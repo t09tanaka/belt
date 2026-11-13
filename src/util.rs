@@ -120,12 +120,12 @@ mod tests {
 
     #[test]
     fn tilde_abbreviates_home_only_as_a_path_prefix() {
-        let home = Path::new("/Users/me");
-        assert_eq!(tilde_with(Path::new("/Users/me/a/b"), home), "~/a/b");
-        assert_eq!(tilde_with(Path::new("/Users/me"), home), "~");
+        let home = Path::new("/home/me");
+        assert_eq!(tilde_with(Path::new("/home/me/a/b"), home), "~/a/b");
+        assert_eq!(tilde_with(Path::new("/home/me"), home), "~");
         assert_eq!(
-            tilde_with(Path::new("/Users/meow/a"), home),
-            "/Users/meow/a"
+            tilde_with(Path::new("/home/meow/a"), home),
+            "/home/meow/a"
         );
         assert_eq!(tilde_with(Path::new("/x"), Path::new("/")), "/x");
     }

@@ -1,7 +1,8 @@
 //! Thin wrappers around the `git` CLI.
 
 use crate::error::{bail, Error, Result};
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -20,7 +21,18 @@ pub fn output(dir: &Path, args: &[&str]) -> Result<String> {
 
 /// [`output`] with extra environment variables for git and its hooks.
 pub fn output_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String> {
-    let out = command(dir)
+    let registration = if args.windows(2).any(|a| a[0] == "worktree")
+        || matches!(args, ["branch", "-d" | "-D", ..])
+    {
+        Some(registration_lock(dir)?)
+    } else {
+        None
+    };
+    let mut child = command(dir);
+    if let Some(held) = &registration {
+        child.env(REGISTRATION_OWNER, &held.key);
+    }
+    let out = child
         .args(args)
         .envs(env.iter().copied())
         .output()
@@ -36,15 +48,68 @@ pub fn output_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Resul
 /// output the user should see, like `git worktree add`), with extra
 /// environment variables for git and its hooks.
 pub fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
+    let registration = registration_lock(dir)?;
     let status = command(dir)
+        .env(REGISTRATION_OWNER, &registration.key)
         .args(args)
         .envs(env.iter().copied())
         .status()
         .map_err(|e| Error(format!("cannot run git: {e}")))?;
     if !status.success() {
-        bail!("git {} failed", args.join(" "));
+        bail!("git {} failed ({status})", args.join(" "));
     }
     Ok(())
+}
+
+/// The marker identifies inherited, synchronous calls from a Git hook. It
+/// never bypasses the lock: even a stale marker must acquire it normally.
+const REGISTRATION_OWNER: &str = "FAST_WORKTREE_REGISTRATION_OWNER";
+
+struct RegistrationLock {
+    _file: File,
+    key: PathBuf,
+}
+
+/// Serialize native Git metadata operations and their hooks. Dependency
+/// preparation and fast-worktree's own hooks run after this guard is dropped.
+fn registration_lock(dir: &Path) -> Result<RegistrationLock> {
+    let out = command(dir)
+        .args(["rev-parse", "--path-format=absolute", "--git-common-dir"])
+        .output()?;
+    if !out.status.success() {
+        bail!(
+            "cannot locate common Git directory: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    lock_common(Path::new(
+        String::from_utf8_lossy(&out.stdout).trim_end_matches('\n'),
+    ))
+}
+
+fn lock_common(common: &Path) -> Result<RegistrationLock> {
+    let key = common.canonicalize()?;
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(key.join("fast-worktree-registration.lock"))?;
+    // SAFETY: a valid descriptor; closing it releases the process-shared lock.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::EWOULDBLOCK) {
+            return Err(error.into());
+        }
+        if std::env::var_os(REGISTRATION_OWNER).is_some_and(|owner| Path::new(&owner) == key) {
+            bail!("recursive Git metadata operation in the same repository: a Git hook already holds the worktree registration lock; run this operation after the hook returns");
+        }
+        // A separate operation waits; only inherited same-repository reentry
+        // fails. The marker is never permission to access incomplete metadata.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+    }
+    Ok(RegistrationLock { _file: file, key })
 }
 
 pub fn toplevel(dir: &Path) -> Result<PathBuf> {
@@ -142,6 +207,11 @@ pub fn admin_dir(path: &Path) -> Result<PathBuf> {
 /// worktree on a volume that is not mounted right now also looks missing to
 /// `prune`, and must keep its registration.
 pub fn unregister(admin: &Path) -> Result<()> {
+    let common = admin
+        .parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| Error("not a worktree administrative directory".into()))?;
+    let _registration = lock_common(common)?;
     let is_entry = admin
         .parent()
         .is_some_and(|p| p.file_name().is_some_and(|n| n == "worktrees"))
