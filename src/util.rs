@@ -123,10 +123,7 @@ mod tests {
         let home = Path::new("/home/me");
         assert_eq!(tilde_with(Path::new("/home/me/a/b"), home), "~/a/b");
         assert_eq!(tilde_with(Path::new("/home/me"), home), "~");
-        assert_eq!(
-            tilde_with(Path::new("/home/meow/a"), home),
-            "/home/meow/a"
-        );
+        assert_eq!(tilde_with(Path::new("/home/meow/a"), home), "/home/meow/a");
         assert_eq!(tilde_with(Path::new("/x"), Path::new("/")), "/x");
     }
 
