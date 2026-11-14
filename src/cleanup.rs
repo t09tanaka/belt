@@ -69,6 +69,8 @@ fn docker_with_cancel(
             .spawn()
             .context("start Docker command")?,
     );
+    #[cfg(test)]
+    tests::observe_spawn(&child.0, args, timeout);
     let mut stdout = child.0.stdout.take().context("missing stdout")?;
     let mut stderr = child.0.stderr.take().context("missing stderr")?;
     for fd in [stdout.as_raw_fd(), stderr.as_raw_fd()] {
@@ -178,13 +180,28 @@ fn remove_tracked_with_timeout(
 }
 
 pub(crate) fn compose_down(ctx: &ExecContext, projects: &[String]) -> Vec<CleanupIncomplete> {
-    compose_down_with_timeout(ctx, projects, Duration::from_secs(30))
+    compose_down_with_budgets(
+        ctx,
+        projects,
+        Duration::from_secs(5),
+        Duration::from_secs(30),
+    )
 }
 
+#[cfg(test)]
 fn compose_down_with_timeout(
     ctx: &ExecContext,
     projects: &[String],
     timeout: Duration,
+) -> Vec<CleanupIncomplete> {
+    compose_down_with_budgets(ctx, projects, timeout, timeout)
+}
+
+fn compose_down_with_budgets(
+    ctx: &ExecContext,
+    projects: &[String],
+    query_timeout: Duration,
+    action_timeout: Duration,
 ) -> Vec<CleanupIncomplete> {
     let mut failures = Vec::new();
     for (index, project) in projects.iter().enumerate() {
@@ -202,7 +219,7 @@ fn compose_down_with_timeout(
                 bail!("invalid Compose project name");
             }
             let label = format!("label=com.docker.compose.project={project}");
-            let bytes = docker(ctx, &["ps", "-aq", "--filter", &label], timeout)
+            let bytes = docker(ctx, &["ps", "-aq", "--filter", &label], query_timeout)
                 .context("query owned Compose containers")?;
             let ids = std::str::from_utf8(&bytes).context("invalid container ID encoding")?;
             for id in ids.lines() {
@@ -218,7 +235,7 @@ fn compose_down_with_timeout(
                 docker(
                     ctx,
                     &["compose", "-p", project, "down", "--remove-orphans"],
-                    timeout,
+                    action_timeout,
                 )
                 .context("take down owned Compose project")?;
             }
@@ -243,6 +260,95 @@ fn compose_down_with_timeout(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    // Parent-owned receipts do not depend on the stub being scheduled before
+    // a short deadline. Selected adversarial fixtures additionally establish
+    // their causal state before the production runtime budget starts.
+    struct SpawnReceipt {
+        pid: i32,
+        args: Vec<String>,
+        started: Instant,
+        timeout: Duration,
+    }
+    type SpawnObserver = Box<dyn FnMut(&Child, &[&str], Duration)>;
+    std::thread_local! {
+        static OBSERVER: std::cell::RefCell<Option<SpawnObserver>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(super) fn observe_spawn(child: &Child, args: &[&str], timeout: Duration) {
+        OBSERVER.with_borrow_mut(|observer| {
+            if let Some(observer) = observer {
+                observer(child, args, timeout);
+            }
+        });
+    }
+    fn observed<T>(
+        ready: Option<(String, std::path::PathBuf, bool)>,
+        run: impl FnOnce() -> T,
+    ) -> (T, Vec<SpawnReceipt>) {
+        let receipts = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recorded = receipts.clone();
+        OBSERVER.with_borrow_mut(|observer| {
+            assert!(observer.is_none());
+            *observer = Some(Box::new(move |child, args, timeout| {
+                if let Some((phase, marker, wait_for_exit)) = &ready {
+                    if args.first() == Some(&phase.as_str()) {
+                        let setup = Instant::now();
+                        while !marker.exists() {
+                            assert!(
+                                setup.elapsed() < Duration::from_secs(10),
+                                "stub startup marker missing"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                    if args.first() != Some(&phase.as_str()) || *wait_for_exit {
+                        // The prerequisite query must complete before testing
+                        // the down phase's deadline, even on a busy scheduler.
+                        let setup = Instant::now();
+                        loop {
+                            let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                            let rc = unsafe {
+                                libc::waitid(
+                                    libc::P_PID,
+                                    child.id(),
+                                    &mut status,
+                                    libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                                )
+                            };
+                            assert_eq!(rc, 0);
+                            if unsafe { status.si_pid() } != 0 {
+                                break;
+                            }
+                            assert!(
+                                setup.elapsed() < Duration::from_secs(10),
+                                "prerequisite stub did not exit"
+                            );
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                    }
+                }
+                recorded.borrow_mut().push(SpawnReceipt {
+                    pid: child.id() as i32,
+                    args: args.iter().map(|arg| (*arg).to_owned()).collect(),
+                    started: Instant::now(),
+                    timeout,
+                });
+            }));
+        });
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                OBSERVER.with_borrow_mut(|observer| *observer = None);
+            }
+        }
+        let reset = Reset;
+        let result = run();
+        drop(reset);
+        (
+            result,
+            std::rc::Rc::try_unwrap(receipts).ok().unwrap().into_inner(),
+        )
+    }
 
     fn fixture(script: &str) -> (tempfile::TempDir, ExecContext) {
         let dir = tempfile::tempdir().unwrap();
@@ -281,21 +387,25 @@ mod tests {
         let ready = dir.path().join("pid");
         let signal = std::thread::spawn(move || {
             let start = Instant::now();
-            while !ready.exists() && start.elapsed() < Duration::from_secs(2) {
+            while !ready.exists() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "stub startup marker missing"
+                );
                 std::thread::sleep(Duration::from_millis(5));
             }
+            let cancelled = Instant::now();
             cancel.cancel();
+            cancelled
         });
-        let started = Instant::now();
-        let result = docker_control(&ctx, &["info"], Duration::from_secs(20));
-        signal.join().unwrap();
+        let (result, receipts) = observed(None, || {
+            docker_control(&ctx, &["info"], Duration::from_secs(20))
+        });
+        let cancelled = signal.join().unwrap();
         assert!(result.unwrap_err().to_string().contains("cancelled"));
-        assert!(started.elapsed() < Duration::from_secs(3));
-        let pid = std::fs::read_to_string(dir.path().join("pid"))
-            .unwrap()
-            .trim()
-            .parse::<i32>()
-            .unwrap();
+        assert!(cancelled.elapsed() < Duration::from_secs(3));
+        assert_eq!(receipts.len(), 1);
+        let pid = receipts[0].pid;
         assert_eq!(
             unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
             -1
@@ -315,7 +425,7 @@ mod tests {
         assert!(remove_tracked_with_timeout(
             &ctx,
             &["owned-container".into()],
-            Duration::from_millis(250)
+            Duration::from_secs(2)
         )
         .is_empty());
         assert!(calls(&dir).contains("rm -f -- owned-container"));
@@ -336,7 +446,7 @@ mod tests {
         assert!(remove_tracked_with_timeout(
             &ctx,
             &["one_1".into(), "two.2".into()],
-            Duration::from_millis(250)
+            Duration::from_secs(2)
         )
         .is_empty());
         assert_eq!(calls(&dir), "rm -f -- one_1 two.2\n");
@@ -441,24 +551,24 @@ mod tests {
     fn cleanup_bounds_blocked_query_and_down_and_reaps_owned_leader() {
         for phase in ["ps", "compose"] {
             let (dir, ctx) = fixture(&format!(
-                "if [ \"$1\" = {phase} ]; then echo $$ > \"$HOME/pid\"; exec sleep 20; fi\necho 012345abcdef"));
-            let started = Instant::now();
-            let errors = compose_down_with_timeout(
-                &ctx,
-                &["owned-project".into()],
-                Duration::from_millis(250),
-            );
+                "if [ \"$1\" = {phase} ]; then sleep 0.35; echo $$ > \"$HOME/pid\"; exec sleep 20; fi\necho 012345abcdef"));
+            let (errors, receipts) =
+                observed(Some((phase.into(), dir.path().join("pid"), false)), || {
+                    compose_down_with_timeout(
+                        &ctx,
+                        &["owned-project".into()],
+                        Duration::from_millis(250),
+                    )
+                });
             assert_eq!(errors.len(), 1);
             assert!(errors[0].to_string().contains("deadline"));
-            assert!(started.elapsed() < Duration::from_secs(3));
+            let blocked = receipts.last().unwrap();
+            assert_eq!(blocked.args[0], phase);
+            assert!(blocked.started.elapsed() < Duration::from_secs(3));
             if phase == "ps" {
                 assert!(!calls(&dir).lines().any(|line| line.starts_with("compose ")));
             }
-            let pid: i32 = std::fs::read_to_string(dir.path().join("pid"))
-                .unwrap()
-                .trim()
-                .parse()
-                .unwrap();
+            let pid = blocked.pid;
             // waitpid is read-only here: ECHILD proves the helper already reaped it.
             assert_eq!(
                 unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
@@ -472,13 +582,18 @@ mod tests {
     }
     #[test]
     fn cleanup_bounds_inherited_pipe_after_leader_exits() {
-        let (dir, ctx) = fixture("sleep 20 &\necho $! > \"$HOME/plugin\"\nexit 0");
-        assert!(!compose_down_with_timeout(
-            &ctx,
-            &["owned-project".into()],
-            Duration::from_millis(250)
-        )
-        .is_empty());
+        let (dir, ctx) = fixture("sleep 0.35; sleep 20 &\necho $! > \"$HOME/plugin\"\nexit 0");
+        let (errors, receipts) =
+            observed(Some(("ps".into(), dir.path().join("plugin"), true)), || {
+                compose_down_with_timeout(
+                    &ctx,
+                    &["owned-project".into()],
+                    Duration::from_millis(250),
+                )
+            });
+        assert!(!errors.is_empty());
+        assert_eq!(receipts.len(), 1);
+        assert!(receipts[0].started.elapsed() < Duration::from_secs(3));
         assert!(!calls(&dir).lines().any(|line| line.starts_with("compose ")));
         // The leader exits before the timeout, but stays unreaped until the
         // helper kills its owned process group, including its pipe holder.
@@ -515,17 +630,38 @@ mod tests {
         }
     }
     #[test]
+    fn cleanup_selects_shorter_read_only_budget_and_preserves_action_budget() {
+        let (_dir, ctx) = fixture("[ \"$1\" = ps ] && echo 012345abcdef; exit 0");
+        let (errors, receipts) = observed(None, || compose_down(&ctx, &["owned-project".into()]));
+        assert!(errors.is_empty());
+        assert_eq!(receipts.len(), 2);
+        assert_eq!(receipts[0].args[0], "ps");
+        assert_eq!(receipts[0].timeout, Duration::from_secs(5));
+        assert_eq!(receipts[1].args[0], "compose");
+        assert_eq!(receipts[1].timeout, Duration::from_secs(30));
+        let (errors, receipts) = observed(None, || run(&ctx));
+        assert!(errors.is_empty());
+        assert_eq!(receipts.len(), 2);
+        assert!(receipts
+            .iter()
+            .all(|receipt| receipt.timeout == Duration::from_secs(2)));
+    }
+
+    #[test]
     fn cleanup_failure_marks_unattempted_projects_without_more_queries() {
-        let (dir, ctx) = fixture("exit 1");
-        let failures = compose_down_with_timeout(
-            &ctx,
-            &["one".into(), "two".into(), "three".into()],
-            Duration::from_millis(250),
-        );
+        let (_dir, ctx) = fixture("exit 1");
+        let (failures, receipts) = observed(None, || {
+            compose_down_with_timeout(
+                &ctx,
+                &["one".into(), "two".into(), "three".into()],
+                Duration::from_millis(250),
+            )
+        });
         assert_eq!(failures.len(), 3);
         assert!(failures[1].to_string().contains("not attempted"));
         assert!(failures[2].to_string().contains("not attempted"));
-        assert_eq!(calls(&dir).lines().count(), 1);
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].args[0], "ps");
     }
     #[test]
     fn cleanup_reaps_successful_owned_child() {
