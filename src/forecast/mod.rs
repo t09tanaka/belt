@@ -12,6 +12,7 @@
 //! - this file: the gathering, in the order that cannot lose a demand
 
 pub mod plan;
+pub const COMMAND_FEATURE: &str = "forecast_command_v1";
 
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::CoordinatorEpoch;
@@ -43,11 +44,24 @@ pub fn compute(
     req: &ForecastRequest,
     accepted: &[AcceptedNode],
 ) -> Result<(ForecastResponse, ttc::OverlayReport), ApiError> {
+    compute_target(ctx, insp, default_weight, ident, req, accepted, None)
+}
+
+fn compute_target(
+    ctx: &Context,
+    insp: &Inspection,
+    default_weight: u32,
+    ident: &Ident,
+    req: &ForecastRequest,
+    accepted: &[AcceptedNode],
+    target: Option<ttc::WorkloadPlan>,
+) -> Result<(ForecastResponse, ttc::OverlayReport), ApiError> {
     plan::check_request(req).map_err(plan::RequestError::into_api)?;
     let defaults = Defaults {
         weight: default_weight,
     };
-    let (target, mut notes) = plan::target_plan(&req.workload, defaults);
+    let (numeric_target, mut notes) = plan::target_plan(&req.workload, defaults);
+    let target = target.unwrap_or(numeric_target);
     if accepted.iter().any(|a| !a.terminal) {
         // Not `soft`: it only makes the answer later, never earlier.
         notes.note(
@@ -164,6 +178,117 @@ pub fn answer(
     let paths = Paths::new(traffic_state_dir, config_path);
     let cfg = Config::load(paths.config_file()).map_err(|e| internal("traffic config", e))?;
     answer_with(&Context::new(paths), &cfg, ident, attempts, max_epoch, req)
+}
+
+/// Derive command history only from an existing canonical clone, without preparing it.
+#[allow(clippy::too_many_arguments)]
+pub fn answer_command(
+    traffic: &Path,
+    config: Option<&Path>,
+    worker_state: &Path,
+    profile: Option<&crate::ids::Digest>,
+    ident: &Ident,
+    attempts: &[AcceptedAttempt],
+    max_epoch: CoordinatorEpoch,
+    req: &crate::wire::ForecastCommandRequest,
+) -> Result<ForecastResponse, ApiError> {
+    if req.version != 1
+        || req.argv.is_empty()
+        || req.argv.len() > 256
+        || req.argv.iter().map(String::len).sum::<usize>() > 65536
+        || req.argv.iter().any(|a| a.contains('\0'))
+        || req.forecast.workload.nodes.len() != 1
+        || req.coordinator_epoch != req.forecast.coordinator_epoch
+    {
+        return Err(ApiError::new(
+            ErrorCode::InvalidInput,
+            "invalid command forecast",
+        ));
+    }
+    crate::workspace::plan::check_cwd_relative(Path::new(&req.cwd_relative))?;
+    let paths = Paths::new(
+        traffic,
+        config
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| traffic.join("config.toml")),
+    );
+    let cfg = Config::load(paths.config_file()).map_err(|e| internal("traffic config", e))?;
+    let ctx = Context::new(paths);
+    if req.coordinator_epoch < max_epoch {
+        return Err(ApiError::new(
+            ErrorCode::StaleEpoch,
+            "stale command forecast epoch",
+        ));
+    }
+    plan::check_request(&req.forecast).map_err(plan::RequestError::into_api)?;
+    let cwd = req
+        .repository_id
+        .as_ref()
+        .filter(|id| id.len() <= 4096)
+        .and_then(|id| {
+            let clone = worker_state
+                .join("clones")
+                .join(crate::workspace::plan::clone_dir_name(id));
+            if std::fs::symlink_metadata(&clone)
+                .ok()?
+                .file_type()
+                .is_symlink()
+            {
+                return None;
+            }
+            let clones = std::fs::canonicalize(worker_state.join("clones")).ok()?;
+            let clone = std::fs::canonicalize(clone).ok()?;
+            if !clone.starts_with(clones) {
+                return None;
+            }
+            let cwd = std::fs::canonicalize(clone.join(&req.cwd_relative)).ok()?;
+            (req.cwd_relative.is_empty()
+                && cwd.starts_with(&clone)
+                && cwd.is_dir()
+                && clone.join(".git").is_dir()
+                && task_traffic_controller::gitctx::main_worktree(&cwd).as_deref()
+                    == clone.to_str()
+                && task_traffic_controller::gitctx::subdir(&cwd).is_empty())
+            .then_some(cwd)
+        });
+    let target = cwd
+        .map(|cwd| {
+            let key = crate::supervisor::run::profile_history_key(&ctx, &cwd, &req.argv, profile)
+                .map_err(|e| internal("history identity", e))?;
+            let opts = task_traffic_controller::exec::Opts {
+                weight: None,
+                front: false,
+                key,
+                label: None,
+                argv: req.argv.clone(),
+                cwd,
+                env: None,
+                stdout_log: None,
+            };
+            let mut target = task_traffic_controller::estimate::command_plan(&ctx, &cfg, &opts)
+                .map_err(|e| internal("command plan", e))?;
+            let wire = &req.forecast.workload;
+            target.attempt_id = wire.attempt_id.to_string();
+            target.plan_digest = wire.plan_digest.to_string();
+            target.nodes[0].node_id = wire.nodes[0].node_id.to_string();
+            target.nodes[0].external_delay_ms = wire.nodes[0].external_delay_ms.unwrap_or(0);
+            Ok::<_, ApiError>(target)
+        })
+        .transpose()?;
+    let (accepted, insp) = gather(
+        || accepted_of(attempts),
+        || inspect_with(&ctx, &cfg).map_err(|e| internal("inspect", e)),
+        |node| {
+            if let Loaded::Ok(sc) = managed::load_sidecar(&ctx, &node.command_id) {
+                node.terminal = sc.terminal.is_some();
+            }
+        },
+    )?;
+    compute_target(&ctx, &insp, cfg.default_weight, ident, &req.forecast, &accepted, target).map(|(mut answer, _)| {
+        answer.target.assumptions.push("transfer, setup and result collection costs are unknown; command history requires an existing canonical repository".into());
+        answer.target.conditional = true;
+        answer
+    })
 }
 
 #[cfg(test)]

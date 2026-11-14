@@ -2845,3 +2845,154 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     }
     shutdown(&load(&spec)).await;
 }
+
+#[tokio::test]
+async fn estimate_offline_100_calls_without_git_leave_db_epoch_and_source_roots_unchanged() {
+    let (_root, mut spec, input) = control_fixture();
+    let store = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+    let epoch = store.epoch();
+    drop(store);
+    let db = std::fs::read(spec.state_dir.join("coordinator.db")).unwrap();
+    spec.env.insert("PATH".into(), "/nonexistent".into());
+    for _ in 0..100 {
+        let context = remote_task_runner::service::context::Context::discover_estimate(
+            spec.env.clone(),
+            input.clone(),
+        )
+        .unwrap();
+        let answer = remote_task_runner::service::estimate::command(
+            context,
+            vec!["echo".into(), "hello".into()],
+        )
+        .await
+        .unwrap();
+        assert!(!answer.online);
+        assert!(answer.conditional && answer.decision.is_none() && answer.forecasts.is_empty());
+    }
+    assert_eq!(
+        db,
+        std::fs::read(spec.state_dir.join("coordinator.db")).unwrap()
+    );
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    assert!(!spec.state_dir.join("parent").exists());
+    assert!(!spec.state_dir.join("startup.lock").exists());
+    assert!(!spec.state_dir.join("sources").exists());
+    assert!(!spec.worker_state_dir.join("traffic").exists());
+    assert!(!spec.worker_state_dir.join("clones").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn estimate_reads_real_worker_execution_history_through_authenticated_owner() {
+    let (_root, mut spec, repo) = control_fixture();
+    spec.env
+        .insert("PATH".into(), std::env::var("PATH").unwrap());
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "fixture"]);
+    // The retained fixture input has a deliberately minimal PATH; keep its
+    // existing content and start the explicit owned child with the intended env.
+    let resident_input = repo.parent().unwrap().join("history-resident.json");
+    remote_task_runner::service::bootstrap::write_input(&resident_input, &spec).unwrap();
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(remote_task_runner::service::bootstrap::daemon_argv(&resident_input).unwrap())
+        .env_clear()
+        .envs(&spec.env)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let client = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            assert!(child.try_wait().unwrap().is_none());
+            if let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) {
+                if let Ok(client) = Client::load(&spec.state_dir, store.cluster_id().clone()) {
+                    if matches!(
+                        client.request(Operation::Ping).await,
+                        Ok(Reply::Ready { .. })
+                    ) {
+                        break client;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for _ in 0..2 {
+        let output = tokio::time::timeout(
+            Duration::from_secs(40),
+            tokio::process::Command::new(&spec.executable)
+                .args(["--json", "exec", "--", "/bin/sh", "-c", "sleep 1"])
+                .env_clear()
+                .envs(&spec.env)
+                .current_dir(&repo)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let history = task_traffic_controller::history::read_all(
+        &spec.worker_state_dir.join("traffic/history.jsonl"),
+    )
+    .unwrap();
+    assert_eq!(history.len(), 2);
+    assert!(history.iter().all(|record| record.wall_secs >= 1.0
+        && record.exit_code == 0
+        && record.measurement_id.is_some()));
+    let context = remote_task_runner::service::context::Context::discover_estimate(
+        spec.env.clone(),
+        repo.clone(),
+    )
+    .unwrap();
+    let answer = remote_task_runner::service::estimate::command(
+        context,
+        vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()],
+    )
+    .await
+    .unwrap();
+    shutdown(&client).await;
+    assert!(child.wait().await.unwrap().success());
+    assert!(answer.online, "{}", answer.human());
+    assert_eq!(answer.forecasts.len(), 1, "{}", answer.human());
+    let forecast = &answer.forecasts[0];
+    assert_eq!(
+        forecast.target.runtime_source,
+        remote_task_runner::wire::RuntimeSource::Measured,
+        "{}",
+        answer.human()
+    );
+    assert_eq!(forecast.target.history_count, 2);
+    assert!(forecast.target.execution_ms.is_some());
+    assert!(forecast.target.conditional);
+}

@@ -70,6 +70,48 @@ impl Context {
         let spec = runtime_spec(&env)?;
         Self::load(env, cwd, spec)
     }
+    /// Estimate tolerates unavailable Git; absent identity remains unknown.
+    /// Configuration and bootstrap are read without creating any state.
+    pub fn discover_estimate(
+        env: BTreeMap<String, String>,
+        cwd: PathBuf,
+    ) -> Result<Self, ApiError> {
+        let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
+        if !cwd.is_absolute() {
+            return Err(invalid("command directory must be absolute".into()));
+        }
+        let file =
+            crate::config::paths::user_config_path(&env).map_err(|e| invalid(e.to_string()))?;
+        let input = file
+            .parent()
+            .expect("config parent")
+            .join("coordinator.json");
+        let bootstrap = super::bootstrap::read_input(&input).map_err(|e| invalid(e.to_string()))?;
+        let repo_root = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .env("LC_ALL", "C")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.strip_suffix('\n').map(PathBuf::from));
+        let config = crate::config::load::load(
+            &env,
+            Some(repo_root.as_deref().unwrap_or(&cwd)),
+            &Overlay::default(),
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        Ok(Self {
+            env,
+            cwd,
+            config,
+            repo_root,
+            bootstrap,
+        })
+    }
     pub fn state_dir(&self) -> &Path {
         &self.bootstrap.state_dir
     }

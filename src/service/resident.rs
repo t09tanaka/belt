@@ -50,6 +50,9 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    Estimate {
+        query: super::estimate::Query,
+    },
     Cancel {
         target: super::completion::Target,
         expected_control_revision: u64,
@@ -91,6 +94,9 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
+    Estimate {
+        estimate: super::estimate::Estimate,
+    },
     RetryAccepted {
         receipt: super::completion::RetryReceipt,
     },
@@ -904,6 +910,13 @@ async fn handle(
         .await?;
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
+    if let Operation::Estimate { query } = request.operation {
+        let reply = match coordinator.estimate(query).await {
+            Ok(estimate) => Reply::Estimate { estimate },
+            Err(error) => Reply::ControlError { error },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     let mut gate = admission.lock().await;
     let reply = if *gate || coordinator.is_fenced() {
         if matches!(
@@ -1173,7 +1186,9 @@ async fn handle(
                     },
                 }
             }
-            Operation::Query { .. } => unreachable!("query handled before admission"),
+            Operation::Query { .. } | Operation::Estimate { .. } => {
+                unreachable!("read handled before admission")
+            }
             Operation::Shutdown => {
                 *gate = true;
                 let _ = stop.send(true);

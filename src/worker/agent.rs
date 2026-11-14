@@ -1717,6 +1717,30 @@ impl Agent {
                 blobs::get(&self.store, &self.cfg.attempts_root(), &r).map(Response::BlobGet)
             }
             Request::Forecast(r) => self.forecast(r).map(Response::Forecast),
+            Request::ForecastCommand(r) => {
+                let attempts = self.store.list_nonterminal().map_err(api)?;
+                let max_epoch = self.store.max_coordinator_epoch().map_err(api)?;
+                let ident = crate::forecast::plan::Ident {
+                    worker_id: self.cfg.worker_id.clone(),
+                    boot_id: self.cfg.boot_id.clone(),
+                    agent_epoch: self.epoch,
+                    forecast_ttl_ms: self.cfg.forecast_ttl_ms,
+                };
+                crate::forecast::answer_command(
+                    &self.cfg.traffic_state_dir,
+                    self.cfg.traffic_config.as_deref(),
+                    &self.cfg.state_dir,
+                    self.cfg
+                        .capability_profile
+                        .as_ref()
+                        .map(|_| &self.cfg.profile_fingerprint),
+                    &ident,
+                    &attempts,
+                    max_epoch,
+                    &r,
+                )
+                .map(Response::ForecastCommand)
+            }
             Request::EnvReport(_) | Request::EnvSync(_) => Err(ApiError::new(
                 ErrorCode::NotImplemented,
                 "this operation is not implemented by the worker agent yet",

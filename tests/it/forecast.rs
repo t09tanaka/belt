@@ -385,3 +385,131 @@ fn an_oversized_request_is_refused_before_any_file_is_read() {
     assert_eq!(e.code, ErrorCode::InvalidInput);
     assert!(!f.traffic().exists());
 }
+
+#[test]
+fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
+    let f = fx();
+    let ctx = f.ctx();
+    let state = f.dir.path().join("worker");
+    let repository = "root:0123456789012345678901234567890123456789";
+    let clone = state
+        .join("clones")
+        .join(remote_task_runner::workspace::plan::clone_dir_name(
+            repository,
+        ));
+    std::fs::create_dir_all(&clone).unwrap();
+    assert!(std::process::Command::new("git")
+        .args(["init", "-q"])
+        .arg(&clone)
+        .status()
+        .unwrap()
+        .success());
+    let attempt = AttemptId::generate();
+    let mut target = node(&attempt, "command", 1000);
+    target.predicted_runtime_ms = None;
+    target.predicted_rss_bytes = None;
+    let forecast = request(plan(&attempt, vec![target]), vec![], 1);
+    let req = ForecastCommandRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        coordinator_epoch: CoordinatorEpoch(1),
+        version: 1,
+        repository_id: Some(repository.into()),
+        cwd_relative: String::new(),
+        argv: vec!["echo".into(), "hello".into()],
+        forecast,
+    };
+    let opts = Opts {
+        weight: None,
+        front: false,
+        key: None,
+        label: None,
+        argv: req.argv.clone(),
+        cwd: clone.clone(),
+        env: None,
+        stdout_log: None,
+    };
+    let learned = task_traffic_controller::estimate::command_plan(&ctx, &cfg(), &opts).unwrap();
+    for seconds in [8.0, 9.0] {
+        task_traffic_controller::history::append(
+            ctx.paths.history_file(),
+            &task_traffic_controller::history::Record {
+                key: learned.nodes[0].identity.clone(),
+                repo: String::new(),
+                subdir: String::new(),
+                argv: "echo hello".into(),
+                key_argv: String::new(),
+                started_at: chrono::Utc::now(),
+                wall_secs: seconds,
+                cpu_secs: seconds,
+                max_rss_bytes: 1024,
+                exit_code: 0,
+                weight_used: 1,
+                contended: false,
+                measurement_id: None,
+            },
+        )
+        .unwrap();
+    }
+    fn snapshot(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        if root.exists() {
+            for entry in std::fs::read_dir(root).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    out.extend(snapshot(&entry.path()));
+                } else {
+                    out.insert(entry.path(), std::fs::read(entry.path()).unwrap());
+                }
+            }
+        }
+        out
+    }
+    let before = snapshot(f.dir.path());
+    for _ in 0..100 {
+        let result = remote_task_runner::forecast::answer_command(
+            &f.traffic(),
+            None,
+            &state,
+            None,
+            &ident(),
+            &[],
+            CoordinatorEpoch(1),
+            &req,
+        )
+        .unwrap();
+        assert_eq!(result.target.runtime_source, RuntimeSource::Measured);
+        assert_eq!(result.target.history_count, 2);
+        assert_eq!(result.target.execution_ms, Some(9000));
+        assert!(result.target.conditional);
+    }
+    assert_eq!(before, snapshot(f.dir.path()));
+    let mut missing = req.clone();
+    missing.repository_id = Some("root:other".into());
+    let result = remote_task_runner::forecast::answer_command(
+        &f.traffic(),
+        None,
+        &state,
+        None,
+        &ident(),
+        &[],
+        CoordinatorEpoch(1),
+        &missing,
+    )
+    .unwrap();
+    assert_ne!(result.target.runtime_source, RuntimeSource::Measured);
+    assert_eq!(result.target.execution_ms, None);
+    assert_eq!(before, snapshot(f.dir.path()));
+    missing.cwd_relative = "../outside".into();
+    assert!(remote_task_runner::forecast::answer_command(
+        &f.traffic(),
+        None,
+        &state,
+        None,
+        &ident(),
+        &[],
+        CoordinatorEpoch(1),
+        &missing
+    )
+    .is_err());
+}

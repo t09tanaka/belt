@@ -15,6 +15,7 @@ pub const PROTOCOL_VERSIONS: &[u32] = &[1];
 /// Features this build implements. `blob_resume` is offset and digest resume of
 /// blob transfer, `log_resume` the offset and sequence resume of logs.
 pub const SUPPORTED_FEATURES: &[&str] = &[
+    crate::forecast::COMMAND_FEATURE,
     "blob_resume",
     "log_resume",
     "output_bundles_v1",

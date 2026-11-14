@@ -109,6 +109,10 @@ pub trait WorkerLink: Send + Sync {
         None
     }
     fn inputs_evaluated(&self, _generation: u64, _run: &crate::ids::RunId) {}
+    /// Inspection without observing source gates or changing placement state.
+    fn read_only_call(&self, request: Request) -> LinkFuture<'_> {
+        self.call(request)
+    }
     fn call(&self, request: Request) -> LinkFuture<'_>;
 }
 
@@ -139,6 +143,17 @@ impl ClientLink {
     }
 }
 impl WorkerLink for ClientLink {
+    fn read_only_call(&self, request: Request) -> LinkFuture<'_> {
+        Box::pin(async move {
+            self.client
+                .call(request, self.timeout)
+                .await
+                .map_err(|e| match e {
+                    CallError::Remote(e) => LinkError::Remote(e),
+                    _ => LinkError::Unconfirmed,
+                })
+        })
+    }
     fn placement_fence(&self) -> Option<std::sync::Arc<tokio::sync::Mutex<()>>> {
         self.gate.as_ref().map(|gate| gate.placement_fence())
     }
@@ -178,6 +193,13 @@ pub(super) struct Budgeted {
 }
 
 impl WorkerLink for Budgeted {
+    fn read_only_call(&self, request: Request) -> LinkFuture<'_> {
+        Box::pin(async move {
+            tokio::time::timeout_at(self.deadline, self.inner.read_only_call(request))
+                .await
+                .unwrap_or(Err(LinkError::Unconfirmed))
+        })
+    }
     fn placement_fence(&self) -> Option<std::sync::Arc<tokio::sync::Mutex<()>>> {
         self.inner.placement_fence()
     }

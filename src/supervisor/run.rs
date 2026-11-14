@@ -999,6 +999,13 @@ impl Control<'_> {
         id: &str,
         limits: task_traffic_controller::admit::Limits,
     ) -> Result<NodeEnd> {
+        // Keep the actual registered key and weight, rather than deriving a
+        // second identity after project execution may have changed its files.
+        // An unreadable snapshot loses this sample, never invents one.
+        let measurement_entry =
+            task_traffic_controller::ledger::Ledger::load(&self.traffic.ctx.paths.ledger_file())
+                .ok()
+                .and_then(|ledger| ledger.entries.into_iter().find(|entry| entry.id == id));
         let run_since = platform::monotonic_ms();
         let ctx = self.traffic.ctx.clone();
         let mut watch = Watch::default();
@@ -1076,6 +1083,36 @@ impl Control<'_> {
             (_, None) => TerminalKind::SpawnFailed,
         };
         let confirmed = managed::finish(&self.traffic.ctx, guard, kind).is_ok();
+        if confirmed && reason.is_none() {
+            if let (Some(entry), Ok(ran)) = (measurement_entry, &ran) {
+                if !ran.outcome.tracker_unknown && !ran.outcome.descendants_left {
+                    let record = task_traffic_controller::history::Record {
+                        key: entry.key,
+                        repo: entry.repo,
+                        subdir: entry.subdir,
+                        argv: entry.argv,
+                        key_argv: String::new(),
+                        started_at: ran.started_at,
+                        wall_secs: ran.outcome.wall_secs,
+                        cpu_secs: ran.outcome.cpu_secs,
+                        max_rss_bytes: ran.outcome.max_rss_bytes,
+                        exit_code: ran.outcome.exit.code(),
+                        weight_used: entry.weight,
+                        contended: ran.contended,
+                        measurement_id: None,
+                    };
+                    // The command id fences replay. A crash between durable
+                    // finish and this append can lose one sample; recovery
+                    // never executes or appends a second one for this id.
+                    if managed::record_measurement(&self.traffic.ctx, id, &record).is_err() {
+                        eprintln!(
+                            "supervise: runtime history write failed; computation result retained"
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(NodeEnd {
             reason,
             exit,
@@ -1521,7 +1558,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
 // TTC's explicit key replaces its command identity rather than extending it.
 // Keep its normalized repo/subdir/work identity and add only an opaque profile
 // namespace: neither raw argv nor profile environment enters the override.
-fn profile_history_key(
+pub(crate) fn profile_history_key(
     ctx: &Context,
     cwd: &Path,
     argv: &[String],
