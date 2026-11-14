@@ -273,7 +273,7 @@ impl CoordinatorStore {
 
         crate::source::SourceStore::open(&self.state_dir)
             .and_then(|source| source.mutation_guard())
-            .map_err(|e| StorageError::Invalid(format!("source mutation guard: {e}")))
+            .map_err(|e| StorageError::Invalid(format!("source mutation guard: {e:#}")))
     }
     /// Resolve immutable target identity, lock one run, then validate fresh metadata.
     /// Export/read commands must retain this pin for their whole invocation.

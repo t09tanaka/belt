@@ -3,9 +3,9 @@
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
-use std::fs::{File, OpenOptions, TryLockError};
+use std::fs::{File, TryLockError};
 use std::io::{self, Read};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -28,26 +28,45 @@ const DIR: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY
     .union(rustix::fs::OFlags::DIRECTORY)
     .union(rustix::fs::OFlags::NOFOLLOW)
     .union(rustix::fs::OFlags::CLOEXEC);
+fn open_permanent_file(root: &File, name: &str) -> Result<File> {
+    let flags =
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOFOLLOW | rustix::fs::OFlags::CLOEXEC;
+    // Give first creation one atomic winner instead of racing nonexclusive
+    // O_CREAT lookups, which produced native ENOENT in the regression setup.
+    let file = match rustix::fs::openat(
+        root,
+        name,
+        flags | rustix::fs::OFlags::CREATE | rustix::fs::OFlags::EXCL,
+        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
+    ) {
+        Ok(file) => Ok(file),
+        Err(rustix::io::Errno::EXIST) => {
+            rustix::fs::openat(root, name, flags, rustix::fs::Mode::empty())
+        }
+        Err(error) => Err(error),
+    }?;
+    Ok(file.into())
+}
 impl Index {
     pub(crate) fn open(root: &Path) -> Result<Self> {
         let this = Self {
             path: root.into(),
-            database: std::fs::canonicalize(root)?.join("retention.db"),
-            root: Arc::new(rustix::fs::open(root, DIR, rustix::fs::Mode::empty())?.into()),
+            database: std::fs::canonicalize(root)
+                .context("resolve source root")?
+                .join("retention.db"),
+            root: Arc::new(
+                rustix::fs::open(root, DIR, rustix::fs::Mode::empty())
+                    .context("open source root")?
+                    .into(),
+            ),
             #[cfg(test)]
             reads: Default::default(),
             #[cfg(test)]
             verifications: Default::default(),
         };
-        let _guard = this.guard(false)?;
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(root.join("retention.db"))?;
+        let _guard = this.guard(false).context("initial source guard")?;
+        let file =
+            open_permanent_file(&this.root, "retention.db").context("open source index file")?;
         let m = file.metadata()?;
         ensure!(
             m.is_file()
@@ -56,9 +75,9 @@ impl Index {
                 && m.mode() & 0o077 == 0,
             "unsafe source index"
         );
-        file.sync_all()?;
-        this.root.sync_all()?;
-        this.connect()?.execute_batch("PRAGMA synchronous=FULL;
+        file.sync_all().context("sync source index file")?;
+        this.root.sync_all().context("sync source index parent")?;
+        this.connect().context("connect source index")?.execute_batch("PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS root(id TEXT PRIMARY KEY,kind TEXT NOT NULL,source TEXT);
           CREATE INDEX IF NOT EXISTS root_kind ON root(kind,id);
           CREATE INDEX IF NOT EXISTS root_unknown ON root(source,kind,id);
@@ -68,7 +87,7 @@ impl Index {
           CREATE TABLE IF NOT EXISTS graph(root TEXT NOT NULL,source TEXT NOT NULL,done INTEGER NOT NULL DEFAULT 0,position INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(root,source));
           CREATE INDEX IF NOT EXISTS graph_pending ON graph(root,done,source);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-          INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');")?;
+          INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');").context("initialize source index")?;
         Ok(this)
     }
     fn current(&self) -> Result<()> {
@@ -87,17 +106,9 @@ impl Index {
         Ok(())
     }
     pub(crate) fn guard(&self, exclusive: bool) -> Result<Guard> {
-        self.current()?;
-        let file: File = rustix::fs::openat(
-            &*self.root,
-            "mutation.lock",
-            rustix::fs::OFlags::RDWR
-                | rustix::fs::OFlags::CREATE
-                | rustix::fs::OFlags::NOFOLLOW
-                | rustix::fs::OFlags::CLOEXEC,
-            rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        )?
-        .into();
+        self.current().context("check source root for lock")?;
+        let file = open_permanent_file(&self.root, "mutation.lock")
+            .context("open source mutation lock")?;
         let m = file.metadata()?;
         ensure!(
             m.is_file()
@@ -114,19 +125,23 @@ impl Index {
         lock.map_err(|e| match e {
             TryLockError::WouldBlock => io::Error::from(io::ErrorKind::WouldBlock),
             TryLockError::Error(e) => e,
-        })?;
+        })
+        .context("acquire source mutation lock")?;
         let opened = rustix::fs::fstat(&file)?;
         let named = rustix::fs::statat(
             &*self.root,
             "mutation.lock",
             rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )?;
+        )
+        .context("stat source mutation lock")?;
         ensure!(
             (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino),
             "source lock changed"
         );
-        file.sync_all()?;
-        self.root.sync_all()?;
+        file.sync_all().context("sync source mutation lock")?;
+        self.root
+            .sync_all()
+            .context("sync source mutation parent")?;
         Ok(Guard {
             _file: Arc::new(file),
             root: self.path.clone(),
@@ -1069,6 +1084,115 @@ mod tests {
             )
             .is_err());
         assert_eq!(std::fs::read(input.join("sentinel")).unwrap(), b"original");
+    }
+    #[test]
+    fn concurrent_first_lock_open_keeps_one_inode_and_shared_exclusion() {
+        // Keep the database out of this native first-creation regression:
+        // every participant starts with the same retained directory FD, and
+        // no participant ever removes or replaces the lock file.
+        for _ in 0..32 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = std::fs::canonicalize(dir.path()).unwrap();
+            let index = Index {
+                database: path.join("retention.db"),
+                root: Arc::new(
+                    rustix::fs::open(&path, DIR, rustix::fs::Mode::empty())
+                        .unwrap()
+                        .into(),
+                ),
+                path,
+                reads: Default::default(),
+                verifications: Default::default(),
+            };
+            let gate = std::sync::Barrier::new(8);
+            let guards = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        let index = &index;
+                        let gate = &gate;
+                        scope.spawn(move || {
+                            gate.wait();
+                            index.guard(false).unwrap()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| handle.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let named = std::fs::symlink_metadata(index.path.join("mutation.lock")).unwrap();
+            for guard in &guards {
+                let opened = guard._file.metadata().unwrap();
+                assert_eq!((opened.dev(), opened.ino()), (named.dev(), named.ino()));
+            }
+            assert!(index.guard(true).is_err());
+            drop(guards);
+            let exclusive = index.guard(true).unwrap();
+            assert!(index.guard(false).is_err());
+            drop(exclusive);
+            assert!(index.guard(false).is_ok());
+        }
+    }
+    #[test]
+    fn concurrent_first_index_file_open_keeps_one_private_inode() {
+        for _ in 0..32 {
+            let dir = tempfile::tempdir().unwrap();
+            let root: File = rustix::fs::open(dir.path(), DIR, rustix::fs::Mode::empty())
+                .unwrap()
+                .into();
+            let gate = std::sync::Barrier::new(8);
+            let files = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..8)
+                    .map(|_| {
+                        let root = &root;
+                        let gate = &gate;
+                        scope.spawn(move || {
+                            gate.wait();
+                            open_permanent_file(root, "retention.db").unwrap()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().unwrap())
+                    .collect::<Vec<_>>()
+            });
+            let named = std::fs::symlink_metadata(dir.path().join("retention.db")).unwrap();
+            assert_eq!(named.mode() & 0o777, 0o600);
+            assert_eq!(named.nlink(), 1);
+            for file in files {
+                let opened = file.metadata().unwrap();
+                assert_eq!((opened.dev(), opened.ino()), (named.dev(), named.ino()));
+            }
+        }
+    }
+    #[test]
+    fn mutation_lock_aliases_and_retargeted_source_root_fail_closed() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for hardlink in [false, true] {
+            let f = Fixture::new();
+            let sentinel = f.input.join("sentinel");
+            std::fs::write(&sentinel, b"private sentinel").unwrap();
+            std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let lock = f.store.root().join("mutation.lock");
+            std::fs::rename(&lock, f.store.root().join("saved.lock")).unwrap();
+            if hardlink {
+                std::fs::hard_link(&sentinel, &lock).unwrap();
+            } else {
+                symlink(&sentinel, &lock).unwrap();
+            }
+            assert!(f.store.mutation_guard().is_err());
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"private sentinel");
+        }
+        let f = Fixture::new();
+        let retained = f.store.mutation_guard().unwrap();
+        let root = f.store.root();
+        std::fs::rename(root, root.with_file_name("saved-sources")).unwrap();
+        std::fs::create_dir(root).unwrap();
+        assert!(f.store.mutation_guard().is_err());
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+        assert_eq!(retained._file.metadata().unwrap().nlink(), 1);
     }
     #[test]
     #[ignore = "owned helper subprocess"]
