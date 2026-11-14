@@ -1092,7 +1092,7 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 版指定ファイルの無いtoolで、workflowやprofileが必要とするもの（例: 版を固定していないFlutter・Xcode）は、親でcapture時に解決された版を、そのrunの `toolchain_baseline` として記録する。照合規則はプロジェクト設定 `[toolchain] match = "exact" | "minor" | "major" | "any"` で選び、既定は `exact` とする。baselineと合わないworkerは候補から外すか、自動導入できるなら導入する。
 
-S20b の内部APIと未統合の境界は [private adapter API](toolchain-adapters.md) に記録する。閉じた導入計画・receipt・activation APIがあっても、既存setup admission/singleflightとsubmit/workerへの接続が完了するまでは自動導入対応を広告しない。
+S20b/S20c の内部API・worker-local registry と未統合の境界は [private adapter API](toolchain-adapters.md) に記録する。閉じた導入計画・receipt・activation APIがあっても、既存setup admission/singleflightとsubmit/workerへの接続が完了するまでは自動導入対応を広告しない。
 
 workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、corepack）を持つ。adapterは `detect`（導入済み版の列挙）、`resolve`（要件を具体版へ）、`install`、`activate`（そのattemptのPATH・envへの反映）を備える。不足版の導入は、第8章のsetupと同じ経路（task-traffic-controllerのadmission、worker内singleflight、導入済み版のworker内再利用）で行い、導入にかかる時間と負荷をforecastの準備時間に含める。導入はattemptのworkspaceではなくworkerのtool領域に行い、同じ版の並行導入を1回にまとめる。
 

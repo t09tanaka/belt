@@ -113,3 +113,65 @@ Primary recipe references: [node-build usage](https://github.com/nodenv/node-bui
 [Corepack commands and environment](https://github.com/nodejs/corepack#utility-commands).
 The operator executable byte identities pin the actual installed manager release;
 unsupported CLI versions fail preparation rather than fall back to other flags.
+
+## Worker-local registry (S20c infrastructure)
+
+`toolchain::registry::Registry` retains a private `state/toolchains.toml` snapshot
+for one resident lifetime. Changes require operator drain/restart; request building
+and detection do not reread configuration, run discovery commands, create directories,
+install, or modify manager defaults. The checked worker factory supplies its existing
+trusted `Profile` and measured execution fingerprint to `Registry::load`; it must first
+obtain the canonical private tool root from `Setups::private_tool_root`. No task or wire
+input may supply this configuration or the measured fingerprint.
+
+The schema is version 1, with `active_profile`, local `profile_definition`, and a
+`recipes` array. Each recipe has `tool`, closed `kind` (`Nodenv`, `Rustup`, `Mise`,
+`Fvm`, `Corepack`), absolute canonical `manager`, `dependencies`, `search_path`,
+optional `rust_host` (required for Rustup), explicit concrete `inventory`, and optional
+`resolved_inputs` mapping aliases to inventory versions. Nodenv requires a trusted executable `node-build` dependency; Corepack requires
+a trusted executable `node` dependency. Unknown fields, duplicate tool recipes,
+unsupported kind/tool pairs and invalid paths are rejected. There are no shell,
+installer argv, task environment or project path fields. The configuration is read
+through one no-follow descriptor and must be an owned private singly linked regular
+file, at most 64 KiB; recipes are limited to 32 and each inventory to 256 versions.
+A missing file yields an unconfigured registry; malformed supplied configuration fails
+closed. Manager/dependency identities are captured and revalidated when planning.
+
+Inventory is operator authorization to prepare a concrete version, not evidence that
+it is installed or available from a remote server. Local resolution chooses the highest
+matching authorized version and binds evidence to the recipe's inventory authority digest;
+aliases require explicit `resolved_inputs`. Expressions and version-file expressions always
+require original parent evidence attesting the captured CI context; a static local
+expression mapping cannot select a matrix leg. An existing frozen selection
+requires its original `ResolutionEvidence`: the bridge validates the full source contract
+and selection, requires the selected version in the local inventory, and preserves the
+parent catalog, alias evidence and authority without substituting local mappings.
+`PreparationRequest` derives its local definition and base execution identity from the
+retained trusted worker inputs; the frozen parent definition remains capture provenance.
+The exact plan key and private root come from the closed adapter plan. Source-independent
+artifact reuse retains separate source-bound request evidence.
+
+`Registry::detect` validates the exact request binding and only checks that plan's private
+adapter receipt/tree. It does not recursively discover manager catalogs. Unconfigured,
+unsupported, resolution-required, unauthorized versions, manual requirements, missing
+receipts and unknown/drift states remain distinct; the registry never advertises
+`auto_installable` capabilities. TaskSpec/submit/resident routing, consumer activation,
+baseline checking in worker routing, installed-version index enumeration,
+`workers diff`/`sync`, and admission forecasting remain
+unconnected. Private fake-manager setup integration exercises this bridge; host installers
+and network access are outside this slice.
+
+A valid baseline-only tool returns `BaselineCheckRequired`, not an invalid-capture
+error or an install request. Future worker routing must first compare frozen baselines
+with actual base observations under the frozen match policy. A match needs no installer;
+mismatch or unknown can exclude the candidate or block with `environment_mismatch`.
+The registry does not synthesize explicit requirements from baselines.
+
+Multi-tool callers must finish a coherent resolution phase before polling or installing
+any tool. A request used to resolve the first tool may contain an intermediate frozen
+contract with later tools still unselected. Retain each tool's original evidence, finish
+all selections, then rebuild every request from the complete final frozen contract using
+`request(final_frozen, tool, Some(original_evidence))`. All plans passed to activation must
+contain the same complete frozen contract. Evidence contract digests clear all selections,
+so this rebuild preserves the original authority. Do not begin installation with an
+intermediate request and later change that consumer's binding to a completed contract.

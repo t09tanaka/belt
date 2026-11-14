@@ -470,3 +470,20 @@ local definition は helper の request binding に含めるが、再利用 arti
 wire/submit からの worker request 構築と consumer activation は引き続き未接続である。
 異なる親/local definition の private fake-manager install/reuse と、誤った local definition の
 実行前拒否を含む process 10件、focused unit 4件、strict clippy と fmt が成功した。
+
+S20c の worker-local registry infrastructure は、private `toolchains.toml` の
+schema 1、閉じた5 adapter recipe、bounded explicit inventory、active local profile binding
+から `PreparationRequest` を構築する。既存の parent resolution evidence を検証・保持する経路と、
+local inventory authority で未解決契約を解決する経路を分けた。local profile definition と
+既存の実測 execution fingerprint は信頼済み worker factory から与え、parent provenance を
+置換しない。resident 中は immutable snapshot とし、設定更新には drain/restart を要する。
+request/detect は process・network・mkdir・manager listing を実行せず、exact plan receipt のみ
+検証する。inventory は導入済み版の申告ではない。TaskSpec/submit/resident routing、consumer
+activation、installed inventory index、diff/sync、forecast は残件であり、自動導入 capability を
+公開しない。API と信頼境界は [private adapter API](toolchain-adapters.md) を参照する。
+registry unit 9件、private preparation process 11件（新規 registry→Setups bridge を含む）、
+strict clippy all-targets/all-features と fmt が成功した。検証は private fake-manager のみで、
+実ホスト installer・network・Docker/service は実行していない。full CI はこの差分では未実施。
+複数 tool は全選択を確定後、original evidence を保持して同じ complete frozen contract から
+全 request を再構築してから導入する。baseline-only は `BaselineCheckRequired` とし、
+worker routing での実測 base observation と frozen policy の照合を残す。

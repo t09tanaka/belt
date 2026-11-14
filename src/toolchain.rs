@@ -4,6 +4,7 @@ pub mod adapters;
 pub mod capability;
 pub mod preparation;
 pub mod profile;
+pub mod registry;
 
 pub mod declarations;
 pub mod snapshot;

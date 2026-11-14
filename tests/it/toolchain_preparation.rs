@@ -648,3 +648,65 @@ fn parent_capture_definition_and_local_worker_definition_remain_separate() {
     assert_eq!(f.request.frozen, parent);
     assert_eq!(wrong_local.frozen, parent);
 }
+
+#[test]
+fn worker_private_registry_builds_request_for_real_setup_preparation() {
+    use remote_task_runner::toolchain::profile::Profile;
+    use remote_task_runner::toolchain::registry::Registry;
+    let mut f = Fx::new(AdapterKind::Nodenv, "node", "");
+    let state = &f.cfg.state_dir;
+    let host = f.request.host.manager.path.parent().unwrap();
+    let profiles = format!(
+        "schema_version=1\nactive='fixture'\n[profiles.fixture]\npath=[{:?}]\nshell='/bin/sh'\ncache_namespace='fixture'\n",
+        host.to_str().unwrap()
+    );
+    std::fs::write(state.join("profiles.toml"), profiles).unwrap();
+    std::fs::set_permissions(
+        state.join("profiles.toml"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let profile = Profile::load(state, &BTreeMap::new()).unwrap();
+    let config = format!(
+        "schema_version=1\nactive_profile='fixture'\nprofile_definition={:?}\n[[recipes]]\ntool='node'\nkind='Nodenv'\nmanager={:?}\ndependencies=[{:?}]\nsearch_path=[{:?},'/usr/bin','/bin']\ninventory=['1.2.3']\n",
+        profile.definition_digest().as_str(), f.request.host.manager.path.to_str().unwrap(), host.join("node-build").to_str().unwrap(), host.to_str().unwrap()
+    );
+    std::fs::write(state.join("toolchains.toml"), config).unwrap();
+    std::fs::set_permissions(
+        state.join("toolchains.toml"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    // The fixture supplies the same trusted measured identity to both checked factories.
+    let registry =
+        Registry::load(state, &profile, f.cfg.profile_fingerprint.clone().unwrap()).unwrap();
+    f.cfg.profile_definition = Some(profile.definition_digest().clone());
+    f.setups = Setups::open(f.cfg.clone(), Arc::new(NoWorkspace)).unwrap();
+    let frozen = f.request.frozen.clone();
+    let parent_evidence = f.request.evidence.clone();
+    f.request = registry
+        .request(&frozen, &f.request.tool, Some(&parent_evidence))
+        .unwrap();
+    assert_eq!(f.request.frozen, frozen);
+    assert_ne!(
+        f.request.profile_definition,
+        f.request.frozen.profile_definition
+    );
+    assert!(matches!(
+        registry.detect(&f.request).unwrap(),
+        adapters::Availability::Missing
+    ));
+    assert_eq!(f.calls(), 0);
+    let consumer = f.consumer();
+    assert!(matches!(
+        f.done(&consumer),
+        ToolPreparationPoll::Installed(_)
+    ));
+    assert!(matches!(
+        registry.detect(&f.request).unwrap(),
+        adapters::Availability::Installed(_)
+    ));
+    let second = f.consumer();
+    assert!(matches!(f.done(&second), ToolPreparationPoll::Installed(_)));
+    assert_eq!(f.calls(), 1);
+}
