@@ -248,13 +248,15 @@ async fn resident_rejects_foreign_credentials_oversized_frames_and_schema() {
     let runner = tokio::spawn(resident.run());
     let rejected = RunId::generate();
     for (version, cluster, owner) in [
-        (1, ClusterId::generate(), token.clone()),
-        (1, client.cluster_id().clone(), "wrong".into()),
-        (2, client.cluster_id().clone(), token),
+        (2, ClusterId::generate(), token.clone()),
+        (2, client.cluster_id().clone(), "wrong".into()),
+        (1, client.cluster_id().clone(), token),
     ] {
         for operation in [
             Operation::Shutdown,
             Operation::Cancel {
+                request_id: RunId::generate().to_string(),
+                expected_control_revision: 0,
                 target: remote_task_runner::service::completion::Target::Run(rejected.clone()),
             },
         ] {

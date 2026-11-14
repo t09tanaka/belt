@@ -937,3 +937,239 @@ async fn source_prefetch_verifies_legacy_inputs_and_advances_after_full_cache_ev
     peer.abort();
     let _ = peer.await;
 }
+
+#[test]
+fn retry_controls_require_revision_and_private_ipc_version() {
+    let target = super::super::completion::Target::Run(RunId::generate());
+    let encoded = serde_json::to_value(Operation::Cancel {
+        request_id: RunId::generate().to_string(),
+        target: target.clone(),
+        expected_control_revision: 7,
+    })
+    .unwrap();
+    assert_eq!(encoded["expected_control_revision"], 7);
+    let mut missing_id = encoded.clone();
+    missing_id.as_object_mut().unwrap().remove("request_id");
+    assert!(serde_json::from_value::<Operation>(missing_id).is_err());
+    let mut missing = encoded;
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("expected_control_revision");
+    assert!(serde_json::from_value::<Operation>(missing).is_err());
+    let retry = Operation::Retry {
+        target,
+        expected_control_revision: 8,
+        request_id: "same-request".into(),
+    };
+    let mut encoded = serde_json::to_value(retry).unwrap();
+    assert_eq!(encoded["expected_control_revision"], 8);
+    encoded.as_object_mut().unwrap().remove("request_id");
+    assert!(serde_json::from_value::<Operation>(encoded).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_preflight_keeps_admission_and_db_available_and_rechecks_stopping() {
+    use crate::service::completion::Target;
+    for stopping in [false, true] {
+        let (_root, coordinator, run) = retry_owner();
+        let admission = Arc::new(Mutex::new(false));
+        let (entered, observed) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let (_stop, stopping_rx) = watch::channel(false);
+        let pending = tokio::spawn(retry_control(
+            coordinator.clone(),
+            admission.clone(),
+            RetryCommand {
+                target: Target::Run(run.clone()),
+                expected: 0,
+                request_id: "slow-input".into(),
+            },
+            Arc::new(()),
+            stopping_rx,
+            move |_| {
+                entered.send(()).unwrap();
+                resume.recv().unwrap();
+                Ok(false)
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(5), observed)
+            .await
+            .unwrap()
+            .unwrap();
+        let other = RunId::generate();
+        let owner = coordinator.clone();
+        let target = other.clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut gate = admission.lock().await;
+            tokio::task::spawn_blocking(move || {
+                owner.store().cancel_control(
+                    Target::Run(target),
+                    0,
+                    RunId::generate().to_string(),
+                    5,
+                )
+            })
+            .await
+            .unwrap()
+            .unwrap();
+            *gate = stopping;
+        })
+        .await
+        .unwrap();
+        assert!(
+            coordinator
+                .store()
+                .completion(Target::Run(other))
+                .unwrap()
+                .cancel_requested
+        );
+        release.send(()).unwrap();
+        let reply = pending.await.unwrap().unwrap();
+        if stopping {
+            assert!(matches!(reply, Reply::ControlError { .. }));
+            assert_eq!(
+                coordinator
+                    .store()
+                    .completion(Target::Run(run))
+                    .unwrap()
+                    .control_revision,
+                0
+            );
+        } else {
+            assert!(matches!(reply, Reply::RetryAccepted { .. }), "{reply:?}");
+            assert_eq!(
+                coordinator
+                    .store()
+                    .completion(Target::Run(run))
+                    .unwrap()
+                    .control_revision,
+                1
+            );
+        }
+    }
+}
+
+fn retry_owner() -> (tempfile::TempDir, Arc<Coordinator>, RunId) {
+    use crate::coordinator::CoordinatorConfig;
+    use crate::state::Exit;
+    let root = tempfile::Builder::new()
+        .prefix("rtr-retry-")
+        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+        .unwrap();
+    let store = CoordinatorStore::open(root.path(), 1).unwrap();
+    let run = RunId::generate();
+    let source = SourceId::generate();
+    let task = TaskId::generate();
+    let digest = Digest::of_bytes(b"retained");
+    store.put_source_ref(&source, &digest, 1).unwrap();
+    store
+        .enqueue(
+            &run,
+            Some(&source),
+            &serde_json::json!({}),
+            &[(
+                task.clone(),
+                serde_json::json!({"manifest_digest":digest,"has_secret_bundle":false}),
+            )],
+            1,
+        )
+        .unwrap();
+    let attempt = AttemptId::generate();
+    store
+        .create_attempt(
+            NewAttempt {
+                attempt_id: attempt.clone(),
+                task_id: task,
+                worker_id: WorkerId::parse("local").unwrap(),
+                payload_hash: Digest::of_bytes(b"payload"),
+                permit_id: None,
+            },
+            2,
+        )
+        .unwrap();
+    for state in [
+        AttemptState::Preparing,
+        AttemptState::Ready,
+        AttemptState::Starting,
+        AttemptState::Active,
+        AttemptState::Finalizing,
+    ] {
+        store.transition_attempt(&attempt, state, 3).unwrap();
+    }
+    store
+        .finalize_attempt(
+            &attempt,
+            Termination::new(Outcome::Failed, Some(Exit::Code(1)), None).unwrap(),
+            4,
+        )
+        .unwrap();
+    let coordinator = Arc::new(Coordinator::start(store, CoordinatorConfig::default()).unwrap());
+    (root, coordinator, run)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_stopping_releases_owner_while_input_io_retains_cross_process_lease() {
+    use crate::service::completion::Target;
+    let (root, coordinator, run) = retry_owner();
+    let sources = crate::source::SourceStore::open(root.path()).unwrap();
+    let transfer = Arc::new(Mutex::new(()));
+    let (stop, mut stopping) = watch::channel(false);
+    let lease =
+        super::super::forward::lease(&sources, &mut stopping, transfer.clone().lock_owned().await)
+            .await
+            .unwrap();
+    let file = secure_file(&sources.root().join("transfer.lock"), true).unwrap();
+    let (entered, observed) = tokio::sync::oneshot::channel();
+    let (release, resume) = std::sync::mpsc::channel();
+    let pending = tokio::spawn(retry_control(
+        coordinator,
+        Arc::new(Mutex::new(false)),
+        RetryCommand {
+            target: Target::Run(run.clone()),
+            expected: 0,
+            request_id: "stopped-preflight".into(),
+        },
+        lease,
+        stopping,
+        move |_| {
+            entered.send(()).unwrap();
+            resume.recv().unwrap();
+            Ok(false)
+        },
+    ));
+    tokio::time::timeout(Duration::from_secs(5), observed)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        file.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    stop.send(true).unwrap();
+    let reply = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(matches!(reply, Reply::ControlError { .. }));
+    // The detached preflight has no Coordinator or CoordinatorStore ownership.
+    let restarted = CoordinatorStore::open(root.path(), 9).unwrap();
+    assert_eq!(
+        restarted
+            .completion(Target::Run(run))
+            .unwrap()
+            .control_revision,
+        0
+    );
+    assert!(matches!(
+        file.try_lock(),
+        Err(std::fs::TryLockError::WouldBlock)
+    ));
+    release.send(()).unwrap();
+    let guard = tokio::time::timeout(Duration::from_secs(2), transfer.lock_owned())
+        .await
+        .unwrap();
+    file.try_lock().unwrap();
+    drop(guard);
+}

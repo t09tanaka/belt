@@ -262,7 +262,10 @@ pub fn run(cli: Cli) -> i32 {
     }
 
     if matches!(&cli.command,Command::Exec(args) if !args.in_place)
-        || matches!(&cli.command, Command::Wait(_) | Command::Cancel(_))
+        || matches!(
+            &cli.command,
+            Command::Wait(_) | Command::Cancel(_) | Command::Retry(_)
+        )
     {
         return run_control(&cli);
     }
@@ -343,7 +346,7 @@ pub fn run(cli: Cli) -> i32 {
 
 fn run_control(cli: &Cli) -> i32 {
     let result = (|| -> Result<crate::service::control::Report, crate::error::ApiError> {
-        if let Command::Wait(args) | Command::Cancel(args) = &cli.command {
+        if let Command::Wait(args) | Command::Cancel(args) | Command::Retry(args) = &cli.command {
             crate::service::completion::Target::parse(&args.id)?;
         }
         let env = std::env::vars_os()
@@ -385,11 +388,19 @@ fn run_control(cli: &Cli) -> i32 {
                     )
                     .await
                 }
+                Command::Retry(args) => {
+                    crate::service::control::retry(
+                        &spec,
+                        crate::service::completion::Target::parse(&args.id)?,
+                    )
+                    .await
+                }
                 Command::Cancel(args) => {
                     let target = crate::service::completion::Target::parse(&args.id)?;
                     let snapshot = crate::service::control::cancel(&spec, target.clone()).await?;
                     Ok(crate::service::control::Report {
                         schema_version: 1,
+                        retry_receipt: None,
                         target,
                         task_id: None,
                         state: "cancel_requested",

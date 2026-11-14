@@ -47,7 +47,8 @@ fn run_facts(c: &Connection, run: &str, cancel: bool, collections: bool) -> Resu
     } else {
         ("", "0", "NULL")
     };
-    let sql=format!("SELECT count(*),coalesce(sum(a.termination_json IS NOT NULL OR ({cancelled})),0),coalesce(sum((a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='complete') OR ({cancelled})),0),coalesce(sum(a.observation IN ('unknown','reconciling')),0),coalesce(sum((a.termination_json IS NOT NULL AND json_extract(a.termination_json,'$.outcome')<>'succeeded') OR ({cancelled})),0),coalesce(sum(a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='gave_up'),0),coalesce(sum(a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='required_missing'),0) FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1");
+    let boundary = current_boundary(c)?;
+    let sql=format!("SELECT count(*),coalesce(sum(a.termination_json IS NOT NULL OR ({cancelled})),0),coalesce(sum((a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='complete') OR ({cancelled})),0),coalesce(sum(a.observation IN ('unknown','reconciling')),0),coalesce(sum((a.termination_json IS NOT NULL AND json_extract(a.termination_json,'$.outcome')<>'succeeded') OR ({cancelled})),0),coalesce(sum(a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='gave_up'),0),coalesce(sum(a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='required_missing'),0) FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1");
     let values = c.query_row(&sql, [run], |r| {
         Ok([
             r.get::<_, i64>(0)?,
@@ -92,7 +93,12 @@ pub struct CurrentAttempt {
     pub termination: Option<Termination>,
 }
 fn current(c: &Connection, task: &str) -> Result<Option<CurrentAttempt>> {
-    let aid=c.query_row("SELECT attempt_id FROM attempt WHERE task_id=?1 AND retired=0 ORDER BY generation DESC LIMIT 1",[task],|r|r.get::<_,String>(0)).optional()?;
+    let boundary = if current_boundary(c)?.is_empty() {
+        ""
+    } else {
+        "AND generation >= (SELECT min_generation FROM task WHERE task_id=?1)"
+    };
+    let aid=c.query_row(&format!("SELECT attempt_id FROM attempt WHERE task_id=?1 AND retired=0 {boundary} ORDER BY generation DESC LIMIT 1"),[task],|r|r.get::<_,String>(0)).optional()?;
     aid.map(|aid| {
         let a = load_attempt(c, &aid)?.ok_or_else(|| not_found(format!("attempt {aid}")))?;
         Ok(CurrentAttempt {
@@ -218,6 +224,19 @@ impl CoordinatorStore {
             Ok(page(items,n,|a|a.generation.0.to_string()))
         })
     }
+}
+
+pub(super) fn current_boundary(c: &Connection) -> Result<&'static str> {
+    let retry: bool = c.query_row(
+        "SELECT count(*)>0 FROM pragma_table_info('task') WHERE name='min_generation'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(if retry {
+        "AND aa.generation>=t.min_generation"
+    } else {
+        ""
+    })
 }
 
 #[cfg(test)]

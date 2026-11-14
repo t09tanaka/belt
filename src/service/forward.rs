@@ -15,7 +15,7 @@ use tokio::sync::{watch, OwnedMutexGuard};
 
 // This lease outlives an interrupted request and every blocking operation it started.
 // The file lock also excludes a restarted owner's exporter/cleanup while old IO ends.
-struct Lease {
+pub(super) struct Lease {
     _local: OwnedMutexGuard<()>,
     _file: File,
 }
@@ -109,17 +109,14 @@ pub(super) async fn verify(
         _ => anyhow::bail!("unexpected source verification answer"),
     }
 }
-/// Retrying uses only the run-bound store and never captures the original again.
-pub async fn source(
-    client: &Client,
-    epoch: CoordinatorEpoch,
-    store: SourceStore,
-    source: &SourceId,
-    env: BTreeMap<String, String>,
-    mut stop: watch::Receiver<bool>,
+/// Shared by source forwarding and retry. Future source/Vault GC must hold this
+/// same cross-process lease; blocking IO retains an Arc until it has drained.
+pub(super) async fn lease(
+    store: &SourceStore,
+    stop: &mut watch::Receiver<bool>,
     ownership: OwnedMutexGuard<()>,
-) -> anyhow::Result<()> {
-    check_stop(&stop)?;
+) -> anyhow::Result<Arc<Lease>> {
+    check_stop(stop)?;
     let path = store.root().join("transfer.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -138,19 +135,32 @@ pub async fn source(
         "unsafe source transfer lock"
     );
     loop {
-        check_stop(&stop)?;
+        check_stop(stop)?;
         match file.try_lock() {
             Ok(()) => break,
             Err(TryLockError::WouldBlock) => {
-                tokio::select! {biased; _=stopped(&mut stop)=>anyhow::bail!("resident is stopping"), _=tokio::time::sleep(Duration::from_millis(25))=>{}}
+                tokio::select! {biased; _=stopped(stop)=>anyhow::bail!("resident is stopping"), _=tokio::time::sleep(Duration::from_millis(25))=>{}}
             }
             Err(error) => return Err(error.into()),
         }
     }
-    let lease = Arc::new(Lease {
+    Ok(Arc::new(Lease {
         _local: ownership,
         _file: file,
-    });
+    }))
+}
+
+/// Retrying uses only the run-bound store and never captures the original again.
+pub async fn source(
+    client: &Client,
+    epoch: CoordinatorEpoch,
+    store: SourceStore,
+    source: &SourceId,
+    env: BTreeMap<String, String>,
+    mut stop: watch::Receiver<bool>,
+    ownership: OwnedMutexGuard<()>,
+) -> anyhow::Result<()> {
+    let lease = lease(&store, &mut stop, ownership).await?;
     let outcome = source_inner(client, epoch, &store, source, env, &mut stop, &lease).await;
     // Do not abort the worker on request cancellation: an exporter already on a
     // blocking thread must finish before cleanup. Neither job owns CoordinatorStore.

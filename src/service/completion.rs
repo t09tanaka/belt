@@ -32,6 +32,7 @@ pub struct Failure {
 pub struct Snapshot {
     pub target: Target,
     pub accepted: bool,
+    pub control_revision: u64,
     pub cancel_requested: bool,
     pub task_count: u64,
     pub computed_tasks: u64,
@@ -47,6 +48,7 @@ impl Snapshot {
         Self {
             target,
             accepted,
+            control_revision: 0,
             cancel_requested,
             task_count: 0,
             computed_tasks: 0,
@@ -158,6 +160,19 @@ pub fn compute_failure(t: Termination) -> Option<(ErrorCode, i32)> {
             Some((ErrorCode::CommandFailed, crate::error::exit::FAILURE))
         }
     }
+}
+
+/// Durable metadata receipt; does not contain input or secret material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryReceipt {
+    pub request_id: String,
+    pub run_id: RunId,
+    pub control_revision: u64,
+    pub task_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<TaskId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub min_generation: Option<u64>,
 }
 
 #[cfg(test)]
@@ -359,6 +374,7 @@ mod tests {
         for accepted in [false, true] {
             for cancelled in [false, true] {
                 let snapshot = Snapshot::new(target(), accepted, cancelled);
+                assert_eq!(snapshot.control_revision, 0);
                 assert_eq!(snapshot.stop_confirmed(), cancelled);
                 assert_eq!(
                     snapshot.exit_code(),

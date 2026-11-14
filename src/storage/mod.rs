@@ -27,7 +27,8 @@ pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATC
 pub use coordinator::{
     ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, InputCursor,
     InputPage, LiveAttempt, LiveAttemptPage, NewAttempt, Permit, PlaceInput, PlaceOutcome,
-    Placement, QueuedTask, ResultRef, RetireEnd, RunStanding, Seen, WorkerLoad,
+    Placement, PreparedRetry, QueuedTask, ResultRef, RetireEnd, RetryPreparation, RunStanding,
+    Seen, WorkerLoad,
 };
 pub use db::Db;
 pub use lock::ProcessLock;
@@ -102,6 +103,8 @@ pub enum StorageError {
         state: AttemptState,
         why: &'static str,
     },
+    #[error("retained secret bundle unavailable; submit a new run")]
+    SecretUnavailable,
     #[error("invalid input: {0}")]
     Invalid(String),
     #[error("already fixed and different: {0}")]
@@ -143,6 +146,7 @@ impl StorageError {
             | StorageError::Immutable(_)
             | StorageError::LiveAttemptExists(_)
             | StorageError::LocatorPendingDelete(_) => ErrorCode::Conflict,
+            StorageError::SecretUnavailable => ErrorCode::Blocked,
             StorageError::NotFound { .. } => ErrorCode::NotFound,
             StorageError::Retired(_) => ErrorCode::Retired,
             StorageError::StaleEpoch { .. } => ErrorCode::StaleEpoch,

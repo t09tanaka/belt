@@ -15,6 +15,8 @@ use tokio::sync::mpsc;
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub schema_version: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_receipt: Option<super::completion::RetryReceipt>,
     pub target: Target,
     pub task_id: Option<TaskId>,
     pub state: &'static str,
@@ -34,6 +36,7 @@ async fn interrupted(signals: &mut mpsc::UnboundedReceiver<()>) {
 fn report(target: Target, snapshot: Option<Snapshot>, state: &'static str, exit: i32) -> Report {
     Report {
         schema_version: 1,
+        retry_receipt: None,
         target,
         task_id: None,
         state,
@@ -57,11 +60,32 @@ fn unknown(target: Target, snapshot: Option<Snapshot>, acknowledged: bool) -> Re
     report
 }
 pub async fn cancel(spec: &super::bootstrap::Spec, target: Target) -> Result<Snapshot, ApiError> {
+    super::bootstrap::ensure(spec.clone())
+        .await
+        .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?;
+    let expected = match read(spec, target.clone()).await {
+        Ok(snapshot) => snapshot.control_revision,
+        Err(error) if error.code == ErrorCode::NotFound && matches!(target, Target::Run(_)) => 0,
+        Err(error) => return Err(error),
+    };
+    let request_id = RunId::generate().to_string();
+    cancel_revision(spec, target, expected, &request_id).await
+}
+async fn cancel_revision(
+    spec: &super::bootstrap::Spec,
+    target: Target,
+    expected_control_revision: u64,
+    request_id: &str,
+) -> Result<Snapshot, ApiError> {
     let client = super::bootstrap::ensure(spec.clone())
         .await
         .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?;
     match client
-        .request(Operation::Cancel { target })
+        .request(Operation::Cancel {
+            target,
+            expected_control_revision,
+            request_id: request_id.to_owned(),
+        })
         .await
         .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?
     {
@@ -126,17 +150,25 @@ pub async fn cancel_and_stop(
 ) -> Report {
     let deadline = tokio::time::Instant::now() + budget;
     let mut acknowledged = false;
+    // exec owns a newly generated run ID; retain the initial revision across retries.
+    let expected_control_revision = 0;
+    let request_id = RunId::generate().to_string();
+    let mut acknowledged_revision = None;
     let mut last = None;
     loop {
         let next = async {
             if !acknowledged {
-                cancel(spec, target.clone()).await
+                cancel_revision(spec, target.clone(), expected_control_revision, &request_id).await
             } else {
                 read(spec, target.clone()).await
             }
         };
         let status = tokio::select! {biased; _=interrupted(signals)=>return unknown(target,last,acknowledged),_=tokio::time::sleep_until(deadline)=>return unknown(target,last,acknowledged),status=next=>status};
         if let Ok(snapshot) = status {
+            if acknowledged_revision.is_some_and(|revision| snapshot.control_revision != revision) {
+                return unknown(target, last, acknowledged);
+            }
+            acknowledged_revision = Some(snapshot.control_revision);
             acknowledged = true;
             if snapshot.stop_confirmed() {
                 let exit = snapshot.exit_code().unwrap_or_else(|| {
@@ -175,4 +207,33 @@ pub async fn exec(
     }?;
     result.task_id = Some(task_id);
     Ok(result)
+}
+
+pub async fn retry(spec: &super::bootstrap::Spec, target: Target) -> Result<Report, ApiError> {
+    let expected_control_revision = read(spec, target.clone()).await?.control_revision;
+    let request_id = RunId::generate().to_string();
+    let client = super::bootstrap::ensure(spec.clone())
+        .await
+        .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?;
+    let operation = Operation::Retry {
+        target: target.clone(),
+        expected_control_revision,
+        request_id,
+    };
+    match client
+        .request(operation)
+        .await
+        .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?
+    {
+        Reply::RetryAccepted { receipt } => {
+            let mut result = report(target, None, "queued", 0);
+            result.retry_receipt = Some(receipt);
+            Ok(result)
+        }
+        Reply::ControlError { error } => Err(error),
+        _ => Err(ApiError::new(
+            ErrorCode::CommunicationUnknown,
+            "unexpected retry response",
+        )),
+    }
 }

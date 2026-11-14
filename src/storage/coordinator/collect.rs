@@ -639,11 +639,12 @@ impl CoordinatorStore {
                 })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
             let mut tasks = Vec::with_capacity(rows.len());
+            let boundary = if super::query::current_boundary(c)?.is_empty() {""}else{"AND generation >= (SELECT min_generation FROM task WHERE task_id=?1)"};
             for (task, cancelled) in rows {
                 let current: Option<String> = c
                     .query_row(
-                        "SELECT attempt_id FROM attempt WHERE task_id = ?1 AND retired = 0
-                         ORDER BY generation DESC LIMIT 1",
+                        &format!("SELECT attempt_id FROM attempt WHERE task_id = ?1 AND retired = 0 {boundary}
+                         ORDER BY generation DESC LIMIT 1"),
                         [&task],
                         |r| r.get(0),
                     )

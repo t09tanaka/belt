@@ -20,6 +20,8 @@ use std::path::Path;
 
 mod collect;
 mod control;
+mod retry;
+pub use retry::{PreparedRetry, RetryPreparation};
 pub mod query;
 mod queue;
 pub use collect::{Collectable, CollectionRow, ResultRef, RunStanding};
@@ -242,6 +244,7 @@ pub struct CoordinatorStore {
     /// False for a step-1 file opened read-only: its tasks have no cancel
     /// column (no task of it was ever cancelled before it was placed).
     task_cancel: bool,
+    retry_boundaries: bool,
     /// False for a file from before the third step opened read-only: it has
     /// no `collection` table (no collection of it was ever begun).
     collections: bool,
@@ -375,6 +378,7 @@ impl CoordinatorStore {
             coordinator_id,
             epoch,
             task_cancel: true,
+            retry_boundaries: true,
             collections: true,
             _lock: Some(lock),
         })
@@ -418,12 +422,20 @@ impl CoordinatorStore {
                 collections,
             ))
         })?;
+        let db_has_retry = db.call(|c| {
+            Ok(c.query_row(
+                "SELECT count(*)>0 FROM pragma_table_info('task') WHERE name='min_generation'",
+                [],
+                |r| r.get(0),
+            )?)
+        })?;
         Ok(Self {
             db,
             cluster_id,
             coordinator_id,
             epoch,
             task_cancel,
+            retry_boundaries: db_has_retry,
             collections,
             _lock: None,
         })

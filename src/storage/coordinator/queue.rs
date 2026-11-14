@@ -24,7 +24,9 @@ pub const MAX_TASKS_PER_RUN: usize = 10_000;
 
 const QUEUED: &str = "t.cancel_requested_at_ms IS NULL
     AND EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL)
-    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0)";
+    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0 AND (a.generation >= t.min_generation OR a.state <> 'terminal'))";
+
+const QUEUED_V1_CANCEL: &str = "t.cancel_requested_at_ms IS NULL AND EXISTS (SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL) AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0)";
 
 /// [`QUEUED`] for a step-1 file, which has no cancel of a task.
 const QUEUED_V1: &str =
@@ -267,7 +269,13 @@ impl CoordinatorStore {
         after: Option<InputCursor>,
     ) -> Result<Vec<QueuedTask>> {
         use rusqlite::types::Value as Sql;
-        let queued = if self.task_cancel { QUEUED } else { QUEUED_V1 };
+        let queued = if self.retry_boundaries {
+            QUEUED
+        } else if self.task_cancel {
+            QUEUED_V1_CANCEL
+        } else {
+            QUEUED_V1
+        };
         let mut args = vec![Sql::Integer(i64::from(limit))];
         let stranded = if workers.is_empty() {
             String::new()
@@ -640,49 +648,6 @@ impl CoordinatorStore {
         })
     }
 
-    /// Persist the cancel of a task before anything is sent: the task is
-    /// never placed again, and its live attempt (if any) carries the request
-    /// to its worker. Returns that attempt. Idempotent.
-    pub fn cancel_task(&self, task_id: &TaskId, at_ms: u64) -> Result<Option<AttemptRecord>> {
-        let task = task_id.to_string();
-        self.db.write(move |tx| {
-            let n = tx.execute(
-                "UPDATE task SET cancel_requested_at_ms = COALESCE(cancel_requested_at_ms, ?1)
-                 WHERE task_id = ?2",
-                params![to_i64(at_ms)?, task],
-            )?;
-            if n != 1 {
-                return Err(not_found(format!("task {task}")));
-            }
-            let live: Option<String> = tx
-                .query_row(
-                    "SELECT attempt_id FROM attempt
-                     WHERE task_id = ?1 AND state <> 'terminal' AND retired = 0",
-                    [&task],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let Some(aid) = live else { return Ok(None) };
-            let fresh = tx.execute(
-                "UPDATE attempt SET cancel_requested_at_ms = ?1
-                 WHERE attempt_id = ?2 AND cancel_requested_at_ms IS NULL",
-                params![to_i64(at_ms)?, aid],
-            )?;
-            if fresh == 1 {
-                let run = run_of(tx, &aid)?;
-                common::append_event(
-                    tx,
-                    run.as_deref(),
-                    Some(&aid),
-                    "cancel_requested",
-                    &Value::Null,
-                    at_ms,
-                )?;
-            }
-            load_attempt(tx, &aid)
-        })
-    }
-
     /// The retire of an attempt was confirmed by its worker (it never
     /// started there, or it stopped without completing). One commit decides
     /// what that means from what is recorded now, not from what the caller
@@ -817,9 +782,14 @@ impl CoordinatorStore {
     /// Bounded status query for the resident request API.
     pub fn latest_attempt_of_task(&self, task_id: &TaskId) -> Result<Option<AttemptRecord>> {
         let task = task_id.to_string();
+        let boundary = if self.retry_boundaries {
+            "AND generation >= (SELECT min_generation FROM task WHERE task_id=?1)"
+        } else {
+            ""
+        };
         self.db.call(move |c| {
             c.query_row(
-                &format!("SELECT {ATTEMPT_COLS} FROM attempt WHERE task_id = ?1 ORDER BY generation DESC LIMIT 1"),
+                &format!("SELECT {ATTEMPT_COLS} FROM attempt WHERE task_id = ?1 {boundary} ORDER BY generation DESC LIMIT 1"),
                 [&task],
                 |r| Ok(attempt_from_row(r)),
             ).optional()?.transpose()

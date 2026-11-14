@@ -293,6 +293,19 @@ CREATE TRIGGER task_keep_cancel AFTER UPDATE OF cancel_requested_at_ms ON task W
 BEGIN UPDATE task SET cancel_requested_at_ms=(SELECT requested_at_ms FROM run_cancel_intent WHERE run_id=NEW.run_id) WHERE task_id=NEW.task_id; END;
 CREATE TRIGGER attempt_cancel_gate BEFORE INSERT ON attempt WHEN EXISTS(SELECT 1 FROM task WHERE task_id=NEW.task_id AND cancel_requested_at_ms IS NOT NULL)
 BEGIN SELECT RAISE(ABORT,'cancelled task cannot create an attempt'); END;"#.to_string(),
+            r#"ALTER TABLE run ADD COLUMN control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision >= 0);
+ALTER TABLE task ADD COLUMN min_generation INTEGER NOT NULL DEFAULT 1 CHECK(min_generation > 0);
+ALTER TABLE task ADD COLUMN authorization_revision INTEGER NOT NULL DEFAULT 0 CHECK(authorization_revision >= 0);
+ALTER TABLE run_cancel_intent ADD COLUMN control_revision INTEGER NOT NULL DEFAULT 0 CHECK(control_revision >= 0);
+CREATE TABLE control_request(request_id TEXT PRIMARY KEY, operation TEXT NOT NULL CHECK(operation IN ('cancel','retry')), target_json TEXT NOT NULL, expected_revision INTEGER NOT NULL, reply_json TEXT NOT NULL);
+CREATE TRIGGER run_inherit_control_revision AFTER INSERT ON run WHEN EXISTS(SELECT 1 FROM run_cancel_intent WHERE run_id=NEW.run_id)
+BEGIN UPDATE run SET control_revision=MAX(control_revision,(SELECT control_revision FROM run_cancel_intent WHERE run_id=NEW.run_id)) WHERE run_id=NEW.run_id; END;
+DROP TRIGGER task_inherit_cancel;
+DROP TRIGGER task_keep_cancel;
+CREATE TRIGGER task_inherit_cancel AFTER INSERT ON task WHEN EXISTS(SELECT 1 FROM run_cancel_intent WHERE run_id=NEW.run_id AND control_revision>=NEW.authorization_revision)
+BEGIN UPDATE task SET cancel_requested_at_ms=(SELECT requested_at_ms FROM run_cancel_intent WHERE run_id=NEW.run_id) WHERE task_id=NEW.task_id; END;
+CREATE TRIGGER task_keep_cancel AFTER UPDATE OF cancel_requested_at_ms ON task WHEN NEW.cancel_requested_at_ms IS NULL AND EXISTS(SELECT 1 FROM run_cancel_intent WHERE run_id=NEW.run_id AND control_revision>=NEW.authorization_revision)
+BEGIN UPDATE task SET cancel_requested_at_ms=(SELECT requested_at_ms FROM run_cancel_intent WHERE run_id=NEW.run_id) WHERE task_id=NEW.task_id; END;"#.to_string(),
         ],
         DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}")],
     }

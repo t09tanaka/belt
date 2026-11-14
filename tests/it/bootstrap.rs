@@ -330,7 +330,7 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
     // Simulate the pre-index schema with durable rows and no running owner.
     let db = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
     db.execute_batch(
-        "DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TABLE run_cancel_intent; DROP INDEX task_run_key; UPDATE schema_meta SET value='3' WHERE key='schema_version';",
+        "DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; UPDATE schema_meta SET value='3' WHERE key='schema_version';",
     )
     .unwrap();
     let old_epoch: i64 = db
@@ -734,6 +734,57 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     })
     .await
     .unwrap();
+    // Same-run retry must use the retained run bundle after the file changes.
+    let target = remote_task_runner::service::completion::Target::Task(task.clone());
+    let accepted = client
+        .request(Operation::Retry {
+            target: target.clone(),
+            expected_control_revision: 0,
+            request_id: "retained-secret".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(accepted, Reply::RetryAccepted { .. }),
+        "{accepted:?}"
+    );
+    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        remote_task_runner::service::control::wait(&spec, target.clone(), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.cli_exit_code, 0);
+    vault.erase(&id).unwrap();
+    let unavailable = client
+        .request(Operation::Retry {
+            target,
+            expected_control_revision: 1,
+            request_id: "erased-secret".into(),
+        })
+        .await
+        .unwrap();
+    let Reply::ControlError { error } = unavailable else {
+        panic!("{unavailable:?}")
+    };
+    assert_eq!(
+        error.blocked_reason,
+        Some(remote_task_runner::error::BlockedReason::SecretUnavailable)
+    );
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert_eq!(owner.attempts_of_task(&task).unwrap().len(), 2);
+    assert_eq!(
+        owner
+            .completion(remote_task_runner::service::completion::Target::Run(
+                id.clone()
+            ))
+            .unwrap()
+            .control_revision,
+        1
+    );
+    drop(owner);
     let count_runs = || {
         let db = rusqlite::Connection::open_with_flags(
             spec.state_dir.join("coordinator.db"),
@@ -1277,4 +1328,197 @@ async fn control_exec_succeeded_compute_but_missing_collection_exits_78() {
     assert_eq!(snapshot.collection_failed_tasks, 1);
     assert_eq!(snapshot.collection_pending_tasks, 0);
     shutdown(&load(&spec)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
+    use remote_task_runner::ids::{RunId, TaskId};
+    use remote_task_runner::service::{completion::Target, control};
+    let (_root, spec, input) = control_fixture();
+    let output = tokio::process::Command::new(&spec.executable)
+        .args([
+            "--json",
+            "exec",
+            "--",
+            "/bin/sh",
+            "-c",
+            "cat input.txt; exit 23",
+        ])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
+        .envs(&spec.env)
+        .current_dir(&input)
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let initial: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let run = RunId::parse(initial["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let task = TaskId::parse(initial["result"]["task_id"].as_str().unwrap()).unwrap();
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let old = owner.attempts_of_task(&task).unwrap().remove(0);
+    drop(owner);
+    std::fs::write(input.join("input.txt"), "changed after initial capture").unwrap();
+    // Retry ignores current project configuration and does not need git.
+    std::fs::write(input.join(".remote-task-runner.toml"), "invalid [ config").unwrap();
+    let client = load(&spec);
+    // Treat this accepted cancellation response as lost by the transport.
+    let cancelled = client
+        .request(Operation::Cancel {
+            target: Target::Run(run.clone()),
+            expected_control_revision: 0,
+            request_id: "lost-cancel-response".into(),
+        })
+        .await
+        .unwrap();
+    let Reply::Cancelled {
+        snapshot: cancel_ack,
+    } = cancelled
+    else {
+        panic!("{cancelled:?}")
+    };
+    assert_eq!(cancel_ack.control_revision, 1);
+    shutdown(&client).await;
+    let retry = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "retry", run.as_str()])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|value| ("LLVM_PROFILE_FILE", value)))
+        .envs(&spec.env)
+        .env("PATH", "/no-git")
+        .current_dir(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&retry.stdout),
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&retry.stdout).unwrap();
+    assert_eq!(value["result"]["state"], "queued");
+    let receipt = value["result"]["retry_receipt"].clone();
+    assert_eq!(receipt["run_id"], run.as_str());
+    assert_eq!(receipt["control_revision"], 2);
+    for forbidden in [
+        "changed after initial capture",
+        "commands",
+        "manifest_digest",
+        "snapshot",
+    ] {
+        assert!(!receipt.to_string().contains(forbidden));
+    }
+    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        control::wait(&spec, Target::Run(run.clone()), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.cli_exit_code, 23);
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let attempts = owner.attempts_of_task(&task).unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0], old);
+    assert_eq!(attempts[1].generation.0, 2);
+    drop(owner);
+    let results =
+        remote_task_runner::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
+    let log = results
+        .read_log(
+            &attempts[1].attempt_id,
+            remote_task_runner::wire::LogStream::Stdout,
+        )
+        .unwrap();
+    assert!(String::from_utf8_lossy(&log).contains("snapshot"));
+    let client = load(&spec);
+    assert!(matches!(
+        client
+            .request(Operation::Cancel {
+                request_id: RunId::generate().to_string(),
+                target: Target::Run(run.clone()),
+                expected_control_revision: 0
+            })
+            .await
+            .unwrap(),
+        Reply::ControlError { .. }
+    ));
+    shutdown(&client).await;
+    let client = ensure(spec.clone()).await.unwrap();
+    let replay = client
+        .request(Operation::Retry {
+            target: Target::Run(run.clone()),
+            expected_control_revision: 1,
+            request_id: receipt["request_id"].as_str().unwrap().into(),
+        })
+        .await
+        .unwrap();
+    let Reply::RetryAccepted { receipt: replayed } = replay else {
+        panic!("{replay:?}")
+    };
+    assert_eq!(serde_json::to_value(replayed).unwrap(), receipt);
+    let sources = remote_task_runner::source::SourceStore::open(&spec.state_dir).unwrap();
+    let source = sources.source_of_run(&run).unwrap().unwrap();
+    let manifest = sources.manifest(&source).unwrap().unwrap();
+    let blob = &manifest.object_manifest.entries[0].hash;
+    std::fs::remove_file(sources.object_store().object_path(blob)).unwrap();
+    let rejected = client
+        .request(Operation::Retry {
+            target: Target::Run(run.clone()),
+            expected_control_revision: 2,
+            request_id: "missing-source".into(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(rejected, Reply::ControlError { .. }),
+        "{rejected:?}"
+    );
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert_eq!(
+        owner
+            .completion(Target::Run(run.clone()))
+            .unwrap()
+            .control_revision,
+        2
+    );
+    assert_eq!(owner.attempts_of_task(&task).unwrap().len(), 2);
+    assert!(
+        !owner
+            .completion(Target::Run(run.clone()))
+            .unwrap()
+            .cancel_requested
+    );
+    drop(owner);
+    let replayed = client
+        .request(Operation::Cancel {
+            target: Target::Run(run.clone()),
+            expected_control_revision: 0,
+            request_id: "lost-cancel-response".into(),
+        })
+        .await
+        .unwrap();
+    let Reply::Cancelled {
+        snapshot: replayed_ack,
+    } = replayed
+    else {
+        panic!("{replayed:?}")
+    };
+    assert_eq!(
+        serde_json::to_value(cancel_ack).unwrap(),
+        serde_json::to_value(replayed_ack).unwrap()
+    );
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let snapshot = owner.completion(Target::Run(run)).unwrap();
+    assert_eq!(snapshot.control_revision, 2);
+    assert!(!snapshot.cancel_requested);
+    drop(owner);
+    shutdown(&client).await;
 }

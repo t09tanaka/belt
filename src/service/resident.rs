@@ -52,6 +52,13 @@ pub struct Request {
 pub enum Operation {
     Cancel {
         target: super::completion::Target,
+        expected_control_revision: u64,
+        request_id: String,
+    },
+    Retry {
+        target: super::completion::Target,
+        expected_control_revision: u64,
+        request_id: String,
     },
     Ping,
     Health,
@@ -84,6 +91,9 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
+    RetryAccepted {
+        receipt: super::completion::RetryReceipt,
+    },
     Cancelled {
         snapshot: super::completion::Snapshot,
     },
@@ -193,7 +203,7 @@ impl Client {
             IO_TIMEOUT
         };
         let request = Request {
-            schema_version: 1,
+            schema_version: 2,
             cluster_id: self.cluster_id.clone(),
             owner_token: self.owner_token.clone(),
             operation,
@@ -209,6 +219,55 @@ struct CapturedInputs {
     vault: crate::secrets::vault::Vault,
     key: crate::secrets::key::ClusterKey,
     env: std::collections::BTreeMap<String, String>,
+}
+
+impl CapturedInputs {
+    /// Validate the original run binding and retained bundle without capture.
+    fn validate_retry(
+        &self,
+        prepared: &crate::storage::PreparedRetry,
+    ) -> crate::storage::Result<bool> {
+        use crate::storage::StorageError;
+        let run = &prepared.run_id;
+        let id = crate::source::classify::ci_id_of(&prepared.source_id)
+            .ok_or_else(|| StorageError::Invalid("invalid retained source".into()))?;
+        let unavailable =
+            || StorageError::Immutable("retained source unavailable; submit a new run".into());
+        if self
+            .sources
+            .source_of_run(run)
+            .map_err(|_| unavailable())?
+            .as_deref()
+            != Some(&id)
+        {
+            return Err(unavailable());
+        }
+        let manifest = self
+            .sources
+            .manifest(&id)
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        for retained in self.sources.closure(&manifest).map_err(|_| unavailable())? {
+            crate::source::store::verify_manifest(&retained).map_err(|_| unavailable())?;
+            for entry in &retained.object_manifest.entries {
+                if !self.sources.has_blob(&entry.hash)
+                    || self.sources.blob_size(&entry.hash) != Some(entry.size)
+                {
+                    return Err(unavailable());
+                }
+            }
+        }
+        let digest = Digest::parse(&manifest.manifest_digest)
+            .or_else(|_| Digest::parse(&format!("sha256:{}", manifest.manifest_digest)))
+            .map_err(|_| unavailable())?;
+        if prepared.manifest_digest != digest {
+            return Err(unavailable());
+        }
+        self.vault
+            .load(run, &manifest.secret_files, &self.key)
+            .map_err(|_| StorageError::SecretUnavailable)?;
+        Ok(!manifest.secret_files.is_empty())
+    }
 }
 
 pub struct Resident {
@@ -598,6 +657,103 @@ impl Drop for Resident {
     }
 }
 
+/// Admission stays open while input IO runs. A prepared token is rechecked at commit.
+struct RetryCommand {
+    target: super::completion::Target,
+    expected: u64,
+    request_id: String,
+}
+async fn retry_control<F, L>(
+    coordinator: Arc<Coordinator>,
+    admission: Arc<Mutex<bool>>,
+    command: RetryCommand,
+    lease: Arc<L>,
+    mut stop: watch::Receiver<bool>,
+    validate: F,
+) -> anyhow::Result<Reply>
+where
+    F: FnOnce(&crate::storage::PreparedRetry) -> crate::storage::Result<bool> + Send + 'static,
+    L: Send + Sync + 'static,
+{
+    let error_reply = |error: crate::storage::StorageError| Reply::ControlError {
+        error: if matches!(error, crate::storage::StorageError::SecretUnavailable) {
+            crate::error::ApiError::blocked(
+                crate::error::BlockedReason::SecretUnavailable,
+                error.to_string(),
+            )
+        } else {
+            crate::error::ApiError::new(error.code(), error.to_string())
+        },
+    };
+    let stopping_reply = || Reply::ControlError {
+        error: crate::error::ApiError::new(
+            crate::error::ErrorCode::CommunicationUnknown,
+            "resident is stopping",
+        ),
+    };
+    if *stop.borrow() {
+        return Ok(stopping_reply());
+    }
+    let owner = coordinator.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        owner
+            .store()
+            .prepare_retry(command.target, command.expected, command.request_id)
+    })
+    .await?;
+    let prepared = match prepared {
+        Ok(crate::storage::RetryPreparation::Replay(receipt)) => {
+            return Ok(Reply::RetryAccepted { receipt })
+        }
+        Ok(crate::storage::RetryPreparation::Prepared(prepared)) => prepared,
+        Err(error) => return Ok(error_reply(error)),
+    };
+    let input_lease = lease.clone();
+    // This detached work owns only metadata, captured inputs and the input lease.
+    let preflight = tokio::task::spawn_blocking(move || {
+        let _lease = input_lease;
+        let validated = validate(&prepared);
+        (prepared, validated)
+    });
+    let (prepared, validated) = tokio::select! {
+        biased;
+        _=stop.wait_for(|stopped| *stopped)=>return Ok(stopping_reply()),
+        result=preflight=>result?,
+    };
+    let verified_secret = match validated {
+        Ok(secret) => secret,
+        Err(error) => return Ok(error_reply(error)),
+    };
+    let gate = tokio::select! {
+        biased;
+        _=stop.wait_for(|stopped| *stopped)=>return Ok(stopping_reply()),
+        gate=admission.lock()=>gate,
+    };
+    if *gate || coordinator.is_fenced() {
+        return Ok(Reply::ControlError {
+            error: crate::error::ApiError::new(
+                if coordinator.is_fenced() {
+                    crate::error::ErrorCode::StaleEpoch
+                } else {
+                    crate::error::ErrorCode::CommunicationUnknown
+                },
+                "resident is stopping",
+            ),
+        });
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        coordinator
+            .store()
+            .commit_retry(prepared, verified_secret, wall_ms())
+    })
+    .await?;
+    drop(gate);
+    Ok(match result {
+        Ok(receipt) => Reply::RetryAccepted { receipt },
+        Err(error) => error_reply(error),
+    })
+}
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: UnixStream,
@@ -612,7 +768,7 @@ async fn handle(
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
-        request.schema_version == 1
+        request.schema_version == 2
             && request.cluster_id == client.cluster_id
             && request.owner_token == client.owner_token,
         "unauthorized parent request"
@@ -643,7 +799,10 @@ async fn handle(
     }
     let mut gate = admission.lock().await;
     let reply = if *gate || coordinator.is_fenced() {
-        if matches!(&request.operation, Operation::Cancel { .. }) {
+        if matches!(
+            &request.operation,
+            Operation::Cancel { .. } | Operation::Retry { .. }
+        ) {
             Reply::ControlError {
                 error: crate::error::ApiError::new(
                     if coordinator.is_fenced() {
@@ -661,42 +820,74 @@ async fn handle(
         }
     } else {
         match request.operation {
-            Operation::Cancel { target } => {
-                let result = match &target {
-                    super::completion::Target::Run(run) => {
-                        coordinator.cancel_run(run.clone()).await
-                    }
-                    super::completion::Target::Task(task) => {
-                        coordinator.cancel_task(task).await.map(|_| ())
+            Operation::Retry {
+                target,
+                expected_control_revision,
+                request_id,
+            } => {
+                drop(gate);
+                let mut stopping = stop.subscribe();
+                let retained = async {
+                    let ownership = tokio::select! {
+                        biased;
+                        _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
+                        ownership=captured.transfer.clone().lock_owned()=>ownership,
+                    };
+                    super::forward::lease(&captured.sources, &mut stopping, ownership).await
+                }.await;
+                let lease = match retained {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        return write_message(
+                            &mut stream,
+                            &Reply::ControlError {
+                                error: crate::error::ApiError::new(
+                                    crate::error::ErrorCode::CommunicationUnknown,
+                                    error.to_string(),
+                                ),
+                            },
+                        )
+                        .await
+                        .map_err(Into::into)
                     }
                 };
-                match result {
-                    Ok(()) => {
-                        let owner = coordinator.clone();
-                        match tokio::task::spawn_blocking(move || owner.store().completion(target))
-                            .await?
-                        {
-                            Ok(snapshot) => Reply::Cancelled { snapshot },
-                            Err(e) => Reply::ControlError {
-                                error: crate::error::ApiError::new(e.code(), e.to_string()),
-                            },
-                        }
-                    }
-                    Err(e) => {
-                        let code = match &e {
-                            crate::coordinator::CoordinatorError::Storage(e) => e.code(),
-                            crate::coordinator::CoordinatorError::Fenced(_) => {
-                                crate::error::ErrorCode::StaleEpoch
-                            }
-                            crate::coordinator::CoordinatorError::Invalid(_) => {
-                                crate::error::ErrorCode::InvalidInput
-                            }
-                            _ => crate::error::ErrorCode::Internal,
-                        };
-                        Reply::ControlError {
-                            error: crate::error::ApiError::new(code, e.to_string()),
-                        }
-                    }
+                let answer = retry_control(
+                    coordinator,
+                    admission,
+                    RetryCommand {
+                        target,
+                        expected: expected_control_revision,
+                        request_id,
+                    },
+                    lease,
+                    stopping,
+                    move |prepared| captured.validate_retry(prepared),
+                )
+                .await?;
+                return write_message(&mut stream, &answer)
+                    .await
+                    .map_err(Into::into);
+            }
+            Operation::Cancel {
+                target,
+                expected_control_revision,
+                request_id,
+            } => {
+                let owner = coordinator.clone();
+                match tokio::task::spawn_blocking(move || {
+                    owner.store().cancel_control(
+                        target,
+                        expected_control_revision,
+                        request_id,
+                        wall_ms(),
+                    )
+                })
+                .await?
+                {
+                    Ok(snapshot) => Reply::Cancelled { snapshot },
+                    Err(error) => Reply::ControlError {
+                        error: crate::error::ApiError::new(error.code(), error.to_string()),
+                    },
                 }
             }
             Operation::Health => match super::macos::RunningIdentity::observe(std::process::id()) {
