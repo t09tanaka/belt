@@ -511,6 +511,11 @@ pub fn plan(
             cwd: root.clone(),
         });
     }
+    // Go 1.21+ otherwise switches/downloads toolchains from go.mod/go.work
+    // or persisted go env settings, violating the captured concrete selection.
+    if tool.as_str() == "go" {
+        env.insert("GOTOOLCHAIN".into(), "local".into());
+    }
     env.insert("COREPACK_ENABLE_NETWORK".into(), "0".into());
     env.insert("RUSTUP_AUTO_INSTALL".into(), "0".into());
     env.insert("MISE_AUTO_INSTALL".into(), "false".into());
@@ -529,6 +534,8 @@ pub fn plan(
         .map(|(name, program)| {
             let argv = if name == "flutter" {
                 vec!["--version".into(), "--machine".into()]
+            } else if name == "go" {
+                vec!["version".into()]
             } else {
                 vec!["--version".into()]
             };

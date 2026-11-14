@@ -28,6 +28,14 @@ executor, a private working directory/HOME/config/cache/tmp, and these mappings:
 | fvm | flutter | `install <exact> --skip-pub-get`, private FVM_CACHE_PATH, explicit SDK setup before finalization |
 | corepack | npm, pnpm, yarn | `install --global <manager>@<exact>[+sha…]` within unique private COREPACK_HOME, then `enable --install-directory <private-bin> <manager>` |
 
+Go probes use `go version`. Go probe and consumer environments force
+`GOTOOLCHAIN=local`, overriding base environment values so module/workspace
+requirements and persisted Go settings cannot switch or download another
+compiler. A project requiring a newer compiler fails with the selected local
+compiler rather than changing the frozen receipt. See [Go toolchain
+selection](https://go.dev/doc/toolchain#select) and [Go version
+command](https://pkg.go.dev/cmd/go#hdr-Print_Go_version).
+
 Corepack's private LastKnownGood is allowed; host defaults are untouched.
 Corepack activation disables project-spec/default-to-latest/network/auto-pin and
 `.corepack.env` loading. Distribution integrity is passed as the frozen Corepack

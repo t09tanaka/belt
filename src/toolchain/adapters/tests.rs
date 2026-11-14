@@ -733,3 +733,49 @@ fn restored_invalid_integrity_never_reaches_installer() {
         "invalid_distribution_integrity"
     );
 }
+
+#[test]
+fn go_probe_and_consumer_cannot_switch_the_frozen_toolchain() {
+    let f = fixture(AdapterKind::Mise, "go");
+    let (_, probe) = &f.plan.probes[0];
+    assert_eq!(probe.program.file_name().unwrap(), "go");
+    assert_eq!(probe.argv, vec!["version"]);
+    assert_eq!(probe.env["GOTOOLCHAIN"], "local");
+    let mut fake = Fake::for_plan(&f.plan);
+    let receipt = install_admitted(&f.plan, &mut fake).unwrap();
+    assert_eq!(fake.calls.last().unwrap().argv, vec!["version"]);
+    assert_eq!(fake.calls.last().unwrap().env["GOTOOLCHAIN"], "local");
+    let mut expected = None;
+    for setting in [None, Some("auto"), Some("go1.99.0+auto"), Some("go1.99.0")] {
+        let mut env = base_env(&f.plan);
+        if let Some(value) = setting {
+            env.insert("GOTOOLCHAIN".into(), value.into());
+        }
+        let activation = activate(
+            &f.plan,
+            &receipt,
+            Digest::of_bytes(b"base"),
+            &env,
+            Digest::of_bytes(b"policy"),
+            &f.shell,
+        )
+        .unwrap();
+        assert_eq!(activation.environment["GOTOOLCHAIN"], "local");
+        assert_eq!(activation.environment["HOME"], env["HOME"]);
+        if let Some(previous) = &expected {
+            assert_eq!(previous, &activation.execution_fingerprint);
+        } else {
+            expected = Some(activation.execution_fingerprint);
+        }
+    }
+    // A different observed Go version still cannot publish a valid receipt.
+    let wrong = fixture(AdapterKind::Mise, "go");
+    let mut fake = Fake::for_plan(&wrong.plan);
+    fake.wrong = true;
+    assert_eq!(
+        install_admitted(&wrong.plan, &mut fake),
+        Err("installed_version_mismatch")
+    );
+    assert!(!wrong.plan.root.join("receipt.json").exists());
+    assert!(matches!(detect(&wrong.plan), Availability::Unknown(_)));
+}
