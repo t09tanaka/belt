@@ -337,6 +337,20 @@ pub fn execute_task(
     opts: Opts,
 ) -> Result<TaskResult> {
     fp.require_git_source()?;
+    let runner = Runner::new(ctx, fp, ws, opts)?;
+    execute_with_runner(ctx, fp, task_id, inputs, prepared, ws, runner)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_with_runner(
+    ctx: &ExecContext,
+    fp: &FrozenPlan,
+    task_id: &str,
+    inputs: &TaskInputs,
+    prepared: Option<(&PreparedReceipt, &TemplateContext)>,
+    ws: &Workspace,
+    runner: Runner<'_>,
+) -> Result<TaskResult> {
     let task = fp
         .task(task_id)
         .ok_or_else(|| anyhow!("the plan has no task `{task_id}`"))?;
@@ -344,8 +358,8 @@ pub fn execute_task(
     if let Some((receipt, _)) = prepared {
         crate::wire::check_version("receipt", receipt.schema_version)?;
     }
-    let keep = opts.keep;
-    let runner = Runner::new(ctx, fp, ws, opts)?;
+    let keep = runner.opts.keep;
+
     // as in a run: an artifact step local-ci cannot run fails the task's jobs
     // before anything is started
     if let Some(r) = runner.refused_task(task) {

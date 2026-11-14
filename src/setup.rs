@@ -427,7 +427,7 @@ pub struct PreparedReceipt {
     pub schema_version: u32,
     /// Digest of the [`TemplateKey`] it was made for.
     pub template_key: String,
-    /// The commit it was prepared on.
+    /// The Git commit or prefixed captured manifest identity it was prepared on.
     pub source: String,
     /// The id of the workspace it was prepared in (see [`workspace_id`]). A
     /// task believes the receipt only in the workspace that has this id.
