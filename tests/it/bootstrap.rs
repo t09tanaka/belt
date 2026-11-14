@@ -52,6 +52,74 @@ fn fixture() -> (tempfile::TempDir, Spec) {
     }
     (root, spec)
 }
+// Decode only public diagnostic enums. Journal payloads also contain private
+// commands, paths and arbitrary remote error messages; never format those.
+fn coordinator_event_summary(
+    event: &remote_task_runner::storage::Event,
+) -> (
+    &str,
+    Option<remote_task_runner::error::ErrorCode>,
+    Option<remote_task_runner::error::BlockedReason>,
+) {
+    let code = event
+        .payload
+        .get("code")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    let reason = event
+        .payload
+        .get("reason")
+        .or_else(|| event.payload.get("blocked_reason"))
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok());
+    (&event.kind, code, reason)
+}
+
+fn diagnose_coordinator(spec: &Spec) {
+    let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) else {
+        eprintln!("coordinator journal readable=false");
+        return;
+    };
+    let Ok(events) = store.events_after(0, 128) else {
+        eprintln!("coordinator journal readable=false");
+        return;
+    };
+    for event in events.iter().rev().take(32).rev() {
+        let (kind, code, reason) = coordinator_event_summary(event);
+        eprintln!("coordinator event: {kind} code={code:?} reason={reason:?}");
+    }
+}
+
+#[test]
+fn coordinator_timeout_diagnostic_keeps_only_kind_and_typed_codes() {
+    let mut event = remote_task_runner::storage::Event {
+        seq: 1,
+        run_id: None,
+        attempt_id: None,
+        attempt_seq: None,
+        kind: "submit_deferred".into(),
+        at_ms: 0,
+        payload: serde_json::json!({"code":"BLOCKED", "reason":"secret_unavailable",
+            "message":"PRIVATE_DIAGNOSTIC_SENTINEL", "payload":{"env":"PRIVATE_DIAGNOSTIC_SENTINEL"}}),
+    };
+    assert_eq!(
+        coordinator_event_summary(&event),
+        (
+            "submit_deferred",
+            Some(remote_task_runner::error::ErrorCode::Blocked),
+            Some(remote_task_runner::error::BlockedReason::SecretUnavailable)
+        )
+    );
+    assert!(
+        !format!("{:?}", coordinator_event_summary(&event)).contains("PRIVATE_DIAGNOSTIC_SENTINEL")
+    );
+    event.payload = serde_json::json!({"code":"PRIVATE_DIAGNOSTIC_SENTINEL", "reason":"PRIVATE_DIAGNOSTIC_SENTINEL"});
+    assert_eq!(
+        coordinator_event_summary(&event),
+        ("submit_deferred", None, None)
+    );
+}
+
 // Private fixture metadata only: never dump argv, env, paths, journal payloads,
 // or arbitrary parse errors. Cap reads even when a child leaves malformed files.
 pub(super) fn diagnose_attempt(spec: &Spec, attempt: &remote_task_runner::ids::AttemptId) {
@@ -672,6 +740,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
                 })
                 .await;
             eprintln!("timed out task snapshot: {snapshot:?}");
+            diagnose_coordinator(&spec);
             if let Ok(Reply::Task { attempts }) = &snapshot {
                 let worker = remote_task_runner::storage::WorkerStore::open_read_only(
                     &spec.worker_state_dir,
