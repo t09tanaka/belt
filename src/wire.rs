@@ -2162,6 +2162,22 @@ mod tests {
     }
 
     fn responses() -> Vec<Response> {
+        let forecast = ForecastResponse {
+            schema_version: SV,
+            worker_id: worker(),
+            worker_boot_id: boot(),
+            agent_epoch: AgentEpoch(2),
+            snapshot_digest: dg("s"),
+            policy_digest: dg("p"),
+            ttl_ms: 2000,
+            coverage: vec![Coverage {
+                attempt_id: aid(),
+                plan_digest: dg("prev"),
+                expansion_seq: 1,
+                node_ids: vec![node("setup"), node("test")],
+            }],
+            target: target(),
+        };
         let mut out = vec![
             Response::Hello(HelloResponse {
                 capabilities: None,
@@ -2192,22 +2208,7 @@ mod tests {
                 disk_free_bytes: 1 << 30,
                 draining: false,
             }),
-            Response::Forecast(ForecastResponse {
-                schema_version: SV,
-                worker_id: worker(),
-                worker_boot_id: boot(),
-                agent_epoch: AgentEpoch(2),
-                snapshot_digest: dg("s"),
-                policy_digest: dg("p"),
-                ttl_ms: 2000,
-                coverage: vec![Coverage {
-                    attempt_id: aid(),
-                    plan_digest: dg("prev"),
-                    expansion_seq: 1,
-                    node_ids: vec![node("setup"), node("test")],
-                }],
-                target: target(),
-            }),
+            Response::Forecast(forecast.clone()),
             Response::SubmitAttempt(SubmitAttemptResponse {
                 schema_version: SV,
                 attempt_id: aid(),
@@ -2342,9 +2343,7 @@ mod tests {
                 }],
             }),
         ];
-        if let Response::Forecast(answer) = out[2].clone() {
-            out.push(Response::ForecastCommand(answer));
-        }
+        out.push(Response::ForecastCommand(forecast));
         out.push(Response::ResolveToolchains(ResolveToolchainsResponse {
             schema_version: SV,
             bundle: frozen_bundle(),

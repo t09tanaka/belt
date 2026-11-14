@@ -600,3 +600,10 @@ CI計画summaryをcoverage/mutation対象へ登録し、shard group数の4096/40
 follow pagination（64/64/2件と次pass）、readonly estimate、actor解放、owner reset・同世代attachment置換・InputGate無効化、malformed page、remote age/TTL/clock逆行、永続初回stamp・競合・eviction watermark、namespace上限、queue full・writer故障を確認した。関連18テスト成功後、追加境界を含むfollowの4テストも成功（重複を除き19件）。all-target型検査・strict clippy・fmt/diff確認も成功。これは限定検証で、統合全体CI・新しいwarm/resourceモデルの検証ではない。
 
 独立レビューで、構造正常な期限切れ観測がpage全体を巻き戻し、古い先頭64件を越えられなくなるP2を修正した。identity/sequence/clock等の構造不正はpage全体を拒否し、TTL超・親native uptimeへのmapping不能な観測だけをskipしてvalid cursorを進める。64件の古いprefixからfreshな後続pageへの到達、再接続・親restart、全expired完了pass後のfresh insertを含む関連21テストとstrict all-target clippyが成功した。全体CIはこの修正では再実行していない。
+
+
+### 統合CIの再検証で見つかった問題（2026-11-15）
+
+`98945fc` の全体ローカルCIは2成功・4失敗・2取消・1skip、50分42秒で終了した。通常UbuntuとMSRV名のジョブは成功したが、ローカルRustは1.100であり1.89確認ではない。通常macOS名のbootstrapはEnvironmentMismatchによる未受理、coverageはcapability390/391行・wire1709/1710行、mutation2/3は回収fixtureの64件期待に対し63/60件でbaseline失敗した。mutation0/1は取消で、完全な変異検出結果は無い。
+
+mutation routing traceではGit起動がfixture開始7秒後となり、5秒でready FIFO読取側が閉じていた。所有FIFOへの一時readerで自然解放したが、その実行を成功gateに使わない。ready/release両FDをstartup完了まで保持する修正を統合した。初期Git到達待ちはbootstrapの20秒契約と合わせ、executor応答の5秒watchdogは維持した。6秒遅延Gitが成功し、同期startupへ一時的に戻す退行は5.57秒で検出、最終fixtureも成功して製品sourceは復元済み。残るprofile観測・回収fixture・pure不足を修正してから、コミット済み統合HEADの全CIを再実行する。

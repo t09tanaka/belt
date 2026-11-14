@@ -265,6 +265,31 @@ mod tests {
         let selected = FrozenBundle::seal_exact(frozen).unwrap();
         selected.validate(&selected.frozen.source_manifest).unwrap();
         assert!(missing_with_installable(&required, Some(&report), Some(&selected)).is_empty());
+        assert_eq!(
+            missing_with_installable(&required, Some(&report), None),
+            vec!["Tool(\"node\") unavailable"],
+            "without a verified installable bundle, unavailable native node remains required",
+        );
+        let constrained = ExecutionRequirements::parse(
+            Some("other".into()),
+            &[
+                "node".into(),
+                "os:linux".into(),
+                "arch:x86_64".into(),
+                "feature:blob_resume".into(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            missing_with_installable(&constrained, Some(&report), Some(&selected)),
+            vec![
+                "profile other unavailable",
+                "Os(\"linux\") unavailable",
+                "Arch(\"x86_64\") unavailable",
+                "Feature(\"blob_resume\") unavailable",
+            ],
+            "installable node never waives profile, OS, architecture or feature constraints",
+        );
         assert_eq!(report, before);
         assert!(!missing(&required, Some(&report)).is_empty());
     }

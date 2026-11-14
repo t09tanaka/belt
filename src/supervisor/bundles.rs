@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn refuses_selected_hostile_entries_and_bounds_but_does_not_follow_git() {
         use std::os::unix::ffi::OsStrExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         let ws = dir.path().join("ws");
         let root = dir.path().join("spool");
         fs::create_dir_all(ws.join(".git")).unwrap();

@@ -3954,6 +3954,64 @@ async fn capabilities_detect_tool_drift_but_keep_accepted_replays_idempotent() {
 }
 
 #[tokio::test]
+async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed() {
+    use remote_task_runner::toolchain::{capability::ExecutionRequirements, profile::Profile};
+    for required_profile_tool in [false, true] {
+        let f = fx();
+        let bin = f.path("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let marker = f.path("probe-fails");
+        let node = bin.join("node");
+        std::fs::write(
+            &node,
+            format!("#!/bin/sh\nif [ -f {marker:?} ]; then exit 1; fi\necho v22.0.0\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if required_profile_tool {
+            let path = f.state().join("profiles.toml");
+            std::fs::create_dir_all(f.state()).unwrap();
+            std::fs::write(&path, format!("schema_version=1\nactive='test'\n[profiles.test]\npath=[{bin:?}]\nshell='/bin/sh'\ncache_namespace='test'\nrequired_tools=['node']\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let profile = Profile::load(
+            &f.state(),
+            &[("PATH".into(), bin.to_str().unwrap().into())].into(),
+        )
+        .unwrap();
+        let mut cfg = f.cfg("boot-1");
+        cfg.profile = profile.name().into();
+        cfg.profile_fingerprint = profile.report().profile_fingerprint;
+        cfg.capability_profile = Some(Arc::new(profile));
+        let agent = f.start_with(cfg);
+        let client = f.connect(&agent).await;
+        std::fs::write(&marker, "fail").unwrap();
+        let mut p = payload("exit 0");
+        p.commands[0].env.clear();
+        let a = AttemptId::generate();
+        if required_profile_tool {
+            let error = call(&client, submit_req(&a, &p)).await.unwrap_err();
+            assert_eq!(
+                error.blocked_reason,
+                Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+            );
+            assert!(f.store().get(&a).unwrap().is_none());
+        } else {
+            submit(&client, &a, &p).await;
+            assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+            p.requirements = ExecutionRequirements::parse(None, &["node".into()]).unwrap();
+            let b = AttemptId::generate();
+            let error = call(&client, submit_req(&b, &p)).await.unwrap_err();
+            assert_eq!(
+                error.blocked_reason,
+                Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+            );
+            assert!(f.store().get(&b).unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn capability_negotiation_is_required_even_if_worker_has_the_profile() {
     use remote_task_runner::toolchain::{
         capability::{ExecutionRequirements, FEATURE},

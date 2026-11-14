@@ -2181,34 +2181,51 @@ async fn active_pages_above_64_and_hot_logs_do_not_starve_terminal_artifacts() {
         scan: u32::MAX,
         ..cfg()
     };
-    c.collect(&files, wide).await.unwrap();
-    assert_eq!(
+    let progress = || {
         attempts
             .iter()
-            .filter(|a| c
-                .store()
-                .log_progress(a, LogStream::Stdout)
-                .unwrap()
-                .is_some())
-            .count(),
-        64
-    );
-    c.collect(&files, wide).await.unwrap();
-    for a in &attempts {
+            .map(|a| {
+                c.store()
+                    .log_progress(a, LogStream::Stdout)
+                    .unwrap()
+                    .map_or(0, |p| p.committed_bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    // The live half of the wall budget can stop a page before its 64th
+    // target, especially when durable writes run under instrumentation.
+    // Follow the cursor across bounded passes instead of requiring a full page.
+    let mut before = progress();
+    for pass in 0..attempts.len() * 2 {
+        let report = c.collect(&files, wide).await.unwrap();
+        assert!(report.faults.is_empty(), "{:?}", report.faults);
+        let after = progress();
+        let changed = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+        assert!(changed > 0, "live collection stalled on pass {pass}");
+        assert!(changed <= 64, "one pass advanced {changed} targets");
+        for (old, new) in before.iter().zip(&after) {
+            assert!(*new >= *old && *new - *old <= 65_536);
+        }
+        if pass == 0 {
+            assert!(after.iter().filter(|bytes| **bytes > 0).count() <= 64);
+            assert!(after.contains(&0));
+        }
+        before = after;
+        if before.iter().all(|bytes| *bytes > 0) {
+            break;
+        }
+    }
+    assert!(before.iter().all(|bytes| *bytes > 0), "{before:?}");
+    for (a, bytes) in attempts.iter().zip(&before) {
+        let stored = c
+            .store()
+            .log_progress(a, LogStream::Stdout)
+            .unwrap()
+            .unwrap();
+        assert!(!stored.eof);
         assert_eq!(
-            c.store()
-                .log_progress(a, LogStream::Stdout)
-                .unwrap()
-                .unwrap()
-                .committed_bytes,
-            65_536
-        );
-        assert!(
-            !c.store()
-                .log_progress(a, LogStream::Stdout)
-                .unwrap()
-                .unwrap()
-                .eof
+            files.read_log(a, LogStream::Stdout).unwrap(),
+            vec![0xff; *bytes as usize]
         );
     }
     // One target turns terminal while the others remain hot. The independent
@@ -2220,13 +2237,21 @@ async fn active_pages_above_64_and_hot_logs_do_not_starve_terminal_artifacts() {
     let report = c.collect(&files, wide).await.unwrap();
     assert_eq!(report.collected, vec![terminal.clone()]);
     assert_eq!(fx.w.acks(&terminal).len(), 1);
-    assert!(attempts.iter().filter(|a| *a != &terminal).any(|a| c
-        .store()
-        .log_progress(a, LogStream::Stdout)
-        .unwrap()
-        .unwrap()
-        .committed_bytes
-        > 65_536));
+    assert_eq!(
+        published(&files, &terminal, "alpha.txt").as_deref(),
+        Some(ALPHA)
+    );
+    assert_eq!(
+        published(&files, &terminal, "reports/beta.bin").as_deref(),
+        Some(BETA)
+    );
+    assert!(attempts.iter().zip(&before).any(|(a, old)| a != &terminal
+        && c.store()
+            .log_progress(a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes
+            > *old));
 }
 
 #[tokio::test]
