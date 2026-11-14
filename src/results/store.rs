@@ -104,6 +104,15 @@ pub struct ResultStore {
     /// The `.part` files this process began at their first byte.
     begun: Arc<Mutex<HashSet<PathBuf>>>,
     crash: Arc<Mutex<Option<Crash>>>,
+    #[cfg(test)]
+    append_pause: Arc<Mutex<Option<AppendPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct AppendPause {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
 }
 
 /// A read-only handle to the store. Opening it creates no directories and it
@@ -366,6 +375,8 @@ impl ResultStore {
             root: root.to_path_buf(),
             begun: Arc::default(),
             crash: Arc::default(),
+            #[cfg(test)]
+            append_pause: Arc::default(),
         })
     }
 
@@ -550,6 +561,19 @@ impl ResultStore {
     }
 
     /// Append to a stream at `offset` (its length) and sync.
+    #[cfg(test)]
+    pub(crate) fn pause_next_log_append(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, receive_entered) = std::sync::mpsc::channel();
+        let (resume, receive_resume) = std::sync::mpsc::channel();
+        *self.append_pause.lock().unwrap() = Some(AppendPause {
+            entered,
+            resume: receive_resume,
+        });
+        (receive_entered, resume)
+    }
+
     pub fn append_log(
         &self,
         attempt: &AttemptId,
@@ -558,6 +582,14 @@ impl ResultStore {
         data: &[u8],
     ) -> Result<u64> {
         let len = append_at(&self.log_path(attempt, stream), offset, data)?;
+        #[cfg(test)]
+        if let Some(pause) = self.append_pause.lock().unwrap().take() {
+            let _ = pause.entered.send(());
+            // A failed test must not leave a detached blocking job forever.
+            let _ = pause
+                .resume
+                .recv_timeout(std::time::Duration::from_secs(15));
+        }
         self.passed(Crash::LogAppended)?;
         Ok(len)
     }

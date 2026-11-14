@@ -54,6 +54,7 @@ struct Out {
     artifacts: Vec<(ArtifactRecord, Vec<u8>)>,
     not_stored: Vec<ArtifactNotStored>,
     log: Vec<u8>,
+    stderr: Vec<u8>,
     /// The spool is closed: the log has its end mark.
     log_closed: bool,
     dropped: u64,
@@ -78,6 +79,7 @@ struct State {
     corrupt_chunks: u32,
     /// The next chunk says it is from one byte further.
     shift_chunk: bool,
+    shift_log: bool,
     /// What was left behind for an attempt that has no result yet is stored
     /// as its result the moment an acknowledgement arrives.
     result_appears_on_ack: bool,
@@ -261,17 +263,20 @@ impl Worker {
                 }))
             }
             Request::ReadLog(r) => {
-                job_of(&mut s, &r.attempt_id)?;
+                if !s.jobs.contains_key(&r.attempt_id) {
+                    return Err(err(ErrorCode::NotFound));
+                }
+                let shift = std::mem::take(&mut s.shift_log);
                 let out = &s.jobs[&r.attempt_id].out;
                 let log: &[u8] = match r.stream {
                     LogStream::Stdout => &out.log,
-                    LogStream::Stderr => &[],
+                    LogStream::Stderr => &out.stderr,
                 };
                 let from = (r.offset as usize).min(log.len());
                 let to = (from + r.max_bytes.max(1) as usize).min(log.len());
                 Ok(Response::ReadLog(ReadLogResponse {
                     schema_version: SchemaVersion::CURRENT,
-                    offset: r.offset,
+                    offset: r.offset + u64::from(shift),
                     data: Bytes(log[from..to].to_vec()),
                     next_offset: to as u64,
                     eof: out.log_closed && to == log.len(),
@@ -567,6 +572,7 @@ fn full(fx: &Fx, a: &AttemptId) -> Out {
         ],
         not_stored: vec![],
         log: LOG.to_vec(),
+        stderr: vec![],
         log_closed: true,
         dropped: 0,
     }
@@ -689,7 +695,7 @@ async fn the_outputs_are_fetched_verified_published_and_acknowledged_last() {
     assert_eq!(fx.w.count("result"), 1);
     assert_eq!(fx.w.count("ack"), 1);
     assert_eq!(fx.w.offsets("blob"), vec![0, 4, 8, 0, 4]);
-    assert_eq!(fx.w.offsets("log"), vec![0, 4, 8, 0]);
+    assert_eq!(fx.w.offsets("log"), vec![0, 0, 0, 4, 8, 0]);
     let row = c.store().collection(&a).unwrap().unwrap();
     let logs = row.logs.unwrap();
     assert_eq!(logs["stdout"]["bytes"], 10);
@@ -1254,7 +1260,8 @@ async fn collected_results_are_kept_for_the_retention_and_then_deleted() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
     end(&fx, &c, &b, Outcome::Succeeded, full(&fx, &b)).await;
-    fx.w.set(|s| s.trip = Some(("log", 5, Lost::Request)));
+    let next_log = fx.w.count("log") + 1;
+    fx.w.set(|s| s.trip = Some(("log", next_log, Lost::Request)));
     assert_eq!(collect(&c, &files).await.pending, vec![b.clone()]);
 
     // The retention runs from the later of the end and the collection.
@@ -1351,7 +1358,7 @@ async fn a_parent_that_dies_between_a_file_operation_and_its_record_continues_fr
 }
 
 #[tokio::test]
-async fn what_is_not_on_disk_as_recorded_is_collected_again_before_the_acknowledgement() {
+async fn missing_result_and_artifacts_are_collected_again_before_the_acknowledgement() {
     let fx = fx();
     let (c, files) = fx.open();
     let (_, _, a) = placed(&fx, &c, two()).await;
@@ -1361,10 +1368,9 @@ async fn what_is_not_on_disk_as_recorded_is_collected_again_before_the_acknowled
     assert_eq!(persisted(&c, &a).len(), 2);
 
     // Everything is recorded as collected; then the disk loses the result
-    // and one artifact, and damages the log and the other artifact.
+    // and one artifact, and damages the other artifact.
     let dir = files.root().join(a.as_str());
     std::fs::remove_file(dir.join("result.json")).unwrap();
-    std::fs::write(dir.join("logs").join("stdout.log"), b"HELLO log\n").unwrap();
     std::fs::remove_file(dir.join("artifacts").join(hex(ALPHA))).unwrap();
     std::fs::write(dir.join("artifacts").join(hex(BETA)), b"abcdeX").unwrap();
     fx.w.set(|s| s.offline = false);
@@ -1375,13 +1381,13 @@ async fn what_is_not_on_disk_as_recorded_is_collected_again_before_the_acknowled
     assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
     assert_all_here(&fx, &c, &files, &a);
     assert_eq!(fx.w.count("blob"), blobs + 5);
-    assert!(fx.w.count("log") > logs);
+    assert_eq!(fx.w.count("log"), logs);
     assert_eq!(fx.w.count("result"), 1);
     assert_eq!(fx.w.acks(&a).len(), 1);
     assert_eq!(strikes(&c, &a), 0);
     let events = c.store().events_of(&a, "collection_recollect").unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].payload["logs"], true);
+    assert_eq!(events[0].payload["logs"], false);
     assert_eq!(
         events[0].payload["artifacts"],
         json!(["alpha.txt", "reports/beta.bin"])
@@ -1660,6 +1666,7 @@ async fn names_that_are_one_path_on_the_parent_are_each_collected() {
         artifacts: all.iter().map(|(n, b)| stored(&a, &p, n, b)).collect(),
         not_stored: vec![],
         log: LOG.to_vec(),
+        stderr: vec![],
         log_closed: true,
         dropped: 0,
     };
@@ -1743,4 +1750,468 @@ async fn a_name_that_is_published_is_not_fetched_over_with_other_bytes() {
     assert!(fx.w.acks(&a).is_empty());
     assert_eq!(published(&files, &a, "alpha.txt").as_deref(), Some(ALPHA));
     assert!(!files.artifact_path(&a, &other).exists());
+}
+
+// ------------------------------------------------ durable active prefixes
+
+#[tokio::test]
+async fn active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    let raw = b"a\xff\x00bcdef";
+    fx.w.set(|s| {
+        let job = s.jobs.get_mut(&a).unwrap();
+        job.state = AttemptState::Active;
+        job.out.log = raw.to_vec();
+        job.out.stderr = b"\xfe\xff".to_vec();
+    });
+    c.tick().await.unwrap();
+    assert_eq!(
+        c.store().get_attempt(&a).unwrap().unwrap().state,
+        AttemptState::Active
+    );
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&a, LogStream::Stderr).unwrap(), b"\xfe\xff");
+    let p = c
+        .store()
+        .log_progress(&a, LogStream::Stdout)
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.committed_bytes, 4);
+    assert!(!p.eof);
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), &raw[..4]);
+    assert!(c.store().collection(&a).unwrap().is_none());
+    assert!(!is_collected(&c, &a));
+    assert!(fx.w.acks(&a).is_empty());
+    // Reopening uses the DB prefix, not the physical length, including a
+    // durable append that never reached its paired DB commit.
+    files
+        .append_log(&a, LogStream::Stdout, 4, b"uncommitted")
+        .unwrap();
+    drop(c);
+    let (c, files) = fx.open();
+    fx.w.set(|s| {
+        s.offline = true;
+        s.ops.clear();
+    });
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), &raw[..4]);
+    fx.w.set(|s| s.offline = false);
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), raw);
+    assert!(fx.w.state.lock().unwrap().ops.contains(&("log", 4)));
+    // Empty without an end mark remains active, including repeated polls.
+    for _ in 0..3 {
+        collect(&c, &files).await;
+    }
+    assert!(
+        !c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .eof
+    );
+    end(
+        &fx,
+        &c,
+        &a,
+        Outcome::Succeeded,
+        Out {
+            has_result: true,
+            log: raw.to_vec(),
+            stderr: b"\xfe\xff".to_vec(),
+            log_closed: true,
+            ..Out::default()
+        },
+    )
+    .await;
+    assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), raw);
+    assert_eq!(fx.w.acks(&a).len(), 1);
+}
+
+#[tokio::test]
+async fn a_short_published_active_prefix_is_an_error_and_is_never_reset() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| s.jobs.get_mut(&a).unwrap().out.log = b"abcdef".to_vec());
+    collect(&c, &files).await;
+    std::fs::write(files.log_path(&a, LogStream::Stdout), b"a").unwrap();
+    fx.w.set(|s| s.ops.clear());
+    let report = collect(&c, &files).await;
+    assert!(report.faults.iter().any(|(id, _)| id == &a));
+    assert_eq!(
+        c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes,
+        4
+    );
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"a");
+    assert!(!fx.w.state.lock().unwrap().ops.contains(&("log", 4)));
+}
+
+#[tokio::test]
+async fn active_log_response_with_malformed_offset_publishes_no_bytes() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| {
+        s.jobs.get_mut(&a).unwrap().out.log = b"abcdef".to_vec();
+        s.shift_log = true;
+    });
+    let report = collect(&c, &files).await;
+    assert!(report
+        .faults
+        .iter()
+        .any(|(id, why)| id == &a && why.contains("offset")));
+    assert_eq!(
+        c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes,
+        0
+    );
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"");
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"abcd");
+}
+
+#[tokio::test]
+async fn published_log_digest_corruption_fails_closed_before_ack() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    end(
+        &fx,
+        &c,
+        &a,
+        Outcome::Succeeded,
+        Out {
+            has_result: true,
+            log: LOG.to_vec(),
+            log_closed: true,
+            ..Out::default()
+        },
+    )
+    .await;
+    fx.w.set(|s| s.trip = Some(("ack", 1, Lost::Request)));
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    std::fs::write(files.log_path(&a, LogStream::Stdout), b"HELLO log\n").unwrap();
+    fx.w.set(|s| s.offline = false);
+    let report = collect(&c, &files).await;
+    assert!(report
+        .faults
+        .iter()
+        .any(|(id, why)| id == &a && why.contains("published log prefix")));
+    assert!(fx.w.acks(&a).is_empty());
+    assert_eq!(
+        files.read_log(&a, LogStream::Stdout).unwrap(),
+        b"HELLO log\n"
+    );
+    assert_eq!(
+        c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes,
+        LOG.len() as u64
+    );
+}
+
+#[tokio::test]
+async fn active_pages_above_64_and_hot_logs_do_not_starve_terminal_artifacts() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (run, _, first) = placed(&fx, &c, two()).await;
+    let base = fx.w.payload(&first);
+    let mut attempts = vec![first];
+    for _ in 1..70 {
+        let task = TaskId::generate();
+        let a = AttemptId::generate();
+        let mut payload = base.clone();
+        payload.task_id = task.clone();
+        let db = c.store();
+        db.create_task(&task, &run, &json!({}), 1).unwrap();
+        db.create_attempt(
+            remote_task_runner::storage::NewAttempt {
+                attempt_id: a.clone(),
+                task_id: task.clone(),
+                worker_id: fx.w.id.clone(),
+                payload_hash: payload_hash(&payload).unwrap(),
+                permit_id: None,
+            },
+            1,
+        )
+        .unwrap();
+        let placement = db
+            .record_placement(&task, &fx.w.id, Some(&a), &json!({"payload": payload}), 1)
+            .unwrap();
+        db.ack_placement(placement, 1).unwrap();
+        let mut receipts = Receipts::default();
+        receipts.mark(Receipt::WorkerAccepted, 1);
+        db.record_seen(
+            &a,
+            true,
+            Some(Seen {
+                state: AttemptState::Active,
+                termination: None,
+                receipts,
+            }),
+            Observation::Known,
+            1,
+        )
+        .unwrap();
+        fx.w.set(|s| {
+            s.jobs.insert(
+                a.clone(),
+                Job {
+                    payload,
+                    state: AttemptState::Active,
+                    termination: None,
+                    out: Out::default(),
+                    acks: vec![],
+                },
+            );
+        });
+        attempts.push(a);
+    }
+    fx.w.set(|s| {
+        for job in s.jobs.values_mut() {
+            job.out.log = vec![0xff; 140_000];
+        }
+    });
+    let wide = CollectConfig {
+        chunk_bytes: u32::MAX,
+        scan: u32::MAX,
+        ..cfg()
+    };
+    c.collect(&files, wide).await.unwrap();
+    assert_eq!(
+        attempts
+            .iter()
+            .filter(|a| c
+                .store()
+                .log_progress(a, LogStream::Stdout)
+                .unwrap()
+                .is_some())
+            .count(),
+        64
+    );
+    c.collect(&files, wide).await.unwrap();
+    for a in &attempts {
+        assert_eq!(
+            c.store()
+                .log_progress(a, LogStream::Stdout)
+                .unwrap()
+                .unwrap()
+                .committed_bytes,
+            65_536
+        );
+        assert!(
+            !c.store()
+                .log_progress(a, LogStream::Stdout)
+                .unwrap()
+                .unwrap()
+                .eof
+        );
+    }
+    // One target turns terminal while the others remain hot. The independent
+    // final quota still fetches its artifact and ACKs in the same pass.
+    let terminal = attempts[0].clone();
+    let mut out = full(&fx, &terminal);
+    out.log = vec![0xff; 140_000];
+    end(&fx, &c, &terminal, Outcome::Succeeded, out).await;
+    let report = c.collect(&files, wide).await.unwrap();
+    assert_eq!(report.collected, vec![terminal.clone()]);
+    assert_eq!(fx.w.acks(&terminal).len(), 1);
+    assert!(attempts.iter().filter(|a| *a != &terminal).any(|a| c
+        .store()
+        .log_progress(a, LogStream::Stdout)
+        .unwrap()
+        .unwrap()
+        .committed_bytes
+        > 65_536));
+}
+
+#[tokio::test]
+async fn reaching_the_parent_log_cap_does_not_fabricate_an_end_mark() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| s.jobs.get_mut(&a).unwrap().out.log = b"abcdef".to_vec());
+    let cap = CollectConfig {
+        max_log_bytes: 4,
+        ..cfg()
+    };
+    c.collect(&files, cap).await.unwrap();
+    c.collect(&files, cap).await.unwrap();
+    let progress = c
+        .store()
+        .log_progress(&a, LogStream::Stdout)
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.committed_bytes, 4);
+    assert!(!progress.eof);
+    assert!(c.store().collection(&a).unwrap().is_none());
+    assert!(fx.w.acks(&a).is_empty());
+}
+
+#[tokio::test]
+async fn unpublished_legacy_final_log_corruption_can_be_refetched_before_ack() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    end(
+        &fx,
+        &c,
+        &a,
+        Outcome::Succeeded,
+        Out {
+            has_result: true,
+            log: LOG.to_vec(),
+            log_closed: true,
+            ..Out::default()
+        },
+    )
+    .await;
+    fx.w.set(|s| s.trip = Some(("ack", 1, Lost::Request)));
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    // Simulate a pre-migration final receipt: no prefix was ever published.
+    sql(
+        &fx,
+        &format!(
+            "DELETE FROM collection_log WHERE attempt_id='{}' AND stream='stdout'",
+            a
+        ),
+    );
+    sql(
+        &fx,
+        &format!(
+            "DELETE FROM collection_log WHERE attempt_id='{}' AND stream='stderr'",
+            a
+        ),
+    );
+    std::fs::write(files.log_path(&a, LogStream::Stdout), b"HELLO log\n").unwrap();
+    fx.w.set(|s| s.offline = false);
+    assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), LOG);
+    assert_eq!(fx.w.acks(&a).len(), 1);
+    assert_eq!(
+        c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes,
+        LOG.len() as u64
+    );
+}
+
+struct DelayedLog {
+    inner: Arc<Worker>,
+    old: AttemptId,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+impl WorkerLink for DelayedLog {
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            if matches!(&request, Request::ReadLog(r) if r.attempt_id == self.old && r.stream == LogStream::Stdout && r.offset == 0)
+            {
+                self.entered.notify_one();
+                self.resume.notified().await;
+            }
+            self.inner.call(request).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn retirement_and_replacement_during_log_rpc_never_mix_attempt_bytes() {
+    let fx = fx();
+    let (coordinator, files) = fx.open();
+    let c = Arc::new(coordinator);
+    let (_, task, old) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| s.jobs.get_mut(&old).unwrap().out.log = b"old!".to_vec());
+    let delayed = Arc::new(DelayedLog {
+        inner: fx.w.clone(),
+        old: old.clone(),
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    c.attach(fx.w.id.clone(), delayed.clone()).await;
+    let (collect_c, collect_files) = (c.clone(), files.clone());
+    let pass = tokio::spawn(async move { collect(&collect_c, &collect_files).await });
+    tokio::time::timeout(Duration::from_secs(2), delayed.entered.notified())
+        .await
+        .unwrap();
+    let db = c.store();
+    db.begin_retire(&old, "replace", 2).unwrap();
+    db.confirm_retire(&old, 3).unwrap();
+    let new = AttemptId::generate();
+    let record = db
+        .create_attempt(
+            remote_task_runner::storage::NewAttempt {
+                attempt_id: new.clone(),
+                task_id: task.clone(),
+                worker_id: fx.w.id.clone(),
+                payload_hash: Digest::of_bytes(b"replacement"),
+                permit_id: None,
+            },
+            4,
+        )
+        .unwrap();
+    let mut payload = fx.w.payload(&old);
+    payload.generation = record.generation;
+    let placement = db
+        .record_placement(&task, &fx.w.id, Some(&new), &json!({"payload":payload}), 4)
+        .unwrap();
+    db.ack_placement(placement, 4).unwrap();
+    let mut receipts = Receipts::default();
+    receipts.mark(Receipt::WorkerAccepted, 4);
+    db.record_seen(
+        &new,
+        true,
+        Some(Seen {
+            state: AttemptState::Active,
+            termination: None,
+            receipts,
+        }),
+        Observation::Known,
+        4,
+    )
+    .unwrap();
+    fx.w.set(|s| {
+        s.jobs.insert(
+            new.clone(),
+            Job {
+                payload,
+                state: AttemptState::Active,
+                termination: None,
+                out: Out {
+                    log: b"NEW!".to_vec(),
+                    ..Out::default()
+                },
+                acks: vec![],
+            },
+        );
+    });
+    delayed.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), pass)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(files.read_log(&old, LogStream::Stdout).unwrap(), b"old!");
+    assert!(db.log_progress(&old, LogStream::Stderr).unwrap().is_none());
+    assert!(db.log_progress(&new, LogStream::Stdout).unwrap().is_none());
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&new, LogStream::Stdout).unwrap(), b"NEW!");
+    assert_eq!(files.read_log(&old, LogStream::Stdout).unwrap(), b"old!");
 }

@@ -42,8 +42,8 @@ use crate::ids::{AttemptId, Digest, NodeId, RequestId, WorkerId};
 use crate::platform::wall_ms;
 use crate::state::{Receipt, Termination};
 use crate::storage::{
-    ArtifactReceipt, AttemptRecord, BlobKind, Collectable, CoordinatorStore, ResultRef,
-    StorageError,
+    ArtifactReceipt, AttemptRecord, BlobKind, Collectable, CoordinatorStore, LogProgress,
+    ResultRef, StorageError,
 };
 use crate::supervisor::spool_plan::relative_path;
 use crate::wire::{
@@ -211,6 +211,17 @@ impl Waits {
         entry.0 = entry.0.saturating_add(1);
     }
 
+    /// Live faults can leave selection through retirement/termination without
+    /// another successful poll. Bound this retry hint to one full live sweep.
+    /// Eviction only permits an earlier retry; durable offsets remain the truth.
+    fn put_off_live(&self, attempt: &AttemptId, base_ms: u64) {
+        self.put_off(attempt, base_ms);
+        let mut map = self.map();
+        while map.len() > 8 * 64 {
+            map.pop_first();
+        }
+    }
+
     fn clear(&self, attempt: &AttemptId) {
         self.map().remove(attempt);
     }
@@ -264,6 +275,16 @@ pub struct Collector {
     files: Arc<ResultStore>,
     cfg: CollectConfig,
     waits: Arc<Waits>,
+    live_waits: Arc<Waits>,
+    stop: Option<tokio::sync::watch::Receiver<bool>>,
+    collecting: Option<Arc<tokio::sync::OwnedMutexGuard<()>>>,
+}
+
+enum LogRead {
+    Stopped,
+    Progress(LogProgress),
+    Wait(LogProgress),
+    Fault(Fault, String),
 }
 
 impl Collector {
@@ -277,6 +298,9 @@ impl Collector {
             files,
             cfg,
             waits: Arc::default(),
+            live_waits: Arc::default(),
+            stop: None,
+            collecting: None,
         }
     }
 
@@ -284,6 +308,28 @@ impl Collector {
     pub fn with_waits(mut self, waits: Arc<Waits>) -> Collector {
         self.waits = waits;
         self
+    }
+
+    pub(crate) fn with_live_waits(mut self, waits: Arc<Waits>) -> Self {
+        self.live_waits = waits;
+        self
+    }
+
+    pub(crate) fn with_collecting(
+        mut self,
+        collecting: Arc<tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Self {
+        self.collecting = Some(collecting);
+        self
+    }
+
+    pub(crate) fn with_stop(mut self, stop: Option<tokio::sync::watch::Receiver<bool>>) -> Self {
+        self.stop = stop;
+        self
+    }
+
+    fn stopping(&self) -> bool {
+        self.stop.as_ref().is_some_and(|stop| *stop.borrow())
     }
 
     pub fn config(&self) -> CollectConfig {
@@ -296,7 +342,16 @@ impl Collector {
         F: FnOnce(&CoordinatorStore) -> crate::storage::Result<T> + Send + 'static,
     {
         let store = Arc::clone(&self.store);
-        match tokio::task::spawn_blocking(move || f(&store)).await {
+        let collecting = self.collecting.clone();
+        match tokio::task::spawn_blocking(move || {
+            // Retain the same writer guard through a commit even if its async
+            // waiter is dropped before this blocking job is scheduled.
+            let out = f(&store);
+            drop(collecting);
+            out
+        })
+        .await
+        {
             Ok(out) => Ok(out?),
             Err(_) => Err(CollectError::Aborted),
         }
@@ -308,7 +363,19 @@ impl Collector {
         F: FnOnce(&ResultStore) -> std::result::Result<T, StoreError> + Send + 'static,
     {
         let files = Arc::clone(&self.files);
-        match tokio::task::spawn_blocking(move || f(&files)).await {
+        let owner = Arc::clone(&self.store);
+        let collecting = self.collecting.clone();
+        match tokio::task::spawn_blocking(move || {
+            // A dropped async caller cannot cancel a blocking file mutation.
+            // Retain the process owner lock until that mutation has drained;
+            // an interrupted DB commit leaves only a recoverable private tail.
+            let out = f(&files);
+            drop(collecting);
+            drop(owner);
+            out
+        })
+        .await
+        {
             Ok(out) => Ok(out?),
             Err(_) => Err(CollectError::Aborted),
         }
@@ -383,7 +450,7 @@ impl Collector {
             return Ok(End::Pending);
         };
         loop {
-            if Instant::now() >= deadline {
+            if self.stopping() || Instant::now() >= deadline {
                 return Ok(End::Pending);
             }
             let (fault, why) = match self.step(link, &c.record, &declared, deadline).await? {
@@ -555,21 +622,58 @@ impl Collector {
                     (stream, digest.zip(logs[name]["bytes"].as_u64()))
                 })
                 .collect();
+        let mut unpublished = Vec::new();
+        for (stream, recorded) in &streams {
+            let (id, stream) = (a.clone(), *stream);
+            let mut progress = self.db(move |s| s.log_progress(&id, stream)).await?;
+            if progress.is_none() {
+                if let Some((digest, bytes)) = recorded {
+                    let (id, digest, bytes) = (a.clone(), digest.clone(), *bytes);
+                    if let Some(verified) = self
+                        .fs(move |f| f.verify_legacy_log_prefix(&id, stream, &digest, bytes))
+                        .await?
+                    {
+                        progress = self
+                            .db(move |s| s.bootstrap_log_progress(verified, wall_ms()))
+                            .await?;
+                    }
+                }
+            }
+            if let Some(progress) = progress {
+                if recorded.as_ref().map(|(_, bytes)| *bytes) != Some(progress.committed_bytes) {
+                    return Err(StorageError::Corrupt(
+                        "final receipt differs from committed log prefix".into(),
+                    )
+                    .into());
+                }
+                let (id, bytes) = (a.clone(), progress.committed_bytes);
+                self.fs(move |f| f.recover_log_prefix(&id, stream, bytes))
+                    .await?;
+            } else {
+                // A legacy file with no published progress may still use the
+                // old repair contract. Never discard a published live prefix.
+                unpublished.push(stream);
+            }
+        }
         let (bytes, wanted) = (result.to_string().into_bytes(), artifacts.to_vec());
         let id = a.clone();
-        let (logs_ok, lost) = self
+        let (logs_ok, published_bad, lost) = self
             .fs(move |f| {
                 f.write_result(&id, &bytes)?;
                 let mut logs_ok = true;
+                let mut published_bad = false;
                 for (stream, recorded) in &streams {
-                    logs_ok &= match recorded {
+                    let valid = match recorded {
                         Some((digest, bytes)) => f.verify_log(&id, *stream, digest, *bytes)?,
                         None => false,
                     };
-                }
-                if !logs_ok {
-                    for (stream, _) in &streams {
-                        f.discard_log(&id, *stream)?;
+                    if !valid {
+                        logs_ok = false;
+                        if unpublished.contains(stream) {
+                            f.discard_log(&id, *stream)?;
+                        } else {
+                            published_bad = true;
+                        }
                     }
                 }
                 let mut lost = Vec::new();
@@ -581,9 +685,15 @@ impl Collector {
                 if logs_ok && lost.is_empty() {
                     f.seal(&id)?;
                 }
-                Ok((logs_ok, lost))
+                Ok((logs_ok, published_bad, lost))
             })
             .await?;
+        if published_bad {
+            return Err(StorageError::Corrupt(
+                "published log prefix differs from its final receipt".into(),
+            )
+            .into());
+        }
         if logs_ok && lost.is_empty() {
             return Ok(true);
         }
@@ -686,6 +796,266 @@ impl Collector {
         Ok(())
     }
 
+    async fn prepare_log_prefix(
+        &self,
+        attempt: &AttemptId,
+        stream: LogStream,
+    ) -> Result<LogProgress> {
+        let a = attempt.clone();
+        let old = self.db(move |s| s.log_progress(&a, stream)).await?;
+        if old.is_none() {
+            let a = attempt.clone();
+            let receipt = self
+                .db(move |s| s.collection(&a))
+                .await?
+                .and_then(|c| c.logs)
+                .and_then(|logs| {
+                    logs.get(match stream {
+                        LogStream::Stdout => "stdout",
+                        LogStream::Stderr => "stderr",
+                    })
+                    .cloned()
+                });
+            if let Some(receipt) = receipt {
+                if let (Some(digest), Some(bytes)) = (
+                    receipt["sha256"]
+                        .as_str()
+                        .and_then(|v| Digest::parse(v).ok()),
+                    receipt["bytes"].as_u64(),
+                ) {
+                    let a = attempt.clone();
+                    let verified = self
+                        .fs(move |f| f.verify_legacy_log_prefix(&a, stream, &digest, bytes))
+                        .await?
+                        .ok_or_else(|| {
+                            StorageError::Corrupt(
+                                "legacy final log prefix differs from its receipt".into(),
+                            )
+                        })?;
+                    self.db(move |s| s.bootstrap_log_progress(verified, wall_ms()))
+                        .await?;
+                } else {
+                    return Err(
+                        StorageError::Corrupt("invalid legacy final log receipt".into()).into(),
+                    );
+                }
+            }
+        }
+        let a = attempt.clone();
+        let progress = self
+            .db(move |s| s.prepare_log_progress(&a, stream, wall_ms()))
+            .await?;
+        Ok(progress)
+    }
+
+    /// A single durable step, shared by active and final collection. The caller
+    /// owns the coordinator collecting guard; never cancel this future during FS IO.
+    async fn read_log_step(
+        &self,
+        link: &dyn WorkerLink,
+        attempt: &AttemptId,
+        node: &NodeId,
+        stream: LogStream,
+        deadline: Instant,
+    ) -> Result<LogRead> {
+        let progress = self.prepare_log_prefix(attempt, stream).await?;
+        let offset = progress.committed_bytes;
+        let a = attempt.clone();
+        self.fs(move |f| f.recover_log_prefix(&a, stream, offset))
+            .await?;
+        if progress.eof {
+            return Ok(LogRead::Progress(progress));
+        }
+        let max_bytes = self.cfg.chunk_bytes.min(65536).min(
+            self.cfg
+                .max_log_bytes
+                .saturating_sub(offset)
+                .min(u64::from(u32::MAX)) as u32,
+        );
+        // A parent cap is not an EOF. A zero-byte probe can still observe a
+        // real end mark, but must never invent one for a growing worker spool.
+        let request = Request::ReadLog(ReadLogRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: attempt.clone(),
+            node_id: node.clone(),
+            stream,
+            offset,
+            max_bytes,
+        });
+        if self.stopping() {
+            return Ok(LogRead::Stopped);
+        }
+        let mut stop = self.stop.clone();
+        let stopped = async {
+            if let Some(stop) = stop.as_mut() {
+                if !*stop.borrow() {
+                    let _ = stop.changed().await;
+                }
+            } else {
+                std::future::pending::<()>().await;
+            }
+        };
+        // Only network IO is cancellable. Once append begins, await its fsync
+        // and paired fenced commit before releasing the collecting guard.
+        let answer = tokio::select! {
+            _ = stopped => return Ok(LogRead::Stopped),
+            answer = tokio::time::timeout_at(deadline, link.call(request)) => answer,
+        };
+        let r = match answer {
+            Ok(Ok(Response::ReadLog(r))) => r,
+            Ok(Ok(_)) => {
+                return Ok(LogRead::Fault(
+                    Fault::BadAnswer,
+                    "another answer than log bytes".into(),
+                ))
+            }
+            Ok(Err(e)) => return Ok(LogRead::Fault(fault_of(e), "read_log".into())),
+            Err(_) => {
+                return Ok(LogRead::Fault(
+                    Fault::Unreachable,
+                    "read_log deadline".into(),
+                ))
+            }
+        };
+        let wait = match plan::check_log(LogFacts {
+            want_offset: offset,
+            max: u64::from(max_bytes),
+            limit: self.cfg.max_log_bytes,
+            got_offset: r.offset,
+            got_len: r.data.0.len() as u64,
+            got_next: r.next_offset,
+            got_eof: r.eof,
+        }) {
+            LogVerdict::Bad(why) => return Ok(LogRead::Fault(Fault::BadAnswer, why.into())),
+            LogVerdict::Wait => true,
+            LogVerdict::Append { .. } => false,
+        };
+        let next = r.next_offset;
+        let a = attempt.clone();
+        self.fs(move |f| f.append_log(&a, stream, offset, &r.data.0))
+            .await?;
+        let a = attempt.clone();
+        let (eof, truncated, dropped) = (r.eof, r.log_truncated, r.dropped_bytes);
+        if !self
+            .db(move |s| {
+                s.commit_log_progress(&a, stream, offset, next, eof, truncated, dropped, wall_ms())
+            })
+            .await?
+        {
+            return Ok(LogRead::Fault(Fault::Local, "stale log offset".into()));
+        }
+        let progress = LogProgress {
+            committed_bytes: next,
+            eof,
+            log_truncated: truncated,
+            dropped_bytes: dropped,
+            updated_at_ms: wall_ms(),
+        };
+        Ok(if wait {
+            LogRead::Wait(progress)
+        } else {
+            LogRead::Progress(progress)
+        })
+    }
+
+    /// Poll a bounded keyset page. Each target receives at most one chunk per
+    /// stream, so an indefinitely growing spool cannot starve another attempt.
+    pub async fn collect_live_worker(
+        &self,
+        worker: &WorkerId,
+        link: &dyn WorkerLink,
+        after: Option<AttemptId>,
+        deadline: Instant,
+    ) -> Result<(Option<AttemptId>, CollectReport)> {
+        let (w, scan) = (worker.clone(), self.cfg.scan.min(64));
+        let wrap = after.is_some();
+        let mut page = self
+            .db(move |s| s.query_live_log_targets(&w, after.as_ref(), scan))
+            .await?;
+        if page.is_empty() && wrap {
+            let w = worker.clone();
+            page = self
+                .db(move |s| s.query_live_log_targets(&w, None, scan))
+                .await?;
+        }
+        let mut cursor = None;
+        let mut report = CollectReport::default();
+        for target in page {
+            if self.stopping() || Instant::now() >= deadline {
+                break;
+            }
+            let a = target.record.attempt_id;
+            cursor = Some(a.clone());
+            // Final collection owns terminal attempts and its established RPC
+            // order/fault policy; live polling only precedes termination.
+            if target.record.termination.is_some() {
+                continue;
+            }
+            if self.live_waits.waiting(&a) {
+                continue;
+            }
+            let declared = match declared_of(&Some(target.payload)) {
+                Ok(d) => d,
+                Err(why) => {
+                    report.faults.push((a, why.into()));
+                    continue;
+                }
+            };
+            let Some(node) = declared.node else {
+                report
+                    .faults
+                    .push((a, "no source node to read logs".into()));
+                continue;
+            };
+            let mut retry = false;
+            for (index, stream) in [LogStream::Stdout, LogStream::Stderr]
+                .into_iter()
+                .enumerate()
+            {
+                if self.stopping() || Instant::now() >= deadline {
+                    break;
+                }
+                let id = a.clone();
+                if self
+                    .db(move |s| s.get_attempt(&id))
+                    .await?
+                    .is_none_or(|rec| rec.retired || rec.termination.is_some())
+                {
+                    break;
+                }
+                let step_deadline = if index == 0 {
+                    Instant::now() + deadline.saturating_duration_since(Instant::now()) / 2
+                } else {
+                    deadline
+                };
+                match self
+                    .read_log_step(link, &a, &node, stream, step_deadline)
+                    .await
+                {
+                    Ok(LogRead::Fault(fault, why)) => {
+                        retry = true;
+                        if matches!(fault, Fault::BadAnswer | Fault::Local) {
+                            report.faults.push((a.clone(), why));
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e @ (CollectError::Fenced | CollectError::Aborted)) => return Err(e),
+                    Err(e) => {
+                        retry = true;
+                        report.faults.push((a.clone(), e.to_string()));
+                    }
+                }
+            }
+            if retry {
+                self.live_waits.put_off_live(&a, self.cfg.backoff_ms);
+            } else {
+                self.live_waits.clear(&a);
+            }
+        }
+        Ok((cursor, report))
+    }
+
     /// Read both streams to their end and record what they hold.
     async fn logs(
         &self,
@@ -704,52 +1074,28 @@ impl Collector {
         };
         let mut summary = serde_json::Map::new();
         for (stream, name) in [(LogStream::Stdout, "stdout"), (LogStream::Stderr, "stderr")] {
-            let a = rec.attempt_id.clone();
-            let mut offset = self.fs(move |f| f.log_len(&a, stream)).await?;
             let info = loop {
-                if Instant::now() >= deadline {
+                if self.stopping() || Instant::now() >= deadline {
                     return Ok(Flow::Later);
                 }
-                let request = Request::ReadLog(ReadLogRequest {
-                    schema_version: SchemaVersion::CURRENT,
-                    request_id: RequestId::generate(),
-                    attempt_id: rec.attempt_id.clone(),
-                    node_id: node.clone(),
-                    stream,
-                    offset,
-                    max_bytes: self.cfg.chunk_bytes,
-                });
-                let r = match link.call(request).await {
-                    Ok(Response::ReadLog(r)) => r,
-                    Ok(_) => return Ok(bad("another answer than log bytes")),
-                    Err(e) => return Ok(Flow::Fault(fault_of(e), "read_log".into())),
-                };
-                let verdict = plan::check_log(LogFacts {
-                    want_offset: offset,
-                    max: u64::from(self.cfg.chunk_bytes),
-                    limit: self.cfg.max_log_bytes,
-                    got_offset: r.offset,
-                    got_len: r.data.0.len() as u64,
-                    got_next: r.next_offset,
-                    got_eof: r.eof,
-                });
-                let complete = match verdict {
-                    LogVerdict::Bad(why) => return Ok(bad(why)),
-                    LogVerdict::Wait => match plan::log_wait(has_stored_result) {
+                let (progress, complete) = match self
+                    .read_log_step(link, &rec.attempt_id, &node, stream, deadline)
+                    .await?
+                {
+                    LogRead::Stopped => return Ok(Flow::Later),
+                    LogRead::Fault(fault, why) => return Ok(Flow::Fault(fault, why)),
+                    LogRead::Wait(progress) => match plan::log_wait(has_stored_result) {
                         LogWait::Retry => return Ok(Flow::Later),
-                        LogWait::TakeIncomplete => false,
+                        LogWait::TakeIncomplete => (progress, false),
                     },
-                    LogVerdict::Append { next, end } => {
-                        let (a, at, data) = (rec.attempt_id.clone(), offset, r.data.0);
-                        self.fs(move |f| f.append_log(&a, stream, at, &data))
-                            .await?;
-                        offset = next;
-                        if !end {
+                    LogRead::Progress(progress) => {
+                        if !progress.eof {
                             continue;
                         }
-                        true
+                        (progress, true)
                     }
                 };
+                let offset = progress.committed_bytes;
                 // What is here now is what the acknowledgement vouches for:
                 // its length and digest are recorded and compared again
                 // before it is sent.
@@ -766,8 +1112,8 @@ impl Collector {
                     "bytes": offset,
                     "sha256": sha256.as_str(),
                     "complete": complete,
-                    "log_truncated": r.log_truncated,
-                    "dropped_bytes": r.dropped_bytes,
+                    "log_truncated": progress.log_truncated,
+                    "dropped_bytes": progress.dropped_bytes,
                 });
             };
             summary.insert(name.to_string(), info);
@@ -822,7 +1168,7 @@ impl Collector {
                     Mismatch::Refetch => continue,
                 }
             }
-            if Instant::now() >= deadline {
+            if self.stopping() || Instant::now() >= deadline {
                 return Ok(Flow::Later);
             }
             let request = Request::BlobGet(BlobGetRequest {
@@ -939,4 +1285,87 @@ impl Collector {
 
 fn bad(why: &str) -> Flow {
     Flow::Fault(Fault::BadAnswer, why.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_retry_hints_stay_bounded_when_faulted_attempts_leave_selection() {
+        let waits = Waits::default();
+        for _ in 0..1024 {
+            waits.put_off_live(&AttemptId::generate(), 60_000);
+        }
+        assert_eq!(waits.map().len(), 8 * 64);
+        let attempt = AttemptId::generate();
+        let counts = Waits::default();
+        counts.put_off_live(&attempt, 60_000);
+        counts.put_off_live(&attempt, 60_000);
+        assert_eq!(counts.map()[&attempt].0, 2);
+        counts.clear(&attempt);
+        assert!(counts.map().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborted_filesystem_await_keeps_owner_until_blocking_mutation_drains() {
+        let root = tempfile::tempdir().unwrap();
+        let store = Arc::new(CoordinatorStore::open(root.path(), 1).unwrap());
+        let owner = Arc::downgrade(&store);
+        let files = Arc::new(ResultStore::open(&root.path().join("results")).unwrap());
+        let attempt = AttemptId::generate();
+        let id = attempt.clone();
+        let writer = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = Arc::new(writer.clone().lock_owned().await);
+        let collector =
+            Collector::new(store, files.clone(), CollectConfig::default()).with_collecting(guard);
+        let (entered, receive_entered) = std::sync::mpsc::channel();
+        let (resume, receive_resume) = std::sync::mpsc::channel();
+        let task = tokio::spawn(async move {
+            collector
+                .fs(move |files| {
+                    files.append_log(&id, LogStream::Stdout, 0, b"uncommitted")?;
+                    entered.send(()).unwrap();
+                    receive_resume
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || receive_entered.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let retained = matches!(
+            CoordinatorStore::open(root.path(), 1),
+            Err(StorageError::Locked(_))
+        );
+        let writer_retained = writer.try_lock().is_err();
+        resume.send(()).unwrap();
+        assert!(
+            writer_retained,
+            "abort released collecting guard before blocking FS completed"
+        );
+        assert!(
+            retained,
+            "abort released owner before blocking FS completed"
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while owner.strong_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let _drained = tokio::time::timeout(Duration::from_secs(2), writer.lock())
+            .await
+            .unwrap();
+        assert_eq!(
+            files.read_log(&attempt, LogStream::Stdout).unwrap(),
+            b"uncommitted"
+        );
+    }
 }

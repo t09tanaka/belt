@@ -552,7 +552,7 @@ impl Resident {
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _ = collect_stop.changed() => return Ok(()), _ = timer.tick() => {} }
-                if let Err(e) = coordinator.collect(&files, collection).await { let _ = stop_collect.send(true); return Err(e.into()); }
+                if let Err(e) = coordinator.collect_stopping(&files, collection, Some(collect_stop.clone())).await { let _ = stop_collect.send(true); return Err(e.into()); }
             }
         });
         let agent = self.agent.clone();
