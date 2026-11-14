@@ -220,3 +220,10 @@ owner再起動と明示retry、Git secret現物maskとinventory拒否、prepare�
 SIGINT停止確定、scheduler / worker admission / 原本cleanup）に加え、secret unit 76件、
 retry関連20件、legacy payload hash 1件、既存実SIGINT 1件、未実装CLI grammar 3件が成功。
 strict all-target / all-feature clippy、fmt、diff checkが成功。全体CIと公開は統合時に行う。
+
+独立レビューのP2（元subdirectoryが外部symlinkへ差し替わると明示retryでroot外へ
+cwdが解決される）を修正した。Agentのprepareでin-placeの全command cwdを
+canonicalizeし、directoryかつ検証済み原本root内の場合のみresolved pathを使う。
+owner再起動後の差替えretryがrunning前に拒否され、外部markerを作らず原本とsecretを
+保つ回帰を含むin-place unit 5件・integration 9件、通常snapshot exec回帰、strict clippy
+が成功した。TTCのpath登録後に同UIDが任意に差し替える競合への新たなFD layerは追加していない。

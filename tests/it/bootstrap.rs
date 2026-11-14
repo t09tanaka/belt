@@ -2109,3 +2109,119 @@ async fn in_place_preparation_runs_in_original_and_artifacts_use_normal_collecti
     assert_eq!(store.attempts_of_task(&task).unwrap().len(), 1);
     shutdown(&load(&spec)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_retry_rejects_original_subdirectory_replaced_by_external_symlink() {
+    use remote_task_runner::{
+        ids::{RunId, TaskId},
+        service::{completion::Target, control},
+    };
+    let (root, spec, input) = control_fixture();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&input)
+            .envs(&spec.env)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let sub = input.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("input.txt"), "original subdirectory").unwrap();
+    std::fs::write(input.join(".gitignore"), ".env.test\n").unwrap();
+    std::fs::write(
+        input.join(".remote-task-runner.toml"),
+        "schema_version = 1\n[source]\nsecret_files = [\".env.test\"]\n",
+    )
+    .unwrap();
+    assert!(Command::new("git")
+        .args(["add", "."])
+        .current_dir(&input)
+        .envs(&spec.env)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["commit", "-qm", "fixture"])
+        .current_dir(&input)
+        .envs(&spec.env)
+        .status()
+        .unwrap()
+        .success());
+    let secret = input.join(".env.test");
+    std::fs::write(&secret, "TOKEN=private-original-secret\n").unwrap();
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(&spec.executable)
+            .args([
+                "--json",
+                "exec",
+                "--in-place",
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf ran > marker; exit 23",
+            ])
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+            .envs(&spec.env)
+            .current_dir(&sub)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
+    assert!(sub.join("marker").exists());
+    shutdown(&load(&spec)).await;
+    let saved = input.join("saved-sub");
+    std::fs::rename(&sub, &saved).unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &sub).unwrap();
+    control::retry(&spec, Target::Run(run.clone()))
+        .await
+        .unwrap();
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = tokio::time::timeout(
+        Duration::from_secs(30),
+        control::wait(&spec, Target::Run(run), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(done.cli_exit_code, 0);
+    assert_ne!(done.cli_exit_code, 23);
+    assert!(!outside.join("marker").exists());
+    assert_eq!(
+        std::fs::read_to_string(saved.join("input.txt")).unwrap(),
+        "original subdirectory"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "TOKEN=private-original-secret\n"
+    );
+    let attempts = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .attempts_of_task(&task)
+        .unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts[1].receipts.running_at_ms.is_none());
+    shutdown(&load(&spec)).await;
+    assert!(input.is_dir());
+    assert!(saved.join("marker").exists());
+}
