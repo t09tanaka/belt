@@ -1445,8 +1445,101 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
         resident.agent.agent_epoch(),
     )
     .await;
+    let task_id = TaskId::generate();
+    let run_id = RunId::generate();
+    let checkout = root.path().join("original-checkout");
+    std::fs::create_dir(&checkout).unwrap();
+    std::fs::write(checkout.join("command.txt"), "original input").unwrap();
+    let captured = crate::source::capture_for_run(
+        &resident.captured.env,
+        &resident.sources,
+        &run_id,
+        &crate::source::SourceRequest::Directory {
+            dir: checkout.clone(),
+        },
+        &Default::default(),
+    )
+    .unwrap();
+    let source_id = captured.manifest.source_id;
+    let digest = Digest::parse(&captured.manifest.manifest_digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest)))
+        .unwrap();
+    let mut frozen = delivery_spec(digest, false);
+    frozen.commands[0]
+        .env
+        .insert("FROZEN".into(), "original".into());
+    let mut second = frozen.commands[0].clone();
+    second.node_id = NodeId::parse("second").unwrap();
+    second.depends_on = vec![frozen.commands[0].node_id.clone()];
+    second.argv = vec!["/bin/echo".into(), "stored second command".into()];
+    frozen.commands.push(second);
+    let frozen_json = serde_json::to_value(&frozen).unwrap();
+    coordinator
+        .store()
+        .put_source_ref(
+            &source_id,
+            &frozen.manifest_digest,
+            crate::platform::wall_ms(),
+        )
+        .unwrap();
+    coordinator
+        .store()
+        .enqueue(
+            &run_id,
+            Some(&source_id),
+            &serde_json::json!({}),
+            &[(task_id.clone(), frozen_json.clone())],
+            crate::platform::wall_ms(),
+        )
+        .unwrap();
+    // Closed runs remain estimable and cannot be scheduled by the owner's tick.
+    coordinator
+        .store()
+        .close_run(&run_id, crate::platform::wall_ms())
+        .unwrap();
+    // Keep the resident's unrelated retention loop outside the measured snapshot.
+    let _reader_pin =
+        crate::results::pin::RunPin::shared(&root.path().join("parent"), &run_id).unwrap();
+    let worker = WorkerId::parse("local").unwrap();
+    let mut cost_query = crate::scheduler::measured::CostQuery::task(
+        &frozen_json,
+        Some(source_id.as_str()),
+        gate.cost_transport(),
+    );
+    let model = coordinator.scheduler().model();
+    cost_query.collection_policy = model.collection_policy();
+    for phase in [
+        crate::scheduler::measured::Phase::Transfer,
+        crate::scheduler::measured::Phase::TerminalTail,
+    ] {
+        let sample = crate::scheduler::measured::Sample::verified(
+            &worker,
+            &cost_query,
+            phase,
+            format!("captured-{phase:?}"),
+            crate::platform::monotonic_ms().saturating_sub(100),
+            10,
+        )
+        .unwrap();
+        model.record(sample);
+    }
+    model.drain();
+    fn stable_evidence(evidence: crate::scheduler::measured::CostEvidence) -> serde_json::Value {
+        let mut value = serde_json::to_value(evidence).unwrap();
+        for name in ["transfer", "setup", "collection"] {
+            value[name]
+                .as_object_mut()
+                .unwrap()
+                .remove("remaining_ttl_ms");
+        }
+        value
+    }
+    let captured_evidence = stable_evidence(model.evidence(&worker, &cost_query).unwrap());
+    assert!(captured_evidence.to_string().contains("measured"));
+    std::fs::write(checkout.join("command.txt"), "changed after capture").unwrap();
     let before_generation = gate.generation();
     let before_readiness = gate.snapshot();
+    let before_preferred = gate.preferred();
     fn rows(coordinator: &Coordinator) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
         coordinator
             .store()
@@ -1508,6 +1601,56 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
             other => panic!("unexpected estimate reply: {other:?}"),
         }
     }
+    for _ in 0..100 {
+        match client
+            .request(Operation::EstimateTask {
+                task_id: task_id.clone(),
+            })
+            .await
+            .unwrap()
+        {
+            Reply::Estimate { estimate } => {
+                assert!(estimate.online && estimate.conditional);
+                assert_eq!(estimate.source_kind, "captured");
+                assert_eq!(estimate.forecasts.len(), 1, "{}", estimate.human());
+                assert_eq!(estimate.forecasts[0].target.plan_digest, frozen.plan_digest);
+                assert_ne!(
+                    estimate.forecasts[0].target.runtime_source,
+                    RuntimeSource::Measured
+                );
+                assert_eq!(estimate.components.len(), 1);
+                assert!(serde_json::to_value(&estimate.components[0])
+                    .unwrap()
+                    .to_string()
+                    .contains("measured"));
+                assert_eq!(
+                    stable_evidence(estimate.components[0].costs.clone()),
+                    captured_evidence
+                );
+            }
+            other => panic!("unexpected known-task reply: {other:?}"),
+        }
+    }
+    match client
+        .request(Operation::EstimateTask {
+            task_id: TaskId::generate(),
+        })
+        .await
+        .unwrap()
+    {
+        Reply::ControlError { error } => assert_eq!(error.code, crate::error::ErrorCode::NotFound),
+        other => panic!("unexpected missing-task reply: {other:?}"),
+    }
+    assert_eq!(
+        coordinator
+            .store()
+            .estimate_input(&task_id)
+            .unwrap()
+            .unwrap()
+            .spec,
+        frozen_json
+    );
+    assert_eq!(before_preferred, gate.preferred());
     assert_eq!(before_rows, rows(&coordinator));
     assert_eq!(before_epoch, coordinator.epoch());
     assert_eq!(before_generation, gate.generation());

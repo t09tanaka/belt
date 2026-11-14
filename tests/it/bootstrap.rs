@@ -3033,6 +3033,33 @@ async fn estimate_offline_100_calls_without_git_leave_db_epoch_and_source_roots_
     assert!(!spec.worker_state_dir.join("clones").exists());
 }
 
+#[tokio::test]
+async fn estimate_known_task_without_database_does_not_initialize_state() {
+    let (_root, spec, input) = control_fixture();
+    let missing = remote_task_runner::ids::TaskId::generate();
+    let error = remote_task_runner::service::estimate::task(spec.clone(), missing.clone())
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        remote_task_runner::error::ErrorCode::InvalidInput
+    );
+    let output = tokio::process::Command::new(&spec.executable)
+        .args(["estimate", "--task", missing.as_str(), "--json"])
+        .env_clear()
+        .envs(&spec.env)
+        .current_dir(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(!spec.state_dir.join("coordinator.db").exists());
+    assert!(!spec.state_dir.join("owner.json").exists());
+    assert!(!spec.state_dir.join("startup.lock").exists());
+    assert!(!spec.state_dir.join("sources").exists());
+    assert!(!spec.worker_state_dir.join("traffic").exists());
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn estimate_reads_real_worker_execution_history_through_authenticated_owner() {
     let (root, mut spec, repo) = control_fixture();
@@ -3102,6 +3129,7 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     })
     .await
     .unwrap();
+    let mut successful_task = None;
     for _ in 0..2 {
         let output = tokio::time::timeout(
             Duration::from_secs(40),
@@ -3121,7 +3149,61 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        successful_task = Some(
+            remote_task_runner::ids::TaskId::parse(result["result"]["task_id"].as_str().unwrap())
+                .unwrap(),
+        );
     }
+    let successful_task = successful_task.unwrap();
+    let first_known =
+        remote_task_runner::service::estimate::task(spec.clone(), successful_task.clone())
+            .await
+            .unwrap();
+    assert!(first_known.online);
+    assert_eq!(first_known.forecasts.len(), 1, "{}", first_known.human());
+    assert_ne!(
+        first_known.forecasts[0].target.runtime_source,
+        remote_task_runner::wire::RuntimeSource::Measured
+    );
+    assert!(!first_known.components.is_empty());
+    // This uses the successful transfer/collection producers, not hand-inserted stats.
+    assert!(
+        first_known.components.iter().any(|entry| matches!(
+            entry.costs.collection.kind,
+            remote_task_runner::scheduler::measured::EvidenceKind::Measured
+        )),
+        "{:?}",
+        first_known.components
+    );
+    std::fs::write(
+        repo.join("input.txt"),
+        "changed after successful captured execution",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".remote-task-runner.toml"),
+        "deliberately invalid current project config",
+    )
+    .unwrap();
+    let changed =
+        remote_task_runner::service::estimate::task(spec.clone(), successful_task.clone())
+            .await
+            .unwrap();
+    assert_eq!(
+        changed.forecasts[0].target.plan_digest,
+        first_known.forecasts[0].target.plan_digest
+    );
+    assert_eq!(
+        serde_json::to_value(&changed.components[0].costs.collection.provenance).unwrap(),
+        serde_json::to_value(&first_known.components[0].costs.collection.provenance).unwrap()
+    );
+    assert_eq!(
+        changed.components[0].costs.collection.ms,
+        first_known.components[0].costs.collection.ms
+    );
+    // Remove intentionally invalid config before exercising the original raw-command path.
+    std::fs::remove_file(repo.join(".remote-task-runner.toml")).unwrap();
     let history = task_traffic_controller::history::read_all(
         &spec.worker_state_dir.join("traffic/history.jsonl"),
     )
@@ -3143,6 +3225,75 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     .unwrap();
     shutdown(&client).await;
     assert!(child.wait().await.unwrap().success());
+    let before_startup_lock = spec.state_dir.join("startup.lock").exists();
+    let before_db = std::fs::read(spec.state_dir.join("coordinator.db")).unwrap();
+    let before_epoch = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .epoch();
+    // Public CLI task mode must work from a changed checkout with no Git in PATH.
+    let mut offline_env = spec.env.clone();
+    offline_env.insert("PATH".into(), "/nonexistent".into());
+    std::fs::write(
+        repo.join(".remote-task-runner.toml"),
+        "invalid project config",
+    )
+    .unwrap();
+    for _ in 0..100 {
+        let offline =
+            remote_task_runner::service::estimate::task(spec.clone(), successful_task.clone())
+                .await
+                .unwrap();
+        assert!(!offline.online && offline.decision.is_none());
+        assert_eq!(offline.source_kind, "captured");
+    }
+    let output = tokio::process::Command::new(&spec.executable)
+        .args(["estimate", "--task", successful_task.as_str(), "--json"])
+        .env_clear()
+        .envs(&offline_env)
+        .current_dir(&repo)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"]["online"], false);
+    assert_eq!(value["result"]["source_kind"], "captured");
+    let unknown = remote_task_runner::service::estimate::task(
+        spec.clone(),
+        remote_task_runner::ids::TaskId::generate(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(unknown.code, remote_task_runner::error::ErrorCode::NotFound);
+    let invalid = tokio::process::Command::new(&spec.executable)
+        .args(["estimate", "--task", "not-a-task", "--json"])
+        .env_clear()
+        .envs(&offline_env)
+        .current_dir(&repo)
+        .output()
+        .await
+        .unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&invalid.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "INVALID_INPUT");
+    assert_eq!(
+        before_db,
+        std::fs::read(spec.state_dir.join("coordinator.db")).unwrap()
+    );
+    assert_eq!(
+        before_epoch,
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch()
+    );
+    assert_eq!(
+        before_startup_lock,
+        spec.state_dir.join("startup.lock").exists()
+    );
     assert!(answer.online, "{}", answer.human());
     assert_eq!(answer.forecasts.len(), 1, "{}", answer.human());
     let forecast = &answer.forecasts[0];
