@@ -773,10 +773,12 @@ impl Control<'_> {
             label: None,
             weight: node.weight,
             front: false,
-            key: spec
-                .profile_fingerprint
-                .as_ref()
-                .map(|p| format!("rtr-profile:{p}")),
+            key: profile_history_key(
+                &self.traffic.ctx,
+                &node.cwd,
+                &node.argv,
+                spec.profile_fingerprint.as_ref(),
+            )?,
             argv: node.argv.clone(),
             cwd: node.cwd.clone(),
             env: Some(node.env.clone()),
@@ -1466,9 +1468,63 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
     })
 }
 
+// TTC's explicit key replaces its command identity rather than extending it.
+// Keep its normalized repo/subdir/work identity and add only an opaque profile
+// namespace: neither raw argv nor profile environment enters the override.
+fn profile_history_key(
+    ctx: &Context,
+    cwd: &Path,
+    argv: &[String],
+    profile: Option<&crate::ids::Digest>,
+) -> Result<Option<String>> {
+    let Some(profile) = profile else {
+        return Ok(None);
+    };
+    let command = task_traffic_controller::exec::command_key(ctx, cwd, None, argv)
+        .map_err(SupervisorError::traffic)?;
+    Ok(Some(format!(
+        "rtr-profile:{profile}:command:{}",
+        command.hash
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_history_preserves_normalized_command_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::new(Paths::new(dir.path(), dir.path().join("config.toml")));
+        let profile_a = crate::ids::Digest::of_bytes(b"profile-a");
+        let profile_b = crate::ids::Digest::of_bytes(b"profile-b");
+        let check = vec!["cargo".into(), "check".into()];
+        let test = vec!["cargo".into(), "test".into()];
+        let wrapped = vec!["sh".into(), "-c".into(), "cargo check".into()];
+        let history = |argv: &[String], profile: &crate::ids::Digest| {
+            let override_key = profile_history_key(&ctx, dir.path(), argv, Some(profile)).unwrap();
+            task_traffic_controller::exec::command_key(
+                &ctx,
+                dir.path(),
+                override_key.as_deref(),
+                argv,
+            )
+            .unwrap()
+            .hash
+        };
+        assert_ne!(history(&check, &profile_a), history(&test, &profile_a));
+        assert_ne!(history(&check, &profile_a), history(&check, &profile_b));
+        assert_eq!(history(&check, &profile_a), history(&check, &profile_a));
+        assert_eq!(history(&check, &profile_a), history(&wrapped, &profile_a));
+        assert!(profile_history_key(&ctx, dir.path(), &check, None)
+            .unwrap()
+            .is_none());
+        let secret_argv = vec!["echo".into(), "private-value".into()];
+        let key = profile_history_key(&ctx, dir.path(), &secret_argv, Some(&profile_a))
+            .unwrap()
+            .unwrap();
+        assert!(!key.contains("private-value"));
+    }
 
     #[test]
     fn the_flag_is_set_when_its_guard_goes_also_by_a_panic() {
