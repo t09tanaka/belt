@@ -279,6 +279,12 @@ Git外のgeneric execにはdirectory snapshotを提供する。sourceが不要�
 
 `in-place` は明示的な別workspace modeである。記録するsnapshotは比較用baselineで、実行入力の不変性は保証しない。remote配置、結果cache、既定の自動retryを無効にし、表示・結果でもsnapshot実行と区別する。
 
+`exec --in-place` はGit worktreeとGit外directoryの双方を対象とする。Gitでは元worktreeのrootを保持し、元cwdからの相対pathでcommandを実行する。親local workerのidentityとrun/source/manifest digest、canonical rootのdevice/inodeを親state内の0600 bindingに保持し、rootの差替えや別workerへの配置を拒否する。原本pathは転送payloadや公開queryへ含めず、task/completionの `in_place: true` でmodeを示す。setup templateの適用・builder起動を行わず、prepare commandsは原本で通常commandとして実行する。workspace cleanupで原本を削除しない。
+
+明示 `retry` は通常と同じterminal・停止確定・回収・control revisionの条件を満たした場合だけ、同runの新attemptとして同じ原本を再実行する。baselineは作り直さない。元のsecret globs契約はprivate bindingに保持し、現在のproject configを再loadしない。原本secretはbounded/no-followのread-only処理で実行時の値をmaskし、bundleの配置・chmod・消去を原本へ行わない。元globsと現在の `.worktreeinclude` が選ぶpath集合がbaselineのsecret inventoryと違えば実行・retryを拒否し、新しい `exec` によるbaseline作成を求める。値の変更だけなら現物をmaskして実行でき、元Vault bundleの消去は妨げにならない。
+
+private bindingはowner再起動と明示retryのため親stateとともに保持する。binding自体はbaseline sourceや結果のGC pinではなく、元sourceが消去されたrunはretryできない。現段階ではbindingの個別GCは行わず、親stateの削除まで保持する。bindingやrunの取消・workspace cleanupは原本の削除を意味しない。
+
 依存の準備は、プロジェクトの `.fast-worktree.toml` の `[[clone]]`（と `post_add`）が担う。attempt workspaceをfast-worktreeで作る方針と、`.worktreeinclude` の扱いは22.5で定める。第8章のSetupRecipeとtemplateは、workflowのsetup stepの再利用に限る。`.fast-worktree.toml` を持たないプロジェクトでは、第8章の `[prepare]` が代わりを務める。両方がある場合は `.fast-worktree.toml` を優先し、`ci plan` が準備の出所（`fast-worktree` / `[prepare]` / workflowのsetup step）を表示する。
 
 # 7. CI計画と分散単位
@@ -1117,3 +1123,112 @@ workerのattempt workspaceは、fast-worktreeで作り、消す（2026-11-10の�
 2. **lib化後の基準**: task-traffic-controller 0.5.0（main `18b2d45`、タグ `v0.5.0`）、local-ci 0.9.0（main `8666da7`、タグ `v0.9.0`）。いずれもcrates.ioに公開済みで、remote-task-runnerはcrates.ioの版へ依存する。2026-11-09の決定時点の基準は local-ci main `7deff5e`（v0.7.0 + PR #21 によるlib化）、task-traffic-controller main `7f095ad`（v0.4.2 + PR #14 によるlib化）で、第3項・第4項の観察はその時点のものである。
 3. **待ち時間の分離**: local-ci v0.7.0は、jobごとに資源待ちを実行時間と分けて記録する。第9章の実行時間には、この待ちを除いた値を使う。
 4. **task-traffic-controllerの既知の窓**: PR #14の後、待ち中のrunnerがSIGTERMを2回続けて受けると、exit fileを書かずに終了し、jobがlostに見える短い窓がある。C3（受理段階のreceiptと終了順序）で、signal handlerを既定へ戻す時点をCLIの再送の直前へ移して閉じる。
+
+
+### 公開ログの読み取り
+
+`logs <run-or-task-id> [--follow]` は親が回収して commit した stdout / stderr の
+prefix を読み、worker 接続・owner 起動・Git/project 設定を必要としない。
+既定は非 retired の最新 generation（task の min_generation 以上）であり、retry 待ちに
+旧 attempt へ戻らない。`logs <task-id> --attempt <attempt-id>` で同 task の履歴を明示できる。
+wire の node_id は公開 CLI の選択単位にせず、attempt 集約 stream を読む。
+
+text は任意 bytes を変換せず対応する stdout / stderr へ出す。識別・回収状態の診断は
+stderr へ出す。stream 間の時系列順序は保証しない。`--json` は snapshot / follow とも
+schema_version=1 の NDJSON で、data.kind は status / replacement / reconnecting / chunk / final。
+chunk は run_id / task_id / attempt_id / generation / stream / offset / next_offset /
+bytes_base64 を持ち、生 bytes は JSON stdout に混ぜない。chunk は最大 64 KiB、
+run は最大 32 task のページで走査する。final は件数・bytes・pending / failure の集計であり、
+全 task の配列を保持しない。読み取りエラーは既存の error envelope を返す。
+
+follow は invocation 専用の mode-0700 一時ディレクトリ / mode-0600 SQLite cursor に
+配信 offset を保存し、メモリは task 数やログ量によらず制限する。終了時に削除し、
+プロセスを跨ぐ resume は提供しない。owner の再起動でも read-only DB から同じ offset
+を継続する。prefix の縮小は CONFLICT、commit 済みファイルの欠損・短縮は INTERNAL とする。
+実行 terminal だけでは終了せず、collection closed と利用可能 prefix の配信完了を待つ。
+closed の不完全ログ・回収失敗は利用可能 bytes を返して COLLECTION_FAILED / 78。
+途中 snapshot は pending を明示して 0。Ctrl-C は cancel を送らず detach / 130。
+出力先が詰まっている場合も detach は待たず、割り込み時の final は出力可能な場合に送る。
+
+retention GC は run ごとの永続 pin の共有/排他 lock で reader と分離する。
+read-only CLI は pin 作成・DB 更新を行わず、owner が準備した inode を検証して保持する。
+active / pending / finalizing と reader 使用中の削除を防ぐ。ログ経路だけで
+source/Vault/private binding GC や output planner の完成を意味しない。
+
+### Generic output bundles (TarV1)
+
+`[[outputs]]` の各論理名は1つの非圧縮 tar blob として回収する。`paths` は
+workspace 相対の globset パターンの和集合であり、`*` は1要素、`**` は再帰、
+`?`・文字クラス・brace alternation は globset の構文とする。literal directory は
+全 regular file descendants を含み、重複は除く。member 名は workspace 相対のまま
+保持する。通常の dotfile は対象となる。`.git` と runner metadata は走査しない。
+選択された symlink、hardlink、FIFO、socket、device、secret path/inode/value、
+case/NFC 名衝突は論理 output 全体を refused にする。source の captured input
+manifest は出力 allowlist として使わず、新しく生成したファイルも回収できる。
+
+`when = success` は Succeeded、`failure` は Failed/TimedOut、`always` は収集可能な
+全 terminal outcome に適用する。Cancelled/Interrupted は always のみ。未起動の
+cancel/prepare failure は収集せず、prepared-only success は収集する。条件に
+合わない required output は required_missing にしない。条件は command outcome
+で判定し、artifact 不足による verdict を再入力しない。
+
+1 attempt は raw artifact と合わせて1024論理出力・1024 patterns、1 bundle は
+4096 files、attempt 全体16384 files、走査は1 bundle 当たり100000 entries、
+path は UTF-8 1024 bytes・16要素、member と serialized bundle は各最大1 GiB
+（worker設定がより小さければその上限）とする。上限超過は切り捨てず refused。
+各 member は held directory fd と NOFOLLOW/NONBLOCK で開き、64 KiB 単位で
+private spool に secret 検査してから archive に追加する。bundle 失敗は他の
+論理 output を妨げず、既存の required/optional 判定を維持する。
+
+wire schema 1 に default/skip-empty の `outputs` を追加し、従来の `artifacts`
+は raw のまま保持する。`ArtifactRecord.encoding` は raw を既定とし省略し、
+TarV1 は明示 `tar_v1` とする。収集段階の到達は `outputs_evaluated` (default false/skipfalse) として journal と
+result に固定する。missing/refused や zero eligible でも収集を評価した場合は true、
+未起動 cancel/prepare failure は false とする。Succeeded/exit/Running receipt/
+Running timeout と marker false が矛盾する結果は拒否する。CommandRegistered は
+admission 前に立つので、その receipt 単独は開始証拠としない。
+encoding と marker を含む immutable result JSON と digest が
+既存の exact name/digest/size receipt・ACK を束縛する。旧 persisted payload/result
+の canonical bytes と digest は変えない。全 live hello で `output_bundles_v1` を
+必須とし、設定の required_features が空でも迂回できない。旧 peer との接続は
+明示的な protocol_incompatible となる。doctor/version で同一 schema だけを見て
+互換と判断せず、hello の必須 feature も確認する。
+
+TarV1 writer は Rust tar crate の GNU regular-file header のみを出力し、mode0600、
+uid/gid/mtime0、名前順とする。100 bytes 超の名前は同 crate が生成する bounded
+GNU `L` (`././@LongLink`, UTF-8 member path + NUL) metadata を許可する。
+compressed data、directory entries、link、special、sparse、PAX/global metadata は
+生成しない。reader/export はこの subset と全構造・外側 digest を再検証し、
+raw bytes を magic sniffing で tar と解釈しない。汎用 unpack は使用しない。
+
+
+### Public collected output export
+
+`outputs <run-or-task-id> --dir <directory>` exports currently receipted outputs. The destination is required. `--attempt <attempt-id>` addresses an exact historical attempt and is valid only with its owning task. Default selection respects the task's latest generation boundary; a retry awaiting placement never exports an old success. Reads work with the owner stopped, without Git or project configuration, and never start a service or change the coordinator epoch.
+
+Legacy raw objects export at `<directory>/<task>/<attempt>/<name>`. Generic `tar_v1` bundles export at `<directory>/<task>/<attempt>/<name>/<workspace-relative-member>`. Encoding comes from immutable result metadata; raw bytes are never sniffed as archives. Durable artifact receipts plus fresh retained result/blob references authorize objects. Reads and private spool copies use bounded buffers, and metadata/task pages contain at most 64 entries.
+
+The exporter verifies outer size and SHA-256, then validates the whole uncompressed GNU tar subset before publishing any bundle member. Only regular files and bounded GNU long names are supported. Unsafe paths, duplicate/case/Unicode/prefix collisions, links, sparse/PAX/special entries, truncation and trailing garbage are refused. Destination ancestors must be real directories; symlinks and existing destination files conflict, even when bytes match. New directories are 0700 and files 0600. Publication never overwrites. Concurrent destination conflicts preserve successful exports and report each failure.
+
+`--json` uses bounded NDJSON: target observation, per-file outcome or artifact error, then exactly one final summary attempt with aggregate counts and a reader exit code. Target execution failure is independent of successful export. Pending collection is reported without claiming run success; closed collection failure exits 78. Expired, unreferenced or deletion-claimed data exits 73 even if the file still exists. Missing/short/corrupt files with live references exit 79, destination conflicts 72, invalid inputs 2. Ctrl-C exits 130 and detaches only the reader, including when stdout is blocked. The shared run pin is held through cooperative worker cancellation/drain and every final write/flush, including backpressure and SIGINT.
+結果 retention GC は run ごとの永続 reader-pins inode と共有/排他 flock を使う。
+read-only logs は対象 run を仮解決し、pin を read-only/nonblocking shared-lock し、
+inode と新しい metadata binding を確認した後に読み始め、follow/detach を含む invocation 全体で保持する。
+missing/legacy pin は明示 unavailable とし、reader は作成・DB 更新・owner 起動を行わない。
+outputs/export CLI も configured read-only store の identity 検証後に CoordinatorStore::result_read_pin を取得し、
+新しい metadata 読取から blocking worker の drain と最終出力/flush 完了まで invocation 外側で保持する。
+owner は create_run/enqueue の両経路で DB transaction に入る前に pin 作成と fsync を行う。
+ref 公開前にも pin を準備し、legacy run は bounded page で backfill する。
+pin inode は parent state とともに保持し、unlink/置換しない。最初の GC 対応版以降の owner と
+reader がこの protocol を共有することが互換条件で、旧 reader と同時利用する GC の安全性は保証しない。
+resident は bounded keyset の結果 ref/claim page だけ処理し、run-exclusive pin を FS delete 完了まで保持する。
+known durable claim のみ NotFound を冪等成功とし、未関連 legacy pending や foreign locator は削除しない。
+run 選択は task facts/count を読まない run ID index の 1 件 keyset query とする。
+削除は open 時の result root inode を確認し、各祖先を NOFOLLOW で開いた FD を基準に行う。
+leaf symlink は参照先を辿らず unlink し、祖先/root の差替えは claim を残して失敗する。
+空親/tmp の cleanup も同じ FD から行い、外部 symlink 先を削除しない。
+GC 排他 pin と writer shared pin の通常競合は対象を pending として次 pass へ送り、
+resident の収集 loop・lease 更新・IPC は継続する。pin 破損や他の I/O error は通常競合にしない。
+時計 cutoff は boot identity と永続 monotonic baseline から導出し、boot 不明/変更後は全 retention の
+quarantine、時計異常は retention 0 でも Hold。壁時計だけを理由に削除を前倒ししない。
+source/Vault/private binding の GC と output planner 完成はこの結果 retention 経路に含まない。

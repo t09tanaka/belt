@@ -61,16 +61,34 @@ pub struct ResultRef {
 
 /// Reference a file of the result store. The same reference again is a
 /// no-op; the same id for another file is refused.
-fn add_ref(tx: &rusqlite::Transaction<'_>, attempt: &str, r: &ResultRef, at_ms: u64) -> Result<()> {
-    let have: Option<String> = tx
+pub(super) fn add_ref(
+    tx: &rusqlite::Transaction<'_>,
+    attempt: &str,
+    r: &ResultRef,
+    at_ms: u64,
+) -> Result<()> {
+    let queued: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pending_delete WHERE locator=?1)",
+        [&r.locator],
+        |row| row.get(0),
+    )?;
+    if queued {
+        return Err(StorageError::LocatorPendingDelete(r.locator.clone()));
+    }
+    let have: Option<(String, String, String)> = tx
         .query_row(
-            "SELECT locator FROM blob_ref WHERE ref_id = ?1",
+            "SELECT attempt_id, kind, locator FROM blob_ref WHERE ref_id = ?1",
             [&r.ref_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
+    let kind = match r.kind {
+        BlobKind::Input => "input",
+        BlobKind::Log => "log",
+        BlobKind::Result => "result",
+    };
     match have {
-        Some(l) if l == r.locator => Ok(()),
+        Some((a, k, l)) if a == attempt && k == kind && l == r.locator => Ok(()),
         Some(_) => Err(StorageError::Immutable(format!("reference {}", r.ref_id))),
         None => common::add_blob_ref(
             tx,
@@ -253,6 +271,122 @@ impl CoordinatorStore {
             return Ok(None);
         }
         self.db.call(move |c| load_row(c, &a))
+    }
+
+    /// Whitelisted immutable output metadata joined to durable receipts. No
+    /// physical object or unfinished part is made visible by this query.
+    pub fn query_output_metadata(
+        &self,
+        attempt: &AttemptId,
+        after: Option<String>,
+        limit: u32,
+    ) -> Result<crate::storage::query::Page<crate::storage::query::Output>> {
+        use crate::storage::query::Output;
+        let limit = limit.clamp(1, 64) as usize;
+        let a = attempt.to_string();
+        let receipts: Vec<(String, String, i64)> = self.db.call(move |c| {
+            let mut statement = c.prepare("SELECT name,digest,size FROM artifact_receipt WHERE attempt_id=?1 AND persisted_at_ms IS NOT NULL ORDER BY name LIMIT 1025")?;
+            let rows = statement.query_map([a], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
+            Ok(rows)
+        })?;
+        if receipts.len() > crate::outputs::MAX_OUTPUTS {
+            return Err(StorageError::Corrupt("too many receipts".into()));
+        }
+        let row = self.collection(attempt)?;
+        let mut items = Vec::new();
+        if let Some(result) = row.and_then(|r| r.result) {
+            self.result_data_available(
+                attempt,
+                &crate::results::store::ResultStore::result_locator(attempt),
+            )?;
+            if result
+                .get("attempt_id")
+                .is_some_and(|id| id.as_str() != Some(attempt.as_str()))
+            {
+                return Err(StorageError::Corrupt("result attempt mismatch".into()));
+            }
+            let artifacts: Vec<crate::wire::ArtifactRecord> = serde_json::from_value(
+                result
+                    .get("artifacts")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            )
+            .map_err(|e| StorageError::Corrupt(e.to_string()))?;
+            let not_stored: Vec<crate::wire::ArtifactNotStored> = serde_json::from_value(
+                result
+                    .get("artifacts_not_stored")
+                    .cloned()
+                    .unwrap_or_else(|| json!([])),
+            )
+            .map_err(|e| StorageError::Corrupt(e.to_string()))?;
+            if artifacts.len() + not_stored.len() > crate::outputs::MAX_OUTPUTS
+                || artifacts.iter().any(|a| a.attempt_id != *attempt)
+            {
+                return Err(StorageError::Corrupt("invalid result artifacts".into()));
+            }
+            let declarations = artifacts
+                .iter()
+                .map(|a| a.name.as_str())
+                .chain(not_stored.iter().map(|a| a.name.as_str()))
+                .map(|name| crate::wire::ArtifactDecl {
+                    name: name.into(),
+                    path: name.into(),
+                    if_missing: crate::wire::MissingPolicy::Optional,
+                })
+                .collect::<Vec<_>>();
+            crate::outputs::validate(&declarations, &[])
+                .map_err(|e| StorageError::Corrupt(e.into()))?;
+            for artifact in artifacts {
+                let name = artifact.name.clone();
+                let output = if let Some((_, digest, size)) =
+                    receipts.iter().find(|(name, _, _)| *name == artifact.name)
+                {
+                    if *digest != artifact.digest.as_str()
+                        || u64::try_from(*size).ok() != Some(artifact.size)
+                    {
+                        return Err(StorageError::Corrupt(
+                            "artifact receipt differs from immutable result".into(),
+                        ));
+                    }
+                    self.result_data_available(
+                        attempt,
+                        &crate::results::store::ResultStore::artifact_locator(
+                            attempt,
+                            &artifact.digest,
+                        ),
+                    )?;
+                    Output::Artifact {
+                        record: artifact.into(),
+                    }
+                } else {
+                    Output::Pending { name: name.clone() }
+                };
+                items.push((name, output));
+            }
+            items.extend(not_stored.into_iter().map(|a| {
+                (
+                    a.name.clone(),
+                    Output::NotStored {
+                        name: a.name,
+                        reason: a.reason,
+                        if_missing: a.if_missing,
+                    },
+                )
+            }));
+        }
+        items.sort_by(|a, b| a.0.cmp(&b.0));
+        items.retain(|(name, _)| after.as_ref().is_none_or(|a| name > a));
+        let more = items.len() > limit;
+        items.truncate(limit);
+        let next_cursor = if more {
+            items.last().map(|(name, _)| name.clone())
+        } else {
+            None
+        };
+        Ok(crate::storage::query::Page {
+            items: items.into_iter().map(|(_, item)| item).collect(),
+            next_cursor,
+        })
     }
 
     /// The artifacts of an attempt that are verified and published here:

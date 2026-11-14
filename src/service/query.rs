@@ -7,6 +7,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "query", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Query {
+    OutputMetadata {
+        task_id: TaskId,
+        attempt_id: AttemptId,
+        after: Option<String>,
+        limit: u32,
+    },
+    LogMetadata {
+        task_id: TaskId,
+        attempt_id: AttemptId,
+    },
     Completion {
         target: super::completion::Target,
     },
@@ -50,9 +60,28 @@ pub struct Attempt {
     pub collection_verdict: Option<String>,
     pub collection_closed_at_ms: Option<u64>,
 }
+/// Whitelisted log identity and durable stream facts; no payload or node input.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LogMetadata {
+    pub attempt_id: AttemptId,
+    pub task_id: TaskId,
+    pub run_id: RunId,
+    pub generation: Generation,
+    pub terminal: bool,
+    pub collection_verdict: Option<String>,
+    pub collection_closed_at_ms: Option<u64>,
+    pub stdout: Option<crate::storage::LogProgress>,
+    pub stderr: Option<crate::storage::LogProgress>,
+}
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
+    OutputMetadata {
+        page: Page<crate::storage::query::Output>,
+    },
+    LogMetadata {
+        metadata: Box<LogMetadata>,
+    },
     Completion {
         snapshot: super::completion::Snapshot,
     },
@@ -75,6 +104,63 @@ pub enum Response {
 impl CoordinatorStore {
     pub fn query(&self, query: Query) -> Result<Response> {
         Ok(match query {
+            Query::OutputMetadata {
+                task_id,
+                attempt_id,
+                after,
+                limit,
+            } => {
+                let a = self.get_attempt(&attempt_id)?.ok_or_else(|| {
+                    crate::storage::StorageError::NotFound {
+                        what: "attempt".into(),
+                    }
+                })?;
+                if a.task_id != task_id {
+                    return Err(crate::storage::StorageError::Invalid(
+                        "attempt does not belong to task".into(),
+                    ));
+                }
+                Response::OutputMetadata {
+                    page: self.query_output_metadata(&attempt_id, after, limit)?,
+                }
+            }
+            Query::LogMetadata {
+                task_id,
+                attempt_id,
+            } => {
+                let task = self.query_task(task_id.clone())?.ok_or_else(|| {
+                    crate::storage::StorageError::NotFound {
+                        what: format!("task {task_id}"),
+                    }
+                })?;
+                let attempt = self.get_attempt(&attempt_id)?.ok_or_else(|| {
+                    crate::storage::StorageError::NotFound {
+                        what: format!("attempt {attempt_id}"),
+                    }
+                })?;
+                if attempt.task_id != task_id {
+                    return Err(crate::storage::StorageError::Invalid(
+                        "attempt does not belong to task".into(),
+                    ));
+                }
+                let (collection_verdict, collection_closed_at_ms) =
+                    self.query_collection_metadata(&attempt_id)?;
+                Response::LogMetadata {
+                    metadata: Box::new(LogMetadata {
+                        stdout: self
+                            .query_log_progress(&attempt_id, crate::wire::LogStream::Stdout)?,
+                        stderr: self
+                            .query_log_progress(&attempt_id, crate::wire::LogStream::Stderr)?,
+                        attempt_id,
+                        task_id,
+                        run_id: task.run_id,
+                        generation: attempt.generation,
+                        terminal: attempt.termination.is_some(),
+                        collection_verdict,
+                        collection_closed_at_ms,
+                    }),
+                }
+            }
             Query::Completion { target } => Response::Completion {
                 snapshot: self.completion(target)?,
             },
@@ -190,7 +276,14 @@ impl Reader {
                 tokio::task::spawn_blocking(move || store.query(query))
                     .await
                     .map_err(|e| Error::new(crate::error::ErrorCode::Internal, e))?
-                    .map_err(|e| Error::new(e.code(), e))
+                    .map_err(|e| {
+                        let code = if e.is_retryable() {
+                            crate::error::ErrorCode::Overloaded
+                        } else {
+                            e.code()
+                        };
+                        Error::new(code, e)
+                    })
             }
         }
     }

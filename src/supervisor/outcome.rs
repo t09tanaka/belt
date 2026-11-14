@@ -125,7 +125,7 @@ fn source_io(source: &Path) -> impl Fn(io::Error) -> OutcomeError + '_ {
     }
 }
 
-fn artifacts_root(root: &Path, attempt: &AttemptId) -> PathBuf {
+pub(super) fn artifacts_root(root: &Path, attempt: &AttemptId) -> PathBuf {
     root.join(attempt.as_str()).join("artifacts")
 }
 
@@ -165,8 +165,8 @@ fn checked_source(workspace: &Path, source: &Path) -> Result<(PathBuf, fs::Metad
 /// `max_bytes`, a non-regular source (a symlink, a device) or a name that is not
 /// a plain relative path is refused before anything is kept. The same name with
 /// the same content is a replay (the existing file is kept); with other content
-/// it is a conflict. Call it after the command has exited: a directory swapped
-/// for a symlink between the check and the open is not defended against.
+/// it is a conflict. Call it after the command has exited. The source is opened through held
+/// directory descriptors with NOFOLLOW, including the leaf (NONBLOCK).
 ///
 /// Secrets (`input.forbidden`): the file that was opened is compared, by
 /// device and inode of the open handle, with the secret files placed for the
@@ -187,7 +187,22 @@ pub fn store_artifact(
     let rel =
         relative_path(input.name).ok_or_else(|| OutcomeError::BadName(input.name.to_string()))?;
     let (source, meta) = checked_source(workspace, input.source)?;
-    let mut src = File::open(&source).map_err(source_io(input.source))?;
+    // Legacy callers may supply a trusted workspace root reached through a
+    // symlink. Descendants still use the same fd-only reader as generic outputs.
+    let workspace_fd: File = rustix::fs::open(
+        workspace,
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY | rustix::fs::OFlags::CLOEXEC,
+        rustix::fs::Mode::empty(),
+    )
+    .map_err(std::io::Error::from)?
+    .into();
+    let mut src = crate::platform::open_beneath_dir(
+        &workspace_fd,
+        source
+            .strip_prefix(workspace)
+            .map_err(|_| OutcomeError::BadSource(source.clone()))?,
+    )
+    .map_err(source_io(input.source))?;
     let opened = src.metadata()?;
     if !opened.is_file() || (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
         return Err(OutcomeError::NotRegular(input.source.to_path_buf()));
@@ -244,6 +259,7 @@ pub fn store_artifact(
     }
     File::open(parent)?.sync_all()?;
     Ok(ArtifactRecord {
+        encoding: crate::wire::ArtifactEncoding::Raw,
         name: input.name.to_string(),
         path: input.name.to_string(),
         size,
@@ -260,7 +276,7 @@ pub fn store_artifact(
 /// area leads outside it. `base` itself is the configured root and is trusted.
 /// (A swap between the check and the use needs a writer inside the area, which
 /// only the supervisor's own user has.)
-fn ensure_real_dirs(base: &Path, comps: &[&std::ffi::OsStr]) -> Result<()> {
+pub(super) fn ensure_real_dirs(base: &Path, comps: &[&std::ffi::OsStr]) -> Result<()> {
     let mut cur = base.to_path_buf();
     for c in comps {
         cur.push(c);
@@ -628,13 +644,21 @@ pub fn finish_attempt_with<'a>(
         )?;
     }
     // One commit: a reader that finds the attempt terminal finds its result.
+    let outputs_evaluated = store
+        .events_of(attempt, "artifacts_stored")?
+        .iter()
+        .any(|e| e.payload["outputs_evaluated"] == true);
     let (artifacts, not_stored) = (artifacts.to_vec(), not_stored.to_vec());
     let (fin, result, fresh) =
         store.finalize_with_result(attempt, termination, at_ms, move |fixed| {
-            with_not_stored(
+            let mut result = with_not_stored(
                 result_json(fixed, &artifacts, summary(out), summary(err)),
                 &not_stored,
-            )
+            );
+            if outputs_evaluated {
+                result["outputs_evaluated"] = json!(true);
+            }
+            result
         })?;
     // The stored result is the truth, whichever call stored it: a crash
     // between storing it and the events is repaired by the next call, which

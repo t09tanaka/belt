@@ -15,6 +15,15 @@ use crate::wire::{AttemptPayload, SecretFile};
 use crate::workspace::Workspace;
 
 pub trait Host: Send + Sync {
+    fn admit(&self, payload: &AttemptPayload) -> Result<(), ApiError> {
+        if payload.in_place {
+            return Err(ApiError::new(
+                crate::error::ErrorCode::InvalidInput,
+                "in-place requires the parent local worker",
+            ));
+        }
+        Ok(())
+    }
     /// Once, before any secret is read (process-wide).
     fn disable_core_dumps(&self) -> Result<(), ApiError>;
     /// Plaintext secret bundles a crashed capture left in the source store.

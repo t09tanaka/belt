@@ -194,6 +194,8 @@ impl Fx {
     fn payload_of(&self, run: &RunId, spec: &SetupSpec) -> AttemptPayload {
         let d = Digest::of_bytes(b"the source");
         AttemptPayload {
+            outputs: Vec::new(),
+            in_place: false,
             run_id: run.clone(),
             task_id: TaskId::generate(),
             generation: Generation(1),

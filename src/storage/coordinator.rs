@@ -6,9 +6,10 @@ use super::common::{self, from_json, json, parse_state};
 use super::policy::{Access, GcCandidate};
 use super::Db;
 use super::{
-    to_i64, to_u64, BlobRef, DbKind, Event, Finalized, GcReport, NewBlobRef, ProcessLock, Result,
-    StorageError, DEFAULT_GC_BATCH,
+    to_i64, to_u64, DbKind, Event, Finalized, NewBlobRef, ProcessLock, Result, StorageError,
 };
+#[cfg(test)]
+use super::{BlobRef, GcReport, DEFAULT_GC_BATCH};
 use crate::ids::{
     AttemptId, ClusterId, CoordinatorEpoch, CoordinatorId, Digest, Generation, IdError,
     ManifestDigest, PayloadHash, PermitId, RunId, SourceId, TaskId, WorkerId,
@@ -18,7 +19,11 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 use std::path::Path;
 
+mod retention;
+pub use retention::{ResultDeleteClaim, ResultGcPage};
 mod collect;
+mod live_log;
+pub use live_log::{LiveLogTarget, LogProgress};
 mod control;
 mod retry;
 pub use retry::{PreparedRetry, RetryPreparation};
@@ -163,6 +168,12 @@ fn confirm_tombstone(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
 /// The confirmed retire of an attempt that did not end: the attempt is
 /// retired and its task is free for a new one.
 fn free_by_retire(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
+    let in_place: bool = conn.query_row("SELECT coalesce(json_extract(t.spec_json,'$.in_place'),0) FROM task t JOIN attempt a USING(task_id) WHERE a.attempt_id=?1",[aid],|r|r.get(0))?;
+    if in_place {
+        return Err(StorageError::Invalid(
+            "in-place cannot be automatically retried".into(),
+        ));
+    }
     confirm_tombstone(conn, aid, at_ms)?;
     let n = conn.execute(
         "UPDATE attempt SET retired = 1, retired_at_ms = COALESCE(retired_at_ms, ?2)
@@ -248,10 +259,83 @@ pub struct CoordinatorStore {
     /// False for a file from before the third step opened read-only: it has
     /// no `collection` table (no collection of it was ever begun).
     collections: bool,
+    state_dir: std::path::PathBuf,
     _lock: Option<ProcessLock>,
 }
 
 impl CoordinatorStore {
+    /// Resolve immutable target identity, lock one run, then validate fresh metadata.
+    /// Export/read commands must retain this pin for their whole invocation.
+    pub fn result_read_pin(
+        &self,
+        target: &crate::service::completion::Target,
+        attempt: Option<&AttemptId>,
+    ) -> Result<crate::results::pin::RunPin> {
+        let run = self.result_target_run(target, attempt)?;
+        let pin =
+            crate::results::pin::RunPin::shared(&self.state_dir, &run).map_err(
+                |error| {
+                    match error.kind() {
+                std::io::ErrorKind::NotFound => not_found(
+                    "result reader pin unavailable; compatible owner must backfill legacy state",
+                ),
+                std::io::ErrorKind::WouldBlock => {
+                    StorageError::Locked(self.state_dir.join(format!("reader-pins/{run}.lock")))
+                }
+                _ => StorageError::Io(error),
+            }
+                },
+            )?;
+        if self.result_target_run(target, attempt)? != run {
+            return Err(StorageError::Invalid(
+                "result target changed while acquiring pin".into(),
+            ));
+        }
+        Ok(pin)
+    }
+    fn result_target_run(
+        &self,
+        target: &crate::service::completion::Target,
+        attempt: Option<&AttemptId>,
+    ) -> Result<RunId> {
+        use crate::service::completion::Target;
+        match target {
+            Target::Run(run) if attempt.is_none() => self
+                .query_run(run.clone())?
+                .map(|_| run.clone())
+                .ok_or_else(|| not_found("run")),
+            Target::Task(task) => {
+                let row = self
+                    .query_task(task.clone())?
+                    .ok_or_else(|| not_found("task"))?;
+                if let Some(a) = attempt {
+                    if self.get_attempt(a)?.is_none_or(|a| a.task_id != *task) {
+                        return Err(not_found("attempt of selected task"));
+                    }
+                }
+                Ok(row.run_id)
+            }
+            _ => Err(StorageError::Invalid("attempt requires task".into())),
+        }
+    }
+    pub(crate) fn result_writer_pin(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<crate::results::pin::RunPin> {
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+        let task = self
+            .get_attempt(attempt)?
+            .ok_or_else(|| not_found("attempt"))?
+            .task_id;
+        let run = self
+            .query_task(task)?
+            .ok_or_else(|| not_found("task"))?
+            .run_id;
+        crate::results::pin::RunPin::ensure(&self.state_dir, &run)?;
+        Ok(crate::results::pin::RunPin::shared(&self.state_dir, &run)?)
+    }
     /// Prepare a private, fully initialized metadata database without claiming an epoch.
     /// The publish callback journals the staged inode before its no-replace rename.
     /// Existing databases are inspected read-only under the owner lock, never migrated.
@@ -380,6 +464,7 @@ impl CoordinatorStore {
             task_cancel: true,
             retry_boundaries: true,
             collections: true,
+            state_dir: state_dir.to_path_buf(),
             _lock: Some(lock),
         })
     }
@@ -437,6 +522,7 @@ impl CoordinatorStore {
             task_cancel,
             retry_boundaries: db_has_retry,
             collections,
+            state_dir: state_dir.to_path_buf(),
             _lock: None,
         })
     }
@@ -506,6 +592,10 @@ impl CoordinatorStore {
         spec: &Value,
         at_ms: u64,
     ) -> Result<()> {
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+        crate::results::pin::RunPin::ensure(&self.state_dir, run_id)?;
         let run = run_id.to_string();
         let source = source_id.map(ToString::to_string);
         let bundle = secret_bundle_id.map(str::to_string);
@@ -1262,10 +1352,12 @@ impl CoordinatorStore {
     /// and the event journal are never touched. The pass is a series of
     /// transactions of [`DEFAULT_GC_BATCH`] references; a busy database is
     /// [`StorageError::Busy`] and the pass can simply be run again.
+    #[cfg(test)]
     pub fn gc(&self, now_ms: u64, retention_ms: u64) -> Result<GcReport> {
         self.gc_batched(now_ms, retention_ms, DEFAULT_GC_BATCH)
     }
 
+    #[cfg(test)]
     pub(crate) fn gc_batched(
         &self,
         now_ms: u64,

@@ -105,7 +105,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 
 ### 受入環境と S26 の進め方
 
-- 当面の追加 worker と Linux 検証には Docker を使う。別 state dir と portool で分離し、複数 worker、親の再起動、接続断、ACK 消失、worker 消失、cold/warm と親単独との差を確認する。
+- ユーザーの受入環境では追加の Mac/Linux 実機を準備しない。当面の追加 worker と Linux 検証には承認済みの Docker を使う。別 state dir と portool で分離し、複数 worker、親の再起動、接続断、ACK 消失、worker 消失、cold/warm と親単独との差を確認する。
 - Docker 上の Linux worker と macOS ホストの結果は区別する。Docker を別の Mac 実機と記載せず、独立した Mac の sleep・boot・launchd・実機間転送など、代替できない項目は実機確認待ちとして A 対応表と最終報告へ残す。
 - 公開する版には Docker で確認した範囲と未検証範囲を明記する。実機未確認の項目を、A01〜A49 全件確認済みと報告しない。
 
@@ -198,3 +198,94 @@ managed init、独立 worker role、配置前の source readiness、双方向に
 `--in-place`、requires/profile、条件付き・glob・複数 path の出力計画、公開 logs/outputs、retention/GC、estimate、SSH の接続所有と再接続は引き続き必須残件である。途中ログの storage 基盤と collector 接続は別 slice とし、終了後の再生だけを live follow 完成とは扱わない。
 
 統合 HEAD の全体ローカル CI は通常テスト・coverage を通過した一方、mutation の unmutated baseline で init readiness 2 件と captured submit 1 件が期限切れになった。原因は未確定で、変異の結果とは区別する。private fixture の owned child にだけ Tokio worker 数を制限し、init の終了状態・private stderr の固定分類、submit の bounded TTC ledger/sidecar metadata と worker journal を期限切れ時に残す。本番の CPU guard・期限・登録手順は変更しない。対象 3 件は各 3 回と strict clippy が成功した。診断追加後の全体 CI とリモート検証は未実施である。
+
+### S15e の増分ログ回収
+
+S15e1a は schema v7 の stream ごとの committed offset、GC ref の先行登録、CAS 更新、未 commit tail の回復、読取専用の prefix reader、検証済み旧 receipt の引継ぎを実装・独立レビュー済み。storage 92 件・ResultStore 14 件・migration と読取専用 CLI の関連 1 件、strict clippy が成功した。collector / resident の増分回収と公開 `logs --follow` は後続 slice で接続する。`outputs`、resident GC と reader lifetime の接続は別の必須残件であり、この基盤だけで S15e 完成とは扱わない。
+
+S15a は PR #40（merge `8939ef2`）、S15b は PR #41（merge `05e981c`）で main に統合済み。各対象 HEAD のローカル実行 9 ジョブとリモート 9 ジョブが成功した。S15c の bootstrap / source / query slice は PR #42 でリモート CI を確認中。
+
+
+S15e public logs slice は read-only metadata / committed-prefix reader を公開 `logs` と
+`logs --follow` へ接続する。32-task pagination、64 KiB raw chunk、NDJSON base64、
+private SQLite 配信 cursor、latest/min_generation と明示 --attempt、collection closed
+までの follow と Ctrl-C detach を実装する。active collector から公開 observer までの
+回帰、raw bytes / retry / 欠損 / 大規模ページ / cursor permissions を focused 検証済み。
+unit 10 件・active collector から公開 follow まで 1 件・実 CLI 2 件が成功し、
+実行中および終了後 final の blocked stdout でも SIGINT detach と cursor cleanup を確認した。
+strict all-target clippy、fmt、diff check も成功した。
+outputs、resident GC / reader lifetime、output planner、estimate は別の必須残件として残す。
+
+Generic outputs worker/collector slice adds frozen declarations, success/failure/always
+eligibility and TarV1 opaque bundles. Multiple globs and literal directories preserve
+workspace-relative member paths. Additive schema-1 serialization retains historical raw
+canonical bytes; every live hello requires output_bundles_v1. The journal fixes encoding, outputs_evaluated
+and all eligible stored/not-stored names before terminal settlement; collector exact-name
+receipts and ACK remain opaque. Public outputs query/export and resident result GC are integrated below; estimate and
+CI intermediate upload/download integration remain required follow-up work.
+
+
+Public outputs slice connects paged read-only immutable artifact metadata and durable receipts to legacy raw and TarV1 export. Private bounded spooling verifies outer size/digest; full tar structural/path preflight precedes fd-based no-replace publication. It preserves partial successes, emits bounded NDJSON outcomes/final counts and reuses logs' interruptible final emitter. Real worker execution through immutable bundle, parent receipt and offline public CLI export covers raw plus two generic members, no Git, unchanged epoch and historical-attempt conflicts. Focused hostile archive, symlink, concurrent no-replace, receipt visibility, metadata paging and retry boundary tests accompany the change. Result GC/pinning is integrated below; estimate and CI intermediate artifacts remain mandatory follow-up work.
+
+Public outputs independent review corrections restrict artifact query records to name, encoding, digest and size; declaration paths and execution identities remain private. Producer and retained export share the reserved component namespace and existing Unicode/case folding. Retained archive validation failures use Internal (79), while destination argument errors and no-replace conflicts retain their existing codes. Regression coverage includes exact public metadata keys, reserved nested/alias paths, malformed archives with matching outer receipts, and zero member publication before complete preflight. GC invocation pin integration is completed in the integration section below.
+Focused output tests (13), real offline CLI corruption/export regressions (2), and strict all-target clippy pass for these corrections. Independent resolution review and combined full CI remain parent integration checks.
+
+S15d in-place slice は公開 `exec --in-place` を既存の型付きWorkspaceへ接続する。
+Git worktree / directoryの原本rootをprivate run bindingに保持し、baseline sourceと
+mutable modeを分離する。親local identityのscheduler制限とworker admissionの両方で
+remote配置を拒否し、setup template/cacheと自動retryを無効化する。明示retryはD2の
+停止・回収・revision条件を維持して同じ原本を再実行する。元secret inventoryの増減は
+新しいexecを求め、値変更は現物をread-onlyでmaskする。原本へのsecret配置・消去を
+行わない。public task/completionはpathを含めずin_place flagを示す。private bindingは
+親stateとともに保持し、個別GCは後続の親retention統合事項とする。
+
+このsliceのfocused検証はin-place unit 5件・integration 8件（実CLIの原本更新、
+owner再起動と明示retry、Git secret現物maskとinventory拒否、prepareとrequired output、
+SIGINT停止確定、scheduler / worker admission / 原本cleanup）に加え、secret unit 76件、
+retry関連20件、legacy payload hash 1件、既存実SIGINT 1件、未実装CLI grammar 3件が成功。
+strict all-target / all-feature clippy、fmt、diff checkが成功。全体CIと公開は統合時に行う。
+
+独立レビューのP2（元subdirectoryが外部symlinkへ差し替わると明示retryでroot外へ
+cwdが解決される）を修正した。Agentのprepareでin-placeの全command cwdを
+canonicalizeし、directoryかつ検証済み原本root内の場合のみresolved pathを使う。
+owner再起動後の差替えretryがrunning前に拒否され、外部markerを作らず原本とsecretを
+保つ回帰を含むin-place unit 5件・integration 9件、通常snapshot exec回帰、strict clippy
+が成功した。TTCのpath登録後に同UIDが任意に差し替える競合への新たなFD layerは追加していない。
+
+### 結果 retention GC の独立レビュー修正
+
+独立レビューの 3 指摘（祖先 symlink 経由の外部削除、GC pin 競合時の live collection 全体停止、run 選択での task 全件集計）に限定して修正する。
+root/祖先 FD と NOFOLLOW による unlink、競合対象の pending 再試行、run ID index の 1 件 keyset query を実装した。
+実 GC claim と外部 sentinel、root/祖先/leaf symlink と rename 競合、pin 競合中の収集/tick と実 resident の IPC/lease 継続・解放後の回収再開、破損 pin、2000 task と EXPLAIN/no-task-facts の回帰を追加した。
+修正後の results unit 39 件、guarded retention 4 件、indexed run 選択 1 件、実 resident の競合回帰 1 件、collection 競合回帰 2 件、strict clippy all-targets/all-features は成功。collection 全体は 38 件中 37 件成功後、新規 fixture の pin backfill 不足を修正し、その 2 件を再実行して成功した。
+独立レビュアーの resolved 確認、全 CI と Linux 実行はこの実装修正時点では未完了。pure clock policy は変更していない。
+
+追加調査で enqueue の run INSERT が create_run の durable pin 準備を迂回していたため、両公開経路を確認し、enqueue も既存 blocking wrapper 内・DB transaction 前に pin を作成/fsync するよう修正した。
+pin 準備失敗時に run/task が公開されない回帰と、実 resident IPC の submit を全 worker offline で受理した直後に logs 共通 observer が pending を返し follow を継続する回帰が成功した。追加修正後の strict clippy all-targets/all-features も成功。独立レビューの resolved 確認と全 CI は引き続き未完了。
+
+### Public outputs と result retention GC の統合
+
+独立確認済みの public outputs と result retention/in-place feature を統合した。
+TaskSpec/AttemptPayload の outputs と in_place、明示 encoding/outputs_evaluated、schema 8 の
+result refs/clock/pins は同時に保持し、legacy raw serialization と両 PURE 対象・coverage union を残す。
+outputs は configured read-only store の identity 検証と run shared pin 取得後に fresh metadata を読む。
+pin は処理ブロック外側で保持し、owned blocking export worker の cooperative cancel/drain と
+最終 write/flush（backpressure・SIGINT を含む）の完了後に解放する。logs Observer の既存 pin も保持する。
+metadata query は fresh durable result/blob refs と既知の delete claim を確認し、expired/unreferenced/claimed は
+NOT_FOUND / 73 とする。claim 永続化後・FS 削除前の owner crash でも残存 file を成功 export しない。
+live ref の published file 欠損・短縮・破損は INTERNAL / 79 を維持し、全 NotFound の一律変換を行わない。
+reader は owner 起動・Git/project 読取・DB 更新・pin 作成を行わない。
+
+この統合は result store のみを対象とする。source/Vault/private in-place binding の GC は引き続き必須残件で、
+原本 filesystem は削除対象にしない。全 CI・公開前検証と最終 acceptance は親統合で行う。
+Docker/Linux の承認済み受入と、追加 Mac 実機の sleep/boot/実 launchd 未確認は上記受入環境に従い区別する。
+
+統合後の focused 検証は outputs/export unit 15、logs unit 11、public outputs CLI 3、guarded retention 4、
+indexed run 選択 1、migration 2、legacy hash/encoding 2、実 resident GC 競合 1、in-place integration 9、
+通常 snapshot/offline control 1、collection integration 39、実 worker から offline raw/Tar export 1 の計 89 件が成功。
+raw/Tar の export outcome・final write・final flush をそれぞれ block して GC 排他拒否を確認し、
+実 CLI の Tar worker 中断は cooperative drain・temp cleanup 後に pin を解放する。
+実 CLI で live-ref file 欠損 79、owner restart/claim-before-FS と削除完了後の 73 を区別した。
+strict all-target/all-feature clippy、fmt、diff check、公開禁止文字列 scan は成功。
+今回新しい pure decision helper は追加しておらず、元 feature の PURE/coverage union と clock/mutation 証跡を保持する。
+全体 local CI・MSRV・Linux と公開はこの focused 検証に含めない。

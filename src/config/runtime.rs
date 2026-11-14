@@ -187,6 +187,22 @@ impl WorkerRuntime {
         .map(Arc::new)
     }
 
+    pub(crate) fn open_host_in_place(
+        &self,
+        parent_state: PathBuf,
+    ) -> Result<Arc<Machine>, ApiError> {
+        Machine::open(
+            &self.agent.state_dir,
+            self.env.clone(),
+            self.cluster_key_path.clone(),
+        )
+        .and_then(|machine| machine.with_setup(self.setup.clone()))
+        .map(|machine| Arc::new(machine.with_in_place(parent_state, self.agent.worker_id.clone())))
+    }
+    pub(crate) fn start_with_host(self, host: Arc<Machine>) -> Result<Arc<Agent>, ApiError> {
+        Agent::start(self.agent, host)
+    }
+
     pub fn start(self) -> Result<Arc<Agent>, ApiError> {
         let host = self.open_host()?;
         Agent::start(self.agent, host)

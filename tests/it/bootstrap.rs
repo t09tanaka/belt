@@ -405,7 +405,7 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
     // Simulate the pre-index schema with durable rows and no running owner.
     let db = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
     db.execute_batch(
-        "DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; UPDATE schema_meta SET value='3' WHERE key='schema_version';",
+        "DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; UPDATE schema_meta SET value='3' WHERE key='schema_version';",
     )
     .unwrap();
     let old_epoch: i64 = db
@@ -1238,9 +1238,28 @@ async fn control_wait_interrupt_detaches_without_cancelling_work() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_real_exec_sigint_only_signals_owned_cli_and_confirms_worker_stop() {
+    control_exec_sigint(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_real_exec_sigint_confirms_stop_and_preserves_original() {
+    control_exec_sigint(true).await;
+}
+async fn control_exec_sigint(in_place: bool) {
     let (_root, spec, input) = control_fixture();
     let mut child = tokio::process::Command::new(&spec.executable)
-        .args(["--json", "exec", "--", "/bin/sh", "-c", "sleep 30"])
+        .args(if in_place {
+            vec![
+                "--json",
+                "exec",
+                "--in-place",
+                "--",
+                "/bin/sh",
+                "-c",
+                "sleep 30",
+            ]
+        } else {
+            vec!["--json", "exec", "--", "/bin/sh", "-c", "sleep 30"]
+        })
         .env_clear()
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
         .envs(&spec.env)
@@ -1303,6 +1322,14 @@ async fn control_real_exec_sigint_only_signals_owned_cli_and_confirms_worker_sto
         .unwrap()
         .is_empty());
     shutdown(&load(&spec)).await;
+    assert!(input.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(input.join("input.txt")).unwrap(),
+        "snapshot"
+    );
+    if in_place {
+        assert_eq!(value["result"]["snapshot"]["in_place"], true);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1601,4 +1628,1128 @@ async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
     assert!(!snapshot.cancel_requested);
     drop(owner);
     shutdown(&client).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git() {
+    use remote_task_runner::ids::{AttemptId, Digest, RunId, TaskId};
+    use remote_task_runner::state::AttemptState;
+    use remote_task_runner::storage::NewAttempt;
+    use remote_task_runner::wire::LogStream;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let (root, spec, _) = control_fixture();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let attempt = AttemptId::generate();
+    let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+    owner
+        .create_run(
+            &run,
+            None,
+            None,
+            &serde_json::json!({"secret":"NO_LOG_PAYLOAD"}),
+            1,
+        )
+        .unwrap();
+    owner
+        .create_task(&task, &run, &serde_json::json!({}), 1)
+        .unwrap();
+    owner
+        .create_attempt(
+            NewAttempt {
+                attempt_id: attempt.clone(),
+                task_id: task.clone(),
+                worker_id: spec.worker_id.clone(),
+                payload_hash: Digest::of_bytes(b"p"),
+                permit_id: None,
+            },
+            2,
+        )
+        .unwrap();
+    for state in [
+        AttemptState::Preparing,
+        AttemptState::Ready,
+        AttemptState::Starting,
+        AttemptState::Active,
+    ] {
+        owner.transition_attempt(&attempt, state, 3).unwrap();
+    }
+    let files =
+        remote_task_runner::results::store::ResultStore::open(&spec.state_dir.join("results"))
+            .unwrap();
+    owner
+        .prepare_log_progress(&attempt, LogStream::Stdout, 3)
+        .unwrap();
+    files
+        .append_log(&attempt, LogStream::Stdout, 0, b"\xff\0active")
+        .unwrap();
+    owner
+        .commit_log_progress(&attempt, LogStream::Stdout, 0, 8, false, false, 0, 4)
+        .unwrap();
+    let epoch = owner.epoch();
+    drop(owner);
+    let mut snapshot = tokio::process::Command::new(&spec.executable);
+    snapshot
+        .args(["logs", task.as_str()])
+        .env_clear()
+        .envs(&spec.env)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path());
+    let output = tokio::time::timeout(Duration::from_secs(10), snapshot.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"\xff\0active");
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "logs", task.as_str(), "--follow"])
+        .env_clear()
+        .envs(&spec.env)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut first))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.is_empty());
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).await.unwrap();
+    let all = [first.as_bytes(), rest.as_slice()].concat();
+    let records = all
+        .split(|b| *b == b'\n')
+        .filter(|s| !s.is_empty())
+        .map(|s| serde_json::from_slice::<serde_json::Value>(s).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["data"]["kind"] == "final")
+            .count(),
+        1
+    );
+    assert_eq!(records.last().unwrap()["data"]["summary"]["detached"], true);
+    let reader = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert_eq!(reader.epoch(), epoch);
+    assert!(reader.task_cancel_requested(&task).unwrap().is_none());
+    assert!(reader
+        .get_attempt(&attempt)
+        .unwrap()
+        .unwrap()
+        .cancel_requested_at_ms
+        .is_none());
+    assert!(!spec.state_dir.join("parent").exists());
+    drop(reader);
+    let owner = CoordinatorStore::open(&spec.state_dir, 5).unwrap();
+    let bytes = vec![b'x'; 1024 * 1024];
+    files
+        .append_log(&attempt, LogStream::Stdout, 8, &bytes)
+        .unwrap();
+    owner
+        .commit_log_progress(
+            &attempt,
+            LogStream::Stdout,
+            8,
+            8 + bytes.len() as u64,
+            false,
+            false,
+            0,
+            6,
+        )
+        .unwrap();
+    drop(owner);
+    let mut blocked = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "logs", task.as_str(), "--follow"])
+        .env_clear()
+        .envs(&spec.env)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = blocked.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    let mut unconsumed = tokio::io::BufReader::new(blocked.stdout.take().unwrap());
+    let mut first = String::new();
+    tokio::time::timeout(Duration::from_secs(10), unconsumed.read_line(&mut first))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.is_empty());
+    // Deliberately stop reading while an encoded 64-KiB chunk fills the pipe.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(blocked.try_wait().unwrap().is_none());
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    // wait() does NOT drain stdout. Detach must finish even with no consumer.
+    let status = tokio::time::timeout(Duration::from_secs(3), blocked.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert!(CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .task_cancel_requested(&task)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_logs_closed_run_final_blocked_stdout_still_detaches() {
+    use remote_task_runner::ids::RunId;
+    use std::os::fd::OwnedFd;
+    let (root, spec, _) = control_fixture();
+    let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+    let run = RunId::generate();
+    owner
+        .create_run(&run, None, None, &serde_json::json!({}), 1)
+        .unwrap();
+    owner.close_run(&run, 2).unwrap();
+    let epoch = owner.epoch();
+    drop(owner);
+    // This closed no-work run emits no status/chunk records: its only stdout
+    // operation is final. Prefill an owned socket so that final cannot finish.
+    let (_unconsumed, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let buffer = [0_u8; 16384];
+    let mut filled = 0;
+    loop {
+        match writer.write(&buffer) {
+            Ok(n) => {
+                assert!(n > 0);
+                filled += n;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("prefill stdout: {error}"),
+        }
+    }
+    assert!(filled > 0);
+    writer.set_nonblocking(false).unwrap();
+    let stdout: OwnedFd = writer.into();
+    let temporary = root.path().join("reader-tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "logs", run.as_str(), "--follow"])
+        .env_clear()
+        .envs(&spec.env)
+        .env("TMPDIR", &temporary)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(child.try_wait().unwrap().is_none());
+            if std::fs::read_dir(&temporary).unwrap().next().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Allow the empty, read-only sweep to reach its sole final write.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    assert_eq!(
+        std::fs::read_dir(&temporary).unwrap().count(),
+        0,
+        "cursor directory leaked during blocked final detach"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
+    use remote_task_runner::ids::RunId;
+    use std::os::fd::OwnedFd;
+    let (root, spec, _) = control_fixture();
+    let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+    let run = RunId::generate();
+    owner
+        .create_run(&run, None, None, &serde_json::json!({}), 1)
+        .unwrap();
+    owner.close_run(&run, 2).unwrap();
+    drop(owner);
+    // Prefill an owned socket: observation output must remain interruptible.
+    let (_unconsumed, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let buffer = [0_u8; 16384];
+    let mut filled = 0;
+    loop {
+        match writer.write(&buffer) {
+            Ok(n) => {
+                assert!(n > 0);
+                filled += n;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("prefill stdout: {error}"),
+        }
+    }
+    assert!(filled > 0);
+    writer.set_nonblocking(false).unwrap();
+    let stdout: OwnedFd = writer.into();
+    let temporary = root.path().join("reader-tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "outputs", run.as_str(), "--dir"])
+        .arg(root.path().join("exported"))
+        .env_clear()
+        .envs(&spec.env)
+        .env("TMPDIR", &temporary)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(child.try_wait().unwrap().is_none());
+            if root.path().join("exported").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Allow the read-only observer to reach its blocked status write.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    let gc_owner = CoordinatorStore::open(&spec.state_dir, 10).unwrap();
+    assert!(
+        matches!(gc_owner.result_gc_guard(&run), Err(remote_task_runner::storage::StorageError::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
+    );
+    let epoch = gc_owner.epoch();
+    drop(gc_owner);
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    let gc_owner = CoordinatorStore::open(&spec.state_dir, 11).unwrap();
+    drop(gc_owner.result_gc_guard(&run).unwrap());
+    drop(gc_owner);
+    assert!(
+        !CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .unwrap()
+            .cancel_requested
+    );
+    assert_eq!(
+        std::fs::read_dir(&temporary).unwrap().count(),
+        0,
+        "output reader leaked a temporary file"
+    );
+}
+
+fn seed_public_output(
+    spec: &Spec,
+    bytes: &[u8],
+    encoding: remote_task_runner::wire::ArtifactEncoding,
+) -> (
+    remote_task_runner::ids::RunId,
+    remote_task_runner::ids::TaskId,
+    remote_task_runner::ids::AttemptId,
+    remote_task_runner::wire::ArtifactRecord,
+) {
+    use remote_task_runner::ids::{AttemptId, Digest, RunId, SourceId, TaskId};
+    use remote_task_runner::results::ResultStore;
+    use remote_task_runner::state::{AttemptState, Outcome, Termination};
+    use remote_task_runner::storage::{ArtifactReceipt, NewAttempt};
+    use remote_task_runner::wire::ArtifactRecord;
+    let db = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let attempt = AttemptId::generate();
+    db.create_run(&run, None, None, &serde_json::json!({}), 1)
+        .unwrap();
+    db.create_task(&task, &run, &serde_json::json!({}), 1)
+        .unwrap();
+    db.create_attempt(
+        NewAttempt {
+            attempt_id: attempt.clone(),
+            task_id: task.clone(),
+            worker_id: spec.worker_id.clone(),
+            payload_hash: Digest::of_bytes(b"payload"),
+            permit_id: None,
+        },
+        2,
+    )
+    .unwrap();
+    for state in [
+        AttemptState::Preparing,
+        AttemptState::Ready,
+        AttemptState::Starting,
+        AttemptState::Active,
+        AttemptState::Finalizing,
+    ] {
+        db.transition_attempt(&attempt, state, 3).unwrap();
+    }
+    db.finalize_attempt(
+        &attempt,
+        Termination::new(Outcome::Succeeded, None, None).unwrap(),
+        4,
+    )
+    .unwrap();
+    let artifact = ArtifactRecord {
+        encoding,
+        name: "bundle".into(),
+        path: "PRIVATE_DECLARATION_SENTINEL".into(),
+        size: bytes.len() as u64,
+        digest: Digest::of_bytes(bytes),
+        source_id: SourceId::generate(),
+        plan_digest: Digest::of_bytes(b"plan"),
+        attempt_id: attempt.clone(),
+        profile_fingerprint: Digest::of_bytes(b"profile"),
+    };
+    db.begin_collection(
+        &attempt,
+        &Digest::of_bytes(b"result"),
+        &serde_json::json!({"artifacts":[artifact.clone()]}),
+        &[(artifact.name.clone(), true)],
+        &[remote_task_runner::storage::ResultRef {
+            ref_id: format!("{attempt}:result"),
+            kind: remote_task_runner::storage::BlobKind::Result,
+            locator: ResultStore::result_locator(&attempt),
+        }],
+        5,
+    )
+    .unwrap();
+    db.record_collected_artifact(
+        &ArtifactReceipt {
+            attempt_id: attempt.clone(),
+            name: artifact.name.clone(),
+            rel_path: artifact.path.clone(),
+            size: artifact.size,
+            digest: artifact.digest.clone(),
+            source_id: artifact.source_id.clone(),
+            plan_digest: artifact.plan_digest.clone(),
+            profile_fingerprint: artifact.profile_fingerprint.to_string(),
+        },
+        &remote_task_runner::storage::ResultRef {
+            ref_id: format!("{attempt}:artifact:{}", artifact.name),
+            kind: remote_task_runner::storage::BlobKind::Result,
+            locator: ResultStore::artifact_locator(&attempt, &artifact.digest),
+        },
+        6,
+    )
+    .unwrap();
+    let store = ResultStore::open(&spec.state_dir.join("results")).unwrap();
+    store
+        .append_part(&attempt, &artifact.digest, 0, bytes)
+        .unwrap();
+    store
+        .publish_artifact(&attempt, &artifact.digest, artifact.size)
+        .unwrap();
+    drop(store);
+    drop(db);
+    (run, task, attempt, artifact)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_outputs_retained_corruption_is_internal_before_publication() {
+    use remote_task_runner::ids::Digest;
+    use remote_task_runner::results::ResultStore;
+    use remote_task_runner::wire::ArtifactEncoding;
+    let mut builder = tar::Builder::new(Vec::new());
+    for path in ["ordinary", "nested/.GiT/config"] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, b"x".as_slice())
+            .unwrap();
+    }
+    let reserved = builder.into_inner().unwrap();
+    let mut checksum = reserved.clone();
+    checksum[0] ^= 1;
+    for bytes in [reserved, checksum, vec![0; 511]] {
+        let (root, spec, _) = control_fixture();
+        let (run, task, attempt, artifact) =
+            seed_public_output(&spec, &bytes, ArtifactEncoding::TarV1);
+        let destination = root.path().join("exported");
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(&spec.executable)
+                .args(["--json", "outputs", task.as_str(), "--dir"])
+                .arg(&destination)
+                .env_clear()
+                .envs(&spec.env)
+                .env("PATH", "/no-programs")
+                .current_dir(root.path())
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(79),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("INTERNAL"), "{text}");
+        assert!(!text.contains("PRIVATE_DECLARATION_SENTINEL"));
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        let files = ResultStore::open(&spec.state_dir.join("results")).unwrap();
+        std::fs::remove_file(files.artifact_path(&attempt, &artifact.digest)).unwrap();
+        let missing = tokio::process::Command::new(&spec.executable)
+            .args(["--json", "outputs", task.as_str(), "--dir"])
+            .arg(&destination)
+            .env_clear()
+            .envs(&spec.env)
+            .env("PATH", "/no-programs")
+            .current_dir(root.path())
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            missing.status.code(),
+            Some(79),
+            "live reference must preserve corruption classification"
+        );
+        files
+            .append_part(&attempt, &artifact.digest, 0, &bytes)
+            .unwrap();
+        files
+            .publish_artifact(&attempt, &artifact.digest, artifact.size)
+            .unwrap();
+        let db = CoordinatorStore::open(&spec.state_dir, 20).unwrap();
+        db.close_collection(
+            &attempt,
+            Some(&Digest::of_bytes(b"result")),
+            remote_task_runner::results::plan::Verdict::Complete,
+            true,
+            8,
+        )
+        .unwrap();
+        let guard = db.result_gc_guard(&run).unwrap();
+        assert!(
+            db.claim_result_page(&guard, &run, "", 64, 100, 10, Some("boot".into()), 10)
+                .unwrap()
+                .clock_held
+        );
+        assert_eq!(
+            db.claim_result_page(&guard, &run, "", 64, 110, 20, Some("boot".into()), 10)
+                .unwrap()
+                .removed,
+            2
+        );
+        let claims = db.pending_result_page(&guard, &run, 64).unwrap();
+        drop(guard);
+        drop(db); // Simulate owner crash after durable claim, before filesystem deletion.
+        for phase in 0..2 {
+            let unavailable = tokio::process::Command::new(&spec.executable)
+                .args(["--json", "outputs", task.as_str(), "--dir"])
+                .arg(&destination)
+                .env_clear()
+                .envs(&spec.env)
+                .env("PATH", "/no-programs")
+                .current_dir(root.path())
+                .output()
+                .await
+                .unwrap();
+            assert_eq!(
+                unavailable.status.code(),
+                Some(73),
+                "phase {phase}: {}",
+                String::from_utf8_lossy(&unavailable.stdout)
+            );
+            assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+            if phase == 0 {
+                assert!(files.artifact_path(&attempt, &artifact.digest).exists());
+                let restarted = CoordinatorStore::open(&spec.state_dir, 30).unwrap();
+                let guard = restarted.result_gc_guard(&run).unwrap();
+                for claim in &claims {
+                    files.remove(&claim.locator).unwrap();
+                    restarted.finish_result_delete(&guard, claim).unwrap();
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_exec_updates_original_directory_and_retries_mutable_input_after_restart() {
+    use remote_task_runner::{
+        ids::{RunId, TaskId},
+        service::{completion::Target, control},
+    };
+    let (_root, spec, input) = control_fixture();
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(&spec.executable)
+            .args([
+                "--json",
+                "exec",
+                "--in-place",
+                "--",
+                "/bin/sh",
+                "-c",
+                "cat input.txt > output.txt; exit 23",
+            ])
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+            .envs(&spec.env)
+            .current_dir(&input)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["result"]["snapshot"]["in_place"], true);
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(input.join("output.txt")).unwrap(),
+        "snapshot"
+    );
+    shutdown(&load(&spec)).await;
+    std::fs::write(input.join("input.txt"), "mutable retry").unwrap();
+    std::fs::write(input.join(".remote-task-runner.toml"), "invalid [ config").unwrap();
+    let report = control::retry(&spec, Target::Run(run.clone()))
+        .await
+        .unwrap();
+    assert!(report.retry_receipt.is_some());
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = control::wait(&spec, Target::Run(run.clone()), &mut signals)
+        .await
+        .unwrap();
+    assert_eq!(done.cli_exit_code, 23);
+    assert!(done.snapshot.unwrap().in_place);
+    assert_eq!(
+        std::fs::read_to_string(input.join("output.txt")).unwrap(),
+        "mutable retry"
+    );
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert_eq!(store.attempts_of_task(&task).unwrap().len(), 2);
+    let public = serde_json::to_string(&store.query_task(task).unwrap()).unwrap();
+    assert!(public.contains("\"in_place\":true"));
+    assert!(!public.contains(input.to_str().unwrap()));
+    let source = remote_task_runner::source::SourceStore::open(&spec.state_dir).unwrap();
+    let source_id = source.source_of_run(&run).unwrap().unwrap();
+    let manifest = source.manifest(&source_id).unwrap().unwrap();
+    let baseline = input.parent().unwrap().join("baseline-check");
+    source.materialize(&manifest, &baseline).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(baseline.join("input.txt")).unwrap(),
+        "snapshot"
+    );
+    shutdown(&load(&spec)).await;
+    assert!(input.is_dir());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_secret_values_are_read_only_masked_and_inventory_changes_reject_retry() {
+    use remote_task_runner::{
+        ids::{RunId, TaskId},
+        service::{completion::Target, control},
+        wire::LogStream,
+    };
+    let (_root, spec, input) = control_fixture();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&input)
+            .envs(&spec.env)
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::write(input.join(".gitignore"), ".env*\n").unwrap();
+    std::fs::write(
+        input.join(".remote-task-runner.toml"),
+        "schema_version = 1\n[source]\nsecret_files = [\".env*\"]\n",
+    )
+    .unwrap();
+    assert!(Command::new("git")
+        .args(["add", "."])
+        .current_dir(&input)
+        .envs(&spec.env)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["commit", "-qm", "fixture"])
+        .current_dir(&input)
+        .envs(&spec.env)
+        .status()
+        .unwrap()
+        .success());
+    let secret = input.join(".env.test");
+    std::fs::write(&secret, "TOKEN=initial-private-secret\n").unwrap();
+    let original_mode = std::fs::metadata(&secret).unwrap().permissions().mode();
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(&spec.executable)
+            .args([
+                "--json",
+                "exec",
+                "--in-place",
+                "--",
+                "/bin/sh",
+                "-c",
+                "cat .env.test; exit 23",
+            ])
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+            .envs(&spec.env)
+            .current_dir(&input)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
+    let old = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .attempts_of_task(&task)
+        .unwrap()
+        .remove(0);
+    let files =
+        remote_task_runner::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
+    let log = files.read_log(&old.attempt_id, LogStream::Stdout).unwrap();
+    assert!(!String::from_utf8_lossy(&log).contains("initial-private-secret"));
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "TOKEN=initial-private-secret\n"
+    );
+    assert_eq!(
+        std::fs::metadata(&secret).unwrap().permissions().mode(),
+        original_mode
+    );
+    remote_task_runner::secrets::vault::Vault::open(&spec.state_dir)
+        .unwrap()
+        .erase(&run)
+        .unwrap();
+    std::fs::write(&secret, "TOKEN=changed-private-secret\n").unwrap();
+    control::retry(&spec, Target::Run(run.clone()))
+        .await
+        .unwrap();
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = control::wait(&spec, Target::Run(run.clone()), &mut signals)
+        .await
+        .unwrap();
+    assert_eq!(done.cli_exit_code, 23);
+    let second = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .attempts_of_task(&task)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let log = files
+        .read_log(&second.attempt_id, LogStream::Stdout)
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&log).contains("changed-private-secret"));
+    std::fs::write(input.join(".env.new"), "TOKEN=new-private-secret\n").unwrap();
+    assert!(control::retry(&spec, Target::Run(run)).await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "TOKEN=changed-private-secret\n"
+    );
+    assert!(input.join(".env.new").exists());
+    shutdown(&load(&spec)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_preparation_runs_in_original_and_artifacts_use_normal_collection() {
+    use remote_task_runner::service::{context::Context, control};
+    let (_root, spec, input) = control_fixture();
+    let mut context = Context::load(spec.env.clone(), input.clone(), spec.clone()).unwrap();
+    context.config.prepare_commands = vec![vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf preparation > prepared.txt".into(),
+    ]];
+    context
+        .config
+        .outputs
+        .push(remote_task_runner::config::resolve::OutputSpec {
+            name: "kept".into(),
+            paths: vec!["output.txt".into()],
+            required: true,
+            when: remote_task_runner::config::model::OutputWhen::Always,
+        });
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = control::exec_mode(
+        context,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat prepared.txt > output.txt".into(),
+        ],
+        true,
+        &mut signals,
+    )
+    .await
+    .unwrap();
+    assert_eq!(done.cli_exit_code, 0);
+    assert!(done.snapshot.unwrap().in_place);
+    assert_eq!(
+        std::fs::read_to_string(input.join("output.txt")).unwrap(),
+        "preparation"
+    );
+    let task = done.task_id.unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert_eq!(store.attempts_of_task(&task).unwrap().len(), 1);
+    shutdown(&load(&spec)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_retry_rejects_original_subdirectory_replaced_by_external_symlink() {
+    use remote_task_runner::{
+        ids::{RunId, TaskId},
+        service::{completion::Target, control},
+    };
+    let (root, spec, input) = control_fixture();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&input)
+            .envs(&spec.env)
+            .status()
+            .unwrap()
+            .success());
+    }
+    let sub = input.join("sub");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("input.txt"), "original subdirectory").unwrap();
+    std::fs::write(input.join(".gitignore"), ".env.test\n").unwrap();
+    std::fs::write(
+        input.join(".remote-task-runner.toml"),
+        "schema_version = 1\n[source]\nsecret_files = [\".env.test\"]\n",
+    )
+    .unwrap();
+    assert!(Command::new("git")
+        .args(["add", "."])
+        .current_dir(&input)
+        .envs(&spec.env)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["commit", "-qm", "fixture"])
+        .current_dir(&input)
+        .envs(&spec.env)
+        .status()
+        .unwrap()
+        .success());
+    let secret = input.join(".env.test");
+    std::fs::write(&secret, "TOKEN=private-original-secret\n").unwrap();
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(&spec.executable)
+            .args([
+                "--json",
+                "exec",
+                "--in-place",
+                "--",
+                "/bin/sh",
+                "-c",
+                "printf ran > marker; exit 23",
+            ])
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+            .envs(&spec.env)
+            .current_dir(&sub)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
+    assert!(sub.join("marker").exists());
+    shutdown(&load(&spec)).await;
+    let saved = input.join("saved-sub");
+    std::fs::rename(&sub, &saved).unwrap();
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, &sub).unwrap();
+    control::retry(&spec, Target::Run(run.clone()))
+        .await
+        .unwrap();
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = tokio::time::timeout(
+        Duration::from_secs(30),
+        control::wait(&spec, Target::Run(run), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_ne!(done.cli_exit_code, 0);
+    assert_ne!(done.cli_exit_code, 23);
+    assert!(!outside.join("marker").exists());
+    assert_eq!(
+        std::fs::read_to_string(saved.join("input.txt")).unwrap(),
+        "original subdirectory"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "TOKEN=private-original-secret\n"
+    );
+    let attempts = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .attempts_of_task(&task)
+        .unwrap();
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts[1].receipts.running_at_ms.is_none());
+    shutdown(&load(&spec)).await;
+    assert!(input.is_dir());
+    assert!(saved.join("marker").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_outputs_sigint_drains_blocked_tar_worker_before_releasing_pin() {
+    use std::os::fd::OwnedFd;
+    let (root, spec, _) = control_fixture();
+    let mut builder = tar::Builder::new(Vec::new());
+    for n in 0..2048 {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("member-{n:04}"), b"x".as_slice())
+            .unwrap();
+    }
+    let bytes = builder.into_inner().unwrap();
+    let (run, task, attempt, _) = seed_public_output(
+        &spec,
+        &bytes,
+        remote_task_runner::wire::ArtifactEncoding::TarV1,
+    );
+    let (_unconsumed, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let stdout: OwnedFd = writer.into();
+    let temporary = root.path().join("reader-tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "outputs", run.as_str(), "--dir"])
+        .arg(root.path().join("exported"))
+        .env_clear()
+        .envs(&spec.env)
+        .env("TMPDIR", &temporary)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(child.try_wait().unwrap().is_none());
+            if root
+                .path()
+                .join("exported")
+                .join(task.as_str())
+                .join(attempt.as_str())
+                .join("bundle/member-0000")
+                .exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The bounded channel and unread stdout leave the owned worker mid-export.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    let gc_owner = CoordinatorStore::open(&spec.state_dir, 10).unwrap();
+    assert!(
+        matches!(gc_owner.result_gc_guard(&run), Err(remote_task_runner::storage::StorageError::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
+    );
+    let epoch = gc_owner.epoch();
+    drop(gc_owner);
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    let gc_owner = CoordinatorStore::open(&spec.state_dir, 11).unwrap();
+    drop(gc_owner.result_gc_guard(&run).unwrap());
+    drop(gc_owner);
+    assert!(
+        !CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .unwrap()
+            .cancel_requested
+    );
+    let members = root
+        .path()
+        .join("exported")
+        .join(task.as_str())
+        .join(attempt.as_str())
+        .join("bundle");
+    let names = std::fs::read_dir(&members)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert!(!names.is_empty() && names.len() < 2048);
+    assert!(
+        names
+            .iter()
+            .all(|name| name.to_str().unwrap().starts_with("member-")),
+        "owned destination temp leaked"
+    );
+    assert_eq!(
+        std::fs::read_dir(&temporary).unwrap().count(),
+        0,
+        "output reader leaked a temporary file"
+    );
 }

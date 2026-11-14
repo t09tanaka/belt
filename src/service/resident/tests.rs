@@ -14,6 +14,7 @@ struct Slow {
     collecting: AtomicBool,
     offline: AtomicBool,
     renewals: AtomicUsize,
+    append_bytes: bool,
 }
 impl WorkerLink for Slow {
     fn call(
@@ -53,7 +54,19 @@ impl WorkerLink for Slow {
                         state: AttemptState::Active,
                     }))
                 }
-                crate::wire::Request::GetResult(_) => {
+                crate::wire::Request::ReadLog(r) if self.append_bytes => {
+                    self.collecting.store(true, Ordering::SeqCst);
+                    Ok(Response::ReadLog(ReadLogResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        offset: r.offset,
+                        data: Bytes(b"active".to_vec()),
+                        next_offset: r.offset + 6,
+                        eof: false,
+                        log_truncated: false,
+                        dropped_bytes: 0,
+                    }))
+                }
+                crate::wire::Request::ReadLog(_) | crate::wire::Request::GetResult(_) => {
                     self.collecting.store(true, Ordering::SeqCst);
                     std::future::pending().await
                 }
@@ -65,6 +78,20 @@ impl WorkerLink for Slow {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_unknown() {
+    collection_shutdown_fixture(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_drains_log_append_and_commit_before_releasing_owner() {
+    collection_shutdown_fixture(true, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_pin_contention_keeps_resident_ipc_and_lease_renewal_alive() {
+    collection_shutdown_fixture(false, true).await;
+}
+
+async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
     let root = tempfile::Builder::new()
         .prefix("rtr-clocks-")
         .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
@@ -117,6 +144,8 @@ async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_un
         let task = TaskId::generate();
         let attempt = AttemptId::generate();
         let payload = AttemptPayload {
+            outputs: Vec::new(),
+            in_place: false,
             setup: None,
             run_id: run.clone(),
             task_id: task.clone(),
@@ -125,7 +154,15 @@ async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_un
             plan_digest: digest.clone(),
             manifest_digest: digest.clone(),
             permit_id: None,
-            commands: vec![],
+            commands: vec![CommandSpec {
+                setup_step: None,
+                node_id: NodeId::parse("main").unwrap(),
+                argv: vec!["/usr/bin/true".into()],
+                cwd: String::new(),
+                env: BTreeMap::new(),
+                depends_on: vec![],
+                timeout_ms: None,
+            }],
             lease_ms: 60000,
             command_timeout_ms: None,
             deadline_ms: None,
@@ -204,13 +241,41 @@ async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_un
         collecting: AtomicBool::new(false),
         offline: AtomicBool::new(false),
         renewals: AtomicUsize::new(0),
+        append_bytes,
     });
     // Replace only this test's local protocol server with a controlled link.
     resident.worker_connection.abort();
     resident.worker_connection = tokio::spawn(std::future::pending());
     resident.coordinator.attach(worker, slow.clone()).await;
+    let append_pause = append_bytes.then(|| resident.files.pause_next_log_append());
     let client = resident.client();
-    let runner = tokio::spawn(resident.run());
+    let guard = gc_contention.then(|| resident.coordinator.store().result_gc_guard(&run).unwrap());
+    let mut runner = tokio::spawn(resident.run());
+    if gc_contention {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            while slow.renewals.load(Ordering::SeqCst) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!runner.is_finished(), "GC contention stopped the resident");
+        assert!(
+            !slow.collecting.load(Ordering::SeqCst),
+            "collection bypassed the exclusive pin"
+        );
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            client.query(crate::service::query::Query::Run {
+                run_id: run.clone(),
+            }),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    }
+    drop(guard);
+    // The next pass resumes collection after the exclusive guard is released.
     tokio::time::timeout(Duration::from_secs(4), async {
         loop {
             if slow.collecting.load(Ordering::SeqCst) && slow.renewals.load(Ordering::SeqCst) >= 2 {
@@ -269,6 +334,25 @@ async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_un
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
     ));
+    if let Some((entered, resume)) = append_pause {
+        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(2)))
+            .await
+            .unwrap()
+            .unwrap();
+        let still_running = tokio::time::timeout(Duration::from_millis(100), &mut runner)
+            .await
+            .is_err();
+        let owner_retained = matches!(
+            CoordinatorStore::open(&state, 1),
+            Err(crate::storage::StorageError::Locked(_))
+        );
+        resume.send(()).unwrap();
+        assert!(still_running, "shutdown abandoned an append in flight");
+        assert!(
+            owner_retained,
+            "owner lock released before filesystem IO drained"
+        );
+    }
     tokio::time::timeout(Duration::from_secs(7), runner)
         .await
         .unwrap()
@@ -283,6 +367,24 @@ async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_un
     assert_eq!(record.state, AttemptState::Active);
     assert!(record.termination.is_none());
     assert!(record.cancel_requested_at_ms.is_some());
+    if append_bytes {
+        let progress = CoordinatorStore::open_read_only(&state)
+            .unwrap()
+            .log_progress(&slow.active.attempt_id, LogStream::Stdout)
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.committed_bytes, 6);
+        assert_eq!(
+            std::fs::read(
+                state
+                    .join("results")
+                    .join(slow.active.attempt_id.as_str())
+                    .join("logs/stdout.log")
+            )
+            .unwrap(),
+            b"active"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -344,6 +446,8 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
             tasks: vec![(
                 TaskId::generate(),
                 TaskSpec {
+                    outputs: Vec::new(),
+                    in_place: false,
                     setup: None,
                     plan_digest: Digest::of_bytes(b"plan"),
                     manifest_digest: digest,
@@ -537,6 +641,8 @@ pub(super) async fn delivery_resident(root: &Path) -> Resident {
 }
 pub(super) fn delivery_spec(digest: Digest, secrets: bool) -> TaskSpec {
     TaskSpec {
+        outputs: Vec::new(),
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: digest,
@@ -678,6 +784,8 @@ async fn per_worker_secret_jobs_route_exact_attempts_and_resend_after_session_re
         )
         .unwrap();
         let payload = AttemptPayload {
+            outputs: Vec::new(),
+            in_place: false,
             setup: None,
             run_id: run,
             task_id: task.clone(),
@@ -1172,4 +1280,85 @@ async fn retry_stopping_releases_owner_while_input_io_retains_cross_process_leas
         .unwrap();
     file.try_lock().unwrap();
     drop(guard);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_submit_publishes_reader_pin_before_immediate_logs_follow() {
+    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let mut resident = delivery_resident(root.path()).await;
+    // Keep every worker offline, so no collector can backfill a missing pin.
+    resident.worker_connection.abort();
+    resident.worker_connection = tokio::spawn(std::future::pending());
+    resident
+        .coordinator
+        .detach(&WorkerId::parse("local").unwrap())
+        .await
+        .unwrap();
+    let directory = root.path().join("input");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("data"), b"snapshot").unwrap();
+    let run = RunId::generate();
+    let captured = crate::source::capture_for_run(
+        &resident.captured.env,
+        &resident.sources,
+        &run,
+        &crate::source::SourceRequest::Directory { dir: directory },
+        &Default::default(),
+    )
+    .unwrap();
+    let source = captured.manifest.source_id;
+    let digest = Digest::parse(&captured.manifest.manifest_digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest)))
+        .unwrap();
+    let task = TaskId::generate();
+    let state = root.path().join("parent");
+    let client = resident.client();
+    let runner = tokio::spawn(resident.run());
+    let accepted = client
+        .request(Operation::Submit {
+            run_id: run.clone(),
+            source_id: source,
+            tasks: vec![(task, delivery_spec(digest, false))],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(accepted, Reply::Accepted { run_id } if run_id == run));
+    // The CLI's exact follow observer must acquire its read-only pin before
+    // querying log metadata, even though this run has no attempt/results yet.
+    let mut observer = crate::service::logs::Observer::new(
+        crate::service::query::Reader::Connected(client.clone()),
+        state.join("results"),
+        crate::service::completion::Target::Run(run.clone()),
+        None,
+    )
+    .unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let pending = observer
+        .observe(false, true, &mut out, &mut err)
+        .await
+        .unwrap();
+    assert_eq!(pending.pending_tasks, 1);
+    assert!(String::from_utf8_lossy(&out).contains("\"pending\":true"));
+    // Follow stays attached awaiting work instead of failing legacy-unavailable.
+    assert!(tokio::time::timeout(
+        Duration::from_millis(300),
+        observer.observe(true, true, &mut out, &mut err)
+    )
+    .await
+    .is_err());
+    assert!(err.is_empty());
+    let reader = CoordinatorStore::open_read_only(&state).unwrap();
+    assert!(reader.query_tasks(run, 1, None).unwrap().items[0]
+        .current_attempt
+        .is_none());
+    drop(observer);
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    tokio::time::timeout(Duration::from_secs(7), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
 }

@@ -81,7 +81,8 @@ async fn raw(path: &Path, request: &Request) -> UnixStream {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects() {
+async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects_and_generic_outputs(
+) {
     let root = root();
     let input = inputs(root.path());
     std::fs::create_dir(&input.worker.state_dir).unwrap();
@@ -110,6 +111,21 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
     let task = TaskId::generate();
     let manifest = &captured.manifest.manifest_digest;
     let spec = TaskSpec {
+        outputs: vec![
+            remote_task_runner::wire::OutputDecl {
+                name: "bundle".into(),
+                paths: vec!["reports/**".into(), "coverage/**".into(), "reports".into()],
+                if_missing: remote_task_runner::wire::MissingPolicy::Required,
+                when: remote_task_runner::wire::OutputWhen::Success,
+            },
+            remote_task_runner::wire::OutputDecl {
+                name: "unsafe".into(),
+                paths: vec!["forbidden".into()],
+                if_missing: remote_task_runner::wire::MissingPolicy::Optional,
+                when: remote_task_runner::wire::OutputWhen::Always,
+            },
+        ],
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::parse(manifest)
@@ -121,7 +137,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
             argv: vec![
                 "/bin/sh".into(),
                 "-c".into(),
-                "sleep 1; cat input.txt".into(),
+                "mkdir reports coverage; ln -s /etc/hosts forbidden; printf report > reports/a; printf cover > coverage/b; sleep 1; cat input.txt".into(),
             ],
             cwd: String::new(),
             env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
@@ -132,7 +148,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: false,
-        artifacts: vec![],
+        artifacts: vec![remote_task_runner::wire::ArtifactDecl { name:"raw".into(), path:"input.txt".into(), if_missing:remote_task_runner::wire::MissingPolicy::Required }],
     };
     let submitter = client.clone();
     let reply = submitter
@@ -184,6 +200,142 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
             .unwrap(),
         b"snapshot\n"
     );
+    let result: remote_task_runner::wire::GetResultResponse =
+        serde_json::from_slice(&files.read_result(&attempt.attempt_id).unwrap().unwrap()).unwrap();
+    assert!(result.outputs_evaluated);
+    assert_eq!(result.artifacts.len(), 2);
+    assert_eq!(result.artifacts_not_stored.len(), 1);
+    assert_eq!(result.artifacts_not_stored[0].name, "unsafe");
+    assert_eq!(
+        result.artifacts_not_stored[0].reason,
+        remote_task_runner::wire::NotStoredReason::Refused
+    );
+    let bundle = result
+        .artifacts
+        .iter()
+        .find(|a| a.name == "bundle")
+        .unwrap();
+    assert_eq!(bundle.name, "bundle");
+    assert_eq!(
+        bundle.encoding,
+        remote_task_runner::wire::ArtifactEncoding::TarV1
+    );
+    let bytes = std::fs::read(files.artifact_path(&attempt.attempt_id, &bundle.digest)).unwrap();
+    assert_eq!(Digest::of_bytes(&bytes), bundle.digest);
+    assert_eq!(bytes.len() as u64, bundle.size);
+    let mut archive = tar::Archive::new(bytes.as_slice());
+    let paths: Vec<_> = archive
+        .entries()
+        .unwrap()
+        .map(|e| e.unwrap().path().unwrap().to_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(paths, ["coverage/b", "reports/a"]);
+    let worker =
+        remote_task_runner::storage::WorkerStore::open_read_only(&root.path().join("worker"))
+            .unwrap();
+    let journal = worker
+        .events_of(&attempt.attempt_id, "artifacts_stored")
+        .unwrap();
+    assert_eq!(journal.len(), 1);
+    assert_eq!(journal[0].payload["outputs_evaluated"], true);
+    assert_eq!(journal[0].payload["artifacts"][0]["encoding"], "tar_v1");
+    let immutable = worker.get_result(&attempt.attempt_id).unwrap().unwrap();
+    assert_eq!(
+        remote_task_runner::wire::payload_hash(&immutable).unwrap(),
+        result.result_digest
+    );
+    // Public CLI works offline without Git, project configuration or an owner.
+    let config_root = root.path().join("config");
+    let config_dir = config_root.join("remote-task-runner");
+    std::fs::create_dir_all(&config_dir).unwrap();
+    std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let spec = remote_task_runner::service::bootstrap::Spec {
+        state_dir: root.path().join("parent-state"),
+        worker_state_dir: root.path().join("worker"),
+        worker_id: WorkerId::parse("local").unwrap(),
+        cluster_key_path: root.path().join("key"),
+        executable: env!("CARGO_BIN_EXE_remote-task-runner").into(),
+        env: BTreeMap::new(),
+        repo_root: None,
+        expected_cluster: None,
+        managed_service: None,
+    };
+    remote_task_runner::service::bootstrap::write_input(
+        &config_dir.join("coordinator.json"),
+        &spec,
+    )
+    .unwrap();
+    let before = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .epoch();
+    let no_git = root.path().join("no-git");
+    std::fs::create_dir(&no_git).unwrap();
+    let exported = root.path().join("exported");
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+        .env_clear()
+        .env("XDG_CONFIG_HOME", &config_root)
+        .env("PATH", "/unavailable")
+        .current_dir(&no_git)
+        .args(["--json", "outputs", run.as_str(), "--dir"])
+        .arg(&exported)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l["data"]["kind"] == "final")
+            .count(),
+        1
+    );
+    assert_eq!(lines.last().unwrap()["data"]["summary"]["exported"], 3);
+    assert_eq!(lines.last().unwrap()["data"]["summary"]["refused"], 1);
+    let prefix = exported
+        .join(task.as_str())
+        .join(attempt.attempt_id.as_str());
+    assert_eq!(std::fs::read(prefix.join("raw")).unwrap(), b"snapshot\n");
+    assert_eq!(
+        std::fs::read(prefix.join("bundle/reports/a")).unwrap(),
+        b"report"
+    );
+    assert_eq!(
+        std::fs::read(prefix.join("bundle/coverage/b")).unwrap(),
+        b"cover"
+    );
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        before
+    );
+    let conflict = tokio::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+        .env_clear()
+        .env("XDG_CONFIG_HOME", &config_root)
+        .current_dir(&no_git)
+        .args([
+            "--json",
+            "outputs",
+            task.as_str(),
+            "--attempt",
+            attempt.attempt_id.as_str(),
+            "--dir",
+        ])
+        .arg(&exported)
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(conflict.status.code(), Some(72));
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

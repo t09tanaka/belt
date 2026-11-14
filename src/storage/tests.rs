@@ -2985,7 +2985,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     let all = schema::steps(DbKind::Coordinator);
     assert_eq!(
         all.len(),
-        6,
+        7,
         "this test is about step 1 and the steps after it"
     );
     let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
@@ -3098,7 +3098,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opened for writing, it is migrated, and every row is still there.
     let store = CoordinatorStore::open(dir.path(), 10).unwrap();
-    assert_eq!(schema_of(&store), ("6".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("7".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(4));
     assert_eq!(store.cluster_id(), &cluster);
     check_rows(&store);
@@ -3116,7 +3116,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opening again migrates nothing and loses nothing.
     let store = CoordinatorStore::open(dir.path(), 20).unwrap();
-    assert_eq!(schema_of(&store), ("6".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("7".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(5));
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);
@@ -3307,7 +3307,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(all.len(), 6);
+    assert_eq!(all.len(), 8);
     let cluster = ClusterId::generate();
     let co = CoordinatorId::generate();
     let run = RunId::generate();
@@ -3362,7 +3362,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     }
     let owner = CoordinatorStore::open(dir.path(), 2).unwrap();
     let migrated = schema_info(&owner);
-    assert_eq!(migrated.0, "6");
+    assert_eq!(migrated.0, "8");
     assert_eq!(migrated.2, 3);
     assert!(migrated.1.is_some());
     let target_run = run.to_string();
@@ -4620,4 +4620,696 @@ fn control_fence_cancel_overflow_and_conflicting_retry_identity_change_nothing()
         1
     );
     assert!(f.store.queued_tasks(10).unwrap().len() == 1);
+}
+
+#[test]
+fn live_log_progress_registers_ref_cas_metadata_and_survives_final_receipt_reset() {
+    use crate::wire::LogStream::{Stderr, Stdout};
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 0, 3, false, false, 0, 2)
+        .is_err());
+    let progress = f.store.prepare_log_progress(&a, Stdout, 2).unwrap();
+    assert_eq!(progress.committed_bytes, 0);
+    assert!(f.store.collection(&a).unwrap().is_none());
+    let aid = a.to_string();
+    f.store
+        .db
+        .call(move |c| {
+            let row: (String, String, String) = c.query_row(
+                "SELECT attempt_id,kind,locator FROM blob_ref WHERE ref_id=?1",
+                [format!("{aid}:logs")],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(
+                row,
+                (aid.clone(), "log".into(), format!("results/{aid}/logs"))
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 0, 3, false, false, 0, 3)
+        .unwrap());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 0, 3, false, false, 0, 4)
+        .unwrap());
+    assert_eq!(
+        f.store
+            .log_progress(&a, Stdout)
+            .unwrap()
+            .unwrap()
+            .updated_at_ms,
+        3
+    );
+    assert!(!f
+        .store
+        .commit_log_progress(&a, Stdout, 0, 4, false, false, 0, 4)
+        .unwrap());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 2, false, false, 0, 4)
+        .is_err());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 3, true, true, 7, 4)
+        .unwrap());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 3, false, true, 7, 5)
+        .is_err());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 4, true, true, 7, 5)
+        .is_err());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 3, true, false, 7, 5)
+        .is_err());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 3, true, true, 6, 5)
+        .is_err());
+    assert_eq!(
+        f.store
+            .prepare_log_progress(&a, Stderr, 5)
+            .unwrap()
+            .committed_bytes,
+        0
+    );
+    f.to_finalizing(&a);
+    f.store
+        .finalize_attempt(&a, done(Outcome::Succeeded), 6)
+        .unwrap();
+    f.store
+        .begin_collection(&a, &Digest::of_bytes(b"one"), &json!({}), &[], &[], 7)
+        .unwrap();
+    f.store
+        .set_collection_logs(&a, &Digest::of_bytes(b"one"), &json!({}), 8)
+        .unwrap();
+    f.store
+        .begin_collection(&a, &Digest::of_bytes(b"two"), &json!({}), &[], &[], 9)
+        .unwrap();
+    assert!(f.store.collection(&a).unwrap().unwrap().logs.is_none());
+    let progress = f.store.log_progress(&a, Stdout).unwrap().unwrap();
+    assert_eq!(progress.committed_bytes, 3);
+    assert!(progress.eof);
+}
+
+#[test]
+fn live_log_prepare_rolls_back_on_pending_delete_or_mismatched_reference() {
+    use crate::wire::LogStream::Stdout;
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    let locator = crate::results::ResultStore::logs_locator(&a);
+    let l = locator.clone();
+    f.store
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO pending_delete(locator,queued_at_ms) VALUES(?1,1)",
+                [l],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(matches!(
+        f.store.prepare_log_progress(&a, Stdout, 2),
+        Err(StorageError::LocatorPendingDelete(_))
+    ));
+    assert!(f.store.log_progress(&a, Stdout).unwrap().is_none());
+    let aid = a.to_string();
+    f.store.db.write(move |tx| {tx.execute("DELETE FROM pending_delete WHERE locator=?1",[locator])?;tx.execute("INSERT INTO blob_ref(ref_id,attempt_id,kind,locator,created_at_ms) VALUES(?1,?2,'result','other',1)",rusqlite::params![format!("{aid}:logs"),aid])?;Ok(())}).unwrap();
+    assert!(matches!(
+        f.store.prepare_log_progress(&a, Stdout, 3),
+        Err(StorageError::Immutable(_))
+    ));
+    assert!(f.store.log_progress(&a, Stdout).unwrap().is_none());
+}
+
+#[test]
+fn live_log_target_pages_are_bounded_current_and_payload_backed() {
+    let (_dir, store, _run, tasks) = queue_fx(68);
+    let worker = worker("w-a");
+    let mut attempts = Vec::new();
+    for (n, task) in tasks.iter().enumerate() {
+        let a = AttemptId::generate();
+        let record = placed(
+            store
+                .place(
+                    task,
+                    &worker,
+                    &a,
+                    |_| true,
+                    move |_| {
+                        Ok((
+                            hash('a'),
+                            if n == 67 {
+                                json!({})
+                            } else {
+                                json!({"payload":{"nodes":[]}})
+                            },
+                        ))
+                    },
+                    10,
+                )
+                .unwrap(),
+        );
+        if n != 66 {
+            store
+                .mark_receipt(&record.attempt_id, Receipt::WorkerAccepted, 11)
+                .unwrap();
+        }
+        attempts.push(record.attempt_id);
+    }
+    let first = store.query_live_log_targets(&worker, None, 1000).unwrap();
+    assert_eq!(first.len(), 64);
+    assert!(first
+        .windows(2)
+        .all(|w| w[0].record.attempt_id < w[1].record.attempt_id));
+    let second = store
+        .query_live_log_targets(&worker, Some(&first[63].record.attempt_id), 1000)
+        .unwrap();
+    assert_eq!(second.len(), 2);
+    assert!(store
+        .query_live_log_targets(&worker, Some(&second[1].record.attempt_id), 64)
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .query_live_log_targets(&worker, None, 0)
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .query_live_log_targets(&WorkerId::parse("other").unwrap(), None, 64)
+        .unwrap()
+        .is_empty());
+    store.begin_retire(&attempts[0], "replaced", 12).unwrap();
+    store.confirm_retire(&attempts[0], 13).unwrap();
+    let all = store.query_live_log_targets(&worker, None, 64).unwrap();
+    assert!(!all.iter().any(|t| t.record.attempt_id == attempts[0]));
+}
+
+#[test]
+fn live_log_legacy_bootstrap_needs_matching_final_receipt_and_keeps_stream_metadata() {
+    use crate::wire::LogStream::Stdout;
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    f.to_finalizing(&a);
+    f.store
+        .finalize_attempt(&a, done(Outcome::Succeeded), 21)
+        .unwrap();
+    let files = crate::results::ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.append_log(&a, Stdout, 0, b"bytes").unwrap();
+    let digest = Digest::of_bytes(b"bytes");
+    let verified = || {
+        files
+            .verify_legacy_log_prefix(&a, Stdout, &digest, 5)
+            .unwrap()
+            .unwrap()
+    };
+    assert!(f
+        .store
+        .bootstrap_log_progress(verified(), 22)
+        .unwrap()
+        .is_none());
+    let result = Digest::of_bytes(b"result");
+    f.store
+        .begin_collection(&a, &result, &json!({}), &[], &[], 23)
+        .unwrap();
+    f.store.set_collection_logs(&a,&result,&json!({"stdout":{"sha256":digest.as_str(),"bytes":4,"complete":true,"log_truncated":true,"dropped_bytes":8}}),24).unwrap();
+    assert!(f
+        .store
+        .bootstrap_log_progress(verified(), 25)
+        .unwrap()
+        .is_none());
+    f.store.set_collection_logs(&a,&result,&json!({"stdout":{"sha256":digest.as_str(),"bytes":5,"complete":false,"log_truncated":true,"dropped_bytes":8}}),26).unwrap();
+    let p = f
+        .store
+        .bootstrap_log_progress(verified(), 27)
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.committed_bytes, 5);
+    assert!(!p.eof);
+    assert!(p.log_truncated);
+    assert_eq!(p.dropped_bytes, 8);
+    assert_eq!(
+        f.store
+            .bootstrap_log_progress(verified(), 28)
+            .unwrap()
+            .unwrap(),
+        p
+    );
+    assert!(f
+        .store
+        .collection(&a)
+        .unwrap()
+        .unwrap()
+        .closed_at_ms
+        .is_none());
+}
+
+#[test]
+fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes() {
+    use crate::wire::LogStream::Stdout;
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    f.to_finalizing(&a);
+    f.store
+        .finalize_attempt(&a, done(Outcome::Succeeded), 21)
+        .unwrap();
+    let files = crate::results::ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.append_log(&a, Stdout, 0, b"old").unwrap();
+    let result = Digest::of_bytes(b"result");
+    let digest = Digest::of_bytes(b"old");
+    let receipt = json!({"stdout":{"sha256":digest.as_str(),"bytes":3,"complete":true,"log_truncated":false,"dropped_bytes":0}});
+    f.store
+        .begin_collection(&a, &result, &json!({"old":true}), &[], &[], 22)
+        .unwrap();
+    f.store
+        .set_collection_logs(&a, &result, &receipt, 23)
+        .unwrap();
+    // Exactly the pre-progress schema: no rows or constraints are skipped.
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    drop(f.store);
+    let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
+    assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
+    assert!(owner.log_progress(&a, Stdout).unwrap().is_none());
+    let token = files
+        .verify_legacy_log_prefix(&a, Stdout, &digest, 3)
+        .unwrap()
+        .unwrap();
+    let progress = owner.bootstrap_log_progress(token, 25).unwrap().unwrap();
+    assert_eq!(progress.committed_bytes, 3);
+    assert!(progress.eof);
+    let reader = CoordinatorStore::open_read_only(f._dir.path()).unwrap();
+    assert_eq!(reader.epoch(), owner.epoch());
+    assert_eq!(reader.log_progress(&a, Stdout).unwrap(), Some(progress));
+}
+
+#[test]
+fn live_log_append_crash_replays_from_committed_offset_without_publishing_tail() {
+    use crate::results::store::{Crash, StoreError};
+    use crate::wire::LogStream::Stdout;
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    let files = crate::results::ResultStore::open(&f._dir.path().join("results")).unwrap();
+    let reader = crate::results::ResultStore::open_read_only(files.root()).unwrap();
+    assert_eq!(
+        f.store
+            .prepare_log_progress(&a, Stdout, 21)
+            .unwrap()
+            .committed_bytes,
+        0
+    );
+    files.append_log(&a, Stdout, 0, b"first").unwrap();
+    f.store
+        .commit_log_progress(&a, Stdout, 0, 5, false, false, 0, 22)
+        .unwrap();
+    files.crash_once_at(Crash::LogAppended);
+    assert!(matches!(
+        files.append_log(&a, Stdout, 5, b"second"),
+        Err(StoreError::Crash(Crash::LogAppended))
+    ));
+    let progress = f.store.log_progress(&a, Stdout).unwrap().unwrap();
+    assert_eq!(progress.committed_bytes, 5);
+    assert_eq!(
+        reader
+            .read_range(&a, Stdout, progress.committed_bytes, 0, 100)
+            .unwrap(),
+        b"first"
+    );
+    let resumed = crate::results::ResultStore::open(files.root()).unwrap();
+    resumed
+        .recover_log_prefix(&a, Stdout, progress.committed_bytes)
+        .unwrap();
+    resumed.append_log(&a, Stdout, 5, b"second").unwrap();
+    f.store
+        .commit_log_progress(&a, Stdout, 5, 11, false, false, 0, 23)
+        .unwrap();
+    assert_eq!(
+        reader.read_range(&a, Stdout, 11, 0, 100).unwrap(),
+        b"firstsecond"
+    );
+}
+
+// ================================================= guarded result retention
+fn retention_ready(f: &Fx) -> AttemptId {
+    let a = f.attempt('a').unwrap().attempt_id;
+    f.to_finalizing(&a);
+    f.store
+        .finalize_attempt(&a, done(Outcome::Failed), 100)
+        .unwrap();
+    f.store.mark_collected(&a, 101).unwrap();
+    let id = a.to_string();
+    f.store.db.write(move |tx| {tx.execute("INSERT INTO collection(attempt_id,verdict,acked_at_ms,closed_at_ms,updated_at_ms) VALUES(?1,'complete',102,101,102)",[id])?;Ok(())}).unwrap();
+    a
+}
+#[test]
+fn result_retention_claims_bounded_pages_and_replays_only_known_claims() {
+    use crate::results::store::ResultStore;
+    let f = fx();
+    let a = retention_ready(&f);
+    let files = ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.write_result(&a, b"{}").unwrap();
+    let locator = ResultStore::result_locator(&a);
+    for n in 0..70 {
+        f.store
+            .add_blob_ref(
+                &blob(&format!("result-{n:03}"), &a, BlobKind::Result, &locator),
+                102,
+            )
+            .unwrap();
+    }
+    let run = f.run.to_string();
+    let plan=f.store.db.call(move |c| {let mut s=c.prepare("EXPLAIN QUERY PLAN SELECT b.ref_id,b.attempt_id,b.locator,b.pins FROM result_gc_ref g JOIN blob_ref b USING(ref_id) WHERE g.run_id=?1 AND g.ref_id>?2 ORDER BY g.ref_id LIMIT 32")?;let rows=s.query_map(rusqlite::params![run,""],|r|r.get::<_,String>(3))?.collect::<std::result::Result<Vec<_>,_>>()?;Ok(rows)}).unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("result_gc_ref_run")),
+        "{plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+        "{plan:?}"
+    );
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    assert!(f
+        .store
+        .claim_result_page(&guard, &f.run, "", 0, 200, 10, Some("boot".into()), 10)
+        .is_err());
+    assert!(f
+        .store
+        .claim_result_page(&guard, &f.run, "", 65, 200, 10, Some("boot".into()), 10)
+        .is_err());
+    assert!(
+        f.store
+            .claim_result_page(&guard, &f.run, "", 32, 200, 10, Some("boot".into()), 10)
+            .unwrap()
+            .clock_held
+    );
+    let first = f
+        .store
+        .claim_result_page(&guard, &f.run, "", 32, 210, 20, Some("boot".into()), 10)
+        .unwrap();
+    assert_eq!((first.examined, first.removed, first.queued), (32, 32, 0));
+    let second = f
+        .store
+        .claim_result_page(
+            &guard,
+            &f.run,
+            first.next.as_ref().unwrap(),
+            32,
+            211,
+            21,
+            Some("boot".into()),
+            10,
+        )
+        .unwrap();
+    assert_eq!(
+        (second.examined, second.removed, second.queued),
+        (32, 32, 0)
+    );
+    let third = f
+        .store
+        .claim_result_page(
+            &guard,
+            &f.run,
+            second.next.as_ref().unwrap(),
+            32,
+            212,
+            22,
+            Some("boot".into()),
+            10,
+        )
+        .unwrap();
+    assert_eq!((third.examined, third.removed, third.queued), (6, 6, 1));
+    assert!(third.next.is_none());
+    assert!(f
+        .store
+        .add_blob_ref(&blob("late", &a, BlobKind::Result, &locator), 212)
+        .is_err());
+    assert!(f.store.pending_result_page(&guard, &f.run, 0).is_err());
+    let claim = f
+        .store
+        .pending_result_page(&guard, &f.run, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.attempt, a);
+    assert_eq!(claim.run, f.run);
+    files.remove(&claim.locator).unwrap(); // crash after FS, before completion
+    drop(guard);
+    drop(f.store);
+    let restarted = CoordinatorStore::open(f._dir.path(), 300).unwrap();
+    let guard = restarted.result_gc_guard(&f.run).unwrap();
+    let replay = restarted
+        .pending_result_page(&guard, &f.run, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    files.remove(&replay.locator).unwrap();
+    restarted.finish_result_delete(&guard, &replay).unwrap();
+    assert!(restarted
+        .pending_result_page(&guard, &f.run, 1)
+        .unwrap()
+        .is_empty());
+    assert!(restarted.finish_result_delete(&guard, &replay).is_err());
+    // Verdict/audit survive physical deletion, including failed compute.
+    assert_eq!(
+        restarted
+            .get_attempt(&a)
+            .unwrap()
+            .unwrap()
+            .termination
+            .unwrap()
+            .outcome(),
+        Outcome::Failed
+    );
+    assert!(restarted
+        .collection(&a)
+        .unwrap()
+        .unwrap()
+        .closed_at_ms
+        .is_some());
+    restarted
+        .db
+        .write(|tx| {
+            tx.execute("INSERT INTO pending_delete VALUES('results/legacy',1)", [])?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(restarted
+        .pending_result_page(&guard, &f.run, 32)
+        .unwrap()
+        .is_empty());
+    assert_eq!(restarted.pending_deletes().unwrap(), vec!["results/legacy"]);
+}
+#[test]
+fn result_retention_reader_writer_and_legacy_backfill_are_fail_closed() {
+    use crate::service::completion::Target;
+    let f = fx();
+    let a = retention_ready(&f);
+    let reader = CoordinatorStore::open_read_only(f._dir.path()).unwrap();
+    let target = Target::Task(f.task.clone());
+    let pin = reader.result_read_pin(&target, Some(&a)).unwrap();
+    assert!(f
+        .store
+        .claim_result_page(&pin, &f.run, "", 1, 200, 10, Some("boot".into()), 0)
+        .is_err());
+    assert!(f.store.result_gc_guard(&f.run).is_err());
+    assert!(reader.result_gc_guard(&f.run).is_err());
+    assert!(reader
+        .result_read_pin(&target, Some(&AttemptId::generate()))
+        .is_err());
+    assert!(reader
+        .result_read_pin(&Target::Run(f.run.clone()), Some(&a))
+        .is_err());
+    drop(pin);
+    let writer = f.store.result_writer_pin(&a).unwrap();
+    assert!(f.store.result_gc_guard(&f.run).is_err());
+    drop(writer);
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    assert_eq!(
+        reader.result_read_pin(&target, None).unwrap_err().code(),
+        ErrorCode::Conflict
+    );
+    drop(guard);
+    let path = f._dir.path().join(format!("reader-pins/{}.lock", f.run));
+    // Legacy fixture only: production never unlinks a pin.
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        reader.result_read_pin(&target, None).unwrap_err().code(),
+        ErrorCode::NotFound
+    );
+    assert!(!path.exists());
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    drop(guard);
+    reader.result_read_pin(&target, None).unwrap();
+}
+#[test]
+fn result_retention_keeps_unknown_unacked_open_and_pinned_references() {
+    let f = fx();
+    let a = retention_ready(&f);
+    let locator = crate::results::store::ResultStore::result_locator(&a);
+    f.store
+        .add_blob_ref(&blob("ref", &a, BlobKind::Result, &locator), 102)
+        .unwrap();
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    f.store
+        .claim_result_page(&guard, &f.run, "", 1, 200, 10, Some("boot".into()), 10)
+        .unwrap();
+    for mutation in ["UPDATE attempt SET observation='unknown'", "UPDATE attempt SET observation='known'; UPDATE collection SET acked_at_ms=NULL", "UPDATE collection SET acked_at_ms=NULL,closed_at_ms=NULL,verdict=NULL", "UPDATE collection SET acked_at_ms=102,closed_at_ms=101,verdict='complete'; UPDATE blob_ref SET pins=1"] {
+        f.store.db.write(move |tx| {tx.execute_batch(mutation)?;Ok(())}).unwrap();
+        let p=f.store.claim_result_page(&guard,&f.run,"",1,210,20,Some("boot".into()),10).unwrap();assert_eq!(p.removed,0);
+    }
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute_batch(
+                "UPDATE blob_ref SET pins=0; UPDATE attempt SET terminal_at_ms=1000;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let future = f
+        .store
+        .claim_result_page(&guard, &f.run, "", 1, 210, 20, Some("boot".into()), 0)
+        .unwrap();
+    assert_eq!(future.removed, 0);
+    // Invalid clock must Hold even retention zero.
+    let p = f
+        .store
+        .claim_result_page(&guard, &f.run, "", 1, 500, u64::MAX, Some("boot".into()), 0)
+        .unwrap();
+    assert!(p.clock_held);
+    assert_eq!(p.removed, 0);
+}
+
+#[test]
+fn result_gc_run_selection_is_indexed_and_independent_of_task_facts() {
+    let f = fx();
+    let run = f.run.to_string();
+    f.store
+        .db
+        .write(move |tx| {
+            for _ in 0..2000 {
+                tx.execute(
+                    "INSERT INTO task(task_id,run_id,spec_json,created_at_ms) VALUES(?1,?2,'{}',1)",
+                    rusqlite::params![TaskId::generate().to_string(), run],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        f.store.result_gc_next_run(None).unwrap(),
+        Some(f.run.clone())
+    );
+    assert_eq!(
+        f.store.result_gc_next_run(Some(f.run.clone())).unwrap(),
+        None
+    );
+    let plan = f
+        .store
+        .db
+        .call(|c| {
+            let mut q = c.prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                coordinator::query::RESULT_GC_NEXT_RUN
+            ))?;
+            let rows = q
+                .query_map([""], |r| r.get::<_, String>(3))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    assert!(
+        plan[0].contains("SEARCH run USING COVERING INDEX") && plan[0].contains("run_id>?"),
+        "{plan:?}"
+    );
+    // A facts query would fail; the GC path must never consult task metadata.
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute_batch("ALTER TABLE task RENAME TO unrelated_tasks;")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(f.store.result_gc_next_run(None).unwrap(), Some(f.run));
+}
+
+#[test]
+fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
+    use crate::results::{retention, ResultStore};
+    use std::os::unix::fs::symlink;
+    let f = fx();
+    let a = retention_ready(&f);
+    let files = ResultStore::open(&f._dir.path().join("results")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(outside.path().join("logs")).unwrap();
+    std::fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
+    let locator = ResultStore::logs_locator(&a);
+    f.store
+        .add_blob_ref(&blob("claimed", &a, BlobKind::Log, &locator), 102)
+        .unwrap();
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    f.store
+        .claim_result_page(&guard, &f.run, "", 32, 200, 10, Some("boot".into()), 10)
+        .unwrap();
+    f.store
+        .claim_result_page(&guard, &f.run, "", 32, 210, 20, Some("boot".into()), 10)
+        .unwrap();
+    drop(guard);
+    symlink(outside.path(), files.root().join(a.as_str())).unwrap();
+    assert!(retention::page(&f.store, &files, &mut retention::Cursor::default(), 7).is_err());
+    assert_eq!(
+        std::fs::read(outside.path().join("logs/sentinel")).unwrap(),
+        b"safe"
+    );
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    assert_eq!(
+        f.store
+            .pending_result_page(&guard, &f.run, 32)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(guard);
+    std::fs::remove_file(files.root().join(a.as_str())).unwrap();
+    // The known claim alone permits a missing object to finish successfully.
+    assert_eq!(
+        retention::page(&f.store, &files, &mut retention::Cursor::default(), 7)
+            .unwrap()
+            .deleted,
+        1
+    );
+}
+
+#[test]
+fn enqueue_does_not_publish_run_when_reader_pin_cannot_be_secured() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let pins = f._dir.path().join("reader-pins");
+    std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(f
+        .store
+        .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 2)
+        .is_err());
+    assert!(f.store.query_run(run.clone()).unwrap().is_none());
+    assert!(f.store.query_task(task.clone()).unwrap().is_none());
+    std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o700)).unwrap();
+    f.store
+        .enqueue(&run, None, &json!({}), &[(task, json!({}))], 2)
+        .unwrap();
+    let reader = CoordinatorStore::open_read_only(f._dir.path()).unwrap();
+    let pin = reader
+        .result_read_pin(&crate::service::completion::Target::Run(run.clone()), None)
+        .unwrap();
+    assert!(f.store.result_gc_guard(&run).is_err());
+    drop(pin);
 }

@@ -6,6 +6,7 @@ pub mod coordinator;
 pub mod error;
 pub mod forecast;
 pub mod ids;
+pub mod outputs;
 pub mod platform;
 pub mod protocol;
 pub mod results;

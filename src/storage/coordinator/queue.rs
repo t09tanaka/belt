@@ -190,6 +190,13 @@ impl CoordinatorStore {
                 tasks.len()
             )));
         }
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+        // Like create_run, publish the persistent pin inode durably before
+        // the database can expose this run to read-only CLI invocations.
+        // Coordinator::enqueue already invokes this method in its blocking job.
+        crate::results::pin::RunPin::ensure(&self.state_dir, run_id)?;
         let run = run_id.to_string();
         let source = source_id.map(ToString::to_string);
         let run_spec = run_spec.to_string();
@@ -682,9 +689,11 @@ impl CoordinatorStore {
                 [&aid],
                 |r| r.get(0),
             )?;
+            let in_place: bool = tx.query_row(
+                "SELECT coalesce(json_extract(t.spec_json,'$.in_place'),0) FROM task t JOIN attempt a USING(task_id) WHERE a.attempt_id=?1", [&aid], |r| r.get(0))?;
             let outcome = if cancelled {
                 Outcome::Cancelled
-            } else if reason == failed_reason {
+            } else if reason == failed_reason || in_place {
                 Outcome::Failed
             } else {
                 super::free_by_retire(tx, &aid, at_ms)?;

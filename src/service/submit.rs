@@ -41,7 +41,43 @@ pub async fn command_with_ids(
     run_id: RunId,
     task_id: TaskId,
 ) -> Result<Receipt, ApiError> {
+    command_with_mode(context, command, revision, run_id, task_id, false).await
+}
+
+pub async fn command_with_mode(
+    mut context: Context,
+    command: Vec<String>,
+    revision: Option<String>,
+    run_id: RunId,
+    task_id: TaskId,
+    in_place: bool,
+) -> Result<Receipt, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
+    if in_place && (!context.config.local_worker.value || revision.is_some()) {
+        return Err(invalid("in-place requires the parent local worker".into()));
+    }
+    if in_place {
+        let root = context.repo_root.as_deref().unwrap_or(&context.cwd);
+        let root = std::fs::canonicalize(root).map_err(|e| invalid(e.to_string()))?;
+        let home = context
+            .env
+            .get("HOME")
+            .and_then(|h| std::fs::canonicalize(h).ok());
+        for state in [
+            &context.bootstrap.state_dir,
+            &context.bootstrap.worker_state_dir,
+        ] {
+            let state = std::fs::canonicalize(state).unwrap_or(state.clone());
+            crate::workspace::plan::check_in_place(
+                &root,
+                std::path::Path::new(""),
+                &state,
+                home.as_deref(),
+                true,
+            )?;
+        }
+        context.config.source_mode.value = crate::config::model::SourceMode::Worktree;
+    }
     if command.is_empty() {
         return Err(invalid("command cannot be empty".into()));
     }
@@ -100,32 +136,32 @@ pub async fn command_with_ids(
         has_fast_worktree,
         false,
     );
-    let mut artifacts = Vec::new();
-    for output in &context.config.outputs {
-        if output.paths.len() != 1
-            || output.when != crate::config::model::OutputWhen::Always
-            || output.paths[0].contains(['*', '?', '[', '{'])
-        {
-            return Err(ApiError::new(
-                ErrorCode::NotImplemented,
-                "conditional, multi-path and glob outputs need an output expansion planner",
-            ));
-        }
-        artifacts.push(crate::wire::ArtifactDecl {
-            name: output.name.clone(),
-            path: output.paths[0].clone(),
-            if_missing: if output.required {
+    let outputs: Vec<crate::wire::OutputDecl> = context
+        .config
+        .outputs
+        .iter()
+        .map(|o| crate::wire::OutputDecl {
+            name: o.name.clone(),
+            paths: o.paths.clone(),
+            if_missing: if o.required {
                 crate::wire::MissingPolicy::Required
             } else {
                 crate::wire::MissingPolicy::Optional
             },
-        });
-    }
-    let spec = TaskSpec {
+            when: match o.when {
+                crate::config::model::OutputWhen::Always => crate::wire::OutputWhen::Always,
+                crate::config::model::OutputWhen::Success => crate::wire::OutputWhen::Success,
+                crate::config::model::OutputWhen::Failure => crate::wire::OutputWhen::Failure,
+            },
+        })
+        .collect();
+    crate::outputs::validate(&[], &outputs).map_err(|e| invalid(e.into()))?;
+    let mut spec = TaskSpec {
+        in_place,
+        outputs: outputs.clone(),
         setup,
-        plan_digest: Digest::of_bytes(
-            &serde_json::to_vec(&command).map_err(|e| invalid(e.to_string()))?,
-        ),
+        plan_digest: crate::outputs::command_plan_digest(&command, &outputs)
+            .map_err(|e| invalid(e.to_string()))?,
         manifest_digest: digest,
         commands: vec![CommandSpec {
             node_id: NodeId::parse("command").map_err(|e| invalid(e.to_string()))?,
@@ -139,9 +175,51 @@ pub async fn command_with_ids(
         command_timeout_ms: timeout,
         deadline_ms: None,
         resource_wait_timeout_ms: None,
-        has_secret_bundle: !captured.manifest.secret_files.is_empty(),
-        artifacts,
+        has_secret_bundle: !in_place && !captured.manifest.secret_files.is_empty(),
+        artifacts: Vec::new(),
     };
+    if in_place {
+        if spec.setup.take().is_some() {
+            let mut prep = Vec::new();
+            for (i, argv) in context.config.prepare_commands.iter().enumerate() {
+                let node =
+                    NodeId::parse(&format!("prepare-{i}")).map_err(|e| invalid(e.to_string()))?;
+                let depends_on = prep
+                    .last()
+                    .map(|c: &CommandSpec| vec![c.node_id.clone()])
+                    .unwrap_or_default();
+                prep.push(CommandSpec {
+                    node_id: node,
+                    argv: argv.clone(),
+                    cwd: String::new(),
+                    env: spec.commands[0].env.clone(),
+                    depends_on,
+                    timeout_ms: timeout,
+                    setup_step: None,
+                });
+            }
+            if let Some(last) = prep.last() {
+                spec.commands[0].depends_on.push(last.node_id.clone());
+            }
+            prep.append(&mut spec.commands);
+            spec.commands = prep;
+        }
+        crate::workspace::in_place::bind(
+            context.state_dir(),
+            &run_id,
+            &source_id,
+            &spec.manifest_digest,
+            &context.bootstrap.worker_id,
+            context.repo_root.as_deref().unwrap_or(&context.cwd),
+            context
+                .config
+                .secret_files
+                .value
+                .iter()
+                .map(|s| (s.glob.clone(), s.required))
+                .collect(),
+        )?;
+    }
     match owner
         .request(Operation::SubmitCaptured {
             run_id: run_id.clone(),

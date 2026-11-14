@@ -180,11 +180,12 @@ fn completion_on(
     } else {
         ("", "NULL")
     };
-    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict} FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
+    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0) FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
     let mut stmt = c.prepare(&sql)?;
     let mut rows = stmt.query(params![run, task])?;
     while let Some(row) = rows.next()? {
         let task = id("task_id", TaskId::parse(&row.get::<_, String>(0)?))?;
+        snapshot.in_place |= row.get::<_, bool>(6)?;
         let cancel: bool = row.get(1)?;
         let state: Option<String> = row.get(2)?;
         let observation: Option<String> = row.get(3)?;

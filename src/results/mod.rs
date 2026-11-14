@@ -5,7 +5,9 @@
 //! of an ended attempt from its worker and [`retention`] removes what is past
 //! its retention.
 
+pub mod clock_policy;
 pub mod collect;
+pub mod pin;
 pub mod plan;
 pub mod retention;
 pub mod store;
