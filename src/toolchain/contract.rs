@@ -246,6 +246,82 @@ mod tests {
         assert_eq!(original, restored);
     }
     #[test]
+    fn exact_pin_does_not_replace_an_unproven_alias_constraint() {
+        let mut frozen = bundle("20.0.0").frozen;
+        frozen.selections.clear();
+        frozen.requirements[0]
+            .constraints
+            .push(Constraint::parse("lts/*").unwrap());
+        frozen.requirements[0].provenance.push(Location {
+            path: ".nvmrc".into(),
+            first_line: 1,
+            last_line: 1,
+        });
+        frozen.validate().unwrap();
+        let unresolved = FrozenBundle::seal_exact(frozen).unwrap();
+        assert!(unresolved.evidence.is_empty());
+        assert!(unresolved.frozen.selections.is_empty());
+        unresolved
+            .validate_partial(&unresolved.frozen.source_manifest)
+            .unwrap();
+        assert_eq!(
+            unresolved.validate(&unresolved.frozen.source_manifest),
+            Err("toolchain_resolve_required")
+        );
+    }
+    #[test]
+    fn complete_resolution_still_requires_a_known_native_baseline() {
+        let mut frozen = bundle("20.0.0").frozen;
+        frozen.selections.clear();
+        frozen.baseline.push(Baseline {
+            tool: ToolId::parse("rust").unwrap(),
+            version: VersionObservation::Unknown,
+            provenance: Location {
+                path: "profile".into(),
+                first_line: 1,
+                last_line: 1,
+            },
+        });
+        let unresolved = FrozenBundle::seal_exact(frozen).unwrap();
+        assert_eq!(unresolved.evidence.len(), 1);
+        unresolved
+            .validate_partial(&unresolved.frozen.source_manifest)
+            .unwrap();
+        assert_eq!(
+            unresolved.validate(&unresolved.frozen.source_manifest),
+            Err("toolchain_resolve_required")
+        );
+    }
+    #[test]
+    fn maximum_complete_evidence_bundle_is_accepted() {
+        let scope = Scope::project("");
+        let declarations: Vec<_> = (0..256)
+            .map(|index| Declaration {
+                tool: ToolId::parse(&format!("tool{index}")).unwrap(),
+                constraint: Constraint::parse("1.0.0").unwrap(),
+                scope: scope.clone(),
+                location: Location {
+                    path: "toolchain-manifest".into(),
+                    first_line: index + 1,
+                    last_line: index + 1,
+                },
+            })
+            .collect();
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"parent"),
+            scope,
+            &declarations,
+            &[],
+            &Default::default(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let complete = FrozenBundle::seal_exact(frozen).unwrap();
+        assert_eq!(complete.evidence.len(), 256);
+        complete.validate(&complete.frozen.source_manifest).unwrap();
+    }
+    #[test]
     fn malformed_bundle_and_changed_contract_cannot_keep_resolution_authority() {
         let original = bundle("20.0.0");
         let source = original.frozen.source_manifest.clone();
