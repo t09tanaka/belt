@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.12.1] - 2026-11-14
+
+- Bound Docker Compose cleanup queries and commands by time and output size. Only successful, validated project queries can trigger cleanup; timeout or invalid output leaves an explicit cleanup-incomplete warning. Owned helper processes are terminated and reaped.
+- Preserve test outcomes, step counts and existing notes when cleanup is unavailable, including on hosts without Docker. Keep failed-step details visible alongside warnings.
+- Isolate executor test fixtures from the host Docker CLI.
+
 ## [0.12.0] - 2026-11-14
 
 - Add `build_frozen_plan_from_source` for verified captured inputs, including
