@@ -394,3 +394,7 @@ in-place 9、same-run retry 11 の計 74 件と strict all-target/all-feature cl
 submodule の current-manifest 優先修正後にも source capture 全 38 件を再実行し成功。
 親レビューは flat と submodule-preemption の P2 を解消確認済みで、他の指摘はない。
 全体 CI/push と actual source/Vault erasure は今回の非削除 foundation に含めない。
+S20a adds captured version declaration readers and typed scoped requirement /
+immutable baseline APIs. Remaining S20 work: adapter detect/resolve/install/activate,
+private roots and singleflight, frozen submit/admission integration. S21 diff/sync/
+doctor and S22/S23 service acceptance remain required; S20a alone is not S20 completion.

@@ -1092,6 +1092,8 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 版指定ファイルの無いtoolで、workflowやprofileが必要とするもの（例: 版を固定していないFlutter・Xcode）は、親でcapture時に解決された版を、そのrunの `toolchain_baseline` として記録する。照合規則はプロジェクト設定 `[toolchain] match = "exact" | "minor" | "major" | "any"` で選び、既定は `exact` とする。baselineと合わないworkerは候補から外すか、自動導入できるなら導入する。
 
+S20b の内部APIと未統合の境界は [private adapter API](toolchain-adapters.md) に記録する。閉じた導入計画・receipt・activation APIがあっても、既存setup admission/singleflightとsubmit/workerへの接続が完了するまでは自動導入対応を広告しない。
+
 workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、corepack）を持つ。adapterは `detect`（導入済み版の列挙）、`resolve`（要件を具体版へ）、`install`、`activate`（そのattemptのPATH・envへの反映）を備える。不足版の導入は、第8章のsetupと同じ経路（task-traffic-controllerのadmission、worker内singleflight、導入済み版のworker内再利用）で行い、導入にかかる時間と負荷をforecastの準備時間に含める。導入はattemptのworkspaceではなくworkerのtool領域に行い、同じ版の並行導入を1回にまとめる。
 
 管理者権限・ライセンス同意・GUI操作が必要なもの（Xcode本体の導入とライセンス同意、Docker Desktop、Homebrewのsystem package、macOSの権限）は自動導入しない。`blocked: environment_mismatch` とし、不足内容と実行すべき手順を示す。自動導入に失敗した場合も同じとし、成功扱いや別版での実行に切り替えない。
@@ -1255,3 +1257,39 @@ The source store owns a private permanent mutation-lock inode and a separate ret
 Retry/enqueue acquire source guards before admission/actor/DB operations and retain matching guards through actual commit; forwarding retains its guard through blocking IO drain. Preview takes nonblocking exclusive ownership, validates the configured store and source/run binding, checks all generations and trusted monotonic retention, and reports at most 32 unique owned manifest/blob paths. Unknown, pending, malformed or shared roots remain held. Preview never expires a root, writes an unavailable tombstone, claims deletion or removes source/Vault files. No automatic source deletion is enabled. Source/Vault erasure, owned Git/bundle cache cleanup and safe legacy abandonment remain mandatory follow-up work. Original workspaces and private in-place bindings are excluded.
 
 Registration retains one validated manifest and its file/directory identity across 32-reference pages, finishing that manifest before selecting newly queued children even when their IDs sort before it, so pages never repeatedly parse/hash the full manifest. Foreground producers supply their already-held manifest; run binding copies the completed indexed membership instead of rereading it. Background legacy loads default to the receiver's 64 MiB manifest limit and use a measured-length bounded reader. An oversized legacy manifest produces typed `Preview.manifest_limit` Hold; callers may set `PreviewCursor.manifest_byte_limit` explicitly to resume registration within that chosen bound. Source usage remains available. Arbitrary-size automatic legacy streaming registration remains pending. The preview cursor holds at most one manifest, with memory proportional to that manifest within the chosen byte bound, never a whole source graph. Future expiry of received roots also requires per-import pending ownership instead of relying on the current hash-shared pending blob marker.
+### S20a: captured declaration API boundary
+
+`toolchain::snapshot::read_captured` reads bounded, verified captured objects,
+not the live checkout. `versions::effective` intersects declarations per explicit
+project/workflow/job/step scope; contradictory declarations fail with source
+locations. There is no implicit precedence between project declaration files.
+The setup-node action's nonempty direct node-version does override its own
+node-version-file, including when the direct input is an unresolved expression.
+Action version-file paths are relative to the repository workspace, independently
+of the selected project directory. Captured Node files are decoded as structured
+JSON (Volta/devEngines/engines), mise TOML or node/nodejs-prefixed plain versions.
+Deferred expressions and
+manager channels require explicit resolution; missing observations remain unknown,
+even with `match = "any"`. `FrozenToolchains` retains source/profile identity,
+requirements, baseline provenance and explicit concrete selections for reuse on
+retry. Every declared range/channel needs a concrete selection before the frozen
+contract becomes resolved; a matching range alone cannot float on retry. Declared
+concrete selections always use exact version identity. The configurable match
+policy applies only to baselines for tools without a declaration. This API
+is not yet part of submit/admission payloads.
+
+Node-style ranges use the npm-compatible `node-semver` parser. Pub environment
+constraints use Dart's distinct caret and prerelease-bound rules. Pub concrete
+observations/selections include build metadata in ordering and equality; bounds
+containing build metadata currently return an explicit resolution-required diagnostic. Channel,
+workflow-expression and version-file-expression resolution is deferred, with no
+host env expansion. A selection's authority digest is supplied by the trusted
+parent/adapter; this API verifies its source/profile/scope/requirement binding,
+not the external resolver evidence itself. Snapshot version documents must be
+regular captured objects; secret entries and symlinks are rejected explicitly.
+
+S20 still requires manager adapters (nodenv/rustup/mise/fvm/corepack), private
+installation roots, resolution evidence, activation, installation singleflight
+and submit/worker integration. S21 workers diff/sync/doctor and real service
+environment acceptance remain mandatory. This declaration slice advertises no
+auto-installable capability.
