@@ -168,4 +168,11 @@ impl WorkerRuntime {
         let host = self.open_host()?;
         Agent::start(self.agent, host)
     }
+
+    /// Keep the enrollment gate continuously held through host preflight and DB open.
+    pub(crate) fn start_owned(self, file: std::fs::File) -> Result<Arc<Agent>, ApiError> {
+        let owner = crate::worker::agent::OwnedAgentLock::new(self.agent.clone(), file)?;
+        let host = self.open_host()?;
+        Agent::start_owned(owner, host)
+    }
 }

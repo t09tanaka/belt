@@ -29,3 +29,5 @@ mod resident;
 mod bootstrap;
 
 mod init;
+
+mod worker_role;

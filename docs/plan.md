@@ -147,3 +147,26 @@ Managed init binds planned cluster/coordinator IDs before preparing a staged met
 
 
 同時 init が `init.lock` 作成前の directory 作成で競合し、`AlreadyExists` をエラーにする問題を追加検証で確認した。競合した entry は非 symlink の実 directory と再確認し、勝った側だけでなく競合した側でも directory と親を fsync する。private leaf の所有 UID・permission 検査は維持する。directory/file/symlink と fsync の決定的 unit、および同じ epoch・worker・cluster と 1 回だけの daemon 起動を確認する所有子 process の同時 init テストが成功。負荷下の後者は約 120 秒を要した。strict all-target clippy・fmt・diff 検査も成功し、最終 immutable HEAD の全体 CI は親担当で行う。
+
+Standalone worker foreground slice: `worker --input` reads an owner-only retained
+WorkerSpec (schema 1, enrolled cluster/worker IDs, pinned executable, private key,
+allowlisted environment and captured user TOML). Its state must be the canonical
+HOME worker state so `worker --stdio` reaches the same agent socket. This is a
+persistent role; `--ephemeral` remains a separate required S24 implementation.
+The runtime owns its agent lock, independent tick/supervision and staged socket
+publication with durable inode receipt. Bridge disconnection never shuts it down.
+Only a dead socket matching the private receipt is reclaimed after a crash;
+foreign or uncertain ownership is refused. Unpublished crash staging directories
+are retained for future owned-artifact reconciliation. Cooperative owner locks and
+inode rechecks do not provide atomic protection against arbitrary same-UID/root
+replacement. Provisioning must retain this input/identity and the canonical HOME
+binding when native worker services are added. This slice does not complete S22:
+workers add/install, SSH bootstrap/key enrollment, versioned deployment,
+launchd/system-user and systemd worker roles, upgrade/rollback, worker lifecycle
+controls and native platform acceptance remain required. S24 ephemeral identity
+and forget semantics also remain required.
+Native worker service plans must select the worker foreground role rather than
+reuse the combined parent's `daemon --input` role. Parent remote-link attachment
+and per-worker source/secret routing are separate required slices: the existing
+resident source and secret delivery paths still target its local worker. A public
+standalone worker does not by itself establish remote end-to-end execution.

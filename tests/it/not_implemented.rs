@@ -20,7 +20,7 @@ const CASES: &[&[&str]] = &[
     &["workers", "diff", "w"],
     &["workers", "sync", "w", "--project", "p"],
     &["workers", "forget", "w"],
-    &["worker", "--stdio", "--ephemeral"],
+    &["worker", "--ephemeral"],
 ];
 
 #[test]

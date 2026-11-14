@@ -196,8 +196,12 @@ pub struct WorkerArgs {
     /// Speak the protocol over stdin/stdout.
     #[arg(long)]
     pub stdio: bool,
+    /// Retained private input for a foreground persistent worker.
+    #[arg(long, conflicts_with_all = ["stdio", "ephemeral"])]
+    pub input: Option<std::path::PathBuf>,
     /// Exit when the work is done.
     #[arg(long)]
+    #[arg(conflicts_with = "stdio")]
     pub ephemeral: bool,
 }
 
@@ -271,6 +275,9 @@ pub fn run(cli: Cli) -> i32 {
         return crate::service::bootstrap::daemon_main(args.input.as_deref());
     }
     if let Command::Worker(args) = &cli.command {
+        if let Some(input) = &args.input {
+            return crate::service::worker::main(input);
+        }
         if args.stdio && !args.ephemeral {
             return run_worker_stdio();
         }

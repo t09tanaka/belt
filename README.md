@@ -21,3 +21,11 @@ local-ci run --include-disabled
 ## License
 
 MIT
+
+A separately provisioned persistent worker can run in the foreground with
+`remote-task-runner worker --input "$WORKER_INPUT"`. The retained input is private
+and binds the cluster, worker identity, executable, key and captured configuration.
+Its HOME and canonical worker state must match the `worker --stdio` bridge. The
+bridge may disconnect while accepted work and its independent supervisor continue.
+Provisioning and native worker service installation remain required follow-up work;
+this entry point alone does not provide remote enrollment or end-to-end routing.

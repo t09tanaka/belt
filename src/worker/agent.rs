@@ -393,11 +393,39 @@ type Ended = (
     bool,
 );
 
+/// A validated agent.lock descriptor bound to the configuration it protects.
+/// Fields are private: callers cannot substitute another path/configuration at start.
+pub(crate) struct OwnedAgentLock {
+    config: AgentConfig,
+    lock: ProcessLock,
+}
+impl OwnedAgentLock {
+    pub(crate) fn new(config: AgentConfig, file: std::fs::File) -> Result<Self, ApiError> {
+        let lock =
+            ProcessLock::adopt_private(file, config.state_dir.join("agent.lock")).map_err(api)?;
+        Ok(Self { config, lock })
+    }
+}
+
 impl Agent {
     /// Run the startup steps in [`policy::STARTUP_ORDER`] and return the
     /// running agent. Any failing step refuses the start.
     pub fn start(cfg: AgentConfig, host: Arc<dyn Host>) -> Result<Arc<Agent>, ApiError> {
-        let mut lock = None;
+        Self::start_inner(cfg, host, None)
+    }
+
+    pub(crate) fn start_owned(
+        owner: OwnedAgentLock,
+        host: Arc<dyn Host>,
+    ) -> Result<Arc<Agent>, ApiError> {
+        Self::start_inner(owner.config, host, Some(owner.lock))
+    }
+
+    fn start_inner(
+        cfg: AgentConfig,
+        host: Arc<dyn Host>,
+        mut lock: Option<ProcessLock>,
+    ) -> Result<Arc<Agent>, ApiError> {
         let mut opened: Option<(WorkerStore, AgentEpoch)> = None;
         let mut report = StartupReport::default();
         let mut todo: Vec<AttemptId> = Vec::new();
@@ -411,7 +439,11 @@ impl Agent {
                         .map_err(|e| internal("attempts directory", e))?;
                 }
                 Step::CoreDumps => host.disable_core_dumps()?,
-                Step::Lock => lock = Some(acquire_lock(&cfg)?),
+                Step::Lock => {
+                    if lock.is_none() {
+                        lock = Some(acquire_lock(&cfg)?);
+                    }
+                }
                 Step::Store => {
                     let s = WorkerStore::open(&cfg.state_dir, &cfg.worker_id).map_err(api)?;
                     let e = s.start_agent(now()).map_err(api)?;

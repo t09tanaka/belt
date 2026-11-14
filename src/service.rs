@@ -11,3 +11,6 @@ pub mod resident;
 pub mod submit;
 
 pub mod init;
+
+/// Standalone persistent worker role, independent of SSH bridge lifetime.
+pub mod worker;
