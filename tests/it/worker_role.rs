@@ -60,6 +60,8 @@ impl Fixture {
         std::fs::write(&self.input, serde_json::to_vec(&self.spec).unwrap()).unwrap();
         std::fs::set_permissions(&self.input, std::fs::Permissions::from_mode(0o600)).unwrap();
     }
+    // Inherit harness environment (including LLVM_PROFILE_FILE) for instrumented
+    // owned children; never add test instrumentation to WorkerSpec.env.
     fn spawn(&self) -> tokio::process::Child {
         tokio::process::Command::new(BIN)
             .args(["worker", "--input"])
@@ -242,23 +244,74 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     assert!(adopted.worker.agent_epoch > initial.agent_epoch);
     assert_eq!(
         remote_task_runner::platform::process_start_identity(command_pid as u32),
-        remote_task_runner::platform::StartIdentity::Identity(command_start)
+        remote_task_runner::platform::StartIdentity::Identity(command_start.clone())
     );
-    let status = adopted
-        .client
-        .call(
-            Request::GetAttempt(GetAttemptRequest {
-                schema_version: SchemaVersion::CURRENT,
-                request_id: RequestId::generate(),
-                attempt_id: attempt.clone(),
-            }),
-            T,
-        )
-        .await
-        .unwrap();
+    // Command exec/PID-file creation precedes the supervisor's durable process
+    // identity and Running receipt. A hello is not an adoption-ready barrier.
+    let mut last_status = None;
+    let active = tokio::time::timeout(T, async {
+        loop {
+            assert!(
+                !release.exists(),
+                "command gate must remain closed during adoption"
+            );
+            assert_eq!(
+                remote_task_runner::platform::process_start_identity(command_pid as u32),
+                remote_task_runner::platform::StartIdentity::Identity(command_start.clone())
+            );
+            let response = adopted
+                .client
+                .call(
+                    Request::GetAttempt(GetAttemptRequest {
+                        schema_version: SchemaVersion::CURRENT,
+                        request_id: RequestId::generate(),
+                        attempt_id: attempt.clone(),
+                    }),
+                    T,
+                )
+                .await
+                .unwrap();
+            let Response::GetAttempt(status) = response else {
+                panic!("unexpected adoption response: {response:?}");
+            };
+            assert_eq!(status.attempt_id, attempt);
+            assert_eq!(status.agent_epoch, adopted.worker.agent_epoch);
+            assert!(
+                matches!(
+                    status.state,
+                    remote_task_runner::state::AttemptState::Starting
+                        | remote_task_runner::state::AttemptState::Active
+                ),
+                "unexpected adoption state: {status:?}"
+            );
+            let ready = status.state == remote_task_runner::state::AttemptState::Active
+                && status
+                    .receipts
+                    .reached(remote_task_runner::state::Receipt::Running);
+            last_status = Some(status);
+            if ready {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await;
     assert!(
-        matches!(status, Response::GetAttempt(s) if s.state == remote_task_runner::state::AttemptState::Active)
+        active.is_ok(),
+        "adoption did not become active: {last_status:?}"
     );
+    let store =
+        remote_task_runner::storage::WorkerStore::open_read_only(&f.spec.state_dir).unwrap();
+    let launches = store.launches(&attempt).unwrap();
+    assert_eq!(store.count_launches().unwrap(), 1);
+    assert_eq!(launches.len(), 1);
+    let identity = launches[0]
+        .2
+        .as_ref()
+        .expect("durable command process identity");
+    assert_eq!(identity.pid, command_pid as u32);
+    assert_eq!(identity.start_identity, command_start);
+    drop(store);
     kill_owned(&mut adoption_bridge).await;
     drop(adopted);
     std::fs::write(&release, "finish").unwrap();
@@ -286,6 +339,27 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }).await.unwrap();
+    let response = connected
+        .client
+        .call(
+            Request::GetResult(GetResultRequest {
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+                attempt_id: attempt.clone(),
+                generation: Generation(1),
+            }),
+            T,
+        )
+        .await
+        .unwrap();
+    let Response::GetResult(result) = response else {
+        panic!("unexpected result response: {response:?}");
+    };
+    assert_eq!(result.attempt_id, attempt);
+    assert_eq!(
+        result.termination.outcome(),
+        remote_task_runner::state::Outcome::Succeeded
+    );
     kill_owned(&mut bridge).await;
     drop(connected);
     f.stop(&mut worker).await;
@@ -296,9 +370,29 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     assert_eq!(connected.worker.cluster_id, initial.cluster_id);
     assert_eq!(connected.worker.worker_boot_id, initial.worker_boot_id);
     assert!(connected.worker.agent_epoch > initial.agent_epoch);
+    let response = connected
+        .client
+        .call(
+            Request::GetResult(GetResultRequest {
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+                attempt_id: attempt.clone(),
+                generation: Generation(1),
+            }),
+            T,
+        )
+        .await
+        .unwrap();
+    assert!(
+        matches!(response, Response::GetResult(ref restored) if restored == &result),
+        "durable result changed: {response:?}"
+    );
     kill_owned(&mut bridge).await;
     drop(connected);
     f.stop(&mut worker).await;
+    let store =
+        remote_task_runner::storage::WorkerStore::open_read_only(&f.spec.state_dir).unwrap();
+    assert_eq!(store.count_launches().unwrap(), 1);
     assert_eq!(std::fs::read_to_string(side_effect).unwrap(), "done");
 }
 
