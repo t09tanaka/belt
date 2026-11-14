@@ -222,6 +222,11 @@ mod tests {
                 Err("toolchain_resolve_required")
             );
         }
+        let distribution = bundle(&format!("20.0.0+sha256.{}", "a".repeat(64)));
+        distribution
+            .validate(&distribution.frozen.source_manifest)
+            .unwrap();
+        assert_eq!(distribution.evidence[0].concrete.to_string(), "20.0.0");
     }
     #[test]
     fn full_evidence_and_source_binding_are_mandatory_and_immutable() {
