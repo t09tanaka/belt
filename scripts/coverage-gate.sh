@@ -69,6 +69,7 @@ want = {
     "src/results/clock_policy.rs",
     "src/scheduler/decide.rs",
     "src/setup/policy.rs",
+    "src/setup/observation_transport.rs",
     "src/service/macos/policy.rs",
     "src/service/macos/observe.rs",
 }
