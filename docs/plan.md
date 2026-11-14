@@ -579,3 +579,12 @@ prefetchは同一blobの既存結果を再利用した。これは限定結果�
 `ci plan` は local-ci 0.13.0 の `build_frozen_plan_from_source` へ一度の capture の manifest と検証済み object store を渡す。`CiPlan` は同じ FrozenPlan と captured identity を保持し、公開出力は上限付きの構造 summary のみとする。captured config は manifest に載った regular file だけを読み、秘密入力・hash/size 不一致を拒否する。capture 後に live project を再読込しない。Directory に架空の Git revision を補わず、branch/path filter の不足 metadata は core の型付きエラーで拒否する。
 
 planning は owner、epoch、attempt、ledger へ登録せず、close / Drop で自分が作った private draft と Vault だけを削除する。Git/worktree/Directory と dirty submodule の planning を検証する。初期 capture policy は既存 Context の設定解決を利用する。実 CI 実行、worker Driver、remote artifact、CI status、shard retry、強制終了で残った draft の回収はこの区切りの完了に含めず、既存の必須残件として保持する。subcommand 無しの `ci` は引き続き未実装。
+
+
+### 統合検証と次の区切り（2026-11-15）
+
+S15統合 `f94d6f1` の全体ローカルCIは9ジョブ中1成功・7失敗・1環境エラーで終了した。通常テストのHOME比較・保護PATHのfixture、短いUnix socket path、source guard最後所有者の明示unlock、bootstrapのAccepted待機を個別に調査する。mutationはbaselineで停止し、mutant検出率は未測定、coverage集計も未完了。限定pure gateの成功を全体CI成功とは扱わない。修正統合後のコミット済みHEADで全体検証をやり直す。
+
+関連SDK local-ci 0.13.0はPR46、ローカル10項目・リモート10項目を通過し、crate・tag・4対象8配布assetの公開と照合が完了した。0.14開発のDriverは動的展開・worker再検証まで実装し、評価サイズ上限と状態容量境界を修正中。元の独立レビュー担当でproducer確定・permit解放を失わないことを確認してから、既存RunnerのDriver接続、cancel/fence、shard retry、artifact backendへ進む。
+
+setup実測は成功した準備コマンドの観測生成までで、遠隔取得・親側取り込み・推定への接続は未完了。次はowner世代と挿入順で束縛した最大64件の観測page、boot/epochを照合したfollow専用取り込み、元のmonotonic時刻を延長しないTTLを接続する。読み取り専用estimateから履歴を書かない。準備CPU時間を単純なready delayへ足さず、既存TTCの依存nodeと実ledger entryの対応でモデル化する。warmの0は現在のartifact内容・receipt・profileが検証された場合だけに限定し、観測不足や検証budget超過はUnknownを維持する。新しいschedulerは作らない。この接続と資源モデルの検証が済むまでS15f完成とは扱わない。
