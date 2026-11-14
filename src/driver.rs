@@ -22,7 +22,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const DRIVER_VERSION: u32 = 3;
+pub const DRIVER_VERSION: u32 = 4;
+mod atomic;
+pub use atomic::{AtomicGroupUnsupported, GroupPlacement, TaskExecutionMode};
 const MAX_TASKS: usize = 4096;
 const MAX_TEXT: usize = 16384;
 
@@ -228,7 +230,22 @@ impl Driver {
                 !t.jobs.is_empty() && ids.insert(t.id.clone()),
                 "empty/duplicate task"
             );
-            if t.dynamic_matrix {
+            atomic::validate_task(plan, t)?;
+            if t.jobs.len() > 1
+                && t.jobs.iter().any(|j| {
+                    plan.workflows
+                        .iter()
+                        .find(|w| w.file == t.workflow)
+                        .and_then(|w| w.job(j))
+                        .is_some_and(|j| j.matrix.is_some())
+                })
+            {
+                ensure!(
+                    evaluation.is_some(),
+                    "atomic matrix group needs verified evaluation source"
+                );
+            }
+            if t.dynamic_matrix && t.jobs.len() == 1 {
                 ensure!(
                     t.jobs.len() == 1
                         && t.nodes.len() == 1
@@ -308,6 +325,19 @@ impl Driver {
         }
         for g in &plan.graph.nodes {
             if let NodeKind::MatrixGroup { variants, .. } = &g.kind {
+                if let Some(owner) = producers.get(&(g.workflow.clone(), g.job.clone(), None)) {
+                    let task = plan.task(owner).context("missing atomic producer")?;
+                    ensure!(task.jobs.len() > 1, "mixed matrix/job producers");
+                    ensure!(
+                        !(0..variants.len()).any(|i| producers.contains_key(&(
+                            g.workflow.clone(),
+                            g.job.clone(),
+                            Some(i)
+                        ))),
+                        "mixed atomic/matrix producers"
+                    );
+                    continue;
+                }
                 ensure!(
                     !variants.is_empty(),
                     "empty matrix unsupported in this slice"
@@ -324,6 +354,7 @@ impl Driver {
                 );
             }
         }
+        atomic::validate_readiness(plan, &producers)?;
         let phases = plan
             .tasks
             .iter()
@@ -361,7 +392,15 @@ impl Driver {
             _ => None,
         }
     }
+    /// Deterministic execution contract of the original immutable task. A group
+    /// owns one permit/workspace; internal matrices never become derived claims.
+    pub fn execution_mode(&self, task: &str) -> Result<TaskExecutionMode> {
+        let task = self.plan.task(task).context("unknown original task")?;
+        Ok(atomic::mode(task))
+    }
     /// Placement descriptors from immutable source facts, including static jobs.
+    /// Atomic groups return original descriptors with evaluated=None: internal
+    /// needs/matrix labels and heterogeneous co-placement remain unknown.
     pub fn requirements(&self, task: &str) -> Result<Vec<RunnerRequirement>> {
         let evaluation = self
             .evaluation
@@ -377,6 +416,9 @@ impl Driver {
             return Ok(vec![selection.requirement.clone()]);
         }
         let task = self.plan.task(task).context("unknown task")?;
+        if task.jobs.len() > 1 {
+            return atomic::requirements(evaluation, task);
+        }
         let mut contexts = evaluation.contexts(&self.plan, task)?;
         let inputs = match &self.state.phases[&task.id] {
             Phase::Ready { inputs } | Phase::Claimed { inputs, .. } => inputs,
@@ -600,16 +642,20 @@ impl Driver {
                         "result ancestor failure mismatch"
                     );
                 }
-                ensure!(
-                    r.jobs.len() == t.jobs.len(),
-                    "missing/duplicate job reports"
-                );
-                for o in &r.outcomes {
-                    let reports: Vec<_> = r.jobs.iter().filter(|j| j.job == o.job).collect();
+                if t.jobs.len() > 1 {
+                    atomic::verify_result(&self.plan, &t, inputs, &r)?;
+                } else {
                     ensure!(
-                        reports.len() == 1 && JobStatus::of(reports[0]) == o.status,
-                        "job report/status mismatch"
+                        r.jobs.len() == t.jobs.len(),
+                        "missing/duplicate job reports"
                     );
+                    for o in &r.outcomes {
+                        let reports: Vec<_> = r.jobs.iter().filter(|j| j.job == o.job).collect();
+                        ensure!(
+                            reports.len() == 1 && JobStatus::of(reports[0]) == o.status,
+                            "job report/status mismatch"
+                        );
+                    }
                 }
                 for j in &r.jobs {
                     ensure!(
@@ -1040,7 +1086,7 @@ impl Driver {
                     s.cancelled,
                 );
                 changed = true;
-                if t.dynamic_matrix {
+                if t.dynamic_matrix && t.jobs.len() == 1 {
                     let evaluation = self
                         .evaluation
                         .as_ref()

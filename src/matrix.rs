@@ -17,7 +17,10 @@ pub fn expand(m: &Value) -> Result<Vec<Map<String, Value>>> {
 /// Excludes do not permit an oversized intermediate product.
 pub fn expand_bounded(m: &Value, max_combinations: usize) -> Result<Vec<Map<String, Value>>> {
     if max_combinations == 0 {
-        bail!("matrix combination limit must be positive");
+        return Err(crate::expr::EvaluationBudgetExceeded(
+            "matrix combination limit must be positive",
+        )
+        .into());
     }
     expand_with_limit(m, Some(max_combinations), None)
 }
@@ -28,7 +31,10 @@ pub(crate) fn expand_portable(
     bytes: usize,
 ) -> Result<Vec<Map<String, Value>>> {
     if max_combinations == 0 {
-        bail!("matrix expansion data budget exhausted");
+        return Err(crate::expr::EvaluationBudgetExceeded(
+            "matrix expansion data budget exhausted",
+        )
+        .into());
     }
     expand_with_limit(m, Some(max_combinations), Some(bytes))
 }
@@ -56,7 +62,10 @@ fn expand_with_limit(
                 .checked_mul(cardinality)
                 .is_none_or(|n| n > limit)
             {
-                bail!("matrix Cartesian product exceeds combination limit");
+                return Err(crate::expr::EvaluationBudgetExceeded(
+                    "matrix Cartesian product exceeds combination limit",
+                )
+                .into());
             }
         }
         let scalar;
@@ -75,13 +84,21 @@ fn expand_with_limit(
                 .iter()
                 .try_fold(0usize, |sum, combo| -> Result<usize> {
                     sum.checked_add(crate::expr::serialized_size(combo, bytes)?)
-                        .ok_or_else(|| anyhow::anyhow!("matrix byte budget exceeded"))
+                        .ok_or_else(|| {
+                            anyhow::Error::new(crate::expr::EvaluationBudgetExceeded(
+                                "matrix byte budget exceeded",
+                            ))
+                        })
                 })?;
             let value_bytes = values
                 .iter()
                 .try_fold(0usize, |sum, value| -> Result<usize> {
                     sum.checked_add(crate::expr::serialized_size(value, bytes)?)
-                        .ok_or_else(|| anyhow::anyhow!("matrix byte budget exceeded"))
+                        .ok_or_else(|| {
+                            anyhow::Error::new(crate::expr::EvaluationBudgetExceeded(
+                                "matrix byte budget exceeded",
+                            ))
+                        })
                 })?;
             let key_bytes = crate::expr::serialized_size(k, bytes)?;
             let next_bytes = old_bytes
@@ -102,9 +119,15 @@ fn expand_with_limit(
                         })
                         .and_then(|overhead| n.checked_add(overhead))
                 })
-                .ok_or_else(|| anyhow::anyhow!("matrix byte budget exceeded"))?;
+                .ok_or_else(|| {
+                    anyhow::Error::new(crate::expr::EvaluationBudgetExceeded(
+                        "matrix byte budget exceeded",
+                    ))
+                })?;
             if next_bytes > bytes {
-                bail!("matrix byte budget exceeded");
+                return Err(
+                    crate::expr::EvaluationBudgetExceeded("matrix byte budget exceeded").into(),
+                );
             }
         }
         original_keys.push(k.clone());
@@ -143,7 +166,10 @@ fn expand_with_limit(
                     .checked_mul(base_len.max(1))
                     .and_then(|n| n.checked_add(existing));
                 if additional.is_none_or(|n| n > bytes) {
-                    bail!("matrix include byte budget exceeded");
+                    return Err(crate::expr::EvaluationBudgetExceeded(
+                        "matrix include byte budget exceeded",
+                    )
+                    .into());
                 }
             }
             let mut matched = false;
@@ -161,7 +187,10 @@ fn expand_with_limit(
             }
             if !matched {
                 if limit.is_some_and(|n| combos.len() >= n) {
-                    bail!("matrix include exceeds combination limit");
+                    return Err(crate::expr::EvaluationBudgetExceeded(
+                        "matrix include exceeds combination limit",
+                    )
+                    .into());
                 }
                 combos.push(item.clone());
             }

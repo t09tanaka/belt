@@ -34,11 +34,18 @@ pub(crate) struct EvaluatedEntry {
 #[derive(Debug)]
 pub(crate) struct JobEvaluation {
     pub entries: Vec<EvaluatedEntry>,
+    pub(crate) budget_exceeded: bool,
 }
 impl JobEvaluation {
+    fn budget(display: String, reason: &str) -> Self {
+        let mut result = Self::terminal(display, Decision::Error(reason.into()));
+        result.budget_exceeded = true;
+        result
+    }
     fn terminal(display: String, decision: Decision) -> Self {
         Self {
             entries: vec![EvaluatedEntry { display, decision }],
+            budget_exceeded: false,
         }
     }
 }
@@ -63,6 +70,7 @@ pub(crate) fn evaluate_job(
         only,
         shard,
         None,
+        false,
     )
 }
 
@@ -84,7 +92,36 @@ pub(crate) fn evaluate_portable(
         None,
         None,
         Some((contexts, limit)),
+        false,
     )
+}
+
+/// Atomic replay uses legacy expansion-before-if order with bounded allocations.
+/// Resource refusal is not a fabricated one-report worker matrix failure.
+pub(crate) fn evaluate_atomic(
+    job: &Job,
+    github: Value,
+    needs: &Map<String, Value>,
+    ancestor_failed: bool,
+    run_cancelled: bool,
+) -> Result<JobEvaluation> {
+    let result = evaluate_inner(
+        job,
+        github,
+        json!({}),
+        needs,
+        ancestor_failed,
+        run_cancelled,
+        None,
+        None,
+        None,
+        true,
+    );
+    anyhow::ensure!(
+        !result.budget_exceeded,
+        "atomic membership evaluation budget exceeded"
+    );
+    Ok(result)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -98,7 +135,9 @@ fn evaluate_inner(
     only: Option<usize>,
     shard: Option<&TaskShard>,
     portable: Option<(&Map<String, Value>, usize)>,
+    bounded_legacy: bool,
 ) -> JobEvaluation {
+    let allocation_bounds = portable.is_some() || bounded_legacy;
     let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
     let needs_of_job: Map<String, Value> = job
         .needs
@@ -183,7 +222,7 @@ fn evaluate_inner(
     let combos = match &job.matrix {
         None => vec![Map::new()],
         Some(m) => {
-            let ctx = bounded(Ctx::new(&ctx_map, Status::Success), portable.is_some());
+            let ctx = bounded(Ctx::new(&ctx_map, Status::Success), allocation_bounds);
             let raw = matrix::yaml_to_json(m);
             let value = if portable.is_some() {
                 validate_strings(&raw, &ctx_map, expr::PortableStage::Matrix)
@@ -194,14 +233,19 @@ fn evaluate_inner(
             match value.and_then(|v| match portable {
                 Some((_, 0)) => anyhow::bail!("matrix expansion data budget exhausted"),
                 Some((_, limit)) => matrix::expand_portable(&v, limit, PORTABLE_OUTPUT_BYTES),
+                None if bounded_legacy => matrix::expand_portable(&v, 4096, PORTABLE_OUTPUT_BYTES),
                 None => matrix::expand(&v),
             }) {
                 Ok(c) => c,
                 Err(e) => {
-                    return JobEvaluation::terminal(
+                    let budget_exceeded =
+                        e.downcast_ref::<expr::EvaluationBudgetExceeded>().is_some();
+                    let mut result = JobEvaluation::terminal(
                         base_name,
                         Decision::Error(format!("matrix: {e:#}")),
-                    )
+                    );
+                    result.budget_exceeded = budget_exceeded;
+                    return result;
                 }
             }
         }
@@ -237,11 +281,8 @@ fn evaluate_inner(
             }
         }
     }
-    if portable.is_some() && expr::serialized_size(&job.name, PORTABLE_OUTPUT_BYTES).is_err() {
-        return JobEvaluation::terminal(
-            base_name,
-            Decision::Error("name: byte budget exceeded".into()),
-        );
+    if allocation_bounds && expr::serialized_size(&job.name, PORTABLE_OUTPUT_BYTES).is_err() {
+        return JobEvaluation::budget(base_name, "name: byte budget exceeded");
     }
     // Combinations that pass `if:` run after this loop.
     let mut evaluated_bytes = 0usize;
@@ -249,16 +290,13 @@ fn evaluate_inner(
     let mut seen: HashSet<String> = HashSet::new();
     let total = combos.len();
     for (idx, combo) in combos.into_iter().enumerate() {
-        if portable.is_some() {
+        if allocation_bounds {
             let next =
                 expr::serialized_size(&(&ctx_map, &combo, &job.name), PORTABLE_EVALUATION_BYTES)
                     .ok()
                     .and_then(|bytes| evaluated_bytes.checked_add(bytes));
             if next.is_none_or(|bytes| bytes > PORTABLE_EVALUATION_BYTES) {
-                return JobEvaluation::terminal(
-                    base_name,
-                    Decision::Error("evaluation byte budget exceeded".into()),
-                );
+                return JobEvaluation::budget(base_name, "evaluation byte budget exceeded");
             }
         }
         let mut cm = ctx_map.clone();
@@ -268,10 +306,16 @@ fn evaluate_inner(
             json!({"job-index": idx, "job-total": total}),
         );
         let mut display = {
-            let ctx = bounded(Ctx::new(&cm, Status::Success), portable.is_some());
+            let ctx = bounded(Ctx::new(&cm, Status::Success), allocation_bounds);
             match &job.name {
                 Some(n) if n.contains("${{") => match expr::interpolate(n, &ctx) {
                     Ok(value) => value,
+                    Err(e)
+                        if bounded_legacy
+                            && e.downcast_ref::<expr::EvaluationBudgetExceeded>().is_some() =>
+                    {
+                        return JobEvaluation::budget(base_name, "name: byte budget exceeded");
+                    }
                     Err(e) if portable.is_some() => {
                         return JobEvaluation::terminal(
                             base_name,
@@ -288,11 +332,8 @@ fn evaluate_inner(
                 None => job.id.clone(),
             }
         };
-        if portable.is_some() && expr::serialized_size(&display, PORTABLE_OUTPUT_BYTES).is_err() {
-            return JobEvaluation::terminal(
-                base_name,
-                Decision::Error("name: byte budget exceeded".into()),
-            );
+        if allocation_bounds && expr::serialized_size(&display, PORTABLE_OUTPUT_BYTES).is_err() {
+            return JobEvaluation::budget(base_name, "name: byte budget exceeded");
         }
         // each shard of a job has a name (and so a log) of its own
         if let Some(t) = shard {
@@ -306,22 +347,17 @@ fn evaluate_inner(
         if only.is_some_and(|o| o != idx) {
             continue;
         }
-        if portable.is_some() {
+        if allocation_bounds {
             let next = expr::serialized_size(&(&cm, &display), PORTABLE_EVALUATION_BYTES)
                 .ok()
                 .and_then(|bytes| evaluated_bytes.checked_add(bytes));
             match next {
                 Some(bytes) if bytes <= PORTABLE_EVALUATION_BYTES => evaluated_bytes = bytes,
-                _ => {
-                    return JobEvaluation::terminal(
-                        base_name,
-                        Decision::Error("evaluation byte budget exceeded".into()),
-                    )
-                }
+                _ => return JobEvaluation::budget(base_name, "evaluation byte budget exceeded"),
             }
         }
         let run_it = {
-            let ctx = bounded(Ctx::with_fns(&cm, needs_fns), portable.is_some());
+            let ctx = bounded(Ctx::with_fns(&cm, needs_fns), allocation_bounds);
             expr::condition(job.cond.as_deref(), &ctx)
         };
         let decision = match run_it {
@@ -332,7 +368,10 @@ fn evaluate_inner(
         entries.push(EvaluatedEntry { display, decision });
     }
 
-    JobEvaluation { entries }
+    JobEvaluation {
+        entries,
+        budget_exceeded: false,
+    }
 }
 
 pub(crate) fn validate_strings(

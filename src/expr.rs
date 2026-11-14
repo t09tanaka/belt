@@ -89,7 +89,7 @@ impl<'a> Ctx<'a> {
     }
     fn check_len(&self, bytes: usize) -> Result<()> {
         if self.output_limit.is_some_and(|limit| bytes > limit) {
-            bail!("expression output byte budget exceeded");
+            return Err(EvaluationBudgetExceeded("expression output byte budget exceeded").into());
         }
         Ok(())
     }
@@ -97,6 +97,16 @@ impl<'a> Ctx<'a> {
         self.token_from?.github_token().map(str::to_string)
     }
 }
+
+/// Distinguishes resource refusal from an ordinary expression/matrix error.
+#[derive(Debug)]
+pub(crate) struct EvaluationBudgetExceeded(pub &'static str);
+impl std::fmt::Display for EvaluationBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for EvaluationBudgetExceeded {}
 
 /// Count serialized bytes without allocating a second serialized value.
 pub(crate) fn serialized_size<T: serde::Serialize>(value: &T, limit: usize) -> Result<usize> {
@@ -118,8 +128,9 @@ pub(crate) fn serialized_size<T: serde::Serialize>(value: &T, limit: usize) -> R
         }
     }
     let mut counter = Counter { bytes: 0, limit };
-    serde_json::to_writer(&mut counter, value)
-        .map_err(|_| anyhow::anyhow!("serialized byte budget exceeded"))?;
+    serde_json::to_writer(&mut counter, value).map_err(|_| {
+        anyhow::Error::new(EvaluationBudgetExceeded("serialized byte budget exceeded"))
+    })?;
     Ok(counter.bytes)
 }
 
@@ -564,7 +575,11 @@ fn call(name: &str, args: &[Ast], ctx: &Ctx) -> Result<Value> {
         if let Some(limit) = ctx.output_limit {
             argument_bytes = argument_bytes
                 .checked_add(serialized_size(&value, limit)?)
-                .ok_or_else(|| anyhow::anyhow!("expression argument byte budget exceeded"))?;
+                .ok_or_else(|| {
+                    anyhow::Error::new(EvaluationBudgetExceeded(
+                        "expression argument byte budget exceeded",
+                    ))
+                })?;
             ctx.check_len(argument_bytes)?;
         }
         a.push(value);
@@ -602,7 +617,11 @@ fn call(name: &str, args: &[Ast], ctx: &Ctx) -> Result<Value> {
                                 .checked_mul(replacement.len())
                                 .and_then(|added| base.checked_add(added))
                         })
-                        .ok_or_else(|| anyhow::anyhow!("expression output byte budget exceeded"))?;
+                        .ok_or_else(|| {
+                            anyhow::Error::new(EvaluationBudgetExceeded(
+                                "expression output byte budget exceeded",
+                            ))
+                        })?;
                     ctx.check_len(bytes)?;
                 }
                 out = out.replace(&needle, &replacement);
@@ -624,7 +643,9 @@ fn call(name: &str, args: &[Ast], ctx: &Ctx) -> Result<Value> {
                                     .and_then(|separators| n.checked_add(separators))
                             })
                             .ok_or_else(|| {
-                                anyhow::anyhow!("expression output byte budget exceeded")
+                                anyhow::Error::new(EvaluationBudgetExceeded(
+                                    "expression output byte budget exceeded",
+                                ))
                             })?;
                         ctx.check_len(bytes)?;
                     }
@@ -663,8 +684,11 @@ fn call(name: &str, args: &[Ast], ctx: &Ctx) -> Result<Value> {
                     output: Vec::new(),
                     limit,
                 };
-                serde_json::to_writer_pretty(&mut writer, value)
-                    .map_err(|_| anyhow::anyhow!("expression output byte budget exceeded"))?;
+                serde_json::to_writer_pretty(&mut writer, value).map_err(|_| {
+                    anyhow::Error::new(EvaluationBudgetExceeded(
+                        "expression output byte budget exceeded",
+                    ))
+                })?;
                 Value::String(String::from_utf8(writer.output)?)
             } else {
                 Value::String(serde_json::to_string_pretty(value)?)
@@ -685,29 +709,29 @@ pub fn interpolate(s: &str, ctx: &Ctx) -> Result<String> {
     let mut out = String::new();
     let mut rest = s;
     while let Some(start) = rest.find("${{") {
-        ctx.check_len(
-            out.len()
-                .checked_add(start)
-                .ok_or_else(|| anyhow::anyhow!("expression output byte budget exceeded"))?,
-        )?;
+        ctx.check_len(out.len().checked_add(start).ok_or_else(|| {
+            anyhow::Error::new(EvaluationBudgetExceeded(
+                "expression output byte budget exceeded",
+            ))
+        })?)?;
         out.push_str(&rest[..start]);
         let after = &rest[start + 3..];
         let end =
             find_close(after).ok_or_else(|| anyhow::anyhow!("unterminated `${{{{` in `{s}`"))?;
         let value = to_string(&evaluate(&after[..end], ctx)?);
-        ctx.check_len(
-            out.len()
-                .checked_add(value.len())
-                .ok_or_else(|| anyhow::anyhow!("expression output byte budget exceeded"))?,
-        )?;
+        ctx.check_len(out.len().checked_add(value.len()).ok_or_else(|| {
+            anyhow::Error::new(EvaluationBudgetExceeded(
+                "expression output byte budget exceeded",
+            ))
+        })?)?;
         out.push_str(&value);
         rest = &after[end + 2..];
     }
-    ctx.check_len(
-        out.len()
-            .checked_add(rest.len())
-            .ok_or_else(|| anyhow::anyhow!("expression output byte budget exceeded"))?,
-    )?;
+    ctx.check_len(out.len().checked_add(rest.len()).ok_or_else(|| {
+        anyhow::Error::new(EvaluationBudgetExceeded(
+            "expression output byte budget exceeded",
+        ))
+    })?)?;
     out.push_str(rest);
     ctx.check_value(&out)?;
     Ok(out)

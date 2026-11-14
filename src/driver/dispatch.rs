@@ -217,6 +217,7 @@ impl Selection {
         .into_iter()
         .collect();
         job_evaluate::JobEvaluation {
+            budget_exceeded: false,
             entries: vec![job_evaluate::EvaluatedEntry {
                 display: self.display.clone(),
                 decision: Decision::Run(contexts),

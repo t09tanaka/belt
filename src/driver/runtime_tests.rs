@@ -737,7 +737,7 @@ fn expansion_budgets_and_grouped_dynamic_are_explicit_before_dispatch() {
         f.facts.clone(),
     )
     .unwrap_err();
-    assert!(error.to_string().contains("grouped dynamic"));
+    assert!(error.to_string().contains("atomic shared-workspace"));
 }
 
 #[test]
@@ -1235,4 +1235,524 @@ fn oversized_real_result_is_explicit_storage_error_and_keeps_owner() {
     assert_eq!(d.admitted(), 1);
     assert!(!finished(&d));
     assert_eq!(cancel_actions(&d).len(), 1);
+}
+
+const ATOMIC_WORKFLOW: &str = r#"on: push
+jobs:
+  producer:
+    runs-on: x
+    outputs:
+      matrix: ${{ steps.out.outputs.matrix }}
+    steps:
+      - id: out
+        run: echo 'matrix={"n":[0,1]}' >> "$GITHUB_OUTPUT"
+  first:
+    needs: producer
+    runs-on: initial
+    outputs:
+      matrix: ${{ steps.out.outputs.matrix }}
+    steps:
+      - id: out
+        run: |
+          echo first > shared.txt
+          echo 'matrix=${{ needs.producer.outputs.matrix }}' >> "$GITHUB_OUTPUT"
+  matrix:
+    needs: first
+    runs-on: ${{ needs.first.outputs.label }}
+    name: 'member-${{ matrix.n }}'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.first.outputs.matrix) }}
+    outputs:
+      value: ${{ steps.out.outputs.value }}
+    steps:
+      - id: out
+        run: |
+          test -f shared.txt
+          echo '${{ matrix.n }}' >> shared.txt
+          echo 'value=v${{ matrix.n }}' >> "$GITHUB_OUTPUT"
+  last:
+    needs: matrix
+    runs-on: last
+    steps:
+      - run: |
+          test '${{ needs.matrix.outputs.value }}' = v1
+          echo last >> shared.txt
+  consumer:
+    needs: [matrix, last]
+    runs-on: x
+    steps:
+      - run: test '${{ needs.matrix.outputs.value }}' = v1
+"#;
+fn atomic_action(d: &Driver) -> ActionKind {
+    ready(d)
+        .into_iter()
+        .find(|a| match a {
+            ActionKind::Ready { task, .. } => d.plan.task(task).unwrap().jobs.len() > 1,
+            _ => false,
+        })
+        .expect("atomic group ready")
+}
+fn atomic_start(f: &Fixture, d: &mut Driver) -> Vec<Transition> {
+    let mut records = vec![commit(d, Input::Advance)];
+    let producer = ready(d)
+        .into_iter()
+        .find(|a| match a {
+            ActionKind::Ready { task, .. } => d.plan.task(task).unwrap().jobs == ["producer"],
+            _ => false,
+        })
+        .unwrap();
+    let record = d
+        .propose(Input::Claim {
+            task: ready_task(&producer).unwrap().into(),
+            token: ready_task(&producer).unwrap().into(),
+        })
+        .unwrap();
+    d.apply(&record).unwrap();
+    records.push(record);
+    let (wire, _) = f.execute(&producer, "producer");
+    records.push(settle(d, &producer, wire));
+    records
+}
+#[test]
+fn atomic_group_real_dynamic_shared_workspace_exact_settlement_replay() {
+    let f = Fixture::new(ATOMIC_WORKFLOW);
+    let mut d = f.driver(2);
+    let mut records = atomic_start(&f, &mut d);
+    let action = atomic_action(&d);
+    let id = ready_task(&action).unwrap();
+    assert_eq!(d.plan.task(id).unwrap().jobs, ["first", "matrix", "last"]);
+    assert!(!d.plan.task(id).unwrap().dynamic_matrix); // immutable planner flag
+    assert_eq!(
+        d.execution_mode(id).unwrap(),
+        TaskExecutionMode::AtomicSharedWorkspace {
+            placement: GroupPlacement::Unknown
+        }
+    );
+    let requirements = d.requirements(id).unwrap();
+    assert_eq!(requirements.len(), 3);
+    assert_eq!(
+        requirements[1].original,
+        Some(json!("${{ needs.first.outputs.label }}"))
+    );
+    assert!(requirements.iter().all(|r| r.evaluated.is_none()));
+    assert!(d.outcome(FILE, "first").is_none());
+    records.push(commit(
+        &mut d,
+        Input::Claim {
+            task: id.into(),
+            token: id.into(),
+        },
+    ));
+    assert_eq!(d.admitted(), 1);
+    let (wire, root) = f.execute(&action, "group");
+    assert_eq!(
+        std::fs::read_to_string(root.join("shared.txt")).unwrap(),
+        "first\n0\n1\nlast\n"
+    );
+    assert_eq!(
+        wire.clone()
+            .into_task_result(Path::new("."))
+            .unwrap()
+            .jobs
+            .len(),
+        4
+    );
+    for change in ["missing", "order", "status", "identity", "duplicate"] {
+        let mut result = wire.clone().into_task_result(Path::new(".")).unwrap();
+        match change {
+            "missing" => {
+                result.jobs.remove(1);
+            }
+            "order" => result.jobs.swap(1, 2),
+            "status" => result.outcomes[1].status = JobStatus::Failure,
+            "identity" => result.task.push_str("-other"),
+            _ => result.jobs.push(result.jobs[1].clone()),
+        }
+        let bad = WireTaskResult::from_task_result(&result, Path::new(".")).unwrap();
+        let before = digest(&d.state).unwrap();
+        assert!(
+            d.propose(Input::Settle {
+                task: id.into(),
+                token: id.into(),
+                result_digest: bad.digest().unwrap(),
+                result: Box::new(bad)
+            })
+            .is_err(),
+            "{change}"
+        );
+        assert_eq!(digest(&d.state).unwrap(), before);
+        assert_eq!(d.admitted(), 1);
+    }
+    records.push(settle(&mut d, &action, wire));
+    assert_eq!(d.outcome(FILE, "matrix").unwrap().outputs["value"], "v1");
+    assert_eq!(d.admitted(), 0);
+    assert!(d.state.expansions.is_empty());
+    let consumer = ready(&d).pop().unwrap();
+    records.push(commit(
+        &mut d,
+        Input::Claim {
+            task: ready_task(&consumer).unwrap().into(),
+            token: ready_task(&consumer).unwrap().into(),
+        },
+    ));
+    let (wire, _) = f.execute(&consumer, "consumer");
+    records.push(settle(&mut d, &consumer, wire));
+    let mut replay = f.driver(2);
+    for record in records {
+        replay.apply(&record).unwrap();
+    }
+    assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+    assert!(d.state.finished);
+}
+
+#[test]
+fn atomic_group_real_static_and_failed_invalid_empty_internal_matrices() {
+    for (name, workflow, expected) in [
+        (
+            "static",
+            ATOMIC_WORKFLOW.replace(
+                "matrix: ${{ fromJSON(needs.first.outputs.matrix) }}",
+                "matrix: {n: [0,1]}",
+            ),
+            JobStatus::Success,
+        ),
+        (
+            "failed",
+            ATOMIC_WORKFLOW.replace(
+                "echo 'value=v${{ matrix.n }}'",
+                "test '${{ matrix.n }}' != 0\n          echo 'value=v${{ matrix.n }}'",
+            ),
+            JobStatus::Failure,
+        ),
+        (
+            "invalid",
+            ATOMIC_WORKFLOW.replace("matrix={\"n\":[0,1]}", "matrix=broken"),
+            JobStatus::Failure,
+        ),
+        (
+            "empty",
+            ATOMIC_WORKFLOW.replace("matrix={\"n\":[0,1]}", "matrix={\"n\":[]}"),
+            JobStatus::Failure,
+        ),
+    ] {
+        let f = Fixture::new(&workflow);
+        let mut d = f.driver(2);
+        atomic_start(&f, &mut d);
+        let action = atomic_action(&d);
+        claim(&mut d, &action);
+        let (wire, _) = f.execute(&action, name);
+        settle(&mut d, &action, wire);
+        assert_eq!(
+            d.outcome(FILE, "matrix").unwrap().status,
+            expected,
+            "{name}"
+        );
+        if expected == JobStatus::Failure {
+            assert!(d.outcome(FILE, "last").unwrap().ancestor_failed);
+        }
+        assert!(d.state.expansions.is_empty());
+    }
+}
+
+#[test]
+fn atomic_group_cancel_inflight_or_late_real_receipt_retains_ownership_and_replays() {
+    use std::io::Read;
+    for in_flight in [false, true] {
+        let signal_area = tempfile::tempdir_in("/private/tmp").unwrap();
+        let signal = signal_area.path().join("running.fifo");
+        assert!(ExecContext::new(Default::default())
+            .command("/usr/bin/mkfifo")
+            .arg(&signal)
+            .status()
+            .unwrap()
+            .success());
+        let workflow = if in_flight {
+            ATOMIC_WORKFLOW.replace("          test -f shared.txt",&format!("          test -f shared.txt\n          echo running > '{}'\n          sleep 60",signal.display()))
+        } else {
+            ATOMIC_WORKFLOW.into()
+        };
+        let f = Fixture::new(&workflow);
+        let mut d = f.driver(2);
+        let mut records = atomic_start(&f, &mut d);
+        let action = atomic_action(&d);
+        let id = ready_task(&action).unwrap();
+        records.push(commit(
+            &mut d,
+            Input::Claim {
+                task: id.into(),
+                token: id.into(),
+            },
+        ));
+        let wire = std::thread::scope(|scope| {
+            let mut worker = Some(scope.spawn(|| f.execute(&action, "owned-group").0));
+            let completed = if in_flight {
+                let mut line = String::new();
+                std::fs::File::open(&signal)
+                    .unwrap()
+                    .read_to_string(&mut line)
+                    .unwrap();
+                assert_eq!(line, "running\n");
+                None
+            } else {
+                Some(worker.take().unwrap().join().unwrap())
+            };
+            records.push(commit(&mut d, Input::Cancel));
+            assert!(d.outcome(FILE, "first").is_none());
+            assert!(d.outcome(FILE, "matrix").is_none());
+            assert_eq!(d.admitted(), 1);
+            assert!(!finished(&d));
+            assert!(ready(&d).is_empty());
+            let cancel = cancel_actions(&d).remove(0);
+            records.push(commit(&mut d, Input::Ack { action: cancel.id }));
+            records.push(commit(&mut d, Input::Cancel));
+            assert!(cancel_actions(&d).is_empty());
+            if let Some(wire) = completed {
+                wire
+            } else {
+                f.ctx.cancel.cancel(); // Deliver only to this fixture's real process group.
+                worker.take().unwrap().join().unwrap()
+            }
+        });
+        records.push(settle(&mut d, &action, wire));
+        assert_eq!(d.admitted(), 0);
+        assert!(finished(&d));
+        assert_eq!(
+            d.outcome(FILE, "matrix").unwrap().status,
+            if in_flight {
+                JobStatus::Cancelled
+            } else {
+                JobStatus::Success
+            }
+        );
+        assert!(matches!(
+            d.state.phases[id],
+            Phase::Terminal(Terminal::Worker { .. })
+        ));
+        let mut replay = f.driver(2);
+        for record in records {
+            replay.apply(&record).unwrap();
+        }
+        assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+    }
+}
+
+#[test]
+fn atomic_group_rejects_unsafe_partial_readiness_membership_source_and_runtime_context() {
+    let f = Fixture::new(ATOMIC_WORKFLOW);
+    let mut d = f.driver(2);
+    let records = atomic_start(&f, &mut d);
+    let group = d.plan.tasks.iter().find(|t| t.jobs.len() > 1).unwrap();
+    for mutation in ["nodes", "order", "external"] {
+        let mut plan = f.plan.clone();
+        let task = plan.tasks.iter_mut().find(|t| t.id == group.id).unwrap();
+        match mutation {
+            "nodes" => {
+                task.nodes.pop();
+            }
+            "order" => {
+                task.jobs.swap(0, 1);
+                task.nodes.swap(0, 1);
+            }
+            _ => task.depends_on.clear(),
+        }
+        plan.digest = plan.compute_digest().unwrap();
+        let source = PinnedExecution::new(&plan, &f.manifest, &f.store)
+            .unwrap()
+            .evaluation_source()
+            .unwrap();
+        assert!(
+            Driver::with_evaluation(
+                &plan,
+                DriverConfig {
+                    schema_version: DRIVER_VERSION,
+                    max_parallel: 2
+                },
+                &source,
+                f.facts.clone()
+            )
+            .is_err(),
+            "{mutation}"
+        );
+    }
+    // Forged task partition, but unchanged real job graph: first -> matrix
+    // -> last. Grouping first+last would require first's partial publication
+    // to start the external matrix. Never repair this by inventing edges.
+    let mut unsafe_plan = f.plan.clone();
+    let at = unsafe_plan
+        .tasks
+        .iter()
+        .position(|t| t.jobs.len() > 1)
+        .unwrap();
+    let original = unsafe_plan.tasks[at].clone();
+    let mut outer = original.clone();
+    outer.jobs = vec!["first".into(), "last".into()];
+    outer.nodes = outer
+        .jobs
+        .iter()
+        .map(|j| crate::dag::node_id(FILE, j))
+        .collect();
+    outer.id = format!("{FILE}::first+last");
+    let mut middle = original;
+    middle.jobs = vec!["matrix".into()];
+    middle.nodes = vec![crate::dag::node_id(FILE, "matrix")];
+    middle.id = format!("{FILE}::matrix");
+    middle.dynamic_matrix = true;
+    middle.grouped_reason = None;
+    middle.workspace.shared_by_jobs = false;
+    middle.depends_on = vec![outer.id.clone()];
+    unsafe_plan.tasks[at] = outer;
+    unsafe_plan.tasks.insert(at + 1, middle);
+    let owners = vec![
+        unsafe_plan.tasks[at].id.clone(),
+        unsafe_plan.tasks[at + 1].id.clone(),
+    ];
+    for task in unsafe_plan.tasks.iter_mut().skip(at + 2) {
+        task.depends_on = owners.clone();
+    }
+    unsafe_plan.digest = unsafe_plan.compute_digest().unwrap();
+    assert_eq!(unsafe_plan.graph, f.plan.graph);
+    let source = PinnedExecution::new(&unsafe_plan, &f.manifest, &f.store)
+        .unwrap()
+        .evaluation_source()
+        .unwrap();
+    let error = Driver::with_evaluation(
+        &unsafe_plan,
+        DriverConfig {
+            schema_version: DRIVER_VERSION,
+            max_parallel: 2,
+        },
+        &source,
+        f.facts.clone(),
+    )
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("unsafe atomic/external readiness"));
+    let other = Fixture::new(&ATOMIC_WORKFLOW.replace("runs-on: initial", "runs-on: different"));
+    let source = other.input().evaluation_source().unwrap();
+    assert!(Driver::with_evaluation(
+        &f.plan,
+        DriverConfig {
+            schema_version: DRIVER_VERSION,
+            max_parallel: 2
+        },
+        &source,
+        f.facts.clone()
+    )
+    .is_err());
+    let mut other_driver = other.driver(2);
+    assert!(other_driver.apply(&records[0]).is_err());
+    let runtime = Fixture::new(&ATOMIC_WORKFLOW.replace(
+        "fromJSON(needs.first.outputs.matrix)",
+        "fromJSON(runner.temp)",
+    ));
+    let error = Driver::with_evaluation(
+        &runtime.plan,
+        DriverConfig {
+            schema_version: DRIVER_VERSION,
+            max_parallel: 2,
+        },
+        &runtime.input().evaluation_source().unwrap(),
+        runtime.facts.clone(),
+    )
+    .unwrap_err();
+    assert!(error.downcast_ref::<AtomicGroupUnsupported>().is_some());
+}
+
+#[test]
+fn atomic_group_bounded_membership_keeps_real_receipt_and_permit_on_unsupported_size() {
+    // The real worker expands 4097 skipped entries. Core's replay bound cannot
+    // authenticate that membership, so it retains ownership rather than
+    // accepting a synthetic one-report matrix error.
+    let matrix = json!({"n":(0..4097).collect::<Vec<_>>()}).to_string();
+    let workflow = ATOMIC_WORKFLOW
+        .replace("matrix={\"n\":[0,1]}", &format!("matrix={matrix}"))
+        .replace(
+            "    name: 'member-${{ matrix.n }}'",
+            "    name: 'member-${{ matrix.n }}'\n    if: false",
+        );
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(1);
+    atomic_start(&f, &mut d);
+    let action = atomic_action(&d);
+    claim(&mut d, &action);
+    let (wire, _) = f.execute(&action, "real-oversize-membership");
+    let result = wire.clone().into_task_result(Path::new(".")).unwrap();
+    assert_eq!(
+        result.jobs.iter().filter(|r| r.job == "matrix").count(),
+        4097
+    );
+    let before = digest(&d.state).unwrap();
+    let error = d
+        .propose(Input::Settle {
+            task: ready_task(&action).unwrap().into(),
+            token: ready_task(&action).unwrap().into(),
+            result_digest: wire.digest().unwrap(),
+            result: Box::new(wire),
+        })
+        .unwrap_err();
+    assert!(error.downcast_ref::<AtomicGroupUnsupported>().is_some());
+    assert_eq!(digest(&d.state).unwrap(), before);
+    assert_eq!(d.admitted(), 1);
+    commit(&mut d, Input::Cancel);
+    assert_eq!(d.admitted(), 1);
+    assert!(!finished(&d));
+}
+
+#[test]
+fn atomic_group_shared_evaluator_bounds_cartesian_expression_names_and_context_copies() {
+    let f = Fixture::new(ATOMIC_WORKFLOW);
+    let mut spec = f.plan.workflows[0].job("matrix").unwrap().to_job();
+    let mut needs = Map::new();
+    needs.insert("first".into(),json!({"result":"success","outputs":{"matrix":json!({"n":(0..100).collect::<Vec<_>>(),"m":(0..100).collect::<Vec<_>>()} ).to_string()}}));
+    assert!(crate::job_evaluate::evaluate_atomic(&spec, json!({}), &needs, false, false).is_err());
+    needs["first"]["outputs"]["matrix"] = json!("{\"n\":[0,1]}");
+    spec.name = Some("${{ format('{0}{0}', needs.first.outputs.big) }}".into());
+    needs["first"]["outputs"]["big"] = json!("x".repeat(600_000));
+    assert!(crate::job_evaluate::evaluate_atomic(&spec, json!({}), &needs, false, false).is_err());
+    spec.name = None;
+    needs["first"]["outputs"]["matrix"] = json!("{\"n\":[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15]}");
+    assert!(crate::job_evaluate::evaluate_atomic(&spec, json!({}), &needs, false, false).is_err());
+    // Malformed expression data remains a genuine worker error, and a false
+    // condition still preserves legacy expansion-before-if cardinality.
+    needs["first"]["outputs"]
+        .as_object_mut()
+        .unwrap()
+        .remove("big");
+    needs["first"]["outputs"]["matrix"] = json!("broken");
+    let evaluated =
+        crate::job_evaluate::evaluate_atomic(&spec, json!({}), &needs, false, false).unwrap();
+    assert!(matches!(
+        evaluated.entries[0].decision,
+        crate::job_evaluate::Decision::Error(_)
+    ));
+    spec.cond = Some("false".into());
+    needs["first"]["outputs"]["matrix"] = json!("{\"n\":[0,1]}");
+    let evaluated =
+        crate::job_evaluate::evaluate_atomic(&spec, json!({}), &needs, false, false).unwrap();
+    assert_eq!(evaluated.entries.len(), 2);
+    assert!(evaluated
+        .entries
+        .iter()
+        .all(|e| matches!(e.decision, crate::job_evaluate::Decision::Skip(_))));
+}
+
+#[test]
+fn atomic_group_nonmatrix_worker_runtime_if_and_name_remain_supported() {
+    let workflow=ATOMIC_WORKFLOW.replace("    strategy:\n      fail-fast: false\n      max-parallel: 1\n      matrix: ${{ fromJSON(needs.first.outputs.matrix) }}\n", "")
+        .replace("name: 'member-${{ matrix.n }}'", "name: '${{ runner.os }}'\n    if: runner.os != ''")
+        .replace("echo 'value=v${{ matrix.n }}'", "echo 'value=v1'");
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(2);
+    atomic_start(&f, &mut d);
+    let action = atomic_action(&d);
+    claim(&mut d, &action);
+    let (wire, _) = f.execute(&action, "nonmatrix-runtime");
+    settle(&mut d, &action, wire);
+    assert_eq!(
+        d.outcome(FILE, "matrix").unwrap().status,
+        JobStatus::Success
+    );
 }
