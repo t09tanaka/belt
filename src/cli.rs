@@ -325,6 +325,10 @@ pub fn run(cli: Cli) -> i32 {
         };
     }
 
+    if matches!(&cli.command, Command::Ci(args) if matches!(args.sub, Some(CiSub::Plan))) {
+        return run_ci_plan(&cli);
+    }
+
     if matches!(&cli.command, Command::Exec(_))
         || matches!(
             &cli.command,
@@ -418,6 +422,75 @@ pub fn run(cli: Cli) -> i32 {
         eprintln!("error: {}", envelope.error.message);
     }
     ErrorCode::NotImplemented.exit_code()
+}
+
+fn run_ci_plan(cli: &Cli) -> i32 {
+    let result = (|| -> Result<_, crate::error::ApiError> {
+        use crate::{
+            config::{model::SourceMode, Overlay},
+            service::context::{runtime_spec, Context},
+        };
+        let Command::Ci(args) = &cli.command else {
+            unreachable!()
+        };
+        let invalid = |message| crate::error::ApiError::new(ErrorCode::InvalidInput, message);
+        let source_mode = match args.snapshot.as_deref() {
+            None => None,
+            Some("worktree") => Some(SourceMode::Worktree),
+            Some("commit") => Some(SourceMode::Commit),
+            Some(_) => return Err(invalid("unsupported snapshot kind")),
+        };
+        if source_mode == Some(SourceMode::Worktree) && args.git_ref.is_some() {
+            return Err(invalid("worktree snapshot does not accept a revision"));
+        }
+        let env = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let cwd =
+            std::env::current_dir().map_err(|_| invalid("command directory is unavailable"))?;
+        let spec = runtime_spec(&env)
+            .map_err(|_| invalid("coordinator configuration is unavailable; initialize first"))?;
+        let overlay = Overlay {
+            source_mode,
+            ..Default::default()
+        };
+        let context = Context::load_with_overlay(env, cwd, spec, &overlay)
+            .map_err(|_| invalid("planning configuration is invalid or unavailable"))?;
+        let prepared = crate::service::planning::prepare(context, args.git_ref.as_deref())?;
+        let summary = prepared.plan().summary().clone();
+        prepared.close()?;
+        Ok(summary)
+    })();
+    match result {
+        Ok(summary) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":true,"result":summary})
+                );
+            } else {
+                println!(
+                    "{} workflows, {} tasks, {} nodes\nplan {}",
+                    summary.selected_workflows,
+                    summary.tasks.len(),
+                    summary.nodes.len(),
+                    summary.digest
+                );
+            }
+            exit::SUCCESS
+        }
+        Err(error) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":{"code":error.code,"message":error.message}})
+                );
+            } else {
+                eprintln!("{}", error.message);
+            }
+            error.code.exit_code()
+        }
+    }
 }
 
 fn run_control(cli: &Cli) -> i32 {

@@ -20,6 +20,15 @@ impl Context {
         cwd: PathBuf,
         bootstrap: Spec,
     ) -> Result<Self, ApiError> {
+        Self::load_with_overlay(env, cwd, bootstrap, &Overlay::default())
+    }
+    /// Apply explicit CLI values through the existing configuration resolver.
+    pub fn load_with_overlay(
+        env: BTreeMap<String, String>,
+        cwd: PathBuf,
+        bootstrap: Spec,
+        overlay: &Overlay,
+    ) -> Result<Self, ApiError> {
         if !cwd.is_absolute() {
             return Err(ApiError::new(
                 ErrorCode::InvalidInput,
@@ -56,7 +65,7 @@ impl Context {
         // Directory snapshots have project configuration too. Keep their
         // source identity non-Git, but resolve policy from the capture root.
         let project = root.as_deref().unwrap_or(&cwd);
-        let config = crate::config::load::load(&env, Some(project), &Overlay::default())
+        let config = crate::config::load::load(&env, Some(project), overlay)
             .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
         Ok(Self {
             env,

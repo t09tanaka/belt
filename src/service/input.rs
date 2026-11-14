@@ -14,6 +14,17 @@ pub fn capture(
     run: &RunId,
     revision: Option<&str>,
 ) -> Result<Captured, ApiError> {
+    capture_into(context, run, revision, context.state_dir())
+}
+
+/// Use the same capture path with an explicitly owned source/Vault destination.
+/// Authentication and runtime identity continue to come from the original context.
+pub fn capture_into(
+    context: &Context,
+    run: &RunId,
+    revision: Option<&str>,
+    input_state: &std::path::Path,
+) -> Result<Captured, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
     let request = match (context.repo_root.as_ref(), context.config.source_mode.value) {
         (None, crate::config::model::SourceMode::Commit) => {
@@ -39,8 +50,8 @@ pub fn capture(
                 .to_string(),
         },
     };
-    let store = SourceStore::open(context.state_dir()).map_err(|e| invalid(e.to_string()))?;
-    let vault = Vault::open(context.state_dir()).map_err(|e| e.to_api())?;
+    let store = SourceStore::open(input_state).map_err(|e| invalid(e.to_string()))?;
+    let vault = Vault::open(input_state).map_err(|e| e.to_api())?;
     let key =
         crate::secrets::key::load(&context.bootstrap.cluster_key_path).map_err(|e| e.to_api())?;
     let declared: Vec<_> = context
@@ -78,15 +89,33 @@ pub fn source_view(
     run: &RunId,
     destination: &std::path::Path,
 ) -> Result<(), ApiError> {
-    let internal = |e: anyhow::Error| ApiError::new(ErrorCode::Internal, e.to_string());
-    let store = SourceStore::open(context.state_dir()).map_err(internal)?;
+    let manifest = source_manifest(context, run)?;
+    SourceStore::open(context.state_dir())
+        .and_then(|store| store.materialize(&manifest, destination))
+        .map_err(|_| ApiError::new(ErrorCode::Internal, "cannot materialize captured source"))
+}
+
+/// Load the bound descriptor without recapturing or restoring secrets.
+pub fn source_manifest(
+    context: &Context,
+    run: &RunId,
+) -> Result<local_ci::source::SourceManifest, ApiError> {
+    source_manifest_in(context.state_dir(), run)
+}
+
+/// Resolve the same bound descriptor from an explicitly owned input store.
+pub fn source_manifest_in(
+    input_state: &std::path::Path,
+    run: &RunId,
+) -> Result<local_ci::source::SourceManifest, ApiError> {
+    let internal = |_| ApiError::new(ErrorCode::Internal, "captured source is unavailable");
+    let store = SourceStore::open(input_state).map_err(internal)?;
     let source = store
         .source_of_run(run)
         .map_err(internal)?
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "run input is unavailable"))?;
-    let manifest = store
+    store
         .manifest(&source)
         .map_err(internal)?
-        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "source manifest is unavailable"))?;
-    store.materialize(&manifest, destination).map_err(internal)
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "source manifest is unavailable"))
 }

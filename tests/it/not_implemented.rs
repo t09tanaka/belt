@@ -2,7 +2,6 @@ use assert_cmd::Command;
 
 const CASES: &[&[&str]] = &[
     &["ci"],
-    &["ci", "plan"],
     &["ci", "--snapshot", "commit", "--ref", "HEAD"],
     &["doctor"],
     &["workers"],

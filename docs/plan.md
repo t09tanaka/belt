@@ -572,3 +572,10 @@ local-ci0.13.0はローカル10項目・リモート10項目後に公開済み�
 最大256 evidenceの試験を補った後、contract411/411・prefetch215/215行がcoverage100%。
 contract35・prefetch46のmutantをcaught、survived0・timeout0・unviable11だった。
 prefetchは同一blobの既存結果を再利用した。これは限定結果であり、統合全CIは次に確認する。
+
+
+### S16 captured planning integration
+
+`ci plan` は local-ci 0.13.0 の `build_frozen_plan_from_source` へ一度の capture の manifest と検証済み object store を渡す。`CiPlan` は同じ FrozenPlan と captured identity を保持し、公開出力は上限付きの構造 summary のみとする。captured config は manifest に載った regular file だけを読み、秘密入力・hash/size 不一致を拒否する。capture 後に live project を再読込しない。Directory に架空の Git revision を補わず、branch/path filter の不足 metadata は core の型付きエラーで拒否する。
+
+planning は owner、epoch、attempt、ledger へ登録せず、close / Drop で自分が作った private draft と Vault だけを削除する。Git/worktree/Directory と dirty submodule の planning を検証する。初期 capture policy は既存 Context の設定解決を利用する。実 CI 実行、worker Driver、remote artifact、CI status、shard retry、強制終了で残った draft の回収はこの区切りの完了に含めず、既存の必須残件として保持する。subcommand 無しの `ci` は引き続き未実装。
