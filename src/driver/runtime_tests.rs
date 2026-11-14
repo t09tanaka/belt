@@ -755,3 +755,73 @@ fn source_identity_overrides_case_variants_and_fact_ambiguity_rejects() {
     f.facts.github.insert("actor".into(), json!("ambiguous"));
     assert!(EvaluationContext::new(&f.plan, &source, f.facts.clone()).is_err());
 }
+
+#[test]
+fn amplified_values_and_small_remaining_state_keep_real_producer_and_replay() {
+    let repeated = "{0}".repeat(32);
+    let expression = format!("format('{repeated}', vars.blob)");
+    for target in ["matrix", "name", "remaining"] {
+        let workflow = if target == "matrix" {
+            // Real expression-valued include, before combo/variant/display copies.
+            format!("on: push\njobs:\n  seed:\n    runs-on: [self-hosted, seed]\n    outputs:\n      matrix: ${{{{ steps.seed.outputs.matrix }}}}\n    steps:\n      - id: seed\n        run: echo 'matrix={{\"n\":[0]}}' >> \"$GITHUB_OUTPUT\"\n  dynamic:\n    needs: seed\n    runs-on: x\n    strategy:\n      matrix:\n        include:\n          - blob: ${{{{ {expression} }}}}\n    steps: []\n  consumer:\n    needs: dynamic\n    runs-on: x\n    steps:\n      - run: exit 99\n")
+        } else if target == "name" {
+            WORKFLOW.replace(
+                "name: 'leg-${{ matrix.n }}'",
+                &format!("name: ${{{{ {expression} }}}}"),
+            )
+        } else {
+            WORKFLOW.to_string()
+        };
+        let mut f = Fixture::new(&workflow);
+        if target != "remaining" {
+            f.facts
+                .vars
+                .insert("blob".into(), json!("x".repeat(512 * 1024)));
+        }
+        let mut d = f.driver(2);
+        if target == "remaining" {
+            d.state_byte_limit = 16 * 1024;
+        }
+        let journal = seed(&f, &mut d);
+        let origin = f.plan.tasks.iter().find(|t| t.dynamic_matrix).unwrap();
+        let (decision, reason) = d.core_decision(&origin.id).unwrap();
+        assert_eq!(decision, CoreDecision::EarlyFailure);
+        assert!(reason.unwrap().contains("budget"), "{target}: {reason:?}");
+        assert!(reason.unwrap().len() < 2048);
+        assert_eq!(d.outcome(FILE, "seed").unwrap().status, JobStatus::Success);
+        assert_eq!(d.admitted(), 0);
+        assert!(!ready(&d)
+            .iter()
+            .any(|a| matches!(a, ActionKind::DerivedReady { .. })));
+        let mut replay = f.driver(2);
+        replay.state_byte_limit = d.state_byte_limit;
+        for record in journal {
+            replay.apply(&record).unwrap();
+        }
+        assert_eq!(
+            replay.core_decision(&origin.id),
+            d.core_decision(&origin.id)
+        );
+        assert_eq!(
+            serde_json::to_value(replay.pending_actions()).unwrap(),
+            serde_json::to_value(d.pending_actions()).unwrap()
+        );
+        let consumer = ready(&d).remove(0);
+        claim(&mut d, &consumer);
+        let (wire, _) = f.execute(&consumer, "budget-skipped-consumer");
+        assert_eq!(
+            wire.clone()
+                .into_task_result(Path::new("."))
+                .unwrap()
+                .outcomes[0]
+                .status,
+            JobStatus::Skipped
+        );
+        settle(&mut d, &consumer, wire);
+        assert!(d
+            .pending_actions()
+            .iter()
+            .any(|a| a.kind == ActionKind::Finished));
+        assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+    }
+}

@@ -168,6 +168,7 @@ pub struct Driver {
     plan: FrozenPlan,
     config: DriverConfig,
     evaluation: Option<EvaluationContext>,
+    state_byte_limit: usize,
     state: State,
 }
 impl Driver {
@@ -322,6 +323,7 @@ impl Driver {
             plan: plan.clone(),
             config,
             evaluation,
+            state_byte_limit: MAX_WIRE_BYTES,
             state: State {
                 revision: 0,
                 phases,
@@ -626,10 +628,8 @@ impl Driver {
             "driver membership exceeds bound"
         );
         ensure!(s.outbox.len() <= MAX_TASKS * 2 + 1, "outbox exceeds bound");
-        ensure!(
-            serde_json::to_vec(s)?.len() <= MAX_WIRE_BYTES,
-            "driver state exceeds byte bound"
-        );
+        crate::expr::serialized_size(s, self.state_byte_limit)
+            .context("driver state exceeds byte bound")?;
         Ok(())
     }
     fn push(&self, s: &mut State, key: &str, kind: ActionKind) {
@@ -731,6 +731,32 @@ impl Driver {
             .map(|e| &e.group)
             .chain(self.plan.graph.nodes.iter())
             .find(|g| g.id == id)
+    }
+    fn expansion_state_bytes(
+        &self,
+        origin: &str,
+        expansion: &Expansion,
+        limit: usize,
+    ) -> Result<usize> {
+        // Count actual JSON data (including escapes), without cloning inputs or
+        // selections. Fixed allowances exceed the enum/map wrapper punctuation.
+        let mut bytes = crate::expr::serialized_size(&(origin, expansion), limit)?
+            .checked_add(512)
+            .context("expansion state byte budget exceeded")?;
+        for dispatch in &expansion.dispatches {
+            let phase =
+                crate::expr::serialized_size(&(dispatch.task_id(), &expansion.inputs), limit)?;
+            let id = format!("{}:ready:{}", self.plan.digest, dispatch.task_id());
+            let action = crate::expr::serialized_size(&(&id, dispatch, &expansion.inputs), limit)?;
+            bytes = bytes
+                .checked_add(phase)
+                .and_then(|n| n.checked_add(action))
+                .and_then(|n| n.checked_add(512))
+                .context("expansion state byte budget exceeded")?;
+            ensure!(bytes <= limit, "expansion state byte budget exceeded");
+        }
+        ensure!(bytes <= limit, "expansion state byte budget exceeded");
+        Ok(bytes)
     }
     fn progress(&self, s: &mut State) -> Result<()> {
         loop {
@@ -843,14 +869,36 @@ impl Driver {
                         .context("missing evaluation context")?;
                     // User expression failures are core outcomes; never discard the
                     // already-validated producer settlement and permit release.
-                    let derivation = dispatch::derive(
+                    // Reserve the small typed fallback and its logical outcome;
+                    // expansion may consume only the remaining durable-state space.
+                    let baseline_bytes = crate::expr::serialized_size(s, MAX_WIRE_BYTES)?;
+                    let fallback_reserve = 8192usize.saturating_add(
+                        crate::expr::serialized_size(&(&t.jobs, &t.workflow), MAX_WIRE_BYTES)?
+                            .saturating_mul(4),
+                    );
+                    let remaining = self
+                        .state_byte_limit
+                        .saturating_sub(baseline_bytes)
+                        .saturating_sub(fallback_reserve);
+                    let mut derivation = dispatch::derive(
                         &self.plan,
                         evaluation,
                         t,
                         &inputs,
                         MAX_TASKS.saturating_sub(s.phases.len()),
+                        remaining,
                     )
                     .unwrap_or_else(|e| Derivation::Failed(format!("expansion: {e:#}")));
+                    if let Derivation::Expanded(expansion) = &derivation {
+                        if self
+                            .expansion_state_bytes(&t.id, expansion, remaining)
+                            .is_err()
+                        {
+                            derivation = Derivation::Failed(
+                                "expansion exceeds remaining state byte budget".into(),
+                            );
+                        }
+                    }
                     match derivation {
                         Derivation::Expanded(expansion) => {
                             for selection in &expansion.selections {

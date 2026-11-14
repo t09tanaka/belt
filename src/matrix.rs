@@ -10,7 +10,7 @@ pub fn yaml_to_json(v: &serde_yaml::Value) -> Value {
 /// Expand a matrix (already a JSON object) into its combinations.
 /// An absent matrix is one empty combination.
 pub fn expand(m: &Value) -> Result<Vec<Map<String, Value>>> {
-    expand_with_limit(m, None)
+    expand_with_limit(m, None, None)
 }
 
 /// Bound intermediate Cartesian allocations as well as final include growth.
@@ -19,10 +19,25 @@ pub fn expand_bounded(m: &Value, max_combinations: usize) -> Result<Vec<Map<Stri
     if max_combinations == 0 {
         bail!("matrix combination limit must be positive");
     }
-    expand_with_limit(m, Some(max_combinations))
+    expand_with_limit(m, Some(max_combinations), None)
 }
 
-fn expand_with_limit(m: &Value, limit: Option<usize>) -> Result<Vec<Map<String, Value>>> {
+pub(crate) fn expand_portable(
+    m: &Value,
+    max_combinations: usize,
+    bytes: usize,
+) -> Result<Vec<Map<String, Value>>> {
+    if max_combinations == 0 {
+        bail!("matrix expansion data budget exhausted");
+    }
+    expand_with_limit(m, Some(max_combinations), Some(bytes))
+}
+
+fn expand_with_limit(
+    m: &Value,
+    limit: Option<usize>,
+    byte_limit: Option<usize>,
+) -> Result<Vec<Map<String, Value>>> {
     let obj = match m {
         Value::Null => return Ok(vec![Map::new()]),
         Value::Object(o) => o,
@@ -55,6 +70,43 @@ fn expand_with_limit(m: &Value, limit: Option<usize>) -> Result<Vec<Map<String, 
                 &scalar
             }
         };
+        if let Some(bytes) = byte_limit {
+            let old_bytes = combos
+                .iter()
+                .try_fold(0usize, |sum, combo| -> Result<usize> {
+                    sum.checked_add(crate::expr::serialized_size(combo, bytes)?)
+                        .ok_or_else(|| anyhow::anyhow!("matrix byte budget exceeded"))
+                })?;
+            let value_bytes = values
+                .iter()
+                .try_fold(0usize, |sum, value| -> Result<usize> {
+                    sum.checked_add(crate::expr::serialized_size(value, bytes)?)
+                        .ok_or_else(|| anyhow::anyhow!("matrix byte budget exceeded"))
+                })?;
+            let key_bytes = crate::expr::serialized_size(k, bytes)?;
+            let next_bytes = old_bytes
+                .checked_mul(values.len())
+                .and_then(|n| {
+                    value_bytes
+                        .checked_mul(combos.len())
+                        .and_then(|v| n.checked_add(v))
+                })
+                .and_then(|n| {
+                    combos
+                        .len()
+                        .checked_mul(values.len())
+                        .and_then(|count| {
+                            key_bytes
+                                .checked_add(2)
+                                .and_then(|overhead| count.checked_mul(overhead))
+                        })
+                        .and_then(|overhead| n.checked_add(overhead))
+                })
+                .ok_or_else(|| anyhow::anyhow!("matrix byte budget exceeded"))?;
+            if next_bytes > bytes {
+                bail!("matrix byte budget exceeded");
+            }
+        }
         original_keys.push(k.clone());
         let mut next = Vec::new();
         for c in &combos {
@@ -84,6 +136,16 @@ fn expand_with_limit(m: &Value, limit: Option<usize>) -> Result<Vec<Map<String, 
             let Some(item) = item.as_object() else {
                 continue;
             };
+            if let Some(bytes) = byte_limit {
+                let existing = crate::expr::serialized_size(&combos, bytes)?;
+                let item_bytes = crate::expr::serialized_size(item, bytes)?;
+                let additional = item_bytes
+                    .checked_mul(base_len.max(1))
+                    .and_then(|n| n.checked_add(existing));
+                if additional.is_none_or(|n| n > bytes) {
+                    bail!("matrix include byte budget exceeded");
+                }
+            }
             let mut matched = false;
             for c in combos.iter_mut().take(base_len) {
                 // an include entry extends every combination whose original values it does not change
@@ -216,5 +278,17 @@ mod bounded_tests {
         }
         assert!(expand_bounded(&json!({"a":[]}), 1).is_err());
         assert!(expand_bounded(&json!({"a":"${{ x }}"}), 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    #[test]
+    fn portable_byte_budget_rejects_cartesian_copies_before_construction() {
+        let value =
+            serde_json::json!({"blob":["x".repeat(16*1024)],"n":(0..32).collect::<Vec<_>>()});
+        assert!(expand_portable(&value, 4096, 32 * 1024).is_err());
+        assert_eq!(expand_bounded(&value, 4096).unwrap().len(), 32);
     }
 }

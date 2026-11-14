@@ -10,6 +10,15 @@ use crate::workflow::Job;
 use anyhow::Result;
 use serde_json::{json, Map, Value};
 use std::collections::HashSet;
+pub(crate) const PORTABLE_OUTPUT_BYTES: usize = 1024 * 1024;
+const PORTABLE_EVALUATION_BYTES: usize = 8 * 1024 * 1024;
+fn bounded(ctx: Ctx<'_>, portable: bool) -> Ctx<'_> {
+    if portable {
+        ctx.with_output_limit(PORTABLE_OUTPUT_BYTES)
+    } else {
+        ctx
+    }
+}
 
 #[derive(Debug)]
 pub(crate) enum Decision {
@@ -149,7 +158,10 @@ fn evaluate_inner(
                     Some(&ctx_map),
                 )?;
             }
-            expr::condition(job.cond.as_deref(), &Ctx::with_fns(&ctx_map, needs_fns))
+            expr::condition(
+                job.cond.as_deref(),
+                &bounded(Ctx::with_fns(&ctx_map, needs_fns), true),
+            )
         };
         match check() {
             Ok(false) => {
@@ -171,7 +183,7 @@ fn evaluate_inner(
     let combos = match &job.matrix {
         None => vec![Map::new()],
         Some(m) => {
-            let ctx = Ctx::new(&ctx_map, Status::Success);
+            let ctx = bounded(Ctx::new(&ctx_map, Status::Success), portable.is_some());
             let raw = matrix::yaml_to_json(m);
             let value = if portable.is_some() {
                 validate_strings(&raw, &ctx_map, expr::PortableStage::Matrix)
@@ -181,7 +193,7 @@ fn evaluate_inner(
             };
             match value.and_then(|v| match portable {
                 Some((_, 0)) => anyhow::bail!("matrix expansion data budget exhausted"),
-                Some((_, limit)) => matrix::expand_bounded(&v, limit),
+                Some((_, limit)) => matrix::expand_portable(&v, limit, PORTABLE_OUTPUT_BYTES),
                 None => matrix::expand(&v),
             }) {
                 Ok(c) => c,
@@ -221,11 +233,30 @@ fn evaluate_inner(
             }
         }
     }
+    if portable.is_some() && expr::serialized_size(&job.name, PORTABLE_OUTPUT_BYTES).is_err() {
+        return JobEvaluation::terminal(
+            base_name,
+            Decision::Error("name: byte budget exceeded".into()),
+        );
+    }
     // Combinations that pass `if:` run after this loop.
+    let mut evaluated_bytes = 0usize;
     let mut entries = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let total = combos.len();
     for (idx, combo) in combos.into_iter().enumerate() {
+        if portable.is_some() {
+            let next =
+                expr::serialized_size(&(&ctx_map, &combo, &job.name), PORTABLE_EVALUATION_BYTES)
+                    .ok()
+                    .and_then(|bytes| evaluated_bytes.checked_add(bytes));
+            if next.is_none_or(|bytes| bytes > PORTABLE_EVALUATION_BYTES) {
+                return JobEvaluation::terminal(
+                    base_name,
+                    Decision::Error("evaluation byte budget exceeded".into()),
+                );
+            }
+        }
         let mut cm = ctx_map.clone();
         cm.insert("matrix".into(), Value::Object(combo.clone()));
         cm.insert(
@@ -233,11 +264,18 @@ fn evaluate_inner(
             json!({"job-index": idx, "job-total": total}),
         );
         let mut display = {
-            let ctx = Ctx::new(&cm, Status::Success);
+            let ctx = bounded(Ctx::new(&cm, Status::Success), portable.is_some());
             match &job.name {
-                Some(n) if n.contains("${{") => {
-                    expr::interpolate(n, &ctx).unwrap_or_else(|_| n.clone())
-                }
+                Some(n) if n.contains("${{") => match expr::interpolate(n, &ctx) {
+                    Ok(value) => value,
+                    Err(e) if portable.is_some() => {
+                        return JobEvaluation::terminal(
+                            base_name,
+                            Decision::Error(format!("name: {e:#}")),
+                        )
+                    }
+                    Err(_) => n.clone(),
+                },
                 Some(n) if !combo.is_empty() => format!("{n} ({})", matrix::describe(&combo)),
                 Some(n) => n.clone(),
                 None if !combo.is_empty() => {
@@ -246,6 +284,12 @@ fn evaluate_inner(
                 None => job.id.clone(),
             }
         };
+        if portable.is_some() && expr::serialized_size(&display, PORTABLE_OUTPUT_BYTES).is_err() {
+            return JobEvaluation::terminal(
+                base_name,
+                Decision::Error("name: byte budget exceeded".into()),
+            );
+        }
         // each shard of a job has a name (and so a log) of its own
         if let Some(t) = shard {
             display = format!("{display} (shard {}/{})", t.index + 1, t.count);
@@ -258,8 +302,22 @@ fn evaluate_inner(
         if only.is_some_and(|o| o != idx) {
             continue;
         }
+        if portable.is_some() {
+            let next = expr::serialized_size(&(&cm, &display), PORTABLE_EVALUATION_BYTES)
+                .ok()
+                .and_then(|bytes| evaluated_bytes.checked_add(bytes));
+            match next {
+                Some(bytes) if bytes <= PORTABLE_EVALUATION_BYTES => evaluated_bytes = bytes,
+                _ => {
+                    return JobEvaluation::terminal(
+                        base_name,
+                        Decision::Error("evaluation byte budget exceeded".into()),
+                    )
+                }
+            }
+        }
         let run_it = {
-            let ctx = Ctx::with_fns(&cm, needs_fns);
+            let ctx = bounded(Ctx::with_fns(&cm, needs_fns), portable.is_some());
             expr::condition(job.cond.as_deref(), &ctx)
         };
         let decision = match run_it {
@@ -292,7 +350,8 @@ pub(crate) fn validate_strings(
 
 /// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
 pub(crate) fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
-    Ok(match v {
+    ctx.check_value(v)?;
+    let result = match v {
         Value::String(s) if s.contains("${{") => expr::interpolate_value(s, ctx)?,
         Value::Array(a) => Value::Array(
             a.iter()
@@ -305,7 +364,9 @@ pub(crate) fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
                 .collect::<Result<_>>()?,
         ),
         other => other.clone(),
-    })
+    };
+    ctx.check_value(&result)?;
+    Ok(result)
 }
 
 #[cfg(test)]

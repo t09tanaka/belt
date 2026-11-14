@@ -158,7 +158,11 @@ impl EvaluationContext {
             .as_ref()
             .map(|value| {
                 job_evaluate::validate_strings(value, &contexts, PortableStage::RunsOn)?;
-                job_evaluate::eval_strings(value, &Ctx::new(&contexts, Status::Success))
+                job_evaluate::eval_strings(
+                    value,
+                    &Ctx::new(&contexts, Status::Success)
+                        .with_output_limit(job_evaluate::PORTABLE_OUTPUT_BYTES),
+                )
             })
             .transpose()?;
         Ok(RunnerRequirement {
@@ -234,12 +238,18 @@ pub(crate) enum Derivation {
     Failed(String),
 }
 
+fn ensure_expansion_budget(bytes: usize, limit: usize) -> Result<()> {
+    ensure!(bytes <= limit, "expansion evaluated byte budget exceeded");
+    Ok(())
+}
+
 pub(crate) fn derive(
     plan: &FrozenPlan,
     evaluation: &EvaluationContext,
     origin: &ExecutionTask,
     inputs: &TaskInputs,
     limit: usize,
+    byte_limit: usize,
 ) -> Result<Derivation> {
     ensure!(
         origin.dynamic_matrix
@@ -274,7 +284,8 @@ pub(crate) fn derive(
     let per_member = serde_json::to_vec(&(origin, inputs, &evaluation.facts, source_job))?
         .len()
         .max(1);
-    let limit = limit.min(MAX_DERIVED_BYTES / per_member);
+    let byte_limit = byte_limit.min(MAX_DERIVED_BYTES);
+    let limit = limit.min(byte_limit / per_member);
     let contexts = evaluation.contexts(plan, origin)?;
     let ancestor_failed = spec
         .needs
@@ -288,6 +299,10 @@ pub(crate) fn derive(
         inputs.run_cancelled,
         limit.min(MAX_TASKS),
     );
+    let input_bytes = crate::expr::serialized_size(inputs, MAX_DERIVED_BYTES)?;
+    let mut charged = input_bytes
+        .checked_add(4096)
+        .context("expansion byte budget exhausted")?;
     let mut selections = Vec::new();
     for (index, entry) in evaluated.entries.into_iter().enumerate() {
         let cm = match entry.decision {
@@ -295,6 +310,41 @@ pub(crate) fn derive(
             Decision::Skip(reason) => return Ok(Derivation::Skipped(reason)),
             Decision::Error(reason) => return Ok(Derivation::Failed(reason)),
         };
+        // Count actual evaluated data before cloning into variant/matrix/label
+        // and before duplicating authoritative inputs into Ready phase/outbox.
+        let requirement = match evaluation.requirement(origin, &origin.jobs[0], &cm) {
+            Ok(requirement) => requirement,
+            Err(error) => return Ok(Derivation::Failed(format!("runs-on: {error:#}"))),
+        };
+        let evaluated_bytes = crate::expr::serialized_size(
+            &(
+                origin,
+                &cm["matrix"],
+                &cm["matrix"],
+                &entry.display,
+                &entry.display,
+                &cm["strategy"],
+                &requirement,
+            ),
+            byte_limit,
+        )?;
+        charged = charged
+            .checked_add(evaluated_bytes)
+            .and_then(|n| {
+                input_bytes
+                    .checked_mul(2)
+                    .and_then(|inputs| n.checked_add(inputs))
+            })
+            .and_then(|n| {
+                origin
+                    .id
+                    .len()
+                    .checked_mul(8)
+                    .and_then(|ids| n.checked_add(ids))
+            })
+            .and_then(|n| n.checked_add(4096))
+            .context("expansion byte budget exhausted")?;
+        ensure_expansion_budget(charged, byte_limit)?;
         let mut task = origin.clone();
         task.id = format!("{}#{index}", origin.id);
         ensure!(
@@ -312,10 +362,6 @@ pub(crate) fn derive(
                 .clone(),
             label: entry.display.clone(),
         });
-        let requirement = match evaluation.requirement(&task, &task.jobs[0], &cm) {
-            Ok(requirement) => requirement,
-            Err(error) => return Ok(Derivation::Failed(format!("runs-on: {error:#}"))),
-        };
         selections.push(Selection {
             task,
             display: entry.display,
@@ -373,7 +419,14 @@ pub(crate) fn validate(
     let origin = plan
         .task(&dispatch.origin)
         .context("unknown dispatch origin")?;
-    let Derivation::Expanded(expansion) = derive(plan, &evaluation, origin, inputs, MAX_TASKS)?
+    let Derivation::Expanded(expansion) = derive(
+        plan,
+        &evaluation,
+        origin,
+        inputs,
+        MAX_TASKS,
+        MAX_DERIVED_BYTES,
+    )?
     else {
         anyhow::bail!("dispatch origin does not expand");
     };
