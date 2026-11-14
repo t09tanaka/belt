@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.13.0] - Unreleased
+
+- Execute frozen tasks from verified captured workspaces with source-aware Git HEAD/index checks and recursive submodule payload verification.
+- Isolate concurrent captured invocations, matrix workspaces, scripts and Compose resources while preserving setup state across task execution and trusted worker recovery.
+- Bind worker workspace receipts to immutable source, plan, accepted attempt and root identity in private worker state.
+- Read only verified planning inputs when building captured plans; verify all execution payloads at materialization instead of repeatedly copying source trees.
+
 ## [0.12.1] - 2026-11-14
 
 - Bound internal Docker probes, control and cleanup commands by time and output size. Only successful, validated project queries can trigger cleanup; timeout or invalid output leaves an explicit cleanup-incomplete warning. Owned helper processes are terminated and reaped. Read-only Compose cleanup queries have a 5-second budget; cleanup actions retain their 30-second budget.
