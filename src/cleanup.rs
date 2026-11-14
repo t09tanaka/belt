@@ -1,4 +1,4 @@
-//! Bounded, attempt-owned Docker Compose cleanup. No daemon discovery or fallback.
+//! Bounded, attempt-owned Docker control and cleanup. No global discovery or fallback.
 use crate::context::ExecContext;
 use anyhow::{bail, Context, Result};
 use std::io::Read;
@@ -36,7 +36,29 @@ impl Drop for OwnedGroup {
     }
 }
 
+/// Control commands stop promptly when the attempt is cancelled. Cleanup
+/// commands use the same runner but must still run after cancellation.
+pub(crate) fn docker_control(
+    ctx: &ExecContext,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<Vec<u8>> {
+    docker_with_cancel(ctx, args, timeout, true)
+}
+
 fn docker(ctx: &ExecContext, args: &[&str], timeout: Duration) -> Result<Vec<u8>> {
+    docker_with_cancel(ctx, args, timeout, false)
+}
+
+fn docker_with_cancel(
+    ctx: &ExecContext,
+    args: &[&str],
+    timeout: Duration,
+    stop_on_cancel: bool,
+) -> Result<Vec<u8>> {
+    if stop_on_cancel && ctx.cancel.is_cancelled() {
+        bail!("Docker command cancelled");
+    }
     let mut child = OwnedGroup(
         ctx.command("docker")
             .args(args)
@@ -45,7 +67,7 @@ fn docker(ctx: &ExecContext, args: &[&str], timeout: Duration) -> Result<Vec<u8>
             .stderr(Stdio::piped())
             .process_group(0)
             .spawn()
-            .context("start Docker cleanup")?,
+            .context("start Docker command")?,
     );
     let mut stdout = child.0.stdout.take().context("missing stdout")?;
     let mut stderr = child.0.stderr.take().context("missing stderr")?;
@@ -54,7 +76,7 @@ fn docker(ctx: &ExecContext, args: &[&str], timeout: Duration) -> Result<Vec<u8>
         unsafe {
             let flags = libc::fcntl(fd, libc::F_GETFL);
             if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
-                return Err(std::io::Error::last_os_error()).context("nonblocking cleanup pipe");
+                return Err(std::io::Error::last_os_error()).context("nonblocking Docker pipe");
             }
         }
     }
@@ -63,8 +85,11 @@ fn docker(ctx: &ExecContext, args: &[&str], timeout: Duration) -> Result<Vec<u8>
     let mut errors = Vec::new();
     let mut eof = [false; 2];
     loop {
+        if stop_on_cancel && ctx.cancel.is_cancelled() {
+            bail!("Docker command cancelled");
+        }
         if started.elapsed() >= timeout {
-            bail!("Docker cleanup deadline exceeded");
+            bail!("Docker command deadline exceeded");
         }
         for (i, (pipe, bytes)) in [
             (&mut stdout as &mut dyn Read, &mut output),
@@ -80,13 +105,13 @@ fn docker(ctx: &ExecContext, args: &[&str], timeout: Duration) -> Result<Vec<u8>
                 Ok(0) => eof[i] = true,
                 Ok(n) => {
                     if bytes.len() + n > MAX_OUTPUT {
-                        bail!("Docker cleanup output limit exceeded");
+                        bail!("Docker command output limit exceeded");
                     }
                     bytes.extend_from_slice(&buf[..n]);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => (),
-                Err(e) => return Err(e).context("read Docker cleanup output"),
+                Err(e) => return Err(e).context("read Docker command output"),
             }
         }
         let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
@@ -101,16 +126,54 @@ fn docker(ctx: &ExecContext, args: &[&str], timeout: Duration) -> Result<Vec<u8>
             )
         };
         if rc != 0 {
-            return Err(std::io::Error::last_os_error()).context("inspect cleanup child");
+            return Err(std::io::Error::last_os_error()).context("inspect Docker child");
         }
         if unsafe { status.si_pid() } != 0 && eof.iter().all(|v| *v) {
             if status.si_code != libc::CLD_EXITED || unsafe { status.si_status() } != 0 {
                 // Do not expose daemon stderr, which can contain credentials.
-                bail!("Docker cleanup command exited unsuccessfully");
+                bail!("Docker command exited unsuccessfully");
             }
             return Ok(output);
         }
         std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Only names from this attempt's tracked resource list are accepted. No
+/// listing, stale-PID heuristic, or unfiltered fallback can broaden the scope.
+pub(crate) fn remove_tracked_containers(
+    ctx: &ExecContext,
+    names: &[String],
+) -> Vec<CleanupIncomplete> {
+    remove_tracked_with_timeout(ctx, names, Duration::from_secs(30))
+}
+
+fn remove_tracked_with_timeout(
+    ctx: &ExecContext,
+    names: &[String],
+    timeout: Duration,
+) -> Vec<CleanupIncomplete> {
+    if names.is_empty() {
+        return vec![];
+    }
+    for name in names {
+        if name.is_empty()
+            || name.len() > 255
+            || !name.as_bytes()[0].is_ascii_alphanumeric()
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+        {
+            return vec![CleanupIncomplete("invalid tracked container name".into())];
+        }
+    }
+    let mut args = vec!["rm", "-f", "--"];
+    args.extend(names.iter().map(String::as_str));
+    match docker(ctx, &args, timeout) {
+        Ok(_) => vec![],
+        Err(error) => vec![CleanupIncomplete(format!(
+            "remove tracked containers: {error:#}"
+        ))],
     }
 }
 
@@ -209,6 +272,114 @@ mod tests {
     fn calls(dir: &tempfile::TempDir) -> String {
         std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default()
     }
+    #[test]
+    fn control_cancel_is_prompt_and_reaps_owned_child_but_cleanup_still_runs() {
+        let (dir, ctx) = fixture("echo $$ > \"$HOME/pid\"; exec sleep 20");
+        let cancel = ctx.cancel.clone();
+        let ready = dir.path().join("pid");
+        let signal = std::thread::spawn(move || {
+            let start = Instant::now();
+            while !ready.exists() && start.elapsed() < Duration::from_secs(2) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            cancel.cancel();
+        });
+        let started = Instant::now();
+        let result = docker_control(&ctx, &["info"], Duration::from_secs(20));
+        signal.join().unwrap();
+        assert!(result.unwrap_err().to_string().contains("cancelled"));
+        assert!(started.elapsed() < Duration::from_secs(3));
+        let pid = std::fs::read_to_string(dir.path().join("pid"))
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD)
+        );
+        std::fs::write(
+            dir.path().join("docker"),
+            "#!/bin/sh\necho \"$*\" >> \"$HOME/calls\"\nexit 0\n",
+        )
+        .unwrap();
+        assert!(docker_control(&ctx, &["logs"], Duration::from_millis(250)).is_err());
+        assert!(!calls(&dir).lines().any(|line| line == "logs"));
+        assert!(run(&ctx).is_empty());
+        assert!(remove_tracked_with_timeout(
+            &ctx,
+            &["owned-container".into()],
+            Duration::from_millis(250)
+        )
+        .is_empty());
+        assert!(calls(&dir).contains("rm -f -- owned-container"));
+    }
+
+    #[test]
+    fn tracked_removal_validates_scope_and_reports_blockage_and_failure() {
+        let (dir, ctx) = fixture("exit 0");
+        assert!(remove_tracked_with_timeout(&ctx, &[], Duration::from_millis(250)).is_empty());
+        assert!(calls(&dir).is_empty());
+        for name in ["", "--all", "one two", "a\n", &"a".repeat(256)] {
+            assert!(
+                !remove_tracked_with_timeout(&ctx, &[name.into()], Duration::from_millis(250))
+                    .is_empty()
+            );
+        }
+        assert!(calls(&dir).is_empty());
+        assert!(remove_tracked_with_timeout(
+            &ctx,
+            &["one_1".into(), "two.2".into()],
+            Duration::from_millis(250)
+        )
+        .is_empty());
+        assert_eq!(calls(&dir), "rm -f -- one_1 two.2\n");
+        for script in ["exec sleep 20", "echo secret-daemon-error >&2; exit 1"] {
+            let (_dir, ctx) = fixture(script);
+            let errors =
+                remove_tracked_with_timeout(&ctx, &["owned".into()], Duration::from_millis(250));
+            assert_eq!(errors.len(), 1);
+            assert!(errors[0].to_string().contains("remove tracked"));
+            assert!(!errors[0].to_string().contains("secret-daemon-error"));
+        }
+    }
+
+    #[test]
+    fn control_drains_both_pipes_and_keeps_daemon_errors_private() {
+        let (_dir, ctx) = fixture("(dd if=/dev/zero bs=32768 count=1 2>/dev/null) >&2\n(dd if=/dev/zero bs=32768 count=1 2>/dev/null)");
+        assert_eq!(
+            docker_control(&ctx, &["logs"], Duration::from_secs(2))
+                .unwrap()
+                .len(),
+            32768
+        );
+        let (_dir, ctx) = fixture("echo daemon-private >&2; echo partial; exit 1");
+        let error = docker_control(&ctx, &["inspect"], Duration::from_secs(2)).unwrap_err();
+        assert!(!format!("{error:#}").contains("daemon-private"));
+        let (_dir, ctx) =
+            fixture("while :; do printf 'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx' >&2; done");
+        assert!(docker_control(&ctx, &["logs"], Duration::from_secs(2))
+            .unwrap_err()
+            .to_string()
+            .contains("output limit"));
+    }
+
+    #[test]
+    fn cancellation_handle_removes_only_tracked_names_even_after_cancel() {
+        let (dir, ctx) = fixture("exit 0");
+        ctx.cancel.track_container("owned-a".into());
+        ctx.cancel.track_container("owned-b".into());
+        ctx.cancel.cancel();
+        ctx.cancel.remove_containers(&ctx);
+        assert_eq!(calls(&dir), "rm -f -- owned-a owned-b\n");
+        ctx.cancel.remove_containers(&ctx);
+        assert_eq!(calls(&dir).lines().count(), 1);
+    }
+
     #[test]
     fn cleanup_normal_and_empty() {
         for ids in [

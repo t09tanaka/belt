@@ -826,3 +826,79 @@ fn compose_cleanup_warning_preserves_existing_step_note() {
         .unwrap()
         .starts_with("continue-on-error; warning: cleanup incomplete:"));
 }
+
+#[test]
+fn run_never_discovers_or_removes_other_runs_containers_at_startup() {
+    let l = lab_for(TWO_STEPS);
+    std::fs::write(
+        l.tmp.path().join("fakebin/docker"),
+        "#!/bin/sh\necho \"$*\" >> \"$HOME/docker-calls\"\nexit 0\n",
+    )
+    .unwrap();
+    let report = local_ci::run(
+        &l.ctx,
+        local_ci::RunOptions {
+            target: target(&l.dir),
+            parallel: Some(1),
+            no_traffic_controller: true,
+            no_portool: true,
+            containers: 1,
+            keep: false,
+            job_timeout: 5.0,
+            no_cache: true,
+            cache_dir: l.tmp.path().join("startup-run"),
+            source: None,
+        },
+        &mut Quiet,
+    )
+    .unwrap();
+    assert_eq!(
+        report.result.state, "success",
+        "{}",
+        report.result.description
+    );
+    let calls = std::fs::read_to_string(l.tmp.path().join("docker-calls")).unwrap();
+    assert!(!calls.is_empty());
+    assert!(
+        calls
+            .lines()
+            .all(|line| line
+                .starts_with("ps -aq --filter label=com.docker.compose.project=local-ci-")),
+        "{calls}"
+    );
+}
+
+const SERVICE_JOB: &str = "name: w\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  a:\n    runs-on: x\n    services:\n      db:\n        image: example-db\n    steps:\n      - run: echo tests\n";
+
+#[test]
+fn service_control_and_tracked_removal_use_the_bounded_runner() {
+    let l = lab_for(SERVICE_JOB);
+    std::fs::write(l.tmp.path().join("fakebin/docker"),
+        "#!/bin/sh\necho \"$*\" >> \"$HOME/docker-calls\"\ncase \"$1\" in\n  info) echo 1;;\n  inspect) echo 'running none';;\n  run) echo container;;\n  rm) echo private-daemon-error >&2; exit 1;;\nesac\nexit 0\n").unwrap();
+    let result = l.run(Some(Recorder::new(Exit::Code(0), None)));
+    assert_eq!(job(&result).outcome, Outcome::Pass);
+    assert_eq!(job(&result).steps.len(), 1);
+    assert!(job(&result).steps[0]
+        .note
+        .as_ref()
+        .unwrap()
+        .contains("cleanup incomplete: remove tracked containers"));
+    let calls = std::fs::read_to_string(l.tmp.path().join("docker-calls")).unwrap();
+    assert!(calls
+        .lines()
+        .any(|line| line.starts_with("rm -f -- local-ci-")));
+    assert!(!serde_json::to_string(&result)
+        .unwrap()
+        .contains("private-daemon-error"));
+}
+
+#[test]
+fn exited_service_diagnostics_do_not_expose_daemon_stderr() {
+    let l = lab_for(SERVICE_JOB);
+    std::fs::write(l.tmp.path().join("fakebin/docker"),
+        "#!/bin/sh\ncase \"$1\" in\n  inspect) echo 'exited none';;\n  logs) echo private-daemon-error >&2; exit 1;;\nesac\nexit 0\n").unwrap();
+    let result = l.run(Some(Recorder::new(Exit::Code(0), None)));
+    assert!(
+        matches!(&job(&result).outcome, Outcome::Error(why) if why.contains("diagnostic logs unavailable") && !why.contains("private-daemon-error"))
+    );
+}

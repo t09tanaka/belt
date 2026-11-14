@@ -703,7 +703,6 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             None => git::add_worktree(ctx, &root, &wt, sha)?,
         }
         obs.executing();
-        exec::remove_orphan_containers(ctx);
         let traffic_controller = if a.no_traffic_controller {
             None
         } else {
