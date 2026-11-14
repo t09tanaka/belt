@@ -1155,7 +1155,8 @@ read-only logs は対象 run を仮解決し、pin を read-only/nonblocking sha
 inode と新しい metadata binding を確認した後に読み始め、follow/detach を含む invocation 全体で保持する。
 missing/legacy pin は明示 unavailable とし、reader は作成・DB 更新・owner 起動を行わない。
 将来の outputs/export CLI も CoordinatorStore::result_read_pin を取得し、出力完了まで保持する。
-owner は run/ref 公開前に pin 作成と fsync を行い、legacy run は bounded page で backfill する。
+owner は create_run/enqueue の両経路で DB transaction に入る前に pin 作成と fsync を行う。
+ref 公開前にも pin を準備し、legacy run は bounded page で backfill する。
 pin inode は parent state とともに保持し、unlink/置換しない。最初の GC 対応版以降の owner と
 reader がこの protocol を共有することが互換条件で、旧 reader と同時利用する GC の安全性は保証しない。
 resident は bounded keyset の結果 ref/claim page だけ処理し、run-exclusive pin を FS delete 完了まで保持する。

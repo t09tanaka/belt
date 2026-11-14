@@ -1277,3 +1277,84 @@ async fn retry_stopping_releases_owner_while_input_io_retains_cross_process_leas
     file.try_lock().unwrap();
     drop(guard);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn offline_submit_publishes_reader_pin_before_immediate_logs_follow() {
+    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let mut resident = delivery_resident(root.path()).await;
+    // Keep every worker offline, so no collector can backfill a missing pin.
+    resident.worker_connection.abort();
+    resident.worker_connection = tokio::spawn(std::future::pending());
+    resident
+        .coordinator
+        .detach(&WorkerId::parse("local").unwrap())
+        .await
+        .unwrap();
+    let directory = root.path().join("input");
+    std::fs::create_dir(&directory).unwrap();
+    std::fs::write(directory.join("data"), b"snapshot").unwrap();
+    let run = RunId::generate();
+    let captured = crate::source::capture_for_run(
+        &resident.captured.env,
+        &resident.sources,
+        &run,
+        &crate::source::SourceRequest::Directory { dir: directory },
+        &Default::default(),
+    )
+    .unwrap();
+    let source = captured.manifest.source_id;
+    let digest = Digest::parse(&captured.manifest.manifest_digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest)))
+        .unwrap();
+    let task = TaskId::generate();
+    let state = root.path().join("parent");
+    let client = resident.client();
+    let runner = tokio::spawn(resident.run());
+    let accepted = client
+        .request(Operation::Submit {
+            run_id: run.clone(),
+            source_id: source,
+            tasks: vec![(task, delivery_spec(digest, false))],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(accepted, Reply::Accepted { run_id } if run_id == run));
+    // The CLI's exact follow observer must acquire its read-only pin before
+    // querying log metadata, even though this run has no attempt/results yet.
+    let mut observer = crate::service::logs::Observer::new(
+        crate::service::query::Reader::Connected(client.clone()),
+        state.join("results"),
+        crate::service::completion::Target::Run(run.clone()),
+        None,
+    )
+    .unwrap();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let pending = observer
+        .observe(false, true, &mut out, &mut err)
+        .await
+        .unwrap();
+    assert_eq!(pending.pending_tasks, 1);
+    assert!(String::from_utf8_lossy(&out).contains("\"pending\":true"));
+    // Follow stays attached awaiting work instead of failing legacy-unavailable.
+    assert!(tokio::time::timeout(
+        Duration::from_millis(300),
+        observer.observe(true, true, &mut out, &mut err)
+    )
+    .await
+    .is_err());
+    assert!(err.is_empty());
+    let reader = CoordinatorStore::open_read_only(&state).unwrap();
+    assert!(reader.query_tasks(run, 1, None).unwrap().items[0]
+        .current_attempt
+        .is_none());
+    drop(observer);
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    tokio::time::timeout(Duration::from_secs(7), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

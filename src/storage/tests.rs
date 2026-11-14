@@ -5287,3 +5287,29 @@ fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
         1
     );
 }
+
+#[test]
+fn enqueue_does_not_publish_run_when_reader_pin_cannot_be_secured() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let pins = f._dir.path().join("reader-pins");
+    std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(f
+        .store
+        .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 2)
+        .is_err());
+    assert!(f.store.query_run(run.clone()).unwrap().is_none());
+    assert!(f.store.query_task(task.clone()).unwrap().is_none());
+    std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o700)).unwrap();
+    f.store
+        .enqueue(&run, None, &json!({}), &[(task, json!({}))], 2)
+        .unwrap();
+    let reader = CoordinatorStore::open_read_only(f._dir.path()).unwrap();
+    let pin = reader
+        .result_read_pin(&crate::service::completion::Target::Run(run.clone()), None)
+        .unwrap();
+    assert!(f.store.result_gc_guard(&run).is_err());
+    drop(pin);
+}

@@ -190,6 +190,13 @@ impl CoordinatorStore {
                 tasks.len()
             )));
         }
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+        // Like create_run, publish the persistent pin inode durably before
+        // the database can expose this run to read-only CLI invocations.
+        // Coordinator::enqueue already invokes this method in its blocking job.
+        crate::results::pin::RunPin::ensure(&self.state_dir, run_id)?;
         let run = run_id.to_string();
         let source = source_id.map(ToString::to_string);
         let run_spec = run_spec.to_string();
