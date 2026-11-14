@@ -120,7 +120,9 @@ pub struct Connected {
     pub negotiated: Negotiated,
 }
 
-pub async fn connect(mut io: Io, cfg: ClientConfig) -> Result<Connected, ConnectError> {
+pub async fn connect(mut io: Io, mut cfg: ClientConfig) -> Result<Connected, ConnectError> {
+    cfg.features.push(crate::outputs::FEATURE.into());
+    cfg.required_features.push(crate::outputs::FEATURE.into());
     let hello = HelloRequest {
         schema_version: SchemaVersion::CURRENT,
         request_id: RequestId::generate(),
@@ -204,7 +206,11 @@ async fn refuse(io: &mut Io, max_frame: usize, request_id: Option<RequestId>, er
     let _ = io.writer.shutdown().await;
 }
 
-pub async fn accept(mut io: Io, cfg: ServerConfig) -> Result<Accepted, ConnectError> {
+pub async fn accept(mut io: Io, mut cfg: ServerConfig) -> Result<Accepted, ConnectError> {
+    cfg.local.features.push(crate::outputs::FEATURE.into());
+    cfg.local
+        .required_features
+        .push(crate::outputs::FEATURE.into());
     let first = read_first(&mut io, cfg.max_frame, cfg.hello_timeout).await?;
     let Body::Message(Message::Request(Request::Hello(hello))) = first.body else {
         let error = ApiError::new(ErrorCode::InvalidInput, "hello must be the first request");

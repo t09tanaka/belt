@@ -171,6 +171,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     let started = f.root.path().join("started");
     let release = f.root.path().join("release");
     let payload = AttemptPayload {
+        outputs: Vec::new(),
         setup: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),

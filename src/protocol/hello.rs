@@ -14,7 +14,7 @@ pub const PROTOCOL_VERSIONS: &[u32] = &[1];
 
 /// Features this build implements. `blob_resume` is offset and digest resume of
 /// blob transfer, `log_resume` the offset and sequence resume of logs.
-pub const SUPPORTED_FEATURES: &[&str] = &["blob_resume", "log_resume"];
+pub const SUPPORTED_FEATURES: &[&str] = &["blob_resume", "log_resume", "output_bundles_v1"];
 
 /// What one side offers and requires.
 #[derive(Debug, Clone, PartialEq, Eq)]

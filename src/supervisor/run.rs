@@ -412,6 +412,7 @@ pub(crate) fn keep_artifacts(
     spec: &SuperviseSpec,
     store: &WorkerStore,
     masker: &Masker,
+    termination: &Termination,
 ) -> Result<()> {
     let Some(plan) = &spec.artifacts else {
         return Ok(());
@@ -459,6 +460,21 @@ pub(crate) fn keep_artifacts(
             }
         }
     }
+    let mut remaining = crate::outputs::MAX_ATTEMPT_FILES;
+    for d in &plan.outputs {
+        if !crate::outputs::eligible(d.when, termination.outcome(), true) {
+            continue;
+        }
+        match super::bundles::store_bundle(&root, attempt, plan, d, &forbidden, &mut remaining) {
+            Ok(record) => kept.push(record),
+            Err(e) => not_stored.push(ArtifactNotStored {
+                name: d.name.clone(),
+                path: d.paths.first().cloned().unwrap_or_default(),
+                if_missing: d.if_missing,
+                reason: not_stored_reason(&e),
+            }),
+        }
+    }
     let at = platform::wall_ms();
     store.append_events_unseen(
         Some(&rec.run_id),
@@ -468,15 +484,16 @@ pub(crate) fn keep_artifacts(
         &refused,
         at,
     )?;
+    let mut fixed_event = artifacts_event(&kept, &not_stored);
+    if !plan.outputs.is_empty() {
+        fixed_event["outputs_evaluated"] = json!(true);
+    }
     store.append_events_unseen(
         Some(&rec.run_id),
         attempt,
         ARTIFACTS_EVENT,
         "set",
-        &[(
-            ARTIFACTS_EVENT_KEY.to_string(),
-            artifacts_event(&kept, &not_stored),
-        )],
+        &[(ARTIFACTS_EVENT_KEY.to_string(), fixed_event)],
         at,
     )?;
     Ok(())
@@ -1443,15 +1460,17 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
                 )],
                 platform::wall_ms(),
             )?;
-            keep_artifacts(spec, &store, &masker)?;
-            Termination::new(crate::state::Outcome::Succeeded, None, None)
-                .expect("a success without an exit is valid")
+            let term = Termination::new(crate::state::Outcome::Succeeded, None, None)
+                .expect("a success without an exit is valid");
+            keep_artifacts(spec, &store, &masker, &term)?;
+            term
         }
     } else {
+        let term = termination(end.reason, end.exit);
         if !store.launches(attempt)?.is_empty() {
-            keep_artifacts(spec, &store, &masker)?;
+            keep_artifacts(spec, &store, &masker, &term)?;
         }
-        termination(end.reason, end.exit)
+        term
     };
     let (termination, finalized_here) = settle(&store, &root, attempt, &spool, term)?;
     Ok(Report {

@@ -48,6 +48,7 @@ enum Lost {
 /// What an ended attempt left on the worker.
 #[derive(Debug, Clone, Default)]
 struct Out {
+    outputs_evaluated: Option<bool>,
     /// A result is stored (otherwise the attempt has its termination only).
     has_result: bool,
     /// The records of the result, each with the bytes the worker serves.
@@ -100,7 +101,15 @@ fn err(code: ErrorCode) -> ApiError {
 }
 
 fn ended(outcome: Outcome) -> Termination {
-    Termination::new(outcome, None, None).unwrap()
+    Termination::new(
+        outcome,
+        None,
+        (outcome == Outcome::TimedOut).then_some(remote_task_runner::state::TimeoutInfo {
+            kind: remote_task_runner::state::TimeoutKind::ResourceWait,
+            phase: remote_task_runner::state::TimeoutPhase::Waiting,
+        }),
+    )
+    .unwrap()
 }
 
 fn digest_of(job: &Job) -> Digest {
@@ -164,6 +173,10 @@ impl Worker {
     }
 
     fn status(a: &AttemptId, job: &Job) -> AttemptStatus {
+        let mut receipts = Receipts::default();
+        if job.out.outputs_evaluated == Some(false) {
+            receipts.mark(Receipt::CommandRegistered, 1);
+        }
         AttemptStatus {
             schema_version: SchemaVersion::CURRENT,
             attempt_id: a.clone(),
@@ -173,7 +186,7 @@ impl Worker {
             worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
             agent_epoch: AgentEpoch(1),
             state: job.state,
-            receipts: Receipts::default(),
+            receipts,
             spawned_at_ms: None,
             observation: Observation::Known,
             termination: job.termination,
@@ -244,6 +257,10 @@ impl Worker {
                 let job = &s.jobs[&r.attempt_id];
                 let stored = job.out.has_result;
                 Ok(Response::GetResult(GetResultResponse {
+                    outputs_evaluated: job
+                        .out
+                        .outputs_evaluated
+                        .unwrap_or(stored && !job.payload.outputs.is_empty()),
                     schema_version: SchemaVersion::CURRENT,
                     attempt_id: r.attempt_id.clone(),
                     generation: r.generation,
@@ -473,6 +490,7 @@ fn decl(name: &str, if_missing: MissingPolicy) -> ArtifactDecl {
 
 fn spec(artifacts: Vec<ArtifactDecl>) -> TaskSpec {
     TaskSpec {
+        outputs: Vec::new(),
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
@@ -501,6 +519,7 @@ fn stored(
     bytes: &[u8],
 ) -> (ArtifactRecord, Vec<u8>) {
     let record = ArtifactRecord {
+        encoding: remote_task_runner::wire::ArtifactEncoding::Raw,
         name: name.into(),
         path: name.into(),
         size: bytes.len() as u64,
@@ -565,6 +584,7 @@ fn two() -> Vec<ArtifactDecl> {
 fn full(fx: &Fx, a: &AttemptId) -> Out {
     let p = fx.w.payload(a);
     Out {
+        outputs_evaluated: None,
         has_result: true,
         artifacts: vec![
             stored(a, &p, "alpha.txt", ALPHA),
@@ -1662,6 +1682,7 @@ async fn names_that_are_one_path_on_the_parent_are_each_collected() {
     let (_, _, a) = placed(&fx, &c, decls.collect()).await;
     let p = fx.w.payload(&a);
     let out = Out {
+        outputs_evaluated: None,
         has_result: true,
         artifacts: all.iter().map(|(n, b)| stored(&a, &p, n, b)).collect(),
         not_stored: vec![],
@@ -2244,4 +2265,201 @@ async fn retirement_and_replacement_during_log_rpc_never_mix_attempt_bytes() {
     collect(&c, &files).await;
     assert_eq!(files.read_log(&new, LogStream::Stdout).unwrap(), b"NEW!");
     assert_eq!(files.read_log(&old, LogStream::Stdout).unwrap(), b"old!");
+}
+
+#[tokio::test]
+async fn generic_bundle_encoding_conditions_and_exact_receipt_are_enforced() {
+    use remote_task_runner::supervisor::bundles::store_bundle;
+    use remote_task_runner::supervisor::outcome::Forbidden;
+    use remote_task_runner::supervisor::spec::ArtifactsSpec;
+    for (when, outcome, required, include, wrong_encoding, drop_marker) in [
+        (
+            OutputWhen::Success,
+            Outcome::Succeeded,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Failure,
+            Outcome::Failed,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Failure,
+            Outcome::Succeeded,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Succeeded,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Succeeded,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Succeeded,
+            true,
+            true,
+            true,
+            false,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Succeeded,
+            true,
+            false,
+            false,
+            true,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Cancelled,
+            true,
+            false,
+            false,
+            true,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::TimedOut,
+            true,
+            false,
+            false,
+            true,
+        ),
+    ] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let (run, task) = (RunId::generate(), TaskId::generate());
+        let source = SourceId::generate();
+        c.store()
+            .put_source_ref(&source, &Digest::of_bytes(b"manifest"), 1)
+            .unwrap();
+        let d = OutputDecl {
+            name: "bundle".into(),
+            paths: vec!["reports/**".into(), "coverage/**".into(), "reports".into()],
+            if_missing: if required {
+                MissingPolicy::Required
+            } else {
+                MissingPolicy::Optional
+            },
+            when,
+        };
+        let mut s = spec(vec![]);
+        s.outputs = vec![d.clone()];
+        c.enqueue(run, source, vec![(task, s)]).await.unwrap();
+        let a = c.tick().await.unwrap().placed[0].clone();
+        let p = fx.w.payload(&a);
+        let ws = fx.dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("reports")).unwrap();
+        std::fs::create_dir_all(ws.join("coverage")).unwrap();
+        std::fs::write(ws.join("reports/a"), ALPHA).unwrap();
+        std::fs::write(ws.join("coverage/b"), BETA).unwrap();
+        let plan = ArtifactsSpec {
+            workspace: ws,
+            source_id: p.source_id.clone(),
+            plan_digest: p.plan_digest.clone(),
+            profile_fingerprint: Digest::of_bytes(b"profile"),
+            max_bytes: 1 << 20,
+            files: vec![],
+            outputs: vec![d.clone()],
+            secret_files: vec![],
+            secret_paths: vec![],
+        };
+        let mut records = vec![];
+        let mut bytes = vec![];
+        if include {
+            let mut remaining = 16384;
+            let mut record = store_bundle(
+                &fx.dir.path().join("spool"),
+                &a,
+                &plan,
+                &d,
+                &Forbidden::nothing(),
+                &mut remaining,
+            )
+            .unwrap();
+            bytes = std::fs::read(
+                fx.dir
+                    .path()
+                    .join("spool")
+                    .join(a.as_str())
+                    .join("artifacts/bundle"),
+            )
+            .unwrap();
+            if wrong_encoding || (drop_marker && outcome == Outcome::Succeeded) {
+                record.encoding = ArtifactEncoding::Raw;
+            }
+            records.push((record, bytes.clone()));
+        }
+        end(
+            &fx,
+            &c,
+            &a,
+            outcome,
+            Out {
+                outputs_evaluated: if drop_marker { Some(false) } else { None },
+                has_result: true,
+                artifacts: records,
+                log_closed: true,
+                ..Out::default()
+            },
+        )
+        .await;
+        let mut config = cfg();
+        config.chunk_bytes = 64 << 10;
+        let report = c.collect(&files, config).await.unwrap();
+        if wrong_encoding || (drop_marker && outcome == Outcome::Succeeded) {
+            assert!(report.collected.is_empty());
+            assert!(persisted(&c, &a).is_empty());
+            assert!(fx.w.acks(&a).is_empty());
+            continue;
+        }
+        if !include
+            && required
+            && remote_task_runner::outputs::eligible(when, outcome, !drop_marker)
+        {
+            assert_eq!(report.required_missing, vec![a.clone()]);
+        } else {
+            assert_eq!(report.collected, vec![a.clone()]);
+        }
+        let collection = c.store().collection(&a).unwrap().unwrap();
+        if include {
+            assert_eq!(published(&files, &a, "bundle"), Some(bytes));
+            assert_eq!(persisted(&c, &a), vec!["bundle"]);
+            let result: serde_json::Value =
+                serde_json::from_slice(&files.read_result(&a).unwrap().unwrap()).unwrap();
+            assert_eq!(result["artifacts"][0]["encoding"], "tar_v1");
+        } else if required && remote_task_runner::outputs::eligible(when, outcome, !drop_marker) {
+            assert_eq!(collection.verdict, Some(Verdict::RequiredMissing));
+        }
+        if drop_marker {
+            assert!(c
+                .store()
+                .get_attempt(&a)
+                .unwrap()
+                .unwrap()
+                .receipts
+                .reached(Receipt::CommandRegistered));
+        }
+        assert!(!fx.w.acks(&a).is_empty());
+    }
 }

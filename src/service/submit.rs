@@ -100,32 +100,31 @@ pub async fn command_with_ids(
         has_fast_worktree,
         false,
     );
-    let mut artifacts = Vec::new();
-    for output in &context.config.outputs {
-        if output.paths.len() != 1
-            || output.when != crate::config::model::OutputWhen::Always
-            || output.paths[0].contains(['*', '?', '[', '{'])
-        {
-            return Err(ApiError::new(
-                ErrorCode::NotImplemented,
-                "conditional, multi-path and glob outputs need an output expansion planner",
-            ));
-        }
-        artifacts.push(crate::wire::ArtifactDecl {
-            name: output.name.clone(),
-            path: output.paths[0].clone(),
-            if_missing: if output.required {
+    let outputs: Vec<crate::wire::OutputDecl> = context
+        .config
+        .outputs
+        .iter()
+        .map(|o| crate::wire::OutputDecl {
+            name: o.name.clone(),
+            paths: o.paths.clone(),
+            if_missing: if o.required {
                 crate::wire::MissingPolicy::Required
             } else {
                 crate::wire::MissingPolicy::Optional
             },
-        });
-    }
+            when: match o.when {
+                crate::config::model::OutputWhen::Always => crate::wire::OutputWhen::Always,
+                crate::config::model::OutputWhen::Success => crate::wire::OutputWhen::Success,
+                crate::config::model::OutputWhen::Failure => crate::wire::OutputWhen::Failure,
+            },
+        })
+        .collect();
+    crate::outputs::validate(&[], &outputs).map_err(|e| invalid(e.into()))?;
     let spec = TaskSpec {
+        outputs: outputs.clone(),
         setup,
-        plan_digest: Digest::of_bytes(
-            &serde_json::to_vec(&command).map_err(|e| invalid(e.to_string()))?,
-        ),
+        plan_digest: crate::outputs::command_plan_digest(&command, &outputs)
+            .map_err(|e| invalid(e.to_string()))?,
         manifest_digest: digest,
         commands: vec![CommandSpec {
             node_id: NodeId::parse("command").map_err(|e| invalid(e.to_string()))?,
@@ -140,7 +139,7 @@ pub async fn command_with_ids(
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: !captured.manifest.secret_files.is_empty(),
-        artifacts,
+        artifacts: Vec::new(),
     };
     match owner
         .request(Operation::SubmitCaptured {

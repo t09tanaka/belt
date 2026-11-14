@@ -55,7 +55,20 @@ pub fn open_beneath(
     base: &std::path::Path,
     rel: &std::path::Path,
 ) -> std::io::Result<std::fs::File> {
-    use rustix::fs::{open, openat, Mode, OFlags};
+    use rustix::fs::{open, Mode, OFlags};
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let root: std::fs::File = open(base, flags, Mode::empty())?.into();
+    open_beneath_dir(&root, rel)
+}
+
+/// Descriptor variant: the caller decides how to acquire its trusted root.
+/// Every descendant is held open and refuses symlinks; a hostile FIFO leaf
+/// cannot block this reader.
+pub fn open_beneath_dir(
+    base: &std::fs::File,
+    rel: &std::path::Path,
+) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{openat, Mode, OFlags};
     use std::path::Component;
     let mut names = vec![];
     for c in rel.components() {
@@ -68,7 +81,7 @@ pub fn open_beneath(
         return Err(std::io::ErrorKind::InvalidInput.into());
     };
     let dir_flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-    let mut cur = open(base, dir_flags, Mode::empty())?;
+    let mut cur = openat(base, ".", dir_flags, Mode::empty())?;
     for d in dirs {
         cur = openat(&cur, *d, dir_flags, Mode::empty())?;
     }

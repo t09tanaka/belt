@@ -204,3 +204,11 @@ unit 10 件・active collector から公開 follow まで 1 件・実 CLI 2 件�
 実行中および終了後 final の blocked stdout でも SIGINT detach と cursor cleanup を確認した。
 strict all-target clippy、fmt、diff check も成功した。
 outputs、resident GC / reader lifetime、output planner、estimate は別の必須残件として残す。
+
+Generic outputs worker/collector slice adds frozen declarations, success/failure/always
+eligibility and TarV1 opaque bundles. Multiple globs and literal directories preserve
+workspace-relative member paths. Additive schema-1 serialization retains historical raw
+canonical bytes; every live hello requires output_bundles_v1. The journal fixes encoding, outputs_evaluated
+and all eligible stored/not-stored names before terminal settlement; collector exact-name
+receipts and ACK remain opaque. Public outputs query/export, resident GC, estimate and
+CI intermediate upload/download integration remain required follow-up work.

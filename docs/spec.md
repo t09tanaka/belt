@@ -1148,3 +1148,49 @@ closed の不完全ログ・回収失敗は利用可能 bytes を返して COLLE
 active / pending / finalizing の回収と reader 使用中の削除を防ぐ必要がある。
 現時点の read-only CLI は親 DB へ pin を書かない。GC 未接続の間も消失を空成功にせず
 明示エラーとする。GC / outputs / output planner の完成を本ログ経路だけで意味しない。
+
+### Generic output bundles (TarV1)
+
+`[[outputs]]` の各論理名は1つの非圧縮 tar blob として回収する。`paths` は
+workspace 相対の globset パターンの和集合であり、`*` は1要素、`**` は再帰、
+`?`・文字クラス・brace alternation は globset の構文とする。literal directory は
+全 regular file descendants を含み、重複は除く。member 名は workspace 相対のまま
+保持する。通常の dotfile は対象となる。`.git` と runner metadata は走査しない。
+選択された symlink、hardlink、FIFO、socket、device、secret path/inode/value、
+case/NFC 名衝突は論理 output 全体を refused にする。source の captured input
+manifest は出力 allowlist として使わず、新しく生成したファイルも回収できる。
+
+`when = success` は Succeeded、`failure` は Failed/TimedOut、`always` は収集可能な
+全 terminal outcome に適用する。Cancelled/Interrupted は always のみ。未起動の
+cancel/prepare failure は収集せず、prepared-only success は収集する。条件に
+合わない required output は required_missing にしない。条件は command outcome
+で判定し、artifact 不足による verdict を再入力しない。
+
+1 attempt は raw artifact と合わせて1024論理出力・1024 patterns、1 bundle は
+4096 files、attempt 全体16384 files、走査は1 bundle 当たり100000 entries、
+path は UTF-8 1024 bytes・16要素、member と serialized bundle は各最大1 GiB
+（worker設定がより小さければその上限）とする。上限超過は切り捨てず refused。
+各 member は held directory fd と NOFOLLOW/NONBLOCK で開き、64 KiB 単位で
+private spool に secret 検査してから archive に追加する。bundle 失敗は他の
+論理 output を妨げず、既存の required/optional 判定を維持する。
+
+wire schema 1 に default/skip-empty の `outputs` を追加し、従来の `artifacts`
+は raw のまま保持する。`ArtifactRecord.encoding` は raw を既定とし省略し、
+TarV1 は明示 `tar_v1` とする。収集段階の到達は `outputs_evaluated` (default false/skipfalse) として journal と
+result に固定する。missing/refused や zero eligible でも収集を評価した場合は true、
+未起動 cancel/prepare failure は false とする。Succeeded/exit/Running receipt/
+Running timeout と marker false が矛盾する結果は拒否する。CommandRegistered は
+admission 前に立つので、その receipt 単独は開始証拠としない。
+encoding と marker を含む immutable result JSON と digest が
+既存の exact name/digest/size receipt・ACK を束縛する。旧 persisted payload/result
+の canonical bytes と digest は変えない。全 live hello で `output_bundles_v1` を
+必須とし、設定の required_features が空でも迂回できない。旧 peer との接続は
+明示的な protocol_incompatible となる。doctor/version で同一 schema だけを見て
+互換と判断せず、hello の必須 feature も確認する。
+
+TarV1 writer は Rust tar crate の GNU regular-file header のみを出力し、mode0600、
+uid/gid/mtime0、名前順とする。100 bytes 超の名前は同 crate が生成する bounded
+GNU `L` (`././@LongLink`, UTF-8 member path + NUL) metadata を許可する。
+compressed data、directory entries、link、special、sparse、PAX/global metadata は
+生成しない。reader/export はこの subset と全構造・外側 digest を再検証し、
+raw bytes を magic sniffing で tar と解釈しない。汎用 unpack は使用しない。

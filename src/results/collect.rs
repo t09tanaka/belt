@@ -188,6 +188,28 @@ fn declared_of(payload: &Option<Value>) -> std::result::Result<Declared, &'stati
     })
 }
 
+impl Declared {
+    fn names(&self, result: &GetResultResponse) -> Vec<(String, bool)> {
+        self.artifacts
+            .iter()
+            .cloned()
+            .chain(
+                self.payload
+                    .outputs
+                    .iter()
+                    .filter(|d| {
+                        crate::outputs::eligible(
+                            d.when,
+                            result.termination.outcome(),
+                            result.outputs_evaluated,
+                        )
+                    })
+                    .map(|d| (d.name.clone(), d.if_missing == MissingPolicy::Required)),
+            )
+            .collect()
+    }
+}
+
 /// The collections that wait before their next try, and until when. In
 /// memory: a parent that starts again tries each once.
 #[derive(Debug, Default)]
@@ -547,7 +569,7 @@ impl Collector {
             });
         let all: Vec<ArtifactRecord> = current
             .iter()
-            .flat_map(|(_, _, result)| wanted(&declared.artifacts, result))
+            .flat_map(|(_, _, result)| wanted(&declared.names(result), result))
             .cloned()
             .collect();
         // Published is what has this name and this digest. A name that is
@@ -736,7 +758,7 @@ impl Collector {
         let (a, digest, names) = (
             rec.attempt_id.clone(),
             result.result_digest.clone(),
-            declared.artifacts.clone(),
+            declared.names(&result),
         );
         self.db(move |s| {
             let refs = [
@@ -771,6 +793,19 @@ impl Collector {
         if Some(result.termination) != rec.termination {
             return Err("a result with another termination than the attempt's");
         }
+        if declared.payload.outputs.is_empty() && result.outputs_evaluated {
+            return Err("raw-only result claims generic output evaluation");
+        }
+        let started = result.termination.outcome() == crate::state::Outcome::Succeeded
+            || result.termination.exit().is_some()
+            || rec.receipts.reached(Receipt::Running)
+            || result
+                .termination
+                .timeout()
+                .is_some_and(|t| t.phase == crate::state::TimeoutPhase::Running);
+        if !declared.payload.outputs.is_empty() && !result.outputs_evaluated && started {
+            return Err("started attempt omitted immutable output evaluation");
+        }
         let names: BTreeSet<&str> = result
             .artifacts
             .iter()
@@ -783,6 +818,41 @@ impl Collector {
             names.len(),
         )?;
         for artifact in &result.artifacts {
+            if declared.payload.outputs.iter().any(|d| {
+                d.name == artifact.name
+                    && !crate::outputs::eligible(
+                        d.when,
+                        result.termination.outcome(),
+                        result.outputs_evaluated,
+                    )
+            }) {
+                return Err("an ineligible output is listed as stored");
+            }
+            let expected = if declared
+                .payload
+                .artifacts
+                .iter()
+                .any(|d| d.name == artifact.name)
+            {
+                Some(crate::wire::ArtifactEncoding::Raw)
+            } else if declared.payload.outputs.iter().any(|d| {
+                d.name == artifact.name
+                    && crate::outputs::eligible(
+                        d.when,
+                        result.termination.outcome(),
+                        result.outputs_evaluated,
+                    )
+            }) {
+                Some(crate::wire::ArtifactEncoding::TarV1)
+            } else {
+                None
+            };
+            if expected.is_some_and(|e| e != artifact.encoding)
+                || (expected.is_none() && artifact.encoding != crate::wire::ArtifactEncoding::Raw)
+            {
+                return Err("output encoding or eligibility does not match its declaration");
+            }
+
             let of_payload = declared.payload.source_id == artifact.source_id
                 && declared.payload.plan_digest == artifact.plan_digest;
             plan::check_record(RecordFacts {
@@ -792,6 +862,24 @@ impl Collector {
                 size: artifact.size,
                 max_size: self.cfg.max_artifact_bytes,
             })?;
+        }
+        for missing in &result.artifacts_not_stored {
+            if let Some(d) = declared
+                .payload
+                .outputs
+                .iter()
+                .find(|d| d.name == missing.name)
+            {
+                if !crate::outputs::eligible(
+                    d.when,
+                    result.termination.outcome(),
+                    result.outputs_evaluated,
+                ) || missing.if_missing != d.if_missing
+                    || d.paths.first() != Some(&missing.path)
+                {
+                    return Err("output refusal does not match its eligible declaration");
+                }
+            }
         }
         Ok(())
     }
@@ -1245,7 +1333,7 @@ impl Collector {
         });
         match link.call(request).await {
             Ok(Response::AckCollected(r)) if r.attempt_id == a && r.released => {
-                let verdict = verdict_of(&declared.artifacts, result);
+                let verdict = verdict_of(&declared.names(result), result);
                 let digest = digest.clone();
                 self.db(move |s| s.close_collection(&a, Some(&digest), verdict, true, wall_ms()))
                     .await?;
@@ -1268,7 +1356,7 @@ impl Collector {
                 // the worker deleted what it released). Everything is here,
                 // verified: the collection is closed, as not acknowledged.
                 AckRefusal::Gone => {
-                    let verdict = verdict_of(&declared.artifacts, result);
+                    let verdict = verdict_of(&declared.names(result), result);
                     let digest = digest.clone();
                     self.db(move |s| {
                         s.close_collection(&a, Some(&digest), verdict, false, wall_ms())

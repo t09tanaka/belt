@@ -399,6 +399,7 @@ fn payload(script: &str) -> AttemptPayload {
     let mut env = BTreeMap::new();
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
+        outputs: Vec::new(),
         setup: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
@@ -2090,6 +2091,7 @@ async fn declared_artifacts_reach_the_supervisor_and_the_result_tells_required_f
     };
     // Everything chapter 13 lists, per artifact.
     let record = |name: &str, content: &[u8]| ArtifactRecord {
+        encoding: remote_task_runner::wire::ArtifactEncoding::Raw,
         name: name.to_string(),
         path: name.to_string(),
         size: content.len() as u64,

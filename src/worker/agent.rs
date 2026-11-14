@@ -1219,7 +1219,7 @@ impl Agent {
         // The declared artifacts, checked again against the secret files of
         // the source (which is here now: the workspace was made from it). An
         // acceptance that came before the source could not look.
-        let artifacts = if payload.artifacts.is_empty() {
+        let artifacts = if payload.artifacts.is_empty() && payload.outputs.is_empty() {
             None
         } else {
             let secrets = self.host.secret_paths(&payload)?.ok_or_else(|| {
@@ -1233,6 +1233,8 @@ impl Agent {
             })?;
             check_artifacts_not_secret(&payload, &secrets)?;
             Some(ArtifactsSpec {
+                outputs: payload.outputs.clone(),
+                secret_paths: secrets,
                 // Declared paths are relative to the workspace root, like
                 // the paths of the secret files they are compared with.
                 workspace: ws.root.clone(),
@@ -2083,6 +2085,11 @@ impl Agent {
         let (termination, artifacts, artifacts_not_stored, result_digest, _) =
             self.ended(&r.attempt_id, r.generation)?;
         Ok(GetResultResponse {
+            outputs_evaluated: self
+                .store
+                .get_result(&r.attempt_id)
+                .map_err(api)?
+                .is_some_and(|v| v["outputs_evaluated"] == true),
             schema_version: SchemaVersion::CURRENT,
             attempt_id: r.attempt_id,
             generation: r.generation,

@@ -779,6 +779,36 @@ pub struct ArtifactDecl {
     pub if_missing: MissingPolicy,
 }
 
+/// A logical output, stored as one uncompressed TarV1 blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDecl {
+    pub name: String,
+    pub paths: Vec<String>,
+    pub if_missing: MissingPolicy,
+    pub when: OutputWhen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputWhen {
+    Always,
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactEncoding {
+    #[default]
+    Raw,
+    TarV1,
+}
+impl ArtifactEncoding {
+    pub fn is_raw(&self) -> bool {
+        *self == Self::Raw
+    }
+}
+
 /// What a worker persists on acceptance. Its canonical JSON is hashed into
 /// `payload_hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -812,6 +842,8 @@ pub struct AttemptPayload {
     /// canonical JSON, and the hash, it had before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactDecl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<OutputDecl>,
     /// The setup of the task, to be prepared once by the worker's builder
     /// and shared. Not written when absent, like `artifacts`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1187,6 +1219,8 @@ pub struct ReadLogResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRecord {
+    #[serde(default, skip_serializing_if = "ArtifactEncoding::is_raw")]
+    pub encoding: ArtifactEncoding,
     pub name: String,
     /// Relative path.
     pub path: String,
@@ -1231,6 +1265,9 @@ pub struct GetResultRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetResultResponse {
+    /// True only when the immutable collection journal was fixed, including zero eligible outputs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outputs_evaluated: bool,
     pub schema_version: SchemaVersion,
     pub attempt_id: AttemptId,
     pub generation: Generation,
@@ -1723,6 +1760,7 @@ mod tests {
 
     fn payload() -> AttemptPayload {
         AttemptPayload {
+            outputs: Vec::new(),
             setup: None,
             run_id: RunId::generate(),
             task_id: TaskId::generate(),
@@ -1832,6 +1870,7 @@ mod tests {
 
     fn artifact() -> ArtifactRecord {
         ArtifactRecord {
+            encoding: crate::wire::ArtifactEncoding::Raw,
             name: "out".into(),
             path: "out/a.txt".into(),
             size: 3,
@@ -2122,6 +2161,7 @@ mod tests {
                 dropped_bytes: 0,
             }),
             Response::GetResult(GetResultResponse {
+                outputs_evaluated: false,
                 schema_version: SV,
                 attempt_id: aid(),
                 generation: Generation(1),
@@ -3281,5 +3321,39 @@ mod tests {
         };
         assert!(!st.receipts.reached(Receipt::Running));
         assert!(st.spawned_at_ms.is_some());
+    }
+    #[test]
+    fn output_encoding_is_explicit_and_legacy_raw_bytes_are_unchanged() {
+        let raw = artifact();
+        let value = serde_json::to_value(&raw).unwrap();
+        assert!(value.get("encoding").is_none());
+        assert_eq!(
+            serde_json::from_value::<ArtifactRecord>(value.clone())
+                .unwrap()
+                .encoding,
+            ArtifactEncoding::Raw
+        );
+        let digest = payload_hash(&value).unwrap();
+        let mut tar = raw;
+        tar.encoding = ArtifactEncoding::TarV1;
+        let encoded = serde_json::to_value(tar).unwrap();
+        assert_eq!(encoded["encoding"], "tar_v1");
+        assert_ne!(digest, payload_hash(&encoded).unwrap());
+        let mut unknown = encoded;
+        unknown["encoding"] = json!("zip");
+        assert!(serde_json::from_value::<ArtifactRecord>(unknown).is_err());
+        let mut p = payload();
+        let before = payload_hash(&p).unwrap();
+        p.outputs = vec![OutputDecl {
+            name: "reports".into(),
+            paths: vec!["reports/**".into()],
+            if_missing: MissingPolicy::Required,
+            when: OutputWhen::Always,
+        }];
+        assert_ne!(before, payload_hash(&p).unwrap());
+        assert_eq!(
+            serde_json::from_value::<AttemptPayload>(serde_json::to_value(&p).unwrap()).unwrap(),
+            p
+        );
     }
 }

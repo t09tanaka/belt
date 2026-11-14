@@ -131,6 +131,10 @@ pub struct ArtifactsSpec {
     #[serde(default = "d_artifact_bytes")]
     pub max_bytes: u64,
     pub files: Vec<ArtifactFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<crate::wire::OutputDecl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_paths: Vec<String>,
     /// The secret files placed in the workspace, as the file system knew
     /// them before the commands started. A declared source that turns out to
     /// be one of them (by another spelling of its name, or a hard link) is
@@ -252,6 +256,19 @@ impl SuperviseSpec {
             if !a.workspace.is_absolute() {
                 return bad("the artifacts' workspace must be an absolute path");
             }
+            crate::outputs::validate(&[], &a.outputs)
+                .map_err(|e| SupervisorError::Spec(e.into()))?;
+            if a.files.len() + a.outputs.len() > crate::outputs::MAX_OUTPUTS {
+                return bad("too many logical outputs");
+            }
+            let names: Vec<&str> = a
+                .files
+                .iter()
+                .map(|f| f.name.as_str())
+                .chain(a.outputs.iter().map(|d| d.name.as_str()))
+                .collect();
+            super::spool_plan::check_artifact_names(&names)
+                .map_err(|e| SupervisorError::Spec(format!("conflicting output names: {e:?}")))?;
             let files: Vec<(&str, &Path)> = a
                 .files
                 .iter()
@@ -303,8 +320,8 @@ impl SuperviseSpec {
         }
         let mut text = String::new();
         file.read_to_string(&mut text)?;
-        let spec: SuperviseSpec =
-            serde_json::from_str(&text).map_err(|e| SupervisorError::Spec(e.to_string()))?;
+        let spec: SuperviseSpec = serde_json::from_str(&text)
+            .map_err(|e| SupervisorError::Spec(format!("conflicting output names: {e:?}")))?;
         spec.validate()?;
         Ok(spec)
     }

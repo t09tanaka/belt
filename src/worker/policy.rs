@@ -120,7 +120,7 @@ pub fn check_payload(p: &AttemptPayload, poll_ms: u64) -> Result<(), &'static st
     if bytes > MAX_COMMAND_BYTES {
         return Err("the commands are too large");
     }
-    check_artifacts(&p.artifacts)?;
+    crate::outputs::validate(&p.artifacts, &p.outputs)?;
     execution_order(&p.commands).map(|_| ())
 }
 
@@ -615,6 +615,7 @@ mod tests {
     fn payload() -> AttemptPayload {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
+            outputs: Vec::new(),
             setup: None,
             run_id: RunId::generate(),
             task_id: TaskId::generate(),
@@ -1463,5 +1464,18 @@ mod tests {
         assert_eq!(at(Step::StateDir), 0);
         assert!(at(Step::Lock) < at(Step::Store));
         assert_eq!(at(Step::BootRecord), STARTUP_ORDER.len() - 1);
+    }
+    #[test]
+    fn direct_payload_calls_validate_generic_declarations() {
+        let mut p = payload();
+        p.outputs = vec![crate::wire::OutputDecl {
+            name: "reports".into(),
+            paths: vec!["reports/**".into()],
+            if_missing: crate::wire::MissingPolicy::Required,
+            when: crate::wire::OutputWhen::Success,
+        }];
+        assert_eq!(check_payload(&p, 0), Ok(()));
+        p.outputs[0].paths = vec!["../escape".into()];
+        assert!(check_payload(&p, 0).is_err());
     }
 }

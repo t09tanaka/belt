@@ -773,6 +773,7 @@ mod tests {
         };
         let a = AttemptId::generate();
         let art = |n: &str| ArtifactRecord {
+            encoding: crate::wire::ArtifactEncoding::Raw,
             name: n.into(),
             path: n.into(),
             size: 1,
@@ -814,6 +815,7 @@ mod tests {
 
     fn record(name: &str) -> ArtifactRecord {
         ArtifactRecord {
+            encoding: crate::wire::ArtifactEncoding::Raw,
             name: name.into(),
             path: name.into(),
             size: 3,
@@ -1100,6 +1102,7 @@ mod tests {
 
     fn rec_of(name: &str, size: u64) -> ArtifactRecord {
         ArtifactRecord {
+            encoding: crate::wire::ArtifactEncoding::Raw,
             name: name.into(),
             path: name.into(),
             size,

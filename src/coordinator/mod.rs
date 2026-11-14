@@ -111,6 +111,8 @@ pub struct TaskSpec {
     /// then not written, like in the payload).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactDecl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<crate::wire::OutputDecl>,
 }
 
 /// The one place an [`AttemptPayload`] is made.
@@ -139,6 +141,7 @@ pub fn build_payload(
         resource_wait_timeout_ms: spec.resource_wait_timeout_ms,
         has_secret_bundle: spec.has_secret_bundle,
         artifacts: spec.artifacts.clone(),
+        outputs: spec.outputs.clone(),
     })
 }
 
