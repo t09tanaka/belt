@@ -182,6 +182,7 @@ pub struct Workspace {
 pub struct Runner<'a> {
     pinned: Option<(
         &'a crate::source_execute::PinnedExecution<'a>,
+        &'a crate::source_execute::PinnedWorkspace,
         &'a dyn crate::source_execute::PinnedWorkspaceProvider,
     )>,
     pub ctx: &'a ExecContext,
@@ -201,7 +202,7 @@ pub struct Runner<'a> {
     /// What each task was told is prepared, and the context its template keys
     /// are made under.
     receipts: Option<(HashMap<String, PreparedReceipt>, TemplateContext)>,
-    seq: AtomicUsize,
+    seq: Arc<AtomicUsize>,
     /// Copies that took a port block of their own.
     synced: Mutex<HashSet<PathBuf>>,
     docker_ok: OnceLock<Result<(), String>>,
@@ -806,17 +807,27 @@ impl<'a> Runner<'a> {
     pub(crate) fn new_pinned(
         ctx: &'a ExecContext,
         input: &'a crate::source_execute::PinnedExecution<'a>,
-        ws: &Workspace,
+        ws: &'a crate::source_execute::PinnedWorkspace,
         opts: Opts,
         provider: &'a dyn crate::source_execute::PinnedWorkspaceProvider,
     ) -> Result<Self> {
         input.validate(input.plan)?;
-        Self::construct(ctx, input.plan, ws, opts, Some((input, provider)))
+        ws.validate(input)?;
+        Self::construct(
+            ctx,
+            input.plan,
+            ws.workspace(),
+            opts,
+            Some((input, ws, provider)),
+        )
     }
 
     fn validate_source(&self) -> Result<()> {
         match self.pinned {
-            Some((input, _)) => input.validate(self.fp),
+            Some((input, ws, _)) => {
+                input.validate(self.fp)?;
+                ws.validate(input)
+            }
             None => self.fp.require_git_source(),
         }
     }
@@ -829,6 +840,9 @@ impl<'a> Runner<'a> {
     }
 
     fn workspace_name(&self) -> String {
+        if let Some((_, ws, _)) = self.pinned {
+            return ws.namespace.clone();
+        }
         self.fp
             .source
             .execution_commit
@@ -839,6 +853,14 @@ impl<'a> Runner<'a> {
             .collect()
     }
 
+    fn resource_name(&self) -> String {
+        let n = self.seq.fetch_add(1, Ordering::SeqCst);
+        match self.pinned {
+            Some((_, ws, _)) => format!("local-ci-{}-{n}-{}", ws.namespace, std::process::id()),
+            None => format!("local-ci-{}-{n}", std::process::id()),
+        }
+    }
+
     fn construct(
         ctx: &'a ExecContext,
         fp: &'a FrozenPlan,
@@ -846,6 +868,7 @@ impl<'a> Runner<'a> {
         opts: Opts,
         pinned: Option<(
             &'a crate::source_execute::PinnedExecution<'a>,
+            &'a crate::source_execute::PinnedWorkspace,
             &'a dyn crate::source_execute::PinnedWorkspaceProvider,
         )>,
     ) -> Result<Self> {
@@ -870,7 +893,9 @@ impl<'a> Runner<'a> {
             slug: fp.repository.clone().unwrap_or_default(),
             opts,
             base_path,
-            seq: AtomicUsize::new(0),
+            seq: pinned
+                .map(|(_, ws, _)| ws.sequence.clone())
+                .unwrap_or_else(|| Arc::new(AtomicUsize::new(0))),
             synced: Mutex::new(HashSet::new()),
             docker_ok: OnceLock::new(),
         })
@@ -1076,7 +1101,12 @@ impl<'a> Runner<'a> {
         piped: bool,
     ) -> Result<(Exit, Duration)> {
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
-        let file = self.tools.join(format!("scripts/step-{n}.sh"));
+        let script_name = if self.pinned.is_some() {
+            format!("step-{}-{n}.sh", self.workspace_name())
+        } else {
+            format!("step-{n}.sh")
+        };
+        let file = self.tools.join("scripts").join(script_name);
         // With task-traffic-controller the script touches this file as its first act, on the
         // line the script starts on, so task-traffic-controller still sees the same command and
         // the script keeps its line numbers. The file's time tells how long the
@@ -1873,7 +1903,7 @@ impl<'a> Runner<'a> {
     /// A copy of `from` at `to`, with the installs the npm shim recorded for it.
     fn copy_of(&self, from: &Path, to: &Path) -> Result<()> {
         self.validate_source()?;
-        if let Some((_, provider)) = self.pinned {
+        if let Some((_, _, provider)) = self.pinned {
             provider.fork(from, to)?;
         } else {
             crate::git::clone_worktree(
@@ -1902,7 +1932,7 @@ impl<'a> Runner<'a> {
     fn remove_copy(&self, ws: &Path) {
         if !self.opts.keep {
             let _ = self.release_ports(ws);
-            if let Some((_, provider)) = self.pinned {
+            if let Some((_, _, provider)) = self.pinned {
                 let _ = provider.remove(ws);
             } else {
                 crate::git::remove_worktree(self.ctx, &self.repo_root, ws, &self.opts.trash);
@@ -1914,7 +1944,11 @@ impl<'a> Runner<'a> {
     /// own checkout: a unit that edits tracked files for a while (a negative
     /// control, a formatter) must not change what the units beside it read.
     fn run_unit_in_copy(&self, ui: usize, u: &Unit, waited: UnitWait) -> UnitResult {
-        let n = ui + 1;
+        let n = if self.pinned.is_some() {
+            self.seq.fetch_add(1, Ordering::SeqCst)
+        } else {
+            ui + 1
+        };
         // the pid stays last in the name: cleanup scripts read it from there
         let ws = self.wt.with_file_name(format!(
             "{}-u{n}-{}",
@@ -2920,11 +2954,7 @@ impl<'a> Runner<'a> {
         let mut extra_path: Vec<String> = Vec::new();
         let mut failed = false;
         // `docker compose` without `-p` would share the project of the main checkout's directory.
-        let compose_default = format!(
-            "local-ci-{}-{}",
-            std::process::id(),
-            self.seq.fetch_add(1, Ordering::SeqCst)
-        );
+        let compose_default = self.resource_name();
         let tag = format!("lc{}", &compose_default["local-ci-".len()..]);
         let mut projects = vec![compose_default.clone()];
         self.ctx.cancel.track_compose(compose_default.clone());
@@ -3183,9 +3213,12 @@ impl<'a> Runner<'a> {
                 },
                 None => script,
             };
-            let files_dir = self
-                .tools
-                .join(format!("files/{}", self.seq.fetch_add(1, Ordering::SeqCst)));
+            let files_name = if self.pinned.is_some() {
+                self.resource_name()
+            } else {
+                self.seq.fetch_add(1, Ordering::SeqCst).to_string()
+            };
+            let files_dir = self.tools.join("files").join(files_name);
             let _ = fs::create_dir_all(&files_dir);
             {
                 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -3596,11 +3629,7 @@ impl<'a> Runner<'a> {
                 self.docker(&["pull", "--quiet", &image], Duration::from_secs(600))
                     .with_context(|| format!("pull {image}"))?;
             }
-            let name = format!(
-                "local-ci-{}-{}",
-                std::process::id(),
-                self.seq.fetch_add(1, Ordering::SeqCst)
-            );
+            let name = self.resource_name();
             let mut args: Vec<String> = vec![
                 "run".into(),
                 "-d".into(),

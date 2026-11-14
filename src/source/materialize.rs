@@ -149,6 +149,9 @@ fn scan(dest: &Path, skip: &[&RelPath]) -> Result<Vec<FileEntry>> {
                     hash: sha256_hex(bytes),
                 });
             } else {
+                if !md.is_file() {
+                    bail!("captured workspace contains a non-file entry");
+                }
                 let bytes = std::fs::read(&full)?;
                 out.push(FileEntry {
                     path: p,
@@ -442,4 +445,166 @@ pub fn materialize_secrets(
         std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600))?;
     }
     Ok(())
+}
+
+/// Verify an already materialized, still secret-free source without writing it.
+/// Each captured submodule is checked against its own immutable manifest.
+/// This proves payload bytes, not the existence of nested Git administrative data.
+pub fn verify_materialized_from(
+    store: &ObjectStore,
+    m: &SourceManifest,
+    root: &Path,
+) -> Result<()> {
+    fn verify(
+        store: &ObjectStore,
+        m: &SourceManifest,
+        root: &Path,
+        ancestors: &mut BTreeSet<String>,
+        remaining: &mut usize,
+    ) -> Result<()> {
+        if *remaining == 0 || !ancestors.insert(m.source_id.clone()) {
+            bail!("captured source graph exceeds its bound or has a cycle");
+        }
+        *remaining -= 1;
+        check_digest_of(m)?;
+        if m.secret_files.iter().any(|secret| {
+            m.object_manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path == secret.path)
+        }) {
+            bail!("captured source includes secret payload in ordinary objects");
+        }
+        if !std::fs::symlink_metadata(root)?.is_dir() {
+            bail!("captured source root is not a directory");
+        }
+        for entry in &m.object_manifest.entries {
+            check_safe(&entry.path)?;
+        }
+        let sub_paths: Vec<_> = m.submodules.iter().map(|sub| &sub.path).collect();
+        for sub in &m.submodules {
+            check_safe(&sub.path)?;
+            for ancestor in sub.path.ancestors() {
+                if !std::fs::symlink_metadata(root.join(ancestor.to_path()))?.is_dir() {
+                    bail!("submodule path traverses a non-directory");
+                }
+            }
+            if m.object_manifest
+                .entries
+                .iter()
+                .any(|entry| entry.path == sub.path || entry.path.starts_with_dir(&sub.path))
+            {
+                bail!("captured entry overlaps a submodule");
+            }
+            let nested_root = root.join(sub.path.to_path());
+            if !std::fs::symlink_metadata(&nested_root)?.is_dir() {
+                bail!("submodule is not an owned directory");
+            }
+            if let Some(id) = &sub.source_id {
+                let nested = store
+                    .load_manifest(id)?
+                    .context("captured submodule manifest is missing")?;
+                if nested.source_id != *id {
+                    bail!("captured submodule identity mismatch");
+                }
+                verify(store, &nested, &nested_root, ancestors, remaining)?;
+            } else if std::fs::read_dir(&nested_root)?.next().is_some() {
+                bail!("uncaptured submodule is not empty");
+            }
+        }
+        if tree_digest(&scan(root, &sub_paths)?) != m.object_manifest.tree_digest {
+            bail!("workspace bytes do not match captured source");
+        }
+        ancestors.remove(&m.source_id);
+        Ok(())
+    }
+    verify(
+        store,
+        m,
+        root,
+        &mut BTreeSet::new(),
+        &mut (super::MAX_DIRTY_SUBMODULES + 1),
+    )
+}
+
+/// Validate immutable source metadata and referenced manifests without reading
+/// payload objects or creating a materialized workspace.
+pub(crate) fn check_materialization_graph(store: &ObjectStore, m: &SourceManifest) -> Result<()> {
+    fn check(
+        store: &ObjectStore,
+        m: &SourceManifest,
+        ancestors: &mut BTreeSet<String>,
+        remaining: &mut usize,
+    ) -> Result<()> {
+        if *remaining == 0
+            || ancestors.len() > super::MAX_NESTED
+            || !ancestors.insert(m.source_id.clone())
+        {
+            bail!("captured source graph exceeds its bound or has a cycle");
+        }
+        *remaining -= 1;
+        check_digest_of(m)?;
+        let entries = &m.object_manifest.entries;
+        if entries.windows(2).any(|pair| pair[0].path >= pair[1].path)
+            || tree_digest(entries) != m.object_manifest.tree_digest
+        {
+            bail!("captured source entries do not match their tree identity");
+        }
+        let paths: BTreeSet<_> = entries.iter().map(|entry| entry.path.clone()).collect();
+        for entry in entries {
+            check_safe(&entry.path)?;
+            if !matches!(entry.mode, 0o100644 | 0o100755 | 0o120000)
+                || entry.hash.len() != 64
+                || !entry.hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                bail!("invalid captured source entry");
+            }
+            if entry
+                .path
+                .ancestors()
+                .iter()
+                .any(|ancestor| paths.contains(ancestor))
+            {
+                bail!("captured file overlaps another entry");
+            }
+        }
+        for secret in &m.secret_files {
+            check_safe(&secret.path)?;
+            if paths.contains(&secret.path) {
+                bail!("captured source includes secret payload in ordinary objects");
+            }
+        }
+        let mut sub_paths = BTreeSet::new();
+        for sub in &m.submodules {
+            check_safe(&sub.path)?;
+            if !sub_paths.insert(sub.path.clone())
+                || sub.revision.len() != 40
+                || !sub.revision.bytes().all(|b| b.is_ascii_hexdigit())
+                || entries.iter().any(|entry| {
+                    entry.path == sub.path
+                        || entry.path.starts_with_dir(&sub.path)
+                        || sub.path.starts_with_dir(&entry.path)
+                })
+            {
+                bail!("invalid or overlapping captured submodule");
+            }
+            if let Some(id) = &sub.source_id {
+                let nested = store
+                    .load_manifest(id)?
+                    .context("captured submodule manifest is missing")?;
+                if nested.source_id != *id {
+                    bail!("captured submodule identity mismatch");
+                }
+                check(store, &nested, ancestors, remaining)?;
+            }
+        }
+        ancestors.remove(&m.source_id);
+        Ok(())
+    }
+    check(
+        store,
+        m,
+        &mut BTreeSet::new(),
+        &mut (super::MAX_DIRTY_SUBMODULES + 1),
+    )
 }

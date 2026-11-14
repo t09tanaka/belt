@@ -1,8 +1,8 @@
 //! Planning from captured bytes without Git, commands, secrets or mutable caller views.
 //!
-//! This entry point owns a private, short-lived materialization. It validates
-//! the manifest and every object before parsing, never restores secret files,
-//! and returns an ordinary frozen plan whose digest binds its captured source.
+//! This entry point validates immutable manifest metadata and reads only the
+//! workflow/configuration objects it parses. It never materializes source or
+//! restores secrets. Execution verifies payload objects at its own boundary.
 
 use crate::frozen::{
     DisabledRecord, DisabledSource, DisabledWorkflow, Filters, FrozenConfig, FrozenPlan, PlanParts,
@@ -11,6 +11,7 @@ use crate::frozen::{
 use crate::source::{ObjectStore, RelPath, SourceKind, SourceManifest};
 use crate::{config, filter, plan, workflow};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Component, Path};
 
 /// Captured-source plans use a distinct format; legacy Git plans remain schema 6.
@@ -89,7 +90,7 @@ fn relative(path: &str) -> bool {
             .all(|c| matches!(c, Component::Normal(_)))
 }
 
-fn text(root: &Path, m: &SourceManifest, path: &str) -> Result<Option<String>> {
+fn text(store: &ObjectStore, m: &SourceManifest, path: &str) -> Result<Option<String>> {
     let rel = RelPath::new(path);
     if m.secret_files.iter().any(|s| s.path == rel) {
         return Err(PinnedPlanError::UnavailablePlanningInput);
@@ -100,7 +101,13 @@ fn text(root: &Path, m: &SourceManifest, path: &str) -> Result<Option<String>> {
     if !matches!(entry.mode, 0o100644 | 0o100755) {
         return Err(PinnedPlanError::UnavailablePlanningInput);
     }
-    std::fs::read_to_string(root.join(path))
+    let bytes = store
+        .read(&entry.hash)
+        .map_err(|_| PinnedPlanError::InvalidSource)?;
+    if bytes.len() as u64 != entry.size || format!("{:x}", Sha256::digest(&bytes)) != entry.hash {
+        return Err(PinnedPlanError::InvalidSource);
+    }
+    String::from_utf8(bytes)
         .map(Some)
         .map_err(|_| PinnedPlanError::UnavailablePlanningInput)
 }
@@ -109,7 +116,8 @@ fn text(root: &Path, m: &SourceManifest, path: &str) -> Result<Option<String>> {
 /// queue, ledger, tool lookup, or secret restoration is involved.
 ///
 /// The manifest is not trusted merely because it is a public DTO: its schema,
-/// digest, paths, objects and complete materialized tree are checked first.
+/// digest, paths and referenced manifest graph are checked first. Objects used
+/// for planning are verified on read; execution verifies the remaining payload.
 /// Directory sources retain `None` for commit and base; the legacy Git
 /// execution entry points reject them before side effects.
 pub fn build_frozen_plan_from_source(
@@ -117,8 +125,8 @@ pub fn build_frozen_plan_from_source(
     manifest: &SourceManifest,
     options: &PinnedPlanOptions,
 ) -> Result<FrozenPlan> {
-    if !manifest.submodules.is_empty() {
-        return Err(PinnedPlanError::UnsupportedSource);
+    if manifest.source_kind == SourceKind::Directory && !manifest.submodules.is_empty() {
+        return Err(PinnedPlanError::InvalidSource);
     }
     if manifest.source_kind != SourceKind::Directory
         && manifest
@@ -158,10 +166,9 @@ pub fn build_frozen_plan_from_source(
     }) {
         return Err(PinnedPlanError::InvalidSource);
     }
-    let lease = tempfile::tempdir().map_err(|_| PinnedPlanError::InvalidSource)?;
-    crate::source::materialize_from(store, manifest, lease.path())
+    crate::source::check_materialization_graph(store, manifest)
         .map_err(|_| PinnedPlanError::InvalidSource)?;
-    let mut cfg = match text(lease.path(), manifest, config::FILE)? {
+    let mut cfg = match text(store, manifest, config::FILE)? {
         Some(s) => config::parse(&s).map_err(|_| PinnedPlanError::InvalidConfig)?,
         None => config::Config::default(),
     };
@@ -234,8 +241,8 @@ pub fn build_frozen_plan_from_source(
             return Err(PinnedPlanError::UnavailablePlanningInput);
         }
         for file in files {
-            let content = text(lease.path(), manifest, &file)?
-                .ok_or(PinnedPlanError::UnavailablePlanningInput)?;
+            let content =
+                text(store, manifest, &file)?.ok_or(PinnedPlanError::UnavailablePlanningInput)?;
             workflows.push(
                 workflow::parse(&file, &content).map_err(|_| PinnedPlanError::InvalidWorkflow)?,
             );
