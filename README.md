@@ -573,3 +573,35 @@ produces no mutants, for example after a rename.
 ## License
 
 MIT
+
+### Executing captured tasks (library)
+
+`source_execute::PinnedExecution` binds a verified frozen plan and source
+manifest once. Actual materialization verifies the captured file objects;
+subsequent setup/task entry guards check the retained plan and root identity,
+without recreating the source. `materialize_workspace` handles directory inputs.
+`materialize_git_workspace` uses the existing Git worktree materialization policy
+at the captured execution commit, from a repository holding the imported bundle.
+
+A worker that already owns materialization can call `verify_workspace` before
+restoring secrets or applying setup. This checks the secret-free payload,
+recursively including captured submodule payloads, and derives Git HEAD/index
+requirements from the manifest: worktree input keeps its original HEAD and
+captured index; commit input keeps the captured commit. A plain directory never
+receives synthetic Git identity. Submodule payload verification does not create
+nested Git administrative directories.
+
+For detached helpers, persist a verified capability with `write_receipt` in a
+`PrivateReceiptDirectory`, opened below the trusted worker-state directory FD
+and the accepted attempt directory. This state must be private and external to
+the project. Recovery uses `restore_workspace` with the accepted attempt and
+generation; it checks the SDK-issued receipt, source/plan binding, every workspace
+path, and the root device/inode while allowing declared setup mutations. These
+receipts share the worker UID trust boundary of accepted attempt records; they
+are not credentials for accepting arbitrary serialized checkouts.
+
+Each capability has independent scripts, matrix copies and container resource
+names, with shared sequence allocation across its setup/task runners. Recovery
+preserves setup tools and install markers while issuing a fresh execution
+namespace. Hosts retain workspace, secret restoration and cleanup ownership via
+`PinnedWorkspaceProvider`.

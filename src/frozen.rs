@@ -37,6 +37,17 @@ pub struct SourceRef {
     pub pinned: Option<crate::source_plan::PinnedIdentity>,
 }
 
+impl SourceRef {
+    /// Receipt identity: Git retains its commit value; captured input is
+    /// explicitly named by its manifest, including dirty and directory input.
+    pub fn receipt_identity(&self) -> Option<String> {
+        match &self.pinned {
+            Some(p) => Some(format!("manifest:{}", p.manifest_digest)),
+            None => self.execution_commit.clone(),
+        }
+    }
+}
+
 /// `.local-ci.toml` as it applied to the plan, plus the workflow directories
 /// that were read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -537,6 +548,36 @@ pub fn derive_job_dag(fp: &FrozenPlan) -> Result<JobGraph> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn receipt_source_identity_distinguishes_captured_bytes_from_git_metadata() {
+        let mut source = super::SourceRef {
+            source_id: "unused".into(),
+            execution_commit: None,
+            base: None,
+            pinned: None,
+        };
+        assert_eq!(source.receipt_identity(), None);
+        source.execution_commit = Some("real-commit".into());
+        assert_eq!(source.receipt_identity().as_deref(), Some("real-commit"));
+        source.pinned = Some(crate::source_plan::PinnedIdentity {
+            kind: crate::source::SourceKind::Directory,
+            manifest_digest: "sha256:fixed".into(),
+            repository_id: None,
+            cwd_relative: crate::source::RelPath::new(""),
+            changed_files_known: false,
+            base_branch: None,
+        });
+        assert_eq!(
+            source.receipt_identity().as_deref(),
+            Some("manifest:sha256:fixed")
+        );
+        source.execution_commit = None;
+        assert_eq!(
+            source.receipt_identity().as_deref(),
+            Some("manifest:sha256:fixed")
+        );
+    }
+
     use super::*;
 
     #[test]

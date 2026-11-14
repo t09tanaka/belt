@@ -518,7 +518,7 @@ fn unsupported_inputs_and_tampered_repository_identity_fail_safely() {
         dirty: false,
     });
     bad = source::seal_manifest(bad);
-    f.error(&bad, &options(), E::UnsupportedSource);
+    f.error(&bad, &options(), E::InvalidSource);
     let mut p = build(&f.store, &m, &options()).unwrap();
     p.repository = Some("owner/other".into());
     p.digest = p.compute_digest().unwrap();
@@ -783,4 +783,31 @@ fn raw_frozen_git_guards_reject_each_independent_invalid_identity() {
         );
         assert!(invalid.verify().is_err(), "case {case}");
     }
+}
+
+#[test]
+fn planning_reads_only_required_objects_and_execution_rejects_unavailable_payload() {
+    let f = Fixture::new(WORKFLOW);
+    std::fs::write(f.root.join("unrelated-payload"), "not a planning input").unwrap();
+    let m = f.capture();
+    let expected = build(&f.store, &m, &options()).unwrap();
+    let entry = m
+        .object_manifest
+        .entries
+        .iter()
+        .find(|entry| entry.path == RelPath::new("unrelated-payload"))
+        .unwrap();
+    std::fs::remove_file(f.store.object_path(&entry.hash)).unwrap();
+    assert_eq!(build(&f.store, &m, &options()).unwrap(), expected);
+    let input = local_ci::source_execute::PinnedExecution::new(&expected, &m, &f.store).unwrap();
+    let area = f._tmp.path().join("execution");
+    assert!(input
+        .materialize_workspace(local_ci::exec::Workspace {
+            root: area.join("root"),
+            repo_root: area.join("repo"),
+            run_dir: area.join("run"),
+            tools: area.join("tools"),
+            lock_file: area.join("lock")
+        })
+        .is_err());
 }

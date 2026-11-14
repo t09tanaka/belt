@@ -22,10 +22,13 @@ mod secret;
 mod store;
 mod transfer;
 
+pub(crate) use capture::check_digest as check_manifest_digest;
 pub use capture::{capture_directory, capture_source, seal_manifest};
 pub use gate::{publishable, SourceInfo};
+pub(crate) use materialize::check_materialization_graph;
 pub use materialize::{
     add_worktree, default_store, materialize_from, materialize_secrets, materialize_source,
+    verify_materialized_from,
 };
 pub use secret::{hmac_sha256, secret_digest, SecretBundle};
 pub use store::{ObjectStore, RelPath};

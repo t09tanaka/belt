@@ -29,6 +29,7 @@ mod script;
 pub mod setup;
 pub mod shard;
 pub mod source;
+pub mod source_execute;
 pub mod source_plan;
 pub mod step_executor;
 pub mod task;
