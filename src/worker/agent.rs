@@ -1295,7 +1295,7 @@ impl Agent {
                 }
                 resolved
             } else {
-                ws.cwd.join(rel)
+                ws.root.join(rel)
             };
             let env = match &self.cfg.capability_profile {
                 Some(profile) => profile.execution_environment(&c.env).map_err(invalid)?,

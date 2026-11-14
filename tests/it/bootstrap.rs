@@ -2845,3 +2845,108 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     }
     shutdown(&load(&spec)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_exec_nested_git_cwd_uses_snapshot_root_and_preserves_in_place() {
+    let (root, mut spec) = fixture();
+    spec.env
+        .insert("PATH".into(), std::env::var("PATH").unwrap());
+    let repo = root.path().join("project");
+    let sub = repo.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    std::fs::write(repo.join("parent.txt"), "root input").unwrap();
+    std::fs::write(sub.join("input.txt"), "committed nested input").unwrap();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+        vec!["add", "."],
+        vec!["commit", "-qm", "nested fixture"],
+    ] {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    std::fs::write(sub.join("input.txt"), "dirty nested input").unwrap();
+    let config = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "schema_version = 1\n[coordinator]\nheartbeat_seconds = 1\nstale_seconds = 3\n",
+    )
+    .unwrap();
+    let retained = config.join("coordinator.json");
+    remote_task_runner::service::bootstrap::write_input(&retained, &spec).unwrap();
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(remote_task_runner::service::bootstrap::daemon_argv(&retained).unwrap())
+        .env_clear()
+        .envs(&spec.env)
+        .kill_on_drop(true)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let client = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "private owner exited early"
+            );
+            if let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) {
+                if let Ok(client) = Client::load(&spec.state_dir, store.cluster_id().clone()) {
+                    if matches!(
+                        client.request(Operation::Ping).await,
+                        Ok(Reply::Ready { .. })
+                    ) {
+                        break client;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let results = async {
+        for in_place in [false, true] {
+            let marker = if in_place { "nested-in-place" } else { "nested-snapshot" };
+            let script = format!("set -eu; test \"$(cat input.txt)\" = 'dirty nested input'; test \"$(cat ../parent.txt)\" = 'root input'; test \"${{PWD##*/}}\" = sub; printf '%s' {marker} > proof.txt; cat proof.txt");
+            let mut command = tokio::process::Command::new(&spec.executable);
+            command.args(["--json", "exec"]);
+            if in_place { command.arg("--in-place"); }
+            let output = tokio::time::timeout(Duration::from_secs(40), command.args(["--", "/bin/sh", "-c", &script]).env_clear().envs(&spec.env).current_dir(&sub).output()).await.map_err(|_| "nested exec timed out".to_string())?.map_err(|e|e.to_string())?;
+            if !output.status.success() { return Err(format!("nested exec failed: {} {}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr))); }
+            let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|e|e.to_string())?;
+            if value["result"]["snapshot"]["in_place"].as_bool().unwrap_or(false) != in_place { return Err("wrong execution mode".into()); }
+            let task = value["result"]["task_id"].as_str().ok_or("missing task id")?;
+            let logs = tokio::process::Command::new(&spec.executable).args(["logs", task]).env_clear().envs(&spec.env).current_dir(&sub).output().await.map_err(|e|e.to_string())?;
+            if !logs.status.success() || !String::from_utf8_lossy(&logs.stdout).contains(marker) { return Err("nested command did not produce its expected collected log".into()); }
+            if in_place {
+                if std::fs::read_to_string(sub.join("proof.txt")).map_err(|e|e.to_string())? != marker { return Err("in-place command did not write in the original subdirectory".into()); }
+            } else if sub.join("proof.txt").exists() { return Err("snapshot command changed the original subdirectory".into()); }
+        }
+        Ok::<_, String>(())
+    }.await;
+    shutdown(&client).await;
+    assert!(child.wait().await.unwrap().success());
+    results.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(sub.join("input.txt")).unwrap(),
+        "dirty nested input"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("parent.txt")).unwrap(),
+        "root input"
+    );
+}
