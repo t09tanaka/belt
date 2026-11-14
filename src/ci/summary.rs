@@ -464,6 +464,13 @@ jobs:
         fp.workflows = vec![fp.workflows[0].clone(); 513];
         assert_eq!(summarize(&fp), Err(PlanError::InputLimit));
         fp = base.clone();
+        fp.shard_groups = vec![fp.shard_groups[0].clone(); 4096];
+        fp.tasks[0].workflow = "/invalid".into();
+        assert_eq!(summarize(&fp), Err(PlanError::InvalidMetadata));
+        fp = base.clone();
+        fp.shard_groups = vec![fp.shard_groups[0].clone(); 4097];
+        assert_eq!(summarize(&fp), Err(PlanError::InputLimit));
+        fp = base.clone();
         fp.schema_version = 0;
         assert!(crate::ci::CiPlan::from_frozen(fp).is_err());
         fp = base.clone();

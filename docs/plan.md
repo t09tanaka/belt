@@ -588,3 +588,8 @@ S15統合 `f94d6f1` の全体ローカルCIは9ジョブ中1成功・7失敗・1
 関連SDK local-ci 0.13.0はPR46、ローカル10項目・リモート10項目を通過し、crate・tag・4対象8配布assetの公開と照合が完了した。0.14開発のDriverは動的展開・worker再検証まで実装し、評価サイズ上限と状態容量境界を修正中。元の独立レビュー担当でproducer確定・permit解放を失わないことを確認してから、既存RunnerのDriver接続、cancel/fence、shard retry、artifact backendへ進む。
 
 setup実測は成功した準備コマンドの観測生成までで、遠隔取得・親側取り込み・推定への接続は未完了。次はowner世代と挿入順で束縛した最大64件の観測page、boot/epochを照合したfollow専用取り込み、元のmonotonic時刻を延長しないTTLを接続する。読み取り専用estimateから履歴を書かない。準備CPU時間を単純なready delayへ足さず、既存TTCの依存nodeと実ledger entryの対応でモデル化する。warmの0は現在のartifact内容・receipt・profileが検証された場合だけに限定し、観測不足や検証budget超過はUnknownを維持する。新しいschedulerは作らない。この接続と資源モデルの検証が済むまでS15f完成とは扱わない。
+
+
+### 新しい純粋ロジックの限定gate
+
+CI計画summaryをcoverage/mutation対象へ登録し、shard group数の4096/4097境界を追加した。限定3テストでcoverage364/364行、mutant40件はcaught39・survived0・timeout0・unviable1。観測page transportは別branchの`6b5a4c1`でcoverage341/341行、mutant34件はcaught32・survived0・timeout0・unviable2、baseline5件成功を独立担当で確認した。どちらも通常閾値を維持した限定結果で、統合全体CIの結果ではない。

@@ -24,6 +24,7 @@ import json, os, sys
 root = os.getcwd()
 data = json.load(open("target/llvm-cov.json"))
 want = {
+    "src/ci/summary.rs",
     "src/outputs.rs",
     "src/toolchain/versions.rs",
     "src/toolchain/declarations.rs",
