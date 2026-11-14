@@ -398,3 +398,41 @@ S20a adds captured version declaration readers and typed scoped requirement /
 immutable baseline APIs. Remaining S20 work: adapter detect/resolve/install/activate,
 private roots and singleflight, frozen submit/admission integration. S21 diff/sync/
 doctor and S22/S23 service acceptance remain required; S20a alone is not S20 completion.
+
+### S15/S20 API の統合確認（2026-11-15）
+
+読み取り専用 command estimate、検証済み実行時間の TTC history 登録、
+source 保持の非削除 roots/guards/index、S20 の宣言・凍結契約と5種の private adapter APIを
+同じ feature branch へ統合した。outputs・capability・toolchain の coverage/mutation 対象は
+和集合を保ち、schema v9 の fence と source store 専用 index の所有を分けた。
+
+通常 snapshot の command cwd は attempt root 相対として解決する。
+nested Git project からの公開 exec と in-place の実行を確認し、元入力と親ディレクトリへの
+アクセス、実際の回収ログ、snapshot が元ファイルへ書かないことを検証した。
+estimate は実 worker の2回の実行から得た履歴を読み、未知の transfer/setup/collection は
+未知のまま表示する。実測 cost の永続化と本配置との共通 model 接続は引き続き必須である。
+履歴の統合 fixture は実 fast-worktree とシステムコマンドだけを PATH に置き、
+無関係な optional manager の起動遅延へ依存しない。通常 profile の probe 最適化は別の残件である。
+
+private adapter の独立レビューで Go の自動 compiler 切替と probe argv を修正し、
+probe/consumer に GOTOOLCHAIN=local、probe に go version を固定した。
+source ごとの契約 binding と実行環境 fingerprint は分離し、consumer の HOME は維持する。
+実 installer を Setups/supervisor/TTC の同一 lifecycle へ接続する S20c、
+TaskSpec/submit/worker の凍結・activation 接続、S21 の diff/sync/doctor はまだ完成していない。
+adapter API だけを理由に自動導入可能とは申告しない。
+
+PR #42 の 21be1ec はローカル実行9ジョブ成功、リモート通常テストの Linux/macOS と
+MSRV 1.89 が成功した。coverage と各 mutation baseline は captured-submit の command 開始前に
+失敗したため、通常テストだけにあった fast-worktree 導入を両ジョブへ追加し、
+terminal failure でも bounded diagnostic と owner drain を実行する。補正後 HEAD を再検証中で、
+リモートの全チェック確認前には統合しない。
+source/Vault の実削除、S16・S18〜S26 の必須実装、Docker 受入・公開は残件として維持する。
+
+統合後の focused 検証は toolchain 42件、source retention 13件、readonly estimate の
+DB全行不変1件、retry source guard 1件、公開 estimate 2件、nested exec 1件、
+captured submit 1件、Forecast 7件、source capture 38件が成功した。
+all-target/all-feature 型検査、strict clippy と fmt も成功。
+captured submit の retry は一度 exit 1 になり、追加した安全な診断付きの再実行では成功した。
+この失敗の原因は未確定であり、全体 CI で再発した場合は診断に基づき解消する。
+通常 profile の eager probe による遅延や一時的な観測差は調査対象として残し、
+focused 成功だけで全体の安定性確認を完了したとは扱わない。

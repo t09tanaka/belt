@@ -854,7 +854,31 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     .await
     .unwrap()
     .unwrap();
-    assert_eq!(report.cli_exit_code, 0);
+    if report.cli_exit_code != 0 {
+        eprintln!("retained retry snapshot: {:?}", report.snapshot);
+        if let Ok(Reply::Task { attempts }) = client
+            .request(Operation::Task {
+                task_id: task.clone(),
+            })
+            .await
+        {
+            let worker =
+                remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
+                    .unwrap();
+            for attempt in attempts.iter().take(8) {
+                diagnose_attempt(&spec, &attempt.attempt_id);
+                for event in worker.events_of_attempt(&attempt.attempt_id, 30).unwrap() {
+                    eprintln!(
+                        "retry event: {} code={:?}",
+                        event.kind,
+                        event.payload.get("code")
+                    );
+                }
+            }
+        }
+        shutdown(&client).await;
+        panic!("retained retry failed");
+    }
     vault.erase(&id).unwrap();
     let unavailable = client
         .request(Operation::Retry {
@@ -3011,9 +3035,22 @@ async fn estimate_offline_100_calls_without_git_leave_db_epoch_and_source_roots_
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn estimate_reads_real_worker_execution_history_through_authenticated_owner() {
-    let (_root, mut spec, repo) = control_fixture();
+    let (root, mut spec, repo) = control_fixture();
+    // This history test needs the real workspace tool, but no optional host
+    // managers. Keep Inspect independent of unrelated tool startup latency.
+    let tool = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+        .map(|path| path.join("fast-worktree"))
+        .find(|path| path.is_file())
+        .expect("real fast-worktree must be installed for this fixture");
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    std::os::unix::fs::symlink(
+        std::fs::canonicalize(tool).unwrap(),
+        bin.join("fast-worktree"),
+    )
+    .unwrap();
     spec.env
-        .insert("PATH".into(), std::env::var("PATH").unwrap());
+        .insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
     let git = |args: &[&str]| {
         let output = Command::new("git")
             .args(args)
