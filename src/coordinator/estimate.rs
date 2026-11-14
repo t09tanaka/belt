@@ -172,7 +172,13 @@ impl Coordinator {
                             worker_id: worker_id.clone(),
                             priority: self.sched.priority_of(&worker_id),
                             load: load.active.saturating_add(load.pending),
-                            costs: decide::Costs::default(),
+                            costs: self.sched.query(
+                                &worker_id,
+                                &scheduler::measured::CostQuery {
+                                    transport: link.cost_transport(),
+                                    ..Default::default()
+                                },
+                            ),
                             outlook,
                         },
                         answer,
@@ -204,8 +210,28 @@ impl Coordinator {
                 Err(reason) => excluded.push(reason),
             }
         }
+        let mut costs: Vec<_> = candidates.iter().map(|c| c.costs).collect();
+        decide::fill_costs(&mut costs);
+        for (candidate, costs) in candidates.iter_mut().zip(costs) {
+            candidate.costs = costs;
+        }
         let decision = decide::decide(candidates, excluded, self.sched.cfg.rules);
-        Ok(crate::service::estimate::Estimate {version:1,online:true,source_kind:"unknown".into(),conditional:true,decision:Some(decision),forecasts,assumptions:vec!["transfer, setup and result collection costs are unknown; no source was captured".into(),"preview is conditional on current worker state and command history; fallback values rank candidates only".into()]})
+        let components = decision
+            .compared
+            .iter()
+            .filter_map(|compared| {
+                let mut costs = self.sched.evidence(
+                    &compared.worker_id,
+                    &scheduler::measured::CostQuery::default(),
+                )?;
+                costs.fallback(&compared.costs);
+                Some(crate::service::estimate::WorkerCostEvidence {
+                    worker_id: compared.worker_id.clone(),
+                    costs,
+                })
+            })
+            .collect();
+        Ok(crate::service::estimate::Estimate {components,version:1,online:true,source_kind:"unknown".into(),conditional:true,decision:Some(decision),forecasts,assumptions:vec!["transfer, setup and result collection costs are unknown; no source was captured".into(),"preview is conditional on current worker state and command history; fallback values rank candidates only".into()]})
     }
 }
 

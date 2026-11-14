@@ -42,6 +42,7 @@ impl Coordinator {
         let one = Arc::new(Arc::clone(&self.collecting).lock_owned().await);
         self.check_fenced()?;
         let collector = Collector::new(Arc::clone(&self.store), Arc::clone(files), cfg)
+            .with_costs(self.sched.model(), self.cost_tails.clone())
             .with_waits(Arc::clone(&self.collect_waits))
             .with_live_waits(Arc::clone(&self.live_log_waits))
             .with_stop(stop)

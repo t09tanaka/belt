@@ -553,3 +553,145 @@ async fn failed_listener_startup_releases_both_owner_and_agent_locks() {
     let client = resident.client();
     stop(&client, tokio::spawn(resident.run())).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resident_records_verified_source_transfer_and_complete_terminal_tail() {
+    resident_measured_fixture(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resident_computation_and_collection_survive_measurement_writer_failure() {
+    resident_measured_fixture(true).await;
+}
+async fn resident_measured_fixture(metrics_fail: bool) {
+    let root = root();
+    let input = inputs(root.path());
+    let state = input.state_dir.clone();
+    let env = input.worker.env.clone();
+    std::fs::create_dir(&state).unwrap();
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let source = root.path().join("source-measured");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("payload"), vec![b'x'; 128 * 1024]).unwrap();
+    let run = RunId::generate();
+    let sources = SourceStore::open(&state).unwrap();
+    let vault = remote_task_runner::secrets::vault::Vault::open(&state).unwrap();
+    let key = remote_task_runner::secrets::key::load(&root.path().join("key")).unwrap();
+    let captured = remote_task_runner::secrets::capture::capture_run(
+        &env,
+        &sources,
+        &vault,
+        &remote_task_runner::secrets::capture::SecretInputs {
+            key: &key,
+            declared: &[],
+        },
+        &run,
+        &SourceRequest::Directory { dir: source },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let manifest = &captured.manifest.manifest_digest;
+    let spec = TaskSpec {
+        outputs: vec![],
+        requirements: Default::default(),
+        in_place: false,
+        setup: None,
+        plan_digest: Digest::of_bytes(b"measured-plan"),
+        manifest_digest: Digest::parse(manifest)
+            .or_else(|_| Digest::parse(&format!("sha256:{manifest}")))
+            .unwrap(),
+        commands: vec![CommandSpec {
+            setup_step: None,
+            node_id: NodeId::parse("main").unwrap(),
+            argv: vec!["/bin/sh".into(), "-c".into(), "cat payload".into()],
+            cwd: String::new(),
+            env: BTreeMap::new(),
+            depends_on: vec![],
+            timeout_ms: None,
+        }],
+        command_timeout_ms: None,
+        deadline_ms: None,
+        resource_wait_timeout_ms: None,
+        has_secret_bundle: false,
+        artifacts: vec![],
+    };
+    let resident = Resident::start(&config(), input).await.unwrap();
+    if metrics_fail {
+        let db = rusqlite::Connection::open(state.join("parent/stats/costs-v1.sqlite")).unwrap();
+        db.execute_batch("CREATE TRIGGER fixture_deny_metrics BEFORE INSERT ON costs BEGIN SELECT RAISE(ABORT,'fixture telemetry writer failure'); END;").unwrap();
+    }
+    let client = resident.client();
+    let runner = tokio::spawn(resident.run());
+    let task = TaskId::generate();
+    let reply = client
+        .request(Operation::SubmitCaptured {
+            run_id: run,
+            source_id: captured.manifest.source_id,
+            tasks: vec![(task.clone(), spec)],
+        })
+        .await
+        .unwrap();
+    assert!(matches!(reply, Reply::Accepted { .. }), "{reply:?}");
+    let attempt = tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            if let Reply::Task { attempts } = client
+                .request(Operation::Task {
+                    task_id: task.clone(),
+                })
+                .await
+                .unwrap()
+            {
+                if let Some(attempt) = attempts
+                    .into_iter()
+                    .find(|a| a.receipts.collected_at_ms.is_some())
+                {
+                    break attempt;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(attempt.termination.unwrap().outcome(), Outcome::Succeeded);
+    // Preview must not create captured sources, admissions or measurement rows.
+    let source_files = std::fs::read_dir(sources.root()).unwrap().count();
+    for _ in 0..(if metrics_fail { 0 } else { 100 }) {
+        let reply = client
+            .request(Operation::Estimate {
+                query: remote_task_runner::service::estimate::Query {
+                    version: 1,
+                    argv: vec!["/bin/true".into()],
+                    repository_id: None,
+                    cwd_relative: String::new(),
+                    requirements: Default::default(),
+                },
+            })
+            .await
+            .unwrap();
+        assert!(matches!(reply, Reply::Estimate { .. }), "{reply:?}");
+    }
+    assert_eq!(
+        std::fs::read_dir(sources.root()).unwrap().count(),
+        source_files
+    );
+    stop(&client, runner).await;
+    let db = rusqlite::Connection::open(state.join("parent/stats/costs-v1.sqlite")).unwrap();
+    let samples: Vec<(String, i64)> = db
+        .prepare("SELECT receipt,duration FROM costs ORDER BY receipt")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    if metrics_fail {
+        assert!(samples.is_empty(), "{samples:?}");
+        return;
+    }
+    assert_eq!(samples.len(), 2, "{samples:?}");
+    assert!(samples
+        .iter()
+        .any(|(receipt, _)| receipt.starts_with("transfer:")));
+    assert!(samples
+        .iter()
+        .any(|(receipt, _)| receipt.starts_with("terminal-tail:")));
+}

@@ -27,6 +27,7 @@ mod estimate;
 mod input_gate;
 mod link;
 pub mod policy;
+mod prefetch;
 
 pub use input_gate::{PlacementInputs, ReadyInput};
 pub use link::{ClientLink, InputGate, LinkError, WorkerLink};
@@ -307,6 +308,7 @@ pub struct Coordinator {
     collecting: Arc<tokio::sync::Mutex<()>>,
     /// The collections that wait before they are tried again.
     collect_waits: Arc<crate::results::collect::Waits>,
+    cost_tails: Arc<scheduler::measured::Tails>,
     live_log_waits: Arc<crate::results::collect::Waits>,
     live_worker_cursor: std::sync::Mutex<Option<WorkerId>>,
     live_log_cursors: std::sync::Mutex<std::collections::BTreeMap<WorkerId, crate::ids::AttemptId>>,
@@ -355,6 +357,7 @@ impl Coordinator {
             actor: tokio::sync::Mutex::new(()),
             collecting: Arc::new(tokio::sync::Mutex::new(())),
             collect_waits: Arc::default(),
+            cost_tails: Arc::default(),
             live_log_waits: Arc::default(),
             live_worker_cursor: std::sync::Mutex::default(),
             live_log_cursors: std::sync::Mutex::default(),
@@ -530,17 +533,32 @@ impl Coordinator {
         .await
     }
 
+    pub(crate) fn clear_prefetch(&self, target: &crate::service::completion::Target) {
+        let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        for link in workers.values() {
+            match target {
+                crate::service::completion::Target::Task(task) => {
+                    link.clear_preference(Some(task), None)
+                }
+                crate::service::completion::Target::Run(run) => {
+                    link.clear_preference(None, Some(run))
+                }
+            }
+        }
+    }
     /// Cancel a task: durable before anything is sent. A queued task is
     /// never placed; a placed one gets the cancel on the next tick, and on
     /// every later one until its worker answered.
     pub async fn cancel_task(&self, task_id: &TaskId) -> Result<Option<AttemptRecord>> {
         self.check_fenced()?;
+        self.clear_prefetch(&crate::service::completion::Target::Task(task_id.clone()));
         let task = task_id.clone();
         self.db(move |s| s.cancel_task(&task, wall_ms())).await
     }
 
     pub async fn cancel_run(&self, run_id: RunId) -> Result<()> {
         self.check_fenced()?;
+        self.clear_prefetch(&crate::service::completion::Target::Run(run_id.clone()));
         self.db(move |s| s.cancel_run(&run_id, wall_ms())).await
     }
 
@@ -1256,6 +1274,18 @@ impl Coordinator {
             }
         };
         let ready = |w: &Reached| readiness(w).is_some();
+        let measured_cold = |w: &Reached| {
+            if spec.in_place || !w.link.cold_eligible(&task.task_id) {
+                return false;
+            }
+            let query = scheduler::measured::CostQuery::task(
+                &task.spec,
+                task.source_id.as_ref().map(|s| s.as_str()),
+                w.link.cost_transport(),
+            );
+            let costs = self.sched.query(&w.worker_id, &query);
+            costs.ms[decide::TRANSFER].is_some() && !costs.assumed[decide::TRANSFER]
+        };
         if !round.open.is_empty() && !round.open.iter().any(&ready) {
             return Ok(());
         }
@@ -1291,8 +1321,11 @@ impl Coordinator {
                     why: *why,
                 })
                 .collect();
-            let (compatible, mismatched): (Vec<&Reached>, Vec<&Reached>) =
-                round.open.iter().filter(|w| ready(w)).partition(|w| {
+            let (compatible, mismatched): (Vec<&Reached>, Vec<&Reached>) = round
+                .open
+                .iter()
+                .filter(|w| ready(w) || measured_cold(w))
+                .partition(|w| {
                     crate::toolchain::capability::missing(
                         &spec.requirements,
                         w.capabilities.as_ref(),
@@ -1319,13 +1352,30 @@ impl Coordinator {
                 .iter()
                 .filter_map(|w| readiness(w).map(|generation| (w.worker_id.clone(), generation)))
                 .collect();
-            let asked: Vec<_> = asked
-                .into_iter()
-                .filter(|w| sessions.contains_key(&w.worker_id))
-                .collect();
+
             let mut costs: Vec<decide::Costs> = asked
                 .iter()
-                .map(|w| self.sched.costs(&w.worker_id, task))
+                .map(|w| {
+                    let mut query = scheduler::measured::CostQuery::task(
+                        &task.spec,
+                        task.source_id.as_ref().map(|s| s.as_str()),
+                        w.link.cost_transport(),
+                    );
+                    query.ready = readiness(w).is_some_and(|generation| generation.is_some());
+                    let mut costs = self.sched.query(&w.worker_id, &query);
+                    // Preserve external injected models' existing task adapter.
+                    let legacy = self.sched.costs(&w.worker_id, task);
+                    for part in 0..3 {
+                        if costs.ms[part].is_none() {
+                            costs.ms[part] = legacy.ms[part];
+                            costs.assumed[part] = legacy.assumed[part];
+                        }
+                    }
+                    costs.transfer_bytes = costs.transfer_bytes.or(legacy.transfer_bytes);
+                    costs.cache_warm = costs.cache_warm.or(legacy.cache_warm);
+                    costs.affinity |= legacy.affinity;
+                    costs
+                })
                 .collect();
             decide::fill_costs(&mut costs);
             let attempt_id = AttemptId::generate();
@@ -1342,6 +1392,7 @@ impl Coordinator {
             let ttl = self.sched.cfg.rules.forecast_ttl_ms;
             let mut candidates = Vec::new();
             let mut silent = Vec::new();
+            let mut forecast_ttl = BTreeMap::new();
             for ((w, c), answer) in asked.iter().zip(&costs).zip(answers) {
                 let outlook = match answer {
                     Forecast::Fenced => return Err(self.fence()),
@@ -1352,6 +1403,11 @@ impl Coordinator {
                     Forecast::Refused => Outlook::unusable(decide::Unusable::Refused),
                     Forecast::Answer(sent, answer) => {
                         let age = now.saturating_duration_since(sent).as_millis();
+                        forecast_ttl.insert(
+                            w.worker_id.clone(),
+                            ttl.min(answer.ttl_ms)
+                                .saturating_sub(u64::try_from(age).unwrap_or(u64::MAX)),
+                        );
                         let asked = Asked {
                             worker_id: &w.worker_id,
                             plan_digest: &spec.plan_digest,
@@ -1366,6 +1422,19 @@ impl Coordinator {
                         )
                     }
                 };
+                // An unusable/expired cold forecast cannot authorize a wait
+                // hint; ready workers retain the existing unknown-outlook rule.
+                if !ready(w)
+                    && (outlook.unusable.is_some()
+                        || forecast_ttl.get(&w.worker_id).copied().unwrap_or(0) == 0)
+                {
+                    excluded.push(Excluded {
+                        worker_id: w.worker_id.clone(),
+                        why: Exclusion::NoForecast,
+                        unmet: vec![],
+                    });
+                    continue;
+                }
                 let load = loads[&w.worker_id];
                 candidates.push(Candidate {
                     worker_id: w.worker_id.clone(),
@@ -1389,6 +1458,29 @@ impl Coordinator {
             let Some(winner) = decision.winner.clone() else {
                 return self.note_waiting(task, &decision).await;
             };
+            if let Some(cold) = round
+                .open
+                .iter()
+                .find(|w| w.worker_id == winner && !ready(w))
+            {
+                let query = scheduler::measured::CostQuery::task(
+                    &task.spec,
+                    task.source_id.as_ref().map(|s| s.as_str()),
+                    cold.link.cost_transport(),
+                );
+                if let Some(expected) = self.sched.query(&winner, &query).ms[decide::TRANSFER] {
+                    if cold.link.prefer(
+                        task,
+                        expected,
+                        forecast_ttl.get(&winner).copied().unwrap_or(0),
+                    ) {
+                        return self.note_waiting(task, &decision).await;
+                    }
+                }
+                // First wait expired while forecasts were in flight. Re-run
+                // the same comparison with that cold candidate suppressed.
+                continue;
+            }
             let Some(limits) = round
                 .open
                 .iter()
@@ -1443,7 +1535,30 @@ impl Coordinator {
             }
             let (t, w, a) = (task.task_id.clone(), winner.clone(), attempt_id.clone());
             let lease_ms = self.cfg.lease_ms;
+            let cost_evidence: Vec<_> = decision
+                .compared
+                .iter()
+                .filter_map(|compared| {
+                    let worker = round
+                        .open
+                        .iter()
+                        .find(|w| w.worker_id == compared.worker_id)?;
+                    let mut query = scheduler::measured::CostQuery::task(
+                        &task.spec,
+                        task.source_id.as_ref().map(|s| s.as_str()),
+                        worker.link.cost_transport(),
+                    );
+                    query.ready = readiness(worker).is_some_and(|generation| generation.is_some());
+                    let mut costs = self.sched.evidence(&compared.worker_id, &query)?;
+                    costs.fallback(&compared.costs);
+                    Some(scheduler::measured::WorkerCostEvidence {
+                        worker_id: compared.worker_id.clone(),
+                        costs,
+                    })
+                })
+                .collect();
             let record = json!({
+                "cost_evidence":cost_evidence,
                 "decision": serde_json::to_value(&decision)
                     .map_err(|e| CoordinatorError::Invalid(e.to_string()))?,
                 "decision_seq": self.sched.next_seq(),
@@ -1461,6 +1576,12 @@ impl Coordinator {
                             let (hash, mut demand) = demand_of(input, lease_ms)?;
                             demand["decision"] = record["decision"].clone();
                             demand["decision_seq"] = record["decision_seq"].clone();
+                            if record["cost_evidence"]
+                                .as_array()
+                                .is_some_and(|e| !e.is_empty())
+                            {
+                                demand["cost_evidence"] = record["cost_evidence"].clone();
+                            }
                             Ok((hash, demand))
                         },
                         wall_ms(),
@@ -1477,6 +1598,9 @@ impl Coordinator {
                     return self.note_unplaceable(task, why).await;
                 }
                 PlaceOutcome::Placed(_) => {
+                    self.clear_prefetch(&crate::service::completion::Target::Task(
+                        task.task_id.clone(),
+                    ));
                     self.sched.clear_waiting(&task.task_id);
                     report.placed.push(attempt_id.clone());
                     let link = round

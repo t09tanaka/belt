@@ -42,7 +42,10 @@ pub struct Estimate {
     pub decision: Option<Decision>,
     pub forecasts: Vec<crate::wire::ForecastResponse>,
     pub assumptions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub components: Vec<WorkerCostEvidence>,
 }
+pub type WorkerCostEvidence = crate::scheduler::measured::WorkerCostEvidence;
 impl Estimate {
     pub fn offline(source_kind: String) -> Self {
         Self {
@@ -52,6 +55,7 @@ impl Estimate {
             conditional: true,
             decision: None,
             forecasts: vec![],
+            components: vec![],
             assumptions: vec![
                 "owner unavailable; runtime, queue, transfer, setup and collection are unknown"
                     .into(),

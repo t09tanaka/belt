@@ -2085,6 +2085,24 @@ struct InputGatedWorker {
     invalidate_forecast: AtomicBool,
 }
 impl WorkerLink for InputGatedWorker {
+    fn cost_transport(&self) -> Option<remote_task_runner::scheduler::measured::Transport> {
+        self.gate.cost_transport()
+    }
+    fn cold_eligible(&self, task: &TaskId) -> bool {
+        self.gate.cold_eligible(task)
+    }
+    fn prefer(
+        &self,
+        task: &remote_task_runner::storage::QueuedTask,
+        expected: u64,
+        ttl: u64,
+    ) -> bool {
+        self.gate.prefer(task, expected, ttl)
+    }
+    fn clear_preference(&self, task: Option<&TaskId>, run: Option<&RunId>) {
+        self.gate.clear_preference(task, run);
+    }
+
     fn placement_fence(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
         Some(self.gate.placement_fence())
     }
@@ -2725,4 +2743,117 @@ async fn capability_filter_runs_before_forecast_and_records_unmet_requirements()
         .unwrap()
         .iter()
         .any(|e| e["why"] == "capability_mismatch" && !e["unmet"].as_array().unwrap().is_empty()));
+}
+
+#[tokio::test]
+async fn measured_cold_choice_waits_without_attempt_then_failed_prefetch_places_healthy_warm() {
+    measured_cold_fixture(true).await;
+}
+#[tokio::test]
+async fn unknown_cold_candidate_keeps_existing_ready_gate_eligibility() {
+    measured_cold_fixture(false).await;
+}
+async fn measured_cold_fixture(known: bool) {
+    use remote_task_runner::scheduler::measured::{CostQuery, MeasuredCosts, Phase, Sample};
+    let mut f = fx();
+    let stats = tempfile::tempdir().unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(stats.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let model = Arc::new(
+        MeasuredCosts::open(
+            &std::fs::canonicalize(stats.path()).unwrap(),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    f.costs = model.clone();
+    let warm = f.worker("warm", (2, 1));
+    let cold = f.worker("cold", (2, 1));
+    warm.set(|s| s.forecasting.run_ms = 100_000);
+    cold.set(|s| s.forecasting.run_ms = 1000);
+    let c = f.open(&[]);
+    let warm_link = Arc::new(InputGatedWorker {
+        worker: warm.clone(),
+        gate: Arc::new(
+            remote_task_runner::coordinator::InputGate::with_transport_policy(
+                "fixture-rpc-v1".into(),
+            ),
+        ),
+        invalidate_forecast: AtomicBool::new(false),
+    });
+    let cold_link = Arc::new(InputGatedWorker {
+        worker: cold.clone(),
+        gate: Arc::new(
+            remote_task_runner::coordinator::InputGate::with_transport_policy(
+                "fixture-rpc-v1".into(),
+            ),
+        ),
+        invalidate_forecast: AtomicBool::new(false),
+    });
+    for link in [&warm_link, &cold_link] {
+        link.gate
+            .observe(WorkerBootId::parse("boot-1").unwrap(), AgentEpoch(1))
+            .await;
+    }
+    c.attach(warm.id.clone(), warm_link.clone()).await;
+    c.attach(cold.id.clone(), cold_link.clone()).await;
+    let tasks = enqueue(&c, 1).await;
+    let task = c.store().queued_tasks(1).unwrap().remove(0);
+    warm_link
+        .gate
+        .publish(warm_link.gate.generation(), ready_input(&task));
+    if known {
+        let query = CostQuery::task(
+            &task.spec,
+            task.source_id.as_ref().map(|s| s.as_str()),
+            cold_link.cost_transport(),
+        );
+        let now = remote_task_runner::platform::monotonic_ms();
+        model.record(
+            Sample::verified(
+                &cold.id,
+                &query,
+                Phase::Transfer,
+                "verified-fixture-exchange".into(),
+                now.saturating_sub(10),
+                10,
+            )
+            .unwrap(),
+        );
+    }
+    model.drain();
+    let report = c.tick().await.unwrap();
+    if known {
+        assert!(report.placed.is_empty());
+        assert!(attempts(&c, &tasks[0]).is_empty());
+        assert_eq!(cold_link.gate.preferred().unwrap().task_id, task.task_id);
+        assert!(cold.count(Op::Forecast) > 0);
+        // A real delivery error suppresses the cold choice; the next normal
+        // scheduler comparison places the healthy ready worker.
+        cold_link.gate.fail_preference(&task.run_id);
+        assert_eq!(c.tick().await.unwrap().placed.len(), 1);
+    } else {
+        assert_eq!(report.placed.len(), 1);
+        assert_eq!(cold.count(Op::Forecast), 0);
+    }
+    assert_eq!(only(&c, &tasks[0]).worker_id, warm.id);
+    let evidence =
+        remote_task_runner::scheduler::cost_evidence_of(c.store(), &only(&c, &tasks[0]).attempt_id)
+            .unwrap()
+            .unwrap();
+    let warm_evidence = &evidence
+        .iter()
+        .find(|e| e.worker_id == warm.id)
+        .unwrap()
+        .costs;
+    assert_eq!(
+        warm_evidence.transfer.kind,
+        remote_task_runner::scheduler::measured::EvidenceKind::VerifiedReady
+    );
+    assert_eq!(warm_evidence.transfer.sample_count, Some(0));
+    assert_eq!(warm_evidence.setup.ms, None);
+    assert!(cold_link.gate.preferred().is_none());
+    assert_eq!(warm.count(Op::Submit), 1);
 }

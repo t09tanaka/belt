@@ -19,21 +19,42 @@ pub(super) struct Lease {
     _local: OwnedMutexGuard<()>,
     _file: File,
     _source: crate::source::retention::Guard,
+    measurable: std::sync::atomic::AtomicBool,
+    started: u64,
 }
 // Retain the existing transfer lease even if cancellation drops the upload
 // future while one bounded blocking read is still finishing.
 struct OwnedUpload {
     file: File,
     _lease: Arc<Lease>,
+    read: u64,
+    size: u64,
 }
 impl std::io::Read for OwnedUpload {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        std::io::Read::read(&mut self.file, buf)
+        let count = std::io::Read::read(&mut self.file, buf)?;
+        self.read = self.read.saturating_add(count as u64);
+        Ok(count)
+    }
+}
+impl Drop for OwnedUpload {
+    fn drop(&mut self) {
+        if self.read != self.size {
+            self._lease
+                .measurable
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 impl std::io::Seek for OwnedUpload {
     fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
-        std::io::Seek::seek(&mut self.file, from)
+        let offset = std::io::Seek::seek(&mut self.file, from)?;
+        if !matches!(from, std::io::SeekFrom::End(0)) && offset != self.read {
+            self._lease
+                .measurable
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(offset)
     }
 }
 async fn stopped(stop: &mut watch::Receiver<bool>) {
@@ -76,6 +97,8 @@ async fn put_file(
     let reader = OwnedUpload {
         file: upload.file,
         _lease: lease,
+        read: 0,
+        size: upload.size,
     };
     let answer = tokio::select! {
         biased;
@@ -150,11 +173,13 @@ pub(super) async fn lease(
         _local: ownership,
         _file: file,
         _source: source,
+        measurable: std::sync::atomic::AtomicBool::new(true),
+        started: crate::platform::monotonic_ms(),
     }))
 }
 
-/// Retrying uses only the run-bound store and never captures the original again.
-pub async fn source(
+/// Returns the verified phase origin after both local and file ownership leases.
+pub(super) async fn source_timed(
     client: &Client,
     epoch: CoordinatorEpoch,
     store: SourceStore,
@@ -162,11 +187,13 @@ pub async fn source(
     env: BTreeMap<String, String>,
     mut stop: watch::Receiver<bool>,
     ownership: OwnedMutexGuard<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<u64>> {
     let lease = lease(&store, &mut stop, ownership).await?;
+    let started = lease.started;
     let outcome = source_inner(client, epoch, &store, source, env, &mut stop, &lease).await;
     // Do not abort the worker on request cancellation: an exporter already on a
     // blocking thread must finish before cleanup. Neither job owns CoordinatorStore.
+    let trace = lease.clone();
     let clean = store.clone();
     let lease = lease.clone();
     if let Some(id) = crate::source::classify::ci_id_of(source) {
@@ -176,7 +203,12 @@ pub async fn source(
         })
         .await??;
     }
-    outcome
+    outcome.map(|_| {
+        trace
+            .measurable
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .then_some(started)
+    })
 }
 async fn source_inner(
     client: &Client,
@@ -202,12 +234,20 @@ async fn source_inner(
     .await??;
     check_stop(stop)?;
     if verify(client, source, stop).await?.ready {
+        lease
+            .measurable
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         return Ok(());
     }
     // The wire requires the root manifest first; remaining manifests are its closure.
     // Secrets are metadata only.
     for item in closure.iter().rev() {
         let bytes = serde_json::to_vec(item)?;
+        if bytes.len() > 64 * 1024 {
+            lease
+                .measurable
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         put(
             client,
             epoch,
@@ -255,6 +295,7 @@ async fn source_inner(
             if response.ready { return Ok(()); }
             anyhow::ensure!(response.bundle_needed, "source verification did not request a bundle");
             let have = response.have.into_iter().flat_map(|h| h.commits).collect::<Vec<_>>();
+            if !have.is_empty() {lease.measurable.store(false,std::sync::atomic::Ordering::Relaxed);}
             let read = store.clone(); let manifest = manifest.clone(); let env = env.clone();
             let ownership=lease.clone(); let cancellation=stop.clone();
             let upload = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -280,4 +321,120 @@ async fn source_inner(
         Ok(())
     }.await;
     outcome
+}
+
+#[cfg(test)]
+mod measured_tests {
+    use super::*;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    async fn upload() -> (tempfile::TempDir, Arc<Lease>, OwnedUpload) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = SourceStore::open(dir.path()).unwrap();
+        let local = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let lease = Arc::new(Lease {
+            _local: local,
+            _file: tempfile::tempfile().unwrap(),
+            _source: source.mutation_guard().unwrap(),
+            measurable: std::sync::atomic::AtomicBool::new(true),
+            started: crate::platform::monotonic_ms(),
+        });
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"abcdefgh").unwrap();
+        let reader = OwnedUpload {
+            file,
+            _lease: lease.clone(),
+            read: 0,
+            size: 8,
+        };
+        (dir, lease, reader)
+    }
+    #[tokio::test]
+    async fn contiguous_chunks_with_size_probes_are_complete_but_resume_is_unknown() {
+        let (_dir, lease, mut reader) = upload().await;
+        let mut bytes = [0; 4];
+        assert_eq!(reader.seek(SeekFrom::End(0)).unwrap(), 8);
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut bytes).unwrap();
+        reader.seek(SeekFrom::End(0)).unwrap();
+        reader.seek(SeekFrom::Start(4)).unwrap();
+        reader.read_exact(&mut bytes).unwrap();
+        drop(reader);
+        assert!(lease.measurable.load(std::sync::atomic::Ordering::Relaxed));
+        let (_dir, lease, mut reader) = upload().await;
+        reader.seek(SeekFrom::Start(4)).unwrap();
+        reader.read_exact(&mut bytes).unwrap();
+        drop(reader);
+        assert!(!lease.measurable.load(std::sync::atomic::Ordering::Relaxed));
+        let (_dir, lease, mut reader) = upload().await;
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        reader.read_exact(&mut bytes).unwrap();
+        drop(reader);
+        assert!(!lease.measurable.load(std::sync::atomic::Ordering::Relaxed));
+    }
+}
+
+#[cfg(test)]
+mod measured_lease_tests {
+    use super::*;
+    #[tokio::test]
+    async fn phase_origin_excludes_local_and_file_ownership_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SourceStore::open(dir.path()).unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(store.root().join("transfer.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let local = Arc::new(tokio::sync::Mutex::new(()));
+        let blocked = local.clone().lock_owned().await;
+        let (_keep_alive, mut stop) = watch::channel(false);
+        let before = crate::platform::monotonic_ms();
+        let mut job = tokio::spawn(async move {
+            let ownership = local.lock_owned().await;
+            lease(&store, &mut stop, ownership).await
+        });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!job.is_finished());
+        drop(blocked);
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!job.is_finished());
+        let released = crate::platform::monotonic_ms();
+        drop(lock);
+        let acquired = tokio::time::timeout(Duration::from_secs(1), &mut job)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(acquired.started >= released);
+        assert!(acquired.started.saturating_sub(before) >= 50);
+    }
+    #[tokio::test]
+    async fn cancelled_ownership_wait_has_no_measurement_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SourceStore::open(dir.path()).unwrap();
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(store.root().join("transfer.lock"))
+            .unwrap();
+        lock.try_lock().unwrap();
+        let ownership = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
+        let (cancel, mut stop) = watch::channel(false);
+        let job = tokio::spawn(async move { lease(&store, &mut stop, ownership).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!job.is_finished());
+        cancel.send(true).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), job)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err());
+    }
 }
