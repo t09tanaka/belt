@@ -531,8 +531,10 @@ printf 'git version 2.50.0\n'
             events: libc::POLLIN,
             revents: 0,
         };
-        // Both readiness observation and the executor's response are bounded.
-        let observed = unsafe { libc::poll(&mut poll, 1, 5_000) } == 1;
+        // Git may start after other native probes under instrumentation. Match
+        // bootstrap's 20-second startup budget for reaching the gate; only the
+        // separate five-second response below measures executor responsiveness.
+        let observed = unsafe { libc::poll(&mut poll, 1, 20_000) } == 1;
         let mut message = [0; 6];
         let observed = observed && ready.read_exact(&mut message).is_ok() && message == *b"ready\n";
         let progressed = observed
