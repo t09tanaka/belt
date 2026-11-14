@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
@@ -61,6 +62,15 @@ pub struct Profile {
     definition: Definition,
     env: BTreeMap<String, String>,
     digest: Digest,
+    report_identity: Arc<Mutex<Option<ReportIdentity>>>,
+}
+
+#[derive(Clone)]
+struct ReportIdentity {
+    files: Digest,
+    context: Digest,
+    fingerprint: Digest,
+    tools: BTreeMap<String, ToolObservation>,
 }
 
 impl std::fmt::Debug for Profile {
@@ -229,6 +239,7 @@ impl Profile {
             definition,
             env,
             digest,
+            report_identity: Arc::new(Mutex::new(None)),
         };
         for tool in &profile.definition.required_tools {
             if !matches!(profile.probe(tool), ToolObservation::Available { .. }) {
@@ -276,6 +287,7 @@ impl Profile {
     /// registered optional tools, bounded to 14 fixed calls ×
     /// 300ms, and no source command or script can be supplied over the wire.
     pub fn report(&self) -> WorkerCapabilities {
+        let files_before = self.executable_identity();
         let tools: BTreeMap<_, _> = TOOLS
             .iter()
             .map(|t| (t.to_string(), self.probe(t)))
@@ -297,6 +309,16 @@ impl Profile {
                     .ok()
                     .map(|m| (path, m.dev(), m.ino(), m.len(), m.mtime(), m.mtime_nsec()))
             });
+        let context = Digest::of_bytes(
+            &serde_json::to_vec(&(
+                &shell_identity,
+                &self.digest,
+                &os,
+                &arch,
+                rustix::process::geteuid().as_raw(),
+            ))
+            .expect("profile context serializes"),
+        );
         let bytes = serde_json::to_vec(&(
             &shell_identity,
             &self.digest,
@@ -306,6 +328,48 @@ impl Profile {
             &tools,
         ))
         .expect("profile report serializes");
+        let files = self.executable_identity();
+        let observed_fingerprint = Digest::of_bytes(
+            &serde_json::to_vec(&(&bytes, &files_before, &files))
+                .expect("profile identity serializes"),
+        );
+        // Probe failure is a current capability observation, not proof that the
+        // execution profile changed. Keep the startup identity only while the
+        // executable files and every positive observation still agree. Never
+        // substitute a remembered success into the published tools map.
+        let profile_fingerprint = match self.report_identity.lock() {
+            Ok(mut retained) => {
+                let baseline = retained.get_or_insert_with(|| ReportIdentity {
+                    files: files.clone(),
+                    context: context.clone(),
+                    fingerprint: observed_fingerprint.clone(),
+                    tools: tools.clone(),
+                });
+                let unchanged = files_before == files
+                    && baseline.files == files
+                    && baseline.context == context
+                    && tools.iter().all(|(tool, observed)| {
+                        baseline.tools.get(tool).is_some_and(|initial| {
+                            observed == initial
+                                || matches!(
+                                    (initial, observed),
+                                    (ToolObservation::Available { .. }, ToolObservation::Unknown)
+                                )
+                        })
+                    });
+                if unchanged {
+                    baseline.fingerprint.clone()
+                } else {
+                    // Domain separation also invalidates drift if the raw
+                    // observation happens to equal the original report again.
+                    Digest::of_bytes(
+                        &serde_json::to_vec(&("profile_drift", &observed_fingerprint))
+                            .expect("profile drift serializes"),
+                    )
+                }
+            }
+            Err(_) => Digest::of_bytes(b"profile identity unavailable"),
+        };
         WorkerCapabilities {
             disk_free_bytes: None,
             resource_budget: None,
@@ -316,10 +380,50 @@ impl Profile {
             profile_digest: self.digest.clone(),
             execution_uid: rustix::process::geteuid().as_raw(),
             protocol_versions: vec![1],
-            profile_fingerprint: Digest::of_bytes(&bytes),
+            profile_fingerprint,
             tools,
             features: FEATURES.iter().map(|v| v.to_string()).collect(),
         }
+    }
+    /// Resolve the same PATH candidates as the probes without executing them.
+    /// ctime/mode catch replacement or permission changes even if mtime is kept.
+    fn executable_identity(&self) -> Digest {
+        type FileIdentity = (PathBuf, u64, u64, u64, i64, i64, i64, i64, u32);
+        fn identity(path: &Path) -> Option<FileIdentity> {
+            let real = fs::canonicalize(path).ok()?;
+            let m = fs::metadata(&real).ok()?;
+            Some((
+                real,
+                m.dev(),
+                m.ino(),
+                m.len(),
+                m.mtime(),
+                m.mtime_nsec(),
+                m.ctime(),
+                m.ctime_nsec(),
+                m.mode(),
+            ))
+        }
+        let tools: BTreeMap<_, _> = TOOLS
+            .iter()
+            .copied()
+            .chain(["xcrun"])
+            .map(|tool| {
+                let binary = if tool == "xcode" { "xcodebuild" } else { tool };
+                let file = self
+                    .definition
+                    .path
+                    .iter()
+                    .map(|p| p.join(binary))
+                    .find(|p| executable(p))
+                    .and_then(|p| identity(&p));
+                (tool, file)
+            })
+            .collect();
+        Digest::of_bytes(
+            &serde_json::to_vec(&(identity(self.shell()), tools))
+                .expect("executable identity serializes"),
+        )
     }
     fn probe(&self, tool: &str) -> ToolObservation {
         let binary = if tool == "xcode" { "xcodebuild" } else { tool };
@@ -612,6 +716,72 @@ mod tests {
         write_profile(a.path(), "absent", "");
         assert!(Profile::load(a.path(), &env(a.path())).is_err());
     }
+    #[test]
+    fn transient_unknown_preserves_identity_without_claiming_availability() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("probe-mode");
+        fake(root.path(), "node", &format!(
+            "case $(/bin/cat {marker:?} 2>/dev/null) in timeout) /bin/sleep 2;; changed) echo v20.0.0;; *) echo v22.0.0;; esac"
+        ), 0o700);
+        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        let initial = profile.report();
+        assert!(matches!(
+            initial.tools["node"],
+            ToolObservation::Available { .. }
+        ));
+        fs::write(&marker, "timeout").unwrap();
+        let unknown = profile.report();
+        assert_eq!(unknown.tools["node"], ToolObservation::Unknown);
+        assert_eq!(unknown.profile_fingerprint, initial.profile_fingerprint);
+        let required =
+            super::super::capability::ExecutionRequirements::parse(None, &["node".into()]).unwrap();
+        assert!(!super::super::capability::missing_with_installable(
+            &required,
+            Some(&unknown),
+            None
+        )
+        .is_empty());
+        fs::write(&marker, "changed").unwrap();
+        assert_ne!(
+            profile.report().profile_fingerprint,
+            initial.profile_fingerprint
+        );
+        fs::remove_file(&marker).unwrap();
+        assert_eq!(
+            profile.report().profile_fingerprint,
+            initial.profile_fingerprint
+        );
+        fake(root.path(), "node", "echo v22.0.0", 0o700);
+        assert_ne!(
+            profile.report().profile_fingerprint,
+            initial.profile_fingerprint
+        );
+    }
+
+    #[test]
+    fn initially_unknown_probe_requires_new_identity_when_it_becomes_known() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("probe-mode");
+        fake(root.path(), "node", &format!(
+            "case $(/bin/cat {marker:?} 2>/dev/null) in known) echo v22.0.0;; changed) echo v20.0.0;; *) exit 1;; esac"
+        ), 0o700);
+        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        let initial = profile.report();
+        assert_eq!(initial.tools["node"], ToolObservation::Unknown);
+        fs::write(&marker, "known").unwrap();
+        let recovered = profile.clone().report();
+        assert!(matches!(
+            recovered.tools["node"],
+            ToolObservation::Available { .. }
+        ));
+        assert_ne!(recovered.profile_fingerprint, initial.profile_fingerprint);
+        fs::write(&marker, "changed").unwrap();
+        assert_ne!(
+            profile.report().profile_fingerprint,
+            initial.profile_fingerprint
+        );
+    }
+
     #[test]
     fn probe_failures_and_docker_info_are_not_available() {
         let root = tempfile::tempdir().unwrap();
