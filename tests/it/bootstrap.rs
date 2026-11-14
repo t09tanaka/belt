@@ -1935,3 +1935,130 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
         "output reader leaked a temporary file"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_outputs_retained_corruption_is_internal_before_publication() {
+    use remote_task_runner::ids::{AttemptId, Digest, RunId, SourceId, TaskId};
+    use remote_task_runner::results::ResultStore;
+    use remote_task_runner::state::{AttemptState, Outcome, Termination};
+    use remote_task_runner::storage::{ArtifactReceipt, NewAttempt};
+    use remote_task_runner::wire::{ArtifactEncoding, ArtifactRecord};
+    let mut builder = tar::Builder::new(Vec::new());
+    for path in ["ordinary", "nested/.GiT/config"] {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, path, b"x".as_slice())
+            .unwrap();
+    }
+    let reserved = builder.into_inner().unwrap();
+    let mut checksum = reserved.clone();
+    checksum[0] ^= 1;
+    for bytes in [reserved, checksum, vec![0; 511]] {
+        let (root, spec, _) = control_fixture();
+        let db = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+        let run = RunId::generate();
+        let task = TaskId::generate();
+        let attempt = AttemptId::generate();
+        db.create_run(&run, None, None, &serde_json::json!({}), 1)
+            .unwrap();
+        db.create_task(&task, &run, &serde_json::json!({}), 1)
+            .unwrap();
+        db.create_attempt(
+            NewAttempt {
+                attempt_id: attempt.clone(),
+                task_id: task.clone(),
+                worker_id: spec.worker_id.clone(),
+                payload_hash: Digest::of_bytes(b"payload"),
+                permit_id: None,
+            },
+            2,
+        )
+        .unwrap();
+        for state in [
+            AttemptState::Preparing,
+            AttemptState::Ready,
+            AttemptState::Starting,
+            AttemptState::Active,
+            AttemptState::Finalizing,
+        ] {
+            db.transition_attempt(&attempt, state, 3).unwrap();
+        }
+        db.finalize_attempt(
+            &attempt,
+            Termination::new(Outcome::Succeeded, None, None).unwrap(),
+            4,
+        )
+        .unwrap();
+        let artifact = ArtifactRecord {
+            encoding: ArtifactEncoding::TarV1,
+            name: "bundle".into(),
+            path: "PRIVATE_DECLARATION_SENTINEL".into(),
+            size: bytes.len() as u64,
+            digest: Digest::of_bytes(&bytes),
+            source_id: SourceId::generate(),
+            plan_digest: Digest::of_bytes(b"plan"),
+            attempt_id: attempt.clone(),
+            profile_fingerprint: Digest::of_bytes(b"profile"),
+        };
+        db.begin_collection(
+            &attempt,
+            &Digest::of_bytes(b"result"),
+            &serde_json::json!({"artifacts":[artifact.clone()]}),
+            &[(artifact.name.clone(), true)],
+            &[],
+            5,
+        )
+        .unwrap();
+        db.record_artifact(
+            &ArtifactReceipt {
+                attempt_id: attempt.clone(),
+                name: artifact.name.clone(),
+                rel_path: artifact.path.clone(),
+                size: artifact.size,
+                digest: artifact.digest.clone(),
+                source_id: artifact.source_id.clone(),
+                plan_digest: artifact.plan_digest.clone(),
+                profile_fingerprint: artifact.profile_fingerprint.to_string(),
+            },
+            6,
+        )
+        .unwrap();
+        let store = ResultStore::open(&spec.state_dir.join("results")).unwrap();
+        store
+            .append_part(&attempt, &artifact.digest, 0, &bytes)
+            .unwrap();
+        store
+            .publish_artifact(&attempt, &artifact.digest, artifact.size)
+            .unwrap();
+        drop(store);
+        drop(db);
+        let destination = root.path().join("exported");
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            tokio::process::Command::new(&spec.executable)
+                .args(["--json", "outputs", task.as_str(), "--dir"])
+                .arg(&destination)
+                .env_clear()
+                .envs(&spec.env)
+                .env("PATH", "/no-programs")
+                .current_dir(root.path())
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(79),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.contains("INTERNAL"), "{text}");
+        assert!(!text.contains("PRIVATE_DECLARATION_SENTINEL"));
+        assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+    }
+}

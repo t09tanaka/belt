@@ -444,7 +444,7 @@ mod tests {
             let artifact = ArtifactRecord {
                 encoding: ArtifactEncoding::Raw,
                 name: "raw".into(),
-                path: "raw".into(),
+                path: "PRIVATE_DECLARATION_SENTINEL".into(),
                 size: 3,
                 digest: Digest::of_bytes(b"raw"),
                 source_id: SourceId::generate(),
@@ -613,6 +613,32 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+        let page = f.db.query_output_metadata(&f.attempt, None, 64).unwrap();
+        let public = serde_json::to_value(&page).unwrap();
+        let record = public["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|item| item["record"].as_object())
+            .unwrap();
+        assert_eq!(
+            record
+                .keys()
+                .map(String::as_str)
+                .collect::<std::collections::BTreeSet<_>>(),
+            std::collections::BTreeSet::from(["digest", "encoding", "name", "size"])
+        );
+        let encoded = public.to_string();
+        for private in [
+            "PRIVATE_DECLARATION_SENTINEL",
+            "path",
+            "source_id",
+            "plan_digest",
+            "profile_fingerprint",
+            "attempt_id",
+        ] {
+            assert!(!encoded.contains(private), "{private}");
+        }
         let mut out = Vec::new();
         let mut err = Vec::new();
         let (summary, error) = f
@@ -626,6 +652,7 @@ mod tests {
         assert_eq!(error, None);
         let text = String::from_utf8(out).unwrap();
         assert!(!text.contains("DO_NOT_EMIT_DECLARATION_PATH"));
+        assert!(!text.contains("PRIVATE_DECLARATION_SENTINEL"));
         assert!(text.contains("COMMAND_FAILED"));
         assert!(text.contains("not_stored"));
     }

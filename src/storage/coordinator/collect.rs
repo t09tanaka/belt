@@ -344,7 +344,9 @@ impl CoordinatorStore {
                             "artifact receipt differs from immutable result".into(),
                         ));
                     }
-                    Output::Artifact { record: artifact }
+                    Output::Artifact {
+                        record: artifact.into(),
+                    }
                 } else {
                     Output::Pending { name: name.clone() }
                 };

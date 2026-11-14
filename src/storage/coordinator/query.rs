@@ -16,12 +16,30 @@ pub struct Run {
     pub task_count: u64,
     pub facts: RunFacts,
 }
+/// Public immutable export metadata. Execution identities and declaration paths stay private.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Artifact {
+    pub name: String,
+    pub encoding: crate::wire::ArtifactEncoding,
+    pub digest: crate::ids::Digest,
+    pub size: u64,
+}
+impl From<crate::wire::ArtifactRecord> for Artifact {
+    fn from(record: crate::wire::ArtifactRecord) -> Self {
+        Self {
+            name: record.name,
+            encoding: record.encoding,
+            digest: record.digest,
+            size: record.size,
+        }
+    }
+}
 /// Bounded public output facts. Declaration paths and execution inputs are omitted.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "availability", rename_all = "snake_case")]
 pub enum Output {
     Artifact {
-        record: crate::wire::ArtifactRecord,
+        record: Artifact,
     },
     Pending {
         name: String,

@@ -1,6 +1,7 @@
 //! Safe opaque-output export. Full bundle preflight precedes any destination write.
 use crate::error::{ApiError, ErrorCode};
-use crate::wire::{ArtifactEncoding, ArtifactRecord};
+use crate::storage::query::Artifact;
+use crate::wire::ArtifactEncoding;
 use rustix::fs::{mkdirat, open, openat, unlinkat, AtFlags, Mode, OFlags};
 use sha2::{Digest as _, Sha256};
 use std::collections::BTreeMap;
@@ -35,16 +36,16 @@ struct Member {
     size: u64,
 }
 impl Bundle {
-    pub fn verify(source: File, artifact: &ArtifactRecord) -> Result<Self, ApiError> {
+    pub fn verify(source: File, artifact: &Artifact) -> Result<Self, ApiError> {
         Self::verify_cancellable(source, artifact, &AtomicBool::new(false))
     }
     pub fn verify_cancellable(
         mut source: File,
-        artifact: &ArtifactRecord,
+        artifact: &Artifact,
         cancelled: &AtomicBool,
     ) -> Result<Self, ApiError> {
         if artifact.size > crate::outputs::MAX_BUNDLE_BYTES {
-            return Err(invalid("output exceeds bundle limit"));
+            return Err(internal("output exceeds bundle limit"));
         }
         let mut file = tempfile::tempfile().map_err(internal)?;
         let mut hash = Sha256::new();
@@ -92,18 +93,18 @@ impl Bundle {
         let mut end = 0;
         {
             let mut archive = tar::Archive::new(&mut *file);
-            for entry in archive.entries().map_err(invalid)?.raw(true) {
+            for entry in archive.entries().map_err(internal)?.raw(true) {
                 if cancelled.load(Ordering::Relaxed) {
                     return Err(internal("export detached"));
                 }
-                let mut entry = entry.map_err(invalid)?;
+                let mut entry = entry.map_err(internal)?;
                 let length = entry.size();
                 let offset = entry.raw_file_position();
                 let kind = entry.header().entry_type();
                 let gnu = entry
                     .header()
                     .as_gnu()
-                    .ok_or_else(|| invalid("tar_v1 requires GNU headers"))?;
+                    .ok_or_else(|| internal("tar_v1 requires GNU headers"))?;
                 if gnu.is_extended()
                     || gnu.realsize.iter().any(|b| *b != 0)
                     || gnu
@@ -112,7 +113,7 @@ impl Bundle {
                         .any(|s| s.offset.iter().chain(&s.numbytes).any(|b| *b != 0))
                     || gnu.linkname.iter().any(|b| *b != 0)
                 {
-                    return Err(invalid("unsupported GNU sparse/link metadata"));
+                    return Err(internal("unsupported GNU sparse/link metadata"));
                 }
                 if kind.is_gnu_longname() {
                     if long.is_some()
@@ -120,32 +121,38 @@ impl Bundle {
                         || length > (crate::outputs::MAX_PATH_BYTES + 1) as u64
                         || entry.path_bytes().as_ref() != b"././@LongLink"
                     {
-                        return Err(invalid("invalid GNU long name"));
+                        return Err(internal("invalid GNU long name"));
                     }
                     let mut bytes = Vec::with_capacity(length as usize);
-                    entry.read_to_end(&mut bytes).map_err(invalid)?;
+                    entry.read_to_end(&mut bytes).map_err(internal)?;
                     if bytes.len() as u64 != length || bytes.pop() != Some(0) || bytes.contains(&0)
                     {
-                        return Err(invalid("invalid GNU long name bytes"));
+                        return Err(internal("invalid GNU long name bytes"));
                     }
-                    long = Some(String::from_utf8(bytes).map_err(invalid)?);
+                    long = Some(String::from_utf8(bytes).map_err(internal)?);
                 } else {
                     if !kind.is_file()
                         || kind.as_byte() != b'0'
                         || length > crate::outputs::MAX_BUNDLE_BYTES
                         || members.len() == crate::outputs::MAX_FILES
                     {
-                        return Err(invalid("unsupported tar member or limit exceeded"));
+                        return Err(internal("unsupported tar member or limit exceeded"));
                     }
                     let path = match long.take() {
                         Some(path) => path,
                         None => std::str::from_utf8(&entry.path_bytes())
-                            .map_err(invalid)?
+                            .map_err(internal)?
                             .to_owned(),
                     };
-                    if !crate::outputs::valid_path(&path) || path.split('/').any(|c| c.len() > 255)
+                    if !crate::outputs::valid_path(&path)
+                        || path.split('/').any(|c| {
+                            c.len() > 255
+                                || crate::outputs::RESERVED_COMPONENTS.contains(
+                                    &crate::source::safety::fold_path(c.as_bytes()).as_slice(),
+                                )
+                        })
                     {
-                        return Err(invalid("unsafe tar member path"));
+                        return Err(internal("unsafe tar member path"));
                     }
                     let components: Vec<_> = path.split('/').collect();
                     for i in 1..=components.len() {
@@ -157,16 +164,16 @@ impl Bundle {
                         let leaf = i == components.len();
                         if let Some((old, old_leaf)) = seen.get(&folded) {
                             if old != &spelling || *old_leaf || leaf {
-                                return Err(invalid("duplicate/case/prefix tar collision"));
+                                return Err(internal("duplicate/case/prefix tar collision"));
                             }
                         } else {
                             seen.insert(folded, (spelling, leaf));
                         }
                     }
                     let copied =
-                        std::io::copy(&mut entry, &mut std::io::sink()).map_err(invalid)?;
+                        std::io::copy(&mut entry, &mut std::io::sink()).map_err(internal)?;
                     if copied != length {
-                        return Err(invalid("short tar member"));
+                        return Err(internal("short tar member"));
                     }
                     members.push(Member {
                         path,
@@ -176,14 +183,14 @@ impl Bundle {
                 }
                 end = offset
                     .checked_add(length.div_ceil(512) * 512)
-                    .ok_or_else(|| invalid("tar offset overflow"))?;
+                    .ok_or_else(|| internal("tar offset overflow"))?;
                 if end > size {
-                    return Err(invalid("truncated tar member"));
+                    return Err(internal("truncated tar member"));
                 }
             }
         }
         if members.is_empty() || long.is_some() || size < end + 1024 || !size.is_multiple_of(512) {
-            return Err(invalid("missing tar terminator"));
+            return Err(internal("missing tar terminator"));
         }
         file.seek(SeekFrom::Start(end)).map_err(internal)?;
         let mut buffer = [0; 65536];
@@ -196,7 +203,7 @@ impl Bundle {
                 break;
             }
             if buffer[..n].iter().any(|b| *b != 0) {
-                return Err(invalid("trailing tar garbage"));
+                return Err(internal("trailing tar garbage"));
             }
         }
         Ok(members)
@@ -329,19 +336,14 @@ pub fn destination(path: &Path) -> Result<File, ApiError> {
 mod tests {
     use super::*;
     use crate::ids::*;
-    use crate::wire::ArtifactRecord;
+
     use std::os::unix::fs::{symlink, PermissionsExt};
-    fn record(bytes: &[u8], encoding: ArtifactEncoding) -> ArtifactRecord {
-        ArtifactRecord {
+    fn record(bytes: &[u8], encoding: ArtifactEncoding) -> Artifact {
+        Artifact {
             encoding,
             name: "bundle".into(),
-            path: "bundle".into(),
             size: bytes.len() as u64,
             digest: Digest::of_bytes(bytes),
-            source_id: SourceId::generate(),
-            plan_digest: Digest::of_bytes(b"plan"),
-            attempt_id: AttemptId::generate(),
-            profile_fingerprint: Digest::of_bytes(b"profile"),
         }
     }
     fn verify(bytes: &[u8], encoding: ArtifactEncoding) -> Result<Bundle, ApiError> {
@@ -487,20 +489,66 @@ mod tests {
             ],
         ] {
             assert!(
-                verify(&tar(&entries), ArtifactEncoding::TarV1).is_err(),
+                verify(&tar(&entries), ArtifactEncoding::TarV1)
+                    .err()
+                    .unwrap()
+                    .code
+                    == ErrorCode::Internal,
                 "{entries:?}"
             );
         }
         let bytes = tar(&[("a", b"x", b'0')]);
         for len in [0, 511, 512, 1023, 1535] {
-            assert!(verify(&bytes[..len], ArtifactEncoding::TarV1).is_err());
+            assert_eq!(
+                verify(&bytes[..len], ArtifactEncoding::TarV1)
+                    .err()
+                    .unwrap()
+                    .code,
+                ErrorCode::Internal
+            );
         }
         let mut garbage = bytes.clone();
         *garbage.last_mut().unwrap() = 1;
-        assert!(verify(&garbage, ArtifactEncoding::TarV1).is_err());
+        assert_eq!(
+            verify(&garbage, ArtifactEncoding::TarV1)
+                .err()
+                .unwrap()
+                .code,
+            ErrorCode::Internal
+        );
         let mut bad = bytes;
         bad[0] ^= 1;
-        assert!(verify(&bad, ArtifactEncoding::TarV1).is_err());
+        assert_eq!(
+            verify(&bad, ArtifactEncoding::TarV1).err().unwrap().code,
+            ErrorCode::Internal
+        );
+    }
+    #[test]
+    fn reserved_members_are_corruption_before_any_publication() {
+        for path in [
+            ".git/config",
+            "a/.git/config",
+            ".remote-task-runner/token",
+            "a/.remote-task-runner/token",
+            "a/.GiT/config",
+            "a/.g\u{200d}it/config",
+            "a/.remote-task-runner\u{feff}/token",
+            "a/.REMOTE-TASK-RUNNER/token",
+        ] {
+            // A valid member preceding the malicious member must not become visible.
+            let bytes = tar(&[("ordinary", b"ok", b'0'), (path, b"private", b'0')]);
+            let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+            let root = destination(dir.path()).unwrap();
+            let error = match verify(&bytes, ArtifactEncoding::TarV1) {
+                Err(error) => error,
+                Ok(mut bundle) => {
+                    bundle.publish(&root, "bundle", &AtomicBool::new(false), |_, _| true);
+                    panic!("reserved archive accepted: {path}");
+                }
+            };
+            assert_eq!(error.code, ErrorCode::Internal, "{path}");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
     }
     #[test]
     fn refuses_wrong_outer_digest_size_and_symlink_ancestors() {

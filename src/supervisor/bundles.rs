@@ -73,10 +73,8 @@ impl Selection<'_> {
             };
             let selected = self.matches(&path);
             // Runner metadata is never traversed or archived, even via an explicit declaration.
-            if matches!(
-                fold_path(name.as_bytes()).as_slice(),
-                b".git" | b".remote-task-runner"
-            ) {
+            if crate::outputs::RESERVED_COMPONENTS.contains(&fold_path(name.as_bytes()).as_slice())
+            {
                 if selected || self.parents.contains(&path) {
                     return Err(refused());
                 } else {
