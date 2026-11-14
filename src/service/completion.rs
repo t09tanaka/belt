@@ -30,6 +30,8 @@ pub struct Failure {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_place: bool,
     pub target: Target,
     pub accepted: bool,
     pub control_revision: u64,
@@ -46,6 +48,7 @@ pub struct Snapshot {
 impl Snapshot {
     pub fn new(target: Target, accepted: bool, cancel_requested: bool) -> Self {
         Self {
+            in_place: false,
             target,
             accepted,
             control_revision: 0,

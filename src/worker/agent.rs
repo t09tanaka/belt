@@ -1726,6 +1726,7 @@ impl Agent {
         let fresh = self.store.get(&r.attempt_id).map_err(api)?.is_none()
             && self.store.tombstone(&r.attempt_id).map_err(api)?.is_none();
         if fresh {
+            self.host.admit(&r.payload)?;
             policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
             for c in &r.payload.commands {
                 check_cwd_relative(Path::new(&c.cwd))?;

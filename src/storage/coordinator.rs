@@ -165,6 +165,12 @@ fn confirm_tombstone(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
 /// The confirmed retire of an attempt that did not end: the attempt is
 /// retired and its task is free for a new one.
 fn free_by_retire(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
+    let in_place: bool = conn.query_row("SELECT coalesce(json_extract(t.spec_json,'$.in_place'),0) FROM task t JOIN attempt a USING(task_id) WHERE a.attempt_id=?1",[aid],|r|r.get(0))?;
+    if in_place {
+        return Err(StorageError::Invalid(
+            "in-place cannot be automatically retried".into(),
+        ));
+    }
     confirm_tombstone(conn, aid, at_ms)?;
     let n = conn.execute(
         "UPDATE attempt SET retired = 1, retired_at_ms = COALESCE(retired_at_ms, ?2)

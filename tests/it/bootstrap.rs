@@ -1173,9 +1173,28 @@ async fn control_wait_interrupt_detaches_without_cancelling_work() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_real_exec_sigint_only_signals_owned_cli_and_confirms_worker_stop() {
+    control_exec_sigint(false).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_real_exec_sigint_confirms_stop_and_preserves_original() {
+    control_exec_sigint(true).await;
+}
+async fn control_exec_sigint(in_place: bool) {
     let (_root, spec, input) = control_fixture();
     let mut child = tokio::process::Command::new(&spec.executable)
-        .args(["--json", "exec", "--", "/bin/sh", "-c", "sleep 30"])
+        .args(if in_place {
+            vec![
+                "--json",
+                "exec",
+                "--in-place",
+                "--",
+                "/bin/sh",
+                "-c",
+                "sleep 30",
+            ]
+        } else {
+            vec!["--json", "exec", "--", "/bin/sh", "-c", "sleep 30"]
+        })
         .env_clear()
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
         .envs(&spec.env)
@@ -1238,6 +1257,14 @@ async fn control_real_exec_sigint_only_signals_owned_cli_and_confirms_worker_sto
         .unwrap()
         .is_empty());
     shutdown(&load(&spec)).await;
+    assert!(input.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(input.join("input.txt")).unwrap(),
+        "snapshot"
+    );
+    if in_place {
+        assert_eq!(value["result"]["snapshot"]["in_place"], true);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1834,4 +1861,251 @@ async fn public_logs_closed_run_final_blocked_stdout_still_detaches() {
         0,
         "cursor directory leaked during blocked final detach"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_exec_updates_original_directory_and_retries_mutable_input_after_restart() {
+    use remote_task_runner::{
+        ids::{RunId, TaskId},
+        service::{completion::Target, control},
+    };
+    let (_root, spec, input) = control_fixture();
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(&spec.executable)
+            .args([
+                "--json",
+                "exec",
+                "--in-place",
+                "--",
+                "/bin/sh",
+                "-c",
+                "cat input.txt > output.txt; exit 23",
+            ])
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+            .envs(&spec.env)
+            .current_dir(&input)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["result"]["snapshot"]["in_place"], true);
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(input.join("output.txt")).unwrap(),
+        "snapshot"
+    );
+    shutdown(&load(&spec)).await;
+    std::fs::write(input.join("input.txt"), "mutable retry").unwrap();
+    std::fs::write(input.join(".remote-task-runner.toml"), "invalid [ config").unwrap();
+    let report = control::retry(&spec, Target::Run(run.clone()))
+        .await
+        .unwrap();
+    assert!(report.retry_receipt.is_some());
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = control::wait(&spec, Target::Run(run.clone()), &mut signals)
+        .await
+        .unwrap();
+    assert_eq!(done.cli_exit_code, 23);
+    assert!(done.snapshot.unwrap().in_place);
+    assert_eq!(
+        std::fs::read_to_string(input.join("output.txt")).unwrap(),
+        "mutable retry"
+    );
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert_eq!(store.attempts_of_task(&task).unwrap().len(), 2);
+    let public = serde_json::to_string(&store.query_task(task).unwrap()).unwrap();
+    assert!(public.contains("\"in_place\":true"));
+    assert!(!public.contains(input.to_str().unwrap()));
+    let source = remote_task_runner::source::SourceStore::open(&spec.state_dir).unwrap();
+    let source_id = source.source_of_run(&run).unwrap().unwrap();
+    let manifest = source.manifest(&source_id).unwrap().unwrap();
+    let baseline = input.parent().unwrap().join("baseline-check");
+    source.materialize(&manifest, &baseline).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(baseline.join("input.txt")).unwrap(),
+        "snapshot"
+    );
+    shutdown(&load(&spec)).await;
+    assert!(input.is_dir());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_secret_values_are_read_only_masked_and_inventory_changes_reject_retry() {
+    use remote_task_runner::{
+        ids::{RunId, TaskId},
+        service::{completion::Target, control},
+        wire::LogStream,
+    };
+    let (_root, spec, input) = control_fixture();
+    for args in [
+        vec!["init", "-q"],
+        vec!["config", "user.name", "Fixture"],
+        vec!["config", "user.email", "fixture@example.invalid"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&input)
+            .envs(&spec.env)
+            .status()
+            .unwrap()
+            .success());
+    }
+    std::fs::write(input.join(".gitignore"), ".env*\n").unwrap();
+    std::fs::write(
+        input.join(".remote-task-runner.toml"),
+        "schema_version = 1\n[source]\nsecret_files = [\".env*\"]\n",
+    )
+    .unwrap();
+    assert!(Command::new("git")
+        .args(["add", "."])
+        .current_dir(&input)
+        .envs(&spec.env)
+        .status()
+        .unwrap()
+        .success());
+    assert!(Command::new("git")
+        .args(["commit", "-qm", "fixture"])
+        .current_dir(&input)
+        .envs(&spec.env)
+        .status()
+        .unwrap()
+        .success());
+    let secret = input.join(".env.test");
+    std::fs::write(&secret, "TOKEN=initial-private-secret\n").unwrap();
+    let original_mode = std::fs::metadata(&secret).unwrap().permissions().mode();
+    let out = tokio::time::timeout(
+        Duration::from_secs(30),
+        tokio::process::Command::new(&spec.executable)
+            .args([
+                "--json",
+                "exec",
+                "--in-place",
+                "--",
+                "/bin/sh",
+                "-c",
+                "cat .env.test; exit 23",
+            ])
+            .env_clear()
+            .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+            .envs(&spec.env)
+            .current_dir(&input)
+            .output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(23),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
+    let old = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .attempts_of_task(&task)
+        .unwrap()
+        .remove(0);
+    let files =
+        remote_task_runner::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
+    let log = files.read_log(&old.attempt_id, LogStream::Stdout).unwrap();
+    assert!(!String::from_utf8_lossy(&log).contains("initial-private-secret"));
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "TOKEN=initial-private-secret\n"
+    );
+    assert_eq!(
+        std::fs::metadata(&secret).unwrap().permissions().mode(),
+        original_mode
+    );
+    remote_task_runner::secrets::vault::Vault::open(&spec.state_dir)
+        .unwrap()
+        .erase(&run)
+        .unwrap();
+    std::fs::write(&secret, "TOKEN=changed-private-secret\n").unwrap();
+    control::retry(&spec, Target::Run(run.clone()))
+        .await
+        .unwrap();
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = control::wait(&spec, Target::Run(run.clone()), &mut signals)
+        .await
+        .unwrap();
+    assert_eq!(done.cli_exit_code, 23);
+    let second = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .attempts_of_task(&task)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let log = files
+        .read_log(&second.attempt_id, LogStream::Stdout)
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&log).contains("changed-private-secret"));
+    std::fs::write(input.join(".env.new"), "TOKEN=new-private-secret\n").unwrap();
+    assert!(control::retry(&spec, Target::Run(run)).await.is_err());
+    assert_eq!(
+        std::fs::read_to_string(&secret).unwrap(),
+        "TOKEN=changed-private-secret\n"
+    );
+    assert!(input.join(".env.new").exists());
+    shutdown(&load(&spec)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_preparation_runs_in_original_and_artifacts_use_normal_collection() {
+    use remote_task_runner::service::{context::Context, control};
+    let (_root, spec, input) = control_fixture();
+    let mut context = Context::load(spec.env.clone(), input.clone(), spec.clone()).unwrap();
+    context.config.prepare_commands = vec![vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "printf preparation > prepared.txt".into(),
+    ]];
+    context
+        .config
+        .outputs
+        .push(remote_task_runner::config::resolve::OutputSpec {
+            name: "kept".into(),
+            paths: vec!["output.txt".into()],
+            required: true,
+            when: remote_task_runner::config::model::OutputWhen::Always,
+        });
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = control::exec_mode(
+        context,
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "cat prepared.txt > output.txt".into(),
+        ],
+        true,
+        &mut signals,
+    )
+    .await
+    .unwrap();
+    assert_eq!(done.cli_exit_code, 0);
+    assert!(done.snapshot.unwrap().in_place);
+    assert_eq!(
+        std::fs::read_to_string(input.join("output.txt")).unwrap(),
+        "preparation"
+    );
+    let task = done.task_id.unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert_eq!(store.attempts_of_task(&task).unwrap().len(), 1);
+    shutdown(&load(&spec)).await;
 }

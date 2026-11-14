@@ -221,6 +221,16 @@ pub fn preflight(
     declared: &[SecretSpec],
     included: &[String],
 ) -> Result<()> {
+    secret_paths(env, dir, declared, included).map(|_| ())
+}
+
+/// The validated paths selected by the original capture contract.
+pub fn secret_paths(
+    env: &BTreeMap<String, String>,
+    dir: &Path,
+    declared: &[SecretSpec],
+    included: &[String],
+) -> Result<Vec<String>> {
     check_declared(declared).map_err(SecretError::Limit)?;
     let root = repo_root(env, dir)?;
     // (path, origin, pattern); declared globs win over `.worktreeinclude`
@@ -298,5 +308,8 @@ pub fn preflight(
         pattern,
         reason: l.to_string(),
     })?;
-    Ok(())
+    Ok(found
+        .into_iter()
+        .map(|(path, _, _)| String::from_utf8(path).expect("validated UTF-8"))
+        .collect())
 }

@@ -219,6 +219,8 @@ struct CapturedInputs {
     vault: crate::secrets::vault::Vault,
     key: crate::secrets::key::ClusterKey,
     env: std::collections::BTreeMap<String, String>,
+    parent_state: std::path::PathBuf,
+    local_worker: WorkerId,
 }
 
 impl CapturedInputs {
@@ -262,6 +264,24 @@ impl CapturedInputs {
             .map_err(|_| unavailable())?;
         if prepared.manifest_digest != digest {
             return Err(unavailable());
+        }
+        if prepared.in_place {
+            let b = crate::workspace::in_place::load(
+                &self.parent_state,
+                run,
+                &prepared.source_id,
+                &digest,
+                &self.local_worker,
+            )
+            .map_err(|_| unavailable())?;
+            let paths = manifest
+                .secret_files
+                .iter()
+                .map(|s| s.path.display())
+                .collect::<Vec<_>>();
+            crate::workspace::in_place::read_secrets(&b, &self.env, &paths)
+                .map_err(|_| StorageError::SecretUnavailable)?;
+            return Ok(false);
         }
         self.vault
             .load(run, &manifest.secret_files, &self.key)
@@ -351,9 +371,17 @@ impl StartupParts {
             vault: crate::secrets::vault::Vault::open(&inputs.state_dir)?,
             key: crate::secrets::key::load(&inputs.worker.cluster_key_path)?,
             env: inputs.worker.env.clone(),
+            parent_state: inputs.state_dir.clone(),
+            local_worker: worker_id.clone(),
         });
+        coordinator.set_parent_local(worker_id.clone());
         let runtime = config.worker_runtime(inputs.worker)?;
-        let agent = runtime.start().map_err(|e| anyhow::anyhow!(e.message))?;
+        let host = runtime
+            .open_host_in_place(inputs.state_dir.clone())
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        let agent = runtime
+            .start_with_host(host)
+            .map_err(|e| anyhow::anyhow!(e.message))?;
         let cluster = coordinator.store().cluster_id().clone();
         Ok(StartupParts {
             cluster,
@@ -1015,7 +1043,7 @@ async fn handle(
                     );
                     anyhow::ensure!(
                         tasks.iter().all(|(_, task)| task.manifest_digest == digest
-                            && task.has_secret_bundle == has_secrets),
+                            && task.has_secret_bundle == (has_secrets && !task.in_place)),
                         "source digest mismatch"
                     );
                     let guard = admission.lock().await;

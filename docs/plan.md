@@ -204,3 +204,19 @@ unit 10 件・active collector から公開 follow まで 1 件・実 CLI 2 件�
 実行中および終了後 final の blocked stdout でも SIGINT detach と cursor cleanup を確認した。
 strict all-target clippy、fmt、diff check も成功した。
 outputs、resident GC / reader lifetime、output planner、estimate は別の必須残件として残す。
+
+
+S15d in-place slice は公開 `exec --in-place` を既存の型付きWorkspaceへ接続する。
+Git worktree / directoryの原本rootをprivate run bindingに保持し、baseline sourceと
+mutable modeを分離する。親local identityのscheduler制限とworker admissionの両方で
+remote配置を拒否し、setup template/cacheと自動retryを無効化する。明示retryはD2の
+停止・回収・revision条件を維持して同じ原本を再実行する。元secret inventoryの増減は
+新しいexecを求め、値変更は現物をread-onlyでmaskする。原本へのsecret配置・消去を
+行わない。public task/completionはpathを含めずin_place flagを示す。private bindingは
+親stateとともに保持し、個別GCは後続の親retention統合事項とする。
+
+このsliceのfocused検証はin-place unit 5件・integration 8件（実CLIの原本更新、
+owner再起動と明示retry、Git secret現物maskとinventory拒否、prepareとrequired output、
+SIGINT停止確定、scheduler / worker admission / 原本cleanup）に加え、secret unit 76件、
+retry関連20件、legacy payload hash 1件、既存実SIGINT 1件、未実装CLI grammar 3件が成功。
+strict all-target / all-feature clippy、fmt、diff checkが成功。全体CIと公開は統合時に行う。

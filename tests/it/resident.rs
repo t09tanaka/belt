@@ -110,6 +110,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
     let task = TaskId::generate();
     let manifest = &captured.manifest.manifest_digest;
     let spec = TaskSpec {
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::parse(manifest)

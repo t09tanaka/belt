@@ -105,12 +105,16 @@ pub(super) async fn sources(
                     })?;
                     anyhow::ensure!(
                         digest == expected.manifest_digest
-                            && secrets == !manifest.secret_files.is_empty(),
+                            && (spec.in_place || secrets == !manifest.secret_files.is_empty()),
                         "source digest mismatch"
                     );
-                    captured
-                        .vault
-                        .load(&expected.run_id, &manifest.secret_files, &captured.key)?;
+                    if !spec.in_place {
+                        captured.vault.load(
+                            &expected.run_id,
+                            &manifest.secret_files,
+                            &captured.key,
+                        )?;
+                    }
                     Ok(())
                 });
                 let valid = tokio::select! { _=input_stop.changed()=>return Ok(()), result=validation=>result? };

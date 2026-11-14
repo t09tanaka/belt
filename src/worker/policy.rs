@@ -615,6 +615,7 @@ mod tests {
     fn payload() -> AttemptPayload {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
+            in_place: false,
             setup: None,
             run_id: RunId::generate(),
             task_id: TaskId::generate(),

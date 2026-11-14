@@ -139,6 +139,7 @@ async fn collection_shutdown_fixture(append_bytes: bool) {
         let task = TaskId::generate();
         let attempt = AttemptId::generate();
         let payload = AttemptPayload {
+            in_place: false,
             setup: None,
             run_id: run.clone(),
             task_id: task.clone(),
@@ -413,6 +414,7 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
             tasks: vec![(
                 TaskId::generate(),
                 TaskSpec {
+                    in_place: false,
                     setup: None,
                     plan_digest: Digest::of_bytes(b"plan"),
                     manifest_digest: digest,
@@ -606,6 +608,7 @@ async fn delivery_resident(root: &Path) -> Resident {
 }
 fn delivery_spec(digest: Digest, secrets: bool) -> TaskSpec {
     TaskSpec {
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: digest,
@@ -747,6 +750,7 @@ async fn per_worker_secret_jobs_route_exact_attempts_and_resend_after_session_re
         )
         .unwrap();
         let payload = AttemptPayload {
+            in_place: false,
             setup: None,
             run_id: run,
             task_id: task.clone(),

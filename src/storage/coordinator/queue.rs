@@ -682,9 +682,11 @@ impl CoordinatorStore {
                 [&aid],
                 |r| r.get(0),
             )?;
+            let in_place: bool = tx.query_row(
+                "SELECT coalesce(json_extract(t.spec_json,'$.in_place'),0) FROM task t JOIN attempt a USING(task_id) WHERE a.attempt_id=?1", [&aid], |r| r.get(0))?;
             let outcome = if cancelled {
                 Outcome::Cancelled
-            } else if reason == failed_reason {
+            } else if reason == failed_reason || in_place {
                 Outcome::Failed
             } else {
                 super::free_by_retire(tx, &aid, at_ms)?;
