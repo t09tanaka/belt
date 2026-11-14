@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "query", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Query {
+    Completion {
+        target: super::completion::Target,
+    },
     Runs {
         limit: u32,
         after: Option<RunId>,
@@ -50,15 +53,31 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
-    Runs { page: Page<Run> },
-    Run { run: Option<Run> },
-    Tasks { page: Page<Task> },
-    Task { task: Option<Task> },
-    Attempts { page: Page<Attempt> },
+    Completion {
+        snapshot: super::completion::Snapshot,
+    },
+    Runs {
+        page: Page<Run>,
+    },
+    Run {
+        run: Option<Run>,
+    },
+    Tasks {
+        page: Page<Task>,
+    },
+    Task {
+        task: Option<Task>,
+    },
+    Attempts {
+        page: Page<Attempt>,
+    },
 }
 impl CoordinatorStore {
     pub fn query(&self, query: Query) -> Result<Response> {
         Ok(match query {
+            Query::Completion { target } => Response::Completion {
+                snapshot: self.completion(target)?,
+            },
             Query::Runs { limit, after } => Response::Runs {
                 page: self.query_runs(limit, after)?,
             },

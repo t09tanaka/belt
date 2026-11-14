@@ -230,6 +230,12 @@ impl Envelope {
 
 /// Run a parsed command and return the process exit code.
 pub fn run(cli: Cli) -> i32 {
+    if matches!(&cli.command,Command::Exec(args) if !args.in_place)
+        || matches!(&cli.command, Command::Wait(_) | Command::Cancel(_))
+    {
+        return run_control(&cli);
+    }
+
     if matches!(cli.command, Command::Ls(_) | Command::Show(_)) {
         return run_query(&cli);
     }
@@ -299,6 +305,117 @@ pub fn run(cli: Cli) -> i32 {
         eprintln!("error: {}", envelope.error.message);
     }
     ErrorCode::NotImplemented.exit_code()
+}
+
+fn run_control(cli: &Cli) -> i32 {
+    let result = (|| -> Result<crate::service::control::Report, crate::error::ApiError> {
+        if let Command::Wait(args) | Command::Cancel(args) = &cli.command {
+            crate::service::completion::Target::parse(&args.id)?;
+        }
+        let env = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let cwd = std::env::current_dir()
+            .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+        let spec = crate::service::context::runtime_spec(&env)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| crate::error::ApiError::new(ErrorCode::Internal, e.to_string()))?;
+        let result = runtime.block_on(async {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let mut interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .map_err(|e| crate::error::ApiError::new(ErrorCode::Internal, e.to_string()))?;
+            let watcher = tokio::spawn(async move {
+                while interrupt.recv().await.is_some() {
+                    if sender.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let result = match &cli.command {
+                Command::Exec(args) => {
+                    crate::service::control::exec(
+                        crate::service::context::Context::load(env, cwd, spec.clone())?,
+                        args.command.clone(),
+                        &mut receiver,
+                    )
+                    .await
+                }
+                Command::Wait(args) => {
+                    crate::service::control::wait(
+                        &spec,
+                        crate::service::completion::Target::parse(&args.id)?,
+                        &mut receiver,
+                    )
+                    .await
+                }
+                Command::Cancel(args) => {
+                    let target = crate::service::completion::Target::parse(&args.id)?;
+                    let snapshot = crate::service::control::cancel(&spec, target.clone()).await?;
+                    Ok(crate::service::control::Report {
+                        schema_version: 1,
+                        target,
+                        task_id: None,
+                        state: "cancel_requested",
+                        stop_confirmed: snapshot.stop_confirmed(),
+                        collection_pending: Some(snapshot.collection_pending_tasks > 0),
+                        cancel_requested: true,
+                        cancel_acknowledged: true,
+                        snapshot: Some(snapshot),
+                        cli_exit_code: 0,
+                        error: None,
+                    })
+                }
+                _ => unreachable!(),
+            };
+            watcher.abort();
+            let _ = watcher.await;
+            result
+        });
+        runtime.shutdown_background();
+        result
+    })();
+    match result {
+        Ok(report) => {
+            let code = report.cli_exit_code;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":code==0,"result":report})
+                );
+            } else {
+                let id = match &report.target {
+                    crate::service::completion::Target::Run(id) => id.to_string(),
+                    crate::service::completion::Target::Task(id) => id.to_string(),
+                };
+                if let Some(task) = &report.task_id {
+                    println!("{id} {task} {}", report.state);
+                } else {
+                    println!("{id} {}", report.state);
+                }
+                if report.collection_pending == Some(true) {
+                    eprintln!("collection is still pending");
+                }
+                if let Some(error) = &report.error {
+                    eprintln!("error: {}", error.message);
+                }
+            }
+            code
+        }
+        Err(error) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                );
+            } else {
+                eprintln!("error: {}", error.message);
+            }
+            error.code.exit_code()
+        }
+    }
 }
 
 /// `worker --stdio`: relay stdin and stdout to the worker agent's Unix socket.
@@ -405,15 +522,13 @@ fn run_query(cli: &Cli) -> i32 {
         let env = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
             .collect();
-        let cwd = std::env::current_dir().map_err(|e| invalid(e.to_string()))?;
-        let context = crate::service::context::Context::discover(env, cwd)?;
+        let spec = crate::service::context::runtime_spec(&env)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
         runtime.block_on(async {
-            let client = context
-                .readonly()
+            let client = crate::service::query::Reader::open(spec)
                 .await
                 .map_err(|e| ApiError::new(e.code, e.to_string()))?;
             let value = match &cli.command {

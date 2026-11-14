@@ -2985,7 +2985,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     let all = schema::steps(DbKind::Coordinator);
     assert_eq!(
         all.len(),
-        4,
+        5,
         "this test is about step 1 and the steps after it"
     );
     let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
@@ -3098,7 +3098,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opened for writing, it is migrated, and every row is still there.
     let store = CoordinatorStore::open(dir.path(), 10).unwrap();
-    assert_eq!(schema_of(&store), ("4".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("5".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(4));
     assert_eq!(store.cluster_id(), &cluster);
     check_rows(&store);
@@ -3116,7 +3116,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opening again migrates nothing and loses nothing.
     let store = CoordinatorStore::open(dir.path(), 20).unwrap();
-    assert_eq!(schema_of(&store), ("4".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("5".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(5));
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);
@@ -3307,7 +3307,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(all.len(), 4);
+    assert_eq!(all.len(), 5);
     let cluster = ClusterId::generate();
     let co = CoordinatorId::generate();
     let run = RunId::generate();
@@ -3362,7 +3362,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     }
     let owner = CoordinatorStore::open(dir.path(), 2).unwrap();
     let migrated = schema_info(&owner);
-    assert_eq!(migrated.0, "4");
+    assert_eq!(migrated.0, "5");
     assert_eq!(migrated.2, 3);
     assert!(migrated.1.is_some());
     let target_run = run.to_string();
@@ -3381,4 +3381,220 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
         owner.query_tasks(run, 64, None).unwrap().items.len(),
         tasks.len()
     );
+}
+
+#[test]
+fn run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate() {
+    use crate::service::completion::Target;
+    let dir = tempfile::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    store.cancel_run(&run, 2).unwrap();
+    store.cancel_run(&run, 3).unwrap();
+    let before = store.completion(Target::Run(run.clone())).unwrap();
+    assert!(!before.accepted);
+    assert!(before.cancel_requested);
+    assert!(before.stop_confirmed());
+    assert_eq!(before.exit_code(), Some(130));
+    store
+        .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 4)
+        .unwrap();
+    let next = TaskId::generate();
+    store.create_task(&next, &run, &json!({}), 5).unwrap();
+    assert!(store.queued_tasks(10).unwrap().is_empty());
+    for task in [&task, &next] {
+        assert!(matches!(
+            store
+                .place(
+                    task,
+                    &WorkerId::parse("local").unwrap(),
+                    &AttemptId::generate(),
+                    |_| true,
+                    |_| panic!("cancelled task reached payload construction"),
+                    6
+                )
+                .unwrap(),
+            PlaceOutcome::NotQueued
+        ));
+        assert!(store
+            .create_attempt(
+                NewAttempt {
+                    attempt_id: AttemptId::generate(),
+                    task_id: task.clone(),
+                    worker_id: WorkerId::parse("local").unwrap(),
+                    payload_hash: hash('a'),
+                    permit_id: None
+                },
+                6
+            )
+            .is_err());
+    }
+    let task_id = task.to_string();
+    store
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE task SET cancel_requested_at_ms=NULL WHERE task_id=?1",
+                [task_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(store.task_cancel_requested(&task).unwrap().is_some());
+    let after = store.completion(Target::Run(run)).unwrap();
+    assert_eq!(after.task_count, 2);
+    assert_eq!(after.computed_tasks, 2);
+    assert_eq!(after.exit_code(), Some(130));
+}
+
+#[test]
+fn run_cancel_is_atomic_idempotent_and_preserves_unknown_and_natural_completion() {
+    use crate::service::completion::Target;
+    let f = fx();
+    let attempt = f.attempt('a').unwrap();
+    f.store
+        .set_observation(&attempt.attempt_id, Observation::Unknown)
+        .unwrap();
+    f.store.cancel_run(&f.run, 20).unwrap();
+    f.store.cancel_run(&f.run, 21).unwrap();
+    let snapshot = f.store.completion(Target::Run(f.run.clone())).unwrap();
+    assert!(snapshot.cancel_requested);
+    assert_eq!(snapshot.uncertain_tasks, 1);
+    assert!(!snapshot.stop_confirmed());
+    assert_eq!(snapshot.exit_code(), None);
+    assert_eq!(
+        f.store
+            .get_attempt(&attempt.attempt_id)
+            .unwrap()
+            .unwrap()
+            .cancel_requested_at_ms,
+        Some(20)
+    );
+    let events = f
+        .store
+        .events_of(&attempt.attempt_id, "cancel_requested")
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    f.to_finalizing(&attempt.attempt_id);
+    f.store
+        .finalize_attempt(&attempt.attempt_id, done(Outcome::Succeeded), 30)
+        .unwrap();
+    let snapshot = f.store.completion(Target::Task(f.task.clone())).unwrap();
+    assert!(snapshot.stop_confirmed());
+    assert_eq!(snapshot.collection_pending_tasks, 1);
+    assert_eq!(snapshot.exit_code(), None);
+    let b = TaskId::generate();
+    f.store.create_task(&b, &f.run, &json!({}), 31).unwrap();
+    let snapshot = f.store.completion(Target::Run(f.run.clone())).unwrap();
+    assert_eq!(snapshot.task_count, 2);
+    assert!(snapshot.stop_confirmed());
+    assert_eq!(snapshot.first_compute_failure.unwrap().termination, None);
+}
+
+#[test]
+fn run_cancel_races_enqueue_and_place_without_losing_the_intent() {
+    use crate::service::completion::Target;
+    use std::sync::{Arc, Barrier};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(CoordinatorStore::open(dir.path(), 1).unwrap());
+    for _ in 0..8 {
+        let run = RunId::generate();
+        let task = TaskId::generate();
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                store.cancel_run(&run, 5).unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                store
+                    .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 4)
+                    .unwrap();
+            });
+        });
+        assert_eq!(
+            store.completion(Target::Run(run)).unwrap().exit_code(),
+            Some(130)
+        );
+        assert!(store.task_cancel_requested(&task).unwrap().is_some());
+        let run = RunId::generate();
+        let task = TaskId::generate();
+        store
+            .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 6)
+            .unwrap();
+        let barrier = Barrier::new(2);
+        let attempt = AttemptId::generate();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                store.cancel_run(&run, 8).unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                store
+                    .place(
+                        &task,
+                        &WorkerId::parse("local").unwrap(),
+                        &attempt,
+                        |_| true,
+                        |_| Ok((hash('a'), json!({}))),
+                        7,
+                    )
+                    .unwrap();
+            });
+        });
+        assert!(store.task_cancel_requested(&task).unwrap().is_some());
+        if let Some(attempt) = store.get_attempt(&attempt).unwrap() {
+            assert_eq!(attempt.cancel_requested_at_ms, Some(8));
+            assert!(attempt.termination.is_none());
+        }
+        assert!(store.queued_tasks(1000).unwrap().is_empty());
+    }
+}
+#[test]
+fn completion_waits_for_closed_collection_and_preserves_compute_error_precedence() {
+    use crate::results::plan::Verdict;
+    use crate::service::completion::Target;
+    for outcome in [Outcome::Succeeded, Outcome::Failed] {
+        for verdict in [Verdict::Complete, Verdict::RequiredMissing, Verdict::GaveUp] {
+            let f = fx();
+            let attempt = f.attempt('a').unwrap();
+            f.to_finalizing(&attempt.attempt_id);
+            f.store
+                .finalize_attempt(&attempt.attempt_id, done(outcome), 30)
+                .unwrap();
+            let target = Target::Task(f.task.clone());
+            assert_eq!(
+                f.store.completion(target.clone()).unwrap().exit_code(),
+                None
+            );
+            let digest = Digest::of_bytes(b"result");
+            f.store
+                .begin_collection(&attempt.attempt_id, &digest, &json!({}), &[], &[], 31)
+                .unwrap();
+            assert_eq!(
+                f.store.completion(target.clone()).unwrap().exit_code(),
+                None,
+                "result receipt alone isn't closed collection"
+            );
+            f.store
+                .close_collection(&attempt.attempt_id, Some(&digest), verdict, false, 32)
+                .unwrap();
+            let snapshot = f.store.completion(target).unwrap();
+            assert!(snapshot.settled());
+            assert_eq!(snapshot.collection_pending_tasks, 0);
+            assert_eq!(
+                snapshot.exit_code(),
+                Some(if outcome == Outcome::Failed {
+                    1
+                } else if verdict == Verdict::Complete {
+                    0
+                } else {
+                    78
+                })
+            );
+        }
+    }
 }

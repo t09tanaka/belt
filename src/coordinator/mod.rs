@@ -432,8 +432,14 @@ impl Coordinator {
     /// never placed; a placed one gets the cancel on the next tick, and on
     /// every later one until its worker answered.
     pub async fn cancel_task(&self, task_id: &TaskId) -> Result<Option<AttemptRecord>> {
+        self.check_fenced()?;
         let task = task_id.clone();
         self.db(move |s| s.cancel_task(&task, wall_ms())).await
+    }
+
+    pub async fn cancel_run(&self, run_id: RunId) -> Result<()> {
+        self.check_fenced()?;
+        self.db(move |s| s.cancel_run(&run_id, wall_ms())).await
     }
 
     /// Ask for an attempt to be taken off its worker so that its task can be

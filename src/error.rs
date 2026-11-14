@@ -12,6 +12,10 @@ pub mod exit {
     pub const SUCCESS: i32 = 0;
     /// A command ran and failed generically (the original code is passed through when known).
     pub const FAILURE: i32 = 1;
+    /// Conventional cancellation/local interrupt result when no command exit exists.
+    pub const CANCELLED: i32 = 130;
+    /// A timed out command without a more specific command exit.
+    pub const TIMED_OUT: i32 = 124;
     /// Invalid input (bad arguments); clap also exits with this code.
     pub const INPUT_ERROR: i32 = 2;
     /// The command is defined but not implemented yet.

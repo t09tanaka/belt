@@ -246,23 +246,31 @@ async fn resident_rejects_foreign_credentials_oversized_frames_and_schema() {
     let token = std::fs::read_to_string(client.socket_path().parent().unwrap().join("owner.token"))
         .unwrap();
     let runner = tokio::spawn(resident.run());
+    let rejected = RunId::generate();
     for (version, cluster, owner) in [
         (1, ClusterId::generate(), token.clone()),
         (1, client.cluster_id().clone(), "wrong".into()),
         (2, client.cluster_id().clone(), token),
     ] {
-        let mut stream = raw(
-            client.socket_path(),
-            &Request {
-                schema_version: version,
-                cluster_id: cluster,
-                owner_token: owner,
-                operation: Operation::Shutdown,
+        for operation in [
+            Operation::Shutdown,
+            Operation::Cancel {
+                target: remote_task_runner::service::completion::Target::Run(rejected.clone()),
             },
-        )
-        .await;
-        let mut byte = [0];
-        assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        ] {
+            let mut stream = raw(
+                client.socket_path(),
+                &Request {
+                    schema_version: version,
+                    cluster_id: cluster.clone(),
+                    owner_token: owner.clone(),
+                    operation,
+                },
+            )
+            .await;
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        }
     }
     let mut stream = UnixStream::connect(client.socket_path()).await.unwrap();
     stream
@@ -279,6 +287,20 @@ async fn resident_rejects_foreign_credentials_oversized_frames_and_schema() {
             .await
             .unwrap(),
         Reply::Task { .. }
+    ));
+    assert!(matches!(
+        client
+            .request(Operation::Query {
+                query: remote_task_runner::service::query::Query::Completion {
+                    target: remote_task_runner::service::completion::Target::Run(rejected)
+                }
+            })
+            .await
+            .unwrap(),
+        Reply::QueryError {
+            code: remote_task_runner::error::ErrorCode::NotFound,
+            ..
+        }
     ));
     stop(&client, runner).await;
 }

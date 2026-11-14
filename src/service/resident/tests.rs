@@ -237,6 +237,33 @@ async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_un
     })
     .await
     .unwrap();
+    let spec = crate::service::bootstrap::Spec {
+        state_dir: state.clone(),
+        worker_state_dir: root.path().join("worker"),
+        worker_id: WorkerId::parse("local").unwrap(),
+        cluster_key_path: root.path().join("key"),
+        executable: "/usr/bin/false".into(),
+        env: BTreeMap::from([
+            ("HOME".into(), root.path().display().to_string()),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+        ]),
+        repo_root: None,
+        expected_cluster: Some(client.cluster_id().clone()),
+    };
+    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let target = crate::service::completion::Target::Run(run.clone());
+    let pending = crate::service::control::cancel_and_stop(
+        &spec,
+        target,
+        &mut signals,
+        Duration::from_millis(500),
+    )
+    .await;
+    assert_eq!(pending.cli_exit_code, 77);
+    assert!(pending.cancel_requested);
+    assert!(pending.cancel_acknowledged);
+    assert_eq!(pending.state, "cancel_requested");
+    assert!(!pending.snapshot.unwrap().stop_confirmed());
     assert!(matches!(
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
@@ -254,7 +281,7 @@ async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_un
     assert_eq!(record.observation, Observation::Unknown);
     assert_eq!(record.state, AttemptState::Active);
     assert!(record.termination.is_none());
-    assert!(record.cancel_requested_at_ms.is_none());
+    assert!(record.cancel_requested_at_ms.is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

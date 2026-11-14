@@ -48,6 +48,9 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    Cancel {
+        target: super::completion::Target,
+    },
     Ping,
     Submit {
         run_id: RunId,
@@ -78,6 +81,12 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
+    Cancelled {
+        snapshot: super::completion::Snapshot,
+    },
+    ControlError {
+        error: crate::error::ApiError,
+    },
     Ready {
         epoch: CoordinatorEpoch,
     },
@@ -614,11 +623,62 @@ async fn handle(
     }
     let mut gate = admission.lock().await;
     let reply = if *gate || coordinator.is_fenced() {
-        Reply::Error {
-            message: "resident is stopping".into(),
+        if matches!(&request.operation, Operation::Cancel { .. }) {
+            Reply::ControlError {
+                error: crate::error::ApiError::new(
+                    if coordinator.is_fenced() {
+                        crate::error::ErrorCode::StaleEpoch
+                    } else {
+                        crate::error::ErrorCode::CommunicationUnknown
+                    },
+                    "resident is stopping",
+                ),
+            }
+        } else {
+            Reply::Error {
+                message: "resident is stopping".into(),
+            }
         }
     } else {
         match request.operation {
+            Operation::Cancel { target } => {
+                let result = match &target {
+                    super::completion::Target::Run(run) => {
+                        coordinator.cancel_run(run.clone()).await
+                    }
+                    super::completion::Target::Task(task) => {
+                        coordinator.cancel_task(task).await.map(|_| ())
+                    }
+                };
+                match result {
+                    Ok(()) => {
+                        let owner = coordinator.clone();
+                        match tokio::task::spawn_blocking(move || owner.store().completion(target))
+                            .await?
+                        {
+                            Ok(snapshot) => Reply::Cancelled { snapshot },
+                            Err(e) => Reply::ControlError {
+                                error: crate::error::ApiError::new(e.code(), e.to_string()),
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        let code = match &e {
+                            crate::coordinator::CoordinatorError::Storage(e) => e.code(),
+                            crate::coordinator::CoordinatorError::Fenced(_) => {
+                                crate::error::ErrorCode::StaleEpoch
+                            }
+                            crate::coordinator::CoordinatorError::Invalid(_) => {
+                                crate::error::ErrorCode::InvalidInput
+                            }
+                            _ => crate::error::ErrorCode::Internal,
+                        };
+                        Reply::ControlError {
+                            error: crate::error::ApiError::new(code, e.to_string()),
+                        }
+                    }
+                }
+            }
             Operation::Ping => Reply::Ready {
                 epoch: coordinator.store().epoch(),
             },

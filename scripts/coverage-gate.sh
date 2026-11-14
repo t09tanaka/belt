@@ -23,6 +23,7 @@ root = os.getcwd()
 data = json.load(open("target/llvm-cov.json"))
 want = {
     "src/ids.rs",
+    "src/service/completion.rs",
     "src/state.rs",
     "src/error.rs",
     "src/wire.rs",

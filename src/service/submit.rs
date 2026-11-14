@@ -25,6 +25,22 @@ pub async fn command(
     command: Vec<String>,
     revision: Option<String>,
 ) -> Result<Receipt, ApiError> {
+    command_with_ids(
+        context,
+        command,
+        revision,
+        RunId::generate(),
+        TaskId::generate(),
+    )
+    .await
+}
+pub async fn command_with_ids(
+    context: Context,
+    command: Vec<String>,
+    revision: Option<String>,
+    run_id: RunId,
+    task_id: TaskId,
+) -> Result<Receipt, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
     if command.is_empty() {
         return Err(invalid("command cannot be empty".into()));
@@ -33,8 +49,6 @@ pub async fn command(
         .owner()
         .await
         .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?;
-    let run_id = RunId::generate();
-    let task_id = TaskId::generate();
     let (context, captured, run_id) = tokio::task::spawn_blocking(move || {
         let captured = super::input::capture(&context, &run_id, revision.as_deref());
         (context, captured, run_id)

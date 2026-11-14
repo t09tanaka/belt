@@ -5,6 +5,7 @@ use crate::error::{ApiError, ErrorCode};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Context {
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
@@ -63,23 +64,7 @@ impl Context {
         })
     }
     pub fn discover(env: BTreeMap<String, String>, cwd: PathBuf) -> Result<Self, ApiError> {
-        let file = crate::config::paths::user_config_path(&env)
-            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
-        let input = file
-            .parent()
-            .expect("configuration parent")
-            .join("coordinator.json");
-        if !input
-            .try_exists()
-            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?
-        {
-            return Err(ApiError::new(
-                ErrorCode::NotFound,
-                "coordinator is not initialized; run remote-task-runner init",
-            ));
-        }
-        let spec = super::bootstrap::read_input(&input)
-            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+        let spec = runtime_spec(&env)?;
         Self::load(env, cwd, spec)
     }
     pub fn state_dir(&self) -> &Path {
@@ -91,4 +76,26 @@ impl Context {
     pub async fn owner(&self) -> anyhow::Result<super::resident::Client> {
         super::bootstrap::ensure(self.bootstrap.clone()).await
     }
+}
+
+/// Discover only authenticated runtime input; metadata/control do not need Git or project config.
+pub fn runtime_spec(env: &BTreeMap<String, String>) -> Result<Spec, ApiError> {
+    let file = crate::config::paths::user_config_path(env)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+    let input = file
+        .parent()
+        .expect("configuration parent")
+        .join("coordinator.json");
+    if !input
+        .try_exists()
+        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?
+    {
+        return Err(ApiError::new(
+            ErrorCode::NotFound,
+            "coordinator is not initialized; run remote-task-runner init",
+        ));
+    }
+    let spec = super::bootstrap::read_input(&input)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+    Ok(spec)
 }

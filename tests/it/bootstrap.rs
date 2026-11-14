@@ -880,3 +880,400 @@ fn command_commit_capture_requires_and_preserves_explicit_revision() {
         "dirty worktree"
     );
 }
+
+fn control_fixture() -> (tempfile::TempDir, Spec, std::path::PathBuf) {
+    let (root, spec) = fixture();
+    let config = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "schema_version = 1\n[coordinator]\nheartbeat_seconds = 1\nstale_seconds = 3\n",
+    )
+    .unwrap();
+    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
+        .unwrap();
+    let input = root.path().join("input");
+    std::fs::create_dir(&input).unwrap();
+    std::fs::write(input.join("input.txt"), "snapshot").unwrap();
+    (root, spec, input)
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_control_exec_exit_and_offline_wait_ignore_current_project_and_git() {
+    let (_root, spec, input) = control_fixture();
+    let mut run = None;
+    for (script, exit) in [("exit 0", 0), ("exit 23", 23), ("kill -TERM $$", 143)] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(&spec.executable)
+                .args(["--json", "exec", "--", "/bin/sh", "-c", script])
+                .env_clear()
+                .envs(
+                    std::env::var_os("LLVM_PROFILE_FILE")
+                        .map(|profile| ("LLVM_PROFILE_FILE", profile)),
+                )
+                .envs(&spec.env)
+                .current_dir(&input)
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(exit),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["result"]["state"], "settled");
+        assert_eq!(value["result"]["snapshot"]["collection_pending_tasks"], 0);
+        if exit == 23 {
+            run = Some(
+                value["result"]["target"]["id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            );
+        }
+    }
+    let client = load(&spec);
+    let epoch = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .epoch();
+    shutdown(&client).await;
+    std::fs::write(
+        input.join(".remote-task-runner.toml"),
+        "invalid project config [",
+    )
+    .unwrap();
+    for args in [
+        vec!["ls"],
+        vec!["show", run.as_deref().unwrap()],
+        vec!["wait", run.as_deref().unwrap()],
+    ] {
+        let output = tokio::process::Command::new(&spec.executable)
+            .arg("--json")
+            .args(&args)
+            .env_clear()
+            .envs(
+                std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)),
+            )
+            .envs(&spec.env)
+            .env("PATH", "/does-not-contain-git")
+            .current_dir(&input)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(if args[0] == "wait" { 23 } else { 0 }),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(serde_json::from_slice::<serde_json::Value>(&output.stdout).is_ok());
+    }
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_starts() {
+    use remote_task_runner::service::{
+        completion::Target,
+        context::Context,
+        control,
+        query::{Query, Response},
+    };
+    let (_root, spec, input) = control_fixture();
+    let context = Context::load(spec.env.clone(), input, spec.clone()).unwrap();
+    let (sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    sender.send(()).unwrap();
+    let report = control::exec(
+        context.clone(),
+        vec!["/bin/sh".into(), "-c".into(), "exit 99".into()],
+        &mut signals,
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.state, "stop_confirmed");
+    assert_eq!(report.cli_exit_code, 130);
+    assert!(report.cancel_acknowledged);
+    assert!(!report.snapshot.as_ref().unwrap().accepted);
+    let Target::Run(run) = report.target else {
+        panic!("exec must bind a run")
+    };
+    let task = report.task_id.unwrap();
+    remote_task_runner::service::submit::command_with_ids(
+        context.clone(),
+        vec!["/bin/sh".into(), "-c".into(), "exit 99".into()],
+        None,
+        run.clone(),
+        task,
+    )
+    .await
+    .unwrap();
+    let reader = context.readonly().await.unwrap();
+    let Response::Completion { snapshot } = reader
+        .query(Query::Completion {
+            target: Target::Run(run),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("completion")
+    };
+    assert!(snapshot.accepted);
+    assert_eq!(snapshot.task_count, 1);
+    assert_eq!(snapshot.exit_code(), Some(130));
+    assert!(CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .list_nonterminal_attempts()
+        .unwrap()
+        .is_empty());
+    let missing = remote_task_runner::ids::TaskId::generate().to_string();
+    let error = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "cancel", &missing])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
+        .envs(&spec.env)
+        .env("PATH", "/no-git")
+        .current_dir(&context.cwd)
+        .output()
+        .await
+        .unwrap();
+    assert_eq!(
+        error.status.code(),
+        Some(73),
+        "{}",
+        String::from_utf8_lossy(&error.stdout)
+    );
+    let absent = remote_task_runner::ids::RunId::generate().to_string();
+    let receipt = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "cancel", &absent])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
+        .envs(&spec.env)
+        .env("PATH", "/no-git")
+        .current_dir(&context.cwd)
+        .output()
+        .await
+        .unwrap();
+    assert!(receipt.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&receipt.stdout).unwrap();
+    assert_eq!(value["result"]["cancel_acknowledged"], true);
+    assert_eq!(value["result"]["snapshot"]["accepted"], false);
+    shutdown(&load(&spec)).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_wait_interrupt_detaches_without_cancelling_work() {
+    use remote_task_runner::service::{completion::Target, context::Context, control};
+    let (_root, spec, input) = control_fixture();
+    let context = Context::load(spec.env.clone(), input, spec.clone()).unwrap();
+    let receipt = remote_task_runner::service::submit::command(
+        context.clone(),
+        vec!["/bin/sh".into(), "-c".into(), "sleep 1; exit 0".into()],
+        None,
+    )
+    .await
+    .unwrap();
+    let (sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    sender.send(()).unwrap();
+    let target = Target::Task(receipt.task_id.clone());
+    let detached = control::wait(&spec, target.clone(), &mut signals)
+        .await
+        .unwrap();
+    assert_eq!(detached.state, "wait_interrupted");
+    assert!(!detached.cancel_requested);
+    assert!(CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .task_cancel_requested(&receipt.task_id)
+        .unwrap()
+        .is_none());
+    let finished = tokio::time::timeout(
+        Duration::from_secs(20),
+        control::wait(&spec, target, &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(finished.cli_exit_code, 0);
+    shutdown(&load(&spec)).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_real_exec_sigint_only_signals_owned_cli_and_confirms_worker_stop() {
+    let (_root, spec, input) = control_fixture();
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "exec", "--", "/bin/sh", "-c", "sleep 30"])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
+        .envs(&spec.env)
+        .current_dir(&input)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "CLI exited before its command started"
+            );
+            if let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) {
+                if store
+                    .list_nonterminal_attempts()
+                    .unwrap()
+                    .iter()
+                    .any(|a| a.receipts.running_at_ms.is_some())
+                {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(35), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(output.status.code(), Some(130 | 143)),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"]["state"], "stop_confirmed");
+    assert_eq!(value["result"]["cancel_acknowledged"], true);
+    assert!(CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .list_nonterminal_attempts()
+        .unwrap()
+        .is_empty());
+    shutdown(&load(&spec)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_wait_reopens_after_owner_restart_without_new_attempt() {
+    use remote_task_runner::service::{completion::Target, context::Context, control};
+    let (_root, spec, input) = control_fixture();
+    let context = Context::load(spec.env.clone(), input, spec.clone()).unwrap();
+    let receipt = remote_task_runner::service::submit::command(
+        context,
+        vec!["/bin/sh".into(), "-c".into(), "sleep 3; exit 0".into()],
+        None,
+    )
+    .await
+    .unwrap();
+    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let reading_spec = spec.clone();
+    let target = Target::Task(receipt.task_id.clone());
+    let waiting =
+        tokio::spawn(async move { control::wait(&reading_spec, target, &mut signals).await });
+    let client = load(&spec);
+    shutdown(&client).await;
+    let restarted = ensure(spec.clone()).await.unwrap();
+    let waited = tokio::time::timeout(Duration::from_secs(20), waiting).await;
+    let result = match waited {
+        Ok(result) => result.unwrap().unwrap(),
+        Err(error) => {
+            let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+            eprintln!(
+                "restart completion: {:?}",
+                store
+                    .completion(remote_task_runner::service::completion::Target::Task(
+                        receipt.task_id.clone()
+                    ))
+                    .unwrap()
+            );
+            let attempts = store.attempts_of_task(&receipt.task_id).unwrap();
+            let worker =
+                remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
+                    .unwrap();
+            for attempt in attempts {
+                eprintln!(
+                    "parent attempt: state={:?} observation={:?} termination={:?}",
+                    attempt.state, attempt.observation, attempt.termination
+                );
+                for event in worker.events_of_attempt(&attempt.attempt_id, 40).unwrap() {
+                    eprintln!(
+                        "restart event {} code={:?} reason={:?} verdict={:?}",
+                        event.kind,
+                        event.payload.get("code"),
+                        event.payload.get("reason"),
+                        event.payload.get("verdict")
+                    );
+                }
+            }
+            shutdown(&restarted).await;
+            panic!("wait did not settle after owner restart: {error}");
+        }
+    };
+    assert_eq!(result.cli_exit_code, 0);
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .attempts_of_task(&receipt.task_id)
+            .unwrap()
+            .len(),
+        1
+    );
+    shutdown(&restarted).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn control_exec_succeeded_compute_but_missing_collection_exits_78() {
+    use remote_task_runner::service::{context::Context, control};
+    let (_root, spec, input) = control_fixture();
+    let mut context = Context::load(spec.env.clone(), input, spec.clone()).unwrap();
+    context
+        .config
+        .outputs
+        .push(remote_task_runner::config::resolve::OutputSpec {
+            name: "required.txt".into(),
+            paths: vec!["not-created.txt".into()],
+            required: true,
+            when: remote_task_runner::config::model::OutputWhen::Always,
+        });
+    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let report = tokio::time::timeout(
+        Duration::from_secs(20),
+        control::exec(
+            context,
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            &mut signals,
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.state, "settled");
+    assert_eq!(report.cli_exit_code, 78);
+    let snapshot = report.snapshot.unwrap();
+    assert_eq!(
+        snapshot.first_termination.unwrap().outcome(),
+        remote_task_runner::state::Outcome::Succeeded
+    );
+    assert_eq!(snapshot.collection_failed_tasks, 1);
+    assert_eq!(snapshot.collection_pending_tasks, 0);
+    shutdown(&load(&spec)).await;
+}

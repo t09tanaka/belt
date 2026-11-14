@@ -286,6 +286,13 @@ pub(crate) fn steps(kind: DbKind) -> Vec<String> {
             COORDINATOR_V2.to_string(),
             COORDINATOR_V3.to_string(),
             "CREATE INDEX task_run_key ON task(run_id, task_id);".to_string(),
+            r#"CREATE TABLE run_cancel_intent (run_id TEXT PRIMARY KEY, requested_at_ms INTEGER NOT NULL);
+CREATE TRIGGER task_inherit_cancel AFTER INSERT ON task WHEN EXISTS(SELECT 1 FROM run_cancel_intent WHERE run_id=NEW.run_id)
+BEGIN UPDATE task SET cancel_requested_at_ms=(SELECT requested_at_ms FROM run_cancel_intent WHERE run_id=NEW.run_id) WHERE task_id=NEW.task_id; END;
+CREATE TRIGGER task_keep_cancel AFTER UPDATE OF cancel_requested_at_ms ON task WHEN NEW.cancel_requested_at_ms IS NULL AND EXISTS(SELECT 1 FROM run_cancel_intent WHERE run_id=NEW.run_id)
+BEGIN UPDATE task SET cancel_requested_at_ms=(SELECT requested_at_ms FROM run_cancel_intent WHERE run_id=NEW.run_id) WHERE task_id=NEW.task_id; END;
+CREATE TRIGGER attempt_cancel_gate BEFORE INSERT ON attempt WHEN EXISTS(SELECT 1 FROM task WHERE task_id=NEW.task_id AND cancel_requested_at_ms IS NOT NULL)
+BEGIN SELECT RAISE(ABORT,'cancelled task cannot create an attempt'); END;"#.to_string(),
         ],
         DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}")],
     }
