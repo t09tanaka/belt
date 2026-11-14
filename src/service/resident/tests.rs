@@ -552,8 +552,11 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
         .unwrap()
         .unwrap()
         .unwrap();
+    // The source peer remains blocked. Reacquiring the non-waiting writer
+    // proves source IO does not retain the stopped coordinator owner.
+    assert!(!peer.is_finished());
+    let store = CoordinatorStore::open(&state, wall_ms()).unwrap();
     // Durable acceptance survives while source provisioning remains unready.
-    let store = CoordinatorStore::open_read_only(&state).unwrap();
     assert_eq!(store.queued_tasks(10).unwrap().len(), 2);
     assert!(store.list_nonterminal_attempts().unwrap().is_empty());
     drop(store);
@@ -569,7 +572,7 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
     transfer_file.try_lock().unwrap();
     drop(transfer_file);
     drop(guard);
-    let restart = tokio::time::timeout(Duration::from_secs(2), Resident::start(&config, inputs()))
+    let restart = tokio::time::timeout(Duration::from_secs(20), Resident::start(&config, inputs()))
         .await
         .unwrap()
         .unwrap();

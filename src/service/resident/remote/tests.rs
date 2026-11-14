@@ -18,6 +18,28 @@ fn config(text: &str) -> ResolvedConfig {
 }
 
 #[test]
+fn local_only_startup_does_not_require_private_ssh_registration_config() {
+    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let env = BTreeMap::from([("XDG_CONFIG_HOME".into(), root.path().display().to_string())]);
+    let dir = root.path().join("remote-task-runner");
+    private_dir(&dir).unwrap();
+    let path = dir.join("config.toml");
+    let text = "schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\n";
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let local = config(text);
+    assert!(snapshot(&local, &env, &WorkerId::parse("local").unwrap())
+        .unwrap()
+        .workers
+        .is_empty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}
+
+#[test]
 fn registration_is_private_bounded_and_snapshotted_from_user_only() {
     let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let env = BTreeMap::from([("XDG_CONFIG_HOME".into(), root.path().display().to_string())]);

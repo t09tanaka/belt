@@ -14,6 +14,12 @@ pub(super) fn snapshot(
 ) -> anyhow::Result<ResolvedConfig> {
     let mut snapshot = config.clone();
     snapshot.workers.clear();
+    // A local-only configuration does not enroll SSH peers. In particular,
+    // ordinary readable user config need not satisfy private registration's
+    // stricter file permissions when no remote worker was configured.
+    if config.workers.is_empty() {
+        return Ok(snapshot);
+    }
     let path = match crate::config::paths::user_config_path(env) {
         Ok(path) => path,
         Err(_) if config.workers.is_empty() => return Ok(snapshot),

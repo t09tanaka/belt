@@ -10,6 +10,7 @@ use remote_task_runner::state::{Observation, Outcome};
 use remote_task_runner::storage::CoordinatorStore;
 use remote_task_runner::wire::CommandSpec;
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
@@ -82,9 +83,12 @@ fn spawn_worker(home: &Path, cluster: &ClusterId, key: &Path, id: &str) -> Owned
             .args(["worker", "--input"])
             .arg(input)
             .env("HOME", home)
+            .env("TOKIO_WORKER_THREADS", "2")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(
+                std::fs::File::create(home.join("fixture-worker.stderr")).unwrap(),
+            ))
             .spawn()
             .unwrap(),
     )
@@ -208,13 +212,30 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
         store.cluster_id().clone()
     };
     let homes = [root.join("peer-a"), root.join("peer-b")];
-    let a = spawn_worker(&homes[0], &cluster, &key, "remote-a");
-    let b = spawn_worker(&homes[1], &cluster, &key, "remote-b");
-    for home in &homes {
-        wait_for("worker role socket", || {
-            home.join(".remote-task-runner/agent.sock").exists()
+    let mut a = spawn_worker(&homes[0], &cluster, &key, "remote-a");
+    let mut b = spawn_worker(&homes[1], &cluster, &key, "remote-b");
+    for (home, worker) in homes.iter().zip([&mut a, &mut b]) {
+        let ready = tokio::time::timeout(T, async {
+            loop {
+                if let Some(status) = worker.child.as_mut().unwrap().try_wait().unwrap() {
+                    return Err(status);
+                }
+                if home.join(".remote-task-runner/agent.sock").exists() {
+                    return Ok(());
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
         })
         .await;
+        if !matches!(ready, Ok(Ok(()))) {
+            let mut diagnostic = String::new();
+            std::fs::File::open(home.join("fixture-worker.stderr"))
+                .unwrap()
+                .take(8192)
+                .read_to_string(&mut diagnostic)
+                .unwrap();
+            panic!("owned worker startup {ready:?}: {diagnostic}");
+        }
     }
     let wrong_home = root.join("wrong-home");
     private(&wrong_home);
@@ -240,6 +261,7 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
             ("HOME".into(), root.display().to_string()),
             ("XDG_CONFIG_HOME".into(), xdg.display().to_string()),
             ("PATH".into(), "/usr/bin:/bin".into()),
+            ("TOKIO_WORKER_THREADS".into(), "2".into()),
             ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
             ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
         ]),
@@ -252,6 +274,7 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
             .args(["daemon", "--input"])
             .arg(&input)
             .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("TOKIO_WORKER_THREADS", "2")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::from(std::fs::File::create(&parent_log).unwrap()))
@@ -271,10 +294,31 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
     let client = Client::load(&state, cluster).unwrap();
     // Occupy the local slot first while both remotes are deliberately offline.
     let blocker = submit(&client, &state, &spec.env, &key, root, "blocker", u32::MAX).await;
-    wait_for("initial local execution", || {
-        root.join("count-blocker").exists()
+    if tokio::time::timeout(T, async {
+        while !root.join("count-blocker").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     })
-    .await;
+    .await
+    .is_err()
+    {
+        if let Some(attempt) = attempt(&state, &blocker) {
+            eprintln!(
+                "initial local state={:?} observation={:?}",
+                attempt.state, attempt.observation
+            );
+            super::bootstrap::diagnose_attempt(&spec, &attempt.attempt_id);
+            let worker =
+                remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
+                    .unwrap();
+            for event in worker.events_of_attempt(&attempt.attempt_id, 40).unwrap() {
+                eprintln!("initial local event={}", event.kind);
+            }
+        } else {
+            eprintln!("initial local attempt absent");
+        }
+        panic!("timed out waiting for initial local execution");
+    }
     assert_eq!(
         attempt(&state, &blocker).unwrap().worker_id.as_str(),
         "local"

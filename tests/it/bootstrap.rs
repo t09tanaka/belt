@@ -54,7 +54,7 @@ fn fixture() -> (tempfile::TempDir, Spec) {
 }
 // Private fixture metadata only: never dump argv, env, paths, journal payloads,
 // or arbitrary parse errors. Cap reads even when a child leaves malformed files.
-fn diagnose_attempt(spec: &Spec, attempt: &remote_task_runner::ids::AttemptId) {
+pub(super) fn diagnose_attempt(spec: &Spec, attempt: &remote_task_runner::ids::AttemptId) {
     use remote_task_runner::supervisor::spec::{command_id, SuperviseSpec};
     use task_traffic_controller::managed::Sidecar;
     fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
@@ -899,9 +899,22 @@ fn command_capture_directory_is_bound_once_and_source_view_reuses_it() {
     let dir = root.path().join("directory");
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("input"), "first immutable input").unwrap();
+    std::fs::write(dir.join("ignored.txt"), "excluded by directory policy").unwrap();
+    std::fs::write(
+        dir.join(".remote-task-runner.toml"),
+        "schema_version=1\n[[outputs]]\nname='report'\npaths=['report.txt']\n[source]\nexclude=['ignored.txt']\n",
+    ).unwrap();
     let mut context = Context::load(spec.env.clone(), dir.clone(), spec).unwrap();
+    assert!(context.repo_root.is_none());
+    assert_eq!(context.config.outputs.len(), 1);
     let run = remote_task_runner::ids::RunId::generate();
     let first = input::capture(&context, &run, None).unwrap();
+    assert!(!first
+        .manifest
+        .object_manifest
+        .entries
+        .iter()
+        .any(|entry| entry.path.0 == b"ignored.txt"));
     std::fs::write(dir.join("input"), "later content").unwrap();
     let second = input::capture(&context, &run, None).unwrap();
     assert_eq!(first.manifest.source_id, second.manifest.source_id);
@@ -2769,7 +2782,11 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
         std::fs::Permissions::from_mode(0o600),
     )
     .unwrap();
-    let output=tokio::time::timeout(Duration::from_secs(30),tokio::process::Command::new(&spec.executable).args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c","test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; exit 23"]).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v))).envs(&spec.env).current_dir(&input).output()).await.unwrap().unwrap();
+    std::fs::write(
+        input.join(".remote-task-runner.toml"),
+        "schema_version=1\n[[outputs]]\nname='report'\npaths=['report.txt']\nrequired=true\nwhen='always'\n",
+    ).unwrap();
+    let output=tokio::time::timeout(Duration::from_secs(30),tokio::process::Command::new(&spec.executable).args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c","test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; echo report > report.txt; exit 23"]).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v))).envs(&spec.env).current_dir(&input).output()).await.unwrap().unwrap();
     assert_eq!(
         output.status.code(),
         Some(23),
@@ -2819,6 +2836,11 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
         let payload: remote_task_runner::wire::AttemptPayload =
             serde_json::from_value(accepted.spec.clone()).unwrap();
         assert_eq!(payload.requirements, expected);
+        assert_eq!(payload.outputs.len(), 1);
+        assert_eq!(payload.outputs[0].name, "report");
+        let artifacts = owner.persisted_artifacts(&attempt.attempt_id).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].0, "report");
         assert!(!accepted.spec["_worker_profile_fingerprint"].is_null());
     }
     shutdown(&load(&spec)).await;

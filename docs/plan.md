@@ -4,6 +4,8 @@
 
 ## 前提
 
+- lease 更新の実プロセス試験は、準備開始・更新の durable commit・seed の更新キーと単一 monotonic 測定期限・コマンド開始・supervisor の更新キー観測を順に確認する。短い実時間枠内での起動速度や旧 watcher を期待せず、期限境界は純粋な LeaseClock 試験で検証する。観測 journal は best-effort 診断であり、lease の判定やコマンドの継続条件にしない。
+
 - 全 PR を `main` 宛てにし、単体で CI が通る形で都度マージする。依存列の「#N」は「#N が main にマージされた後、main から起点を切る」。
 - 共通の検証コマンド（RTR = remote-task-runner）: `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、GitHub Actions の緑。純粋モジュールは local-ci と同じく行カバレッジ 100% のゲートと cargo-schemata の変異テストに登録する。
 - 略称: RTR = remote-task-runner、LC = local-ci、TTC = task-traffic-controller。
@@ -195,7 +197,7 @@ S15a（PR #40、merge `8939ef2`）と S15b（PR #41、merge `05e981c`）は main
 
 managed init、独立 worker role、配置前の source readiness、双方向に revision で fence する Cancel/Retry を、利用者の local 実行経路の区切りとして統合する。異なる設計の担当コミットと独立レビュー結果を保持し、統合時の旧 IPC fixture と非同期 adoption の観測 race は別のテスト修正で扱う。storage 86 件、resident unit 8 件、completion 4 件、coordinator 41 件、retry/secret の実 CLI、resident integration 6 件、worker role 6 件と strict clippy が統合後に成功した。転送完了を待たず durable queued を返し、source gate と接続交換は SQLite commit 完了まで同期する。全体 CI とリモート検証が終わるまで本流へ統合しない。
 
-`--in-place`、requires/profile、条件付き・glob・複数 path の出力計画、公開 logs/outputs、retention/GC、estimate、SSH の接続所有と再接続は引き続き必須残件である。途中ログの storage 基盤と collector 接続は別 slice とし、終了後の再生だけを live follow 完成とは扱わない。
+`--in-place`、requires/profile、条件付き・glob・複数 path の出力計画、公開 logs/outputs、結果 retention と reader pin、SSH の接続所有・再接続は実装と個別検証後、同じ S15 feature branch へ統合した。統合後の全体 CI・公開は未完了。source/Vault の保持・消去、読み取り専用 estimate と実測 cost 接続は必須残件として継続する。
 
 統合 HEAD の全体ローカル CI は通常テスト・coverage を通過した一方、mutation の unmutated baseline で init readiness 2 件と captured submit 1 件が期限切れになった。原因は未確定で、変異の結果とは区別する。private fixture の owned child にだけ Tokio worker 数を制限し、init の終了状態・private stderr の固定分類、submit の bounded TTC ledger/sidecar metadata と worker journal を期限切れ時に残す。本番の CPU guard・期限・登録手順は変更しない。対象 3 件は各 3 回と strict clippy が成功した。診断追加後の全体 CI とリモート検証は未実施である。
 
@@ -261,7 +263,7 @@ root/祖先 FD と NOFOLLOW による unlink、競合対象の pending 再試行
 独立レビュアーの resolved 確認、全 CI と Linux 実行はこの実装修正時点では未完了。pure clock policy は変更していない。
 
 追加調査で enqueue の run INSERT が create_run の durable pin 準備を迂回していたため、両公開経路を確認し、enqueue も既存 blocking wrapper 内・DB transaction 前に pin を作成/fsync するよう修正した。
-pin 準備失敗時に run/task が公開されない回帰と、実 resident IPC の submit を全 worker offline で受理した直後に logs 共通 observer が pending を返し follow を継続する回帰が成功した。追加修正後の strict clippy all-targets/all-features も成功。独立レビューの resolved 確認と全 CI は引き続き未完了。
+pin 準備失敗時に run/task が公開されない回帰と、実 resident IPC の submit を全 worker offline で受理した直後に logs 共通 observer が pending を返し follow を継続する回帰が成功した。追加修正後の strict clippy all-targets/all-features も成功。独立レビューで元の3件と enqueue pin の解消を確認済み。統合後の全 CI は未実施。
 
 ### Public outputs と result retention GC の統合
 
@@ -295,3 +297,26 @@ strict all-target/all-feature clippy、fmt、diff check、公開禁止文字列 
 worker-local `profiles.toml` の active profile、実際の PATH での固定 tool probe、durable な execution requirements、forecast 前の候補除外と worker の独立 admission を接続する。project/CLI profile は配置 selector であり worker の環境を変更しない。profile fingerprint は setup/template、artifact と TTC command history に使い、受理時の実 identity は worker 内の記録へ固定する。tool drift は report を無効にし、再検査に通るまで新規受理・準備を拒否する。旧 peer は制約なし task のみ互換とする。
 
 この接続では S20 の version-file readers・baseline・typed match・nodenv/rustup/mise/fvm/corepack の detect/resolve/install/activate、S21 の diff/sync/doctor、S22/S23 の実機 service 環境 acceptance は完了しない。profile の nonempty `secret_refs` は安全な provider が未接続のため明示 unsupported とする。adapter/installable/secret provider を成功として申告しない。Flutter 標準 launcher と Dart bootstrap wrapper は `--version` でも SDK を導入し得るため、この slice では Unknown とし、S20 の noninstalling snapshot/native probe を必須残件とする（native Dart は測定する）。optional tool は固定された最大 14 fixed calls を各 300ms 以内で probe する。要求された tool のみの lazy probe/cache、installed-version inventory と private tool-root adapters は後続の必須実装へ引き継ぐ。
+
+
+### S15 機能接続の確認（2026-11-14）
+
+SSH owner、公開 logs/outputs、in-place、結果保持、private profile と能力判定を同じ feature branch へ接続した。
+outputs と requirements は両方を payload・計画 digest へ保持し、両方の feature 交渉と PURE/coverage/mutation 対象を統合した。
+TTC history は profile だけの上書きにせず、正規化された command identity と実 profile fingerprint を組み合わせる。
+
+接続検証で local-only 起動に SSH 登録専用の private-file 検査を適用する問題と、非 Git directory の project 設定を読まない問題を修正した。
+remote が設定されている場合の private 登録検査は維持し、directory の source identity は非 Git のまま出力・除外方針を読む。
+関連 51 件、全 target/all feature の型検査、strict clippy と fmt が成功した。
+実 CLI で profile/requires と required/always output を同時に使い、元 snapshot の retry でも制約・出力宣言・回収済み artifact を保持することを確認した。
+SSH の2 worker・切断・再接続・local 継続は2回成功した。途中の期限切れは原因未確定として扱い、私有 child の runtime thread 数制限と bounded 起動/attempt 診断を fixture に追加した。
+worker spec の env 許可制は維持し、runtime 制限は所有プロセス側で行う。
+この統合 HEAD の全体 CI・リモート CI は未実施であり、S15 完了とは扱わない。
+
+PR #43（merge `98b91156ff22e0a6e72a41b0d084a8f113dc3584`）は lease seed の単一 monotonic 計測と owner Drop 時の明示 unlock を統合した。
+対象 `9b725b7` のローカル9ジョブ、リモート9ジョブが成功した。ローカル未対応 installer と Docker cleanup 未確認は成功へ置き換えていない。
+PR #42 の修正へ接続した `de35f94` はローカル7ジョブ成功、2ジョブ失敗。mutation shard 3 の unmutated baseline で setup 4件・workspace hook 1件・captured submit 1件が失敗し、残る1件は report 不足による gate 失敗である。
+通常テストと coverage は成功しており、baseline の原因確認・修正を継続する。変異 survivor や正常終了として報告しない。
+
+source 保持は別 feature で削除しない root/index・cross-process guard・候補 preview を先行実装中で、実消去は未有効。
+S15f、S16、S18〜S26 の必須範囲と Docker 受入・実機固有の未検証範囲は維持する。

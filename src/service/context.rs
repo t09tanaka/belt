@@ -53,7 +53,10 @@ impl Context {
                 "cannot determine the source repository; Git preflight failed",
             ));
         };
-        let config = crate::config::load::load(&env, root.as_deref(), &Overlay::default())
+        // Directory snapshots have project configuration too. Keep their
+        // source identity non-Git, but resolve policy from the capture root.
+        let project = root.as_deref().unwrap_or(&cwd);
+        let config = crate::config::load::load(&env, Some(project), &Overlay::default())
             .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
         Ok(Self {
             env,
