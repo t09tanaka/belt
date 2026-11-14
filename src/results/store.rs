@@ -101,11 +101,14 @@ pub enum Publish {
 #[derive(Debug, Clone)]
 pub struct ResultStore {
     root: PathBuf,
+    deletion_root: Arc<File>,
     /// The `.part` files this process began at their first byte.
     begun: Arc<Mutex<HashSet<PathBuf>>>,
     crash: Arc<Mutex<Option<Crash>>>,
     #[cfg(test)]
     append_pause: Arc<Mutex<Option<AppendPause>>>,
+    #[cfg(test)]
+    remove_pause: Arc<Mutex<Option<AppendPause>>>,
 }
 
 #[cfg(test)]
@@ -185,6 +188,61 @@ fn open_root(root: &Path) -> io::Result<File> {
         Mode::empty(),
     )?
     .into())
+}
+
+fn delete_dir_flags() -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+fn delete_names(dir: &File) -> io::Result<Vec<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsStr::from_bytes(name).to_owned());
+        }
+    }
+    Ok(names)
+}
+
+fn unlink_open_dir(parent: &File, name: &std::ffi::OsStr, dir: &File) -> io::Result<()> {
+    use rustix::fs::{fstat, statat, unlinkat, AtFlags};
+    let opened = fstat(dir)?;
+    let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino) {
+        return Err(io::Error::other("result directory changed"));
+    }
+    unlinkat(parent, name, AtFlags::REMOVEDIR)?;
+    parent.sync_all()
+}
+
+/// Every recursive step is anchored to a held directory. A symlink leaf is
+/// unlinked, never followed; a concurrent symlink substitution cannot redirect
+/// any traversal, including the temporary-directory cleanup.
+fn remove_entry(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+    use rustix::fs::{openat, statat, unlinkat, AtFlags, FileType, Mode};
+    let stat = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+        let dir = File::from(openat(parent, name, delete_dir_flags(), Mode::empty())?);
+        let opened = rustix::fs::fstat(&dir)?;
+        if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino) {
+            return Err(io::Error::other("result directory changed"));
+        }
+        for child in delete_names(&dir)? {
+            remove_entry(&dir, &child)?;
+        }
+        unlink_open_dir(parent, name, &dir)?;
+    } else {
+        unlinkat(parent, name, AtFlags::empty())?;
+    }
+    parent.sync_all()
 }
 
 impl LogPrefixReader {
@@ -399,10 +457,13 @@ impl ResultStore {
         dir_all(root)?;
         Ok(ResultStore {
             root: root.to_path_buf(),
+            deletion_root: Arc::new(open_root(root)?),
             begun: Arc::default(),
             crash: Arc::default(),
             #[cfg(test)]
             append_pause: Arc::default(),
+            #[cfg(test)]
+            remove_pause: Arc::default(),
         })
     }
 
@@ -795,31 +856,54 @@ impl ResultStore {
             .strip_prefix(LOCATOR_PREFIX)
             .and_then(relative_path)
             .ok_or_else(|| StoreError::BadName(locator.to_string()))?;
-        let path = self.root.join(&rel);
-        let gone = match fs::symlink_metadata(&path) {
-            Ok(m) if m.is_dir() => fs::remove_dir_all(&path),
-            Ok(_) => fs::remove_file(&path),
-            Err(e) => Err(e),
-        };
-        match gone {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
+        use rustix::fs::{openat, Mode};
+        use std::os::unix::fs::MetadataExt;
+        // Reject a replaced root. Ancestor aliases in the configured path must
+        // still resolve to the directory opened with this store.
+        let current = open_root(&self.root)?;
+        let original = self.deletion_root.metadata()?;
+        let current = current.metadata()?;
+        if (current.dev(), current.ino()) != (original.dev(), original.ino()) {
+            return Err(io::Error::other("result root changed").into());
         }
-        // Empty directories above it, up to the attempt's own.
-        let mut dir = path.parent();
-        while let Some(d) = dir.filter(|d| *d != self.root && d.starts_with(&self.root)) {
-            if d.parent() == Some(self.root.as_path()) {
-                // What is left of an attempt without files is its `tmp`.
-                let only_tmp = fs::read_dir(d)
-                    .is_ok_and(|entries| entries.flatten().all(|e| e.file_name() == "tmp"));
-                if only_tmp {
-                    let _ = fs::remove_dir_all(d.join("tmp"));
+        let names: Vec<_> = rel.iter().collect();
+        let mut dirs = vec![self.deletion_root.try_clone()?];
+        for name in &names[..names.len() - 1] {
+            match openat(
+                dirs.last().unwrap(),
+                *name,
+                delete_dir_flags(),
+                Mode::empty(),
+            ) {
+                Ok(fd) => dirs.push(File::from(fd)),
+                Err(rustix::io::Errno::NOENT) => return Ok(()),
+                Err(e) => return Err(io::Error::from(e).into()),
+            }
+        }
+        #[cfg(test)]
+        if let Some(pause) = self.remove_pause.lock().unwrap().take() {
+            pause.entered.send(()).unwrap();
+            pause
+                .resume
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        remove_entry(dirs.last().unwrap(), names.last().unwrap())?;
+        // Cleanup is also relative to the descriptors used for traversal.
+        // Never reopen an ancestor through its mutable pathname.
+        for i in (1..dirs.len()).rev() {
+            let dir = &dirs[i];
+            if i == 1 {
+                let entries = delete_names(dir)?;
+                if entries.iter().all(|n| n == "tmp") {
+                    remove_entry(dir, std::ffi::OsStr::new("tmp"))?;
                 }
             }
-            if fs::remove_dir(d).is_err() {
-                break;
+            match unlink_open_dir(&dirs[i - 1], names[i - 1], dir) {
+                Ok(()) => {}
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::ENOENT)) => break,
+                Err(e) => return Err(e.into()),
             }
-            dir = d.parent();
         }
         Ok(())
     }
@@ -1344,6 +1428,84 @@ mod tests {
         assert_eq!(
             s.publish_artifact(a, &d, 10).unwrap(),
             Publish::Mismatch { whole: true }
+        );
+    }
+
+    #[test]
+    fn deletion_never_follows_ancestor_root_or_leaf_symlinks() {
+        use std::os::unix::fs::symlink;
+        let f = fx();
+        let store = f.open();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("logs")).unwrap();
+        fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
+        let attempt = store.attempt_dir(&f.a);
+        symlink(outside.path(), &attempt).unwrap();
+        assert!(store.remove(&ResultStore::logs_locator(&f.a)).is_err());
+        fs::remove_file(&attempt).unwrap();
+        fs::create_dir(&attempt).unwrap();
+        symlink(outside.path(), attempt.join("artifacts")).unwrap();
+        assert!(store
+            .remove(&ResultStore::artifact_locator(
+                &f.a,
+                &Digest::of_bytes(b"x")
+            ))
+            .is_err());
+        // A claimed symlink itself may be unlinked, but its destination survives.
+        symlink(outside.path().join("logs"), attempt.join("logs")).unwrap();
+        store.remove(&ResultStore::logs_locator(&f.a)).unwrap();
+        assert_eq!(
+            fs::read(outside.path().join("logs/sentinel")).unwrap(),
+            b"safe"
+        );
+        let old = store.root().with_extension("old");
+        fs::rename(store.root(), &old).unwrap();
+        symlink(outside.path(), store.root()).unwrap();
+        assert!(store.remove(&ResultStore::logs_locator(&f.a)).is_err());
+        fs::remove_file(store.root()).unwrap();
+        fs::create_dir(store.root()).unwrap();
+        assert!(store.remove(&ResultStore::logs_locator(&f.a)).is_err());
+        assert_eq!(
+            fs::read(outside.path().join("logs/sentinel")).unwrap(),
+            b"safe"
+        );
+    }
+
+    #[test]
+    fn deletion_holds_open_ancestor_across_rename_and_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+        use std::sync::mpsc;
+        let f = fx();
+        let store = f.open();
+        store
+            .append_log(&f.a, LogStream::Stdout, 0, b"owned")
+            .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("logs")).unwrap();
+        fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
+        let (entered, got_entered) = mpsc::channel();
+        let (resume, got_resume) = mpsc::channel();
+        *store.remove_pause.lock().unwrap() = Some(AppendPause {
+            entered,
+            resume: got_resume,
+        });
+        let worker = store.clone();
+        let locator = ResultStore::logs_locator(&f.a);
+        let thread = std::thread::spawn(move || worker.remove(&locator));
+        got_entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let attempt = store.attempt_dir(&f.a);
+        let moved = store.root().join("moved");
+        fs::rename(&attempt, &moved).unwrap();
+        symlink(outside.path(), &attempt).unwrap();
+        resume.send(()).unwrap();
+        // Cleanup detects the substituted ancestor instead of traversing it.
+        assert!(thread.join().unwrap().is_err());
+        assert!(!moved.join("logs").exists());
+        assert_eq!(
+            fs::read(outside.path().join("logs/sentinel")).unwrap(),
+            b"safe"
         );
     }
 

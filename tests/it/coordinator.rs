@@ -666,6 +666,7 @@ impl Fx {
 pub(crate) fn spec() -> TaskSpec {
     TaskSpec {
         outputs: Vec::new(),
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
@@ -2588,4 +2589,36 @@ async fn source_gate_unrestricted_forecast_cannot_commit_into_a_gated_replacemen
         .is_empty());
     assert!(attempts(&c, &tasks[0]).is_empty());
     assert!(replacement.gate.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn in_place_scheduler_uses_only_explicit_parent_local_and_never_automatic_retry() {
+    let f = fx();
+    let remote = f.worker("a-remote", (1, 0));
+    let local = f.worker("z-local", (1, 0));
+    let c = f.open(&[&remote, &local]);
+    let task = TaskId::generate();
+    let mut input = spec();
+    input.in_place = true;
+    c.enqueue(RunId::generate(), source(&c), vec![(task.clone(), input)])
+        .await
+        .unwrap();
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert!(remote.holds().is_empty());
+    c.set_parent_local(local.id.clone());
+    c.tick().await.unwrap();
+    let attempt = only(&c, &task);
+    assert_eq!(attempt.worker_id, local.id);
+    assert!(remote.holds().is_empty());
+    c.request_retire(&attempt.attempt_id, "move").await.unwrap();
+    c.tick().await.unwrap();
+    assert_eq!(
+        only(&c, &task).termination.unwrap().outcome(),
+        Outcome::Failed
+    );
+    for _ in 0..3 {
+        assert!(c.tick().await.unwrap().placed.is_empty());
+    }
+    assert_eq!(attempts(&c, &task).len(), 1);
+    assert!(remote.holds().is_empty());
 }

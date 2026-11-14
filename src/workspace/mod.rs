@@ -24,6 +24,7 @@
 
 mod fastwt;
 mod git;
+pub mod in_place;
 mod overlay;
 pub mod plan;
 
@@ -530,8 +531,8 @@ impl Workspaces {
     /// The user's own worktree as the workspace of an `--in-place` run. Nothing
     /// is copied and nothing is removed later; the supervisor keeps
     /// [`plan::IN_PLACE_PROTECTED`] out of the run's reach. The directory has
-    /// to be the top of a Git worktree (not the home directory, not the file
-    /// system root), and the working directory, resolved, has to stay inside it.
+    /// to be a project directory (the top when it is a Git worktree), not the
+    /// home directory or file system root; the resolved cwd stays inside it.
     pub fn open_in_place(
         &self,
         dir: &Path,
@@ -556,7 +557,7 @@ impl Workspaces {
         let top = git::run(&self.env, &real, &["rev-parse", "--show-toplevel"])
             .ok()
             .and_then(|t| std::fs::canonicalize(t).ok());
-        if top.as_deref() != Some(real.as_path()) {
+        if top.is_some() && top.as_deref() != Some(real.as_path()) {
             return Err(ApiError::new(
                 ErrorCode::InvalidInput,
                 format!(

@@ -218,3 +218,36 @@ Public outputs slice connects paged read-only immutable artifact metadata and du
 
 Public outputs independent review corrections restrict artifact query records to name, encoding, digest and size; declaration paths and execution identities remain private. Producer and retained export share the reserved component namespace and existing Unicode/case folding. Retained archive validation failures use Internal (79), while destination argument errors and no-replace conflicts retain their existing codes. Regression coverage includes exact public metadata keys, reserved nested/alias paths, malformed archives with matching outer receipts, and zero member publication before complete preflight. GC invocation pin integration remains a separate mandatory dependency.
 Focused output tests (13), real offline CLI corruption/export regressions (2), and strict all-target clippy pass for these corrections. Independent resolution review and combined full CI remain parent integration checks.
+
+S15d in-place slice は公開 `exec --in-place` を既存の型付きWorkspaceへ接続する。
+Git worktree / directoryの原本rootをprivate run bindingに保持し、baseline sourceと
+mutable modeを分離する。親local identityのscheduler制限とworker admissionの両方で
+remote配置を拒否し、setup template/cacheと自動retryを無効化する。明示retryはD2の
+停止・回収・revision条件を維持して同じ原本を再実行する。元secret inventoryの増減は
+新しいexecを求め、値変更は現物をread-onlyでmaskする。原本へのsecret配置・消去を
+行わない。public task/completionはpathを含めずin_place flagを示す。private bindingは
+親stateとともに保持し、個別GCは後続の親retention統合事項とする。
+
+このsliceのfocused検証はin-place unit 5件・integration 8件（実CLIの原本更新、
+owner再起動と明示retry、Git secret現物maskとinventory拒否、prepareとrequired output、
+SIGINT停止確定、scheduler / worker admission / 原本cleanup）に加え、secret unit 76件、
+retry関連20件、legacy payload hash 1件、既存実SIGINT 1件、未実装CLI grammar 3件が成功。
+strict all-target / all-feature clippy、fmt、diff checkが成功。全体CIと公開は統合時に行う。
+
+独立レビューのP2（元subdirectoryが外部symlinkへ差し替わると明示retryでroot外へ
+cwdが解決される）を修正した。Agentのprepareでin-placeの全command cwdを
+canonicalizeし、directoryかつ検証済み原本root内の場合のみresolved pathを使う。
+owner再起動後の差替えretryがrunning前に拒否され、外部markerを作らず原本とsecretを
+保つ回帰を含むin-place unit 5件・integration 9件、通常snapshot exec回帰、strict clippy
+が成功した。TTCのpath登録後に同UIDが任意に差し替える競合への新たなFD layerは追加していない。
+
+### 結果 retention GC の独立レビュー修正
+
+独立レビューの 3 指摘（祖先 symlink 経由の外部削除、GC pin 競合時の live collection 全体停止、run 選択での task 全件集計）に限定して修正する。
+root/祖先 FD と NOFOLLOW による unlink、競合対象の pending 再試行、run ID index の 1 件 keyset query を実装した。
+実 GC claim と外部 sentinel、root/祖先/leaf symlink と rename 競合、pin 競合中の収集/tick と実 resident の IPC/lease 継続・解放後の回収再開、破損 pin、2000 task と EXPLAIN/no-task-facts の回帰を追加した。
+修正後の results unit 39 件、guarded retention 4 件、indexed run 選択 1 件、実 resident の競合回帰 1 件、collection 競合回帰 2 件、strict clippy all-targets/all-features は成功。collection 全体は 38 件中 37 件成功後、新規 fixture の pin backfill 不足を修正し、その 2 件を再実行して成功した。
+独立レビュアーの resolved 確認、全 CI と Linux 実行はこの実装修正時点では未完了。pure clock policy は変更していない。
+
+追加調査で enqueue の run INSERT が create_run の durable pin 準備を迂回していたため、両公開経路を確認し、enqueue も既存 blocking wrapper 内・DB transaction 前に pin を作成/fsync するよう修正した。
+pin 準備失敗時に run/task が公開されない回帰と、実 resident IPC の submit を全 worker offline で受理した直後に logs 共通 observer が pending を返し follow を継続する回帰が成功した。追加修正後の strict clippy all-targets/all-features も成功。独立レビューの resolved 確認と全 CI は引き続き未完了。

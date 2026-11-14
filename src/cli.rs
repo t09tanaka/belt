@@ -267,7 +267,7 @@ pub fn run(cli: Cli) -> i32 {
         };
     }
 
-    if matches!(&cli.command,Command::Exec(args) if !args.in_place)
+    if matches!(&cli.command, Command::Exec(_))
         || matches!(
             &cli.command,
             Command::Wait(_) | Command::Cancel(_) | Command::Retry(_)
@@ -386,9 +386,10 @@ fn run_control(cli: &Cli) -> i32 {
             });
             let result = match &cli.command {
                 Command::Exec(args) => {
-                    crate::service::control::exec(
+                    crate::service::control::exec_mode(
                         crate::service::context::Context::load(env, cwd, spec.clone())?,
                         args.command.clone(),
+                        args.in_place,
                         &mut receiver,
                     )
                     .await
@@ -448,6 +449,11 @@ fn run_control(cli: &Cli) -> i32 {
                     crate::service::completion::Target::Run(id) => id.to_string(),
                     crate::service::completion::Target::Task(id) => id.to_string(),
                 };
+                if report.snapshot.as_ref().is_some_and(|s| s.in_place) {
+                    eprintln!(
+                        "in-place: mutable original workspace; snapshot is a comparison baseline"
+                    );
+                }
                 if let Some(task) = &report.task_id {
                     println!("{id} {task} {}", report.state);
                 } else {

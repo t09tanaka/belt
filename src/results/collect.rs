@@ -292,7 +292,9 @@ fn wanted<'a>(
 }
 
 /// One pass over the collections of one worker.
+#[derive(Clone)]
 pub struct Collector {
+    pin: Option<Arc<crate::results::pin::RunPin>>,
     store: Arc<CoordinatorStore>,
     files: Arc<ResultStore>,
     cfg: CollectConfig,
@@ -316,6 +318,7 @@ impl Collector {
         cfg: CollectConfig,
     ) -> Collector {
         Collector {
+            pin: None,
             store,
             files,
             cfg,
@@ -365,7 +368,9 @@ impl Collector {
     {
         let store = Arc::clone(&self.store);
         let collecting = self.collecting.clone();
+        let pin = self.pin.clone();
         match tokio::task::spawn_blocking(move || {
+            let _pin = pin;
             // Retain the same writer guard through a commit even if its async
             // waiter is dropped before this blocking job is scheduled.
             let out = f(&store);
@@ -387,7 +392,9 @@ impl Collector {
         let files = Arc::clone(&self.files);
         let owner = Arc::clone(&self.store);
         let collecting = self.collecting.clone();
+        let pin = self.pin.clone();
         match tokio::task::spawn_blocking(move || {
+            let _pin = pin;
             // A dropped async caller cannot cancel a blocking file mutation.
             // Retain the process owner lock until that mutation has drained;
             // an interrupted DB commit leaves only a recoverable private tail.
@@ -452,6 +459,28 @@ impl Collector {
     /// Work on one collection. An `Err` is about this attempt only, unless
     /// it is `Fenced` or `Aborted`.
     async fn one(
+        &self,
+        link: Option<&dyn WorkerLink>,
+        c: &Collectable,
+        deadline: Instant,
+    ) -> Result<End> {
+        let mut pinned = self.clone();
+        let attempt = c.record.attempt_id.clone();
+        pinned.pin = match self
+            .db(move |store| store.result_writer_pin(&attempt))
+            .await
+        {
+            Ok(pin) => Some(Arc::new(pin)),
+            Err(CollectError::Storage(StorageError::Io(e)))
+                if e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                return Ok(End::Pending)
+            }
+            Err(e) => return Err(e),
+        };
+        pinned.one_pinned(link, c, deadline).await
+    }
+    async fn one_pinned(
         &self,
         link: Option<&dyn WorkerLink>,
         c: &Collectable,
@@ -1096,6 +1125,21 @@ impl Collector {
                     .push((a, "no source node to read logs".into()));
                 continue;
             };
+            let mut pinned = self.clone();
+            let attempt = a.clone();
+            pinned.pin = match self
+                .db(move |store| store.result_writer_pin(&attempt))
+                .await
+            {
+                Ok(pin) => Some(Arc::new(pin)),
+                Err(CollectError::Storage(StorageError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    report.pending.push(a);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let mut retry = false;
             for (index, stream) in [LogStream::Stdout, LogStream::Stderr]
                 .into_iter()
@@ -1117,7 +1161,7 @@ impl Collector {
                 } else {
                     deadline
                 };
-                match self
+                match pinned
                     .read_log_step(link, &a, &node, stream, step_deadline)
                     .await
                 {

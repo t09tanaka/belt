@@ -1199,8 +1199,9 @@ fn in_place_wants_the_top_of_a_worktree_inside_which_the_cwd_stays() {
     // not a Git worktree
     let plain = f.root.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
-    let e = ws.open_in_place(&plain, Path::new(""), true).unwrap_err();
-    assert_eq!(e.code, ErrorCode::InvalidInput);
+    let original = ws.open_in_place(&plain, Path::new(""), true).unwrap();
+    ws.remove(&original).unwrap();
+    assert!(plain.is_dir());
     // inside one, not its top
     let e = ws
         .open_in_place(&f.dir.join("pkg"), Path::new(""), true)

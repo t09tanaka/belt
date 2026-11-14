@@ -1263,10 +1263,24 @@ impl Agent {
         for c in order.into_iter().map(|i| &commands[i]) {
             let rel = Path::new(&c.cwd);
             check_cwd_relative(rel)?;
+            let cwd = if ws.kind == crate::workspace::WorkspaceKind::InPlace {
+                // Recheck every command, including recovered preparation and
+                // explicit retry: the original tree is mutable between attempts.
+                let resolved = fs::canonicalize(ws.cwd.join(rel))
+                    .map_err(|_| invalid("in-place command cwd is unavailable"))?;
+                if !resolved.is_dir() || !resolved.starts_with(&ws.root) {
+                    return Err(invalid(
+                        "in-place command cwd leaves the original workspace",
+                    ));
+                }
+                resolved
+            } else {
+                ws.cwd.join(rel)
+            };
             nodes.push(NodeSpec {
                 node_id: c.node_id.clone(),
                 argv: c.argv.clone(),
-                cwd: ws.cwd.join(rel),
+                cwd,
                 env: c.env.clone(),
                 weight: None,
                 timeout_ms: c.timeout_ms,
@@ -1728,6 +1742,7 @@ impl Agent {
         let fresh = self.store.get(&r.attempt_id).map_err(api)?.is_none()
             && self.store.tombstone(&r.attempt_id).map_err(api)?.is_none();
         if fresh {
+            self.host.admit(&r.payload)?;
             policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
             for c in &r.payload.commands {
                 check_cwd_relative(Path::new(&c.cwd))?;

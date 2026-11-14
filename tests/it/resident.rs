@@ -125,6 +125,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
                 when: remote_task_runner::wire::OutputWhen::Always,
             },
         ],
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::parse(manifest)

@@ -813,6 +813,9 @@ impl ArtifactEncoding {
 /// `payload_hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptPayload {
+    /// Mutable local workspace; source is a comparison baseline only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_place: bool,
     pub run_id: RunId,
     pub task_id: TaskId,
     pub generation: Generation,
@@ -1761,6 +1764,7 @@ mod tests {
     fn payload() -> AttemptPayload {
         AttemptPayload {
             outputs: Vec::new(),
+            in_place: false,
             setup: None,
             run_id: RunId::generate(),
             task_id: TaskId::generate(),
@@ -2928,6 +2932,13 @@ mod tests {
             assert_eq!(canonical_json(&v).unwrap(), BEFORE);
             assert_eq!(payload_hash(p).unwrap().to_string(), HASH);
         }
+        let mut mutable = absent.clone();
+        mutable.in_place = true;
+        assert_ne!(
+            payload_hash(&mutable).unwrap(),
+            payload_hash(&absent).unwrap()
+        );
+        assert_eq!(serde_json::to_value(&mutable).unwrap()["in_place"], true);
         // A declaration is written, and is another payload.
         let mut declared = absent.clone();
         declared.artifacts = payload().artifacts;

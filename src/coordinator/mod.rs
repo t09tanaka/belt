@@ -94,6 +94,9 @@ type Result<T, E = CoordinatorError> = std::result::Result<T, E>;
 /// from this by [`build_payload`] and nowhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
+    /// Mutable local workspace; source is a comparison baseline only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_place: bool,
     #[serde(default)]
     pub setup: Option<crate::wire::SetupSpec>,
     pub plan_digest: PlanDigest,
@@ -126,6 +129,7 @@ pub fn build_payload(
         .clone()
         .ok_or_else(|| StorageError::Invalid(format!("run {} has no source", input.run_id)))?;
     Ok(AttemptPayload {
+        in_place: spec.in_place,
         setup: spec.setup.clone(),
         run_id: input.run_id.clone(),
         task_id: input.task_id.clone(),
@@ -289,6 +293,7 @@ pub struct Coordinator {
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
+    parent_local: Mutex<Option<WorkerId>>,
     actor: tokio::sync::Mutex<()>,
     /// One pass of result collection at a time.
     collecting: Arc<tokio::sync::Mutex<()>>,
@@ -338,6 +343,7 @@ impl Coordinator {
             store: Arc::new(store),
             cfg,
             workers: Mutex::default(),
+            parent_local: Mutex::default(),
             actor: tokio::sync::Mutex::new(()),
             collecting: Arc::new(tokio::sync::Mutex::new(())),
             collect_waits: Arc::default(),
@@ -393,6 +399,10 @@ impl Coordinator {
         } else {
             Ok(())
         }
+    }
+
+    pub fn set_parent_local(&self, worker: WorkerId) {
+        *self.parent_local.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
     }
 
     /// Install a verified connection. Replacement is linearized with placement
@@ -1164,17 +1174,27 @@ impl Coordinator {
             // This task only; the ones behind it are placed.
             Err(e) => return self.note_unplaceable(task, format!("task spec: {e}")).await,
         };
-        let readiness = |w: &Reached| match w.link.placement_inputs() {
-            None => Some(None),
-            Some(snapshot) => snapshot
-                .ready
-                .iter()
-                .any(|i| {
-                    i.run_id == task.run_id
-                        && Some(&i.source_id) == task.source_id.as_ref()
-                        && i.manifest_digest == spec.manifest_digest
-                })
-                .then_some(Some(snapshot.generation)),
+        let parent_local = self
+            .parent_local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let readiness = |w: &Reached| {
+            if spec.in_place && parent_local.as_ref() != Some(&w.worker_id) {
+                return None;
+            }
+            match w.link.placement_inputs() {
+                None => Some(None),
+                Some(snapshot) => snapshot
+                    .ready
+                    .iter()
+                    .any(|i| {
+                        i.run_id == task.run_id
+                            && Some(&i.source_id) == task.source_id.as_ref()
+                            && i.manifest_digest == spec.manifest_digest
+                    })
+                    .then_some(Some(snapshot.generation)),
+            }
         };
         let ready = |w: &Reached| readiness(w).is_some();
         if !round.open.is_empty() && !round.open.iter().any(&ready) {

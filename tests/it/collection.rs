@@ -16,7 +16,58 @@ use remote_task_runner::error::{ApiError, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::platform::wall_ms;
 use remote_task_runner::results::plan::{RunVerdict, TaskStanding, Verdict};
-use remote_task_runner::results::retention::sweep;
+// Deterministic clock samples for retention integration; production uses
+// suspend-aware platform samples and a persisted quarantine baseline.
+#[derive(Default)]
+struct Sweep {
+    deleted: Vec<String>,
+}
+fn sweep(
+    store: &remote_task_runner::storage::CoordinatorStore,
+    files: &ResultStore,
+    now: u64,
+    days: u32,
+) -> Result<Sweep, remote_task_runner::results::CollectError> {
+    let retention = remote_task_runner::results::plan::retention_ms(days);
+    let mut report = Sweep::default();
+    for run in store.query_runs(64, None)?.items {
+        let guard = store.result_gc_guard(&run.run_id)?;
+        // Give the fixture a full, known elapsed retention interval.
+        store.claim_result_page(
+            &guard,
+            &run.run_id,
+            "",
+            64,
+            1,
+            1,
+            Some("integration".into()),
+            retention,
+        )?;
+        let mut after = String::new();
+        loop {
+            let page = store.claim_result_page(
+                &guard,
+                &run.run_id,
+                &after,
+                64,
+                now,
+                now,
+                Some("integration".into()),
+                retention,
+            )?;
+            for claim in store.pending_result_page(&guard, &run.run_id, 64)? {
+                files.remove(&claim.locator)?;
+                store.finish_result_delete(&guard, &claim)?;
+                report.deleted.push(claim.locator);
+            }
+            match page.next {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+    }
+    Ok(report)
+}
 use remote_task_runner::results::{CollectConfig, CollectReport, ResultStore};
 use remote_task_runner::state::{
     AttemptState, Collection, Observation, Outcome, Receipt, Receipts, RunDisplay, Termination,
@@ -491,6 +542,7 @@ fn decl(name: &str, if_missing: MissingPolicy) -> ArtifactDecl {
 fn spec(artifacts: Vec<ArtifactDecl>) -> TaskSpec {
     TaskSpec {
         outputs: Vec::new(),
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
@@ -1774,6 +1826,74 @@ async fn a_name_that_is_published_is_not_fetched_over_with_other_bytes() {
 }
 
 // ------------------------------------------------ durable active prefixes
+
+#[tokio::test]
+async fn gc_pin_contention_skips_live_poll_without_stopping_coordinator() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (run, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| {
+        let job = s.jobs.get_mut(&a).unwrap();
+        job.state = AttemptState::Active;
+        job.out.log = b"live".to_vec();
+    });
+    c.tick().await.unwrap();
+    let guard = c.store().result_gc_guard(&run).unwrap();
+    let report = c.collect(&files, cfg()).await.unwrap();
+    assert!(report.pending.contains(&a));
+    assert!(report.faults.is_empty());
+    // A fresh coordinator tick and metadata request remain usable under GC.
+    c.tick().await.unwrap();
+    assert_eq!(
+        c.store().get_attempt(&a).unwrap().unwrap().state,
+        AttemptState::Active
+    );
+    assert!(c
+        .store()
+        .log_progress(&a, LogStream::Stdout)
+        .unwrap()
+        .is_none());
+    drop(guard);
+    let report = c.collect(&files, cfg()).await.unwrap();
+    assert!(report.faults.is_empty());
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"live");
+}
+
+#[tokio::test]
+async fn gc_pin_contention_leaves_terminal_collection_pending_and_corruption_errors() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (run, _, a) = placed(&fx, &c, vec![]).await;
+    end(
+        &fx,
+        &c,
+        &a,
+        Outcome::Succeeded,
+        Out {
+            has_result: true,
+            log_closed: true,
+            ..Out::default()
+        },
+    )
+    .await;
+    let guard = c.store().result_gc_guard(&run).unwrap();
+    let report = c.collect(&files, cfg()).await.unwrap();
+    assert!(report.pending.contains(&a));
+    assert!(report.faults.is_empty());
+    drop(guard);
+    assert_eq!(collect(&c, &files).await.collected, vec![a]);
+
+    // A malformed pin is an I/O failure, not ordinary GC contention.
+    let (run, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| s.jobs.get_mut(&a).unwrap().state = AttemptState::Active);
+    c.tick().await.unwrap();
+    drop(c.store().result_gc_guard(&run).unwrap());
+    let pin = fx.dir.path().join(format!("reader-pins/{run}.lock"));
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(c.collect(&files, cfg()).await.is_err());
+    std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
 
 #[tokio::test]
 async fn active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset() {

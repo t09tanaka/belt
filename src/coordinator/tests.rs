@@ -22,6 +22,7 @@ impl WorkerLink for Silent {
 fn spec() -> TaskSpec {
     TaskSpec {
         outputs: Vec::new(),
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),

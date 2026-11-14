@@ -219,6 +219,8 @@ struct CapturedInputs {
     vault: crate::secrets::vault::Vault,
     key: crate::secrets::key::ClusterKey,
     env: std::collections::BTreeMap<String, String>,
+    parent_state: std::path::PathBuf,
+    local_worker: WorkerId,
 }
 
 impl CapturedInputs {
@@ -263,6 +265,24 @@ impl CapturedInputs {
         if prepared.manifest_digest != digest {
             return Err(unavailable());
         }
+        if prepared.in_place {
+            let b = crate::workspace::in_place::load(
+                &self.parent_state,
+                run,
+                &prepared.source_id,
+                &digest,
+                &self.local_worker,
+            )
+            .map_err(|_| unavailable())?;
+            let paths = manifest
+                .secret_files
+                .iter()
+                .map(|s| s.path.display())
+                .collect::<Vec<_>>();
+            crate::workspace::in_place::read_secrets(&b, &self.env, &paths)
+                .map_err(|_| StorageError::SecretUnavailable)?;
+            return Ok(false);
+        }
         self.vault
             .load(run, &manifest.secret_files, &self.key)
             .map_err(|_| StorageError::SecretUnavailable)?;
@@ -285,6 +305,7 @@ pub struct Resident {
     heartbeat: Duration,
     collection_interval: Duration,
     collection: CollectConfig,
+    retention_days: u32,
     _token_file: File,
 }
 
@@ -303,6 +324,7 @@ struct StartupParts {
     worker_timeout: Duration,
     collection_interval: Duration,
     collection: CollectConfig,
+    retention_days: u32,
 }
 impl StartupParts {
     fn prepare(
@@ -351,9 +373,17 @@ impl StartupParts {
             vault: crate::secrets::vault::Vault::open(&inputs.state_dir)?,
             key: crate::secrets::key::load(&inputs.worker.cluster_key_path)?,
             env: inputs.worker.env.clone(),
+            parent_state: inputs.state_dir.clone(),
+            local_worker: worker_id.clone(),
         });
+        coordinator.set_parent_local(worker_id.clone());
         let runtime = config.worker_runtime(inputs.worker)?;
-        let agent = runtime.start().map_err(|e| anyhow::anyhow!(e.message))?;
+        let host = runtime
+            .open_host_in_place(inputs.state_dir.clone())
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        let agent = runtime
+            .start_with_host(host)
+            .map_err(|e| anyhow::anyhow!(e.message))?;
         let cluster = coordinator.store().cluster_id().clone();
         Ok(StartupParts {
             cluster,
@@ -370,6 +400,7 @@ impl StartupParts {
             worker_timeout: Duration::from_millis(settings.coordinator.worker_budget_ms),
             collection_interval: inputs.collection_interval,
             collection: inputs.collection,
+            retention_days: config.retention_days.value,
         })
     }
 }
@@ -517,6 +548,7 @@ impl Resident {
             heartbeat: parts.heartbeat,
             collection_interval: parts.collection_interval,
             collection: parts.collection,
+            retention_days: parts.retention_days,
             _token_file: parts.token_file,
         })
     }
@@ -553,6 +585,43 @@ impl Resident {
             loop {
                 tokio::select! { _ = collect_stop.changed() => return Ok(()), _ = timer.tick() => {} }
                 if let Err(e) = coordinator.collect_stopping(&files, collection, Some(collect_stop.clone())).await { let _ = stop_collect.send(true); return Err(e.into()); }
+            }
+        });
+        let gc_coordinator = self.coordinator.clone();
+        let gc_files = self.files.clone();
+        let retention_days = self.retention_days;
+        let mut gc_stop = rx.clone();
+        let gc_failure = stop.clone();
+        loops.spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(60));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut cursor = crate::results::retention::Cursor::default();
+            loop {
+                tokio::select! { _ = gc_stop.changed()=>return Ok(()), _=timer.tick()=>{} }
+                if *gc_stop.borrow() {
+                    return Ok(());
+                }
+                let owner = gc_coordinator.clone();
+                let files = gc_files.clone();
+                // Keep owner + exclusive pin alive inside the blocking job and
+                // await its drain before token/process-owner cleanup on shutdown.
+                let (next, result) =
+                    crate::results::retention::owned_blocking(owner, move |owner| {
+                        let result = crate::results::retention::page(
+                            owner.store(),
+                            &files,
+                            &mut cursor,
+                            retention_days,
+                        );
+                        (cursor, result)
+                    })
+                    .await?;
+                cursor = next;
+                if let Err(error) = result {
+                    let _ = gc_failure.send(true);
+                    return Err(error.into());
+                }
+                tokio::task::yield_now().await;
             }
         });
         let agent = self.agent.clone();
@@ -1015,7 +1084,7 @@ async fn handle(
                     );
                     anyhow::ensure!(
                         tasks.iter().all(|(_, task)| task.manifest_digest == digest
-                            && task.has_secret_bundle == has_secrets),
+                            && task.has_secret_bundle == (has_secrets && !task.in_place)),
                         "source digest mismatch"
                     );
                     let guard = admission.lock().await;

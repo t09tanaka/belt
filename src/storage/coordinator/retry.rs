@@ -20,6 +20,7 @@ pub struct PreparedRetry {
     pub(crate) source_id: SourceId,
     pub(crate) manifest_digest: Digest,
     has_secret_bundle: bool,
+    pub(crate) in_place: bool,
     fingerprint: [u8; 32],
 }
 
@@ -46,6 +47,7 @@ struct TaskRow {
     unsafe_history: bool,
     manifest: Option<String>,
     secret: Option<bool>,
+    in_place: bool,
 }
 
 impl CoordinatorStore {
@@ -66,6 +68,7 @@ impl CoordinatorStore {
             }
             let binding = binding(&tx, &target, expected)?;
             let scan = scan(&tx, &binding, None)?;
+            let in_place: bool=tx.query_row("SELECT count(*)>0 AND min(coalesce(json_extract(spec_json,'$.in_place'),0))=1 FROM task WHERE run_id=?1 AND (?2 IS NULL OR task_id=?2)", rusqlite::params![binding.run.as_str(),binding.selected.as_deref()],|r|r.get(0))?;
             Ok(RetryPreparation::Prepared(PreparedRetry {
                 target,
                 expected,
@@ -74,6 +77,7 @@ impl CoordinatorStore {
                 source_id: binding.source,
                 manifest_digest: binding.digest,
                 has_secret_bundle: scan.secret,
+                in_place,
                 fingerprint: scan.fingerprint,
             }))
         })
@@ -224,7 +228,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
             let mut stmt = c.prepare(
                 "SELECT t.task_id,t.min_generation,a.generation,a.state,a.observation,a.termination_json,a.retired,
                  EXISTS(SELECT 1 FROM attempt x LEFT JOIN retire_tombstone z USING(attempt_id) WHERE x.task_id=t.task_id AND x.retired=0 AND (x.state<>'terminal' OR (z.attempt_id IS NOT NULL AND z.confirmed_at_ms IS NULL))),
-                 json_extract(t.spec_json,'$.manifest_digest'),json_extract(t.spec_json,'$.has_secret_bundle')
+                 json_extract(t.spec_json,'$.manifest_digest'),json_extract(t.spec_json,'$.has_secret_bundle'),coalesce(json_extract(t.spec_json,'$.in_place'),0)
                  FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id ORDER BY aa.generation DESC LIMIT 1)
                  WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) AND t.task_id>?3 ORDER BY t.task_id LIMIT ?4",
             )?;
@@ -242,6 +246,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                         unsafe_history: r.get(7)?,
                         manifest: r.get(8)?,
                         secret: r.get(9)?,
+                        in_place: r.get(10)?,
                     })
                 },
             )?;
@@ -298,7 +303,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
             }
             hash.update(generation.to_be_bytes());
             hash.update(row.min.to_be_bytes());
-            hash.update([u8::from(flag)]);
+            hash.update([u8::from(flag), u8::from(row.in_place)]);
             if binding.selected.is_none() && term.outcome() == Outcome::Succeeded {
                 continue;
             }

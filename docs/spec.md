@@ -279,6 +279,12 @@ Git外のgeneric execにはdirectory snapshotを提供する。sourceが不要�
 
 `in-place` は明示的な別workspace modeである。記録するsnapshotは比較用baselineで、実行入力の不変性は保証しない。remote配置、結果cache、既定の自動retryを無効にし、表示・結果でもsnapshot実行と区別する。
 
+`exec --in-place` はGit worktreeとGit外directoryの双方を対象とする。Gitでは元worktreeのrootを保持し、元cwdからの相対pathでcommandを実行する。親local workerのidentityとrun/source/manifest digest、canonical rootのdevice/inodeを親state内の0600 bindingに保持し、rootの差替えや別workerへの配置を拒否する。原本pathは転送payloadや公開queryへ含めず、task/completionの `in_place: true` でmodeを示す。setup templateの適用・builder起動を行わず、prepare commandsは原本で通常commandとして実行する。workspace cleanupで原本を削除しない。
+
+明示 `retry` は通常と同じterminal・停止確定・回収・control revisionの条件を満たした場合だけ、同runの新attemptとして同じ原本を再実行する。baselineは作り直さない。元のsecret globs契約はprivate bindingに保持し、現在のproject configを再loadしない。原本secretはbounded/no-followのread-only処理で実行時の値をmaskし、bundleの配置・chmod・消去を原本へ行わない。元globsと現在の `.worktreeinclude` が選ぶpath集合がbaselineのsecret inventoryと違えば実行・retryを拒否し、新しい `exec` によるbaseline作成を求める。値の変更だけなら現物をmaskして実行でき、元Vault bundleの消去は妨げにならない。
+
+private bindingはowner再起動と明示retryのため親stateとともに保持する。binding自体はbaseline sourceや結果のGC pinではなく、元sourceが消去されたrunはretryできない。現段階ではbindingの個別GCは行わず、親stateの削除まで保持する。bindingやrunの取消・workspace cleanupは原本の削除を意味しない。
+
 依存の準備は、プロジェクトの `.fast-worktree.toml` の `[[clone]]`（と `post_add`）が担う。attempt workspaceをfast-worktreeで作る方針と、`.worktreeinclude` の扱いは22.5で定める。第8章のSetupRecipeとtemplateは、workflowのsetup stepの再利用に限る。`.fast-worktree.toml` を持たないプロジェクトでは、第8章の `[prepare]` が代わりを務める。両方がある場合は `.fast-worktree.toml` を優先し、`ci plan` が準備の出所（`fast-worktree` / `[prepare]` / workflowのsetup step）を表示する。
 
 # 7. CI計画と分散単位
@@ -1205,3 +1211,23 @@ Legacy raw objects export at `<directory>/<task>/<attempt>/<name>`. Generic `tar
 The exporter verifies outer size and SHA-256, then validates the whole uncompressed GNU tar subset before publishing any bundle member. Only regular files and bounded GNU long names are supported. Unsafe paths, duplicate/case/Unicode/prefix collisions, links, sparse/PAX/special entries, truncation and trailing garbage are refused. Destination ancestors must be real directories; symlinks and existing destination files conflict, even when bytes match. New directories are 0700 and files 0600. Publication never overwrites. Concurrent destination conflicts preserve successful exports and report each failure.
 
 `--json` uses bounded NDJSON: target observation, per-file outcome or artifact error, then exactly one final summary attempt with aggregate counts and a reader exit code. Target execution failure is independent of successful export. Pending collection is reported without claiming run success; closed collection failure exits 78. Corruption/missing retained objects exit 79, destination conflicts 72, invalid inputs 2. Ctrl-C exits 130 and detaches only the reader, including when stdout is blocked. GC reader lifetime integration remains required before resident automatic deletion is enabled.
+結果 retention GC は run ごとの永続 reader-pins inode と共有/排他 flock を使う。
+read-only logs は対象 run を仮解決し、pin を read-only/nonblocking shared-lock し、
+inode と新しい metadata binding を確認した後に読み始め、follow/detach を含む invocation 全体で保持する。
+missing/legacy pin は明示 unavailable とし、reader は作成・DB 更新・owner 起動を行わない。
+将来の outputs/export CLI も CoordinatorStore::result_read_pin を取得し、出力完了まで保持する。
+owner は create_run/enqueue の両経路で DB transaction に入る前に pin 作成と fsync を行う。
+ref 公開前にも pin を準備し、legacy run は bounded page で backfill する。
+pin inode は parent state とともに保持し、unlink/置換しない。最初の GC 対応版以降の owner と
+reader がこの protocol を共有することが互換条件で、旧 reader と同時利用する GC の安全性は保証しない。
+resident は bounded keyset の結果 ref/claim page だけ処理し、run-exclusive pin を FS delete 完了まで保持する。
+known durable claim のみ NotFound を冪等成功とし、未関連 legacy pending や foreign locator は削除しない。
+run 選択は task facts/count を読まない run ID index の 1 件 keyset query とする。
+削除は open 時の result root inode を確認し、各祖先を NOFOLLOW で開いた FD を基準に行う。
+leaf symlink は参照先を辿らず unlink し、祖先/root の差替えは claim を残して失敗する。
+空親/tmp の cleanup も同じ FD から行い、外部 symlink 先を削除しない。
+GC 排他 pin と writer shared pin の通常競合は対象を pending として次 pass へ送り、
+resident の収集 loop・lease 更新・IPC は継続する。pin 破損や他の I/O error は通常競合にしない。
+時計 cutoff は boot identity と永続 monotonic baseline から導出し、boot 不明/変更後は全 retention の
+quarantine、時計異常は retention 0 でも Hold。壁時計だけを理由に削除を前倒ししない。
+source/Vault/private binding の GC と output planner 完成はこの結果 retention 経路に含まない。

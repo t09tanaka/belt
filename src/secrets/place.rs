@@ -373,54 +373,10 @@ impl WorkerSecrets {
     /// file they were read from: what the supervisor refuses to keep as an
     /// artifact under any name.
     pub fn placed(&self, attempt: &AttemptId) -> Result<Placed> {
-        let mut all = Values::default();
-        let mut files = Vec::new();
         let Some(rec) = self.load_record(attempt)? else {
             return Ok(Placed::default());
         };
-        let root = PathBuf::from(&rec.workspace);
-        let mut skipped = BTreeSet::new();
-        for p in &rec.paths {
-            let gone = || placement(format!("{p} is not in the workspace"));
-            let (last, parents) = split_rel(p)?;
-            let Walk::Dir(dir) = walk_existing(&root, &parents, p)? else {
-                return Err(gone());
-            };
-            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
-            let fd = rustix::fs::openat(dir.as_fd(), last, flags, Mode::empty()).map_err(|e| {
-                if e == Errno::NOENT || is_not_dir(e) {
-                    gone()
-                } else {
-                    SecretError::io(format!("secret file {p}"), errno_io(e))
-                }
-            })?;
-            let file = File::from(fd);
-            let meta = file
-                .metadata()
-                .map_err(|e| SecretError::io(format!("secret file {p}"), e))?;
-            if !meta.is_file() || meta.mode() & 0o777 != 0o600 {
-                return Err(placement(format!(
-                    "{p} is not a regular file with mode 0600"
-                )));
-            }
-            files.push(FileIdentity::of(&meta));
-            let mut content = Vec::new();
-            file.take(MAX_FILE_BYTES as u64 + 1)
-                .read_to_end(&mut content)
-                .map_err(|e| SecretError::io(format!("secret file {p}"), e))?;
-            if content.len() > MAX_FILE_BYTES {
-                return Err(placement(format!("{p} grew since it was placed")));
-            }
-            let v = secret_values(&content);
-            for x in v.values {
-                if !all.values.contains(&x) {
-                    all.values.push(x);
-                }
-            }
-            skipped.extend(v.skipped_keys);
-        }
-        all.skipped_keys = skipped.into_iter().collect();
-        Ok(Placed { values: all, files })
+        read_files(Path::new(&rec.workspace), &rec.paths, true)
     }
 
     /// Remove the files placed for `attempt` and forget them. Idempotent.
@@ -634,6 +590,57 @@ fn erase_one(root: &Path, rel: &str) -> Result<Step> {
             Err(e) => Err(io(e)),
         },
     }
+}
+
+/// Read original secret files without placing, indexing, chmod, or erasing them.
+pub fn read_original(root: &Path, paths: &[String]) -> Result<Placed> {
+    read_files(root, paths, false)
+}
+fn read_files(root: &Path, paths: &[String], require_private: bool) -> Result<Placed> {
+    let mut all = Values::default();
+    let mut files = Vec::new();
+    let mut skipped = BTreeSet::new();
+    for p in paths {
+        let gone = || placement(format!("{p} is not in the workspace"));
+        let (last, parents) = split_rel(p)?;
+        let Walk::Dir(dir) = walk_existing(root, &parents, p)? else {
+            return Err(gone());
+        };
+        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+        let fd = rustix::fs::openat(dir.as_fd(), last, flags, Mode::empty()).map_err(|e| {
+            if e == Errno::NOENT || is_not_dir(e) {
+                gone()
+            } else {
+                SecretError::io(format!("secret file {p}"), errno_io(e))
+            }
+        })?;
+        let file = File::from(fd);
+        let meta = file
+            .metadata()
+            .map_err(|e| SecretError::io(format!("secret file {p}"), e))?;
+        if !meta.is_file() || (require_private && meta.mode() & 0o777 != 0o600) {
+            return Err(placement(format!(
+                "{p} is not a regular file with mode 0600"
+            )));
+        }
+        files.push(FileIdentity::of(&meta));
+        let mut content = Vec::new();
+        file.take(MAX_FILE_BYTES as u64 + 1)
+            .read_to_end(&mut content)
+            .map_err(|e| SecretError::io(format!("secret file {p}"), e))?;
+        if content.len() > MAX_FILE_BYTES {
+            return Err(placement(format!("{p} grew since it was placed")));
+        }
+        let v = secret_values(&content);
+        for x in v.values {
+            if !all.values.contains(&x) {
+                all.values.push(x);
+            }
+        }
+        skipped.extend(v.skipped_keys);
+    }
+    all.skipped_keys = skipped.into_iter().collect();
+    Ok(Placed { values: all, files })
 }
 
 #[cfg(test)]

@@ -400,6 +400,7 @@ fn payload(script: &str) -> AttemptPayload {
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
         outputs: Vec::new(),
+        in_place: false,
         setup: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
@@ -3871,4 +3872,17 @@ async fn bounded_terminal_cleanup_progresses_and_retries_without_touching_runnin
     }
     assert_eq!(f.host.count(&format!("cleanup {ended}")), cleaned);
     assert!(f.rec(&ended).acked_at_ms.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_is_refused_by_default_worker_admission_before_acceptance() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let mut p = payload("true");
+    p.in_place = true;
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert!(f.store().get(&a).unwrap().is_none());
 }

@@ -60,6 +60,7 @@ want = {
     "src/coordinator/policy.rs",
     "src/coordinator/input_gate.rs",
     "src/results/plan.rs",
+    "src/results/clock_policy.rs",
     "src/scheduler/decide.rs",
     "src/setup/policy.rs",
     "src/service/macos/policy.rs",
