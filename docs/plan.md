@@ -540,3 +540,30 @@ exact source/outputが不明なコストはUnknownを維持する。大きいman
 S16 SDK 0.13.0候補はローカル10項目が成功しPR46でリモート確認中。
 shared driverと既存Runner評価の共有、dynamic matrix・artifact交換・shard retry・
 親の厳密status判定、S21〜S26とDocker受入は必須範囲として継続する。
+
+
+### 統合検証のfixture補正とreadonly入口（2026-11-15）
+
+統合c30c0b6の全CIは通常試験2件が失敗し、coverageのGit FIFO fixtureが停止したため
+所有する検証だけを取消・回収した。coverageとmutationを成功扱いにはしていない。
+停止は複数Git probeへ一度しか解放しないfixtureが原因で、Machine preflightだけを
+対象にboundedに解放・回収するよう修正した。同期preflightへの制御変更では
+期待のassertで失敗し、通常とinstrumentedの関連起動試験で成功を確認した。
+旧schema再現に残る新index/markerと、実追記前にshutdownへ進めるfixtureも補正した。
+productionのlease・timeout・drain条件は変更せず、関連strict checkも成功した。
+
+`estimate --task ID` は保存済みspec/sourceを使う追加実行のreadonly予測として接続した。
+raw commandの既存形式を維持し、全commands/env/requirements/toolchainsと同じcost bindingを
+使う。current projectやGitの再探索・owner開始は行わない。raw100回＋known100回の
+DB/epoch/actor/gate/source/ledger不変と、変更後workspace・offline/不正IDを確認した。
+独立レビューも成功。native runtime履歴を識別できない既知taskはUnknown/fallbackを保つ。
+
+準備観測のproducerは、確認済みTTC admitted executionだけをimmutable private proofへ
+記録し、全node成功とtemplate publish/tool detect後のcurrent builderに結び付けた。
+policyはsum-ttc-admitted-run-wall-v1でspawn overheadを含み、queueや待ち区間を含めない。
+worker owner再起動時は古い観測を再利用しない。関連97試験と独立レビューが成功した。
+worker wire・parent ingestion・remote age/TTL変換・pagination・warm proofと、forecastでの
+同一builder二重計上除外は次の必須接続で、setup costは引き続きUnknownである。
+
+local-ci0.13.0はローカル10項目・リモート10項目後に公開済み。
+次は統合HEADのpure coverage/mutationを先に絞って確認し、全CIを再実行する。
