@@ -267,7 +267,9 @@ mod tests {
         (dir, ctx)
     }
     fn run(ctx: &ExecContext) -> Vec<CleanupIncomplete> {
-        compose_down_with_timeout(ctx, &["owned-project".into()], Duration::from_millis(250))
+        // Normal behavior is not a subprocess-startup benchmark. Explicit timeout
+        // fixtures below keep their short deadline and reaping assertions.
+        compose_down_with_timeout(ctx, &["owned-project".into()], Duration::from_secs(2))
     }
     fn calls(dir: &tempfile::TempDir) -> String {
         std::fs::read_to_string(dir.path().join("calls")).unwrap_or_default()
@@ -389,7 +391,8 @@ mod tests {
             &"a".repeat(64),
         ] {
             let (dir, ctx) = fixture(&format!("[ \"$1\" = ps ] && printf '%s' '{ids}'\nexit 0"));
-            assert!(run(&ctx).is_empty());
+            let errors = run(&ctx);
+            assert!(errors.is_empty(), "{errors:?}");
             let log = calls(&dir);
             assert!(
                 log.starts_with("ps -aq --filter label=com.docker.compose.project=owned-project\n")
@@ -440,7 +443,11 @@ mod tests {
             let (dir, ctx) = fixture(&format!(
                 "if [ \"$1\" = {phase} ]; then echo $$ > \"$HOME/pid\"; exec sleep 20; fi\necho 012345abcdef"));
             let started = Instant::now();
-            let errors = run(&ctx);
+            let errors = compose_down_with_timeout(
+                &ctx,
+                &["owned-project".into()],
+                Duration::from_millis(250),
+            );
             assert_eq!(errors.len(), 1);
             assert!(errors[0].to_string().contains("deadline"));
             assert!(started.elapsed() < Duration::from_secs(3));
@@ -466,7 +473,12 @@ mod tests {
     #[test]
     fn cleanup_bounds_inherited_pipe_after_leader_exits() {
         let (dir, ctx) = fixture("sleep 20 &\necho $! > \"$HOME/plugin\"\nexit 0");
-        assert!(!run(&ctx).is_empty());
+        assert!(!compose_down_with_timeout(
+            &ctx,
+            &["owned-project".into()],
+            Duration::from_millis(250)
+        )
+        .is_empty());
         assert!(!calls(&dir).lines().any(|line| line.starts_with("compose ")));
         // The leader exits before the timeout, but stays unreaped until the
         // helper kills its owned process group, including its pipe holder.
@@ -538,7 +550,10 @@ mod tests {
         let (dir, ctx) = fixture("[ \"$1\" = ps ] && { echo 012345abcdef; exit 0; }\nexit 2");
         let errors = run(&ctx);
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].to_string().contains("take down owned"));
+        assert!(
+            errors[0].to_string().contains("take down owned"),
+            "{errors:?}"
+        );
         assert_eq!(calls(&dir).lines().count(), 2);
     }
 }

@@ -3,8 +3,10 @@
 #![allow(clippy::disallowed_methods)] // the tests build the binary's environment
 
 mod common;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 fn copy_dir(from: &Path, to: &Path) {
     std::fs::create_dir_all(to).unwrap();
@@ -70,24 +72,98 @@ fn demo(change: &str) -> Demo {
 }
 
 fn local_ci(d: &Demo, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_local-ci"))
-        .args(args)
-        .current_dir(&d.repo)
-        .env("LOCAL_CI_HOME", &d.home)
-        .output()
-        .unwrap()
+    local_ci_path(d, &std::env::var("PATH").unwrap(), args)
 }
 
 fn stdout(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
+// The unreaped leader pins the identity of the process group until cleanup.
+struct ProbeChild(Child);
+impl Drop for ProbeChild {
+    fn drop(&mut self) {
+        let pid = self.0.id() as i32;
+        if pid > 1 {
+            // SAFETY: this Child was spawned into its own group and is unreaped.
+            unsafe {
+                libc::killpg(pid, libc::SIGKILL);
+            }
+        }
+        let _ = self.0.wait();
+    }
+}
+
+fn probe_success(mut command: Command, timeout: Duration) -> bool {
+    let Ok(child) = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+    else {
+        return false;
+    };
+    let child = ProbeChild(child);
+    let start = Instant::now();
+    loop {
+        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        // SAFETY: inspect only our owned child without reaping its group leader.
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.0.id(),
+                &mut status,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        if unsafe { status.si_pid() } != 0 {
+            return status.si_code == libc::CLD_EXITED && unsafe { status.si_status() } == 0;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn docker_available() -> bool {
-    Command::new("docker")
-        .args(["info"])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    let mut command = Command::new("docker");
+    command.arg("info");
+    probe_success(command, Duration::from_secs(5))
+}
+
+#[test]
+fn availability_probe_is_bounded_and_reaps_its_owned_child() {
+    let tmp = common::tempdir().unwrap();
+    let pidfile = tmp.path().join("pid");
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "echo $$ > \"$1\"; exec sleep 20", "probe"])
+        .arg(&pidfile);
+    assert!(!probe_success(command, Duration::from_secs(2)));
+    let pid: i32 = std::fs::read_to_string(pidfile)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    // The helper already reaped this owned child.
+    assert_eq!(
+        unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+    for (script, expected) in [("exit 0", true), ("exit 2", false)] {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        assert_eq!(probe_success(command, Duration::from_secs(2)), expected);
+    }
 }
 
 #[test]
@@ -469,6 +545,10 @@ fn container_slot_and_repository_lock_waits_are_counted() {
         ])
         .current_dir(&d.repo)
         .env("LOCAL_CI_HOME", &d.home)
+        .env(
+            "PATH",
+            common::private_docker_path(&d.home, &std::env::var("PATH").unwrap()),
+        )
         .stdout(std::process::Stdio::piped())
         .spawn()
         .unwrap();
@@ -537,12 +617,15 @@ jobs:
 #[test]
 fn services_get_their_own_port() {
     if !docker_available() {
-        eprintln!("docker is not available; skipping");
+        eprintln!(
+            "real Docker acceptance unavailable (missing, failed, or timed out); not verified"
+        );
         return;
     }
     let d = demo("app/lib.sh");
-    let o = local_ci(
+    let o = local_ci_real_path(
         &d,
+        &std::env::var("PATH").unwrap(),
         &[
             "run",
             "--no-status",
@@ -581,6 +664,10 @@ fn fake_gh_disabled(d: &Demo) -> String {
 }
 
 fn local_ci_path(d: &Demo, path: &str, args: &[&str]) -> Output {
+    local_ci_real_path(d, &common::private_docker_path(&d.home, path), args)
+}
+
+fn local_ci_real_path(d: &Demo, path: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_local-ci"))
         .args(args)
         .current_dir(&d.repo)
