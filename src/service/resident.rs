@@ -1,5 +1,4 @@
-//! Single-owner local runtime with durable captured input acceptance and local delivery.
-//! Remote connection/reconnection ownership remains a separate layer.
+//! Single-owner runtime with durable acceptance and independent local/remote delivery.
 use crate::config::runtime::{WorkerInputs, WorkerTarget};
 use crate::config::ResolvedConfig;
 use crate::coordinator::{Coordinator, TaskSpec};
@@ -24,6 +23,7 @@ use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 mod delivery;
+mod remote;
 
 pub const MAX_REQUEST_BYTES: usize = 262_144;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -271,6 +271,7 @@ impl CapturedInputs {
 }
 
 pub struct Resident {
+    remote_config: Arc<ResolvedConfig>,
     coordinator: Arc<Coordinator>,
     files: Arc<ResultStore>,
     agent: Arc<Agent>,
@@ -471,6 +472,11 @@ impl Resident {
             config.local_worker.value,
             "local resident requires local worker"
         );
+        let remote_config = Arc::new(remote::snapshot(
+            config,
+            &inputs.worker.env,
+            &inputs.worker.worker_id,
+        )?);
         let config_owned = config.clone();
         let mut startup = tokio::task::spawn_blocking(move || {
             StartupParts::prepare(config_owned, inputs, binding)
@@ -499,6 +505,7 @@ impl Resident {
             )
             .await;
         Ok(Self {
+            remote_config,
             coordinator: parts.coordinator,
             files: parts.files,
             agent: parts.agent,
@@ -529,6 +536,17 @@ impl Resident {
     pub async fn run(mut self) -> anyhow::Result<()> {
         let (stop, rx) = watch::channel(false);
         let mut loops = JoinSet::new();
+        // Connection failures stay inside each owner and never terminate the resident.
+        let mut remotes = JoinSet::new();
+        for worker in self.remote_config.workers.clone() {
+            remotes.spawn(remote::run(
+                self.remote_config.clone(),
+                worker,
+                self.coordinator.clone(),
+                self.captured.clone(),
+                rx.clone(),
+            ));
+        }
         let coordinator = self.coordinator.clone();
         let stop_tick = stop.clone();
         let mut tick_stop = rx.clone();
@@ -635,6 +653,11 @@ impl Resident {
                 Err(e) => {
                     failure.get_or_insert(e.into());
                 }
+            }
+        }
+        while let Some(result) = remotes.join_next().await {
+            if let Err(e) = result {
+                failure.get_or_insert(e.into());
             }
         }
         // No cancellation or terminal write: supervisors keep running, and a

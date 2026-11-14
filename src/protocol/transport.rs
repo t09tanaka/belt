@@ -145,8 +145,8 @@ fn probe_error_means_dead(e: &io::Error) -> bool {
 
 /// A started child process whose stdin and stdout carry the protocol (for
 /// example `ssh ... worker --stdio`). Its stderr is inherited: diagnostics reach
-/// the user and never mix with protocol bytes. The child is killed when this
-/// value is dropped.
+/// the user and never mix with protocol bytes. The generic spawn helper enables
+/// kill-on-drop; a guarded connection owner instead explicitly kills and reaps.
 pub struct ChildTransport {
     pub child: Child,
     pub io: Io,
@@ -193,6 +193,21 @@ impl AsyncWrite for CloseOnShutdown {
 }
 
 pub fn spawn_child(argv: &[String]) -> io::Result<ChildTransport> {
+    spawn_child_with_stderr(argv, Stdio::inherit(), true)
+}
+
+/// Protocol stdout stays separate from a pipe drained by the connection owner.
+/// The owner must guard signals by start identity and explicitly reap the child;
+/// unlike the generic transport, Tokio's unguarded kill-on-drop is disabled.
+pub fn spawn_child_piped_stderr(argv: &[String]) -> io::Result<ChildTransport> {
+    spawn_child_with_stderr(argv, Stdio::piped(), false)
+}
+
+fn spawn_child_with_stderr(
+    argv: &[String],
+    stderr: Stdio,
+    kill_on_drop: bool,
+) -> io::Result<ChildTransport> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty command"))?;
@@ -200,8 +215,8 @@ pub fn spawn_child(argv: &[String]) -> io::Result<ChildTransport> {
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .kill_on_drop(true)
+        .stderr(stderr)
+        .kill_on_drop(kill_on_drop)
         .spawn()?;
     let stdin = child.stdin.take().expect("stdin is piped");
     let stdout = child.stdout.take().expect("stdout is piped");

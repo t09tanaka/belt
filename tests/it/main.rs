@@ -31,3 +31,5 @@ mod bootstrap;
 mod init;
 
 mod worker_role;
+
+mod remote_links;

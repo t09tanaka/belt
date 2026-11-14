@@ -67,6 +67,11 @@ impl InputGate {
             .unwrap_or_else(|e| e.into_inner())
             .observe(boot, epoch, next_gate_generation());
     }
+    /// Invalidate this connection before removing it from placement eligibility.
+    pub async fn invalidate(&self) {
+        let _commit = self.commit.lock().await;
+        *self.state.lock().unwrap_or_else(|e| e.into_inner()) = State::new(next_gate_generation());
+    }
     pub fn publish(&self, generation: u64, input: ReadyInput) {
         self.state
             .lock()

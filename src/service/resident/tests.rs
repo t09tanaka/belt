@@ -504,7 +504,7 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
     let _ = peer.await;
 }
 
-async fn delivery_resident(root: &Path) -> Resident {
+pub(super) async fn delivery_resident(root: &Path) -> Resident {
     crate::secrets::key::init(&root.join("key")).unwrap();
     let config = crate::config::resolve(&crate::config::Inputs {
         overlay: &crate::config::Overlay::default(),
@@ -535,7 +535,7 @@ async fn delivery_resident(root: &Path) -> Resident {
     .await
     .unwrap()
 }
-fn delivery_spec(digest: Digest, secrets: bool) -> TaskSpec {
+pub(super) fn delivery_spec(digest: Digest, secrets: bool) -> TaskSpec {
     TaskSpec {
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),

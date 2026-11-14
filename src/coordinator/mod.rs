@@ -429,6 +429,34 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Disconnect only the installed session. Late cleanup must never remove
+    /// a replacement connection or mark its observations unknown.
+    pub async fn detach_link(
+        &self,
+        worker_id: &WorkerId,
+        expected: &Arc<dyn WorkerLink>,
+    ) -> Result<bool> {
+        let _actor = self.actor.lock().await;
+        let _commit = self.placement_fence.lock().await;
+        {
+            let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            if !workers
+                .get(worker_id)
+                .is_some_and(|link| Arc::ptr_eq(link, expected))
+            {
+                return Ok(false);
+            }
+            workers.remove(worker_id);
+        }
+        let w = worker_id.clone();
+        let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
+        for l in live {
+            self.observe(&l.record.attempt_id, Observation::Unknown)
+                .await?;
+        }
+        Ok(true)
+    }
+
     /// Accept a run and its tasks durably (`coordinator accepted`).
     pub async fn enqueue(
         &self,
