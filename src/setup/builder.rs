@@ -212,6 +212,12 @@ struct Meta {
     key: String,
 }
 
+struct BuilderLease {
+    last: u64,
+    seq: u64,
+    cancelled: bool,
+}
+
 struct Flight {
     key: String,
     attempt_id: AttemptId,
@@ -239,6 +245,7 @@ struct Consumer {
     builder: Option<BuilderId>,
     resolved: Option<Resolved>,
     binding: Option<Digest>,
+    binding_generation: Option<BuilderId>,
 }
 
 #[derive(Default)]
@@ -248,6 +255,8 @@ struct Inner {
     /// Private artifacts remain owned until every old writer is settled.
     barriers: HashMap<String, AttemptId>,
     unknown_builder: bool,
+    /// Detect snapshots are invalidated even when a concurrent writer already settled.
+    tool_versions: HashMap<String, BuilderId>,
     flights: HashMap<BuilderId, Flight>,
     consumers: HashMap<String, Consumer>,
     /// Keys whose steps passed but made something that cannot be kept, with
@@ -332,7 +341,8 @@ impl Setups {
     /// could not be settled at the start): the worker's sweep of workspaces
     /// no attempt owns must leave them.
     pub fn owns_workspace(&self, attempt: &AttemptId) -> bool {
-        lock(&self.leftover).contains(attempt)
+        let leftover = { lock(&self.leftover).contains(attempt) };
+        leftover
             || lock(&self.inner)
                 .flights
                 .values()
@@ -475,6 +485,31 @@ impl Setups {
         }
         let root = self.private_tool_root()?;
         let plan = request.plan(&root).map_err(invalid)?;
+        self.poll_tool_checked(attempt, request, &plan, |receipt| match receipt {
+            Some(receipt) => match receipt.validate(&plan) {
+                Ok(()) => ToolPreparationPoll::Installed(receipt),
+                Err(e) => ToolPreparationPoll::Failed(PreparationFailure(e.into())),
+            },
+            None => match adapters::detect(&plan) {
+                Availability::Installed(receipt) => ToolPreparationPoll::Installed(receipt),
+                Availability::Unknown(e) | Availability::ManualRequired(e) => {
+                    ToolPreparationPoll::Failed(PreparationFailure(e.into()))
+                }
+                Availability::Missing => ToolPreparationPoll::Pending,
+            },
+        })
+    }
+
+    // The private validation seam also lets tests hold actual receipt/detect I/O at
+    // a causal gate while unrelated builders renew and cancel. No filesystem work
+    // belongs under `inner`, including verification of a previously finished flight.
+    fn poll_tool_checked(
+        self: &Arc<Self>,
+        attempt: &AttemptId,
+        request: &PreparationRequest,
+        plan: &adapters::InstallPlan,
+        validate: impl FnOnce(Option<Box<InstallationReceipt>>) -> ToolPreparationPoll,
+    ) -> Result<ToolPreparationPoll, ApiError> {
         let key = format!("tool:{}", plan.key());
         let consumer = format!("{attempt}/tool:{}", request.tool.as_str());
         let binding = request.digest();
@@ -488,49 +523,83 @@ impl Setups {
         if c.binding.as_ref().is_some_and(|old| *old != binding) {
             return Err(invalid("preparation consumer binding changed"));
         }
-        c.binding = Some(binding);
+        if c.binding.is_none() {
+            c.binding_generation = Some(BuilderId::generate());
+        }
+        c.binding = Some(binding.clone());
+        let generation = c.binding_generation.clone();
         let joined = c.builder.clone();
-        if let Some(id) = joined {
-            match inner.flights.get(&id).map(|f| f.end.clone()) {
+        let receipt = if let Some(id) = &joined {
+            match inner.flights.get(id).map(|f| f.end.clone()) {
                 Some(None) => return Ok(ToolPreparationPoll::Pending),
                 Some(Some(BuilderResult::Tool(Err(failure)))) => {
                     return Ok(ToolPreparationPoll::Failed(failure))
                 }
-                Some(Some(BuilderResult::Tool(Ok(receipt)))) => {
-                    return Ok(match receipt.validate(&plan) {
-                        Ok(()) => ToolPreparationPoll::Installed(receipt),
-                        Err(e) => ToolPreparationPoll::Failed(PreparationFailure(e.into())),
-                    });
-                }
+                Some(Some(BuilderResult::Tool(Ok(receipt)))) => Some(receipt),
                 _ => {
                     return Ok(ToolPreparationPoll::Failed(PreparationFailure(
                         "tool builder lost".into(),
                     )))
                 }
             }
-        }
-        if let Some(id) = inner.by_key.get(&key).cloned() {
-            let f = inner.flights.get_mut(&id).expect("listed builder exists");
-            // A stopped writer cannot be joined, but still owns its artifact until drain.
-            if f.stop {
+        } else {
+            if Self::join_tool(&mut inner, &key, &consumer) {
                 return Ok(ToolPreparationPoll::Pending);
             }
-            policy::join(&mut f.refs, &consumer);
-            inner.consumers.get_mut(&consumer).unwrap().builder = Some(id);
-            return Ok(ToolPreparationPoll::Pending);
-        }
-        if inner.barriers.contains_key(&key) {
-            return Ok(ToolPreparationPoll::Pending);
-        }
-        match adapters::detect(&plan) {
-            Availability::Installed(receipt) => return Ok(ToolPreparationPoll::Installed(receipt)),
-            Availability::Unknown(e) | Availability::ManualRequired(e) => {
-                return Ok(ToolPreparationPoll::Failed(PreparationFailure(e.into())))
+            if inner.barriers.contains_key(&key) {
+                return Ok(ToolPreparationPoll::Pending);
             }
-            Availability::Missing => (),
+            None
+        };
+        let version = inner.tool_versions.get(&key).cloned();
+        drop(inner);
+        let checked = validate(receipt);
+        let mut inner = lock(&self.inner);
+        // A release, new binding, joined flight, or writer may have changed while
+        // files were read. Never resurrect a released consumer or trust old I/O.
+        if inner.unknown_builder {
+            return Ok(ToolPreparationPoll::Failed(PreparationFailure(
+                "unresolved builder metadata".into(),
+            )));
+        }
+        let Some(c) = inner.consumers.get(&consumer) else {
+            return Ok(ToolPreparationPoll::Failed(PreparationFailure(
+                "preparation consumer released during validation".into(),
+            )));
+        };
+        if c.binding.as_ref() != Some(&binding) || c.binding_generation != generation {
+            return Err(invalid(
+                "preparation consumer binding changed during validation",
+            ));
+        }
+        if c.builder != joined {
+            return Ok(ToolPreparationPoll::Pending);
+        }
+        if joined.is_none() && Self::join_tool(&mut inner, &key, &consumer) {
+            return Ok(ToolPreparationPoll::Pending);
+        }
+        if inner.barriers.contains_key(&key) || inner.tool_versions.get(&key).cloned() != version {
+            return Ok(ToolPreparationPoll::Pending);
+        }
+        if let Some(id) = joined {
+            if !inner
+                .flights
+                .get(&id)
+                .is_some_and(|f| matches!(&f.end, Some(BuilderResult::Tool(Ok(_)))))
+            {
+                return Ok(ToolPreparationPoll::Failed(PreparationFailure(
+                    "tool builder lost during validation".into(),
+                )));
+            }
+            return Ok(checked);
+        }
+        // Pending from detection means a missing artifact, not a cache success.
+        if checked != ToolPreparationPoll::Pending {
+            return Ok(checked);
         }
         let id = BuilderId::generate();
         let builder_attempt = AttemptId::generate();
+        inner.tool_versions.insert(key.clone(), id.clone());
         inner.barriers.insert(key.clone(), builder_attempt.clone());
         inner.by_key.insert(key.clone(), id.clone());
         inner.flights.insert(
@@ -555,6 +624,23 @@ impl Setups {
             },
         );
         Ok(ToolPreparationPoll::Pending)
+    }
+
+    /// Join only a live writer; a stopped writer still blocks until settlement.
+    fn join_tool(inner: &mut Inner, key: &str, consumer: &str) -> bool {
+        let Some(id) = inner.by_key.get(key).cloned() else {
+            return false;
+        };
+        let f = inner.flights.get_mut(&id).expect("listed builder exists");
+        if !f.stop {
+            policy::join(&mut f.refs, consumer);
+            inner
+                .consumers
+                .get_mut(consumer)
+                .expect("bound consumer")
+                .builder = Some(id);
+        }
+        true
     }
 
     fn clear_barrier(&self, attempt: &AttemptId) {
@@ -967,6 +1053,16 @@ impl Setups {
     }
 
     fn finish(&self, id: &BuilderId, end: BuilderResult) {
+        // Never hold both mutexes: ownership readers and finishers can run together.
+        let attempt = {
+            lock(&self.inner)
+                .flights
+                .get(id)
+                .map(|f| f.attempt_id.clone())
+        };
+        let unsettled = attempt
+            .as_ref()
+            .is_some_and(|attempt| lock(&self.leftover).contains(attempt));
         let mut inner = lock(&self.inner);
         let Some(f) = inner.flights.get_mut(id) else {
             return;
@@ -976,8 +1072,8 @@ impl Setups {
             _ => None,
         };
         f.end = Some(end);
-        let (key, empty, attempt) = (f.key.clone(), f.refs.is_empty(), f.attempt_id.clone());
-        if !lock(&self.leftover).contains(&attempt) {
+        let (key, empty) = (f.key.clone(), f.refs.is_empty());
+        if !unsettled {
             inner.barriers.remove(&key);
         }
         if let Some(why) = unkept {
@@ -1105,6 +1201,35 @@ impl Setups {
         }
     }
 
+    /// One iteration of the existing supervisor lease loop. Clock inputs permit
+    /// causal tests without waiting for a real lease interval to elapse.
+    fn lease_tick(
+        &self,
+        id: &BuilderId,
+        attempt: &AttemptId,
+        store: &WorkerStore,
+        lease: &mut BuilderLease,
+        clock: impl FnOnce() -> (u64, u64),
+    ) {
+        let (refs, stop) = self.wanted(id);
+        let (now, wall) = clock();
+        let every = (self.cfg.lease_ms / 3).max(self.cfg.poll_ms);
+        if policy::renew_lease(refs, stop) {
+            if now.saturating_sub(lease.last) >= every {
+                lease.seq += 1;
+                let key = LeaseKey {
+                    coordinator_epoch: CoordinatorEpoch(1),
+                    lease_seq: lease.seq,
+                };
+                let _ = store.renew_lease(attempt, key, wall);
+                lease.last = now;
+            }
+        } else if !lease.cancelled {
+            lease.cancelled = true;
+            let _ = store.cancel(attempt, CoordinatorEpoch(1), wall);
+        }
+    }
+
     /// Shared supervised execution, renewal, cancellation and settlement for both job kinds.
     fn supervised(
         &self,
@@ -1119,11 +1244,12 @@ impl Setups {
             Ok(c) => c,
             Err(e) => return crashed("supervisor", &e),
         };
-        // the lease: renewed while somebody needs the result
-        let every = (self.cfg.lease_ms / 3).max(self.cfg.poll_ms);
-        let mut last = platform::monotonic_ms();
-        let mut seq = 0u64;
-        let mut cancelled = false;
+        // The same lease tick is used by both builder kinds.
+        let mut lease = BuilderLease {
+            last: platform::monotonic_ms(),
+            seq: 0,
+            cancelled: false,
+        };
         let status = loop {
             match child.try_wait() {
                 Ok(Some(s)) => break s,
@@ -1137,22 +1263,9 @@ impl Setups {
                     return crashed("supervisor", &e);
                 }
             }
-            let (refs, stop) = self.wanted(id);
-            let now = platform::monotonic_ms();
-            if policy::renew_lease(refs, stop) {
-                if now.saturating_sub(last) >= every {
-                    seq += 1;
-                    let key = LeaseKey {
-                        coordinator_epoch: CoordinatorEpoch(1),
-                        lease_seq: seq,
-                    };
-                    let _ = store.renew_lease(attempt, key, platform::wall_ms());
-                    last = now;
-                }
-            } else if !cancelled {
-                cancelled = true;
-                let _ = store.cancel(attempt, CoordinatorEpoch(1), platform::wall_ms());
-            }
+            self.lease_tick(id, attempt, store, &mut lease, || {
+                (platform::monotonic_ms(), platform::wall_ms())
+            });
             std::thread::sleep(Duration::from_millis(self.cfg.poll_ms.clamp(1, 100)));
         };
         match status.code() {
@@ -1499,4 +1612,328 @@ fn tool_marks(spec: &SetupSpec, env: &BTreeMap<String, String>) -> Vec<(String, 
             )
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tool_validation_tests {
+    use super::*;
+    use crate::toolchain::adapters::{
+        AdapterKind, AdmittedExecutor, CommandOutput, CommandSpec, FileIdentity, HostTools,
+        ResolutionEvidence,
+    };
+    use crate::toolchain::versions::{
+        Constraint, Declaration, FrozenToolchains, Location, MatchPolicy, Scope, ToolId,
+    };
+    use std::sync::mpsc;
+
+    struct NoWorkspace;
+    impl BuilderWorkspaces for NoWorkspace {
+        fn create(&self, _: &AttemptId, _: &AttemptPayload) -> Result<Workspace, ApiError> {
+            panic!("unexpected workspace")
+        }
+        fn remove(&self, _: &Workspace) -> Result<(), ApiError> {
+            panic!("unexpected workspace cleanup")
+        }
+    }
+    fn fixture() -> (
+        tempfile::TempDir,
+        Arc<Setups>,
+        PreparationRequest,
+        adapters::InstallPlan,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let mut cfg = SetupConfig::new(
+            base.join("state"),
+            crate::ids::WorkerId::parse("w-validation").unwrap(),
+            "/bin/sh".into(),
+        );
+        cfg.profile_definition = Some(Digest::of_bytes(b"definition"));
+        cfg.profile_fingerprint = Some(Digest::of_bytes(b"execution"));
+        let setups = Setups::open(cfg, Arc::new(NoWorkspace)).unwrap();
+        let root = setups.private_tool_root().unwrap();
+        let manager = base.join("node-build");
+        std::fs::write(&manager, b"private fake manager; never executed").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let identity = FileIdentity::capture(&manager).unwrap();
+        let host = HostTools {
+            manager: identity.clone(),
+            dependencies: vec![identity],
+            search_path: vec![],
+            rust_host: String::new(),
+        };
+        let tool = ToolId::parse("node").unwrap();
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"definition"),
+            scope.clone(),
+            &[Declaration {
+                tool: tool.clone(),
+                constraint: Constraint::parse("1.2.3").unwrap(),
+                scope,
+                location: Location {
+                    path: "captured".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let evidence = ResolutionEvidence {
+            contract: frozen.digest(),
+            tool: tool.clone(),
+            concrete: node_semver::Version::parse("1.2.3").unwrap(),
+            catalog: Digest::of_bytes(b"fixture authority"),
+            resolved_inputs: BTreeMap::new(),
+        };
+        let frozen = adapters::resolve(&frozen, &evidence).unwrap();
+        let plan =
+            adapters::plan(AdapterKind::Nodenv, &frozen, &tool, &evidence, &root, &host).unwrap();
+        let request = PreparationRequest {
+            kind: AdapterKind::Nodenv,
+            frozen,
+            tool,
+            evidence,
+            private_root: root,
+            host,
+            expected_plan: plan.key(),
+            base_profile: Digest::of_bytes(b"execution"),
+        };
+        (temp, setups, request, plan)
+    }
+    struct Populate(adapters::InstallPlan);
+    impl AdmittedExecutor for Populate {
+        fn execute(&mut self, _: &CommandSpec) -> Result<CommandOutput, &'static str> {
+            for (_, probe) in self.0.probes() {
+                std::fs::create_dir_all(probe.program.parent().unwrap()).unwrap();
+                std::fs::write(&probe.program, b"private fake executable").unwrap();
+                std::fs::set_permissions(&probe.program, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            Ok(CommandOutput {
+                success: true,
+                stdout: b"1.2.3".to_vec(),
+            })
+        }
+    }
+    fn seed(
+        setups: &Setups,
+        consumer: &AttemptId,
+        kind: BuilderKind,
+    ) -> (BuilderId, AttemptId, WorkerStore) {
+        let id = BuilderId::generate();
+        let attempt = AttemptId::generate();
+        let dir = setups.cfg.builders().join(id.as_str());
+        private_dir(&dir).unwrap();
+        let store = setups.accept(&dir, &attempt).unwrap();
+        let consumer_key = consumer.to_string();
+        let key = format!("fixture:{id}");
+        let mut inner = lock(&setups.inner);
+        inner.consumers.insert(
+            consumer_key.clone(),
+            Consumer {
+                builder: Some(id.clone()),
+                ..Consumer::default()
+            },
+        );
+        inner.flights.insert(
+            id.clone(),
+            Flight {
+                key,
+                attempt_id: attempt.clone(),
+                refs: BTreeSet::from([consumer_key]),
+                end: None,
+                stop: false,
+                kind,
+            },
+        );
+        (id, attempt, store)
+    }
+
+    #[test]
+    fn blocked_detect_and_receipt_verification_allow_durable_renew_cancel_finish_and_ownership_reads(
+    ) {
+        for receipt_path in [false, true] {
+            let (_temp, setups, request, plan) = fixture();
+            let checked_consumer = AttemptId::generate();
+            if receipt_path {
+                let receipt =
+                    adapters::install_admitted(&plan, &mut Populate(plan.clone())).unwrap();
+                let builder = BuilderId::generate();
+                let consumer_key = format!("{checked_consumer}/tool:node");
+                let mut inner = lock(&setups.inner);
+                inner.consumers.insert(
+                    consumer_key.clone(),
+                    Consumer {
+                        builder: Some(builder.clone()),
+                        binding: Some(request.digest()),
+                        binding_generation: Some(BuilderId::generate()),
+                        ..Consumer::default()
+                    },
+                );
+                inner.flights.insert(
+                    builder,
+                    Flight {
+                        key: format!("tool:{}", plan.key()),
+                        attempt_id: AttemptId::generate(),
+                        refs: BTreeSet::from([consumer_key]),
+                        end: Some(BuilderResult::Tool(Ok(Box::new(receipt)))),
+                        stop: false,
+                        kind: BuilderKind::ToolInstall,
+                    },
+                );
+            }
+            let workspace_consumer = AttemptId::generate();
+            let tool_consumer = AttemptId::generate();
+            let workspace = seed(&setups, &workspace_consumer, BuilderKind::WorkspaceSetup);
+            let tool = seed(&setups, &tool_consumer, BuilderKind::ToolInstall);
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (resume_tx, resume_rx) = mpsc::channel();
+            let (progress_tx, progress_rx) = mpsc::channel();
+            std::thread::scope(|scope| {
+                let s = setups.clone();
+                let req = request.clone();
+                let p = plan.clone();
+                let consumer = checked_consumer.clone();
+                let validation = scope.spawn(move || {
+                    s.poll_tool_checked(&consumer, &req, &p, |receipt| {
+                        assert_eq!(receipt.is_some(), receipt_path);
+                        entered_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                        match receipt {
+                            Some(receipt) => {
+                                receipt.validate(&p).unwrap();
+                                ToolPreparationPoll::Installed(receipt)
+                            }
+                            None => {
+                                assert_eq!(adapters::detect(&p), Availability::Missing);
+                                ToolPreparationPoll::Pending
+                            }
+                        }
+                    })
+                });
+                entered_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                let progress = scope.spawn(|| {
+                    for (consumer, (id, attempt, store), kind) in [
+                        (&workspace_consumer, &workspace, BuilderKind::WorkspaceSetup),
+                        (&tool_consumer, &tool, BuilderKind::ToolInstall),
+                    ] {
+                        let (refs, stop) = setups.wanted(id);
+                        assert!(policy::renew_lease(refs, stop));
+                        let key = LeaseKey {
+                            coordinator_epoch: CoordinatorEpoch(1),
+                            lease_seq: 1,
+                        };
+                        let mut lease = BuilderLease {
+                            last: 0,
+                            seq: 0,
+                            cancelled: false,
+                        };
+                        setups.lease_tick(id, attempt, store, &mut lease, || {
+                            (setups.cfg.lease_ms, 42_000)
+                        });
+                        assert_eq!(store.lease(attempt).unwrap(), Some((key, false)));
+                        assert_eq!(store.lease_renewed_at(attempt).unwrap(), Some(42_000));
+                        assert!(setups.owns_workspace(attempt));
+                        setups.release(consumer);
+                        let (refs, stop) = setups.wanted(id);
+                        assert_eq!((refs, stop), (0, true));
+                        assert!(!policy::renew_lease(refs, stop));
+                        setups.lease_tick(id, attempt, store, &mut lease, || {
+                            (setups.cfg.lease_ms + 1, 42_001)
+                        });
+                        assert_eq!(
+                            store.get(attempt).unwrap().unwrap().cancel_requested_at_ms,
+                            Some(42_001)
+                        );
+                        setups.finish(
+                            id,
+                            match kind {
+                                BuilderKind::WorkspaceSetup => {
+                                    BuilderResult::Workspace(BuildEnd::Cancelled)
+                                }
+                                BuilderKind::ToolInstall => {
+                                    BuilderResult::Tool(Err(PreparationFailure("cancelled".into())))
+                                }
+                            },
+                        );
+                        assert!(!setups.owns_workspace(attempt));
+                    }
+                    setups.release(&checked_consumer);
+                    progress_tx.send(()).unwrap();
+                });
+                // This acknowledgment must arrive while validation is still gated;
+                // it observes real durable renewals and cancellation, not a timing benchmark.
+                let progressed = progress_rx.recv_timeout(Duration::from_secs(5));
+                resume_tx.send(()).unwrap();
+                assert!(
+                    progressed.is_ok(),
+                    "validation held the shared lifecycle lock"
+                );
+                progress.join().unwrap();
+                assert!(matches!(
+                    validation.join().unwrap().unwrap(),
+                    ToolPreparationPoll::Failed(_)
+                ));
+            });
+            assert_eq!(
+                setups.builds_started(),
+                0,
+                "released validator must not resurrect a builder"
+            );
+        }
+    }
+
+    #[test]
+    fn released_and_rebound_identical_consumer_cannot_accept_old_validation() {
+        let (_temp, setups, request, plan) = fixture();
+        let consumer = AttemptId::generate();
+        let polled = setups.poll_tool_checked(&consumer, &request, &plan, |_| {
+            setups.release(&consumer);
+            lock(&setups.inner).consumers.insert(
+                format!("{consumer}/tool:node"),
+                Consumer {
+                    binding: Some(request.digest()),
+                    binding_generation: Some(BuilderId::generate()),
+                    ..Consumer::default()
+                },
+            );
+            ToolPreparationPoll::Pending
+        });
+        assert!(polled.is_err());
+        assert_eq!(setups.builds_started(), 0);
+    }
+
+    #[test]
+    fn validation_rechecks_settlement_barrier_and_completed_concurrent_writer_generation() {
+        let (_temp, setups, request, plan) = fixture();
+        let consumer = AttemptId::generate();
+        let key = format!("tool:{}", plan.key());
+        let polled = setups
+            .poll_tool_checked(&consumer, &request, &plan, |_| {
+                let mut inner = lock(&setups.inner);
+                // Another writer started and settled while detection was reading.
+                inner
+                    .tool_versions
+                    .insert(key.clone(), BuilderId::generate());
+                ToolPreparationPoll::Pending
+            })
+            .unwrap();
+        assert_eq!(polled, ToolPreparationPoll::Pending);
+        assert_eq!(setups.builds_started(), 0);
+        let polled = setups
+            .poll_tool_checked(&consumer, &request, &plan, |_| {
+                lock(&setups.inner)
+                    .barriers
+                    .insert(key.clone(), AttemptId::generate());
+                ToolPreparationPoll::Failed(PreparationFailure("stale read must be ignored".into()))
+            })
+            .unwrap();
+        assert_eq!(polled, ToolPreparationPoll::Pending);
+        assert_eq!(setups.builds_started(), 0);
+    }
 }

@@ -454,3 +454,10 @@ private fake manager と所有する supervisor/TTC process の9件、private fi
 実ホスト manager・network・service 導入は実行していない。全 CI はこの差分では未実施。
 TaskSpec/submit/worker routing と consumer activation、inventory/diff/sync は未接続であり、
 この infrastructure だけでは S20 全体の完了や公開 task の自動導入を申告しない。
+private preparation の review 補正では、receipt/tree の検証と detect を共有 builder mutex の
+外へ移した。検証後に consumer の世代・binding・flight・settlement barrier・同じ key の
+writer 世代を再確認し、release 後の復活や古い Missing 判定による二重導入を防ぐ。
+所有確認と finish も mutex を同時保持しない。検証を channel gate で止めたまま、
+既存 lease loop と共通の tick が無関係な workspace/tool builder の renewal と cancel を
+WorkerStore へ永続化し、release/finish/所有確認まで進む回帰を追加した。
+補正後は causal/recheck unit 3件、private process 9件、既存 setup 31件、strict clippy と fmt が成功した。
