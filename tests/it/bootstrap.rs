@@ -402,10 +402,11 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     remote_task_runner::service::bootstrap::write_input(&dir.join("coordinator.json"), &spec)
         .unwrap();
-    // Simulate the pre-index schema with durable rows and no running owner.
+    // Simulate v3 with durable rows and no owner, removing later indexes and
+    // feature markers as well as tables so every migration can run again.
     let db = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
     db.execute_batch(
-        "DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; UPDATE schema_meta SET value='3' WHERE key='schema_version';",
+        "DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; DROP INDEX event_task_waiting; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='3' WHERE key='schema_version';",
     )
     .unwrap();
     let old_epoch: i64 = db

@@ -478,6 +478,8 @@ async fn resident_rejects_symlinked_or_shared_state_before_opening_database() {
 #[tokio::test(flavor = "current_thread")]
 async fn resident_startup_does_not_block_the_executor_during_git_preflight() {
     use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
     let root = root();
     let bin = root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -489,48 +491,82 @@ async fn resident_startup_does_not_block_the_executor_during_git_preflight() {
         .status()
         .unwrap()
         .success());
+    // Hold both FIFO ends open before starting Git. The watchdog can always
+    // queue the release, even if startup fails before Git opens either FIFO.
+    let open_fifo = |path| {
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .unwrap()
+    };
+    let mut ready = open_fifo(&ready);
+    let mut release = open_fifo(&release);
     let git = bin.join("git");
-    std::fs::write(&git, "#!/bin/sh\ndir=${0%/*}\nprintf 'ready\\n' > \"$dir/ready\"\nread -r released < \"$dir/release\"\nprintf 'git version 2.50.0\\n'\n").unwrap();
+    std::fs::write(
+        &git,
+        r#"#!/bin/sh
+dir=${0%/*}
+printf '%s\n' "$*" >> "$dir/calls"
+# Profile discovery queries Git with its own timeout. Gate the following
+# Machine preflight instead, so a synchronous regression requires our watchdog.
+# Later capability probes must not wait for a spent watchdog.
+if mkdir "$dir/discovered" 2>/dev/null; then
+    :
+elif mkdir "$dir/claimed" 2>/dev/null; then
+    printf 'ready\n' > "$dir/ready"
+    read -r released < "$dir/release"
+fi
+printf 'git version 2.50.0\n'
+"#,
+    )
+    .unwrap();
     std::fs::set_permissions(&git, std::fs::Permissions::from_mode(0o700)).unwrap();
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel();
-    // The watchdog releases a regressed blocking startup so this test fails
-    // with evidence instead of hanging. Success requires the async task to
-    // release a preflight that is known to be blocked in the FIFO read.
     let observer = std::thread::spawn(move || {
-        let mut message = String::new();
-        std::fs::File::open(ready)
-            .unwrap()
-            .read_to_string(&mut message)
-            .unwrap();
-        assert_eq!(message, "ready\n");
-        ready_tx.send(()).unwrap();
-        let progressed = release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
-        std::fs::OpenOptions::new()
-            .write(true)
-            .open(release)
-            .unwrap()
-            .write_all(b"release\n")
-            .unwrap();
-        progressed
+        let mut poll = libc::pollfd {
+            fd: ready.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // Both readiness observation and the executor's response are bounded.
+        let observed = unsafe { libc::poll(&mut poll, 1, 5_000) } == 1;
+        let mut message = [0; 6];
+        let observed = observed && ready.read_exact(&mut message).is_ok() && message == *b"ready\n";
+        let progressed = observed
+            && ready_tx.send(()).is_ok()
+            && release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
+        // Do this before reporting any assertion failure, including no reader.
+        release.write_all(b"release\n").unwrap();
+        (progressed, release)
     });
     let releaser = tokio::spawn(async move {
-        ready_rx.await.unwrap();
-        let _ = release_tx.send(());
+        if ready_rx.await.is_ok() {
+            let _ = release_tx.send(());
+        }
     });
     let mut input = inputs(root.path());
     input
         .worker
         .env
         .insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
-    let resident = Resident::start(&config(), input).await.unwrap();
+    let started = Resident::start(&config(), input).await;
     releaser.await.unwrap();
-    assert!(
-        observer.join().unwrap(),
-        "startup blocked the sole executor thread until the watchdog released Git"
-    );
+    let (progressed, _release) = observer.join().unwrap();
+    let resident = started.unwrap();
+    let calls = std::fs::read_to_string(bin.join("calls")).unwrap();
     let client = resident.client();
     stop(&client, tokio::spawn(resident.run())).await;
+    assert!(
+        progressed,
+        "startup blocked the sole executor thread until the watchdog released Git"
+    );
+    assert!(
+        calls.lines().count() >= 2,
+        "exercise subsequent Git probes: {calls:?}"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
