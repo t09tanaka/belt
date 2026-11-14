@@ -28,6 +28,7 @@ want = {
     "src/toolchain/versions.rs",
     "src/toolchain/declarations.rs",
     "src/toolchain/capability.rs",
+    "src/toolchain/contract.rs",
     "src/ids.rs",
     "src/service/completion.rs",
     "src/state.rs",

@@ -241,6 +241,95 @@ mod tests {
         assert_eq!(original, restored);
     }
     #[test]
+    fn malformed_bundle_and_changed_contract_cannot_keep_resolution_authority() {
+        let original = bundle("20.0.0");
+        let source = original.frozen.source_manifest.clone();
+        for schema in [0, 2, u32::MAX] {
+            let mut changed = original.clone();
+            changed.schema_version = schema;
+            assert_eq!(changed.validate(&source), Err("toolchain_bundle_binding"));
+        }
+        let mut oversized = original.clone();
+        oversized.evidence = vec![original.evidence[0].clone(); 257];
+        assert_eq!(oversized.validate(&source), Err("toolchain_bundle_binding"));
+        let mut duplicate = original.clone();
+        duplicate.evidence.push(duplicate.evidence[0].clone());
+        assert_eq!(
+            duplicate.validate(&source),
+            Err("duplicate_resolution_evidence")
+        );
+        let mut changed = original.clone();
+        changed.frozen.schema_version = 0;
+        assert!(changed.validate(&source).is_err());
+        let mut changed = original.clone();
+        changed.frozen.profile_definition = Digest::of_bytes(b"different profile");
+        assert!(changed.validate(&source).is_err());
+        assert_ne!(changed.digest(), original.digest());
+    }
+    #[test]
+    fn baseline_requires_positive_consistent_native_observations() {
+        use crate::toolchain::capability::{ToolObservation, WorkerCapabilities};
+        let id = Digest::of_bytes(b"native");
+        let available = |version: &str| ToolObservation::Available {
+            version: version.into(),
+            identity: id.clone(),
+        };
+        let mut report = WorkerCapabilities {
+            disk_free_bytes: None,
+            resource_budget: None,
+            schema_version: 1,
+            os: "linux".into(),
+            arch: "aarch64".into(),
+            profile: "default".into(),
+            profile_digest: id.clone(),
+            execution_uid: 1000,
+            protocol_versions: vec![1],
+            profile_fingerprint: id.clone(),
+            tools: Default::default(),
+            features: Default::default(),
+        };
+        let mut frozen = bundle("20.0.0").frozen;
+        assert_eq!(check_baselines(&frozen, None), Ok(()));
+        frozen.baseline.push(Baseline {
+            tool: ToolId::parse("rust").unwrap(),
+            version: VersionObservation::parse("1.89.0"),
+            provenance: Location {
+                path: "baseline".into(),
+                first_line: 1,
+                last_line: 1,
+            },
+        });
+        assert_eq!(
+            check_baselines(&frozen, None),
+            Err("toolchain_baseline_mismatch")
+        );
+        report.tools.insert("rustc".into(), available("1.89.0"));
+        report.tools.insert("cargo".into(), available("1.89.0"));
+        report.tools.insert("node".into(), ToolObservation::Unknown);
+        report
+            .tools
+            .insert("go".into(), ToolObservation::Unavailable);
+        report
+            .tools
+            .insert("invalid tool".into(), available("1.0.0"));
+        assert_eq!(observations(&report).len(), 1);
+        assert_eq!(check_baselines(&frozen, Some(&report)), Ok(()));
+        report.tools.insert("cargo".into(), available("1.88.0"));
+        assert_eq!(
+            observations(&report)[&ToolId::parse("rust").unwrap()],
+            VersionObservation::Unknown
+        );
+        assert_eq!(
+            check_baselines(&frozen, Some(&report)),
+            Err("toolchain_baseline_mismatch")
+        );
+        report.tools.remove("rustc");
+        assert_eq!(
+            check_baselines(&frozen, Some(&report)),
+            Err("toolchain_baseline_mismatch")
+        );
+    }
+    #[test]
     fn submitted_environment_cannot_replace_activation_but_allowed_values_merge() {
         let id = Digest::of_bytes(b"fixture");
         let binding = ExecutionBinding {
@@ -264,6 +353,7 @@ mod tests {
                 execution_fingerprint: id,
             },
         };
+        assert_eq!(binding.fingerprint(), &Digest::of_bytes(b"fixture"));
         for key in [
             "PATH",
             "HOME",
@@ -273,6 +363,11 @@ mod tests {
             "MISE_DATA_DIR",
             "NODENV_ROOT",
             "COREPACK_HOME",
+            "TMPDIR",
+            "CI",
+            "XDG_CACHE_HOME",
+            "CARGO_HOME",
+            "FVM_CACHE_PATH",
         ] {
             assert_eq!(
                 binding.environment(&std::collections::BTreeMap::from([(
@@ -292,5 +387,14 @@ mod tests {
         assert_eq!(env["PATH"], binding.activation.environment["PATH"]);
         assert_eq!(env["HOME"], "/private/home");
         assert_eq!(env["GOTOOLCHAIN"], "local");
+        assert_eq!(
+            binding
+                .environment(&std::collections::BTreeMap::from([(
+                    "PATH".into(),
+                    env["PATH"].clone()
+                )]))
+                .unwrap()["PATH"],
+            env["PATH"]
+        );
     }
 }
