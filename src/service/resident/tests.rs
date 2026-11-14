@@ -777,7 +777,7 @@ async fn captured_submit_losing_admission_race_is_rejected_without_queue_mutatio
     write_message(
         &mut client,
         &super::Request {
-            schema_version: 1,
+            schema_version: 2,
             cluster_id: resident.client.cluster_id.clone(),
             owner_token: resident.client.owner_token.clone(),
             operation: Operation::SubmitCaptured {
