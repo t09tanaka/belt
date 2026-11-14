@@ -142,6 +142,12 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
         .unwrap();
     let mut active = None;
     for terminal in [false, true] {
+        // The append-drain case needs only the active attempt. A terminal
+        // GetResult would stall the next live-log pass if its first budget
+        // elapsed before append, obscuring the write this case must observe.
+        if append_bytes && terminal {
+            continue;
+        }
         let task = TaskId::generate();
         let attempt = AttemptId::generate();
         let payload = AttemptPayload {
@@ -280,8 +286,24 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
     drop(guard);
     // The next pass resumes collection after the exclusive guard is released.
     tokio::time::timeout(Duration::from_secs(4), async {
+        let mut append_entered = append_pause.is_none();
         loop {
-            if slow.collecting.load(Ordering::SeqCst) && slow.renewals.load(Ordering::SeqCst) >= 2 {
+            // GetResult also marks collecting, and a live-log pass can exhaust
+            // its budget before reading logs. Observe the actual append before
+            // taking the link offline; shutdown must drain this exact write.
+            if let Some((entered, _)) = &append_pause {
+                if !append_entered {
+                    append_entered = match entered.try_recv() {
+                        Ok(()) => true,
+                        Err(std::sync::mpsc::TryRecvError::Empty) => false,
+                        Err(e) => panic!("append pause disconnected: {e}"),
+                    };
+                }
+            }
+            if append_entered
+                && slow.collecting.load(Ordering::SeqCst)
+                && slow.renewals.load(Ordering::SeqCst) >= 2
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -337,11 +359,7 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
     ));
-    if let Some((entered, resume)) = append_pause {
-        tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(2)))
-            .await
-            .unwrap()
-            .unwrap();
+    if let Some((_, resume)) = append_pause {
         let still_running = tokio::time::timeout(Duration::from_millis(100), &mut runner)
             .await
             .is_err();
