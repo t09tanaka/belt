@@ -330,8 +330,18 @@ fn all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipt
         );
         assert_eq!(f.calls(), calls);
         let env = std::fs::read_to_string(f.dir.path().join("host/environment")).unwrap();
-        assert!(env.contains(f.plan().root().to_str().unwrap()));
-        assert!(!env.contains(std::env::var("HOME").unwrap().as_str()));
+        let plan = f.plan();
+        // Private roots and explicitly selected manager paths may live below
+        // the harness HOME. Compare environment values, not path substrings.
+        let expected: Vec<_> = plan
+            .commands()
+            .iter()
+            .flat_map(|command| {
+                assert_eq!(Path::new(&command.env["HOME"]), plan.root().join("home"));
+                [command.env["HOME"].as_str(), command.env["PATH"].as_str()]
+            })
+            .collect();
+        assert_eq!(env.lines().collect::<Vec<_>>(), expected);
         let traffic = std::fs::read_dir(f.cfg.traffic_state_dir.join("managed")).unwrap();
         let sidecars: Vec<task_traffic_controller::managed::Sidecar> = traffic
             .map(|e| serde_json::from_slice(&std::fs::read(e.unwrap().path()).unwrap()).unwrap())
