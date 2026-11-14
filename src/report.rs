@@ -360,7 +360,14 @@ pub fn description(
 fn failed_step(j: &JobResult) -> Option<&StepResult> {
     j.steps
         .iter()
-        .find(|s| s.outcome == Outcome::Fail && s.note.is_none())
+        .find(|s| {
+            s.outcome == Outcome::Fail
+                && !s
+                    .note
+                    .iter()
+                    .flat_map(|note| note.split("; "))
+                    .any(|segment| segment == "continue-on-error")
+        })
         .or_else(|| {
             j.steps
                 .iter()
@@ -552,6 +559,44 @@ mod tests {
             steps: vec![],
             cancelled: false,
             time: None,
+        }
+    }
+
+    #[test]
+    fn failed_step_ignores_only_the_continue_on_error_note_segment() {
+        for note in [
+            None,
+            Some("warning: cleanup incomplete: query failed"),
+            Some("job output key holds the GitHub token: not passed on"),
+            Some("warning: continue-on-error"),
+            Some("not-continue-on-error"),
+        ] {
+            let mut result = job(Outcome::Fail);
+            result.steps.push(StepResult {
+                label: "tests".into(),
+                outcome: Outcome::Fail,
+                exit: Some(1),
+                secs: 0.0,
+                log: None,
+                note: note.map(String::from),
+            });
+            assert_eq!(failed_step(&result).unwrap().label, "tests");
+        }
+        for note in [
+            "continue-on-error",
+            "continue-on-error; warning: cleanup incomplete: query failed",
+            "warning: cleanup incomplete: query failed; continue-on-error",
+        ] {
+            let mut result = job(Outcome::Pass);
+            result.steps.push(StepResult {
+                label: "allowed failure".into(),
+                outcome: Outcome::Fail,
+                exit: Some(1),
+                secs: 0.0,
+                log: None,
+                note: Some(note.into()),
+            });
+            assert!(failed_step(&result).is_none());
         }
     }
 
