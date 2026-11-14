@@ -500,7 +500,8 @@ base profile と attempt の effective fingerprint を分離し、受入後の�
 実 manager の導入、変更後の pure coverage/mutation と全 CI は未実施であり必須残件とする。
 
 検証基盤は local-ci 0.12.1 のローカル10項目とリモート10項目が成功し、PR45をマージ、
-crate とリリースタグを公開した。配布物の生成・checksum 確認は継続中。
+crate とリリースタグを公開し、4環境の配布物とchecksum計8件を照合した。
+公開crateも検証済みソースと一致し、手元のCLIを0.12.1へ更新した。
 RTR PR44 の timing fixture 補正はローカル9項目・リモート9項目成功後にマージした。
 PR42 はその補正と CI 依存準備を取り込んだ committed HEAD の全体検証を実行中。
 ローカル未対応 installer・Docker 環境は未検証として区別する。
