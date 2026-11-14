@@ -59,6 +59,11 @@ fn lab(workflow: &str) -> (common::Tmp, PathBuf) {
 fn ctx(home: &Path) -> ExecContext {
     let bin = home.join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
+    // These executor fixtures own no Docker resources. Keep cleanup local even
+    // on a host with an installed but unavailable Docker daemon.
+    std::fs::write(bin.join("docker"), "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
     std::fs::write(
         bin.join("gh"),
         "#!/bin/sh\n[ \"$1 $2\" = \"auth token\" ] && echo ghs_faketoken123\n",
@@ -759,5 +764,141 @@ fn the_legs_of_a_matrix_call_the_executor_at_once() {
     assert!(
         ex.peak.load(std::sync::atomic::Ordering::SeqCst) > 1,
         "legs ran one after another"
+    );
+}
+
+#[test]
+fn compose_cleanup_warnings_preserve_test_outcomes_and_step_count() {
+    for exit in [0, 1] {
+        let l = lab_for(TWO_STEPS);
+        let docker = l.tmp.path().join("fakebin/docker");
+        std::fs::write(&docker, "#!/bin/sh\nprintf '012345abcdef\\n'\nexit 1\n").unwrap();
+        let result = l.run(Some(Recorder::new(Exit::Code(exit), None)));
+        let job = job(&result);
+        let expected = if exit == 0 {
+            Outcome::Pass
+        } else {
+            Outcome::Fail
+        };
+        assert_eq!(job.steps[0].outcome, expected);
+        assert_eq!(job.outcome, expected);
+        assert_eq!(job.steps.len(), 2);
+        assert_eq!(job.steps.last().unwrap().label, "echo second");
+        assert!(job
+            .steps
+            .last()
+            .unwrap()
+            .note
+            .as_ref()
+            .unwrap()
+            .starts_with("warning: cleanup incomplete:"));
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.to_string().contains("cleanup incomplete"));
+
+        let run = l.run_plan(Recorder::new(Exit::Code(exit), None), 1);
+        assert_eq!(run.state, if exit == 0 { "success" } else { "failure" });
+        assert!(run
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("warning: cleanup incomplete:")
+                && warning.contains("query owned")));
+        let json = serde_json::to_value(&run).unwrap();
+        assert!(json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("cleanup incomplete")));
+    }
+}
+
+#[test]
+fn compose_cleanup_warning_preserves_existing_step_note() {
+    let l = lab_for("name: w\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo one\n        continue-on-error: true\n");
+    std::fs::write(l.tmp.path().join("fakebin/docker"), "#!/bin/sh\nexit 1\n").unwrap();
+    let result = l.run(Some(Recorder::new(Exit::Code(1), None)));
+    let job = job(&result);
+    assert_eq!(job.outcome, Outcome::Pass);
+    assert_eq!(job.steps.len(), 1);
+    assert_eq!(job.steps[0].outcome, Outcome::Fail);
+    assert!(job.steps[0]
+        .note
+        .as_ref()
+        .unwrap()
+        .starts_with("continue-on-error; warning: cleanup incomplete:"));
+}
+
+#[test]
+fn run_never_discovers_or_removes_other_runs_containers_at_startup() {
+    let l = lab_for(TWO_STEPS);
+    std::fs::write(
+        l.tmp.path().join("fakebin/docker"),
+        "#!/bin/sh\necho \"$*\" >> \"$HOME/docker-calls\"\nexit 0\n",
+    )
+    .unwrap();
+    let report = local_ci::run(
+        &l.ctx,
+        local_ci::RunOptions {
+            target: target(&l.dir),
+            parallel: Some(1),
+            no_traffic_controller: true,
+            no_portool: true,
+            containers: 1,
+            keep: false,
+            job_timeout: 5.0,
+            no_cache: true,
+            cache_dir: l.tmp.path().join("startup-run"),
+            source: None,
+        },
+        &mut Quiet,
+    )
+    .unwrap();
+    assert_eq!(
+        report.result.state, "success",
+        "{}",
+        report.result.description
+    );
+    let calls = std::fs::read_to_string(l.tmp.path().join("docker-calls")).unwrap();
+    assert!(!calls.is_empty());
+    assert!(
+        calls
+            .lines()
+            .all(|line| line
+                .starts_with("ps -aq --filter label=com.docker.compose.project=local-ci-")),
+        "{calls}"
+    );
+}
+
+const SERVICE_JOB: &str = "name: w\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  a:\n    runs-on: x\n    services:\n      db:\n        image: example-db\n    steps:\n      - run: echo tests\n";
+
+#[test]
+fn service_control_and_tracked_removal_use_the_bounded_runner() {
+    let l = lab_for(SERVICE_JOB);
+    std::fs::write(l.tmp.path().join("fakebin/docker"),
+        "#!/bin/sh\necho \"$*\" >> \"$HOME/docker-calls\"\ncase \"$1\" in\n  info) echo 1;;\n  inspect) echo 'running none';;\n  run) echo container;;\n  rm) echo private-daemon-error >&2; exit 1;;\nesac\nexit 0\n").unwrap();
+    let result = l.run(Some(Recorder::new(Exit::Code(0), None)));
+    assert_eq!(job(&result).outcome, Outcome::Pass);
+    assert_eq!(job(&result).steps.len(), 1);
+    assert!(job(&result).steps[0]
+        .note
+        .as_ref()
+        .unwrap()
+        .contains("cleanup incomplete: remove tracked containers"));
+    let calls = std::fs::read_to_string(l.tmp.path().join("docker-calls")).unwrap();
+    assert!(calls
+        .lines()
+        .any(|line| line.starts_with("rm -f -- local-ci-")));
+    assert!(!serde_json::to_string(&result)
+        .unwrap()
+        .contains("private-daemon-error"));
+}
+
+#[test]
+fn exited_service_diagnostics_do_not_expose_daemon_stderr() {
+    let l = lab_for(SERVICE_JOB);
+    std::fs::write(l.tmp.path().join("fakebin/docker"),
+        "#!/bin/sh\ncase \"$1\" in\n  inspect) echo 'exited none';;\n  logs) echo private-daemon-error >&2; exit 1;;\nesac\nexit 0\n").unwrap();
+    let result = l.run(Some(Recorder::new(Exit::Code(0), None)));
+    assert!(
+        matches!(&job(&result).outcome, Outcome::Error(why) if why.contains("diagnostic logs unavailable") && !why.contains("private-daemon-error"))
     );
 }

@@ -36,9 +36,10 @@ fn git(dir: &Path, args: &[&str]) {
 }
 
 fn ctx(home: &Path) -> ExecContext {
+    let path = common::private_docker_path(home, "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin");
     ExecContext::new(
         [
-            ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+            ("PATH", path.as_str()),
             ("HOME", &home.to_string_lossy()),
             ("LOCAL_CI_HOME", &home.join("cache").to_string_lossy()),
         ]

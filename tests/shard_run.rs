@@ -79,6 +79,8 @@ fn ctx(home: &Path) -> ExecContext {
             || k.starts_with("RUSTC_")
             || k == "CARGO_TARGET_DIR")
     });
+    let path = common::private_docker_path(home, env.get("PATH").map(String::as_str).unwrap_or(""));
+    env.insert("PATH".into(), path);
     env.insert(
         "LOCAL_CI_HOME".into(),
         home.join("cache").to_string_lossy().into_owned(),

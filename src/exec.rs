@@ -28,56 +28,6 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Remove the service containers of `local-ci` runs that are gone: a run
-/// killed before it cleaned up left its database behind on the service's
-/// declared port, and later runs could not bind it. A container is named
-/// `local-ci-<pid>-<n>` by the run that started it.
-pub(crate) fn remove_orphan_containers(ctx: &ExecContext) {
-    let Ok(out) = ctx
-        .command("docker")
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            "label=local-ci=1",
-            "--format",
-            "{{.Names}}",
-        ])
-        .stderr(Stdio::null())
-        .output()
-    else {
-        return;
-    };
-    let names: Vec<String> = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter(|n| orphan_owner(n).is_some_and(|pid| !alive(pid)))
-        .map(String::from)
-        .collect();
-    if !names.is_empty() {
-        let _ = ctx
-            .command("docker")
-            .args(["rm", "-f"])
-            .args(&names)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-}
-
-/// The pid in a `local-ci-<pid>-<n>` container name.
-fn orphan_owner(name: &str) -> Option<i32> {
-    let rest = name.strip_prefix("local-ci-")?;
-    let (pid, n) = rest.split_once('-')?;
-    n.parse::<u64>().ok()?;
-    pid.parse().ok()
-}
-
-fn alive(pid: i32) -> bool {
-    // SAFETY: signal 0 only checks that the process exists.
-    let sent = unsafe { libc::kill(pid, 0) } == 0;
-    sent || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "result", content = "reason", rename_all = "lowercase")]
 pub enum Outcome {
@@ -579,28 +529,6 @@ fn compose_globals(args: &str) -> &str {
         }
     }
     args
-}
-
-/// `docker compose -p <name> down` for each project that still has containers.
-pub(crate) fn compose_down(ctx: &ExecContext, projects: &[String]) {
-    for p in projects {
-        let label = format!("label=com.docker.compose.project={p}");
-        let has = ctx
-            .command("docker")
-            .args(["ps", "-aq", "--filter", &label])
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-        if has {
-            let _ = ctx
-                .command("docker")
-                .args(["compose", "-p", p, "down", "--remove-orphans"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
 }
 
 /// Put in front of PATH for the run. Every job shares one checkout, and `npm ci`
@@ -2880,7 +2808,7 @@ impl<'a> Runner<'a> {
                     services_ctx = sc;
                 }
                 Err(e) => {
-                    self.stop_services(&names);
+                    self.stop_services(&names, &mut steps);
                     let mut r = finish(Outcome::Error(format!("services: {e:#}")), steps, t0);
                     r.cancelled = self.ctx.cancel.is_cancelled();
                     return (r, Map::new());
@@ -2906,7 +2834,7 @@ impl<'a> Runner<'a> {
                 match crate::portool::sync(self.ctx, bin, ws) {
                     Ok(v) => v,
                     Err(e) => {
-                        self.stop_services(&names);
+                        self.stop_services(&names, &mut steps);
                         return (
                             finish(Outcome::Error(format!("{e:#}")), steps, t0),
                             Map::new(),
@@ -2940,7 +2868,7 @@ impl<'a> Runner<'a> {
                 Ok(())
             })
         {
-            self.stop_services(&names);
+            self.stop_services(&names, &mut steps);
             return (
                 finish(Outcome::Error(format!("env: {e:#}")), steps, t0),
                 Map::new(),
@@ -3397,8 +3325,9 @@ impl<'a> Runner<'a> {
                 }
             }
         }
-        self.stop_services(&names);
-        compose_down(self.ctx, &projects);
+        self.stop_services(&names, &mut steps);
+        let cleanup = crate::cleanup::compose_down(self.ctx, &projects);
+        self.record_cleanup_warnings(&mut steps, cleanup);
         self.ctx.cancel.untrack_compose(&projects);
 
         // job outputs
@@ -3593,57 +3522,19 @@ impl<'a> Runner<'a> {
     fn docker_ok(&self) -> Result<(), String> {
         self.docker_ok
             .get_or_init(|| {
-                match self
-                    .ctx
-                    .command("docker")
-                    .args(["info", "--format", "{{.ServerVersion}}"])
-                    .output()
-                {
-                    Ok(o) if o.status.success() => Ok(()),
-                    Ok(o) => Err(String::from_utf8_lossy(&o.stderr)
-                        .lines()
-                        .next()
-                        .unwrap_or("docker info failed")
-                        .to_string()),
-                    Err(e) => Err(format!("docker: {e}")),
-                }
+                self.docker(
+                    &["info", "--format", "{{.ServerVersion}}"],
+                    Duration::from_secs(30),
+                )
+                .map(|_| ())
+                .map_err(|error| format!("{error:#}"))
             })
             .clone()
     }
 
     fn docker(&self, args: &[&str], timeout: Duration) -> Result<String> {
-        let mut child = self
-            .ctx
-            .command("docker")
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let t0 = Instant::now();
-        loop {
-            if child.try_wait()?.is_some() {
-                break;
-            }
-            if t0.elapsed() > timeout || self.ctx.cancel.is_cancelled() {
-                let _ = child.kill();
-                bail!(
-                    "docker {} did not finish in {}s",
-                    args.first().unwrap_or(&""),
-                    timeout.as_secs()
-                );
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-        let out = child.wait_with_output()?;
-        if !out.status.success() {
-            bail!(
-                "docker {}: {}",
-                args.first().unwrap_or(&""),
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
-        }
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        let output = crate::cleanup::docker_control(self.ctx, args, timeout)?;
+        Ok(String::from_utf8_lossy(&output).trim().to_string())
     }
 
     fn start_services(
@@ -3742,15 +3633,9 @@ impl<'a> Runner<'a> {
             let (run, health) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
             if run == "exited" || run == "dead" {
                 let logs = self
-                    .ctx
-                    .command("docker")
-                    .args(["logs", "--tail", "15", name])
-                    .output()
-                    .map(|o| {
-                        String::from_utf8_lossy(&o.stderr).to_string()
-                            + &String::from_utf8_lossy(&o.stdout)
-                    })
-                    .unwrap_or_default();
+                    .docker(&["logs", "--tail", "15", name], Duration::from_secs(30))
+                    .map(|logs| self.hide_token(logs))
+                    .unwrap_or_else(|error| format!("diagnostic logs unavailable: {error:#}"));
                 bail!("service {} exited:\n{}", svc.id, logs.trim());
             }
             if has_health {
@@ -3784,19 +3669,31 @@ impl<'a> Runner<'a> {
         }
     }
 
-    fn stop_services(&self, names: &[String]) {
-        if names.is_empty() {
-            return;
+    fn record_cleanup_warnings(
+        &self,
+        steps: &mut [StepResult],
+        cleanup: Vec<crate::cleanup::CleanupIncomplete>,
+    ) {
+        for diagnostic in cleanup {
+            let warning = format!("warning: {diagnostic}");
+            // Cleanup is reported separately from test/check outcomes. A
+            // default Compose project is tracked even by Docker-free jobs;
+            // probing it must not introduce a Docker dependency for them.
+            eprintln!("local-ci: {warning}");
+            if let Some(last) = steps.last_mut() {
+                last.note = Some(match last.note.take() {
+                    Some(note) => format!("{note}; {warning}"),
+                    None => warning,
+                });
+            }
         }
-        let _ = self
-            .ctx
-            .command("docker")
-            .arg("rm")
-            .arg("-f")
-            .args(names)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+    }
+
+    fn stop_services(&self, names: &[String], steps: &mut [StepResult]) {
+        self.record_cleanup_warnings(
+            steps,
+            crate::cleanup::remove_tracked_containers(self.ctx, names),
+        );
         let set: HashSet<&String> = names.iter().collect();
         self.ctx.cancel.untrack_containers(&set);
     }
@@ -4442,15 +4339,6 @@ mod tests {
         assert!(!writes_node_modules("npm run test"));
         assert!(!writes_node_modules("npm init -y"));
         assert!(!writes_node_modules("npx prisma migrate deploy"));
-    }
-
-    #[test]
-    fn orphan_containers_are_told_by_their_owner() {
-        assert_eq!(orphan_owner("local-ci-28989-214"), Some(28989));
-        assert_eq!(orphan_owner("local-ci-28989"), None);
-        assert_eq!(orphan_owner("local-ci-lc1-x"), None);
-        assert_eq!(orphan_owner("postgres"), None);
-        assert!(alive(std::process::id() as i32));
     }
 
     #[test]

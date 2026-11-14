@@ -4,7 +4,15 @@
 # planner in the integration tests, not by unit tests.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo llvm-cov --json --output-path target/llvm-cov.json >/dev/null
+output=$(mktemp)
+trap 'rm -f "$output"' EXIT
+if cargo llvm-cov --json --output-path target/llvm-cov.json >"$output"; then
+    rm -f "$output"
+else
+    status=$?
+    cat "$output"
+    exit "$status"
+fi
 python3 - <<'PY'
 import json, os, sys
 root = os.getcwd()

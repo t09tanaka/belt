@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.12.1] - 2026-11-14
+
+- Bound internal Docker probes, control and cleanup commands by time and output size. Only successful, validated project queries can trigger cleanup; timeout or invalid output leaves an explicit cleanup-incomplete warning. Owned helper processes are terminated and reaped. Read-only Compose cleanup queries have a 5-second budget; cleanup actions retain their 30-second budget.
+- Preserve test outcomes, step counts and existing notes when cleanup is unavailable, including on hosts without Docker. Keep failed-step details visible alongside warnings.
+- Remove global orphan-container scanning at startup; cleanup acts only on resources tracked by the current run.
+- Isolate executor test fixtures from the host Docker CLI.
+
 ## [0.12.0] - 2026-11-14
 
 - Add `build_frozen_plan_from_source` for verified captured inputs, including

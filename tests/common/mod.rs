@@ -40,3 +40,26 @@ impl Drop for Tmp {
         }
     }
 }
+
+/// Keep Docker-free execution fixtures independent of the host daemon. The
+/// private PATH entry only answers cleanup's empty-container query; unexpected
+/// Docker use fails instead of pretending a service was started.
+pub fn private_docker_path(home: &Path, path: &str) -> String {
+    use std::io::Write;
+    let bin = home.join("fixture-docker-bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let mut staged = tempfile::NamedTempFile::new_in(&bin).unwrap();
+    staged
+        .write_all(b"#!/bin/sh\ncase \"$1\" in\n  ps) exit 0;;\n  *) exit 1;;\nesac\n")
+        .unwrap();
+    staged
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o755))
+        .unwrap();
+    match staged.persist_noclobber(bin.join("docker")) {
+        Ok(_) => (),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(e) => panic!("private Docker fixture: {e}"),
+    }
+    format!("{}:{path}", bin.display())
+}

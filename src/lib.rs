@@ -7,6 +7,7 @@
 pub mod artifact;
 pub mod artifact_io;
 pub mod cache;
+mod cleanup;
 pub mod complete;
 pub mod config;
 pub mod context;
