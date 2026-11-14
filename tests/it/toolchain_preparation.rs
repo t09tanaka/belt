@@ -128,7 +128,7 @@ done
         let scope = Scope::project("");
         let frozen = FrozenToolchains::freeze(
             Digest::of_bytes(b"source"),
-            cfg.profile_definition.clone().unwrap(),
+            Digest::of_bytes(b"parent capture definition"),
             scope.clone(),
             &[Declaration {
                 tool: tool.clone(),
@@ -162,6 +162,7 @@ done
             private_root: root,
             host: tools,
             expected_plan: plan.key(),
+            profile_definition: cfg.profile_definition.clone().unwrap(),
             base_profile: cfg.profile_fingerprint.clone().unwrap(),
         };
         Self {
@@ -595,4 +596,55 @@ fn helper_death_still_drains_recorded_owned_manager_children() {
     let b = f.consumer();
     assert!(matches!(f.done(&b), ToolPreparationPoll::Failed(_)));
     assert_eq!(f.setups.builds_started(), 1);
+}
+
+#[test]
+fn parent_capture_definition_and_local_worker_definition_remain_separate() {
+    let mut f = Fx::new(AdapterKind::Nodenv, "node", "");
+    let parent = f.request.frozen.clone();
+    let parent_digest = parent.digest();
+    assert_ne!(parent.profile_definition, f.request.profile_definition);
+    assert_eq!(
+        f.cfg.profile_definition.as_ref(),
+        Some(&f.request.profile_definition)
+    );
+    assert_eq!(
+        f.cfg.profile_fingerprint.as_ref(),
+        Some(&f.request.base_profile)
+    );
+    let a = f.consumer();
+    let mut wrong_local = f.request.clone();
+    wrong_local.profile_definition = parent.profile_definition.clone();
+    assert_ne!(
+        wrong_local.digest(),
+        f.request.digest(),
+        "helper request binding includes the local definition"
+    );
+    assert_eq!(
+        wrong_local.expected_plan, f.request.expected_plan,
+        "local preparation identity does not namespace the reusable artifact"
+    );
+    assert!(f.setups.poll_tool(&a, &wrong_local).is_err());
+    assert_eq!(f.setups.builds_started(), 0);
+    assert_eq!(
+        f.calls(),
+        0,
+        "wrong local definition must fail before manager execution"
+    );
+    assert!(matches!(f.done(&a), ToolPreparationPoll::Installed(_)));
+    assert_eq!(f.calls(), 1);
+    assert_eq!(f.request.frozen, parent);
+    assert_eq!(f.request.frozen.digest(), parent_digest);
+    let b = f.consumer();
+    assert!(matches!(f.done(&b), ToolPreparationPoll::Installed(_)));
+    assert_eq!(f.setups.builds_started(), 1);
+    assert_eq!(
+        f.calls(),
+        1,
+        "the unchanged parent contract reuses the verified receipt"
+    );
+    assert!(f.setups.poll_tool(&b, &wrong_local).is_err());
+    assert_eq!(f.calls(), 1);
+    assert_eq!(f.request.frozen, parent);
+    assert_eq!(wrong_local.frozen, parent);
 }

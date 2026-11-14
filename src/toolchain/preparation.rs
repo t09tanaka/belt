@@ -29,6 +29,9 @@ pub struct PreparationRequest {
     pub private_root: PathBuf,
     pub host: HostTools,
     pub expected_plan: Digest,
+    /// Trusted local worker definition, derived from its own configuration.
+    /// `frozen.profile_definition` remains the parent's capture provenance.
+    pub profile_definition: Digest,
     /// Actual operator execution identity, distinct from profile definition.
     pub base_profile: Digest,
 }

@@ -478,7 +478,7 @@ impl Setups {
         attempt: &AttemptId,
         request: &PreparationRequest,
     ) -> Result<ToolPreparationPoll, ApiError> {
-        if self.cfg.profile_definition.as_ref() != Some(&request.frozen.profile_definition)
+        if self.cfg.profile_definition.as_ref() != Some(&request.profile_definition)
             || self.cfg.profile_fingerprint.as_ref() != Some(&request.base_profile)
         {
             return Err(invalid("preparation profile identity mismatch"));
@@ -1701,6 +1701,7 @@ mod tool_validation_tests {
             private_root: root,
             host,
             expected_plan: plan.key(),
+            profile_definition: Digest::of_bytes(b"definition"),
             base_profile: Digest::of_bytes(b"execution"),
         };
         (temp, setups, request, plan)

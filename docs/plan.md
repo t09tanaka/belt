@@ -461,3 +461,12 @@ writer 世代を再確認し、release 後の復活や古い Missing 判定に�
 既存 lease loop と共通の tick が無関係な workspace/tool builder の renewal と cancel を
 WorkerStore へ永続化し、release/finish/所有確認まで進む回帰を追加した。
 補正後は causal/recheck unit 3件、private process 9件、既存 setup 31件、strict clippy と fmt が成功した。
+
+preparation の profile identity は、親が凍結した capture provenance と worker-local な
+operator definition を分離した。`PreparationRequest.profile_definition` は信頼済みの
+worker 設定から与えて照合し、`base_profile` は引き続き worker の実 execution identity とする。
+`frozen.profile_definition` と resolution authority は親の捕捉契約のまま変更しない。
+local definition は helper の request binding に含めるが、再利用 artifact key へ追加しない。
+wire/submit からの worker request 構築と consumer activation は引き続き未接続である。
+異なる親/local definition の private fake-manager install/reuse と、誤った local definition の
+実行前拒否を含む process 10件、focused unit 4件、strict clippy と fmt が成功した。
