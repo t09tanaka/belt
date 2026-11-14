@@ -91,7 +91,9 @@ impl CancelHandle {
     /// containers.
     pub(crate) fn remove_containers(&self, ctx: &ExecContext) {
         let projects: Vec<String> = self.0.compose_projects.lock().unwrap().drain(..).collect();
-        crate::exec::compose_down(ctx, &projects);
+        for diagnostic in crate::cleanup::compose_down(ctx, &projects) {
+            eprintln!("local-ci: {diagnostic}");
+        }
         let names: Vec<String> = self.0.containers.lock().unwrap().drain(..).collect();
         if !names.is_empty() {
             let _ = ctx

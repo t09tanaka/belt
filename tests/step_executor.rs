@@ -766,3 +766,36 @@ fn the_legs_of_a_matrix_call_the_executor_at_once() {
         "legs ran one after another"
     );
 }
+
+#[test]
+fn compose_cleanup_errors_are_reported_separately_from_test_steps() {
+    for exit in [0, 1] {
+        let l = lab_for(TWO_STEPS);
+        let docker = l.tmp.path().join("fakebin/docker");
+        std::fs::write(&docker, "#!/bin/sh\nprintf '012345abcdef\\n'\nexit 1\n").unwrap();
+        let result = l.run(Some(Recorder::new(Exit::Code(exit), None)));
+        let job = job(&result);
+        assert_eq!(
+            job.steps[0].outcome,
+            if exit == 0 {
+                Outcome::Pass
+            } else {
+                Outcome::Fail
+            }
+        );
+        let diagnostic = job.steps.last().unwrap();
+        assert_eq!(diagnostic.label, "Docker Compose cleanup");
+        assert!(
+            matches!(&diagnostic.outcome, Outcome::Error(why) if why.contains("cleanup incomplete") && why.contains("query owned"))
+        );
+        if exit == 0 {
+            assert!(
+                matches!(&job.outcome, Outcome::Error(why) if why.contains("cleanup incomplete"))
+            );
+        } else {
+            assert_eq!(job.outcome, Outcome::Fail);
+        }
+        let json = serde_json::to_value(&result).unwrap();
+        assert!(json.to_string().contains("cleanup incomplete"));
+    }
+}

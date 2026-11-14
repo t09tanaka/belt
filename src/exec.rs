@@ -581,28 +581,6 @@ fn compose_globals(args: &str) -> &str {
     args
 }
 
-/// `docker compose -p <name> down` for each project that still has containers.
-pub(crate) fn compose_down(ctx: &ExecContext, projects: &[String]) {
-    for p in projects {
-        let label = format!("label=com.docker.compose.project={p}");
-        let has = ctx
-            .command("docker")
-            .args(["ps", "-aq", "--filter", &label])
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-        if has {
-            let _ = ctx
-                .command("docker")
-                .args(["compose", "-p", p, "down", "--remove-orphans"])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-        }
-    }
-}
-
 /// Put in front of PATH for the run. Every job shares one checkout, and `npm ci`
 /// deletes `node_modules` before installing, so a job installing a directory
 /// (directly or from a script) would break another job running there. A
@@ -3398,7 +3376,19 @@ impl<'a> Runner<'a> {
             }
         }
         self.stop_services(&names);
-        compose_down(self.ctx, &projects);
+        let cleanup = crate::cleanup::compose_down(self.ctx, &projects);
+        for diagnostic in cleanup {
+            let reason = diagnostic.to_string();
+            steps.push(StepResult {
+                label: "Docker Compose cleanup".into(),
+                outcome: Outcome::Error(reason.clone()),
+                exit: None,
+                secs: 0.0,
+                log: None,
+                note: Some("test step results are preserved".into()),
+            });
+            errored.get_or_insert(reason);
+        }
         self.ctx.cancel.untrack_compose(&projects);
 
         // job outputs
