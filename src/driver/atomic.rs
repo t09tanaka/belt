@@ -168,7 +168,7 @@ fn validate_membership_contexts(
 
 pub(super) fn validate_readiness(
     plan: &FrozenPlan,
-    producers: &BTreeMap<(String, String, Option<usize>), String>,
+    producers: &BTreeMap<(String, String, Option<usize>), Vec<String>>,
 ) -> Result<()> {
     for (index, task) in plan.tasks.iter().enumerate() {
         let wf = plan
@@ -184,7 +184,7 @@ pub(super) fn validate_readiness(
                 let owners: BTreeSet<_> = producers
                     .iter()
                     .filter(|((w, j, _), _)| w == &task.workflow && j == need)
-                    .map(|(_, id)| id)
+                    .flat_map(|(_, ids)| ids)
                     .collect();
                 ensure!(!owners.is_empty(), "missing external logical producer");
                 for owner in owners {

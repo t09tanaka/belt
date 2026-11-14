@@ -1,7 +1,7 @@
 //! Transactional, host-neutral progression for frozen tasks.
 //!
 //! Dynamic members are derived from verified source metadata and portable facts.
-//! Shards, worker authentication and retries remain host/following-slice work.
+//! Frozen shards join in core; worker authentication and retries remain host work.
 //! Hosts durably commit a proposed transition before applying it and sending
 //! its outbox. A claim acknowledges Ready. Before sending execution work or
 //! starting task execution, hosts MUST durably commit/apply MarkDispatched. Its marker
@@ -28,7 +28,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const DRIVER_VERSION: u32 = 5;
+pub const DRIVER_VERSION: u32 = 6;
+mod shards;
+pub use shards::{FrozenShardUnsupported, ShardJoin};
 mod atomic;
 pub use atomic::{AtomicGroupUnsupported, GroupPlacement, TaskExecutionMode};
 const MAX_TASKS: usize = 4096;
@@ -146,6 +148,25 @@ pub enum CoreDecision {
     HostFailure,
 }
 
+/// The proposed state cannot durably retain its real receipts and obligations.
+/// A rejected proposal leaves the committed owner and permit unchanged.
+#[derive(Debug)]
+pub struct DriverStorageError {
+    pub reason: String,
+}
+impl std::fmt::Display for DriverStorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "driver storage capacity: {}", self.reason)
+    }
+}
+impl std::error::Error for DriverStorageError {}
+fn storage_error(error: anyhow::Error) -> anyhow::Error {
+    DriverStorageError {
+        reason: format!("{error:#}"),
+    }
+    .into()
+}
+
 /// Bounded host preparation categories; detailed errors remain in host storage.
 /// None of these categories attests that an already-dispatched worker stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -177,14 +198,12 @@ enum Terminal {
         token: String,
         result_digest: String,
         outcomes: Vec<JobOutcome>,
+        shard: Option<crate::shard::ShardOutcome>,
     },
     HostAbort {
         token: String,
         reason: HostFailureReason,
         decision: CoreDecision,
-        outcomes: Vec<JobOutcome>,
-    },
-    Unstarted {
         outcomes: Vec<JobOutcome>,
     },
     Core {
@@ -197,7 +216,6 @@ impl Terminal {
     fn outcomes(&self) -> &[JobOutcome] {
         match self {
             Self::Worker { outcomes, .. }
-            | Self::Unstarted { outcomes }
             | Self::Core { outcomes, .. }
             | Self::HostAbort { outcomes, .. } => outcomes,
         }
@@ -225,6 +243,7 @@ struct State {
     cancelled: bool,
     phases: BTreeMap<String, Phase>,
     expansions: BTreeMap<String, Expansion>,
+    shard_joins: BTreeMap<String, shards::JoinSummary>,
     // Tuple keys are not JSON object keys; nested maps preserve workflow scope.
     outcomes: BTreeMap<String, BTreeMap<String, JobOutcome>>,
     outbox: Vec<Action>,
@@ -271,16 +290,13 @@ impl Driver {
             "invalid admission limit"
         );
         ensure!(plan.tasks.len() <= MAX_TASKS, "too many driver tasks");
-        ensure!(
-            plan.shard_groups.iter().all(|g| !g.split),
-            "driver slice does not support shards"
-        );
+        shards::validate(plan)?;
         let mut ids = BTreeSet::new();
         let mut producers = BTreeMap::new();
         for t in &plan.tasks {
             ensure!(
-                (!t.dynamic_matrix || evaluation.is_some()) && t.shard.is_none(),
-                "driver needs evaluation context for dynamic unsharded tasks"
+                !t.dynamic_matrix || evaluation.is_some(),
+                "driver needs evaluation context for dynamic tasks"
             );
             ensure!(
                 !t.jobs.is_empty() && ids.insert(t.id.clone()),
@@ -355,19 +371,27 @@ impl Driver {
                     producers
                         .insert(
                             (t.workflow.clone(), t.jobs[0].clone(), Some(v.index)),
-                            t.id.clone()
+                            vec![t.id.clone()]
                         )
                         .is_none(),
                     "duplicate matrix member"
                 );
             } else {
                 for j in &t.jobs {
-                    ensure!(
-                        producers
-                            .insert((t.workflow.clone(), j.clone(), None), t.id.clone())
-                            .is_none(),
-                        "duplicate job producer"
-                    );
+                    let owners = producers
+                        .entry((t.workflow.clone(), j.clone(), None))
+                        .or_insert_with(Vec::new);
+                    if !owners.is_empty() {
+                        let previous = plan.task(&owners[0]).context("missing producer")?;
+                        ensure!(
+                            t.shard
+                                .as_ref()
+                                .zip(previous.shard.as_ref())
+                                .is_some_and(|(a, b)| a.group == b.group),
+                            "duplicate job producer"
+                        );
+                    }
+                    owners.push(t.id.clone());
                 }
             }
             let wf = plan
@@ -382,7 +406,8 @@ impl Driver {
         for g in &plan.graph.nodes {
             if let NodeKind::MatrixGroup { variants, .. } = &g.kind {
                 if let Some(owner) = producers.get(&(g.workflow.clone(), g.job.clone(), None)) {
-                    let task = plan.task(owner).context("missing atomic producer")?;
+                    ensure!(owner.len() == 1, "mixed shard/matrix producers");
+                    let task = plan.task(&owner[0]).context("missing atomic producer")?;
                     ensure!(task.jobs.len() > 1, "mixed matrix/job producers");
                     ensure!(
                         !(0..variants.len()).any(|i| producers.contains_key(&(
@@ -426,6 +451,7 @@ impl Driver {
                 cancelled: false,
                 phases,
                 expansions: BTreeMap::new(),
+                shard_joins: BTreeMap::new(),
                 outcomes: BTreeMap::new(),
                 outbox: vec![],
                 finished: false,
@@ -433,6 +459,13 @@ impl Driver {
         };
         driver.bound(&driver.state)?;
         Ok(driver)
+    }
+    /// A frozen shard join exists only after every member is terminal.
+    /// Coverage is computed from genuine worker receipts; core skips stay absent.
+    pub fn shard_join(&self, group: &str) -> Option<ShardJoin> {
+        let summary = self.state.shard_joins.get(group)?;
+        let group = self.plan.shard_groups.iter().find(|g| g.id == group)?;
+        Some(shards::view(group, &self.state.phases, summary))
     }
     /// Whether a cancellation request was committed before run completion.
     pub fn cancelled(&self) -> bool {
@@ -790,7 +823,7 @@ impl Driver {
                     "invalid result: {}",
                     problems.join("; ")
                 );
-                ensure!(r.shard.is_none(), "unexpected shard result");
+                shards::verify_receipt(&t, r.shard.as_ref())?;
                 ensure!(
                     r.outcomes.len() == t.jobs.len(),
                     "missing/duplicate job outcomes"
@@ -847,13 +880,15 @@ impl Driver {
                         "worker result lacks job report"
                     );
                 }
-                let failed = r.outcomes.iter().any(|o| o.status == JobStatus::Failure);
+                let failed = r.outcomes.iter().any(|o| o.status == JobStatus::Failure)
+                    || r.shard.as_ref().is_some_and(shards::failed);
                 s.phases.insert(
                     task.clone(),
                     Phase::Terminal(Terminal::Worker {
                         token: token.clone(),
                         result_digest: result_digest.clone(),
                         outcomes: r.outcomes,
+                        shard: r.shard,
                     }),
                 );
                 s.outbox.retain(
@@ -871,7 +906,7 @@ impl Driver {
         self.checked(s)
     }
     fn checked(&self, s: State) -> Result<State> {
-        self.bound(&s)?;
+        self.bound(&s).map_err(storage_error)?;
         Ok(s)
     }
     fn bound(&self, s: &State) -> Result<()> {
@@ -892,17 +927,25 @@ impl Driver {
         }
     }
     fn fail_fast(&self, s: &mut State, task: &ExecutionTask) -> Result<()> {
-        let Some(v) = &task.variant else {
-            return Ok(());
+        let shard_scope = task.shard.as_ref().map(|v| &v.group);
+        let matrix_scope = task.variant.as_ref().map(|v| &v.group);
+        let enabled = if let Some(id) = shard_scope {
+            self.plan
+                .shard_groups
+                .iter()
+                .any(|g| &g.id == id && g.split && g.fail_fast)
+        } else if let Some(id) = matrix_scope {
+            matches!(
+                self.group(s, id).map(|g| &g.kind),
+                Some(NodeKind::MatrixGroup {
+                    fail_fast: true,
+                    ..
+                })
+            )
+        } else {
+            false
         };
-        let g = self.group(s, &v.group).context("missing group")?;
-        if !matches!(
-            g.kind,
-            NodeKind::MatrixGroup {
-                fail_fast: true,
-                ..
-            }
-        ) {
+        if !enabled {
             return Ok(());
         }
         let ancestor_failed = match &s.phases[&task.id] {
@@ -910,7 +953,15 @@ impl Driver {
             _ => false,
         };
         for member in self.tasks(s) {
-            if !member.variant.as_ref().is_some_and(|m| m.group == v.group) {
+            let same = if let Some(id) = shard_scope {
+                member.shard.as_ref().is_some_and(|m| &m.group == id)
+            } else {
+                member
+                    .variant
+                    .as_ref()
+                    .is_some_and(|m| Some(&m.group) == matrix_scope)
+            };
+            if !same {
                 continue;
             }
             match s.phases[&member.id].clone() {
@@ -929,7 +980,11 @@ impl Driver {
                         .collect();
                     s.phases.insert(
                         member.id.clone(),
-                        Phase::Terminal(Terminal::Unstarted { outcomes }),
+                        Phase::Terminal(Terminal::Core {
+                            decision: CoreDecision::UnstartedSkipped,
+                            diagnostic: Some("fail-fast".into()),
+                            outcomes,
+                        }),
                     );
                     s.outbox
                         .retain(|a| ready_task(&a.kind) != Some(member.id.as_str()));
@@ -959,7 +1014,19 @@ impl Driver {
                 .values()
                 .flat_map(|e| e.selections.iter().map(|selection| &selection.task)),
         );
-        let mut reserve = 0usize;
+        // One bounded summary + join envelope per unfinished frozen group.
+        let mut reserve = self
+            .plan
+            .shard_groups
+            .iter()
+            .filter(|g| g.split && !s.shard_joins.contains_key(&g.id))
+            .try_fold(0usize, |n, g| -> Result<usize> {
+                Ok(n.saturating_add(8192)
+                    .saturating_add(crate::expr::serialized_size(
+                        &(&g.id, &g.workflow, &g.source_jobs),
+                        MAX_WIRE_BYTES,
+                    )?))
+            })?;
         for task in tasks {
             let addition = match &s.phases[&task.id] {
                 Phase::Pending | Phase::Ready { .. } => Self::unstarted_cancel_reserve(task)?,
@@ -1017,14 +1084,17 @@ impl Driver {
         Ok(reserve)
     }
     fn ensure_cancel_capacity(&self, s: &State) -> Result<()> {
-        let bytes = crate::expr::serialized_size(s, self.state_byte_limit)?;
-        ensure!(
-            bytes
-                .checked_add(self.cancel_reserve(s)?)
-                .is_some_and(|n| n <= self.state_byte_limit),
-            "state lacks durable cancellation capacity"
-        );
-        Ok(())
+        (|| {
+            let bytes = crate::expr::serialized_size(s, self.state_byte_limit)?;
+            ensure!(
+                bytes
+                    .checked_add(self.cancel_reserve(s)?)
+                    .is_some_and(|n| n <= self.state_byte_limit),
+                "state lacks durable cancellation capacity"
+            );
+            Ok(())
+        })()
+        .map_err(storage_error)
     }
     fn request_cancel(&self, s: &mut State, task: &str) {
         let Some(Phase::Claimed {
@@ -1176,7 +1246,7 @@ impl Driver {
         loop {
             let mut changed = false;
             for t in &self.plan.tasks {
-                if t.variant.is_some() {
+                if t.variant.is_some() || t.shard.is_some() {
                     continue;
                 }
                 if let Phase::Terminal(terminal) = &s.phases[&t.id] {
@@ -1186,6 +1256,19 @@ impl Driver {
                             .or_default()
                             .insert(o.job.clone(), o.clone());
                     }
+                }
+            }
+            for group in self.plan.shard_groups.iter().filter(|g| g.split) {
+                if s.shard_joins.contains_key(&group.id) {
+                    continue;
+                }
+                if let Some(join) = shards::join(group, &s.phases)? {
+                    s.outcomes
+                        .entry(group.workflow.clone())
+                        .or_default()
+                        .insert(group.source_jobs[0].clone(), join.outcome);
+                    s.shard_joins.insert(group.id.clone(), join.summary);
+                    changed = true;
                 }
             }
             let groups: Vec<_> = self
@@ -1667,7 +1750,10 @@ mod tests {
         assert!(d.outcome(".github/workflows/a.yml", "first").is_none());
         assert!(matches!(
             d.state.phases[&ids[2]],
-            Phase::Terminal(Terminal::Unstarted { .. })
+            Phase::Terminal(Terminal::Core {
+                decision: CoreDecision::UnstartedSkipped,
+                ..
+            })
         ));
         let cancel = d
             .pending_actions()

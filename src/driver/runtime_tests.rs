@@ -73,6 +73,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(workflow: &str) -> Self {
+        Self::new_files(workflow, &[])
+    }
+    fn new_files(workflow: &str, files: &[(&str, &str)]) -> Self {
         let area = tempfile::Builder::new()
             .prefix("localci-dynamic-driver-")
             .tempdir_in("/private/tmp")
@@ -80,6 +83,10 @@ impl Fixture {
         let root = area.path().join("source");
         std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
         std::fs::write(root.join(FILE), workflow).unwrap();
+        for (path, content) in files {
+            std::fs::create_dir_all(root.join(path).parent().unwrap()).unwrap();
+            std::fs::write(root.join(path), content).unwrap();
+        }
         let store = ObjectStore::open(area.path().join("objects")).unwrap();
         let ctx = ExecContext::new(
             [
@@ -655,7 +662,10 @@ fn dynamic_fail_fast_retires_queued_and_holds_cancelled_owner_until_real_result(
     assert!(d.outcome(FILE, "dynamic").is_none());
     assert!(matches!(
         d.state.phases[ready_task(&legs[2]).unwrap()],
-        Phase::Terminal(Terminal::Unstarted { .. })
+        Phase::Terminal(Terminal::Core {
+            decision: CoreDecision::UnstartedSkipped,
+            ..
+        })
     ));
     assert!(!ready(&d)
         .iter()
@@ -2157,4 +2167,655 @@ fn never_dispatched_abort_after_cancel_preserves_real_matrix_outputs_at_capacity
         matches!(&d.state.phases[first], Phase::Terminal(Terminal::Worker { result_digest, .. }) if result_digest == &real_receipt)
     );
     assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+}
+
+// Dependency-free real libtest processes. The discovery and execution commands
+// use a fixture-owned offline target, never the repository's build directory.
+fn shard_fixture(fail_fast: bool, preparation: &str, test_body: &str) -> Fixture {
+    shard_fixture_output(fail_fast, preparation, test_body, "agreed")
+}
+fn shard_fixture_output(
+    fail_fast: bool,
+    preparation: &str,
+    test_body: &str,
+    output: &str,
+) -> Fixture {
+    use crate::shard::adapters::{run_invocation, CargoTest, Safety};
+    use crate::shard::{partition_tests, History, PartitionOpts, RunnerAdapter};
+    let workflow = format!(
+        r#"on: push
+jobs:
+  test:
+    runs-on: [shard-runner]
+    outputs:
+      value: ${{{{ steps.out.outputs.value }}}}
+    steps:
+      - id: out
+        run: echo "value={output}" >> "$GITHUB_OUTPUT"
+      - run: {preparation}
+      - run: cargo test --offline --lib
+  matrix:
+    runs-on: unrelated
+    strategy:
+      max-parallel: 1
+      matrix:
+        n: [0, 1]
+    steps:
+      - run: 'true'
+  consumer:
+    runs-on: consumer
+    needs: test
+    steps:
+      - run: test '${{{{ needs.test.outputs.value }}}}' = agreed
+"#
+    );
+    let mut fixture = Fixture::new_files(&workflow, &[
+        ("Cargo.toml", "[package]\nname='driver-shard-fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n"),
+        ("src/lib.rs", test_body),
+        (".github/workflows/other.yml", "on: push\njobs:\n  test:\n    runs-on: other\n    steps:\n      - run: 'true'\n"),
+    ]);
+    fixture.ctx = ExecContext::new(
+        [
+            (
+                "PATH".into(),
+                format!(
+                    "{}:/usr/bin:/bin",
+                    Path::new(env!("CARGO")).parent().unwrap().display()
+                ),
+            ),
+            ("HOME".into(), fixture.area.path().display().to_string()),
+            (
+                "CARGO_TARGET_DIR".into(),
+                fixture
+                    .area
+                    .path()
+                    .join("cargo-target")
+                    .display()
+                    .to_string(),
+            ),
+            (
+                "CARGO_HOME".into(),
+                fixture.area.path().join("cargo-home").display().to_string(),
+            ),
+            ("CARGO_BUILD_JOBS".into(), "2".into()),
+            ("CARGO_INCREMENTAL".into(), "0".into()),
+            ("CARGO_PROFILE_DEV_DEBUG".into(), "0".into()),
+            ("CARGO_PROFILE_TEST_DEBUG".into(), "0".into()),
+        ]
+        .into(),
+    );
+    let adapter = CargoTest::new("1.100.0", &["--offline", "--lib"], Safety::default());
+    let discovery = run_invocation(
+        &fixture.ctx,
+        &adapter.discover_command(),
+        &fixture.area.path().join("source"),
+    )
+    .unwrap();
+    let discovered = adapter.discover(&discovery).unwrap();
+    assert_eq!(discovered.tests, ["alpha", "beta"]);
+    assert!(discovered.complete);
+    let partition = partition_tests(
+        &adapter,
+        &discovered,
+        &History::default(),
+        2,
+        &PartitionOpts::default(),
+    );
+    fixture.plan = fixture
+        .plan
+        .with_shards(&[crate::dag::ShardRequest {
+            workflow: FILE.into(),
+            job: "test".into(),
+            plan: partition,
+            step: 2,
+            dir: "".into(),
+            discovered,
+            fail_fast,
+        }])
+        .unwrap();
+    assert!(fixture.plan.shard_groups.iter().any(|g| g.split));
+    fixture
+}
+const SHARD_TESTS: &str = "#[test] fn alpha() {}\n#[test] fn beta() {}\n";
+fn mark(d: &mut Driver, action: &ActionKind) {
+    let task = ready_task(action).unwrap().to_string();
+    commit(
+        d,
+        Input::MarkDispatched {
+            task: task.clone(),
+            token: task,
+        },
+    );
+}
+fn shard_actions(d: &Driver) -> Vec<ActionKind> {
+    ready(d)
+        .into_iter()
+        .filter(|a| d.plan.task(ready_task(a).unwrap()).unwrap().shard.is_some())
+        .collect()
+}
+fn replay_shards(f: &Fixture, d: &Driver, records: &[Transition], limit: usize) {
+    let mut restored = f.driver(limit);
+    for record in records {
+        restored
+            .apply(&Transition::from_json(&serde_json::to_string(record).unwrap()).unwrap())
+            .unwrap();
+    }
+    assert_eq!(digest(&restored.state).unwrap(), digest(&d.state).unwrap());
+}
+#[test]
+fn frozen_shards_real_reverse_join_and_static_matrix_coexist() {
+    let f = shard_fixture(false, "'true'", SHARD_TESTS);
+    let mut d = f.driver(2);
+    let mut journal = vec![commit(&mut d, Input::Advance)];
+    let actions = shard_actions(&d);
+    assert_eq!(actions.len(), 2);
+    assert!(ready(&d)
+        .iter()
+        .any(|a| ready_task(a) == Some(".github/workflows/other.yml::test")));
+    assert!(d.outcome(".github/workflows/other.yml", "test").is_none());
+
+    for action in &actions {
+        let task = ready_task(action).unwrap().to_string();
+        journal.push(commit(
+            &mut d,
+            Input::Claim {
+                task: task.clone(),
+                token: task.clone(),
+            },
+        ));
+        journal.push(commit(
+            &mut d,
+            Input::MarkDispatched {
+                task: task.clone(),
+                token: task,
+            },
+        ));
+    }
+    let matrix = ready(&d)
+        .into_iter()
+        .find(|a| {
+            d.plan
+                .task(ready_task(a).unwrap())
+                .unwrap()
+                .variant
+                .is_some()
+        })
+        .unwrap();
+    assert!(d
+        .propose(Input::Claim {
+            task: ready_task(&matrix).unwrap().into(),
+            token: "blocked".into()
+        })
+        .is_err());
+    for (index, action) in actions.iter().rev().enumerate() {
+        let (wire, _) = f.execute(action, &format!("shard-{index}"));
+        assert!(wire.shard.as_ref().unwrap().parsed);
+        journal.push(settle(&mut d, action, wire));
+        if index == 0 {
+            assert!(d.outcome(FILE, "test").is_none());
+        }
+    }
+    let group = &f.plan.shard_groups.iter().find(|g| g.split).unwrap().id;
+    let join = d.shard_join(group).unwrap();
+    assert!(join.aggregate.ok(), "{:?}", join.aggregate.problems());
+    assert_eq!(join.outcome.status, JobStatus::Success);
+    assert!(join.core_members.is_empty());
+    assert_eq!(join.outcome.outputs["value"], "agreed");
+    // Matrix concurrency remains separate from the released shard lifetimes.
+    claim(&mut d, &matrix);
+    let matrix2 = ready(&d)
+        .into_iter()
+        .find(|a| {
+            d.plan
+                .task(ready_task(a).unwrap())
+                .unwrap()
+                .variant
+                .is_some()
+        })
+        .unwrap();
+    assert!(d
+        .propose(Input::Claim {
+            task: ready_task(&matrix2).unwrap().into(),
+            token: "matrix-cap".into()
+        })
+        .is_err());
+    // Only journaled shard transitions are compared before unrelated matrix work.
+    let mut shard_only = f.driver(2);
+    for record in &journal {
+        shard_only.apply(record).unwrap();
+    }
+    replay_shards(&f, &shard_only, &journal, 2);
+    let consumer = ready(&d)
+        .into_iter()
+        .find(|a| ready_task(a).unwrap().ends_with("::consumer"))
+        .unwrap();
+    claim(&mut d, &consumer);
+    mark(&mut d, &consumer);
+    let (wire, _) = f.execute(&consumer, "consumer");
+    assert_eq!(wire.outcomes[0].status, JobStatus::Success);
+    settle(&mut d, &consumer, wire);
+}
+#[test]
+fn frozen_shards_genuine_missing_coverage_and_output_disagreement_fail_join() {
+    // A real pre-test step changes the suite after its actual frozen discovery.
+    let f = shard_fixture(false, "sed -i '' '/fn beta/d' src/lib.rs", SHARD_TESTS);
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    for (i, action) in shard_actions(&d).iter().enumerate() {
+        claim(&mut d, action);
+        mark(&mut d, action);
+        let (wire, _) = f.execute(action, &format!("coverage-{i}"));
+        settle(&mut d, action, wire);
+    }
+    let group = &f.plan.shard_groups.iter().find(|g| g.split).unwrap().id;
+    let join = d.shard_join(group).unwrap();
+    assert!(!join.aggregate.ok());
+    assert!(join.aggregate.problems().iter().any(|p| p.contains("beta")));
+    assert_eq!(join.outcome.status, JobStatus::Failure);
+    assert_eq!(d.admitted(), 0);
+    // Different genuine processes emit different values from the declared step.
+    let f = shard_fixture_output(false, "'true'", SHARD_TESTS, "$$");
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    for (i, action) in shard_actions(&d).iter().enumerate() {
+        claim(&mut d, action);
+        mark(&mut d, action);
+        let (wire, _) = f.execute(action, &format!("outputs-{i}"));
+        settle(&mut d, action, wire);
+    }
+    let join = d
+        .shard_join(&f.plan.shard_groups.iter().find(|g| g.split).unwrap().id)
+        .unwrap();
+    assert!(join.aggregate.ok());
+    assert_eq!(join.outcome.status, JobStatus::Failure);
+    assert!(join.diagnostic.unwrap().contains("different values"));
+}
+#[test]
+fn frozen_shards_real_failure_core_skip_and_cancel_ack_keep_owner() {
+    let f = shard_fixture(true, "'true'", "#[test] fn alpha() { panic!(\"real failure\"); }\n#[test] fn beta() { panic!(\"real failure\"); }\n");
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    let actions = shard_actions(&d);
+    claim(&mut d, &actions[0]);
+    mark(&mut d, &actions[0]);
+    let (wire, _) = f.execute(&actions[0], "failed-shard");
+    assert_eq!(wire.outcomes[0].status, JobStatus::Failure);
+    settle(&mut d, &actions[0], wire);
+    assert_eq!(
+        d.core_decision(ready_task(&actions[1]).unwrap()).unwrap().0,
+        CoreDecision::UnstartedSkipped
+    );
+    let group = &f.plan.shard_groups.iter().find(|g| g.split).unwrap().id;
+    let join = d.shard_join(group).unwrap();
+    assert_eq!(join.core_members.len(), 1);
+    assert_eq!(join.aggregate.missing.len(), 1);
+    assert_eq!(join.outcome.status, JobStatus::Failure);
+    // Claimed but undispatched cancellation retains ownership through ACK.
+    let f = shard_fixture(false, "'true'", SHARD_TESTS);
+    let mut d = f.driver(2);
+    let mut journal = vec![commit(&mut d, Input::Advance)];
+    let action = shard_actions(&d)[0].clone();
+    let task = ready_task(&action).unwrap().to_string();
+    journal.push(commit(
+        &mut d,
+        Input::Claim {
+            task: task.clone(),
+            token: task.clone(),
+        },
+    ));
+    journal.push(commit(&mut d, Input::Cancel));
+    let cancel = d
+        .pending_actions()
+        .iter()
+        .find(|a| matches!(a.kind, ActionKind::Cancel { .. }))
+        .unwrap()
+        .id
+        .clone();
+    journal.push(commit(&mut d, Input::Ack { action: cancel }));
+    assert_eq!(d.admitted(), 1);
+    assert!(d.outcome(FILE, "test").is_none());
+    journal.push(commit(
+        &mut d,
+        Input::AbortBeforeExecution {
+            task: task.clone(),
+            token: task,
+            reason: HostFailureReason::ExecutorPreparation,
+        },
+    ));
+    assert_eq!(d.admitted(), 0);
+    let join = d
+        .shard_join(&f.plan.shard_groups.iter().find(|g| g.split).unwrap().id)
+        .unwrap();
+    assert_eq!(join.aggregate.missing.len(), 2);
+    assert_eq!(join.core_members.len(), 2);
+    assert_eq!(join.outcome.status, JobStatus::Cancelled);
+    replay_shards(&f, &d, &journal, 2);
+}
+
+#[test]
+fn frozen_shards_typed_membership_and_receipt_identity_reject_without_mutation() {
+    let f = shard_fixture(false, "'true'", SHARD_TESTS);
+    for shape in [
+        "dynamic",
+        "grouped",
+        "variant",
+        "missing",
+        "index",
+        "count",
+        "assignment",
+        "manifest",
+        "runner",
+        "step",
+        "order",
+        "producer",
+    ] {
+        let mut plan = f.plan.clone();
+        let i = plan.tasks.iter().position(|t| t.shard.is_some()).unwrap();
+        match shape {
+            "dynamic" => plan.tasks[i].dynamic_matrix = true,
+            "grouped" => plan.tasks[i].jobs.push("consumer".into()),
+            "variant" => plan.tasks[i].variant = plan.tasks.iter().find_map(|t| t.variant.clone()),
+            "missing" => {
+                plan.tasks.remove(i);
+            }
+            "index" => plan.tasks[i].shard.as_mut().unwrap().index = 99,
+            "count" => plan.tasks[i].shard.as_mut().unwrap().count = 99,
+            "assignment" => plan
+                .shard_groups
+                .iter_mut()
+                .find(|g| g.split)
+                .unwrap()
+                .assignments[0]
+                .push("other".into()),
+            "manifest" => plan
+                .shard_groups
+                .iter_mut()
+                .find(|g| g.split)
+                .unwrap()
+                .manifest
+                .push("other".into()),
+            "runner" => plan.tasks[i].shard.as_mut().unwrap().runner.runner = "unknown".into(),
+            "step" => plan.tasks[i].shard.as_mut().unwrap().step = 0,
+            "order" => plan
+                .shard_groups
+                .iter_mut()
+                .find(|g| g.split)
+                .unwrap()
+                .shards
+                .reverse(),
+            _ => {
+                let mut t = plan.tasks[i].clone();
+                t.shard = None;
+                t.id = format!("{FILE}::test");
+                plan.tasks.push(t);
+            }
+        }
+        plan.digest = plan.compute_digest().unwrap();
+        let error = Driver::new(
+            &plan,
+            DriverConfig {
+                schema_version: DRIVER_VERSION,
+                max_parallel: 2,
+            },
+        )
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<FrozenShardUnsupported>().is_some(),
+            "{shape}: {error:#}"
+        );
+    }
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    let action = shard_actions(&d)[0].clone();
+    claim(&mut d, &action);
+    mark(&mut d, &action);
+    let (wire, _) = f.execute(&action, "identity");
+    let id = ready_task(&action).unwrap().to_string();
+    for wrong in ["job", "shard", "missing"] {
+        let mut invalid = wire.clone();
+        match wrong {
+            "job" => invalid.shard.as_mut().unwrap().job_id = "consumer".into(),
+            "shard" => invalid.shard.as_mut().unwrap().shard_id = "other-owner".into(),
+            _ => invalid.shard = None,
+        }
+        assert_rejected_unchanged(
+            &d,
+            Input::Settle {
+                task: id.clone(),
+                token: id.clone(),
+                result_digest: invalid.digest().unwrap(),
+                result: Box::new(invalid),
+            },
+        );
+    }
+    settle(&mut d, &action, wire.clone());
+    settle(&mut d, &action, wire);
+    assert!(d.outcome(FILE, "test").is_none());
+}
+
+#[test]
+fn frozen_shards_inflight_cancel_real_terminal_and_late_success_replay() {
+    use std::io::Read;
+    for inflight in [false, true] {
+        let signal_area = tempfile::tempdir_in("/private/tmp").unwrap();
+        let signal = signal_area.path().join("started.fifo");
+        assert!(ExecContext::new(Default::default())
+            .command("/usr/bin/mkfifo")
+            .arg(&signal)
+            .status()
+            .unwrap()
+            .success());
+        let prep = if inflight {
+            format!("echo running > '{}'; sleep 60", signal.display())
+        } else {
+            "'true'".into()
+        };
+        let f = shard_fixture(false, &prep, SHARD_TESTS);
+        let mut d = f.driver(2);
+        let mut journal = vec![commit(&mut d, Input::Advance)];
+        let action = shard_actions(&d)[0].clone();
+        let id = ready_task(&action).unwrap().to_string();
+        journal.push(commit(
+            &mut d,
+            Input::Claim {
+                task: id.clone(),
+                token: id.clone(),
+            },
+        ));
+        journal.push(commit(
+            &mut d,
+            Input::MarkDispatched {
+                task: id.clone(),
+                token: id.clone(),
+            },
+        ));
+        let wire = std::thread::scope(|scope| {
+            let mut worker = Some(scope.spawn(|| f.execute(&action, "cancelled-shard").0));
+            let completed = if inflight {
+                let mut line = String::new();
+                std::fs::File::open(&signal)
+                    .unwrap()
+                    .read_to_string(&mut line)
+                    .unwrap();
+                assert_eq!(line, "running\n");
+                None
+            } else {
+                Some(worker.take().unwrap().join().unwrap())
+            };
+            journal.push(commit(&mut d, Input::Cancel));
+            let cancel = cancel_actions(&d).remove(0);
+            journal.push(commit(&mut d, Input::Ack { action: cancel.id }));
+            assert_eq!(d.admitted(), 1);
+            assert!(d.outcome(FILE, "test").is_none());
+            assert_rejected_unchanged(&d, abort_input(&id, HostFailureReason::ExecutorPreparation));
+            if let Some(wire) = completed {
+                wire
+            } else {
+                f.ctx.cancel.cancel();
+                worker.take().unwrap().join().unwrap()
+            }
+        });
+        let actual_status = wire.outcomes[0].status;
+        let receipt_digest = wire.digest().unwrap();
+        journal.push(settle(&mut d, &action, wire));
+        assert_eq!(d.admitted(), 0);
+        assert!(finished(&d));
+        assert_eq!(
+            actual_status,
+            if inflight {
+                JobStatus::Cancelled
+            } else {
+                JobStatus::Success
+            }
+        );
+        assert!(
+            matches!(&d.state.phases[&id], Phase::Terminal(Terminal::Worker { result_digest, .. }) if result_digest == &receipt_digest)
+        );
+        let join = d
+            .shard_join(&f.plan.shard_groups.iter().find(|g| g.split).unwrap().id)
+            .unwrap();
+        assert_eq!(join.core_members.len(), 1);
+        assert_eq!(join.aggregate.missing.len(), 1);
+        assert_eq!(join.outcome.status, JobStatus::Cancelled);
+        replay_shards(&f, &d, &journal, 2);
+    }
+}
+
+#[test]
+fn frozen_shards_reserved_escaped_outputs_cancel_abort_exact_capacity() {
+    // Shell printf writes actual control characters, which expand sixfold in
+    // JSON. Genuine Wire projections and all immutable output copies count.
+    let f = shard_fixture_output(
+        false,
+        "'true'",
+        SHARD_TESTS,
+        "$(printf '\\001%.0s' {1..1024})",
+    );
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    let actions = shard_actions(&d);
+    claim(&mut d, &actions[0]);
+    mark(&mut d, &actions[0]);
+    let (wire, _) = f.execute(&actions[0], "reserved-real-shard");
+    let real_digest = wire.digest().unwrap();
+    settle(&mut d, &actions[0], wire);
+    let task = ready_task(&actions[1]).unwrap().to_string();
+    let owner = "\0".repeat(256);
+    let input = Input::Claim {
+        task: task.clone(),
+        token: owner.clone(),
+    };
+    let candidate = d.compute(&input).unwrap();
+    let required = crate::expr::serialized_size(&candidate, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&candidate).unwrap();
+    d.state_byte_limit = required - 1;
+    assert_rejected_unchanged(&d, input.clone());
+    d.state_byte_limit = required;
+    commit(&mut d, input);
+    commit(&mut d, Input::Cancel);
+    let cancel = cancel_actions(&d).remove(0);
+    commit(&mut d, Input::Ack { action: cancel.id });
+    assert_eq!(d.admitted(), 1);
+    commit(
+        &mut d,
+        Input::AbortBeforeExecution {
+            task,
+            token: owner,
+            reason: HostFailureReason::Lock,
+        },
+    );
+    let group = &f.plan.shard_groups.iter().find(|g| g.split).unwrap().id;
+    let join = d.shard_join(group).unwrap();
+    assert_eq!(join.outcome.outputs["value"], "\u{1}".repeat(1024));
+    assert_eq!(join.outcome.status, JobStatus::Cancelled);
+    assert_eq!(join.core_members.len(), 1);
+    assert_eq!(d.admitted(), 0);
+    assert!(finished(&d));
+    assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+    assert!(
+        matches!(&d.state.phases[ready_task(&actions[0]).unwrap()], Phase::Terminal(Terminal::Worker { result_digest, .. }) if result_digest == &real_digest)
+    );
+}
+
+#[test]
+fn frozen_shards_final_real_receipt_uses_join_reserve_and_storage_rejection_is_typed() {
+    for large in [false, true] {
+        let output = if large {
+            "x".repeat(16 * 1024)
+        } else {
+            "agreed".into()
+        };
+        let f = shard_fixture_output(false, "'true'", SHARD_TESTS, &output);
+        let mut d = f.driver(2);
+        commit(&mut d, Input::Advance);
+        let actions = shard_actions(&d);
+        claim(&mut d, &actions[0]);
+        mark(&mut d, &actions[0]);
+        let (first_wire, _) = f.execute(&actions[0], "reserve-first");
+        settle(&mut d, &actions[0], first_wire);
+        claim(&mut d, &actions[1]);
+        mark(&mut d, &actions[1]);
+        let (wire, _) = f.execute(&actions[1], "reserve-last");
+        let id = ready_task(&actions[1]).unwrap().to_string();
+        let input = Input::Settle {
+            task: id.clone(),
+            token: id.clone(),
+            result_digest: wire.digest().unwrap(),
+            result: Box::new(wire),
+        };
+        // Capacity for a new real receipt is deliberately not promised by a
+        // claim. For the small case count the exact verified pre-join state and
+        // its obligations, then prove joining cannot discard that producer in
+        // final checked(). A larger receipt with only old-state capacity is a
+        // separate, typed storage rejection.
+        if large {
+            d.state_byte_limit = crate::expr::serialized_size(&d.state, MAX_WIRE_BYTES).unwrap()
+                + d.cancel_reserve(&d.state).unwrap();
+        } else {
+            let Input::Settle {
+                result,
+                result_digest,
+                ..
+            } = &input
+            else {
+                unreachable!()
+            };
+            let mut prejoin = d.state.clone();
+            prejoin.revision += 1;
+            prejoin.phases.insert(
+                id.clone(),
+                Phase::Terminal(Terminal::Worker {
+                    token: id.clone(),
+                    result_digest: result_digest.clone(),
+                    outcomes: result.outcomes.clone(),
+                    shard: result.shard.clone(),
+                }),
+            );
+            d.state_byte_limit = crate::expr::serialized_size(&prejoin, MAX_WIRE_BYTES).unwrap()
+                + d.cancel_reserve(&prejoin).unwrap();
+        }
+        if large {
+            let before = digest(&d.state).unwrap();
+            let error = d.propose(input.clone()).unwrap_err();
+            assert!(
+                error.downcast_ref::<DriverStorageError>().is_some(),
+                "{error:#}"
+            );
+            assert_eq!(before, digest(&d.state).unwrap());
+            assert_eq!(d.admitted(), 1);
+            assert!(d.outcome(FILE, "test").is_none());
+            // The host still owns the immutable real receipt; a larger durable
+            // storage policy is outside this stage. Restoring the test limit
+            // demonstrates that the same real receipt can settle unchanged.
+            d.state_byte_limit = MAX_WIRE_BYTES;
+        }
+        commit(&mut d, input);
+        assert_eq!(d.admitted(), 0);
+        let joined = d
+            .shard_join(&f.plan.shard_groups.iter().find(|g| g.split).unwrap().id)
+            .unwrap();
+        assert!(joined.aggregate.ok());
+        assert_eq!(joined.outcome.outputs["value"], output);
+        assert_eq!(joined.outcome.status, JobStatus::Success);
+    }
 }
