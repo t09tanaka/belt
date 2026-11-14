@@ -377,6 +377,17 @@ fn two_concurrent_consumers_cause_one_build() {
     assert_eq!(f.done(&c, &p, &wc).0, ["i1"]);
     assert_eq!(f.setups.builds_started(), 1);
     assert_eq!(lines(&f.path("count")), 1);
+    let observations = f.setups.preparation_observations(64);
+    assert_eq!(
+        observations.len(),
+        1,
+        "shared builder and cached consumer produce one original observation"
+    );
+    assert_eq!(observations[0].policy, "sum-ttc-admitted-run-wall-v1");
+    assert_eq!(observations[0].node_count, 1);
+    for _ in 0..100 {
+        assert_eq!(f.setups.preparation_observations(64), observations);
+    }
     // nothing of the builder is left but the template
     wait_for("the builder to be removed", || f.builder_dirs() == 0);
     assert!(f.supervisors().is_empty());
@@ -422,6 +433,7 @@ fn a_builder_that_dies_releases_its_waiters_and_a_later_attempt_rebuilds() {
         assert!(!w.root.join("node_modules").exists());
     }
     assert!(f.template_dirs().is_empty());
+    assert!(f.setups.preparation_observations(64).is_empty());
     // the step it started does not run on
     wait_for("the step to be stopped", || !f.hanging());
     wait_for("the builder to be removed", || f.builder_dirs() == 0);
@@ -1390,4 +1402,27 @@ fn capability_profile_setup_uses_actual_path_shell_and_fingerprint() {
     assert!(std::fs::read_to_string(ws.root.join("shell-path"))
         .unwrap()
         .ends_with("/profile-bin/sh"));
+}
+
+#[test]
+fn successful_execution_with_failed_template_publish_has_no_observation() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let started = f.path("observation-started");
+    let release = f.path("observation-release");
+    let run = format!("touch '{}'; while [ ! -f '{}' ]; do sleep 0.05; done; mkdir -p node_modules; echo ok > node_modules/x", started.display(), release.display());
+    let p = f.payload(&spec(vec![step("i1", &run)]));
+    let (a, wa) = f.consumer();
+    assert_eq!(f.poll(&a, &p, &wa), SetupPoll::Pending);
+    wait_for("private setup step to start", || started.exists());
+    std::fs::set_permissions(f.templates(), std::fs::Permissions::from_mode(0o500)).unwrap();
+    std::fs::write(&release, b"release").unwrap();
+    let (skip, note) = f.done(&a, &p, &wa);
+    std::fs::set_permissions(f.templates(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(skip.is_empty());
+    assert!(note.is_some());
+    assert!(
+        f.setups.preparation_observations(64).is_empty(),
+        "successful command alone is not a published build"
+    );
 }

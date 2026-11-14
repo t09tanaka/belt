@@ -302,12 +302,32 @@ fn all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipt
         assert!(matches!(f.done(&b), ToolPreparationPoll::Installed(_)));
         assert_eq!(f.setups.builds_started(), 1);
         assert_eq!(f.calls(), calls);
+        let original = f.setups.preparation_observations(64);
+        assert_eq!(
+            original.len(),
+            1,
+            "two consumers share one producer observation"
+        );
+        assert_eq!(original[0].policy, "sum-ttc-admitted-run-wall-v1");
+        assert_eq!(original[0].node_count, 1);
+        assert_eq!(
+            original[0].boot,
+            remote_task_runner::platform::boot_id().unwrap()
+        );
+        for _ in 0..100 {
+            assert_eq!(f.setups.preparation_observations(usize::MAX), original);
+        }
+        assert!(f.setups.preparation_observations(0).is_empty());
         let reopened = Setups::open(f.cfg.clone(), Arc::new(NoWorkspace)).unwrap();
         assert!(matches!(
             reopened.poll_tool(&a, &f.request).unwrap(),
             ToolPreparationPoll::Installed(_)
         ));
         assert_eq!(reopened.builds_started(), 0);
+        assert!(
+            reopened.preparation_observations(64).is_empty(),
+            "warm receipt is not a duration observation"
+        );
         assert_eq!(f.calls(), calls);
         let env = std::fs::read_to_string(f.dir.path().join("host/environment")).unwrap();
         assert!(env.contains(f.plan().root().to_str().unwrap()));
@@ -350,6 +370,7 @@ fn manager_failures_probe_mismatch_output_limit_and_partial_roots_fail_closed() 
             "{mode}"
         );
         assert!(!f.plan().root().join("receipt.json").exists());
+        assert!(f.setups.preparation_observations(64).is_empty());
         let other = f.consumer();
         assert!(matches!(f.done(&other), ToolPreparationPoll::Failed(_)));
         assert_eq!(f.setups.builds_started(), 1);
@@ -465,6 +486,7 @@ fn releasing_one_consumer_preserves_install_and_final_release_drains_owned_child
         "partial private root must survive cancellation"
     );
     assert!(!f.plan().root().join("receipt.json").exists());
+    assert!(f.setups.preparation_observations(64).is_empty());
 }
 
 #[test]
@@ -489,6 +511,8 @@ fn restart_keeps_same_key_barrier_until_old_writer_settles_then_reports_partial_
     wait_until(|| !same_live(pid, start));
     assert_eq!(f.calls(), 1);
     assert!(f.plan().root().exists());
+    assert!(f.setups.preparation_observations(64).is_empty());
+    assert!(reopened.preparation_observations(64).is_empty());
 }
 
 #[test]
@@ -717,4 +741,101 @@ fn worker_private_registry_builds_request_for_real_setup_preparation() {
         assert!(matches!(f.done(&second), ToolPreparationPoll::Installed(_)));
         assert_eq!(f.calls(), if kind == AdapterKind::Corepack { 2 } else { 1 });
     }
+}
+
+#[test]
+fn preparation_observation_excludes_actual_ttc_admission_wait() {
+    use task_traffic_controller::config::Config;
+    use task_traffic_controller::{managed, Context};
+    let mut f = Fx::new(AdapterKind::Nodenv, "node", "");
+    let cfg = Config {
+        budget: 1,
+        cpu_threshold_percent: 100.0,
+        memory_reserve_mib: 0,
+        ..Config::default()
+    };
+    std::fs::create_dir_all(&f.cfg.traffic_state_dir).unwrap();
+    std::fs::write(
+        f.cfg.traffic_state_dir.join("config.toml"),
+        toml::to_string(&cfg).unwrap(),
+    )
+    .unwrap();
+    let ctx = Context::new(task_traffic_controller::paths::Paths::new(
+        &f.cfg.traffic_state_dir,
+        f.cfg.traffic_state_dir.join("config.toml"),
+    ));
+    let id = "preparation-admission-blocker".to_string();
+    let command = managed::CommandSpec {
+        command_id: id.clone(),
+        spec_digest: "private-fixture".into(),
+        opts: task_traffic_controller::exec::Opts {
+            label: None,
+            weight: Some(1),
+            front: false,
+            key: None,
+            argv: vec!["/usr/bin/true".into()],
+            cwd: f.dir.path().into(),
+            env: None,
+            stdout_log: None,
+        },
+        attempt: None,
+        services: vec![],
+    };
+    let managed::Registration::Registered(_, guard) =
+        managed::register(&ctx, &cfg, &command).unwrap()
+    else {
+        panic!("fresh blocker")
+    };
+    assert!(matches!(
+        managed::try_admit(&ctx, cfg.limits(), &id, 0.0).unwrap(),
+        managed::TryAdmit::Admitted
+    ));
+    let a = f.consumer();
+    let start = Instant::now();
+    assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
+    wait_until(|| {
+        task_traffic_controller::ledger::Ledger::load(&ctx.paths.ledger_file())
+            .unwrap()
+            .entries
+            .len()
+            == 2
+    });
+    // Hold the fixture's own permit; the manager cannot start during this wait.
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(f.calls(), 0);
+    assert!(f.setups.preparation_observations(64).is_empty());
+    managed::finish(&ctx, guard, managed::TerminalKind::Cancelled).unwrap();
+    assert!(matches!(f.done(&a), ToolPreparationPoll::Installed(_)));
+    let observations = f.setups.preparation_observations(64);
+    assert_eq!(observations.len(), 1);
+    let elapsed = u64::try_from(start.elapsed().as_millis()).unwrap();
+    assert!(
+        elapsed >= observations[0].duration_ms + 1400,
+        "admission wait must not enter admitted run duration: {elapsed} vs {:?}",
+        observations[0]
+    );
+}
+
+#[test]
+fn preparation_telemetry_publish_failure_preserves_successful_installation() {
+    let mut f = Fx::new(AdapterKind::Nodenv, "node", "gate");
+    let a = f.consumer();
+    assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
+    wait_until(|| f.calls() == 1);
+    let dir = std::fs::read_dir(f.cfg.state_dir.join("setup/builders"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let node_digest = Digest::of_bytes(b"tool-install").as_str().replace(':', "-");
+    // Occupy the immutable telemetry destination only, leaving computation files untouched.
+    std::fs::create_dir(dir.join(format!("preparation-{node_digest}.json"))).unwrap();
+    std::fs::write(f.dir.path().join("host/release"), b"release").unwrap();
+    assert!(matches!(f.done(&a), ToolPreparationPoll::Installed(_)));
+    assert!(matches!(
+        adapters::detect(&f.plan()),
+        adapters::Availability::Installed(_)
+    ));
+    assert!(f.setups.preparation_observations(64).is_empty());
 }

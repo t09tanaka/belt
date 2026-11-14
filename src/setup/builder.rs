@@ -26,6 +26,7 @@
 //! not outlive its agent: at the next start it is stopped and removed, and
 //! the first attempt that needs the template starts a new one.
 
+use super::observation::{self, PreparationBinding, PreparationKind, PreparationObservation};
 use super::policy::{self, BuildEnd, KeyContext, Leave, Limits, LinkPlan, Sig, Unkept};
 use super::store::{digest_of, remove_tree, StoreError, Template, TemplateStore};
 use crate::error::{ApiError, ErrorCode};
@@ -252,6 +253,7 @@ struct Consumer {
 
 #[derive(Default)]
 struct Inner {
+    observations: HashMap<BuilderId, PreparationObservation>,
     /// The builder working for a key (none once it ended or was stopped).
     by_key: HashMap<String, BuilderId>,
     /// Private artifacts remain owned until every old writer is settled.
@@ -268,6 +270,7 @@ struct Inner {
 }
 
 pub struct Setups {
+    owner_generation: BuilderId,
     cfg: SetupConfig,
     store: TemplateStore,
     ws: Arc<dyn BuilderWorkspaces>,
@@ -292,6 +295,7 @@ impl Setups {
             .map_err(|e| internal("template store", e))?;
         store.sweep().map_err(|e| internal("template store", e))?;
         let s = Setups {
+            owner_generation: BuilderId::generate(),
             cfg,
             store,
             ws,
@@ -699,6 +703,9 @@ impl Setups {
             }
         };
         let result = work().map(Box::new).map_err(PreparationFailure);
+        if result.is_ok() {
+            self.handoff_observation(id, attempt, key, BuilderKind::ToolInstall, &dir);
+        }
         if !lock(&self.leftover).contains(attempt) {
             let _ = remove_tree(&dir);
         }
@@ -1080,6 +1087,73 @@ impl Setups {
             .is_some_and(|r| r.unresolved.is_none())
     }
 
+    /// Bounded immutable process-local producer snapshot. No filesystem or database I/O.
+    /// A reopened owner has no observations, even if installed artifacts remain valid.
+    pub fn preparation_observations(&self, limit: usize) -> Vec<PreparationObservation> {
+        lock(&self.inner)
+            .observations
+            .values()
+            .take(limit.min(64))
+            .cloned()
+            .collect()
+    }
+
+    fn handoff_observation(
+        &self,
+        id: &BuilderId,
+        attempt: &AttemptId,
+        key: &str,
+        kind: BuilderKind,
+        dir: &Path,
+    ) {
+        // Read outside the ownership mutex; recheck its current generation afterwards.
+        let Some(spec): Option<SuperviseSpec> = observation::read_private(&dir.join("spec.json"))
+        else {
+            return;
+        };
+        if spec.validate().is_err() {
+            return;
+        }
+        let Some(value) = observation::aggregate(&spec) else {
+            return;
+        };
+        let expected_kind = match kind {
+            BuilderKind::WorkspaceSetup => PreparationKind::WorkspaceSetup,
+            BuilderKind::ToolInstall => PreparationKind::ToolInstall,
+        };
+        if value.binding.builder_id != *id
+            || value.binding.attempt_id != *attempt
+            || value.binding.owner_generation != self.owner_generation
+            || value.binding.kind != expected_kind
+            || value.binding.key != crate::ids::Digest::of_bytes(key.as_bytes())
+        {
+            return;
+        }
+        if lock(&self.leftover).contains(attempt) {
+            return;
+        }
+        let mut inner = lock(&self.inner);
+        if inner.unknown_builder
+            || !inner.flights.get(id).is_some_and(|f| {
+                f.attempt_id == *attempt
+                    && f.key == key
+                    && f.kind == kind
+                    && !f.stop
+                    && !f.refs.is_empty()
+                    && f.end.is_none()
+            })
+            || inner.by_key.get(key) != Some(id)
+            || (kind == BuilderKind::ToolInstall
+                && (inner.barriers.get(key) != Some(attempt)
+                    || inner.tool_versions.get(key) != Some(id)))
+        {
+            return;
+        }
+        if inner.observations.len() < 4096 {
+            inner.observations.entry(id.clone()).or_insert(value);
+        }
+    }
+
     fn finish(&self, id: &BuilderId, end: BuilderResult) {
         // Never hold both mutexes: ownership readers and finishers can run together.
         let attempt = {
@@ -1228,7 +1302,17 @@ impl Setups {
             .store
             .publish(key, &receipt, &ws.root, run.as_deref(), now)
         {
-            Ok(_) => BuildEnd::Built,
+            Ok(template) => {
+                // Publication can legitimately retain an older pinned template.
+                // Its success is not proof of this builder's completed artifact.
+                if template.receipt.builder_id == *id
+                    && template.receipt.template_key == key
+                    && template.receipt.source_digest == source
+                {
+                    self.handoff_observation(id, attempt, key, BuilderKind::WorkspaceSetup, dir);
+                }
+                BuildEnd::Built
+            }
             Err(e) => crashed("the template", &e),
         }
     }
@@ -1438,7 +1522,21 @@ impl Setups {
         workspace_warnings: Vec<String>,
         fingerprint: Option<crate::ids::Digest>,
     ) -> Result<(), String> {
+        let meta: Option<Meta> = observation::read_private(&dir.join("meta.json"));
+        let preparation = meta
+            .filter(|m| &m.attempt_id == attempt)
+            .map(|m| PreparationBinding {
+                builder_id: m.builder_id,
+                attempt_id: m.attempt_id,
+                owner_generation: self.owner_generation.clone(),
+                kind: match m.kind {
+                    BuilderKind::WorkspaceSetup => PreparationKind::WorkspaceSetup,
+                    BuilderKind::ToolInstall => PreparationKind::ToolInstall,
+                },
+                key: crate::ids::Digest::of_bytes(m.key.as_bytes()),
+            });
         let sup = SuperviseSpec {
+            preparation,
             profile_fingerprint: fingerprint,
             state_dir: dir.to_path_buf(),
             worker_id: self.cfg.worker_id.clone(),
@@ -2001,5 +2099,101 @@ mod tool_validation_tests {
             .unwrap();
         assert_eq!(polled, ToolPreparationPoll::Pending);
         assert_eq!(setups.builds_started(), 0);
+    }
+    #[test]
+    fn observation_handoff_checks_generation_cancel_barriers_and_bounded_cache() {
+        let (_temp, setups, _, _) = fixture();
+        let consumer = AttemptId::generate();
+        let (id, attempt, _store) = seed(&setups, &consumer, BuilderKind::ToolInstall);
+        let key = format!("fixture:{id}");
+        let dir = setups.cfg.builders().join(id.as_str());
+        write_private(
+            &dir.join("meta.json"),
+            &serde_json::to_vec(&Meta {
+                kind: BuilderKind::ToolInstall,
+                builder_id: id.clone(),
+                attempt_id: attempt.clone(),
+                key: key.clone(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        setups
+            .write_nodes(
+                &dir,
+                &attempt,
+                vec![NodeSpec {
+                    node_id: NodeId::parse("tool-install").unwrap(),
+                    argv: vec!["/usr/bin/true".into()],
+                    cwd: dir.clone(),
+                    env: BTreeMap::new(),
+                    weight: None,
+                    timeout_ms: None,
+                }],
+                vec![],
+            )
+            .unwrap();
+        let spec = SuperviseSpec::from_file(&dir.join("spec.json")).unwrap();
+        observation::record_node(&spec, 0, 0.01).unwrap();
+        let value = observation::aggregate(&spec).unwrap();
+        {
+            let mut inner = lock(&setups.inner);
+            inner.by_key.insert(key.clone(), id.clone());
+            inner.barriers.insert(key.clone(), attempt.clone());
+            inner.tool_versions.insert(key.clone(), id.clone());
+        }
+        for variant in 0..4 {
+            {
+                let mut inner = lock(&setups.inner);
+                match variant {
+                    0 => inner.flights.get_mut(&id).unwrap().stop = true,
+                    1 => {
+                        inner.barriers.remove(&key);
+                    }
+                    2 => {
+                        inner
+                            .tool_versions
+                            .insert(key.clone(), BuilderId::generate());
+                    }
+                    _ => inner.flights.get_mut(&id).unwrap().attempt_id = AttemptId::generate(),
+                }
+            }
+            setups.handoff_observation(&id, &attempt, &key, BuilderKind::ToolInstall, &dir);
+            assert!(setups.preparation_observations(64).is_empty());
+            let mut inner = lock(&setups.inner);
+            inner.flights.get_mut(&id).unwrap().stop = false;
+            inner.flights.get_mut(&id).unwrap().attempt_id = attempt.clone();
+            inner.barriers.insert(key.clone(), attempt.clone());
+            inner.tool_versions.insert(key.clone(), id.clone());
+        }
+        let mut foreign = spec.clone();
+        foreign.preparation.as_mut().unwrap().owner_generation = BuilderId::generate();
+        write_private(
+            &dir.join("spec.json"),
+            &serde_json::to_vec(&foreign).unwrap(),
+        )
+        .unwrap();
+        setups.handoff_observation(&id, &attempt, &key, BuilderKind::ToolInstall, &dir);
+        assert!(setups.preparation_observations(64).is_empty());
+        write_private(&dir.join("spec.json"), &serde_json::to_vec(&spec).unwrap()).unwrap();
+        {
+            let mut inner = lock(&setups.inner);
+            for _ in 0..4096 {
+                let mut other = value.clone();
+                other.binding.builder_id = BuilderId::generate();
+                inner
+                    .observations
+                    .insert(other.binding.builder_id.clone(), other);
+            }
+        }
+        setups.handoff_observation(&id, &attempt, &key, BuilderKind::ToolInstall, &dir);
+        assert_eq!(lock(&setups.inner).observations.len(), 4096);
+        assert!(!lock(&setups.inner).observations.contains_key(&id));
+        assert_eq!(setups.preparation_observations(usize::MAX).len(), 64);
+        lock(&setups.inner).observations.clear();
+        setups.handoff_observation(&id, &attempt, &key, BuilderKind::ToolInstall, &dir);
+        assert_eq!(setups.preparation_observations(64), vec![value.clone()]);
+        setups.handoff_observation(&id, &attempt, &key, BuilderKind::ToolInstall, &dir);
+        assert_eq!(setups.preparation_observations(64), vec![value]);
     }
 }
