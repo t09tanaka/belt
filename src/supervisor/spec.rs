@@ -145,6 +145,9 @@ pub struct ArtifactsSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuperviseSpec {
+    /// Private builder-only telemetry binding; ordinary attempts omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<crate::setup::observation::PreparationBinding>,
     /// Worker-measured identity, frozen before execution; namespaces TTC history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_fingerprint: Option<crate::ids::Digest>,
@@ -374,6 +377,7 @@ mod tests {
 
     fn spec() -> SuperviseSpec {
         SuperviseSpec {
+            preparation: None,
             profile_fingerprint: None,
             state_dir: "/s".into(),
             worker_id: WorkerId::parse("w").unwrap(),

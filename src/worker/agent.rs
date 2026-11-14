@@ -1332,6 +1332,7 @@ impl Agent {
             });
         }
         let spec = SuperviseSpec {
+            preparation: None,
             profile_fingerprint: binding.map(|b| b.fingerprint().clone()).or_else(|| {
                 self.cfg
                     .capability_profile

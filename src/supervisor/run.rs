@@ -1083,6 +1083,25 @@ impl Control<'_> {
             (_, None) => TerminalKind::SpawnFailed,
         };
         let confirmed = managed::finish(&self.traffic.ctx, guard, kind).is_ok();
+        if confirmed && reason.is_none() && exit == Some(Exit::Code(0)) {
+            if let Ok(ran) = &ran {
+                if !ran.outcome.tracker_unknown && !ran.outcome.descendants_left {
+                    if let Some(index) = self
+                        .spec
+                        .nodes
+                        .iter()
+                        .position(|n| n.node_id == node.node_id)
+                    {
+                        // Telemetry is best effort and cannot change execution settlement.
+                        let _ = crate::setup::observation::record_node(
+                            self.spec,
+                            index,
+                            ran.outcome.wall_secs,
+                        );
+                    }
+                }
+            }
+        }
         if confirmed && reason.is_none() {
             if let (Some(entry), Ok(ran)) = (measurement_entry, &ran) {
                 if !ran.outcome.tracker_unknown && !ran.outcome.descendants_left {

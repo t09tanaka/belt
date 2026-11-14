@@ -83,6 +83,7 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
         .unwrap();
     store.transition(&attempt, AttemptState::Ready, 3).unwrap();
     let spec = SuperviseSpec {
+        preparation: None,
         profile_fingerprint: None,
         state_dir: state,
         worker_id: worker,
