@@ -54,8 +54,8 @@ pub enum Command {
     Retry(IdArgs),
     /// Fetch outputs.
     Outputs(OutputsArgs),
-    /// Estimate a command.
-    Estimate(SubmitArgs),
+    /// Preview placement if a command or a captured task were run again.
+    Estimate(EstimateArgs),
     /// Check the setup.
     Doctor,
     /// Manage workers.
@@ -116,6 +116,20 @@ pub struct SubmitArgs {
     #[command(flatten)]
     pub execution: ExecutionArgs,
     #[arg(last = true, required = true)]
+    pub command: Vec<String>,
+}
+
+/// A task preview reuses its stored inputs; it does not predict remaining runtime.
+#[derive(Debug, Args)]
+pub struct EstimateArgs {
+    #[command(flatten)]
+    pub execution: ExecutionArgs,
+    /// Task whose frozen commands, environment, setup and output plan would run again.
+    /// Does not capture the current checkout or apply current project settings.
+    /// This previews a hypothetical rerun, not remaining runtime.
+    #[arg(long, conflicts_with_all = ["profile", "requires", "command"])]
+    pub task: Option<String>,
+    #[arg(last = true, required_unless_present = "task")]
     pub command: Vec<String>,
 }
 
@@ -699,5 +713,41 @@ fn run_query(cli: &Cli) -> i32 {
             }
             error.code.exit_code()
         }
+    }
+}
+
+#[cfg(test)]
+mod estimate_args_tests {
+    use super::*;
+    #[test]
+    fn frozen_task_conflicts_with_execution_overrides_and_raw_command_stays_required() {
+        assert!(
+            Cli::try_parse_from(["rtr", "estimate", "--task", "task_example", "--json"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["rtr", "estimate", "--", "echo", "hello"]).is_ok());
+        assert!(Cli::try_parse_from(["rtr", "estimate"]).is_err());
+        for extra in [
+            vec!["--profile", "p"],
+            vec!["--requires", "node"],
+            vec!["--", "echo"],
+        ] {
+            let mut args = vec!["rtr", "estimate", "--task", "task_example"];
+            args.extend(extra);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let query = crate::service::estimate::Query {
+            version: 1,
+            argv: vec!["echo".into()],
+            repository_id: None,
+            cwd_relative: String::new(),
+            requirements: Default::default(),
+        };
+        assert_eq!(
+            serde_json::to_value(query).unwrap(),
+            serde_json::json!({
+                "version":1,"argv":["echo"],"repository_id":null,"cwd_relative":"",
+                "requirements": {}
+            })
+        );
     }
 }

@@ -184,18 +184,81 @@ pub async fn command(
     }
     Ok(Estimate::offline(source_kind))
 }
-pub fn cli(args: &crate::cli::SubmitArgs, json: bool) -> i32 {
+/// Exact private input, deliberately never exposed through public metadata queries.
+pub(crate) fn frozen_input(
+    store: &crate::storage::CoordinatorStore,
+    task_id: &crate::ids::TaskId,
+) -> Result<crate::storage::QueuedTask, ApiError> {
+    let input = store
+        .estimate_input(task_id)
+        .map_err(|e| ApiError::new(e.code(), e.to_string()))?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, format!("task {task_id} not found")))?;
+    let spec: crate::coordinator::TaskSpec = serde_json::from_value(input.spec.clone())
+        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, format!("stored task spec: {e}")))?;
+    spec.requirements
+        .validate()
+        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e))?;
+    if let Some(bundle) = &spec.toolchains {
+        bundle
+            .validate(&spec.manifest_digest)
+            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e))?;
+    }
+    Ok(input)
+}
+
+/// No checkout discovery, project config, capture, owner startup or source-store opening.
+pub async fn task(
+    bootstrap: super::bootstrap::Spec,
+    task_id: crate::ids::TaskId,
+) -> Result<Estimate, ApiError> {
+    let store = super::bootstrap::read_only_store(&bootstrap)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+    frozen_input(&store, &task_id)?;
+    let client = super::resident::Client::load(&bootstrap.state_dir, store.cluster_id().clone());
+    drop(store);
+    if let Ok(client) = client {
+        match client
+            .request(super::resident::Operation::EstimateTask { task_id })
+            .await
+        {
+            Ok(super::resident::Reply::Estimate { estimate }) => return Ok(estimate),
+            Ok(super::resident::Reply::ControlError { error }) => return Err(error),
+            _ => {}
+        }
+    }
+    let mut estimate = Estimate::offline("captured".into());
+    estimate.assumptions.push("hypothetical rerun using stored task inputs; not remaining runtime; captured source kind is unknown".into());
+    estimate
+        .assumptions
+        .push("stored specifications do not freeze mutable in-place workspace files".into());
+    Ok(estimate)
+}
+
+pub fn cli(args: &crate::cli::EstimateArgs, json: bool) -> i32 {
     let result = (|| {
         let env = std::env::vars().collect();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+        if let Some(id) = &args.task {
+            let id = crate::ids::TaskId::parse(id)
+                .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+            let config = crate::config::paths::user_config_path(&env)
+                .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+            let input = config
+                .parent()
+                .expect("config parent")
+                .join("coordinator.json");
+            let bootstrap = super::bootstrap::read_input(&input)
+                .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+            return runtime.block_on(task(bootstrap, id));
+        }
         let cwd = std::env::current_dir()
             .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
         let context = args
             .execution
             .apply(super::context::Context::discover_estimate(env, cwd)?);
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
         runtime.block_on(command(context, args.command.clone()))
     })();
     match result {

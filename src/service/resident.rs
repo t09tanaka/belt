@@ -57,6 +57,9 @@ pub enum Operation {
     Estimate {
         query: super::estimate::Query,
     },
+    EstimateTask {
+        task_id: TaskId,
+    },
     Cancel {
         target: super::completion::Target,
         expected_control_revision: u64,
@@ -954,6 +957,13 @@ async fn handle(
         .await?;
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
+    if let Operation::EstimateTask { task_id } = request.operation {
+        let reply = match coordinator.estimate_task(task_id).await {
+            Ok(estimate) => Reply::Estimate { estimate },
+            Err(error) => Reply::ControlError { error },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     if let Operation::Estimate { query } = request.operation {
         let reply = match coordinator.estimate(query).await {
             Ok(estimate) => Reply::Estimate { estimate },
@@ -1274,6 +1284,7 @@ async fn handle(
             }
             Operation::Query { .. }
             | Operation::Estimate { .. }
+            | Operation::EstimateTask { .. }
             | Operation::ResolveToolchains { .. } => {
                 unreachable!("read handled before admission")
             }

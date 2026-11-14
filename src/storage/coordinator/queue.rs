@@ -245,6 +245,28 @@ impl CoordinatorStore {
         })
     }
 
+    /// Private immutable execution input lookup, including completed tasks.
+    /// No queue predicate, ownership, source-store access or filesystem creation.
+    pub(crate) fn estimate_input(&self, task: &TaskId) -> Result<Option<QueuedTask>> {
+        let task = task.clone();
+        self.db.call(move |c| {
+            let row = c.query_row(
+                "SELECT t.run_id,r.source_id,t.spec_json,t.created_at_ms,t.rowid FROM task t JOIN run r USING(run_id) WHERE t.task_id=?1",
+                [task.as_str()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)),
+            ).optional()?;
+            row.map(|(run, source, spec, created, rowid)| Ok(QueuedTask {
+                task_id: task,
+                run_id: id("run_id", RunId::parse(&run))?,
+                source_id: source.map(|s| id("source_id", SourceId::parse(&s))).transpose()?,
+                spec: from_json("task spec", &spec)?,
+                created_at_ms: to_u64(created)?,
+                queue_rowid: rowid,
+            })).transpose()
+        })
+    }
+
     /// The tasks that may be placed, oldest first (insertion order within
     /// the same millisecond).
     pub fn queued_tasks(&self, limit: u32) -> Result<Vec<QueuedTask>> {
