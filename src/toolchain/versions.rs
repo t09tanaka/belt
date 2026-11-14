@@ -692,12 +692,20 @@ impl PubRange {
         Ok(version)
     }
     pub fn matches(&self, version: &Version) -> bool {
-        self.bounds.iter().all(|(op, bound)| match op {
-            PubOp::Eq => version == bound,
-            PubOp::Ge => version >= bound,
-            PubOp::Gt => version > bound,
-            PubOp::Le => version <= bound,
-            PubOp::Lt => version < bound,
+        self.bounds.iter().all(|(op, bound)| {
+            // Pub compares build components after ordinary semver precedence;
+            // missing components sort first, numbers before strings. The parsed
+            // Identifier ordering has those exact list/component rules.
+            let ordering = version
+                .cmp(bound)
+                .then_with(|| version.build.cmp(&bound.build));
+            match op {
+                PubOp::Eq => ordering.is_eq(),
+                PubOp::Ge => !ordering.is_lt(),
+                PubOp::Gt => ordering.is_gt(),
+                PubOp::Le => !ordering.is_gt(),
+                PubOp::Lt => ordering.is_lt(),
+            }
         })
     }
     fn as_range(&self) -> Range {

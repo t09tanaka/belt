@@ -88,11 +88,7 @@ pub fn read_captured(
         let doc = Document::new(&path, &bytes)?;
         if workflows.contains(&path) {
             for value in declarations::workflow_version_files(&doc)? {
-                paths.insert(if project.is_empty() {
-                    value
-                } else {
-                    format!("{project}/{value}")
-                });
+                paths.insert(value);
             }
         }
         documents.insert(path, doc);

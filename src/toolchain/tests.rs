@@ -146,11 +146,11 @@ fn workflows_keep_jobs_steps_and_unresolved_matrices_separate() {
     let wf="jobs:\n  test:\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version-file: custom.txt\n      - uses: unknown/setup-thing@v1\n      - run: true\n";
     let got = read_project(
         "app",
-        &docs(&[("ci.yml", wf), ("app/custom.txt", "22")]),
+        &docs(&[("ci.yml", wf), ("custom.txt", "22")]),
         &["ci.yml".into()],
     )
     .unwrap();
-    assert_eq!(got[0].location.path, "app/custom.txt");
+    assert_eq!(got[0].location.path, "custom.txt");
 }
 #[test]
 fn malformed_inputs_fail_without_printing_source_values() {
@@ -1178,4 +1178,270 @@ fn declared_selections_stay_exact_while_undeclared_baselines_use_policy() {
         }
         assert_eq!(baseline.check(&BTreeMap::new())[&tool], Match::Unknown);
     }
+}
+
+fn node_file_workflow(input: &str) -> String {
+    format!(
+        "jobs:\n  node:\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n{input}"
+    )
+}
+#[test]
+fn setup_node_structured_custom_files_follow_upstream_selectors() {
+    for (path, content) in [
+        ("meta/package.json", r#"{"engines":{"node":"22.1.0"}}"#),
+        (
+            "meta/custom.txt",
+            r#"{"volta":{"node":"22.1.0"},"engines":{"node":"20"}}"#,
+        ),
+        (
+            "meta/custom.txt",
+            r#"{"volta":{"node":false},"devEngines":{"runtime":{"name":"Node","version":"22.1.0"}},"engines":{"node":"20"}}"#,
+        ),
+        (
+            "meta/custom.txt",
+            r#"{"devEngines":{"runtime":[{"name":"other","version":"20"},{"name":"node","version":"22.1.0"}]},"engines":{"node":"20"}}"#,
+        ),
+        (
+            "meta/custom.txt",
+            r#"{"volta":{"node":null},"devEngines":{"runtime":{"name":"node","version":0}},"engines":{"node":"22.1.0"}}"#,
+        ),
+        (
+            "meta/custom.txt",
+            r#"{"volta":{"node":""},"engines":{"node":"22.1.0"}}"#,
+        ),
+        ("meta/.tool-versions", "python 3.12\nnodejs 22.1.0\n"),
+        ("meta/custom.txt", "node 22.1.0\n"),
+        ("meta/mise.toml", "[tools]\nnode = '22.1.0'\n"),
+        (
+            "meta/custom.txt",
+            "[tools]\nnode = { version = '22.1.0' }\n",
+        ),
+        ("meta/custom.txt", "# captured\nv22.1.0\n"),
+    ] {
+        let workflow = node_file_workflow(&format!("          node-version-file: '{path}'\n"));
+        let got = read_project(
+            "app",
+            &docs(&[("ci.yml", &workflow), (path, content)]),
+            &["ci.yml".into()],
+        )
+        .unwrap();
+        assert_eq!(got.len(), 1, "{path}: {content}");
+        assert_eq!(got[0].location.path, path);
+        assert_eq!(
+            got[0]
+                .constraint
+                .matches(&VersionObservation::parse("22.1.0")),
+            Match::Match
+        );
+        assert_eq!(
+            got[0]
+                .constraint
+                .matches(&VersionObservation::parse("20.1.0")),
+            Match::Mismatch
+        );
+    }
+    for content in [
+        "{bad",
+        r#"{"volta":{"extends":"../package.json"}}"#,
+        r#"{"engines":{"node":[]}}"#,
+        r#"{"volta":{"node":{}}}"#,
+        r#"{"engines":{"node":true}}"#,
+        r#"{"engines":{"node":22}}"#,
+        r#"{"engines":{"node":"bad"}}"#,
+        "[tools]\nnode = ['22']",
+        "nodejs bad",
+        "bad",
+    ] {
+        let workflow = node_file_workflow("          node-version-file: 'meta/custom.json'\n");
+        assert!(read_project(
+            "app",
+            &docs(&[("ci.yml", &workflow), ("meta/custom.json", content)]),
+            &["ci.yml".into()]
+        )
+        .is_err());
+    }
+    // Independent project declarations remain constraints even though a
+    // setup-node direct input takes precedence over its own file input.
+    let workflow =
+        node_file_workflow("          node-version: '20'\n          node-version-file: ignored\n");
+    assert!(read_project(
+        "app",
+        &docs(&[("app/.node-version", "22"), ("ci.yml", &workflow)]),
+        &["ci.yml".into()]
+    )
+    .is_err());
+}
+#[test]
+fn setup_node_direct_input_precedes_ignored_files_in_discovery_and_reading() {
+    for direct in ["22.1.0", "${{ matrix.node }}"] {
+        for file in ["missing.json", "bad.json", "../not-read"] {
+            let workflow = node_file_workflow(&format!(
+                "          node-version: '{direct}'\n          node-version-file: '{file}'\n"
+            ));
+            let document = Document::new("ci.yml", workflow.as_bytes()).unwrap();
+            assert!(workflow_version_files(&document).unwrap().is_empty());
+            let got = read_project(
+                "app",
+                &docs(&[("ci.yml", &workflow), ("bad.json", "{malformed")]),
+                &["ci.yml".into()],
+            )
+            .unwrap();
+            assert_eq!(got.len(), 1);
+            if direct.contains("${{") {
+                assert!(matches!(got[0].constraint, Constraint::Expression(_)));
+            } else {
+                assert_eq!(
+                    got[0]
+                        .constraint
+                        .matches(&VersionObservation::parse("22.1.0")),
+                    Match::Match
+                );
+            }
+        }
+    }
+    let workflow = node_file_workflow(
+        "          node-version: ''\n          node-version-file: 'meta/package.json'\n",
+    );
+    let document = Document::new("ci.yml", workflow.as_bytes()).unwrap();
+    assert_eq!(
+        workflow_version_files(&document).unwrap(),
+        vec!["meta/package.json"]
+    );
+    assert_eq!(
+        read_project(
+            "app",
+            &docs(&[
+                ("ci.yml", &workflow),
+                ("meta/package.json", r#"{"engines":{"node":"22.1.0"}}"#)
+            ]),
+            &["ci.yml".into()]
+        )
+        .unwrap()
+        .len(),
+        1
+    );
+}
+#[test]
+fn captured_monorepo_node_files_are_workspace_relative_and_snapshot_bound() {
+    use crate::source::store::SourceStore;
+    use local_ci::source::{capture_directory, CaptureOptions};
+    for (input,path,content,expected) in [
+        ("          node-version-file: 'app/.node-version'\n","app/.node-version","22.1.0",2),
+        ("          node-version-file: 'meta/package.json'\n","meta/package.json",r#"{"engines":{"node":"22.1.0"}}"#,1),
+        ("          node-version-file: 'meta/mise.toml'\n","meta/mise.toml","[tools]\nnode = { version = '22.1.0' }\n",1),
+        ("          node-version-file: 'meta/.tool-versions'\n","meta/.tool-versions","python 3.12\nnodejs 22.1.0\n",1),
+        ("          node-version: '22.1.0'\n          node-version-file: missing.json\n","unused.txt","unused",1),
+        ("          node-version: '${{ matrix.node }}'\n          node-version-file: missing.json\n","unused.txt","unused",1),
+        ("          node-version: '22.1.0'\n          node-version-file: bad.json\n","bad.json","{malformed",1),
+    ] {
+        let tmp=tempfile::tempdir().unwrap();let source=tmp.path().join("source");std::fs::create_dir(&source).unwrap();let file=source.join(path);std::fs::create_dir_all(file.parent().unwrap()).unwrap();std::fs::write(&file,content).unwrap();
+        let workflow=node_file_workflow(input);std::fs::write(source.join("ci.yml"),workflow).unwrap();
+        let store=SourceStore::open(&tmp.path().join("state")).unwrap();let ctx=local_ci::ExecContext::new(Default::default());let captured=capture_directory(&ctx,&source,&CaptureOptions{store:Some(store.root().into()),..Default::default()}).unwrap();
+        std::fs::write(file,"20.1.0").unwrap();
+        let got=snapshot::read_captured(&store,&captured.manifest,"app",&["ci.yml".into()]).unwrap();assert_eq!(got.len(),expected,"{path}");
+        for declaration in got {if !matches!(declaration.constraint,Constraint::Expression(_)) {assert_eq!(declaration.constraint.matches(&VersionObservation::parse("22.1.0")),Match::Match);}}
+    }
+}
+#[test]
+fn pub_observed_and_selected_build_metadata_uses_pub_ordering() {
+    for (range, version, expected) in [
+        ("1.2.3", "1.2.3+1", false),
+        ("<=1.2.3", "1.2.3+1", false),
+        (">1.2.3", "1.2.3+1", true),
+        (">=1.2.3", "1.2.3+1", true),
+        ("<1.2.3", "1.2.3+1", false),
+        ("^1.2.3", "1.2.3+2.10", true),
+        ("<2.0.0", "2.0.0-0+1", false),
+        ("<=1.2.3-beta", "1.2.3-beta+1", false),
+        (">1.2.3-beta", "1.2.3-beta+1", true),
+    ] {
+        assert_eq!(
+            PubRange::parse(range)
+                .unwrap()
+                .matches(&version.parse().unwrap()),
+            expected,
+            "{range}: {version}"
+        );
+    }
+    let digest = crate::ids::Digest::of_bytes(b"pub-build");
+    for (range, allowed) in [("1.2.3", false), ("<=1.2.3", false), (">1.2.3", true)] {
+        let mut declaration = decl("1.2.3");
+        declaration.tool = ToolId::parse("dart").unwrap();
+        declaration.constraint = Constraint::Pub(PubRange::parse(range).unwrap());
+        let frozen = FrozenToolchains::freeze(
+            digest.clone(),
+            digest.clone(),
+            Scope::project(""),
+            &[declaration.clone()],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Any,
+        )
+        .unwrap();
+        let selected = frozen.with_selection(
+            &declaration.tool,
+            "1.2.3+1".parse().unwrap(),
+            digest.clone(),
+        );
+        assert_eq!(selected.is_ok(), allowed);
+        if let Ok(selected) = selected {
+            assert!(selected.validate().is_ok());
+            assert_eq!(
+                selected.check(
+                    &[(
+                        declaration.tool.clone(),
+                        VersionObservation::parse("1.2.3+1")
+                    )]
+                    .into()
+                )[&declaration.tool],
+                Match::Match
+            );
+            assert_eq!(
+                selected.check(
+                    &[(
+                        declaration.tool.clone(),
+                        VersionObservation::parse("1.2.3+2")
+                    )]
+                    .into()
+                )[&declaration.tool],
+                Match::Mismatch
+            );
+        }
+    }
+    assert!(
+        PubRange::parse("1.2.3+1").is_err(),
+        "build-bearing bounds remain explicitly resolution-required"
+    );
+}
+
+#[test]
+fn non_node_workspace_files_and_node_toml_without_node_remain_explicit() {
+    let workflow="jobs:\n  python:\n    steps:\n      - uses: actions/setup-python@v5\n        with:\n          python-version-file: meta/python.txt\n";
+    let got = read_project(
+        "app",
+        &docs(&[
+            ("ci.yml", workflow),
+            ("meta/python.txt", "# captured\n3.12\n"),
+        ]),
+        &["ci.yml".into()],
+    )
+    .unwrap();
+    assert_eq!(got[0].tool.as_str(), "python");
+    assert_eq!(got[0].location.path, "meta/python.txt");
+    assert!(read_project(
+        "app",
+        &docs(&[("ci.yml", workflow), ("meta/python.txt", "bad")]),
+        &["ci.yml".into()]
+    )
+    .is_err());
+    let workflow = node_file_workflow("          node-version-file: meta/mise.toml\n");
+    assert!(read_project(
+        "app",
+        &docs(&[
+            ("ci.yml", &workflow),
+            ("meta/mise.toml", "[tools]\npython = '3.12'\n")
+        ]),
+        &["ci.yml".into()]
+    )
+    .is_err());
 }

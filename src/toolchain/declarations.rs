@@ -355,11 +355,12 @@ fn read_workflow(
                     .find(|(k, _)| k == key)
                     .map(|(_, v)| v.as_str())
             };
-            if let Some(raw) = get(key) {
+            let (direct, file) = version_inputs(action, key, &step.with);
+            if let Some(raw) = direct {
                 add(out, doc, &scope, tool, raw, key)?;
             }
             let file_key = format!("{key}-file");
-            if let Some(file) = get(&file_key) {
+            if let Some(file) = file {
                 if file.contains("${{") {
                     Constraint::parse(file).map_err(|code| doc.error(code, &file_key))?;
                     out.push(Declaration {
@@ -372,23 +373,21 @@ fn read_workflow(
                     if !safe_path(file) {
                         return Err(doc.error("invalid_version_file", &file_key));
                     }
-                    let path = if project.project.is_empty() {
-                        file.into()
-                    } else {
-                        format!("{}/{file}", project.project)
-                    };
                     let input = documents
-                        .get(&path)
+                        .get(file)
                         .ok_or_else(|| doc.error("missing_version_file", &file_key))?;
-                    let value = input
-                        .text
-                        .lines()
-                        .filter_map(|line| line.split('#').next())
-                        .map(str::trim)
-                        .filter(|line| !line.is_empty())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    add(out, input, &scope, tool, &value, "")?;
+                    if action == "actions/setup-node" {
+                        let (constraint, key) = node_file_constraint(input)?;
+                        out.push(Declaration {
+                            tool: ToolId::parse(tool).expect("registered action tool"),
+                            constraint,
+                            scope: scope.clone(),
+                            location: input.location(key),
+                        });
+                    } else {
+                        let value = plain_version(&input.text);
+                        add(out, input, &scope, tool, &value, "")?;
+                    }
                 }
             }
             if action == "dtolnay/rust-toolchain"
@@ -445,16 +444,137 @@ pub fn workflow_version_files(doc: &Document) -> Result<Vec<String>, Diagnostic>
             continue;
         };
         let file_key = format!("{key}-file");
-        for (_, path) in step.with.into_iter().filter(|(k, _)| k == &file_key) {
+        if let Some(path) = version_inputs(action, key, &step.with).1 {
             if path.contains("${{") {
-                Constraint::parse(&path).map_err(|code| doc.error(code, &file_key))?;
+                Constraint::parse(path).map_err(|code| doc.error(code, &file_key))?;
                 continue;
             }
-            if !safe_path(&path) {
+            if !safe_path(path) {
                 return Err(doc.error("invalid_version_file", &file_key));
             }
-            paths.push(path);
+            paths.push(path.to_string());
         }
     }
     Ok(paths)
+}
+
+// setup-node returns its nonempty direct input before it consults a file.
+// Share this decision with snapshot discovery, including unresolved expressions.
+fn version_inputs<'a>(
+    action: &str,
+    key: &str,
+    inputs: &'a [(String, String)],
+) -> (Option<&'a str>, Option<&'a str>) {
+    let get = |key: &str| {
+        inputs
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.as_str())
+    };
+    let mut direct = get(key);
+    if action == "actions/setup-node" {
+        direct = direct.filter(|value| !value.trim().is_empty());
+    }
+    let file = if action == "actions/setup-node" && direct.is_some() {
+        None
+    } else {
+        get(&format!("{key}-file"))
+    };
+    (direct, file)
+}
+fn plain_version(text: &str) -> String {
+    text.lines()
+        .filter_map(|line| line.split('#').next())
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+// Format/selector precedence follows actions/setup-node src/util.ts:
+// Volta, npm devEngines runtime, engines; mise tools.node; node(js) prefix.
+// Only the supplied immutable document is read. Unsupported structured choices
+// require explicit resolution, never fallback to another installed version.
+fn node_file_constraint(doc: &Document) -> Result<(Constraint, &'static str), Diagnostic> {
+    let raw = doc.text.trim();
+    let mut selected = None;
+    if let Ok(value) = serde_json::from_str::<Value>(raw) {
+        if value.is_object() {
+            if let Some(version) = value.pointer("/volta/node").filter(|v| json_truthy(v)) {
+                selected = Some((version.clone(), "node"));
+            }
+            if selected.is_none() {
+                if let Some(runtime) = value.pointer("/devEngines/runtime") {
+                    let candidates = runtime
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or(std::slice::from_ref(runtime));
+                    if let Some(entry) = candidates.iter().find(|entry| {
+                        entry
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|name| name.eq_ignore_ascii_case("node"))
+                            && entry.get("version").is_some_and(json_truthy)
+                    }) {
+                        selected = entry.get("version").map(|v| (v.clone(), "version"));
+                    }
+                }
+            }
+            if selected.is_none() {
+                selected = value
+                    .pointer("/engines/node")
+                    .filter(|v| json_truthy(v))
+                    .map(|v| (v.clone(), "node"));
+            }
+            if selected.is_none() {
+                return Err(doc.error("node_version_file_requires_resolution", ""));
+            }
+        }
+    } else if raw.starts_with('{') {
+        return Err(doc.error("invalid_json", ""));
+    }
+    if selected.is_none() {
+        if let Ok(value) = toml::from_str::<toml::Value>(raw) {
+            if let Some(node) = value.get("tools").and_then(|v| v.get("node")) {
+                let version = node.get("version").unwrap_or(node);
+                selected = Some((
+                    serde_json::to_value(version).expect("TOML value serializes"),
+                    "node",
+                ));
+            }
+        }
+    }
+    if let Some((value, key)) = selected {
+        return Ok((
+            Constraint::parse(text(doc, &value, key)?).map_err(|code| doc.error(code, key))?,
+            key,
+        ));
+    }
+    for line in raw.lines() {
+        let words: Vec<_> = line
+            .split('#')
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        if words.len() == 2 && matches!(words[0], "node" | "nodejs") {
+            return Ok((
+                Constraint::parse(words[1]).map_err(|code| doc.error(code, words[0]))?,
+                "node",
+            ));
+        }
+    }
+    Ok((
+        Constraint::parse(&plain_version(raw)).map_err(|code| doc.error(code, ""))?,
+        "",
+    ))
+}
+
+fn json_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(value) => *value,
+        Value::Number(value) => value.as_f64() != Some(0.0),
+        Value::String(value) => !value.is_empty(),
+        Value::Array(_) | Value::Object(_) => true,
+    }
 }

@@ -1191,7 +1191,13 @@ source/Vault/private binding の GC と output planner 完成はこの結果 ret
 `toolchain::snapshot::read_captured` reads bounded, verified captured objects,
 not the live checkout. `versions::effective` intersects declarations per explicit
 project/workflow/job/step scope; contradictory declarations fail with source
-locations. There is no implicit file precedence. Deferred expressions and
+locations. There is no implicit precedence between project declaration files.
+The setup-node action's nonempty direct node-version does override its own
+node-version-file, including when the direct input is an unresolved expression.
+Action version-file paths are relative to the repository workspace, independently
+of the selected project directory. Captured Node files are decoded as structured
+JSON (Volta/devEngines/engines), mise TOML or node/nodejs-prefixed plain versions.
+Deferred expressions and
 manager channels require explicit resolution; missing observations remain unknown,
 even with `match = "any"`. `FrozenToolchains` retains source/profile identity,
 requirements, baseline provenance and explicit concrete selections for reuse on
@@ -1202,8 +1208,9 @@ policy applies only to baselines for tools without a declaration. This API
 is not yet part of submit/admission payloads.
 
 Node-style ranges use the npm-compatible `node-semver` parser. Pub environment
-constraints use Dart's distinct caret and prerelease-bound rules; Pub build
-metadata currently returns an explicit resolution-required diagnostic. Channel,
+constraints use Dart's distinct caret and prerelease-bound rules. Pub concrete
+observations/selections include build metadata in ordering and equality; bounds
+containing build metadata currently return an explicit resolution-required diagnostic. Channel,
 workflow-expression and version-file-expression resolution is deferred, with no
 host env expansion. A selection's authority digest is supplied by the trusted
 parent/adapter; this API verifies its source/profile/scope/requirement binding,
