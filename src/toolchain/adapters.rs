@@ -1,6 +1,6 @@
 //! Private installation plans and durable activation contracts.
-//! No process execution or admission grant lives here. S20c must connect the
-//! trusted executor to existing setup admission/singleflight/child ownership.
+//! No process execution or admission grant lives here. Private preparation connects
+//! the trusted helper to setup admission, singleflight and supervised child ownership.
 use super::versions::{Constraint, FrozenToolchains, ToolId};
 use crate::ids::Digest;
 use node_semver::Version;
@@ -100,7 +100,7 @@ impl FileIdentity {
 }
 /// Trusted operator configuration, never project/wire input. Canonical regular
 /// executable paths and complete external runtime dependencies are required.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostTools {
     pub manager: FileIdentity,
     pub dependencies: Vec<FileIdentity>,

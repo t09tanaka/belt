@@ -21,6 +21,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run one admitted private tool installer (internal).
+    #[command(hide = true)]
+    ToolchainInstall {
+        #[arg(long)]
+        request: std::path::PathBuf,
+        #[arg(long)]
+        binding: String,
+    },
     /// Run the parent owner process (internal).
     #[command(hide = true)]
     Daemon(DaemonArgs),
@@ -273,6 +281,9 @@ impl Envelope {
 
 /// Run a parsed command and return the process exit code.
 pub fn run(cli: Cli) -> i32 {
+    if let Command::ToolchainInstall { request, binding } = &cli.command {
+        return crate::toolchain::preparation::helper_main(request, binding);
+    }
     if matches!(cli.command, Command::Init) {
         return match crate::service::init::command() {
             Ok(receipt) => {

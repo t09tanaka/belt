@@ -2,6 +2,7 @@
 
 pub mod adapters;
 pub mod capability;
+pub mod preparation;
 pub mod profile;
 
 pub mod declarations;

@@ -436,3 +436,21 @@ captured submit の retry は一度 exit 1 になり、追加した安全な診�
 この失敗の原因は未確定であり、全体 CI で再発した場合は診断に基づき解消する。
 通常 profile の eager probe による遅延や一時的な観測差は調査対象として残し、
 focused 成功だけで全体の安定性確認を完了したとは扱わない。
+### S20c private preparation infrastructure（2026-11-15）
+
+trusted な concrete adapter request を受ける内部 `Setups::poll_tool` を追加した。
+5種の adapter は既存 builder の singleflight、detached supervisor、TTC permit、
+lease/cancel/drain/recovery を共有し、private root へ導入する。helper は private request と
+spec の binding、worker acceptance/launch identity、live managed Running command の
+正確な child identity を確認するまで manager を実行しない。source contract と artifact key、
+profile definition と実 execution fingerprint はそれぞれ分離する。
+
+完了 receipt は現在の外部 identity と tree を再検証する。最後の consumer が離れた後も、
+旧 writer の settlement が不明なら同じ key の新規導入を止める。partial/drift は blocking failure
+とし、tool root の自動削除・再導入や workspace template への置換を行わない。
+
+private fake manager と所有する supervisor/TTC process の9件、private file 検査1件、
+既存 workspace setup の31件が成功した。strict clippy all-targets/all-features と fmt も成功。
+実ホスト manager・network・service 導入は実行していない。全 CI はこの差分では未実施。
+TaskSpec/submit/worker routing と consumer activation、inventory/diff/sync は未接続であり、
+この infrastructure だけでは S20 全体の完了や公開 task の自動導入を申告しない。

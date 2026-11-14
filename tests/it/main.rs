@@ -18,6 +18,7 @@ mod setup;
 mod source_capture;
 mod stop;
 mod supervisor;
+mod toolchain_preparation;
 mod worker_agent;
 mod worker_blobs;
 mod workspace;

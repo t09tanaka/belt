@@ -148,10 +148,12 @@ impl ResolvedConfig {
             .map_err(|e| super::ConfigError::Invalid { problems: vec![e] })?;
         agent.profile = profile.name().into();
         agent.profile_fingerprint = profile.report().profile_fingerprint;
+        let profile_definition = profile.definition_digest().clone();
         let env = profile.environment().clone();
         agent.capability_profile = Some(Arc::new(profile));
         let mut setup = SetupConfig::new(inputs.state_dir, inputs.worker_id, inputs.supervisor_exe);
         setup.env = env.clone();
+        setup.profile_definition = Some(profile_definition);
         setup.profile_fingerprint = Some(agent.profile_fingerprint.clone());
         setup.profile = format!("{}:{}", agent.profile, agent.profile_fingerprint);
         setup.traffic_state_dir = agent.traffic_state_dir.clone();

@@ -38,6 +38,10 @@ use crate::storage::{NewAcceptance, WorkerStore};
 use crate::supervisor::lock::SupervisorLock;
 use crate::supervisor::process::{code, spawn_detached, supervise};
 use crate::supervisor::spec::{MaskValues, NodeSpec, SuperviseSpec};
+use crate::toolchain::adapters::{self, Availability, InstallationReceipt};
+use crate::toolchain::preparation::{
+    self, PreparationFailure, PreparationRequest, ToolPreparationPoll,
+};
 use crate::wire::{
     AttemptPayload, LeaseKey, PreparedArtifact, PreparedChange, PreparedRemoval, ReuseScope,
     SetupSpec,
@@ -46,7 +50,7 @@ use crate::workspace::{Workspace, WorkspaceKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -79,6 +83,8 @@ pub struct SetupConfig {
     /// Part of every template key: what the tools of this worker are.
     pub profile: String,
     pub profile_fingerprint: Option<crate::ids::Digest>,
+    /// Operator profile definition, distinct from its observed execution identity.
+    pub profile_definition: Option<crate::ids::Digest>,
     /// The environment the steps start from (`PATH`, `HOME`, ...). Nothing
     /// of this process's own environment is inherited.
     pub env: BTreeMap<String, String>,
@@ -114,6 +120,7 @@ impl SetupConfig {
             traffic_config: None,
             profile: "default".into(),
             profile_fingerprint: None,
+            profile_definition: None,
             log_limit_bytes: crate::supervisor::spec::DEFAULT_LOG_LIMIT_BYTES,
             env: BTreeMap::new(),
             poll_ms: 200,
@@ -173,8 +180,33 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|p| p.into_inner())
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+enum BuilderKind {
+    #[default]
+    WorkspaceSetup,
+    ToolInstall,
+}
+
+enum BuilderJob {
+    WorkspaceSetup {
+        source: String,
+        payload: AttemptPayload,
+    },
+    ToolInstall {
+        request: PreparationRequest,
+    },
+}
+
+#[derive(Clone)]
+enum BuilderResult {
+    Workspace(BuildEnd),
+    Tool(Result<Box<InstallationReceipt>, PreparationFailure>),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Meta {
+    #[serde(default)]
+    kind: BuilderKind,
     builder_id: BuilderId,
     attempt_id: AttemptId,
     key: String,
@@ -186,7 +218,8 @@ struct Flight {
     /// The attempts that hold a reference.
     refs: BTreeSet<String>,
     /// Set once, when the builder has ended.
-    end: Option<BuildEnd>,
+    end: Option<BuilderResult>,
+    kind: BuilderKind,
     /// The last reference went: no new consumer joins, and the builder is
     /// cancelled.
     stop: bool,
@@ -205,12 +238,16 @@ struct Consumer {
     run: String,
     builder: Option<BuilderId>,
     resolved: Option<Resolved>,
+    binding: Option<Digest>,
 }
 
 #[derive(Default)]
 struct Inner {
     /// The builder working for a key (none once it ended or was stopped).
     by_key: HashMap<String, BuilderId>,
+    /// Private artifacts remain owned until every old writer is settled.
+    barriers: HashMap<String, AttemptId>,
+    unknown_builder: bool,
     flights: HashMap<BuilderId, Flight>,
     consumers: HashMap<String, Consumer>,
     /// Keys whose steps passed but made something that cannot be kept, with
@@ -320,12 +357,27 @@ impl Setups {
                 .and_then(|b| serde_json::from_slice::<Meta>(&b).ok());
             let Some(meta) = meta else {
                 // made but not described: nothing ran
-                let _ = remove_tree(&dir);
+                if !dir.join("worker.db").exists() && !dir.join("spec.json").exists() {
+                    let _ = remove_tree(&dir);
+                } else {
+                    lock(&self.inner).unknown_builder = true;
+                }
                 continue;
             };
+            if meta.key.starts_with("tool:") && meta.kind != BuilderKind::ToolInstall {
+                lock(&self.inner).unknown_builder = true;
+                continue;
+            }
+            if meta.kind == BuilderKind::ToolInstall {
+                lock(&self.inner)
+                    .barriers
+                    .insert(meta.key.clone(), meta.attempt_id.clone());
+            }
             if !self.settle_old(&dir, &meta) {
                 lock(&self.leftover_dirs).insert(meta.attempt_id.clone(), dir);
                 lock(&self.leftover).insert(meta.attempt_id);
+            } else {
+                self.clear_barrier(&meta.attempt_id);
             }
         }
     }
@@ -350,7 +402,14 @@ impl Setups {
         let launched =
             WorkerStore::open(dir, &self.cfg.worker_id).and_then(|s| match s.get(attempt)? {
                 None => Ok(false),
-                Some(_) => Ok(!s.launches(attempt)?.is_empty()),
+                Some(_) => {
+                    if meta.kind == BuilderKind::ToolInstall {
+                        // A supervisor may have loaded its spec before recovery took the lock.
+                        // Fence that late starter before no-launch scratch can be removed.
+                        s.cancel(attempt, CoordinatorEpoch(1), platform::wall_ms())?;
+                    }
+                    Ok(!s.launches(attempt)?.is_empty())
+                }
             });
         let launched = match launched {
             Ok(l) => l,
@@ -364,15 +423,198 @@ impl Setups {
                 return false;
             }
         }
-        if let Some(ws) = std::fs::read(dir.join("workspace.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Workspace>(&b).ok())
-        {
-            if self.ws.remove(&ws).is_err() {
-                return false;
+        if meta.kind == BuilderKind::WorkspaceSetup {
+            if let Some(ws) = std::fs::read(dir.join("workspace.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Workspace>(&b).ok())
+            {
+                if self.ws.remove(&ws).is_err() {
+                    return false;
+                }
             }
         }
         remove_tree(dir).is_ok()
+    }
+
+    /// Allocate the worker-owned private tool area, never a project path.
+    pub fn private_tool_root(&self) -> Result<PathBuf, ApiError> {
+        let state =
+            std::fs::canonicalize(&self.cfg.state_dir).map_err(|e| internal("worker state", e))?;
+        let root = state.join("toolchains");
+        match std::fs::symlink_metadata(&root) {
+            Ok(m)
+                if m.is_dir()
+                    && m.uid() == rustix::process::geteuid().as_raw()
+                    && m.mode() & 0o077 == 0 => {}
+            Ok(_) => return Err(invalid("unsafe private tool root")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .mode(0o700)
+                    .create(&root)
+                    .map_err(|e| internal("private tool directory", e))?;
+            }
+            Err(e) => return Err(internal("private tool directory", e)),
+        }
+        if std::fs::canonicalize(&root).map_err(|e| internal("private tool directory", e))? != root
+        {
+            return Err(invalid("private tool root is not canonical"));
+        }
+        Ok(root)
+    }
+
+    /// Poll one trusted concrete tool plan. Failed preparation never becomes setup fallback.
+    pub fn poll_tool(
+        self: &Arc<Self>,
+        attempt: &AttemptId,
+        request: &PreparationRequest,
+    ) -> Result<ToolPreparationPoll, ApiError> {
+        if self.cfg.profile_definition.as_ref() != Some(&request.frozen.profile_definition)
+            || self.cfg.profile_fingerprint.as_ref() != Some(&request.base_profile)
+        {
+            return Err(invalid("preparation profile identity mismatch"));
+        }
+        let root = self.private_tool_root()?;
+        let plan = request.plan(&root).map_err(invalid)?;
+        let key = format!("tool:{}", plan.key());
+        let consumer = format!("{attempt}/tool:{}", request.tool.as_str());
+        let binding = request.digest();
+        let mut inner = lock(&self.inner);
+        if inner.unknown_builder {
+            return Ok(ToolPreparationPoll::Failed(PreparationFailure(
+                "unresolved builder metadata".into(),
+            )));
+        }
+        let c = inner.consumers.entry(consumer.clone()).or_default();
+        if c.binding.as_ref().is_some_and(|old| *old != binding) {
+            return Err(invalid("preparation consumer binding changed"));
+        }
+        c.binding = Some(binding);
+        let joined = c.builder.clone();
+        if let Some(id) = joined {
+            match inner.flights.get(&id).map(|f| f.end.clone()) {
+                Some(None) => return Ok(ToolPreparationPoll::Pending),
+                Some(Some(BuilderResult::Tool(Err(failure)))) => {
+                    return Ok(ToolPreparationPoll::Failed(failure))
+                }
+                Some(Some(BuilderResult::Tool(Ok(receipt)))) => {
+                    return Ok(match receipt.validate(&plan) {
+                        Ok(()) => ToolPreparationPoll::Installed(receipt),
+                        Err(e) => ToolPreparationPoll::Failed(PreparationFailure(e.into())),
+                    });
+                }
+                _ => {
+                    return Ok(ToolPreparationPoll::Failed(PreparationFailure(
+                        "tool builder lost".into(),
+                    )))
+                }
+            }
+        }
+        if let Some(id) = inner.by_key.get(&key).cloned() {
+            let f = inner.flights.get_mut(&id).expect("listed builder exists");
+            // A stopped writer cannot be joined, but still owns its artifact until drain.
+            if f.stop {
+                return Ok(ToolPreparationPoll::Pending);
+            }
+            policy::join(&mut f.refs, &consumer);
+            inner.consumers.get_mut(&consumer).unwrap().builder = Some(id);
+            return Ok(ToolPreparationPoll::Pending);
+        }
+        if inner.barriers.contains_key(&key) {
+            return Ok(ToolPreparationPoll::Pending);
+        }
+        match adapters::detect(&plan) {
+            Availability::Installed(receipt) => return Ok(ToolPreparationPoll::Installed(receipt)),
+            Availability::Unknown(e) | Availability::ManualRequired(e) => {
+                return Ok(ToolPreparationPoll::Failed(PreparationFailure(e.into())))
+            }
+            Availability::Missing => (),
+        }
+        let id = BuilderId::generate();
+        let builder_attempt = AttemptId::generate();
+        inner.barriers.insert(key.clone(), builder_attempt.clone());
+        inner.by_key.insert(key.clone(), id.clone());
+        inner.flights.insert(
+            id.clone(),
+            Flight {
+                key: key.clone(),
+                attempt_id: builder_attempt.clone(),
+                refs: BTreeSet::from([consumer.clone()]),
+                end: None,
+                stop: false,
+                kind: BuilderKind::ToolInstall,
+            },
+        );
+        inner.consumers.get_mut(&consumer).unwrap().builder = Some(id.clone());
+        drop(inner);
+        self.spawn_builder(
+            id,
+            builder_attempt,
+            key,
+            BuilderJob::ToolInstall {
+                request: request.clone(),
+            },
+        );
+        Ok(ToolPreparationPoll::Pending)
+    }
+
+    fn clear_barrier(&self, attempt: &AttemptId) {
+        lock(&self.inner).barriers.retain(|_, old| old != attempt);
+    }
+
+    fn run_tool_builder(
+        &self,
+        id: &BuilderId,
+        attempt: &AttemptId,
+        key: &str,
+        request: &PreparationRequest,
+    ) -> Result<Box<InstallationReceipt>, PreparationFailure> {
+        let dir = std::fs::canonicalize(self.cfg.builders())
+            .map_err(|e| PreparationFailure(e.to_string()))?
+            .join(id.as_str());
+        let work = || -> Result<InstallationReceipt, String> {
+            private_dir(&dir).map_err(|e| e.to_string())?;
+            let meta = Meta {
+                kind: BuilderKind::ToolInstall,
+                builder_id: id.clone(),
+                attempt_id: attempt.clone(),
+                key: key.into(),
+            };
+            write_private(
+                &dir.join("meta.json"),
+                &serde_json::to_vec(&meta).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            write_private(
+                &dir.join(preparation::REQUEST_FILE),
+                &serde_json::to_vec(request).map_err(|e| e.to_string())?,
+            )
+            .map_err(|e| e.to_string())?;
+            if self.wanted(id).0 == 0 {
+                return Err("tool preparation cancelled".into());
+            }
+            let exe = std::fs::canonicalize(&self.cfg.supervisor_exe).map_err(|e| e.to_string())?;
+            let node = preparation::helper_node(&exe, &dir, request)?;
+            self.write_nodes(&dir, attempt, vec![node], Vec::new())?;
+            let store = self.accept(&dir, attempt)?;
+            if self.wanted(id).0 == 0 {
+                return Err("tool preparation cancelled".into());
+            }
+            let end = self.supervised(id, attempt, &dir, &store);
+            if !end.is_built() {
+                return Err(end.describe());
+            }
+            let plan = request.plan(&self.private_tool_root().map_err(|e| e.message)?)?;
+            match adapters::detect(&plan) {
+                Availability::Installed(receipt) => Ok(*receipt),
+                Availability::Unknown(e) | Availability::ManualRequired(e) => Err(e.into()),
+                Availability::Missing => Err("installer ended without receipt".into()),
+            }
+        };
+        let result = work().map(Box::new).map_err(PreparationFailure);
+        if !lock(&self.leftover).contains(attempt) {
+            let _ = remove_tree(&dir);
+        }
+        result
     }
 
     /// Where a consumer stands. Never blocks for a build: a template that is
@@ -429,7 +671,12 @@ impl Setups {
         inner.consumers.entry(a.clone()).or_default().run = ctx.run_id.clone();
         let joined = inner.consumers.get(&a).and_then(|c| c.builder.clone());
         let ready: Option<Template> = match joined {
-            Some(id) => match inner.flights.get(&id).map(|f| f.end.clone()) {
+            Some(id) => match inner.flights.get(&id).map(|f| {
+                f.end.as_ref().map(|end| match end {
+                    BuilderResult::Workspace(end) => end.clone(),
+                    BuilderResult::Tool(_) => BuildEnd::Crashed("wrong builder kind".into()),
+                })
+            }) {
                 Some(None) => return Ok(SetupPoll::Pending),
                 None => {
                     drop(inner);
@@ -475,13 +722,22 @@ impl Setups {
                                 attempt_id: attempt_id.clone(),
                                 refs,
                                 end: None,
+                                kind: BuilderKind::WorkspaceSetup,
                                 stop: false,
                             },
                         );
                         inner.by_key.insert(key.clone(), id.clone());
                         inner.consumers.entry(a.clone()).or_default().builder = Some(id.clone());
                         drop(inner);
-                        self.spawn_builder(id, attempt_id, key, ctx.source_digest, payload.clone());
+                        self.spawn_builder(
+                            id,
+                            attempt_id,
+                            key,
+                            BuilderJob::WorkspaceSetup {
+                                source: ctx.source_digest,
+                                payload: payload.clone(),
+                            },
+                        );
                         return Ok(SetupPoll::Pending);
                     }
                     drop(inner);
@@ -543,11 +799,19 @@ impl Setups {
     pub fn release(&self, attempt: &AttemptId) {
         let a = attempt.to_string();
         let mut inner = lock(&self.inner);
-        let Some(c) = inner.consumers.remove(&a) else {
-            return;
-        };
-        if let Some(id) = c.builder {
-            Self::drop_ref(&mut inner, &id, &a);
+        let prefix = format!("{a}/tool:");
+        let keys: Vec<_> = inner
+            .consumers
+            .keys()
+            .filter(|k| **k == a || k.starts_with(&prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            if let Some(c) = inner.consumers.remove(&key) {
+                if let Some(id) = c.builder {
+                    Self::drop_ref(&mut inner, &id, &key);
+                }
+            }
         }
     }
 
@@ -559,7 +823,7 @@ impl Setups {
         if policy::leave(&mut f.refs, consumer, building) == Leave::StopBuilder {
             f.stop = true;
             let key = f.key.clone();
-            if inner.by_key.get(&key) == Some(id) {
+            if f.kind == BuilderKind::WorkspaceSetup && inner.by_key.get(&key) == Some(id) {
                 inner.by_key.remove(&key);
             }
         }
@@ -575,8 +839,7 @@ impl Setups {
         id: BuilderId,
         attempt: AttemptId,
         key: String,
-        source: String,
-        payload: AttemptPayload,
+        job: BuilderJob,
     ) {
         self.started.fetch_add(1, Ordering::SeqCst);
         let me = self.clone();
@@ -585,20 +848,46 @@ impl Setups {
             .spawn({
                 let (id, attempt, key) = (id.clone(), attempt.clone(), key.clone());
                 move || {
-                    let end = catch_unwind(AssertUnwindSafe(|| {
-                        me.run_builder(&id, &attempt, &key, &source, &payload)
+                    let end = catch_unwind(AssertUnwindSafe(|| match &job {
+                        BuilderJob::WorkspaceSetup { source, payload } => BuilderResult::Workspace(
+                            me.run_builder(&id, &attempt, &key, source, payload),
+                        ),
+                        BuilderJob::ToolInstall { request } => {
+                            BuilderResult::Tool(me.run_tool_builder(&id, &attempt, &key, request))
+                        }
                     }))
-                    .unwrap_or_else(|_| BuildEnd::Crashed("the builder thread panicked".into()));
+                    .unwrap_or_else(|_| match job {
+                        BuilderJob::WorkspaceSetup { .. } => BuilderResult::Workspace(
+                            BuildEnd::Crashed("the builder thread panicked".into()),
+                        ),
+                        BuilderJob::ToolInstall { .. } => {
+                            let dir = me.cfg.builders().join(id.as_str());
+                            if dir.join("worker.db").exists()
+                                && !me.settle_in_process(&dir, &attempt)
+                            {
+                                lock(&me.leftover).insert(attempt.clone());
+                            }
+                            BuilderResult::Tool(Err(PreparationFailure(
+                                "the builder thread panicked".into(),
+                            )))
+                        }
+                    });
                     // the consumers are told first; then a builder whose
                     // processes could not be confirmed stopped is looked at
                     // again, as the agent does for an attempt
+                    let workspace = matches!(&end, BuilderResult::Workspace(_));
                     me.finish(&id, end);
-                    me.evict();
+                    if workspace {
+                        me.evict();
+                    }
                     me.reap(&me.cfg.builders().join(id.as_str()), &attempt);
                 }
             });
         if spawned.is_err() {
-            self.finish(&id, BuildEnd::Crashed("no thread for the builder".into()));
+            self.finish(
+                &id,
+                BuilderResult::Workspace(BuildEnd::Crashed("no thread for the builder".into())),
+            );
         }
     }
 
@@ -617,6 +906,7 @@ impl Setups {
             if !dir.exists() {
                 // somebody else cleared it up
                 lock(&self.leftover).remove(attempt);
+                self.clear_barrier(attempt);
                 return;
             }
             // a supervisor that is still alive holds the lock: it is left
@@ -628,15 +918,19 @@ impl Setups {
             if !self.settle_in_process(dir, attempt) {
                 continue;
             }
-            if let Some(ws) = std::fs::read(dir.join("workspace.json"))
-                .ok()
-                .and_then(|b| serde_json::from_slice::<Workspace>(&b).ok())
-            {
-                if self.ws.remove(&ws).is_err() {
-                    continue;
+            let tool = lock(&self.inner).barriers.values().any(|a| a == attempt);
+            if !tool {
+                if let Some(ws) = std::fs::read(dir.join("workspace.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice::<Workspace>(&b).ok())
+                {
+                    if self.ws.remove(&ws).is_err() {
+                        continue;
+                    }
                 }
             }
             if remove_tree(dir).is_ok() {
+                self.clear_barrier(attempt);
                 lock(&self.leftover).remove(attempt);
                 return;
             }
@@ -672,17 +966,20 @@ impl Setups {
             .is_some_and(|r| r.unresolved.is_none())
     }
 
-    fn finish(&self, id: &BuilderId, end: BuildEnd) {
+    fn finish(&self, id: &BuilderId, end: BuilderResult) {
         let mut inner = lock(&self.inner);
         let Some(f) = inner.flights.get_mut(id) else {
             return;
         };
         let unkept = match &end {
-            BuildEnd::NotKept(why) => Some(why.clone()),
+            BuilderResult::Workspace(BuildEnd::NotKept(why)) => Some(why.clone()),
             _ => None,
         };
         f.end = Some(end);
-        let (key, empty) = (f.key.clone(), f.refs.is_empty());
+        let (key, empty, attempt) = (f.key.clone(), f.refs.is_empty(), f.attempt_id.clone());
+        if !lock(&self.leftover).contains(&attempt) {
+            inner.barriers.remove(&key);
+        }
         if let Some(why) = unkept {
             if inner.unkept.len() >= MAX_UNKEPT {
                 inner.unkept.clear();
@@ -748,6 +1045,7 @@ impl Setups {
             return crashed("builder directory", &e);
         }
         let meta = Meta {
+            kind: BuilderKind::WorkspaceSetup,
             builder_id: id.clone(),
             attempt_id: attempt.clone(),
             key: key.to_string(),
@@ -782,6 +1080,41 @@ impl Setups {
         if self.wanted(id).0 == 0 {
             return BuildEnd::Cancelled;
         }
+        let end = self.supervised(id, attempt, dir, &store);
+        if lock(&self.leftover).contains(attempt) {
+            *made = None;
+        }
+        if !end.is_built() {
+            return end;
+        }
+        let (artifacts, modified, removed) = match capture(&ws.root, &before) {
+            Ok(c) => c,
+            Err(why) => return BuildEnd::NotKept(why.to_string()),
+        };
+        let now = platform::wall_ms();
+        let receipt =
+            policy::seal_receipt(key, source, id, spec, artifacts, modified, removed, now);
+        let run =
+            (policy::effective_scope(spec) == ReuseScope::Run).then(|| payload.run_id.to_string());
+        match self
+            .store
+            .publish(key, &receipt, &ws.root, run.as_deref(), now)
+        {
+            Ok(_) => BuildEnd::Built,
+            Err(e) => crashed("the template", &e),
+        }
+    }
+
+    /// Shared supervised execution, renewal, cancellation and settlement for both job kinds.
+    fn supervised(
+        &self,
+        id: &BuilderId,
+        attempt: &AttemptId,
+        dir: &Path,
+        store: &WorkerStore,
+    ) -> BuildEnd {
+        let crashed =
+            |what: &str, e: &dyn std::fmt::Display| BuildEnd::Crashed(format!("{what}: {e}"));
         let mut child = match spawn_detached(&self.cfg.supervisor_exe, &dir.join("spec.json")) {
             Ok(c) => c,
             Err(e) => return crashed("supervisor", &e),
@@ -800,7 +1133,6 @@ impl Setups {
                     // stop, and its workspace and directory are kept until
                     // it is seen settled (`reap`), not removed under it
                     let _ = store.cancel(attempt, CoordinatorEpoch(1), platform::wall_ms());
-                    *made = None;
                     lock(&self.leftover).insert(attempt.clone());
                     return crashed("supervisor", &e);
                 }
@@ -828,7 +1160,6 @@ impl Setups {
             Some(code::UNRESOLVED) | Some(code::IDENTITY_UNKNOWN) => {
                 // the processes could not be confirmed stopped: the builder
                 // and its workspace are kept for the next start's recovery
-                *made = None;
                 lock(&self.leftover).insert(attempt.clone());
                 return BuildEnd::Crashed("its processes could not be confirmed stopped".into());
             }
@@ -837,38 +1168,18 @@ impl Setups {
                 // by the supervisor's own recovery, which settles the
                 // attempt. Only a builder that could not be settled is kept.
                 if !self.settle_in_process(dir, attempt) {
-                    *made = None;
                     lock(&self.leftover).insert(attempt.clone());
                 }
                 return BuildEnd::Crashed(format!("the supervisor ended with {other:?}"));
             }
         }
-        let end = policy::end_of(
+        policy::end_of(
             store
                 .get(attempt)
                 .ok()
                 .flatten()
                 .and_then(|r| r.termination),
-        );
-        if !end.is_built() {
-            return end;
-        }
-        let (artifacts, modified, removed) = match capture(&ws.root, &before) {
-            Ok(c) => c,
-            Err(why) => return BuildEnd::NotKept(why.to_string()),
-        };
-        let now = platform::wall_ms();
-        let receipt =
-            policy::seal_receipt(key, source, id, spec, artifacts, modified, removed, now);
-        let run =
-            (policy::effective_scope(spec) == ReuseScope::Run).then(|| payload.run_id.to_string());
-        match self
-            .store
-            .publish(key, &receipt, &ws.root, run.as_deref(), now)
-        {
-            Ok(_) => BuildEnd::Built,
-            Err(e) => crashed("the template", &e),
-        }
+        )
     }
 
     /// The builder's own database: one attempt, `Ready`.
@@ -939,6 +1250,16 @@ impl Setups {
                 timeout_ms: spec.step_timeout_ms,
             });
         }
+        self.write_nodes(dir, attempt, nodes, ws.warnings.clone())
+    }
+
+    fn write_nodes(
+        &self,
+        dir: &Path,
+        attempt: &AttemptId,
+        nodes: Vec<NodeSpec>,
+        workspace_warnings: Vec<String>,
+    ) -> Result<(), String> {
         let sup = SuperviseSpec {
             profile_fingerprint: self.cfg.profile_fingerprint.clone(),
             state_dir: dir.to_path_buf(),
@@ -958,7 +1279,7 @@ impl Setups {
             inhibit_sleep: self.cfg.inhibit_sleep,
             spool_root: None,
             log_limit_bytes: self.cfg.log_limit_bytes,
-            workspace_warnings: ws.warnings.clone(),
+            workspace_warnings,
             // no secret reaches a builder; an explicit empty list says so
             mask: MaskValues(Vec::new()),
             artifacts: None,
