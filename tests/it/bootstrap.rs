@@ -1835,3 +1835,103 @@ async fn public_logs_closed_run_final_blocked_stdout_still_detaches() {
         "cursor directory leaked during blocked final detach"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
+    use remote_task_runner::ids::RunId;
+    use std::os::fd::OwnedFd;
+    let (root, spec, _) = control_fixture();
+    let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+    let run = RunId::generate();
+    owner
+        .create_run(&run, None, None, &serde_json::json!({}), 1)
+        .unwrap();
+    owner.close_run(&run, 2).unwrap();
+    let epoch = owner.epoch();
+    drop(owner);
+    // Prefill an owned socket: observation output must remain interruptible.
+    let (_unconsumed, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let buffer = [0_u8; 16384];
+    let mut filled = 0;
+    loop {
+        match writer.write(&buffer) {
+            Ok(n) => {
+                assert!(n > 0);
+                filled += n;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("prefill stdout: {error}"),
+        }
+    }
+    assert!(filled > 0);
+    writer.set_nonblocking(false).unwrap();
+    let stdout: OwnedFd = writer.into();
+    let temporary = root.path().join("reader-tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "outputs", run.as_str(), "--dir"])
+        .arg(root.path().join("exported"))
+        .env_clear()
+        .envs(&spec.env)
+        .env("TMPDIR", &temporary)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(child.try_wait().unwrap().is_none());
+            if root.path().join("exported").exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Allow the read-only observer to reach its blocked status write.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    assert!(
+        !CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .unwrap()
+            .cancel_requested
+    );
+    assert_eq!(
+        std::fs::read_dir(&temporary).unwrap().count(),
+        0,
+        "output reader leaked a temporary file"
+    );
+}

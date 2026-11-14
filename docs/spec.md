@@ -1194,3 +1194,14 @@ GNU `L` (`././@LongLink`, UTF-8 member path + NUL) metadata を許可する。
 compressed data、directory entries、link、special、sparse、PAX/global metadata は
 生成しない。reader/export はこの subset と全構造・外側 digest を再検証し、
 raw bytes を magic sniffing で tar と解釈しない。汎用 unpack は使用しない。
+
+
+### Public collected output export
+
+`outputs <run-or-task-id> --dir <directory>` exports currently receipted outputs. The destination is required. `--attempt <attempt-id>` addresses an exact historical attempt and is valid only with its owning task. Default selection respects the task's latest generation boundary; a retry awaiting placement never exports an old success. Reads work with the owner stopped, without Git or project configuration, and never start a service or change the coordinator epoch.
+
+Legacy raw objects export at `<directory>/<task>/<attempt>/<name>`. Generic `tar_v1` bundles export at `<directory>/<task>/<attempt>/<name>/<workspace-relative-member>`. Encoding comes from immutable result metadata; raw bytes are never sniffed as archives. Only durable artifact receipts authorize objects. Reads and private spool copies use bounded buffers, and metadata/task pages contain at most 64 entries.
+
+The exporter verifies outer size and SHA-256, then validates the whole uncompressed GNU tar subset before publishing any bundle member. Only regular files and bounded GNU long names are supported. Unsafe paths, duplicate/case/Unicode/prefix collisions, links, sparse/PAX/special entries, truncation and trailing garbage are refused. Destination ancestors must be real directories; symlinks and existing destination files conflict, even when bytes match. New directories are 0700 and files 0600. Publication never overwrites. Concurrent destination conflicts preserve successful exports and report each failure.
+
+`--json` uses bounded NDJSON: target observation, per-file outcome or artifact error, then exactly one final summary attempt with aggregate counts and a reader exit code. Target execution failure is independent of successful export. Pending collection is reported without claiming run success; closed collection failure exits 78. Corruption/missing retained objects exit 79, destination conflicts 72, invalid inputs 2. Ctrl-C exits 130 and detaches only the reader, including when stdout is blocked. GC reader lifetime integration remains required before resident automatic deletion is enabled.

@@ -508,8 +508,31 @@ async fn command_async(args: &crate::cli::LogsArgs, json: bool) -> i32 {
             )
         }
     };
+    emit_final(
+        record,
+        code,
+        detached,
+        json,
+        &mut out,
+        &mut err,
+        interrupt.as_mut(),
+    )
+    .await
+}
+
+/// One interruptible final attempt shared by public streaming readers.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn emit_final<'a>(
+    record: serde_json::Value,
+    code: i32,
+    detached: bool,
+    json: bool,
+    out: &'a mut (dyn AsyncWrite + Unpin),
+    err: &'a mut (dyn AsyncWrite + Unpin),
+    mut interrupt: Option<&mut tokio::signal::unix::Signal>,
+) -> i32 {
     let bytes = format!("{record}\n");
-    let writer: &mut (dyn AsyncWrite + Unpin) = if json { &mut out } else { &mut err };
+    let writer: &mut (dyn AsyncWrite + Unpin) = if json { out } else { err };
     let output = async {
         writer.write_all(bytes.as_bytes()).await?;
         writer.flush().await
@@ -524,7 +547,7 @@ async fn command_async(args: &crate::cli::LogsArgs, json: bool) -> i32 {
     // including a closed collection whose last chunk filled the output pipe.
     tokio::select! {
         result=output=>if result.is_ok() {code}else{ErrorCode::Internal.exit_code()},
-        _=async {interrupt.as_mut().expect("follow signal installed").recv().await}, if interrupt.is_some()=>crate::error::exit::CANCELLED,
+        _=async {interrupt.as_mut().expect("signal installed").recv().await}, if interrupt.is_some()=>crate::error::exit::CANCELLED,
     }
 }
 

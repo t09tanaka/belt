@@ -188,6 +188,32 @@ fn open_root(root: &Path) -> io::Result<File> {
 }
 
 impl LogPrefixReader {
+    /// Read a receipted opaque object through held, no-follow descriptors.
+    /// Authorization is performed by the caller's metadata/receipt query.
+    pub fn open_artifact(&self, attempt: &AttemptId, digest: &Digest, size: u64) -> Result<File> {
+        use rustix::fs::{openat, Mode, OFlags};
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let a =
+            openat(&*self.root, attempt.as_str(), flags, Mode::empty()).map_err(io::Error::from)?;
+        let d = openat(&a, "artifacts", flags, Mode::empty()).map_err(io::Error::from)?;
+        let file: File = openat(
+            &d,
+            digest
+                .as_str()
+                .strip_prefix("sha256:")
+                .ok_or_else(|| io::Error::other("invalid digest"))?,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?
+        .into();
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.len() != size {
+            return Err(io::Error::other("artifact size/type mismatch").into());
+        }
+        Ok(file)
+    }
+
     /// Read at most 64 KiB from a DB snapshot's committed prefix. Physical tail
     /// bytes are invisible. A missing/short prefix fails closed; no read repair.
     /// Hold the collector/reader exclusion guard or an owner pin while reading.

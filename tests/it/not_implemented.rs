@@ -5,7 +5,6 @@ const CASES: &[&[&str]] = &[
     &["ci", "plan"],
     &["ci", "--snapshot", "commit", "--ref", "HEAD"],
     &["exec", "--in-place", "--", "true"],
-    &["outputs", "x", "--dir", "out"],
     &["estimate", "--", "true"],
     &["doctor"],
     &["workers"],

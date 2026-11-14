@@ -16,6 +16,22 @@ pub struct Run {
     pub task_count: u64,
     pub facts: RunFacts,
 }
+/// Bounded public output facts. Declaration paths and execution inputs are omitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum Output {
+    Artifact {
+        record: crate::wire::ArtifactRecord,
+    },
+    Pending {
+        name: String,
+    },
+    NotStored {
+        name: String,
+        reason: crate::wire::NotStoredReason,
+        if_missing: crate::wire::MissingPolicy,
+    },
+}
 /// Whole-run facts from one read snapshot, independently of the displayed page.
 /// A computed attempt can still have pending or failed collection. These facts
 /// do not claim a final outcome; an empty run is never marked complete.

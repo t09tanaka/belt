@@ -423,3 +423,42 @@ mod tests {
         assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), e);
     }
 }
+
+/// Deterministic aggregate failure precedence for partial read/export results.
+pub fn result_read_precedence(old: Option<ErrorCode>, new: ErrorCode) -> ErrorCode {
+    fn rank(code: ErrorCode) -> u8 {
+        match code {
+            ErrorCode::Internal => 6,
+            ErrorCode::InvalidInput | ErrorCode::Conflict => 5,
+            ErrorCode::CommunicationUnknown => 4,
+            ErrorCode::CollectionFailed => 3,
+            ErrorCode::NotFound => 2,
+            _ => 1,
+        }
+    }
+    old.filter(|code| rank(*code) >= rank(new)).unwrap_or(new)
+}
+#[cfg(test)]
+mod result_read_tests {
+    use super::*;
+    #[test]
+    fn result_read_precedence_orders_partial_outcomes_and_preserves_ties() {
+        let codes = [
+            ErrorCode::Overloaded,
+            ErrorCode::NotFound,
+            ErrorCode::CollectionFailed,
+            ErrorCode::CommunicationUnknown,
+            ErrorCode::Conflict,
+            ErrorCode::InvalidInput,
+            ErrorCode::Internal,
+        ];
+        for (i, a) in codes.iter().enumerate() {
+            assert_eq!(result_read_precedence(None, *a), *a);
+            assert_eq!(result_read_precedence(Some(*a), *a), *a);
+            for (j, b) in codes.iter().enumerate() {
+                let expected = if i >= j || (i == 4 && j == 5) { *a } else { *b };
+                assert_eq!(result_read_precedence(Some(*a), *b), expected);
+            }
+        }
+    }
+}

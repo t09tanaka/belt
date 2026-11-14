@@ -143,6 +143,9 @@ pub struct LogsArgs {
 #[derive(Debug, Args)]
 pub struct OutputsArgs {
     pub id: String,
+    /// Read an exact historical attempt belonging to the task.
+    #[arg(long)]
+    pub attempt: Option<String>,
     /// Destination directory.
     #[arg(long)]
     pub dir: Option<std::path::PathBuf>,
@@ -273,6 +276,9 @@ pub fn run(cli: Cli) -> i32 {
         return run_control(&cli);
     }
 
+    if let Command::Outputs(args) = &cli.command {
+        return crate::service::outputs::command(args, cli.json);
+    }
     if let Command::Logs(args) = &cli.command {
         return crate::service::logs::command(args, cli.json);
     }

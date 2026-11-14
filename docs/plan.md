@@ -212,3 +212,6 @@ canonical bytes; every live hello requires output_bundles_v1. The journal fixes 
 and all eligible stored/not-stored names before terminal settlement; collector exact-name
 receipts and ACK remain opaque. Public outputs query/export, resident GC, estimate and
 CI intermediate upload/download integration remain required follow-up work.
+
+
+Public outputs slice connects paged read-only immutable artifact metadata and durable receipts to legacy raw and TarV1 export. Private bounded spooling verifies outer size/digest; full tar structural/path preflight precedes fd-based no-replace publication. It preserves partial successes, emits bounded NDJSON outcomes/final counts and reuses logs' interruptible final emitter. Real worker execution through immutable bundle, parent receipt and offline public CLI export covers raw plus two generic members, no Git, unchanged epoch and historical-attempt conflicts. Focused hostile archive, symlink, concurrent no-replace, receipt visibility, metadata paging and retry boundary tests accompany the change. Resident GC/pinning integration, estimate and CI intermediate artifacts remain mandatory follow-up work; this slice does not claim GC safety without the shared invocation pin.

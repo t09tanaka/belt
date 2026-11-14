@@ -7,6 +7,8 @@ mod forward;
 pub mod input;
 pub mod logs;
 pub mod macos;
+pub mod output_export;
+pub mod outputs;
 pub mod query;
 pub mod resident;
 pub mod submit;
