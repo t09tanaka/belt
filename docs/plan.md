@@ -487,3 +487,25 @@ strict clippy all-targets/all-features と fmt が成功した。検証は priva
 複数 tool は全選択を確定後、original evidence を保持して同じ complete frozen contract から
 全 request を再構築してから導入する。baseline-only は `BaselineCheckRequired` とし、
 worker routing での実測 base observation と frozen policy の照合を残す。
+
+
+### 公開 toolchain 接続と検証の区切り（2026-11-15）
+
+公開 submit から source-bound frozen contract、read-only resolution、durable acceptance、
+既存 Setups/supervisor/TTC、consumer activation と recovery へ接続した。
+base profile と attempt の effective fingerprint を分離し、受入後の有効 receipt 置換も
+完全な activation binding の照合で起動前に拒否する。稼働中 process の adoption は維持する。
+独立レビューの P2 は解消確認済み。private fake-manager を使った公開 CLI の
+並行版・retry・setup/consumer・復旧回帰と focused units、strict clippy、fmt は成功した。
+実 manager の導入、変更後の pure coverage/mutation と全 CI は未実施であり必須残件とする。
+
+検証基盤は local-ci 0.12.1 のローカル10項目とリモート10項目が成功し、PR45をマージ、
+crate とリリースタグを公開した。配布物の生成・checksum 確認は継続中。
+RTR PR44 の timing fixture 補正はローカル9項目・リモート9項目成功後にマージした。
+PR42 はその補正と CI 依存準備を取り込んだ committed HEAD の全体検証を実行中。
+ローカル未対応 installer・Docker 環境は未検証として区別する。
+
+追加実機は未準備との回答に従い、S26 は Docker の複数 worker/Linux で実行可能な
+受入を進める。Mac の実 sleep/boot/launchd と追加 Mac 固有の確認は未検証として残す。
+S16 の SDK 修正と実行 driver、実測 transfer/collection/setup、S18〜S26 は必須残件。
+source/Vault 実削除の具体案は回答待ちで、Docker 利用の回答を削除承認とは扱わない。
