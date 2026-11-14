@@ -485,3 +485,214 @@ fn cross_source_artifact_reuse_preserves_actual_identity_and_changes_binding() {
     assert_eq!(first.execution_fingerprint, next.execution_fingerprint);
     assert_ne!(first.binding_digest, next.binding_digest);
 }
+
+#[test]
+fn frozen_distribution_integrity_and_resolution_authority_are_enforced() {
+    let f = fixture(AdapterKind::Corepack, "pnpm");
+    let state = f.plan.root.parent().unwrap();
+    let host = HostTools {
+        manager: f.plan.external[0].clone(),
+        dependencies: f.plan.external[1..].to_vec(),
+        search_path: vec![f.plan.external[0].path.parent().unwrap().into()],
+        rust_host: "aarch64-apple-darwin".into(),
+    };
+    let mut frozen = f.plan.frozen.clone();
+    frozen.selections.clear();
+    let integrity = format!("sha512.{}", "a".repeat(128));
+    frozen.requirements[0].constraints = vec![Constraint::Distribution {
+        version: Version::parse("1.2.3").unwrap(),
+        integrity: integrity.clone(),
+    }];
+    let mut evidence = ResolutionEvidence {
+        contract: frozen.digest(),
+        tool: f.plan.tool.clone(),
+        concrete: Version::parse("1.2.3").unwrap(),
+        catalog: Digest::of_bytes(b"catalog"),
+        resolved_inputs: BTreeMap::new(),
+    };
+    let selected = resolve(&frozen, &evidence).unwrap();
+    let p = plan(
+        AdapterKind::Corepack,
+        &selected,
+        &evidence.tool,
+        &evidence,
+        state,
+        &host,
+    )
+    .unwrap();
+    assert_eq!(
+        p.commands[0].argv,
+        vec!["install", "--global", &format!("pnpm@1.2.3+{integrity}")]
+    );
+    evidence.catalog = Digest::of_bytes(b"different-catalog");
+    assert_eq!(
+        plan(
+            AdapterKind::Corepack,
+            &selected,
+            &evidence.tool,
+            &evidence,
+            state,
+            &host
+        )
+        .unwrap_err(),
+        "resolution_authority_mismatch"
+    );
+    let mut alias = f.plan.frozen.clone();
+    alias.selections.clear();
+    alias.requirements[0].constraints = vec![Constraint::Resolve("latest".into())];
+    let mut evidence = ResolutionEvidence {
+        contract: alias.digest(),
+        tool: f.plan.tool.clone(),
+        concrete: Version::parse("1.2.3").unwrap(),
+        catalog: Digest::of_bytes(b"catalog"),
+        resolved_inputs: BTreeMap::new(),
+    };
+    assert_eq!(
+        resolve(&alias, &evidence).unwrap_err(),
+        "resolution_input_unproven"
+    );
+    evidence
+        .resolved_inputs
+        .insert("latest".into(), evidence.concrete.clone());
+    assert!(resolve(&alias, &evidence).is_ok());
+    evidence.contract = Digest::of_bytes(b"other-contract");
+    assert_eq!(
+        resolve(&alias, &evidence).unwrap_err(),
+        "resolution_contract_mismatch"
+    );
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let mut frozen = f.plan.frozen.clone();
+    frozen.selections.clear();
+    frozen.requirements[0].constraints = vec![Constraint::Distribution {
+        version: Version::parse("1.2.3").unwrap(),
+        integrity,
+    }];
+    let evidence = ResolutionEvidence {
+        contract: frozen.digest(),
+        tool: f.plan.tool.clone(),
+        concrete: Version::parse("1.2.3").unwrap(),
+        catalog: Digest::of_bytes(b"catalog"),
+        resolved_inputs: BTreeMap::new(),
+    };
+    let selected = resolve(&frozen, &evidence).unwrap();
+    let host = HostTools {
+        manager: f.plan.external[0].clone(),
+        dependencies: f.plan.external[1..].to_vec(),
+        search_path: vec![],
+        rust_host: String::new(),
+    };
+    assert_eq!(
+        plan(
+            AdapterKind::Nodenv,
+            &selected,
+            &evidence.tool,
+            &evidence,
+            f.plan.root.parent().unwrap(),
+            &host
+        )
+        .unwrap_err(),
+        "distribution_integrity_not_supported"
+    );
+}
+
+#[test]
+fn manager_recipes_are_exact_and_base_identity_policy_stays_separate() {
+    let f = fixture(AdapterKind::Rustup, "rust");
+    assert_eq!(
+        f.plan.commands[0].argv,
+        vec![
+            "toolchain",
+            "install",
+            "1.2.3-aarch64-apple-darwin",
+            "--profile",
+            "minimal",
+            "--no-self-update"
+        ]
+    );
+    let f = fixture(AdapterKind::Mise, "node");
+    assert_eq!(
+        f.plan.commands[0].argv,
+        vec![
+            "install-into",
+            "node@1.2.3",
+            f.plan.payload.to_str().unwrap()
+        ]
+    );
+    assert_eq!(f.plan.commands[0].env["MISE_NO_CONFIG"], "1");
+    assert_eq!(f.plan.commands[0].env["MISE_NO_HOOKS"], "1");
+    let f = fixture(AdapterKind::Fvm, "flutter");
+    assert_eq!(
+        f.plan.commands[0].argv,
+        vec!["install", "1.2.3", "--skip-pub-get"]
+    );
+    assert_eq!(f.plan.probes[0].1.argv, vec!["--version", "--machine"]);
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let receipt = install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    let env = base_env(&f.plan);
+    let base = Digest::of_bytes(b"base");
+    let policy = Digest::of_bytes(b"policy");
+    let original = activate(
+        &f.plan,
+        &receipt,
+        base.clone(),
+        &env,
+        policy.clone(),
+        &f.shell,
+    )
+    .unwrap();
+    let mut changed_env = env.clone();
+    changed_env.insert("APP_ENV".into(), "changed".into());
+    let changed = activate(
+        &f.plan,
+        &receipt,
+        base.clone(),
+        &changed_env,
+        policy.clone(),
+        &f.shell,
+    )
+    .unwrap();
+    assert_ne!(
+        original.execution_fingerprint,
+        changed.execution_fingerprint
+    );
+    let mut bad_env = env;
+    bad_env.insert("PATH".into(), "relative".into());
+    assert_eq!(
+        activate(
+            &f.plan,
+            &receipt,
+            base.clone(),
+            &bad_env,
+            policy.clone(),
+            &f.shell
+        ),
+        Err("invalid_base_path")
+    );
+    let mut with_baseline = f.plan.clone();
+    with_baseline
+        .frozen
+        .baseline
+        .push(crate::toolchain::versions::Baseline {
+            tool: ToolId::parse("git").unwrap(),
+            version: crate::toolchain::versions::VersionObservation::Known(
+                Version::parse("1.2.3").unwrap(),
+            ),
+            provenance: Location {
+                path: "profile".into(),
+                first_line: 1,
+                last_line: 1,
+            },
+        });
+    assert_eq!(
+        activate_set(
+            &with_baseline.frozen,
+            &[(&with_baseline, &receipt)],
+            base,
+            &BTreeMap::new(),
+            &base_env(&with_baseline),
+            policy,
+            &f.shell
+        ),
+        Err("activation_baseline_mismatch")
+    );
+}
