@@ -685,7 +685,7 @@ impl SourceStore {
         tmp.persist(self.inner.manifest_path(&m.source_id))
             .map_err(|e| e.error)?;
         self.retention
-            .register(self, &root, "received", &m.source_id)?;
+            .register_held(&root, "received", std::sync::Arc::new(m.clone()))?;
         self.retention.finish_imports(&root)?;
         Ok(())
     }
@@ -936,7 +936,7 @@ impl SourceStore {
             Err(e) => Err(e.into()),
         }?;
         self.retention
-            .register(self, run.as_str(), "run", &bound.ci_source_id)?;
+            .register(run.as_str(), "run", &bound.ci_source_id)?;
         Ok(bound)
     }
 }

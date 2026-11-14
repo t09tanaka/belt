@@ -4,7 +4,7 @@ use super::SourceStore;
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use std::fs::{File, OpenOptions, TryLockError};
-use std::io;
+use std::io::{self, Read};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -19,6 +19,10 @@ pub(crate) struct Index {
     path: PathBuf,
     database: PathBuf,
     root: Arc<File>,
+    #[cfg(test)]
+    reads: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    verifications: Arc<std::sync::atomic::AtomicUsize>,
 }
 const DIR: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY
     .union(rustix::fs::OFlags::DIRECTORY)
@@ -30,6 +34,10 @@ impl Index {
             path: root.into(),
             database: std::fs::canonicalize(root)?.join("retention.db"),
             root: Arc::new(rustix::fs::open(root, DIR, rustix::fs::Mode::empty())?.into()),
+            #[cfg(test)]
+            reads: Default::default(),
+            #[cfg(test)]
+            verifications: Default::default(),
         };
         let _guard = this.guard(false)?;
         let file = OpenOptions::new()
@@ -140,14 +148,15 @@ impl Index {
         )?;
         Ok(())
     }
-    fn load_manifest(&self, id: &str) -> Result<local_ci::source::SourceManifest> {
+    fn load_validated(&self, id: &str, limit: u64) -> Result<Validated> {
         ensure!(
             super::classify::source_id_of_ci(id).is_some(),
             "invalid source manifest identity"
         );
-        let dir = rustix::fs::openat(&*self.root, "manifests", DIR, rustix::fs::Mode::empty())?;
+        let directory: File =
+            rustix::fs::openat(&*self.root, "manifests", DIR, rustix::fs::Mode::empty())?.into();
         let file: File = rustix::fs::openat(
-            &dir,
+            &directory,
             format!("{id}.json"),
             rustix::fs::OFlags::RDONLY
                 | rustix::fs::OFlags::NOFOLLOW
@@ -156,42 +165,137 @@ impl Index {
             rustix::fs::Mode::empty(),
         )?
         .into();
-        ensure!(file.metadata()?.is_file(), "source manifest is not regular");
-        let manifest: local_ci::source::SourceManifest = serde_json::from_reader(file)?;
+        let metadata = file.metadata()?;
+        ensure!(metadata.is_file(), "source manifest is not regular");
+        if metadata.len() > limit {
+            return Err(ManifestLimit {
+                source_id: id.into(),
+                bytes: metadata.len(),
+                limit,
+            }
+            .into());
+        }
+        #[cfg(test)]
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // Exactly the opened file's measured size plus one: growth cannot turn
+        // a bounded background load into an unbounded serde stream.
+        let manifest: local_ci::source::SourceManifest =
+            serde_json::from_reader((&file).take(metadata.len().saturating_add(1)))?;
         ensure!(
             manifest.source_id == id,
             "source manifest identity mismatch"
         );
-        let opened = rustix::fs::fstat(&dir)?;
-        let named = rustix::fs::statat(
-            &*self.root,
-            "manifests",
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
-        )?;
-        ensure!(
-            (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino),
-            "source manifests directory changed"
-        );
-        Ok(manifest)
+        super::store::verify_manifest(&manifest)?;
+        #[cfg(test)]
+        self.verifications
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let validated = Validated {
+            manifest: Arc::new(manifest),
+            file: Some(file),
+            directory: Some(directory),
+            metadata: Some(metadata),
+        };
+        validated.check(self)?;
+        Ok(validated)
     }
-    /// Capture may finish its own graph; the resident uses bounded steps instead.
-    pub(crate) fn register(
+    pub(crate) fn register_held(
         &self,
-        store: &SourceStore,
         root: &str,
         kind: &str,
-        id: &str,
+        manifest: Arc<local_ci::source::SourceManifest>,
     ) -> Result<()> {
-        while !self.register_step(store, root, kind, id, 32)? {}
+        if self.complete(root, &manifest.source_id)? {
+            return Ok(());
+        }
+        super::store::verify_manifest(&manifest)?;
+        #[cfg(test)]
+        self.verifications
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let id = manifest.source_id.clone();
+        let mut cache = Some(Validated {
+            manifest,
+            file: None,
+            directory: None,
+            metadata: None,
+        });
+        while !self.register_step(root, kind, &id, 32, &mut cache, u64::MAX)? {}
+        Ok(())
+    }
+    fn complete(&self, root: &str, id: &str) -> Result<bool> {
+        let found: Option<Option<String>> = self
+            .connect()?
+            .query_row("SELECT source FROM root WHERE id=?1", [root], |r| r.get(0))
+            .optional()?;
+        if let Some(Some(source)) = found {
+            ensure!(source == id, "source root already bound");
+            return Ok(true);
+        }
+        Ok(false)
+    }
+    /// Copy the producer's private completed pending root before run binding.
+    /// The token is held by that capture; GC cannot expire any root under SH.
+    pub(crate) fn copy_root(&self, origin: &str, root: &str, kind: &str, id: &str) -> Result<()> {
+        if self.complete(root, id)? {
+            return Ok(());
+        }
+        let mut c = self.connect()?;
+        let source: Option<String> = c
+            .query_row("SELECT source FROM root WHERE id=?1", [origin], |r| {
+                r.get(0)
+            })
+            .optional()?
+            .flatten();
+        ensure!(
+            source.as_deref() == Some(id),
+            "source root handoff mismatch"
+        );
+        c.execute(
+            "INSERT OR IGNORE INTO root(id,kind) VALUES(?1,'pending')",
+            [root],
+        )?;
+        let mut after = String::new();
+        loop {
+            let keys: Vec<String> = {
+                let mut s=c.prepare("SELECT object FROM member WHERE root=?1 AND object>?2 ORDER BY object LIMIT 32")?;
+                let rows = s.query_map(params![origin, after], |r| r.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            if keys.is_empty() {
+                break;
+            }
+            after = keys.last().unwrap().clone();
+            let tx = c.transaction()?;
+            for key in keys {
+                tx.execute(
+                    "INSERT OR IGNORE INTO member VALUES(?1,?2)",
+                    params![root, key],
+                )?;
+            }
+            tx.commit()?;
+        }
+        c.execute(
+            "UPDATE root SET source=?2,kind=?3 WHERE id=?1",
+            params![root, id, kind],
+        )?;
+        Ok(())
+    }
+    /// Capture may finish its own graph; the resident uses bounded steps instead.
+    pub(crate) fn register(&self, root: &str, kind: &str, id: &str) -> Result<()> {
+        if self.complete(root, id)? {
+            return Ok(());
+        }
+        let mut cache = None;
+        while !self.register_step(root, kind, id, 32, &mut cache, u64::MAX)? {}
         Ok(())
     }
     fn register_step(
         &self,
-        _store: &SourceStore,
         root: &str,
         kind: &str,
         id: &str,
         limit: u32,
+        cache: &mut Option<Validated>,
+        manifest_limit: u64,
     ) -> Result<bool> {
         let mut c = self.connect()?;
         let old: Option<Option<String>> = c
@@ -210,23 +314,41 @@ impl Index {
             params![root, id],
         )?;
         for _ in 0..limit {
-            let next: Option<(String,u32)> = c
-                .query_row(
-                    "SELECT source,position FROM graph WHERE root=?1 AND done=0 ORDER BY source LIMIT 1",
-                    [root],
-                    |r| Ok((r.get(0)?,r.get(1)?)),
+            // Finish the current manifest before newly discovered children,
+            // including children whose source IDs sort before their parent.
+            let preferred = cache
+                .as_ref()
+                .map(|cached| cached.manifest.source_id.as_str());
+            let current: Option<(String, u32)> = if let Some(source) = preferred {
+                c.query_row(
+                    "SELECT source,position FROM graph WHERE root=?1 AND source=?2 AND done=0",
+                    params![root, source],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .optional()?;
+                .optional()?
+            } else {
+                None
+            };
+            let next=match current {Some(current)=>Some(current),None=>c.query_row("SELECT source,position FROM graph WHERE root=?1 AND done=0 ORDER BY source LIMIT 1",[root],|r|Ok((r.get::<_,String>(0)?,r.get::<_,u32>(1)?))).optional()?};
             let Some((next, position)) = next else {
                 c.execute(
                     "UPDATE root SET source=?2,kind=?3 WHERE id=?1",
                     params![root, id, kind],
                 )?;
+                *cache = None;
                 return Ok(true);
             };
-            // All filesystem IO occurs outside the source-index transaction.
-            let m = self.load_manifest(&next)?;
-            super::store::verify_manifest(&m)?;
+            // One validated manifest is retained between pages. Every page
+            // checks FD identity, not the full JSON/digest again.
+            if cache
+                .as_ref()
+                .is_none_or(|cached| cached.manifest.source_id != next)
+            {
+                *cache = Some(self.load_validated(&next, manifest_limit)?);
+            }
+            let cached = cache.as_ref().unwrap();
+            cached.check(self)?;
+            let m = &cached.manifest;
             let tx = c.transaction()?;
             let key = format!("m:{}", m.source_id);
             let path = format!("manifests/{}.json", m.source_id);
@@ -317,6 +439,59 @@ impl SourceStore {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("manifest {source_id} has {bytes} bytes; background registration limit is {limit}; increase PreviewCursor.manifest_byte_limit to register it")]
+pub struct ManifestLimit {
+    pub source_id: String,
+    pub bytes: u64,
+    pub limit: u64,
+}
+#[derive(Debug)]
+struct Validated {
+    manifest: Arc<local_ci::source::SourceManifest>,
+    file: Option<File>,
+    directory: Option<File>,
+    metadata: Option<std::fs::Metadata>,
+}
+impl Validated {
+    fn check(&self, index: &Index) -> Result<()> {
+        index.current()?;
+        if let (Some(file), Some(dir), Some(before)) = (&self.file, &self.directory, &self.metadata)
+        {
+            let after = file.metadata()?;
+            ensure!(
+                after.len() == before.len()
+                    && after.mtime() == before.mtime()
+                    && after.mtime_nsec() == before.mtime_nsec()
+                    && after.ctime() == before.ctime()
+                    && after.ctime_nsec() == before.ctime_nsec(),
+                "source manifest changed during registration"
+            );
+            let opened = rustix::fs::fstat(file)?;
+            let named = rustix::fs::statat(
+                dir,
+                format!("{}.json", self.manifest.source_id),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+            ensure!(
+                (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino),
+                "source manifest identity changed"
+            );
+            let opened = rustix::fs::fstat(dir)?;
+            let named = rustix::fs::statat(
+                &*index.root,
+                "manifests",
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )?;
+            ensure!(
+                (opened.st_dev, opened.st_ino) == (named.st_dev, named.st_ino),
+                "source manifests directory changed"
+            );
+        }
+        Ok(())
+    }
+}
+
 /// Only a dry-run cursor/report: no root expiry, deletion claim, or filesystem removal.
 #[derive(Default)]
 pub struct PreviewCursor {
@@ -324,11 +499,16 @@ pub struct PreviewCursor {
     object: String,
     legacy: Option<rustix::fs::Dir>,
     legacy_pending: Option<String>,
+    validated: Option<Validated>,
+    /// Default receiver limit (64 MiB) when None. Raising it explicitly permits
+    /// registration of larger legacy inputs without changing source usability.
+    pub manifest_byte_limit: Option<u64>,
 }
 #[derive(Debug, Default)]
 pub struct Preview {
     pub held: bool,
     pub registered: u32,
+    pub manifest_limit: Option<ManifestLimit>,
     pub run: Option<crate::ids::RunId>,
     pub eligible: bool,
     /// Proven owned paths unique to this root, at most 32 per page. Shared data is kept.
@@ -369,13 +549,27 @@ impl SourceStore {
                 cursor.legacy_pending=c.query_row("SELECT substr(id,8) FROM root WHERE kind='pending' AND source IS NULL AND id LIKE 'legacy:%' ORDER BY id LIMIT 1",[],|r|r.get(0)).optional()?;
             }
             if let Some(id) = cursor.legacy_pending.clone() {
-                let done = self.retention.register_step(
-                    self,
+                let limit = cursor.manifest_byte_limit.unwrap_or(
+                    crate::worker::blob_policy::BlobLimits::default().max_manifest_bytes,
+                );
+                let done = match self.retention.register_step(
                     &format!("legacy:{id}"),
                     "legacy",
                     &id,
                     1,
-                )?;
+                    &mut cursor.validated,
+                    limit,
+                ) {
+                    Ok(done) => done,
+                    Err(error) => {
+                        let limit = error.downcast::<ManifestLimit>()?;
+                        return Ok(Preview {
+                            held: true,
+                            manifest_limit: Some(limit),
+                            ..Default::default()
+                        });
+                    }
+                };
                 if done {
                     cursor.legacy_pending = None;
                 }
@@ -949,7 +1143,7 @@ mod tests {
         assert!(f
             .store
             .retention
-            .load_manifest(&a)
+            .load_validated(&a, u64::MAX)
             .unwrap_err()
             .to_string()
             .contains("identity mismatch"));
@@ -966,5 +1160,293 @@ mod tests {
         assert!(SourceStore::open(&state).is_err());
         assert!(!original.join("objects").exists());
         assert_eq!(std::fs::read(original.join("sentinel")).unwrap(), b"kept");
+    }
+    #[test]
+    fn foreground_indexes_held_manifest_once_and_run_bind_never_rereads_it() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let f = Fixture::new();
+        for n in 0..130 {
+            std::fs::write(f.input.join(format!("file-{n:03}")), format!("value-{n}")).unwrap();
+        }
+        let run = RunId::generate();
+        f.bind(&run);
+        assert_eq!(
+            f.store.retention.reads.load(SeqCst),
+            0,
+            "producer manifest was read from disk again"
+        );
+        assert_eq!(
+            f.store.retention.verifications.load(SeqCst),
+            1,
+            "index verification repeated per reference page or run binding"
+        );
+        assert!(f.store.source_of_run(&run).unwrap().is_some());
+    }
+    #[test]
+    fn legacy_manifest_is_parsed_verified_once_across_pages_and_once_after_restart() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let state = root.path().join("state");
+        let input = root.path().join("original");
+        std::fs::create_dir(&input).unwrap();
+        for n in 0..130 {
+            std::fs::write(input.join(format!("file-{n:03}")), format!("value-{n}")).unwrap();
+        }
+        let capture = local_ci::source::capture_directory(
+            &local_ci::ExecContext::new(BTreeMap::new()),
+            &input,
+            &local_ci::source::CaptureOptions {
+                store: Some(state.join("sources")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let store = SourceStore::open(&state).unwrap();
+        let owner = CoordinatorStore::open(&state, 1).unwrap();
+        let mut cursor = PreviewCursor::default();
+        for n in 0..2 {
+            store
+                .retention_preview(
+                    &owner,
+                    &mut cursor,
+                    100 + n,
+                    10 + n,
+                    Some("boot".into()),
+                    10,
+                )
+                .unwrap();
+        }
+        assert_eq!(store.retention.reads.load(SeqCst), 1);
+        assert_eq!(store.retention.verifications.load(SeqCst), 1);
+        let c = store.retention.connect().unwrap();
+        let root_id = format!("legacy:{}", capture.manifest.source_id);
+        assert_eq!(
+            c.query_row(
+                "SELECT position FROM graph WHERE root=?1 AND source=?2",
+                params![root_id, capture.manifest.source_id],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            32
+        );
+        assert!(c
+            .query_row("SELECT source FROM root WHERE id=?1", [&root_id], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .unwrap()
+            .is_none());
+        // Discard the in-memory validated cursor as on owner restart. The
+        // durable root stays pending; a fresh cursor reads once and resumes64.
+        drop(cursor);
+        let mut cursor = PreviewCursor::default();
+        store
+            .retention_preview(&owner, &mut cursor, 102, 12, Some("boot".into()), 10)
+            .unwrap();
+        assert_eq!(
+            c.query_row(
+                "SELECT position FROM graph WHERE root=?1 AND source=?2",
+                params![root_id, capture.manifest.source_id],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            64
+        );
+        for n in 3..12 {
+            store
+                .retention_preview(
+                    &owner,
+                    &mut cursor,
+                    100 + n,
+                    10 + n,
+                    Some("boot".into()),
+                    10,
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store.retention.reads.load(SeqCst),
+            2,
+            "manifest reread for a 32-reference page"
+        );
+        assert_eq!(store.retention.verifications.load(SeqCst), 2);
+        assert_eq!(
+            c.query_row("SELECT kind FROM root WHERE id=?1", [root_id], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "legacy"
+        );
+        assert_eq!(std::fs::read(input.join("file-000")).unwrap(), b"value-0");
+    }
+    #[test]
+    fn oversized_legacy_is_typed_recoverable_hold_and_explicit_limit_resumes() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let state = root.path().join("state");
+        let input = root.path().join("original");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::write(input.join("file"), b"kept").unwrap();
+        let capture = local_ci::source::capture_directory(
+            &local_ci::ExecContext::new(BTreeMap::new()),
+            &input,
+            &local_ci::source::CaptureOptions {
+                store: Some(state.join("sources")),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let store = SourceStore::open(&state).unwrap();
+        let owner = CoordinatorStore::open(&state, 1).unwrap();
+        let mut cursor = PreviewCursor {
+            manifest_byte_limit: Some(1),
+            ..Default::default()
+        };
+        store
+            .retention_preview(&owner, &mut cursor, 100, 10, Some("boot".into()), 10)
+            .unwrap();
+        let report = store
+            .retention_preview(&owner, &mut cursor, 101, 11, Some("boot".into()), 10)
+            .unwrap();
+        assert!(report.held && !report.eligible && report.candidate_paths.is_empty());
+        let diagnostic = report.manifest_limit.unwrap();
+        assert_eq!(diagnostic.source_id, capture.manifest.source_id);
+        assert_eq!(diagnostic.limit, 1);
+        assert!(diagnostic.bytes > 1);
+        assert_eq!(store.retention.reads.load(SeqCst), 0);
+        cursor.manifest_byte_limit = Some(diagnostic.bytes);
+        for n in 2..7 {
+            store
+                .retention_preview(
+                    &owner,
+                    &mut cursor,
+                    100 + n,
+                    10 + n,
+                    Some("boot".into()),
+                    10,
+                )
+                .unwrap();
+        }
+        assert_eq!(store.retention.reads.load(SeqCst), 1);
+        assert_eq!(store.retention.verifications.load(SeqCst), 1);
+        assert!(store
+            .manifest(&capture.manifest.source_id)
+            .unwrap()
+            .is_some());
+        assert_eq!(std::fs::read(input.join("file")).unwrap(), b"kept");
+    }
+    #[test]
+    fn queued_children_before_large_parent_never_preempt_its_validated_cursor() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let f = Fixture::new();
+        let base = capture(
+            &BTreeMap::new(),
+            &f.store,
+            &SourceRequest::Directory {
+                dir: f.input.clone(),
+            },
+            &CaptureParams::default(),
+        )
+        .unwrap();
+        let child = f
+            .store
+            .manifest(&base.manifest.ci_source_id)
+            .unwrap()
+            .unwrap();
+        let mut children = (0..128)
+            .map(|n| {
+                let mut m = child.clone();
+                m.branch = Some(format!("child-{n}"));
+                local_ci::source::seal_manifest(m)
+            })
+            .collect::<Vec<_>>();
+        children.sort_by(|a, b| a.source_id.cmp(&b.source_id));
+        children.truncate(65);
+        for n in 0..130 {
+            std::fs::write(
+                f.input.join(format!("parent-{n:03}")),
+                format!("parent-value-{n}"),
+            )
+            .unwrap();
+        }
+        let captured = capture(
+            &BTreeMap::new(),
+            &f.store,
+            &SourceRequest::Directory {
+                dir: f.input.clone(),
+            },
+            &CaptureParams::default(),
+        )
+        .unwrap();
+        let mut parent = f
+            .store
+            .manifest(&captured.manifest.ci_source_id)
+            .unwrap()
+            .unwrap();
+        parent.submodules = children
+            .iter()
+            .enumerate()
+            .map(|(n, m)| local_ci::source::SubmoduleRef {
+                path: local_ci::source::RelPath(format!("sub-{n:03}").into_bytes()),
+                revision: "0".repeat(40),
+                source_id: Some(m.source_id.clone()),
+                dirty: true,
+            })
+            .collect();
+        parent = (0..1000)
+            .find_map(|n| {
+                let mut m = parent.clone();
+                m.branch = Some(format!("parent-{n}"));
+                let m = local_ci::source::seal_manifest(m);
+                (m.source_id > children.last().unwrap().source_id).then_some(m)
+            })
+            .expect("parent after all65 child IDs");
+        let _guard = f.store.mutation_guard().unwrap();
+        for manifest in children.iter().chain(std::iter::once(&parent)) {
+            super::super::store::verify_manifest(manifest).unwrap();
+            std::fs::write(
+                f.store.object_store().manifest_path(&manifest.source_id),
+                serde_json::to_vec(manifest).unwrap(),
+            )
+            .unwrap();
+        }
+        f.store.retention.reads.store(0, SeqCst);
+        f.store.retention.verifications.store(0, SeqCst);
+        f.store
+            .retention
+            .register_held("foreground-parent", "pending", Arc::new(parent.clone()))
+            .unwrap();
+        assert_eq!(
+            f.store.retention.reads.load(SeqCst),
+            65,
+            "held parent was evicted and reread"
+        );
+        assert_eq!(f.store.retention.verifications.load(SeqCst), 66);
+        f.store.retention.reads.store(0, SeqCst);
+        f.store.retention.verifications.store(0, SeqCst);
+        let mut cache = None;
+        let mut completed = false;
+        for _ in 0..200 {
+            if f.store
+                .retention
+                .register_step(
+                    "legacy-parent",
+                    "legacy",
+                    &parent.source_id,
+                    1,
+                    &mut cache,
+                    64 << 20,
+                )
+                .unwrap()
+            {
+                completed = true;
+                break;
+            }
+        }
+        assert!(completed);
+        assert_eq!(
+            f.store.retention.reads.load(SeqCst),
+            66,
+            "parent reparsed after child insert page"
+        );
+        assert_eq!(f.store.retention.verifications.load(SeqCst), 66);
     }
 }

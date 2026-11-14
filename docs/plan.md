@@ -301,3 +301,26 @@ retry guard 1、retry 停止と input IO drain 1、source capture 38、実 worke
 unknown root 保持、clock Hold の cursor 保持、foreign coordinator/source/guard、manifest identity、
 source root/ancestor symlink と canonical path alias を確認した。strict all-target/all-feature clippy、
 fmt/diff と公開文字列確認が成功。全体 CI/MSRV/Linux はこの focused 検証に含めず、実削除は未実装のままとする。
+
+source index のレビュー修正として、32 参照ごとの full manifest 再読込・再検証を除去した。
+foreground capture/receive は既に保持する manifest を登録し、run root は検証済み membership を
+32 件ずつ引き継ぐ。background は検証済み manifest 1 個と FD identity を cursor に保持し、
+ページごとは identity のみ検査する。初回読取は receiver 既定と同じ 64 MiB 上限で、超過は
+`Preview.manifest_limit` の型付き recoverable Hold とする。`PreviewCursor.manifest_byte_limit` を
+明示的に上げると既存の大きい manifest も登録でき、通常の source 利用や foreground capture を失効させない。
+自動で任意サイズの旧 manifest を扱う streaming staging は後続事項とし、全 legacy GC 完了とは扱わない。
+130 参照を跨ぐ読取/検証 1 回、cursor 再起動時だけ再読取 1 回と永続 position 再開、foreground の
+再読込 0 回・検証 1 回、上限 Hold から明示 bound 変更での再開を回帰で確認する。
+received root を将来失効させる前には、hash 共通の pending blob 保護を per-import token/fence に分ける必要がある。
+現在の received root は永久保守保持で、今回も actual source/Vault deletion は追加しない。
+
+submodule の発見による cache eviction も同じ修正で防ぐ。current manifest の graph 行を完了するまで
+優先し、新しく発見した child の ID が parent より前に sort しても切り替えない。
+131 entry の parent と先に sort する 65 child の回帰で、foreground は held parent の再読込 0 回、
+background は各 66 manifest の読取/検証がそれぞれ 1 回だけであることを確認した。
+
+修正後は root/preview 13、retry guard 1、retry 停止/drain 1、source capture 38、実 worker/offline outputs 1、
+in-place 9、same-run retry 11 の計 74 件と strict all-target/all-feature clippy が成功した。
+submodule の current-manifest 優先修正後にも source capture 全 38 件を再実行し成功。
+親レビューは flat と submodule-preemption の P2 を解消確認済みで、他の指摘はない。
+全体 CI/push と actual source/Vault erasure は今回の非削除 foundation に含めない。
