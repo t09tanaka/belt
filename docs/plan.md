@@ -510,3 +510,33 @@ PR42 はその補正と CI 依存準備を取り込んだ committed HEAD の全�
 受入を進める。Mac の実 sleep/boot/launchd と追加 Mac 固有の確認は未検証として残す。
 S16 の SDK 修正と実行 driver、実測 transfer/collection/setup、S18〜S26 は必須残件。
 source/Vault 実削除の具体案は回答待ちで、Docker 利用の回答を削除承認とは扱わない。
+
+
+### 実測モデルと保持ガードの統合（2026-11-15）
+
+PR42は5a990d5のローカル9項目とリモート9項目成功後、2b3078cでマージした。
+source保持ガードの初回並行作成は、このMacのnative openatで競合時ENOENTを再現し、
+atomic create-newと既存openへ分離して解消した。retention DBの検査用FDが稼働中
+SQLiteの排他を解除する問題も、別processによる旧方式失敗・修正後成功で確認した。
+既存DBはmetadata検査、新規DBはprivate tempを閉じてからNOREPLACE公開とし、
+private mode・nofollow・nlink・root identity・永久SH/EX lockの条件を維持した。
+保持unit18件、並行投入10回、strict checkと独立レビューが成功。実GCは追加していない。
+
+転送は両lease取得後から現在generationのsource-ready確認まで、回収は検証済みterminal tailの
+active IOだけを記録する。durable close、boot/epoch・exact入力・TTL・bounded dedupと
+永続化後のメモリ参照を使い、配置とestimateが同じCostModelを読む。writer障害は計算結果を
+変更しない。確認済みreadyの転送0は標本数0の別の証拠として表示する。
+known cold候補は期限付きprefetchだけを選び、source readyになる前にattemptを作らない。
+frozen toolchain適合はwarm/cold双方に独立した必須条件とし、readonly照合はreadyを先に行う。
+実private RPCの128KiB転送・計算・回収・100回preview、metrics書込失敗時の計算継続、
+source gate、cold選択・適合拒否、strict checkと独立レビューは成功した。
+
+pure contractとprefetchをcoverage/mutation gateへ追加した。統合HEADの全CIと
+100% line coverage・zero-survivorは次の必須検証で、まだ成功とは申告しない。
+setupの実測producerと公開の既知task estimate入口は残件。prospective commandの
+exact source/outputが不明なコストはUnknownを維持する。大きいmanifest等の完全転送を
+証明できない場合もUnknownで、配信自体の成功を妨げない。
+
+S16 SDK 0.13.0候補はローカル10項目が成功しPR46でリモート確認中。
+shared driverと既存Runner評価の共有、dynamic matrix・artifact交換・shard retry・
+親の厳密status判定、S21〜S26とDocker受入は必須範囲として継続する。
