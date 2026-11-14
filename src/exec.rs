@@ -192,6 +192,10 @@ pub struct Workspace {
 }
 
 pub struct Runner<'a> {
+    selected: Option<(
+        crate::driver::dispatch::Selection,
+        crate::driver::PortableFacts,
+    )>,
     pinned: Option<(
         &'a crate::source_execute::PinnedExecution<'a>,
         &'a crate::source_execute::PinnedWorkspace,
@@ -833,6 +837,15 @@ fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
 }
 
 impl<'a> Runner<'a> {
+    pub(crate) fn select_derived(
+        mut self,
+        selection: crate::driver::dispatch::Selection,
+        facts: crate::driver::PortableFacts,
+    ) -> Self {
+        self.selected = Some((selection, facts));
+        self
+    }
+
     pub fn new(
         ctx: &'a ExecContext,
         fp: &'a FrozenPlan,
@@ -917,6 +930,7 @@ impl<'a> Runner<'a> {
             .filter_map(|wf| Some((wf, artifact_io::workflow_refusal(&plan, wf)?)))
             .collect();
         Ok(Runner {
+            selected: None,
             pinned,
             ctx,
             fp,
@@ -2358,6 +2372,12 @@ impl<'a> Runner<'a> {
         whole_matrix: bool,
     ) -> Result<TaskResult> {
         self.validate_source()?;
+        anyhow::ensure!(
+            self.selected
+                .as_ref()
+                .is_none_or(|(selection, _)| &selection.task == task),
+            "selected dispatch task mismatch"
+        );
         let wi = self
             .plan
             .selected
@@ -2669,16 +2689,21 @@ impl<'a> Runner<'a> {
             )
         };
 
-        let evaluated = crate::job_evaluate::evaluate_job(
-            job,
-            gh,
-            self.runner_ctx(),
-            needs,
-            ancestor_failed,
-            run_cancelled,
-            only,
-            shard,
-        );
+        let evaluated = match &self.selected {
+            Some((selection, facts)) => {
+                selection.worker_evaluation(gh, self.runner_ctx(), needs, facts)
+            }
+            None => crate::job_evaluate::evaluate_job(
+                job,
+                gh,
+                self.runner_ctx(),
+                needs,
+                ancestor_failed,
+                run_cancelled,
+                only,
+                shard,
+            ),
+        };
         let mut out = Vec::new();
         let notes: Vec<(usize, String)> = Vec::new();
         let mut todo = Vec::new();

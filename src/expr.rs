@@ -619,6 +619,16 @@ pub enum PortableStage {
 /// `bare` matches job `if:` syntax; other fields only evaluate `${{ }}`.
 /// This checks context availability, not the authenticity of supplied facts.
 pub fn validate_portable(text: &str, bare: bool, stage: PortableStage) -> Result<()> {
+    validate_portable_context(text, bare, stage, None)
+}
+
+/// Additionally reject github properties missing from explicit portable facts.
+pub fn validate_portable_context(
+    text: &str,
+    bare: bool,
+    stage: PortableStage,
+    contexts: Option<&Map<String, Value>>,
+) -> Result<()> {
     let mut rest = text;
     let mut found = false;
     while let Some(start) = rest.find("${{") {
@@ -631,16 +641,20 @@ pub fn validate_portable(text: &str, bare: bool, stage: PortableStage) -> Result
         if bare && (!text[..start].trim().is_empty() || !after[end + 2..].trim().is_empty()) {
             bail!("portable if requires one complete expression");
         }
-        portable_ast(&parse(&after[..end])?, stage)?;
+        portable_ast(&parse(&after[..end])?, stage, contexts)?;
         rest = &after[end + 2..];
     }
     if bare && !found && !text.trim().is_empty() {
-        portable_ast(&parse(text)?, stage)?;
+        portable_ast(&parse(text)?, stage, contexts)?;
     }
     Ok(())
 }
 
-fn portable_ast(ast: &Ast, stage: PortableStage) -> Result<()> {
+fn portable_ast(
+    ast: &Ast,
+    stage: PortableStage,
+    contexts: Option<&Map<String, Value>>,
+) -> Result<()> {
     // A github chain must select a literal portable property before the
     // object is read. Reject computed indices and whole-object serialization,
     // even in dead branches; no guessed worker workspace or token is supplied.
@@ -691,6 +705,19 @@ fn portable_ast(ast: &Ast, stage: PortableStage) -> Result<()> {
         {
             bail!("computed github properties are unavailable before worker selection");
         }
+        if let Some(contexts) = contexts {
+            let mut value = contexts
+                .get("github")
+                .ok_or_else(|| anyhow::anyhow!("github facts unavailable"))?;
+            for key in keys.iter().rev() {
+                let Some(Ast::Lit(Value::String(key))) = key else {
+                    unreachable!()
+                };
+                value = value.get(key).ok_or_else(|| {
+                    anyhow::anyhow!("github property unavailable in supplied facts")
+                })?;
+            }
+        }
         return Ok(());
     }
     match ast {
@@ -707,13 +734,13 @@ fn portable_ast(ast: &Ast, stage: PortableStage) -> Result<()> {
             }
         }
         Ast::Prop(base, key) => {
-            portable_ast(base, stage)?;
-            portable_ast(key, stage)
+            portable_ast(base, stage, contexts)?;
+            portable_ast(key, stage, contexts)
         }
-        Ast::Star(base) | Ast::Not(base) => portable_ast(base, stage),
+        Ast::Star(base) | Ast::Not(base) => portable_ast(base, stage, contexts),
         Ast::Bin(_, left, right) => {
-            portable_ast(left, stage)?;
-            portable_ast(right, stage)
+            portable_ast(left, stage, contexts)?;
+            portable_ast(right, stage, contexts)
         }
         Ast::Call(name, args) => {
             let ordinary = matches!(
@@ -729,7 +756,7 @@ fn portable_ast(ast: &Ast, stage: PortableStage) -> Result<()> {
                 bail!("function is unavailable at portable {stage:?} stage");
             }
             for arg in args {
-                portable_ast(arg, stage)?;
+                portable_ast(arg, stage, contexts)?;
             }
             Ok(())
         }

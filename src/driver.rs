@@ -1,22 +1,26 @@
-//! Transactional, host-neutral progression for static frozen tasks.
+//! Transactional, host-neutral progression for frozen tasks.
 //!
-//! This first slice refuses dynamic matrices and shards. It does not evaluate
-//! expressions, run commands, authenticate worker ownership, or retry attempts.
+//! Dynamic members are derived from verified source metadata and portable facts.
+//! Shards, worker authentication and retries remain host/following-slice work.
 //! Hosts durably commit a proposed transition before applying it and sending
 //! its outbox. A claim acknowledges Ready; only settlement releases admission.
 //! Worker ownership/source/receipt authentication remains the host's duty.
 
-use crate::dag::{ExecutionTask, NodeKind};
+use crate::dag::{ExecutionTask, JobNode, NodeKind};
+pub(crate) mod dispatch;
 use crate::frozen::FrozenPlan;
 use crate::result_wire::{WireTaskResult, MAX_WIRE_BYTES};
+use crate::source_execute::VerifiedEvaluationSource;
 use crate::task::{JobOutcome, JobStatus, TaskInputs};
 use crate::wire::Digested;
 use anyhow::{bail, ensure, Context, Result};
+use dispatch::{Derivation, EvaluationContext, Expansion};
+pub use dispatch::{DerivedDispatch, PortableFacts, RunnerRequirement, DISPATCH_VERSION};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const DRIVER_VERSION: u32 = 1;
+pub const DRIVER_VERSION: u32 = 2;
 const MAX_TASKS: usize = 4096;
 const MAX_TEXT: usize = 16384;
 
@@ -51,8 +55,18 @@ pub enum Input {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ActionKind {
-    Ready { task: String, inputs: TaskInputs },
-    Cancel { task: String, token: String },
+    Ready {
+        task: String,
+        inputs: TaskInputs,
+    },
+    DerivedReady {
+        dispatch: Box<DerivedDispatch>,
+        inputs: TaskInputs,
+    },
+    Cancel {
+        task: String,
+        token: String,
+    },
     Finished,
 }
 
@@ -70,6 +84,7 @@ pub struct Transition {
     schema_version: u32,
     plan_digest: String,
     config: DriverConfig,
+    evaluation_digest: Option<String>,
     revision: u64,
     input: Input,
     state_digest: String,
@@ -87,6 +102,14 @@ impl Transition {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoreDecision {
+    UnstartedSkipped,
+    EarlyFailure,
+    MatrixJoined,
+}
+
 /// A never-started decision is deliberately distinct from a worker receipt.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -99,11 +122,18 @@ enum Terminal {
     Unstarted {
         outcomes: Vec<JobOutcome>,
     },
+    Core {
+        decision: CoreDecision,
+        diagnostic: Option<String>,
+        outcomes: Vec<JobOutcome>,
+    },
 }
 impl Terminal {
     fn outcomes(&self) -> &[JobOutcome] {
         match self {
-            Self::Worker { outcomes, .. } | Self::Unstarted { outcomes } => outcomes,
+            Self::Worker { outcomes, .. }
+            | Self::Unstarted { outcomes }
+            | Self::Core { outcomes, .. } => outcomes,
         }
     }
 }
@@ -111,6 +141,7 @@ impl Terminal {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Phase {
     Pending,
+    Expanded,
     Ready {
         inputs: TaskInputs,
     },
@@ -125,6 +156,7 @@ enum Phase {
 struct State {
     revision: u64,
     phases: BTreeMap<String, Phase>,
+    expansions: BTreeMap<String, Expansion>,
     // Tuple keys are not JSON object keys; nested maps preserve workflow scope.
     outcomes: BTreeMap<String, BTreeMap<String, JobOutcome>>,
     outbox: Vec<Action>,
@@ -135,10 +167,27 @@ struct State {
 pub struct Driver {
     plan: FrozenPlan,
     config: DriverConfig,
+    evaluation: Option<EvaluationContext>,
     state: State,
 }
 impl Driver {
     pub fn new(plan: &FrozenPlan, config: DriverConfig) -> Result<Self> {
+        Self::construct(plan, config, None)
+    }
+    pub fn with_evaluation(
+        plan: &FrozenPlan,
+        config: DriverConfig,
+        source: &VerifiedEvaluationSource,
+        facts: PortableFacts,
+    ) -> Result<Self> {
+        let evaluation = EvaluationContext::new(plan, source, facts)?;
+        Self::construct(plan, config, Some(evaluation))
+    }
+    fn construct(
+        plan: &FrozenPlan,
+        config: DriverConfig,
+        evaluation: Option<EvaluationContext>,
+    ) -> Result<Self> {
         plan.verify()?;
         ensure!(
             serde_json::to_vec(plan)?.len() <= MAX_WIRE_BYTES,
@@ -161,13 +210,29 @@ impl Driver {
         let mut producers = BTreeMap::new();
         for t in &plan.tasks {
             ensure!(
-                !t.dynamic_matrix && t.shard.is_none(),
-                "driver slice requires static unsharded tasks"
+                (!t.dynamic_matrix || evaluation.is_some()) && t.shard.is_none(),
+                "driver needs evaluation context for dynamic unsharded tasks"
             );
             ensure!(
                 !t.jobs.is_empty() && ids.insert(t.id.clone()),
                 "empty/duplicate task"
             );
+            if t.dynamic_matrix {
+                ensure!(
+                    t.jobs.len() == 1
+                        && t.nodes.len() == 1
+                        && t.variant.is_none()
+                        && t.grouped_reason.is_none(),
+                    "grouped dynamic tasks are unsupported"
+                );
+                ensure!(
+                    plan.graph.nodes.iter().any(|g| g.id == t.nodes[0]
+                        && g.workflow == t.workflow
+                        && g.job == t.jobs[0]
+                        && matches!(g.kind, NodeKind::DynamicMatrix { .. })),
+                    "dynamic origin graph mismatch"
+                );
+            }
             crate::wire::check_version("execution task", t.schema_version)?;
             for dep in &t.depends_on {
                 ensure!(
@@ -256,9 +321,11 @@ impl Driver {
         let driver = Self {
             plan: plan.clone(),
             config,
+            evaluation,
             state: State {
                 revision: 0,
                 phases,
+                expansions: BTreeMap::new(),
                 outcomes: BTreeMap::new(),
                 outbox: vec![],
                 finished: false,
@@ -266,6 +333,54 @@ impl Driver {
         };
         driver.bound(&driver.state)?;
         Ok(driver)
+    }
+    pub fn core_decision(&self, task: &str) -> Option<(CoreDecision, Option<&str>)> {
+        match self.state.phases.get(task)? {
+            Phase::Terminal(Terminal::Core {
+                decision,
+                diagnostic,
+                ..
+            }) => Some((*decision, diagnostic.as_deref())),
+            _ => None,
+        }
+    }
+    /// Placement descriptors from immutable source facts, including static jobs.
+    pub fn requirements(&self, task: &str) -> Result<Vec<RunnerRequirement>> {
+        let evaluation = self
+            .evaluation
+            .as_ref()
+            .context("evaluation source unavailable")?;
+        if let Some(selection) = self
+            .state
+            .expansions
+            .values()
+            .flat_map(|e| &e.selections)
+            .find(|s| s.task.id == task)
+        {
+            return Ok(vec![selection.requirement.clone()]);
+        }
+        let task = self.plan.task(task).context("unknown task")?;
+        let mut contexts = evaluation.contexts(&self.plan, task)?;
+        let inputs = match &self.state.phases[&task.id] {
+            Phase::Ready { inputs } | Phase::Claimed { inputs, .. } => inputs,
+            _ => anyhow::bail!("task inputs unavailable before readiness"),
+        };
+        contexts.insert("needs".into(), serde_json::Value::Object(inputs.context()));
+        if let Some(v) = &task.variant {
+            contexts.insert("matrix".into(), serde_json::Value::Object(v.values.clone()));
+            let g = self.group(&self.state, &v.group).context("missing group")?;
+            let NodeKind::MatrixGroup { variants, .. } = &g.kind else {
+                anyhow::bail!("not matrix group")
+            };
+            contexts.insert(
+                "strategy".into(),
+                serde_json::json!({"job-index":v.index,"job-total":variants.len()}),
+            );
+        }
+        task.jobs
+            .iter()
+            .map(|job| evaluation.requirement(task, job, &contexts))
+            .collect()
     }
     pub fn revision(&self) -> u64 {
         self.state.revision
@@ -289,6 +404,7 @@ impl Driver {
             schema_version: DRIVER_VERSION,
             plan_digest: self.plan.digest.clone(),
             config: self.config.clone(),
+            evaluation_digest: self.evaluation.as_ref().map(digest).transpose()?,
             revision: next.revision,
             input,
             state_digest: digest(&next)?,
@@ -300,7 +416,9 @@ impl Driver {
         ensure!(
             committed.schema_version == DRIVER_VERSION
                 && committed.plan_digest == self.plan.digest
-                && committed.config == self.config,
+                && committed.config == self.config
+                && committed.evaluation_digest
+                    == self.evaluation.as_ref().map(digest).transpose()?,
             "transition binding mismatch"
         );
         ensure!(
@@ -331,15 +449,20 @@ impl Driver {
                 ensure!(action.len() <= MAX_TEXT, "action id too long");
                 // Unknown ACKs are harmless and idempotent. A Ready ACK does
                 // not claim work; it remains visible until claim/termination.
-                s.outbox
-                    .retain(|a| &a.id != action || matches!(a.kind, ActionKind::Ready { .. }));
+                s.outbox.retain(|a| {
+                    &a.id != action
+                        || matches!(
+                            a.kind,
+                            ActionKind::Ready { .. } | ActionKind::DerivedReady { .. }
+                        )
+                });
             }
             Input::Claim { task, token } => {
                 ensure!(
                     !token.is_empty() && token.len() <= MAX_TEXT,
                     "invalid ownership token"
                 );
-                let t = self.plan.task(task).context("unknown task")?;
+                let t = self.task(&s, task).context("unknown task")?;
                 let Phase::Ready { inputs } = s.phases.get(task).context("unknown task")? else {
                     bail!("task is not ready")
                 };
@@ -353,21 +476,14 @@ impl Driver {
                     "global admission exhausted"
                 );
                 if let Some(v) = &t.variant {
-                    let g = self
-                        .plan
-                        .graph
-                        .nodes
-                        .iter()
-                        .find(|g| g.id == v.group)
-                        .context("missing group")?;
+                    let g = self.group(&s, &v.group).context("missing group")?;
                     if let NodeKind::MatrixGroup {
                         max_parallel: Some(limit),
                         ..
                     } = g.kind
                     {
                         let active = self
-                            .plan
-                            .tasks
+                            .tasks(&s)
                             .iter()
                             .filter(|m| {
                                 m.variant.as_ref().is_some_and(|m| m.group == v.group)
@@ -385,9 +501,8 @@ impl Driver {
                         cancel_requested: false,
                     },
                 );
-                s.outbox.retain(
-                    |a| !matches!(&a.kind, ActionKind::Ready { task: id, .. } if id == task),
-                );
+                s.outbox
+                    .retain(|a| ready_task(&a.kind) != Some(task.as_str()));
             }
             Input::Settle {
                 task,
@@ -395,7 +510,7 @@ impl Driver {
                 result_digest,
                 result,
             } => {
-                let t = self.plan.task(task).context("unknown task")?;
+                let t = self.task(&s, task).context("unknown task")?;
                 if let Phase::Terminal(Terminal::Worker {
                     token: old,
                     result_digest: old_digest,
@@ -422,7 +537,7 @@ impl Driver {
                 // Relative wire logs are validated by the shared codec. No
                 // files are read and no host paths enter committed state.
                 let r = result.as_ref().clone().into_task_result(Path::new("."))?;
-                let problems = crate::complete::verify_task_result(t, &r);
+                let problems = crate::complete::verify_task_result(&t, &r);
                 ensure!(
                     problems.is_empty(),
                     "invalid result: {}",
@@ -494,7 +609,7 @@ impl Driver {
                     |a| !matches!(&a.kind, ActionKind::Cancel { task: id, .. } if id == task),
                 );
                 if failed {
-                    self.fail_fast(&mut s, t)?;
+                    self.fail_fast(&mut s, &t)?;
                 }
             }
         }
@@ -506,6 +621,10 @@ impl Driver {
         Ok(s)
     }
     fn bound(&self, s: &State) -> Result<()> {
+        ensure!(
+            s.phases.len() <= MAX_TASKS,
+            "driver membership exceeds bound"
+        );
         ensure!(s.outbox.len() <= MAX_TASKS * 2 + 1, "outbox exceeds bound");
         ensure!(
             serde_json::to_vec(s)?.len() <= MAX_WIRE_BYTES,
@@ -523,13 +642,7 @@ impl Driver {
         let Some(v) = &task.variant else {
             return Ok(());
         };
-        let g = self
-            .plan
-            .graph
-            .nodes
-            .iter()
-            .find(|g| g.id == v.group)
-            .context("missing group")?;
+        let g = self.group(s, &v.group).context("missing group")?;
         if !matches!(
             g.kind,
             NodeKind::MatrixGroup {
@@ -543,7 +656,7 @@ impl Driver {
             Phase::Terminal(t) => t.outcomes().iter().any(|o| o.ancestor_failed),
             _ => false,
         };
-        for member in &self.plan.tasks {
+        for member in self.tasks(s) {
             if !member.variant.as_ref().is_some_and(|m| m.group == v.group) {
                 continue;
             }
@@ -565,7 +678,8 @@ impl Driver {
                         member.id.clone(),
                         Phase::Terminal(Terminal::Unstarted { outcomes }),
                     );
-                    s.outbox.retain(|a| !matches!(&a.kind, ActionKind::Ready { task, .. } if task == &member.id));
+                    s.outbox
+                        .retain(|a| ready_task(&a.kind) != Some(member.id.as_str()));
                 }
                 Phase::Claimed { token, inputs, .. } => {
                     s.phases.insert(
@@ -585,110 +699,251 @@ impl Driver {
                         },
                     );
                 }
-                Phase::Terminal(_) => {}
+                Phase::Terminal(_) | Phase::Expanded => {}
             }
         }
         Ok(())
     }
+    fn task(&self, s: &State, id: &str) -> Option<ExecutionTask> {
+        self.plan.task(id).cloned().or_else(|| {
+            s.expansions
+                .values()
+                .flat_map(|e| &e.selections)
+                .find(|selection| selection.task.id == id)
+                .map(|selection| selection.task.clone())
+        })
+    }
+    fn tasks(&self, s: &State) -> Vec<ExecutionTask> {
+        self.plan
+            .tasks
+            .iter()
+            .cloned()
+            .chain(
+                s.expansions
+                    .values()
+                    .flat_map(|e| e.selections.iter().map(|s| s.task.clone())),
+            )
+            .collect()
+    }
+    fn group<'a>(&'a self, s: &'a State, id: &str) -> Option<&'a JobNode> {
+        s.expansions
+            .values()
+            .map(|e| &e.group)
+            .chain(self.plan.graph.nodes.iter())
+            .find(|g| g.id == id)
+    }
     fn progress(&self, s: &mut State) -> Result<()> {
-        for t in &self.plan.tasks {
-            if t.variant.is_some() {
-                continue;
-            }
-            if let Phase::Terminal(terminal) = &s.phases[&t.id] {
-                for o in terminal.outcomes() {
-                    s.outcomes
-                        .entry(t.workflow.clone())
-                        .or_default()
-                        .insert(o.job.clone(), o.clone());
+        loop {
+            let mut changed = false;
+            for t in &self.plan.tasks {
+                if t.variant.is_some() {
+                    continue;
+                }
+                if let Phase::Terminal(terminal) = &s.phases[&t.id] {
+                    for o in terminal.outcomes() {
+                        s.outcomes
+                            .entry(t.workflow.clone())
+                            .or_default()
+                            .insert(o.job.clone(), o.clone());
+                    }
                 }
             }
-        }
-        for g in &self.plan.graph.nodes {
-            let NodeKind::MatrixGroup { .. } = g.kind else {
-                continue;
-            };
-            let members: Vec<_> = self
+            let groups: Vec<_> = self
                 .plan
-                .tasks
+                .graph
+                .nodes
                 .iter()
-                .filter(|t| t.variant.as_ref().is_some_and(|v| v.group == g.id))
+                .filter(|g| matches!(g.kind, NodeKind::MatrixGroup { .. }))
+                .cloned()
+                .chain(s.expansions.values().map(|e| e.group.clone()))
                 .collect();
-            if members
-                .iter()
-                .all(|t| matches!(s.phases[&t.id], Phase::Terminal(_)))
-            {
-                let parts: Vec<_> = members
+            let tasks = self.tasks(s);
+            for g in groups {
+                let members: Vec<_> = tasks
                     .iter()
-                    .flat_map(|t| match &s.phases[&t.id] {
-                        Phase::Terminal(x) => x.outcomes().to_vec(),
-                        _ => vec![],
-                    })
+                    .filter(|t| t.variant.as_ref().is_some_and(|v| v.group == g.id))
                     .collect();
-                let joined = crate::task::aggregate_matrix(g, &parts)?;
-                s.outcomes
-                    .entry(g.workflow.clone())
-                    .or_default()
-                    .insert(g.job.clone(), joined);
+                if !members.is_empty()
+                    && members
+                        .iter()
+                        .all(|t| matches!(s.phases[&t.id], Phase::Terminal(_)))
+                {
+                    let parts: Vec<_> = members
+                        .iter()
+                        .flat_map(|t| match &s.phases[&t.id] {
+                            Phase::Terminal(x) => x.outcomes().to_vec(),
+                            _ => vec![],
+                        })
+                        .collect();
+                    let joined = crate::task::aggregate_matrix(&g, &parts)?;
+                    s.outcomes
+                        .entry(g.workflow.clone())
+                        .or_default()
+                        .insert(g.job.clone(), joined.clone());
+                    if let Some(origin) = s
+                        .expansions
+                        .iter()
+                        .find(|(_, e)| e.group.id == g.id)
+                        .map(|(id, _)| id.clone())
+                    {
+                        if matches!(s.phases[&origin], Phase::Expanded) {
+                            s.phases.insert(
+                                origin,
+                                Phase::Terminal(Terminal::Core {
+                                    decision: CoreDecision::MatrixJoined,
+                                    diagnostic: None,
+                                    outcomes: vec![joined],
+                                }),
+                            );
+                            changed = true;
+                        }
+                    }
+                }
             }
-        }
-        for t in &self.plan.tasks {
-            if !matches!(s.phases[&t.id], Phase::Pending) {
-                continue;
-            }
-            if !t
-                .depends_on
-                .iter()
-                .all(|d| matches!(s.phases[d], Phase::Terminal(_)))
-            {
-                continue;
-            }
-            let wf = self
-                .plan
-                .workflows
-                .iter()
-                .find(|w| w.file == t.workflow)
-                .context("missing workflow")?;
-            let needs: BTreeSet<_> = t
-                .jobs
-                .iter()
-                .flat_map(|j| wf.job(j).into_iter().flat_map(|j| &j.needs))
-                .filter(|n| !t.jobs.contains(n))
-                .collect();
-            let finished = s.outcomes.get(&t.workflow);
-            if !needs
-                .iter()
-                .all(|n| finished.is_some_and(|m| m.contains_key(*n)))
-            {
-                continue;
-            }
-            let inputs = TaskInputs::new(
-                needs
+            for t in &self.plan.tasks {
+                if !matches!(s.phases[&t.id], Phase::Pending)
+                    || !t
+                        .depends_on
+                        .iter()
+                        .all(|d| matches!(s.phases[d], Phase::Terminal(_)))
+                {
+                    continue;
+                }
+                let wf = self
+                    .plan
+                    .workflows
                     .iter()
-                    .filter_map(|n| finished.and_then(|m| m.get(*n))),
-                finished.into_iter().flat_map(|m| m.values()),
-                false,
-            );
-            s.phases.insert(
-                t.id.clone(),
-                Phase::Ready {
-                    inputs: inputs.clone(),
-                },
-            );
-            self.push(
-                s,
-                &format!("ready:{}", t.id),
-                ActionKind::Ready {
-                    task: t.id.clone(),
-                    inputs,
-                },
-            );
+                    .find(|w| w.file == t.workflow)
+                    .context("missing workflow")?;
+                let needs: BTreeSet<_> = t
+                    .jobs
+                    .iter()
+                    .flat_map(|j| wf.job(j).into_iter().flat_map(|j| &j.needs))
+                    .filter(|n| !t.jobs.contains(n))
+                    .collect();
+                let finished = s.outcomes.get(&t.workflow);
+                if !needs
+                    .iter()
+                    .all(|n| finished.is_some_and(|m| m.contains_key(*n)))
+                {
+                    continue;
+                }
+                let inputs = TaskInputs::new(
+                    needs
+                        .iter()
+                        .filter_map(|n| finished.and_then(|m| m.get(*n))),
+                    finished.into_iter().flat_map(|m| m.values()),
+                    false,
+                );
+                changed = true;
+                if t.dynamic_matrix {
+                    let evaluation = self
+                        .evaluation
+                        .as_ref()
+                        .context("missing evaluation context")?;
+                    // User expression failures are core outcomes; never discard the
+                    // already-validated producer settlement and permit release.
+                    let derivation = dispatch::derive(
+                        &self.plan,
+                        evaluation,
+                        t,
+                        &inputs,
+                        MAX_TASKS.saturating_sub(s.phases.len()),
+                    )
+                    .unwrap_or_else(|e| Derivation::Failed(format!("expansion: {e:#}")));
+                    match derivation {
+                        Derivation::Expanded(expansion) => {
+                            for selection in &expansion.selections {
+                                ensure!(
+                                    !s.phases.contains_key(&selection.task.id),
+                                    "derived membership collision"
+                                );
+                            }
+                            for dispatch in &expansion.dispatches {
+                                s.phases.insert(
+                                    dispatch.task_id().into(),
+                                    Phase::Ready {
+                                        inputs: inputs.clone(),
+                                    },
+                                );
+                                self.push(
+                                    s,
+                                    &format!("ready:{}", dispatch.task_id()),
+                                    ActionKind::DerivedReady {
+                                        dispatch: Box::new(dispatch.clone()),
+                                        inputs: inputs.clone(),
+                                    },
+                                );
+                            }
+                            s.phases.insert(t.id.clone(), Phase::Expanded);
+                            s.expansions.insert(t.id.clone(), *expansion);
+                        }
+                        terminal => {
+                            let (decision, status, reason) = match terminal {
+                                Derivation::Skipped(reason) => {
+                                    (CoreDecision::UnstartedSkipped, JobStatus::Skipped, reason)
+                                }
+                                Derivation::Failed(reason) => {
+                                    (CoreDecision::EarlyFailure, JobStatus::Failure, reason)
+                                }
+                                _ => unreachable!(),
+                            };
+                            let diagnostic: String = reason.chars().take(1024).collect();
+                            let ancestor_failed = inputs
+                                .needs
+                                .values()
+                                .any(JobOutcome::failed_or_ancestor_failed);
+                            let outcome = JobOutcome {
+                                job: t.jobs[0].clone(),
+                                variant: None,
+                                status,
+                                outputs: BTreeMap::new(),
+                                skipped: (status == JobStatus::Skipped).then(|| diagnostic.clone()),
+                                ancestor_failed,
+                            };
+                            s.phases.insert(
+                                t.id.clone(),
+                                Phase::Terminal(Terminal::Core {
+                                    decision,
+                                    diagnostic: Some(diagnostic),
+                                    outcomes: vec![outcome],
+                                }),
+                            );
+                        }
+                    }
+                } else {
+                    s.phases.insert(
+                        t.id.clone(),
+                        Phase::Ready {
+                            inputs: inputs.clone(),
+                        },
+                    );
+                    self.push(
+                        s,
+                        &format!("ready:{}", t.id),
+                        ActionKind::Ready {
+                            task: t.id.clone(),
+                            inputs,
+                        },
+                    );
+                }
+            }
+            if !changed {
+                break;
+            }
         }
         if !s.finished && s.phases.values().all(|p| matches!(p, Phase::Terminal(_))) {
             s.finished = true;
             self.push(s, "finished", ActionKind::Finished);
         }
         Ok(())
+    }
+}
+fn ready_task(action: &ActionKind) -> Option<&str> {
+    match action {
+        ActionKind::Ready { task, .. } => Some(task),
+        ActionKind::DerivedReady { dispatch, .. } => Some(dispatch.task_id()),
+        _ => None,
     }
 }
 fn digest<T: Serialize>(value: &T) -> Result<String> {
@@ -1090,3 +1345,6 @@ mod tests {
             .is_err());
     }
 }
+
+#[cfg(test)]
+mod runtime_tests;

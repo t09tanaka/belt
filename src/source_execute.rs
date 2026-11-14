@@ -331,6 +331,31 @@ pub fn execute_pinned_task(
     )
 }
 
+/// Execute only a recomputed member of the original captured dynamic task.
+/// Host must bind dispatch/inputs/facts to its committed readiness/attempt.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pinned_dispatch(
+    ctx: &ExecContext,
+    input: &PinnedExecution<'_>,
+    dispatch: &crate::driver::DerivedDispatch,
+    inputs: &TaskInputs,
+    facts: &crate::driver::PortableFacts,
+    prepared: Option<(&PreparedReceipt, &TemplateContext)>,
+    ws: &PinnedWorkspace,
+    opts: Opts,
+    workspaces: &dyn PinnedWorkspaceProvider,
+) -> Result<TaskResult> {
+    input.validate(input.plan)?;
+    ws.validate(input)?;
+    let source = input.evaluation_source()?;
+    let selection =
+        crate::driver::dispatch::validate(input.plan, &source, facts, dispatch, inputs)?;
+    let task = selection.task.clone();
+    let runner = Runner::new_pinned(ctx, input, ws, opts, workspaces)?
+        .select_derived(selection, facts.clone());
+    crate::task::execute_resolved_with_runner(ctx, &task, inputs, prepared, ws.workspace(), runner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

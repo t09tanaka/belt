@@ -354,6 +354,19 @@ pub(crate) fn execute_with_runner(
     let task = fp
         .task(task_id)
         .ok_or_else(|| anyhow!("the plan has no task `{task_id}`"))?;
+    execute_resolved_with_runner(ctx, task, inputs, prepared, ws, runner)
+}
+
+/// Only frozen lookup or a source-validated derived proof may reach this helper.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_resolved_with_runner(
+    ctx: &ExecContext,
+    task: &crate::dag::ExecutionTask,
+    inputs: &TaskInputs,
+    prepared: Option<(&PreparedReceipt, &TemplateContext)>,
+    ws: &Workspace,
+    runner: Runner<'_>,
+) -> Result<TaskResult> {
     crate::wire::check_version("task inputs", inputs.schema_version)?;
     if let Some((receipt, _)) = prepared {
         crate::wire::check_version("receipt", receipt.schema_version)?;

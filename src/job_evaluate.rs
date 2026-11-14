@@ -1,8 +1,8 @@
 //! Shared pure job evaluation extracted from Runner::run_job.
 //!
-//! These are the legacy worker-context semantics: matrix expansion precedes
-//! per-variant conditions. The caller supplies its actual worker contexts.
-//! Portable parent evaluation/context policy is a separate following slice.
+//! Legacy worker evaluation preserves expansion before per-variant conditions.
+//! Portable evaluation opts into early condition/context validation and bounded
+//! expansion, while reusing the same expression/matrix/display implementation.
 use crate::dag::TaskShard;
 use crate::expr::{self, Ctx, Status};
 use crate::matrix;
@@ -43,6 +43,52 @@ pub(crate) fn evaluate_job(
     run_cancelled: bool,
     only: Option<usize>,
     shard: Option<&TaskShard>,
+) -> JobEvaluation {
+    evaluate_inner(
+        job,
+        github,
+        runner,
+        needs,
+        ancestor_failed,
+        run_cancelled,
+        only,
+        shard,
+        None,
+    )
+}
+
+pub(crate) fn evaluate_portable(
+    job: &Job,
+    contexts: &Map<String, Value>,
+    needs: &Map<String, Value>,
+    ancestor_failed: bool,
+    run_cancelled: bool,
+    limit: usize,
+) -> JobEvaluation {
+    evaluate_inner(
+        job,
+        contexts.get("github").cloned().unwrap_or(json!({})),
+        json!({}),
+        needs,
+        ancestor_failed,
+        run_cancelled,
+        None,
+        None,
+        Some((contexts, limit)),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_inner(
+    job: &Job,
+    github: Value,
+    runner: Value,
+    needs: &Map<String, Value>,
+    ancestor_failed: bool,
+    run_cancelled: bool,
+    only: Option<usize>,
+    shard: Option<&TaskShard>,
+    portable: Option<(&Map<String, Value>, usize)>,
 ) -> JobEvaluation {
     let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
     let needs_of_job: Map<String, Value> = job
@@ -88,13 +134,56 @@ pub(crate) fn evaluate_job(
     ctx_map.insert("matrix".into(), json!({}));
     ctx_map.insert("strategy".into(), json!({}));
 
+    if let Some((contexts, _)) = portable {
+        for root in ["vars", "inputs"] {
+            if let Some(value) = contexts.get(root) {
+                ctx_map.insert(root.into(), value.clone());
+            }
+        }
+        let check = || -> Result<bool> {
+            if let Some(cond) = &job.cond {
+                expr::validate_portable_context(
+                    cond,
+                    true,
+                    expr::PortableStage::JobIf,
+                    Some(&ctx_map),
+                )?;
+            }
+            expr::condition(job.cond.as_deref(), &Ctx::with_fns(&ctx_map, needs_fns))
+        };
+        match check() {
+            Ok(false) => {
+                return JobEvaluation::terminal(base_name, Decision::Skip(why_not().into()))
+            }
+            Err(e) => {
+                return JobEvaluation::terminal(base_name, Decision::Error(format!("if: {e:#}")))
+            }
+            Ok(true) => {}
+        }
+        if job.max_parallel == Some(0) {
+            return JobEvaluation::terminal(
+                base_name,
+                Decision::Error("strategy.max-parallel: must be positive".into()),
+            );
+        }
+    }
     // The matrix may be an expression over `needs`.
     let combos = match &job.matrix {
         None => vec![Map::new()],
         Some(m) => {
             let ctx = Ctx::new(&ctx_map, Status::Success);
-            let value = eval_strings(&matrix::yaml_to_json(m), &ctx);
-            match value.and_then(|v| matrix::expand(&v)) {
+            let raw = matrix::yaml_to_json(m);
+            let value = if portable.is_some() {
+                validate_strings(&raw, &ctx_map, expr::PortableStage::Matrix)
+                    .and_then(|()| eval_strings(&raw, &ctx))
+            } else {
+                eval_strings(&raw, &ctx)
+            };
+            match value.and_then(|v| match portable {
+                Some((_, 0)) => anyhow::bail!("matrix expansion data budget exhausted"),
+                Some((_, limit)) => matrix::expand_bounded(&v, limit),
+                None => matrix::expand(&v),
+            }) {
                 Ok(c) => c,
                 Err(e) => {
                     return JobEvaluation::terminal(
@@ -118,6 +207,20 @@ pub(crate) fn evaluate_job(
         );
     }
 
+    if portable.is_some() {
+        if let Some(name) = &job.name {
+            // Matrix/strategy keys are validated for availability by stage;
+            // actual values are supplied for each member below.
+            if let Err(e) = expr::validate_portable_context(
+                name,
+                false,
+                expr::PortableStage::Name,
+                Some(&ctx_map),
+            ) {
+                return JobEvaluation::terminal(base_name, Decision::Error(format!("name: {e:#}")));
+            }
+        }
+    }
     // Combinations that pass `if:` run after this loop.
     let mut entries = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
@@ -170,8 +273,25 @@ pub(crate) fn evaluate_job(
     JobEvaluation { entries }
 }
 
+pub(crate) fn validate_strings(
+    value: &Value,
+    contexts: &Map<String, Value>,
+    stage: expr::PortableStage,
+) -> Result<()> {
+    match value {
+        Value::String(s) => expr::validate_portable_context(s, false, stage, Some(contexts)),
+        Value::Array(a) => a
+            .iter()
+            .try_for_each(|v| validate_strings(v, contexts, stage)),
+        Value::Object(m) => m
+            .values()
+            .try_for_each(|v| validate_strings(v, contexts, stage)),
+        _ => Ok(()),
+    }
+}
+
 /// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
-fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
+pub(crate) fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
     Ok(match v {
         Value::String(s) if s.contains("${{") => expr::interpolate_value(s, ctx)?,
         Value::Array(a) => Value::Array(
