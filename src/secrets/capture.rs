@@ -76,6 +76,9 @@ pub fn capture_run(
     request: &SourceRequest,
     params: &CaptureParams,
 ) -> Result<Captured, ApiError> {
+    let _mutation = store
+        .mutation_guard()
+        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     let (key, declared) = (inputs.key, inputs.declared);
     check_declared(declared).map_err(|l| ApiError::new(ErrorCode::InvalidInput, l.to_string()))?;
     let included = match request {

@@ -1254,6 +1254,7 @@ async fn retry_stopping_releases_owner_while_input_io_retains_cross_process_leas
         file.try_lock(),
         Err(std::fs::TryLockError::WouldBlock)
     ));
+    assert!(sources.retention.guard(true).is_err());
     stop.send(true).unwrap();
     let reply = tokio::time::timeout(Duration::from_secs(2), pending)
         .await
@@ -1274,11 +1275,13 @@ async fn retry_stopping_releases_owner_while_input_io_retains_cross_process_leas
         file.try_lock(),
         Err(std::fs::TryLockError::WouldBlock)
     ));
+    assert!(sources.retention.guard(true).is_err());
     release.send(()).unwrap();
     let guard = tokio::time::timeout(Duration::from_secs(2), transfer.lock_owned())
         .await
         .unwrap();
     file.try_lock().unwrap();
+    drop(sources.retention.guard(true).unwrap());
     drop(guard);
 }
 

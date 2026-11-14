@@ -5313,3 +5313,46 @@ fn enqueue_does_not_publish_run_when_reader_pin_cannot_be_secured() {
     assert!(f.store.result_gc_guard(&run).is_err());
     drop(pin);
 }
+
+#[test]
+fn source_preview_guard_fences_retry_commit_and_foreign_guards_without_mutation() {
+    use crate::service::completion::Target;
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let target = Target::Run(f.run.clone());
+    let prepare = || match f
+        .store
+        .prepare_retry(target.clone(), 0, "source-fence".into())
+        .unwrap()
+    {
+        RetryPreparation::Prepared(p) => p,
+        _ => panic!("expected prepare"),
+    };
+    let source = crate::source::SourceStore::open(f._dir.path()).unwrap();
+    let exclusive = source.retention.guard(true).unwrap();
+    assert!(f.store.commit_retry(prepare(), false, 40).is_err());
+    assert_eq!(
+        f.store.completion(target.clone()).unwrap().control_revision,
+        0
+    );
+    drop(exclusive);
+    let other = tempfile::tempdir().unwrap();
+    let foreign = crate::source::SourceStore::open(other.path())
+        .unwrap()
+        .mutation_guard()
+        .unwrap();
+    assert!(f
+        .store
+        .commit_retry_guarded(prepare(), false, 40, foreign)
+        .is_err());
+    assert_eq!(
+        f.store.completion(target.clone()).unwrap().control_revision,
+        0
+    );
+    let shared = source.mutation_guard().unwrap();
+    assert!(source.retention.guard(true).is_err());
+    f.store
+        .commit_retry_guarded(prepare(), false, 40, shared)
+        .unwrap();
+    assert_eq!(f.store.completion(target).unwrap().control_revision, 1);
+    drop(source.retention.guard(true).unwrap());
+}

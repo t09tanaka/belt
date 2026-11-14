@@ -16,6 +16,7 @@ pub mod classify;
 mod commit;
 pub mod diff;
 pub mod manifest;
+pub mod retention;
 pub mod safety;
 pub mod store;
 
@@ -104,6 +105,7 @@ pub struct Captured {
     pub secrets: Option<PathBuf>,
     /// Things worth saying that did not stop the capture.
     pub warnings: Vec<String>,
+    pub(crate) retention_root: Option<String>,
 }
 
 /// Capture `request` into `store`. Never writes the original. When the input
@@ -115,6 +117,12 @@ pub fn capture(
     request: &SourceRequest,
     params: &CaptureParams,
 ) -> Result<Captured, ApiError> {
+    let _mutation = store
+        .mutation_guard()
+        .map_err(|e| classify::api_error_of(&e))?;
+    let retention_root = store
+        .capture_pending_root()
+        .map_err(|e| classify::api_error_of(&e))?;
     let ctx = ExecContext::new(env.clone());
     let opts = CaptureOptions {
         store: Some(store.root().to_path_buf()),
@@ -169,7 +177,12 @@ pub fn capture(
             return Err(e);
         }
     };
+    store
+        .retention
+        .register(store, &retention_root, "pending", &manifest.ci_source_id)
+        .map_err(|e| classify::api_error_of(&e))?;
     Ok(Captured {
+        retention_root: Some(retention_root),
         manifest,
         secrets: snap.secrets,
         warnings: snap.warnings,
@@ -243,6 +256,7 @@ pub fn capture_for_run(
             )
         })
     };
+    let _mutation = store.mutation_guard().map_err(internal)?;
     // one capture of a run at a time, in this process and in others
     let _lock = store.lock_run(run).map_err(internal)?;
     let wanted = RunRecord {
@@ -274,7 +288,12 @@ pub fn capture_for_run(
                     ),
                 )
             })?;
+        store
+            .retention
+            .register(store, run.as_str(), "run", &rec.ci_source_id)
+            .map_err(internal)?;
         return Ok(Captured {
+            retention_root: None,
             manifest: from_ci(&m)?,
             secrets: None,
             warnings: vec![],
@@ -294,7 +313,7 @@ pub fn capture_for_run(
             _ => {}
         }
     }
-    let got = capture(env, store, request, params)?;
+    let mut got = capture(env, store, request, params)?;
     let record = RunRecord {
         ci_source_id: got.manifest.ci_source_id.clone(),
         ..wanted
@@ -315,6 +334,12 @@ pub fn capture_for_run(
                 bound.ci_source_id
             ),
         ));
+    }
+    if let Some(pending) = got.retention_root.take() {
+        store
+            .retention
+            .handoff(&pending, run.as_str())
+            .map_err(internal)?;
     }
     Ok(got)
 }

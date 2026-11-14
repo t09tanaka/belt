@@ -24,6 +24,26 @@ pub struct ResultDeleteClaim {
 }
 
 impl CoordinatorStore {
+    /// Fresh scalar all-generation input-retention proof. No source lock is taken
+    /// here: the caller holds source EX before entering this metadata operation.
+    pub fn input_retention_end(&self, run: &RunId, source: &SourceId) -> Result<Option<u64>> {
+        let run = run.to_string();
+        let source = source.to_string();
+        self.db.call(move |c| {
+            let ended:Option<i64>=c.query_row("SELECT CASE WHEN
+              EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND source_id=?2)
+              AND EXISTS(SELECT 1 FROM task WHERE run_id=?1)
+              AND NOT EXISTS(SELECT 1 FROM task t WHERE t.run_id=?1 AND
+                (NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)
+                 OR (t.cancel_requested_at_ms IS NULL AND NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.generation>=t.min_generation))))
+              AND NOT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id)
+                WHERE t.run_id=?1 AND (a.observation<>'known' OR a.state<>'terminal' OR a.terminal_at_ms IS NULL OR a.termination_json IS NULL OR json_valid(a.termination_json)=0 OR x.closed_at_ms IS NULL OR x.verdict IS NULL OR x.verdict NOT IN ('complete','required_missing','gave_up')))
+              THEN (SELECT max(max(coalesce(a.terminal_at_ms,0),coalesce(x.closed_at_ms,0))) FROM task t JOIN attempt a USING(task_id) JOIN collection x USING(attempt_id) WHERE t.run_id=?1)
+              ELSE NULL END",params![run,source],|r|r.get(0))?;
+            ended.map(to_u64).transpose()
+        })
+    }
+
     /// Authorize retained bytes from fresh durable references, never filesystem
     /// existence or an old receipt. The invocation must already hold its run pin.
     pub(super) fn result_data_available(&self, attempt: &AttemptId, locator: &str) -> Result<()> {

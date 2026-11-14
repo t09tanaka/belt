@@ -48,6 +48,7 @@ pub struct TransferPlan {
 #[derive(Debug, Clone)]
 pub struct SourceStore {
     inner: ObjectStore,
+    pub(crate) retention: super::retention::Index,
 }
 
 /// A peer as a transfer sees it: its source store, and the Git repository the
@@ -355,10 +356,19 @@ impl SourceStore {
     /// `<state_dir>/sources`, private to this user.
     pub fn open(state_dir: &Path) -> Result<Self> {
         let root = state_dir.join("sources");
+        match std::fs::symlink_metadata(&root) {
+            Ok(meta) => anyhow::ensure!(
+                meta.is_dir() && !meta.file_type().is_symlink(),
+                "unsafe source root"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
         let inner = ObjectStore::open(&root)?;
         std::fs::create_dir_all(root.join("runs"))?;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
-        Ok(SourceStore { inner })
+        let retention = super::retention::Index::open(&root)?;
+        Ok(SourceStore { inner, retention })
     }
 
     /// Is the blob in the store? (Only a well-formed hash can be.)
@@ -514,9 +524,11 @@ impl SourceStore {
     /// blobs a manifest names are there with the size it says (the same hash
     /// cannot hold other content).
     pub fn ingest_blob(&self, want: &BlobWant, r: &mut impl Read) -> Result<()> {
+        let _mutation = self.mutation_guard()?;
         if !is_blob_hash(&want.hash) {
             return Err(corrupt(format!("not a blob hash: {:?}", want.hash)));
         }
+        self.retention.pending(&format!("blob:{}", want.hash))?;
         // hash first, in a scratch copy: a wrong blob must not enter the store
         let mut tmp = tempfile::Builder::new()
             .prefix(".recv.")
@@ -627,7 +639,10 @@ impl SourceStore {
     }
 
     fn publish_checked(&self, m: &CiManifest) -> Result<()> {
+        let _mutation = self.mutation_guard()?;
         verify_manifest(m)?;
+        let root = format!("receive:{}", m.source_id);
+        self.retention.pending(&root)?;
         for e in &m.object_manifest.entries {
             let p = self.inner.object_path(&e.hash);
             match std::fs::metadata(&p) {
@@ -669,6 +684,9 @@ impl SourceStore {
         tmp.as_file().sync_all()?;
         tmp.persist(self.inner.manifest_path(&m.source_id))
             .map_err(|e| e.error)?;
+        self.retention
+            .register(self, &root, "received", &m.source_id)?;
+        self.retention.finish_imports(&root)?;
         Ok(())
     }
 
@@ -680,6 +698,7 @@ impl SourceStore {
     /// is made of are decided on first; then local-ci writes the files, never
     /// through a symlink, and checks the result against the tree digest.
     pub fn materialize(&self, m: &CiManifest, dest: &Path) -> Result<()> {
+        let _mutation = self.mutation_guard()?;
         for s in self.closure(m)? {
             verify_manifest(&s)?;
         }
@@ -759,6 +778,7 @@ impl SourceStore {
         m: &CiManifest,
         have: &[String],
     ) -> Result<PathBuf> {
+        let _mutation = self.mutation_guard()?;
         verify_manifest(m)?;
         let mut basis: Vec<String> = vec![];
         for c in have.iter().filter(|c| is_hex40(c)) {
@@ -827,6 +847,7 @@ impl SourceStore {
     /// transfer was given up. Returns how many were removed. One that is
     /// asked for again is written again.
     pub fn remove_bundles(&self, ci_source_id: &str) -> Result<usize> {
+        let _mutation = self.mutation_guard()?;
         let mut n = 0;
         for p in self.bundles_of(ci_source_id)? {
             if remove_if_there(&p)? {
@@ -893,6 +914,7 @@ impl SourceStore {
     /// Record the capture of `run`, once. Returns the record the run is bound
     /// to: `record`, or the one an earlier call wrote.
     pub fn bind_run(&self, run: &RunId, record: &RunRecord) -> Result<RunRecord> {
+        let _mutation = self.mutation_guard()?;
         if source_id_of_ci(&record.ci_source_id).is_none() {
             bail!("not a source id: {}", record.ci_source_id);
         }
@@ -903,13 +925,19 @@ impl SourceStore {
         tmp.write_all(&serde_json::to_vec_pretty(record)?)?;
         tmp.as_file().sync_all()?;
         // a hard link fails when the record exists: the first writer wins
-        match std::fs::hard_link(tmp.path(), &dest) {
-            Ok(()) => Ok(record.clone()),
+        let bound = match std::fs::hard_link(tmp.path(), &dest) {
+            Ok(()) => {
+                std::fs::File::open(dest.parent().unwrap())?.sync_all()?;
+                Ok(record.clone())
+            }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                 self.run_record(run)?.context("the run record disappeared")
             }
             Err(e) => Err(e.into()),
-        }
+        }?;
+        self.retention
+            .register(self, run.as_str(), "run", &bound.ci_source_id)?;
+        Ok(bound)
     }
 }
 

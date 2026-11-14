@@ -184,6 +184,23 @@ impl CoordinatorStore {
         tasks: &[(TaskId, Value)],
         at_ms: u64,
     ) -> Result<()> {
+        let source = self.source_mutation_guard()?;
+        self.enqueue_guarded(run_id, source_id, run_spec, tasks, at_ms, source)
+    }
+    pub(crate) fn enqueue_guarded(
+        &self,
+        run_id: &RunId,
+        source_id: Option<&SourceId>,
+        run_spec: &Value,
+        tasks: &[(TaskId, Value)],
+        at_ms: u64,
+        source: crate::source::retention::Guard,
+    ) -> Result<()> {
+        if source.root != self.state_dir.join("sources") {
+            return Err(StorageError::Invalid("foreign source guard".into()));
+        }
+        let _source = source;
+
         if tasks.is_empty() || tasks.len() > MAX_TASKS_PER_RUN {
             return Err(StorageError::Invalid(format!(
                 "a run has 1 to {MAX_TASKS_PER_RUN} tasks, not {}",

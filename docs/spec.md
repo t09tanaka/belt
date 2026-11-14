@@ -1232,3 +1232,9 @@ resident の収集 loop・lease 更新・IPC は継続する。pin 破損や他�
 時計 cutoff は boot identity と永続 monotonic baseline から導出し、boot 不明/変更後は全 retention の
 quarantine、時計異常は retention 0 でも Hold。壁時計だけを理由に削除を前倒ししない。
 source/Vault/private binding の GC と output planner 完成はこの結果 retention 経路に含まない。
+
+### Source retention roots (nondeleting foundation)
+
+The source store owns a private permanent mutation-lock inode and a separate retention index. Capture takes a shared guard and persists a pending root before local-ci publishes any objects. Graph registration uses persistent manifest positions and at most 32 references per step, including submodule edges and shared blobs. A matching durable run root precedes pending-root handoff. Unsubmitted captures and unknown crash roots remain protected. Legacy registration is bounded and conservative.
+
+Retry/enqueue acquire source guards before admission/actor/DB operations and retain matching guards through actual commit; forwarding retains its guard through blocking IO drain. Preview takes nonblocking exclusive ownership, validates the configured store and source/run binding, checks all generations and trusted monotonic retention, and reports at most 32 unique owned manifest/blob paths. Unknown, pending, malformed or shared roots remain held. Preview never expires a root, writes an unavailable tombstone, claims deletion or removes source/Vault files. No automatic source deletion is enabled. Source/Vault erasure, owned Git/bundle cache cleanup and safe legacy abandonment remain mandatory follow-up work. Original workspaces and private in-place bindings are excluded.

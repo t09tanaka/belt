@@ -278,3 +278,26 @@ raw/Tar の export outcome・final write・final flush をそれぞれ block し
 strict all-target/all-feature clippy、fmt、diff check、公開禁止文字列 scan は成功。
 今回新しい pure decision helper は追加しておらず、元 feature の PURE/coverage union と clock/mutation 証跡を保持する。
 全体 local CI・MSRV・Linux と公開はこの focused 検証に含めない。
+
+### Source retention の非削除 foundation
+
+source store 専用の永続 mutation lock と retention index を追加する。capture 前の unknown pending root、
+immutable manifest/submodule/blob graph の 32 参照ずつの永続登録、durable run root への一致 handoff、
+未 submit capture と crash root の保守保持を扱う。旧 manifest は bounded page で保護 root へ登録する。
+同じ store の shared guard を capture/import、submit/enqueue、retry commit、source/secret delivery と
+blocking transfer drain まで保持し、source lock は admission/actor/DB transaction より前に取得する。
+index は coordinator DB と別の所有領域で、cross-DB atomicity を保証したとは扱わない。
+
+この段階は dry-run のみで、root 失効・利用不能 tombstone・不可逆 deletion claim・source/Vault の
+実削除や resident automatic source GC は追加しない。trusted boot/monotonic cutoff、同一 store/source/run
+binding、全 generation の known terminal と collection closed の正の証拠から、最大 32 件の owned
+manifest/blob 候補を示す。未知・不正・query error・pending・shared digest は保持し、collection failure を
+成功へ変えない。source/Git refs/bundles と Vault の実削除、旧 unsubmitted capture の安全な reconciliation は
+引き続き必須残件。private in-place binding と原本 filesystem はこの cleanup 対象に含めない。
+
+非削除 foundation の focused 検証は新規 root/preview 9 件（owned helper は単独 subprocess として実行）、
+retry guard 1、retry 停止と input IO drain 1、source capture 38、実 worker/offline outputs 1、in-place 9、
+既存 same-run retry 11 の計 70 件が成功した。shared digest/submodule、capture-before-bind fault、
+unknown root 保持、clock Hold の cursor 保持、foreign coordinator/source/guard、manifest identity、
+source root/ancestor symlink と canonical path alias を確認した。strict all-target/all-feature clippy、
+fmt/diff と公開文字列確認が成功。全体 CI/MSRV/Linux はこの focused 検証に含めず、実削除は未実装のままとする。

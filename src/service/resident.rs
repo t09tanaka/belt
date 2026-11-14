@@ -779,9 +779,13 @@ where
     };
     let input_lease = lease.clone();
     // This detached work owns only metadata, captured inputs and the input lease.
+    let inputs = coordinator.clone();
     let preflight = tokio::task::spawn_blocking(move || {
         let _lease = input_lease;
-        let validated = validate(&prepared);
+        let source = inputs.store().source_mutation_guard();
+        drop(inputs); // Detached input IO retains only its source guard, never owner metadata.
+        let validated =
+            source.and_then(|source| validate(&prepared).map(|secret| (secret, source)));
         (prepared, validated)
     });
     let (prepared, validated) = tokio::select! {
@@ -789,7 +793,7 @@ where
         _=stop.wait_for(|stopped| *stopped)=>return Ok(stopping_reply()),
         result=preflight=>result?,
     };
-    let verified_secret = match validated {
+    let (verified_secret, source) = match validated {
         Ok(secret) => secret,
         Err(error) => return Ok(error_reply(error)),
     };
@@ -814,7 +818,7 @@ where
         let _lease = lease;
         coordinator
             .store()
-            .commit_retry(prepared, verified_secret, wall_ms())
+            .commit_retry_guarded(prepared, verified_secret, wall_ms(), source)
     })
     .await?;
     drop(gate);
@@ -980,7 +984,8 @@ async fn handle(
                 source_id,
                 tasks,
             } => {
-                if tasks.is_empty() || tasks.len() > 64 {
+                drop(gate);
+                let answer = if tasks.is_empty() || tasks.len() > 64 {
                     Reply::Error {
                         message: "submit requires 1..64 tasks".into(),
                     }
@@ -1003,40 +1008,57 @@ async fn handle(
                         .map_err(Into::into);
                     }
                     let owner = coordinator.clone();
-                    let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                        let ci = crate::source::classify::ci_id_of(&source)
-                            .ok_or_else(|| anyhow::anyhow!("source is not a captured source"))?;
-                        let manifest = sources.manifest(&ci)?.ok_or_else(|| {
-                            anyhow::anyhow!("source has not reached the local worker")
-                        })?;
-                        crate::source::store::verify_manifest(&manifest)?;
-                        let digest = Digest::parse(&manifest.manifest_digest).or_else(|_| {
-                            Digest::parse(&format!("sha256:{}", manifest.manifest_digest))
-                        })?;
-                        anyhow::ensure!(digest == expected, "source manifest digest mismatch");
-                        owner
-                            .store()
-                            .put_source_ref(&source, &expected, wall_ms())?;
-                        Ok(())
-                    })
+                    let checked = tokio::task::spawn_blocking(
+                        move || -> anyhow::Result<crate::source::retention::Guard> {
+                            let mutation = owner.store().source_mutation_guard()?;
+                            let ci =
+                                crate::source::classify::ci_id_of(&source).ok_or_else(|| {
+                                    anyhow::anyhow!("source is not a captured source")
+                                })?;
+                            let manifest = sources.manifest(&ci)?.ok_or_else(|| {
+                                anyhow::anyhow!("source has not reached the local worker")
+                            })?;
+                            crate::source::store::verify_manifest(&manifest)?;
+                            let digest =
+                                Digest::parse(&manifest.manifest_digest).or_else(|_| {
+                                    Digest::parse(&format!("sha256:{}", manifest.manifest_digest))
+                                })?;
+                            anyhow::ensure!(digest == expected, "source manifest digest mismatch");
+                            owner
+                                .store()
+                                .put_source_ref(&source, &expected, wall_ms())?;
+                            Ok(mutation)
+                        },
+                    )
                     .await?;
-                    if let Err(e) = checked {
-                        return write_message(
-                            &mut stream,
-                            &Reply::Error {
-                                message: e.to_string(),
-                            },
-                        )
+                    let source_guard = match checked {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            return write_message(
+                                &mut stream,
+                                &Reply::Error {
+                                    message: e.to_string(),
+                                },
+                            )
+                            .await
+                            .map_err(Into::into);
+                        }
+                    };
+                    let gate = admission.lock().await;
+                    anyhow::ensure!(!*gate && !coordinator.is_fenced(), "resident is stopping");
+                    match coordinator
+                        .enqueue_guarded(run_id.clone(), source_id, tasks, source_guard)
                         .await
-                        .map_err(Into::into);
-                    }
-                    match coordinator.enqueue(run_id.clone(), source_id, tasks).await {
+                    {
                         Ok(()) => Reply::Accepted { run_id },
                         Err(e) => Reply::Error {
                             message: e.to_string(),
                         },
                     }
-                }
+                };
+                return write_message(&mut stream, &answer)
+                    .await
+                    .map_err(Into::into);
             }
             Operation::SubmitCaptured {
                 run_id,
@@ -1049,8 +1071,9 @@ async fn handle(
                 let run = run_id.clone();
                 let capture = captured.clone();
                 let mut stopping = stop.subscribe();
-                let checked =
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<(Digest, bool)> {
+                let checked = tokio::task::spawn_blocking(
+                    move || -> anyhow::Result<(Digest, bool, crate::source::retention::Guard)> {
+                        let mutation = capture.sources.mutation_guard()?;
                         let id = crate::source::classify::ci_id_of(&source)
                             .ok_or_else(|| anyhow::anyhow!("invalid source"))?;
                         anyhow::ensure!(
@@ -1070,10 +1093,12 @@ async fn handle(
                                 Digest::parse(&format!("sha256:{}", manifest.manifest_digest))
                             })?,
                             !manifest.secret_files.is_empty(),
+                            mutation,
                         ))
-                    });
+                    },
+                );
                 let result = async {
-                    let (digest, has_secrets) = tokio::select! {
+                    let (digest, has_secrets, source_guard) = tokio::select! {
                         biased;
                         _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
                         checked=checked=>checked??,
@@ -1096,7 +1121,7 @@ async fn handle(
                     })
                     .await??;
                     coordinator
-                        .enqueue(run_id.clone(), source_id, tasks)
+                        .enqueue_guarded(run_id.clone(), source_id, tasks, source_guard)
                         .await?;
                     Ok::<_, anyhow::Error>(())
                 }
