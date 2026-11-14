@@ -1185,3 +1185,31 @@ resident の収集 loop・lease 更新・IPC は継続する。pin 破損や他�
 時計 cutoff は boot identity と永続 monotonic baseline から導出し、boot 不明/変更後は全 retention の
 quarantine、時計異常は retention 0 でも Hold。壁時計だけを理由に削除を前倒ししない。
 source/Vault/private binding の GC と output planner 完成はこの結果 retention 経路に含まない。
+
+### S20a: captured declaration API boundary
+
+`toolchain::snapshot::read_captured` reads bounded, verified captured objects,
+not the live checkout. `versions::effective` intersects declarations per explicit
+project/workflow/job/step scope; contradictory declarations fail with source
+locations. There is no implicit file precedence. Deferred expressions and
+manager channels require explicit resolution; missing observations remain unknown,
+even with `match = "any"`. `FrozenToolchains` retains source/profile identity,
+requirements, baseline provenance and explicit concrete selections for reuse on
+retry. Every declared range/channel needs a concrete selection before the frozen
+contract becomes resolved; a matching range alone cannot float on retry. This API
+is not yet part of submit/admission payloads.
+
+Node-style ranges use the npm-compatible `node-semver` parser. Pub environment
+constraints use Dart's distinct caret and prerelease-bound rules; Pub build
+metadata currently returns an explicit resolution-required diagnostic. Channel,
+workflow-expression and version-file-expression resolution is deferred, with no
+host env expansion. A selection's authority digest is supplied by the trusted
+parent/adapter; this API verifies its source/profile/scope/requirement binding,
+not the external resolver evidence itself. Snapshot version documents must be
+regular captured objects; secret entries and symlinks are rejected explicitly.
+
+S20 still requires manager adapters (nodenv/rustup/mise/fvm/corepack), private
+installation roots, resolution evidence, activation, installation singleflight
+and submit/worker integration. S21 workers diff/sync/doctor and real service
+environment acceptance remain mandatory. This declaration slice advertises no
+auto-installable capability.
