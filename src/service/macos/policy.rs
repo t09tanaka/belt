@@ -22,8 +22,28 @@ pub struct Plan {
     label: String,
     domain: String,
     plist: String,
+    domain_identity: Mode,
+    executable: PathBuf,
+    arguments: Vec<String>,
+    working_directory: PathBuf,
+    environment: BTreeMap<String, String>,
 }
 impl Plan {
+    pub fn mode(&self) -> &Mode {
+        &self.domain_identity
+    }
+    pub fn executable(&self) -> &Path {
+        &self.executable
+    }
+    pub fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+    pub fn working_directory(&self) -> &Path {
+        &self.working_directory
+    }
+    pub fn environment(&self) -> &BTreeMap<String, String> {
+        &self.environment
+    }
     pub fn label(&self) -> &str {
         &self.label
     }
@@ -37,8 +57,15 @@ impl Plan {
         let path = absolute(installed_path)?;
         Ok(vec!["bootstrap".into(), self.domain.clone(), path.into()])
     }
-    pub fn stop_arguments(&self) -> Vec<String> {
-        vec!["bootout".into(), format!("{}/{}", self.domain, self.label)]
+    pub fn stop_arguments(&self, installed_path: &Path) -> Result<Vec<String>, String> {
+        Ok(vec![
+            "bootout".into(),
+            self.domain.clone(),
+            absolute(installed_path)?.into(),
+        ])
+    }
+    pub fn service_target(&self) -> String {
+        format!("{}/{}", self.domain, self.label)
     }
 }
 fn absolute(path: &Path) -> Result<&str, String> {
@@ -116,6 +143,13 @@ pub fn render(def: &Definition) -> Result<Plan, String> {
         label: def.label.clone(),
         domain,
         plist,
+        domain_identity: def.mode.clone(),
+        executable: def.executable.clone(),
+        arguments: std::iter::once(absolute(&def.executable)?.to_owned())
+            .chain(def.arguments.clone())
+            .collect(),
+        working_directory: def.working_directory.clone(),
+        environment: def.environment.clone(),
     })
 }
 
@@ -143,8 +177,8 @@ mod tests {
             ["bootstrap", "gui/501", "/tmp/example.plist"]
         );
         assert_eq!(
-            p.stop_arguments(),
-            ["bootout", "gui/501/org.example.worker"]
+            p.stop_arguments(Path::new("/tmp/example.plist")).unwrap(),
+            ["bootout", "gui/501", "/tmp/example.plist"]
         );
         assert_eq!(p.plist(), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key><string>org.example.worker</string><key>ProgramArguments</key><array><string>/opt/example/bin/runner</string><string>a&lt;&amp;&gt;&quot;&apos;</string></array><key>WorkingDirectory</key><string>/var/example</string><key>EnvironmentVariables</key><dict><key>PATH</key><string>/usr/bin</string></dict><key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n");
         assert!(p.start_arguments(Path::new("relative")).is_err());
@@ -157,7 +191,10 @@ mod tests {
         assert!(p
             .plist()
             .contains("<key>UserName</key><string>worker_user-2</string>"));
-        assert_eq!(p.stop_arguments(), ["bootout", "system/org.example.worker"]);
+        assert_eq!(
+            p.stop_arguments(Path::new("/tmp/example.plist")).unwrap(),
+            ["bootout", "system", "/tmp/example.plist"]
+        );
         assert_eq!(xml("\t\n\r😀").unwrap(), "\t\n\r😀");
     }
     #[test]

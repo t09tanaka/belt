@@ -10,9 +10,15 @@ struct FakeLaunch {
     fail: Vec<usize>,
     unknown: bool,
     loaded: SharedLoaded,
+    locked_root: Option<PathBuf>,
 }
 impl Launcher for FakeLaunch {
     fn launchctl(&mut self, args: &[String]) -> Result<(), LaunchError> {
+        if args[0] == "bootout" {
+            if let Some(root) = &self.locked_root {
+                assert!(lifecycle_is_locked(root));
+            }
+        }
         self.calls.push(args.to_vec());
         if self.fail.contains(&self.calls.len()) {
             return Err(if self.unknown {
@@ -53,6 +59,8 @@ struct FakeWorker {
     fail: bool,
     identities: Vec<WorkerIdentity>,
     replace_on_stop: Option<(SharedLoaded, Loaded)>,
+    mutate_receipt_on_stop: Option<PathBuf>,
+    locked_root: Option<PathBuf>,
 }
 impl WorkerControl for FakeWorker {
     fn request(&mut self, identity: &WorkerIdentity, request: WorkerRequest) -> anyhow::Result<()> {
@@ -60,6 +68,12 @@ impl WorkerControl for FakeWorker {
         self.calls.push(request);
         anyhow::ensure!(!self.fail, "worker unavailable");
         if matches!(request, WorkerRequest::Stop { .. }) {
+            if let Some(root) = &self.locked_root {
+                assert!(lifecycle_is_locked(root));
+            }
+            if let Some(path) = &self.mutate_receipt_on_stop {
+                std::fs::write(path, b"foreign replacement").unwrap();
+            }
             if let Some((loaded, replacement)) = &self.replace_on_stop {
                 *loaded.borrow_mut() = replacement.clone();
             }
@@ -138,7 +152,7 @@ fn lifecycle_is_separate_from_worker_control() {
     );
     assert_eq!(
         m.launcher.calls[1],
-        ["bootout", "gui/501/org.example.worker"]
+        ["bootout", "gui/501", receipt.path().to_str().unwrap()]
     );
     m.remove(&receipt).unwrap();
     assert!(!receipt.path().exists());
@@ -260,6 +274,10 @@ struct FailingFiles {
     fail_remove: bool,
 }
 impl ManagedFiles for FailingFiles {
+    type LifecycleLease = Arc<DirectoryLock>;
+    fn lifecycle_lock(&mut self) -> anyhow::Result<Self::LifecycleLease> {
+        self.inner.lifecycle_lock()
+    }
     fn install(&mut self, p: &Plan) -> Result<Receipt, InstallStartError> {
         if self.fail_install {
             return Err(InstallStartError::without_receipt(anyhow::anyhow!(
@@ -348,4 +366,332 @@ fn worker_ack_cannot_authorize_bootout_after_loaded_job_replacement() {
     assert_eq!(m.launcher.calls.len(), 1);
     assert_eq!(*m.launcher.loaded.borrow(), foreign);
     m.files.verify(&r).unwrap();
+}
+
+fn lifecycle_is_locked(root: &Path) -> bool {
+    use std::os::fd::AsRawFd;
+    let file = File::open(root).unwrap();
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result == 0 {
+        unsafe {
+            libc::flock(file.as_raw_fd(), libc::LOCK_UN);
+        }
+        false
+    } else {
+        assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+        true
+    }
+}
+#[test]
+fn lifecycle_lease_covers_nested_checks_worker_ack_and_path_bootout() {
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let mut m = manager(tmp.path());
+    let p = plan();
+    let receipt = m.install_and_start(&p).unwrap();
+    m.worker.locked_root = Some(tmp.path().into());
+    m.launcher.locked_root = Some(tmp.path().into());
+    m.stop(&p, &receipt, false).unwrap();
+    assert!(!lifecycle_is_locked(tmp.path()));
+    assert_eq!(
+        m.launcher.calls[1],
+        ["bootout", "gui/501", receipt.path().to_str().unwrap()]
+    );
+}
+#[test]
+fn receipt_change_during_ack_prevents_bootout() {
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let mut m = manager(tmp.path());
+    let p = plan();
+    let receipt = m.install_and_start(&p).unwrap();
+    m.worker.mutate_receipt_on_stop = Some(receipt.path().into());
+    assert!(m
+        .stop(&p, &receipt, false)
+        .unwrap_err()
+        .to_string()
+        .contains("reconciliation required"));
+    assert_eq!(m.worker.calls.len(), 1);
+    assert_eq!(m.launcher.calls.len(), 1);
+    assert!(receipt.path().exists());
+    assert!(!lifecycle_is_locked(tmp.path()));
+}
+#[derive(Default)]
+struct FakeRunner {
+    calls: Rc<RefCell<Vec<Vec<String>>>>,
+    outputs: std::collections::VecDeque<Result<CommandOutput, String>>,
+}
+impl CommandRunner for FakeRunner {
+    fn run(&mut self, arguments: &[String]) -> Result<CommandOutput, String> {
+        self.calls.borrow_mut().push(arguments.to_vec());
+        self.outputs.pop_front().expect("unexpected command")
+    }
+}
+struct FakeAccounts(Option<Account>);
+impl AccountLookup for FakeAccounts {
+    fn lookup(&mut self, _: &str) -> Result<Option<Account>, String> {
+        Ok(self.0.clone())
+    }
+}
+fn native_output(plan: &Plan, receipt: &Receipt) -> CommandOutput {
+    let target = plan.service_target();
+    let domain = target.rsplit_once('/').unwrap().0;
+    let mut fields = format!(
+        "{target} = {{\n\tpath = {}\n\tprogram = {}\n\targuments = {{\n",
+        receipt.path().display(),
+        plan.executable().display()
+    );
+    for arg in plan.arguments() {
+        fields.push_str(&format!("\t\t{arg}\n"));
+    }
+    fields.push_str("\t}\n");
+    match plan.mode() {
+        policy::Mode::User { .. } => {
+            fields.push_str(&format!("\tdomain = {domain} [100001]\n\tasid = 100001\n"))
+        }
+        policy::Mode::SystemUser { username, .. } => {
+            fields.push_str(&format!("\tdomain = system\n\tusername = {username}\n"))
+        }
+    }
+    fields.push_str("}\n");
+    CommandOutput {
+        success: true,
+        stdout: fields.into_bytes(),
+        stderr: Vec::new(),
+    }
+}
+#[test]
+fn native_verifier_queries_exact_target_and_refuses_unconfirmed_observations() {
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let p = plan();
+    let mut files = DirectoryFiles::open(tmp.path()).unwrap();
+    let receipt = files.install(&p).unwrap();
+    let mut native = NativeLauncher::with_accounts(
+        FakeRunner {
+            outputs: [Ok(native_output(&p, &receipt))].into(),
+            ..Default::default()
+        },
+        FakeAccounts(None),
+    );
+    native.verify_loaded(&p, &receipt).unwrap();
+    // Fake runner asserts exact target and bounded error behavior, never runs OS commands.
+    let mut bads = vec![
+        Err("deadline".into()),
+        Ok(CommandOutput {
+            success: false,
+            ..native_output(&p, &receipt)
+        }),
+        Ok(CommandOutput {
+            stderr: b"diagnostic".to_vec(),
+            ..native_output(&p, &receipt)
+        }),
+        Ok(CommandOutput {
+            stdout: vec![b'x'; native::OUTPUT_LIMIT + 1],
+            ..native_output(&p, &receipt)
+        }),
+        Ok(CommandOutput {
+            stdout: b"unknown format\n".to_vec(),
+            ..native_output(&p, &receipt)
+        }),
+    ];
+    for bad in bads.drain(..) {
+        let mut native = NativeLauncher::with_accounts(
+            FakeRunner {
+                outputs: [bad].into(),
+                ..Default::default()
+            },
+            FakeAccounts(None),
+        );
+        assert!(matches!(
+            native.verify_loaded(&p, &receipt),
+            Err(LaunchError::NotApplied(_))
+        ));
+    }
+    let mut system = policy::Definition {
+        label: "org.example.system".into(),
+        mode: policy::Mode::User { uid: 501 },
+        executable: "/opt/example/runner".into(),
+        arguments: vec![
+            "daemon".into(),
+            "--input".into(),
+            "/var/example/private/input.json".into(),
+        ],
+        environment: BTreeMap::new(),
+        working_directory: "/var/example".into(),
+    };
+    system.mode = policy::Mode::SystemUser {
+        uid: 502,
+        username: "worker_user".into(),
+    };
+    system.environment.clear();
+    let system = policy::render(&system).unwrap();
+    for account in [
+        None,
+        Some(Account {
+            name: "worker_user".into(),
+            uid: 501,
+        }),
+        Some(Account {
+            name: "other".into(),
+            uid: 502,
+        }),
+    ] {
+        let mut native = NativeLauncher::with_accounts(
+            FakeRunner {
+                outputs: [Ok(native_output(&system, &receipt))].into(),
+                ..Default::default()
+            },
+            FakeAccounts(account),
+        );
+        assert!(native.verify_loaded(&system, &receipt).is_err());
+    }
+    let mut native = NativeLauncher::with_accounts(
+        FakeRunner {
+            outputs: [Ok(native_output(&system, &receipt))].into(),
+            ..Default::default()
+        },
+        FakeAccounts(Some(Account {
+            name: "worker_user".into(),
+            uid: 502,
+        })),
+    );
+    native.verify_loaded(&system, &receipt).unwrap();
+}
+
+#[test]
+fn native_stop_observes_before_and_after_ack_and_has_no_label_fallback() {
+    for scenario in 0..3 {
+        let changed = scenario == 1;
+        let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+        let p = plan();
+        let mut files = DirectoryFiles::open(tmp.path()).unwrap();
+        let receipt = files.install(&p).unwrap();
+        let mut after = native_output(&p, &receipt);
+        if changed {
+            after.stdout = String::from_utf8(after.stdout)
+                .unwrap()
+                .replace("program = /opt/example/runner", "program = /foreign")
+                .into_bytes();
+        }
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let runner = FakeRunner {
+            calls: calls.clone(),
+            outputs: [
+                Ok(native_output(&p, &receipt)),
+                Ok(after),
+                if scenario == 2 {
+                    Err("bootout failed".into())
+                } else {
+                    Ok(CommandOutput {
+                        success: true,
+                        stdout: Vec::new(),
+                        stderr: Vec::new(),
+                    })
+                },
+            ]
+            .into(),
+        };
+        let mut manager = Manager {
+            identity: identity(),
+            files,
+            launcher: NativeLauncher::with_accounts(runner, FakeAccounts(None)),
+            worker: FakeWorker::default(),
+        };
+        assert_eq!(manager.stop(&p, &receipt, false).is_err(), scenario != 0);
+        let commands = calls.borrow();
+        assert_eq!(commands[0], ["print", "gui/501/org.example.worker"]);
+        assert_eq!(commands[1], commands[0]);
+        assert_eq!(commands.len(), if changed { 2 } else { 3 });
+        if !changed {
+            assert_eq!(
+                commands[2],
+                ["bootout", "gui/501", receipt.path().to_str().unwrap()]
+            );
+        }
+        assert_eq!(manager.worker.calls.len(), 1);
+    }
+}
+#[test]
+fn native_execution_failure_is_uncertain_and_account_lookup_failure_refuses_stop() {
+    struct Unavailable;
+    impl AccountLookup for Unavailable {
+        fn lookup(&mut self, _: &str) -> Result<Option<Account>, String> {
+            Err("unavailable".into())
+        }
+    }
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let p = plan();
+    let mut files = DirectoryFiles::open(tmp.path()).unwrap();
+    let receipt = files.install(&p).unwrap();
+    let mut output = native_output(&p, &receipt);
+    output.stdout = String::from_utf8(output.stdout)
+        .unwrap()
+        .replace("\tdomain =", "\tusername = worker_user\n\tdomain =")
+        .into_bytes();
+    let mut native = NativeLauncher::with_accounts(
+        FakeRunner {
+            outputs: [Ok(output)].into(),
+            ..Default::default()
+        },
+        Unavailable,
+    );
+    assert!(native.verify_loaded(&p, &receipt).is_err());
+    for output in [
+        Err("spawn".into()),
+        Ok(CommandOutput {
+            success: false,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        }),
+        Ok(CommandOutput {
+            success: true,
+            stdout: Vec::new(),
+            stderr: vec![0; native::OUTPUT_LIMIT + 1],
+        }),
+        Ok(CommandOutput {
+            success: true,
+            stdout: vec![0; native::OUTPUT_LIMIT + 1],
+            stderr: Vec::new(),
+        }),
+    ] {
+        let mut native = NativeLauncher::new(FakeRunner {
+            outputs: [output].into(),
+            ..Default::default()
+        });
+        assert!(matches!(
+            native.launchctl(&["bootstrap".into()]),
+            Err(LaunchError::OutcomeUnknown(_))
+        ));
+    }
+}
+
+#[test]
+fn unparseable_native_observation_prevents_worker_stop() {
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let p = plan();
+    let mut files = DirectoryFiles::open(tmp.path()).unwrap();
+    let receipt = files.install(&p).unwrap();
+    let calls = Rc::new(RefCell::new(Vec::new()));
+    let runner = FakeRunner {
+        calls: calls.clone(),
+        outputs: [Ok(CommandOutput {
+            success: true,
+            stdout: b"unknown layout\n".to_vec(),
+            stderr: Vec::new(),
+        })]
+        .into(),
+    };
+    let mut manager = Manager {
+        identity: identity(),
+        files,
+        launcher: NativeLauncher::with_accounts(runner, FakeAccounts(None)),
+        worker: FakeWorker::default(),
+    };
+    assert!(manager.stop(&p, &receipt, false).is_err());
+    assert!(manager.worker.calls.is_empty());
+    assert_eq!(
+        calls.borrow().as_slice(),
+        [vec![
+            "print".to_owned(),
+            "gui/501/org.example.worker".to_owned()
+        ]]
+    );
 }

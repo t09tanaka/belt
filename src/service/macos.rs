@@ -3,13 +3,20 @@
 //! `Plan` accepts argv from a runtime bootstrap builder; never put credentials in
 //! argv/environment. Supply private configuration file references instead. This
 //! module does not equate launchd registration with worker readiness or drain.
+//! Lifecycle leases coordinate cooperating writers. Same-UID/root actors and
+//! the service root are trusted; loaded observations and path bootout are not
+//! an atomic identity-conditioned removal and do not protect against external
+//! privileged replacement between the last observation and bootout.
 pub mod policy;
+use anyhow::Context;
 use policy::Plan;
 use sha2::{Digest, Sha256};
+use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Weak};
 
 /// Separate from launchd operations: implementations must acknowledge actual
 /// worker state. Failure must remain an error, never a simulated success.
@@ -45,27 +52,12 @@ pub trait Launcher {
     /// receipt alone is insufficient. Must reject missing/foreign/unknown jobs.
     fn verify_loaded(&mut self, plan: &Plan, receipt: &Receipt) -> Result<(), LaunchError>;
 }
-/// Production backend, provided for composition only. Tests inject recording fakes.
-pub struct NativeLauncher;
-impl Launcher for NativeLauncher {
-    fn verify_loaded(&mut self, _: &Plan, _: &Receipt) -> Result<(), LaunchError> {
-        Err(LaunchError::NotApplied(
-            "native loaded-job identity verification is not wired; stop requires reconciliation"
-                .into(),
-        ))
-    }
-    fn launchctl(&mut self, arguments: &[String]) -> Result<(), LaunchError> {
-        let status = std::process::Command::new("/bin/launchctl")
-            .args(arguments)
-            .env_clear()
-            .status()
-            .map_err(|e| LaunchError::OutcomeUnknown(e.to_string()))?;
-        if !status.success() {
-            return Err(LaunchError::OutcomeUnknown(format!("exit status {status}")));
-        }
-        Ok(())
-    }
-}
+mod native;
+pub mod observe;
+pub use native::{
+    Account, AccountLookup, CommandOutput, CommandRunner, NativeAccounts, NativeLauncher,
+    NativeRunner,
+};
 /// Evidence returned by the store; persist only in caller-owned private state.
 /// Never reconstruct or adopt evidence from an arbitrary existing plist.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -82,6 +74,9 @@ impl Receipt {
     }
 }
 pub trait ManagedFiles {
+    type LifecycleLease;
+    /// Hold across a complete cooperative install/start/stop/remove operation.
+    fn lifecycle_lock(&mut self) -> anyhow::Result<Self::LifecycleLease>;
     fn install(&mut self, plan: &Plan) -> Result<Receipt, InstallStartError>;
     fn verify(&mut self, receipt: &Receipt) -> anyhow::Result<()>;
     fn remove(&mut self, receipt: &Receipt) -> anyhow::Result<()>;
@@ -94,6 +89,7 @@ pub trait ManagedFiles {
 pub struct DirectoryFiles {
     root: PathBuf,
     directory: File,
+    lease: RefCell<Weak<DirectoryLock>>,
 }
 impl DirectoryFiles {
     pub fn open(root: &Path) -> anyhow::Result<Self> {
@@ -122,9 +118,10 @@ impl DirectoryFiles {
         Ok(Self {
             root: root.into(),
             directory,
+            lease: RefCell::new(Weak::new()),
         })
     }
-    fn lock(&self) -> anyhow::Result<Lock> {
+    fn lock(&self) -> anyhow::Result<Arc<DirectoryLock>> {
         use std::os::fd::AsRawFd;
         let file = self.directory.try_clone()?;
         // A root can be renamed after construction; do not operate through a
@@ -139,10 +136,15 @@ impl DirectoryFiles {
                 && current.uid() == unsafe { libc::geteuid() },
             "service root replaced"
         );
+        if let Some(lease) = self.lease.borrow().upgrade() {
+            return Ok(lease);
+        }
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
             return Err(io::Error::last_os_error().into());
         }
-        Ok(Lock(file))
+        let lease = Arc::new(DirectoryLock(file));
+        *self.lease.borrow_mut() = Arc::downgrade(&lease);
+        Ok(lease)
     }
     fn read(&self, path: &Path) -> anyhow::Result<(Receipt, Vec<u8>)> {
         anyhow::ensure!(
@@ -228,8 +230,8 @@ impl DirectoryFiles {
     }
 }
 
-struct Lock(File);
-impl Drop for Lock {
+pub struct DirectoryLock(File);
+impl Drop for DirectoryLock {
     fn drop(&mut self) {
         use std::os::fd::AsRawFd;
         unsafe {
@@ -238,6 +240,10 @@ impl Drop for Lock {
     }
 }
 impl ManagedFiles for DirectoryFiles {
+    type LifecycleLease = Arc<DirectoryLock>;
+    fn lifecycle_lock(&mut self) -> anyhow::Result<Self::LifecycleLease> {
+        self.lock()
+    }
     fn install(&mut self, plan: &Plan) -> Result<Receipt, InstallStartError> {
         self.install_with(plan, File::sync_all, |files, receipt| {
             anyhow::ensure!(
@@ -292,10 +298,15 @@ pub struct Manager<F, L, W> {
 }
 impl<F: ManagedFiles, L: Launcher, W: WorkerControl> Manager<F, L, W> {
     pub fn install(&mut self, plan: &Plan) -> Result<Receipt, InstallStartError> {
+        let _lease = self
+            .files
+            .lifecycle_lock()
+            .map_err(InstallStartError::without_receipt)?;
         self.files.install(plan)
     }
     /// Idempotence requires explicit ownership evidence, never file adoption.
     pub fn ensure_installed(&mut self, plan: &Plan, receipt: &Receipt) -> anyhow::Result<()> {
+        let _lease = self.files.lifecycle_lock()?;
         self.files.verify(receipt)?;
         anyhow::ensure!(
             receipt.path.file_name().and_then(|n| n.to_str()) == Some(plan.filename().as_str())
@@ -305,6 +316,7 @@ impl<F: ManagedFiles, L: Launcher, W: WorkerControl> Manager<F, L, W> {
         Ok(())
     }
     pub fn start(&mut self, plan: &Plan, receipt: &Receipt) -> anyhow::Result<()> {
+        let _lease = self.files.lifecycle_lock()?;
         self.ensure_installed(plan, receipt)?;
         Ok(self.launcher.launchctl(
             &plan
@@ -317,6 +329,10 @@ impl<F: ManagedFiles, L: Launcher, W: WorkerControl> Manager<F, L, W> {
     /// reconciliation. Never bootout after an error: the label may belong to
     /// an existing, unrelated job that rejected our bootstrap.
     pub fn install_and_start(&mut self, plan: &Plan) -> Result<Receipt, InstallStartError> {
+        let _lease = self
+            .files
+            .lifecycle_lock()
+            .map_err(InstallStartError::without_receipt)?;
         let receipt = self.install(plan)?;
         let args = self
             .ensure_installed(plan, &receipt)
@@ -358,12 +374,22 @@ impl<F: ManagedFiles, L: Launcher, W: WorkerControl> Manager<F, L, W> {
         receipt: &Receipt,
         cancel_running: bool,
     ) -> anyhow::Result<()> {
+        let _lease = self.files.lifecycle_lock()?;
         self.ensure_installed(plan, receipt)?;
         self.launcher.verify_loaded(plan, receipt)?;
         self.worker
             .request(&self.identity, WorkerRequest::Stop { cancel_running })?;
-        self.launcher.verify_loaded(plan, receipt)?;
-        Ok(self.launcher.launchctl(&plan.stop_arguments())?)
+        self.ensure_installed(plan, receipt).context(
+            "worker acknowledged stop; managed-file reconciliation required; bootout not applied",
+        )?;
+        self.launcher.verify_loaded(plan, receipt).context(
+            "worker acknowledged stop; loaded-job reconciliation required; bootout not applied",
+        )?;
+        Ok(self.launcher.launchctl(
+            &plan
+                .stop_arguments(receipt.path())
+                .map_err(anyhow::Error::msg)?,
+        )?)
     }
     pub fn drain(&mut self) -> anyhow::Result<()> {
         self.worker.request(&self.identity, WorkerRequest::Drain)
@@ -374,6 +400,7 @@ impl<F: ManagedFiles, L: Launcher, W: WorkerControl> Manager<F, L, W> {
     /// Caller must first stop/confirm the service; removing a plist alone does
     /// not stop launchd or cancel worker attempts.
     pub fn remove(&mut self, receipt: &Receipt) -> anyhow::Result<()> {
+        let _lease = self.files.lifecycle_lock()?;
         self.files.remove(receipt)
     }
 }
