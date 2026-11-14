@@ -123,14 +123,16 @@ impl ResolvedConfig {
         agent.term_grace_ms = settings.term_grace_ms;
         agent.log_limit_bytes = settings.log_limit_bytes;
         agent.retention_ms = settings.retention_ms;
-        agent.profile = self
-            .profile
-            .value
-            .clone()
-            .unwrap_or_else(|| "default".into());
+        let profile = crate::toolchain::profile::Profile::load(&inputs.state_dir, &inputs.env)
+            .map_err(|e| super::ConfigError::Invalid { problems: vec![e] })?;
+        agent.profile = profile.name().into();
+        agent.profile_fingerprint = profile.report().profile_fingerprint;
+        let env = profile.environment().clone();
+        agent.capability_profile = Some(Arc::new(profile));
         let mut setup = SetupConfig::new(inputs.state_dir, inputs.worker_id, inputs.supervisor_exe);
-        setup.env = inputs.env.clone();
-        setup.profile = agent.profile.clone();
+        setup.env = env.clone();
+        setup.profile_fingerprint = Some(agent.profile_fingerprint.clone());
+        setup.profile = format!("{}:{}", agent.profile, agent.profile_fingerprint);
         setup.traffic_state_dir = agent.traffic_state_dir.clone();
         setup.traffic_config = agent.traffic_config.clone();
         setup.lease_ms = settings.coordinator.lease_ms;
@@ -142,7 +144,7 @@ impl ResolvedConfig {
         Ok(WorkerRuntime {
             agent,
             setup,
-            env: inputs.env,
+            env,
             cluster_key_path: inputs.cluster_key_path,
         })
     }

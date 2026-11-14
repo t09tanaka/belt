@@ -14,7 +14,11 @@ pub const PROTOCOL_VERSIONS: &[u32] = &[1];
 
 /// Features this build implements. `blob_resume` is offset and digest resume of
 /// blob transfer, `log_resume` the offset and sequence resume of logs.
-pub const SUPPORTED_FEATURES: &[&str] = &["blob_resume", "log_resume"];
+pub const SUPPORTED_FEATURES: &[&str] = &[
+    "blob_resume",
+    "log_resume",
+    crate::toolchain::capability::FEATURE,
+];
 
 /// What one side offers and requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +132,7 @@ pub fn verify_response(
 /// What a worker reports about itself in `hello`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerIdentity {
+    pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     pub worker_id: WorkerId,
     pub worker_boot_id: WorkerBootId,
     pub agent_epoch: AgentEpoch,
@@ -140,6 +145,16 @@ pub struct WorkerIdentity {
 impl WorkerIdentity {
     pub fn response(&self, cluster_id: &ClusterId, negotiated: &Negotiated) -> HelloResponse {
         HelloResponse {
+            capabilities: negotiated
+                .features
+                .iter()
+                .any(|v| v == crate::toolchain::capability::FEATURE)
+                .then(|| self.capabilities.clone())
+                .flatten()
+                .map(|mut report| {
+                    report.features.retain(|v| negotiated.features.contains(v));
+                    report
+                }),
             schema_version: SchemaVersion::CURRENT,
             cluster_id: cluster_id.clone(),
             protocol_version: negotiated.version,
@@ -186,6 +201,7 @@ mod tests {
 
     fn identity() -> WorkerIdentity {
         WorkerIdentity {
+            capabilities: None,
             worker_id: WorkerId::parse("w1").unwrap(),
             worker_boot_id: WorkerBootId::parse("boot1").unwrap(),
             agent_epoch: AgentEpoch(4),

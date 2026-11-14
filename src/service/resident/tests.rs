@@ -27,6 +27,7 @@ impl WorkerLink for Slow {
             }
             match request {
                 crate::wire::Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
+                    capabilities: None,
                     schema_version: SchemaVersion::CURRENT,
                     worker_id: WorkerId::parse("local").unwrap(),
                     worker_boot_id: self.active.worker_boot_id.clone(),
@@ -144,6 +145,7 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
         let task = TaskId::generate();
         let attempt = AttemptId::generate();
         let payload = AttemptPayload {
+            requirements: Default::default(),
             in_place: false,
             setup: None,
             run_id: run.clone(),
@@ -445,6 +447,7 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
             tasks: vec![(
                 TaskId::generate(),
                 TaskSpec {
+                    requirements: Default::default(),
                     in_place: false,
                     setup: None,
                     plan_digest: Digest::of_bytes(b"plan"),
@@ -639,6 +642,7 @@ async fn delivery_resident(root: &Path) -> Resident {
 }
 fn delivery_spec(digest: Digest, secrets: bool) -> TaskSpec {
     TaskSpec {
+        requirements: Default::default(),
         in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
@@ -781,6 +785,7 @@ async fn per_worker_secret_jobs_route_exact_attempts_and_resend_after_session_re
         )
         .unwrap();
         let payload = AttemptPayload {
+            requirements: Default::default(),
             in_place: false,
             setup: None,
             run_id: run,
@@ -1357,4 +1362,56 @@ async fn offline_submit_publishes_reader_pin_before_immediate_logs_follow() {
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn capability_private_ipc_prevents_old_owner_from_discarding_requirements() {
+    use crate::toolchain::capability::ExecutionRequirements;
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("old-owner.sock");
+    let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+    let client = Client {
+        socket,
+        cluster_id: ClusterId::generate(),
+        owner_token: "a".repeat(64),
+    };
+    let server = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request: super::Request = read_message(&mut stream).await.unwrap();
+        assert_eq!(request.schema_version, 3);
+        let Operation::SubmitCaptured { tasks, .. } = request.operation else {
+            panic!()
+        };
+        assert!(!tasks[0].1.requirements.is_empty());
+        write_message(
+            &mut stream,
+            &Reply::Error {
+                message: "old owner supports only private IPC v2".into(),
+            },
+        )
+        .await
+        .unwrap();
+    });
+    let mut task = delivery_spec(Digest::of_bytes(b"m"), false);
+    task.requirements =
+        ExecutionRequirements::parse(Some("node22".into()), &["node".into()]).unwrap();
+    let op = Operation::SubmitCaptured {
+        run_id: RunId::generate(),
+        source_id: SourceId::generate(),
+        tasks: vec![(TaskId::generate(), task)],
+    };
+    assert!(op.requires_capabilities());
+    let reply = client.request(op).await.unwrap();
+    assert!(matches!(reply, Reply::Error { .. }));
+    server.await.unwrap();
+    assert!(!Operation::Ping.requires_capabilities());
+    assert!(!Operation::Submit {
+        run_id: RunId::generate(),
+        source_id: SourceId::generate(),
+        tasks: vec![(
+            TaskId::generate(),
+            delivery_spec(Digest::of_bytes(b"m"), false)
+        )]
+    }
+    .requires_capabilities());
 }

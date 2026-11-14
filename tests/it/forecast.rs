@@ -109,6 +109,7 @@ fn request(target: WorkloadPlan, pending: Vec<WorkloadPlan>, epoch: u64) -> Fore
 fn accept(store: &WorkerStore, attempt: &AttemptId, node: &str) -> AcceptedAttempt {
     let d = Digest::of_bytes(attempt.as_str().as_bytes());
     let payload = AttemptPayload {
+        requirements: Default::default(),
         in_place: false,
         setup: None,
         run_id: RunId::generate(),

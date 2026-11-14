@@ -94,6 +94,8 @@ pub enum CiSub {
 
 #[derive(Debug, Args)]
 pub struct ExecArgs {
+    #[command(flatten)]
+    pub execution: ExecutionArgs,
     /// Run in the current directory instead of a snapshot.
     #[arg(long)]
     pub in_place: bool,
@@ -103,8 +105,39 @@ pub struct ExecArgs {
 
 #[derive(Debug, Args)]
 pub struct SubmitArgs {
+    #[command(flatten)]
+    pub execution: ExecutionArgs,
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
+}
+
+/// Placement selectors never change the worker's own active environment.
+#[derive(Debug, Args)]
+pub struct ExecutionArgs {
+    #[arg(long)]
+    pub profile: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    pub requires: Vec<String>,
+}
+impl ExecutionArgs {
+    fn apply(
+        &self,
+        mut context: crate::service::context::Context,
+    ) -> crate::service::context::Context {
+        if let Some(profile) = &self.profile {
+            context.config.profile = crate::config::Value {
+                value: Some(profile.clone()),
+                origin: crate::config::Origin::Cli,
+            };
+        }
+        if !self.requires.is_empty() {
+            context.config.requires = crate::config::Value {
+                value: self.requires.clone(),
+                origin: crate::config::Origin::Cli,
+            };
+        }
+        context
+    }
 }
 
 /// Metadata listing, ordered by canonical identifier. Cursors are exclusive.
@@ -302,7 +335,9 @@ pub fn run(cli: Cli) -> i32 {
                 .collect();
             let cwd = std::env::current_dir()
                 .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
-            let context = crate::service::context::Context::discover(env, cwd)?;
+            let context = args
+                .execution
+                .apply(crate::service::context::Context::discover(env, cwd)?);
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -381,7 +416,11 @@ fn run_control(cli: &Cli) -> i32 {
             let result = match &cli.command {
                 Command::Exec(args) => {
                     crate::service::control::exec_mode(
-                        crate::service::context::Context::load(env, cwd, spec.clone())?,
+                        args.execution.apply(crate::service::context::Context::load(
+                            env,
+                            cwd,
+                            spec.clone(),
+                        )?),
                         args.command.clone(),
                         args.in_place,
                         &mut receiver,

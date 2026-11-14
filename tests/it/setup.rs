@@ -194,6 +194,7 @@ impl Fx {
     fn payload_of(&self, run: &RunId, spec: &SetupSpec) -> AttemptPayload {
         let d = Digest::of_bytes(b"the source");
         AttemptPayload {
+            requirements: Default::default(),
             in_place: false,
             run_id: run.clone(),
             task_id: TaskId::generate(),
@@ -1342,4 +1343,48 @@ fn a_run_scope_template_goes_when_its_run_has_left() {
     std::thread::sleep(Duration::from_millis(5));
     f.setups.evict();
     assert_eq!(f.template_dirs().len(), 1);
+}
+
+#[test]
+fn capability_profile_setup_uses_actual_path_shell_and_fingerprint() {
+    let f = fx_with(|cfg, root| {
+        let bin = root.join("profile-bin");
+        std::fs::create_dir(&bin).unwrap();
+        crate::common::write_executable(&bin.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
+        let shell = bin.join("sh");
+        let marker = root.join("selected-shell");
+        crate::common::write_executable(
+            &shell,
+            &format!(
+                "#!/bin/sh\nprintf selected > {:?}\nexec /bin/sh \"$@\"\n",
+                marker
+            ),
+        );
+        cfg.env
+            .insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
+        cfg.env
+            .insert("SHELL".into(), shell.to_str().unwrap().into());
+        cfg.profile_fingerprint = Some(Digest::of_bytes(b"node22 actual tools"));
+        cfg.profile = format!("node22:{}", cfg.profile_fingerprint.as_ref().unwrap());
+    });
+    let setup = spec(vec![step(
+        "install",
+        "node --version > node-version; printf '%s' \"$SHELL\" > shell-path",
+    )]);
+    let p = f.payload(&setup);
+    let (a, ws) = f.consumer();
+    let (skip, note) = f.done(&a, &p, &ws);
+    assert_eq!(skip, vec!["install"]);
+    assert!(note.is_none(), "{note:?}");
+    assert_eq!(
+        std::fs::read_to_string(ws.root.join("node-version")).unwrap(),
+        "v22.0.0\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(f.path("selected-shell")).unwrap(),
+        "selected"
+    );
+    assert!(std::fs::read_to_string(ws.root.join("shell-path"))
+        .unwrap()
+        .ends_with("/profile-bin/sh"));
 }

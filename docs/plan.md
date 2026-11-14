@@ -238,3 +238,9 @@ root/祖先 FD と NOFOLLOW による unlink、競合対象の pending 再試行
 
 追加調査で enqueue の run INSERT が create_run の durable pin 準備を迂回していたため、両公開経路を確認し、enqueue も既存 blocking wrapper 内・DB transaction 前に pin を作成/fsync するよう修正した。
 pin 準備失敗時に run/task が公開されない回帰と、実 resident IPC の submit を全 worker offline で受理した直後に logs 共通 observer が pending を返し follow を継続する回帰が成功した。追加修正後の strict clippy all-targets/all-features も成功。独立レビューの resolved 確認と全 CI は引き続き未完了。
+
+### S15 worker capabilities の接続
+
+worker-local `profiles.toml` の active profile、実際の PATH での固定 tool probe、durable な execution requirements、forecast 前の候補除外と worker の独立 admission を接続する。project/CLI profile は配置 selector であり worker の環境を変更しない。profile fingerprint は setup/template、artifact と TTC command history に使い、受理時の実 identity は worker 内の記録へ固定する。tool drift は report を無効にし、再検査に通るまで新規受理・準備を拒否する。旧 peer は制約なし task のみ互換とする。
+
+この接続では S20 の version-file readers・baseline・typed match・nodenv/rustup/mise/fvm/corepack の detect/resolve/install/activate、S21 の diff/sync/doctor、S22/S23 の実機 service 環境 acceptance は完了しない。profile の nonempty `secret_refs` は安全な provider が未接続のため明示 unsupported とする。adapter/installable/secret provider を成功として申告しない。Flutter 標準 launcher と Dart bootstrap wrapper は `--version` でも SDK を導入し得るため、この slice では Unknown とし、S20 の noninstalling snapshot/native probe を必須残件とする（native Dart は測定する）。optional tool は固定された最大 14 fixed calls を各 300ms 以内で probe する。要求された tool のみの lazy probe/cache、installed-version inventory と private tool-root adapters は後続の必須実装へ引き継ぐ。

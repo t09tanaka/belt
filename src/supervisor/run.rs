@@ -773,7 +773,10 @@ impl Control<'_> {
             label: None,
             weight: node.weight,
             front: false,
-            key: None,
+            key: spec
+                .profile_fingerprint
+                .as_ref()
+                .map(|p| format!("rtr-profile:{p}")),
             argv: node.argv.clone(),
             cwd: node.cwd.clone(),
             env: Some(node.env.clone()),

@@ -21,6 +21,7 @@ impl WorkerLink for Silent {
 
 fn spec() -> TaskSpec {
     TaskSpec {
+        requirements: Default::default(),
         in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
