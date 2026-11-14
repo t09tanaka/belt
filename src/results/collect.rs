@@ -444,10 +444,18 @@ impl Collector {
     ) -> Result<End> {
         let mut pinned = self.clone();
         let attempt = c.record.attempt_id.clone();
-        pinned.pin = Some(Arc::new(
-            self.db(move |store| store.result_writer_pin(&attempt))
-                .await?,
-        ));
+        pinned.pin = match self
+            .db(move |store| store.result_writer_pin(&attempt))
+            .await
+        {
+            Ok(pin) => Some(Arc::new(pin)),
+            Err(CollectError::Storage(StorageError::Io(e)))
+                if e.kind() == std::io::ErrorKind::WouldBlock =>
+            {
+                return Ok(End::Pending)
+            }
+            Err(e) => return Err(e),
+        };
         pinned.one_pinned(link, c, deadline).await
     }
     async fn one_pinned(
@@ -1031,10 +1039,19 @@ impl Collector {
             };
             let mut pinned = self.clone();
             let attempt = a.clone();
-            pinned.pin = Some(Arc::new(
-                self.db(move |store| store.result_writer_pin(&attempt))
-                    .await?,
-            ));
+            pinned.pin = match self
+                .db(move |store| store.result_writer_pin(&attempt))
+                .await
+            {
+                Ok(pin) => Some(Arc::new(pin)),
+                Err(CollectError::Storage(StorageError::Io(e)))
+                    if e.kind() == std::io::ErrorKind::WouldBlock =>
+                {
+                    report.pending.push(a);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
             let mut retry = false;
             for (index, stream) in [LogStream::Stdout, LogStream::Stderr]
                 .into_iter()

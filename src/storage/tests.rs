@@ -5186,3 +5186,104 @@ fn result_retention_keeps_unknown_unacked_open_and_pinned_references() {
     assert!(p.clock_held);
     assert_eq!(p.removed, 0);
 }
+
+#[test]
+fn result_gc_run_selection_is_indexed_and_independent_of_task_facts() {
+    let f = fx();
+    let run = f.run.to_string();
+    f.store
+        .db
+        .write(move |tx| {
+            for _ in 0..2000 {
+                tx.execute(
+                    "INSERT INTO task(task_id,run_id,spec_json,created_at_ms) VALUES(?1,?2,'{}',1)",
+                    rusqlite::params![TaskId::generate().to_string(), run],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        f.store.result_gc_next_run(None).unwrap(),
+        Some(f.run.clone())
+    );
+    assert_eq!(
+        f.store.result_gc_next_run(Some(f.run.clone())).unwrap(),
+        None
+    );
+    let plan = f
+        .store
+        .db
+        .call(|c| {
+            let mut q = c.prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                coordinator::query::RESULT_GC_NEXT_RUN
+            ))?;
+            let rows = q
+                .query_map([""], |r| r.get::<_, String>(3))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    assert!(
+        plan[0].contains("SEARCH run USING COVERING INDEX") && plan[0].contains("run_id>?"),
+        "{plan:?}"
+    );
+    // A facts query would fail; the GC path must never consult task metadata.
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute_batch("ALTER TABLE task RENAME TO unrelated_tasks;")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(f.store.result_gc_next_run(None).unwrap(), Some(f.run));
+}
+
+#[test]
+fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
+    use crate::results::{retention, ResultStore};
+    use std::os::unix::fs::symlink;
+    let f = fx();
+    let a = retention_ready(&f);
+    let files = ResultStore::open(&f._dir.path().join("results")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(outside.path().join("logs")).unwrap();
+    std::fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
+    let locator = ResultStore::logs_locator(&a);
+    f.store
+        .add_blob_ref(&blob("claimed", &a, BlobKind::Log, &locator), 102)
+        .unwrap();
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    f.store
+        .claim_result_page(&guard, &f.run, "", 32, 200, 10, Some("boot".into()), 10)
+        .unwrap();
+    f.store
+        .claim_result_page(&guard, &f.run, "", 32, 210, 20, Some("boot".into()), 10)
+        .unwrap();
+    drop(guard);
+    symlink(outside.path(), files.root().join(a.as_str())).unwrap();
+    assert!(retention::page(&f.store, &files, &mut retention::Cursor::default(), 7).is_err());
+    assert_eq!(
+        std::fs::read(outside.path().join("logs/sentinel")).unwrap(),
+        b"safe"
+    );
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    assert_eq!(
+        f.store
+            .pending_result_page(&guard, &f.run, 32)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(guard);
+    std::fs::remove_file(files.root().join(a.as_str())).unwrap();
+    // The known claim alone permits a missing object to finish successfully.
+    assert_eq!(
+        retention::page(&f.store, &files, &mut retention::Cursor::default(), 7)
+            .unwrap()
+            .deleted,
+        1
+    );
+}

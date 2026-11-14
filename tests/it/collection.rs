@@ -1807,6 +1807,74 @@ async fn a_name_that_is_published_is_not_fetched_over_with_other_bytes() {
 // ------------------------------------------------ durable active prefixes
 
 #[tokio::test]
+async fn gc_pin_contention_skips_live_poll_without_stopping_coordinator() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (run, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| {
+        let job = s.jobs.get_mut(&a).unwrap();
+        job.state = AttemptState::Active;
+        job.out.log = b"live".to_vec();
+    });
+    c.tick().await.unwrap();
+    let guard = c.store().result_gc_guard(&run).unwrap();
+    let report = c.collect(&files, cfg()).await.unwrap();
+    assert!(report.pending.contains(&a));
+    assert!(report.faults.is_empty());
+    // A fresh coordinator tick and metadata request remain usable under GC.
+    c.tick().await.unwrap();
+    assert_eq!(
+        c.store().get_attempt(&a).unwrap().unwrap().state,
+        AttemptState::Active
+    );
+    assert!(c
+        .store()
+        .log_progress(&a, LogStream::Stdout)
+        .unwrap()
+        .is_none());
+    drop(guard);
+    let report = c.collect(&files, cfg()).await.unwrap();
+    assert!(report.faults.is_empty());
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"live");
+}
+
+#[tokio::test]
+async fn gc_pin_contention_leaves_terminal_collection_pending_and_corruption_errors() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (run, _, a) = placed(&fx, &c, vec![]).await;
+    end(
+        &fx,
+        &c,
+        &a,
+        Outcome::Succeeded,
+        Out {
+            has_result: true,
+            log_closed: true,
+            ..Out::default()
+        },
+    )
+    .await;
+    let guard = c.store().result_gc_guard(&run).unwrap();
+    let report = c.collect(&files, cfg()).await.unwrap();
+    assert!(report.pending.contains(&a));
+    assert!(report.faults.is_empty());
+    drop(guard);
+    assert_eq!(collect(&c, &files).await.collected, vec![a]);
+
+    // A malformed pin is an I/O failure, not ordinary GC contention.
+    let (run, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| s.jobs.get_mut(&a).unwrap().state = AttemptState::Active);
+    c.tick().await.unwrap();
+    drop(c.store().result_gc_guard(&run).unwrap());
+    let pin = fx.dir.path().join(format!("reader-pins/{run}.lock"));
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(c.collect(&files, cfg()).await.is_err());
+    std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[tokio::test]
 async fn active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset() {
     let fx = fx();
     let (c, files) = fx.open();

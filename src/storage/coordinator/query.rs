@@ -2,6 +2,9 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+pub(crate) const RESULT_GC_NEXT_RUN: &str =
+    "SELECT run_id FROM run WHERE run_id > coalesce(?1,'') ORDER BY run_id LIMIT 1";
+
 pub const MAX_QUERY_ROWS: u32 = 64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page<T> {
@@ -150,6 +153,18 @@ impl CoordinatorStore {
             if verdict.as_deref()==Some("invalid") {return Err(StorageError::Corrupt("invalid collection verdict".into()));}
             let closed=closed.map(to_u64).transpose()?;
             Ok((verdict.filter(|_|closed.is_some()),closed))
+        })
+    }
+
+    /// One indexed run-ID step for GC; deliberately performs no task facts or counts.
+    pub(crate) fn result_gc_next_run(&self, after: Option<RunId>) -> Result<Option<RunId>> {
+        self.db.call(move |c| {
+            let raw = c
+                .query_row(RESULT_GC_NEXT_RUN, [after.map(String::from)], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?;
+            raw.map(|run| id("run", RunId::parse(&run))).transpose()
         })
     }
 

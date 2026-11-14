@@ -227,3 +227,11 @@ canonicalizeし、directoryかつ検証済み原本root内の場合のみresolve
 owner再起動後の差替えretryがrunning前に拒否され、外部markerを作らず原本とsecretを
 保つ回帰を含むin-place unit 5件・integration 9件、通常snapshot exec回帰、strict clippy
 が成功した。TTCのpath登録後に同UIDが任意に差し替える競合への新たなFD layerは追加していない。
+
+### 結果 retention GC の独立レビュー修正
+
+独立レビューの 3 指摘（祖先 symlink 経由の外部削除、GC pin 競合時の live collection 全体停止、run 選択での task 全件集計）に限定して修正する。
+root/祖先 FD と NOFOLLOW による unlink、競合対象の pending 再試行、run ID index の 1 件 keyset query を実装した。
+実 GC claim と外部 sentinel、root/祖先/leaf symlink と rename 競合、pin 競合中の収集/tick と実 resident の IPC/lease 継続・解放後の回収再開、破損 pin、2000 task と EXPLAIN/no-task-facts の回帰を追加した。
+修正後の results unit 39 件、guarded retention 4 件、indexed run 選択 1 件、実 resident の競合回帰 1 件、collection 競合回帰 2 件、strict clippy all-targets/all-features は成功。collection 全体は 38 件中 37 件成功後、新規 fixture の pin backfill 不足を修正し、その 2 件を再実行して成功した。
+独立レビュアーの resolved 確認、全 CI と Linux 実行はこの実装修正時点では未完了。pure clock policy は変更していない。

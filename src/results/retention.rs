@@ -39,12 +39,11 @@ pub fn page(
     let (run, after) = if let Some(current) = cursor.current.take() {
         current
     } else {
-        let mut runs = store.query_runs(1, cursor.run_after.clone())?.items;
-        if runs.is_empty() {
+        let Some(run) = store.result_gc_next_run(cursor.run_after.clone())? else {
             cursor.run_after = None;
             return Ok(PageReport::default());
-        }
-        (runs.remove(0).run_id, String::new())
+        };
+        (run, String::new())
     };
     cursor.run_after = Some(run.clone());
     let guard = match store.result_gc_guard(&run) {

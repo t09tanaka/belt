@@ -1160,6 +1160,12 @@ pin inode は parent state とともに保持し、unlink/置換しない。最�
 reader がこの protocol を共有することが互換条件で、旧 reader と同時利用する GC の安全性は保証しない。
 resident は bounded keyset の結果 ref/claim page だけ処理し、run-exclusive pin を FS delete 完了まで保持する。
 known durable claim のみ NotFound を冪等成功とし、未関連 legacy pending や foreign locator は削除しない。
+run 選択は task facts/count を読まない run ID index の 1 件 keyset query とする。
+削除は open 時の result root inode を確認し、各祖先を NOFOLLOW で開いた FD を基準に行う。
+leaf symlink は参照先を辿らず unlink し、祖先/root の差替えは claim を残して失敗する。
+空親/tmp の cleanup も同じ FD から行い、外部 symlink 先を削除しない。
+GC 排他 pin と writer shared pin の通常競合は対象を pending として次 pass へ送り、
+resident の収集 loop・lease 更新・IPC は継続する。pin 破損や他の I/O error は通常競合にしない。
 時計 cutoff は boot identity と永続 monotonic baseline から導出し、boot 不明/変更後は全 retention の
 quarantine、時計異常は retention 0 でも Hold。壁時計だけを理由に削除を前倒ししない。
 source/Vault/private binding の GC と output planner 完成はこの結果 retention 経路に含まない。
