@@ -175,9 +175,10 @@ controls and native platform acceptance remain required. S24 ephemeral identity
 and forget semantics also remain required.
 Native worker service plans must select the worker foreground role rather than
 reuse the combined parent's `daemon --input` role. Parent remote-link attachment
-and per-worker source/secret routing are separate required slices: the existing
-resident source and secret delivery paths still target its local worker. A public
-standalone worker does not by itself establish remote end-to-end execution.
+now uses independent owners and the shared source/secret delivery helpers for
+explicitly registered private user-config workers. Real SSH/Docker and native
+acceptance remain required; the fake-SSH process fixture is a focused regression,
+not completion of provisioning or native lifecycle acceptance.
 
 
 ### Resident source-ready gate slice
@@ -186,7 +187,7 @@ standalone worker does not by itself establish remote end-to-end execution.
 
 source export/upload の共有 transfer lease と cleanup は background job 間で維持する。admission は network や transfer mutex を待たない。停止後の残 IO は capture store と lease だけを保持し、旧 coordinator owner を保持しない。secrets は既存 attempt/generation へ配置後に送り、worker の Preparing/lease gate を維持する。local に事前配置した legacy source も再起動後に worker verification で Ready を再構築する。
 
-この slice は local resident と再利用できる per-worker delivery helper まで。verified remote の SSH 接続・再接続 owner、worker add/install・鍵登録・native service、実 remote source/secret routing と SSH/native end-to-end acceptance は次 slice の必須残件で、S15b 以降と S22 の完了を意味しない。schema migration は不要。
+接続 owner の追加 slice は private user config の既存 `[[workers]]` を起動時に snapshot し、`id` を期待 worker identity、`ssh` を接続先として独立した serial lifecycle で維持する。hello の cluster/name/protocol 検証後だけ source gate 付き link を attach する。切断は gate 無効化、接続を照合した detach/unknown、所有 SSH child の reap、stop-aware bounded backoff の順とし、同じ worker/boot の再接続でも delivery cache を新しくする。登録の再読込・自動登録は行わない。worker add/install・鍵登録・native service・upgrade/rollback・ephemeral と実 SSH/Docker/native acceptance は必須残件であり、S15b 以降と S22 の完了を意味しない。schema migration は不要。
 
 ### S15 の利用者経路の統合
 

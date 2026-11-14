@@ -41,6 +41,30 @@ impl ResolvedConfig {
         target: WorkerTarget<'_>,
         connected: Connected,
     ) -> Result<(), ApiError> {
+        self.attach_worker_link(coordinator, target, connected, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Verify and install a source-gated session in one placement-fenced operation.
+    pub async fn attach_gated_worker(
+        &self,
+        coordinator: &Coordinator,
+        target: WorkerTarget<'_>,
+        connected: Connected,
+        gate: Arc<crate::coordinator::InputGate>,
+    ) -> Result<Arc<dyn crate::coordinator::WorkerLink>, ApiError> {
+        self.attach_worker_link(coordinator, target, connected, Some(gate))
+            .await
+    }
+
+    async fn attach_worker_link(
+        &self,
+        coordinator: &Coordinator,
+        target: WorkerTarget<'_>,
+        connected: Connected,
+        gate: Option<Arc<crate::coordinator::InputGate>>,
+    ) -> Result<Arc<dyn crate::coordinator::WorkerLink>, ApiError> {
         let invalid = |message| ApiError::new(ErrorCode::InvalidInput, message);
         let settings = self
             .runtime_settings()
@@ -73,16 +97,13 @@ impl ResolvedConfig {
             }
         };
         coordinator.scheduler().set_priority(id, priority);
-        coordinator
-            .attach(
-                id.clone(),
-                Arc::new(ClientLink::new(
-                    connected.client,
-                    Duration::from_millis(settings.coordinator.worker_budget_ms),
-                )),
-            )
-            .await;
-        Ok(())
+        let timeout = Duration::from_millis(settings.coordinator.worker_budget_ms);
+        let link: Arc<dyn crate::coordinator::WorkerLink> = Arc::new(match gate {
+            Some(gate) => ClientLink::gated(connected.client, timeout, gate),
+            None => ClientLink::new(connected.client, timeout),
+        });
+        coordinator.attach(id.clone(), link.clone()).await;
+        Ok(link)
     }
 }
 

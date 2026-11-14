@@ -27,8 +27,18 @@ A separately provisioned persistent worker can run in the foreground with
 and binds the cluster, worker identity, executable, key and captured configuration.
 Its HOME and canonical worker state must match the `worker --stdio` bridge. The
 bridge may disconnect while accepted work and its independent supervisor continue.
-Provisioning and native worker service installation remain required follow-up work;
-this entry point alone does not provide remote enrollment or end-to-end routing.
+The parent snapshots explicitly registered workers from its private user
+`config.toml` at startup. Each `[[workers]]` entry's `id` is the expected worker
+identity; `ssh` is its SSH destination. The parent verifies cluster, identity and
+protocol before attachment, forwards captured source and secrets on that link,
+and reconnects without creating a replacement attempt. The remote executable is
+`remote-task-runner` on the remote PATH, through the fixed `worker --stdio` bridge.
+SSH connection failures stay isolated from local work and other peers.
+
+Registration changes require a parent restart. Automatic enrollment, worker
+add/install, ephemeral workers, native worker services and upgrade/rollback remain
+required follow-up work. Cluster keys and worker inputs are provisioned privately
+out of band; a hello never enrolls an unknown identity.
 
 
 Worker-link attachment is asynchronous: `Coordinator::attach(...).await` installs

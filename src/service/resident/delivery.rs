@@ -16,6 +16,9 @@ pub(super) async fn sources(
     let mut timer = tokio::time::interval(Duration::from_millis(100));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
+        if *input_stop.borrow() {
+            return Ok(());
+        }
         tokio::select! { _=input_stop.changed()=>return Ok(()), _=timer.tick()=>{} }
         let owner = coordinator.clone();
         let id = worker_id.clone();
@@ -82,6 +85,11 @@ pub(super) async fn sources(
             let verified = super::super::forward::verify(&worker, &source, &mut input_stop)
                 .await
                 .is_ok_and(|v| v.ready);
+            // The nested forwarding cancellation wait may have consumed the
+            // watch change; observe its current value before any further IO.
+            if *input_stop.borrow() {
+                return Ok(());
+            }
             let delivered = if verified && !spec.has_secret_bundle {
                 true
             } else {
