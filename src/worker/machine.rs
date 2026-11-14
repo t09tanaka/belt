@@ -205,6 +205,9 @@ impl BuilderWorkspaces for BuilderWs {
 }
 
 impl Host for Machine {
+    fn setup_owner(&self) -> Option<&Setups> {
+        self.setups.as_deref()
+    }
     fn preparation_observation_page(
         &self,
         request: &crate::setup::observation_transport::ObservationPageRequest,

@@ -254,6 +254,7 @@ struct Consumer {
 #[derive(Default)]
 struct Inner {
     observations: super::observation_transport::ObservationLog,
+    probe_versions: HashMap<String, std::sync::Weak<AtomicU64>>,
     /// The builder working for a key (none once it ended or was stopped).
     by_key: HashMap<String, BuilderId>,
     /// Private artifacts remain owned until every old writer is settled.
@@ -606,6 +607,7 @@ impl Setups {
         let id = BuilderId::generate();
         let builder_attempt = AttemptId::generate();
         inner.tool_versions.insert(key.clone(), id.clone());
+        Self::invalidate_probe(&mut inner, &key);
         inner.barriers.insert(key.clone(), builder_attempt.clone());
         inner.by_key.insert(key.clone(), id.clone());
         inner.flights.insert(
@@ -767,15 +769,13 @@ impl Setups {
         let bound_profile = binding
             .map(|b| b.fingerprint().to_string())
             .unwrap_or_else(|| self.cfg.profile.clone());
-        let ctx = KeyContext {
-            source_digest: payload.manifest_digest.to_string(),
-            os: std::env::consts::OS.to_string(),
-            arch: std::env::consts::ARCH.to_string(),
-            profile: bound_profile,
-            run_id: payload.run_id.to_string(),
-            env: bound_env.clone(),
-            tools: tool_marks(spec, &bound_env),
-        };
+        let ctx = workspace_key_context(
+            spec,
+            &payload.manifest_digest,
+            &payload.run_id,
+            bound_profile,
+            bound_env,
+        );
         let key = policy::template_key(spec, &ctx);
         let now = platform::wall_ms();
         let mut inner = lock(&self.inner);
@@ -838,6 +838,7 @@ impl Setups {
                             },
                         );
                         inner.by_key.insert(key.clone(), id.clone());
+                        Self::invalidate_probe(&mut inner, &key);
                         inner.consumers.entry(a.clone()).or_default().builder = Some(id.clone());
                         drop(inner);
                         self.spawn_builder(
@@ -935,7 +936,9 @@ impl Setups {
         if policy::leave(&mut f.refs, consumer, building) == Leave::StopBuilder {
             f.stop = true;
             let key = f.key.clone();
-            if f.kind == BuilderKind::WorkspaceSetup && inner.by_key.get(&key) == Some(id) {
+            let workspace = f.kind == BuilderKind::WorkspaceSetup;
+            Self::invalidate_probe(inner, &key);
+            if workspace && inner.by_key.get(&key) == Some(id) {
                 inner.by_key.remove(&key);
             }
         }
@@ -1180,6 +1183,7 @@ impl Setups {
         };
         f.end = Some(end);
         let (key, empty) = (f.key.clone(), f.refs.is_empty());
+        Self::invalidate_probe(&mut inner, &key);
         if !unsettled {
             inner.barriers.remove(&key);
         }
@@ -1741,6 +1745,25 @@ fn capture(root: &Path, before: &BTreeMap<String, Sig>) -> Result<Captured, Unke
     Ok((artifacts, modified, changes.removed))
 }
 
+/// One key context shared by the actual producer and read-only probe.
+fn workspace_key_context(
+    spec: &SetupSpec,
+    manifest: &Digest,
+    run: &RunId,
+    profile: String,
+    env: BTreeMap<String, String>,
+) -> KeyContext {
+    KeyContext {
+        source_digest: manifest.to_string(),
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+        profile,
+        run_id: run.to_string(),
+        tools: tool_marks(spec, &env),
+        env,
+    }
+}
+
 /// What the tools the spec declares are on this worker: for each name, the
 /// file `PATH` (of the steps' environment) resolves it to, with its size
 /// and time of change, or that there is none. Part of the template key, so
@@ -2200,3 +2223,5 @@ mod tool_validation_tests {
         assert_eq!(setups.preparation_observations(64), vec![value]);
     }
 }
+
+mod probe;

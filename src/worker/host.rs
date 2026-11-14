@@ -15,6 +15,10 @@ use crate::wire::{AttemptPayload, SecretFile};
 use crate::workspace::Workspace;
 
 pub trait Host: Send + Sync {
+    /// Existing worker-local setup owner; access never initializes it.
+    fn setup_owner(&self) -> Option<&crate::setup::builder::Setups> {
+        None
+    }
     /// Optional immutable telemetry; unavailable hosts make no cost claims.
     fn preparation_observation_page(
         &self,

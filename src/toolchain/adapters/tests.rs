@@ -779,3 +779,43 @@ fn go_probe_and_consumer_cannot_switch_the_frozen_toolchain() {
     assert!(!wrong.plan.root.join("receipt.json").exists());
     assert!(matches!(detect(&wrong.plan), Availability::Unknown(_)));
 }
+
+#[test]
+fn preparation_probe_bounded_identity_detects_growth_race_and_never_follows_links() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("manager");
+    fs::write(&path, b"small").unwrap();
+    let before = FileIdentity::capture(&path).unwrap();
+    assert_eq!(FileIdentity::capture_bounded(&path, 5).unwrap(), before);
+    assert_eq!(
+        FileIdentity::capture_bounded(&path, 4),
+        Err("identity_not_bounded_regular")
+    );
+    assert_eq!(
+        FileIdentity::capture_bounded_checked(&path, 8, || {
+            fs::write(&path, vec![b'x'; 1024 * 1024]).unwrap();
+        }),
+        Err("identity_too_large")
+    );
+    let link = temp.path().join("link");
+    symlink(&path, &link).unwrap();
+    assert_eq!(
+        FileIdentity::capture_bounded(&link, 8),
+        Err("identity_open")
+    );
+    assert!(FileIdentity::capture_bounded(&temp.path().join("absent"), 8).is_err());
+}
+
+#[test]
+fn preparation_probe_total_fd_byte_budget_is_shared_across_files() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("manager");
+    fs::write(&path, vec![b'x'; 1024 * 1024]).unwrap();
+    let budget = IdentityReadBudget::probe();
+    for _ in 0..7 {
+        assert!(budget.capture(&path).is_ok());
+    }
+    // Reserve a growth sentinel; never begin an eighth full read at the boundary.
+    assert!(budget.capture(&path).is_err());
+    assert_eq!(budget.remaining.get(), 1024 * 1024);
+}

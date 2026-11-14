@@ -152,6 +152,38 @@ impl Registry {
         tool: &ToolId,
         evidence: Option<&ResolutionEvidence>,
     ) -> Result<PreparationRequest, Unavailable> {
+        self.request_with_limit(frozen, tool, evidence, None)
+    }
+
+    pub(crate) fn probe_request(
+        &self,
+        frozen: &FrozenToolchains,
+        tool: &ToolId,
+        evidence: &ResolutionEvidence,
+        budget: &adapters::IdentityReadBudget,
+    ) -> Result<PreparationRequest, Unavailable> {
+        use crate::setup::preparation_probe::bounded_path;
+        bounded_path(&self.root).map_err(|_| Unavailable::Invalid("probe_root"))?;
+        let entry = self.recipes.get(tool).ok_or(Unavailable::Unsupported)?;
+        if entry.host.dependencies.len() > 8 || entry.host.search_path.len() > 32 {
+            return Err(Unavailable::Invalid("probe_budget"));
+        }
+        for path in std::iter::once(&entry.host.manager.path)
+            .chain(entry.host.dependencies.iter().map(|d| &d.path))
+            .chain(entry.host.search_path.iter())
+        {
+            bounded_path(path).map_err(|_| Unavailable::Invalid("probe_path"))?;
+        }
+        self.request_with_limit(frozen, tool, Some(evidence), Some(budget))
+    }
+
+    fn request_with_limit(
+        &self,
+        frozen: &FrozenToolchains,
+        tool: &ToolId,
+        evidence: Option<&ResolutionEvidence>,
+        max_bytes: Option<&adapters::IdentityReadBudget>,
+    ) -> Result<PreparationRequest, Unavailable> {
         frozen.validate().map_err(Unavailable::Invalid)?;
         if frozen
             .baseline
@@ -240,14 +272,25 @@ impl Registry {
             let resolved = adapters::resolve(frozen, &evidence).map_err(Unavailable::Invalid)?;
             (resolved, evidence)
         };
-        let plan = adapters::plan(
-            entry.recipe.kind,
-            &resolved,
-            tool,
-            &evidence,
-            &self.root,
-            &entry.host,
-        )
+        let plan = match max_bytes {
+            Some(limit) => adapters::plan_with_limit(
+                entry.recipe.kind,
+                &resolved,
+                tool,
+                &evidence,
+                &self.root,
+                &entry.host,
+                limit,
+            ),
+            None => adapters::plan(
+                entry.recipe.kind,
+                &resolved,
+                tool,
+                &evidence,
+                &self.root,
+                &entry.host,
+            ),
+        }
         .map_err(Unavailable::Invalid)?;
         Ok(PreparationRequest {
             kind: entry.recipe.kind,

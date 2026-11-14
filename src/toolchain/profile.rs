@@ -18,6 +18,7 @@ use std::time::{Duration, Instant};
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_PROBE_BYTES: u64 = 8192;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+const PREPARATION_SNAPSHOT_TTL_MS: u64 = 5_000;
 // Tool discovery must not bootstrap a manager-selected tool behind admission.
 const INSTALL_GUARDS: &[(&str, &str)] = &[
     ("COREPACK_ENABLE_NETWORK", "0"),
@@ -63,6 +64,15 @@ pub struct Profile {
     env: BTreeMap<String, String>,
     digest: Digest,
     report_identity: Arc<Mutex<Option<ReportIdentity>>>,
+    completed_report: Arc<Mutex<Option<CompletedReport>>>,
+}
+
+#[derive(Clone)]
+struct CompletedReport {
+    boot: String,
+    finished_ms: u64,
+    files: Digest,
+    report: WorkerCapabilities,
 }
 
 #[derive(Clone)]
@@ -240,6 +250,7 @@ impl Profile {
             env,
             digest,
             report_identity: Arc::new(Mutex::new(None)),
+            completed_report: Arc::new(Mutex::new(None)),
         };
         for tool in &profile.definition.required_tools {
             if !matches!(profile.probe(tool), ToolObservation::Available { .. }) {
@@ -370,7 +381,7 @@ impl Profile {
             }
             Err(_) => Digest::of_bytes(b"profile identity unavailable"),
         };
-        WorkerCapabilities {
+        let report = WorkerCapabilities {
             disk_free_bytes: None,
             resource_budget: None,
             schema_version: 1,
@@ -383,7 +394,60 @@ impl Profile {
             profile_fingerprint,
             tools,
             features: FEATURES.iter().map(|v| v.to_string()).collect(),
+        };
+        let completed = crate::platform::boot_id()
+            .filter(|_| files_before == files)
+            .map(|boot| CompletedReport {
+                boot,
+                finished_ms: crate::platform::monotonic_ms(),
+                files,
+                report: report.clone(),
+            });
+        if let Ok(mut slot) = self.completed_report.lock() {
+            *slot = completed;
         }
+        report
+    }
+
+    /// Consume only: never probes, renews the stamp, or changes admission reports.
+    pub(crate) fn preparation_snapshot(&self, expected: &Digest) -> Option<WorkerCapabilities> {
+        let snapshot = self.completed_report.lock().ok()?.clone()?;
+        let boot = crate::platform::boot_id()?;
+        let now = crate::platform::monotonic_ms();
+        let report = self.preparation_snapshot_at(&snapshot, expected, &boot, now)?;
+        let finished = crate::platform::monotonic_ms();
+        if finished < now
+            || finished.checked_sub(snapshot.finished_ms)? > PREPARATION_SNAPSHOT_TTL_MS
+            || crate::platform::boot_id().as_deref() != Some(snapshot.boot.as_str())
+        {
+            return None;
+        }
+        Some(report)
+    }
+    fn preparation_snapshot_at(
+        &self,
+        snapshot: &CompletedReport,
+        expected: &Digest,
+        boot: &str,
+        now: u64,
+    ) -> Option<WorkerCapabilities> {
+        if snapshot.boot != boot
+            || now.checked_sub(snapshot.finished_ms)? > PREPARATION_SNAPSHOT_TTL_MS
+            || &snapshot.report.profile_fingerprint != expected
+        {
+            return None;
+        }
+        // Fixed 15 tools x at most 64 search directories; paths are component-bounded
+        // before metadata. No content/tree traversal or subprocess is performed.
+        crate::setup::preparation_probe::bounded_path(self.shell()).ok()?;
+        for dir in &self.definition.path {
+            crate::setup::preparation_probe::bounded_path(dir).ok()?;
+            for tool in TOOLS.iter().copied().chain(["xcrun"]) {
+                let binary = if tool == "xcode" { "xcodebuild" } else { tool };
+                crate::setup::preparation_probe::bounded_path(&dir.join(binary)).ok()?;
+            }
+        }
+        (snapshot.files == self.executable_identity()).then(|| snapshot.report.clone())
     }
     /// Resolve the same PATH candidates as the probes without executing them.
     /// ctime/mode catch replacement or permission changes even if mtime is kept.
@@ -882,5 +946,85 @@ mod tests {
         fs::remove_file(root.path().join("profiles.toml")).unwrap();
         symlink(root.path().join("other"), root.path().join("profiles.toml")).unwrap();
         assert!(Profile::load(root.path(), &env(root.path())).is_err());
+    }
+}
+
+#[cfg(test)]
+mod preparation_snapshot_tests {
+    use super::*;
+    #[test]
+    fn preparation_snapshot_consumption_is_process_free_and_never_renews_age() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let shell = root.join("sh");
+        fs::copy("/bin/sh", &shell).unwrap();
+        let marker = root.join("ran");
+        let node = root.join("node");
+        fs::write(
+            &node,
+            format!(
+                "#!/bin/sh\necho ran >> '{}'\necho v22.0.0\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&node, fs::Permissions::from_mode(0o700)).unwrap();
+        let profile = Profile::load(
+            &root,
+            &BTreeMap::from([
+                ("PATH".into(), root.to_str().unwrap().into()),
+                ("SHELL".into(), shell.to_str().unwrap().into()),
+            ]),
+        )
+        .unwrap();
+        assert!(profile
+            .preparation_snapshot(&Digest::of_bytes(b"none"))
+            .is_none());
+        let report = profile.report();
+        let snapshot = profile.completed_report.lock().unwrap().clone().unwrap();
+        let marker_before = fs::read(&marker).unwrap();
+        for _ in 0..3 {
+            assert!(profile
+                .preparation_snapshot(&report.profile_fingerprint)
+                .is_some());
+        }
+        assert_eq!(fs::read(&marker).unwrap(), marker_before);
+        assert_eq!(
+            profile
+                .completed_report
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .finished_ms,
+            snapshot.finished_ms
+        );
+        for (boot, now) in [
+            ("different", snapshot.finished_ms),
+            (
+                snapshot.boot.as_str(),
+                snapshot.finished_ms.saturating_sub(1),
+            ),
+            (snapshot.boot.as_str(), snapshot.finished_ms + 5001),
+        ] {
+            assert!(profile
+                .preparation_snapshot_at(&snapshot, &report.profile_fingerprint, boot, now)
+                .is_none());
+        }
+        assert!(profile
+            .preparation_snapshot_at(
+                &snapshot,
+                &report.profile_fingerprint,
+                &snapshot.boot,
+                snapshot.finished_ms + 5000
+            )
+            .is_some());
+        assert!(profile
+            .preparation_snapshot(&Digest::of_bytes(b"wrong"))
+            .is_none());
+        fs::write(&node, b"changed identity").unwrap();
+        assert!(profile
+            .preparation_snapshot(&report.profile_fingerprint)
+            .is_none());
     }
 }

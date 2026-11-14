@@ -1445,6 +1445,27 @@ impl Agent {
 
         Ok(bundle)
     }
+    /// Worker-local read-only preparation identity; no wire or forecast use.
+    #[allow(
+        dead_code,
+        reason = "Consumed by the next worker protocol slice; remove when that slice connects this entrypoint."
+    )]
+    pub(crate) fn probe_preparation(
+        &self,
+        input: crate::setup::preparation_probe::PreparationProbeInput<'_>,
+    ) -> crate::setup::preparation_probe::PreparationProbe {
+        use crate::setup::preparation_probe::{PreparationProbe, ProbeUnknown};
+        let Some(owner) = self.host.setup_owner() else {
+            return PreparationProbe::Unknown(ProbeUnknown::MissingContext);
+        };
+        owner.probe_preparation(
+            input,
+            self.cfg.capability_profile.as_deref(),
+            Some(&self.cfg.profile_fingerprint),
+            self.toolchains.as_ref(),
+        )
+    }
+
     fn toolchain_requests(
         &self,
         bundle: &crate::toolchain::contract::FrozenBundle,

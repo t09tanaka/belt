@@ -449,7 +449,9 @@ mod tests {
     #[test]
     fn malformed_public_reports_fail_closed_and_versions_are_bounded() {
         let mut r = report();
-        r.features = ["a".into(), "b".into(), "c".into(), "d".into()].into();
+        r.features = (0..=FEATURES.len())
+            .map(|i| format!("invalid_{i}"))
+            .collect();
         assert!(!r.validate());
         r = report();
         r.features.insert("magic".into());
