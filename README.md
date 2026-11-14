@@ -84,6 +84,17 @@ Or download a binary from the
 fast-worktree add <path> -b <branch> [--fetch-timeout <secs>] [<start-point>]
 ```
 
+Native Git worktree metadata operations and branch deletion are serialized
+per repository, including their Git hooks, to avoid reading another
+creation's incomplete metadata. Long Git hooks therefore delay other
+metadata operations in that repository. A synchronous metadata operation
+from a Git hook in the same repository fails immediately with a recursive
+operation error instead of waiting for its own parent. The normal
+`FAST_WORKTREE_SKIP=1` post-checkout integration still returns immediately.
+Dependency installation and `.fast-worktree.toml` hooks remain outside this
+lock and can run concurrently. Raw Git commands and other tools do not
+participate in this cooperative lock.
+
 Runs `git worktree add <path> -b <branch> <start-point>`, copies the files
 `.worktreeinclude` selects, then runs `install` in the new worktree, then
 the `post_add` hooks. With the [pool](#the-pool) on, a ready worktree is

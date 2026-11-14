@@ -6044,3 +6044,379 @@ fn plan_runs_no_verify_in_a_cache_entry() {
         );
     }
 }
+
+fn registration_child(
+    w: &World,
+    dest: &Path,
+    branch: &str,
+    extra: &[(&str, &str)],
+) -> std::process::Child {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_fast-worktree"));
+    w.env(&mut command);
+    command
+        .current_dir(w.main())
+        .args(["add", dest.to_str().unwrap(), "-b", branch, "HEAD"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    for (key, value) in extra {
+        command.env(key, value);
+    }
+    command.spawn().unwrap()
+}
+
+#[test]
+fn registration_readers_wait_for_complete_commondir() {
+    let w = World::new();
+    fs::write(w.main().join(".fast-worktree.toml"), "").unwrap();
+    let barrier = w.base.join("registration-barrier");
+    fs::create_dir(&barrier).unwrap();
+    write_exe(
+        &w.base.join("bin/git"),
+        r#"#!/bin/sh
+case " $* " in
+  *" worktree add "*)
+    if [ -n "$REGISTRATION_BARRIER" ]; then
+      /usr/bin/git "$@" || exit $?
+      common=$(/usr/bin/git rev-parse --path-format=absolute --git-common-dir)
+      admin="$common/worktrees/first/commondir"
+      cp "$admin" "$REGISTRATION_BARRIER/original"
+      : > "$admin"
+      : > "$REGISTRATION_BARRIER/entered"
+      i=0
+      while [ ! -f "$REGISTRATION_BARRIER/release" ]; do
+        i=$((i+1)); [ "$i" -le 200 ] || exit 90
+        sleep 0.05
+      done
+      cat "$REGISTRATION_BARRIER/original" > "$admin"
+      exit 0
+    fi
+    ;;
+esac
+exec /usr/bin/git "$@"
+"#,
+    );
+    let first = registration_child(
+        &w,
+        &w.base.join("first"),
+        "first",
+        &[("REGISTRATION_BARRIER", barrier.to_str().unwrap())],
+    );
+    wait_until("incomplete registration", || {
+        barrier.join("entered").exists()
+    });
+    let mut second = registration_child(&w, &w.base.join("second"), "second", &[]);
+    // Without the repository lock the second process reads the empty file
+    // immediately and exits with Git's 'failed to read .../commondir'.
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let waiting = second.try_wait().unwrap().is_none();
+    fs::write(barrier.join("release"), "").unwrap();
+    Run(first.wait_with_output().unwrap()).assert_ok();
+    Run(second.wait_with_output().unwrap()).assert_ok();
+    assert!(waiting, "a reader must wait for registration to finish");
+}
+
+#[test]
+fn registration_native_hooks_hold_the_lock_and_standard_check_returns() {
+    let w = World::new();
+    fs::write(w.main().join(".fast-worktree.toml"), "").unwrap();
+    let barrier = w.base.join("hook-barrier");
+    fs::create_dir(&barrier).unwrap();
+    let custom_hooks = w.base.join("custom-hooks");
+    w.git(
+        &w.main(),
+        &["config", "core.hooksPath", custom_hooks.to_str().unwrap()],
+    );
+    write_exe(
+        &custom_hooks.join("post-checkout"),
+        r#"#!/bin/sh
+"$FASTWT_BIN" check --post-checkout "$1" "$2" "$3" || exit $?
+git worktree list --porcelain >/dev/null || exit $?
+printf '%s\n' "$1 $2 $3" >> "$HOOK_BARRIER/arguments"
+case "$PWD" in
+  */slow)
+    : > "$HOOK_BARRIER/entered"
+    i=0
+    while [ ! -f "$HOOK_BARRIER/release" ]; do
+      i=$((i+1)); [ "$i" -le 200 ] || exit 90
+      sleep 0.05
+    done
+    ;;
+esac
+"#,
+    );
+    let extra = [
+        ("FASTWT_BIN", env!("CARGO_BIN_EXE_fast-worktree")),
+        ("HOOK_BARRIER", barrier.to_str().unwrap()),
+    ];
+    let slow = registration_child(&w, &w.base.join("slow"), "slow", &extra);
+    wait_until("nested post-checkout hook", || {
+        barrier.join("entered").exists()
+    });
+    let mut fast = registration_child(&w, &w.base.join("fast"), "fast", &extra);
+    std::thread::sleep(std::time::Duration::from_millis(250));
+    let waiting = fast.try_wait().unwrap().is_none();
+    fs::write(barrier.join("release"), "").unwrap();
+    Run(slow.wait_with_output().unwrap()).assert_ok();
+    Run(fast.wait_with_output().unwrap()).assert_ok();
+    assert!(waiting, "another add must wait while the native hook runs");
+    let head = w.git(&w.main(), &["rev-parse", "HEAD"]);
+    let head = head.trim();
+    let expected = format!("{} {head} 1", "0".repeat(head.len()));
+    let arguments = fs::read_to_string(barrier.join("arguments")).unwrap();
+    assert_eq!(
+        arguments.lines().collect::<Vec<_>>(),
+        vec![expected.as_str(), expected.as_str()]
+    );
+}
+
+#[test]
+fn registration_post_checkout_failure_preserves_the_registered_worktree() {
+    let w = World::new();
+    write_exe(
+        &w.main().join(".git/hooks/post-checkout"),
+        "#!/bin/sh\necho registration-hook-failure >&2\nexit 7\n",
+    );
+    let destination = w.base.join("hook-failure");
+    let result = w.fw(
+        &w.main(),
+        &[
+            "add",
+            destination.to_str().unwrap(),
+            "-b",
+            "hook-failure",
+            "HEAD",
+        ],
+    );
+    assert!(!result.ok());
+    assert!(
+        result.err().contains("registration-hook-failure"),
+        "{}",
+        result.err()
+    );
+    assert!(result.err().contains("exit status: 7"), "{}", result.err());
+    assert!(destination.join(".git").is_file());
+    assert!(w
+        .git(&w.main(), &["worktree", "list", "--porcelain"])
+        .contains(destination.to_str().unwrap()));
+}
+
+#[test]
+fn registration_post_checkout_uses_sha256_null_oid() {
+    let w = World::new();
+    let repository = w.base.join("sha256");
+    fs::create_dir(&repository).unwrap();
+    w.git(&repository, &["init", "-q", "--object-format=sha256"]);
+    w.git(
+        &repository,
+        &["commit", "-q", "--allow-empty", "-m", "initial"],
+    );
+    write_exe(
+        &repository.join(".git/hooks/post-checkout"),
+        "#!/bin/sh\nprintf '%s\\n' \"$1 $2 $3\" > \"$HOOK_LOG\"\n",
+    );
+    let destination = w.base.join("sha256-worktree");
+    w.fw(
+        &repository,
+        &[
+            "add",
+            destination.to_str().unwrap(),
+            "-b",
+            "sha256-worktree",
+            "HEAD",
+        ],
+    )
+    .assert_ok();
+    let head = w.git(&repository, &["rev-parse", "HEAD"]);
+    assert_eq!(head.trim().len(), 64);
+    assert_eq!(
+        w.hook_log().trim(),
+        format!("{} {} 1", "0".repeat(64), head.trim())
+    );
+}
+
+#[test]
+fn registration_reference_hooks_are_preserved_and_metadata_reentry_fails_fast() {
+    let w = World::new();
+    fs::write(w.main().join(".fast-worktree.toml"), "").unwrap();
+    let nested = w.base.join("nested");
+    let result_file = w.base.join("nested-output");
+    write_exe(
+        &w.main().join(".git/hooks/reference-transaction"),
+        r#"#!/bin/sh
+printf '%s\n' "$1" >> "$HOOK_LOG"
+cat >/dev/null
+[ "$1" = prepared ] || exit 0
+"$FASTWT_BIN" add "$NESTED_DEST" -b nested HEAD > "$NESTED_OUTPUT" 2>&1 &
+child=$!
+i=0
+while kill -0 "$child" 2>/dev/null; do
+  i=$((i+1))
+  if [ "$i" -gt 100 ]; then
+    kill "$child"
+    wait "$child"
+    echo 'nested operation hung' >&2
+    exit 91
+  fi
+  sleep 0.02
+done
+wait "$child"
+status=$?
+[ "$status" -ne 0 ] || exit 92
+grep 'recursive Git metadata operation' "$NESTED_OUTPUT" >/dev/null || exit 93
+"#,
+    );
+    let extra = [
+        ("FASTWT_BIN", env!("CARGO_BIN_EXE_fast-worktree")),
+        ("NESTED_DEST", nested.to_str().unwrap()),
+        ("NESTED_OUTPUT", result_file.to_str().unwrap()),
+    ];
+    Run(
+        registration_child(&w, &w.base.join("outer"), "outer", &extra)
+            .wait_with_output()
+            .unwrap(),
+    )
+    .assert_ok();
+    let log = w.hook_log();
+    assert!(
+        log.contains("prepared"),
+        "native reference-transaction hook must run"
+    );
+    assert!(
+        log.contains("committed"),
+        "native reference transaction must finish"
+    );
+    assert!(fs::read_to_string(result_file)
+        .unwrap()
+        .contains("recursive Git metadata operation"));
+    assert!(!nested.exists());
+}
+
+#[test]
+fn registration_stale_owner_marker_never_bypasses_an_available_lock() {
+    let w = World::new();
+    let common = w.main().join(".git").canonicalize().unwrap();
+    Run(registration_child(
+        &w,
+        &w.base.join("stale"),
+        "stale",
+        &[("FAST_WORKTREE_REGISTRATION_OWNER", common.to_str().unwrap())],
+    )
+    .wait_with_output()
+    .unwrap())
+    .assert_ok();
+}
+
+#[test]
+fn registration_preserves_native_sparse_checkout() {
+    let w = World::new();
+    w.git(&w.main(), &["sparse-checkout", "init", "--cone"]);
+    w.git(&w.main(), &["sparse-checkout", "set", "app"]);
+    let destination = w.base.join("sparse");
+    w.fw(
+        &w.main(),
+        &["add", destination.to_str().unwrap(), "-b", "sparse", "HEAD"],
+    )
+    .assert_ok();
+    assert!(destination.join("app/package.json").is_file());
+    assert!(!destination.join("lib/package.json").exists());
+    assert_eq!(
+        w.git(&destination, &["sparse-checkout", "list"]).trim(),
+        "app"
+    );
+}
+
+#[test]
+fn registration_preserves_native_submodule_checkout() {
+    let w = World::new();
+    let upstream = w.base.join("submodule-upstream");
+    fs::create_dir(&upstream).unwrap();
+    w.git(&upstream, &["init", "-q"]);
+    w.commit(&upstream, &[("submodule.txt", "content")], "submodule");
+    w.git(
+        &w.main(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            upstream.to_str().unwrap(),
+            "sub",
+        ],
+    );
+    w.git(&w.main(), &["commit", "-q", "-m", "add submodule"]);
+    let destination = w.base.join("with-submodule");
+    w.fw(
+        &w.main(),
+        &[
+            "add",
+            destination.to_str().unwrap(),
+            "-b",
+            "with-submodule",
+            "HEAD",
+        ],
+    )
+    .assert_ok();
+    assert!(destination.join(".gitmodules").is_file());
+    assert!(w
+        .git(&destination, &["ls-files", "--stage", "sub"])
+        .starts_with("160000 "));
+    // Native worktree add creates the gitlink, without initializing a
+    // second checkout of the submodule or changing the main checkout.
+    assert!(!destination.join("sub/.git").exists());
+    assert!(w.main().join("sub/submodule.txt").is_file());
+}
+
+#[test]
+fn registration_pool_existing_branch_switch_holds_the_repository_lock() {
+    let w = World::new();
+    w.pool_size(1);
+    w.fw(&w.main(), &["pool", "fill"]).assert_ok();
+    let _fill = hold_fill_lock(&w.pool_dir());
+    w.git(&w.main(), &["branch", "worktree-existing"]);
+    let nested = w.base.join("nested-switch");
+    let nested_output = w.base.join("nested-switch-output");
+    write_exe(
+        &w.base.join("bin/git"),
+        r#"#!/bin/sh
+case " $* " in
+  *" switch -q worktree-existing "*)
+    # A nested metadata call proves both the marker and the actual lock
+    # are held during the existing-branch switch, including its hooks.
+    "$FASTWT_BIN" add "$NESTED_DEST" -b nested-switch HEAD > "$NESTED_OUTPUT" 2>&1
+    [ "$?" -ne 0 ] || exit 91
+    grep 'recursive Git metadata operation' "$NESTED_OUTPUT" >/dev/null || exit 92
+    ;;
+esac
+exec /usr/bin/git "$@"
+"#,
+    );
+    let result = w.hook_create(
+        "existing",
+        &[
+            ("FASTWT_BIN", env!("CARGO_BIN_EXE_fast-worktree")),
+            ("NESTED_DEST", nested.to_str().unwrap()),
+            ("NESTED_OUTPUT", nested_output.to_str().unwrap()),
+        ],
+    );
+    result.assert_ok();
+    assert!(
+        result.err().contains("worktree from the pool"),
+        "{}",
+        result.err()
+    );
+    assert!(
+        !result.err().contains("git switch failed in the spare"),
+        "{}",
+        result.err()
+    );
+    let destination = PathBuf::from(last_line(&result.out()));
+    assert_eq!(
+        w.git(&destination, &["branch", "--show-current"]).trim(),
+        "worktree-existing"
+    );
+    assert!(!nested.exists());
+    assert!(fs::read_to_string(nested_output)
+        .unwrap()
+        .contains("recursive Git metadata operation"));
+}

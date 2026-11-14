@@ -150,18 +150,12 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<Spare> {
             return None;
         }
     };
-    let p = path.to_string_lossy();
-    let mut args = vec!["-C", &p, "switch", "-q"];
+    let mut args = vec!["switch", "-q"];
     match branch {
         Branch::New { name, start } => args.extend(["-c", name, start]),
         Branch::Existing(name) => args.push(name),
     }
-    let switched = std::process::Command::new("git")
-        .args(&args)
-        .env("FAST_WORKTREE_SKIP", "1")
-        .stdin(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success());
+    let switched = git::run_with_env(path, &args, &[("FAST_WORKTREE_SKIP", "1")]).is_ok();
     if switched {
         return Some(Spare { made_at });
     }

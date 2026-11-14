@@ -5,6 +5,25 @@ based on [Keep a Changelog](https://keepachangelog.com/), and this project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking
 change bumps the minor version).
 
+## [0.4.0] - 2026-11-14
+
+### Fixed
+
+- Coordinate worktree registration, inspection, branch switching and removal
+  across fast-worktree processes sharing a repository. Concurrent operations
+  no longer read another registration's incomplete Git administrative files.
+  Pool worktrees use the same coordination.
+
+### Changed
+
+- Native Git hooks retain their behavior and run within the repository
+  operation's lock. A long native hook serializes other fast-worktree Git
+  metadata operations on that repository; dependency installation and configured
+  fast-worktree preparation hooks remain outside this lock.
+- Synchronous Git metadata re-entry from a native hook into the same repository
+  now fails immediately instead of deadlocking. The inherited marker never
+  bypasses the lock. Raw Git commands do not participate in this coordination.
+
 ## [0.3.2] - 2026-11-04
 
 ### Changed
