@@ -57,8 +57,12 @@ pub(super) async fn sources(
         .await??;
         live_cursor = live.last().map(|(cursor, _)| *cursor);
         queued_cursor = queued.last().map(|(cursor, _)| *cursor);
+        let preferred = gate.preferred();
         let mut discovered = std::collections::BTreeSet::new();
-        for (_, task) in live.into_iter().chain(queued) {
+        for task in preferred
+            .into_iter()
+            .chain(live.into_iter().chain(queued).map(|(_, task)| task))
+        {
             if !discovered.insert(task.run_id.clone()) {
                 continue;
             }
@@ -75,7 +79,7 @@ pub(super) async fn sources(
             let input = crate::coordinator::ReadyInput {
                 run_id: task.run_id,
                 source_id: source.clone(),
-                manifest_digest: spec.manifest_digest,
+                manifest_digest: spec.manifest_digest.clone(),
             };
             if gate.snapshot().contains(&input) {
                 continue;
@@ -94,6 +98,12 @@ pub(super) async fn sources(
             if *input_stop.borrow() {
                 return Ok(());
             }
+            let mut transfer_started = None;
+            let query = crate::scheduler::measured::CostQuery::task(
+                &serde_json::to_value(&spec)?,
+                Some(source.as_str()),
+                gate.cost_transport(),
+            );
             let delivered = if verified && !spec.has_secret_bundle {
                 true
             } else {
@@ -133,6 +143,7 @@ pub(super) async fn sources(
                 });
                 let valid = tokio::select! { _=input_stop.changed()=>return Ok(()), result=validation=>result? };
                 if valid.is_err() {
+                    gate.fail_preference(&input.run_id);
                     continue;
                 }
                 if verified {
@@ -147,7 +158,7 @@ pub(super) async fn sources(
                     // This detached job owns only captured IO and its lease. Shutdown
                     // releases resident ownership while blocking exporter cleanup drains.
                     let mut job = tokio::spawn(async move {
-                        super::super::forward::source(
+                        super::super::forward::source_timed(
                             &client, epoch, store, &source, env, stopped, transfer,
                         )
                         .await
@@ -155,12 +166,36 @@ pub(super) async fn sources(
                     tokio::select! {
                         _=input_stop.changed()=> { let _=cancel.send(true); return Ok(()); },
                         _ = tokio::time::sleep(Duration::from_secs(30)) => { let _=cancel.send(true); tokio::select! { _=input_stop.changed()=>return Ok(()), result=job=>result?.is_ok() } },
-                        result=&mut job=>result?.is_ok(),
+                        result=&mut job=>match result? {Ok(started)=>{transfer_started=started;true},Err(_)=>false},
                     }
                 }
             };
-            if delivered && !*input_stop.borrow() {
-                gate.publish(generation, input);
+            if !delivered {
+                gate.fail_preference(&input.run_id);
+            }
+            if delivered
+                && !*input_stop.borrow()
+                && gate.publish_verified(generation, input.clone())
+                && query.transport == gate.cost_transport()
+            {
+                if let Some(started) = transfer_started {
+                    let now = crate::platform::monotonic_ms();
+                    if let Some(duration) = now.checked_sub(started) {
+                        if let Some(sample) = crate::scheduler::measured::Sample::verified(
+                            &worker_id,
+                            &query,
+                            crate::scheduler::measured::Phase::Transfer,
+                            format!(
+                                "transfer:{}:{}:{}:{}",
+                                input.run_id, generation, input.manifest_digest, started
+                            ),
+                            started,
+                            duration,
+                        ) {
+                            coordinator.scheduler().model().record(sample);
+                        }
+                    }
+                }
             }
         }
     }

@@ -32,16 +32,83 @@ fn next_gate_generation() -> u64 {
 pub struct InputGate {
     state: std::sync::Mutex<State>,
     commit: std::sync::Arc<tokio::sync::Mutex<()>>,
+    transport_policy: Option<String>,
+    preferences: std::sync::Mutex<super::prefetch::Preferences>,
 }
 impl Default for InputGate {
     fn default() -> Self {
         Self {
             state: std::sync::Mutex::new(State::new(next_gate_generation())),
             commit: std::sync::Arc::default(),
+            transport_policy: None,
+            preferences: std::sync::Mutex::default(),
         }
     }
 }
 impl InputGate {
+    pub fn with_transport_policy(policy: String) -> Self {
+        Self {
+            transport_policy: Some(policy),
+            ..Self::default()
+        }
+    }
+    pub fn cost_transport(&self) -> Option<crate::scheduler::measured::Transport> {
+        let (worker_boot, agent_epoch) = self.placement_inputs().identity?;
+        Some(crate::scheduler::measured::Transport {
+            worker_boot,
+            agent_epoch,
+            policy: self.transport_policy.clone()?,
+        })
+    }
+    pub fn publish_verified(&self, generation: u64, input: ReadyInput) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.publish(generation, input.clone());
+        let snapshot = state.snapshot();
+        snapshot.identity.is_some()
+            && snapshot.generation == generation
+            && snapshot.ready.contains(&input)
+    }
+
+    pub fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
+        self.preferences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .eligible(task, self.generation(), crate::platform::monotonic_ms())
+    }
+    pub fn prefer(&self, task: &crate::storage::QueuedTask, expected: u64, ttl: u64) -> bool {
+        self.preferences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .choose(
+                task,
+                self.generation(),
+                expected,
+                ttl,
+                crate::platform::monotonic_ms(),
+            )
+    }
+    pub fn preferred(&self) -> Option<crate::storage::QueuedTask> {
+        self.preferences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .preferred(self.generation(), crate::platform::monotonic_ms())
+    }
+    pub fn fail_preference(&self, run: &crate::ids::RunId) {
+        self.preferences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .fail(run, self.generation());
+    }
+    pub fn clear_preference(
+        &self,
+        task: Option<&crate::ids::TaskId>,
+        run: Option<&crate::ids::RunId>,
+    ) {
+        self.preferences
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear(task, run);
+    }
     pub fn placement_fence(&self) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         self.commit.clone()
     }
@@ -99,6 +166,23 @@ impl InputGate {
 }
 
 pub trait WorkerLink: Send + Sync {
+    fn cold_eligible(&self, _task: &crate::ids::TaskId) -> bool {
+        false
+    }
+    fn prefer(&self, _task: &crate::storage::QueuedTask, _expected: u64, _ttl: u64) -> bool {
+        false
+    }
+    fn clear_preference(
+        &self,
+        _task: Option<&crate::ids::TaskId>,
+        _run: Option<&crate::ids::RunId>,
+    ) {
+    }
+
+    fn cost_transport(&self) -> Option<crate::scheduler::measured::Transport> {
+        None
+    }
+
     /// A stable fence for session-generation invalidation. Gated links await it
     /// before resetting generation; a placement holds it through SQLite commit.
     /// Cache eviction does not invalidate the worker's verified source facts.
@@ -143,6 +227,24 @@ impl ClientLink {
     }
 }
 impl WorkerLink for ClientLink {
+    fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
+        self.gate.as_ref().is_some_and(|g| g.cold_eligible(task))
+    }
+    fn prefer(&self, task: &crate::storage::QueuedTask, expected: u64, ttl: u64) -> bool {
+        self.gate
+            .as_ref()
+            .is_some_and(|g| g.prefer(task, expected, ttl))
+    }
+    fn clear_preference(&self, task: Option<&crate::ids::TaskId>, run: Option<&crate::ids::RunId>) {
+        if let Some(gate) = &self.gate {
+            gate.clear_preference(task, run);
+        }
+    }
+
+    fn cost_transport(&self) -> Option<crate::scheduler::measured::Transport> {
+        self.gate.as_ref()?.cost_transport()
+    }
+
     fn read_only_call(&self, request: Request) -> LinkFuture<'_> {
         Box::pin(async move {
             self.client
@@ -193,6 +295,20 @@ pub(super) struct Budgeted {
 }
 
 impl WorkerLink for Budgeted {
+    fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
+        self.inner.cold_eligible(task)
+    }
+    fn prefer(&self, task: &crate::storage::QueuedTask, expected: u64, ttl: u64) -> bool {
+        self.inner.prefer(task, expected, ttl)
+    }
+    fn clear_preference(&self, task: Option<&crate::ids::TaskId>, run: Option<&crate::ids::RunId>) {
+        self.inner.clear_preference(task, run);
+    }
+
+    fn cost_transport(&self) -> Option<crate::scheduler::measured::Transport> {
+        self.inner.cost_transport()
+    }
+
     fn read_only_call(&self, request: Request) -> LinkFuture<'_> {
         Box::pin(async move {
             tokio::time::timeout_at(self.deadline, self.inner.read_only_call(request))

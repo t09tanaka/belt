@@ -63,6 +63,7 @@ want = {
     "src/platform/process_read.rs",
     "src/coordinator/policy.rs",
     "src/coordinator/input_gate.rs",
+    "src/coordinator/prefetch.rs",
     "src/results/plan.rs",
     "src/results/clock_policy.rs",
     "src/scheduler/decide.rs",

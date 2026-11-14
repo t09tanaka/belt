@@ -6,7 +6,7 @@ use crate::ids::*;
 use crate::platform::wall_ms;
 use crate::protocol::{connect, ClientConfig, Io};
 use crate::results::{CollectConfig, ResultStore};
-use crate::scheduler::UnknownCosts;
+use crate::scheduler::measured::MeasuredCosts;
 use crate::state::{AttemptState, Observation, Receipts, Termination};
 use crate::storage::CoordinatorStore;
 use crate::worker::{agent::Agent, serve::serve_connection};
@@ -376,7 +376,12 @@ impl StartupParts {
         reject_symlinks(&inputs.state_dir)?;
         let settings = config.runtime_settings()?;
         let store = CoordinatorStore::open_bound(&inputs.state_dir, wall_ms(), binding)?;
-        let coordinator = Arc::new(settings.start_coordinator(store, Arc::new(UnknownCosts))?);
+        private_dir(&inputs.state_dir.join("parent"))?;
+        let costs: Arc<dyn crate::scheduler::CostModel> =
+            MeasuredCosts::open(&inputs.state_dir.join("parent/stats"), inputs.collection)
+                .map(|costs| Arc::new(costs) as Arc<dyn crate::scheduler::CostModel>)
+                .unwrap_or_else(|_| Arc::new(crate::scheduler::UnknownCosts));
+        let coordinator = Arc::new(settings.start_coordinator(store, costs)?);
         let files = Arc::new(ResultStore::open(&inputs.state_dir.join("results"))?);
         let ipc = inputs.state_dir.join("parent");
         private_dir(&ipc)?;
@@ -475,6 +480,7 @@ async fn connect_local(
     UnixListener,
     tokio::task::JoinHandle<()>,
     crate::protocol::Client,
+    Arc<crate::coordinator::InputGate>,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
@@ -508,6 +514,18 @@ async fn connect_local(
         }
     };
     let worker_client = connected.client.clone();
+    let provenance = Digest::of_bytes(&serde_json::to_vec(
+        &serde_json::json!({"transport":"local-private-rpc-v1","protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"timeout_ms":parts.worker_timeout.as_millis()}),
+    )?);
+    let input_gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(
+        provenance.to_string(),
+    ));
+    input_gate
+        .observe(
+            connected.worker.worker_boot_id.clone(),
+            connected.worker.agent_epoch,
+        )
+        .await;
     if let Err(e) = config
         .attach_worker(
             &parts.coordinator,
@@ -519,7 +537,7 @@ async fn connect_local(
         worker_connection.abort();
         anyhow::bail!(e.message);
     }
-    Ok((listener, worker_connection, worker_client))
+    Ok((listener, worker_connection, worker_client, input_gate))
 }
 
 impl Resident {
@@ -553,7 +571,7 @@ impl Resident {
         })
         .await??;
         let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection, worker_client) = match connected {
+        let (listener, worker_connection, worker_client, input_gate) = match connected {
             Ok(value) => value,
             Err(e) => {
                 tokio::task::spawn_blocking(move || startup.cleanup()).await?;
@@ -561,7 +579,7 @@ impl Resident {
             }
         };
         let parts = startup.parts.take().expect("prepared startup");
-        let input_gate = Arc::new(crate::coordinator::InputGate::default());
+
         parts
             .coordinator
             .attach(
@@ -767,6 +785,9 @@ impl Resident {
                 failure.get_or_insert(e.into());
             }
         }
+        let costs = self.coordinator.scheduler().model();
+        // All telemetry producers are drained, outside actor and admission locks.
+        let _ = tokio::task::spawn_blocking(move || costs.drain()).await;
         // No cancellation or terminal write: supervisors keep running, and a
         // restarted owner adopts the same durable attempts.
         let agent = self.agent.clone();
@@ -1033,6 +1054,7 @@ async fn handle(
                 expected_control_revision,
                 request_id,
             } => {
+                let clear_target = target.clone();
                 let owner = coordinator.clone();
                 match tokio::task::spawn_blocking(move || {
                     owner.store().cancel_control(
@@ -1044,7 +1066,10 @@ async fn handle(
                 })
                 .await?
                 {
-                    Ok(snapshot) => Reply::Cancelled { snapshot },
+                    Ok(snapshot) => {
+                        coordinator.clear_prefetch(&clear_target);
+                        Reply::Cancelled { snapshot }
+                    }
                     Err(error) => Reply::ControlError {
                         error: crate::error::ApiError::new(error.code(), error.to_string()),
                     },
@@ -1317,7 +1342,7 @@ pub(super) fn private_dir(path: &Path) -> io::Result<()> {
         Err(e) => Err(e),
     }
 }
-pub(super) fn validate_components(path: &Path) -> io::Result<()> {
+pub(crate) fn validate_components(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

@@ -295,6 +295,10 @@ fn wanted<'a>(
 #[derive(Clone)]
 pub struct Collector {
     pin: Option<Arc<crate::results::pin::RunPin>>,
+    costs: Option<(
+        Arc<dyn crate::scheduler::CostModel>,
+        Arc<crate::scheduler::measured::Tails>,
+    )>,
     store: Arc<CoordinatorStore>,
     files: Arc<ResultStore>,
     cfg: CollectConfig,
@@ -319,6 +323,7 @@ impl Collector {
     ) -> Collector {
         Collector {
             pin: None,
+            costs: None,
             store,
             files,
             cfg,
@@ -327,6 +332,15 @@ impl Collector {
             stop: None,
             collecting: None,
         }
+    }
+
+    pub(crate) fn with_costs(
+        mut self,
+        model: Arc<dyn crate::scheduler::CostModel>,
+        tails: Arc<crate::scheduler::measured::Tails>,
+    ) -> Self {
+        self.costs = Some((model, tails));
+        self
     }
 
     /// Use the waits of the passes before this one.
@@ -478,7 +492,47 @@ impl Collector {
             }
             Err(e) => return Err(e),
         };
-        pinned.one_pinned(link, c, deadline).await
+        // Pin acquisition/ownership wait is outside the active tail interval.
+        // A result file without a collection row is interrupted pretracking IO.
+        let pristine = if c.row.is_none() {
+            let attempt = c.record.attempt_id.clone();
+            pinned
+                .fs(move |files| Ok(!files.result_path(&attempt).exists()))
+                .await
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        let segment = self.costs.as_ref().and_then(|(_, tails)| {
+            let payload = c.payload.as_ref()?;
+            let source = payload.get("source_id")?.as_str()?;
+            let mut query = crate::scheduler::measured::CostQuery::task(
+                payload,
+                Some(source),
+                link?.cost_transport(),
+            );
+            query.collection_policy = Some(crate::scheduler::measured::collection_policy(self.cfg));
+            tails.begin(
+                &c.record.attempt_id,
+                &c.record.worker_id,
+                query,
+                pristine && !c.settled_here,
+            )
+        });
+        let outcome = pinned.one_pinned(link, c, deadline).await;
+        if let Some(segment) = segment {
+            let complete = matches!(&outcome, Ok(End::Closed(Verdict::Complete)));
+            let healthy = matches!(
+                &outcome,
+                Ok(End::Pending) | Ok(End::Closed(Verdict::Complete))
+            ) && !pinned.stopping();
+            if let Some(sample) = segment.finish(healthy, complete) {
+                if let Some((model, _)) = &self.costs {
+                    model.record(sample);
+                }
+            }
+        }
+        outcome
     }
     async fn one_pinned(
         &self,

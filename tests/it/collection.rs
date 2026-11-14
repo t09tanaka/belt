@@ -425,6 +425,14 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
 }
 
 impl WorkerLink for Worker {
+    fn cost_transport(&self) -> Option<remote_task_runner::scheduler::measured::Transport> {
+        Some(remote_task_runner::scheduler::measured::Transport {
+            worker_boot: WorkerBootId::parse("boot-1").unwrap(),
+            agent_epoch: AgentEpoch(1),
+            policy: "verified-memory-fixture-v1".into(),
+        })
+    }
+
     fn call(
         &self,
         request: Request,
@@ -484,7 +492,7 @@ struct Fx {
 
 fn fx() -> Fx {
     Fx {
-        dir: tempfile::tempdir().unwrap(),
+        dir: tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap(),
         w: Worker::new("w-a"),
     }
 }
@@ -504,6 +512,12 @@ impl Fx {
     /// Start a coordinator and open the result store on the state directory:
     /// the first, or the next after the one before was dropped.
     fn open(&self) -> (Coordinator, Arc<ResultStore>) {
+        self.open_with(Arc::new(remote_task_runner::scheduler::UnknownCosts))
+    }
+    fn open_with(
+        &self,
+        costs: Arc<dyn remote_task_runner::scheduler::CostModel>,
+    ) -> (Coordinator, Arc<ResultStore>) {
         let started = std::time::Instant::now();
         let store = loop {
             match CoordinatorStore::open(self.dir.path(), 1) {
@@ -521,7 +535,9 @@ impl Fx {
             lease_ms: 60_000,
             worker_budget_ms: 10_000,
         };
-        let c = Coordinator::start(store, cfg).unwrap();
+        let scheduler =
+            remote_task_runner::scheduler::Scheduler::new(Default::default(), costs).unwrap();
+        let c = Coordinator::start_with(store, cfg, scheduler).unwrap();
         c.try_attach(
             self.w.id.clone(),
             Arc::clone(&self.w) as Arc<dyn WorkerLink>,
@@ -2585,4 +2601,138 @@ async fn generic_bundle_encoding_conditions_and_exact_receipt_are_enforced() {
         }
         assert!(!fx.w.acks(&a).is_empty());
     }
+}
+
+#[tokio::test]
+async fn measured_terminal_tail_records_real_chunked_complete_collection_after_live_progress() {
+    use remote_task_runner::scheduler::{
+        measured::{collection_policy, CostQuery, MeasuredCosts},
+        CostModel,
+    };
+    let f = fx();
+    let model = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
+    let (c, files) = f.open_with(model.clone());
+    let (_, _, a) = placed(&f, &c, two()).await;
+    f.w.set(|s| s.jobs.get_mut(&a).unwrap().out.log = b"hello ".to_vec());
+    collect(&c, &files).await;
+    assert!(c
+        .store()
+        .log_progress(&a, LogStream::Stdout)
+        .unwrap()
+        .is_some_and(|p| p.committed_bytes > 0));
+    end(&f, &c, &a, Outcome::Succeeded, full(&f, &a)).await;
+    for _ in 0..20 {
+        if is_collected(&c, &a) {
+            break;
+        }
+        collect(&c, &files).await;
+    }
+    assert!(is_collected(&c, &a));
+    assert_eq!(published(&files, &a, "alpha.txt"), Some(ALPHA.to_vec()));
+    model.drain();
+    let payload = f.w.payload(&a);
+    let mut query = CostQuery::task(
+        &serde_json::to_value(&payload).unwrap(),
+        Some(payload.source_id.as_str()),
+        f.w.cost_transport(),
+    );
+    query.collection_policy = Some(collection_policy(cfg()));
+    assert!(model.query(&f.w.id, &query).ms[COLLECTION_PART].is_some());
+    assert_eq!(model.query(&f.w.id, &query).ms[1], None);
+    // A closed receipt is never timed again, nor does a lookup refresh it.
+    let db = rusqlite::Connection::open(f.dir.path().join("stats/costs-v1.sqlite")).unwrap();
+    let before: (i64, i64) = db
+        .query_row("SELECT COUNT(*),SUM(observed) FROM costs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    for _ in 0..100 {
+        let _ = model.query(&f.w.id, &query);
+    }
+    collect(&c, &files).await;
+    let after: (i64, i64) = db
+        .query_row("SELECT COUNT(*),SUM(observed) FROM costs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(before, after);
+    drop(c);
+    let restarted = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
+    let (c, files) = f.open_with(restarted.clone());
+    for _ in 0..3 {
+        collect(&c, &files).await;
+    }
+    assert!(is_collected(&c, &a));
+    restarted.drain();
+    let after_restart: (i64, i64) = db
+        .query_row("SELECT COUNT(*),SUM(observed) FROM costs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(before, after_restart);
+}
+const COLLECTION_PART: usize = 2;
+
+#[tokio::test]
+async fn measured_terminal_tail_fault_then_recovery_does_not_publish_partial_duration() {
+    use remote_task_runner::scheduler::measured::MeasuredCosts;
+    let f = fx();
+    let model = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
+    let (c, files) = f.open_with(model.clone());
+    let (_, _, a) = placed(&f, &c, two()).await;
+    end(&f, &c, &a, Outcome::Succeeded, full(&f, &a)).await;
+    f.w.set(|s| s.fail = Some(("result", ErrorCode::NotFound, 1)));
+    let failed = collect(&c, &files).await;
+    assert!(failed.pending.contains(&a));
+    assert!(!is_collected(&c, &a));
+    assert_eq!(
+        f.w.state.lock().unwrap().fail,
+        Some(("result", ErrorCode::NotFound, 0))
+    );
+    for _ in 0..20 {
+        if is_collected(&c, &a) {
+            break;
+        }
+        collect(&c, &files).await;
+    }
+    assert!(is_collected(&c, &a));
+    model.drain();
+    let db = rusqlite::Connection::open(f.dir.path().join("stats/costs-v1.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM costs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn measured_terminal_tail_durable_close_failure_keeps_sample_unknown_after_recovery() {
+    use remote_task_runner::scheduler::measured::MeasuredCosts;
+    let f = fx();
+    let model = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
+    let (c, files) = f.open_with(model.clone());
+    let (_, _, a) = placed(&f, &c, two()).await;
+    end(&f, &c, &a, Outcome::Succeeded, full(&f, &a)).await;
+    // Reject only the final durable closure, after all actual result IO and
+    // worker acknowledgement. Recovery must not invent a whole-tail sample.
+    let db = rusqlite::Connection::open(f.dir.path().join("coordinator.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fixture_deny_close BEFORE UPDATE ON collection WHEN NEW.closed_at_ms IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture durable close failure'); END;").unwrap();
+    collect(&c, &files).await;
+    assert!(!is_collected(&c, &a));
+    db.execute_batch("DROP TRIGGER fixture_deny_close;")
+        .unwrap();
+    for _ in 0..20 {
+        if is_collected(&c, &a) {
+            break;
+        }
+        collect(&c, &files).await;
+    }
+    assert!(is_collected(&c, &a));
+    model.drain();
+    let db = rusqlite::Connection::open(f.dir.path().join("stats/costs-v1.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM costs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }

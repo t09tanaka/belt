@@ -12,6 +12,7 @@ pub struct ReadyInput {
 pub struct PlacementInputs {
     pub generation: u64,
     pub ready: Vec<ReadyInput>,
+    pub identity: Option<(WorkerBootId, AgentEpoch)>,
 }
 
 pub(super) struct State {
@@ -33,6 +34,7 @@ impl State {
         PlacementInputs {
             generation: self.generation,
             ready: self.ready.clone(),
+            identity: self.identity.clone(),
         }
     }
     pub fn generation(&self) -> u64 {

@@ -2084,8 +2084,37 @@ struct InputGatedWorker {
     worker: Arc<FakeWorker>,
     gate: Arc<remote_task_runner::coordinator::InputGate>,
     invalidate_forecast: AtomicBool,
+    attestor: Option<Arc<ToolchainAttestor>>,
 }
 impl WorkerLink for InputGatedWorker {
+    fn read_only_call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        match &self.attestor {
+            Some(attestor) => attestor.read_only_call(request),
+            None => self.call(request),
+        }
+    }
+
+    fn cost_transport(&self) -> Option<remote_task_runner::scheduler::measured::Transport> {
+        self.gate.cost_transport()
+    }
+    fn cold_eligible(&self, task: &TaskId) -> bool {
+        self.gate.cold_eligible(task)
+    }
+    fn prefer(
+        &self,
+        task: &remote_task_runner::storage::QueuedTask,
+        expected: u64,
+        ttl: u64,
+    ) -> bool {
+        self.gate.prefer(task, expected, ttl)
+    }
+    fn clear_preference(&self, task: Option<&TaskId>, run: Option<&RunId>) {
+        self.gate.clear_preference(task, run);
+    }
+
     fn placement_fence(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
         Some(self.gate.placement_fence())
     }
@@ -2120,6 +2149,7 @@ fn gated_worker(worker: &Arc<FakeWorker>) -> Arc<InputGatedWorker> {
         worker: worker.clone(),
         gate: Arc::default(),
         invalidate_forecast: AtomicBool::new(false),
+        attestor: None,
     })
 }
 fn ready_input(
@@ -2839,4 +2869,177 @@ async fn slow_toolchain_attestation_respects_round_budget_and_other_lease_progre
     healthy.finish(&active.attempt_id, Outcome::Succeeded);
     c.tick().await.unwrap();
     assert_eq!(only(&c, &first[0]).state, AttemptState::Terminal);
+}
+
+#[tokio::test]
+async fn measured_cold_choice_waits_without_attempt_then_failed_prefetch_places_healthy_warm() {
+    measured_cold_fixture(true, false, false).await;
+}
+#[tokio::test]
+async fn unknown_cold_candidate_keeps_existing_ready_gate_eligibility() {
+    measured_cold_fixture(false, false, false).await;
+}
+#[tokio::test]
+async fn measured_cold_candidate_cannot_bypass_frozen_toolchain_eligibility() {
+    measured_cold_fixture(true, true, false).await;
+}
+#[tokio::test]
+async fn measured_cold_frozen_attested_candidate_prefetches_before_attempt() {
+    measured_cold_fixture(true, true, true).await;
+}
+async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
+    use remote_task_runner::scheduler::measured::{CostQuery, MeasuredCosts, Phase, Sample};
+    let mut f = fx();
+    let stats = tempfile::tempdir().unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(stats.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let model = Arc::new(
+        MeasuredCosts::open(
+            &std::fs::canonicalize(stats.path()).unwrap(),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    f.costs = model.clone();
+    let warm = f.worker("warm", (2, 1));
+    let cold = f.worker("cold", (2, 1));
+    warm.set(|s| s.forecasting.run_ms = 100_000);
+    cold.set(|s| s.forecasting.run_ms = 1000);
+    let c = f.open(&[]);
+    let warm_link = Arc::new(InputGatedWorker {
+        worker: warm.clone(),
+        gate: Arc::new(
+            remote_task_runner::coordinator::InputGate::with_transport_policy(
+                "fixture-rpc-v1".into(),
+            ),
+        ),
+        invalidate_forecast: AtomicBool::new(false),
+        attestor: frozen.then(|| {
+            Arc::new(ToolchainAttestor {
+                worker: warm.clone(),
+                stall_resolution: false,
+            })
+        }),
+    });
+    let cold_link = Arc::new(InputGatedWorker {
+        worker: cold.clone(),
+        gate: Arc::new(
+            remote_task_runner::coordinator::InputGate::with_transport_policy(
+                "fixture-rpc-v1".into(),
+            ),
+        ),
+        invalidate_forecast: AtomicBool::new(false),
+        attestor: frozen.then(|| {
+            Arc::new(ToolchainAttestor {
+                worker: cold.clone(),
+                stall_resolution: !cold_attests,
+            })
+        }),
+    });
+    for link in [&warm_link, &cold_link] {
+        link.gate
+            .observe(WorkerBootId::parse("boot-1").unwrap(), AgentEpoch(1))
+            .await;
+    }
+    c.attach(warm.id.clone(), warm_link.clone()).await;
+    c.attach(cold.id.clone(), cold_link.clone()).await;
+    let tasks = if frozen {
+        use remote_task_runner::toolchain::{contract::FrozenBundle, versions::*};
+        let mut task_spec = spec();
+        let scope = Scope::project("");
+        task_spec.toolchains = Some(
+            FrozenBundle::seal_exact(
+                FrozenToolchains::freeze(
+                    task_spec.manifest_digest.clone(),
+                    Digest::of_bytes(b"parent"),
+                    scope.clone(),
+                    &[Declaration {
+                        tool: ToolId::parse("node").unwrap(),
+                        constraint: Constraint::parse("20.0.0").unwrap(),
+                        scope,
+                        location: Location {
+                            path: ".node-version".into(),
+                            first_line: 1,
+                            last_line: 1,
+                        },
+                    }],
+                    &[],
+                    &BTreeMap::new(),
+                    MatchPolicy::Exact,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let id = TaskId::generate();
+        c.enqueue(RunId::generate(), source(&c), vec![(id.clone(), task_spec)])
+            .await
+            .unwrap();
+        vec![id]
+    } else {
+        enqueue(&c, 1).await
+    };
+    let task = c.store().queued_tasks(1).unwrap().remove(0);
+    warm_link
+        .gate
+        .publish(warm_link.gate.generation(), ready_input(&task));
+    if known {
+        let query = CostQuery::task(
+            &task.spec,
+            task.source_id.as_ref().map(|s| s.as_str()),
+            cold_link.cost_transport(),
+        );
+        let now = remote_task_runner::platform::monotonic_ms();
+        model.record(
+            Sample::verified(
+                &cold.id,
+                &query,
+                Phase::Transfer,
+                "verified-fixture-exchange".into(),
+                now.saturating_sub(10),
+                10,
+            )
+            .unwrap(),
+        );
+    }
+    model.drain();
+    let report = c.tick().await.unwrap();
+    if known && (!frozen || cold_attests) {
+        assert!(report.placed.is_empty());
+        assert!(attempts(&c, &tasks[0]).is_empty());
+        assert_eq!(cold_link.gate.preferred().unwrap().task_id, task.task_id);
+        assert!(cold.count(Op::Forecast) > 0);
+        // A real delivery error suppresses the cold choice; the next normal
+        // scheduler comparison places the healthy ready worker.
+        cold_link.gate.fail_preference(&task.run_id);
+        assert_eq!(c.tick().await.unwrap().placed.len(), 1);
+    } else {
+        assert_eq!(report.placed.len(), 1);
+        assert_eq!(cold.count(Op::Forecast), 0);
+    }
+    assert_eq!(only(&c, &tasks[0]).worker_id, warm.id);
+    let evidence =
+        remote_task_runner::scheduler::cost_evidence_of(c.store(), &only(&c, &tasks[0]).attempt_id)
+            .unwrap()
+            .unwrap();
+    let warm_evidence = &evidence
+        .iter()
+        .find(|e| e.worker_id == warm.id)
+        .unwrap()
+        .costs;
+    assert_eq!(
+        warm_evidence.transfer.kind,
+        remote_task_runner::scheduler::measured::EvidenceKind::VerifiedReady
+    );
+    assert_eq!(warm_evidence.transfer.sample_count, Some(0));
+    assert_eq!(warm_evidence.setup.ms, None);
+    assert!(cold_link.gate.preferred().is_none());
+    assert_eq!(warm.count(Op::Submit), 1);
+    assert_eq!(cold.count(Op::Submit), 0);
+    if frozen && !cold_attests {
+        assert_eq!(warm.count(Op::Forecast), 1);
+        assert_eq!(cold.count(Op::Forecast), 0);
+    }
 }
