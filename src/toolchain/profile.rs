@@ -626,7 +626,7 @@ mod tests {
             fake(
                 root.path(),
                 tool,
-                &format!("touch {:?}; echo 3.0.0", marker),
+                &format!("printf bootstrap > {:?}; echo 3.0.0", marker),
                 0o700,
             );
             assert_eq!(p.probe(tool), ToolObservation::Unknown);
