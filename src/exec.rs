@@ -2628,7 +2628,6 @@ impl<'a> Runner<'a> {
         shard: Option<&dag::TaskShard>,
     ) -> Vec<(JobResult, Map<String, Value>)> {
         let gh = self.github_ctx(ws, w, event, &job.id);
-        let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
         let skip = |display: String, reason: String| {
             (
                 JobResult {
@@ -2670,161 +2669,31 @@ impl<'a> Runner<'a> {
             )
         };
 
-        let needs_of_job: Map<String, Value> = job
-            .needs
-            .iter()
-            .filter_map(|n| needs.get(n).map(|v| (n.clone(), v.clone())))
-            .collect();
-        // The status functions of a job, as on GitHub: `success()` when every
-        // job it needs succeeded (a skipped one does not count), `failure()`
-        // when one failed, or any job further up did, `cancelled()` when the
-        // run was cancelled.
-        let results: Vec<String> = needs_of_job
-            .values()
-            .map(|v| v["result"].as_str().unwrap_or("success").to_string())
-            .collect();
-        let any_result = |r: &str| results.iter().any(|x| x == r);
-        let needs_fns = expr::StatusFns {
-            success: results.iter().all(|r| r == "success"),
-            failure: ancestor_failed || any_result("failure"),
-            cancelled: run_cancelled,
-        };
-        // why a job that is not run by its `if:` is not run
-        let why_not = || {
-            if needs_fns.success || !expr::success_gated(job.cond.as_deref()) {
-                "if: false"
-            } else if any_result("failure") {
-                "needs failed"
-            } else if any_result("cancelled") {
-                "needs cancelled"
-            } else if any_result("skipped") {
-                "needs skipped"
-            } else {
-                "if: false"
-            }
-        };
-        let mut ctx_map = Map::new();
-        ctx_map.insert("github".into(), gh.clone());
-        ctx_map.insert("needs".into(), Value::Object(needs_of_job.clone()));
-        ctx_map.insert("runner".into(), self.runner_ctx());
-        ctx_map.insert("inputs".into(), json!({}));
-        ctx_map.insert("vars".into(), json!({}));
-        ctx_map.insert("env".into(), json!({}));
-        ctx_map.insert("matrix".into(), json!({}));
-        ctx_map.insert("strategy".into(), json!({}));
-
-        // The matrix may be an expression over `needs`.
-        let combos = match &job.matrix {
-            None => vec![Map::new()],
-            Some(m) => {
-                let ctx = Ctx::new(&ctx_map, Status::Success);
-                let value = eval_strings(&matrix::yaml_to_json(m), &ctx);
-                match value.and_then(|v| matrix::expand(&v)) {
-                    Ok(c) => c,
-                    Err(e) => return vec![error(base_name, format!("matrix: {e:#}"))],
+        let evaluated = crate::job_evaluate::evaluate_job(
+            job,
+            gh,
+            self.runner_ctx(),
+            needs,
+            ancestor_failed,
+            run_cancelled,
+            only,
+            shard,
+        );
+        let mut out = Vec::new();
+        let notes: Vec<(usize, String)> = Vec::new();
+        let mut todo = Vec::new();
+        for entry in evaluated.entries {
+            match entry.decision {
+                crate::job_evaluate::Decision::Run(cm) => {
+                    todo.push((out.len(), cm, entry.display));
+                    out.push(None);
                 }
-            }
-        };
-        if job.container {
-            return vec![skip(base_name, "container: is not supported".into())];
-        }
-        if let Some(u) = &job.reusable {
-            return vec![skip(
-                base_name,
-                format!("reusable workflow {u} is not supported"),
-            )];
-        }
-
-        // The entries of the matrix with their contexts and names.
-        let mut entries: Vec<(usize, Map<String, Value>, String)> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let total = combos.len();
-        let mut matrices: Vec<Map<String, Value>> = Vec::new();
-        for (idx, combo) in combos.into_iter().enumerate() {
-            let mut cm = ctx_map.clone();
-            cm.insert("matrix".into(), Value::Object(combo.clone()));
-            cm.insert(
-                "strategy".into(),
-                json!({"job-index": idx, "job-total": total}),
-            );
-            let mut display = {
-                let ctx = Ctx::new(&cm, Status::Success);
-                match &job.name {
-                    Some(n) if n.contains("${{") => {
-                        expr::interpolate(n, &ctx).unwrap_or_else(|_| n.clone())
-                    }
-                    Some(n) if !combo.is_empty() => format!("{n} ({})", matrix::describe(&combo)),
-                    Some(n) => n.clone(),
-                    None if !combo.is_empty() => {
-                        format!("{} ({})", job.id, matrix::describe(&combo))
-                    }
-                    None => job.id.clone(),
+                crate::job_evaluate::Decision::Skip(reason) => {
+                    out.push(Some(skip(entry.display, reason)))
                 }
-            };
-            // each shard of a job has a name (and so a log) of its own
-            if let Some(t) = shard {
-                display = format!("{display} (shard {}/{})", t.index + 1, t.count);
-            }
-            // a name over some of the matrix only: keep the entries (and their logs) apart
-            if !seen.insert(display.clone()) {
-                display = format!("{display} #{}", idx + 1);
-                seen.insert(display.clone());
-            }
-            matrices.push(combo);
-            entries.push((idx, cm, display));
-        }
-
-        // The OS each entry's `runs-on` names. Every job runs on the host: the
-        // entries of another OS that a leg of the host's OS stands in for are
-        // not run, the others run with a note.
-        let host = os_legs::Family::host();
-        let os_of: Vec<Option<(os_legs::Family, String)>> = entries
-            .iter()
-            .map(|(_, cm, _)| os_legs::family_of_leg(job, cm))
-            .collect();
-        let twin_of: Vec<Option<usize>> = if self.opts.all_os_legs {
-            vec![None; entries.len()]
-        } else {
-            let legs: Vec<os_legs::Leg> = os_of
-                .iter()
-                .zip(matrices)
-                .map(|(o, matrix)| os_legs::Leg {
-                    family: o.as_ref().map(|(f, _)| *f),
-                    matrix,
-                })
-                .collect();
-            os_legs::twins(host, job, &legs)
-        };
-
-        // Combinations that pass `if:` run after this loop.
-        let mut out: Vec<Option<(JobResult, Map<String, Value>)>> = Vec::new();
-        let mut todo: Vec<(usize, Map<String, Value>, String)> = Vec::new();
-        let mut notes: Vec<(usize, String)> = Vec::new();
-        for (k, (idx, cm, display)) in entries.iter().enumerate() {
-            if only.is_some_and(|o| o != *idx) {
-                continue;
-            }
-            let (cm, display) = (cm.clone(), display.clone());
-            let run_it = {
-                let ctx = Ctx::with_fns(&cm, needs_fns);
-                expr::condition(job.cond.as_deref(), &ctx)
-            };
-            match run_it {
-                Ok(true) => match (&os_of[k], twin_of[k]) {
-                    (Some((family, label)), Some(t)) => out.push(Some(skip(
-                        display,
-                        os_legs::not_run_reason(label, *family, host, &entries[t].2),
-                    ))),
-                    (os, _) => {
-                        if let Some((family, label)) = os.as_ref().filter(|(f, _)| *f != host) {
-                            notes.push((out.len(), os_legs::ran_on_note(label, *family, host)));
-                        }
-                        todo.push((out.len(), cm, display));
-                        out.push(None);
-                    }
-                },
-                Ok(false) => out.push(Some(skip(display, why_not().into()))),
-                Err(e) => out.push(Some(error(display, format!("if: {e:#}")))),
+                crate::job_evaluate::Decision::Error(reason) => {
+                    out.push(Some(error(entry.display, reason)))
+                }
             }
         }
 
