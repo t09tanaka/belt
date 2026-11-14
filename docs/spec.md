@@ -1150,10 +1150,10 @@ closed の不完全ログ・回収失敗は利用可能 bytes を返して COLLE
 途中 snapshot は pending を明示して 0。Ctrl-C は cancel を送らず detach / 130。
 出力先が詰まっている場合も detach は待たず、割り込み時の final は出力可能な場合に送る。
 
-将来の retention GC は reader が検証して開いた FD / 短期 pin と排他を統合し、
-active / pending / finalizing の回収と reader 使用中の削除を防ぐ必要がある。
-現時点の read-only CLI は親 DB へ pin を書かない。GC 未接続の間も消失を空成功にせず
-明示エラーとする。GC / outputs / output planner の完成を本ログ経路だけで意味しない。
+retention GC は run ごとの永続 pin の共有/排他 lock で reader と分離する。
+read-only CLI は pin 作成・DB 更新を行わず、owner が準備した inode を検証して保持する。
+active / pending / finalizing と reader 使用中の削除を防ぐ。ログ経路だけで
+source/Vault/private binding GC や output planner の完成を意味しない。
 
 ### Generic output bundles (TarV1)
 
@@ -1206,16 +1206,17 @@ raw bytes を magic sniffing で tar と解釈しない。汎用 unpack は使�
 
 `outputs <run-or-task-id> --dir <directory>` exports currently receipted outputs. The destination is required. `--attempt <attempt-id>` addresses an exact historical attempt and is valid only with its owning task. Default selection respects the task's latest generation boundary; a retry awaiting placement never exports an old success. Reads work with the owner stopped, without Git or project configuration, and never start a service or change the coordinator epoch.
 
-Legacy raw objects export at `<directory>/<task>/<attempt>/<name>`. Generic `tar_v1` bundles export at `<directory>/<task>/<attempt>/<name>/<workspace-relative-member>`. Encoding comes from immutable result metadata; raw bytes are never sniffed as archives. Only durable artifact receipts authorize objects. Reads and private spool copies use bounded buffers, and metadata/task pages contain at most 64 entries.
+Legacy raw objects export at `<directory>/<task>/<attempt>/<name>`. Generic `tar_v1` bundles export at `<directory>/<task>/<attempt>/<name>/<workspace-relative-member>`. Encoding comes from immutable result metadata; raw bytes are never sniffed as archives. Durable artifact receipts plus fresh retained result/blob references authorize objects. Reads and private spool copies use bounded buffers, and metadata/task pages contain at most 64 entries.
 
 The exporter verifies outer size and SHA-256, then validates the whole uncompressed GNU tar subset before publishing any bundle member. Only regular files and bounded GNU long names are supported. Unsafe paths, duplicate/case/Unicode/prefix collisions, links, sparse/PAX/special entries, truncation and trailing garbage are refused. Destination ancestors must be real directories; symlinks and existing destination files conflict, even when bytes match. New directories are 0700 and files 0600. Publication never overwrites. Concurrent destination conflicts preserve successful exports and report each failure.
 
-`--json` uses bounded NDJSON: target observation, per-file outcome or artifact error, then exactly one final summary attempt with aggregate counts and a reader exit code. Target execution failure is independent of successful export. Pending collection is reported without claiming run success; closed collection failure exits 78. Corruption/missing retained objects exit 79, destination conflicts 72, invalid inputs 2. Ctrl-C exits 130 and detaches only the reader, including when stdout is blocked. GC reader lifetime integration remains required before resident automatic deletion is enabled.
+`--json` uses bounded NDJSON: target observation, per-file outcome or artifact error, then exactly one final summary attempt with aggregate counts and a reader exit code. Target execution failure is independent of successful export. Pending collection is reported without claiming run success; closed collection failure exits 78. Expired, unreferenced or deletion-claimed data exits 73 even if the file still exists. Missing/short/corrupt files with live references exit 79, destination conflicts 72, invalid inputs 2. Ctrl-C exits 130 and detaches only the reader, including when stdout is blocked. The shared run pin is held through cooperative worker cancellation/drain and every final write/flush, including backpressure and SIGINT.
 結果 retention GC は run ごとの永続 reader-pins inode と共有/排他 flock を使う。
 read-only logs は対象 run を仮解決し、pin を read-only/nonblocking shared-lock し、
 inode と新しい metadata binding を確認した後に読み始め、follow/detach を含む invocation 全体で保持する。
 missing/legacy pin は明示 unavailable とし、reader は作成・DB 更新・owner 起動を行わない。
-将来の outputs/export CLI も CoordinatorStore::result_read_pin を取得し、出力完了まで保持する。
+outputs/export CLI も configured read-only store の identity 検証後に CoordinatorStore::result_read_pin を取得し、
+新しい metadata 読取から blocking worker の drain と最終出力/flush 完了まで invocation 外側で保持する。
 owner は create_run/enqueue の両経路で DB transaction に入る前に pin 作成と fsync を行う。
 ref 公開前にも pin を準備し、legacy run は bounded page で backfill する。
 pin inode は parent state とともに保持し、unlink/置換しない。最初の GC 対応版以降の owner と

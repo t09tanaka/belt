@@ -295,6 +295,10 @@ impl CoordinatorStore {
         let row = self.collection(attempt)?;
         let mut items = Vec::new();
         if let Some(result) = row.and_then(|r| r.result) {
+            self.result_data_available(
+                attempt,
+                &crate::results::store::ResultStore::result_locator(attempt),
+            )?;
             if result
                 .get("attempt_id")
                 .is_some_and(|id| id.as_str() != Some(attempt.as_str()))
@@ -344,6 +348,13 @@ impl CoordinatorStore {
                             "artifact receipt differs from immutable result".into(),
                         ));
                     }
+                    self.result_data_available(
+                        attempt,
+                        &crate::results::store::ResultStore::artifact_locator(
+                            attempt,
+                            &artifact.digest,
+                        ),
+                    )?;
                     Output::Artifact {
                         record: artifact.into(),
                     }

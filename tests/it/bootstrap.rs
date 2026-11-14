@@ -1874,7 +1874,6 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
         .create_run(&run, None, None, &serde_json::json!({}), 1)
         .unwrap();
     owner.close_run(&run, 2).unwrap();
-    let epoch = owner.epoch();
     drop(owner);
     // Prefill an owned socket: observation output must remain interruptible.
     let (_unconsumed, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
@@ -1929,6 +1928,12 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
     // Allow the read-only observer to reach its blocked status write.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(child.try_wait().unwrap().is_none());
+    let gc_owner = CoordinatorStore::open(&spec.state_dir, 10).unwrap();
+    assert!(
+        matches!(gc_owner.result_gc_guard(&run), Err(remote_task_runner::storage::StorageError::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
+    );
+    let epoch = gc_owner.epoch();
+    drop(gc_owner);
     assert_eq!(
         remote_task_runner::platform::process_start_identity(pid),
         identity
@@ -1943,12 +1948,16 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
         .unwrap()
         .unwrap();
     assert_eq!(status.code(), Some(130));
+
     assert_eq!(
         CoordinatorStore::open_read_only(&spec.state_dir)
             .unwrap()
             .epoch(),
         epoch
     );
+    let gc_owner = CoordinatorStore::open(&spec.state_dir, 11).unwrap();
+    drop(gc_owner.result_gc_guard(&run).unwrap());
+    drop(gc_owner);
     assert!(
         !CoordinatorStore::open_read_only(&spec.state_dir)
             .unwrap()
@@ -1963,13 +1972,115 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn public_outputs_retained_corruption_is_internal_before_publication() {
+fn seed_public_output(
+    spec: &Spec,
+    bytes: &[u8],
+    encoding: remote_task_runner::wire::ArtifactEncoding,
+) -> (
+    remote_task_runner::ids::RunId,
+    remote_task_runner::ids::TaskId,
+    remote_task_runner::ids::AttemptId,
+    remote_task_runner::wire::ArtifactRecord,
+) {
     use remote_task_runner::ids::{AttemptId, Digest, RunId, SourceId, TaskId};
     use remote_task_runner::results::ResultStore;
     use remote_task_runner::state::{AttemptState, Outcome, Termination};
     use remote_task_runner::storage::{ArtifactReceipt, NewAttempt};
-    use remote_task_runner::wire::{ArtifactEncoding, ArtifactRecord};
+    use remote_task_runner::wire::ArtifactRecord;
+    let db = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let attempt = AttemptId::generate();
+    db.create_run(&run, None, None, &serde_json::json!({}), 1)
+        .unwrap();
+    db.create_task(&task, &run, &serde_json::json!({}), 1)
+        .unwrap();
+    db.create_attempt(
+        NewAttempt {
+            attempt_id: attempt.clone(),
+            task_id: task.clone(),
+            worker_id: spec.worker_id.clone(),
+            payload_hash: Digest::of_bytes(b"payload"),
+            permit_id: None,
+        },
+        2,
+    )
+    .unwrap();
+    for state in [
+        AttemptState::Preparing,
+        AttemptState::Ready,
+        AttemptState::Starting,
+        AttemptState::Active,
+        AttemptState::Finalizing,
+    ] {
+        db.transition_attempt(&attempt, state, 3).unwrap();
+    }
+    db.finalize_attempt(
+        &attempt,
+        Termination::new(Outcome::Succeeded, None, None).unwrap(),
+        4,
+    )
+    .unwrap();
+    let artifact = ArtifactRecord {
+        encoding,
+        name: "bundle".into(),
+        path: "PRIVATE_DECLARATION_SENTINEL".into(),
+        size: bytes.len() as u64,
+        digest: Digest::of_bytes(bytes),
+        source_id: SourceId::generate(),
+        plan_digest: Digest::of_bytes(b"plan"),
+        attempt_id: attempt.clone(),
+        profile_fingerprint: Digest::of_bytes(b"profile"),
+    };
+    db.begin_collection(
+        &attempt,
+        &Digest::of_bytes(b"result"),
+        &serde_json::json!({"artifacts":[artifact.clone()]}),
+        &[(artifact.name.clone(), true)],
+        &[remote_task_runner::storage::ResultRef {
+            ref_id: format!("{attempt}:result"),
+            kind: remote_task_runner::storage::BlobKind::Result,
+            locator: ResultStore::result_locator(&attempt),
+        }],
+        5,
+    )
+    .unwrap();
+    db.record_collected_artifact(
+        &ArtifactReceipt {
+            attempt_id: attempt.clone(),
+            name: artifact.name.clone(),
+            rel_path: artifact.path.clone(),
+            size: artifact.size,
+            digest: artifact.digest.clone(),
+            source_id: artifact.source_id.clone(),
+            plan_digest: artifact.plan_digest.clone(),
+            profile_fingerprint: artifact.profile_fingerprint.to_string(),
+        },
+        &remote_task_runner::storage::ResultRef {
+            ref_id: format!("{attempt}:artifact:{}", artifact.name),
+            kind: remote_task_runner::storage::BlobKind::Result,
+            locator: ResultStore::artifact_locator(&attempt, &artifact.digest),
+        },
+        6,
+    )
+    .unwrap();
+    let store = ResultStore::open(&spec.state_dir.join("results")).unwrap();
+    store
+        .append_part(&attempt, &artifact.digest, 0, bytes)
+        .unwrap();
+    store
+        .publish_artifact(&attempt, &artifact.digest, artifact.size)
+        .unwrap();
+    drop(store);
+    drop(db);
+    (run, task, attempt, artifact)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_outputs_retained_corruption_is_internal_before_publication() {
+    use remote_task_runner::ids::Digest;
+    use remote_task_runner::results::ResultStore;
+    use remote_task_runner::wire::ArtifactEncoding;
     let mut builder = tar::Builder::new(Vec::new());
     for path in ["ordinary", "nested/.GiT/config"] {
         let mut header = tar::Header::new_gnu();
@@ -1985,83 +2096,8 @@ async fn public_outputs_retained_corruption_is_internal_before_publication() {
     checksum[0] ^= 1;
     for bytes in [reserved, checksum, vec![0; 511]] {
         let (root, spec, _) = control_fixture();
-        let db = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
-        let run = RunId::generate();
-        let task = TaskId::generate();
-        let attempt = AttemptId::generate();
-        db.create_run(&run, None, None, &serde_json::json!({}), 1)
-            .unwrap();
-        db.create_task(&task, &run, &serde_json::json!({}), 1)
-            .unwrap();
-        db.create_attempt(
-            NewAttempt {
-                attempt_id: attempt.clone(),
-                task_id: task.clone(),
-                worker_id: spec.worker_id.clone(),
-                payload_hash: Digest::of_bytes(b"payload"),
-                permit_id: None,
-            },
-            2,
-        )
-        .unwrap();
-        for state in [
-            AttemptState::Preparing,
-            AttemptState::Ready,
-            AttemptState::Starting,
-            AttemptState::Active,
-            AttemptState::Finalizing,
-        ] {
-            db.transition_attempt(&attempt, state, 3).unwrap();
-        }
-        db.finalize_attempt(
-            &attempt,
-            Termination::new(Outcome::Succeeded, None, None).unwrap(),
-            4,
-        )
-        .unwrap();
-        let artifact = ArtifactRecord {
-            encoding: ArtifactEncoding::TarV1,
-            name: "bundle".into(),
-            path: "PRIVATE_DECLARATION_SENTINEL".into(),
-            size: bytes.len() as u64,
-            digest: Digest::of_bytes(&bytes),
-            source_id: SourceId::generate(),
-            plan_digest: Digest::of_bytes(b"plan"),
-            attempt_id: attempt.clone(),
-            profile_fingerprint: Digest::of_bytes(b"profile"),
-        };
-        db.begin_collection(
-            &attempt,
-            &Digest::of_bytes(b"result"),
-            &serde_json::json!({"artifacts":[artifact.clone()]}),
-            &[(artifact.name.clone(), true)],
-            &[],
-            5,
-        )
-        .unwrap();
-        db.record_artifact(
-            &ArtifactReceipt {
-                attempt_id: attempt.clone(),
-                name: artifact.name.clone(),
-                rel_path: artifact.path.clone(),
-                size: artifact.size,
-                digest: artifact.digest.clone(),
-                source_id: artifact.source_id.clone(),
-                plan_digest: artifact.plan_digest.clone(),
-                profile_fingerprint: artifact.profile_fingerprint.to_string(),
-            },
-            6,
-        )
-        .unwrap();
-        let store = ResultStore::open(&spec.state_dir.join("results")).unwrap();
-        store
-            .append_part(&attempt, &artifact.digest, 0, &bytes)
-            .unwrap();
-        store
-            .publish_artifact(&attempt, &artifact.digest, artifact.size)
-            .unwrap();
-        drop(store);
-        drop(db);
+        let (run, task, attempt, artifact) =
+            seed_public_output(&spec, &bytes, ArtifactEncoding::TarV1);
         let destination = root.path().join("exported");
         let output = tokio::time::timeout(
             Duration::from_secs(10),
@@ -2087,6 +2123,81 @@ async fn public_outputs_retained_corruption_is_internal_before_publication() {
         assert!(text.contains("INTERNAL"), "{text}");
         assert!(!text.contains("PRIVATE_DECLARATION_SENTINEL"));
         assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+        let files = ResultStore::open(&spec.state_dir.join("results")).unwrap();
+        std::fs::remove_file(files.artifact_path(&attempt, &artifact.digest)).unwrap();
+        let missing = tokio::process::Command::new(&spec.executable)
+            .args(["--json", "outputs", task.as_str(), "--dir"])
+            .arg(&destination)
+            .env_clear()
+            .envs(&spec.env)
+            .env("PATH", "/no-programs")
+            .current_dir(root.path())
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(
+            missing.status.code(),
+            Some(79),
+            "live reference must preserve corruption classification"
+        );
+        files
+            .append_part(&attempt, &artifact.digest, 0, &bytes)
+            .unwrap();
+        files
+            .publish_artifact(&attempt, &artifact.digest, artifact.size)
+            .unwrap();
+        let db = CoordinatorStore::open(&spec.state_dir, 20).unwrap();
+        db.close_collection(
+            &attempt,
+            Some(&Digest::of_bytes(b"result")),
+            remote_task_runner::results::plan::Verdict::Complete,
+            true,
+            8,
+        )
+        .unwrap();
+        let guard = db.result_gc_guard(&run).unwrap();
+        assert!(
+            db.claim_result_page(&guard, &run, "", 64, 100, 10, Some("boot".into()), 10)
+                .unwrap()
+                .clock_held
+        );
+        assert_eq!(
+            db.claim_result_page(&guard, &run, "", 64, 110, 20, Some("boot".into()), 10)
+                .unwrap()
+                .removed,
+            2
+        );
+        let claims = db.pending_result_page(&guard, &run, 64).unwrap();
+        drop(guard);
+        drop(db); // Simulate owner crash after durable claim, before filesystem deletion.
+        for phase in 0..2 {
+            let unavailable = tokio::process::Command::new(&spec.executable)
+                .args(["--json", "outputs", task.as_str(), "--dir"])
+                .arg(&destination)
+                .env_clear()
+                .envs(&spec.env)
+                .env("PATH", "/no-programs")
+                .current_dir(root.path())
+                .output()
+                .await
+                .unwrap();
+            assert_eq!(
+                unavailable.status.code(),
+                Some(73),
+                "phase {phase}: {}",
+                String::from_utf8_lossy(&unavailable.stdout)
+            );
+            assert_eq!(std::fs::read_dir(&destination).unwrap().count(), 0);
+            if phase == 0 {
+                assert!(files.artifact_path(&attempt, &artifact.digest).exists());
+                let restarted = CoordinatorStore::open(&spec.state_dir, 30).unwrap();
+                let guard = restarted.result_gc_guard(&run).unwrap();
+                for claim in &claims {
+                    files.remove(&claim.locator).unwrap();
+                    restarted.finish_result_delete(&guard, claim).unwrap();
+                }
+            }
+        }
     }
 }
 
@@ -2451,4 +2562,129 @@ async fn in_place_retry_rejects_original_subdirectory_replaced_by_external_symli
     shutdown(&load(&spec)).await;
     assert!(input.is_dir());
     assert!(saved.join("marker").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_outputs_sigint_drains_blocked_tar_worker_before_releasing_pin() {
+    use std::os::fd::OwnedFd;
+    let (root, spec, _) = control_fixture();
+    let mut builder = tar::Builder::new(Vec::new());
+    for n in 0..2048 {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(1);
+        header.set_mode(0o600);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, format!("member-{n:04}"), b"x".as_slice())
+            .unwrap();
+    }
+    let bytes = builder.into_inner().unwrap();
+    let (run, task, attempt, _) = seed_public_output(
+        &spec,
+        &bytes,
+        remote_task_runner::wire::ArtifactEncoding::TarV1,
+    );
+    let (_unconsumed, writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    let stdout: OwnedFd = writer.into();
+    let temporary = root.path().join("reader-tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "outputs", run.as_str(), "--dir"])
+        .arg(root.path().join("exported"))
+        .env_clear()
+        .envs(&spec.env)
+        .env("TMPDIR", &temporary)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(child.try_wait().unwrap().is_none());
+            if root
+                .path()
+                .join("exported")
+                .join(task.as_str())
+                .join(attempt.as_str())
+                .join("bundle/member-0000")
+                .exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // The bounded channel and unread stdout leave the owned worker mid-export.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    let gc_owner = CoordinatorStore::open(&spec.state_dir, 10).unwrap();
+    assert!(
+        matches!(gc_owner.result_gc_guard(&run), Err(remote_task_runner::storage::StorageError::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
+    );
+    let epoch = gc_owner.epoch();
+    drop(gc_owner);
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    let gc_owner = CoordinatorStore::open(&spec.state_dir, 11).unwrap();
+    drop(gc_owner.result_gc_guard(&run).unwrap());
+    drop(gc_owner);
+    assert!(
+        !CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .unwrap()
+            .cancel_requested
+    );
+    let members = root
+        .path()
+        .join("exported")
+        .join(task.as_str())
+        .join(attempt.as_str())
+        .join("bundle");
+    let names = std::fs::read_dir(&members)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert!(!names.is_empty() && names.len() < 2048);
+    assert!(
+        names
+            .iter()
+            .all(|name| name.to_str().unwrap().starts_with("member-")),
+        "owned destination temp leaked"
+    );
+    assert_eq!(
+        std::fs::read_dir(&temporary).unwrap().count(),
+        0,
+        "output reader leaked a temporary file"
+    );
 }

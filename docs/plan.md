@@ -105,7 +105,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 
 ### 受入環境と S26 の進め方
 
-- 当面の追加 worker と Linux 検証には Docker を使う。別 state dir と portool で分離し、複数 worker、親の再起動、接続断、ACK 消失、worker 消失、cold/warm と親単独との差を確認する。
+- ユーザーの受入環境では追加の Mac/Linux 実機を準備しない。当面の追加 worker と Linux 検証には承認済みの Docker を使う。別 state dir と portool で分離し、複数 worker、親の再起動、接続断、ACK 消失、worker 消失、cold/warm と親単独との差を確認する。
 - Docker 上の Linux worker と macOS ホストの結果は区別する。Docker を別の Mac 実機と記載せず、独立した Mac の sleep・boot・launchd・実機間転送など、代替できない項目は実機確認待ちとして A 対応表と最終報告へ残す。
 - 公開する版には Docker で確認した範囲と未検証範囲を明記する。実機未確認の項目を、A01〜A49 全件確認済みと報告しない。
 
@@ -210,13 +210,13 @@ eligibility and TarV1 opaque bundles. Multiple globs and literal directories pre
 workspace-relative member paths. Additive schema-1 serialization retains historical raw
 canonical bytes; every live hello requires output_bundles_v1. The journal fixes encoding, outputs_evaluated
 and all eligible stored/not-stored names before terminal settlement; collector exact-name
-receipts and ACK remain opaque. Public outputs query/export, resident GC, estimate and
+receipts and ACK remain opaque. Public outputs query/export and resident result GC are integrated below; estimate and
 CI intermediate upload/download integration remain required follow-up work.
 
 
-Public outputs slice connects paged read-only immutable artifact metadata and durable receipts to legacy raw and TarV1 export. Private bounded spooling verifies outer size/digest; full tar structural/path preflight precedes fd-based no-replace publication. It preserves partial successes, emits bounded NDJSON outcomes/final counts and reuses logs' interruptible final emitter. Real worker execution through immutable bundle, parent receipt and offline public CLI export covers raw plus two generic members, no Git, unchanged epoch and historical-attempt conflicts. Focused hostile archive, symlink, concurrent no-replace, receipt visibility, metadata paging and retry boundary tests accompany the change. Resident GC/pinning integration, estimate and CI intermediate artifacts remain mandatory follow-up work; this slice does not claim GC safety without the shared invocation pin.
+Public outputs slice connects paged read-only immutable artifact metadata and durable receipts to legacy raw and TarV1 export. Private bounded spooling verifies outer size/digest; full tar structural/path preflight precedes fd-based no-replace publication. It preserves partial successes, emits bounded NDJSON outcomes/final counts and reuses logs' interruptible final emitter. Real worker execution through immutable bundle, parent receipt and offline public CLI export covers raw plus two generic members, no Git, unchanged epoch and historical-attempt conflicts. Focused hostile archive, symlink, concurrent no-replace, receipt visibility, metadata paging and retry boundary tests accompany the change. Result GC/pinning is integrated below; estimate and CI intermediate artifacts remain mandatory follow-up work.
 
-Public outputs independent review corrections restrict artifact query records to name, encoding, digest and size; declaration paths and execution identities remain private. Producer and retained export share the reserved component namespace and existing Unicode/case folding. Retained archive validation failures use Internal (79), while destination argument errors and no-replace conflicts retain their existing codes. Regression coverage includes exact public metadata keys, reserved nested/alias paths, malformed archives with matching outer receipts, and zero member publication before complete preflight. GC invocation pin integration remains a separate mandatory dependency.
+Public outputs independent review corrections restrict artifact query records to name, encoding, digest and size; declaration paths and execution identities remain private. Producer and retained export share the reserved component namespace and existing Unicode/case folding. Retained archive validation failures use Internal (79), while destination argument errors and no-replace conflicts retain their existing codes. Regression coverage includes exact public metadata keys, reserved nested/alias paths, malformed archives with matching outer receipts, and zero member publication before complete preflight. GC invocation pin integration is completed in the integration section below.
 Focused output tests (13), real offline CLI corruption/export regressions (2), and strict all-target clippy pass for these corrections. Independent resolution review and combined full CI remain parent integration checks.
 
 S15d in-place slice は公開 `exec --in-place` を既存の型付きWorkspaceへ接続する。
@@ -251,3 +251,30 @@ root/祖先 FD と NOFOLLOW による unlink、競合対象の pending 再試行
 
 追加調査で enqueue の run INSERT が create_run の durable pin 準備を迂回していたため、両公開経路を確認し、enqueue も既存 blocking wrapper 内・DB transaction 前に pin を作成/fsync するよう修正した。
 pin 準備失敗時に run/task が公開されない回帰と、実 resident IPC の submit を全 worker offline で受理した直後に logs 共通 observer が pending を返し follow を継続する回帰が成功した。追加修正後の strict clippy all-targets/all-features も成功。独立レビューの resolved 確認と全 CI は引き続き未完了。
+
+### Public outputs と result retention GC の統合
+
+独立確認済みの public outputs と result retention/in-place feature を統合した。
+TaskSpec/AttemptPayload の outputs と in_place、明示 encoding/outputs_evaluated、schema 8 の
+result refs/clock/pins は同時に保持し、legacy raw serialization と両 PURE 対象・coverage union を残す。
+outputs は configured read-only store の identity 検証と run shared pin 取得後に fresh metadata を読む。
+pin は処理ブロック外側で保持し、owned blocking export worker の cooperative cancel/drain と
+最終 write/flush（backpressure・SIGINT を含む）の完了後に解放する。logs Observer の既存 pin も保持する。
+metadata query は fresh durable result/blob refs と既知の delete claim を確認し、expired/unreferenced/claimed は
+NOT_FOUND / 73 とする。claim 永続化後・FS 削除前の owner crash でも残存 file を成功 export しない。
+live ref の published file 欠損・短縮・破損は INTERNAL / 79 を維持し、全 NotFound の一律変換を行わない。
+reader は owner 起動・Git/project 読取・DB 更新・pin 作成を行わない。
+
+この統合は result store のみを対象とする。source/Vault/private in-place binding の GC は引き続き必須残件で、
+原本 filesystem は削除対象にしない。全 CI・公開前検証と最終 acceptance は親統合で行う。
+Docker/Linux の承認済み受入と、追加 Mac 実機の sleep/boot/実 launchd 未確認は上記受入環境に従い区別する。
+
+統合後の focused 検証は outputs/export unit 15、logs unit 11、public outputs CLI 3、guarded retention 4、
+indexed run 選択 1、migration 2、legacy hash/encoding 2、実 resident GC 競合 1、in-place integration 9、
+通常 snapshot/offline control 1、collection integration 39、実 worker から offline raw/Tar export 1 の計 89 件が成功。
+raw/Tar の export outcome・final write・final flush をそれぞれ block して GC 排他拒否を確認し、
+実 CLI の Tar worker 中断は cooperative drain・temp cleanup 後に pin を解放する。
+実 CLI で live-ref file 欠損 79、owner restart/claim-before-FS と削除完了後の 73 を区別した。
+strict all-target/all-feature clippy、fmt、diff check、公開禁止文字列 scan は成功。
+今回新しい pure decision helper は追加しておらず、元 feature の PURE/coverage union と clock/mutation 証跡を保持する。
+全体 local CI・MSRV・Linux と公開はこの focused 検証に含めない。

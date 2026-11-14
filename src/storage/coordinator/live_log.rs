@@ -146,9 +146,10 @@ impl CoordinatorStore {
         attempt: &AttemptId,
         stream: LogStream,
     ) -> Result<Option<LogProgress>> {
+        let id = attempt.clone();
         let attempt = attempt.to_string();
         let collections = self.collections;
-        self.db.call(move |c| {
+        let progress = self.db.call(move |c| {
             let live: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_log')", [], |r| r.get(0))?;
             if live {
                 if let Some(progress) = load(c, &attempt, stream_key(stream))? {
@@ -171,7 +172,14 @@ impl CoordinatorStore {
                 None | Some((None,None,None,None)) => Ok(None),
                 _ => Err(StorageError::Corrupt("invalid final log metadata".into())),
             }
-        })
+        })?;
+        if progress.is_some() {
+            self.result_data_available(
+                &id,
+                &crate::results::store::ResultStore::logs_locator(&id),
+            )?;
+        }
+        Ok(progress)
     }
 
     /// Atomically register the GC reference BEFORE any filesystem creation.

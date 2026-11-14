@@ -24,6 +24,30 @@ pub struct ResultDeleteClaim {
 }
 
 impl CoordinatorStore {
+    /// Authorize retained bytes from fresh durable references, never filesystem
+    /// existence or an old receipt. The invocation must already hold its run pin.
+    pub(super) fn result_data_available(&self, attempt: &AttemptId, locator: &str) -> Result<()> {
+        let (attempt, locator) = (attempt.to_string(), locator.to_owned());
+        self.db.call(move |c| {
+            let referenced: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM blob_ref WHERE attempt_id=?1 AND locator=?2)",
+                params![attempt, locator], |r| r.get(0),
+            )?;
+            let claims: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='result_delete_claim')",
+                [], |r| r.get(0),
+            )?;
+            let claimed = claims && c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM result_delete_claim WHERE locator=?1)",
+                [&locator], |r| r.get::<_, bool>(0),
+            )?;
+            if !referenced || claimed {
+                return Err(not_found("result data unavailable: expired, unreferenced or deletion claimed"));
+            }
+            Ok(())
+        })
+    }
+
     /// One durable run pin backfill, bounded by the caller's keyset run page.
     pub fn result_gc_guard(&self, run: &RunId) -> Result<RunPin> {
         if self._lock.is_none() {

@@ -322,21 +322,42 @@ async fn command_async(args: &crate::cli::OutputsArgs, json: bool) -> i32 {
                 return ErrorCode::Internal.exit_code();
             }
         };
+    invocation(args, json, &mut out, &mut err, &mut interrupt, || {
+        let env = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        super::context::runtime_spec(&env)
+    })
+    .await
+}
+
+async fn invocation(
+    args: &crate::cli::OutputsArgs,
+    json: bool,
+    out: &mut (dyn AsyncWrite + Unpin),
+    err: &mut (dyn AsyncWrite + Unpin),
+    interrupt: &mut tokio::signal::unix::Signal,
+    spec: impl FnOnce() -> Result<super::bootstrap::Spec, ApiError>,
+) -> i32 {
     let cancelled = Arc::new(AtomicBool::new(false));
     let _cancel = Cancel(cancelled.clone());
     let active: ActiveWork = Arc::new(std::sync::Mutex::new(None));
+    // Keep the shared run lock through worker drain and final write/flush.
+    let mut invocation_pin = None;
     let outcome = tokio::select! {
         result=async {
             let dir=args.dir.as_ref().ok_or_else(||ApiError::new(ErrorCode::InvalidInput,"--dir is required"))?;
             let target=Target::parse(&args.id)?;
             let attempt=args.attempt.as_deref().map(AttemptId::parse).transpose().map_err(|e|ApiError::new(ErrorCode::InvalidInput,e.to_string()))?;
             if attempt.is_some() && matches!(target,Target::Run(_)){return Err(ApiError::new(ErrorCode::InvalidInput,"--attempt requires a task identifier"));}
-            let env=std::env::vars_os().filter_map(|(k,v)|Some((k.into_string().ok()?,v.into_string().ok()?))).collect();
-            let spec=super::context::runtime_spec(&env)?;
+            let spec=spec()?;
             let root=spec.state_dir.join("results");
-            let reader=Reader::open(spec).await.map_err(query_error)?;
+            let store=tokio::task::spawn_blocking(move || super::bootstrap::read_only_store(&spec))
+                .await.map_err(internal)?.map_err(|e|ApiError::new(ErrorCode::InvalidInput,e.to_string()))?;
+            invocation_pin=Some(store.result_read_pin(&target,attempt.as_ref()).map_err(|e|ApiError::new(e.code(),e.to_string()))?);
+            let reader=Reader::Offline(Arc::new(store));
             let destination=Arc::new(super::output_export::destination(dir)?);
-            Exporter{reader,root,destination,target,attempt,cancelled:cancelled.clone(),active:active.clone()}.export(json,&mut out,&mut err).await
+            Exporter{reader,root,destination,target,attempt,cancelled:cancelled.clone(),active:active.clone()}.export(json,out,err).await
         }=>Some(result),
         _=interrupt.recv()=>None,
     };
@@ -370,16 +391,10 @@ async fn command_async(args: &crate::cli::OutputsArgs, json: bool) -> i32 {
             )
         }
     };
-    super::logs::emit_final(
-        record,
-        code,
-        detached,
-        json,
-        &mut out,
-        &mut err,
-        Some(&mut interrupt),
-    )
-    .await
+    let code =
+        super::logs::emit_final(record, code, detached, json, out, err, Some(interrupt)).await;
+    drop(invocation_pin);
+    code
 }
 
 #[cfg(test)]
@@ -457,7 +472,11 @@ mod tests {
                 &Digest::of_bytes(b"result"),
                 &serde_json::json!({"artifacts":[artifact.clone()]}),
                 &[("raw".into(), true)],
-                &[],
+                &[crate::storage::ResultRef {
+                    ref_id: format!("{attempt}:result"),
+                    kind: crate::storage::BlobKind::Result,
+                    locator: ResultStore::result_locator(&attempt),
+                }],
                 5,
             )
             .unwrap();
@@ -472,7 +491,7 @@ mod tests {
         }
         fn receipt(&self) {
             self.db
-                .record_artifact(
+                .record_collected_artifact(
                     &ArtifactReceipt {
                         attempt_id: self.attempt.clone(),
                         name: self.artifact.name.clone(),
@@ -482,6 +501,14 @@ mod tests {
                         source_id: self.artifact.source_id.clone(),
                         plan_digest: self.artifact.plan_digest.clone(),
                         profile_fingerprint: self.artifact.profile_fingerprint.to_string(),
+                    },
+                    &crate::storage::ResultRef {
+                        ref_id: format!("{}:artifact:{}", self.attempt, self.artifact.name),
+                        kind: crate::storage::BlobKind::Result,
+                        locator: ResultStore::artifact_locator(
+                            &self.attempt,
+                            &self.artifact.digest,
+                        ),
                     },
                     6,
                 )
@@ -659,6 +686,7 @@ mod tests {
     #[test]
     fn metadata_pages_are_capped_and_mismatched_receipts_fail() {
         let f = Fixture::new();
+        f.receipt();
         let mut artifacts = vec![];
         for n in 0..70 {
             let mut a = f.artifact.clone();
@@ -709,5 +737,263 @@ mod tests {
             })
             .unwrap();
         assert!(f.db.query_output_metadata(&f.attempt, None, 1).is_err());
+    }
+    struct Gate {
+        reached: tokio::sync::Notify,
+        released: AtomicBool,
+        waker: std::sync::Mutex<Option<std::task::Waker>>,
+    }
+    struct GateWriter {
+        bytes: Vec<u8>,
+        kind: &'static str,
+        flush: bool,
+        seen: bool,
+        gate: Arc<Gate>,
+    }
+    impl GateWriter {
+        fn blocked(&self, cx: &std::task::Context<'_>) -> bool {
+            if self.gate.released.load(Ordering::SeqCst) {
+                return false;
+            }
+            *self.gate.waker.lock().unwrap() = Some(cx.waker().clone());
+            self.gate.reached.notify_one();
+            true
+        }
+    }
+    impl AsyncWrite for GateWriter {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let record: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            if record["data"]["kind"] == self.kind {
+                self.seen = true;
+                if !self.flush && self.blocked(cx) {
+                    return std::task::Poll::Pending;
+                }
+            }
+            self.bytes.extend_from_slice(bytes);
+            std::task::Poll::Ready(Ok(bytes.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            if self.flush && self.seen && self.blocked(cx) {
+                std::task::Poll::Pending
+            } else {
+                std::task::Poll::Ready(Ok(()))
+            }
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+    #[tokio::test]
+    async fn invocation_pin_excludes_gc_during_raw_tar_export_and_final_write_flush() {
+        use std::os::unix::fs::PermissionsExt;
+        for encoding in [ArtifactEncoding::Raw, ArtifactEncoding::TarV1] {
+            for (kind, flush) in [("output", false), ("final", false), ("final", true)] {
+                let mut f = Fixture::new();
+                std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+                let bytes = if encoding == ArtifactEncoding::Raw {
+                    b"raw".to_vec()
+                } else {
+                    let mut builder = tar::Builder::new(Vec::new());
+                    let mut header = tar::Header::new_gnu();
+                    header.set_size(3);
+                    header.set_mode(0o600);
+                    header.set_cksum();
+                    builder
+                        .append_data(&mut header, "member", b"tar".as_slice())
+                        .unwrap();
+                    builder.into_inner().unwrap()
+                };
+                f.artifact.encoding = encoding;
+                f.artifact.digest = Digest::of_bytes(&bytes);
+                f.artifact.size = bytes.len() as u64;
+                let text = serde_json::json!({"artifacts":[f.artifact.clone()]}).to_string();
+                let id = f.attempt.to_string();
+                f.db.db
+                    .write(move |tx| {
+                        tx.execute(
+                            "UPDATE collection SET result_json=?1 WHERE attempt_id=?2",
+                            rusqlite::params![text, id],
+                        )?;
+                        Ok(())
+                    })
+                    .unwrap();
+                f.receipt();
+                f.db.close_collection(
+                    &f.attempt,
+                    Some(&Digest::of_bytes(b"result")),
+                    crate::results::plan::Verdict::Complete,
+                    true,
+                    8,
+                )
+                .unwrap();
+                let files = ResultStore::open(&f.dir.path().join("results")).unwrap();
+                files
+                    .append_part(&f.attempt, &f.artifact.digest, 0, &bytes)
+                    .unwrap();
+                files
+                    .publish_artifact(&f.attempt, &f.artifact.digest, f.artifact.size)
+                    .unwrap();
+                let worker = f.dir.path().join("worker");
+                std::fs::create_dir(&worker).unwrap();
+                std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+                let key = f.dir.path().join("key");
+                crate::secrets::key::init(&key).unwrap();
+                let spec = super::super::bootstrap::Spec {
+                    state_dir: f.dir.path().into(),
+                    worker_state_dir: worker,
+                    worker_id: WorkerId::parse("test").unwrap(),
+                    cluster_key_path: key,
+                    executable: std::env::current_exe().unwrap(),
+                    env: Default::default(),
+                    repo_root: None,
+                    expected_cluster: Some(f.db.cluster_id().clone()),
+                    managed_service: None,
+                };
+                let args = crate::cli::OutputsArgs {
+                    id: f.task.to_string(),
+                    attempt: None,
+                    dir: Some(f.dir.path().join("exported")),
+                };
+                let gate = Arc::new(Gate {
+                    reached: tokio::sync::Notify::new(),
+                    released: AtomicBool::new(false),
+                    waker: Default::default(),
+                });
+                let mut out = GateWriter {
+                    bytes: Vec::new(),
+                    kind,
+                    flush,
+                    seen: false,
+                    gate: gate.clone(),
+                };
+                let mut err = Vec::new();
+                let mut signal =
+                    tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                        .unwrap();
+                let control = async {
+                    gate.reached.notified().await;
+                    assert!(
+                        matches!(f.db.result_gc_guard(&f.run), Err(crate::storage::StorageError::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
+                    );
+                    gate.released.store(true, Ordering::SeqCst);
+                    gate.waker.lock().unwrap().take().unwrap().wake();
+                };
+                let (code, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    tokio::join!(
+                        invocation(&args, true, &mut out, &mut err, &mut signal, || Ok(spec)),
+                        control
+                    )
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "{encoding:?}/{kind}/{flush}: {}",
+                        String::from_utf8_lossy(&out.bytes)
+                    )
+                });
+                assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out.bytes));
+                assert!(out.seen);
+                drop(f.db.result_gc_guard(&f.run).unwrap());
+                let path = f
+                    .dir
+                    .path()
+                    .join("exported")
+                    .join(f.task.as_str())
+                    .join(f.attempt.as_str())
+                    .join("raw");
+                assert_eq!(
+                    std::fs::read(if encoding == ArtifactEncoding::Raw {
+                        path
+                    } else {
+                        path.join("member")
+                    })
+                    .unwrap(),
+                    if encoding == ArtifactEncoding::Raw {
+                        b"raw"
+                    } else {
+                        b"tar"
+                    }
+                );
+            }
+        }
+    }
+    #[tokio::test]
+    async fn deletion_claim_before_filesystem_and_completed_gc_are_unavailable() {
+        let f = Fixture::new();
+        f.receipt();
+        let files = ResultStore::open(&f.dir.path().join("results")).unwrap();
+        files.write_result(&f.attempt, b"{}").unwrap();
+        files
+            .append_part(&f.attempt, &f.artifact.digest, 0, b"raw")
+            .unwrap();
+        files
+            .publish_artifact(&f.attempt, &f.artifact.digest, 3)
+            .unwrap();
+        f.db.close_collection(
+            &f.attempt,
+            Some(&Digest::of_bytes(b"result")),
+            crate::results::plan::Verdict::Complete,
+            true,
+            8,
+        )
+        .unwrap();
+        let guard = f.db.result_gc_guard(&f.run).unwrap();
+        assert!(
+            f.db.claim_result_page(&guard, &f.run, "", 64, 100, 10, Some("boot".into()), 10)
+                .unwrap()
+                .clock_held
+        );
+        let page =
+            f.db.claim_result_page(&guard, &f.run, "", 64, 110, 20, Some("boot".into()), 10)
+                .unwrap();
+        assert_eq!(page.removed, 2);
+        let claims = f.db.pending_result_page(&guard, &f.run, 64).unwrap();
+        assert_eq!(claims.len(), 2);
+        // Crash-before-FS leaves published bytes, but removes authorization.
+        drop(guard);
+        let reader = CoordinatorStore::open_read_only(f.dir.path()).unwrap();
+        let pin = reader
+            .result_read_pin(&Target::Task(f.task.clone()), None)
+            .unwrap();
+        assert!(files.artifact_path(&f.attempt, &f.artifact.digest).exists());
+        assert_eq!(
+            reader
+                .query_output_metadata(&f.attempt, None, 64)
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
+        let error = f
+            .exporter(Target::Task(f.task.clone()), None)
+            .export(true, &mut Vec::new(), &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotFound);
+        drop(pin);
+        let guard = f.db.result_gc_guard(&f.run).unwrap();
+        for claim in claims {
+            files.remove(&claim.locator).unwrap();
+            f.db.finish_result_delete(&guard, &claim).unwrap();
+        }
+        drop(guard);
+        assert_eq!(
+            CoordinatorStore::open_read_only(f.dir.path())
+                .unwrap()
+                .query_output_metadata(&f.attempt, None, 64)
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
     }
 }

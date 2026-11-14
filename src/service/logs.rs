@@ -325,9 +325,8 @@ impl Observer {
             if offset >= committed {
                 break;
             }
-            // Opening per chunk validates NOFOLLOW/regular file and the entire
-            // committed size. Future GC must honor reader FDs/pins; disappearance
-            // is an explicit error today, never an empty successful read.
+            // The invocation pin excludes GC. A missing/short file with a
+            // live durable reference is corruption, never an empty read.
             let reader = ResultStore::open_read_only(&self.root).map_err(internal)?;
             let bytes = reader
                 .read_range(&metadata.attempt_id, stream, committed, offset, 65536)
@@ -1038,8 +1037,19 @@ mod tests {
         let f = Fixture::new();
         f.terminal(false);
         let digest = Digest::of_bytes(b"result");
-        f.db.begin_collection(&f.attempt, &digest, &serde_json::json!({}), &[], &[], 7)
-            .unwrap();
+        f.db.begin_collection(
+            &f.attempt,
+            &digest,
+            &serde_json::json!({}),
+            &[],
+            &[crate::storage::ResultRef {
+                ref_id: format!("{}:logs", f.attempt),
+                kind: crate::storage::BlobKind::Log,
+                locator: ResultStore::logs_locator(&f.attempt),
+            }],
+            7,
+        )
+        .unwrap();
         f.files
             .append_log(&f.attempt, LogStream::Stdout, 0, b"oldTAIL")
             .unwrap();
@@ -1098,5 +1108,42 @@ mod tests {
             follow: false,
         };
         assert_eq!(command(&args, true), ErrorCode::InvalidInput.exit_code());
+    }
+    #[tokio::test]
+    async fn gc_claimed_log_prefix_is_unavailable_even_before_file_deletion() {
+        let f = Fixture::new();
+        f.append(LogStream::Stdout, b"retained", true);
+        f.terminal(true);
+        let guard = f.db.result_gc_guard(&f.run).unwrap();
+        assert!(
+            f.db.claim_result_page(&guard, &f.run, "", 64, 100, 10, Some("boot".into()), 10)
+                .unwrap()
+                .clock_held
+        );
+        assert_eq!(
+            f.db.claim_result_page(&guard, &f.run, "", 64, 110, 20, Some("boot".into()), 10)
+                .unwrap()
+                .removed,
+            1
+        );
+        drop(guard);
+        let error = f
+            .observer(false)
+            .observe(false, true, &mut Vec::new(), &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotFound);
+        let guard = f.db.result_gc_guard(&f.run).unwrap();
+        for claim in f.db.pending_result_page(&guard, &f.run, 64).unwrap() {
+            f.files.remove(&claim.locator).unwrap();
+            f.db.finish_result_delete(&guard, &claim).unwrap();
+        }
+        drop(guard);
+        assert_eq!(
+            f.db.query_log_progress(&f.attempt, LogStream::Stdout)
+                .unwrap_err()
+                .code(),
+            ErrorCode::NotFound
+        );
     }
 }
