@@ -205,6 +205,51 @@ impl BuilderWorkspaces for BuilderWs {
 }
 
 impl Host for Machine {
+    fn toolchain_registry(
+        &self,
+        profile: &crate::toolchain::profile::Profile,
+        base: crate::ids::Digest,
+    ) -> Result<Option<crate::toolchain::registry::Registry>, ApiError> {
+        let Some(setups) = &self.setups else {
+            return Ok(None);
+        };
+        let root = setups.private_tool_root()?;
+        crate::toolchain::registry::Registry::load(
+            root.parent().expect("tool root parent"),
+            profile,
+            base,
+        )
+        .map(Some)
+        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))
+    }
+    fn toolchain_poll(
+        &self,
+        attempt: &AttemptId,
+        request: &crate::toolchain::preparation::PreparationRequest,
+    ) -> Result<crate::toolchain::preparation::ToolPreparationPoll, ApiError> {
+        self.setups
+            .as_ref()
+            .ok_or_else(|| {
+                ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "toolchain preparation unavailable",
+                )
+            })?
+            .poll_tool(attempt, request)
+    }
+    fn setup_poll_bound(
+        &self,
+        attempt: &AcceptedAttempt,
+        payload: &AttemptPayload,
+        workspace: &Workspace,
+        binding: Option<&crate::toolchain::contract::ExecutionBinding>,
+    ) -> Result<SetupPoll, ApiError> {
+        match &self.setups {
+            Some(s) => s.poll_bound(&attempt.attempt_id, payload, workspace, binding),
+            None => self.setup_poll(attempt, payload, workspace),
+        }
+    }
+
     fn admit(&self, payload: &AttemptPayload) -> Result<(), ApiError> {
         if payload.in_place {
             self.original(payload)?;
@@ -282,6 +327,25 @@ impl Host for Machine {
         payload: &AttemptPayload,
     ) -> Result<Workspace, ApiError> {
         let m = self.manifest(attempt)?;
+        if let Some(bundle) = &payload.toolchains {
+            let invalid = |e: &str| ApiError::new(crate::error::ErrorCode::InvalidInput, e);
+            bundle.validate(&payload.manifest_digest).map_err(invalid)?;
+            let project = std::str::from_utf8(&m.cwd_relative.0)
+                .map_err(|_| invalid("toolchain project scope"))?;
+            if bundle.frozen.scope != crate::toolchain::versions::Scope::project(project) {
+                return Err(invalid("toolchain source scope mismatch"));
+            }
+            let declarations =
+                crate::toolchain::snapshot::read_captured(&self.store, &m, project, &[])
+                    .map_err(|e| invalid(&e.code))?;
+            let effective =
+                crate::toolchain::versions::effective(&declarations, &bundle.frozen.scope)
+                    .map_err(|e| invalid(&e.code))?;
+            if effective != bundle.frozen.requirements {
+                return Err(invalid("toolchain source declarations mismatch"));
+            }
+        }
+
         if payload.in_place {
             let root = self.original(payload)?;
             return self.workspaces.open_in_place(&root, Path::new(""), true);

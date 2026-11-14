@@ -83,6 +83,7 @@ pub fn kind_of_operation(op: Operation) -> StreamKind {
         | Operation::Inspect
         | Operation::Forecast
         | Operation::ForecastCommand
+        | Operation::ResolveToolchains
         | Operation::SubmitAttempt
         | Operation::GetAttempt
         | Operation::ListAttempts

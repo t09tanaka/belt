@@ -20,6 +20,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     "log_resume",
     "output_bundles_v1",
     crate::toolchain::capability::FEATURE,
+    crate::toolchain::contract::FEATURE,
 ];
 
 /// What one side offers and requires.

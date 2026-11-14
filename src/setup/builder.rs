@@ -39,6 +39,7 @@ use crate::supervisor::lock::SupervisorLock;
 use crate::supervisor::process::{code, spawn_detached, supervise};
 use crate::supervisor::spec::{MaskValues, NodeSpec, SuperviseSpec};
 use crate::toolchain::adapters::{self, Availability, InstallationReceipt};
+use crate::toolchain::contract::ExecutionBinding;
 use crate::toolchain::preparation::{
     self, PreparationFailure, PreparationRequest, ToolPreparationPoll,
 };
@@ -191,6 +192,7 @@ enum BuilderJob {
     WorkspaceSetup {
         source: String,
         payload: AttemptPayload,
+        binding: Option<Box<ExecutionBinding>>,
     },
     ToolInstall {
         request: PreparationRequest,
@@ -712,6 +714,16 @@ impl Setups {
         payload: &AttemptPayload,
         ws: &Workspace,
     ) -> Result<SetupPoll, ApiError> {
+        self.poll_bound(attempt, payload, ws, None)
+    }
+
+    pub fn poll_bound(
+        self: &Arc<Self>,
+        attempt: &AttemptId,
+        payload: &AttemptPayload,
+        ws: &Workspace,
+        binding: Option<&ExecutionBinding>,
+    ) -> Result<SetupPoll, ApiError> {
         let Some(spec) = &payload.setup else {
             return Ok(SetupPoll::nothing());
         };
@@ -742,14 +754,20 @@ impl Setups {
             }
             None => {}
         }
+        let bound_env = binding
+            .map(|b| b.activation.environment.clone())
+            .unwrap_or_else(|| self.cfg.env.clone());
+        let bound_profile = binding
+            .map(|b| b.fingerprint().to_string())
+            .unwrap_or_else(|| self.cfg.profile.clone());
         let ctx = KeyContext {
             source_digest: payload.manifest_digest.to_string(),
             os: std::env::consts::OS.to_string(),
             arch: std::env::consts::ARCH.to_string(),
-            profile: self.cfg.profile.clone(),
+            profile: bound_profile,
             run_id: payload.run_id.to_string(),
-            env: self.cfg.env.clone(),
-            tools: tool_marks(spec, &self.cfg.env),
+            env: bound_env.clone(),
+            tools: tool_marks(spec, &bound_env),
         };
         let key = policy::template_key(spec, &ctx);
         let now = platform::wall_ms();
@@ -822,6 +840,7 @@ impl Setups {
                             BuilderJob::WorkspaceSetup {
                                 source: ctx.source_digest,
                                 payload: payload.clone(),
+                                binding: binding.cloned().map(Box::new),
                             },
                         );
                         return Ok(SetupPoll::Pending);
@@ -935,9 +954,18 @@ impl Setups {
                 let (id, attempt, key) = (id.clone(), attempt.clone(), key.clone());
                 move || {
                     let end = catch_unwind(AssertUnwindSafe(|| match &job {
-                        BuilderJob::WorkspaceSetup { source, payload } => BuilderResult::Workspace(
-                            me.run_builder(&id, &attempt, &key, source, payload),
-                        ),
+                        BuilderJob::WorkspaceSetup {
+                            source,
+                            payload,
+                            binding,
+                        } => BuilderResult::Workspace(me.run_builder(
+                            &id,
+                            &attempt,
+                            &key,
+                            source,
+                            payload,
+                            binding.as_deref(),
+                        )),
                         BuilderJob::ToolInstall { request } => {
                             BuilderResult::Tool(me.run_tool_builder(&id, &attempt, &key, request))
                         }
@@ -1106,11 +1134,14 @@ impl Setups {
         key: &str,
         source: &str,
         payload: &AttemptPayload,
+        binding: Option<&ExecutionBinding>,
     ) -> BuildEnd {
         let spec = payload.setup.as_ref().expect("a builder is for a setup");
         let dir = self.cfg.builders().join(id.as_str());
         let mut made: Option<Workspace> = None;
-        let end = self.build(id, attempt, key, source, payload, spec, &dir, &mut made);
+        let end = self.build(
+            id, attempt, key, source, payload, spec, &dir, &mut made, binding,
+        );
         // the supervisor has ended or never started: nothing runs in them
         if let Some(ws) = &made {
             let _ = self.ws.remove(ws);
@@ -1134,6 +1165,7 @@ impl Setups {
         spec: &SetupSpec,
         dir: &Path,
         made: &mut Option<Workspace>,
+        binding: Option<&ExecutionBinding>,
     ) -> BuildEnd {
         let crashed =
             |what: &str, e: &dyn std::fmt::Display| BuildEnd::Crashed(format!("{what}: {e}"));
@@ -1170,7 +1202,7 @@ impl Setups {
             Ok(s) => s,
             Err(e) => return crashed("builder state", &e),
         };
-        if let Err(e) = self.write_spec(dir, attempt, spec, &ws) {
+        if let Err(e) = self.write_spec(dir, attempt, spec, &ws, binding) {
             return crashed("builder spec", &e);
         }
         if self.wanted(id).0 == 0 {
@@ -1327,13 +1359,17 @@ impl Setups {
         attempt: &AttemptId,
         spec: &SetupSpec,
         ws: &Workspace,
+        binding: Option<&ExecutionBinding>,
     ) -> Result<(), String> {
+        let base_env = binding
+            .map(|b| &b.activation.environment)
+            .unwrap_or(&self.cfg.env);
         let mut nodes = Vec::new();
         for (i, s) in policy::hoisted(spec).iter().enumerate() {
             let mut argv = policy::shell_argv(s.shell.as_deref(), &s.run)
                 .ok_or_else(|| format!("step {}: unsupported shell", s.id))?;
             if s.shell.is_none() {
-                if let Some(shell) = self.cfg.env.get("SHELL") {
+                if let Some(shell) = base_env.get("SHELL") {
                     match Path::new(shell).file_name().and_then(|v| v.to_str()) {
                         Some("bash") => argv[0] = shell.clone(),
                         Some("sh") => {
@@ -1352,8 +1388,14 @@ impl Setups {
                     }
                 }
             }
-            let mut env = self.cfg.env.clone();
-            env.extend(s.env.clone());
+            let env = match binding {
+                Some(b) => b.environment(&s.env).map_err(str::to_string)?,
+                None => {
+                    let mut env = base_env.clone();
+                    env.extend(s.env.clone());
+                    env
+                }
+            };
             nodes.push(NodeSpec {
                 node_id: NodeId::parse(&format!("setup-{i}")).map_err(|e| e.to_string())?,
                 argv,
@@ -1363,7 +1405,13 @@ impl Setups {
                 timeout_ms: spec.step_timeout_ms,
             });
         }
-        self.write_nodes(dir, attempt, nodes, ws.warnings.clone())
+        self.write_nodes_bound(
+            dir,
+            attempt,
+            nodes,
+            ws.warnings.clone(),
+            binding.map(|b| b.fingerprint().clone()),
+        )
     }
 
     fn write_nodes(
@@ -1373,8 +1421,25 @@ impl Setups {
         nodes: Vec<NodeSpec>,
         workspace_warnings: Vec<String>,
     ) -> Result<(), String> {
+        self.write_nodes_bound(
+            dir,
+            attempt,
+            nodes,
+            workspace_warnings,
+            self.cfg.profile_fingerprint.clone(),
+        )
+    }
+
+    fn write_nodes_bound(
+        &self,
+        dir: &Path,
+        attempt: &AttemptId,
+        nodes: Vec<NodeSpec>,
+        workspace_warnings: Vec<String>,
+        fingerprint: Option<crate::ids::Digest>,
+    ) -> Result<(), String> {
         let sup = SuperviseSpec {
-            profile_fingerprint: self.cfg.profile_fingerprint.clone(),
+            profile_fingerprint: fingerprint,
             state_dir: dir.to_path_buf(),
             worker_id: self.cfg.worker_id.clone(),
             attempt_id: attempt.clone(),

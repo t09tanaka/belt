@@ -195,6 +195,7 @@ impl Fx {
     fn payload_of(&self, run: &RunId, spec: &SetupSpec) -> AttemptPayload {
         let d = Digest::of_bytes(b"the source");
         AttemptPayload {
+            toolchains: None,
             outputs: Vec::new(),
             requirements: Default::default(),
             in_place: false,

@@ -90,7 +90,7 @@ impl FileIdentity {
             executable: m.mode() & 0o111 != 0,
         })
     }
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if Self::capture(&self.path)? != *self {
             Err("tool_identity_drift")
         } else {
@@ -124,7 +124,7 @@ pub struct CommandOutput {
 pub trait AdmittedExecutor {
     fn execute(&mut self, command: &CommandSpec) -> Result<CommandOutput>;
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResolutionEvidence {
     pub contract: Digest,
     pub tool: ToolId,

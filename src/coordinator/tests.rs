@@ -21,6 +21,7 @@ impl WorkerLink for Silent {
 
 fn spec() -> TaskSpec {
     TaskSpec {
+        toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),
         in_place: false,

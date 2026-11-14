@@ -3156,3 +3156,236 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     assert!(forecast.target.execution_ms.is_some());
     assert!(forecast.target.conditional);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries() {
+    use remote_task_runner::service::{completion::Target, context::Context, control};
+    use remote_task_runner::toolchain::profile::Profile;
+    let (root, spec, input) = control_fixture();
+    let host = root.path().join("private-managers");
+    std::fs::create_dir(&host).unwrap();
+    crate::common::write_executable(&host.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
+    let profile_text = format!("schema_version=1\nactive='base22'\n[profiles.base22]\npath=[{:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='base22'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
+    let profile_file = spec.worker_state_dir.join("profiles.toml");
+    std::fs::write(&profile_file, &profile_text).unwrap();
+    std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let profile = Profile::load(&spec.worker_state_dir, &spec.env).unwrap();
+    let manager = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$1" >> '{host}/calls'
+version="$1"
+bin="$NODENV_ROOT/versions/$version/bin"
+/bin/mkdir -p "$bin"
+/usr/bin/printf '#!/bin/sh\necho v%s\n' "$version" > "$bin/node"
+/bin/chmod 700 "$bin/node"
+"#,
+        host = host.display()
+    );
+    crate::common::write_executable(&host.join("manager"), &manager);
+    crate::common::write_executable(&host.join("node-build"), &manager);
+    let registry = format!("schema_version=1\nactive_profile='base22'\nprofile_definition={:?}\n[[recipes]]\ntool='node'\nkind='Nodenv'\nmanager={:?}\ndependencies=[{:?}]\nsearch_path=[{:?},'/usr/bin','/bin']\ninventory=['20.0.0','22.0.0']\n", profile.definition_digest().as_str(), host.join("manager").to_str().unwrap(),host.join("node-build").to_str().unwrap(),host.to_str().unwrap());
+    let registry_file = spec.worker_state_dir.join("toolchains.toml");
+    std::fs::write(&registry_file, registry).unwrap();
+    std::fs::set_permissions(&registry_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::write(input.join(".node-version"), "20.0.0\n").unwrap();
+    // The public submit capture path, with the existing project builder enabled.
+    let mut context = Context::load(spec.env.clone(), input.clone(), spec.clone()).unwrap();
+    context.config.prepare_commands = vec![vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "node --version > prepared-node.txt".into(),
+    ]];
+    let ready = host.join("node20-ready");
+    let release = host.join("node20-release");
+    let first_script = format!("test \"$(node --version)\" = v20.0.0 && test \"$(cat prepared-node.txt)\" = v20.0.0 || exit 91; : > '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 400 ]; do /bin/sleep 0.05; i=$((i+1)); done; test -f '{}' || exit 92; test \"$(node --version)\" = v20.0.0 || exit 93; exit 23", ready.display(), release.display(), release.display());
+    let first = remote_task_runner::service::submit::command(
+        context,
+        vec!["/bin/sh".into(), "-c".into(), first_script],
+        None,
+    )
+    .await
+    .unwrap();
+    // A different snapshot requests Node22 without changing operator defaults.
+    std::fs::write(input.join(".node-version"), "22.0.0\n").unwrap();
+    let second_script = format!("test \"$(node --version)\" = v22.0.0 || exit 94; i=0; while [ ! -f '{}' ] && [ $i -lt 400 ]; do /bin/sleep 0.05; i=$((i+1)); done; test -f '{}' || exit 95; : > '{}'", ready.display(), ready.display(), release.display());
+    let output = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "exec", "--", "/bin/sh", "-c", &second_script])
+        .env_clear()
+        .envs(&spec.env)
+        .current_dir(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = tokio::time::timeout(
+        Duration::from_secs(45),
+        control::wait(&spec, Target::Run(first.run_id.clone()), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    if done.cli_exit_code != 23 {
+        eprintln!("public activation completion: {done:?}");
+        let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+        let worker =
+            remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
+                .unwrap();
+        for attempt in owner.attempts_of_task(&first.task_id).unwrap() {
+            eprintln!(
+                "private preparation diagnostics: {:?}",
+                worker
+                    .events_of(&attempt.attempt_id, "agent_prepare_failed")
+                    .unwrap()
+            );
+        }
+        shutdown(&load(&spec)).await;
+        panic!("activated setup and command must both see Node20");
+    }
+    // Retry keeps the original capture and exact evidence even after changing the checkout.
+    control::retry(&spec, Target::Run(first.run_id.clone()))
+        .await
+        .unwrap();
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = tokio::time::timeout(
+        Duration::from_secs(45),
+        control::wait(&spec, Target::Run(first.run_id.clone()), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(done.cli_exit_code, 23);
+    std::fs::write(input.join(".node-version"), "20.0.0\n").unwrap();
+    let public20 = tokio::process::Command::new(&spec.executable)
+        .args([
+            "--json",
+            "exec",
+            "--",
+            "/bin/sh",
+            "-c",
+            "test \"$(node --version)\" = v20.0.0",
+        ])
+        .env_clear()
+        .envs(&spec.env)
+        .current_dir(&input)
+        .output()
+        .await
+        .unwrap();
+    if !public20.status.success() {
+        shutdown(&load(&spec)).await;
+        panic!(
+            "public Node20 exec failed: {}",
+            String::from_utf8_lossy(&public20.stderr)
+        );
+    }
+    let calls = std::fs::read_to_string(host.join("calls")).unwrap();
+    assert_eq!(calls.lines().filter(|v| *v == "20.0.0").count(), 1);
+    assert_eq!(calls.lines().filter(|v| *v == "22.0.0").count(), 1);
+    assert_eq!(std::fs::read_to_string(profile_file).unwrap(), profile_text);
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let attempts = owner.attempts_of_task(&first.task_id).unwrap();
+    assert_eq!(attempts.len(), 2);
+    let worker =
+        remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
+    let mut bundles = Vec::new();
+    let mut node20 = None;
+    for attempt in attempts {
+        let accepted = worker.get(&attempt.attempt_id).unwrap().unwrap();
+        let payload: remote_task_runner::wire::AttemptPayload =
+            serde_json::from_value(accepted.spec).unwrap();
+        bundles.push(payload.toolchains.unwrap());
+        let binding: remote_task_runner::toolchain::contract::ExecutionBinding =
+            serde_json::from_slice(
+                &std::fs::read(
+                    spec.worker_state_dir
+                        .join("attempts")
+                        .join(attempt.attempt_id.as_str())
+                        .join("execution-binding.json"),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        node20 = std::env::split_paths(&binding.activation.environment["PATH"])
+            .next()
+            .map(|bin| bin.join("node"));
+        assert_eq!(binding.activation.environment["HOME"], spec.env["HOME"]);
+        assert_ne!(binding.fingerprint(), &profile.report().profile_fingerprint);
+    }
+    assert_eq!(bundles[0], bundles[1]);
+    // A running supervisor keeps its accepted immutable execution binding even
+    // when a later owner observes drift. It must be adopted, never relaunched.
+    let adoption_ready = host.join("adoption-ready");
+    let adoption_release = host.join("adoption-release");
+    let adoption_script = format!("test \"$(node --version)\" = v20.0.0 || exit 96; : > '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 800 ]; do /bin/sleep 0.05; i=$((i+1)); done; test -f '{}' || exit 97; exit 23", adoption_ready.display(), adoption_release.display(), adoption_release.display());
+    let context = Context::load(spec.env.clone(), input.clone(), spec.clone()).unwrap();
+    let adopting = remote_task_runner::service::submit::command(
+        context,
+        vec!["/bin/sh".into(), "-c".into(), adoption_script],
+        None,
+    )
+    .await
+    .unwrap();
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !adoption_ready.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let active = owner
+        .attempts_of_task(&adopting.task_id)
+        .unwrap()
+        .pop()
+        .unwrap();
+    let binding_path = spec
+        .worker_state_dir
+        .join("attempts")
+        .join(active.attempt_id.as_str())
+        .join("execution-binding.json");
+    let accepted_binding = std::fs::read(&binding_path).unwrap();
+    assert_eq!(worker.launches(&active.attempt_id).unwrap().len(), 1);
+    shutdown(&load(&spec)).await;
+    crate::common::write_executable(&node20.unwrap(), "#!/bin/sh\necho v99.0.0\n");
+    ensure(spec.clone()).await.unwrap();
+    assert_eq!(std::fs::read(&binding_path).unwrap(), accepted_binding);
+    assert_eq!(worker.launches(&active.attempt_id).unwrap().len(), 1);
+    std::fs::write(&adoption_release, "release").unwrap();
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let adopted = tokio::time::timeout(
+        Duration::from_secs(30),
+        control::wait(&spec, Target::Run(adopting.run_id), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(adopted.cli_exit_code, 23);
+    assert_eq!(worker.launches(&active.attempt_id).unwrap().len(), 1);
+    // The same changed artifact blocks a new launch without repair/install.
+
+    let escaped = host.join("drift-consumer-ran");
+    let drift_script = format!("echo unsafe > '{}'", escaped.display());
+    let drift = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "exec", "--", "/bin/sh", "-c", &drift_script])
+        .env_clear()
+        .envs(&spec.env)
+        .current_dir(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(!drift.status.success());
+    assert!(!escaped.exists());
+    assert_eq!(std::fs::read_to_string(host.join("calls")).unwrap(), calls);
+    let native = Command::new(host.join("node"))
+        .arg("--version")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert_eq!(native.stdout, b"v22.0.0\n");
+    shutdown(&load(&spec)).await;
+}

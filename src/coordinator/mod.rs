@@ -95,6 +95,8 @@ type Result<T, E = CoordinatorError> = std::result::Result<T, E>;
 /// from this by [`build_payload`] and nowhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchains: Option<crate::toolchain::contract::FrozenBundle>,
     #[serde(
         default,
         skip_serializing_if = "crate::toolchain::capability::ExecutionRequirements::is_empty"
@@ -135,6 +137,7 @@ pub fn build_payload(
         .clone()
         .ok_or_else(|| StorageError::Invalid(format!("run {} has no source", input.run_id)))?;
     Ok(AttemptPayload {
+        toolchains: spec.toolchains.clone().map(Box::new),
         requirements: spec.requirements.clone(),
         in_place: spec.in_place,
         setup: spec.setup.clone(),
@@ -409,6 +412,71 @@ impl Coordinator {
         }
     }
 
+    /// Bounded, authenticated metadata calls outside actor/admission/SQLite ownership.
+    pub async fn resolve_toolchains(
+        &self,
+        bundle: crate::toolchain::contract::FrozenBundle,
+        requirements: crate::toolchain::capability::ExecutionRequirements,
+    ) -> std::result::Result<crate::toolchain::contract::FrozenBundle, crate::error::ApiError> {
+        let mut workers: Vec<_> = self
+            .workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, link)| (id.clone(), link.clone()))
+            .collect();
+        workers.sort_by(|a, b| {
+            self.sched
+                .priority_of(&b.0)
+                .cmp(&self.sched.priority_of(&a.0))
+                .then(a.0.cmp(&b.0))
+        });
+        let budget = std::time::Duration::from_millis(self.cfg.worker_budget_ms);
+        let epoch = self.epoch();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        let source = bundle.frozen.source_manifest.clone();
+        for (_, link) in workers.into_iter().take(32) {
+            if self.is_fenced() {
+                break;
+            }
+            let request =
+                crate::wire::Request::ResolveToolchains(crate::wire::ResolveToolchainsRequest {
+                    schema_version: crate::wire::SchemaVersion::CURRENT,
+                    request_id: crate::ids::RequestId::generate(),
+                    bundle: bundle.clone(),
+                    requirements: requirements.clone(),
+                });
+            if let Ok(Ok(crate::wire::Response::ResolveToolchains(response))) =
+                tokio::time::timeout(
+                    budget.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    link.read_only_call(request),
+                )
+                .await
+            {
+                if self.is_fenced() || self.epoch() != epoch {
+                    break;
+                }
+                let proposed = response.bundle;
+                let mut original = proposed.frozen.clone();
+                original.selections = bundle.frozen.selections.clone();
+                if original != bundle.frozen
+                    || bundle
+                        .evidence
+                        .iter()
+                        .any(|e| !proposed.evidence.contains(e))
+                    || proposed.validate(&source).is_err()
+                {
+                    continue;
+                }
+                return Ok(proposed);
+            }
+        }
+        Err(crate::error::ApiError::blocked(
+            crate::error::BlockedReason::EnvironmentMismatch,
+            "toolchain resolve required: no coherent worker proposal",
+        ))
+    }
+
     pub fn set_parent_local(&self, worker: WorkerId) {
         *self.parent_local.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
     }
@@ -507,6 +575,11 @@ impl Coordinator {
         self.check_fenced()?;
         let mut specs = Vec::with_capacity(tasks.len());
         for (task, spec) in tasks {
+            if let Some(bundle) = &spec.toolchains {
+                bundle
+                    .validate(&spec.manifest_digest)
+                    .map_err(|e| CoordinatorError::Invalid(e.into()))?;
+            }
             if spec.commands.is_empty() {
                 return Err(CoordinatorError::Invalid(format!(
                     "task {task} has no command"
@@ -1259,6 +1332,29 @@ impl Coordinator {
         if !round.open.is_empty() && !round.open.iter().any(&ready) {
             return Ok(());
         }
+        let mut toolchain_eligible = BTreeSet::new();
+        if let Some(bundle) = &spec.toolchains {
+            for worker in round.open.iter().filter(|w| ready(w)) {
+                let remaining = round.deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let wait = Duration::from_millis(self.sched.cfg.forecast_wait_ms).min(remaining);
+                let request = Request::ResolveToolchains(crate::wire::ResolveToolchainsRequest {
+                    schema_version: crate::wire::SchemaVersion::CURRENT,
+                    request_id: RequestId::generate(),
+                    bundle: bundle.clone(),
+                    requirements: spec.requirements.clone(),
+                });
+                if let Ok(Ok(Response::ResolveToolchains(response))) =
+                    tokio::time::timeout(wait, worker.link.read_only_call(request)).await
+                {
+                    if response.bundle == *bundle {
+                        toolchain_eligible.insert(worker.worker_id.clone());
+                    }
+                }
+            }
+        }
         let refused = self.refused_by(&task.task_id).await?;
         loop {
             // Who has room, counted from the parent's own record.
@@ -1293,11 +1389,13 @@ impl Coordinator {
                 .collect();
             let (compatible, mismatched): (Vec<&Reached>, Vec<&Reached>) =
                 round.open.iter().filter(|w| ready(w)).partition(|w| {
-                    crate::toolchain::capability::missing(
-                        &spec.requirements,
-                        w.capabilities.as_ref(),
-                    )
-                    .is_empty()
+                    (spec.toolchains.is_none() || toolchain_eligible.contains(&w.worker_id))
+                        && crate::toolchain::capability::missing_with_installable(
+                            &spec.requirements,
+                            w.capabilities.as_ref(),
+                            spec.toolchains.as_ref(),
+                        )
+                        .is_empty()
                 });
             excluded.extend(mismatched.into_iter().map(|w| Excluded {
                 unmet: crate::toolchain::capability::missing(

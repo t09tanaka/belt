@@ -399,6 +399,7 @@ fn payload(script: &str) -> AttemptPayload {
     let mut env = BTreeMap::new();
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
+        toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),
         in_place: false,
@@ -3992,4 +3993,69 @@ async fn capability_negotiation_is_required_even_if_worker_has_the_profile() {
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::ProtocolIncompatible);
     assert!(f.store().get(&attempt).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn frozen_toolchain_submit_and_readonly_proposal_require_negotiated_feature() {
+    use remote_task_runner::toolchain::{
+        contract::{FrozenBundle, FEATURE},
+        versions::*,
+    };
+    let f = fx();
+    let agent = f.start("boot-1");
+    let (a, b) = duplex_pair(64 * 1024);
+    let server = tokio::spawn(serve_connection(
+        agent.clone(),
+        b,
+        f.cluster.clone(),
+        Arc::new(Semaphore::new(4)),
+    ));
+    let mut config = client_cfg(&f.cluster);
+    config.features.retain(|feature| feature != FEATURE);
+    let client = connect(a, config).await.unwrap().client;
+    let mut p = payload("exit 0");
+    let scope = Scope::project("");
+    let bundle = FrozenBundle::seal_exact(
+        FrozenToolchains::freeze(
+            p.manifest_digest.clone(),
+            Digest::of_bytes(b"parent"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("node").unwrap(),
+                constraint: Constraint::parse("20.0.0").unwrap(),
+                scope,
+                location: Location {
+                    path: ".node-version".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    p.toolchains = Some(Box::new(bundle.clone()));
+    let attempt = AttemptId::generate();
+    let rejected = call(&client, submit_req(&attempt, &p)).await.unwrap_err();
+    assert_eq!(rejected.code, ErrorCode::ProtocolIncompatible);
+    assert!(f.store().get(&attempt).unwrap().is_none());
+    let rejected = call(
+        &client,
+        Request::ResolveToolchains(ResolveToolchainsRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            bundle,
+            requirements: Default::default(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(rejected.code, ErrorCode::ProtocolIncompatible);
+    assert!(f.store().list_nonterminal().unwrap().is_empty());
+    server.abort();
+    let _ = server.await;
+    agent.shutdown();
 }

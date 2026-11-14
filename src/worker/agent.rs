@@ -190,6 +190,7 @@ pub struct StartupReport {
 }
 
 pub struct Agent {
+    toolchains: Option<crate::toolchain::registry::Registry>,
     cfg: AgentConfig,
     store: WorkerStore,
     host: Arc<dyn Host>,
@@ -514,7 +515,14 @@ impl Agent {
         let (store, epoch) = opened.expect("the store step ran");
         report.watched = todo.clone();
         let max_prepares = cfg.max_concurrent_prepares.max(1);
+        let toolchains = cfg
+            .capability_profile
+            .as_ref()
+            .map(|profile| host.toolchain_registry(profile, cfg.profile_fingerprint.clone()))
+            .transpose()?
+            .flatten();
         let agent = Arc::new(Agent {
+            toolchains,
             cfg,
             store,
             host,
@@ -909,6 +917,7 @@ impl Agent {
         if let Err(error) = self
             .check_capabilities(&payload)
             .and_then(|_| self.check_profile_identity(rec))
+            .and_then(|_| self.check_execution_binding(rec))
         {
             self.note_once(a, "agent_environment_changed", json!({ "code": error.code, "blocked_reason": error.blocked_reason, "message": error.message }));
             settle(
@@ -1170,7 +1179,11 @@ impl Agent {
 
         // The prepared setup steps are copied in (or waited for); the
         // commands that are such a step are left out.
-        let Some(skip) = self.setup_wait(rec, &payload, &ws)? else {
+        let Some(binding) = self.prepare_toolchains(rec, &payload)? else {
+            return Ok(());
+        };
+        let binding = binding.as_ref();
+        let Some(skip) = self.setup_wait(rec, &payload, &ws, binding)? else {
             return Ok(());
         };
         let commands = crate::setup::policy::prune_commands(&payload.commands, &skip);
@@ -1260,7 +1273,9 @@ impl Agent {
                 workspace: ws.root.clone(),
                 source_id: payload.source_id.clone(),
                 plan_digest: payload.plan_digest.clone(),
-                profile_fingerprint: self.cfg.profile_fingerprint.clone(),
+                profile_fingerprint: binding
+                    .map(|b| b.fingerprint().clone())
+                    .unwrap_or_else(|| self.cfg.profile_fingerprint.clone()),
                 max_bytes: DEFAULT_ARTIFACT_BYTES,
                 files: payload
                     .artifacts
@@ -1298,7 +1313,13 @@ impl Agent {
                 ws.root.join(rel)
             };
             let env = match &self.cfg.capability_profile {
-                Some(profile) => profile.execution_environment(&c.env).map_err(invalid)?,
+                Some(profile) => {
+                    profile.execution_environment(&c.env).map_err(invalid)?;
+                    match binding {
+                        Some(binding) => binding.environment(&c.env).map_err(invalid)?,
+                        None => profile.execution_environment(&c.env).map_err(invalid)?,
+                    }
+                }
                 None => c.env.clone(),
             };
             nodes.push(NodeSpec {
@@ -1311,11 +1332,12 @@ impl Agent {
             });
         }
         let spec = SuperviseSpec {
-            profile_fingerprint: self
-                .cfg
-                .capability_profile
-                .as_ref()
-                .map(|_| self.cfg.profile_fingerprint.clone()),
+            profile_fingerprint: binding.map(|b| b.fingerprint().clone()).or_else(|| {
+                self.cfg
+                    .capability_profile
+                    .as_ref()
+                    .map(|_| self.cfg.profile_fingerprint.clone())
+            }),
             state_dir: self.cfg.state_dir.clone(),
             worker_id: self.cfg.worker_id.clone(),
             attempt_id: attempt.clone(),
@@ -1357,6 +1379,238 @@ impl Agent {
         Ok(())
     }
 
+    fn resolve_toolchains(
+        &self,
+        mut bundle: crate::toolchain::contract::FrozenBundle,
+        requirements: &crate::toolchain::capability::ExecutionRequirements,
+    ) -> Result<crate::toolchain::contract::FrozenBundle, ApiError> {
+        bundle
+            .validate_partial(&bundle.frozen.source_manifest)
+            .map_err(invalid)?;
+        requirements.validate().map_err(invalid)?;
+        let report = self
+            .capabilities()
+            .ok_or_else(|| invalid("proposal profile unavailable"))?;
+        let observed = crate::toolchain::contract::observations(&report);
+        for baseline in &bundle.frozen.baseline {
+            if bundle.frozen.policy.compare(
+                &baseline.version,
+                observed
+                    .get(&baseline.tool)
+                    .unwrap_or(&crate::toolchain::versions::VersionObservation::Unknown),
+            ) != crate::toolchain::versions::Match::Match
+            {
+                return Err(ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "proposal baseline mismatch",
+                ));
+            }
+        }
+        let registry = self
+            .toolchains
+            .as_ref()
+            .ok_or_else(|| invalid("proposal registry unavailable"))?;
+        for requirement in bundle.frozen.requirements.clone() {
+            if bundle.evidence.iter().any(|e| e.tool == requirement.tool) {
+                continue;
+            }
+            let request = registry
+                .request(&bundle.frozen, &requirement.tool, None)
+                .map_err(|e| {
+                    ApiError::blocked(
+                        crate::error::BlockedReason::EnvironmentMismatch,
+                        format!("toolchain resolve required: {e:?}"),
+                    )
+                })?;
+            bundle.frozen = request.frozen;
+            bundle.evidence.push(request.evidence);
+        }
+        bundle
+            .validate(&bundle.frozen.source_manifest)
+            .map_err(invalid)?;
+        self.toolchain_requests(&bundle)?;
+        if !crate::toolchain::capability::missing_with_installable(
+            requirements,
+            Some(&report),
+            Some(&bundle),
+        )
+        .is_empty()
+        {
+            return Err(ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                "proposal worker requirements mismatch",
+            ));
+        }
+
+        Ok(bundle)
+    }
+    fn toolchain_requests(
+        &self,
+        bundle: &crate::toolchain::contract::FrozenBundle,
+    ) -> Result<Vec<crate::toolchain::preparation::PreparationRequest>, ApiError> {
+        let registry = self.toolchains.as_ref().ok_or_else(|| {
+            ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                "toolchain registry unavailable",
+            )
+        })?;
+        bundle
+            .evidence
+            .iter()
+            .map(|e| {
+                registry
+                    .request(&bundle.frozen, &e.tool, Some(e))
+                    .map_err(|e| {
+                        ApiError::blocked(
+                            crate::error::BlockedReason::EnvironmentMismatch,
+                            format!("toolchain unavailable: {e:?}"),
+                        )
+                    })
+            })
+            .collect()
+    }
+    fn execution_binding_path(&self, attempt: &AttemptId) -> PathBuf {
+        self.attempt_dir(attempt).join("execution-binding.json")
+    }
+    fn check_execution_binding(&self, rec: &AcceptedAttempt) -> Result<(), ApiError> {
+        let payload: AttemptPayload =
+            serde_json::from_value(rec.spec.clone()).map_err(|e| internal("stored payload", e))?;
+        let Some(bundle) = payload.toolchains else {
+            return Ok(());
+        };
+        let binding: crate::toolchain::contract::ExecutionBinding = serde_json::from_slice(
+            &fs::read(self.execution_binding_path(&rec.attempt_id))
+                .map_err(|e| internal("execution binding", e))?,
+        )
+        .map_err(|e| internal("execution binding", e))?;
+        let requests = self.toolchain_requests(&bundle)?;
+        let registry = self.toolchains.as_ref().expect("requests checked registry");
+        for request in requests {
+            if !matches!(
+                registry.detect(&request),
+                Ok(crate::toolchain::adapters::Availability::Installed(_))
+            ) {
+                return Err(ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "activated tool identity changed",
+                ));
+            }
+        }
+        binding.activation.shell.validate().map_err(invalid)?;
+        if binding.activation.base_profile != self.cfg.profile_fingerprint
+            || binding.activation.frozen != bundle.frozen.digest()
+        {
+            return Err(invalid("execution binding identity changed"));
+        }
+        Ok(())
+    }
+    fn prepare_toolchains(
+        &self,
+        rec: &AcceptedAttempt,
+        payload: &AttemptPayload,
+    ) -> Result<Option<Option<crate::toolchain::contract::ExecutionBinding>>, ApiError> {
+        use crate::toolchain::{
+            adapters,
+            contract::{observations, ExecutionBinding},
+            preparation::ToolPreparationPoll,
+        };
+        let Some(bundle) = &payload.toolchains else {
+            return Ok(Some(None));
+        };
+        let accepted_path = self.execution_binding_path(&rec.attempt_id);
+        if accepted_path.exists() {
+            // Recovery inspects accepted identities; it must not repair drift by reinstalling.
+            self.check_execution_binding(rec)?;
+            let binding = serde_json::from_slice(
+                &fs::read(accepted_path).map_err(|e| internal("execution binding", e))?,
+            )
+            .map_err(|e| internal("execution binding", e))?;
+            return Ok(Some(Some(binding)));
+        }
+        let requests = self.toolchain_requests(bundle)?;
+        let profile = self
+            .cfg
+            .capability_profile
+            .as_ref()
+            .ok_or_else(|| invalid("toolchain profile unavailable"))?;
+        let begun = platform::monotonic_ms();
+        let mut receipts = Vec::new();
+        for request in &requests {
+            loop {
+                match self.host.toolchain_poll(&rec.attempt_id, request)? {
+                    ToolPreparationPoll::Installed(receipt) => {
+                        receipts.push(receipt);
+                        break;
+                    }
+                    ToolPreparationPoll::Failed(reason) => {
+                        return Err(ApiError::blocked(
+                            crate::error::BlockedReason::EnvironmentMismatch,
+                            format!("toolchain preparation failed: {reason:?}"),
+                        ))
+                    }
+                    ToolPreparationPoll::Pending => {
+                        if self.stopping() || self.stop_requested(&rec.attempt_id) {
+                            self.host.setup_release(&rec.attempt_id);
+                            return Ok(None);
+                        }
+                        if platform::monotonic_ms().saturating_sub(begun)
+                            >= self.cfg.prepare_timeout_ms
+                        {
+                            return Err(ApiError::blocked(
+                                crate::error::BlockedReason::EnvironmentMismatch,
+                                "toolchain preparation timed out",
+                            ));
+                        }
+                        self.pause(self.cfg.poll_ms);
+                    }
+                }
+            }
+        }
+        let plans = requests
+            .iter()
+            .map(|r| r.plan(&r.private_root).map_err(invalid))
+            .collect::<Result<Vec<_>, _>>()?;
+        let installed = plans
+            .iter()
+            .zip(receipts.iter().map(|r| r.as_ref()))
+            .collect::<Vec<_>>();
+        let shell = adapters::FileIdentity::capture(profile.shell()).map_err(invalid)?;
+        let setup_policy = Digest::of_bytes(
+            &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
+        );
+        let activation = adapters::activate_set(
+            &bundle.frozen,
+            &installed,
+            self.cfg.profile_fingerprint.clone(),
+            &observations(&profile.report()),
+            profile.environment(),
+            setup_policy,
+            &shell,
+        )
+        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))?;
+        let binding = ExecutionBinding { activation };
+        let path = self.execution_binding_path(&rec.attempt_id);
+        if path.exists() {
+            let previous: ExecutionBinding = serde_json::from_slice(
+                &fs::read(&path).map_err(|e| internal("execution binding", e))?,
+            )
+            .map_err(|e| internal("execution binding", e))?;
+            if previous != binding {
+                return Err(ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "accepted execution binding changed",
+                ));
+            }
+        } else {
+            write_atomic(
+                &path,
+                &serde_json::to_vec(&binding).map_err(|e| internal("execution binding", e))?,
+            )
+            .map_err(|e| internal("execution binding", e))?;
+        }
+        Ok(Some(Some(binding)))
+    }
+
     /// Wait for the setup of the attempt (`Host::setup_poll`), as long as
     /// the preparation may take. `None`: the agent is stopping or the
     /// attempt is being stopped. An attempt that waited too long, or whose
@@ -1366,11 +1620,12 @@ impl Agent {
         rec: &AcceptedAttempt,
         payload: &AttemptPayload,
         ws: &Workspace,
+        binding: Option<&crate::toolchain::contract::ExecutionBinding>,
     ) -> Result<Option<std::collections::BTreeSet<String>>, ApiError> {
         let attempt = &rec.attempt_id;
         let begun = platform::monotonic_ms();
         loop {
-            match self.host.setup_poll(rec, payload, ws)? {
+            match self.host.setup_poll_bound(rec, payload, ws, binding)? {
                 SetupPoll::Done { skip, note } => {
                     if let Some(why) = note {
                         self.note_once(
@@ -1740,6 +1995,15 @@ impl Agent {
                     &r,
                 )
                 .map(Response::ForecastCommand)
+            }
+            Request::ResolveToolchains(r) => {
+                let bundle = self.resolve_toolchains(r.bundle, &r.requirements)?;
+                Ok(Response::ResolveToolchains(
+                    crate::wire::ResolveToolchainsResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        bundle,
+                    },
+                ))
             }
             Request::EnvReport(_) | Request::EnvSync(_) => Err(ApiError::new(
                 ErrorCode::NotImplemented,
@@ -2313,6 +2577,10 @@ impl Agent {
     }
     fn check_capabilities(&self, payload: &AttemptPayload) -> Result<(), ApiError> {
         payload.requirements.validate().map_err(invalid)?;
+        if let Some(bundle) = &payload.toolchains {
+            bundle.validate(&payload.manifest_digest).map_err(invalid)?;
+            self.toolchain_requests(bundle)?;
+        }
         if let Some(profile) = &self.cfg.capability_profile {
             for command in &payload.commands {
                 profile
@@ -2326,7 +2594,16 @@ impl Agent {
             }
         }
         let report = self.capabilities();
-        let missing = crate::toolchain::capability::missing(&payload.requirements, report.as_ref());
+        if let Some(bundle) = &payload.toolchains {
+            crate::toolchain::contract::check_baselines(&bundle.frozen, report.as_ref()).map_err(
+                |e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e),
+            )?;
+        }
+        let missing = crate::toolchain::capability::missing_with_installable(
+            &payload.requirements,
+            report.as_ref(),
+            payload.toolchains.as_deref(),
+        );
         if !missing.is_empty() || (self.cfg.capability_profile.is_some() && report.is_none()) {
             return Err(ApiError::blocked(
                 crate::error::BlockedReason::EnvironmentMismatch,

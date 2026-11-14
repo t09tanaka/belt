@@ -103,6 +103,54 @@ pub async fn command_with_mode(
         .map_err(|e| invalid(e.to_string()))?;
     let cwd = String::from_utf8(captured.manifest.cwd_relative.0.clone())
         .map_err(|e| invalid(e.to_string()))?;
+    let freeze_state = context.state_dir().to_owned();
+    let resolution_guard = tokio::task::spawn_blocking(move || {
+        crate::source::SourceStore::open(&freeze_state).and_then(|s| s.mutation_guard())
+    })
+    .await
+    .map_err(|e| invalid(e.to_string()))?
+    .map_err(|e| invalid(e.to_string()))?;
+    let (toolchains, resolution_guard) = {
+        let capture_context = context.clone();
+        let manifest = captured.manifest.clone();
+        let source_digest = digest.clone();
+        let requirements = requirements.clone();
+        tokio::task::spawn_blocking(move || {
+            // Blocking source IO retains ownership even when the submit future
+            // is cancelled. Return the guard only after that IO has drained.
+            let frozen =
+                freeze_toolchains(&capture_context, &manifest, source_digest, &requirements);
+            (frozen, resolution_guard)
+        })
+        .await
+        .map_err(|e| invalid(e.to_string()))?
+    };
+    let toolchains = match toolchains? {
+        Some(bundle) if bundle.validate(&digest).is_err() => {
+            match owner
+                .request(Operation::ResolveToolchains {
+                    bundle,
+                    requirements: requirements.clone(),
+                })
+                .await
+                .map_err(|e| ApiError::new(ErrorCode::CommunicationUnknown, e.to_string()))?
+            {
+                Reply::ResolvedToolchains { bundle } => {
+                    bundle.validate(&digest).map_err(|e| invalid(e.into()))?;
+                    Some(bundle)
+                }
+                Reply::ControlError { error } => return Err(error),
+                _ => {
+                    return Err(ApiError::blocked(
+                        crate::error::BlockedReason::EnvironmentMismatch,
+                        "toolchain resolve required",
+                    ))
+                }
+            }
+        }
+        other => other,
+    };
+    drop(resolution_guard);
     let env = context
         .config
         .pass_env
@@ -156,11 +204,17 @@ pub async fn command_with_mode(
         .collect();
     crate::outputs::validate(&[], &outputs).map_err(|e| invalid(e.into()))?;
     let mut spec = TaskSpec {
+        toolchains: toolchains.clone(),
         requirements: requirements.clone(),
         in_place,
         outputs: outputs.clone(),
         setup,
-        plan_digest: if requirements.is_empty() {
+        plan_digest: if let Some(bundle) = &toolchains {
+            Digest::of_bytes(
+                &serde_json::to_vec(&(&command, &outputs, &requirements, bundle.digest()))
+                    .map_err(|e| invalid(e.to_string()))?,
+            )
+        } else if requirements.is_empty() {
             crate::outputs::command_plan_digest(&command, &outputs)
                 .map_err(|e| invalid(e.to_string()))?
         } else {
@@ -254,4 +308,111 @@ pub async fn command_with_mode(
             "unexpected submit receipt",
         )),
     }
+}
+
+fn freeze_toolchains(
+    context: &Context,
+    captured: &crate::source::manifest::SourceManifest,
+    digest: Digest,
+    requirements: &crate::toolchain::capability::ExecutionRequirements,
+) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
+    use crate::toolchain::{
+        contract::{self, FrozenBundle},
+        versions::{FrozenToolchains, Location, MatchPolicy, Scope, ToolId, VersionObservation},
+    };
+    let blocked =
+        |e: String| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e);
+    let store = crate::source::SourceStore::open(context.state_dir())
+        .map_err(|e| blocked(e.to_string()))?;
+    let manifest = store
+        .manifest(&captured.ci_source_id)
+        .map_err(|e| blocked(e.to_string()))?
+        .ok_or_else(|| blocked("captured toolchain source unavailable".into()))?;
+    if manifest.manifest_digest != captured.manifest_digest {
+        return Err(blocked("captured toolchain source binding changed".into()));
+    }
+    let project = std::str::from_utf8(&manifest.cwd_relative.0)
+        .map_err(|_| blocked("invalid toolchain project scope".into()))?;
+    let declarations = crate::toolchain::snapshot::read_captured(&store, &manifest, project, &[])
+        .map_err(|e| blocked(e.code))?;
+    // Required profile tools are capture-time baseline inputs, not all optional probes.
+    let profile = crate::toolchain::profile::Profile::load(
+        &context.bootstrap.worker_state_dir,
+        &context.bootstrap.env,
+    )
+    .map_err(blocked)?;
+    let generic = requirements.requires.iter().filter_map(|r| match r {
+        crate::toolchain::capability::Requirement::Tool(name) => Some(name.clone()),
+        _ => None,
+    });
+    let required = profile
+        .required_tools()
+        .iter()
+        .cloned()
+        .chain(generic)
+        .map(|name| {
+            ToolId::parse(contract::canonical_tool(&name))
+                .map(|tool| {
+                    (
+                        tool,
+                        Location {
+                            path: "profile:required_tools".into(),
+                            first_line: 1,
+                            last_line: 1,
+                        },
+                    )
+                })
+                .map_err(|e| blocked(e.into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if declarations.is_empty() && required.is_empty() {
+        return Ok(None);
+    }
+    let policy = match context.config.toolchain_match.value {
+        crate::config::model::ToolchainMatch::Exact => MatchPolicy::Exact,
+        crate::config::model::ToolchainMatch::Minor => MatchPolicy::Minor,
+        crate::config::model::ToolchainMatch::Major => MatchPolicy::Major,
+        crate::config::model::ToolchainMatch::Any => MatchPolicy::Any,
+    };
+    let observations = contract::observations(&profile.report());
+    let frozen = FrozenToolchains::freeze(
+        digest,
+        profile.definition_digest().clone(),
+        Scope::project(project),
+        &declarations,
+        &required,
+        &observations,
+        policy,
+    )
+    .map_err(|e| blocked(e.code))?;
+    if frozen
+        .baseline
+        .iter()
+        .any(|b| b.version == VersionObservation::Unknown)
+    {
+        return Err(blocked(
+            "toolchain baseline unknown; capture requires an observed required tool".into(),
+        ));
+    }
+    let mut bundle = FrozenBundle::seal_exact(frozen).map_err(|e| blocked(e.into()))?;
+    if bundle.validate(&bundle.frozen.source_manifest).is_ok() {
+        return Ok(Some(bundle));
+    }
+    // Loading a configured inventory is read-only and invokes no managers.
+    if let Ok(registry) = crate::toolchain::registry::Registry::load(
+        &context.bootstrap.worker_state_dir,
+        &profile,
+        profile.report().profile_fingerprint,
+    ) {
+        for requirement in bundle.frozen.requirements.clone() {
+            if bundle.evidence.iter().any(|e| e.tool == requirement.tool) {
+                continue;
+            }
+            if let Ok(request) = registry.request(&bundle.frozen, &requirement.tool, None) {
+                bundle.frozen = request.frozen;
+                bundle.evidence.push(request.evidence);
+            }
+        }
+    }
+    Ok(Some(bundle))
 }

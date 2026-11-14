@@ -582,6 +582,7 @@ fn payload(p: &Parcel, script: &str) -> AttemptPayload {
     let mut env = BTreeMap::new();
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
+        toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),
         in_place: false,

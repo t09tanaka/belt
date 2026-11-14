@@ -244,10 +244,11 @@ pub enum Operation {
     EnvReport,
     EnvSync,
     ForecastCommand,
+    ResolveToolchains,
 }
 
 impl Operation {
-    pub const ALL: [Operation; 20] = [
+    pub const ALL: [Operation; 21] = [
         Operation::Hello,
         Operation::Inspect,
         Operation::Forecast,
@@ -268,6 +269,7 @@ impl Operation {
         Operation::EnvReport,
         Operation::EnvSync,
         Operation::ForecastCommand,
+        Operation::ResolveToolchains,
     ];
 
     pub fn idempotency(self) -> Idempotency {
@@ -291,7 +293,8 @@ impl Operation {
             | Operation::GetResult
             | Operation::BlobGet
             | Operation::BlobVerify
-            | Operation::EnvReport => Idempotency::ReadOnly,
+            | Operation::EnvReport
+            | Operation::ResolveToolchains => Idempotency::ReadOnly,
         }
     }
 }
@@ -835,6 +838,8 @@ impl ArtifactEncoding {
 /// `payload_hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchains: Option<Box<crate::toolchain::contract::FrozenBundle>>,
     #[serde(
         default,
         skip_serializing_if = "crate::toolchain::capability::ExecutionRequirements::is_empty"
@@ -1671,6 +1676,21 @@ macro_rules! operations {
     };
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveToolchainsRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub bundle: crate::toolchain::contract::FrozenBundle,
+    pub requirements: crate::toolchain::capability::ExecutionRequirements,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveToolchainsResponse {
+    pub schema_version: SchemaVersion,
+    pub bundle: crate::toolchain::contract::FrozenBundle,
+}
+
 operations! {
     Hello(HelloRequest, HelloResponse),
     Inspect(InspectRequest, InspectResponse),
@@ -1692,6 +1712,7 @@ operations! {
     SecretBundlePut(SecretBundlePutRequest, SecretBundlePutResponse),
     EnvReport(EnvReportRequest, EnvReportResponse),
     EnvSync(EnvSyncRequest, EnvSyncResponse),
+    ResolveToolchains(ResolveToolchainsRequest, ResolveToolchainsResponse),
 }
 
 /// An error reply.
@@ -1791,6 +1812,7 @@ mod tests {
 
     fn payload() -> AttemptPayload {
         AttemptPayload {
+            toolchains: None,
             outputs: Vec::new(),
             requirements: Default::default(),
             in_place: false,
@@ -1937,6 +1959,23 @@ mod tests {
                 start_in_ms: Some(30_000),
                 finish_in_ms: None,
             }),
+        }
+    }
+
+    fn frozen_bundle() -> crate::toolchain::contract::FrozenBundle {
+        crate::toolchain::contract::FrozenBundle {
+            schema_version: 1,
+            frozen: crate::toolchain::versions::FrozenToolchains::freeze(
+                dg("source"),
+                dg("parent"),
+                crate::toolchain::versions::Scope::project(""),
+                &[],
+                &[],
+                &BTreeMap::new(),
+                crate::toolchain::versions::MatchPolicy::Exact,
+            )
+            .unwrap(),
+            evidence: vec![],
         }
     }
 
@@ -2106,6 +2145,12 @@ mod tests {
                 workload: plan(),
                 pending: vec![],
             },
+        }));
+        out.push(Request::ResolveToolchains(ResolveToolchainsRequest {
+            schema_version: SV,
+            request_id: rid(),
+            bundle: frozen_bundle(),
+            requirements: Default::default(),
         }));
         out
     }
@@ -2293,6 +2338,10 @@ mod tests {
         if let Response::Forecast(answer) = out[2].clone() {
             out.push(Response::ForecastCommand(answer));
         }
+        out.push(Response::ResolveToolchains(ResolveToolchainsResponse {
+            schema_version: SV,
+            bundle: frozen_bundle(),
+        }));
         out
     }
 
@@ -2449,6 +2498,7 @@ mod tests {
             (Inspect, ReadOnly),
             (Forecast, ReadOnly),
             (ForecastCommand, ReadOnly),
+            (ResolveToolchains, ReadOnly),
             (SubmitAttempt, AttemptAndPayload),
             (GetAttempt, ReadOnly),
             (ListAttempts, ReadOnly),

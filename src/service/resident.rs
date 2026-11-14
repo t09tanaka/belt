@@ -50,6 +50,10 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    ResolveToolchains {
+        bundle: crate::toolchain::contract::FrozenBundle,
+        requirements: crate::toolchain::capability::ExecutionRequirements,
+    },
     Estimate {
         query: super::estimate::Query,
     },
@@ -94,6 +98,9 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
+    ResolvedToolchains {
+        bundle: crate::toolchain::contract::FrozenBundle,
+    },
     Estimate {
         estimate: super::estimate::Estimate,
     },
@@ -144,6 +151,15 @@ pub struct Client {
     owner_token: String,
 }
 impl Operation {
+    fn requires_toolchains(&self) -> bool {
+        match self {
+            Self::ResolveToolchains { .. } => true,
+            Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
+                tasks.iter().any(|(_, spec)| spec.toolchains.is_some())
+            }
+            _ => false,
+        }
+    }
     fn requires_capabilities(&self) -> bool {
         match self {
             Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
@@ -219,7 +235,9 @@ impl Client {
             IO_TIMEOUT
         };
         let request = Request {
-            schema_version: if operation.requires_capabilities() {
+            schema_version: if operation.requires_toolchains() {
+                4
+            } else if operation.requires_capabilities() {
                 3
             } else {
                 2
@@ -884,8 +902,9 @@ async fn handle(
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
-        matches!(request.schema_version, 2 | 3)
-            && (request.schema_version == 3 || !request.operation.requires_capabilities())
+        matches!(request.schema_version, 2..=4)
+            && (request.schema_version >= 3 || !request.operation.requires_capabilities())
+            && (request.schema_version >= 4 || !request.operation.requires_toolchains())
             && request.cluster_id == client.cluster_id
             && request.owner_token == client.owner_token,
         "unauthorized parent request"
@@ -918,6 +937,23 @@ async fn handle(
         let reply = match coordinator.estimate(query).await {
             Ok(estimate) => Reply::Estimate { estimate },
             Err(error) => Reply::ControlError { error },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
+    if let Operation::ResolveToolchains {
+        bundle,
+        requirements,
+    } = request.operation
+    {
+        // No admission lock or writable SQLite scope is held during remote IO.
+        let mut stopping = stop.subscribe();
+        let reply = tokio::select! {
+            _ = stopping.changed() => Reply::Stopping,
+            result = coordinator.resolve_toolchains(bundle, requirements) => match result {
+                Ok(bundle) if !*stop.borrow() && !coordinator.is_fenced() => Reply::ResolvedToolchains { bundle },
+                Ok(_) => Reply::Stopping,
+                Err(error) => Reply::ControlError { error },
+            }
         };
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
@@ -1211,7 +1247,9 @@ async fn handle(
                     },
                 }
             }
-            Operation::Query { .. } | Operation::Estimate { .. } => {
+            Operation::Query { .. }
+            | Operation::Estimate { .. }
+            | Operation::ResolveToolchains { .. } => {
                 unreachable!("read handled before admission")
             }
             Operation::Shutdown => {

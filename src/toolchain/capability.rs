@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const FEATURE: &str = "worker_capabilities_v1";
 pub const FEATURES: &[&str] = &[
     FEATURE,
+    crate::toolchain::contract::FEATURE,
     "blob_resume",
     "log_resume",
     crate::forecast::COMMAND_FEATURE,
@@ -193,6 +194,27 @@ pub fn missing(req: &ExecutionRequirements, report: Option<&WorkerCapabilities>)
     missing
 }
 
+/// Eligibility is distinct from a native observation. Call only after validating
+/// the complete bundle against this worker's trusted registry.
+pub fn missing_with_installable(
+    req: &ExecutionRequirements,
+    report: Option<&WorkerCapabilities>,
+    bundle: Option<&crate::toolchain::contract::FrozenBundle>,
+) -> Vec<String> {
+    let mut native = req.clone();
+    if let Some(bundle) = bundle {
+        native.requires.retain(|r| match r {
+            Requirement::Tool(name) => !bundle
+                .frozen
+                .selections
+                .iter()
+                .any(|s| s.tool.as_str() == crate::toolchain::contract::canonical_tool(name)),
+            _ => true,
+        });
+    }
+    missing(&native, report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,6 +234,40 @@ mod tests {
             features: [FEATURE.into()].into(),
         }
     }
+    #[test]
+    fn eligible_selected_tool_is_distinct_from_its_native_unavailable_observation() {
+        use crate::toolchain::{contract::FrozenBundle, versions::*};
+        let report = report();
+        let before = report.clone();
+        let required = ExecutionRequirements::parse(None, &["node".into()]).unwrap();
+        assert!(!missing(&required, Some(&report)).is_empty());
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"source"),
+            Digest::of_bytes(b"capture"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("node").unwrap(),
+                constraint: Constraint::parse("20.0.0").unwrap(),
+                scope,
+                location: Location {
+                    path: ".node-version".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let selected = FrozenBundle::seal_exact(frozen).unwrap();
+        selected.validate(&selected.frozen.source_manifest).unwrap();
+        assert!(missing_with_installable(&required, Some(&report), Some(&selected)).is_empty());
+        assert_eq!(report, before);
+        assert!(!missing(&required, Some(&report)).is_empty());
+    }
+
     #[test]
     fn grammar_is_strict_and_aliases_are_canonical() {
         for v in [

@@ -668,6 +668,7 @@ impl Fx {
 
 pub(crate) fn spec() -> TaskSpec {
     TaskSpec {
+        toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),
         in_place: false,
@@ -2725,4 +2726,117 @@ async fn capability_filter_runs_before_forecast_and_records_unmet_requirements()
         .unwrap()
         .iter()
         .any(|e| e["why"] == "capability_mismatch" && !e["unmet"].as_array().unwrap().is_empty()));
+}
+
+struct ToolchainAttestor {
+    worker: Arc<FakeWorker>,
+    stall_resolution: bool,
+}
+impl WorkerLink for ToolchainAttestor {
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        self.worker.call(request)
+    }
+    fn read_only_call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            match request {
+                Request::ResolveToolchains(r) if !self.stall_resolution => {
+                    Ok(Response::ResolveToolchains(ResolveToolchainsResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        bundle: r.bundle,
+                    }))
+                }
+                Request::ResolveToolchains(_) => std::future::pending().await,
+                other => self.worker.call(other).await,
+            }
+        })
+    }
+}
+#[tokio::test]
+async fn slow_toolchain_attestation_respects_round_budget_and_other_lease_progress() {
+    use remote_task_runner::toolchain::{contract::FrozenBundle, versions::*};
+    let mut f = fx();
+    f.cfg.worker_budget_ms = 1500;
+    f.sched.forecast_wait_ms = 50;
+    let healthy = f.worker("w-b", (2, 0));
+    let c = f.open(&[&healthy]);
+    let first = enqueue(&c, 1).await;
+    c.tick().await.unwrap();
+    let active = only(&c, &first[0]);
+    healthy.start(&active.attempt_id);
+    c.tick().await.unwrap();
+    let before = healthy.held(&active.attempt_id).unwrap().renewals;
+    let stalled = f.worker("w-a", (2, 0));
+    c.attach(
+        stalled.id.clone(),
+        Arc::new(ToolchainAttestor {
+            worker: stalled,
+            stall_resolution: true,
+        }),
+    )
+    .await;
+    c.attach(
+        healthy.id.clone(),
+        Arc::new(ToolchainAttestor {
+            worker: healthy.clone(),
+            stall_resolution: false,
+        }),
+    )
+    .await;
+    let mut task_spec = spec();
+    let scope = Scope::project("");
+    task_spec.toolchains = Some(
+        FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                task_spec.manifest_digest.clone(),
+                Digest::of_bytes(b"parent"),
+                scope.clone(),
+                &[Declaration {
+                    tool: ToolId::parse("node").unwrap(),
+                    constraint: Constraint::parse("20.0.0").unwrap(),
+                    scope,
+                    location: Location {
+                        path: ".node-version".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &BTreeMap::new(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    let task = TaskId::generate();
+    c.enqueue(
+        RunId::generate(),
+        source(&c),
+        vec![(task.clone(), task_spec)],
+    )
+    .await
+    .unwrap();
+    let begun = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(3), c.tick())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        begun.elapsed() < Duration::from_secs(1),
+        "a complete attestation cannot spend the full peer budget"
+    );
+    assert_eq!(
+        healthy.held(&active.attempt_id).unwrap().renewals,
+        before + 1
+    );
+    assert_eq!(only(&c, &task).worker_id, healthy.id);
+    healthy.finish(&active.attempt_id, Outcome::Succeeded);
+    c.tick().await.unwrap();
+    assert_eq!(only(&c, &first[0]).state, AttemptState::Terminal);
 }

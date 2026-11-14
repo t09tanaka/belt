@@ -1,10 +1,11 @@
 # Private toolchain adapter API (S20b)
 
 `toolchain::adapters` supplies closed installation plans, durable installation
-receipts, and per-attempt activation contracts. It does not complete S20 and
-currently does not change worker placement, TaskSpec, active Profile, setup
-builders, forecast, or consumer process environments. No worker advertises
-`auto_installable` on the strength of this module alone.
+receipts, and per-attempt activation contracts. Public command submission freezes
+source declarations before persistence and routes configured recipes through the
+shared setup builder. Operator profiles remain base worker identities; each task
+receives an activated environment. Native observations remain distinct from
+eligibility to install a selected version.
 
 The trusted parent supplies an authenticated catalog digest and explicit alias
 or expression resolutions to `resolve`. This API checks those resolutions
@@ -91,19 +92,36 @@ Conflicting manager env fails closed: separate Corepack homes for two different
 package-manager selections are currently unsupported. No selection is silently
 dropped. Tasks cannot supply these activation overrides through the wire.
 
-## Mandatory S20c integration
+## Public command routing
 
-Connect catalog acquisition, baseline observation and plan reconstruction to
-captured submit requirements; connect admitted execution to `Setups` rather than
-inventing admission grants. Reuse its existing per-key singleflight/cancellation
-and forecast preparation accounting. Carry the same activation receipt/env/shell
-to setup builders and consumers, and use its effective fingerprint for
-cache/template/history/artifact identity. Revalidate changed/missing tools before
-new launch/relaunch without rewriting already accepted attempts; supervisor
-adoption remains bound to its previous actual identity. Add bundled Dart matching
-and broader manager combinations before advertising those capabilities. Actual
-manager/Docker acceptance is still required in owned isolated environments; the
-current tests execute fake fixture interfaces only and never install host tools.
+`TaskSpec` and `AttemptPayload` optionally carry a versioned `FrozenBundle`:
+the source-bound frozen contract and every original resolution evidence. The
+absent field preserves legacy serialization and hashes. Exact typed source pins
+can be sealed offline. Ranges and aliases require a coherent trusted local
+inventory or one authenticated read-only worker proposal, tried by configured
+priority and worker ID. Versions from different workers are never combined.
+Unknown required baselines block capture. Project commands do not guess CI matrix
+or secret-derived values.
+
+`frozen_toolchains_v1` must be negotiated. Both durable database schema fences
+prevent older owners from silently dropping constraints. Parent proposal IO runs
+outside admission and database ownership with a source lifetime guard. It never
+uploads source or installs. Workers derive manager paths and environment locally
+and verify the captured source declarations before installation.
+
+The complete resolved set is rebuilt into trusted requests before polling the
+shared `Setups` lifecycle. Project setup builders and consumers receive the same
+activation environment, shell and execution fingerprint. The accepted base
+profile stays separate; effective fingerprints feed template, history and
+artifact identity. Submitted environments cannot change protected activation
+variables, including `GOTOOLCHAIN`. Private durable bindings are checked before
+new launches; recovery inspects identities without repairing drift. Running
+supervisors retain their existing adoption path. Forecast and inspection never
+install.
+
+Actual manager/Docker acceptance remains outside private fake-manager tests.
+Bundled Dart matching, installed-version enumeration, reusable installation timing
+telemetry and `workers diff`/`sync` remain separate work.
 
 Primary recipe references: [node-build usage](https://github.com/nodenv/node-build#usage),
 [rustup environment](https://rust-lang.github.io/rustup/environment-variables.html),
@@ -155,14 +173,13 @@ artifact reuse retains separate source-bound request evidence.
 adapter receipt/tree. It does not recursively discover manager catalogs. Unconfigured,
 unsupported, resolution-required, unauthorized versions, manual requirements, missing
 receipts and unknown/drift states remain distinct; the registry never advertises
-`auto_installable` capabilities. TaskSpec/submit/resident routing, consumer activation,
-baseline checking in worker routing, installed-version index enumeration,
-`workers diff`/`sync`, and admission forecasting remain
-unconnected. Private fake-manager setup integration exercises this bridge; host installers
-and network access are outside this slice.
+`auto_installable` native observations. Public routing uses explicit preparation
+eligibility and baseline checks. Installed-version enumeration, `workers diff`/`sync`
+and installation timing telemetry remain separate. Host installation and network
+acceptance are outside this slice.
 
 A valid baseline-only tool returns `BaselineCheckRequired`, not an invalid-capture
-error or an install request. Future worker routing must first compare frozen baselines
+error or an install request. Worker routing first compares frozen baselines
 with actual base observations under the frozen match policy. A match needs no installer;
 mismatch or unknown can exclude the candidate or block with `environment_mismatch`.
 The registry does not synthesize explicit requirements from baselines.

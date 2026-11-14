@@ -1671,7 +1671,7 @@ fn many_connections_opening_a_fresh_worker_database_at_once_all_succeed() {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, "2");
+        assert_eq!(version, "3");
     }
 }
 
@@ -2985,7 +2985,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     let all = schema::steps(DbKind::Coordinator);
     assert_eq!(
         all.len(),
-        9,
+        10,
         "this test is about step 1 and the steps after it"
     );
     let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
@@ -3098,7 +3098,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opened for writing, it is migrated, and every row is still there.
     let store = CoordinatorStore::open(dir.path(), 10).unwrap();
-    assert_eq!(schema_of(&store), ("9".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("10".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(4));
     assert_eq!(store.cluster_id(), &cluster);
     check_rows(&store);
@@ -3116,7 +3116,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opening again migrates nothing and loses nothing.
     let store = CoordinatorStore::open(dir.path(), 20).unwrap();
-    assert_eq!(schema_of(&store), ("9".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("10".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(5));
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);
@@ -3307,7 +3307,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(all.len(), 9);
+    assert_eq!(all.len(), 10);
     let cluster = ClusterId::generate();
     let co = CoordinatorId::generate();
     let run = RunId::generate();
@@ -3362,7 +3362,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     }
     let owner = CoordinatorStore::open(dir.path(), 2).unwrap();
     let migrated = schema_info(&owner);
-    assert_eq!(migrated.0, "9");
+    assert_eq!(migrated.0, "10");
     assert_eq!(migrated.2, 3);
     assert!(migrated.1.is_some());
     let target_run = run.to_string();
@@ -4893,7 +4893,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DELETE FROM schema_meta WHERE key='execution_requirements_v1'; UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
@@ -5337,6 +5337,16 @@ fn capability_durable_schema_fence_rejects_old_binaries_and_indexes_placement() 
             current
                 .call(|c| Ok(c.query_row(
                     "SELECT value FROM schema_meta WHERE key='execution_requirements_v1'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )?))
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            current
+                .call(|c| Ok(c.query_row(
+                    "SELECT value FROM schema_meta WHERE key='frozen_toolchains_v1'",
                     [],
                     |r| r.get::<_, String>(0)
                 )?))

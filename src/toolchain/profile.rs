@@ -237,6 +237,9 @@ impl Profile {
         }
         Ok(profile)
     }
+    pub fn required_tools(&self) -> &BTreeSet<String> {
+        &self.definition.required_tools
+    }
     pub fn name(&self) -> &str {
         &self.name
     }

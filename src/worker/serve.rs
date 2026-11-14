@@ -99,6 +99,23 @@ pub async fn serve_connection(
                     .await;
                 return;
             }
+            let requires_toolchains = matches!(
+                &request,
+                crate::wire::Request::ResolveToolchains(_)
+            ) || matches!(&request, crate::wire::Request::SubmitAttempt(r) if r.payload.toolchains.is_some());
+            if requires_toolchains
+                && !negotiated_features
+                    .iter()
+                    .any(|v| v == crate::toolchain::contract::FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "frozen toolchains were not negotiated",
+                    ))
+                    .await;
+                return;
+            }
             if !capabilities_negotiated
                 && matches!(&request, crate::wire::Request::SubmitAttempt(r) if !r.payload.requirements.is_empty())
             {

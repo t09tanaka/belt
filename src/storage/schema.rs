@@ -335,10 +335,11 @@ CREATE TABLE result_gc_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1), s
 CREATE INDEX attempt_task_key ON attempt(task_id,attempt_id);"#.to_string(),
             r#"CREATE INDEX event_task_waiting ON event(json_extract(payload_json,'$.task'),seq DESC) WHERE kind='task_waiting';
 INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');"#.to_string(),
+            "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.
-        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into()],
+        DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}"), "INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');".into(), "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into()],
     }
 }
 
