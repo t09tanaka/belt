@@ -65,18 +65,7 @@ impl Index {
             verifications: Default::default(),
         };
         let _guard = this.guard(false).context("initial source guard")?;
-        let file =
-            open_permanent_file(&this.root, "retention.db").context("open source index file")?;
-        let m = file.metadata()?;
-        ensure!(
-            m.is_file()
-                && m.nlink() == 1
-                && m.uid() == rustix::process::geteuid().as_raw()
-                && m.mode() & 0o077 == 0,
-            "unsafe source index"
-        );
-        file.sync_all().context("sync source index file")?;
-        this.root.sync_all().context("sync source index parent")?;
+        this.prepare_index_file()?;
         this.connect().context("connect source index")?.execute_batch("PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS root(id TEXT PRIMARY KEY,kind TEXT NOT NULL,source TEXT);
           CREATE INDEX IF NOT EXISTS root_kind ON root(kind,id);
@@ -89,6 +78,64 @@ impl Index {
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');").context("initialize source index")?;
         Ok(this)
+    }
+    fn prepare_index_file(&self) -> Result<()> {
+        use rustix::fs::{statat, AtFlags, FileType, Mode, OFlags, RenameFlags};
+        // Closing any independently opened descriptor for a live SQLite inode
+        // drops this process's POSIX locks. Existing databases are inspected
+        // only with stat; SQLite alone owns their descriptors.
+        match statat(&*self.root, "retention.db", AtFlags::SYMLINK_NOFOLLOW) {
+            Ok(_) => {}
+            Err(rustix::io::Errno::NOENT) => {
+                // Close our preparation descriptor BEFORE the inode becomes
+                // the database name another connection can open.
+                let temporary = format!(".retention-init-{}.tmp", ulid::Ulid::new());
+                let file: File = rustix::fs::openat(
+                    &*self.root,
+                    &temporary,
+                    OFlags::RDWR
+                        | OFlags::CREATE
+                        | OFlags::EXCL
+                        | OFlags::NOFOLLOW
+                        | OFlags::CLOEXEC,
+                    Mode::RUSR | Mode::WUSR,
+                )?
+                .into();
+                let synced = file.sync_all();
+                drop(file);
+                let published = synced.and_then(|()| {
+                    rustix::fs::renameat_with(
+                        &*self.root,
+                        &temporary,
+                        &*self.root,
+                        "retention.db",
+                        RenameFlags::NOREPLACE,
+                    )
+                    .map_err(io::Error::from)
+                });
+                if published.is_err() {
+                    rustix::fs::unlinkat(&*self.root, &temporary, AtFlags::empty())
+                        .context("remove unpublished source index temporary")?;
+                }
+                match published {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                    Err(error) => return Err(error.into()),
+                }
+                self.root.sync_all().context("sync source index parent")?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let metadata = statat(&*self.root, "retention.db", AtFlags::SYMLINK_NOFOLLOW)?;
+        ensure!(
+            FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile
+                && metadata.st_nlink == 1
+                && metadata.st_uid == rustix::process::geteuid().as_raw()
+                && metadata.st_mode & 0o077 == 0,
+            "unsafe source index"
+        );
+        self.current()?;
+        Ok(())
     }
     fn current(&self) -> Result<()> {
         let a = self.root.metadata()?;
@@ -1138,18 +1185,34 @@ mod tests {
     fn concurrent_first_index_file_open_keeps_one_private_inode() {
         for _ in 0..32 {
             let dir = tempfile::tempdir().unwrap();
-            let root: File = rustix::fs::open(dir.path(), DIR, rustix::fs::Mode::empty())
-                .unwrap()
-                .into();
+            let path = std::fs::canonicalize(dir.path()).unwrap();
+            let index = Index {
+                database: path.join("retention.db"),
+                root: Arc::new(
+                    rustix::fs::open(&path, DIR, rustix::fs::Mode::empty())
+                        .unwrap()
+                        .into(),
+                ),
+                path,
+                reads: Default::default(),
+                verifications: Default::default(),
+            };
             let gate = std::sync::Barrier::new(8);
-            let files = std::thread::scope(|scope| {
+            let identities = std::thread::scope(|scope| {
                 let handles: Vec<_> = (0..8)
                     .map(|_| {
-                        let root = &root;
+                        let index = &index;
                         let gate = &gate;
                         scope.spawn(move || {
                             gate.wait();
-                            open_permanent_file(root, "retention.db").unwrap()
+                            index.prepare_index_file().unwrap();
+                            let metadata = rustix::fs::statat(
+                                &*index.root,
+                                "retention.db",
+                                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+                            )
+                            .unwrap();
+                            (metadata.st_dev, metadata.st_ino)
                         })
                     })
                     .collect();
@@ -1158,13 +1221,46 @@ mod tests {
                     .map(|h| h.join().unwrap())
                     .collect::<Vec<_>>()
             });
-            let named = std::fs::symlink_metadata(dir.path().join("retention.db")).unwrap();
-            assert_eq!(named.mode() & 0o777, 0o600);
-            assert_eq!(named.nlink(), 1);
-            for file in files {
-                let opened = file.metadata().unwrap();
-                assert_eq!((opened.dev(), opened.ino()), (named.dev(), named.ino()));
+            let named = rustix::fs::statat(
+                &*index.root,
+                "retention.db",
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .unwrap();
+            assert_eq!(named.st_mode & 0o777, 0o600);
+            assert_eq!(named.st_nlink, 1);
+            for (device, inode) in identities {
+                assert_eq!((device, inode), (named.st_dev, named.st_ino));
             }
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+    #[test]
+    fn source_index_aliases_and_public_file_fail_before_sqlite_open() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for kind in ["symlink", "hardlink", "public"] {
+            let f = Fixture::new();
+            let sentinel = f.input.join("sentinel");
+            std::fs::write(&sentinel, b"untouched non-database").unwrap();
+            std::fs::set_permissions(&sentinel, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let path = f.store.root().join("retention.db");
+            std::fs::rename(&path, f.store.root().join("saved.db")).unwrap();
+            match kind {
+                "symlink" => symlink(&sentinel, &path).unwrap(),
+                "hardlink" => std::fs::hard_link(&sentinel, &path).unwrap(),
+                "public" => {
+                    std::fs::write(&path, b"public non-database").unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+            let error = Index::open(f.store.root()).unwrap_err();
+            assert!(
+                error.to_string().contains("unsafe source index"),
+                "{error:#}"
+            );
+            assert_eq!(std::fs::read(&sentinel).unwrap(), b"untouched non-database");
         }
     }
     #[test]
@@ -1193,6 +1289,66 @@ mod tests {
         assert!(f.store.mutation_guard().is_err());
         assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
         assert_eq!(retained._file.metadata().unwrap().nlink(), 1);
+    }
+    #[test]
+    #[ignore = "owned SQLite lock probe subprocess"]
+    fn source_index_writer_probe_child() {
+        let path = std::env::var_os("RTR_SOURCE_INDEX_PROBE").expect("private probe database");
+        let db = Connection::open_with_flags(
+            Path::new(&path),
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+        )
+        .unwrap();
+        db.busy_timeout(std::time::Duration::ZERO).unwrap();
+        match db.execute_batch("BEGIN IMMEDIATE") {
+            Ok(()) => {
+                db.execute_batch("ROLLBACK").unwrap();
+                println!("RTR_INDEX_PROBE=ACQUIRED");
+            }
+            Err(rusqlite::Error::SqliteFailure(error, _))
+                if error.code == rusqlite::ErrorCode::DatabaseBusy =>
+            {
+                println!("RTR_INDEX_PROBE=BUSY");
+            }
+            other => panic!("unexpected SQLite lock probe: {other:?}"),
+        }
+    }
+    #[test]
+    fn opening_another_index_preserves_live_sqlite_writer_exclusion() {
+        fn probe(path: &Path) -> String {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "source::retention::tests::source_index_writer_probe_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("RTR_SOURCE_INDEX_PROBE", path)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            String::from_utf8(output.stdout).unwrap()
+        }
+        let f = Fixture::new();
+        let first = f.store.retention.connect().unwrap();
+        first.execute_batch("BEGIN IMMEDIATE").unwrap();
+        assert!(probe(&f.store.retention.database).contains("RTR_INDEX_PROBE=BUSY"));
+        // Initializing another connection needs a write too. It may report
+        // BUSY, but its cleanup must not release this process's existing lock.
+        let reopened = Index::open(f.store.root()).unwrap_err();
+        assert!(
+            matches!(
+                reopened.downcast_ref::<rusqlite::Error>(),
+                Some(rusqlite::Error::SqliteFailure(error, _))
+                    if error.code == rusqlite::ErrorCode::DatabaseBusy
+            ),
+            "{reopened:#}"
+        );
+        assert!(!first.is_autocommit());
+        let after = probe(&f.store.retention.database);
+        assert!(after.contains("RTR_INDEX_PROBE=BUSY"), "{after}");
+        first.execute_batch("ROLLBACK").unwrap();
+        assert!(probe(&f.store.retention.database).contains("RTR_INDEX_PROBE=ACQUIRED"));
     }
     #[test]
     #[ignore = "owned helper subprocess"]
