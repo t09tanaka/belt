@@ -3378,16 +3378,17 @@ impl<'a> Runner<'a> {
         self.stop_services(&names);
         let cleanup = crate::cleanup::compose_down(self.ctx, &projects);
         for diagnostic in cleanup {
-            let reason = diagnostic.to_string();
-            steps.push(StepResult {
-                label: "Docker Compose cleanup".into(),
-                outcome: Outcome::Error(reason.clone()),
-                exit: None,
-                secs: 0.0,
-                log: None,
-                note: Some("test step results are preserved".into()),
-            });
-            errored.get_or_insert(reason);
+            let warning = format!("warning: {diagnostic}");
+            // Cleanup is reported separately from test/check outcomes. A
+            // default Compose project is tracked even by Docker-free jobs;
+            // probing it must not introduce a Docker dependency for them.
+            eprintln!("local-ci: {warning}");
+            if let Some(last) = steps.last_mut() {
+                last.note = Some(match last.note.take() {
+                    Some(note) => format!("{note}; {warning}"),
+                    None => warning,
+                });
+            }
         }
         self.ctx.cancel.untrack_compose(&projects);
 

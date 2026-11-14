@@ -768,34 +768,61 @@ fn the_legs_of_a_matrix_call_the_executor_at_once() {
 }
 
 #[test]
-fn compose_cleanup_errors_are_reported_separately_from_test_steps() {
+fn compose_cleanup_warnings_preserve_test_outcomes_and_step_count() {
     for exit in [0, 1] {
         let l = lab_for(TWO_STEPS);
         let docker = l.tmp.path().join("fakebin/docker");
         std::fs::write(&docker, "#!/bin/sh\nprintf '012345abcdef\\n'\nexit 1\n").unwrap();
         let result = l.run(Some(Recorder::new(Exit::Code(exit), None)));
         let job = job(&result);
-        assert_eq!(
-            job.steps[0].outcome,
-            if exit == 0 {
-                Outcome::Pass
-            } else {
-                Outcome::Fail
-            }
-        );
-        let diagnostic = job.steps.last().unwrap();
-        assert_eq!(diagnostic.label, "Docker Compose cleanup");
-        assert!(
-            matches!(&diagnostic.outcome, Outcome::Error(why) if why.contains("cleanup incomplete") && why.contains("query owned"))
-        );
-        if exit == 0 {
-            assert!(
-                matches!(&job.outcome, Outcome::Error(why) if why.contains("cleanup incomplete"))
-            );
+        let expected = if exit == 0 {
+            Outcome::Pass
         } else {
-            assert_eq!(job.outcome, Outcome::Fail);
-        }
+            Outcome::Fail
+        };
+        assert_eq!(job.steps[0].outcome, expected);
+        assert_eq!(job.outcome, expected);
+        assert_eq!(job.steps.len(), 2);
+        assert_eq!(job.steps.last().unwrap().label, "echo second");
+        assert!(job
+            .steps
+            .last()
+            .unwrap()
+            .note
+            .as_ref()
+            .unwrap()
+            .starts_with("warning: cleanup incomplete:"));
         let json = serde_json::to_value(&result).unwrap();
         assert!(json.to_string().contains("cleanup incomplete"));
+
+        let run = l.run_plan(Recorder::new(Exit::Code(exit), None), 1);
+        assert_eq!(run.state, if exit == 0 { "success" } else { "failure" });
+        assert!(run
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("warning: cleanup incomplete:")
+                && warning.contains("query owned")));
+        let json = serde_json::to_value(&run).unwrap();
+        assert!(json["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.as_str().unwrap().contains("cleanup incomplete")));
     }
+}
+
+#[test]
+fn compose_cleanup_warning_preserves_existing_step_note() {
+    let l = lab_for("name: w\non:\n  pull_request:\n    paths: ['x/**']\njobs:\n  a:\n    runs-on: x\n    steps:\n      - run: echo one\n        continue-on-error: true\n");
+    std::fs::write(l.tmp.path().join("fakebin/docker"), "#!/bin/sh\nexit 1\n").unwrap();
+    let result = l.run(Some(Recorder::new(Exit::Code(1), None)));
+    let job = job(&result);
+    assert_eq!(job.outcome, Outcome::Pass);
+    assert_eq!(job.steps.len(), 1);
+    assert_eq!(job.steps[0].outcome, Outcome::Fail);
+    assert!(job.steps[0]
+        .note
+        .as_ref()
+        .unwrap()
+        .starts_with("continue-on-error; warning: cleanup incomplete:"));
 }
