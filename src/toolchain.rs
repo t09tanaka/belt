@@ -1,5 +1,6 @@
 //! Toolchain declaration and installation.
 
+pub mod adapters;
 pub mod capability;
 pub mod profile;
 
