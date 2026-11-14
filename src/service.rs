@@ -6,6 +6,6 @@ pub mod input;
 pub mod query;
 pub mod resident;
 pub mod submit;
-
 pub mod completion;
 pub mod control;
+pub mod macos;
