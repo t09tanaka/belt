@@ -578,7 +578,7 @@ impl FrozenToolchains {
             };
             let selected = selection
                 .map(|s| {
-                    self.policy.compare(
+                    MatchPolicy::Exact.compare(
                         &VersionObservation::Known(s.concrete.clone()),
                         observed.get(&r.tool).unwrap_or(&missing),
                     )

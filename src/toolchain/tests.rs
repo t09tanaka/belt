@@ -1113,3 +1113,69 @@ fn version_file_expressions_wait_for_resolution_and_errors_keep_locations() {
     let invalid = docs(&[("ci.yml", &workflow), ("custom.txt", "bad")]);
     assert!(read_project("", &invalid, &["ci.yml".into()]).is_err());
 }
+
+#[test]
+fn declared_selections_stay_exact_while_undeclared_baselines_use_policy() {
+    let tool = ToolId::parse("node").unwrap();
+    let digest = crate::ids::Digest::of_bytes(b"exact-selection");
+    let captured = [(tool.clone(), VersionObservation::parse("20.1.0"))].into();
+    for policy in [
+        MatchPolicy::Exact,
+        MatchPolicy::Minor,
+        MatchPolicy::Major,
+        MatchPolicy::Any,
+    ] {
+        let selected = FrozenToolchains::freeze(
+            digest.clone(),
+            digest.clone(),
+            Scope::project(""),
+            &[decl(">=20 <23")],
+            &[],
+            &captured,
+            policy,
+        )
+        .unwrap()
+        .with_selection(&tool, "20.1.0".parse().unwrap(), digest.clone())
+        .unwrap();
+        assert_eq!(selected.check(&captured)[&tool], Match::Match);
+        for observed in ["20.1.1", "20.5.0", "22.0.0"] {
+            assert_eq!(
+                selected.check(&[(tool.clone(), VersionObservation::parse(observed))].into())
+                    [&tool],
+                Match::Mismatch,
+                "{policy:?}: {observed}"
+            );
+        }
+        assert_eq!(selected.check(&BTreeMap::new())[&tool], Match::Unknown);
+        let baseline = FrozenToolchains::freeze(
+            digest.clone(),
+            digest.clone(),
+            Scope::project(""),
+            &[],
+            &[(tool.clone(), loc())],
+            &captured,
+            policy,
+        )
+        .unwrap();
+        for (observed, allowed) in [
+            ("20.1.1", policy != MatchPolicy::Exact),
+            (
+                "20.5.0",
+                matches!(policy, MatchPolicy::Major | MatchPolicy::Any),
+            ),
+            ("22.0.0", policy == MatchPolicy::Any),
+        ] {
+            assert_eq!(
+                baseline.check(&[(tool.clone(), VersionObservation::parse(observed))].into())
+                    [&tool],
+                if allowed {
+                    Match::Match
+                } else {
+                    Match::Mismatch
+                },
+                "baseline {policy:?}: {observed}"
+            );
+        }
+        assert_eq!(baseline.check(&BTreeMap::new())[&tool], Match::Unknown);
+    }
+}

@@ -1196,7 +1196,9 @@ manager channels require explicit resolution; missing observations remain unknow
 even with `match = "any"`. `FrozenToolchains` retains source/profile identity,
 requirements, baseline provenance and explicit concrete selections for reuse on
 retry. Every declared range/channel needs a concrete selection before the frozen
-contract becomes resolved; a matching range alone cannot float on retry. This API
+contract becomes resolved; a matching range alone cannot float on retry. Declared
+concrete selections always use exact version identity. The configurable match
+policy applies only to baselines for tools without a declaration. This API
 is not yet part of submit/admission payloads.
 
 Node-style ranges use the npm-compatible `node-semver` parser. Pub environment
