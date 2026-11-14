@@ -696,3 +696,40 @@ fn manager_recipes_are_exact_and_base_identity_policy_stays_separate() {
         Err("activation_baseline_mismatch")
     );
 }
+
+#[test]
+fn restored_invalid_integrity_never_reaches_installer() {
+    let f = fixture(AdapterKind::Corepack, "pnpm");
+    let mut frozen = f.plan.frozen.clone();
+    frozen.selections.clear();
+    frozen.requirements[0].constraints = vec![Constraint::Distribution {
+        version: f.plan.version.clone(),
+        integrity: "sha512.invalid".into(),
+    }];
+    let evidence = ResolutionEvidence {
+        contract: frozen.digest(),
+        tool: f.plan.tool.clone(),
+        concrete: f.plan.version.clone(),
+        catalog: Digest::of_bytes(b"catalog"),
+        resolved_inputs: BTreeMap::new(),
+    };
+    let frozen = resolve(&frozen, &evidence).unwrap();
+    let host = HostTools {
+        manager: f.plan.external[0].clone(),
+        dependencies: f.plan.external[1..].to_vec(),
+        search_path: vec![],
+        rust_host: String::new(),
+    };
+    assert_eq!(
+        plan(
+            AdapterKind::Corepack,
+            &frozen,
+            &evidence.tool,
+            &evidence,
+            f.plan.root.parent().unwrap(),
+            &host
+        )
+        .unwrap_err(),
+        "invalid_distribution_integrity"
+    );
+}

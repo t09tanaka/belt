@@ -332,6 +332,16 @@ pub fn plan(
             }
         })
         .collect();
+    // Restored typed contracts can have been constructed without the parser.
+    // Reuse its integrity validator before any descriptor reaches a manager.
+    for value in &integrity {
+        let parsed = Constraint::parse(&format!("{}+{}", selected.concrete, value))
+            .map_err(|_| "invalid_distribution_integrity")?;
+        if !matches!(parsed,Constraint::Distribution{ref version,ref integrity} if version==&selected.concrete && integrity==*value)
+        {
+            return Err("invalid_distribution_integrity");
+        }
+    }
     let identity = hash(&(
         kind,
         &selected.concrete,
