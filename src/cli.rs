@@ -120,7 +120,7 @@ pub struct ExecutionArgs {
     pub requires: Vec<String>,
 }
 impl ExecutionArgs {
-    fn apply(
+    pub(crate) fn apply(
         &self,
         mut context: crate::service::context::Context,
     ) -> crate::service::context::Context {
@@ -309,6 +309,9 @@ pub fn run(cli: Cli) -> i32 {
         return run_control(&cli);
     }
 
+    if let Command::Estimate(args) = &cli.command {
+        return crate::service::estimate::cli(args, cli.json);
+    }
     if let Command::Outputs(args) = &cli.command {
         return crate::service::outputs::command(args, cli.json);
     }

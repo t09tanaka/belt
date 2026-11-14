@@ -3,7 +3,12 @@ use crate::ids::Digest;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub const FEATURE: &str = "worker_capabilities_v1";
-pub const FEATURES: &[&str] = &[FEATURE, "blob_resume", "log_resume"];
+pub const FEATURES: &[&str] = &[
+    FEATURE,
+    "blob_resume",
+    "log_resume",
+    crate::forecast::COMMAND_FEATURE,
+];
 pub const TOOLS: &[&str] = &[
     "node",
     "npm",

@@ -1422,3 +1422,96 @@ async fn capability_private_ipc_prevents_old_owner_from_discarding_requirements(
     }
     .requires_capabilities());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
+    let root = tempfile::Builder::new()
+        .prefix("rtr-estimate-")
+        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
+        .unwrap();
+    let resident = delivery_resident(root.path()).await;
+    let coordinator = resident.coordinator.clone();
+    let gate = resident.input_gate.clone();
+    let client = resident.client();
+    gate.observe(
+        resident.agent.config().boot_id.clone(),
+        resident.agent.agent_epoch(),
+    )
+    .await;
+    let before_generation = gate.generation();
+    let before_readiness = gate.snapshot();
+    fn rows(coordinator: &Coordinator) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        coordinator
+            .store()
+            .db
+            .call(|db| {
+                let tables = db
+                    .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut all = vec![];
+                for table in tables {
+                    let mut statement = db.prepare(&format!(
+                        "SELECT * FROM \"{}\" ORDER BY rowid",
+                        table.replace('"', "\"\"")
+                    ))?;
+                    let columns = statement.column_count();
+                    let rows = statement
+                        .query_map([], |r| {
+                            (0..columns)
+                                .map(|i| r.get(i))
+                                .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    all.push((table, rows));
+                }
+                Ok(all)
+            })
+            .unwrap()
+    }
+    fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        let mut out = BTreeMap::new();
+        if root.exists() {
+            for e in std::fs::read_dir(root).unwrap() {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_dir() {
+                    out.extend(files(&e.path()));
+                } else {
+                    out.insert(e.path(), std::fs::read(e.path()).unwrap());
+                }
+            }
+        }
+        out
+    }
+    let before_rows = rows(&coordinator);
+    let before_sources = files(&root.path().join("parent/sources"));
+    let before_traffic = files(&root.path().join("worker/traffic"));
+    let before_epoch = coordinator.epoch();
+    let runner = tokio::spawn(resident.run());
+    for _ in 0..100 {
+        let query = crate::service::estimate::Query {
+            version: 1,
+            argv: vec!["echo".into()],
+            repository_id: None,
+            cwd_relative: String::new(),
+            requirements: Default::default(),
+        };
+        match client.request(Operation::Estimate { query }).await.unwrap() {
+            Reply::Estimate { estimate } => assert!(estimate.online && estimate.conditional),
+            other => panic!("unexpected estimate reply: {other:?}"),
+        }
+    }
+    assert_eq!(before_rows, rows(&coordinator));
+    assert_eq!(before_epoch, coordinator.epoch());
+    assert_eq!(before_generation, gate.generation());
+    assert_eq!(before_readiness, gate.snapshot());
+    assert_eq!(before_sources, files(&root.path().join("parent/sources")));
+    assert_eq!(before_traffic, files(&root.path().join("worker/traffic")));
+    assert!(!root.path().join("worker/clones").exists());
+    client.request(Operation::Shutdown).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

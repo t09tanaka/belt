@@ -83,6 +83,14 @@ F2 は登録と hook を分離する案も調査したが、`core.hooksPath` の
 | S15e | `logs --follow`・再接続・`outputs`・retention の常駐 loop への接続 | 非 UTF-8・offset・切断再開、出力 path 衝突と部分失敗、回収失敗、実行中・回収中・保持対象を消さない GC を検証。自動削除に件数上限と時計跳躍の保護を付ける | S15d・S14 |
 | S15f | 読み取り専用 `estimate`、配置理由、転送・setup・回収の実測値の接続 | estimate が queue・attempt・ledger 需要を増やさない。measured/fallback/unknown・TTL・priority の説明を保つ。S15 の受入条件を利用者経路で閉じる | S15b〜S15e、S11・S13 |
 
+S15f の最初の slice は読み取り専用 `estimate` とする。既に起動している認証済み owner にだけ照会し、停止時は unknown を返す。command forecast は `forecast_command_v1` の交渉が必要で、既存 canonical clone と実際の profile fingerprint から TTC の正規化 command history を参照する。clone・workspace・source・attempt は作成せず、履歴がない場合の fallback は順位付け専用で ETA として表示しない。source の repository identity が判明しない場合や clone が存在しない場合は、別の cwd の履歴で代用しない。
+
+nested cwd は標準実行の cwd 合成との一致を別途修正・検証するまで履歴を unknown とする。既存 clone でも TTC の main-worktree identity を検証できない場合は履歴を流用しない。
+
+標準 supervisor が TTC の verified execution outcome を履歴へ記録していなかった欠落も接続する。実登録 ledger の key・weight と実測 wall/CPU/RSS を、停止・finish が確認された自然終了（不成功 exit code も保持）だけで idempotent に記録し、取消・timeout・追跡不能・停止未確認は学習しない。履歴書込失敗は計算結果を失敗へ変えず、finish 後の crash は一標本を失うことを許容する。
+
+この slice で S15f は完了しない。転送・setup・成果物回収は実測モデル未接続のため unknown と明示する。source-ready・setup receipt・collection-complete の検証済み境界で、identity・TTL・sample count・provenance を保つ bounded な観測を記録し、実配置と estimate が同じ CostModel を使う接続を必須残件として維持する。queue wait を転送時間へ混ぜず、結果の総 byte 数が不明なら回収コストも unknown のままにする。
+
 S15c の常駐入力は既存 user config の隣にある private `coordinator.json` に保存し、既存 bootstrap input を再利用する。`config.toml` の文法や暗黙の環境変数は追加しない。未初期化は明示エラーとし、`ls` / `show` は停止中でも読み取り専用 DB を使い、起動・epoch 更新・migration を行わない。`submit` だけが必要な owner 起動を要求する。
 
 S15c の残件には、file/reader ベースのメモリ上限付き source 転送、active attempt のページ走査、requires/profile の配置条件、success/failure/always と glob・複数 path の出力計画を含める。現在の限定的な submit 経路でこれらを明示拒否していても、完成条件からは外さない。終了済み worker の spec・workspace は回収 ACK 前にも削除し、保持対象の結果・ログは残す。親側 source/Vault の retention は S15e で retry と回収条件を保護して接続する。

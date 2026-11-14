@@ -243,10 +243,11 @@ pub enum Operation {
     SecretBundlePut,
     EnvReport,
     EnvSync,
+    ForecastCommand,
 }
 
 impl Operation {
-    pub const ALL: [Operation; 19] = [
+    pub const ALL: [Operation; 20] = [
         Operation::Hello,
         Operation::Inspect,
         Operation::Forecast,
@@ -266,6 +267,7 @@ impl Operation {
         Operation::SecretBundlePut,
         Operation::EnvReport,
         Operation::EnvSync,
+        Operation::ForecastCommand,
     ];
 
     pub fn idempotency(self) -> Idempotency {
@@ -281,6 +283,7 @@ impl Operation {
             Operation::Hello
             | Operation::Inspect
             | Operation::Forecast
+            | Operation::ForecastCommand
             | Operation::GetAttempt
             | Operation::ListAttempts
             | Operation::WatchEvents
@@ -490,6 +493,21 @@ pub struct ForecastRequest {
     /// to this worker (the overlay); counted once.
     #[serde(default)]
     pub pending: Vec<WorkloadPlan>,
+}
+
+/// Read-only command forecast, negotiated as `forecast_command_v1`.
+/// A repository identity names an existing canonical clone, never a path to create.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForecastCommandRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub coordinator_epoch: CoordinatorEpoch,
+    pub version: u32,
+    pub repository_id: Option<String>,
+    pub cwd_relative: String,
+    pub argv: Vec<String>,
+    pub forecast: ForecastRequest,
 }
 
 /// Which nodes of which plan the worker already accounts for.
@@ -1657,6 +1675,7 @@ operations! {
     Hello(HelloRequest, HelloResponse),
     Inspect(InspectRequest, InspectResponse),
     Forecast(ForecastRequest, ForecastResponse),
+    ForecastCommand(ForecastCommandRequest, ForecastResponse),
     SubmitAttempt(SubmitAttemptRequest, SubmitAttemptResponse),
     GetAttempt(GetAttemptRequest, GetAttemptResponse),
     ListAttempts(ListAttemptsRequest, ListAttemptsResponse),
@@ -1923,7 +1942,7 @@ mod tests {
 
     fn requests() -> Vec<Request> {
         let aid = aid();
-        vec![
+        let mut out = vec![
             Request::Hello(HelloRequest {
                 schema_version: SV,
                 request_id: rid(),
@@ -2071,11 +2090,28 @@ mod tests {
                 }],
                 dry_run: true,
             }),
-        ]
+        ];
+        out.push(Request::ForecastCommand(ForecastCommandRequest {
+            schema_version: SV,
+            request_id: rid(),
+            coordinator_epoch: CoordinatorEpoch(3),
+            version: 1,
+            repository_id: None,
+            cwd_relative: String::new(),
+            argv: vec!["echo".into()],
+            forecast: ForecastRequest {
+                schema_version: SV,
+                request_id: rid(),
+                coordinator_epoch: CoordinatorEpoch(3),
+                workload: plan(),
+                pending: vec![],
+            },
+        }));
+        out
     }
 
     fn responses() -> Vec<Response> {
-        vec![
+        let mut out = vec![
             Response::Hello(HelloResponse {
                 capabilities: None,
                 schema_version: SV,
@@ -2253,7 +2289,11 @@ mod tests {
                     message: None,
                 }],
             }),
-        ]
+        ];
+        if let Response::Forecast(answer) = out[2].clone() {
+            out.push(Response::ForecastCommand(answer));
+        }
+        out
     }
 
     #[test]
@@ -2408,6 +2448,7 @@ mod tests {
             (Hello, ReadOnly),
             (Inspect, ReadOnly),
             (Forecast, ReadOnly),
+            (ForecastCommand, ReadOnly),
             (SubmitAttempt, AttemptAndPayload),
             (GetAttempt, ReadOnly),
             (ListAttempts, ReadOnly),

@@ -23,6 +23,7 @@
 //! completion belongs to the scheduler.
 
 mod collect;
+mod estimate;
 mod input_gate;
 mod link;
 pub mod policy;
