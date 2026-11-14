@@ -587,9 +587,14 @@ S15統合 `f94d6f1` の全体ローカルCIは9ジョブ中1成功・7失敗・1
 
 関連SDK local-ci 0.13.0はPR46、ローカル10項目・リモート10項目を通過し、crate・tag・4対象8配布assetの公開と照合が完了した。0.14開発のDriverは動的展開・worker再検証まで実装し、評価サイズ上限と状態容量境界を修正中。元の独立レビュー担当でproducer確定・permit解放を失わないことを確認してから、既存RunnerのDriver接続、cancel/fence、shard retry、artifact backendへ進む。
 
-setup実測は成功した準備コマンドの観測生成までで、遠隔取得・親側取り込み・推定への接続は未完了。次はowner世代と挿入順で束縛した最大64件の観測page、boot/epochを照合したfollow専用取り込み、元のmonotonic時刻を延長しないTTLを接続する。読み取り専用estimateから履歴を書かない。準備CPU時間を単純なready delayへ足さず、既存TTCの依存nodeと実ledger entryの対応でモデル化する。warmの0は現在のartifact内容・receipt・profileが検証された場合だけに限定し、観測不足や検証budget超過はUnknownを維持する。新しいschedulerは作らない。この接続と資源モデルの検証が済むまでS15f完成とは扱わない。
+setup実測は、workerのowner世代・挿入順に束縛した最大64件pageの取得から、follow専用の親bounded committed historyまで接続した。実際のfeature交渉・worker/boot/epoch・attachment/InputGate世代を照合し、actor解放後に既存のqueue32/cache4096 writerへbest effortで渡す。親send時刻からremote ageを差し引き、TTL・native boot・clock逆行を検証する。同じreceipt・競合は初回stampを更新せず、eviction後もnamespace sequence watermarkで古い再送を拒否する。namespace台帳も4096件に制限し、同じ親native bootで満杯なら新namespaceの観測はUnknownとする。親native bootが変わった履歴はfreshnessに使わず、旧namespace slotを回収する。queue fullやwriter故障による欠落は許容し、通常placementへ失敗を伝播させない。読み取り専用estimateはpageを要求せず、cursorと履歴も更新しない。setup CostModelのscalar・forecast・warm readiness・resource/dependency展開は引き続きUnknownで、次の必須sliceに残す。準備CPU時間を単純なready delayへ足さず、既存TTCの依存nodeと実ledger entryの対応でモデル化する。warmの0は現在のartifact内容・receipt・profileが検証された場合だけに限定し、観測不足や検証budget超過はUnknownを維持する。新しいschedulerは作らない。この接続と資源モデルの検証が済むまでS15f完成とは扱わない。
 
 
 ### 新しい純粋ロジックの限定gate
 
 CI計画summaryをcoverage/mutation対象へ登録し、shard group数の4096/4097境界を追加した。限定3テストでcoverage364/364行、mutant40件はcaught39・survived0・timeout0・unviable1。観測page transportは別branchの`6b5a4c1`でcoverage341/341行、mutant34件はcaught32・survived0・timeout0・unviable2、baseline5件成功を独立担当で確認した。どちらも通常閾値を維持した限定結果で、統合全体CIの結果ではない。
+
+
+### 準備観測の親取り込み限定検証
+
+follow pagination（64/64/2件と次pass）、readonly estimate、actor解放、owner reset・同世代attachment置換・InputGate無効化、malformed page、remote age/TTL/clock逆行、永続初回stamp・競合・eviction watermark、namespace上限、queue full・writer故障を確認した。関連18テスト成功後、追加境界を含むfollowの4テストも成功（重複を除き19件）。all-target型検査・strict clippy・fmt/diff確認も成功。これは限定検証で、統合全体CI・新しいwarm/resourceモデルの検証ではない。

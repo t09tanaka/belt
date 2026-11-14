@@ -99,6 +99,7 @@ pub trait CostModel: Send + Sync {
         None
     }
     fn record(&self, _sample: measured::Sample) {}
+    fn record_preparation(&self, _sample: measured::PreparationSample) {}
     fn drain(&self) {}
     fn collection_policy(&self) -> Option<String> {
         None

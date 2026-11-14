@@ -28,6 +28,7 @@ mod input_gate;
 mod link;
 pub mod policy;
 mod prefetch;
+mod preparation;
 
 pub use input_gate::{PlacementInputs, ReadyInput};
 pub use link::{ClientLink, InputGate, LinkError, WorkerLink};
@@ -306,6 +307,7 @@ pub struct Coordinator {
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
     parent_local: Mutex<Option<WorkerId>>,
+    preparation_cursors: Mutex<BTreeMap<WorkerId, preparation::CursorState>>,
     actor: tokio::sync::Mutex<()>,
     /// One pass of result collection at a time.
     collecting: Arc<tokio::sync::Mutex<()>>,
@@ -357,6 +359,7 @@ impl Coordinator {
             cfg,
             workers: Mutex::default(),
             parent_local: Mutex::default(),
+            preparation_cursors: Mutex::default(),
             actor: tokio::sync::Mutex::new(()),
             collecting: Arc::new(tokio::sync::Mutex::new(())),
             collect_waits: Arc::default(),
@@ -649,8 +652,9 @@ impl Coordinator {
     /// then place queued tasks. Fails only for a storage fault or when this
     /// coordinator was fenced; a worker that does not answer is not an error.
     pub async fn tick(&self) -> Result<TickReport> {
-        let _actor = self.actor.lock().await;
+        let actor = self.actor.lock().await;
         self.check_fenced()?;
+        let telemetry = Mutex::new(Vec::new());
         let mut report = TickReport::default();
         let attached: Vec<(WorkerId, Arc<dyn WorkerLink>)> = {
             let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
@@ -664,7 +668,7 @@ impl Coordinator {
         let follows: Vec<Pin<Box<dyn Future<Output = Followed> + Send + '_>>> = attached
             .into_iter()
             .map(|(worker_id, link)| {
-                Box::pin(self.follow(worker_id, link, deadline))
+                Box::pin(self.follow(worker_id, link, deadline, &telemetry))
                     as Pin<Box<dyn Future<Output = Followed> + Send + '_>>
             })
             .collect();
@@ -683,7 +687,11 @@ impl Coordinator {
         if let Some(e) = failed {
             return Err(e);
         }
-        self.dispatch(known, reached, &mut report).await?;
+        let result = self.dispatch(known, reached, &mut report, &telemetry).await;
+        drop(actor);
+        // Conversion and the best-effort writer queue never run under the actor.
+        self.ingest_preparation(telemetry.into_inner().unwrap_or_else(|e| e.into_inner()));
+        result?;
         Ok(report)
     }
 
@@ -698,13 +706,50 @@ impl Coordinator {
         worker_id: WorkerId,
         link: Arc<dyn WorkerLink>,
         deadline: Instant,
+        telemetry: &Mutex<Vec<preparation::RawPage>>,
     ) -> Followed {
         let budgeted = Budgeted {
             inner: Arc::clone(&link),
             deadline,
         };
         let mut report = TickReport::default();
-        let inspected = self.inspect(&worker_id, &budgeted).await;
+        let inputs = link.placement_inputs();
+        let requested = self.preparation_request(&worker_id, &link, inputs.as_ref());
+        let sent_boot = crate::platform::boot_id();
+        let sent = crate::platform::monotonic_ms();
+        let mut inspected = self.inspect(&worker_id, &budgeted, requested.clone()).await;
+        let received = crate::platform::monotonic_ms();
+        let received_boot = crate::platform::boot_id();
+        if let (Some(response), Some(inputs), Some(requested), Some(transport), Some(sent_boot)) = (
+            inspected.as_mut(),
+            inputs,
+            requested,
+            link.cost_transport(),
+            sent_boot,
+        ) {
+            if received_boot.as_deref() == Some(sent_boot.as_str())
+                && response.schema_version == SchemaVersion::CURRENT
+            {
+                if let Some(page) = response.preparation_observations.take() {
+                    let mut pending = telemetry.lock().unwrap_or_else(|e| e.into_inner());
+                    if pending.len() < 32 {
+                        pending.push(preparation::RawPage {
+                            worker: worker_id.clone(),
+                            link: link.clone(),
+                            inputs,
+                            transport,
+                            request: requested,
+                            response_boot: response.worker_boot_id.clone(),
+                            response_epoch: response.agent_epoch,
+                            page,
+                            parent_boot: sent_boot,
+                            sent,
+                            received,
+                        });
+                    }
+                }
+            }
+        }
         let w = worker_id.clone();
         let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
         let Some(inspected) = inspected else {
@@ -742,9 +787,12 @@ impl Coordinator {
         &self,
         worker_id: &WorkerId,
         link: &dyn WorkerLink,
+        preparation_observations: Option<
+            crate::setup::observation_transport::ObservationPageRequest,
+        >,
     ) -> Option<InspectResponse> {
         let request = Request::Inspect(InspectRequest {
-            preparation_observations: None,
+            preparation_observations,
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
         });
@@ -1146,6 +1194,7 @@ impl Coordinator {
         known: BTreeSet<WorkerId>,
         reached: Vec<Reached>,
         report: &mut TickReport,
+        telemetry: &Mutex<Vec<preparation::RawPage>>,
     ) -> Result<()> {
         let mut round = Round {
             out: BTreeMap::new(),
@@ -1207,7 +1256,7 @@ impl Coordinator {
         let page_len = queued.len();
         let mut processed = 0;
         for task in queued {
-            self.join_newcomers(&mut round, report).await?;
+            self.join_newcomers(&mut round, report, telemetry).await?;
             let evaluated: Vec<_> = round
                 .open
                 .iter()
@@ -1249,7 +1298,12 @@ impl Coordinator {
     /// Workers that were attached since this tick began are looked at like
     /// the others (their attempts are followed first), so that the next
     /// decision counts them in.
-    async fn join_newcomers(&self, round: &mut Round, report: &mut TickReport) -> Result<()> {
+    async fn join_newcomers(
+        &self,
+        round: &mut Round,
+        report: &mut TickReport,
+        telemetry: &Mutex<Vec<preparation::RawPage>>,
+    ) -> Result<()> {
         let fresh: Vec<(WorkerId, Arc<dyn WorkerLink>)> = {
             let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
             workers
@@ -1260,7 +1314,9 @@ impl Coordinator {
         };
         for (worker_id, link) in fresh {
             round.known.insert(worker_id.clone());
-            let (reached, part) = self.follow(worker_id.clone(), link, round.deadline).await?;
+            let (reached, part) = self
+                .follow(worker_id.clone(), link, round.deadline, telemetry)
+                .await?;
             report.absorb(part);
             match reached {
                 Some(worker) => round.admit(worker),
