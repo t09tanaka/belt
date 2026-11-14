@@ -377,12 +377,17 @@ pub struct HelloResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_observations:
+        Option<crate::setup::observation_transport::ObservationPageRequest>,
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_observations: Option<crate::setup::observation_transport::ObservationPage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     pub schema_version: SchemaVersion,
@@ -1992,6 +1997,7 @@ mod tests {
                 features: vec!["secret_bundle".into()],
             }),
             Request::Inspect(InspectRequest {
+                preparation_observations: None,
                 schema_version: SV,
                 request_id: rid(),
             }),
@@ -2171,6 +2177,7 @@ mod tests {
                 coordinator_epoch: CoordinatorEpoch(3),
             }),
             Response::Inspect(InspectResponse {
+                preparation_observations: None,
                 capabilities: None,
                 schema_version: SV,
                 worker_id: worker(),
@@ -2368,6 +2375,17 @@ mod tests {
             let back: Request = serde_json::from_value(v).unwrap();
             assert_eq!(back, req);
         }
+    }
+
+    #[test]
+    fn legacy_inspect_omits_observation_fields_and_decodes_them_as_unknown() {
+        let response = responses().remove(1);
+        let legacy = serde_json::to_value(&response).unwrap();
+        assert!(legacy.get("preparation_observations").is_none());
+        let Response::Inspect(decoded) = serde_json::from_value::<Response>(legacy).unwrap() else {
+            panic!()
+        };
+        assert!(decoded.preparation_observations.is_none());
     }
 
     #[test]
@@ -2590,10 +2608,12 @@ mod tests {
     #[test]
     fn content_hash_ignores_request_id_only() {
         let a = Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SV,
             request_id: rid(),
         });
         let b = Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SV,
             request_id: rid(),
         });

@@ -110,6 +110,7 @@ impl Coordinator {
                     let response = tokio::time::timeout(
                         Duration::from_millis(self.sched.cfg.forecast_wait_ms),
                         link.read_only_call(Request::Inspect(crate::wire::InspectRequest {
+                            preparation_observations: None,
                             schema_version: SchemaVersion::CURRENT,
                             request_id: RequestId::generate(),
                         })),

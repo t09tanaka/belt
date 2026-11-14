@@ -81,6 +81,16 @@ impl DirHost {
 }
 
 impl Host for DirHost {
+    fn preparation_observation_page(
+        &self,
+        _request: &remote_task_runner::setup::observation_transport::ObservationPageRequest,
+    ) -> Option<remote_task_runner::setup::observation_transport::ObservationPage> {
+        use remote_task_runner::setup::observation_transport::*;
+        self.log("observation_page");
+        Some(ObservationPage::Unavailable {
+            reason: UnavailableReason::OwnerChanged,
+        })
+    }
     fn disable_core_dumps(&self) -> Result<(), ApiError> {
         self.log("core_dumps");
         if self.fail_core_dumps.load(Ordering::SeqCst) {
@@ -1503,6 +1513,7 @@ async fn status_events_logs_lease_and_inspect_answer_from_the_store() {
     let Response::Inspect(i) = call(
         &c,
         Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
         }),
@@ -3973,6 +3984,7 @@ async fn capability_negotiation_is_required_even_if_worker_has_the_profile() {
         .client
         .call(
             Request::Inspect(InspectRequest {
+                preparation_observations: None,
                 schema_version: SchemaVersion::CURRENT,
                 request_id: RequestId::generate(),
             }),
@@ -4058,4 +4070,64 @@ async fn frozen_toolchain_submit_and_readonly_proposal_require_negotiated_featur
     server.abort();
     let _ = server.await;
     agent.shutdown();
+}
+
+#[tokio::test]
+async fn preparation_observations_are_optional_negotiated_and_never_break_inspect() {
+    use remote_task_runner::setup::observation_transport::*;
+    let f = fx();
+    let agent = f.start("boot-1");
+    for negotiated in [false, true] {
+        let (a, b) = duplex_pair(64 * 1024);
+        tokio::spawn(serve_connection(
+            agent.clone(),
+            b,
+            f.cluster.clone(),
+            Arc::new(Semaphore::new(4)),
+        ));
+        let mut config = client_cfg(&f.cluster);
+        if !negotiated {
+            config.features.retain(|v| v != FEATURE);
+        }
+        let connection = connect(a, config).await.unwrap();
+        assert_eq!(
+            connection.negotiated.features.iter().any(|v| v == FEATURE),
+            negotiated
+        );
+        for requested in [false, true] {
+            let before = f.host.count("observation_page");
+            let Response::Inspect(inspect) = connection
+                .client
+                .call(
+                    Request::Inspect(InspectRequest {
+                        schema_version: SchemaVersion::CURRENT,
+                        request_id: RequestId::generate(),
+                        preparation_observations: requested.then(ObservationPageRequest::default),
+                    }),
+                    T,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(inspect.worker_id, f.cfg("boot-1").worker_id);
+            if negotiated && requested {
+                assert_eq!(
+                    inspect.preparation_observations,
+                    Some(ObservationPage::Unavailable {
+                        reason: UnavailableReason::OwnerChanged
+                    })
+                );
+                assert_eq!(f.host.count("observation_page"), before + 1);
+            } else {
+                assert!(inspect.preparation_observations.is_none());
+                assert_eq!(f.host.count("observation_page"), before);
+                assert!(serde_json::to_value(inspect)
+                    .unwrap()
+                    .get("preparation_observations")
+                    .is_none());
+            }
+        }
+    }
 }

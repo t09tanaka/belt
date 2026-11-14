@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 pub const FEATURE: &str = "worker_capabilities_v1";
 pub const FEATURES: &[&str] = &[
+    crate::setup::observation_transport::FEATURE,
     FEATURE,
     crate::toolchain::contract::FEATURE,
     "blob_resume",

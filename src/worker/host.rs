@@ -15,6 +15,13 @@ use crate::wire::{AttemptPayload, SecretFile};
 use crate::workspace::Workspace;
 
 pub trait Host: Send + Sync {
+    /// Optional immutable telemetry; unavailable hosts make no cost claims.
+    fn preparation_observation_page(
+        &self,
+        _request: &crate::setup::observation_transport::ObservationPageRequest,
+    ) -> Option<crate::setup::observation_transport::ObservationPage> {
+        None
+    }
     fn toolchain_registry(
         &self,
         _profile: &crate::toolchain::profile::Profile,

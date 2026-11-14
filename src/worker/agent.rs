@@ -1986,7 +1986,7 @@ impl Agent {
             .map_err(|e| ApiError::new(ErrorCode::ProtocolIncompatible, e.to_string()))?;
         match request {
             Request::Hello(_) => Err(invalid("hello is the first request of a connection")),
-            Request::Inspect(_) => self.inspect().map(Response::Inspect),
+            Request::Inspect(r) => self.inspect(r).map(Response::Inspect),
             Request::SubmitAttempt(r) => self.submit(r).map(Response::SubmitAttempt),
             Request::GetAttempt(r) => {
                 let rec = self.known(&r.attempt_id)?;
@@ -2654,7 +2654,7 @@ impl Agent {
         }
         Ok(())
     }
-    fn inspect(&self) -> Result<InspectResponse, ApiError> {
+    fn inspect(&self, request: InspectRequest) -> Result<InspectResponse, ApiError> {
         let live = self.store.list_nonterminal().map_err(api)?;
         let (active, pending) = policy::load_counts(live.iter().map(|r| r.state));
         let policy_bytes = self
@@ -2667,6 +2667,10 @@ impl Agent {
             .map(|s| s.f_bavail.saturating_mul(s.f_frsize))
             .unwrap_or(0);
         Ok(InspectResponse {
+            preparation_observations: request
+                .preparation_observations
+                .as_ref()
+                .and_then(|request| self.host.preparation_observation_page(request)),
             capabilities: self.capabilities(),
             schema_version: SchemaVersion::CURRENT,
             worker_id: self.cfg.worker_id.clone(),

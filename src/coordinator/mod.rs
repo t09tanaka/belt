@@ -744,6 +744,7 @@ impl Coordinator {
         link: &dyn WorkerLink,
     ) -> Option<InspectResponse> {
         let request = Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
         });

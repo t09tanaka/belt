@@ -315,6 +315,7 @@ impl FakeWorker {
             Request::Inspect(_) => {
                 let (active, pending) = load_counts(s.held.values().map(|h| h.state));
                 Ok(Response::Inspect(InspectResponse {
+                    preparation_observations: None,
                     capabilities: s.capabilities.clone(),
                     schema_version: SchemaVersion::CURRENT,
                     worker_id: s.says.clone(),

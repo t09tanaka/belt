@@ -253,7 +253,7 @@ struct Consumer {
 
 #[derive(Default)]
 struct Inner {
-    observations: HashMap<BuilderId, PreparationObservation>,
+    observations: super::observation_transport::ObservationLog,
     /// The builder working for a key (none once it ended or was stopped).
     by_key: HashMap<String, BuilderId>,
     /// Private artifacts remain owned until every old writer is settled.
@@ -1090,12 +1090,19 @@ impl Setups {
     /// Bounded immutable process-local producer snapshot. No filesystem or database I/O.
     /// A reopened owner has no observations, even if installed artifacts remain valid.
     pub fn preparation_observations(&self, limit: usize) -> Vec<PreparationObservation> {
+        lock(&self.inner).observations.snapshot(limit)
+    }
+
+    /// Read native clock before acquiring the ownership mutex; no I/O under it.
+    pub fn preparation_observation_page(
+        &self,
+        request: &super::observation_transport::ObservationPageRequest,
+    ) -> super::observation_transport::ObservationPage {
+        let boot = platform::boot_id();
+        let now = platform::monotonic_ms();
         lock(&self.inner)
             .observations
-            .values()
-            .take(limit.min(64))
-            .cloned()
-            .collect()
+            .page(&self.owner_generation, request, boot.as_deref(), now)
     }
 
     fn handoff_observation(
@@ -1149,9 +1156,7 @@ impl Setups {
         {
             return;
         }
-        if inner.observations.len() < 4096 {
-            inner.observations.entry(id.clone()).or_insert(value);
-        }
+        inner.observations.insert(value);
     }
 
     fn finish(&self, id: &BuilderId, end: BuilderResult) {
@@ -2181,16 +2186,14 @@ mod tool_validation_tests {
             for _ in 0..4096 {
                 let mut other = value.clone();
                 other.binding.builder_id = BuilderId::generate();
-                inner
-                    .observations
-                    .insert(other.binding.builder_id.clone(), other);
+                inner.observations.insert(other);
             }
         }
         setups.handoff_observation(&id, &attempt, &key, BuilderKind::ToolInstall, &dir);
         assert_eq!(lock(&setups.inner).observations.len(), 4096);
         assert!(!lock(&setups.inner).observations.contains_key(&id));
         assert_eq!(setups.preparation_observations(usize::MAX).len(), 64);
-        lock(&setups.inner).observations.clear();
+        lock(&setups.inner).observations = Default::default();
         setups.handoff_observation(&id, &attempt, &key, BuilderKind::ToolInstall, &dir);
         assert_eq!(setups.preparation_observations(64), vec![value.clone()]);
         setups.handoff_observation(&id, &attempt, &key, BuilderKind::ToolInstall, &dir);
