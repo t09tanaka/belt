@@ -210,20 +210,18 @@ mod tests {
             now,
         )
     }
-    fn available(
-        page: ObservationPage,
-    ) -> (Vec<SequencedObservation>, ObservationCursor, bool, bool) {
-        let ObservationPage::Available {
-            entries,
-            cursor,
-            pass_complete,
-            overflow,
-            ..
-        } = page
-        else {
-            panic!("expected available page")
-        };
-        (entries, cursor, pass_complete, overflow)
+    type Batch = (Vec<SequencedObservation>, ObservationCursor, bool, bool);
+    fn available(page: ObservationPage) -> Result<Batch, UnavailableReason> {
+        match page {
+            ObservationPage::Available {
+                entries,
+                cursor,
+                pass_complete,
+                overflow,
+                ..
+            } => Ok((entries, cursor, pass_complete, overflow)),
+            ObservationPage::Unavailable { reason } => Err(reason),
+        }
     }
     #[test]
     fn bounded_passes_cover_insertions_without_sort_order_or_stamp_renewal() {
@@ -234,7 +232,11 @@ mod tests {
         for value in &samples {
             log.insert(value.clone());
         }
-        let (first, cursor, complete, overflow) = available(read(&log, &owner, None, 200));
+        assert!(log.snapshot(0).is_empty());
+        assert_eq!(log.snapshot(usize::MAX), samples[..PAGE_LIMIT]);
+        assert!(log.contains_key(&samples[0].binding.builder_id));
+        assert!(!log.contains_key(&BuilderId::generate()));
+        let (first, cursor, complete, overflow) = available(read(&log, &owner, None, 200)).unwrap();
         assert_eq!(first.len(), 64);
         assert!(!complete && !overflow);
         assert_eq!(cursor.upper_sequence, 130);
@@ -242,11 +244,13 @@ mod tests {
         // Even an insertion whose builder sorts before every existing key is next.
         late.binding.builder_id = BuilderId::parse("bld_00000000000000000000000002").unwrap();
         log.insert(late.clone());
-        let (second, cursor, complete, _) = available(read(&log, &owner, Some(cursor), 210));
+        let (second, cursor, complete, _) =
+            available(read(&log, &owner, Some(cursor), 210)).unwrap();
         assert_eq!(second.len(), 64);
         assert!(!complete);
         assert_eq!(cursor.upper_sequence, 130);
-        let (third, cursor, complete, _) = available(read(&log, &owner, Some(cursor), 220));
+        let (third, cursor, complete, _) =
+            available(read(&log, &owner, Some(cursor), 220)).unwrap();
         assert_eq!(third.len(), 2);
         assert!(complete);
         let joined: Vec<_> = first.into_iter().chain(second).chain(third).collect();
@@ -261,7 +265,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             samples
         );
-        let (next, cursor, complete, _) = available(read(&log, &owner, Some(cursor), 230));
+        let (next, cursor, complete, _) = available(read(&log, &owner, Some(cursor), 230)).unwrap();
         assert_eq!(
             next,
             vec![SequencedObservation {
@@ -270,12 +274,13 @@ mod tests {
             }]
         );
         assert!(complete);
-        let (empty, cursor, complete, _) = available(read(&log, &owner, Some(cursor), 240));
+        let (empty, cursor, complete, _) =
+            available(read(&log, &owner, Some(cursor), 240)).unwrap();
         assert!(empty.is_empty() && complete);
         let mut after_pass = sample(&owner);
         after_pass.binding.builder_id = BuilderId::parse("bld_00000000000000000000000001").unwrap();
         log.insert(after_pass.clone());
-        let (next, _, complete, _) = available(read(&log, &owner, Some(cursor), 250));
+        let (next, _, complete, _) = available(read(&log, &owner, Some(cursor), 250)).unwrap();
         assert_eq!(
             next,
             vec![SequencedObservation {
@@ -287,7 +292,7 @@ mod tests {
         let mut replay = late.clone();
         replay.finished_monotonic_ms = 239;
         log.insert(replay);
-        let (_, _, _, _) = available(read(&log, &owner, None, 250));
+        let (_, _, _, _) = available(read(&log, &owner, None, 250)).unwrap();
         let retained = log.values.get(&131).unwrap();
         assert_eq!(retained, &late);
         assert_eq!(log.last_sequence, 132);
@@ -298,57 +303,110 @@ mod tests {
         let owner = BuilderId::generate();
         let mut log = ObservationLog::default();
         log.insert(sample(&owner));
-        let (_, cursor, _, _) = available(read(&log, &owner, None, 200));
-        let unavailable = |reason| ObservationPage::Unavailable { reason };
+        let (_, cursor, _, _) = available(read(&log, &owner, None, 200)).unwrap();
         assert_eq!(
-            read(&log, &BuilderId::generate(), Some(cursor.clone()), 201),
-            unavailable(UnavailableReason::OwnerChanged)
+            available(read(
+                &log,
+                &BuilderId::generate(),
+                Some(cursor.clone()),
+                201
+            ))
+            .unwrap_err(),
+            UnavailableReason::OwnerChanged
         );
         let mut invalid = cursor.clone();
         invalid.after_sequence = 2;
         assert_eq!(
-            read(&log, &owner, Some(invalid), 201),
-            unavailable(UnavailableReason::InvalidCursor)
+            available(read(&log, &owner, Some(invalid), 201)).unwrap_err(),
+            UnavailableReason::InvalidCursor
         );
         let mut invalid = cursor.clone();
         invalid.upper_sequence = 2;
         assert_eq!(
-            read(&log, &owner, Some(invalid), 201),
-            unavailable(UnavailableReason::InvalidCursor)
+            available(read(&log, &owner, Some(invalid), 201)).unwrap_err(),
+            UnavailableReason::InvalidCursor
         );
         assert_eq!(
-            read(&log, &owner, Some(cursor.clone()), 199),
-            unavailable(UnavailableReason::ClockAnomaly)
+            available(read(&log, &owner, Some(cursor.clone()), 199)).unwrap_err(),
+            UnavailableReason::ClockAnomaly
         );
+        // Repeating an exchange at the same native tick is valid, not regression.
+        let (entries, same_tick, complete, _) =
+            available(read(&log, &owner, Some(cursor.clone()), 200)).unwrap();
+        assert!(entries.is_empty() && complete);
+        assert_eq!(same_tick.monotonic_now_ms, cursor.monotonic_now_ms);
         assert_eq!(
-            log.page(
+            available(log.page(
                 &owner,
                 &ObservationPageRequest {
                     cursor: Some(cursor)
                 },
                 Some("new-boot"),
                 201
-            ),
-            unavailable(UnavailableReason::NativeBootChanged)
+            ))
+            .unwrap_err(),
+            UnavailableReason::NativeBootChanged
         );
         for boot in [None, Some("")] {
             assert_eq!(
-                log.page(&owner, &ObservationPageRequest::default(), boot, 201),
-                unavailable(UnavailableReason::ClockAnomaly)
+                available(log.page(&owner, &ObservationPageRequest::default(), boot, 201))
+                    .unwrap_err(),
+                UnavailableReason::ClockAnomaly
             );
         }
+        let empty = ObservationLog::default();
+        for length in [1, 128, 129] {
+            let boot = "b".repeat(length);
+            let page =
+                available(empty.page(&owner, &ObservationPageRequest::default(), Some(&boot), 201));
+            if length <= 128 {
+                assert!(page.unwrap().0.is_empty());
+            } else {
+                assert_eq!(page.unwrap_err(), UnavailableReason::ClockAnomaly);
+            }
+        }
         assert_eq!(
-            read(&log, &owner, None, u64::MAX),
-            unavailable(UnavailableReason::ClockAnomaly)
+            available(read(&log, &owner, None, u64::MAX)).unwrap_err(),
+            UnavailableReason::ClockAnomaly
         );
         assert_eq!(
-            read(&log, &owner, None, 99),
-            unavailable(UnavailableReason::ClockAnomaly)
+            available(read(&log, &owner, None, 99)).unwrap_err(),
+            UnavailableReason::ClockAnomaly
         );
-        let (empty, cursor, complete, overflow) =
-            available(read(&ObservationLog::default(), &owner, None, 201));
-        assert!(empty.is_empty() && complete && !overflow);
+        let (entries, cursor, complete, overflow) =
+            available(read(&empty, &owner, None, 201)).unwrap();
+        assert!(entries.is_empty() && complete && !overflow);
         assert_eq!((cursor.after_sequence, cursor.upper_sequence), (0, 0));
+    }
+    #[test]
+    fn each_sample_requires_its_own_owner_boot_and_checked_duration() {
+        let owner = BuilderId::generate();
+        for variant in 0..4 {
+            let mut log = ObservationLog::default();
+            let mut value = sample(&owner);
+            match variant {
+                0 => value.binding.owner_generation = BuilderId::generate(),
+                1 => value.boot = "other-native-boot".into(),
+                2 => value.finished_monotonic_ms = 201,
+                _ => value.duration_ms = value.finished_monotonic_ms + 1,
+            }
+            log.insert(value);
+            assert_eq!(
+                available(read(&log, &owner, None, 200)).unwrap_err(),
+                UnavailableReason::ClockAnomaly
+            );
+        }
+        for duration in [0, 1, 100] {
+            let mut log = ObservationLog::default();
+            let mut value = sample(&owner);
+            value.duration_ms = duration;
+            log.insert(value.clone());
+            // A completion in the current millisecond and duration == finish
+            // are both valid; neither may be rounded into an anomaly.
+            let (entries, _, complete, _) = available(read(&log, &owner, None, 100)).unwrap();
+            assert!(complete);
+            assert_eq!(entries[0].observation, value);
+        }
     }
     #[test]
     fn full_log_and_sequence_overflow_preserve_known_samples_and_expose_unknown() {
@@ -364,7 +422,7 @@ mod tests {
         log.insert(sample(&owner));
         assert_eq!(log.len(), CAPACITY);
         assert_eq!(log.values[&1], original);
-        assert!(available(read(&log, &owner, None, 200)).3);
+        assert!(available(read(&log, &owner, None, 200)).unwrap().3);
         let mut exhausted = ObservationLog {
             last_sequence: u64::MAX,
             ..Default::default()
@@ -402,7 +460,7 @@ mod tests {
         for private in ["argv", "env", "path", "private recipe", "private commands"] {
             assert!(!encoded.contains(private));
         }
-        let (_, cursor, _, _) = available(page);
+        let (_, cursor, _, _) = available(page).unwrap();
         let request = InspectRequest {
             preparation_observations: Some(ObservationPageRequest {
                 cursor: Some(cursor),
