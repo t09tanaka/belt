@@ -8,6 +8,10 @@ use crate::{
     task::{TaskInputs, TaskResult},
 };
 use anyhow::{bail, Context, Result};
+mod evaluation;
+pub use evaluation::{
+    EvaluationSource, JobScheduling, VerifiedEvaluationSource, WorkflowScheduling,
+};
 mod receipt;
 pub use receipt::{AttemptBinding, PrivateReceiptDirectory};
 use std::path::Path;

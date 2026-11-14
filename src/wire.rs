@@ -302,6 +302,7 @@ impl JobSpec {
     }
     pub fn to_job(&self) -> Job {
         Job {
+            runs_on: None,
             id: self.id.clone(),
             name: self.name.clone(),
             needs: self.needs.clone(),

@@ -605,6 +605,137 @@ fn find_close(s: &str) -> Option<usize> {
     None
 }
 
+/// Portable evaluation stages used before a worker has been selected.
+/// Ordinary Runner evaluation does not opt into this stricter policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortableStage {
+    Matrix,
+    JobIf,
+    RunsOn,
+    Name,
+}
+
+/// Check availability using the same parsed AST as expression execution.
+/// `bare` matches job `if:` syntax; other fields only evaluate `${{ }}`.
+/// This checks context availability, not the authenticity of supplied facts.
+pub fn validate_portable(text: &str, bare: bool, stage: PortableStage) -> Result<()> {
+    let mut rest = text;
+    let mut found = false;
+    while let Some(start) = rest.find("${{") {
+        found = true;
+        let after = &rest[start + 3..];
+        let end =
+            find_close(after).ok_or_else(|| anyhow::anyhow!("unterminated portable expression"))?;
+        // condition() reparses mixed interpolation output as an expression.
+        // Its runtime-generated AST cannot be approved before evaluation.
+        if bare && (!text[..start].trim().is_empty() || !after[end + 2..].trim().is_empty()) {
+            bail!("portable if requires one complete expression");
+        }
+        portable_ast(&parse(&after[..end])?, stage)?;
+        rest = &after[end + 2..];
+    }
+    if bare && !found && !text.trim().is_empty() {
+        portable_ast(&parse(text)?, stage)?;
+    }
+    Ok(())
+}
+
+fn portable_ast(ast: &Ast, stage: PortableStage) -> Result<()> {
+    // A github chain must select a literal portable property before the
+    // object is read. Reject computed indices and whole-object serialization,
+    // even in dead branches; no guessed worker workspace or token is supplied.
+    let mut base = ast;
+    let mut keys = Vec::new();
+    loop {
+        match base {
+            Ast::Prop(parent, key) => {
+                keys.push(Some(key.as_ref()));
+                base = parent;
+            }
+            Ast::Star(parent) => {
+                keys.push(None);
+                base = parent;
+            }
+            _ => break,
+        }
+    }
+    if matches!(base, Ast::Ctx(name) if name.eq_ignore_ascii_case("github")) {
+        let Some(Some(Ast::Lit(Value::String(first)))) = keys.last() else {
+            bail!("portable github requires a literal property");
+        };
+        if !matches!(
+            first.to_ascii_lowercase().as_str(),
+            "event_name"
+                | "event"
+                | "sha"
+                | "ref"
+                | "ref_name"
+                | "head_ref"
+                | "base_ref"
+                | "repository"
+                | "repository_owner"
+                | "workflow"
+                | "job"
+                | "run_id"
+                | "run_number"
+                | "run_attempt"
+                | "actor"
+                | "server_url"
+                | "api_url"
+        ) {
+            bail!("github property is unavailable before worker selection");
+        }
+        if !keys
+            .iter()
+            .all(|k| matches!(k, Some(Ast::Lit(Value::String(_)))))
+        {
+            bail!("computed github properties are unavailable before worker selection");
+        }
+        return Ok(());
+    }
+    match ast {
+        Ast::Lit(_) => Ok(()),
+        Ast::Ctx(name) => {
+            let name = name.to_ascii_lowercase();
+            if matches!(name.as_str(), "needs" | "vars" | "inputs")
+                || (stage != PortableStage::Matrix
+                    && matches!(name.as_str(), "matrix" | "strategy"))
+            {
+                Ok(())
+            } else {
+                bail!("context is unavailable at portable {stage:?} stage")
+            }
+        }
+        Ast::Prop(base, key) => {
+            portable_ast(base, stage)?;
+            portable_ast(key, stage)
+        }
+        Ast::Star(base) | Ast::Not(base) => portable_ast(base, stage),
+        Ast::Bin(_, left, right) => {
+            portable_ast(left, stage)?;
+            portable_ast(right, stage)
+        }
+        Ast::Call(name, args) => {
+            let ordinary = matches!(
+                name.as_str(),
+                "contains" | "startswith" | "endswith" | "format" | "join" | "tojson" | "fromjson"
+            );
+            let status = stage == PortableStage::JobIf
+                && matches!(
+                    name.as_str(),
+                    "success" | "failure" | "cancelled" | "always"
+                );
+            if !ordinary && !status {
+                bail!("function is unavailable at portable {stage:?} stage");
+            }
+            for arg in args {
+                portable_ast(arg, stage)?;
+            }
+            Ok(())
+        }
+    }
+}
+
 /// What an expression takes from the `needs` context.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum NeedsRef {
@@ -865,5 +996,94 @@ mod tests {
         let m = ctx_map();
         let c = Ctx::new(&m, Status::Success);
         assert_eq!(interpolate("${{ format('{{x}}') }}", &c).unwrap(), "{x}");
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    #[test]
+    fn stages_validate_actual_ast_and_fail_closed_in_dead_branches() {
+        for expression in [
+            "fromJSON(needs.seed.outputs.matrix)",
+            "inputs[vars.key]",
+            "toJSON(needs)",
+            "github.event.pull_request.head.ref",
+            "github['repository']",
+        ] {
+            validate_portable(expression, true, PortableStage::Matrix).unwrap();
+        }
+        for stage in [
+            PortableStage::Matrix,
+            PortableStage::JobIf,
+            PortableStage::RunsOn,
+            PortableStage::Name,
+        ] {
+            for expression in [
+                "runner.os",
+                "env.CACHE",
+                "secrets.X",
+                "steps.out.outputs.x",
+                "github.workspace",
+                "github.token",
+                "github[inputs.key]",
+                "github.event[inputs.key]",
+                "toJSON(github)",
+                "github.*",
+                "hashFiles('**')",
+                "false && runner.os",
+                "true || secrets.X",
+                "fromJSON(toJSON(github)).workspace",
+            ] {
+                assert!(
+                    validate_portable(expression, true, stage).is_err(),
+                    "{stage:?}: {expression}"
+                );
+            }
+        }
+        assert!(validate_portable("matrix.os", true, PortableStage::Matrix).is_err());
+        assert!(validate_portable("strategy.job-total", true, PortableStage::Matrix).is_err());
+        for stage in [
+            PortableStage::JobIf,
+            PortableStage::RunsOn,
+            PortableStage::Name,
+        ] {
+            validate_portable(
+                "format('{0}-{1}', matrix.os, strategy.job-index)",
+                true,
+                stage,
+            )
+            .unwrap();
+        }
+        validate_portable(
+            "always() && needs.seed.result == 'success'",
+            true,
+            PortableStage::JobIf,
+        )
+        .unwrap();
+        assert!(validate_portable("success()", true, PortableStage::Matrix).is_err());
+    }
+    #[test]
+    fn interpolation_does_not_reparse_unvalidated_generated_if() {
+        validate_portable("plain runner.os", false, PortableStage::RunsOn).unwrap();
+        validate_portable("worker-${{ matrix.os }}", false, PortableStage::RunsOn).unwrap();
+        validate_portable(
+            " ${{ needs.seed.result == 'success' }} ",
+            true,
+            PortableStage::JobIf,
+        )
+        .unwrap();
+        for text in [
+            "runner.${{ inputs.key }}",
+            "${{ inputs.root }}.os",
+            "${{ inputs.a }} == ${{ inputs.b }}",
+            "${{ runner.os",
+            "${{ needs[ }}",
+        ] {
+            assert!(
+                validate_portable(text, true, PortableStage::JobIf).is_err(),
+                "{text}"
+            );
+        }
     }
 }

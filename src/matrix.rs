@@ -10,6 +10,19 @@ pub fn yaml_to_json(v: &serde_yaml::Value) -> Value {
 /// Expand a matrix (already a JSON object) into its combinations.
 /// An absent matrix is one empty combination.
 pub fn expand(m: &Value) -> Result<Vec<Map<String, Value>>> {
+    expand_with_limit(m, None)
+}
+
+/// Bound intermediate Cartesian allocations as well as final include growth.
+/// Excludes do not permit an oversized intermediate product.
+pub fn expand_bounded(m: &Value, max_combinations: usize) -> Result<Vec<Map<String, Value>>> {
+    if max_combinations == 0 {
+        bail!("matrix combination limit must be positive");
+    }
+    expand_with_limit(m, Some(max_combinations))
+}
+
+fn expand_with_limit(m: &Value, limit: Option<usize>) -> Result<Vec<Map<String, Value>>> {
     let obj = match m {
         Value::Null => return Ok(vec![Map::new()]),
         Value::Object(o) => o,
@@ -21,17 +34,31 @@ pub fn expand(m: &Value) -> Result<Vec<Map<String, Value>>> {
         if k == "include" || k == "exclude" {
             continue;
         }
+        let cardinality = v.as_array().map_or(1, Vec::len);
+        if let Some(limit) = limit {
+            if combos
+                .len()
+                .checked_mul(cardinality)
+                .is_none_or(|n| n > limit)
+            {
+                bail!("matrix Cartesian product exceeds combination limit");
+            }
+        }
+        let scalar;
         let values = match v {
-            Value::Array(a) => a.clone(),
+            Value::Array(a) => a,
             Value::String(s) if s.contains("${{") => {
                 bail!("matrix key `{k}` is an unevaluated expression")
             }
-            other => vec![other.clone()],
+            other => {
+                scalar = vec![other.clone()];
+                &scalar
+            }
         };
         original_keys.push(k.clone());
         let mut next = Vec::new();
         for c in &combos {
-            for val in &values {
+            for val in values {
                 let mut c2 = c.clone();
                 c2.insert(k.clone(), val.clone());
                 next.push(c2);
@@ -71,6 +98,9 @@ pub fn expand(m: &Value) -> Result<Vec<Map<String, Value>>> {
                 }
             }
             if !matched {
+                if limit.is_some_and(|n| combos.len() >= n) {
+                    bail!("matrix include exceeds combination limit");
+                }
                 combos.push(item.clone());
             }
         }
@@ -152,5 +182,39 @@ mod tests {
         let c = expand(&json!({"os": ["a"], "include": ["x", 3, {"os": "b"}]})).unwrap();
         assert_eq!(c.len(), 2);
         assert_eq!(c[1].get("os"), Some(&json!("b")));
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn bounds_intermediate_products_before_exclusion_and_include_growth() {
+        let axis = json!((0..1000).collect::<Vec<_>>());
+        assert!(expand_bounded(&json!({"a": axis, "b": axis, "c": axis}), 4096).is_err());
+        assert!(
+            expand_bounded(&json!({"a": [1,2], "b": [1,2], "exclude": [{"a": 1}]}), 3).is_err()
+        );
+        assert!(expand_bounded(&json!({"include": [{"a":1}, {"a":2}]}), 1).is_err());
+        assert!(expand_bounded(&json!({"a": [1], "include": [{"a":2}]}), 1).is_err());
+        assert!(expand_bounded(&Value::Null, 0).is_err());
+    }
+    #[test]
+    fn bounded_and_legacy_share_ordered_include_exclude_semantics() {
+        for matrix in [
+            Value::Null,
+            json!({"a":[1,2],"b":[3,4],"exclude":[{"a":1,"b":3}],"include":[{"a":2,"extra":true},{"a":3}]}),
+            json!({"include":[{"a":1},{"a":2}]}),
+            json!({"a":"scalar"}),
+        ] {
+            let ordinary = expand(&matrix).unwrap();
+            assert_eq!(
+                expand_bounded(&matrix, ordinary.len().max(4)).unwrap(),
+                ordinary
+            );
+        }
+        assert!(expand_bounded(&json!({"a":[]}), 1).is_err());
+        assert!(expand_bounded(&json!({"a":"${{ x }}"}), 1).is_err());
     }
 }
