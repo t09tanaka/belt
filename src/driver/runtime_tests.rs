@@ -825,3 +825,70 @@ fn amplified_values_and_small_remaining_state_keep_real_producer_and_replay() {
         assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
     }
 }
+
+#[test]
+fn fanout_fallbacks_do_not_spend_producer_terminal_capacity() {
+    let mut workflow = WORKFLOW.replace(
+        "name: 'leg-${{ matrix.n }}'",
+        &format!("name: '{}'", "x".repeat(32 * 1024)),
+    );
+    for index in 0..80 {
+        let condition = if index % 4 == 0 {
+            "false".to_string()
+        } else {
+            format!("'{}' trailing", "x".repeat(1536))
+        };
+        workflow.push_str(&format!("  zz_fanout_{index:02}:\n    needs: seed\n    if: \"{condition}\"\n    runs-on: x\n    strategy:\n      matrix: ${{{{ fromJSON(needs.seed.outputs.matrix) }}}}\n    steps: []\n"));
+    }
+    let f = Fixture::new(&workflow);
+    assert_eq!(f.plan.tasks.iter().filter(|t| t.dynamic_matrix).count(), 81);
+    let mut d = f.driver(2);
+    d.state_byte_limit = 180 * 1024;
+    let journal = seed(&f, &mut d);
+    assert_eq!(d.admitted(), 0);
+    assert_eq!(d.outcome(FILE, "seed").unwrap().status, JobStatus::Success);
+    assert!(!ready(&d)
+        .iter()
+        .any(|a| matches!(a, ActionKind::DerivedReady { .. })));
+    for origin in f.plan.tasks.iter().filter(|t| t.dynamic_matrix) {
+        let (decision, _) = d.core_decision(&origin.id).unwrap();
+        if let Some(index) = origin.jobs[0].strip_prefix("zz_fanout_") {
+            assert_eq!(
+                decision,
+                if index.parse::<usize>().unwrap() % 4 == 0 {
+                    CoreDecision::UnstartedSkipped
+                } else {
+                    CoreDecision::EarlyFailure
+                }
+            );
+        } else {
+            assert_eq!(decision, CoreDecision::EarlyFailure);
+        }
+    }
+    let mut replay = f.driver(2);
+    replay.state_byte_limit = d.state_byte_limit;
+    for record in journal {
+        replay.apply(&record).unwrap();
+    }
+    assert_eq!(
+        serde_json::to_value(&replay.state).unwrap(),
+        serde_json::to_value(&d.state).unwrap()
+    );
+    let consumer = ready(&d).remove(0);
+    claim(&mut d, &consumer);
+    let (wire, _) = f.execute(&consumer, "fanout-skipped-consumer");
+    assert_eq!(
+        wire.clone()
+            .into_task_result(Path::new("."))
+            .unwrap()
+            .outcomes[0]
+            .status,
+        JobStatus::Skipped
+    );
+    settle(&mut d, &consumer, wire);
+    assert!(d
+        .pending_actions()
+        .iter()
+        .any(|a| a.kind == ActionKind::Finished));
+    assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+}

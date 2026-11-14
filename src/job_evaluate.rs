@@ -215,7 +215,11 @@ fn evaluate_inner(
     if let Some(u) = &job.reusable {
         return JobEvaluation::terminal(
             base_name,
-            Decision::Skip(format!("reusable workflow {u} is not supported")),
+            Decision::Skip(if portable.is_some() {
+                "reusable workflow is not supported".into()
+            } else {
+                format!("reusable workflow {u} is not supported")
+            }),
         );
     }
 

@@ -758,6 +758,21 @@ impl Driver {
         ensure!(bytes <= limit, "expansion state byte budget exceeded");
         Ok(bytes)
     }
+    fn fallback_reserve(task: &ExecutionTask) -> Result<usize> {
+        Ok(8192usize.saturating_add(
+            crate::expr::serialized_size(&(&task.jobs, &task.workflow), MAX_WIRE_BYTES)?
+                .saturating_mul(4),
+        ))
+    }
+    fn pending_fallback_reserve(&self, s: &State) -> Result<usize> {
+        self.plan
+            .tasks
+            .iter()
+            .filter(|task| task.dynamic_matrix && matches!(s.phases[&task.id], Phase::Pending))
+            .try_fold(0usize, |bytes, task| {
+                Ok(bytes.saturating_add(Self::fallback_reserve(task)?))
+            })
+    }
     fn progress(&self, s: &mut State) -> Result<()> {
         loop {
             let mut changed = false;
@@ -826,6 +841,9 @@ impl Driver {
                     }
                 }
             }
+            // Keep room for every pending origin's core terminal and logical
+            // outcome, including siblings not yet reached in frozen order.
+            let mut fallback_reserve = self.pending_fallback_reserve(s)?;
             for t in &self.plan.tasks {
                 if !matches!(s.phases[&t.id], Phase::Pending)
                     || !t
@@ -869,13 +887,8 @@ impl Driver {
                         .context("missing evaluation context")?;
                     // User expression failures are core outcomes; never discard the
                     // already-validated producer settlement and permit release.
-                    // Reserve the small typed fallback and its logical outcome;
-                    // expansion may consume only the remaining durable-state space.
+                    // Expansion cannot consume any pending origin's fallback.
                     let baseline_bytes = crate::expr::serialized_size(s, MAX_WIRE_BYTES)?;
-                    let fallback_reserve = 8192usize.saturating_add(
-                        crate::expr::serialized_size(&(&t.jobs, &t.workflow), MAX_WIRE_BYTES)?
-                            .saturating_mul(4),
-                    );
                     let remaining = self
                         .state_byte_limit
                         .saturating_sub(baseline_bytes)
@@ -949,6 +962,12 @@ impl Driver {
                                 skipped: (status == JobStatus::Skipped).then(|| diagnostic.clone()),
                                 ancestor_failed,
                             };
+                            // Publish the small logical outcome now, so later
+                            // origins count its bytes before releasing its reserve.
+                            s.outcomes
+                                .entry(t.workflow.clone())
+                                .or_default()
+                                .insert(outcome.job.clone(), outcome.clone());
                             s.phases.insert(
                                 t.id.clone(),
                                 Phase::Terminal(Terminal::Core {
@@ -959,6 +978,7 @@ impl Driver {
                             );
                         }
                     }
+                    fallback_reserve = fallback_reserve.saturating_sub(Self::fallback_reserve(t)?);
                 } else {
                     s.phases.insert(
                         t.id.clone(),
