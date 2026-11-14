@@ -94,7 +94,7 @@ impl Drop for ProbeChild {
     }
 }
 
-fn probe_success(mut command: Command, timeout: Duration) -> bool {
+fn probe_status(mut command: Command, timeout: Duration) -> (bool, Option<u32>) {
     let Ok(child) = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -102,11 +102,12 @@ fn probe_success(mut command: Command, timeout: Duration) -> bool {
         .process_group(0)
         .spawn()
     else {
-        return false;
+        return (false, None);
     };
     let child = ProbeChild(child);
+    let pid = child.0.id();
     let start = Instant::now();
-    loop {
+    let success = loop {
         let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: inspect only our owned child without reaping its group leader.
         let rc = unsafe {
@@ -118,16 +119,22 @@ fn probe_success(mut command: Command, timeout: Duration) -> bool {
             )
         };
         if rc != 0 {
-            return false;
+            break false;
         }
         if unsafe { status.si_pid() } != 0 {
-            return status.si_code == libc::CLD_EXITED && unsafe { status.si_status() } == 0;
+            break status.si_code == libc::CLD_EXITED && unsafe { status.si_status() } == 0;
         }
         if start.elapsed() >= timeout {
-            return false;
+            break false;
         }
         std::thread::sleep(Duration::from_millis(10));
-    }
+    };
+    drop(child);
+    (success, Some(pid))
+}
+
+fn probe_success(command: Command, timeout: Duration) -> bool {
+    probe_status(command, timeout).0
 }
 
 fn docker_available() -> bool {
@@ -138,18 +145,15 @@ fn docker_available() -> bool {
 
 #[test]
 fn availability_probe_is_bounded_and_reaps_its_owned_child() {
-    let tmp = common::tempdir().unwrap();
-    let pidfile = tmp.path().join("pid");
     let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "echo $$ > \"$1\"; exec sleep 20", "probe"])
-        .arg(&pidfile);
-    assert!(!probe_success(command, Duration::from_secs(2)));
-    let pid: i32 = std::fs::read_to_string(pidfile)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    command.args(["-c", "exec sleep 20"]);
+    let (success, pid) = probe_status(command, Duration::from_secs(2));
+    assert!(!success);
+    // Use the parent's spawn receipt: the child need not get CPU time before
+    // its deadline, and need not write a file to prove which process was reaped.
+    let pid = pid.expect("the owned child was spawned");
+    assert!(pid > 1 && pid <= i32::MAX as u32);
+    let pid = pid as i32;
     // The helper already reaped this owned child.
     assert_eq!(
         unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) },
