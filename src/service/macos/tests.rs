@@ -111,7 +111,7 @@ fn manager(root: &Path) -> Manager<DirectoryFiles, FakeLaunch, FakeWorker> {
 }
 #[test]
 fn lifecycle_is_separate_from_worker_control() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut m = manager(tmp.path());
     let p = plan();
     let receipt = m.install_and_start(&p).unwrap();
@@ -160,7 +160,7 @@ fn lifecycle_is_separate_from_worker_control() {
 }
 #[test]
 fn proven_start_rejection_rolls_back_but_unknown_preserves_evidence() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut m = manager(tmp.path());
     m.launcher.fail = vec![1];
     assert!(m.install_and_start(&plan()).is_err());
@@ -184,7 +184,7 @@ fn proven_start_rejection_rolls_back_but_unknown_preserves_evidence() {
 }
 #[test]
 fn worker_failure_prevents_bootout() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut m = manager(tmp.path());
     let p = plan();
     let r = m.install(&p).unwrap();
@@ -198,7 +198,7 @@ fn worker_failure_prevents_bootout() {
 }
 #[test]
 fn foreign_modified_or_replaced_files_are_never_adopted() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut m = manager(tmp.path());
     let p = plan();
     let r = m.install(&p).unwrap();
@@ -218,7 +218,7 @@ fn foreign_modified_or_replaced_files_are_never_adopted() {
 }
 #[test]
 fn roots_symlinks_permissions_hardlinks_and_foreign_receipts_rejected() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let root = tmp.path().join("root");
     std::fs::create_dir(&root).unwrap();
     assert!(DirectoryFiles::open(Path::new("relative")).is_err());
@@ -231,7 +231,7 @@ fn roots_symlinks_permissions_hardlinks_and_foreign_receipts_rejected() {
     let mut m = manager(&root);
     let p = plan();
     let r = m.install(&p).unwrap();
-    let other = tempfile::tempdir_in("/private/tmp").unwrap();
+    let other = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     assert!(manager(other.path()).remove(&r).is_err());
     std::fs::set_permissions(r.path(), std::fs::Permissions::from_mode(0o644)).unwrap();
     assert!(m.remove(&r).is_err());
@@ -251,7 +251,7 @@ fn roots_symlinks_permissions_hardlinks_and_foreign_receipts_rejected() {
 }
 #[test]
 fn a_receipt_cannot_start_another_plan() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut m = manager(tmp.path());
     let p = plan();
     let r = m.install(&p).unwrap();
@@ -296,7 +296,7 @@ impl ManagedFiles for FailingFiles {
 }
 #[test]
 fn publish_and_rollback_failures_remain_errors() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut m = Manager {
         identity: identity(),
         files: FailingFiles {
@@ -321,7 +321,7 @@ fn publish_and_rollback_failures_remain_errors() {
 
 #[test]
 fn post_publish_sync_and_rollback_failures_preserve_exact_evidence() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut files = DirectoryFiles::open(tmp.path()).unwrap();
     for fail_verification in [true, false] {
         let error = files
@@ -350,7 +350,7 @@ fn post_publish_sync_and_rollback_failures_preserve_exact_evidence() {
 }
 #[test]
 fn worker_ack_cannot_authorize_bootout_after_loaded_job_replacement() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut m = manager(tmp.path());
     let p = plan();
     let r = m.install_and_start(&p).unwrap();
@@ -384,7 +384,7 @@ fn lifecycle_is_locked(root: &Path) -> bool {
 }
 #[test]
 fn lifecycle_lease_covers_nested_checks_worker_ack_and_path_bootout() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut m = manager(tmp.path());
     let p = plan();
     let receipt = m.install_and_start(&p).unwrap();
@@ -399,7 +399,7 @@ fn lifecycle_lease_covers_nested_checks_worker_ack_and_path_bootout() {
 }
 #[test]
 fn receipt_change_during_ack_prevents_bootout() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let mut m = manager(tmp.path());
     let p = plan();
     let receipt = m.install_and_start(&p).unwrap();
@@ -461,7 +461,7 @@ fn native_output(plan: &Plan, receipt: &Receipt) -> CommandOutput {
 }
 #[test]
 fn native_verifier_queries_exact_target_and_refuses_unconfirmed_observations() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let p = plan();
     let mut files = DirectoryFiles::open(tmp.path()).unwrap();
     let receipt = files.install(&p).unwrap();
@@ -562,7 +562,7 @@ fn native_verifier_queries_exact_target_and_refuses_unconfirmed_observations() {
 fn native_stop_observes_before_and_after_ack_and_has_no_label_fallback() {
     for scenario in 0..3 {
         let changed = scenario == 1;
-        let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+        let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
         let p = plan();
         let mut files = DirectoryFiles::open(tmp.path()).unwrap();
         let receipt = files.install(&p).unwrap();
@@ -620,7 +620,7 @@ fn native_execution_failure_is_uncertain_and_account_lookup_failure_refuses_stop
             Err("unavailable".into())
         }
     }
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let p = plan();
     let mut files = DirectoryFiles::open(tmp.path()).unwrap();
     let receipt = files.install(&p).unwrap();
@@ -671,7 +671,7 @@ fn native_execution_failure_is_uncertain_and_account_lookup_failure_refuses_stop
 
 #[test]
 fn unparseable_native_observation_prevents_worker_stop() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let p = plan();
     let mut files = DirectoryFiles::open(tmp.path()).unwrap();
     let receipt = files.install(&p).unwrap();
@@ -705,7 +705,7 @@ fn unparseable_native_observation_prevents_worker_stop() {
 
 #[test]
 fn native_absence_requires_exact_known_exit_and_domain_diagnostic() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let p = plan();
     let mut files = DirectoryFiles::open(tmp.path()).unwrap();
     let receipt = files.install(&p).unwrap();
@@ -770,7 +770,7 @@ fn native_absence_requires_exact_known_exit_and_domain_diagnostic() {
 fn running_identity_is_fresh_and_refuses_nonrunning_or_changed_jobs() {
     assert!(RunningIdentity::observe(0).is_err());
     assert!(RunningIdentity::observe(1).is_err());
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let p = plan();
     let mut files = DirectoryFiles::open(tmp.path()).unwrap();
     let receipt = files.install(&p).unwrap();
@@ -836,7 +836,7 @@ fn running_identity_is_fresh_and_refuses_nonrunning_or_changed_jobs() {
 }
 #[test]
 fn journal_callback_waits_for_durable_stage_directory() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let p = plan();
     let mut files = DirectoryFiles::open(tmp.path()).unwrap();
     let called = std::cell::Cell::new(false);
@@ -879,7 +879,7 @@ fn journal_callback_waits_for_durable_stage_directory() {
 
 #[test]
 fn failed_native_publication_retains_staged_evidence_after_journal_callback() {
-    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let p = plan();
     let mut files = DirectoryFiles::open(tmp.path()).unwrap();
     let stage = std::cell::RefCell::new(None);

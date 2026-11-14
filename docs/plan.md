@@ -336,3 +336,8 @@ fixture 補正 `72b3f09` で setup 全30件、hook 1件、captured submit 1件�
 strict all-target/all-feature clippy と fmt が成功した。
 以前の interrupted が lease expiry だったことは追跡されておらず、起動・スケジュール感度という推定と区別する。
 補正後 HEAD の全体 CI とリモート確認が終わるまで PR #42 を統合しない。
+
+S15 の追加 fixture 点検で、macOS 専用の temp path を34か所検出した。
+canonical な /tmp 配下へ統一し、Macでは従来と同じ private path、Linuxでは存在する temp root を使う。
+出力15件・macOS backend の fake/観測27件・init の private/fake 15件が成功し、fmt も成功した。
+実 Linux での確認は統合後のリモート CI で行い、実 launchd の受入としては扱わない。
