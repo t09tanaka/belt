@@ -187,3 +187,11 @@ standalone worker does not by itself establish remote end-to-end execution.
 source export/upload の共有 transfer lease と cleanup は background job 間で維持する。admission は network や transfer mutex を待たない。停止後の残 IO は capture store と lease だけを保持し、旧 coordinator owner を保持しない。secrets は既存 attempt/generation へ配置後に送り、worker の Preparing/lease gate を維持する。local に事前配置した legacy source も再起動後に worker verification で Ready を再構築する。
 
 この slice は local resident と再利用できる per-worker delivery helper まで。verified remote の SSH 接続・再接続 owner、worker add/install・鍵登録・native service、実 remote source/secret routing と SSH/native end-to-end acceptance は次 slice の必須残件で、S15b 以降と S22 の完了を意味しない。schema migration は不要。
+
+### S15 の利用者経路の統合
+
+S15a（PR #40、merge `8939ef2`）と S15b（PR #41、merge `05e981c`）は main に統合済みで、各 HEAD のローカル実行 9 ジョブ・リモート 9 ジョブが成功した。S15c の PR #42 はローカル実行 9 ジョブ成功後、Linux の失敗子プロセス fixture が startup lock の試験へ到達しない問題を検出した。専用の private executable と起動 marker へ置き換え、同じ lock・中断・再起動の検査を保って再検証中である。
+
+managed init、独立 worker role、配置前の source readiness、双方向に revision で fence する Cancel/Retry を、利用者の local 実行経路の区切りとして統合する。異なる設計の担当コミットと独立レビュー結果を保持し、統合時の旧 IPC fixture と非同期 adoption の観測 race は別のテスト修正で扱う。storage 86 件、resident unit 8 件、completion 4 件、coordinator 41 件、retry/secret の実 CLI、resident integration 6 件、worker role 6 件と strict clippy が統合後に成功した。転送完了を待たず durable queued を返し、source gate と接続交換は SQLite commit 完了まで同期する。全体 CI とリモート検証が終わるまで本流へ統合しない。
+
+`--in-place`、requires/profile、条件付き・glob・複数 path の出力計画、公開 logs/outputs、retention/GC、estimate、SSH の接続所有と再接続は引き続き必須残件である。途中ログの storage 基盤と collector 接続は別 slice とし、終了後の再生だけを live follow 完成とは扱わない。
