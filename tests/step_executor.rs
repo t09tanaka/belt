@@ -59,6 +59,11 @@ fn lab(workflow: &str) -> (common::Tmp, PathBuf) {
 fn ctx(home: &Path) -> ExecContext {
     let bin = home.join("fakebin");
     std::fs::create_dir_all(&bin).unwrap();
+    // These executor fixtures own no Docker resources. Keep cleanup local even
+    // on a host with an installed but unavailable Docker daemon.
+    std::fs::write(bin.join("docker"), "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(bin.join("docker"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
     std::fs::write(
         bin.join("gh"),
         "#!/bin/sh\n[ \"$1 $2\" = \"auth token\" ] && echo ghs_faketoken123\n",
