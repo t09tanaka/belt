@@ -190,6 +190,17 @@ source export/upload の共有 transfer lease と cleanup は background job 間
 
 ### S15e の増分ログ回収
 
-S15e1a は schema v7 の stream ごとの committed offset、GC ref の先行登録、CAS 更新、未 commit tail の回復、読取専用の prefix reader、検証済み旧 receipt の引継ぎを実装・独立レビュー済み。storage 92 件・ResultStore 14 件・migration と読取専用 CLI の関連 1 件、strict clippy が成功した。collector と resident の途中ログ回収、公開 `logs --follow` / `outputs`、GC と reader lifetime の接続は未実装であり、この基盤だけで live follow 完成とは扱わない。
+S15e1a は schema v7 の stream ごとの committed offset、GC ref の先行登録、CAS 更新、未 commit tail の回復、読取専用の prefix reader、検証済み旧 receipt の引継ぎを実装・独立レビュー済み。storage 92 件・ResultStore 14 件・migration と読取専用 CLI の関連 1 件、strict clippy が成功した。collector / resident の増分回収と公開 `logs --follow` は後続 slice で接続する。`outputs`、resident GC と reader lifetime の接続は別の必須残件であり、この基盤だけで S15e 完成とは扱わない。
 
 S15a は PR #40（merge `8939ef2`）、S15b は PR #41（merge `05e981c`）で main に統合済み。各対象 HEAD のローカル実行 9 ジョブとリモート 9 ジョブが成功した。S15c の bootstrap / source / query slice は PR #42 でリモート CI を確認中。
+
+
+S15e public logs slice は read-only metadata / committed-prefix reader を公開 `logs` と
+`logs --follow` へ接続する。32-task pagination、64 KiB raw chunk、NDJSON base64、
+private SQLite 配信 cursor、latest/min_generation と明示 --attempt、collection closed
+までの follow と Ctrl-C detach を実装する。active collector から公開 observer までの
+回帰、raw bytes / retry / 欠損 / 大規模ページ / cursor permissions を focused 検証済み。
+unit 10 件・active collector から公開 follow まで 1 件・実 CLI 2 件が成功し、
+実行中および終了後 final の blocked stdout でも SIGINT detach と cursor cleanup を確認した。
+strict all-target clippy、fmt、diff check も成功した。
+outputs、resident GC / reader lifetime、output planner、estimate は別の必須残件として残す。

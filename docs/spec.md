@@ -1117,3 +1117,34 @@ workerのattempt workspaceは、fast-worktreeで作り、消す（2026-11-10の�
 2. **lib化後の基準**: task-traffic-controller 0.5.0（main `18b2d45`、タグ `v0.5.0`）、local-ci 0.9.0（main `8666da7`、タグ `v0.9.0`）。いずれもcrates.ioに公開済みで、remote-task-runnerはcrates.ioの版へ依存する。2026-11-09の決定時点の基準は local-ci main `7deff5e`（v0.7.0 + PR #21 によるlib化）、task-traffic-controller main `7f095ad`（v0.4.2 + PR #14 によるlib化）で、第3項・第4項の観察はその時点のものである。
 3. **待ち時間の分離**: local-ci v0.7.0は、jobごとに資源待ちを実行時間と分けて記録する。第9章の実行時間には、この待ちを除いた値を使う。
 4. **task-traffic-controllerの既知の窓**: PR #14の後、待ち中のrunnerがSIGTERMを2回続けて受けると、exit fileを書かずに終了し、jobがlostに見える短い窓がある。C3（受理段階のreceiptと終了順序）で、signal handlerを既定へ戻す時点をCLIの再送の直前へ移して閉じる。
+
+
+### 公開ログの読み取り
+
+`logs <run-or-task-id> [--follow]` は親が回収して commit した stdout / stderr の
+prefix を読み、worker 接続・owner 起動・Git/project 設定を必要としない。
+既定は非 retired の最新 generation（task の min_generation 以上）であり、retry 待ちに
+旧 attempt へ戻らない。`logs <task-id> --attempt <attempt-id>` で同 task の履歴を明示できる。
+wire の node_id は公開 CLI の選択単位にせず、attempt 集約 stream を読む。
+
+text は任意 bytes を変換せず対応する stdout / stderr へ出す。識別・回収状態の診断は
+stderr へ出す。stream 間の時系列順序は保証しない。`--json` は snapshot / follow とも
+schema_version=1 の NDJSON で、data.kind は status / replacement / reconnecting / chunk / final。
+chunk は run_id / task_id / attempt_id / generation / stream / offset / next_offset /
+bytes_base64 を持ち、生 bytes は JSON stdout に混ぜない。chunk は最大 64 KiB、
+run は最大 32 task のページで走査する。final は件数・bytes・pending / failure の集計であり、
+全 task の配列を保持しない。読み取りエラーは既存の error envelope を返す。
+
+follow は invocation 専用の mode-0700 一時ディレクトリ / mode-0600 SQLite cursor に
+配信 offset を保存し、メモリは task 数やログ量によらず制限する。終了時に削除し、
+プロセスを跨ぐ resume は提供しない。owner の再起動でも read-only DB から同じ offset
+を継続する。prefix の縮小は CONFLICT、commit 済みファイルの欠損・短縮は INTERNAL とする。
+実行 terminal だけでは終了せず、collection closed と利用可能 prefix の配信完了を待つ。
+closed の不完全ログ・回収失敗は利用可能 bytes を返して COLLECTION_FAILED / 78。
+途中 snapshot は pending を明示して 0。Ctrl-C は cancel を送らず detach / 130。
+出力先が詰まっている場合も detach は待たず、割り込み時の final は出力可能な場合に送る。
+
+将来の retention GC は reader が検証して開いた FD / 短期 pin と排他を統合し、
+active / pending / finalizing の回収と reader 使用中の削除を防ぐ必要がある。
+現時点の read-only CLI は親 DB へ pin を書かない。GC 未接続の間も消失を空成功にせず
+明示エラーとする。GC / outputs / output planner の完成を本ログ経路だけで意味しない。

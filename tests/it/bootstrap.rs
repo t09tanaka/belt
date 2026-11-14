@@ -1537,3 +1537,301 @@ async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
     drop(owner);
     shutdown(&client).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git() {
+    use remote_task_runner::ids::{AttemptId, Digest, RunId, TaskId};
+    use remote_task_runner::state::AttemptState;
+    use remote_task_runner::storage::NewAttempt;
+    use remote_task_runner::wire::LogStream;
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let (root, spec, _) = control_fixture();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let attempt = AttemptId::generate();
+    let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+    owner
+        .create_run(
+            &run,
+            None,
+            None,
+            &serde_json::json!({"secret":"NO_LOG_PAYLOAD"}),
+            1,
+        )
+        .unwrap();
+    owner
+        .create_task(&task, &run, &serde_json::json!({}), 1)
+        .unwrap();
+    owner
+        .create_attempt(
+            NewAttempt {
+                attempt_id: attempt.clone(),
+                task_id: task.clone(),
+                worker_id: spec.worker_id.clone(),
+                payload_hash: Digest::of_bytes(b"p"),
+                permit_id: None,
+            },
+            2,
+        )
+        .unwrap();
+    for state in [
+        AttemptState::Preparing,
+        AttemptState::Ready,
+        AttemptState::Starting,
+        AttemptState::Active,
+    ] {
+        owner.transition_attempt(&attempt, state, 3).unwrap();
+    }
+    let files =
+        remote_task_runner::results::store::ResultStore::open(&spec.state_dir.join("results"))
+            .unwrap();
+    owner
+        .prepare_log_progress(&attempt, LogStream::Stdout, 3)
+        .unwrap();
+    files
+        .append_log(&attempt, LogStream::Stdout, 0, b"\xff\0active")
+        .unwrap();
+    owner
+        .commit_log_progress(&attempt, LogStream::Stdout, 0, 8, false, false, 0, 4)
+        .unwrap();
+    let epoch = owner.epoch();
+    drop(owner);
+    let mut snapshot = tokio::process::Command::new(&spec.executable);
+    snapshot
+        .args(["logs", task.as_str()])
+        .env_clear()
+        .envs(&spec.env)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path());
+    let output = tokio::time::timeout(Duration::from_secs(10), snapshot.output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"\xff\0active");
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "logs", task.as_str(), "--follow"])
+        .env_clear()
+        .envs(&spec.env)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
+    let mut first = String::new();
+    tokio::time::timeout(Duration::from_secs(10), stdout.read_line(&mut first))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.is_empty());
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(130));
+    let mut rest = Vec::new();
+    stdout.read_to_end(&mut rest).await.unwrap();
+    let all = [first.as_bytes(), rest.as_slice()].concat();
+    let records = all
+        .split(|b| *b == b'\n')
+        .filter(|s| !s.is_empty())
+        .map(|s| serde_json::from_slice::<serde_json::Value>(s).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        records
+            .iter()
+            .filter(|r| r["data"]["kind"] == "final")
+            .count(),
+        1
+    );
+    assert_eq!(records.last().unwrap()["data"]["summary"]["detached"], true);
+    let reader = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert_eq!(reader.epoch(), epoch);
+    assert!(reader.task_cancel_requested(&task).unwrap().is_none());
+    assert!(reader
+        .get_attempt(&attempt)
+        .unwrap()
+        .unwrap()
+        .cancel_requested_at_ms
+        .is_none());
+    assert!(!spec.state_dir.join("parent").exists());
+    drop(reader);
+    let owner = CoordinatorStore::open(&spec.state_dir, 5).unwrap();
+    let bytes = vec![b'x'; 1024 * 1024];
+    files
+        .append_log(&attempt, LogStream::Stdout, 8, &bytes)
+        .unwrap();
+    owner
+        .commit_log_progress(
+            &attempt,
+            LogStream::Stdout,
+            8,
+            8 + bytes.len() as u64,
+            false,
+            false,
+            0,
+            6,
+        )
+        .unwrap();
+    drop(owner);
+    let mut blocked = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "logs", task.as_str(), "--follow"])
+        .env_clear()
+        .envs(&spec.env)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = blocked.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    let mut unconsumed = tokio::io::BufReader::new(blocked.stdout.take().unwrap());
+    let mut first = String::new();
+    tokio::time::timeout(Duration::from_secs(10), unconsumed.read_line(&mut first))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!first.is_empty());
+    // Deliberately stop reading while an encoded 64-KiB chunk fills the pipe.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(blocked.try_wait().unwrap().is_none());
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    // wait() does NOT drain stdout. Detach must finish even with no consumer.
+    let status = tokio::time::timeout(Duration::from_secs(3), blocked.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert!(CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .task_cancel_requested(&task)
+        .unwrap()
+        .is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_logs_closed_run_final_blocked_stdout_still_detaches() {
+    use remote_task_runner::ids::RunId;
+    use std::os::fd::OwnedFd;
+    let (root, spec, _) = control_fixture();
+    let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+    let run = RunId::generate();
+    owner
+        .create_run(&run, None, None, &serde_json::json!({}), 1)
+        .unwrap();
+    owner.close_run(&run, 2).unwrap();
+    let epoch = owner.epoch();
+    drop(owner);
+    // This closed no-work run emits no status/chunk records: its only stdout
+    // operation is final. Prefill an owned socket so that final cannot finish.
+    let (_unconsumed, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    let buffer = [0_u8; 16384];
+    let mut filled = 0;
+    loop {
+        match writer.write(&buffer) {
+            Ok(n) => {
+                assert!(n > 0);
+                filled += n;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("prefill stdout: {error}"),
+        }
+    }
+    assert!(filled > 0);
+    writer.set_nonblocking(false).unwrap();
+    let stdout: OwnedFd = writer.into();
+    let temporary = root.path().join("reader-tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut child = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "logs", run.as_str(), "--follow"])
+        .env_clear()
+        .envs(&spec.env)
+        .env("TMPDIR", &temporary)
+        .env("PATH", "/no-programs")
+        .current_dir(root.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            assert!(child.try_wait().unwrap().is_none());
+            if std::fs::read_dir(&temporary).unwrap().next().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    // Allow the empty, read-only sweep to reach its sole final write.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(child.try_wait().unwrap().is_none());
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    assert_eq!(
+        std::fs::read_dir(&temporary).unwrap().count(),
+        0,
+        "cursor directory leaked during blocked final detach"
+    );
+}

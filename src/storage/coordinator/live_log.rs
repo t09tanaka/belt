@@ -12,7 +12,7 @@ use crate::wire::LogStream;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LogProgress {
     pub committed_bytes: u64,
     pub eof: bool,
@@ -137,6 +137,41 @@ impl CoordinatorStore {
     ) -> Result<Option<LogProgress>> {
         let attempt = attempt.to_string();
         self.db.call(move |c| load(c, &attempt, stream_key(stream)))
+    }
+
+    /// Read only bounded scalar metadata, including final receipts from older
+    /// schemas. Never deserialize the potentially large collection logs_json.
+    pub fn query_log_progress(
+        &self,
+        attempt: &AttemptId,
+        stream: LogStream,
+    ) -> Result<Option<LogProgress>> {
+        let attempt = attempt.to_string();
+        let collections = self.collections;
+        self.db.call(move |c| {
+            let live: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='collection_log')", [], |r| r.get(0))?;
+            if live {
+                if let Some(progress) = load(c, &attempt, stream_key(stream))? {
+                    return Ok(Some(progress));
+                }
+            }
+            if !collections { return Ok(None); }
+            // A normal two-stream final receipt is well below this bound.
+            // Check byte length before JSON functions can allocate a parse tree
+            // for a corrupt or unexpectedly huge legacy receipt.
+            let oversized: bool = c.query_row("SELECT EXISTS(SELECT 1 FROM collection WHERE attempt_id=?1 AND octet_length(logs_json)>4096)", [&attempt], |r|r.get(0))?;
+            if oversized {return Err(StorageError::Corrupt("oversized legacy log receipt".into()));}
+            let path = format!("$.{}", stream_key(stream));
+            let row = c.query_row(
+                "SELECT json_extract(logs_json,?2||'.bytes'),json_extract(logs_json,?2||'.complete'),json_extract(logs_json,?2||'.log_truncated'),json_extract(logs_json,?2||'.dropped_bytes') FROM collection WHERE attempt_id=?1 AND logs_json IS NOT NULL",
+                params![attempt,path], |r| Ok((r.get::<_,Option<i64>>(0)?,r.get::<_,Option<bool>>(1)?,r.get::<_,Option<bool>>(2)?,r.get::<_,Option<i64>>(3)?))
+            ).optional()?;
+            match row {
+                Some((Some(bytes),Some(eof),Some(truncated),Some(dropped))) => Ok(Some(LogProgress{committed_bytes:to_u64(bytes)?,eof,log_truncated:truncated,dropped_bytes:to_u64(dropped)?,updated_at_ms:0})),
+                None | Some((None,None,None,None)) => Ok(None),
+                _ => Err(StorageError::Corrupt("invalid final log metadata".into())),
+            }
+        })
     }
 
     /// Atomically register the GC reference BEFORE any filesystem creation.

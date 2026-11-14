@@ -1784,6 +1784,26 @@ async fn active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_
     assert!(c.store().collection(&a).unwrap().is_none());
     assert!(!is_collected(&c, &a));
     assert!(fx.w.acks(&a).is_empty());
+    // The same public observer used by CLI follow sees active committed bytes
+    // before termination, and keeps waiting rather than treating file EOF as done.
+    let task = c.store().get_attempt(&a).unwrap().unwrap().task_id;
+    let mut observer = remote_task_runner::service::logs::Observer::new(
+        remote_task_runner::service::query::Reader::Offline(Arc::new(
+            CoordinatorStore::open_read_only(fx.dir.path()).unwrap(),
+        )),
+        fx.dir.path().join("results"),
+        remote_task_runner::service::completion::Target::Task(task),
+        None,
+    )
+    .unwrap();
+    let (mut visible, mut diagnostics) = (Vec::new(), Vec::new());
+    assert!(tokio::time::timeout(
+        Duration::from_millis(300),
+        observer.observe(true, false, &mut visible, &mut diagnostics)
+    )
+    .await
+    .is_err());
+    assert_eq!(visible, &raw[..4]);
     // Reopening uses the DB prefix, not the physical length, including a
     // durable append that never reached its paired DB commit.
     files
@@ -1829,6 +1849,16 @@ async fn active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_
     assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
     assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), raw);
     assert_eq!(fx.w.acks(&a).len(), 1);
+    let summary = tokio::time::timeout(
+        Duration::from_secs(5),
+        observer.observe(true, false, &mut visible, &mut diagnostics),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(visible, raw);
+    assert_eq!(summary.pending_tasks, 0);
+    assert_eq!(summary.failed_tasks, 0);
 }
 
 #[tokio::test]

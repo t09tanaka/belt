@@ -5,6 +5,7 @@ pub mod context;
 pub mod control;
 mod forward;
 pub mod input;
+pub mod logs;
 pub mod macos;
 pub mod query;
 pub mod resident;

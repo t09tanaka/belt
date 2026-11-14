@@ -135,6 +135,9 @@ pub struct LogsArgs {
     /// Keep streaming.
     #[arg(long)]
     pub follow: bool,
+    /// Read a specific historical attempt belonging to the task.
+    #[arg(long)]
+    pub attempt: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -268,6 +271,10 @@ pub fn run(cli: Cli) -> i32 {
         )
     {
         return run_control(&cli);
+    }
+
+    if let Command::Logs(args) = &cli.command {
+        return crate::service::logs::command(args, cli.json);
     }
 
     if matches!(cli.command, Command::Ls(_) | Command::Show(_)) {
