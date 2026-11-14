@@ -11,8 +11,18 @@ use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct Guard {
-    _file: Arc<File>,
+    _file: Arc<LockedFile>,
     pub(crate) root: PathBuf,
+}
+#[derive(Debug)]
+struct LockedFile(File);
+impl Drop for LockedFile {
+    fn drop(&mut self) {
+        // A concurrent fork can retain this open file description until exec.
+        // Release the lock when the last guard ends, even while that inherited
+        // descriptor remains open; cloned guards still share this lifetime.
+        let _ = self.0.unlock();
+    }
 }
 #[derive(Debug, Clone)]
 pub(crate) struct Index {
@@ -190,7 +200,7 @@ impl Index {
             .sync_all()
             .context("sync source mutation parent")?;
         Ok(Guard {
-            _file: Arc::new(file),
+            _file: Arc::new(LockedFile(file)),
             root: self.path.clone(),
         })
     }
@@ -1170,7 +1180,7 @@ mod tests {
             });
             let named = std::fs::symlink_metadata(index.path.join("mutation.lock")).unwrap();
             for guard in &guards {
-                let opened = guard._file.metadata().unwrap();
+                let opened = guard._file.0.metadata().unwrap();
                 assert_eq!((opened.dev(), opened.ino()), (named.dev(), named.ino()));
             }
             assert!(index.guard(true).is_err());
@@ -1288,7 +1298,26 @@ mod tests {
         std::fs::create_dir(root).unwrap();
         assert!(f.store.mutation_guard().is_err());
         assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
-        assert_eq!(retained._file.metadata().unwrap().nlink(), 1);
+        assert_eq!(retained._file.0.metadata().unwrap().nlink(), 1);
+    }
+    #[test]
+    fn last_guard_unlocks_even_when_an_inherited_descriptor_remains_open() {
+        let f = Fixture::new();
+        for exclusive in [false, true] {
+            let guard = f.store.retention.guard(exclusive).unwrap();
+            let inherited = guard._file.0.try_clone().unwrap();
+            let cloned = guard.clone();
+            drop(guard);
+            assert!(f.store.retention.guard(true).is_err());
+            let independent = (!exclusive).then(|| f.store.mutation_guard().unwrap());
+            drop(cloned);
+            if independent.is_some() {
+                assert!(f.store.retention.guard(true).is_err());
+            }
+            drop(independent);
+            assert!(f.store.retention.guard(true).is_ok());
+            drop(inherited);
+        }
     }
     #[test]
     #[ignore = "owned SQLite lock probe subprocess"]

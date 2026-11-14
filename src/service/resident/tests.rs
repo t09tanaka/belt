@@ -1399,7 +1399,7 @@ async fn offline_submit_publishes_reader_pin_before_immediate_logs_follow() {
 #[tokio::test]
 async fn capability_private_ipc_prevents_old_owner_from_discarding_requirements() {
     use crate::toolchain::capability::ExecutionRequirements;
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
     let socket = root.path().join("old-owner.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let client = Client {
