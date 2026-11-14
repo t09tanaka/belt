@@ -198,7 +198,8 @@ async fn a02_a_worker_that_joins_takes_the_backlog_the_parent_kept() {
     assert_eq!(recorded[0]["decision"]["why"]["kind"], "no_candidate");
 
     let b = f.worker("w-b", (1, 1));
-    c.attach(b.id.clone(), Arc::clone(&b) as Arc<dyn WorkerLink>);
+    c.attach(b.id.clone(), Arc::clone(&b) as Arc<dyn WorkerLink>)
+        .await;
     let report = c.tick().await.unwrap();
     assert_eq!(report.placed.len(), 2);
     assert!(queued(&c).is_empty());
@@ -227,10 +228,11 @@ impl CostModel for JoinsMidway {
         if !*joined {
             *joined = true;
             let c = self.coordinator.get().unwrap();
-            c.attach(
+            c.try_attach(
                 self.late.id.clone(),
                 Arc::clone(&self.late) as Arc<dyn WorkerLink>,
-            );
+            )
+            .unwrap();
         }
         Costs::default()
     }
@@ -296,7 +298,8 @@ async fn busy_and_cold(cold_setup_ms: u64) -> (Fx, Coordinator, Arc<FakeWorker>,
         busy.start(&only(&c, &t).attempt_id);
     }
     c.tick().await.unwrap();
-    c.attach(cold.id.clone(), Arc::clone(&cold) as Arc<dyn WorkerLink>);
+    c.attach(cold.id.clone(), Arc::clone(&cold) as Arc<dyn WorkerLink>)
+        .await;
     let task = enqueue(&c, 1).await.remove(0);
     c.tick().await.unwrap();
     let d = reason(&c, &only(&c, &task).attempt_id);
@@ -977,7 +980,8 @@ async fn tasks_every_worker_is_excluded_for_do_not_keep_newer_ones_from_being_pl
         assert!(all[0].retired && all[0].termination.is_none());
     }
     // A worker that joins later takes the oldest of them.
-    c.attach(b.id.clone(), Arc::clone(&b) as Arc<dyn WorkerLink>);
+    c.attach(b.id.clone(), Arc::clone(&b) as Arc<dyn WorkerLink>)
+        .await;
     let report = c.tick().await.unwrap();
     assert_eq!(report.placed.len(), 1);
     let moved = attempts(&c, &tasks[0]);

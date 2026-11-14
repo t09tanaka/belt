@@ -52,7 +52,7 @@
 この計画を進捗と追加変更の基準とする。完成に必要な不足が判明したら、理由・担当・検証条件・依存を追記する。実装済みの部品と、利用者が実際に使う経路への接続は区別し、接続と受入検証が終わるまで担当行を完了にしない。
 
 - S0〜S14 と S17（PR #38、merge `9a9abc8`）は main に統合済み。S17 の検証対象 `279449b` はローカル実行 9 ジョブとリモート 9 ジョブが成功。S15 以降の接続と、追加検証で見つかった回復・テストの問題を別変更で進める。
-- S15 は以下の小さい PR に分ける。S15a は S17 を起点に実装を先行できるが、公開・統合前に S17 の統合結果へ載せ直す。S15b の library 常駐基盤も実装・独立レビュー済みであり、別 process の bootstrap と CLI 接続は S15c で検証する。独立した修正・調査は担当を分け、設計と統合は親担当が行う。
+- S15 は以下の小さい PR に分ける。S15a は S17 の統合結果へ載せ直し、PR #40 で本流へ統合済み。S15b の library 常駐基盤も実装・独立レビュー済みであり、別 process の bootstrap と CLI 接続は S15c で検証する。独立した修正・調査は担当を分け、設計と統合は親担当が行う。
 - 検証はコミット済み HEAD に対する `local-ci run --include-disabled` を基準とし、対象 SHA、コードの失敗、環境エラー、未再現の範囲、リモート CI の結果を分ける。共有ツールが原因なら、そのツールで修正・検証・公開した後、RTR の利用版を別変更で追従する。
 
 | 追加行 | 担当 | 必要になった理由・スコープ | 完了条件 | 依存・状態 |
@@ -74,7 +74,7 @@ F2 は登録と hook を分離する案も調査したが、`core.hooksPath` の
 
 | 行 | スコープ | 完了条件 | 依存・状態 |
 |---|---|---|---|
-| S15a | 設定から Coordinator・Scheduler・Agent・Setup への checked 変換、検証済み worker identity と priority、`TaskSpec.setup` の転送、`Machine::with_setup` 必須の共通 factory | 非既定値・単位変換の境界・lease/budget/TTL・identity の不一致・旧 task JSON・setup payload 転送・factory の関連テスト | 実装・独立レビュー・関連検証済み。S17 統合後の載せ直しと全体 CI 待ち |
+| S15a | 設定から Coordinator・Scheduler・Agent・Setup への checked 変換、検証済み worker identity と priority、`TaskSpec.setup` の転送、`Machine::with_setup` 必須の共通 factory | 非既定値・単位変換の境界・lease/budget/TTL・identity の不一致・旧 task JSON・setup payload 転送・factory の関連テスト | PR #40 を merge `8939ef25c877448f3ae428caf6f666bebd6afad3` で統合済み。対象 `87f8df2` は Rust 1.100 のローカル実行 9 ジョブ成功（native installers は未検証）、リモート 9 ジョブ成功（Linux・macOS・MSRV 1.89） |
 | S15b | 親の常駐 loop、local worker、hello 検証済み remote link、再接続、独立した回収 loop、単一の ResultStore、ローカル IPC | 呼出元 CLI 終了後も durable task が実行・回収され、再起動で同じ attempt を引き継ぐ。遅い回収が lease 更新を止めない | S15a |
 | S15c | `init`・source/secret capture と durable `submit`・`ls`・`show`、run/task の問い合わせ API | 同時 CLI でも coordinator epoch が増殖しない。capture 失敗時は配置せず、完了済み run も正しく列挙する。JSON と stderr の契約を検証 | S15b、起動方式は S22 と整合 |
 | S15d | `exec`・`wait`・`cancel`・Ctrl-C・明示 `retry`・local-only `--in-place` | exit code を透過し、停止不明を cancelled にしない。unknown の retry を拒否し、元 snapshot と履歴を保つ。in-place を remote に配置しない | S15c |
@@ -170,3 +170,12 @@ reuse the combined parent's `daemon --input` role. Parent remote-link attachment
 and per-worker source/secret routing are separate required slices: the existing
 resident source and secret delivery paths still target its local worker. A public
 standalone worker does not by itself establish remote end-to-end execution.
+
+
+### Resident source-ready gate slice
+
+`SubmitCaptured` の `Accepted` は run/task が durable queue に記録された意味とし、worker の source 受領や `WorkerAccepted` receipt とは区別する。local resident も source IO を独立した bounded background job へ移し、実際の worker `BlobVerify.ready` 後だけ new placement を許可する。接続ごとの volatile cache は最大 64 run とし、run/source/manifest digest と connection generation が一致した forecast だけを commit に使う。queued/live の metadata scan と secret delivery は keyset page、eligible run/worker union は SQLite `json_each` を使う。未評価 cache entry は保持し、dispatch 評価済み entry は FIFO eviction で後続 run へ進む。gated dispatch も keyset cursor で同 run 内の大きな backlog を走査し、filtered page で既存 waiting state を消さない。
+
+source export/upload の共有 transfer lease と cleanup は background job 間で維持する。admission は network や transfer mutex を待たない。停止後の残 IO は capture store と lease だけを保持し、旧 coordinator owner を保持しない。secrets は既存 attempt/generation へ配置後に送り、worker の Preparing/lease gate を維持する。local に事前配置した legacy source も再起動後に worker verification で Ready を再構築する。
+
+この slice は local resident と再利用できる per-worker delivery helper まで。verified remote の SSH 接続・再接続 owner、worker add/install・鍵登録・native service、実 remote source/secret routing と SSH/native end-to-end acceptance は次 slice の必須残件で、S15b 以降と S22 の完了を意味しない。schema migration は不要。

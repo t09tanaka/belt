@@ -84,7 +84,7 @@ async fn put_file(
     anyhow::ensure!(answer.complete, "source transfer incomplete");
     Ok(())
 }
-async fn verify(
+pub(super) async fn verify(
     client: &Client,
     source: &SourceId,
     stop: &mut watch::Receiver<bool>,

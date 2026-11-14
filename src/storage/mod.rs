@@ -25,9 +25,9 @@ mod worker;
 
 pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
 pub use coordinator::{
-    ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, LiveAttempt,
-    NewAttempt, Permit, PlaceInput, PlaceOutcome, Placement, QueuedTask, ResultRef, RetireEnd,
-    RunStanding, Seen, WorkerLoad,
+    ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, InputCursor,
+    InputPage, LiveAttempt, LiveAttemptPage, NewAttempt, Permit, PlaceInput, PlaceOutcome,
+    Placement, QueuedTask, ResultRef, RetireEnd, RunStanding, Seen, WorkerLoad,
 };
 pub use db::Db;
 pub use lock::ProcessLock;

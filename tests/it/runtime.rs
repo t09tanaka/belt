@@ -156,12 +156,14 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
         WorkerTarget::Local(&local),
         connected(&c, "local").await,
     )
+    .await
     .unwrap();
     cfg.attach_worker(
         &c,
         WorkerTarget::Remote("remote"),
         connected(&c, "remote").await,
     )
+    .await
     .unwrap();
     assert_eq!(c.scheduler().priority_of(&local), -9);
     assert_eq!(c.scheduler().priority_of(&remote), 21);
@@ -174,6 +176,7 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
     ] {
         assert!(cfg
             .attach_worker(&c, target, connected(&c, "other").await)
+            .await
             .is_err());
     }
     assert_eq!(c.scheduler().priority_of(&other), 0);
@@ -190,6 +193,7 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
             WorkerTarget::Local(&local),
             connected(&foreign, "local").await
         )
+        .await
         .is_err());
     cfg.local_worker.value = false;
     assert!(cfg
@@ -198,6 +202,7 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
             WorkerTarget::Local(&local),
             connected(&c, "local").await
         )
+        .await
         .is_err());
     assert_eq!(c.scheduler().priority_of(&local), -9);
 }

@@ -23,6 +23,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
+mod delivery;
+
 pub const MAX_REQUEST_BYTES: usize = 262_144;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -35,7 +37,7 @@ pub struct Inputs {
 }
 
 /// Private, versioned IPC. Clients capture into the configured private parent stores.
-/// SubmitCaptured forwards that immutable input; legacy Submit accepts prepositioned
+/// SubmitCaptured durably queues that immutable input; legacy Submit accepts prepositioned
 /// local sources only and explicitly refuses secret-bearing tasks.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -216,6 +218,7 @@ pub struct Resident {
     sources: crate::source::SourceStore,
     captured: Arc<CapturedInputs>,
     worker_client: crate::protocol::Client,
+    input_gate: Arc<crate::coordinator::InputGate>,
     worker_id: WorkerId,
     listener: UnixListener,
     worker_connection: tokio::task::JoinHandle<()>,
@@ -238,6 +241,7 @@ struct StartupParts {
     worker_id: WorkerId,
     cluster: ClusterId,
     heartbeat: Duration,
+    worker_timeout: Duration,
     collection_interval: Duration,
     collection: CollectConfig,
 }
@@ -304,6 +308,7 @@ impl StartupParts {
             token,
             worker_id,
             heartbeat: Duration::from_millis(settings.heartbeat_ms),
+            worker_timeout: Duration::from_millis(settings.coordinator.worker_budget_ms),
             collection_interval: inputs.collection_interval,
             collection: inputs.collection,
         })
@@ -374,11 +379,14 @@ async fn connect_local(
         }
     };
     let worker_client = connected.client.clone();
-    if let Err(e) = config.attach_worker(
-        &parts.coordinator,
-        WorkerTarget::Local(&parts.worker_id),
-        connected,
-    ) {
+    if let Err(e) = config
+        .attach_worker(
+            &parts.coordinator,
+            WorkerTarget::Local(&parts.worker_id),
+            connected,
+        )
+        .await
+    {
         worker_connection.abort();
         anyhow::bail!(e.message);
     }
@@ -419,6 +427,18 @@ impl Resident {
             }
         };
         let parts = startup.parts.take().expect("prepared startup");
+        let input_gate = Arc::new(crate::coordinator::InputGate::default());
+        parts
+            .coordinator
+            .attach(
+                parts.worker_id.clone(),
+                Arc::new(crate::coordinator::ClientLink::gated(
+                    worker_client.clone(),
+                    parts.worker_timeout,
+                    input_gate.clone(),
+                )),
+            )
+            .await;
         Ok(Self {
             coordinator: parts.coordinator,
             files: parts.files,
@@ -426,6 +446,7 @@ impl Resident {
             sources: parts.sources,
             captured: parts.captured,
             worker_client,
+            input_gate,
             worker_id: parts.worker_id,
             listener,
             worker_connection,
@@ -486,46 +507,22 @@ impl Resident {
                 tokio::task::spawn_blocking(move || agent.supervise()).await?;
             }
         });
-        let coordinator = self.coordinator.clone();
-        let captured = self.captured.clone();
-        let worker_client = self.worker_client.clone();
-        let worker_id = self.worker_id.clone();
-        let mut secret_stop = rx.clone();
-        loops.spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_millis(100));
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut sent = std::collections::BTreeSet::new();
-            let mut next = 0usize;
-            loop {
-                tokio::select! { _ = secret_stop.changed() => return Ok(()), _ = timer.tick() => {} }
-                let owner = coordinator.clone(); let worker = worker_id.clone();
-                let attempts = tokio::task::spawn_blocking(move || owner.store().live_attempts(Some(&worker))).await??;
-                let active: std::collections::BTreeSet<_> = attempts.iter().map(|a| a.record.attempt_id.clone()).collect();
-                sent.retain(|id| active.contains(id));
-                let start = next.min(attempts.len());
-                next = if start.saturating_add(16) >= attempts.len() { 0 } else { start + 16 };
-                for attempt in attempts.into_iter().skip(start).take(16) {
-                    let Some(placement) = attempt.placement else { continue; };
-                    let payload: crate::wire::AttemptPayload = serde_json::from_value(placement.demand["payload"].clone())?;
-                    if !payload.has_secret_bundle || sent.contains(&attempt.record.attempt_id) { continue; }
-                    let capture = captured.clone(); let run = payload.run_id.clone(); let source = payload.source_id.clone();
-                    let bundle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                        let id = crate::source::classify::ci_id_of(&source).ok_or_else(|| anyhow::anyhow!("invalid source"))?;
-                        let manifest = capture.sources.manifest(&id)?.ok_or_else(|| anyhow::anyhow!("input source unavailable"))?;
-                        Ok(capture.vault.load(&run, &manifest.secret_files, &capture.key)?)
-                    }).await?;
-                    // Missing/tampered bundles never become an empty bundle. The worker's
-                    // secret gate eventually reports SECRET_UNAVAILABLE without running.
-                    let Ok(bundle) = bundle else { continue; };
-                    let delivered = tokio::select! {
-                        _ = secret_stop.changed() => return Ok(()),
-                        result = crate::secrets::send::send_bundle(&worker_client, &bundle,
-                            coordinator.epoch(), &attempt.record.attempt_id, attempt.record.generation, IO_TIMEOUT) => result.is_ok(),
-                    };
-                    if delivered { sent.insert(attempt.record.attempt_id); }
-                }
-            }
-        });
+        loops.spawn(delivery::sources(
+            self.coordinator.clone(),
+            self.captured.clone(),
+            self.worker_client.clone(),
+            self.worker_id.clone(),
+            self.input_gate.clone(),
+            rx.clone(),
+        ));
+        loops.spawn(delivery::secrets(
+            self.coordinator.clone(),
+            self.captured.clone(),
+            self.worker_client.clone(),
+            self.worker_id.clone(),
+            self.input_gate.clone(),
+            rx.clone(),
+        ));
         let permits = Arc::new(Semaphore::new(32));
         // Serializes acceptance with shutdown, not with placement/collection.
         let admission = Arc::new(Mutex::new(false));
@@ -786,7 +783,7 @@ async fn handle(
                 source_id,
                 tasks,
             } => {
-                // Transfer can be slow; admission/shutdown and other RPCs stay responsive.
+                // Capture validation runs outside admission; delivery is a background job.
                 drop(gate);
                 let source = source_id.clone();
                 let run = run_id.clone();
@@ -830,24 +827,6 @@ async fn handle(
                             && task.has_secret_bundle == has_secrets),
                         "source digest mismatch"
                     );
-                    let transfer=tokio::select! {
-                        biased;
-                        _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
-                        transfer=captured.transfer.clone().lock_owned()=>transfer,
-                    };
-                    let source=source_id.clone(); let store=captured.sources.clone();
-                    let env=captured.env.clone(); let worker=worker_client.clone();
-                    let epoch=coordinator.epoch(); let transfer_stop=stopping.clone();
-                    // A detached transfer owns only source IO and its locks. It drains any
-                    // current blocking operation before cleanup, never coordinator ownership.
-                    let forwarding=tokio::spawn(async move {
-                        super::forward::source(&worker,epoch,store,&source,env,transfer_stop,transfer).await
-                    });
-                    tokio::select! {
-                        biased;
-                        _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
-                        forwarded=forwarding=>forwarded??,
-                    }
                     let guard = admission.lock().await;
                     anyhow::ensure!(!*guard && !coordinator.is_fenced(), "resident is stopping");
                     let owner = coordinator.clone();

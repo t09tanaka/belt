@@ -23,7 +23,10 @@ mod control;
 pub mod query;
 mod queue;
 pub use collect::{Collectable, CollectionRow, ResultRef, RunStanding};
-pub use queue::{LiveAttempt, PlaceInput, PlaceOutcome, QueuedTask, RetireEnd, Seen, WorkerLoad};
+pub use queue::{
+    InputCursor, InputPage, LiveAttempt, LiveAttemptPage, PlaceInput, PlaceOutcome, QueuedTask,
+    RetireEnd, Seen, WorkerLoad,
+};
 
 const ATTEMPT: &str = "attempt";
 

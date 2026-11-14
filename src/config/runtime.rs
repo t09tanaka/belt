@@ -35,7 +35,7 @@ pub enum WorkerTarget<'a> {
 impl ResolvedConfig {
     /// Only a completed protocol handshake can enter this construction path.
     /// Identity mismatches leave both the scheduler and attached links untouched.
-    pub fn attach_worker(
+    pub async fn attach_worker(
         &self,
         coordinator: &Coordinator,
         target: WorkerTarget<'_>,
@@ -73,13 +73,15 @@ impl ResolvedConfig {
             }
         };
         coordinator.scheduler().set_priority(id, priority);
-        coordinator.attach(
-            id.clone(),
-            Arc::new(ClientLink::new(
-                connected.client,
-                Duration::from_millis(settings.coordinator.worker_budget_ms),
-            )),
-        );
+        coordinator
+            .attach(
+                id.clone(),
+                Arc::new(ClientLink::new(
+                    connected.client,
+                    Duration::from_millis(settings.coordinator.worker_budget_ms),
+                )),
+            )
+            .await;
         Ok(())
     }
 }

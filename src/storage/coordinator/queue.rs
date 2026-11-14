@@ -41,9 +41,16 @@ const EXCLUDES: &str = "a.retired = 1";
 pub struct QueuedTask {
     pub task_id: TaskId,
     pub run_id: RunId,
+    pub source_id: Option<SourceId>,
     pub spec: Value,
     pub created_at_ms: u64,
+    pub queue_rowid: i64,
 }
+
+/// Stable insertion-order cursor for fixed-size input and attempt scans.
+pub type InputCursor = (u64, i64);
+pub type InputPage = Vec<(InputCursor, QueuedTask)>;
+pub type LiveAttemptPage = Vec<(InputCursor, LiveAttempt)>;
 
 /// The attempts of one worker that hold a slot: not terminal and not
 /// confirmed retired. `active` may be running a command (`starting` onward);
@@ -229,6 +236,36 @@ impl CoordinatorStore {
         workers: &[WorkerId],
         retire_reason: &str,
     ) -> Result<Vec<QueuedTask>> {
+        self.queued_tasks_eligible(limit, workers, retire_reason, None)
+    }
+
+    pub fn queued_tasks_eligible(
+        &self,
+        limit: u32,
+        workers: &[WorkerId],
+        retire_reason: &str,
+        eligible: Option<&[RunId]>,
+    ) -> Result<Vec<QueuedTask>> {
+        self.queued_tasks_scan(limit, workers, retire_reason, eligible, None)
+    }
+
+    pub fn queued_tasks_ready_page(
+        &self,
+        limit: u32,
+        eligible: &[RunId],
+        after: Option<InputCursor>,
+    ) -> Result<Vec<QueuedTask>> {
+        self.queued_tasks_scan(limit, &[], "", Some(eligible), after)
+    }
+
+    fn queued_tasks_scan(
+        &self,
+        limit: u32,
+        workers: &[WorkerId],
+        retire_reason: &str,
+        eligible: Option<&[RunId]>,
+        after: Option<InputCursor>,
+    ) -> Result<Vec<QueuedTask>> {
         use rusqlite::types::Value as Sql;
         let queued = if self.task_cancel { QUEUED } else { QUEUED_V1 };
         let mut args = vec![Sql::Integer(i64::from(limit))];
@@ -237,20 +274,44 @@ impl CoordinatorStore {
         } else {
             args.push(Sql::Text(retire_reason.to_string()));
             args.push(Sql::Integer(to_i64(workers.len() as u64)?));
-            args.extend(workers.iter().map(|w| Sql::Text(w.to_string())));
-            let marks: Vec<String> = (0..workers.len()).map(|i| format!("?{}", i + 4)).collect();
-            let marks = marks.join(",");
+            args.push(Sql::Text(
+                serde_json::to_string(&workers.iter().map(ToString::to_string).collect::<Vec<_>>())
+                    .map_err(|e| StorageError::Invalid(e.to_string()))?,
+            ));
             format!(
                 "(SELECT COUNT(DISTINCT a.worker_id) FROM attempt a
                   JOIN retire_tombstone rt ON rt.attempt_id = a.attempt_id
                   WHERE a.task_id = t.task_id AND {EXCLUDES}
-                    AND rt.reason = ?2 AND a.worker_id IN ({marks})) >= ?3, "
+                    AND rt.reason = ?2 AND a.worker_id IN (SELECT value FROM json_each(?4))) >= ?3, "
             )
+        };
+        let filter = if let Some(ids) = eligible {
+            args.push(Sql::Text(
+                serde_json::to_string(&ids.iter().map(ToString::to_string).collect::<Vec<_>>())
+                    .map_err(|e| StorageError::Invalid(e.to_string()))?,
+            ));
+            format!(
+                " AND t.run_id IN (SELECT value FROM json_each(?{}))",
+                args.len()
+            )
+        } else {
+            String::new()
+        };
+        let cursor = if let Some((created, rowid)) = after {
+            let index = args.len() + 1;
+            args.push(Sql::Integer(to_i64(created)?));
+            args.push(Sql::Integer(rowid));
+            format!(
+                " AND (t.created_at_ms>?{index} OR (t.created_at_ms=?{index} AND t.rowid>?{}))",
+                index + 1
+            )
+        } else {
+            String::new()
         };
         self.db.call(move |c| {
             let mut s = c.prepare(&format!(
-                "SELECT t.task_id, t.run_id, t.spec_json, t.created_at_ms FROM task t
-                 WHERE {queued} ORDER BY {stranded}t.created_at_ms, t.rowid LIMIT ?1"
+                "SELECT t.task_id, t.run_id, t.spec_json, t.created_at_ms, (SELECT source_id FROM run r WHERE r.run_id=t.run_id),t.rowid FROM task t
+                 WHERE {queued}{filter}{cursor} ORDER BY {stranded}t.created_at_ms, t.rowid LIMIT ?1"
             ))?;
             let rows = s.query_map(rusqlite::params_from_iter(args), |r| {
                 Ok((
@@ -258,20 +319,62 @@ impl CoordinatorStore {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_,i64>(5)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (task, run, spec, created) = row?;
+                let (task, run, spec, created, source,rowid) = row?;
                 out.push(QueuedTask {
+                    source_id: source.map(|s| id("source_id", SourceId::parse(&s))).transpose()?,
                     task_id: id("task_id", TaskId::parse(&task))?,
                     run_id: id("run_id", RunId::parse(&run))?,
                     spec: from_json("task spec", &spec)?,
                     created_at_ms: to_u64(created)?,
+                    queue_rowid: rowid,
                 });
             }
             Ok(out)
         })
+    }
+
+    /// Fixed-size keyset discovery; neither a stalled oldest source nor queue size
+    /// controls memory use. Live inputs are scanned separately after reconnect.
+    pub fn input_page(
+        &self,
+        after: Option<(u64, i64)>,
+        limit: u32,
+        worker: Option<&WorkerId>,
+    ) -> Result<InputPage> {
+        let predicate = if worker.is_some() {
+            "EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.worker_id=?4 AND a.state <> 'terminal' AND a.retired=0)".to_string()
+        } else {
+            format!(
+                "{} AND ?4 IS NULL",
+                if self.task_cancel { QUEUED } else { QUEUED_V1 }
+            )
+        };
+        let (created, rowid) = after.unwrap_or((0, 0));
+        let created = to_i64(created)?;
+        let worker = worker.map(ToString::to_string);
+        self.db.call(move |c| {
+            let mut query = c.prepare(&format!("SELECT t.task_id,t.run_id,t.spec_json,t.created_at_ms,t.rowid,r.source_id FROM task t JOIN run r ON r.run_id=t.run_id JOIN source_ref sr ON sr.source_id=r.source_id WHERE json_extract(t.spec_json,'$.manifest_digest')=sr.manifest_digest AND {predicate} AND (t.created_at_ms > ?1 OR (t.created_at_ms=?1 AND t.rowid>?2)) ORDER BY t.created_at_ms,t.rowid LIMIT ?3"))?;
+            let rows = query.query_map(params![created,rowid,i64::from(limit.min(64)),worker], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?)))?;
+            rows.map(|row| {
+                let (task,run,spec,created,rowid,source)=row?;
+                let created=to_u64(created)?;
+                Ok(((created,rowid),QueuedTask {task_id:id("task_id",TaskId::parse(&task))?,run_id:id("run_id",RunId::parse(&run))?,source_id:source.map(|s|id("source_id",SourceId::parse(&s))).transpose()?,spec:from_json("task spec",&spec)?,created_at_ms:created,queue_rowid:rowid}))
+            }).collect()
+        })
+    }
+
+    /// A bounded EXISTS check is used for pruning the connection's 64-entry cache.
+    pub fn input_need(&self, run: &RunId, worker: &WorkerId) -> Result<(bool, bool)> {
+        let run = run.to_string();
+        let worker = worker.to_string();
+        let queued = if self.task_cancel { QUEUED } else { QUEUED_V1 };
+        self.db.call(move |c| Ok(c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM task t WHERE t.run_id=?1 AND ({queued})),EXISTS(SELECT 1 FROM attempt a JOIN task t ON t.task_id=a.task_id WHERE t.run_id=?1 AND a.worker_id=?2 AND a.state <> 'terminal' AND a.retired=0)"),params![run,worker],|r|Ok((r.get(0)?,r.get(1)?)))?))
     }
 
     pub fn worker_load(&self, worker_id: &WorkerId) -> Result<WorkerLoad> {
@@ -419,6 +522,43 @@ impl CoordinatorStore {
                     record,
                 });
             }
+            Ok(out)
+        })
+    }
+
+    /// Bounded cache pruning without materializing the worker's complete live set.
+    pub fn live_attempt_subset(
+        &self,
+        worker: &WorkerId,
+        ids: &[AttemptId],
+    ) -> Result<BTreeSet<AttemptId>> {
+        if ids.len() > 64 {
+            return Err(StorageError::Invalid("live subset exceeds 64".into()));
+        }
+        let worker = worker.to_string();
+        let ids = json(&ids);
+        self.db.call(move |c| {
+            let mut query=c.prepare("SELECT attempt_id FROM attempt WHERE worker_id=?1 AND state <> 'terminal' AND retired=0 AND attempt_id IN (SELECT value FROM json_each(?2))")?;
+            let rows=query.query_map(params![worker,ids],|r|r.get::<_,String>(0))?;
+            rows.map(|row|id("attempt_id",AttemptId::parse(&row?))).collect()
+        })
+    }
+
+    pub fn live_attempt_page(
+        &self,
+        worker: &WorkerId,
+        after: Option<(u64, i64)>,
+        limit: u32,
+    ) -> Result<LiveAttemptPage> {
+        let worker = worker.to_string();
+        let (created, rowid) = after.unwrap_or((0, 0));
+        let created = to_i64(created)?;
+        self.db.call(move |c| {
+            let mut query=c.prepare(&format!("SELECT {ATTEMPT_COLS},rowid FROM attempt WHERE worker_id=?1 AND state <> 'terminal' AND retired=0 AND (created_at_ms>?2 OR (created_at_ms=?2 AND rowid>?3)) ORDER BY created_at_ms,rowid LIMIT ?4"))?;
+            let rows=query.query_map(params![worker,created,rowid,i64::from(limit.min(64))], |r| Ok((attempt_from_row(r),r.get::<_,i64>(ATTEMPT_COLS.split(',').count())?)))?;
+            let mut out=Vec::new();
+            for row in rows { let (record,rowid)=row?; let record=record?; let aid=record.attempt_id.to_string(); let cursor=(record.created_at_ms,rowid);
+                out.push((cursor,LiveAttempt {placement:placement_of(c,&aid)?,retire_reason:c.query_row("SELECT reason FROM retire_tombstone WHERE attempt_id=?1 AND confirmed_at_ms IS NULL",[&aid],|r|r.get(0)).optional()?,record})); }
             Ok(out)
         })
     }

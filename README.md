@@ -29,3 +29,11 @@ Its HOME and canonical worker state must match the `worker --stdio` bridge. The
 bridge may disconnect while accepted work and its independent supervisor continue.
 Provisioning and native worker service installation remain required follow-up work;
 this entry point alone does not provide remote enrollment or end-to-end routing.
+
+
+Worker-link attachment is asynchronous: `Coordinator::attach(...).await` installs
+a verified connection after any in-flight placement commit. `detach` and source
+session resets use the same placement ordering. Forecasts remain outside this
+fence, so a worker may still join during a running tick. Synchronous construction
+and cost callbacks can use checked `try_attach`; a busy result installs nothing
+and must be retried or handled, never treated as a successful attachment.

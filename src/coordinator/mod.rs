@@ -23,10 +23,12 @@
 //! completion belongs to the scheduler.
 
 mod collect;
+mod input_gate;
 mod link;
 pub mod policy;
 
-pub use link::{ClientLink, LinkError, WorkerLink};
+pub use input_gate::{PlacementInputs, ReadyInput};
+pub use link::{ClientLink, InputGate, LinkError, WorkerLink};
 
 use crate::error::{ApiError, ConflictReason, ErrorCode};
 use crate::ids::{
@@ -194,6 +196,7 @@ impl TickReport {
 struct Reached {
     worker_id: WorkerId,
     link: Arc<dyn WorkerLink>,
+    attachment: Arc<dyn WorkerLink>,
     limits: Limits,
     draining: bool,
     /// Who answered: a forecast from another boot or agent is not used.
@@ -289,6 +292,8 @@ pub struct Coordinator {
     /// The collections that wait before they are tried again.
     collect_waits: Arc<crate::results::collect::Waits>,
     lease_seq: AtomicU64,
+    input_cursor: Mutex<Option<crate::storage::InputCursor>>,
+    placement_fence: Arc<tokio::sync::Mutex<()>>,
     fenced: AtomicBool,
     /// The queued tasks no payload could be made for, as this process
     /// already recorded.
@@ -331,6 +336,8 @@ impl Coordinator {
             collecting: tokio::sync::Mutex::new(()),
             collect_waits: Arc::default(),
             lease_seq: AtomicU64::new(0),
+            input_cursor: Mutex::default(),
+            placement_fence: Arc::default(),
             fenced: AtomicBool::new(false),
             unplaceable: Mutex::default(),
             sched,
@@ -379,18 +386,36 @@ impl Coordinator {
         }
     }
 
-    /// A worker is reachable through `link` from now on (its `hello` was
-    /// checked by whoever connected). Replaces an earlier link. The next
-    /// placement decision counts it in, also within a running tick.
-    pub fn attach(&self, worker_id: WorkerId, link: Arc<dyn WorkerLink>) {
-        let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
-        workers.insert(worker_id, link);
+    /// Install a verified connection. Replacement is linearized with placement
+    /// commits, without holding up forecasts or blocking the async executor.
+    pub async fn attach(&self, worker_id: WorkerId, link: Arc<dyn WorkerLink>) {
+        let _commit = self.placement_fence.lock().await;
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worker_id, link);
+    }
+
+    /// Nonblocking attachment for synchronous construction and cost callbacks.
+    /// Busy means no connection was installed; callers must handle the result.
+    pub fn try_attach(
+        &self,
+        worker_id: WorkerId,
+        link: Arc<dyn WorkerLink>,
+    ) -> std::result::Result<(), tokio::sync::TryLockError> {
+        let _commit = self.placement_fence.try_lock()?;
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worker_id, link);
+        Ok(())
     }
 
     /// The link is gone. The worker's attempts are `unknown` from here on;
     /// they are kept, and followed again when it is attached again.
     pub async fn detach(&self, worker_id: &WorkerId) -> Result<()> {
         {
+            let _commit = self.placement_fence.lock().await;
             let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
             workers.remove(worker_id);
         }
@@ -531,6 +556,7 @@ impl Coordinator {
         }
         let reached = Reached {
             worker_id,
+            attachment: Arc::clone(&link),
             link,
             limits: self.cfg.limits.stricter(Limits {
                 max_active_task: inspected.max_active_task,
@@ -969,27 +995,83 @@ impl Coordinator {
         // that can be placed. A worker that is attached later is not
         // excluded for them, which puts them back in their place by age.
         let attached: Vec<WorkerId> = round.known.iter().cloned().collect();
+        let eligible = {
+            let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            if workers.is_empty() {
+                None
+            } else {
+                workers
+                    .values()
+                    .try_fold(BTreeSet::new(), |mut ids, link| {
+                        let inputs = link.placement_inputs()?;
+                        ids.extend(inputs.ready.into_iter().map(|i| i.run_id));
+                        Some(ids)
+                    })
+                    .map(|ids| ids.into_iter().collect::<Vec<_>>())
+            }
+        };
+        let filtered = eligible.is_some();
+        let cursor = *self.input_cursor.lock().unwrap_or_else(|e| e.into_inner());
         let queued = self
             .db(move |s| {
-                s.queued_tasks_for(
-                    DISPATCH_SCAN,
-                    &attached,
-                    scheduler::REASON_WORKER_CANNOT_RUN,
-                )
+                if let Some(eligible) = eligible {
+                    s.queued_tasks_ready_page(DISPATCH_SCAN, &eligible, cursor)
+                } else {
+                    s.queued_tasks_eligible(
+                        DISPATCH_SCAN,
+                        &attached,
+                        scheduler::REASON_WORKER_CANNOT_RUN,
+                        None,
+                    )
+                }
             })
             .await?;
-        if queued.len() < DISPATCH_SCAN as usize {
+        if !filtered && queued.len() < DISPATCH_SCAN as usize {
             // The whole queue was read: a task that is not in it waits no
             // more.
             let ids = queued.iter().map(|t| t.task_id.clone()).collect();
             self.sched.keep_waiting(&ids);
         }
+        let page_complete = queued.len() < DISPATCH_SCAN as usize;
+        let mut next_cursor = None;
+        let page_len = queued.len();
+        let mut processed = 0;
         for task in queued {
             self.join_newcomers(&mut round, report).await?;
+            let evaluated: Vec<_> = round
+                .open
+                .iter()
+                .filter_map(|w| {
+                    let snapshot = w.link.placement_inputs()?;
+                    snapshot
+                        .ready
+                        .iter()
+                        .any(|i| {
+                            i.run_id == task.run_id
+                                && Some(&i.source_id) == task.source_id.as_ref()
+                                && task.spec["manifest_digest"].as_str()
+                                    == Some(i.manifest_digest.as_str())
+                        })
+                        .then(|| (Arc::clone(&w.link), snapshot.generation))
+                })
+                .collect();
             self.place_one(&task, &mut round, report).await?;
+            for (link, generation) in evaluated {
+                link.inputs_evaluated(generation, &task.run_id);
+            }
+            processed += 1;
+            next_cursor = Some((task.created_at_ms, task.queue_rowid));
             if round.open.is_empty() || Instant::now() >= round.deadline {
                 break;
             }
+        }
+        if filtered {
+            *self.input_cursor.lock().unwrap_or_else(|e| e.into_inner()) =
+                if page_complete && processed == page_len {
+                    None
+                } else {
+                    next_cursor
+                };
         }
         Ok(())
     }
@@ -1073,6 +1155,22 @@ impl Coordinator {
             // This task only; the ones behind it are placed.
             Err(e) => return self.note_unplaceable(task, format!("task spec: {e}")).await,
         };
+        let readiness = |w: &Reached| match w.link.placement_inputs() {
+            None => Some(None),
+            Some(snapshot) => snapshot
+                .ready
+                .iter()
+                .any(|i| {
+                    i.run_id == task.run_id
+                        && Some(&i.source_id) == task.source_id.as_ref()
+                        && i.manifest_digest == spec.manifest_digest
+                })
+                .then_some(Some(snapshot.generation)),
+        };
+        let ready = |w: &Reached| readiness(w).is_some();
+        if !round.open.is_empty() && !round.open.iter().any(&ready) {
+            return Ok(());
+        }
         let refused = self.refused_by(&task.task_id).await?;
         loop {
             // Who has room, counted from the parent's own record.
@@ -1107,11 +1205,20 @@ impl Coordinator {
             let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = round
                 .open
                 .iter()
+                .filter(|w| ready(w))
                 .partition(|w| !refused.contains(&w.worker_id));
             excluded.extend(left_out.into_iter().map(|w| Excluded {
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::RefusedTask,
             }));
+            let sessions: BTreeMap<_, _> = asked
+                .iter()
+                .filter_map(|w| readiness(w).map(|generation| (w.worker_id.clone(), generation)))
+                .collect();
+            let asked: Vec<_> = asked
+                .into_iter()
+                .filter(|w| sessions.contains_key(&w.worker_id))
+                .collect();
             let mut costs: Vec<decide::Costs> = asked
                 .iter()
                 .map(|w| self.sched.costs(&w.worker_id, task))
@@ -1185,6 +1292,50 @@ impl Coordinator {
             else {
                 return Ok(());
             };
+            // Lock order is registry then source generation. Owned guards move
+            // into the blocking DB closure, so dropping this future cannot let a
+            // connection exchange/reset overtake an already-started commit.
+            let registry_guard = self.placement_fence.clone().lock_owned().await;
+            let source_fence = round
+                .open
+                .iter()
+                .find(|w| w.worker_id == winner)
+                .and_then(|w| w.link.placement_fence());
+            let source_guard = match source_fence {
+                Some(fence) => Some(fence.lock_owned().await),
+                None => None,
+            };
+            if !round
+                .open
+                .iter()
+                .any(|w| w.worker_id == winner && readiness(w) == sessions.get(&winner).copied())
+            {
+                return Ok(());
+            }
+            let same_attachment = {
+                let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+                workers.get(&winner).is_some_and(|current| {
+                    round
+                        .open
+                        .iter()
+                        .any(|w| w.worker_id == winner && Arc::ptr_eq(current, &w.attachment))
+                })
+            };
+            if !same_attachment {
+                return Ok(());
+            }
+            if let Some(Some(generation)) = sessions.get(&winner) {
+                let current = self
+                    .workers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&winner)
+                    .and_then(|link| link.placement_inputs())
+                    .map(|inputs| inputs.generation);
+                if current != Some(*generation) {
+                    return Ok(());
+                }
+            }
             let (t, w, a) = (task.task_id.clone(), winner.clone(), attempt_id.clone());
             let lease_ms = self.cfg.lease_ms;
             let record = json!({
@@ -1194,6 +1345,8 @@ impl Coordinator {
             });
             let outcome = self
                 .db(move |s| {
+                    let _registry_guard = registry_guard;
+                    let _source_guard = source_guard;
                     s.place(
                         &t,
                         &w,

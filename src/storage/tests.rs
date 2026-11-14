@@ -3598,3 +3598,24 @@ fn completion_waits_for_closed_collection_and_preserves_compute_error_precedence
         }
     }
 }
+
+#[test]
+fn eligible_queue_filter_accepts_large_worker_and_run_unions_without_sql_variable_growth() {
+    let (_dir, store, run, tasks) = queue_fx(1);
+    let workers: Vec<_> = (0..2000).map(|i| worker(&format!("worker-{i}"))).collect();
+    let mut runs: Vec<_> = (0..2000).map(|_| RunId::generate()).collect();
+    assert!(store
+        .queued_tasks_eligible(10, &workers, "cannot", Some(&runs))
+        .unwrap()
+        .is_empty());
+    runs.push(run);
+    let queued = store
+        .queued_tasks_eligible(10, &workers, "cannot", Some(&runs))
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].task_id, tasks[0]);
+    assert!(store
+        .queued_tasks_eligible(10, &workers, "cannot", Some(&[]))
+        .unwrap()
+        .is_empty());
+}

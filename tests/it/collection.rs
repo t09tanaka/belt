@@ -448,10 +448,11 @@ impl Fx {
             worker_budget_ms: 10_000,
         };
         let c = Coordinator::start(store, cfg).unwrap();
-        c.attach(
+        c.try_attach(
             self.w.id.clone(),
             Arc::clone(&self.w) as Arc<dyn WorkerLink>,
-        );
+        )
+        .unwrap();
         let files = ResultStore::open(&self.dir.path().join("results")).unwrap();
         (c, Arc::new(files))
     }
