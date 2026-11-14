@@ -80,6 +80,10 @@ pub(super) async fn sources(
             if gate.snapshot().contains(&input) {
                 continue;
             }
+            let source_guard = match capture.sources.mutation_guard() {
+                Ok(guard) => Arc::new(guard),
+                Err(_) => continue,
+            };
             // Verify first so legacy submissions with preseeded worker inputs
             // recover after restart without requiring a parent capture manifest.
             let verified = super::super::forward::verify(&worker, &source, &mut input_stop)
@@ -96,7 +100,9 @@ pub(super) async fn sources(
                 let captured = capture.clone();
                 let expected = input.clone();
                 let secrets = spec.has_secret_bundle;
+                let retained = source_guard.clone();
                 let validation = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                    let _source = retained;
                     let id = crate::source::classify::ci_id_of(&expected.source_id)
                         .ok_or_else(|| anyhow::anyhow!("invalid source"))?;
                     anyhow::ensure!(
@@ -206,6 +212,7 @@ pub(super) async fn secrets(
             let run = payload.run_id.clone();
             let source = payload.source_id.clone();
             let loading = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let mutation = capture.sources.mutation_guard()?;
                 let id = crate::source::classify::ci_id_of(&source)
                     .ok_or_else(|| anyhow::anyhow!("invalid source"))?;
                 anyhow::ensure!(
@@ -216,15 +223,18 @@ pub(super) async fn secrets(
                     .sources
                     .manifest(&id)?
                     .ok_or_else(|| anyhow::anyhow!("input source unavailable"))?;
-                Ok(capture
-                    .vault
-                    .load(&run, &manifest.secret_files, &capture.key)?)
+                Ok((
+                    capture
+                        .vault
+                        .load(&run, &manifest.secret_files, &capture.key)?,
+                    mutation,
+                ))
             });
             let bundle =
                 tokio::select! { _=secret_stop.changed()=>return Ok(()), bundle=loading=>bundle? };
             // Missing/tampered bundles never become an empty bundle. The worker's
             // secret gate eventually reports SECRET_UNAVAILABLE without running.
-            let Ok(bundle) = bundle else {
+            let Ok((bundle, _source)) = bundle else {
                 continue;
             };
             let delivered = tokio::select! {

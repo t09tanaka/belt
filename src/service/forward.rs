@@ -18,6 +18,7 @@ use tokio::sync::{watch, OwnedMutexGuard};
 pub(super) struct Lease {
     _local: OwnedMutexGuard<()>,
     _file: File,
+    _source: crate::source::retention::Guard,
 }
 // Retain the existing transfer lease even if cancellation drops the upload
 // future while one bounded blocking read is still finishing.
@@ -117,6 +118,7 @@ pub(super) async fn lease(
     ownership: OwnedMutexGuard<()>,
 ) -> anyhow::Result<Arc<Lease>> {
     check_stop(stop)?;
+    let source = store.mutation_guard()?;
     let path = store.root().join("transfer.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -147,6 +149,7 @@ pub(super) async fn lease(
     Ok(Arc::new(Lease {
         _local: ownership,
         _file: file,
+        _source: source,
     }))
 }
 

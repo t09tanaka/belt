@@ -491,6 +491,19 @@ impl Coordinator {
         source_id: SourceId,
         tasks: Vec<(TaskId, TaskSpec)>,
     ) -> Result<()> {
+        let owner = self.store.clone();
+        let source = tokio::task::spawn_blocking(move || owner.source_mutation_guard())
+            .await
+            .map_err(|e| CoordinatorError::Invalid(e.to_string()))??;
+        self.enqueue_guarded(run_id, source_id, tasks, source).await
+    }
+    pub(crate) async fn enqueue_guarded(
+        &self,
+        run_id: RunId,
+        source_id: SourceId,
+        tasks: Vec<(TaskId, TaskSpec)>,
+        source: crate::source::retention::Guard,
+    ) -> Result<()> {
         self.check_fenced()?;
         let mut specs = Vec::with_capacity(tasks.len());
         for (task, spec) in tasks {
@@ -504,8 +517,17 @@ impl Coordinator {
             check_spec(&run_id, &source_id, &task, &value, self.cfg.lease_ms)?;
             specs.push((task, value));
         }
-        self.db(move |s| s.enqueue(&run_id, Some(&source_id), &json!({}), &specs, wall_ms()))
-            .await
+        self.db(move |s| {
+            s.enqueue_guarded(
+                &run_id,
+                Some(&source_id),
+                &json!({}),
+                &specs,
+                wall_ms(),
+                source,
+            )
+        })
+        .await
     }
 
     /// Cancel a task: durable before anything is sent. A queued task is

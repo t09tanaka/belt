@@ -92,6 +92,21 @@ impl CoordinatorStore {
         verified_secret: bool,
         at_ms: u64,
     ) -> Result<RetryReceipt> {
+        let source = self.source_mutation_guard()?;
+        self.commit_retry_guarded(prepared, verified_secret, at_ms, source)
+    }
+    pub(crate) fn commit_retry_guarded(
+        &self,
+        prepared: PreparedRetry,
+        verified_secret: bool,
+        at_ms: u64,
+        source: crate::source::retention::Guard,
+    ) -> Result<RetryReceipt> {
+        if source.root != self.state_dir.join("sources") {
+            return Err(StorageError::Invalid("foreign source guard".into()));
+        }
+        let _source = source;
+
         self.db.write(move |tx| {
             if let Some(receipt) = control_receipt(tx, &prepared.target, prepared.expected, &prepared.request_id, "retry")? {
                 return Ok(receipt);

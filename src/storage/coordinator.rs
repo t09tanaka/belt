@@ -264,6 +264,17 @@ pub struct CoordinatorStore {
 }
 
 impl CoordinatorStore {
+    /// Source lock is always acquired before entering a coordinator DB operation.
+    /// Nonblocking acquisition never waits under the actor/admission/transaction.
+    pub(crate) fn source_mutation_guard(&self) -> Result<crate::source::retention::Guard> {
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+
+        crate::source::SourceStore::open(&self.state_dir)
+            .and_then(|source| source.mutation_guard())
+            .map_err(|e| StorageError::Invalid(format!("source mutation guard: {e}")))
+    }
     /// Resolve immutable target identity, lock one run, then validate fresh metadata.
     /// Export/read commands must retain this pin for their whole invocation.
     pub fn result_read_pin(
