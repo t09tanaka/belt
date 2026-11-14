@@ -232,6 +232,20 @@ mod tests {
         }
     }
     #[test]
+    fn legacy_per_combo_if_keeps_matrix_and_strategy_contexts() {
+        let j = job("    if: matrix.n == 1 && strategy.job-index == 1 && strategy.job-total == 2\n    strategy:\n      matrix:\n        n: [0, 1]\n    steps: []\n");
+        let all = evaluate(&j, &Map::new(), None);
+        assert_eq!(all.entries.len(), 2);
+        assert!(
+            matches!(&all.entries[0].decision, Decision::Skip(reason) if reason == "if: false")
+        );
+        assert!(matches!(&all.entries[1].decision, Decision::Run(cm) if cm["matrix"]["n"] == 1));
+        let selected = evaluate(&j, &Map::new(), Some(1));
+        assert!(
+            matches!(&selected.entries[0].decision, Decision::Run(cm) if cm["strategy"]["job-index"] == 1)
+        );
+    }
+    #[test]
     fn direct_needs_status_and_if_errors_keep_legacy_reasons() {
         let mut j = job("    needs: seed\n    runs-on: x\n    steps: []\n");
         for (status, reason) in [

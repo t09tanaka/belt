@@ -698,7 +698,7 @@ fn portable_ast(ast: &Ast, stage: PortableStage) -> Result<()> {
         Ast::Ctx(name) => {
             let name = name.to_ascii_lowercase();
             if matches!(name.as_str(), "needs" | "vars" | "inputs")
-                || (stage != PortableStage::Matrix
+                || (matches!(stage, PortableStage::RunsOn | PortableStage::Name)
                     && matches!(name.as_str(), "matrix" | "strategy"))
             {
                 Ok(())
@@ -1043,11 +1043,9 @@ mod portable_tests {
         }
         assert!(validate_portable("matrix.os", true, PortableStage::Matrix).is_err());
         assert!(validate_portable("strategy.job-total", true, PortableStage::Matrix).is_err());
-        for stage in [
-            PortableStage::JobIf,
-            PortableStage::RunsOn,
-            PortableStage::Name,
-        ] {
+        assert!(validate_portable("matrix.os", true, PortableStage::JobIf).is_err());
+        assert!(validate_portable("strategy.job-total", true, PortableStage::JobIf).is_err());
+        for stage in [PortableStage::RunsOn, PortableStage::Name] {
             validate_portable(
                 "format('{0}-{1}', matrix.os, strategy.job-index)",
                 true,
