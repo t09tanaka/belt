@@ -66,9 +66,10 @@ fn repo_of(files: &[(&str, &str)]) -> (common::Tmp, PathBuf) {
 }
 
 fn ctx_with(home: &Path, path: &str) -> ExecContext {
+    let path = common::private_docker_path(home, path);
     ExecContext::new(
         [
-            ("PATH", path),
+            ("PATH", path.as_str()),
             ("HOME", &home.to_string_lossy()),
             ("LOCAL_CI_HOME", &home.join("cache").to_string_lossy()),
         ]
