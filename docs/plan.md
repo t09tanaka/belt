@@ -567,3 +567,8 @@ worker wire・parent ingestion・remote age/TTL変換・pagination・warm proof�
 
 local-ci0.13.0はローカル10項目・リモート10項目後に公開済み。
 次は統合HEADのpure coverage/mutationを先に絞って確認し、全CIを再実行する。
+
+新規pure 2モジュールの限定検証では、contractのbaseline不明・alias未証明・
+最大256 evidenceの試験を補った後、contract411/411・prefetch215/215行がcoverage100%。
+contract35・prefetch46のmutantをcaught、survived0・timeout0・unviable11だった。
+prefetchは同一blobの既存結果を再利用した。これは限定結果であり、統合全CIは次に確認する。
