@@ -10,6 +10,7 @@ use remote_task_runner::{
 };
 use std::{
     collections::BTreeMap,
+    io::{Read, Seek, SeekFrom},
     process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::Duration,
@@ -19,6 +20,45 @@ struct State {
     child: Option<Child>,
     starts: usize,
     manual: Vec<Child>,
+    stderr: Vec<std::fs::File>,
+}
+impl State {
+    fn stderr(&mut self) -> Stdio {
+        let file = tempfile::tempfile().unwrap();
+        let output = file.try_clone().unwrap();
+        self.stderr.push(file);
+        Stdio::from(output)
+    }
+    fn diagnose(&mut self) {
+        for child in self.manual.iter_mut().chain(self.child.iter_mut()) {
+            eprintln!(
+                "owned daemon pid={} status={:?}",
+                child.id(),
+                child.try_wait()
+            );
+        }
+        for file in &mut self.stderr {
+            let bytes = file.metadata().map(|m| m.len()).ok();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            let mut prefix = Vec::new();
+            let _ = file.take(4096).read_to_end(&mut prefix);
+            let text = String::from_utf8_lossy(&prefix);
+            // Never print arbitrary child output: it can include paths or inputs.
+            let classes: Vec<_> = [
+                "panicked",
+                "Resource temporarily unavailable",
+                "Too many open files",
+                "startup lock",
+                "identity",
+                "database",
+                "permission",
+            ]
+            .into_iter()
+            .filter(|class| text.contains(class))
+            .collect();
+            eprintln!("owned daemon stderr bytes={bytes:?} classes={classes:?}");
+        }
+    }
 }
 impl Drop for State {
     fn drop(&mut self) {
@@ -75,6 +115,7 @@ impl Launcher for OwnedLauncher {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         let mut state = self.0.lock().unwrap();
+        c.stderr(state.stderr());
         assert!(state.child.is_none());
         state.child = Some(c.spawn().unwrap());
         state.starts += 1;
@@ -85,7 +126,7 @@ impl Launcher for OwnedLauncher {
 // This belongs only to the test harness, never the managed service environment.
 fn test_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     let mut command = Command::new(program);
-    command.env_clear();
+    command.env_clear().env("TOKIO_WORKER_THREADS", "2");
     if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
         command.env("LLVM_PROFILE_FILE", profile);
     }
@@ -128,8 +169,11 @@ fn concurrent_init_reuses_one_real_combined_resident_and_epoch() {
                 .enable_all()
                 .build()
                 .unwrap();
-            rt.block_on(initialize(context, &mut OwnedLauncher(state)))
-                .unwrap()
+            rt.block_on(initialize(context, &mut OwnedLauncher(state.clone())))
+                .unwrap_or_else(|error| {
+                    state.lock().unwrap().diagnose();
+                    panic!("initialization failed: {error}");
+                })
         }));
     }
     let a = threads.remove(0).join().unwrap();
@@ -233,24 +277,28 @@ fn manual_resident_and_failed_registered_daemon_are_not_initialized() {
             let input = self_input(&args[2]);
             let spec = bootstrap::read_input(&input).unwrap();
             let spawn = || {
+                let stderr = self.0.lock().unwrap().stderr();
                 test_command(&spec.executable)
                     .args(bootstrap::daemon_argv(&input).unwrap())
                     .envs(&spec.env)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
-                    .stderr(Stdio::null())
+                    .stderr(stderr)
                     .spawn()
                     .unwrap()
             };
             let manual = spawn();
+            self.0.lock().unwrap().manual.push(manual);
             let deadline = std::time::Instant::now() + Duration::from_secs(10);
             while !spec.state_dir.join("parent/owner.token").exists() {
-                assert!(std::time::Instant::now() < deadline);
+                if std::time::Instant::now() >= deadline {
+                    self.0.lock().unwrap().diagnose();
+                    panic!("owned daemon did not create owner token");
+                }
                 std::thread::sleep(Duration::from_millis(10));
             }
             let registered = spawn();
             let mut state = self.0.lock().unwrap();
-            state.manual.push(manual);
             state.child = Some(registered);
             state.starts += 1;
             Ok(())

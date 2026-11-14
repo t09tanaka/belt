@@ -195,3 +195,5 @@ S15a（PR #40、merge `8939ef2`）と S15b（PR #41、merge `05e981c`）は main
 managed init、独立 worker role、配置前の source readiness、双方向に revision で fence する Cancel/Retry を、利用者の local 実行経路の区切りとして統合する。異なる設計の担当コミットと独立レビュー結果を保持し、統合時の旧 IPC fixture と非同期 adoption の観測 race は別のテスト修正で扱う。storage 86 件、resident unit 8 件、completion 4 件、coordinator 41 件、retry/secret の実 CLI、resident integration 6 件、worker role 6 件と strict clippy が統合後に成功した。転送完了を待たず durable queued を返し、source gate と接続交換は SQLite commit 完了まで同期する。全体 CI とリモート検証が終わるまで本流へ統合しない。
 
 `--in-place`、requires/profile、条件付き・glob・複数 path の出力計画、公開 logs/outputs、retention/GC、estimate、SSH の接続所有と再接続は引き続き必須残件である。途中ログの storage 基盤と collector 接続は別 slice とし、終了後の再生だけを live follow 完成とは扱わない。
+
+統合 HEAD の全体ローカル CI は通常テスト・coverage を通過した一方、mutation の unmutated baseline で init readiness 2 件と captured submit 1 件が期限切れになった。原因は未確定で、変異の結果とは区別する。private fixture の owned child にだけ Tokio worker 数を制限し、init の終了状態・private stderr の固定分類、submit の bounded TTC ledger/sidecar metadata と worker journal を期限切れ時に残す。本番の CPU guard・期限・登録手順は変更しない。対象 3 件は各 3 回と strict clippy が成功した。診断追加後の全体 CI とリモート検証は未実施である。
