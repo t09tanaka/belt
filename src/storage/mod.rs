@@ -30,7 +30,7 @@ pub use coordinator::{
     Placement, PreparedRetry, QueuedTask, ResultRef, RetireEnd, RetryPreparation, RunStanding,
     Seen, WorkerLoad,
 };
-pub use coordinator::{LiveLogTarget, LogProgress};
+pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
 pub use db::Db;
 pub use lock::ProcessLock;
 pub use worker::{

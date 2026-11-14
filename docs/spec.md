@@ -1150,7 +1150,16 @@ closed の不完全ログ・回収失敗は利用可能 bytes を返して COLLE
 途中 snapshot は pending を明示して 0。Ctrl-C は cancel を送らず detach / 130。
 出力先が詰まっている場合も detach は待たず、割り込み時の final は出力可能な場合に送る。
 
-将来の retention GC は reader が検証して開いた FD / 短期 pin と排他を統合し、
-active / pending / finalizing の回収と reader 使用中の削除を防ぐ必要がある。
-現時点の read-only CLI は親 DB へ pin を書かない。GC 未接続の間も消失を空成功にせず
-明示エラーとする。GC / outputs / output planner の完成を本ログ経路だけで意味しない。
+結果 retention GC は run ごとの永続 reader-pins inode と共有/排他 flock を使う。
+read-only logs は対象 run を仮解決し、pin を read-only/nonblocking shared-lock し、
+inode と新しい metadata binding を確認した後に読み始め、follow/detach を含む invocation 全体で保持する。
+missing/legacy pin は明示 unavailable とし、reader は作成・DB 更新・owner 起動を行わない。
+将来の outputs/export CLI も CoordinatorStore::result_read_pin を取得し、出力完了まで保持する。
+owner は run/ref 公開前に pin 作成と fsync を行い、legacy run は bounded page で backfill する。
+pin inode は parent state とともに保持し、unlink/置換しない。最初の GC 対応版以降の owner と
+reader がこの protocol を共有することが互換条件で、旧 reader と同時利用する GC の安全性は保証しない。
+resident は bounded keyset の結果 ref/claim page だけ処理し、run-exclusive pin を FS delete 完了まで保持する。
+known durable claim のみ NotFound を冪等成功とし、未関連 legacy pending や foreign locator は削除しない。
+時計 cutoff は boot identity と永続 monotonic baseline から導出し、boot 不明/変更後は全 retention の
+quarantine、時計異常は retention 0 でも Hold。壁時計だけを理由に削除を前倒ししない。
+source/Vault/private binding の GC と output planner 完成はこの結果 retention 経路に含まない。

@@ -3307,7 +3307,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(all.len(), 7);
+    assert_eq!(all.len(), 8);
     let cluster = ClusterId::generate();
     let co = CoordinatorId::generate();
     let run = RunId::generate();
@@ -3362,7 +3362,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     }
     let owner = CoordinatorStore::open(dir.path(), 2).unwrap();
     let migrated = schema_info(&owner);
-    assert_eq!(migrated.0, "7");
+    assert_eq!(migrated.0, "8");
     assert_eq!(migrated.2, 3);
     assert!(migrated.1.is_some());
     let target_run = run.to_string();
@@ -4893,7 +4893,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TABLE collection_log; UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
@@ -4954,4 +4954,235 @@ fn live_log_append_crash_replays_from_committed_offset_without_publishing_tail()
         reader.read_range(&a, Stdout, 11, 0, 100).unwrap(),
         b"firstsecond"
     );
+}
+
+// ================================================= guarded result retention
+fn retention_ready(f: &Fx) -> AttemptId {
+    let a = f.attempt('a').unwrap().attempt_id;
+    f.to_finalizing(&a);
+    f.store
+        .finalize_attempt(&a, done(Outcome::Failed), 100)
+        .unwrap();
+    f.store.mark_collected(&a, 101).unwrap();
+    let id = a.to_string();
+    f.store.db.write(move |tx| {tx.execute("INSERT INTO collection(attempt_id,verdict,acked_at_ms,closed_at_ms,updated_at_ms) VALUES(?1,'complete',102,101,102)",[id])?;Ok(())}).unwrap();
+    a
+}
+#[test]
+fn result_retention_claims_bounded_pages_and_replays_only_known_claims() {
+    use crate::results::store::ResultStore;
+    let f = fx();
+    let a = retention_ready(&f);
+    let files = ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.write_result(&a, b"{}").unwrap();
+    let locator = ResultStore::result_locator(&a);
+    for n in 0..70 {
+        f.store
+            .add_blob_ref(
+                &blob(&format!("result-{n:03}"), &a, BlobKind::Result, &locator),
+                102,
+            )
+            .unwrap();
+    }
+    let run = f.run.to_string();
+    let plan=f.store.db.call(move |c| {let mut s=c.prepare("EXPLAIN QUERY PLAN SELECT b.ref_id,b.attempt_id,b.locator,b.pins FROM result_gc_ref g JOIN blob_ref b USING(ref_id) WHERE g.run_id=?1 AND g.ref_id>?2 ORDER BY g.ref_id LIMIT 32")?;let rows=s.query_map(rusqlite::params![run,""],|r|r.get::<_,String>(3))?.collect::<std::result::Result<Vec<_>,_>>()?;Ok(rows)}).unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("result_gc_ref_run")),
+        "{plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+        "{plan:?}"
+    );
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    assert!(f
+        .store
+        .claim_result_page(&guard, &f.run, "", 0, 200, 10, Some("boot".into()), 10)
+        .is_err());
+    assert!(f
+        .store
+        .claim_result_page(&guard, &f.run, "", 65, 200, 10, Some("boot".into()), 10)
+        .is_err());
+    assert!(
+        f.store
+            .claim_result_page(&guard, &f.run, "", 32, 200, 10, Some("boot".into()), 10)
+            .unwrap()
+            .clock_held
+    );
+    let first = f
+        .store
+        .claim_result_page(&guard, &f.run, "", 32, 210, 20, Some("boot".into()), 10)
+        .unwrap();
+    assert_eq!((first.examined, first.removed, first.queued), (32, 32, 0));
+    let second = f
+        .store
+        .claim_result_page(
+            &guard,
+            &f.run,
+            first.next.as_ref().unwrap(),
+            32,
+            211,
+            21,
+            Some("boot".into()),
+            10,
+        )
+        .unwrap();
+    assert_eq!(
+        (second.examined, second.removed, second.queued),
+        (32, 32, 0)
+    );
+    let third = f
+        .store
+        .claim_result_page(
+            &guard,
+            &f.run,
+            second.next.as_ref().unwrap(),
+            32,
+            212,
+            22,
+            Some("boot".into()),
+            10,
+        )
+        .unwrap();
+    assert_eq!((third.examined, third.removed, third.queued), (6, 6, 1));
+    assert!(third.next.is_none());
+    assert!(f
+        .store
+        .add_blob_ref(&blob("late", &a, BlobKind::Result, &locator), 212)
+        .is_err());
+    assert!(f.store.pending_result_page(&guard, &f.run, 0).is_err());
+    let claim = f
+        .store
+        .pending_result_page(&guard, &f.run, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.attempt, a);
+    assert_eq!(claim.run, f.run);
+    files.remove(&claim.locator).unwrap(); // crash after FS, before completion
+    drop(guard);
+    drop(f.store);
+    let restarted = CoordinatorStore::open(f._dir.path(), 300).unwrap();
+    let guard = restarted.result_gc_guard(&f.run).unwrap();
+    let replay = restarted
+        .pending_result_page(&guard, &f.run, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    files.remove(&replay.locator).unwrap();
+    restarted.finish_result_delete(&guard, &replay).unwrap();
+    assert!(restarted
+        .pending_result_page(&guard, &f.run, 1)
+        .unwrap()
+        .is_empty());
+    assert!(restarted.finish_result_delete(&guard, &replay).is_err());
+    // Verdict/audit survive physical deletion, including failed compute.
+    assert_eq!(
+        restarted
+            .get_attempt(&a)
+            .unwrap()
+            .unwrap()
+            .termination
+            .unwrap()
+            .outcome(),
+        Outcome::Failed
+    );
+    assert!(restarted
+        .collection(&a)
+        .unwrap()
+        .unwrap()
+        .closed_at_ms
+        .is_some());
+    restarted
+        .db
+        .write(|tx| {
+            tx.execute("INSERT INTO pending_delete VALUES('results/legacy',1)", [])?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(restarted
+        .pending_result_page(&guard, &f.run, 32)
+        .unwrap()
+        .is_empty());
+    assert_eq!(restarted.pending_deletes().unwrap(), vec!["results/legacy"]);
+}
+#[test]
+fn result_retention_reader_writer_and_legacy_backfill_are_fail_closed() {
+    use crate::service::completion::Target;
+    let f = fx();
+    let a = retention_ready(&f);
+    let reader = CoordinatorStore::open_read_only(f._dir.path()).unwrap();
+    let target = Target::Task(f.task.clone());
+    let pin = reader.result_read_pin(&target, Some(&a)).unwrap();
+    assert!(f
+        .store
+        .claim_result_page(&pin, &f.run, "", 1, 200, 10, Some("boot".into()), 0)
+        .is_err());
+    assert!(f.store.result_gc_guard(&f.run).is_err());
+    assert!(reader.result_gc_guard(&f.run).is_err());
+    assert!(reader
+        .result_read_pin(&target, Some(&AttemptId::generate()))
+        .is_err());
+    assert!(reader
+        .result_read_pin(&Target::Run(f.run.clone()), Some(&a))
+        .is_err());
+    drop(pin);
+    let writer = f.store.result_writer_pin(&a).unwrap();
+    assert!(f.store.result_gc_guard(&f.run).is_err());
+    drop(writer);
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    assert_eq!(
+        reader.result_read_pin(&target, None).unwrap_err().code(),
+        ErrorCode::Conflict
+    );
+    drop(guard);
+    let path = f._dir.path().join(format!("reader-pins/{}.lock", f.run));
+    // Legacy fixture only: production never unlinks a pin.
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        reader.result_read_pin(&target, None).unwrap_err().code(),
+        ErrorCode::NotFound
+    );
+    assert!(!path.exists());
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    drop(guard);
+    reader.result_read_pin(&target, None).unwrap();
+}
+#[test]
+fn result_retention_keeps_unknown_unacked_open_and_pinned_references() {
+    let f = fx();
+    let a = retention_ready(&f);
+    let locator = crate::results::store::ResultStore::result_locator(&a);
+    f.store
+        .add_blob_ref(&blob("ref", &a, BlobKind::Result, &locator), 102)
+        .unwrap();
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    f.store
+        .claim_result_page(&guard, &f.run, "", 1, 200, 10, Some("boot".into()), 10)
+        .unwrap();
+    for mutation in ["UPDATE attempt SET observation='unknown'", "UPDATE attempt SET observation='known'; UPDATE collection SET acked_at_ms=NULL", "UPDATE collection SET acked_at_ms=NULL,closed_at_ms=NULL,verdict=NULL", "UPDATE collection SET acked_at_ms=102,closed_at_ms=101,verdict='complete'; UPDATE blob_ref SET pins=1"] {
+        f.store.db.write(move |tx| {tx.execute_batch(mutation)?;Ok(())}).unwrap();
+        let p=f.store.claim_result_page(&guard,&f.run,"",1,210,20,Some("boot".into()),10).unwrap();assert_eq!(p.removed,0);
+    }
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute_batch(
+                "UPDATE blob_ref SET pins=0; UPDATE attempt SET terminal_at_ms=1000;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let future = f
+        .store
+        .claim_result_page(&guard, &f.run, "", 1, 210, 20, Some("boot".into()), 0)
+        .unwrap();
+    assert_eq!(future.removed, 0);
+    // Invalid clock must Hold even retention zero.
+    let p = f
+        .store
+        .claim_result_page(&guard, &f.run, "", 1, 500, u64::MAX, Some("boot".into()), 0)
+        .unwrap();
+    assert!(p.clock_held);
+    assert_eq!(p.removed, 0);
 }

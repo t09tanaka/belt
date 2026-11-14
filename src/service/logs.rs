@@ -119,6 +119,7 @@ impl Sink<'_> {
 }
 
 pub struct Observer {
+    _pin: crate::results::pin::RunPin,
     reader: Reader,
     root: PathBuf,
     target: Target,
@@ -140,7 +141,16 @@ impl Observer {
                 "--attempt requires a task identifier",
             ));
         }
+        let state = root
+            .parent()
+            .ok_or_else(|| internal("result state directory missing"))?;
+        let metadata = crate::storage::CoordinatorStore::open_read_only(state)
+            .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
+        let pin = metadata
+            .result_read_pin(&target, attempt.as_ref())
+            .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
         Ok(Self {
+            _pin: pin,
             reader,
             root,
             target,

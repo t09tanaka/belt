@@ -316,6 +316,23 @@ BEGIN UPDATE task SET cancel_requested_at_ms=(SELECT requested_at_ms FROM run_ca
     updated_at_ms INTEGER NOT NULL,
     PRIMARY KEY(attempt_id,stream)
 );"#.to_string(),
+            r#"CREATE TABLE result_gc_ref (
+    ref_id TEXT PRIMARY KEY REFERENCES blob_ref(ref_id) ON DELETE CASCADE,
+    run_id TEXT NOT NULL REFERENCES run(run_id)
+);
+CREATE INDEX result_gc_ref_run ON result_gc_ref(run_id,ref_id);
+INSERT INTO result_gc_ref(ref_id,run_id)
+    SELECT b.ref_id,t.run_id FROM blob_ref b JOIN attempt a USING(attempt_id) JOIN task t USING(task_id) WHERE b.kind IN ('log','result');
+CREATE TRIGGER result_gc_ref_insert AFTER INSERT ON blob_ref WHEN NEW.kind IN ('log','result')
+BEGIN INSERT INTO result_gc_ref(ref_id,run_id) SELECT NEW.ref_id,t.run_id FROM attempt a JOIN task t USING(task_id) WHERE a.attempt_id=NEW.attempt_id; END;
+CREATE TABLE result_delete_claim (
+    locator TEXT PRIMARY KEY REFERENCES pending_delete(locator),
+    run_id TEXT NOT NULL REFERENCES run(run_id),
+    attempt_id TEXT NOT NULL REFERENCES attempt(attempt_id)
+);
+CREATE INDEX result_delete_claim_run ON result_delete_claim(run_id,locator);
+CREATE TABLE result_gc_clock(singleton INTEGER PRIMARY KEY CHECK(singleton=1), state_json TEXT NOT NULL);
+CREATE INDEX attempt_task_key ON attempt(task_id,attempt_id);"#.to_string(),
         ],
         DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}")],
     }

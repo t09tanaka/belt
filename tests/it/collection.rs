@@ -16,7 +16,58 @@ use remote_task_runner::error::{ApiError, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::platform::wall_ms;
 use remote_task_runner::results::plan::{RunVerdict, TaskStanding, Verdict};
-use remote_task_runner::results::retention::sweep;
+// Deterministic clock samples for retention integration; production uses
+// suspend-aware platform samples and a persisted quarantine baseline.
+#[derive(Default)]
+struct Sweep {
+    deleted: Vec<String>,
+}
+fn sweep(
+    store: &remote_task_runner::storage::CoordinatorStore,
+    files: &ResultStore,
+    now: u64,
+    days: u32,
+) -> Result<Sweep, remote_task_runner::results::CollectError> {
+    let retention = remote_task_runner::results::plan::retention_ms(days);
+    let mut report = Sweep::default();
+    for run in store.query_runs(64, None)?.items {
+        let guard = store.result_gc_guard(&run.run_id)?;
+        // Give the fixture a full, known elapsed retention interval.
+        store.claim_result_page(
+            &guard,
+            &run.run_id,
+            "",
+            64,
+            1,
+            1,
+            Some("integration".into()),
+            retention,
+        )?;
+        let mut after = String::new();
+        loop {
+            let page = store.claim_result_page(
+                &guard,
+                &run.run_id,
+                &after,
+                64,
+                now,
+                now,
+                Some("integration".into()),
+                retention,
+            )?;
+            for claim in store.pending_result_page(&guard, &run.run_id, 64)? {
+                files.remove(&claim.locator)?;
+                store.finish_result_delete(&guard, &claim)?;
+                report.deleted.push(claim.locator);
+            }
+            match page.next {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+    }
+    Ok(report)
+}
 use remote_task_runner::results::{CollectConfig, CollectReport, ResultStore};
 use remote_task_runner::state::{
     AttemptState, Collection, Observation, Outcome, Receipt, Receipts, RunDisplay, Termination,
