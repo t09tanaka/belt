@@ -2638,11 +2638,23 @@ impl Agent {
                 |e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e),
             )?;
         }
-        let missing = crate::toolchain::capability::missing_with_installable(
+        let mut missing = crate::toolchain::capability::missing_with_installable(
             &payload.requirements,
             report.as_ref(),
             payload.toolchains.as_deref(),
         );
+        if let Some(profile) = &self.cfg.capability_profile {
+            for tool in profile.required_tools() {
+                if !report.as_ref().is_some_and(|r| {
+                    matches!(
+                        r.tools.get(tool),
+                        Some(crate::toolchain::capability::ToolObservation::Available { .. })
+                    )
+                }) {
+                    missing.push(format!("profile tool {tool}"));
+                }
+            }
+        }
         if !missing.is_empty() || (self.cfg.capability_profile.is_some() && report.is_none()) {
             return Err(ApiError::blocked(
                 crate::error::BlockedReason::EnvironmentMismatch,
