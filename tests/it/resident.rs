@@ -540,7 +540,9 @@ printf 'git version 2.50.0\n'
             && release_rx.recv_timeout(Duration::from_secs(5)).is_ok();
         // Do this before reporting any assertion failure, including no reader.
         release.write_all(b"release\n").unwrap();
-        (progressed, release)
+        // Keep both FIFOs open until startup has consumed the release, even if
+        // readiness timed out before Git opened the ready FIFO.
+        (progressed, ready, release)
     });
     let releaser = tokio::spawn(async move {
         if ready_rx.await.is_ok() {
@@ -554,7 +556,7 @@ printf 'git version 2.50.0\n'
         .insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
     let started = Resident::start(&config(), input).await;
     releaser.await.unwrap();
-    let (progressed, _release) = observer.join().unwrap();
+    let (progressed, _ready, _release) = observer.join().unwrap();
     let resident = started.unwrap();
     let calls = std::fs::read_to_string(bin.join("calls")).unwrap();
     let client = resident.client();
