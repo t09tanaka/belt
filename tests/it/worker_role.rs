@@ -170,6 +170,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     let side_effect = f.root.path().join("effect");
     let started = f.root.path().join("started");
     let release = f.root.path().join("release");
+    let command_path = f.root.path().join("command-path");
     let payload = AttemptPayload {
         toolchains: None,
         outputs: Vec::new(),
@@ -192,14 +193,16 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
                 "/bin/sh".into(),
                 "-c".into(),
                 format!(
-                    "printf '%s' $$ > '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; printf done >> '{}'",
+                    "printf '%s' \"$PATH\" > '{}'; printf '%s' $$ > '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 200 ]; do sleep 0.05; i=$((i+1)); done; printf done >> '{}'",
+                    command_path.display(),
                     started.display(),
                     release.display(),
                     side_effect.display()
                 ),
             ],
             cwd: String::new(),
-            env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            // A command can repeat the protected worker profile PATH exactly.
+            env: BTreeMap::from([("PATH".into(), f.spec.env["PATH"].clone())]),
             depends_on: vec![],
             timeout_ms: None,
         }],
@@ -234,6 +237,10 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     })
     .await
     .unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&command_path).unwrap(),
+        f.spec.env["PATH"]
+    );
     let command_pid = super::common::read_pid(&started).expect("running command PID");
     assert!(command_pid > 1);
     let command_start =
