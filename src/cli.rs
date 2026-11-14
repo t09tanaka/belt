@@ -230,6 +230,33 @@ impl Envelope {
 
 /// Run a parsed command and return the process exit code.
 pub fn run(cli: Cli) -> i32 {
+    if matches!(cli.command, Command::Init) {
+        return match crate::service::init::command() {
+            Ok(receipt) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":true,"result":receipt})
+                    );
+                } else {
+                    println!("initialized {} {}", receipt.cluster_id, receipt.worker_id);
+                }
+                exit::SUCCESS
+            }
+            Err(error) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                    );
+                } else {
+                    eprintln!("error: {}", error.message);
+                }
+                error.code.exit_code()
+            }
+        };
+    }
+
     if matches!(&cli.command,Command::Exec(args) if !args.in_place)
         || matches!(&cli.command, Command::Wait(_) | Command::Cancel(_))
     {

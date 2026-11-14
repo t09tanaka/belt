@@ -95,7 +95,15 @@ pub fn runtime_spec(env: &BTreeMap<String, String>) -> Result<Spec, ApiError> {
             "coordinator is not initialized; run remote-task-runner init",
         ));
     }
-    let spec = super::bootstrap::read_input(&input)
-        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+    let spec = super::bootstrap::read_input(&input).map_err(|e| {
+        ApiError::new(
+            if super::init::is_unconfirmed(&e) {
+                ErrorCode::CommunicationUnknown
+            } else {
+                ErrorCode::InvalidInput
+            },
+            e.to_string(),
+        )
+    })?;
     Ok(spec)
 }

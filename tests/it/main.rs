@@ -27,3 +27,5 @@ mod runtime;
 mod resident;
 
 mod bootstrap;
+
+mod init;

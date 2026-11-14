@@ -37,6 +37,7 @@ fn fixture() -> (tempfile::TempDir, Spec) {
         ]),
         repo_root: None,
         expected_cluster: None,
+        managed_service: None,
     };
     // Instrumented CLI/daemon/supervisor descendants keep the harness's private
     // profile destination (including %p/%m), outside captured inputs and HOME.

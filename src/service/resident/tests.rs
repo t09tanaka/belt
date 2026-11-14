@@ -249,6 +249,7 @@ async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_un
         ]),
         repo_root: None,
         expected_cluster: Some(client.cluster_id().clone()),
+        managed_service: None,
     };
     let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let target = crate::service::completion::Target::Run(run.clone());

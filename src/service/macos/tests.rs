@@ -454,6 +454,7 @@ fn native_output(plan: &Plan, receipt: &Receipt) -> CommandOutput {
     fields.push_str("}\n");
     CommandOutput {
         success: true,
+        exit_code: Some(0),
         stdout: fields.into_bytes(),
         stderr: Vec::new(),
     }
@@ -477,6 +478,7 @@ fn native_verifier_queries_exact_target_and_refuses_unconfirmed_observations() {
         Err("deadline".into()),
         Ok(CommandOutput {
             success: false,
+            exit_code: Some(1),
             ..native_output(&p, &receipt)
         }),
         Ok(CommandOutput {
@@ -582,6 +584,7 @@ fn native_stop_observes_before_and_after_ack_and_has_no_label_fallback() {
                 } else {
                     Ok(CommandOutput {
                         success: true,
+                        exit_code: Some(0),
                         stdout: Vec::new(),
                         stderr: Vec::new(),
                     })
@@ -638,16 +641,19 @@ fn native_execution_failure_is_uncertain_and_account_lookup_failure_refuses_stop
         Err("spawn".into()),
         Ok(CommandOutput {
             success: false,
+            exit_code: Some(1),
             stdout: Vec::new(),
             stderr: Vec::new(),
         }),
         Ok(CommandOutput {
             success: true,
+            exit_code: Some(0),
             stdout: Vec::new(),
             stderr: vec![0; native::OUTPUT_LIMIT + 1],
         }),
         Ok(CommandOutput {
             success: true,
+            exit_code: Some(0),
             stdout: vec![0; native::OUTPUT_LIMIT + 1],
             stderr: Vec::new(),
         }),
@@ -674,6 +680,7 @@ fn unparseable_native_observation_prevents_worker_stop() {
         calls: calls.clone(),
         outputs: [Ok(CommandOutput {
             success: true,
+            exit_code: Some(0),
             stdout: b"unknown layout\n".to_vec(),
             stderr: Vec::new(),
         })]
@@ -693,5 +700,201 @@ fn unparseable_native_observation_prevents_worker_stop() {
             "print".to_owned(),
             "gui/501/org.example.worker".to_owned()
         ]]
+    );
+}
+
+#[test]
+fn native_absence_requires_exact_known_exit_and_domain_diagnostic() {
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let p = plan();
+    let mut files = DirectoryFiles::open(tmp.path()).unwrap();
+    let receipt = files.install(&p).unwrap();
+    let domain = match p.mode() {
+        policy::Mode::User { uid } => format!("user gui: {uid}"),
+        policy::Mode::SystemUser { .. } => "system".into(),
+    };
+    let diagnostic = format!(
+        "Bad request.\nCould not find service \"{}\" in domain for {domain}\n",
+        p.label()
+    );
+    for (code, stdout, stderr, expected) in [
+        (
+            Some(113),
+            vec![],
+            diagnostic.as_bytes().to_vec(),
+            LoadedState::Absent,
+        ),
+        (
+            Some(1),
+            vec![],
+            diagnostic.as_bytes().to_vec(),
+            LoadedState::Unknown,
+        ),
+        (
+            Some(113),
+            b"extra".to_vec(),
+            diagnostic.as_bytes().to_vec(),
+            LoadedState::Unknown,
+        ),
+        (
+            Some(113),
+            vec![],
+            b"permission denied".to_vec(),
+            LoadedState::Unknown,
+        ),
+        (
+            None,
+            vec![],
+            diagnostic.as_bytes().to_vec(),
+            LoadedState::Unknown,
+        ),
+    ] {
+        let mut native = NativeLauncher::with_accounts(
+            FakeRunner {
+                outputs: [Ok(CommandOutput {
+                    success: false,
+                    exit_code: code,
+                    stdout,
+                    stderr,
+                })]
+                .into(),
+                ..Default::default()
+            },
+            FakeAccounts(None),
+        );
+        assert_eq!(native.loaded_state(&p, &receipt), expected);
+    }
+}
+
+#[test]
+fn running_identity_is_fresh_and_refuses_nonrunning_or_changed_jobs() {
+    assert!(RunningIdentity::observe(0).is_err());
+    assert!(RunningIdentity::observe(1).is_err());
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let p = plan();
+    let mut files = DirectoryFiles::open(tmp.path()).unwrap();
+    let receipt = files.install(&p).unwrap();
+    fn running(plan: &Plan, receipt: &Receipt, pid: u32) -> CommandOutput {
+        let mut o = native_output(plan, receipt);
+        let text = String::from_utf8(o.stdout).unwrap();
+        o.stdout = text
+            .replacen(
+                " = {\n",
+                &format!(" = {{\n\tstate = running\n\tpid = {pid}\n"),
+                1,
+            )
+            .into_bytes();
+        o
+    }
+    let pid = std::process::id();
+    let expected = RunningIdentity::observe(pid).unwrap();
+    let mut native = NativeLauncher::with_accounts(
+        FakeRunner {
+            outputs: [
+                Ok(running(&p, &receipt, pid)),
+                Ok(running(&p, &receipt, pid)),
+            ]
+            .into(),
+            ..Default::default()
+        },
+        FakeAccounts(None),
+    );
+    assert_eq!(native.running_identity(&p, &receipt).unwrap(), expected);
+    for output in [
+        native_output(&p, &receipt),
+        running(&p, &receipt, 1),
+        CommandOutput {
+            success: false,
+            ..running(&p, &receipt, pid)
+        },
+    ] {
+        let mut native = NativeLauncher::with_accounts(
+            FakeRunner {
+                outputs: [Ok(output)].into(),
+                ..Default::default()
+            },
+            FakeAccounts(None),
+        );
+        assert!(native.running_identity(&p, &receipt).is_err());
+    }
+    let mut changed = running(&p, &receipt, pid);
+    changed.stdout = String::from_utf8(changed.stdout)
+        .unwrap()
+        .replace("state = running", "state = waiting")
+        .into_bytes();
+    let mut native = NativeLauncher::with_accounts(
+        FakeRunner {
+            outputs: [Ok(running(&p, &receipt, pid)), Ok(changed)].into(),
+            ..Default::default()
+        },
+        FakeAccounts(None),
+    );
+    assert!(native.running_identity(&p, &receipt).is_err());
+    let mut stale = expected;
+    stale.start.push_str("-reused");
+    assert!(stale.verify_live().is_err());
+}
+#[test]
+fn journal_callback_waits_for_durable_stage_directory() {
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let p = plan();
+    let mut files = DirectoryFiles::open(tmp.path()).unwrap();
+    let called = std::cell::Cell::new(false);
+    let e = files
+        .install_journaled_with_sync(
+            &p,
+            |_, _| {
+                called.set(true);
+                Ok(())
+            },
+            |_| {
+                Err(std::io::Error::other(
+                    "injected stage directory fsync failure",
+                ))
+            },
+        )
+        .unwrap_err();
+    assert!(!called.get());
+    assert!(e.receipt.is_some());
+    assert!(!tmp.path().join(p.filename()).exists());
+    let synced = std::cell::Cell::new(false);
+    files
+        .install_journaled_with_sync(
+            &p,
+            |receipt, stage| {
+                assert!(synced.get());
+                assert!(stage.exists());
+                assert!(!receipt.path().exists());
+                Ok(())
+            },
+            |path| {
+                assert_eq!(path, tmp.path());
+                File::open(path)?.sync_all()?;
+                synced.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+}
+
+#[test]
+fn failed_native_publication_retains_staged_evidence_after_journal_callback() {
+    let tmp = tempfile::tempdir_in("/private/tmp").unwrap();
+    let p = plan();
+    let mut files = DirectoryFiles::open(tmp.path()).unwrap();
+    let stage = std::cell::RefCell::new(None);
+    let error = files
+        .install_journaled(&p, |receipt, path| {
+            *stage.borrow_mut() = Some(path.to_owned());
+            std::fs::write(receipt.path(), b"foreign target appeared")?;
+            Ok(())
+        })
+        .unwrap_err();
+    assert!(error.receipt.is_some());
+    let staged = stage.borrow().clone().unwrap();
+    assert_eq!(std::fs::read(&staged).unwrap(), p.plist().as_bytes());
+    assert_eq!(
+        std::fs::read(tmp.path().join(p.filename())).unwrap(),
+        b"foreign target appeared"
     );
 }

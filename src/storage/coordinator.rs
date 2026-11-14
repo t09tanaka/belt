@@ -246,11 +246,81 @@ pub struct CoordinatorStore {
 }
 
 impl CoordinatorStore {
+    /// Prepare a private, fully initialized metadata database without claiming an epoch.
+    /// The publish callback journals the staged inode before its no-replace rename.
+    /// Existing databases are inspected read-only under the owner lock, never migrated.
+    pub(crate) fn initialize_identity(
+        state_dir: &Path,
+        cluster: &ClusterId,
+        coordinator: &CoordinatorId,
+        publish: impl FnOnce(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let _owner = ProcessLock::acquire(state_dir, "coordinator.lock")?;
+        let target = state_dir.join("coordinator.db");
+        if target.try_exists()? {
+            let existing = Self::open_read_only(state_dir)?;
+            anyhow::ensure!(
+                existing.cluster_id() == cluster && existing.coordinator_id() == coordinator,
+                "foreign coordinator metadata; no migration or epoch change applied"
+            );
+            return Ok(());
+        }
+        let stage = tempfile::Builder::new()
+            .prefix(".init-")
+            .tempfile_in(state_dir)?;
+        let db = Db::open(stage.path(), DbKind::Coordinator, Access::ReadWrite)?;
+        let cl = cluster.clone();
+        let co = coordinator.clone();
+        db.write(move |tx| {
+            tx.execute(
+                "INSERT INTO cluster VALUES (?1, ?2, 0)",
+                params![cl.as_str(), co.as_str()],
+            )?;
+            tx.execute(
+                "INSERT INTO coordinator_state (singleton, cluster_id, epoch) VALUES (1, ?1, 0)",
+                [cl.as_str()],
+            )?;
+            Ok(())
+        })?;
+        db.call(|conn| {
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+            let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
+            if mode != "delete" {
+                return Err(StorageError::Corrupt(
+                    "metadata checkpoint unconfirmed".into(),
+                ));
+            }
+            Ok(())
+        })?;
+        drop(db);
+        stage.as_file().sync_all()?;
+        // Retain the staged inode when publication/journal outcome is uncertain.
+        let (_file, path) = stage.keep()?;
+        publish(&path)?;
+        Ok(())
+    }
+
     /// Open the coordinator state in `state_dir`: take the process lock (a
     /// second coordinator fails with `Locked`), migrate the database, create
     /// the cluster on first use and start a new coordinator epoch.
     pub fn open(state_dir: &Path, now_ms: u64) -> Result<Self> {
+        Self::open_bound(state_dir, now_ms, None)
+    }
+    pub(crate) fn open_bound(
+        state_dir: &Path,
+        now_ms: u64,
+        binding: Option<(ClusterId, CoordinatorId)>,
+    ) -> Result<Self> {
         let lock = ProcessLock::acquire(state_dir, "coordinator.lock")?;
+        if let Some((cluster, coordinator)) = binding {
+            let existing = Self::open_read_only(state_dir)?;
+            if existing.cluster_id() != &cluster || existing.coordinator_id() != &coordinator {
+                return Err(StorageError::Corrupt(
+                    "managed coordinator metadata binding differs; no migration/epoch change"
+                        .into(),
+                ));
+            }
+        }
         let db = Db::open(
             &state_dir.join("coordinator.db"),
             DbKind::Coordinator,

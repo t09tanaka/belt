@@ -3,6 +3,8 @@
 # Add a file to `want` when a module becomes pure and tested.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+# The report path stays local even when compilation uses CARGO_TARGET_DIR.
+mkdir -p target
 # The test run's stdout is where the harness names a failing test, so it is
 # kept in a file: shown (the failed tests and their output) when the run
 # fails, dropped when it passes.

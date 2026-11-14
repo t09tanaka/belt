@@ -423,3 +423,27 @@ fn environment_extras_require_observed_os_provenance_and_exact_values() {
             .is_err()
     );
 }
+
+#[test]
+fn running_process_requires_running_state_and_canonical_safe_pid() {
+    let base = fixture();
+    assert!(parsed(&base).running_pid().is_err());
+    for text in ["0", "1", "2147483648", "4294967296", "unknown", "+2", "002"] {
+        let sample = base.replacen(
+            "\tstate = running\n",
+            &format!("\tstate = running\n\tpid = {text}\n"),
+            1,
+        );
+        assert!(parsed(&sample).running_pid().is_err(), "{text}");
+    }
+    let sample = base.replacen("\tstate = running\n", "\tstate = running\n\tpid = 42\n", 1);
+    assert_eq!(parsed(&sample).running_pid(), Ok(42));
+    assert!(
+        parsed(&sample.replace("\tstate = running\n", "\tstate = waiting\n"))
+            .running_pid()
+            .is_err()
+    );
+    assert!(parsed(&sample.replace("\tstate = running\n", ""))
+        .running_pid()
+        .is_err());
+}

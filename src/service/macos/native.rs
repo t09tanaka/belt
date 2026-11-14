@@ -1,5 +1,5 @@
 //! Bounded launchctl transport. Captured output is never forwarded to logs.
-use super::{LaunchError, Launcher, Plan, Receipt};
+use super::{LaunchError, Launcher, LoadedState, Plan, Receipt, RunningIdentity};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::process::{Command, Stdio};
@@ -9,6 +9,7 @@ pub const OUTPUT_LIMIT: usize = 64 * 1024;
 const DEADLINE: Duration = Duration::from_secs(5);
 pub struct CommandOutput {
     pub success: bool,
+    pub exit_code: Option<i32>,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
 }
@@ -53,6 +54,7 @@ impl CommandRunner for NativeRunner {
                     if out_done && err_done {
                         return Ok(CommandOutput {
                             success: status.success(),
+                            exit_code: status.code(),
                             stdout: out,
                             stderr: err,
                         });
@@ -151,19 +153,15 @@ impl<R: CommandRunner, A: AccountLookup> NativeLauncher<R, A> {
         Self { runner, accounts }
     }
 }
-impl<R: CommandRunner, A: AccountLookup> Launcher for NativeLauncher<R, A> {
-    fn verify_loaded(&mut self, plan: &Plan, receipt: &Receipt) -> Result<(), LaunchError> {
-        let output = self
-            .runner
-            .run(&["print".into(), plan.service_target()])
-            .map_err(|_| LaunchError::NotApplied("loaded-job query failed".into()))?;
-        if !output.success || !output.stderr.is_empty() || output.stdout.len() > OUTPUT_LIMIT {
-            return Err(LaunchError::NotApplied(
-                "loaded-job query unconfirmed".into(),
-            ));
-        }
-        let observed = super::observe::parse(&output.stdout)
-            .map_err(|why| LaunchError::NotApplied(why.into()))?;
+impl<R: CommandRunner, A: AccountLookup> NativeLauncher<R, A> {
+    fn verify_output(
+        &mut self,
+        plan: &Plan,
+        receipt: &Receipt,
+        bytes: &[u8],
+    ) -> Result<(), LaunchError> {
+        let observed =
+            super::observe::parse(bytes).map_err(|why| LaunchError::NotApplied(why.into()))?;
         let account = observed
             .username()
             .map(|name| self.accounts.lookup(name))
@@ -177,6 +175,84 @@ impl<R: CommandRunner, A: AccountLookup> Launcher for NativeLauncher<R, A> {
                 account.as_ref().map(|a| (a.name.as_str(), a.uid)),
             )
             .map_err(|why| LaunchError::NotApplied(why.into()))
+    }
+}
+impl<R: CommandRunner, A: AccountLookup> Launcher for NativeLauncher<R, A> {
+    fn running_identity(
+        &mut self,
+        plan: &Plan,
+        receipt: &Receipt,
+    ) -> Result<RunningIdentity, LaunchError> {
+        let mut original = None;
+        for _ in 0..2 {
+            let output = self
+                .runner
+                .run(&["print".into(), plan.service_target()])
+                .map_err(|_| LaunchError::NotApplied("running-job query failed".into()))?;
+            if !output.success || !output.stderr.is_empty() || output.stdout.len() > OUTPUT_LIMIT {
+                return Err(LaunchError::NotApplied(
+                    "running-job query unconfirmed".into(),
+                ));
+            }
+            self.verify_output(plan, receipt, &output.stdout)?;
+            let pid = super::observe::parse(&output.stdout)
+                .and_then(|o| o.running_pid())
+                .map_err(|why| LaunchError::NotApplied(why.into()))?;
+            let identity = RunningIdentity::observe(pid).map_err(|_| {
+                LaunchError::NotApplied("running process identity unconfirmed".into())
+            })?;
+            if let Some(previous) = &original {
+                if previous != &identity {
+                    return Err(LaunchError::NotApplied("running service changed".into()));
+                }
+            }
+            original = Some(identity);
+        }
+        let identity = original.expect("two observations");
+        identity
+            .verify_live()
+            .map_err(|_| LaunchError::NotApplied("running service stopped or changed".into()))?;
+        Ok(identity)
+    }
+    fn loaded_state(&mut self, plan: &Plan, receipt: &Receipt) -> LoadedState {
+        let Ok(output) = self.runner.run(&["print".into(), plan.service_target()]) else {
+            return LoadedState::Unknown;
+        };
+        let domain = match plan.mode() {
+            super::policy::Mode::User { uid } => format!("user gui: {uid}"),
+            super::policy::Mode::SystemUser { .. } => "system".into(),
+        };
+        let absent = format!(
+            "Bad request.\nCould not find service \"{}\" in domain for {domain}\n",
+            plan.label()
+        );
+        if !output.success
+            && output.exit_code == Some(113)
+            && output.stdout.is_empty()
+            && output.stderr == absent.as_bytes()
+        {
+            return LoadedState::Absent;
+        }
+        if !output.success || !output.stderr.is_empty() || output.stdout.len() > OUTPUT_LIMIT {
+            return LoadedState::Unknown;
+        }
+        if self.verify_output(plan, receipt, &output.stdout).is_ok() {
+            LoadedState::Match
+        } else {
+            LoadedState::Unknown
+        }
+    }
+    fn verify_loaded(&mut self, plan: &Plan, receipt: &Receipt) -> Result<(), LaunchError> {
+        let output = self
+            .runner
+            .run(&["print".into(), plan.service_target()])
+            .map_err(|_| LaunchError::NotApplied("loaded-job query failed".into()))?;
+        if !output.success || !output.stderr.is_empty() || output.stdout.len() > OUTPUT_LIMIT {
+            return Err(LaunchError::NotApplied(
+                "loaded-job query unconfirmed".into(),
+            ));
+        }
+        self.verify_output(plan, receipt, &output.stdout)
     }
     fn launchctl(&mut self, arguments: &[String]) -> Result<(), LaunchError> {
         let output = self

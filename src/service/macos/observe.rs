@@ -65,6 +65,18 @@ fn scalar(key: &str) -> bool {
     )
 }
 impl Observed {
+    pub fn running_pid(&self) -> Result<u32, &'static str> {
+        if self.fields.get("state").map(String::as_str) != Some("running") {
+            return Err("service is not running");
+        }
+        let text = self.fields.get("pid").ok_or("missing running pid")?;
+        let pid = text.parse::<u32>().map_err(|_| "invalid running pid")?;
+        if pid <= 1 || i32::try_from(pid).is_err() || pid.to_string() != *text {
+            return Err("invalid running pid");
+        }
+        Ok(pid)
+    }
+
     pub fn username(&self) -> Option<&str> {
         self.fields.get("username").map(String::as_str)
     }

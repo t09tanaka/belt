@@ -52,6 +52,7 @@ pub enum Operation {
         target: super::completion::Target,
     },
     Ping,
+    Health,
     Submit {
         run_id: RunId,
         source_id: SourceId,
@@ -89,6 +90,14 @@ pub enum Reply {
     },
     Ready {
         epoch: CoordinatorEpoch,
+    },
+    Health {
+        cluster_id: ClusterId,
+        coordinator_id: CoordinatorId,
+        worker_id: WorkerId,
+        epoch: CoordinatorEpoch,
+        ready: bool,
+        process: super::macos::RunningIdentity,
     },
     Accepted {
         run_id: RunId,
@@ -233,12 +242,16 @@ struct StartupParts {
     collection: CollectConfig,
 }
 impl StartupParts {
-    fn prepare(config: ResolvedConfig, inputs: Inputs) -> anyhow::Result<Self> {
+    fn prepare(
+        config: ResolvedConfig,
+        inputs: Inputs,
+        binding: Option<(ClusterId, CoordinatorId)>,
+    ) -> anyhow::Result<Self> {
         private_dir(&inputs.state_dir)?;
         // Refuse symlinked existing state entries before storage follows them.
         reject_symlinks(&inputs.state_dir)?;
         let settings = config.runtime_settings()?;
-        let store = CoordinatorStore::open(&inputs.state_dir, wall_ms())?;
+        let store = CoordinatorStore::open_bound(&inputs.state_dir, wall_ms(), binding)?;
         let coordinator = Arc::new(settings.start_coordinator(store, Arc::new(UnknownCosts))?);
         let files = Arc::new(ResultStore::open(&inputs.state_dir.join("results"))?);
         let ipc = inputs.state_dir.join("parent");
@@ -376,6 +389,13 @@ impl Resident {
     /// Take the process lock before starting a new epoch, then construct exactly
     /// one coordinator and one ResultStore. A second owner fails before mutation.
     pub async fn start(config: &ResolvedConfig, inputs: Inputs) -> anyhow::Result<Self> {
+        Self::start_bound(config, inputs, None).await
+    }
+    pub(crate) async fn start_bound(
+        config: &ResolvedConfig,
+        inputs: Inputs,
+        binding: Option<(ClusterId, CoordinatorId)>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !inputs.collection_interval.is_zero(),
             "zero collection interval"
@@ -386,7 +406,8 @@ impl Resident {
         );
         let config_owned = config.clone();
         let mut startup = tokio::task::spawn_blocking(move || {
-            StartupParts::prepare(config_owned, inputs).map(|parts| Startup { parts: Some(parts) })
+            StartupParts::prepare(config_owned, inputs, binding)
+                .map(|parts| Startup { parts: Some(parts) })
         })
         .await??;
         let connected = connect_local(&startup, config).await;
@@ -532,11 +553,12 @@ impl Resident {
                     let captured = self.captured.clone();
                     let worker_client = self.worker_client.clone();
                     let client = self.client.clone();
+                    let worker_id = self.worker_id.clone();
                     let stop = stop.clone();
                     let admission = admission.clone();
                     requests.spawn(async move {
                         let _permit = permit;
-                        let _ = handle(stream, coordinator, sources, captured, worker_client, client, admission, stop).await;
+                        let _ = handle(stream, coordinator, sources, captured, worker_client, worker_id, client, admission, stop).await;
                     });
                 }
             }
@@ -586,6 +608,7 @@ async fn handle(
     sources: crate::source::SourceStore,
     captured: Arc<CapturedInputs>,
     worker_client: crate::protocol::Client,
+    worker_id: WorkerId,
     client: Client,
     admission: Arc<Mutex<bool>>,
     stop: watch::Sender<bool>,
@@ -679,6 +702,19 @@ async fn handle(
                     }
                 }
             }
+            Operation::Health => match super::macos::RunningIdentity::observe(std::process::id()) {
+                Ok(process) => Reply::Health {
+                    cluster_id: coordinator.store().cluster_id().clone(),
+                    coordinator_id: coordinator.store().coordinator_id().clone(),
+                    worker_id,
+                    epoch: coordinator.epoch(),
+                    ready: worker_client.ping(Duration::from_secs(1)).await.is_ok(),
+                    process,
+                },
+                Err(_) => Reply::Error {
+                    message: "resident process identity unknown".into(),
+                },
+            },
             Operation::Ping => Reply::Ready {
                 epoch: coordinator.store().epoch(),
             },

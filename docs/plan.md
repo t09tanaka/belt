@@ -45,7 +45,7 @@
 | S23 | RTR | upgrade・rollback・doctor | drain → 配置 → 互換検査 → 切替 → health → resume、失敗時の rollback、doctor（task-traffic-controller runtime の互換・policy digest・state path・Docker の resource domain・service 環境での profile 検査） | A05・A34・A36 のテスト | Mac 以外 | S22 |
 | S24 | RTR | Linux の常駐と Colab の一時 worker | Linux の systemd user service（install / start / stop / upgrade）、Colab の一時 worker（`worker --ephemeral` をノートブックから起動、利用者が用意したトンネル経由で親が SSH、起動ごとに新しい identity、`workers forget` で消滅を宣言したときだけ interrupted に確定） | Linux（CI の ubuntu）での install → start → stop の統合テスト、ephemeral の identity と forget のテスト | macOS の常駐（S22）、トンネルの提供 | S22・S23 |
 | S25 | RTR | 1 台上の試験ハーネスと障害注入 | 複数 worker（別 state dir）を 1 台で立てる、kill 点・ACK 消失・時計のずれの注入口、A 対応表のうち実機不要のものを自動試験にまとめる | 実機不要の A がすべて自動で緑 | 実機の試験（S26） | S15・S16・S18・S23 |
-| S26 | RTR | 実機での受入と初回リリース | 手元の Mac ＋ 2 台目の Mac（＋ S24 の Linux・一時 worker）で A01・A02・A24・A26・A34・A35・A37・A45・A46、結果の報告、0.1.0 の `cargo publish` とタグ・Release | §19 の全 A が緑、§20 の完了報告 | なし（最終行） | 全行、実機（2 台目の Mac）の用意 |
+| S26 | RTR | Docker での受入と初回リリース | 手元の Mac と Docker の複数 Linux worker で A01・A02・A24・A26・A34・A35・A37・A45・A46 の適用可能な範囲を検証、結果の報告、0.1.0 の `cargo publish` とタグ・Release | 適用可能な A が緑、§20 の完了報告。独立 Mac 固有の未検証項目は明記する | 追加 Mac の調達 | 全行、Docker。受入環境は下記に従う |
 
 ## 現在の進捗と追加作業（2026-11-14）
 
@@ -138,3 +138,12 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 - Linux（x86_64・arm64）を正式対応する（systemd user service）。Google Colab は常駐なしの一時 worker とする。OS 依存部分（suspend を含む単調時計、boot ID、process identity、sleep 抑止）は platform module に macOS と Linux の実装を置き、S9a・S10 から両方で動かす。
 - `.worktreeinclude` に一致する ignored ファイルは、自動で secret_files と同じ経路で送る。`secret_files` には追加分だけを書く。
 - 追加実機が未準備のため、当面は Docker の複数 worker と Linux・障害注入で受入を進める。Mac 実機固有の未検証項目は対応表に残す。
+
+### S15 public init integration
+
+Mac user init wires one LaunchAgent to the foreground combined coordinator/local-worker resident, using private retained input, a receipt journal, hash-addressed binary and authenticated connect-only readiness. Initialization never starts a detached fallback. Journaled pending publication binds device/inode/digest before publication; foreign or uncertain state requires reconciliation. Ordinary init retains its pinned binary and requires the separate upgrade flow for changed bytes. Native launchd acceptance is still required: fake transport and owned-child tests do not establish real launchd behavior. Linux public init requires S24 systemd backend and currently refuses before filesystem changes. System-user installation, runtime WorkerControl stop/drain/resume, SSH remote enrollment and upgrade/rollback remain required S22/S24 dependencies, not completion exclusions.
+
+Managed init binds planned cluster/coordinator IDs before preparing a staged metadata database at epoch 0; the first daemon claim advances it to epoch 1. A private optional managed-service reference in the immutable input makes normal bootstrap connect-only, validates journal/input/key/database receipts and refuses incomplete or foreign bindings. Readiness compares authenticated resident PID/start/boot identity with fresh running launchd observations. Stage parent directories and newly created directory ancestry are synced before a pending journal may reference them; uncertain journal/publication errors retain the exact staged inode for reconciliation. Legacy unmanaged bootstrap keeps its prior behavior.
+
+
+同時 init が `init.lock` 作成前の directory 作成で競合し、`AlreadyExists` をエラーにする問題を追加検証で確認した。競合した entry は非 symlink の実 directory と再確認し、勝った側だけでなく競合した側でも directory と親を fsync する。private leaf の所有 UID・permission 検査は維持する。directory/file/symlink と fsync の決定的 unit、および同じ epoch・worker・cluster と 1 回だけの daemon 起動を確認する所有子 process の同時 init テストが成功。負荷下の後者は約 120 秒を要した。strict all-target clippy・fmt・diff 検査も成功し、最終 immutable HEAD の全体 CI は親担当で行う。

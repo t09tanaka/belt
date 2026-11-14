@@ -45,7 +45,55 @@ pub enum LaunchError {
     #[error("launchctl outcome unknown: {0}")]
     OutcomeUnknown(String),
 }
+#[derive(Debug, PartialEq, Eq)]
+pub enum LoadedState {
+    Absent,
+    Match,
+    Unknown,
+}
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunningIdentity {
+    pub pid: u32,
+    pub start: String,
+    pub boot: String,
+}
+impl RunningIdentity {
+    /// Read-only kernel observation. Zero, init, zombies and unknowns are not owners.
+    pub fn observe(pid: u32) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            pid > 1 && i32::try_from(pid).is_ok(),
+            "invalid resident pid"
+        );
+        let start = match crate::platform::process_start_identity(pid) {
+            crate::platform::StartIdentity::Identity(start) => start,
+            _ => anyhow::bail!("resident process identity unknown"),
+        };
+        let boot =
+            crate::platform::boot_id().ok_or_else(|| anyhow::anyhow!("boot identity unknown"))?;
+        Ok(Self { pid, start, boot })
+    }
+    pub fn verify_live(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            Self::observe(self.pid)? == *self,
+            "resident process changed or stopped"
+        );
+        Ok(())
+    }
+}
 pub trait Launcher {
+    fn running_identity(&mut self, _: &Plan, _: &Receipt) -> Result<RunningIdentity, LaunchError> {
+        Err(LaunchError::NotApplied(
+            "running service identity unavailable".into(),
+        ))
+    }
+    fn loaded_state(&mut self, plan: &Plan, receipt: &Receipt) -> LoadedState {
+        if self.verify_loaded(plan, receipt).is_ok() {
+            LoadedState::Match
+        } else {
+            LoadedState::Unknown
+        }
+    }
     fn launchctl(&mut self, arguments: &[String]) -> Result<(), LaunchError>;
     /// Independently and freshly verify the loaded domain/label and executable,
     /// argv/config reference against this exact plan and managed file. A plist
@@ -146,6 +194,23 @@ impl DirectoryFiles {
         *self.lease.borrow_mut() = Arc::downgrade(&lease);
         Ok(lease)
     }
+    /// Read-only snapshot for health/bootstrap; never wait on a writer's lifecycle lease.
+    pub(crate) fn verify_read_only(&self, receipt: &Receipt) -> anyhow::Result<()> {
+        let held = self.directory.metadata()?;
+        let current = std::fs::symlink_metadata(&self.root)?;
+        anyhow::ensure!(
+            held.dev() == current.dev()
+                && held.ino() == current.ino()
+                && current.uid() == unsafe { libc::geteuid() }
+                && current.mode() & 0o022 == 0,
+            "service root changed"
+        );
+        anyhow::ensure!(
+            self.read(receipt.path())?.0 == *receipt,
+            "managed service identity/digest changed"
+        );
+        Ok(())
+    }
     fn read(&self, path: &Path) -> anyhow::Result<(Receipt, Vec<u8>)> {
         anyhow::ensure!(
             path.parent() == Some(self.root.as_path()),
@@ -180,17 +245,55 @@ impl DirectoryFiles {
     }
 }
 impl DirectoryFiles {
+    pub(crate) fn install_journaled(
+        &mut self,
+        plan: &Plan,
+        before_publish: impl FnOnce(&Receipt, &Path) -> anyhow::Result<()>,
+    ) -> Result<Receipt, InstallStartError> {
+        self.install_journaled_with_sync(plan, before_publish, |path| File::open(path)?.sync_all())
+    }
+    pub(crate) fn install_journaled_with_sync(
+        &mut self,
+        plan: &Plan,
+        before_publish: impl FnOnce(&Receipt, &Path) -> anyhow::Result<()>,
+        sync_stage_directory: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Result<Receipt, InstallStartError> {
+        self.install_prepared(
+            plan,
+            File::sync_all,
+            |_, _| Ok(()),
+            |receipt, stage| {
+                sync_stage_directory(
+                    stage
+                        .parent()
+                        .ok_or_else(|| anyhow::anyhow!("stage parent missing"))?,
+                )?;
+                before_publish(receipt, stage)
+            },
+        )
+    }
     fn install_with(
         &mut self,
         plan: &Plan,
         sync: impl FnOnce(&File) -> io::Result<()>,
         rollback: impl FnOnce(&Self, &Receipt) -> anyhow::Result<()>,
     ) -> Result<Receipt, InstallStartError> {
+        self.install_prepared(plan, sync, rollback, |_, _| Ok(()))
+    }
+    fn install_prepared(
+        &mut self,
+        plan: &Plan,
+        sync: impl FnOnce(&File) -> io::Result<()>,
+        rollback: impl FnOnce(&Self, &Receipt) -> anyhow::Result<()>,
+        before_publish: impl FnOnce(&Receipt, &Path) -> anyhow::Result<()>,
+    ) -> Result<Receipt, InstallStartError> {
         let _lock = self.lock().map_err(InstallStartError::without_receipt)?;
         let (tmp, receipt) = (|| -> anyhow::Result<_> {
             let target = self.root.join(plan.filename());
             // Never claim or overwrite a pre-existing file, even if bytes match.
-            let mut tmp = tempfile::NamedTempFile::new_in(&self.root)?;
+            let mut tmp = tempfile::Builder::new()
+                .prefix(".init-")
+                .tempfile_in(&self.root)?;
             tmp.as_file()
                 .set_permissions(std::fs::Permissions::from_mode(0o600))?;
             tmp.write_all(plan.plist().as_bytes())?;
@@ -210,11 +313,38 @@ impl DirectoryFiles {
         .map_err(InstallStartError::without_receipt)?;
         // A publication error may be ambiguous; preserve the prepared inode and
         // digest even if verification/cleanup subsequently cannot run.
-        tmp.persist_noclobber(receipt.path())
-            .map_err(|source| InstallStartError {
+        if let Err(source) = before_publish(&receipt, tmp.path()) {
+            // The callback may have durably renamed its journal before a later
+            // fsync failed. Retain the exact staged inode on every callback error.
+            tmp.keep().map_err(|error| InstallStartError {
                 receipt: Some(receipt.clone()),
-                source: source.into(),
+                source: error.into(),
             })?;
+            return Err(InstallStartError {
+                receipt: Some(receipt),
+                source,
+            });
+        }
+        if let Err(source) = rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            tmp.path(),
+            rustix::fs::CWD,
+            receipt.path(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            // A committed journal can already reference this exact staged inode.
+            tmp.keep().map_err(|error| InstallStartError {
+                receipt: Some(receipt.clone()),
+                source: error.into(),
+            })?;
+            return Err(InstallStartError {
+                receipt: Some(receipt),
+                source: std::io::Error::from(source).into(),
+            });
+        }
+        // Atomic rename leaves no hardlink/nlink=2 power-cut window. Drop only
+        // attempts cleanup of the old staging name, never the published target.
+        drop(tmp);
         if let Err(error) = sync(&self.directory) {
             return match rollback(self, &receipt) {
                 Ok(()) => Err(InstallStartError::without_receipt(error.into())),
