@@ -306,6 +306,16 @@ CREATE TRIGGER task_inherit_cancel AFTER INSERT ON task WHEN EXISTS(SELECT 1 FRO
 BEGIN UPDATE task SET cancel_requested_at_ms=(SELECT requested_at_ms FROM run_cancel_intent WHERE run_id=NEW.run_id) WHERE task_id=NEW.task_id; END;
 CREATE TRIGGER task_keep_cancel AFTER UPDATE OF cancel_requested_at_ms ON task WHEN NEW.cancel_requested_at_ms IS NULL AND EXISTS(SELECT 1 FROM run_cancel_intent WHERE run_id=NEW.run_id AND control_revision>=NEW.authorization_revision)
 BEGIN UPDATE task SET cancel_requested_at_ms=(SELECT requested_at_ms FROM run_cancel_intent WHERE run_id=NEW.run_id) WHERE task_id=NEW.task_id; END;"#.to_string(),
+            r#"CREATE TABLE collection_log (
+    attempt_id TEXT NOT NULL REFERENCES attempt(attempt_id),
+    stream TEXT NOT NULL CHECK(stream IN ('stdout','stderr')),
+    committed_bytes INTEGER NOT NULL DEFAULT 0 CHECK(committed_bytes >= 0),
+    eof INTEGER NOT NULL DEFAULT 0 CHECK(eof IN (0,1)),
+    log_truncated INTEGER NOT NULL DEFAULT 0 CHECK(log_truncated IN (0,1)),
+    dropped_bytes INTEGER NOT NULL DEFAULT 0 CHECK(dropped_bytes >= 0),
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY(attempt_id,stream)
+);"#.to_string(),
         ],
         DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}")],
     }

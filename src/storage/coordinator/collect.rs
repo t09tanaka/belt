@@ -61,16 +61,34 @@ pub struct ResultRef {
 
 /// Reference a file of the result store. The same reference again is a
 /// no-op; the same id for another file is refused.
-fn add_ref(tx: &rusqlite::Transaction<'_>, attempt: &str, r: &ResultRef, at_ms: u64) -> Result<()> {
-    let have: Option<String> = tx
+pub(super) fn add_ref(
+    tx: &rusqlite::Transaction<'_>,
+    attempt: &str,
+    r: &ResultRef,
+    at_ms: u64,
+) -> Result<()> {
+    let queued: bool = tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pending_delete WHERE locator=?1)",
+        [&r.locator],
+        |row| row.get(0),
+    )?;
+    if queued {
+        return Err(StorageError::LocatorPendingDelete(r.locator.clone()));
+    }
+    let have: Option<(String, String, String)> = tx
         .query_row(
-            "SELECT locator FROM blob_ref WHERE ref_id = ?1",
+            "SELECT attempt_id, kind, locator FROM blob_ref WHERE ref_id = ?1",
             [&r.ref_id],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .optional()?;
+    let kind = match r.kind {
+        BlobKind::Input => "input",
+        BlobKind::Log => "log",
+        BlobKind::Result => "result",
+    };
     match have {
-        Some(l) if l == r.locator => Ok(()),
+        Some((a, k, l)) if a == attempt && k == kind && l == r.locator => Ok(()),
         Some(_) => Err(StorageError::Immutable(format!("reference {}", r.ref_id))),
         None => common::add_blob_ref(
             tx,

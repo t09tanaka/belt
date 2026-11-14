@@ -187,3 +187,9 @@ standalone worker does not by itself establish remote end-to-end execution.
 source export/upload の共有 transfer lease と cleanup は background job 間で維持する。admission は network や transfer mutex を待たない。停止後の残 IO は capture store と lease だけを保持し、旧 coordinator owner を保持しない。secrets は既存 attempt/generation へ配置後に送り、worker の Preparing/lease gate を維持する。local に事前配置した legacy source も再起動後に worker verification で Ready を再構築する。
 
 この slice は local resident と再利用できる per-worker delivery helper まで。verified remote の SSH 接続・再接続 owner、worker add/install・鍵登録・native service、実 remote source/secret routing と SSH/native end-to-end acceptance は次 slice の必須残件で、S15b 以降と S22 の完了を意味しない。schema migration は不要。
+
+### S15e の増分ログ回収
+
+S15e1a は schema v7 の stream ごとの committed offset、GC ref の先行登録、CAS 更新、未 commit tail の回復、読取専用の prefix reader、検証済み旧 receipt の引継ぎを実装・独立レビュー済み。storage 92 件・ResultStore 14 件・migration と読取専用 CLI の関連 1 件、strict clippy が成功した。collector と resident の途中ログ回収、公開 `logs --follow` / `outputs`、GC と reader lifetime の接続は未実装であり、この基盤だけで live follow 完成とは扱わない。
+
+S15a は PR #40（merge `8939ef2`）、S15b は PR #41（merge `05e981c`）で main に統合済み。各対象 HEAD のローカル実行 9 ジョブとリモート 9 ジョブが成功した。S15c の bootstrap / source / query slice は PR #42 でリモート CI を確認中。

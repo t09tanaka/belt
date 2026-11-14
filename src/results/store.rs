@@ -39,7 +39,7 @@ use crate::wire::LogStream;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -104,6 +104,122 @@ pub struct ResultStore {
     /// The `.part` files this process began at their first byte.
     begun: Arc<Mutex<HashSet<PathBuf>>>,
     crash: Arc<Mutex<Option<Crash>>>,
+}
+
+/// A read-only handle to the store. Opening it creates no directories and it
+/// exposes only committed-prefix range reads, never recovery or mutation.
+#[derive(Debug, Clone)]
+pub struct LogPrefixReader {
+    root: Arc<File>,
+}
+
+/// Proof that a legacy file matched a specific final receipt on disk. Only the
+/// store can construct it; storage also checks the persisted final receipt.
+#[derive(Debug)]
+pub struct VerifiedLogPrefix {
+    attempt: AttemptId,
+    stream: LogStream,
+    digest: Digest,
+    bytes: u64,
+}
+impl VerifiedLogPrefix {
+    pub fn attempt(&self) -> &AttemptId {
+        &self.attempt
+    }
+    pub fn stream(&self) -> LogStream {
+        self.stream
+    }
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+fn open_log(
+    root: &File,
+    attempt: &AttemptId,
+    stream: LogStream,
+    write: bool,
+) -> io::Result<Option<File>> {
+    use rustix::fs::{openat, Mode, OFlags};
+    let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let open = || -> io::Result<File> {
+        let attempt_dir = openat(root, attempt.as_str(), directory, Mode::empty())?;
+        let logs = openat(&attempt_dir, "logs", directory, Mode::empty())?;
+        let access = if write { OFlags::RDWR } else { OFlags::RDONLY };
+        let file: File = openat(
+            &logs,
+            format!("{}.log", stream_name(stream)),
+            access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into();
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("log is not a regular file"));
+        }
+        Ok(file)
+    };
+    match open() {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn open_root(root: &Path) -> io::Result<File> {
+    use rustix::fs::{open, Mode, OFlags};
+    Ok(open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into())
+}
+
+impl LogPrefixReader {
+    /// Read at most 64 KiB from a DB snapshot's committed prefix. Physical tail
+    /// bytes are invisible. A missing/short prefix fails closed; no read repair.
+    /// Hold the collector/reader exclusion guard or an owner pin while reading.
+    pub fn read_range(
+        &self,
+        attempt: &AttemptId,
+        stream: LogStream,
+        committed: u64,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<Vec<u8>> {
+        if offset > committed {
+            return Err(StoreError::Offset {
+                want: offset,
+                have: committed,
+            });
+        }
+        let file = open_log(&self.root, attempt, stream, false)?;
+        let Some(mut file) = file else {
+            return if committed == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(StoreError::Offset {
+                    want: committed,
+                    have: 0,
+                })
+            };
+        };
+        let have = file.metadata()?.len();
+        if have < committed {
+            return Err(StoreError::Offset {
+                want: committed,
+                have,
+            });
+        }
+        let count = (committed - offset).min(u64::from(max_bytes.min(65536))) as usize;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; count];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
 }
 
 fn stream_name(stream: LogStream) -> &'static str {
@@ -213,9 +329,13 @@ fn append_at(path: &Path, offset: u64, data: &[u8]) -> Result<u64> {
         .append(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    let have = f.metadata()?.len();
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other("append target is not a regular file").into());
+    }
+    let have = meta.len();
     if have != offset {
         return Err(StoreError::Offset { want: offset, have });
     }
@@ -247,6 +367,97 @@ impl ResultStore {
             begun: Arc::default(),
             crash: Arc::default(),
         })
+    }
+
+    /// Open only the existing root, without creating any filesystem entries.
+    pub fn open_read_only(root: &Path) -> Result<LogPrefixReader> {
+        Ok(LogPrefixReader {
+            root: Arc::new(open_root(root)?),
+        })
+    }
+
+    /// Discard ONLY a durable-but-uncommitted append tail. The caller must own
+    /// the coordinator's collecting guard throughout recovery/append/DB commit.
+    /// A missing or short committed file is corruption, never reset to zero.
+    pub fn recover_log_prefix(
+        &self,
+        attempt: &AttemptId,
+        stream: LogStream,
+        committed: u64,
+    ) -> Result<()> {
+        let root = open_root(&self.root)?;
+        let Some(file) = open_log(&root, attempt, stream, true)? else {
+            return if committed == 0 {
+                Ok(())
+            } else {
+                Err(StoreError::Offset {
+                    want: committed,
+                    have: 0,
+                })
+            };
+        };
+        let have = file.metadata()?.len();
+        if have < committed {
+            return Err(StoreError::Offset {
+                want: committed,
+                have,
+            });
+        }
+        if have > committed {
+            file.set_len(committed)?;
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Verify a legacy final receipt before allowing its length to bootstrap
+    /// durable progress. The collecting guard must cover verification and DB
+    /// bootstrap, so the immutable receipt and file remain the same stream.
+    pub fn verify_legacy_log_prefix(
+        &self,
+        attempt: &AttemptId,
+        stream: LogStream,
+        digest: &Digest,
+        bytes: u64,
+    ) -> Result<Option<VerifiedLogPrefix>> {
+        let root = open_root(&self.root)?;
+        let file = open_log(&root, attempt, stream, false)?;
+        let actual = match file {
+            None => (Digest::of_bytes(b""), 0),
+            Some(mut file) => {
+                if file.metadata()?.len() != bytes {
+                    return Ok(None);
+                }
+                let mut hash = Sha256::new();
+                let mut size = 0u64;
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hash.update(&buf[..n]);
+                    size += n as u64;
+                    if size > bytes {
+                        return Ok(None);
+                    }
+                }
+                file.sync_all()?;
+                (
+                    sha256_digest(&hash.finalize()).expect("sha256 digest"),
+                    size,
+                )
+            }
+        };
+        if &actual.0 != digest || actual.1 != bytes {
+            return Ok(None);
+        }
+        Ok(Some(VerifiedLogPrefix {
+            attempt: attempt.clone(),
+            stream,
+            digest: digest.clone(),
+            bytes,
+        }))
     }
 
     pub fn root(&self) -> &Path {
@@ -560,6 +771,109 @@ impl ResultStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn committed_prefix_reads_hide_tail_and_recovery_truncates_only_uncommitted_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("results");
+        assert!(ResultStore::open_read_only(&root).is_err());
+        assert!(!root.exists());
+        let store = ResultStore::open(&root).unwrap();
+        let a = AttemptId::generate();
+        let reader = ResultStore::open_read_only(&root).unwrap();
+        assert_eq!(
+            reader.read_range(&a, LogStream::Stdout, 0, 0, 10).unwrap(),
+            b""
+        );
+        assert!(reader.read_range(&a, LogStream::Stdout, 1, 0, 10).is_err());
+        store
+            .append_log(&a, LogStream::Stdout, 0, b"a\xffbc")
+            .unwrap();
+        store.crash_once_at(Crash::LogAppended);
+        assert!(matches!(
+            store.append_log(&a, LogStream::Stdout, 4, b"tail"),
+            Err(StoreError::Crash(Crash::LogAppended))
+        ));
+        assert_eq!(
+            reader.read_range(&a, LogStream::Stdout, 4, 1, 2).unwrap(),
+            b"\xffb"
+        );
+        assert_eq!(
+            fs::read(store.log_path(&a, LogStream::Stdout)).unwrap(),
+            b"a\xffbctail"
+        );
+        assert!(reader.read_range(&a, LogStream::Stdout, 9, 0, 1).is_err());
+        assert!(reader.read_range(&a, LogStream::Stdout, 4, 5, 1).is_err());
+        store.recover_log_prefix(&a, LogStream::Stdout, 4).unwrap();
+        assert_eq!(store.log_len(&a, LogStream::Stdout).unwrap(), 4);
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 5).is_err());
+        assert_eq!(store.log_len(&a, LogStream::Stdout).unwrap(), 4);
+        assert!(store.recover_log_prefix(&a, LogStream::Stderr, 1).is_err());
+        store.recover_log_prefix(&a, LogStream::Stderr, 0).unwrap();
+        assert!(!store.log_path(&a, LogStream::Stderr).exists());
+        let big = vec![3; 70000];
+        store.append_log(&a, LogStream::Stderr, 0, &big).unwrap();
+        assert_eq!(
+            reader
+                .read_range(&a, LogStream::Stderr, 70000, 0, u32::MAX)
+                .unwrap()
+                .len(),
+            65536
+        );
+        assert_eq!(
+            reader
+                .read_range(&a, LogStream::Stderr, 70000, 69999, 8)
+                .unwrap(),
+            vec![3]
+        );
+        assert!(store
+            .verify_legacy_log_prefix(&a, LogStream::Stdout, &Digest::of_bytes(b"bad"), 4)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .verify_legacy_log_prefix(&a, LogStream::Stdout, &Digest::of_bytes(b"a\xffbc"), 4)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn prefix_io_refuses_symlink_components_and_nonregular_files_without_mutation() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::open(&dir.path().join("results")).unwrap();
+        let a = AttemptId::generate();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(outside.join("logs")).unwrap();
+        fs::write(outside.join("logs/stdout.log"), b"keep").unwrap();
+        symlink(&outside, store.root().join(a.as_str())).unwrap();
+        let reader = ResultStore::open_read_only(store.root()).unwrap();
+        assert!(reader.read_range(&a, LogStream::Stdout, 4, 0, 4).is_err());
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 0).is_err());
+        assert_eq!(fs::read(outside.join("logs/stdout.log")).unwrap(), b"keep");
+        fs::remove_file(store.root().join(a.as_str())).unwrap();
+        fs::create_dir(store.root().join(a.as_str())).unwrap();
+        symlink(
+            outside.join("logs"),
+            store.root().join(a.as_str()).join("logs"),
+        )
+        .unwrap();
+        assert!(reader.read_range(&a, LogStream::Stdout, 4, 0, 4).is_err());
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 0).is_err());
+        fs::remove_file(store.root().join(a.as_str()).join("logs")).unwrap();
+        fs::create_dir(store.root().join(a.as_str()).join("logs")).unwrap();
+        let path = store.log_path(&a, LogStream::Stdout);
+        symlink(outside.join("logs/stdout.log"), &path).unwrap();
+        assert!(reader.read_range(&a, LogStream::Stdout, 4, 0, 4).is_err());
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 0).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(reader.read_range(&a, LogStream::Stdout, 0, 0, 4).is_err());
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 0).is_err());
+        let alias = dir.path().join("alias");
+        symlink(store.root(), &alias).unwrap();
+        assert!(ResultStore::open_read_only(&alias).is_err());
+    }
 
     const ALPHA: &[u8] = b"0123456789";
 

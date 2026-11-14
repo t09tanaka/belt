@@ -19,6 +19,8 @@ use serde_json::Value;
 use std::path::Path;
 
 mod collect;
+mod live_log;
+pub use live_log::{LiveLogTarget, LogProgress};
 mod control;
 mod retry;
 pub use retry::{PreparedRetry, RetryPreparation};

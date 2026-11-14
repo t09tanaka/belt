@@ -330,7 +330,7 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
     // Simulate the pre-index schema with durable rows and no running owner.
     let db = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
     db.execute_batch(
-        "DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; UPDATE schema_meta SET value='3' WHERE key='schema_version';",
+        "DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; UPDATE schema_meta SET value='3' WHERE key='schema_version';",
     )
     .unwrap();
     let old_epoch: i64 = db
