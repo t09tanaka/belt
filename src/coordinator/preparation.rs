@@ -169,10 +169,20 @@ fn validate(raw: &RawPage) -> Option<(ObservationCursor, Vec<PreparationSample>)
     for (index, entry) in entries.iter().enumerate() {
         if entry.sequence != after.checked_add(index as u64 + 1)?
             || !builders.insert(entry.observation.binding.builder_id.clone())
+            || !PreparationSample::structurally_valid(
+                owner_generation,
+                native_boot,
+                entry.sequence,
+                &entry.observation,
+                *monotonic_now_ms,
+            )
         {
             return None;
         }
-        samples.push(PreparationSample::verified(
+        // An intact original observation may outlive TTL or predate the
+        // parent's current native uptime. Skip its value, not the valid page:
+        // resetting this cursor would replay the same old prefix forever.
+        if let Some(sample) = PreparationSample::verified(
             &raw.worker,
             &raw.transport,
             owner_generation,
@@ -183,7 +193,9 @@ fn validate(raw: &RawPage) -> Option<(ObservationCursor, Vec<PreparationSample>)
             raw.sent,
             raw.received,
             *monotonic_now_ms,
-        )?);
+        ) {
+            samples.push(sample);
+        }
     }
     // Empty responses still have to prove a usable native clock and boot.
     if native_boot.is_empty() || native_boot.len() > 128 {
@@ -204,6 +216,7 @@ mod tests {
     struct Feed {
         owner: crate::ids::BuilderId,
         values: Vec<PreparationObservation>,
+        now: Option<u64>,
     }
     struct Link {
         gate: Arc<InputGate>,
@@ -235,7 +248,7 @@ mod tests {
                     .push(request.preparation_observations.clone());
                 let page = request.preparation_observations.map(|request| {
                     let feed = self.feed.lock().unwrap();
-                    let now = crate::platform::monotonic_ms();
+                    let now = feed.now.unwrap_or_else(crate::platform::monotonic_ms);
                     let after = request.cursor.as_ref().map_or(0, |v| v.after_sequence);
                     let upper = request
                         .cursor
@@ -343,7 +356,11 @@ mod tests {
         let values = (0..count).map(|_| sample(&owner)).collect();
         let link = Arc::new(Link {
             gate,
-            feed: Mutex::new(Feed { owner, values }),
+            feed: Mutex::new(Feed {
+                owner,
+                values,
+                now: None,
+            }),
             questions: Mutex::default(),
             supported,
         });
@@ -514,5 +531,117 @@ mod tests {
         }
         assert_eq!(c.tick().await.unwrap(), TickReport::default());
         assert_eq!(spy.samples.lock().unwrap().len(), 1);
+    }
+    async fn synthetic_follow(c: &Coordinator, link: Arc<dyn WorkerLink>, sent: u64) {
+        let pending = Mutex::new(Vec::new());
+        let (reached, report) = c
+            .follow(
+                WorkerId::parse("worker-a").unwrap(),
+                link,
+                c.deadline(),
+                &pending,
+            )
+            .await
+            .unwrap();
+        assert!(reached.is_some());
+        assert_eq!(report, TickReport::default());
+        let mut pages = pending.into_inner().unwrap();
+        assert_eq!(pages.len(), 1);
+        pages[0].sent = sent;
+        pages[0].received = sent + 1;
+        c.ingest_preparation(pages);
+    }
+    #[tokio::test]
+    async fn old_prefix_does_not_hide_fresh_later_pages_after_reconnect_or_parent_restart() {
+        for (sent, remote_now) in [
+            (
+                2 * crate::scheduler::measured::TTL_MS,
+                2 * crate::scheduler::measured::TTL_MS,
+            ),
+            (100, 10000),
+        ] {
+            let (dir, c, link, spy) = fixture(65, true).await;
+            {
+                let mut feed = link.feed.lock().unwrap();
+                feed.now = Some(remote_now);
+                for value in &mut feed.values[..64] {
+                    value.finished_monotonic_ms = 1;
+                    value.duration_ms = 1;
+                }
+                feed.values[64].finished_monotonic_ms = remote_now - 10;
+            }
+            synthetic_follow(&c, link.clone(), sent).await;
+            assert!(spy.samples.lock().unwrap().is_empty());
+            assert_eq!(
+                c.preparation_cursors.lock().unwrap()[&WorkerId::parse("worker-a").unwrap()]
+                    .cursor
+                    .after_sequence,
+                64
+            );
+            synthetic_follow(&c, link.clone(), sent).await;
+            assert_eq!(spy.samples.lock().unwrap().len(), 1);
+            // The replacement attachment begins at zero but still crosses
+            // the retained expired prefix instead of resetting each tick.
+            let replacement: Arc<dyn WorkerLink> = Arc::new(Budgeted {
+                inner: link.clone(),
+                deadline: c.deadline(),
+            });
+            c.attach(WorkerId::parse("worker-a").unwrap(), replacement.clone())
+                .await;
+            synthetic_follow(&c, replacement.clone(), sent).await;
+            synthetic_follow(&c, replacement, sent).await;
+            assert_eq!(spy.samples.lock().unwrap().len(), 2);
+            // Parent restart loses only the cursor, not traversal progress
+            // on a structurally normal page containing unusable samples.
+            drop(c);
+            let restarted = Arc::new(
+                Coordinator::start_with(
+                    CoordinatorStore::open(dir.path(), 1).unwrap(),
+                    Default::default(),
+                    Scheduler::new(Default::default(), spy.clone()).unwrap(),
+                )
+                .unwrap(),
+            );
+            *spy.owner.lock().unwrap() = Some(Arc::downgrade(&restarted));
+            restarted
+                .attach(WorkerId::parse("worker-a").unwrap(), link.clone())
+                .await;
+            synthetic_follow(&restarted, link.clone(), sent).await;
+            synthetic_follow(&restarted, link, sent).await;
+            assert_eq!(spy.samples.lock().unwrap().len(), 3);
+        }
+    }
+    #[tokio::test]
+    async fn completed_expired_pass_advances_to_a_later_fresh_insert() {
+        let (_d, c, link, spy) = fixture(64, true).await;
+        {
+            let mut feed = link.feed.lock().unwrap();
+            feed.now = Some(10000);
+            for value in &mut feed.values {
+                value.finished_monotonic_ms = 1;
+                value.duration_ms = 1;
+            }
+        }
+        synthetic_follow(&c, link.clone(), 100).await;
+        assert!(spy.samples.lock().unwrap().is_empty());
+        {
+            let mut feed = link.feed.lock().unwrap();
+            let mut fresh = sample(&feed.owner);
+            fresh.finished_monotonic_ms = 9990;
+            feed.values.push(fresh);
+        }
+        synthetic_follow(&c, link.clone(), 100).await;
+        assert_eq!(spy.samples.lock().unwrap().len(), 1);
+        let questions = link.questions.lock().unwrap();
+        assert_eq!(
+            questions[1]
+                .as_ref()
+                .unwrap()
+                .cursor
+                .as_ref()
+                .unwrap()
+                .after_sequence,
+            64
+        );
     }
 }

@@ -11,6 +11,28 @@ pub struct PreparationSample {
     payload: String,
 }
 impl PreparationSample {
+    /// Integrity is independent of whether the remote finish can still be
+    /// mapped into this parent's native uptime and retained TTL.
+    pub(crate) fn structurally_valid(
+        owner: &BuilderId,
+        native_boot: &str,
+        sequence: u64,
+        value: &PreparationObservation,
+        remote_now: u64,
+    ) -> bool {
+        !native_boot.is_empty()
+            && native_boot.len() <= 128
+            && sequence > 0
+            && sequence <= i64::MAX as u64
+            && value.policy == POLICY
+            && value.binding.owner_generation == *owner
+            && value.boot == native_boot
+            && (1..=256).contains(&value.node_count)
+            && remote_now != u64::MAX
+            && value.finished_monotonic_ms != u64::MAX
+            && value.finished_monotonic_ms <= remote_now
+            && value.duration_ms <= i64::MAX as u64
+    }
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn verified(
         worker: &WorkerId,
@@ -24,25 +46,10 @@ impl PreparationSample {
         received: u64,
         remote_now: u64,
     ) -> Option<Self> {
-        if native_boot.is_empty()
-            || native_boot.len() > 128
+        if !Self::structurally_valid(owner, native_boot, sequence, value, remote_now)
             || parent_boot.is_empty()
-            || sequence == 0
-            || sequence > i64::MAX as u64
-            || value.policy != POLICY
-            || value.binding.owner_generation != *owner
-            || value.boot != native_boot
-            || !(1..=256).contains(&value.node_count)
-            || [
-                sent,
-                received,
-                remote_now,
-                value.finished_monotonic_ms,
-                value.duration_ms,
-            ]
-            .contains(&u64::MAX)
+            || [sent, received].contains(&u64::MAX)
             || received < sent
-            || value.duration_ms > i64::MAX as u64
         {
             return None;
         }
