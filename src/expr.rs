@@ -708,14 +708,16 @@ fn portable_ast(
         if let Some(contexts) = contexts {
             let mut value = contexts
                 .get("github")
-                .ok_or_else(|| anyhow::anyhow!("github facts unavailable"))?;
+                .ok_or_else(|| anyhow::anyhow!("github facts unavailable"))?
+                .clone();
             for key in keys.iter().rev() {
                 let Some(Ast::Lit(Value::String(key))) = key else {
                     unreachable!()
                 };
-                value = value.get(key).ok_or_else(|| {
-                    anyhow::anyhow!("github property unavailable in supplied facts")
-                })?;
+                value = get_prop(&value, &Value::String(key.clone()));
+                if value.is_null() {
+                    bail!("github property unavailable in supplied facts");
+                }
             }
         }
         return Ok(());
@@ -1087,6 +1089,34 @@ mod portable_tests {
         )
         .unwrap();
         assert!(validate_portable("success()", true, PortableStage::Matrix).is_err());
+    }
+    #[test]
+    fn portable_fact_lookup_shares_case_insensitive_property_semantics() {
+        let contexts = json_context_for_portable();
+        validate_portable_context(
+            "github.ACTOR == 'known'",
+            true,
+            PortableStage::JobIf,
+            Some(&contexts),
+        )
+        .unwrap();
+        validate_portable_context(
+            "${{ github.event.COMMITS.message }}",
+            false,
+            PortableStage::Name,
+            Some(&contexts),
+        )
+        .unwrap();
+        assert!(validate_portable_context(
+            "github.base_ref",
+            true,
+            PortableStage::JobIf,
+            Some(&contexts)
+        )
+        .is_err());
+    }
+    fn json_context_for_portable() -> Map<String, Value> {
+        [("github".into(), serde_json::json!({"actor":"known", "event":{"commits":[{"message":"first"},{"message":"second"}]}}))].into_iter().collect()
     }
     #[test]
     fn interpolation_does_not_reparse_unvalidated_generated_if() {

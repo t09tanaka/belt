@@ -33,7 +33,12 @@ impl PortableFacts {
             serde_json::to_vec(self)?.len() <= MAX_FACT_BYTES,
             "portable facts exceed byte bound"
         );
+        let mut keys = std::collections::BTreeSet::new();
         for key in self.github.keys() {
+            ensure!(
+                keys.insert(key.to_ascii_lowercase()),
+                "duplicate case-insensitive github fact"
+            );
             ensure!(
                 key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_'),
                 "invalid github fact key"
@@ -107,7 +112,12 @@ impl EvaluationContext {
             .iter()
             .find(|w| w.file == task.workflow)
             .context("missing evaluation workflow")?;
-        let mut github = self.facts.github.clone();
+        let mut github: Map<String, Value> = self
+            .facts
+            .github
+            .iter()
+            .map(|(key, value)| (key.to_ascii_lowercase(), value.clone()))
+            .collect();
         // These facts are actually present in the selected source plan.
         github.insert("workflow".into(), Value::String(wf.name.clone()));
         github.insert("event_name".into(), Value::String(wf.event.clone()));
@@ -181,8 +191,13 @@ impl Selection {
                 facts
                     .github
                     .iter()
-                    .filter(|(key, _)| !matches!(key.as_str(), "workflow" | "job" | "event_name"))
-                    .map(|(key, value)| (key.clone(), value.clone())),
+                    .filter(|(key, _)| {
+                        !matches!(
+                            key.to_ascii_lowercase().as_str(),
+                            "workflow" | "job" | "event_name"
+                        )
+                    })
+                    .map(|(key, value)| (key.to_ascii_lowercase(), value.clone())),
             );
         }
         let contexts = [

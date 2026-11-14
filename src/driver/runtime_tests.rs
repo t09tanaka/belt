@@ -739,3 +739,19 @@ fn expansion_budgets_and_grouped_dynamic_are_explicit_before_dispatch() {
     .unwrap_err();
     assert!(error.to_string().contains("grouped dynamic"));
 }
+
+#[test]
+fn source_identity_overrides_case_variants_and_fact_ambiguity_rejects() {
+    let mut f = Fixture::new(WORKFLOW);
+    f.facts.github = json!({"WORKFLOW":"forged", "JOB":"forged", "EVENT_NAME":"forged", "ACTOR":"explicit-host"}).as_object().unwrap().clone();
+    let source = f.input().evaluation_source().unwrap();
+    let evaluation = EvaluationContext::new(&f.plan, &source, f.facts.clone()).unwrap();
+    let origin = f.plan.tasks.iter().find(|t| t.dynamic_matrix).unwrap();
+    let contexts = evaluation.contexts(&f.plan, origin).unwrap();
+    assert_eq!(contexts["github"]["workflow"], f.plan.workflows[0].name);
+    assert_eq!(contexts["github"]["job"], "dynamic");
+    assert_eq!(contexts["github"]["event_name"], "push");
+    assert_eq!(contexts["github"]["actor"], "explicit-host");
+    f.facts.github.insert("actor".into(), json!("ambiguous"));
+    assert!(EvaluationContext::new(&f.plan, &source, f.facts.clone()).is_err());
+}
