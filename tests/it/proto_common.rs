@@ -16,6 +16,7 @@ pub const T: Duration = Duration::from_secs(5);
 
 pub fn identity(name: &str) -> WorkerIdentity {
     WorkerIdentity {
+        capabilities: None,
         worker_id: WorkerId::parse(name).unwrap(),
         worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
         agent_epoch: AgentEpoch(1),

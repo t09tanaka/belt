@@ -116,6 +116,8 @@ fn run_facts(c: &Connection, run: &str, cancel: bool, collections: bool) -> Resu
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementDiagnostics>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub in_place: bool,
     pub task_id: TaskId,
@@ -123,6 +125,50 @@ pub struct Task {
     pub created_at_ms: u64,
     pub cancel_requested_at_ms: Option<u64>,
     pub current_attempt: Option<CurrentAttempt>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementDiagnostics {
+    pub blocked_reason: Option<crate::error::BlockedReason>,
+    pub excluded: Vec<crate::scheduler::decide::Excluded>,
+    pub truncated: bool,
+}
+fn placement(c: &Connection, task: &str) -> Result<Option<PlacementDiagnostics>> {
+    // Readonly access to an older schema never migrates or scans its journal.
+    if !c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='event_task_waiting')", [], |r|r.get::<_,bool>(0))? { return Ok(None); }
+
+    let raw = c.query_row("SELECT substr(e.payload_json,1,65537),coalesce(json_extract(e.payload_json,'$.blocked_reason')='no_compatible_worker',0) FROM event e JOIN task t ON t.run_id=e.run_id WHERE t.task_id=?1 AND e.kind='task_waiting' AND json_extract(e.payload_json,'$.task')=?1 ORDER BY e.seq DESC LIMIT 1", [task], |r| Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?))).optional()?;
+    let Some((raw, blocked)) = raw else {
+        return Ok(None);
+    };
+    let reason = blocked.then_some(crate::error::BlockedReason::NoCompatibleWorker);
+    let decision = (raw.len() <= 65536)
+        .then(|| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .flatten()
+        .and_then(|v| {
+            serde_json::from_value::<crate::scheduler::decide::Decision>(v["decision"].clone()).ok()
+        });
+    let Some(mut decision) = decision else {
+        return Ok(Some(PlacementDiagnostics {
+            blocked_reason: reason,
+            excluded: vec![],
+            truncated: true,
+        }));
+    };
+    let mut truncated = decision.excluded.len() > 4;
+    decision.excluded.truncate(4);
+    for excluded in &mut decision.excluded {
+        truncated |= excluded.unmet.len() > 4;
+        excluded.unmet.truncate(4);
+        for text in &mut excluded.unmet {
+            truncated |= text.chars().count() > 128;
+            *text = text.chars().take(128).collect();
+        }
+    }
+    Ok(Some(PlacementDiagnostics {
+        blocked_reason: reason,
+        excluded: decision.excluded,
+        truncated,
+    }))
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentAttempt {
@@ -229,7 +275,7 @@ impl CoordinatorStore {
             let cancel=if cancel {"cancel_requested_at_ms"}else{"NULL"};
             let mut q=c.prepare(&format!("SELECT task_id,created_at_ms,{cancel} FROM task WHERE run_id=?1 AND task_id>coalesce(?2,'') ORDER BY task_id LIMIT ?3"))?;
             let raw=q.query_map(params![run.as_str(),after.map(String::from),bound],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<i64>>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
-            let items=raw.into_iter().map(|(tid,created,cancel)|Ok(Task{in_place:in_place(c,&tid)?,current_attempt:current(c,&tid)?,task_id:id("task",TaskId::parse(&tid))?,run_id:run.clone(),created_at_ms:to_u64(created)?,cancel_requested_at_ms:cancel.map(to_u64).transpose()?})).collect::<Result<Vec<_>>>()?;
+            let items=raw.into_iter().map(|(tid,created,cancel)|Ok(Task{placement: if cancel.is_none() && current(c,&tid)?.is_none() {placement(c,&tid)?} else {None},in_place:in_place(c,&tid)?,current_attempt:current(c,&tid)?,task_id:id("task",TaskId::parse(&tid))?,run_id:run.clone(),created_at_ms:to_u64(created)?,cancel_requested_at_ms:cancel.map(to_u64).transpose()?})).collect::<Result<Vec<_>>>()?;
             Ok(page(items,n,|t|t.task_id.to_string()))
         })
     }
@@ -256,6 +302,11 @@ impl CoordinatorStore {
                 .optional()?;
             raw.map(|(run, created, cancel)| {
                 Ok(Task {
+                    placement: if cancel.is_none() && current(c, task.as_str())?.is_none() {
+                        placement(c, task.as_str())?
+                    } else {
+                        None
+                    },
                     in_place: in_place(c, task.as_str())?,
                     current_attempt: current(c, task.as_str())?,
                     task_id: task,

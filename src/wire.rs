@@ -348,6 +348,8 @@ pub struct HelloRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     pub schema_version: SchemaVersion,
     /// The cluster this worker belongs to.
     pub cluster_id: ClusterId,
@@ -375,6 +377,8 @@ pub struct InspectRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     pub schema_version: SchemaVersion,
     pub worker_id: WorkerId,
     pub worker_boot_id: WorkerBootId,
@@ -813,6 +817,11 @@ impl ArtifactEncoding {
 /// `payload_hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptPayload {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::toolchain::capability::ExecutionRequirements::is_empty"
+    )]
+    pub requirements: crate::toolchain::capability::ExecutionRequirements,
     /// Mutable local workspace; source is a comparison baseline only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub in_place: bool,
@@ -1764,6 +1773,7 @@ mod tests {
     fn payload() -> AttemptPayload {
         AttemptPayload {
             outputs: Vec::new(),
+            requirements: Default::default(),
             in_place: false,
             setup: None,
             run_id: RunId::generate(),
@@ -2067,6 +2077,7 @@ mod tests {
     fn responses() -> Vec<Response> {
         vec![
             Response::Hello(HelloResponse {
+                capabilities: None,
                 schema_version: SV,
                 cluster_id: ClusterId::generate(),
                 protocol_version: 1,
@@ -2079,6 +2090,7 @@ mod tests {
                 coordinator_epoch: CoordinatorEpoch(3),
             }),
             Response::Inspect(InspectResponse {
+                capabilities: None,
                 schema_version: SV,
                 worker_id: worker(),
                 worker_boot_id: boot(),
@@ -3365,6 +3377,28 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<AttemptPayload>(serde_json::to_value(&p).unwrap()).unwrap(),
             p
+        );
+    }
+    #[test]
+    fn requirements_bind_payload_hash_without_changing_legacy_json() {
+        let old = payload();
+        let legacy = serde_json::to_value(&old).unwrap();
+        assert!(legacy.get("requirements").is_none());
+        let decoded: AttemptPayload = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(payload_hash(&old).unwrap(), payload_hash(&decoded).unwrap());
+        let mut constrained = decoded;
+        constrained.requirements = crate::toolchain::capability::ExecutionRequirements::parse(
+            Some("node22".into()),
+            &["node".into()],
+        )
+        .unwrap();
+        assert_ne!(
+            payload_hash(&old).unwrap(),
+            payload_hash(&constrained).unwrap()
+        );
+        assert_eq!(
+            constrained,
+            serde_json::from_value(serde_json::to_value(&constrained).unwrap()).unwrap()
         );
     }
 }

@@ -311,6 +311,7 @@ mod tests {
             )
             .unwrap();
         let spec = SuperviseSpec {
+            profile_fingerprint: None,
             state_dir: state,
             worker_id: worker,
             attempt_id: attempt,

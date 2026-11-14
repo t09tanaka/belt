@@ -2753,3 +2753,73 @@ async fn public_outputs_sigint_drains_blocked_tar_worker_before_releasing_pin() 
         "output reader leaked a temporary file"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_retry() {
+    use remote_task_runner::service::{completion::Target, control};
+    use remote_task_runner::toolchain::capability::ExecutionRequirements;
+    let (root, spec, input) = control_fixture();
+    let bin = root.path().join("profile-bin");
+    std::fs::create_dir(&bin).unwrap();
+    crate::common::write_executable(&bin.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
+    let profile_text=format!("schema_version=1\nactive='node22'\n[profiles.node22]\npath=[{:?}, '/usr/bin', '/bin']\nshell='/bin/sh'\ncache_namespace='node22'\nrequired_tools=['node']\nallowed_env=['MARKER','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n[profiles.node22.env]\nMARKER='profile-constant'\n",bin.to_str().unwrap());
+    std::fs::write(spec.worker_state_dir.join("profiles.toml"), profile_text).unwrap();
+    std::fs::set_permissions(
+        spec.worker_state_dir.join("profiles.toml"),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    let output=tokio::time::timeout(Duration::from_secs(30),tokio::process::Command::new(&spec.executable).args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c","test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; exit 23"]).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v))).envs(&spec.env).current_dir(&input).output()).await.unwrap().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let initial: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let run =
+        remote_task_runner::ids::RunId::parse(initial["result"]["target"]["id"].as_str().unwrap())
+            .unwrap();
+    let task =
+        remote_task_runner::ids::TaskId::parse(initial["result"]["task_id"].as_str().unwrap())
+            .unwrap();
+    let expected = ExecutionRequirements::parse(Some("node22".into()), &["node".into()]).unwrap();
+    std::fs::write(input.join(".remote-task-runner.toml"), "invalid [ config").unwrap();
+    let retry = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "retry", run.as_str()])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v)))
+        .envs(&spec.env)
+        .current_dir(&input)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        retry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&retry.stderr)
+    );
+    let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let report = tokio::time::timeout(
+        Duration::from_secs(30),
+        control::wait(&spec, Target::Run(run), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(report.cli_exit_code, 23);
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let attempts = owner.attempts_of_task(&task).unwrap();
+    assert_eq!(attempts.len(), 2);
+    let worker =
+        remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
+    for attempt in attempts {
+        let accepted = worker.get(&attempt.attempt_id).unwrap().unwrap();
+        let payload: remote_task_runner::wire::AttemptPayload =
+            serde_json::from_value(accepted.spec.clone()).unwrap();
+        assert_eq!(payload.requirements, expected);
+        assert!(!accepted.spec["_worker_profile_fingerprint"].is_null());
+    }
+    shutdown(&load(&spec)).await;
+}

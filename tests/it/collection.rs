@@ -260,6 +260,7 @@ impl Worker {
         };
         match request {
             Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
+                capabilities: None,
                 schema_version: SchemaVersion::CURRENT,
                 worker_id: self.id.clone(),
                 worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
@@ -542,6 +543,7 @@ fn decl(name: &str, if_missing: MissingPolicy) -> ArtifactDecl {
 fn spec(artifacts: Vec<ArtifactDecl>) -> TaskSpec {
     TaskSpec {
         outputs: Vec::new(),
+        requirements: Default::default(),
         in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),

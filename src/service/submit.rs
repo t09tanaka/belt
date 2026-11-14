@@ -78,6 +78,11 @@ pub async fn command_with_mode(
         }
         context.config.source_mode.value = crate::config::model::SourceMode::Worktree;
     }
+    let requirements = crate::toolchain::capability::ExecutionRequirements::parse(
+        context.config.profile.value.clone(),
+        &context.config.requires.value,
+    )
+    .map_err(invalid)?;
     if command.is_empty() {
         return Err(invalid("command cannot be empty".into()));
     }
@@ -119,12 +124,6 @@ pub async fn command_with_mode(
                 .ok_or_else(|| invalid("command timeout overflow".into()))
         })
         .transpose()?;
-    if !context.config.requires.value.is_empty() || context.config.profile.value.is_some() {
-        return Err(ApiError::new(
-            ErrorCode::NotImplemented,
-            "command capability requirements and profiles need a frozen execution planner",
-        ));
-    }
     let has_fast_worktree = captured
         .manifest
         .object_manifest
@@ -157,11 +156,19 @@ pub async fn command_with_mode(
         .collect();
     crate::outputs::validate(&[], &outputs).map_err(|e| invalid(e.into()))?;
     let mut spec = TaskSpec {
+        requirements: requirements.clone(),
         in_place,
         outputs: outputs.clone(),
         setup,
-        plan_digest: crate::outputs::command_plan_digest(&command, &outputs)
-            .map_err(|e| invalid(e.to_string()))?,
+        plan_digest: if requirements.is_empty() {
+            crate::outputs::command_plan_digest(&command, &outputs)
+                .map_err(|e| invalid(e.to_string()))?
+        } else {
+            Digest::of_bytes(
+                &serde_json::to_vec(&(&command, &outputs, &requirements))
+                    .map_err(|e| invalid(e.to_string()))?,
+            )
+        },
         manifest_digest: digest,
         commands: vec![CommandSpec {
             node_id: NodeId::parse("command").map_err(|e| invalid(e.to_string()))?,

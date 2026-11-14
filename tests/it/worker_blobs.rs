@@ -583,6 +583,7 @@ fn payload(p: &Parcel, script: &str) -> AttemptPayload {
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
         outputs: Vec::new(),
+        requirements: Default::default(),
         in_place: false,
         setup: None,
         run_id: RunId::generate(),

@@ -110,6 +110,7 @@ fn accept(store: &WorkerStore, attempt: &AttemptId, node: &str) -> AcceptedAttem
     let d = Digest::of_bytes(attempt.as_str().as_bytes());
     let payload = AttemptPayload {
         outputs: Vec::new(),
+        requirements: Default::default(),
         in_place: false,
         setup: None,
         run_id: RunId::generate(),

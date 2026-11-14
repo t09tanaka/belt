@@ -78,6 +78,7 @@ pub struct SetupConfig {
     pub traffic_config: Option<PathBuf>,
     /// Part of every template key: what the tools of this worker are.
     pub profile: String,
+    pub profile_fingerprint: Option<crate::ids::Digest>,
     /// The environment the steps start from (`PATH`, `HOME`, ...). Nothing
     /// of this process's own environment is inherited.
     pub env: BTreeMap<String, String>,
@@ -112,6 +113,7 @@ impl SetupConfig {
             supervisor_exe,
             traffic_config: None,
             profile: "default".into(),
+            profile_fingerprint: None,
             log_limit_bytes: crate::supervisor::spec::DEFAULT_LOG_LIMIT_BYTES,
             env: BTreeMap::new(),
             poll_ms: 200,
@@ -904,8 +906,28 @@ impl Setups {
     ) -> Result<(), String> {
         let mut nodes = Vec::new();
         for (i, s) in policy::hoisted(spec).iter().enumerate() {
-            let argv = policy::shell_argv(s.shell.as_deref(), &s.run)
+            let mut argv = policy::shell_argv(s.shell.as_deref(), &s.run)
                 .ok_or_else(|| format!("step {}: unsupported shell", s.id))?;
+            if s.shell.is_none() {
+                if let Some(shell) = self.cfg.env.get("SHELL") {
+                    match Path::new(shell).file_name().and_then(|v| v.to_str()) {
+                        Some("bash") => argv[0] = shell.clone(),
+                        Some("sh") => {
+                            argv = vec![shell.clone(), "-e".into(), "-c".into(), s.run.clone()]
+                        }
+                        Some("zsh") => {
+                            argv = vec![
+                                shell.clone(),
+                                "-f".into(),
+                                "-e".into(),
+                                "-c".into(),
+                                s.run.clone(),
+                            ]
+                        }
+                        _ => return Err("unsupported worker profile shell".into()),
+                    }
+                }
+            }
             let mut env = self.cfg.env.clone();
             env.extend(s.env.clone());
             nodes.push(NodeSpec {
@@ -918,6 +940,7 @@ impl Setups {
             });
         }
         let sup = SuperviseSpec {
+            profile_fingerprint: self.cfg.profile_fingerprint.clone(),
             state_dir: dir.to_path_buf(),
             worker_id: self.cfg.worker_id.clone(),
             attempt_id: attempt.clone(),

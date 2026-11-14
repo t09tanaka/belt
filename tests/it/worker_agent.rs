@@ -400,6 +400,7 @@ fn payload(script: &str) -> AttemptPayload {
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
         outputs: Vec::new(),
+        requirements: Default::default(),
         in_place: false,
         setup: None,
         run_id: RunId::generate(),
@@ -3885,4 +3886,120 @@ async fn in_place_is_refused_by_default_worker_admission_before_acceptance() {
     let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidInput);
     assert!(f.store().get(&a).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn capabilities_reject_bypassed_placement_before_acceptance_or_workspace() {
+    use remote_task_runner::toolchain::capability::ExecutionRequirements;
+    let f = fx();
+    let agent = f.start("boot-1");
+    let client = f.connect(&agent).await;
+    let mut p = payload("true");
+    p.requirements = ExecutionRequirements::parse(None, &["node".into()]).unwrap();
+    let a = AttemptId::generate();
+    let error = call(&client, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(
+        error.blocked_reason,
+        Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+    );
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert_eq!(f.host.count("prepare"), 0);
+}
+
+#[tokio::test]
+async fn capabilities_detect_tool_drift_but_keep_accepted_replays_idempotent() {
+    use remote_task_runner::toolchain::{capability::ExecutionRequirements, profile::Profile};
+    let f = fx();
+    let bin = f.path("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let node = bin.join("node");
+    std::fs::write(&node, "#!/bin/sh\necho v22.0.0\n").unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = Profile::load(
+        &f.state(),
+        &[
+            ("PATH".into(), bin.to_str().unwrap().into()),
+            ("HOME".into(), f.dir.path().to_str().unwrap().into()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile = profile.name().into();
+    cfg.profile_fingerprint = profile.report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = f.start_with(cfg);
+    let client = f.connect(&agent).await;
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    p.requirements =
+        ExecutionRequirements::parse(Some("default".into()), &["node".into()]).unwrap();
+    let a = AttemptId::generate();
+    assert!(!submit(&client, &a, &p).await.duplicate);
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    let original = f.rec(&a).spec["_worker_profile_fingerprint"].clone();
+    assert!(!original.is_null());
+    std::fs::write(&node, "#!/bin/sh\necho v20.0.0\n").unwrap();
+    assert!(submit(&client, &a, &p).await.duplicate);
+    assert_eq!(f.rec(&a).spec["_worker_profile_fingerprint"], original);
+    let b = AttemptId::generate();
+    let error = call(&client, submit_req(&b, &p)).await.unwrap_err();
+    assert_eq!(
+        error.blocked_reason,
+        Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+    );
+    assert!(f.store().get(&b).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn capability_negotiation_is_required_even_if_worker_has_the_profile() {
+    use remote_task_runner::toolchain::{
+        capability::{ExecutionRequirements, FEATURE},
+        profile::Profile,
+    };
+    let f = fx();
+    let profile = Profile::load(
+        &f.state(),
+        &[("PATH".into(), f.dir.path().to_str().unwrap().into())].into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile_fingerprint = profile.report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = f.start_with(cfg);
+    let (a, b) = duplex_pair(64 * 1024);
+    tokio::spawn(serve_connection(
+        agent,
+        b,
+        f.cluster.clone(),
+        Arc::new(Semaphore::new(4)),
+    ));
+    let mut config = client_cfg(&f.cluster);
+    config.features.retain(|v| v != FEATURE);
+    let connection = connect(a, config).await.unwrap();
+    assert!(connection.worker.capabilities.is_none());
+    let inspect = connection
+        .client
+        .call(
+            Request::Inspect(InspectRequest {
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+            }),
+            T,
+        )
+        .await
+        .unwrap();
+    let Response::Inspect(inspect) = inspect else {
+        panic!()
+    };
+    assert!(inspect.capabilities.is_none());
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    p.requirements = ExecutionRequirements::parse(Some("default".into()), &[]).unwrap();
+    let attempt = AttemptId::generate();
+    let error = call(&connection.client, submit_req(&attempt, &p))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ProtocolIncompatible);
+    assert!(f.store().get(&attempt).unwrap().is_none());
 }

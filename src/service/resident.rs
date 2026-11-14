@@ -137,6 +137,16 @@ pub struct Client {
     cluster_id: ClusterId,
     owner_token: String,
 }
+impl Operation {
+    fn requires_capabilities(&self) -> bool {
+        match self {
+            Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
+                tasks.iter().any(|(_, spec)| !spec.requirements.is_empty())
+            }
+            _ => false,
+        }
+    }
+}
 impl Client {
     /// Load credentials without taking writable coordinator ownership.
     /// The expected cluster is supplied by the caller, never inferred from a token.
@@ -203,7 +213,11 @@ impl Client {
             IO_TIMEOUT
         };
         let request = Request {
-            schema_version: 2,
+            schema_version: if operation.requires_capabilities() {
+                3
+            } else {
+                2
+            },
             cluster_id: self.cluster_id.clone(),
             owner_token: self.owner_token.clone(),
             operation,
@@ -860,7 +874,8 @@ async fn handle(
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
-        request.schema_version == 2
+        matches!(request.schema_version, 2 | 3)
+            && (request.schema_version == 3 || !request.operation.requires_capabilities())
             && request.cluster_id == client.cluster_id
             && request.owner_token == client.owner_token,
         "unauthorized parent request"

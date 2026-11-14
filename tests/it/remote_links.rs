@@ -159,6 +159,7 @@ async fn submit(
         format!("sleep {delay}")
     };
     let spec = TaskSpec {
+        in_place: false, outputs: Vec::new(), requirements: Default::default(),
         setup: None, plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::parse(manifest).or_else(|_| Digest::parse(&format!("sha256:{manifest}"))).unwrap(),
         commands: vec![CommandSpec { node_id: NodeId::parse("main").unwrap(),

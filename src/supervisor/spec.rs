@@ -145,6 +145,9 @@ pub struct ArtifactsSpec {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuperviseSpec {
+    /// Worker-measured identity, frozen before execution; namespaces TTC history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_fingerprint: Option<crate::ids::Digest>,
     /// The worker's state directory (`worker.db` lives here).
     pub state_dir: PathBuf,
     pub worker_id: WorkerId,
@@ -371,6 +374,7 @@ mod tests {
 
     fn spec() -> SuperviseSpec {
         SuperviseSpec {
+            profile_fingerprint: None,
             state_dir: "/s".into(),
             worker_id: WorkerId::parse("w").unwrap(),
             attempt_id: AttemptId::generate(),

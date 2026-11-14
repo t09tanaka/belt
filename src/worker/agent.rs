@@ -67,6 +67,7 @@ pub struct AgentConfig {
     pub supervisor_exe: PathBuf,
     pub traffic_state_dir: PathBuf,
     pub traffic_config: Option<PathBuf>,
+    pub capability_profile: Option<Arc<crate::toolchain::profile::Profile>>,
     pub profile: String,
     pub profile_fingerprint: Digest,
     pub max_active_task: u32,
@@ -130,6 +131,7 @@ impl AgentConfig {
             boot_id,
             supervisor_exe,
             traffic_config: None,
+            capability_profile: None,
             profile: "default".into(),
             profile_fingerprint: Digest::of_bytes(b""),
             max_active_task: 1,
@@ -904,6 +906,22 @@ impl Agent {
                 json!({ "error": format!("stored payload: {e}") }),
             );
         })?;
+        if let Err(error) = self
+            .check_capabilities(&payload)
+            .and_then(|_| self.check_profile_identity(rec))
+        {
+            self.note_once(a, "agent_environment_changed", json!({ "code": error.code, "blocked_reason": error.blocked_reason, "message": error.message }));
+            settle(
+                &self.cfg,
+                &self.store,
+                a,
+                failed(),
+                Settle::Interrupted,
+                false,
+            )
+            .map_err(|_| ())?;
+            return Ok(None);
+        }
         self.at(ProbePoint::LeaseMeasure, a);
         // The key and the time of its grant, with no renewal in between
         // (`lease_step`): a key read with the time of an earlier grant would
@@ -1129,6 +1147,8 @@ impl Agent {
         let attempt = &rec.attempt_id;
         let payload: AttemptPayload =
             serde_json::from_value(rec.spec.clone()).map_err(|e| internal("stored payload", e))?;
+        self.check_capabilities(&payload)?;
+        self.check_profile_identity(rec)?;
         if rec.state == AttemptState::Accepted {
             self.store
                 .transition(attempt, AttemptState::Preparing, now())
@@ -1277,16 +1297,25 @@ impl Agent {
             } else {
                 ws.cwd.join(rel)
             };
+            let env = match &self.cfg.capability_profile {
+                Some(profile) => profile.execution_environment(&c.env).map_err(invalid)?,
+                None => c.env.clone(),
+            };
             nodes.push(NodeSpec {
                 node_id: c.node_id.clone(),
                 argv: c.argv.clone(),
                 cwd,
-                env: c.env.clone(),
+                env,
                 weight: None,
                 timeout_ms: c.timeout_ms,
             });
         }
         let spec = SuperviseSpec {
+            profile_fingerprint: self
+                .cfg
+                .capability_profile
+                .as_ref()
+                .map(|_| self.cfg.profile_fingerprint.clone()),
             state_dir: self.cfg.state_dir.clone(),
             worker_id: self.cfg.worker_id.clone(),
             attempt_id: attempt.clone(),
@@ -1313,6 +1342,7 @@ impl Agent {
             artifacts,
             prepared_only,
         };
+        self.check_capabilities(&payload)?;
         spec.validate().map_err(|e| invalid(e.to_string()))?;
         let bytes = serde_json::to_vec(&spec).map_err(|e| internal("supervisor spec", e))?;
         write_atomic(&self.spec_path(attempt), &bytes)
@@ -1742,8 +1772,9 @@ impl Agent {
         let fresh = self.store.get(&r.attempt_id).map_err(api)?.is_none()
             && self.store.tombstone(&r.attempt_id).map_err(api)?.is_none();
         if fresh {
-            self.host.admit(&r.payload)?;
             policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
+            self.check_capabilities(&r.payload)?;
+            self.host.admit(&r.payload)?;
             for c in &r.payload.commands {
                 check_cwd_relative(Path::new(&c.cwd))?;
             }
@@ -1773,7 +1804,14 @@ impl Agent {
                 ));
             }
         }
-        let spec = serde_json::to_value(&r.payload).map_err(|e| internal("payload", e))?;
+        let mut spec = serde_json::to_value(&r.payload).map_err(|e| internal("payload", e))?;
+        if self.cfg.capability_profile.is_some() {
+            spec.as_object_mut().expect("payload object").insert(
+                "_worker_profile_fingerprint".into(),
+                serde_json::to_value(&self.cfg.profile_fingerprint)
+                    .map_err(|e| internal("profile identity", e))?,
+            );
+        }
         let outcome = self
             .store
             .submit(
@@ -2228,6 +2266,54 @@ impl Agent {
         )
     }
 
+    pub(crate) fn capabilities(&self) -> Option<crate::toolchain::capability::WorkerCapabilities> {
+        self.cfg
+            .capability_profile
+            .as_ref()
+            .map(|p| p.report())
+            .filter(|r| r.profile_fingerprint == self.cfg.profile_fingerprint)
+    }
+    fn check_profile_identity(&self, rec: &AcceptedAttempt) -> Result<(), ApiError> {
+        if let Some(expected) = rec.spec.get("_worker_profile_fingerprint") {
+            if expected
+                != &serde_json::to_value(&self.cfg.profile_fingerprint)
+                    .map_err(|e| internal("profile identity", e))?
+            {
+                return Err(ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "accepted worker profile changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn check_capabilities(&self, payload: &AttemptPayload) -> Result<(), ApiError> {
+        payload.requirements.validate().map_err(invalid)?;
+        if let Some(profile) = &self.cfg.capability_profile {
+            for command in &payload.commands {
+                profile
+                    .execution_environment(&command.env)
+                    .map_err(invalid)?;
+            }
+            if let Some(setup) = &payload.setup {
+                for step in &setup.steps {
+                    profile.execution_environment(&step.env).map_err(invalid)?;
+                }
+            }
+        }
+        let report = self.capabilities();
+        let missing = crate::toolchain::capability::missing(&payload.requirements, report.as_ref());
+        if !missing.is_empty() || (self.cfg.capability_profile.is_some() && report.is_none()) {
+            return Err(ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                format!(
+                    "worker capabilities changed or unmet: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+        Ok(())
+    }
     fn inspect(&self) -> Result<InspectResponse, ApiError> {
         let live = self.store.list_nonterminal().map_err(api)?;
         let (active, pending) = policy::load_counts(live.iter().map(|r| r.state));
@@ -2241,6 +2327,7 @@ impl Agent {
             .map(|s| s.f_bavail.saturating_mul(s.f_frsize))
             .unwrap_or(0);
         Ok(InspectResponse {
+            capabilities: self.capabilities(),
             schema_version: SchemaVersion::CURRENT,
             worker_id: self.cfg.worker_id.clone(),
             worker_boot_id: self.cfg.boot_id.clone(),

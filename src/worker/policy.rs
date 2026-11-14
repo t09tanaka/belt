@@ -616,6 +616,7 @@ mod tests {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
             outputs: Vec::new(),
+            requirements: Default::default(),
             in_place: false,
             setup: None,
             run_id: RunId::generate(),

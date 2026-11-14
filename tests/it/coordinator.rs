@@ -121,6 +121,7 @@ impl Cluster {
 }
 
 pub(crate) struct State {
+    capabilities: Option<remote_task_runner::toolchain::capability::WorkerCapabilities>,
     pub(crate) max_epoch: u64,
     pub(crate) held: BTreeMap<AttemptId, Held>,
     pub(crate) tombstones: BTreeSet<AttemptId>,
@@ -171,6 +172,7 @@ impl FakeWorker {
             id: id.clone(),
             cluster: Arc::clone(cluster),
             state: Mutex::new(State {
+                capabilities: None,
                 max_epoch: 0,
                 held: BTreeMap::new(),
                 tombstones: BTreeSet::new(),
@@ -313,6 +315,7 @@ impl FakeWorker {
             Request::Inspect(_) => {
                 let (active, pending) = load_counts(s.held.values().map(|h| h.state));
                 Ok(Response::Inspect(InspectResponse {
+                    capabilities: s.capabilities.clone(),
                     schema_version: SchemaVersion::CURRENT,
                     worker_id: s.says.clone(),
                     worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
@@ -666,6 +669,7 @@ impl Fx {
 pub(crate) fn spec() -> TaskSpec {
     TaskSpec {
         outputs: Vec::new(),
+        requirements: Default::default(),
         in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
@@ -2621,4 +2625,104 @@ async fn in_place_scheduler_uses_only_explicit_parent_local_and_never_automatic_
     }
     assert_eq!(attempts(&c, &task).len(), 1);
     assert!(remote.holds().is_empty());
+}
+
+#[tokio::test]
+async fn capability_filter_runs_before_forecast_and_records_unmet_requirements() {
+    use remote_task_runner::toolchain::capability::*;
+    let f = fx();
+    let old = f.worker("old", (1, 1));
+    let capable = f.worker("capable", (1, 1));
+    capable.set(|s| {
+        s.capabilities = Some(WorkerCapabilities {
+            schema_version: 1,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            profile: "node22".into(),
+            profile_digest: Digest::of_bytes(b"definition"),
+            execution_uid: 1,
+            protocol_versions: vec![1],
+            profile_fingerprint: Digest::of_bytes(b"p"),
+            tools: [(
+                "node".into(),
+                ToolObservation::Available {
+                    version: "v22.0.0".into(),
+                    identity: Digest::of_bytes(b"node"),
+                },
+            )]
+            .into(),
+            features: [FEATURE.into()].into(),
+            disk_free_bytes: None,
+            resource_budget: None,
+        })
+    });
+    let c = f.open(&[&old, &capable]);
+    let task = TaskId::generate();
+    let run = RunId::generate();
+    let mut task_spec = spec();
+    task_spec.requirements =
+        ExecutionRequirements::parse(Some("node22".into()), &["node".into(), "linux".into()])
+            .unwrap();
+    c.enqueue(
+        run.clone(),
+        source(&c),
+        vec![(task.clone(), task_spec.clone())],
+    )
+    .await
+    .unwrap();
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    assert_eq!(old.received(Op::Forecast), 0);
+    assert_eq!(capable.received(Op::Forecast), 1);
+    assert_eq!(only(&c, &task).worker_id, capable.id);
+    assert_eq!(
+        capable
+            .held(&only(&c, &task).attempt_id)
+            .unwrap()
+            .payload
+            .requirements,
+        task_spec.requirements
+    );
+    let mismatch_task = TaskId::generate();
+    task_spec.requirements.profile = Some("unknown".into());
+    c.enqueue(
+        RunId::generate(),
+        source(&c),
+        vec![(mismatch_task.clone(), task_spec)],
+    )
+    .await
+    .unwrap();
+    c.tick().await.unwrap();
+    assert!(attempts(&c, &mismatch_task).is_empty());
+    assert_eq!(old.received(Op::Forecast), 0);
+    let event = c
+        .store()
+        .events_after(0, 100)
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            e.kind == remote_task_runner::scheduler::EVENT_TASK_WAITING
+                && e.payload["task"] == mismatch_task.to_string()
+        })
+        .unwrap();
+    assert_eq!(event.payload["blocked_reason"], "no_compatible_worker");
+    let public = c
+        .store()
+        .query_task(mismatch_task)
+        .unwrap()
+        .unwrap()
+        .placement
+        .unwrap();
+    assert_eq!(
+        public.blocked_reason,
+        Some(BlockedReason::NoCompatibleWorker)
+    );
+    assert!(!public.truncated);
+    assert!(public.excluded.iter().all(|w| !w.unmet.is_empty()));
+
+    assert!(event.payload["decision"]["excluded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["why"] == "capability_mismatch" && !e["unmet"].as_array().unwrap().is_empty()));
 }

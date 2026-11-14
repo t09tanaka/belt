@@ -94,6 +94,11 @@ type Result<T, E = CoordinatorError> = std::result::Result<T, E>;
 /// from this by [`build_payload`] and nowhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
+    #[serde(
+        default,
+        skip_serializing_if = "crate::toolchain::capability::ExecutionRequirements::is_empty"
+    )]
+    pub requirements: crate::toolchain::capability::ExecutionRequirements,
     /// Mutable local workspace; source is a comparison baseline only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub in_place: bool,
@@ -129,6 +134,7 @@ pub fn build_payload(
         .clone()
         .ok_or_else(|| StorageError::Invalid(format!("run {} has no source", input.run_id)))?;
     Ok(AttemptPayload {
+        requirements: spec.requirements.clone(),
         in_place: spec.in_place,
         setup: spec.setup.clone(),
         run_id: input.run_id.clone(),
@@ -201,6 +207,7 @@ impl TickReport {
 
 /// A worker that answered `inspect` in this tick.
 struct Reached {
+    capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     worker_id: WorkerId,
     link: Arc<dyn WorkerLink>,
     attachment: Arc<dyn WorkerLink>,
@@ -602,6 +609,7 @@ impl Coordinator {
             return Ok((None, report));
         }
         let reached = Reached {
+            capabilities: inspected.capabilities,
             worker_id,
             attachment: Arc::clone(&link),
             link,
@@ -1255,16 +1263,32 @@ impl Coordinator {
                 .out
                 .iter()
                 .map(|(w, why)| Excluded {
+                    unmet: Vec::new(),
                     worker_id: w.clone(),
                     why: *why,
                 })
                 .collect();
-            let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = round
-                .open
-                .iter()
-                .filter(|w| ready(w))
+            let (compatible, mismatched): (Vec<&Reached>, Vec<&Reached>) =
+                round.open.iter().filter(|w| ready(w)).partition(|w| {
+                    crate::toolchain::capability::missing(
+                        &spec.requirements,
+                        w.capabilities.as_ref(),
+                    )
+                    .is_empty()
+                });
+            excluded.extend(mismatched.into_iter().map(|w| Excluded {
+                unmet: crate::toolchain::capability::missing(
+                    &spec.requirements,
+                    w.capabilities.as_ref(),
+                ),
+                worker_id: w.worker_id.clone(),
+                why: Exclusion::CapabilityMismatch,
+            }));
+            let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = compatible
+                .into_iter()
                 .partition(|w| !refused.contains(&w.worker_id));
             excluded.extend(left_out.into_iter().map(|w| Excluded {
+                unmet: Vec::new(),
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::RefusedTask,
             }));
@@ -1333,6 +1357,7 @@ impl Coordinator {
                 // wait for it again.
                 round.close(worker_id, Exclusion::NoForecast);
                 excluded.push(Excluded {
+                    unmet: Vec::new(),
                     worker_id: worker_id.clone(),
                     why: Exclusion::NoForecast,
                 });
@@ -1460,8 +1485,14 @@ impl Coordinator {
             return Ok(());
         }
         let run = task.run_id.clone();
+        let capability_mismatch = !decision.excluded.is_empty()
+            && decision
+                .excluded
+                .iter()
+                .all(|e| e.why == Exclusion::CapabilityMismatch);
         let payload = json!({
             "task": task.task_id.to_string(),
+            "blocked_reason": capability_mismatch.then_some("no_compatible_worker"),
             "decision": serde_json::to_value(decision)
                 .map_err(|e| CoordinatorError::Invalid(e.to_string()))?,
         });
