@@ -3157,6 +3157,71 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     assert!(forecast.target.conditional);
 }
 
+// Publish a valid same-plan, same-version replacement in this fixture's own
+// private root. Only the node script comment and its exact tree identity change;
+// both the receipt validator and registry detection must accept the replacement.
+fn replace_private_node_receipt(
+    state: &std::path::Path,
+    profile: &remote_task_runner::toolchain::profile::Profile,
+    bundle: &remote_task_runner::toolchain::contract::FrozenBundle,
+    node: &std::path::Path,
+) {
+    use remote_task_runner::toolchain::{
+        adapters::{Availability, FileIdentity, InstallationReceipt},
+        registry::Registry,
+        versions::ToolId,
+    };
+    let registry = Registry::load(state, profile, profile.report().profile_fingerprint).unwrap();
+    let tool = ToolId::parse("node").unwrap();
+    let evidence = bundle.evidence.iter().find(|e| e.tool == tool).unwrap();
+    let request = registry
+        .request(&bundle.frozen, &tool, Some(evidence))
+        .unwrap();
+    let plan = remote_task_runner::toolchain::adapters::plan(
+        request.kind,
+        &request.frozen,
+        &request.tool,
+        &request.evidence,
+        &request.private_root,
+        &request.host,
+    )
+    .unwrap();
+    let path = plan.root().join("receipt.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let previous: InstallationReceipt = serde_json::from_value(value.clone()).unwrap();
+    previous.validate(&plan).unwrap();
+    let mut bytes = std::fs::read(node).unwrap();
+    bytes.extend_from_slice(
+        format!("\n# valid replacement after {}\n", previous.digest()).as_bytes(),
+    );
+    std::fs::write(node, bytes).unwrap();
+    let identity = FileIdentity::capture(node).unwrap();
+    let entry = value["tree"]["files"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|file| file["path"].as_str() == node.to_str())
+        .unwrap();
+    *entry = serde_json::to_value(identity).unwrap();
+    let replacement: InstallationReceipt = serde_json::from_value(value).unwrap();
+    replacement.validate(&plan).unwrap();
+    assert_eq!(replacement.version(), previous.version());
+    assert_ne!(replacement.digest(), previous.digest());
+    std::fs::write(path, serde_json::to_vec(&replacement).unwrap()).unwrap();
+    let Availability::Installed(detected) = registry.detect(&request).unwrap() else {
+        panic!("valid replacement must remain installed");
+    };
+    assert_eq!(detected.digest(), replacement.digest());
+    let version = Command::new(node)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .unwrap();
+    assert!(version.status.success());
+    assert_eq!(version.stdout, b"v20.0.0\n");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries() {
     use remote_task_runner::service::{completion::Target, context::Context, control};
@@ -3318,6 +3383,87 @@ bin="$NODENV_ROOT/versions/$version/bin"
         assert_ne!(binding.fingerprint(), &profile.report().profile_fingerprint);
     }
     assert_eq!(bundles[0], bundles[1]);
+    let node20 = node20.unwrap();
+    // The binding is already accepted while project setup waits. A fully valid
+    // replacement receipt must reject both a later launch and preparation recovery.
+    for recover in [false, true] {
+        let ready = host.join(if recover {
+            "recover-setup-ready"
+        } else {
+            "waiting-setup-ready"
+        });
+        let release = host.join(if recover {
+            "recover-setup-release"
+        } else {
+            "waiting-setup-release"
+        });
+        let escaped = host.join(if recover {
+            "recover-consumer-ran"
+        } else {
+            "waiting-consumer-ran"
+        });
+        let setup_script = format!(": > '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 800 ]; do /bin/sleep 0.05; i=$((i+1)); done; test -f '{}'", ready.display(), release.display(), release.display());
+        let mut context = Context::load(spec.env.clone(), input.clone(), spec.clone()).unwrap();
+        context.config.prepare_commands = vec![vec!["/bin/sh".into(), "-c".into(), setup_script]];
+        let consumer_script = format!("echo unsafe > '{}'", escaped.display());
+        let waiting = remote_task_runner::service::submit::command(
+            context,
+            vec!["/bin/sh".into(), "-c".into(), consumer_script],
+            None,
+        )
+        .await
+        .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let accepted = owner
+            .attempts_of_task(&waiting.task_id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let binding_path = spec
+            .worker_state_dir
+            .join("attempts")
+            .join(accepted.attempt_id.as_str())
+            .join("execution-binding.json");
+        let original_binding = std::fs::read(&binding_path).unwrap();
+        assert!(worker.launches(&accepted.attempt_id).unwrap().is_empty());
+        let payload: remote_task_runner::wire::AttemptPayload =
+            serde_json::from_value(worker.get(&accepted.attempt_id).unwrap().unwrap().spec)
+                .unwrap();
+        if recover {
+            shutdown(&load(&spec)).await;
+        }
+        replace_private_node_receipt(
+            &spec.worker_state_dir,
+            &profile,
+            payload.toolchains.as_deref().unwrap(),
+            &node20,
+        );
+        if recover {
+            ensure(spec.clone()).await.unwrap();
+        }
+        std::fs::write(&release, "release").unwrap();
+        let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(30),
+            control::wait(&spec, Target::Run(waiting.run_id), &mut signals),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        if refused.cli_exit_code == 0 || escaped.exists() {
+            shutdown(&load(&spec)).await;
+            panic!("a waiting/recovered consumer used a replaced installation receipt");
+        }
+        assert!(worker.launches(&accepted.attempt_id).unwrap().is_empty());
+        assert_eq!(std::fs::read(binding_path).unwrap(), original_binding);
+        assert_eq!(std::fs::read_to_string(host.join("calls")).unwrap(), calls);
+    }
     // A running supervisor keeps its accepted immutable execution binding even
     // when a later owner observes drift. It must be adopted, never relaunched.
     let adoption_ready = host.join("adoption-ready");
@@ -3350,8 +3496,15 @@ bin="$NODENV_ROOT/versions/$version/bin"
         .join("execution-binding.json");
     let accepted_binding = std::fs::read(&binding_path).unwrap();
     assert_eq!(worker.launches(&active.attempt_id).unwrap().len(), 1);
+    let active_payload: remote_task_runner::wire::AttemptPayload =
+        serde_json::from_value(worker.get(&active.attempt_id).unwrap().unwrap().spec).unwrap();
     shutdown(&load(&spec)).await;
-    crate::common::write_executable(&node20.unwrap(), "#!/bin/sh\necho v99.0.0\n");
+    replace_private_node_receipt(
+        &spec.worker_state_dir,
+        &profile,
+        active_payload.toolchains.as_deref().unwrap(),
+        &node20,
+    );
     ensure(spec.clone()).await.unwrap();
     assert_eq!(std::fs::read(&binding_path).unwrap(), accepted_binding);
     assert_eq!(worker.launches(&active.attempt_id).unwrap().len(), 1);
@@ -3366,8 +3519,9 @@ bin="$NODENV_ROOT/versions/$version/bin"
     .unwrap();
     assert_eq!(adopted.cli_exit_code, 23);
     assert_eq!(worker.launches(&active.attempt_id).unwrap().len(), 1);
-    // The same changed artifact blocks a new launch without repair/install.
-
+    // Invalid bytes still block a new task without repair/install, independently
+    // of the valid replacement receipt checks above.
+    crate::common::write_executable(&node20, "#!/bin/sh\necho v99.0.0\n");
     let escaped = host.join("drift-consumer-ran");
     let drift_script = format!("echo unsafe > '{}'", escaped.display());
     let drift = tokio::process::Command::new(&spec.executable)

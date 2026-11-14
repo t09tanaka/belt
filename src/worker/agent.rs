@@ -1483,24 +1483,62 @@ impl Agent {
                 .map_err(|e| internal("execution binding", e))?,
         )
         .map_err(|e| internal("execution binding", e))?;
+        use crate::toolchain::{adapters, contract::observations};
         let requests = self.toolchain_requests(&bundle)?;
         let registry = self.toolchains.as_ref().expect("requests checked registry");
-        for request in requests {
-            if !matches!(
-                registry.detect(&request),
-                Ok(crate::toolchain::adapters::Availability::Installed(_))
-            ) {
-                return Err(ApiError::blocked(
-                    crate::error::BlockedReason::EnvironmentMismatch,
-                    "activated tool identity changed",
-                ));
+        let mut receipts = Vec::with_capacity(requests.len());
+        for request in &requests {
+            match registry.detect(request) {
+                Ok(adapters::Availability::Installed(receipt)) => receipts.push(receipt),
+                _ => {
+                    return Err(ApiError::blocked(
+                        crate::error::BlockedReason::EnvironmentMismatch,
+                        "activated tool identity changed",
+                    ))
+                }
             }
         }
-        binding.activation.shell.validate().map_err(invalid)?;
-        if binding.activation.base_profile != self.cfg.profile_fingerprint
-            || binding.activation.frozen != bundle.frozen.digest()
-        {
-            return Err(invalid("execution binding identity changed"));
+        let profile = self
+            .cfg
+            .capability_profile
+            .as_ref()
+            .ok_or_else(|| invalid("toolchain profile unavailable"))?;
+        let report = self.capabilities().ok_or_else(|| {
+            ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                "accepted base profile changed",
+            )
+        })?;
+        let plans = requests
+            .iter()
+            .map(|r| r.plan(&r.private_root).map_err(invalid))
+            .collect::<Result<Vec<_>, _>>()?;
+        let installed = plans
+            .iter()
+            .zip(receipts.iter().map(|r| r.as_ref()))
+            .collect::<Vec<_>>();
+        let shell = adapters::FileIdentity::capture(profile.shell()).map_err(invalid)?;
+        let setup_policy = Digest::of_bytes(
+            &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
+        );
+        // A valid same-version replacement receipt is a different execution
+        // identity. Reconstruct the complete activation read-only; never repair
+        // or rewrite the accepted binding during launch/recovery checks.
+        let current = adapters::activate_set(
+            &bundle.frozen,
+            &installed,
+            self.cfg.profile_fingerprint.clone(),
+            &observations(&report),
+            profile.environment(),
+            setup_policy,
+            &shell,
+        )
+        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))?;
+        if current != binding.activation {
+            return Err(ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                "accepted execution binding changed",
+            ));
         }
         Ok(())
     }
