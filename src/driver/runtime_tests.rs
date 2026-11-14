@@ -892,3 +892,347 @@ fn fanout_fallbacks_do_not_spend_producer_terminal_capacity() {
         .any(|a| a.kind == ActionKind::Finished));
     assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
 }
+
+fn cancel_actions(d: &Driver) -> Vec<Action> {
+    d.pending_actions()
+        .iter()
+        .filter(|a| matches!(a.kind, ActionKind::Cancel { .. }))
+        .cloned()
+        .collect()
+}
+fn finished(d: &Driver) -> bool {
+    d.pending_actions()
+        .iter()
+        .any(|a| a.kind == ActionKind::Finished)
+}
+
+#[test]
+fn cancellation_before_dispatch_and_after_finished_are_stable() {
+    let f = Fixture::new(WORKFLOW);
+    let mut d = f.driver(2);
+    let proposed = d.propose(Input::Cancel).unwrap();
+    assert!(!d.cancelled());
+    assert!(!finished(&d));
+    d.apply(&proposed).unwrap();
+    assert!(d.cancelled());
+    assert!(finished(&d));
+    assert_eq!(d.admitted(), 0);
+    assert!(ready(&d).is_empty());
+    assert!(d.state.expansions.is_empty());
+    for task in &f.plan.tasks {
+        assert_eq!(
+            d.core_decision(&task.id).unwrap().0,
+            CoreDecision::UnstartedCancelled
+        );
+    }
+    let before =
+        serde_json::to_value((&d.state.phases, &d.state.outcomes, &d.state.outbox)).unwrap();
+    commit(&mut d, Input::Cancel);
+    commit(&mut d, Input::Advance);
+    assert_eq!(
+        serde_json::to_value((&d.state.phases, &d.state.outcomes, &d.state.outbox)).unwrap(),
+        before
+    );
+    let completed=Fixture::new("on: push\njobs:\n  seed:\n    runs-on: [self-hosted, seed]\n    steps:\n      - run: echo completed\n");
+    let mut done = completed.driver(1);
+    seed(&completed, &mut done);
+    assert!(finished(&done));
+    assert!(!done.cancelled());
+    let before =
+        serde_json::to_value((&done.state.phases, &done.state.outcomes, &done.state.outbox))
+            .unwrap();
+    commit(&mut done, Input::Cancel);
+    commit(&mut done, Input::Cancel);
+    assert!(!done.cancelled());
+    assert_eq!(
+        serde_json::to_value((&done.state.phases, &done.state.outcomes, &done.state.outbox))
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn cancellation_owned_producer_waits_real_wire_through_ack_and_replay() {
+    let f = Fixture::new(WORKFLOW);
+    let mut d = f.driver(2);
+    let mut journal = vec![commit(&mut d, Input::Advance)];
+    let action = ready(&d).remove(0);
+    let task = ready_task(&action).unwrap().to_string();
+    journal.push(commit(
+        &mut d,
+        Input::Claim {
+            task: task.clone(),
+            token: "actual-owner".into(),
+        },
+    ));
+    let (wire, _) = f.execute(&action, "owned-seed");
+    journal.push(commit(&mut d, Input::Cancel));
+    assert!(d.cancelled());
+    assert_eq!(d.admitted(), 1);
+    assert!(!finished(&d));
+    assert!(d.state.expansions.is_empty());
+    let actions = cancel_actions(&d);
+    assert_eq!(actions.len(), 1);
+    assert!(
+        matches!(&actions[0].kind,ActionKind::Cancel{task:id,token} if id==&task && token=="actual-owner")
+    );
+    journal.push(commit(&mut d, Input::Cancel));
+    assert_eq!(cancel_actions(&d), actions);
+    let mut replay = f.driver(2);
+    for record in &journal {
+        replay
+            .apply(&Transition::from_json(&serde_json::to_string(record).unwrap()).unwrap())
+            .unwrap();
+    }
+    assert_eq!(cancel_actions(&replay), actions);
+    let ack = commit(
+        &mut d,
+        Input::Ack {
+            action: actions[0].id.clone(),
+        },
+    );
+    replay.apply(&ack).unwrap();
+    let repeat = commit(&mut d, Input::Cancel);
+    replay.apply(&repeat).unwrap();
+    assert!(cancel_actions(&d).is_empty());
+    assert_eq!(d.admitted(), 1);
+    assert!(!finished(&d));
+    assert!(d
+        .propose(Input::Claim {
+            task: task.clone(),
+            token: "replacement".into()
+        })
+        .is_err());
+    let receipt = commit(
+        &mut d,
+        Input::Settle {
+            task: task.clone(),
+            token: "actual-owner".into(),
+            result_digest: wire.digest().unwrap(),
+            result: Box::new(wire),
+        },
+    );
+    replay.apply(&receipt).unwrap();
+    assert_eq!(d.admitted(), 0);
+    assert!(finished(&d));
+    assert_eq!(d.outcome(FILE, "seed").unwrap().status, JobStatus::Success);
+    assert_eq!(
+        d.outcome(FILE, "dynamic").unwrap().status,
+        JobStatus::Cancelled
+    );
+    assert_eq!(
+        serde_json::to_value(&d.state).unwrap(),
+        serde_json::to_value(&replay.state).unwrap()
+    );
+}
+
+#[test]
+fn cancellation_expanded_members_joins_only_after_owned_receipt() {
+    let f = Fixture::new(WORKFLOW);
+    let mut d = f.driver(2);
+    seed(&f, &mut d);
+    let legs = ready(&d);
+    claim(&mut d, &legs[0]);
+    let (wire, _) = f.execute(&legs[0], "owned-leg");
+    commit(&mut d, Input::Cancel);
+    assert_eq!(d.admitted(), 1);
+    assert!(!finished(&d));
+    assert!(ready(&d).is_empty());
+    assert!(d.outcome(FILE, "dynamic").is_none());
+    assert_eq!(
+        d.core_decision(ready_task(&legs[1]).unwrap()).unwrap().0,
+        CoreDecision::UnstartedCancelled
+    );
+    let cancellation = cancel_actions(&d).remove(0);
+    commit(
+        &mut d,
+        Input::Ack {
+            action: cancellation.id,
+        },
+    );
+    commit(&mut d, Input::Cancel);
+    assert_eq!(d.admitted(), 1);
+    assert!(cancel_actions(&d).is_empty());
+    settle(&mut d, &legs[0], wire);
+    assert!(finished(&d));
+    assert_eq!(d.admitted(), 0);
+    let joined = d.outcome(FILE, "dynamic").unwrap();
+    assert_eq!(joined.status, JobStatus::Cancelled);
+    assert_eq!(joined.outputs["value"], "v0");
+    let live = &d.state.phases[ready_task(&legs[0]).unwrap()];
+    assert!(matches!(live, Phase::Terminal(Terminal::Worker { .. })));
+}
+
+#[test]
+fn cancellation_and_failfast_share_once_only_requests_in_both_orders() {
+    let workflow = WORKFLOW
+        .replace("fail-fast: false", "fail-fast: true")
+        .replace(
+            "{\"n\":1,\"os\":\"beta\"}]}",
+            "{\"n\":1,\"os\":\"beta\"},{\"n\":2,\"os\":\"gamma\"}]}",
+        )
+        .replace("strategy.job-total }}' = 2", "strategy.job-total }}' = 3")
+        .replace(
+            "          test ! -e marker",
+            "          if [ \"$LEG\" = 0 ]; then exit 1; fi\n          test ! -e marker",
+        );
+    for cancel_first in [false, true] {
+        let f = Fixture::new(&workflow);
+        let mut d = f.driver(3);
+        seed(&f, &mut d);
+        let legs = ready(&d);
+        claim(&mut d, &legs[0]);
+        claim(&mut d, &legs[1]);
+        let (failure, _) = f.execute(&legs[0], "failing-owner");
+        let (success, _) = f.execute(&legs[1], "live-owner");
+        if cancel_first {
+            commit(&mut d, Input::Cancel);
+        }
+        if cancel_first {
+            for action in cancel_actions(&d) {
+                commit(&mut d, Input::Ack { action: action.id });
+            }
+        }
+        settle(&mut d, &legs[0], failure);
+        if !cancel_first {
+            for action in cancel_actions(&d) {
+                commit(&mut d, Input::Ack { action: action.id });
+            }
+            commit(&mut d, Input::Cancel);
+        }
+        commit(&mut d, Input::Cancel);
+        assert!(cancel_actions(&d).is_empty());
+        assert_eq!(d.admitted(), 1);
+        assert!(!finished(&d));
+        let Phase::Terminal(queued) = &d.state.phases[ready_task(&legs[2]).unwrap()] else {
+            panic!()
+        };
+        assert_eq!(
+            queued.outcomes()[0].status,
+            if cancel_first {
+                JobStatus::Cancelled
+            } else {
+                JobStatus::Skipped
+            }
+        );
+        settle(&mut d, &legs[1], success);
+        assert_eq!(d.admitted(), 0);
+        assert!(finished(&d));
+        assert_eq!(
+            d.outcome(FILE, "dynamic").unwrap().status,
+            JobStatus::Failure
+        );
+    }
+}
+
+#[test]
+fn claim_capacity_accounts_escaped_tokens_and_keeps_cancel_admissible() {
+    let f = Fixture::new(WORKFLOW);
+    let mut d = f.driver(2);
+    d.state_byte_limit = 12 * 1024;
+    commit(&mut d, Input::Advance);
+    let action = ready(&d).remove(0);
+    let task = ready_task(&action).unwrap().to_string();
+    let before = serde_json::to_value(&d.state).unwrap();
+    let rejected = d
+        .propose(Input::Claim {
+            task: task.clone(),
+            token: "\0".repeat(1024),
+        })
+        .unwrap_err();
+    assert!(rejected.to_string().contains("cancellation capacity"));
+    assert_eq!(serde_json::to_value(&d.state).unwrap(), before);
+    let owner = "\0".repeat(256);
+    commit(
+        &mut d,
+        Input::Claim {
+            task: task.clone(),
+            token: owner.clone(),
+        },
+    );
+    assert_eq!(d.admitted(), 1);
+    let (wire, _) = f.execute(&action, "capacity-owner");
+    commit(&mut d, Input::Cancel);
+    assert_eq!(d.admitted(), 1);
+    assert!(!finished(&d));
+    assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+    let requested = cancel_actions(&d);
+    assert_eq!(requested.len(), 1);
+    assert!(matches!(&requested[0].kind,ActionKind::Cancel{token,..} if token==&owner));
+    commit(
+        &mut d,
+        Input::Settle {
+            task,
+            token: owner,
+            result_digest: wire.digest().unwrap(),
+            result: Box::new(wire),
+        },
+    );
+    assert_eq!(d.admitted(), 0);
+    assert!(finished(&d));
+}
+
+#[test]
+fn cancel_projection_reserves_existing_matrix_outputs_with_json_escapes() {
+    let payload = "\\001".repeat(1024);
+    let workflow = WORKFLOW.replace(
+        "          echo \"value=v$LEG\" >> \"$GITHUB_OUTPUT\"",
+        &format!("          printf 'value=%b\\n' '{payload}' >> \"$GITHUB_OUTPUT\""),
+    );
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(2);
+    d.state_byte_limit = 32 * 1024;
+    seed(&f, &mut d);
+    let legs = ready(&d);
+    assert_eq!(legs.len(), 2);
+    claim(&mut d, &legs[0]);
+    let (wire, _) = f.execute(&legs[0], "escaped-result-worker");
+    assert_eq!(wire.outcomes[0].status, JobStatus::Success);
+    assert_eq!(wire.outcomes[0].outputs["value"], "\u{1}".repeat(1024));
+    settle(&mut d, &legs[0], wire);
+    assert!(d.outcome(FILE, "dynamic").is_none());
+    let bytes = crate::expr::serialized_size(&d.state, d.state_byte_limit).unwrap();
+    assert!(bytes + d.cancel_reserve(&d.state).unwrap() <= d.state_byte_limit);
+    commit(&mut d, Input::Cancel);
+    assert!(finished(&d));
+    assert_eq!(d.admitted(), 0);
+    let joined = d.outcome(FILE, "dynamic").unwrap();
+    assert_eq!(joined.status, JobStatus::Cancelled);
+    assert_eq!(joined.outputs["value"], "\u{1}".repeat(1024));
+    assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+}
+
+#[test]
+fn oversized_real_result_is_explicit_storage_error_and_keeps_owner() {
+    let value = "z".repeat(6000);
+    let workflow=format!("on: push\njobs:\n  seed:\n    runs-on: [self-hosted, seed]\n    outputs:\n      value: ${{{{ steps.seed.outputs.value }}}}\n    steps:\n      - id: seed\n        run: printf 'value=%s\\n' '{value}' >> \"$GITHUB_OUTPUT\"\n  consumer:\n    needs: seed\n    runs-on: x\n    steps:\n      - run: exit 99\n");
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(1);
+    d.state_byte_limit = 12 * 1024;
+    commit(&mut d, Input::Advance);
+    let action = ready(&d).remove(0);
+    claim(&mut d, &action);
+    let (wire, _) = f.execute(&action, "oversized-real-worker");
+    assert_eq!(wire.outcomes[0].status, JobStatus::Success);
+    let task = ready_task(&action).unwrap().to_string();
+    let before = serde_json::to_value(&d.state).unwrap();
+    let error = d
+        .propose(Input::Settle {
+            task: task.clone(),
+            token: task,
+            result_digest: wire.digest().unwrap(),
+            result: Box::new(wire),
+        })
+        .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("worker result exceeds remaining state capacity"));
+    assert_eq!(serde_json::to_value(&d.state).unwrap(), before);
+    assert_eq!(d.admitted(), 1);
+    // The valid external terminal receipt cannot be stored in this tiny State;
+    // requesting cancellation cannot forge a smaller receipt or release owner.
+    commit(&mut d, Input::Cancel);
+    assert_eq!(d.admitted(), 1);
+    assert!(!finished(&d));
+    assert_eq!(cancel_actions(&d).len(), 1);
+}

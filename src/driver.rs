@@ -3,7 +3,9 @@
 //! Dynamic members are derived from verified source metadata and portable facts.
 //! Shards, worker authentication and retries remain host/following-slice work.
 //! Hosts durably commit a proposed transition before applying it and sending
-//! its outbox. A claim acknowledges Ready; only settlement releases admission.
+//! its outbox. A claim acknowledges Ready; only a real terminal Wire settlement
+//! releases admission. Cancel is a request, never confirmation that a host
+//! stopped. Hosts retain ownership/permits through ACK/restart until that receipt.
 //! Worker ownership/source/receipt authentication remains the host's duty.
 
 use crate::dag::{ExecutionTask, JobNode, NodeKind};
@@ -20,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const DRIVER_VERSION: u32 = 2;
+pub const DRIVER_VERSION: u32 = 3;
 const MAX_TASKS: usize = 4096;
 const MAX_TEXT: usize = 16384;
 
@@ -36,11 +38,17 @@ pub struct DriverConfig {
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Input {
     Advance,
+    /// Durably request cancellation of this entire driver/run. Unclaimed
+    /// work becomes a core cancellation; owned work requires real settlement.
+    Cancel,
     Claim {
         task: String,
         token: String,
     },
     /// A real worker result. Host must fence/verify attempt ownership first.
+    /// A result (or downstream input copies) exceeding bounded State storage
+    /// remains an explicit capacity error with ownership/permit unchanged;
+    /// cancellation is not a substitute terminal receipt for such a worker.
     Settle {
         task: String,
         token: String,
@@ -106,6 +114,7 @@ impl Transition {
 #[serde(rename_all = "snake_case")]
 pub enum CoreDecision {
     UnstartedSkipped,
+    UnstartedCancelled,
     EarlyFailure,
     MatrixJoined,
 }
@@ -155,6 +164,7 @@ enum Phase {
 #[derive(Debug, Clone, Serialize)]
 struct State {
     revision: u64,
+    cancelled: bool,
     phases: BTreeMap<String, Phase>,
     expansions: BTreeMap<String, Expansion>,
     // Tuple keys are not JSON object keys; nested maps preserve workflow scope.
@@ -326,6 +336,7 @@ impl Driver {
             state_byte_limit: MAX_WIRE_BYTES,
             state: State {
                 revision: 0,
+                cancelled: false,
                 phases,
                 expansions: BTreeMap::new(),
                 outcomes: BTreeMap::new(),
@@ -335,6 +346,10 @@ impl Driver {
         };
         driver.bound(&driver.state)?;
         Ok(driver)
+    }
+    /// Whether a cancellation request was committed before run completion.
+    pub fn cancelled(&self) -> bool {
+        self.state.cancelled
     }
     pub fn core_decision(&self, task: &str) -> Option<(CoreDecision, Option<&str>)> {
         match self.state.phases.get(task)? {
@@ -447,6 +462,13 @@ impl Driver {
             .context("driver revision exhausted")?;
         match input {
             Input::Advance => {}
+            Input::Cancel => {
+                // A late request cannot rewrite an already completed run.
+                if !s.finished && !s.cancelled {
+                    s.cancelled = true;
+                    self.cancel_unclaimed(&mut s)?;
+                }
+            }
             Input::Ack { action } => {
                 ensure!(action.len() <= MAX_TEXT, "action id too long");
                 // Unknown ACKs are harmless and idempotent. A Ready ACK does
@@ -460,6 +482,7 @@ impl Driver {
                 });
             }
             Input::Claim { task, token } => {
+                ensure!(!s.cancelled, "run is cancelled");
                 ensure!(
                     !token.is_empty() && token.len() <= MAX_TEXT,
                     "invalid ownership token"
@@ -505,6 +528,8 @@ impl Driver {
                 );
                 s.outbox
                     .retain(|a| ready_task(&a.kind) != Some(task.as_str()));
+                self.ensure_cancel_capacity(&s)
+                    .context("claim exceeds durable cancellation capacity")?;
             }
             Input::Settle {
                 task,
@@ -613,6 +638,9 @@ impl Driver {
                 if failed {
                     self.fail_fast(&mut s, &t)?;
                 }
+                self.ensure_cancel_capacity(&s).context(
+                    "worker result exceeds remaining state capacity reserved for cancellation",
+                )?;
             }
         }
         self.progress(&mut s)?;
@@ -630,6 +658,7 @@ impl Driver {
         ensure!(s.outbox.len() <= MAX_TASKS * 2 + 1, "outbox exceeds bound");
         crate::expr::serialized_size(s, self.state_byte_limit)
             .context("driver state exceeds byte bound")?;
+        self.ensure_cancel_capacity(s)?;
         Ok(())
     }
     fn push(&self, s: &mut State, key: &str, kind: ActionKind) {
@@ -681,25 +710,153 @@ impl Driver {
                     s.outbox
                         .retain(|a| ready_task(&a.kind) != Some(member.id.as_str()));
                 }
-                Phase::Claimed { token, inputs, .. } => {
-                    s.phases.insert(
-                        member.id.clone(),
-                        Phase::Claimed {
-                            token: token.clone(),
-                            inputs,
-                            cancel_requested: true,
-                        },
-                    );
-                    self.push(
-                        s,
-                        &format!("cancel:{}", member.id),
-                        ActionKind::Cancel {
-                            task: member.id.clone(),
-                            token,
-                        },
-                    );
-                }
+                Phase::Claimed { .. } => self.request_cancel(s, &member.id),
                 Phase::Terminal(_) | Phase::Expanded => {}
+            }
+        }
+        Ok(())
+    }
+    fn unstarted_cancel_reserve(task: &ExecutionTask) -> Result<usize> {
+        // Core terminal + logical outcome/map identity; cancelled outcomes have
+        // no user outputs and a fixed short diagnostic. Count escaped JSON IDs.
+        Ok(1024usize
+            .saturating_mul(task.jobs.len().max(1))
+            .saturating_add(
+                crate::expr::serialized_size(&(&task.jobs, &task.workflow), MAX_WIRE_BYTES)?
+                    .saturating_mul(4),
+            ))
+    }
+    fn cancel_reserve(&self, s: &State) -> Result<usize> {
+        if s.cancelled || s.finished {
+            return Ok(0);
+        }
+        let tasks = self.plan.tasks.iter().chain(
+            s.expansions
+                .values()
+                .flat_map(|e| e.selections.iter().map(|selection| &selection.task)),
+        );
+        let mut reserve = 0usize;
+        for task in tasks {
+            let addition = match &s.phases[&task.id] {
+                Phase::Pending | Phase::Ready { .. } => Self::unstarted_cancel_reserve(task)?,
+                Phase::Claimed {
+                    token,
+                    cancel_requested: false,
+                    ..
+                } => {
+                    let id = format!("{}:cancel:{}", self.plan.digest, task.id);
+                    crate::expr::serialized_size(&(&id, &task.id, token), MAX_WIRE_BYTES)?
+                        .saturating_add(512)
+                }
+                Phase::Terminal(terminal)
+                    if task.variant.as_ref().is_some_and(|_| {
+                        !s.outcomes
+                            .get(&task.workflow)
+                            .is_some_and(|m| m.contains_key(&task.jobs[0]))
+                    }) =>
+                {
+                    // Cancellation may complete an otherwise-unfinished matrix:
+                    // reserve aggregate/Core/map copies of already-real outputs.
+                    crate::expr::serialized_size(&terminal.outcomes(), MAX_WIRE_BYTES)?
+                        .saturating_mul(2)
+                        .saturating_add(1024)
+                }
+                Phase::Terminal(terminal)
+                    if task.variant.is_none()
+                        && !s
+                            .outcomes
+                            .get(&task.workflow)
+                            .is_some_and(|m| task.jobs.iter().all(|job| m.contains_key(job))) =>
+                {
+                    crate::expr::serialized_size(&terminal.outcomes(), MAX_WIRE_BYTES)?
+                        .saturating_add(1024)
+                }
+                _ => 0,
+            };
+            reserve = reserve.saturating_add(addition);
+        }
+        Ok(reserve)
+    }
+    fn ensure_cancel_capacity(&self, s: &State) -> Result<()> {
+        let bytes = crate::expr::serialized_size(s, self.state_byte_limit)?;
+        ensure!(
+            bytes
+                .checked_add(self.cancel_reserve(s)?)
+                .is_some_and(|n| n <= self.state_byte_limit),
+            "state lacks durable cancellation capacity"
+        );
+        Ok(())
+    }
+    fn request_cancel(&self, s: &mut State, task: &str) {
+        let Some(Phase::Claimed {
+            token,
+            cancel_requested,
+            ..
+        }) = s.phases.get_mut(task)
+        else {
+            return;
+        };
+        // Persist the request bit independently of its outbox ACK; a repeated
+        // run cancel or another fail-fast must not recreate an ACKed action.
+        if *cancel_requested {
+            return;
+        }
+        *cancel_requested = true;
+        let token = token.clone();
+        self.push(
+            s,
+            &format!("cancel:{task}"),
+            ActionKind::Cancel {
+                task: task.into(),
+                token,
+            },
+        );
+    }
+    fn cancel_unclaimed(&self, s: &mut State) -> Result<()> {
+        for task in self.tasks(s) {
+            match &s.phases[&task.id] {
+                Phase::Pending | Phase::Ready { .. } => {
+                    let wf = self
+                        .plan
+                        .workflows
+                        .iter()
+                        .find(|w| w.file == task.workflow)
+                        .context("missing cancellation workflow")?;
+                    let outcomes = task
+                        .jobs
+                        .iter()
+                        .map(|job| {
+                            let ancestor_failed = wf.job(job).is_some_and(|j| {
+                                j.needs.iter().any(|need| {
+                                    s.outcomes
+                                        .get(&task.workflow)
+                                        .and_then(|m| m.get(need))
+                                        .is_some_and(JobOutcome::failed_or_ancestor_failed)
+                                })
+                            });
+                            JobOutcome {
+                                job: job.clone(),
+                                variant: task.variant.as_ref().map(|v| v.index),
+                                status: JobStatus::Cancelled,
+                                outputs: BTreeMap::new(),
+                                skipped: Some("run cancelled".into()),
+                                ancestor_failed,
+                            }
+                        })
+                        .collect();
+                    s.phases.insert(
+                        task.id.clone(),
+                        Phase::Terminal(Terminal::Core {
+                            decision: CoreDecision::UnstartedCancelled,
+                            diagnostic: Some("run cancelled".into()),
+                            outcomes,
+                        }),
+                    );
+                    s.outbox
+                        .retain(|action| ready_task(&action.kind) != Some(task.id.as_str()));
+                }
+                Phase::Claimed { .. } => self.request_cancel(s, &task.id),
+                Phase::Expanded | Phase::Terminal(_) => {}
             }
         }
         Ok(())
@@ -743,6 +900,9 @@ impl Driver {
         let mut bytes = crate::expr::serialized_size(&(origin, expansion), limit)?
             .checked_add(512)
             .context("expansion state byte budget exceeded")?;
+        for selection in &expansion.selections {
+            bytes = bytes.saturating_add(Self::unstarted_cancel_reserve(&selection.task)?);
+        }
         for dispatch in &expansion.dispatches {
             let phase =
                 crate::expr::serialized_size(&(dispatch.task_id(), &expansion.inputs), limit)?;
@@ -877,7 +1037,7 @@ impl Driver {
                         .iter()
                         .filter_map(|n| finished.and_then(|m| m.get(*n))),
                     finished.into_iter().flat_map(|m| m.values()),
-                    false,
+                    s.cancelled,
                 );
                 changed = true;
                 if t.dynamic_matrix {
@@ -892,7 +1052,8 @@ impl Driver {
                     let remaining = self
                         .state_byte_limit
                         .saturating_sub(baseline_bytes)
-                        .saturating_sub(fallback_reserve);
+                        .saturating_sub(fallback_reserve)
+                        .saturating_sub(self.cancel_reserve(s)?);
                     let mut derivation = dispatch::derive(
                         &self.plan,
                         evaluation,
@@ -1411,6 +1572,57 @@ mod tests {
                 action: "x".repeat(MAX_WIRE_BYTES + 1)
             })
             .is_err());
+    }
+    #[test]
+    fn run_cancel_joins_static_matrices_without_cross_workflow_results() {
+        let mut d = driver(true, 2);
+        commit(&mut d, Input::Advance);
+        let a = ready(&d, ".github/workflows/a.yml")[0].clone();
+        let b = ready(&d, ".github/workflows/b.yml")[0].clone();
+        commit(
+            &mut d,
+            Input::Claim {
+                task: a.clone(),
+                token: a.clone(),
+            },
+        );
+        commit(
+            &mut d,
+            Input::Claim {
+                task: b.clone(),
+                token: b.clone(),
+            },
+        );
+        commit(&mut d, Input::Cancel);
+        assert_eq!(d.admitted(), 2);
+        assert_eq!(
+            d.pending_actions()
+                .iter()
+                .filter(|a| matches!(a.kind, ActionKind::Cancel { .. }))
+                .count(),
+            2
+        );
+        settle(&mut d, &a, JobStatus::Success, "A");
+        assert_eq!(d.admitted(), 1);
+        assert_eq!(
+            d.outcome(".github/workflows/a.yml", "first")
+                .unwrap()
+                .outputs["value"],
+            "A"
+        );
+        assert!(d.outcome(".github/workflows/b.yml", "first").is_none());
+        settle(&mut d, &b, JobStatus::Success, "B");
+        assert_eq!(d.admitted(), 0);
+        assert_eq!(
+            d.outcome(".github/workflows/b.yml", "first")
+                .unwrap()
+                .outputs["value"],
+            "B"
+        );
+        assert!(d
+            .pending_actions()
+            .iter()
+            .any(|a| a.kind == ActionKind::Finished));
     }
 }
 
