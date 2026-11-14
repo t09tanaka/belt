@@ -3,9 +3,15 @@
 //! Dynamic members are derived from verified source metadata and portable facts.
 //! Shards, worker authentication and retries remain host/following-slice work.
 //! Hosts durably commit a proposed transition before applying it and sending
-//! its outbox. A claim acknowledges Ready; only a real terminal Wire settlement
-//! releases admission. Cancel is a request, never confirmation that a host
-//! stopped. Hosts retain ownership/permits through ACK/restart until that receipt.
+//! its outbox. A claim acknowledges Ready. Before sending execution work or
+//! starting task execution, hosts MUST durably commit/apply MarkDispatched. Its marker
+//! means may-have-started, not authenticated delivery. Hosts serialize dispatch
+//! with cancellation and reconcile crash/replay without sending twice.
+//! Admission releases on a real terminal Wire receipt, or a typed host abort
+//! asserting execution was never dispatched. The latter trusts the host:
+//! drain preparation and queued senders first. Cancel/ACK never proves stopping.
+//! After dispatch, errors (including run_task errors after partial execution) need
+//! a real receipt or a separately designed authenticated fenced-stop path.
 //! Worker ownership/source/receipt authentication remains the host's duty.
 
 use crate::dag::{ExecutionTask, JobNode, NodeKind};
@@ -22,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const DRIVER_VERSION: u32 = 4;
+pub const DRIVER_VERSION: u32 = 5;
 mod atomic;
 pub use atomic::{AtomicGroupUnsupported, GroupPlacement, TaskExecutionMode};
 const MAX_TASKS: usize = 4096;
@@ -41,13 +47,31 @@ pub struct DriverConfig {
 pub enum Input {
     Advance,
     /// Durably request cancellation of this entire driver/run. Unclaimed
-    /// work becomes a core cancellation; owned work requires real settlement.
+    /// work becomes a core cancellation; owned work retains its permit until a
+    /// real settlement or an exact never-dispatched host abort.
     Cancel,
     Claim {
         task: String,
         token: String,
     },
+    /// Commit/apply before sending execution work or starting task execution.
+    /// This is a conservative may-have-started marker, not a delivery receipt.
+    /// Repeating the same owner's mark is idempotent, never permission to resend.
+    MarkDispatched {
+        task: String,
+        token: String,
+    },
+    /// Trusted host assertion that preparation and queued senders are drained,
+    /// and this exact claim never dispatched execution. Arbitrary executor errors
+    /// after entry/partial execution cannot use this input. After cancellation,
+    /// this releases never-dispatched ownership as UnstartedCancelled.
+    AbortBeforeExecution {
+        task: String,
+        token: String,
+        reason: HostFailureReason,
+    },
     /// A real worker result. Host must fence/verify attempt ownership first.
+    /// Accepted even without a dispatch marker: the real terminal is stronger.
     /// A result (or downstream input copies) exceeding bounded State storage
     /// remains an explicit capacity error with ownership/permit unchanged;
     /// cancellation is not a substitute terminal receipt for such a worker.
@@ -119,6 +143,30 @@ pub enum CoreDecision {
     UnstartedCancelled,
     EarlyFailure,
     MatrixJoined,
+    HostFailure,
+}
+
+/// Bounded host preparation categories; detailed errors remain in host storage.
+/// None of these categories attests that an already-dispatched worker stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostFailureReason {
+    WorkspaceCopy,
+    Lock,
+    Setup,
+    Provenance,
+    ExecutorPreparation,
+}
+impl HostFailureReason {
+    fn diagnostic(self) -> &'static str {
+        match self {
+            Self::WorkspaceCopy => "host workspace preparation failed",
+            Self::Lock => "host lock preparation failed",
+            Self::Setup => "host setup preparation failed",
+            Self::Provenance => "host provenance preparation failed",
+            Self::ExecutorPreparation => "host executor preparation failed",
+        }
+    }
 }
 
 /// A never-started decision is deliberately distinct from a worker receipt.
@@ -128,6 +176,12 @@ enum Terminal {
     Worker {
         token: String,
         result_digest: String,
+        outcomes: Vec<JobOutcome>,
+    },
+    HostAbort {
+        token: String,
+        reason: HostFailureReason,
+        decision: CoreDecision,
         outcomes: Vec<JobOutcome>,
     },
     Unstarted {
@@ -144,7 +198,8 @@ impl Terminal {
         match self {
             Self::Worker { outcomes, .. }
             | Self::Unstarted { outcomes }
-            | Self::Core { outcomes, .. } => outcomes,
+            | Self::Core { outcomes, .. }
+            | Self::HostAbort { outcomes, .. } => outcomes,
         }
     }
 }
@@ -160,6 +215,7 @@ enum Phase {
         token: String,
         inputs: TaskInputs,
         cancel_requested: bool,
+        dispatched: bool,
     },
     Terminal(Terminal),
 }
@@ -389,6 +445,24 @@ impl Driver {
                 diagnostic,
                 ..
             }) => Some((*decision, diagnostic.as_deref())),
+            Phase::Terminal(Terminal::HostAbort {
+                decision, reason, ..
+            }) => Some((
+                *decision,
+                Some(if *decision == CoreDecision::UnstartedCancelled {
+                    "run cancelled before dispatch"
+                } else {
+                    reason.diagnostic()
+                }),
+            )),
+            _ => None,
+        }
+    }
+    /// Original bounded host abort reason, including aborts after cancellation.
+    /// It is not a worker receipt or authenticated stop proof.
+    pub fn host_failure_reason(&self, task: &str) -> Option<HostFailureReason> {
+        match self.state.phases.get(task)? {
+            Phase::Terminal(Terminal::HostAbort { reason, .. }) => Some(*reason),
             _ => None,
         }
     }
@@ -566,12 +640,116 @@ impl Driver {
                         token: token.clone(),
                         inputs,
                         cancel_requested: false,
+                        dispatched: false,
                     },
                 );
                 s.outbox
                     .retain(|a| ready_task(&a.kind) != Some(task.as_str()));
                 self.ensure_cancel_capacity(&s)
                     .context("claim exceeds durable cancellation capacity")?;
+            }
+            Input::MarkDispatched { task, token } => {
+                let Phase::Claimed {
+                    token: owner,
+                    dispatched,
+                    cancel_requested,
+                    ..
+                } = s.phases.get_mut(task).context("unknown task")?
+                else {
+                    bail!("dispatch has no admitted owner")
+                };
+                ensure!(owner == token, "dispatch owner mismatch");
+                if !*dispatched {
+                    ensure!(!s.cancelled && !*cancel_requested, "dispatch is cancelled");
+                    *dispatched = true;
+                }
+            }
+            Input::AbortBeforeExecution {
+                task,
+                token,
+                reason,
+            } => {
+                let t = self.task(&s, task).context("unknown task")?;
+                if let Phase::Terminal(Terminal::HostAbort {
+                    token: old,
+                    reason: old_reason,
+                    ..
+                }) = &s.phases[task]
+                {
+                    ensure!(
+                        old == token && old_reason == reason,
+                        "conflicting duplicate host abort"
+                    );
+                    return self.checked(s);
+                }
+                let Phase::Claimed {
+                    token: owner,
+                    inputs,
+                    dispatched,
+                    cancel_requested,
+                } = &s.phases[task]
+                else {
+                    bail!("host abort has no admitted owner")
+                };
+                ensure!(owner == token, "host abort owner mismatch");
+                ensure!(
+                    !dispatched,
+                    "host abort cannot release dispatched execution"
+                );
+                let cancelled = s.cancelled || *cancel_requested;
+                let decision = if cancelled {
+                    CoreDecision::UnstartedCancelled
+                } else {
+                    CoreDecision::HostFailure
+                };
+                let wf = self
+                    .plan
+                    .workflows
+                    .iter()
+                    .find(|w| w.file == t.workflow)
+                    .context("missing workflow")?;
+                let mut outcomes: Vec<JobOutcome> = Vec::new();
+                for job in &t.jobs {
+                    let ancestor_failed =
+                        wf.job(job)
+                            .context("missing job")?
+                            .needs
+                            .iter()
+                            .any(|need| {
+                                outcomes
+                                    .iter()
+                                    .find(|o| &o.job == need)
+                                    .or_else(|| inputs.needs.get(need))
+                                    .is_some_and(JobOutcome::failed_or_ancestor_failed)
+                            });
+                    outcomes.push(JobOutcome {
+                        job: job.clone(),
+                        variant: t.variant.as_ref().map(|v| v.index),
+                        status: if cancelled {
+                            JobStatus::Cancelled
+                        } else {
+                            JobStatus::Failure
+                        },
+                        outputs: BTreeMap::new(),
+                        skipped: cancelled.then(|| "run cancelled before dispatch".into()),
+                        ancestor_failed,
+                    });
+                }
+                s.phases.insert(
+                    task.clone(),
+                    Phase::Terminal(Terminal::HostAbort {
+                        token: token.clone(),
+                        reason: *reason,
+                        decision,
+                        outcomes,
+                    }),
+                );
+                s.outbox.retain(
+                    |a| !matches!(&a.kind, ActionKind::Cancel { task: id, .. } if id == task),
+                );
+                if !cancelled {
+                    self.fail_fast(&mut s, &t)?;
+                }
             }
             Input::Settle {
                 task,
@@ -773,7 +951,7 @@ impl Driver {
             ))
     }
     fn cancel_reserve(&self, s: &State) -> Result<usize> {
-        if s.cancelled || s.finished {
+        if s.finished {
             return Ok(0);
         }
         let tasks = self.plan.tasks.iter().chain(
@@ -787,12 +965,27 @@ impl Driver {
                 Phase::Pending | Phase::Ready { .. } => Self::unstarted_cancel_reserve(task)?,
                 Phase::Claimed {
                     token,
-                    cancel_requested: false,
+                    cancel_requested,
+                    dispatched,
                     ..
                 } => {
-                    let id = format!("{}:cancel:{}", self.plan.digest, task.id);
-                    crate::expr::serialized_size(&(&id, &task.id, token), MAX_WIRE_BYTES)?
-                        .saturating_add(512)
+                    let cancel = if !*cancel_requested {
+                        let id = format!("{}:cancel:{}", self.plan.digest, task.id);
+                        crate::expr::serialized_size(&(&id, &task.id, token), MAX_WIRE_BYTES)?
+                            .saturating_add(512)
+                    } else {
+                        0
+                    };
+                    // Keep never-dispatched abort terminal/publication/join capacity
+                    // through Cancel and ACK. The abort retains its original token.
+                    let abort = if !*dispatched {
+                        Self::unstarted_cancel_reserve(task)?
+                            .saturating_add(crate::expr::serialized_size(token, MAX_WIRE_BYTES)?)
+                            .saturating_add(1024)
+                    } else {
+                        0
+                    };
+                    cancel.saturating_add(abort)
                 }
                 Phase::Terminal(terminal)
                     if task.variant.as_ref().is_some_and(|_| {

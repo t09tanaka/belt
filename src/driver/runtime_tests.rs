@@ -1756,3 +1756,405 @@ fn atomic_group_nonmatrix_worker_runtime_if_and_name_remain_supported() {
         JobStatus::Success
     );
 }
+
+fn abort_input(task: &str, reason: HostFailureReason) -> Input {
+    Input::AbortBeforeExecution {
+        task: task.into(),
+        token: task.into(),
+        reason,
+    }
+}
+fn mark_input(task: &str) -> Input {
+    Input::MarkDispatched {
+        task: task.into(),
+        token: task.into(),
+    }
+}
+fn assert_rejected_unchanged(d: &Driver, input: Input) {
+    let before = serde_json::to_value(&d.state).unwrap();
+    assert!(d.propose(input).is_err());
+    assert_eq!(serde_json::to_value(&d.state).unwrap(), before);
+}
+
+#[test]
+fn host_abort_typed_identity_cancel_orders_and_replay() {
+    for reason in [
+        HostFailureReason::WorkspaceCopy,
+        HostFailureReason::Lock,
+        HostFailureReason::Setup,
+        HostFailureReason::Provenance,
+        HostFailureReason::ExecutorPreparation,
+    ] {
+        for cancel_first in [false, true] {
+            let f = Fixture::new(WORKFLOW);
+            let mut d = f.driver(2);
+            let mut records = vec![commit(&mut d, Input::Advance)];
+            let action = ready(&d).remove(0);
+            let task = ready_task(&action).unwrap().to_string();
+            records.push(commit(
+                &mut d,
+                Input::Claim {
+                    task: task.clone(),
+                    token: task.clone(),
+                },
+            ));
+            assert_rejected_unchanged(
+                &d,
+                Input::AbortBeforeExecution {
+                    task: task.clone(),
+                    token: "wrong-owner".into(),
+                    reason,
+                },
+            );
+            assert_rejected_unchanged(&d, abort_input("unknown-task", reason));
+            if cancel_first {
+                records.push(commit(&mut d, Input::Cancel));
+                let requested = cancel_actions(&d);
+                assert_eq!(requested.len(), 1);
+                records.push(commit(
+                    &mut d,
+                    Input::Ack {
+                        action: requested[0].id.clone(),
+                    },
+                ));
+                assert_eq!(d.admitted(), 1);
+                assert_rejected_unchanged(&d, mark_input(&task));
+            }
+            let before = serde_json::to_value(&d.state).unwrap();
+            let aborted = d.propose(abort_input(&task, reason)).unwrap();
+            assert_eq!(serde_json::to_value(&d.state).unwrap(), before);
+            let mut tampered = serde_json::to_value(&aborted).unwrap();
+            tampered["state_digest"] = json!("forged");
+            assert!(d
+                .apply(&Transition::from_json(&tampered.to_string()).unwrap())
+                .is_err());
+            assert_eq!(serde_json::to_value(&d.state).unwrap(), before);
+            d.apply(&aborted).unwrap();
+            records.push(aborted.clone());
+            assert!(d.apply(&aborted).is_err()); // exact record is not an extra transition
+            assert_eq!(d.admitted(), 0);
+            assert!(cancel_actions(&d).is_empty());
+            let expected = if cancel_first {
+                CoreDecision::UnstartedCancelled
+            } else {
+                CoreDecision::HostFailure
+            };
+            assert_eq!(d.core_decision(&task).unwrap().0, expected);
+            assert_eq!(d.host_failure_reason(&task), Some(reason));
+            assert!(matches!(
+                &d.state.phases[&task],
+                Phase::Terminal(Terminal::HostAbort { .. })
+            ));
+            assert_eq!(
+                d.outcome(FILE, "seed").unwrap().status,
+                if cancel_first {
+                    JobStatus::Cancelled
+                } else {
+                    JobStatus::Failure
+                }
+            );
+            records.push(commit(&mut d, abort_input(&task, reason))); // exact assertion idempotent
+            let different = if reason == HostFailureReason::Lock {
+                HostFailureReason::Setup
+            } else {
+                HostFailureReason::Lock
+            };
+            assert_rejected_unchanged(&d, abort_input(&task, different));
+            assert_rejected_unchanged(
+                &d,
+                Input::AbortBeforeExecution {
+                    task: task.clone(),
+                    token: "different-owner".into(),
+                    reason,
+                },
+            );
+            assert_rejected_unchanged(&d, mark_input(&task));
+            let (wire, _) = f.execute(&action, "contradictory-late-worker");
+            assert_rejected_unchanged(
+                &d,
+                Input::Settle {
+                    task: task.clone(),
+                    token: task.clone(),
+                    result_digest: wire.digest().unwrap(),
+                    result: Box::new(wire),
+                },
+            );
+            records.push(commit(&mut d, Input::Cancel));
+            assert_eq!(d.core_decision(&task).unwrap().0, expected);
+            let mut replay = f.driver(2);
+            for record in records {
+                let text = serde_json::to_string(&record).unwrap();
+                replay
+                    .apply(&Transition::from_json(&text).unwrap())
+                    .unwrap();
+            }
+            assert_eq!(
+                serde_json::to_value(&replay.state).unwrap(),
+                serde_json::to_value(&d.state).unwrap()
+            );
+        }
+    }
+}
+
+#[test]
+fn dispatch_marker_never_releases_owner_and_actual_terminal_is_stronger() {
+    for marked in [false, true] {
+        let f = Fixture::new(WORKFLOW);
+        let mut d = f.driver(2);
+        let mut records = vec![commit(&mut d, Input::Advance)];
+        let action = ready(&d).remove(0);
+        let task = ready_task(&action).unwrap().to_string();
+        records.push(commit(
+            &mut d,
+            Input::Claim {
+                task: task.clone(),
+                token: task.clone(),
+            },
+        ));
+        let stale = d.propose(mark_input(&task)).unwrap();
+        assert_rejected_unchanged(
+            &d,
+            Input::MarkDispatched {
+                task: task.clone(),
+                token: "wrong".into(),
+            },
+        );
+        if marked {
+            let before = serde_json::to_value(&d.state).unwrap();
+            let record = d.propose(mark_input(&task)).unwrap();
+            assert_eq!(serde_json::to_value(&d.state).unwrap(), before);
+            d.apply(&record).unwrap();
+            records.push(record);
+            records.push(commit(&mut d, mark_input(&task)));
+            assert_rejected_unchanged(
+                &d,
+                abort_input(&task, HostFailureReason::ExecutorPreparation),
+            );
+        }
+        records.push(commit(&mut d, Input::Cancel));
+        assert!(d.apply(&stale).is_err());
+        if marked {
+            records.push(commit(&mut d, mark_input(&task))); // idempotent marker, NOT resend authorization
+        } else {
+            assert_rejected_unchanged(&d, mark_input(&task));
+        }
+        let action_id = cancel_actions(&d)[0].id.clone();
+        records.push(commit(&mut d, Input::Ack { action: action_id }));
+        assert_eq!(d.admitted(), 1);
+        let (wire, _) = f.execute(&action, "real-terminal");
+        records.push(settle(&mut d, &action, wire));
+        assert_eq!(d.outcome(FILE, "seed").unwrap().status, JobStatus::Success);
+        assert_eq!(d.admitted(), 0);
+        assert!(finished(&d));
+        let mut replay = f.driver(2);
+        for record in records {
+            replay.apply(&record).unwrap();
+        }
+        assert_eq!(
+            serde_json::to_value(&d.state).unwrap(),
+            serde_json::to_value(&replay.state).unwrap()
+        );
+    }
+}
+
+#[test]
+fn real_workspace_preparation_failure_drains_before_abort_and_preserves_source_and_receipt() {
+    let f = Fixture::new(ATOMIC_WORKFLOW);
+    let plan_digest = f.plan.digest.clone();
+    let manifest = serde_json::to_value(&f.manifest).unwrap();
+    let mut d = f.driver(2);
+    let mut records = atomic_start(&f, &mut d);
+    let producer = f
+        .plan
+        .tasks
+        .iter()
+        .find(|t| t.jobs == ["producer"])
+        .unwrap();
+    let producer_terminal = serde_json::to_value(&d.state.phases[&producer.id]).unwrap();
+    let action = atomic_action(&d);
+    let task = ready_task(&action).unwrap().to_string();
+    records.push(commit(
+        &mut d,
+        Input::Claim {
+            task: task.clone(),
+            token: task.clone(),
+        },
+    ));
+    let ws = f.workspace("failed-preparation");
+    std::fs::create_dir_all(ws.root.parent().unwrap()).unwrap();
+    std::fs::write(&ws.root, "root is a file, not a checkout directory").unwrap();
+    // Real source materialization failure, joined before asserting no dispatch.
+    std::thread::scope(|scope| {
+        let preparing = scope.spawn(|| f.input().materialize_workspace(ws.clone()));
+        assert!(preparing.join().unwrap().is_err());
+    });
+    assert!(!ws.root.join("shared.txt").exists()); // first actual command never ran
+    assert!(!ws.root.join("marker").exists());
+    records.push(commit(
+        &mut d,
+        abort_input(&task, HostFailureReason::WorkspaceCopy),
+    ));
+    assert_eq!(d.core_decision(&task).unwrap().0, CoreDecision::HostFailure);
+    for job in ["first", "matrix", "last"] {
+        let outcome = d.outcome(FILE, job).unwrap();
+        assert_eq!(outcome.status, JobStatus::Failure);
+        assert!(outcome.outputs.is_empty());
+        assert_eq!(outcome.ancestor_failed, job != "first");
+    }
+    assert_eq!(
+        serde_json::to_value(&d.state.phases[&producer.id]).unwrap(),
+        producer_terminal
+    );
+    assert_eq!(f.plan.digest, plan_digest);
+    assert_eq!(serde_json::to_value(&f.manifest).unwrap(), manifest);
+    let consumer = ready(&d).remove(0);
+    records.push(commit(
+        &mut d,
+        Input::Claim {
+            task: ready_task(&consumer).unwrap().into(),
+            token: ready_task(&consumer).unwrap().into(),
+        },
+    ));
+    records.push(commit(&mut d, mark_input(ready_task(&consumer).unwrap())));
+    let (wire, _) = f.execute(&consumer, "host-abort-consumer");
+    assert_eq!(wire.outcomes[0].status, JobStatus::Skipped);
+    records.push(settle(&mut d, &consumer, wire));
+    assert!(finished(&d));
+    let mut replay = f.driver(2);
+    for record in records {
+        replay.apply(&record).unwrap();
+    }
+    assert_eq!(
+        serde_json::to_value(&d.state).unwrap(),
+        serde_json::to_value(&replay.state).unwrap()
+    );
+}
+
+#[test]
+fn never_dispatched_group_abort_capacity_survives_cancel_and_ack() {
+    let f = Fixture::new(ATOMIC_WORKFLOW);
+    let mut d = f.driver(2);
+    atomic_start(&f, &mut d);
+    let action = atomic_action(&d);
+    let task = ready_task(&action).unwrap().to_string();
+    let token = "\0".repeat(256);
+    let input = Input::Claim {
+        task: task.clone(),
+        token: token.clone(),
+    };
+    let candidate = d.compute(&input).unwrap();
+    let required = crate::expr::serialized_size(&candidate, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&candidate).unwrap();
+    d.state_byte_limit = required - 1;
+    assert_rejected_unchanged(&d, input.clone());
+    d.state_byte_limit = required;
+    commit(&mut d, input);
+    let reserve = d.cancel_reserve(&d.state).unwrap();
+    assert!(reserve > 0);
+    commit(&mut d, Input::Cancel);
+    let request = cancel_actions(&d).remove(0);
+    commit(&mut d, Input::Ack { action: request.id });
+    assert_eq!(d.admitted(), 1);
+    assert!(d.cancel_reserve(&d.state).unwrap() > 0);
+    commit(
+        &mut d,
+        Input::AbortBeforeExecution {
+            task: task.clone(),
+            token,
+            reason: HostFailureReason::Provenance,
+        },
+    );
+    assert_eq!(
+        d.core_decision(&task).unwrap().0,
+        CoreDecision::UnstartedCancelled
+    );
+    assert_eq!(d.admitted(), 0);
+    assert!(finished(&d));
+    assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+}
+
+#[test]
+fn host_abort_matrix_failfast_and_cancelled_sibling_join_exact_membership() {
+    let workflow = WORKFLOW.replace("fail-fast: false", "fail-fast: true");
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(2);
+    seed(&f, &mut d);
+    let actions = ready(&d);
+    assert_eq!(actions.len(), 2);
+    for action in &actions {
+        claim(&mut d, action);
+    }
+    let first = ready_task(&actions[0]).unwrap();
+    let second = ready_task(&actions[1]).unwrap();
+    commit(&mut d, abort_input(first, HostFailureReason::Setup));
+    assert_eq!(d.admitted(), 1);
+    assert!(d.outcome(FILE, "dynamic").is_none());
+    assert_rejected_unchanged(&d, mark_input(second));
+    let request = cancel_actions(&d).remove(0);
+    commit(&mut d, Input::Ack { action: request.id });
+    commit(
+        &mut d,
+        abort_input(second, HostFailureReason::ExecutorPreparation),
+    );
+    assert_eq!(
+        d.core_decision(second).unwrap().0,
+        CoreDecision::UnstartedCancelled
+    );
+    assert_eq!(
+        d.outcome(FILE, "dynamic").unwrap().status,
+        JobStatus::Failure
+    );
+    assert_eq!(d.admitted(), 0);
+    let Phase::Terminal(Terminal::HostAbort { outcomes, .. }) = &d.state.phases[first] else {
+        panic!()
+    };
+    assert_eq!(
+        outcomes[0].variant,
+        d.task(&d.state, first)
+            .unwrap()
+            .variant
+            .as_ref()
+            .map(|v| v.index)
+    );
+}
+
+#[test]
+fn never_dispatched_abort_after_cancel_preserves_real_matrix_outputs_at_capacity() {
+    let payload = "\\001".repeat(1024);
+    let workflow = WORKFLOW.replace(
+        "          echo \"value=v$LEG\" >> \"$GITHUB_OUTPUT\"",
+        &format!("          printf 'value=%b\\n' '{payload}' >> \"$GITHUB_OUTPUT\""),
+    );
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(2);
+    seed(&f, &mut d);
+    let legs = ready(&d);
+    claim(&mut d, &legs[0]);
+    let (wire, _) = f.execute(&legs[0], "abort-retained-real-output");
+    let real_receipt = wire.digest().unwrap();
+    settle(&mut d, &legs[0], wire);
+    let first = ready_task(&legs[0]).unwrap();
+    let task = ready_task(&legs[1]).unwrap().to_string();
+    let input = Input::Claim {
+        task: task.clone(),
+        token: task.clone(),
+    };
+    let candidate = d.compute(&input).unwrap();
+    d.state_byte_limit = crate::expr::serialized_size(&candidate, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&candidate).unwrap();
+    commit(&mut d, input);
+    commit(&mut d, Input::Cancel);
+    let request = cancel_actions(&d).remove(0);
+    commit(&mut d, Input::Ack { action: request.id });
+    assert_eq!(d.admitted(), 1);
+    commit(&mut d, abort_input(&task, HostFailureReason::Lock));
+    assert!(finished(&d));
+    assert_eq!(d.admitted(), 0);
+    let joined = d.outcome(FILE, "dynamic").unwrap();
+    assert_eq!(joined.status, JobStatus::Cancelled);
+    assert_eq!(joined.outputs["value"], "\u{1}".repeat(1024));
+    assert!(
+        matches!(&d.state.phases[first], Phase::Terminal(Terminal::Worker { result_digest, .. }) if result_digest == &real_receipt)
+    );
+    assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+}
