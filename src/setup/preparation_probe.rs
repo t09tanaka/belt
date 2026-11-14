@@ -126,6 +126,17 @@ pub(crate) fn input_budget(input: &PreparationProbeInput<'_>) -> Result<(), Prob
     {
         return Err(ProbeUnknown::BudgetExceeded);
     }
+    // Output cardinality is separate from the serialized-input and shared FD
+    // byte budgets. The optional managed workspace entry consumes one slot too.
+    let workspace = !input.in_place
+        && input
+            .setup
+            .as_ref()
+            .is_some_and(|s| !super::policy::hoisted(s).is_empty());
+    let tools = input.frozen.as_ref().map_or(0, |b| b.evidence.len());
+    if tools + usize::from(workspace) > 16 {
+        return Err(ProbeUnknown::BudgetExceeded);
+    }
     bounded(&(
         input.manifest_digest,
         input.source_id,

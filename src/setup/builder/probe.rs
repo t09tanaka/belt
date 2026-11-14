@@ -559,4 +559,54 @@ mod preparation_probe_tests {
         f.setup = None;
         assert_eq!(f.probe(), Probe::NoManagedPreparation);
     }
+    #[test]
+    fn preparation_probe_output_budget_counts_workspace_with_tool_entries() {
+        let mut f = Fixture::new();
+        let frozen = crate::toolchain::versions::FrozenToolchains::freeze(
+            f.manifest.clone(),
+            f.profile.definition_digest().clone(),
+            crate::toolchain::versions::Scope::project(""),
+            &[],
+            &[],
+            &BTreeMap::new(),
+            crate::toolchain::versions::MatchPolicy::Exact,
+        )
+        .unwrap();
+        // Count validation precedes semantic contract validation and any IO.
+        let evidence = (0..16)
+            .map(|i| crate::toolchain::adapters::ResolutionEvidence {
+                contract: frozen.digest(),
+                tool: crate::toolchain::versions::ToolId::parse(&format!("tool{i}")).unwrap(),
+                concrete: node_semver::Version::parse("1.2.3").unwrap(),
+                catalog: Digest::of_bytes(b"catalog"),
+                resolved_inputs: BTreeMap::new(),
+            })
+            .collect();
+        f.frozen = Some(Box::new(crate::toolchain::contract::FrozenBundle {
+            schema_version: 1,
+            frozen,
+            evidence,
+        }));
+        assert_eq!(
+            crate::setup::preparation_probe::input_budget(&f.input()),
+            Err(Unknown::BudgetExceeded)
+        );
+        assert_eq!(f.probe(), Probe::Unknown(Unknown::BudgetExceeded));
+        let mut in_place = f.input();
+        in_place.in_place = true;
+        assert_eq!(
+            crate::setup::preparation_probe::input_budget(&in_place),
+            Ok(())
+        ); // 16 tools, no managed workspace
+        f.frozen.as_mut().unwrap().evidence.pop();
+        assert_eq!(
+            crate::setup::preparation_probe::input_budget(&f.input()),
+            Ok(())
+        ); // 15 + 1 = 16
+        f.setup = None;
+        assert_eq!(
+            crate::setup::preparation_probe::input_budget(&f.input()),
+            Ok(())
+        ); // 15 tools alone
+    }
 }
