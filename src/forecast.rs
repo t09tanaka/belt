@@ -503,6 +503,7 @@ fn queue_entries(jobs: &[Job], now: u64) -> Vec<QueueEntry> {
                 expected_secs: j.expected_secs,
                 backfilled: j.backfilled,
                 parent: None,
+                ran_secs: 0.0,
             }
         })
         .collect()
@@ -1519,6 +1520,8 @@ mod tests {
             front_overload_max_wait_secs: 10.0,
             backfill_max_job_secs: 0.0,
             backfill_max_wait_secs: 60.0,
+            nested_guard_max_wait_secs: 60.0,
+            nested_sibling_max_wait_secs: 600.0,
         }
     }
 
@@ -1552,6 +1555,7 @@ mod tests {
                 backfilled: false,
                 label: None,
                 parent: None,
+                nested_cpu_secs: 0.0,
             },
             suspect_dead: false,
         }

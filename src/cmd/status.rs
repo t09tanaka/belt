@@ -55,9 +55,21 @@ pub fn render(ctx: &Context, cfg: &Config) -> Result<String> {
     };
 
     let _ = writeln!(out, "budget {used}/{} used", cfg.budget);
-    if format > task_traffic_controller::ledger::SCHEMA_VERSION {
+    if format >= task_traffic_controller::ledger::NESTED_SCHEMA_VERSION {
+        let _ = writeln!(out,
+            "ledger format v{format}: task-traffic-controller binaries from before nested admission (0.8 and older) refuse it until the nested commands have finished"
+        );
+    } else if format > task_traffic_controller::ledger::SCHEMA_VERSION {
         let _ = writeln!(out,
             "ledger format v{format}: older task-traffic-controller binaries refuse it until every managed entry is settled (`task-traffic-controller resolve <id> [--force]`)"
+        );
+    }
+    let cycles = ledger.parent_cycles();
+    if !cycles.is_empty() {
+        let _ = writeln!(
+            out,
+            "warning: entries {} name each other as parent (was the ledger edited?); they are not counted in the budget",
+            cycles.join(", ")
         );
     }
     if let Some(s) = ctx.live.snapshot() {

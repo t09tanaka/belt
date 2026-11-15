@@ -14,10 +14,8 @@ use crate::eta;
 use crate::gitctx;
 use crate::history::{self, Record};
 use crate::key::{self, CommandKey};
-use crate::ledger::Ledger;
-// The unit tests below build entries through `use super::*`.
-#[cfg(test)]
 use crate::ledger::Entry;
+use crate::ledger::Ledger;
 use crate::managed::{self, OwnerGuard, Ran, TryAdmit, Waiting};
 use crate::runner::Exit;
 use crate::weight::{self, Measurement};
@@ -380,6 +378,16 @@ pub fn run_gated(
         if let Some(sig) = stop_requested(ctx, id, hooks) {
             return Ok(Gated::Interrupted(sig));
         }
+        // The command that asked for this one has ended (stopped, most
+        // likely): nobody is left to want it, so it is not started as a
+        // top-level command after all.
+        if opts.parent.as_deref().is_some_and(|p| !in_ledger(ctx, p)) {
+            (hooks.progress)(
+                "task-traffic-controller: the command this was started from has ended; not starting",
+            );
+            remove_entry(ctx, id);
+            return Ok(Gated::Interrupted(libc::SIGTERM));
+        }
         let Waiting {
             reason,
             queue,
@@ -437,7 +445,8 @@ pub fn run_gated(
         return Ok(Gated::Interrupted(sig));
     }
     let ran = managed::run_command(ctx, &guard, opts, limits);
-    remove_entry(ctx, id);
+    let cpu_secs = ran.as_ref().map_or(0.0, |r| r.outcome.cpu_secs);
+    let entry = settle_entry(ctx, id, opts.parent.as_deref(), cpu_secs);
     drop(guard);
     let Ran {
         outcome: out,
@@ -459,8 +468,10 @@ pub fn run_gated(
             argv: key.argv,
             started_at,
             wall_secs: out.wall_secs,
-            cpu_secs: out.cpu_secs,
-            max_rss_bytes: out.max_rss_bytes,
+            // Less what its nested entries used: they recorded that
+            // themselves, and this command only waited for them.
+            cpu_secs: own_cpu_secs(out.cpu_secs, entry.map_or(0.0, |e| e.nested_cpu_secs)),
+            max_rss_bytes: out.own_max_rss_bytes.unwrap_or(out.max_rss_bytes),
             exit_code: out.exit.code(),
             weight_used: plan.weight,
             contended,
@@ -486,13 +497,47 @@ fn stop_requested(ctx: &Context, id: &str, hooks: &Hooks) -> Option<i32> {
 }
 
 pub(crate) fn remove_entry(ctx: &Context, id: &str) {
+    settle_entry(ctx, id, None, 0.0);
+}
+
+/// Remove the entry `id` and its lease, adding the `cpu_secs` its command
+/// used to what its `parent` (if that is still there) has seen its nested
+/// entries use. Returns the entry as it was, when the ledger could be
+/// read.
+fn settle_entry(ctx: &Context, id: &str, parent: Option<&str>, cpu_secs: f64) -> Option<Entry> {
+    let mut removed = None;
     if let Ok(_guard) = lock::ledger(ctx) {
         if let Ok(mut ledger) = Ledger::load(&ctx.paths.ledger_file()) {
-            ledger.remove(id);
+            removed = settle(&mut ledger, id, parent, cpu_secs);
             let _ = ledger.save(&ctx.paths.ledger_file());
         }
     }
     let _ = std::fs::remove_file(ctx.paths.lease_file(id));
+    removed
+}
+
+fn settle(ledger: &mut Ledger, id: &str, parent: Option<&str>, cpu_secs: f64) -> Option<Entry> {
+    if let Some(p) = parent.and_then(|p| ledger.find_mut(p)) {
+        p.nested_cpu_secs += cpu_secs;
+    }
+    let removed = ledger.find(id).cloned();
+    ledger.remove(id);
+    removed
+}
+
+/// The CPU time a command used itself: what was measured for its whole
+/// tree less what its nested entries reported, never below zero (the two
+/// are measured separately).
+pub fn own_cpu_secs(total: f64, nested: f64) -> f64 {
+    (total - nested).max(0.0)
+}
+
+/// Whether the ledger holds the entry `id`. A plain read (saves are atomic
+/// renames); an unreadable ledger counts as holding it.
+fn in_ledger(ctx: &Context, id: &str) -> bool {
+    Ledger::load(&ctx.paths.ledger_file())
+        .map(|l| l.find(id).is_some())
+        .unwrap_or(true)
 }
 
 /// How many running entries a waiting line names.
@@ -595,6 +640,57 @@ pub fn describe(reason: &Reason) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_finished_nested_entry_leaves_its_cpu_time_with_its_parent() {
+        let entry = |id: &str, parent: Option<&str>| Entry {
+            id: id.into(),
+            pid: 1,
+            state: State::Running,
+            front: false,
+            weight: 1,
+            predicted_rss: 0,
+            expected_secs: None,
+            repo: String::new(),
+            subdir: String::new(),
+            argv: id.into(),
+            key: id.into(),
+            seq: 1,
+            enqueued_at: chrono::Utc::now(),
+            started_at: None,
+            using: None,
+            backfilled: false,
+            label: None,
+            parent: parent.map(str::to_string),
+            nested_cpu_secs: 0.0,
+        };
+        let mut ledger = Ledger {
+            entries: vec![
+                entry("p", None),
+                entry("c1", Some("p")),
+                entry("c2", Some("p")),
+                entry("orphan", Some("gone")),
+            ],
+            ..Ledger::default()
+        };
+        let cpu = |l: &Ledger| l.find("p").unwrap().nested_cpu_secs;
+        assert_eq!(settle(&mut ledger, "c1", Some("p"), 4.0).unwrap().id, "c1");
+        assert_eq!(settle(&mut ledger, "c2", Some("p"), 2.5).unwrap().id, "c2");
+        assert_eq!(cpu(&ledger), 6.5);
+        // A parent that is gone, or none: only the entry is removed.
+        assert!(settle(&mut ledger, "orphan", Some("gone"), 9.0).is_some());
+        assert_eq!(cpu(&ledger), 6.5);
+        // The parent hands back what it was told, for its own record.
+        let p = settle(&mut ledger, "p", None, 7.0).unwrap();
+        assert_eq!(p.nested_cpu_secs, 6.5);
+        assert!(ledger.entries.is_empty());
+        assert!(settle(&mut ledger, "p", None, 1.0).is_none());
+
+        assert_eq!(own_cpu_secs(7.0, 6.5), 0.5);
+        assert_eq!(own_cpu_secs(7.0, 0.0), 7.0);
+        // Measured separately: never below zero.
+        assert_eq!(own_cpu_secs(6.0, 6.5), 0.0);
+    }
+
     mod with_context {
         use super::*;
         use crate::context::{Clock, FakeClock, FixedLive};
@@ -688,6 +784,7 @@ mod tests {
                 backfilled: false,
                 label: None,
                 parent: None,
+                nested_cpu_secs: 0.0,
             });
             ledger.save(&ctx.paths.ledger_file()).unwrap();
 

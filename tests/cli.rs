@@ -524,12 +524,168 @@ fn what_a_nested_exec_uses_is_not_measured_on_its_parent_too() {
     assert!(!on_parent, "charged twice: {entries:?}");
 }
 
+/// A command that only starts its steps and waits for them does not learn
+/// their weight: what they used is recorded on them, and taken off what
+/// was measured for the whole tree.
+#[test]
+fn a_command_does_not_learn_the_weight_of_what_its_nested_execs_used() {
+    let env = TestEnv::new()
+        .with_config("budget = 4\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
+    let dir = env.marker_dir();
+    // Two workers each burning 2 s of their own CPU time.
+    let burn = "for i in 1 2; do perl -e '1 while (times)[0] < 2' & done; wait\n";
+    let outer = script_file(
+        &dir,
+        "outer",
+        &format!(
+            "{BIN} exec --weight 1 -- {}\n",
+            script_file(&dir, "burn", burn)
+        ),
+    );
+    let out = env.run(&["exec", "--", "sh", "-c", &outer]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let records: Vec<serde_json::Value> = fs::read_to_string(env.state().join("history.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    let cpu_of = |script: &str| {
+        records
+            .iter()
+            .find(|r| r["argv"].as_str().unwrap().contains(script))
+            .unwrap_or_else(|| panic!("no record for {script}: {records:?}"))["cpu_secs"]
+            .as_f64()
+            .unwrap()
+    };
+    assert!(cpu_of("burn.sh") >= 3.5, "{records:?}");
+    assert!(cpu_of("outer.sh") < 1.0, "{records:?}");
+    // The second run queues at weight 1, not at the two cores its step
+    // used.
+    let mut again = env.spawn_exec(&[], &outer);
+    assert!(wait_until(Duration::from_secs(10), || !nested_entries(
+        &env
+    )
+    .is_empty()));
+    let entries = env.entries();
+    assert!(again.wait().unwrap().success());
+    let outer_entry = entries.iter().find(|e| e["parent"].is_null()).unwrap();
+    assert_eq!(outer_entry["weight"], 1, "{entries:?}");
+}
+
+/// Stopping a command also drops the nested commands of it that have not
+/// started: nobody is left to want them.
+#[test]
+fn stopping_a_command_drops_its_nested_execs_that_are_still_waiting() {
+    let env = TestEnv::new()
+        .with_config("budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
+    let dir = env.marker_dir();
+    let (gate_a, gate_b) = (Gate::new(&dir, "a"), Gate::new(&dir, "b"));
+    let step = |name: &str| {
+        format!(
+            "{BIN} exec --weight 2 -- {} &\n",
+            script_file(&dir, name, &marked_gate(&dir, name))
+        )
+    };
+    let outer = format!("{}{}wait\n", step("a"), step("b"));
+    let mut parent = env.spawn_exec(&["--weight", "1"], &script_file(&dir, "outer", &outer));
+    let started = || {
+        ["a", "b"]
+            .iter()
+            .filter(|n| dir.join(format!("{n}.start")).exists())
+            .count()
+    };
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let nested = nested_entries(&env);
+            nested.len() == 2
+                && nested.iter().filter(|e| e["state"] == "waiting").count() == 1
+                && started() == 1
+        }),
+        "{:?}",
+        env.entries()
+    );
+    // SIGTERM to the outer `exec`, which passes it on to its command.
+    assert_eq!(
+        unsafe { libc::kill(parent.id() as libc::pid_t, libc::SIGTERM) },
+        0
+    );
+    assert!(!parent.wait().unwrap().success());
+    // The step that was waiting leaves the queue without starting; the
+    // one that runs is not touched.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let entries = env.entries();
+            entries.len() == 1 && entries[0]["state"] == "running"
+        }),
+        "{:?}",
+        env.entries()
+    );
+    gate_a.release();
+    gate_b.release();
+    assert!(
+        wait_until(Duration::from_secs(10), || env.entries().is_empty()),
+        "{:?}",
+        env.entries()
+    );
+    assert_eq!(started(), 1, "the waiting step ran after its parent ended");
+}
+
+/// A nested command that waits for one of its siblings (a server and its
+/// client) is not held for ever: after the configured time the next one
+/// starts although the budget is full.
+#[test]
+fn a_nested_exec_that_does_not_fit_starts_after_the_sibling_limit() {
+    let env = TestEnv::new().with_config(
+        "budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\nnested_sibling_max_wait_secs = 2\n",
+    );
+    let dir = env.marker_dir();
+    let server = Gate::new(&dir, "server");
+    // The client is started only once the server runs.
+    let outer = format!(
+        "{BIN} exec --weight 2 -- {} &\nwhile [ ! -e {} ]; do sleep 0.05; done\n{BIN} exec --weight 2 -- {}\n",
+        script_file(&dir, "server", &marked_gate(&dir, "server")),
+        dir.join("server.start").display(),
+        script_file(&dir, "client", &marker_script(&dir, "client", "0"))
+    );
+    let mut parent = env.spawn_exec(
+        &["--weight", "1"],
+        &script_file(&dir, "outer", &format!("{outer}wait\n")),
+    );
+    // The client is queued behind the server for the budget.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            nested_entries(&env).iter().any(|e| e["state"] == "waiting")
+        }),
+        "{:?}",
+        env.entries()
+    );
+    assert!(!dir.join("client.start").exists());
+    // It runs while the server still holds its slot.
+    assert!(
+        wait_until(Duration::from_secs(20), || dir.join("client.end").exists()),
+        "{:?}",
+        env.entries()
+    );
+    assert!(!dir.join("server.released.end").exists());
+    server.release();
+    assert!(parent.wait().unwrap().success());
+    assert!(
+        read_ns(&dir.join("client.start")) - read_ns(&dir.join("server.start")) >= 2_000_000_000,
+        "started before the limit"
+    );
+}
+
 /// `--nested inherit` (or the environment variable, for a whole tree) is
 /// what every nested `exec` did before: it runs at once under the outer
 /// entry and is not a run of its own.
 #[test]
 fn nested_inherit_runs_at_once_under_the_outer_entry() {
-    let env = TestEnv::new().with_config("budget = 1\n");
+    let env = TestEnv::new()
+        .with_config("budget = 1\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
     let nested = format!("{BIN} exec --weight 1 -- echo nested-ok");
     let by_flag = format!("{BIN} exec --nested inherit --weight 1 -- echo nested-ok");
     for (var, inner) in [(None, &by_flag), (Some("inherit"), &nested)] {
@@ -706,7 +862,8 @@ fn nested_entries(env: &TestEnv) -> Vec<serde_json::Value> {
 
 #[test]
 fn nested_exec_is_admitted_in_its_parent_and_bogus_lease_is_gated() {
-    let env = TestEnv::new().with_config("budget = 1\n");
+    let env = TestEnv::new()
+        .with_config("budget = 1\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
     // Outer takes the whole budget; inner still runs, in the outer's share,
     // and so does one nested in the inner.
     let out = env.run(&[

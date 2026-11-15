@@ -542,6 +542,7 @@ fn a_plain_entry_keeps_the_old_ledger_readable() {
         backfilled: false,
         label: None,
         parent: None,
+        nested_cpu_secs: 0.0,
     });
     l.save(&ctx.paths.ledger_file()).unwrap();
     let old: old_ledger::Ledger =
@@ -582,6 +583,7 @@ fn a_nested_entry_whose_parent_was_dropped_from_the_ledger_names_it_again() {
         label: None,
         // As an older binary left it.
         parent: None,
+        nested_cpu_secs: 0.0,
     };
     let _leases = [
         lock::take_lease(&ctx, "p").unwrap(),

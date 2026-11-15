@@ -12,6 +12,8 @@ use std::path::Path;
 pub const SCHEMA_VERSION: u32 = 1;
 /// The version of a ledger that holds managed entries (see [`Ledger`]).
 pub const MANAGED_SCHEMA_VERSION: u32 = 2;
+/// The version of a ledger that holds nested entries (see [`Ledger`]).
+pub const NESTED_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Entry {
@@ -50,6 +52,16 @@ pub struct Entry {
     /// [`crate::admit::used_budget`]). Absent for a top-level command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
+    /// CPU seconds of the nested entries of this one that have finished.
+    /// The entry's own measurement (`rusage` of its command) covers them
+    /// too; this is taken off before its run is recorded, so it does not
+    /// learn the weight of what it only started.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub nested_cpu_secs: f64,
+}
+
+fn is_zero(v: &f64) -> bool {
+    *v == 0.0
 }
 
 /// The ledger. In memory (and in `status --json`) it is always `entries`;
@@ -64,6 +76,14 @@ pub struct Entry {
 /// rewrites it: it sees only plain entries and does not know that managed
 /// ones keep their budget after the owner's lease is gone, so failing
 /// closed is the only safe answer.
+///
+/// A ledger that holds a nested entry (one with a `parent`, or one that
+/// has counted the CPU time of nested entries) is written with `version`
+/// 3 and its entries under `entries_v3` alone, for the same reason: a
+/// binary from before nested admission would rewrite it without those
+/// fields, which charges a nested command twice and leaves a waiting one
+/// queued behind its own parent. Such a binary fails on the file until
+/// the nested commands have finished.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Ledger {
     pub version: u32,
@@ -80,6 +100,8 @@ struct Wire<E> {
     entries: Option<E>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     entries_v2: Option<E>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    entries_v3: Option<E>,
 }
 
 impl Default for Ledger {
@@ -98,13 +120,14 @@ impl Ledger {
             Ok(bytes) if bytes.is_empty() => Ok(Ledger::default()),
             Ok(bytes) => {
                 let w: Wire<Vec<Entry>> = serde_json::from_slice(&bytes)?;
-                let entries = match (w.entries, w.entries_v2) {
-                    (Some(e), None) | (None, Some(e)) => e,
-                    _ => {
-                        return Err(Error::Ledger(
-                            "a ledger has exactly one of `entries` and `entries_v2`".into(),
-                        ))
-                    }
+                let mut shapes = [w.entries, w.entries_v2, w.entries_v3]
+                    .into_iter()
+                    .flatten();
+                let (Some(entries), None) = (shapes.next(), shapes.next()) else {
+                    return Err(Error::Ledger(
+                        "a ledger has exactly one of `entries`, `entries_v2` and `entries_v3`"
+                            .into(),
+                    ));
                 };
                 Ok(Ledger {
                     version: w.version,
@@ -118,7 +141,8 @@ impl Ledger {
     }
 
     /// The format version the ledger file on disk is written in: 1 (readable
-    /// by older binaries) or 2 (holds a managed entry). A missing or
+    /// by older binaries), 2 (holds a managed entry) or 3 (holds a nested
+    /// entry). A missing or
     /// unreadable file is the plain format, which is what the next save
     /// writes when no managed entry exists.
     pub fn file_format(path: &Path) -> u32 {
@@ -143,20 +167,24 @@ impl Ledger {
                 .try_exists()
                 .unwrap_or(true)
         });
-        let wire = if managed {
-            Wire {
-                version: MANAGED_SCHEMA_VERSION,
-                next_seq: self.next_seq,
-                entries: None,
-                entries_v2: Some(&self.entries),
-            }
+        let nested = self
+            .entries
+            .iter()
+            .any(|e| e.parent.is_some() || e.nested_cpu_secs != 0.0);
+        let version = if nested {
+            NESTED_SCHEMA_VERSION
+        } else if managed {
+            MANAGED_SCHEMA_VERSION
         } else {
-            Wire {
-                version: SCHEMA_VERSION,
-                next_seq: self.next_seq,
-                entries: Some(&self.entries),
-                entries_v2: None,
-            }
+            SCHEMA_VERSION
+        };
+        let shape = |v| (version == v).then_some(&self.entries);
+        let wire = Wire {
+            version,
+            next_seq: self.next_seq,
+            entries: shape(SCHEMA_VERSION),
+            entries_v2: shape(MANAGED_SCHEMA_VERSION),
+            entries_v3: shape(NESTED_SCHEMA_VERSION),
         };
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         serde_json::to_writer_pretty(&mut tmp, &wire)?;
@@ -197,7 +225,35 @@ impl Ledger {
                 expected_secs: e.expected_secs,
                 backfilled: e.backfilled,
                 parent: e.parent.clone(),
+                ran_secs: match (e.state, e.started_at) {
+                    (State::Running, Some(at)) => {
+                        (now - at).num_milliseconds().max(0) as f64 / 1000.0
+                    }
+                    _ => 0.0,
+                },
             })
+            .collect()
+    }
+
+    /// The entries whose `parent` chain leads back to themselves. `exec`
+    /// cannot write one (a parent runs before its child exists); admission
+    /// counts such entries for nothing, so `status` warns about them.
+    pub fn parent_cycles(&self) -> Vec<&str> {
+        let in_cycle = |e: &Entry| {
+            let mut at = e.parent.as_deref();
+            for _ in 0..self.entries.len() {
+                match at {
+                    Some(p) if p == e.id => return true,
+                    Some(p) => at = self.find(p).and_then(|q| q.parent.as_deref()),
+                    None => return false,
+                }
+            }
+            false
+        };
+        self.entries
+            .iter()
+            .filter(|e| in_cycle(e))
+            .map(|e| e.id.as_str())
             .collect()
     }
 
@@ -240,6 +296,7 @@ mod tests {
             backfilled: false,
             label: None,
             parent: None,
+            nested_cpu_secs: 0.0,
         }
     }
 
@@ -394,6 +451,126 @@ mod tests {
             std::fs::write(&p, body).unwrap();
             assert!(Ledger::load(&p).is_err(), "{body}");
         }
+    }
+
+    /// How the last release before nested admission reads the file: one
+    /// of `entries` and `entries_v2`, anything else refused.
+    fn read_by_0_8(path: &Path) -> std::result::Result<usize, String> {
+        #[derive(Deserialize)]
+        struct OldWire {
+            #[serde(default)]
+            entries: Option<Vec<serde_json::Value>>,
+            #[serde(default)]
+            entries_v2: Option<Vec<serde_json::Value>>,
+        }
+        let w: OldWire =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).map_err(|e| e.to_string())?;
+        match (w.entries, w.entries_v2) {
+            (Some(e), None) | (None, Some(e)) => Ok(e.len()),
+            _ => Err("a ledger has exactly one of `entries` and `entries_v2`".into()),
+        }
+    }
+
+    #[test]
+    fn a_ledger_with_a_nested_entry_is_one_older_binaries_refuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        let mut l = Ledger::default();
+        l.entries.push(entry("p", 1));
+        l.save(&path).unwrap();
+        assert_eq!(Ledger::file_format(&path), SCHEMA_VERSION);
+        assert_eq!(read_by_0_8(&path), Ok(1));
+
+        // A child: an older binary would write the file back without
+        // `parent`, so it must not be able to read it.
+        let mut child = entry("c", 2);
+        child.parent = Some("p".into());
+        l.entries.push(child);
+        l.save(&path).unwrap();
+        assert_eq!(Ledger::file_format(&path), NESTED_SCHEMA_VERSION);
+        assert!(read_by_0_8(&path).is_err());
+        assert_eq!(Ledger::load(&path).unwrap().entries, l.entries);
+
+        // The child is gone but the parent still carries what it used.
+        l.entries.pop();
+        l.entries[0].nested_cpu_secs = 2.5;
+        l.save(&path).unwrap();
+        assert_eq!(Ledger::file_format(&path), NESTED_SCHEMA_VERSION);
+        assert!(read_by_0_8(&path).is_err());
+        assert_eq!(Ledger::load(&path).unwrap().entries, l.entries);
+
+        // Nothing nested any more: the old shape again.
+        l.entries[0].nested_cpu_secs = 0.0;
+        l.save(&path).unwrap();
+        assert_eq!(Ledger::file_format(&path), SCHEMA_VERSION);
+        assert_eq!(read_by_0_8(&path), Ok(1));
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("nested_cpu_secs") && !text.contains("parent"));
+    }
+
+    #[test]
+    fn a_file_with_two_shapes_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ledger.json");
+        std::fs::write(
+            &path,
+            r#"{"version":3,"next_seq":1,"entries":[],"entries_v3":[]}"#,
+        )
+        .unwrap();
+        assert!(Ledger::load(&path).is_err());
+        std::fs::write(&path, r#"{"version":3,"next_seq":1}"#).unwrap();
+        assert!(Ledger::load(&path).is_err());
+    }
+
+    #[test]
+    fn a_running_entry_reports_how_long_it_has_run() {
+        let now = Utc::now();
+        let mut running = entry("r", 1);
+        running.state = State::Running;
+        running.started_at = Some(now - chrono::Duration::seconds(90));
+        let mut unstamped = entry("u", 2);
+        unstamped.state = State::Running;
+        let mut waiting = entry("w", 3);
+        waiting.enqueued_at = now - chrono::Duration::seconds(30);
+        // Never read for a waiting entry.
+        waiting.started_at = Some(now - chrono::Duration::seconds(30));
+        let l = Ledger {
+            entries: vec![running, unstamped, waiting],
+            ..Ledger::default()
+        };
+        let q = l.queue_at(now);
+        assert_eq!(
+            q.iter().map(|e| e.ran_secs).collect::<Vec<_>>(),
+            [90.0, 0.0, 0.0]
+        );
+        assert_eq!(q[2].waited_secs, 30.0);
+    }
+
+    #[test]
+    fn entries_that_name_each_other_as_parent_are_found() {
+        let with_parent = |id: &str, seq, parent: &str| {
+            let mut e = entry(id, seq);
+            e.parent = Some(parent.into());
+            e
+        };
+        let mut l = Ledger {
+            entries: vec![
+                entry("p", 1),
+                with_parent("c", 2, "p"),
+                with_parent("g", 3, "c"),
+                with_parent("orphan", 4, "gone"),
+            ],
+            ..Ledger::default()
+        };
+        assert!(l.parent_cycles().is_empty());
+        l.entries.extend([
+            with_parent("a", 5, "b"),
+            with_parent("b", 6, "a"),
+            with_parent("self", 7, "self"),
+            // Hangs off a cycle without being part of it.
+            with_parent("below", 8, "a"),
+        ]);
+        assert_eq!(l.parent_cycles(), ["a", "b", "self"]);
     }
 
     #[test]

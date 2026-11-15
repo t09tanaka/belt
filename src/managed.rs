@@ -876,6 +876,7 @@ pub(crate) fn push_entry(
             backfilled: false,
             label: opts.label.clone(),
             parent: opts.parent.clone(),
+            nested_cpu_secs: 0.0,
         });
         ledger.save(&ctx.paths.ledger_file())?;
         return Ok(Pushed::New { seq });
@@ -1182,6 +1183,7 @@ pub fn run_command_with_tracker(
             start_tracker,
             env: opts.env.as_ref(),
             stdout_log: opts.stdout_log.as_deref(),
+            parent: opts.parent.as_deref(),
         },
     )?;
     if let Some(at) = outcome.tracked_to_exit_at {

@@ -55,6 +55,10 @@ pub struct Outcome {
     /// [`crate::tracker::Finished::covered`]): the command had been reaped,
     /// and nothing it started can have been missed after that time.
     pub tracked_to_exit_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// When entries were nested in this one while it ran: the largest
+    /// resident size sampled among the command's own processes, with the
+    /// nested entries' trees left out. `max_rss_bytes` covers those too.
+    pub own_max_rss_bytes: Option<u64>,
 }
 
 /// Run `argv` with inherited stdio in our process group, in `cwd`, with
@@ -97,6 +101,8 @@ pub struct Spawn<'a> {
     pub env: Option<&'a std::collections::BTreeMap<String, String>>,
     /// Append stdout and stderr to this file, stdin from `/dev/null`.
     pub stdout_log: Option<&'a Path>,
+    /// The entry this one is nested in ([`crate::exec::Opts::parent`]).
+    pub parent: Option<&'a str>,
 }
 
 /// Starts the recorder of a command's descendants.
@@ -327,8 +333,14 @@ pub fn run_with(
         _ => None,
     };
     // Dropped (stopped and joined) once the child has been reaped.
-    let _monitor =
-        measure.then(|| crate::usage::Monitor::start(ctx.clone(), lease.to_string(), child.id()));
+    let monitor = measure.then(|| {
+        crate::usage::Monitor::start(
+            ctx.clone(),
+            lease.to_string(),
+            child.id(),
+            spawn.parent.map(str::to_string),
+        )
+    });
     // A signal delivered between handler installation and spawn is
     // forwarded now rather than waiting for the next EINTR.
     let early = ctx.supervisor.take_pending();
@@ -412,6 +424,7 @@ pub fn run_with(
     };
     let cpu_secs = tv(ru.ru_utime) + tv(ru.ru_stime);
     let max_rss_bytes = normalise_maxrss(ru.ru_maxrss as u64);
+    let own_max_rss_bytes = monitor.and_then(crate::usage::Monitor::finish);
     Ok(Outcome {
         exit,
         wall_secs,
@@ -420,6 +433,7 @@ pub fn run_with(
         descendants_left,
         tracker_unknown,
         tracked_to_exit_at,
+        own_max_rss_bytes,
     })
 }
 

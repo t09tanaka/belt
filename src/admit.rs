@@ -35,6 +35,8 @@ pub struct QueueEntry {
     /// The entry whose command started this one (a nested `exec`). It
     /// counts only while that entry is running (see [`is_nested`]).
     pub parent: Option<String>,
+    /// Seconds a running entry has been running (0 for a waiting one).
+    pub ran_secs: f64,
 }
 
 /// What the machine looks like right now.
@@ -66,6 +68,13 @@ pub struct Limits {
     /// No new entry passes a normal entry that backfilled ones are holding
     /// up once it has waited this long.
     pub backfill_max_wait_secs: f64,
+    /// The first nested entry of a parent that has none running is not
+    /// held by the budget; the live guards hold it for at most this long.
+    pub nested_guard_max_wait_secs: f64,
+    /// A nested entry that has waited this long starts whatever the
+    /// budget says, once every nested entry of the same parent that is
+    /// running has also run this long (0 disables).
+    pub nested_sibling_max_wait_secs: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -230,24 +239,37 @@ fn used_once_started(entries: &[QueueEntry], e: &QueueEntry, count: Count, budge
     used(&started, count)
 }
 
-/// Whether `e` is the nested entry its parent's command is certainly
-/// waiting for: no entry nested in the same parent is running, and `e`
-/// is the first of them in the queue. It starts whatever the budget and
-/// the guards say. A command that waits for its nested command cannot
-/// finish, so the budget it holds would never come back and both would
-/// wait for ever; this way a command that runs its nested commands one at
-/// a time never waits for them, and each running parent goes at most one
-/// nested entry over the budget.
-fn is_only_child(entries: &[QueueEntry], order: &[&QueueEntry], e: &QueueEntry) -> bool {
-    let Some(parent) = running_parent(entries, e) else {
-        return false;
-    };
+/// The running entries nested in the same parent as `e`, when `e` is
+/// nested and is the first waiting entry of that parent in the queue;
+/// `None` otherwise.
+fn running_siblings<'a>(
+    entries: &'a [QueueEntry],
+    order: &[&QueueEntry],
+    e: &QueueEntry,
+) -> Option<Vec<&'a QueueEntry>> {
+    let parent = running_parent(entries, e)?;
     let sibling = |q: &QueueEntry| q.parent.as_deref() == Some(parent.id.as_str());
-    let first = order.iter().find(|q| sibling(q)).map(|q| q.id.as_str());
-    first == Some(e.id.as_str())
-        && !entries
+    let first = order.iter().find(|q| sibling(q))?;
+    (first.id == e.id).then(|| {
+        entries
             .iter()
-            .any(|q| q.state == State::Running && sibling(q))
+            .filter(|q| q.state == State::Running && sibling(q))
+            .collect()
+    })
+}
+
+/// Whether a nested entry that has waited `waited` seconds behind the
+/// `running` entries of its parent has waited long enough to start
+/// whatever the budget says: a running nested command may itself be
+/// waiting for this one. One entry is let through per
+/// `nested_sibling_max_wait_secs`, since each that starts must have run
+/// that long before the next may.
+fn overdue(running: &[&QueueEntry], waited: f64, limits: Limits) -> bool {
+    let limit = limits.nested_sibling_max_wait_secs;
+    !running.is_empty()
+        && limit > 0.0
+        && waited >= limit
+        && running.iter().all(|r| r.ran_secs >= limit)
 }
 
 /// The weight admission counts for `e`: floor 1, ceiling the budget.
@@ -319,8 +341,14 @@ fn may_pass(entries: &[QueueEntry], order: &[&QueueEntry], pos: usize, limits: L
 ///
 /// A nested entry (one whose `parent` is running) is ahead of every
 /// top-level one, and the budget counts it inside its parent's share
-/// first. The first nested entry of a parent that has none running
-/// starts at once (see `is_only_child`).
+/// first. The first nested entry of a parent that has none running is
+/// not held by the queue or the budget (its parent's command waits for
+/// it, so that budget would never come back), only by the live guards
+/// and by those for at most `nested_guard_max_wait_secs`: a command that
+/// runs its nested commands one at a time never waits for the budget, and
+/// each running parent goes at most one nested entry over it. Any other
+/// nested entry waits until it fits, but for at most
+/// `nested_sibling_max_wait_secs` (see `overdue`).
 pub fn admit(
     entries: &[QueueEntry],
     me: &str,
@@ -336,26 +364,37 @@ pub fn admit(
         return Decision::Wait(Reason::NotHead { ahead: usize::MAX });
     };
     let candidate = order[pos];
-    if is_only_child(entries, &order, candidate) {
+    let siblings = running_siblings(entries, &order, candidate);
+    if siblings
+        .as_ref()
+        .is_some_and(|running| overdue(running, waited_secs, limits))
+    {
         return Decision::Admitted;
     }
-    if pos != 0 {
-        match may_pass(entries, &order, pos, limits) {
-            Pass::Yes => {}
-            Pass::No => return Decision::Wait(Reason::NotHead { ahead: pos }),
-            Pass::Reserved => return Decision::Wait(Reason::Reserved { ahead: pos }),
-        }
-    }
-    let count = count_for(candidate, waited_secs, limits, false);
-    if used_once_started(entries, candidate, count, limits.budget) > limits.budget {
-        return Decision::Wait(if pos == 0 {
-            Reason::Budget {
-                used: used(entries, count),
-                budget: limits.budget,
+    // The first nested entry of a parent that has none running: the
+    // parent's command is certainly waiting for it, so the budget that
+    // command holds never comes back by waiting. Neither the queue nor
+    // the budget holds it; the live guards do, for a bounded time.
+    let only_child = siblings.is_some_and(|running| running.is_empty());
+    if !only_child {
+        if pos != 0 {
+            match may_pass(entries, &order, pos, limits) {
+                Pass::Yes => {}
+                Pass::No => return Decision::Wait(Reason::NotHead { ahead: pos }),
+                Pass::Reserved => return Decision::Wait(Reason::Reserved { ahead: pos }),
             }
-        } else {
-            Reason::NotHead { ahead: pos }
-        });
+        }
+        let count = count_for(candidate, waited_secs, limits, false);
+        if used_once_started(entries, candidate, count, limits.budget) > limits.budget {
+            return Decision::Wait(if pos == 0 {
+                Reason::Budget {
+                    used: used(entries, count),
+                    budget: limits.budget,
+                }
+            } else {
+                Reason::NotHead { ahead: pos }
+            });
+        }
     }
     let anything_running = entries.iter().any(|e| e.state == State::Running);
     if !anything_running {
@@ -364,6 +403,9 @@ pub fn admit(
     let Some(live) = live else {
         return Decision::Admitted;
     };
+    if only_child && waited_secs >= limits.nested_guard_max_wait_secs {
+        return Decision::Admitted;
+    }
     let need = predicted_rss.saturating_add(limits.memory_reserve);
     if live.available_memory < need {
         return Decision::Wait(Reason::Memory {
@@ -407,7 +449,12 @@ mod tests {
             expected_secs: None,
             backfilled: false,
             parent: None,
+            ran_secs: 0.0,
         }
+    }
+    fn ran(mut q: QueueEntry, secs: f64) -> QueueEntry {
+        q.ran_secs = secs;
+        q
     }
     fn using(mut q: QueueEntry, cores: f64) -> QueueEntry {
         q.using = Some(cores);
@@ -422,6 +469,8 @@ mod tests {
         front_overload_max_wait_secs: 30.0,
         backfill_max_job_secs: 300.0,
         backfill_max_wait_secs: 300.0,
+        nested_guard_max_wait_secs: 60.0,
+        nested_sibling_max_wait_secs: 600.0,
     };
     /// A waiting entry expected to take `secs`, queued for `waited`.
     fn short(mut q: QueueEntry, secs: f64) -> QueueEntry {
@@ -1203,18 +1252,121 @@ mod tests {
     }
 
     #[test]
-    fn the_only_nested_entry_of_a_parent_starts_whatever_the_budget_and_the_guards_say() {
+    fn the_only_nested_entry_of_a_parent_is_not_held_by_the_budget() {
         // The parent uses the whole budget itself and waits for its child:
-        // holding the child would hold both for ever.
+        // holding the child for the budget would hold both for ever.
         let q = [
             using(e("p", State::Running, false, 12, 1), 12.0),
             e("other", State::Running, false, 6, 2),
-            child(e("c", State::Waiting, false, 12, 3), "p"),
+            e("top", State::Waiting, true, 1, 3),
+            child(e("c", State::Waiting, false, 12, 4), "p"),
         ];
         assert_eq!(used_budget(&q), 18);
         assert_eq!(
-            admit(&q, "c", 0, 0.0, LIMITS, Some(saturated())),
+            admit(&q, "c", 0, 0.0, LIMITS, Some(calm())),
             Decision::Admitted
+        );
+        // Without a reading of the machine there is nothing to hold it.
+        assert_eq!(admit(&q, "c", 0, 0.0, LIMITS, None), Decision::Admitted);
+    }
+
+    #[test]
+    fn the_guards_hold_an_only_nested_entry_for_a_bounded_time() {
+        let q = [
+            using(e("p", State::Running, false, 12, 1), 12.0),
+            child(e("c", State::Waiting, false, 12, 2), "p"),
+        ];
+        // Memory is short: several parents each starting one more command
+        // must not push the machine into swap.
+        assert_eq!(
+            admit(&q, "c", 0, 59.9, LIMITS, Some(saturated())),
+            Decision::Wait(Reason::Memory {
+                available: 0,
+                need: 2 << 30
+            })
+        );
+        let busy = LiveSnapshot {
+            cpu_busy: 0.95,
+            ..calm()
+        };
+        assert_eq!(
+            admit(&q, "c", 0, 59.9, LIMITS, Some(busy)),
+            Decision::Wait(Reason::Cpu {
+                busy: 0.95,
+                threshold: 0.85
+            })
+        );
+        // Its parent cannot finish without it: it starts anyway in the end.
+        assert_eq!(
+            admit(&q, "c", 0, 60.0, LIMITS, Some(saturated())),
+            Decision::Admitted
+        );
+        // That is for the only child. One with a running sibling that
+        // fits the budget is held by the guards like any entry.
+        let fits = [
+            e("p", State::Running, false, 12, 1),
+            child(e("c1", State::Running, false, 4, 2), "p"),
+            child(e("c2", State::Waiting, false, 4, 3), "p"),
+        ];
+        assert_eq!(
+            admit(&fits, "c2", 0, 60.0, LIMITS, Some(saturated())),
+            Decision::Wait(Reason::Memory {
+                available: 0,
+                need: 2 << 30
+            })
+        );
+    }
+
+    #[test]
+    fn a_nested_entry_starts_once_it_and_its_running_siblings_have_waited_long_enough() {
+        // `c1` may be waiting for `c2` (a server and its client): `c2`
+        // does not wait for the budget for ever.
+        let family = |c1_ran, limits: Limits, waited_secs| {
+            let q = [
+                e("p", State::Running, false, 12, 1),
+                ran(child(e("c1", State::Running, false, 12, 2), "p"), c1_ran),
+                child(e("c2", State::Waiting, false, 12, 3), "p"),
+                child(e("c3", State::Waiting, false, 12, 4), "p"),
+            ];
+            move |id: &str| admit(&q, id, 0, waited_secs, limits, Some(saturated()))
+        };
+        let budget = Decision::Wait(Reason::Budget {
+            used: 12,
+            budget: 12,
+        });
+        assert_eq!(family(600.0, LIMITS, 599.9)("c2"), budget);
+        assert_eq!(family(600.0, LIMITS, 600.0)("c2"), Decision::Admitted);
+        // One at a time: the sibling that started last has not run long
+        // enough yet, and the next in the queue goes first.
+        assert_eq!(family(599.9, LIMITS, 600.0)("c2"), budget);
+        assert_eq!(
+            family(600.0, LIMITS, 600.0)("c3"),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+        // 0 turns it off.
+        let off = Limits {
+            nested_sibling_max_wait_secs: 0.0,
+            ..LIMITS
+        };
+        assert_eq!(family(900.0, off, 900.0)("c2"), budget);
+    }
+
+    #[test]
+    fn the_sibling_limit_is_not_what_frees_an_only_nested_entry_from_the_guards() {
+        let limits = Limits {
+            nested_guard_max_wait_secs: 1000.0,
+            ..LIMITS
+        };
+        let q = [
+            e("p", State::Running, false, 12, 1),
+            child(e("c", State::Waiting, false, 12, 2), "p"),
+        ];
+        assert_eq!(
+            admit(&q, "c", 0, 700.0, limits, Some(saturated())),
+            Decision::Wait(Reason::Memory {
+                available: 0,
+                need: 2 << 30
+            })
         );
     }
 
@@ -1230,7 +1382,7 @@ mod tests {
         ];
         for id in ["c2", "c1"] {
             assert_eq!(
-                admit(&q, id, 0, 0.0, LIMITS, Some(saturated())),
+                admit(&q, id, 0, 0.0, LIMITS, Some(calm())),
                 Decision::Admitted,
                 "{id}"
             );
@@ -1245,11 +1397,11 @@ mod tests {
             child(e("c2", State::Waiting, false, 12, 3), "p"),
         ];
         assert_eq!(
-            admit(&q, "c1", 0, 0.0, LIMITS, Some(saturated())),
+            admit(&q, "c1", 0, 0.0, LIMITS, Some(calm())),
             Decision::Admitted
         );
         assert_eq!(
-            admit(&q, "c2", 0, 0.0, LIMITS, Some(saturated())),
+            admit(&q, "c2", 0, 0.0, LIMITS, Some(calm())),
             Decision::Wait(Reason::NotHead { ahead: 1 })
         );
         // Once the first runs, the second waits for the budget it takes.
