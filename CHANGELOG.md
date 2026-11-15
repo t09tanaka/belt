@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-16
+
 - Add a build cache for Rust jobs. A job whose checkout has a `Cargo.toml` and `Cargo.lock` at its root gets the `target/` of an earlier passing job with the same key (toolchain, OS, the root `Cargo.lock`, workflow and job, build-affecting variables) cloned into its worktree before its first step, so its dependencies are not built again; a job that passes saves what cargo owns in its `target/` (`deps`, `build`, `.fingerprint` of each profile directory; nothing else) when the key has no entry. The key also holds `.cargo/config.toml`, `rust-toolchain.toml`, the evaluated environment and the matrix values. The toolchain is asked within 20 s and without installing anything; if that fails the job goes without the cache. Entries are immutable, written under a temporary name (held by a lock) and renamed, and deleted only by moving them to the trash. The cache is capped at 20 GB (`LOCAL_CI_BUILD_CACHE_MAX_GB`, `0` turns it off), least recently used first, temporary entries counted, and an entry that alone is over the cap is not kept. Off with `--no-build-cache` or `LOCAL_CI_NO_BUILD_CACHE=1`; `local-ci cache status` lists it and `local-ci cache prune --build` empties it. The summary says `build cache  restored 2 · saved 1`, and `result.json` has an optional `build_cache` on the job. See "The build cache for Rust jobs" in the README.
 - `Runner::build_cache` (library) turns it on, `RunOptions` has `no_build_cache`, `JobResult` and `WireJobResult` have an optional `build_cache`.
 
