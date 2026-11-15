@@ -65,21 +65,26 @@ pub fn private_docker_path(home: &Path, path: &str) -> String {
 }
 
 /// Install the npm dependencies of an example directory when `node_modules`
-/// is missing or older than `package-lock.json`, as CI does with `npm ci`.
+/// has no complete install (`node_modules/.package-lock.json`) newer than
+/// `package-lock.json`, as CI does with `npm ci`.
 /// Tests run in parallel, so the install is serialised by a file lock and
 /// re-checked under it: one test installs, the others wait and reuse it.
 /// Without npm this panics with the fix; it never skips, which would weaken
 /// the gate.
 pub fn ensure_npm_deps(dir: &Path) {
     use fs2::FileExt;
-    let modules = dir.join("node_modules");
+    // npm writes `node_modules/.package-lock.json` last, so a failed or
+    // interrupted `npm ci` leaves it missing (stale) rather than looking fresh.
+    let marker = dir.join("node_modules").join(".package-lock.json");
     let fresh = || {
         let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-        match (mtime(&modules), mtime(&dir.join("package-lock.json"))) {
-            (Some(m), Some(l)) => m >= l,
-            (Some(_), None) => true,
-            _ => false,
-        }
+        let Some(m) = mtime(&marker) else {
+            return false;
+        };
+        ["package-lock.json", "package.json"]
+            .iter()
+            .filter_map(|f| mtime(&dir.join(f)))
+            .all(|src| m >= src)
     };
     if fresh() {
         return;
