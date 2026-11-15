@@ -180,9 +180,9 @@ impl PinnedWorkspace {
             Ok(existing) if existing == receipt => return Ok(()),
             Ok(_) => bail!("cannot replace another captured workspace receipt"),
             Err(error) => {
-                if !error
+                if error
                     .downcast_ref::<std::io::Error>()
-                    .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+                    .is_none_or(|e| e.kind() != std::io::ErrorKind::NotFound)
                 {
                     return Err(error);
                 }
