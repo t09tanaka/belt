@@ -983,7 +983,7 @@ libtestのsubstring仕様でservice::outputs等のlibrary consumerも少数含�
 productionや変異除外は変更していない。
 
 全actual2656変異を単一shardで完走し、2417 caught・239 unviable・0 missed・0 timeout。
-総1102.45秒（18分22秒）で、一括prepare430.9秒、baseline8.8秒、trace612件8.6秒、
+schemata実行1102.45秒（18分22秒、事前discovery/compile35.95秒は別、合計約18分58秒）で、一括prepare430.9秒、baseline8.8秒、trace612件8.6秒、
 変異phase653.3秒（単独再compileを含む）。build内訳は一括2404、単独16、prepare時unviable236。
 旧baseline1262/1303秒に対して約143〜148倍短くなった。state::successorsのVec::new変異は
 旧heavy-test経路56.9秒に対して0.2秒でcaught。総時間は単独再compileにも左右されるため、
