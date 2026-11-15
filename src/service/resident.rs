@@ -351,7 +351,44 @@ pub struct Resident {
     collection_interval: Duration,
     collection: CollectConfig,
     retention_days: u32,
+    state_root: Arc<StateRoot>,
     _token_file: File,
+}
+
+/// The state directory this owner opened at startup. The open handle keeps
+/// its inode from being reused, so device and inode identify it for as long
+/// as the owner runs.
+struct StateRoot {
+    path: PathBuf,
+    dir: File,
+}
+impl StateRoot {
+    fn open(path: &Path) -> io::Result<Self> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dir,
+        })
+    }
+    /// False once the path no longer names the directory opened at startup:
+    /// it was removed, or something else took its name. An owner without its
+    /// directory can reach neither its clients nor its durable work. A read
+    /// that fails for another reason proves nothing and keeps the owner.
+    fn present(&self) -> bool {
+        let Ok(held) = self.dir.metadata() else {
+            return true;
+        };
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(now) => now.dev() == held.dev() && now.ino() == held.ino(),
+            Err(e) => !matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ),
+        }
+    }
 }
 
 struct StartupParts {
@@ -361,6 +398,7 @@ struct StartupParts {
     captured: Arc<CapturedInputs>,
     agent: Arc<Agent>,
     token_file: File,
+    state_root: StateRoot,
     socket: PathBuf,
     token: String,
     worker_id: WorkerId,
@@ -380,6 +418,7 @@ impl StartupParts {
         private_dir(&inputs.state_dir)?;
         // Refuse symlinked existing state entries before storage follows them.
         reject_symlinks(&inputs.state_dir)?;
+        let state_root = StateRoot::open(&inputs.state_dir)?;
         let settings = config.runtime_settings()?;
         let store = CoordinatorStore::open_bound(&inputs.state_dir, wall_ms(), binding)?;
         private_dir(&inputs.state_dir.join("parent"))?;
@@ -445,6 +484,7 @@ impl StartupParts {
             captured,
             agent,
             token_file,
+            state_root,
             socket,
             token,
             worker_id,
@@ -644,6 +684,7 @@ impl Resident {
             collection_interval: parts.collection_interval,
             collection: parts.collection,
             retention_days: parts.retention_days,
+            state_root: Arc::new(parts.state_root),
             _token_file: parts.token_file,
         })
     }
@@ -651,8 +692,10 @@ impl Resident {
         self.client.clone()
     }
 
-    /// Run until owner-authenticated shutdown or fencing. Disconnecting a
-    /// request never cancels accepted work. All work loops have separate clocks.
+    /// Run until owner-authenticated shutdown, fencing, or the loss of the
+    /// state directory (checked on the heartbeat tick; a clean exit).
+    /// Disconnecting a request never cancels accepted work. All work loops
+    /// have separate clocks.
     pub async fn run(mut self) -> anyhow::Result<()> {
         let (stop, rx) = watch::channel(false);
         let mut loops = JoinSet::new();
@@ -671,11 +714,14 @@ impl Resident {
         let stop_tick = stop.clone();
         let mut tick_stop = rx.clone();
         let heartbeat = self.heartbeat;
+        let state_root = self.state_root.clone();
+        let tick_root = state_root.clone();
         loops.spawn(async move {
             let mut timer = tokio::time::interval(heartbeat);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _ = tick_stop.changed() => return Ok::<(), anyhow::Error>(()), _ = timer.tick() => {} }
+                if !tick_root.present() { let _ = stop_tick.send(true); return Ok(()); }
                 if let Err(e) = coordinator.tick().await { let _ = stop_tick.send(true); return Err(e.into()); }
             }
         });
@@ -832,8 +878,10 @@ impl Resident {
         tokio::task::spawn_blocking(move || agent.shutdown()).await?;
         self.worker_connection.abort();
         match failure {
-            Some(e) => Err(e),
-            None => Ok(()),
+            // Another loop may meet the missing files before the heartbeat
+            // does; without the directory that is the same clean exit.
+            Some(e) if state_root.present() => Err(e),
+            _ => Ok(()),
         }
     }
 }
@@ -841,8 +889,11 @@ impl Drop for Resident {
     fn drop(&mut self) {
         self.worker_connection.abort();
         self.agent.shutdown();
-        // Only this lock-holding owner's private socket is removed.
-        let _ = std::fs::remove_file(&self.client.socket);
+        // Only this lock-holding owner's private socket is removed: when the
+        // directory was replaced, the name belongs to someone else.
+        if self.state_root.present() {
+            let _ = std::fs::remove_file(&self.client.socket);
+        }
     }
 }
 

@@ -737,3 +737,38 @@ async fn resident_measured_fixture(metrics_fail: bool) {
         .iter()
         .any(|(receipt, _)| receipt.starts_with("terminal-tail:")));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resident_exits_cleanly_when_its_state_directory_is_gone_or_replaced() {
+    for replaced in [false, true] {
+        let root = root();
+        let resident = Resident::start(&config(), inputs(root.path()))
+            .await
+            .unwrap();
+        let client = resident.client();
+        let runner = tokio::spawn(resident.run());
+        assert!(matches!(
+            client.request(Operation::Ping).await.unwrap(),
+            Reply::Ready { .. }
+        ));
+        let state = root.path().join("parent-state");
+        // One atomic step: the path stops naming the directory this owner opened.
+        std::fs::rename(&state, root.path().join("moved")).unwrap();
+        let foreign = state.join("parent/request.sock");
+        if replaced {
+            // Another owner's directory under the same name is not ours to clean.
+            std::fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+            std::fs::write(&foreign, b"foreign").unwrap();
+        }
+        // No shutdown request is sent: the heartbeat tick notices on its own.
+        let result = tokio::time::timeout(Duration::from_secs(10), runner)
+            .await
+            .expect("owner keeps running without its state directory")
+            .unwrap();
+        assert!(result.is_ok(), "{result:?}");
+        assert!(client.request(Operation::Ping).await.is_err());
+        if replaced {
+            assert_eq!(std::fs::read(&foreign).unwrap(), b"foreign");
+        }
+    }
+}
