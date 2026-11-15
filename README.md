@@ -259,13 +259,19 @@ Each `run:` step of a job is then given the share in two ways:
   variable in the job's `env:` to keep a number of your own.
 - As the weight it asks task-traffic-controller for (`exec --weight
   <share>`), so the steps that run at once are the ones whose shares fit the
-  budget, and the rest wait. The checks themselves are not changed: nothing
-  is skipped and no timeout is shortened.
+  budget, and the rest wait there. (task-traffic-controller lets a step of a
+  nested run start after a long wait although the budget is full, 10 minutes
+  by default, so that nothing waits for ever: with jobs longer than that the
+  shares can add up to more than the budget.) The checks themselves are not
+  changed: nothing is skipped and no timeout is shortened.
 
-A run whose jobs run one at a time (a single unit without a matrix, or
-`--parallel 1`) is not limited: no variable is set and task-traffic-controller
-works the weight out from earlier runs, as before. Setup steps run before the
-jobs, alone, and are not limited either.
+A job that has the whole budget is not limited: no variable is set and
+task-traffic-controller works the weight out from earlier runs, as before.
+That is a run with a single unit without a matrix (or with a matrix under
+`strategy.max-parallel: 1`), a budget under 8 with task-traffic-controller,
+and `--parallel 1`. With `--parallel 1` and task-traffic-controller the
+entries of a matrix still run together, each without a share. Setup steps run
+before the jobs, alone, and are not limited either.
 
 When jobs are limited, the summary says how
 (`cpu    budget 12 · 3 jobs at once · 4 threads each`), and `result.json` and

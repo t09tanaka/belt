@@ -983,6 +983,13 @@ jobs:
             say("own")
         ),
     );
+    let path = budget_controller(&d);
+    (d, path)
+}
+
+/// A `PATH` with a controller whose budget is 8 and which starts every
+/// command at once, after writing how it was called to `argv`.
+fn budget_controller(d: &Demo) -> String {
     let bin = d.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("task-traffic-controller");
@@ -996,14 +1003,18 @@ jobs:
     .unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
-    (d, path)
+    format!("{}:{}", bin.display(), std::env::var("PATH").unwrap())
 }
 
 /// local-ci with `env` added and the thread variables of the caller removed.
 fn local_ci_threads(d: &Demo, path: &str, env: &[(&str, &str)], args: &[&str]) -> Output {
+    let args = [&["-w", "threads.yml"], args].concat();
+    local_ci_share(d, path, env, &args)
+}
+
+fn local_ci_share(d: &Demo, path: &str, env: &[(&str, &str)], args: &[&str]) -> Output {
     let mut c = Command::new(env!("CARGO_BIN_EXE_local-ci"));
-    c.args(["run", "--no-status", "--no-cache", "-w", "threads.yml"])
+    c.args(["run", "--no-status", "--no-cache"])
         .args(args)
         .current_dir(&d.repo)
         .env("LOCAL_CI_HOME", &d.home)
@@ -1076,6 +1087,58 @@ fn parallel_decides_the_share_and_one_job_at_a_time_has_no_limit() {
     assert_eq!(threads_of(&d, "own"), "1 7");
     let argv = std::fs::read_to_string(d.home.join("argv")).unwrap();
     assert!(argv.lines().all(|l| l.starts_with("exec --key ")), "{argv}");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v.get("cpu").is_none(), "{v}");
+}
+
+#[test]
+fn the_entries_of_a_matrix_count_as_jobs_that_run_at_once() {
+    let d = demo("app/lib.sh");
+    let out = d.home.join("threads");
+    std::fs::create_dir_all(&out).unwrap();
+    let matrix = |max_parallel: &str| {
+        format!(
+            r#"name: Matrix
+on: pull_request
+jobs:
+  entry:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2, 3, 4]{max_parallel}
+    steps:
+      - run: echo "$CARGO_BUILD_JOBS $NEXTEST_TEST_THREADS $RUST_TEST_THREADS" > {}/${{{{ matrix.n }}}}
+"#,
+            out.display()
+        )
+    };
+    add_workflow(&d, "matrix.yml", &matrix(""));
+    let path = budget_controller(&d);
+    let o = local_ci_share(&d, &path, &[], &["-w", "matrix.yml", "--json"]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    // one unit, but its four entries run together: two of them fit a budget of 8
+    for n in 1..=4 {
+        assert_eq!(threads_of(&d, &n.to_string()), "4 4 4", "entry {n}");
+    }
+    let argv = std::fs::read_to_string(d.home.join("argv")).unwrap();
+    assert_eq!(argv.lines().count(), 4, "{argv}");
+    assert!(
+        argv.lines()
+            .all(|l| l.starts_with("exec --weight 4 --key ")),
+        "{argv}"
+    );
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        v["cpu"],
+        serde_json::json!({"budget": 8, "jobs_at_once": 2, "threads_per_job": 4})
+    );
+    // `max-parallel: 1` runs them one after another: each has the whole budget
+    add_workflow(&d, "matrix.yml", &matrix("\n      max-parallel: 1"));
+    let o = local_ci_share(&d, &path, &[], &["-w", "matrix.yml", "--json"]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    for n in 1..=4 {
+        assert_eq!(threads_of(&d, &n.to_string()), "", "entry {n}");
+    }
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert!(v.get("cpu").is_none(), "{v}");
 }
