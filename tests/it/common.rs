@@ -12,6 +12,23 @@ use remote_task_runner::supervisor::stop::{
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+/// Inner fixture commands already run inside the harness's shared TTC lease.
+/// Keep their private admission ledger, without depending on unrelated host load.
+pub fn fixture_traffic_config(state: &Path) {
+    let traffic = state.join("traffic");
+    std::fs::create_dir_all(&traffic).unwrap();
+    std::fs::set_permissions(&traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = task_traffic_controller::config::Config {
+        budget: 2,
+        cpu_threshold_percent: 100.0,
+        memory_reserve_mib: 0,
+        ..Default::default()
+    };
+    let path = traffic.join("config.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 /// A temporary directory that can be removed even though the content-addressed
 /// stores under it are read-only by design (`tempfile` would leak it).
 pub struct Tmp(tempfile::TempDir);

@@ -703,3 +703,16 @@ queue exclusion, permanent directAPI fences, clock-Hold replay, claim/unlink/fsy
 claimed/unclaimed missing, same-ID next incarnation, root/ancestor/leaf/symlink/hardlink/mode/path mismatch,
 owner-lock replacement, pending roots and sparse oversized leaf retention. Source preview and reader/IPC/async
 cancellation guard regressions remain green. Full local-ci/MSRV/Linux/remote/native/runtime-GC acceptance is not claimed.
+
+### 起動時attestation修正後の通常CI
+
+3216a745eec89202d68cc5a61e91150a7274f016の通常matrixローカルCIは2ジョブ成功、失敗・環境エラー0、11分33秒だった。git-lfsのシステム導入とtaiki-e/install-actionは各matrixで未再現のため、CLI全体はincomplete（exit3）で、完全再現成功とは区別する。Docker cleanupはコマンド不在で確認できない警告があった。全9ジョブはこの結果に含まれず、coverage・mutationを含む全体検証を次の区切りとする。source削除Bは別branch e5eb4df6で44件とstrict検証済み、Vault Cと専任削除レビュー・常駐有効化は継続中で、この通常CIには含まれない。
+
+
+### a4875b3 全体CIの部分結果とfixture・並列度補正（2026-11-15）
+
+`a4875b3b576296d8c097e84d1366dc95d62f6393` の `local-ci run --include-disabled --parallel 1` は3470.86秒で所有実行を取消・回収した。9ジョブ中3成功（通常matrix各1606件とMSRV名）、2失敗（mutation baselineのtoolchain PID読取とworker起動待ち）、2取消error、2取消skipで、全体成功ではない。MSRV名の実toolchainはRust1.100。結果は `/private/tmp/rtr-a487-full-local-ci-partial-result.json`。coverage・mutation全gateと未再現actionは未検証のまま。
+
+manager子PIDは一時ファイルへの書込後renameで公開する。toolchain/workerの私有fake fixtureだけにbudget2・CPU閾値100・memory reserve0のTTC設定を置き、実ledgerとquotaを維持する。workerはenrollment完了後に作成し、既存state拒否を回避しない。外側の共有CPU admissionと製品既定値は変更しない。mutationは明示されたCARGO_BUILD_JOBSを尊重し、各shardのRust test並列度を1にする。従来の4 shard×nproc12による共有予算12の超過を補正するもので、すべての起動遅延がCPU guardだけで説明できたとは主張しない。
+
+Rust1.100で限定検証はtoolchain13件（21.83秒、1500ms deadlineと子回収assertを維持）およびworker_role6件（5.00秒）が成功。`cargo clippy --all-targets --all-features -- -D warnings`、fmt、diff-checkも成功。全体CIはこの補正後に再実行が必要。削除B/Cと純粋モジュールgateの統合・専任レビューは別の残件として維持する。

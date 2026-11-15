@@ -56,6 +56,7 @@ impl Fx {
         cfg.kill_wait_ms = 5000;
         cfg.deadline_ms = 60_000;
         let setups = Setups::open(cfg.clone(), Arc::new(NoWorkspace)).unwrap();
+        super::common::fixture_traffic_config(&cfg.state_dir);
         let root = setups.private_tool_root().unwrap();
         let host = base.join("host");
         std::fs::create_dir(&host).unwrap();
