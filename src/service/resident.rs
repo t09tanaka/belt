@@ -952,14 +952,16 @@ where
     // This detached work owns only metadata, captured inputs and the input lease.
     let inputs = coordinator.clone();
     let preflight = tokio::task::spawn_blocking(move || {
-        let _lease = input_lease;
         let source = inputs.store().source_mutation_guard_foreground();
         drop(inputs); // Detached input IO retains only its source guard, never owner metadata.
         let validated =
             source.and_then(|source| validate(&prepared).map(|secret| (secret, source)));
-        (prepared, validated)
+        // The lease leaves with the source guard and behind it. When a stopped
+        // caller has dropped the handle, the runtime drops this output in field
+        // order, so the source lock is released before the lease's ownership.
+        (prepared, validated, input_lease)
     });
-    let (prepared, validated) = tokio::select! {
+    let (prepared, validated, _input_lease) = tokio::select! {
         biased;
         _=stop.wait_for(|stopped| *stopped)=>return Ok(stopping_reply()),
         result=preflight=>result?,
