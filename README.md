@@ -75,9 +75,10 @@ saturated.
   steps, a `make` whose recipes do) gets an entry of its own for each
   call, queued against the same budget as a child of the outer entry. A
   child uses up its parent's weight first and is charged only for what
-  goes beyond it, and what it runs is measured on the child, not on the
-  parent as well. It cannot deadlock: the first child of a parent that
-  has none running always starts (see "Nested commands").
+  goes beyond it, and what it runs is measured (and learned) on the
+  child, not on the parent as well. It cannot deadlock: the first child
+  of a parent that has none running is not held by the budget, and no
+  child waits for the budget for ever (see "Nested commands").
 - **Async jobs that die with their waiter.** `submit` returns a job id as
   soon as the job is queued; `wait` collects the log and exit code later. A job nobody is
   waiting on is cancelled after a grace period, so a crashed caller never
@@ -542,6 +543,8 @@ front_overload_factor = 2.0 # --front waits while load average >= budget x this 
 front_overload_max_wait_secs = 30 # ...but never for longer than this
 backfill_max_job_secs = 300 # a command learned to take at most this may pass a head that does not fit (0: never)
 backfill_max_wait_secs = 300 # ...until that head, held up by such commands, has waited this long
+nested_guard_max_wait_secs = 60 # the first nested exec of a command is held by the memory/CPU guards for at most this long
+nested_sibling_max_wait_secs = 600 # a nested exec that does not fit starts anyway after this, one per period (0: never)
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
 jobs_keep_days = 7          # `gc` removes finished job files older than this
 managed_keep_days = 7       # ...and receipts of managed commands that ended longer ago (1..3650)
@@ -653,25 +656,69 @@ own weight, measurement and history. Three rules make that safe.
 - **Nothing is measured twice.** The sampler of the outer entry leaves
   out the process trees of its children, which their own entries
   measure.
-- **The first child always starts.** A command that waits for its child
-  cannot finish, so the budget it holds would never come back. When no
-  child of a parent is running, the first one in the queue starts
-  whatever the budget and the live guards say. A command that runs its
-  nested commands one at a time therefore never waits for them, exactly
-  as before 0.9, and each running parent can take the budget over by at
-  most one child. Further children wait until they fit. Waiting children
-  are ahead of every top-level entry, `--front` included, since the
-  budget their parent holds comes back only after they have run.
+- **Nothing is learned twice.** A finished child leaves its CPU time
+  with its parent, and the parent's run is recorded without it (and with
+  the peak memory of its own processes only). An outer command that only
+  starts and waits for its steps keeps a small learned weight instead of
+  growing to the sum of its steps.
+- **The first child is not held by the budget.** A command that waits
+  for its child cannot finish, so the budget it holds would never come
+  back. When no child of a parent is running, the first one in the queue
+  starts although the budget is full, and ahead of everything else. The
+  memory and CPU guards still hold it, so that several parents each
+  starting one more command do not exhaust the machine, but for at most
+  `nested_guard_max_wait_secs` (60 s). A command that runs its nested
+  commands one at a time therefore never waits for the budget, and each
+  running parent can take the budget over by at most one child.
+- **Further children wait until they fit, but not for ever.** A running
+  child may itself be waiting for one that is queued (a server and the
+  client that stops it). A child that has waited
+  `nested_sibling_max_wait_secs` (10 min; 0 turns this off) starts
+  although the budget is full, once every running child of the same
+  parent has also run that long, so at most one more starts per period.
+- Waiting children are ahead of every top-level entry, `--front`
+  included, since the budget their parent holds comes back only after
+  they have run.
+- **Stopping the outer command drops what has not started.** A waiting
+  child whose parent's entry is gone (the outer command was stopped, or
+  ended without waiting for it) leaves the queue without running. A child
+  that already runs carries on as a top-level entry.
 
 An `exec` whose lease is stale (the outer command is gone) is gated as a
-top-level command, and a child whose parent finishes first carries on as
-one. A caller inside a managed run whose supervisor has died still runs
-under that run without an entry, as before.
+top-level command; if it still runs below a gated command, that
+command's measurement leaves its process tree out too. A caller inside a
+managed run whose supervisor has died still runs under that run without
+an entry, as before.
 
 `--nested inherit`, or `TASK_TRAFFIC_CONTROLLER_NESTED=inherit` in the
 environment of the outer command, restores the old behaviour for
 everything below it: the nested command runs at once and is charged to
-the outer entry through its measurement.
+the outer entry through its measurement. Use it where a nested command
+must never wait: a build whose own parallel jobs keep the CPU above the
+threshold would otherwise hold each nested call for up to
+`nested_guard_max_wait_secs`, and a nested long-lived server holds its
+weight against its siblings like any other entry.
+
+**Upgrading.** While a nested entry exists the ledger is written in a
+shape (`version` 3, `entries_v3`) that binaries from before nested
+admission (0.8 and older) refuse, because they would write it back
+without the nesting and charge commands twice. `status` says so while it
+lasts. An older `exec` that is waiting or starting at that moment fails
+with a ledger error; one that is already running its command finishes
+it, and its entry is reaped afterwards. Upgrade when nothing is queued,
+or let running commands finish before the first nested one starts.
+
+Known limits:
+
+- A nested step with no history starts at the default weight, so on its
+  first runs several can start before their measurements arrive.
+- The ETA and `top` do not model nesting: estimates treat nested entries
+  as ordinary ones, and `top` does not mark them.
+- A managed command (the library's `register` path) that has nested
+  entries is measured by its caller, which does not get the nested CPU
+  time taken off.
+- Entries that name each other as `parent` (only possible by editing the
+  ledger) are not counted in the budget; `status` warns about them.
 
 ### Idle entries are charged their weight
 
