@@ -253,6 +253,28 @@ pub fn read_pid(path: &Path) -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
+/// The host's system command directories as a toolchain registry must name
+/// them: canonical and without repeats. `/bin` is a symlink to `usr/bin` on a
+/// merged-usr Linux, and the registry refuses a search path through a symlink.
+pub fn system_search_path() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for dir in ["/usr/bin", "/bin"] {
+        let real = std::fs::canonicalize(dir).unwrap();
+        if !out.contains(&real) {
+            out.push(real);
+        }
+    }
+    out
+}
+
+/// [`system_search_path`] as the tail of a TOML array: `,'/usr/bin','/bin'`.
+pub fn system_search_path_toml() -> String {
+    system_search_path()
+        .iter()
+        .map(|dir| format!(",{:?}", dir.to_str().unwrap()))
+        .collect()
+}
+
 /// Write `text` to `path` and make it executable, so that it can be run at
 /// once by a test that shares its process with other tests.
 ///

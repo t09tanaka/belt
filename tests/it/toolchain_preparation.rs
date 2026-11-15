@@ -122,7 +122,9 @@ done
                 .iter()
                 .map(|n| FileIdentity::capture(&host.join(n)).unwrap())
                 .collect(),
-            search_path: vec![host, PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+            search_path: std::iter::once(host)
+                .chain(crate::common::system_search_path())
+                .collect(),
             rust_host: "fixture-host".into(),
         };
         let tool = ToolId::parse(tool).unwrap();
@@ -710,8 +712,8 @@ fn worker_private_registry_builds_request_for_real_setup_preparation() {
         .unwrap();
         let profile = Profile::load(state, &BTreeMap::new()).unwrap();
         let config = format!(
-        "schema_version=1\nactive_profile='fixture'\nprofile_definition={:?}\n[[recipes]]\ntool={:?}\nkind={:?}\nmanager={:?}\ndependencies=[{:?},{:?}]\nsearch_path=[{:?},'/usr/bin','/bin']\ninventory=['1.2.3']\nrust_host='fixture-host'\n",
-        profile.definition_digest().as_str(), tool, format!("{kind:?}"), f.request.host.manager.path.to_str().unwrap(), host.join("node-build").to_str().unwrap(), host.join("node").to_str().unwrap(), host.to_str().unwrap()
+        "schema_version=1\nactive_profile='fixture'\nprofile_definition={:?}\n[[recipes]]\ntool={:?}\nkind={:?}\nmanager={:?}\ndependencies=[{:?},{:?}]\nsearch_path=[{:?}{}]\ninventory=['1.2.3']\nrust_host='fixture-host'\n",
+        profile.definition_digest().as_str(), tool, format!("{kind:?}"), f.request.host.manager.path.to_str().unwrap(), host.join("node-build").to_str().unwrap(), host.join("node").to_str().unwrap(), host.to_str().unwrap(), crate::common::system_search_path_toml()
     );
         std::fs::write(state.join("toolchains.toml"), config).unwrap();
         std::fs::set_permissions(

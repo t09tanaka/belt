@@ -124,6 +124,35 @@ fn coordinator_refusal_class(event: &remote_task_runner::storage::Event) -> Opti
     }
 }
 
+/// Why the worker refused or failed an attempt before any command ran. Only
+/// the event kinds and the typed refusal of `agent_environment_changed` are
+/// printed, never other payloads.
+fn diagnose_worker(spec: &Spec) {
+    let Ok(store) =
+        remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
+    else {
+        eprintln!("worker journal readable=false");
+        return;
+    };
+    let Ok(events) = store.events_after(0, 128) else {
+        eprintln!("worker journal readable=false");
+        return;
+    };
+    for event in events.iter().rev().take(48).rev() {
+        if event.kind == "agent_environment_changed" {
+            eprintln!(
+                "worker event: {} code={} reason={} message={}",
+                event.kind,
+                event.payload["code"],
+                event.payload["blocked_reason"],
+                event.payload["message"]
+            );
+        } else {
+            eprintln!("worker event: {}", event.kind);
+        }
+    }
+}
+
 fn diagnose_coordinator(spec: &Spec) {
     let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) else {
         eprintln!("coordinator journal readable=false");
@@ -1548,7 +1577,11 @@ async fn control_exec_sigint(in_place: bool) {
         }
     })
     .await
-    .unwrap();
+    .unwrap_or_else(|elapsed| {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+        panic!("no attempt reached running: {elapsed}");
+    });
     assert_eq!(
         remote_task_runner::platform::process_start_identity(pid),
         identity
@@ -3005,6 +3038,9 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
         "schema_version=1\n[[outputs]]\nname='report'\npaths=['report.txt']\nrequired=true\nwhen='always'\n",
     ).unwrap();
     let output=tokio::time::timeout(Duration::from_secs(30),tokio::process::Command::new(&spec.executable).args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c","test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; echo report > report.txt; exit 23"]).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v))).envs(&spec.env).current_dir(&input).output()).await.unwrap().unwrap();
+    if output.status.code() != Some(23) {
+        diagnose_worker(&spec);
+    }
     assert_eq!(
         output.status.code(),
         Some(23),
@@ -3578,7 +3614,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
     );
     crate::common::write_executable(&host.join("manager"), &manager);
     crate::common::write_executable(&host.join("node-build"), &manager);
-    let registry = format!("schema_version=1\nactive_profile='base22'\nprofile_definition={:?}\n[[recipes]]\ntool='node'\nkind='Nodenv'\nmanager={:?}\ndependencies=[{:?}]\nsearch_path=[{:?},'/usr/bin','/bin']\ninventory=['20.0.0','22.0.0']\n", profile.definition_digest().as_str(), host.join("manager").to_str().unwrap(),host.join("node-build").to_str().unwrap(),host.to_str().unwrap());
+    let registry = format!("schema_version=1\nactive_profile='base22'\nprofile_definition={:?}\n[[recipes]]\ntool='node'\nkind='Nodenv'\nmanager={:?}\ndependencies=[{:?}]\nsearch_path=[{:?}{}]\ninventory=['20.0.0','22.0.0']\n", profile.definition_digest().as_str(), host.join("manager").to_str().unwrap(),host.join("node-build").to_str().unwrap(),host.to_str().unwrap(), crate::common::system_search_path_toml());
     let registry_file = spec.worker_state_dir.join("toolchains.toml");
     std::fs::write(&registry_file, registry).unwrap();
     std::fs::set_permissions(&registry_file, std::fs::Permissions::from_mode(0o600)).unwrap();
