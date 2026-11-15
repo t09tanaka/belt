@@ -97,7 +97,7 @@ done
                 "wrong" => "# wrong probe is injected below".to_string(),
                 "long" => "/usr/bin/yes x | /usr/bin/head -c 9000; exit 0".to_string(),
                 "hang" => format!(
-                    "/bin/sleep 120 &\necho $! > '{}/child'\nwait",
+                    "/bin/sleep 120 &\nprintf '%s\\n' \"$!\" > '{0}/child.pending'\n/bin/mv '{0}/child.pending' '{0}/child'\nwait",
                     host.display()
                 ),
                 "gate" => format!(
