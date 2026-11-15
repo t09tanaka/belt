@@ -444,15 +444,13 @@ mod tests {
             let selected = evaluate(&j, &Map::new(), Some(i));
             assert_eq!(selected.entries.len(), 1);
             assert_eq!(selected.entries[0].display, expected_entry.display);
-            let (Decision::Run(cm), Decision::Run(expected)) =
-                (&selected.entries[0].decision, &expected_entry.decision)
-            else {
-                panic!()
-            };
-            assert_eq!(cm, expected);
-            assert_eq!(cm["strategy"], json!({"job-index": i, "job-total": 2}));
-            assert_eq!(cm["github"]["workspace"], "/actual-worker/root");
-            assert_eq!(cm["runner"]["os"], "actual-worker-os");
+            assert!(
+                matches!((&selected.entries[0].decision, &expected_entry.decision),
+                (Decision::Run(cm), Decision::Run(expected)) if cm == expected
+                    && cm["strategy"] == json!({"job-index": i, "job-total": 2})
+                    && cm["github"]["workspace"] == "/actual-worker/root"
+                    && cm["runner"]["os"] == "actual-worker-os")
+            );
         }
     }
     #[test]
@@ -482,10 +480,9 @@ mod tests {
             assert!(matches!(&evaluated.entries[0].decision, Decision::Skip(why) if why == reason));
             j.cond = Some("always()".into());
             let evaluated = evaluate(&j, &needs, None);
-            let Decision::Run(cm) = &evaluated.entries[0].decision else {
-                panic!()
-            };
-            assert!(cm["needs"].get("unrelated").is_none());
+            assert!(
+                matches!(&evaluated.entries[0].decision, Decision::Run(cm) if cm["needs"].get("unrelated").is_none())
+            );
             j.cond = None;
         }
         j.cond = Some("unknownFunction()".into());
@@ -522,6 +519,111 @@ mod tests {
             .iter()
             .all(|e| matches!(&e.decision, Decision::Skip(why) if why == "if: false")));
     }
+    #[test]
+    fn portable_conditions_limits_and_unsupported_jobs_have_exact_diagnostics() {
+        let contexts = json!({"github": {}, "vars": {}, "inputs": {}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut j = job("    runs-on: x\n    steps: []\n");
+        let check = |j: &Job, reason: &str| {
+            let result = evaluate_portable(j, &contexts, &Map::new(), false, false, 4);
+            assert_eq!(result.entries.len(), 1);
+            assert!(
+                matches!(&result.entries[0].decision, Decision::Error(why) if why.contains(reason)),
+                "{result:?}"
+            );
+        };
+        j.cond = Some("unknownFunction()".into());
+        check(&j, "if:");
+        j.cond = None;
+        j.max_parallel = Some(0);
+        check(&j, "strategy.max-parallel: must be positive");
+        j.max_parallel = None;
+        j.name = Some("${{ runner.temp }}".into());
+        check(&j, "name:");
+        j.name = Some("${{ fromJSON('broken') }}".into());
+        check(&j, "name:");
+        j.name = None;
+        j.reusable = Some("other.yml".into());
+        let result = evaluate_portable(&j, &contexts, &Map::new(), false, false, 4);
+        assert!(
+            matches!(&result.entries[0].decision, Decision::Skip(why) if why == "reusable workflow is not supported")
+        );
+    }
+
+    #[test]
+    fn legacy_names_and_missing_or_unrecognized_need_results_preserve_behavior() {
+        let mut j = job("    needs: seed\n    name: '${{ fromJSON(\"broken\") }}'\n    strategy:\n      matrix:\n        n: [0, 1]\n    steps: []\n");
+        let result = evaluate(&j, &Map::new(), None);
+        assert_eq!(result.entries[0].display, j.name.as_ref().unwrap().as_str());
+        assert!(matches!(result.entries[0].decision, Decision::Run(_)));
+        j.name = Some("literal".into());
+        assert_eq!(
+            evaluate(&j, &Map::new(), None).entries[0].display,
+            "literal (0)"
+        );
+        j.matrix = None;
+        assert_eq!(
+            evaluate(&j, &Map::new(), None).entries[0].display,
+            "literal"
+        );
+        for result in [json!({}), json!({"result": "unknown"})] {
+            let needs: Map<String, Value> = [("seed".into(), result)].into_iter().collect();
+            let evaluated = evaluate(&j, &needs, None);
+            if needs["seed"].get("result").is_none() {
+                assert!(matches!(evaluated.entries[0].decision, Decision::Run(_)));
+            } else {
+                assert!(
+                    matches!(&evaluated.entries[0].decision, Decision::Skip(reason) if reason == "if: false")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn portable_and_atomic_name_and_context_budgets_refuse_amplification() {
+        let contexts = json!({"github": {}, "vars": {}, "inputs": {}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut j = job("    runs-on: x\n    steps: []\n");
+        j.name = Some("x".repeat(PORTABLE_OUTPUT_BYTES));
+        let result = evaluate_portable(&j, &contexts, &Map::new(), false, false, 4);
+        assert!(result.budget_exceeded);
+        assert!(
+            matches!(&result.entries[0].decision, Decision::Error(reason) if reason == "name: byte budget exceeded")
+        );
+        j.name = Some("${{ format('{0}{0}', github.large) }}".into());
+        let github = json!({"large": "x".repeat(PORTABLE_OUTPUT_BYTES / 2 + 1)});
+        assert!(evaluate_atomic(&j, github, &Map::new(), false, false).is_err());
+        j.name = Some("n".repeat(PORTABLE_OUTPUT_BYTES - 4));
+        j.matrix = Some(serde_yaml::from_str("n: [0]").unwrap());
+        let result = evaluate_portable(&j, &contexts, &Map::new(), false, false, 4);
+        assert!(result.budget_exceeded);
+        assert!(
+            matches!(&result.entries[0].decision, Decision::Error(reason) if reason == "name: byte budget exceeded")
+        );
+        j.name = None;
+        j.matrix = None;
+        let large = json!({"github": {"large": "x".repeat(PORTABLE_EVALUATION_BYTES)}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(evaluate_portable(&j, &large, &Map::new(), false, false, 4).budget_exceeded);
+    }
+
+    #[test]
+    fn portable_expanded_display_is_charged_against_aggregate_byte_budget() {
+        let j = job("    name: '${{ vars.display }}'\n    steps: []\n");
+        let contexts = json!({"github": {"padding": "p".repeat(7 * 1024 * 1024)}, "vars": {"display": "d".repeat(768 * 1024)}}).as_object().unwrap().clone();
+        let result = evaluate_portable(&j, &contexts, &Map::new(), false, false, 1);
+        assert!(result.budget_exceeded);
+        assert!(
+            matches!(&result.entries[0].decision, Decision::Error(reason) if reason == "evaluation byte budget exceeded")
+        );
+    }
+
     #[test]
     fn ancestor_failure_and_run_cancellation_are_explicit_facts() {
         let mut j = job("    runs-on: x\n    if: failure()\n    steps: []\n");

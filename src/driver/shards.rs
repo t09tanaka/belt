@@ -39,19 +39,6 @@ pub(super) fn validate(plan: &FrozenPlan) -> Result<()> {
             ));
         }
     }
-    // Use the original planner's request/manifest/structural checks, rather than
-    // inventing a second test inventory or weakening native partial manifests.
-    let requests = plan.shard_requests();
-    if requests.len() != split {
-        return Err(unsupported("incomplete shard request membership"));
-    }
-    let (tasks, groups) =
-        crate::dag::derive_tasks(&plan.to_plan(), &plan.workflows, &plan.units, &requests);
-    if tasks != plan.tasks || groups != plan.shard_groups {
-        return Err(unsupported(
-            "tasks/groups do not equal the canonical frozen shard partition",
-        ));
-    }
     // derive_tasks preserves the request's indices: require the planner's real
     // partition index/order convention, which shard arguments rely upon.
     let mut seen = BTreeSet::new();
@@ -75,6 +62,16 @@ pub(super) fn validate(plan: &FrozenPlan) -> Result<()> {
                 return Err(unsupported("shard identity/index/count mismatch"));
             }
         }
+    }
+    // Use the original planner's request/manifest/structural checks, rather than
+    // inventing a second test inventory or weakening native partial manifests.
+    let requests = plan.shard_requests();
+    let (tasks, groups) =
+        crate::dag::derive_tasks(&plan.to_plan(), &plan.workflows, &plan.units, &requests);
+    if tasks != plan.tasks || groups != plan.shard_groups {
+        return Err(unsupported(
+            "tasks/groups do not equal the canonical frozen shard partition",
+        ));
     }
     Ok(())
 }
@@ -131,10 +128,9 @@ fn outcomes(group: &ShardGroup, phases: &BTreeMap<String, Phase>) -> Vec<JobOutc
     group
         .shards
         .iter()
-        .flat_map(|id| match &phases[id] {
-            Phase::Terminal(t) => t.outcomes().to_vec(),
-            _ => vec![],
-        })
+        .filter_map(|id| phases[id].terminal_outcomes())
+        .flatten()
+        .cloned()
         .collect()
 }
 fn logical(

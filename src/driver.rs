@@ -276,6 +276,15 @@ enum Phase {
     },
     Terminal(Terminal),
 }
+impl Phase {
+    fn terminal_outcomes(&self) -> Option<&[JobOutcome]> {
+        match self {
+            Self::Terminal(terminal) => Some(terminal.outcomes()),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 struct State {
     revision: u64,
@@ -382,25 +391,12 @@ impl Driver {
             }
             if let Some(v) = &t.variant {
                 ensure!(t.jobs.len() == 1, "matrix task must hold one job");
-                let g = plan
-                    .graph
-                    .nodes
-                    .iter()
-                    .find(|g| g.id == v.group)
-                    .context("missing matrix group")?;
-                let NodeKind::MatrixGroup {
-                    variants,
-                    max_parallel,
-                    ..
-                } = &g.kind
-                else {
-                    bail!("not a static matrix group")
-                };
+                let (g, variants, max_parallel) = static_matrix_group(plan, &v.group)?;
                 ensure!(
                     g.workflow == t.workflow && g.job == t.jobs[0],
                     "matrix workflow/job mismatch"
                 );
-                ensure!(max_parallel != &Some(0), "zero matrix admission limit");
+                ensure!(max_parallel != Some(0), "zero matrix admission limit");
                 ensure!(
                     variants
                         .get(v.index)
@@ -444,35 +440,35 @@ impl Driver {
             }
         }
         for g in &plan.graph.nodes {
-            if let NodeKind::MatrixGroup { variants, .. } = &g.kind {
-                if let Some(owner) = producers.get(&(g.workflow.clone(), g.job.clone(), None)) {
-                    ensure!(owner.len() == 1, "mixed shard/matrix producers");
-                    let task = plan.task(&owner[0]).context("missing atomic producer")?;
-                    ensure!(task.jobs.len() > 1, "mixed matrix/job producers");
-                    ensure!(
-                        !(0..variants.len()).any(|i| producers.contains_key(&(
-                            g.workflow.clone(),
-                            g.job.clone(),
-                            Some(i)
-                        ))),
-                        "mixed atomic/matrix producers"
-                    );
-                    continue;
+            if matches!(g.kind, NodeKind::MatrixGroup { .. }) {
+                let (_, variants, _) = static_matrix_group(plan, &g.id)?;
+                match producers.get(&(g.workflow.clone(), g.job.clone(), None)) {
+                    Some(owner) => {
+                        ensure!(owner.len() == 1, "mixed shard/matrix producers");
+                        let task = plan.task(&owner[0]).context("missing atomic producer")?;
+                        ensure!(task.jobs.len() > 1, "mixed matrix/job producers");
+                        ensure!(
+                            !(0..variants.len()).any(|i| producers.contains_key(&(
+                                g.workflow.clone(),
+                                g.job.clone(),
+                                Some(i)
+                            ))),
+                            "mixed atomic/matrix producers"
+                        );
+                    }
+                    None => {
+                        for i in 0..variants.len() {
+                            ensure!(
+                                producers.contains_key(&(
+                                    g.workflow.clone(),
+                                    g.job.clone(),
+                                    Some(i)
+                                )),
+                                "incomplete matrix task membership"
+                            );
+                        }
+                    }
                 }
-                ensure!(
-                    !variants.is_empty(),
-                    "empty matrix unsupported in this slice"
-                );
-                for i in 0..variants.len() {
-                    ensure!(
-                        producers.contains_key(&(g.workflow.clone(), g.job.clone(), Some(i))),
-                        "incomplete matrix task membership"
-                    );
-                }
-                ensure!(
-                    !producers.contains_key(&(g.workflow.clone(), g.job.clone(), None)),
-                    "mixed matrix/job producers"
-                );
             }
         }
         atomic::validate_readiness(plan, &producers)?;
@@ -618,10 +614,7 @@ impl Driver {
         contexts.insert("needs".into(), serde_json::Value::Object(inputs.context()));
         if let Some(v) = &task.variant {
             contexts.insert("matrix".into(), serde_json::Value::Object(v.values.clone()));
-            let g = self.group(&self.state, &v.group).context("missing group")?;
-            let NodeKind::MatrixGroup { variants, .. } = &g.kind else {
-                anyhow::bail!("not matrix group")
-            };
+            let (_, variants, _) = static_matrix_group(&self.plan, &v.group)?;
             contexts.insert(
                 "strategy".into(),
                 serde_json::json!({"job-index":v.index,"job-total":variants.len()}),
@@ -913,10 +906,6 @@ impl Driver {
                     problems.join("; ")
                 );
                 shards::verify_receipt(&t, r.shard.as_ref())?;
-                ensure!(
-                    r.outcomes.len() == t.jobs.len(),
-                    "missing/duplicate job outcomes"
-                );
                 for j in &t.jobs {
                     let parts: Vec<_> = r.outcomes.iter().filter(|o| &o.job == j).collect();
                     ensure!(
@@ -961,12 +950,6 @@ impl Driver {
                     ensure!(
                         j.workflow == t.workflow && t.jobs.contains(&j.job),
                         "result report workflow/job mismatch"
-                    );
-                }
-                for j in &t.jobs {
-                    ensure!(
-                        r.jobs.iter().any(|r| &r.job == j),
-                        "worker result lacks job report"
                     );
                 }
                 return self.settle_validated(s, &t, token, result_digest, r);
@@ -1031,10 +1014,8 @@ impl Driver {
                 self.progress(&mut normal)?;
                 self.checked(normal)
             })();
-            match candidate {
-                Ok(normal) => return Ok(normal),
-                Err(error) if error.downcast_ref::<DriverStorageError>().is_some() => {}
-                Err(error) => return Err(error),
+            if let Some(normal) = classify_settlement_candidate(candidate)? {
+                return Ok(normal);
             }
         }
         s.phases
@@ -1117,10 +1098,11 @@ impl Driver {
         if !enabled {
             return Ok(());
         }
-        let ancestor_failed = match &s.phases[&task.id] {
-            Phase::Terminal(t) => t.outcomes().iter().any(|o| o.ancestor_failed),
-            _ => false,
-        };
+        let ancestor_failed = s.phases[&task.id]
+            .terminal_outcomes()
+            .into_iter()
+            .flatten()
+            .any(|o| o.ancestor_failed);
         for member in self.tasks(s) {
             let same = if let Some(id) = shard_scope {
                 member.shard.as_ref().is_some_and(|m| &m.group == id)
@@ -1186,23 +1168,19 @@ impl Driver {
         // One bounded summary + join envelope per unfinished frozen group.
         // Fixed run failure marker and Finished envelope. Each unfinished phase
         // separately reserves its own worst halt replacement below.
-        let mut reserve = 1024usize.saturating_add(
-            self.plan
-                .shard_groups
-                .iter()
-                .filter(|g| {
-                    s.infrastructure_failure.is_none()
-                        && g.split
-                        && !s.shard_joins.contains_key(&g.id)
-                })
-                .try_fold(0usize, |n, g| -> Result<usize> {
-                    Ok(n.saturating_add(8192)
-                        .saturating_add(crate::expr::serialized_size(
-                            &(&g.id, &g.workflow, &g.source_jobs),
-                            MAX_WIRE_BYTES,
-                        )?))
-                })?,
-        );
+        let mut reserve = 1024usize;
+        for group in self.plan.shard_groups.iter().filter(|group| {
+            s.infrastructure_failure.is_none()
+                && group.split
+                && !s.shard_joins.contains_key(&group.id)
+        }) {
+            reserve = reserve
+                .saturating_add(8192)
+                .saturating_add(crate::expr::serialized_size(
+                    &(&group.id, &group.workflow, &group.source_jobs),
+                    MAX_WIRE_BYTES,
+                )?);
+        }
         for task in tasks {
             let addition = match &s.phases[&task.id] {
                 Phase::Pending | Phase::Ready { .. } => Self::unstarted_cancel_reserve(task)?,
@@ -1496,18 +1474,12 @@ impl Driver {
                     .iter()
                     .filter(|t| t.variant.as_ref().is_some_and(|v| v.group == g.id))
                     .collect();
-                if !members.is_empty()
-                    && members
-                        .iter()
-                        .all(|t| matches!(s.phases[&t.id], Phase::Terminal(_)))
-                {
-                    let parts: Vec<_> = members
-                        .iter()
-                        .flat_map(|t| match &s.phases[&t.id] {
-                            Phase::Terminal(x) => x.outcomes().to_vec(),
-                            _ => vec![],
-                        })
-                        .collect();
+                let parts = members
+                    .iter()
+                    .map(|t| s.phases[&t.id].terminal_outcomes())
+                    .collect::<Option<Vec<_>>>();
+                if let Some(parts) = parts.filter(|_| !members.is_empty()) {
+                    let parts: Vec<_> = parts.into_iter().flatten().cloned().collect();
                     let joined = crate::task::aggregate_matrix(&g, &parts)?;
                     s.outcomes
                         .entry(g.workflow.clone())
@@ -1538,12 +1510,7 @@ impl Driver {
             // outcome, including siblings not yet reached in frozen order.
             let mut fallback_reserve = self.pending_fallback_reserve(s)?;
             for t in &self.plan.tasks {
-                if !matches!(s.phases[&t.id], Phase::Pending)
-                    || !t
-                        .depends_on
-                        .iter()
-                        .all(|d| matches!(s.phases[d], Phase::Terminal(_)))
-                {
+                if !matches!(s.phases[&t.id], Phase::Pending) {
                     continue;
                 }
                 let wf = self
@@ -1559,9 +1526,13 @@ impl Driver {
                     .filter(|n| !t.jobs.contains(n))
                     .collect();
                 let finished = s.outcomes.get(&t.workflow);
-                if !needs
+                if !t
+                    .depends_on
                     .iter()
-                    .all(|n| finished.is_some_and(|m| m.contains_key(*n)))
+                    .all(|d| matches!(s.phases[d], Phase::Terminal(_)))
+                    || !needs
+                        .iter()
+                        .all(|n| finished.is_some_and(|m| m.contains_key(*n)))
                 {
                     continue;
                 }
@@ -1606,14 +1577,9 @@ impl Driver {
                             );
                         }
                     }
-                    match derivation {
+                    let terminal = match derivation {
                         Derivation::Expanded(expansion) => {
-                            for selection in &expansion.selections {
-                                ensure!(
-                                    !s.phases.contains_key(&selection.task.id),
-                                    "derived membership collision"
-                                );
-                            }
+                            verify_derived_membership_available(s, &expansion)?;
                             for dispatch in &expansion.dispatches {
                                 s.phases.insert(
                                     dispatch.task_id().into(),
@@ -1632,45 +1598,43 @@ impl Driver {
                             }
                             s.phases.insert(t.id.clone(), Phase::Expanded);
                             s.expansions.insert(t.id.clone(), *expansion);
+                            None
                         }
-                        terminal => {
-                            let (decision, status, reason) = match terminal {
-                                Derivation::Skipped(reason) => {
-                                    (CoreDecision::UnstartedSkipped, JobStatus::Skipped, reason)
-                                }
-                                Derivation::Failed(reason) => {
-                                    (CoreDecision::EarlyFailure, JobStatus::Failure, reason)
-                                }
-                                _ => unreachable!(),
-                            };
-                            let diagnostic: String = reason.chars().take(1024).collect();
-                            let ancestor_failed = inputs
-                                .needs
-                                .values()
-                                .any(JobOutcome::failed_or_ancestor_failed);
-                            let outcome = JobOutcome {
-                                job: t.jobs[0].clone(),
-                                variant: None,
-                                status,
-                                outputs: BTreeMap::new(),
-                                skipped: (status == JobStatus::Skipped).then(|| diagnostic.clone()),
-                                ancestor_failed,
-                            };
-                            // Publish the small logical outcome now, so later
-                            // origins count its bytes before releasing its reserve.
-                            s.outcomes
-                                .entry(t.workflow.clone())
-                                .or_default()
-                                .insert(outcome.job.clone(), outcome.clone());
-                            s.phases.insert(
-                                t.id.clone(),
-                                Phase::Terminal(Terminal::Core {
-                                    decision,
-                                    diagnostic: Some(diagnostic),
-                                    outcomes: vec![outcome],
-                                }),
-                            );
+                        Derivation::Skipped(reason) => {
+                            Some((CoreDecision::UnstartedSkipped, JobStatus::Skipped, reason))
                         }
+                        Derivation::Failed(reason) => {
+                            Some((CoreDecision::EarlyFailure, JobStatus::Failure, reason))
+                        }
+                    };
+                    if let Some((decision, status, reason)) = terminal {
+                        let diagnostic: String = reason.chars().take(1024).collect();
+                        let ancestor_failed = inputs
+                            .needs
+                            .values()
+                            .any(JobOutcome::failed_or_ancestor_failed);
+                        let outcome = JobOutcome {
+                            job: t.jobs[0].clone(),
+                            variant: None,
+                            status,
+                            outputs: BTreeMap::new(),
+                            skipped: (status == JobStatus::Skipped).then(|| diagnostic.clone()),
+                            ancestor_failed,
+                        };
+                        // Publish the small logical outcome now, so later
+                        // origins count its bytes before releasing its reserve.
+                        s.outcomes
+                            .entry(t.workflow.clone())
+                            .or_default()
+                            .insert(outcome.job.clone(), outcome.clone());
+                        s.phases.insert(
+                            t.id.clone(),
+                            Phase::Terminal(Terminal::Core {
+                                decision,
+                                diagnostic: Some(diagnostic),
+                                outcomes: vec![outcome],
+                            }),
+                        );
                     }
                     fallback_reserve = fallback_reserve.saturating_sub(Self::fallback_reserve(t)?);
                 } else {
@@ -1701,6 +1665,53 @@ impl Driver {
         Ok(())
     }
 }
+/// Check the entire proposed membership before adding any Ready phase/outbox.
+fn verify_derived_membership_available(state: &State, expansion: &Expansion) -> Result<()> {
+    for selection in &expansion.selections {
+        ensure!(
+            !state.phases.contains_key(&selection.task.id),
+            "derived membership collision"
+        );
+    }
+    Ok(())
+}
+
+/// Only an explicitly typed capacity refusal permits genuine-receipt fallback.
+/// Every other validation/infrastructure error retains its original type/source.
+fn classify_settlement_candidate(candidate: Result<State>) -> Result<Option<State>> {
+    match candidate {
+        Ok(normal) => Ok(Some(normal)),
+        Err(error) if error.downcast_ref::<DriverStorageError>().is_some() => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+/// Resolve the immutable static matrix contract once for admission and labels.
+fn static_matrix_group<'a>(
+    plan: &'a FrozenPlan,
+    id: &str,
+) -> Result<(&'a JobNode, &'a [String], Option<usize>)> {
+    let group = plan
+        .graph
+        .nodes
+        .iter()
+        .find(|g| g.id == id)
+        .context("missing matrix group")?;
+    let NodeKind::MatrixGroup {
+        variants,
+        max_parallel,
+        ..
+    } = &group.kind
+    else {
+        bail!("not a static matrix group")
+    };
+    ensure!(
+        !variants.is_empty(),
+        "empty matrix unsupported in this slice"
+    );
+    Ok((group, variants, *max_parallel))
+}
+
 fn ready_task(action: &ActionKind) -> Option<&str> {
     match action {
         ActionKind::Ready { task, .. } => Some(task),
@@ -1883,15 +1894,14 @@ mod tests {
         assert!(d.outcome(".github/workflows/b.yml", "first").is_none());
         let next = ready(&d, ".github/workflows/a.yml");
         assert_eq!(next.len(), 1);
-        let ActionKind::Ready { inputs, .. } = &d
+        let inputs = d
             .pending_actions()
             .iter()
-            .find(|a| matches!(&a.kind, ActionKind::Ready { task, .. } if task == &next[0]))
-            .unwrap()
-            .kind
-        else {
-            panic!()
-        };
+            .find_map(|a| match &a.kind {
+                ActionKind::Ready { task, inputs } if task == &next[0] => Some(inputs),
+                _ => None,
+            })
+            .unwrap();
         assert_eq!(inputs.needs["first"].outputs["value"], "from-a");
         let mut replay = original;
         // Include the Ready ACK revision in exact event order.

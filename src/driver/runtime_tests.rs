@@ -1283,6 +1283,10 @@ fn oversized_real_result_preserves_genuine_receipt_and_halts_without_fake_output
     };
     assert_eq!(result.outcomes[0].outputs["value"], value);
     assert_eq!(result.digest().unwrap(), real_digest);
+    assert!(d.state.phases[&task]
+        .terminal_outcomes()
+        .unwrap()
+        .is_empty());
     // Exact duplicates retain real identity; conflicts and stale replay reject.
     commit(&mut d, input);
     assert_rejected_unchanged(
@@ -3114,4 +3118,908 @@ fn wire_envelope_has_independent_bound_without_raising_state_or_wire_limit() {
         crate::expr::serialized_size(&input, MAX_TRANSITION_BYTES).unwrap() - wire_bytes
             < MAX_TRANSITION_BYTES - MAX_WIRE_BYTES
     );
+}
+
+#[test]
+fn pure_dispatch_fact_validation_and_selection_preserve_host_worker_boundary() {
+    let f = Fixture::new(WORKFLOW);
+    let mut facts = f.facts.clone();
+    facts.schema_version += 1;
+    assert!(facts
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("version"));
+    facts = f.facts.clone();
+    facts
+        .vars
+        .insert("large".into(), json!("x".repeat(1024 * 1024)));
+    assert!(facts
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("byte bound"));
+    facts = f.facts.clone();
+    facts.github.insert("bad-key".into(), json!(true));
+    assert!(facts
+        .validate()
+        .unwrap_err()
+        .to_string()
+        .contains("fact key"));
+    assert!(DerivedDispatch::from_json(&" ".repeat(1024 * 1024 + 1)).is_err());
+    assert!(Transition::from_json(&" ".repeat(MAX_TRANSITION_BYTES + 1)).is_err());
+    assert_eq!(
+        Transition::from_json(
+            &serde_json::to_string(&f.driver(2).propose(Input::Advance).unwrap()).unwrap()
+        )
+        .unwrap()
+        .revision(),
+        1
+    );
+    assert_eq!(
+        AtomicGroupUnsupported {
+            task: "task".into(),
+            reason: "reason".into()
+        }
+        .to_string(),
+        "unsupported atomic group task: reason"
+    );
+    assert_eq!(
+        FrozenShardUnsupported {
+            reason: "reason".into()
+        }
+        .to_string(),
+        "unsupported frozen shards: reason"
+    );
+    assert_eq!(
+        DriverStorageError {
+            reason: "reason".into()
+        }
+        .to_string(),
+        "driver storage capacity: reason"
+    );
+    let mut d = f.driver(2);
+    let mut records = seed(&f, &mut d);
+    let expansion = d.state.expansions.values().next().unwrap();
+    let fresh = f.driver(2);
+    let before = digest(&d.state).unwrap();
+    let fresh_before = digest(&fresh.state).unwrap();
+    verify_derived_membership_available(&fresh.state, expansion).unwrap();
+    assert!(verify_derived_membership_available(&d.state, expansion)
+        .unwrap_err()
+        .to_string()
+        .contains("derived membership collision"));
+    assert_eq!(digest(&d.state).unwrap(), before);
+    assert_eq!(digest(&fresh.state).unwrap(), fresh_before);
+    let dispatch = ready(&d)
+        .into_iter()
+        .find_map(|a| match a {
+            ActionKind::DerivedReady { dispatch, .. } => Some(dispatch),
+            _ => None,
+        })
+        .unwrap();
+    let selection = d
+        .state
+        .expansions
+        .values()
+        .flat_map(|e| &e.selections)
+        .find(|s| s.task.id == dispatch.task_id())
+        .unwrap();
+    facts = f.facts.clone();
+    facts.github = json!({"WORKFLOW": "forged", "JOB": "forged", "EVENT_NAME": "forged", "REF": "refs/heads/host"}).as_object().unwrap().clone();
+    let selected = selection.worker_evaluation(json!({"workflow":"worker-workflow", "job":"dynamic", "event_name":"push", "workspace":"worker-root"}), json!({"os":"worker-os"}), &Map::new(), &facts);
+    let cm = selected
+        .entries
+        .into_iter()
+        .filter_map(|e| match e.decision {
+            crate::job_evaluate::Decision::Run(cm) => Some(cm),
+            _ => None,
+        })
+        .next()
+        .unwrap();
+    assert_eq!(
+        cm["github"],
+        json!({"workflow":"worker-workflow", "job":"dynamic", "event_name":"push", "workspace":"worker-root", "ref":"refs/heads/host"})
+    );
+    assert_eq!(cm["runner"]["os"], "worker-os");
+    assert_eq!(cm["vars"]["tag"], "actual-portable");
+    assert_eq!(cm["inputs"]["group"], "private-pool");
+    assert_eq!(cm["env"], json!({}));
+    assert!(matches!(
+        selection
+            .worker_evaluation(json!(null), json!(null), &Map::new(), &facts)
+            .entries[0]
+            .decision,
+        crate::job_evaluate::Decision::Run(_)
+    ));
+    records.push(commit(&mut d, Input::Cancel));
+    let mut replay = f.driver(2);
+    for record in records {
+        replay.apply(&record).unwrap();
+    }
+    assert_eq!(digest(&replay.state).unwrap(), digest(&d.state).unwrap());
+}
+
+#[test]
+fn pure_driver_rejects_invalid_frozen_task_contracts_before_admission() {
+    let f = Fixture::new(WORKFLOW);
+    let config = DriverConfig {
+        schema_version: DRIVER_VERSION,
+        max_parallel: 2,
+    };
+    for (version, limit) in [
+        (DRIVER_VERSION + 1, 2),
+        (DRIVER_VERSION, 0),
+        (DRIVER_VERSION, MAX_TASKS + 1),
+    ] {
+        assert!(Driver::with_evaluation(
+            &f.plan,
+            DriverConfig {
+                schema_version: version,
+                max_parallel: limit
+            },
+            &f.input().evaluation_source().unwrap(),
+            f.facts.clone()
+        )
+        .is_err());
+    }
+    for shape in [
+        "empty",
+        "duplicate",
+        "dependency",
+        "dynamic nodes",
+        "dynamic grouping",
+        "dynamic graph",
+        "job",
+        "workflow",
+    ] {
+        let mut plan = f.plan.clone();
+        let at = plan.tasks.iter().position(|t| t.dynamic_matrix).unwrap();
+        match shape {
+            "empty" => plan.tasks[at].jobs.clear(),
+            "duplicate" => plan.tasks.push(plan.tasks[at].clone()),
+            "dependency" => plan.tasks[at].depends_on.push("absent".into()),
+            "dynamic nodes" => plan.tasks[at].nodes.clear(),
+            "dynamic grouping" => {
+                plan.tasks[at].grouped_reason =
+                    Some(crate::dag::GroupedReason::OrderAroundSharedOutputs)
+            }
+            "dynamic graph" => plan.tasks[at].nodes = vec!["absent".into()],
+            "job" => {
+                plan.tasks[at].dynamic_matrix = false;
+                plan.tasks[at].jobs = vec!["absent".into()];
+            }
+            _ => {
+                plan.tasks[at].dynamic_matrix = false;
+                plan.tasks[at].workflow = "absent".into();
+            }
+        }
+        plan.digest = plan.compute_digest().unwrap();
+        let source = PinnedExecution::new(&plan, &f.manifest, &f.store)
+            .unwrap()
+            .evaluation_source()
+            .unwrap();
+        assert!(
+            Driver::with_evaluation(&plan, config.clone(), &source, f.facts.clone()).is_err(),
+            "{shape}"
+        );
+    }
+    let f = Fixture::new(
+        &WORKFLOW.replace("${{ fromJSON(needs.seed.outputs.matrix) }}", "{n: [0, 1]}"),
+    );
+    for shape in [
+        "missing group",
+        "not matrix",
+        "wrong workflow",
+        "index",
+        "duplicate",
+        "incomplete",
+        "mixed",
+    ] {
+        let mut plan = f.plan.clone();
+        let at = plan.tasks.iter().position(|t| t.variant.is_some()).unwrap();
+        match shape {
+            "missing group" => plan.tasks[at].variant.as_mut().unwrap().group = "absent".into(),
+            "not matrix" => {
+                plan.tasks[at].variant.as_mut().unwrap().group = plan.tasks[0].nodes[0].clone()
+            }
+            "wrong workflow" => plan.tasks[at].workflow = "other".into(),
+            "index" => plan.tasks[at].variant.as_mut().unwrap().index = usize::MAX,
+            "duplicate" => {
+                let mut duplicate = plan.tasks[at].clone();
+                duplicate.id.push_str("copy");
+                plan.tasks.push(duplicate);
+            }
+            "incomplete" => {
+                let removed = plan.tasks.remove(at).id;
+                for task in &mut plan.tasks {
+                    task.depends_on.retain(|id| id != &removed);
+                }
+            }
+            _ => plan.tasks[at].variant = None,
+        }
+        plan.digest = plan.compute_digest().unwrap();
+        assert!(Driver::new(&plan, config.clone()).is_err(), "{shape}");
+    }
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    let action = ready(&d).remove(0);
+    let id = ready_task(&action).unwrap();
+    assert_rejected_unchanged(
+        &d,
+        Input::Claim {
+            task: id.into(),
+            token: String::new(),
+        },
+    );
+    assert_rejected_unchanged(&d, abort_input(id, HostFailureReason::Setup));
+    assert!(d.unavailable_worker_receipt(id).is_none());
+    assert!(d.unavailable_worker_receipt("absent").is_none());
+    assert!(d.host_failure_reason("absent").is_none());
+    assert!(d.requirements("absent").is_err());
+    assert!(d.execution_mode("absent").is_err());
+}
+
+#[test]
+fn pure_atomic_validation_refuses_invalid_membership_and_report_contracts() {
+    let f = Fixture::new(ATOMIC_WORKFLOW);
+    let original = f
+        .plan
+        .tasks
+        .iter()
+        .find(|t| t.jobs.len() > 1)
+        .unwrap()
+        .clone();
+    for shape in [
+        "unit order",
+        "matrix name",
+        "unit",
+        "unit workflow",
+        "unit job",
+        "workflow",
+        "job",
+        "needs",
+        "graph",
+    ] {
+        let mut plan = f.plan.clone();
+        let mut task = original.clone();
+        match shape {
+            "unit order" => plan.units[task.unit].jobs.reverse(),
+            "matrix name" => {
+                plan.workflows
+                    .iter_mut()
+                    .find(|w| w.file == task.workflow)
+                    .unwrap()
+                    .jobs
+                    .iter_mut()
+                    .find(|j| j.matrix.is_some())
+                    .unwrap()
+                    .name = Some("${{ runner.temp }}".into())
+            }
+            "unit" => task.unit = usize::MAX,
+            "unit workflow" => plan.units[task.unit].workflow = usize::MAX,
+            "unit job" => plan.units[task.unit].jobs.clear(),
+            "workflow" => {
+                task.workflow = "absent".into();
+                task.nodes = task
+                    .jobs
+                    .iter()
+                    .map(|j| crate::dag::node_id(&task.workflow, j))
+                    .collect();
+                task.id = format!("{}::{}", task.workflow, task.jobs.join("+"));
+                plan.workflows[plan.units[task.unit].workflow].file = task.workflow.clone();
+            }
+            "job" => plan
+                .workflows
+                .iter_mut()
+                .find(|w| w.file == task.workflow)
+                .unwrap()
+                .jobs
+                .retain(|j| j.id != task.jobs[0]),
+            "needs" => plan
+                .workflows
+                .iter_mut()
+                .find(|w| w.file == task.workflow)
+                .unwrap()
+                .jobs
+                .iter_mut()
+                .find(|j| j.id == task.jobs[0])
+                .unwrap()
+                .needs
+                .push(task.jobs[1].clone()),
+            _ => plan.graph.nodes.retain(|n| n.id != task.nodes[0]),
+        }
+        assert!(atomic::validate_task(&plan, &task).is_err(), "{shape}");
+    }
+    let mut unnamed = f.plan.clone();
+    unnamed
+        .workflows
+        .iter_mut()
+        .find(|w| w.file == original.workflow)
+        .unwrap()
+        .jobs
+        .iter_mut()
+        .find(|j| j.matrix.is_some())
+        .unwrap()
+        .name = None;
+    assert!(atomic::validate_task(&unnamed, &original).is_ok());
+    let mut no_workflow = f.plan.clone();
+    no_workflow.workflows.clear();
+    assert!(atomic::validate_readiness(&no_workflow, &BTreeMap::new()).is_err());
+    let mut no_job = f.plan.clone();
+    no_job.workflows[0].jobs.clear();
+    assert!(atomic::validate_readiness(&no_job, &BTreeMap::new()).is_err());
+    assert!(atomic::validate_readiness(&f.plan, &BTreeMap::new())
+        .unwrap_err()
+        .to_string()
+        .contains("missing external logical producer"));
+    let mut d = f.driver(2);
+    atomic_start(&f, &mut d);
+    let action = atomic_action(&d);
+    let (wire, _) = f.execute(&action, "pure-atomic-contract");
+    let result = wire.into_task_result(f.area.path()).unwrap();
+    let inputs = ready(&d)
+        .into_iter()
+        .find_map(|a| match a {
+            ActionKind::Ready { task, inputs } if task == original.id => Some(inputs),
+            _ => None,
+        })
+        .unwrap();
+    assert!(atomic::verify_result(&no_workflow, &original, &inputs, &result).is_err());
+    let mut no_spec = f.plan.clone();
+    no_spec.workflows[0].jobs.clear();
+    assert!(atomic::verify_result(&no_spec, &original, &inputs, &result).is_err());
+    let mut wrong = result.clone();
+    wrong.outcomes.reverse();
+    assert!(atomic::verify_result(&f.plan, &original, &inputs, &wrong).is_err());
+    wrong = result.clone();
+    wrong.outcomes[0].status = JobStatus::Failure;
+    assert!(atomic::verify_result(&f.plan, &original, &inputs, &wrong).is_err());
+    let mut result = result;
+    result.jobs.clear();
+    assert!(atomic::verify_result(&f.plan, &original, &inputs, &result).is_err());
+}
+
+#[test]
+fn pure_dispatch_rejects_missing_source_and_needs_before_expansion() {
+    let f = Fixture::new(WORKFLOW);
+    let d = f.driver(2);
+    let evaluation = d.evaluation.as_ref().unwrap();
+    let original = f.plan.tasks.iter().find(|t| t.dynamic_matrix).unwrap();
+    let inputs = TaskInputs::new([], [], false);
+    let mut bad = original.clone();
+    bad.dynamic_matrix = false;
+    assert!(dispatch::derive(&f.plan, evaluation, &bad, &inputs, 4, MAX_WIRE_BYTES).is_err());
+    let mut bad_inputs = inputs.clone();
+    bad_inputs.schema_version += 1;
+    assert!(dispatch::derive(
+        &f.plan,
+        evaluation,
+        original,
+        &bad_inputs,
+        4,
+        MAX_WIRE_BYTES
+    )
+    .is_err());
+    bad = original.clone();
+    bad.workflow = "absent".into();
+    assert!(evaluation.contexts(&f.plan, &bad).is_err());
+    assert!(evaluation
+        .requirement(&bad, "dynamic", &Map::new())
+        .is_err());
+    assert!(dispatch::derive(&f.plan, evaluation, &bad, &inputs, 4, MAX_WIRE_BYTES).is_err());
+    bad = original.clone();
+    bad.jobs = vec!["absent".into()];
+    assert!(evaluation.requirement(&bad, "absent", &Map::new()).is_err());
+    assert!(dispatch::derive(&f.plan, evaluation, &bad, &inputs, 4, MAX_WIRE_BYTES).is_err());
+    assert!(dispatch::derive(&f.plan, evaluation, original, &inputs, 4, MAX_WIRE_BYTES).is_err());
+    assert!(atomic::requirements(evaluation, &bad).is_err());
+    let seed_task = &f.plan.tasks[0];
+    assert!(evaluation
+        .requirement(seed_task, "seed", &Map::new())
+        .is_ok());
+    let mut group = original.clone();
+    group.jobs.push("consumer".into());
+    assert!(evaluation.contexts(&f.plan, &group).unwrap()["github"]
+        .get("job")
+        .is_none());
+    bad.workflow = "absent".into();
+    assert!(atomic::requirements(evaluation, &bad).is_err());
+}
+
+#[test]
+fn pure_static_requirements_and_receipt_rejections_preserve_admitted_state() {
+    let f = Fixture::new(&WORKFLOW.replace(
+        "${{ fromJSON(needs.seed.outputs.matrix) }}",
+        "{n: [0, 1], os: [alpha]}",
+    ));
+    let mut d = f.driver(2);
+    let dynamic = f
+        .plan
+        .tasks
+        .iter()
+        .find(|t| t.variant.is_some())
+        .unwrap()
+        .id
+        .clone();
+    assert!(d.requirements(&dynamic).is_err());
+    assert!(matches!(
+        d.execution_mode(&dynamic).unwrap(),
+        TaskExecutionMode::Independent
+    ));
+    let records = seed(&f, &mut d);
+    for action in ready(&d) {
+        let id = ready_task(&action).unwrap();
+        let requirement = &d.requirements(id).unwrap()[0];
+        assert_eq!(
+            requirement.evaluated,
+            Some(json!({"group":"private-pool", "labels":["self-hosted", "alpha"]}))
+        );
+    }
+    let mut replay = f.driver(2);
+    for record in records {
+        replay.apply(&record).unwrap();
+    }
+    assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+    let action = ready(&d).remove(0);
+    claim(&mut d, &action);
+    let (wire, _) = f.execute(&action, "pure-real-static");
+    for shape in [
+        "missing outcome",
+        "extra outcome",
+        "duplicate outcome",
+        "missing report",
+        "extra report",
+        "status",
+    ] {
+        let mut invalid = wire.clone();
+        match shape {
+            "missing outcome" => invalid.outcomes.clear(),
+            "extra outcome" => {
+                let mut extra = invalid.outcomes[0].clone();
+                extra.job = "absent".into();
+                invalid.outcomes.push(extra);
+            }
+            "duplicate outcome" => invalid.outcomes.push(invalid.outcomes[0].clone()),
+            "missing report" => invalid.jobs.clear(),
+            "extra report" => invalid.jobs.push(invalid.jobs[0].clone()),
+            _ => {
+                invalid.jobs[0].outcome = if matches!(invalid.jobs[0].outcome, Outcome::Fail) {
+                    Outcome::Pass
+                } else {
+                    Outcome::Fail
+                }
+            }
+        }
+        let id = ready_task(&action).unwrap();
+        assert_rejected_unchanged(
+            &d,
+            Input::Settle {
+                task: id.into(),
+                token: id.into(),
+                result_digest: invalid.digest().unwrap(),
+                result: Box::new(invalid),
+            },
+        );
+    }
+}
+
+#[test]
+fn pure_dispatch_label_errors_and_existing_task_collisions_are_core_failures() {
+    let bad_label = Fixture::new(&WORKFLOW.replace(
+        "labels: [self-hosted, '${{ matrix.os }}']",
+        "labels: '${{ fromJSON(\"broken\") }}'",
+    ));
+    let mut d = bad_label.driver(2);
+    seed(&bad_label, &mut d);
+    let outcome = d.outcome(FILE, "dynamic").unwrap();
+    assert_eq!(outcome.status, JobStatus::Failure);
+    let origin = bad_label
+        .plan
+        .tasks
+        .iter()
+        .find(|t| t.dynamic_matrix)
+        .unwrap();
+    assert!(d
+        .core_decision(&origin.id)
+        .unwrap()
+        .1
+        .unwrap()
+        .starts_with("runs-on:"));
+    let mut f = Fixture::new(WORKFLOW);
+    let origin = f
+        .plan
+        .tasks
+        .iter()
+        .find(|t| t.dynamic_matrix)
+        .unwrap()
+        .id
+        .clone();
+    f.plan
+        .tasks
+        .iter_mut()
+        .find(|t| t.jobs == ["consumer"])
+        .unwrap()
+        .id = format!("{origin}#0");
+    f.plan.digest = f.plan.compute_digest().unwrap();
+    let mut d = f.driver(2);
+    let records = seed(&f, &mut d);
+    assert!(d
+        .core_decision(&origin)
+        .unwrap()
+        .1
+        .unwrap()
+        .contains("collides with frozen task"));
+    let mut replay = f.driver(2);
+    for record in records {
+        replay.apply(&record).unwrap();
+    }
+    assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+}
+
+#[test]
+fn pure_shard_structural_errors_precede_canonical_partition_and_join_views_are_explicit() {
+    let f = shard_fixture(false, "'true'", SHARD_TESTS);
+    let group = f.plan.shard_groups.iter().find(|g| g.split).unwrap();
+    for shape in [
+        "duplicate",
+        "empty",
+        "grouped",
+        "missing",
+        "nonshard",
+        "index",
+        "count",
+        "identity",
+    ] {
+        let mut plan = f.plan.clone();
+        let at = plan.shard_groups.iter().position(|g| g.split).unwrap();
+        let id = plan.shard_groups[at].shards[0].clone();
+        let task = plan.tasks.iter().position(|t| t.id == id).unwrap();
+        match shape {
+            "duplicate" => plan.shard_groups.push(plan.shard_groups[at].clone()),
+            "empty" => plan.shard_groups[at].shards.clear(),
+            "grouped" => plan.shard_groups[at].source_jobs.push("consumer".into()),
+            "missing" => {
+                plan.tasks.remove(task);
+            }
+            "nonshard" => plan.tasks[task].shard = None,
+            "index" => plan.tasks[task].shard.as_mut().unwrap().index = 99,
+            "count" => plan.tasks[task].shard.as_mut().unwrap().count = 99,
+            _ => {
+                plan.tasks[task].id = "wrong".into();
+                plan.shard_groups[at].shards[0] = "wrong".into();
+            }
+        }
+        assert!(shards::validate(&plan).is_err(), "{shape}");
+    }
+    let mut d = f.driver(2);
+    assert!(matches!(
+        d.shard_join_availability("absent"),
+        ShardJoinAvailability::Pending
+    ));
+    assert!(matches!(
+        d.shard_join_availability(&group.id),
+        ShardJoinAvailability::Pending
+    ));
+    let mut records = vec![commit(&mut d, Input::Advance)];
+    while d.shard_join(&group.id).is_none() {
+        let actions = ready(&d);
+        assert!(!actions.is_empty());
+        for action in actions {
+            claim(&mut d, &action);
+            let (wire, _) = f.execute(&action, &format!("pure-shard-{}", d.revision()));
+            records.push(settle(&mut d, &action, wire));
+        }
+    }
+    assert!(matches!(
+        d.shard_join_availability(&group.id),
+        ShardJoinAvailability::Available(_)
+    ));
+}
+
+#[test]
+fn pure_driver_plan_and_state_capacity_guards_and_outbox_idempotence() {
+    let f = Fixture::new(WORKFLOW);
+    assert!(Driver::new(
+        &f.plan,
+        DriverConfig {
+            schema_version: DRIVER_VERSION,
+            max_parallel: 1
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("evaluation context"));
+    let f = Fixture::new(
+        &ATOMIC_WORKFLOW.replace("${{ fromJSON(needs.first.outputs.matrix) }}", "{n: [0, 1]}"),
+    );
+    assert!(Driver::new(
+        &f.plan,
+        DriverConfig {
+            schema_version: DRIVER_VERSION,
+            max_parallel: 1
+        }
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("verified evaluation source"));
+    let f = Fixture::new("on: push\njobs:\n  test:\n    runs-on: x\n    steps: []\n");
+    let d = f.driver(1);
+    let mut state = d.state.clone();
+    for index in 0..=MAX_TASKS {
+        state
+            .phases
+            .insert(format!("extra-{index}"), Phase::Pending);
+    }
+    assert!(d
+        .bound(&state)
+        .unwrap_err()
+        .to_string()
+        .contains("membership exceeds bound"));
+    state = d.state.clone();
+    d.push(&mut state, "same", ActionKind::Finished);
+    let once = digest(&state).unwrap();
+    d.push(&mut state, "same", ActionKind::Finished);
+    assert_eq!(digest(&state).unwrap(), once);
+    d.request_cancel(&mut state, "absent");
+    assert_eq!(digest(&state).unwrap(), once);
+    let mut driver = d;
+    commit(&mut driver, Input::Advance);
+    let id = &driver.plan.tasks[0].id;
+    assert!(driver.core_decision(id).is_none());
+    assert!(driver.host_failure_reason(id).is_none());
+}
+
+#[test]
+fn pure_driver_plan_byte_bound_rejects_large_external_metadata() {
+    let f = Fixture::new("on: push\njobs:\n  test:\n    runs-on: x\n    steps: []\n");
+    let d = f.driver(1);
+    let mut large = f.plan.clone();
+    large.workflows[0].name = "x".repeat(MAX_WIRE_BYTES);
+    large.digest = large.compute_digest().unwrap();
+    assert!(Driver::new(&large, d.config.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("plan exceeds byte bound"));
+}
+
+#[test]
+fn pure_driver_rejects_duplicate_and_mixed_matrix_producers_and_empty_static_axes() {
+    let f = Fixture::new(WORKFLOW);
+    let mut plan = f.plan.clone();
+    let mut duplicate = plan.tasks[0].clone();
+    duplicate.id = "extra-seed-owner".into();
+    plan.tasks.push(duplicate);
+    plan.digest = plan.compute_digest().unwrap();
+    let source = PinnedExecution::new(&plan, &f.manifest, &f.store)
+        .unwrap()
+        .evaluation_source()
+        .unwrap();
+    let config = DriverConfig {
+        schema_version: DRIVER_VERSION,
+        max_parallel: 2,
+    };
+    assert!(
+        Driver::with_evaluation(&plan, config.clone(), &source, f.facts.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate job producer")
+    );
+    let f = Fixture::new(
+        &ATOMIC_WORKFLOW.replace("${{ fromJSON(needs.first.outputs.matrix) }}", "{n: [0, 1]}"),
+    );
+    let mut plan = f.plan.clone();
+    let group = plan
+        .graph
+        .nodes
+        .iter()
+        .find(|n| n.job == "matrix" && matches!(n.kind, NodeKind::MatrixGroup { .. }))
+        .unwrap();
+    let mut extra = plan
+        .tasks
+        .iter()
+        .find(|t| t.jobs.len() > 1)
+        .unwrap()
+        .clone();
+    extra.depends_on.push(extra.id.clone());
+    extra.id = "extra-static-matrix-owner".into();
+    extra.jobs = vec!["matrix".into()];
+    extra.nodes = vec![format!("{FILE}::matrix#0")];
+    extra.grouped_reason = None;
+    extra.workspace.shared_by_jobs = false;
+    extra.variant = Some(crate::dag::TaskVariant {
+        group: group.id.clone(),
+        index: 0,
+        values: json!({"n":0}).as_object().unwrap().clone(),
+        label: "member-0".into(),
+    });
+    plan.tasks.push(extra);
+    plan.digest = plan.compute_digest().unwrap();
+    let source = PinnedExecution::new(&plan, &f.manifest, &f.store)
+        .unwrap()
+        .evaluation_source()
+        .unwrap();
+    assert!(
+        Driver::with_evaluation(&plan, config.clone(), &source, f.facts.clone())
+            .unwrap_err()
+            .to_string()
+            .contains("mixed atomic/matrix producers")
+    );
+    let f = Fixture::new("on: push\njobs:\n  empty:\n    runs-on: x\n    strategy:\n      matrix:\n        n: []\n    steps: []\n");
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    assert_eq!(d.outcome(FILE, "empty").unwrap().status, JobStatus::Failure);
+    let id = &f.plan.tasks[0].id;
+    assert!(d
+        .core_decision(id)
+        .unwrap()
+        .1
+        .unwrap()
+        .starts_with("matrix:"));
+}
+
+#[test]
+fn pure_storage_fallback_retires_unacknowledged_cancel_and_replays_real_receipt() {
+    let value = "z".repeat(6000);
+    let workflow = format!("on: push\njobs:\n  seed:\n    runs-on: x\n    outputs:\n      value: ${{{{ steps.seed.outputs.value }}}}\n    steps:\n      - id: seed\n        run: printf 'value=%s\\n' '{value}' >> \"$GITHUB_OUTPUT\"\n  consumer:\n    needs: seed\n    runs-on: x\n    steps:\n      - run: exit 99\n");
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(1);
+    d.state_byte_limit = 12 * 1024;
+    commit(&mut d, Input::Advance);
+    let action = ready(&d).remove(0);
+    claim(&mut d, &action);
+    mark(&mut d, &action);
+    commit(&mut d, Input::Cancel);
+    assert_eq!(cancel_actions(&d).len(), 1);
+    let (wire, _) = f.execute(&action, "pure-cancelled-storage");
+    assert_eq!(wire.outcomes[0].status, JobStatus::Success);
+    let id = ready_task(&action).unwrap();
+    let digest = wire.digest().unwrap();
+    let mut replay = d.clone();
+    let transition = settle(&mut d, &action, wire);
+    replay
+        .apply(&Transition::from_json(&serde_json::to_string(&transition).unwrap()).unwrap())
+        .unwrap();
+    assert_eq!(
+        super::digest(&d.state).unwrap(),
+        super::digest(&replay.state).unwrap()
+    );
+    assert_eq!(
+        d.infrastructure_failure(),
+        Some(ResultStorageFailure::DriverCapacity)
+    );
+    assert!(d.cancelled());
+    assert!(finished(&d));
+    assert_eq!(d.admitted(), 0);
+    assert!(cancel_actions(&d).is_empty());
+    assert_eq!(
+        d.unavailable_worker_receipt(id).unwrap().result_digest,
+        digest
+    );
+    assert!(d.outcome(FILE, "seed").is_none());
+}
+
+#[test]
+fn pure_settlement_fallback_accepts_only_typed_capacity_and_preserves_other_errors() {
+    let f = Fixture::new("on: push\njobs:\n  test:\n    runs-on: x\n    steps: []\n");
+    let d = f.driver(1);
+    let before = digest(&d.state).unwrap();
+    let state = classify_settlement_candidate(d.checked(d.state.clone()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(digest(&state).unwrap(), before);
+    let mut tiny = d.clone();
+    tiny.state_byte_limit = 1;
+    assert!(
+        classify_settlement_candidate(tiny.checked(tiny.state.clone()))
+            .unwrap()
+            .is_none()
+    );
+    let error = serde_json::from_str::<DriverConfig>("{").unwrap_err();
+    let diagnostic = error.to_string();
+    let returned = classify_settlement_candidate(Err(error.into())).unwrap_err();
+    assert!(returned.downcast_ref::<serde_json::Error>().is_some());
+    assert_eq!(returned.to_string(), diagnostic);
+    let mut invalid = f.plan.clone();
+    invalid.config_digest = "invalid".into();
+    let error = invalid.verify().unwrap_err();
+    let diagnostic = error.to_string();
+    assert_eq!(
+        classify_settlement_candidate(Err(error))
+            .unwrap_err()
+            .to_string(),
+        diagnostic
+    );
+    assert_eq!(digest(&d.state).unwrap(), before);
+    assert_eq!(d.revision(), 0);
+    assert!(d.pending_actions().is_empty());
+    let mut invalid = f.plan.clone();
+    invalid.graph.nodes[0].kind = NodeKind::MatrixGroup {
+        variants: vec![],
+        fail_fast: false,
+        max_parallel: None,
+        aggregation: crate::dag::OutputAggregation::MatrixOrder,
+    };
+    assert!(static_matrix_group(&invalid, &invalid.graph.nodes[0].id)
+        .unwrap_err()
+        .to_string()
+        .contains("empty matrix"));
+}
+
+#[test]
+fn pure_expansion_state_reserve_refusal_keeps_real_producer_and_replays() {
+    let job = "d".repeat(1000);
+    let workflow = WORKFLOW
+        .replace("dynamic", &job)
+        .replace(",{\"n\":1,\"os\":\"beta\"}", "");
+    let mut f = Fixture::new(&workflow);
+    let old = f
+        .plan
+        .tasks
+        .iter()
+        .find(|t| t.dynamic_matrix)
+        .unwrap()
+        .id
+        .clone();
+    for task in &mut f.plan.tasks {
+        if task.id == old {
+            task.id = "origin".into();
+        }
+        for dependency in &mut task.depends_on {
+            if *dependency == old {
+                *dependency = "origin".into();
+            }
+        }
+    }
+    f.plan.digest = f.plan.compute_digest().unwrap();
+    let mut normal = f.driver(2);
+    let records = seed(&f, &mut normal);
+    let mut before_settle = f.driver(2);
+    for record in &records[..records.len() - 1] {
+        before_settle.apply(record).unwrap();
+    }
+    let input = records.last().unwrap().input.clone();
+    let mut found = None;
+    // Probe a fixed, small range of real capacity configurations. Long logical
+    // names with a short valid task ID make cancellation reservations dominate
+    // the dispatch estimate without exceeding the worker's string bound.
+    for kib in 16..128 {
+        let mut candidate = before_settle.clone();
+        candidate.state_byte_limit = kib * 1024;
+        if let Ok(record) = candidate.propose(input.clone()) {
+            let mut next = candidate.clone();
+            next.apply(&record).unwrap();
+            if matches!(
+                next.core_decision("origin"),
+                Some((
+                    CoreDecision::EarlyFailure,
+                    Some("expansion exceeds remaining state byte budget")
+                ))
+            ) {
+                found = Some((candidate, record));
+                break;
+            }
+        }
+    }
+    let (mut limited, record) =
+        found.expect("one bounded capacity must refuse the additional state reservations");
+    let mut replay = limited.clone();
+    limited.apply(&record).unwrap();
+    replay
+        .apply(&Transition::from_json(&serde_json::to_string(&record).unwrap()).unwrap())
+        .unwrap();
+    assert_eq!(
+        digest(&limited.state).unwrap(),
+        digest(&replay.state).unwrap()
+    );
+    assert_eq!(limited.admitted(), 0);
+    assert_eq!(
+        limited.outcome(FILE, "seed").unwrap().status,
+        JobStatus::Success
+    );
+    assert_eq!(
+        limited.outcome(FILE, &job).unwrap().status,
+        JobStatus::Failure
+    );
+    assert!(limited.infrastructure_failure().is_none());
 }
