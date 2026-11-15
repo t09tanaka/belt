@@ -2593,12 +2593,21 @@ impl Agent {
         )
     }
 
+    fn capabilities_with_diagnostic(
+        &self,
+    ) -> Result<Option<crate::toolchain::capability::WorkerCapabilities>, &'static str> {
+        let Some(profile) = &self.cfg.capability_profile else {
+            return Ok(None);
+        };
+        let report = profile.report();
+        if report.profile_fingerprint == self.cfg.profile_fingerprint {
+            Ok(Some(report))
+        } else {
+            Err(profile.identity_failure_message(&report))
+        }
+    }
     pub(crate) fn capabilities(&self) -> Option<crate::toolchain::capability::WorkerCapabilities> {
-        self.cfg
-            .capability_profile
-            .as_ref()
-            .map(|p| p.report())
-            .filter(|r| r.profile_fingerprint == self.cfg.profile_fingerprint)
+        self.capabilities_with_diagnostic().ok().flatten()
     }
     fn check_profile_identity(&self, rec: &AcceptedAttempt) -> Result<(), ApiError> {
         if let Some(expected) = rec.spec.get("_worker_profile_fingerprint") {
@@ -2632,7 +2641,9 @@ impl Agent {
                 }
             }
         }
-        let report = self.capabilities();
+        let report = self.capabilities_with_diagnostic().map_err(|message| {
+            ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, message)
+        })?;
         if let Some(bundle) = &payload.toolchains {
             crate::toolchain::contract::check_baselines(&bundle.frozen, report.as_ref()).map_err(
                 |e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e),

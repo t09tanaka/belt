@@ -385,6 +385,34 @@ impl Profile {
             features: FEATURES.iter().map(|v| v.to_string()).collect(),
         }
     }
+    /// Safe classification of an already rejected report; no new probe or private value.
+    pub(crate) fn identity_failure_message(&self, report: &WorkerCapabilities) -> &'static str {
+        let Ok(retained) = self.report_identity.lock() else {
+            return "worker profile identity unavailable";
+        };
+        let Some(initial) = retained.as_ref() else {
+            return "worker profile identity unavailable";
+        };
+        if report.profile_fingerprint == initial.fingerprint {
+            return "worker configured profile fingerprint mismatch";
+        }
+        if report.tools.iter().any(|(tool, observation)| {
+            matches!(observation, ToolObservation::Available { .. })
+                && !matches!(
+                    initial.tools.get(tool),
+                    Some(ToolObservation::Available { .. })
+                )
+        }) {
+            return "worker profile gained a native observation";
+        }
+        if report.tools.iter().any(|(tool, observation)| {
+            matches!(observation, ToolObservation::Available { .. })
+                && initial.tools.get(tool) != Some(observation)
+        }) {
+            return "worker profile native observation changed";
+        }
+        "worker profile executable or context changed"
+    }
     /// Resolve the same PATH candidates as the probes without executing them.
     /// ctime/mode catch replacement or permission changes even if mtime is kept.
     fn executable_identity(&self) -> Digest {
@@ -742,9 +770,11 @@ mod tests {
         )
         .is_empty());
         fs::write(&marker, "changed").unwrap();
-        assert_ne!(
-            profile.report().profile_fingerprint,
-            initial.profile_fingerprint
+        let changed = profile.report();
+        assert_ne!(changed.profile_fingerprint, initial.profile_fingerprint);
+        assert_eq!(
+            profile.identity_failure_message(&changed),
+            "worker profile native observation changed"
         );
         fs::remove_file(&marker).unwrap();
         assert_eq!(
@@ -775,6 +805,10 @@ mod tests {
             ToolObservation::Available { .. }
         ));
         assert_ne!(recovered.profile_fingerprint, initial.profile_fingerprint);
+        assert_eq!(
+            profile.identity_failure_message(&recovered),
+            "worker profile gained a native observation"
+        );
         fs::write(&marker, "changed").unwrap();
         assert_ne!(
             profile.report().profile_fingerprint,
