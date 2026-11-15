@@ -8,23 +8,38 @@
 //! relative to the workspace, and the dependencies by their path in the
 //! registry, and neither changes from one worktree to the next.
 //!
+//! An entry holds only what cargo owns: for each profile directory (`debug/`,
+//! `release/`, `<triple>/<profile>/`) its `deps`, `build` and `.fingerprint`
+//! (and `.cargo-lock`), and the two files at the root of `target/`. Whatever
+//! else a job left there (`tmp`, nextest, `llvm-cov-target`, profile data,
+//! `criterion`, `incremental`, the output of examples) is not kept.
+//!
 //! Entries are immutable: `<dir>/<key>/target`, written under a temporary name
 //! and renamed into place, so that two jobs saving the same key cannot mix
-//! theirs. The marker file in an entry holds its size, and its mtime is the
-//! time of its last use (for the least-recently-used pruning).
+//! theirs. A writer holds an exclusive lock on `<tmp>.lock` for the whole
+//! save: a temporary entry whose lock can be taken belongs to a writer that is
+//! gone. The marker file in an entry holds its size, and its mtime is the time
+//! of its last use (for the least-recently-used pruning).
+//!
+//! The key holds the toolchain as `rustc -vV` and `cargo -V` report it before
+//! the job's steps run. A toolchain that a setup step of the job installs is
+//! not seen by the key: the job uses the one that is there at the start.
 //!
 //! Nothing here may fail a job: the functions report, and the caller warns.
+//! Entries are deleted only by moving them into the trash directory; when the
+//! move fails the entry stays and a warning says so.
 
 use crate::context::ExecContext;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 /// Changes when what an entry holds, or what its key covers, changes.
-pub const SCHEMA: u32 = 1;
+pub const SCHEMA: u32 = 2;
 
 /// The file in an entry that holds its size in bytes.
 const MARKER: &str = ".local-ci-entry";
@@ -39,8 +54,12 @@ const DEFAULT_MAX_GB: f64 = 20.0;
 /// is skipped rather than slow the job down with a copy.
 const DEFAULT_COPY_LIMIT_MB: u64 = 512;
 
-/// A temporary entry this old was left by a job that died.
+/// A temporary entry this old, without a lock file, was left by a job that
+/// died (one with a lock file is judged by the lock).
 const STALE_TMP: Duration = Duration::from_secs(3600);
+
+/// The most the `rustc -vV` and `cargo -V` of the key may take together.
+const DEFAULT_PROBE_SECS: u64 = 20;
 
 /// Where the cache is and how much it may hold.
 #[derive(Debug, Clone)]
@@ -53,19 +72,23 @@ pub struct Settings {
     /// The size above which an entry is not copied when cloning is not
     /// certain.
     pub copy_limit: u64,
+    /// The most the toolchain probe of a job may take.
+    pub probe_timeout: Duration,
 }
 
 impl Settings {
     /// The settings for a cache directory, from the environment of `ctx`:
     /// `LOCAL_CI_NO_BUILD_CACHE` (anything but empty or `0`) turns the cache
     /// off (`None`), `LOCAL_CI_BUILD_CACHE_MAX_GB` sets the size cap (default
-    /// 20) and `LOCAL_CI_BUILD_CACHE_COPY_LIMIT_MB` the most that is copied
-    /// where cloning is not available (default 512).
+    /// 20; `0` turns the cache off) and `LOCAL_CI_BUILD_CACHE_COPY_LIMIT_MB` the
+    /// most that is copied where cloning is not available (default 512).
+    /// `LOCAL_CI_BUILD_CACHE_PROBE_TIMEOUT_SECS` bounds the toolchain probe
+    /// (default 20).
     pub fn from_ctx(ctx: &ExecContext, cache_dir: &Path, disabled: bool) -> Option<Settings> {
         if disabled || ctx.var("LOCAL_CI_NO_BUILD_CACHE").is_some_and(truthy) {
             return None;
         }
-        Some(Self::at(ctx, cache_dir))
+        Some(Self::at(ctx, cache_dir)).filter(|s| s.max_bytes > 0)
     }
 
     /// The settings whether or not the cache is turned off: for looking at
@@ -80,11 +103,18 @@ impl Settings {
             .var("LOCAL_CI_BUILD_CACHE_COPY_LIMIT_MB")
             .and_then(|v| v.trim().parse::<u64>().ok())
             .unwrap_or(DEFAULT_COPY_LIMIT_MB);
+        let probe = ctx
+            .var("LOCAL_CI_BUILD_CACHE_PROBE_TIMEOUT_SECS")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .map(Duration::from_secs_f64)
+            .unwrap_or(Duration::from_secs(DEFAULT_PROBE_SECS));
         Settings {
             dir: cache_dir.join(DIR),
             trash: cache_dir.join("trash"),
             max_bytes: (gb * 1024.0 * 1024.0 * 1024.0) as u64,
             copy_limit: mb * 1024 * 1024,
+            probe_timeout: probe,
         }
     }
 }
@@ -130,12 +160,17 @@ pub struct KeyInputs {
     /// `cargo -V`
     pub cargo: String,
     pub os_arch: String,
-    /// every `Cargo.lock` of the checkout: relative path and the hash of its content
+    /// the `Cargo.lock` of the checkout's root: relative path and the hash of its content
     pub locks: Vec<(String, String)>,
     /// the workflow file and the job id
     pub job: String,
-    /// the variables that change a build, see [`build_env`]
+    /// the variables that change a build (as the job evaluates them), see [`build_env`]
     pub env: Vec<(String, String)>,
+    /// `.cargo/config.toml`, `.cargo/config`, `rust-toolchain.toml` and
+    /// `rust-toolchain` of the checkout: name and the hash of the content
+    pub files: Vec<(String, String)>,
+    /// the values of the job's matrix entry
+    pub matrix: String,
 }
 
 pub fn key(i: &KeyInputs) -> String {
@@ -156,6 +191,10 @@ pub fn key(i: &KeyInputs) -> String {
     for (k, v) in &i.env {
         part("env", &format!("{k}={v}"));
     }
+    for (n, d) in &i.files {
+        part("file", &format!("{n}={d}"));
+    }
+    part("matrix", &i.matrix);
     hex(&h.finalize())
 }
 
@@ -221,121 +260,259 @@ pub fn applies(ws: &Path) -> bool {
     ws.join("Cargo.toml").is_file() && ws.join("Cargo.lock").is_file()
 }
 
-/// Every `Cargo.lock` below `ws` (not in `target`, `.git` or `node_modules`),
-/// by relative path, with the hash of its content.
+/// The `Cargo.lock` at the root of `ws` (the cache is of the root crate
+/// only), as relative path and the hash of its content; empty when there is none.
 pub fn lock_digests(ws: &Path) -> Vec<(String, String)> {
-    fn walk(base: &Path, dir: &Path, depth: usize, out: &mut Vec<(String, String)>) {
-        let Ok(rd) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for e in rd.flatten() {
-            let Ok(t) = e.file_type() else { continue };
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            if t.is_file() && name == "Cargo.lock" {
-                if let Ok(bytes) = std::fs::read(e.path()) {
-                    let rel = e
-                        .path()
-                        .strip_prefix(base)
-                        .map(|p| p.to_string_lossy().into_owned())
-                        .unwrap_or_default();
-                    out.push((rel, hex(&Sha256::digest(&bytes))));
-                }
-            } else if t.is_dir()
-                && depth < 4
-                && !matches!(name.as_ref(), "target" | ".git" | "node_modules")
-            {
-                walk(base, &e.path(), depth + 1, out);
-            }
-        }
-    }
-    let mut out = Vec::new();
-    walk(ws, ws, 0, &mut out);
-    out.sort();
-    out
+    std::fs::read(ws.join("Cargo.lock"))
+        .map(|b| vec![("Cargo.lock".to_string(), hex(&Sha256::digest(&b)))])
+        .unwrap_or_default()
+}
+
+/// The files of the checkout that choose the toolchain and how cargo builds,
+/// by name, with the hash of their content (those that exist).
+pub fn config_digests(ws: &Path) -> Vec<(String, String)> {
+    [
+        ".cargo/config.toml",
+        ".cargo/config",
+        "rust-toolchain.toml",
+        "rust-toolchain",
+    ]
+    .into_iter()
+    .filter_map(|n| {
+        let p = ws.join(n);
+        std::fs::symlink_metadata(&p).ok()?;
+        let d = std::fs::read(&p)
+            .map(|b| hex(&Sha256::digest(&b)))
+            .unwrap_or_else(|e| format!("unreadable:{}", e.kind()));
+        Some((n.to_string(), d))
+    })
+    .collect()
 }
 
 /// The `rustc -vV` and `cargo -V` of the checkout (so that `rust-toolchain.toml`
-/// is honoured), run with `path` as `PATH`. `None` when either is missing.
-pub fn toolchain(ctx: &ExecContext, ws: &Path, path: &str) -> Option<(String, String)> {
-    let run = |prog: &str, arg: &str| -> Option<String> {
-        let out = ctx
+/// is honoured), run with `path` as `PATH`, together within `timeout`. A
+/// toolchain that is not installed is not installed by this
+/// (`RUSTUP_AUTO_INSTALL=0`). `Err` with the reason when either is missing,
+/// fails or is too slow: the job then goes without the cache.
+pub fn toolchain(
+    ctx: &ExecContext,
+    ws: &Path,
+    path: &str,
+    timeout: Duration,
+) -> Result<(String, String), String> {
+    let deadline = Instant::now() + timeout;
+    let run = |prog: &str, arg: &str| -> Result<String, String> {
+        use std::io::Read;
+        use std::os::unix::process::CommandExt;
+        let mut child = ctx
             .command(prog)
             .arg(arg)
             .env("PATH", path)
+            .env("RUSTUP_AUTO_INSTALL", "0")
             .current_dir(ws)
             .stdin(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (out.status.success() && !text.is_empty()).then_some(text)
+            .process_group(0)
+            .spawn()
+            .map_err(|e| format!("`{prog} {arg}`: {e}"))?;
+        let pg = child.id() as i32;
+        let kill = || {
+            // SAFETY: a signal to the group this function started.
+            unsafe {
+                libc::killpg(pg, libc::SIGKILL);
+            }
+        };
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break st,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Ok(None) => {
+                    kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "`{prog} {arg}` took more than {:.0}s",
+                        timeout.as_secs_f64()
+                    ));
+                }
+                Err(e) => {
+                    kill();
+                    return Err(format!("`{prog} {arg}`: {e}"));
+                }
+            }
+        };
+        // nothing of the group may hold the pipe open while it is read
+        kill();
+        let mut bytes = Vec::new();
+        if let Some(mut o) = child.stdout.take() {
+            let _ = o.read_to_end(&mut bytes);
+        }
+        let text = String::from_utf8_lossy(&bytes).trim().to_string();
+        if status.success() && !text.is_empty() {
+            Ok(text)
+        } else {
+            Err(format!("`{prog} {arg}` failed ({status})"))
+        }
     };
-    Some((run("rustc", "-vV")?, run("cargo", "-V")?))
+    Ok((run("rustc", "-vV")?, run("cargo", "-V")?))
 }
 
 pub fn os_arch() -> String {
     format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH)
 }
 
-// -------------------------------------------------------------- strip
+// ---------------------------------------------------------- allowlist
 
-/// Whether a file or directory found in a `target/` is left out of an entry:
-/// incremental compilation data (large, and only good for the checkout that
-/// made it), raw coverage data and the output of mutation testing.
-pub fn should_strip(name: &str, is_dir: bool) -> bool {
-    if is_dir {
-        name == "incremental" || name.starts_with("mutants.out")
-    } else {
-        name.ends_with(".profraw")
-    }
+/// Directories at the root of `target/` that hold a build of their own and
+/// are not a target triple.
+fn not_a_triple(dir: &Path, name: &str) -> bool {
+    // a target directory of its own (llvm-cov, a tool's) has the files cargo
+    // writes at the root of one; a target triple's directory has not
+    dir.join("CACHEDIR.TAG").exists()
+        || dir.join(".rustc_info.json").exists()
+        || matches!(
+            name,
+            "llvm-cov-target" | "nextest" | "tmp" | "criterion" | "doc" | "package"
+        )
+        || name.starts_with("mutants.out")
 }
 
-/// Remove what [`should_strip`] names from below `dir`, links not followed.
-pub fn strip(dir: &Path) {
-    let Ok(rd) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for e in rd.flatten() {
-        let Ok(t) = e.file_type() else { continue };
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        if t.is_symlink() {
-            continue;
-        }
-        if should_strip(&name, t.is_dir()) {
-            if t.is_dir() {
-                let _ = std::fs::remove_dir_all(e.path());
-            } else {
-                let _ = std::fs::remove_file(e.path());
+/// The lock files cargo keeps in a profile directory (which of them, depends on its version).
+const LOCKS: [&str; 3] = [".cargo-lock", ".cargo-build-lock", ".cargo-artifact-lock"];
+
+/// A directory cargo builds in: it has a `.fingerprint` directory (the layout
+/// of older cargo) or one of its lock files (the newer layout keeps
+/// everything under `build/`).
+fn is_profile_dir(p: &Path) -> bool {
+    crate::git::is_real_dir(&p.join(".fingerprint"))
+        || LOCKS
+            .iter()
+            .any(|l| std::fs::symlink_metadata(p.join(l)).is_ok_and(|m| m.is_file()))
+}
+
+/// What an entry holds, as paths relative to `target`: the files cargo
+/// keeps at its root, and for each profile directory (`debug`, `release`,
+/// `<triple>/debug`, ...) its `deps`, `build` and `.fingerprint` and the
+/// lock files. A directory is a profile directory when it has a
+/// `.fingerprint` directory or a lock file of cargo's. Everything else in `target/` is left out.
+pub fn allowed(target: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let profile = |rel: PathBuf, out: &mut Vec<PathBuf>| {
+        for d in ["deps", "build", ".fingerprint"] {
+            if crate::git::is_real_dir(&target.join(&rel).join(d)) {
+                out.push(rel.join(d));
             }
-        } else if t.is_dir() {
-            strip(&e.path());
+        }
+        for l in LOCKS {
+            let lock = rel.join(l);
+            if std::fs::symlink_metadata(target.join(&lock)).is_ok_and(|m| m.is_file()) {
+                out.push(lock);
+            }
+        }
+    };
+    for f in [".rustc_info.json", "CACHEDIR.TAG"] {
+        if std::fs::symlink_metadata(target.join(f)).is_ok_and(|m| m.is_file()) {
+            out.push(PathBuf::from(f));
         }
     }
+    let mut names: Vec<String> = std::fs::read_dir(target)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for n in names {
+        let top = target.join(&n);
+        if is_profile_dir(&top) {
+            profile(PathBuf::from(&n), &mut out);
+        } else if !not_a_triple(&top, &n) {
+            let mut subs: Vec<String> = std::fs::read_dir(&top)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .collect();
+            subs.sort();
+            for s in subs {
+                if is_profile_dir(&top.join(&s)) {
+                    profile(Path::new(&n).join(&s), &mut out);
+                }
+            }
+        }
+    }
+    out
 }
 
 // --------------------------------------------------------------- copy
 
-/// Clone-or-copy `from` (a directory) to `to` (which must not exist), keeping
-/// the times of the files: cargo's freshness check compares them.
+/// The type of the file system that holds `p` (or the nearest directory
+/// above it that exists) is APFS, which clones.
+#[cfg(target_os = "macos")]
+fn is_apfs(p: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let mut p = p.to_path_buf();
+    while !p.exists() {
+        if !p.pop() {
+            return false;
+        }
+    }
+    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c` is a valid C string and `st` is written by statfs.
+    unsafe {
+        let mut st: libc::statfs = std::mem::zeroed();
+        if libc::statfs(c.as_ptr(), &mut st) != 0 {
+            return false;
+        }
+        let name = std::ffi::CStr::from_ptr(st.f_fstypename.as_ptr());
+        name.to_bytes() == b"apfs"
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_apfs(_: &Path) -> bool {
+    false
+}
+
+/// One copy: a directory (its content, into `to`, which is made) or a file.
+struct Piece {
+    from: PathBuf,
+    to: PathBuf,
+    dir: bool,
+}
+
+/// Clone-or-copy the `pieces`, keeping the times of the files: cargo's
+/// freshness check compares them. `size` is what they hold together.
 ///
-/// A clone shares the blocks and costs next to nothing. `cp` falls back to a
-/// full copy by itself on macOS when the volumes differ, so there the copy
-/// is allowed only when the two are on one device or `size` is under the
-/// limit; on Linux the clone is asked for with `--reflink=always` and the
-/// plain copy is only tried under the limit.
-fn clone_dir(
-    ctx: &ExecContext,
-    s: &Settings,
-    from: &Path,
-    to: &Path,
-    size: u64,
-) -> Result<(), String> {
-    let cp = |args: &[&str]| -> Result<(), String> {
+/// A clone shares the blocks and costs next to nothing. On macOS `cp -c`
+/// falls back to a full copy by itself when it cannot clone, so a clone is
+/// counted on only when both sides are on one APFS volume, and otherwise
+/// `size` must be under the limit. On Linux the clone is asked for with
+/// `--reflink=always` and the plain copy is only tried under the limit.
+fn copy_pieces(ctx: &ExecContext, s: &Settings, pieces: &[Piece], size: u64) -> Result<(), String> {
+    let Some(first) = pieces.first() else {
+        return Ok(());
+    };
+    let cp = |flags: &[&str], p: &Piece| -> Result<(), String> {
+        let (from, to) = if p.dir {
+            std::fs::create_dir_all(&p.to).map_err(|e| format!("{}: {e}", p.to.display()))?;
+            (p.from.join("."), p.to.clone())
+        } else {
+            if let Some(parent) = p.to.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("{}: {e}", parent.display()))?;
+            }
+            (p.from.clone(), p.to.clone())
+        };
         let out = ctx
             .command("cp")
-            .args(args)
+            .args(flags)
             .arg(from)
             .arg(to)
             .stdin(Stdio::null())
@@ -345,42 +522,54 @@ fn clone_dir(
         if out.status.success() {
             Ok(())
         } else {
-            let _ = std::fs::remove_dir_all(to);
             Err(format!(
                 "cp: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ))
         }
     };
-    if cfg!(target_os = "macos") {
-        if size > s.copy_limit && !same_device(from, to) {
+    let flags: &[&str] = if cfg!(target_os = "macos") {
+        if size > s.copy_limit && !(same_device(&first.from, &first.to) && is_apfs(&first.to)) {
             return Err(format!(
-                "the cache is on another volume and the copy would take {} MiB",
+                "no copy-on-write clone here (not one APFS volume) and the copy would take {} MiB",
                 size >> 20
             ));
         }
-        cp(&["-c", "-pR"])
+        &["-c", "-pR"]
     } else {
-        match cp(&["--reflink=always", "-pR"]) {
-            Ok(()) => Ok(()),
-            Err(why) if size > s.copy_limit => Err(format!(
-                "no copy-on-write clone here ({why}) and the copy would take {} MiB",
-                size >> 20
-            )),
-            Err(_) => cp(&["-pR"]),
+        match cp(&["--reflink=always", "-pR"], first) {
+            Ok(()) => &["--reflink=always", "-pR"],
+            Err(why) if size > s.copy_limit => {
+                return Err(format!(
+                    "no copy-on-write clone here ({why}) and the copy would take {} MiB",
+                    size >> 20
+                ))
+            }
+            Err(_) => {
+                cp(&["-pR"], first)?;
+                &["-pR"]
+            }
         }
+    };
+    for (n, p) in pieces.iter().enumerate() {
+        // on Linux the first one is done
+        if n == 0 && !cfg!(target_os = "macos") {
+            continue;
+        }
+        cp(flags, p)?;
     }
+    Ok(())
 }
 
 fn same_device(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    // `to` does not exist yet: its parent is on the device it will be on
+    // `to` does not exist yet: its nearest parent is on the device it will be on
     let dev = |p: &Path| {
-        let p = if p.exists() {
-            p.to_path_buf()
-        } else {
-            p.parent().map(Path::to_path_buf).unwrap_or_default()
-        };
+        let mut p = p.to_path_buf();
+        while !p.exists() {
+            if !p.pop() {
+                return None;
+            }
+        }
         std::fs::metadata(p).map(|m| m.dev()).ok()
     };
     matches!((dev(a), dev(b)), (Some(x), Some(y)) if x == y)
@@ -427,12 +616,103 @@ pub fn restore(ctx: &ExecContext, s: &Settings, key: &str, ws: &Path) -> Restore
         return Restore::Skipped("target/ exists".into());
     }
     let size = marker_size(&entry).unwrap_or(0);
-    match clone_dir(ctx, s, &from, &to, size) {
+    let piece = Piece {
+        from,
+        to: to.clone(),
+        dir: true,
+    };
+    match copy_pieces(ctx, s, &[piece], size) {
         Ok(()) => {
             touch(&entry);
             Restore::Restored
         }
-        Err(why) => Restore::Skipped(why),
+        Err(why) => {
+            // `to` did not exist before: what is there is a part of the copy
+            crate::git::remove_now(&to);
+            Restore::Skipped(why)
+        }
+    }
+}
+
+// --------------------------------------------------------------- locks
+
+/// The lock a writer holds on `<tmp>.lock` while it saves.
+struct TmpLock {
+    path: PathBuf,
+    _file: std::fs::File,
+}
+
+fn lock_path(tmp: &Path) -> PathBuf {
+    let mut p = tmp.as_os_str().to_os_string();
+    p.push(".lock");
+    PathBuf::from(p)
+}
+
+impl TmpLock {
+    fn acquire(tmp: &Path) -> std::io::Result<TmpLock> {
+        let path = lock_path(tmp);
+        for _ in 0..3 {
+            let f = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&path)?;
+            fs2::FileExt::try_lock_exclusive(&f)?;
+            // a prune may have removed the file between open and lock
+            if std::fs::metadata(&path)
+                .is_ok_and(|m| m.ino() == f.metadata().map_or(0, |m| m.ino()))
+            {
+                return Ok(TmpLock { path, _file: f });
+            }
+        }
+        Err(std::io::Error::other("the lock file keeps going away"))
+    }
+}
+
+impl Drop for TmpLock {
+    fn drop(&mut self) {
+        // before the lock is let go
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// A temporary entry whose writer is gone, with the lock held so that
+/// nothing else takes it.
+struct Dead {
+    lock: Option<std::fs::File>,
+    lock_path: PathBuf,
+}
+
+/// `Some` when nothing writes `tmp`: its lock can be taken, or it has none
+/// (a directory from a version that did not lock) and is `old` enough or
+/// `any_age` is set.
+fn dead_tmp(tmp: &Path, any_age: bool) -> Option<Dead> {
+    let lock_path = lock_path(tmp);
+    match std::fs::OpenOptions::new().write(true).open(&lock_path) {
+        Ok(f) => fs2::FileExt::try_lock_exclusive(&f).ok().map(|()| Dead {
+            lock: Some(f),
+            lock_path,
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let old = std::fs::metadata(tmp)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_some_and(|age| age > STALE_TMP);
+            (any_age || old).then_some(Dead {
+                lock: None,
+                lock_path,
+            })
+        }
+        Err(_) => None,
+    }
+}
+
+impl Dead {
+    fn done(self) {
+        if self.lock.is_some() {
+            let _ = std::fs::remove_file(&self.lock_path);
+        }
     }
 }
 
@@ -447,8 +727,9 @@ pub enum Save {
     Skipped(String),
 }
 
-/// Add the `target/` of `ws` as the entry for `key`, if there is none. `seq`
-/// tells apart the temporary names of the threads of one process.
+/// Add what cargo owns in the `target/` of `ws` ([`allowed`]) as the entry for
+/// `key`, if there is none. `seq` tells apart the temporary names of the
+/// threads of one process.
 pub fn save(ctx: &ExecContext, s: &Settings, key: &str, ws: &Path, seq: usize) -> Save {
     let entry = s.dir.join(key);
     if entry.exists() {
@@ -458,26 +739,59 @@ pub fn save(ctx: &ExecContext, s: &Settings, key: &str, ws: &Path, seq: usize) -
     if !crate::git::is_real_dir(&from) {
         return Save::Skipped("no target/".into());
     }
-    let tmp = s
-        .dir
-        .join(format!("{key}.tmp-{}-{seq}", std::process::id()));
+    let rels = allowed(&from);
+    // the files at the root of target/ alone would hold the key for nothing
+    if !rels.iter().any(|r| r.components().count() > 1) {
+        return Save::Skipped("no build of cargo's in target/".into());
+    }
+    // the size of what is copied, walked once
+    let size: u64 = rels
+        .iter()
+        .map(|r| crate::reclaim::disk_usage(&from.join(r)))
+        .sum();
+    if size > s.max_bytes {
+        return Save::Skipped(format!(
+            "{} MiB is more than the cap of the cache",
+            size >> 20
+        ));
+    }
     if let Err(e) = std::fs::create_dir_all(&s.dir) {
         return Save::Skipped(format!("{}: {e}", s.dir.display()));
     }
-    let _ = std::fs::remove_dir_all(&tmp);
+    let tmp = s
+        .dir
+        .join(format!("{key}.tmp-{}-{seq}", std::process::id()));
+    let _lock = match TmpLock::acquire(&tmp) {
+        Ok(l) => l,
+        Err(e) => return Save::Skipped(format!("lock: {e}")),
+    };
+    // held until this returns; the entry is renamed or moved away before
+    let fail = |why: String| {
+        if tmp.exists() {
+            let _ = crate::git::move_to_trash(&tmp, &s.trash);
+        }
+        Save::Skipped(why)
+    };
+    if tmp.exists() {
+        // a dead writer's of the same name
+        if crate::git::move_to_trash(&tmp, &s.trash).is_none() {
+            return Save::Skipped(format!("{}: cannot be moved to the trash", tmp.display()));
+        }
+    }
     if let Err(e) = std::fs::create_dir(&tmp) {
         return Save::Skipped(format!("{}: {e}", tmp.display()));
     }
-    let fail = |why: String| {
-        let _ = std::fs::remove_dir_all(&tmp);
-        Save::Skipped(why)
-    };
-    let size = crate::reclaim::disk_usage(&from);
-    if let Err(why) = clone_dir(ctx, s, &from, &tmp.join("target"), size) {
+    let pieces: Vec<Piece> = rels
+        .iter()
+        .map(|r| Piece {
+            from: from.join(r),
+            to: tmp.join("target").join(r),
+            dir: std::fs::symlink_metadata(from.join(r)).is_ok_and(|m| m.is_dir()),
+        })
+        .collect();
+    if let Err(why) = copy_pieces(ctx, s, &pieces, size) {
         return fail(why);
     }
-    strip(&tmp.join("target"));
-    let size = crate::reclaim::disk_usage(&tmp.join("target"));
     if let Err(e) = std::fs::write(tmp.join(MARKER), size.to_string()) {
         return fail(format!("{MARKER}: {e}"));
     }
@@ -485,7 +799,7 @@ pub fn save(ctx: &ExecContext, s: &Settings, key: &str, ws: &Path, seq: usize) -
         Ok(()) => Save::Saved,
         // another job saved the key first
         Err(_) if entry.exists() => {
-            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = fail(String::new());
             Save::Exists
         }
         Err(e) => fail(format!("rename: {e}")),
@@ -501,15 +815,23 @@ pub struct Entry {
     pub used: SystemTime,
 }
 
-/// The entries of the cache (not the temporary ones), as they are on disk.
+fn is_tmp(name: &str) -> bool {
+    name.contains(".tmp-")
+}
+
+/// The entries of the cache (not the temporary ones, nor anything that is
+/// not an entry: those have the marker file), as they are on disk.
 pub fn entries(dir: &Path) -> Vec<Entry> {
     let mut v = Vec::new();
     for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        if name.contains(".tmp-") || !e.file_type().is_ok_and(|t| t.is_dir()) {
+        if is_tmp(&name) || !e.file_type().is_ok_and(|t| t.is_dir()) {
             continue;
         }
         let path = e.path();
+        if !path.join(MARKER).is_file() {
+            continue;
+        }
         let used = std::fs::metadata(path.join(MARKER))
             .and_then(|m| m.modified())
             .or_else(|_| e.metadata().and_then(|m| m.modified()))
@@ -524,10 +846,16 @@ pub fn entries(dir: &Path) -> Vec<Entry> {
     v
 }
 
-/// The keys to remove so that the rest fits in `max_bytes`: the least
-/// recently used first. `keep` is never chosen.
-pub fn lru_victims(entries: &[Entry], max_bytes: u64, keep: Option<&str>) -> Vec<String> {
-    let mut total: u64 = entries.iter().map(|e| e.bytes).sum();
+/// The keys to remove so that the rest, with `extra` bytes that are not
+/// entries (temporary ones), fits in `max_bytes`: the least recently used
+/// first. `keep` is never chosen.
+pub fn lru_victims(
+    entries: &[Entry],
+    extra: u64,
+    max_bytes: u64,
+    keep: Option<&str>,
+) -> Vec<String> {
+    let mut total: u64 = extra + entries.iter().map(|e| e.bytes).sum::<u64>();
     let mut by_age: Vec<&Entry> = entries.iter().collect();
     by_age.sort_by(|a, b| a.used.cmp(&b.used).then_with(|| a.key.cmp(&b.key)));
     let mut out = Vec::new();
@@ -544,45 +872,111 @@ pub fn lru_victims(entries: &[Entry], max_bytes: u64, keep: Option<&str>) -> Vec
     out
 }
 
-fn remove_entry(ctx: &ExecContext, s: &Settings, path: &Path) {
+/// What [`prune`] and [`clear`] did.
+#[derive(Debug, Default, PartialEq)]
+pub struct Pruned {
+    /// entries (and dead temporary ones) moved to the trash
+    pub removed: usize,
+    /// what could not be done: those stay where they are
+    pub warnings: Vec<String>,
+    /// the entry that was just saved had to go too: it alone was over the cap
+    pub evicted_keep: bool,
+}
+
+/// Move `path` to the trash and start emptying it. Nothing is deleted in
+/// place: when the move fails the entry stays.
+fn remove_entry(ctx: &ExecContext, s: &Settings, path: &Path) -> Result<(), String> {
     if crate::git::move_to_trash(path, &s.trash).is_none() {
-        crate::git::remove_now(path);
+        return Err(format!("{}: cannot be moved to the trash", path.display()));
     }
     crate::git::empty_trash(ctx, &s.trash);
+    Ok(())
 }
 
-/// Remove the least recently used entries until the cache fits its cap, and
-/// the temporary entries of jobs that died. Returns the number of entries
-/// removed.
-pub fn prune(ctx: &ExecContext, s: &Settings, keep: Option<&str>) -> usize {
+/// Reap the temporary entries of writers that are gone (and their lock files).
+/// Returns what the ones still being written take.
+fn reap_tmps(ctx: &ExecContext, s: &Settings, any_age: bool, out: &mut Pruned) -> u64 {
+    let mut live = 0;
     for e in std::fs::read_dir(&s.dir).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().into_owned();
-        let old = e
-            .metadata()
-            .and_then(|m| m.modified())
-            .ok()
-            .and_then(|t| t.elapsed().ok())
-            .is_some_and(|age| age > STALE_TMP);
-        if name.contains(".tmp-") && old {
-            remove_entry(ctx, s, &e.path());
+        if !is_tmp(&name) {
+            continue;
+        }
+        let path = e.path();
+        if let Some(base) = name.strip_suffix(".lock") {
+            // a lock file whose temporary entry is gone
+            if !s.dir.join(base).exists() {
+                if let Some(d) = dead_tmp(&s.dir.join(base), true) {
+                    d.done();
+                }
+            }
+            continue;
+        }
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        match dead_tmp(&path, any_age) {
+            Some(d) => match remove_entry(ctx, s, &path) {
+                Ok(()) => {
+                    out.removed += 1;
+                    d.done();
+                }
+                Err(w) => out.warnings.push(w),
+            },
+            None => live += crate::reclaim::disk_usage(&path),
         }
     }
-    let victims = lru_victims(&entries(&s.dir), s.max_bytes, keep);
-    for k in &victims {
-        remove_entry(ctx, s, &s.dir.join(k));
-    }
-    victims.len()
+    live
 }
 
-/// Remove every entry (`local-ci cache prune --build`). Returns the number
-/// removed.
-pub fn clear(ctx: &ExecContext, s: &Settings) -> usize {
-    let mut n = 0;
-    for e in std::fs::read_dir(&s.dir).into_iter().flatten().flatten() {
-        remove_entry(ctx, s, &e.path());
-        n += 1;
+/// Remove the least recently used entries until the cache (the temporary
+/// entries being written count) fits its cap, and the temporary entries of
+/// jobs that died. When only the entry `keep` is left and the cache is still
+/// over the cap, that goes too (`evicted_keep`).
+pub fn prune(ctx: &ExecContext, s: &Settings, keep: Option<&str>) -> Pruned {
+    let mut out = Pruned::default();
+    let live = reap_tmps(ctx, s, false, &mut out);
+    let es = entries(&s.dir);
+    let mut total: u64 = live + es.iter().map(|e| e.bytes).sum::<u64>();
+    for k in lru_victims(&es, live, s.max_bytes, keep) {
+        match remove_entry(ctx, s, &s.dir.join(&k)) {
+            Ok(()) => {
+                out.removed += 1;
+                total = total.saturating_sub(es.iter().find(|e| e.key == k).map_or(0, |e| e.bytes));
+            }
+            Err(w) => out.warnings.push(w),
+        }
     }
-    n
+    if total > s.max_bytes {
+        if let Some(k) = keep.filter(|k| s.dir.join(k).is_dir()) {
+            match remove_entry(ctx, s, &s.dir.join(k)) {
+                Ok(()) => {
+                    out.removed += 1;
+                    out.evicted_keep = true;
+                    out.warnings.push(format!(
+                        "the cache is over its cap ({} MiB) with the new entry alone: it is not kept",
+                        s.max_bytes >> 20
+                    ));
+                }
+                Err(w) => out.warnings.push(w),
+            }
+        }
+    }
+    out
+}
+
+/// Remove every entry and every temporary entry whose writer is gone
+/// (`local-ci cache prune --build`). Nothing else in the directory is touched.
+pub fn clear(ctx: &ExecContext, s: &Settings) -> Pruned {
+    let mut out = Pruned::default();
+    reap_tmps(ctx, s, true, &mut out);
+    for e in entries(&s.dir) {
+        match remove_entry(ctx, s, &s.dir.join(&e.key)) {
+            Ok(()) => out.removed += 1,
+            Err(w) => out.warnings.push(w),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -598,6 +992,8 @@ mod tests {
             locks: vec![("Cargo.lock".into(), "aa".into())],
             job: ".github/workflows/ci.yml#test".into(),
             env: vec![("RUSTFLAGS".into(), "-D warnings".into())],
+            files: vec![("rust-toolchain.toml".into(), "t1".into())],
+            matrix: "{\"os\":\"linux\"}".into(),
         }
     }
 
@@ -640,6 +1036,25 @@ mod tests {
             },
             KeyInputs {
                 env: vec![],
+                ..inputs()
+            },
+            KeyInputs {
+                files: vec![("rust-toolchain.toml".into(), "t2".into())],
+                ..inputs()
+            },
+            KeyInputs {
+                files: vec![],
+                ..inputs()
+            },
+            KeyInputs {
+                files: vec![
+                    ("rust-toolchain.toml".into(), "t1".into()),
+                    (".cargo/config.toml".into(), "c".into()),
+                ],
+                ..inputs()
+            },
+            KeyInputs {
+                matrix: "{\"os\":\"macos\"}".into(),
                 ..inputs()
             },
         ];
@@ -713,72 +1128,93 @@ mod tests {
     }
 
     #[test]
-    fn locks_are_found_below_the_root_but_not_in_target() {
+    fn only_the_lock_at_the_root_counts() {
         let t = tempfile::tempdir().unwrap();
         let p = t.path();
+        assert!(lock_digests(p).is_empty());
         std::fs::write(p.join("Cargo.lock"), "a").unwrap();
-        for d in ["sub", "target/debug", "node_modules/x", ".git"] {
-            std::fs::create_dir_all(p.join(d)).unwrap();
-        }
+        std::fs::create_dir_all(p.join("sub")).unwrap();
         std::fs::write(p.join("sub/Cargo.lock"), "b").unwrap();
-        std::fs::write(p.join("target/debug/Cargo.lock"), "c").unwrap();
-        std::fs::write(p.join("node_modules/x/Cargo.lock"), "d").unwrap();
         let locks = lock_digests(p);
         let names: Vec<&str> = locks.iter().map(|(n, _)| n.as_str()).collect();
-        assert_eq!(names, ["Cargo.lock", "sub/Cargo.lock"]);
+        assert_eq!(names, ["Cargo.lock"]);
         // the content is what counts
         std::fs::write(p.join("Cargo.lock"), "changed").unwrap();
         assert_ne!(locks[0].1, lock_digests(p)[0].1);
         assert!(applies(p) == p.join("Cargo.toml").is_file());
     }
 
-    #[test]
-    fn strip_rules() {
-        assert!(should_strip("incremental", true));
-        assert!(should_strip("mutants.out", true));
-        assert!(should_strip("mutants.out.old", true));
-        assert!(should_strip("default_1234.profraw", false));
-        assert!(!should_strip("incremental", false));
-        assert!(!should_strip("deps", true));
-        assert!(!should_strip("libfoo.rlib", false));
-        assert!(!should_strip("foo.profraw", true));
+    fn touch_files(root: &Path, files: &[&str]) {
+        for f in files {
+            let p = root.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, "x").unwrap();
+        }
     }
 
     #[test]
-    fn strip_removes_only_what_the_rules_name() {
+    fn only_what_cargo_owns_is_allowed() {
         let t = tempfile::tempdir().unwrap();
         let d = t.path().join("target");
-        for dir in [
-            "debug/incremental/foo-1",
+        touch_files(
+            &d,
+            &[
+                "CACHEDIR.TAG",
+                ".rustc_info.json",
+                "debug/.fingerprint/a/x",
+                "debug/deps/libfoo.rlib",
+                "debug/build/b/out",
+                "debug/.cargo-lock",
+                "debug/incremental/foo-1/a.o",
+                // the layout of the newer cargo: no deps, no .fingerprint
+                "bench/.cargo-build-lock",
+                "bench/build/p/h/out/x",
+                "bench/examples/e",
+                "debug/examples/ex",
+                "debug/myapp",
+                "release/.fingerprint/a/x",
+                "release/deps/libfoo.rlib",
+                "x86_64-unknown-linux-gnu/debug/.fingerprint/a/x",
+                "x86_64-unknown-linux-gnu/debug/deps/libfoo.rlib",
+                "x86_64-unknown-linux-gnu/debug/incremental/i",
+                "llvm-cov-target/debug/.fingerprint/a/x",
+                "llvm-cov-target/CACHEDIR.TAG",
+                // a target directory of a tool, whatever its name
+                "somename/CACHEDIR.TAG",
+                "somename/debug/.fingerprint/a/x",
+                "llvm-cov-target/debug/deps/default_1.profraw",
+                "nextest/default/junit.xml",
+                "tmp/x",
+                "criterion/report/index.html",
+                "doc/foo/index.html",
+                "mutants.out/log",
+                "lcov.info",
+                "default.profdata",
+            ],
+        );
+        let got: Vec<String> = allowed(&d)
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let want = [
+            ".rustc_info.json",
+            "CACHEDIR.TAG",
             "debug/deps",
-            "x86_64-unknown-linux-gnu/debug/incremental",
-            "llvm-cov-target/debug/deps",
-            "mutants.out",
-        ] {
-            std::fs::create_dir_all(d.join(dir)).unwrap();
-        }
-        for f in [
-            "debug/incremental/foo-1/a.o",
-            "debug/deps/libfoo.rlib",
-            "debug/deps/foo.d",
-            "llvm-cov-target/debug/deps/default_1.profraw",
-            "llvm-cov-target/debug/deps/libbar.rlib",
-            "mutants.out/log",
-        ] {
-            std::fs::write(d.join(f), "x").unwrap();
-        }
-        strip(&d);
-        assert!(!d.join("debug/incremental").exists());
-        assert!(!d
-            .join("x86_64-unknown-linux-gnu/debug/incremental")
-            .exists());
-        assert!(!d.join("mutants.out").exists());
-        assert!(!d
-            .join("llvm-cov-target/debug/deps/default_1.profraw")
-            .exists());
-        assert!(d.join("debug/deps/libfoo.rlib").exists());
-        assert!(d.join("debug/deps/foo.d").exists());
-        assert!(d.join("llvm-cov-target/debug/deps/libbar.rlib").exists());
+            "debug/build",
+            "debug/.fingerprint",
+            "debug/.cargo-lock",
+            "bench/build",
+            "bench/.cargo-build-lock",
+            "release/deps",
+            "release/.fingerprint",
+            "x86_64-unknown-linux-gnu/debug/deps",
+            "x86_64-unknown-linux-gnu/debug/.fingerprint",
+        ];
+        let mut got_sorted = got.clone();
+        got_sorted.sort();
+        let mut want_sorted: Vec<String> = want.iter().map(|w| w.to_string()).collect();
+        want_sorted.sort();
+        assert_eq!(got_sorted, want_sorted, "{got:?}");
     }
 
     fn entry(key: &str, bytes: u64, age: u64) -> Entry {
@@ -796,12 +1232,14 @@ mod tests {
             entry("b", 10, 100),
             entry("c", 10, 200),
         ];
-        assert!(lru_victims(&es, 30, None).is_empty());
-        assert_eq!(lru_victims(&es, 20, None), ["a"]);
-        assert_eq!(lru_victims(&es, 10, None), ["a", "c"]);
-        assert_eq!(lru_victims(&es, 0, None), ["a", "c", "b"]);
+        assert!(lru_victims(&es, 0, 30, None).is_empty());
+        assert_eq!(lru_victims(&es, 0, 20, None), ["a"]);
+        assert_eq!(lru_victims(&es, 0, 10, None), ["a", "c"]);
+        assert_eq!(lru_victims(&es, 0, 0, None), ["a", "c", "b"]);
         // the entry just saved stays
-        assert_eq!(lru_victims(&es, 20, Some("a")), ["c"]);
+        assert_eq!(lru_victims(&es, 0, 20, Some("a")), ["c"]);
+        // what is being written counts
+        assert_eq!(lru_victims(&es, 10, 30, None), ["a"]);
     }
 
     #[test]
@@ -833,19 +1271,44 @@ mod tests {
             trash: root.join("cache/trash"),
             max_bytes: u64::MAX,
             copy_limit: u64::MAX,
+            probe_timeout: Duration::from_secs(20),
         }
     }
 
+    /// A target with what cargo owns and what it does not.
+    fn make_target(ws: &Path) {
+        touch_files(
+            &ws.join("target"),
+            &[
+                "debug/.fingerprint/dep-1/x",
+                "debug/deps/lib.rlib",
+                "debug/incremental/x",
+                "tmp/x",
+                "nextest/y",
+            ],
+        );
+        std::fs::write(ws.join("target/debug/deps/lib.rlib"), "lib").unwrap();
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
+
     #[test]
-    fn a_saved_target_is_restored_without_what_was_stripped() {
+    fn a_saved_target_is_restored_without_what_cargo_does_not_own() {
         let t = tempfile::tempdir().unwrap();
         let s = settings(t.path());
         let (a, b) = (t.path().join("a"), t.path().join("b"));
-        std::fs::create_dir_all(a.join("target/debug/incremental")).unwrap();
-        std::fs::create_dir_all(a.join("target/debug/deps")).unwrap();
+        make_target(&a);
         std::fs::create_dir_all(&b).unwrap();
-        std::fs::write(a.join("target/debug/deps/lib.rlib"), "lib").unwrap();
-        std::fs::write(a.join("target/debug/incremental/x"), "inc").unwrap();
         let c = ctx();
         assert_eq!(restore(&c, &s, "k", &b), Restore::Miss);
         assert_eq!(save(&c, &s, "k", &a, 0), Save::Saved);
@@ -857,19 +1320,30 @@ mod tests {
             std::fs::read_to_string(b.join("target/debug/deps/lib.rlib")).unwrap(),
             "lib"
         );
+        assert!(b.join("target/debug/.fingerprint/dep-1/x").exists());
         assert!(!b.join("target/debug/incremental").exists());
+        assert!(!b.join("target/tmp").exists());
+        assert!(!b.join("target/nextest").exists());
         // not over a target that is there
         assert!(matches!(restore(&c, &s, "k", &b), Restore::Skipped(_)));
-        // no temporary entry is left
-        let names: Vec<String> = std::fs::read_dir(&s.dir)
-            .unwrap()
-            .flatten()
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(names, ["k"]);
+        // no temporary entry, and no lock file, is left
+        assert_eq!(names(&s.dir), ["k"]);
         let es = entries(&s.dir);
         assert_eq!(es.len(), 1);
         assert!(es[0].bytes > 0);
+    }
+
+    #[test]
+    fn a_target_without_what_cargo_owns_is_not_saved() {
+        let t = tempfile::tempdir().unwrap();
+        let s = settings(t.path());
+        let a = t.path().join("a");
+        touch_files(&a.join("target"), &["tmp/x"]);
+        assert!(matches!(save(&ctx(), &s, "k", &a, 0), Save::Skipped(_)));
+        // the files at the root alone are not an entry either
+        touch_files(&a.join("target"), &["CACHEDIR.TAG", ".rustc_info.json"]);
+        assert!(matches!(save(&ctx(), &s, "k", &a, 0), Save::Skipped(_)));
+        assert!(!s.dir.join("k").exists());
     }
 
     #[test]
@@ -877,8 +1351,8 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let mut s = settings(t.path());
         let a = t.path().join("a");
-        std::fs::create_dir_all(a.join("target")).unwrap();
-        std::fs::write(a.join("target/f"), vec![0u8; 8192]).unwrap();
+        make_target(&a);
+        std::fs::write(a.join("target/debug/deps/big"), vec![0u8; 8192]).unwrap();
         s.copy_limit = 0;
         let c = ctx();
         // on a file system that clones, this is saved; on one that does not, skipped
@@ -888,10 +1362,19 @@ mod tests {
             Save::Skipped(_) => assert!(!s.dir.join("k").exists()),
             Save::Exists => unreachable!(),
         }
-        let left: Vec<_> = std::fs::read_dir(&s.dir)
-            .map(|d| d.flatten().map(|e| e.file_name()).collect())
-            .unwrap_or_default();
-        assert!(left.iter().all(|n| !n.to_string_lossy().contains(".tmp-")));
+        assert!(names(&s.dir).iter().all(|n| !n.contains(".tmp-")));
+    }
+
+    fn fake_entry(s: &Settings, k: &str, bytes: u64, age: u64) {
+        let p = s.dir.join(k);
+        std::fs::create_dir_all(p.join("target")).unwrap();
+        std::fs::write(p.join(MARKER), bytes.to_string()).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(p.join(MARKER))
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(age))
+            .unwrap();
     }
 
     #[test]
@@ -899,34 +1382,127 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let mut s = settings(t.path());
         std::fs::create_dir_all(&s.dir).unwrap();
-        for (k, age) in [("old", 100u64), ("new", 10)] {
-            let p = s.dir.join(k);
-            std::fs::create_dir_all(p.join("target")).unwrap();
-            std::fs::write(p.join(MARKER), "1000").unwrap();
-            let f = std::fs::OpenOptions::new()
-                .write(true)
-                .open(p.join(MARKER))
-                .unwrap();
-            f.set_modified(SystemTime::now() - Duration::from_secs(age))
-                .unwrap();
-        }
+        fake_entry(&s, "old", 1000, 100);
+        fake_entry(&s, "new", 1000, 10);
+        // a temporary entry of a version that did not lock, old
         let dead = s.dir.join("zz.tmp-1-0");
         std::fs::create_dir_all(&dead).unwrap();
         std::fs::File::open(&dead)
             .unwrap()
             .set_modified(SystemTime::now() - 2 * STALE_TMP)
             .unwrap();
-        let live = s.dir.join("yy.tmp-2-0");
-        std::fs::create_dir_all(&live).unwrap();
+        // one that is young, without a lock
+        let young = s.dir.join("yy.tmp-2-0");
+        std::fs::create_dir_all(&young).unwrap();
         s.max_bytes = 1500;
         let c = ctx();
-        assert_eq!(prune(&c, &s, None), 1);
+        let p = prune(&c, &s, None);
+        assert_eq!(p.removed, 2, "{p:?}");
+        assert!(p.warnings.is_empty(), "{p:?}");
         assert!(!s.dir.join("old").exists());
         assert!(s.dir.join("new").exists());
         assert!(!dead.exists());
-        assert!(live.exists());
-        assert_eq!(clear(&c, &s), 2);
+        assert!(young.exists());
+        // a file that is not the cache's is not touched by clear
+        std::fs::write(s.dir.join("foreign.txt"), "x").unwrap();
+        std::fs::create_dir_all(s.dir.join("foreign-dir")).unwrap();
+        let p = clear(&c, &s);
+        // `new` and the young temporary entry (no writer holds it)
+        assert_eq!(p.removed, 2, "{p:?}");
         assert!(entries(&s.dir).is_empty());
+        assert!(!young.exists());
+        assert!(s.dir.join("foreign.txt").exists());
+        assert!(s.dir.join("foreign-dir").exists());
+    }
+
+    #[test]
+    fn a_temporary_entry_that_a_writer_holds_is_not_reaped() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = settings(t.path());
+        std::fs::create_dir_all(&s.dir).unwrap();
+        let tmp = s.dir.join("k.tmp-9-0");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("f"), "x").unwrap();
+        // old by every clock
+        std::fs::File::open(&tmp)
+            .unwrap()
+            .set_modified(SystemTime::now() - 2 * STALE_TMP)
+            .unwrap();
+        let lock = TmpLock::acquire(&tmp).unwrap();
+        let c = ctx();
+        assert_eq!(prune(&c, &s, None).removed, 0);
+        assert!(tmp.join("f").exists());
+        assert_eq!(clear(&c, &s).removed, 0);
+        assert!(tmp.join("f").exists());
+        // what it holds counts against the cap
+        fake_entry(&s, "e", 1000, 10);
+        s.max_bytes = 1000;
+        assert!(crate::reclaim::disk_usage(&tmp) > 0);
+        assert_eq!(prune(&c, &s, None).removed, 1);
+        assert!(!s.dir.join("e").exists());
+        // the writer is done: the lock goes and the next prune reaps it
+        drop(lock);
+        assert!(!lock_path(&tmp).exists());
+        assert!(tmp.exists());
+        // no lock file and old: reaped by age
+        assert_eq!(prune(&c, &s, None).removed, 1);
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn a_stale_unlocked_temporary_entry_is_reaped_with_its_lock_file() {
+        let t = tempfile::tempdir().unwrap();
+        let s = settings(t.path());
+        std::fs::create_dir_all(&s.dir).unwrap();
+        let tmp = s.dir.join("k.tmp-9-0");
+        std::fs::create_dir_all(&tmp).unwrap();
+        // the writer died: the file is there, nobody holds it. Young by the clock.
+        std::fs::write(lock_path(&tmp), "").unwrap();
+        // and a lock file whose directory is gone
+        let orphan = lock_path(&s.dir.join("j.tmp-9-1"));
+        std::fs::write(&orphan, "").unwrap();
+        let p = prune(&ctx(), &s, None);
+        assert_eq!(p.removed, 1, "{p:?}");
+        assert!(!tmp.exists());
+        assert!(!lock_path(&tmp).exists());
+        assert!(!orphan.exists());
+    }
+
+    #[test]
+    fn a_cache_still_over_its_cap_drops_the_entry_just_saved() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = settings(t.path());
+        std::fs::create_dir_all(&s.dir).unwrap();
+        fake_entry(&s, "other", 400, 100);
+        fake_entry(&s, "fresh", 1000, 0);
+        s.max_bytes = 500;
+        let p = prune(&ctx(), &s, Some("fresh"));
+        assert!(p.evicted_keep, "{p:?}");
+        assert_eq!(p.removed, 2);
+        assert_eq!(p.warnings.len(), 1);
+        assert!(entries(&s.dir).is_empty());
+        // within the cap: kept
+        fake_entry(&s, "fresh", 400, 0);
+        let p = prune(&ctx(), &s, Some("fresh"));
+        assert!(!p.evicted_keep && p.removed == 0, "{p:?}");
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_moved_to_the_trash_stays() {
+        let t = tempfile::tempdir().unwrap();
+        let mut s = settings(t.path());
+        std::fs::create_dir_all(&s.dir).unwrap();
+        fake_entry(&s, "old", 1000, 100);
+        fake_entry(&s, "new", 1000, 10);
+        // the trash is a file: nothing can be moved into it
+        std::fs::write(&s.trash, "").unwrap();
+        s.max_bytes = 1000;
+        let p = prune(&ctx(), &s, None);
+        assert_eq!(p.removed, 0, "{p:?}");
+        assert_eq!(p.warnings.len(), 1);
+        assert!(s.dir.join("old").join("target").is_dir());
+        assert_eq!(clear(&ctx(), &s).removed, 0);
+        assert!(s.dir.join("new").exists());
     }
 
     #[test]
@@ -934,7 +1510,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let s = settings(t.path());
         let (a, b) = (t.path().join("a"), t.path().join("b"));
-        std::fs::create_dir_all(a.join("target")).unwrap();
+        make_target(&a);
         std::fs::create_dir_all(&b).unwrap();
         let c = ctx();
         assert_eq!(save(&c, &s, "k", &a, 0), Save::Saved);
@@ -964,11 +1540,69 @@ mod tests {
         let s = Settings::from_ctx(&with("X", "1"), dir, false).unwrap();
         assert_eq!(s.dir, Path::new("/c/build"));
         assert_eq!(s.max_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(s.probe_timeout, Duration::from_secs(20));
         assert!(Settings::from_ctx(&with("X", "1"), dir, true).is_none());
         assert!(Settings::from_ctx(&with("LOCAL_CI_NO_BUILD_CACHE", "1"), dir, false).is_none());
         assert!(Settings::from_ctx(&with("LOCAL_CI_NO_BUILD_CACHE", "0"), dir, false).is_some());
         let s =
             Settings::from_ctx(&with("LOCAL_CI_BUILD_CACHE_MAX_GB", "0.5"), dir, false).unwrap();
         assert_eq!(s.max_bytes, 512 * 1024 * 1024);
+        // a cap of 0 is a cache that is off (but can still be looked at)
+        let zero = with("LOCAL_CI_BUILD_CACHE_MAX_GB", "0");
+        assert!(Settings::from_ctx(&zero, dir, false).is_none());
+        assert_eq!(Settings::at(&zero, dir).max_bytes, 0);
+        let s = Settings::from_ctx(
+            &with("LOCAL_CI_BUILD_CACHE_PROBE_TIMEOUT_SECS", "2.5"),
+            dir,
+            false,
+        )
+        .unwrap();
+        assert_eq!(s.probe_timeout, Duration::from_millis(2500));
+    }
+
+    fn fake_tool(dir: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let p = dir.join(name);
+        std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn the_toolchain_probe_is_bounded_and_does_not_install() {
+        let t = tempfile::tempdir().unwrap();
+        let bin = t.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        // prints what rustup would be told, to see it is told not to install
+        fake_tool(&bin, "rustc", "echo \"rustc 1 auto=$RUSTUP_AUTO_INSTALL\"");
+        fake_tool(&bin, "cargo", "echo cargo 1");
+        let path = format!("{}:/usr/bin:/bin", bin.display());
+        let c = ctx();
+        let (r, k) = toolchain(&c, t.path(), &path, Duration::from_secs(20)).unwrap();
+        assert_eq!(r, "rustc 1 auto=0");
+        assert_eq!(k, "cargo 1");
+        // too slow
+        fake_tool(&bin, "rustc", "sleep 30");
+        let started = Instant::now();
+        let e = toolchain(&c, t.path(), &path, Duration::from_millis(300)).unwrap_err();
+        assert!(e.contains("took more than"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // failing
+        fake_tool(&bin, "rustc", "exit 3");
+        assert!(toolchain(&c, t.path(), &path, Duration::from_secs(20)).is_err());
+        // missing
+        assert!(toolchain(&c, t.path(), "/nonexistent", Duration::from_secs(20)).is_err());
+    }
+
+    #[test]
+    fn the_files_that_choose_the_toolchain_are_in_the_key() {
+        let t = tempfile::tempdir().unwrap();
+        assert!(config_digests(t.path()).is_empty());
+        std::fs::create_dir_all(t.path().join(".cargo")).unwrap();
+        std::fs::write(t.path().join(".cargo/config.toml"), "a").unwrap();
+        std::fs::write(t.path().join("rust-toolchain.toml"), "b").unwrap();
+        let one = config_digests(t.path());
+        assert_eq!(one.len(), 2);
+        std::fs::write(t.path().join(".cargo/config.toml"), "c").unwrap();
+        assert_ne!(one, config_digests(t.path()));
     }
 }

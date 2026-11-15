@@ -410,8 +410,15 @@ fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
             if build {
                 let s = local_ci::build_cache::Settings::at(ctx, &dir);
                 let before = reclaim::disk_usage(&s.dir);
-                let n = local_ci::build_cache::clear(ctx, &s);
-                println!("removed {n} build cache entries, freed {}", size(before));
+                let cleared = local_ci::build_cache::clear(ctx, &s);
+                for w in &cleared.warnings {
+                    eprintln!("warning: build cache: {w}");
+                }
+                println!(
+                    "removed {} build cache entries, freed {}",
+                    cleared.removed,
+                    size(before)
+                );
             }
         }
     }

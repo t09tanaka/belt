@@ -227,6 +227,19 @@ struct BuildCacheRun {
     key: String,
     stat: crate::build_cache::JobCache,
     notes: Vec<String>,
+    /// false when the job goes without the cache (only `notes` is left)
+    active: bool,
+}
+
+impl BuildCacheRun {
+    fn off(note: String) -> Self {
+        BuildCacheRun {
+            key: String::new(),
+            stat: Default::default(),
+            notes: vec![note],
+            active: false,
+        }
+    }
 }
 
 /// What [`Runner::run_unit`] keeps of the shards of one split job until the job
@@ -2981,7 +2994,7 @@ impl<'a> Runner<'a> {
                 Map::new(),
             );
         }
-        let mut bc = self.build_cache_start(ws, w, job, &env_ctx);
+        let mut bc = self.build_cache_start(ws, w, job, &cm, &env_ctx);
         let job_timeout = Duration::from_secs_f64(
             60.0 * job.timeout_minutes.unwrap_or(self.opts.job_timeout_min),
         );
@@ -3498,7 +3511,7 @@ impl<'a> Runner<'a> {
         // the plan has.
         let mut build_cache = None;
         if let Some(b) = bc.as_mut() {
-            if matches!(outcome, Outcome::Pass) {
+            if b.active && matches!(outcome, Outcome::Pass) {
                 self.build_cache_save(b, ws);
             }
             if let Some(last) = steps.last_mut() {
@@ -3509,7 +3522,7 @@ impl<'a> Runner<'a> {
                     });
                 }
             }
-            build_cache = Some(b.stat.clone());
+            build_cache = b.active.then(|| b.stat.clone());
         }
         let mut result = finish(outcome, steps, t0);
         result.build_cache = build_cache;
@@ -3529,6 +3542,7 @@ impl<'a> Runner<'a> {
         ws: &Path,
         w: &Workflow,
         job: &Job,
+        cm: &Map<String, Value>,
         env_ctx: &Map<String, Value>,
     ) -> Option<BuildCacheRun> {
         use crate::build_cache as bc;
@@ -3543,12 +3557,42 @@ impl<'a> Runner<'a> {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         vars.extend(env_ctx.iter().map(|(k, v)| (k.clone(), expr::to_string(v))));
-        vars.extend(job.steps.iter().flat_map(|st| st.env.iter().cloned()));
+        // the steps' own variables, as they are when the step runs (a step
+        // that reads the output of an earlier one is not seen by the key)
+        for st in &job.steps {
+            // only the variables that reach the build are evaluated
+            let own: Vec<(String, String)> = st
+                .env
+                .iter()
+                .filter(|(k, _)| bc::affects_build(k))
+                .cloned()
+                .collect();
+            if own.is_empty() {
+                continue;
+            }
+            let mut into = env_ctx.clone();
+            if let Err(e) = Self::eval_env(self.ctx, &own, cm, &mut into, &[]) {
+                return Some(BuildCacheRun::off(format!(
+                    "build cache: skipped (env of a step: {e:#})"
+                )));
+            }
+            vars.extend(
+                own.iter()
+                    .filter_map(|(k, _)| Some((k.clone(), expr::to_string(into.get(k)?)))),
+            );
+        }
         let env = bc::build_env(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())), ws);
         if bc::moves_target(&env) {
             return None;
         }
-        let (rustc, cargo) = bc::toolchain(self.ctx, ws, &self.base_path)?;
+        let (rustc, cargo) = match bc::toolchain(self.ctx, ws, &self.base_path, s.probe_timeout) {
+            Ok(t) => t,
+            Err(why) => {
+                return Some(BuildCacheRun::off(format!(
+                    "build cache: skipped (toolchain: {why})"
+                )))
+            }
+        };
         let key = bc::key(&bc::KeyInputs {
             rustc,
             cargo,
@@ -3556,6 +3600,8 @@ impl<'a> Runner<'a> {
             locks: bc::lock_digests(ws),
             job: format!("{}#{}", w.file, job.id),
             env,
+            files: bc::config_digests(ws),
+            matrix: cm.get("matrix").map(|m| m.to_string()).unwrap_or_default(),
         });
         let mut run = BuildCacheRun {
             stat: bc::JobCache {
@@ -3564,6 +3610,7 @@ impl<'a> Runner<'a> {
             },
             key,
             notes: Vec::new(),
+            active: true,
         };
         let t = Instant::now();
         match bc::restore(self.ctx, s, &run.key, ws) {
@@ -3599,7 +3646,13 @@ impl<'a> Runner<'a> {
                     run.stat.key,
                     t.elapsed().as_secs_f64()
                 ));
-                bc::prune(self.ctx, s, Some(&run.key));
+                let pruned = bc::prune(self.ctx, s, Some(&run.key));
+                if pruned.evicted_keep {
+                    run.stat.saved = false;
+                }
+                for w in pruned.warnings {
+                    run.notes.push(format!("build cache: {w}"));
+                }
             }
             bc::Save::Exists => {}
             bc::Save::Skipped(why) => run.notes.push(format!("build cache: not saved ({why})")),

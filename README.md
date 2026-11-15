@@ -304,27 +304,49 @@ the workspace itself are built again: their sources are newer than the build.)
 `actions/cache` and `Swatinem/rust-cache` stay no-ops; this does their job.
 
 - **Key.** `rustc -vV` and `cargo -V` (asked in the job's worktree, so
-  `rust-toolchain.toml` counts), the OS and architecture, every `Cargo.lock` of
-  the checkout, the workflow file and job id (matrix values only where they
-  reach the environment), and the variables that change a build: `RUSTFLAGS`,
+  `rust-toolchain.toml` counts), the OS and architecture, the `Cargo.lock` of
+  the checkout's root (the cache is of the root crate only), the content of
+  `.cargo/config.toml` / `.cargo/config` and `rust-toolchain.toml` /
+  `rust-toolchain` of the checkout, the workflow file and job id, the values of
+  the job's matrix entry, and the variables that change a build as the job
+  evaluates them (`${{ }}` is resolved, in the workflow's, the job's and the
+  steps' `env`, and in the environment local-ci runs in): `RUSTFLAGS`,
   `RUSTDOCFLAGS`, `RUSTC_WRAPPER`, `RUSTUP_TOOLCHAIN`, `CARGO_*` (not
   `CARGO_BUILD_JOBS`, which is the job's CPU share, nor `CARGO_TERM_*`), and the
   coverage variables (`LLVM_PROFILE_FILE`, `CARGO_LLVM_COV_*`). The path of the
   worktree in a value is left out. A job that sets `CARGO_TARGET_DIR` or
   `CARGO_BUILD_TARGET_DIR` does not use the cache.
+- **Toolchain.** The two version commands run once per job, before its steps,
+  with `RUSTUP_AUTO_INSTALL=0` (a toolchain that is not installed is not
+  installed for the key) and together within 20 seconds
+  (`LOCAL_CI_BUILD_CACHE_PROBE_TIMEOUT_SECS`). If they fail or are too slow the
+  job goes without the cache and a note says so; it never fails or waits
+  because of it. A toolchain that a setup step of the job installs is not seen
+  by the key: the key holds the one that is there when the job starts.
 - **Restore.** Only when `target/` does not exist yet. The copy is a clone
-  where the file system has them (`cp -c` on APFS, `cp --reflink=always` on
-  btrfs, XFS): a 1.3 GB `target/` takes about a second. Without cloning, an
-  entry up to 512 MiB is copied (`LOCAL_CI_BUILD_CACHE_COPY_LIMIT_MB`); a larger
-  one is skipped and the job builds as before.
-- **Save.** Only when the job passed and the key has no entry yet. The entry is
-  written under a temporary name and renamed, so two jobs saving one key cannot
-  mix them; the job's own `target/` is not touched. `*/incremental`,
-  `*.profraw` and `mutants.out*` are left out.
-- **Limits.** Entries are in `<cache dir>/build/<key>/`. Once the cache is over
-  20 GB (`LOCAL_CI_BUILD_CACHE_MAX_GB`), the least recently used entries are
-  removed after a save. `local-ci cache status` lists them,
-  `local-ci cache prune --build` removes all.
+  where the file system has them (`cp -c` on an APFS volume, `cp --reflink=always`
+  on btrfs, XFS): a 1.3 GB `target/` takes about a second. Where the clone is
+  not certain (on macOS: not one APFS volume), an entry up to 512 MiB is copied
+  (`LOCAL_CI_BUILD_CACHE_COPY_LIMIT_MB`); a larger one is skipped and the job
+  builds as before.
+- **Save.** Only when the job passed and the key has no entry yet. An entry
+  keeps what cargo owns: for each profile directory (`debug/`, `release/`,
+  `<triple>/<profile>/`) its `deps`, `build`, `.fingerprint` and `.cargo-lock`,
+  and the two files at the root of `target/`. Everything else is left out
+  (`tmp`, nextest, `llvm-cov-target`, profile data, `criterion`,
+  `incremental`, the output of examples). The entry is written under a
+  temporary name while an exclusive lock is held on a lock file beside it, and
+  renamed, so two jobs saving one key cannot mix them; the job's own `target/`
+  is not touched.
+- **Limits.** Entries are in `<cache dir>/build/<key>/`. Once the cache (the
+  entries being written count) is over 20 GB (`LOCAL_CI_BUILD_CACHE_MAX_GB`),
+  the least recently used entries are removed after a save; when that is not
+  enough the new entry goes too, with a note. `LOCAL_CI_BUILD_CACHE_MAX_GB=0`
+  turns the cache off. A temporary entry is removed only when its lock can be
+  taken, that is, when its writer is gone. Entries are never deleted in place:
+  they are moved to the trash, and one that cannot be moved stays, with a
+  warning. `local-ci cache status` lists the entries, `local-ci cache prune --build`
+  removes them all (and nothing else in the directory).
 - **Off.** `local-ci run --no-build-cache`, or `LOCAL_CI_NO_BUILD_CACHE=1`.
 - **Failures.** A restore or save that fails never fails the job: a note on its
   last step says why. The job's own steps are not changed.
