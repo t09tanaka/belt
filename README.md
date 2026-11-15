@@ -59,6 +59,8 @@ Or download a binary from the [releases](https://github.com/t09tanaka/local-ci/r
 | `local-ci plan` | Show the workflows, units and setup steps that would run. Runs nothing. |
 | `local-ci run` | Run them and report. Exit code 0 = success (or `no_work`: the changes trigger no workflow), 1 = failure, 2 = error (could not run, or the result lacks something the plan expects), 3 = `incomplete` (what ran passed, but steps or workflows that local-ci cannot reproduce were left out, so it is not a pass; the commit status is `error`), 130 = interrupted. |
 | `local-ci status` | Record the last run's result as the `local-ci` commit status (for a commit you have pushed since). |
+| `local-ci cache status` | Show the disk space each part of the cache directory takes, and how many worktrees are in use, kept, or left by runs that are gone. |
+| `local-ci cache prune` | Remove the worktrees left by runs that are gone and empty the trash, before returning. `--kept` also removes the ones kept with `run --keep`. |
 
 Common options (`plan` and `run`):
 
@@ -525,6 +527,27 @@ The cache directory is `~/Library/Caches/local-ci` on macOS and
 runs of each repository (`runs/<repo>/<time>-<sha>/` with one log per step and
 `result.json`), the results that may be reused (`results/<repo>/`, a day at
 most), and the locks.
+
+Nothing a job builds is kept from one run to the next: each run checks the
+commit out afresh, and a worktree holds whatever the jobs built in it (a
+`target` directory, `node_modules`), so a run removes its worktrees, its
+copies and its tools directory (`wt/<sha>-<pid>.tools`) when it ends, whether
+the jobs passed, failed, or the run was stopped with Ctrl-C, `SIGTERM` or
+`SIGHUP`. The directories are moved to `trash/` and deleted in the
+background.
+
+A run that is killed outright (`SIGKILL`, a crash, a power loss) cannot do
+that. Each run holds a lock on `wt/.owner-<pid>` while it lives, and every run
+starts by removing the entries whose owner is gone, by dropping their
+registration from the repository they belong to (`git worktree prune`) and by
+deleting what is still in `trash/`. An entry is removed only when its owner
+is known to be gone: its owner file is no longer locked, or, for an entry made
+by a version before the owner files, no process has the pid in its name. Age
+is not looked at, and the entries of a run that is alive, in another terminal
+too, are left alone. Worktrees kept with `--keep` stay until
+`local-ci cache prune --kept`. `local-ci cache status` shows what the
+directory holds, and `local-ci cache prune` does the same removal without a
+run and waits for the deletion.
 
 ## Development
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Stop leaking worktrees in the cache directory. A run now also removes its worktrees, copies and tools directory when it is stopped with `SIGTERM` or `SIGHUP` (before, only Ctrl-C was handled, and only once the checkout was made) or when it panics. Each run holds a lock on `wt/.owner-<pid>`, and every run starts by removing the entries whose owner is gone (killed, crashed), dropping their `git worktree` registration and deleting what earlier deletions left in `trash/`. Entries of a live run are never touched; age is not used.
+- Deletions run in their own process group, so stopping local-ci's group no longer stops them halfway, and a tree with read-only directories is deleted too. The tools directory is deleted in the background like the worktrees.
+- Add `local-ci cache status` and `local-ci cache prune [--kept]`.
+- Worktrees kept with `--keep` are marked as kept and stay until `local-ci cache prune --kept`. Worktrees kept by an earlier version carry no mark: they are removed by the next run once the process that made them is gone.
+- `Observer::executing` is now called before the worktree is created, so a signal during the checkout is handled.
+
 ## [0.13.0] - Unreleased
 
 - Execute frozen tasks from verified captured workspaces with source-aware Git HEAD/index checks and recursive submodule payload verification.
