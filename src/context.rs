@@ -154,6 +154,8 @@ impl CancelHandle {
         ctx: &ExecContext,
         projects: &[String],
     ) -> Vec<crate::cleanup::CleanupIncomplete> {
+        #[cfg(test)]
+        crate::exec::finalization_test::inspect("resource cleanup");
         let unverified = self.0.unverified_compose.lock().unwrap().clone();
         let allowed: Vec<String> = projects
             .iter()

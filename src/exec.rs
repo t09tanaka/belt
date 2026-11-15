@@ -1722,6 +1722,8 @@ impl<'a> Runner<'a> {
                 break;
             }
         }
+        // Stop script producers before observing the prepared artifact tree.
+        drop(native_scope);
         let artifacts = if out.iter().all(|r| r.outcome == Outcome::Pass) {
             setup::artifact_digests(
                 &self.wt,
@@ -3441,6 +3443,8 @@ impl<'a> Runner<'a> {
                 }
             }
         }
+        // A surviving script must not recreate daemon resources after cleanup.
+        drop(native_scope);
         self.stop_services(&names, &mut steps);
         let cleanup = self.ctx.cancel.cleanup_projects(self.ctx, &projects);
         self.record_cleanup_warnings(&mut steps, cleanup);
@@ -4114,6 +4118,35 @@ fn ensure_container_id(id: &str) -> Result<()> {
         "Docker did not acknowledge a complete container ID"
     );
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod finalization_test {
+    type Probe = Box<dyn FnMut(&str)>;
+    std::thread_local! {
+        static PROBE: std::cell::RefCell<Option<Probe>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(crate) fn inspect(boundary: &str) {
+        PROBE.with_borrow_mut(|probe| {
+            if let Some(probe) = probe {
+                probe(boundary);
+            }
+        });
+    }
+    pub(crate) fn observe<T>(probe: impl FnMut(&str) + 'static, action: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PROBE.with_borrow_mut(|probe| *probe = None);
+            }
+        }
+        PROBE.with_borrow_mut(|slot| {
+            assert!(slot.is_none());
+            *slot = Some(Box::new(probe));
+        });
+        let _reset = Reset;
+        action()
+    }
 }
 
 #[cfg(test)]

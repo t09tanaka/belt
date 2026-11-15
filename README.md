@@ -917,8 +917,11 @@ or preparation recipe finishes. This pins the identity used by cancellation:
 groups are untracked before the leader is reaped, including on error and unwind.
 Script-pipe writers are stopped and joined on every return path. A background
 server may continue into subsequent steps of the same entry; draining that entry
-does not signal groups owned by another entry. Holding completed leaders uses
-kernel child slots for the entry lifetime, rather than silently narrowing the
+does not signal groups owned by another entry. The entry drains its native
+scripts before service/Compose cleanup, and a preparation recipe drains them
+before computing artifact digests. This prevents a still-running script from
+recreating resources after cleanup or mutating a receipt's artifact snapshot.
+Holding completed leaders uses kernel child slots for the entry lifetime, rather than silently narrowing the
 accepted step count.
 
 This native-group boundary is not a physical stop proof for an entire execution.

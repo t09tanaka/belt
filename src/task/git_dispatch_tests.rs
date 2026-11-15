@@ -487,10 +487,8 @@ fn git_derived_uses_original_commit_not_live_workflow_and_rejects_other_commit()
 
 #[test]
 fn git_derived_native_background_remains_for_next_step_and_drains_with_entry() {
-    use std::io::Read;
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::OpenOptionsExt;
-    use std::time::{Duration, Instant};
     let old = "      - id: out\n        run: |\n          test \"$TAG\" = verified";
     let new = r#"      - name: start background
         run: |
@@ -510,40 +508,27 @@ fn git_derived_native_background_remains_for_next_step_and_drains_with_entry() {
     let fifo = ws.root.join("witness");
     let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
-    let mut reader = std::fs::OpenOptions::new()
+    let reader = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK)
         .open(fifo)
         .unwrap();
     let ctx = f.ctx.fresh_attempt();
-    let result = crate::execute_git_dispatch(
-        &ctx,
-        &f.plan,
-        &dispatch,
-        &inputs,
-        &f.facts,
-        None,
-        &ws,
-        f.opts(),
-    )
+    let result = observe_drained_witness("resource cleanup", ctx.cancel.clone(), reader, || {
+        crate::execute_git_dispatch(
+            &ctx,
+            &f.plan,
+            &dispatch,
+            &inputs,
+            &f.facts,
+            None,
+            &ws,
+            f.opts(),
+        )
+    })
     .unwrap();
     assert_eq!(result.outcomes[0].status, JobStatus::Success);
     assert_eq!(ctx.cancel.native_group_count(), 0);
-    let until = Instant::now() + Duration::from_secs(3);
-    let mut bytes = Vec::new();
-    loop {
-        let mut b = [0; 16];
-        match reader.read(&mut b) {
-            Ok(0) => break,
-            Ok(n) => bytes.extend_from_slice(&b[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                assert!(Instant::now() < until, "background still owns witness pipe");
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(e) => panic!("owned witness read: {e}"),
-        }
-    }
-    assert_eq!(bytes, b"ru");
 }
 
 #[test]
@@ -582,4 +567,91 @@ fn git_attempt_cleanup_failure_keeps_the_actual_result_and_pending_port() {
         std::fs::read_to_string(ws.root.join("marker")).unwrap(),
         dispatch.index().to_string()
     );
+}
+
+/// Observe actual resource/receipt boundaries with a kernel pipe witness.
+/// The producer reaches the second-step handshake before it can be drained.
+fn observe_drained_witness<T>(
+    boundary: &'static str,
+    cancel: crate::CancelHandle,
+    mut reader: std::fs::File,
+    action: impl FnOnce() -> T,
+) -> T {
+    use std::io::Read;
+    use std::time::{Duration, Instant};
+    let seen = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = seen.clone();
+    let result = crate::exec::finalization_test::observe(
+        move |phase| {
+            if phase != boundary || observed.replace(true) {
+                return;
+            }
+            assert_eq!(
+                cancel.native_group_count(),
+                0,
+                "live native group at {boundary}"
+            );
+            let until = Instant::now() + Duration::from_secs(3);
+            let mut bytes = Vec::new();
+            loop {
+                let mut buf = [0; 16];
+                match reader.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => bytes.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < until,
+                            "live background producer at {boundary}"
+                        );
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(e) => panic!("owned witness read: {e}"),
+                }
+            }
+            assert_eq!(bytes, b"ru", "both step handshakes must precede {boundary}");
+        },
+        action,
+    );
+    assert!(seen.get(), "actual {boundary} boundary was not reached");
+    result
+}
+
+#[test]
+fn recipe_drains_background_before_observing_artifact_digests() {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let f = Fixture::with_workflow(
+        "on: push\njobs:\n  prepare:\n    runs-on: fixture\n    steps:\n      - run: npm ci\n",
+    );
+    let ws = f.ws("recipe-producer");
+    let fifo = ws.root.join("witness");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(fifo)
+        .unwrap();
+    let mut recipe = crate::setup::derive_setup_recipe(&f.plan, &f.plan.tasks[0].id).unwrap();
+    assert_eq!(recipe.steps.len(), 1);
+    recipe.steps[0].run = r#"(exec 9>"$GITHUB_WORKSPACE/witness"; printf r >&9; while [ ! -f "$GITHUB_WORKSPACE/proceed" ]; do sleep 0.01; done; printf u >&9; touch "$GITHUB_WORKSPACE/used"; while :; do sleep 1; done) &"#.into();
+    let mut next = recipe.steps[0].clone();
+    next.id = "handshake-and-artifact".into();
+    next.run = r#"touch "$GITHUB_WORKSPACE/proceed"; for n in $(seq 1 200); do test ! -f "$GITHUB_WORKSPACE/used" || break; sleep 0.01; done; test -f "$GITHUB_WORKSPACE/used"; mkdir prepared-artifact; echo done > prepared-artifact/content"#.into();
+    recipe.steps.push(next);
+    let runner = Runner::new(&f.ctx, &f.plan, &ws, f.opts()).unwrap();
+    runner.prepare_tools().unwrap();
+    let result = observe_drained_witness("artifact capture", f.ctx.cancel.clone(), reader, || {
+        runner.run_recipe(&recipe, "fixture-key")
+    })
+    .unwrap();
+    assert!(result
+        .steps
+        .iter()
+        .all(|step| step.outcome == crate::exec::Outcome::Pass));
+    assert!(result
+        .receipt
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.path == "prepared-artifact"));
 }
