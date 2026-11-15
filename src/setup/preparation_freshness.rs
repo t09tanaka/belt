@@ -126,5 +126,9 @@ mod tests {
         assert_eq!(p.deadline(1000, 1000), None);
         p.verification_started_monotonic_ms = Some(5000);
         assert_eq!(p.deadline(1000, 1009), Some(1010));
+        // Millisecond timestamps may put a complete tiny verification and
+        // the final observation at exactly the same instant.
+        p.verification_started_monotonic_ms = Some(p.observed_monotonic_ms);
+        assert_eq!(p.deadline(1000, 1009), Some(1010));
     }
 }
