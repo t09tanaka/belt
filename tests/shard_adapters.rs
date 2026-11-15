@@ -1,8 +1,9 @@
 //! The adapters against real runners: `examples/sharding` holds a small Rust
 //! crate and Node test suites (Vitest, Jest). Each runner lists its tests, the
 //! tests are partitioned, every shard is run and the results are merged. The
-//! Node suites need `npm ci` in `examples/sharding/node` and Node on the PATH;
-//! without them the tests fail rather than skip.
+//! Node suites need Node on the PATH; the tests run `npm ci` in
+//! `examples/sharding/node` when `node_modules` is missing or stale, and fail
+//! rather than skip when npm is absent.
 
 #![allow(clippy::disallowed_methods)] // the tests read the environment of the run
 
@@ -20,6 +21,13 @@ fn example(name: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("examples/sharding")
         .join(name)
+}
+
+/// The Node example with its dependencies installed (see `ensure_npm_deps`).
+fn node_example() -> PathBuf {
+    let dir = example("node");
+    common::ensure_npm_deps(&dir);
+    dir
 }
 
 fn ctx(extra: &[(&str, &str)]) -> ExecContext {
@@ -142,7 +150,7 @@ fn cargo_lists_the_same_tests_whatever_its_colour_and_quiet_settings() {
 
 #[test]
 fn vitest_shards_cover_every_file_once() {
-    let dir = example("node");
+    let dir = node_example();
     let a = Vitest::new("2.1.9", dir.to_str().unwrap(), &[], Safety::default());
     let (d, _, m) = drive(&a, &ctx(&[]), &dir, 2);
     assert_eq!(
@@ -161,7 +169,7 @@ fn vitest_shards_cover_every_file_once() {
 
 #[test]
 fn jest_shards_cover_every_file_once() {
-    let dir = example("node");
+    let dir = node_example();
     let a = Jest::new("29.7.0", dir.to_str().unwrap(), &[], Safety::default());
     let (d, _, m) = drive(&a, &ctx(&[]), &dir, 2);
     assert_eq!(
@@ -180,7 +188,7 @@ fn jest_shards_cover_every_file_once() {
 
 #[test]
 fn the_runners_own_shard_feature_covers_every_file_once() {
-    let dir = example("node");
+    let dir = node_example();
     let root = dir.to_str().unwrap();
     let ctx = ctx(&[]);
     for (name, a) in [

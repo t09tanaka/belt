@@ -2586,6 +2586,7 @@ impl<'a> Runner<'a> {
             stdout: log.clone().unwrap_or_default(),
             stderr: String::new(),
             success: ran.outcome == Outcome::Pass && ran.exit == Some(0),
+            exit: ran.exit,
         };
         let mut o = adapter.collect_given(&job.id, &task.id, &out, &ts.tests);
         o.parsed &= log.is_some();

@@ -63,3 +63,59 @@ pub fn private_docker_path(home: &Path, path: &str) -> String {
     }
     format!("{}:{path}", bin.display())
 }
+
+/// Install the npm dependencies of an example directory when `node_modules`
+/// has no complete install (`node_modules/.package-lock.json`) newer than
+/// `package-lock.json`, as CI does with `npm ci`.
+/// Tests run in parallel, so the install is serialised by a file lock and
+/// re-checked under it: one test installs, the others wait and reuse it.
+/// Without npm this panics with the fix; it never skips, which would weaken
+/// the gate.
+pub fn ensure_npm_deps(dir: &Path) {
+    use fs2::FileExt;
+    // npm writes `node_modules/.package-lock.json` last, so a failed or
+    // interrupted `npm ci` leaves it missing (stale) rather than looking fresh.
+    let marker = dir.join("node_modules").join(".package-lock.json");
+    let fresh = || {
+        let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+        let Some(m) = mtime(&marker) else {
+            return false;
+        };
+        ["package-lock.json", "package.json"]
+            .iter()
+            .filter_map(|f| mtime(&dir.join(f)))
+            .all(|src| m >= src)
+    };
+    if fresh() {
+        return;
+    }
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".npm-ci.lock"))
+        .expect("cannot create the npm install lock");
+    lock.lock_exclusive()
+        .expect("cannot take the npm install lock");
+    if !fresh() {
+        let out = std::process::Command::new("npm")
+            .args(["ci", "--no-audit", "--no-fund"])
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|e| {
+                panic!(
+                    "npm is required for the vitest shard tests; install Node or run \
+                     `npm ci` in {} ({e})",
+                    dir.display()
+                )
+            });
+        assert!(
+            out.status.success(),
+            "`npm ci` in {} failed ({}):\n{}",
+            dir.display(),
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let _ = lock.unlock();
+}

@@ -167,6 +167,8 @@ pub struct CommandOutput {
     pub stdout: String,
     pub stderr: String,
     pub success: bool,
+    /// The exit code, when the process ended with one.
+    pub exit: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -771,6 +773,7 @@ mod tests {
             stdout: String::new(),
             stderr: String::new(),
             success: true,
+            exit: None,
         };
         let a = f.collect_given("j", "s", &out, &["a".to_string()]);
         let b = f.collect("j", "s", &out);
@@ -1309,7 +1312,8 @@ mod tests {
             .discover(&CommandOutput {
                 stdout: String::new(),
                 stderr: String::new(),
-                success: true
+                success: true,
+                exit: Some(0),
             })
             .is_err());
         let shard = Shard {
@@ -1325,7 +1329,8 @@ mod tests {
                 &CommandOutput {
                     stdout: String::new(),
                     stderr: String::new(),
-                    success: true
+                    success: true,
+                    exit: Some(0),
                 }
             )
             .shard_id,
