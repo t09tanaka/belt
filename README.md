@@ -70,8 +70,14 @@ saturated.
   nothing new passes it after it has waited `backfill_max_wait_secs`
   (default 5 min), or at once when it is `--front`. `--front` lets a human
   at the keyboard jump ahead.
-- **Nesting-safe.** A gated command that itself calls `task-traffic-controller exec`
-  inherits the outer lease instead of deadlocking.
+- **Nesting is gated too.** A gated command that itself calls
+  `task-traffic-controller exec` (a CI runner that wraps each of its
+  steps, a `make` whose recipes do) gets an entry of its own for each
+  call, queued against the same budget as a child of the outer entry. A
+  child uses up its parent's weight first and is charged only for what
+  goes beyond it, and what it runs is measured on the child, not on the
+  parent as well. It cannot deadlock: the first child of a parent that
+  has none running always starts (see "Nested commands").
 - **Async jobs that die with their waiter.** `submit` returns a job id as
   soon as the job is queued; `wait` collects the log and exit code later. A job nobody is
   waiting on is cancelled after a grace period, so a crashed caller never
@@ -99,7 +105,7 @@ Intel) and Linux (x86_64 / arm64) are attached to each
 ### `task-traffic-controller exec`
 
 ```
-task-traffic-controller exec [--weight N] [--front] [--key K] [--label TEXT] -- <command> [args...]
+task-traffic-controller exec [--weight N] [--front] [--key K] [--label TEXT] [--nested admit|inherit] -- <command> [args...]
 ```
 
 Waits until admitted, then runs `<command>` with inherited stdin/stdout/
@@ -119,6 +125,12 @@ if you need one.
   the run. `status` and `top` show it instead of the command line. It is
   stored in the ledger as an optional field and is not part of the history
   key. Also accepted by `submit` and `estimate`.
+- `--nested admit|inherit` (or `TASK_TRAFFIC_CONTROLLER_NESTED`; the flag
+  wins) says what happens when this `exec` is called from inside another
+  gated command. `admit`, the default, queues it as a child of the outer
+  entry. `inherit` runs it at once under the outer entry, with no entry,
+  weight or history of its own, as every nested `exec` did before 0.9.
+  See "Nested commands".
 
 Wrapped commands are keyed by the heavy command inside them, so a
 one-off shell line still learns from earlier runs:
@@ -215,7 +227,11 @@ entry at its weight or at that measurement, whichever is more. `idle`
 marks an entry that has run for 5 minutes and is using almost nothing:
 usually a development server or a watch mode, which holds its weight
 until it exits (see "What not to wrap"). `[backfill]` marks an entry
-that started ahead of a head that did not fit. `--json`
+that started ahead of a head that did not fit. `[in 48190]` marks an
+entry nested in the running entry with that pid; it is counted inside
+that entry's share of the budget first (see "Nested commands"), and in
+`--json` and `inspect --json` it carries the outer entry's id as
+`parent`. `--json`
 dumps the ledger. Dead entries are reaped first, so the view is accurate
 without a daemon.
 
@@ -619,6 +635,43 @@ repository is the main worktree (`git rev-parse --git-common-dir`), so
 every linked worktree of a project shares one history; the subdirectory
 (`git rev-parse --show-prefix`) keeps `api/` and `client/` of one monorepo
 apart.
+
+### Nested commands
+
+A command that runs under `exec` has `TASK_TRAFFIC_CONTROLLER_LEASE` in
+its environment. An `exec` that finds a live lease there registers as a
+*child* of that entry and is admitted like any other command, with its
+own weight, measurement and history. Three rules make that safe.
+
+- **A child takes from its parent's share first.** A running entry and
+  everything nested in it take `max(weight, own use + what its running
+  children take)` from the budget. With an outer command at weight 4,
+  two children at weight 2 cost nothing more; a third makes the group
+  take 6. An outer command that only starts and waits for its steps can
+  declare `--weight 1`: while a step runs, the group takes what the step
+  takes.
+- **Nothing is measured twice.** The sampler of the outer entry leaves
+  out the process trees of its children, which their own entries
+  measure.
+- **The first child always starts.** A command that waits for its child
+  cannot finish, so the budget it holds would never come back. When no
+  child of a parent is running, the first one in the queue starts
+  whatever the budget and the live guards say. A command that runs its
+  nested commands one at a time therefore never waits for them, exactly
+  as before 0.9, and each running parent can take the budget over by at
+  most one child. Further children wait until they fit. Waiting children
+  are ahead of every top-level entry, `--front` included, since the
+  budget their parent holds comes back only after they have run.
+
+An `exec` whose lease is stale (the outer command is gone) is gated as a
+top-level command, and a child whose parent finishes first carries on as
+one. A caller inside a managed run whose supervisor has died still runs
+under that run without an entry, as before.
+
+`--nested inherit`, or `TASK_TRAFFIC_CONTROLLER_NESTED=inherit` in the
+environment of the outer command, restores the old behaviour for
+everything below it: the nested command runs at once and is charged to
+the outer entry through its measurement.
 
 ### Idle entries are charged their weight
 

@@ -372,6 +372,202 @@ fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
     );
 }
 
+/// The shape that ran nine jobs of a CI runner at once: a gated command
+/// that wraps each of its own steps in `exec`. The steps queue against the
+/// same budget as children of the outer entry.
+#[test]
+fn nested_execs_that_do_not_fit_together_run_one_after_another() {
+    let env = TestEnv::new()
+        .with_config("budget = 4\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
+    let dir = env.marker_dir();
+    let (gate_a, gate_b) = (Gate::new(&dir, "a"), Gate::new(&dir, "b"));
+    let step = |name: &str| {
+        format!(
+            "{BIN} exec --weight 3 -- {} &\n",
+            script_file(&dir, name, &marked_gate(&dir, name))
+        )
+    };
+    let outer = format!("{}{}wait\n", step("a"), step("b"));
+    let mut parent = env.spawn_exec(&["--weight", "1"], &script_file(&dir, "outer", &outer));
+    // One step runs, the other waits; both are entries nested in the outer.
+    assert!(
+        wait_until(Duration::from_secs(10), || {
+            let nested = nested_entries(&env);
+            nested.len() == 2 && nested.iter().filter(|e| e["state"] == "running").count() == 1
+        }),
+        "{:?}",
+        env.entries()
+    );
+    let entries = env.entries();
+    let outer_entry = entries.iter().find(|e| e["parent"].is_null()).unwrap();
+    for e in nested_entries(&env) {
+        assert_eq!(e["parent"], outer_entry["id"], "{entries:?}");
+    }
+    let status = stdout(&env.run(&["status"]));
+    assert!(
+        status.contains(&format!("[in {}] ", outer_entry["pid"])),
+        "{status}"
+    );
+    // The outer's weight of 1 is inside the step's 3, not on top of it.
+    assert!(status.contains("budget 3/4 used"), "{status}");
+    let inspect: serde_json::Value =
+        serde_json::from_slice(&env.run(&["inspect", "--json"]).stdout).unwrap();
+    assert_eq!(
+        inspect["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["parent"] == outer_entry["id"])
+            .count(),
+        2,
+        "{inspect}"
+    );
+    // The second stays queued for as long as the first holds its slot.
+    let (first, second) = if dir.join("a.start").exists() {
+        ("a", "b")
+    } else {
+        ("b", "a")
+    };
+    assert!(!dir.join(format!("{second}.start")).exists());
+    if first == "a" {
+        gate_a.release();
+    } else {
+        gate_b.release();
+    }
+    assert!(wait_until(Duration::from_secs(10), || dir
+        .join(format!("{second}.start"))
+        .exists()));
+    gate_a.release();
+    gate_b.release();
+    assert!(parent.wait().unwrap().success());
+    assert!(
+        read_ns(&dir.join(format!("{second}.start")))
+            >= read_ns(&dir.join(format!("{first}.released.end"))),
+        "the steps overlapped"
+    );
+    assert_eq!(history_lines(&env), 3);
+    assert!(env.entries().is_empty());
+}
+
+/// A command that waits for its nested command never gets its budget back
+/// by waiting: the nested one starts although nothing is free, and ahead
+/// of a top-level entry that queued before it.
+#[test]
+fn a_nested_exec_starts_when_the_budget_is_full_and_someone_queued_first() {
+    let env = TestEnv::new()
+        .with_config("budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
+    let dir = env.marker_dir();
+    let (hog_gate, go) = (Gate::new(&dir, "hog"), Gate::new(&dir, "go"));
+    let mut hog = env.spawn_exec(&["--weight", "1"], &gated_script(&dir, "hog"));
+    let outer = format!(
+        "{}\n{BIN} exec --weight 2 -- {}\n",
+        gated_script(&dir, "go"),
+        script_file(&dir, "step", &marker_script(&dir, "step", "0"))
+    );
+    let mut parent = env.spawn_exec(&["--weight", "1"], &script_file(&dir, "outer", &outer));
+    assert!(wait_until(Duration::from_secs(10), || {
+        env.entries()
+            .iter()
+            .filter(|e| e["state"] == "running")
+            .count()
+            == 2
+    }));
+    // Queued before the nested step exists, and needing the whole budget.
+    let mut big = env.spawn_exec(&["--weight", "2"], &marker_script(&dir, "big", "0"));
+    assert!(wait_until(Duration::from_secs(10), || env.entries().len() == 3));
+    go.release();
+    // The outer command finishes while the hog still holds its slot.
+    assert!(parent.wait().unwrap().success());
+    assert!(dir.join("step.end").exists());
+    assert!(!dir.join("big.start").exists());
+    hog_gate.release();
+    assert!(hog.wait().unwrap().success());
+    assert!(big.wait().unwrap().success());
+    assert!(read_ns(&dir.join("big.start")) >= read_ns(&dir.join("step.end")));
+}
+
+/// What a nested entry runs is measured on that entry, not also on the
+/// one it is nested in.
+#[test]
+fn what_a_nested_exec_uses_is_not_measured_on_its_parent_too() {
+    let env = TestEnv::new()
+        .with_config("budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
+    let dir = env.marker_dir();
+    // Three workers each burning 6 s of their own CPU time.
+    let burn = "for i in 1 2 3; do perl -e '1 while (times)[0] < 6' & done; wait\n";
+    let outer = format!(
+        "{BIN} exec --weight 1 -- {}\n",
+        script_file(&dir, "burn", burn)
+    );
+    let mut parent = env.spawn_exec(&["--weight", "1"], &script_file(&dir, "outer", &outer));
+    let using = |e: &serde_json::Value| e["using"].as_f64().unwrap_or(0.0);
+    assert!(
+        wait_until(Duration::from_secs(30), || {
+            nested_entries(&env).iter().any(|e| using(e) >= 1.5)
+        }),
+        "the nested tree was never measured: {:?}",
+        env.entries()
+    );
+    // The outer's own sampler has had time to see the same processes.
+    let on_parent = wait_until(Duration::from_millis(2500), || {
+        env.entries()
+            .iter()
+            .any(|e| e["parent"].is_null() && using(e) >= 1.0)
+    });
+    let entries = env.entries();
+    assert!(parent.wait().unwrap().success());
+    assert!(!on_parent, "charged twice: {entries:?}");
+}
+
+/// `--nested inherit` (or the environment variable, for a whole tree) is
+/// what every nested `exec` did before: it runs at once under the outer
+/// entry and is not a run of its own.
+#[test]
+fn nested_inherit_runs_at_once_under_the_outer_entry() {
+    let env = TestEnv::new().with_config("budget = 1\n");
+    let nested = format!("{BIN} exec --weight 1 -- echo nested-ok");
+    let by_flag = format!("{BIN} exec --nested inherit --weight 1 -- echo nested-ok");
+    for (var, inner) in [(None, &by_flag), (Some("inherit"), &nested)] {
+        let mut cmd = env.cmd();
+        if let Some(v) = var {
+            cmd.env("TASK_TRAFFIC_CONTROLLER_NESTED", v);
+        }
+        let before = history_lines(&env);
+        let out = cmd
+            .args(["exec", "--weight", "1", "--", "sh", "-c", inner])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(stdout(&out), "nested-ok\n");
+        assert_eq!(history_lines(&env), before + 1, "{var:?}");
+    }
+    // The flag wins over the variable.
+    let out = env
+        .cmd()
+        .env("TASK_TRAFFIC_CONTROLLER_NESTED", "inherit")
+        .args(["exec", "--weight", "1", "--", "sh", "-c"])
+        .arg(format!(
+            "{BIN} exec --nested admit --weight 1 -- echo nested-ok"
+        ))
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert_eq!(history_lines(&env), 4);
+    // Anything else is refused before the command runs.
+    let out = env.run(&["exec", "--nested", "off", "--", "echo", "no"]);
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(stdout(&out), "");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("`admit` or `inherit`"),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn front_jumps_the_queue() {
     let env = TestEnv::new().with_config("budget = 1\n");
@@ -479,11 +675,35 @@ fn killed_waiting_head_is_reaped_and_queue_moves_on() {
     assert!(!env.state().join("leases").read_dir().unwrap().any(|_| true));
 }
 
+const BIN: &str = env!("CARGO_BIN_EXE_task-traffic-controller");
+
+/// Write `body` as a shell script in `dir` and return the command line
+/// that runs it, so nested command lines need no quoting.
+fn script_file(dir: &Path, name: &str, body: &str) -> String {
+    let p = dir.join(format!("{name}.sh"));
+    fs::write(&p, body).unwrap();
+    format!("sh {}", p.display())
+}
+
+fn history_lines(env: &TestEnv) -> usize {
+    fs::read_to_string(env.state().join("history.jsonl"))
+        .map(|h| h.lines().count())
+        .unwrap_or(0)
+}
+
+/// The entries nested in another, as `status --json` shows them.
+fn nested_entries(env: &TestEnv) -> Vec<serde_json::Value> {
+    env.entries()
+        .into_iter()
+        .filter(|e| e["parent"].is_string())
+        .collect()
+}
+
 #[test]
-fn nested_exec_inherits_lease_and_bogus_lease_is_gated() {
+fn nested_exec_is_admitted_in_its_parent_and_bogus_lease_is_gated() {
     let env = TestEnv::new().with_config("budget = 1\n");
-    let bin = env!("CARGO_BIN_EXE_task-traffic-controller");
-    // Outer takes the whole budget; inner must still run (inherited lease).
+    // Outer takes the whole budget; inner still runs, in the outer's share,
+    // and so does one nested in the inner.
     let out = env.run(&[
         "exec",
         "--weight",
@@ -491,7 +711,7 @@ fn nested_exec_inherits_lease_and_bogus_lease_is_gated() {
         "--",
         "sh",
         "-c",
-        &format!("{bin} exec --weight 1 -- echo nested-ok"),
+        &format!("{BIN} exec --weight 1 -- {BIN} exec --weight 1 -- echo nested-ok"),
     ]);
     assert!(
         out.status.success(),
@@ -499,9 +719,9 @@ fn nested_exec_inherits_lease_and_bogus_lease_is_gated() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(stdout(&out), "nested-ok\n");
-    // History is written once (outer only).
-    let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
-    assert_eq!(hist.lines().count(), 1);
+    // Each was a run of its own.
+    assert_eq!(history_lines(&env), 3);
+    assert!(env.entries().is_empty());
 
     // A stale lease id gates normally: with budget 1 busy, it waits.
     let dir = env.marker_dir();

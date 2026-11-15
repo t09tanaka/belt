@@ -44,6 +44,12 @@ pub struct Entry {
     /// and `top` instead of the command line. Never part of the history key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The running entry whose command started this one (a nested `exec`).
+    /// Such an entry is admitted against the same budget, and what it takes
+    /// is counted inside its parent's share first (see
+    /// [`crate::admit::used_budget`]). Absent for a top-level command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
 }
 
 /// The ledger. In memory (and in `status --json`) it is always `entries`;
@@ -190,6 +196,7 @@ impl Ledger {
                 },
                 expected_secs: e.expected_secs,
                 backfilled: e.backfilled,
+                parent: e.parent.clone(),
             })
             .collect()
     }
@@ -232,6 +239,7 @@ mod tests {
             using: None,
             backfilled: false,
             label: None,
+            parent: None,
         }
     }
 

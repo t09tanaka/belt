@@ -151,6 +151,7 @@ mod tests {
                 waited_secs: 0.0,
                 expected_secs: exp,
                 backfilled: false,
+                parent: None,
             },
             elapsed_secs: elapsed,
         }

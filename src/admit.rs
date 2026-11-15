@@ -32,6 +32,9 @@ pub struct QueueEntry {
     /// A running entry that started ahead of a waiting one that did not
     /// fit (see [`admit`]).
     pub backfilled: bool,
+    /// The entry whose command started this one (a nested `exec`). It
+    /// counts only while that entry is running (see [`is_nested`]).
+    pub parent: Option<String>,
 }
 
 /// What the machine looks like right now.
@@ -102,53 +105,149 @@ pub enum Decision {
     Wait(Reason),
 }
 
-/// Waiting entries in admission order: `--front` entries first (by seq),
-/// then the rest (by seq).
+/// The running entry `e` was started from, if it still runs. A parent that
+/// is gone (or was never in the ledger) leaves `e` a top-level entry.
+fn running_parent<'a>(entries: &'a [QueueEntry], e: &QueueEntry) -> Option<&'a QueueEntry> {
+    let parent = e.parent.as_deref()?;
+    entries
+        .iter()
+        .find(|p| p.id == parent && p.state == State::Running)
+}
+
+/// Whether `e` is nested: started by the command of an entry that is
+/// still running.
+pub fn is_nested(entries: &[QueueEntry], e: &QueueEntry) -> bool {
+    running_parent(entries, e).is_some()
+}
+
+/// Waiting entries in admission order: nested entries first (they belong
+/// to work that already holds budget, and that work cannot finish, and so
+/// cannot free its budget, before they have run), then `--front` entries,
+/// then the rest; by seq within each.
 pub fn queue_order(entries: &[QueueEntry]) -> Vec<&QueueEntry> {
     let mut waiting: Vec<&QueueEntry> = entries
         .iter()
         .filter(|e| e.state == State::Waiting)
         .collect();
-    waiting.sort_by_key(|e| (!e.front, e.seq));
+    waiting.sort_by_key(|e| (!is_nested(entries, e), !e.front, e.seq));
     waiting
 }
 
-/// What a running entry takes from the budget: its declared weight, or
-/// the cores it was measured using when that is more. The measurement is
-/// rounded, so a command hovering just above its weight is not charged a
-/// whole extra slot.
-pub fn charged(e: &QueueEntry) -> u32 {
-    let measured = e.using.map(|u| u.round() as u32).unwrap_or(0);
-    e.weight.max(measured)
+/// The cores a running entry was last measured using, rounded, so a
+/// command hovering just above its weight is not charged a whole extra
+/// slot. A parent's measurement leaves out what its nested entries run.
+fn measured(e: &QueueEntry) -> u32 {
+    e.using.map(|u| u.round() as u32).unwrap_or(0)
 }
 
-/// Sum of what running entries take from the budget (see [`charged`]).
-pub fn used_budget(entries: &[QueueEntry]) -> u32 {
+/// What a running entry takes from the budget on its own account: its
+/// declared weight, or the cores it was measured using when that is more.
+/// What its nested entries take is not in here (see [`used_budget`]).
+pub fn charged(e: &QueueEntry) -> u32 {
+    e.weight.max(measured(e))
+}
+
+/// How running entries are counted (see `count_for`).
+#[derive(Clone, Copy)]
+struct Count {
+    /// Declared weights only, not what was measured.
+    declared: bool,
+    /// Entries that started by backfill are left out.
+    skip_backfilled: bool,
+}
+
+/// What the running entry `e` and everything nested in it take from the
+/// budget: its weight, or what it uses itself plus what its running
+/// nested entries take, when that is more. So nested entries use up their
+/// parent's weight first, and only what goes beyond it is charged on top:
+/// nothing is charged twice.
+fn tree_charge(entries: &[QueueEntry], e: &QueueEntry, count: Count) -> u32 {
+    if count.skip_backfilled && e.backfilled {
+        return 0;
+    }
+    let own = if count.declared { 0 } else { measured(e) };
+    let nested: u32 = entries
+        .iter()
+        .filter(|c| c.state == State::Running && c.parent.as_deref() == Some(e.id.as_str()))
+        .map(|c| tree_charge(entries, c, count))
+        .sum();
+    e.weight.max(own + nested)
+}
+
+fn used(entries: &[QueueEntry], count: Count) -> u32 {
     entries
         .iter()
-        .filter(|e| e.state == State::Running)
-        .map(charged)
+        .filter(|e| e.state == State::Running && !is_nested(entries, e))
+        .map(|e| tree_charge(entries, e, count))
         .sum()
 }
 
-/// What the budget looks like to the waiting entry `e` that has waited
+/// What running entries take from the budget. A top-level entry takes
+/// its weight, or what it uses itself plus what its running nested entries
+/// take when that is more; a nested entry is counted inside its parent.
+pub fn used_budget(entries: &[QueueEntry]) -> u32 {
+    used(
+        entries,
+        Count {
+            declared: false,
+            skip_backfilled: false,
+        },
+    )
+}
+
+/// How the budget is counted for the waiting entry `e` that has waited
 /// `waited` seconds. A `--front` entry is held by what running entries
 /// measure beyond their weight only for `front_overload_max_wait_secs`;
 /// after that the declared weights decide, as before measurement existed.
 /// With `skip_backfilled`, entries that started by backfill are left out.
-fn used_for(
-    entries: &[QueueEntry],
-    e: &QueueEntry,
-    waited: f64,
-    limits: Limits,
-    skip_backfilled: bool,
-) -> u32 {
-    let declared = e.front && waited >= limits.front_overload_max_wait_secs;
-    entries
+fn count_for(e: &QueueEntry, waited: f64, limits: Limits, skip_backfilled: bool) -> Count {
+    Count {
+        declared: e.front && waited >= limits.front_overload_max_wait_secs,
+        skip_backfilled,
+    }
+}
+
+/// The budget in use once the waiting entry `e` has started. For a
+/// top-level entry that is its weight more than now; for a nested one
+/// only what does not fit in its parent's share.
+fn used_once_started(entries: &[QueueEntry], e: &QueueEntry, count: Count, budget: u32) -> u32 {
+    let started: Vec<QueueEntry> = entries
         .iter()
-        .filter(|r| r.state == State::Running && !(skip_backfilled && r.backfilled))
-        .map(|r| if declared { r.weight } else { charged(r) })
-        .sum()
+        .map(|q| QueueEntry {
+            state: if q.id == e.id {
+                State::Running
+            } else {
+                q.state
+            },
+            weight: if q.id == e.id {
+                clamped(e, budget)
+            } else {
+                q.weight
+            },
+            ..q.clone()
+        })
+        .collect();
+    used(&started, count)
+}
+
+/// Whether `e` is the nested entry its parent's command is certainly
+/// waiting for: no entry nested in the same parent is running, and `e`
+/// is the first of them in the queue. It starts whatever the budget and
+/// the guards say. A command that waits for its nested command cannot
+/// finish, so the budget it holds would never come back and both would
+/// wait for ever; this way a command that runs its nested commands one at
+/// a time never waits for them, and each running parent goes at most one
+/// nested entry over the budget.
+fn is_only_child(entries: &[QueueEntry], order: &[&QueueEntry], e: &QueueEntry) -> bool {
+    let Some(parent) = running_parent(entries, e) else {
+        return false;
+    };
+    let sibling = |q: &QueueEntry| q.parent.as_deref() == Some(parent.id.as_str());
+    let first = order.iter().find(|q| sibling(q)).map(|q| q.id.as_str());
+    first == Some(e.id.as_str())
+        && !entries
+            .iter()
+            .any(|q| q.state == State::Running && sibling(q))
 }
 
 /// The weight admission counts for `e`: floor 1, ceiling the budget.
@@ -182,16 +281,18 @@ fn may_pass(entries: &[QueueEntry], order: &[&QueueEntry], pos: usize, limits: L
         return Pass::No;
     }
     for (i, a) in order[..pos].iter().enumerate() {
-        let w = clamped(a, limits.budget);
-        if used_for(entries, a, a.waited_secs, limits, false) + w <= limits.budget {
+        let fits = |skip_backfilled| {
+            let count = count_for(a, a.waited_secs, limits, skip_backfilled);
+            used_once_started(entries, a, count, limits.budget) <= limits.budget
+        };
+        if fits(false) {
             // `a` fits: it starts first, as the head or as a backfill.
             if i == 0 || is_short(a, limits) {
                 return Pass::No;
             }
             continue;
         }
-        let held_by_backfill =
-            used_for(entries, a, a.waited_secs, limits, true) + w <= limits.budget;
+        let held_by_backfill = fits(true);
         if held_by_backfill && (a.front || a.waited_secs >= limits.backfill_max_wait_secs) {
             return Pass::Reserved;
         }
@@ -215,6 +316,11 @@ fn may_pass(entries: &[QueueEntry], order: &[&QueueEntry], pos: usize, limits: L
 /// Only the head of the queue starts, except that a short command behind
 /// heads that do not fit may start first when it fits (see `may_pass`);
 /// the budget and the guards then apply to it as to a head.
+///
+/// A nested entry (one whose `parent` is running) is ahead of every
+/// top-level one, and the budget counts it inside its parent's share
+/// first. The first nested entry of a parent that has none running
+/// starts at once (see `is_only_child`).
 pub fn admit(
     entries: &[QueueEntry],
     me: &str,
@@ -229,6 +335,10 @@ pub fn admit(
         // caller re-registers rather than starting un-gated.
         return Decision::Wait(Reason::NotHead { ahead: usize::MAX });
     };
+    let candidate = order[pos];
+    if is_only_child(entries, &order, candidate) {
+        return Decision::Admitted;
+    }
     if pos != 0 {
         match may_pass(entries, &order, pos, limits) {
             Pass::Yes => {}
@@ -236,12 +346,11 @@ pub fn admit(
             Pass::Reserved => return Decision::Wait(Reason::Reserved { ahead: pos }),
         }
     }
-    let candidate = order[pos];
-    let used = used_for(entries, candidate, waited_secs, limits, false);
-    if used + clamped(candidate, limits.budget) > limits.budget {
+    let count = count_for(candidate, waited_secs, limits, false);
+    if used_once_started(entries, candidate, count, limits.budget) > limits.budget {
         return Decision::Wait(if pos == 0 {
             Reason::Budget {
-                used,
+                used: used(entries, count),
                 budget: limits.budget,
             }
         } else {
@@ -297,6 +406,7 @@ mod tests {
             waited_secs: 0.0,
             expected_secs: None,
             backfilled: false,
+            parent: None,
         }
     }
     fn using(mut q: QueueEntry, cores: f64) -> QueueEntry {
@@ -944,6 +1054,261 @@ mod tests {
         // Within it, 9 + 4 does not fit, and `s` (9 + 1) does.
         assert_eq!(
             admit(&q(29.9), "s", 0, 0.0, LIMITS, None),
+            Decision::Admitted
+        );
+    }
+
+    /// `q` as started by the command of the entry `parent`.
+    fn child(mut q: QueueEntry, parent: &str) -> QueueEntry {
+        q.parent = Some(parent.into());
+        q
+    }
+    /// Nothing is free: no memory, every core busy, a high load.
+    fn saturated() -> LiveSnapshot {
+        LiveSnapshot {
+            available_memory: 0,
+            cpu_busy: 1.0,
+            load_avg: 99.0,
+        }
+    }
+
+    #[test]
+    fn nested_entries_use_up_their_parents_weight_before_they_are_charged() {
+        let p = e("p", State::Running, false, 4, 1);
+        let c = |id: &str, seq| child(e(id, State::Running, false, 2, seq), "p");
+        // One and two children fit in the parent's 4: nothing on top.
+        assert_eq!(used_budget(&[p.clone(), c("c1", 2)]), 4);
+        assert_eq!(used_budget(&[p.clone(), c("c1", 2), c("c2", 3)]), 4);
+        // The third does not: the group takes what its children take.
+        assert_eq!(
+            used_budget(&[p.clone(), c("c1", 2), c("c2", 3), c("c3", 4)]),
+            6
+        );
+        // What the parent's own processes use comes on top of its children.
+        assert_eq!(
+            used_budget(&[using(p.clone(), 1.4), c("c1", 2), c("c2", 3)]),
+            5
+        );
+        assert_eq!(used_budget(&[using(p.clone(), 3.0), c("c1", 2)]), 5);
+        // A child is charged what it uses beyond its weight, as any entry.
+        assert_eq!(used_budget(&[p.clone(), using(c("c1", 2), 5.2)]), 5);
+        // A waiting child takes nothing yet.
+        assert_eq!(
+            used_budget(&[p, child(e("w", State::Waiting, false, 9, 2), "p")]),
+            4
+        );
+    }
+
+    #[test]
+    fn nesting_is_counted_to_any_depth() {
+        let q = [
+            e("p", State::Running, false, 1, 1),
+            child(e("c", State::Running, false, 2, 2), "p"),
+            child(e("g", State::Running, false, 5, 3), "c"),
+            child(e("h", State::Running, false, 1, 4), "c"),
+            e("other", State::Running, false, 3, 5),
+        ];
+        assert_eq!(used_budget(&q), 6 + 3);
+    }
+
+    #[test]
+    fn an_entry_whose_parent_is_not_running_is_top_level() {
+        // The parent is gone from the ledger (it finished, or the lease
+        // named was never there): the entry is charged on its own.
+        let gone = [
+            child(e("c", State::Running, false, 3, 2), "gone"),
+            e("r", State::Running, false, 2, 3),
+        ];
+        assert!(!is_nested(&gone, &gone[0]));
+        assert_eq!(used_budget(&gone), 5);
+        // A parent that is in the ledger but not running does not count
+        // either.
+        let waiting = [
+            e("p", State::Waiting, false, 4, 1),
+            child(e("c", State::Running, false, 3, 2), "p"),
+        ];
+        assert!(!is_nested(&waiting, &waiting[1]));
+        assert_eq!(used_budget(&waiting), 3);
+        let running = [
+            e("p", State::Running, false, 4, 1),
+            child(e("c", State::Running, false, 3, 2), "p"),
+        ];
+        assert!(is_nested(&running, &running[1]));
+        assert!(!is_nested(&running, &running[0]));
+    }
+
+    #[test]
+    fn entries_that_name_each_other_as_parent_are_not_followed_for_ever() {
+        // Cannot be written by `exec` (a parent runs before its child
+        // exists); a ledger edited by hand must still not hang admission.
+        let q = [
+            child(e("a", State::Running, false, 3, 1), "b"),
+            child(e("b", State::Running, false, 3, 2), "a"),
+            e("r", State::Running, false, 2, 3),
+            e("w", State::Waiting, false, 1, 4),
+        ];
+        assert_eq!(used_budget(&q), 2);
+        assert_eq!(
+            admit(&q, "w", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+    }
+
+    #[test]
+    fn nested_entries_are_ahead_of_top_level_ones() {
+        let q = [
+            e("p", State::Running, false, 1, 1),
+            e("front", State::Waiting, true, 1, 2),
+            e("top", State::Waiting, false, 1, 3),
+            child(e("late", State::Waiting, false, 1, 4), "p"),
+            child(e("late-front", State::Waiting, true, 1, 5), "p"),
+            // Its parent is not running: queued as a top-level entry.
+            child(e("orphan", State::Waiting, false, 1, 6), "gone"),
+        ];
+        let ids: Vec<&str> = queue_order(&q).iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(ids, ["late-front", "late", "front", "top", "orphan"]);
+    }
+
+    #[test]
+    fn a_nested_entry_that_fits_in_its_parents_share_starts_when_the_budget_is_full() {
+        // The parent holds the whole budget and one child runs in it.
+        let family = |weight| {
+            [
+                e("p", State::Running, false, 12, 1),
+                child(e("c1", State::Running, false, 4, 2), "p"),
+                child(e("c2", State::Waiting, false, weight, 3), "p"),
+            ]
+        };
+        // 4 + 8 is exactly the parent's 12: nothing more is taken.
+        assert_eq!(
+            admit(&family(8), "c2", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+        // One more does not fit, and it has a running sibling to wait for.
+        assert_eq!(
+            admit(&family(9), "c2", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::Budget {
+                used: 12,
+                budget: 12
+            })
+        );
+        // With a running sibling the guards hold it like any other entry.
+        assert_eq!(
+            admit(&family(8), "c2", 0, 0.0, LIMITS, Some(saturated())),
+            Decision::Wait(Reason::Memory {
+                available: 0,
+                need: 2 << 30
+            })
+        );
+    }
+
+    #[test]
+    fn the_only_nested_entry_of_a_parent_starts_whatever_the_budget_and_the_guards_say() {
+        // The parent uses the whole budget itself and waits for its child:
+        // holding the child would hold both for ever.
+        let q = [
+            using(e("p", State::Running, false, 12, 1), 12.0),
+            e("other", State::Running, false, 6, 2),
+            child(e("c", State::Waiting, false, 12, 3), "p"),
+        ];
+        assert_eq!(used_budget(&q), 18);
+        assert_eq!(
+            admit(&q, "c", 0, 0.0, LIMITS, Some(saturated())),
+            Decision::Admitted
+        );
+    }
+
+    #[test]
+    fn two_parents_that_each_wait_for_a_nested_entry_both_get_it() {
+        // Neither child fits beside the other family; each parent waits
+        // for its own, so each gets one, in whatever order they ask.
+        let q = [
+            e("p1", State::Running, false, 6, 1),
+            e("p2", State::Running, false, 6, 2),
+            child(e("c1", State::Waiting, false, 9, 3), "p1"),
+            child(e("c2", State::Waiting, false, 9, 4), "p2"),
+        ];
+        for id in ["c2", "c1"] {
+            assert_eq!(
+                admit(&q, id, 0, 0.0, LIMITS, Some(saturated())),
+                Decision::Admitted,
+                "{id}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_entries_of_one_parent_start_in_queue_order() {
+        let q = [
+            e("p", State::Running, false, 12, 1),
+            child(e("c1", State::Waiting, false, 12, 2), "p"),
+            child(e("c2", State::Waiting, false, 12, 3), "p"),
+        ];
+        assert_eq!(
+            admit(&q, "c1", 0, 0.0, LIMITS, Some(saturated())),
+            Decision::Admitted
+        );
+        assert_eq!(
+            admit(&q, "c2", 0, 0.0, LIMITS, Some(saturated())),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+        // Once the first runs, the second waits for the budget it takes.
+        let q = [
+            e("p", State::Running, false, 12, 1),
+            child(e("c1", State::Running, false, 12, 2), "p"),
+            child(e("c2", State::Waiting, false, 12, 3), "p"),
+        ];
+        assert_eq!(
+            admit(&q, "c2", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::Budget {
+                used: 12,
+                budget: 12
+            })
+        );
+    }
+
+    #[test]
+    fn a_top_level_head_that_does_not_fit_does_not_hold_a_nested_entry() {
+        // `big` waits for the budget `p` holds, and `p` cannot finish
+        // before its nested entries have run: they go first.
+        let q = [
+            e("p", State::Running, false, 6, 1),
+            child(e("c1", State::Running, false, 2, 2), "p"),
+            e("big", State::Waiting, true, 12, 3),
+            child(e("c2", State::Waiting, false, 2, 4), "p"),
+        ];
+        assert_eq!(
+            admit(&q, "c2", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Admitted
+        );
+        assert_eq!(
+            admit(&q, "big", 0, 0.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::NotHead { ahead: 1 })
+        );
+    }
+
+    #[test]
+    fn a_front_nested_entry_sees_declared_weights_after_its_window() {
+        // `p` uses 9 cores itself, far beyond its weight of 2.
+        let family = |waited_secs| {
+            [
+                e("r", State::Running, false, 10, 1),
+                using(e("p", State::Running, false, 2, 2), 9.0),
+                child(e("c1", State::Running, false, 1, 3), "p"),
+                waited(child(e("c2", State::Waiting, true, 1, 4), "p"), waited_secs),
+            ]
+        };
+        // Measured: 10 + (9 + 1 + 1) is over the budget.
+        assert_eq!(
+            admit(&family(29.0), "c2", 0, 29.0, LIMITS, Some(calm())),
+            Decision::Wait(Reason::Budget {
+                used: 20,
+                budget: 12
+            })
+        );
+        // Declared: the two children fit exactly in the parent's 2.
+        assert_eq!(
+            admit(&family(30.0), "c2", 0, 30.0, LIMITS, Some(calm())),
             Decision::Admitted
         );
     }

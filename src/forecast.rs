@@ -502,6 +502,7 @@ fn queue_entries(jobs: &[Job], now: u64) -> Vec<QueueEntry> {
                 },
                 expected_secs: j.expected_secs,
                 backfilled: j.backfilled,
+                parent: None,
             }
         })
         .collect()
@@ -1550,6 +1551,7 @@ mod tests {
                 using: None,
                 backfilled: false,
                 label: None,
+                parent: None,
             },
             suspect_dead: false,
         }

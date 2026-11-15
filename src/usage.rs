@@ -48,8 +48,10 @@ pub struct Proc {
     pub cpu_percent: f32,
 }
 
-/// Cores used by `root` and all of its descendants.
-pub fn tree_cores(procs: &[Proc], root: u32) -> f64 {
+/// Cores used by `root` and all of its descendants, leaving out the
+/// processes in `skip` and everything below them (`root` itself is never
+/// left out).
+pub fn tree_cores(procs: &[Proc], root: u32, skip: &HashSet<u32>) -> f64 {
     let mut children: HashMap<u32, Vec<&Proc>> = HashMap::new();
     let mut by_pid: HashMap<u32, &Proc> = HashMap::new();
     for p in procs {
@@ -71,7 +73,7 @@ pub fn tree_cores(procs: &[Proc], root: u32) -> f64 {
             total += f64::from(p.cpu_percent.max(0.0)) / 100.0;
         }
         if let Some(kids) = children.get(&pid) {
-            stack.extend(kids.iter().map(|k| k.pid));
+            stack.extend(kids.iter().map(|k| k.pid).filter(|k| !skip.contains(k)));
         }
     }
     total
@@ -150,13 +152,34 @@ fn sample_loop(ctx: &Context, id: &str, root: u32, stop: &mpsc::Receiver<()>) {
                 cpu_percent: p.cpu_usage(),
             })
             .collect();
-        let cores = (peak.push(tree_cores(&procs, root)) * 10.0).round() / 10.0;
+        let cores =
+            (peak.push(tree_cores(&procs, root, &nested_pids(ctx, id))) * 10.0).round() / 10.0;
         // An unchanged value is not written again: every write takes the
         // ledger lock that waiting entries poll.
         if recorded != Some(cores) && record(ctx, id, cores) {
             recorded = Some(cores);
         }
     }
+}
+
+/// The `task-traffic-controller` processes of the entries nested in `id`.
+/// Each has its own entry that is charged for what it runs, so its tree is
+/// left out of what `id` is measured using: nothing is counted twice.
+fn nested_pids(ctx: &Context, id: &str) -> HashSet<u32> {
+    // A plain read: saves are atomic renames, and a stale copy is at worst
+    // one sample behind.
+    Ledger::load(&ctx.paths.ledger_file())
+        .map(|ledger| nested_in(&ledger, id))
+        .unwrap_or_default()
+}
+
+fn nested_in(ledger: &Ledger, id: &str) -> HashSet<u32> {
+    ledger
+        .entries
+        .iter()
+        .filter(|e| e.parent.as_deref() == Some(id))
+        .map(|e| e.pid)
+        .collect()
 }
 
 /// Write `cores` to the entry; false when it could not be written.
@@ -196,9 +219,62 @@ mod tests {
             p(12, Some(11), 50.0),
             p(20, Some(1), 400.0),
         ];
-        assert!((tree_cores(&procs, 10) - 4.0).abs() < 1e-9);
-        assert!((tree_cores(&procs, 12) - 0.5).abs() < 1e-9);
-        assert_eq!(tree_cores(&procs, 99), 0.0);
+        let none = HashSet::new();
+        assert!((tree_cores(&procs, 10, &none) - 4.0).abs() < 1e-9);
+        assert!((tree_cores(&procs, 12, &none) - 0.5).abs() < 1e-9);
+        assert_eq!(tree_cores(&procs, 99, &none), 0.0);
+    }
+
+    #[test]
+    fn a_skipped_process_and_everything_below_it_is_left_out() {
+        let procs = [
+            p(10, None, 100.0),
+            p(11, Some(10), 250.0),
+            p(12, Some(11), 50.0),
+            p(13, Some(10), 30.0),
+        ];
+        let skip = |pids: &[u32]| pids.iter().copied().collect::<HashSet<u32>>();
+        assert!((tree_cores(&procs, 10, &skip(&[11])) - 1.3).abs() < 1e-9);
+        assert!((tree_cores(&procs, 10, &skip(&[12, 13])) - 3.5).abs() < 1e-9);
+        // The root is what is measured, whatever the ledger says of it.
+        assert!((tree_cores(&procs, 10, &skip(&[10])) - 4.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn only_the_entries_nested_in_this_one_are_left_out() {
+        let entry = |id: &str, pid: u32, parent: Option<&str>| crate::ledger::Entry {
+            id: id.into(),
+            pid,
+            state: crate::admit::State::Running,
+            front: false,
+            weight: 1,
+            predicted_rss: 0,
+            expected_secs: None,
+            repo: String::new(),
+            subdir: String::new(),
+            argv: id.into(),
+            key: id.into(),
+            seq: u64::from(pid),
+            enqueued_at: chrono::Utc::now(),
+            started_at: None,
+            using: None,
+            backfilled: false,
+            label: None,
+            parent: parent.map(str::to_string),
+        };
+        let ledger = Ledger {
+            entries: vec![
+                entry("p", 1, None),
+                entry("c1", 2, Some("p")),
+                entry("c2", 3, Some("p")),
+                entry("other", 4, Some("q")),
+                entry("grandchild", 5, Some("c1")),
+            ],
+            ..Ledger::default()
+        };
+        assert_eq!(nested_in(&ledger, "p"), [2, 3].into_iter().collect());
+        assert_eq!(nested_in(&ledger, "c1"), [5].into_iter().collect());
+        assert!(nested_in(&ledger, "other").is_empty());
     }
 
     #[test]
@@ -218,7 +294,8 @@ mod tests {
             p(2, Some(3), 100.0),
             p(3, Some(2), -5.0),
         ];
-        assert!((tree_cores(&procs, 1) - 1.0).abs() < 1e-9);
-        assert!((tree_cores(&procs, 2) - 1.0).abs() < 1e-9);
+        let none = HashSet::new();
+        assert!((tree_cores(&procs, 1, &none) - 1.0).abs() < 1e-9);
+        assert!((tree_cores(&procs, 2, &none) - 1.0).abs() < 1e-9);
     }
 }

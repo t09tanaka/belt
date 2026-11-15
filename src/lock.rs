@@ -385,6 +385,7 @@ mod tests {
             using: None,
             backfilled: false,
             label: None,
+            parent: None,
         }
     }
 

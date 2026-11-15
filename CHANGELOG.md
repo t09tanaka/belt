@@ -7,6 +7,41 @@ the minor version).
 
 ## [Unreleased]
 
+### Changed
+
+- **A nested `exec` is now gated.** An `exec` called from inside a gated
+  command used to inherit the outer lease and run at once, with no weight
+  and no entry. A command that wraps each of its own steps in `exec` (a
+  CI runner under `exec`) therefore ran all of them together, each on
+  every core. A nested `exec` now registers as a child of the outer entry
+  (`parent` in the ledger, `status --json` and `inspect --json`; `[in
+  <pid>]` in `status`) and queues against the same budget with its own
+  weight, measurement and history.
+  - A running entry and what is nested in it take `max(weight, own use +
+    what its running children take)`: children use up their parent's
+    weight first, and the parent's measurement leaves out its children's
+    process trees, so nothing is charged twice.
+  - The first child of a parent that has no child running always starts,
+    whatever the budget and the guards say, so a parent waiting for its
+    child cannot deadlock and a command that nests one `exec` at a time
+    behaves as before. Each running parent can exceed the budget by at
+    most one child.
+  - Waiting children are ahead of every top-level entry, `--front`
+    included.
+  - A stale lease is gated as a top-level command, as before. A caller
+    inside a managed run whose supervisor is gone still runs under it
+    without an entry, as before.
+
+### Added
+
+- `exec --nested admit|inherit` and `TASK_TRAFFIC_CONTROLLER_NESTED`.
+  `inherit` is the previous behaviour, for one call or (through the
+  environment of the outer command) a whole tree.
+- Library: `ledger::Entry::parent`, `admit::QueueEntry::parent`,
+  `admit::is_nested`, `exec::Opts::parent`, `exec::NestedMode`,
+  `exec::Nesting` and `exec::nesting`. `usage::tree_cores` takes the
+  processes to leave out.
+
 ## [0.8.2] - 2026-11-14
 
 ### Added

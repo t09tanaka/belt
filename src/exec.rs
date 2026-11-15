@@ -37,6 +37,10 @@ pub struct Opts {
     /// A human-readable name for the run, shown instead of the command line.
     /// Not part of the history key.
     pub label: Option<String>,
+    /// The live running entry this command was started from (see
+    /// [`nested_lease_is_live`]): it is queued as that entry's child.
+    /// `None` for a top-level command.
+    pub parent: Option<String>,
     pub argv: Vec<String>,
     /// Directory the command runs in; also what the history key is derived
     /// from.
@@ -124,6 +128,75 @@ pub fn nested_run_id(
         }
     }
     Ok(None)
+}
+
+/// What `exec` does when it is called from inside a gated command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NestedMode {
+    /// Queue against the same budget as a child of the outer entry (the
+    /// default).
+    #[default]
+    Admit,
+    /// Run at once under the outer entry, with no entry of its own: what
+    /// every nested `exec` did before 0.9.
+    Inherit,
+}
+
+impl NestedMode {
+    /// `admit` or `inherit`, as `--nested` and `TASK_TRAFFIC_CONTROLLER_NESTED`
+    /// spell them.
+    pub fn parse(s: &str) -> Option<NestedMode> {
+        match s {
+            "admit" => Some(NestedMode::Admit),
+            "inherit" => Some(NestedMode::Inherit),
+            _ => None,
+        }
+    }
+}
+
+/// Where a new `exec` stands relative to the gated command it was called
+/// from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Nesting {
+    /// Not inside a gated command (or inside one whose lease is stale):
+    /// gated as a top-level command.
+    Top,
+    /// Inside the live running entry with this id: gated as its child
+    /// ([`Opts::parent`]).
+    Child(String),
+    /// Runs at once under the entry with this id, ungated.
+    Inherit(String),
+}
+
+/// Decide [`Nesting`] from the caller's environment (see
+/// [`nested_run_id`] for the three values). With [`NestedMode::Admit`] a
+/// live lease makes the caller a child of that entry. A managed run whose
+/// supervisor is gone has no live lease, so nothing would notice its
+/// nested entries finishing in its place; a caller inside one still runs
+/// under it ungated, as with [`NestedMode::Inherit`].
+pub fn nesting(
+    ctx: &Context,
+    mode: NestedMode,
+    lease: Option<&str>,
+    managed_id: Option<&str>,
+    managed_scope: Option<&str>,
+) -> Result<Nesting> {
+    let lease = match (mode, lease) {
+        (NestedMode::Admit, Some(lease)) => {
+            if nested_lease_is_live(ctx, lease)? {
+                return Ok(Nesting::Child(lease.to_string()));
+            }
+            // Stale: only the managed pair can still place the caller.
+            None
+        }
+        (_, lease) => lease,
+    };
+    Ok(
+        match nested_run_id(ctx, lease, managed_id, managed_scope)? {
+            Some(id) => Nesting::Inherit(id),
+            None => Nesting::Top,
+        },
+    )
 }
 
 /// Is the calling process inside the managed run `id`: the ledger holds it,
@@ -608,6 +681,7 @@ mod tests {
                 using: None,
                 backfilled: false,
                 label: None,
+                parent: None,
             });
             ledger.save(&ctx.paths.ledger_file()).unwrap();
 

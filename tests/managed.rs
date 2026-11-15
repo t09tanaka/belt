@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use task_traffic_controller::admit::State;
 use task_traffic_controller::config::Config;
-use task_traffic_controller::exec::{self, Gated, Hooks, Opts};
+use task_traffic_controller::exec::{self, Gated, Hooks, NestedMode, Nesting, Opts};
 use task_traffic_controller::history::{self, Record};
 use task_traffic_controller::ledger::Ledger;
 use task_traffic_controller::managed::{
@@ -541,6 +541,7 @@ fn a_plain_entry_keeps_the_old_ledger_readable() {
         using: None,
         backfilled: false,
         label: None,
+        parent: None,
     });
     l.save(&ctx.paths.ledger_file()).unwrap();
     let old: old_ledger::Ledger =
@@ -2273,11 +2274,39 @@ fn a_started_managed_run_of_this_state_dir_is_nested_without_its_lease() {
     let nested = |lease: Option<&str>, id: Option<&str>, sc: Option<&str>| {
         exec::nested_run_id(&ctx, lease, id, sc).unwrap()
     };
+    let nesting = |mode, lease: Option<&str>, id: Option<&str>| {
+        exec::nesting(&ctx, mode, lease, id, Some(&scope)).unwrap()
+    };
     // Registered only: nothing started, so a caller is not inside it.
     assert_eq!(nested(None, Some("c"), Some(&scope)), None);
+    assert_eq!(
+        nesting(NestedMode::Admit, Some("c"), Some("c")),
+        Nesting::Top
+    );
     orphan_with_live_child(&ctx, "c");
+    admit_now(&ctx, &cfg, "c");
+    // Running under a held lease: a caller that names it queues as its
+    // child, unless told to run under it as before.
+    assert_eq!(
+        nesting(NestedMode::Admit, Some("c"), Some("c")),
+        Nesting::Child("c".into())
+    );
+    assert_eq!(
+        nesting(NestedMode::Inherit, Some("c"), None),
+        Nesting::Inherit("c".into())
+    );
+    assert_eq!(nesting(NestedMode::Admit, None, None), Nesting::Top);
     drop(g); // the supervisor and its lease are gone
     assert_eq!(nested(None, Some("c"), Some(&scope)).as_deref(), Some("c"));
+    // With no supervisor left, a caller inside the run is not queued
+    // behind it: it runs under it, whichever way was asked for.
+    for mode in [NestedMode::Admit, NestedMode::Inherit] {
+        assert_eq!(
+            nesting(mode, Some("c"), Some("c")),
+            Nesting::Inherit("c".into())
+        );
+        assert_eq!(nesting(mode, Some("c"), None), Nesting::Top);
+    }
     assert_eq!(
         nested(Some("stale"), Some("c"), Some(&scope)).as_deref(),
         Some("c")
