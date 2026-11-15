@@ -395,7 +395,7 @@ pub(crate) fn validate_strings(
 pub(crate) fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
     ctx.check_value(v)?;
     let result = match v {
-        Value::String(s) if s.contains("${{") => expr::interpolate_value(s, ctx)?,
+        Value::String(s) => expr::interpolate_value(s, ctx)?,
         Value::Array(a) => Value::Array(
             a.iter()
                 .map(|x| eval_strings(x, ctx))
@@ -672,6 +672,15 @@ mod tests {
             .entries
             .iter()
             .all(|entry| matches!(entry.decision, Decision::Run(_))));
+    }
+
+    #[test]
+    fn literal_strings_preserve_bytes_and_raw_value_bounds() {
+        let contexts = Map::new();
+        let ctx = Ctx::new(&contexts, Status::Success).with_output_limit(64);
+        let value = json!({"plain": ["literal runner.temp", "é\n\"\\"]});
+        assert_eq!(eval_strings(&value, &ctx).unwrap(), value);
+        assert!(eval_strings(&json!("x".repeat(65)), &ctx).is_err());
     }
 
     #[test]

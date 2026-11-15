@@ -4399,3 +4399,46 @@ fn pure_nonvariant_publication_reserve_tracks_only_unpublished_real_outputs() {
     }
     assert_eq!(published_reserves[0], published_reserves[1]);
 }
+
+#[test]
+fn pure_atomic_failed_need_keeps_real_matrix_report_membership_and_ancestor() {
+    let workflow = ATOMIC_WORKFLOW
+        .replace(
+            "echo first > shared.txt",
+            "echo first > shared.txt\n          false",
+        )
+        .replace(
+            "  matrix:\n    needs: first",
+            "  matrix:\n    needs: first\n    if: failure()",
+        )
+        .replace(
+            "matrix: ${{ fromJSON(needs.first.outputs.matrix) }}",
+            "matrix: {n: [0, 1]}",
+        );
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(2);
+    atomic_start(&f, &mut d);
+    let action = atomic_action(&d);
+    claim(&mut d, &action);
+    let (wire, _) = f.execute(&action, "survivor-atomic-failed-need");
+    assert_eq!(
+        wire.outcomes
+            .iter()
+            .find(|outcome| outcome.job == "first")
+            .unwrap()
+            .status,
+        JobStatus::Failure
+    );
+    let matrix = wire
+        .outcomes
+        .iter()
+        .find(|outcome| outcome.job == "matrix")
+        .unwrap();
+    assert_eq!(matrix.status, JobStatus::Success);
+    assert!(matrix.ancestor_failed);
+    let mut replay = d.clone();
+    let record = settle(&mut d, &action, wire);
+    replay.apply(&record).unwrap();
+    assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+    assert!(d.outcome(FILE, "matrix").unwrap().ancestor_failed);
+}

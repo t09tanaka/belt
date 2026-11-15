@@ -248,22 +248,17 @@ pub(super) fn verify_result(
     let mut offset = 0;
     for (id, outcome) in task.jobs.iter().zip(&result.outcomes) {
         let spec = wf.job(id).context("missing group job")?;
-        let ancestor = spec.needs.iter().any(|n| {
-            result
-                .outcomes
-                .iter()
-                .find(|o| &o.job == n)
-                .or_else(|| inputs.needs.get(n))
-                .is_some_and(JobOutcome::failed_or_ancestor_failed)
-        });
         let evaluated = if spec.matrix.is_some() {
             Some(
                 crate::job_evaluate::evaluate_atomic(
                     &spec.to_job(),
                     contexts(plan, task, id)?["github"].clone(),
                     &needs,
-                    ancestor,
-                    inputs.run_cancelled,
+                    // This validates report membership/display only. Job `if:`
+                    // decisions do not change legacy matrix membership; actual
+                    // worker decisions and reported statuses are checked elsewhere.
+                    false,
+                    false,
                 )
                 .map_err(|e| AtomicGroupUnsupported {
                     task: task.id.clone(),
