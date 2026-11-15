@@ -19,6 +19,53 @@ use std::time::{Duration, Instant};
 const MAX_PROFILE_BYTES: u64 = 64 * 1024;
 const MAX_PROBE_BYTES: u64 = 8192;
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
+/// Startup only. One call may take `call`; a call that timed out is repeated
+/// while the tool has attempts left and the shared `total` has time left, and
+/// a repeat ends with that time. The first call of a tool never gets less than
+/// the live 300ms, so the wait is bounded by `total` plus 300ms for each of
+/// the fixed calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartupProbes {
+    call: Duration,
+    total: Duration,
+    attempts: u32,
+}
+const STARTUP_PROBES: StartupProbes = StartupProbes {
+    call: Duration::from_millis(2_000),
+    total: Duration::from_millis(5_000),
+    attempts: 3,
+};
+/// The shared clock of one startup measurement.
+struct StartupClock {
+    limits: StartupProbes,
+    started: Instant,
+}
+impl StartupClock {
+    fn start(limits: StartupProbes) -> Self {
+        Self {
+            limits,
+            started: Instant::now(),
+        }
+    }
+    fn remaining(&self) -> Duration {
+        self.limits.total.saturating_sub(self.started.elapsed())
+    }
+    /// A first call: never less than the live deadline.
+    fn call_deadline(&self) -> Duration {
+        self.repeat_deadline().max(PROBE_TIMEOUT)
+    }
+    /// A repeated call ends with the shared time.
+    fn repeat_deadline(&self) -> Duration {
+        self.remaining().min(self.limits.call)
+    }
+}
+/// Why a fixed probe produced no output. Only a timeout may be repeated: a
+/// failed or unparsable probe is already a determinate answer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProbeMiss {
+    TimedOut,
+    Failed,
+}
 const PREPARATION_SNAPSHOT_TTL_MS: u64 = 5_000;
 // Tool discovery must not bootstrap a manager-selected tool behind admission.
 const INSTALL_GUARDS: &[(&str, &str)] = &[
@@ -67,6 +114,9 @@ pub struct Profile {
     report_identity: Arc<Mutex<Option<ReportIdentity>>>,
     completed_report: Arc<Mutex<Option<CompletedReport>>>,
     report_sequence: Arc<AtomicU64>,
+    /// The live deadline of one fixed call; only tests that are not about the
+    /// deadline replace it.
+    probe_timeout: Duration,
 }
 
 #[derive(Clone)]
@@ -255,9 +305,16 @@ impl Profile {
             report_identity: Arc::new(Mutex::new(None)),
             completed_report: Arc::new(Mutex::new(None)),
             report_sequence: Arc::new(AtomicU64::new(0)),
+            probe_timeout: PROBE_TIMEOUT,
         };
+        // Loading is part of startup: a cold required tool gets the startup
+        // deadline and repeats, and is refused only once it stays undetermined.
+        let clock = StartupClock::start(STARTUP_PROBES);
         for tool in &profile.definition.required_tools {
-            if !matches!(profile.probe(tool), ToolObservation::Available { .. }) {
+            if !matches!(
+                profile.startup_probe(tool, &clock),
+                ToolObservation::Available { .. }
+            ) {
                 return Err(format!("required worker profile tool {tool} unavailable"));
             }
         }
@@ -302,25 +359,28 @@ impl Profile {
     /// registered optional tools, bounded to 14 fixed calls ×
     /// 300ms, and no source command or script can be supplied over the wire.
     pub fn report(&self) -> WorkerCapabilities {
-        self.measured_report(false)
+        self.measured_report(None)
     }
-    /// Warm cold native launchers before publishing the resident baseline.
-    /// Retry only unknown observations, once, with the same 300ms deadline.
-    /// At most 28 fixed calls take 8.4s; absent or persistently unknown tools
-    /// remain unavailable/unknown and do not prevent unconstrained shell work.
+    /// Measure every tool to a determinate answer before publishing the
+    /// resident baseline, so a cold native launcher is not recorded as unknown
+    /// and then taken for drift when it later answers. One call may take 2s;
+    /// only a call that timed out is repeated, at most 3 times per tool, within
+    /// one shared 5s. The wait is at most 5s + 14 fixed calls x 300ms = 9.2s.
+    /// A tool that is absent, fails, or still times out stays
+    /// unavailable/unknown and does not prevent unconstrained shell work; if it
+    /// answers after this baseline, that is drift.
     pub(crate) fn startup_report(&self) -> WorkerCapabilities {
-        self.measured_report(true)
+        self.measured_report(Some(STARTUP_PROBES))
     }
-    fn measured_report(&self, startup: bool) -> WorkerCapabilities {
+    fn measured_report(&self, startup: Option<StartupProbes>) -> WorkerCapabilities {
         let files_before = self.executable_identity();
+        let clock = startup.map(StartupClock::start);
         let tools: BTreeMap<_, _> = TOOLS
             .iter()
             .map(|t| {
-                let observed = self.probe(t);
-                let observed = if startup && observed == ToolObservation::Unknown {
-                    self.probe(t)
-                } else {
-                    observed
+                let observed = match &clock {
+                    Some(clock) => self.startup_probe(t, clock),
+                    None => self.probe(t),
                 };
                 (t.to_string(), observed)
             })
@@ -562,6 +622,40 @@ impl Profile {
         )
     }
     fn probe(&self, tool: &str) -> ToolObservation {
+        self.probe_within(tool, &|| self.probe_timeout)
+            .unwrap_or(ToolObservation::Unknown)
+    }
+    /// Repeat only timeouts; every other answer is final at once.
+    fn startup_probe(&self, tool: &str, clock: &StartupClock) -> ToolObservation {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let deadline = || match attempt {
+                1 => clock.call_deadline(),
+                _ => clock.repeat_deadline(),
+            };
+            match self.probe_within(tool, &deadline) {
+                Some(observed) => return observed,
+                None if attempt >= clock.limits.attempts || clock.remaining().is_zero() => {
+                    return ToolObservation::Unknown
+                }
+                None => {}
+            }
+        }
+    }
+    /// `None`: a fixed call ran out of time, which says nothing about the tool.
+    fn probe_within(&self, tool: &str, deadline: &dyn Fn() -> Duration) -> Option<ToolObservation> {
+        Some(match self.probe_once(tool, deadline) {
+            Ok(observed) => observed,
+            Err(ProbeMiss::Failed) => ToolObservation::Unknown,
+            Err(ProbeMiss::TimedOut) => return None,
+        })
+    }
+    fn probe_once(
+        &self,
+        tool: &str,
+        deadline: &dyn Fn() -> Duration,
+    ) -> Result<ToolObservation, ProbeMiss> {
         let binary = if tool == "xcode" { "xcodebuild" } else { tool };
         let Some(path) = self
             .definition
@@ -570,14 +664,14 @@ impl Profile {
             .map(|p| p.join(binary))
             .find(|p| executable(p))
         else {
-            return ToolObservation::Unavailable;
+            return Ok(ToolObservation::Unavailable);
         };
         // The standard Flutter launcher bootstraps SDK/cache even for
         // --version. Its noninstalling snapshot adapter belongs to S20.
         // Flutter's dart launcher has the same behavior; native Dart can be
         // measured without invoking that bootstrap wrapper.
         if tool == "flutter" {
-            return ToolObservation::Unknown;
+            return Ok(ToolObservation::Unknown);
         }
         if tool == "dart" {
             let mut magic = [0u8; 4];
@@ -592,7 +686,7 @@ impl Profile {
                         | [0xca, 0xfe, 0xba, 0xbe]
                 );
             if !native {
-                return ToolObservation::Unknown;
+                return Ok(ToolObservation::Unknown);
             }
         }
         let args: &[&str] = match tool {
@@ -600,11 +694,9 @@ impl Profile {
             "xcode" => &["-version"],
             _ => &["--version"],
         };
-        let Some(version) = bounded_probe(&path, args, &self.env) else {
-            return ToolObservation::Unknown;
-        };
+        let version = bounded_probe(&path, args, &self.env, deadline())?;
         let Some(version) = measured_version(tool, &version) else {
-            return ToolObservation::Unknown;
+            return Ok(ToolObservation::Unknown);
         };
         let sdk_identity = if tool == "xcode" {
             let Some(xcrun) = self
@@ -614,27 +706,25 @@ impl Profile {
                 .map(|p| p.join("xcrun"))
                 .find(|p| executable(p))
             else {
-                return ToolObservation::Unknown;
+                return Ok(ToolObservation::Unknown);
             };
-            let Some(sdk) = bounded_probe(&xcrun, &["--show-sdk-path"], &self.env) else {
-                return ToolObservation::Unknown;
-            };
+            let sdk = bounded_probe(&xcrun, &["--show-sdk-path"], &self.env, deadline())?;
             let sdk = PathBuf::from(sdk.trim());
             if !sdk.is_absolute() || !sdk.is_dir() {
-                return ToolObservation::Unknown;
+                return Ok(ToolObservation::Unknown);
             }
             let Ok(real_sdk) = fs::canonicalize(&sdk) else {
-                return ToolObservation::Unknown;
+                return Ok(ToolObservation::Unknown);
             };
             Some(Digest::of_bytes(real_sdk.as_os_str().as_encoded_bytes()))
         } else {
             None
         };
         let Ok(real) = fs::canonicalize(&path) else {
-            return ToolObservation::Unknown;
+            return Ok(ToolObservation::Unknown);
         };
         let Ok(meta) = fs::metadata(&real) else {
-            return ToolObservation::Unknown;
+            return Ok(ToolObservation::Unknown);
         };
         let bytes = serde_json::to_vec(&(
             &real,
@@ -647,10 +737,10 @@ impl Profile {
             &version,
         ))
         .expect("tool identity serializes");
-        ToolObservation::Available {
+        Ok(ToolObservation::Available {
             version,
             identity: Digest::of_bytes(&bytes),
-        }
+        })
     }
 }
 fn measured_version(tool: &str, output: &str) -> Option<String> {
@@ -689,11 +779,16 @@ fn executable(path: &Path) -> bool {
 
 /// Nonblocking pipe reads bound output and avoid waiting on descendant-held
 /// pipes. WNOWAIT retains the leader pid until group cleanup and reap.
-fn bounded_probe(path: &Path, args: &[&str], env: &BTreeMap<String, String>) -> Option<String> {
+fn bounded_probe(
+    path: &Path,
+    args: &[&str],
+    env: &BTreeMap<String, String>,
+    deadline: Duration,
+) -> Result<String, ProbeMiss> {
     let cwd = tempfile::Builder::new()
         .prefix("rtr-tool-probe-")
         .tempdir()
-        .ok()?;
+        .map_err(|_| ProbeMiss::Failed)?;
     let mut child = Command::new(path)
         .args(args)
         .current_dir(cwd.path())
@@ -704,17 +799,17 @@ fn bounded_probe(path: &Path, args: &[&str], env: &BTreeMap<String, String>) -> 
         .stderr(Stdio::piped())
         .process_group(0)
         .spawn()
-        .ok()?;
+        .map_err(|_| ProbeMiss::Failed)?;
     let pid = child.id();
     // Every failure after spawn still passes through owned group cleanup/reap.
     let output = (|| {
-        let mut out = child.stdout.take()?;
-        let mut err = child.stderr.take()?;
+        let mut out = child.stdout.take().ok_or(ProbeMiss::Failed)?;
+        let mut err = child.stderr.take().ok_or(ProbeMiss::Failed)?;
         for fd in [out.as_raw_fd(), err.as_raw_fd()] {
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
             if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
             {
-                return None;
+                return Err(ProbeMiss::Failed);
             }
         }
         let mut stdout = Vec::new();
@@ -722,7 +817,7 @@ fn bounded_probe(path: &Path, args: &[&str], env: &BTreeMap<String, String>) -> 
         let started = Instant::now();
         loop {
             if !read_available(&mut out, &mut stdout) || !read_available(&mut err, &mut stderr) {
-                return None;
+                return Err(ProbeMiss::Failed);
             }
             let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
             let observed = unsafe {
@@ -733,15 +828,18 @@ fn bounded_probe(path: &Path, args: &[&str], env: &BTreeMap<String, String>) -> 
                     libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
                 )
             };
-            if observed != 0 || started.elapsed() >= PROBE_TIMEOUT {
-                return None;
+            if observed != 0 {
+                return Err(ProbeMiss::Failed);
+            }
+            if started.elapsed() >= deadline {
+                return Err(ProbeMiss::TimedOut);
             }
             if unsafe { info.si_pid() } == pid as i32 {
                 if !read_available(&mut out, &mut stdout) || !read_available(&mut err, &mut stderr)
                 {
-                    return None;
+                    return Err(ProbeMiss::Failed);
                 }
-                return Some(if stdout.is_empty() { stderr } else { stdout });
+                return Ok(if stdout.is_empty() { stderr } else { stdout });
             }
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -750,11 +848,13 @@ fn bounded_probe(path: &Path, args: &[&str], env: &BTreeMap<String, String>) -> 
     if let Ok(group) = i32::try_from(pid) {
         crate::platform::signal_process_group(group, libc::SIGKILL);
     }
-    let status = child.wait().ok()?;
+    let status = child.wait().map_err(|_| ProbeMiss::Failed)?;
+    // The timeout was decided before the kill above; its status is no answer.
+    let output = output?;
     if !status.success() {
-        return None;
+        return Err(ProbeMiss::Failed);
     }
-    String::from_utf8(output?).ok()
+    String::from_utf8(output).map_err(|_| ProbeMiss::Failed)
 }
 fn read_available(input: &mut impl Read, output: &mut Vec<u8>) -> bool {
     loop {
@@ -776,6 +876,17 @@ fn read_available(input: &mut impl Read, output: &mut Vec<u8>) -> bool {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => return false,
         }
+    }
+}
+
+/// For a test that is not about the live deadline: its fakes are decided by
+/// what they print, not by how fast a loaded host starts a new script. A fake
+/// that must time out sleeps far longer than this.
+#[cfg(test)]
+fn patient(profile: Profile) -> Profile {
+    Profile {
+        probe_timeout: Duration::from_secs(2),
+        ..profile
     }
 }
 
@@ -807,8 +918,8 @@ mod tests {
         fake(b.path(), "node", "printf 'v20.0.0\\n'", 0o700);
         let p22 = Profile::load(a.path(), &env(a.path())).unwrap();
         let p20 = Profile::load(b.path(), &env(b.path())).unwrap();
-        let a_report = p22.report();
-        let b_report = p20.report();
+        let a_report = p22.startup_report();
+        let b_report = p20.startup_report();
         assert!(
             matches!(&a_report.tools["node"], ToolObservation::Available {version,..} if version == "v22.0.0")
         );
@@ -857,9 +968,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let marker = root.path().join("probe-mode");
         fake(root.path(), "node", &format!(
-            "mode=; if [ -r {marker:?} ]; then IFS= read -r mode < {marker:?} || :; fi; case \"$mode\" in timeout) /bin/sleep 2;; changed) echo v20.0.0;; *) echo v22.0.0;; esac"
+            "mode=; if [ -r {marker:?} ]; then IFS= read -r mode < {marker:?} || :; fi; case \"$mode\" in timeout) /bin/sleep 30;; changed) echo v20.0.0;; *) echo v22.0.0;; esac"
         ), 0o700);
-        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        let profile = patient(Profile::load(root.path(), &env(root.path())).unwrap());
         // Establish the known baseline through the actual resident startup
         // path. The later deliberately unknown sample still uses report().
         let initial = profile.startup_report();
@@ -908,11 +1019,11 @@ mod tests {
             root.path(),
             "node",
             &format!(
-            "if [ ! -f {marker:?} ]; then echo warm > {marker:?}; /bin/sleep 2; fi\necho v22.0.0"
+            "if [ ! -f {marker:?} ]; then echo warm > {marker:?}; /bin/sleep 30; fi\necho v22.0.0"
         ),
             0o700,
         );
-        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        let profile = patient(Profile::load(root.path(), &env(root.path())).unwrap());
         let initial = profile.startup_report();
         assert!(matches!(
             initial.tools["node"],
@@ -933,7 +1044,7 @@ mod tests {
             &format!("if [ -f {marker:?} ]; then echo 27.0.0; else exit 1; fi"),
             0o700,
         );
-        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        let profile = patient(Profile::load(root.path(), &env(root.path())).unwrap());
         let initial = profile.startup_report();
         assert_eq!(initial.tools["docker"], ToolObservation::Unknown);
         assert_eq!(initial.tools["node"], ToolObservation::Unavailable);
@@ -953,13 +1064,150 @@ mod tests {
     }
 
     #[test]
+    fn startup_limits_are_pinned() {
+        assert_eq!(PROBE_TIMEOUT, Duration::from_millis(300));
+        assert_eq!(
+            STARTUP_PROBES,
+            StartupProbes {
+                call: Duration::from_millis(2_000),
+                total: Duration::from_millis(5_000),
+                attempts: 3,
+            }
+        );
+        let clock = StartupClock::start(STARTUP_PROBES);
+        assert_eq!(clock.call_deadline(), Duration::from_millis(2_000));
+        // Out of shared time, a call still gets the live deadline and no more.
+        let spent = StartupClock::start(StartupProbes {
+            call: Duration::from_millis(2_000),
+            total: Duration::ZERO,
+            attempts: 3,
+        });
+        assert!(spent.remaining().is_zero());
+        assert_eq!(spent.call_deadline(), PROBE_TIMEOUT);
+        assert!(spent.repeat_deadline().is_zero());
+        assert_eq!(clock.repeat_deadline(), Duration::from_millis(2_000));
+    }
+
+    fn calls(file: &Path) -> usize {
+        fs::read_to_string(file).map_or(0, |text| text.lines().count())
+    }
+
+    #[test]
+    fn startup_repeats_only_timeouts_within_its_bounds_and_late_success_is_drift() {
+        let root = tempfile::tempdir().unwrap();
+        let node_calls = root.path().join("node-calls");
+        let ready = root.path().join("ready");
+        // node never answers in time until `ready`.
+        fake(
+            root.path(),
+            "node",
+            &format!(
+                "echo call >> {node_calls:?}\nif [ ! -f {ready:?} ]; then /bin/sleep 30; fi\necho v22.0.0"
+            ),
+            0o700,
+        );
+        let profile = patient(Profile::load(root.path(), &env(root.path())).unwrap());
+        let at = Instant::now();
+        let initial = profile.measured_report(Some(StartupProbes {
+            call: Duration::from_millis(400),
+            total: Duration::from_secs(20),
+            attempts: 3,
+        }));
+        // Three calls waited 400ms each (the time says at least three, the
+        // count at most three), and nothing waits for the shared 20s.
+        assert!(at.elapsed() >= Duration::from_millis(1_200));
+        assert!(at.elapsed() < Duration::from_secs(10));
+        assert!(calls(&node_calls) <= 3);
+        assert_eq!(initial.tools["node"], ToolObservation::Unknown);
+
+        // Shared time already spent: one call with the live deadline, no repeat.
+        let other = tempfile::tempdir().unwrap();
+        let other_calls = other.path().join("node-calls");
+        fake(
+            other.path(),
+            "node",
+            &format!("echo call >> {other_calls:?}\n/bin/sleep 30"),
+            0o700,
+        );
+        let spent = Profile::load(other.path(), &env(other.path())).unwrap();
+        let at = Instant::now();
+        let report = spent.measured_report(Some(StartupProbes {
+            call: Duration::from_secs(20),
+            total: Duration::ZERO,
+            attempts: 3,
+        }));
+        assert!(at.elapsed() >= PROBE_TIMEOUT);
+        assert!(at.elapsed() < Duration::from_secs(10));
+        assert!(calls(&other_calls) <= 1);
+        assert_eq!(report.tools["node"], ToolObservation::Unknown);
+
+        // Still unknown after every repeat: the baseline says so, and an
+        // answer after it is drift, exactly as for a failed probe.
+        fs::write(&ready, "ready").unwrap();
+        let live = profile.report();
+        assert!(matches!(
+            live.tools["node"],
+            ToolObservation::Available { .. }
+        ));
+        assert_ne!(live.profile_fingerprint, initial.profile_fingerprint);
+        assert_eq!(
+            profile.identity_failure_message(&live),
+            "worker profile gained a native observation"
+        );
+    }
+
+    #[test]
+    fn startup_takes_a_failure_as_final_at_once() {
+        let root = tempfile::tempdir().unwrap();
+        let docker_calls = root.path().join("docker-calls");
+        fake(
+            root.path(),
+            "docker",
+            &format!("echo call >> {docker_calls:?}\nexit 1"),
+            0o700,
+        );
+        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        // The call has all the time it could need, so it ends by failing.
+        let report = profile.measured_report(Some(StartupProbes {
+            call: Duration::from_secs(30),
+            total: Duration::from_secs(60),
+            attempts: 3,
+        }));
+        assert_eq!(report.tools["docker"], ToolObservation::Unknown);
+        assert_eq!(calls(&docker_calls), 1);
+    }
+
+    #[test]
+    fn a_cold_required_tool_is_measured_at_load_and_a_silent_one_is_refused() {
+        let root = tempfile::tempdir().unwrap();
+        let warmed = root.path().join("warmed");
+        fake(
+            root.path(),
+            "node",
+            &format!(
+                "if [ ! -f {warmed:?} ]; then echo warm > {warmed:?}; /bin/sleep 30; fi\necho v22.0.0"
+            ),
+            0o700,
+        );
+        write_profile(root.path(), "node22", "required_tools = [\"node\"]\n");
+        // The first call runs out of the startup deadline; the repeat answers.
+        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        assert!(profile.required_tools().contains("node"));
+        fake(root.path(), "node", "exit 1", 0o700);
+        assert_eq!(
+            Profile::load(root.path(), &env(root.path())).unwrap_err(),
+            "required worker profile tool node unavailable"
+        );
+    }
+
+    #[test]
     fn initially_unknown_probe_requires_new_identity_when_it_becomes_known() {
         let root = tempfile::tempdir().unwrap();
         let marker = root.path().join("probe-mode");
         fake(root.path(), "node", &format!(
             "case $(/bin/cat {marker:?} 2>/dev/null) in known) echo v22.0.0;; changed) echo v20.0.0;; *) exit 1;; esac"
         ), 0o700);
-        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        let profile = patient(Profile::load(root.path(), &env(root.path())).unwrap());
         let initial = profile.report();
         assert_eq!(initial.tools["node"], ToolObservation::Unknown);
         fs::write(&marker, "known").unwrap();
@@ -985,6 +1233,9 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fake(root.path(), "node", "echo v22.0.0", 0o600);
         let p = Profile::load(root.path(), &env(root.path())).unwrap();
+        // Deadlines are measured with the live one; answers that only have
+        // to arrive are read through a clone that waits for a loaded host.
+        let answers = patient(p.clone());
         assert_eq!(p.probe("node"), ToolObservation::Unavailable);
         for (key, value) in INSTALL_GUARDS {
             assert_eq!(p.environment().get(*key).map(String::as_str), Some(*value));
@@ -1027,7 +1278,7 @@ mod tests {
             0o700,
         );
         assert!(matches!(
-            p.probe("docker"),
+            answers.probe("docker"),
             ToolObservation::Available { .. }
         ));
         fake(root.path(), "xcodebuild", "echo 'Xcode 16.2'", 0o700);
@@ -1042,19 +1293,27 @@ mod tests {
             0o700,
         );
         assert!(matches!(
-            p.probe("xcode"),
+            answers.probe("xcode"),
             ToolObservation::Available { .. }
         ));
         fake(root.path(), "node", "echo v22.0.0 >&2", 0o700);
-        assert!(matches!(p.probe("node"), ToolObservation::Available { .. }));
+        assert!(matches!(
+            answers.probe("node"),
+            ToolObservation::Available { .. }
+        ));
         fake(
             root.path(),
             "node",
             "(while :; do :; done) &\necho v22.0.0",
             0o700,
         );
+        // The answer is taken when the leader exits, not when its busy
+        // descendant would: well inside even the patient deadline.
         let at = Instant::now();
-        assert!(matches!(p.probe("node"), ToolObservation::Available { .. }));
+        assert!(matches!(
+            answers.probe("node"),
+            ToolObservation::Available { .. }
+        ));
         assert!(at.elapsed() < Duration::from_secs(2));
     }
     #[test]
@@ -1141,14 +1400,16 @@ mod preparation_snapshot_tests {
         )
         .unwrap();
         fs::set_permissions(&node, fs::Permissions::from_mode(0o700)).unwrap();
-        let profile = Profile::load(
-            &root,
-            &BTreeMap::from([
-                ("PATH".into(), root.to_str().unwrap().into()),
-                ("SHELL".into(), shell.to_str().unwrap().into()),
-            ]),
-        )
-        .unwrap();
+        let profile = patient(
+            Profile::load(
+                &root,
+                &BTreeMap::from([
+                    ("PATH".into(), root.to_str().unwrap().into()),
+                    ("SHELL".into(), shell.to_str().unwrap().into()),
+                ]),
+            )
+            .unwrap(),
+        );
         assert!(profile
             .preparation_snapshot(&Digest::of_bytes(b"none"))
             .is_none());
