@@ -857,6 +857,7 @@ Source/Vault GCと通常source利用の競合を、ログ根拠に沿って別�
 テスト不足1件を追加して閉じた。実 user stateのGCやnative manager実行は行っていない。
 この結果も新しい統合候補の全体CI・実MSRV1.89・Linux/remote受入の代わりにはしない。
 
+
 ### 単一スレッドのmutation baselineで止まるfixtureの修正
 
 1e7a37e の全体CIは最後のmutation shardの無変異baselineで停止した。pin helperが実lockを
@@ -882,3 +883,58 @@ panic unwindの子回収を含む。strict all-target/all-feature clippy成功�
 実Rustは1.100であり実MSRV1.89・新しい全9ジョブ・remote CIの成功はここでは主張しない。
 
 補足レビューに従いsupervisor fixtureの200000-byte読取loopにも10秒のelapsed期限と数値のみの失敗診断を追加し、終了済みwriterの未読spoolは拒否せず元の検証を維持した。threads1/2 exact各1件成功（0.45秒/0.44秒）、lib/tests strict clippy成功（12.34秒）、fmt/diff-check成功。production変更はない。
+
+### Source intake の並行 SQLite write 修正
+
+1e7a 全体CIは成功ではない。open済みの同一 SourceStore に8接続が同時 ingest する
+経路で database-is-locked が発生した。barrier を付けた実 API 回帰でも旧実装は0.20秒で
+SQLite code5を再現し、最初のSELECT後に書込みへ昇格する Deferred transaction が原因と確認した。
+書込みを行う8箇所は最初のread前に BEGIN IMMEDIATE を取得し、真のread-only handoff
+precheckは変更しない。FS hashing/書込みやcoordinator actor呼出はtransactionへ移さない。
+同一回帰は変更後0.25秒で成功し、保存blobの内容も一致した。Source/Vault lock・claim・clock
+条件は不変。関連source保持/転送の検証と別のforeground GC競合修正を続ける。
+
+### Foreground source 入力と optional GC の競合修正
+
+Source EX を持つ正常なGC pageに、capture/open/submit/retryのtry-SHが重なると、
+入力自体が正常でも INVALID_INPUT / COMMUNICATION_UNKNOWN へ落ちる経路を修正した。
+GC・actor-sensitive API・best-effort deliveryの既存try取得は変更しない。既にactor/admissionを
+離したblocking入力/preflightだけ、foreground専用の取得を使う。通常IPCの5秒timeoutを
+使い切らないようlock待ちは2秒固定とし、最初にopenした永久lock FDを保持したまま同じFDで
+try-SHする。root、named lockのdev/inode・owner・mode・nlinkを各回と成功後に検査し、
+置換・不正・IO faultは再試行しない。open_foregroundは初期化時のSH guardをStoreと共に返し、
+capture・freeze・guarded enqueue/retry commitまで保持する。永久SH pinは作らない。
+
+明示待機が期限へ達した場合だけtyped ForegroundBusy/StorageError::SourceBusyを
+既存 SOURCE_BUSY (exit71)へ対応付ける。一般IOのWouldBlock、SQLite Busy、result-pin、
+expired run、tombstone、digest不一致を同じものへ分類しない。既存stop-selectのあるinput
+preflightはそのままstop-awareで、cancel能力のない同期open/metadata段階のwaitは2秒以内の
+協調的な待機となる。FS syscall自体のhard cancel/deadlineは主張しない。独立DB検査用FDの
+追加、actor内でのsource待機、claim/clock/reader/transport条件の弱化はない。
+
+private fixtureの実retention_pageをSource EX内で停止し、長い競合ではtyped71を返すこと、
+同じ入力の再送と別入力の初回RPCは実wait開始後もpendingのままPingへ応答し、EXを実drain
+するとそのままAcceptedになることを確認した。元のstalled transfer・queue2・shutdown/restart
+assertionsは維持し、失敗時は実Replyを表示する。既存のGC page中のrenew/cancel・owner stop
+drainとretryのsource lease安全テストも成功。lock/root/mode置換拒否、期限、guard clone最終
+unlockも検証した。旧MacのAccepted不一致logは実Replyを表示しておらず、その1回の原因を
+後付けで断定しない。今回の強化した同名テストと過去失敗CLI7経路は成功した。
+
+関連unit105件成功+既存owned helper2件ignore (84.23秒)、source_capture38件を含む実CLI/
+転送integration45件成功 (60.09秒)、strict all-target/all-feature clippy成功 (12.84秒)、
+fmt/diff check成功。actual Rust1.100。独立レビュー、親統合後の全9CI、Rust1.89/remote/native
+受入はこの修正では未実行。実user stateのGC、元ファイルやnative serviceへの操作はない。
+
+foreground最終追記: secret-aware公開capture_runでも明示ForegroundBusyだけを71へ維持し、
+一般IOの従来Internal分類は変更しない。実2秒の公開API回帰で、run/Vault/原本sentinelを
+変更しないことを確認した。親の事前点検に従い、wait中のprivate Source rootについても
+retained FDとnamed root双方のUID・private bits・同inodeを各回/成功後に検証する。
+root chmod755の負例を追加し、既存のlock mode/lock inode/root replacement拒否も保持する。
+nested755の許可範囲は変更しない。最終focused13件成功 (9.06秒)、追記後strict全target/feature
+成功 (12.75秒)、fmt/diff成功。先のunit105+integration45は追記前の8adb6a5での結果と区別する。
+
+
+Source競合修正5c434aaの独立安全レビューは actionable P1/P2なし。pin fixture01e45c5も
+所有child・PID再利用・通知・元assert維持を独立確認済みで、spool deadline補足は0b5df11で
+閉じた。両方を親へ統合し、変更したsource分類のpure gateと、統合後のfocused/全9CIを
+次の区切りとする。前の1e7a37eの失敗・中止結果を新候補の成功へ読み替えない。

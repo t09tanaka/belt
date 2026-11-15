@@ -275,6 +275,23 @@ impl CoordinatorStore {
             .and_then(|source| source.mutation_guard())
             .map_err(|e| StorageError::Invalid(format!("source mutation guard: {e:#}")))
     }
+    /// Foreground input preflight only: call outside actor/admission ownership.
+    pub(crate) fn source_mutation_guard_foreground(
+        &self,
+    ) -> Result<crate::source::retention::Guard> {
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+        crate::source::SourceStore::open_foreground(&self.state_dir)
+            .map(|(_source, guard)| guard)
+            .map_err(|error| {
+                if error.is::<crate::source::retention::ForegroundBusy>() {
+                    StorageError::SourceBusy
+                } else {
+                    StorageError::Invalid(format!("source mutation guard: {error:#}"))
+                }
+            })
+    }
     /// Resolve immutable target identity, lock one run, then validate fresh metadata.
     /// Export/read commands must retain this pin for their whole invocation.
     pub fn result_read_pin(

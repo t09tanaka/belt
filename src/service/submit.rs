@@ -105,11 +105,17 @@ pub async fn command_with_mode(
         .map_err(|e| invalid(e.to_string()))?;
     let freeze_state = context.state_dir().to_owned();
     let resolution_guard = tokio::task::spawn_blocking(move || {
-        crate::source::SourceStore::open(&freeze_state).and_then(|s| s.mutation_guard())
+        crate::source::SourceStore::open_foreground(&freeze_state).map(|(_source, guard)| guard)
     })
     .await
     .map_err(|e| invalid(e.to_string()))?
-    .map_err(|e| invalid(e.to_string()))?;
+    .map_err(|error| {
+        if error.is::<crate::source::retention::ForegroundBusy>() {
+            crate::source::classify::api_error_of(&error)
+        } else {
+            invalid(error.to_string())
+        }
+    })?;
     let (toolchains, resolution_guard) = {
         let capture_context = context.clone();
         let manifest = captured.manifest.clone();
@@ -302,6 +308,7 @@ pub async fn command_with_mode(
             state: "coordinator_accepted",
             warnings: captured.warnings,
         }),
+        Reply::ControlError { error } => Err(error),
         Reply::Error { message } => Err(invalid(message)),
         _ => Err(ApiError::new(
             ErrorCode::CommunicationUnknown,

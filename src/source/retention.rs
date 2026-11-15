@@ -1,11 +1,13 @@
 //! Persistent roots and cross-process exclusion for captured inputs.
 //! Explicit parent retention pages are separate from the nondeleting preview.
 mod deletion;
+mod foreground;
+pub(crate) use foreground::ForegroundBusy;
 mod vault_retention;
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
 pub use deletion::{RetentionCursor, RetentionPage};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::fs::{File, TryLockError};
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
@@ -43,6 +45,8 @@ pub(crate) struct Index {
     verifications: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     page_pause: Arc<std::sync::Mutex<Option<PagePause>>>,
+    #[cfg(test)]
+    foreground_waits: Arc<std::sync::atomic::AtomicUsize>,
 }
 #[cfg(test)]
 #[derive(Debug)]
@@ -99,6 +103,12 @@ fn open_permanent_file(root: &File, name: &str) -> Result<File> {
 }
 impl Index {
     pub(crate) fn open(root: &Path) -> Result<Self> {
+        Self::open_guarded(root, false).map(|(index, _guard)| index)
+    }
+    pub(crate) fn open_foreground(root: &Path) -> Result<(Self, Guard)> {
+        Self::open_guarded(root, true)
+    }
+    fn open_guarded(root: &Path, foreground: bool) -> Result<(Self, Guard)> {
         let this = Self {
             path: root.into(),
             database: std::fs::canonicalize(root)
@@ -115,8 +125,15 @@ impl Index {
             verifications: Default::default(),
             #[cfg(test)]
             page_pause: Default::default(),
+            #[cfg(test)]
+            foreground_waits: Default::default(),
         };
-        let _guard = this.guard(false).context("initial source guard")?;
+        let guard = if foreground {
+            this.foreground_guard()
+        } else {
+            this.guard(false)
+        }
+        .context("initial source guard")?;
         this.prepare_index_file()?;
         this.connect().context("connect source index")?.execute_batch("PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS root(id TEXT PRIMARY KEY,kind TEXT NOT NULL,source TEXT);
@@ -138,7 +155,7 @@ impl Index {
           CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');").context("initialize source index")?;
-        Ok(this)
+        Ok((this, guard))
     }
     fn prepare_index_file(&self) -> Result<()> {
         use rustix::fs::{statat, AtFlags, FileType, Mode, OFlags, RenameFlags};
@@ -388,7 +405,7 @@ impl Index {
                 break;
             }
             after = keys.last().unwrap().clone();
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for key in keys {
                 tx.execute(
                     "INSERT OR IGNORE INTO member VALUES(?1,?2)",
@@ -473,7 +490,7 @@ impl Index {
             let cached = cache.as_ref().unwrap();
             cached.check(self)?;
             let m = &cached.manifest;
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let key = format!("m:{}", m.source_id);
             let path = format!("manifests/{}.json", m.source_id);
             Self::check_publication(&tx, &key)?;
@@ -531,7 +548,7 @@ impl Index {
     fn release_import_page(&self, token: &ImportToken, received: &str) -> Result<bool> {
         self.check_token(token)?;
         let mut c = self.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let keys: Vec<String> = {
             let mut s = tx.prepare("SELECT a.object FROM member a WHERE a.root=?1 AND EXISTS(SELECT 1 FROM member b WHERE b.root=?2 AND b.object=a.object) ORDER BY a.object LIMIT 32")?;
             let rows = s.query_map(params![token.root(), received], |r| r.get(0))?;
@@ -572,7 +589,9 @@ impl Index {
     pub(crate) fn import_blob(&self, token: &ImportToken, hash: &str) -> Result<()> {
         self.check_token(token)?;
         let mut c = self.connect()?;
-        let tx = c.transaction()?;
+        // Reserve the writer before reading. Competing Deferred readers cannot
+        // both upgrade to a writer, even with SQLite's busy timeout installed.
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pending: bool = tx.query_row(
             "SELECT state='pending' FROM import_session WHERE token=?1",
             [&token.id],
@@ -656,7 +675,7 @@ impl Index {
     }
     fn handoff_page(&self, pending: &str, run: &str) -> Result<bool> {
         let mut c = self.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Destination must contain each membership before its source is released.
         let keys: Vec<String> = {
             let mut s =
@@ -751,7 +770,7 @@ impl SourceStore {
             store: (metadata.dev(), metadata.ino()),
         };
         let mut c = self.retention.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO import_session(token,state) VALUES(?1,'pending')",
             [&token.id],
@@ -766,7 +785,7 @@ impl SourceStore {
     pub(crate) fn import_publication_root(&self, token: &ImportToken, id: &str) -> Result<String> {
         self.retention.check_token(token)?;
         let mut c = self.retention.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (state, source): (String, Option<String>) = tx.query_row(
             "SELECT state,source FROM import_session WHERE token=?1",
             [&token.id],
@@ -809,7 +828,7 @@ impl SourceStore {
         guard.ensure_run_available(run)?;
         self.retention.check_token(token)?;
         let mut c = self.retention.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (state, id, bound_run): (String, Option<String>, Option<String>) = tx.query_row(
             "SELECT state,source,run_id FROM import_session WHERE token=?1",
             [&token.id],
@@ -1551,6 +1570,7 @@ mod tests {
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),
+                foreground_waits: Default::default(),
             };
             let gate = std::sync::Barrier::new(8);
             let guards = std::thread::scope(|scope| {
@@ -1598,6 +1618,7 @@ mod tests {
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),
+                foreground_waits: Default::default(),
             };
             let gate = std::sync::Barrier::new(8);
             let identities = std::thread::scope(|scope| {

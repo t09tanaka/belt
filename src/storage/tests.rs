@@ -1836,6 +1836,12 @@ fn a_busy_database_is_a_retryable_error_and_changes_nothing() {
         assert!(e.is_retryable());
         assert_eq!(e.code(), ErrorCode::Internal);
         assert!(!StorageError::Closed.is_retryable());
+        assert!(StorageError::SourceBusy.is_retryable());
+        assert_eq!(StorageError::SourceBusy.code(), ErrorCode::SourceBusy);
+        assert_eq!(
+            StorageError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)).code(),
+            ErrorCode::Internal
+        );
         let e = other.gc(1, 1, 1).err().unwrap();
         assert!(e.is_retryable());
         release_tx.send(()).unwrap();

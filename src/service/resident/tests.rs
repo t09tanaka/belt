@@ -578,20 +578,82 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
     .await
     .unwrap()
     .client;
+    let (gc_entered, gc_resume) = captured.sources.pause_retention_page();
+    let gc_sources = captured.sources.clone();
+    let gc_owner = resident.coordinator.clone();
+    // One real GC page, rather than repeatedly colliding a 10ms test cadence
+    // with the independent source-delivery timer.
+    let gc = tokio::task::spawn_blocking(move || {
+        gc_sources.retention_page(
+            gc_owner.store(),
+            &mut Default::default(),
+            wall_ms(),
+            crate::platform::clock::monotonic_ms(),
+            crate::platform::boot_id(),
+            crate::results::plan::retention_ms(7),
+        )
+    });
     let owner = tokio::spawn(resident.run());
+    tokio::task::spawn_blocking(move || gc_entered.recv_timeout(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
+    let waits_before = captured.sources.foreground_wait_count();
+    let busy_client = client.clone();
+    let busy_input: Operation =
+        serde_json::from_value(serde_json::to_value(&first).unwrap()).unwrap();
+    let busy = tokio::spawn(async move { busy_client.request(busy_input).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while captured.sources.foreground_wait_count() == waits_before {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        client.request(Operation::Ping).await.unwrap(),
+        Reply::Ready { .. }
+    ));
+    let busy_reply = tokio::time::timeout(Duration::from_secs(3), busy)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(&busy_reply, Reply::ControlError { error } if error.code == crate::error::ErrorCode::SourceBusy),
+        "actual busy reply: {busy_reply:?}"
+    );
     let first_client = client.clone();
     let first = tokio::spawn(async move { first_client.request(first).await });
     let second_client = client.clone();
     let second = tokio::spawn(async move { second_client.request(second).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while captured.sources.foreground_wait_count() < waits_before + 3 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!first.is_finished() && !second.is_finished());
+    assert!(matches!(
+        tokio::time::timeout(Duration::from_secs(1), client.request(Operation::Ping))
+            .await
+            .unwrap()
+            .unwrap(),
+        Reply::Ready { .. }
+    ));
+    gc_resume.send(()).unwrap();
+    gc.await.unwrap().unwrap();
     for task in [first, second] {
-        assert!(matches!(
-            tokio::time::timeout(Duration::from_secs(2), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap(),
-            Reply::Accepted { .. }
-        ));
+        let reply = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(reply, Reply::Accepted { .. }),
+            "actual acceptance reply: {reply:?}"
+        );
     }
     drop(held_transfer);
     tokio::time::timeout(Duration::from_secs(2), received)

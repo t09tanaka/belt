@@ -21,7 +21,7 @@ pub fn attempt_budget(requested: Option<u32>) -> u32 {
 
 /// What a refused capture is to the caller. Nothing is dispatched on any of
 /// these; of the codes a capture can end with, only `SOURCE_BUSY` says "try
-/// again" (the input was moving). A worker that is too busy to take a request
+/// again" (the input was moving or retention is still busy). A worker that is too busy to take a request
 /// answers `OVERLOADED`, which has its own exit code and is never a capture's.
 pub fn error_code(e: &SourceError) -> ErrorCode {
     use SourceError::*;
@@ -59,6 +59,12 @@ pub fn api_error(e: &SourceError) -> ApiError {
 /// The error body for any failure of a capture: a [`SourceError`] says what it
 /// is, everything else is an unexpected failure.
 pub fn api_error_of(e: &anyhow::Error) -> ApiError {
+    if e.is::<crate::source::retention::ForegroundBusy>() {
+        return ApiError::new(
+            ErrorCode::SourceBusy,
+            "captured inputs are temporarily busy",
+        );
+    }
     match e.downcast_ref::<SourceError>() {
         Some(s) => api_error(s),
         None => ApiError::new(ErrorCode::Internal, format!("{e:#}")),
@@ -206,6 +212,11 @@ mod tests {
 
     #[test]
     fn an_error_that_is_not_a_source_error_is_internal() {
+        let busy = anyhow::Error::new(crate::source::retention::ForegroundBusy)
+            .context("waiting for source");
+        assert_eq!(api_error_of(&busy).code, ErrorCode::SourceBusy);
+        let generic_busy = anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        assert_eq!(api_error_of(&generic_busy).code, ErrorCode::Internal);
         let a = api_error_of(&anyhow::anyhow!("disk full"));
         assert_eq!(a.code, ErrorCode::Internal);
         assert!(a.message.contains("disk full"));

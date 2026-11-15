@@ -403,6 +403,20 @@ impl GuardedObjectStore<'_> {
 impl SourceStore {
     /// `<state_dir>/sources`, private to this user.
     pub fn open(state_dir: &Path) -> Result<Self> {
+        let inner = Self::open_root(state_dir)?;
+        let retention = super::retention::Index::open(inner.root())?;
+        Ok(SourceStore { inner, retention })
+    }
+
+    /// Blocking input/preflight only, before actor/admission ownership. The
+    /// initial SH guard stays with the caller across all subsequent input IO.
+    pub(crate) fn open_foreground(state_dir: &Path) -> Result<(Self, super::retention::Guard)> {
+        let inner = Self::open_root(state_dir)?;
+        let (retention, guard) = super::retention::Index::open_foreground(inner.root())?;
+        Ok((SourceStore { inner, retention }, guard))
+    }
+
+    fn open_root(state_dir: &Path) -> Result<ObjectStore> {
         let root = state_dir.join("sources");
         match std::fs::symlink_metadata(&root) {
             Ok(meta) => anyhow::ensure!(
@@ -415,8 +429,7 @@ impl SourceStore {
         let inner = ObjectStore::open(&root)?;
         std::fs::create_dir_all(root.join("runs"))?;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
-        let retention = super::retention::Index::open(&root)?;
-        Ok(SourceStore { inner, retention })
+        Ok(inner)
     }
 
     /// Is the blob in the store? (Only a well-formed hash can be.)

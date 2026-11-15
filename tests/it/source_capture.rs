@@ -1492,12 +1492,17 @@ fn the_same_blob_arriving_from_many_connections_at_once_is_stored() {
         },
         size: data.len() as u64,
     };
+    let entered = std::sync::Barrier::new(8);
     std::thread::scope(|sc| {
         for _ in 0..8 {
-            sc.spawn(|| s.ingest_blob(&want, &mut &data[..]).unwrap());
+            sc.spawn(|| {
+                entered.wait();
+                s.ingest_blob(&want, &mut &data[..]).unwrap();
+            });
         }
     });
     assert!(s.has_blob(&want.hash));
+    assert_eq!(s.read_blob(&want.hash).unwrap(), data);
 }
 
 #[test]

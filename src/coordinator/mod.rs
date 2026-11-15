@@ -571,7 +571,7 @@ impl Coordinator {
         tasks: Vec<(TaskId, TaskSpec)>,
     ) -> Result<()> {
         let owner = self.store.clone();
-        let source = tokio::task::spawn_blocking(move || owner.source_mutation_guard())
+        let source = tokio::task::spawn_blocking(move || owner.source_mutation_guard_foreground())
             .await
             .map_err(|e| CoordinatorError::Invalid(e.to_string()))??;
         self.enqueue_guarded(run_id, source_id, tasks, source).await
