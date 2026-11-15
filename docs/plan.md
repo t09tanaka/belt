@@ -664,7 +664,12 @@ Vault は独立した永続 `vault_clock`（retention 0、初回は Hold）を�
 private UID/nlink1/0600 の厳密な run.json のみで、親 directory fsync 後に完了する。
 
 Vault 内の private parent registration は source root/index の identity を固定し、generic constructor/has/load/adopt/capture も
-この永続境界を確認する。index 欠損・交換・不明は Unavailable/has=false で、worker mode へ戻らない。
+この永続境界を確認する。SourceIndex meta にも marker 公開前に同一登録を永続化し、marker 欠損時は
+既存 index のみを READ_ONLY で開いて分類を復元する（新規 index は作らない）。永続 Vault lock にも
+marker/claim より先に同じ登録を fsync し、source tree と marker の同時欠損でも親分類を保持する。index 欠損・交換・不明は
+Unavailable/has=false で、worker mode へ戻らない。secret run の source expiry/member 解除は、
+その run/source/厳密 binding と一致する完了済み Vault claim まで保留する。共有 manifest の各 run に適用し、
+C の clock Hold・busy・cursor 遅延・個別エラー・未完了 claim があっても必要な manifest を保持する。
 直接 API と cloneable HeldBundle は Vault SH を持つ。send_bundle は opaque lease を encoded Outgoing に渡し、
 caller timeout/cancellation 後も queue・write・flush/cut が所有する。writer 死亡/abort は残る queue を破棄し、
 writer の内部 buffer を破棄するまで current frame の lease を保持する。last lease は明示 unlock する。

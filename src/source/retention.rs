@@ -11,7 +11,9 @@ use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-pub(crate) use vault_retention::{check_vault_registration, check_vault_run, VaultRegistration};
+pub(crate) use vault_retention::{
+    check_vault_registration, check_vault_run, recover_vault_registration, VaultRegistration,
+};
 pub use vault_retention::{VaultCursor, VaultPage};
 
 #[derive(Debug, Clone)]
@@ -3259,6 +3261,236 @@ mod tests {
                 .unwrap()
                 .unwrap()
                 .secret_files
+        }
+        #[test]
+        fn source_gc_preserves_secret_proof_before_vault_and_pending_claim() {
+            let (f, r, v, k) = prepared();
+            let source = f.store.source_of_run(&r).unwrap().unwrap();
+            let mut b = RetentionCursor::default();
+            assert!(
+                f.store
+                    .retention_page(&f.owner, &mut b, 100, 10, Some("boot".into()), 10)
+                    .unwrap()
+                    .held
+            );
+            assert_eq!(deletion_tick(&f, &mut b).claimed, 0);
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            b = RetentionCursor::default();
+            assert_eq!(deletion_tick(&f, &mut b).claimed, 0);
+            crate::secrets::vault::set_retention_fault(Some("after_claim"));
+            let page = tick(&f, &v, &k, &mut c, 101, 11);
+            crate::secrets::vault::set_retention_fault(None);
+            assert_eq!((page.claimed, page.unknown), (1, 1));
+            b = RetentionCursor::default();
+            assert_eq!(deletion_tick(&f, &mut b).claimed, 0);
+            assert!(f.store.manifest(&source).unwrap().is_some());
+            let db = f.store.retention.connect().unwrap();
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM run_expiry", [], |r| r
+                    .get::<_, u32>(0))
+                    .unwrap(),
+                0
+            );
+            assert_eq!(tick(&f, &v, &k, &mut c, 102, 12).removed, 1);
+            // A completed row with the wrong binding is not authority either.
+            let binding: String = db
+                .query_row("SELECT binding_digest FROM vault_delete_claim", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            db.execute("UPDATE vault_delete_claim SET binding_digest='wrong'", [])
+                .unwrap();
+            b = RetentionCursor::default();
+            assert_eq!(deletion_tick(&f, &mut b).claimed, 0);
+            db.execute("UPDATE vault_delete_claim SET binding_digest=?1", [binding])
+                .unwrap();
+            b = RetentionCursor::default();
+            assert!(deletion_tick(&f, &mut b).removed > 0);
+            assert!(!f.state.join("secrets").join(format!("{r}.json")).exists());
+        }
+        #[test]
+        fn source_gc_shared_manifest_waits_for_each_secret_run_failure() {
+            let (f, r, v, k) = prepared();
+            let other = RunId::generate();
+            secret_bind(&f, &other, &v, &k);
+            f.terminal(&other);
+            let source = f.store.source_of_run(&r).unwrap().unwrap();
+            assert_eq!(f.store.source_of_run(&other).unwrap().unwrap(), source);
+            let path = f.state.join("secrets").join(format!("{other}.json"));
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            let mut c = VaultCursor::default();
+            tick(&f, &v, &k, &mut c, 100, 10);
+            let page = tick(&f, &v, &k, &mut c, 101, 11);
+            assert_eq!((page.claimed, page.removed, page.unknown), (1, 1, 1));
+            let mut b = RetentionCursor::default();
+            f.store
+                .retention_page(&f.owner, &mut b, 100, 10, Some("boot".into()), 10)
+                .unwrap();
+            for _ in 0..4 {
+                deletion_tick(&f, &mut b);
+            }
+            assert!(f.store.manifest(&source).unwrap().is_some());
+            let db = f.store.retention.connect().unwrap();
+            assert!(!db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM run_expiry WHERE run_id=?1)",
+                    [other.as_str()],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap());
+            assert!(db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM member WHERE root=?1)",
+                    [other.as_str()],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap());
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+            c = VaultCursor::default();
+            assert_eq!(tick(&f, &v, &k, &mut c, 102, 12).removed, 1);
+            for _ in 0..4 {
+                deletion_tick(&f, &mut b);
+            }
+            assert!(!db
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM member WHERE root=?1)",
+                    [other.as_str()],
+                    |r| r.get::<_, bool>(0)
+                )
+                .unwrap());
+        }
+        #[test]
+        fn vault_missing_marker_recovers_parent_fence_for_existing_and_reopened() {
+            let (f, r, v, k) = prepared();
+            let files = entries(&f, &r);
+            let path = f.state.join("secrets").join(format!("{r}.json"));
+            let bytes = std::fs::read(&path).unwrap();
+            let mut c = VaultCursor::default();
+            tick(&f, &v, &k, &mut c, 100, 10);
+            assert_eq!(tick(&f, &v, &k, &mut c, 101, 11).removed, 1);
+            let marker = f.state.join("secrets/parent-retention.json");
+            std::fs::rename(&marker, marker.with_extension("renamed")).unwrap();
+            let reopened = Vault::open(&f.state).unwrap();
+            for vault in [&v, &reopened] {
+                assert!(!vault.has(&r));
+                assert!(matches!(
+                    vault.load(&r, &files, &k),
+                    Err(crate::secrets::SecretError::Unavailable { .. })
+                ));
+                let copy = f._root.path().join("attempted-replacement");
+                std::fs::write(&copy, &bytes).unwrap();
+                std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600)).unwrap();
+                assert!(matches!(
+                    vault.adopt(&r, &copy, &files, &k),
+                    Err(crate::secrets::SecretError::Unavailable { .. })
+                ));
+                let result = capture_run(
+                    &BTreeMap::new(),
+                    &f.store,
+                    vault,
+                    &SecretInputs {
+                        key: &k,
+                        declared: &[local_ci::source::SecretSpec {
+                            glob: ".env".into(),
+                            required: true,
+                        }],
+                    },
+                    &r,
+                    &SourceRequest::Directory {
+                        dir: f.input.clone(),
+                    },
+                    &CaptureParams::default(),
+                )
+                .unwrap_err();
+                assert_eq!(
+                    result.blocked_reason,
+                    Some(crate::error::BlockedReason::SecretUnavailable)
+                );
+                assert!(!path.exists());
+            }
+            // Source index loss together with marker loss is still fail closed.
+            let database = f.state.join("sources/retention.db");
+            std::fs::rename(&database, database.with_extension("renamed")).unwrap();
+            assert!(!v.has(&r));
+            assert!(v.load(&r, &files, &k).is_err());
+            assert!(Vault::open(&f.state).is_err());
+            assert!(!database.exists());
+            std::fs::rename(database.with_extension("renamed"), &database).unwrap();
+            let sources = f.state.join("sources");
+            std::fs::rename(&sources, sources.with_extension("renamed")).unwrap();
+            assert!(!v.has(&r));
+            assert!(Vault::open(&f.state).is_err());
+            std::fs::rename(sources.with_extension("renamed"), &sources).unwrap();
+        }
+        #[test]
+        fn vault_classification_pin_malformed_or_conflicting_marker_fails_closed() {
+            use std::os::unix::fs::FileExt;
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            tick(&f, &v, &k, &mut c, 100, 10);
+            let marker = f.state.join("secrets/parent-retention.json");
+            let original = std::fs::read(&marker).unwrap();
+            let plaintext = f.state.join("secrets").join(format!("{r}.json"));
+            let original_plaintext = std::fs::read(&plaintext).unwrap();
+            let mut wrong: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            wrong["database"][1] = serde_json::json!(0);
+            std::fs::write(&marker, serde_json::to_vec(&wrong).unwrap()).unwrap();
+            assert!(!v.has(&r));
+            assert!(Vault::open(&f.state).is_err());
+            assert!(f
+                .store
+                .vault_retention_page(&f.owner, &v, &k, &mut c, 101, 11, Some("boot".into()))
+                .is_err());
+            assert_eq!(std::fs::read(&plaintext).unwrap(), original_plaintext);
+            std::fs::write(&marker, &original).unwrap();
+            let db = f.store.retention.connect().unwrap();
+            let mut wrong_meta: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            wrong_meta["database"][1] = serde_json::json!(0);
+            db.execute(
+                "UPDATE meta SET value=?1 WHERE key='vault_registration'",
+                [serde_json::to_string(&wrong_meta).unwrap()],
+            )
+            .unwrap();
+            assert!(!v.has(&r));
+            assert!(Vault::open(&f.state).is_err());
+            db.execute(
+                "UPDATE meta SET value=?1 WHERE key='vault_registration'",
+                [std::str::from_utf8(&original).unwrap()],
+            )
+            .unwrap();
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(f.state.join("secrets/retention.lock"))
+                .unwrap();
+            lock.write_all_at(b"!", 0).unwrap();
+            lock.sync_all().unwrap();
+            assert!(!v.has(&r));
+            assert!(Vault::open(&f.state).is_err());
+            assert!(f.state.join("secrets/retention.lock").exists());
+            assert!(f
+                .store
+                .vault_retention_page(&f.owner, &v, &k, &mut c, 101, 11, Some("boot".into()))
+                .is_err());
+            assert_eq!(std::fs::read(&plaintext).unwrap(), original_plaintext);
+        }
+        #[test]
+        fn vault_marker_missing_recovers_from_index_before_lock_pin() {
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            // Model a crash after meta commit, before the first lock pin/marker.
+            let lock = std::fs::OpenOptions::new()
+                .write(true)
+                .open(f.state.join("secrets/retention.lock"))
+                .unwrap();
+            lock.set_len(0).unwrap();
+            lock.sync_all().unwrap();
+            std::fs::remove_file(f.state.join("secrets/parent-retention.json")).unwrap();
+            let reopened = Vault::open(&f.state).unwrap();
+            assert!(reopened.has(&r));
+            assert_eq!(tick(&f, &v, &k, &mut c, 101, 11).removed, 1);
+            assert!(!reopened.has(&r));
         }
         #[test]
         fn vault_parent_tombstone_deletes_only_private_copy_and_never_expires_source() {

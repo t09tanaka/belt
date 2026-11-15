@@ -462,6 +462,22 @@ impl SourceStore {
                 return Ok(report);
             }
             let binding = self.retention.exact_run_binding(&run, &source, &binding)?;
+            // Secret manifests remain roots until this exact run's Vault work
+            // has completed. C may be held, busy, behind its cursor, or failed
+            // after its durable claim; scheduling order is not authority.
+            if !validated.manifest.secret_files.is_empty() {
+                let resolved: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM vault_delete_claim WHERE run_id=?1 AND source_id=?2 AND binding_digest=?3 AND done=1)",
+                    params![run, source, binding],
+                    |r| r.get(0),
+                )?;
+                if !resolved {
+                    cursor.run = Some(run);
+                    cursor.object.clear();
+                    cursor.validated = None;
+                    return Ok(report);
+                }
+            }
             // Permanent fence commits BEFORE any membership can be released.
             ensure!(
                 owner.check_input_store(&self.retention.path, &self.retention.root)?

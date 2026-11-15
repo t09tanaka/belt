@@ -184,29 +184,69 @@ impl Lease {
             .read_open(name)?
             .map(|(bytes, identity, _)| (bytes, identity)))
     }
-    pub(crate) fn check_parent(&self) -> anyhow::Result<()> {
+    fn parent_registration(
+        &self,
+    ) -> anyhow::Result<Option<crate::source::retention::VaultRegistration>> {
+        let state = self.path.parent().context("Vault state parent")?;
+        // The permanent lock also pins parent classification: losing the
+        // optional marker and even the source tree cannot downgrade a parent.
+        if let Some(registration) = self.pinned_registration()? {
+            ensure!(
+                registration.matches_parent(state),
+                "Vault pinned source path mismatch"
+            );
+            if let Some((bytes, _)) = self.read("parent-retention.json")? {
+                ensure!(
+                    serde_json::from_slice::<crate::source::retention::VaultRegistration>(&bytes)?
+                        == registration,
+                    "Vault marker and classification pin disagree"
+                );
+            }
+            return Ok(Some(registration));
+        }
         if let Some((bytes, _)) = self.read("parent-retention.json")? {
             let registration: crate::source::retention::VaultRegistration =
                 serde_json::from_slice(&bytes)?;
             ensure!(
-                registration.matches_parent(self.path.parent().context("Vault state parent")?),
+                registration.matches_parent(state),
                 "Vault registration source path mismatch"
             );
+            Ok(Some(registration))
+        } else {
+            crate::source::retention::recover_vault_registration(state)
+        }
+    }
+    fn pinned_registration(
+        &self,
+    ) -> anyhow::Result<Option<crate::source::retention::VaultRegistration>> {
+        use std::os::unix::fs::FileExt;
+        let before = Identity::of(&self.lock)?;
+        ensure!(
+            before.private() && before.size <= 65536,
+            "unsafe Vault classification pin"
+        );
+        if before.size == 0 {
+            return Ok(None);
+        }
+        let mut bytes = vec![0; before.size as usize];
+        self.lock.read_exact_at(&mut bytes, 0)?;
+        ensure!(
+            Identity::of(&self.lock)? == before,
+            "Vault classification pin changed"
+        );
+        Ok(Some(serde_json::from_slice(&bytes)?))
+    }
+    pub(crate) fn check_parent(&self) -> anyhow::Result<()> {
+        if let Some(registration) = self.parent_registration()? {
             crate::source::retention::check_vault_registration(&registration)?;
         }
         Ok(())
     }
     pub(crate) fn registered(&self) -> anyhow::Result<bool> {
-        Ok(self.read("parent-retention.json")?.is_some())
+        Ok(self.parent_registration()?.is_some())
     }
     pub(crate) fn available(&self, run: &RunId) -> anyhow::Result<()> {
-        if let Some((bytes, _)) = self.read("parent-retention.json")? {
-            let registration: crate::source::retention::VaultRegistration =
-                serde_json::from_slice(&bytes)?;
-            ensure!(
-                registration.matches_parent(self.path.parent().context("Vault state parent")?),
-                "Vault registration source path mismatch"
-            );
+        if let Some(registration) = self.parent_registration()? {
             crate::source::retention::check_vault_run(&registration, run)?;
         }
         Ok(())
@@ -282,6 +322,17 @@ impl Lease {
         &self,
         registration: &crate::source::retention::VaultRegistration,
     ) -> anyhow::Result<()> {
+        if let Some(pinned) = self.pinned_registration()? {
+            ensure!(
+                pinned == *registration,
+                "Vault parent classification changed"
+            );
+        } else {
+            use std::os::unix::fs::FileExt;
+            self.lock
+                .write_all_at(&serde_json::to_vec(registration)?, 0)?;
+            self.lock.sync_all()?;
+        }
         if let Some((bytes, _)) = self.read("parent-retention.json")? {
             ensure!(
                 serde_json::from_slice::<crate::source::retention::VaultRegistration>(&bytes)?
