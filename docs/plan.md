@@ -763,3 +763,9 @@ receipt/dir flood/共有byte上限の否定、actual admitted receipt と activa
 
 大きい native install、template complete-content proof、実 TTC ledger ID と依存/resource graph/simulator、
 実 user-path setup cost と Docker 受入は必須残件で、S15f 全体の完成とは扱わない。
+
+独立レビューは9c963739に actionable P1/P2なし。追加で元profileとverification STARTの
+包含関係を明示した。profile TTLは正確に5000ms、completed ≤ START ≤ observed なので、
+verification ageはprofile age以下となり、同じ5000msの検証期限は既に元profile期限に含まれる。
+STARTの前後範囲の検証を維持し、冗長なmin計算のみ整理する。受信から期限を作ることや、
+元sampleの更新、期限の延長はしない。この追加差分のfocused pure gateは親が再検証する。

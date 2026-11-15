@@ -42,13 +42,14 @@ impl ProbeProvenance {
         let age = self
             .observed_monotonic_ms
             .checked_sub(p.completed_monotonic_ms)?;
-        let mut remaining = p.ttl_ms.checked_sub(age)?.min(self.observation_ttl_ms);
+        let remaining = p.ttl_ms.checked_sub(age)?.min(self.observation_ttl_ms);
         if let Some(started) = self.verification_started_monotonic_ms {
-            if started < p.completed_monotonic_ms || started == u64::MAX {
+            if started < p.completed_monotonic_ms || started > self.observed_monotonic_ms {
                 return None;
             }
-            let verification_age = self.observed_monotonic_ms.checked_sub(started)?;
-            remaining = remaining.min(5000u64.checked_sub(verification_age)?);
+            // Verification starts after the original profile sample. Its age
+            // is therefore no greater, so the same 5000ms lifetime is already
+            // bounded by the original profile deadline above.
         }
         let deadline = sent.checked_add(remaining)?;
         (received < deadline).then_some(deadline)
