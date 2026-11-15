@@ -797,3 +797,69 @@ fn an_unknown_key_is_refused_except_where_serde_cannot() {
     let read = WireRunResult::from_json(&v.to_string()).unwrap();
     assert_eq!(read.digest().unwrap(), w.digest().unwrap());
 }
+
+#[test]
+fn receipt_timing_bits_digest_and_transaction_replay_survive_json_roundtrip() {
+    use local_ci::driver::{Driver, DriverConfig, Input, Transition, DRIVER_VERSION};
+    use local_ci::task::{JobOutcome, JobStatus};
+    let (_tmp, plan) = plan();
+    let mut driver = Driver::new(
+        &plan,
+        DriverConfig {
+            schema_version: DRIVER_VERSION,
+            max_parallel: 1,
+        },
+    )
+    .unwrap();
+    let advance = driver.propose(Input::Advance).unwrap();
+    driver.apply(&advance).unwrap();
+    let task = &plan.tasks[0];
+    let claim = driver
+        .propose(Input::Claim {
+            task: task.id.clone(),
+            token: "timing-owner".into(),
+        })
+        .unwrap();
+    driver.apply(&claim).unwrap();
+    let mut receipt = wire_task("/runs/r1");
+    receipt.task = task.id.clone();
+    receipt.outcomes = vec![JobOutcome {
+        job: "a".into(),
+        variant: None,
+        status: JobStatus::Success,
+        outputs: Default::default(),
+        skipped: None,
+        ancestor_failed: false,
+    }];
+    // A supported finite timing value whose parser previously lost one bit.
+    let secs = f64::from_bits(0x3f77_702c_4c0d_9e0d);
+    receipt.jobs[0].secs = secs;
+    receipt.jobs[0].steps[0].secs = secs;
+    let text = serde_json::to_string(&receipt).unwrap();
+    let decoded = WireTaskResult::from_json(&text).unwrap();
+    assert_eq!(decoded.jobs[0].secs.to_bits(), secs.to_bits());
+    assert_eq!(decoded.jobs[0].steps[0].secs.to_bits(), secs.to_bits());
+    let digest = receipt.digest().unwrap();
+    assert_eq!(decoded.digest().unwrap(), digest);
+    WireTaskResult::from_json_checked(&text, &digest).unwrap();
+    let mut replay = driver.clone();
+    let settled = driver
+        .propose(Input::Settle {
+            task: task.id.clone(),
+            token: "timing-owner".into(),
+            result_digest: digest,
+            result: Box::new(receipt),
+        })
+        .unwrap();
+    driver.apply(&settled).unwrap();
+    replay
+        .apply(&Transition::from_json(&serde_json::to_string(&settled).unwrap()).unwrap())
+        .unwrap();
+    assert_eq!(replay.revision(), driver.revision());
+    assert_eq!(replay.admitted(), 0);
+    assert_eq!(
+        replay.outcome(&task.workflow, "a"),
+        driver.outcome(&task.workflow, "a")
+    );
+    assert_eq!(replay.pending_actions(), driver.pending_actions());
+}
