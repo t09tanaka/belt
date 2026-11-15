@@ -16,7 +16,7 @@ use crate::frozen::{
     SourceRef,
 };
 use crate::source::{self, SourceInfo, SourceKind, SourceManifest};
-use crate::{cache, config, exec, filter, git, plan, report, setup, workflow};
+use crate::{cache, config, exec, filter, git, plan, reclaim, report, setup, workflow};
 use anyhow::{bail, Context, Result};
 use std::path::PathBuf;
 
@@ -684,13 +684,18 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         ));
     }
 
+    // What runs that were killed left under `wt` is removed, and what this
+    // run makes there is removed when `owner` goes, however the run ends.
+    let owner = reclaim::enter(ctx, &cache)?;
     let (setup, units) = if fp.units.is_empty() {
         (vec![], vec![])
     } else {
         let name = format!("{}-{}", &sha[..7], std::process::id());
         let wt = cache.join("wt").join(&name);
         let tools = cache.join("wt").join(format!("{name}.tools"));
-        std::fs::create_dir_all(cache.join("wt"))?;
+        // before the worktree is made: a signal during the checkout must not
+        // leave it behind
+        obs.executing();
         match &a.source {
             // the captured bytes, not a checkout of the commit
             Some(m) => source::add_worktree(
@@ -702,7 +707,6 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             )?,
             None => git::add_worktree(ctx, &root, &wt, sha)?,
         }
-        obs.executing();
         let traffic_controller = if a.no_traffic_controller {
             None
         } else {
@@ -736,6 +740,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         };
         let result = run_plan(ctx, &fp, &ws, opts);
         if a.keep {
+            owner.keep();
             obs.notice(&format!("kept worktree {}", report::tilde(&wt, ctx.home())));
             if fp.units.len() > 1 {
                 obs.notice(
@@ -744,11 +749,12 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             }
         } else {
             git::remove_worktree(ctx, &root, &wt, &cache.join("trash"));
-            let _ = std::fs::remove_dir_all(&tools);
+            git::remove_dir_later(ctx, &tools, &cache.join("trash"));
         }
         let r = result?;
         (r.setup, r.units)
     };
+    drop(owner);
     if !ctx.cancel.is_cancelled() {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
