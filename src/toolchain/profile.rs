@@ -857,10 +857,12 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let marker = root.path().join("probe-mode");
         fake(root.path(), "node", &format!(
-            "case $(/bin/cat {marker:?} 2>/dev/null) in timeout) /bin/sleep 2;; changed) echo v20.0.0;; *) echo v22.0.0;; esac"
+            "mode=; if [ -r {marker:?} ]; then IFS= read -r mode < {marker:?} || :; fi; case \"$mode\" in timeout) /bin/sleep 2;; changed) echo v20.0.0;; *) echo v22.0.0;; esac"
         ), 0o700);
         let profile = Profile::load(root.path(), &env(root.path())).unwrap();
-        let initial = profile.report();
+        // Establish the known baseline through the actual resident startup
+        // path. The later deliberately unknown sample still uses report().
+        let initial = profile.startup_report();
         assert!(matches!(
             initial.tools["node"],
             ToolObservation::Available { .. }

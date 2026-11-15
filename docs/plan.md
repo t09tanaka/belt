@@ -950,3 +950,19 @@ exact coverage184/184、全14変異は10 caught・4 unviable・0 missed・0 time
 所有targetプロセス残存0を確認し、結果はprivate fixtureのみである。
 この記録を含むコミット済み候補で全9 local-ciを新規実行する。実Rust1.100とMSRV1.89・
 ローカルinstaller未再現・Docker cleanupの環境制限・remote未実行は引き続き区別する。
+
+### 450ae1f の失敗と変異検証の選択を先に修正する方針
+
+全9CI450ae1fは64分46秒で中止、1成功・5失敗・2中止・1未実行。全体ゲート成功ではない。
+Retry前forward leaseのtry-SH、transfer leaseの解放順/明示unlock、profile fixtureの
+初回Known前提を追加原因として切り分けた。transfer修正10cee9eを先に取り込み、
+profile fixtureは実residentと同じstartup_reportでKnown baselineを確立し、marker読取を
+shell builtinへ変更した。後続のnormal reportによるUnknown拒否・実version/実行file変化の
+assertは維持、productionの300ms期限と観測動作は不変更。threads1/2各3件成功(1.07/0.84秒)。
+
+ユーザーの優先指示に従い、次の全体CI前にpure変異検証の選択と再発防止を修正する。
+現状の全integration込みbaselineは成功した2分割で1262/1303秒、既定mutant上限も6310/6517秒へ
+膨らんだ。compile一括化の効果とは別のtest selection問題である。通常matrix/coverageの全integrationは
+維持し、pure module用の明示lib/positive module filtersで全対象mutantの検出能力を実証する。
+不足を変異除外で隠さず、必要な意味あるunit回帰か限定integrationを追加する。選択の共通定義、
+workflow経由と広域テスト混入の契約検査、選択・所要時間・件数の記録を加え、再発を防ぐ。
