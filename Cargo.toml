@@ -31,8 +31,6 @@ required-features = ["browser-tests"]
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-# SIGTERM and SIGHUP end a run the way Ctrl-C does: its worktrees are removed
-ctrlc = { version = "3", features = ["termination"] }
 fs2 = "0.4"
 globset = "0.4"
 libc = "0.2"
@@ -40,6 +38,8 @@ regex = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 serde_yaml = "0.9"
+# SIGINT, SIGTERM and SIGHUP end a run in order: its worktrees are removed
+signal-hook = "0.3"
 sha2 = "0.10"
 shlex = "1"
 toml = "1"

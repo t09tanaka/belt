@@ -568,6 +568,13 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     }
     let root = git::toplevel(ctx, &a.target.dir)?;
     let cache = a.cache_dir.clone();
+    if !cache.is_absolute() {
+        // local-ci deletes what it left in this directory
+        bail!(
+            "the cache directory `{}` is not an absolute path",
+            cache.display()
+        );
+    }
     let key = repo_key(ctx, &root);
     let runs = cache.join("runs").join(&key);
     let stamp = std::time::SystemTime::now()
@@ -687,6 +694,12 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
     // What runs that were killed left under `wt` is removed, and what this
     // run makes there is removed when `owner` goes, however the run ends.
     let owner = reclaim::enter(ctx, &cache)?;
+    if owner.legacy() > 0 {
+        obs.notice(&format!(
+            "{} leftover worktree(s) from an older version; run `local-ci cache prune --legacy` to remove them",
+            owner.legacy()
+        ));
+    }
     let (setup, units) = if fp.units.is_empty() {
         (vec![], vec![])
     } else {

@@ -2353,11 +2353,10 @@ fn check_secret_opts(opts: &CaptureOptions) -> Result<()> {
 }
 
 fn store_of(ctx: &ExecContext, o: &CaptureOptions) -> Result<ObjectStore> {
-    ObjectStore::open(
-        o.store
-            .clone()
-            .unwrap_or_else(|| ctx.cache_dir().join("sources")),
-    )
+    ObjectStore::open(match &o.store {
+        Some(store) => store.clone(),
+        None => ctx.cache_dir()?.join("sources"),
+    })
 }
 
 struct Read {

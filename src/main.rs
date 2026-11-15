@@ -8,7 +8,10 @@ use clap::{Args, Parser, Subcommand};
 use local_ci::{
     plan, report, workflow, CancelHandle, ExecContext, Observer, Repo, RunOptions, Target,
 };
+use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::Once;
 
 #[derive(Parser)]
 #[command(
@@ -141,10 +144,71 @@ enum CacheCmd {
         /// Also remove the worktrees kept with `run --keep`
         #[arg(long)]
         kept: bool,
+        /// Also remove the worktrees left by an earlier version, which recorded
+        /// no owner, once no process has the pid in their name
+        #[arg(long)]
+        legacy: bool,
     },
 }
 
-/// Prints notices the way `local-ci` always has, and installs the Ctrl-C handler.
+/// The first signal that cancelled the run, or 0.
+static CANCELLED_BY: AtomicI32 = AtomicI32::new(0);
+
+/// Whether the process was started with `sig` ignored (`nohup`, a shell's
+/// `trap '' TERM`).
+fn inherited_ignored(sig: i32) -> bool {
+    // SAFETY: a null new action only reads the current one into `old`.
+    unsafe {
+        let mut old: libc::sigaction = std::mem::zeroed();
+        libc::sigaction(sig, std::ptr::null(), &mut old) == 0 && old.sa_sigaction == libc::SIG_IGN
+    }
+}
+
+/// Make Ctrl-C, `SIGTERM` and `SIGHUP` cancel the run, so that it ends in
+/// order and removes its worktrees. `SIGTERM` and `SIGHUP` stay ignored when
+/// the process was started with them ignored; Ctrl-C is always handled, as
+/// it always was.
+fn cancel_on_signals(cancel: CancelHandle) {
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let mut handled = vec![libc::SIGINT];
+        handled.extend(
+            [libc::SIGTERM, libc::SIGHUP]
+                .into_iter()
+                .filter(|sig| !inherited_ignored(*sig)),
+        );
+        let Ok(mut signals) = signal_hook::iterator::Signals::new(&handled) else {
+            return;
+        };
+        // cancelling takes locks: in a thread, not in the signal handler
+        std::thread::spawn(move || {
+            for sig in signals.forever() {
+                let _ = CANCELLED_BY.compare_exchange(0, sig, Ordering::SeqCst, Ordering::SeqCst);
+                cancel.cancel();
+            }
+        });
+    });
+}
+
+/// End the way the signal that cancelled the run would have ended the
+/// process, now that the run has cleaned up: whoever waits for local-ci
+/// (a supervisor, a shell) sees that `SIGTERM` or `SIGHUP` ended it. Ctrl-C
+/// keeps its exit code, 130.
+fn die_of_the_signal_that_cancelled() {
+    let sig = CANCELLED_BY.load(Ordering::SeqCst);
+    if sig != libc::SIGTERM && sig != libc::SIGHUP {
+        return;
+    }
+    let _ = std::io::stdout().flush();
+    // SAFETY: the default action is restored for one of two fixed signals,
+    // and the signal is raised in this process only (`raise`, no pid).
+    unsafe {
+        libc::signal(sig, libc::SIG_DFL);
+        libc::raise(sig);
+    }
+}
+
+/// Prints notices the way `local-ci` always has, and installs the signal handlers.
 struct Stderr {
     cancel: CancelHandle,
 }
@@ -153,9 +217,8 @@ impl Observer for Stderr {
         eprintln!("local-ci: {msg}");
     }
     fn executing(&mut self) {
-        // Ctrl-C stops the run this process is making
-        let cancel = self.cancel.clone();
-        ctrlc::set_handler(move || cancel.cancel()).ok();
+        // Ctrl-C, SIGTERM and SIGHUP stop the run this process is making
+        cancel_on_signals(self.cancel.clone());
     }
 }
 
@@ -179,7 +242,7 @@ fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
         keep: a.keep,
         job_timeout: a.job_timeout,
         no_cache: a.no_cache,
-        cache_dir: ctx.cache_dir(),
+        cache_dir: ctx.cache_dir()?,
         source: None,
     };
     let rep = local_ci::run(
@@ -252,7 +315,7 @@ fn status(ctx: &ExecContext, dir: Option<PathBuf>, sha: &str) -> Result<i32> {
         Some(d) => d,
         None => std::env::current_dir()?,
     };
-    let (state, short) = local_ci::status(ctx, &dir, sha, &ctx.cache_dir())?;
+    let (state, short) = local_ci::status(ctx, &dir, sha, &ctx.cache_dir()?)?;
     println!("status: local-ci={state} posted to {short}");
     Ok(0)
 }
@@ -273,7 +336,7 @@ fn size(bytes: u64) -> String {
 
 fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
     use local_ci::reclaim::{self, State};
-    let dir = ctx.cache_dir();
+    let dir = ctx.cache_dir()?;
     match cmd {
         CacheCmd::Status => {
             println!("cache: {}", dir.display());
@@ -294,28 +357,33 @@ fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
             let entries = reclaim::entries(&dir)?;
             let count = |s: State| entries.iter().filter(|e| e.state == s).count();
             println!(
-                "worktrees: {} in use, {} kept (--keep), {} left by runs that are gone, {} not local-ci's",
+                "worktrees: {} in use, {} kept (--keep), {} left by runs that are gone, {} from an older version, {} not local-ci's",
                 count(State::InUse),
                 count(State::Kept),
                 count(State::Stale),
+                count(State::Legacy),
                 count(State::Unknown)
             );
             if count(State::Stale) > 0 {
                 println!("`local-ci cache prune` removes the ones left by runs that are gone (so does the next run)");
             }
+            if count(State::Legacy) > 0 {
+                println!("`local-ci cache prune --legacy` removes the ones from an older version (no run does)");
+            }
         }
-        CacheCmd::Prune { kept } => {
+        CacheCmd::Prune { kept, legacy } => {
             let before =
                 reclaim::disk_usage(&dir.join("wt")) + reclaim::disk_usage(&dir.join("trash"));
-            let swept = reclaim::prune(ctx, &dir, kept)?;
+            let swept = reclaim::prune_all(ctx, &dir, kept, legacy)?;
             let after =
                 reclaim::disk_usage(&dir.join("wt")) + reclaim::disk_usage(&dir.join("trash"));
             println!(
-                "removed {} worktree entries, freed {}; {} in use, {} kept (--keep), {} not local-ci's",
+                "removed {} worktree entries, freed {}; {} in use, {} kept (--keep), {} from an older version, {} not local-ci's",
                 swept.removed.len(),
                 size(before.saturating_sub(after)),
                 swept.in_use,
                 swept.kept,
+                swept.legacy,
                 swept.unknown
             );
         }
@@ -491,5 +559,6 @@ fn main() {
         eprintln!("local-ci: {e:#}");
         64
     });
+    die_of_the_signal_that_cancelled();
     std::process::exit(code);
 }

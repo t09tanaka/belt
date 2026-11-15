@@ -643,19 +643,44 @@ pub fn prune_worktrees(ctx: &ExecContext, repo: &Path) -> Result<()> {
 /// because an earlier deletion of the same name is not over. `None` when it
 /// could not be moved. A link is moved as a link.
 pub fn move_to_trash(path: &Path, trash: &Path) -> Option<PathBuf> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::fs::create_dir_all(trash).ok()?;
     if !is_real_dir(trash) {
         return None;
     }
-    let mut name = path.file_name()?.to_os_string();
-    name.push(format!(
+    let target = trash.join(moved_name(path.file_name()?));
+    std::fs::rename(path, &target).ok().map(|()| target)
+}
+
+/// The name a directory called `name` is moved out of the way under:
+/// `<name>.<pid>.<n>`, which nothing else has.
+pub fn moved_name(name: &std::ffi::OsStr) -> std::ffi::OsString {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut moved = name.to_os_string();
+    moved.push(format!(
         ".{}.{}",
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let target = trash.join(name);
-    std::fs::rename(path, &target).ok().map(|()| target)
+    moved
+}
+
+/// Whether `name` is one [`moved_name`] gives to an entry of `wt`
+/// (`<entry>.<pid>.<n>`), or the name of an entry itself, which is what
+/// earlier versions moved their worktrees to the trash under. Nothing else
+/// in the trash is local-ci's to delete: the cache directory can be one the
+/// user also keeps files in.
+pub fn is_moved_name(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    let is_entry = |s: &str| crate::reclaim::entry_pid(s).is_some();
+    let mut parts = name.rsplitn(3, '.');
+    let moved = match (parts.next(), parts.next(), parts.next()) {
+        (Some(n), Some(pid), Some(entry)) => digits(n) && digits(pid) && is_entry(entry),
+        _ => false,
+    };
+    moved || is_entry(name)
 }
 
 /// A directory itself, not a link to one: what is behind a link is not
@@ -672,32 +697,38 @@ fn trashed(trash: &Path) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| e.file_name() != ".lock")
+        .filter(|e| is_moved_name(&e.file_name()))
         .map(|e| e.path())
         .collect()
 }
 
-/// Delete in the background whatever is in the trash: what a deletion that
-/// was killed (with its run, or by a reboot) left there.
+/// Delete in the background what local-ci left in the trash: what a deletion
+/// that was killed (with its run, or by a reboot) left there. Only names
+/// local-ci gives ([`is_moved_name`]) are touched.
 pub fn empty_trash(ctx: &ExecContext, trash: &Path) {
     for some in trashed(trash).chunks(64) {
         delete_in_background(ctx, some, trash);
     }
 }
 
-/// Delete whatever is in the trash before returning. Links are removed, not
-/// followed.
+/// Delete what local-ci left in the trash before returning. Links are
+/// removed, not followed.
 pub fn empty_trash_now(trash: &Path) {
     for p in trashed(trash) {
-        let is_dir = std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir());
-        if !is_dir {
-            let _ = std::fs::remove_file(&p);
-        } else if std::fs::remove_dir_all(&p).is_err() {
-            // a background deletion may be in the same tree, and a job may
-            // have left directories that cannot be written
-            make_dirs_writable(&p);
-            let _ = std::fs::remove_dir_all(&p);
-        }
+        remove_now(&p);
+    }
+}
+
+/// Delete `path` before returning. A link is removed, not followed.
+pub fn remove_now(path: &Path) {
+    let is_dir = std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir());
+    if !is_dir {
+        let _ = std::fs::remove_file(path);
+    } else if std::fs::remove_dir_all(path).is_err() {
+        // a background deletion may be in the same tree, and a job may
+        // have left directories that cannot be written
+        make_dirs_writable(path);
+        let _ = std::fs::remove_dir_all(path);
     }
 }
 
@@ -722,7 +753,7 @@ fn delete_in_background(ctx: &ExecContext, targets: &[PathBuf], trash: &Path) {
     }
     if spawn_quiet(delete_later(ctx, targets, &trash.join(".lock"))).is_err() {
         let mut rm = ctx.command("rm");
-        rm.arg("-rf").args(targets);
+        rm.args(["-rf", "--"]).args(targets);
         let _ = spawn_quiet(rm);
     }
 }
@@ -748,7 +779,7 @@ fn delete_later(ctx: &ExecContext, targets: &[PathBuf], lock: &Path) -> Command 
     cmd.args([
         "sh",
         "-c",
-        r#"for t; do rm -rf "$t" 2>/dev/null || { find "$t" -type d -exec chmod u+rwx {} + ; rm -rf "$t"; }; done"#,
+        r#"for t; do rm -rf -- "$t" 2>/dev/null || { find -- "$t" -type d -exec chmod u+rwx {} + ; rm -rf -- "$t"; }; done"#,
         "sh",
     ])
     .args(targets);

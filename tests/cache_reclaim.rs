@@ -130,9 +130,12 @@ impl Fixture {
 
     /// Start a run whose steps wait at the gate, and return once one waits.
     fn start_blocked(&self) -> Child {
+        self.start_blocked_with(self.run())
+    }
+
+    fn start_blocked_with(&self, mut run: Command) -> Child {
         std::fs::write(self.gate(), "").unwrap();
-        let child = self
-            .run()
+        let child = run
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -217,9 +220,59 @@ fn an_interrupted_run_leaves_nothing() {
         assert!(!f.entries().is_empty());
         signal(&child, sig);
         let status = child.wait().unwrap();
-        assert_eq!(status.code(), Some(130), "signal {sig}");
+        if sig == libc::SIGINT {
+            assert_eq!(status.code(), Some(130));
+        } else {
+            // whoever waits for the run sees the signal that ended it
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(sig), "{status:?}");
+        }
         f.assert_nothing_left();
     }
+}
+
+#[test]
+fn a_signal_that_was_ignored_when_the_run_started_stays_ignored() {
+    use std::os::unix::process::CommandExt;
+    for sig in [libc::SIGHUP, libc::SIGTERM] {
+        let f = gated_fixture();
+        let mut run = f.run();
+        // what `nohup` does before it starts a command
+        // SAFETY: signal() is async-signal-safe, and nothing else runs
+        // between the fork and the exec.
+        unsafe {
+            run.pre_exec(move || {
+                libc::signal(sig, libc::SIG_IGN);
+                Ok(())
+            });
+        }
+        let mut child = f.start_blocked_with(run);
+        signal(&child, sig);
+        // a run that handled the signal is over, or is ending, by now
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(child.try_wait().unwrap().is_none(), "signal {sig}");
+        f.open_gate();
+        let status = child.wait().unwrap();
+        assert_eq!(status.code(), Some(0), "signal {sig}");
+        f.assert_nothing_left();
+    }
+}
+
+#[test]
+fn a_cache_directory_that_is_not_an_absolute_path_is_refused() {
+    let f = fixture("true");
+    for home in ["", "relative/cache", "."] {
+        for args in [&["cache", "status"][..], &["cache", "prune"][..]] {
+            let o = f.command(args).env("LOCAL_CI_HOME", home).output().unwrap();
+            assert_eq!(o.status.code(), Some(64), "{home:?} {o:?}");
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(err.contains("LOCAL_CI_HOME"), "{home:?} {err}");
+        }
+        let o = f.run().env("LOCAL_CI_HOME", home).output().unwrap();
+        assert_eq!(o.status.code(), Some(64), "{home:?} {o:?}");
+    }
+    assert!(!f.repo.join("relative").exists());
+    assert!(!f.repo.join("wt").exists());
 }
 
 #[test]
@@ -273,5 +326,37 @@ fn keep_keeps_the_worktrees_until_they_are_pruned() {
     assert_eq!(f.entries(), kept);
 
     assert!(f.output(&["cache", "prune", "--kept"]).status.success());
+    f.assert_nothing_left();
+}
+
+#[test]
+fn worktrees_of_an_older_version_are_reported_and_removed_only_when_asked() {
+    let f = fixture("true");
+    // a pid no process has: a child this test started and reaped
+    let mut child = Command::new("true").spawn().unwrap();
+    let pid = child.id();
+    child.wait().unwrap();
+    // no owner file: a version before them made it, perhaps with `--keep`
+    let old = format!("abc1234-{pid}");
+    std::fs::create_dir_all(f.home.join("wt").join(&old).join("target")).unwrap();
+
+    let o = f.run().output().unwrap();
+    assert_eq!(o.status.code(), Some(0), "{o:?}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        err.contains(
+            "1 leftover worktree(s) from an older version; run `local-ci cache prune --legacy` to remove them"
+        ),
+        "{err}"
+    );
+    assert_eq!(f.entries(), std::slice::from_ref(&old));
+
+    let o = f.output(&["cache", "status"]);
+    let out = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(out.contains("1 from an older version"), "{out}");
+    assert!(f.output(&["cache", "prune", "--kept"]).status.success());
+    assert_eq!(f.entries(), std::slice::from_ref(&old));
+
+    assert!(f.output(&["cache", "prune", "--legacy"]).status.success());
     f.assert_nothing_left();
 }

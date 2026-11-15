@@ -15,7 +15,7 @@ use std::path::Path;
 
 /// The store at its default place for `ctx`.
 pub fn default_store(ctx: &ExecContext) -> Result<ObjectStore> {
-    ObjectStore::open(ctx.cache_dir().join("sources"))
+    ObjectStore::open(ctx.cache_dir()?.join("sources"))
 }
 
 /// Write the workspace of `m` into `dest` (which does not exist yet, or is an
