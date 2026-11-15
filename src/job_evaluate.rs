@@ -630,27 +630,25 @@ mod tests {
             .unwrap()
             .clone();
         let initial = evaluate_portable(&j, &contexts, &needs, false, false, 1);
-        let Decision::Run(mut cm) = initial.entries.into_iter().next().unwrap().decision else {
-            panic!("baseline runs")
-        };
-        cm.insert("strategy".into(), json!({}));
-        let base = serde_json::to_vec(&(&cm, &Map::<String, Value>::new(), &j.name))
-            .unwrap()
-            .len();
-        assert!(base < 8_388_608);
-        let padding = 8_388_608 - base;
-        assert!(padding < 8_388_608);
-        needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding));
-        let exact = evaluate_portable(&j, &contexts, &needs, false, false, 1);
-        assert!(
-            matches!(exact.entries[0].decision, Decision::Run(_)),
-            "{exact:?}"
-        );
-        needs.get_mut("seed").unwrap()["outputs"]["padding"]
-            .as_str()
-            .unwrap();
-        needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding + 1));
-        assert!(evaluate_portable(&j, &contexts, &needs, false, false, 1).budget_exceeded);
+        assert_eq!(initial.entries.len(), 1);
+        assert!(matches!(initial.entries[0].decision, Decision::Run(_)));
+        if let Decision::Run(mut cm) = initial.entries.into_iter().next().unwrap().decision {
+            cm.insert("strategy".into(), json!({}));
+            let base = serde_json::to_vec(&(&cm, &Map::<String, Value>::new(), &j.name))
+                .unwrap()
+                .len();
+            assert!(base < 8_388_608);
+            let padding = 8_388_608 - base;
+            assert!(padding < 8_388_608);
+            needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding));
+            let exact = evaluate_portable(&j, &contexts, &needs, false, false, 1);
+            assert!(
+                matches!(exact.entries[0].decision, Decision::Run(_)),
+                "{exact:?}"
+            );
+            needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding + 1));
+            assert!(evaluate_portable(&j, &contexts, &needs, false, false, 1).budget_exceeded);
+        }
 
         let mut j = job("    needs: seed\n    name: '${{ vars.display }}'\n    strategy:\n      matrix:\n        n: [0, 1, 2, 3, 4]\n    steps: []\n");
         let contexts =
