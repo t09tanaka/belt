@@ -4442,3 +4442,50 @@ fn pure_atomic_failed_need_keeps_real_matrix_report_membership_and_ancestor() {
     assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
     assert!(d.outcome(FILE, "matrix").unwrap().ancestor_failed);
 }
+
+#[test]
+fn pure_expanded_reserve_composition_funds_actual_halt_phase_growth() {
+    let f = Fixture::new(WORKFLOW);
+    let mut d = f.driver(2);
+    seed(&f, &mut d);
+    let origin = f
+        .plan
+        .tasks
+        .iter()
+        .find(|task| task.dynamic_matrix)
+        .unwrap();
+    assert!(matches!(d.state.phases[&origin.id], Phase::Expanded));
+    // Local policy input for the typed infrastructure-loss stage, never
+    // installed or applied. Test the compositional per-phase worst-halt
+    // funding contract even when other margins mask a public capacity failure.
+    let mut before = d.state.clone();
+    before.infrastructure_failure = Some(ResultStorageFailure::DriverCapacity);
+    let mut halted = before.clone();
+    d.halt_progress(&mut halted);
+    let replacement = halted.phases[&origin.id].clone();
+    assert!(matches!(
+        replacement,
+        Phase::Terminal(Terminal::Core {
+            decision: CoreDecision::InfrastructureBlocked,
+            ..
+        })
+    ));
+    let growth = serde_json::to_vec(&replacement)
+        .unwrap()
+        .len()
+        .checked_sub(
+            serde_json::to_vec(&before.phases[&origin.id])
+                .unwrap()
+                .len(),
+        )
+        .unwrap();
+    assert!(growth > 0);
+    let mut after = before.clone();
+    after.phases.insert(origin.id.clone(), replacement);
+    let funding = d
+        .cancel_reserve(&before)
+        .unwrap()
+        .checked_sub(d.cancel_reserve(&after).unwrap())
+        .unwrap();
+    assert!(funding >= growth);
+}
