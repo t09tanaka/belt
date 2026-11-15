@@ -216,6 +216,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn capabilities_are_reported_only_when_negotiated_and_features_are_intersected() {
+        use crate::toolchain::capability::{WorkerCapabilities, FEATURE};
+        let mut id = identity();
+        id.capabilities = Some(WorkerCapabilities {
+            disk_free_bytes: None,
+            resource_budget: None,
+            schema_version: 1,
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            profile: "p".into(),
+            profile_digest: Digest::of_bytes(b"definition"),
+            execution_uid: 1,
+            protocol_versions: vec![1],
+            profile_fingerprint: Digest::of_bytes(b"p"),
+            tools: Default::default(),
+            features: [FEATURE.into(), "private-feature".into()].into(),
+        });
+        let c = ClusterId::generate();
+        let mut n = Negotiated {
+            version: 1,
+            features: vec![FEATURE.into()],
+        };
+        let response = id.response(&c, &n);
+        assert_eq!(
+            response.capabilities.unwrap().features,
+            [FEATURE.into()].into()
+        );
+        assert!(id
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .features
+            .contains("private-feature"));
+        n.features.clear();
+        assert!(id.response(&c, &n).capabilities.is_none());
+        id.capabilities = None;
+        n.features.push(FEATURE.into());
+        assert!(id.response(&c, &n).capabilities.is_none());
+    }
+
     fn code(e: ApiError) -> (ErrorCode, String) {
         (e.code, e.message)
     }

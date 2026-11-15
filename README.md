@@ -18,6 +18,22 @@ Run the configured CI against committed HEAD:
 local-ci run --include-disabled
 ```
 
+Pure mutation and line coverage share `scripts/pure-modules.txt`. Mutation uses
+`python3 scripts/mutation-run.py --shard 0/4` (repeat shards 1–3), selecting
+module library tests plus the existing `config::` integration tests. Shared
+toolchain parser tests live under `toolchain::tests::`; substring matches also
+include a few library consumers such as `service::outputs::`. Actual integration
+discovery fails if any selected test is outside `config::`. Normal CI on both
+platforms and the coverage gate still execute the full test suite.
+
+The runner pins cargo-schemata 0.4.0, limits baseline/test execution to 60 seconds
+per binary/mutant (compilation is separate), and rejects missing, empty, surviving,
+timed-out or unknown results. `python3 scripts/mutation-policy-test.py` checks the
+real runner's Cargo arguments and rejects workflow bypasses and accidental extra
+integration tests. Each shard uploads selected test names, `selection.json`
+(run identity, counts and timings), `run.log` and the mutation report. Use the
+repository's resource admission and portool entry when running locally.
+
 ## License
 
 MIT

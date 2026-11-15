@@ -1430,6 +1430,85 @@ mod tests {
     }
 
     #[test]
+    fn multi_node_wire_times_use_critical_path_and_explain_unmeasured_ahead_work() {
+        let mut fc = forecast_of(&Digest::of_bytes(b"l").to_string(), vec![]);
+        fc.target.nodes = ["x", "y"]
+            .into_iter()
+            .map(|node_id| ttc::NodeForecast {
+                node_id: node_id.into(),
+                timing: timing(),
+            })
+            .collect();
+        fc.target.critical_path_wait_ms = Some(17);
+        fc.target.critical_path_execution_ms = Some(29);
+        let r = convert(&fc, &Notes::default()).unwrap();
+        assert_eq!(r.target.queue_wait_after_ready_ms, Some(17));
+        assert_eq!(r.target.execution_ms, Some(29));
+
+        let ident = Ident {
+            worker_id: WorkerId::parse("w").unwrap(),
+            boot_id: WorkerBootId::parse("b").unwrap(),
+            agent_epoch: AgentEpoch(1),
+            forecast_ttl_ms: 2000,
+        };
+        let plan = ttc::WorkloadPlan {
+            attempt_id: "a".into(),
+            plan_digest: "d".into(),
+            expansion_seq: 0,
+            max_in_flight: None,
+            nodes: vec![ttc::CommandNode {
+                node_id: "x".into(),
+                identity: "x".into(),
+                label: "x".into(),
+                weight: 1,
+                predicted_rss: 0,
+                runtime: ttc::Runtime::measured(1.0, 1),
+                priority: ttc::Priority::Normal,
+                depends_on: vec![],
+                ready_in_ms: 0,
+                external_delay_ms: 0,
+                ledger_entry: None,
+                shared_id: None,
+            }],
+        };
+        let overlay = [ttc::FutureDemand {
+            attempt_id: "o".into(),
+            plan_digest: "d".into(),
+            expansion_seq: 0,
+            node_id: "n".into(),
+            weight: 1,
+            predicted_rss: 0,
+            runtime: ttc::Runtime::fallback(),
+            priority: ttc::Priority::Normal,
+            ready_in_ms: 0,
+            ledger_entry: None,
+            shared_id: None,
+            terminal: false,
+        }];
+        fc.overlay.applied = vec!["o/n".into()];
+        let r = to_wire(
+            &fc,
+            &Wiring {
+                ident: &ident,
+                plan: &plan,
+                target_digest: &Digest::of_bytes(b"t"),
+                insp: &insp_of(vec![]),
+                overlay: &overlay,
+                notes: &Notes::default(),
+            },
+        )
+        .unwrap();
+        assert!(r.target.assumptions.iter().any(|note| note == "work queued ahead of the target has no recorded runtime; its fallback runtime is used for ordering only"));
+        fc.overlay.applied.clear();
+        let r = convert(&fc, &Notes::default()).unwrap();
+        assert!(!r
+            .target
+            .assumptions
+            .iter()
+            .any(|note| note.contains("work queued ahead")));
+    }
+
+    #[test]
     fn the_fallback_ranking_is_carried_as_it_is_and_never_as_a_time() {
         let mut fc = forecast_of(&Digest::of_bytes(b"l").to_string(), vec![]);
         let t = &mut fc.target.timing;

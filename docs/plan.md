@@ -966,3 +966,41 @@ assertは維持、productionの300ms期限と観測動作は不変更。threads1
 維持し、pure module用の明示lib/positive module filtersで全対象mutantの検出能力を実証する。
 不足を変異除外で隠さず、必要な意味あるunit回帰か限定integrationを追加する。選択の共通定義、
 workflow経由と広域テスト混入の契約検査、選択・所要時間・件数の記録を加え、再発を防ぐ。
+
+### Pure変異の選択短縮と再発防止の実証
+
+対象49ファイルは `scripts/pure-modules.txt` に集約し、coverageとmutationで共用する。
+mutationは専用runnerから明示的に `--lib --test it` とpositive module filtersを渡す。
+configのlegacy/parse/pathsは既存の短いconfig integration37件を維持し、toolchainの
+versions/declarationsは共有unit `toolchain::tests::` を使う。他のintegrationは実際の
+`--test it --list` で検出し、config以外の名前が1件でも混ざると失敗する。
+libtestのsubstring仕様でservice::outputs等のlibrary consumerも少数含むことは許容する。
+通常2matrixとcoverageの全integration実行は維持した。
+
+初回の選択suiteは47/49が100%行coverageだった。forecastのcritical-path時刻と未測定の
+前方work理由、hello capabilityのnegotiated feature交差を意味あるunit2件で補強し、
+最終575lib+37config IT=612件で49/49全行100%を確認した（instrumented compile込み43.97秒）。
+productionや変異除外は変更していない。
+
+全actual2656変異を単一shardで完走し、2417 caught・239 unviable・0 missed・0 timeout。
+総1102.45秒（18分22秒）で、一括prepare430.9秒、baseline8.8秒、trace612件8.6秒、
+変異phase653.3秒（単独再compileを含む）。build内訳は一括2404、単独16、prepare時unviable236。
+旧baseline1262/1303秒に対して約143〜148倍短くなった。state::successorsのVec::new変異は
+旧heavy-test経路56.9秒に対して0.2秒でcaught。総時間は単独再compileにも左右されるため、
+compile時間とtest選択の短縮を区別する。
+
+再発防止は通常CIのpolicy testで、実runnerのargv、workflowでの直接実行への迂回、
+全target/testへの逆戻り、config外ITの混入、空suite、空/重複/rename済み対象、
+欠落/古い/空/未知/生存/timeout reportの誤成功を拒否する。各runは識別子を持ち、
+古いreportを消去してから開始し、選択名・件数・実引数・各stage時間・mutant件数を保存する。
+baselineとmutantのtest期限は固定60秒（compileは別）とし、merge gateもtimeoutを拒否する。
+最終runnerの1変異smoke（97/2656）はbaseline8.3秒、trace7.9秒、state変異0.1秒caught、
+compile込み64.6秒で成功した。全2656証明の既定45秒期限より寛容な60秒への変更であり、
+選択suiteと変異の母集団は同一である。
+
+検証は実Rust1.100、Cargo jobs2、TTC外側/portool内側、専有targetで実施。
+local-ci0.13の公開済みsourceでは固定labelの全stepをhistory keyでTTCに載せるため、
+Python runnerにもTTC二重wrapperは追加しない。3件のpolicy testとshell構文/diff確認を実施。
+全体local-ci・remote CI・Linux/macOS matrix・実MSRV1.89はこの段階で未実行で、
+全体ゲート成功とは扱わない。全2656の成果物は `/private/tmp/rtr-pure-mutation-all/`、
+最終期限smokeは `/private/tmp/rtr-pure-mutation-timeout-smoke/` に保全した。
