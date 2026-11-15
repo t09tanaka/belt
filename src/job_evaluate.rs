@@ -583,21 +583,25 @@ mod tests {
 
     #[test]
     fn portable_and_atomic_name_and_context_budgets_refuse_amplification() {
+        // Assert the protocol before allocating fixed, bounded fixtures. Never
+        // derive allocation lengths (including subtraction) from mutable limits.
+        assert_eq!(PORTABLE_OUTPUT_BYTES, 1_048_576);
+        assert_eq!(PORTABLE_EVALUATION_BYTES, 8_388_608);
         let contexts = json!({"github": {}, "vars": {}, "inputs": {}})
             .as_object()
             .unwrap()
             .clone();
         let mut j = job("    runs-on: x\n    steps: []\n");
-        j.name = Some("x".repeat(PORTABLE_OUTPUT_BYTES));
+        j.name = Some("x".repeat(1_048_576));
         let result = evaluate_portable(&j, &contexts, &Map::new(), false, false, 4);
         assert!(result.budget_exceeded);
         assert!(
             matches!(&result.entries[0].decision, Decision::Error(reason) if reason == "name: byte budget exceeded")
         );
         j.name = Some("${{ format('{0}{0}', github.large) }}".into());
-        let github = json!({"large": "x".repeat(PORTABLE_OUTPUT_BYTES / 2 + 1)});
+        let github = json!({"large": "x".repeat(524_289)});
         assert!(evaluate_atomic(&j, github, &Map::new(), false, false).is_err());
-        j.name = Some("n".repeat(PORTABLE_OUTPUT_BYTES - 4));
+        j.name = Some("n".repeat(1_048_572));
         j.matrix = Some(serde_yaml::from_str("n: [0]").unwrap());
         let result = evaluate_portable(&j, &contexts, &Map::new(), false, false, 4);
         assert!(result.budget_exceeded);
@@ -606,7 +610,7 @@ mod tests {
         );
         j.name = None;
         j.matrix = None;
-        let large = json!({"github": {"large": "x".repeat(PORTABLE_EVALUATION_BYTES)}})
+        let large = json!({"github": {"large": "x".repeat(8_388_608)}})
             .as_object()
             .unwrap()
             .clone();

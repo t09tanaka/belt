@@ -3147,7 +3147,19 @@ fn pure_dispatch_fact_validation_and_selection_preserve_host_worker_boundary() {
         .to_string()
         .contains("fact key"));
     assert!(DerivedDispatch::from_json(&" ".repeat(1024 * 1024 + 1)).is_err());
-    assert!(Transition::from_json(&" ".repeat(MAX_TRANSITION_BYTES + 1)).is_err());
+    // Protocol limits are independent fixture sizes: a mutated implementation
+    // constant must fail before it can control an allocation.
+    assert_eq!(MAX_TRANSITION_BYTES, 67_375_104);
+    let mut envelope =
+        serde_json::to_string(&f.driver(2).propose(Input::Advance).unwrap()).unwrap();
+    assert!(envelope.len() < 67_375_104);
+    envelope.extend(std::iter::repeat_n(' ', 67_375_104 - envelope.len()));
+    assert!(Transition::from_json(&envelope).is_ok());
+    envelope.push(' ');
+    assert!(Transition::from_json(&envelope)
+        .unwrap_err()
+        .to_string()
+        .contains("transition exceeds byte bound"));
     assert_eq!(
         Transition::from_json(
             &serde_json::to_string(&f.driver(2).propose(Input::Advance).unwrap()).unwrap()
@@ -3746,7 +3758,8 @@ fn pure_driver_plan_and_state_capacity_guards_and_outbox_idempotence() {
     let f = Fixture::new("on: push\njobs:\n  test:\n    runs-on: x\n    steps: []\n");
     let d = f.driver(1);
     let mut state = d.state.clone();
-    for index in 0..=MAX_TASKS {
+    assert_eq!(MAX_TASKS, 4096);
+    for index in 0..=4096 {
         state
             .phases
             .insert(format!("extra-{index}"), Phase::Pending);
@@ -3775,7 +3788,8 @@ fn pure_driver_plan_byte_bound_rejects_large_external_metadata() {
     let f = Fixture::new("on: push\njobs:\n  test:\n    runs-on: x\n    steps: []\n");
     let d = f.driver(1);
     let mut large = f.plan.clone();
-    large.workflows[0].name = "x".repeat(MAX_WIRE_BYTES);
+    assert_eq!(MAX_WIRE_BYTES, 67_108_864);
+    large.workflows[0].name = "x".repeat(67_108_864);
     large.digest = large.compute_digest().unwrap();
     assert!(Driver::new(&large, d.config.clone())
         .unwrap_err()
