@@ -271,6 +271,7 @@ struct Inner {
 }
 
 pub struct Setups {
+    probe_gate: Mutex<()>,
     owner_generation: BuilderId,
     cfg: SetupConfig,
     store: TemplateStore,
@@ -296,6 +297,7 @@ impl Setups {
             .map_err(|e| internal("template store", e))?;
         store.sweep().map_err(|e| internal("template store", e))?;
         let s = Setups {
+            probe_gate: Mutex::new(()),
             owner_generation: BuilderId::generate(),
             cfg,
             store,

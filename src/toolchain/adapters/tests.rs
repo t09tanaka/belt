@@ -809,13 +809,189 @@ fn preparation_probe_bounded_identity_detects_growth_race_and_never_follows_link
 #[test]
 fn preparation_probe_total_fd_byte_budget_is_shared_across_files() {
     let temp = tempfile::tempdir().unwrap();
-    let path = temp.path().join("manager");
+    let path = fs::canonicalize(temp.path()).unwrap().join("manager");
     fs::write(&path, vec![b'x'; 1024 * 1024]).unwrap();
-    let budget = IdentityReadBudget::probe();
+    let budget = IdentityReadBudget::limited(1024 * 1024, 8 * 1024 * 1024);
     for _ in 0..7 {
         assert!(budget.capture(&path).is_ok());
     }
     // Reserve a growth sentinel; never begin an eighth full read at the boundary.
     assert!(budget.capture(&path).is_err());
     assert_eq!(budget.remaining.get(), 1024 * 1024);
+}
+
+#[test]
+fn preparation_probe_complete_installation_matches_real_activation_and_detects_drift() {
+    for (kind, tool) in [
+        (AdapterKind::Nodenv, "node"),
+        (AdapterKind::Rustup, "rust"),
+        (AdapterKind::Mise, "python"),
+        (AdapterKind::Fvm, "flutter"),
+        (AdapterKind::Corepack, "pnpm"),
+    ] {
+        let f = fixture(kind, tool);
+        let receipt = install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+        let budget = IdentityReadBudget::probe();
+        let verified = inspect_installation(f.plan.clone(), &budget).unwrap();
+        assert_eq!(verified.digest(), hash(&(&f.plan.key(), &receipt.digest())));
+        let base = Digest::of_bytes(b"actual-base");
+        let policy = Digest::of_bytes(b"actual-setup");
+        let actual = activate_set(
+            &f.plan.frozen,
+            &[(&f.plan, &receipt)],
+            base.clone(),
+            &BTreeMap::new(),
+            &base_env(&f.plan),
+            policy.clone(),
+            &f.shell,
+        )
+        .unwrap();
+        let sampled = prospective_activation(
+            &f.plan.frozen,
+            &[verified],
+            base,
+            &BTreeMap::new(),
+            &base_env(&f.plan),
+            policy,
+            &f.shell.path,
+            &budget,
+        )
+        .unwrap();
+        assert_eq!(sampled, actual);
+        budget.finish().unwrap();
+        // Same-size bytes and restored mtime still fail complete content checks.
+        let file = &f.plan.probes[0].1.program;
+        let prior = fs::metadata(file).unwrap();
+        fs::write(file, vec![b'x'; prior.len() as usize]).unwrap();
+        File::options()
+            .write(true)
+            .open(file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(prior.modified().unwrap()))
+            .unwrap();
+        assert_eq!(
+            fs::metadata(file).unwrap().modified().unwrap(),
+            prior.modified().unwrap()
+        );
+        let changed = IdentityReadBudget::probe();
+        assert!(inspect_installation(f.plan.clone(), &changed).is_err());
+        assert!(budget.finish().is_err());
+    }
+}
+#[test]
+fn preparation_probe_complete_installation_never_accepts_partial_unsafe_or_replaced_tree() {
+    for change in 0..9 {
+        let f = fixture(AdapterKind::Nodenv, "node");
+        install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+        let path = &f.plan.probes[0].1.program;
+        match change {
+            0 => fs::remove_file(path).unwrap(),
+            1 => fs::write(f.plan.payload.join("unexpected"), b"extra").unwrap(),
+            2 => {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o722)).unwrap();
+            }
+            3 => {
+                fs::hard_link(path, f.plan.payload.join("hardlink")).unwrap();
+            }
+            4 => {
+                fs::remove_file(path).unwrap();
+                symlink(&f.shell.path, path).unwrap();
+            }
+            5 => {
+                fs::write(f.plan.root.join("receipt.json"), b"{}").unwrap();
+            }
+            6 => {
+                fs::set_permissions(
+                    f.plan.root.join("receipt.json"),
+                    fs::Permissions::from_mode(0o644),
+                )
+                .unwrap();
+            }
+            7 => {
+                fs::set_permissions(&f.plan.root, fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            _ => {
+                fs::remove_dir_all(&f.plan.payload).unwrap();
+                fs::create_dir_all(&f.plan.payload).unwrap();
+            }
+        }
+        assert!(
+            inspect_installation(f.plan, &IdentityReadBudget::probe()).is_err(),
+            "change {change}"
+        );
+    }
+    let f = fixture(AdapterKind::Nodenv, "node");
+    install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    let b = IdentityReadBudget::probe();
+    inspect_installation(f.plan.clone(), &b).unwrap();
+    let old = f.plan.root.with_extension("old");
+    fs::rename(&f.plan.root, &old).unwrap();
+    fs::rename(&old, &f.plan.root).unwrap();
+    assert!(b.finish().is_err());
+}
+#[test]
+fn preparation_probe_complete_budgets_receipt_directory_and_content() {
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let receipt = install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    assert!(inspect_installation(f.plan.clone(), &IdentityReadBudget::limited(4, 10)).is_err());
+    fs::write(
+        f.plan.root.join("receipt.json"),
+        vec![b' '; 1024 * 1024 + 1],
+    )
+    .unwrap();
+    assert!(inspect_installation(f.plan.clone(), &IdentityReadBudget::probe()).is_err());
+    // Compact tree vector flooding is refused while deserializing, before a
+    // complete candidate can allocate an unbounded inventory.
+    let entries = vec!["/small"; 1025];
+    let mut value = serde_json::to_value(receipt).unwrap();
+    value["tree"]["directories"] = serde_json::to_value(entries).unwrap();
+    fs::write(
+        f.plan.root.join("receipt.json"),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
+    assert!(inspect_installation(f.plan, &IdentityReadBudget::probe()).is_err());
+}
+
+#[test]
+fn preparation_probe_directory_flood_and_receipt_replacement_never_publish_partial_proof() {
+    let f = fixture(AdapterKind::Nodenv, "node");
+    install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    let sampled = IdentityReadBudget::probe();
+    inspect_installation(f.plan.clone(), &sampled).unwrap();
+    let receipt = f.plan.root.join("receipt.json");
+    let old = f.plan.root.join("receipt.old");
+    fs::rename(&receipt, &old).unwrap();
+    fs::copy(&old, &receipt).unwrap();
+    fs::set_permissions(&receipt, fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(sampled.finish().is_err());
+    for i in 0..1025 {
+        fs::write(f.plan.payload.join(format!("extra-{i}")), b"x").unwrap();
+    }
+    let flooded = IdentityReadBudget::probe();
+    assert!(inspect_installation(f.plan, &flooded).is_err());
+    assert!(flooded.snapshot.borrow().paths_len() <= 256);
+    assert!(flooded.snapshot.borrow().visits() <= 1024);
+}
+
+#[test]
+fn preparation_probe_activation_cannot_mix_verification_queries() {
+    let f = fixture(AdapterKind::Nodenv, "node");
+    install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    let first = IdentityReadBudget::probe();
+    let verified = inspect_installation(f.plan.clone(), &first).unwrap();
+    let second = IdentityReadBudget::probe();
+    assert_eq!(
+        prospective_activation(
+            &f.plan.frozen,
+            &[verified],
+            Digest::of_bytes(b"base"),
+            &BTreeMap::new(),
+            &base_env(&f.plan),
+            Digest::of_bytes(b"policy"),
+            &f.shell.path,
+            &second
+        ),
+        Err("probe_verification_query_mismatch")
+    );
 }

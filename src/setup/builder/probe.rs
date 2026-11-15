@@ -36,6 +36,9 @@ impl Setups {
             PreparationProbe as Probe, PreparationProbeEntry as Entry,
             PreparationProbeState as State, ProbeUnknown as Unknown,
         };
+        let Ok(_probe_guard) = self.probe_gate.try_lock() else {
+            return Probe::Unknown(Unknown::BudgetExceeded);
+        };
         if let Err(e) = crate::setup::preparation_probe::input_budget(&input) {
             return Probe::Unknown(e);
         }
@@ -70,6 +73,12 @@ impl Setups {
         }
         type ResolvedProbeEntry = (PreparationKind, Option<String>, Option<Unknown>);
         let byte_budget = adapters::IdentityReadBudget::probe();
+        // Real plans are retained only in the first pass; the second must derive
+        // exactly the same keys from the same normal profile sample.
+        let verified = std::cell::RefCell::new(Vec::<adapters::VerifiedInstallation<'_>>::new());
+        let proofs = std::cell::RefCell::new(BTreeMap::<String, Digest>::new());
+        let first_pass = std::cell::Cell::new(true);
+        let verification_started = std::cell::Cell::new(None);
         let resolve = || -> Result<(Vec<ResolvedProbeEntry>, crate::setup::preparation_probe::ProfileSample), Unknown> {
             let profile = profile.ok_or(Unknown::ProfileUnavailable)?;
             let fingerprint = fingerprint.ok_or(Unknown::ProfileUnavailable)?;
@@ -90,18 +99,27 @@ impl Setups {
                 return Err(Unknown::ProfileUnavailable);
             }
             let mut entries = Vec::new();
+            if first_pass.get() && input.frozen.is_some() {
+                verification_started.set(Some(platform::monotonic_ms()));
+            }
             if let Some(bundle) = input.frozen {
                 crate::toolchain::contract::check_baselines(&bundle.frozen, Some(&snapshot))
                     .map_err(|_| Unknown::ProfileUnavailable)?;
                 for evidence in &bundle.evidence {
                     let registry = registry.ok_or(Unknown::MissingContext)?;
-                    let request = registry
-                        .probe_request(&bundle.frozen, &evidence.tool, evidence, &byte_budget)
+                    let (request, plan) = registry
+                        .probe_plan_request(&bundle.frozen, &evidence.tool, evidence, &byte_budget)
                         .map_err(|_| Unknown::IoUnavailable)?;
                     if self.cfg.profile_definition.as_ref() != Some(&request.profile_definition)
                         || self.cfg.profile_fingerprint.as_ref() != Some(&request.base_profile)
                     {
                         return Err(Unknown::InvalidBinding);
+                    }
+                    if first_pass.get() {
+                        if let Ok(installation) = adapters::inspect_installation(plan, &byte_budget) {
+                            proofs.borrow_mut().insert(format!("tool:{}", request.expected_plan), installation.digest());
+                            verified.borrow_mut().push(installation);
+                        }
                     }
                     // expected_plan was produced by the shared actual adapter plan path.
                     entries.push((
@@ -113,11 +131,22 @@ impl Setups {
             }
             if workspace {
                 if input.frozen.is_some() {
-                    entries.push((
-                        PreparationKind::WorkspaceSetup,
-                        None,
-                        Some(Unknown::ActivationUnverified),
-                    ));
+                    let bundle = input.frozen.as_ref().expect("frozen checked");
+                    let activation = adapters::prospective_activation(
+                        &bundle.frozen, &verified.borrow(), fingerprint.clone(),
+                        &crate::toolchain::contract::observations(&snapshot), profile.environment(),
+                        Digest::of_bytes(&serde_json::to_vec(&input.setup).map_err(|_| Unknown::InvalidBinding)?),
+                        profile.shell(), &byte_budget,
+                    );
+                    if let Ok(activation) = activation {
+                        let spec = input.setup.as_ref().expect("workspace checked");
+                        crate::setup::preparation_probe::environment_budget(spec, &activation.environment)?;
+                        let ctx = workspace_key_context(spec, input.manifest_digest, input.run_id,
+                            activation.execution_fingerprint.to_string(), activation.environment);
+                        entries.push((PreparationKind::WorkspaceSetup, Some(policy::template_key(spec, &ctx)), None));
+                    } else {
+                        entries.push((PreparationKind::WorkspaceSetup, None, Some(Unknown::ActivationUnverified)));
+                    }
                 } else {
                     let spec = input.setup.as_ref().expect("workspace checked");
                     crate::setup::preparation_probe::environment_budget(spec, &self.cfg.env)?;
@@ -168,11 +197,15 @@ impl Setups {
                 .collect::<Vec<_>>()
         };
         io_gate();
+        first_pass.set(false);
         let (second, second_sample) = match resolve() {
             Ok(v) => v,
             Err(e) => return Probe::Unknown(e),
         };
         if first != second || sample != second_sample {
+            return Probe::Unknown(Unknown::OwnershipChanged);
+        }
+        if byte_budget.finish().is_err() {
             return Probe::Unknown(Unknown::OwnershipChanged);
         }
         // Native boot discovery may read procfs on Linux; keep it outside ownership.
@@ -220,6 +253,10 @@ impl Setups {
                         }
                         _ => State::Unknown(Unknown::OwnershipChanged),
                     }
+                } else if let Some(proof) =
+                    key.as_ref().and_then(|k| proofs.borrow().get(k).cloned())
+                {
+                    State::VerifiedAvailable { proof }
                 } else {
                     State::ConcretePlan
                 };
@@ -235,6 +272,7 @@ impl Setups {
             profile: sample,
             observed_monotonic_ms: observed,
             observation_ttl_ms: 5000,
+            verification_started_monotonic_ms: verification_started.get(),
         };
         if observed < began
             || observed < checked_at
@@ -587,11 +625,9 @@ mod preparation_probe_tests {
             frozen,
             evidence: vec![],
         }));
-        // Even an empty frozen set changes workspace execution activation semantics.
-        assert_eq!(
-            entry(f.probe()).state,
-            State::Unknown(Unknown::ActivationUnverified)
-        );
+        // An empty complete frozen set can now compose its exact shell-bound
+        // activation; the workspace is still identity-only, never available.
+        assert_eq!(entry(f.probe()).state, State::ConcretePlan);
         f.frozen = None;
         f.setup.as_mut().unwrap().steps[0].run = "x".repeat(300 * 1024);
         assert_eq!(f.probe(), Probe::Unknown(Unknown::BudgetExceeded));
@@ -647,5 +683,265 @@ mod preparation_probe_tests {
             crate::setup::preparation_probe::input_budget(&f.input()),
             Ok(())
         ); // 15 tools alone
+    }
+    struct SmallTool {
+        plan: adapters::InstallPlan,
+    }
+    impl adapters::AdmittedExecutor for SmallTool {
+        fn execute(
+            &mut self,
+            command: &adapters::CommandSpec,
+        ) -> Result<adapters::CommandOutput, &'static str> {
+            for (_, probe) in self.plan.probes() {
+                std::fs::create_dir_all(probe.program.parent().unwrap()).unwrap();
+                std::fs::write(&probe.program, b"tiny-complete-tool").unwrap();
+                std::fs::set_permissions(&probe.program, std::fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            let name = self
+                .plan
+                .probes()
+                .iter()
+                .find(|(_, p)| p == command)
+                .map(|(n, _)| n.as_str());
+            let output = match name {
+                Some("rustc") => "rustc 1.2.3 (fixture)",
+                Some("cargo") => "cargo 1.2.3 (fixture)",
+                _ => "",
+            };
+            Ok(adapters::CommandOutput {
+                success: true,
+                stdout: output.as_bytes().to_vec(),
+            })
+        }
+    }
+    fn small_install(
+        f: &mut Fixture,
+        manager: &std::path::Path,
+    ) -> (
+        crate::toolchain::registry::Registry,
+        adapters::InstallPlan,
+        adapters::InstallationReceipt,
+    ) {
+        use crate::toolchain::versions::*;
+        let state = &f.owner.cfg.state_dir;
+        private_dir(&state.join("toolchains")).unwrap();
+        let config = serde_json::json!({"schema_version":1,"active_profile":f.profile.name(),"profile_definition":f.profile.definition_digest(),"recipes":[{"tool":"rust","kind":"Rustup","manager":manager,"dependencies":[],"search_path":[manager.parent().unwrap()],"rust_host":"fixture-host","inventory":["1.2.3"],"resolved_inputs":{}}]});
+        let path = state.join("toolchains.toml");
+        std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let scope = Scope::project("");
+        let frozen = FrozenToolchains::freeze(
+            f.manifest.clone(),
+            f.profile.definition_digest().clone(),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("rust").unwrap(),
+                constraint: Constraint::parse("1.2.3").unwrap(),
+                scope,
+                location: Location {
+                    path: "captured".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap();
+        let bundle = crate::toolchain::contract::FrozenBundle::seal_exact(frozen).unwrap();
+        let registry =
+            crate::toolchain::registry::Registry::load(state, &f.profile, f.fingerprint.clone())
+                .unwrap();
+        let evidence = &bundle.evidence[0];
+        let request = registry
+            .request(&bundle.frozen, &evidence.tool, Some(evidence))
+            .unwrap();
+        let plan = request.plan(&request.private_root).unwrap();
+        let receipt =
+            adapters::install_admitted(&plan, &mut SmallTool { plan: plan.clone() }).unwrap();
+        f.frozen = Some(Box::new(bundle));
+        // Installation writes preceded the normal report sample; a query must
+        // never refresh that sample itself.
+        assert_eq!(f.profile.report().profile_fingerprint, f.fingerprint);
+        (registry, plan, receipt)
+    }
+    #[test]
+    fn preparation_probe_small_complete_tool_and_exact_frozen_workspace_key() {
+        let mut f = Fixture::new();
+        let manager = std::fs::canonicalize(f._temp.path())
+            .unwrap()
+            .join("manager");
+        std::fs::write(&manager, b"private-manager-never-executed").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (registry, plan, receipt) = small_install(&mut f, &manager);
+        let probe = f.owner.probe_preparation(
+            f.input(),
+            Some(&f.profile),
+            Some(&f.fingerprint),
+            Some(&registry),
+        );
+        let Probe::Entries {
+            entries,
+            provenance,
+            ..
+        } = probe
+        else {
+            panic!("expected bounded sampled entries");
+        };
+        assert_eq!(entries.len(), 2);
+        assert!(matches!(entries[0].state, State::VerifiedAvailable { .. }));
+        assert_eq!(entries[1].state, State::ConcretePlan);
+        assert!(provenance.verification_started_monotonic_ms.is_some());
+        let (snapshot, _) = f.profile.preparation_snapshot(&f.fingerprint).unwrap();
+        let activation = adapters::activate_set(
+            &f.frozen.as_ref().unwrap().frozen,
+            &[(&plan, &receipt)],
+            f.fingerprint.clone(),
+            &crate::toolchain::contract::observations(&snapshot),
+            f.profile.environment(),
+            Digest::of_bytes(&serde_json::to_vec(&f.setup).unwrap()),
+            &adapters::FileIdentity::capture(f.profile.shell()).unwrap(),
+        )
+        .unwrap();
+        let expected = policy::template_key(
+            f.setup.as_ref().unwrap(),
+            &workspace_key_context(
+                f.setup.as_ref().unwrap(),
+                &f.manifest,
+                &f.run,
+                activation.execution_fingerprint.to_string(),
+                activation.environment,
+            ),
+        );
+        assert_eq!(entries[1].key, Some(Digest::of_bytes(expected.as_bytes())));
+        // Real mutation is rejected even at identical version/length.
+        let executable = &plan.probes()[0].1.program;
+        let size = std::fs::metadata(executable).unwrap().len() as usize;
+        std::fs::write(executable, vec![b'z'; size]).unwrap();
+        let changed = f.owner.probe_preparation(
+            f.input(),
+            Some(&f.profile),
+            Some(&f.fingerprint),
+            Some(&registry),
+        );
+        let Probe::Entries { entries, .. } = changed else {
+            panic!("expected conservative entries");
+        };
+        assert_eq!(entries[0].state, State::ConcretePlan);
+        assert_eq!(
+            entries[1].state,
+            State::Unknown(Unknown::ActivationUnverified)
+        );
+    }
+    #[test]
+    fn preparation_probe_global_gate_rejects_second_query_while_io_is_paused() {
+        let f = Fixture::new();
+        let first = f.owner.probe_preparation_checked(
+            f.input(),
+            Some(&f.profile),
+            Some(&f.fingerprint),
+            None,
+            || {
+                // The first query owns the gate while outside the ownership mutex.
+                assert!(f.owner.inner.try_lock().is_ok());
+                assert_eq!(f.probe(), Probe::Unknown(Unknown::BudgetExceeded));
+            },
+        );
+        assert!(matches!(first, Probe::Entries { .. }));
+        assert!(matches!(f.probe(), Probe::Entries { .. }));
+    }
+    #[test]
+    #[ignore = "explicit read-only manager calibration; requires owned fixture and manager path"]
+    fn preparation_probe_calibration_real_manager_six_samples() {
+        let manager = std::fs::canonicalize(
+            std::env::var_os("RTR_PROBE_CALIBRATION_MANAGER").expect("explicit manager required"),
+        )
+        .unwrap();
+        let mut f = Fixture::new();
+        let (registry, _, _) = small_install(&mut f, &manager);
+        let manager_size = std::fs::metadata(&manager).unwrap().len();
+        let mut samples = vec![];
+        for i in 0..6 {
+            // Normal report is a separate lifecycle action; the queried profile
+            // contains only the owned shell, never the real manager on PATH.
+            assert_eq!(f.profile.report().profile_fingerprint, f.fingerprint);
+            let started = platform::monotonic_ms();
+            let probe = f.owner.probe_preparation(
+                f.input(),
+                Some(&f.profile),
+                Some(&f.fingerprint),
+                Some(&registry),
+            );
+            let ended = platform::monotonic_ms();
+            let (bytes, reads, paths, visits) = adapters::probe_statistics();
+            let Probe::Entries {
+                provenance,
+                entries,
+                ..
+            } = probe
+            else {
+                panic!("calibration query was unknown");
+            };
+            assert!(matches!(entries[0].state, State::VerifiedAvailable { .. }));
+            let start = provenance.verification_started_monotonic_ms.unwrap();
+            let profile_age_entry = started - provenance.profile.completed_monotonic_ms;
+            let profile_age_exit = ended - provenance.profile.completed_monotonic_ms;
+            assert!(profile_age_exit < 5000);
+            samples.push(serde_json::json!({"sample":i,"manager_bytes":manager_size,"charged_bytes_both_passes":bytes,"read_calls":reads,"held_paths":paths,"visited_entries":visits,"in_process_roundtrip_ms":ended-started,"profile_age_entry_ms":profile_age_entry,"profile_age_exit_ms":profile_age_exit,"verification_age_ms":ended-start,"unknown":false}));
+        }
+        println!(
+            "PROBE_CALIBRATION {}",
+            serde_json::to_string(&samples).unwrap()
+        );
+    }
+    #[test]
+    fn preparation_probe_expired_io_keeps_owner_until_real_drain_and_releases_gate() {
+        let mut fixture = Fixture::new();
+        let manager = std::fs::canonicalize(fixture._temp.path())
+            .unwrap()
+            .join("manager");
+        std::fs::write(&manager, b"private-manager-never-executed").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (registry, _, _) = small_install(&mut fixture, &manager);
+        let f = Arc::new(fixture);
+        let weak = Arc::downgrade(&f.owner);
+        let (entered, waiting) = std::sync::mpsc::sync_channel(0);
+        let (release, resume) = std::sync::mpsc::sync_channel(0);
+        let child = f.clone();
+        let task = std::thread::spawn(move || {
+            let probe = child.owner.probe_preparation_checked(
+                child.input(),
+                Some(&child.profile),
+                Some(&child.fingerprint),
+                Some(&registry),
+                || {
+                    entered.send(()).unwrap();
+                    resume.recv().unwrap();
+                },
+            );
+            let released = child.owner.probe_gate.try_lock().is_ok();
+            let retained = adapters::probe_statistics().2;
+            (probe, released, retained)
+        });
+        waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(f.owner.inner.try_lock().is_ok());
+        assert_eq!(f.probe(), Probe::Unknown(Unknown::BudgetExceeded));
+        // One real elapsed interval crosses the immutable profile deadline while
+        // the IO phase is paused. Dropping the caller does not detach another
+        // verifier or release ownership beneath this still-running query.
+        std::thread::sleep(Duration::from_millis(5010));
+        drop(f);
+        assert!(weak.upgrade().is_some());
+        release.send(()).unwrap();
+        let (probe, released, retained) = task.join().unwrap();
+        assert_eq!(probe, Probe::Unknown(Unknown::ProfileUnavailable));
+        assert!(released);
+        assert!(
+            retained > 0,
+            "paused query retained actual artifact descriptor identities"
+        );
+        assert!(weak.upgrade().is_none());
     }
 }

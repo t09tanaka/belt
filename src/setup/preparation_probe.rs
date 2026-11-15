@@ -55,6 +55,10 @@ pub struct PreparationProbeEntry {
 pub enum PreparationProbeState {
     /// Concrete identity only, never evidence that work is cold, warm or usable.
     ConcretePlan,
+    /// Complete sampled tool contents only; never reservation, admission or zero cost.
+    VerifiedAvailable {
+        proof: Digest,
+    },
     Active {
         builder_id: BuilderId,
         builder_attempt_id: AttemptId,

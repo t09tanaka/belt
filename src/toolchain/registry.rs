@@ -153,8 +153,10 @@ impl Registry {
         evidence: Option<&ResolutionEvidence>,
     ) -> Result<PreparationRequest, Unavailable> {
         self.request_with_limit(frozen, tool, evidence, None)
+            .map(|v| v.0)
     }
 
+    #[cfg(test)]
     pub(crate) fn probe_request(
         &self,
         frozen: &FrozenToolchains,
@@ -162,6 +164,16 @@ impl Registry {
         evidence: &ResolutionEvidence,
         budget: &adapters::IdentityReadBudget,
     ) -> Result<PreparationRequest, Unavailable> {
+        self.probe_plan_request(frozen, tool, evidence, budget)
+            .map(|v| v.0)
+    }
+    pub(crate) fn probe_plan_request(
+        &self,
+        frozen: &FrozenToolchains,
+        tool: &ToolId,
+        evidence: &ResolutionEvidence,
+        budget: &adapters::IdentityReadBudget,
+    ) -> Result<(PreparationRequest, adapters::InstallPlan), Unavailable> {
         use crate::setup::preparation_probe::bounded_path;
         bounded_path(&self.root).map_err(|_| Unavailable::Invalid("probe_root"))?;
         let entry = self.recipes.get(tool).ok_or(Unavailable::Unsupported)?;
@@ -183,7 +195,7 @@ impl Registry {
         tool: &ToolId,
         evidence: Option<&ResolutionEvidence>,
         max_bytes: Option<&adapters::IdentityReadBudget>,
-    ) -> Result<PreparationRequest, Unavailable> {
+    ) -> Result<(PreparationRequest, adapters::InstallPlan), Unavailable> {
         frozen.validate().map_err(Unavailable::Invalid)?;
         if frozen
             .baseline
@@ -292,17 +304,20 @@ impl Registry {
             ),
         }
         .map_err(Unavailable::Invalid)?;
-        Ok(PreparationRequest {
-            kind: entry.recipe.kind,
-            frozen: resolved,
-            tool: tool.clone(),
-            evidence,
-            private_root: self.root.clone(),
-            host: entry.host.clone(),
-            expected_plan: plan.key(),
-            profile_definition: self.profile_definition.clone(),
-            base_profile: self.base_profile.clone(),
-        })
+        Ok((
+            PreparationRequest {
+                kind: entry.recipe.kind,
+                frozen: resolved,
+                tool: tool.clone(),
+                evidence,
+                private_root: self.root.clone(),
+                host: entry.host.clone(),
+                expected_plan: plan.key(),
+                profile_definition: self.profile_definition.clone(),
+                base_profile: self.base_profile.clone(),
+            },
+            plan,
+        ))
     }
     /// Detect only the indexed exact artifact using its validated adapter receipt.
     pub fn detect(&self, request: &PreparationRequest) -> Result<Availability, Unavailable> {

@@ -131,6 +131,9 @@ impl Coordinator {
             || response.worker_id != *worker
             || (response.worker_boot_id.clone(), response.agent_epoch) != identity
             || entries.len() > 16
+            || (provenance.verification_started_monotonic_ms.is_none()
+                && entries.iter().any(|entry| matches!(entry.state,
+                    crate::setup::preparation_probe::PreparationProbeState::VerifiedAvailable { .. })))
             || self.is_fenced()
             || crate::platform::boot_id().as_deref() != Some(parent_boot.as_str())
         {
@@ -234,6 +237,7 @@ impl Coordinator {
                 && matches!(&v.probe, PreparationProbe::Entries { entries, .. }
                 if entries.iter().any(|entry| entry.key.is_some() && matches!(entry.state,
                     crate::setup::preparation_probe::PreparationProbeState::ConcretePlan
+                    | crate::setup::preparation_probe::PreparationProbeState::VerifiedAvailable { .. }
                     | crate::setup::preparation_probe::PreparationProbeState::Active { .. })))
         })
     }
@@ -427,6 +431,7 @@ mod tests {
                             },
                             observed_monotonic_ms: 100,
                             observation_ttl_ms: 5000,
+                            verification_started_monotonic_ms: None,
                         },
                         entries: vec![PreparationProbeEntry {
                             kind: crate::setup::observation::PreparationKind::WorkspaceSetup,
@@ -499,6 +504,18 @@ mod tests {
     #[tokio::test]
     async fn preparation_identity_stored_estimate_queries_selected_worker_only_without_cost() {
         let f = Fixture::new().await;
+        if let PreparationProbe::Entries {
+            provenance,
+            entries,
+            ..
+        } = &mut f.link.response.lock().unwrap().probe
+        {
+            provenance.verification_started_monotonic_ms = Some(100);
+            entries[0].kind = crate::setup::observation::PreparationKind::ToolInstall;
+            entries[0].state = PreparationProbeState::VerifiedAvailable {
+                proof: Digest::of_bytes(b"bounded complete sample"),
+            };
+        }
         f.c.store
             .put_source_ref(
                 f.input.source_id.as_ref().unwrap(),
@@ -670,5 +687,30 @@ mod tests {
             assert!(!task.await.unwrap());
             assert!(f.c.preparation_identities.lock().unwrap().is_empty());
         }
+    }
+    #[tokio::test]
+    async fn preparation_identity_complete_sample_requires_valid_original_verification_start() {
+        let f = Fixture::new().await;
+        for started in [None, Some(99), Some(101)] {
+            if let PreparationProbe::Entries {
+                provenance,
+                entries,
+                ..
+            } = &mut f.link.response.lock().unwrap().probe
+            {
+                provenance.verification_started_monotonic_ms = started;
+                entries[0].state = PreparationProbeState::VerifiedAvailable {
+                    proof: Digest::of_bytes(b"sample"),
+                };
+            }
+            assert!(!f.query().await);
+            assert!(f.c.preparation_identities.lock().unwrap().is_empty());
+        }
+        if let PreparationProbe::Entries { provenance, .. } =
+            &mut f.link.response.lock().unwrap().probe
+        {
+            provenance.verification_started_monotonic_ms = Some(100);
+        }
+        assert!(f.query().await);
     }
 }

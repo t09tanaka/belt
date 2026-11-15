@@ -782,6 +782,7 @@ D 最終 focused 検証: resident 23件成功 (88.35s)、retention filter 69件�
 
 現在の producer Active は実 BuilderId/attempt の観測であり TTC command node の証明ではない。artifact の bounded 完全検証・正確な frozen activation の証明、実 TTC ledger identity と依存/resource graph の対応、既存 simulator への接続とユーザー経路の受入は引き続き必須残件である。ConcretePlan/producer 不在から cold/warm/0 を作らず、setup cost は Unknown を維持する。
 
+
 ### Source/Vault retention と準備 freshness の親統合検証
 
 承認済みの自動消去条件に沿う D と、元 profile sample に束縛した preparation preview を親へ統合した。
@@ -794,3 +795,64 @@ preparation_freshness73/73、wire1823/1823。sched 全27変異は25 caught、2 u
 これらは全体CIの成功とは区別する。次にコミット済み候補の全9ジョブを local-ci で再検証する。
 ローカルの実 Rust は1.100であり、1.89の実MSRV確認・installer actions・独立Mac固有の受入は未検証。
 S15f の完全artifact/activation証明と実TTC依存/resource graph、S16以降、Docker受入と公開は必須残件。
+
+### 小さい complete tool artifact の bounded 観測と exact prospective activation
+
+未公開 preparation_probe_v1 に VerifiedAvailable（完全な tool 内容をこの query 中に検証した sample）と
+verification START を追加する。元 normal profile sample・owner/input/attachment/InputGate の fence を維持し、
+親 deadline は親 SEND と元 profile/verification START の残 TTL から計算する。再送で期限を更新しない。
+VerifiedAvailable は admission/reservation や Warm/準備時間0を意味しない。実 admission の検証は引き続き独立に行う。
+
+query 全体（両 resolver・external・receipt・tree・shell）で64MiB、1 file16MiB、receipt1MiB、最大256 retained paths、
+1024 visited entries、256 pending paths を上限とする。FD-relative NOFOLLOW で全祖先を開き、完全な tree hash と
+owner/mode/nlink・inode・mtime/ctime・path-to-FD binding・private directory inventory を最後まで検証する。
+コンパクトな receipt inventory も deserialize 中に制限し、失敗した read/growth sentinel の byte 消費を戻さない。
+symlink を含む tool tree、上限超過、大きい/部分的な artifact は Unknown のままである。query は native command、
+get/detect/materialize、pin、usage、attempt、lease を作成しない。filesystem IO は Setups ownership mutex の外に置く。
+owner ごとの単一 try-lock は実 IO 終了まで保持し、timeout 後の重い detached query の積み上がりを防ぐ。
+blocking filesystem syscall の壁時計上限は保証せず、元 TTL を越えた reply は破棄する。
+
+VerifiedInstallation は Deserialize/外部 constructor を持たず、同じ live query budget への lifetime と identity を要求する。
+通常 activate_set の IO validation と同じ順序の shared composition を使い、frozen complete set、baseline、shell、
+protected environment、tool 順序、receipt digest と execution fingerprint の計算を共有する。この activation から
+実 prepare と同じ workspace_key_context/template_key を計算する。workspace template の availability 自体は
+引き続き identity-only/Unknown であり、setup scalar・ready_delay・admission は変更しない。
+
+実 clock の private fixture と read-only real rustup binary（11,031,216 bytes、実行なし）による6回の校正では、
+両 resolver を含む charged bytes33,428,886/query、524 read calls、27 retained paths、19 visited entries、
+in-process roundtrip977〜988ms、元 profile age0→977〜988ms、Unknown0/6だった。
+32MiB では125,546 bytesしか余裕がないため total64MiB/file16MiBを選んだ。
+first observed read と5 repeatであり OS cache eviction は制御していない。tiny admitted payload の測定で、
+network/RPC・実際の大きい Rust installation・一般的な warm 性能の測定には外挿しない。
+
+最終 focused 検証は preparation/adapters/wire/protocol150件成功＋明示手動 calibration1件ignore、
+別途 toolchain/preparation106件成功＋同ignore、strict all-target/all-feature clippy成功（Rust1.100）。
+calibrationは別の明示コマンドで6 sample成功。実5.01秒 IO pause による元 profile expiry、二重 query拒否、
+ownerを実drainまで保持してgateを解放、same-size/restored-mtime・ctime・root/receipt入替・hardlink/symlink・
+receipt/dir flood/共有byte上限の否定、actual admitted receipt と activate_set の一致を確認した。
+実 worker の negotiated readonly/profile-bound RPC1件も成功。全 local-ci/MSRV/Linux/独立レビューと新 wire/pure gate は親統合の区切りで行う。
+
+大きい native install、template complete-content proof、実 TTC ledger ID と依存/resource graph/simulator、
+実 user-path setup cost と Docker 受入は必須残件で、S15f 全体の完成とは扱わない。
+
+独立レビューは9c963739に actionable P1/P2なし。追加で元profileとverification STARTの
+包含関係を明示した。profile TTLは正確に5000ms、completed ≤ START ≤ observed なので、
+verification ageはprofile age以下となり、同じ5000msの検証期限は既に元profile期限に含まれる。
+STARTの前後範囲の検証を維持し、冗長なmin計算のみ整理する。受信から期限を作ることや、
+元sampleの更新、期限の延長はしない。この追加差分のfocused pure gateは親が再検証する。
+
+
+### 1e7a37e 全体検証の失敗と次の統合候補
+
+全9 local-ci は44分39秒で中止（exit130）。1成功、5失敗、1中止、2未実行だった。
+通常2matrixとmutation baseline3本で source guard/SQLite競合などを確認し、最後のbaselineでは
+pin testの親子待機が停止した。全4shardともbaseline段階で変異実行は0件。完了した成功ゲートとは扱わない。
+全所有プロセスと固有run pathの孤立daemonを照合して回収し、残存0を確認した。
+pin fixtureの単一thread libtest出力prefixとstdout ready判定の衝突、同種supervisor fixture、
+Source/Vault GCと通常source利用の競合を、ログ根拠に沿って別々に修正・再検証する。
+
+一方、独立レビュー済みの小さいtool検証を次の候補へ統合する。Cost bd26449の親focused検証は
+46件成功、strict all-target/all-feature clippy成功、exact coverageはfreshness95/95・wire1827/1827、
+全87変異は75 caught・12 unviable・0 missed・0 timeout。正常な同ミリ秒START/observed境界の
+テスト不足1件を追加して閉じた。実 user stateのGCやnative manager実行は行っていない。
+この結果も新しい統合候補の全体CI・実MSRV1.89・Linux/remote受入の代わりにはしない。
