@@ -950,7 +950,14 @@ impl<'a> Runner<'a> {
             base_path,
             seq: pinned
                 .map(|(_, ws, _)| ws.sequence.clone())
-                .unwrap_or_else(|| Arc::new(AtomicUsize::new(0))),
+                .unwrap_or_else(|| {
+                    // Ordinary runners name resources by process ID. Fresh
+                    // attempts in that process must share the counter too.
+                    static SEQUENCE: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+                    SEQUENCE
+                        .get_or_init(|| Arc::new(AtomicUsize::new(0)))
+                        .clone()
+                }),
             synced: Mutex::new(HashSet::new()),
             docker_ok: OnceLock::new(),
         })
@@ -4084,6 +4091,96 @@ pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn fresh_git_runners_share_process_resource_sequence() {
+        let area = tempfile::Builder::new()
+            .prefix("localci-resource-sequence-")
+            .tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap())
+            .unwrap();
+        let root = area.path();
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::write(root.join(".github/workflows/ci.yml"),
+            "on: push\njobs:\n  check:\n    runs-on: fixture\n    steps:\n      - run: echo fixture\n").unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "fixture"],
+        ] {
+            let status = Command::new("/usr/bin/git")
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(root)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let ctx = ExecContext::new(
+            [
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("HOME".into(), root.display().to_string()),
+            ]
+            .into(),
+        );
+        let other_ctx = ctx.fresh_attempt();
+        let fp = crate::build_frozen_plan(
+            &ctx,
+            &crate::Target {
+                dir: root.into(),
+                sha: "HEAD".into(),
+                base: Some("HEAD".into()),
+                all: true,
+                include_disabled: true,
+                workflows_dirs: vec![],
+                workflows: vec![],
+                jobs: vec![],
+            },
+            &mut crate::Quiet,
+        )
+        .unwrap();
+        let workspace = |name: &str| Workspace {
+            root: root.join(name),
+            repo_root: root.into(),
+            run_dir: root.join(format!("{name}-run")),
+            tools: root.join(format!("{name}-tools")),
+            lock_file: root.join(format!("{name}-lock")),
+        };
+        let opts = || Opts {
+            parallel: 1,
+            traffic_controller: None,
+            executor: None,
+            portool: None,
+            containers: 1,
+            job_timeout_min: 1.,
+            keep: false,
+            trash: root.join("trash"),
+        };
+        let a = Runner::new(&ctx, &fp, &workspace("one"), opts()).unwrap();
+        let b = Runner::new(&other_ctx, &fp, &workspace("two"), opts()).unwrap();
+        let names = [a.resource_name(), b.resource_name(), a.resource_name()];
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), 3, "{names:?}");
+        assert!(Arc::ptr_eq(&a.seq, &b.seq));
+        let prefix = format!("local-ci-{}-", std::process::id());
+        let values: Vec<usize> = names
+            .iter()
+            .map(|n| n.strip_prefix(&prefix).unwrap().parse().unwrap())
+            .collect();
+        assert!(values.windows(2).all(|v| v[0] < v[1]));
+        assert_ne!(a.wt, b.wt);
+        assert_ne!(a.run_dir, b.run_dir);
+    }
 
     #[test]
     fn run_label_plain() {
