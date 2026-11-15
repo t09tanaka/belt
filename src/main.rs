@@ -108,6 +108,9 @@ struct RunArgs {
     /// (results of this run are still kept)
     #[arg(long)]
     no_cache: bool,
+    /// Do not restore or save the `target/` of Rust jobs (LOCAL_CI_NO_BUILD_CACHE=1 does the same)
+    #[arg(long)]
+    no_build_cache: bool,
 }
 
 #[derive(Subcommand)]
@@ -148,6 +151,9 @@ enum CacheCmd {
         /// no owner, once no process has the pid in their name
         #[arg(long)]
         legacy: bool,
+        /// Remove the build cache (the `target/` directories kept for Rust jobs)
+        #[arg(long)]
+        build: bool,
     },
 }
 
@@ -242,6 +248,7 @@ fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
         keep: a.keep,
         job_timeout: a.job_timeout,
         no_cache: a.no_cache,
+        no_build_cache: a.no_build_cache,
         cache_dir: ctx.cache_dir()?,
         source: None,
     };
@@ -356,6 +363,16 @@ fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
             println!("  {:<10} {:>10}", "total", size(total));
             let entries = reclaim::entries(&dir)?;
             let count = |s: State| entries.iter().filter(|e| e.state == s).count();
+            let build = dir.join(local_ci::build_cache::DIR);
+            let es = local_ci::build_cache::entries(&build);
+            println!(
+                "build cache: {} entries, {} (the least recently used go above {}; LOCAL_CI_BUILD_CACHE_MAX_GB)",
+                es.len(),
+                size(es.iter().map(|e| e.bytes).sum()),
+                size(
+                    local_ci::build_cache::Settings::at(ctx, &dir).max_bytes
+                )
+            );
             println!(
                 "worktrees: {} in use, {} kept (--keep), {} left by runs that are gone, {} from an older version, {} not local-ci's",
                 count(State::InUse),
@@ -371,7 +388,11 @@ fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
                 println!("`local-ci cache prune --legacy` removes the ones from an older version (no run does)");
             }
         }
-        CacheCmd::Prune { kept, legacy } => {
+        CacheCmd::Prune {
+            kept,
+            legacy,
+            build,
+        } => {
             let before =
                 reclaim::disk_usage(&dir.join("wt")) + reclaim::disk_usage(&dir.join("trash"));
             let swept = reclaim::prune_all(ctx, &dir, kept, legacy)?;
@@ -386,6 +407,19 @@ fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
                 swept.legacy,
                 swept.unknown
             );
+            if build {
+                let s = local_ci::build_cache::Settings::at(ctx, &dir);
+                let before = reclaim::disk_usage(&s.dir);
+                let cleared = local_ci::build_cache::clear(ctx, &s);
+                for w in &cleared.warnings {
+                    eprintln!("warning: build cache: {w}");
+                }
+                println!(
+                    "removed {} build cache entries, freed {}",
+                    cleared.removed,
+                    size(before)
+                );
+            }
         }
     }
     Ok(0)

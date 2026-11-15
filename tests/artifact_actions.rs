@@ -524,6 +524,7 @@ fn cached_opts(tmp: &common::Tmp, dir: &Path, workflows: &[&str]) -> local_ci::R
         keep: false,
         job_timeout: 5.0,
         no_cache: false,
+        no_build_cache: true,
         cache_dir: tmp.path().join("cache3"),
         source: None,
     }

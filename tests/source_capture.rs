@@ -1285,6 +1285,7 @@ fn run_in_worker(
         keep: false,
         job_timeout: 5.0,
         no_cache: true,
+        no_build_cache: true,
         cache_dir: w.home.clone(),
         source: Some(m.clone()),
     };
@@ -2500,6 +2501,7 @@ fn run_options(p: &Pair, m: &local_ci::source::SourceManifest) -> local_ci::RunO
         keep: false,
         job_timeout: 5.0,
         no_cache: true,
+        no_build_cache: true,
         cache_dir: p.home.clone(),
         source: Some(m.clone()),
     }

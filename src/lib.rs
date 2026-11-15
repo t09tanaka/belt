@@ -6,6 +6,7 @@
 
 pub mod artifact;
 pub mod artifact_io;
+pub mod build_cache;
 pub mod cache;
 mod cleanup;
 pub mod complete;

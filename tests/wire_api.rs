@@ -234,6 +234,7 @@ fn run_result(dir: &str) -> RunResult {
                 ],
                 cancelled: false,
                 time: None,
+                build_cache: None,
             }],
             waited_secs: 0.0,
             copy_secs: None,

@@ -425,6 +425,15 @@ pub fn print(r: &RunResult, tail_lines: usize, style: &Style) {
     if let Some(line) = r.cpu.as_ref().map(cpu_line) {
         println!("{line}");
     }
+    let bc = crate::build_cache::summary(
+        r.units
+            .iter()
+            .flat_map(|u| &u.jobs)
+            .filter_map(|j| j.build_cache.as_ref()),
+    );
+    if !bc.is_empty() {
+        println!("{bc}");
+    }
     let setup_bad: Vec<&StepResult> = r
         .setup
         .iter()
@@ -577,6 +586,7 @@ mod tests {
             steps: vec![],
             cancelled: false,
             time: None,
+            build_cache: None,
         }
     }
 
