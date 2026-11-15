@@ -258,6 +258,7 @@ fn git_blob_budget_and_missing_local_objects_fail_without_fetching() {
     )
     .unwrap();
     assert!(git_evaluation_source(&f.ctx, f.root(), &f.plan).is_err());
+    assert!(crate::git::workflows_at(&f.ctx, f.root(), "HEAD", None, &[]).is_err());
     assert!(!f.root().join(".git/FETCH_HEAD").exists());
 }
 
@@ -500,4 +501,37 @@ fn ordinary_git_planning_preserves_trailing_workflow_scalar_bytes() {
     )
     .unwrap();
     git_evaluation_source(&f.ctx, f.root(), &plan).unwrap();
+}
+
+#[test]
+fn ordinary_git_listing_ignores_replace_refs_and_propagates_missing_tree_errors() {
+    let f = Fixture::new();
+    let commit = f.plan.source.execution_commit.as_ref().unwrap();
+    git(f.root(), &["rm", "-q", ".github/workflows/ci.yml"]);
+    git(f.root(), &["commit", "-qm", "no workflows"]);
+    let replacement = git(f.root(), &["rev-parse", "HEAD"]);
+    git(f.root(), &["replace", commit, &replacement]);
+    let files = crate::git::workflows_at(&f.ctx, f.root(), commit, None, &[]).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1, WORKFLOW);
+    let tree = git(
+        f.root(),
+        &[
+            "--no-replace-objects",
+            "rev-parse",
+            &format!("{commit}^{{tree}}"),
+        ],
+    );
+    std::fs::remove_file(
+        f.root()
+            .join(".git/objects")
+            .join(&tree[..2])
+            .join(&tree[2..]),
+    )
+    .unwrap();
+    assert!(
+        crate::git::workflows_at(&f.ctx, f.root(), commit, None, &[]).is_err(),
+        "a Git listing error must not become an empty successful plan"
+    );
+    assert!(!f.root().join(".git/FETCH_HEAD").exists());
 }

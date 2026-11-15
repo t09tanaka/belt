@@ -182,6 +182,11 @@ pub fn workflows_at(
         ctx,
         dir,
         &[
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "--literal-pathspecs",
+            "-c",
+            "protocol.allow=never",
             "rev-parse",
             "--verify",
             "--end-of-options",
@@ -194,9 +199,18 @@ pub fn workflows_at(
         let list = git(
             ctx,
             dir,
-            &["ls-tree", "--name-only", &commit, &format!("{d}/")],
-        )
-        .unwrap_or_default();
+            &[
+                "--no-replace-objects",
+                "--no-lazy-fetch",
+                "--literal-pathspecs",
+                "-c",
+                "protocol.allow=never",
+                "ls-tree",
+                "--name-only",
+                &commit,
+                &format!("{d}/"),
+            ],
+        )?;
         let files: Vec<&str> = list
             .lines()
             .filter(|f| f.ends_with(".yml") || f.ends_with(".yaml"))
