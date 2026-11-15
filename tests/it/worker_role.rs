@@ -10,11 +10,36 @@ use std::process::Stdio;
 use std::time::Duration;
 const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
 const T: Duration = Duration::from_secs(15);
-async fn kill_owned(child: &mut tokio::process::Child) {
+// Start identities are recorded once, when this test spawns the child. A later
+// signal compares against that record, never against a fresh read of the pid.
+// None: the child had already ended when it was read (some are spawned to be
+// refused at once), so there never is anything to signal.
+static STARTED: std::sync::Mutex<Vec<(u32, Option<String>)>> = std::sync::Mutex::new(Vec::new());
+fn own(child: tokio::process::Child) -> tokio::process::Child {
+    let pid = child.id().expect("spawned child has a pid");
+    assert!(pid > 1);
+    let start = super::common::identity_of(pid);
+    let mut started = STARTED.lock().unwrap();
+    // A reused pid number belongs to the newest child only.
+    started.retain(|(known, _)| *known != pid);
+    started.push((pid, start));
+    child
+}
+fn recorded(child: &tokio::process::Child) -> (u32, Option<String>) {
     let pid = child.id().expect("owned child still live");
     assert!(pid > 1);
-    let start = super::common::identity_of(pid).expect("owned child start identity");
-    super::common::kill_recorded(pid, &start);
+    let started = STARTED.lock().unwrap();
+    let start = started
+        .iter()
+        .find(|(known, _)| *known == pid)
+        .map(|(_, start)| start.clone())
+        .expect("child was recorded at spawn");
+    (pid, start)
+}
+async fn kill_owned(child: &mut tokio::process::Child) {
+    if let (pid, Some(start)) = recorded(child) {
+        super::common::kill_recorded(pid, &start);
+    }
     tokio::time::timeout(T, child.wait())
         .await
         .unwrap()
@@ -63,7 +88,7 @@ impl Fixture {
     // Inherit harness environment (including LLVM_PROFILE_FILE) for instrumented
     // owned children; never add test instrumentation to WorkerSpec.env.
     fn spawn(&self) -> tokio::process::Child {
-        tokio::process::Command::new(BIN)
+        own(tokio::process::Command::new(BIN)
             .args(["worker", "--input"])
             .arg(&self.input)
             .env("HOME", self.spec.env.get("HOME").unwrap())
@@ -72,7 +97,7 @@ impl Fixture {
             .stderr(Stdio::piped())
             .kill_on_drop(true)
             .spawn()
-            .unwrap()
+            .unwrap())
     }
     async fn ready(&self, child: &mut tokio::process::Child) {
         tokio::time::timeout(T, async {
@@ -102,7 +127,7 @@ impl Fixture {
         super::common::fixture_traffic_config(&self.spec.state_dir);
     }
     async fn bridge(&self) -> (tokio::process::Child, Connected) {
-        let mut child = tokio::process::Command::new(BIN)
+        let child = tokio::process::Command::new(BIN)
             .args(["worker", "--stdio"])
             .env("HOME", self.spec.env.get("HOME").unwrap())
             .stdin(Stdio::piped())
@@ -111,6 +136,7 @@ impl Fixture {
             .kill_on_drop(true)
             .spawn()
             .unwrap();
+        let mut child = own(child);
         let io = Io::new(child.stdout.take().unwrap(), child.stdin.take().unwrap());
         let connected = connect(
             io,
@@ -121,14 +147,13 @@ impl Fixture {
         (child, connected)
     }
     async fn stop(&self, child: &mut tokio::process::Child) {
-        let pid = child.id().expect("owned child still live");
-        assert!(pid > 1);
-        let start = super::common::identity_of(pid).expect("owned child start identity");
+        let (pid, start) = recorded(child);
+        let start = start.expect("child was live when spawned");
         assert_eq!(
             remote_task_runner::platform::process_start_identity(pid),
             remote_task_runner::platform::StartIdentity::Identity(start)
         );
-        remote_task_runner::platform::signal_pid(pid, libc::SIGTERM);
+        assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGTERM));
         assert!(tokio::time::timeout(T, child.wait())
             .await
             .unwrap()

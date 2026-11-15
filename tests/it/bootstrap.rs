@@ -9,7 +9,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
-fn fixture() -> (tempfile::TempDir, Spec) {
+fn fixture() -> (super::common::DaemonRoot, Spec) {
     let root = tempfile::Builder::new()
         .prefix("rtr-boot-")
         .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
@@ -50,10 +50,33 @@ fn fixture() -> (tempfile::TempDir, Spec) {
                 .expect("coverage profile path is UTF-8"),
         );
     }
+    // Every daemon these tests start, directly or through the CLI, owns this
+    // state directory; the root stops it when the test ends or panics.
+    let root = super::common::DaemonRoot::new(root, &spec.state_dir);
     (root, spec)
 }
 // Decode only public diagnostic enums. Journal payloads also contain private
 // commands, paths and arbitrary remote error messages; never format those.
+/// A worker tool path holding only the named host tools, next to the base
+/// system directory. A worker measures every native tool found on its path
+/// under a short deadline, at startup and on each inspection. A launcher that
+/// answers too late only at startup changes the worker identity afterwards,
+/// the coordinator excludes the worker, and the task waits for good. The
+/// whole host PATH offers many such launchers; these fixtures do not test
+/// tool discovery, so they offer none.
+fn private_tool_path(root: &std::path::Path, names: &[&str]) -> String {
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    for name in names {
+        let tool = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|dir| dir.join(name))
+            .find(|path| path.is_file())
+            .unwrap_or_else(|| panic!("{name} must be installed for this fixture"));
+        std::os::unix::fs::symlink(std::fs::canonicalize(tool).unwrap(), bin.join(name)).unwrap();
+    }
+    format!("{}:/bin", bin.display())
+}
+
 fn coordinator_event_summary(
     event: &remote_task_runner::storage::Event,
 ) -> (
@@ -250,6 +273,67 @@ fn launcher_process() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(ensure(spec)).unwrap();
     // Runtime teardown and launcher exit must leave the owner running.
+}
+
+#[test]
+#[ignore = "invoked as a dedicated panicking subprocess by the cleanup regression"]
+fn panicking_fixture_process() {
+    let mut record = String::new();
+    std::io::stdin().read_to_string(&mut record).unwrap();
+    let (_root, spec) = fixture();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let (pid, start) = rt.block_on(async {
+        let client = ensure(spec).await.unwrap();
+        let pid = super::common::listener_pid(client.socket_path())
+            .await
+            .unwrap();
+        (pid, super::common::identity_of(pid).unwrap())
+    });
+    std::fs::write(record.trim(), format!("{pid}\n{start}")).unwrap();
+    // The test body fails before any explicit shutdown, as a failed assert does.
+    panic!("fixture test failed with a live owner");
+}
+
+#[tokio::test]
+async fn panicking_fixture_test_leaves_no_owner_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let record = dir.path().join("owner");
+    let mut helper = Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "bootstrap::panicking_fixture_process",
+            "--ignored",
+            "--nocapture",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    helper
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(record.to_str().unwrap().as_bytes())
+        .unwrap();
+    let output = tokio::task::spawn_blocking(move || helper.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("fixture test failed with a live owner"),
+        "{stderr}"
+    );
+    let text = std::fs::read_to_string(&record).unwrap();
+    let (pid, start) = text.split_once('\n').unwrap();
+    let pid: u32 = pid.parse().unwrap();
+    assert!(pid > 1);
+    // The fixture root stopped the owner before the helper process ended.
+    assert_ne!(
+        remote_task_runner::platform::process_start_identity(pid),
+        remote_task_runner::platform::StartIdentity::Identity(start.to_string())
+    );
 }
 
 #[tokio::test]
@@ -714,8 +798,10 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     std::fs::write(repo.join("input.txt"), "dirty-snapshot").unwrap();
     let secret = "fixture-secret-value-abcdefghijkl";
     std::fs::write(repo.join("private.env"), format!("TOKEN={secret}\n")).unwrap();
-    spec.env
-        .insert("PATH".into(), std::env::var("PATH").unwrap());
+    spec.env.insert(
+        "PATH".into(),
+        private_tool_path(root.path(), &["git", "fast-worktree", "wc"]),
+    );
     let configdir = root.path().join(".config/remote-task-runner");
     std::fs::create_dir_all(&configdir).unwrap();
     std::fs::set_permissions(&configdir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1182,7 +1268,7 @@ fn command_commit_capture_requires_and_preserves_explicit_revision() {
     );
 }
 
-fn control_fixture() -> (tempfile::TempDir, Spec, std::path::PathBuf) {
+fn control_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
     let (root, spec) = fixture();
     let config = root.path().join(".config/remote-task-runner");
     std::fs::create_dir_all(&config).unwrap();
@@ -1467,11 +1553,7 @@ async fn control_exec_sigint(in_place: bool) {
         remote_task_runner::platform::process_start_identity(pid),
         identity
     );
-    rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
-        rustix::process::Signal::INT,
-    )
-    .unwrap();
+    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
     let output = tokio::time::timeout(Duration::from_secs(35), child.wait_with_output())
         .await
         .unwrap()
@@ -1901,11 +1983,7 @@ async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git()
         remote_task_runner::platform::process_start_identity(pid),
         identity
     );
-    rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
-        rustix::process::Signal::INT,
-    )
-    .unwrap();
+    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
     let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
         .await
         .unwrap()
@@ -1986,11 +2064,7 @@ async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git()
         remote_task_runner::platform::process_start_identity(pid),
         identity
     );
-    rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
-        rustix::process::Signal::INT,
-    )
-    .unwrap();
+    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
     // wait() does NOT drain stdout. Detach must finish even with no consumer.
     let status = tokio::time::timeout(Duration::from_secs(3), blocked.wait())
         .await
@@ -2074,11 +2148,7 @@ async fn public_logs_closed_run_final_blocked_stdout_still_detaches() {
         remote_task_runner::platform::process_start_identity(pid),
         identity
     );
-    rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
-        rustix::process::Signal::INT,
-    )
-    .unwrap();
+    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
     let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
         .await
         .unwrap()
@@ -2172,11 +2242,7 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
         remote_task_runner::platform::process_start_identity(pid),
         identity
     );
-    rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
-        rustix::process::Signal::INT,
-    )
-    .unwrap();
+    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
     let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
         .await
         .unwrap()
@@ -2872,11 +2938,7 @@ async fn public_outputs_sigint_drains_blocked_tar_worker_before_releasing_pin() 
         remote_task_runner::platform::process_start_identity(pid),
         identity
     );
-    rustix::process::kill_process(
-        rustix::process::Pid::from_raw(i32::try_from(pid).unwrap()).unwrap(),
-        rustix::process::Signal::INT,
-    )
-    .unwrap();
+    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
     let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
         .await
         .unwrap()
@@ -3005,8 +3067,10 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_exec_nested_git_cwd_uses_snapshot_root_and_preserves_in_place() {
     let (root, mut spec) = fixture();
-    spec.env
-        .insert("PATH".into(), std::env::var("PATH").unwrap());
+    spec.env.insert(
+        "PATH".into(),
+        private_tool_path(root.path(), &["git", "fast-worktree"]),
+    );
     let repo = root.path().join("project");
     let sub = repo.join("sub");
     std::fs::create_dir_all(&sub).unwrap();
