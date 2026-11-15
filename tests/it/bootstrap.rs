@@ -134,11 +134,26 @@ fn diagnose_worker(spec: &Spec) {
         eprintln!("worker journal readable=false");
         return;
     };
-    let Ok(events) = store.events_after(0, 128) else {
-        eprintln!("worker journal readable=false");
-        return;
-    };
-    for event in events.iter().rev().take(48).rev() {
+    // The whole journal, a page at a time, without the periodic renewals that
+    // would otherwise fill it.
+    let mut events = Vec::new();
+    let mut after = 0;
+    loop {
+        let Ok(page) = store.events_after(after, 128) else {
+            eprintln!("worker journal readable=false");
+            return;
+        };
+        let Some(last) = page.last() else { break };
+        after = last.seq;
+        events.extend(
+            page.into_iter()
+                .filter(|event| event.kind != "lease_renewal_observed"),
+        );
+        if events.len() > 4096 {
+            break;
+        }
+    }
+    for event in events.iter().rev().take(96).rev() {
         if matches!(
             event.kind.as_str(),
             "agent_environment_changed" | "agent_prepare_failed" | "agent_spawn_failed"
@@ -3044,7 +3059,11 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
         input.join(".remote-task-runner.toml"),
         "schema_version=1\n[[outputs]]\nname='report'\npaths=['report.txt']\nrequired=true\nwhen='always'\n",
     ).unwrap();
-    let output=tokio::time::timeout(Duration::from_secs(30),tokio::process::Command::new(&spec.executable).args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c","test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; echo report > report.txt; exit 23"]).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v))).envs(&spec.env).current_dir(&input).output()).await.unwrap().unwrap();
+    let output=tokio::time::timeout(Duration::from_secs(30),tokio::process::Command::new(&spec.executable).args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c","test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; echo report > report.txt; exit 23"]).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v))).envs(&spec.env).current_dir(&input).output()).await.unwrap_or_else(|elapsed| {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+        panic!("named-profile exec did not finish: {elapsed}");
+    }).unwrap();
     if output.status.code() != Some(23) {
         diagnose_worker(&spec);
     }
@@ -3655,6 +3674,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
         .await
         .unwrap();
     if !output.status.success() {
+        diagnose_coordinator(&spec);
         diagnose_worker(&spec);
     }
     assert!(
