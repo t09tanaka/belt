@@ -53,6 +53,14 @@ pub struct Config {
     /// Once a normal entry held up by backfilled ones has waited this
     /// long, nothing new passes it.
     pub backfill_max_wait_secs: u64,
+    /// The first nested `exec` of a command that has none running is not
+    /// held by the budget; the memory and CPU guards hold it for at most
+    /// this long.
+    pub nested_guard_max_wait_secs: u64,
+    /// A nested `exec` that does not fit the budget starts anyway once it
+    /// has waited this long and every nested command of the same parent
+    /// that is running has run this long (0: it waits until it fits).
+    pub nested_sibling_max_wait_secs: u64,
     /// `gc` removes finished job files older than this.
     pub jobs_keep_days: u64,
     /// `gc` removes the sidecars (receipts) of managed commands that ended
@@ -89,6 +97,8 @@ impl Default for Config {
             front_overload_max_wait_secs: 30,
             backfill_max_job_secs: 300,
             backfill_max_wait_secs: 300,
+            nested_guard_max_wait_secs: 60,
+            nested_sibling_max_wait_secs: 600,
             jobs_keep_days: 7,
             managed_keep_days: 7,
             jobs_orphan_grace_secs: 30,
@@ -201,6 +211,8 @@ impl Config {
             front_overload_max_wait_secs: self.front_overload_max_wait_secs as f64,
             backfill_max_job_secs: self.backfill_max_job_secs as f64,
             backfill_max_wait_secs: self.backfill_max_wait_secs as f64,
+            nested_guard_max_wait_secs: self.nested_guard_max_wait_secs as f64,
+            nested_sibling_max_wait_secs: self.nested_sibling_max_wait_secs as f64,
         }
     }
 }

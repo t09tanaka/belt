@@ -652,6 +652,8 @@ mod tests {
             using: None,
             backfilled: false,
             label: None,
+            parent: None,
+            nested_cpu_secs: 0.0,
         }
     }
 

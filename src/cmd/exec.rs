@@ -5,25 +5,47 @@ use crate::signals::reraise;
 use std::io::IsTerminal;
 use task_traffic_controller::config::Config;
 use task_traffic_controller::error::{Error, Result};
-use task_traffic_controller::exec::{self, Gated, Hooks, Opts};
+use task_traffic_controller::exec::{self, Gated, Hooks, NestedMode, Nesting, Opts};
 use task_traffic_controller::runner::{self, Exit};
 use task_traffic_controller::Context;
 
-pub fn run(ctx: &Context, cfg: &Config, opts: Opts) -> Result<i32> {
+/// Overrides how a nested `exec` is treated (`admit` or `inherit`) for
+/// everything started with it in the environment; `--nested` wins.
+pub const NESTED_ENV: &str = "TASK_TRAFFIC_CONTROLLER_NESTED";
+
+/// `--nested`, else [`NESTED_ENV`], else the default.
+pub fn nested_mode(flag: Option<&str>, env: Option<&str>) -> Result<NestedMode> {
+    let (Some(text), from) = (match flag {
+        Some(f) => (Some(f), "--nested"),
+        None => (env, NESTED_ENV),
+    }) else {
+        return Ok(NestedMode::default());
+    };
+    NestedMode::parse(text)
+        .ok_or_else(|| Error::Spawn(format!("{from} is `admit` or `inherit`, not {text:?}")))
+}
+
+pub fn run(ctx: &Context, cfg: &Config, mut opts: Opts, nested: Option<&str>) -> Result<i32> {
     if opts.argv.is_empty() {
         return Err(Error::Spawn(
-            "usage: task-traffic-controller exec [--weight N] [--front] [--key K] -- <command> [args...]".into(),
+            "usage: task-traffic-controller exec [--weight N] [--front] [--key K] [--nested admit|inherit] -- <command> [args...]".into(),
         ));
     }
     let var = |name: &str| std::env::var_os(name).map(|v| v.to_string_lossy().into_owned());
-    if let Some(lease) = exec::nested_run_id(
+    let mode = nested_mode(nested, var(NESTED_ENV).as_deref())?;
+    match exec::nesting(
         ctx,
+        mode,
         var("TASK_TRAFFIC_CONTROLLER_LEASE").as_deref(),
         var(task_traffic_controller::marker::ENV_VAR).as_deref(),
         var(task_traffic_controller::marker::SCOPE_VAR).as_deref(),
     )? {
-        let out = runner::run(ctx, &opts.argv, &opts.cwd, &lease, false)?;
-        return Ok(finish(out.exit));
+        Nesting::Inherit(lease) => {
+            let out = runner::run(ctx, &opts.argv, &opts.cwd, &lease, false)?;
+            return Ok(finish(out.exit));
+        }
+        Nesting::Child(parent) => opts.parent = Some(parent),
+        Nesting::Top => {}
     }
     let id = exec::new_id();
     match run_gated(ctx, cfg, &opts, &id, &|| false)? {
@@ -60,5 +82,33 @@ pub fn finish(exit: Exit) -> i32 {
             c
         }
         Exit::Signal(s) => reraise(s),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_flag_wins_over_the_environment_and_admit_is_the_default() {
+        assert_eq!(nested_mode(None, None).unwrap(), NestedMode::Admit);
+        assert_eq!(
+            nested_mode(None, Some("inherit")).unwrap(),
+            NestedMode::Inherit
+        );
+        assert_eq!(
+            nested_mode(Some("admit"), Some("inherit")).unwrap(),
+            NestedMode::Admit
+        );
+        assert_eq!(
+            nested_mode(Some("inherit"), None).unwrap(),
+            NestedMode::Inherit
+        );
+        let err = nested_mode(None, Some("off")).unwrap_err().to_string();
+        assert!(err.contains(NESTED_ENV) && err.contains("off"), "{err}");
+        let err = nested_mode(Some("no"), Some("admit"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--nested"), "{err}");
     }
 }

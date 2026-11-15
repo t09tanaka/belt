@@ -875,6 +875,8 @@ pub(crate) fn push_entry(
             using: None,
             backfilled: false,
             label: opts.label.clone(),
+            parent: opts.parent.clone(),
+            nested_cpu_secs: 0.0,
         });
         ledger.save(&ctx.paths.ledger_file())?;
         return Ok(Pushed::New { seq });
@@ -963,6 +965,35 @@ pub enum TryAdmit {
 /// One admission attempt for the registered `id`, as of the latest ledger
 /// state under its lock. `waited_secs` is the queue age to judge with.
 pub fn try_admit(ctx: &Context, limits: Limits, id: &str, waited_secs: f64) -> Result<TryAdmit> {
+    try_admit_in(ctx, limits, id, waited_secs, None)
+}
+
+/// Put `parent` back on the entry `id` when the ledger has lost it; true
+/// when it was written. A binary from before nested admission that is
+/// still running a command rewrites the ledger without the field (about
+/// once a second, from its sampler). The entry would then be a top-level
+/// one, waiting for budget its own parent holds while the parent waits
+/// for it.
+fn restamp_parent(ledger: &mut Ledger, id: &str, parent: Option<&str>) -> bool {
+    match (parent, ledger.find_mut(id)) {
+        (Some(parent), Some(e)) if e.parent.as_deref() != Some(parent) => {
+            e.parent = Some(parent.to_string());
+            true
+        }
+        _ => false,
+    }
+}
+
+/// [`try_admit`] for an entry registered with `parent`
+/// ([`crate::exec::Opts::parent`]): the same attempt, after making sure the
+/// ledger still names that parent.
+pub fn try_admit_in(
+    ctx: &Context,
+    limits: Limits,
+    id: &str,
+    waited_secs: f64,
+    parent: Option<&str>,
+) -> Result<TryAdmit> {
     // Process scans for entries kept without a lease holder happen here,
     // outside the lock (and at most every few seconds per entry).
     lock::refresh_verdicts(ctx);
@@ -973,7 +1004,8 @@ pub fn try_admit(ctx: &Context, limits: Limits, id: &str, waited_secs: f64) -> R
             return Ok(TryAdmit::LockBusy);
         };
         let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
-        if !lock::reap_dead(ctx, &mut ledger).is_empty() {
+        let reaped = !lock::reap_dead(ctx, &mut ledger).is_empty();
+        if restamp_parent(&mut ledger, id, parent) || reaped {
             ledger.save(&ctx.paths.ledger_file())?;
         }
         let queue = ledger.queue_at(ctx.clock.now());
@@ -1014,6 +1046,7 @@ pub fn try_admit(ctx: &Context, limits: Limits, id: &str, waited_secs: f64) -> R
     };
     let mut ledger = Ledger::load(&ctx.paths.ledger_file())?;
     let reaped = !lock::reap_dead(ctx, &mut ledger).is_empty();
+    let reaped = restamp_parent(&mut ledger, id, parent) || reaped;
     let queue = ledger.queue_at(ctx.clock.now());
     let decision = admit::admit(&queue, id, predicted_rss, waited_secs, limits, snapshot);
     if decision == Decision::Admitted {
@@ -1150,6 +1183,7 @@ pub fn run_command_with_tracker(
             start_tracker,
             env: opts.env.as_ref(),
             stdout_log: opts.stdout_log.as_deref(),
+            parent: opts.parent.as_deref(),
         },
     )?;
     if let Some(at) = outcome.tracked_to_exit_at {

@@ -7,6 +7,65 @@ the minor version).
 
 ## [Unreleased]
 
+### Changed
+
+- **A nested `exec` is now gated.** An `exec` called from inside a gated
+  command used to inherit the outer lease and run at once, with no weight
+  and no entry. A command that wraps each of its own steps in `exec` (a
+  CI runner under `exec`) therefore ran all of them together, each on
+  every core. A nested `exec` now registers as a child of the outer entry
+  (`parent` in the ledger, `status --json` and `inspect --json`; `[in
+  <pid>]` in `status`) and queues against the same budget with its own
+  weight, measurement and history.
+  - A running entry and what is nested in it take `max(weight, own use +
+    what its running children take)`: children use up their parent's
+    weight first, and the parent's measurement leaves out its children's
+    process trees, so nothing is charged twice.
+  - A finished child leaves its CPU time with its parent; the parent's
+    run is recorded without it and with the peak memory of its own
+    processes, so a command that only starts its steps does not learn
+    their weight.
+  - The first child of a parent that has no child running is not held by
+    the queue or the budget, so a parent waiting for its child cannot
+    deadlock and a command that nests one `exec` at a time does not wait
+    for the budget. The memory and CPU guards hold it for at most
+    `nested_guard_max_wait_secs` (60 s). Each running parent can exceed
+    the budget by at most one child.
+  - A further child that does not fit starts anyway after
+    `nested_sibling_max_wait_secs` (10 min, 0 disables), once every
+    running child of the same parent has run that long: a running child
+    that waits for a queued one does not wait for ever.
+  - Waiting children are ahead of every top-level entry, `--front`
+    included. A waiting child whose parent's entry is gone leaves the
+    queue without running.
+  - A stale lease is gated as a top-level command, as before; a gated
+    command's measurement leaves out the tree of every other entry found
+    below it. A caller inside a managed run whose supervisor is gone
+    still runs under it without an entry, as before.
+  - **Ledger format.** While a nested entry exists the ledger is written
+    as `version` 3 with `entries_v3`, which binaries older than this one
+    refuse (they would write it back without the nesting). Upgrade when
+    nothing is queued. A nested entry also writes its `parent` back if it
+    finds it missing.
+  - `status` warns about entries that name each other as `parent`.
+
+### Added
+
+- `exec --nested admit|inherit` and `TASK_TRAFFIC_CONTROLLER_NESTED`.
+  `inherit` is the previous behaviour, for one call or (through the
+  environment of the outer command) a whole tree.
+- Library: `ledger::Entry::parent`, `admit::QueueEntry::parent`,
+  `admit::is_nested`, `exec::Opts::parent`, `exec::NestedMode`,
+  `exec::Nesting`, `exec::nesting`, `exec::own_cpu_secs`,
+  `managed::try_admit_in`, `ledger::Entry::nested_cpu_secs`,
+  `ledger::NESTED_SCHEMA_VERSION`, `Ledger::parent_cycles`,
+  `admit::QueueEntry::ran_secs`, `runner::Outcome::own_max_rss_bytes`,
+  `runner::Spawn::parent` and `usage::tree_peak_rss`. `usage::tree_cores`
+  and `usage::Monitor::start` take more arguments; `usage::Proc` has
+  `rss`.
+- Configuration: `nested_guard_max_wait_secs` (60) and
+  `nested_sibling_max_wait_secs` (600); both are in `admit::Limits`.
+
 ## [0.8.2] - 2026-11-14
 
 ### Added

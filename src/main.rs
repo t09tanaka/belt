@@ -34,6 +34,11 @@ enum Cmd {
         /// Name the run for `status` and `top` (or TASK_TRAFFIC_CONTROLLER_LABEL)
         #[arg(long)]
         label: Option<String>,
+        /// Inside another gated command: `admit` (default) queues against
+        /// the same budget as its child, `inherit` runs at once under it
+        /// (or TASK_TRAFFIC_CONTROLLER_NESTED)
+        #[arg(long, value_name = "MODE")]
+        nested: Option<String>,
         /// Command and arguments (after `--`)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
         command: Vec<String>,
@@ -164,8 +169,14 @@ fn run(cli: Cli) -> error::Result<i32> {
             front,
             key,
             label,
+            nested,
             command,
-        } => cmd::exec::run(&ctx, &cfg, opts(weight, front, key, label, command)?),
+        } => cmd::exec::run(
+            &ctx,
+            &cfg,
+            opts(weight, front, key, label, command)?,
+            nested.as_deref(),
+        ),
         Cmd::Status { json } => cmd::status::run(&ctx, &cfg, json),
         Cmd::Top { interval } => cmd::top::run(&ctx, &cfg, interval),
         Cmd::History {

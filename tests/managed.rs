@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use task_traffic_controller::admit::State;
 use task_traffic_controller::config::Config;
-use task_traffic_controller::exec::{self, Gated, Hooks, Opts};
+use task_traffic_controller::exec::{self, Gated, Hooks, NestedMode, Nesting, Opts};
 use task_traffic_controller::history::{self, Record};
 use task_traffic_controller::ledger::Ledger;
 use task_traffic_controller::managed::{
@@ -541,12 +541,72 @@ fn a_plain_entry_keeps_the_old_ledger_readable() {
         using: None,
         backfilled: false,
         label: None,
+        parent: None,
+        nested_cpu_secs: 0.0,
     });
     l.save(&ctx.paths.ledger_file()).unwrap();
     let old: old_ledger::Ledger =
         serde_json::from_slice(&std::fs::read(ctx.paths.ledger_file()).unwrap()).unwrap();
     assert_eq!(old.version, 1);
     assert_eq!(old.entries.len(), 1);
+}
+
+/// A binary from before nested admission that is still running a command
+/// rewrites the ledger without `parent`. The waiting child puts it back on
+/// every attempt; without it the child would wait for the budget its own
+/// parent holds.
+#[test]
+fn a_nested_entry_whose_parent_was_dropped_from_the_ledger_names_it_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path());
+    let cfg = Config {
+        budget: 2,
+        ..Config::default()
+    };
+    let entry = |id: &str, state, seq| task_traffic_controller::ledger::Entry {
+        id: id.into(),
+        pid: std::process::id(),
+        state,
+        front: false,
+        weight: 2,
+        predicted_rss: 0,
+        expected_secs: None,
+        repo: String::new(),
+        subdir: String::new(),
+        argv: id.into(),
+        key: id.into(),
+        seq,
+        enqueued_at: chrono::Utc::now(),
+        started_at: None,
+        using: None,
+        backfilled: false,
+        label: None,
+        // As an older binary left it.
+        parent: None,
+        nested_cpu_secs: 0.0,
+    };
+    let _leases = [
+        lock::take_lease(&ctx, "p").unwrap(),
+        lock::take_lease(&ctx, "c").unwrap(),
+    ];
+    let mut l = Ledger::default();
+    l.entries.push(entry("p", State::Running, l.next_seq));
+    l.entries.push(entry("c", State::Waiting, l.next_seq + 1));
+    l.save(&ctx.paths.ledger_file()).unwrap();
+    let attempt = |parent| loop {
+        match managed::try_admit_in(&ctx, cfg.limits(), "c", 0.0, parent).unwrap() {
+            TryAdmit::LockBusy => continue,
+            other => break other,
+        }
+    };
+    // As a top-level entry it waits for the budget `p` holds.
+    assert!(matches!(attempt(None), TryAdmit::Wait(_)));
+    assert_eq!(reaped(&ctx).find("c").unwrap().parent, None);
+    // Naming its parent again, it is that parent's only child.
+    assert_eq!(attempt(Some("p")), TryAdmit::Admitted);
+    let c = reaped(&ctx).find("c").cloned().unwrap();
+    assert_eq!(c.parent.as_deref(), Some("p"));
+    assert_eq!(c.state, State::Running);
 }
 
 #[test]
@@ -2273,11 +2333,39 @@ fn a_started_managed_run_of_this_state_dir_is_nested_without_its_lease() {
     let nested = |lease: Option<&str>, id: Option<&str>, sc: Option<&str>| {
         exec::nested_run_id(&ctx, lease, id, sc).unwrap()
     };
+    let nesting = |mode, lease: Option<&str>, id: Option<&str>| {
+        exec::nesting(&ctx, mode, lease, id, Some(&scope)).unwrap()
+    };
     // Registered only: nothing started, so a caller is not inside it.
     assert_eq!(nested(None, Some("c"), Some(&scope)), None);
+    assert_eq!(
+        nesting(NestedMode::Admit, Some("c"), Some("c")),
+        Nesting::Top
+    );
     orphan_with_live_child(&ctx, "c");
+    admit_now(&ctx, &cfg, "c");
+    // Running under a held lease: a caller that names it queues as its
+    // child, unless told to run under it as before.
+    assert_eq!(
+        nesting(NestedMode::Admit, Some("c"), Some("c")),
+        Nesting::Child("c".into())
+    );
+    assert_eq!(
+        nesting(NestedMode::Inherit, Some("c"), None),
+        Nesting::Inherit("c".into())
+    );
+    assert_eq!(nesting(NestedMode::Admit, None, None), Nesting::Top);
     drop(g); // the supervisor and its lease are gone
     assert_eq!(nested(None, Some("c"), Some(&scope)).as_deref(), Some("c"));
+    // With no supervisor left, a caller inside the run is not queued
+    // behind it: it runs under it, whichever way was asked for.
+    for mode in [NestedMode::Admit, NestedMode::Inherit] {
+        assert_eq!(
+            nesting(mode, Some("c"), Some("c")),
+            Nesting::Inherit("c".into())
+        );
+        assert_eq!(nesting(mode, Some("c"), None), Nesting::Top);
+    }
     assert_eq!(
         nested(Some("stale"), Some("c"), Some(&scope)).as_deref(),
         Some("c")

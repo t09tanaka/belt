@@ -45,10 +45,31 @@ pub fn render(ctx: &Context, cfg: &Config) -> Result<String> {
             .unwrap_or_default()
     };
 
+    // `[in 48211] `: the pid column of the running entry it is nested in.
+    let nested_in = |e: &task_traffic_controller::ledger::Entry| {
+        e.parent
+            .as_deref()
+            .and_then(|p| ledger.find(p))
+            .map(|p| format!("[in {}] ", p.pid))
+            .unwrap_or_default()
+    };
+
     let _ = writeln!(out, "budget {used}/{} used", cfg.budget);
-    if format > task_traffic_controller::ledger::SCHEMA_VERSION {
+    if format >= task_traffic_controller::ledger::NESTED_SCHEMA_VERSION {
+        let _ = writeln!(out,
+            "ledger format v{format}: task-traffic-controller binaries from before nested admission (0.8 and older) refuse it until the nested commands have finished"
+        );
+    } else if format > task_traffic_controller::ledger::SCHEMA_VERSION {
         let _ = writeln!(out,
             "ledger format v{format}: older task-traffic-controller binaries refuse it until every managed entry is settled (`task-traffic-controller resolve <id> [--force]`)"
+        );
+    }
+    let cycles = ledger.parent_cycles();
+    if !cycles.is_empty() {
+        let _ = writeln!(
+            out,
+            "warning: entries {} name each other as parent (was the ledger edited?); they are not counted in the budget",
+            cycles.join(", ")
         );
     }
     if let Some(s) = ctx.live.snapshot() {
@@ -67,7 +88,7 @@ pub fn render(ctx: &Context, cfg: &Config) -> Result<String> {
         any_idle |= is_idle(e.using, elapsed);
         let _ = writeln!(
             out,
-            "  {:>7}  {}{} {:>8}  {}{}{}",
+            "  {:>7}  {}{} {:>8}  {}{}{}{}",
             e.pid,
             weight_label(e.weight, e.using),
             if is_idle(e.using, elapsed) {
@@ -76,6 +97,7 @@ pub fn render(ctx: &Context, cfg: &Config) -> Result<String> {
                 ""
             },
             fmt_duration(elapsed),
+            nested_in(e),
             if e.backfilled { "[backfill] " } else { "" },
             truncate(&entry_label(e), 70),
             eta_of(&e.id)
@@ -96,10 +118,11 @@ pub fn render(ctx: &Context, cfg: &Config) -> Result<String> {
         let waited = (now - e.enqueued_at).to_std().unwrap_or_default();
         let _ = writeln!(
             out,
-            "  {:>7}  w{:<2} {:>8}  {}{}{}",
+            "  {:>7}  w{:<2} {:>8}  {}{}{}{}",
             e.pid,
             e.weight,
             fmt_duration(waited),
+            nested_in(e),
             if e.front { "[front] " } else { "" },
             truncate(&entry_label(e), 70),
             eta_of(&e.id)

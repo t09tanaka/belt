@@ -151,6 +151,8 @@ mod tests {
                 waited_secs: 0.0,
                 expected_secs: exp,
                 backfilled: false,
+                parent: None,
+                ran_secs: 0.0,
             },
             elapsed_secs: elapsed,
         }
@@ -167,6 +169,8 @@ mod tests {
             front_overload_max_wait_secs: 30.0,
             backfill_max_job_secs: 300.0,
             backfill_max_wait_secs: 300.0,
+            nested_guard_max_wait_secs: 60.0,
+            nested_sibling_max_wait_secs: 600.0,
         }
     }
 

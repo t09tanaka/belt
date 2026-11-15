@@ -117,6 +117,8 @@ mod tests {
             using: Some(0.0),
             backfilled: false,
             label: None,
+            parent: None,
+            nested_cpu_secs: 0.0,
         };
         assert_eq!(holder(&e, now, 40), "48211 w2 idle 52:10 make api");
         e.using = Some(1.26);
@@ -147,6 +149,8 @@ mod tests {
             using: None,
             backfilled: false,
             label: None,
+            parent: None,
+            nested_cpu_secs: 0.0,
         };
         assert_eq!(entry_label(&e), "web/api: npm run test");
         e.label = Some("unit tests".into());
