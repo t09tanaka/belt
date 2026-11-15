@@ -632,23 +632,32 @@ mod tests {
         let initial = evaluate_portable(&j, &contexts, &needs, false, false, 1);
         assert_eq!(initial.entries.len(), 1);
         assert!(matches!(initial.entries[0].decision, Decision::Run(_)));
-        if let Decision::Run(mut cm) = initial.entries.into_iter().next().unwrap().decision {
-            cm.insert("strategy".into(), json!({}));
-            let base = serde_json::to_vec(&(&cm, &Map::<String, Value>::new(), &j.name))
-                .unwrap()
-                .len();
-            assert!(base < 8_388_608);
-            let padding = 8_388_608 - base;
-            assert!(padding < 8_388_608);
-            needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding));
-            let exact = evaluate_portable(&j, &contexts, &needs, false, false, 1);
-            assert!(
-                matches!(exact.entries[0].decision, Decision::Run(_)),
-                "{exact:?}"
-            );
-            needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding + 1));
-            assert!(evaluate_portable(&j, &contexts, &needs, false, false, 1).budget_exceeded);
-        }
+        // The portable context contract is explicit, so calibration does not
+        // need an unreachable extraction branch in the test fixture.
+        let cm = json!({"github": {}, "runner": {}, "needs": needs,
+            "inputs": {}, "vars": {}, "env": {}, "matrix": {}, "strategy": {}})
+        .as_object()
+        .unwrap()
+        .clone();
+        let mut running = cm.clone();
+        running.insert("strategy".into(), json!({"job-index": 0, "job-total": 1}));
+        assert!(
+            matches!(&initial.entries[0].decision, Decision::Run(actual) if actual == &running)
+        );
+        let base = serde_json::to_vec(&(&cm, &Map::<String, Value>::new(), &j.name))
+            .unwrap()
+            .len();
+        assert!(base < 8_388_608);
+        let padding = 8_388_608 - base;
+        assert!(padding < 8_388_608);
+        needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding));
+        let exact = evaluate_portable(&j, &contexts, &needs, false, false, 1);
+        assert!(
+            matches!(exact.entries[0].decision, Decision::Run(_)),
+            "{exact:?}"
+        );
+        needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding + 1));
+        assert!(evaluate_portable(&j, &contexts, &needs, false, false, 1).budget_exceeded);
 
         let mut j = job("    needs: seed\n    name: '${{ vars.display }}'\n    strategy:\n      matrix:\n        n: [0, 1, 2, 3, 4]\n    steps: []\n");
         let contexts =
