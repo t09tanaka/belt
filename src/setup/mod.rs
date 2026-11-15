@@ -12,3 +12,5 @@ pub mod observation;
 pub mod observation_transport;
 
 pub mod preparation_probe;
+
+pub mod preparation_freshness;

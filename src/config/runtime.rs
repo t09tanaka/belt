@@ -98,6 +98,11 @@ impl ResolvedConfig {
         };
         coordinator.scheduler().set_priority(id, priority);
         let timeout = Duration::from_millis(settings.coordinator.worker_budget_ms);
+        let probe = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|feature| feature == crate::wire::PREPARATION_PROBE_FEATURE);
         let observations = connected
             .negotiated
             .features
@@ -108,7 +113,8 @@ impl ResolvedConfig {
                 Some(gate) => ClientLink::gated(connected.client, timeout, gate),
                 None => ClientLink::new(connected.client, timeout),
             })
-            .with_preparation_observations(observations),
+            .with_preparation_observations(observations)
+            .with_preparation_probe(probe),
         );
         coordinator.attach(id.clone(), link.clone()).await;
         Ok(link)

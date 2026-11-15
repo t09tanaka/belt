@@ -95,9 +95,11 @@ impl Coordinator {
             ),
         };
         let attempt = AttemptId::generate();
+        let preparation_profiles = Mutex::new(BTreeMap::new());
         let questions = workers
             .into_iter()
             .map(|(worker_id, link)| {
+                let preparation_profiles = &preparation_profiles;
                 let query = &query;
                 let loads = &loads;
                 let pending = &pending;
@@ -123,6 +125,14 @@ impl Coordinator {
                             unmet: vec![],
                         });
                     };
+                    if spec.is_some() && inspect.worker_id == worker_id {
+                        if let Some(cap) = inspect.capabilities.as_ref() {
+                            let mut profiles = preparation_profiles.lock().unwrap_or_else(|e| e.into_inner());
+                            if profiles.len() < 256 {
+                                profiles.insert(worker_id.clone(), (cap.profile_fingerprint.clone(), inspect.worker_boot_id.clone(), inspect.agent_epoch, Arc::clone(&link)));
+                            }
+                        }
+                    }
                     let bundle = spec.and_then(|spec| spec.toolchains.as_ref());
                     let mut bundle_valid = bundle.is_none();
                     if let Some(bundle) = bundle {
@@ -315,12 +325,39 @@ impl Coordinator {
                 })
             })
             .collect();
+        let identity_observed = if let (Some(input), Some(spec), Some(worker)) =
+            (input.as_ref(), spec.as_ref(), decision.winner.as_ref())
+        {
+            let profile = preparation_profiles
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(worker)
+                .cloned();
+            if let Some((profile, boot, epoch, attachment)) = profile {
+                self.query_preparation_identity(
+                    worker,
+                    input,
+                    spec,
+                    profile,
+                    (boot, epoch),
+                    attachment,
+                )
+                .await
+            } else {
+                false
+            }
+        } else {
+            false
+        };
         let assumptions = if let Some(spec) = &spec {
             let mut notes = vec![
                 "hypothetical rerun using stored commands, environment, setup, frozen toolchains and output plan; not remaining runtime".into(),
                 "captured source kind is unknown; native runtime history correlation is unproven; fallback values rank candidates only".into(),
                 "preview is conditional on current worker state; unobserved setup and additional inputs remain unknown".into(),
             ];
+            if identity_observed {
+                notes.push("selected worker preparation identity observed; availability, activation and setup delay remain unknown".into());
+            }
             if spec.in_place {
                 notes.push("in-place workspace content remains mutable; stored specification does not freeze its files".into());
             }

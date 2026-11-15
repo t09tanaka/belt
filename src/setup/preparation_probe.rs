@@ -31,12 +31,14 @@ pub enum ProbeUnknown {
     OwnershipChanged,
     Barrier,
 }
+pub use super::preparation_freshness::{ProbeProvenance, ProfileSample};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PreparationProbe {
     /// No managed preparation; ordinary task steps may still perform setup.
     NoManagedPreparation,
     Unknown(ProbeUnknown),
     Entries {
+        provenance: ProbeProvenance,
         owner_generation: BuilderId,
         #[serde(deserialize_with = "bounded_entries")]
         entries: Vec<PreparationProbeEntry>,

@@ -716,3 +716,11 @@ cancellation guard regressions remain green. Full local-ci/MSRV/Linux/remote/nat
 manager子PIDは一時ファイルへの書込後renameで公開する。toolchain/workerの私有fake fixtureだけにbudget2・CPU閾値100・memory reserve0のTTC設定を置き、実ledgerとquotaを維持する。workerはenrollment完了後に作成し、既存state拒否を回避しない。外側の共有CPU admissionと製品既定値は変更しない。mutationは明示されたCARGO_BUILD_JOBSを尊重し、各shardのRust test並列度を1にする。従来の4 shard×nproc12による共有予算12の超過を補正するもので、すべての起動遅延がCPU guardだけで説明できたとは主張しない。
 
 Rust1.100で限定検証はtoolchain13件（21.83秒、1500ms deadlineと子回収assertを維持）およびworker_role6件（5.00秒）が成功。`cargo clippy --all-targets --all-features -- -D warnings`、fmt、diff-checkも成功。全体CIはこの補正後に再実行が必要。削除B/Cと純粋モジュールgateの統合・専任レビューは別の残件として維持する。
+
+### 準備 identity の元 sample freshness と stored-task preview 接続
+
+未公開の `preparation_probe_v1` を、normal profile report 完了時だけ採番する非再利用 sample sequence・native boot・元の completed monotonic stamp/5000ms TTL と、probe 最終 observed stamp を含む契約へ拡張した。completed snapshot が一時的に無くても sequence は戻さず、overflow は Unknown とする。二度の resolver が同じ実 sample を使い、全 IO 後も native boot・clock・元 TTL を再確認する。query は report/native command を呼ばず、sample を更新しない。
+
+`estimate --task ID` は、保存済みの完全 TaskSpec/source/run と選択 worker の preview profile/boot/epoch が揃う場合だけ、hello で feature 交渉済みの同じ attachment に一度だけ readonly probe を送る。command-only・source 不明・古い peer は Unknown のままである。IO 中は actor を保持せず、応答後に attachment/InputGate 世代・worker identity・owner/input/profile binding を再照合する。最大256 worker の private identity context、同時 query 全体1件、送信 input 256KiB と最大16 entry の上限を保つ。親 send 時刻から元 sample の age と observation TTL の最小残量を使い、受信から5秒を作らない。同じ sample の再送は最初の deadline を延長しない。identity の確認だけを preview assumption に表示し、setup scalar・ready delay・admission は変更しない。
+
+現在の producer Active は実 BuilderId/attempt の観測であり TTC command node の証明ではない。artifact の bounded 完全検証・正確な frozen activation の証明、実 TTC ledger identity と依存/resource graph の対応、既存 simulator への接続とユーザー経路の受入は引き続き必須残件である。ConcretePlan/producer 不在から cold/warm/0 を作らず、setup cost は Unknown を維持する。
