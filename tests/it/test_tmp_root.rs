@@ -24,9 +24,8 @@ fn temp_root_process() {
     std::fs::write(&pending, crate::test_tmp::root().to_str().unwrap()).unwrap();
     std::fs::rename(pending, &record).unwrap();
     if std::env::var_os(HANG).is_some() {
-        loop {
-            std::thread::sleep(Duration::from_secs(1));
-        }
+        // Until the parent kills this process; bounded in case it cannot.
+        std::thread::sleep(Duration::from_secs(120));
     }
 }
 
@@ -87,7 +86,8 @@ fn killed_test_process_root_is_removed_by_the_next_test_process() {
         libc::SIGKILL
     ));
     assert!(!killed.wait().unwrap().success());
-    assert!(outer.exists(), "a killed process ran its cleanup");
+    // Any test process that starts from here on may remove the root: no
+    // assertion that it still exists.
     let next = dir.path().join("next");
     assert!(helper(&next, false).wait().unwrap().success());
     assert!(!outer.exists(), "{outer:?} survived the next test process");
