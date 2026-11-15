@@ -869,9 +869,13 @@ the whole commit/tree object graph against hostile database replacement.
 The planner shares that raw workflow-body reader and one combined byte/count
 budget, preserving trailing YAML block-scalar newlines instead of trimming
 workflow text. Ref metadata is resolved once to an immutable commit before
-listing and reading. Workflow listing and other metadata still use the existing
-Git metadata helper; the raw-body bounds do not claim a bound on those legacy
-listing allocations or syscalls. Git plans previously frozen with trimmed
+listing and reading. Listing uses the same owned Git process boundary with
+literal NUL-terminated paths and strict UTF-8 decoding. A separate aggregate
+metadata allowance covers all directories: at most 4096 listed entries (including
+non-workflow files), at most 4096 bytes per path and about 16MiB of raw listing
+bytes. Those limits do not reset per directory and do not consume the separate
+4MiB workflow-body budget. Other legacy metadata calls remain outside these
+bounds; no hard filesystem syscall deadline is claimed. Git plans previously frozen with trimmed
 block-scalar text must be rebuilt from the same immutable commit before using
 the strict scheduling verifier; no trimming compatibility fallback is applied.
 

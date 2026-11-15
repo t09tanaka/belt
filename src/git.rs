@@ -196,23 +196,9 @@ pub fn workflows_at(
     let mut reader = crate::source_execute::GitWorkflowReader::new(ctx, dir, &commit)?;
     let mut out = Vec::new();
     for (d, named) in &dirs {
-        let list = git(
-            ctx,
-            dir,
-            &[
-                "--no-replace-objects",
-                "--no-lazy-fetch",
-                "--literal-pathspecs",
-                "-c",
-                "protocol.allow=never",
-                "ls-tree",
-                "--name-only",
-                &commit,
-                &format!("{d}/"),
-            ],
-        )?;
+        let list = reader.paths(d)?;
         let files: Vec<&str> = list
-            .lines()
+            .split('\0')
             .filter(|f| f.ends_with(".yml") || f.ends_with(".yaml"))
             .collect();
         if files.is_empty() && *named != Named::Default {

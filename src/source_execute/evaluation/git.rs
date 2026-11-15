@@ -16,6 +16,7 @@ use std::{
 };
 
 const MAX_PATH: usize = 4096;
+const MAX_LIST_BYTES: usize = MAX_WORKFLOWS * (MAX_PATH + 1);
 const MAX_STDERR: usize = 64 * 1024;
 const REQUEST_TIME: Duration = Duration::from_secs(30);
 const COMMAND_TIME: Duration = Duration::from_secs(5);
@@ -86,6 +87,8 @@ pub(crate) struct GitWorkflowReader<'a> {
     started: Instant,
     remaining: usize,
     count: usize,
+    listing_remaining: usize,
+    listed: usize,
 }
 impl<'a> GitWorkflowReader<'a> {
     pub(crate) fn new(ctx: &'a ExecContext, repository: &'a Path, commit: &'a str) -> Result<Self> {
@@ -119,7 +122,51 @@ impl<'a> GitWorkflowReader<'a> {
             started,
             remaining: MAX_SOURCE_BYTES,
             count: 0,
+            listing_remaining: MAX_LIST_BYTES,
+            listed: 0,
         })
+    }
+    /// NUL-terminated literal paths, with one metadata budget for all dirs.
+    /// Decode strictly: lossy decoding could map a non-UTF8 entry to a different
+    /// existing workflow whose name actually contains the replacement character.
+    pub(crate) fn paths(&mut self, directory: &str) -> Result<String> {
+        ensure!(
+            directory.len() <= MAX_PATH && !directory.contains('\0'),
+            "invalid Git workflow listing directory"
+        );
+        let bytes = command(
+            self.ctx,
+            self.repository,
+            &[
+                "ls-tree",
+                "--name-only",
+                "-z",
+                self.commit,
+                "--",
+                &format!("{directory}/"),
+            ],
+            self.listing_remaining,
+            self.started,
+        )?;
+        self.listing_remaining -= bytes.len();
+        let text = String::from_utf8(bytes).context("Git workflow paths must be UTF-8")?;
+        ensure!(
+            text.is_empty() || text.ends_with('\0'),
+            "unterminated Git workflow listing"
+        );
+        for path in text.split('\0').filter(|p| !p.is_empty()) {
+            ensure!(
+                path.len() <= MAX_PATH,
+                "Git workflow listing path exceeds byte bound"
+            );
+            ensure!(
+                self.listed < MAX_WORKFLOWS,
+                "too many Git workflow listing entries"
+            );
+            self.listed += 1;
+        }
+        self.finish()?;
+        Ok(text)
     }
     pub(crate) fn read(&mut self, path: &str) -> Result<Vec<u8>> {
         ensure!(self.count < MAX_WORKFLOWS, "too many evaluation workflows");

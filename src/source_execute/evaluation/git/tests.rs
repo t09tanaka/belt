@@ -535,3 +535,91 @@ fn ordinary_git_listing_ignores_replace_refs_and_propagates_missing_tree_errors(
     );
     assert!(!f.root().join(".git/FETCH_HEAD").exists());
 }
+
+#[test]
+fn ordinary_git_planning_keeps_unicode_and_space_workflow_names() {
+    for name in [
+        "検証 workflow.yml",
+        "space name.yml",
+        "replacement-\u{fffd}.yml",
+    ] {
+        let f = Fixture::new();
+        let path = format!(".github/workflows/{name}");
+        git(f.root(), &["mv", ".github/workflows/ci.yml", &path]);
+        git(f.root(), &["commit", "-qm", "literal workflow filename"]);
+        let files = crate::git::workflows_at(&f.ctx, f.root(), "HEAD", None, &[]).unwrap();
+        assert_eq!(
+            files.len(),
+            1,
+            "workflow {name:?} must not be silently skipped"
+        );
+        assert_eq!(files[0].0, path);
+        assert_eq!(files[0].1, WORKFLOW);
+    }
+}
+
+fn listing_context(body: &str) -> (tempfile::TempDir, ExecContext) {
+    fake_context(&format!("#!/bin/sh\nfor arg in \"$@\"; do\n case \"$arg\" in\n --show-object-format) echo sha1; exit 0;;\n -t) echo commit; exit 0;;\n esac\ndone\n{body}\n"))
+}
+#[test]
+fn workflow_listing_is_strict_utf8_and_has_shared_metadata_budgets() {
+    let commit = "0".repeat(40);
+    let (area, ctx) = listing_context("printf 'bad\\377.yml\\000'");
+    let mut reader = GitWorkflowReader::new(&ctx, area.path(), &commit).unwrap();
+    assert!(reader
+        .paths(".github/workflows")
+        .unwrap_err()
+        .to_string()
+        .contains("UTF-8"));
+    let (area, ctx) = listing_context("printf 'x.yml\\000'");
+    let mut reader = GitWorkflowReader::new(&ctx, area.path(), &commit).unwrap();
+    assert_eq!(reader.listing_remaining, 16_781_312);
+    // A smaller live quota exercises exact exhaustion across separate dirs.
+    reader.listing_remaining = 12;
+    assert_eq!(reader.paths("one").unwrap(), "x.yml\0");
+    assert_eq!(reader.paths("two").unwrap(), "x.yml\0");
+    assert_eq!(
+        reader.remaining, 4_194_304,
+        "listing must not consume body bytes"
+    );
+    assert!(reader
+        .paths("three")
+        .unwrap_err()
+        .to_string()
+        .contains("output limit"));
+    let (area, ctx) = listing_context(
+        "i=0; while [ \"$i\" -lt 4096 ]; do printf '%s.yml\\000' \"$i\"; i=$((i+1)); done",
+    );
+    let mut reader = GitWorkflowReader::new(&ctx, area.path(), &commit).unwrap();
+    reader.paths("one").unwrap();
+    assert_eq!(reader.listed, 4096);
+    assert!(reader
+        .paths("two")
+        .unwrap_err()
+        .to_string()
+        .contains("too many"));
+}
+#[test]
+fn workflow_listing_rejects_overlong_paths_unterminated_output_and_bad_directory() {
+    let commit = "0".repeat(40);
+    for (body, expected) in [
+        (
+            format!("printf '{}.yml\\000'", "x".repeat(4097)),
+            "path exceeds",
+        ),
+        ("printf 'x.yml'".into(), "unterminated"),
+    ] {
+        let (area, ctx) = listing_context(&body);
+        let mut reader = GitWorkflowReader::new(&ctx, area.path(), &commit).unwrap();
+        assert!(reader
+            .paths("one")
+            .unwrap_err()
+            .to_string()
+            .contains(expected));
+    }
+    let (area, ctx) = listing_context("printf 'x.yml\\000'");
+    let mut reader = GitWorkflowReader::new(&ctx, area.path(), &commit).unwrap();
+    assert!(reader.paths(&"x".repeat(4097)).is_err());
+    assert!(reader.paths("one\0two").is_err());
+    assert_eq!(reader.paths("one").unwrap(), "x.yml\0");
+}
