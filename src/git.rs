@@ -605,15 +605,9 @@ fn clone_tree(_from: &Path, _to: &Path) -> bool {
 
 /// Move the worktree out of the way, unregister it, and delete the files in the background.
 pub fn remove_worktree(ctx: &ExecContext, repo: &Path, path: &Path, trash: &Path) {
-    let _ = std::fs::create_dir_all(trash);
-    let target = trash.join(path.file_name().unwrap_or_default());
-    if std::fs::rename(path, &target).is_ok() {
-        let _ = worktree_admin(ctx, repo, || git(ctx, repo, &["worktree", "prune"]));
-        if spawn_quiet(delete_later(ctx, &target, &trash.join(".lock"))).is_err() {
-            let mut rm = ctx.command("rm");
-            rm.arg("-rf").arg(&target);
-            let _ = spawn_quiet(rm);
-        }
+    if let Some(target) = move_to_trash(path, trash) {
+        let _ = prune_worktrees(ctx, repo);
+        delete_in_background(ctx, &[target], trash);
     } else {
         let _ = worktree_admin(ctx, repo, || {
             git(
@@ -625,6 +619,102 @@ pub fn remove_worktree(ctx: &ExecContext, repo: &Path, path: &Path, trash: &Path
     }
 }
 
+/// Move a directory that is not a worktree (the tools of a run) out of the
+/// way and delete it in the background.
+pub fn remove_dir_later(ctx: &ExecContext, path: &Path, trash: &Path) {
+    match move_to_trash(path, trash) {
+        Some(target) => delete_in_background(ctx, &[target], trash),
+        None => {
+            let _ = std::fs::remove_dir_all(path);
+        }
+    }
+}
+
+/// Drop the registrations of the worktrees of `repo` whose directory is gone.
+/// `repo` is the repository or its git directory.
+pub fn prune_worktrees(ctx: &ExecContext, repo: &Path) -> Result<()> {
+    worktree_admin(ctx, repo, || {
+        git(ctx, repo, &["worktree", "prune"]).map(|_| ())
+    })
+}
+
+/// Rename `path` into `trash`, under a name nothing else there has: the
+/// rename is the whole cost of a removal for the run, and it must not fail
+/// because an earlier deletion of the same name is not over. `None` when it
+/// could not be moved. A link is moved as a link.
+pub fn move_to_trash(path: &Path, trash: &Path) -> Option<PathBuf> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::create_dir_all(trash).ok()?;
+    let mut name = path.file_name()?.to_os_string();
+    name.push(format!(
+        ".{}.{}",
+        std::process::id(),
+        SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    let target = trash.join(name);
+    std::fs::rename(path, &target).ok().map(|()| target)
+}
+
+fn trashed(trash: &Path) -> Vec<PathBuf> {
+    std::fs::read_dir(trash)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.file_name() != ".lock")
+        .map(|e| e.path())
+        .collect()
+}
+
+/// Delete in the background whatever is in the trash: what a deletion that
+/// was killed (with its run, or by a reboot) left there.
+pub fn empty_trash(ctx: &ExecContext, trash: &Path) {
+    for some in trashed(trash).chunks(64) {
+        delete_in_background(ctx, some, trash);
+    }
+}
+
+/// Delete whatever is in the trash before returning. Links are removed, not
+/// followed.
+pub fn empty_trash_now(trash: &Path) {
+    for p in trashed(trash) {
+        let is_dir = std::fs::symlink_metadata(&p).is_ok_and(|m| m.is_dir());
+        if !is_dir {
+            let _ = std::fs::remove_file(&p);
+        } else if std::fs::remove_dir_all(&p).is_err() {
+            // a background deletion may be in the same tree, and a job may
+            // have left directories that cannot be written
+            make_dirs_writable(&p);
+            let _ = std::fs::remove_dir_all(&p);
+        }
+    }
+}
+
+fn make_dirs_writable(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !meta.is_dir() {
+        return;
+    }
+    let mode = meta.permissions().mode();
+    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        make_dirs_writable(&e.path());
+    }
+}
+
+fn delete_in_background(ctx: &ExecContext, targets: &[PathBuf], trash: &Path) {
+    if targets.is_empty() {
+        return;
+    }
+    if spawn_quiet(delete_later(ctx, targets, &trash.join(".lock"))).is_err() {
+        let mut rm = ctx.command("rm");
+        rm.arg("-rf").args(targets);
+        let _ = spawn_quiet(rm);
+    }
+}
+
 /// `rm -rf` at the lowest priority, one deletion at a time across runs. Many
 /// units end together, and a dozen copies holding `node_modules` deleted side
 /// by side took several cores, and as many again in fseventsd and the kernel,
@@ -632,20 +722,36 @@ pub fn remove_worktree(ctx: &ExecContext, repo: &Path, path: &Path, trash: &Path
 /// it. Only the CPU priority is lowered: `taskpolicy -b` also throttled the
 /// disk, and on a busy machine it deleted a thousand files in two minutes, so
 /// the copies would pile up faster than they went.
-fn delete_later(ctx: &ExecContext, target: &Path, lock: &Path) -> Command {
+///
+/// A tree with directories that cannot be written (a module cache a job
+/// sealed) is not deleted by `rm -rf`; its directories are made writable and
+/// it is tried again. Only directories: files may be hard links shared with a
+/// worktree that is in use. Neither `rm` nor `find` follows a link.
+fn delete_later(ctx: &ExecContext, targets: &[PathBuf], lock: &Path) -> Command {
     let mut cmd = ctx.command("nice");
     cmd.args(["-n", "19"]);
     if cfg!(target_os = "macos") {
         cmd.args(["lockf", "-k"]).arg(lock);
     }
-    cmd.args(["rm", "-rf"]).arg(target);
+    cmd.args([
+        "sh",
+        "-c",
+        r#"for t; do rm -rf "$t" 2>/dev/null || { find "$t" -type d -exec chmod u+rwx {} + ; rm -rf "$t"; }; done"#,
+        "sh",
+    ])
+    .args(targets);
     cmd
 }
 
+/// Start a command that outlives the run: in a process group of its own, so
+/// that a Ctrl-C in the terminal, or whatever stops the group of local-ci
+/// when it ends, does not stop a deletion halfway.
 fn spawn_quiet(mut cmd: Command) -> std::io::Result<std::process::Child> {
+    use std::os::unix::process::CommandExt;
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
+        .process_group(0)
         .spawn()
 }
 
