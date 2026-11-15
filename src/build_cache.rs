@@ -1394,7 +1394,10 @@ mod tests {
         // one that is young, without a lock
         let young = s.dir.join("yy.tmp-2-0");
         std::fs::create_dir_all(&young).unwrap();
-        s.max_bytes = 1500;
+        // the young temporary entry counts by its size on disk, which differs
+        // by platform (an empty directory takes 0 blocks on APFS, 4 KiB on
+        // ext4): the cap leaves room for it and one 1000-byte entry, not two
+        s.max_bytes = 1500 + crate::reclaim::disk_usage(&young);
         let c = ctx();
         let p = prune(&c, &s, None);
         assert_eq!(p.removed, 2, "{p:?}");
