@@ -595,3 +595,7 @@ mutation routing traceではGit起動がfixture開始7秒後となり、5秒でr
 runtime 構築時だけ `startup_report` を使い、Unknown の固定 native probe を同じ 300ms 制限で一度だけ再測定してから最終 report と baseline を作る。各 pass は xcode の SDK probe を含め最大14 calls、startup report は最大28 calls / 8.4秒の probe 待ち。required tool の load 時検査と最初の live report を各4.2秒として計16.8秒の probe 待ちであり、20秒 bootstrap に対する残り時間にはプロセス起動・ファイル処理等の overhead が入る。無制限の収束待ちや完全な遅延耐性は保証しない。
 
 missing binary は Unavailable、再測定しても失敗する Docker 等は Unknown のままなので制約なし shell を妨げない。初回の Unknown report/fingerprint は公開せず、成功も実測値のみを使う。公開後の Unknown→Available は引き続き identity を無効化し、known version・executable・context drift、required tool と frozen baseline の fail-closed 判定は変更しない。private cold script が初回 timeout→再測定成功を決定的に再現し、再測定除去の退行が同じ availability assertion で失敗することを確認した。profile 7件と最終 toolchain 65件、strict clippy all-targets、fmt/diff check と、元の失敗対象 `bootstrap::configured_cli_submit_captures_worktree_and_secrets_then_outlives_caller` の単体実行が成功した。normal matrix と全体 CI は統合後に別途必須。
+
+### 起動時attestation修正後の通常CI
+
+3216a745eec89202d68cc5a61e91150a7274f016の通常matrixローカルCIは2ジョブ成功、失敗・環境エラー0、11分33秒だった。git-lfsのシステム導入とtaiki-e/install-actionは各matrixで未再現のため、CLI全体はincomplete（exit3）で、完全再現成功とは区別する。Docker cleanupはコマンド不在で確認できない警告があった。全9ジョブはこの結果に含まれず、coverage・mutationを含む全体検証を次の区切りとする。source削除Bは別branch e5eb4df6で44件とstrict検証済み、Vault Cと専任削除レビュー・常駐有効化は継続中で、この通常CIには含まれない。
