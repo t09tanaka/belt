@@ -98,6 +98,8 @@ impl Fixture {
         })
         .await
         .unwrap();
+        // Enrollment must commit before a fixture adds its private traffic state.
+        super::common::fixture_traffic_config(&self.spec.state_dir);
     }
     async fn bridge(&self) -> (tokio::process::Child, Connected) {
         let mut child = tokio::process::Command::new(BIN)
