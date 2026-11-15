@@ -182,18 +182,33 @@ impl ExecContext {
 
     /// Where runs, results, worktrees and locks live by default
     /// (`LOCAL_CI_HOME`, else the platform cache directory).
-    pub fn cache_dir(&self) -> PathBuf {
+    ///
+    /// Only an absolute path: local-ci deletes what it left in this
+    /// directory, and a path that is empty or relative names a different
+    /// directory wherever local-ci is started.
+    pub fn cache_dir(&self) -> anyhow::Result<PathBuf> {
         if let Some(d) = self.var("LOCAL_CI_HOME") {
-            return PathBuf::from(d);
+            if !std::path::Path::new(d).is_absolute() {
+                anyhow::bail!("LOCAL_CI_HOME must be an absolute path (it is `{d}`)");
+            }
+            return Ok(PathBuf::from(d));
         }
         let home = PathBuf::from(self.var("HOME").unwrap_or("/tmp"));
-        if cfg!(target_os = "macos") {
-            return home.join("Library/Caches/local-ci");
+        let dir = if cfg!(target_os = "macos") {
+            home.join("Library/Caches/local-ci")
+        } else {
+            match self.var("XDG_CACHE_HOME") {
+                Some(x) if !x.is_empty() => PathBuf::from(x).join("local-ci"),
+                _ => home.join(".cache/local-ci"),
+            }
+        };
+        if !dir.is_absolute() {
+            anyhow::bail!(
+                "the cache directory `{}` is not an absolute path: set LOCAL_CI_HOME to one",
+                dir.display()
+            );
         }
-        match self.var("XDG_CACHE_HOME") {
-            Some(x) if !x.is_empty() => PathBuf::from(x).join("local-ci"),
-            _ => home.join(".cache/local-ci"),
-        }
+        Ok(dir)
     }
 
     /// An executable on this context's `PATH`, or in `~/.cargo/bin`.

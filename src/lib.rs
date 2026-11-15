@@ -22,6 +22,7 @@ pub mod git;
 pub mod matrix;
 pub mod plan;
 pub mod portool;
+pub mod reclaim;
 pub mod report;
 pub mod result_wire;
 mod run;
