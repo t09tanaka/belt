@@ -14,6 +14,8 @@
 //! a real receipt or a separately designed authenticated fenced-stop path.
 //! Worker ownership/source/receipt authentication remains the host's duty.
 
+#![doc = include_str!("driver/RESULT_STORAGE.md")]
+
 use crate::dag::{ExecutionTask, JobNode, NodeKind};
 pub(crate) mod dispatch;
 use crate::frozen::FrozenPlan;
@@ -28,13 +30,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const DRIVER_VERSION: u32 = 6;
+pub const DRIVER_VERSION: u32 = 7;
 mod shards;
 pub use shards::{FrozenShardUnsupported, ShardJoin};
 mod atomic;
 pub use atomic::{AtomicGroupUnsupported, GroupPlacement, TaskExecutionMode};
 const MAX_TASKS: usize = 4096;
 const MAX_TEXT: usize = 16384;
+// The independently bounded Wire has a bounded ownership/replay envelope.
+const MAX_TRANSITION_BYTES: usize = MAX_WIRE_BYTES + 16 * MAX_TEXT + 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -74,9 +78,9 @@ pub enum Input {
     },
     /// A real worker result. Host must fence/verify attempt ownership first.
     /// Accepted even without a dispatch marker: the real terminal is stronger.
-    /// A result (or downstream input copies) exceeding bounded State storage
-    /// remains an explicit capacity error with ownership/permit unchanged;
-    /// cancellation is not a substitute terminal receipt for such a worker.
+    /// A fully validated result that exceeds bounded State storage settles its
+    /// owner with genuine digest/status metadata and halts run progression with
+    /// a typed infrastructure failure. The full Wire remains in the replay record.
     Settle {
         task: String,
         token: String,
@@ -131,7 +135,7 @@ impl Transition {
     }
     pub fn from_json(text: &str) -> Result<Self> {
         ensure!(
-            text.len() <= MAX_WIRE_BYTES,
+            text.len() <= MAX_TRANSITION_BYTES,
             "transition exceeds byte bound"
         );
         Ok(serde_json::from_str(text)?)
@@ -146,6 +150,35 @@ pub enum CoreDecision {
     EarlyFailure,
     MatrixJoined,
     HostFailure,
+    InfrastructureBlocked,
+}
+
+/// Run infrastructure failure, distinct from the genuine worker's status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultStorageFailure {
+    DriverCapacity,
+}
+
+/// Genuine statuses in immutable task job order; outputs are unavailable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct WorkerStatus {
+    pub status: JobStatus,
+    pub ancestor_failed: bool,
+}
+
+#[derive(Debug)]
+pub struct UnavailableWorkerReceipt<'a> {
+    pub result_digest: &'a str,
+    pub statuses: &'a [WorkerStatus],
+    pub reason: ResultStorageFailure,
+}
+
+#[derive(Debug)]
+pub enum ShardJoinAvailability {
+    Available(Box<ShardJoin>),
+    Pending,
+    Unavailable(ResultStorageFailure),
 }
 
 /// The proposed state cannot durably retain its real receipts and obligations.
@@ -194,6 +227,11 @@ impl HostFailureReason {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum Terminal {
+    WorkerStorageUnavailable {
+        token: String,
+        result_digest: String,
+        statuses: Vec<WorkerStatus>,
+    },
     Worker {
         token: String,
         result_digest: String,
@@ -215,6 +253,7 @@ enum Terminal {
 impl Terminal {
     fn outcomes(&self) -> &[JobOutcome] {
         match self {
+            Self::WorkerStorageUnavailable { .. } => &[],
             Self::Worker { outcomes, .. }
             | Self::Core { outcomes, .. }
             | Self::HostAbort { outcomes, .. } => outcomes,
@@ -241,6 +280,7 @@ enum Phase {
 struct State {
     revision: u64,
     cancelled: bool,
+    infrastructure_failure: Option<ResultStorageFailure>,
     phases: BTreeMap<String, Phase>,
     expansions: BTreeMap<String, Expansion>,
     shard_joins: BTreeMap<String, shards::JoinSummary>,
@@ -449,6 +489,7 @@ impl Driver {
             state: State {
                 revision: 0,
                 cancelled: false,
+                infrastructure_failure: None,
                 phases,
                 expansions: BTreeMap::new(),
                 shard_joins: BTreeMap::new(),
@@ -462,10 +503,53 @@ impl Driver {
     }
     /// A frozen shard join exists only after every member is terminal.
     /// Coverage is computed from genuine worker receipts; core skips stay absent.
+    /// None also means unavailable after storage halt; hosts must inspect
+    /// shard_join_availability and infrastructure_failure before reporting success.
     pub fn shard_join(&self, group: &str) -> Option<ShardJoin> {
+        if self.state.infrastructure_failure.is_some() {
+            return None;
+        }
         let summary = self.state.shard_joins.get(group)?;
         let group = self.plan.shard_groups.iter().find(|g| g.id == group)?;
         Some(shards::view(group, &self.state.phases, summary))
+    }
+    /// Unlike shard_join, distinguishes storage loss from unfinished coverage.
+    pub fn shard_join_availability(&self, group: &str) -> ShardJoinAvailability {
+        if !self
+            .plan
+            .shard_groups
+            .iter()
+            .any(|g| g.id == group && g.split)
+        {
+            return ShardJoinAvailability::Pending;
+        }
+        if let Some(reason) = self.infrastructure_failure() {
+            return ShardJoinAvailability::Unavailable(reason);
+        }
+        match self.shard_join(group) {
+            Some(join) => ShardJoinAvailability::Available(Box::new(join)),
+            None => ShardJoinAvailability::Pending,
+        }
+    }
+    /// Finished means drained orchestration, not success, when this is present.
+    pub fn infrastructure_failure(&self) -> Option<ResultStorageFailure> {
+        self.state.infrastructure_failure
+    }
+    /// Full genuine Wire is retained in the committed Settle replay record.
+    /// Missing outputs must never be read as an empty successful result.
+    pub fn unavailable_worker_receipt(&self, task: &str) -> Option<UnavailableWorkerReceipt<'_>> {
+        match self.state.phases.get(task)? {
+            Phase::Terminal(Terminal::WorkerStorageUnavailable {
+                result_digest,
+                statuses,
+                ..
+            }) => Some(UnavailableWorkerReceipt {
+                result_digest,
+                statuses,
+                reason: ResultStorageFailure::DriverCapacity,
+            }),
+            _ => None,
+        }
     }
     /// Whether a cancellation request was committed before run completion.
     pub fn cancelled(&self) -> bool {
@@ -600,10 +684,7 @@ impl Driver {
         Ok(())
     }
     fn compute(&self, input: &Input) -> Result<State> {
-        ensure!(
-            serde_json::to_vec(input)?.len() <= MAX_WIRE_BYTES,
-            "input exceeds byte bound"
-        );
+        input_bound(input, MAX_WIRE_BYTES)?;
         let mut s = self.state.clone();
         s.revision = s
             .revision
@@ -632,6 +713,7 @@ impl Driver {
             }
             Input::Claim { task, token } => {
                 ensure!(!s.cancelled, "run is cancelled");
+                ensure!(s.infrastructure_failure.is_none(), "run storage halted");
                 ensure!(
                     !token.is_empty() && token.len() <= MAX_TEXT,
                     "invalid ownership token"
@@ -791,11 +873,18 @@ impl Driver {
                 result,
             } => {
                 let t = self.task(&s, task).context("unknown task")?;
-                if let Phase::Terminal(Terminal::Worker {
-                    token: old,
-                    result_digest: old_digest,
-                    ..
-                }) = &s.phases[task]
+                if let Phase::Terminal(
+                    Terminal::Worker {
+                        token: old,
+                        result_digest: old_digest,
+                        ..
+                    }
+                    | Terminal::WorkerStorageUnavailable {
+                        token: old,
+                        result_digest: old_digest,
+                        ..
+                    },
+                ) = &s.phases[task]
                 {
                     ensure!(
                         old == token && old_digest == result_digest,
@@ -880,30 +969,110 @@ impl Driver {
                         "worker result lacks job report"
                     );
                 }
-                let failed = r.outcomes.iter().any(|o| o.status == JobStatus::Failure)
-                    || r.shard.as_ref().is_some_and(shards::failed);
-                s.phases.insert(
-                    task.clone(),
-                    Phase::Terminal(Terminal::Worker {
-                        token: token.clone(),
-                        result_digest: result_digest.clone(),
-                        outcomes: r.outcomes,
-                        shard: r.shard,
-                    }),
-                );
-                s.outbox.retain(
-                    |a| !matches!(&a.kind, ActionKind::Cancel { task: id, .. } if id == task),
-                );
-                if failed {
-                    self.fail_fast(&mut s, &t)?;
-                }
-                self.ensure_cancel_capacity(&s).context(
-                    "worker result exceeds remaining state capacity reserved for cancellation",
-                )?;
+                return self.settle_validated(s, &t, token, result_digest, r);
             }
         }
         self.progress(&mut s)?;
         self.checked(s)
+    }
+    /// Entered only after the complete, single genuine Settle validation path.
+    fn settle_validated(
+        &self,
+        mut s: State,
+        task: &ExecutionTask,
+        token: &str,
+        result_digest: &str,
+        result: crate::task::TaskResult,
+    ) -> Result<State> {
+        let unavailable = Terminal::WorkerStorageUnavailable {
+            token: token.into(),
+            result_digest: result_digest.into(),
+            statuses: task
+                .jobs
+                .iter()
+                .map(|job| {
+                    let o = result
+                        .outcomes
+                        .iter()
+                        .find(|o| &o.job == job)
+                        .expect("validated job");
+                    WorkerStatus {
+                        status: o.status,
+                        ancestor_failed: o.ancestor_failed,
+                    }
+                })
+                .collect(),
+        };
+        if s.infrastructure_failure.is_none() {
+            let mut normal = s.clone();
+            let failed = result
+                .outcomes
+                .iter()
+                .any(|o| o.status == JobStatus::Failure)
+                || result.shard.as_ref().is_some_and(shards::failed);
+            normal.phases.insert(
+                task.id.clone(),
+                Phase::Terminal(Terminal::Worker {
+                    token: token.into(),
+                    result_digest: result_digest.into(),
+                    outcomes: result.outcomes,
+                    shard: result.shard,
+                }),
+            );
+            normal.outbox.retain(|a| {
+                !matches!(&a.kind,
+                ActionKind::Cancel { task: id, .. } if id == &task.id)
+            });
+            let candidate = (|| {
+                if failed {
+                    self.fail_fast(&mut normal, task)?;
+                }
+                self.ensure_cancel_capacity(&normal)?;
+                self.progress(&mut normal)?;
+                self.checked(normal)
+            })();
+            match candidate {
+                Ok(normal) => return Ok(normal),
+                Err(error) if error.downcast_ref::<DriverStorageError>().is_some() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        s.phases
+            .insert(task.id.clone(), Phase::Terminal(unavailable));
+        s.outbox.retain(|a| {
+            !matches!(&a.kind,
+            ActionKind::Cancel { task: id, .. } if id == &task.id)
+        });
+        s.infrastructure_failure = Some(ResultStorageFailure::DriverCapacity);
+        self.halt_progress(&mut s);
+        self.checked(s)
+    }
+    /// Do not publish incomplete outputs or derive work after storage loss.
+    fn halt_progress(&self, s: &mut State) {
+        for task in self.tasks(s) {
+            match &s.phases[&task.id] {
+                Phase::Pending | Phase::Ready { .. } | Phase::Expanded => {
+                    s.phases.insert(
+                        task.id.clone(),
+                        Phase::Terminal(Terminal::Core {
+                            decision: CoreDecision::InfrastructureBlocked,
+                            diagnostic: None,
+                            outcomes: vec![],
+                        }),
+                    );
+                }
+                Phase::Claimed { .. } => self.request_cancel(s, &task.id),
+                Phase::Terminal(_) => {}
+            }
+        }
+        s.outbox.retain(|a| ready_task(&a.kind).is_none());
+        self.finish_if_drained(s);
+    }
+    fn finish_if_drained(&self, s: &mut State) {
+        if !s.finished && s.phases.values().all(|p| matches!(p, Phase::Terminal(_))) {
+            s.finished = true;
+            self.push(s, "finished", ActionKind::Finished);
+        }
     }
     fn checked(&self, s: State) -> Result<State> {
         self.bound(&s).map_err(storage_error)?;
@@ -1015,21 +1184,29 @@ impl Driver {
                 .flat_map(|e| e.selections.iter().map(|selection| &selection.task)),
         );
         // One bounded summary + join envelope per unfinished frozen group.
-        let mut reserve = self
-            .plan
-            .shard_groups
-            .iter()
-            .filter(|g| g.split && !s.shard_joins.contains_key(&g.id))
-            .try_fold(0usize, |n, g| -> Result<usize> {
-                Ok(n.saturating_add(8192)
-                    .saturating_add(crate::expr::serialized_size(
-                        &(&g.id, &g.workflow, &g.source_jobs),
-                        MAX_WIRE_BYTES,
-                    )?))
-            })?;
+        // Fixed run failure marker and Finished envelope. Each unfinished phase
+        // separately reserves its own worst halt replacement below.
+        let mut reserve = 1024usize.saturating_add(
+            self.plan
+                .shard_groups
+                .iter()
+                .filter(|g| {
+                    s.infrastructure_failure.is_none()
+                        && g.split
+                        && !s.shard_joins.contains_key(&g.id)
+                })
+                .try_fold(0usize, |n, g| -> Result<usize> {
+                    Ok(n.saturating_add(8192)
+                        .saturating_add(crate::expr::serialized_size(
+                            &(&g.id, &g.workflow, &g.source_jobs),
+                            MAX_WIRE_BYTES,
+                        )?))
+                })?,
+        );
         for task in tasks {
             let addition = match &s.phases[&task.id] {
                 Phase::Pending | Phase::Ready { .. } => Self::unstarted_cancel_reserve(task)?,
+                Phase::Expanded => 512,
                 Phase::Claimed {
                     token,
                     cancel_requested,
@@ -1052,14 +1229,32 @@ impl Driver {
                     } else {
                         0
                     };
-                    cancel.saturating_add(abort)
+                    // Keep this reserve after dispatch and through cancellation
+                    // ACKs. All jobs are known at claim time; Cancelled/false are
+                    // the longest serialized genuine status/ancestor variants.
+                    let terminal = Terminal::WorkerStorageUnavailable {
+                        token: token.clone(),
+                        result_digest: format!("sha256:{}", "f".repeat(64)),
+                        statuses: task
+                            .jobs
+                            .iter()
+                            .map(|_| WorkerStatus {
+                                status: JobStatus::Cancelled,
+                                ancestor_failed: false,
+                            })
+                            .collect(),
+                    };
+                    let storage = crate::expr::serialized_size(&terminal, MAX_WIRE_BYTES)?
+                        .saturating_add(512);
+                    cancel.saturating_add(abort).saturating_add(storage)
                 }
                 Phase::Terminal(terminal)
-                    if task.variant.as_ref().is_some_and(|_| {
-                        !s.outcomes
-                            .get(&task.workflow)
-                            .is_some_and(|m| m.contains_key(&task.jobs[0]))
-                    }) =>
+                    if s.infrastructure_failure.is_none()
+                        && task.variant.as_ref().is_some_and(|_| {
+                            !s.outcomes
+                                .get(&task.workflow)
+                                .is_some_and(|m| m.contains_key(&task.jobs[0]))
+                        }) =>
                 {
                     // Cancellation may complete an otherwise-unfinished matrix:
                     // reserve aggregate/Core/map copies of already-real outputs.
@@ -1068,7 +1263,8 @@ impl Driver {
                         .saturating_add(1024)
                 }
                 Phase::Terminal(terminal)
-                    if task.variant.is_none()
+                    if s.infrastructure_failure.is_none()
+                        && task.variant.is_none()
                         && !s
                             .outcomes
                             .get(&task.workflow)
@@ -1242,7 +1438,17 @@ impl Driver {
                 Ok(bytes.saturating_add(Self::fallback_reserve(task)?))
             })
     }
+    fn check_progress_storage(&self, s: &State) -> Result<()> {
+        crate::expr::serialized_size(s, self.state_byte_limit)
+            .context("progress exceeds state byte bound")
+            .map_err(storage_error)?;
+        Ok(())
+    }
     fn progress(&self, s: &mut State) -> Result<()> {
+        if s.infrastructure_failure.is_some() {
+            self.halt_progress(s);
+            return Ok(());
+        }
         loop {
             let mut changed = false;
             for t in &self.plan.tasks {
@@ -1258,6 +1464,9 @@ impl Driver {
                     }
                 }
             }
+            // Publication/join batches copy at most the bounded resident
+            // receipts. Check before the next stage can amplify those values.
+            self.check_progress_storage(s)?;
             for group in self.plan.shard_groups.iter().filter(|g| g.split) {
                 if s.shard_joins.contains_key(&group.id) {
                     continue;
@@ -1271,6 +1480,7 @@ impl Driver {
                     changed = true;
                 }
             }
+            self.check_progress_storage(s)?;
             let groups: Vec<_> = self
                 .plan
                 .graph
@@ -1323,6 +1533,7 @@ impl Driver {
                     }
                 }
             }
+            self.check_progress_storage(s)?;
             // Keep room for every pending origin's core terminal and logical
             // outcome, including siblings not yet reached in frozen order.
             let mut fallback_reserve = self.pending_fallback_reserve(s)?;
@@ -1478,15 +1689,15 @@ impl Driver {
                         },
                     );
                 }
+                // Each new Ready copies bounded needs into its phase/outbox.
+                // Never materialize the entire fanout before detecting overflow.
+                self.check_progress_storage(s)?;
             }
             if !changed {
                 break;
             }
         }
-        if !s.finished && s.phases.values().all(|p| matches!(p, Phase::Terminal(_))) {
-            s.finished = true;
-            self.push(s, "finished", ActionKind::Finished);
-        }
+        self.finish_if_drained(s);
         Ok(())
     }
 }
@@ -1496,6 +1707,20 @@ fn ready_task(action: &ActionKind) -> Option<&str> {
         ActionKind::DerivedReady { dispatch, .. } => Some(dispatch.task_id()),
         _ => None,
     }
+}
+fn input_bound(input: &Input, wire_limit: usize) -> Result<()> {
+    // A Settle contains one independently bounded Wire plus task/token/digest.
+    // At most 6 bytes per escaped ownership byte, 4KiB Wire task identity,
+    // fixed digests, config/revision and JSON punctuation fit this allowance.
+    crate::expr::serialized_size(input, wire_limit + MAX_TRANSITION_BYTES - MAX_WIRE_BYTES)
+        .context("input exceeds byte bound")?;
+    if let Input::Settle { result, .. } = input {
+        crate::expr::serialized_size(result, wire_limit)
+            .context("worker result exceeds wire byte bound")?;
+    } else {
+        crate::expr::serialized_size(input, wire_limit).context("input exceeds byte bound")?;
+    }
+    Ok(())
 }
 fn digest<T: Serialize>(value: &T) -> Result<String> {
     Ok(crate::frozen::sha256_of(&crate::frozen::canonical_json(

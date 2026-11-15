@@ -1139,10 +1139,16 @@ fn cancellation_and_failfast_share_once_only_requests_in_both_orders() {
 fn claim_capacity_accounts_escaped_tokens_and_keeps_cancel_admissible() {
     let f = Fixture::new(WORKFLOW);
     let mut d = f.driver(2);
-    d.state_byte_limit = 12 * 1024;
     commit(&mut d, Input::Advance);
     let action = ready(&d).remove(0);
     let task = ready_task(&action).unwrap().to_string();
+    let small_claim = Input::Claim {
+        task: task.clone(),
+        token: "\0".repeat(256),
+    };
+    let candidate = d.compute(&small_claim).unwrap();
+    d.state_byte_limit = crate::expr::serialized_size(&candidate, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&candidate).unwrap();
     let before = serde_json::to_value(&d.state).unwrap();
     let rejected = d
         .propose(Input::Claim {
@@ -1213,7 +1219,7 @@ fn cancel_projection_reserves_existing_matrix_outputs_with_json_escapes() {
 }
 
 #[test]
-fn oversized_real_result_is_explicit_storage_error_and_keeps_owner() {
+fn oversized_real_result_preserves_genuine_receipt_and_halts_without_fake_outputs() {
     let value = "z".repeat(6000);
     let workflow=format!("on: push\njobs:\n  seed:\n    runs-on: [self-hosted, seed]\n    outputs:\n      value: ${{{{ steps.seed.outputs.value }}}}\n    steps:\n      - id: seed\n        run: printf 'value=%s\\n' '{value}' >> \"$GITHUB_OUTPUT\"\n  consumer:\n    needs: seed\n    runs-on: x\n    steps:\n      - run: exit 99\n");
     let f = Fixture::new(&workflow);
@@ -1226,25 +1232,69 @@ fn oversized_real_result_is_explicit_storage_error_and_keeps_owner() {
     assert_eq!(wire.outcomes[0].status, JobStatus::Success);
     let task = ready_task(&action).unwrap().to_string();
     let before = serde_json::to_value(&d.state).unwrap();
-    let error = d
-        .propose(Input::Settle {
+    let real_digest = wire.digest().unwrap();
+    let input = Input::Settle {
+        task: task.clone(),
+        token: task.clone(),
+        result_digest: real_digest.clone(),
+        result: Box::new(wire.clone()),
+    };
+    // Even under storage pressure malformed data cannot enter the fallback.
+    let mut forged = wire.clone();
+    forged.outcomes[0].ancestor_failed = true;
+    assert_rejected_unchanged(
+        &d,
+        Input::Settle {
             task: task.clone(),
-            token: task,
-            result_digest: wire.digest().unwrap(),
-            result: Box::new(wire),
-        })
-        .unwrap_err();
-    assert!(error
-        .to_string()
-        .contains("worker result exceeds remaining state capacity"));
+            token: task.clone(),
+            result_digest: forged.digest().unwrap(),
+            result: Box::new(forged),
+        },
+    );
+    let record = d.propose(input.clone()).unwrap();
     assert_eq!(serde_json::to_value(&d.state).unwrap(), before);
     assert_eq!(d.admitted(), 1);
-    // The valid external terminal receipt cannot be stored in this tiny State;
-    // requesting cancellation cannot forge a smaller receipt or release owner.
-    commit(&mut d, Input::Cancel);
-    assert_eq!(d.admitted(), 1);
-    assert!(!finished(&d));
-    assert_eq!(cancel_actions(&d).len(), 1);
+    let mut replay = d.clone();
+    let decoded = Transition::from_json(&serde_json::to_string(&record).unwrap()).unwrap();
+    let mut tampered = decoded.clone();
+    tampered.state_digest = "sha256:tampered".into();
+    assert!(replay.apply(&tampered).is_err());
+    assert_eq!(serde_json::to_value(&replay.state).unwrap(), before);
+    d.apply(&record).unwrap();
+    replay.apply(&decoded).unwrap();
+    assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+    assert_eq!(d.admitted(), 0);
+    assert!(finished(&d));
+    assert!(!d.cancelled());
+    assert_eq!(
+        d.infrastructure_failure(),
+        Some(ResultStorageFailure::DriverCapacity)
+    );
+    let receipt = d.unavailable_worker_receipt(&task).unwrap();
+    assert_eq!(receipt.result_digest, real_digest);
+    assert_eq!(receipt.statuses[0].status, JobStatus::Success);
+    assert!(d.outcome(FILE, "seed").is_none());
+    assert!(d.outcome(FILE, "consumer").is_none());
+    assert!(ready(&d).is_empty());
+    assert!(cancel_actions(&d).is_empty());
+    assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+    let Input::Settle { result, .. } = decoded.input else {
+        unreachable!()
+    };
+    assert_eq!(result.outcomes[0].outputs["value"], value);
+    assert_eq!(result.digest().unwrap(), real_digest);
+    // Exact duplicates retain real identity; conflicts and stale replay reject.
+    commit(&mut d, input);
+    assert_rejected_unchanged(
+        &d,
+        Input::Settle {
+            task: task.clone(),
+            token: task.clone(),
+            result_digest: "sha256:wrong".into(),
+            result: Box::new(wire),
+        },
+    );
+    assert!(d.apply(&record).is_err());
 }
 
 const ATOMIC_WORKFLOW: &str = r#"on: push
@@ -2738,7 +2788,7 @@ fn frozen_shards_reserved_escaped_outputs_cancel_abort_exact_capacity() {
 }
 
 #[test]
-fn frozen_shards_final_real_receipt_uses_join_reserve_and_storage_rejection_is_typed() {
+fn frozen_shards_final_real_receipt_joins_or_reports_typed_storage_unavailability() {
     for large in [false, true] {
         let output = if large {
             "x".repeat(16 * 1024)
@@ -2767,7 +2817,7 @@ fn frozen_shards_final_real_receipt_uses_join_reserve_and_storage_rejection_is_t
         // claim. For the small case count the exact verified pre-join state and
         // its obligations, then prove joining cannot discard that producer in
         // final checked(). A larger receipt with only old-state capacity is a
-        // separate, typed storage rejection.
+        // separate, typed infrastructure halt with a genuine worker terminal.
         if large {
             d.state_byte_limit = crate::expr::serialized_size(&d.state, MAX_WIRE_BYTES).unwrap()
                 + d.cancel_reserve(&d.state).unwrap();
@@ -2796,18 +2846,27 @@ fn frozen_shards_final_real_receipt_uses_join_reserve_and_storage_rejection_is_t
         }
         if large {
             let before = digest(&d.state).unwrap();
-            let error = d.propose(input.clone()).unwrap_err();
-            assert!(
-                error.downcast_ref::<DriverStorageError>().is_some(),
-                "{error:#}"
-            );
+            let record = d.propose(input.clone()).unwrap();
             assert_eq!(before, digest(&d.state).unwrap());
             assert_eq!(d.admitted(), 1);
             assert!(d.outcome(FILE, "test").is_none());
-            // The host still owns the immutable real receipt; a larger durable
-            // storage policy is outside this stage. Restoring the test limit
-            // demonstrates that the same real receipt can settle unchanged.
-            d.state_byte_limit = MAX_WIRE_BYTES;
+            let mut replay = d.clone();
+            replay
+                .apply(&Transition::from_json(&serde_json::to_string(&record).unwrap()).unwrap())
+                .unwrap();
+            d.apply(&record).unwrap();
+            assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+            assert_eq!(d.admitted(), 0);
+            assert!(d.unavailable_worker_receipt(&id).is_some());
+            let group = &f.plan.shard_groups.iter().find(|g| g.split).unwrap().id;
+            assert!(matches!(
+                d.shard_join_availability(group),
+                ShardJoinAvailability::Unavailable(ResultStorageFailure::DriverCapacity)
+            ));
+            assert!(d.shard_join(group).is_none());
+            assert!(d.outcome(FILE, "test").is_none());
+            assert!(finished(&d));
+            continue;
         }
         commit(&mut d, input);
         assert_eq!(d.admitted(), 0);
@@ -2818,4 +2877,239 @@ fn frozen_shards_final_real_receipt_uses_join_reserve_and_storage_rejection_is_t
         assert_eq!(joined.outcome.outputs["value"], output);
         assert_eq!(joined.outcome.status, JobStatus::Success);
     }
+}
+
+#[test]
+fn storage_halt_fanout_is_causal_and_other_real_owners_drain_through_ack() {
+    let payload = "x".repeat(4096);
+    let mut workflow = format!("on: push\njobs:\n  producer:\n    runs-on: x\n    outputs:\n      value: ${{{{ steps.out.outputs.value }}}}\n    steps:\n      - id: out\n        run: echo 'value={payload}' >> \"$GITHUB_OUTPUT\"\n  independent:\n    runs-on: x\n    steps:\n      - run: 'true'\n");
+    for i in 0..24 {
+        workflow.push_str(&format!("  consumer{i}:\n    runs-on: x\n    needs: producer\n    steps:\n      - run: exit 99\n"));
+    }
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    let actions = ready(&d);
+    let producer = actions
+        .iter()
+        .find(|a| f.plan.task(ready_task(a).unwrap()).unwrap().jobs == ["producer"])
+        .unwrap();
+    let independent = actions
+        .iter()
+        .find(|a| f.plan.task(ready_task(a).unwrap()).unwrap().jobs == ["independent"])
+        .unwrap();
+    claim(&mut d, producer);
+    claim(&mut d, independent);
+    mark(&mut d, producer);
+    mark(&mut d, independent);
+    let limit = crate::expr::serialized_size(&d.state, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&d.state).unwrap();
+    d.state_byte_limit = limit;
+    let (wire, _) = f.execute(producer, "fanout-storage-producer");
+    let id = ready_task(producer).unwrap();
+    let input = Input::Settle {
+        task: id.into(),
+        token: id.into(),
+        result_digest: wire.digest().unwrap(),
+        result: Box::new(wire.clone()),
+    };
+    // The same real result succeeds with room, producing 24 full input actions.
+    // Its receipt alone fits the small budget; derived copies cause the halt.
+    assert!(crate::expr::serialized_size(&wire, MAX_WIRE_BYTES).unwrap() < limit);
+    let mut roomy = d.clone();
+    roomy.state_byte_limit = MAX_WIRE_BYTES;
+    commit(&mut roomy, input.clone());
+    assert_eq!(ready(&roomy).len(), 24);
+    assert!(crate::expr::serialized_size(&roomy.state, MAX_WIRE_BYTES).unwrap() > limit);
+    commit(&mut d, input);
+    assert_eq!(d.admitted(), 1);
+    assert!(ready(&d).is_empty());
+    assert!(d.outcome(FILE, "producer").is_none());
+    assert!(!d.cancelled());
+    assert!(!finished(&d));
+    assert!(d.unavailable_worker_receipt(id).is_some());
+    let cancel = cancel_actions(&d).remove(0);
+    commit(&mut d, Input::Ack { action: cancel.id });
+    assert_eq!(d.admitted(), 1);
+    commit(&mut d, Input::Advance);
+    assert!(cancel_actions(&d).is_empty());
+    let (other, _) = f.execute(independent, "fanout-storage-independent");
+    let actual_digest = other.digest().unwrap();
+    let record = settle(&mut d, independent, other);
+    assert_eq!(d.admitted(), 0);
+    assert!(finished(&d));
+    assert_eq!(
+        d.unavailable_worker_receipt(ready_task(independent).unwrap())
+            .unwrap()
+            .result_digest,
+        actual_digest
+    );
+    assert_eq!(
+        d.unavailable_worker_receipt(ready_task(independent).unwrap())
+            .unwrap()
+            .statuses[0]
+            .status,
+        JobStatus::Success
+    );
+    assert!(crate::expr::serialized_size(&d.state, limit).is_ok());
+    assert!(!d.cancelled());
+    assert!(record.state_digest == digest(&d.state).unwrap());
+}
+
+#[test]
+fn storage_halt_exact_dispatched_claim_reserve_survives_cancel_ack_and_replay() {
+    let value = "x".repeat(32 * 1024);
+    let workflow = format!("on: push\njobs:\n  seed:\n    runs-on: x\n    outputs:\n      value: ${{{{ steps.out.outputs.value }}}}\n    steps:\n      - id: out\n        run: echo 'value={value}' >> \"$GITHUB_OUTPUT\"\n  consumer:\n    needs: seed\n    runs-on: x\n    steps:\n      - run: exit 99\n");
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(1);
+    let mut records = vec![commit(&mut d, Input::Advance)];
+    let action = ready(&d).remove(0);
+    let task = ready_task(&action).unwrap().to_string();
+    let token = "\0".repeat(256);
+    let input = Input::Claim {
+        task: task.clone(),
+        token: token.clone(),
+    };
+    let candidate = d.compute(&input).unwrap();
+    let limit = crate::expr::serialized_size(&candidate, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&candidate).unwrap();
+    d.state_byte_limit = limit - 1;
+    assert_rejected_unchanged(&d, input.clone());
+    d.state_byte_limit = limit;
+    records.push(commit(&mut d, input));
+    records.push(commit(
+        &mut d,
+        Input::MarkDispatched {
+            task: task.clone(),
+            token: token.clone(),
+        },
+    ));
+    assert!(d.cancel_reserve(&d.state).unwrap() > 0);
+    records.push(commit(&mut d, Input::Cancel));
+    let request = cancel_actions(&d).remove(0);
+    records.push(commit(&mut d, Input::Ack { action: request.id }));
+    assert_eq!(d.admitted(), 1);
+    let (wire, _) = f.execute(&action, "dispatched-storage-late-success");
+    let real_digest = wire.digest().unwrap();
+    records.push(commit(
+        &mut d,
+        Input::Settle {
+            task: task.clone(),
+            token,
+            result_digest: real_digest.clone(),
+            result: Box::new(wire),
+        },
+    ));
+    assert!(d.cancelled());
+    assert!(finished(&d));
+    assert_eq!(d.admitted(), 0);
+    let receipt = d.unavailable_worker_receipt(&task).unwrap();
+    assert_eq!(receipt.result_digest, real_digest);
+    assert_eq!(receipt.statuses[0].status, JobStatus::Success);
+    assert!(d.outcome(FILE, "seed").is_none());
+    let mut replay = f.driver(1);
+    replay.state_byte_limit = limit;
+    for record in records {
+        let decoded = Transition::from_json(&serde_json::to_string(&record).unwrap()).unwrap();
+        replay.apply(&decoded).unwrap();
+    }
+    assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+}
+
+#[test]
+fn storage_halt_expanded_origin_and_grouped_genuine_statuses_are_explicit() {
+    // Generate large output with short, codec-valid genuine step labels.
+    let command = "printf 'value=%s\\n' \"$(printf 'z%.0s' {1..32768})\"";
+    let workflow = WORKFLOW.replace("echo \"value=v$LEG\"", command);
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(2);
+    seed(&f, &mut d);
+    let legs = ready(&d);
+    claim(&mut d, &legs[0]);
+    claim(&mut d, &legs[1]);
+    mark(&mut d, &legs[0]);
+    let limit = crate::expr::serialized_size(&d.state, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&d.state).unwrap();
+    d.state_byte_limit = limit;
+    let (wire, _) = f.execute(&legs[0], "expanded-storage");
+    settle(&mut d, &legs[0], wire);
+    let task = ready_task(&legs[1]).unwrap();
+    commit(
+        &mut d,
+        Input::AbortBeforeExecution {
+            task: task.into(),
+            token: task.into(),
+            reason: HostFailureReason::ExecutorPreparation,
+        },
+    );
+    assert!(finished(&d));
+    assert!(d.infrastructure_failure().is_some());
+    assert!(d.outcome(FILE, "dynamic").is_none());
+
+    let workflow = ATOMIC_WORKFLOW
+        .replace("echo 'value=v${{ matrix.n }}'", command)
+        // Keep the later genuine failure independent of large interpolation:
+        // substituted command labels themselves must remain codec-valid.
+        .replace("test '${{ needs.matrix.outputs.value }}' = v1", "false");
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(1);
+    atomic_start(&f, &mut d);
+    let action = atomic_action(&d);
+    claim(&mut d, &action);
+    mark(&mut d, &action);
+    d.state_byte_limit = crate::expr::serialized_size(&d.state, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&d.state).unwrap();
+    let (wire, _) = f.execute(&action, "grouped-storage");
+    let expected: Vec<_> = f
+        .plan
+        .task(ready_task(&action).unwrap())
+        .unwrap()
+        .jobs
+        .iter()
+        .map(|job| {
+            let o = wire.outcomes.iter().find(|o| &o.job == job).unwrap();
+            WorkerStatus {
+                status: o.status,
+                ancestor_failed: o.ancestor_failed,
+            }
+        })
+        .collect();
+    settle(&mut d, &action, wire);
+    assert_eq!(
+        d.unavailable_worker_receipt(ready_task(&action).unwrap())
+            .unwrap()
+            .statuses,
+        expected
+    );
+    assert!(finished(&d));
+}
+
+#[test]
+fn wire_envelope_has_independent_bound_without_raising_state_or_wire_limit() {
+    let f = Fixture::new(WORKFLOW);
+    let mut d = f.driver(1);
+    commit(&mut d, Input::Advance);
+    let action = ready(&d).remove(0);
+    claim(&mut d, &action);
+    let (wire, _) = f.execute(&action, "envelope-real-worker");
+    let wire_bytes = crate::expr::serialized_size(&wire, MAX_WIRE_BYTES).unwrap();
+    let input = Input::Settle {
+        task: ready_task(&action).unwrap().into(),
+        token: "\0".repeat(MAX_TEXT),
+        result_digest: wire.digest().unwrap(),
+        result: Box::new(wire),
+    };
+    assert!(crate::expr::serialized_size(&input, MAX_TRANSITION_BYTES).unwrap() > wire_bytes);
+    input_bound(&input, wire_bytes).unwrap();
+    assert!(input_bound(&input, wire_bytes - 1)
+        .unwrap_err()
+        .to_string()
+        .contains("wire byte bound"));
+    // Production caps stay fixed; only the proven envelope allowance is extra.
+    assert_eq!(d.state_byte_limit, 64 * 1024 * 1024);
+    assert_eq!(MAX_WIRE_BYTES, 64 * 1024 * 1024);
+    assert!(
+        crate::expr::serialized_size(&input, MAX_TRANSITION_BYTES).unwrap() - wire_bytes
+            < MAX_TRANSITION_BYTES - MAX_WIRE_BYTES
+    );
 }
