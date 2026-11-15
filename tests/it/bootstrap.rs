@@ -75,6 +75,32 @@ fn coordinator_event_summary(
     (&event.kind, code, reason)
 }
 
+// Classify fixed server diagnostics without ever printing their arbitrary text.
+fn coordinator_refusal_class(event: &remote_task_runner::storage::Event) -> Option<&'static str> {
+    let message = event.payload.get("message")?.as_str()?;
+    match message {
+        "toolchain_baseline_mismatch" => Some("native_baseline_mismatch"),
+        "worker profile identity unavailable" => Some("profile_identity_unavailable"),
+        "worker configured profile fingerprint mismatch" => Some("configured_profile_mismatch"),
+        "worker profile gained a native observation" => Some("profile_gained_observation"),
+        "worker profile native observation changed" => Some("profile_observation_changed"),
+        "worker profile executable or context changed" => {
+            Some("profile_executable_or_context_changed")
+        }
+        "worker capabilities changed or unmet: " => Some("profile_report_unavailable"),
+        "toolchain registry unavailable" => Some("registry_unavailable"),
+        "accepted base profile changed" => Some("accepted_profile_changed"),
+        "activated tool identity changed" => Some("activation_changed"),
+        "toolchain preparation unavailable" => Some("preparation_unavailable"),
+        "proposal worker requirements mismatch" => Some("proposal_requirements_mismatch"),
+        _ if message.starts_with("worker capabilities changed or unmet: ") => {
+            Some("requirements_unmet")
+        }
+        _ if message.starts_with("toolchain unavailable: ") => Some("registry_plan_unavailable"),
+        _ => None,
+    }
+}
+
 fn diagnose_coordinator(spec: &Spec) {
     let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) else {
         eprintln!("coordinator journal readable=false");
@@ -86,7 +112,8 @@ fn diagnose_coordinator(spec: &Spec) {
     };
     for event in events.iter().rev().take(32).rev() {
         let (kind, code, reason) = coordinator_event_summary(event);
-        eprintln!("coordinator event: {kind} code={code:?} reason={reason:?}");
+        let refusal = coordinator_refusal_class(event);
+        eprintln!("coordinator event: {kind} code={code:?} reason={reason:?} refusal={refusal:?}");
     }
 }
 
@@ -113,6 +140,23 @@ fn coordinator_timeout_diagnostic_keeps_only_kind_and_typed_codes() {
     assert!(
         !format!("{:?}", coordinator_event_summary(&event)).contains("PRIVATE_DIAGNOSTIC_SENTINEL")
     );
+    assert_eq!(coordinator_refusal_class(&event), None);
+    for (message, expected) in [
+        ("toolchain_baseline_mismatch", "native_baseline_mismatch"),
+        (
+            "worker capabilities changed or unmet: ",
+            "profile_report_unavailable",
+        ),
+        (
+            "worker capabilities changed or unmet: PRIVATE_DIAGNOSTIC_SENTINEL",
+            "requirements_unmet",
+        ),
+    ] {
+        event.payload["message"] = serde_json::json!(message);
+        assert_eq!(coordinator_refusal_class(&event), Some(expected));
+        assert!(!format!("{:?}", coordinator_refusal_class(&event))
+            .contains("PRIVATE_DIAGNOSTIC_SENTINEL"));
+    }
     event.payload = serde_json::json!({"code":"PRIVATE_DIAGNOSTIC_SENTINEL", "reason":"PRIVATE_DIAGNOSTIC_SENTINEL"});
     assert_eq!(
         coordinator_event_summary(&event),
