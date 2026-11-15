@@ -275,6 +275,34 @@ pub fn system_search_path_toml() -> String {
         .collect()
 }
 
+/// A directory to put first in a fixture's PATH: every probed tool that the
+/// fixture does not use is answered there, at once and always the same way,
+/// instead of by whatever the host has under `/usr/bin` or a package manager
+/// and however long that takes to start. `git` is left to the host: the
+/// fixtures run it.
+pub fn tool_stubs(root: &Path) -> std::path::PathBuf {
+    let dir = root.join("tool-stubs");
+    std::fs::create_dir(&dir).unwrap();
+    for tool in [
+        "node",
+        "npm",
+        "pnpm",
+        "yarn",
+        "rustc",
+        "cargo",
+        "flutter",
+        "dart",
+        "xcodebuild",
+        "xcrun",
+        "portool",
+        "fast-worktree",
+        "docker",
+    ] {
+        write_executable(&dir.join(tool), "#!/bin/sh\nexit 1\n");
+    }
+    dir
+}
+
 /// Write `text` to `path` and make it executable, so that it can be run at
 /// once by a test that shares its process with other tests.
 ///

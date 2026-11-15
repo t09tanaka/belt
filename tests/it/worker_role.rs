@@ -71,7 +71,13 @@ impl Fixture {
             executable: BIN.into(),
             env: BTreeMap::from([
                 ("HOME".into(), root.path().display().to_string()),
-                ("PATH".into(), "/usr/bin:/bin:/opt/homebrew/bin".into()),
+                (
+                    "PATH".into(),
+                    format!(
+                        "{}:/usr/bin:/bin:/opt/homebrew/bin",
+                        super::common::tool_stubs(root.path()).display()
+                    ),
+                ),
             ]),
             config: "schema_version = 1\n[coordinator]\nheartbeat_seconds = 1\nstale_seconds = 3\n"
                 .into(),

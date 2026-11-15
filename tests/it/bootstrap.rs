@@ -31,7 +31,13 @@ fn fixture() -> (super::common::DaemonRoot, Spec) {
         executable: env!("CARGO_BIN_EXE_remote-task-runner").into(),
         env: BTreeMap::from([
             ("HOME".into(), root.path().display().to_string()),
-            ("PATH".into(), "/usr/bin:/bin".into()),
+            (
+                "PATH".into(),
+                format!(
+                    "{}:/usr/bin:/bin",
+                    super::common::tool_stubs(root.path()).display()
+                ),
+            ),
             ("TOKIO_WORKER_THREADS".into(), "2".into()),
             ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
             ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
@@ -153,20 +159,35 @@ fn diagnose_worker(spec: &Spec) {
             break;
         }
     }
+    let origin = events.first().map_or(0, |event| event.at_ms);
     for event in events.iter().rev().take(96).rev() {
-        if matches!(
-            event.kind.as_str(),
-            "agent_environment_changed" | "agent_prepare_failed" | "agent_spawn_failed"
-        ) {
-            eprintln!(
-                "worker event: {} code={} reason={} message={}",
-                event.kind,
-                event.payload["code"],
-                event.payload["blocked_reason"],
-                event.payload["message"]
-            );
-        } else {
-            eprintln!("worker event: {}", event.kind);
+        // The last characters tell two attempts apart; the time is relative
+        // to the first event, so a silent wait shows as a gap.
+        let attempt = event
+            .attempt_id
+            .as_deref()
+            .and_then(|id| id.get(id.len().saturating_sub(6)..))
+            .unwrap_or("-");
+        let at = event.at_ms.saturating_sub(origin);
+        match event.kind.as_str() {
+            "agent_environment_changed" | "agent_prepare_failed" | "agent_spawn_failed" => {
+                eprintln!(
+                    "worker event: +{at}ms {attempt} {} code={} reason={} message={}",
+                    event.kind,
+                    event.payload["code"],
+                    event.payload["blocked_reason"],
+                    event.payload["message"]
+                )
+            }
+            "attempt_state" => eprintln!(
+                "worker event: +{at}ms {attempt} attempt_state {}->{}",
+                event.payload["from"], event.payload["to"]
+            ),
+            "agent_setup_unavailable" => eprintln!(
+                "worker event: +{at}ms {attempt} {} reason={}",
+                event.kind, event.payload["reason"]
+            ),
+            kind => eprintln!("worker event: +{at}ms {attempt} {kind}"),
         }
     }
 }
@@ -3621,6 +3642,20 @@ async fn frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and
     let host = root.path().join("private-managers");
     std::fs::create_dir(&host).unwrap();
     crate::common::write_executable(&host.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
+    // Both commands are alive at once: the second waits for the first, which
+    // has to be admitted meanwhile. The default admission budget is the
+    // host's core count and the default weight is 2, so on a 3-core host the
+    // first stays ready until the second gave up; a busy host holds a start
+    // as well. This test is about toolchains, so its admission is fixed here
+    // instead of taken from the host.
+    let traffic = spec.worker_state_dir.join("traffic");
+    std::fs::create_dir(&traffic).unwrap();
+    std::fs::set_permissions(&traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        traffic.join("config.toml"),
+        "budget = 8\ncpu_threshold_percent = 100.0\nmemory_reserve_mib = 0\n",
+    )
+    .unwrap();
     let profile_text = format!("schema_version=1\nactive='base22'\n[profiles.base22]\npath=[{:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='base22'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
     let profile_file = spec.worker_state_dir.join("profiles.toml");
     std::fs::write(&profile_file, &profile_text).unwrap();
