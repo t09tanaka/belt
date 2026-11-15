@@ -623,3 +623,7 @@ mutation routing traceではGit起動がfixture開始7秒後となり、5秒でr
 runtime 構築時だけ `startup_report` を使い、Unknown の固定 native probe を同じ 300ms 制限で一度だけ再測定してから最終 report と baseline を作る。各 pass は xcode の SDK probe を含め最大14 calls、startup report は最大28 calls / 8.4秒の probe 待ち。required tool の load 時検査と最初の live report を各4.2秒として計16.8秒の probe 待ちであり、20秒 bootstrap に対する残り時間にはプロセス起動・ファイル処理等の overhead が入る。無制限の収束待ちや完全な遅延耐性は保証しない。
 
 missing binary は Unavailable、再測定しても失敗する Docker 等は Unknown のままなので制約なし shell を妨げない。初回の Unknown report/fingerprint は公開せず、成功も実測値のみを使う。公開後の Unknown→Available は引き続き identity を無効化し、known version・executable・context drift、required tool と frozen baseline の fail-closed 判定は変更しない。private cold script が初回 timeout→再測定成功を決定的に再現し、再測定除去の退行が同じ availability assertion で失敗することを確認した。profile 7件と最終 toolchain 65件、strict clippy all-targets、fmt/diff check と、元の失敗対象 `bootstrap::configured_cli_submit_captures_worktree_and_secrets_then_outlives_caller` の単体実行が成功した。normal matrix と全体 CI は統合後に別途必須。
+
+### 準備状態probeへの起動時attestation修正の統合
+
+ROOTの起動時attestation修正3216a745を、準備状態probe branchへd2968294で統合した。最初の測定とUnknownのみの1回再測定を完了してからfingerprintとcompleted snapshotを保存する。読み取り専用probeがsnapshotの時刻を更新しない契約と、公開後のUnknown→Availableを同じidentityで受理しない契約は維持する。統合後のprobe関連10件、profile/snapshot関連8件、strict clippy全target/featureが成功した。wireへのprobe接続・warm activation証明・実測cost接続は残件で、setup時間を推定成功へ変更しない。ROOT3216の通常matrixローカルCIは別途進行中で、このfocused結果を全体CI成功とは扱わない。
