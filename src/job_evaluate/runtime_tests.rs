@@ -104,7 +104,7 @@ fn ready(driver: &Driver) -> Vec<(String, TaskInputs)> {
 fn actual_two_static_legs_settle_driver_and_match_legacy_whole_matrix() {
     let area = tempfile::Builder::new()
         .prefix("localci-static-driver-")
-        .tempdir_in("/private/tmp")
+        .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
         .unwrap();
     let root = area.path().join("source");
     std::fs::create_dir_all(root.join(".github/workflows")).unwrap();

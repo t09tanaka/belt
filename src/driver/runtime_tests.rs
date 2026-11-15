@@ -78,7 +78,7 @@ impl Fixture {
     fn new_files(workflow: &str, files: &[(&str, &str)]) -> Self {
         let area = tempfile::Builder::new()
             .prefix("localci-dynamic-driver-")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
             .unwrap();
         let root = area.path().join("source");
         std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
@@ -1520,7 +1520,8 @@ fn atomic_group_real_static_and_failed_invalid_empty_internal_matrices() {
 fn atomic_group_cancel_inflight_or_late_real_receipt_retains_ownership_and_replays() {
     use std::io::Read;
     for in_flight in [false, true] {
-        let signal_area = tempfile::tempdir_in("/private/tmp").unwrap();
+        let signal_area =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let signal = signal_area.path().join("running.fifo");
         assert!(ExecContext::new(Default::default())
             .command("/usr/bin/mkfifo")
@@ -2647,7 +2648,8 @@ fn frozen_shards_typed_membership_and_receipt_identity_reject_without_mutation()
 fn frozen_shards_inflight_cancel_real_terminal_and_late_success_replay() {
     use std::io::Read;
     for inflight in [false, true] {
-        let signal_area = tempfile::tempdir_in("/private/tmp").unwrap();
+        let signal_area =
+            tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
         let signal = signal_area.path().join("started.fifo");
         assert!(ExecContext::new(Default::default())
             .command("/usr/bin/mkfifo")

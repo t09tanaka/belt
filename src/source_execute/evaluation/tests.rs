@@ -33,7 +33,7 @@ fn captured_directory_and_git_recompute_scheduling_provenance() {
     for is_git in [false, true] {
         let area = tempfile::Builder::new()
             .prefix("localci-evaluation-")
-            .tempdir_in("/private/tmp")
+            .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
             .unwrap();
         let root = area.path().join("source");
         std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
