@@ -30,11 +30,12 @@ pub fn fixture_traffic_config(state: &Path) {
 }
 
 /// A temporary directory that can be removed even though the content-addressed
-/// stores under it are read-only by design (`tempfile` would leak it).
+/// stores under it are read-only by design (`tempfile` alone would leave it
+/// until the test process exits).
 pub struct Tmp(tempfile::TempDir);
 
 pub fn tempdir() -> std::io::Result<Tmp> {
-    tempfile::tempdir().map(Tmp)
+    crate::test_tmp::tempdir().map(Tmp)
 }
 
 impl Tmp {
@@ -45,21 +46,7 @@ impl Tmp {
 
 impl Drop for Tmp {
     fn drop(&mut self) {
-        let mut todo = vec![self.0.path().to_path_buf()];
-        while let Some(dir) = todo.pop() {
-            let Ok(meta) = std::fs::symlink_metadata(&dir) else {
-                continue;
-            };
-            if !meta.is_dir() {
-                continue;
-            }
-            let mut mode = meta.permissions();
-            mode.set_mode(mode.mode() | 0o700);
-            let _ = std::fs::set_permissions(&dir, mode);
-            if let Ok(rd) = std::fs::read_dir(&dir) {
-                todo.extend(rd.flatten().map(|e| e.path()));
-            }
-        }
+        remote_task_runner::platform::owned_temp::make_writable(self.0.path());
     }
 }
 
@@ -180,6 +167,9 @@ impl DaemonRoot {
 impl Drop for DaemonRoot {
     fn drop(&mut self) {
         stop_daemon(&self.state);
+        // Prepared templates under the worker state are read-only by design,
+        // and removal stops at the first directory it cannot empty.
+        remote_task_runner::platform::owned_temp::make_writable(self.dir.path());
     }
 }
 
