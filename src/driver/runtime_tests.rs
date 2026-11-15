@@ -2274,6 +2274,15 @@ fn shard_fixture_output(
     test_body: &str,
     output: &str,
 ) -> Fixture {
+    shard_fixture_with_peer(fail_fast, preparation, test_body, output, false)
+}
+fn shard_fixture_with_peer(
+    fail_fast: bool,
+    preparation: &str,
+    test_body: &str,
+    output: &str,
+    peer: bool,
+) -> Fixture {
     use crate::shard::adapters::{run_invocation, CargoTest, Safety};
     use crate::shard::{partition_tests, History, PartitionOpts, RunnerAdapter};
     let workflow = format!(
@@ -2303,6 +2312,11 @@ jobs:
       - run: test '${{{{ needs.test.outputs.value }}}}' = agreed
 "#
     );
+    let workflow = if peer {
+        workflow.replace("\n  matrix:\n", "\n  peer:\n    runs-on: shard-runner\n    steps:\n      - run: 'true'\n      - run: 'true'\n      - run: cargo test --offline --lib\n  matrix:\n")
+    } else {
+        workflow
+    };
     let mut fixture = Fixture::new_files(&workflow, &[
         ("Cargo.toml", "[package]\nname='driver-shard-fixture'\nversion='0.1.0'\nedition='2021'\n[workspace]\n"),
         ("src/lib.rs", test_body),
@@ -2355,18 +2369,27 @@ jobs:
         2,
         &PartitionOpts::default(),
     );
-    fixture.plan = fixture
-        .plan
-        .with_shards(&[crate::dag::ShardRequest {
+    let mut requests = vec![crate::dag::ShardRequest {
+        workflow: FILE.into(),
+        job: "test".into(),
+        plan: partition.clone(),
+        step: 2,
+        dir: "".into(),
+        discovered: discovered.clone(),
+        fail_fast,
+    }];
+    if peer {
+        requests.push(crate::dag::ShardRequest {
             workflow: FILE.into(),
-            job: "test".into(),
+            job: "peer".into(),
             plan: partition,
             step: 2,
             dir: "".into(),
             discovered,
-            fail_fast,
-        }])
-        .unwrap();
+            fail_fast: true,
+        });
+    }
+    fixture.plan = fixture.plan.with_shards(&requests).unwrap();
     assert!(fixture.plan.shard_groups.iter().any(|g| g.split));
     fixture
 }
@@ -4271,4 +4294,108 @@ fn pure_small_plan_progress_finishes_within_watchdog() {
         .expect("small pure driver proposal must terminate")
         .unwrap();
     thread.join().unwrap();
+}
+
+#[test]
+fn pure_shard_failfast_does_not_borrow_another_groups_policy() {
+    let tests = SHARD_TESTS.replace(
+        "fn alpha() {}",
+        "fn alpha() { panic!(\"genuine failure\") }",
+    );
+    let f = shard_fixture_with_peer(false, "'true'", &tests, "agreed", true);
+    let mut d = f.driver(4);
+    commit(&mut d, Input::Advance);
+    let actions = shard_actions(&d)
+        .into_iter()
+        .filter(|a| f.plan.task(ready_task(a).unwrap()).unwrap().jobs == ["test"])
+        .collect::<Vec<_>>();
+    assert_eq!(actions.len(), 2);
+    claim(&mut d, &actions[0]);
+    mark(&mut d, &actions[0]);
+    let (wire, _) = f.execute(&actions[0], "survivor-cross-group");
+    assert_eq!(wire.outcomes[0].status, JobStatus::Failure);
+    settle(&mut d, &actions[0], wire);
+    assert!(cancel_actions(&d).is_empty());
+    assert!(ready(&d)
+        .iter()
+        .any(|a| ready_task(a) == ready_task(&actions[1])));
+}
+
+#[test]
+fn pure_pending_fallback_reserve_funds_actual_core_publication() {
+    let workflow = WORKFLOW.replace(
+        "matrix={\"include\":[{\"n\":0,\"os\":\"alpha\"},{\"n\":1,\"os\":\"beta\"}]}",
+        "matrix=broken",
+    );
+    let f = Fixture::new(&workflow);
+    let mut d = f.driver(2);
+    let initial = d.state.clone();
+    seed(&f, &mut d);
+    let origin = f
+        .plan
+        .tasks
+        .iter()
+        .find(|task| task.dynamic_matrix)
+        .unwrap();
+    assert_eq!(
+        d.core_decision(&origin.id).unwrap().0,
+        CoreDecision::EarlyFailure
+    );
+    let terminal = &d.state.phases[&origin.id];
+    let outcome = d.outcome(FILE, "dynamic").unwrap();
+    // Actual retained phase + logical publication, serialized independently of
+    // the reserve implementation, are the minimum fallback obligation.
+    let obligation = serde_json::to_vec(&(&origin.id, terminal, FILE, "dynamic", outcome))
+        .unwrap()
+        .len();
+    assert!(obligation > 1);
+    assert!(Driver::fallback_reserve(origin).unwrap() >= obligation);
+    assert!(d.pending_fallback_reserve(&initial).unwrap() >= obligation);
+}
+
+#[test]
+fn pure_nonvariant_publication_reserve_tracks_only_unpublished_real_outputs() {
+    let mut published_reserves = Vec::new();
+    for length in [1, 6000] {
+        let value = "z".repeat(length);
+        let workflow = format!("on: push\njobs:\n  first:\n    runs-on: x\n    outputs:\n      value: ${{{{ steps.out.outputs.value }}}}\n    steps:\n      - id: out\n        run: printf 'value=%s\\n' '{value}' >> \"$GITHUB_OUTPUT\"\n  second:\n    runs-on: x\n    steps: []\n");
+        let f = Fixture::new(&workflow);
+        let mut d = f.driver(2);
+        commit(&mut d, Input::Advance);
+        let action = ready(&d)
+            .into_iter()
+            .find(|a| f.plan.task(ready_task(a).unwrap()).unwrap().jobs == ["first"])
+            .unwrap();
+        claim(&mut d, &action);
+        let (wire, _) = f.execute(&action, "survivor-publication");
+        let result_digest = wire.digest().unwrap();
+        let mut published = d.clone();
+        settle(&mut published, &action, wire.clone());
+        assert_eq!(
+            published.outcome(FILE, "first").unwrap().outputs["value"],
+            value
+        );
+        assert!(!finished(&published));
+        published_reserves.push(published.cancel_reserve(&published.state).unwrap());
+        if length == 6000 {
+            let task = ready_task(&action).unwrap();
+            // This is the genuine compute intermediate before publication. It
+            // is passed only to the pure policy helper, never installed/applied.
+            let mut prepublication = d.state.clone();
+            prepublication.phases.insert(
+                task.into(),
+                Phase::Terminal(Terminal::Worker {
+                    token: task.into(),
+                    result_digest,
+                    outcomes: wire.outcomes.clone(),
+                    shard: wire.shard.clone(),
+                }),
+            );
+            let obligation = serde_json::to_vec(&(FILE, "first", &wire.outcomes))
+                .unwrap()
+                .len();
+            assert!(d.cancel_reserve(&prepublication).unwrap() >= obligation);
+        }
+    }
+    assert_eq!(published_reserves[0], published_reserves[1]);
 }
