@@ -77,7 +77,7 @@ pub fn capture_run(
     params: &CaptureParams,
 ) -> Result<Captured, ApiError> {
     let _mutation = store
-        .mutation_guard()
+        .foreground_guard()
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     vault.ensure_run_available(run).map_err(|e| e.to_api())?;
     let (key, declared) = (inputs.key, inputs.declared);

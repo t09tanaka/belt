@@ -1,6 +1,8 @@
 //! Persistent roots and cross-process exclusion for captured inputs.
 //! Explicit parent retention pages are separate from the nondeleting preview.
 mod deletion;
+mod foreground;
+pub(crate) use foreground::ForegroundBusy;
 mod vault_retention;
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
@@ -43,6 +45,8 @@ pub(crate) struct Index {
     verifications: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     page_pause: Arc<std::sync::Mutex<Option<PagePause>>>,
+    #[cfg(test)]
+    foreground_waits: Arc<std::sync::atomic::AtomicUsize>,
 }
 #[cfg(test)]
 #[derive(Debug)]
@@ -99,6 +103,12 @@ fn open_permanent_file(root: &File, name: &str) -> Result<File> {
 }
 impl Index {
     pub(crate) fn open(root: &Path) -> Result<Self> {
+        Self::open_guarded(root, false).map(|(index, _guard)| index)
+    }
+    pub(crate) fn open_foreground(root: &Path) -> Result<(Self, Guard)> {
+        Self::open_guarded(root, true)
+    }
+    fn open_guarded(root: &Path, foreground: bool) -> Result<(Self, Guard)> {
         let this = Self {
             path: root.into(),
             database: std::fs::canonicalize(root)
@@ -115,8 +125,15 @@ impl Index {
             verifications: Default::default(),
             #[cfg(test)]
             page_pause: Default::default(),
+            #[cfg(test)]
+            foreground_waits: Default::default(),
         };
-        let _guard = this.guard(false).context("initial source guard")?;
+        let guard = if foreground {
+            this.foreground_guard()
+        } else {
+            this.guard(false)
+        }
+        .context("initial source guard")?;
         this.prepare_index_file()?;
         this.connect().context("connect source index")?.execute_batch("PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS root(id TEXT PRIMARY KEY,kind TEXT NOT NULL,source TEXT);
@@ -138,7 +155,7 @@ impl Index {
           CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');").context("initialize source index")?;
-        Ok(this)
+        Ok((this, guard))
     }
     fn prepare_index_file(&self) -> Result<()> {
         use rustix::fs::{statat, AtFlags, FileType, Mode, OFlags, RenameFlags};
@@ -1553,6 +1570,7 @@ mod tests {
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),
+                foreground_waits: Default::default(),
             };
             let gate = std::sync::Barrier::new(8);
             let guards = std::thread::scope(|scope| {
@@ -1600,6 +1618,7 @@ mod tests {
                 reads: Default::default(),
                 verifications: Default::default(),
                 page_pause: Default::default(),
+                foreground_waits: Default::default(),
             };
             let gate = std::sync::Barrier::new(8);
             let identities = std::thread::scope(|scope| {

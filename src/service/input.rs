@@ -50,7 +50,13 @@ pub fn capture_into(
                 .to_string(),
         },
     };
-    let store = SourceStore::open(input_state).map_err(|e| invalid(e.to_string()))?;
+    let (store, _source) = SourceStore::open_foreground(input_state).map_err(|error| {
+        if error.is::<crate::source::retention::ForegroundBusy>() {
+            crate::source::classify::api_error_of(&error)
+        } else {
+            invalid(error.to_string())
+        }
+    })?;
     let vault = Vault::open(input_state).map_err(|e| e.to_api())?;
     let key =
         crate::secrets::key::load(&context.bootstrap.cluster_key_path).map_err(|e| e.to_api())?;
@@ -90,9 +96,15 @@ pub fn source_view(
     destination: &std::path::Path,
 ) -> Result<(), ApiError> {
     let manifest = source_manifest(context, run)?;
-    SourceStore::open(context.state_dir())
-        .and_then(|store| store.materialize(&manifest, destination))
-        .map_err(|_| ApiError::new(ErrorCode::Internal, "cannot materialize captured source"))
+    SourceStore::open_foreground(context.state_dir())
+        .and_then(|(store, _source)| store.materialize(&manifest, destination))
+        .map_err(|error| {
+            if error.is::<crate::source::retention::ForegroundBusy>() {
+                crate::source::classify::api_error_of(&error)
+            } else {
+                ApiError::new(ErrorCode::Internal, "cannot materialize captured source")
+            }
+        })
 }
 
 /// Load the bound descriptor without recapturing or restoring secrets.
@@ -109,7 +121,13 @@ pub fn source_manifest_in(
     run: &RunId,
 ) -> Result<local_ci::source::SourceManifest, ApiError> {
     let internal = |_| ApiError::new(ErrorCode::Internal, "captured source is unavailable");
-    let store = SourceStore::open(input_state).map_err(internal)?;
+    let (store, _source) = SourceStore::open_foreground(input_state).map_err(|error| {
+        if error.is::<crate::source::retention::ForegroundBusy>() {
+            crate::source::classify::api_error_of(&error)
+        } else {
+            internal(error)
+        }
+    })?;
     let source = store
         .source_of_run(run)
         .map_err(internal)?

@@ -58,7 +58,7 @@ impl CoordinatorStore {
         expected: u64,
         request_id: String,
     ) -> Result<RetryPreparation> {
-        let source_guard = self.source_mutation_guard()?;
+        let source_guard = self.source_mutation_guard_foreground()?;
         if request_id.is_empty() || request_id.len() > 128 {
             return Err(StorageError::Invalid("invalid retry request ID".into()));
         }

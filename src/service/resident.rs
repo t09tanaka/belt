@@ -902,7 +902,7 @@ where
     let inputs = coordinator.clone();
     let preflight = tokio::task::spawn_blocking(move || {
         let _lease = input_lease;
-        let source = inputs.store().source_mutation_guard();
+        let source = inputs.store().source_mutation_guard_foreground();
         drop(inputs); // Detached input IO retains only its source guard, never owner metadata.
         let validated =
             source.and_then(|source| validate(&prepared).map(|secret| (secret, source)));
@@ -1167,7 +1167,7 @@ async fn handle(
                     let owner = coordinator.clone();
                     let checked = tokio::task::spawn_blocking(
                         move || -> anyhow::Result<crate::source::retention::Guard> {
-                            let mutation = owner.store().source_mutation_guard()?;
+                            let mutation = owner.store().source_mutation_guard_foreground()?;
                             let ci =
                                 crate::source::classify::ci_id_of(&source).ok_or_else(|| {
                                     anyhow::anyhow!("source is not a captured source")
@@ -1190,6 +1190,24 @@ async fn handle(
                     .await?;
                     let source_guard = match checked {
                         Ok(guard) => guard,
+                        Err(e)
+                            if e.downcast_ref::<crate::storage::StorageError>()
+                                .is_some_and(|e| {
+                                    matches!(e, crate::storage::StorageError::SourceBusy)
+                                }) =>
+                        {
+                            return write_message(
+                                &mut stream,
+                                &Reply::ControlError {
+                                    error: crate::error::ApiError::new(
+                                        crate::error::ErrorCode::SourceBusy,
+                                        "captured inputs are temporarily busy",
+                                    ),
+                                },
+                            )
+                            .await
+                            .map_err(Into::into);
+                        }
                         Err(e) => {
                             return write_message(
                                 &mut stream,
@@ -1230,7 +1248,7 @@ async fn handle(
                 let mut stopping = stop.subscribe();
                 let checked = tokio::task::spawn_blocking(
                     move || -> anyhow::Result<(Digest, bool, crate::source::retention::Guard)> {
-                        let mutation = capture.sources.mutation_guard()?;
+                        let mutation = capture.sources.foreground_guard()?;
                         let id = crate::source::classify::ci_id_of(&source)
                             .ok_or_else(|| anyhow::anyhow!("invalid source"))?;
                         anyhow::ensure!(
@@ -1285,6 +1303,11 @@ async fn handle(
                 .await;
                 let answer = match result {
                     Ok(()) => Reply::Accepted { run_id },
+                    Err(e) if e.is::<crate::source::retention::ForegroundBusy>() => {
+                        Reply::ControlError {
+                            error: crate::source::classify::api_error_of(&e),
+                        }
+                    }
                     Err(e) => Reply::Error {
                         message: e.to_string(),
                     },

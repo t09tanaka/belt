@@ -104,6 +104,8 @@ pub enum StorageError {
         state: AttemptState,
         why: &'static str,
     },
+    #[error("captured inputs are temporarily busy; retry the request")]
+    SourceBusy,
     #[error("retained secret bundle unavailable; submit a new run")]
     SecretUnavailable,
     #[error("invalid input: {0}")]
@@ -130,10 +132,11 @@ impl From<rusqlite::Error> for StorageError {
 }
 
 impl StorageError {
-    /// True when the same call may succeed later without any change (a busy
-    /// database). Everything else is a verdict or a fault.
+    /// True when the same call may succeed later without any input change
+    /// (database or foreground source retention contention). Everything else
+    /// is a verdict or a fault.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, StorageError::Busy)
+        matches!(self, StorageError::Busy | StorageError::SourceBusy)
     }
 
     /// The wire error code this maps to.
@@ -148,6 +151,7 @@ impl StorageError {
             | StorageError::LiveAttemptExists(_)
             | StorageError::LocatorPendingDelete(_) => ErrorCode::Conflict,
             StorageError::SecretUnavailable => ErrorCode::Blocked,
+            StorageError::SourceBusy => ErrorCode::SourceBusy,
             StorageError::NotFound { .. } => ErrorCode::NotFound,
             StorageError::Retired(_) => ErrorCode::Retired,
             StorageError::StaleEpoch { .. } => ErrorCode::StaleEpoch,
