@@ -574,6 +574,34 @@ contract35・prefetch46のmutantをcaught、survived0・timeout0・unviable11だ
 prefetchは同一blobの既存結果を再利用した。これは限定結果であり、統合全CIは次に確認する。
 
 
+### S16 captured planning integration
+
+`ci plan` は local-ci 0.13.0 の `build_frozen_plan_from_source` へ一度の capture の manifest と検証済み object store を渡す。`CiPlan` は同じ FrozenPlan と captured identity を保持し、公開出力は上限付きの構造 summary のみとする。captured config は manifest に載った regular file だけを読み、秘密入力・hash/size 不一致を拒否する。capture 後に live project を再読込しない。Directory に架空の Git revision を補わず、branch/path filter の不足 metadata は core の型付きエラーで拒否する。
+
+planning は owner、epoch、attempt、ledger へ登録せず、close / Drop で自分が作った private draft と Vault だけを削除する。Git/worktree/Directory と dirty submodule の planning を検証する。初期 capture policy は既存 Context の設定解決を利用する。実 CI 実行、worker Driver、remote artifact、CI status、shard retry、強制終了で残った draft の回収はこの区切りの完了に含めず、既存の必須残件として保持する。subcommand 無しの `ci` は引き続き未実装。
+
+
+### 統合検証と次の区切り（2026-11-15）
+
+S15統合 `f94d6f1` の全体ローカルCIは9ジョブ中1成功・7失敗・1環境エラーで終了した。通常テストのHOME比較・保護PATHのfixture、短いUnix socket path、source guard最後所有者の明示unlock、bootstrapのAccepted待機を個別に調査する。mutationはbaselineで停止し、mutant検出率は未測定、coverage集計も未完了。限定pure gateの成功を全体CI成功とは扱わない。修正統合後のコミット済みHEADで全体検証をやり直す。
+
+関連SDK local-ci 0.13.0はPR46、ローカル10項目・リモート10項目を通過し、crate・tag・4対象8配布assetの公開と照合が完了した。0.14開発のDriverは動的展開・worker再検証まで実装し、評価サイズ上限と状態容量境界を修正中。元の独立レビュー担当でproducer確定・permit解放を失わないことを確認してから、既存RunnerのDriver接続、cancel/fence、shard retry、artifact backendへ進む。
+
+setup実測は、workerのowner世代・挿入順に束縛した最大64件pageの取得から、follow専用の親bounded committed historyまで接続した。実際のfeature交渉・worker/boot/epoch・attachment/InputGate世代を照合し、actor解放後に既存のqueue32/cache4096 writerへbest effortで渡す。親send時刻からremote ageを差し引き、TTL・native boot・clock逆行を検証する。同じreceipt・競合は初回stampを更新せず、eviction後もnamespace sequence watermarkで古い再送を拒否する。namespace台帳も4096件に制限し、同じ親native bootで満杯なら新namespaceの観測はUnknownとする。親native bootが変わった履歴はfreshnessに使わず、旧namespace slotを回収する。queue fullやwriter故障による欠落は許容し、通常placementへ失敗を伝播させない。読み取り専用estimateはpageを要求せず、cursorと履歴も更新しない。setup CostModelのscalar・forecast・warm readiness・resource/dependency展開は引き続きUnknownで、次の必須sliceに残す。準備CPU時間を単純なready delayへ足さず、既存TTCの依存nodeと実ledger entryの対応でモデル化する。warmの0は現在のartifact内容・receipt・profileが検証された場合だけに限定し、観測不足や検証budget超過はUnknownを維持する。新しいschedulerは作らない。この接続と資源モデルの検証が済むまでS15f完成とは扱わない。
+
+
+### 新しい純粋ロジックの限定gate
+
+CI計画summaryをcoverage/mutation対象へ登録し、shard group数の4096/4097境界を追加した。限定3テストでcoverage364/364行、mutant40件はcaught39・survived0・timeout0・unviable1。観測page transportは別branchの`6b5a4c1`でcoverage341/341行、mutant34件はcaught32・survived0・timeout0・unviable2、baseline5件成功を独立担当で確認した。どちらも通常閾値を維持した限定結果で、統合全体CIの結果ではない。
+
+
+### 準備観測の親取り込み限定検証
+
+follow pagination（64/64/2件と次pass）、readonly estimate、actor解放、owner reset・同世代attachment置換・InputGate無効化、malformed page、remote age/TTL/clock逆行、永続初回stamp・競合・eviction watermark、namespace上限、queue full・writer故障を確認した。関連18テスト成功後、追加境界を含むfollowの4テストも成功（重複を除き19件）。all-target型検査・strict clippy・fmt/diff確認も成功。これは限定検証で、統合全体CI・新しいwarm/resourceモデルの検証ではない。
+
+独立レビューで、構造正常な期限切れ観測がpage全体を巻き戻し、古い先頭64件を越えられなくなるP2を修正した。identity/sequence/clock等の構造不正はpage全体を拒否し、TTL超・親native uptimeへのmapping不能な観測だけをskipしてvalid cursorを進める。64件の古いprefixからfreshな後続pageへの到達、再接続・親restart、全expired完了pass後のfresh insertを含む関連21テストとstrict all-target clippyが成功した。全体CIはこの修正では再実行していない。
+
+
 ### 統合CIの再検証で見つかった問題（2026-11-15）
 
 `98945fc` の全体ローカルCIは2成功・4失敗・2取消・1skip、50分42秒で終了した。通常UbuntuとMSRV名のジョブは成功したが、ローカルRustは1.100であり1.89確認ではない。通常macOS名のbootstrapはEnvironmentMismatchによる未受理、coverageはcapability390/391行・wire1709/1710行、mutation2/3は回収fixtureの64件期待に対し63/60件でbaseline失敗した。mutation0/1は取消で、完全な変異検出結果は無い。
@@ -595,6 +623,86 @@ mutation routing traceではGit起動がfixture開始7秒後となり、5秒でr
 runtime 構築時だけ `startup_report` を使い、Unknown の固定 native probe を同じ 300ms 制限で一度だけ再測定してから最終 report と baseline を作る。各 pass は xcode の SDK probe を含め最大14 calls、startup report は最大28 calls / 8.4秒の probe 待ち。required tool の load 時検査と最初の live report を各4.2秒として計16.8秒の probe 待ちであり、20秒 bootstrap に対する残り時間にはプロセス起動・ファイル処理等の overhead が入る。無制限の収束待ちや完全な遅延耐性は保証しない。
 
 missing binary は Unavailable、再測定しても失敗する Docker 等は Unknown のままなので制約なし shell を妨げない。初回の Unknown report/fingerprint は公開せず、成功も実測値のみを使う。公開後の Unknown→Available は引き続き identity を無効化し、known version・executable・context drift、required tool と frozen baseline の fail-closed 判定は変更しない。private cold script が初回 timeout→再測定成功を決定的に再現し、再測定除去の退行が同じ availability assertion で失敗することを確認した。profile 7件と最終 toolchain 65件、strict clippy all-targets、fmt/diff check と、元の失敗対象 `bootstrap::configured_cli_submit_captures_worktree_and_secrets_then_outlives_caller` の単体実行が成功した。normal matrix と全体 CI は統合後に別途必須。
+
+### 準備状態probeへの起動時attestation修正の統合
+
+ROOTの起動時attestation修正3216a745を、準備状態probe branchへd2968294で統合した。最初の測定とUnknownのみの1回再測定を完了してからfingerprintとcompleted snapshotを保存する。読み取り専用probeがsnapshotの時刻を更新しない契約と、公開後のUnknown→Availableを同じidentityで受理しない契約は維持する。統合後のprobe関連10件、profile/snapshot関連8件、strict clippy全target/featureが成功した。wireへのprobe接続・warm activation証明・実測cost接続は残件で、setup時間を推定成功へ変更しない。ROOT3216の通常matrixローカルCIは別途進行中で、このfocused結果を全体CI成功とは扱わない。
+
+
+### 準備状態probeの読み取り専用worker protocol
+
+独立した `preparation_probe_v1` を交渉し、`PreparationProbe` をread-only/control operationとして追加した。実際のmanifest/source/run/setup/frozen/in_placeと選択workerのexpected profile fingerprintを受け、現在のcfg fingerprintが一致した場合だけ既存のbounded worker-local probeへ渡す。setup/frozenはDebugから除外する。応答はworker/boot/agent epochと実際のowner generation・opaque producer key・ConcretePlan・Active builder/attempt・typed Unknownのみで、最大16件をdecode時にも制限する。InspectやProfile.reportを呼ばず、completed snapshotの元の時刻とTTLを維持し、queue/attempt/ledger/native commandへ作用しない。
+
+このsliceはworker/wireだけであり、親のquery送信・観測取り込み・generation fencing、verified activation/warm proof、実際のTTC ledger identityとの対応とcost接続は必須残件として残す。setup秒・foreground forecast・cold/warm・admissionの意味は変更しない。focused wire/probe/protocol/RPCとstrict checkの結果はhandoffへ記録し、全体CI・push・公開の成功とは扱わない。
+
+### Source/Vault deletion A: 非削除の ownership / availability fences
+
+ユーザーは具体的な保持・削除条件に対して「この条件で実装・有効化する（推奨）」と明示承認した。
+承認は後続の実装・有効化まで持続する。今回は A の foundation のみで、実際の root expiry、
+削除 claim の作成、unlink、Vault erasure、resident 自動削除の有効化は追加しない。
+B/C と削除専任レビューを経て実削除へ進む。ユーザー実 state は検証に使わない。
+
+取り込みごとの durable token と store identity、publishing / published / bound の状態・正確な run 予約を追加し、
+同じ hash を受け取る別 import の保護を解除しない。handoff と membership release は一度に32件以下の
+transaction とし、crash / 不一致時は保護を残す。token 無しの旧 API は独立した保護 root を残し、
+hash 共通 marker の一括解除を廃止する。旧 unknown / legacy / unsubmitted root は保持を続ける。
+
+将来の run expiry fence と source/object publication incarnation を別の型・source-owned table で表す。
+content-addressed SourceID の生成式・同一入力IDは変えない。B の claim 完了後、同じ ID/hash の
+新 publication incarnation は可能だが、旧 run の失効は解除しない。A は production から expiry / claim
+状態へ遷移させない。将来の Vault-only SecretUnavailable fence は別の責務で、source bytes の7日保持や
+共有 source の読み取りと混同しない。
+
+publication / bind / enqueue / retry preflight+commit / source read・transfer・readiness に将来の fence 検査を接続する。
+source-first / EX nonblocking を維持し、actor の中で source lock を待たない。公開 object_store は guard-owned
+view とし、SDK raw handle を通常の公開 API から返さない。crate 内 SDK 呼び出し用の with_sdk callback は
+全 callback 中 SH を保持する。SDK は書きながら hash を発見するため、pending publication claim 中は raw SDK
+操作を保守的に拒否する。S16 の build_frozen_plan_from_source はこの callback 内へ適応する。
+UploadFile の reader 自身も SH を所有し、async waiter の取消後も実 blocking read / upload drain まで保持する。
+信頼 caller の意図的な filesystem / SDK handle 持ち出しまで防げるとは主張しない。
+
+private fixture の source retention 26件、retry 関連25件、toolchain 63件、source capture 38件、worker blobs 34件、
+forward upload 1件と strict all-target/all-feature clippy、fmt/diff check が成功した（群間に重複あり）。
+source subprocess helper 2件は standalone ignored で、親テストが必要時に直接起動する。
+全体 CI / push / 実削除の検証は A の対象外とする。
+
+
+### S15 source retention B: bounded explicit deletion (resident disabled)
+
+B adds an explicit parent-only `SourceStore::retention_page`; no resident caller or Vault erasure is enabled.
+Source EX is acquired nonblocking before coordinator actor work and held through synchronous physical IO/commit.
+The configured writable coordinator is matched to held source/state identities and SQLite's actual main connection
+via actor-local `SQLITE_FCNTL_HAS_MOVED` (unknown/unsupported/moved fails closed without opening a validation DB FD).
+Exact run/source-ref digest, sealed manifest and FD-read private run binding precede a permanent run-expiry fence.
+Every generation must be known/typed terminal with mandatory collection closed; queued/retry generations block.
+The history proof intentionally scans a run's history, so it is not described as constant-time.
+Direct create_task/create_attempt now take source SH and consult the run fence; terminal/result updates are unchanged.
+
+Each page selects <=32 indexed memberships or <=32 pending exact claims, with separate examined/path counters.
+Only exact membership PK rows are released; root/graph/object/run tombstones remain and no cascade/directory walk
+is used. Incomplete/unknown/import/legacy and shared memberships retain protection. Clock Hold forbids expiry,
+new claims AND replay unlink. A durable claim includes store/ancestor identity, incarnation, safe relative class/path,
+leaf dev/inode/size/UID/link/mode/timestamps and verified content digest before any unlink. Root/ancestors are
+NOFOLLOW-opened and checked again before FD-relative leaf unlink; directories are never removed. Data 0644 and
+nested owner-controlled 0755 directories are accepted under the private 0700 source root; index/lock rules stay 0600.
+Claimed NotFound alone allows parent fsync + durable completion. Errors retain claims/data. Completed claim records
+are permanent, excluded from replay, and atomically reserve a higher publication incarnation before same-ID reuse.
+Old run fences remain permanent. No source expiry is created for Vault-only SecretUnavailable.
+
+Content hashing (new proof plus replay) shares 64MiB/page; a new leaf above 32MiB or insufficient remaining budget
+is Unknown and retained. Initial sealed parent-manifest eligibility validation separately has a 64MiB bound and is
+cached across member pages. Unproven large legacy inputs are explicitly not fully covered. Source registration still
+uses the separate nondeleting preview; B Holds until bounded registration is known complete. C must thread trusted
+clock/config samples, owned blocking shutdown/cancellation drain, parent-only Vault semantics and resident scheduling,
+then obtain deletion-focused review before automatic deletion. No real user state is a test fixture.
+
+B focused verification completed on private fixtures: source retention44 passed plus2 standalone-ignored owned
+subprocess helpers, retry-filter25 passed, strict all-target/all-feature clippy, fmt and diff checks passed.
+New tests include33/65 refs,65-submodule graph and read counters, exact owner/DB/run digest, retired-current-generation
+queue exclusion, permanent directAPI fences, clock-Hold replay, claim/unlink/fsync/completion crash points,
+claimed/unclaimed missing, same-ID next incarnation, root/ancestor/leaf/symlink/hardlink/mode/path mismatch,
+owner-lock replacement, pending roots and sparse oversized leaf retention. Source preview and reader/IPC/async
+cancellation guard regressions remain green. Full local-ci/MSRV/Linux/remote/native/runtime-GC acceptance is not claimed.
 
 ### 起動時attestation修正後の通常CI
 

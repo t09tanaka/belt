@@ -205,6 +205,17 @@ impl BuilderWorkspaces for BuilderWs {
 }
 
 impl Host for Machine {
+    fn setup_owner(&self) -> Option<&Setups> {
+        self.setups.as_deref()
+    }
+    fn preparation_observation_page(
+        &self,
+        request: &crate::setup::observation_transport::ObservationPageRequest,
+    ) -> Option<crate::setup::observation_transport::ObservationPage> {
+        self.setups
+            .as_ref()
+            .map(|setups| setups.preparation_observation_page(request))
+    }
     fn toolchain_registry(
         &self,
         profile: &crate::toolchain::profile::Profile,

@@ -484,6 +484,7 @@ async fn connect_local(
     tokio::task::JoinHandle<()>,
     crate::protocol::Client,
     Arc<crate::coordinator::InputGate>,
+    bool,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
@@ -516,6 +517,11 @@ async fn connect_local(
             return Err(e.into());
         }
     };
+    let observations = connected
+        .negotiated
+        .features
+        .iter()
+        .any(|feature| feature == crate::setup::observation_transport::FEATURE);
     let worker_client = connected.client.clone();
     let provenance = Digest::of_bytes(&serde_json::to_vec(
         &serde_json::json!({"transport":"local-private-rpc-v1","protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"timeout_ms":parts.worker_timeout.as_millis()}),
@@ -540,7 +546,13 @@ async fn connect_local(
         worker_connection.abort();
         anyhow::bail!(e.message);
     }
-    Ok((listener, worker_connection, worker_client, input_gate))
+    Ok((
+        listener,
+        worker_connection,
+        worker_client,
+        input_gate,
+        observations,
+    ))
 }
 
 impl Resident {
@@ -574,7 +586,8 @@ impl Resident {
         })
         .await??;
         let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection, worker_client, input_gate) = match connected {
+        let (listener, worker_connection, worker_client, input_gate, observations) = match connected
+        {
             Ok(value) => value,
             Err(e) => {
                 tokio::task::spawn_blocking(move || startup.cleanup()).await?;
@@ -587,11 +600,14 @@ impl Resident {
             .coordinator
             .attach(
                 parts.worker_id.clone(),
-                Arc::new(crate::coordinator::ClientLink::gated(
-                    worker_client.clone(),
-                    parts.worker_timeout,
-                    input_gate.clone(),
-                )),
+                Arc::new(
+                    crate::coordinator::ClientLink::gated(
+                        worker_client.clone(),
+                        parts.worker_timeout,
+                        input_gate.clone(),
+                    )
+                    .with_preparation_observations(observations),
+                ),
             )
             .await;
         Ok(Self {

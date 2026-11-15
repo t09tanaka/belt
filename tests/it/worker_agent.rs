@@ -81,6 +81,16 @@ impl DirHost {
 }
 
 impl Host for DirHost {
+    fn preparation_observation_page(
+        &self,
+        _request: &remote_task_runner::setup::observation_transport::ObservationPageRequest,
+    ) -> Option<remote_task_runner::setup::observation_transport::ObservationPage> {
+        use remote_task_runner::setup::observation_transport::*;
+        self.log("observation_page");
+        Some(ObservationPage::Unavailable {
+            reason: UnavailableReason::OwnerChanged,
+        })
+    }
     fn disable_core_dumps(&self) -> Result<(), ApiError> {
         self.log("core_dumps");
         if self.fail_core_dumps.load(Ordering::SeqCst) {
@@ -1503,6 +1513,7 @@ async fn status_events_logs_lease_and_inspect_answer_from_the_store() {
     let Response::Inspect(i) = call(
         &c,
         Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
         }),
@@ -4031,6 +4042,7 @@ async fn capability_negotiation_is_required_even_if_worker_has_the_profile() {
         .client
         .call(
             Request::Inspect(InspectRequest {
+                preparation_observations: None,
                 schema_version: SchemaVersion::CURRENT,
                 request_id: RequestId::generate(),
             }),
@@ -4115,5 +4127,156 @@ async fn frozen_toolchain_submit_and_readonly_proposal_require_negotiated_featur
     assert!(f.store().list_nonterminal().unwrap().is_empty());
     server.abort();
     let _ = server.await;
+    agent.shutdown();
+}
+
+#[tokio::test]
+async fn preparation_observations_are_optional_negotiated_and_never_break_inspect() {
+    use remote_task_runner::setup::observation_transport::*;
+    let f = fx();
+    let agent = f.start("boot-1");
+    for negotiated in [false, true] {
+        let (a, b) = duplex_pair(64 * 1024);
+        tokio::spawn(serve_connection(
+            agent.clone(),
+            b,
+            f.cluster.clone(),
+            Arc::new(Semaphore::new(4)),
+        ));
+        let mut config = client_cfg(&f.cluster);
+        if !negotiated {
+            config.features.retain(|v| v != FEATURE);
+        }
+        let connection = connect(a, config).await.unwrap();
+        assert_eq!(
+            connection.negotiated.features.iter().any(|v| v == FEATURE),
+            negotiated
+        );
+        for requested in [false, true] {
+            let before = f.host.count("observation_page");
+            let Response::Inspect(inspect) = connection
+                .client
+                .call(
+                    Request::Inspect(InspectRequest {
+                        schema_version: SchemaVersion::CURRENT,
+                        request_id: RequestId::generate(),
+                        preparation_observations: requested.then(ObservationPageRequest::default),
+                    }),
+                    T,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(inspect.worker_id, f.cfg("boot-1").worker_id);
+            if negotiated && requested {
+                assert_eq!(
+                    inspect.preparation_observations,
+                    Some(ObservationPage::Unavailable {
+                        reason: UnavailableReason::OwnerChanged
+                    })
+                );
+                assert_eq!(f.host.count("observation_page"), before + 1);
+            } else {
+                assert!(inspect.preparation_observations.is_none());
+                assert_eq!(f.host.count("observation_page"), before);
+                assert!(serde_json::to_value(inspect)
+                    .unwrap()
+                    .get("preparation_observations")
+                    .is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn preparation_probe_is_negotiated_readonly_and_profile_bound() {
+    use remote_task_runner::setup::preparation_probe::{PreparationProbe, ProbeUnknown};
+    let f = fx();
+    let cfg = f.cfg("boot-probe");
+    let fingerprint = cfg.profile_fingerprint.clone();
+    let agent = f.start_with(cfg);
+    for negotiated in [false, true] {
+        let (a, b) = duplex_pair(64 * 1024);
+        let server = tokio::spawn(serve_connection(
+            agent.clone(),
+            b,
+            f.cluster.clone(),
+            Arc::new(Semaphore::new(4)),
+        ));
+        let mut config = client_cfg(&f.cluster);
+        if !negotiated {
+            config.features.retain(|v| v != PREPARATION_PROBE_FEATURE);
+        }
+        let connection = connect(a, config).await.unwrap();
+        let calls = f.host.calls();
+        let ledger_epoch = f.store().max_coordinator_epoch().unwrap();
+        let launches = f.store().count_launches().unwrap();
+        let epoch = agent.agent_epoch();
+        for (stale, oversized) in [(false, false), (true, false), (false, true)] {
+            let setup = oversized.then(|| SetupSpec {
+                steps: vec![
+                    SetupStep {
+                        id: "private-id".into(),
+                        dir: String::new(),
+                        run: "private command must never run".into(),
+                        shell: None,
+                        env: BTreeMap::new(),
+                        unresolved_env: vec![]
+                    };
+                    65
+                ],
+                toolchain: vec![],
+                scope: ReuseScope::Persistent,
+                freshness_secs: None,
+                secrets: vec![],
+                no_cache: false,
+                step_timeout_ms: None,
+            });
+            let request = Request::PreparationProbe(PreparationProbeRequest {
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+                expected_profile_fingerprint: if stale {
+                    Digest::of_bytes(b"stale")
+                } else {
+                    fingerprint.clone()
+                },
+                manifest_digest: Digest::of_bytes(b"manifest"),
+                source_id: SourceId::generate(),
+                run_id: RunId::generate(),
+                setup,
+                frozen: None,
+                in_place: true,
+            });
+            let answer = call(&connection.client, request).await;
+            if !negotiated {
+                assert_eq!(answer.unwrap_err().code, ErrorCode::ProtocolIncompatible);
+            } else {
+                let Response::PreparationProbe(answer) = answer.unwrap() else {
+                    panic!()
+                };
+                assert_eq!(answer.worker_id, f.cfg("boot-probe").worker_id);
+                assert_eq!(answer.worker_boot_id, f.cfg("boot-probe").boot_id);
+                assert_eq!(answer.agent_epoch, epoch);
+                assert_eq!(
+                    answer.probe,
+                    PreparationProbe::Unknown(if stale {
+                        ProbeUnknown::InvalidBinding
+                    } else if oversized {
+                        ProbeUnknown::BudgetExceeded
+                    } else {
+                        ProbeUnknown::MissingContext
+                    })
+                );
+            }
+            assert!(f.store().list_nonterminal().unwrap().is_empty());
+            assert_eq!(f.store().max_coordinator_epoch().unwrap(), ledger_epoch);
+            assert_eq!(f.store().count_launches().unwrap(), launches);
+            assert_eq!(f.host.calls(), calls);
+        }
+        server.abort();
+        let _ = server.await;
+    }
     agent.shutdown();
 }

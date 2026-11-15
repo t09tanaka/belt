@@ -245,10 +245,11 @@ pub enum Operation {
     EnvSync,
     ForecastCommand,
     ResolveToolchains,
+    PreparationProbe,
 }
 
 impl Operation {
-    pub const ALL: [Operation; 21] = [
+    pub const ALL: [Operation; 22] = [
         Operation::Hello,
         Operation::Inspect,
         Operation::Forecast,
@@ -270,6 +271,7 @@ impl Operation {
         Operation::EnvSync,
         Operation::ForecastCommand,
         Operation::ResolveToolchains,
+        Operation::PreparationProbe,
     ];
 
     pub fn idempotency(self) -> Idempotency {
@@ -294,7 +296,8 @@ impl Operation {
             | Operation::BlobGet
             | Operation::BlobVerify
             | Operation::EnvReport
-            | Operation::ResolveToolchains => Idempotency::ReadOnly,
+            | Operation::ResolveToolchains
+            | Operation::PreparationProbe => Idempotency::ReadOnly,
         }
     }
 }
@@ -377,12 +380,17 @@ pub struct HelloResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_observations:
+        Option<crate::setup::observation_transport::ObservationPageRequest>,
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_observations: Option<crate::setup::observation_transport::ObservationPage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     pub schema_version: SchemaVersion,
@@ -1691,6 +1699,40 @@ pub struct ResolveToolchainsResponse {
     pub bundle: crate::toolchain::contract::FrozenBundle,
 }
 
+/// Negotiated, process-free preparation identity queries.
+pub const PREPARATION_PROBE_FEATURE: &str = "preparation_probe_v1";
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationProbeRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub expected_profile_fingerprint: Digest,
+    pub manifest_digest: Digest,
+    pub source_id: SourceId,
+    pub run_id: RunId,
+    pub setup: Option<SetupSpec>,
+    pub frozen: Option<Box<crate::toolchain::contract::FrozenBundle>>,
+    pub in_place: bool,
+}
+impl std::fmt::Debug for PreparationProbeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparationProbeRequest")
+            .field("schema_version", &self.schema_version)
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationProbeResponse {
+    pub schema_version: SchemaVersion,
+    pub worker_id: WorkerId,
+    pub worker_boot_id: WorkerBootId,
+    pub agent_epoch: AgentEpoch,
+    pub probe: crate::setup::preparation_probe::PreparationProbe,
+}
+
 operations! {
     Hello(HelloRequest, HelloResponse),
     Inspect(InspectRequest, InspectResponse),
@@ -1713,6 +1755,7 @@ operations! {
     EnvReport(EnvReportRequest, EnvReportResponse),
     EnvSync(EnvSyncRequest, EnvSyncResponse),
     ResolveToolchains(ResolveToolchainsRequest, ResolveToolchainsResponse),
+    PreparationProbe(PreparationProbeRequest, PreparationProbeResponse),
 }
 
 /// An error reply.
@@ -1992,6 +2035,7 @@ mod tests {
                 features: vec!["secret_bundle".into()],
             }),
             Request::Inspect(InspectRequest {
+                preparation_observations: None,
                 schema_version: SV,
                 request_id: rid(),
             }),
@@ -2152,7 +2196,22 @@ mod tests {
             bundle: frozen_bundle(),
             requirements: Default::default(),
         }));
+        out.push(Request::PreparationProbe(preparation_probe_request()));
         out
+    }
+
+    fn preparation_probe_request() -> PreparationProbeRequest {
+        PreparationProbeRequest {
+            schema_version: SV,
+            request_id: rid(),
+            expected_profile_fingerprint: Digest::of_bytes(b"profile"),
+            manifest_digest: Digest::of_bytes(b"manifest"),
+            source_id: SourceId::generate(),
+            run_id: RunId::generate(),
+            setup: None,
+            frozen: None,
+            in_place: true,
+        }
     }
 
     fn responses() -> Vec<Response> {
@@ -2187,6 +2246,7 @@ mod tests {
                 coordinator_epoch: CoordinatorEpoch(3),
             }),
             Response::Inspect(InspectResponse {
+                preparation_observations: None,
                 capabilities: None,
                 schema_version: SV,
                 worker_id: worker(),
@@ -2341,7 +2401,86 @@ mod tests {
             schema_version: SV,
             bundle: frozen_bundle(),
         }));
+        out.push(Response::PreparationProbe(PreparationProbeResponse {
+            schema_version: SV,
+            worker_id: worker(),
+            worker_boot_id: boot(),
+            agent_epoch: AgentEpoch(1),
+            probe: crate::setup::preparation_probe::PreparationProbe::NoManagedPreparation,
+        }));
         out
+    }
+
+    #[test]
+    fn preparation_probe_debug_redacts_and_states_roundtrip() {
+        use crate::setup::preparation_probe::*;
+        let mut query = preparation_probe_request();
+        query.setup = Some(setup_spec());
+        query.frozen = Some(Box::new(frozen_bundle()));
+        let request = Request::PreparationProbe(query);
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+        let debug = format!("{request:?}");
+        assert!(debug.contains("PreparationProbeRequest"));
+        assert!(!debug.contains("manifest_digest"));
+        assert!(!debug.contains("setup"));
+        assert!(!debug.contains("frozen"));
+        let reasons = [
+            ProbeUnknown::MissingContext,
+            ProbeUnknown::InvalidBinding,
+            ProbeUnknown::ActivationUnverified,
+            ProbeUnknown::ProfileUnavailable,
+            ProbeUnknown::UnsafePath,
+            ProbeUnknown::IoUnavailable,
+            ProbeUnknown::BudgetExceeded,
+            ProbeUnknown::OwnershipChanged,
+            ProbeUnknown::Barrier,
+        ];
+        for state in [
+            PreparationProbeState::ConcretePlan,
+            PreparationProbeState::Active {
+                builder_id: BuilderId::generate(),
+                builder_attempt_id: AttemptId::generate(),
+            },
+            PreparationProbeState::Unknown(ProbeUnknown::Barrier),
+        ] {
+            let entry = PreparationProbeEntry {
+                kind: crate::setup::observation::PreparationKind::ToolInstall,
+                key: Some(Digest::of_bytes(b"opaque actual key")),
+                state,
+            };
+            let probe = PreparationProbe::Entries {
+                owner_generation: BuilderId::generate(),
+                entries: vec![entry.clone(); 16],
+            };
+            assert_eq!(
+                serde_json::from_value::<PreparationProbe>(serde_json::to_value(&probe).unwrap())
+                    .unwrap(),
+                probe
+            );
+            let mut invalid = serde_json::to_value(&probe).unwrap();
+            invalid["Entries"]["entries"] = serde_json::json!({});
+            assert!(serde_json::from_value::<PreparationProbe>(invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("at most 16 preparation entries"));
+            let mut value = serde_json::to_value(&probe).unwrap();
+            value["Entries"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::to_value(entry).unwrap());
+            assert!(serde_json::from_value::<PreparationProbe>(value).is_err());
+        }
+        for reason in reasons {
+            let probe = PreparationProbe::Unknown(reason);
+            assert_eq!(
+                serde_json::from_value::<PreparationProbe>(serde_json::to_value(&probe).unwrap())
+                    .unwrap(),
+                probe
+            );
+        }
     }
 
     #[test]
@@ -2367,6 +2506,17 @@ mod tests {
             let back: Request = serde_json::from_value(v).unwrap();
             assert_eq!(back, req);
         }
+    }
+
+    #[test]
+    fn legacy_inspect_omits_observation_fields_and_decodes_them_as_unknown() {
+        let response = responses().remove(1);
+        let legacy = serde_json::to_value(&response).unwrap();
+        assert!(legacy.get("preparation_observations").is_none());
+        let decoded = serde_json::from_value::<Response>(legacy).unwrap();
+        assert!(
+            matches!(decoded, Response::Inspect(ref inspect) if inspect.preparation_observations.is_none())
+        );
     }
 
     #[test]
@@ -2498,6 +2648,7 @@ mod tests {
             (Forecast, ReadOnly),
             (ForecastCommand, ReadOnly),
             (ResolveToolchains, ReadOnly),
+            (PreparationProbe, ReadOnly),
             (SubmitAttempt, AttemptAndPayload),
             (GetAttempt, ReadOnly),
             (ListAttempts, ReadOnly),
@@ -2589,10 +2740,12 @@ mod tests {
     #[test]
     fn content_hash_ignores_request_id_only() {
         let a = Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SV,
             request_id: rid(),
         });
         let b = Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SV,
             request_id: rid(),
         });

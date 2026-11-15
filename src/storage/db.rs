@@ -56,6 +56,41 @@ impl Db {
         &self.path
     }
 
+    /// Validate the identity of SQLite's own live main-file descriptor. Never
+    /// open/close a validation descriptor on a live SQLite inode: on POSIX that
+    /// would release this process's unrelated record locks on that inode.
+    pub(crate) fn check_current_file(&self) -> Result<()> {
+        let path = (*self.path).clone();
+        self.call(move |connection| {
+            use std::os::unix::fs::MetadataExt;
+            let before = std::fs::symlink_metadata(&path)?;
+            let mut moved: std::ffi::c_int = -1;
+            // SAFETY: this closure runs on the connection's owning actor;
+            // handle stays live for the call, main is a static NUL-terminated
+            // database name, and moved is an aligned valid writable c_int.
+            let rc = unsafe {
+                rusqlite::ffi::sqlite3_file_control(
+                    connection.handle(),
+                    c"main".as_ptr(),
+                    rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+                    std::ptr::from_mut(&mut moved).cast(),
+                )
+            };
+            let after = std::fs::symlink_metadata(&path)?;
+            if rc != rusqlite::ffi::SQLITE_OK
+                || moved != 0
+                || !before.is_file()
+                || !after.is_file()
+                || (before.dev(), before.ino()) != (after.dev(), after.ino())
+            {
+                return Err(StorageError::Invalid(
+                    "coordinator database moved or identity unknown".into(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
     /// Run `f` on the database thread and wait for its result.
     pub fn call<T, F>(&self, f: F) -> Result<T>
     where

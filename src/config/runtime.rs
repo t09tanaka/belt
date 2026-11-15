@@ -98,10 +98,18 @@ impl ResolvedConfig {
         };
         coordinator.scheduler().set_priority(id, priority);
         let timeout = Duration::from_millis(settings.coordinator.worker_budget_ms);
-        let link: Arc<dyn crate::coordinator::WorkerLink> = Arc::new(match gate {
-            Some(gate) => ClientLink::gated(connected.client, timeout, gate),
-            None => ClientLink::new(connected.client, timeout),
-        });
+        let observations = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|feature| feature == crate::setup::observation_transport::FEATURE);
+        let link: Arc<dyn crate::coordinator::WorkerLink> = Arc::new(
+            (match gate {
+                Some(gate) => ClientLink::gated(connected.client, timeout, gate),
+                None => ClientLink::new(connected.client, timeout),
+            })
+            .with_preparation_observations(observations),
+        );
         coordinator.attach(id.clone(), link.clone()).await;
         Ok(link)
     }

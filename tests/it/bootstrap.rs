@@ -1744,7 +1744,7 @@ async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
     let source = sources.source_of_run(&run).unwrap().unwrap();
     let manifest = sources.manifest(&source).unwrap().unwrap();
     let blob = &manifest.object_manifest.entries[0].hash;
-    std::fs::remove_file(sources.object_store().object_path(blob)).unwrap();
+    std::fs::remove_file(sources.object_store().unwrap().object_path(blob)).unwrap();
     let rejected = client
         .request(Operation::Retry {
             target: Target::Run(run.clone()),
@@ -3807,4 +3807,414 @@ bin="$NODENV_ROOT/versions/$version/bin"
         .unwrap();
     assert_eq!(native.stdout, b"v22.0.0\n");
     shutdown(&load(&spec)).await;
+}
+
+#[test]
+fn ci_plan_public_cli_frozen_worktree_commit_directory_and_private_failures() {
+    use remote_task_runner::service::{context::Context, planning};
+    let (root, spec) = fixture();
+    let config = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
+        .unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
+    let workflow = repo.join(".github/workflows/ci.yml");
+    let old = "on: push\njobs:\n  old_job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo PRIVATE_SCRIPT_SENTINEL\n";
+    let dirty = old.replace("old_job", "dirty_job");
+    std::fs::write(&workflow, old).unwrap();
+    std::fs::write(repo.join(".gitignore"), "private.env\n").unwrap();
+    std::fs::write(
+        repo.join(".remote-task-runner.toml"),
+        "schema_version=1\n[source]\nsecret_files=[{glob='private.env',required=true}]\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "first"]);
+    let commit = git(&["rev-parse", "HEAD"]).trim().to_string();
+    std::fs::write(&workflow, old.replace("old_job", "head_job")).unwrap();
+    git(&["commit", "-qam", "second"]);
+    std::fs::write(&workflow, &dirty).unwrap();
+    std::fs::write(repo.join("private.env"), "TOKEN=PRIVATE_SECRET_SENTINEL").unwrap();
+    let epoch = {
+        let store = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+        store.epoch()
+    };
+    let initial_events: i64 = rusqlite::Connection::open(spec.state_dir.join("coordinator.db"))
+        .unwrap()
+        .query_row("SELECT count(*) FROM event", [], |row| row.get(0))
+        .unwrap();
+    let call = |dir: &std::path::Path, args: &[&str]| {
+        let output = Command::new(&spec.executable)
+            .args(args)
+            .current_dir(dir)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        for hidden in [
+            "PRIVATE_SCRIPT_SENTINEL",
+            "PRIVATE_SECRET_SENTINEL",
+            root.path().to_str().unwrap(),
+        ] {
+            assert!(!text.contains(hidden), "{text}");
+        }
+        serde_json::from_str::<serde_json::Value>(&text).unwrap()
+    };
+    let value = call(&repo, &["--json", "ci", "plan"]);
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["result"]["nodes"][0]["job"], "dirty_job");
+    let value = call(
+        &repo,
+        &[
+            "--json",
+            "ci",
+            "--snapshot",
+            "commit",
+            "--ref",
+            &commit,
+            "plan",
+        ],
+    );
+    assert_eq!(value["ok"], true, "{value}");
+    assert_eq!(value["result"]["nodes"][0]["job"], "old_job");
+    assert_eq!(std::fs::read_to_string(&workflow).unwrap(), dirty);
+    for args in [
+        vec!["--json", "ci", "--snapshot", "commit", "plan"],
+        vec!["--json", "ci", "--snapshot", "unknown", "plan"],
+        vec![
+            "--json",
+            "ci",
+            "--snapshot",
+            "worktree",
+            "--ref",
+            "HEAD",
+            "plan",
+        ],
+    ] {
+        assert_eq!(call(&repo, &args)["ok"], false);
+    }
+    let context = Context::load(spec.env.clone(), repo.clone(), spec.clone()).unwrap();
+    let prepared = planning::prepare(context, None).unwrap();
+    let digest = prepared.plan().frozen().digest.clone();
+    assert_eq!(
+        prepared
+            .source_store()
+            .source_of_run(prepared.run_id())
+            .unwrap()
+            .as_deref(),
+        Some(prepared.manifest().source_id.as_str())
+    );
+    let bindings = std::fs::read_dir(prepared.source_store().root().join("runs"))
+        .unwrap()
+        .filter(|e| {
+            !e.as_ref()
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".lock")
+        })
+        .count();
+    assert_eq!(bindings, 1, "prepare must bind exactly one capture");
+    let pinned = prepared.plan().frozen().source.pinned.as_ref().unwrap();
+    assert_eq!(pinned.manifest_digest, prepared.manifest().manifest_digest);
+    assert_eq!(
+        prepared.plan().frozen().source.source_id,
+        prepared.manifest().source_id
+    );
+
+    assert_eq!(prepared.manifest().secret_files.len(), 1);
+    assert!(!prepared
+        .manifest()
+        .object_manifest
+        .entries
+        .iter()
+        .any(|e| e.path.0 == b"private.env"));
+    let draft = prepared.source_store().root().parent().unwrap().to_owned();
+    std::fs::write(&workflow, old.replace("old_job", "after_prepare")).unwrap();
+    assert_eq!(prepared.plan().frozen().digest, digest);
+    assert_eq!(prepared.plan().summary().nodes[0].job, "dirty_job");
+    prepared.close().unwrap();
+    assert!(!draft.exists());
+    let directory = root.path().join("directory");
+    std::fs::create_dir_all(directory.join(".github/workflows")).unwrap();
+    std::fs::write(directory.join(".github/workflows/ci.yml"), old).unwrap();
+    assert_eq!(call(&directory, &["--json", "ci", "plan"])["ok"], true);
+    std::fs::write(
+        directory.join(".github/workflows/ci.yml"),
+        "on:\n  push:\n    paths: ['PRIVATE_FILTER_SENTINEL']\njobs: {}\n",
+    )
+    .unwrap();
+    let failed = call(&directory, &["--json", "ci", "plan"]);
+    assert_eq!(failed["ok"], false);
+    assert!(!failed.to_string().contains("PRIVATE_FILTER_SENTINEL"));
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    let database = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
+    for table in ["run", "task", "attempt", "event"] {
+        let count: i64 = database
+            .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            count,
+            if table == "event" { initial_events } else { 0 },
+            "planning changed {table}"
+        );
+    }
+    let names: Vec<_> = std::fs::read_dir(&spec.state_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    assert!(
+        !names
+            .iter()
+            .any(|n| n.starts_with("ci-plan-") || n.ends_with(".sock")),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn ci_plan_captured_rtr_workflow_directories_never_use_live_config() {
+    use remote_task_runner::{
+        config::{model::SourceMode, Origin, Overlay},
+        service::{context::Context, planning},
+    };
+    let (root, spec) = fixture();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(repo.join("old-ci")).unwrap();
+    let yaml = "on: push\njobs:\n  old_job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo safe\n";
+    std::fs::write(repo.join("old-ci/ci.yml"), yaml).unwrap();
+    let config = repo.join(".remote-task-runner.toml");
+    std::fs::write(
+        &config,
+        "schema_version=1\n[ci]\nworkflows_dirs=['old-ci']\n",
+    )
+    .unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "old"]);
+    let old = git(&["rev-parse", "HEAD"]).trim().to_owned();
+    std::fs::create_dir(repo.join("live-ci")).unwrap();
+    std::fs::write(
+        repo.join("live-ci/ci.yml"),
+        yaml.replace("old_job", "live_job"),
+    )
+    .unwrap();
+    std::fs::write(
+        &config,
+        "schema_version=1\n[ci]\nworkflows_dirs=['live-ci']\n",
+    )
+    .unwrap();
+    let context = Context::load(spec.env.clone(), repo.clone(), spec.clone()).unwrap();
+    let prepared = planning::prepare(context, None).unwrap();
+    assert_eq!(prepared.plan().summary().nodes[0].job, "live_job");
+    assert_eq!(
+        prepared.plan().frozen().config.workflow_dirs,
+        vec!["live-ci"]
+    );
+    std::fs::write(
+        &config,
+        "schema_version=1\n[ci]\nworkflows_dirs=['missing-private-directory']\n",
+    )
+    .unwrap();
+    assert_eq!(prepared.plan().summary().nodes[0].job, "live_job");
+    prepared.close().unwrap();
+    let context = Context::load_with_overlay(
+        spec.env.clone(),
+        repo.clone(),
+        spec.clone(),
+        &Overlay {
+            source_mode: Some(SourceMode::Commit),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(context.config.source_mode.origin, Origin::Cli);
+    let prepared = planning::prepare(context, Some(&old)).unwrap();
+    assert_eq!(prepared.plan().summary().nodes[0].job, "old_job");
+    assert_eq!(
+        prepared.plan().frozen().config.workflow_dirs,
+        vec!["old-ci"]
+    );
+    prepared.close().unwrap();
+    let directory = root.path().join("plain");
+    std::fs::create_dir_all(directory.join("custom-ci")).unwrap();
+    std::fs::write(
+        directory.join("custom-ci/ci.yml"),
+        yaml.replace("old_job", "directory_job"),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join(".remote-task-runner.toml"),
+        "schema_version=1\n[ci]\nworkflows_dirs=['custom-ci']\n",
+    )
+    .unwrap();
+    let context = Context::load(spec.env.clone(), directory.clone(), spec.clone()).unwrap();
+    let prepared = planning::prepare(context, None).unwrap();
+    assert_eq!(prepared.plan().summary().nodes[0].job, "directory_job");
+    assert_eq!(prepared.plan().frozen().source.execution_commit, None);
+    assert_eq!(prepared.plan().frozen().source.base, None);
+    assert_eq!(
+        prepared
+            .plan()
+            .frozen()
+            .source
+            .pinned
+            .as_ref()
+            .unwrap()
+            .kind,
+        local_ci::source::SourceKind::Directory
+    );
+
+    assert_eq!(
+        prepared.plan().frozen().config.workflow_dirs,
+        vec!["custom-ci"]
+    );
+    let draft = prepared.source_store().root().parent().unwrap().to_owned();
+    drop(prepared);
+    assert!(!draft.exists());
+    let context = Context::load(spec.env.clone(), directory.clone(), spec).unwrap();
+    std::fs::write(
+        directory.join(".local-ci.toml"),
+        "workflows-dirs=['other-ci']\n",
+    )
+    .unwrap();
+    let error = planning::prepare(context, None).err().unwrap();
+    assert_eq!(error.message, "captured planning configuration is invalid");
+}
+
+#[test]
+fn ci_plan_submodules_and_distinct_capture_bindings_keep_exact_identity() {
+    use remote_task_runner::service::{context::Context, planning};
+    let (root, spec) = fixture();
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "fixture git failed");
+    };
+    let module = root.path().join("module");
+    let project = root.path().join("project");
+    for dir in [&module, &project] {
+        std::fs::create_dir_all(dir).unwrap();
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.name", "Fixture"]);
+        git(dir, &["config", "user.email", "fixture@example.invalid"]);
+        std::fs::write(dir.join("tracked"), "base").unwrap();
+        git(dir, &["add", "."]);
+        git(dir, &["commit", "-qm", "initial"]);
+    }
+    git(
+        &project,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            module.to_str().unwrap(),
+            "module",
+        ],
+    );
+    std::fs::create_dir_all(project.join(".github/workflows")).unwrap();
+    let workflow = project.join(".github/workflows/ci.yml");
+    std::fs::write(&workflow, "on: push\njobs:\n  first:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo private\n").unwrap();
+    git(&project, &["add", "."]);
+    git(&project, &["commit", "-qm", "workflow and submodule"]);
+    std::fs::write(project.join("module/tracked"), "dirty module").unwrap();
+    let context = Context::load(spec.env.clone(), project.clone(), spec.clone()).unwrap();
+    let first = planning::prepare(context, None).unwrap();
+    assert_eq!(first.manifest().submodules.len(), 1);
+    assert!(first.manifest().submodules[0].dirty);
+    let nested = first.manifest().submodules[0].source_id.as_ref().unwrap();
+    assert!(first.source_store().manifest(nested).unwrap().is_some());
+    std::fs::write(&workflow, "on: push\njobs:\n  second:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo private\n").unwrap();
+    let second = planning::prepare(
+        Context::load(spec.env.clone(), project, spec.clone()).unwrap(),
+        None,
+    )
+    .unwrap();
+    assert_ne!(first.manifest().source_id, second.manifest().source_id);
+    for prepared in [&first, &second] {
+        assert_eq!(
+            prepared
+                .source_store()
+                .source_of_run(prepared.run_id())
+                .unwrap()
+                .as_ref(),
+            Some(&prepared.manifest().source_id)
+        );
+        assert_eq!(
+            prepared
+                .plan()
+                .frozen()
+                .source
+                .pinned
+                .as_ref()
+                .unwrap()
+                .manifest_digest,
+            prepared.manifest().manifest_digest
+        );
+    }
+    assert_eq!(first.plan().summary().nodes[0].job, "first");
+    assert_eq!(second.plan().summary().nodes[0].job, "second");
+    first.close().unwrap();
+    second.close().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(module.join("tracked")).unwrap(),
+        "base"
+    );
+    assert!(!spec.state_dir.join("coordinator.db").exists());
 }

@@ -88,6 +88,16 @@ pub(super) async fn sources(
                 Ok(guard) => Arc::new(guard),
                 Err(_) => continue,
             };
+            if source_guard.ensure_run_available(&input.run_id).is_err() {
+                gate.fail_preference(&input.run_id);
+                continue;
+            }
+            let Some(ci_id) = crate::source::classify::ci_id_of(&input.source_id) else {
+                continue;
+            };
+            if source_guard.ensure_source_available(&ci_id).is_err() {
+                continue;
+            }
             // Verify first so legacy submissions with preseeded worker inputs
             // recover after restart without requiring a parent capture manifest.
             let verified = super::super::forward::verify(&worker, &source, &mut input_stop)

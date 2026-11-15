@@ -29,18 +29,92 @@ impl CoordinatorStore {
     pub fn input_retention_end(&self, run: &RunId, source: &SourceId) -> Result<Option<u64>> {
         let run = run.to_string();
         let source = source.to_string();
+        self.db
+            .call(move |c| input_retention_end_on(c, &run, &source))
+    }
+
+    /// Source EX must already be held. Require this live writable owner and a
+    /// physical source directory belonging to its configured state directory.
+    pub(crate) fn check_input_store(
+        &self,
+        source: &std::path::Path,
+        held: &std::fs::File,
+    ) -> anyhow::Result<String> {
+        use std::os::unix::fs::MetadataExt;
+        self._lock
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("read-only input retention owner"))?
+            .check_current()?;
+        let state: std::fs::File = rustix::fs::open(
+            &self.state_dir,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::DIRECTORY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?
+        .into();
+        let physical =
+            rustix::fs::statat(&state, "sources", rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+        let actual = held.metadata()?;
+        // st_dev's integer type differs between macOS and Linux.
+        #[allow(clippy::unnecessary_cast)]
+        let physical_device = physical.st_dev as u64;
+        anyhow::ensure!(
+            rustix::fs::FileType::from_raw_mode(physical.st_mode)
+                == rustix::fs::FileType::Directory
+                && (physical_device, physical.st_ino) == (actual.dev(), actual.ino()),
+            "foreign coordinator source store"
+        );
+        let named = std::fs::symlink_metadata(source)?;
+        anyhow::ensure!(
+            (named.dev(), named.ino()) == (actual.dev(), actual.ino()) && named.is_dir(),
+            "source store changed"
+        );
+        self.db.check_current_file()?;
+        let db = rustix::fs::statat(
+            &state,
+            "coordinator.db",
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        anyhow::ensure!(
+            rustix::fs::FileType::from_raw_mode(db.st_mode) == rustix::fs::FileType::RegularFile
+                && db.st_nlink == 1
+                && db.st_uid == rustix::process::geteuid().as_raw(),
+            "unsafe coordinator input proof database"
+        );
+        let state = state.metadata()?;
+        Ok(format!(
+            "{}:{}:{}:{}:{}",
+            self.coordinator_id,
+            state.dev(),
+            state.ino(),
+            db.st_dev,
+            db.st_ino
+        ))
+    }
+
+    /// Exact run/source/digest proof. The generation history is scanned, not a
+    /// constant-time page; typed termination validation never collects that
+    /// history into a root-sized Vec. Source EX prevents retry admission here.
+    pub(crate) fn input_retention_binding(
+        &self,
+        run: &RunId,
+        source: &SourceId,
+        digest: &str,
+    ) -> Result<Option<(u64, String)>> {
+        let (run, source, digest) = (run.to_string(), source.to_string(), digest.to_owned());
         self.db.call(move |c| {
-            let ended:Option<i64>=c.query_row("SELECT CASE WHEN
-              EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND source_id=?2)
-              AND EXISTS(SELECT 1 FROM task WHERE run_id=?1)
-              AND NOT EXISTS(SELECT 1 FROM task t WHERE t.run_id=?1 AND
-                (NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)
-                 OR (t.cancel_requested_at_ms IS NULL AND NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.generation>=t.min_generation))))
-              AND NOT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id)
-                WHERE t.run_id=?1 AND (a.observation<>'known' OR a.state<>'terminal' OR a.terminal_at_ms IS NULL OR a.termination_json IS NULL OR json_valid(a.termination_json)=0 OR x.closed_at_ms IS NULL OR x.verdict IS NULL OR x.verdict NOT IN ('complete','required_missing','gave_up')))
-              THEN (SELECT max(max(coalesce(a.terminal_at_ms,0),coalesce(x.closed_at_ms,0))) FROM task t JOIN attempt a USING(task_id) JOIN collection x USING(attempt_id) WHERE t.run_id=?1)
-              ELSE NULL END",params![run,source],|r|r.get(0))?;
-            ended.map(to_u64).transpose()
+            let Some(ended)=input_retention_end_on(c,&run,&source)? else {return Ok(None)};
+            let exact:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM run r JOIN source_ref s USING(source_id) WHERE r.run_id=?1 AND r.source_id=?2 AND s.manifest_digest=?3)",params![run,source,digest],|r|r.get(0))?;
+            if !exact{return Ok(None)}
+            let mut statement=c.prepare("SELECT a.termination_json FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1")?;
+            let mut rows=statement.query([&run])?;
+            while let Some(row)=rows.next()? {
+                let termination:String=row.get(0)?;
+                if serde_json::from_str::<crate::state::Termination>(&termination).is_err(){return Ok(None)}
+            }
+            Ok(Some((ended,format!("{run}:{source}:{digest}"))))
         })
     }
 
@@ -180,4 +254,19 @@ impl CoordinatorStore {
             Ok(())
         })
     }
+}
+
+/// Caller holds source EX; history scan is deliberate and not a bounded-ref claim.
+fn input_retention_end_on(c: &Connection, run: &str, source: &str) -> Result<Option<u64>> {
+    let ended:Option<i64>=c.query_row("SELECT CASE WHEN
+              EXISTS(SELECT 1 FROM run WHERE run_id=?1 AND source_id=?2)
+              AND EXISTS(SELECT 1 FROM task WHERE run_id=?1)
+              AND NOT EXISTS(SELECT 1 FROM task t WHERE t.run_id=?1 AND
+                (NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)
+                 OR (t.cancel_requested_at_ms IS NULL AND EXISTS(SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL) AND NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal')))))
+              AND NOT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) LEFT JOIN collection x USING(attempt_id)
+                WHERE t.run_id=?1 AND (a.observation<>'known' OR a.state<>'terminal' OR a.terminal_at_ms IS NULL OR a.termination_json IS NULL OR json_valid(a.termination_json)=0 OR x.closed_at_ms IS NULL OR x.verdict IS NULL OR x.verdict NOT IN ('complete','required_missing','gave_up')))
+              THEN (SELECT max(max(coalesce(a.terminal_at_ms,0),coalesce(x.closed_at_ms,0))) FROM task t JOIN attempt a USING(task_id) JOIN collection x USING(attempt_id) WHERE t.run_id=?1)
+              ELSE NULL END",params![run,source],|r|r.get(0))?;
+    ended.map(to_u64).transpose()
 }

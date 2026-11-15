@@ -905,9 +905,9 @@ checksum = "4744e383959f0db86ede514b809b1c53251889093803c05267acc7d4e7030d70"
 
 [[package]]
 name = "local-ci"
-version = "0.11.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2cc2e1adf6c50c3f7e05417f3fcf0ef1f0c52124f7952bfe4ab06f75274b064"
+checksum = "be066324bf634896797aeada8a1153413b86ff40049a71db3a7e0145c51b9dee"
 dependencies = [
  "anyhow",
  "clap",
@@ -921,6 +921,7 @@ dependencies = [
  "serde_yaml",
  "sha2",
  "shlex 1.3.0",
+ "tempfile",
  "toml 1.2.1+spec-1.1.0",
 ]
 

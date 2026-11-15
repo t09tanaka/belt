@@ -1445,6 +1445,23 @@ impl Agent {
 
         Ok(bundle)
     }
+    /// Read-only preparation identity; never readiness or forecast evidence.
+    pub(crate) fn probe_preparation(
+        &self,
+        input: crate::setup::preparation_probe::PreparationProbeInput<'_>,
+    ) -> crate::setup::preparation_probe::PreparationProbe {
+        use crate::setup::preparation_probe::{PreparationProbe, ProbeUnknown};
+        let Some(owner) = self.host.setup_owner() else {
+            return PreparationProbe::Unknown(ProbeUnknown::MissingContext);
+        };
+        owner.probe_preparation(
+            input,
+            self.cfg.capability_profile.as_deref(),
+            Some(&self.cfg.profile_fingerprint),
+            self.toolchains.as_ref(),
+        )
+    }
+
     fn toolchain_requests(
         &self,
         bundle: &crate::toolchain::contract::FrozenBundle,
@@ -1986,7 +2003,7 @@ impl Agent {
             .map_err(|e| ApiError::new(ErrorCode::ProtocolIncompatible, e.to_string()))?;
         match request {
             Request::Hello(_) => Err(invalid("hello is the first request of a connection")),
-            Request::Inspect(_) => self.inspect().map(Response::Inspect),
+            Request::Inspect(r) => self.inspect(r).map(Response::Inspect),
             Request::SubmitAttempt(r) => self.submit(r).map(Response::SubmitAttempt),
             Request::GetAttempt(r) => {
                 let rec = self.known(&r.attempt_id)?;
@@ -2034,6 +2051,36 @@ impl Agent {
                     &r,
                 )
                 .map(Response::ForecastCommand)
+            }
+            Request::PreparationProbe(r) => {
+                use crate::setup::preparation_probe::{
+                    PreparationProbe, PreparationProbeInput, ProbeUnknown,
+                };
+                let probe = if r.expected_profile_fingerprint != self.cfg.profile_fingerprint {
+                    PreparationProbe::Unknown(ProbeUnknown::InvalidBinding)
+                } else {
+                    let input = PreparationProbeInput {
+                        manifest_digest: &r.manifest_digest,
+                        source_id: &r.source_id,
+                        run_id: &r.run_id,
+                        setup: &r.setup,
+                        frozen: &r.frozen,
+                        in_place: r.in_place,
+                    };
+                    match crate::setup::preparation_probe::input_budget(&input) {
+                        Ok(()) => self.probe_preparation(input),
+                        Err(reason) => PreparationProbe::Unknown(reason),
+                    }
+                };
+                Ok(Response::PreparationProbe(
+                    crate::wire::PreparationProbeResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        worker_id: self.cfg.worker_id.clone(),
+                        worker_boot_id: self.cfg.boot_id.clone(),
+                        agent_epoch: self.epoch,
+                        probe,
+                    },
+                ))
             }
             Request::ResolveToolchains(r) => {
                 let bundle = self.resolve_toolchains(r.bundle, &r.requirements)?;
@@ -2677,7 +2724,7 @@ impl Agent {
         }
         Ok(())
     }
-    fn inspect(&self) -> Result<InspectResponse, ApiError> {
+    fn inspect(&self, request: InspectRequest) -> Result<InspectResponse, ApiError> {
         let live = self.store.list_nonterminal().map_err(api)?;
         let (active, pending) = policy::load_counts(live.iter().map(|r| r.state));
         let policy_bytes = self
@@ -2690,6 +2737,10 @@ impl Agent {
             .map(|s| s.f_bavail.saturating_mul(s.f_frsize))
             .unwrap_or(0);
         Ok(InspectResponse {
+            preparation_observations: request
+                .preparation_observations
+                .as_ref()
+                .and_then(|request| self.host.preparation_observation_page(request)),
             capabilities: self.capabilities(),
             schema_version: SchemaVersion::CURRENT,
             worker_id: self.cfg.worker_id.clone(),

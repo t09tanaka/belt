@@ -22,3 +22,5 @@ pub mod toolchain;
 pub mod wire;
 pub mod worker;
 pub mod workspace;
+
+pub mod ci;

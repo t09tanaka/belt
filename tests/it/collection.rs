@@ -260,6 +260,7 @@ impl Worker {
         };
         match request {
             Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
+                preparation_observations: None,
                 capabilities: None,
                 schema_version: SchemaVersion::CURRENT,
                 worker_id: self.id.clone(),

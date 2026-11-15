@@ -1,5 +1,11 @@
 //! Parent-owned measurements. Lookup never opens storage or mutates history.
 //! Transport costs are deliberately distinct from worker runtime/profile history.
+mod preparation;
+pub use preparation::PreparationSample;
+enum Write {
+    Phase(Sample),
+    Preparation(Box<PreparationSample>),
+}
 use super::decide::Costs;
 use crate::ids::{AgentEpoch, Digest, WorkerBootId, WorkerId};
 use crate::platform;
@@ -13,7 +19,7 @@ use std::time::Duration;
 
 const CAP: usize = 4096;
 const QUEUE: usize = 32;
-const TTL_MS: u64 = 24 * 60 * 60 * 1000;
+pub(crate) const TTL_MS: u64 = 24 * 60 * 60 * 1000;
 
 /// Positive connection identity, never inferred from a worker name alone.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,7 +210,7 @@ pub struct MeasuredCosts {
     boot: Option<String>,
     policy: String,
     cache: Arc<RwLock<BTreeMap<String, Sample>>>,
-    writer: Mutex<Option<mpsc::SyncSender<Sample>>>,
+    writer: Mutex<Option<mpsc::SyncSender<Write>>>,
     join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 impl MeasuredCosts {
@@ -259,9 +265,10 @@ impl MeasuredCosts {
             CREATE TABLE IF NOT EXISTS costs(version INTEGER NOT NULL, key TEXT PRIMARY KEY, receipt TEXT NOT NULL UNIQUE, boot TEXT NOT NULL, observed INTEGER NOT NULL, duration INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS costs_age ON costs(observed,key);
             CREATE TABLE IF NOT EXISTS cost_eviction(id INTEGER PRIMARY KEY CHECK(id=1),boot TEXT NOT NULL,cutoff INTEGER NOT NULL);")?;
+        preparation::initialize(&db)?;
         let mut cache = BTreeMap::new();
         {
-            let mut stmt = db.prepare("SELECT key,receipt,boot,observed,duration FROM costs WHERE version=1 ORDER BY observed DESC LIMIT ?1")?;
+            let mut stmt = db.prepare("SELECT key,receipt,boot,observed,duration FROM costs WHERE version IN (1,2) ORDER BY observed DESC LIMIT ?1")?;
             for row in stmt.query_map([CAP as i64], |r| {
                 Ok(Sample {
                     key: r.get(0)?,
@@ -276,14 +283,24 @@ impl MeasuredCosts {
             }
         }
         let cache = Arc::new(RwLock::new(cache));
-        let (tx, rx) = mpsc::sync_channel::<Sample>(QUEUE);
+        let (tx, rx) = mpsc::sync_channel::<Write>(QUEUE);
         let view = cache.clone();
         let join = std::thread::Builder::new()
             .name("parent-cost-writer".into())
             .spawn(move || {
                 let mut db = db;
-                while let Ok(sample) = rx.recv() {
-                    if !record(&mut db, &sample).unwrap_or(false) {
+                while let Ok(message) = rx.recv() {
+                    let (sample, committed) = match message {
+                        Write::Phase(sample) => {
+                            let committed = record(&mut db, &sample).unwrap_or(false);
+                            (sample, committed)
+                        }
+                        Write::Preparation(value) => {
+                            let committed = preparation::record(&mut db, &value).unwrap_or(false);
+                            (value.sample, committed)
+                        }
+                    };
+                    if !committed {
                         continue;
                     }
                     let mut cache = view.write().unwrap_or_else(|e| e.into_inner());
@@ -323,7 +340,7 @@ impl MeasuredCosts {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
         {
-            let _ = tx.try_send(sample);
+            let _ = tx.try_send(Write::Phase(sample));
         }
     }
     fn lookup_at(&self, worker: &WorkerId, query: &CostQuery, now: u64) -> Costs {
@@ -467,13 +484,19 @@ fn record(db: &mut Connection, sample: &Sample) -> rusqlite::Result<bool> {
     // new phases, so evicted old receipts cannot be re-created by closure scans.
     let changed=tx.execute("INSERT INTO costs(version,key,receipt,boot,observed,duration) VALUES(1,?1,?2,?3,?4,?5) ON CONFLICT(key) DO UPDATE SET receipt=excluded.receipt,boot=excluded.boot,observed=excluded.observed,duration=excluded.duration WHERE costs.receipt != excluded.receipt AND (costs.boot != excluded.boot OR costs.observed < excluded.observed)",
         params![sample.key,sample.receipt,sample.boot,observed,duration])?;
-    let evicted:Option<i64>=tx.query_row("SELECT MAX(observed) FROM (SELECT boot,observed FROM costs ORDER BY (boot=?2) DESC,observed DESC,key LIMIT -1 OFFSET ?1) WHERE boot=?2",params![CAP as i64,sample.boot],|r|r.get(0))?;
-    if let Some(evicted) = evicted {
-        tx.execute("INSERT INTO cost_eviction(id,boot,cutoff) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET boot=excluded.boot,cutoff=CASE WHEN cost_eviction.boot=excluded.boot THEN MAX(cost_eviction.cutoff,excluded.cutoff) ELSE excluded.cutoff END",params![sample.boot,evicted])?;
-    }
-    tx.execute("DELETE FROM costs WHERE key IN (SELECT key FROM costs ORDER BY (boot=?2) DESC,observed DESC,key LIMIT -1 OFFSET ?1)",params![CAP as i64,sample.boot])?;
+    prune(&tx, &sample.boot)?;
     tx.commit()?;
     Ok(changed > 0)
+}
+fn prune(tx: &rusqlite::Transaction<'_>, boot: &str) -> rusqlite::Result<()> {
+    tx.execute("UPDATE preparation_namespaces SET cutoff=MAX(cutoff,coalesce((SELECT MAX(p.sequence) FROM preparation_receipts p JOIN costs c ON c.key=p.key WHERE p.namespace=preparation_namespaces.namespace AND c.key IN (SELECT key FROM costs ORDER BY (boot=?2) DESC,observed DESC,key LIMIT -1 OFFSET ?1)),0)) WHERE namespace IN (SELECT namespace FROM preparation_receipts WHERE key IN (SELECT key FROM costs ORDER BY (boot=?2) DESC,observed DESC,key LIMIT -1 OFFSET ?1))", params![CAP as i64,boot])?;
+    tx.execute("DELETE FROM preparation_receipts WHERE key IN (SELECT key FROM costs ORDER BY (boot=?2) DESC,observed DESC,key LIMIT -1 OFFSET ?1)",params![CAP as i64,boot])?;
+    let evicted:Option<i64>=tx.query_row("SELECT MAX(observed) FROM (SELECT boot,observed FROM costs ORDER BY (boot=?2) DESC,observed DESC,key LIMIT -1 OFFSET ?1) WHERE boot=?2",params![CAP as i64,boot],|r|r.get(0))?;
+    if let Some(evicted) = evicted {
+        tx.execute("INSERT INTO cost_eviction(id,boot,cutoff) VALUES(1,?1,?2) ON CONFLICT(id) DO UPDATE SET boot=excluded.boot,cutoff=CASE WHEN cost_eviction.boot=excluded.boot THEN MAX(cost_eviction.cutoff,excluded.cutoff) ELSE excluded.cutoff END",params![boot,evicted])?;
+    }
+    tx.execute("DELETE FROM costs WHERE key IN (SELECT key FROM costs ORDER BY (boot=?2) DESC,observed DESC,key LIMIT -1 OFFSET ?1)",params![CAP as i64,boot])?;
+    Ok(())
 }
 impl super::CostModel for MeasuredCosts {
     fn costs(&self, _: &WorkerId, _: &crate::storage::QueuedTask) -> Costs {
@@ -487,6 +510,9 @@ impl super::CostModel for MeasuredCosts {
     }
     fn record(&self, sample: Sample) {
         self.record(sample);
+    }
+    fn record_preparation(&self, sample: PreparationSample) {
+        self.record_preparation(sample);
     }
     fn drain(&self) {
         self.drain();

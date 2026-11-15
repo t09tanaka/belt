@@ -58,10 +58,11 @@ impl CoordinatorStore {
         expected: u64,
         request_id: String,
     ) -> Result<RetryPreparation> {
+        let source_guard = self.source_mutation_guard()?;
         if request_id.is_empty() || request_id.len() > 128 {
             return Err(StorageError::Invalid("invalid retry request ID".into()));
         }
-        self.db.call(move |c| {
+        let preparation=self.db.call(move |c| {
             let tx = c.unchecked_transaction()?;
             if let Some(receipt) = control_receipt(&tx, &target, expected, &request_id, "retry")? {
                 return Ok(RetryPreparation::Replay(receipt));
@@ -80,7 +81,21 @@ impl CoordinatorStore {
                 in_place,
                 fingerprint: scan.fingerprint,
             }))
-        })
+        })?;
+        if let RetryPreparation::Prepared(ref prepared) = preparation {
+            source_guard
+                .ensure_sdk_available()
+                .map_err(|e| StorageError::Invalid(e.to_string()))?;
+            source_guard
+                .ensure_run_available(&prepared.run_id)
+                .map_err(|e| StorageError::Invalid(e.to_string()))?;
+            if let Some(id) = crate::source::classify::ci_id_of(&prepared.source_id) {
+                source_guard
+                    .ensure_source_available(&id)
+                    .map_err(|e| StorageError::Invalid(e.to_string()))?;
+            }
+        }
+        Ok(preparation)
     }
 
     /// Filesystem validation has finished. Recheck everything before authorizing work.
@@ -104,6 +119,17 @@ impl CoordinatorStore {
     ) -> Result<RetryReceipt> {
         if source.root != self.state_dir.join("sources") {
             return Err(StorageError::Invalid("foreign source guard".into()));
+        }
+        source
+            .ensure_sdk_available()
+            .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        source
+            .ensure_run_available(&prepared.run_id)
+            .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        if let Some(id) = crate::source::classify::ci_id_of(&prepared.source_id) {
+            source
+                .ensure_source_available(&id)
+                .map_err(|e| StorageError::Invalid(e.to_string()))?;
         }
         let _source = source;
 

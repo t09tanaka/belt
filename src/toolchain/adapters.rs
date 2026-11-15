@@ -45,8 +45,49 @@ pub struct FileIdentity {
     pub size: u64,
     pub executable: bool,
 }
+/// Shared FD byte budget for both key-validation passes of one probe.
+/// Each file is capped at 1 MiB plus a sentinel, the whole probe at 8 MiB including a
+/// possible growth sentinel. Admission uses its existing per-file bound.
+pub(crate) struct IdentityReadBudget {
+    per_file: u64,
+    remaining: std::cell::Cell<u64>,
+}
+impl IdentityReadBudget {
+    pub(crate) fn probe() -> Self {
+        Self {
+            per_file: 1024 * 1024,
+            remaining: std::cell::Cell::new(8 * 1024 * 1024),
+        }
+    }
+    fn admission() -> Self {
+        Self {
+            per_file: MAX_TOTAL,
+            remaining: std::cell::Cell::new(u64::MAX),
+        }
+    }
+    fn capture(&self, path: &Path) -> Result<FileIdentity> {
+        let remaining = self.remaining.get();
+        if remaining == 0 {
+            return Err("identity_byte_budget");
+        }
+        // Reserve one byte even when metadata says that the file fits.
+        let identity = FileIdentity::capture_bounded(path, self.per_file.min(remaining - 1))?;
+        self.remaining.set(remaining - identity.size);
+        Ok(identity)
+    }
+}
 impl FileIdentity {
     pub fn capture(path: &Path) -> Result<Self> {
+        Self::capture_bounded(path, MAX_TOTAL)
+    }
+    fn capture_bounded(path: &Path, max_bytes: u64) -> Result<Self> {
+        Self::capture_bounded_checked(path, max_bytes, || {})
+    }
+    fn capture_bounded_checked(
+        path: &Path,
+        max_bytes: u64,
+        after_metadata: impl FnOnce(),
+    ) -> Result<Self> {
         if !path.is_absolute() {
             return Err("absolute_identity_required");
         }
@@ -56,19 +97,24 @@ impl FileIdentity {
             .open(path)
             .map_err(|_| "identity_open")?;
         let m = f.metadata().map_err(|_| "identity_metadata")?;
-        if !m.is_file() || m.len() > MAX_TOTAL {
+        if !m.is_file() || m.len() > max_bytes {
             return Err("identity_not_bounded_regular");
         }
+        after_metadata();
         let mut h = Sha256::new();
         let mut buf = [0u8; 65536];
         let mut size = 0;
         loop {
-            let n = f.read(&mut buf).map_err(|_| "identity_read")?;
+            // One sentinel byte detects growth; never read an unbounded chunk
+            // after a stale metadata size check.
+            let left = max_bytes.saturating_sub(size).saturating_add(1);
+            let length = buf.len().min(usize::try_from(left).unwrap_or(usize::MAX));
+            let n = f.read(&mut buf[..length]).map_err(|_| "identity_read")?;
             if n == 0 {
                 break;
             }
             size += n as u64;
-            if size > MAX_TOTAL {
+            if size > max_bytes {
                 return Err("identity_too_large");
             }
             h.update(&buf[..n]);
@@ -247,6 +293,26 @@ pub fn plan(
     state: &Path,
     host: &HostTools,
 ) -> Result<InstallPlan> {
+    plan_with_limit(
+        kind,
+        frozen,
+        tool,
+        evidence,
+        state,
+        host,
+        &IdentityReadBudget::admission(),
+    )
+}
+
+pub(crate) fn plan_with_limit(
+    kind: AdapterKind,
+    frozen: &FrozenToolchains,
+    tool: &ToolId,
+    evidence: &ResolutionEvidence,
+    state: &Path,
+    host: &HostTools,
+    budget: &IdentityReadBudget,
+) -> Result<InstallPlan> {
     frozen.validate()?;
     owned_dir(state)?;
     if !clean_absolute(state)
@@ -260,12 +326,16 @@ pub fn plan(
     {
         return Err("invalid_host_tools");
     }
-    host.manager.validate()?;
+    if budget.capture(&host.manager.path)? != host.manager {
+        return Err("tool_identity_drift");
+    }
     if !host.manager.executable {
         return Err("manager_not_executable");
     }
     for dep in &host.dependencies {
-        dep.validate()?;
+        if budget.capture(&dep.path)? != *dep {
+            return Err("tool_identity_drift");
+        }
     }
     let selected = frozen
         .selections

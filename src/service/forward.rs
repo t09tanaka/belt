@@ -25,7 +25,7 @@ pub(super) struct Lease {
 // Retain the existing transfer lease even if cancellation drops the upload
 // future while one bounded blocking read is still finishing.
 struct OwnedUpload {
-    file: File,
+    file: crate::source::store::SourceReader,
     _lease: Arc<Lease>,
     read: u64,
     size: u64,
@@ -326,7 +326,7 @@ async fn source_inner(
 #[cfg(test)]
 mod measured_tests {
     use super::*;
-    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::io::{Read, Seek, SeekFrom};
     async fn upload() -> (tempfile::TempDir, Arc<Lease>, OwnedUpload) {
         let dir = tempfile::tempdir().unwrap();
         let source = SourceStore::open(dir.path()).unwrap();
@@ -338,8 +338,12 @@ mod measured_tests {
             measurable: std::sync::atomic::AtomicBool::new(true),
             started: crate::platform::monotonic_ms(),
         });
-        let mut file = tempfile::tempfile().unwrap();
-        file.write_all(b"abcdefgh").unwrap();
+        let (hash, _) = source
+            .object_store()
+            .unwrap()
+            .put_bytes(b"abcdefgh")
+            .unwrap();
+        let file = source.open_blob_verified(&hash).unwrap().file;
         let reader = OwnedUpload {
             file,
             _lease: lease.clone(),

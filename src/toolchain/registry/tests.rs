@@ -491,3 +491,66 @@ fn multi_tool_callers_complete_resolution_before_building_install_requests() {
     assert_eq!(node_final.expected_plan, node_intermediate.expected_plan);
     assert_ne!(node_final.digest(), node_intermediate.digest());
 }
+
+#[test]
+fn preparation_probe_request_uses_actual_plan_with_bounded_read_only_identity() {
+    let f = Fixture::new(AdapterKind::Nodenv, "node");
+    let registry = f.load().unwrap();
+    let tool = ToolId::parse("node").unwrap();
+    let request = registry
+        .request(&f.frozen("1.2.3", b"source"), &tool, None)
+        .unwrap();
+    let probed = registry
+        .probe_request(
+            &request.frozen,
+            &tool,
+            &request.evidence,
+            &adapters::IdentityReadBudget::probe(),
+        )
+        .unwrap();
+    assert_eq!(probed.digest(), request.digest());
+    assert_eq!(probed.expected_plan, request.expected_plan);
+    let changed = registry
+        .request(&f.frozen("1.3.0", b"source"), &tool, None)
+        .unwrap();
+    let changed_probe = registry
+        .probe_request(
+            &changed.frozen,
+            &tool,
+            &changed.evidence,
+            &adapters::IdentityReadBudget::probe(),
+        )
+        .unwrap();
+    assert_eq!(changed.expected_plan, changed_probe.expected_plan);
+    assert_ne!(changed.expected_plan, request.expected_plan);
+    assert!(!f.state.join("manager-ran").exists());
+    std::fs::remove_dir(f.state.join("toolchains")).unwrap();
+    assert!(registry
+        .probe_request(
+            &request.frozen,
+            &tool,
+            &request.evidence,
+            &adapters::IdentityReadBudget::probe()
+        )
+        .is_err());
+    assert!(!f.state.join("toolchains").exists());
+}
+#[test]
+fn preparation_probe_request_budget_and_replaced_manager_fail_closed() {
+    let f = Fixture::new(AdapterKind::Nodenv, "node");
+    let tool = ToolId::parse("node").unwrap();
+    let registry = f.load().unwrap();
+    let request = registry
+        .request(&f.frozen("1.2.3", b"source"), &tool, None)
+        .unwrap();
+    std::fs::write(&f.config.recipes[0].manager, vec![b'x'; 1024 * 1024 + 1]).unwrap();
+    assert!(registry
+        .probe_request(
+            &request.frozen,
+            &tool,
+            &request.evidence,
+            &adapters::IdentityReadBudget::probe()
+        )
+        .is_err());
+    assert!(!f.state.join("manager-ran").exists());
+}

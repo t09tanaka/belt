@@ -74,7 +74,11 @@ pub async fn serve_connection(
     let negotiated_features = accepted.negotiated.features;
     let mut incoming = accepted.incoming;
     loop {
-        let Some(InboundRequest { request, responder }) = incoming.next().await else {
+        let Some(InboundRequest {
+            mut request,
+            responder,
+        }) = incoming.next().await
+        else {
             return Ok(());
         };
         // No further request is taken from this connection until this one
@@ -86,6 +90,19 @@ pub async fn serve_connection(
         let agent = agent.clone();
         let negotiated_features = negotiated_features.clone();
         tokio::spawn(async move {
+            if matches!(&request, crate::wire::Request::PreparationProbe(_))
+                && !negotiated_features
+                    .iter()
+                    .any(|v| v == crate::wire::PREPARATION_PROBE_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "preparation probe was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
             if matches!(&request, crate::wire::Request::ForecastCommand(_))
                 && !negotiated_features
                     .iter()
@@ -128,10 +145,21 @@ pub async fn serve_connection(
                 drop(permit);
                 return;
             }
+            let observations_negotiated = negotiated_features
+                .iter()
+                .any(|v| v == crate::setup::observation_transport::FEATURE);
+            if !observations_negotiated {
+                if let crate::wire::Request::Inspect(r) = &mut request {
+                    r.preparation_observations = None;
+                }
+            }
             let done = tokio::task::spawn_blocking(move || agent.handle(session, request)).await;
             let _ = match done {
                 Ok(Ok(mut response)) => {
                     if let crate::wire::Response::Inspect(r) = &mut response {
+                        if !observations_negotiated {
+                            r.preparation_observations = None;
+                        }
                         if !capabilities_negotiated {
                             r.capabilities = None;
                         } else if let Some(report) = &mut r.capabilities {

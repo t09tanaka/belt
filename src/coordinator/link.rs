@@ -166,6 +166,11 @@ impl InputGate {
 }
 
 pub trait WorkerLink: Send + Sync {
+    /// Exact hello negotiation; never inferred from opaque transport provenance.
+    fn preparation_observations_negotiated(&self) -> bool {
+        false
+    }
+
     fn cold_eligible(&self, _task: &crate::ids::TaskId) -> bool {
         false
     }
@@ -205,6 +210,7 @@ pub struct ClientLink {
     client: Client,
     timeout: Duration,
     gate: Option<std::sync::Arc<InputGate>>,
+    preparation_observations: bool,
 }
 
 impl ClientLink {
@@ -213,6 +219,7 @@ impl ClientLink {
             client,
             timeout,
             gate: None,
+            preparation_observations: false,
         }
     }
 }
@@ -223,10 +230,21 @@ impl ClientLink {
             client,
             timeout,
             gate: Some(gate),
+            preparation_observations: false,
         }
     }
 }
+impl ClientLink {
+    pub fn with_preparation_observations(mut self, negotiated: bool) -> Self {
+        self.preparation_observations = negotiated;
+        self
+    }
+}
 impl WorkerLink for ClientLink {
+    fn preparation_observations_negotiated(&self) -> bool {
+        self.preparation_observations
+    }
+
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
         self.gate.as_ref().is_some_and(|g| g.cold_eligible(task))
     }
@@ -295,6 +313,10 @@ pub(super) struct Budgeted {
 }
 
 impl WorkerLink for Budgeted {
+    fn preparation_observations_negotiated(&self) -> bool {
+        self.inner.preparation_observations_negotiated()
+    }
+
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
         self.inner.cold_eligible(task)
     }

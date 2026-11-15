@@ -24,6 +24,7 @@ import json, os, sys
 root = os.getcwd()
 data = json.load(open("target/llvm-cov.json"))
 want = {
+    "src/ci/summary.rs",
     "src/outputs.rs",
     "src/toolchain/versions.rs",
     "src/toolchain/declarations.rs",
@@ -68,6 +69,7 @@ want = {
     "src/results/clock_policy.rs",
     "src/scheduler/decide.rs",
     "src/setup/policy.rs",
+    "src/setup/observation_transport.rs",
     "src/service/macos/policy.rs",
     "src/service/macos/observe.rs",
 }

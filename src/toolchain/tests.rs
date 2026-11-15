@@ -464,7 +464,11 @@ fn readers_use_verified_captured_directory_bytes_and_reject_corruption() {
     let symlink = seal_manifest(symlink);
     assert!(snapshot::read_captured(&store, &symlink, "", &[]).is_err());
     let entry = &capture.manifest.object_manifest.entries[0];
-    std::fs::write(store.object_store().object_path(&entry.hash), "20.1.0").unwrap();
+    std::fs::write(
+        store.object_store().unwrap().object_path(&entry.hash),
+        "20.1.0",
+    )
+    .unwrap();
     assert!(snapshot::read_captured(&store, &capture.manifest, "", &[]).is_err());
 }
 
