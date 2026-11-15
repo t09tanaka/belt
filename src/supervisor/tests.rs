@@ -440,7 +440,13 @@ fn another_process_writes_while_this_one_reads_then_crashes_and_resumes() {
     ));
     let r = SpoolReader::open(dir.path(), &a).unwrap();
     let (mut got, mut off, mut last_seq) = (Vec::new(), 0u64, 0u64);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while got.len() < 200_000 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "spool writer did not publish 200000 bytes within 10s: read {}, offset {off}, sequence {last_seq}",
+            got.len()
+        );
         let c = r.read(Stdout, off, 4096).unwrap();
         assert_eq!(c.offset, off, "the offset never moves back");
         assert!(c.seq >= last_seq);

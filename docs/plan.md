@@ -880,3 +880,5 @@ spool内容・crash/restartの検証は維持し、productionのlockやGCは変�
 unique receipt・実正常終了・ready前終了・started確認後のready timeout・完了timeout・
 panic unwindの子回収を含む。strict all-target/all-feature clippy成功（12.16秒）、fmt/diff-check成功。
 実Rustは1.100であり実MSRV1.89・新しい全9ジョブ・remote CIの成功はここでは主張しない。
+
+補足レビューに従いsupervisor fixtureの200000-byte読取loopにも10秒のelapsed期限と数値のみの失敗診断を追加し、終了済みwriterの未読spoolは拒否せず元の検証を維持した。threads1/2 exact各1件成功（0.45秒/0.44秒）、lib/tests strict clippy成功（12.34秒）、fmt/diff-check成功。production変更はない。
