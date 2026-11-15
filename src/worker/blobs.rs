@@ -1579,10 +1579,7 @@ impl Incoming {
                 SourceBlobKind::Content => {
                     // held whole: in the store, or waiting here under the
                     // size its manifest gives
-                    let mut stored = fs::metadata(self.store.object_store().object_path(hex))
-                        .ok()
-                        .filter(|m| m.is_file())
-                        .map(|m| m.len());
+                    let mut stored = self.store.blob_size(hex);
                     if let (None, Some(size)) = (stored, st.wanted.get(hex)) {
                         let waiting = dir.join(FILES).join(staged_name(b.kind, hex, *size, true));
                         stored = staged_len(&waiting)?;

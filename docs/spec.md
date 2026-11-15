@@ -1293,3 +1293,25 @@ installation roots, resolution evidence, activation, installation singleflight
 and submit/worker integration. S21 workers diff/sync/doctor and real service
 environment acceptance remain mandatory. This declaration slice advertises no
 auto-installable capability.
+
+### Source import ownership and future erasure fences (nondeleting stage A)
+
+Source import ownership is per opaque token and physical store identity, never per shared hash.
+Publishing one import only releases its own matching memberships after its immutable graph is durable;
+positive handoff to an exact durable run binding releases memberships in transactions of at most 32 rows.
+Failures, unmatched blobs and unknown crash/legacy roots remain protected. Tokenless legacy intake keeps
+independent protective roots. A does not infer abandonment from absence of coordinator references.
+
+Run expiry and publication incarnation are distinct source-owned records. Content-addressed SourceID/hash
+identity is unchanged: the same immutable input can be republished in a new incarnation after an old claim
+completes, while the old run remains permanently expired. A only adds schema/checks; production creates no
+expiry or deletion claim and removes no source/Vault file. Vault-only SecretUnavailable must remain separate
+from source expiry and from source retention. Actual bounded deletion and resident activation remain B/C work.
+
+Public SDK access is a shared-guard-owning view with no raw ObjectStore Deref/Clone. Trusted crate SDK calls
+use a scoped callback whose entire execution holds SH; pending publication claims conservatively block raw
+SDK operations. Opened upload readers own SH through actual blocking reads and cancellation drain. These
+APIs do not claim to prevent intentional raw filesystem or SDK-handle escape by trusted callers. Publication,
+binding, enqueue, retry preflight/commit, input read and delivery readiness check future availability fences,
+with source ownership acquired before coordinator operations. The permanent lock and SQLite inode safety
+protocols remain unchanged. No automatic source/Vault deletion is enabled by this stage.

@@ -13,6 +13,7 @@ use std::sync::Arc;
 pub struct Guard {
     _file: Arc<LockedFile>,
     pub(crate) root: PathBuf,
+    index: Index,
 }
 #[derive(Debug)]
 struct LockedFile(File);
@@ -85,6 +86,10 @@ impl Index {
           CREATE INDEX IF NOT EXISTS member_object ON member(object,root);
           CREATE TABLE IF NOT EXISTS graph(root TEXT NOT NULL,source TEXT NOT NULL,done INTEGER NOT NULL DEFAULT 0,position INTEGER NOT NULL DEFAULT 0,PRIMARY KEY(root,source));
           CREATE INDEX IF NOT EXISTS graph_pending ON graph(root,done,source);
+          CREATE TABLE IF NOT EXISTS publication(object TEXT PRIMARY KEY,incarnation INTEGER NOT NULL CHECK(incarnation>0),state TEXT NOT NULL CHECK(state IN ('live','claimed')));
+          CREATE INDEX IF NOT EXISTS publication_state ON publication(state,object);
+          CREATE TABLE IF NOT EXISTS run_expiry(run_id TEXT PRIMARY KEY,source_id TEXT NOT NULL,binding_digest TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');").context("initialize source index")?;
         Ok(this)
@@ -202,6 +207,7 @@ impl Index {
         Ok(Guard {
             _file: Arc::new(LockedFile(file)),
             root: self.path.clone(),
+            index: self.clone(),
         })
     }
     fn connect(&self) -> Result<Connection> {
@@ -424,6 +430,11 @@ impl Index {
             let tx = c.transaction()?;
             let key = format!("m:{}", m.source_id);
             let path = format!("manifests/{}.json", m.source_id);
+            Self::check_publication(&tx, &key)?;
+            tx.execute(
+                "INSERT OR IGNORE INTO publication VALUES(?1,1,'live')",
+                [&key],
+            )?;
             tx.execute(
                 "INSERT OR IGNORE INTO object VALUES(?1,?2)",
                 params![key, path],
@@ -439,6 +450,11 @@ impl Index {
                     ensure!(super::diff::is_blob_hash(&b.hash), "invalid source digest");
                     let key = format!("b:{}", b.hash);
                     let path = format!("objects/{}/{}", &b.hash[..2], b.hash);
+                    Self::check_publication(&tx, &key)?;
+                    tx.execute(
+                        "INSERT OR IGNORE INTO publication VALUES(?1,1,'live')",
+                        [&key],
+                    )?;
                     tx.execute(
                         "INSERT OR IGNORE INTO object VALUES(?1,?2)",
                         params![key, path],
@@ -464,9 +480,104 @@ impl Index {
         }
         Ok(false)
     }
-    pub(crate) fn finish_imports(&self, root: &str) -> Result<()> {
-        // Published graph membership is durable before any pending blob root is released.
-        self.connect()?.execute("DELETE FROM root WHERE kind='pending' AND source IS NULL AND id IN (SELECT 'blob:'||substr(object,3) FROM member WHERE root=?1 AND object LIKE 'b:%')",[root])?;
+    // Tokenless legacy imports deliberately keep their independent roots.
+    // A published graph is not proof that some other import has handed off.
+    fn release_import_page(&self, token: &ImportToken, received: &str) -> Result<bool> {
+        self.check_token(token)?;
+        let mut c = self.connect()?;
+        let tx = c.transaction()?;
+        let keys: Vec<String> = {
+            let mut s = tx.prepare("SELECT a.object FROM member a WHERE a.root=?1 AND EXISTS(SELECT 1 FROM member b WHERE b.root=?2 AND b.object=a.object) ORDER BY a.object LIMIT 32")?;
+            let rows = s.query_map(params![token.root(), received], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for key in &keys {
+            tx.execute(
+                "DELETE FROM member WHERE root=?1 AND object=?2",
+                params![token.root(), key],
+            )?;
+        }
+        let remains: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM member WHERE root=?1)",
+            [token.root()],
+            |r| r.get(0),
+        )?;
+        if !remains {
+            tx.execute("DELETE FROM root WHERE id=?1", [token.root()])?;
+        }
+        tx.commit()?;
+        Ok(keys.len() < 32)
+    }
+    fn check_token(&self, token: &ImportToken) -> Result<()> {
+        self.current()?;
+        let m = self.root.metadata()?;
+        ensure!(
+            (m.dev(), m.ino()) == token.store,
+            "foreign source import token"
+        );
+        let exists: bool = self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM import_session WHERE token=?1)",
+            [&token.id],
+            |r| r.get(0),
+        )?;
+        ensure!(exists, "unknown source import token");
+        Ok(())
+    }
+    pub(crate) fn import_blob(&self, token: &ImportToken, hash: &str) -> Result<()> {
+        self.check_token(token)?;
+        let mut c = self.connect()?;
+        let tx = c.transaction()?;
+        let pending: bool = tx.query_row(
+            "SELECT state='pending' FROM import_session WHERE token=?1",
+            [&token.id],
+            |r| r.get(0),
+        )?;
+        ensure!(pending, "source import already published");
+        let key = format!("b:{hash}");
+        Self::check_publication(&tx, &key)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO publication VALUES(?1,1,'live')",
+            [&key],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO object VALUES(?1,?2)",
+            params![key, format!("objects/{}/{hash}", &hash[..2])],
+        )?;
+        tx.execute(
+            "INSERT OR IGNORE INTO member VALUES(?1,?2)",
+            params![token.root(), key],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+    fn check_publication(c: &Connection, object: &str) -> Result<()> {
+        let claimed: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM publication WHERE object=?1 AND state='claimed')",
+            [object],
+            |r| r.get(0),
+        )?;
+        ensure!(!claimed, "source publication unavailable: deletion claimed");
+        Ok(())
+    }
+    pub(crate) fn publication(&self, object: &str) -> Result<PublicationIncarnation> {
+        let c = self.connect()?;
+        Self::check_publication(&c, object)?;
+        let n: Option<i64> = c
+            .query_row(
+                "SELECT incarnation FROM publication WHERE object=?1",
+                [object],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(PublicationIncarnation(u64::try_from(n.unwrap_or(1))?))
+    }
+    pub(crate) fn ensure_run(&self, run: &crate::ids::RunId) -> Result<()> {
+        let expired: bool = self.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_expiry WHERE run_id=?1)",
+            [run.as_str()],
+            |r| r.get(0),
+        )?;
+        ensure!(!expired, "retained source unavailable: run expired");
         Ok(())
     }
     /// Remove only a positively handed-off pending root, after a durable run root.
@@ -493,16 +604,198 @@ impl Index {
             source.is_some() && source == pending_source,
             "source root handoff mismatch"
         );
-        tx.execute("DELETE FROM member WHERE root=?1", [pending])?;
-        tx.execute("DELETE FROM root WHERE id=?1 AND kind='pending'", [pending])?;
         tx.commit()?;
+        while !self.handoff_page(pending, run)? {}
         Ok(())
+    }
+    fn handoff_page(&self, pending: &str, run: &str) -> Result<bool> {
+        let mut c = self.connect()?;
+        let tx = c.transaction()?;
+        // Destination must contain each membership before its source is released.
+        let keys: Vec<String> = {
+            let mut s =
+                tx.prepare("SELECT object FROM member WHERE root=?1 ORDER BY object LIMIT 32")?;
+            let rows = s.query_map([pending], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        for key in &keys {
+            let copied: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM member WHERE root=?1 AND object=?2)",
+                params![run, key],
+                |r| r.get(0),
+            )?;
+            ensure!(copied, "incomplete source root handoff");
+            tx.execute(
+                "DELETE FROM member WHERE root=?1 AND object=?2",
+                params![pending, key],
+            )?;
+        }
+        let done = keys.len() < 32;
+        if done {
+            tx.execute("DELETE FROM root WHERE id=?1", [pending])?;
+        }
+        tx.commit()?;
+        Ok(done)
+    }
+}
+/// A publication generation is independent of content-addressed SourceID/hash.
+/// B will advance it only after a durable old deletion claim is completed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PublicationIncarnation(u64);
+impl PublicationIncarnation {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// Durable per-import ownership. Dropping a token never abandons its data.
+#[derive(Debug, Clone)]
+pub struct ImportToken {
+    id: String,
+    store: (u64, u64),
+}
+impl ImportToken {
+    fn root(&self) -> String {
+        format!("import:{}", self.id)
+    }
+    pub(crate) fn received_root(&self) -> String {
+        format!("receive:{}", self.id)
+    }
+}
+impl Guard {
+    /// The SDK discovers content IDs while writing. Pending claims therefore
+    /// fence the whole raw SDK operation until B completes their incarnations.
+    pub(crate) fn ensure_sdk_available(&self) -> Result<()> {
+        let claimed: bool = self.index.connect()?.query_row(
+            "SELECT EXISTS(SELECT 1 FROM publication WHERE state='claimed')",
+            [],
+            |r| r.get(0),
+        )?;
+        ensure!(!claimed, "source SDK unavailable: deletion claimed");
+        Ok(())
+    }
+    pub fn ensure_run_available(&self, run: &crate::ids::RunId) -> Result<()> {
+        self.index.ensure_run(run)
+    }
+    pub fn ensure_source_available(&self, id: &str) -> Result<PublicationIncarnation> {
+        ensure!(
+            super::classify::source_id_of_ci(id).is_some(),
+            "invalid source identity"
+        );
+        self.index.publication(&format!("m:{id}"))
+    }
+    pub fn ensure_blob_available(&self, hash: &str) -> Result<PublicationIncarnation> {
+        ensure!(super::diff::is_blob_hash(hash), "invalid source digest");
+        self.index.publication(&format!("b:{hash}"))
     }
 }
 impl SourceStore {
     /// Nonblocking; acquire before coordinator operations, never inside its actor/txn.
     pub fn mutation_guard(&self) -> Result<Guard> {
         self.retention.guard(false)
+    }
+    pub fn begin_import(&self) -> Result<ImportToken> {
+        let guard = self.mutation_guard()?;
+        // Do not create an unknown root that would prevent an older claim
+        // from draining while this import waits to publish its incarnation.
+        guard.ensure_sdk_available()?;
+        let metadata = self.retention.root.metadata()?;
+        let token = ImportToken {
+            id: ulid::Ulid::new().to_string(),
+            store: (metadata.dev(), metadata.ino()),
+        };
+        let mut c = self.retention.connect()?;
+        let tx = c.transaction()?;
+        tx.execute(
+            "INSERT INTO import_session(token,state) VALUES(?1,'pending')",
+            [&token.id],
+        )?;
+        tx.execute(
+            "INSERT INTO root(id,kind) VALUES(?1,'pending')",
+            [token.root()],
+        )?;
+        tx.commit()?;
+        Ok(token)
+    }
+    pub(crate) fn import_publication_root(&self, token: &ImportToken, id: &str) -> Result<String> {
+        self.retention.check_token(token)?;
+        let mut c = self.retention.connect()?;
+        let tx = c.transaction()?;
+        let (state, source): (String, Option<String>) = tx.query_row(
+            "SELECT state,source FROM import_session WHERE token=?1",
+            [&token.id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        ensure!(
+            state != "bound" && source.as_deref().is_none_or(|s| s == id),
+            "source import binding mismatch"
+        );
+        if state == "pending" {
+            tx.execute(
+                "UPDATE import_session SET state='publishing',source=?2 WHERE token=?1",
+                params![token.id, id],
+            )?;
+        }
+        tx.commit()?;
+        Ok(token.received_root())
+    }
+    pub(crate) fn finish_import(&self, token: &ImportToken, id: &str) -> Result<()> {
+        let root = token.received_root();
+        ensure!(
+            self.retention.complete(&root, id)?,
+            "incomplete source import publication"
+        );
+        self.retention.connect()?.execute(
+            "UPDATE import_session SET state='published',source=?2 WHERE token=?1",
+            params![token.id, id],
+        )?;
+        while !self.retention.release_import_page(token, &root)? {}
+        Ok(())
+    }
+    /// Handoff this import only after the exact run binding is durable.
+    pub fn bind_import(
+        &self,
+        token: &ImportToken,
+        run: &crate::ids::RunId,
+        record: &super::store::RunRecord,
+    ) -> Result<()> {
+        let guard = self.mutation_guard()?;
+        guard.ensure_run_available(run)?;
+        self.retention.check_token(token)?;
+        let mut c = self.retention.connect()?;
+        let tx = c.transaction()?;
+        let (state, id, bound_run): (String, Option<String>, Option<String>) = tx.query_row(
+            "SELECT state,source,run_id FROM import_session WHERE token=?1",
+            [&token.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        ensure!(
+            bound_run.as_deref().is_none_or(|id| id == run.as_str()),
+            "source import already bound to another run"
+        );
+        ensure!(
+            (state == "published" || state == "bound")
+                && id.as_deref() == Some(record.ci_source_id.as_str()),
+            "source import not published"
+        );
+        tx.execute(
+            "UPDATE import_session SET run_id=?2 WHERE token=?1",
+            params![token.id, run.as_str()],
+        )?;
+        tx.commit()?;
+        let bound = self.bind_run(run, record)?;
+        ensure!(bound == *record, "source import run binding mismatch");
+        if state != "bound" {
+            while !self
+                .retention
+                .handoff_page(&token.received_root(), run.as_str())?
+            {}
+            c.execute(
+                "UPDATE import_session SET state='bound',run_id=?2 WHERE token=?1",
+                params![token.id, run.as_str()],
+            )?;
+        }
+        Ok(())
     }
     pub(crate) fn capture_pending_root(&self) -> Result<String> {
         let id = format!("capture:{}", ulid::Ulid::new());
@@ -795,6 +1088,7 @@ mod tests {
     use crate::source::{capture, capture_for_run, CaptureParams, SourceRequest};
     use crate::state::{AttemptState, Outcome, Termination};
     use crate::storage::{CoordinatorStore, NewAttempt};
+    use sha2::Digest as _;
     use std::collections::BTreeMap;
     struct Fixture {
         _root: tempfile::TempDir,
@@ -1445,8 +1739,8 @@ mod tests {
         let b = f.store.source_of_run(&second).unwrap().unwrap();
         assert_ne!(a, b);
         std::fs::copy(
-            f.store.object_store().manifest_path(&b),
-            f.store.object_store().manifest_path(&a),
+            f.store.object_store().unwrap().manifest_path(&b),
+            f.store.object_store().unwrap().manifest_path(&a),
         )
         .unwrap();
         assert!(f
@@ -1712,7 +2006,10 @@ mod tests {
         for manifest in children.iter().chain(std::iter::once(&parent)) {
             super::super::store::verify_manifest(manifest).unwrap();
             std::fs::write(
-                f.store.object_store().manifest_path(&manifest.source_id),
+                f.store
+                    .object_store()
+                    .unwrap()
+                    .manifest_path(&manifest.source_id),
                 serde_json::to_vec(manifest).unwrap(),
             )
             .unwrap();
@@ -1757,5 +2054,423 @@ mod tests {
             "parent reparsed after child insert page"
         );
         assert_eq!(f.store.retention.verifications.load(SeqCst), 66);
+    }
+    #[test]
+    fn import_tokens_do_not_release_another_owner_of_the_same_digest() {
+        let f = Fixture::new();
+        let run = RunId::generate();
+        f.bind(&run);
+        let id = f.store.source_of_run(&run).unwrap().unwrap();
+        let m = f.store.manifest(&id).unwrap().unwrap();
+        let entry = &m.object_manifest.entries[0];
+        let want = super::super::diff::BlobWant {
+            hash: entry.hash.clone(),
+            size: entry.size,
+        };
+        let bytes = f.store.read_blob(&entry.hash).unwrap();
+        let state = f._root.path().join("receiver");
+        let receiver = SourceStore::open(&state).unwrap();
+        let a = receiver.begin_import().unwrap();
+        let b = receiver.begin_import().unwrap();
+        receiver
+            .ingest_blob_with_token(&a, &want, &mut &bytes[..])
+            .unwrap();
+        receiver
+            .ingest_blob_with_token(&b, &want, &mut &bytes[..])
+            .unwrap();
+        receiver.publish_received_with_token(&a, &m, None).unwrap();
+        assert!(receiver
+            .ingest_blob_with_token(&a, &want, &mut &bytes[..])
+            .is_err());
+        let count = |store: &SourceStore, root: String| {
+            store
+                .retention
+                .connect()
+                .unwrap()
+                .query_row("SELECT count(*) FROM member WHERE root=?1", [root], |r| {
+                    r.get::<_, u32>(0)
+                })
+                .unwrap()
+        };
+        assert_eq!(count(&receiver, a.root()), 0);
+        assert_eq!(count(&receiver, b.root()), 1);
+        // A legacy publish cannot release the token of an unrelated importer.
+        receiver.publish_received(&m, None).unwrap();
+        drop(receiver);
+        let reopened = SourceStore::open(&state).unwrap();
+        assert_eq!(count(&reopened, b.root()), 1);
+        assert!(reopened.has_blob(&entry.hash));
+        // The token of a different physical store is rejected before reading.
+        let foreign = f.store.begin_import().unwrap();
+        let mut input = std::io::Cursor::new(bytes.clone());
+        assert!(reopened
+            .ingest_blob_with_token(&foreign, &want, &mut input)
+            .is_err());
+        assert_eq!(input.position(), 0);
+        let forged = ImportToken {
+            id: ulid::Ulid::new().to_string(),
+            store: b.store,
+        };
+        assert!(reopened
+            .ingest_blob_with_token(&forged, &want, &mut &bytes[..])
+            .is_err());
+        // Positive handoff to one durable run releases only this received root.
+        let record = f.store.run_record(&run).unwrap().unwrap();
+        reopened.bind_import(&a, &run, &record).unwrap();
+        reopened.bind_import(&a, &run, &record).unwrap();
+        assert_eq!(count(&reopened, a.received_root()), 0);
+        assert_eq!(count(&reopened, b.root()), 1);
+        assert_eq!(reopened.source_of_run(&run).unwrap().unwrap(), id);
+    }
+
+    #[test]
+    fn legacy_intake_keeps_independent_roots_without_hash_global_handoff() {
+        let f = Fixture::new();
+        let bytes = b"same bytes";
+        let hash = format!("{:x}", sha2::Sha256::digest(bytes));
+        let want = super::super::diff::BlobWant {
+            hash: hash.clone(),
+            size: bytes.len() as u64,
+        };
+        f.store.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        f.store.ingest_blob(&want, &mut &bytes[..]).unwrap();
+        let c = f.store.retention.connect().unwrap();
+        let owners: u32 = c
+            .query_row(
+                "SELECT count(*) FROM member WHERE object=?1",
+                [format!("b:{hash}")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(owners, 2);
+        let roots: u32 = c
+            .query_row(
+                "SELECT count(*) FROM root WHERE source IS NULL AND id LIKE 'import:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(roots, 2);
+    }
+
+    #[test]
+    fn handoff_pages_are_bounded_and_restart_overretains_until_destination_proof() {
+        let f = Fixture::new();
+        let c = f.store.retention.connect().unwrap();
+        for root in ["producer", "destination"] {
+            c.execute(
+                "INSERT INTO root VALUES(?1,'pending','src-00000000000000000000000000000000')",
+                [root],
+            )
+            .unwrap();
+        }
+        for n in 0..65 {
+            let key = format!("b:{n:064x}");
+            for root in ["producer", "destination"] {
+                c.execute("INSERT INTO member VALUES(?1,?2)", params![root, key])
+                    .unwrap();
+            }
+        }
+        assert!(!f
+            .store
+            .retention
+            .handoff_page("producer", "destination")
+            .unwrap());
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM member WHERE root='producer'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            33
+        );
+        let reopened = SourceStore::open(&f.state).unwrap();
+        // A failed destination-proof page commits no partial release.
+        c.execute(
+            "DELETE FROM member WHERE root='destination' AND object=?1",
+            [format!("b:{:064x}", 32)],
+        )
+        .unwrap();
+        assert!(reopened
+            .retention
+            .handoff_page("producer", "destination")
+            .is_err());
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM member WHERE root='producer'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            33
+        );
+        c.execute(
+            "INSERT INTO member VALUES('destination',?1)",
+            [format!("b:{:064x}", 32)],
+        )
+        .unwrap();
+        assert!(!reopened
+            .retention
+            .handoff_page("producer", "destination")
+            .unwrap());
+        assert!(reopened
+            .retention
+            .handoff_page("producer", "destination")
+            .unwrap());
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM member WHERE root='destination'",
+                [],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            65
+        );
+    }
+
+    #[test]
+    fn import_release_pages_retain_other_tokens_and_unpublished_extra_blobs() {
+        let f = Fixture::new();
+        let a = f.store.begin_import().unwrap();
+        let b = f.store.begin_import().unwrap();
+        for n in 0..65 {
+            for token in [&a, &b] {
+                f.store
+                    .retention
+                    .import_blob(token, &format!("{n:064x}"))
+                    .unwrap();
+            }
+        }
+        let c = f.store.retention.connect().unwrap();
+        c.execute("INSERT INTO root VALUES('published','received','src-00000000000000000000000000000000')",[]).unwrap();
+        c.execute(
+            "INSERT INTO member SELECT 'published',object FROM member WHERE root=?1 AND object<>?2",
+            params![a.root(), format!("b:{:064x}", 64)],
+        )
+        .unwrap();
+        assert!(!f
+            .store
+            .retention
+            .release_import_page(&a, "published")
+            .unwrap());
+        let reopened = SourceStore::open(&f.state).unwrap();
+        assert!(!reopened
+            .retention
+            .release_import_page(&a, "published")
+            .unwrap());
+        assert!(reopened
+            .retention
+            .release_import_page(&a, "published")
+            .unwrap());
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM member WHERE root=?1",
+                [a.root()],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            1
+        );
+        assert_eq!(
+            c.query_row(
+                "SELECT count(*) FROM member WHERE root=?1",
+                [b.root()],
+                |r| r.get::<_, u32>(0)
+            )
+            .unwrap(),
+            65
+        );
+        assert!(c
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM root WHERE id=?1 AND source IS NULL)",
+                [a.root()],
+                |r| r.get::<_, bool>(0)
+            )
+            .unwrap());
+    }
+
+    #[test]
+    fn fixture_run_fence_does_not_change_content_identity_or_new_publication_generation() {
+        use sha2::Digest as _;
+        let f = Fixture::new();
+        let old = RunId::generate();
+        f.bind(&old);
+        let record = f.store.run_record(&old).unwrap().unwrap();
+        let id = record.ci_source_id.clone();
+        let m = f.store.manifest(&id).unwrap().unwrap();
+        let hash = m.object_manifest.entries[0].hash.clone();
+        // Test-only future fence. Production has no expiry/claim mutator in A.
+        {
+            let _exclusive = f.store.retention.guard(true).unwrap();
+            f.store
+                .retention
+                .connect()
+                .unwrap()
+                .execute(
+                    "INSERT INTO run_expiry VALUES(?1,?2,?3)",
+                    params![old.as_str(), id, m.manifest_digest],
+                )
+                .unwrap();
+        }
+        assert!(f.store.source_of_run(&old).is_err());
+        assert!(f.store.bind_run(&old, &record).is_err());
+        assert!(capture_for_run(
+            &BTreeMap::new(),
+            &f.store,
+            &old,
+            &SourceRequest::Directory {
+                dir: f.input.clone()
+            },
+            &CaptureParams::default()
+        )
+        .is_err());
+        let new = RunId::generate();
+        f.bind(&new);
+        assert_eq!(f.store.source_of_run(&new).unwrap().unwrap(), id);
+        {
+            let _exclusive = f.store.retention.guard(true).unwrap();
+            f.store
+                .retention
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE publication SET state='claimed' WHERE object=?1",
+                    [format!("b:{hash}")],
+                )
+                .unwrap();
+        }
+        assert!(f.store.read_blob(&hash).is_err());
+        assert!(f.store.open_blob_verified(&hash).is_err());
+        assert!(f
+            .store
+            .object_store()
+            .unwrap()
+            .put_bytes(b"original")
+            .is_err());
+        assert!(capture(
+            &BTreeMap::new(),
+            &f.store,
+            &SourceRequest::Directory {
+                dir: f.input.clone()
+            },
+            &CaptureParams::default()
+        )
+        .is_err());
+        // Simulate B's completed-claim/new-incarnation boundary, without unlink.
+        {
+            let _exclusive = f.store.retention.guard(true).unwrap();
+            f.store
+                .retention
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE publication SET state='live',incarnation=2 WHERE object=?1",
+                    [format!("b:{hash}")],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            f.store
+                .mutation_guard()
+                .unwrap()
+                .ensure_blob_available(&hash)
+                .unwrap()
+                .get(),
+            2
+        );
+        assert!(f.store.source_of_run(&old).is_err());
+        assert_eq!(f.store.read_blob(&hash).unwrap(), b"original");
+        assert_eq!(format!("{:x}", sha2::Sha256::digest(b"original")), hash);
+        assert_eq!(f.store.source_of_run(&new).unwrap().unwrap(), id);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opened_reader_keeps_source_shared_guard_after_async_waiter_cancellation() {
+        use std::io::Read as _;
+        let f = Fixture::new();
+        let (hash, _) = f
+            .store
+            .object_store()
+            .unwrap()
+            .put_bytes(b"held-reader")
+            .unwrap();
+        let mut reader = f.store.open_blob_verified(&hash).unwrap().file;
+        let (entered, seen) = tokio::sync::oneshot::channel();
+        let (release, resume) = std::sync::mpsc::channel();
+        let (drained, drain) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                entered.send(()).unwrap();
+                resume.recv().unwrap();
+                let mut bytes = Vec::new();
+                reader.read_to_end(&mut bytes).unwrap();
+                assert_eq!(bytes, b"held-reader");
+                drop(reader);
+                drained.send(()).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        seen.await.unwrap();
+        waiter.abort();
+        let _ = waiter.await;
+        assert!(f.store.retention.guard(true).is_err());
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(f.store.retention.guard(true).is_ok());
+    }
+    #[test]
+    fn guarded_sdk_view_retains_shared_ownership_and_claim_fences_its_callback() {
+        let f = Fixture::new();
+        let view = f.store.object_store().unwrap();
+        view.with_sdk(|_| {
+            assert!(f.store.retention.guard(true).is_err());
+            Ok(())
+        })
+        .unwrap();
+        drop(view);
+        let (hash, _) = f
+            .store
+            .object_store()
+            .unwrap()
+            .put_bytes(b"sdk-fence")
+            .unwrap();
+        {
+            let _exclusive = f.store.retention.guard(true).unwrap();
+            f.store
+                .retention
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE publication SET state='claimed' WHERE object=?1",
+                    [format!("b:{hash}")],
+                )
+                .unwrap();
+        }
+        let c = f.store.retention.connect().unwrap();
+        let before: u32 = c
+            .query_row("SELECT count(*) FROM root", [], |r| r.get(0))
+            .unwrap();
+        assert!(f.store.begin_import().is_err());
+        assert_eq!(
+            c.query_row("SELECT count(*) FROM root", [], |r| r.get::<_, u32>(0))
+                .unwrap(),
+            before
+        );
+        let view = f.store.object_store().unwrap();
+        let mut called = false;
+        assert!(view
+            .with_sdk(|_| {
+                called = true;
+                Ok(())
+            })
+            .is_err());
+        assert!(!called);
+        drop(view);
+        assert!(f.store.retention.guard(true).is_ok());
     }
 }

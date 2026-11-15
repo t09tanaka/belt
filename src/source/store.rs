@@ -64,7 +64,7 @@ impl Inventory for Peer<'_> {
         self.store.has_blob(hash)
     }
     fn has_manifest(&self, ci_source_id: &str) -> bool {
-        matches!(self.store.inner.load_manifest(ci_source_id), Ok(Some(_)))
+        matches!(self.store.manifest(ci_source_id), Ok(Some(_)))
     }
     fn has_commit(&self, sha: &str) -> bool {
         self.objects.is_some_and(|o| o.has_commit(sha))
@@ -347,9 +347,58 @@ fn corrupt(what: impl Into<String>) -> anyhow::Error {
 /// Verified descriptor and immutable transfer identity. Hashing never holds the
 /// object or bundle in memory; callers must run this synchronous IO off executor threads.
 pub struct UploadFile {
-    pub file: std::fs::File,
+    pub file: SourceReader,
     pub digest: crate::ids::Digest,
     pub size: u64,
+}
+
+/// An opened reader owns its source lease through its final blocking read.
+/// Intentional raw filesystem access by trusted callers is outside this API.
+#[derive(Debug)]
+pub struct SourceReader {
+    file: std::fs::File,
+    _guard: super::retention::Guard,
+}
+impl Read for SourceReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.file.read(bytes)
+    }
+}
+impl Seek for SourceReader {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(position)
+    }
+}
+/// Scoped SDK access. No Deref/Clone exposes an unleased ObjectStore.
+pub struct GuardedObjectStore<'a> {
+    store: &'a SourceStore,
+    guard: super::retention::Guard,
+}
+impl GuardedObjectStore<'_> {
+    pub fn object_path(&self, hash: &str) -> PathBuf {
+        self.store.inner.object_path(hash)
+    }
+    pub fn manifest_path(&self, id: &str) -> PathBuf {
+        self.store.inner.manifest_path(id)
+    }
+    pub fn put_bytes(&self, bytes: &[u8]) -> Result<(String, u64)> {
+        // SDK writers need a durable unknown root before learning their digest.
+        let hash = format!("{:x}", Sha256::digest(bytes));
+        self.guard.ensure_blob_available(&hash)?;
+        let token = self.store.begin_import()?;
+        self.store.retention.import_blob(&token, &hash)?;
+        self.store.inner.put_bytes(bytes)
+    }
+    /// S16 planning's SDK call must execute entirely inside this callback.
+    /// Trusted crate code must not return cloned SDK handles from the scope.
+    #[allow(dead_code)]
+    pub(crate) fn with_sdk<T>(
+        &self,
+        use_store: impl FnOnce(&ObjectStore) -> Result<T>,
+    ) -> Result<T> {
+        self.guard.ensure_sdk_available()?;
+        use_store(&self.store.inner)
+    }
 }
 
 impl SourceStore {
@@ -373,22 +422,27 @@ impl SourceStore {
 
     /// Is the blob in the store? (Only a well-formed hash can be.)
     pub fn has_blob(&self, hash: &str) -> bool {
-        is_blob_hash(hash) && self.inner.has(hash)
+        let Ok(guard) = self.mutation_guard() else {
+            return false;
+        };
+        guard.ensure_blob_available(hash).is_ok() && self.inner.has(hash)
     }
 
     /// The bytes the store holds under the hash, when it holds the blob.
     pub fn blob_size(&self, hash: &str) -> Option<u64> {
-        if !is_blob_hash(hash) {
-            return None;
-        }
+        let guard = self.mutation_guard().ok()?;
+        guard.ensure_blob_available(hash).ok()?;
         std::fs::metadata(self.inner.object_path(hash))
             .ok()
             .filter(|m| m.is_file())
             .map(|m| m.len())
     }
 
-    pub fn object_store(&self) -> &ObjectStore {
-        &self.inner
+    pub fn object_store(&self) -> Result<GuardedObjectStore<'_>> {
+        Ok(GuardedObjectStore {
+            store: self,
+            guard: self.mutation_guard()?,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -397,12 +451,16 @@ impl SourceStore {
 
     /// A published manifest. `None` for a capture that never got to publish.
     pub fn manifest(&self, ci_source_id: &str) -> Result<Option<CiManifest>> {
+        let guard = self.mutation_guard()?;
+        guard.ensure_source_available(ci_source_id)?;
         self.inner.load_manifest(ci_source_id)
     }
 
     /// The sources `m` is made of, leaf first: the captures of its
     /// submodules (nested ones included), then `m`. Each once.
     pub fn closure(&self, m: &CiManifest) -> Result<Vec<CiManifest>> {
+        let guard = self.mutation_guard()?;
+        guard.ensure_source_available(&m.source_id)?;
         fn walk(
             s: &SourceStore,
             m: &CiManifest,
@@ -459,9 +517,10 @@ impl SourceStore {
     /// Open a captured object without following links, verify SHA-256 with
     /// bounded reads, then rewind the same descriptor for upload.
     pub fn open_blob_verified(&self, hash: &str) -> Result<UploadFile> {
-        anyhow::ensure!(is_blob_hash(hash), "invalid source blob hash");
+        let guard = self.mutation_guard()?;
+        guard.ensure_blob_available(hash)?;
         let file = self.open_upload_file(&["objects", &hash[..2]], hash)?;
-        let upload = verify_upload_file(file)?;
+        let upload = verify_upload_file(file, guard)?;
         anyhow::ensure!(
             upload.digest == crate::ids::Digest::parse(&format!("sha256:{hash}"))?,
             "source blob digest mismatch"
@@ -470,6 +529,7 @@ impl SourceStore {
     }
     /// Open only an export in this store's private bundles directory.
     pub fn open_bundle_verified(&self, path: &Path) -> Result<UploadFile> {
+        let guard = self.mutation_guard()?;
         anyhow::ensure!(
             path.parent() == Some(self.root().join("bundles").as_path()),
             "bundle is outside the source store"
@@ -479,7 +539,7 @@ impl SourceStore {
             .and_then(|s| s.to_str())
             .ok_or_else(|| corrupt("invalid bundle filename"))?;
         anyhow::ensure!(name.ends_with(".bundle"), "invalid bundle filename");
-        verify_upload_file(self.open_upload_file(&["bundles"], name)?)
+        verify_upload_file(self.open_upload_file(&["bundles"], name)?, guard)
     }
     fn open_upload_file(&self, dirs: &[&str], name: &str) -> Result<std::fs::File> {
         use rustix::fs::{open, openat, Mode, OFlags};
@@ -512,6 +572,8 @@ impl SourceStore {
 
     /// The bytes of a blob, to send.
     pub fn read_blob(&self, hash: &str) -> Result<Vec<u8>> {
+        let guard = self.mutation_guard()?;
+        guard.ensure_blob_available(hash)?;
         self.inner.read(hash)
     }
 
@@ -524,11 +586,23 @@ impl SourceStore {
     /// blobs a manifest names are there with the size it says (the same hash
     /// cannot hold other content).
     pub fn ingest_blob(&self, want: &BlobWant, r: &mut impl Read) -> Result<()> {
-        let _mutation = self.mutation_guard()?;
+        // Legacy intake cannot prove which publication owns this handoff.
+        // Keep an independent durable token/root rather than a hash-global marker.
+        let token = self.begin_import()?;
+        self.ingest_blob_with_token(&token, want, r)
+    }
+    pub fn ingest_blob_with_token(
+        &self,
+        token: &super::retention::ImportToken,
+        want: &BlobWant,
+        r: &mut impl Read,
+    ) -> Result<()> {
+        let mutation = self.mutation_guard()?;
         if !is_blob_hash(&want.hash) {
             return Err(corrupt(format!("not a blob hash: {:?}", want.hash)));
         }
-        self.retention.pending(&format!("blob:{}", want.hash))?;
+        mutation.ensure_blob_available(&want.hash)?;
+        self.retention.import_blob(token, &want.hash)?;
         // hash first, in a scratch copy: a wrong blob must not enter the store
         let mut tmp = tempfile::Builder::new()
             .prefix(".recv.")
@@ -638,12 +712,34 @@ impl SourceStore {
         }
     }
 
-    fn publish_checked(&self, m: &CiManifest) -> Result<()> {
-        let _mutation = self.mutation_guard()?;
+    pub fn publish_received_with_token(
+        &self,
+        token: &super::retention::ImportToken,
+        m: &CiManifest,
+        objects: Option<&ObjectsRepo>,
+    ) -> Result<()> {
+        let _guard = self.mutation_guard()?;
+        let root = self.import_publication_root(token, &m.source_id)?;
         verify_manifest(m)?;
-        let root = format!("receive:{}", m.source_id);
-        self.retention.pending(&root)?;
+        if m.execution_commit.is_some() {
+            objects
+                .context("no receiving objects to hold execution commit")?
+                .check_reachable(m)?;
+        }
+        self.publish_checked_root(m, &root)?;
+        self.finish_import(token, &m.source_id)
+    }
+    fn publish_checked(&self, m: &CiManifest) -> Result<()> {
+        self.publish_checked_root(m, &format!("receive:{}", m.source_id))
+    }
+    fn publish_checked_root(&self, m: &CiManifest, root: &str) -> Result<()> {
+        let mutation = self.mutation_guard()?;
+        mutation.ensure_sdk_available()?;
+        mutation.ensure_source_available(&m.source_id)?;
+        verify_manifest(m)?;
+        self.retention.pending(root)?;
         for e in &m.object_manifest.entries {
+            mutation.ensure_blob_available(&e.hash)?;
             let p = self.inner.object_path(&e.hash);
             match std::fs::metadata(&p) {
                 Ok(meta) if meta.len() == e.size => {}
@@ -685,20 +781,20 @@ impl SourceStore {
         tmp.persist(self.inner.manifest_path(&m.source_id))
             .map_err(|e| e.error)?;
         self.retention
-            .register_held(&root, "received", std::sync::Arc::new(m.clone()))?;
-        self.retention.finish_imports(&root)?;
+            .register_held(root, "received", std::sync::Arc::new(m.clone()))?;
         Ok(())
     }
 
     fn inner_has_manifest(&self, ci_source_id: &str) -> bool {
-        matches!(self.inner.load_manifest(ci_source_id), Ok(Some(_)))
+        matches!(self.manifest(ci_source_id), Ok(Some(_)))
     }
 
     /// Unpack `m` into `dest` (absent or empty). The paths of every source it
     /// is made of are decided on first; then local-ci writes the files, never
     /// through a symlink, and checks the result against the tree digest.
     pub fn materialize(&self, m: &CiManifest, dest: &Path) -> Result<()> {
-        let _mutation = self.mutation_guard()?;
+        let mutation = self.mutation_guard()?;
+        mutation.ensure_sdk_available()?;
         for s in self.closure(m)? {
             verify_manifest(&s)?;
         }
@@ -723,6 +819,8 @@ impl SourceStore {
     /// The manifests of the dirty submodules below `m`, at every depth, each
     /// once: what goes with `m` into [`ObjectsRepo::receive_bundle`].
     pub fn dirty_below(&self, m: &CiManifest) -> Result<Vec<CiManifest>> {
+        let mutation = self.mutation_guard()?;
+        mutation.ensure_source_available(&m.source_id)?;
         let mut out: Vec<CiManifest> = vec![];
         let mut seen = BTreeSet::new();
         let mut todo = vec![m.submodules.clone()];
@@ -732,7 +830,7 @@ impl SourceStore {
                 if !seen.insert(id.clone()) {
                     continue;
                 }
-                let nested = self.inner.load_manifest(id)?.with_context(|| {
+                let nested = self.manifest(id)?.with_context(|| {
                     format!(
                         "submodule {}: manifest {id} is not in the store",
                         s.path.display()
@@ -778,7 +876,9 @@ impl SourceStore {
         m: &CiManifest,
         have: &[String],
     ) -> Result<PathBuf> {
-        let _mutation = self.mutation_guard()?;
+        let mutation = self.mutation_guard()?;
+        mutation.ensure_sdk_available()?;
+        mutation.ensure_source_available(&m.source_id)?;
         verify_manifest(m)?;
         let mut basis: Vec<String> = vec![];
         for c in have.iter().filter(|c| is_hex40(c)) {
@@ -908,13 +1008,18 @@ impl SourceStore {
 
     /// The source a run already captured, if any.
     pub fn source_of_run(&self, run: &RunId) -> Result<Option<String>> {
+        let guard = self.mutation_guard()?;
+        guard.ensure_run_available(run)?;
         Ok(self.run_record(run)?.map(|r| r.ci_source_id))
     }
 
     /// Record the capture of `run`, once. Returns the record the run is bound
     /// to: `record`, or the one an earlier call wrote.
     pub fn bind_run(&self, run: &RunId, record: &RunRecord) -> Result<RunRecord> {
-        let _mutation = self.mutation_guard()?;
+        let mutation = self.mutation_guard()?;
+        mutation.ensure_run_available(run)?;
+        mutation.ensure_sdk_available()?;
+        mutation.ensure_source_available(&record.ci_source_id)?;
         if source_id_of_ci(&record.ci_source_id).is_none() {
             bail!("not a source id: {}", record.ci_source_id);
         }
@@ -964,7 +1069,10 @@ pub struct RequestSummary {
     pub exclude: Vec<String>,
 }
 
-fn verify_upload_file(mut file: std::fs::File) -> Result<UploadFile> {
+fn verify_upload_file(
+    mut file: std::fs::File,
+    guard: super::retention::Guard,
+) -> Result<UploadFile> {
     let before = file.metadata()?;
     let mut hasher = Sha256::new();
     let mut count = 0u64;
@@ -997,7 +1105,10 @@ fn verify_upload_file(mut file: std::fs::File) -> Result<UploadFile> {
         .collect();
     file.seek(SeekFrom::Start(0))?;
     Ok(UploadFile {
-        file,
+        file: SourceReader {
+            file,
+            _guard: guard,
+        },
         digest: crate::ids::Digest::parse(&format!("sha256:{hash}"))?,
         size: count,
     })

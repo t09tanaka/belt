@@ -5395,8 +5395,13 @@ fn source_preview_guard_fences_retry_commit_and_foreign_guards_without_mutation(
         _ => panic!("expected prepare"),
     };
     let source = crate::source::SourceStore::open(f._dir.path()).unwrap();
+    let prepared = prepare();
     let exclusive = source.retention.guard(true).unwrap();
-    assert!(f.store.commit_retry(prepare(), false, 40).is_err());
+    assert!(f
+        .store
+        .prepare_retry(target.clone(), 0, "blocked-preflight".into())
+        .is_err());
+    assert!(f.store.commit_retry(prepared, false, 40).is_err());
     assert_eq!(
         f.store.completion(target.clone()).unwrap().control_revision,
         0
@@ -5422,4 +5427,62 @@ fn source_preview_guard_fences_retry_commit_and_foreign_guards_without_mutation(
         .unwrap();
     assert_eq!(f.store.completion(target).unwrap().control_revision, 1);
     drop(source.retention.guard(true).unwrap());
+}
+
+#[test]
+fn future_run_expiry_fences_retry_preflight_commit_and_enqueue_without_mutation() {
+    use crate::service::completion::Target;
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let target = Target::Run(f.run.clone());
+    let prepared = match f
+        .store
+        .prepare_retry(target.clone(), 0, "before-expiry".into())
+        .unwrap()
+    {
+        RetryPreparation::Prepared(p) => p,
+        _ => panic!("expected prepared retry"),
+    };
+    let sources = crate::source::SourceStore::open(f._dir.path()).unwrap();
+    {
+        let _exclusive = sources.retention.guard(true).unwrap();
+        // Fixture-only insertion: production A exposes no expiry mutator.
+        rusqlite::Connection::open(sources.root().join("retention.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO run_expiry VALUES(?1,?2,?3)",
+                rusqlite::params![
+                    f.run.as_str(),
+                    prepared.source_id.as_str(),
+                    prepared.manifest_digest.as_str()
+                ],
+            )
+            .unwrap();
+    }
+    match f
+        .store
+        .prepare_retry(target.clone(), 0, "after-expiry".into())
+    {
+        Err(error) => assert!(error.to_string().contains("run expired")),
+        Ok(_) => panic!("expired preflight accepted"),
+    }
+    assert!(f
+        .store
+        .commit_retry(prepared, false, 40)
+        .unwrap_err()
+        .to_string()
+        .contains("run expired"));
+    assert!(f
+        .store
+        .enqueue(
+            &f.run,
+            None,
+            &json!({}),
+            &[(TaskId::generate(), json!({}))],
+            40
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("run expired"));
+    assert_eq!(f.store.completion(target).unwrap().control_revision, 0);
+    assert_eq!(f.store.attempts_of_task(&f.task).unwrap().len(), 1);
 }

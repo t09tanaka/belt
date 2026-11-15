@@ -582,3 +582,34 @@ mutation routing traceではGit起動がfixture開始7秒後となり、5秒でr
 
 
 989で失敗した3経路は修正統合`208987d`で、bootstrap・起動preflight・部分ページ回収をnextest jobs2へ絞って再実行し3件とも成功した。capabilityのinstallable bundleがprofile/OS/arch/feature条件を免除しないこととbundle無しの拒否を追加し、wire test helperの不要な型分岐を共有response値へ整理した。限定46件成功、coverageはcapability411/411行・wire1709/1709行、mutation130件はcaught117・survived0・timeout0・unviable13。profile修正は起動時Knownから一時Unknownへの変化だけを許容し、実体/版の変更と初期UnknownからKnownは従来通り再attestationを要求する。必須ツール・固定baselineはlive Unknownで拒否し、独立安全レビューでP1/P2無し。実際のCI不一致の方向は未確定なので、全体CIで再確認する。
+
+### Source/Vault deletion A: 非削除の ownership / availability fences
+
+ユーザーは具体的な保持・削除条件に対して「この条件で実装・有効化する（推奨）」と明示承認した。
+承認は後続の実装・有効化まで持続する。今回は A の foundation のみで、実際の root expiry、
+削除 claim の作成、unlink、Vault erasure、resident 自動削除の有効化は追加しない。
+B/C と削除専任レビューを経て実削除へ進む。ユーザー実 state は検証に使わない。
+
+取り込みごとの durable token と store identity、publishing / published / bound の状態・正確な run 予約を追加し、
+同じ hash を受け取る別 import の保護を解除しない。handoff と membership release は一度に32件以下の
+transaction とし、crash / 不一致時は保護を残す。token 無しの旧 API は独立した保護 root を残し、
+hash 共通 marker の一括解除を廃止する。旧 unknown / legacy / unsubmitted root は保持を続ける。
+
+将来の run expiry fence と source/object publication incarnation を別の型・source-owned table で表す。
+content-addressed SourceID の生成式・同一入力IDは変えない。B の claim 完了後、同じ ID/hash の
+新 publication incarnation は可能だが、旧 run の失効は解除しない。A は production から expiry / claim
+状態へ遷移させない。将来の Vault-only SecretUnavailable fence は別の責務で、source bytes の7日保持や
+共有 source の読み取りと混同しない。
+
+publication / bind / enqueue / retry preflight+commit / source read・transfer・readiness に将来の fence 検査を接続する。
+source-first / EX nonblocking を維持し、actor の中で source lock を待たない。公開 object_store は guard-owned
+view とし、SDK raw handle を通常の公開 API から返さない。crate 内 SDK 呼び出し用の with_sdk callback は
+全 callback 中 SH を保持する。SDK は書きながら hash を発見するため、pending publication claim 中は raw SDK
+操作を保守的に拒否する。S16 の build_frozen_plan_from_source はこの callback 内へ適応する。
+UploadFile の reader 自身も SH を所有し、async waiter の取消後も実 blocking read / upload drain まで保持する。
+信頼 caller の意図的な filesystem / SDK handle 持ち出しまで防げるとは主張しない。
+
+private fixture の source retention 26件、retry 関連25件、toolchain 63件、source capture 38件、worker blobs 34件、
+forward upload 1件と strict all-target/all-feature clippy、fmt/diff check が成功した（群間に重複あり）。
+source subprocess helper 2件は standalone ignored で、親テストが必要時に直接起動する。
+全体 CI / push / 実削除の検証は A の対象外とする。

@@ -199,6 +199,17 @@ impl CoordinatorStore {
         if source.root != self.state_dir.join("sources") {
             return Err(StorageError::Invalid("foreign source guard".into()));
         }
+        source
+            .ensure_sdk_available()
+            .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        source
+            .ensure_run_available(run_id)
+            .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        if let Some(id) = source_id.and_then(crate::source::classify::ci_id_of) {
+            source
+                .ensure_source_available(&id)
+                .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        }
         let _source = source;
 
         if tasks.is_empty() || tasks.len() > MAX_TASKS_PER_RUN {

@@ -1700,7 +1700,7 @@ async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
     let source = sources.source_of_run(&run).unwrap().unwrap();
     let manifest = sources.manifest(&source).unwrap().unwrap();
     let blob = &manifest.object_manifest.entries[0].hash;
-    std::fs::remove_file(sources.object_store().object_path(blob)).unwrap();
+    std::fs::remove_file(sources.object_store().unwrap().object_path(blob)).unwrap();
     let rejected = client
         .request(Operation::Retry {
             target: Target::Run(run.clone()),

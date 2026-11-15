@@ -120,6 +120,9 @@ pub fn capture(
     let _mutation = store
         .mutation_guard()
         .map_err(|e| classify::api_error_of(&e))?;
+    _mutation
+        .ensure_sdk_available()
+        .map_err(|e| classify::api_error_of(&e))?;
     let retention_root = store
         .capture_pending_root()
         .map_err(|e| classify::api_error_of(&e))?;
@@ -258,6 +261,8 @@ pub fn capture_for_run(
         })
     };
     let _mutation = store.mutation_guard().map_err(internal)?;
+    _mutation.ensure_run_available(run).map_err(internal)?;
+    _mutation.ensure_sdk_available().map_err(internal)?;
     // one capture of a run at a time, in this process and in others
     let _lock = store.lock_run(run).map_err(internal)?;
     let wanted = RunRecord {
