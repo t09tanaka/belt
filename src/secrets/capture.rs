@@ -79,6 +79,7 @@ pub fn capture_run(
     let _mutation = store
         .mutation_guard()
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    vault.ensure_run_available(run).map_err(|e| e.to_api())?;
     let (key, declared) = (inputs.key, inputs.declared);
     check_declared(declared).map_err(|l| ApiError::new(ErrorCode::InvalidInput, l.to_string()))?;
     let included = match request {

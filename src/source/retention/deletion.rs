@@ -1,4 +1,4 @@
-//! Parent-only, explicitly invoked source retention. No resident task calls this.
+//! Parent-only source retention, invoked by the resident bounded driver.
 //! Source EX spans the synchronous operation, including unlink/fsync/SQLite drain.
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -103,7 +103,42 @@ fn components(object: &str, path: &str) -> Result<Vec<String>> {
     Ok(path.split('/').map(str::to_owned).collect())
 }
 impl Index {
-    fn check_anchor(&self) -> Result<()> {
+    pub(super) fn exact_run_binding(
+        &self,
+        run: &str,
+        source: &str,
+        binding: &str,
+    ) -> Result<String> {
+        let runs: File =
+            rustix::fs::openat(&*self.root, "runs", DIR, rustix::fs::Mode::empty())?.into();
+        directory(&runs, false)?;
+        let record: File = rustix::fs::openat(
+            &runs,
+            run,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?
+        .into();
+        let identity = Identity::of(&record)?;
+        ensure!(
+            identity.leaf() && identity.size <= 65536,
+            "unsafe source run binding"
+        );
+        let mut bytes = Vec::new();
+        (&record).take(identity.size + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            Identity::of(&record)? == identity && bytes.len() as u64 == identity.size,
+            "source run binding changed"
+        );
+        let record: super::super::store::RunRecord = serde_json::from_slice(&bytes)?;
+        ensure!(record.ci_source_id == source, "source run binding mismatch");
+        Ok(format!("{binding}:{:x}", Sha256::digest(&bytes)))
+    }
+
+    pub(super) fn check_anchor(&self) -> Result<()> {
         self.current()?;
         // Walk every configured ancestor without following a symlink. This
         // also rechecks root identity after a state-parent replacement.
@@ -286,7 +321,7 @@ impl Index {
 }
 impl SourceStore {
     /// Explicit parent-only page. Samples must come from trusted platform clocks
-    /// in a future driver; this API does not enable an automatic deletion loop.
+    /// in the resident driver; callers must retain the owner through actual drain.
     /// Eligibility scans a run's generation history and is not constant-time.
     #[allow(clippy::too_many_arguments)]
     pub fn retention_page(
@@ -314,6 +349,8 @@ impl SourceStore {
             }
             Err(error) => return Err(error),
         };
+        #[cfg(test)]
+        self.retention.pause_page();
         self.retention.check_anchor()?;
         let owner_identity = owner.check_input_store(&self.retention.path, &self.retention.root)?;
         let mut c = self.retention.connect()?;
@@ -426,39 +463,23 @@ impl SourceStore {
                 cursor.validated = None;
                 return Ok(report);
             }
-            // Positive immutable private binding, read only through held root.
-            let runs: File = rustix::fs::openat(
-                &*self.retention.root,
-                "runs",
-                DIR,
-                rustix::fs::Mode::empty(),
-            )?
-            .into();
-            directory(&runs, false)?;
-            let record: File = rustix::fs::openat(
-                &runs,
-                &run,
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::NOFOLLOW
-                    | rustix::fs::OFlags::NONBLOCK
-                    | rustix::fs::OFlags::CLOEXEC,
-                rustix::fs::Mode::empty(),
-            )?
-            .into();
-            let identity = Identity::of(&record)?;
-            ensure!(
-                identity.leaf() && identity.size <= 65536,
-                "unsafe source run binding"
-            );
-            let mut bytes = Vec::new();
-            (&record).take(identity.size + 1).read_to_end(&mut bytes)?;
-            ensure!(
-                Identity::of(&record)? == identity && bytes.len() as u64 == identity.size,
-                "source run binding changed"
-            );
-            let record: super::super::store::RunRecord = serde_json::from_slice(&bytes)?;
-            ensure!(record.ci_source_id == source, "source run binding mismatch");
-            let binding = format!("{binding}:{:x}", Sha256::digest(&bytes));
+            let binding = self.retention.exact_run_binding(&run, &source, &binding)?;
+            // Secret manifests remain roots until this exact run's Vault work
+            // has completed. C may be held, busy, behind its cursor, or failed
+            // after its durable claim; scheduling order is not authority.
+            if !validated.manifest.secret_files.is_empty() {
+                let resolved: bool = c.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM vault_delete_claim WHERE run_id=?1 AND source_id=?2 AND binding_digest=?3 AND done=1)",
+                    params![run, source, binding],
+                    |r| r.get(0),
+                )?;
+                if !resolved {
+                    cursor.run = Some(run);
+                    cursor.object.clear();
+                    cursor.validated = None;
+                    return Ok(report);
+                }
+            }
             // Permanent fence commits BEFORE any membership can be released.
             ensure!(
                 owner.check_input_store(&self.retention.path, &self.retention.root)?

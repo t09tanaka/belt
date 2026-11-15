@@ -80,20 +80,25 @@ impl WorkerLink for Slow {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_unknown() {
-    collection_shutdown_fixture(false, false).await;
+    collection_shutdown_fixture(false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_drains_log_append_and_commit_before_releasing_owner() {
-    collection_shutdown_fixture(true, false).await;
+    collection_shutdown_fixture(true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gc_pin_contention_keeps_resident_ipc_and_lease_renewal_alive() {
-    collection_shutdown_fixture(false, true).await;
+    collection_shutdown_fixture(false, true, false).await;
 }
 
-async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn input_gc_blocking_page_keeps_ipc_renewals_and_owner_until_stop_drain() {
+    collection_shutdown_fixture(false, false, true).await;
+}
+
+async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool, input_pause: bool) {
     let root = tempfile::Builder::new()
         .prefix("rtr-clocks-")
         .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
@@ -258,10 +263,27 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
     resident.worker_connection = tokio::spawn(std::future::pending());
     resident.coordinator.attach(worker, slow.clone()).await;
     let append_pause = append_bytes.then(|| resident.files.pause_next_log_append());
+    let input_pause = input_pause.then(|| {
+        resident.captured.retention_test.fast();
+        resident.captured.sources.pause_retention_page()
+    });
+    let input_sources = resident.captured.sources.clone();
     let client = resident.client();
     let guard = gc_contention.then(|| resident.coordinator.store().result_gc_guard(&run).unwrap());
     let mut runner = tokio::spawn(resident.run());
-    if gc_contention {
+    if let Some((entered, _)) = &input_pause {
+        tokio::time::timeout(Duration::from_secs(4), async {
+            loop {
+                if entered.try_recv().is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    if gc_contention || input_pause.is_some() {
         tokio::time::timeout(Duration::from_secs(4), async {
             while slow.renewals.load(Ordering::SeqCst) < 2 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -270,10 +292,12 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
         .await
         .unwrap();
         assert!(!runner.is_finished(), "GC contention stopped the resident");
-        assert!(
-            !slow.collecting.load(Ordering::SeqCst),
-            "collection bypassed the exclusive pin"
-        );
+        if gc_contention {
+            assert!(
+                !slow.collecting.load(Ordering::SeqCst),
+                "collection bypassed the exclusive pin"
+            );
+        }
         tokio::time::timeout(
             Duration::from_secs(2),
             client.query(crate::service::query::Query::Run {
@@ -360,7 +384,7 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
     ));
-    if let Some((_, resume)) = append_pause {
+    if let Some((_, resume)) = append_pause.or(input_pause) {
         let still_running = tokio::time::timeout(Duration::from_millis(100), &mut runner)
             .await
             .is_err();
@@ -368,8 +392,18 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool) {
             CoordinatorStore::open(&state, 1),
             Err(crate::storage::StorageError::Locked(_))
         );
+        if !append_bytes
+            && (input_sources.mutation_guard().is_ok()
+                || crate::secrets::vault::Vault::open(&state).is_ok())
+        {
+            resume.send(()).unwrap();
+            panic!("source/Vault EX released before blocking retention page drained");
+        }
         resume.send(()).unwrap();
-        assert!(still_running, "shutdown abandoned an append in flight");
+        assert!(
+            still_running,
+            "shutdown abandoned filesystem work in flight"
+        );
         assert!(
             owner_retained,
             "owner lock released before filesystem IO drained"
@@ -1602,6 +1636,9 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
         }
         out
     }
+    // Isolate read-only IPC evidence from the enabled background input GC.
+    // Production uses the same nonblocking busy skip while a reader holds SH.
+    let _source_gc_pin = resident.captured.sources.mutation_guard().unwrap();
     let before_rows = rows(&coordinator);
     let before_sources = files(&root.path().join("parent/sources"));
     let before_traffic = files(&root.path().join("worker/traffic"));

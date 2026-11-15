@@ -7,6 +7,12 @@
 //! once. A retry of the run reads the same copy, never the working tree again.
 //! The copy is deleted when the run is terminal.
 
+mod guard;
+#[cfg(test)]
+pub(crate) use guard::set_retention_fault;
+pub(crate) use guard::{retention_fault, Claim, Lease};
+use std::sync::Arc;
+
 use super::envfile::{secret_values, Values};
 use super::key::ClusterKey;
 use super::plan::{check_limits, check_paths, ct_eq, hex_decode, listing_digest, to_wire_digest};
@@ -27,11 +33,18 @@ pub(crate) const STALE_TMP_AGE: Duration = Duration::from_secs(600);
 
 /// The files of one run with their keyed digests, ready to send. `Debug`
 /// names the paths and never shows a content.
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct HeldBundle {
     pub files: Vec<SecretFile>,
+    retained: Option<crate::protocol::sched::Retained>,
 }
 
+impl PartialEq for HeldBundle {
+    fn eq(&self, other: &Self) -> bool {
+        self.files == other.files
+    }
+}
+impl Eq for HeldBundle {}
 impl std::fmt::Debug for HeldBundle {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HeldBundle")
@@ -48,6 +61,9 @@ impl std::fmt::Debug for HeldBundle {
 }
 
 impl HeldBundle {
+    pub(crate) fn retained(&self) -> Option<crate::protocol::sched::Retained> {
+        self.retained.clone()
+    }
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
@@ -203,6 +219,7 @@ pub(crate) fn sweep_stale_tmp(dir: &Path, max_age: Duration) -> Result<usize> {
 
 pub struct Vault {
     dir: PathBuf,
+    root: Arc<std::fs::File>,
 }
 
 impl Vault {
@@ -217,21 +234,76 @@ impl Vault {
             .map_err(|e| SecretError::io(format!("directory {}", dir.display()), e))?;
         let meta = fs::symlink_metadata(&dir)
             .map_err(|e| SecretError::io(format!("directory {}", dir.display()), e))?;
-        if !meta.file_type().is_dir() || meta.mode() & 0o077 != 0 {
+        if !meta.file_type().is_dir()
+            || meta.mode() & 0o077 != 0
+            || meta.uid() != rustix::process::geteuid().as_raw()
+        {
             return Err(SecretError::Insecure {
                 what: "secret directory",
                 path: dir,
             });
         }
-        Ok(Vault { dir })
+        let dir = std::fs::canonicalize(&dir)
+            .map_err(|e| SecretError::io("resolve Vault directory", e))?;
+        let root = Arc::new(
+            rustix::fs::open(
+                &dir,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::DIRECTORY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )
+            .map(std::fs::File::from)
+            .map_err(|e| SecretError::io("open Vault directory", e.into()))?,
+        );
+        let vault = Vault { dir, root };
+        let lease = vault.lease(false)?;
+        lease.check_parent().map_err(|_| SecretError::Unavailable {
+            what: "registered parent Vault".into(),
+        })?;
+        drop(lease);
+        Ok(vault)
     }
 
+    #[cfg(test)]
     fn path(&self, run: &RunId) -> PathBuf {
         self.dir.join(format!("{run}.json"))
     }
 
+    pub(crate) fn lease(&self, exclusive: bool) -> Result<Arc<Lease>> {
+        Lease::acquire(&self.dir, Arc::clone(&self.root), exclusive)
+            .map(Arc::new)
+            .map_err(|error| {
+                let busy = error.chain().any(|e| {
+                    e.downcast_ref::<std::io::Error>()
+                        .is_some_and(|e| e.kind() == ErrorKind::WouldBlock)
+                });
+                SecretError::io(
+                    "Vault ownership",
+                    if busy {
+                        std::io::Error::from(ErrorKind::WouldBlock)
+                    } else {
+                        std::io::Error::other(error)
+                    },
+                )
+            })
+    }
+    pub(crate) fn matches_source(&self, source: &Path) -> bool {
+        self.dir.parent() == source.parent()
+    }
+    fn available(&self, lease: &Lease, run: &RunId) -> Result<()> {
+        lease.available(run).map_err(|_| SecretError::Unavailable {
+            what: format!("run {run}"),
+        })
+    }
+    pub(crate) fn ensure_run_available(&self, run: &RunId) -> Result<()> {
+        self.available(self.lease(false)?.as_ref(), run)
+    }
     pub fn has(&self, run: &RunId) -> bool {
-        fs::symlink_metadata(self.path(run)).is_ok()
+        self.lease(false).ok().is_some_and(|lease| {
+            self.available(&lease, run).is_ok() && lease.has(run).unwrap_or(false)
+        })
     }
 
     /// Take the bundle local-ci wrote at `store_copy` for `run`, and check it
@@ -246,7 +318,11 @@ impl Vault {
         entries: &[SecretEntry],
         key: &ClusterKey,
     ) -> Result<()> {
-        let taken = self.take(run, store_copy, entries, key);
+        let taken = (|| {
+            let lease = self.lease(false)?;
+            self.available(&lease, run)?;
+            self.take(&lease, run, store_copy, entries, key)
+        })();
         let removed = match fs::remove_file(store_copy) {
             Err(e) if e.kind() != ErrorKind::NotFound => Err(SecretError::io(
                 format!("secret bundle {}", store_copy.display()),
@@ -259,6 +335,7 @@ impl Vault {
 
     fn take(
         &self,
+        lease: &Arc<Lease>,
         run: &RunId,
         store_copy: &Path,
         entries: &[SecretEntry],
@@ -266,14 +343,18 @@ impl Vault {
     ) -> Result<()> {
         let bytes = read_private(store_copy, "secret bundle")?;
         serde_json::from_slice::<Stored>(&bytes).map_err(|_| unreadable())?;
-        if self.has(run) {
+        if lease.has(run).map_err(|e| {
+            e.downcast::<SecretError>()
+                .unwrap_or_else(|e| SecretError::io("read Vault bundle", std::io::Error::other(e)))
+        })? {
             return Ok(());
         }
-        write_private(&self.path(run), &bytes)?;
-        if let Err(e) = self.load(run, entries, key) {
-            let _ = self.erase(run);
-            return Err(e);
-        }
+        // Verify before publication. This also avoids trying to upgrade a
+        // parent SH lease to EX for error cleanup while adoption still holds SH.
+        Self::decode(&bytes, entries, key)?;
+        lease
+            .publish(&format!("{run}.json"), &bytes)
+            .map_err(|e| SecretError::io("publish Vault bundle", std::io::Error::other(e)))?;
         Ok(())
     }
 
@@ -288,16 +369,40 @@ impl Vault {
         entries: &[SecretEntry],
         key: &ClusterKey,
     ) -> Result<HeldBundle> {
+        self.load_owned(self.lease(false)?, run, entries, key)
+    }
+    fn load_owned(
+        &self,
+        lease: Arc<Lease>,
+        run: &RunId,
+        entries: &[SecretEntry],
+        key: &ClusterKey,
+    ) -> Result<HeldBundle> {
+        self.available(&lease, run)?;
+        let retained = Some(crate::protocol::sched::Retained::new(Arc::clone(&lease)));
         if entries.is_empty() {
-            return Ok(HeldBundle { files: vec![] });
+            return Ok(HeldBundle {
+                files: vec![],
+                retained,
+            });
         }
-        let bytes = read_private(&self.path(run), "secret bundle").map_err(|e| match e {
-            SecretError::Unavailable { .. } => SecretError::Unavailable {
+        let bytes = lease
+            .bundle(run)
+            .map_err(|e| {
+                e.downcast::<SecretError>().unwrap_or_else(|e| {
+                    SecretError::io("read Vault bundle", std::io::Error::other(e))
+                })
+            })?
+            .ok_or_else(|| SecretError::Unavailable {
                 what: format!("run {run}"),
-            },
-            other => other,
-        })?;
-        let stored: Stored = serde_json::from_slice(&bytes).map_err(|_| unreadable())?;
+            })?;
+        Ok(HeldBundle {
+            files: Self::decode(&bytes, entries, key)?,
+            retained,
+        })
+    }
+    fn decode(bytes: &[u8], entries: &[SecretEntry], key: &ClusterKey) -> Result<Vec<SecretFile>> {
+        let stored: Stored = serde_json::from_slice(bytes).map_err(|_| unreadable())?;
         if stored.schema_version != 1 {
             return Err(SecretError::Format(format!(
                 "secret bundle schema {} is not supported",
@@ -342,17 +447,49 @@ impl Vault {
             .map(|f| (f.path.len(), f.content.0.len()))
             .collect();
         check_limits(&sizes).map_err(SecretError::Limit)?;
-        Ok(HeldBundle { files })
+        Ok(files)
+    }
+
+    pub(crate) fn claim_for_retention(
+        &self,
+        lease: &Lease,
+        run: &RunId,
+        entries: &[SecretEntry],
+        key: &ClusterKey,
+    ) -> anyhow::Result<Claim> {
+        // HMAC and file identity must describe the very same bytes. A later
+        // replacement cannot become authority merely by being privately owned.
+        let (claim, bytes) = lease.proof(run)?;
+        if let Some(bytes) = bytes {
+            anyhow::ensure!(
+                !entries.is_empty(),
+                "unexpected Vault bundle for a secret-free run"
+            );
+            Self::decode(&bytes, entries, key)?;
+        }
+        Ok(claim)
     }
 
     /// Delete the run's bundle (idempotent).
     pub fn erase(&self, run: &RunId) -> Result<()> {
-        match fs::remove_file(self.path(run)) {
-            Err(e) if e.kind() != ErrorKind::NotFound => {
-                Err(SecretError::io(format!("secret bundle of run {run}"), e))
-            }
-            _ => Ok(()),
-        }
+        // Even unregistered worker erasure participates in SH exclusion: a
+        // parent cannot register/claim concurrently with this ephemeral erase.
+        let shared = self.lease(false)?;
+        let registered = shared
+            .registered()
+            .map_err(|e| SecretError::io("read Vault registration", std::io::Error::other(e)))?;
+        let lease = if registered {
+            drop(shared);
+            self.lease(true)?
+        } else {
+            shared
+        };
+        self.available(&lease, run)?;
+        let result = (|| {
+            let claim = lease.claim(run)?;
+            lease.drain(run, &claim)
+        })();
+        result.map_err(|e| SecretError::io("erase private Vault bundle", std::io::Error::other(e)))
     }
 
     /// Delete the bundle of every run `is_terminal` says is finished (and
