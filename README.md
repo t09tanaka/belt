@@ -59,8 +59,8 @@ Or download a binary from the [releases](https://github.com/t09tanaka/local-ci/r
 | `local-ci plan` | Show the workflows, units and setup steps that would run. Runs nothing. |
 | `local-ci run` | Run them and report. Exit code 0 = success (or `no_work`: the changes trigger no workflow), 1 = failure, 2 = error (could not run, or the result lacks something the plan expects), 3 = `incomplete` (what ran passed, but steps or workflows that local-ci cannot reproduce were left out, so it is not a pass; the commit status is `error`), 130 = interrupted with Ctrl-C (a run stopped with `SIGTERM` or `SIGHUP` cleans up and ends by that signal). |
 | `local-ci status` | Record the last run's result as the `local-ci` commit status (for a commit you have pushed since). |
-| `local-ci cache status` | Show the disk space each part of the cache directory takes, and how many worktrees are in use, kept, left by runs that are gone, or left by an older version. |
-| `local-ci cache prune` | Remove the worktrees left by runs that are gone and empty the trash, before returning. `--kept` also removes the ones kept with `run --keep`, `--legacy` the ones left by a version that recorded no owner. |
+| `local-ci cache status` | Show the disk space each part of the cache directory takes, the entries of the build cache, and how many worktrees are in use, kept, left by runs that are gone, or left by an older version. |
+| `local-ci cache prune` | Remove the worktrees left by runs that are gone and empty the trash, before returning. `--kept` also removes the ones kept with `run --keep`, `--legacy` the ones left by a version that recorded no owner, `--build` empties the build cache. |
 
 Common options (`plan` and `run`):
 
@@ -292,6 +292,48 @@ there is one.
 When jobs are limited, the summary says how
 (`cpu    budget 12 · 3 jobs at once · 4 threads each`), and `result.json` and
 `--json` have it as `cpu`: `budget`, `jobs_at_once` and `threads_per_job`.
+
+### The build cache for Rust jobs
+
+Every job runs in a worktree of its own, so every job would build all its
+dependencies again. For a job whose checkout has a `Cargo.toml` and a
+`Cargo.lock` at its root, local-ci keeps the `target/` directory that the job
+left when it passed, and gives a copy of it to the next job with the same key,
+before its first step. Cargo then finds the dependencies Fresh. (The crates of
+the workspace itself are built again: their sources are newer than the build.)
+`actions/cache` and `Swatinem/rust-cache` stay no-ops; this does their job.
+
+- **Key.** `rustc -vV` and `cargo -V` (asked in the job's worktree, so
+  `rust-toolchain.toml` counts), the OS and architecture, every `Cargo.lock` of
+  the checkout, the workflow file and job id (matrix values only where they
+  reach the environment), and the variables that change a build: `RUSTFLAGS`,
+  `RUSTDOCFLAGS`, `RUSTC_WRAPPER`, `RUSTUP_TOOLCHAIN`, `CARGO_*` (not
+  `CARGO_BUILD_JOBS`, which is the job's CPU share, nor `CARGO_TERM_*`), and the
+  coverage variables (`LLVM_PROFILE_FILE`, `CARGO_LLVM_COV_*`). The path of the
+  worktree in a value is left out. A job that sets `CARGO_TARGET_DIR` or
+  `CARGO_BUILD_TARGET_DIR` does not use the cache.
+- **Restore.** Only when `target/` does not exist yet. The copy is a clone
+  where the file system has them (`cp -c` on APFS, `cp --reflink=always` on
+  btrfs, XFS): a 1.3 GB `target/` takes about a second. Without cloning, an
+  entry up to 512 MiB is copied (`LOCAL_CI_BUILD_CACHE_COPY_LIMIT_MB`); a larger
+  one is skipped and the job builds as before.
+- **Save.** Only when the job passed and the key has no entry yet. The entry is
+  written under a temporary name and renamed, so two jobs saving one key cannot
+  mix them; the job's own `target/` is not touched. `*/incremental`,
+  `*.profraw` and `mutants.out*` are left out.
+- **Limits.** Entries are in `<cache dir>/build/<key>/`. Once the cache is over
+  20 GB (`LOCAL_CI_BUILD_CACHE_MAX_GB`), the least recently used entries are
+  removed after a save. `local-ci cache status` lists them,
+  `local-ci cache prune --build` removes all.
+- **Off.** `local-ci run --no-build-cache`, or `LOCAL_CI_NO_BUILD_CACHE=1`.
+- **Failures.** A restore or save that fails never fails the job: a note on its
+  last step says why. The job's own steps are not changed.
+- **Seen.** The summary says `build cache  restored 2 · saved 1`; the last step
+  of the job has a note; `result.json` has `build_cache` (`key`, `restored`,
+  `saved`) on the job, left out for jobs the cache does not apply to.
+
+Only `local-ci run` uses it; `execute_plan` and the pinned executor do not (set
+`Runner::build_cache` to turn it on in a library caller).
 
 ## What is supported
 

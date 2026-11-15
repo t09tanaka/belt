@@ -377,6 +377,7 @@ impl Store {
                 secs: 0.0,
                 cancelled: false,
                 time: None,
+                build_cache: None,
                 steps: j
                     .steps
                     .into_iter()
@@ -710,6 +711,7 @@ jobs:
             ],
             cancelled: false,
             time: None,
+            build_cache: None,
         };
         let u = |o: Outcome| UnitResult {
             unit: None,

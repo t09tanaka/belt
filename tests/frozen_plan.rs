@@ -190,6 +190,7 @@ fn run_options(dir: &Path, cache: &Path) -> RunOptions {
         keep: false,
         job_timeout: 5.0,
         no_cache: true,
+        no_build_cache: true,
         cache_dir: cache.to_path_buf(),
         source: None,
     }

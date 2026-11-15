@@ -177,6 +177,8 @@ pub struct WireJobResult {
     pub cancelled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<JobTime>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_cache: Option<crate::build_cache::JobCache>,
 }
 
 impl WireJobResult {
@@ -190,6 +192,7 @@ impl WireJobResult {
             steps: steps_of(&j.steps, base)?,
             cancelled: j.cancelled,
             time: j.time.clone(),
+            build_cache: j.build_cache.clone(),
         })
     }
 
@@ -211,6 +214,7 @@ impl WireJobResult {
             steps: steps_back(self.steps, base)?,
             cancelled: self.cancelled,
             time: self.time,
+            build_cache: self.build_cache,
         })
     }
 }

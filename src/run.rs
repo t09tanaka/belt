@@ -58,6 +58,8 @@ pub struct RunOptions {
     pub keep: bool,
     pub job_timeout: f64,
     pub no_cache: bool,
+    /// Do not restore or save the `target/` of Rust jobs (see [`crate::build_cache`]).
+    pub no_build_cache: bool,
     /// Where runs, results, worktrees and locks live (see [`ExecContext::cache_dir`]).
     pub cache_dir: PathBuf,
     /// The captured source the run is over: `target.sha` is its execution
@@ -480,7 +482,7 @@ pub fn execute_plan(
             ws.run_dir.display()
         );
     }
-    run_plan(ctx, fp, ws, opts, None)
+    run_plan(ctx, fp, ws, opts, None, None)
 }
 
 /// [`execute_plan`] without the check of the run directory, for a run that
@@ -492,6 +494,7 @@ fn run_plan(
     opts: exec::Opts,
     // how the CPU is divided between the jobs, when it is
     cpu: Option<crate::cpu::Share>,
+    build_cache: Option<crate::build_cache::Settings>,
 ) -> Result<report::RunResult> {
     let t0 = std::time::Instant::now();
     let nothing = fp.units.is_empty();
@@ -507,6 +510,7 @@ fn run_plan(
     let keep = opts.keep;
     let mut runner = exec::Runner::new(ctx, fp, ws, opts)?;
     runner.job_threads = cpu.map(|c| c.threads_per_job);
+    runner.build_cache = build_cache;
     let result = (|| -> Result<_> {
         runner.prepare_tools()?;
         // Each task has a recipe of its own. This run does them in the one
@@ -788,7 +792,8 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             tools: tools.clone(),
             lock_file: cache.join("locks").join(format!("{key}.lock")),
         };
-        let result = run_plan(ctx, &fp, &ws, opts, cpu);
+        let build_cache = crate::build_cache::Settings::from_ctx(ctx, &cache, a.no_build_cache);
+        let result = run_plan(ctx, &fp, &ws, opts, cpu, build_cache);
         if a.keep {
             owner.keep();
             obs.notice(&format!("kept worktree {}", report::tilde(&wt, ctx.home())));

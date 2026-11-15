@@ -68,6 +68,10 @@ pub struct JobResult {
     /// Where the time went. Absent for jobs that did not run and for reused results.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub time: Option<JobTime>,
+    /// What the job did with the build cache (see [`crate::build_cache`]).
+    /// Absent when the cache was not used for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_cache: Option<crate::build_cache::JobCache>,
 }
 
 /// What a job waited for, and how long it really ran, in seconds.
@@ -200,6 +204,9 @@ pub struct Runner<'a> {
     /// in `cpu::JOB_THREAD_ENV` and ask task-traffic-controller for that weight.
     /// `None` (the default): jobs are not limited.
     pub job_threads: Option<usize>,
+    /// The build cache for `target/` of Rust jobs (see [`crate::build_cache`]).
+    /// `None` (the default): jobs do not use it. `local-ci run` sets it.
+    pub build_cache: Option<crate::build_cache::Settings>,
     pub base_path: String,
     /// The keys of the steps that count as setup, from the plan alone.
     hoisted: plan::Hoist,
@@ -213,6 +220,13 @@ pub struct Runner<'a> {
     /// Why the units of a workflow (by index in the plan) are not run: an
     /// artifact step of it that cannot be run.
     refused: HashMap<usize, String>,
+}
+
+/// What one job did with the build cache.
+struct BuildCacheRun {
+    key: String,
+    stat: crate::build_cache::JobCache,
+    notes: Vec<String>,
 }
 
 /// What [`Runner::run_unit`] keeps of the shards of one split job until the job
@@ -897,6 +911,7 @@ impl<'a> Runner<'a> {
             slug: fp.repository.clone().unwrap_or_default(),
             opts,
             job_threads: None,
+            build_cache: None,
             base_path,
             seq: pinned
                 .map(|(_, ws, _)| ws.sequence.clone())
@@ -1773,6 +1788,7 @@ impl<'a> Runner<'a> {
                 steps: vec![],
                 cancelled: false,
                 time: None,
+                build_cache: None,
             })
             .collect()
     }
@@ -1993,6 +2009,7 @@ impl<'a> Runner<'a> {
                         steps: vec![],
                         cancelled: false,
                         time: None,
+                        build_cache: None,
                     })
                     .collect();
                 charge(&mut jobs, waited);
@@ -2108,6 +2125,7 @@ impl<'a> Runner<'a> {
                             steps: vec![],
                             cancelled: true,
                             time: None,
+                            build_cache: None,
                         };
                         hold.outcomes.push(outcome_of(id, None, &r, &Map::new()));
                         jobs.push(r);
@@ -2194,6 +2212,7 @@ impl<'a> Runner<'a> {
                                 steps: vec![],
                                 cancelled: false,
                                 time: None,
+                                build_cache: None,
                             });
                         }
                     }
@@ -2595,6 +2614,7 @@ impl<'a> Runner<'a> {
                     steps: vec![],
                     cancelled: false,
                     time: None,
+                    build_cache: None,
                 },
                 Map::new(),
             )
@@ -2616,6 +2636,7 @@ impl<'a> Runner<'a> {
                     steps: vec![],
                     cancelled: false,
                     time: None,
+                    build_cache: None,
                 },
                 Map::new(),
             )
@@ -2881,6 +2902,7 @@ impl<'a> Runner<'a> {
             steps,
             cancelled: false,
             time: None,
+            build_cache: None,
         };
 
         // services
@@ -2959,6 +2981,7 @@ impl<'a> Runner<'a> {
                 Map::new(),
             );
         }
+        let mut bc = self.build_cache_start(ws, w, job, &env_ctx);
         let job_timeout = Duration::from_secs_f64(
             60.0 * job.timeout_minutes.unwrap_or(self.opts.job_timeout_min),
         );
@@ -3470,7 +3493,26 @@ impl<'a> Runner<'a> {
         } else {
             Outcome::Pass
         };
+        // A job that passed leaves its `target/` for the next one with the
+        // same key. The notes go on the last step: a result has as many steps as
+        // the plan has.
+        let mut build_cache = None;
+        if let Some(b) = bc.as_mut() {
+            if matches!(outcome, Outcome::Pass) {
+                self.build_cache_save(b, ws);
+            }
+            if let Some(last) = steps.last_mut() {
+                for n in &b.notes {
+                    last.note = Some(match last.note.take() {
+                        Some(o) => format!("{o}; {n}"),
+                        None => n.clone(),
+                    });
+                }
+            }
+            build_cache = Some(b.stat.clone());
+        }
         let mut result = finish(outcome, steps, t0);
+        result.build_cache = build_cache;
         result.cancelled = cancelled && matches!(result.outcome, Outcome::Error(_));
         result.time = Some(JobTime {
             work_secs: (result.secs - queue.as_secs_f64()).max(0.0),
@@ -3478,6 +3520,90 @@ impl<'a> Runner<'a> {
             ..JobTime::default()
         });
         (result, outputs)
+    }
+
+    /// Fill `<ws>/target` from the build cache, if the job is one the cache
+    /// is for: a Rust workspace, with the cache on. Never fails the job.
+    fn build_cache_start(
+        &self,
+        ws: &Path,
+        w: &Workflow,
+        job: &Job,
+        env_ctx: &Map<String, Value>,
+    ) -> Option<BuildCacheRun> {
+        use crate::build_cache as bc;
+        let s = self.build_cache.as_ref()?;
+        if !bc::applies(ws) {
+            return None;
+        }
+        let mut vars: Vec<(String, String)> = self
+            .ctx
+            .env()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        vars.extend(env_ctx.iter().map(|(k, v)| (k.clone(), expr::to_string(v))));
+        vars.extend(job.steps.iter().flat_map(|st| st.env.iter().cloned()));
+        let env = bc::build_env(vars.iter().map(|(k, v)| (k.as_str(), v.as_str())), ws);
+        if bc::moves_target(&env) {
+            return None;
+        }
+        let (rustc, cargo) = bc::toolchain(self.ctx, ws, &self.base_path)?;
+        let key = bc::key(&bc::KeyInputs {
+            rustc,
+            cargo,
+            os_arch: bc::os_arch(),
+            locks: bc::lock_digests(ws),
+            job: format!("{}#{}", w.file, job.id),
+            env,
+        });
+        let mut run = BuildCacheRun {
+            stat: bc::JobCache {
+                key: key[..12].to_string(),
+                ..Default::default()
+            },
+            key,
+            notes: Vec::new(),
+        };
+        let t = Instant::now();
+        match bc::restore(self.ctx, s, &run.key, ws) {
+            bc::Restore::Restored => {
+                run.stat.restored = true;
+                run.notes.push(format!(
+                    "build cache: restored {} in {:.1}s",
+                    run.stat.key,
+                    t.elapsed().as_secs_f64()
+                ));
+            }
+            bc::Restore::Miss => {}
+            bc::Restore::Skipped(why) => {
+                run.notes.push(format!("build cache: not restored ({why})"))
+            }
+        }
+        Some(run)
+    }
+
+    /// Add the job's `target/` to the build cache, and prune the cache. Never fails the job.
+    fn build_cache_save(&self, run: &mut BuildCacheRun, ws: &Path) {
+        use crate::build_cache as bc;
+        let Some(s) = self.build_cache.as_ref() else {
+            return;
+        };
+        let t = Instant::now();
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        match bc::save(self.ctx, s, &run.key, ws, seq) {
+            bc::Save::Saved => {
+                run.stat.saved = true;
+                run.notes.push(format!(
+                    "build cache: saved {} in {:.1}s",
+                    run.stat.key,
+                    t.elapsed().as_secs_f64()
+                ));
+                bc::prune(self.ctx, s, Some(&run.key));
+            }
+            bc::Save::Exists => {}
+            bc::Save::Skipped(why) => run.notes.push(format!("build cache: not saved ({why})")),
+        }
     }
 
     /// `uses:` steps: version checks for setup actions, skips for the rest.
@@ -4059,6 +4185,7 @@ mod tests {
             steps: vec![],
             cancelled: false,
             time: None,
+            build_cache: None,
         }
     }
 
@@ -4462,6 +4589,7 @@ mod tests {
             ],
             cancelled,
             time,
+            build_cache: None,
         };
         let time = JobTime {
             work_secs: 1.0,

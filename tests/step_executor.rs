@@ -846,6 +846,7 @@ fn run_never_discovers_or_removes_other_runs_containers_at_startup() {
             keep: false,
             job_timeout: 5.0,
             no_cache: true,
+            no_build_cache: true,
             cache_dir: l.tmp.path().join("startup-run"),
             source: None,
         },
