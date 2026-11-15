@@ -640,6 +640,10 @@ impl CoordinatorStore {
         spec: &Value,
         at_ms: u64,
     ) -> Result<()> {
+        let mutation = self.source_mutation_guard()?;
+        mutation
+            .ensure_run_available(run_id)
+            .map_err(|error| StorageError::Invalid(format!("{error:#}")))?;
         let (task, run, spec) = (task_id.to_string(), run_id.to_string(), spec.to_string());
         self.db.write(move |tx| {
             tx.execute(
@@ -658,6 +662,8 @@ impl CoordinatorStore {
     /// earlier attempt of the same task is neither terminal nor confirmed
     /// retired: a new attempt needs the old one's end (or retire) first.
     pub fn create_attempt(&self, new: NewAttempt, at_ms: u64) -> Result<AttemptRecord> {
+        let retained_mutation = self.source_mutation_guard()?;
+        let mutation = retained_mutation.clone();
         let epoch = self.epoch;
         self.db.write(move |tx| {
             let task = new.task_id.to_string();
@@ -667,6 +673,11 @@ impl CoordinatorStore {
                 })
                 .optional()?
                 .ok_or_else(|| not_found(format!("task {task}")))?;
+            mutation
+                .ensure_run_available(
+                    &RunId::parse(&run).map_err(|e| StorageError::Invalid(e.to_string()))?,
+                )
+                .map_err(|error| StorageError::Invalid(format!("{error:#}")))?;
             let live: Option<String> = tx
                 .query_row(
                     "SELECT attempt_id FROM attempt

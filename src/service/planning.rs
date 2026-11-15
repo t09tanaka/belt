@@ -148,7 +148,16 @@ pub fn prepare(context: Context, revision: Option<&str>) -> Result<Prepared, Api
         base_branch: None,
         changed_files: None,
     };
-    let frozen = local_ci::build_frozen_plan_from_source(store.object_store(), &manifest, &options)
+    let frozen = store
+        .object_store()
+        .and_then(|view| {
+            view.with_sdk(|objects| {
+                Ok(local_ci::build_frozen_plan_from_source(
+                    objects, &manifest, &options,
+                ))
+            })
+        })
+        .map_err(|_| failure("captured planning input is unavailable"))?
         .map_err(|error| ApiError::new(ErrorCode::InvalidInput, error.to_string()))?;
     let plan = CiPlan::from_frozen(frozen)
         .map_err(|_| failure("captured plan cannot be summarized safely"))?;
@@ -208,7 +217,7 @@ mod tests {
         });
         assert!(captured_text(&store, &bad, path).is_err());
         let hash = &manifest.object_manifest.entries[0].hash;
-        std::fs::write(store.object_store().object_path(hash), "corrupt!").unwrap();
+        std::fs::write(store.object_store().unwrap().object_path(hash), "corrupt!").unwrap();
         assert!(captured_text(&store, &manifest, path).is_err());
     }
     #[test]
@@ -244,7 +253,15 @@ mod tests {
             changed_files: None,
         };
         assert!(matches!(
-            local_ci::build_frozen_plan_from_source(store.object_store(), &manifest, &options),
+            store
+                .object_store()
+                .unwrap()
+                .with_sdk(|objects| {
+                    Ok(local_ci::build_frozen_plan_from_source(
+                        objects, &manifest, &options,
+                    ))
+                })
+                .unwrap(),
             Err(local_ci::PinnedPlanError::MissingChangedFiles)
         ));
     }

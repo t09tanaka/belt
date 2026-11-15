@@ -634,3 +634,72 @@ ROOTの起動時attestation修正3216a745を、準備状態probe branchへd29682
 独立した `preparation_probe_v1` を交渉し、`PreparationProbe` をread-only/control operationとして追加した。実際のmanifest/source/run/setup/frozen/in_placeと選択workerのexpected profile fingerprintを受け、現在のcfg fingerprintが一致した場合だけ既存のbounded worker-local probeへ渡す。setup/frozenはDebugから除外する。応答はworker/boot/agent epochと実際のowner generation・opaque producer key・ConcretePlan・Active builder/attempt・typed Unknownのみで、最大16件をdecode時にも制限する。InspectやProfile.reportを呼ばず、completed snapshotの元の時刻とTTLを維持し、queue/attempt/ledger/native commandへ作用しない。
 
 このsliceはworker/wireだけであり、親のquery送信・観測取り込み・generation fencing、verified activation/warm proof、実際のTTC ledger identityとの対応とcost接続は必須残件として残す。setup秒・foreground forecast・cold/warm・admissionの意味は変更しない。focused wire/probe/protocol/RPCとstrict checkの結果はhandoffへ記録し、全体CI・push・公開の成功とは扱わない。
+
+### Source/Vault deletion A: 非削除の ownership / availability fences
+
+ユーザーは具体的な保持・削除条件に対して「この条件で実装・有効化する（推奨）」と明示承認した。
+承認は後続の実装・有効化まで持続する。今回は A の foundation のみで、実際の root expiry、
+削除 claim の作成、unlink、Vault erasure、resident 自動削除の有効化は追加しない。
+B/C と削除専任レビューを経て実削除へ進む。ユーザー実 state は検証に使わない。
+
+取り込みごとの durable token と store identity、publishing / published / bound の状態・正確な run 予約を追加し、
+同じ hash を受け取る別 import の保護を解除しない。handoff と membership release は一度に32件以下の
+transaction とし、crash / 不一致時は保護を残す。token 無しの旧 API は独立した保護 root を残し、
+hash 共通 marker の一括解除を廃止する。旧 unknown / legacy / unsubmitted root は保持を続ける。
+
+将来の run expiry fence と source/object publication incarnation を別の型・source-owned table で表す。
+content-addressed SourceID の生成式・同一入力IDは変えない。B の claim 完了後、同じ ID/hash の
+新 publication incarnation は可能だが、旧 run の失効は解除しない。A は production から expiry / claim
+状態へ遷移させない。将来の Vault-only SecretUnavailable fence は別の責務で、source bytes の7日保持や
+共有 source の読み取りと混同しない。
+
+publication / bind / enqueue / retry preflight+commit / source read・transfer・readiness に将来の fence 検査を接続する。
+source-first / EX nonblocking を維持し、actor の中で source lock を待たない。公開 object_store は guard-owned
+view とし、SDK raw handle を通常の公開 API から返さない。crate 内 SDK 呼び出し用の with_sdk callback は
+全 callback 中 SH を保持する。SDK は書きながら hash を発見するため、pending publication claim 中は raw SDK
+操作を保守的に拒否する。S16 の build_frozen_plan_from_source はこの callback 内へ適応する。
+UploadFile の reader 自身も SH を所有し、async waiter の取消後も実 blocking read / upload drain まで保持する。
+信頼 caller の意図的な filesystem / SDK handle 持ち出しまで防げるとは主張しない。
+
+private fixture の source retention 26件、retry 関連25件、toolchain 63件、source capture 38件、worker blobs 34件、
+forward upload 1件と strict all-target/all-feature clippy、fmt/diff check が成功した（群間に重複あり）。
+source subprocess helper 2件は standalone ignored で、親テストが必要時に直接起動する。
+全体 CI / push / 実削除の検証は A の対象外とする。
+
+
+### S15 source retention B: bounded explicit deletion (resident disabled)
+
+B adds an explicit parent-only `SourceStore::retention_page`; no resident caller or Vault erasure is enabled.
+Source EX is acquired nonblocking before coordinator actor work and held through synchronous physical IO/commit.
+The configured writable coordinator is matched to held source/state identities and SQLite's actual main connection
+via actor-local `SQLITE_FCNTL_HAS_MOVED` (unknown/unsupported/moved fails closed without opening a validation DB FD).
+Exact run/source-ref digest, sealed manifest and FD-read private run binding precede a permanent run-expiry fence.
+Every generation must be known/typed terminal with mandatory collection closed; queued/retry generations block.
+The history proof intentionally scans a run's history, so it is not described as constant-time.
+Direct create_task/create_attempt now take source SH and consult the run fence; terminal/result updates are unchanged.
+
+Each page selects <=32 indexed memberships or <=32 pending exact claims, with separate examined/path counters.
+Only exact membership PK rows are released; root/graph/object/run tombstones remain and no cascade/directory walk
+is used. Incomplete/unknown/import/legacy and shared memberships retain protection. Clock Hold forbids expiry,
+new claims AND replay unlink. A durable claim includes store/ancestor identity, incarnation, safe relative class/path,
+leaf dev/inode/size/UID/link/mode/timestamps and verified content digest before any unlink. Root/ancestors are
+NOFOLLOW-opened and checked again before FD-relative leaf unlink; directories are never removed. Data 0644 and
+nested owner-controlled 0755 directories are accepted under the private 0700 source root; index/lock rules stay 0600.
+Claimed NotFound alone allows parent fsync + durable completion. Errors retain claims/data. Completed claim records
+are permanent, excluded from replay, and atomically reserve a higher publication incarnation before same-ID reuse.
+Old run fences remain permanent. No source expiry is created for Vault-only SecretUnavailable.
+
+Content hashing (new proof plus replay) shares 64MiB/page; a new leaf above 32MiB or insufficient remaining budget
+is Unknown and retained. Initial sealed parent-manifest eligibility validation separately has a 64MiB bound and is
+cached across member pages. Unproven large legacy inputs are explicitly not fully covered. Source registration still
+uses the separate nondeleting preview; B Holds until bounded registration is known complete. C must thread trusted
+clock/config samples, owned blocking shutdown/cancellation drain, parent-only Vault semantics and resident scheduling,
+then obtain deletion-focused review before automatic deletion. No real user state is a test fixture.
+
+B focused verification completed on private fixtures: source retention44 passed plus2 standalone-ignored owned
+subprocess helpers, retry-filter25 passed, strict all-target/all-feature clippy, fmt and diff checks passed.
+New tests include33/65 refs,65-submodule graph and read counters, exact owner/DB/run digest, retired-current-generation
+queue exclusion, permanent directAPI fences, clock-Hold replay, claim/unlink/fsync/completion crash points,
+claimed/unclaimed missing, same-ID next incarnation, root/ancestor/leaf/symlink/hardlink/mode/path mismatch,
+owner-lock replacement, pending roots and sparse oversized leaf retention. Source preview and reader/IPC/async
+cancellation guard regressions remain green. Full local-ci/MSRV/Linux/remote/native/runtime-GC acceptance is not claimed.

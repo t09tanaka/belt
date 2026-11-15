@@ -1293,3 +1293,59 @@ installation roots, resolution evidence, activation, installation singleflight
 and submit/worker integration. S21 workers diff/sync/doctor and real service
 environment acceptance remain mandatory. This declaration slice advertises no
 auto-installable capability.
+
+### Source import ownership and future erasure fences (nondeleting stage A)
+
+Source import ownership is per opaque token and physical store identity, never per shared hash.
+Publishing one import only releases its own matching memberships after its immutable graph is durable;
+positive handoff to an exact durable run binding releases memberships in transactions of at most 32 rows.
+Failures, unmatched blobs and unknown crash/legacy roots remain protected. Tokenless legacy intake keeps
+independent protective roots. A does not infer abandonment from absence of coordinator references.
+
+Run expiry and publication incarnation are distinct source-owned records. Content-addressed SourceID/hash
+identity is unchanged: the same immutable input can be republished in a new incarnation after an old claim
+completes, while the old run remains permanently expired. A only adds schema/checks; production creates no
+expiry or deletion claim and removes no source/Vault file. Vault-only SecretUnavailable must remain separate
+from source expiry and from source retention. Actual bounded deletion and resident activation remain B/C work.
+
+Public SDK access is a shared-guard-owning view with no raw ObjectStore Deref/Clone. Trusted crate SDK calls
+use a scoped callback whose entire execution holds SH; pending publication claims conservatively block raw
+SDK operations. Opened upload readers own SH through actual blocking reads and cancellation drain. These
+APIs do not claim to prevent intentional raw filesystem or SDK-handle escape by trusted callers. Publication,
+binding, enqueue, retry preflight/commit, input read and delivery readiness check future availability fences,
+with source ownership acquired before coordinator operations. The permanent lock and SQLite inode safety
+protocols remain unchanged. No automatic source/Vault deletion is enabled by this stage.
+
+
+### Explicit source deletion page (B, automatic scheduling disabled)
+
+The parent source store exposes an explicit synchronous retention page separately from preview. It takes source
+EX before any coordinator actor operation and retains it through unlink, parent fsync and claim completion. The
+writable configured coordinator, current physical state/source directories, actual SQLite main-file identity,
+exact durable run binding and sealed source-ref digest must agree. All execution generations require typed known
+termination and closed mandatory collection, including recorded closed failure verdicts. Eligibility scans the
+run's generation history and is not a constant-time SQL proof. Direct task/attempt creation holds source SH through
+commit and rejects an expired run; worker terminal/result processing is unchanged.
+
+The existing persisted trusted clock policy gates every expiry, claim and physical replay. Hold never consumes
+member cursors. A permanent source-run fence commits before any member release. A page examines at most 32 indexed
+memberships or processes at most 32 pending claim paths. Shared, import/pending, incomplete and unproven roots stay
+protected. Exact claims precede unlink and bind a publication incarnation, held store/ancestor identity, strictly
+owned manifest/blob path, verified content digest and regular owned nlink=1 leaf identity. Source files 0644 and
+owner-controlled 0755 nested directories are legitimate under the private 0700 source root; other permissions
+cannot introduce group/world write. Every configured ancestor is opened NOFOLLOW. Only durable claimed NotFound
+is idempotent, still requiring parent fsync before completion. Unknown/mismatch/permission/IO errors keep data/claim.
+Completion retains the old claim and reserves a higher incarnation; completed claims never replay against a new
+same-hash file. Content-addressed SourceID/hash and the permanent old-run fence are unchanged.
+
+Source content hashing has a shared 64MiB/page budget including replay; larger/unproven legacy files are retained
+as Unknown (new leaves above 32MiB cannot obtain both proof and revalidation within the page). Initial eligibility
+manifest validation has a separate 64MiB cap and remains cached across member pages. Persistent root/graph/object
+metadata is retained; no unbounded metadata cascade, directory removal or filesystem discovery is performed by B.
+Source registration completion remains a prerequisite; the separate preview registers legacy inputs conservatively.
+Only owned `manifests/src-<32lowerhex>.json` and `objects/<2lowerhex>/<64sha256>` are candidates. Git refs/objects,
+bundle caches, unknown entries, originals, keys, source secret copies, run records, lock/index/root identity and
+all Vault state are excluded. No automatic source/Vault deletion is enabled; parent-only Vault erasure and resident
+clock/owner/cancellation-safe scheduling remain C plus dedicated deletion review. Vault-only secret erasure must
+never create a source-run expiry. Unsupported SQLite identity checks fail closed without opening/closing a live DB
+validation descriptor, preserving unrelated POSIX SQLite writer locks.
