@@ -282,6 +282,10 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
             .spawn()
             .unwrap(),
     );
+    // The socket file appears at bind and becomes private (and the token
+    // complete) a moment later, so wait for a client that loads, as the
+    // product bootstrap does, not for the bare path.
+    let mut loaded = None;
     wait_for("parent IPC socket", || {
         let exited = owner.child.as_mut().unwrap().try_wait().unwrap();
         assert!(
@@ -289,10 +293,11 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
             "parent exited {exited:?}: {}",
             std::fs::read_to_string(&parent_log).unwrap()
         );
-        state.join("parent/request.sock").exists()
+        loaded = Client::load(&state, cluster.clone()).ok();
+        loaded.is_some()
     })
     .await;
-    let client = Client::load(&state, cluster).unwrap();
+    let client = loaded.unwrap();
     // Occupy the local slot first while both remotes are deliberately offline.
     let blocker = submit(&client, &state, &spec.env, &key, root, "blocker", u32::MAX).await;
     if tokio::time::timeout(T, async {
