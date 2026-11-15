@@ -1254,7 +1254,7 @@ source/Vault/private binding の GC と output planner 完成はこの結果 ret
 
 The source store owns a private permanent mutation-lock inode and a separate retention index. Capture takes a shared guard and persists a pending root before local-ci publishes any objects. Graph registration uses persistent manifest positions and at most 32 references per step, including submodule edges and shared blobs. A matching durable run root precedes pending-root handoff. Unsubmitted captures and unknown crash roots remain protected. Legacy registration is bounded and conservative.
 
-Retry/enqueue acquire source guards before admission/actor/DB operations and retain matching guards through actual commit; forwarding retains its guard through blocking IO drain. Preview takes nonblocking exclusive ownership, validates the configured store and source/run binding, checks all generations and trusted monotonic retention, and reports at most 32 unique owned manifest/blob paths. Unknown, pending, malformed or shared roots remain held. Preview never expires a root, writes an unavailable tombstone, claims deletion or removes source/Vault files. No automatic source deletion is enabled. Source/Vault erasure, owned Git/bundle cache cleanup and safe legacy abandonment remain mandatory follow-up work. Original workspaces and private in-place bindings are excluded.
+Retry/enqueue acquire source guards before admission/actor/DB operations and retain matching guards through actual commit; forwarding retains its guard through blocking IO drain. Preview takes nonblocking exclusive ownership, validates the configured store and source/run binding, checks all generations and trusted monotonic retention, and reports at most 32 unique owned manifest/blob paths. Unknown, pending, malformed or shared roots remain held. Preview never expires a root, writes an unavailable tombstone, claims deletion or removes source/Vault files. The foundation itself enables no deletion; the D resident driver below now schedules Source/Vault retention. Owned Git/bundle cache cleanup and safe legacy abandonment remain follow-up work. Original workspaces and private in-place bindings are excluded.
 
 Registration retains one validated manifest and its file/directory identity across 32-reference pages, finishing that manifest before selecting newly queued children even when their IDs sort before it, so pages never repeatedly parse/hash the full manifest. Foreground producers supply their already-held manifest; run binding copies the completed indexed membership instead of rereading it. Background legacy loads default to the receiver's 64 MiB manifest limit and use a measured-length bounded reader. An oversized legacy manifest produces typed `Preview.manifest_limit` Hold; callers may set `PreviewCursor.manifest_byte_limit` explicitly to resume registration within that chosen bound. Source usage remains available. Arbitrary-size automatic legacy streaming registration remains pending. The preview cursor holds at most one manifest, with memory proportional to that manifest within the chosen byte bound, never a whole source graph. Future expiry of received roots also requires per-import pending ownership instead of relying on the current hash-shared pending blob marker.
 ### S20a: captured declaration API boundary
@@ -1317,7 +1317,7 @@ with source ownership acquired before coordinator operations. The permanent lock
 protocols remain unchanged. No automatic source/Vault deletion is enabled by this stage.
 
 
-### Explicit source deletion page (B, automatic scheduling disabled)
+### Source deletion page (B, scheduled by D below)
 
 The parent source store exposes an explicit synchronous retention page separately from preview. It takes source
 EX before any coordinator actor operation and retains it through unlink, parent fsync and claim completion. The
@@ -1345,13 +1345,13 @@ metadata is retained; no unbounded metadata cascade, directory removal or filesy
 Source registration completion remains a prerequisite; the separate preview registers legacy inputs conservatively.
 Only owned `manifests/src-<32lowerhex>.json` and `objects/<2lowerhex>/<64sha256>` are candidates. Git refs/objects,
 bundle caches, unknown entries, originals, keys, source secret copies, run records, lock/index/root identity and
-all Vault state are excluded. No automatic source/Vault deletion is enabled; parent-only Vault erasure and resident
-clock/owner/cancellation-safe scheduling remain C plus dedicated deletion review. Vault-only secret erasure must
+all Vault state are excluded from this source API. The D resident driver below schedules this page and the separate
+C Vault page after dedicated B+C deletion review. Vault-only secret erasure must
 never create a source-run expiry. Unsupported SQLite identity checks fail closed without opening/closing a live DB
 validation descriptor, preserving unrelated POSIX SQLite writer locks.
 
 
-#### Explicit parent Vault retention (C; automatic scheduling remains disabled)
+#### Parent Vault retention (C; scheduled by D below)
 
 `SourceStore::vault_retention_page` synchronously holds source EX then Vault EX through proof, durable claim,
 unlink, directory fsync and completion. It selects at most 32 indexed runs or pending claims and shares a 64MiB
@@ -1374,8 +1374,45 @@ Only exact private owned regular nlink=1 mode0600 run.json targets are deletable
 leaf inode/metadata and content digest; held NOFOLLOW descriptors and current anchors are rechecked before FD-relative
 unlink. Durable claimed absence still requires parent fsync before completion. Changed/recreated/unsafe targets are
 retained. Original workspaces, keys, Git references/caches, source secret copies and unknown entries remain excluded.
-No resident automatic deletion is enabled; dedicated B+C+transport deletion review and D scheduling/drain remain required.
+C originally exposed no automatic caller; dedicated B+C+transport review is closed and D scheduling/drain is enabled below.
 
 Secret-free manifests never receive a Vault tombstone: their empty load stays available for source-only retry.
 An unexpected Vault file for such a run is retained as Unknown. Missing bundles for manifests that require secrets
 can receive a permanent exact parent tombstone, preventing later re-adoption or recapture.
+
+
+#### Default resident input retention (D)
+
+The configured parent resident enables Source/Vault retention by default using the existing `retention_days`
+(default 7) for Source only. Vault has no additional age delay after all execution generations have typed known
+terminal evidence, mandatory collection is closed (including valid closed failure), and no queue/retry/delivery
+boundary remains. Its separate zero-retention clock still requires valid initial and subsequent native samples.
+Source keeps its own persisted seven-day policy and quarantine; every clock Hold blocks claims and replay in both
+protocols. A secret-bearing Source membership cannot expire before its exact completed Vault claim exists.
+
+One owned blocking page starts immediately, then at most one every 60 seconds with missed ticks skipped. During
+legacy registration the phases are registration, Vault, Source. New Source/Vault claims hold globally until persisted
+legacy registration is done and no unknown pending root or incomplete graph remains; an unrelated terminal Vault run
+is also held by this reviewed C precondition. Existing exact Vault claims may replay before registration completes,
+but only with a valid trusted clock. Bounded legacy reconciliation remains a separate unfinished plan item. The registration phase examines at most 32 directory entries or registers at most 32 indexed
+references with the existing bounded manifest cursor. Failed directory entries restart conservative discovery;
+oversized/unknown/incomplete inputs remain retained. Registration touches no retention clock or generation proof.
+Once registration completes the driver alternates one Vault page and one Source page, never both on one tick.
+Each deletion invocation selects at most 32 runs/references or exact claimed paths, using the existing 64MiB
+validation limits. No unbounded directory scan or root-sized vector is added. Generation-history eligibility still
+scans the complete selected run and is not a constant-time actor operation; bounded paths/bytes do not imply bounded
+CPU latency. Oversized legacy coverage and arbitrary-history latency are not claimed solved.
+
+Only trusted platform wall/monotonic/native-boot samples enter production. Source EX and Vault EX are nonblocking;
+readers, actual encoded secret sends and retry/publication guards make pages skip. Coordinator and CapturedInputs
+Arcs, cursors and acquired guards remain inside owned blocking work until actual completion. Normal stop/IPC
+cancellation drains accepted work before owner cleanup; no page is detached or overlapped by the loop. The driver
+checks coordinator fencing before accepting work and again inside the closure, and each page checks current
+physical owner/store binding. Unknown/proof/IO failures retain data and exact claims for later retry; optional GC
+errors never shut down accepted user jobs. Diagnostics contain bounded counters and static descriptions, not raw
+errors, paths or secret bytes. Existing result GC behavior is unchanged.
+
+Physical deletion remains limited to the approved indexed private parent Source manifest/blob copies and exact
+private parent Vault run files. Original paths, keys, Git refs/objects, caches, unknown extra files, unproven/pending
+roots, run binding records, lock/index identities and worker Vault erase/reupload behavior are outside this driver.
+Runtime tests invoke only private owned TempDir state; no production user-state invocation is part of validation.

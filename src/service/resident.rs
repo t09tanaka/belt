@@ -23,6 +23,7 @@ use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 mod delivery;
+mod input_retention;
 mod remote;
 
 pub const MAX_REQUEST_BYTES: usize = 262_144;
@@ -255,6 +256,8 @@ impl Client {
 }
 
 struct CapturedInputs {
+    #[cfg(test)]
+    retention_test: input_retention::TestControl,
     transfer: Arc<Mutex<()>>,
     sources: crate::source::SourceStore,
     vault: crate::secrets::vault::Vault,
@@ -415,6 +418,8 @@ impl StartupParts {
         reject_symlinks(&inputs.worker.state_dir)?;
         let sources = crate::source::SourceStore::open(&inputs.worker.state_dir)?;
         let captured = Arc::new(CapturedInputs {
+            #[cfg(test)]
+            retention_test: input_retention::TestControl::default(),
             transfer: Arc::new(Mutex::new(())),
             sources: crate::source::SourceStore::open(&inputs.state_dir)?,
             vault: crate::secrets::vault::Vault::open(&inputs.state_dir)?,
@@ -701,6 +706,12 @@ impl Resident {
                 tokio::task::yield_now().await;
             }
         });
+        loops.spawn(input_retention::run(
+            self.coordinator.clone(),
+            self.captured.clone(),
+            self.retention_days,
+            rx.clone(),
+        ));
         let agent = self.agent.clone();
         let mut maintain_stop = rx.clone();
         loops.spawn(async move {

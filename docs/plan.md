@@ -679,3 +679,32 @@ parent 登録のない worker の ephemeral erase/reupload は維持する。
 自動 resident loop は追加していない。B+C+transport の専任削除レビュー後に D で trusted clock、bounded scheduling、
 spawn_blocking の所有と shutdown/drain を接続する。実 user state、原本、key、Git refs/cache、unknown legacy の消去は行わない。
 focused 検証と strict lint の最終結果は C handoff に記録し、全体 local-ci/MSRV/Linux/native/runtime acceptance は親統合で行う。
+
+
+### S15e D: default parent resident Source/Vault retention
+
+B+C+transport の専任削除レビューは ecf2f020 で P1/P2 解消済み。resident は既存 retention_days
+(default 7) に従う Source と、terminal+mandatory collection closed 後の独立 retention 0 の Vault を
+既定有効で処理する。最初と60秒 Skip tick ごとに登録/Vault/Source の単一 bounded page、登録完了後は
+Vault/Source を交互に実行し、同一 tick で両方32件を処理しない。登録は別フェーズで最大32 directory entries
+または32 refs、未知 entry のエラー時は traversal を再開せずリセットし、oversized/unknown は保持する。
+Source/Vault の新規 claim は legacy done・unknown pending root 不在・incomplete graph 不在まで global Hold する。
+無関係な terminal Vault run もこの既存 C 条件で保持し、既存の厳密 Vault claim のみ trusted clock 下で replay できる。
+bounded legacy reconciliation は既存計画の未完了項目として残す。各ページの新規・replay 上限32と64MiB検証予算、独立 persisted clock/Hold、全 generation・queue・
+厳密 owner/binding・Source の完了済み Vault claim 条件は変更しない。原本/key/Git/cache/unknown extra は消去しない。
+
+Coordinator と CapturedInputs の Arc/cursor/guard を owned_blocking closure が保持し、shutdown は実作業完了まで
+待つ。actor/admission/transfer mutex 上で filesystem IO は行わない。fenced owner は page を受け付けず、optional GC の
+unknown/IO エラーは data/claim 保持と sanitized counter 診断で次の tick に再試行する。結果GCの動作変更はない。
+既存 generation-history proof は全履歴走査であり、page件数/byte bound から定数CPU時間は主張しない。
+
+private fixture で actual automatic Vault cleanup・reader busy・未提出/incomplete collection 保持・未知legacy保持、
+helper の deterministic sample で default Source7日/Vault0 独立・65 files 最大32/page と scope sentinel、
+actual resident で SourceEX/VaultEX 内 blocked page の IPC/renewal 継続と shutdown/owner/fence drain を確認する。
+128 terminal task fixture の status+tick latency は実測サンプルのみ。専任 D レビューと親の最終 local-ci は
+この実装 handoff 後であり、本作業で実 user state、native service、SSH、push、merge は実行しない。
+
+D 最終 focused 検証: resident 23件成功 (88.35s)、retention filter 69件成功 +2 standalone owned-helper ignore
+(28.36s)、strict all-target/all-feature clippy 成功 (12.35s)。128 terminal-task fixture の最大 status+tick latency は
+1.287625ms のサンプルで、任意履歴の最悪時間や定数CPUを保証しない。既存 estimate readonly fixture は Source SH
+で背景 GC を隔離した上で whole-source-file/DB snapshot を維持確認する。原本や実 user state は一切対象にしていない。

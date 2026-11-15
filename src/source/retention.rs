@@ -41,6 +41,38 @@ pub(crate) struct Index {
     reads: Arc<std::sync::atomic::AtomicUsize>,
     #[cfg(test)]
     verifications: Arc<std::sync::atomic::AtomicUsize>,
+    #[cfg(test)]
+    page_pause: Arc<std::sync::Mutex<Option<PagePause>>>,
+}
+#[cfg(test)]
+#[derive(Debug)]
+struct PagePause {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+#[cfg(test)]
+impl Index {
+    fn pause_page(&self) {
+        let pause = self.page_pause.lock().unwrap().take();
+        if let Some(pause) = pause {
+            let _ = pause.entered.send(());
+            let _ = pause.resume.recv();
+        }
+    }
+}
+#[cfg(test)]
+impl SourceStore {
+    pub(crate) fn pause_retention_page(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, wait) = std::sync::mpsc::channel();
+        let (resume, drain) = std::sync::mpsc::channel();
+        *self.retention.page_pause.lock().unwrap() = Some(PagePause {
+            entered,
+            resume: drain,
+        });
+        (wait, resume)
+    }
 }
 const DIR: rustix::fs::OFlags = rustix::fs::OFlags::RDONLY
     .union(rustix::fs::OFlags::DIRECTORY)
@@ -81,6 +113,8 @@ impl Index {
             reads: Default::default(),
             #[cfg(test)]
             verifications: Default::default(),
+            #[cfg(test)]
+            page_pause: Default::default(),
         };
         let _guard = this.guard(false).context("initial source guard")?;
         this.prepare_index_file()?;
@@ -883,6 +917,8 @@ pub struct PreviewCursor {
 }
 #[derive(Debug, Default)]
 pub struct Preview {
+    /// True only after the persisted bounded legacy traversal is complete.
+    pub registration_done: bool,
     pub held: bool,
     pub registered: u32,
     pub manifest_limit: Option<ManifestLimit>,
@@ -904,6 +940,45 @@ impl SourceStore {
         boot: Option<String>,
         retention: u64,
     ) -> Result<Preview> {
+        self.retention_preview_inner(owner, cursor, wall, mono, boot, retention, false)
+    }
+
+    /// Bounded nondeleting legacy registration only. No run-history proof or
+    /// retention clock is touched. Unknown/oversized inputs remain protected.
+    pub(crate) fn retention_registration_page(
+        &self,
+        owner: &crate::storage::CoordinatorStore,
+        cursor: &mut PreviewCursor,
+    ) -> Result<Preview> {
+        match self.retention_preview_inner(owner, cursor, 0, 0, None, 0, true) {
+            Ok(page) => Ok(page),
+            Err(error) => {
+                // A failed directory entry must never be skipped on the next
+                // automatic pass and later mistaken for a closed traversal.
+                let busy = error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|e| e.kind() == io::ErrorKind::WouldBlock)
+                });
+                if !busy {
+                    *cursor = PreviewCursor::default();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn retention_preview_inner(
+        &self,
+        owner: &crate::storage::CoordinatorStore,
+        cursor: &mut PreviewCursor,
+        wall: u64,
+        mono: u64,
+        boot: Option<String>,
+        retention: u64,
+        registration_only: bool,
+    ) -> Result<Preview> {
         let _guard = self.retention.guard(true)?;
         ensure!(
             owner
@@ -915,6 +990,9 @@ impl SourceStore {
                 == Some(self.root()),
             "foreign coordinator source store"
         );
+        if registration_only {
+            owner.check_input_store(&self.retention.path, &self.retention.root)?;
+        }
         let c = self.retention.connect()?;
         let backfill: String = c.query_row(
             "SELECT value FROM meta WHERE key='legacy_registration'",
@@ -998,6 +1076,12 @@ impl SourceStore {
             }
             return Ok(Preview {
                 held: true,
+                ..Default::default()
+            });
+        }
+        if registration_only {
+            return Ok(Preview {
+                registration_done: true,
                 ..Default::default()
             });
         }
@@ -1466,6 +1550,7 @@ mod tests {
                 path,
                 reads: Default::default(),
                 verifications: Default::default(),
+                page_pause: Default::default(),
             };
             let gate = std::sync::Barrier::new(8);
             let guards = std::thread::scope(|scope| {
@@ -1512,6 +1597,7 @@ mod tests {
                 path,
                 reads: Default::default(),
                 verifications: Default::default(),
+                page_pause: Default::default(),
             };
             let gate = std::sync::Barrier::new(8);
             let identities = std::thread::scope(|scope| {

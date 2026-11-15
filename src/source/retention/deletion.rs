@@ -1,4 +1,4 @@
-//! Parent-only, explicitly invoked source retention. No resident task calls this.
+//! Parent-only source retention, invoked by the resident bounded driver.
 //! Source EX spans the synchronous operation, including unlink/fsync/SQLite drain.
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -321,7 +321,7 @@ impl Index {
 }
 impl SourceStore {
     /// Explicit parent-only page. Samples must come from trusted platform clocks
-    /// in a future driver; this API does not enable an automatic deletion loop.
+    /// in the resident driver; callers must retain the owner through actual drain.
     /// Eligibility scans a run's generation history and is not constant-time.
     #[allow(clippy::too_many_arguments)]
     pub fn retention_page(
@@ -349,6 +349,8 @@ impl SourceStore {
             }
             Err(error) => return Err(error),
         };
+        #[cfg(test)]
+        self.retention.pause_page();
         self.retention.check_anchor()?;
         let owner_identity = owner.check_input_store(&self.retention.path, &self.retention.root)?;
         let mut c = self.retention.connect()?;

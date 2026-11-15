@@ -252,6 +252,8 @@ impl SourceStore {
                 return Err(e);
             }
         };
+        #[cfg(test)]
+        self.retention.pause_page();
         self.retention.check_anchor()?;
         let identity = owner.check_input_store(&self.retention.path, &self.retention.root)?;
         let c = self.retention.connect()?;
