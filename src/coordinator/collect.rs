@@ -171,7 +171,7 @@ mod tests {
 
     #[tokio::test]
     async fn detached_worker_cursors_are_pruned_before_the_attached_page_is_truncated() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let store = CoordinatorStore::open(root.path(), 1).unwrap();
         let coordinator = Coordinator::start(store, CoordinatorConfig::default()).unwrap();
         let files = Arc::new(ResultStore::open(&root.path().join("results")).unwrap());

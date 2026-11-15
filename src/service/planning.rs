@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn captured_configuration_verifies_used_bytes_and_never_reads_live_source() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let project = root.path().join("project");
         std::fs::create_dir(&project).unwrap();
         let path = ".local-ci.toml";
@@ -222,7 +222,7 @@ mod tests {
     }
     #[test]
     fn captured_plan_keeps_missing_filter_metadata_typed() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let project = root.path().join("project");
         std::fs::create_dir_all(project.join(".github/workflows")).unwrap();
         std::fs::write(project.join(".github/workflows/ci.yml"),

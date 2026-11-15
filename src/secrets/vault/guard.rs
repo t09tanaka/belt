@@ -445,7 +445,7 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     fn fixture() -> (tempfile::TempDir, Vault, RunId) {
-        let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let tmp = crate::test_tmp::tempdir().unwrap();
         let vault = Vault::open(tmp.path()).unwrap();
         let run = RunId::generate();
         let lease = vault.lease(true).unwrap();
@@ -512,7 +512,7 @@ mod tests {
     #[test]
     fn vault_direct_concurrent_adopt_keeps_first_durable_publication() {
         use std::sync::{mpsc, Barrier};
-        let tmp = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let tmp = crate::test_tmp::tempdir().unwrap();
         let run = RunId::generate();
         let key = ClusterKey::from_bytes(vec![9; 32]).unwrap();
         let entries = |content: &[u8]| {

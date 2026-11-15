@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn creates_uses_wal_full_and_reopens_idempotently() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let p = dir.path().join("a.db");
         let db = open_with(&p, "coordinator", &steps(1), table(1), Access::ReadWrite).unwrap();
         assert_eq!(version(&db), "1");
@@ -430,7 +430,7 @@ mod tests {
 
     #[test]
     fn migrates_one_step_at_a_time_and_repeats_as_a_no_op() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let p = dir.path().join("a.db");
         drop(open_with(&p, "worker", &steps(1), table(1), Access::ReadWrite).unwrap());
         // The newer binary knows three steps and migrates 1 -> 3.
@@ -444,7 +444,7 @@ mod tests {
 
     #[test]
     fn a_failing_step_rolls_back_and_keeps_the_old_version() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let p = dir.path().join("a.db");
         drop(open_with(&p, "worker", &steps(1), table(1), Access::ReadWrite).unwrap());
         let mut bad = steps(2);
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn a_newer_database_is_refused_and_left_byte_for_byte_alone() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let p = dir.path().join("a.db");
         drop(open_with(&p, "worker", &steps(3), table(3), Access::ReadWrite).unwrap());
         // Make it look like a default (rollback-journal) file so a stray write
@@ -491,7 +491,7 @@ mod tests {
 
     #[test]
     fn foreign_and_wrong_kind_files_are_refused_unchanged() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let p = dir.path().join("f.db");
         {
             let c = Connection::open(&p).unwrap();
@@ -521,7 +521,7 @@ mod tests {
 
     #[test]
     fn read_only_reads_without_migrating_and_needs_an_existing_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let p = dir.path().join("a.db");
         let err = open_with(&p, "worker", &steps(1), table(1), Access::ReadOnly)
             .err()
@@ -539,7 +539,7 @@ mod tests {
 
     #[test]
     fn dropping_a_transaction_before_commit_leaves_nothing() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let p = dir.path().join("a.db");
         let db = open_with(&p, "worker", &steps(1), table(1), Access::ReadWrite).unwrap();
         // A "crash": the transaction goes away without commit.

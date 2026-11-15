@@ -536,7 +536,7 @@ mod tests {
 
     #[test]
     fn from_file_reads_and_validates() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let p = dir.path().join("spec.json");
         write_private(&p, &serde_json::to_string(&spec()).unwrap());
         assert!(SuperviseSpec::from_file(&p).is_ok());
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn a_spec_file_others_can_reach_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let p = dir.path().join("spec.json");
         write_private(&p, &serde_json::to_string(&spec()).unwrap());
         for mode in [0o640, 0o604, 0o620, 0o602, 0o610, 0o601, 0o644] {

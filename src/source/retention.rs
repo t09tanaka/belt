@@ -1214,7 +1214,7 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+            let root = crate::test_tmp::tempdir().unwrap();
             let state = root.path().join("state");
             let input = root.path().join("original");
             std::fs::create_dir(&input).unwrap();
@@ -1485,7 +1485,7 @@ mod tests {
     }
     #[test]
     fn legacy_registration_is_bounded_and_ancestor_symlink_fails_closed() {
-        let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let input = root.path().join("original");
         std::fs::create_dir(&input).unwrap();
         std::fs::write(input.join("sentinel"), b"original").unwrap();
@@ -1557,7 +1557,7 @@ mod tests {
         // every participant starts with the same retained directory FD, and
         // no participant ever removes or replaces the lock file.
         for _ in 0..32 {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_tmp::tempdir().unwrap();
             let path = std::fs::canonicalize(dir.path()).unwrap();
             let index = Index {
                 database: path.join("retention.db"),
@@ -1605,7 +1605,7 @@ mod tests {
     #[test]
     fn concurrent_first_index_file_open_keeps_one_private_inode() {
         for _ in 0..32 {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_tmp::tempdir().unwrap();
             let path = std::fs::canonicalize(dir.path()).unwrap();
             let index = Index {
                 database: path.join("retention.db"),
@@ -1872,7 +1872,7 @@ mod tests {
     }
     #[test]
     fn source_root_symlink_is_rejected_before_external_store_creation() {
-        let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let state = root.path().join("state");
         let original = root.path().join("original");
         std::fs::create_dir(&state).unwrap();
@@ -1907,7 +1907,7 @@ mod tests {
     #[test]
     fn legacy_manifest_is_parsed_verified_once_across_pages_and_once_after_restart() {
         use std::sync::atomic::Ordering::SeqCst;
-        let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let state = root.path().join("state");
         let input = root.path().join("original");
         std::fs::create_dir(&input).unwrap();
@@ -2002,7 +2002,7 @@ mod tests {
     #[test]
     fn oversized_legacy_is_typed_recoverable_hold_and_explicit_limit_resumes() {
         use std::sync::atomic::Ordering::SeqCst;
-        let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let state = root.path().join("state");
         let input = root.path().join("original");
         std::fs::create_dir(&input).unwrap();

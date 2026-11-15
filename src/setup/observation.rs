@@ -194,7 +194,7 @@ mod tests {
     }
     #[test]
     fn complete_original_nodes_are_required_and_replay_cannot_refresh_them() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let mut spec = fixture(dir.path());
         assert!(aggregate(&spec).is_none(), "no recovered or missing proof");
         record_node(&spec, 0, 0.125).unwrap();
@@ -216,7 +216,7 @@ mod tests {
     }
     #[test]
     fn observation_binding_boot_finish_and_command_are_verified() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let mut spec = fixture(dir.path());
         for index in 0..2 {
             record_node(&spec, index, 0.001).unwrap();
@@ -249,7 +249,7 @@ mod tests {
     }
     #[test]
     fn private_observations_refuse_links_and_oversized_files() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let path = dir.path().join("observation");
         std::fs::write(&path, b"7").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();

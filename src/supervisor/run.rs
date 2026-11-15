@@ -1600,7 +1600,7 @@ mod tests {
 
     #[test]
     fn profile_history_preserves_normalized_command_identity() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let ctx = Context::new(Paths::new(dir.path(), dir.path().join("config.toml")));
         let profile_a = crate::ids::Digest::of_bytes(b"profile-a");
         let profile_b = crate::ids::Digest::of_bytes(b"profile-b");

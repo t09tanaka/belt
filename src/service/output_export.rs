@@ -376,7 +376,7 @@ mod tests {
     fn raw_never_sniffs_tar_and_no_replace_preserves_foreign_bytes() {
         let bytes = tar(&[("a", b"content", b'0')]);
         let mut bundle = verify(&bytes, ArtifactEncoding::Raw).unwrap();
-        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let root = destination(dir.path()).unwrap();
         let mut outcomes = vec![];
         bundle.publish(
@@ -432,7 +432,7 @@ mod tests {
             ("z", b"last", b'0'),
         ]);
         let mut bundle = verify(&bytes, ArtifactEncoding::TarV1).unwrap();
-        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let root = destination(dir.path()).unwrap();
         std::fs::create_dir_all(dir.path().join("task/attempt/bundle")).unwrap();
         std::fs::write(dir.path().join("task/attempt/bundle/z"), b"foreign").unwrap();
@@ -537,7 +537,7 @@ mod tests {
         ] {
             // A valid member preceding the malicious member must not become visible.
             let bytes = tar(&[("ordinary", b"ok", b'0'), (path, b"private", b'0')]);
-            let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+            let dir = crate::test_tmp::tempdir().unwrap();
             let root = destination(dir.path()).unwrap();
             let error = match verify(&bytes, ArtifactEncoding::TarV1) {
                 Err(error) => error,
@@ -564,8 +564,8 @@ mod tests {
         file.rewind().unwrap();
         meta.size += 1;
         assert!(Bundle::verify(file, &meta).is_err());
-        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
-        let outside = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let outside = crate::test_tmp::tempdir().unwrap();
         symlink(outside.path(), dir.path().join("link")).unwrap();
         assert!(destination(&dir.path().join("link/root")).is_err());
         let root = destination(dir.path()).unwrap();
@@ -607,7 +607,7 @@ mod tests {
     }
     #[test]
     fn concurrent_publish_has_exactly_one_winner() {
-        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let root = std::sync::Arc::new(destination(dir.path()).unwrap());
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let jobs = [b"one".as_slice(), b"two".as_slice()]
@@ -648,7 +648,7 @@ mod tests {
     }
     #[test]
     fn cancelled_export_never_creates_member() {
-        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let root = destination(dir.path()).unwrap();
         let mut bundle = verify(b"x", ArtifactEncoding::Raw).unwrap();
         bundle.publish(&root, "task/output", &AtomicBool::new(true), |_, _| {

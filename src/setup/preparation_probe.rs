@@ -209,7 +209,7 @@ mod tests {
     use std::os::unix::fs::{symlink, PermissionsExt};
     #[test]
     fn preparation_probe_paths_are_bounded_nofollow_and_fail_closed() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tmp::tempdir().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         assert_eq!(bounded_path(&root.join("absent")), Ok(()));
         let link = root.join("link");

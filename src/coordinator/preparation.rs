@@ -341,7 +341,7 @@ mod tests {
         count: usize,
         supported: bool,
     ) -> (tempfile::TempDir, Arc<Coordinator>, Arc<Link>, Arc<Spy>) {
-        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let store = CoordinatorStore::open(dir.path(), 1).unwrap();
         let spy = Arc::new(Spy::default());
         let sched = Scheduler::new(Default::default(), spy.clone()).unwrap();

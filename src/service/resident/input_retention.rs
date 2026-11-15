@@ -195,7 +195,7 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+            let root = crate::test_tmp::tempdir().unwrap();
             let input = root.path().join("original");
             std::fs::create_dir(&input).unwrap();
             std::fs::write(input.join("file"), b"original").unwrap();

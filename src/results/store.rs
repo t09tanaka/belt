@@ -916,7 +916,7 @@ mod tests {
 
     #[test]
     fn committed_prefix_reads_hide_tail_and_recovery_truncates_only_uncommitted_bytes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let root = dir.path().join("results");
         assert!(ResultStore::open_read_only(&root).is_err());
         assert!(!root.exists());
@@ -981,7 +981,7 @@ mod tests {
     #[test]
     fn prefix_io_refuses_symlink_components_and_nonregular_files_without_mutation() {
         use std::os::unix::fs::symlink;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let store = ResultStore::open(&dir.path().join("results")).unwrap();
         let a = AttemptId::generate();
         let outside = dir.path().join("outside");
@@ -1026,7 +1026,7 @@ mod tests {
 
     fn fx() -> Fx {
         Fx {
-            dir: tempfile::tempdir().unwrap(),
+            dir: crate::test_tmp::tempdir().unwrap(),
             a: AttemptId::generate(),
         }
     }
@@ -1056,7 +1056,7 @@ mod tests {
 
     #[test]
     fn every_missing_level_is_made_private_and_a_file_in_the_way_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let deep = dir.path().join("a").join("b").join("c");
         dir_all(&deep).unwrap();
         dir_all(&deep).unwrap();
@@ -1436,7 +1436,7 @@ mod tests {
         use std::os::unix::fs::symlink;
         let f = fx();
         let store = f.open();
-        let outside = tempfile::tempdir().unwrap();
+        let outside = crate::test_tmp::tempdir().unwrap();
         fs::create_dir(outside.path().join("logs")).unwrap();
         fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
         let attempt = store.attempt_dir(&f.a);
@@ -1480,7 +1480,7 @@ mod tests {
         store
             .append_log(&f.a, LogStream::Stdout, 0, b"owned")
             .unwrap();
-        let outside = tempfile::tempdir().unwrap();
+        let outside = crate::test_tmp::tempdir().unwrap();
         fs::create_dir(outside.path().join("logs")).unwrap();
         fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
         let (entered, got_entered) = mpsc::channel();

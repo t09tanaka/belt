@@ -617,7 +617,7 @@ pub(crate) struct Fx {
 
 pub(crate) fn fx() -> Fx {
     Fx {
-        dir: tempfile::tempdir().unwrap(),
+        dir: crate::test_tmp::tempdir().unwrap(),
         cluster: Arc::default(),
         cfg: CoordinatorConfig {
             limits: Limits {
@@ -1881,7 +1881,7 @@ fn only_live(c: &Coordinator, task: &TaskId) -> AttemptRecord {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a19_a_real_worker_stops_the_retired_run_and_the_resent_retire_frees_the_task_once() {
     let mut w = worker_agent::fx();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let open = || {
         // The agent of this test lives in this process and forks its
         // supervisors: a child between fork and exec still holds a copy of
@@ -1993,7 +1993,7 @@ async fn a19_a_real_worker_stops_the_retired_run_and_the_resent_retire_frees_the
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_worker_is_told() {
     let mut w = worker_agent::fx();
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let store = CoordinatorStore::open(dir.path(), 1).unwrap();
     let c = Coordinator::start(store, CoordinatorConfig::default()).unwrap();
     w.cluster = c.store().cluster_id().clone();
@@ -2891,7 +2891,7 @@ async fn measured_cold_frozen_attested_candidate_prefetches_before_attempt() {
 async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
     use remote_task_runner::scheduler::measured::{CostQuery, MeasuredCosts, Phase, Sample};
     let mut f = fx();
-    let stats = tempfile::tempdir().unwrap();
+    let stats = crate::test_tmp::tempdir().unwrap();
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(stats.path(), std::fs::Permissions::from_mode(0o700)).unwrap();

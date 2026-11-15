@@ -898,8 +898,8 @@ fn project_and_legacy_paths_sit_at_the_repo_root() {
 
 #[test]
 fn load_reads_the_three_files() {
-    let home = tempfile::tempdir().unwrap();
-    let repo = tempfile::tempdir().unwrap();
+    let home = crate::test_tmp::tempdir().unwrap();
+    let repo = crate::test_tmp::tempdir().unwrap();
     let xdg = home.path().join("xdg");
     std::fs::create_dir_all(xdg.join("remote-task-runner")).unwrap();
     std::fs::write(xdg.join("remote-task-runner/config.toml"), USER_EXAMPLE).unwrap();
@@ -932,8 +932,8 @@ fn load_reads_the_three_files() {
 
 #[test]
 fn load_reports_parse_io_and_missing_home_errors() {
-    let home = tempfile::tempdir().unwrap();
-    let repo = tempfile::tempdir().unwrap();
+    let home = crate::test_tmp::tempdir().unwrap();
+    let repo = crate::test_tmp::tempdir().unwrap();
     let e = env(&[("HOME", home.path().to_str().unwrap())]);
     assert_eq!(
         load(&env(&[]), None, &Overlay::default()).unwrap_err(),

@@ -9,7 +9,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new(kind: AdapterKind, tool: &str) -> Self {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tmp::tempdir().unwrap();
         let state = std::fs::canonicalize(temp.path()).unwrap();
         std::fs::create_dir(state.join("toolchains")).unwrap();
         std::fs::set_permissions(

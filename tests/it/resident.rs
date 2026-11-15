@@ -20,10 +20,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 fn root() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("rtr-res-")
-        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
-        .unwrap()
+    crate::test_tmp::prefixed("rtr-res-").unwrap()
 }
 fn config() -> ResolvedConfig {
     let mut c = resolve(&ConfigInputs {

@@ -195,7 +195,7 @@ fn attempt(state: &Path, task: &TaskId) -> Option<remote_task_runner::storage::A
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offline_peers_do_not_block_local(
 ) {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let root = root.path();
     private(root);
     let state = root.join("parent");

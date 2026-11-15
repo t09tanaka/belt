@@ -150,7 +150,7 @@ mod tests {
     use super::*;
     #[test]
     fn binding_checks_worker_source_digest_and_original_inode() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tmp::tempdir().unwrap();
         let root = temp.path().join("project");
         fs::create_dir(&root).unwrap();
         let run = RunId::generate();
@@ -182,7 +182,7 @@ mod tests {
     }
     #[test]
     fn original_secret_reader_never_writes_or_erases_and_rejects_links() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tmp::tempdir().unwrap();
         let root = temp.path();
         let path = root.join("secret");
         fs::write(&path, b"TOKEN=original-secret-value\n").unwrap();

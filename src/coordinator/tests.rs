@@ -52,7 +52,7 @@ struct Fx {
 }
 
 fn fx() -> Fx {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let store = CoordinatorStore::open(dir.path(), 1).unwrap();
     let c = Coordinator::start(store, CoordinatorConfig::default()).unwrap();
     Fx {

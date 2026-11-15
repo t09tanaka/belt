@@ -2106,7 +2106,7 @@ fn only_one_supervisor_may_hold_an_attempt() {
 
 #[test]
 fn a_bad_spec_is_refused_with_its_own_exit_code() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let p = dir.path().join("spec.json");
     write_private(&p, "{\"nope\": 1}");
     let out = Command::new(exe())

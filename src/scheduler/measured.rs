@@ -643,7 +643,7 @@ impl Drop for Segment {
 #[cfg(test)]
 fn private_test_root() -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
-    let dir = tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     dir
 }

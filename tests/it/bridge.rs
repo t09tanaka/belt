@@ -14,10 +14,7 @@ use std::sync::Arc;
 /// Unix socket paths are limited to about 100 bytes; the default temp
 /// directory can exceed that on macOS.
 fn short_tempdir() -> tempfile::TempDir {
-    tempfile::Builder::new()
-        .prefix("rtr")
-        .tempdir_in("/tmp")
-        .unwrap()
+    crate::test_tmp::prefixed("rtr").unwrap()
 }
 
 const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");

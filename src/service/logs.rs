@@ -577,7 +577,7 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_tmp::tempdir().unwrap();
             let db = Arc::new(CoordinatorStore::open(dir.path(), 1).unwrap());
             let files = ResultStore::open(&dir.path().join("results")).unwrap();
             let run = RunId::generate();

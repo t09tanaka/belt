@@ -320,7 +320,7 @@ mod preparation_probe_tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::test_tmp::tempdir().unwrap();
             let root = std::fs::canonicalize(temp.path()).unwrap();
             // A real fixed shell path, but no tool executable to discover/probe.
             let shell = root.join("sh");

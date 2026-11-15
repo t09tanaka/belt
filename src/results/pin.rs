@@ -116,7 +116,7 @@ mod tests {
     use super::*;
     #[test]
     fn shared_readers_exclude_gc_and_inode_survives_release() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let run = RunId::generate();
         assert!(RunPin::shared(dir.path(), &run).is_err());
         assert!(!dir.path().join("reader-pins").exists());
@@ -161,7 +161,7 @@ mod tests {
     #[test]
     fn pins_exclude_across_processes_without_inheriting_descriptors() {
         use std::process::{Command, Stdio};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let run = RunId::generate();
         RunPin::ensure(dir.path(), &run).unwrap();
         for exclusive in [false, true] {
@@ -199,7 +199,7 @@ mod tests {
     }
     #[test]
     fn unsafe_pin_and_changed_inode_fail_closed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let run = RunId::generate();
         RunPin::ensure(dir.path(), &run).unwrap();
         let path = dir.path().join(format!("reader-pins/{run}.lock"));

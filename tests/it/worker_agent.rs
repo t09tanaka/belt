@@ -1044,7 +1044,7 @@ async fn read_all(c: &Client, a: &AttemptId, stream: LogStream) -> Vec<u8> {
 
 #[test]
 fn secret_scan_uses_an_isolated_reader_including_live_wal_events() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let worker = WorkerId::parse("snapshot-worker").unwrap();
     let store = WorkerStore::open(dir.path(), &worker).unwrap();
     // Put the schema in the main DB first. The following single event commit

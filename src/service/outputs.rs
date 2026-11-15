@@ -415,7 +415,7 @@ mod tests {
     }
     impl Fixture {
         fn new() -> Self {
-            let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+            let dir = crate::test_tmp::tempdir().unwrap();
             let db = Arc::new(CoordinatorStore::open(dir.path(), 1).unwrap());
             let run = RunId::generate();
             let task = TaskId::generate();

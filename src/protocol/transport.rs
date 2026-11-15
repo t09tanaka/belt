@@ -295,10 +295,7 @@ mod tests {
     /// Unix socket paths are limited to about 100 bytes, which the default
     /// temp directory (a long per-user path on macOS) can exceed.
     fn short_tempdir() -> tempfile::TempDir {
-        tempfile::Builder::new()
-            .prefix("rtr")
-            .tempdir_in("/tmp")
-            .unwrap()
+        crate::test_tmp::prefixed("rtr").unwrap()
     }
 
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {

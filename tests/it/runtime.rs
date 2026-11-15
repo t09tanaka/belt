@@ -34,7 +34,7 @@ fn inputs(root: &std::path::Path) -> WorkerInputs {
 
 #[test]
 fn runtime_factory_enables_setup_and_starts_agent() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let mut cfg = config();
     cfg.max_active_task.value = 3;
     cfg.prefetch_per_worker.value = 2;
@@ -103,7 +103,7 @@ fn runtime_factory_enables_setup_and_starts_agent() {
 
 #[test]
 fn runtime_factory_preserves_git_preflight_error() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let mut input = inputs(root.path());
     input.env.insert(
         "PATH".into(),
@@ -139,7 +139,7 @@ async fn connected(c: &remote_task_runner::coordinator::Coordinator, name: &str)
 
 #[tokio::test]
 async fn runtime_attach_applies_only_verified_identity_priorities() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let mut cfg = config();
     cfg.local_worker_priority.value = -9;
     let mut priority = cfg.local_worker_priority.clone();
@@ -190,7 +190,7 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
             .is_err());
     }
     assert_eq!(c.scheduler().priority_of(&other), 0);
-    let foreign_root = tempfile::tempdir().unwrap();
+    let foreign_root = crate::test_tmp::tempdir().unwrap();
     let foreign = settings
         .start_coordinator(
             CoordinatorStore::open(foreign_root.path(), 1).unwrap(),

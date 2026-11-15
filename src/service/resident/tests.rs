@@ -99,10 +99,7 @@ async fn input_gc_blocking_page_keeps_ipc_renewals_and_owner_until_stop_drain() 
 }
 
 async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool, input_pause: bool) {
-    let root = tempfile::Builder::new()
-        .prefix("rtr-clocks-")
-        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
-        .unwrap();
+    let root = crate::test_tmp::prefixed("rtr-clocks-").unwrap();
     let mut config = crate::config::resolve(&crate::config::Inputs {
         overlay: &crate::config::Overlay::default(),
         project: None,
@@ -452,10 +449,7 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool, in
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_acceptance_survives_stalled_source_and_shutdown() {
-    let root = tempfile::Builder::new()
-        .prefix("rtr-stop-source-")
-        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
-        .unwrap();
+    let root = crate::test_tmp::prefixed("rtr-stop-source-").unwrap();
     crate::secrets::key::init(&root.path().join("key")).unwrap();
     let config = crate::config::resolve(&crate::config::Inputs {
         overlay: &crate::config::Overlay::default(),
@@ -859,7 +853,7 @@ async fn secret_peer(
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn per_worker_secret_jobs_route_exact_attempts_and_resend_after_session_reset() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let resident = delivery_resident(root.path()).await;
     let mut expected = Vec::new();
     for (name, text) in [
@@ -1007,7 +1001,7 @@ async fn per_worker_secret_jobs_route_exact_attempts_and_resend_after_session_re
 
 #[tokio::test]
 async fn captured_submit_losing_admission_race_is_rejected_without_queue_mutation() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let resident = delivery_resident(root.path()).await;
     let (mut client, server) = UnixStream::pair().unwrap();
     let (stop, _) = watch::channel(true);
@@ -1053,7 +1047,7 @@ async fn captured_submit_losing_admission_race_is_rejected_without_queue_mutatio
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn source_prefetch_verifies_legacy_inputs_and_advances_after_full_cache_evaluation() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let resident = delivery_resident(root.path()).await;
     let directory = root.path().join("input");
     std::fs::create_dir(&directory).unwrap();
@@ -1301,10 +1295,7 @@ async fn retry_preflight_keeps_admission_and_db_available_and_rechecks_stopping(
 fn retry_owner() -> (tempfile::TempDir, Arc<Coordinator>, RunId) {
     use crate::coordinator::CoordinatorConfig;
     use crate::state::Exit;
-    let root = tempfile::Builder::new()
-        .prefix("rtr-retry-")
-        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
-        .unwrap();
+    let root = crate::test_tmp::prefixed("rtr-retry-").unwrap();
     let store = CoordinatorStore::open(root.path(), 1).unwrap();
     let run = RunId::generate();
     let source = SourceId::generate();
@@ -1427,7 +1418,7 @@ async fn retry_stopping_releases_owner_while_input_io_retains_cross_process_leas
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn offline_submit_publishes_reader_pin_before_immediate_logs_follow() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let mut resident = delivery_resident(root.path()).await;
     // Keep every worker offline, so no collector can backfill a missing pin.
     resident.worker_connection.abort();
@@ -1509,7 +1500,7 @@ async fn offline_submit_publishes_reader_pin_before_immediate_logs_follow() {
 #[tokio::test]
 async fn capability_private_ipc_prevents_old_owner_from_discarding_requirements() {
     use crate::toolchain::capability::ExecutionRequirements;
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let socket = root.path().join("old-owner.sock");
     let listener = tokio::net::UnixListener::bind(&socket).unwrap();
     let client = Client {
@@ -1560,10 +1551,7 @@ async fn capability_private_ipc_prevents_old_owner_from_discarding_requirements(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
-    let root = tempfile::Builder::new()
-        .prefix("rtr-estimate-")
-        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
-        .unwrap();
+    let root = crate::test_tmp::prefixed("rtr-estimate-").unwrap();
     // Each of the 200 reads inspects the worker, and an inspection measures
     // every native tool on the profile path with one subprocess each. On
     // macOS /usr/bin holds launchers for git, xcodebuild, java, python3 and
@@ -1845,7 +1833,7 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retry_rpc_waits_for_source_gc_before_input_lease_and_reports_typed_expiry() {
     use crate::service::completion::Target;
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let mut resident = delivery_resident(root.path()).await;
     resident.worker_connection.abort();
     resident.worker_connection = tokio::spawn(std::future::pending());

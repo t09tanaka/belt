@@ -419,7 +419,7 @@ fn explicit_resolution_and_distribution_integrity_are_frozen() {
 fn readers_use_verified_captured_directory_bytes_and_reject_corruption() {
     use crate::source::store::SourceStore;
     use local_ci::source::{capture_directory, seal_manifest, CaptureOptions, RelPath};
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = crate::test_tmp::tempdir().unwrap();
     let checkout = tmp.path().join("checkout");
     std::fs::create_dir(&checkout).unwrap();
     std::fs::write(checkout.join(".node-version"), "22.1.0").unwrap();
@@ -1340,7 +1340,7 @@ fn captured_monorepo_node_files_are_workspace_relative_and_snapshot_bound() {
         ("          node-version: '${{ matrix.node }}'\n          node-version-file: missing.json\n","unused.txt","unused",1),
         ("          node-version: '22.1.0'\n          node-version-file: bad.json\n","bad.json","{malformed",1),
     ] {
-        let tmp=tempfile::tempdir().unwrap();let source=tmp.path().join("source");std::fs::create_dir(&source).unwrap();let file=source.join(path);std::fs::create_dir_all(file.parent().unwrap()).unwrap();std::fs::write(&file,content).unwrap();
+        let tmp=crate::test_tmp::tempdir().unwrap();let source=tmp.path().join("source");std::fs::create_dir(&source).unwrap();let file=source.join(path);std::fs::create_dir_all(file.parent().unwrap()).unwrap();std::fs::write(&file,content).unwrap();
         let workflow=node_file_workflow(input);std::fs::write(source.join("ci.yml"),workflow).unwrap();
         let store=SourceStore::open(&tmp.path().join("state")).unwrap();let ctx=local_ci::ExecContext::new(Default::default());let captured=capture_directory(&ctx,&source,&CaptureOptions{store:Some(store.root().into()),..Default::default()}).unwrap();
         std::fs::write(file,"20.1.0").unwrap();

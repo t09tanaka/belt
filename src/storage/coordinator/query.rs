@@ -355,7 +355,7 @@ mod tests {
     use serde_json::json;
     #[test]
     fn metadata_pages_include_closed_runs_and_preserve_epoch() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let owner = CoordinatorStore::open(root.path(), 1).unwrap();
         let epoch = owner.epoch();
         let mut runs = Vec::new();
@@ -389,7 +389,7 @@ mod tests {
     }
     #[test]
     fn task_pages_distinguish_missing_and_empty_parents() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let owner = CoordinatorStore::open(root.path(), 1).unwrap();
         let run = RunId::generate();
         owner.create_run(&run, None, None, &json!({}), 1).unwrap();
@@ -432,7 +432,7 @@ mod tests {
     }
     #[test]
     fn history_keeps_retired_generations_and_resumes_exclusively() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let owner = CoordinatorStore::open(root.path(), 1).unwrap();
         let run = RunId::generate();
         let task = TaskId::generate();
@@ -468,7 +468,7 @@ mod tests {
     fn whole_run_facts_include_failures_uncertainty_and_uncollected_outside_page() {
         use crate::results::plan::Verdict;
         use crate::state::Outcome;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let owner = CoordinatorStore::open(root.path(), 1).unwrap();
         let run = RunId::generate();
         owner.create_run(&run, None, None, &json!({}), 1).unwrap();

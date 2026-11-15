@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn a_missing_key_is_created_with_mode_0600_and_read_back() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         let p = d.path().join("state/cluster.key");
         let k = init(&p).unwrap();
         assert_eq!(k.as_bytes().len(), 32);
@@ -276,7 +276,7 @@ mod tests {
     #[test]
     fn key_read_is_bounded_including_sparse_files_and_size_boundary() {
         use std::io::Seek;
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         let path = d.path().join("key");
         init(&path).unwrap();
         fs::write(&path, "ab".repeat(MAX_KEY_FILE_BYTES as usize / 2)).unwrap();
@@ -306,7 +306,7 @@ mod tests {
 
     #[test]
     fn opened_key_is_not_reopened_after_path_is_replaced_by_symlink() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         let path = d.path().join("key");
         let key = init(&path).unwrap();
         let mut file = fs::File::open(&path).unwrap();
@@ -338,7 +338,7 @@ mod tests {
 
     #[test]
     fn racing_creators_all_end_with_one_key() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         let p = d.path().join("cluster.key");
         let handles: Vec<_> = (0..8)
             .map(|_| {
@@ -353,7 +353,7 @@ mod tests {
 
     #[test]
     fn a_key_file_others_can_read_is_refused() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         let p = d.path().join("cluster.key");
         let k = init(&p).unwrap();
         for mode in [0o640, 0o604, 0o644, 0o666] {
@@ -370,7 +370,7 @@ mod tests {
 
     #[test]
     fn a_symlink_or_a_directory_is_not_a_key_file() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         let real = d.path().join("real.key");
         let k = init(&real).unwrap();
         let link = d.path().join("link.key");
@@ -385,7 +385,7 @@ mod tests {
 
     #[test]
     fn a_damaged_or_short_key_is_an_error_not_a_new_key() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         for (i, text) in ["zz\n", "ab\n", "", "ABCDEF0123456789ABCDEF0123456789\n"]
             .iter()
             .enumerate()
@@ -406,7 +406,7 @@ mod tests {
 
     #[test]
     fn missing_file_and_a_path_without_a_directory() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         assert!(matches!(
             load(&d.path().join("none")),
             Err(SecretError::KeyMissing(_))
@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn loading_never_makes_a_key_and_a_used_state_is_told_to_restore_it() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         let p = d.path().join("cluster.key");
         let err = load(&p).unwrap_err();
         assert!(matches!(err, SecretError::KeyMissing(_)));
@@ -449,7 +449,7 @@ mod tests {
     #[test]
     fn a_key_directory_others_can_write_to_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         let sub = d.path().join("keys");
         let p = sub.join("cluster.key");
         let k = init(&p).unwrap();
@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn a_stale_temporary_key_copy_is_swept_by_init_and_a_fresh_one_is_kept() {
-        let d = tempfile::tempdir().unwrap();
+        let d = crate::test_tmp::tempdir().unwrap();
         let sub = d.path().join("k");
         fs::create_dir(&sub).unwrap();
         let old = sub.join(".cluster-key.OLD.tmp");

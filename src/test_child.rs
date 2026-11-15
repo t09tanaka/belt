@@ -35,9 +35,7 @@ pub(crate) struct OwnedChild {
 
 impl OwnedChild {
     fn start(mut command: Command) -> io::Result<Self> {
-        let directory = tempfile::Builder::new()
-            .prefix("rtr-test-child-")
-            .tempdir()?;
+        let directory = crate::test_tmp::prefixed("rtr-test-child-")?;
         let ready = directory.path().join("ready");
         let child = command
             .env(READY_ENV, &ready)

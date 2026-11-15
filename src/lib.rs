@@ -25,5 +25,11 @@ pub mod workspace;
 
 pub mod ci;
 
+// The test-only helpers name this crate the way the integration tests do.
+#[cfg(test)]
+extern crate self as remote_task_runner;
+
 #[cfg(test)]
 mod test_child;
+#[cfg(test)]
+mod test_tmp;

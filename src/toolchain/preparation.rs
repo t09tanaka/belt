@@ -328,7 +328,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     #[test]
     fn preparation_files_are_bounded_owned_private_regular_and_not_links() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tmp::tempdir().unwrap();
         let file = temp.path().join("request");
         std::fs::write(&file, b"{}").unwrap();
         std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();

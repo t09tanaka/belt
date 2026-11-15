@@ -490,7 +490,7 @@ mod tests {
     use super::*;
     #[test]
     fn preparation_probe_failed_and_growth_reads_consume_shared_budget() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tmp::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let path = root.join("growing");
         fs::write(&path, b"aa").unwrap();

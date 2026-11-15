@@ -271,7 +271,7 @@ mod tests {
     /// An attempt whose lost supervisor recorded one launch: a process of
     /// this boot with a PID that cannot exist and the start identity `START`.
     fn fx() -> Fx {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let state = dir.path().join("state");
         let traffic = dir.path().join("traffic");
         std::fs::create_dir_all(&traffic).unwrap();

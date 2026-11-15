@@ -435,7 +435,7 @@ mod tests {
     }
     #[tokio::test]
     async fn estimate_100_calls_preserve_every_durable_row_epoch_and_actor_state() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let store = CoordinatorStore::open(dir.path(), 1).unwrap();
         let c = Coordinator::start(store, CoordinatorConfig::default()).unwrap();
         let link = Arc::new(ReadOnly {

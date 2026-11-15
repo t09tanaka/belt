@@ -11,7 +11,7 @@ impl Launcher for Unknown {
     }
 }
 fn fixture() -> (tempfile::TempDir, ContextInput) {
-    let t = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let t = crate::test_tmp::tempdir().unwrap();
     let executable = t.path().join("source");
     fs::write(&executable, b"test executable").unwrap();
     let env = BTreeMap::from([
@@ -101,7 +101,7 @@ fn pending_publication_is_bound_to_inode_not_matching_bytes() {
 }
 #[test]
 fn destination_links_and_unsafe_permissions_refuse() {
-    let t = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let t = crate::test_tmp::tempdir().unwrap();
     let a = t.path().join("a");
     fs::write(&a, b"x").unwrap();
     fs::set_permissions(&a, fs::Permissions::from_mode(0o600)).unwrap();
@@ -441,7 +441,7 @@ fn concurrent_directory_winner_is_revalidated_and_synced() {
             Ok(())
         }
     }
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let directory = root.path().join("winner");
     fs::DirBuilder::new()
         .mode(0o700)

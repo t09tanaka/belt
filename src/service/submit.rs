@@ -445,7 +445,7 @@ mod tests {
 
     #[test]
     fn the_worker_inventory_is_found_through_a_symlinked_state_directory() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let root = std::fs::canonicalize(root.path()).unwrap();
         let real = root.join("real");
         std::fs::DirBuilder::new()

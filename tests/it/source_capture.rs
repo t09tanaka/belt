@@ -1645,7 +1645,7 @@ fn paths_that_a_folding_file_system_merges_are_refused() {
 #[test]
 fn source_upload_opens_verified_descriptors_without_links_or_whole_reads() {
     use std::io::Seek;
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let store = SourceStore::open(root.path()).unwrap();
     let bytes = vec![37; 3 * 64 * 1024 + 3];
     let (hash, size) = store.object_store().unwrap().put_bytes(&bytes).unwrap();

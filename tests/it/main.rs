@@ -4,6 +4,8 @@
 
 mod common;
 mod proto_common;
+#[path = "../../src/test_tmp.rs"]
+mod test_tmp;
 
 mod bridge;
 mod collection;
@@ -34,3 +36,5 @@ mod init;
 mod worker_role;
 
 mod remote_links;
+
+mod test_tmp_root;
