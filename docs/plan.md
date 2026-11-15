@@ -938,3 +938,15 @@ Source競合修正5c434aaの独立安全レビューは actionable P1/P2なし�
 所有child・PID再利用・通知・元assert維持を独立確認済みで、spool deadline補足は0b5df11で
 閉じた。両方を親へ統合し、変更したsource分類のpure gateと、統合後のfocused/全9CIを
 次の区切りとする。前の1e7a37eの失敗・中止結果を新候補の成功へ読み替えない。
+
+### 競合・fixture修正後の親focused統合検証
+
+親22d744cで単一threadの関連unit22件成功・owned helper1件ignore、public CI plan3件・
+実readonly/profile-bound RPC1件・同時blob取り込み1件が成功した（integration計5件）。
+GC実EX中の入力待機/typed71/同一要求Accepted、Ping/renew/cancel、stop/owner drain、
+pin/helper/spool restart・source分類・元profile期限を統合状態で再確認した。
+strict all-target/all-feature clippy成功（12.90秒）。source修正5c434aaのpure分類は7件成功、
+exact coverage184/184、全14変異は10 caught・4 unviable・0 missed・0 timeout。
+所有targetプロセス残存0を確認し、結果はprivate fixtureのみである。
+この記録を含むコミット済み候補で全9 local-ciを新規実行する。実Rust1.100とMSRV1.89・
+ローカルinstaller未再現・Docker cleanupの環境制限・remote未実行は引き続き区別する。
