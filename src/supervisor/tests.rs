@@ -394,6 +394,7 @@ fn two_threads_share_the_limit_exactly() {
 /// forever (until killed) to the spool named by `RTR_SPOOL_ROOT` /
 /// `RTR_SPOOL_ATTEMPT`. Does nothing in a normal run.
 #[test]
+#[ignore = "owned subprocess helper"]
 fn child_writer_main() {
     let (Ok(root), Ok(attempt)) = (
         std::env::var("RTR_SPOOL_ROOT"),
@@ -404,8 +405,7 @@ fn child_writer_main() {
     let attempt = AttemptId::parse(&attempt).unwrap();
     let s = AttemptSpool::open(Path::new(&root), &attempt, BIG).unwrap();
     let w = s.writer(Stdout);
-    println!("ready");
-    std::io::stdout().flush().unwrap();
+    crate::test_child::publish_ready().unwrap();
     loop {
         let at = w.status().end;
         w.append(&pattern(at, 997)).unwrap();
@@ -413,30 +413,19 @@ fn child_writer_main() {
     }
 }
 
-fn spawn_child(root: &Path, a: &AttemptId) -> std::process::Child {
-    let mut c = Command::new(std::env::current_exe().unwrap())
+fn spawn_child(root: &Path, a: &AttemptId) -> crate::test_child::OwnedChild {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
         .args([
             "--exact",
             "supervisor::tests::child_writer_main",
+            "--ignored",
             "--nocapture",
         ])
         .env("RTR_SPOOL_ROOT", root)
         .env("RTR_SPOOL_ATTEMPT", a.as_str())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    // Wait until the child holds the spool.
-    let mut out = std::io::BufReader::new(c.stdout.take().unwrap());
-    let mut line = String::new();
-    loop {
-        line.clear();
-        assert!(std::io::BufRead::read_line(&mut out, &mut line).unwrap() > 0);
-        if line.trim() == "ready" {
-            break;
-        }
-    }
-    std::mem::forget(out);
-    c
+        .stdin(Stdio::null());
+    crate::test_child::OwnedChild::spawn(command).unwrap()
 }
 
 #[test]

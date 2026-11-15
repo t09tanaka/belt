@@ -141,11 +141,12 @@ mod tests {
         assert_eq!(fs::metadata(path).unwrap().ino(), inode);
     }
     #[test]
+    #[ignore = "owned subprocess helper"]
     fn pin_subprocess_holder() {
         let Ok(state) = std::env::var("RTR_PIN_CHILD_STATE") else {
             return;
         };
-        use std::io::{Read, Write};
+        use std::io::Read;
         let run = RunId::parse(&std::env::var("RTR_PIN_CHILD_RUN").unwrap()).unwrap();
         let _pin = if std::env::var_os("RTR_PIN_CHILD_EXCLUSIVE").is_some() {
             RunPin::exclusive(Path::new(&state), &run)
@@ -153,14 +154,12 @@ mod tests {
             RunPin::shared(Path::new(&state), &run)
         }
         .unwrap();
-        println!("pin-ready");
-        std::io::stdout().flush().unwrap();
+        crate::test_child::publish_ready().unwrap();
         let mut release = [0u8; 1];
         std::io::stdin().read_exact(&mut release).unwrap();
     }
     #[test]
     fn pins_exclude_across_processes_without_inheriting_descriptors() {
-        use std::io::{BufRead, BufReader, Write};
         use std::process::{Command, Stdio};
         let dir = tempfile::tempdir().unwrap();
         let run = RunId::generate();
@@ -171,28 +170,16 @@ mod tests {
                 .args([
                     "--exact",
                     "results::pin::tests::pin_subprocess_holder",
+                    "--ignored",
                     "--nocapture",
                 ])
                 .env("RTR_PIN_CHILD_STATE", dir.path())
                 .env("RTR_PIN_CHILD_RUN", run.as_str())
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped());
+                .stdin(Stdio::piped());
             if exclusive {
                 command.env("RTR_PIN_CHILD_EXCLUSIVE", "1");
             }
-            let mut child = command.spawn().unwrap();
-            let mut output = BufReader::new(child.stdout.take().unwrap());
-            let mut line = String::new();
-            loop {
-                line.clear();
-                assert!(
-                    output.read_line(&mut line).unwrap() > 0,
-                    "child ended before acquiring pin"
-                );
-                if line.trim() == "pin-ready" {
-                    break;
-                }
-            }
+            let mut child = crate::test_child::OwnedChild::spawn(command).unwrap();
             assert_eq!(
                 RunPin::exclusive(dir.path(), &run).unwrap_err().kind(),
                 io::ErrorKind::WouldBlock
@@ -205,7 +192,7 @@ mod tests {
             } else {
                 RunPin::shared(dir.path(), &run).unwrap();
             }
-            child.stdin.take().unwrap().write_all(b"x").unwrap();
+            child.release().unwrap();
             assert!(child.wait().unwrap().success());
             RunPin::exclusive(dir.path(), &run).unwrap();
         }

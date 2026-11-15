@@ -24,3 +24,6 @@ pub mod worker;
 pub mod workspace;
 
 pub mod ci;
+
+#[cfg(test)]
+mod test_child;

@@ -856,3 +856,27 @@ Source/Vault GCと通常source利用の競合を、ログ根拠に沿って別�
 全87変異は75 caught・12 unviable・0 missed・0 timeout。正常な同ミリ秒START/observed境界の
 テスト不足1件を追加して閉じた。実 user stateのGCやnative manager実行は行っていない。
 この結果も新しい統合候補の全体CI・実MSRV1.89・Linux/remote受入の代わりにはしない。
+
+### 単一スレッドのmutation baselineで止まるfixtureの修正
+
+1e7a37e の全体CIは最後のmutation shardの無変異baselineで停止した。pin helperが実lockを
+保持したままstdin releaseを待ち、親はlibtest stdoutのready行を待つ相互待機だった。
+RUST_TEST_THREADS=1 のpretty出力はtest名のprefixとhelperのreadyを同じ行に出すため、
+行全体の等値判定では受信を見落とす。同じ判定を使うsupervisor spool helperも修正対象とした。
+pin moduleは本featureで追加、supervisorの該当源コードはbaseと同一で、新しい単一スレッド
+実行が潜在するfixture前提を露呈した。全体CIの停止は成功として扱わない。
+
+旧コード4d1f228で両親テストを各5秒上限で因果再現した。threads1ではpin 5.076秒・
+supervisor 5.064秒で停止し、threads2ではそれぞれ0.027秒・0.439秒で成功した。
+再現の所有process groupだけを停止・回収し、該当binaryの残存参照0を確認した。
+
+修正はtest-only。子ごとに異なるprivate directoryで、実pin/spool取得後にatomic ready receiptを
+公開する。stdout書式には依存せず、ready/正常終了は各10秒の待機期限を持つ。OwnedChildが
+error・panic時も実Child handleをkill/reapし、既reap/ECHILDのPIDへsignalしない。helpersは
+通常の列挙では明示ignoreし、親がexact+ignoredで実行する。元のSH/EX相互排他・inode・
+spool内容・crash/restartの検証は維持し、productionのlockやGCは変更していない。
+
+修正後の最終focusedはthreads1/2それぞれ7件成功・2件owned-helper ignore、0.69秒/0.49秒。
+unique receipt・実正常終了・ready前終了・started確認後のready timeout・完了timeout・
+panic unwindの子回収を含む。strict all-target/all-feature clippy成功（12.16秒）、fmt/diff-check成功。
+実Rustは1.100であり実MSRV1.89・新しい全9ジョブ・remote CIの成功はここでは主張しない。
