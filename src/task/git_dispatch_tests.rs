@@ -72,13 +72,16 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_workflow(WORKFLOW)
+    }
+    fn with_workflow(workflow: &str) -> Self {
         let area = tempfile::Builder::new()
             .prefix("localci-git-dispatch-")
             .tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap())
             .unwrap();
         let root = area.path().join("repo");
         std::fs::create_dir_all(root.join(".github/workflows")).unwrap();
-        std::fs::write(root.join(FILE), WORKFLOW).unwrap();
+        std::fs::write(root.join(FILE), workflow).unwrap();
         git(&root, &["init", "-q", "-b", "main"]);
         git(&root, &["add", "."]);
         git(&root, &["commit", "-qm", "fixture"]);
@@ -480,4 +483,65 @@ fn git_derived_uses_original_commit_not_live_workflow_and_rejects_other_commit()
     assert!(
         verify_git_dispatch(&f.ctx, &changed, &f.repo(), &dispatch, &inputs, &f.facts).is_err()
     );
+}
+
+#[test]
+fn git_derived_native_background_remains_for_next_step_and_drains_with_entry() {
+    use std::io::Read;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::time::{Duration, Instant};
+    let old = "      - id: out\n        run: |\n          test \"$TAG\" = verified";
+    let new = r#"      - name: start background
+        run: |
+          (exec 9>"$GITHUB_WORKSPACE/witness"; printf r >&9; while [ ! -f "$GITHUB_WORKSPACE/proceed" ]; do sleep 0.01; done; printf u >&9; touch "$GITHUB_WORKSPACE/used"; while :; do sleep 1; done) &
+      - id: out
+        run: |
+          touch "$GITHUB_WORKSPACE/proceed"
+          for n in $(seq 1 200); do test ! -f "$GITHUB_WORKSPACE/used" || break; sleep 0.01; done
+          test -f "$GITHUB_WORKSPACE/used"
+          test "$TAG" = verified"#;
+    assert_eq!(WORKFLOW.matches(old).count(), 1);
+    let f = Fixture::with_workflow(&WORKFLOW.replace(old, new));
+    let mut d = f.driver();
+    f.seed(&mut d);
+    let (dispatch, inputs) = legs(&d).remove(0);
+    let ws = f.ws("native-background");
+    let fifo = ws.root.join("witness");
+    let c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+    let mut reader = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(fifo)
+        .unwrap();
+    let ctx = f.ctx.fresh_attempt();
+    let result = crate::execute_git_dispatch(
+        &ctx,
+        &f.plan,
+        &dispatch,
+        &inputs,
+        &f.facts,
+        None,
+        &ws,
+        f.opts(),
+    )
+    .unwrap();
+    assert_eq!(result.outcomes[0].status, JobStatus::Success);
+    assert_eq!(ctx.cancel.native_group_count(), 0);
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut bytes = Vec::new();
+    loop {
+        let mut b = [0; 16];
+        match reader.read(&mut b) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&b[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < until, "background still owns witness pipe");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(e) => panic!("owned witness read: {e}"),
+        }
+    }
+    assert_eq!(bytes, b"ru");
 }

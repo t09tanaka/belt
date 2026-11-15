@@ -1,5 +1,7 @@
 //! Running the plan: setup once, then every unit on its own thread.
 
+mod native_step;
+
 use crate::artifact::{self};
 use crate::artifact_io;
 use crate::context::ExecContext;
@@ -1109,6 +1111,7 @@ impl<'a> Runner<'a> {
     #[allow(clippy::too_many_arguments)]
     fn shell(
         &self,
+        native_scope: &native_step::NativeScope,
         cwd: &Path,
         script: &str,
         shell: Option<&str>,
@@ -1126,6 +1129,7 @@ impl<'a> Runner<'a> {
         loop {
             let from = fs::metadata(log).map(|m| m.len()).unwrap_or(0);
             let (r, q) = self.shell_once(
+                native_scope,
                 cwd,
                 script,
                 shell,
@@ -1155,6 +1159,7 @@ impl<'a> Runner<'a> {
     #[allow(clippy::too_many_arguments)]
     fn shell_once(
         &self,
+        native_scope: &native_step::NativeScope,
         cwd: &Path,
         script: &str,
         shell: Option<&str>,
@@ -1320,11 +1325,12 @@ impl<'a> Runner<'a> {
         } else {
             None
         };
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .with_context(|| format!("cannot start {}", argv[0]))?;
-        let writer_stop = Arc::new(AtomicBool::new(false));
-        let mut writer = None;
+        let wrapped = self.opts.traffic_controller.is_some() && key.is_some();
+        let mut child = native_step::NativeStep::new(child, self.ctx.cancel.clone(), wrapped);
+        let writer_stop = child.writer_stop();
         if let Some((r, w)) = pipe {
             // the child has its own copy
             drop(r);
@@ -1334,13 +1340,11 @@ impl<'a> Runner<'a> {
             // if something that outlived the step still holds the read end.
             let body = body.clone();
             let stop = writer_stop.clone();
-            writer = Some(std::thread::spawn(move || {
+            child.set_writer(std::thread::spawn(move || {
                 write_until_stopped(w, body.as_bytes(), &stop)
             }));
         }
-        let pid = child.id() as i32;
         let spawned = (Instant::now(), std::time::SystemTime::now());
-        self.ctx.cancel.track_pgid(pid);
         // With task-traffic-controller the clock starts when the command gets its turn, not while it waits.
         let mut started: Option<Instant> = if self.opts.traffic_controller.is_some() {
             None
@@ -1351,7 +1355,7 @@ impl<'a> Runner<'a> {
         let mut term_at: Option<Instant> = None;
         let mut timed_out = false;
         let status = loop {
-            if let Some(st) = child.try_wait()? {
+            if let Some(st) = child.observe()? {
                 break st;
             }
             if started.is_none() && marked && turn.exists() {
@@ -1377,24 +1381,15 @@ impl<'a> Runner<'a> {
             let over = matches!((timeout, started), (Some(t), Some(s)) if s.elapsed() > t);
             if (over || self.ctx.cancel.is_cancelled()) && term_at.is_none() {
                 timed_out = over;
-                unsafe {
-                    libc::killpg(pid, libc::SIGTERM);
-                }
+                child.signal(libc::SIGTERM);
                 term_at = Some(Instant::now());
             }
             if term_at.is_some_and(|t| t.elapsed() > Duration::from_secs(10)) {
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                }
+                child.signal(libc::SIGKILL);
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        self.ctx.cancel.untrack_pgid(pid);
-        // the step is over: nothing is owed to a reader that is still around
-        writer_stop.store(true, Ordering::SeqCst);
-        if let Some(h) = writer {
-            let _ = h.join();
-        }
+        child.finish(native_scope);
         if !piped {
             let _ = fs::remove_file(&file);
         }
@@ -1596,6 +1591,7 @@ impl<'a> Runner<'a> {
     }
 
     pub fn run_recipe(&self, recipe: &SetupRecipe, key: &str) -> Result<PreparedSetup> {
+        let native_scope = native_step::NativeScope::default();
         self.validate_source()?;
         if recipe.steps.is_empty() {
             return Ok(PreparedSetup {
@@ -1676,6 +1672,7 @@ impl<'a> Runner<'a> {
             let cwd = self.wt.join(&s.dir);
             let res = self
                 .shell(
+                    &native_scope,
                     &cwd,
                     &s.run,
                     s.shell.as_deref(),
@@ -2864,6 +2861,7 @@ impl<'a> Runner<'a> {
         // the part of a split job this runs: its step runs the shard's command
         shard: Option<&dag::TaskShard>,
     ) -> (JobResult, Map<String, Value>) {
+        let native_scope = native_step::NativeScope::default();
         let t0 = Instant::now();
         let mut stopped = false;
         let mut steps: Vec<StepResult> = Vec::new();
@@ -3311,6 +3309,7 @@ impl<'a> Runner<'a> {
             }
             let res = self
                 .shell(
+                    &native_scope,
                     &ws.join(&wd),
                     &script,
                     step_shell,

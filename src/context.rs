@@ -18,6 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 struct CancelState {
     cancelled: AtomicBool,
     pgids: Mutex<Vec<i32>>,
+    native_uncertain: Mutex<Vec<u32>>,
     containers: Mutex<Vec<String>>,
     compose_projects: Mutex<Vec<String>>,
 }
@@ -61,6 +62,21 @@ impl CancelHandle {
 
     pub fn untrack_pgid(&self, pg: i32) {
         self.0.pgids.lock().unwrap().retain(|&p| p != pg);
+    }
+
+    pub(crate) fn record_native_uncertain(&self, leader: u32) {
+        let mut ids = self.0.native_uncertain.lock().unwrap();
+        ids.push(leader);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_group_count(&self) -> usize {
+        self.0.pgids.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_uncertain(&self) -> Vec<u32> {
+        self.0.native_uncertain.lock().unwrap().clone()
     }
 
     pub(crate) fn track_container(&self, name: String) {

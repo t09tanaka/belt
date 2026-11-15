@@ -908,3 +908,22 @@ and namespaces are unchanged. This uniqueness fix does not make shared-context
 cleanup safe. The internal provenance/selection helper is separate from execution
 and cleanup for a future persistent-unit host; the ordinary CLI scheduler,
 shared-unit lifecycle and host failure policies remain to be integrated.
+
+
+### Native execution ownership (in development)
+
+Native shell steps keep an owned, unreaped group leader until their matrix entry
+or preparation recipe finishes. This pins the identity used by cancellation:
+groups are untracked before the leader is reaped, including on error and unwind.
+Script-pipe writers are stopped and joined on every return path. A background
+server may continue into subsequent steps of the same entry; draining that entry
+does not signal groups owned by another entry. Holding completed leaders uses
+kernel child slots for the entry lifetime, rather than silently narrowing the
+accepted step count.
+
+This native-group boundary is not a physical stop proof for an entire execution.
+Task-traffic-controller wrappers can own grandchildren in a different group, and
+an external executor has its own lifetime contract. Their direct child returning,
+a cancellation flag or an empty PID list is insufficient. The future shared host
+must consume an explicit drain outcome and retain uncertain ownership; the pure
+Driver host-terminal policy and ordinary Runner adapter remain unfinished.
