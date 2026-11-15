@@ -3063,13 +3063,15 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     use remote_task_runner::toolchain::capability::ExecutionRequirements;
     let (root, spec, input) = control_fixture();
     let bin = root.path().join("profile-bin");
+    // The host tools this test does not use are answered by the fixture.
+    let stubs = root.path().join("tool-stubs");
     std::fs::create_dir(&bin).unwrap();
     crate::common::write_executable(&bin.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
     // The shell is named through a symlink, as /bin/sh is on many Linux hosts.
     let shell = root.path().join("shell-link/sh");
     std::fs::create_dir(shell.parent().unwrap()).unwrap();
     std::os::unix::fs::symlink("/bin/sh", &shell).unwrap();
-    let profile_text=format!("schema_version=1\nactive='node22'\n[profiles.node22]\npath=[{:?}, '/usr/bin', '/bin']\nshell={shell:?}\ncache_namespace='node22'\nrequired_tools=['node']\nallowed_env=['MARKER','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n[profiles.node22.env]\nMARKER='profile-constant'\n",bin.to_str().unwrap());
+    let profile_text=format!("schema_version=1\nactive='node22'\n[profiles.node22]\npath=[{:?}, {stubs:?}, '/usr/bin', '/bin']\nshell={shell:?}\ncache_namespace='node22'\nrequired_tools=['node']\nallowed_env=['MARKER','GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n[profiles.node22.env]\nMARKER='profile-constant'\n",bin.to_str().unwrap());
     std::fs::write(spec.worker_state_dir.join("profiles.toml"), profile_text).unwrap();
     std::fs::set_permissions(
         spec.worker_state_dir.join("profiles.toml"),
@@ -3640,6 +3642,8 @@ async fn frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and
     use remote_task_runner::toolchain::profile::Profile;
     let (root, spec, input) = control_fixture();
     let host = root.path().join("private-managers");
+    // The host tools this test does not use are answered by the fixture.
+    let stubs = root.path().join("tool-stubs");
     std::fs::create_dir(&host).unwrap();
     crate::common::write_executable(&host.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
     // Both commands are alive at once: the second waits for the first, which
@@ -3656,7 +3660,7 @@ async fn frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and
         "budget = 8\ncpu_threshold_percent = 100.0\nmemory_reserve_mib = 0\n",
     )
     .unwrap();
-    let profile_text = format!("schema_version=1\nactive='base22'\n[profiles.base22]\npath=[{:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='base22'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
+    let profile_text = format!("schema_version=1\nactive='base22'\n[profiles.base22]\npath=[{:?},{stubs:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='base22'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
     let profile_file = spec.worker_state_dir.join("profiles.toml");
     std::fs::write(&profile_file, &profile_text).unwrap();
     std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();

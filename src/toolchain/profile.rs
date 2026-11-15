@@ -309,12 +309,12 @@ impl Profile {
         };
         // Loading is part of startup: a cold required tool gets the startup
         // deadline and repeats, and is refused only once it stays undetermined.
-        let clock = StartupClock::start(STARTUP_PROBES);
-        for tool in &profile.definition.required_tools {
-            if !matches!(
-                profile.startup_probe(tool, &clock),
-                ToolObservation::Available { .. }
-            ) {
+        let required = profile.startup_probes(
+            profile.definition.required_tools.iter().map(String::as_str),
+            STARTUP_PROBES,
+        );
+        for (tool, observed) in &required {
+            if !matches!(observed, ToolObservation::Available { .. }) {
                 return Err(format!("required worker profile tool {tool} unavailable"));
             }
         }
@@ -364,8 +364,9 @@ impl Profile {
     /// Measure every tool to a determinate answer before publishing the
     /// resident baseline, so a cold native launcher is not recorded as unknown
     /// and then taken for drift when it later answers. One call may take 2s;
-    /// only a call that timed out is repeated, at most 3 times per tool, within
-    /// one shared 5s. The wait is at most 5s + 14 fixed calls x 300ms = 9.2s.
+    /// only a call that timed out is repeated, after every tool had its first
+    /// call, at most 3 times per tool within one shared 5s. The wait is at
+    /// most 5s + 14 fixed calls x 300ms = 9.2s.
     /// A tool that is absent, fails, or still times out stays
     /// unavailable/unknown and does not prevent unconstrained shell work; if it
     /// answers after this baseline, that is drift.
@@ -374,17 +375,13 @@ impl Profile {
     }
     fn measured_report(&self, startup: Option<StartupProbes>) -> WorkerCapabilities {
         let files_before = self.executable_identity();
-        let clock = startup.map(StartupClock::start);
-        let tools: BTreeMap<_, _> = TOOLS
-            .iter()
-            .map(|t| {
-                let observed = match &clock {
-                    Some(clock) => self.startup_probe(t, clock),
-                    None => self.probe(t),
-                };
-                (t.to_string(), observed)
-            })
-            .collect();
+        let tools: BTreeMap<_, _> = match startup {
+            Some(limits) => self.startup_probes(TOOLS.iter().copied(), limits),
+            None => TOOLS
+                .iter()
+                .map(|t| (t.to_string(), self.probe(t)))
+                .collect(),
+        };
         let os = match std::env::consts::OS {
             "macos" => "macos",
             other => other,
@@ -625,23 +622,45 @@ impl Profile {
         self.probe_within(tool, &|| self.probe_timeout)
             .unwrap_or(ToolObservation::Unknown)
     }
-    /// Repeat only timeouts; every other answer is final at once.
-    fn startup_probe(&self, tool: &str, clock: &StartupClock) -> ToolObservation {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            let deadline = || match attempt {
-                1 => clock.call_deadline(),
-                _ => clock.repeat_deadline(),
-            };
-            match self.probe_within(tool, &deadline) {
-                Some(observed) => return observed,
-                None if attempt >= clock.limits.attempts || clock.remaining().is_zero() => {
-                    return ToolObservation::Unknown
+    /// Every tool is called once, then only the ones that timed out are
+    /// called again, pass by pass: a tool that never answers cannot use up
+    /// the repeats of the others. Every other answer is final at once.
+    fn startup_probes<'a>(
+        &self,
+        tools: impl Iterator<Item = &'a str>,
+        limits: StartupProbes,
+    ) -> BTreeMap<String, ToolObservation> {
+        let clock = StartupClock::start(limits);
+        let mut observed = BTreeMap::new();
+        let mut timed_out = Vec::new();
+        for tool in tools {
+            match self.probe_within(tool, &|| clock.call_deadline()) {
+                Some(answer) => {
+                    observed.insert(tool.to_string(), answer);
                 }
-                None => {}
+                None => timed_out.push(tool),
             }
         }
+        for _ in 1..limits.attempts {
+            let mut still = Vec::new();
+            for tool in timed_out {
+                let answer = match clock.remaining().is_zero() {
+                    true => None,
+                    false => self.probe_within(tool, &|| clock.repeat_deadline()),
+                };
+                match answer {
+                    Some(answer) => {
+                        observed.insert(tool.to_string(), answer);
+                    }
+                    None => still.push(tool),
+                }
+            }
+            timed_out = still;
+        }
+        for tool in timed_out {
+            observed.insert(tool.to_string(), ToolObservation::Unknown);
+        }
+        observed
     }
     /// `None`: a fixed call ran out of time, which says nothing about the tool.
     fn probe_within(&self, tool: &str, deadline: &dyn Fn() -> Duration) -> Option<ToolObservation> {
@@ -1154,6 +1173,27 @@ mod tests {
             profile.identity_failure_message(&live),
             "worker profile gained a native observation"
         );
+    }
+
+    #[test]
+    fn a_tool_that_never_answers_does_not_use_up_the_repeats_of_the_others() {
+        let root = tempfile::tempdir().unwrap();
+        // node comes first and times out in every pass; git needs longer than
+        // the live deadline, well inside one startup call.
+        fake(root.path(), "node", "/bin/sleep 30", 0o700);
+        fake(
+            root.path(),
+            "git",
+            "/bin/sleep 0.6\necho 'git version 2.40.0'",
+            0o700,
+        );
+        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        let report = profile.startup_report();
+        assert_eq!(report.tools["node"], ToolObservation::Unknown);
+        assert!(matches!(
+            &report.tools["git"],
+            ToolObservation::Available { .. }
+        ));
     }
 
     #[test]
