@@ -884,3 +884,23 @@ before accepting them. The verified capability has no deserialization or
 unchecked construction API. This is a scheduling-provenance boundary, not a
 replacement of the ordinary CLI Runner; the shared host adapter remains work
 in progress.
+
+### Verified ordinary Git dynamic execution (library, in development)
+
+`execute_git_dispatch` executes one member from a real `Driver::DerivedReady`
+action. It rereads verified Git source and rederives the complete dispatch from
+the frozen plan, original scheduling facts, host-authorized `PortableFacts` and
+`TaskInputs` before constructing a Runner. Captured execution uses the same
+shared dispatch validator. A decoded dispatch or a caller-made task is not an
+execution capability. The host still authenticates the committed claim, inputs,
+facts, worker selection and delivery; this API does not advance Driver state.
+
+This is an attempt-scoped entry with the same prepared-checkout contract as
+`execute_task`. The caller supplies its own context and workspace, tools and
+run directory. Context-wide container cleanup and workspace port release occur
+after execution, so concurrent attempts must not share those resources. Ordinary
+fresh Runners share a process resource-name counter; captured workspace counters
+and namespaces are unchanged. This uniqueness fix does not make shared-context
+cleanup safe. The internal provenance/selection helper is separate from execution
+and cleanup for a future persistent-unit host; the ordinary CLI scheduler,
+shared-unit lifecycle and host failure policies remain to be integrated.

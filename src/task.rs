@@ -341,6 +341,50 @@ pub fn execute_task(
     execute_with_runner(ctx, fp, task_id, inputs, prepared, ws, runner)
 }
 
+/// Execute one source-verified ordinary Git dynamic member.
+///
+/// The host must authenticate `dispatch`, `inputs` and `facts` against its
+/// committed claim. Scheduling facts are reread from the exact frozen Git
+/// commit in `ws.repo_root`, and the complete dispatch is recomputed before
+/// constructing a runner or starting work. The workspace has the same
+/// caller-owned checkout/prepared-state contract as [`execute_task`].
+///
+/// `ctx` MUST belong exclusively to this attempt: like [`execute_task`], this
+/// entry cleans the context's containers and releases workspace ports. It is
+/// not a persistent shared-unit runner or a concurrent shared-context API.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_git_dispatch(
+    ctx: &ExecContext,
+    fp: &FrozenPlan,
+    dispatch: &crate::driver::DerivedDispatch,
+    inputs: &TaskInputs,
+    facts: &crate::driver::PortableFacts,
+    prepared: Option<(&PreparedReceipt, &TemplateContext)>,
+    ws: &Workspace,
+    opts: Opts,
+) -> Result<TaskResult> {
+    let selection = verify_git_dispatch(ctx, fp, &ws.repo_root, dispatch, inputs, facts)?;
+    let task = selection.task.clone();
+    let runner = Runner::new(ctx, fp, ws, opts)?.select_derived(selection, facts.clone());
+    execute_resolved_with_runner(ctx, &task, inputs, prepared, ws, runner)
+}
+
+/// The provenance/rederivation boundary is separate from runner construction
+/// and cleanup so a future persistent unit host can reuse the same proof.
+/// Captured and Git execution both use dispatch::validate, not separate
+/// expansion or equality rules. Selection has no public unchecked constructor.
+pub(crate) fn verify_git_dispatch(
+    ctx: &ExecContext,
+    fp: &FrozenPlan,
+    repository: &std::path::Path,
+    dispatch: &crate::driver::DerivedDispatch,
+    inputs: &TaskInputs,
+    facts: &crate::driver::PortableFacts,
+) -> Result<crate::driver::dispatch::Selection> {
+    let source = crate::source_execute::git_evaluation_source(ctx, repository, fp)?;
+    crate::driver::dispatch::validate(fp, &source, facts, dispatch, inputs)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_with_runner(
     ctx: &ExecContext,
@@ -403,3 +447,6 @@ pub(crate) fn execute_resolved_with_runner(
     }
     result
 }
+
+#[cfg(test)]
+mod git_dispatch_tests;
