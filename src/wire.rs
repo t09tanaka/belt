@@ -316,6 +316,7 @@ impl JobSpec {
             timeout_minutes: self.timeout_minutes,
             continue_on_error: self.continue_on_error,
             outputs: self.outputs.clone(),
+            job_exprs: vec![],
         }
     }
 }

@@ -287,6 +287,7 @@ mod tests {
             timeout_minutes: None,
             continue_on_error: false,
             outputs: vec![],
+            job_exprs: vec![],
         }
     }
 

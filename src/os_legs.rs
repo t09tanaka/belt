@@ -145,6 +145,17 @@ fn expr_reads(e: &str, keys: &[String]) -> bool {
     if e.contains("strategy.job-") {
         return true;
     }
+    // `runner.os`, `runner.arch`, `runner.name` and the rest are the OS label
+    // the leg runs on, which the host does not reproduce
+    let mut at = 0;
+    while let Some(p) = e[at..].find("runner") {
+        let i = at + p;
+        at = i + "runner".len();
+        let before = e[..i].chars().next_back();
+        if !before.is_some_and(|c| ident(c) || c == '.') && e[at..].starts_with('.') {
+            return true;
+        }
+    }
     let mut from = 0;
     while let Some(p) = e[from..].find("matrix") {
         let at = from + p;
@@ -205,6 +216,10 @@ fn evaluated_parts(job: &Job) -> Value {
         "services": job.services,
         "steps": job.steps,
         "outputs": job.outputs,
+        "timeout_minutes": job.timeout_minutes,
+        "continue_on_error": job.continue_on_error,
+        "container": job.container,
+        "job_exprs": job.job_exprs,
     })
 }
 
@@ -380,6 +395,47 @@ mod tests {
             ),
         ];
         assert_eq!(twins(Family::MacOs, &job(ok), &legs2), vec![Some(1), None]);
+    }
+
+    #[test]
+    fn steps_that_read_the_runner_mean_no_twin() {
+        let legs = [
+            leg("ubuntu-latest", json!({"os": "ubuntu-latest"})),
+            leg("macos-latest", json!({"os": "macos-latest"})),
+        ];
+        for steps in [
+            "    steps:\n      - run: echo hi\n        if: runner.os == 'Linux'\n",
+            "    steps:\n      - run: echo ${{ runner.arch }}\n",
+            "    steps:\n      - run: echo hi\n        env:\n          A: ${{ RUNNER.NAME }}\n",
+        ] {
+            assert_eq!(
+                twins(Family::MacOs, &job(steps), &legs),
+                vec![None, None],
+                "{steps}"
+            );
+        }
+    }
+
+    #[test]
+    fn job_settings_that_read_the_os_mean_no_twin() {
+        let legs = [
+            leg("ubuntu-latest", json!({"os": "ubuntu-latest"})),
+            leg("macos-latest", json!({"os": "macos-latest"})),
+        ];
+        for head in [
+            "    continue-on-error: ${{ matrix.os == 'macos-latest' }}\n",
+            "    timeout-minutes: ${{ matrix.os == 'macos-latest' && 5 || 10 }}\n",
+            "    container: ${{ matrix.os }}\n",
+        ] {
+            let y = format!("{head}    steps:\n      - run: echo hi\n");
+            assert_eq!(
+                twins(Family::MacOs, &job(&y), &legs),
+                vec![None, None],
+                "{y}"
+            );
+        }
+        let y = "    continue-on-error: true\n    timeout-minutes: 5\n    steps:\n      - run: echo hi\n";
+        assert_eq!(twins(Family::MacOs, &job(y), &legs), vec![Some(1), None]);
     }
 
     #[test]

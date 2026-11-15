@@ -52,6 +52,10 @@ pub struct Job {
     pub timeout_minutes: Option<f64>,
     pub continue_on_error: bool,
     pub outputs: Vec<(String, String)>,
+    /// `timeout-minutes`, `continue-on-error` and `container` as written, when
+    /// they hold an expression (the typed fields above read one as unset).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_exprs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -273,6 +277,12 @@ fn parse_job(id: &str, j: &Y) -> Job {
         timeout_minutes: num_of(j, "timeout-minutes"),
         continue_on_error: bool_of(j, "continue-on-error"),
         outputs: pairs(get(j, "outputs")),
+        job_exprs: ["timeout-minutes", "continue-on-error", "container"]
+            .iter()
+            .filter_map(|k| get(j, k))
+            .filter_map(|v| serde_yaml::to_string(v).ok())
+            .filter(|t| t.contains("${{"))
+            .collect(),
     }
 }
 
