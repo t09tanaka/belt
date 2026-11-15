@@ -856,3 +856,13 @@ Source/Vault GCと通常source利用の競合を、ログ根拠に沿って別�
 全87変異は75 caught・12 unviable・0 missed・0 timeout。正常な同ミリ秒START/observed境界の
 テスト不足1件を追加して閉じた。実 user stateのGCやnative manager実行は行っていない。
 この結果も新しい統合候補の全体CI・実MSRV1.89・Linux/remote受入の代わりにはしない。
+
+### Source intake の並行 SQLite write 修正
+
+1e7a 全体CIは成功ではない。open済みの同一 SourceStore に8接続が同時 ingest する
+経路で database-is-locked が発生した。barrier を付けた実 API 回帰でも旧実装は0.20秒で
+SQLite code5を再現し、最初のSELECT後に書込みへ昇格する Deferred transaction が原因と確認した。
+書込みを行う8箇所は最初のread前に BEGIN IMMEDIATE を取得し、真のread-only handoff
+precheckは変更しない。FS hashing/書込みやcoordinator actor呼出はtransactionへ移さない。
+同一回帰は変更後0.25秒で成功し、保存blobの内容も一致した。Source/Vault lock・claim・clock
+条件は不変。関連source保持/転送の検証と別のforeground GC競合修正を続ける。

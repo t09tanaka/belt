@@ -5,7 +5,7 @@ mod vault_retention;
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
 pub use deletion::{RetentionCursor, RetentionPage};
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use std::fs::{File, TryLockError};
 use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
@@ -388,7 +388,7 @@ impl Index {
                 break;
             }
             after = keys.last().unwrap().clone();
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             for key in keys {
                 tx.execute(
                     "INSERT OR IGNORE INTO member VALUES(?1,?2)",
@@ -473,7 +473,7 @@ impl Index {
             let cached = cache.as_ref().unwrap();
             cached.check(self)?;
             let m = &cached.manifest;
-            let tx = c.transaction()?;
+            let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let key = format!("m:{}", m.source_id);
             let path = format!("manifests/{}.json", m.source_id);
             Self::check_publication(&tx, &key)?;
@@ -531,7 +531,7 @@ impl Index {
     fn release_import_page(&self, token: &ImportToken, received: &str) -> Result<bool> {
         self.check_token(token)?;
         let mut c = self.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let keys: Vec<String> = {
             let mut s = tx.prepare("SELECT a.object FROM member a WHERE a.root=?1 AND EXISTS(SELECT 1 FROM member b WHERE b.root=?2 AND b.object=a.object) ORDER BY a.object LIMIT 32")?;
             let rows = s.query_map(params![token.root(), received], |r| r.get(0))?;
@@ -572,7 +572,9 @@ impl Index {
     pub(crate) fn import_blob(&self, token: &ImportToken, hash: &str) -> Result<()> {
         self.check_token(token)?;
         let mut c = self.connect()?;
-        let tx = c.transaction()?;
+        // Reserve the writer before reading. Competing Deferred readers cannot
+        // both upgrade to a writer, even with SQLite's busy timeout installed.
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let pending: bool = tx.query_row(
             "SELECT state='pending' FROM import_session WHERE token=?1",
             [&token.id],
@@ -656,7 +658,7 @@ impl Index {
     }
     fn handoff_page(&self, pending: &str, run: &str) -> Result<bool> {
         let mut c = self.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         // Destination must contain each membership before its source is released.
         let keys: Vec<String> = {
             let mut s =
@@ -751,7 +753,7 @@ impl SourceStore {
             store: (metadata.dev(), metadata.ino()),
         };
         let mut c = self.retention.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         tx.execute(
             "INSERT INTO import_session(token,state) VALUES(?1,'pending')",
             [&token.id],
@@ -766,7 +768,7 @@ impl SourceStore {
     pub(crate) fn import_publication_root(&self, token: &ImportToken, id: &str) -> Result<String> {
         self.retention.check_token(token)?;
         let mut c = self.retention.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (state, source): (String, Option<String>) = tx.query_row(
             "SELECT state,source FROM import_session WHERE token=?1",
             [&token.id],
@@ -809,7 +811,7 @@ impl SourceStore {
         guard.ensure_run_available(run)?;
         self.retention.check_token(token)?;
         let mut c = self.retention.connect()?;
-        let tx = c.transaction()?;
+        let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let (state, id, bound_run): (String, Option<String>, Option<String>) = tx.query_row(
             "SELECT state,source,run_id FROM import_session WHERE token=?1",
             [&token.id],
