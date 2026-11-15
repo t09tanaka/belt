@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-16
+
 ### Changed
 
 - **A nested `exec` is now gated.** An `exec` called from inside a gated
