@@ -385,7 +385,13 @@ pub fn run_gated(
             queue,
             estimate: est,
             holders,
-        } = match managed::try_admit(ctx, limits, id, waited().as_secs_f64())? {
+        } = match managed::try_admit_in(
+            ctx,
+            limits,
+            id,
+            waited().as_secs_f64(),
+            opts.parent.as_deref(),
+        )? {
             TryAdmit::Admitted => break,
             TryAdmit::LockBusy => continue,
             TryAdmit::Wait(w) => *w,

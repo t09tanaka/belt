@@ -31,6 +31,10 @@ the minor version).
   - A stale lease is gated as a top-level command, as before. A caller
     inside a managed run whose supervisor is gone still runs under it
     without an entry, as before.
+  - A binary older than this one that is still running a command rewrites
+    the ledger without `parent`; a waiting child writes it back on its
+    next attempt, so upgrading while commands run cannot leave a child
+    waiting for its own parent.
 
 ### Added
 

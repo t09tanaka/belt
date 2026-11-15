@@ -372,7 +372,7 @@ fn measured_use_beyond_the_declared_weight_holds_the_next_start() {
     );
 }
 
-/// The shape that ran nine jobs of a CI runner at once: a gated command
+/// The shape that ran every job of a CI runner at once: a gated command
 /// that wraps each of its own steps in `exec`. The steps queue against the
 /// same budget as children of the outer entry.
 #[test]
@@ -423,6 +423,10 @@ fn nested_execs_that_do_not_fit_together_run_one_after_another() {
         "{inspect}"
     );
     // The second stays queued for as long as the first holds its slot.
+    // (The marker is written after the entry turns running: wait for it.)
+    assert!(wait_until(Duration::from_secs(10), || {
+        dir.join("a.start").exists() || dir.join("b.start").exists()
+    }));
     let (first, second) = if dir.join("a.start").exists() {
         ("a", "b")
     } else {
@@ -493,8 +497,9 @@ fn what_a_nested_exec_uses_is_not_measured_on_its_parent_too() {
     let env = TestEnv::new()
         .with_config("budget = 2\ncpu_threshold_percent = 100\nmemory_reserve_mib = 0\n");
     let dir = env.marker_dir();
-    // Three workers each burning 6 s of their own CPU time.
-    let burn = "for i in 1 2 3; do perl -e '1 while (times)[0] < 6' & done; wait\n";
+    // One worker burning 6 s of its own CPU time: bounded by CPU time, so
+    // load only stretches the wall time.
+    let burn = "perl -e '1 while (times)[0] < 6'\n";
     let outer = format!(
         "{BIN} exec --weight 1 -- {}\n",
         script_file(&dir, "burn", burn)
@@ -503,7 +508,7 @@ fn what_a_nested_exec_uses_is_not_measured_on_its_parent_too() {
     let using = |e: &serde_json::Value| e["using"].as_f64().unwrap_or(0.0);
     assert!(
         wait_until(Duration::from_secs(30), || {
-            nested_entries(&env).iter().any(|e| using(e) >= 1.5)
+            nested_entries(&env).iter().any(|e| using(e) >= 0.5)
         }),
         "the nested tree was never measured: {:?}",
         env.entries()
@@ -512,7 +517,7 @@ fn what_a_nested_exec_uses_is_not_measured_on_its_parent_too() {
     let on_parent = wait_until(Duration::from_millis(2500), || {
         env.entries()
             .iter()
-            .any(|e| e["parent"].is_null() && using(e) >= 1.0)
+            .any(|e| e["parent"].is_null() && using(e) >= 0.3)
     });
     let entries = env.entries();
     assert!(parent.wait().unwrap().success());
