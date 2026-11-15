@@ -45,37 +45,74 @@ pub struct FileIdentity {
     pub size: u64,
     pub executable: bool,
 }
-/// Shared FD byte budget for both key-validation passes of one probe.
-/// Each file is capped at 1 MiB plus a sentinel, the whole probe at 8 MiB including a
-/// possible growth sentinel. Admission uses its existing per-file bound.
+/// One finite budget for both resolver passes and complete artifact validation.
+/// The read-only verifier retains descriptor identities until its final sweep.
 pub(crate) struct IdentityReadBudget {
     per_file: u64,
     remaining: std::cell::Cell<u64>,
+    reads: std::cell::Cell<u64>,
+    snapshot: std::cell::RefCell<probe::Snapshot>,
+    limited: bool,
+    started: u64,
+    #[cfg(test)]
+    total: u64,
 }
 impl IdentityReadBudget {
     pub(crate) fn probe() -> Self {
+        Self::limited(16 * 1024 * 1024, 64 * 1024 * 1024)
+    }
+    fn limited(per_file: u64, total: u64) -> Self {
         Self {
-            per_file: 1024 * 1024,
-            remaining: std::cell::Cell::new(8 * 1024 * 1024),
+            per_file,
+            remaining: std::cell::Cell::new(total),
+            reads: std::cell::Cell::new(0),
+            snapshot: std::cell::RefCell::new(probe::Snapshot::default()),
+            limited: true,
+            started: crate::platform::monotonic_ms(),
+            #[cfg(test)]
+            total,
         }
     }
     fn admission() -> Self {
-        Self {
-            per_file: MAX_TOTAL,
-            remaining: std::cell::Cell::new(u64::MAX),
-        }
+        let mut b = Self::limited(MAX_TOTAL, u64::MAX);
+        b.limited = false;
+        b
     }
     fn capture(&self, path: &Path) -> Result<FileIdentity> {
-        let remaining = self.remaining.get();
-        if remaining == 0 {
-            return Err("identity_byte_budget");
+        if self.limited {
+            probe::capture(path, self)
+        } else {
+            FileIdentity::capture(path)
         }
-        // Reserve one byte even when metadata says that the file fits.
-        let identity = FileIdentity::capture_bounded(path, self.per_file.min(remaining - 1))?;
-        self.remaining.set(remaining - identity.size);
-        Ok(identity)
+    }
+    pub(crate) fn finish(&self) -> Result<()> {
+        self.snapshot.borrow().finish()
     }
 }
+#[cfg(test)]
+thread_local! { static PROBE_STATISTICS: std::cell::Cell<(u64,u64,usize,usize)> = const { std::cell::Cell::new((0,0,0,0)) }; }
+#[cfg(test)]
+impl Drop for IdentityReadBudget {
+    fn drop(&mut self) {
+        if self.limited {
+            let snapshot = self.snapshot.borrow();
+            PROBE_STATISTICS.with(|s| {
+                s.set((
+                    self.total - self.remaining.get(),
+                    self.reads.get(),
+                    snapshot.paths_len(),
+                    snapshot.visits(),
+                ))
+            });
+        }
+    }
+}
+#[cfg(test)]
+pub(crate) fn probe_statistics() -> (u64, u64, usize, usize) {
+    PROBE_STATISTICS.with(std::cell::Cell::get)
+}
+mod probe;
+pub(crate) use probe::{inspect_installation, prospective_activation, VerifiedInstallation};
 impl FileIdentity {
     pub fn capture(path: &Path) -> Result<Self> {
         Self::capture_bounded(path, MAX_TOTAL)
@@ -314,11 +351,15 @@ pub(crate) fn plan_with_limit(
     budget: &IdentityReadBudget,
 ) -> Result<InstallPlan> {
     frozen.validate()?;
-    owned_dir(state)?;
-    if !clean_absolute(state)
-        || fs::canonicalize(state).map_err(|_| "private_root_canonical")? != state
-    {
-        return Err("noncanonical_private_root");
+    if budget.limited {
+        probe::private_root(state, budget)?;
+    } else {
+        owned_dir(state)?;
+        if !clean_absolute(state)
+            || fs::canonicalize(state).map_err(|_| "private_root_canonical")? != state
+        {
+            return Err("noncanonical_private_root");
+        }
     }
     if host.dependencies.len() > 32
         || host.search_path.len() > 32
@@ -733,19 +774,7 @@ impl InstallationReceipt {
     }
     pub fn validate(&self, plan: &InstallPlan) -> Result<()> {
         owned_dir(&plan.root)?;
-        if self.schema != 1
-            || self.plan != plan.key()
-            || self.version != plan.version
-            || self.root != plan.root
-            || self.external != plan.external
-            || self.probe_outputs.len() != plan.probes.len()
-            || plan
-                .probes
-                .iter()
-                .any(|(p, _)| !self.probe_outputs.contains_key(p))
-        {
-            return Err("installation_receipt_mismatch");
-        }
+        self.validate_contract(plan)?;
         for dep in &self.external {
             dep.validate()?;
         }
@@ -762,6 +791,23 @@ impl InstallationReceipt {
                 return Err("installed_tool_escape");
             }
         }
+        Ok(())
+    }
+    fn validate_contract(&self, plan: &InstallPlan) -> Result<()> {
+        if self.schema != 1
+            || self.plan != plan.key()
+            || self.version != plan.version
+            || self.root != plan.root
+            || self.external != plan.external
+            || self.probe_outputs.len() != plan.probes.len()
+            || plan
+                .probes
+                .iter()
+                .any(|(p, _)| !self.probe_outputs.contains_key(p))
+        {
+            return Err("installation_receipt_mismatch");
+        }
+
         Ok(())
     }
 }
@@ -991,6 +1037,30 @@ pub fn activate_set(
     setup_policy: Digest,
     shell: &FileIdentity,
 ) -> Result<ActivationReceipt> {
+    compose_activation(
+        frozen,
+        installed,
+        base_profile,
+        base_observations,
+        base_env,
+        setup_policy,
+        shell,
+        || shell.validate(),
+        |plan, receipt| receipt.validate(plan),
+    )
+}
+#[allow(clippy::too_many_arguments)]
+fn compose_activation(
+    frozen: &FrozenToolchains,
+    installed: &[(&InstallPlan, &InstallationReceipt)],
+    base_profile: Digest,
+    base_observations: &BTreeMap<ToolId, super::versions::VersionObservation>,
+    base_env: &BTreeMap<String, String>,
+    setup_policy: Digest,
+    shell: &FileIdentity,
+    validate_shell: impl FnOnce() -> Result<()>,
+    validate_receipt: impl Fn(&InstallPlan, &InstallationReceipt) -> Result<()>,
+) -> Result<ActivationReceipt> {
     use super::versions::{Match, MatchPolicy, VersionObservation};
     if !frozen.is_resolved() || installed.len() != frozen.selections.len() || installed.len() > 256
     {
@@ -1014,7 +1084,7 @@ pub fn activate_set(
             return Err("activation_baseline_mismatch");
         }
     }
-    shell.validate()?;
+    validate_shell()?;
     if !shell.executable {
         return Err("activation_shell_not_executable");
     }
@@ -1029,7 +1099,7 @@ pub fn activate_set(
         if plan.frozen != *frozen || !tools.insert(plan.tool.clone()) {
             return Err("activation_contract_mismatch");
         }
-        receipt.validate(plan)?;
+        validate_receipt(plan, receipt)?;
         if MatchPolicy::Exact.compare(
             &VersionObservation::Known(plan.version.clone()),
             &VersionObservation::Known(receipt.version.clone()),

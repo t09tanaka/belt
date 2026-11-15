@@ -15,6 +15,8 @@ pub struct ProbeProvenance {
     pub profile: ProfileSample,
     pub observed_monotonic_ms: u64,
     pub observation_ttl_ms: u64,
+    /// Earliest content verification in this reply; never reset by the second pass.
+    pub verification_started_monotonic_ms: Option<u64>,
 }
 impl ProbeProvenance {
     /// Conservative cross-host deadline: parent send time, never receive time.
@@ -40,7 +42,14 @@ impl ProbeProvenance {
         let age = self
             .observed_monotonic_ms
             .checked_sub(p.completed_monotonic_ms)?;
-        let remaining = p.ttl_ms.checked_sub(age)?.min(self.observation_ttl_ms);
+        let mut remaining = p.ttl_ms.checked_sub(age)?.min(self.observation_ttl_ms);
+        if let Some(started) = self.verification_started_monotonic_ms {
+            if started < p.completed_monotonic_ms || started == u64::MAX {
+                return None;
+            }
+            let verification_age = self.observed_monotonic_ms.checked_sub(started)?;
+            remaining = remaining.min(5000u64.checked_sub(verification_age)?);
+        }
         let deadline = sent.checked_add(remaining)?;
         (received < deadline).then_some(deadline)
     }
@@ -59,6 +68,7 @@ mod tests {
             },
             observed_monotonic_ms: 5090,
             observation_ttl_ms: 5000,
+            verification_started_monotonic_ms: None,
         }
     }
     #[test]
@@ -100,5 +110,20 @@ mod tests {
         let mut p = sample();
         p.profile.native_boot = "x".repeat(128);
         assert_eq!(p.deadline(1000, 1000), Some(1010));
+    }
+    #[test]
+    fn preparation_freshness_limits_complete_verification_from_its_start() {
+        let mut p = sample();
+        p.verification_started_monotonic_ms = Some(100);
+        assert_eq!(p.deadline(1000, 1009), Some(1010));
+        assert_eq!(p.deadline(1000, 1010), None);
+        p.verification_started_monotonic_ms = Some(99);
+        assert_eq!(p.deadline(1000, 1000), None);
+        p.verification_started_monotonic_ms = Some(5091);
+        assert_eq!(p.deadline(1000, 1000), None);
+        p.verification_started_monotonic_ms = Some(u64::MAX);
+        assert_eq!(p.deadline(1000, 1000), None);
+        p.verification_started_monotonic_ms = Some(5000);
+        assert_eq!(p.deadline(1000, 1009), Some(1010));
     }
 }

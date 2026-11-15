@@ -2440,6 +2440,9 @@ mod tests {
         ];
         for state in [
             PreparationProbeState::ConcretePlan,
+            PreparationProbeState::VerifiedAvailable {
+                proof: Digest::of_bytes(b"complete sampled tool proof"),
+            },
             PreparationProbeState::Active {
                 builder_id: BuilderId::generate(),
                 builder_attempt_id: AttemptId::generate(),
@@ -2461,6 +2464,7 @@ mod tests {
                     },
                     observed_monotonic_ms: 11,
                     observation_ttl_ms: 5000,
+                    verification_started_monotonic_ms: None,
                 },
                 owner_generation: BuilderId::generate(),
                 entries: vec![entry.clone(); 16],

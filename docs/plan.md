@@ -724,3 +724,42 @@ Rust1.100で限定検証はtoolchain13件（21.83秒、1500ms deadlineと子回�
 `estimate --task ID` は、保存済みの完全 TaskSpec/source/run と選択 worker の preview profile/boot/epoch が揃う場合だけ、hello で feature 交渉済みの同じ attachment に一度だけ readonly probe を送る。command-only・source 不明・古い peer は Unknown のままである。IO 中は actor を保持せず、応答後に attachment/InputGate 世代・worker identity・owner/input/profile binding を再照合する。最大256 worker の private identity context、同時 query 全体1件、送信 input 256KiB と最大16 entry の上限を保つ。親 send 時刻から元 sample の age と observation TTL の最小残量を使い、受信から5秒を作らない。同じ sample の再送は最初の deadline を延長しない。identity の確認だけを preview assumption に表示し、setup scalar・ready delay・admission は変更しない。
 
 現在の producer Active は実 BuilderId/attempt の観測であり TTC command node の証明ではない。artifact の bounded 完全検証・正確な frozen activation の証明、実 TTC ledger identity と依存/resource graph の対応、既存 simulator への接続とユーザー経路の受入は引き続き必須残件である。ConcretePlan/producer 不在から cold/warm/0 を作らず、setup cost は Unknown を維持する。
+
+### 小さい complete tool artifact の bounded 観測と exact prospective activation
+
+未公開 preparation_probe_v1 に VerifiedAvailable（完全な tool 内容をこの query 中に検証した sample）と
+verification START を追加する。元 normal profile sample・owner/input/attachment/InputGate の fence を維持し、
+親 deadline は親 SEND と元 profile/verification START の残 TTL から計算する。再送で期限を更新しない。
+VerifiedAvailable は admission/reservation や Warm/準備時間0を意味しない。実 admission の検証は引き続き独立に行う。
+
+query 全体（両 resolver・external・receipt・tree・shell）で64MiB、1 file16MiB、receipt1MiB、最大256 retained paths、
+1024 visited entries、256 pending paths を上限とする。FD-relative NOFOLLOW で全祖先を開き、完全な tree hash と
+owner/mode/nlink・inode・mtime/ctime・path-to-FD binding・private directory inventory を最後まで検証する。
+コンパクトな receipt inventory も deserialize 中に制限し、失敗した read/growth sentinel の byte 消費を戻さない。
+symlink を含む tool tree、上限超過、大きい/部分的な artifact は Unknown のままである。query は native command、
+get/detect/materialize、pin、usage、attempt、lease を作成しない。filesystem IO は Setups ownership mutex の外に置く。
+owner ごとの単一 try-lock は実 IO 終了まで保持し、timeout 後の重い detached query の積み上がりを防ぐ。
+blocking filesystem syscall の壁時計上限は保証せず、元 TTL を越えた reply は破棄する。
+
+VerifiedInstallation は Deserialize/外部 constructor を持たず、同じ live query budget への lifetime と identity を要求する。
+通常 activate_set の IO validation と同じ順序の shared composition を使い、frozen complete set、baseline、shell、
+protected environment、tool 順序、receipt digest と execution fingerprint の計算を共有する。この activation から
+実 prepare と同じ workspace_key_context/template_key を計算する。workspace template の availability 自体は
+引き続き identity-only/Unknown であり、setup scalar・ready_delay・admission は変更しない。
+
+実 clock の private fixture と read-only real rustup binary（11,031,216 bytes、実行なし）による6回の校正では、
+両 resolver を含む charged bytes33,428,886/query、524 read calls、27 retained paths、19 visited entries、
+in-process roundtrip977〜988ms、元 profile age0→977〜988ms、Unknown0/6だった。
+32MiB では125,546 bytesしか余裕がないため total64MiB/file16MiBを選んだ。
+first observed read と5 repeatであり OS cache eviction は制御していない。tiny admitted payload の測定で、
+network/RPC・実際の大きい Rust installation・一般的な warm 性能の測定には外挿しない。
+
+最終 focused 検証は preparation/adapters/wire/protocol150件成功＋明示手動 calibration1件ignore、
+別途 toolchain/preparation106件成功＋同ignore、strict all-target/all-feature clippy成功（Rust1.100）。
+calibrationは別の明示コマンドで6 sample成功。実5.01秒 IO pause による元 profile expiry、二重 query拒否、
+ownerを実drainまで保持してgateを解放、same-size/restored-mtime・ctime・root/receipt入替・hardlink/symlink・
+receipt/dir flood/共有byte上限の否定、actual admitted receipt と activate_set の一致を確認した。
+実 worker の negotiated readonly/profile-bound RPC1件も成功。全 local-ci/MSRV/Linux/独立レビューと新 wire/pure gate は親統合の区切りで行う。
+
+大きい native install、template complete-content proof、実 TTC ledger ID と依存/resource graph/simulator、
+実 user-path setup cost と Docker 受入は必須残件で、S15f 全体の完成とは扱わない。
