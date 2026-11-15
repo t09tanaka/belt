@@ -924,9 +924,11 @@ fn frozen_limit_boundaries_reselection_and_all_constraint_validators() {
     )
     .unwrap();
     assert!(full.validate().is_ok());
+    // One entry past each bound is refused for its size, before any
+    // per-entry rule (the extra entry is also a duplicate) is consulted.
     let mut over = full.clone();
     over.requirements.push(over.requirements[0].clone());
-    assert!(over.validate().is_err());
+    assert_eq!(over.validate(), Err("invalid_frozen_toolchains"));
     let mut baselines = full.clone();
     baselines.requirements.clear();
     baselines.baseline = declarations
@@ -940,7 +942,7 @@ fn frozen_limit_boundaries_reselection_and_all_constraint_validators() {
     assert!(baselines.validate().is_ok());
     let mut over = baselines;
     over.baseline.push(over.baseline[0].clone());
-    assert!(over.validate().is_err());
+    assert_eq!(over.validate(), Err("invalid_frozen_toolchains"));
     let mut selected = full;
     for d in &declarations {
         selected = selected
@@ -950,7 +952,7 @@ fn frozen_limit_boundaries_reselection_and_all_constraint_validators() {
     assert!(selected.validate().is_ok());
     let mut over = selected.clone();
     over.selections.push(over.selections[0].clone());
-    assert!(over.validate().is_err());
+    assert_eq!(over.validate(), Err("invalid_frozen_toolchains"));
     let updated = selected
         .with_selection(
             &declarations[0].tool,
