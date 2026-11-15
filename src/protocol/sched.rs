@@ -123,6 +123,48 @@ mod tests {
     }
 
     #[test]
+    fn queued_ownership_is_opaque_and_survives_until_the_last_frame_clone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Lease {
+            drops: Arc<AtomicUsize>,
+            _private: &'static str,
+        }
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let held = Retained::new(Lease {
+            drops: drops.clone(),
+            _private: "private-lease-sentinel",
+        });
+        let same = held.clone();
+        assert_eq!(held, same);
+        assert_ne!(held, Retained::new(7_u8));
+        assert_eq!(format!("{held:?}"), "Retained(..)");
+        let mut scheduler = Scheduler::new();
+        scheduler.push(Outgoing {
+            kind: StreamKind::Blob,
+            bytes: b"encoded".to_vec(),
+            retained: Some(same),
+        });
+        drop(held);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let frame = scheduler.pop().unwrap();
+        assert!(scheduler.is_empty());
+        let inflight = frame.clone();
+        drop(frame);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let diagnostic = format!("{inflight:?}");
+        assert!(diagnostic.contains("Retained(..)"));
+        assert!(!diagnostic.contains("private-lease-sentinel"));
+        drop(inflight);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
     fn control_overtakes_queued_bulk() {
         let mut s = Scheduler::new();
         for i in 0..50 {
