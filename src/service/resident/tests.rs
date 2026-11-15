@@ -1783,3 +1783,137 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retry_rpc_waits_for_source_gc_before_input_lease_and_reports_typed_expiry() {
+    use crate::service::completion::Target;
+    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let mut resident = delivery_resident(root.path()).await;
+    resident.worker_connection.abort();
+    resident.worker_connection = tokio::spawn(std::future::pending());
+    let captured = resident.captured.clone();
+    let input = root.path().join("input");
+    std::fs::create_dir(&input).unwrap();
+    std::fs::write(input.join("data"), "retained retry").unwrap();
+    let run = RunId::generate();
+    let source = crate::source::capture_for_run(
+        &captured.env,
+        &captured.sources,
+        &run,
+        &crate::source::SourceRequest::Directory { dir: input },
+        &Default::default(),
+    )
+    .unwrap();
+    let digest = Digest::parse(&source.manifest.manifest_digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{}", source.manifest.manifest_digest)))
+        .unwrap();
+    let task = TaskId::generate();
+    let store = resident.coordinator.store();
+    store
+        .put_source_ref(&source.manifest.source_id, &digest, 1)
+        .unwrap();
+    store
+        .enqueue(
+            &run,
+            Some(&source.manifest.source_id),
+            &serde_json::json!({}),
+            &[(
+                task.clone(),
+                serde_json::to_value(delivery_spec(digest, false)).unwrap(),
+            )],
+            1,
+        )
+        .unwrap();
+    let attempt = AttemptId::generate();
+    store
+        .create_attempt(
+            NewAttempt {
+                attempt_id: attempt.clone(),
+                task_id: task,
+                worker_id: WorkerId::parse("local").unwrap(),
+                payload_hash: Digest::of_bytes(b"payload"),
+                permit_id: None,
+            },
+            2,
+        )
+        .unwrap();
+    for state in [
+        AttemptState::Preparing,
+        AttemptState::Ready,
+        AttemptState::Starting,
+        AttemptState::Active,
+        AttemptState::Finalizing,
+    ] {
+        store.transition_attempt(&attempt, state, 3).unwrap();
+    }
+    store
+        .finalize_attempt(
+            &attempt,
+            Termination::new(Outcome::Failed, Some(crate::state::Exit::Code(1)), None).unwrap(),
+            4,
+        )
+        .unwrap();
+    let (entered, resume) = captured.sources.pause_retention_page();
+    let sources = captured.sources.clone();
+    let coordinator = resident.coordinator.clone();
+    let gc = tokio::task::spawn_blocking(move || {
+        sources.retention_page(
+            coordinator.store(),
+            &mut Default::default(),
+            wall_ms(),
+            crate::platform::clock::monotonic_ms(),
+            crate::platform::boot_id(),
+            crate::results::plan::retention_ms(7),
+        )
+    });
+    tokio::task::spawn_blocking(move || entered.recv_timeout(Duration::from_secs(2)))
+        .await
+        .unwrap()
+        .unwrap();
+    let client = resident.client();
+    let owner = tokio::spawn(resident.run());
+    let retry = || Operation::Retry {
+        target: Target::Run(run.clone()),
+        expected_control_revision: 0,
+        request_id: RunId::generate().to_string(),
+    };
+    let waits = captured.sources.foreground_wait_count();
+    let first_client = client.clone();
+    let first_request = retry();
+    let first = tokio::spawn(async move { first_client.request(first_request).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while captured.sources.foreground_wait_count() == waits {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(matches!(
+        client.request(Operation::Ping).await.unwrap(),
+        Reply::Ready { .. }
+    ));
+    let reply = first.await.unwrap().unwrap();
+    assert!(
+        matches!(reply, Reply::ControlError { error } if error.code == crate::error::ErrorCode::SourceBusy)
+    );
+    let next_client = client.clone();
+    let next_request = retry();
+    let next = tokio::spawn(async move { next_client.request(next_request).await });
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while captured.sources.foreground_wait_count() < waits + 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!next.is_finished());
+    resume.send(()).unwrap();
+    gc.await.unwrap().unwrap();
+    let reply = next.await.unwrap().unwrap();
+    assert!(matches!(reply, Reply::RetryAccepted { .. }), "{reply:?}");
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    owner.await.unwrap().unwrap();
+}

@@ -1004,3 +1004,33 @@ Python runnerにもTTC二重wrapperは追加しない。3件のpolicy testとshe
 全体local-ci・remote CI・Linux/macOS matrix・実MSRV1.89はこの段階で未実行で、
 全体ゲート成功とは扱わない。全2656の成果物は `/private/tmp/rtr-pure-mutation-all/`、
 最終期限smokeは `/private/tmp/rtr-pure-mutation-timeout-smoke/` に保全した。
+
+### Retry入力leaseの残存try-SH境界と最終解放
+
+450ae1fのmutation baselineでは、restart後in-place Retryがsource mutation lockのraw
+CommunicationUnknownで失敗し、別baselineではretry stoppingのtransfer.lock再取得が
+WouldBlockとなった。前者はprepare_retryより前、Retry RPCがforward::leaseのtry-SHを
+取る境界だった。後者はLeaseのlocal mutexがfile/sourceより先に解放される競合に加え、
+transfer Fileにfork/dup共有descriptionを解く明示unlockがなかった。
+
+10cee9eでtransfer lockを最終Arcで明示unlockし、Sourceとfileをlocal mutexより先に
+解放する。dupを生かしたまま最終Arc後のtransfer EX/source EX再取得を検証し、Arc clone
+が残る間の排他も維持した。旧実装はこのdup回帰でWouldBlockとなった。
+
+Retryだけ専用foreground leaseへ進み、owned spawn_blockingでSource SHを取得する。
+admission/actor外で待機し、同じGuardをtransfer leaseへ渡すため再取得の隙間はない。
+通常配送のtry-SHは維持する。stop/abortしても実blocking取得がdrainするまでlocal所有権を
+保持し、transfer待機中の停止・エラーでもSource→localの解放順を守る。typed
+ForegroundBusyだけ71へ写し、他エラー・停止の従来CommunicationUnknownは維持する。
+
+実residentのretained source/failed runに対し実GC pageをSource EX直後に止め、Retry RPCの
+実foreground待機・Ping応答・2秒のtyped71を確認。その後別Retryの同じpending callが
+EX解除でRetryAcceptedとなる。旧実装はこのforeground待機に到達せず回帰が失敗した。
+永久lock/root/modeの置換拒否は既存foreground群で再確認し、元stoppingのowner解放と
+cross-process排他assertionは弱めていない。
+
+旧実装への新回帰2件は失敗、修正後2件は成功。関連unit51件成功（12.86秒）、実CLIの
+restart/in-place/symlink/通常submitとSource captureのintegration44件成功（64.43秒）。
+全target/feature strict clippy、fmt/diff check成功。実Rust1.100、専用target、承認済み
+TTC外側→portool内側を使用。full local-ci・MSRV1.89・remoteは親の次gateとし、今回の
+focused成功へ読み替えない。実user stateのGCやnative serviceへの操作はない。

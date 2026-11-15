@@ -151,6 +151,40 @@ pub(super) async fn lease(
 ) -> anyhow::Result<Arc<Lease>> {
     check_stop(stop)?;
     let source = store.mutation_guard()?;
+    lease_guarded(store, stop, ownership, source).await
+}
+
+/// Foreground retry input ownership. Blocking Source SH acquisition happens
+/// outside admission/the coordinator actor and never on an async runtime worker.
+/// On stop, detached acquisition keeps local ownership until it actually drains.
+pub(super) async fn foreground_lease(
+    store: &SourceStore,
+    stop: &mut watch::Receiver<bool>,
+    ownership: OwnedMutexGuard<()>,
+) -> anyhow::Result<Arc<Lease>> {
+    check_stop(stop)?;
+    let sources = store.clone();
+    let acquisition = tokio::task::spawn_blocking(move || {
+        sources.foreground_guard().map(|source| (source, ownership))
+    });
+    let (source, ownership) = tokio::select! {
+        biased;
+        _=stopped(stop)=>anyhow::bail!("resident is stopping"),
+        result=acquisition=>result??,
+    };
+    lease_guarded(store, stop, ownership, source).await
+}
+
+async fn lease_guarded(
+    store: &SourceStore,
+    stop: &mut watch::Receiver<bool>,
+    ownership: OwnedMutexGuard<()>,
+    source: crate::source::retention::Guard,
+) -> anyhow::Result<Arc<Lease>> {
+    // Preserve source-before-local teardown on error/cancellation while waiting
+    // for transfer.lock too; tuple fields drop in declaration order.
+    let input = (source, ownership);
+    check_stop(stop)?;
     let path = store.root().join("transfer.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -179,9 +213,9 @@ pub(super) async fn lease(
         }
     }
     Ok(Arc::new(Lease {
-        _local: ownership,
+        _local: input.1,
         _file: LockedTransfer(file),
-        _source: source,
+        _source: input.0,
         measurable: std::sync::atomic::AtomicBool::new(true),
         started: crate::platform::monotonic_ms(),
     }))
@@ -464,6 +498,90 @@ mod measured_lease_tests {
         assert!(acquired.started >= released);
         assert!(acquired.started.saturating_sub(before) >= 50);
     }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreground_source_wait_stop_and_cancellation_keep_local_ownership_until_drain() {
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SourceStore::open(dir.path()).unwrap();
+            let exclusive = store.retention.guard(true).unwrap();
+            let local = Arc::new(tokio::sync::Mutex::new(()));
+            let ownership = local.clone().lock_owned().await;
+            let (stop, mut stopping) = watch::channel(false);
+            let sources = store.clone();
+            let pending =
+                tokio::spawn(
+                    async move { foreground_lease(&sources, &mut stopping, ownership).await },
+                );
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while store.foreground_wait_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if cancel {
+                pending.abort();
+                assert!(matches!(pending.await, Err(error) if error.is_cancelled()));
+            } else {
+                stop.send(true).unwrap();
+                assert!(tokio::time::timeout(Duration::from_secs(1), pending)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_err());
+            }
+            // Async cancellation is not cancellation of the owned blocking IO.
+            assert!(local.try_lock().is_err());
+            drop(exclusive);
+            let _drained = tokio::time::timeout(Duration::from_secs(2), local.lock_owned())
+                .await
+                .unwrap();
+            let _exclusive = store.retention.guard(true).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_transfer_wait_stop_releases_source_before_local_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SourceStore::open(dir.path()).unwrap();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(store.root().join("transfer.lock"))
+            .unwrap();
+        file.try_lock().unwrap();
+        let local = Arc::new(tokio::sync::Mutex::new(()));
+        let ownership = local.clone().lock_owned().await;
+        let (stop, mut stopping) = watch::channel(false);
+        let sources = store.clone();
+        let pending =
+            tokio::spawn(async move { foreground_lease(&sources, &mut stopping, ownership).await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while store.retention.guard(true).is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.send(true).unwrap();
+        assert!(pending.await.unwrap().is_err());
+        let _next = local.lock_owned().await;
+        let _exclusive = store.retention.guard(true).unwrap();
+        // Stopping the waiter must not unlock the separate transfer owner.
+        assert!(matches!(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(store.root().join("transfer.lock"))
+                .unwrap()
+                .try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+    }
+
     #[tokio::test]
     async fn cancelled_ownership_wait_has_no_measurement_origin() {
         let dir = tempfile::tempdir().unwrap();

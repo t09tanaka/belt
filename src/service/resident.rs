@@ -1059,7 +1059,7 @@ async fn handle(
                         _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
                         ownership=captured.transfer.clone().lock_owned()=>ownership,
                     };
-                    super::forward::lease(&captured.sources, &mut stopping, ownership).await
+                    super::forward::foreground_lease(&captured.sources, &mut stopping, ownership).await
                 }.await;
                 let lease = match retained {
                     Ok(lease) => lease,
@@ -1067,10 +1067,14 @@ async fn handle(
                         return write_message(
                             &mut stream,
                             &Reply::ControlError {
-                                error: crate::error::ApiError::new(
-                                    crate::error::ErrorCode::CommunicationUnknown,
-                                    error.to_string(),
-                                ),
+                                error: if error.is::<crate::source::retention::ForegroundBusy>() {
+                                    crate::source::classify::api_error_of(&error)
+                                } else {
+                                    crate::error::ApiError::new(
+                                        crate::error::ErrorCode::CommunicationUnknown,
+                                        error.to_string(),
+                                    )
+                                },
                             },
                         )
                         .await
