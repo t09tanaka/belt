@@ -125,8 +125,8 @@ fn coordinator_refusal_class(event: &remote_task_runner::storage::Event) -> Opti
 }
 
 /// Why the worker refused or failed an attempt before any command ran. Only
-/// the event kinds and the typed refusal of `agent_environment_changed` are
-/// printed, never other payloads.
+/// the event kinds and the typed code and message of the agent's own refusals
+/// are printed, never other payloads.
 fn diagnose_worker(spec: &Spec) {
     let Ok(store) =
         remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
@@ -139,7 +139,10 @@ fn diagnose_worker(spec: &Spec) {
         return;
     };
     for event in events.iter().rev().take(48).rev() {
-        if event.kind == "agent_environment_changed" {
+        if matches!(
+            event.kind.as_str(),
+            "agent_environment_changed" | "agent_prepare_failed" | "agent_spawn_failed"
+        ) {
             eprintln!(
                 "worker event: {} code={} reason={} message={}",
                 event.kind,
@@ -3647,6 +3650,9 @@ bin="$NODENV_ROOT/versions/$version/bin"
         .output()
         .await
         .unwrap();
+    if !output.status.success() {
+        diagnose_worker(&spec);
+    }
     assert!(
         output.status.success(),
         "{} {}",
