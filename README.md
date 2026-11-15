@@ -267,11 +267,27 @@ Each `run:` step of a job is then given the share in two ways:
 
 A job that has the whole budget is not limited: no variable is set and
 task-traffic-controller works the weight out from earlier runs, as before.
-That is a run with a single unit without a matrix (or with a matrix under
-`strategy.max-parallel: 1`), a budget under 8 with task-traffic-controller,
-and `--parallel 1`. With `--parallel 1` and task-traffic-controller the
-entries of a matrix still run together, each without a share. Setup steps run
-before the jobs, alone, and are not limited either.
+That is a run whose jobs never run together: a single unit without a matrix
+(or with a matrix under `strategy.max-parallel: 1`, or of an exclusive job
+that holds the repository lock, whose entries run one after another), or a
+budget under 8 with task-traffic-controller. `--parallel 1` limits nothing
+by itself: the entries of a matrix still run together, and they divide the
+budget between them. Setup steps run before the jobs, alone, and are not
+limited either.
+
+An empty variable counts as not set: `CARGO_BUILD_JOBS=` in the environment
+`local-ci` is started with is replaced by the share.
+
+When task-traffic-controller gates the steps but its budget cannot be read
+(`task-traffic-controller inspect` fails, as in an older version, or has no
+budget), the jobs are not limited: no variable is set, no weight is asked
+for, and `local-ci` prints a warning once. A weight above a budget that is
+not known could never be admitted.
+
+The share is worked out by `local-ci run` only. A library caller of
+`execute_plan` runs the jobs unlimited, unless it sets `Runner::job_threads`
+itself; the `cpu` of a run result does cross the wire (`WireRunResult`) when
+there is one.
 
 When jobs are limited, the summary says how
 (`cpu    budget 12 · 3 jobs at once · 4 threads each`), and `result.json` and

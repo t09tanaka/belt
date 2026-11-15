@@ -462,6 +462,10 @@ pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Resu
 /// `ws.run_dir` must be new and unique to this run (see [`claim_run_dir`]):
 /// the run's artifacts are laid out in it, and one that has artifacts already
 /// (another run's, or an earlier call's) is refused before anything starts.
+///
+/// The jobs are not given a CPU share (see [`crate::cpu`]) here: the share is
+/// worked out by `local-ci run` only, which knows the budget and `--parallel`.
+/// A caller that wants one sets [`exec::Runner::job_threads`] itself.
 pub fn execute_plan(
     ctx: &ExecContext,
     fp: &FrozenPlan,
@@ -742,24 +746,36 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         // What the jobs divide: the controller's budget, as the steps wait
         // for it there, or the cores of this machine. The entries of a matrix
         // run together only with the controller.
-        let peak = crate::cpu::peak(&fp, gated);
+        let portool = if a.no_portool {
+            None
+        } else {
+            ctx.find_tool("portool")
+        };
+        let isolated = portool.is_some() && wt.join(".portool.toml").is_file();
+        let peak = crate::cpu::peak(&fp, gated, isolated, parallel);
         // one job at a time has it all: nothing to ask the controller
-        if peak > 1 && a.parallel != Some(1) {
-            let budget = traffic_controller
-                .as_deref()
-                .and_then(|c| crate::cpu::controller_budget(ctx, c))
-                .unwrap_or_else(crate::cpu::cores);
-            cpu = crate::cpu::share(budget, a.parallel, gated, peak);
+        if peak > 1 {
+            let budget = match traffic_controller.as_deref() {
+                Some(c) => match crate::cpu::controller_budget(ctx, c) {
+                    Ok(b) => Some(b),
+                    // a weight above a budget that is not known could never
+                    // be admitted, and an older controller has no `inspect`
+                    Err(why) => {
+                        obs.notice(&format!(
+                            "the CPU share of the jobs is off: task-traffic-controller {why}, so its budget is not known"
+                        ));
+                        None
+                    }
+                },
+                None => Some(crate::cpu::cores()),
+            };
+            cpu = budget.and_then(|b| crate::cpu::share(b, a.parallel, gated, peak));
         }
         let opts = exec::Opts {
             parallel,
             traffic_controller,
             executor: None,
-            portool: if a.no_portool {
-                None
-            } else {
-                ctx.find_tool("portool")
-            },
+            portool,
             containers: a.containers,
             job_timeout_min: a.job_timeout,
             keep: a.keep,

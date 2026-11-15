@@ -1142,3 +1142,133 @@ jobs:
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert!(v.get("cpu").is_none(), "{v}");
 }
+
+/// A workflow of one job with a matrix of four entries, each saying its threads.
+fn matrix_workflow(d: &Demo, job: &str) {
+    let out = d.home.join("threads");
+    std::fs::create_dir_all(&out).unwrap();
+    add_workflow(
+        d,
+        "matrix.yml",
+        &format!(
+            r#"name: Matrix
+on: pull_request
+jobs:
+  {job}:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2, 3, 4]
+    steps:
+      - run: echo "$CARGO_BUILD_JOBS $NEXTEST_TEST_THREADS $RUST_TEST_THREADS" > {}/${{{{ matrix.n }}}}
+"#,
+            out.display()
+        ),
+    );
+}
+
+#[test]
+fn an_empty_thread_variable_of_the_caller_counts_as_not_set() {
+    let (d, path) = thread_share_demo();
+    let o = local_ci_threads(&d, &path, &[("CARGO_BUILD_JOBS", "")], &[]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert_eq!(threads_of(&d, "plain"), "4 4 4");
+}
+
+#[test]
+fn a_single_job_run_is_not_limited() {
+    let d = demo("app/lib.sh");
+    let out = d.home.join("threads");
+    std::fs::create_dir_all(&out).unwrap();
+    add_workflow(
+        &d,
+        "single.yml",
+        &format!(
+            "name: Single\non: pull_request\njobs:\n  only:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"$CARGO_BUILD_JOBS $NEXTEST_TEST_THREADS $RUST_TEST_THREADS\" > {}/only\n",
+            out.display()
+        ),
+    );
+    let path = budget_controller(&d);
+    let o = local_ci_share(&d, &path, &[], &["-w", "single.yml", "--json"]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert_eq!(threads_of(&d, "only"), "");
+    let argv = std::fs::read_to_string(d.home.join("argv")).unwrap();
+    assert!(!argv.contains("--weight"), "{argv}");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v.get("cpu").is_none(), "{v}");
+}
+
+#[test]
+fn matrix_entries_get_a_share_under_parallel_one() {
+    let d = demo("app/lib.sh");
+    matrix_workflow(&d, "entry");
+    let path = budget_controller(&d);
+    let o = local_ci_share(
+        &d,
+        &path,
+        &[],
+        &["-w", "matrix.yml", "--parallel", "1", "--json"],
+    );
+    assert!(o.status.success(), "{}", stdout(&o));
+    // one unit at a time, but its four entries run together
+    for n in 1..=4 {
+        assert_eq!(threads_of(&d, &n.to_string()), "2 2 2", "entry {n}");
+    }
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        v["cpu"],
+        serde_json::json!({"budget": 8, "jobs_at_once": 4, "threads_per_job": 2})
+    );
+}
+
+#[test]
+fn the_entries_of_an_exclusive_job_do_not_count_as_running_together() {
+    let d = demo("app/lib.sh");
+    // an e2e job holds the repository lock, so its entries run one after another
+    matrix_workflow(&d, "e2e");
+    let path = budget_controller(&d);
+    let o = local_ci_share(&d, &path, &[], &["-w", "matrix.yml", "--json"]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    for n in 1..=4 {
+        assert_eq!(threads_of(&d, &n.to_string()), "", "entry {n}");
+    }
+    let argv = std::fs::read_to_string(d.home.join("argv")).unwrap();
+    assert!(!argv.contains("--weight"), "{argv}");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v.get("cpu").is_none(), "{v}");
+}
+
+#[test]
+fn no_share_is_given_when_the_controller_cannot_say_its_budget() {
+    let (d, _) = thread_share_demo();
+    let bin = d.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("task-traffic-controller");
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\nif [ \"$1\" = inspect ]; then exit 1; fi\necho \"$*\" >> {}/argv\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nexec \"$@\"\n",
+            d.home.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let o = local_ci_threads(&d, &path, &[], &["--json"]);
+    assert!(o.status.success(), "{}", stdout(&o));
+    assert_eq!(threads_of(&d, "plain"), "");
+    assert_eq!(threads_of(&d, "own"), "1 7");
+    let argv = std::fs::read_to_string(d.home.join("argv")).unwrap();
+    assert_eq!(argv.lines().count(), 2, "{argv}");
+    assert!(!argv.contains("--weight"), "{argv}");
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert!(v.get("cpu").is_none(), "{v}");
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert_eq!(
+        err.matches("the CPU share of the jobs is off").count(),
+        1,
+        "{err}"
+    );
+    assert!(err.contains("`inspect` failed"), "{err}");
+}

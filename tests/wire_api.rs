@@ -277,6 +277,25 @@ fn the_json_of_a_run_is_what_it_was() {
 }
 
 #[test]
+fn the_cpu_share_of_a_run_crosses_and_is_left_out_without_one() {
+    let mut r = run_result("/runs/r1");
+    let text = serde_json::to_string(&WireRunResult::from_run_result(&r).unwrap()).unwrap();
+    assert!(!text.contains("\"cpu\""), "{text}");
+    r.cpu = Some(local_ci::cpu::Share {
+        budget: 8,
+        jobs_at_once: 2,
+        threads_per_job: 4,
+    });
+    let text = serde_json::to_string(&WireRunResult::from_run_result(&r).unwrap()).unwrap();
+    assert!(text.contains("\"cpu\":{"), "{text}");
+    let back = WireRunResult::from_json(&text)
+        .unwrap()
+        .into_run_result("/mine/r9".into())
+        .unwrap();
+    assert_eq!(back.cpu, r.cpu);
+}
+
+#[test]
 fn a_run_result_crosses_without_a_path_of_the_host_and_comes_back_in_the_receivers() {
     let r = run_result("/runs/r1");
     let wire = WireRunResult::from_run_result(&r).unwrap();

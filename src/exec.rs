@@ -3280,7 +3280,7 @@ impl<'a> Runner<'a> {
             // caller, the workflow, the job or the step says stays.
             if let Some(threads) = self.job_threads {
                 for k in crate::cpu::JOB_THREAD_ENV {
-                    if self.ctx.var(k).is_none() && !env_now.contains_key(k) {
+                    if self.ctx.var(k).is_none_or(|v| v.is_empty()) && !env_now.contains_key(k) {
                         env.push((k.into(), threads.to_string()));
                     }
                 }

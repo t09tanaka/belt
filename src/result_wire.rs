@@ -284,6 +284,10 @@ pub struct WireRunResult {
     pub state: String,
     pub description: String,
     pub secs: f64,
+    /// How the CPU was divided between the jobs, when it was. Left out when
+    /// not, so a result of a run without a share reads as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<crate::cpu::Share>,
     pub setup: Vec<WireStepResult>,
     pub units: Vec<WireUnitResult>,
     pub skipped_workflows: Vec<Skipped>,
@@ -312,6 +316,7 @@ impl WireRunResult {
             state: r.state.clone(),
             description: r.description.clone(),
             secs: r.secs,
+            cpu: r.cpu,
             setup: steps_of(&r.setup, base)?,
             units: r
                 .units
@@ -340,7 +345,7 @@ impl WireRunResult {
             state: self.state,
             description: self.description,
             secs: self.secs,
-            cpu: None,
+            cpu: self.cpu,
             setup: steps_back(self.setup, &run_dir)?,
             units: self
                 .units
