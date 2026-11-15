@@ -3,10 +3,14 @@
 ## Unreleased
 
 - Stop leaking worktrees in the cache directory. A run now also removes its worktrees, copies and tools directory when it is stopped with `SIGTERM` or `SIGHUP` (before, only Ctrl-C was handled, and only once the checkout was made) or when it panics. Each run holds a lock on `wt/.owner-<pid>`, and every run starts by removing the entries whose owner is gone (killed, crashed), dropping their `git worktree` registration and deleting what earlier deletions left in `trash/`. Entries of a live run are never touched; age is not used.
-- Deletions run in their own process group, so stopping local-ci's group no longer stops them halfway, and a tree with read-only directories is deleted too. The tools directory is deleted in the background like the worktrees.
-- Add `local-ci cache status` and `local-ci cache prune [--kept]`.
-- Worktrees kept with `--keep` are marked as kept and stay until `local-ci cache prune --kept`. Worktrees kept by an earlier version carry no mark: they are removed by the next run once the process that made them is gone.
-- `Observer::executing` is now called before the worktree is created, so a signal during the checkout is handled.
+- A run stopped with `SIGTERM` or `SIGHUP` cleans up and then ends by that signal, so whoever waits for it sees the signal and not an exit code. Ctrl-C still exits with 130. A signal that was ignored when local-ci started (`nohup local-ci run …`) stays ignored.
+- Deletions run in their own process group, so stopping local-ci's group no longer stops them halfway, and a tree with read-only directories is deleted too. The tools directory is deleted in the background like the worktrees. Only names local-ci gave are deleted from `trash/`; anything else there is left alone.
+- Add `local-ci cache status` and `local-ci cache prune [--kept] [--legacy]`.
+- Worktrees kept with `--keep` are marked as kept, each with a mark of its own (`wt/.kept-<entry>`), and stay until `local-ci cache prune --kept`. The mark is written when the run ends: a run with `--keep` that is killed before that is treated like any killed run, and its worktrees are removed by the next run.
+- Worktrees left by an earlier version have no owner file, and no run removes them: they may have been kept with `--keep`. A run that finds some says how many, `local-ci cache status` counts them apart, and `local-ci cache prune --legacy` removes those whose pid no process has.
+- `LOCAL_CI_HOME` must be an absolute path; an empty or relative one is refused. `ExecContext::cache_dir` returns a `Result` for that reason.
+- A run fails at its start when another live process with the same pid holds its owner file: the cache directory is then shared between pid namespaces (containers that mount it, a network file system), which is not supported. Give each its own `LOCAL_CI_HOME`.
+- `Observer::executing` is now called before the worktree is created (it was called after the checkout), so a signal during the checkout is handled. An observer that took the call to mean that the worktree exists has to stop doing so.
 
 ## [0.13.0] - Unreleased
 
