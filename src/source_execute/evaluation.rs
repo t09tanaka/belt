@@ -10,7 +10,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::Read;
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const MAX_SOURCE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_WORKFLOWS: usize = 4096;
 
@@ -49,6 +49,14 @@ impl WorkflowScheduling {
     }
 }
 
+/// The immutable source boundary used to recompute scheduling facts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum EvaluationBinding {
+    Captured { manifest_digest: String },
+    Git { execution_commit: String },
+}
+
 /// Portable transport record; deserialization does not verify its provenance.
 /// Hosts must authenticate their separately supplied github/vars/inputs facts.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -57,7 +65,7 @@ pub struct EvaluationSource {
     schema_version: u32,
     plan_digest: String,
     source_id: String,
-    manifest_digest: String,
+    binding: EvaluationBinding,
     workflows: Vec<WorkflowScheduling>,
 }
 impl EvaluationSource {
@@ -74,15 +82,15 @@ impl EvaluationSource {
     pub fn source_id(&self) -> &str {
         &self.source_id
     }
-    pub fn manifest_digest(&self) -> &str {
-        &self.manifest_digest
+    pub fn binding(&self) -> &EvaluationBinding {
+        &self.binding
     }
     pub fn workflows(&self) -> &[WorkflowScheduling] {
         &self.workflows
     }
 }
 
-/// Capability obtained only by reading verified captured workflow objects.
+/// Capability obtained only by reading source-bound workflow objects.
 /// This deliberately has no Deserialize implementation or unchecked constructor.
 #[derive(Debug, Clone)]
 pub struct VerifiedEvaluationSource(EvaluationSource);
@@ -138,36 +146,15 @@ impl PinnedExecution<'_> {
                 "evaluation object digest mismatch"
             );
             remaining -= bytes.len();
-            let parsed = crate::workflow::parse(&frozen.file, std::str::from_utf8(&bytes)?)?;
-            let projected = WorkflowSpec::from_selected(&Selected {
-                wf: parsed.clone(),
-                event: frozen.event.clone(),
-            });
-            ensure!(
-                &projected == frozen,
-                "evaluation workflow differs from frozen projection"
-            );
-            let jobs = parsed
-                .jobs
-                .into_iter()
-                .map(|job| {
-                    Ok(JobScheduling {
-                        job: job.id,
-                        runs_on: job.runs_on.map(serde_json::to_value).transpose()?,
-                    })
-                })
-                .collect::<Result<Vec<_>>>()?;
-            workflows.push(WorkflowScheduling {
-                workflow: frozen.file.clone(),
-                object_hash: entry.hash.clone(),
-                jobs,
-            });
+            workflows.push(scheduling(frozen, &bytes, entry.hash.clone())?);
         }
         let record = EvaluationSource {
             schema_version: VERSION,
             plan_digest: self.plan.digest.clone(),
             source_id: self.manifest.source_id.clone(),
-            manifest_digest: self.manifest.manifest_digest.clone(),
+            binding: EvaluationBinding::Captured {
+                manifest_digest: self.manifest.manifest_digest.clone(),
+            },
             workflows,
         };
         ensure!(
@@ -191,6 +178,36 @@ impl PinnedExecution<'_> {
         Ok(verified)
     }
 }
+
+fn scheduling(frozen: &WorkflowSpec, bytes: &[u8], hash: String) -> Result<WorkflowScheduling> {
+    let parsed = crate::workflow::parse(&frozen.file, std::str::from_utf8(bytes)?)?;
+    let projected = WorkflowSpec::from_selected(&Selected {
+        wf: parsed.clone(),
+        event: frozen.event.clone(),
+    });
+    ensure!(
+        &projected == frozen,
+        "evaluation workflow differs from frozen projection"
+    );
+    let jobs = parsed
+        .jobs
+        .into_iter()
+        .map(|job| {
+            Ok(JobScheduling {
+                job: job.id,
+                runs_on: job.runs_on.map(serde_json::to_value).transpose()?,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(WorkflowScheduling {
+        workflow: frozen.file.clone(),
+        object_hash: hash,
+        jobs,
+    })
+}
+
+mod git;
+pub use git::{git_evaluation_source, verify_git_evaluation_source};
 
 #[cfg(test)]
 mod tests;

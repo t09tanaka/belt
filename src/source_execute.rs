@@ -10,7 +10,8 @@ use crate::{
 use anyhow::{bail, Context, Result};
 mod evaluation;
 pub use evaluation::{
-    EvaluationSource, JobScheduling, VerifiedEvaluationSource, WorkflowScheduling,
+    git_evaluation_source, verify_git_evaluation_source, EvaluationBinding, EvaluationSource,
+    JobScheduling, VerifiedEvaluationSource, WorkflowScheduling,
 };
 mod receipt;
 pub use receipt::{AttemptBinding, PrivateReceiptDirectory};

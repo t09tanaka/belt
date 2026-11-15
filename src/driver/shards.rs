@@ -196,6 +196,8 @@ pub(super) fn view(
 mod survivor_tests {
     use crate::shard::{ShardOutcome, TestResult, TestStatus};
     #[test]
+    // Keep an explicit independent truth table instead of mirroring the producer predicate.
+    #[allow(clippy::match_like_matches_macro)]
     fn failure_projection_independently_combines_exit_and_test_status() {
         for exit_ok in [false, true] {
             for status in [TestStatus::Passed, TestStatus::Failed, TestStatus::Skipped] {

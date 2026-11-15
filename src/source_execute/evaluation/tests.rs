@@ -91,7 +91,12 @@ fn captured_directory_and_git_recompute_scheduling_provenance() {
         let record = verified.record();
         assert_eq!(record.plan_digest(), plan.digest);
         assert_eq!(record.source_id(), manifest.source_id);
-        assert_eq!(record.manifest_digest(), manifest.manifest_digest);
+        assert_eq!(
+            record.binding(),
+            &EvaluationBinding::Captured {
+                manifest_digest: manifest.manifest_digest.clone()
+            }
+        );
         let workflow = &record.workflows()[0];
         assert_eq!(workflow.workflow(), ".github/workflows/ci.yml");
         assert_eq!(workflow.jobs()[0].job(), "seed");
@@ -116,12 +121,14 @@ fn captured_directory_and_git_recompute_scheduling_provenance() {
             "schema_version",
             "plan_digest",
             "source_id",
-            "manifest_digest",
+            "binding",
             "workflows",
         ] {
             let mut forged = serde_json::to_value(record).unwrap();
             forged[key] = if key == "schema_version" {
                 serde_json::json!(999)
+            } else if key == "binding" {
+                serde_json::json!({"kind": "captured", "manifest_digest": "forged"})
             } else if key == "workflows" {
                 serde_json::json!([])
             } else {

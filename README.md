@@ -846,3 +846,32 @@ names, with shared sequence allocation across its setup/task runners. Recovery
 preserves setup tools and install markers while issuing a fresh execution
 namespace. Hosts retain workspace, secret restoration and cleanup ownership via
 `PinnedWorkspaceProvider`.
+
+
+### Verified scheduling source (library, in development)
+
+`source_execute::git_evaluation_source(ctx, repository, frozen_plan)` reads the
+ordinary Git plan's exact full commit and returns `VerifiedEvaluationSource`.
+It preserves the original `runs-on` facts omitted from the frozen workflow
+projection. Each workflow must be a regular blob at the exact literal path,
+match the frozen projection, and pass raw-byte Git OID and SHA-256 checks.
+Working-tree edits and replacement refs cannot retarget these reads.
+
+This reader requires Git with the `--no-lazy-fetch` global option; unsupported
+versions fail explicitly. Missing local objects fail without fetching, applying
+filters or prompting for credentials. It reads at most 4096 workflows and 4MiB
+of their combined contents, with bounded stdout/stderr and cooperative 5-second
+command / 30-second request deadlines. Owned command groups are killed before
+their leaders are reaped on every return path. The Git executable and repository
+object database remain the host's trust boundary: this does not scan or verify
+the whole commit/tree object graph against hostile database replacement.
+
+Captured inputs still use `PinnedExecution::evaluation_source()` and a real
+manifest binding. The unpublished scheduling record is schema 2 with explicit
+`EvaluationBinding::Captured { manifest_digest }` or `Git { execution_commit }`;
+Git inputs never receive a synthetic manifest digest. Decoded records are
+untrusted: `verify_git_evaluation_source` or the captured verifier must recompute
+before accepting them. The verified capability has no deserialization or
+unchecked construction API. This is a scheduling-provenance boundary, not a
+replacement of the ordinary CLI Runner; the shared host adapter remains work
+in progress.
