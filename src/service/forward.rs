@@ -16,11 +16,20 @@ use tokio::sync::{watch, OwnedMutexGuard};
 // This lease outlives an interrupted request and every blocking operation it started.
 // The file lock also excludes a restarted owner's exporter/cleanup while old IO ends.
 pub(super) struct Lease {
-    _local: OwnedMutexGuard<()>,
-    _file: File,
+    _file: LockedTransfer,
     _source: crate::source::retention::Guard,
     measurable: std::sync::atomic::AtomicBool,
     started: u64,
+    // Local ownership is the drain barrier: release it after both file locks.
+    _local: OwnedMutexGuard<()>,
+}
+struct LockedTransfer(File);
+impl Drop for LockedTransfer {
+    fn drop(&mut self) {
+        // A fork/dup can retain the open description after our File is closed.
+        // Only the final Arc<Lease> releases this ownership, before local handoff.
+        let _ = self.0.unlock();
+    }
 }
 // Retain the existing transfer lease even if cancellation drops the upload
 // future while one bounded blocking read is still finishing.
@@ -171,7 +180,7 @@ pub(super) async fn lease(
     }
     Ok(Arc::new(Lease {
         _local: ownership,
-        _file: file,
+        _file: LockedTransfer(file),
         _source: source,
         measurable: std::sync::atomic::AtomicBool::new(true),
         started: crate::platform::monotonic_ms(),
@@ -333,7 +342,7 @@ mod measured_tests {
         let local = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let lease = Arc::new(Lease {
             _local: local,
-            _file: tempfile::tempfile().unwrap(),
+            _file: LockedTransfer(tempfile::tempfile().unwrap()),
             _source: source.mutation_guard().unwrap(),
             measurable: std::sync::atomic::AtomicBool::new(true),
             started: crate::platform::monotonic_ms(),
@@ -380,6 +389,45 @@ mod measured_tests {
 #[cfg(test)]
 mod measured_lease_tests {
     use super::*;
+    #[tokio::test]
+    async fn final_lease_drop_releases_inherited_transfer_description_before_local_handoff() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SourceStore::open(dir.path()).unwrap();
+        let local = Arc::new(tokio::sync::Mutex::new(()));
+        let (_stop, mut stopping) = watch::channel(false);
+        let owner = lease(&store, &mut stopping, local.clone().lock_owned().await)
+            .await
+            .unwrap();
+        let inherited = owner._file.0.try_clone().unwrap();
+        let independent = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store.root().join("transfer.lock"))
+            .unwrap();
+        let retained = owner.clone();
+        drop(owner);
+        assert!(matches!(
+            independent.try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+        assert!(store.retention.guard(true).is_err());
+        assert!(local.try_lock().is_err());
+        drop(retained);
+        let _next = local.lock_owned().await;
+        independent.try_lock().unwrap();
+        let _exclusive = store.retention.guard(true).unwrap();
+        drop(inherited);
+        assert!(matches!(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(store.root().join("transfer.lock"))
+                .unwrap()
+                .try_lock(),
+            Err(TryLockError::WouldBlock)
+        ));
+    }
+
     #[tokio::test]
     async fn phase_origin_excludes_local_and_file_ownership_waits() {
         let dir = tempfile::tempdir().unwrap();
