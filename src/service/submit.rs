@@ -406,11 +406,7 @@ fn freeze_toolchains(
         return Ok(Some(bundle));
     }
     // Loading a configured inventory is read-only and invokes no managers.
-    if let Ok(registry) = crate::toolchain::registry::Registry::load(
-        &context.bootstrap.worker_state_dir,
-        &profile,
-        profile.report().profile_fingerprint,
-    ) {
+    if let Some(registry) = worker_inventory(&context.bootstrap.worker_state_dir, &profile) {
         for requirement in bundle.frozen.requirements.clone() {
             if bundle.evidence.iter().any(|e| e.tool == requirement.tool) {
                 continue;
@@ -422,4 +418,53 @@ fn freeze_toolchains(
         }
     }
     Ok(Some(bundle))
+}
+
+/// The inventory of the local worker, if this host has one. The worker opens
+/// its state through the canonical path and the inventory refuses any other
+/// spelling, so a state directory reached through a symlink is resolved first;
+/// otherwise its evidence would silently be left out of the capture.
+fn worker_inventory(
+    worker_state_dir: &std::path::Path,
+    profile: &crate::toolchain::profile::Profile,
+) -> Option<crate::toolchain::registry::Registry> {
+    let state = std::fs::canonicalize(worker_state_dir).ok()?;
+    crate::toolchain::registry::Registry::load(
+        &state,
+        profile,
+        profile.report().profile_fingerprint,
+    )
+    .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::worker_inventory;
+    use crate::toolchain::{profile::Profile, registry::Registry};
+    use std::os::unix::fs::{symlink, DirBuilderExt};
+
+    #[test]
+    fn the_worker_inventory_is_found_through_a_symlinked_state_directory() {
+        let root = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(root.path()).unwrap();
+        let real = root.join("real");
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(real.join("toolchains"))
+            .unwrap();
+        let link = root.join("link");
+        symlink(&real, &link).unwrap();
+        let env = [("PATH".to_string(), real.display().to_string())].into();
+        let profile = Profile::load(&link, &env).unwrap();
+        // The raw spelling is what the inventory itself refuses.
+        assert_eq!(
+            Registry::load(&link, &profile, profile.report().profile_fingerprint).err(),
+            Some("noncanonical_toolchains_path".to_string())
+        );
+        assert!(worker_inventory(&link, &profile).is_some());
+        assert!(worker_inventory(&real, &profile).is_some());
+        // No local worker state at all is not an inventory.
+        assert!(worker_inventory(&root.join("absent"), &profile).is_none());
+    }
 }
