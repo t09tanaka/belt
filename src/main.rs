@@ -125,6 +125,23 @@ enum Cmd {
         #[arg(long, default_value = "HEAD")]
         sha: String,
     },
+    /// Show what the cache directory holds, or remove what no run needs
+    Cache {
+        #[command(subcommand)]
+        cmd: CacheCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// The disk space each part of the cache takes, and whose the worktrees are
+    Status,
+    /// Remove the worktrees of runs that are gone and empty the trash
+    Prune {
+        /// Also remove the worktrees kept with `run --keep`
+        #[arg(long)]
+        kept: bool,
+    },
 }
 
 /// Prints notices the way `local-ci` always has, and installs the Ctrl-C handler.
@@ -237,6 +254,72 @@ fn status(ctx: &ExecContext, dir: Option<PathBuf>, sha: &str) -> Result<i32> {
     };
     let (state, short) = local_ci::status(ctx, &dir, sha, &ctx.cache_dir())?;
     println!("status: local-ci={state} posted to {short}");
+    Ok(0)
+}
+
+fn size(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut n = bytes as f64;
+    let mut unit = 0;
+    while n >= 1024.0 && unit + 1 < UNITS.len() {
+        n /= 1024.0;
+        unit += 1;
+    }
+    match unit {
+        0 => format!("{bytes} B"),
+        _ => format!("{n:.1} {}", UNITS[unit]),
+    }
+}
+
+fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
+    use local_ci::reclaim::{self, State};
+    let dir = ctx.cache_dir();
+    match cmd {
+        CacheCmd::Status => {
+            println!("cache: {}", dir.display());
+            let mut parts: Vec<_> = std::fs::read_dir(&dir)
+                .into_iter()
+                .flatten()
+                .flatten()
+                .map(|e| e.file_name())
+                .collect();
+            parts.sort();
+            let mut total = 0;
+            for p in parts {
+                let bytes = reclaim::disk_usage(&dir.join(&p));
+                total += bytes;
+                println!("  {:<10} {:>10}", p.to_string_lossy(), size(bytes));
+            }
+            println!("  {:<10} {:>10}", "total", size(total));
+            let entries = reclaim::entries(&dir)?;
+            let count = |s: State| entries.iter().filter(|e| e.state == s).count();
+            println!(
+                "worktrees: {} in use, {} kept (--keep), {} left by runs that are gone, {} not local-ci's",
+                count(State::InUse),
+                count(State::Kept),
+                count(State::Stale),
+                count(State::Unknown)
+            );
+            if count(State::Stale) > 0 {
+                println!("`local-ci cache prune` removes the ones left by runs that are gone (so does the next run)");
+            }
+        }
+        CacheCmd::Prune { kept } => {
+            let before =
+                reclaim::disk_usage(&dir.join("wt")) + reclaim::disk_usage(&dir.join("trash"));
+            let swept = reclaim::prune(ctx, &dir, kept)?;
+            let after =
+                reclaim::disk_usage(&dir.join("wt")) + reclaim::disk_usage(&dir.join("trash"));
+            println!(
+                "removed {} worktree entries, freed {}; {} in use, {} kept (--keep), {} not local-ci's",
+                swept.removed.len(),
+                size(before.saturating_sub(after)),
+                swept.in_use,
+                swept.kept,
+                swept.unknown
+            );
+        }
+    }
     Ok(0)
 }
 
@@ -402,6 +485,7 @@ fn main() {
         }),
         Cmd::Run(a) => run(&ctx, a),
         Cmd::Status { dir, sha } => status(&ctx, dir, &sha),
+        Cmd::Cache { cmd } => cache(&ctx, cmd),
     };
     let code = res.unwrap_or_else(|e| {
         eprintln!("local-ci: {e:#}");
