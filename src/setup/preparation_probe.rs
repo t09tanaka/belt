@@ -4,7 +4,7 @@ use crate::ids::{AttemptId, BuilderId, Digest, RunId, SourceId};
 use crate::setup::observation::PreparationKind;
 use crate::toolchain::contract::FrozenBundle;
 use crate::wire::SetupSpec;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::io::{self, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Component, Path, PathBuf};
@@ -19,8 +19,8 @@ pub(crate) struct PreparationProbeInput<'a> {
     pub frozen: &'a Option<Box<FrozenBundle>>,
     pub in_place: bool,
 }
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ProbeUnknown {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProbeUnknown {
     MissingContext,
     InvalidBinding,
     ActivationUnverified,
@@ -31,37 +31,26 @@ pub(crate) enum ProbeUnknown {
     OwnershipChanged,
     Barrier,
 }
-#[allow(
-    dead_code,
-    reason = "Consumed by the next worker protocol slice; remove when its entrypoint is connected."
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PreparationProbe {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreparationProbe {
     /// No managed preparation; ordinary task steps may still perform setup.
     NoManagedPreparation,
     Unknown(ProbeUnknown),
     Entries {
         owner_generation: BuilderId,
+        #[serde(deserialize_with = "bounded_entries")]
         entries: Vec<PreparationProbeEntry>,
     },
 }
-#[allow(
-    dead_code,
-    reason = "Consumed by the next worker protocol slice; remove when its entrypoint is connected."
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PreparationProbeEntry {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparationProbeEntry {
     pub kind: PreparationKind,
     /// Hash of the actual internal key, exactly as in preparation observations.
     pub key: Option<Digest>,
     pub state: PreparationProbeState,
 }
-#[allow(
-    dead_code,
-    reason = "Consumed by the next worker protocol slice; remove when its entrypoint is connected."
-)]
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PreparationProbeState {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PreparationProbeState {
     /// Concrete identity only, never evidence that work is cold, warm or usable.
     ConcretePlan,
     Active {
@@ -69,6 +58,33 @@ pub(crate) enum PreparationProbeState {
         builder_attempt_id: AttemptId,
     },
     Unknown(ProbeUnknown),
+}
+
+// Untrusted responses cannot allocate an unbounded entry vector.
+fn bounded_entries<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Vec<PreparationProbeEntry>, D::Error> {
+    struct Entries;
+    impl<'de> serde::de::Visitor<'de> for Entries {
+        type Value = Vec<PreparationProbeEntry>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("at most 16 preparation entries")
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(
+            self,
+            mut seq: A,
+        ) -> Result<Self::Value, A::Error> {
+            let mut entries = Vec::new();
+            while let Some(entry) = seq.next_element()? {
+                if entries.len() == 16 {
+                    return Err(serde::de::Error::custom("too many preparation entries"));
+                }
+                entries.push(entry);
+            }
+            Ok(entries)
+        }
+    }
+    d.deserialize_seq(Entries)
 }
 
 /// Lexical limits precede all IO. Component-by-component no-follow metadata is

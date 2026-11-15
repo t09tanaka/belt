@@ -90,6 +90,19 @@ pub async fn serve_connection(
         let agent = agent.clone();
         let negotiated_features = negotiated_features.clone();
         tokio::spawn(async move {
+            if matches!(&request, crate::wire::Request::PreparationProbe(_))
+                && !negotiated_features
+                    .iter()
+                    .any(|v| v == crate::wire::PREPARATION_PROBE_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "preparation probe was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
             if matches!(&request, crate::wire::Request::ForecastCommand(_))
                 && !negotiated_features
                     .iter()

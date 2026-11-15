@@ -4189,3 +4189,94 @@ async fn preparation_observations_are_optional_negotiated_and_never_break_inspec
         }
     }
 }
+
+#[tokio::test]
+async fn preparation_probe_is_negotiated_readonly_and_profile_bound() {
+    use remote_task_runner::setup::preparation_probe::{PreparationProbe, ProbeUnknown};
+    let f = fx();
+    let cfg = f.cfg("boot-probe");
+    let fingerprint = cfg.profile_fingerprint.clone();
+    let agent = f.start_with(cfg);
+    for negotiated in [false, true] {
+        let (a, b) = duplex_pair(64 * 1024);
+        let server = tokio::spawn(serve_connection(
+            agent.clone(),
+            b,
+            f.cluster.clone(),
+            Arc::new(Semaphore::new(4)),
+        ));
+        let mut config = client_cfg(&f.cluster);
+        if !negotiated {
+            config.features.retain(|v| v != PREPARATION_PROBE_FEATURE);
+        }
+        let connection = connect(a, config).await.unwrap();
+        let calls = f.host.calls();
+        let ledger_epoch = f.store().max_coordinator_epoch().unwrap();
+        let launches = f.store().count_launches().unwrap();
+        let epoch = agent.agent_epoch();
+        for (stale, oversized) in [(false, false), (true, false), (false, true)] {
+            let setup = oversized.then(|| SetupSpec {
+                steps: vec![
+                    SetupStep {
+                        id: "private-id".into(),
+                        dir: String::new(),
+                        run: "private command must never run".into(),
+                        shell: None,
+                        env: BTreeMap::new(),
+                        unresolved_env: vec![]
+                    };
+                    65
+                ],
+                toolchain: vec![],
+                scope: ReuseScope::Persistent,
+                freshness_secs: None,
+                secrets: vec![],
+                no_cache: false,
+                step_timeout_ms: None,
+            });
+            let request = Request::PreparationProbe(PreparationProbeRequest {
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+                expected_profile_fingerprint: if stale {
+                    Digest::of_bytes(b"stale")
+                } else {
+                    fingerprint.clone()
+                },
+                manifest_digest: Digest::of_bytes(b"manifest"),
+                source_id: SourceId::generate(),
+                run_id: RunId::generate(),
+                setup,
+                frozen: None,
+                in_place: true,
+            });
+            let answer = call(&connection.client, request).await;
+            if !negotiated {
+                assert_eq!(answer.unwrap_err().code, ErrorCode::ProtocolIncompatible);
+            } else {
+                let Response::PreparationProbe(answer) = answer.unwrap() else {
+                    panic!()
+                };
+                assert_eq!(answer.worker_id, f.cfg("boot-probe").worker_id);
+                assert_eq!(answer.worker_boot_id, f.cfg("boot-probe").boot_id);
+                assert_eq!(answer.agent_epoch, epoch);
+                assert_eq!(
+                    answer.probe,
+                    PreparationProbe::Unknown(if stale {
+                        ProbeUnknown::InvalidBinding
+                    } else if oversized {
+                        ProbeUnknown::BudgetExceeded
+                    } else {
+                        ProbeUnknown::MissingContext
+                    })
+                );
+            }
+            assert!(f.store().list_nonterminal().unwrap().is_empty());
+            assert_eq!(f.store().max_coordinator_epoch().unwrap(), ledger_epoch);
+            assert_eq!(f.store().count_launches().unwrap(), launches);
+            assert_eq!(f.host.calls(), calls);
+        }
+        server.abort();
+        let _ = server.await;
+    }
+    agent.shutdown();
+}

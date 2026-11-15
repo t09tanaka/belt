@@ -627,3 +627,10 @@ missing binary は Unavailable、再測定しても失敗する Docker 等は Un
 ### 準備状態probeへの起動時attestation修正の統合
 
 ROOTの起動時attestation修正3216a745を、準備状態probe branchへd2968294で統合した。最初の測定とUnknownのみの1回再測定を完了してからfingerprintとcompleted snapshotを保存する。読み取り専用probeがsnapshotの時刻を更新しない契約と、公開後のUnknown→Availableを同じidentityで受理しない契約は維持する。統合後のprobe関連10件、profile/snapshot関連8件、strict clippy全target/featureが成功した。wireへのprobe接続・warm activation証明・実測cost接続は残件で、setup時間を推定成功へ変更しない。ROOT3216の通常matrixローカルCIは別途進行中で、このfocused結果を全体CI成功とは扱わない。
+
+
+### 準備状態probeの読み取り専用worker protocol
+
+独立した `preparation_probe_v1` を交渉し、`PreparationProbe` をread-only/control operationとして追加した。実際のmanifest/source/run/setup/frozen/in_placeと選択workerのexpected profile fingerprintを受け、現在のcfg fingerprintが一致した場合だけ既存のbounded worker-local probeへ渡す。setup/frozenはDebugから除外する。応答はworker/boot/agent epochと実際のowner generation・opaque producer key・ConcretePlan・Active builder/attempt・typed Unknownのみで、最大16件をdecode時にも制限する。InspectやProfile.reportを呼ばず、completed snapshotの元の時刻とTTLを維持し、queue/attempt/ledger/native commandへ作用しない。
+
+このsliceはworker/wireだけであり、親のquery送信・観測取り込み・generation fencing、verified activation/warm proof、実際のTTC ledger identityとの対応とcost接続は必須残件として残す。setup秒・foreground forecast・cold/warm・admissionの意味は変更しない。focused wire/probe/protocol/RPCとstrict checkの結果はhandoffへ記録し、全体CI・push・公開の成功とは扱わない。

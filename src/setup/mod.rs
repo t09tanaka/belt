@@ -11,4 +11,4 @@ pub mod observation;
 
 pub mod observation_transport;
 
-pub(crate) mod preparation_probe;
+pub mod preparation_probe;

@@ -1445,11 +1445,7 @@ impl Agent {
 
         Ok(bundle)
     }
-    /// Worker-local read-only preparation identity; no wire or forecast use.
-    #[allow(
-        dead_code,
-        reason = "Consumed by the next worker protocol slice; remove when that slice connects this entrypoint."
-    )]
+    /// Read-only preparation identity; never readiness or forecast evidence.
     pub(crate) fn probe_preparation(
         &self,
         input: crate::setup::preparation_probe::PreparationProbeInput<'_>,
@@ -2055,6 +2051,36 @@ impl Agent {
                     &r,
                 )
                 .map(Response::ForecastCommand)
+            }
+            Request::PreparationProbe(r) => {
+                use crate::setup::preparation_probe::{
+                    PreparationProbe, PreparationProbeInput, ProbeUnknown,
+                };
+                let probe = if r.expected_profile_fingerprint != self.cfg.profile_fingerprint {
+                    PreparationProbe::Unknown(ProbeUnknown::InvalidBinding)
+                } else {
+                    let input = PreparationProbeInput {
+                        manifest_digest: &r.manifest_digest,
+                        source_id: &r.source_id,
+                        run_id: &r.run_id,
+                        setup: &r.setup,
+                        frozen: &r.frozen,
+                        in_place: r.in_place,
+                    };
+                    match crate::setup::preparation_probe::input_budget(&input) {
+                        Ok(()) => self.probe_preparation(input),
+                        Err(reason) => PreparationProbe::Unknown(reason),
+                    }
+                };
+                Ok(Response::PreparationProbe(
+                    crate::wire::PreparationProbeResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        worker_id: self.cfg.worker_id.clone(),
+                        worker_boot_id: self.cfg.boot_id.clone(),
+                        agent_epoch: self.epoch,
+                        probe,
+                    },
+                ))
             }
             Request::ResolveToolchains(r) => {
                 let bundle = self.resolve_toolchains(r.bundle, &r.requirements)?;
