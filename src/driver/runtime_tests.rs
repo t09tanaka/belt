@@ -296,6 +296,10 @@ fn real_needs_matrix_replay_reverse_workers_join_and_consumer() {
     let before = serde_json::to_vec(&f.plan).unwrap();
     let mut d = f.driver(2);
     let journal = seed(&f, &mut d);
+    assert_eq!(
+        journal.iter().map(Transition::revision).collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
     assert_eq!(d.admitted(), 0);
     let mut legs = ready(&d);
     legs.sort_by_key(|a| match a {
@@ -303,6 +307,19 @@ fn real_needs_matrix_replay_reverse_workers_join_and_consumer() {
         _ => usize::MAX,
     });
     assert_eq!(legs.len(), 2);
+    let origin = f
+        .plan
+        .tasks
+        .iter()
+        .find(|task| task.jobs == ["dynamic"])
+        .unwrap();
+    for (index, leg) in legs.iter().enumerate() {
+        let ActionKind::DerivedReady { dispatch, .. } = leg else {
+            panic!("expected derived dispatch")
+        };
+        assert_eq!(dispatch.origin(), origin.id);
+        assert_eq!(dispatch.index(), index);
+    }
     let mut replay = f.driver(2);
     for record in &journal {
         let decoded = Transition::from_json(&serde_json::to_string(record).unwrap()).unwrap();
@@ -1904,7 +1921,18 @@ fn host_abort_typed_identity_cancel_orders_and_replay() {
             } else {
                 CoreDecision::HostFailure
             };
-            assert_eq!(d.core_decision(&task).unwrap().0, expected);
+            let diagnostic = if cancel_first {
+                "run cancelled before dispatch"
+            } else {
+                match reason {
+                    HostFailureReason::WorkspaceCopy => "host workspace preparation failed",
+                    HostFailureReason::Lock => "host lock preparation failed",
+                    HostFailureReason::Setup => "host setup preparation failed",
+                    HostFailureReason::Provenance => "host provenance preparation failed",
+                    HostFailureReason::ExecutorPreparation => "host executor preparation failed",
+                }
+            };
+            assert_eq!(d.core_decision(&task), Some((expected, Some(diagnostic))));
             assert_eq!(d.host_failure_reason(&task), Some(reason));
             assert!(matches!(
                 &d.state.phases[&task],
@@ -1945,7 +1973,18 @@ fn host_abort_typed_identity_cancel_orders_and_replay() {
                 },
             );
             records.push(commit(&mut d, Input::Cancel));
-            assert_eq!(d.core_decision(&task).unwrap().0, expected);
+            let diagnostic = if cancel_first {
+                "run cancelled before dispatch"
+            } else {
+                match reason {
+                    HostFailureReason::WorkspaceCopy => "host workspace preparation failed",
+                    HostFailureReason::Lock => "host lock preparation failed",
+                    HostFailureReason::Setup => "host setup preparation failed",
+                    HostFailureReason::Provenance => "host provenance preparation failed",
+                    HostFailureReason::ExecutorPreparation => "host executor preparation failed",
+                }
+            };
+            assert_eq!(d.core_decision(&task), Some((expected, Some(diagnostic))));
             let mut replay = f.driver(2);
             for record in records {
                 let text = serde_json::to_string(&record).unwrap();
@@ -2869,6 +2908,10 @@ fn frozen_shards_final_real_receipt_joins_or_reports_typed_storage_unavailabilit
                 d.shard_join_availability(group),
                 ShardJoinAvailability::Unavailable(ResultStorageFailure::DriverCapacity)
             ));
+            assert!(matches!(
+                d.shard_join_availability("absent"),
+                ShardJoinAvailability::Pending
+            ));
             assert!(d.shard_join(group).is_none());
             assert!(d.outcome(FILE, "test").is_none());
             assert!(finished(&d));
@@ -3099,9 +3142,9 @@ fn wire_envelope_has_independent_bound_without_raising_state_or_wire_limit() {
     claim(&mut d, &action);
     let (wire, _) = f.execute(&action, "envelope-real-worker");
     let wire_bytes = crate::expr::serialized_size(&wire, MAX_WIRE_BYTES).unwrap();
-    let input = Input::Settle {
+    let mut input = Input::Settle {
         task: ready_task(&action).unwrap().into(),
-        token: "\0".repeat(MAX_TEXT),
+        token: "\0".repeat(16_384),
         result_digest: wire.digest().unwrap(),
         result: Box::new(wire),
     };
@@ -3118,6 +3161,27 @@ fn wire_envelope_has_independent_bound_without_raising_state_or_wire_limit() {
         crate::expr::serialized_size(&input, MAX_TRANSITION_BYTES).unwrap() - wire_bytes
             < MAX_TRANSITION_BYTES - MAX_WIRE_BYTES
     );
+    // Lower-level adversarial envelope contract; Driver still validates task
+    // identity separately. The embedded Wire is a genuine worker receipt.
+    let target = wire_bytes + 266_240;
+    let base = serde_json::to_vec(&input).unwrap().len();
+    assert!(base < target);
+    let extra = target - base;
+    assert!(extra < 266_240);
+    let Input::Settle { task, .. } = &mut input else {
+        unreachable!()
+    };
+    task.extend(std::iter::repeat_n('x', extra));
+    assert_eq!(serde_json::to_vec(&input).unwrap().len(), target);
+    input_bound(&input, wire_bytes).unwrap();
+    let Input::Settle { task, .. } = &mut input else {
+        unreachable!()
+    };
+    task.push('x');
+    assert!(input_bound(&input, wire_bytes)
+        .unwrap_err()
+        .to_string()
+        .contains("input exceeds byte bound"));
 }
 
 #[test]
@@ -3702,8 +3766,48 @@ fn pure_shard_structural_errors_precede_canonical_partition_and_join_views_are_e
                 plan.shard_groups[at].shards[0] = "wrong".into();
             }
         }
-        assert!(shards::validate(&plan).is_err(), "{shape}");
+        let expected = match shape {
+            "duplicate" | "empty" | "grouped" => "duplicate/empty/grouped shard group",
+            "missing" => "missing frozen shard",
+            "nonshard" => "nonshard member",
+            _ => "shard identity/index/count mismatch",
+        };
+        assert!(
+            shards::validate(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains(expected),
+            "{shape}"
+        );
     }
+    for shape in ["jobs", "dynamic", "grouped", "shared", "variant"] {
+        let mut plan = f.plan.clone();
+        let task = plan
+            .tasks
+            .iter_mut()
+            .find(|task| task.shard.is_some())
+            .unwrap();
+        match shape {
+            "jobs" => task.jobs.push("consumer".into()),
+            "dynamic" => task.dynamic_matrix = true,
+            "grouped" => {
+                task.grouped_reason = Some(crate::dag::GroupedReason::OrderAroundSharedOutputs)
+            }
+            "shared" => task.workspace.shared_by_jobs = true,
+            _ => task.variant = f.plan.tasks.iter().find_map(|task| task.variant.clone()),
+        }
+        assert!(
+            shards::validate(&plan)
+                .unwrap_err()
+                .to_string()
+                .contains("split matrix/dynamic/grouped tasks"),
+            "{shape}"
+        );
+    }
+    let mut missing_groups = f.plan.clone();
+    missing_groups.shard_groups.clear();
+    missing_groups.digest = missing_groups.compute_digest().unwrap();
+    assert!(Driver::new(&missing_groups, f.driver(2).config.clone()).is_err());
     let mut d = f.driver(2);
     assert!(matches!(
         d.shard_join_availability("absent"),
@@ -4036,4 +4140,135 @@ fn pure_expansion_state_reserve_refusal_keeps_real_producer_and_replays() {
         JobStatus::Failure
     );
     assert!(limited.infrastructure_failure().is_none());
+}
+
+#[test]
+fn pure_host_abort_preserves_unrelated_ready_and_retires_unacked_cancel() {
+    for cancel in [false, true] {
+        let f = Fixture::new("on: push\njobs:\n  first:\n    runs-on: x\n    steps: []\n  second:\n    runs-on: x\n    steps: []\n");
+        let mut d = f.driver(2);
+        commit(&mut d, Input::Advance);
+        let actions = ready(&d);
+        assert_eq!(actions.len(), 2);
+        claim(&mut d, &actions[0]);
+        let task = ready_task(&actions[0]).unwrap();
+        if cancel {
+            commit(&mut d, Input::Cancel);
+            assert_eq!(cancel_actions(&d).len(), 1);
+        }
+        let mut replay = d.clone();
+        let record = commit(&mut d, abort_input(task, HostFailureReason::Setup));
+        replay.apply(&record).unwrap();
+        assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+        assert!(cancel_actions(&d).is_empty());
+        if !cancel {
+            assert!(ready(&d)
+                .iter()
+                .any(|a| ready_task(a) == ready_task(&actions[1])));
+        }
+    }
+}
+
+#[test]
+fn pure_progress_storage_checks_real_state_with_independent_small_limit() {
+    let f = Fixture::new("on: push\njobs:\n  test:\n    runs-on: x\n    steps: []\n");
+    let mut d = f.driver(1);
+    assert!(d.check_progress_storage(&d.state).is_ok());
+    d.state_byte_limit = 1;
+    let error = d.check_progress_storage(&d.state).unwrap_err();
+    assert!(error.downcast_ref::<DriverStorageError>().is_some());
+}
+
+#[test]
+fn pure_conservative_frozen_dependency_waits_for_genuine_receipt() {
+    let mut f = Fixture::new("on: push\njobs:\n  first:\n    runs-on: x\n    steps: []\n  second:\n    runs-on: x\n    steps: []\n");
+    let first = f
+        .plan
+        .tasks
+        .iter()
+        .find(|t| t.jobs == ["first"])
+        .unwrap()
+        .id
+        .clone();
+    f.plan
+        .tasks
+        .iter_mut()
+        .find(|t| t.jobs == ["second"])
+        .unwrap()
+        .depends_on
+        .push(first.clone());
+    f.plan.digest = f.plan.compute_digest().unwrap();
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    let actions = ready(&d);
+    assert_eq!(actions.len(), 1);
+    assert_eq!(ready_task(&actions[0]), Some(first.as_str()));
+    claim(&mut d, &actions[0]);
+    let (wire, _) = f.execute(&actions[0], "conservative-dependency");
+    let mut replay = d.clone();
+    let record = settle(&mut d, &actions[0], wire);
+    replay.apply(&record).unwrap();
+    assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+    let next = ready(&d);
+    assert_eq!(next.len(), 1);
+    assert_eq!(
+        f.plan.task(ready_task(&next[0]).unwrap()).unwrap().jobs,
+        ["second"]
+    );
+}
+
+#[test]
+fn pure_shard_failfast_false_and_passing_true_keep_sibling_ready() {
+    for (fail_fast, fails) in [(false, true), (true, false)] {
+        let tests = if fails {
+            SHARD_TESTS.replace(
+                "fn alpha() {}",
+                "fn alpha() { panic!(\"genuine failure\") }",
+            )
+        } else {
+            SHARD_TESTS.into()
+        };
+        let f = shard_fixture(fail_fast, "'true'", &tests);
+        let mut d = f.driver(2);
+        commit(&mut d, Input::Advance);
+        let actions = shard_actions(&d);
+        claim(&mut d, &actions[0]);
+        mark(&mut d, &actions[0]);
+        let (wire, _) = f.execute(&actions[0], "survivor-shard-failfast");
+        assert_eq!(
+            wire.outcomes[0].status,
+            if fails {
+                JobStatus::Failure
+            } else {
+                JobStatus::Success
+            }
+        );
+        settle(&mut d, &actions[0], wire);
+        assert!(cancel_actions(&d).is_empty());
+        assert!(ready(&d)
+            .iter()
+            .any(|action| ready_task(action) == ready_task(&actions[1])));
+        assert!(d.core_decision(ready_task(&actions[1]).unwrap()).is_none());
+    }
+}
+
+#[test]
+fn pure_small_plan_progress_finishes_within_watchdog() {
+    let f = Fixture::new("on: push\njobs:\n  test:\n    runs-on: x\n    steps: []\n");
+    let d = f.driver(1);
+    drop(f);
+    // Only pure owned core data enters this thread: no worker process, fixture,
+    // or durable receipt can be left behind if a mutated loop stops progressing.
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    let thread = std::thread::Builder::new()
+        .name("driver::runtime_tests::pure_small_plan_progress_finishes_within_watchdog".into())
+        .spawn(move || {
+            let _ = send.send(d.propose(Input::Advance));
+        })
+        .unwrap();
+    receive
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("small pure driver proposal must terminate")
+        .unwrap();
+    thread.join().unwrap();
 }

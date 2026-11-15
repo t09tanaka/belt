@@ -582,6 +582,99 @@ mod tests {
     }
 
     #[test]
+    fn survivor_names_nested_portable_facts_and_explicit_false_status() {
+        let j = job("    steps: []\n");
+        assert_eq!(evaluate(&j, &Map::new(), None).entries[0].display, "test");
+        let j = job("    strategy:\n      matrix:\n        n: [0, 1]\n    steps: []\n");
+        assert_eq!(
+            evaluate(&j, &Map::new(), None)
+                .entries
+                .iter()
+                .map(|e| e.display.as_str())
+                .collect::<Vec<_>>(),
+            vec!["test (0)", "test (1)"]
+        );
+        let j = job("    needs: seed\n    if: failure() && false\n    steps: []\n");
+        let needs = json!({"seed": {"result": "failure", "outputs": {}}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(
+            matches!(&evaluate(&j, &needs, None).entries[0].decision, Decision::Skip(reason) if reason == "if: false")
+        );
+        let j = job("    name: '${{ fromJSON(\"invalid\") }}'\n    steps: []\n");
+        let evaluated = evaluate_atomic(&j, json!({}), &Map::new(), false, false).unwrap();
+        assert_eq!(evaluated.entries[0].display, j.name.as_deref().unwrap());
+        assert!(matches!(evaluated.entries[0].decision, Decision::Run(_)));
+        let j =
+            job("    strategy:\n      matrix:\n        n: ['${{ runner.temp }}']\n    steps: []\n");
+        let contexts = json!({"github": {}, "vars": {}, "inputs": {}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let evaluated = evaluate_portable(&j, &contexts, &Map::new(), false, false, 4);
+        assert!(matches!(&evaluated.entries[0].decision, Decision::Error(_)));
+    }
+
+    #[test]
+    fn survivor_aggregate_exact_boundary_and_cumulative_display_charges() {
+        assert_eq!(PORTABLE_EVALUATION_BYTES, 8_388_608);
+        let contexts = json!({"github": {}, "vars": {}, "inputs": {}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let mut j = job("    needs: seed\n    steps: []\n");
+        j.name = Some(format!("${{{{ {}'x' }}}}", " ".repeat(400_000)));
+        let mut needs = json!({"seed": {"result": "success", "outputs": {"padding": ""}}})
+            .as_object()
+            .unwrap()
+            .clone();
+        let initial = evaluate_portable(&j, &contexts, &needs, false, false, 1);
+        let Decision::Run(mut cm) = initial.entries.into_iter().next().unwrap().decision else {
+            panic!("baseline runs")
+        };
+        cm.insert("strategy".into(), json!({}));
+        let base = serde_json::to_vec(&(&cm, &Map::<String, Value>::new(), &j.name))
+            .unwrap()
+            .len();
+        assert!(base < 8_388_608);
+        let padding = 8_388_608 - base;
+        assert!(padding < 8_388_608);
+        needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding));
+        let exact = evaluate_portable(&j, &contexts, &needs, false, false, 1);
+        assert!(
+            matches!(exact.entries[0].decision, Decision::Run(_)),
+            "{exact:?}"
+        );
+        needs.get_mut("seed").unwrap()["outputs"]["padding"]
+            .as_str()
+            .unwrap();
+        needs.get_mut("seed").unwrap()["outputs"]["padding"] = json!("p".repeat(padding + 1));
+        assert!(evaluate_portable(&j, &contexts, &needs, false, false, 1).budget_exceeded);
+
+        let mut j = job("    needs: seed\n    name: '${{ vars.display }}'\n    strategy:\n      matrix:\n        n: [0, 1, 2, 3, 4]\n    steps: []\n");
+        let contexts =
+            json!({"github": {}, "vars": {"display": "d".repeat(600 * 1024)}, "inputs": {}})
+                .as_object()
+                .unwrap()
+                .clone();
+        let needs =
+            json!({"seed": {"result": "success", "outputs": {"padding": "p".repeat(500 * 1024)}}})
+                .as_object()
+                .unwrap()
+                .clone();
+        assert!(evaluate_portable(&j, &contexts, &needs, false, false, 5).budget_exceeded);
+        j.matrix = Some(serde_yaml::from_str("n: [0, 1, 2, 3]").unwrap());
+        let four = evaluate_portable(&j, &contexts, &needs, false, false, 5);
+        assert_eq!(four.entries.len(), 4);
+        assert!(!four.budget_exceeded);
+        assert!(four
+            .entries
+            .iter()
+            .all(|entry| matches!(entry.decision, Decision::Run(_))));
+    }
+
+    #[test]
     fn portable_and_atomic_name_and_context_budgets_refuse_amplification() {
         // Assert the protocol before allocating fixed, bounded fixtures. Never
         // derive allocation lengths (including subtraction) from mutable limits.

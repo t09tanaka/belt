@@ -191,3 +191,32 @@ pub(super) fn view(
             .collect(),
     }
 }
+
+#[cfg(test)]
+mod survivor_tests {
+    use crate::shard::{ShardOutcome, TestResult, TestStatus};
+    #[test]
+    fn failure_projection_independently_combines_exit_and_test_status() {
+        for exit_ok in [false, true] {
+            for status in [TestStatus::Passed, TestStatus::Failed, TestStatus::Skipped] {
+                let receipt = ShardOutcome {
+                    job_id: "job".into(),
+                    shard_id: "shard".into(),
+                    parsed: true,
+                    exit_ok,
+                    tests: vec![TestResult {
+                        identity: "case".into(),
+                        status,
+                    }],
+                };
+                assert_eq!(
+                    super::failed(&receipt),
+                    match (exit_ok, status) {
+                        (true, TestStatus::Passed | TestStatus::Skipped) => false,
+                        _ => true,
+                    }
+                );
+            }
+        }
+    }
+}

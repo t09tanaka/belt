@@ -438,3 +438,15 @@ pub(crate) fn validate(
     ensure!(expected == dispatch, "derived dispatch proof mismatch");
     Ok(expansion.selections[dispatch.index].clone())
 }
+
+#[cfg(test)]
+mod survivor_tests {
+    #[test]
+    fn expansion_budget_accepts_boundary_and_rejects_next_byte() {
+        super::ensure_expansion_budget(4096, 4096).unwrap();
+        assert!(super::ensure_expansion_budget(4097, 4096)
+            .unwrap_err()
+            .to_string()
+            .contains("expansion evaluated byte budget exceeded"));
+    }
+}
