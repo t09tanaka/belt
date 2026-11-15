@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-16
+
 - Jobs that run at once divide the CPU between them instead of each using every core. Each job gets a share of the budget (task-traffic-controller's budget, or the logical cores without it), by default 4 threads or more with task-traffic-controller. Its steps get the share as `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS` and `RUST_TEST_THREADS` (each only when it is not set already) and ask task-traffic-controller for it as their weight (`exec --weight <share>`). `--parallel <n>` divides the budget between `n` jobs. A run whose jobs run one at a time is unchanged. The entries of a matrix that run together divide the budget even under `--parallel 1`; those of an exclusive job that holds the repository lock do not count as together. An empty `CARGO_BUILD_JOBS` (or the other two) counts as not set. When task-traffic-controller's budget cannot be read (`inspect` fails or has no budget), no share is given and a warning says so. The summary says how the CPU was divided, and `result.json` has it as `cpu`. See "The CPU share of a job" in the README.
 - Document running `local-ci` under task-traffic-controller: it needs 0.9 or later (a nested `exec` is gated there), and the outer command should have a small weight (`task-traffic-controller exec --weight 1 -- local-ci run`).
 - `Runner::job_threads` (library) sets the share; `RunResult` has a `cpu` field, and `WireRunResult` carries it (left out when none). `execute_plan` does not work out a share.
