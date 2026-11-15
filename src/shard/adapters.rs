@@ -424,17 +424,26 @@ pub fn run_invocation(ctx: &ExecContext, inv: &Invocation, cwd: &Path) -> Result
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
         stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         success: out.status.success(),
+        exit: out.status.code(),
     })
 }
 
-fn failed_listing(out: &CommandOutput) -> String {
-    let why = out
+fn failed_listing(inv: &Invocation, out: &CommandOutput) -> String {
+    let tail: Vec<&str> = out
         .stderr
         .lines()
-        .rev()
-        .find(|l| !l.trim().is_empty())
-        .unwrap_or("no output");
-    format!("the listing failed: {why}")
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let tail = tail[tail.len().saturating_sub(5)..].join("\n");
+    let tail = if tail.is_empty() { "no output" } else { &tail };
+    let status = match out.exit {
+        Some(code) => format!("exit status {code}"),
+        None => "no exit status (killed by a signal?)".to_string(),
+    };
+    format!(
+        "the listing failed: `{}` ended with {status}; stderr tail:\n{tail}",
+        inv.argv.join(" ")
+    )
 }
 
 fn argv(parts: &[&str]) -> Vec<String> {
@@ -553,7 +562,7 @@ impl RunnerAdapter for CargoTest {
 
     fn discover(&self, out: &CommandOutput) -> Result<Discovered, String> {
         if !out.success {
-            return Err(failed_listing(out));
+            return Err(failed_listing(&self.discover_command(), out));
         }
         let (stdout, stderr) = (without_ansi(&out.stdout), without_ansi(&out.stderr));
         let mut tests = Vec::new();
@@ -766,9 +775,9 @@ fn probed(command: Vec<String>) -> Invocation {
 }
 
 /// The files a listing prints, one per line, by the name they are listed by.
-fn listed_files(root: &str, out: &CommandOutput) -> Result<Discovered, String> {
+fn listed_files(cmd: &Invocation, root: &str, out: &CommandOutput) -> Result<Discovered, String> {
     if !out.success {
-        return Err(failed_listing(out));
+        return Err(failed_listing(cmd, out));
     }
     let lines: Vec<&str> = out
         .stdout
@@ -852,7 +861,7 @@ impl RunnerAdapter for Vitest {
     }
 
     fn discover(&self, out: &CommandOutput) -> Result<Discovered, String> {
-        listed_files(&self.root, out)
+        listed_files(&self.discover_command(), &self.root, out)
     }
 
     fn invoke(&self, shard: &Shard, count: usize, mode: SplitMode) -> Invocation {
@@ -926,7 +935,7 @@ impl RunnerAdapter for Jest {
     }
 
     fn discover(&self, out: &CommandOutput) -> Result<Discovered, String> {
-        listed_files(&self.root, out)
+        listed_files(&self.discover_command(), &self.root, out)
     }
 
     fn invoke(&self, shard: &Shard, count: usize, mode: SplitMode) -> Invocation {
@@ -1305,7 +1314,7 @@ impl RunnerAdapter for Playwright {
 
     fn discover(&self, out: &CommandOutput) -> Result<Discovered, String> {
         if !out.success {
-            return Err(failed_listing(out));
+            return Err(failed_listing(&self.discover_command(), out));
         }
         let report = json_with(&out.stdout, "suites")
             .ok_or_else(|| "the listing holds no JSON report".to_string())?;
@@ -1505,7 +1514,7 @@ impl RunnerAdapter for Cypress {
 
     fn discover(&self, out: &CommandOutput) -> Result<Discovered, String> {
         if !out.success {
-            return Err(failed_listing(out));
+            return Err(failed_listing(&self.discover_command(), out));
         }
         let mut tests: Vec<String> = out
             .stdout
@@ -1568,6 +1577,7 @@ mod tests {
             stdout: stdout.into(),
             stderr: "warn\nboom\n".into(),
             success,
+            exit: None,
         }
     }
 
@@ -1609,6 +1619,7 @@ mod tests {
             stdout: listing.into(),
             stderr: "   Running unittests src/lib.rs (target/debug/deps/a-1)\n".into(),
             success: true,
+            exit: None,
         };
         let d = c.discover(&one).unwrap();
         assert_eq!(d.tests, ["a::one", "b::two"]);
@@ -1621,11 +1632,18 @@ mod tests {
             .discover(&out("src/lib.rs - add (line 1): test\n", true))
             .unwrap();
         assert!(!d.complete);
-        assert!(c.discover(&out("", false)).unwrap_err().contains("boom"));
+        let err = c.discover(&out("", false)).unwrap_err();
+        assert!(err.contains("boom") && err.contains("warn"), "{err}");
+        assert!(err.contains(&c.discover_command().argv.join(" ")), "{err}");
+        let mut coded = out("", false);
+        coded.exit = Some(7);
+        let err = c.discover(&coded).unwrap_err();
+        assert!(err.contains("exit status 7"), "{err}");
         let silent = CommandOutput {
             stdout: String::new(),
             stderr: String::new(),
             success: false,
+            exit: None,
         };
         assert!(c.discover(&silent).unwrap_err().contains("no output"));
 
@@ -2028,6 +2046,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
                 stdout: stdout.into(),
                 stderr: stderr.into(),
                 success: true,
+                exit: None,
             })
             .unwrap()
         };
@@ -2071,6 +2090,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
                 stdout: stdout.into(),
                 stderr: stderr.into(),
                 success: true,
+                exit: None,
             })
             .unwrap()
         };
@@ -2271,7 +2291,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         assert!(a
             .discover(&out("", false))
             .unwrap_err()
-            .contains("the listing failed: boom"));
+            .contains("the listing failed: `"));
         assert!(a
             .discover(&out("no json", true))
             .unwrap_err()
@@ -2576,7 +2596,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         assert!(a
             .discover(&out("", false))
             .unwrap_err()
-            .contains("the listing failed: boom"));
+            .contains("the listing failed: `"));
         assert!(a
             .discover(&out("\n", true))
             .unwrap_err()

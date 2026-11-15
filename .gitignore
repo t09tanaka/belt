@@ -25,3 +25,6 @@ schemata.out/
 
 # Worktrees for development
 .worktrees
+
+# npm install lock written by the shard adapter tests
+.npm-ci.lock
