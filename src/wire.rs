@@ -180,6 +180,9 @@ pub struct JobSpec {
     pub services: Vec<ServiceSpec>,
     pub container: bool,
     pub reusable: Option<String>,
+    /// `runs-on`: a label, a list, a mapping, or an expression string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_on: Option<MatrixValue>,
     /// `strategy.matrix`: a mapping, or an expression string.
     pub matrix: Option<MatrixValue>,
     pub fail_fast: bool,
@@ -283,6 +286,7 @@ impl JobSpec {
             services: j.services.iter().map(ServiceSpec::from_service).collect(),
             container: j.container,
             reusable: j.reusable.clone(),
+            runs_on: j.runs_on.as_ref().map(MatrixValue::from_yaml),
             matrix: j.matrix.as_ref().map(MatrixValue::from_yaml),
             fail_fast: j.fail_fast,
             max_parallel: j.max_parallel,
@@ -304,6 +308,7 @@ impl JobSpec {
             services: self.services.iter().map(ServiceSpec::to_service).collect(),
             container: self.container,
             reusable: self.reusable.clone(),
+            runs_on: self.runs_on.as_ref().map(MatrixValue::to_yaml),
             matrix: self.matrix.as_ref().map(MatrixValue::to_yaml),
             fail_fast: self.fail_fast,
             max_parallel: self.max_parallel,

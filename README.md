@@ -40,8 +40,10 @@ status: not posted (--no-status)
 ```
 
 It is not a GitHub Actions runner. Jobs run directly on your machine (not in
-Ubuntu containers), with the tools you have installed. What cannot be
-reproduced locally is skipped and listed under `not covered` instead of being
+Ubuntu containers), with the tools you have installed, so `runs-on: ubuntu-latest`
+runs on a Mac as it is: a green job is a pass on the OS of your machine, not
+on Linux (see [Jobs for another OS](#jobs-for-another-os-runs-on)). What cannot
+be reproduced locally is skipped and listed under `not covered` instead of being
 reported as a pass.
 
 ## Install
@@ -76,7 +78,7 @@ Common options (`plan` and `run`):
 | `-C <dir>` | Repository directory. |
 
 `run` also takes `--parallel <n>`, `--containers <n>`, `--no-traffic-controller`, `--no-portool`, `--no-status`, `--keep`
-(keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>` and `--json`.
+(keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>`, `--all-os-legs` (below) and `--json`.
 
 `--parallel <n>` is the number of units that run at once. Without it, every
 unit (up to 16) starts when task-traffic-controller is installed, as each
@@ -395,6 +397,43 @@ Only `local-ci run` uses it; `execute_plan` and the pinned executor do not (set
   `setup-dart` and `rust-toolchain` check that the tool is installed and warn
   when its version differs. Other actions are skipped and listed under
   `not covered`.
+
+### Jobs for another OS (`runs-on`)
+
+Every job runs on the host, whatever its `runs-on` says. local-ci maps each
+label to an OS family: `ubuntu-*` and `linux` are Linux, `macos-*` is macOS,
+`windows-*` is Windows. A self-hosted runner, or a label it does not know, is
+run as before.
+
+- **A matrix over the OS.** The legs of one matrix job that differ only in the
+  value of an OS label (`os: [ubuntu-latest, macos-latest]` with
+  `runs-on: ${{ matrix.os }}`) run the same steps on the same machine. When
+  one of them is of the host's OS family, only that leg runs. The others are
+  not run and are listed under `not covered`: `runs-on ubuntu-latest: Linux is
+  not reproduced on this macOS host; the same steps ran as test (macos-latest)`.
+  They count neither as a pass nor as a failure, so the run is `incomplete`
+  (exit code 3, commit status `error`) when everything that ran passed: a
+  repository with an OS matrix cannot be a full pass on one machine, and the
+  run says so. Legs are twins only when their
+  other matrix values are equal and nothing in the job (steps, `env`, `if:`,
+  `outputs`, services; names are left out) reads the differing value, as
+  `${{ matrix.os }}` or `matrix.os == '...'` do: a job that reads it has other
+  steps on each OS and every leg runs.
+- **A leg with no twin** (a lone `runs-on: ubuntu-latest` job, a matrix whose
+  legs have other values) still runs on the host. Its line says so, `PASS
+  ci.yml › build  [ran on macOS, not Linux (runs-on ubuntu-latest)]`, and
+  `result.json` has the same text as the optional `os_note` of the job. This is
+  a pass on the host's OS only.
+- **`needs` and outputs.** A matrix job is one job for `needs`, as on GitHub:
+  its `needs.<id>.result` is `success` when the legs that ran passed (a leg that
+  was left out counts as skipped, not as a failure), and its `outputs` are those
+  of the legs that ran. As the left-out legs run the same steps and produce the
+  same outputs, a job that needs the matrix sees what the leg of the host's OS
+  made. The left-out leg is still listed under `not covered`.
+- **Run every leg.** `--all-os-legs`, or `LOCAL_CI_ALL_OS_LEGS=1`, runs all the
+  legs on the host as before (each with the note above). The legs that are not
+  run are not counted when the CPU is divided between jobs that run at once. A result of a run
+  without it is not reused by a run with it.
 
 ### Artifacts (`upload-artifact@v4`, `download-artifact@v4`)
 

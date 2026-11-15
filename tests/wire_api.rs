@@ -235,6 +235,7 @@ fn run_result(dir: &str) -> RunResult {
                 cancelled: false,
                 time: None,
                 build_cache: None,
+                os_note: None,
             }],
             waited_secs: 0.0,
             copy_secs: None,
@@ -294,6 +295,28 @@ fn the_cpu_share_of_a_run_crosses_and_is_left_out_without_one() {
         .into_run_result("/mine/r9".into())
         .unwrap();
     assert_eq!(back.cpu, r.cpu);
+}
+
+#[test]
+fn the_os_note_of_a_job_crosses_and_is_left_out_without_one() {
+    let mut r = run_result("/runs/r1");
+    let text = serde_json::to_string(&WireRunResult::from_run_result(&r).unwrap()).unwrap();
+    assert!(!text.contains("os_note"), "{text}");
+    let note = "ran on macOS, not Linux (runs-on ubuntu-latest)";
+    r.units[0].jobs[0].os_note = Some(note.into());
+    let text = serde_json::to_string(&WireRunResult::from_run_result(&r).unwrap()).unwrap();
+    assert!(text.contains(&format!("\"os_note\":\"{note}\"")), "{text}");
+    let back = WireRunResult::from_json(&text)
+        .unwrap()
+        .into_run_result("/mine/r9".into())
+        .unwrap();
+    assert_eq!(back.units[0].jobs[0].os_note.as_deref(), Some(note));
+    // the local JSON has it too
+    let local = serde_json::to_string(&r).unwrap();
+    assert!(
+        local.contains(&format!("\"os_note\":\"{note}\"")),
+        "{local}"
+    );
 }
 
 #[test]

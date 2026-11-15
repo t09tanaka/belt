@@ -39,6 +39,10 @@ pub struct Job {
     pub services: Vec<Service>,
     pub container: bool,
     pub reusable: Option<String>,
+    /// `runs-on`, as YAML (a label, a list of labels, a `group`/`labels` mapping,
+    /// or an expression string such as `${{ matrix.os }}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_on: Option<Y>,
     /// `strategy.matrix`, as YAML (a mapping, or an expression string).
     pub matrix: Option<Y>,
     pub fail_fast: bool,
@@ -252,6 +256,7 @@ fn parse_job(id: &str, j: &Y) -> Job {
         services,
         container: get(j, "container").is_some(),
         reusable: str_of(j, "uses"),
+        runs_on: get(j, "runs-on").cloned(),
         matrix: get(j, "strategy").and_then(|s| get(s, "matrix")).cloned(),
         fail_fast: !matches!(
             get(j, "strategy").and_then(|s| get(s, "fail-fast")),

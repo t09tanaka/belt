@@ -109,6 +109,7 @@ fn ws(f: &Fixture, name: &str) -> Workspace {
 }
 fn opts(f: &Fixture, recorder: Arc<Recorder>) -> Opts {
     Opts {
+        all_os_legs: false,
         parallel: 2,
         traffic_controller: None,
         executor: Some(recorder),

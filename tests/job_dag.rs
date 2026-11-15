@@ -368,6 +368,7 @@ impl Lab {
         };
         std::fs::create_dir_all(&ws.run_dir).unwrap();
         let opts = local_ci::exec::Opts {
+            all_os_legs: false,
             parallel: 1,
             traffic_controller: None,
             executor: None,
@@ -993,6 +994,7 @@ impl Lab {
         std::fs::create_dir_all(&ws.run_dir).unwrap();
         std::fs::create_dir_all(cache.join("locks")).unwrap();
         let opts = local_ci::exec::Opts {
+            all_os_legs: false,
             parallel: 2,
             traffic_controller: None,
             executor: None,

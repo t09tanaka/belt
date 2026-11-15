@@ -160,6 +160,7 @@ fn lab(example_dir: &str, command: &str, env: &str) -> Lab {
 impl Lab {
     fn opts(&self) -> Opts {
         Opts {
+            all_os_legs: false,
             parallel: 1,
             traffic_controller: None,
             executor: None,

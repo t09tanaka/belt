@@ -119,7 +119,7 @@ impl Settings {
     }
 }
 
-fn truthy(v: &str) -> bool {
+pub(crate) fn truthy(v: &str) -> bool {
     !matches!(v.trim(), "" | "0" | "false" | "no" | "off")
 }
 

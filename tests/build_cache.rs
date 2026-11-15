@@ -122,6 +122,7 @@ impl Fixture {
         let rep = local_ci::run(
             ctx,
             RunOptions {
+                all_os_legs: false,
                 target: Target {
                     base: Some("main".into()),
                     sha: "HEAD".into(),

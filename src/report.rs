@@ -198,7 +198,7 @@ pub fn not_covered(units: &[UnitResult], dir: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for j in units.iter().flat_map(|u| &u.jobs) {
         if let Outcome::Skip(r) = &j.outcome {
-            if r.contains("not supported") {
+            if r.contains("not supported") || crate::os_legs::is_not_run_reason(r) {
                 out.push(format!("{} › {}: {r}", short(dir, &j.workflow), j.display));
             }
         }
@@ -395,6 +395,15 @@ pub fn group_skipped(skipped: &[Skipped], dir: &str) -> String {
         .join("; ")
 }
 
+/// `  [ran on macOS, not Linux (runs-on ubuntu-latest)]` for a job that ran on
+/// another OS than its `runs-on` names.
+fn os_tag(j: &JobResult) -> String {
+    j.os_note
+        .as_ref()
+        .map(|n| format!("  [{n}]"))
+        .unwrap_or_default()
+}
+
 /// `cpu    budget 12 · 3 jobs at once · 4 threads each`
 fn cpu_line(c: &crate::cpu::Share) -> String {
     format!(
@@ -461,8 +470,13 @@ pub fn print(r: &RunResult, tail_lines: usize, style: &Style) {
         let name = format!("{} › {}", short(dir, &j.workflow), j.display);
         match &j.outcome {
             Outcome::Pass => match &u.cached {
-                Some(from) => println!("PASS   {name}  cached ({from})"),
-                None => println!("PASS   {name}  {}{}", dur(j.secs), waits(j.time.as_ref())),
+                Some(from) => println!("PASS   {name}  cached ({from}){}", os_tag(j)),
+                None => println!(
+                    "PASS   {name}  {}{}{}",
+                    dur(j.secs),
+                    waits(j.time.as_ref()),
+                    os_tag(j)
+                ),
             },
             Outcome::Fail => {
                 let s = failed_step(j);
@@ -470,12 +484,17 @@ pub fn print(r: &RunResult, tail_lines: usize, style: &Style) {
                     .map(|s| format!(" › {} (exit {})", s.label, s.exit.unwrap_or(-1)))
                     .unwrap_or_default();
                 println!(
-                    "FAIL   {name}{what}  {}{}",
+                    "FAIL   {name}{what}  {}{}{}",
                     dur(j.secs),
-                    waits(j.time.as_ref())
+                    waits(j.time.as_ref()),
+                    os_tag(j)
                 );
             }
-            Outcome::Error(e) => println!("ERROR  {name}  {}", e.lines().next().unwrap_or("")),
+            Outcome::Error(e) => println!(
+                "ERROR  {name}  {}{}",
+                e.lines().next().unwrap_or(""),
+                os_tag(j)
+            ),
             Outcome::Skip(reason) => skipped_jobs.push(format!("{} ({reason})", j.display)),
         }
     }
@@ -587,6 +606,7 @@ mod tests {
             cancelled: false,
             time: None,
             build_cache: None,
+            os_note: None,
         }
     }
 

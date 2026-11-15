@@ -394,6 +394,7 @@ mod tests {
             job_timeout_min: 1.,
             keep: false,
             trash: area.path().join("trash"),
+            all_os_legs: false,
         };
         let provider = RefusePinnedForks;
         let mut runner = Runner::new_pinned(&ctx, &input, &workspace, opts, &provider).unwrap();
