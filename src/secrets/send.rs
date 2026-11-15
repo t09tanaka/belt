@@ -67,7 +67,10 @@ pub async fn send_bundle(
         };
         let sent = r.files.len() as u32;
         // the request is moved, not cloned: one more copy of the contents is one more place to leak from
-        let Response::SecretBundlePut(resp) = client.call(request, timeout).await? else {
+        let Response::SecretBundlePut(resp) = client
+            .call_retained(request, timeout, bundle.retained())
+            .await?
+        else {
             return Err(SendError::Refused("another operation was answered"));
         };
         if !resp.verified {

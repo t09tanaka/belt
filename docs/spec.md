@@ -1349,3 +1349,33 @@ all Vault state are excluded. No automatic source/Vault deletion is enabled; par
 clock/owner/cancellation-safe scheduling remain C plus dedicated deletion review. Vault-only secret erasure must
 never create a source-run expiry. Unsupported SQLite identity checks fail closed without opening/closing a live DB
 validation descriptor, preserving unrelated POSIX SQLite writer locks.
+
+
+#### Explicit parent Vault retention (C; automatic scheduling remains disabled)
+
+`SourceStore::vault_retention_page` synchronously holds source EX then Vault EX through proof, durable claim,
+unlink, directory fsync and completion. It selects at most 32 indexed runs or pending claims and shares a 64MiB
+manifest/secret validation budget. Exact configured owner, immutable private run record, sealed source digest,
+all-generation known terminal state, closed mandatory collection and no queued generation precede a permanent
+`vault_delete_claim`. This row also fences later parent has/load/adopt/capture, returning SecretUnavailable without
+recapture. Vault's separate persisted zero-delay clock has initial/anomaly Holds; every Hold blocks claims and
+physical replay. Source retention and source run-expiry are independent. Unknown/incomplete legacy registration
+blocks new claims. Pending exact claims survive later source-manifest removal; completed claims never replay.
+
+A private Vault-side registration pins the canonical source root and SQLite inode. Every generic Vault constructor
+and direct API honors it; missing/replaced/unreadable registrations or indexes fail closed, using SQLite's live
+HAS_MOVED check without an independent validation database FD. Workers without this registration retain ephemeral
+erase/reupload semantics. Direct APIs and cloneable HeldBundle retain cross-process Vault SH. Encoded secret frames
+carry an opaque lease through queued Outgoing and write/flush/cut, even after caller timeout/cancellation. Writer
+failure or abort drops queued frames; writer-owned buffers die before the in-flight lease. Last-lease drop explicitly
+unlocks. Initial direct adoption uses atomic no-replace publication, preserving the first durable bundle.
+
+Only exact private owned regular nlink=1 mode0600 run.json targets are deletable. Claims pin Vault root identity,
+leaf inode/metadata and content digest; held NOFOLLOW descriptors and current anchors are rechecked before FD-relative
+unlink. Durable claimed absence still requires parent fsync before completion. Changed/recreated/unsafe targets are
+retained. Original workspaces, keys, Git references/caches, source secret copies and unknown entries remain excluded.
+No resident automatic deletion is enabled; dedicated B+C+transport deletion review and D scheduling/drain remain required.
+
+Secret-free manifests never receive a Vault tombstone: their empty load stays available for source-only retry.
+An unexpected Vault file for such a run is retained as Unknown. Missing bundles for manifests that require secrets
+can receive a permanent exact parent tombstone, preventing later re-adoption or recapture.

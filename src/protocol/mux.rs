@@ -143,6 +143,9 @@ impl Outbox {
         }
         {
             let mut sched = self.sched.lock().expect("scheduler lock");
+            if self.dead.load(Ordering::SeqCst) || self.shutdown.load(Ordering::SeqCst) {
+                return Err(SendError::Closed);
+            }
             if item.kind == StreamKind::Control
                 && (sched.control_len() >= OUTBOX_CONTROL_MAX_FRAMES
                     || sched.control_bytes().saturating_add(item.bytes.len())
@@ -182,6 +185,7 @@ impl Outbox {
     pub fn send_control(&self, frame: &Frame, max_len: usize) -> Result<(), SendError> {
         let bytes = encode(frame, max_len).map_err(SendError::Frame)?;
         self.push(Outgoing {
+            retained: None,
             kind: StreamKind::Control,
             bytes,
         })
@@ -202,6 +206,8 @@ impl Outbox {
     fn mark_dead(&self) {
         self.dead.store(true, Ordering::SeqCst);
         self.bulk_slots.close();
+        // A surviving Client must not keep dead queued plaintext or its leases.
+        *self.sched.lock().expect("scheduler lock") = Scheduler::new();
     }
 
     async fn next(&self) -> Option<Outgoing> {
@@ -226,30 +232,57 @@ impl Outbox {
     }
 }
 
+// Field order makes writer-owned buffers die before the in-flight lease,
+// including cancellation or panic while AsyncWrite owns pending plaintext.
+struct WriterState<W> {
+    writer: W,
+    in_flight: Option<Outgoing>,
+}
+struct WriterLifetime {
+    outbox: Arc<Outbox>,
+    shared: Arc<Shared>,
+}
+impl Drop for WriterLifetime {
+    fn drop(&mut self) {
+        self.outbox.mark_dead();
+        self.shared.close();
+    }
+}
 /// Write queued frames until shutdown or a write error, then close the stream.
 pub async fn run_writer<W: AsyncWrite + Unpin>(
-    mut writer: W,
+    writer: W,
     outbox: Arc<Outbox>,
     shared: Arc<Shared>,
 ) {
+    let _lifetime = WriterLifetime {
+        outbox: Arc::clone(&outbox),
+        shared,
+    };
+    let mut state = WriterState {
+        writer,
+        in_flight: None,
+    };
     while let Some(item) = outbox.next().await {
-        // A peer that does not read blocks the write for good; the cut signal
-        // (control queue overflow) is what ends it.
+        state.in_flight = Some(item);
+        let item = state.in_flight.as_ref().expect("in-flight frame");
         let written = tokio::select! {
             biased;
             _ = outbox.cut.notified() => false,
             r = async {
-                writer.write_all(&item.bytes).await?;
-                writer.flush().await
+                state.writer.write_all(&item.bytes).await?;
+                state.writer.flush().await
             } => r.is_ok(),
         };
         if !written {
             break;
         }
+        state.in_flight = None;
     }
     outbox.mark_dead();
-    let _ = writer.shutdown().await;
-    shared.close();
+    let _ = state.writer.shutdown().await;
+    // Explicit field order also covers writers retaining a partially written
+    // frame when shutdown returns an error or a connection was cut.
+    drop(state);
 }
 
 // ---------------------------------------------------------------------------
@@ -388,6 +421,17 @@ impl Client {
     /// `Unconfirmed` (disconnect or timeout after the request was queued) means
     /// the worker may have run it. `NotSent` means it certainly did not.
     pub async fn call(&self, request: Request, timeout: Duration) -> Result<Response, CallError> {
+        self.call_retained(request, timeout, None).await
+    }
+
+    /// Keep an opaque lease with the encoded bytes, including after timeout or
+    /// cancellation of the caller. Only the writer draining/cutting releases it.
+    pub(crate) async fn call_retained(
+        &self,
+        request: Request,
+        timeout: Duration,
+        retained: Option<super::sched::Retained>,
+    ) -> Result<Response, CallError> {
         let shared = &self.inner.shared;
         let stream = shared.stream_id();
         let op = request.operation();
@@ -400,6 +444,7 @@ impl Client {
             .map_err(|_| CallError::NotSent)?;
         let _forget = ForgetOnDrop { shared, stream };
         let item = Outgoing {
+            retained,
             kind: frame.kind,
             bytes,
         };
@@ -481,6 +526,7 @@ impl Responder {
             Ok(bytes) => {
                 self.outbox
                     .send(Outgoing {
+                        retained: None,
                         kind: frame.kind,
                         bytes,
                     })

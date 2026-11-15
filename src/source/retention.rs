@@ -1,6 +1,7 @@
 //! Persistent roots and cross-process exclusion for captured inputs.
 //! Explicit parent retention pages are separate from the nondeleting preview.
 mod deletion;
+mod vault_retention;
 use super::SourceStore;
 use anyhow::{ensure, Context, Result};
 pub use deletion::{RetentionCursor, RetentionPage};
@@ -10,6 +11,8 @@ use std::io::{self, Read};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+pub(crate) use vault_retention::{check_vault_registration, check_vault_run, VaultRegistration};
+pub use vault_retention::{VaultCursor, VaultPage};
 
 #[derive(Debug, Clone)]
 pub struct Guard {
@@ -94,6 +97,8 @@ impl Index {
           CREATE TABLE IF NOT EXISTS run_expiry(run_id TEXT PRIMARY KEY,source_id TEXT NOT NULL,binding_digest TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS source_delete_claim(object TEXT NOT NULL,incarnation INTEGER NOT NULL,claim_json TEXT NOT NULL,done INTEGER NOT NULL CHECK(done IN (0,1)),PRIMARY KEY(object,incarnation));
           CREATE INDEX IF NOT EXISTS source_delete_pending ON source_delete_claim(done,object,incarnation);
+          CREATE TABLE IF NOT EXISTS vault_delete_claim(run_id TEXT PRIMARY KEY,source_id TEXT NOT NULL,binding_digest TEXT NOT NULL,claim_json TEXT NOT NULL,done INTEGER NOT NULL CHECK(done IN (0,1)));
+          CREATE INDEX IF NOT EXISTS vault_delete_pending ON vault_delete_claim(done,run_id);
           CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
           INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');").context("initialize source index")?;
@@ -3191,5 +3196,390 @@ mod tests {
                 |r| r.get::<_, bool>(0)
             )
             .unwrap());
+    }
+    mod vault_cases {
+        use super::*;
+        use crate::secrets::capture::{capture_run, SecretInputs};
+        use crate::secrets::{key::ClusterKey, vault::Vault};
+        use std::os::unix::fs::PermissionsExt;
+        fn prepared() -> (Fixture, RunId, Vault, ClusterKey) {
+            let f = Fixture::new();
+            let run = RunId::generate();
+            let key = ClusterKey::from_bytes(vec![7; 32]).unwrap();
+            let vault = Vault::open(&f.state).unwrap();
+            secret_bind(&f, &run, &vault, &key);
+            f.terminal(&run);
+            f.store
+                .retention
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+                    [],
+                )
+                .unwrap();
+            (f, run, vault, key)
+        }
+        fn secret_bind(f: &Fixture, run: &RunId, vault: &Vault, key: &ClusterKey) {
+            std::fs::write(f.input.join(".env"), b"TOKEN=original-private-fixture\n").unwrap();
+            capture_run(
+                &BTreeMap::new(),
+                &f.store,
+                vault,
+                &SecretInputs {
+                    key,
+                    declared: &[local_ci::source::SecretSpec {
+                        glob: ".env".into(),
+                        required: true,
+                    }],
+                },
+                run,
+                &SourceRequest::Directory {
+                    dir: f.input.clone(),
+                },
+                &CaptureParams::default(),
+            )
+            .unwrap();
+        }
+        fn tick(
+            f: &Fixture,
+            v: &Vault,
+            k: &ClusterKey,
+            c: &mut VaultCursor,
+            wall: u64,
+            mono: u64,
+        ) -> VaultPage {
+            f.store
+                .vault_retention_page(&f.owner, v, k, c, wall, mono, Some("boot".into()))
+                .unwrap()
+        }
+        fn entries(f: &Fixture, r: &RunId) -> Vec<local_ci::source::SecretEntry> {
+            f.store
+                .manifest(&f.store.source_of_run(r).unwrap().unwrap())
+                .unwrap()
+                .unwrap()
+                .secret_files
+        }
+        #[test]
+        fn vault_parent_tombstone_deletes_only_private_copy_and_never_expires_source() {
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            let page = tick(&f, &v, &k, &mut c, 101, 11);
+            assert_eq!(
+                (page.claimed, page.removed, page.unknown),
+                (1, 1, 0),
+                "{:?}",
+                page
+            );
+            assert!(!v.has(&r));
+            assert!(matches!(
+                v.load(&r, &[], &k),
+                Err(crate::secrets::SecretError::Unavailable { .. })
+            ));
+            assert!(f
+                .store
+                .mutation_guard()
+                .unwrap()
+                .ensure_run_available(&r)
+                .is_ok());
+            assert_eq!(
+                std::fs::read(f.input.join(".env")).unwrap(),
+                b"TOKEN=original-private-fixture\n"
+            );
+            let unavailable = capture_run(
+                &BTreeMap::new(),
+                &f.store,
+                &v,
+                &SecretInputs {
+                    key: &k,
+                    declared: &[],
+                },
+                &r,
+                &SourceRequest::Directory {
+                    dir: f._root.path().join("nonexistent-original"),
+                },
+                &CaptureParams::default(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                unavailable.blocked_reason,
+                Some(crate::error::BlockedReason::SecretUnavailable)
+            );
+            assert!(f.store.source_of_run(&r).unwrap().is_some());
+            let db = f.store.retention.connect().unwrap();
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM run_expiry", [], |r| r
+                    .get::<_, u32>(0))
+                    .unwrap(),
+                0
+            );
+            // A later recreation is retained, but cannot make the run available.
+            let path = f.state.join("secrets").join(format!("{r}.json"));
+            std::fs::write(&path, b"recreated").unwrap();
+            c = VaultCursor::default();
+            assert_eq!(tick(&f, &v, &k, &mut c, 102, 12).paths, 0);
+            assert!(path.exists());
+            let reopened = Vault::open(&f.state).unwrap();
+            assert!(!reopened.has(&r));
+            let copy = f._root.path().join("new-copy");
+            std::fs::write(&copy, b"private").unwrap();
+            assert!(matches!(
+                reopened.adopt(&r, &copy, &[], &k),
+                Err(crate::secrets::SecretError::Unavailable { .. })
+            ));
+        }
+        #[test]
+        fn vault_held_clone_and_direct_read_keep_gc_busy() {
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            let held = v.load(&r, &entries(&f, &r), &k).unwrap();
+            let clone = held.clone();
+            drop(held);
+            assert!(tick(&f, &v, &k, &mut c, 101, 11).busy);
+            assert!(v.has(&r));
+            drop(clone);
+            assert_eq!(tick(&f, &v, &k, &mut c, 101, 11).removed, 1);
+        }
+        #[test]
+        fn vault_claim_replay_clock_holds_and_changed_target_stays() {
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            tick(&f, &v, &k, &mut c, 100, 10);
+            crate::secrets::vault::set_retention_fault(Some("after_claim"));
+            let page = tick(&f, &v, &k, &mut c, 101, 11);
+            assert_eq!((page.claimed, page.unknown), (1, 1));
+            crate::secrets::vault::set_retention_fault(None);
+            let path = f.state.join("secrets").join(format!("{r}.json"));
+            assert!(path.exists());
+            assert!(!v.has(&r));
+            assert!(tick(&f, &v, &k, &mut c, 99, 12).held);
+            assert!(path.exists());
+            // Replacement has the same bytes and permissions, a different inode.
+            let bytes = std::fs::read(&path).unwrap();
+            let other = path.with_extension("replacement");
+            std::fs::write(&other, bytes).unwrap();
+            std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::rename(&other, &path).unwrap();
+            let p = tick(&f, &v, &k, &mut c, 102, 12);
+            assert_eq!((p.paths, p.removed, p.unknown), (1, 0, 1));
+            assert!(path.exists());
+        }
+        #[test]
+        fn vault_missing_claim_target_replays_only_after_valid_clock() {
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            tick(&f, &v, &k, &mut c, 100, 10);
+            crate::secrets::vault::set_retention_fault(Some("after_unlink"));
+            let p = tick(&f, &v, &k, &mut c, 101, 11);
+            assert_eq!((p.claimed, p.unknown), (1, 1));
+            crate::secrets::vault::set_retention_fault(None);
+            assert!(!f.state.join("secrets").join(format!("{r}.json")).exists());
+            assert!(tick(&f, &v, &k, &mut c, 99, 12).held);
+            let p = tick(&f, &v, &k, &mut c, 102, 12);
+            assert_eq!((p.paths, p.removed), (1, 1));
+            assert_eq!(tick(&f, &v, &k, &mut c, 103, 13).paths, 0);
+        }
+        #[test]
+        fn vault_registered_missing_index_never_becomes_worker_mode() {
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            tick(&f, &v, &k, &mut c, 100, 10);
+            let db = f.state.join("sources/retention.db");
+            let saved = db.with_extension("saved");
+            std::fs::rename(&db, &saved).unwrap();
+            assert!(!v.has(&r));
+            assert!(matches!(
+                v.load(&r, &[], &k),
+                Err(crate::secrets::SecretError::Unavailable { .. })
+            ));
+            assert!(Vault::open(&f.state).is_err());
+            std::fs::rename(saved, db).unwrap();
+            assert!(v.has(&r));
+        }
+        #[test]
+        fn vault_page_is_bounded_and_requires_terminal_exact_proof() {
+            let f = Fixture::new();
+            let v = Vault::open(&f.state).unwrap();
+            let k = ClusterKey::from_bytes(vec![7; 32]).unwrap();
+            for _ in 0..33 {
+                let r = RunId::generate();
+                secret_bind(&f, &r, &v, &k);
+                f.terminal(&r);
+            }
+            let active = RunId::generate();
+            secret_bind(&f, &active, &v, &k);
+            f.store
+                .retention
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+                    [],
+                )
+                .unwrap();
+            let mut c = VaultCursor::default();
+            tick(&f, &v, &k, &mut c, 100, 10);
+            let p = tick(&f, &v, &k, &mut c, 101, 11);
+            assert_eq!((p.examined, p.claimed), (32, 32));
+            let p = tick(&f, &v, &k, &mut c, 102, 12);
+            assert_eq!((p.examined, p.claimed), (2, 1));
+            assert!(v.load(&active, &[], &k).is_ok());
+        }
+        #[test]
+        fn vault_secret_free_terminal_run_keeps_source_only_retry_available() {
+            let f = Fixture::new();
+            let r = RunId::generate();
+            f.bind(&r);
+            f.terminal(&r);
+            let v = Vault::open(&f.state).unwrap();
+            let k = ClusterKey::from_bytes(vec![7; 32]).unwrap();
+            f.store
+                .retention
+                .connect()
+                .unwrap()
+                .execute(
+                    "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+                    [],
+                )
+                .unwrap();
+            let mut c = VaultCursor::default();
+            tick(&f, &v, &k, &mut c, 100, 10);
+            assert_eq!(tick(&f, &v, &k, &mut c, 101, 11).claimed, 0);
+            assert!(v.load(&r, &[], &k).is_ok());
+            v.lease(true)
+                .unwrap()
+                .publish(&format!("{r}.json"), b"unknown-owned-fixture")
+                .unwrap();
+            c = VaultCursor::default();
+            let page = tick(&f, &v, &k, &mut c, 102, 12);
+            assert_eq!((page.claimed, page.unknown), (0, 1));
+            assert!(v.has(&r));
+        }
+        #[test]
+        fn vault_unregistered_erase_still_allows_worker_reupload() {
+            let (f, r, v, k) = prepared();
+            let files = entries(&f, &r);
+            let held = v.load(&r, &files, &k).unwrap();
+            let path = f.state.join("secrets").join(format!("{r}.json"));
+            let bytes = std::fs::read(&path).unwrap();
+            v.erase(&r).unwrap();
+            let copy = f._root.path().join("worker-copy");
+            std::fs::write(&copy, bytes).unwrap();
+            std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600)).unwrap();
+            v.adopt(&r, &copy, &files, &k).unwrap();
+            assert!(v.has(&r));
+            drop(held);
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn vault_encoded_queue_outlives_timeout_and_dropped_sender_until_writer_death() {
+            queued_sender(false).await;
+        }
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn vault_encoded_queue_and_current_frame_release_after_owned_writer_abort() {
+            queued_sender(true).await;
+        }
+        async fn queued_sender(abort: bool) {
+            use crate::protocol::mux::{run_writer, Outbox, Shared};
+            use crate::protocol::Client;
+            use crate::secrets::send::send_bundle;
+            use std::time::Duration;
+            use tokio::io::AsyncReadExt;
+            let (f, r, v, k) = prepared();
+            let mut cursor = VaultCursor::default();
+            tick(&f, &v, &k, &mut cursor, 100, 10);
+            let held = v.load(&r, &entries(&f, &r), &k).unwrap();
+            let shared = Shared::new(crate::protocol::MAX_FRAME_LEN);
+            let outbox = Outbox::new();
+            let client = Client::new(Arc::clone(&shared), Arc::clone(&outbox));
+            assert!(send_bundle(
+                &client,
+                &held,
+                crate::ids::CoordinatorEpoch(1),
+                &AttemptId::generate(),
+                crate::ids::Generation(1),
+                Duration::from_millis(5)
+            )
+            .await
+            .is_err());
+            let attempt = AttemptId::generate();
+            assert!(tokio::time::timeout(
+                Duration::from_millis(5),
+                send_bundle(
+                    &client,
+                    &held,
+                    crate::ids::CoordinatorEpoch(1),
+                    &attempt,
+                    crate::ids::Generation(1),
+                    Duration::from_secs(60)
+                )
+            )
+            .await
+            .is_err());
+            drop(held);
+            assert!(tick(&f, &v, &k, &mut cursor, 101, 11).busy);
+            let (ours, mut peer) = tokio::io::duplex(1);
+            let writer = tokio::spawn(run_writer(ours, Arc::clone(&outbox), Arc::clone(&shared)));
+            tokio::time::timeout(Duration::from_secs(5), peer.read_exact(&mut [0; 1]))
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(tick(&f, &v, &k, &mut cursor, 101, 11).busy);
+            if abort {
+                writer.abort();
+                assert!(writer.await.unwrap_err().is_cancelled());
+                drop(peer);
+            } else {
+                drop(peer);
+                tokio::time::timeout(Duration::from_secs(5), writer)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+            // Client/outbox remain alive: dead queued frames must be discarded.
+            assert!(client.is_closed());
+            assert_eq!(tick(&f, &v, &k, &mut cursor, 101, 11).removed, 1);
+        }
+        #[test]
+        fn vault_fresh_exact_owner_digest_queue_and_collection_proofs_are_required() {
+            for kind in ["digest", "unknown", "retired", "collection", "queued"] {
+                let (f, r, v, k) = prepared();
+                let mut c = VaultCursor::default();
+                tick(&f, &v, &k, &mut c, 100, 10);
+                if kind == "queued" {
+                    f.owner
+                        .create_task(&TaskId::generate(), &r, &serde_json::json!({}), 6)
+                        .unwrap();
+                } else {
+                    f.owner
+                        .db
+                        .call(move |db| {
+                            match kind {
+                                "digest" => db.execute(
+                                    "UPDATE source_ref SET manifest_digest='sha256:wrong'",
+                                    [],
+                                )?,
+                                "unknown" => {
+                                    db.execute("UPDATE attempt SET observation='unknown'", [])?
+                                }
+                                "retired" => {
+                                    db.execute("UPDATE attempt SET retired=1,retired_at_ms=6", [])?
+                                }
+                                "collection" => db.execute(
+                                    "UPDATE collection SET closed_at_ms=NULL,verdict=NULL",
+                                    [],
+                                )?,
+                                _ => unreachable!(),
+                            };
+                            Ok(())
+                        })
+                        .unwrap();
+                }
+                let page = tick(&f, &v, &k, &mut c, 101, 11);
+                assert_eq!(page.claimed, 0, "{kind}: {page:?}");
+                assert!(v.has(&r), "{kind}");
+            }
+        }
     }
 }

@@ -651,3 +651,26 @@ queue exclusion, permanent directAPI fences, clock-Hold replay, claim/unlink/fsy
 claimed/unclaimed missing, same-ID next incarnation, root/ancestor/leaf/symlink/hardlink/mode/path mismatch,
 owner-lock replacement, pending roots and sparse oversized leaf retention. Source preview and reader/IPC/async
 cancellation guard regressions remain green. Full local-ci/MSRV/Linux/remote/native/runtime-GC acceptance is not claimed.
+
+
+### S15e C: parent Vault の明示削除ページ（resident 未接続）
+
+`SourceStore::vault_retention_page` を同期 API として追加した。source EX → Vault EX → owner actor の順で、
+B と同じ owner/source/run/manifest digest・全 generation terminal・必須 collection closed・queue 不在を確認する。
+Vault は独立した永続 `vault_clock`（retention 0、初回は Hold）を使い、source の7日保持や run_expiry を変更しない。
+最大32 run/claim と64MiBの manifest/secret 検証予算を持ち、秘密の HMAC/path/size も削除 claim 前に検証する。
+永続 vault_delete_claim が parent run の利用不能 tombstone を兼ね、clock Hold は新規 claim と物理 replay の両方を止める。
+完了 claim は再実行せず、再作成・別 inode・内容/権限/祖先の変更は保持する。実 unlink は FD 相対 NOFOLLOW、
+private UID/nlink1/0600 の厳密な run.json のみで、親 directory fsync 後に完了する。
+
+Vault 内の private parent registration は source root/index の identity を固定し、generic constructor/has/load/adopt/capture も
+この永続境界を確認する。index 欠損・交換・不明は Unavailable/has=false で、worker mode へ戻らない。
+直接 API と cloneable HeldBundle は Vault SH を持つ。send_bundle は opaque lease を encoded Outgoing に渡し、
+caller timeout/cancellation 後も queue・write・flush/cut が所有する。writer 死亡/abort は残る queue を破棄し、
+writer の内部 buffer を破棄するまで current frame の lease を保持する。last lease は明示 unlock する。
+直接 adopt の初回公開は linkat による atomic no-replace で、同時要求の後発が先発 bundle を置換しない。
+parent 登録のない worker の ephemeral erase/reupload は維持する。
+
+自動 resident loop は追加していない。B+C+transport の専任削除レビュー後に D で trusted clock、bounded scheduling、
+spawn_blocking の所有と shutdown/drain を接続する。実 user state、原本、key、Git refs/cache、unknown legacy の消去は行わない。
+focused 検証と strict lint の最終結果は C handoff に記録し、全体 local-ci/MSRV/Linux/native/runtime acceptance は親統合で行う。

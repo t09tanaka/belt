@@ -311,6 +311,7 @@ fn blob_item(i: u32) -> Outgoing {
     });
     let frame = Frame::message(i + 1, Message::Request(req));
     Outgoing {
+        retained: None,
         kind: frame.kind,
         bytes: encode(&frame, MAX_FRAME_LEN).unwrap(),
     }

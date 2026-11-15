@@ -4,12 +4,35 @@
 
 use super::frame::StreamKind;
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+/// Opaque ownership carried until the encoded frame has drained or is dropped.
+/// Debug never inspects the retained value.
+#[derive(Clone)]
+pub struct Retained(Arc<dyn Send + Sync>);
+impl Retained {
+    pub(crate) fn new(value: impl Send + Sync + 'static) -> Self {
+        Self(Arc::new(value))
+    }
+}
+impl std::fmt::Debug for Retained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Retained(..)")
+    }
+}
+impl PartialEq for Retained {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for Retained {}
 
 /// A frame already turned into bytes, with the queue it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing {
     pub kind: StreamKind,
     pub bytes: Vec<u8>,
+    pub retained: Option<Retained>,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +110,7 @@ mod tests {
 
     fn item(kind: StreamKind, tag: u8) -> Outgoing {
         Outgoing {
+            retained: None,
             kind,
             bytes: vec![tag],
         }
@@ -120,15 +144,18 @@ mod tests {
         let mut s = Scheduler::new();
         assert_eq!((s.control_len(), s.control_bytes()), (0, 0));
         s.push(Outgoing {
+            retained: None,
             kind: StreamKind::Control,
             bytes: vec![0; 5],
         });
         s.push(Outgoing {
+            retained: None,
             kind: StreamKind::Control,
             bytes: vec![0; 7],
         });
         // Bulk frames are not counted: they have their own backpressure.
         s.push(Outgoing {
+            retained: None,
             kind: StreamKind::Blob,
             bytes: vec![0; 100],
         });
