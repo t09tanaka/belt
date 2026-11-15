@@ -349,6 +349,18 @@ fn invalid(m: impl Into<String>) -> ApiError {
     ApiError::new(ErrorCode::InvalidInput, m)
 }
 
+/// The identity of the profile shell's real file. A profile may name its shell
+/// through a symlink (`/bin/sh` is one on many Linux hosts) and already
+/// measures the resolved file for its fingerprint, so a retargeted link is
+/// profile drift. The identity is taken from that resolved path, without
+/// following a link again.
+fn shell_identity(
+    profile: &crate::toolchain::profile::Profile,
+) -> Result<crate::toolchain::adapters::FileIdentity, ApiError> {
+    let real = fs::canonicalize(profile.shell()).map_err(|_| invalid("identity_open"))?;
+    crate::toolchain::adapters::FileIdentity::capture(&real).map_err(invalid)
+}
+
 /// Refuse a payload that declares one of the attempt's secret files (the
 /// declared ones and what `.worktreeinclude` matched) as an artifact.
 fn check_artifacts_not_secret(
@@ -1535,7 +1547,7 @@ impl Agent {
             .iter()
             .zip(receipts.iter().map(|r| r.as_ref()))
             .collect::<Vec<_>>();
-        let shell = adapters::FileIdentity::capture(profile.shell()).map_err(invalid)?;
+        let shell = shell_identity(profile)?;
         let setup_policy = Digest::of_bytes(
             &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
         );
@@ -1630,7 +1642,7 @@ impl Agent {
             .iter()
             .zip(receipts.iter().map(|r| r.as_ref()))
             .collect::<Vec<_>>();
-        let shell = adapters::FileIdentity::capture(profile.shell()).map_err(invalid)?;
+        let shell = shell_identity(profile)?;
         let setup_policy = Digest::of_bytes(
             &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
         );
