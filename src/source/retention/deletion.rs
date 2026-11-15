@@ -1,0 +1,548 @@
+//! Parent-only, explicitly invoked source retention. No resident task calls this.
+//! Source EX spans the synchronous operation, including unlink/fsync/SQLite drain.
+use super::*;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
+use std::os::unix::fs::MetadataExt;
+
+type OpenedParent = (File, String, Vec<(u64, u64)>);
+const PAGE: usize = 32;
+const BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+
+#[derive(Default)]
+pub struct RetentionCursor {
+    run: Option<String>,
+    object: String,
+    validated: Option<Validated>,
+}
+#[derive(Debug, Default)]
+pub struct RetentionPage {
+    pub busy: bool,
+    pub held: bool,
+    pub examined: u32,
+    pub claimed: u32,
+    /// Distinct claimed file paths processed (new or replay), at most 32.
+    pub paths: u32,
+    pub removed: u32,
+    pub shared: u32,
+    pub unknown: u32,
+    pub run: Option<String>,
+    pub errors: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct Identity {
+    dev: u64,
+    ino: u64,
+    size: u64,
+    uid: u32,
+    mode: u32,
+    links: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+impl Identity {
+    fn of(file: &File) -> Result<Self> {
+        let m = file.metadata()?;
+        Ok(Self {
+            dev: m.dev(),
+            ino: m.ino(),
+            size: m.len(),
+            uid: m.uid(),
+            mode: m.mode(),
+            links: m.nlink(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        })
+    }
+    fn leaf(&self) -> bool {
+        self.mode & 0o170000 == 0o100000
+            && self.uid == rustix::process::geteuid().as_raw()
+            && self.links == 1
+            && self.mode & 0o022 == 0
+            && self.mode & 0o111 == 0
+            && self.mode & 0o7000 == 0
+    }
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct Claim {
+    object: String,
+    path: String,
+    incarnation: i64,
+    store: (u64, u64),
+    parents: Vec<(u64, u64)>,
+    leaf: Identity,
+    digest: String,
+}
+fn directory(file: &File, private: bool) -> Result<(u64, u64)> {
+    let m = file.metadata()?;
+    ensure!(
+        m.is_dir()
+            && m.uid() == rustix::process::geteuid().as_raw()
+            && m.mode() & if private { 0o077 } else { 0o022 } == 0,
+        "unsafe source deletion directory"
+    );
+    Ok((m.dev(), m.ino()))
+}
+fn components(object: &str, path: &str) -> Result<Vec<String>> {
+    let expected = if let Some(id) = object.strip_prefix("m:") {
+        ensure!(
+            super::super::classify::source_id_of_ci(id).is_some(),
+            "invalid owned source id"
+        );
+        format!("manifests/{id}.json")
+    } else if let Some(hash) = object.strip_prefix("b:") {
+        ensure!(
+            super::super::diff::is_blob_hash(hash),
+            "invalid source digest"
+        );
+        format!("objects/{}/{hash}", &hash[..2])
+    } else {
+        anyhow::bail!("unknown source object class")
+    };
+    ensure!(path == expected, "source object path mismatch");
+    Ok(path.split('/').map(str::to_owned).collect())
+}
+impl Index {
+    fn check_anchor(&self) -> Result<()> {
+        self.current()?;
+        // Walk every configured ancestor without following a symlink. This
+        // also rechecks root identity after a state-parent replacement.
+        ensure!(
+            self.path.is_absolute(),
+            "source deletion requires absolute root"
+        );
+        let mut anchor: File = rustix::fs::open("/", DIR, rustix::fs::Mode::empty())?.into();
+        for component in self.path.components() {
+            match component {
+                std::path::Component::RootDir => {}
+                std::path::Component::Normal(name) => {
+                    anchor =
+                        rustix::fs::openat(&anchor, name, DIR, rustix::fs::Mode::empty())?.into();
+                }
+                _ => anyhow::bail!("noncanonical source deletion root"),
+            }
+        }
+        ensure!(
+            directory(&anchor, true)? == directory(&self.root, true)?,
+            "source deletion root changed"
+        );
+        Ok(())
+    }
+    fn open_claim_parent(&self, object: &str, path: &str) -> Result<OpenedParent> {
+        self.check_anchor()?;
+        let mut parts = components(object, path)?;
+        let leaf = parts.pop().context("source leaf")?;
+        let mut parent = self.root.try_clone()?;
+        let mut identities = Vec::with_capacity(2);
+        for component in parts {
+            parent = rustix::fs::openat(&parent, component, DIR, rustix::fs::Mode::empty())?.into();
+            identities.push(directory(&parent, false)?);
+        }
+        Ok((parent, leaf, identities))
+    }
+    fn proof(&self, object: &str, path: &str, budget: &mut u64) -> Result<Claim> {
+        let (parent, name, parents) = self.open_claim_parent(object, path)?;
+        let mut file: File = rustix::fs::openat(
+            &parent,
+            &name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        )?
+        .into();
+        let leaf = Identity::of(&file)?;
+        ensure!(leaf.leaf(), "unsafe source deletion leaf");
+        ensure!(
+            leaf.size <= *budget,
+            "source deletion validation byte budget"
+        );
+        *budget -= leaf.size;
+        let mut bytes = Vec::new();
+        (&mut file).take(leaf.size + 1).read_to_end(&mut bytes)?;
+        ensure!(
+            bytes.len() as u64 == leaf.size && Identity::of(&file)? == leaf,
+            "source changed during validation"
+        );
+        let digest = format!("{:x}", Sha256::digest(&bytes));
+        if let Some(hash) = object.strip_prefix("b:") {
+            ensure!(digest == hash, "source blob content identity mismatch");
+        } else {
+            let manifest: local_ci::source::SourceManifest = serde_json::from_slice(&bytes)?;
+            ensure!(
+                Some(manifest.source_id.as_str()) == object.strip_prefix("m:"),
+                "source manifest identity mismatch"
+            );
+            super::super::store::verify_manifest(&manifest)?;
+        }
+        let incarnation = i64::try_from(self.publication(object)?.get())?;
+        ensure!(incarnation < i64::MAX, "source incarnation overflow");
+        Ok(Claim {
+            object: object.into(),
+            path: path.into(),
+            incarnation,
+            store: directory(&self.root, true)?,
+            parents,
+            leaf,
+            digest,
+        })
+    }
+    fn drain_claim(&self, c: &mut Connection, claim: &Claim, budget: &mut u64) -> Result<()> {
+        ensure!(
+            claim.incarnation > 0 && claim.incarnation < i64::MAX,
+            "source incarnation overflow"
+        );
+        ensure!(
+            directory(&self.root, true)? == claim.store,
+            "foreign source deletion claim"
+        );
+        let current: Option<i64> = c
+            .query_row(
+                "SELECT incarnation FROM publication WHERE object=?1 AND state='claimed'",
+                [&claim.object],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            current == Some(claim.incarnation),
+            "stale source deletion incarnation"
+        );
+        let protected:bool=c.query_row("SELECT EXISTS(SELECT 1 FROM member WHERE object=?1) OR EXISTS(SELECT 1 FROM root WHERE source IS NULL) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[&claim.object],|r|r.get(0))?;
+        ensure!(!protected, "source deletion claim still protected");
+        let (parent, name, parents) = self.open_claim_parent(&claim.object, &claim.path)?;
+        ensure!(parents == claim.parents, "source deletion ancestor changed");
+        let opened = rustix::fs::openat(
+            &parent,
+            &name,
+            rustix::fs::OFlags::RDONLY
+                | rustix::fs::OFlags::NOFOLLOW
+                | rustix::fs::OFlags::NONBLOCK
+                | rustix::fs::OFlags::CLOEXEC,
+            rustix::fs::Mode::empty(),
+        );
+        match opened {
+            Ok(fd) => {
+                let file: File = fd.into();
+                ensure!(
+                    Identity::of(&file)? == claim.leaf && claim.leaf.leaf(),
+                    "source deletion leaf changed"
+                );
+                ensure!(
+                    claim.leaf.size <= *budget,
+                    "source replay validation byte budget"
+                );
+                *budget -= claim.leaf.size;
+                let mut digest = Sha256::new();
+                let mut reader = (&file).take(claim.leaf.size + 1);
+                let bytes = std::io::copy(&mut reader, &mut digest)?;
+                ensure!(
+                    bytes == claim.leaf.size
+                        && format!("{:x}", digest.finalize()) == claim.digest
+                        && Identity::of(&file)? == claim.leaf,
+                    "source replay content changed"
+                );
+                self.current()?;
+                let (_, _, current_parents) = self.open_claim_parent(&claim.object, &claim.path)?;
+                ensure!(
+                    current_parents == claim.parents,
+                    "source deletion ancestor swapped"
+                );
+                let named =
+                    rustix::fs::statat(&parent, &name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
+                // st_dev is platform-dependent (signed on macOS, u64 on Linux).
+                #[allow(clippy::unnecessary_cast)]
+                let named_device = named.st_dev as u64;
+                ensure!(
+                    (named_device, named.st_ino) == (claim.leaf.dev, claim.leaf.ino),
+                    "source deletion leaf swapped"
+                );
+                ensure!(
+                    Identity::of(&file)? == claim.leaf,
+                    "source deletion metadata changed before unlink"
+                );
+                // The held descriptors and final pathname identity are checked
+                // immediately before unlink. No directory is ever removed.
+                fault("before_unlink")?;
+                rustix::fs::unlinkat(&parent, &name, rustix::fs::AtFlags::empty())?;
+                fault("after_unlink")?;
+            }
+            Err(rustix::io::Errno::NOENT) => {} // Only this durable exact claim permits absence.
+            Err(error) => return Err(error.into()),
+        }
+        parent.sync_all()?;
+        fault("after_fsync")?;
+        let tx = c.transaction()?;
+        let changed=tx.execute("UPDATE publication SET state='live',incarnation=incarnation+1 WHERE object=?1 AND incarnation=?2 AND state='claimed'",params![claim.object,claim.incarnation])?;
+        ensure!(changed == 1, "source claim completion changed");
+        tx.execute(
+            "UPDATE source_delete_claim SET done=1 WHERE object=?1 AND incarnation=?2 AND done=0",
+            params![claim.object, claim.incarnation],
+        )?;
+        fault("before_completion")?;
+        tx.commit()?;
+        Ok(())
+    }
+}
+impl SourceStore {
+    /// Explicit parent-only page. Samples must come from trusted platform clocks
+    /// in a future driver; this API does not enable an automatic deletion loop.
+    /// Eligibility scans a run's generation history and is not constant-time.
+    #[allow(clippy::too_many_arguments)]
+    pub fn retention_page(
+        &self,
+        owner: &crate::storage::CoordinatorStore,
+        cursor: &mut RetentionCursor,
+        wall: u64,
+        mono: u64,
+        boot: Option<String>,
+        retention: u64,
+    ) -> Result<RetentionPage> {
+        let _guard = match self.retention.guard(true) {
+            Ok(guard) => guard,
+            Err(error)
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::WouldBlock)
+                }) =>
+            {
+                return Ok(RetentionPage {
+                    busy: true,
+                    ..Default::default()
+                })
+            }
+            Err(error) => return Err(error),
+        };
+        self.retention.check_anchor()?;
+        let owner_identity = owner.check_input_store(&self.retention.path, &self.retention.root)?;
+        let mut c = self.retention.connect()?;
+        let registered_owner: Option<String> = c
+            .query_row(
+                "SELECT value FROM meta WHERE key='retention_owner'",
+                [],
+                |r| r.get(0),
+            )
+            .optional()?;
+        ensure!(
+            registered_owner
+                .as_deref()
+                .is_none_or(|old| old == owner_identity),
+            "source retention owner identity changed"
+        );
+        c.execute(
+            "INSERT OR IGNORE INTO meta VALUES('retention_owner',?1)",
+            [&owner_identity],
+        )?;
+        let previous: Option<String> = c
+            .query_row("SELECT value FROM meta WHERE key='clock'", [], |r| r.get(0))
+            .optional()?;
+        let previous = previous
+            .as_deref()
+            .map(serde_json::from_str::<crate::results::clock_policy::ClockState>)
+            .transpose()?;
+        let step = crate::results::clock_policy::step(
+            previous.as_ref(),
+            boot.as_deref(),
+            wall,
+            mono,
+            retention,
+        );
+        if let Some(state) = step.state {
+            c.execute("INSERT INTO meta VALUES('clock',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",[serde_json::to_string(&state)?])?;
+        }
+        let Some(now) = step.cutoff else {
+            return Ok(RetentionPage {
+                held: true,
+                ..Default::default()
+            });
+        };
+        let unknown:bool=c.query_row("SELECT (SELECT value FROM meta WHERE key='legacy_registration')<>'done' OR EXISTS(SELECT 1 FROM root WHERE source IS NULL) OR EXISTS(SELECT 1 FROM graph WHERE done=0)",[],|r|r.get(0))?;
+        if unknown {
+            return Ok(RetentionPage {
+                held: true,
+                ..Default::default()
+            });
+        }
+        let pending: Vec<String> = {
+            let mut s=c.prepare("SELECT claim_json FROM source_delete_claim WHERE done=0 ORDER BY object,incarnation LIMIT 32")?;
+            let rows = s.query_map([], |r| r.get(0))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        let mut report = RetentionPage::default();
+        let mut budget = BYTE_BUDGET;
+        if !pending.is_empty() {
+            for raw in pending {
+                report.paths += 1;
+                let claim: Claim = serde_json::from_str(&raw)?;
+                match self.retention.drain_claim(&mut c, &claim, &mut budget) {
+                    Ok(()) => report.removed += 1,
+                    Err(error) => {
+                        report.unknown += 1;
+                        report.errors.push(format!("{error:#}"));
+                    }
+                }
+            }
+            return Ok(report);
+        }
+        let run:Option<(String,String)>=c.query_row("SELECT id,source FROM root WHERE kind='run' AND id>coalesce(?1,'') ORDER BY id LIMIT 1",[&cursor.run],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+        let Some((run, source)) = run else {
+            *cursor = RetentionCursor::default();
+            return Ok(report);
+        };
+        report.run = Some(run.clone());
+        let parsed = crate::ids::RunId::parse(&run)?;
+        let source_id =
+            super::super::classify::source_id_of_ci(&source).context("invalid owned run source")?;
+        let expired: bool = c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM run_expiry WHERE run_id=?1 AND source_id=?2)",
+            params![run, source],
+            |r| r.get(0),
+        )?;
+        if !expired {
+            if cursor
+                .validated
+                .as_ref()
+                .is_none_or(|v| v.manifest.source_id != source)
+            {
+                cursor.validated = Some(self.retention.load_validated(&source, BYTE_BUDGET)?);
+            }
+            let validated = cursor.validated.as_ref().unwrap();
+            validated.check(&self.retention)?;
+            let Some((ended, binding)) = owner.input_retention_binding(
+                &parsed,
+                &source_id,
+                &validated.manifest.manifest_digest,
+            )?
+            else {
+                cursor.run = Some(run);
+                cursor.object.clear();
+                cursor.validated = None;
+                return Ok(report);
+            };
+            if ended > now || now - ended < retention {
+                cursor.run = Some(run);
+                cursor.object.clear();
+                cursor.validated = None;
+                return Ok(report);
+            }
+            // Positive immutable private binding, read only through held root.
+            let runs: File = rustix::fs::openat(
+                &*self.retention.root,
+                "runs",
+                DIR,
+                rustix::fs::Mode::empty(),
+            )?
+            .into();
+            directory(&runs, false)?;
+            let record: File = rustix::fs::openat(
+                &runs,
+                &run,
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::NOFOLLOW
+                    | rustix::fs::OFlags::NONBLOCK
+                    | rustix::fs::OFlags::CLOEXEC,
+                rustix::fs::Mode::empty(),
+            )?
+            .into();
+            let identity = Identity::of(&record)?;
+            ensure!(
+                identity.leaf() && identity.size <= 65536,
+                "unsafe source run binding"
+            );
+            let mut bytes = Vec::new();
+            (&record).take(identity.size + 1).read_to_end(&mut bytes)?;
+            ensure!(
+                Identity::of(&record)? == identity && bytes.len() as u64 == identity.size,
+                "source run binding changed"
+            );
+            let record: super::super::store::RunRecord = serde_json::from_slice(&bytes)?;
+            ensure!(record.ci_source_id == source, "source run binding mismatch");
+            let binding = format!("{binding}:{:x}", Sha256::digest(&bytes));
+            // Permanent fence commits BEFORE any membership can be released.
+            ensure!(
+                owner.check_input_store(&self.retention.path, &self.retention.root)?
+                    == owner_identity,
+                "source retention owner changed before expiry"
+            );
+            fault("before_expiry")?;
+            c.execute(
+                "INSERT INTO run_expiry VALUES(?1,?2,?3)",
+                params![run, source, binding],
+            )?;
+            fault("after_expiry")?;
+        }
+        let objects: Vec<(String, String)> = {
+            let mut s=c.prepare("SELECT m.object,o.path FROM member m JOIN object o ON o.id=m.object WHERE m.root=?1 AND m.object>?2 ORDER BY m.object LIMIT 32")?;
+            let rows = s.query_map(params![run, cursor.object], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<std::result::Result<_, _>>()?
+        };
+        report.examined = objects.len() as u32;
+        for (object, path) in &objects {
+            cursor.object = object.clone();
+            let shared: bool = c.query_row(
+                "SELECT EXISTS(SELECT 1 FROM member WHERE object=?1 AND root<>?2)",
+                params![object, run],
+                |r| r.get(0),
+            )?;
+            if shared {
+                c.execute(
+                    "DELETE FROM member WHERE root=?1 AND object=?2",
+                    params![run, object],
+                )?;
+                report.shared += 1;
+                continue;
+            }
+            // Half the page budget remains for immediate content revalidation.
+            let mut proof_budget = budget / 2;
+            let claim = match self.retention.proof(object, path, &mut proof_budget) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    report.unknown += 1;
+                    report.errors.push(format!("{error:#}"));
+                    continue;
+                }
+            };
+            budget -= claim.leaf.size;
+            let tx = c.transaction()?;
+            tx.execute("INSERT INTO source_delete_claim(object,incarnation,claim_json,done) VALUES(?1,?2,?3,0)",params![object,claim.incarnation,serde_json::to_string(&claim)?])?;
+            tx.execute("UPDATE publication SET state='claimed' WHERE object=?1 AND incarnation=?2 AND state='live'",params![object,claim.incarnation])?;
+            tx.execute(
+                "DELETE FROM member WHERE root=?1 AND object=?2",
+                params![run, object],
+            )?;
+            tx.commit()?;
+            fault("after_claim")?;
+            report.claimed += 1;
+            report.paths += 1;
+            match self.retention.drain_claim(&mut c, &claim, &mut budget) {
+                Ok(()) => report.removed += 1,
+                Err(error) => {
+                    report.unknown += 1;
+                    report.errors.push(format!("{error:#}"));
+                }
+            }
+        }
+        if objects.len() < PAGE {
+            cursor.run = Some(run);
+            cursor.object.clear();
+            cursor.validated = None;
+        }
+        Ok(report)
+    }
+}
+
+#[cfg(test)]
+thread_local! { static FAULT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
+#[cfg(test)]
+pub(super) fn set_fault(stage: Option<&'static str>) {
+    FAULT.set(stage);
+}
+fn fault(stage: &str) -> Result<()> {
+    #[cfg(test)]
+    if FAULT.get() == Some(stage) {
+        anyhow::bail!("injected {stage}")
+    }
+    let _ = stage;
+    Ok(())
+}

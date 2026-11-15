@@ -60,6 +60,26 @@ impl ProcessLock {
         }
     }
 
+    /// Check the exact still-named owner inode without opening another file.
+    /// Existing coordinator locks may be 0644 under their private state root.
+    pub(crate) fn check_current(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let actual = self._file.metadata()?;
+        let named = std::fs::symlink_metadata(&self.path)?;
+        if !actual.is_file()
+            || !named.is_file()
+            || actual.uid() != rustix::process::geteuid().as_raw()
+            || actual.nlink() != 1
+            || actual.mode() & 0o022 != 0
+            || (actual.dev(), actual.ino()) != (named.dev(), named.ino())
+        {
+            return Err(StorageError::Invalid(
+                "coordinator ownership lock changed or unsafe".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

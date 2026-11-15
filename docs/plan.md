@@ -613,3 +613,41 @@ private fixture の source retention 26件、retry 関連25件、toolchain 63件
 forward upload 1件と strict all-target/all-feature clippy、fmt/diff check が成功した（群間に重複あり）。
 source subprocess helper 2件は standalone ignored で、親テストが必要時に直接起動する。
 全体 CI / push / 実削除の検証は A の対象外とする。
+
+
+### S15 source retention B: bounded explicit deletion (resident disabled)
+
+B adds an explicit parent-only `SourceStore::retention_page`; no resident caller or Vault erasure is enabled.
+Source EX is acquired nonblocking before coordinator actor work and held through synchronous physical IO/commit.
+The configured writable coordinator is matched to held source/state identities and SQLite's actual main connection
+via actor-local `SQLITE_FCNTL_HAS_MOVED` (unknown/unsupported/moved fails closed without opening a validation DB FD).
+Exact run/source-ref digest, sealed manifest and FD-read private run binding precede a permanent run-expiry fence.
+Every generation must be known/typed terminal with mandatory collection closed; queued/retry generations block.
+The history proof intentionally scans a run's history, so it is not described as constant-time.
+Direct create_task/create_attempt now take source SH and consult the run fence; terminal/result updates are unchanged.
+
+Each page selects <=32 indexed memberships or <=32 pending exact claims, with separate examined/path counters.
+Only exact membership PK rows are released; root/graph/object/run tombstones remain and no cascade/directory walk
+is used. Incomplete/unknown/import/legacy and shared memberships retain protection. Clock Hold forbids expiry,
+new claims AND replay unlink. A durable claim includes store/ancestor identity, incarnation, safe relative class/path,
+leaf dev/inode/size/UID/link/mode/timestamps and verified content digest before any unlink. Root/ancestors are
+NOFOLLOW-opened and checked again before FD-relative leaf unlink; directories are never removed. Data 0644 and
+nested owner-controlled 0755 directories are accepted under the private 0700 source root; index/lock rules stay 0600.
+Claimed NotFound alone allows parent fsync + durable completion. Errors retain claims/data. Completed claim records
+are permanent, excluded from replay, and atomically reserve a higher publication incarnation before same-ID reuse.
+Old run fences remain permanent. No source expiry is created for Vault-only SecretUnavailable.
+
+Content hashing (new proof plus replay) shares 64MiB/page; a new leaf above 32MiB or insufficient remaining budget
+is Unknown and retained. Initial sealed parent-manifest eligibility validation separately has a 64MiB bound and is
+cached across member pages. Unproven large legacy inputs are explicitly not fully covered. Source registration still
+uses the separate nondeleting preview; B Holds until bounded registration is known complete. C must thread trusted
+clock/config samples, owned blocking shutdown/cancellation drain, parent-only Vault semantics and resident scheduling,
+then obtain deletion-focused review before automatic deletion. No real user state is a test fixture.
+
+B focused verification completed on private fixtures: source retention44 passed plus2 standalone-ignored owned
+subprocess helpers, retry-filter25 passed, strict all-target/all-feature clippy, fmt and diff checks passed.
+New tests include33/65 refs,65-submodule graph and read counters, exact owner/DB/run digest, retired-current-generation
+queue exclusion, permanent directAPI fences, clock-Hold replay, claim/unlink/fsync/completion crash points,
+claimed/unclaimed missing, same-ID next incarnation, root/ancestor/leaf/symlink/hardlink/mode/path mismatch,
+owner-lock replacement, pending roots and sparse oversized leaf retention. Source preview and reader/IPC/async
+cancellation guard regressions remain green. Full local-ci/MSRV/Linux/remote/native/runtime-GC acceptance is not claimed.
