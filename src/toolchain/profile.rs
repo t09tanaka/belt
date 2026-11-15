@@ -287,10 +287,28 @@ impl Profile {
     /// registered optional tools, bounded to 14 fixed calls ×
     /// 300ms, and no source command or script can be supplied over the wire.
     pub fn report(&self) -> WorkerCapabilities {
+        self.measured_report(false)
+    }
+    /// Warm cold native launchers before publishing the resident baseline.
+    /// Retry only unknown observations, once, with the same 300ms deadline.
+    /// At most 28 fixed calls take 8.4s; absent or persistently unknown tools
+    /// remain unavailable/unknown and do not prevent unconstrained shell work.
+    pub(crate) fn startup_report(&self) -> WorkerCapabilities {
+        self.measured_report(true)
+    }
+    fn measured_report(&self, startup: bool) -> WorkerCapabilities {
         let files_before = self.executable_identity();
         let tools: BTreeMap<_, _> = TOOLS
             .iter()
-            .map(|t| (t.to_string(), self.probe(t)))
+            .map(|t| {
+                let observed = self.probe(t);
+                let observed = if startup && observed == ToolObservation::Unknown {
+                    self.probe(t)
+                } else {
+                    observed
+                };
+                (t.to_string(), observed)
+            })
             .collect();
         let os = match std::env::consts::OS {
             "macos" => "macos",
@@ -786,6 +804,60 @@ mod tests {
             profile.report().profile_fingerprint,
             initial.profile_fingerprint
         );
+    }
+
+    #[test]
+    fn startup_cold_probe_recovers_before_publishing_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("warmed");
+        // The first owned probe times out after recording its cold launch;
+        // subsequent invocations succeed without changing executable identity.
+        fake(
+            root.path(),
+            "node",
+            &format!(
+            "if [ ! -f {marker:?} ]; then echo warm > {marker:?}; /bin/sleep 2; fi\necho v22.0.0"
+        ),
+            0o700,
+        );
+        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        let initial = profile.startup_report();
+        assert!(matches!(
+            initial.tools["node"],
+            ToolObservation::Available { .. }
+        ));
+        let live = profile.report();
+        assert_eq!(live.tools["node"], initial.tools["node"]);
+        assert_eq!(live.profile_fingerprint, initial.profile_fingerprint);
+    }
+
+    #[test]
+    fn startup_unknown_stays_honest_and_late_success_invalidates_baseline() {
+        let root = tempfile::tempdir().unwrap();
+        let marker = root.path().join("ready");
+        fake(
+            root.path(),
+            "docker",
+            &format!("if [ -f {marker:?} ]; then echo 27.0.0; else exit 1; fi"),
+            0o700,
+        );
+        let profile = Profile::load(root.path(), &env(root.path())).unwrap();
+        let initial = profile.startup_report();
+        assert_eq!(initial.tools["docker"], ToolObservation::Unknown);
+        assert_eq!(initial.tools["node"], ToolObservation::Unavailable);
+        assert!(super::super::capability::missing_with_installable(
+            &super::super::capability::ExecutionRequirements::default(),
+            Some(&initial),
+            None
+        )
+        .is_empty());
+        fs::write(marker, "ready").unwrap();
+        let live = profile.report();
+        assert!(matches!(
+            live.tools["docker"],
+            ToolObservation::Available { .. }
+        ));
+        assert_ne!(live.profile_fingerprint, initial.profile_fingerprint);
     }
 
     #[test]

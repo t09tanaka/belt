@@ -587,3 +587,11 @@ mutation routing traceではGit起動がfixture開始7秒後となり、5秒でr
 `a665cf7` の再検証は通常Ubuntu名のbootstrapで同じEnvironmentMismatchが再発したため、16分43秒で早期取消した。通常macOS名は1604件成功、MSRV名は成功（実Rust1.100）、coverage/変異は未完了。profileのKnown→Unknown subsetだけでは全不一致の解消を証明できない。拒否規則を弱めず、実体/観測変化・起動時未知の既知化・固定baseline拒否を静的な安全分類で識別する診断を追加した。既存profile/worker拒否と機密値除外の9テスト、strict clippyが成功。次はnormal jobへ絞った同じlocal-ci環境で原因を確認し、最終の全体9ジョブは別途必須とする。
 
 ユーザーは承認案に示した条件でsource/Vault自動消去の実装・有効化を明示許可した。親state内のみ、sourceは既定7日と全世代終了・必須回収完了・共有/pending参照無し、Vaultは終了・必須回収完了を条件に、32件以下のpage・永続claim・時計異常時の保留・旧claim再実行防止を必須とする。元ファイル/元secret/鍵/Git refsは対象外。Aのtoken/reader/fence下地は別branchで実装・安全レビュー中で、実expiry/unlinkとVault protocol/resident有効化はB/Cの必須残件。元の内容address IDを変えず、新publication incarnationと旧runの永続失効を区別する。承認の再確認は不要だが、有効化前の削除専任レビューと検証は省略しない。
+
+### 起動時 native profile attestation の bounded warm measurement
+
+`252c311` の normal-only local-ci は bootstrap の `profile_gained_observation` を確認して部分実行で取消した。起動時 Unknown が後の Available へ変わる方向を診断できたが、全体 gate の成功ではない。runtime 構築時の最初の report が resident fingerprint を固定していたため、cold launcher の一時 timeout がそのまま baseline になっていた。
+
+runtime 構築時だけ `startup_report` を使い、Unknown の固定 native probe を同じ 300ms 制限で一度だけ再測定してから最終 report と baseline を作る。各 pass は xcode の SDK probe を含め最大14 calls、startup report は最大28 calls / 8.4秒の probe 待ち。required tool の load 時検査と最初の live report を各4.2秒として計16.8秒の probe 待ちであり、20秒 bootstrap に対する残り時間にはプロセス起動・ファイル処理等の overhead が入る。無制限の収束待ちや完全な遅延耐性は保証しない。
+
+missing binary は Unavailable、再測定しても失敗する Docker 等は Unknown のままなので制約なし shell を妨げない。初回の Unknown report/fingerprint は公開せず、成功も実測値のみを使う。公開後の Unknown→Available は引き続き identity を無効化し、known version・executable・context drift、required tool と frozen baseline の fail-closed 判定は変更しない。private cold script が初回 timeout→再測定成功を決定的に再現し、再測定除去の退行が同じ availability assertion で失敗することを確認した。profile 7件と最終 toolchain 65件、strict clippy all-targets、fmt/diff check と、元の失敗対象 `bootstrap::configured_cli_submit_captures_worktree_and_secrets_then_outlives_caller` の単体実行が成功した。normal matrix と全体 CI は統合後に別途必須。

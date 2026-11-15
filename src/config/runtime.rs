@@ -147,7 +147,7 @@ impl ResolvedConfig {
         let profile = crate::toolchain::profile::Profile::load(&inputs.state_dir, &inputs.env)
             .map_err(|e| super::ConfigError::Invalid { problems: vec![e] })?;
         agent.profile = profile.name().into();
-        agent.profile_fingerprint = profile.report().profile_fingerprint;
+        agent.profile_fingerprint = profile.startup_report().profile_fingerprint;
         let profile_definition = profile.definition_digest().clone();
         let env = profile.environment().clone();
         agent.capability_profile = Some(Arc::new(profile));
