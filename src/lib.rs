@@ -11,6 +11,7 @@ mod cleanup;
 pub mod complete;
 pub mod config;
 pub mod context;
+pub mod cpu;
 pub mod dag;
 pub mod demand;
 mod digest;

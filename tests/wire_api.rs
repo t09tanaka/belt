@@ -214,6 +214,7 @@ fn run_result(dir: &str) -> RunResult {
         changed_files: 1,
         mode: "changes".into(),
         state: "success".into(),
+        cpu: None,
         description: "success: pass 1 / fail 0 / error 0 / skip 0".into(),
         secs: 2.0,
         run_dir: dir.into(),
@@ -273,6 +274,25 @@ fn the_json_of_a_run_is_what_it_was() {
         (saved.sha.as_str(), saved.state.as_str()),
         ("abc", "success")
     );
+}
+
+#[test]
+fn the_cpu_share_of_a_run_crosses_and_is_left_out_without_one() {
+    let mut r = run_result("/runs/r1");
+    let text = serde_json::to_string(&WireRunResult::from_run_result(&r).unwrap()).unwrap();
+    assert!(!text.contains("\"cpu\""), "{text}");
+    r.cpu = Some(local_ci::cpu::Share {
+        budget: 8,
+        jobs_at_once: 2,
+        threads_per_job: 4,
+    });
+    let text = serde_json::to_string(&WireRunResult::from_run_result(&r).unwrap()).unwrap();
+    assert!(text.contains("\"cpu\":{"), "{text}");
+    let back = WireRunResult::from_json(&text)
+        .unwrap()
+        .into_run_result("/mine/r9".into())
+        .unwrap();
+    assert_eq!(back.cpu, r.cpu);
 }
 
 #[test]

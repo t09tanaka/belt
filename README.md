@@ -78,6 +78,12 @@ Common options (`plan` and `run`):
 `run` also takes `--parallel <n>`, `--containers <n>`, `--no-traffic-controller`, `--no-portool`, `--no-status`, `--keep`
 (keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>` and `--json`.
 
+`--parallel <n>` is the number of units that run at once. Without it, every
+unit (up to 16) starts when task-traffic-controller is installed, as each
+step then waits there for CPU; without task-traffic-controller it is 4. It is
+also the number of jobs the CPU is divided between (see
+[the CPU share of a job](#the-cpu-share-of-a-job)).
+
 ## `.local-ci.toml`
 
 An optional file at the repository root. Like the workflows, it is read from
@@ -202,7 +208,8 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    theirs alone. Either way, at most
    `--containers` exclusive jobs (default 2) run at once on the machine, across
    all `local-ci` runs, so databases do not pile up while their tests wait
-   for CPU.
+   for CPU. Jobs that run at once each get a share of the CPU (see
+   [the CPU share of a job](#the-cpu-share-of-a-job)).
 4. **Report.** One line per job, the tail of each failing step, where the logs
    are, and the overall state: `success`, `failure`, `error`, `incomplete` (parts that cannot be reproduced here were skipped, or a workflow could not be run at all; `--json` lists them under `completeness.incomplete` and the exit code is 3) or `no_work` (nothing is triggered). `success` is only for a run whose result has everything the plan expects. A job that
    waited a second or more for something says what it waited for and how long
@@ -220,6 +227,71 @@ they end.
 5. **Commit status.** The state is posted as the `local-ci` commit status with
    `gh` when the commit is on GitHub. Before you push it is not; run
    `local-ci status` after pushing. `--no-status` skips this.
+
+### The CPU share of a job
+
+A build or a test runner uses every core unless it is told otherwise. Nine
+jobs at once would each start as many threads as the machine has cores, and
+tests time out that pass on CI, where each job has a runner of its own. So
+the jobs of a run divide the CPU between them:
+
+- **What is divided** (the budget): task-traffic-controller's budget (the
+  `budget` of its configuration, by default the logical cores) when steps
+  are wrapped in it, else the logical cores of the machine.
+- **Between how many jobs**: `--parallel <n>` when it is given. Otherwise,
+  with task-traffic-controller, as many as get 4 threads each (`budget / 4`,
+  at least one): three jobs with four threads each rather than twelve with
+  one. Without task-traffic-controller, the 4 units that run at once. Never
+  more than the jobs the run can have running at once (its units, and with
+  task-traffic-controller the entries of their matrices).
+- **The share** is the budget divided by that number, rounded down, at least 1.
+
+Each `run:` step of a job is then given the share in two ways:
+
+- In its environment, as `CARGO_BUILD_JOBS`, `NEXTEST_TEST_THREADS` and
+  `RUST_TEST_THREADS`. A variable that is already set is left as it is: in
+  the environment `local-ci` is started with, in the workflow's, the job's
+  or the step's `env:`, or by an earlier step through `$GITHUB_ENV`. A tool
+  that reads none of the three is not limited: pass it the share yourself
+  (`--jobs "$CARGO_BUILD_JOBS"`), or set its own variable in the job's `env:`.
+  These variables win over a repository's own `build.jobs` in
+  `.cargo/config.toml` and `test-threads` in `.config/nextest.toml`; set the
+  variable in the job's `env:` to keep a number of your own.
+- As the weight it asks task-traffic-controller for (`exec --weight
+  <share>`), so the steps that run at once are the ones whose shares fit the
+  budget, and the rest wait there. (task-traffic-controller lets a step of a
+  nested run start after a long wait although the budget is full, 10 minutes
+  by default, so that nothing waits for ever: with jobs longer than that the
+  shares can add up to more than the budget.) The checks themselves are not
+  changed: nothing is skipped and no timeout is shortened.
+
+A job that has the whole budget is not limited: no variable is set and
+task-traffic-controller works the weight out from earlier runs, as before.
+That is a run whose jobs never run together: a single unit without a matrix
+(or with a matrix under `strategy.max-parallel: 1`, or of an exclusive job
+that holds the repository lock, whose entries run one after another), or a
+budget under 8 with task-traffic-controller. `--parallel 1` limits nothing
+by itself: the entries of a matrix still run together, and they divide the
+budget between them. Setup steps run before the jobs, alone, and are not
+limited either.
+
+An empty variable counts as not set: `CARGO_BUILD_JOBS=` in the environment
+`local-ci` is started with is replaced by the share.
+
+When task-traffic-controller gates the steps but its budget cannot be read
+(`task-traffic-controller inspect` fails, as in an older version, or has no
+budget), the jobs are not limited: no variable is set, no weight is asked
+for, and `local-ci` prints a warning once. A weight above a budget that is
+not known could never be admitted.
+
+The share is worked out by `local-ci run` only. A library caller of
+`execute_plan` runs the jobs unlimited, unless it sets `Runner::job_threads`
+itself; the `cpu` of a run result does cross the wire (`WireRunResult`) when
+there is one.
+
+When jobs are limited, the summary says how
+(`cpu    budget 12 · 3 jobs at once · 4 threads each`), and `result.json` and
+`--json` have it as `cpu`: `budget`, `jobs_at_once` and `threads_per_job`.
 
 ## What is supported
 
@@ -332,6 +404,15 @@ into a prefix of the run, so neither changes your machine.
 - **[task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller)**: when it is installed,
   every `run:` step, setup included, is wrapped in `task-traffic-controller exec`, so heavy steps
   wait for CPU instead of piling up. Timeouts start when the step gets its turn.
+  The steps of jobs that run at once ask for the job's
+  [CPU share](#the-cpu-share-of-a-job) as their weight. Running `local-ci`
+  itself under it needs task-traffic-controller 0.9 or later, where a nested
+  `exec` waits for its turn too (before 0.9 it started at once, and every job
+  ran on every core). Give the outer command a small weight, as `local-ci`
+  only starts the steps and waits for them:
+  `task-traffic-controller exec --weight 1 -- local-ci run`. The steps then
+  take from the budget what they ask for, and no more is held for `local-ci`
+  itself.
 - **[portool](https://github.com/t09tanaka/portool)**: in a repository with a
   `.portool.toml`, each exclusive job without `services:` asks portool for a
   port block of its own

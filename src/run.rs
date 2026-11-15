@@ -462,6 +462,10 @@ pub fn freeze(ctx: &ExecContext, repo: &Repo, p: plan::Plan, t: &Target) -> Resu
 /// `ws.run_dir` must be new and unique to this run (see [`claim_run_dir`]):
 /// the run's artifacts are laid out in it, and one that has artifacts already
 /// (another run's, or an earlier call's) is refused before anything starts.
+///
+/// The jobs are not given a CPU share (see [`crate::cpu`]) here: the share is
+/// worked out by `local-ci run` only, which knows the budget and `--parallel`.
+/// A caller that wants one sets [`exec::Runner::job_threads`] itself.
 pub fn execute_plan(
     ctx: &ExecContext,
     fp: &FrozenPlan,
@@ -476,7 +480,7 @@ pub fn execute_plan(
             ws.run_dir.display()
         );
     }
-    run_plan(ctx, fp, ws, opts)
+    run_plan(ctx, fp, ws, opts, None)
 }
 
 /// [`execute_plan`] without the check of the run directory, for a run that
@@ -486,6 +490,8 @@ fn run_plan(
     fp: &FrozenPlan,
     ws: &exec::Workspace,
     opts: exec::Opts,
+    // how the CPU is divided between the jobs, when it is
+    cpu: Option<crate::cpu::Share>,
 ) -> Result<report::RunResult> {
     let t0 = std::time::Instant::now();
     let nothing = fp.units.is_empty();
@@ -500,6 +506,7 @@ fn run_plan(
     }
     let keep = opts.keep;
     let mut runner = exec::Runner::new(ctx, fp, ws, opts)?;
+    runner.job_threads = cpu.map(|c| c.threads_per_job);
     let result = (|| -> Result<_> {
         runner.prepare_tools()?;
         // Each task has a recipe of its own. This run does them in the one
@@ -540,13 +547,15 @@ fn run_plan(
         runner.release_ports(&ws.root)?;
     }
     let (setup, units) = result?;
-    report::assemble(
+    let mut r = report::assemble(
         fp,
         ws.run_dir.clone(),
         setup,
         units,
         t0.elapsed().as_secs_f64(),
-    )
+    )?;
+    r.cpu = cpu;
+    Ok(r)
 }
 
 pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<RunReport> {
@@ -700,6 +709,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             owner.legacy()
         ));
     }
+    let mut cpu = None;
     let (setup, units) = if fp.units.is_empty() {
         (vec![], vec![])
     } else {
@@ -725,20 +735,47 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         } else {
             ctx.find_tool("task-traffic-controller")
         };
-        let parallel = a.parallel.unwrap_or(if traffic_controller.is_some() {
+        // The controller admits the steps, so every unit may start; without
+        // it the places are all that keeps the units apart.
+        let gated = traffic_controller.is_some();
+        let parallel = a.parallel.unwrap_or(if gated {
             fp.units.len().clamp(1, 16)
         } else {
-            4
+            crate::cpu::UNGATED_PARALLEL
         });
+        // What the jobs divide: the controller's budget, as the steps wait
+        // for it there, or the cores of this machine. The entries of a matrix
+        // run together only with the controller.
+        let portool = if a.no_portool {
+            None
+        } else {
+            ctx.find_tool("portool")
+        };
+        let isolated = portool.is_some() && wt.join(".portool.toml").is_file();
+        let peak = crate::cpu::peak(&fp, gated, isolated, parallel);
+        // one job at a time has it all: nothing to ask the controller
+        if peak > 1 {
+            let budget = match traffic_controller.as_deref() {
+                Some(c) => match crate::cpu::controller_budget(ctx, c) {
+                    Ok(b) => Some(b),
+                    // a weight above a budget that is not known could never
+                    // be admitted, and an older controller has no `inspect`
+                    Err(why) => {
+                        obs.notice(&format!(
+                            "the CPU share of the jobs is off: task-traffic-controller {why}, so its budget is not known"
+                        ));
+                        None
+                    }
+                },
+                None => Some(crate::cpu::cores()),
+            };
+            cpu = budget.and_then(|b| crate::cpu::share(b, a.parallel, gated, peak));
+        }
         let opts = exec::Opts {
             parallel,
             traffic_controller,
             executor: None,
-            portool: if a.no_portool {
-                None
-            } else {
-                ctx.find_tool("portool")
-            },
+            portool,
             containers: a.containers,
             job_timeout_min: a.job_timeout,
             keep: a.keep,
@@ -751,7 +788,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             tools: tools.clone(),
             lock_file: cache.join("locks").join(format!("{key}.lock")),
         };
-        let result = run_plan(ctx, &fp, &ws, opts);
+        let result = run_plan(ctx, &fp, &ws, opts, cpu);
         if a.keep {
             owner.keep();
             obs.notice(&format!("kept worktree {}", report::tilde(&wt, ctx.home())));
@@ -803,6 +840,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
         units,
         t_start.elapsed().as_secs_f64(),
     )?;
+    let result = report::RunResult { cpu, ..result };
     exec::write_json(&run_dir.join("result.json"), &result)?;
     std::fs::write(runs.join("last"), run_dir.to_string_lossy().as_bytes())?;
     prune_runs(&runs, 20);
