@@ -369,7 +369,7 @@ impl Profile {
     /// A tool that is absent, fails, or still times out stays
     /// unavailable/unknown and does not prevent unconstrained shell work; if it
     /// answers after this baseline, that is drift.
-    pub(crate) fn startup_report(&self) -> WorkerCapabilities {
+    pub fn startup_report(&self) -> WorkerCapabilities {
         self.measured_report(Some(STARTUP_PROBES))
     }
     fn measured_report(&self, startup: Option<StartupProbes>) -> WorkerCapabilities {

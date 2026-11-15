@@ -3928,7 +3928,7 @@ async fn capabilities_detect_tool_drift_but_keep_accepted_replays_idempotent() {
     .unwrap();
     let mut cfg = f.cfg("boot-1");
     cfg.profile = profile.name().into();
-    cfg.profile_fingerprint = profile.report().profile_fingerprint;
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
     cfg.capability_profile = Some(Arc::new(profile));
     let agent = f.start_with(cfg);
     let client = f.connect(&agent).await;
@@ -3981,7 +3981,7 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
         .unwrap();
         let mut cfg = f.cfg("boot-1");
         cfg.profile = profile.name().into();
-        cfg.profile_fingerprint = profile.report().profile_fingerprint;
+        cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
         cfg.capability_profile = Some(Arc::new(profile));
         let agent = f.start_with(cfg);
         let client = f.connect(&agent).await;
@@ -4024,7 +4024,7 @@ async fn capability_negotiation_is_required_even_if_worker_has_the_profile() {
     )
     .unwrap();
     let mut cfg = f.cfg("boot-1");
-    cfg.profile_fingerprint = profile.report().profile_fingerprint;
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
     cfg.capability_profile = Some(Arc::new(profile));
     let agent = f.start_with(cfg);
     let (a, b) = duplex_pair(64 * 1024);
