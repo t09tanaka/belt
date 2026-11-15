@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## [0.14.0] - 2026-11-15
 
 - Stop leaking worktrees in the cache directory. A run now also removes its worktrees, copies and tools directory when it is stopped with `SIGTERM` or `SIGHUP` (before, only Ctrl-C was handled, and only once the checkout was made) or when it panics. Each run holds a lock on `wt/.owner-<pid>`, and every run starts by removing the entries whose owner is gone (killed, crashed), dropping their `git worktree` registration and deleting what earlier deletions left in `trash/`. Entries of a live run are never touched; age is not used.
 - A run stopped with `SIGTERM` or `SIGHUP` cleans up and then ends by that signal, so whoever waits for it sees the signal and not an exit code. Ctrl-C still exits with 130. A signal that was ignored when local-ci started (`nohup local-ci run …`) stays ignored.
@@ -12,7 +12,7 @@
 - A run fails at its start when another live process with the same pid holds its owner file: the cache directory is then shared between pid namespaces (containers that mount it, a network file system), which is not supported. Give each its own `LOCAL_CI_HOME`.
 - `Observer::executing` is now called before the worktree is created (it was called after the checkout), so a signal during the checkout is handled. An observer that took the call to mean that the worktree exists has to stop doing so.
 
-## [0.13.0] - Unreleased
+## [0.13.0] - 2026-11-14
 
 - Execute frozen tasks from verified captured workspaces with source-aware Git HEAD/index checks and recursive submodule payload verification.
 - Isolate concurrent captured invocations, matrix workspaces, scripts and Compose resources while preserving setup state across task execution and trusted worker recovery.
