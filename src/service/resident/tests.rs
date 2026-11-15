@@ -357,7 +357,9 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool, in
         worker_state_dir: root.path().join("worker"),
         worker_id: WorkerId::parse("local").unwrap(),
         cluster_key_path: root.path().join("key"),
-        executable: "/usr/bin/false".into(),
+        // Never started: the live owner answers. A private name instead of a
+        // system tool, whose path is a symlink on some hosts and is refused.
+        executable: root.path().join("owner-is-already-running"),
         env: BTreeMap::from([
             ("HOME".into(), root.path().display().to_string()),
             ("PATH".into(), "/usr/bin:/bin".into()),
@@ -366,6 +368,11 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool, in
         expected_cluster: Some(client.cluster_id().clone()),
         managed_service: None,
     };
+    // The spec itself must reach the live owner; a refused spec would only
+    // show below as an unacknowledged cancellation.
+    crate::service::bootstrap::ensure(spec.clone())
+        .await
+        .expect("spec reaches the live owner");
     let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let target = crate::service::completion::Target::Run(run.clone());
     let pending = crate::service::control::cancel_and_stop(
@@ -732,6 +739,12 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
 }
 
 pub(super) async fn delivery_resident(root: &Path) -> Resident {
+    delivery_resident_on(root, "/usr/bin:/bin").await
+}
+/// `path` is the tool search path of the worker profile. Every worker
+/// inspection measures the native tools found there, one bounded subprocess
+/// each.
+async fn delivery_resident_on(root: &Path, path: &str) -> Resident {
     crate::secrets::key::init(&root.join("key")).unwrap();
     let config = crate::config::resolve(&crate::config::Inputs {
         overlay: &crate::config::Overlay::default(),
@@ -751,7 +764,7 @@ pub(super) async fn delivery_resident(root: &Path) -> Resident {
                 supervisor_exe: "/bin/false".into(),
                 cluster_key_path: root.join("key"),
                 env: BTreeMap::from([
-                    ("PATH".into(), "/usr/bin:/bin".into()),
+                    ("PATH".into(), path.into()),
                     ("HOME".into(), root.display().to_string()),
                 ]),
             },
@@ -1551,7 +1564,31 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
         .prefix("rtr-estimate-")
         .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
         .unwrap();
-    let resident = delivery_resident(root.path()).await;
+    // Each of the 200 reads inspects the worker, and an inspection measures
+    // every native tool on the profile path with one subprocess each. On
+    // macOS /usr/bin holds launchers for git, xcodebuild, java, python3 and
+    // ruby; the git launcher alone starts xcodebuild and takes a third of a
+    // second, which made these reads last minutes. The profile here searches
+    // a private directory with one tool: a git that answers the version
+    // question itself (with the oldest version a worker accepts) and hands
+    // every other call to the host git.
+    let tools = root.path().join("tools");
+    std::fs::create_dir(&tools).unwrap();
+    let git = tools.join("git");
+    // Written by a child process: no descriptor of this multi-threaded test
+    // process is ever open for writing on a file that is executed.
+    let status = std::process::Command::new("/bin/sh")
+        .arg("-c")
+        .arg(
+            "printf '%s\\n' '#!/bin/sh' \
+             'if [ \"$1\" = --version ]; then echo \"git version 2.31.0\"; exit 0; fi' \
+             'exec /usr/bin/git \"$@\"' > \"$0\" && chmod 700 \"$0\"",
+        )
+        .arg(&git)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let resident = delivery_resident_on(root.path(), tools.to_str().unwrap()).await;
     let coordinator = resident.coordinator.clone();
     let gate = resident.input_gate.clone();
     let client = resident.client();
@@ -1706,27 +1743,48 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
     let before_traffic = files(&root.path().join("worker/traffic"));
     let before_epoch = coordinator.epoch();
     let runner = tokio::spawn(resident.run());
-    for _ in 0..100 {
-        let query = crate::service::estimate::Query {
+    // One read holds its worker inspection for a live CPU sample of 300 ms
+    // (task-traffic-controller), so 200 reads one after another cannot take
+    // less than a minute. The same 100 reads are sent 20 at a time; every
+    // reply is still checked.
+    async fn hundred_reads(client: &Client, operation: impl Fn() -> Operation) -> Vec<Reply> {
+        let mut replies = vec![];
+        for _ in 0..5 {
+            let mut wave = tokio::task::JoinSet::new();
+            for _ in 0..20 {
+                let client = client.clone();
+                let operation = operation();
+                wave.spawn(async move { client.request(operation).await.unwrap() });
+            }
+            while let Some(reply) = wave.join_next().await {
+                replies.push(reply.unwrap());
+            }
+        }
+        assert_eq!(replies.len(), 100);
+        replies
+    }
+    let fresh = hundred_reads(&client, || Operation::Estimate {
+        query: crate::service::estimate::Query {
             version: 1,
             argv: vec!["echo".into()],
             repository_id: None,
             cwd_relative: String::new(),
             requirements: Default::default(),
-        };
-        match client.request(Operation::Estimate { query }).await.unwrap() {
+        },
+    })
+    .await;
+    for reply in fresh {
+        match reply {
             Reply::Estimate { estimate } => assert!(estimate.online && estimate.conditional),
             other => panic!("unexpected estimate reply: {other:?}"),
         }
     }
-    for _ in 0..100 {
-        match client
-            .request(Operation::EstimateTask {
-                task_id: task_id.clone(),
-            })
-            .await
-            .unwrap()
-        {
+    let known = hundred_reads(&client, || Operation::EstimateTask {
+        task_id: task_id.clone(),
+    })
+    .await;
+    for reply in known {
+        match reply {
             Reply::Estimate { estimate } => {
                 assert!(estimate.online && estimate.conditional);
                 assert_eq!(estimate.source_kind, "captured");
