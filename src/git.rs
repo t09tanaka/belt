@@ -645,6 +645,9 @@ pub fn prune_worktrees(ctx: &ExecContext, repo: &Path) -> Result<()> {
 pub fn move_to_trash(path: &Path, trash: &Path) -> Option<PathBuf> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     std::fs::create_dir_all(trash).ok()?;
+    if !is_real_dir(trash) {
+        return None;
+    }
     let mut name = path.file_name()?.to_os_string();
     name.push(format!(
         ".{}.{}",
@@ -655,7 +658,16 @@ pub fn move_to_trash(path: &Path, trash: &Path) -> Option<PathBuf> {
     std::fs::rename(path, &target).ok().map(|()| target)
 }
 
+/// A directory itself, not a link to one: what is behind a link is not
+/// local-ci's to list or delete.
+pub fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
 fn trashed(trash: &Path) -> Vec<PathBuf> {
+    if !is_real_dir(trash) {
+        return Vec::new();
+    }
     std::fs::read_dir(trash)
         .into_iter()
         .flatten()

@@ -172,6 +172,9 @@ fn scan(cache: &Path) -> (Vec<Entry>, BTreeSet<u32>) {
     let mut states: BTreeMap<u32, State> = BTreeMap::new();
     let mut entries = Vec::new();
     let mut owners = BTreeSet::new();
+    if !crate::git::is_real_dir(&cache.join("wt")) {
+        return (entries, owners);
+    }
     for e in std::fs::read_dir(cache.join("wt"))
         .into_iter()
         .flatten()
@@ -201,6 +204,9 @@ fn scan(cache: &Path) -> (Vec<Entry>, BTreeSet<u32>) {
 
 /// The entries whose name ends with `pid`.
 fn names_of(cache: &Path, pid: u32) -> BTreeSet<OsString> {
+    if !crate::git::is_real_dir(&cache.join("wt")) {
+        return BTreeSet::new();
+    }
     std::fs::read_dir(cache.join("wt"))
         .into_iter()
         .flatten()
@@ -691,6 +697,27 @@ mod tests {
             std::fs::read_to_string(outside.join("sub/precious")).unwrap(),
             "data"
         );
+    }
+
+    #[test]
+    fn a_trash_or_a_wt_that_is_a_link_out_of_the_cache_is_left_alone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path().join("cache");
+        let outside = tmp.path().join("outside");
+        let pid = dead_pid();
+        for d in ["trash", "wt"] {
+            let target = outside.join(d);
+            std::fs::create_dir_all(target.join(format!("abc1234-{pid}"))).unwrap();
+            std::fs::write(target.join("precious"), "data").unwrap();
+            std::fs::create_dir_all(&cache).unwrap();
+            std::os::unix::fs::symlink(&target, cache.join(d)).unwrap();
+        }
+        assert!(prune(&ctx(), &cache, true).unwrap().removed.is_empty());
+        crate::git::empty_trash(&ctx(), &cache.join("trash"));
+        for d in ["trash", "wt"] {
+            assert!(outside.join(d).join(format!("abc1234-{pid}")).is_dir());
+            assert!(outside.join(d).join("precious").is_file());
+        }
     }
 
     #[test]

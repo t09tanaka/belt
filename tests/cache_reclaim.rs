@@ -138,7 +138,11 @@ impl Fixture {
             .spawn()
             .unwrap();
         let until = Instant::now() + Duration::from_secs(120);
-        while !self.tmp.path().join("started").exists() {
+        // every unit is in its step: no copy is still being made
+        while !["a", "b"]
+            .iter()
+            .all(|j| self.tmp.path().join(format!("started-{j}")).exists())
+        {
             assert!(Instant::now() < until, "no step started");
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -160,7 +164,7 @@ impl Fixture {
 /// most: a step orphaned by a killed run ends by itself).
 fn gated(f: &Path) -> String {
     format!(
-        "touch '{0}/started'; n=0; while [ -e '{0}/gate' ] && [ $n -lt 600 ]; do sleep 0.1; n=$((n+1)); done",
+        "touch '{0}/started-'$GITHUB_JOB; n=0; while [ -e '{0}/gate' ] && [ $n -lt 600 ]; do sleep 0.1; n=$((n+1)); done",
         f.display()
     )
 }
