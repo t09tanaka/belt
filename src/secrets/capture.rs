@@ -76,9 +76,13 @@ pub fn capture_run(
     request: &SourceRequest,
     params: &CaptureParams,
 ) -> Result<Captured, ApiError> {
-    let _mutation = store
-        .foreground_guard()
-        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    let _mutation = store.foreground_guard().map_err(|error| {
+        if error.is::<crate::source::retention::ForegroundBusy>() {
+            crate::source::classify::api_error_of(&error)
+        } else {
+            ApiError::new(ErrorCode::Internal, error.to_string())
+        }
+    })?;
     vault.ensure_run_available(run).map_err(|e| e.to_api())?;
     let (key, declared) = (inputs.key, inputs.declared);
     check_declared(declared).map_err(|l| ApiError::new(ErrorCode::InvalidInput, l.to_string()))?;

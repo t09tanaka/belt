@@ -897,3 +897,11 @@ unlockも検証した。旧MacのAccepted不一致logは実Replyを表示して�
 転送integration45件成功 (60.09秒)、strict all-target/all-feature clippy成功 (12.84秒)、
 fmt/diff check成功。actual Rust1.100。独立レビュー、親統合後の全9CI、Rust1.89/remote/native
 受入はこの修正では未実行。実user stateのGC、元ファイルやnative serviceへの操作はない。
+
+foreground最終追記: secret-aware公開capture_runでも明示ForegroundBusyだけを71へ維持し、
+一般IOの従来Internal分類は変更しない。実2秒の公開API回帰で、run/Vault/原本sentinelを
+変更しないことを確認した。親の事前点検に従い、wait中のprivate Source rootについても
+retained FDとnamed root双方のUID・private bits・同inodeを各回/成功後に検証する。
+root chmod755の負例を追加し、既存のlock mode/lock inode/root replacement拒否も保持する。
+nested755の許可範囲は変更しない。最終focused13件成功 (9.06秒)、追記後strict全target/feature
+成功 (12.75秒)、fmt/diff成功。先のunit105+integration45は追記前の8adb6a5での結果と区別する。

@@ -67,6 +67,17 @@ impl Index {
     }
     fn check_foreground_lock(&self, file: &File) -> Result<()> {
         self.current().context("check foreground source root")?;
+        let root = self.root.metadata()?;
+        let named_root = std::fs::symlink_metadata(&self.path)?;
+        ensure!(
+            named_root.is_dir()
+                && (root.dev(), root.ino()) == (named_root.dev(), named_root.ino())
+                && root.uid() == rustix::process::geteuid().as_raw()
+                && named_root.uid() == rustix::process::geteuid().as_raw()
+                && root.mode() & 0o077 == 0
+                && named_root.mode() & 0o077 == 0,
+            "unsafe foreground source root"
+        );
         let opened = file.metadata()?;
         ensure!(
             opened.is_file()
@@ -166,6 +177,35 @@ mod tests {
         assert!(store.mutation_guard().is_err());
     }
     #[test]
+    fn foreground_busy_stays_typed_through_secret_aware_capture() {
+        let (root, store) = store();
+        let input = root.path().join("original");
+        std::fs::create_dir(&input).unwrap();
+        std::fs::write(input.join("sentinel"), b"unchanged").unwrap();
+        let vault = crate::secrets::vault::Vault::open(root.path()).unwrap();
+        let key = crate::secrets::key::ClusterKey::from_bytes(vec![7; 32]).unwrap();
+        let run = crate::ids::RunId::generate();
+        let exclusive = store.retention.guard(true).unwrap();
+        let error = crate::secrets::capture::capture_run(
+            &Default::default(),
+            &store,
+            &vault,
+            &crate::secrets::capture::SecretInputs {
+                key: &key,
+                declared: &[],
+            },
+            &run,
+            &crate::source::SourceRequest::Directory { dir: input.clone() },
+            &Default::default(),
+        )
+        .unwrap_err();
+        assert_eq!(error.code, crate::error::ErrorCode::SourceBusy);
+        drop(exclusive);
+        assert!(store.source_of_run(&run).unwrap().is_none());
+        assert!(!vault.has(&run));
+        assert_eq!(std::fs::read(input.join("sentinel")).unwrap(), b"unchanged");
+    }
+    #[test]
     fn foreground_wait_rejects_replaced_permanent_lock_instead_of_reopening() {
         let (_root, store) = store();
         let _exclusive = store.retention.guard(true).unwrap();
@@ -191,33 +231,39 @@ mod tests {
     }
     #[test]
     fn foreground_wait_rejects_root_and_mode_drift() {
-        for replace_root in [true, false] {
+        for drift in ["root replacement", "lock mode", "root mode"] {
             let (root, store) = store();
             let _exclusive = store.retention.guard(true).unwrap();
             std::thread::scope(|scope| {
                 let waiting = scope.spawn(|| store.foreground_guard());
                 entered(&store);
-                if replace_root {
+                if drift == "root replacement" {
                     std::fs::rename(store.root(), root.path().join("old-sources")).unwrap();
                     std::fs::create_dir(store.root()).unwrap();
-                } else {
+                } else if drift == "lock mode" {
                     std::fs::set_permissions(
                         store.root().join("mutation.lock"),
                         std::fs::Permissions::from_mode(0o644),
                     )
                     .unwrap();
+                } else {
+                    std::fs::set_permissions(store.root(), std::fs::Permissions::from_mode(0o755))
+                        .unwrap();
                 }
                 let error = waiting.join().unwrap().unwrap_err();
                 assert!(!error.is::<ForegroundBusy>());
-                if replace_root {
+                if drift == "root replacement" {
                     std::fs::remove_dir(store.root()).unwrap();
                     std::fs::rename(root.path().join("old-sources"), store.root()).unwrap();
-                } else {
+                } else if drift == "lock mode" {
                     std::fs::set_permissions(
                         store.root().join("mutation.lock"),
                         std::fs::Permissions::from_mode(0o600),
                     )
                     .unwrap();
+                } else {
+                    std::fs::set_permissions(store.root(), std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
                 }
             });
         }
