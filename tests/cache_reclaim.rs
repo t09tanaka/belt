@@ -215,8 +215,19 @@ fn a_run_with_a_failing_job_leaves_nothing() {
 #[test]
 fn an_interrupted_run_leaves_nothing() {
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+        use std::os::unix::process::CommandExt;
         let f = gated_fixture();
-        let mut child = f.start_blocked();
+        let mut run = f.run();
+        // whatever the tests were started under (`nohup`), the run is not
+        // SAFETY: signal() is async-signal-safe, and nothing else runs
+        // between the fork and the exec.
+        unsafe {
+            run.pre_exec(move || {
+                libc::signal(sig, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        let mut child = f.start_blocked_with(run);
         assert!(!f.entries().is_empty());
         signal(&child, sig);
         let status = child.wait().unwrap();

@@ -453,7 +453,16 @@ pub fn enter<'a>(ctx: &'a ExecContext, cache: &Path) -> Result<Owner<'a>> {
             e.runs += 1;
             return Ok(0);
         }
-        let first = std::fs::symlink_metadata(&path).is_err();
+        // Entries with this pid and no owner file were made by a version
+        // that recorded none. They are marked before the owner file is
+        // there: from then on they are not taken for entries of this run,
+        // whatever becomes of it.
+        let mut legacy = 0;
+        if std::fs::symlink_metadata(&path).is_err() {
+            for name in names_of(cache, pid) {
+                legacy += usize::from(set_mark(cache, LEGACY, &name));
+            }
+        }
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -475,15 +484,6 @@ pub fn enter<'a>(ctx: &'a ExecContext, cache: &Path) -> Result<Owner<'a>> {
                 );
             }
             return Err(e).context("cannot lock the owner file of the worktrees");
-        }
-        // Entries with this pid and no owner file until now were made by a
-        // version that recorded none. Marked, they are not taken for entries
-        // of this run, whatever becomes of it.
-        let mut legacy = 0;
-        if first {
-            for name in names_of(cache, pid) {
-                legacy += usize::from(set_mark(cache, LEGACY, &name));
-            }
         }
         h.insert(
             path.clone(),
@@ -898,6 +898,31 @@ mod tests {
             assert!(outside.join(d).join(format!("abc1234-{pid}")).is_dir());
             assert!(outside.join(d).join("precious").is_file());
         }
+    }
+
+    #[test]
+    fn an_entry_that_cannot_go_to_the_trash_is_deleted_where_it_is() {
+        let c = Cache::new();
+        let outside = c.tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("precious"), "data").unwrap();
+        std::os::unix::fs::symlink(&outside, c.dir().join("trash")).unwrap();
+        let pid = dead_pid();
+        std::fs::write(owner_file(&c.dir(), pid), "").unwrap();
+        c.entry(&format!("abc1234-{pid}"));
+        // what a removal that was killed halfway left under its hidden name
+        std::fs::create_dir_all(c.wt(".gone-abc1234-4242.77.0/sub")).unwrap();
+        std::fs::create_dir_all(c.wt(".gone-fishing")).unwrap();
+
+        assert_eq!(prune(&ctx(), &c.dir(), false).unwrap().removed.len(), 1);
+        let mut left: Vec<String> = std::fs::read_dir(c.dir().join("wt"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, [".gone-fishing", ".lock"]);
+        assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 1);
+        assert!(outside.join("precious").is_file());
     }
 
     #[test]
