@@ -898,7 +898,14 @@ mod preparation_probe_tests {
     }
     #[test]
     fn preparation_probe_expired_io_keeps_owner_until_real_drain_and_releases_gate() {
-        let f = Arc::new(Fixture::new());
+        let mut fixture = Fixture::new();
+        let manager = std::fs::canonicalize(fixture._temp.path())
+            .unwrap()
+            .join("manager");
+        std::fs::write(&manager, b"private-manager-never-executed").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (registry, _, _) = small_install(&mut fixture, &manager);
+        let f = Arc::new(fixture);
         let weak = Arc::downgrade(&f.owner);
         let (entered, waiting) = std::sync::mpsc::sync_channel(0);
         let (release, resume) = std::sync::mpsc::sync_channel(0);
@@ -908,14 +915,15 @@ mod preparation_probe_tests {
                 child.input(),
                 Some(&child.profile),
                 Some(&child.fingerprint),
-                None,
+                Some(&registry),
                 || {
                     entered.send(()).unwrap();
                     resume.recv().unwrap();
                 },
             );
             let released = child.owner.probe_gate.try_lock().is_ok();
-            (probe, released)
+            let retained = adapters::probe_statistics().2;
+            (probe, released, retained)
         });
         waiting.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(f.owner.inner.try_lock().is_ok());
@@ -927,9 +935,13 @@ mod preparation_probe_tests {
         drop(f);
         assert!(weak.upgrade().is_some());
         release.send(()).unwrap();
-        let (probe, released) = task.join().unwrap();
+        let (probe, released, retained) = task.join().unwrap();
         assert_eq!(probe, Probe::Unknown(Unknown::ProfileUnavailable));
         assert!(released);
+        assert!(
+            retained > 0,
+            "paused query retained actual artifact descriptor identities"
+        );
         assert!(weak.upgrade().is_none());
     }
 }
