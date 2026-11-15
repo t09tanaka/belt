@@ -773,3 +773,11 @@ D 最終 focused 検証: resident 23件成功 (88.35s)、retention filter 69件�
 (28.36s)、strict all-target/all-feature clippy 成功 (12.35s)。128 terminal-task fixture の最大 status+tick latency は
 1.287625ms のサンプルで、任意履歴の最悪時間や定数CPUを保証しない。既存 estimate readonly fixture は Source SH
 で背景 GC を隔離した上で whole-source-file/DB snapshot を維持確認する。原本や実 user state は一切対象にしていない。
+
+### 準備 identity の元 sample freshness と stored-task preview 接続
+
+未公開の `preparation_probe_v1` を、normal profile report 完了時だけ採番する非再利用 sample sequence・native boot・元の completed monotonic stamp/5000ms TTL と、probe 最終 observed stamp を含む契約へ拡張した。completed snapshot が一時的に無くても sequence は戻さず、overflow は Unknown とする。二度の resolver が同じ実 sample を使い、全 IO 後も native boot・clock・元 TTL を再確認する。query は report/native command を呼ばず、sample を更新しない。
+
+`estimate --task ID` は、保存済みの完全 TaskSpec/source/run と選択 worker の preview profile/boot/epoch が揃う場合だけ、hello で feature 交渉済みの同じ attachment に一度だけ readonly probe を送る。command-only・source 不明・古い peer は Unknown のままである。IO 中は actor を保持せず、応答後に attachment/InputGate 世代・worker identity・owner/input/profile binding を再照合する。最大256 worker の private identity context、同時 query 全体1件、送信 input 256KiB と最大16 entry の上限を保つ。親 send 時刻から元 sample の age と observation TTL の最小残量を使い、受信から5秒を作らない。同じ sample の再送は最初の deadline を延長しない。identity の確認だけを preview assumption に表示し、setup scalar・ready delay・admission は変更しない。
+
+現在の producer Active は実 BuilderId/attempt の観測であり TTC command node の証明ではない。artifact の bounded 完全検証・正確な frozen activation の証明、実 TTC ledger identity と依存/resource graph の対応、既存 simulator への接続とユーザー経路の受入は引き続き必須残件である。ConcretePlan/producer 不在から cold/warm/0 を作らず、setup cost は Unknown を維持する。

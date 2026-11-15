@@ -12,6 +12,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -65,10 +66,12 @@ pub struct Profile {
     digest: Digest,
     report_identity: Arc<Mutex<Option<ReportIdentity>>>,
     completed_report: Arc<Mutex<Option<CompletedReport>>>,
+    report_sequence: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
 struct CompletedReport {
+    sequence: u64,
     boot: String,
     finished_ms: u64,
     files: Digest,
@@ -251,6 +254,7 @@ impl Profile {
             digest,
             report_identity: Arc::new(Mutex::new(None)),
             completed_report: Arc::new(Mutex::new(None)),
+            report_sequence: Arc::new(AtomicU64::new(0)),
         };
         for tool in &profile.definition.required_tools {
             if !matches!(profile.probe(tool), ToolObservation::Available { .. }) {
@@ -413,9 +417,17 @@ impl Profile {
             tools,
             features: FEATURES.iter().map(|v| v.to_string()).collect(),
         };
+        // The replacement try_update name requires Rust 1.95; keep the 1.89 MSRV.
+        #[allow(deprecated)]
+        let sequence = self
+            .report_sequence
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_add(1))
+            .ok()
+            .and_then(|v| v.checked_add(1));
         let completed = crate::platform::boot_id()
-            .filter(|_| files_before == files)
+            .filter(|_| files_before == files && sequence.is_some())
             .map(|boot| CompletedReport {
+                sequence: sequence.expect("filtered sequence"),
                 boot,
                 finished_ms: crate::platform::monotonic_ms(),
                 files,
@@ -428,7 +440,13 @@ impl Profile {
     }
 
     /// Consume only: never probes, renews the stamp, or changes admission reports.
-    pub(crate) fn preparation_snapshot(&self, expected: &Digest) -> Option<WorkerCapabilities> {
+    pub(crate) fn preparation_snapshot(
+        &self,
+        expected: &Digest,
+    ) -> Option<(
+        WorkerCapabilities,
+        crate::setup::preparation_probe::ProfileSample,
+    )> {
         let snapshot = self.completed_report.lock().ok()?.clone()?;
         let boot = crate::platform::boot_id()?;
         let now = crate::platform::monotonic_ms();
@@ -440,7 +458,15 @@ impl Profile {
         {
             return None;
         }
-        Some(report)
+        Some((
+            report,
+            crate::setup::preparation_probe::ProfileSample {
+                native_boot: snapshot.boot,
+                sequence: snapshot.sequence,
+                completed_monotonic_ms: snapshot.finished_ms,
+                ttl_ms: PREPARATION_SNAPSHOT_TTL_MS,
+            },
+        ))
     }
     fn preparation_snapshot_at(
         &self,
@@ -1058,6 +1084,44 @@ mod tests {
 #[cfg(test)]
 mod preparation_snapshot_tests {
     use super::*;
+    #[test]
+    fn preparation_snapshot_sequence_survives_missing_snapshot_and_overflow() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = Profile::load(
+            temp.path(),
+            &BTreeMap::from([
+                ("PATH".into(), temp.path().to_str().unwrap().into()),
+                ("SHELL".into(), "/bin/sh".into()),
+            ]),
+        )
+        .unwrap();
+        profile.report();
+        let first = profile
+            .completed_report
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .sequence;
+        *profile.completed_report.lock().unwrap() = None;
+        profile.report();
+        assert!(
+            profile
+                .completed_report
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .sequence
+                > first
+        );
+        profile.report_sequence.store(u64::MAX, Ordering::SeqCst);
+        profile.report();
+        assert!(profile.completed_report.lock().unwrap().is_none());
+        profile.report();
+        assert!(profile.completed_report.lock().unwrap().is_none());
+        assert_eq!(profile.report_sequence.load(Ordering::SeqCst), u64::MAX);
+    }
     #[test]
     fn preparation_snapshot_consumption_is_process_free_and_never_renews_age() {
         let temp = tempfile::tempdir().unwrap();

@@ -2452,6 +2452,16 @@ mod tests {
                 state,
             };
             let probe = PreparationProbe::Entries {
+                provenance: ProbeProvenance {
+                    profile: ProfileSample {
+                        native_boot: "native".into(),
+                        sequence: 1,
+                        completed_monotonic_ms: 10,
+                        ttl_ms: 5000,
+                    },
+                    observed_monotonic_ms: 11,
+                    observation_ttl_ms: 5000,
+                },
                 owner_generation: BuilderId::generate(),
                 entries: vec![entry.clone(); 16],
             };

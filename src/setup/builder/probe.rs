@@ -50,6 +50,7 @@ impl Setups {
         {
             return Probe::Unknown(Unknown::InvalidBinding);
         }
+        let began = platform::monotonic_ms();
         let workspace = !input.in_place
             && input
                 .setup
@@ -69,7 +70,7 @@ impl Setups {
         }
         type ResolvedProbeEntry = (PreparationKind, Option<String>, Option<Unknown>);
         let byte_budget = adapters::IdentityReadBudget::probe();
-        let resolve = || -> Result<Vec<ResolvedProbeEntry>, Unknown> {
+        let resolve = || -> Result<(Vec<ResolvedProbeEntry>, crate::setup::preparation_probe::ProfileSample), Unknown> {
             let profile = profile.ok_or(Unknown::ProfileUnavailable)?;
             let fingerprint = fingerprint.ok_or(Unknown::ProfileUnavailable)?;
             if self.cfg.profile_fingerprint.as_ref() != Some(fingerprint)
@@ -77,7 +78,7 @@ impl Setups {
             {
                 return Err(Unknown::InvalidBinding);
             }
-            let snapshot = profile
+            let (snapshot, sample) = profile
                 .preparation_snapshot(fingerprint)
                 .ok_or(Unknown::ProfileUnavailable)?;
             if profile.required_tools().iter().any(|tool| {
@@ -134,9 +135,9 @@ impl Setups {
                     ));
                 }
             }
-            Ok(entries)
+            Ok((entries, sample))
         };
-        let first = match resolve() {
+        let (first, sample) = match resolve() {
             Ok(v) => v,
             Err(e) => return Probe::Unknown(e),
         };
@@ -167,13 +168,16 @@ impl Setups {
                 .collect::<Vec<_>>()
         };
         io_gate();
-        let second = match resolve() {
+        let (second, second_sample) = match resolve() {
             Ok(v) => v,
             Err(e) => return Probe::Unknown(e),
         };
-        if first != second {
+        if first != second || sample != second_sample {
             return Probe::Unknown(Unknown::OwnershipChanged);
         }
+        // Native boot discovery may read procfs on Linux; keep it outside ownership.
+        let final_boot = platform::boot_id();
+        let checked_at = platform::monotonic_ms();
         let inner = lock(&self.inner);
         if watches
             .iter()
@@ -226,7 +230,21 @@ impl Setups {
                 }
             })
             .collect();
+        let observed = platform::monotonic_ms();
+        let provenance = crate::setup::preparation_probe::ProbeProvenance {
+            profile: sample,
+            observed_monotonic_ms: observed,
+            observation_ttl_ms: 5000,
+        };
+        if observed < began
+            || observed < checked_at
+            || final_boot.as_deref() != Some(provenance.profile.native_boot.as_str())
+            || provenance.deadline(0, 0).is_none()
+        {
+            return Probe::Unknown(Unknown::ProfileUnavailable);
+        }
         Probe::Entries {
+            provenance,
             owner_generation: self.owner_generation.clone(),
             entries,
         }
@@ -357,6 +375,27 @@ mod preparation_probe_tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+    #[test]
+    fn preparation_probe_rejects_report_sample_change_between_resolutions() {
+        let f = Fixture::new();
+        let result = f.owner.probe_preparation_checked(
+            f.input(),
+            Some(&f.profile),
+            Some(&f.fingerprint),
+            None,
+            || {
+                f.profile.report();
+            },
+        );
+        assert!(matches!(result, Probe::Unknown(Unknown::OwnershipChanged)));
+        let result = f.probe();
+        let Probe::Entries { provenance, .. } = result else {
+            panic!("expected identity");
+        };
+        let (_, sample) = f.profile.preparation_snapshot(&f.fingerprint).unwrap();
+        assert_eq!(provenance.profile, sample);
+        assert!(provenance.observed_monotonic_ms >= sample.completed_monotonic_ms);
     }
     #[test]
     fn preparation_probe_shared_producer_key_and_private_read_only_output() {

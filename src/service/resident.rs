@@ -490,6 +490,7 @@ async fn connect_local(
     crate::protocol::Client,
     Arc<crate::coordinator::InputGate>,
     bool,
+    bool,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
@@ -522,6 +523,11 @@ async fn connect_local(
             return Err(e.into());
         }
     };
+    let probe = connected
+        .negotiated
+        .features
+        .iter()
+        .any(|feature| feature == crate::wire::PREPARATION_PROBE_FEATURE);
     let observations = connected
         .negotiated
         .features
@@ -557,6 +563,7 @@ async fn connect_local(
         worker_client,
         input_gate,
         observations,
+        probe,
     ))
 }
 
@@ -591,14 +598,14 @@ impl Resident {
         })
         .await??;
         let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection, worker_client, input_gate, observations) = match connected
-        {
-            Ok(value) => value,
-            Err(e) => {
-                tokio::task::spawn_blocking(move || startup.cleanup()).await?;
-                return Err(e);
-            }
-        };
+        let (listener, worker_connection, worker_client, input_gate, observations, probe) =
+            match connected {
+                Ok(value) => value,
+                Err(e) => {
+                    tokio::task::spawn_blocking(move || startup.cleanup()).await?;
+                    return Err(e);
+                }
+            };
         let parts = startup.parts.take().expect("prepared startup");
 
         parts
@@ -611,7 +618,8 @@ impl Resident {
                         parts.worker_timeout,
                         input_gate.clone(),
                     )
-                    .with_preparation_observations(observations),
+                    .with_preparation_observations(observations)
+                    .with_preparation_probe(probe),
                 ),
             )
             .await;

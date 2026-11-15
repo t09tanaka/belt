@@ -29,6 +29,7 @@ mod link;
 pub mod policy;
 mod prefetch;
 mod preparation;
+mod preparation_identity;
 
 pub use input_gate::{PlacementInputs, ReadyInput};
 pub use link::{ClientLink, InputGate, LinkError, WorkerLink};
@@ -307,6 +308,8 @@ pub struct Coordinator {
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
     parent_local: Mutex<Option<WorkerId>>,
+    preparation_identities: Mutex<BTreeMap<WorkerId, preparation_identity::IdentityContext>>,
+    preparation_query: tokio::sync::Mutex<()>,
     preparation_cursors: Mutex<BTreeMap<WorkerId, preparation::CursorState>>,
     actor: tokio::sync::Mutex<()>,
     /// One pass of result collection at a time.
@@ -359,6 +362,8 @@ impl Coordinator {
             cfg,
             workers: Mutex::default(),
             parent_local: Mutex::default(),
+            preparation_identities: Mutex::default(),
+            preparation_query: tokio::sync::Mutex::new(()),
             preparation_cursors: Mutex::default(),
             actor: tokio::sync::Mutex::new(()),
             collecting: Arc::new(tokio::sync::Mutex::new(())),

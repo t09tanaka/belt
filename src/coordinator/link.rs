@@ -166,6 +166,9 @@ impl InputGate {
 }
 
 pub trait WorkerLink: Send + Sync {
+    fn preparation_probe_negotiated(&self) -> bool {
+        false
+    }
     /// Exact hello negotiation; never inferred from opaque transport provenance.
     fn preparation_observations_negotiated(&self) -> bool {
         false
@@ -211,6 +214,7 @@ pub struct ClientLink {
     timeout: Duration,
     gate: Option<std::sync::Arc<InputGate>>,
     preparation_observations: bool,
+    preparation_probe: bool,
 }
 
 impl ClientLink {
@@ -220,6 +224,7 @@ impl ClientLink {
             timeout,
             gate: None,
             preparation_observations: false,
+            preparation_probe: false,
         }
     }
 }
@@ -231,16 +236,24 @@ impl ClientLink {
             timeout,
             gate: Some(gate),
             preparation_observations: false,
+            preparation_probe: false,
         }
     }
 }
 impl ClientLink {
+    pub fn with_preparation_probe(mut self, negotiated: bool) -> Self {
+        self.preparation_probe = negotiated;
+        self
+    }
     pub fn with_preparation_observations(mut self, negotiated: bool) -> Self {
         self.preparation_observations = negotiated;
         self
     }
 }
 impl WorkerLink for ClientLink {
+    fn preparation_probe_negotiated(&self) -> bool {
+        self.preparation_probe
+    }
     fn preparation_observations_negotiated(&self) -> bool {
         self.preparation_observations
     }
@@ -313,6 +326,9 @@ pub(super) struct Budgeted {
 }
 
 impl WorkerLink for Budgeted {
+    fn preparation_probe_negotiated(&self) -> bool {
+        self.inner.preparation_probe_negotiated()
+    }
     fn preparation_observations_negotiated(&self) -> bool {
         self.inner.preparation_observations_negotiated()
     }
