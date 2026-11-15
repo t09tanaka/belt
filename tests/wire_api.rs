@@ -214,6 +214,7 @@ fn run_result(dir: &str) -> RunResult {
         changed_files: 1,
         mode: "changes".into(),
         state: "success".into(),
+        cpu: None,
         description: "success: pass 1 / fail 0 / error 0 / skip 0".into(),
         secs: 2.0,
         run_dir: dir.into(),

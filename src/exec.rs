@@ -196,6 +196,10 @@ pub struct Runner<'a> {
     pub lock_file: PathBuf,
     pub slug: String,
     pub opts: Opts,
+    /// The threads each job may use (see [`crate::cpu`]): its steps are told
+    /// in `cpu::JOB_THREAD_ENV` and ask task-traffic-controller for that weight.
+    /// `None` (the default): jobs are not limited.
+    pub job_threads: Option<usize>,
     pub base_path: String,
     /// The keys of the steps that count as setup, from the plan alone.
     hoisted: plan::Hoist,
@@ -892,6 +896,7 @@ impl<'a> Runner<'a> {
             lock_file: ws.lock_file.clone(),
             slug: fp.repository.clone().unwrap_or_default(),
             opts,
+            job_threads: None,
             base_path,
             seq: pinned
                 .map(|(_, ws, _)| ws.sequence.clone())
@@ -1056,6 +1061,8 @@ impl<'a> Runner<'a> {
         key: Option<String>,
         label: &str,
         piped: bool,
+        // the weight to ask task-traffic-controller for, when it is not to work it out
+        weight: Option<usize>,
     ) -> Result<(Exit, Duration)> {
         let mut attempt = 0;
         let mut queued = Duration::ZERO;
@@ -1071,6 +1078,7 @@ impl<'a> Runner<'a> {
                 key.clone(),
                 label,
                 piped,
+                weight,
             )?;
             queued += q;
             let failed = matches!(r, Exit::Code(c) if c != 0);
@@ -1099,6 +1107,8 @@ impl<'a> Runner<'a> {
         key: Option<String>,
         label: &str,
         piped: bool,
+        // the weight to ask task-traffic-controller for, when it is not to work it out
+        weight: Option<usize>,
     ) -> Result<(Exit, Duration)> {
         let n = self.seq.fetch_add(1, Ordering::SeqCst);
         let script_name = if self.pinned.is_some() {
@@ -1175,13 +1185,14 @@ impl<'a> Runner<'a> {
             key.clone(),
             self.opts.executor.is_none(),
         ) {
-            let mut w = vec![
-                c.to_string_lossy().into_owned(),
-                "exec".into(),
-                "--key".into(),
-                k,
-                "--".into(),
-            ];
+            let mut w = vec![c.to_string_lossy().into_owned(), "exec".into()];
+            // The job's share: what its tools were told to use. Without it
+            // the controller would charge what the step used before, when it
+            // had every core.
+            if let Some(n) = weight {
+                w.extend(["--weight".into(), n.to_string()]);
+            }
+            w.extend(["--key".into(), k, "--".into()]);
             w.append(&mut argv);
             argv = w;
         }
@@ -1617,6 +1628,8 @@ impl<'a> Runner<'a> {
                     Some(format!("local-ci setup {label}")),
                     &run_label(&sel.wf.name, &s.job, &s.label),
                     false,
+                    // setup runs before the jobs, alone
+                    None,
                 )
                 .map(|(exit, _)| exit);
             let (outcome, exit) = match res {
@@ -3263,6 +3276,15 @@ impl<'a> Runner<'a> {
                     projects.push(p);
                 }
             }
+            // The job's share of the CPU, for the tools that read it. What the
+            // caller, the workflow, the job or the step says stays.
+            if let Some(threads) = self.job_threads {
+                for k in crate::cpu::JOB_THREAD_ENV {
+                    if self.ctx.var(k).is_none() && !env_now.contains_key(k) {
+                        env.push((k.into(), threads.to_string()));
+                    }
+                }
+            }
             for (k, v) in &env_now {
                 env.push((k.clone(), expr::to_string(v)));
             }
@@ -3307,6 +3329,7 @@ impl<'a> Runner<'a> {
                         },
                     ),
                     piped,
+                    self.job_threads,
                 )
                 .map(|(exit, queued)| {
                     queue += queued;

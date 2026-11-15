@@ -28,6 +28,9 @@ pub struct RunResult {
     pub skipped_workflows: Vec<Skipped>,
     pub not_covered: Vec<String>,
     pub warnings: Vec<String>,
+    /// How the CPU was divided between the jobs, when it was (see [`crate::cpu`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu: Option<crate::cpu::Share>,
     /// Whether the units, jobs and steps of the plan are all in this result
     /// (see [`crate::complete`]). `state` is `success` only when they are and
     /// nothing was left out.
@@ -284,6 +287,7 @@ pub fn assemble(
             })
             .collect(),
         not_covered,
+        cpu: None,
         completeness: Completeness {
             verdict: Verdict::Complete,
             expected_units: 0,
@@ -391,6 +395,17 @@ pub fn group_skipped(skipped: &[Skipped], dir: &str) -> String {
         .join("; ")
 }
 
+/// `cpu    budget 12 · 3 jobs at once · 4 threads each`
+fn cpu_line(c: &crate::cpu::Share) -> String {
+    format!(
+        "cpu    budget {} · {} jobs at once · {} thread{} each",
+        c.budget,
+        c.jobs_at_once,
+        c.threads_per_job,
+        if c.threads_per_job == 1 { "" } else { "s" }
+    )
+}
+
 pub fn print(r: &RunResult, tail_lines: usize, style: &Style) {
     let dir = style.workflows_dir.as_str();
     println!(
@@ -407,6 +422,9 @@ pub fn print(r: &RunResult, tail_lines: usize, style: &Style) {
         },
         tilde(&r.run_dir, style.home.as_deref())
     );
+    if let Some(line) = r.cpu.as_ref().map(cpu_line) {
+        println!("{line}");
+    }
     let setup_bad: Vec<&StepResult> = r
         .setup
         .iter()

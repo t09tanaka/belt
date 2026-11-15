@@ -153,12 +153,14 @@ fn clones_of_one_repository_in_different_directories_give_one_digest() {
     }
 }
 
-/// What a result says apart from times and paths.
+/// What a result says apart from times, paths and the CPU shares.
 fn essence(r: &local_ci::report::RunResult) -> serde_json::Value {
     let mut v = serde_json::to_value(r).unwrap();
     let o = v.as_object_mut().unwrap();
     o.remove("secs");
     o.remove("run_dir");
+    // how this run divided the CPU: `execute_plan` is not told
+    o.remove("cpu");
     let strip = |x: &mut serde_json::Value| {
         let mut stack = vec![x];
         while let Some(x) = stack.pop() {

@@ -340,6 +340,7 @@ impl WireRunResult {
             state: self.state,
             description: self.description,
             secs: self.secs,
+            cpu: None,
             setup: steps_back(self.setup, &run_dir)?,
             units: self
                 .units
