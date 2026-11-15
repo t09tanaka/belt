@@ -857,14 +857,23 @@ projection. Each workflow must be a regular blob at the exact literal path,
 match the frozen projection, and pass raw-byte Git OID and SHA-256 checks.
 Working-tree edits and replacement refs cannot retarget these reads.
 
-This reader requires Git with the `--no-lazy-fetch` global option; unsupported
-versions fail explicitly. Missing local objects fail without fetching, applying
+Ordinary Git planning and this reader require Git with the `--no-lazy-fetch`
+global option; unsupported versions fail explicitly. Missing local objects fail without fetching, applying
 filters or prompting for credentials. It reads at most 4096 workflows and 4MiB
 of their combined contents, with bounded stdout/stderr and cooperative 5-second
 command / 30-second request deadlines. Owned command groups are killed before
 their leaders are reaped on every return path. The Git executable and repository
 object database remain the host's trust boundary: this does not scan or verify
 the whole commit/tree object graph against hostile database replacement.
+
+The planner shares that raw workflow-body reader and one combined byte/count
+budget, preserving trailing YAML block-scalar newlines instead of trimming
+workflow text. Ref metadata is resolved once to an immutable commit before
+listing and reading. Workflow listing and other metadata still use the existing
+Git metadata helper; the raw-body bounds do not claim a bound on those legacy
+listing allocations or syscalls. Git plans previously frozen with trimmed
+block-scalar text must be rebuilt from the same immutable commit before using
+the strict scheduling verifier; no trimming compatibility fallback is applied.
 
 Captured inputs still use `PinnedExecution::evaluation_source()` and a real
 manifest binding. The unpublished scheduling record is schema 2 with explicit

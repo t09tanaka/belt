@@ -50,66 +50,10 @@ pub fn git_evaluation_source(
         plan.source.source_id == format!("commit:{commit}"),
         "Git source identity mismatch"
     );
-    let started = Instant::now();
-    let format = command(
-        ctx,
-        repository,
-        &["rev-parse", "--show-object-format"],
-        16,
-        started,
-    )?;
-    ensure!(
-        matches!(
-            (format.as_slice(), commit.len()),
-            (b"sha1\n", 40) | (b"sha256\n", 64)
-        ),
-        "Git object format/commit mismatch"
-    );
-    ensure!(
-        command(ctx, repository, &["cat-file", "-t", commit], 16, started)? == b"commit\n",
-        "execution object is not a commit"
-    );
+    let mut reader = GitWorkflowReader::new(ctx, repository, commit)?;
     let mut workflows = Vec::new();
-    let mut remaining = MAX_SOURCE_BYTES;
     for frozen in &plan.workflows {
-        let path = &frozen.file;
-        ensure!(
-            !path.is_empty()
-                && path.len() <= MAX_PATH
-                && !path.bytes().any(|b| b == 0)
-                && path.split('/').all(|c| !matches!(c, "" | "." | "..")),
-            "noncanonical evaluation workflow path"
-        );
-        let entry = command(
-            ctx,
-            repository,
-            &["ls-tree", "-l", "-z", "--full-tree", commit, "--", path],
-            MAX_PATH + 256,
-            started,
-        )?;
-        let (blob, size) = tree_entry(&entry, path, commit.len())?;
-        ensure!(size <= remaining, "evaluation workflow exceeds byte bound");
-        let bytes = command(
-            ctx,
-            repository,
-            &["cat-file", "blob", blob],
-            remaining,
-            started,
-        )?;
-        ensure!(bytes.len() == size, "evaluation blob size mismatch");
-        let object_id = command_input(
-            ctx,
-            repository,
-            &["hash-object", "--no-filters", "--stdin"],
-            128,
-            started,
-            Some(&bytes),
-        )?;
-        ensure!(
-            object_id.strip_suffix(b"\n") == Some(blob.as_bytes()),
-            "Git blob content/object ID mismatch"
-        );
-        remaining -= bytes.len();
+        let bytes = reader.read(&frozen.file)?;
         workflows.push(scheduling(
             frozen,
             &bytes,
@@ -129,12 +73,116 @@ pub fn git_evaluation_source(
         serde_json::to_vec(&record)?.len() <= MAX_SOURCE_BYTES,
         "evaluation source exceeds byte bound"
     );
-    ensure!(!ctx.cancel.is_cancelled(), "Git evaluation cancelled");
-    ensure!(
-        started.elapsed() < REQUEST_TIME,
-        "Git evaluation request deadline exceeded"
-    );
+    reader.finish()?;
     Ok(VerifiedEvaluationSource(record))
+}
+
+/// Shared exact-byte workflow IO for planning and verified scheduling facts.
+/// This owns one aggregate budget, not a new allowance for each workflow.
+pub(crate) struct GitWorkflowReader<'a> {
+    ctx: &'a ExecContext,
+    repository: &'a Path,
+    commit: &'a str,
+    started: Instant,
+    remaining: usize,
+    count: usize,
+}
+impl<'a> GitWorkflowReader<'a> {
+    pub(crate) fn new(ctx: &'a ExecContext, repository: &'a Path, commit: &'a str) -> Result<Self> {
+        ensure!(
+            oid(commit),
+            "workflow reader requires a full lowercase commit object ID"
+        );
+        let started = Instant::now();
+        let format = command(
+            ctx,
+            repository,
+            &["rev-parse", "--show-object-format"],
+            16,
+            started,
+        )?;
+        ensure!(
+            matches!(
+                (format.as_slice(), commit.len()),
+                (b"sha1\n", 40) | (b"sha256\n", 64)
+            ),
+            "Git object format/commit mismatch"
+        );
+        ensure!(
+            command(ctx, repository, &["cat-file", "-t", commit], 16, started)? == b"commit\n",
+            "execution object is not a commit"
+        );
+        Ok(Self {
+            ctx,
+            repository,
+            commit,
+            started,
+            remaining: MAX_SOURCE_BYTES,
+            count: 0,
+        })
+    }
+    pub(crate) fn read(&mut self, path: &str) -> Result<Vec<u8>> {
+        ensure!(self.count < MAX_WORKFLOWS, "too many evaluation workflows");
+        self.count += 1;
+        ensure!(
+            !path.is_empty()
+                && path.len() <= MAX_PATH
+                && !path.bytes().any(|b| b == 0)
+                && path.split('/').all(|c| !matches!(c, "" | "." | "..")),
+            "noncanonical evaluation workflow path"
+        );
+        let entry = command(
+            self.ctx,
+            self.repository,
+            &[
+                "ls-tree",
+                "-l",
+                "-z",
+                "--full-tree",
+                self.commit,
+                "--",
+                path,
+            ],
+            MAX_PATH + 256,
+            self.started,
+        )?;
+        let (blob, size) = tree_entry(&entry, path, self.commit.len())?;
+        ensure!(
+            size <= self.remaining,
+            "evaluation workflow exceeds byte bound"
+        );
+        let bytes = command(
+            self.ctx,
+            self.repository,
+            &["cat-file", "blob", blob],
+            self.remaining,
+            self.started,
+        )?;
+        ensure!(bytes.len() == size, "evaluation blob size mismatch");
+        let object_id = command_input(
+            self.ctx,
+            self.repository,
+            &["hash-object", "--no-filters", "--stdin"],
+            128,
+            self.started,
+            Some(&bytes),
+        )?;
+        ensure!(
+            object_id.strip_suffix(b"\n") == Some(blob.as_bytes()),
+            "Git blob content/object ID mismatch"
+        );
+        self.remaining -= bytes.len();
+        self.finish()?;
+        Ok(bytes)
+    }
+    pub(crate) fn finish(&self) -> Result<()> {
+        ensure!(!self.ctx.cancel.is_cancelled(), "Git evaluation cancelled");
+        ensure!(
+            self.started.elapsed() < REQUEST_TIME,
+            "Git evaluation request deadline exceeded"
+        );
+        Ok(())
+    }
 }
 
 /// Decoding is never verification: recompute from the same repository and

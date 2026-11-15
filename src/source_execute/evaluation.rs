@@ -207,6 +207,7 @@ fn scheduling(frozen: &WorkflowSpec, bytes: &[u8], hash: String) -> Result<Workf
 }
 
 mod git;
+pub(crate) use git::GitWorkflowReader;
 pub use git::{git_evaluation_source, verify_git_evaluation_source};
 
 #[cfg(test)]

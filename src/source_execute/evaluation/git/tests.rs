@@ -395,8 +395,8 @@ fn exact_byte_limit_and_combined_workflow_limit_are_independent_of_projection() 
     first.resize(MAX_SOURCE_BYTES / 2, b' ');
     let mut second = first.clone();
     second.push(b' ');
-    std::fs::write(f.root().join(".github/workflows/ci.yml"), first).unwrap();
-    std::fs::write(f.root().join(".github/workflows/other.yml"), second).unwrap();
+    std::fs::write(f.root().join(".github/workflows/ci.yml"), &first).unwrap();
+    std::fs::write(f.root().join(".github/workflows/other.yml"), &first).unwrap();
     git(f.root(), &["add", "."]);
     git(f.root(), &["commit", "-qm", "combined byte bound"]);
     f.plan = crate::build_frozen_plan(
@@ -415,6 +415,17 @@ fn exact_byte_limit_and_combined_workflow_limit_are_independent_of_projection() 
     )
     .unwrap();
     assert_eq!(f.plan.workflows.len(), 2);
+    git_evaluation_source(&f.ctx, f.root(), &f.plan).unwrap();
+    std::fs::write(f.root().join(".github/workflows/other.yml"), &second).unwrap();
+    git(f.root(), &["add", "."]);
+    git(f.root(), &["commit", "-qm", "combined bound plus one"]);
+    f.retarget(git(f.root(), &["rev-parse", "HEAD"]));
+    assert!(
+        crate::git::workflows_at(&f.ctx, f.root(), "HEAD", None, &[])
+            .unwrap_err()
+            .to_string()
+            .contains("byte bound")
+    );
     assert!(git_evaluation_source(&f.ctx, f.root(), &f.plan)
         .unwrap_err()
         .to_string()
@@ -461,4 +472,32 @@ fn context_git_redirection_cannot_retarget_the_explicit_repository_and_blob_oid_
     std::fs::remove_file(object(&original_blob)).unwrap();
     std::fs::copy(object(&other_blob), object(&original_blob)).unwrap();
     assert!(git_evaluation_source(&f.ctx, f.root(), &f.plan).is_err());
+}
+
+#[test]
+fn ordinary_git_planning_preserves_trailing_workflow_scalar_bytes() {
+    let f = Fixture::new();
+    let text = "on: push\njobs:\n  check:\n    runs-on: fixture\n    steps:\n      - run: |\n          printf fixture\n\n";
+    std::fs::write(f.root().join(".github/workflows/ci.yml"), text).unwrap();
+    git(f.root(), &["add", "."]);
+    git(f.root(), &["commit", "-qm", "trailing block scalar"]);
+    let files = crate::git::workflows_at(&f.ctx, f.root(), "HEAD", None, &[]).unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].1.as_bytes(), text.as_bytes());
+    let plan = crate::build_frozen_plan(
+        &f.ctx,
+        &Target {
+            dir: f.root().into(),
+            sha: "HEAD".into(),
+            base: Some("HEAD".into()),
+            all: true,
+            include_disabled: true,
+            workflows_dirs: vec![],
+            workflows: vec![],
+            jobs: vec![],
+        },
+        &mut Quiet,
+    )
+    .unwrap();
+    git_evaluation_source(&f.ctx, f.root(), &plan).unwrap();
 }
