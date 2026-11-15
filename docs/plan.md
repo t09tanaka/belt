@@ -781,3 +781,16 @@ D 最終 focused 検証: resident 23件成功 (88.35s)、retention filter 69件�
 `estimate --task ID` は、保存済みの完全 TaskSpec/source/run と選択 worker の preview profile/boot/epoch が揃う場合だけ、hello で feature 交渉済みの同じ attachment に一度だけ readonly probe を送る。command-only・source 不明・古い peer は Unknown のままである。IO 中は actor を保持せず、応答後に attachment/InputGate 世代・worker identity・owner/input/profile binding を再照合する。最大256 worker の private identity context、同時 query 全体1件、送信 input 256KiB と最大16 entry の上限を保つ。親 send 時刻から元 sample の age と observation TTL の最小残量を使い、受信から5秒を作らない。同じ sample の再送は最初の deadline を延長しない。identity の確認だけを preview assumption に表示し、setup scalar・ready delay・admission は変更しない。
 
 現在の producer Active は実 BuilderId/attempt の観測であり TTC command node の証明ではない。artifact の bounded 完全検証・正確な frozen activation の証明、実 TTC ledger identity と依存/resource graph の対応、既存 simulator への接続とユーザー経路の受入は引き続き必須残件である。ConcretePlan/producer 不在から cold/warm/0 を作らず、setup cost は Unknown を維持する。
+
+### Source/Vault retention と準備 freshness の親統合検証
+
+承認済みの自動消去条件に沿う D と、元 profile sample に束縛した preparation preview を親へ統合した。
+削除専任レビューと D 専任レビューで P1/P2 は解消済み。親 ef7721f の focused integration 11件、
+blocked GC 中の実 IPC 1件、freshness 統合後37件が成功した。独立した最終検証で strict all-target/all-feature
+clippy と clean LLVM 計測51件が成功し、exact file coverage は sched175/175、
+preparation_freshness73/73、wire1823/1823。sched 全27変異は25 caught、2 unviable、
+0 missed、0 timeout（104.5秒）。対象は private fixtures であり実 user state の GC は実行していない。
+
+これらは全体CIの成功とは区別する。次にコミット済み候補の全9ジョブを local-ci で再検証する。
+ローカルの実 Rust は1.100であり、1.89の実MSRV確認・installer actions・独立Mac固有の受入は未検証。
+S15f の完全artifact/activation証明と実TTC依存/resource graph、S16以降、Docker受入と公開は必須残件。
