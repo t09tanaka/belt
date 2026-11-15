@@ -322,7 +322,9 @@ pub fn execute_setup(
 /// does all its setup itself, and `receipt_ignored` of the result says why.
 /// With `None` the task prepares everything itself. The workspace is left for the caller to
 /// remove.
-/// Containers the task started are gone when this returns.
+/// Cleanup is attempted for acknowledged resources. Failures and ambiguous
+/// creation remain tracked in the attempt context and emit separate warnings;
+/// a returned task result is not a physical-stop capability.
 ///
 /// Conditions (`needs.*.result`, `success()`, `failure()`, `always()`,
 /// `cancelled()`) and `needs.<id>.outputs.*` are evaluated against `inputs`.
@@ -411,40 +413,88 @@ pub(crate) fn execute_resolved_with_runner(
     ws: &Workspace,
     runner: Runner<'_>,
 ) -> Result<TaskResult> {
-    crate::wire::check_version("task inputs", inputs.schema_version)?;
-    if let Some((receipt, _)) = prepared {
-        crate::wire::check_version("receipt", receipt.schema_version)?;
+    execute_resolved_outcome(ctx, task, inputs, prepared, ws, runner).legacy_result()
+}
+
+/// Fresh attempt cleanup policy. Persistent unit hosts must keep their own
+/// context lifetime and call the execution-only boundary instead.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_resolved_outcome(
+    ctx: &ExecContext,
+    task: &crate::dag::ExecutionTask,
+    inputs: &TaskInputs,
+    prepared: Option<(&PreparedReceipt, &TemplateContext)>,
+    ws: &Workspace,
+    runner: Runner<'_>,
+) -> crate::execution_outcome::AttemptExecutionOutcome {
+    let validation = (|| {
+        crate::wire::check_version("task inputs", inputs.schema_version)?;
+        if let Some((receipt, _)) = prepared {
+            crate::wire::check_version("receipt", receipt.schema_version)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = validation {
+        return crate::execution_outcome::AttemptExecutionOutcome {
+            execution: Err(error),
+            final_error: None,
+            cleanup: crate::execution_outcome::CleanupOutcome {
+                diagnostics: vec![],
+                pending: ctx.cancel.pending_ownership(),
+            },
+        };
+    }
+    if let Some(refused) = runner.refused_task(task) {
+        return crate::execution_outcome::AttemptExecutionOutcome {
+            execution: Ok(refused),
+            final_error: None,
+            cleanup: crate::execution_outcome::CleanupOutcome {
+                diagnostics: vec![],
+                pending: ctx.cancel.pending_ownership(),
+            },
+        };
     }
     let keep = runner.opts.keep;
+    let execution = execute_resolved_body(task, inputs, prepared, ws, &runner);
+    let mut cleanup = ctx.cancel.cleanup_owned(ctx);
+    let final_error = if !keep {
+        runner.release_ports_checked(&ws.root).err()
+    } else {
+        None
+    };
+    cleanup.pending = ctx.cancel.pending_ownership();
+    crate::execution_outcome::AttemptExecutionOutcome {
+        execution,
+        cleanup,
+        final_error,
+    }
+}
 
-    // as in a run: an artifact step local-ci cannot run fails the task's jobs
-    // before anything is started
-    if let Some(r) = runner.refused_task(task) {
-        return Ok(r);
-    }
-    let result = (|| {
-        runner.prepare_tools()?;
-        let lock = if runner.task_locked(task) {
-            runner.lock().ok()
-        } else {
-            None
-        };
-        let r = runner.run_task(
-            &ws.root,
-            task,
-            inputs,
-            prepared,
-            true,
-            lock.is_some(),
-            false,
-        );
-        drop(lock);
-        r
-    })();
-    ctx.cancel.remove_containers(ctx);
-    if !keep {
-        runner.release_ports(&ws.root)?;
-    }
+/// Execution only: no context-wide container/port release. The enclosing host
+/// still owns resource cleanup; returning is not a physical-stop assertion.
+fn execute_resolved_body(
+    task: &crate::dag::ExecutionTask,
+    inputs: &TaskInputs,
+    prepared: Option<(&PreparedReceipt, &TemplateContext)>,
+    ws: &Workspace,
+    runner: &Runner<'_>,
+) -> Result<TaskResult> {
+    runner.prepare_tools()?;
+    let lock = if runner.task_locked(task) {
+        runner.lock().ok()
+    } else {
+        None
+    };
+    let result = runner.run_task(
+        &ws.root,
+        task,
+        inputs,
+        prepared,
+        true,
+        lock.is_some(),
+        false,
+    );
+    drop(lock);
     result
 }
 

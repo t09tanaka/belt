@@ -927,3 +927,24 @@ an external executor has its own lifetime contract. Their direct child returning
 a cancellation flag or an empty PID list is insufficient. The future shared host
 must consume an explicit drain outcome and retain uncertain ownership; the pure
 Driver host-terminal policy and ordinary Runner adapter remain unfinished.
+
+The private attempt outcome keeps the actual task `Result` separate from cleanup
+errors and remaining ownership observations. Legacy task entry points preserve
+cleanup warnings and retain the original result inside a final-cleanup error.
+Failed removal and port release keep their references for recovery; failure to
+validate a replaced captured workspace never authorizes cleanup in its replacement.
+A successful detached Docker create must acknowledge a full container ID. Health,
+port and removal commands use that ID, including after renaming. A timed-out,
+failed or invalid acknowledgement leaves a creation candidate, never permission
+to remove the requested name. Retrying removal first queries that exact ID;
+absence is success, and unexpected IDs cannot expand deletion scope.
+
+Generated and rewritten literal Compose namespaces still follow the existing
+Runner naming scheme. An external `COMPOSE_PROJECT_NAME` or an unrewritten
+script literal is an unverified reference: automatic cleanup will not query or
+bring down that project. This
+conservative boundary can leave resources for explicit host reconciliation.
+The next required integration must assign and attest resources per run/unit,
+keep shared setup resources alive for the unit, and map actual engine-domain
+stop evidence into the persistent host. The private outcome does not supply a
+`ConfirmedStopped` capability, and an empty tracking registry never supplies one.

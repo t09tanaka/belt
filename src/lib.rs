@@ -18,6 +18,7 @@ pub mod demand;
 mod digest;
 pub mod driver;
 pub mod exec;
+mod execution_outcome;
 pub mod expr;
 pub mod filter;
 pub mod frozen;

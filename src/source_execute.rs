@@ -448,4 +448,100 @@ mod tests {
             .is_err());
         assert!(!workspace.workspace().tools.exists());
     }
+    #[test]
+    fn replaced_workspace_at_final_cleanup_retains_actual_result_and_port_reference() {
+        struct ReplaceRoot;
+        impl crate::StepExecutor for ReplaceRoot {
+            fn run(&self, req: &crate::StepRequest) -> Result<crate::StepExit> {
+                std::fs::rename(&req.cwd, req.cwd.with_extension("original"))?;
+                std::fs::create_dir(&req.cwd)?;
+                Ok(crate::StepExit {
+                    exit: crate::exec::Exit::Code(0),
+                    run_secs: 0.,
+                    queue_wait_secs: None,
+                })
+            }
+        }
+        let area = tempfile::tempdir().unwrap();
+        let source = area.path().join("source");
+        std::fs::create_dir_all(source.join(".github/workflows")).unwrap();
+        std::fs::write(
+            source.join(".github/workflows/ci.yml"),
+            "on: push\njobs:\n  test:\n    runs-on: x\n    steps:\n      - run: echo completed\n",
+        )
+        .unwrap();
+        let store = ObjectStore::open(area.path().join("store")).unwrap();
+        let ctx = ExecContext::new(Default::default());
+        let manifest = crate::source::capture_directory(
+            &ctx,
+            &source,
+            &crate::source::CaptureOptions {
+                store: Some(store.root().into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .manifest;
+        let plan = crate::build_frozen_plan_from_source(
+            &store,
+            &manifest,
+            &crate::PinnedPlanOptions {
+                filters: crate::frozen::Filters {
+                    all: false,
+                    include_disabled: true,
+                    workflows_dirs: vec![],
+                    workflows: vec![],
+                    jobs: vec![],
+                },
+                workflow_dirs_override: None,
+                disabled: vec![],
+                base_branch: None,
+                changed_files: None,
+            },
+        )
+        .unwrap();
+        let input = PinnedExecution::new(&plan, &manifest, &store).unwrap();
+        let workspace = input
+            .materialize_workspace(Workspace {
+                root: area.path().join("root"),
+                repo_root: area.path().join("no-repo"),
+                run_dir: area.path().join("run"),
+                tools: area.path().join("tools"),
+                lock_file: area.path().join("lock"),
+            })
+            .unwrap();
+        let opts = Opts {
+            parallel: 1,
+            traffic_controller: None,
+            executor: Some(Arc::new(ReplaceRoot)),
+            portool: Some(area.path().join("never-invoked-portool")),
+            containers: 1,
+            job_timeout_min: 1.,
+            keep: false,
+            trash: area.path().join("trash"),
+        };
+        let provider = RefusePinnedForks;
+        let runner = Runner::new_pinned(&ctx, &input, &workspace, opts, &provider).unwrap();
+        let outcome = crate::task::execute_resolved_outcome(
+            &ctx,
+            &plan.tasks[0],
+            &TaskInputs::default(),
+            None,
+            workspace.workspace(),
+            runner,
+        );
+        assert_eq!(
+            outcome.execution.as_ref().unwrap().outcomes[0].status,
+            crate::JobStatus::Success
+        );
+        assert!(outcome.final_error.is_some());
+        assert_eq!(
+            outcome.cleanup.pending.port_paths,
+            vec![workspace.workspace().root.clone()]
+        );
+        assert!(
+            crate::execution_outcome::retained_result(&outcome.legacy_result().unwrap_err())
+                .is_some()
+        );
+    }
 }

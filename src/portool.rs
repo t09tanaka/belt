@@ -41,14 +41,16 @@ pub fn parse(text: &str) -> Vec<(String, String)> {
 
 /// Give the block back. Run it while the worktree still exists.
 pub fn release(ctx: &ExecContext, bin: &Path, ws: &Path) {
-    let _ = ctx
-        .command(bin)
-        .arg("release")
-        .current_dir(ws)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    if let Err(error) = release_checked(ctx, bin, ws) {
+        eprintln!("local-ci: warning: port release incomplete: {error:#}");
+    }
+}
+
+pub(crate) fn release_checked(ctx: &ExecContext, bin: &Path, ws: &Path) -> Result<()> {
+    let mut command = ctx.command(bin);
+    command.arg("release").current_dir(ws);
+    crate::cleanup::bounded_command(ctx, command, std::time::Duration::from_secs(5), false)?;
+    Ok(())
 }
 
 #[cfg(test)]

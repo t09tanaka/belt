@@ -545,3 +545,41 @@ fn git_derived_native_background_remains_for_next_step_and_drains_with_entry() {
     }
     assert_eq!(bytes, b"ru");
 }
+
+#[test]
+fn git_attempt_cleanup_failure_keeps_the_actual_result_and_pending_port() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = Fixture::new();
+    let mut d = f.driver();
+    f.seed(&mut d);
+    let (dispatch, inputs) = legs(&d).remove(0);
+    let ws = f.ws("port-cleanup-failure");
+    std::fs::write(ws.root.join(".portool.toml"), b"# private fixture").unwrap();
+    let portool = f.area.path().join("bin/portool");
+    std::fs::write(&portool,"#!/bin/sh\ncase \"$1\" in\nsync) : > .env.portool;;\nrelease) printf release >> \"$HOME/port-release-called\"; exit 1;;\nesac\nexit 0\n").unwrap();
+    std::fs::set_permissions(&portool, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut opts = f.opts();
+    opts.portool = Some(portool);
+    let ctx = f.ctx.fresh_attempt();
+    let selected =
+        verify_git_dispatch(&ctx, &f.plan, &ws.repo_root, &dispatch, &inputs, &f.facts).unwrap();
+    let task = selected.task.clone();
+    let runner = Runner::new(&ctx, &f.plan, &ws, opts)
+        .unwrap()
+        .select_derived(selected, f.facts.clone());
+    let outcome = execute_resolved_outcome(&ctx, &task, &inputs, None, &ws, runner);
+    assert_eq!(
+        outcome.execution.as_ref().unwrap().outcomes[0].status,
+        JobStatus::Success
+    );
+    assert!(outcome.final_error.is_some());
+    assert_eq!(outcome.cleanup.pending.port_paths, vec![ws.root.clone()]);
+    let error = outcome.legacy_result().unwrap_err();
+    let original = crate::execution_outcome::retained_result(&error)
+        .expect("actual result retained by legacy error");
+    assert_eq!(original.outcomes[0].status, JobStatus::Success);
+    assert_eq!(
+        std::fs::read_to_string(ws.root.join("marker")).unwrap(),
+        dispatch.index().to_string()
+    );
+}

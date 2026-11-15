@@ -1269,6 +1269,7 @@ impl<'a> Runner<'a> {
             return Ok((Exit::Code(1), Duration::ZERO));
         }
         if let Some(ex) = &self.opts.executor {
+            self.ctx.cancel.external_execution_started();
             return self.shell_via_executor(
                 ex.as_ref(),
                 n,
@@ -2072,15 +2073,26 @@ impl<'a> Runner<'a> {
     /// Give back the port block of `ws`. The worktree of the run itself may hold
     /// one even when no job asked: portool's post-checkout hook takes it.
     pub fn release_ports(&self, ws: &Path) -> Result<()> {
+        self.release_ports_checked(ws)
+    }
+
+    pub(crate) fn release_ports_checked(&self, ws: &Path) -> Result<()> {
+        // Record before source validation: failure must not erase the lease's
+        // identity or trigger release in a replaced workspace.
+        if self.opts.portool.is_some() {
+            self.ctx.cancel.port_release_pending(ws);
+        }
         self.validate_source()?;
         let Some(bin) = &self.opts.portool else {
             return Ok(());
         };
-        if (ws == self.wt || self.synced.lock().unwrap().remove(ws))
+        if (ws == self.wt || self.synced.lock().unwrap().contains(ws))
             && ws.join(".portool.toml").is_file()
         {
-            crate::portool::release(self.ctx, bin, ws);
+            crate::portool::release_checked(self.ctx, bin, ws)?;
+            self.synced.lock().unwrap().remove(ws);
         }
+        self.ctx.cancel.port_release_confirmed(ws);
         Ok(())
     }
 
@@ -3267,10 +3279,22 @@ impl<'a> Runner<'a> {
                 .get("COMPOSE_PROJECT_NAME")
                 .map(expr::to_string)
                 .filter(|p| !p.is_empty());
-            for p in compose_projects(&script).into_iter().chain(from_env) {
+            for p in compose_projects(&script) {
                 if !projects.contains(&p) {
-                    self.ctx.cancel.track_compose(p.clone());
+                    if exclusive && p.ends_with(&format!("-{tag}")) {
+                        self.ctx.cancel.track_compose(p.clone());
+                    } else {
+                        self.ctx.cancel.track_unverified_compose(p.clone());
+                    }
                     projects.push(p);
+                }
+            }
+            if let Some(project) = from_env {
+                // An external override is not proof of this entry's namespace.
+                // Never down that project based only on the supplied name.
+                self.ctx.cancel.track_unverified_compose(project.clone());
+                if !projects.contains(&project) {
+                    projects.push(project);
                 }
             }
             // The job's share of the CPU, for the tools that read it. What the
@@ -3418,9 +3442,8 @@ impl<'a> Runner<'a> {
             }
         }
         self.stop_services(&names, &mut steps);
-        let cleanup = crate::cleanup::compose_down(self.ctx, &projects);
+        let cleanup = self.ctx.cancel.cleanup_projects(self.ctx, &projects);
         self.record_cleanup_warnings(&mut steps, cleanup);
-        self.ctx.cancel.untrack_compose(&projects);
 
         // job outputs
         let mut outputs = Map::new();
@@ -3820,15 +3843,15 @@ impl<'a> Runner<'a> {
             );
             args.push(image.clone());
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            self.docker(&refs, Duration::from_secs(120))?;
-            self.ctx.cancel.track_container(name.clone());
-            names.push(name.clone());
+            self.ctx.cancel.creation_started(name.clone());
+            let id = self.docker(&refs, Duration::from_secs(120))?;
+            ensure_container_id(&id)?;
+            self.ctx.cancel.creation_acknowledged(&name, id.clone());
+            names.push(id.clone());
             let mut ports = Map::new();
             for (d, c) in &svc.ports {
-                let line = self.docker(
-                    &["port", &name, &format!("{c}/tcp")],
-                    Duration::from_secs(30),
-                )?;
+                let line =
+                    self.docker(&["port", &id, &format!("{c}/tcp")], Duration::from_secs(30))?;
                 let actual: u16 = line
                     .lines()
                     .next()
@@ -3842,10 +3865,10 @@ impl<'a> Runner<'a> {
                     actual,
                 });
             }
-            self.wait_healthy(&name, svc, &maps)?;
+            self.wait_healthy(&id, svc, &maps)?;
             sctx.insert(
                 svc.id.clone(),
-                json!({"id": name, "ports": ports, "network": ""}),
+                json!({"id": id, "ports": ports, "network": ""}),
             );
         }
         Ok((maps, sctx))
@@ -3921,12 +3944,12 @@ impl<'a> Runner<'a> {
     }
 
     fn stop_services(&self, names: &[String], steps: &mut [StepResult]) {
-        self.record_cleanup_warnings(
-            steps,
-            crate::cleanup::remove_tracked_containers(self.ctx, names),
-        );
-        let set: HashSet<&String> = names.iter().collect();
-        self.ctx.cancel.untrack_containers(&set);
+        let diagnostics = crate::cleanup::remove_tracked_containers(self.ctx, names);
+        if diagnostics.is_empty() {
+            let set: HashSet<&String> = names.iter().collect();
+            self.ctx.cancel.untrack_containers(&set);
+        }
+        self.record_cleanup_warnings(steps, diagnostics);
     }
 }
 
@@ -4082,6 +4105,14 @@ fn record(
 pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
     let mut f = File::create(path)?;
     f.write_all(serde_json::to_string_pretty(v)?.as_bytes())?;
+    Ok(())
+}
+
+fn ensure_container_id(id: &str) -> Result<()> {
+    anyhow::ensure!(
+        crate::cleanup::valid_container_id(id),
+        "Docker did not acknowledge a complete container ID"
+    );
     Ok(())
 }
 
