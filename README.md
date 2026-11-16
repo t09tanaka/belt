@@ -205,9 +205,13 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
     queued by an older version (which recorded none), show `-` and a gray
     band;
   - `job`: the `--label`, else the script's file name for `bash ... step.sh`
-    commands, else the command line; with `idle`, `[backfill]` or `[front]`
-    after it (`z`, `b`, `f` on a narrow terminal);
-  - `cores`: the weight reserved, running or waiting;
+    commands, else the command line; with `[backfill]` or `[front]` after
+    it (`b`, `f` on a narrow terminal);
+  - `need`: the cores reserved (the weight), running or waiting;
+  - `use`: the cores a running command really uses, to one decimal; `-`
+    for a waiting row or one not measured yet. It is dim when far below
+    `need` (idle: running 5:00+ and using under 0.2 cores). Without the use
+    column, `idle` (`z`) is written after the job instead;
   - a bar on a time axis shared by every row, and the text after it.
 
   `exec` records the worktree (`git rev-parse --show-toplevel`) and branch
@@ -219,9 +223,9 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
 
   On a terminal 80 columns wide or more the bar is never narrower than 20
   characters. To keep it, a narrow terminal gives up, in this order: the
-  reason for waiting after the bar (`starts ~1:35?` stays), the words
-  `idle` and `[backfill]` (they shrink to `z` and `b`; `[front]` to `f`),
-  the `project` column, the `cores` column, and only then the worktree and
+  reason for waiting after the bar (`starts ~1:35?` stays), the `use`
+  column, the words `idle` and `[backfill]` (they shrink to `z` and `b`;
+  `[front]` to `f`), the `project` column, the `need` column, and only then the worktree and
   job names are cut (the branch in the middle). The bar and the text after
   it always stay. With the project column gone, a `-` in the worktree
   column is replaced by the project's name, in gray, so the rows can still
