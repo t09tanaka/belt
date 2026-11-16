@@ -400,10 +400,7 @@ fn binary_source(path: &Path) -> anyhow::Result<(File, String)> {
     f.seek(SeekFrom::Start(0))?;
     Ok((f, digest))
 }
-fn service_inputs_observable(
-    paths: &Paths,
-    env: &BTreeMap<String, String>,
-) -> anyhow::Result<()> {
+fn service_inputs_observable(paths: &Paths, env: &BTreeMap<String, String>) -> anyhow::Result<()> {
     let strings = [&paths.config, &paths.input].map(|p| p.to_str());
     let env_values = ENV.iter().filter_map(|k| env.get(*k).map(String::as_str));
     for value in strings.into_iter().flatten().chain(env_values) {

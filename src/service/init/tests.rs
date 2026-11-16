@@ -93,7 +93,10 @@ async fn unobservable_service_values_are_refused_before_any_write() {
         c.env
             .insert("XDG_CONFIG_HOME".into(), config.to_str().unwrap().into());
         let error = initialize(c, &mut Unknown).await.unwrap_err();
-        assert!(error.downcast_ref::<InvalidServiceInput>().is_some(), "{bad}");
+        assert!(
+            error.downcast_ref::<InvalidServiceInput>().is_some(),
+            "{bad}"
+        );
         assert!(!config.exists(), "{bad}");
     }
     let (t, mut c) = fixture();

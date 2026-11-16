@@ -891,7 +891,7 @@ fn output_version(name: &str, bytes: &[u8]) -> Result<Version> {
     } else {
         s.strip_prefix('v').unwrap_or(s)
     };
-    Version::parse(&normalize_probe_version(name, value)).map_err(|_| "probe_version_invalid")
+    Version::parse(normalize_probe_version(name, value)).map_err(|_| "probe_version_invalid")
 }
 /// Ruby before 3.2 prints `X.Y.ZpN` (patchlevel suffix) and Go before 1.21 prints
 /// `X.Y` for `X.Y.0`; normalize only those two shapes to a strict three-part version.
