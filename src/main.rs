@@ -404,9 +404,16 @@ fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
                 reclaim::disk_usage(&dir.join("wt")) + reclaim::disk_usage(&dir.join("trash"));
             let swept = reclaim::prune_all(ctx, &dir, kept, legacy)?;
             // the registrations, in this repository, of worktrees whose files are gone
-            let unregistered = match std::env::current_dir() {
-                Ok(here) => reclaim::prune_registrations(ctx, &dir, &here)?,
-                Err(_) => 0,
+            // (what was removed above is reported even when this fails)
+            let unregistered = match std::env::current_dir()
+                .map_err(anyhow::Error::from)
+                .and_then(|here| reclaim::prune_registrations(ctx, &dir, &here))
+            {
+                Ok(n) => n,
+                Err(e) => {
+                    eprintln!("warning: cannot drop the registrations of worktrees whose files are gone: {e:#}");
+                    0
+                }
             };
             let after =
                 reclaim::disk_usage(&dir.join("wt")) + reclaim::disk_usage(&dir.join("trash"));

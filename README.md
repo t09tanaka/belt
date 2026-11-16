@@ -746,8 +746,9 @@ When registrations are left anyway (by an earlier version, or by a run killed
 between deleting a worktree and unregistering it), nothing in the cache says
 whose they were. Run `local-ci cache prune` in the repository: it also drops
 the registrations there of worktrees under the cache directory whose files
-are gone. Locked registrations, and those that point anywhere else, are left
-alone.
+are gone. Locked registrations are left alone. When it finds one of its own,
+it runs `git worktree prune`, as a run does, so any other registration of
+that repository whose directory is gone is dropped too.
 
 Two kinds of entries are never removed by a run:
 

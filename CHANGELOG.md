@@ -3,7 +3,7 @@
 ## [Unreleased]
 
 - Fix worktree registrations left in the repository when the checkout a run was started from (a linked worktree) is removed while the run goes on. The run ran `git worktree prune` in that checkout, which failed once it was gone, and the failure was not reported; the files were deleted, so nothing in the cache said whose the registration was and `local-ci cache prune` could not drop it. A run now unregisters each worktree in the repository the worktree itself is registered in.
-- `local-ci cache prune`, run in a repository, also drops the registrations there of local-ci worktrees under the cache directory whose files are gone (left by an earlier version, or by a run killed between deleting and unregistering), and says how many. Locked registrations and paths that are not local-ci's are left alone.
+- `local-ci cache prune`, run in a repository, also drops the registrations there of local-ci worktrees under the cache directory whose files are gone (left by an earlier version, or by a run killed between deleting and unregistering), and says how many. Locked registrations are left alone; like a run, it does so with `git worktree prune`.
 
 ## [0.17.0] - 2026-11-16
 
