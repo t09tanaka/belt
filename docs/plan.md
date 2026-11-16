@@ -1068,3 +1068,20 @@ S22 の残り（必須。この変更で S22 は完了しない）:
 2. drain の確認と受理の間に、非常に短い競合が残る（受理が drain の確認を通った直後に stop が 0 件を 2 回数える）。実機での stop と受理の同時試験は S26 で行う。
 3. `system-user`（LaunchDaemon の `UserName`）の導入、Linux、upgrade・rollback・doctor・`workers forget`、fish / csh のログインシェル対応は未実装（S23・S24）。
 4. 実 SQLite の live attempt を持つ worker に対する stop の待ち・cancel の end-to-end（agent の cancel は統合試験済みだが、helper の待ちは注入した計数での単体試験）。
+
+### S23 workers upgrade と rollback（2026-11-17）
+
+`workers upgrade <worker>` を CLI へ接続した（`Envelope::not_implemented` に落ちなくなった）。`doctor` は次の変更で接続する。
+
+- worker host の helper に hidden の `worker-service upgrade` と `rollback` を足した（`src/service/worker_service/upgrade.rs`）。どちらも「目標の版へ切り替える」同じ再開可能な手順で、順序は 配置（版別 directory、既存 file は上書きしない）→ 互換検査（新しい版が worker.json・identity binding・worker DB を読めるか。DB は互換表つきの read-only open で、その場で migrate しない）→ live attempt が 0 になるのを待って旧 service を bootout → journal へ切替を記録 → 旧 plist を receipt で確かめて削除 → worker.json → `bin/current` を rename で付け替え → 新 plist を journal つきで公開 → 起動、である。journal の `switch`（切替元の版と、まだ消していない旧 plist の receipt）は切替の間だけ書き、終われば消す。静止時の journal は S22 の版がそのまま読める形のままである。途中のどの step で落ちても、`upgrade` の再実行で完了し、`rollback` で元に戻る（全 step への失敗注入で確認）。版ごとの worker.json は `bin/<digest>/worker.json` に bytes のまま残し、戻すときはその bytes を使う。drain marker は helper が触らず、resume は親が health の後に行う。
+- 親側（`src/service/workers/upgrade.rs`）は、staging（digest 照合。壊れた転送は公開されない）→ status → drain → helper の `upgrade` → health（host の status が新しい版・loaded・ready で、登録済みの `bin/current` 経由の bridge が `hello` に同じ cluster と worker_id で答える）→ resume の順に行う。失敗の報告は 3 つに分ける。切替が始まる前の失敗は rollback を呼ばず「upgrade されていない、前の版が動いている」と報告する。切替が始まった後の失敗は `rollback` し、前の版にも同じ health を通してから「rollback して前の版が動いている」と報告する（exit は CONFLICT）。rollback も失敗したとき・host を観測できないときは、最後に観測した状態（版・切替が未完か・service が loaded か・agent が ready か・drain 中か）をそのまま言い、「upgraded」「stopped」「serving again」のどれも言わない。観測できなければ `COMMUNICATION_UNKNOWN` とする。利用者が先に drain していた worker は upgrade 後も drain のままにし、resume しない。
+- 親自身の更新との順序: 仕様は親と worker の更新順を定めていない。この実装は「親の binary（この CLI 自身）を worker へ配る」ので、親を先に更新してから `workers upgrade` を実行する形になる。health の `hello` はこの CLI からのものである。
+
+受入項目との対応: A34 のうち upgrade・rollback・失敗からの再開・実行中 binary を上書きしないこと（`bin/<旧 digest>/` の bytes が全経路で変わらないこと）を、偽の Launcher・偽の ssh・一時 HOME で試験した。A36 のうち S23 の分は「静止時の worker-service journal と status JSON が S22 の版でも読める形のままであること」（旧 schema の厳格な読み取りで検証）と、既存の `workers` 系コマンドの統合試験が変わらず通ることである。
+
+S23 の残り（必須。この変更で S23 は完了しない）:
+1. `doctor` と A05（次の変更）。
+2. 本物の launchd・実 SSH・実機での upgrade / rollback（A34 の native 検証、S26）は未実施。
+3. 動いている resident（古い版のままのことがある）が upgrade 後の worker と hello できるかは、この command では確かめていない。resident は切断を検知して自分で再接続し、必須 feature が合わなければ `protocol_incompatible` になる。resident 自身の更新手順（init の「changed bytes は別の upgrade flow」）は未実装で、S23 の範囲外として残る。
+4. rollback で戻した版の plist は、新しい版の helper が描いた内容である。plist の描き方が版の間で変わると、戻した先の古い helper は「installed plan differs」で start / stop を拒否する（現時点では描き方は変わっていない）。
+5. live attempt があるあいだ upgrade は待ち（既定 600 秒）、時間切れなら何も切り替えずに失敗する。稼働中の attempt を旧版の supervisor のまま残して agent だけを切り替えることはしない。

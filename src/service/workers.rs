@@ -573,33 +573,17 @@ pub fn add(
     })
 }
 
-fn install_remote(
+/// Make sure the binary `exe` (whose SHA-256 is `digest`) is staged on a
+/// macOS host of this architecture. An already staged copy is not sent again.
+fn ensure_staged(
     remote: &mut impl Remote,
-    spec: &Spec,
-    exe: &Path,
-    name: &str,
     target: &SshTarget,
-) -> Result<Status, ApiError> {
+    exe: &Path,
+    digest: &str,
+) -> Result<(), ApiError> {
     let internal = |e: &dyn std::fmt::Display| ApiError::new(ErrorCode::Internal, e.to_string());
-    if remote.parent_os() != "macos" {
-        return Err(invalid(
-            "installing a worker is implemented for macOS parents and workers only",
-        ));
-    }
-    let cluster = spec
-        .expected_cluster
-        .clone()
-        .ok_or_else(|| invalid("the coordinator has no cluster identity; run init"))?;
-    let cluster_expected = cluster.clone();
-    let key = crate::secrets::key::load(&spec.cluster_key_path).map_err(|e| internal(&e))?;
-    let digest = worker_service::sha256_file(exe).map_err(|e| internal(&e))?;
     let probe = remote
-        .run(
-            target,
-            &probe_command(&digest),
-            &[],
-            Duration::from_secs(60),
-        )
+        .run(target, &probe_command(digest), &[], Duration::from_secs(60))
         .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
     if probe.code != Some(0) {
         return Err(ApiError::new(
@@ -626,7 +610,7 @@ fn install_remote(
         let out = remote
             .run(
                 target,
-                &stage_command(&digest),
+                &stage_command(digest),
                 &binary,
                 Duration::from_secs(600),
             )
@@ -638,6 +622,30 @@ fn install_remote(
             ));
         }
     }
+    Ok(())
+}
+
+fn install_remote(
+    remote: &mut impl Remote,
+    spec: &Spec,
+    exe: &Path,
+    name: &str,
+    target: &SshTarget,
+) -> Result<Status, ApiError> {
+    let internal = |e: &dyn std::fmt::Display| ApiError::new(ErrorCode::Internal, e.to_string());
+    if remote.parent_os() != "macos" {
+        return Err(invalid(
+            "installing a worker is implemented for macOS parents and workers only",
+        ));
+    }
+    let cluster = spec
+        .expected_cluster
+        .clone()
+        .ok_or_else(|| invalid("the coordinator has no cluster identity; run init"))?;
+    let cluster_expected = cluster.clone();
+    let key = crate::secrets::key::load(&spec.cluster_key_path).map_err(|e| internal(&e))?;
+    let digest = worker_service::sha256_file(exe).map_err(|e| internal(&e))?;
+    ensure_staged(remote, target, exe, &digest)?;
     let request = InstallRequest {
         schema: 1,
         cluster,
@@ -894,6 +902,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
             };
             (name, action, lifecycle_of(name, action))
         }
+        WorkersSub::Upgrade { name } => return Some(upgrade::command(name, json, &env, exe)),
         _ => return None,
     };
     let text = result
@@ -906,6 +915,8 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
         || text,
     ))
 }
+
+pub mod upgrade;
 
 #[cfg(test)]
 mod tests;

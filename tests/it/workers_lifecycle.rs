@@ -10,22 +10,22 @@ use std::process::Output;
 
 const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
 
-struct Fx {
+pub(super) struct Fx {
     dir: super::common::Tmp,
 }
 impl Fx {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let dir = super::common::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("home")).unwrap();
         std::fs::create_dir(dir.path().join("bin")).unwrap();
         Fx { dir }
     }
-    fn path(&self, name: &str) -> std::path::PathBuf {
+    pub(super) fn path(&self, name: &str) -> std::path::PathBuf {
         self.dir.path().join(name)
     }
     /// An initialized coordinator: the retained input names the cluster, as
     /// `init` leaves it. Nothing is started.
-    fn init(&self) -> ClusterId {
+    pub(super) fn init(&self) -> ClusterId {
         use remote_task_runner::service::bootstrap::{write_input, Spec};
         let dir = self.path("home/.config/remote-task-runner");
         std::fs::create_dir_all(&dir).unwrap();
@@ -58,13 +58,13 @@ impl Fx {
         write_input(&dir.join("coordinator.json"), &spec).unwrap();
         cluster
     }
-    fn config(&self, text: &str) {
+    pub(super) fn config(&self, text: &str) {
         let dir = self.path("home/.config/remote-task-runner");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), text).unwrap();
     }
     /// A fake ssh: records its argv (one per line) and runs `body`.
-    fn ssh(&self, body: &str) {
+    pub(super) fn ssh(&self, body: &str) {
         let script = format!(
             "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n{body}\n",
             self.path("argv").display()
@@ -73,7 +73,7 @@ impl Fx {
         std::fs::write(&path, script).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
-    fn run(&self, args: &[&str]) -> Output {
+    pub(super) fn run(&self, args: &[&str]) -> Output {
         std::process::Command::new(BIN)
             .arg("--json")
             .args(args)
@@ -86,7 +86,7 @@ impl Fx {
             .output()
             .unwrap()
     }
-    fn argv(&self) -> Vec<String> {
+    pub(super) fn argv(&self) -> Vec<String> {
         std::fs::read_to_string(self.path("argv"))
             .unwrap()
             .lines()
@@ -108,7 +108,7 @@ fn answer(cluster: &ClusterId, worker: &str, draining: bool, loaded: bool) -> St
     )
 }
 
-fn json(out: &Output) -> serde_json::Value {
+pub(super) fn json(out: &Output) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).expect("stdout is one JSON document")
 }
 
