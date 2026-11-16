@@ -4328,6 +4328,10 @@ async fn an_operator_drain_is_reported_and_a_cancel_request_stops_the_live_attem
     let a = AttemptId::generate();
     submit(&c, &a, &payload(&script)).await;
     wait_for("the command", || read_pid(&pidfile).is_some());
+    // The pid file appears before the attempt leaves Starting.
+    wait_for("the running state", || {
+        f.rec(&a).state == AttemptState::Active
+    });
     control::write(&f.state(), Control::draining()).unwrap();
     assert!(inspect_draining(&c).await);
     agent.tick();
