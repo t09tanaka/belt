@@ -51,6 +51,10 @@ pub enum Action {
     Drain,
     Resume,
     Status,
+    /// Switch this host to the binary that runs the action (request on stdin).
+    Upgrade,
+    /// Switch this host back to an already installed version (request on stdin).
+    Rollback,
 }
 
 /// What the parent sends on stdin for `install`. The key travels only here.
@@ -85,6 +89,10 @@ pub struct Status {
     /// non-login ssh PATH.
     #[serde(default)]
     pub bridge_binary: Option<String>,
+    /// The version an unfinished switch started from. While this is set the
+    /// host is between versions and `upgrade` or `rollback` must finish it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switching_from: Option<String>,
 }
 
 pub struct Paths {
@@ -140,6 +148,10 @@ struct Journal {
     binary_sha256: String,
     env: BTreeMap<String, String>,
     receipt: Option<macos::Receipt>,
+    /// An unfinished version switch. Omitted when there is none, so a journal
+    /// at rest keeps the exact shape every earlier version reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    switch: Option<upgrade::Switch>,
 }
 
 fn euid() -> u32 {
@@ -607,6 +619,7 @@ pub fn install<L: Launcher>(
                 binary_sha256: digest.clone(),
                 env: spec.env.clone(),
                 receipt: None,
+                switch: None,
             };
             save_journal(&paths, &fresh)?;
             fresh
@@ -768,10 +781,9 @@ pub fn status<L: Launcher>(
     let paths = Paths::resolve(env)?;
     let journal = require_journal(&paths)?;
     let plan = plan(&paths, &journal)?;
-    let receipt = journal
-        .receipt
-        .clone()
-        .context("service was never installed")?;
+    let Some(receipt) = journal.receipt.clone() else {
+        return upgrade::unsettled_status(&paths, &journal);
+    };
     let ready = agent_reachable(&paths.state);
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
@@ -802,6 +814,7 @@ fn status_with<L: Launcher>(
         bridge_binary: fs::symlink_metadata(paths.current_link())
             .ok()
             .and_then(|_| paths.bridge_binary().to_str().map(str::to_owned)),
+        switching_from: journal.switch.as_ref().map(|s| s.from.clone()),
     })
 }
 
@@ -833,6 +846,16 @@ pub fn handle<L: Launcher>(
         Action::Drain => drain(env, launcher),
         Action::Resume => resume(env, launcher),
         Action::Status => status(env, launcher),
+        Action::Upgrade => {
+            let request = serde_json::from_slice(stdin).context("upgrade request unreadable")?;
+            upgrade::upgrade(env, &request, current_exe, launcher, options, &mut |_| {
+                Ok(())
+            })
+        }
+        Action::Rollback => {
+            let request = serde_json::from_slice(stdin).context("rollback request unreadable")?;
+            upgrade::rollback(env, &request, launcher, options, &mut |_| Ok(()))
+        }
     }
 }
 
@@ -844,7 +867,7 @@ pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
         .filter_map(|k| Some((k.to_string(), std::env::var_os(k)?.into_string().ok()?)))
         .collect();
     let mut stdin = Vec::new();
-    if action == Action::Install
+    if matches!(action, Action::Install | Action::Upgrade | Action::Rollback)
         && std::io::stdin()
             .take(LIMIT + 1)
             .read_to_end(&mut stdin)
@@ -852,7 +875,7 @@ pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
     {
         println!(
             "{}",
-            serde_json::json!({"ok": false, "error": "install request unreadable"})
+            serde_json::json!({"ok": false, "error": "request unreadable"})
         );
         return 2;
     }
@@ -886,6 +909,8 @@ pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
         }
     }
 }
+
+pub mod upgrade;
 
 #[cfg(test)]
 pub(crate) mod tests;
