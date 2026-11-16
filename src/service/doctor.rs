@@ -127,7 +127,17 @@ pub trait Runner {
     ) -> Option<(i32, String)>;
 }
 
-pub struct SystemRunner;
+pub struct SystemRunner {
+    /// How long one command may take before it is stopped and counts as unanswered.
+    pub timeout: Duration,
+}
+impl Default for SystemRunner {
+    fn default() -> Self {
+        SystemRunner {
+            timeout: COMMAND_TIMEOUT,
+        }
+    }
+}
 impl Runner for SystemRunner {
     fn run(
         &mut self,
@@ -150,7 +160,7 @@ impl Runner for SystemRunner {
             let _ = pipe.take(OUTPUT_LIMIT).read_to_string(&mut text);
             text
         });
-        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        let deadline = Instant::now() + self.timeout;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
@@ -563,7 +573,7 @@ pub fn host_main() -> i32 {
     let answer = super::worker_service::service_view(&env, super::macos::NativeLauncher::default())
         .map(|(status, state, service_env)| HostAnswer {
             status,
-            facts: gather(&state, &service_env, &mut SystemRunner),
+            facts: gather(&state, &service_env, &mut SystemRunner::default()),
         });
     match answer {
         Ok(answer) => {
@@ -813,7 +823,7 @@ pub fn command(json: bool) -> i32 {
             let spec = super::context::runtime_spec(&env)?;
             let report = run(
                 &mut workers::SshRemote,
-                &mut SystemRunner,
+                &mut SystemRunner::default(),
                 &env,
                 &spec,
                 &version,

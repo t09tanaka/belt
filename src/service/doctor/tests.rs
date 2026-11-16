@@ -988,7 +988,8 @@ fn an_endpoint_is_local_only_as_a_socket_or_a_pipe() {
 #[test]
 fn the_system_runner_returns_the_exit_code_and_output_in_the_given_environment() {
     let env = BTreeMap::from([("DOCTOR_TEST".to_string(), "seen".to_string())]);
-    let mut runner = SystemRunner;
+    let mut runner = SystemRunner::default();
+    assert_eq!(runner.timeout, Duration::from_secs(10));
     assert_eq!(
         runner.run(
             Path::new("/bin/sh"),
@@ -1059,4 +1060,41 @@ fn unsupported_legacy_keys_are_noticed_only_when_they_carry_a_value() {
     let checks = project_checks(Err("bad toml".into()));
     assert_eq!(checks[0].level, Level::NotChecked);
     assert!(checks[0].detail.contains("bad toml"));
+}
+
+#[test]
+fn a_command_that_does_not_finish_is_stopped_and_counts_as_unanswered() {
+    let mut runner = SystemRunner {
+        timeout: Duration::from_millis(200),
+    };
+    let started = Instant::now();
+    assert_eq!(
+        runner.run(
+            Path::new("/bin/sh"),
+            &["-c", "exec sleep 30"],
+            &BTreeMap::new()
+        ),
+        None
+    );
+    assert!(started.elapsed() < Duration::from_secs(10));
+    // One that finishes inside the limit is answered.
+    assert_eq!(
+        runner.run(Path::new("/bin/sh"), &["-c", "exit 0"], &BTreeMap::new()),
+        Some((0, String::new()))
+    );
+}
+
+#[test]
+fn the_worker_scope_is_the_one_the_agent_gives_its_supervisors() {
+    let agent = crate::worker::agent::AgentConfig::new(
+        PathBuf::from("/w"),
+        WorkerId::parse("mini-a").unwrap(),
+        crate::ids::WorkerBootId::parse("boot").unwrap(),
+        PathBuf::from("/bin/rtr"),
+    );
+    let (state, config) = worker_scope_paths(&agent.state_dir);
+    assert_eq!(state, agent.traffic_state_dir);
+    // No separate configuration file is set: the default lies in the scope.
+    assert_eq!(agent.traffic_config, None);
+    assert_eq!(config, agent.traffic_state_dir.join("config.toml"));
 }

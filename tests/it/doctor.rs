@@ -11,6 +11,12 @@ fn tool(fx: &Fx, name: &str, body: &str) {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// A docker client that reaches no engine, first on PATH, so a real one on
+/// the machine that runs the test never decides the result.
+fn no_engine(fx: &Fx) {
+    tool(fx, "docker", "exit 1");
+}
+
 fn check<'a>(report: &'a serde_json::Value, host: &str, id: &str) -> &'a serde_json::Value {
     report["result"]["checks"]
         .as_array()
@@ -32,9 +38,14 @@ fn an_uninitialized_parent_is_told_to_run_init() {
 fn a_parent_without_a_separate_command_is_healthy() {
     let fx = Fx::new();
     fx.init();
+    no_engine(&fx);
     let out = fx.run(&["doctor"]);
     let report = json(&out);
     assert_eq!(out.status.code(), Some(0), "{report}");
+    assert_eq!(
+        check(&report, "parent", "docker_resource_domain")["level"],
+        "notice"
+    );
     assert_eq!(report["ok"], true);
     assert_eq!(report["result"]["healthy"], true);
     assert_eq!(check(&report, "parent", "traffic_runtime")["level"], "ok");
@@ -118,6 +129,7 @@ fn an_unreachable_worker_fails_and_the_diff_slot_is_listed_as_not_checked() {
 fn text_mode_lists_every_check_and_exits_by_the_result() {
     let fx = Fx::new();
     fx.init();
+    no_engine(&fx);
     let run = || {
         std::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
             .arg("doctor")
