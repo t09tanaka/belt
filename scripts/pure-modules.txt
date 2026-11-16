@@ -1,6 +1,7 @@
 src/ci/summary.rs
 src/outputs.rs
 src/toolchain/capability.rs
+src/toolchain/envdiff.rs
 src/toolchain/contract.rs
 src/service/completion.rs
 src/ids.rs

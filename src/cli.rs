@@ -243,7 +243,10 @@ pub enum WorkersSub {
     /// Upgrade a worker.
     Upgrade { name: String },
     /// Show differences from the project requirements.
-    Diff { name: String },
+    Diff {
+        /// A registered worker; every registered worker when omitted.
+        name: Option<String>,
+    },
     /// Sync a worker with the project requirements.
     Sync {
         name: String,

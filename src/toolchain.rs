@@ -8,6 +8,8 @@ pub mod profile;
 pub mod registry;
 
 pub mod declarations;
+pub mod envdiff;
+pub mod envreport;
 pub mod snapshot;
 pub mod versions;
 

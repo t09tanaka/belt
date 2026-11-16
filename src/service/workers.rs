@@ -5,6 +5,7 @@
 //! "stopped". No ssh agent forwarding, no copy of any ssh private key.
 use super::bootstrap::Spec;
 use super::worker_service::{self, InstallRequest, Status};
+use crate::toolchain::envdiff::{self, EnvReport, Item};
 use crate::{
     cli::WorkersSub,
     config::paths::user_config_path,
@@ -228,13 +229,26 @@ pub fn helper_command(
     ) {
         words.push(quote("--cancel-running"));
     }
-    let words = words.join(" ");
+    launch(binary, digest, &words.join(" "))
+}
+
+/// `exec` of the worker's own binary (or the staged one) with fixed `words`.
+fn launch(binary: Option<&str>, digest: &str, words: &str) -> String {
     if let Some(binary) = binary {
         return format!("exec {} {words}", quote(binary));
     }
     format!(
         "b=\"{STAGING}/rtr-{digest}\"; if [ -x \"$b\" ]; then exec \"$b\" {words}; else exec {} {words}; fi",
         quote("remote-task-runner")
+    )
+}
+
+/// The shell string asking a worker's binary for its environment report.
+pub fn env_command(binary: Option<&str>, digest: &str) -> String {
+    launch(
+        binary,
+        digest,
+        &format!("{} {}", quote("worker-service"), quote("env")),
     )
 }
 
@@ -797,6 +811,120 @@ pub fn reload_resident(spec: &Spec) -> ResidentReload {
     }
 }
 
+/// What a worker answered to `worker-service env`. An older binary does not
+/// know the action: that is said, never turned into an empty difference.
+fn parse_env_reply(out: &RemoteOutput) -> Result<EnvReport, ApiError> {
+    let unreadable = || {
+        ApiError::new(
+            ErrorCode::Conflict,
+            "the worker's binary does not support environment reports; reinstall it with workers add --install",
+        )
+    };
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| unreadable())?;
+    if value["ok"] == true {
+        return serde_json::from_value(value["env"].clone()).map_err(|_| unreadable());
+    }
+    Err(ApiError::new(
+        ErrorCode::Conflict,
+        format!(
+            "worker environment report refused: {}",
+            value["error"].as_str().unwrap_or("unspecified")
+        ),
+    ))
+}
+
+/// The environment of a registered worker, measured by its own binary.
+pub fn fetch_env(
+    remote: &mut impl Remote,
+    env: &BTreeMap<String, String>,
+    exe: &Path,
+    name: &str,
+) -> Result<EnvReport, ApiError> {
+    check_name(name)?;
+    let registration = registered(env, name)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no such worker is registered"))?;
+    let target = target_of(&registration.ssh)?;
+    let digest = worker_service::sha256_file(exe)
+        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    let out = remote
+        .run(
+            &target,
+            &env_command(registration.binary.as_deref(), &digest),
+            &[],
+            Duration::from_secs(60),
+        )
+        .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
+    parse_env_reply(&out)
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkerDiff {
+    pub worker: String,
+    pub all_same: bool,
+    pub items: Vec<Item>,
+}
+
+/// `workers diff [<worker>]`: the parent's environment against each named
+/// (or every registered) worker. `local` measures the parent.
+pub fn diff_workers(
+    remote: &mut impl Remote,
+    env: &BTreeMap<String, String>,
+    exe: &Path,
+    name: Option<&str>,
+    local: impl FnOnce() -> Result<EnvReport, String>,
+) -> Result<Vec<WorkerDiff>, ApiError> {
+    let names = match name {
+        Some(name) => vec![name.to_string()],
+        None => registered_names(env)?,
+    };
+    let parent = local().map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
+    names
+        .into_iter()
+        .map(|worker| {
+            let report = fetch_env(remote, env, exe, &worker)?;
+            let items = envdiff::diff(&parent, &report);
+            Ok(WorkerDiff {
+                all_same: envdiff::all_same(&items),
+                worker,
+                items,
+            })
+        })
+        .collect()
+}
+
+fn registered_names(env: &BTreeMap<String, String>) -> Result<Vec<String>, ApiError> {
+    let (path, text) = read_user_config(env)?;
+    let user = crate::config::parse::parse_user(&path.to_string_lossy(), &text)
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok(user.workers.into_iter().map(|w| w.id).collect())
+}
+
+/// Plain text for `workers diff`: one line per item.
+pub fn render_diff(diffs: &[WorkerDiff]) -> String {
+    let mut lines = Vec::new();
+    for d in diffs {
+        lines.push(format!("worker {}", d.worker));
+        for i in &d.items {
+            let class = serde_json::to_value(i.class)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let mut line = format!(
+                "  {:<24} {:<16} parent={} worker={}",
+                i.subject,
+                class,
+                i.parent.as_deref().unwrap_or("-"),
+                i.worker.as_deref().unwrap_or("-")
+            );
+            if let Some(steps) = &i.steps {
+                line.push_str(&format!("  -> {steps}"));
+            }
+            lines.push(line);
+        }
+    }
+    lines.join("\n")
+}
+
 fn emit(
     json: bool,
     result: Result<serde_json::Value, ApiError>,
@@ -893,6 +1021,23 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                 cancel_running: *cancel_running,
             };
             (name, action, lifecycle_of(name, action))
+        }
+        WorkersSub::Diff { name } => {
+            let result = (|| {
+                let exe = exe
+                    .as_ref()
+                    .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+                let spec = super::context::runtime_spec(&env)?;
+                diff_workers(&mut SshRemote, &env, exe, name.as_deref(), || {
+                    crate::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env)
+                })
+            })()
+            .map(|diffs| {
+                let text = render_diff(&diffs);
+                (serde_json::json!({ "workers": diffs }), text)
+            });
+            let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
+            return Some(emit(json, result.map(|(v, _)| v), || text));
         }
         _ => return None,
     };

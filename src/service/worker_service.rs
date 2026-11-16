@@ -51,6 +51,8 @@ pub enum Action {
     Drain,
     Resume,
     Status,
+    /// Print this host's environment report (read-only; `workers diff`).
+    Env,
 }
 
 /// What the parent sends on stdin for `install`. The key travels only here.
@@ -833,7 +835,21 @@ pub fn handle<L: Launcher>(
         Action::Drain => drain(env, launcher),
         Action::Resume => resume(env, launcher),
         Action::Status => status(env, launcher),
+        Action::Env => anyhow::bail!("env is answered by env_main"),
     }
+}
+
+/// The environment of this worker, measured with the persisted inputs its
+/// resident uses (its own PATH and profile), not the caller's.
+pub fn env_report(
+    env: &BTreeMap<String, String>,
+) -> anyhow::Result<crate::toolchain::envdiff::EnvReport> {
+    let paths = Paths::resolve(env)?;
+    let bytes = std::fs::read(&paths.input).context("worker input unreadable")?;
+    anyhow::ensure!(bytes.len() as u64 <= LIMIT, "worker input too large");
+    let spec: super::worker::WorkerSpec =
+        serde_json::from_slice(&bytes).context("worker input invalid")?;
+    crate::toolchain::envreport::collect(&spec.state_dir, &spec.env).map_err(anyhow::Error::msg)
 }
 
 /// The hidden `worker-service` command. Drain, resume and status never touch
@@ -843,6 +859,21 @@ pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
         .iter()
         .filter_map(|k| Some((k.to_string(), std::env::var_os(k)?.into_string().ok()?)))
         .collect();
+    if action == Action::Env {
+        return match env_report(&env) {
+            Ok(report) => {
+                println!("{}", serde_json::json!({"ok": true, "env": report}));
+                0
+            }
+            Err(error) => {
+                println!(
+                    "{}",
+                    serde_json::json!({"ok": false, "error": format!("{error:#}")})
+                );
+                1
+            }
+        };
+    }
     let mut stdin = Vec::new();
     if action == Action::Install
         && std::io::stdin()

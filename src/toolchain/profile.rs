@@ -321,6 +321,10 @@ impl Profile {
         }
         Ok(profile)
     }
+    /// The absolute PATH directories the profile executes with.
+    pub fn path_dirs(&self) -> &[PathBuf] {
+        &self.definition.path
+    }
     pub fn required_tools(&self) -> &BTreeSet<String> {
         &self.definition.required_tools
     }

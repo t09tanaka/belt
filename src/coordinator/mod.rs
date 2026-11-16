@@ -1498,9 +1498,12 @@ impl Coordinator {
                         .is_empty()
                 });
             excluded.extend(mismatched.into_iter().map(|w| Excluded {
-                unmet: crate::toolchain::capability::missing(
-                    &spec.requirements,
-                    w.capabilities.as_ref(),
+                unmet: crate::toolchain::envdiff::with_steps(
+                    crate::toolchain::capability::missing(
+                        &spec.requirements,
+                        w.capabilities.as_ref(),
+                    ),
+                    &spec.requirements.requires,
                 ),
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::CapabilityMismatch,

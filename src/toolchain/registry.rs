@@ -43,6 +43,12 @@ struct Registered {
     host: HostTools,
     catalog: Digest,
 }
+/// What one recipe may install and what is installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledInventory {
+    pub inventory: Vec<String>,
+    pub installed: Vec<String>,
+}
 /// A negative result is deliberately distinct from an installable request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unavailable {
@@ -318,6 +324,64 @@ impl Registry {
             },
             plan,
         ))
+    }
+    /// For each configured recipe: the operator-authorized inventory and the
+    /// subset whose private install is present and receipt-valid right now.
+    /// Read-only (the same detect used at admission); a version that cannot be
+    /// proven installed counts as not installed, never as installed.
+    pub fn installed_inventory(&self) -> BTreeMap<String, InstalledInventory> {
+        use super::versions::{Declaration, MatchPolicy, Scope};
+        let mut out = BTreeMap::new();
+        for (tool, entry) in &self.recipes {
+            let mut installed = Vec::new();
+            for version in &entry.recipe.inventory {
+                let scope = Scope::project("");
+                let Ok(constraint) = Constraint::parse(&version.to_string()) else {
+                    continue;
+                };
+                let Ok(frozen) = FrozenToolchains::freeze(
+                    Digest::of_bytes(b"installed inventory"),
+                    self.profile_definition.clone(),
+                    scope.clone(),
+                    &[Declaration {
+                        tool: tool.clone(),
+                        constraint,
+                        scope,
+                        location: super::versions::Location {
+                            path: "inventory".into(),
+                            first_line: 1,
+                            last_line: 1,
+                        },
+                    }],
+                    &[],
+                    &BTreeMap::new(),
+                    MatchPolicy::Exact,
+                ) else {
+                    continue;
+                };
+                let present = self
+                    .request(&frozen, tool, None)
+                    .ok()
+                    .and_then(|request| self.detect(&request).ok())
+                    .is_some_and(|a| matches!(a, Availability::Installed(_)));
+                if present {
+                    installed.push(version.to_string());
+                }
+            }
+            out.insert(
+                tool.as_str().to_string(),
+                InstalledInventory {
+                    inventory: entry
+                        .recipe
+                        .inventory
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect(),
+                    installed,
+                },
+            );
+        }
+        out
     }
     /// Detect only the indexed exact artifact using its validated adapter receipt.
     pub fn detect(&self, request: &PreparationRequest) -> Result<Availability, Unavailable> {

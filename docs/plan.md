@@ -1068,3 +1068,15 @@ S22 の残り（必須。この変更で S22 は完了しない）:
 2. drain の確認と受理の間に、非常に短い競合が残る（受理が drain の確認を通った直後に stop が 0 件を 2 回数える）。実機での stop と受理の同時試験は S26 で行う。
 3. `system-user`（LaunchDaemon の `UserName`）の導入、Linux、upgrade・rollback・doctor・`workers forget`、fish / csh のログインシェル対応は未実装（S23・S24）。
 4. 実 SQLite の live attempt を持つ worker に対する stop の待ち・cancel の end-to-end（agent の cancel は統合試験済みだが、helper の待ちは注入した計数での単体試験）。
+
+### S21 `workers diff`（2026-11-17、1 本目: diff と待機理由の手順）
+
+`workers diff [<worker>]` を実装した。親と worker は同じ測定関数（`toolchain::envreport::collect`）で測り、worker 側は登録済みの binary の隠し action `worker-service env` が ssh 越しに JSON の環境 report を返す。測定は resident と同じ永続入力（worker.json の env と profile の PATH）を使い、ssh セッションの PATH は使わない。report は tool ごとの観測（available / unavailable / unknown）と版、版管理 adapter（registry）の導入候補と導入済みの版、task-traffic-controller・local-ci・remote-task-runner の版、`docker info` による実行可否、空き disk、profile digest、policy digest を持つ。
+
+差の判定は純粋関数 `toolchain::envdiff::diff(parent, worker) -> Vec<Item>`（`doctor` から呼べるよう公開、PURE 対象）。分類は `same / differs / missing / auto_installable / manual_required` で、優先順位は次のとおり。unknown は同じと見なさない（`differs`）。manual の tool（xcode・docker）は版 manager が候補を持っていても常に `manual_required`。worker の版 manager に導入済みの版は、既定の版が違っても `same`。導入候補にある版が未導入なら `auto_installable`、候補外なら `missing` か `differs`。手順（steps）は項目ごとに付ける。古い binary が action を知らない場合や応答が読めない場合は `CONFLICT` で、空の差にはしない。
+
+適合 worker が無い submit の待機理由（`unmet`）には、未充足の tool 要求の直後に `how: …`（128 文字以内、文字数で切る）の 1 行を足す（`envdiff::with_steps`、`task_waiting` と `estimate` の両方）。manual の tool は固定の手順、それ以外は「worker に導入して `workers diff` を再実行」とする。
+
+A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一時 HOME の `src/service/workers/tests.rs`、実 binary・偽 ssh・偽の tool shim の `tests/it/workers_lifecycle.rs`（`a44`）。ネットワークには出ない。
+
+残り（S21 は完了していない）: `workers sync` の実際の導入（worker 側の warm-up 要求。導入は admitted な setup builder の poll_tool 経由でしか始まらないため、既存の認証済み経路へ要求を足す必要がある）、`doctor` への組み込み（S23）、`diff` の worker 省略時の並列化、実機での受入（S26）。
