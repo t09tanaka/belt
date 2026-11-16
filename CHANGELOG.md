@@ -16,10 +16,12 @@ the minor version).
   estimates). The colors no longer mark entries; they mark the git worktree
   a command was queued from, so two parallel runs of one repository from
   different worktrees can be told apart. The row of your own worktree is
-  bold with a `›`. Held entries are one line at the bottom.
+  bold, with `(current)` after its branch in a `worktree` column. Held
+  entries are one line at the bottom. An empty queue lists the last five
+  finished runs; a queue with nobody waiting says what would start at once.
 - `exec` records the worktree and branch it was called from in the ledger
   (`worktree`, `branch`; absent in older entries, ignored by older
-  versions). They are not part of the history key.
+  versions), and in `history.jsonl`. They are not part of the history key.
 
 ## [0.9.0] - 2026-11-16
 

@@ -77,6 +77,8 @@ fn record(key: &str, wall: f64) -> Record {
         weight_used: 1,
         contended: false,
         measurement_id: None,
+        worktree: None,
+        branch: None,
     }
 }
 
