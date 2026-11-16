@@ -9,7 +9,7 @@ repository = "https://github.com/t09tanaka/local-ci"
 readme = "README.md"
 keywords = ["ci", "github-actions", "workflow", "local", "dev-tools"]
 categories = ["command-line-utilities", "development-tools"]
-include = ["src/**/*", "tests/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE"]
+include = ["src/**/*", "tests/**/*", "examples/**/*", "!examples/**/node_modules/**", "!examples/**/.npm-ci.lock", "README.md", "CHANGELOG.md", "LICENSE"]
 
 [lib]
 name = "local_ci"
