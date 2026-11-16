@@ -94,6 +94,51 @@ fn admit_now(ctx: &Context, cfg: &Config, id: &str) {
 }
 
 #[test]
+fn a_rewritten_sidecar_and_ledger_keep_fields_this_binary_does_not_know() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, cfg) = (ctx(dir.path()), Config::default());
+    let s = spec(dir.path(), "cmd-u", "digest-1", &["true"]);
+    let (_r, _g) = registered(managed::register(&ctx, &cfg, &s).unwrap());
+    let edit = |path: std::path::PathBuf, f: &dyn Fn(&mut serde_json::Value)| {
+        let mut v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        f(&mut v);
+        std::fs::write(&path, v.to_string()).unwrap();
+    };
+    let future = serde_json::json!({"a": {"b": [1, null]}});
+    edit(ctx.paths.managed_file("cmd-u"), &|v| {
+        v["future"] = future.clone()
+    });
+    edit(ctx.paths.ledger_file(), &|v| {
+        let key = if v.get("entries_v2").is_some() {
+            "entries_v2"
+        } else {
+            "entries"
+        };
+        v[key][0]["future"] = future.clone();
+        v["top_future"] = future.clone();
+    });
+    let mut sc = sidecar(&ctx, "cmd-u");
+    sc.phase = Phase::LaunchIntent;
+    managed::write_sidecar(&ctx, &sc).unwrap();
+    let mut l = ledger(&ctx);
+    l.entries[0].state = State::Running;
+    l.save(&ctx.paths.ledger_file()).unwrap();
+    let side: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ctx.paths.managed_file("cmd-u")).unwrap()).unwrap();
+    assert_eq!(side["future"], future);
+    let led: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(ctx.paths.ledger_file()).unwrap()).unwrap();
+    assert_eq!(led["top_future"], future);
+    let key = if led.get("entries_v2").is_some() {
+        "entries_v2"
+    } else {
+        "entries"
+    };
+    assert_eq!(led[key][0]["future"], future);
+}
+
+#[test]
 fn register_is_idempotent_and_the_entry_exists_before_the_receipt() {
     let dir = tempfile::tempdir().unwrap();
     let (ctx, cfg) = (ctx(dir.path()), Config::default());
@@ -216,6 +261,7 @@ fn a_full_run_records_terminal_before_releasing_and_measures_once() {
         weight_used: 1,
         contended: ran.contended,
         measurement_id: None,
+        extra: Default::default(),
     };
     assert_eq!(
         managed::record_measurement(&ctx, "m-1", &rec).unwrap(),
@@ -258,6 +304,7 @@ fn a_measurement_interrupted_after_the_append_is_not_applied_twice() {
         weight_used: 1,
         contended: false,
         measurement_id: None,
+        extra: Default::default(),
     };
     // A crash after the append, before the "applied" marker.
     std::fs::create_dir_all(ctx.paths.measurements_dir()).unwrap();
@@ -309,6 +356,7 @@ fn an_identical_record_under_another_id_or_none_is_not_this_measurement() {
         weight_used: 1,
         contended: false,
         measurement_id: None,
+        extra: Default::default(),
     };
     // Two identical records already there: one from another measurement,
     // one from history written before measurement ids existed.
@@ -545,6 +593,7 @@ fn a_plain_entry_keeps_the_old_ledger_readable() {
         branch: None,
         parent: None,
         nested_cpu_secs: 0.0,
+        extra: Default::default(),
     });
     l.save(&ctx.paths.ledger_file()).unwrap();
     let old: old_ledger::Ledger =
@@ -588,6 +637,7 @@ fn a_nested_entry_whose_parent_was_dropped_from_the_ledger_names_it_again() {
         // As an older binary left it.
         parent: None,
         nested_cpu_secs: 0.0,
+        extra: Default::default(),
     };
     let _leases = [
         lock::take_lease(&ctx, "p").unwrap(),
@@ -1451,6 +1501,7 @@ fn record_for(key: &str, mid: Option<&str>) -> Record {
         weight_used: 1,
         contended: false,
         measurement_id: mid.map(String::from),
+        extra: Default::default(),
     }
 }
 

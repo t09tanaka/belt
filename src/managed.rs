@@ -159,6 +159,10 @@ pub struct Sidecar {
     /// `resolve --force`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub tracked_to_exit: bool,
+    /// Fields this binary does not know, kept so that rewriting the file
+    /// does not drop what a newer binary wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -854,6 +858,7 @@ pub(crate) fn push_entry(
                     descendants_truncated: false,
                     recorded_at: None,
                     tracked_to_exit: false,
+                    extra: Default::default(),
                 },
             )?;
         }
@@ -880,6 +885,7 @@ pub(crate) fn push_entry(
             branch: wt.map(|w| w.branch).filter(|b| !b.is_empty()),
             parent: opts.parent.clone(),
             nested_cpu_secs: 0.0,
+            extra: Default::default(),
         });
         ledger.save(&ctx.paths.ledger_file())?;
         return Ok(Pushed::New { seq });
@@ -1337,6 +1343,7 @@ fn settle_by_hand(ctx: &Context, id: &str, kind: TerminalKind, detail: &str) -> 
                     descendants_truncated: false,
                     recorded_at: None,
                     tracked_to_exit: false,
+                    extra: Default::default(),
                 },
             )?;
         }

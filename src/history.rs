@@ -32,6 +32,10 @@ pub struct Record {
     /// record. History written before it existed has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measurement_id: Option<String>,
+    /// Fields this binary does not know, kept so that rewriting the file
+    /// does not drop what a newer binary wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Record {
@@ -135,6 +139,7 @@ mod tests {
             weight_used: 1,
             contended: false,
             measurement_id: None,
+            extra: Default::default(),
         }
     }
 
@@ -177,6 +182,30 @@ mod tests {
         std::fs::write(&p, "garbage\n\n").unwrap();
         append(&p, &rec("a", 1.0)).unwrap();
         assert_eq!(read_all(&p).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn trim_keeps_fields_it_does_not_know() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("h.jsonl");
+        let mut v = serde_json::to_value(rec("k", 1.0)).unwrap();
+        v["future"] = serde_json::json!({"a": [1]});
+        for _ in 0..3 {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&p)
+                .unwrap()
+                .write_all(format!("{v}\n").as_bytes())
+                .unwrap();
+        }
+        assert_eq!(trim(&p, 2).unwrap(), 1);
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert_eq!(text.lines().count(), 2);
+        for line in text.lines() {
+            let got: serde_json::Value = serde_json::from_str(line).unwrap();
+            assert_eq!(got, v);
+        }
     }
 
     #[test]

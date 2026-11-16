@@ -68,6 +68,10 @@ pub struct Entry {
     /// learn the weight of what it only started.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub nested_cpu_secs: f64,
+    /// Fields this binary does not know, kept so that rewriting the ledger
+    /// does not drop what a newer binary wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -99,6 +103,9 @@ pub struct Ledger {
     pub version: u32,
     pub next_seq: u64,
     pub entries: Vec<Entry>,
+    /// Top-level fields this binary does not know, kept on rewrite.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// The file's shapes. Borrowed to write, owned to read.
@@ -112,6 +119,8 @@ struct Wire<E> {
     entries_v2: Option<E>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     entries_v3: Option<E>,
+    #[serde(flatten)]
+    extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl Default for Ledger {
@@ -120,6 +129,7 @@ impl Default for Ledger {
             version: SCHEMA_VERSION,
             next_seq: 1,
             entries: Vec::new(),
+            extra: Default::default(),
         }
     }
 }
@@ -143,6 +153,7 @@ impl Ledger {
                     version: w.version,
                     next_seq: w.next_seq,
                     entries,
+                    extra: w.extra,
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Ledger::default()),
@@ -195,6 +206,7 @@ impl Ledger {
             entries: shape(SCHEMA_VERSION),
             entries_v2: shape(MANAGED_SCHEMA_VERSION),
             entries_v3: shape(NESTED_SCHEMA_VERSION),
+            extra: self.extra.clone(),
         };
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         serde_json::to_writer_pretty(&mut tmp, &wire)?;
@@ -309,6 +321,7 @@ mod tests {
             branch: None,
             parent: None,
             nested_cpu_secs: 0.0,
+            extra: Default::default(),
         }
     }
 
@@ -616,6 +629,58 @@ mod tests {
             with_parent("below", 8, "a"),
         ]);
         assert_eq!(l.parent_cycles(), ["a", "b", "self"]);
+    }
+
+    #[test]
+    fn fields_this_binary_does_not_know_survive_a_rewrite() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("ledger.json");
+        let mut e = serde_json::to_value(entry("a", 1)).unwrap();
+        e["future"] = serde_json::json!({"nested": {"n": [1, 2, {"k": null}]}});
+        e["worktree"] = "/w".into();
+        let file = serde_json::json!({
+            "version": 1, "next_seq": 2, "entries": [e],
+            "top_future": {"a": {"b": 1}},
+        });
+        std::fs::write(&path, file.to_string()).unwrap();
+        let mut l = Ledger::load(&path).unwrap();
+        // Known fields are not also kept as unknown ones.
+        for k in ["worktree", "id", "entries", "version", "next_seq"] {
+            assert!(!l.extra.contains_key(k) && !l.entries[0].extra.contains_key(k));
+        }
+        assert_eq!(l.entries[0].extra.len(), 1);
+        l.entries[0].state = State::Running;
+        l.entries[0].branch = Some("b".into());
+        l.save(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.matches("\"worktree\"").count(), 1);
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["top_future"], file["top_future"]);
+        assert_eq!(back["entries"][0]["future"], e["future"]);
+        assert_eq!(back["entries"][0]["worktree"], "/w");
+        assert_eq!(back["entries"][0]["state"], "running");
+        assert_eq!(back["entries"][0]["branch"], "b");
+        assert_eq!(back["version"], 1);
+    }
+
+    #[test]
+    fn unknown_fields_survive_a_shape_change() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("ledger.json");
+        let mut l = Ledger::default();
+        l.extra.insert("top_future".into(), 7.into());
+        let mut e = entry("a", 1);
+        e.parent = Some("p".into());
+        e.extra.insert("future".into(), "x".into());
+        l.entries.push(e);
+        l.save(&path).unwrap();
+        let back: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(back["version"], 3);
+        assert_eq!(back["top_future"], 7);
+        assert_eq!(back["entries_v3"][0]["future"], "x");
+        let loaded = Ledger::load(&path).unwrap();
+        assert_eq!((loaded.entries, loaded.extra), (l.entries, l.extra));
     }
 
     #[test]

@@ -30,6 +30,14 @@ the minor version).
   (`worktree`, `branch`; absent in older entries, ignored by older
   versions). They are not part of the history key.
 
+### Fixed
+
+- Rewriting the ledger, a managed sidecar, a job descriptor or the history
+  file no longer drops fields this version does not know (a ledger entry's
+  `worktree` was lost when an older binary rewrote it). Unknown fields are
+  read and written back unchanged; binaries older than this version still
+  drop them.
+
 ## [0.9.0] - 2026-11-16
 
 ### Changed

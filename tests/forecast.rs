@@ -59,6 +59,7 @@ fn entry(id: &str, state: task_traffic_controller::admit::State, seq: u64, key: 
         branch: None,
         parent: None,
         nested_cpu_secs: 0.0,
+        extra: Default::default(),
     }
 }
 
@@ -77,6 +78,7 @@ fn record(key: &str, wall: f64) -> Record {
         weight_used: 1,
         contended: false,
         measurement_id: None,
+        extra: Default::default(),
     }
 }
 
