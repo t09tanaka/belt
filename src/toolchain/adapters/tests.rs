@@ -313,6 +313,34 @@ fn corepack_hash_descriptor_and_input_version_validation() {
     assert_eq!(f.plan.commands[0].argv[0], "1.2.3");
 }
 #[test]
+fn ruby_patchlevel_and_go_two_component_probe_versions_normalize() {
+    let v = |s: &str| Version::parse(s).unwrap();
+    assert_eq!(
+        output_version("ruby", b"ruby 3.1.2p20 (2022-04-12 revision 4491bb740a)").unwrap(),
+        v("3.1.2")
+    );
+    assert_eq!(
+        output_version("ruby", b"ruby 3.3.0 (2023-12-25)").unwrap(),
+        v("3.3.0")
+    );
+    assert_eq!(
+        output_version("go", b"go version go1.20 darwin/arm64").unwrap(),
+        v("1.20.0")
+    );
+    assert_eq!(
+        output_version("go", b"go version go1.21.5 darwin/arm64").unwrap(),
+        v("1.21.5")
+    );
+    for (tool, bytes) in [
+        ("ruby", &b"ruby 3.1p20 x"[..]),
+        ("go", b"go version go1 x"),
+        ("go", b"go version go1.x x"),
+        ("node", b"v1.2"),
+    ] {
+        assert!(output_version(tool, bytes).is_err(), "{tool} {bytes:?}");
+    }
+}
+#[test]
 fn complete_multi_tool_activation_fails_closed_for_missing_selection_and_baseline() {
     let f = fixture(AdapterKind::Nodenv, "node");
     let state = f.plan.root.parent().unwrap();
