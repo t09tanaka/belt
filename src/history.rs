@@ -32,17 +32,6 @@ pub struct Record {
     /// record. History written before it existed has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub measurement_id: Option<String>,
-    /// The git worktree and branch the run was queued from (see
-    /// `ledger::Entry`), for `top`'s list of recent runs. History written
-    /// before they existed has none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub worktree: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub branch: Option<String>,
-    /// The `exec --label` of the run, shown by `top` instead of the command
-    /// line. History written before it existed has none.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub label: Option<String>,
 }
 
 impl Record {
@@ -146,9 +135,6 @@ mod tests {
             weight_used: 1,
             contended: false,
             measurement_id: None,
-            worktree: None,
-            branch: None,
-            label: None,
         }
     }
 
@@ -209,22 +195,5 @@ mod tests {
         );
         assert_eq!(for_key(&p, "b").unwrap().len(), 1);
         assert_eq!(trim(&p, 2).unwrap(), 0);
-    }
-
-    #[test]
-    fn worktree_and_branch_are_optional_in_the_file() {
-        let old = r#"{"key":"k","repo":"/r","argv":"a","started_at":"2026-01-01T00:00:00Z","wall_secs":1.0,"cpu_secs":1.0,"max_rss_bytes":1,"exit_code":0,"weight_used":1}"#;
-        let r: Record = serde_json::from_str(old).unwrap();
-        assert!(r.worktree.is_none() && r.branch.is_none() && r.label.is_none());
-        // Not written when absent, so older binaries see the same line.
-        assert!(!serde_json::to_string(&r).unwrap().contains("worktree"));
-        let r = Record {
-            worktree: Some("/w".into()),
-            branch: Some("feat/x".into()),
-            label: Some("local-ci run".into()),
-            ..r
-        };
-        let back: Record = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
-        assert_eq!(back, r);
     }
 }

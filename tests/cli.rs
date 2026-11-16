@@ -1389,40 +1389,6 @@ fn an_entry_records_the_worktree_and_branch_it_was_queued_from() {
 }
 
 #[test]
-fn history_records_the_worktree_and_branch() {
-    let env = TestEnv::new();
-    let repo = env.dir.path().join("repo");
-    fs::create_dir_all(&repo).unwrap();
-    let git = |args: &[&str]| {
-        let o = Command::new("git")
-            .args(args)
-            .current_dir(&repo)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@example.com")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@example.com")
-            .output()
-            .unwrap();
-        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
-    };
-    git(&["init", "-q", "-b", "trunk"]);
-    git(&["commit", "-q", "--allow-empty", "-m", "init"]);
-    env.cmd()
-        .current_dir(&repo)
-        .args(["exec", "--label", "the label", "--", "true"])
-        .output()
-        .unwrap();
-    let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
-    let rec: serde_json::Value = serde_json::from_str(hist.lines().next().unwrap()).unwrap();
-    assert_eq!(rec["branch"], "trunk");
-    assert_eq!(rec["label"], "the label");
-    assert_eq!(
-        rec["worktree"],
-        fs::canonicalize(&repo).unwrap().to_string_lossy().as_ref()
-    );
-}
-
-#[test]
 fn subprojects_of_one_repo_learn_separately() {
     let env = TestEnv::new();
     let repo = env.dir.path().join("mono");

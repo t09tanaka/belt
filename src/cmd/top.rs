@@ -23,7 +23,6 @@ use task_traffic_controller::admit::{self, Decision, Limits, LiveSnapshot, Reaso
 use task_traffic_controller::config::Config;
 use task_traffic_controller::display::{fmt_bytes, fmt_duration, is_idle, running_for, truncate};
 use task_traffic_controller::error::{Error, Result};
-use task_traffic_controller::history::{self, Record};
 use task_traffic_controller::ledger::{Entry, Ledger};
 use task_traffic_controller::{eta, exec, gitctx, key, lock, managed, Context};
 
@@ -122,22 +121,6 @@ pub struct View {
     /// In queue order; numbered after the running rows.
     pub waiting: Vec<WaitRow>,
     pub held: Vec<HeldRow>,
-    /// The latest finished runs, newest first. Only filled when nothing is
-    /// running or waiting.
-    pub recent: Vec<RecentRow>,
-}
-
-/// A finished run, from `history.jsonl`.
-#[derive(Debug, Clone, PartialEq)]
-pub struct RecentRow {
-    pub project: String,
-    pub job: String,
-    pub took: Duration,
-    pub ago: Duration,
-    /// The exit code when it was not 0.
-    pub failed: Option<i32>,
-    /// The worktree it ran from, when recorded.
-    pub wt: Option<Wt>,
 }
 
 impl View {
@@ -154,12 +137,6 @@ impl View {
                 hint: v.hint,
             })
             .collect();
-        // The history is only needed (and only read) for an empty queue.
-        let recent = if ledger.entries.is_empty() {
-            history::read_all(ctx.paths.history_file()).unwrap_or_default()
-        } else {
-            Vec::new()
-        };
         Ok(View::from_parts(
             &ledger,
             held,
@@ -167,7 +144,6 @@ impl View {
             ctx.live.snapshot(),
             ctx.clock.now(),
             me,
-            &recent,
         ))
     }
 
@@ -178,7 +154,6 @@ impl View {
         live: Option<LiveSnapshot>,
         now: DateTime<Utc>,
         me: Option<&str>,
-        history: &[Record],
     ) -> View {
         let queue = ledger.queue_at(now);
         let used = admit::used_budget(&queue);
@@ -288,11 +263,6 @@ impl View {
                 available_memory: s.available_memory,
             }),
             worktrees,
-            recent: if run_rows.is_empty() && wait_rows.is_empty() {
-                recent_rows(history, now, me, RECENT_MAX)
-            } else {
-                Vec::new()
-            },
             running: run_rows,
             waiting: wait_rows,
             held,
@@ -571,6 +541,12 @@ const RIGHT_FLOOR: usize = 8;
 const PROJECT_CAP: usize = 24;
 const WT_CAP: usize = 32;
 const JOB_CAP: usize = 60;
+/// Before a column is dropped, the worktree and job columns are squeezed
+/// to this much (the middle of the name goes).
+const WT_SQUEEZED: usize = 20;
+const JOB_SQUEEZED: usize = 24;
+/// The worktree and job columns are never cut below this.
+const NAME_FLOOR: usize = 8;
 const NEED_HEADER: usize = 4;
 const USE_HEADER: usize = 3;
 
@@ -590,67 +566,73 @@ pub struct Wants {
     /// The job with its flags written out but without `idle` (shown in the
     /// use column instead).
     pub job_no_idle: usize,
+    /// The least the worktree column may get: room for the branch (4
+    /// characters) and ` (current)` when a row has it.
+    pub worktree_floor: usize,
     pub need: usize,
     /// 0 when no row has a use column (the list of finished runs).
     pub use_cores: usize,
     /// The text after the bar with and without the reason for waiting.
     pub right: usize,
     pub right_short: usize,
-    /// The table has no bar (the list of finished runs).
-    pub no_bar: bool,
 }
 
 /// Fit the columns in `width`, keeping the bar readable.
 ///
 /// On a terminal at least [`WIDE`] columns wide the bar is never narrower
 /// than [`BAR_WIDE_MIN`]. To get there, in this order: the reason for
-/// waiting after the bar goes, the use column goes (`idle` is then written
-/// after the job name), `idle` and `[backfill]` shrink to `z` and `b`, the
-/// project column goes, the need column goes, and only then the
-/// worktree and job names are cut (the branch in the middle). The text
+/// waiting after the bar goes, the worktree and job columns are squeezed to
+/// 20 and 24 characters (the middle of the name goes), the use column goes
+/// (`idle` is then written after the job name), `idle` and `[backfill]`
+/// shrink to `z` and `b`, the project column goes, the need column goes,
+/// and only then the worktree and job names are cut further. The text
 /// after the bar, the bar, the worktree and the job are never dropped.
 pub fn layout(width: usize, w: Wants) -> Cols {
-    let bar_min = match (w.no_bar, width >= WIDE) {
-        (true, _) => 0,
-        (false, true) => BAR_WIDE_MIN,
-        (false, false) => BAR_MIN,
-    };
-    let bar_gap = usize::from(!w.no_bar);
+    let bar_min = if width >= WIDE { BAR_WIDE_MIN } else { BAR_MIN };
+    let bar_gap = 1;
     let pw = w.project.clamp(7, PROJECT_CAP);
-    // (why, use, short flags, project, need), most to least.
+    let wt_floor = w.worktree_floor.max(NAME_FLOOR);
+    // (why, squeeze, use, short flags, project, need), most to least.
     let states = [
-        (true, true, false, true, true),
-        (false, true, false, true, true),
-        (false, false, false, true, true),
-        (false, false, true, true, true),
-        (false, false, true, false, true),
-        (false, false, true, false, false),
+        (true, false, true, false, true, true),
+        (false, false, true, false, true, true),
+        (false, true, true, false, true, true),
+        (false, true, false, false, true, true),
+        (false, true, false, true, true, true),
+        (false, true, false, true, false, true),
+        (false, true, false, true, false, false),
     ];
-    let build = |(why, use_, short, project, need): (bool, bool, bool, bool, bool)| {
-        let right = if why { w.right } else { w.right_short };
-        let use_ = use_ && w.use_cores > 0;
-        let job = match (use_, short) {
-            (true, _) => w.job_no_idle,
-            (false, true) => w.job_short_flags,
-            (false, false) => w.job,
+    let build =
+        |(why, squeeze, use_, short, project, need): (bool, bool, bool, bool, bool, bool)| {
+            let right = if why { w.right } else { w.right_short };
+            let use_ = use_ && w.use_cores > 0;
+            let job = match (use_, short) {
+                (true, _) => w.job_no_idle,
+                (false, true) => w.job_short_flags,
+                (false, false) => w.job,
+            };
+            let wt = if project {
+                w.worktree
+            } else {
+                w.worktree_without_project
+            };
+            let (wt_cap, job_cap) = if squeeze {
+                (WT_SQUEEZED, JOB_SQUEEZED)
+            } else {
+                (WT_CAP, JOB_CAP)
+            };
+            Cols {
+                project: project.then_some(pw),
+                worktree: wt.clamp(1, wt_cap.max(wt_floor)).max(wt_floor.min(wt)),
+                job: job.clamp(1, job_cap),
+                need: (need && w.need > 0).then_some(w.need),
+                use_cores: use_.then_some(w.use_cores),
+                bar: bar_min,
+                right: right.clamp(RIGHT_FLOOR, RIGHT_MAX),
+                why,
+                short_flags: short,
+            }
         };
-        let wt = if project {
-            w.worktree
-        } else {
-            w.worktree_without_project
-        };
-        Cols {
-            project: project.then_some(pw),
-            worktree: wt.clamp(1, WT_CAP),
-            job: job.clamp(1, JOB_CAP),
-            need: (need && w.need > 0).then_some(w.need),
-            use_cores: use_.then_some(w.use_cores),
-            bar: bar_min,
-            right: right.clamp(RIGHT_FLOOR, RIGHT_MAX),
-            why,
-            short_flags: short,
-        }
-    };
     let need = |c: &Cols| {
         w.prefix
             + c.project.map_or(0, |p| p + 1)
@@ -677,10 +659,8 @@ pub fn layout(width: usize, w: Wants) -> Cols {
     let mut c = build(states[states.len() - 1]);
     let mut short = need(&c) - width;
     for (which, floor) in [
-        (1, 10),
-        (2, 12),
-        (1, 6),
-        (2, 4),
+        (1, wt_floor),
+        (2, NAME_FLOOR),
         (0, BAR_FLOOR),
         (3, RIGHT_FLOOR),
     ] {
@@ -712,7 +692,7 @@ fn worktree_text(w: Option<&Wt>, max: usize) -> String {
         w.branch.clone()
     };
     let suffix = if w.mine { " (current)" } else { "" };
-    let room = max.saturating_sub(suffix.chars().count()).max(1);
+    let room = max.saturating_sub(suffix.chars().count()).max(4);
     format!("{}{suffix}", ellipsize_middle(&branch, room))
 }
 
@@ -836,9 +816,6 @@ fn table_rows(v: &View) -> Vec<TableRow> {
 
 // ------------------------------------------------------------ empty state
 
-/// How many finished runs the empty screen lists.
-const RECENT_MAX: usize = 5;
-
 fn cores(n: u32) -> String {
     format!("{n} core{}", if n == 1 { "" } else { "s" })
 }
@@ -851,9 +828,6 @@ fn empty_lines(free: u32) -> (String, String) {
     )
 }
 
-const RECENT_TITLE: &str = "recently finished";
-const RUN_HINT: &str = "Run one with: task-traffic-controller exec -- <command>";
-
 /// The line under the table when something runs but nobody waits.
 fn nobody_waiting(free: u32) -> String {
     if free > 0 {
@@ -864,79 +838,6 @@ fn nobody_waiting(free: u32) -> String {
     } else {
         "No one waiting · the next command waits for cores".into()
     }
-}
-
-/// `45s ago`, `2m ago`, `3h ago`, `2d ago`.
-fn ago_text(d: Duration) -> String {
-    let s = d.as_secs();
-    match s {
-        0..=59 => format!("{s}s ago"),
-        60..=3599 => format!("{}m ago", s / 60),
-        3600..=86399 => format!("{}h ago", s / 3600),
-        _ => format!("{}d ago", s / 86400),
-    }
-}
-
-/// The newest `max` finished runs, newest first. Worktrees are colored the
-/// way the queue colors them: per repository, gray when only one worktree
-/// of it is among these runs.
-fn recent_rows(
-    history: &[Record],
-    now: DateTime<Utc>,
-    me: Option<&str>,
-    max: usize,
-) -> Vec<RecentRow> {
-    let finished =
-        |r: &Record| r.started_at + chrono::Duration::milliseconds((r.wall_secs * 1000.0) as i64);
-    let mut recs: Vec<&Record> = history.iter().collect();
-    recs.sort_by_key(|r| std::cmp::Reverse(finished(r)));
-    recs.truncate(max);
-    let mut colors: HashMap<(&str, &str), Color> = HashMap::new();
-    let mut repos: Vec<&str> = recs.iter().map(|r| r.repo.as_str()).collect();
-    repos.sort_unstable();
-    repos.dedup();
-    for repo in repos {
-        let mut paths: Vec<&str> = recs
-            .iter()
-            .filter(|r| r.repo == repo)
-            .filter_map(|r| r.worktree.as_deref())
-            .collect();
-        paths.sort_unstable();
-        paths.dedup();
-        for (p, c) in paths.iter().zip(repo_colors(&paths)) {
-            colors.insert((repo, p), c);
-        }
-    }
-    recs.into_iter()
-        .map(|r| RecentRow {
-            project: if r.repo.is_empty() {
-                "-".into()
-            } else {
-                key::project_label(&r.repo, &r.subdir)
-            },
-            job: match r.label.as_deref().filter(|l| !l.is_empty()) {
-                Some(l) => l.to_string(),
-                None => job_of_argv(&r.argv),
-            },
-            took: Duration::from_secs_f64(r.wall_secs.max(0.0)),
-            ago: (now - finished(r)).to_std().unwrap_or_default(),
-            failed: (r.exit_code != 0).then_some(r.exit_code),
-            wt: r.worktree.as_deref().map(|path| Wt {
-                path: path.to_string(),
-                branch: r.branch.clone().unwrap_or_default(),
-                mine: me == Some(path),
-                color: colors
-                    .get(&(r.repo.as_str(), path))
-                    .copied()
-                    .unwrap_or(Color::Gray),
-            }),
-        })
-        .collect()
-}
-
-/// The text after the job on a finished run: `3:20 · 2m ago`.
-fn recent_time_text(r: &RecentRow) -> String {
-    format!("{} · {}", fmt_duration(r.took), ago_text(r.ago))
 }
 
 // ---------------------------------------------------------------- drawing
@@ -1079,11 +980,15 @@ fn table_wants(v: &View, rows: &[TableRow], prefix: usize) -> Wants {
         job: widest(&|r| job(r, false, true)),
         job_short_flags: widest(&|r| job(r, true, true)),
         job_no_idle: widest(&|r| job(r, false, false)),
+        worktree_floor: 4 + if v.worktrees.iter().any(|w| w.mine) {
+            " (current)".len()
+        } else {
+            0
+        },
         need: widest(&|r| r.need.chars().count()).max(NEED_HEADER),
         use_cores: widest(&|r| r.use_cores.chars().count()).max(USE_HEADER),
         right: widest(&|r| r.right.chars().count()),
         right_short: widest(&|r| r.right_short.chars().count()),
-        no_bar: false,
     }
 }
 
@@ -1214,74 +1119,15 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// The inside of the queue box when nothing runs or waits: what that
-/// means, and what finished lately (or how to start something).
+/// The inside of the queue box when nothing runs or waits.
 fn draw_empty(f: &mut Frame, area: Rect, v: &View) {
     let dim = Style::new().add_modifier(Modifier::DIM);
     let (first, second) = empty_lines(v.free);
-    let mut lines = vec![
+    let lines = vec![
         Line::raw(""),
         Line::raw(format!(" {first}")),
         Line::styled(format!(" {second}"), dim),
-        Line::raw(""),
     ];
-    if v.recent.is_empty() {
-        lines.push(Line::styled(format!(" {RUN_HINT}"), dim));
-    } else {
-        lines.push(Line::styled(format!(" {RECENT_TITLE}"), dim));
-        let wt_text = |r: &RecentRow, project_col: bool, max| {
-            worktree_cell(r.wt.as_ref(), &r.project, project_col, max)
-        };
-        let widest =
-            |len: &dyn Fn(&RecentRow) -> usize| v.recent.iter().map(len).max().unwrap_or(0);
-        let time = widest(&|r| recent_time_text(r).chars().count());
-        let cols = layout(
-            area.width as usize,
-            Wants {
-                prefix: 2,
-                project: widest(&|r| r.project.chars().count()),
-                worktree: widest(&|r| wt_text(r, true, usize::MAX).0.chars().count())
-                    .max("worktree".len()),
-                worktree_without_project: widest(&|r| {
-                    wt_text(r, false, usize::MAX).0.chars().count()
-                })
-                .max("worktree".len()),
-                job: widest(&|r| r.job.chars().count()),
-                job_short_flags: widest(&|r| r.job.chars().count()),
-                job_no_idle: widest(&|r| r.job.chars().count()),
-                need: 0,
-                use_cores: 0,
-                right: time,
-                right_short: time,
-                no_bar: true,
-            },
-        );
-        for r in &v.recent {
-            let color = r.wt.as_ref().map_or(Color::Gray, |w| w.color);
-            let mut spans = vec![Span::styled("▌ ", Style::new().fg(color))];
-            if let Some(pw) = cols.project {
-                spans.push(Span::raw(fit(&r.project, pw + 1)));
-            }
-            let (cell, is_project) = wt_text(r, cols.project.is_some(), cols.worktree);
-            spans.push(Span::styled(
-                fit(&cell, cols.worktree + 1),
-                if is_project {
-                    dim
-                } else {
-                    Style::new().fg(color)
-                },
-            ));
-            spans.push(Span::raw(fit(&r.job, cols.job + 1)));
-            spans.push(Span::styled(recent_time_text(r), dim));
-            if let Some(code) = r.failed {
-                spans.push(Span::styled(
-                    format!("  exit {code}"),
-                    Style::new().fg(Color::Red),
-                ));
-            }
-            lines.push(Line::from(spans));
-        }
-    }
     f.render_widget(Paragraph::new(lines), area);
 }
 
@@ -1521,7 +1367,6 @@ mod tests {
             Some(live()),
             now,
             Some(ME),
-            &[],
         )
     }
 
@@ -1631,7 +1476,6 @@ mod tests {
         assert!(v.running[1].idle && v.running[1].backfilled);
         assert_eq!(v.running[2].progress, Progress::Unknown);
         assert!(v.machine.is_some());
-        assert!(v.recent.is_empty());
     }
     #[test]
     fn equal_finish_times_keep_the_older_run_first() {
@@ -1640,7 +1484,7 @@ mod tests {
         let mut y = entry("y", State::Running, 1, 2, "/r/b", "", "y", now, 50);
         x.expected_secs = Some(100.0);
         y.expected_secs = Some(120.0); // 70 left for both
-        let v = View::from_parts(&ledger(vec![x, y]), vec![], limits(4), None, now, None, &[]);
+        let v = View::from_parts(&ledger(vec![x, y]), vec![], limits(4), None, now, None);
         assert_eq!(
             v.running.iter().map(|r| r.job.as_str()).collect::<Vec<_>>(),
             ["y", "x"]
@@ -1654,7 +1498,7 @@ mod tests {
         let mut y = entry("y", State::Running, 3, 2, "/r/b", "", "b", now, 20);
         y.using = Some(7.0); // measured above its weight
         x.using = None;
-        let v = View::from_parts(&ledger(vec![x, y]), vec![], limits(6), None, now, None, &[]);
+        let v = View::from_parts(&ledger(vec![x, y]), vec![], limits(6), None, now, None);
         let total: u32 = v.slots.iter().map(|s| s.slots).sum();
         assert_eq!(total + v.free, 6);
         assert_eq!(v.free, 0);
@@ -1688,15 +1532,7 @@ mod tests {
     fn an_entry_without_a_worktree_has_none_and_nobody_is_mine() {
         let now = Utc::now();
         let a = entry("a", State::Running, 1, 1, "/r/a", "", "a", now, 5);
-        let v = View::from_parts(
-            &ledger(vec![a]),
-            vec![],
-            limits(4),
-            None,
-            now,
-            Some(ME),
-            &[],
-        );
+        let v = View::from_parts(&ledger(vec![a]), vec![], limits(4), None, now, Some(ME));
         assert!(v.worktrees.is_empty());
         assert_eq!(v.running[0].wt, None);
     }
@@ -1714,15 +1550,7 @@ mod tests {
             "/r/wt",
             "new-branch",
         );
-        let v = View::from_parts(
-            &ledger(vec![old, new]),
-            vec![],
-            limits(4),
-            None,
-            now,
-            None,
-            &[],
-        );
+        let v = View::from_parts(&ledger(vec![old, new]), vec![], limits(4), None, now, None);
         assert_eq!(v.worktrees.len(), 1);
         assert_eq!(v.worktrees[0].branch, "new-branch");
     }
@@ -1801,15 +1629,7 @@ mod tests {
             &b,
             "y",
         );
-        let v = View::from_parts(
-            &ledger(vec![ea, eb]),
-            vec![],
-            limits(4),
-            None,
-            now,
-            None,
-            &[],
-        );
+        let v = View::from_parts(&ledger(vec![ea, eb]), vec![], limits(4), None, now, None);
         assert_ne!(v.worktrees[0].color, v.worktrees[1].color);
         assert!(v.worktrees.iter().all(|w| w.color != Color::Gray));
     }
@@ -1906,19 +1726,19 @@ mod tests {
             job: 24,
             job_short_flags: 16,
             job_no_idle: 24,
+            worktree_floor: 14,
             need: 4,
             use_cores: 3,
             right: 31,
             right_short: 13,
-            no_bar: false,
         }
     }
 
     #[test]
     fn narrow_terminals_keep_the_bar_and_give_up_other_things_in_order() {
-        let cols = |project, need, use_cores, job, bar, right, why, short_flags| Cols {
+        let cols = |project, worktree, need, use_cores, job, bar, right, why, short_flags| Cols {
             project,
-            worktree: 32,
+            worktree,
             job,
             need,
             use_cores,
@@ -1930,38 +1750,41 @@ mod tests {
         // Room for everything; the rest goes to the bar.
         assert_eq!(
             layout(150, wants()),
-            cols(Some(18), Some(4), Some(3), 24, 28, 31, true, false)
+            cols(Some(18), 32, Some(4), Some(3), 24, 28, 31, true, false)
         );
         // 1. The reason for waiting goes.
         assert_eq!(
             layout(130, wants()),
-            cols(Some(18), Some(4), Some(3), 24, 26, 13, false, false)
+            cols(Some(18), 32, Some(4), Some(3), 24, 26, 13, false, false)
         );
-        // 2. The use column goes; `idle` is written after the job again.
+        // 2. The worktree column is squeezed to 20 (the job to 24).
         assert_eq!(
-            layout(122, wants()),
-            cols(Some(18), Some(4), None, 24, 22, 13, false, false)
+            layout(120, wants()),
+            cols(Some(18), 20, Some(4), Some(3), 24, 28, 13, false, false)
         );
-        // 3. idle and [backfill] shrink to z and b.
+        // 3. The use column goes; `idle` is written after the job again.
         assert_eq!(
-            layout(119, wants()),
-            cols(Some(18), Some(4), None, 16, 27, 13, false, true)
+            layout(110, wants()),
+            cols(Some(18), 20, Some(4), None, 24, 22, 13, false, false)
         );
-        // 4. The project column goes, 5. then need.
+        // 4. idle and [backfill] shrink to z and b.
         assert_eq!(
             layout(100, wants()),
-            cols(None, Some(4), None, 16, 27, 13, false, true)
+            cols(Some(18), 20, Some(4), None, 16, 20, 13, false, true)
         );
+        // 5. The project column goes, 6. then need.
         assert_eq!(
             layout(90, wants()),
-            cols(None, None, None, 16, 22, 13, false, true)
+            cols(None, 20, Some(4), None, 16, 29, 13, false, true)
         );
-        // 6. Only then the names are cut; the bar keeps its 20.
-        let c = layout(85, wants());
-        assert_eq!((c.worktree, c.job, c.bar), (29, 16, 20));
-        // Under 80 columns the bar may be narrower.
-        let c = layout(60, wants());
-        assert_eq!((c.worktree, c.job, c.bar, c.right), (14, 16, 10, 13));
+        assert_eq!(
+            layout(80, wants()),
+            cols(None, 20, None, None, 16, 24, 13, false, true)
+        );
+        // 7. Only then the names are cut, to 8 characters at the least;
+        // the bar keeps its 20.
+        let c = layout(50, wants());
+        assert!(c.worktree < 20 && c.worktree >= 14 && c.job >= 8, "{c:?}");
         // Whatever the width, nothing exceeds it, the bar of a wide
         // terminal is at least 20 and the time columns stay.
         for w in 60..220 {
@@ -2003,7 +1826,19 @@ mod tests {
         assert_eq!(worktree_text(Some(fix), 100), FIX_BRANCH);
         // Cut in the middle; "(current)" always stays whole.
         assert_eq!(worktree_text(Some(fix), 20), "fix/queue-…ting-head");
-        assert_eq!(worktree_text(Some(me), 12), "m… (current)");
+        // Only the branch gives way, to 4 characters; the suffix stays whole.
+        assert_eq!(worktree_text(Some(me), 12), "main (current)");
+        let mut long = fix.clone();
+        long.mine = true;
+        let t = worktree_text(Some(&long), 24);
+        assert!(
+            t.ends_with("…ead (current)") || t.ends_with(" (current)"),
+            "{t}"
+        );
+        assert_eq!(t.chars().count(), 24);
+        // Even with no room, 4 characters of the branch stay.
+        let t = worktree_text(Some(&long), 5);
+        assert!(t.ends_with(" (current)") && t.chars().count() == 14, "{t}");
         // A lone worktree (gray) and a row with no record are `-`.
         assert_eq!(worktree_text(Some(&v.worktrees[1]), 40), "-");
         assert_eq!(worktree_text(None, 40), "-");
@@ -2119,14 +1954,22 @@ mod tests {
     fn the_bar_grows_with_the_width_and_every_row_has_the_same_one() {
         let v = sample_view(Utc::now());
         let rows = table_rows(&v);
-        let bars: Vec<usize> = [90usize, 120, 150]
-            .iter()
-            .map(|w| layout(*w - 2, table_wants(&v, &rows, 4)).bar)
-            .collect();
+        let cols = |w: usize| layout(w - 2, table_wants(&v, &rows, 4));
+        // The bar is never under 20, and grows with the width while the
+        // same columns are shown (it gives way when a column comes back).
+        assert!(cols(90).bar >= 20 && cols(120).bar >= 20 && cols(150).bar >= 20);
         assert!(
-            bars[0] >= 20 && bars[0] < bars[1] && bars[1] < bars[2],
-            "{bars:?}"
+            cols(90).bar < cols(120).bar,
+            "{:?} {:?}",
+            cols(90),
+            cols(120)
         );
+        assert_eq!(cols(121).bar, cols(120).bar + 1);
+        assert_eq!(cols(151).bar, cols(150).bar + 1);
+        // At 150 every column is there (but the waiting reason).
+        let c = cols(150);
+        assert!(c.project.is_some() && c.use_cores.is_some() && c.need.is_some());
+        let bars = [cols(90).bar, cols(120).bar, cols(150).bar];
         let out = frame(&v, 120, 16);
         let widths: Vec<usize> = out
             .lines()
@@ -2138,6 +1981,27 @@ mod tests {
         let full = widths.iter().filter(|n| **n > 0).collect::<Vec<_>>();
         assert!(full.iter().all(|n| **n == bars[1] || **n > 0), "{widths:?}");
         assert!(full.iter().all(|n| **n == *full[0]), "{widths:?}");
+    }
+
+    #[test]
+    fn names_are_squeezed_before_a_column_is_dropped_and_current_stays_whole() {
+        let v = sample_view(Utc::now());
+        let rows = table_rows(&v);
+        // At 130 columns every column of the fixture fits with a bar of 20
+        // or more, thanks to the squeezed names (it took 32 + 28 before).
+        let c = layout(128, table_wants(&v, &rows, 4));
+        assert!(c.project.is_some() && c.need.is_some() && c.use_cores.is_some());
+        assert!((c.worktree, c.job) == (20, 24) && c.bar >= 20, "{c:?}");
+        let out = frame(&v, 130, 16);
+        println!("{out}");
+        assert!(out.contains("project") && out.contains("need") && out.contains(" use "));
+        // `(current)` is never cut, at any width.
+        for w in [70u16, 90, 120, 130, 170] {
+            let out = frame(&v, w, 16);
+            assert!(out.contains(" (current)"), "{w}\n{out}");
+        }
+        let out = frame(&v, 120, 16);
+        assert!(out.contains("main (current)"), "{out}");
     }
 
     fn render(v: &View, w: u16, h: u16) -> Terminal<TestBackend> {
@@ -2311,7 +2175,7 @@ mod tests {
         a.expected_secs = Some(60.0);
         let mut b = entry("b", State::Running, 1, 2, "/r/b", "", "b", now, 20);
         b.expected_secs = Some(60.0);
-        let v = View::from_parts(&ledger(vec![a, b]), vec![], limits(4), None, now, None, &[]);
+        let v = View::from_parts(&ledger(vec![a, b]), vec![], limits(4), None, now, None);
         let t = render(&v, 80, 12);
         let buf = t.backend().buffer().clone();
         // Only the text of the row that is over is red; its bar is full.
@@ -2330,97 +2194,14 @@ mod tests {
         assert_eq!(buf[(col, y0)].fg, Color::Red);
     }
 
-    fn rec(
-        repo: &str,
-        argv: &str,
-        wt: Option<(&str, &str)>,
-        ended_ago: i64,
-        wall: f64,
-        exit: i32,
-        now: DateTime<Utc>,
-    ) -> Record {
-        Record {
-            key: "k".into(),
-            repo: repo.into(),
-            subdir: String::new(),
-            argv: argv.into(),
-            key_argv: String::new(),
-            started_at: now - Cd::seconds(ended_ago) - Cd::milliseconds((wall * 1000.0) as i64),
-            wall_secs: wall,
-            cpu_secs: 1.0,
-            max_rss_bytes: 1,
-            exit_code: exit,
-            weight_used: 1,
-            contended: false,
-            measurement_id: None,
-            worktree: wt.map(|w| w.0.into()),
-            branch: wt.map(|w| w.1.into()),
-            label: None,
-        }
-    }
-
-    /// Finished runs, oldest first in the file (as `history.jsonl` is).
-    fn history(now: DateTime<Utc>) -> Vec<Record> {
-        let rtr = "/src/remote-task-runner";
-        vec![
-            rec(
-                "/src/local-ci",
-                "local-ci run",
-                Some((LCI, "main")),
-                3000,
-                250.0,
-                0,
-                now,
-            ),
-            rec(rtr, "cargo test --workspace", None, 2500, 180.0, 0, now),
-            rec(
-                "/src/local-ci",
-                "local-ci run",
-                Some((LCI, "main")),
-                1500,
-                240.0,
-                0,
-                now,
-            ),
-            rec(
-                rtr,
-                "cargo clippy --all-targets",
-                Some((ME, "main")),
-                540,
-                48.0,
-                0,
-                now,
-            ),
-            rec(
-                rtr,
-                "cargo test --workspace",
-                Some((FIX, FIX_BRANCH)),
-                420,
-                190.0,
-                1,
-                now,
-            ),
-            rec(
-                "/src/local-ci",
-                "bash /ci/steps/step-8.sh --fast",
-                Some((LCI, "main")),
-                120,
-                245.0,
-                0,
-                now,
-            ),
-        ]
-    }
-
-    fn empty_view(now: DateTime<Utc>, hist: &[Record]) -> View {
+    fn empty_view(now: DateTime<Utc>) -> View {
         View::from_parts(
             &Ledger::default(),
             vec![],
             limits(12),
             Some(live()),
             now,
-            Some(ME),
-            hist,
+            Some("/src/remote-task-runner"),
         )
     }
 
@@ -2453,168 +2234,20 @@ mod tests {
             nobody_waiting(0),
             "No one waiting · the next command waits for cores"
         );
-        let s = Duration::from_secs;
-        assert_eq!(ago_text(s(0)), "0s ago");
-        assert_eq!(ago_text(s(59)), "59s ago");
-        assert_eq!(ago_text(s(120)), "2m ago");
-        assert_eq!(ago_text(s(3599)), "59m ago");
-        assert_eq!(ago_text(s(3600)), "1h ago");
-        assert_eq!(ago_text(s(86399)), "23h ago");
-        assert_eq!(ago_text(s(86400 * 3)), "3d ago");
     }
 
     #[test]
-    fn recent_runs_are_the_newest_five_with_their_worktree_and_failure() {
-        let now = Utc::now();
-        let rows = recent_rows(&history(now), now, Some(ME), RECENT_MAX);
-        assert_eq!(rows.len(), 5);
-        // Newest first: the step script, the failed test run, clippy, ...
-        let jobs: Vec<_> = rows.iter().map(|r| r.job.as_str()).collect();
-        assert_eq!(
-            jobs,
-            [
-                "step-8.sh",
-                "cargo test --workspace",
-                "cargo clippy --all-targets",
-                "local-ci run",
-                "cargo test --workspace"
-            ]
-        );
-        assert_eq!(rows[0].project, "local-ci");
-        assert_eq!(rows[0].took, Duration::from_secs(245));
-        assert_eq!(ago_text(rows[0].ago), "2m ago");
-        assert_eq!(ago_text(rows[1].ago), "7m ago");
-        assert_eq!(rows[1].failed, Some(1));
-        assert_eq!(rows[0].failed, None);
-        // Worktrees: remote-task-runner has two among these, so both are
-        // colored; local-ci has one (gray); an old record has none.
-        let wt = |i: usize| rows[i].wt.as_ref();
-        assert_eq!(worktree_text(wt(1), 100), FIX_BRANCH);
-        assert_eq!(worktree_text(wt(2), 40), "main (current)");
-        assert_ne!(wt(1).unwrap().color, wt(2).unwrap().color);
-        assert_eq!(worktree_text(wt(0), 40), "-");
-        assert_eq!(wt(0).unwrap().color, Color::Gray);
-        assert_eq!(rows[4].project, "remote-task-runner");
-        // An unrecorded worktree (old history) is `-`.
-        let old = recent_rows(&history(now)[1..2], now, None, 5);
-        assert!(old[0].wt.is_none());
-        assert_eq!(worktree_text(old[0].wt.as_ref(), 40), "-");
-        assert!(recent_rows(&[], now, None, 5).is_empty());
-        assert_eq!(recent_time_text(&rows[0]), "4:05 · 2m ago");
-    }
-
-    #[test]
-    fn an_empty_queue_lists_what_finished_lately() {
-        let now = Utc::now();
-        let v = empty_view(now, &history(now));
-        assert_eq!(v.recent.len(), 5);
-        let t = render(&v, 90, 16);
-        let buf = t.backend().buffer().clone();
-        let out = frame(&v, 90, 16);
-        println!("{out}");
-        assert!(out.contains(" queue "));
-        assert!(out.contains("cores 0/12 in use · 12 free"));
-        assert!(out.contains("Nothing running or waiting"));
-        assert!(out.contains("A new command starts right away · 12 cores free"));
-        assert!(out.contains("recently finished"));
-        assert!(!out.contains("Run one with"));
-        assert!(!out.contains("No one waiting"));
-        // Five rows under the heading, newest first, with the exit code of
-        // the failed one.
-        let lines: Vec<&str> = out.lines().collect();
-        let h = lines
-            .iter()
-            .position(|l| l.contains("recently finished"))
-            .unwrap();
-        let rows = &lines[h + 1..h + 6];
-        assert!(rows[0].contains("step-8.sh") && rows[0].contains("4:05 · 2m ago"));
-        assert!(rows[1].contains("exit 1") && rows[1].contains("7m ago"));
-        assert!(rows[1].contains("fix/queue-"));
-        assert!(rows[2].contains("main (current)"));
-        assert_eq!(out.matches("exit ").count(), 1);
-        assert!(rows.iter().all(|l| l.contains("▌")));
-        // In the upper half of the box; the first line is plain, the second
-        // dim.
-        let y1 = row_y(&buf, 90, 16, "Nothing running");
-        let y2 = row_y(&buf, 90, 16, "A new command");
-        assert!(y1 < 8 && y2 == y1 + 1);
-        let x1 = (0..90u16).find(|&x| buf[(x, y1)].symbol() == "N").unwrap();
-        assert!(!buf[(x1, y1)].modifier.contains(Modifier::BOLD));
-        assert!(!buf[(x1, y1)].modifier.contains(Modifier::DIM));
-        assert!(buf[(x1, y2)].modifier.contains(Modifier::DIM));
-        let yh = row_y(&buf, 90, 16, "recently finished");
-        assert!(buf[(x1, yh)].modifier.contains(Modifier::DIM));
-        // The failure is red.
-        let yf = row_y(&buf, 90, 16, "exit 1");
-        let xf = (0..90u16)
-            .find(|&x| buf[(x, yf)].symbol() == "e" && buf[(x + 1, yf)].symbol() == "x")
-            .unwrap();
-        assert_eq!(buf[(xf, yf)].fg, Color::Red);
-        // Narrow and tiny terminals do not panic.
-        let _ = frame(&v, 40, 10);
-        let _ = frame(&v, 10, 4);
-    }
-
-    #[test]
-    fn a_finished_run_is_named_like_a_queued_one_by_label_then_script_then_argv() {
-        let now = Utc::now();
-        let mut labelled = rec("/src/local-ci", "sleep 60", None, 60, 1.0, 0, now);
-        labelled.label = Some("local-ci run".into());
-        let mut empty = rec("/src/local-ci", "sleep 61", None, 50, 1.0, 0, now);
-        empty.label = Some(String::new());
-        let script = rec(
-            "/src/local-ci",
-            "bash /ci/step-3.sh -x",
-            None,
-            40,
-            1.0,
-            0,
-            now,
-        );
-        let plain = rec("/src/local-ci", "sleep 62", None, 30, 1.0, 0, now);
-        let rows = recent_rows(&[labelled, empty, script, plain], now, None, 5);
-        let jobs: Vec<_> = rows.iter().map(|r| r.job.as_str()).collect();
-        assert_eq!(jobs, ["sleep 62", "step-3.sh", "sleep 61", "local-ci run"]);
-    }
-
-    #[test]
-    fn finished_runs_have_a_project_column_or_name_the_project_in_the_worktree_cell() {
-        let now = Utc::now();
-        let v = empty_view(now, &history(now));
-        // Wide enough: the project column is there, `-` stays `-`.
-        let wide = frame(&v, 150, 16);
-        println!("{wide}");
-        let lci = wide.lines().find(|l| l.contains("step-8.sh")).unwrap();
-        assert!(lci.contains("local-ci") && lci.contains(" - "), "{lci}");
-        let rtr = wide.lines().find(|l| l.contains("main (current)")).unwrap();
-        assert!(rtr.contains("remote-task-runner"), "{rtr}");
-        // Too narrow for it: the lone worktree's cell names the project, gray.
-        let t = render(&v, 90, 16);
-        let buf = t.backend().buffer().clone();
-        let y = row_y(&buf, 90, 16, "step-8.sh");
-        let line: String = (0..90u16)
-            .map(|x| buf[(x, y)].symbol().to_string())
-            .collect();
-        assert!(!line.contains(" - "), "{line}");
-        let at = line.find("local-ci").unwrap();
-        let x = line[..at].chars().count() as u16;
-        assert!(buf[(x, y)].modifier.contains(Modifier::DIM));
-        assert_eq!(buf[(1, y)].fg, Color::Gray);
-    }
-
-    #[test]
-    fn an_empty_queue_with_no_history_says_how_to_start_one() {
-        let now = Utc::now();
-        let v = empty_view(now, &[]);
+    fn an_empty_queue_says_only_that_and_what_is_free() {
+        let v = empty_view(Utc::now());
         let out = frame(&v, 90, 12);
         println!("{out}");
         assert!(out.contains("Nothing running or waiting"));
-        assert!(out.contains("Run one with: task-traffic-controller exec -- <command>"));
-        assert!(!out.contains("recently finished"));
+        assert!(out.contains("A new command starts right away · 12 cores free"));
+        assert!(!out.contains("recently finished") && !out.contains("Run one with"));
         let t = render(&v, 90, 12);
         let buf = t.backend().buffer().clone();
-        let y = row_y(&buf, 90, 12, "Run one with");
-        let x = (0..90u16).find(|&x| buf[(x, y)].symbol() == "R").unwrap();
+        let y = row_y(&buf, 90, 12, "A new command");
+        let x = (0..90u16).find(|&x| buf[(x, y)].symbol() == "A").unwrap();
         assert!(buf[(x, y)].modifier.contains(Modifier::DIM));
     }
 
@@ -2623,7 +2256,7 @@ mod tests {
         let now = Utc::now();
         let mut a = entry("a", State::Running, 4, 1, "/r/a", "", "cargo test", now, 30);
         a.expected_secs = Some(100.0);
-        let v = View::from_parts(&ledger(vec![a]), vec![], limits(12), None, now, None, &[]);
+        let v = View::from_parts(&ledger(vec![a]), vec![], limits(12), None, now, None);
         let out = frame(&v, 90, 12);
         println!("{out}");
         assert!(out.contains("No one waiting · a command needing ≤8 cores starts right away"));
@@ -2640,52 +2273,11 @@ mod tests {
                 now,
                 30,
             );
-            View::from_parts(&ledger(vec![a]), vec![], limits(12), None, now, None, &[])
+            View::from_parts(&ledger(vec![a]), vec![], limits(12), None, now, None)
         };
         assert!(frame(&full, 90, 12).contains("No one waiting · the next command waits for cores"));
         // Someone waiting: the line is not there.
         let out = frame(&sample_view(now), 90, 16);
         assert!(!out.contains("No one waiting"));
-    }
-
-    /// The screens drawn for the pull request description. Run with
-    /// `--nocapture` to see them.
-    #[test]
-    fn the_screens_for_the_description() {
-        let now = Utc::now();
-        for w in [90u16, 120] {
-            println!("== width {w}\n{}", frame(&sample_view(now), w, 16));
-        }
-        println!(
-            "== empty, with history\n{}",
-            frame(&empty_view(now, &history(now)), 90, 16)
-        );
-        println!(
-            "== empty, no history\n{}",
-            frame(&empty_view(now, &[]), 90, 12)
-        );
-        let mut a = entry(
-            "a",
-            State::Running,
-            4,
-            1,
-            "/src/local-ci",
-            "",
-            "local-ci run",
-            now,
-            30,
-        );
-        a.expected_secs = Some(100.0);
-        let a = in_wt(a, LCI, "main");
-        let v = View::from_parts(
-            &ledger(vec![a]),
-            vec![],
-            limits(12),
-            Some(live()),
-            now,
-            Some(ME),
-            &[],
-        );
-        println!("== running, nobody waiting\n{}", frame(&v, 90, 12));
     }
 }

@@ -199,8 +199,9 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
   - a `▌` in the worktree's color, and the number;
   - `project` (repo name, plus `/subdir`);
   - `worktree`: the branch (the short commit hash when detached), in the
-    worktree's color, cut in the middle with `…` when it is long, and
-    `(current)` after the one `top` was started in. That worktree's rows are
+    worktree's color, cut in the middle with `…` when it is long (never under 4 characters),
+    and ` (current)` after the one `top` was started in, which is never
+    cut. That worktree's rows are
     bold. A repository with only one worktree in the queue, and entries
     queued by an older version (which recorded none), show `-` and a gray
     band;
@@ -222,11 +223,14 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
   repository has it; it is not stored.
 
   On a terminal 80 columns wide or more the bar is never narrower than 20
-  characters (10 on a narrower one). To keep it, a narrow terminal gives up, in this order: the
-  reason for waiting after the bar (`starts ~1:35?` stays), the `use`
-  column, the words `idle` and `[backfill]` (they shrink to `z` and `b`;
-  `[front]` to `f`), the `project` column, the `need` column, and only then the worktree and
-  job names are cut (the branch in the middle). The bar and the text after
+  characters (10 on a narrower one). To keep it, a narrow terminal gives up,
+  in this order: the reason for waiting after the bar (`starts ~1:35?`
+  stays), then the worktree and job columns are squeezed to 20 and 24
+  characters (the middle of the name goes), the `use` column, the words
+  `idle` and `[backfill]` (they shrink to `z` and `b`; `[front]` to `f`),
+  the `project` column, the `need` column, and only then the names are cut
+  further (8 characters at the least; the worktree column keeps room for 4
+  of the branch and ` (current)`). The bar and the text after
   it always stay. With the project column gone, a `-` in the worktree
   column is replaced by the project's name, in gray, so the rows can still
   be told apart.
@@ -246,15 +250,8 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
     what would start right away (`No one waiting · a command needing ≤8
     cores starts right away`, or that the next command waits for cores when
     none are free).
-- **An empty queue** says `Nothing running or waiting` and how many cores
-  are free, then lists the last five finished runs from `history.jsonl`
-  under `recently finished`, newest first, laid out like the table above (the
-  project column goes first when narrow, and then a `-` shows the project name):
-  project, worktree, job (named the same way, so a `--label` is kept), how long
-  it took, how long ago it ended and, for a failure, `exit N`. With no
-  history it shows how to start one instead (`Run one with:
-  task-traffic-controller exec -- <command>`). History written before the
-  worktree was recorded shows `-`.
+- **An empty queue** says `Nothing running or waiting` and, dim, how many
+  cores are free (`A new command starts right away · 12 cores free`).
 - **held, owner gone**: one line at the bottom, shown only when there is
   such an entry.
 

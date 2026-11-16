@@ -454,9 +454,6 @@ pub fn run_gated(
         contended,
     } = ran?;
     let key = plan.key;
-    let (worktree, branch, label) = entry.as_ref().map_or((None, None, None), |e| {
-        (e.worktree.clone(), e.branch.clone(), e.label.clone())
-    });
     let _ = history::append(
         ctx.paths.history_file(),
         &Record {
@@ -479,9 +476,6 @@ pub fn run_gated(
             weight_used: plan.weight,
             contended,
             measurement_id: None,
-            worktree,
-            branch,
-            label,
         },
     );
     Ok(Gated::Finished(out.exit))
