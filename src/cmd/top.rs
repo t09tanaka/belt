@@ -3,7 +3,7 @@
 //!
 //! [`View`] is a plain description of what is on screen, built from the
 //! ledger by [`View::build`] (pure) and drawn by [`draw`]. Everything that
-//! decides what a row says (order, numbers, the shared time axis, the bar
+//! decides what a row says (order, numbers, the progress bar, the bar
 //! strings, worktree colors, column widths) is a pure function below, so it
 //! is tested without a terminal.
 
@@ -501,244 +501,42 @@ fn ellipsize_middle(s: &str, max: usize) -> String {
     format!("{h}…{t}")
 }
 
-// ------------------------------------------------------- the time axis
+// ------------------------------------------------------------ the bar
 
-/// Seconds per column the axis can use, finest first.
-const SCALES: [f64; 24] = [
-    1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 300.0, 450.0,
-    600.0, 900.0, 1200.0, 1800.0, 3600.0, 7200.0, 14400.0, 28800.0, 86400.0,
-];
+const FILLED: char = '█';
+const EMPTY: char = '░';
 
-/// Tick spacings for the labels on top.
-const TICKS: [f64; 14] = [
-    10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0, 28800.0,
-    43200.0, 86400.0,
-];
-
-/// What one bar needs to know. Times in seconds.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum BarSpec {
-    Running {
-        elapsed: f64,
-        expected: Option<f64>,
-    },
-    Waiting {
-        start_in: Option<f64>,
-        expected: Option<f64>,
-        rough: bool,
-    },
+/// How full a running row's bar is: time run over the expected time, at
+/// most 1. `None` when the command has no learned wall time (no bar).
+fn run_fraction(elapsed: Duration, expected_secs: Option<f64>) -> Option<f64> {
+    let exp = expected_secs.filter(|x| *x > 0.0)?;
+    Some((elapsed.as_secs_f64() / exp).clamp(0.0, 1.0))
 }
 
-impl BarSpec {
-    fn of_run(r: &RunRow) -> BarSpec {
-        BarSpec::Running {
-            elapsed: r.elapsed.as_secs_f64(),
-            expected: r.expected_secs,
+/// Filled cells of a bar `width` wide at `frac` (0 to 1); `None` when the
+/// row has no bar. Only a full fraction fills every cell.
+pub fn bar_fill(frac: Option<f64>, width: usize) -> Option<usize> {
+    frac.map(|f| {
+        if f >= 1.0 {
+            width
+        } else {
+            ((f.max(0.0) * width as f64).floor() as usize).min(width.saturating_sub(1))
         }
-    }
-
-    fn of_wait(w: &WaitRow) -> BarSpec {
-        BarSpec::Waiting {
-            start_in: w.start_in,
-            expected: w.expected_secs,
-            rough: w.rough,
-        }
-    }
-
-    /// Seconds to the right of "now" this bar needs.
-    fn ahead(&self) -> f64 {
-        match *self {
-            BarSpec::Running { elapsed, expected } => {
-                expected.map_or(0.0, |x| (x - elapsed).max(0.0))
-            }
-            BarSpec::Waiting {
-                start_in, expected, ..
-            } => start_in.unwrap_or(0.0).max(0.0) + expected.unwrap_or(0.0),
-        }
-    }
-
-    /// Seconds to the left of "now".
-    fn behind(&self) -> f64 {
-        match *self {
-            BarSpec::Running { elapsed, .. } => elapsed,
-            BarSpec::Waiting { .. } => 0.0,
-        }
-    }
+    })
 }
 
-/// One scale for every row: `now` sits at column `now_col`, a column is
-/// `secs_per_col` seconds wide.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Scale {
-    pub secs_per_col: f64,
-    pub now_col: usize,
-    pub width: usize,
-}
-
-/// Columns needed to show `secs` (at least one when there is any).
-fn cols_for(secs: f64, per_col: f64) -> usize {
-    if secs <= 0.0 {
-        0
-    } else {
-        ((secs / per_col).ceil() as usize).max(1)
+/// A bar `width` characters wide: `█` for what is done, `░` for the rest;
+/// blank when the row has no bar.
+#[cfg(test)]
+pub fn bar_string(frac: Option<f64>, width: usize) -> String {
+    match bar_fill(frac, width) {
+        Some(n) => format!(
+            "{}{}",
+            FILLED.to_string().repeat(n),
+            EMPTY.to_string().repeat(width - n)
+        ),
+        None => " ".repeat(width),
     }
-}
-
-/// The finest scale at which the row that ends last still fits in `width`
-/// columns. What has already run takes at most a third of the width, so an
-/// old run cannot squeeze out the future; the rest is cut with `←`. When
-/// even the coarsest scale is too small, the bar is cut with `→`.
-pub fn compute_scale(specs: &[BarSpec], width: usize) -> Scale {
-    let behind = specs.iter().map(BarSpec::behind).fold(0.0, f64::max);
-    let ahead = specs.iter().map(BarSpec::ahead).fold(0.0, f64::max);
-    let now_col = |per: f64| cols_for(behind, per).min(width / 3);
-    let per_col = SCALES
-        .iter()
-        .copied()
-        .find(|&s| now_col(s) + 1 + cols_for(ahead, s) <= width)
-        .unwrap_or(SCALES[SCALES.len() - 1]);
-    Scale {
-        secs_per_col: per_col,
-        now_col: now_col(per_col),
-        width,
-    }
-}
-
-/// A bar `scale.width` characters wide.
-///
-/// - `█` ran, `▓` ran past its expected time, `▒` expected to run, `┄` the
-///   same when the estimate is rough, `│` now.
-/// - `→` the duration is unknown (just a start), or the bar goes on past
-///   the right edge; `←` a run older than the left edge.
-pub fn bar_string(spec: BarSpec, scale: Scale) -> String {
-    let w = scale.width;
-    if w == 0 {
-        return String::new();
-    }
-    let now = scale.now_col.min(w - 1);
-    let per = scale.secs_per_col;
-    let mut cells = vec![' '; w];
-    cells[now] = '│';
-    let fill = |cells: &mut Vec<char>, from: usize, len: usize, c: char| {
-        let to = (from + len).min(w);
-        for cell in cells.iter_mut().take(to).skip(from) {
-            *cell = c;
-        }
-        if from + len > w && w > 0 {
-            cells[w - 1] = '→';
-        }
-    };
-    match spec {
-        BarSpec::Running { elapsed, expected } => {
-            let want = cols_for(elapsed, per);
-            let drawn = want.min(now);
-            let start = now - drawn;
-            for cell in cells.iter_mut().take(now).skip(start) {
-                *cell = '█';
-            }
-            if let Some(x) = expected.filter(|x| elapsed > *x) {
-                let over = cols_for(elapsed - x, per).min(drawn);
-                for cell in cells.iter_mut().take(now).skip(now - over) {
-                    *cell = '▓';
-                }
-            }
-            if want > now && now > 0 {
-                cells[0] = '←';
-            }
-            match expected {
-                Some(x) if x > elapsed => {
-                    fill(&mut cells, now + 1, cols_for(x - elapsed, per), '▒');
-                }
-                Some(_) => {}
-                None => fill(&mut cells, now + 1, 1, '→'),
-            }
-        }
-        BarSpec::Waiting {
-            start_in,
-            expected,
-            rough,
-        } => {
-            let from = now + 1 + (start_in.unwrap_or(0.0).max(0.0) / per).floor() as usize;
-            if from >= w {
-                cells[w - 1] = '→';
-            } else {
-                match expected {
-                    Some(x) => {
-                        let c = if rough { '┄' } else { '▒' };
-                        fill(&mut cells, from, cols_for(x, per).max(1), c);
-                    }
-                    None => cells[from] = '→',
-                }
-            }
-        }
-    }
-    cells.into_iter().collect()
-}
-
-/// `+45s`, `+2m`, `+1h30m`.
-fn fmt_tick(secs: f64) -> String {
-    let s = secs.round() as u64;
-    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
-    let mut out = String::from("+");
-    if h > 0 {
-        out.push_str(&format!("{h}h"));
-    }
-    if m > 0 {
-        out.push_str(&format!("{m}m"));
-    }
-    if sec > 0 || (h == 0 && m == 0) {
-        out.push_str(&format!("{sec}s"));
-    }
-    out
-}
-
-/// The ruler above the bars: `now` at the vertical line, then `+2m`-style
-/// labels to the right, at least 7 columns apart (closer, down to 3, when
-/// nothing would fit otherwise).
-pub fn axis_line(scale: Scale) -> String {
-    let w = scale.width;
-    let put = |cells: &mut [char], at: usize, text: &str| -> bool {
-        let n = text.chars().count();
-        if at + n > w {
-            return false;
-        }
-        for (i, c) in text.chars().enumerate() {
-            cells[at + i] = c;
-        }
-        true
-    };
-    let mut cells = vec![' '; w];
-    let mut next_free = 0;
-    if put(&mut cells, scale.now_col.min(w), "now") {
-        next_free = scale.now_col + 4;
-    }
-    for min_cols in [7.0, 5.0, 3.0] {
-        let tick = TICKS
-            .iter()
-            .copied()
-            .find(|t| t / scale.secs_per_col >= min_cols)
-            .unwrap_or(TICKS[TICKS.len() - 1]);
-        let mut placed = false;
-        let mut free = next_free;
-        let mut line = cells.clone();
-        for k in 1.. {
-            let t = tick * k as f64;
-            let col = scale.now_col + 1 + (t / scale.secs_per_col).floor() as usize;
-            if col >= w {
-                break;
-            }
-            let label = fmt_tick(t);
-            if col >= free && put(&mut line, col, &label) {
-                free = col + label.chars().count() + 1;
-                placed = true;
-            }
-        }
-        if placed || min_cols == 3.0 {
-            cells = line;
-            break;
-        }
-    }
-    cells.into_iter().collect()
 }
 
 // -------------------------------------------------------------- the table
@@ -763,12 +561,12 @@ pub struct Cols {
     pub short_flags: bool,
 }
 
-const BAR_MIN: usize = 12;
+const BAR_MIN: usize = 10;
 /// On a terminal this wide the bar is never narrower than [`BAR_WIDE_MIN`].
 const WIDE: usize = 80;
 const BAR_WIDE_MIN: usize = 20;
 const BAR_FLOOR: usize = 6;
-const RIGHT_MAX: usize = 34;
+const RIGHT_MAX: usize = 60;
 const RIGHT_FLOOR: usize = 8;
 const PROJECT_CAP: usize = 24;
 const WT_CAP: usize = 32;
@@ -942,11 +740,12 @@ fn job_parts(job: &str, flags: &[&str], width: usize) -> (String, String) {
 fn right_text_run(r: &RunRow) -> String {
     match &r.progress {
         Progress::Unknown => format!("ran {}", fmt_duration(r.elapsed)),
-        Progress::Known { left, over, .. } => format!(
-            "{} {}",
-            if *over { "over" } else { "left" },
-            fmt_duration(*left)
-        ),
+        Progress::Known {
+            left, over: true, ..
+        } => format!("over {}", fmt_duration(*left)),
+        Progress::Known { pct, left, .. } => {
+            format!("{pct}%  left {}", fmt_duration(*left))
+        }
     }
 }
 
@@ -954,7 +753,8 @@ fn right_text_wait(w: &WaitRow) -> String {
     format!("{} ({})", starts_text(w), w.why)
 }
 
-/// `starts ~1:35?`: when a waiting entry starts, without the reason.
+/// `waited 0:30 · starts ~1:35?`: how long a waiting entry has waited and
+/// when it starts, without the reason.
 fn starts_text(w: &WaitRow) -> String {
     let start = match w.start_in {
         None => "?".to_string(),
@@ -965,7 +765,7 @@ fn starts_text(w: &WaitRow) -> String {
             if w.rough { "?" } else { "" }
         ),
     };
-    format!("starts {start}")
+    format!("waited {} · starts {start}", fmt_duration(w.waited))
 }
 
 /// A flag after the job name: written out, and abbreviated for narrow
@@ -987,7 +787,9 @@ struct TableRow {
     use_cores: String,
     /// Far below what it holds: drawn dim.
     idle: bool,
-    spec: BarSpec,
+    /// Share of the bar filled; `None` for no bar.
+    frac: Option<f64>,
+    waiting: bool,
     right: String,
     /// `right` without the reason for waiting.
     right_short: String,
@@ -1007,7 +809,8 @@ fn table_rows(v: &View) -> Vec<TableRow> {
         need: r.weight.to_string(),
         use_cores: r.using.map_or("-".into(), |u| format!("{u:.1}")),
         idle: r.idle,
-        spec: BarSpec::of_run(r),
+        frac: run_fraction(r.elapsed, r.expected_secs),
+        waiting: false,
         right: right_text_run(r),
         right_short: right_text_run(r),
         wt: r.wt,
@@ -1021,7 +824,8 @@ fn table_rows(v: &View) -> Vec<TableRow> {
         need: w.weight.to_string(),
         use_cores: "-".into(),
         idle: false,
-        spec: BarSpec::of_wait(w),
+        frac: Some(0.0),
+        waiting: true,
         right: right_text_wait(w),
         right_short: starts_text(w),
         wt: w.wt,
@@ -1249,31 +1053,6 @@ fn fit(s: &str, w: usize) -> String {
     format!("{t}{}", " ".repeat(w - n))
 }
 
-/// The bar's characters as spans: runs of one character class share a style.
-fn bar_spans(bar: &str, base: Style) -> Vec<Span<'static>> {
-    let style = |c: char| match c {
-        '▓' => base.fg(Color::Red),
-        '▒' | '┄' | '→' | '←' => base.add_modifier(Modifier::DIM),
-        '│' => base.fg(Color::DarkGray),
-        _ => base,
-    };
-    let mut out: Vec<Span<'static>> = Vec::new();
-    let mut run = String::new();
-    let mut cur: Option<Style> = None;
-    for c in bar.chars() {
-        let s = style(c);
-        if cur.is_some_and(|x| x != s) {
-            out.push(Span::styled(std::mem::take(&mut run), cur.unwrap()));
-        }
-        cur = Some(s);
-        run.push(c);
-    }
-    if let Some(s) = cur {
-        out.push(Span::styled(run, s));
-    }
-    out
-}
-
 /// What the rows of the table would like in the way of columns.
 fn table_wants(v: &View, rows: &[TableRow], prefix: usize) -> Wants {
     let widest = |len: &dyn Fn(&TableRow) -> usize| rows.iter().map(len).max().unwrap_or(0);
@@ -1321,8 +1100,6 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
     let prefix = 1 + num_w + 1;
     let wt_of = |r: &TableRow| r.wt.and_then(|i| v.worktrees.get(i));
     let cols = layout(inner.width as usize, table_wants(v, &rows, prefix));
-    let specs: Vec<BarSpec> = rows.iter().map(|r| r.spec).collect();
-    let scale = compute_scale(&specs, cols.bar);
 
     let dim = Style::new().add_modifier(Modifier::DIM);
     let mut lines = Vec::new();
@@ -1339,7 +1116,7 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
     if let Some(uw) = cols.use_cores {
         head.push(Span::styled(format!("{:>uw$} ", "use"), dim));
     }
-    head.push(Span::styled(axis_line(scale), dim));
+    head.push(Span::styled(fit("progress", cols.bar + 1), dim));
     lines.push(Line::from(head));
 
     for r in &rows {
@@ -1405,7 +1182,18 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
                 },
             ));
         }
-        spans.extend(bar_spans(&bar_string(r.spec, scale), base));
+        match bar_fill(r.frac, cols.bar) {
+            Some(n) => {
+                let color = if r.waiting {
+                    dim
+                } else {
+                    base.fg(wt_color(v, r.wt))
+                };
+                spans.push(Span::styled(FILLED.to_string().repeat(n), color));
+                spans.push(Span::styled(EMPTY.to_string().repeat(cols.bar - n), dim));
+            }
+            None => spans.push(Span::raw(" ".repeat(cols.bar))),
+        }
         spans.push(Span::styled(
             format!(
                 " {}",
@@ -2041,162 +1829,72 @@ mod tests {
         assert_eq!(ellipsize_middle("日本語のブランチ名", 5), "日本…チ名");
     }
 
-    fn scale(per: f64, now: usize, width: usize) -> Scale {
-        Scale {
-            secs_per_col: per,
-            now_col: now,
-            width,
+    #[test]
+    fn a_running_bar_fills_with_the_time_run_over_the_expected_time() {
+        let d = Duration::from_secs;
+        // 12 of 20 s: 60% of 10 cells.
+        assert_eq!(run_fraction(d(12), Some(20.0)), Some(0.6));
+        assert_eq!(
+            bar_string(run_fraction(d(12), Some(20.0)), 10),
+            "██████░░░░"
+        );
+        assert_eq!(bar_string(Some(0.0), 10), "░░░░░░░░░░");
+        // Nearly done is not full: the last cell is for the finish.
+        assert_eq!(
+            bar_string(run_fraction(d(199), Some(200.0)), 10),
+            "█████████░"
+        );
+        // Over the expected time the bar stays full.
+        assert_eq!(
+            bar_string(run_fraction(d(50), Some(30.0)), 10),
+            "██████████"
+        );
+        // No learned wall time (or a useless one): no bar.
+        assert_eq!(run_fraction(d(12), None), None);
+        assert_eq!(run_fraction(d(12), Some(0.0)), None);
+        assert_eq!(bar_string(None, 10), "          ");
+        assert_eq!(bar_fill(Some(0.5), 0), Some(0));
+    }
+
+    fn wait_row(start_in: Option<f64>, rough: bool) -> WaitRow {
+        WaitRow {
+            num: 4,
+            project: "p".into(),
+            job: "j".into(),
+            weight: 6,
+            waited: Duration::from_secs(30),
+            front: false,
+            why: "needs 6, 0 free".into(),
+            start_in,
+            expected_secs: Some(60.0),
+            rough,
+            wt: None,
         }
     }
 
     #[test]
-    fn the_scale_is_the_finest_one_that_fits_the_row_ending_last() {
-        let run = BarSpec::Running {
-            elapsed: 60.0,
-            expected: Some(180.0),
+    fn a_waiting_row_has_an_empty_bar_and_says_how_long_and_until_when() {
+        let w = wait_row(Some(47.0), false);
+        assert_eq!(
+            right_text_wait(&w),
+            "waited 0:30 · starts ~0:47 (needs 6, 0 free)"
+        );
+        assert_eq!(starts_text(&w), "waited 0:30 · starts ~0:47");
+        let w = wait_row(Some(47.0), true);
+        assert_eq!(starts_text(&w), "waited 0:30 · starts ~0:47?");
+        let w = wait_row(None, false);
+        assert_eq!(starts_text(&w), "waited 0:30 · starts ?");
+        let w = wait_row(Some(0.0), false);
+        assert_eq!(starts_text(&w), "waited 0:30 · starts now");
+        // Whatever is known, the bar of a waiting row is empty.
+        let v = View {
+            waiting: vec![wait_row(Some(47.0), false), wait_row(None, true)],
+            ..sample_view(Utc::now())
         };
-        // 12 columns behind, 24 ahead at 5 s per column; 3 s would not fit.
-        assert_eq!(compute_scale(&[run], 40), scale(5.0, 12, 40));
-        // A waiting row that starts in 2 m and runs 5 m pushes it out.
-        let wait = BarSpec::Waiting {
-            start_in: Some(120.0),
-            expected: Some(300.0),
-            rough: false,
-        };
-        let s = compute_scale(&[run, wait], 40);
-        assert_eq!(s.secs_per_col, 15.0);
-        assert!(s.now_col + 1 + cols_for(420.0, 15.0) <= 40);
-        // Nothing to show: the finest scale, now at the left edge.
-        assert_eq!(compute_scale(&[], 40), scale(1.0, 0, 40));
-        // An old run takes at most a third of the width.
-        let old = BarSpec::Running {
-            elapsed: 36000.0,
-            expected: Some(40000.0),
-        };
-        assert_eq!(compute_scale(&[old], 30).now_col, 10);
-        // Even the coarsest scale cannot hold it: cut, not a panic.
-        let huge = BarSpec::Waiting {
-            start_in: Some(1e9),
-            expected: Some(1.0),
-            rough: false,
-        };
-        assert_eq!(compute_scale(&[huge], 20).secs_per_col, 86400.0);
-    }
-
-    #[test]
-    fn a_running_bar_has_what_ran_left_of_now_and_the_rest_right() {
-        let sc = scale(5.0, 12, 40);
-        let bar = |elapsed, expected| bar_string(BarSpec::Running { elapsed, expected }, sc);
-        assert_eq!(
-            bar(60.0, Some(180.0)),
-            format!("{}│{}{}", "█".repeat(12), "▒".repeat(24), " ".repeat(3))
-        );
-        // Past its expected time: the overrun is its own mark, nothing ahead.
-        assert_eq!(
-            bar(100.0, Some(60.0)),
-            format!("←{}{}│{}", "█".repeat(3), "▓".repeat(8), " ".repeat(27))
-        );
-        // Not long enough to reach the left edge.
-        assert_eq!(
-            bar(30.0, Some(60.0)),
-            format!(
-                "{}{}│{}{}",
-                " ".repeat(6),
-                "█".repeat(6),
-                "▒".repeat(6),
-                " ".repeat(21)
-            )
-        );
-        // No learned time: just an arrow after now.
-        assert_eq!(
-            bar(30.0, None),
-            format!("{}{}│→{}", " ".repeat(6), "█".repeat(6), " ".repeat(26))
-        );
-        // Ends exactly on its expected time: nothing ahead.
-        assert_eq!(
-            bar(60.0, Some(60.0)),
-            format!("{}│{}", "█".repeat(12), " ".repeat(27))
-        );
-        // Too long for the right edge: cut with an arrow.
-        let s = bar(60.0, Some(2000.0));
-        assert_eq!(s.chars().count(), 40);
-        assert!(s.ends_with('→'));
-    }
-
-    #[test]
-    fn a_waiting_bar_starts_where_it_is_expected_to_and_is_as_long_as_it_runs() {
-        let sc = scale(5.0, 12, 40);
-        let wait = |start_in, expected, rough| {
-            bar_string(
-                BarSpec::Waiting {
-                    start_in,
-                    expected,
-                    rough,
-                },
-                sc,
-            )
-        };
-        let pad = |n: usize| " ".repeat(n);
-        // Starts in 50 s (10 columns after the first one past now).
-        assert_eq!(
-            wait(Some(50.0), Some(60.0), false),
-            format!("{}│{}{}{}", pad(12), pad(10), "▒".repeat(12), pad(5))
-        );
-        // A rough estimate is dotted.
-        assert_eq!(
-            wait(Some(50.0), Some(60.0), true),
-            format!("{}│{}{}{}", pad(12), pad(10), "┄".repeat(12), pad(5))
-        );
-        // Unknown duration: only an arrow at the start.
-        assert_eq!(
-            wait(Some(50.0), None, false),
-            format!("{}│{}→{}", pad(12), pad(10), pad(16))
-        );
-        // Unknown start: begins at now.
-        assert_eq!(
-            wait(None, Some(10.0), false),
-            format!("{}│▒▒{}", pad(12), pad(25))
-        );
-        // Starts after the right edge: just the arrow at the edge.
-        let far = wait(Some(5000.0), Some(10.0), false);
-        assert_eq!(far, format!("{}│{}→", pad(12), pad(26)));
-        // Starts in view but runs past the edge.
-        let cut = wait(Some(50.0), Some(600.0), false);
-        assert!(cut.ends_with('→') && cut.contains('▒'));
-        assert_eq!(cut.chars().count(), 40);
-        // A zero-width bar draws nothing.
-        assert_eq!(
-            bar_string(
-                BarSpec::Waiting {
-                    start_in: None,
-                    expected: None,
-                    rough: false
-                },
-                scale(1.0, 0, 0)
-            ),
-            ""
-        );
-    }
-
-    #[test]
-    fn the_axis_labels_the_future_every_so_many_columns() {
-        assert_eq!(
-            axis_line(scale(5.0, 12, 40)),
-            format!(
-                "{}now{}+1m{}+2m",
-                " ".repeat(12),
-                " ".repeat(10),
-                " ".repeat(9)
-            )
-        );
-        // No room for "now" at the right edge: no label, no panic.
-        assert_eq!(axis_line(scale(1.0, 39, 40)).chars().count(), 40);
-        assert_eq!(axis_line(scale(86400.0, 0, 3)).chars().count(), 3);
-        assert_eq!(fmt_tick(45.0), "+45s");
-        assert_eq!(fmt_tick(120.0), "+2m");
-        assert_eq!(fmt_tick(90.0), "+1m30s");
-        assert_eq!(fmt_tick(3600.0), "+1h");
-        assert_eq!(fmt_tick(5400.0), "+1h30m");
+        let rows = table_rows(&v);
+        for r in rows.iter().rev().take(2) {
+            assert_eq!(bar_string(r.frac, 8), "░░░░░░░░");
+        }
     }
 
     fn wants() -> Wants {
@@ -2263,7 +1961,7 @@ mod tests {
         assert_eq!((c.worktree, c.job, c.bar), (29, 16, 20));
         // Under 80 columns the bar may be narrower.
         let c = layout(60, wants());
-        assert_eq!((c.worktree, c.job, c.bar, c.right), (12, 16, 12, 13));
+        assert_eq!((c.worktree, c.job, c.bar, c.right), (14, 16, 10, 13));
         // Whatever the width, nothing exceeds it, the bar of a wide
         // terminal is at least 20 and the time columns stay.
         for w in 60..220 {
@@ -2335,22 +2033,34 @@ mod tests {
     #[test]
     fn the_text_after_the_bar_says_time_left_or_when_it_starts_and_why() {
         let v = sample_view(Utc::now());
-        assert_eq!(right_text_run(&v.running[0]), "left 1:35");
+        assert_eq!(right_text_run(&v.running[0]), "50%  left 1:35");
         assert_eq!(right_text_run(&v.running[2]), "ran 0:12");
         let w = &v.waiting[0];
         let t = right_text_wait(w);
         assert!(
-            t.starts_with("starts ~") && t.ends_with("(needs 6, 0 free)"),
+            t.starts_with("waited ")
+                && t.contains(" · starts ~")
+                && t.ends_with("(needs 6, 0 free)"),
             "{t}"
         );
         let mut w = w.clone();
+        w.waited = Duration::ZERO;
         w.start_in = None;
-        assert_eq!(right_text_wait(&w), "starts ? (needs 6, 0 free)");
+        assert_eq!(
+            right_text_wait(&w),
+            "waited 0:00 · starts ? (needs 6, 0 free)"
+        );
         w.start_in = Some(0.0);
-        assert_eq!(right_text_wait(&w), "starts now (needs 6, 0 free)");
+        assert_eq!(
+            right_text_wait(&w),
+            "waited 0:00 · starts now (needs 6, 0 free)"
+        );
         w.start_in = Some(130.0);
         w.rough = true;
-        assert_eq!(right_text_wait(&w), "starts ~2:10? (needs 6, 0 free)");
+        assert_eq!(
+            right_text_wait(&w),
+            "waited 0:00 · starts ~2:10? (needs 6, 0 free)"
+        );
         let mut over = v.running[0].clone();
         over.progress = Progress::Known {
             pct: 99,
@@ -2405,6 +2115,31 @@ mod tests {
         assert!(buf[(x2, y2)].modifier.contains(Modifier::DIM));
     }
 
+    #[test]
+    fn the_bar_grows_with_the_width_and_every_row_has_the_same_one() {
+        let v = sample_view(Utc::now());
+        let rows = table_rows(&v);
+        let bars: Vec<usize> = [90usize, 120, 150]
+            .iter()
+            .map(|w| layout(*w - 2, table_wants(&v, &rows, 4)).bar)
+            .collect();
+        assert!(
+            bars[0] >= 20 && bars[0] < bars[1] && bars[1] < bars[2],
+            "{bars:?}"
+        );
+        let out = frame(&v, 120, 16);
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| l.contains('▌'))
+            .map(|l| l.chars().filter(|c| *c == '░' || *c == '█').count())
+            .collect();
+        // Rows with a bar all draw it as wide as the column (the run
+        // without a learned time draws none).
+        let full = widths.iter().filter(|n| **n > 0).collect::<Vec<_>>();
+        assert!(full.iter().all(|n| **n == bars[1] || **n > 0), "{widths:?}");
+        assert!(full.iter().all(|n| **n == *full[0]), "{widths:?}");
+    }
+
     fn render(v: &View, w: u16, h: u16) -> Terminal<TestBackend> {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, v, Duration::from_secs(1), None))
@@ -2428,7 +2163,7 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_is_one_table_on_a_shared_axis() {
+    fn a_frame_is_one_table_with_a_progress_bar_per_row() {
         let now = Utc::now();
         let mut v = sample_view(now);
         v.held.push(HeldRow {
@@ -2449,7 +2184,8 @@ mod tests {
         assert!(out.contains("fix/queue-") && out.contains("…"));
         assert!(out.contains("held, owner gone (1): m1 owner gone -> resolve m1"));
         assert!(out.contains("q: quit"));
-        assert!(out.contains("now") && out.contains("│"));
+        assert!(out.contains("progress") && out.contains("█") && out.contains("░"));
+        assert!(out.contains("50%  left 1:35") && out.contains("waited "));
         assert!(out.contains("starts ~") && out.contains("(needs 6, 0 free)"));
         // The use column shows idleness (dim); no `idle` flag next to it.
         assert!(out.contains("[backfill]") && !out.contains("idle"));
@@ -2490,9 +2226,9 @@ mod tests {
             // The time columns are all there.
             assert!(out.contains("left 3:20") && out.contains("ran 0:12"), "{w}");
             assert!(out.contains("starts ~"), "{w}");
-            // The axis has a label, and the bar is at least 20 wide.
+            // The bar column is titled, and the bar is at least 20 wide.
             let head = out.lines().find(|l| l.contains("worktree")).unwrap();
-            assert!(head.contains("+"), "{w}\n{out}");
+            assert!(head.contains("progress"), "{w}\n{out}");
             let rows = table_rows(&v);
             let cols = layout(w as usize - 2, table_wants(&v, &rows, 4));
             assert!(cols.bar >= 20, "{w}: {cols:?}");
@@ -2578,19 +2314,17 @@ mod tests {
         let v = View::from_parts(&ledger(vec![a, b]), vec![], limits(4), None, now, None, &[]);
         let t = render(&v, 80, 12);
         let buf = t.backend().buffer().clone();
-        let red = (0..12u16)
-            .flat_map(|y| (0..80u16).map(move |x| (x, y)))
-            .filter(|&(x, y)| buf[(x, y)].symbol() == "▓")
-            .collect::<Vec<_>>();
-        assert!(!red.is_empty());
-        assert!(red.iter().all(|&(x, y)| buf[(x, y)].fg == Color::Red));
-        // The overrun is on one row only: the one that is over.
-        let y0 = red[0].1;
-        assert!(red.iter().all(|&(_, y)| y == y0));
-        // And its text says so, in red.
+        // Only the text of the row that is over is red; its bar is full.
+        let y0 = row_y(&buf, 80, 12, "over");
         let line: String = (0..80u16)
             .map(|x| buf[(x, y0)].symbol().to_string())
             .collect();
+        assert!(line.contains("██████████") && !line.contains('░'), "{line}");
+        let y1 = row_y(&buf, 80, 12, "left");
+        let l1: String = (0..80u16)
+            .map(|x| buf[(x, y1)].symbol().to_string())
+            .collect();
+        assert!(l1.contains('░'), "{l1}");
         let x = line.find("over").unwrap();
         let col = line[..x].chars().count() as u16;
         assert_eq!(buf[(col, y0)].fg, Color::Red);

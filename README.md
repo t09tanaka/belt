@@ -212,7 +212,7 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
     for a waiting row or one not measured yet. It is dim when far below
     `need` (idle: running 5:00+ and using under 0.2 cores). Without the use
     column, `idle` (`z`) is written after the job instead;
-  - a bar on a time axis shared by every row, and the text after it.
+  - `progress`: a bar for how far each row is, and the text after it.
 
   `exec` records the worktree (`git rev-parse --show-toplevel`) and branch
   it was called from, so parallel runs of one repository from different
@@ -222,7 +222,7 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
   repository has it; it is not stored.
 
   On a terminal 80 columns wide or more the bar is never narrower than 20
-  characters. To keep it, a narrow terminal gives up, in this order: the
+  characters (10 on a narrower one). To keep it, a narrow terminal gives up, in this order: the
   reason for waiting after the bar (`starts ~1:35?` stays), the `use`
   column, the words `idle` and `[backfill]` (they shrink to `z` and `b`;
   `[front]` to `f`), the `project` column, the `need` column, and only then the worktree and
@@ -230,23 +230,18 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
   it always stay. With the project column gone, a `-` in the worktree
   column is replaced by the project's name, in gray, so the rows can still
   be told apart.
-  - The axis has a vertical line at `now` and labels such as `+2m` above
-    it. The scale is the finest one at which the row that ends last still
-    fits; what has already run takes at most a third of the width. Whatever
-    still runs off the right edge is cut with `→`.
-  - A running row shows `█` for the time it has run, left of `now`, and
-    `▒` for what it is still expected to run, right of it. A run past its
-    expected time shows the overrun as red `▓`, and `←` marks a run older
-    than the left edge. A run with no learned wall time has only a `→` after
-    `now`.
-  - A waiting row starts at its estimated start and is as long as its
-    expected wall time, `▒`, or `┄` when the estimate is rough (some
-    entry it depends on has no history). With no learned wall time it is
-    only a `→` at its start.
-  - After the bar: `left 3:20` / `over 1:00` / `ran 0:12` (no learned
-    time) for a running entry; `starts ~2:10` and why it waits (`needs 6, 3
-    free`, `behind 2`, ...; left out when there is no room) for a waiting one. `idle` and `[backfill]` mark
-    the same entries as in `status`.
+  - `progress`: one bar per row, all the same width, which takes whatever
+    the other columns leave. A running row fills `█` (in its worktree's
+    color) for the time run over its expected wall time and leaves `░` for
+    the rest; past the expected time the bar stays full. A run with no
+    learned wall time has no bar. A waiting row's bar is always empty
+    (`░`).
+  - After the bar: `62%  left 0:47` / `over 0:20` / `ran 0:12` (no learned
+    time) for a running entry; `waited 0:30 · starts ~0:47` (`starts ?`
+    with no estimate, `~0:47?` when it is rough because an entry it
+    depends on has no history) and why it waits (`needs 6, 3 free`,
+    `behind 2`, ...; left out when there is no room) for a waiting one.
+    `[backfill]` marks the same entries as in `status`.
   - When something runs but nobody waits, a dim line under the table says
     what would start right away (`No one waiting · a command needing ≤8
     cores starts right away`, or that the next command waits for cores when
