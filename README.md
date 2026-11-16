@@ -214,7 +214,7 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
 
   **Colors** have two modes, shown at the top (`focus` / `overview`) and
   switched with `c`. In `focus`, the default when `top` is started inside a
-  git worktree, only the rows of that worktree are colored (one fixed blue):
+  git worktree, only the rows of that worktree are colored (one fixed green):
   the whole row, `#N` to the text after the bar, and its slots in the cores
   box. Every other row is dim gray, its bar filled with a lighter gray. In
   `overview`, the default outside a worktree, each worktree of a repository

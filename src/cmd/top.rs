@@ -384,7 +384,7 @@ const WT_COLORS: [Color; 8] = [
 ];
 
 /// The color of the current worktree's rows in `Focus`.
-const FOCUS_COLOR: Color = Color::LightBlue;
+const FOCUS_COLOR: Color = Color::LightGreen;
 /// Text, band and cores of the rows that get no color in `Focus`.
 const MUTED: Color = Color::Indexed(243);
 
