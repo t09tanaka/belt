@@ -1084,3 +1084,14 @@ task-traffic-controller と local-ci は RTR の binary に組み込まれてい
 A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一時 HOME の `src/service/workers/tests.rs`、実 binary・偽 ssh・偽の tool shim の `tests/it/workers_lifecycle.rs`（`a44`）。ネットワークには出ない。
 
 残り（S21 は完了していない）: `workers sync` の実際の導入（worker 側の warm-up 要求。導入は admitted な setup builder の poll_tool 経由でしか始まらないため、既存の認証済み経路へ要求を足す必要がある。diff が `auto_installable` で「`workers sync`」を案内するのは、この warm-up と一緒に入れる前提）、`doctor` への組み込み（S23）、`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は RTR の版だけで、組み込んだ crate 個別の build 情報は持たない。
+
+### S21 `workers sync`（2026-11-17、2 本目: 計画と blocked、導入の差し込み口）
+
+`workers sync <worker> [--project <dir>]` を実装した。計画は純粋関数 `toolchain::envsync::plan(parent, worker, project)`（PURE 対象）で、diff の `auto_installable` を版管理 adapter の導入手順にし、それ以外（`manual_required`・`missing`・`differs`）は導入せず `blocked: environment_mismatch` として不足内容と手順を出す。platform・disk・digest は sync の対象外。`--project` は dir 直下の版指定ファイル（symlink は辿らない、各 256KiB 以下）を `declarations` で読み、宣言された tool は親ではなくプロジェクトの要求（導入済みか既定の版が満たせば何もしない、満たす最大の許可済み版を導入、無ければ blocked）に従う。alias・式は版ではないので導入しない。
+
+実行は自動導入を先に行い、その後で手動分を blocked として報告する。導入後に worker を測り直し、導入が見えなければ blocked とする。導入の失敗は成功にせず、別の版へ切り替えない。導入そのものは `Installer` trait の差し込み口に分け、現在の本番実装 `NoWarmup` は「warm-up 要求がまだ無い」と報告して何も導入しない。
+
+残り（S21 は完了していない）:
+1. 導入の本番経路。導入は admitted な setup builder の `poll_tool` が配置済み attempt を consumer にしてのみ始まる（`install_admitted` は admission 前提で、ssh helper から直接呼べない）。warm-up 要求を既存の認証済み経路（resident の control → coordinator の worker link → wire request → agent が合成 consumer で `toolchain_poll`）へ 1 つ足し、旧 peer は hello の feature 交渉で外す。wire・protocol・coordinator・resident・agent に及ぶため別の作業にする。
+2. `doctor` への組み込み（S23。`envdiff::diff` は公開済み）。
+3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。

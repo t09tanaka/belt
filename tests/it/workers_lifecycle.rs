@@ -457,4 +457,68 @@ mod a44 {
         let out = fx.run(&["workers", "diff", "ghost"]);
         assert_eq!(out.status.code(), Some(ErrorCode::NotFound.exit_code()));
     }
+
+    #[test]
+    fn sync_blocks_what_needs_a_person_with_the_steps() {
+        let fx = fixture();
+        // The worker's manager has node 20.1.0 installed; only xcode, docker
+        // and the helpers differ.
+        let mut report = worker_report();
+        report.tools.insert(
+            "node".into(),
+            ToolFact {
+                observed: Observed::Available,
+                version: Some("20.1.0".into()),
+                managed: None,
+            },
+        );
+        fx.ssh(&answer(&report));
+        let out = fx.run(&["workers", "sync", "mini-a"]);
+        assert_eq!(out.status.code(), Some(ErrorCode::Blocked.exit_code()));
+        let value = json(&out);
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "BLOCKED");
+        assert_eq!(value["error"]["blocked_reason"], "environment_mismatch");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(message.contains("accept its license"), "{message}");
+        assert!(message.contains("Docker Desktop"), "{message}");
+        assert!(message.contains("task-traffic-controller"), "{message}");
+        assert!(!message.contains("node"), "{message}");
+    }
+
+    #[test]
+    fn sync_does_not_pretend_to_install_without_a_warm_up_request() {
+        let fx = fixture();
+        fx.ssh(&answer(&worker_report()));
+        let out = fx.run(&["workers", "sync", "mini-a"]);
+        assert_eq!(out.status.code(), Some(ErrorCode::Blocked.exit_code()));
+        let message = json(&out)["error"]["message"].as_str().unwrap().to_string();
+        assert!(
+            message.contains("node 20.1.0 was not installed"),
+            "{message}"
+        );
+        assert!(message.contains("no warm-up request yet"), "{message}");
+    }
+
+    #[test]
+    fn sync_with_a_project_follows_its_version_files() {
+        let fx = fixture();
+        let project = fx.path("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join(".node-version"), "18.0.0\n").unwrap();
+        // The worker already runs 18.0.0: the project is satisfied for node.
+        fx.ssh(&answer(&worker_report()));
+        let out = fx.run(&[
+            "workers",
+            "sync",
+            "mini-a",
+            "--project",
+            project.to_str().unwrap(),
+        ]);
+        let message = json(&out)["error"]["message"].as_str().unwrap().to_string();
+        assert!(!message.contains("node"), "{message}");
+        // A project that is not a directory is refused before any ssh.
+        let out = fx.run(&["workers", "sync", "mini-a", "--project", "/no/such/dir"]);
+        assert_eq!(out.status.code(), Some(ErrorCode::InvalidInput.exit_code()));
+    }
 }

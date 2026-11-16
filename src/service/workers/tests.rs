@@ -1150,3 +1150,293 @@ fn diff_of_every_worker_goes_on_after_one_that_fails_and_says_when_there_is_none
     .unwrap_err();
     assert_eq!(err.code, ErrorCode::Conflict);
 }
+
+mod sync {
+    use super::*;
+    use crate::toolchain::envdiff::{Docker, Managed, Observed, ToolFact};
+    use crate::toolchain::envsync::{Blocked, InstallStep};
+
+    fn node(version: &str, installed: &[&str]) -> ToolFact {
+        ToolFact {
+            observed: Observed::Available,
+            version: Some(version.into()),
+            managed: Some(Managed {
+                inventory: vec!["18.0.0".into(), "20.1.0".into()],
+                installed: installed.iter().map(|v| v.to_string()).collect(),
+            }),
+        }
+    }
+    fn parent() -> EnvReport {
+        let mut r = parent_report();
+        r.docker = Docker::Runnable;
+        r.tools.clear();
+        r.helpers.clear();
+        r.tools.insert(
+            "node".into(),
+            ToolFact {
+                observed: Observed::Available,
+                version: Some("20.1.0".into()),
+                managed: None,
+            },
+        );
+        r
+    }
+    fn worker(version: &str, installed: &[&str], docker: Docker) -> Vec<u8> {
+        let mut r = parent();
+        r.docker = docker;
+        r.tools.insert("node".into(), node(version, installed));
+        r.disk_free_bytes = Some(100 << 30);
+        format!("{}\n", serde_json::json!({"ok": true, "env": r})).into_bytes()
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        calls: Vec<(String, InstallStep)>,
+        fail: Option<String>,
+    }
+    impl Installer for Recorder {
+        fn install(&mut self, worker: &str, step: &InstallStep) -> Result<(), String> {
+            self.calls.push((worker.into(), step.clone()));
+            self.fail.clone().map_or(Ok(()), Err)
+        }
+    }
+
+    fn world() -> World {
+        let mut w = World::new();
+        w.add("mini-a", Some("ci@a"), true).unwrap();
+        w.remote.log.clear();
+        w
+    }
+    fn run(
+        w: &mut World,
+        installer: &mut dyn Installer,
+        project: Option<&[crate::toolchain::versions::EffectiveRequirement]>,
+    ) -> Result<SyncResult, ApiError> {
+        sync_worker(
+            &mut w.remote,
+            &w.env,
+            &w.exe,
+            "mini-a",
+            || Ok(parent()),
+            project,
+            installer,
+        )
+    }
+
+    #[test]
+    fn what_the_manager_may_install_is_installed_and_then_checked() {
+        let mut w = world();
+        w.remote.env_queue = [
+            worker("18.0.0", &["18.0.0"], Docker::Runnable),
+            worker("18.0.0", &["18.0.0", "20.1.0"], Docker::Runnable),
+        ]
+        .into();
+        let mut installer = Recorder::default();
+        let done = run(&mut w, &mut installer, None).unwrap();
+        assert_eq!(done.worker, "mini-a");
+        assert_eq!(done.installed.len(), 1);
+        assert_eq!(installer.calls.len(), 1);
+        assert_eq!(installer.calls[0].0, "mini-a");
+        assert_eq!(installer.calls[0].1.tool, "node");
+        assert_eq!(installer.calls[0].1.version, "20.1.0");
+        // Measured before and after, nothing else asked of the host.
+        assert_eq!(w.remote.log.len(), 2);
+    }
+
+    #[test]
+    fn a_worker_already_in_sync_installs_nothing_and_asks_once() {
+        let mut w = world();
+        w.remote.env_queue = [worker("20.1.0", &["20.1.0"], Docker::Runnable)].into();
+        let mut installer = Recorder::default();
+        let done = run(&mut w, &mut installer, None).unwrap();
+        assert!(done.installed.is_empty() && installer.calls.is_empty());
+        assert_eq!(w.remote.log.len(), 1);
+    }
+
+    #[test]
+    fn what_needs_a_person_is_blocked_with_the_steps_and_nothing_is_installed_for_it() {
+        let mut w = world();
+        w.remote.env_queue = [worker("20.1.0", &["20.1.0"], Docker::NotRunnable)].into();
+        let mut installer = Recorder::default();
+        let err = run(&mut w, &mut installer, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Blocked);
+        assert_eq!(
+            err.blocked_reason,
+            Some(crate::error::BlockedReason::EnvironmentMismatch)
+        );
+        assert!(err.message.contains("environment_mismatch"));
+        assert!(err.message.contains("Docker Desktop"), "{}", err.message);
+        assert!(installer.calls.is_empty());
+    }
+
+    #[test]
+    fn an_automatic_install_comes_first_and_the_manual_rest_is_still_reported() {
+        let mut w = world();
+        w.remote.env_queue = [
+            worker("18.0.0", &["18.0.0"], Docker::NotRunnable),
+            worker("18.0.0", &["18.0.0", "20.1.0"], Docker::NotRunnable),
+        ]
+        .into();
+        let mut installer = Recorder::default();
+        let err = run(&mut w, &mut installer, None).unwrap_err();
+        assert_eq!(installer.calls.len(), 1);
+        assert!(err.message.contains("Docker Desktop"));
+        assert!(!err.message.contains("node 20.1.0 was not installed"));
+        assert_eq!(err.message.matches("\n- ").count(), 1);
+    }
+
+    #[test]
+    fn a_failed_install_is_blocked_and_never_success() {
+        let mut w = world();
+        w.remote.env_queue = [worker("18.0.0", &["18.0.0"], Docker::Runnable)].into();
+        let mut installer = Recorder {
+            fail: Some("the manager refused".into()),
+            ..Default::default()
+        };
+        let err = run(&mut w, &mut installer, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Blocked);
+        assert!(err.message.contains("node 20.1.0 was not installed"));
+        assert!(err.message.contains("the manager refused"));
+        // Nothing was installed, so nothing is measured again.
+        assert_eq!(w.remote.log.len(), 1);
+    }
+
+    #[test]
+    fn an_install_that_is_not_visible_afterwards_is_blocked() {
+        let mut w = world();
+        w.remote.env_queue = [
+            worker("18.0.0", &["18.0.0"], Docker::Runnable),
+            worker("18.0.0", &["18.0.0"], Docker::Runnable),
+        ]
+        .into();
+        let mut installer = Recorder::default();
+        let err = run(&mut w, &mut installer, None).unwrap_err();
+        assert!(err
+            .message
+            .contains("node 20.1.0 is still missing after its install"));
+    }
+
+    #[test]
+    fn without_a_warm_up_request_nothing_is_installed_and_it_is_said() {
+        let mut w = world();
+        w.remote.env_queue = [worker("18.0.0", &["18.0.0"], Docker::Runnable)].into();
+        let err = run(&mut w, &mut NoWarmup, None).unwrap_err();
+        assert!(err.message.contains("no warm-up request yet"));
+        let other = Recorder::default();
+        assert!(NoWarmup
+            .install(
+                "w",
+                &InstallStep {
+                    tool: "node".into(),
+                    version: "1".into()
+                }
+            )
+            .is_err());
+        assert!(other.calls.is_empty());
+    }
+
+    #[test]
+    fn a_project_requirement_sets_the_version() {
+        let mut w = world();
+        w.remote.env_queue = [
+            worker("18.0.0", &["18.0.0"], Docker::Runnable),
+            worker("18.0.0", &["18.0.0", "20.1.0"], Docker::Runnable),
+        ]
+        .into();
+        let reqs = [crate::toolchain::versions::EffectiveRequirement {
+            tool: crate::toolchain::versions::ToolId::parse("node").unwrap(),
+            constraints: vec![crate::toolchain::versions::Constraint::parse("^20").unwrap()],
+            provenance: vec![],
+        }];
+        let mut installer = Recorder::default();
+        run(&mut w, &mut installer, Some(&reqs)).unwrap();
+        assert_eq!(installer.calls[0].1.version, "20.1.0");
+    }
+
+    #[test]
+    fn the_parent_that_cannot_be_measured_or_a_worker_that_cannot_answer_installs_nothing() {
+        let mut w = world();
+        let mut installer = Recorder::default();
+        let err = sync_worker(
+            &mut w.remote,
+            &w.env,
+            &w.exe,
+            "mini-a",
+            || Err("no profile".into()),
+            None,
+            &mut installer,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Internal);
+        w.remote.env_answer = Some(b"garbage".to_vec());
+        let err = run(&mut w, &mut installer, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict);
+        assert!(installer.calls.is_empty());
+        let err = sync_worker(
+            &mut w.remote,
+            &w.env,
+            &w.exe,
+            "ghost",
+            || Ok(parent()),
+            None,
+            &mut installer,
+        )
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn the_blocked_message_lists_every_line() {
+        let err = blocked_error(
+            "w",
+            &[
+                Blocked {
+                    subject: "a".into(),
+                    missing: "a is missing".into(),
+                    steps: "do a".into(),
+                },
+                Blocked {
+                    subject: "b".into(),
+                    missing: "b is missing".into(),
+                    steps: "do b".into(),
+                },
+            ],
+        );
+        assert_eq!(
+            err.message,
+            "worker w is not in sync (environment_mismatch):\n- a is missing: do a\n- b is missing: do b"
+        );
+    }
+
+    #[test]
+    fn project_version_files_are_read_bounded_and_not_through_links() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let root = dir.path();
+        assert!(read_project_requirements(&root.join("missing")).is_err());
+        assert!(read_project_requirements(root).unwrap().is_empty());
+        fs::write(root.join(".node-version"), "20.1.0\n").unwrap();
+        let reqs = read_project_requirements(root).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].tool.as_str(), "node");
+        // A link is refused, not followed.
+        fs::remove_file(root.join(".node-version")).unwrap();
+        fs::write(root.join("real"), "20\n").unwrap();
+        std::os::unix::fs::symlink(root.join("real"), root.join(".node-version")).unwrap();
+        assert!(read_project_requirements(root).is_err());
+        fs::remove_file(root.join(".node-version")).unwrap();
+        // Too large.
+        fs::write(
+            root.join(".nvmrc"),
+            vec![b'1'; crate::toolchain::declarations::MAX_DOCUMENT_BYTES + 1],
+        )
+        .unwrap();
+        assert!(read_project_requirements(root).is_err());
+        // Not text.
+        fs::write(root.join(".nvmrc"), [0xff, 0xfe]).unwrap();
+        assert!(read_project_requirements(root).is_err());
+        // Contradicting requirements.
+        fs::write(root.join(".nvmrc"), "18\n").unwrap();
+        fs::write(root.join(".node-version"), "20\n").unwrap();
+        assert!(read_project_requirements(root).is_err());
+    }
+}

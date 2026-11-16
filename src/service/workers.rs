@@ -6,6 +6,7 @@
 use super::bootstrap::Spec;
 use super::worker_service::{self, InstallRequest, Status};
 use crate::toolchain::envdiff::{self, EnvReport, Item};
+use crate::toolchain::envsync::{self, Blocked, InstallStep};
 use crate::{
     cli::WorkersSub,
     config::paths::user_config_path,
@@ -952,6 +953,136 @@ pub fn diff_workers(
     Ok(out)
 }
 
+/// Installs one version on a worker through its version manager, by the same
+/// admitted setup path a placed attempt uses. The production path is a warm-up
+/// request to the worker's resident over the authenticated link; until that
+/// request exists, `NoWarmup` says so and nothing is installed.
+pub trait Installer {
+    fn install(&mut self, worker: &str, step: &InstallStep) -> Result<(), String>;
+}
+
+pub struct NoWarmup;
+impl Installer for NoWarmup {
+    fn install(&mut self, _: &str, _: &InstallStep) -> Result<(), String> {
+        Err("the worker accepts no warm-up request yet, so nothing was installed".into())
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncResult {
+    pub worker: String,
+    pub installed: Vec<InstallStep>,
+}
+
+/// The project's version requirements per tool, read from the version files
+/// directly under `dir` (never followed through a link, bounded in size).
+pub fn read_project_requirements(
+    dir: &Path,
+) -> Result<Vec<crate::toolchain::versions::EffectiveRequirement>, ApiError> {
+    use crate::toolchain::{declarations, versions};
+    use std::os::unix::fs::OpenOptionsExt;
+    let bad = |what: &str| invalid(format!("project version files: {what}"));
+    if !dir.is_dir() {
+        return Err(bad("the project is not a directory"));
+    }
+    let mut documents = BTreeMap::new();
+    for name in declarations::VERSION_FILES {
+        let path = dir.join(name);
+        let Ok(meta) = std::fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() || meta.len() > declarations::MAX_DOCUMENT_BYTES as u64 {
+            return Err(bad(&format!("{name} is not a small regular file")));
+        }
+        let mut bytes = Vec::new();
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .and_then(|f| {
+                f.take(declarations::MAX_DOCUMENT_BYTES as u64 + 1)
+                    .read_to_end(&mut bytes)
+            })
+            .map_err(|_| bad(&format!("{name} is unreadable")))?;
+        let doc = declarations::Document::new(name, &bytes)
+            .map_err(|d| bad(&format!("{name}: {}", d.code)))?;
+        documents.insert(name.to_string(), doc);
+    }
+    let found = declarations::read_project("", &documents, &[]).map_err(|d| bad(&d.code))?;
+    versions::effective(&found, &versions::Scope::project("")).map_err(|d| bad(&d.code))
+}
+
+fn blocked_error(name: &str, blocked: &[Blocked]) -> ApiError {
+    let lines: Vec<String> = blocked
+        .iter()
+        .map(|b| format!("- {}: {}", b.missing, b.steps))
+        .collect();
+    ApiError::blocked(
+        crate::error::BlockedReason::EnvironmentMismatch,
+        format!(
+            "worker {name} is not in sync (environment_mismatch):\n{}",
+            lines.join("\n")
+        ),
+    )
+}
+
+/// `workers sync <worker> [--project <dir>]`. Installs what the worker's
+/// version manager may, then reports every difference that still needs a
+/// person. A failed install is never success, and no other version stands in.
+pub fn sync_worker(
+    remote: &mut impl Remote,
+    env: &BTreeMap<String, String>,
+    exe: &Path,
+    name: &str,
+    local: impl FnOnce() -> Result<EnvReport, String>,
+    project: Option<&[crate::toolchain::versions::EffectiveRequirement]>,
+    installer: &mut dyn Installer,
+) -> Result<SyncResult, ApiError> {
+    let parent = local().map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
+    let worker = fetch_env(remote, env, exe, name)?;
+    let first = envsync::plan(&parent, &worker, project);
+    let mut installed = Vec::new();
+    let mut blocked = Vec::new();
+    for step in &first.install {
+        match installer.install(name, step) {
+            Ok(()) => installed.push(step.clone()),
+            Err(reason) => blocked.push(Blocked {
+                subject: step.tool.clone(),
+                missing: format!("{} {} was not installed", step.tool, step.version),
+                steps: reason,
+            }),
+        }
+    }
+    if installed.is_empty() {
+        blocked.extend(first.blocked);
+    } else {
+        // Look again: what was installed must now be there.
+        let after = fetch_env(remote, env, exe, name)?;
+        let again = envsync::plan(&parent, &after, project);
+        for step in again.install {
+            if installed.contains(&step) {
+                blocked.push(Blocked {
+                    subject: step.tool.clone(),
+                    missing: format!(
+                        "{} {} is still missing after its install",
+                        step.tool, step.version
+                    ),
+                    steps: "run workers diff and check the worker's toolchain directory".into(),
+                });
+            }
+        }
+        blocked.extend(again.blocked);
+    }
+    if blocked.is_empty() {
+        Ok(SyncResult {
+            worker: name.into(),
+            installed,
+        })
+    } else {
+        Err(blocked_error(name, &blocked))
+    }
+}
+
 fn registered_names(env: &BTreeMap<String, String>) -> Result<Vec<String>, ApiError> {
     let (path, text) = read_user_config(env)?;
     let user = crate::config::parse::parse_user(&path.to_string_lossy(), &text)
@@ -1010,7 +1141,7 @@ fn emit(
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"schema_version":1,"ok":false,"error":{"code":error.code,"message":error.message}})
+                    serde_json::json!({"schema_version":1,"ok":false,"error":error})
                 );
             } else {
                 eprintln!("error: {}", error.message);
@@ -1124,6 +1255,42 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
             } else {
                 code
             });
+        }
+        WorkersSub::Sync { name, project } => {
+            let result = (|| {
+                let exe = exe
+                    .as_ref()
+                    .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+                let spec = super::context::runtime_spec(&env)?;
+                let requirements = project
+                    .as_deref()
+                    .map(|dir| read_project_requirements(Path::new(dir)))
+                    .transpose()?;
+                sync_worker(
+                    &mut SshRemote,
+                    &env,
+                    exe,
+                    name,
+                    || crate::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env),
+                    requirements.as_deref(),
+                    &mut NoWarmup,
+                )
+            })()
+            .map(|done| {
+                let text = if done.installed.is_empty() {
+                    format!("worker {name} is in sync")
+                } else {
+                    let list: Vec<String> = done
+                        .installed
+                        .iter()
+                        .map(|s| format!("{} {}", s.tool, s.version))
+                        .collect();
+                    format!("worker {name} is in sync; installed {}", list.join(", "))
+                };
+                (serde_json::to_value(&done).expect("serializes"), text)
+            });
+            let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
+            return Some(emit(json, result.map(|(v, _)| v), || text));
         }
         _ => return None,
     };
