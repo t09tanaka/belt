@@ -146,7 +146,9 @@ enum Cmd {
 enum CacheCmd {
     /// The disk space each part of the cache takes, and whose the worktrees are
     Status,
-    /// Remove the worktrees of runs that are gone and empty the trash
+    /// Remove the worktrees of runs that are gone and empty the trash. Run in a
+    /// repository, it also drops the registrations there of local-ci
+    /// worktrees whose files are gone
     Prune {
         /// Also remove the worktrees kept with `run --keep`
         #[arg(long)]
@@ -401,6 +403,11 @@ fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
             let before =
                 reclaim::disk_usage(&dir.join("wt")) + reclaim::disk_usage(&dir.join("trash"));
             let swept = reclaim::prune_all(ctx, &dir, kept, legacy)?;
+            // the registrations, in this repository, of worktrees whose files are gone
+            let unregistered = match std::env::current_dir() {
+                Ok(here) => reclaim::prune_registrations(ctx, &dir, &here)?,
+                Err(_) => 0,
+            };
             let after =
                 reclaim::disk_usage(&dir.join("wt")) + reclaim::disk_usage(&dir.join("trash"));
             println!(
@@ -412,6 +419,11 @@ fn cache(ctx: &ExecContext, cmd: CacheCmd) -> Result<i32> {
                 swept.legacy,
                 swept.unknown
             );
+            if unregistered > 0 {
+                println!(
+                    "dropped the git registration of {unregistered} worktrees of this repository whose files were gone"
+                );
+            }
             if build {
                 let s = local_ci::build_cache::Settings::at(ctx, &dir);
                 let before = reclaim::disk_usage(&s.dir);

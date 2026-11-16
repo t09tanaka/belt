@@ -62,7 +62,7 @@ Or download a binary from the [releases](https://github.com/t09tanaka/local-ci/r
 | `local-ci run` | Run them and report. Exit code 0 = success (or `no_work`: the changes trigger no workflow), 1 = failure, 2 = error (could not run, or the result lacks something the plan expects), 3 = `incomplete` (what ran passed, but steps or workflows that local-ci cannot reproduce were left out, so it is not a pass; the commit status is `error`), 130 = interrupted with Ctrl-C (a run stopped with `SIGTERM` or `SIGHUP` cleans up and ends by that signal). |
 | `local-ci status` | Record the last run's result as the `local-ci` commit status (for a commit you have pushed since). |
 | `local-ci cache status` | Show the disk space each part of the cache directory takes, the entries of the build cache, and how many worktrees are in use, kept, left by runs that are gone, or left by an older version. |
-| `local-ci cache prune` | Remove the worktrees left by runs that are gone and empty the trash, before returning. `--kept` also removes the ones kept with `run --keep`, `--legacy` the ones left by a version that recorded no owner, `--build` empties the build cache. |
+| `local-ci cache prune` | Remove the worktrees left by runs that are gone and empty the trash, before returning. `--kept` also removes the ones kept with `run --keep`, `--legacy` the ones left by a version that recorded no owner, `--build` empties the build cache. Run in a repository, it also drops the registrations there of local-ci worktrees whose files are gone. |
 
 Common options (`plan` and `run`):
 
@@ -738,6 +738,16 @@ looked at, and the entries of a run that is alive, in another terminal too,
 are left alone. `local-ci cache status` shows what the directory holds, and
 `local-ci cache prune` does the same removal without a run and waits for the
 deletion.
+
+A run unregisters its worktrees in the repository each one is registered in,
+not in the checkout the run was started from, so a linked worktree that is
+removed while a run from it goes on does not leave registrations behind.
+When registrations are left anyway (by an earlier version, or by a run killed
+between deleting a worktree and unregistering it), nothing in the cache says
+whose they were. Run `local-ci cache prune` in the repository: it also drops
+the registrations there of worktrees under the cache directory whose files
+are gone. Locked registrations, and those that point anywhere else, are left
+alone.
 
 Two kinds of entries are never removed by a run:
 

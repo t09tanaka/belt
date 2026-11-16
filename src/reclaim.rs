@@ -300,7 +300,7 @@ fn names_of(cache: &Path, pid: u32) -> Vec<OsString> {
 
 /// The git directory of the repository `entry` is registered in as a
 /// worktree, when its `.git` file and the registration point at each other.
-fn registered_in(entry: &Path) -> Option<PathBuf> {
+pub(crate) fn registered_in(entry: &Path) -> Option<PathBuf> {
     let dot_git = entry.join(".git");
     let meta = std::fs::symlink_metadata(&dot_git).ok()?;
     if !meta.is_file() || meta.len() > 4096 {
@@ -594,6 +594,65 @@ pub fn prune_all(
     after.finish(ctx);
     crate::git::empty_trash_now(&cache.join("trash"));
     Ok(swept)
+}
+
+/// Drop the registrations, in the repository `repo` is in, of the worktrees
+/// local-ci made under `<cache>/wt` whose directory is gone. Returns how many
+/// there were.
+///
+/// A run unregisters its worktrees when it removes them, but a run that could
+/// not run git in its repository then (an earlier version ran it where the
+/// run was started, and that may be a worktree removed in the meantime), or
+/// that is killed between the two, leaves the registration behind. Nothing
+/// in the cache says whose it was once the files are gone, so it is found
+/// from the side of the repository. A registration that is locked, or that
+/// points anywhere but at a name local-ci gives under `<cache>/wt`, does not
+/// count; when one is found, `git worktree prune` drops it, as a run does.
+pub fn prune_registrations(ctx: &ExecContext, cache: &Path, repo: &Path) -> Result<usize> {
+    let Ok(wt) = std::fs::canonicalize(cache.join("wt")) else {
+        return Ok(0);
+    };
+    let Ok(common) = crate::git::git(
+        ctx,
+        repo,
+        &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+    ) else {
+        return Ok(0);
+    };
+    let common = PathBuf::from(common);
+    let gone = std::fs::read_dir(common.join("worktrees"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| is_gone_entry_of(&e.path(), &wt))
+        .count();
+    if gone > 0 {
+        crate::git::prune_worktrees(ctx, &common)?;
+    }
+    Ok(gone)
+}
+
+/// Whether the registration in `admin` is of an entry of `wt` (the resolved
+/// `<cache>/wt`) that is gone, and is not locked.
+fn is_gone_entry_of(admin: &Path, wt: &Path) -> bool {
+    if std::fs::symlink_metadata(admin.join("locked")).is_ok() {
+        return false;
+    }
+    let Ok(text) = std::fs::read_to_string(admin.join("gitdir")) else {
+        return false;
+    };
+    let dot_git = Path::new(text.trim_end());
+    let Some(entry) = dot_git.parent() else {
+        return false;
+    };
+    let (Some(name), Some(parent)) = (entry.file_name(), entry.parent()) else {
+        return false;
+    };
+    dot_git.file_name() == Some(OsStr::new(".git"))
+        && entry_pid(&name.to_string_lossy()).is_some()
+        && std::fs::symlink_metadata(entry).is_err()
+        // git records resolved paths; the cache may be reached through a link
+        && std::fs::canonicalize(parent).is_ok_and(|p| p == wt)
 }
 
 /// The entries of `<cache>/wt` and what is known of their owners.

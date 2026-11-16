@@ -604,7 +604,16 @@ fn clone_tree(_from: &Path, _to: &Path) -> bool {
 }
 
 /// Move the worktree out of the way, unregister it, and delete the files in the background.
+///
+/// git is run in the repository the worktree itself is registered in, read
+/// from its `.git` file before it is moved, and only falls back to `repo`.
+/// `repo` is where the run was started, and that can be a worktree that is
+/// removed while the run goes on: git cannot be run there any more, and a
+/// registration that is not dropped now is never dropped by local-ci, since
+/// once the files are deleted nothing in the cache says whose it was.
 pub fn remove_worktree(ctx: &ExecContext, repo: &Path, path: &Path, trash: &Path) {
+    let registered = crate::reclaim::registered_in(path);
+    let repo = registered.as_deref().unwrap_or(repo);
     if let Some(target) = move_to_trash(path, trash) {
         let _ = prune_worktrees(ctx, repo);
         delete_in_background(ctx, &[target], trash);

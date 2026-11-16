@@ -371,3 +371,90 @@ fn worktrees_of_an_older_version_are_reported_and_removed_only_when_asked() {
     assert!(f.output(&["cache", "prune", "--legacy"]).status.success());
     f.assert_nothing_left();
 }
+
+/// The registrations, in the repository, of worktrees under the cache.
+fn registered_in_cache(f: &Fixture) -> Vec<String> {
+    let home = std::fs::canonicalize(&f.home).unwrap();
+    git(&f.repo, &["worktree", "list", "--porcelain"])
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .filter(|p| Path::new(p).starts_with(&home))
+        .map(String::from)
+        .collect()
+}
+
+#[test]
+fn a_run_whose_checkout_is_removed_while_it_goes_on_leaves_no_registration() {
+    let f = gated_fixture();
+    // the run is started from a linked worktree of the repository
+    git(&f.repo, &["checkout", "-q", "main"]);
+    let caller = f.tmp.path().join("caller");
+    git(
+        &f.repo,
+        &["worktree", "add", "-q", caller.to_str().unwrap(), "feature"],
+    );
+    let mut run = f.run();
+    run.current_dir(&caller);
+    let mut child = f.start_blocked_with(run);
+    assert!(!registered_in_cache(&f).is_empty());
+
+    // that worktree is removed (its branch merged) before the run ends
+    std::fs::remove_dir_all(&caller).unwrap();
+    f.open_gate();
+    child.wait().unwrap();
+
+    assert_eq!(registered_in_cache(&f), Vec::<String>::new());
+    assert_eq!(f.entries(), Vec::<String>::new());
+    assert_eq!(f.owner_files(), 0);
+}
+
+#[test]
+fn prune_drops_the_registrations_of_worktrees_whose_files_are_gone() {
+    let f = fixture("true");
+    let wt = f.home.join("wt");
+    std::fs::create_dir_all(&wt).unwrap();
+    let add = |name: &str| {
+        let p = wt.join(name);
+        git(
+            &f.repo,
+            &["worktree", "add", "-q", "--detach", p.to_str().unwrap()],
+        );
+        p
+    };
+    // left by a run that could not unregister them: only the files went
+    for name in ["abc1234-4242", "abc1234-u1-4242"] {
+        std::fs::remove_dir_all(add(name)).unwrap();
+    }
+    // locked: someone wants it kept even while its files are away
+    let locked = add("abc1234-c2-4242");
+    git(&f.repo, &["worktree", "lock", locked.to_str().unwrap()]);
+    std::fs::remove_dir_all(&locked).unwrap();
+    assert_eq!(registered_in_cache(&f).len(), 3);
+
+    // from outside the repository nothing says whose they are
+    let o = f
+        .command(&["cache", "prune"])
+        .current_dir(f.tmp.path())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    assert_eq!(registered_in_cache(&f).len(), 3);
+
+    let o = f.output(&["cache", "prune"]);
+    assert!(o.status.success(), "{o:?}");
+    let out = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        out.contains("dropped the git registration of 2 worktrees of this repository"),
+        "{out}"
+    );
+    let left = registered_in_cache(&f);
+    assert_eq!(left.len(), 1, "{left:?}");
+    assert!(left[0].ends_with("abc1234-c2-4242"), "{left:?}");
+
+    // nothing more to drop: nothing is said
+    let o = f.output(&["cache", "prune"]);
+    assert!(
+        !String::from_utf8_lossy(&o.stdout).contains("dropped"),
+        "{o:?}"
+    );
+}
