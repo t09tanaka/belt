@@ -36,6 +36,8 @@ struct FakeRemote {
     os: &'static str,
     /// The helper actions that were asked for, in order.
     actions: Vec<String>,
+    /// How long the parent was willing to wait for each of them.
+    timeouts: Vec<Duration>,
     transfers: usize,
     truncate_transfer: bool,
     /// `(action, fault, only once)`.
@@ -99,7 +101,7 @@ impl Remote for FakeRemote {
         _: &SshTarget,
         shell: &str,
         stdin: &[u8],
-        _: Duration,
+        timeout: Duration,
     ) -> Result<RemoteOutput, String> {
         let staged = self.staging.join(format!("rtr-{}", Self::digest_in(shell)));
         if shell.starts_with("uname -s") {
@@ -132,6 +134,7 @@ impl Remote for FakeRemote {
             .expect("a helper action");
         assert!(shell.starts_with("exec \"$HOME/.remote-task-runner-bootstrap/rtr-"));
         self.actions.push(action.to_string());
+        self.timeouts.push(timeout);
         let fault = self.fault(action);
         if fault == Some(Fault::Unreachable) {
             return Ok(output(255, String::new()));
@@ -272,6 +275,7 @@ impl World {
                 fake,
                 os: "macos",
                 actions: vec![],
+                timeouts: vec![],
                 transfers: 0,
                 truncate_transfer: false,
                 faults: vec![],
@@ -331,6 +335,11 @@ fn upgrade_drains_switches_checks_the_bridge_and_resumes() {
     assert!(!result.draining && !result.status.draining);
     assert_eq!(result.status.binary_sha256, w.new);
     assert_eq!(w.actions(), ["status", "drain", "upgrade", "resume"]);
+    // The switch may wait for running work; the others are short questions.
+    assert_eq!(
+        w.remote.timeouts,
+        [120, 120, 900, 120].map(Duration::from_secs)
+    );
     assert_eq!(w.remote.transfers, 1);
     // The check went through the registered, version-independent path.
     let bridge = w.remote.paths().bridge_binary();
@@ -450,6 +459,7 @@ fn a_new_version_that_fails_its_bridge_check_is_rolled_back() {
         w.actions(),
         ["status", "drain", "upgrade", "rollback", "resume"]
     );
+    assert_eq!(w.remote.timeouts[3], Duration::from_secs(900));
     // Once for the new version, once for the restored one.
     assert_eq!(w.remote.bridges.len(), 2);
     w.assert_serving(&w.old);

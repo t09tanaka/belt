@@ -511,3 +511,17 @@ fn a_request_with_an_unknown_field_is_refused_by_the_helper() {
     assert!(run(Action::Rollback, &value).is_err());
     let _ = &h.old_exe;
 }
+
+#[test]
+fn a_stop_that_waited_on_live_attempts_says_nothing_was_switched() {
+    let original = || anyhow::anyhow!("the original reason");
+    let text = |live| stop_failure(live, original()).to_string();
+    assert_eq!(
+        text(Some(2)),
+        "2 attempt(s) are still live after waiting; nothing was switched"
+    );
+    assert_eq!(text(Some(1)).split(' ').next(), Some("1"));
+    // Idle or unreadable: the stop failed for its own reason.
+    assert_eq!(text(Some(0)), "the original reason");
+    assert_eq!(text(None), "the original reason");
+}

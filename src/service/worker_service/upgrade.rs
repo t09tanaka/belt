@@ -9,6 +9,10 @@
 //! change that cannot be undone by doing nothing, so a run that died anywhere
 //! is finished by running `upgrade` again or undone by `rollback`.
 //!
+//! `rollback` restores the files this module moves. It does not restore the
+//! worker database: once a started version has migrated it, an older version
+//! refuses to open it and the rollback ends as a reported failure.
+//!
 //! The drain marker is left as it is: the caller resumes the worker after it
 //! has checked the new service. Nothing here signals a process.
 use super::*;
@@ -193,6 +197,18 @@ pub fn rollback<L: Launcher>(
     )
 }
 
+/// The reason a stop did not finish, in the switch's own words: while
+/// attempts are live nothing was switched (the caller decides about the
+/// drain marker, so the stop command's advice does not apply).
+fn stop_failure(live: Option<u32>, error: anyhow::Error) -> anyhow::Error {
+    match live {
+        Some(live) if live > 0 => {
+            anyhow::anyhow!("{live} attempt(s) are still live after waiting; nothing was switched")
+        }
+        _ => error,
+    }
+}
+
 /// Stop the service of the version the journal names. It is booted out only
 /// after no attempt is live; a state that cannot be told stops nothing.
 fn retire<L: Launcher>(
@@ -209,12 +225,14 @@ fn retire<L: Launcher>(
             "loaded service identity unknown; reconciliation required (nothing stopped)"
         ),
         LoadedState::Absent => {
-            marker(paths, wait).request(
-                &identity(journal),
-                WorkerRequest::Stop {
-                    cancel_running: false,
-                },
-            )?;
+            marker(paths, wait)
+                .request(
+                    &identity(journal),
+                    WorkerRequest::Stop {
+                        cancel_running: false,
+                    },
+                )
+                .map_err(|e| stop_failure(live_attempts(&paths.state).ok(), e))?;
             Ok((files, launcher))
         }
         LoadedState::Match => {
@@ -224,7 +242,9 @@ fn retire<L: Launcher>(
                 launcher,
                 worker: marker(paths, wait),
             };
-            manager.stop(&plan, receipt, false)?;
+            manager
+                .stop(&plan, receipt, false)
+                .map_err(|e| stop_failure(live_attempts(&paths.state).ok(), e))?;
             let Manager {
                 files,
                 mut launcher,
