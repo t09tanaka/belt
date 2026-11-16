@@ -166,9 +166,16 @@ impl Exporter {
                             crate::storage::query::Output::Artifact { record } => record,
                             crate::storage::query::Output::Pending { name } => {
                                 summary.unreceipted += 1;
-                                let error = metadata.collection_closed_at_ms.map(|_| {
-                                    internal("closed collection has an unreceipted output")
-                                });
+                                let collection_failed = metadata
+                                    .collection_verdict
+                                    .as_deref()
+                                    .is_some_and(|v| v != "complete");
+                                let error = metadata
+                                    .collection_closed_at_ms
+                                    .filter(|_| !collection_failed)
+                                    .map(|_| {
+                                        internal("closed collection has an unreceipted output")
+                                    });
                                 if let Some(e) = &error {
                                     summary.failed += 1;
                                     failure =
@@ -574,6 +581,29 @@ mod tests {
         assert_eq!(error, Some(ErrorCode::Internal));
         assert!(!f.dir.path().join("results").exists());
         assert!(!String::from_utf8(out).unwrap().contains("do_not_emit"));
+    }
+    #[tokio::test]
+    async fn closed_failed_collection_with_unreceipted_output_exits_collection_failed() {
+        let f = Fixture::new();
+        let attempt = f.attempt.to_string();
+        f.db.db
+            .write(move |tx| {
+                tx.execute(
+                    "UPDATE collection SET verdict='gave_up', closed_at_ms=7 WHERE attempt_id=?1",
+                    [attempt],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (summary, error) = f
+            .exporter(Target::Task(f.task.clone()), None)
+            .export(true, &mut out, &mut err)
+            .await
+            .unwrap();
+        assert_eq!(summary.unreceipted, 1);
+        assert_eq!(error, Some(ErrorCode::CollectionFailed));
     }
     #[tokio::test]
     async fn pages_over_64_tasks_retry_gap_and_membership() {
