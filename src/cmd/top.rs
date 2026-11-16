@@ -385,8 +385,13 @@ const WT_COLORS: [Color; 8] = [
 
 /// The color of the current worktree's rows in `Focus`.
 const FOCUS_COLOR: Color = Color::LightGreen;
-/// Text, band and cores of the rows that get no color in `Focus`.
+/// The cores slots of the rows that get no color in `Focus`.
 const MUTED: Color = Color::Indexed(243);
+/// The style of the text that is not the point: the `No one waiting` line,
+/// and every part of a row without a color in `Focus` (band, number,
+/// project, worktree, job, the text after the bar). One constant, so the
+/// two cannot drift apart.
+const MUTED_STYLE: Style = Style::new().add_modifier(Modifier::DIM);
 
 /// How rows are colored: `Focus` colors only the worktree `top` was
 /// started in and mutes the rest; `Overview` gives every worktree (of a
@@ -900,7 +905,7 @@ fn band_color(v: &View, wt: Option<usize>) -> Color {
 fn tinted(v: &View, tint: Option<Color>, base: Style) -> Style {
     match (tint, v.mode) {
         (Some(c), _) => base.fg(c),
-        (None, ColorMode::Focus) => base.fg(MUTED),
+        (None, ColorMode::Focus) => base.patch(MUTED_STYLE),
         (None, ColorMode::Overview) => base,
     }
 }
@@ -1087,7 +1092,13 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
         let tint = row_tint(v, r.wt);
         let text = tinted(v, tint, base);
         let mut spans = vec![
-            Span::styled("▌", Style::new().fg(band_color(v, r.wt))),
+            Span::styled(
+                "▌",
+                match tint {
+                    None if v.mode == ColorMode::Focus => MUTED_STYLE,
+                    _ => Style::new().fg(band_color(v, r.wt)),
+                },
+            ),
             Span::styled(format!("{:>num_w$} ", format!("#{}", r.num)), text),
         ];
         spans.push(Span::styled(col(&r.project, cols.project), text));
@@ -1150,7 +1161,10 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
     }
     if v.waiting.is_empty() {
         lines.push(Line::raw(""));
-        lines.push(Line::styled(format!(" {}", nobody_waiting(v.free)), dim));
+        lines.push(Line::styled(
+            format!(" {}", nobody_waiting(v.free)),
+            MUTED_STYLE,
+        ));
     }
     f.render_widget(Paragraph::new(lines), inner);
 }
@@ -2213,6 +2227,41 @@ mod tests {
             .collect()
     }
 
+    /// (fg, bg, modifiers) of every non-blank cell of the row with `needle`.
+    fn row_styles(buf: &ratatui::buffer::Buffer, needle: &str) -> Vec<(Color, Color, Modifier)> {
+        let y = row_y(buf, 120, 16, needle);
+        (1..119u16)
+            .filter(|&x| buf[(x, y)].symbol() != " ")
+            .map(|x| {
+                let c = &buf[(x, y)];
+                (c.fg, c.bg, c.modifier)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_row_without_color_is_styled_like_the_no_one_waiting_line() {
+        let now = Utc::now();
+        let e = in_wt(
+            entry("a", State::Running, 1, 1, "/r/a", "", "a", now, 20),
+            FIX,
+            "b",
+        );
+        let v = View::from_parts(&ledger(vec![e]), vec![], limits(4), None, now, Some(ME));
+        assert_eq!(v.mode, ColorMode::Focus);
+        let t = render(&v, 120, 16);
+        let buf = t.backend().buffer().clone();
+        let line = row_styles(&buf, "No one waiting");
+        let row = row_styles(&buf, "ran ");
+        assert!(line.len() > 10 && row.len() > 10);
+        // Every text cell of the row, band included, has the line's style.
+        assert!(
+            row.iter().all(|s| *s == line[0]) && line.iter().all(|s| *s == line[0]),
+            "{row:?} {line:?}"
+        );
+        assert!(line[0].2.contains(Modifier::DIM));
+    }
+
     #[test]
     fn focus_colors_only_my_rows_in_every_part_and_mutes_the_rest() {
         let mut v = sample_view(Utc::now());
@@ -2230,7 +2279,7 @@ mod tests {
         for needle in ["cargo test --workspace", "local-ci run"] {
             let fgs = row_fgs(&buf, needle);
             assert!(
-                fgs.len() > 20 && fgs.iter().all(|c| *c == MUTED),
+                fgs.len() > 20 && fgs.iter().all(|c| *c == Color::Reset),
                 "{needle} {fgs:?}"
             );
         }
