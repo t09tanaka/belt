@@ -72,6 +72,13 @@ pub fn bind(
         .and_then(|_| std::fs::File::open(&dir)?.sync_all())
         .map_err(|_| invalid())
 }
+/// Remove the binding of a run the owner definitively refused. Best effort: a
+/// missing binding is fine and a failure leaves only an unreferenced private file.
+pub fn unbind(state: &Path, run: &RunId) {
+    if let Ok(dir) = directory(state) {
+        let _ = fs::remove_file(dir.join(format!("{run}.json")));
+    }
+}
 pub fn read_secrets(
     binding: &Binding,
     env: &std::collections::BTreeMap<String, String>,
@@ -179,6 +186,21 @@ mod tests {
         fs::rename(&root, temp.path().join("old")).unwrap();
         fs::create_dir(&root).unwrap();
         assert!(load(temp.path(), &run, &source, &digest, &worker).is_err());
+    }
+    #[test]
+    fn unbind_removes_the_binding_and_tolerates_absence() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let run = RunId::generate();
+        let source = SourceId::generate();
+        let digest = Digest::of_bytes(b"baseline");
+        let worker = WorkerId::parse("parent-local").unwrap();
+        bind(temp.path(), &run, &source, &digest, &worker, &root, vec![]).unwrap();
+        unbind(temp.path(), &run);
+        assert!(load(temp.path(), &run, &source, &digest, &worker).is_err());
+        unbind(temp.path(), &run);
+        bind(temp.path(), &run, &source, &digest, &worker, &root, vec![]).unwrap();
     }
     #[test]
     fn original_secret_reader_never_writes_or_erases_and_rejects_links() {

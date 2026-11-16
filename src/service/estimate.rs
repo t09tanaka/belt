@@ -236,7 +236,9 @@ pub async fn task(
 
 pub fn cli(args: &crate::cli::EstimateArgs, json: bool) -> i32 {
     let result = (|| {
-        let env = std::env::vars().collect();
+        let env = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

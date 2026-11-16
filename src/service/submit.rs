@@ -287,7 +287,10 @@ pub async fn command_with_mode(
                 .collect(),
         )?;
     }
-    match owner
+    // The binding must exist before the owner can accept the run (the worker
+    // reads it at dispatch), so it is written first and removed again when the
+    // owner definitively refuses. An unconfirmed submit keeps it: the run may exist.
+    let reply = owner
         .request(Operation::SubmitCaptured {
             run_id: run_id.clone(),
             source_id: source_id.clone(),
@@ -299,7 +302,11 @@ pub async fn command_with_mode(
                 ErrorCode::CommunicationUnknown,
                 format!("submit unconfirmed for run {run_id}, task {task_id}: {e}"),
             )
-        })? {
+        })?;
+    if in_place && matches!(reply, Reply::ControlError { .. } | Reply::Error { .. }) {
+        crate::workspace::in_place::unbind(context.state_dir(), &run_id);
+    }
+    match reply {
         Reply::Accepted { run_id: accepted } if accepted == run_id => Ok(Receipt {
             schema_version: 1,
             run_id,
