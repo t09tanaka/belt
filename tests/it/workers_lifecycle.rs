@@ -37,11 +37,8 @@ impl Fx {
             path
         };
         remote_task_runner::secrets::key::init(&self.path("cluster.key")).unwrap();
-        for file in ["rtr"] {
-            std::fs::write(self.path(file), b"x").unwrap();
-            std::fs::set_permissions(self.path(file), std::fs::Permissions::from_mode(0o700))
-                .unwrap();
-        }
+        std::fs::write(self.path("rtr"), b"x").unwrap();
+        std::fs::set_permissions(self.path("rtr"), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state_dir = private("coordinator");
         let cluster = remote_task_runner::storage::CoordinatorStore::open(&state_dir, 1)
             .unwrap()
