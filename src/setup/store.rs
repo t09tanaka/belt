@@ -769,7 +769,7 @@ mod tests {
     #[test]
     fn interruption_before_replacement_keeps_the_original_leaf() {
         for link in [false, true] {
-            let tmp = tempfile::tempdir().unwrap();
+            let tmp = crate::test_tmp::tempdir().unwrap();
             let tree = tmp.path().join("tree");
             let dest = tmp.path().join("workspace");
             let scratch = tmp.path().join("scratch");

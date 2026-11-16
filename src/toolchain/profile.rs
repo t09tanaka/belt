@@ -66,6 +66,7 @@ enum ProbeMiss {
     TimedOut,
     Failed,
 }
+const PROBE_DIR_PREFIX: &str = "rtr-tool-probe-";
 const PREPARATION_SNAPSHOT_TTL_MS: u64 = 5_000;
 // Tool discovery must not bootstrap a manager-selected tool behind admission.
 const INSTALL_GUARDS: &[(&str, &str)] = &[
@@ -804,9 +805,25 @@ fn bounded_probe(
     env: &BTreeMap<String, String>,
     deadline: Duration,
 ) -> Result<String, ProbeMiss> {
-    let cwd = tempfile::Builder::new()
-        .prefix("rtr-tool-probe-")
-        .tempdir()
+    static SWEPT: std::sync::Once = std::sync::Once::new();
+    let parent = std::env::temp_dir();
+    // A process that was killed, or that exited, in the middle of a probe ran
+    // no destructor: its directory is removed here, once it is proven gone.
+    SWEPT.call_once(|| {
+        crate::platform::owned_temp::sweep(&parent, PROBE_DIR_PREFIX);
+    });
+    bounded_probe_in(&parent, path, args, env, deadline)
+}
+/// The probe runs in an empty directory under `parent`. It is removed on every
+/// return below, after the probed process group is killed and its leader reaped.
+fn bounded_probe_in(
+    parent: &Path,
+    path: &Path,
+    args: &[&str],
+    env: &BTreeMap<String, String>,
+    deadline: Duration,
+) -> Result<String, ProbeMiss> {
+    let cwd = crate::platform::owned_temp::OwnedTemp::new_in(parent, PROBE_DIR_PREFIX)
         .map_err(|_| ProbeMiss::Failed)?;
     let mut child = Command::new(path)
         .args(args)
@@ -925,14 +942,71 @@ mod tests {
         ]
         .into()
     }
+    /// Every way a probe ends removes its directory: an answer, a failing
+    /// tool, a tool that cannot be started, too much output, and a timeout
+    /// whose descendant keeps the directory as its working directory.
+    #[test]
+    fn a_probe_leaves_nothing_under_its_parent_however_it_ends() {
+        let tmp = crate::test_tmp::tempdir().unwrap();
+        let bin = tmp.path().join("bin");
+        let parent = tmp.path().join("probes");
+        fs::create_dir(&bin).unwrap();
+        fs::create_dir(&parent).unwrap();
+        // The tool sees an empty directory that this process is recorded to own.
+        fake(&bin, "answers", "pwd -P; ls; cat ../owner", 0o755);
+        fake(&bin, "fails", "echo no; exit 3", 0o755);
+        fake(&bin, "floods", "yes | head -c 20000", 0o755);
+        fake(&bin, "hangs", "(sleep 30 &) ; sleep 30", 0o755);
+        fake(&bin, "unreadable", "echo 1", 0o111);
+        let env: BTreeMap<String, String> =
+            [("PATH".to_string(), "/usr/bin:/bin".to_string())].into();
+        let run = |tool: &str, limit: u64| {
+            let got = bounded_probe_in(
+                &parent,
+                &bin.join(tool),
+                &[],
+                &env,
+                Duration::from_millis(limit),
+            );
+            assert!(
+                fs::read_dir(&parent).unwrap().next().is_none(),
+                "{tool} left a probe directory"
+            );
+            got
+        };
+        let answer = run("answers", 10_000).unwrap();
+        let mut lines = answer.lines();
+        let cwd = Path::new(lines.next().unwrap());
+        assert_eq!(cwd.parent().unwrap().parent().unwrap(), parent);
+        let name = cwd.parent().unwrap().file_name().unwrap().to_str().unwrap();
+        assert!(name.starts_with(PROBE_DIR_PREFIX), "{name}");
+        assert_eq!(lines.nth(1).unwrap(), std::process::id().to_string());
+        assert_eq!(run("fails", 10_000), Err(ProbeMiss::Failed));
+        assert_eq!(run("floods", 10_000), Err(ProbeMiss::Failed));
+        assert_eq!(run("unreadable", 10_000), Err(ProbeMiss::Failed));
+        assert_eq!(run("missing", 10_000), Err(ProbeMiss::Failed));
+        assert_eq!(run("hangs", 100), Err(ProbeMiss::TimedOut));
+        // No parent to make the directory in: a failed probe, nothing made.
+        assert_eq!(
+            bounded_probe_in(
+                &tmp.path().join("absent"),
+                &bin.join("answers"),
+                &[],
+                &env,
+                Duration::from_secs(10),
+            ),
+            Err(ProbeMiss::Failed)
+        );
+        assert!(!tmp.path().join("absent").exists());
+    }
     fn write_profile(dir: &Path, active: &str, extra: &str) {
         fs::write(dir.join("profiles.toml"), format!("schema_version = 1\nactive = {active:?}\n[profiles.node22]\npath = [{:?}]\nshell = \"/bin/sh\"\ncache_namespace = \"node22\"\n{extra}", dir.to_str().unwrap())).unwrap();
         fs::set_permissions(dir.join("profiles.toml"), fs::Permissions::from_mode(0o600)).unwrap();
     }
     #[test]
     fn actual_path_versions_and_private_profile_are_authoritative() {
-        let a = tempfile::tempdir().unwrap();
-        let b = tempfile::tempdir().unwrap();
+        let a = crate::test_tmp::tempdir().unwrap();
+        let b = crate::test_tmp::tempdir().unwrap();
         fake(a.path(), "node", "printf 'v22.0.0\\n'", 0o700);
         fake(b.path(), "node", "printf 'v20.0.0\\n'", 0o700);
         let p22 = Profile::load(a.path(), &env(a.path())).unwrap();
@@ -984,7 +1058,7 @@ mod tests {
     }
     #[test]
     fn transient_unknown_preserves_identity_without_claiming_availability() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let marker = root.path().join("probe-mode");
         fake(root.path(), "node", &format!(
             "mode=; if [ -r {marker:?} ]; then IFS= read -r mode < {marker:?} || :; fi; case \"$mode\" in timeout) /bin/sleep 30;; changed) echo v20.0.0;; *) echo v22.0.0;; esac"
@@ -1030,7 +1104,7 @@ mod tests {
 
     #[test]
     fn startup_cold_probe_recovers_before_publishing_baseline() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let marker = root.path().join("warmed");
         // The first owned probe times out after recording its cold launch;
         // subsequent invocations succeed without changing executable identity.
@@ -1055,7 +1129,7 @@ mod tests {
 
     #[test]
     fn startup_unknown_stays_honest_and_late_success_invalidates_baseline() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let marker = root.path().join("ready");
         fake(
             root.path(),
@@ -1113,7 +1187,7 @@ mod tests {
 
     #[test]
     fn startup_repeats_only_timeouts_within_its_bounds_and_late_success_is_drift() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let node_calls = root.path().join("node-calls");
         let ready = root.path().join("ready");
         // node never answers in time until `ready`.
@@ -1140,7 +1214,7 @@ mod tests {
         assert_eq!(initial.tools["node"], ToolObservation::Unknown);
 
         // Shared time already spent: one call with the live deadline, no repeat.
-        let other = tempfile::tempdir().unwrap();
+        let other = crate::test_tmp::tempdir().unwrap();
         let other_calls = other.path().join("node-calls");
         fake(
             other.path(),
@@ -1177,7 +1251,7 @@ mod tests {
 
     #[test]
     fn a_tool_that_never_answers_does_not_use_up_the_repeats_of_the_others() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         // node comes first and times out in every pass; git needs longer than
         // the live deadline, well inside one startup call.
         fake(root.path(), "node", "/bin/sleep 30", 0o700);
@@ -1198,7 +1272,7 @@ mod tests {
 
     #[test]
     fn startup_takes_a_failure_as_final_at_once() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let docker_calls = root.path().join("docker-calls");
         fake(
             root.path(),
@@ -1219,7 +1293,7 @@ mod tests {
 
     #[test]
     fn a_cold_required_tool_is_measured_at_load_and_a_silent_one_is_refused() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let warmed = root.path().join("warmed");
         fake(
             root.path(),
@@ -1242,7 +1316,7 @@ mod tests {
 
     #[test]
     fn initially_unknown_probe_requires_new_identity_when_it_becomes_known() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let marker = root.path().join("probe-mode");
         fake(root.path(), "node", &format!(
             "case $(/bin/cat {marker:?} 2>/dev/null) in known) echo v22.0.0;; changed) echo v20.0.0;; *) exit 1;; esac"
@@ -1270,7 +1344,7 @@ mod tests {
 
     #[test]
     fn probe_failures_and_docker_info_are_not_available() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         fake(root.path(), "node", "echo v22.0.0", 0o600);
         let p = Profile::load(root.path(), &env(root.path())).unwrap();
         // Deadlines are measured with the live one; answers that only have
@@ -1358,7 +1432,7 @@ mod tests {
     }
     #[test]
     fn private_input_rejects_symlinks_permissions_secrets_and_required_missing() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         write_profile(root.path(), "node22", "required_tools = [\"node\"]");
         assert!(Profile::load(root.path(), &env(root.path())).is_err());
         write_profile(
@@ -1387,7 +1461,7 @@ mod preparation_snapshot_tests {
     use super::*;
     #[test]
     fn preparation_snapshot_sequence_survives_missing_snapshot_and_overflow() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tmp::tempdir().unwrap();
         let profile = Profile::load(
             temp.path(),
             &BTreeMap::from([
@@ -1425,7 +1499,7 @@ mod preparation_snapshot_tests {
     }
     #[test]
     fn preparation_snapshot_consumption_is_process_free_and_never_renews_age() {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tmp::tempdir().unwrap();
         let root = fs::canonicalize(temp.path()).unwrap();
         let shell = root.join("sh");
         fs::copy("/bin/sh", &shell).unwrap();

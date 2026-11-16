@@ -122,7 +122,7 @@ mod tests {
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     fn store() -> (tempfile::TempDir, SourceStore) {
-        let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let store = SourceStore::open(root.path()).unwrap();
         (root, store)
     }

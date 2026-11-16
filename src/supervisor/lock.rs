@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn the_lock_is_exclusive_and_released_on_drop() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let a = AttemptId::generate();
         let first = SupervisorLock::try_acquire(dir.path(), &a)
             .unwrap()

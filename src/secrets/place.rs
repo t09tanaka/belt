@@ -690,7 +690,7 @@ mod tests {
     }
 
     fn env() -> Env {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_tmp::tempdir().unwrap();
         let state = tmp.path().join("state");
         let ws = tmp.path().join("ws");
         let outside = tmp.path().join("outside");
@@ -1249,7 +1249,7 @@ mod tests {
 
     #[test]
     fn the_index_directory_must_be_private() {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_tmp::tempdir().unwrap();
         let d = tmp.path().join("secret-index");
         fs::create_dir(&d).unwrap();
         fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();

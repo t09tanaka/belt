@@ -371,7 +371,7 @@ mod measured_tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
     async fn upload() -> (tempfile::TempDir, Arc<Lease>, OwnedUpload) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let source = SourceStore::open(dir.path()).unwrap();
         let local = Arc::new(tokio::sync::Mutex::new(())).lock_owned().await;
         let lease = Arc::new(Lease {
@@ -425,7 +425,7 @@ mod measured_lease_tests {
     use super::*;
     #[tokio::test]
     async fn final_lease_drop_releases_inherited_transfer_description_before_local_handoff() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let store = SourceStore::open(dir.path()).unwrap();
         let local = Arc::new(tokio::sync::Mutex::new(()));
         let (_stop, mut stopping) = watch::channel(false);
@@ -464,7 +464,7 @@ mod measured_lease_tests {
 
     #[tokio::test]
     async fn phase_origin_excludes_local_and_file_ownership_waits() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let store = SourceStore::open(dir.path()).unwrap();
         let lock = OpenOptions::new()
             .read(true)
@@ -501,7 +501,7 @@ mod measured_lease_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn foreground_source_wait_stop_and_cancellation_keep_local_ownership_until_drain() {
         for cancel in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_tmp::tempdir().unwrap();
             let store = SourceStore::open(dir.path()).unwrap();
             let exclusive = store.retention.guard(true).unwrap();
             let local = Arc::new(tokio::sync::Mutex::new(()));
@@ -542,7 +542,7 @@ mod measured_lease_tests {
 
     #[tokio::test]
     async fn foreground_transfer_wait_stop_releases_source_before_local_handoff() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let store = SourceStore::open(dir.path()).unwrap();
         let file = OpenOptions::new()
             .read(true)
@@ -584,7 +584,7 @@ mod measured_lease_tests {
 
     #[tokio::test]
     async fn cancelled_ownership_wait_has_no_measurement_origin() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let store = SourceStore::open(dir.path()).unwrap();
         let lock = OpenOptions::new()
             .read(true)

@@ -401,7 +401,7 @@ mod tests {
     }
     impl Fixture {
         async fn new() -> Self {
-            let temp = tempfile::tempdir().unwrap();
+            let temp = crate::test_tmp::tempdir().unwrap();
             let c = Arc::new(
                 Coordinator::start(
                     CoordinatorStore::open(temp.path(), 1).unwrap(),

@@ -7,6 +7,7 @@
 pub mod boot;
 pub mod clock;
 pub mod inhibit;
+pub mod owned_temp;
 pub mod process;
 pub mod process_read;
 
@@ -108,7 +109,7 @@ mod tests {
 
     #[test]
     fn the_free_space_of_a_disk_is_read() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         assert!(free_bytes(dir.path()).unwrap() > 0);
         assert!(free_bytes(&dir.path().join("nothing")).is_err());
     }
@@ -118,7 +119,7 @@ mod tests {
         use std::io::Read;
         use std::os::unix::fs::symlink;
         use std::path::Path;
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::test_tmp::tempdir().unwrap();
         let base = tmp.path().join("base");
         std::fs::create_dir_all(base.join("a/b")).unwrap();
         std::fs::write(base.join("a/b/f.txt"), "inside").unwrap();

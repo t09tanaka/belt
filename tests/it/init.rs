@@ -156,7 +156,7 @@ fn context(root: &std::path::Path) -> ContextInput {
 }
 #[test]
 fn concurrent_init_reuses_one_real_combined_resident_and_epoch() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let context = context(root.path());
     let state = Arc::new(Mutex::new(State::default()));
     let mut threads = vec![];
@@ -241,7 +241,7 @@ fn concurrent_init_reuses_one_real_combined_resident_and_epoch() {
 #[cfg(not(target_os = "macos"))]
 #[test]
 fn linux_public_init_refuses_without_filesystem_changes() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let out = test_command(env!("CARGO_BIN_EXE_remote-task-runner"))
         .args(["--json", "init"])
         .env("HOME", root.path())
@@ -304,7 +304,7 @@ fn manual_resident_and_failed_registered_daemon_are_not_initialized() {
             Ok(())
         }
     }
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let context = context(root.path());
     let state = Arc::new(Mutex::new(State::default()));
     let runtime = tokio::runtime::Builder::new_multi_thread()

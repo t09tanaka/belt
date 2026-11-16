@@ -365,7 +365,7 @@ mod tests {
     }
     #[test]
     fn union_dedup_sorted_long_names_and_deterministic_headers() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let ws = dir.path().join("ws");
         let root = dir.path().join("spool");
         fs::create_dir_all(ws.join("reports/deep")).unwrap();
@@ -413,7 +413,7 @@ mod tests {
     }
     #[test]
     fn rejects_secret_paths_inodes_links_and_cross_buffer_values() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let ws = dir.path().join("ws");
         let root = dir.path().join("spool");
         fs::create_dir_all(&ws).unwrap();
@@ -447,7 +447,7 @@ mod tests {
     #[test]
     fn refuses_selected_hostile_entries_and_bounds_but_does_not_follow_git() {
         use std::os::unix::ffi::OsStrExt;
-        let dir = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let ws = dir.path().join("ws");
         let root = dir.path().join("spool");
         fs::create_dir_all(ws.join(".git")).unwrap();
@@ -496,7 +496,7 @@ mod tests {
     }
     #[test]
     fn traversal_file_count_depth_and_member_byte_limits_refuse_without_truncation() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let ws = dir.path().join("ws");
         fs::create_dir(&ws).unwrap();
         fs::write(ws.join("good"), b"fine").unwrap();

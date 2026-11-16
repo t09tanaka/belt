@@ -289,7 +289,25 @@ impl Drop for Fx {
         for pid in pgrep(&pattern) {
             crate::common::kill_if_command(pid, &pattern);
         }
+        // Prepared templates are read-only by design, and the removal of the
+        // directory stops at the first one it cannot empty.
+        remote_task_runner::platform::owned_temp::make_writable(self.dir.path());
     }
+}
+
+#[test]
+fn fixture_with_a_sealed_template_leaves_no_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let fx = fx();
+    let path = fx.dir.path().to_path_buf();
+    let template = fx.state().join("setup/templates/sha256-sealed");
+    std::fs::create_dir_all(template.join("tree")).unwrap();
+    std::fs::write(template.join("tree/prepared.txt"), b"x").unwrap();
+    for dir in [template.join("tree"), template] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    drop(fx);
+    assert!(!path.exists(), "the fixture left {path:?}");
 }
 
 /// What only the command line of the attempt's supervisor contains.
@@ -1044,7 +1062,7 @@ async fn read_all(c: &Client, a: &AttemptId, stream: LogStream) -> Vec<u8> {
 
 #[test]
 fn secret_scan_uses_an_isolated_reader_including_live_wal_events() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let worker = WorkerId::parse("snapshot-worker").unwrap();
     let store = WorkerStore::open(dir.path(), &worker).unwrap();
     // Put the schema in the main DB first. The following single event commit

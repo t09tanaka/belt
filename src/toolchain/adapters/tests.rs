@@ -23,7 +23,7 @@ struct Fixture {
     shell: FileIdentity,
 }
 fn fixture(kind: AdapterKind, tool: &str) -> Fixture {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_tmp::tempdir().unwrap();
     let state = fs::canonicalize(temp.path()).unwrap();
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     let hostdir = state.join("host");
@@ -810,7 +810,7 @@ fn go_probe_and_consumer_cannot_switch_the_frozen_toolchain() {
 
 #[test]
 fn preparation_probe_bounded_identity_detects_growth_race_and_never_follows_links() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_tmp::tempdir().unwrap();
     let path = temp.path().join("manager");
     fs::write(&path, b"small").unwrap();
     let before = FileIdentity::capture(&path).unwrap();
@@ -836,7 +836,7 @@ fn preparation_probe_bounded_identity_detects_growth_race_and_never_follows_link
 
 #[test]
 fn preparation_probe_total_fd_byte_budget_is_shared_across_files() {
-    let temp = tempfile::tempdir().unwrap();
+    let temp = crate::test_tmp::tempdir().unwrap();
     let path = fs::canonicalize(temp.path()).unwrap().join("manager");
     fs::write(&path, vec![b'x'; 1024 * 1024]).unwrap();
     let budget = IdentityReadBudget::limited(1024 * 1024, 8 * 1024 * 1024);

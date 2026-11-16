@@ -1495,7 +1495,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_filesystem_await_keeps_owner_until_blocking_mutation_drains() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let store = Arc::new(CoordinatorStore::open(root.path(), 1).unwrap());
         let owner = Arc::downgrade(&store);
         let files = Arc::new(ResultStore::open(&root.path().join("results")).unwrap());

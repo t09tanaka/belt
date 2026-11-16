@@ -493,7 +493,7 @@ struct Fx {
 
 fn fx() -> Fx {
     Fx {
-        dir: tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap(),
+        dir: crate::test_tmp::tempdir().unwrap(),
         w: Worker::new("w-a"),
     }
 }

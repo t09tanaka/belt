@@ -22,7 +22,7 @@ use tempfile::TempDir;
 const BIG: u64 = 1 << 30;
 
 fn spool(limit: u64) -> (TempDir, AttemptId, AttemptSpool) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let a = AttemptId::generate();
     let s = AttemptSpool::open(dir.path(), &a, limit).unwrap();
     (dir, a, s)
@@ -208,7 +208,7 @@ fn tiny_writes_do_not_grow_the_index_per_append() {
     // A small threshold instead of the production 1 MiB, so the test does
     // not have to write a million bytes one at a time.
     const RECORD: u64 = 4096;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let a = AttemptId::generate();
     let s = AttemptSpool::open_with_record_bytes(dir.path(), &a, BIG, RECORD).unwrap();
     let w = s.writer(Stdout);
@@ -227,7 +227,7 @@ fn tiny_writes_do_not_grow_the_index_per_append() {
 
 #[test]
 fn resume_after_a_crash_continues_without_rewinding_or_repeating() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let a = AttemptId::generate();
     let first = {
         let s = AttemptSpool::open(dir.path(), &a, 100).unwrap();
@@ -266,7 +266,7 @@ fn resume_after_a_crash_continues_without_rewinding_or_repeating() {
 
 #[test]
 fn resume_repairs_a_torn_index_and_unindexed_bytes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let a = AttemptId::generate();
     {
         let s = AttemptSpool::open(dir.path(), &a, BIG).unwrap();
@@ -302,7 +302,7 @@ fn resume_repairs_a_torn_index_and_unindexed_bytes() {
 
 #[test]
 fn resume_drops_index_records_the_log_cannot_back() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let a = AttemptId::generate();
     {
         let s = AttemptSpool::open(dir.path(), &a, BIG).unwrap();
@@ -330,7 +330,7 @@ fn resume_drops_index_records_the_log_cannot_back() {
 
 #[test]
 fn only_one_writer_at_a_time() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let a = AttemptId::generate();
     let s = AttemptSpool::open(dir.path(), &a, BIG).unwrap();
     assert!(matches!(
@@ -359,7 +359,7 @@ fn appends_after_finish_are_refused_and_finish_repeats() {
 
 #[test]
 fn a_reader_without_a_spool_is_not_found() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     assert!(matches!(
         SpoolReader::open(dir.path(), &AttemptId::generate()),
         Err(SpoolError::NotFound(_))
@@ -430,7 +430,7 @@ fn spawn_child(root: &Path, a: &AttemptId) -> crate::test_child::OwnedChild {
 
 #[test]
 fn another_process_writes_while_this_one_reads_then_crashes_and_resumes() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let a = AttemptId::generate();
     let mut child = spawn_child(dir.path(), &a);
     // The writer lives in the other process: this one cannot take the spool.
@@ -490,7 +490,7 @@ struct Wk {
 }
 
 fn wk() -> Wk {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let state = dir.path().join("state");
     let store = WorkerStore::open(&state, &WorkerId::parse("mini-a").unwrap()).unwrap();
     store.start_agent(1).unwrap();
@@ -1042,7 +1042,7 @@ fn logs_path(root: &Path, a: &AttemptId, file: &str) -> std::path::PathBuf {
 
 #[test]
 fn a_stream_that_dropped_keeps_dropping_after_a_resume_with_a_larger_limit() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let a = AttemptId::generate();
     {
         let s = AttemptSpool::open(dir.path(), &a, 5).unwrap();
@@ -1436,7 +1436,7 @@ fn random_writes(rng: &mut Rng, s: &AttemptSpool, max_steps: u64) -> [Vec<u8>; 2
 fn any_crash_point_resumes_with_a_prefix_and_never_goes_back() {
     par_cases(80, |case| {
         let mut rng = Rng::new(case + 1);
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let a = AttemptId::generate();
         let limit = rng.below(1500);
         let given = {
@@ -1545,7 +1545,7 @@ fn stored_plus_dropped_is_what_came_in_and_never_exceeds_the_limit() {
     par_cases(150, |case| {
         let mut rng = Rng::new(1000 + case);
         let limit = [0, 1, 2, 5, 64, 500, 5000][rng.below(7) as usize];
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let a = AttemptId::generate();
         let s = AttemptSpool::open(dir.path(), &a, limit).unwrap();
         let mut given = [0u64; 2];

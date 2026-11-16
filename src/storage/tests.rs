@@ -45,7 +45,7 @@ struct Fx {
 }
 
 fn fx() -> Fx {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let store = CoordinatorStore::open(path_state(&dir), 1).unwrap();
     let run = RunId::generate();
     let task = TaskId::generate();
@@ -89,7 +89,7 @@ impl Fx {
 
 #[test]
 fn each_open_starts_a_new_epoch_and_a_second_open_is_locked_out() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let first = CoordinatorStore::open(dir.path(), 1).unwrap();
     assert_eq!(first.epoch(), CoordinatorEpoch(1));
     let err = CoordinatorStore::open(dir.path(), 2).err().unwrap();
@@ -738,7 +738,7 @@ fn coordinator_gc_keeps_everything_that_is_not_safely_finished() {
 
 #[test]
 fn a_restart_keeps_what_was_committed_and_drops_what_was_not() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let (run, task, aid);
     {
         let s = CoordinatorStore::open(dir.path(), 1).unwrap();
@@ -790,7 +790,7 @@ struct Wx {
 }
 
 fn wx() -> Wx {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let id = WorkerId::parse("mini-a").unwrap();
     let store = WorkerStore::open(dir.path(), &id).unwrap();
     store.start_agent(1).unwrap();
@@ -1539,7 +1539,7 @@ fn a_worker_restart_keeps_the_launch_claim_and_the_agent_epoch_grows() {
 
 #[test]
 fn database_files_of_the_wrong_kind_are_not_opened() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     drop(WorkerStore::open(dir.path(), &WorkerId::parse("w").unwrap()).unwrap());
     std::fs::rename(
         dir.path().join("worker.db"),
@@ -1609,7 +1609,7 @@ fn open_together(dir: &std::path::Path, id: &WorkerId, n: usize) -> Vec<Result<W
 }
 
 fn open_many(n: usize) -> (TempDir, WorkerId, Vec<WorkerStore>) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let id = WorkerId::parse("mini-a").unwrap();
     let stores = open_together(dir.path(), &id, n)
         .into_iter()
@@ -1651,7 +1651,7 @@ fn no_busy<T>(rs: &[Result<T>]) {
 #[test]
 fn many_connections_opening_a_fresh_worker_database_at_once_all_succeed() {
     for _ in 0..5 {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let id = WorkerId::parse("mini-a").unwrap();
         let opened = open_together(dir.path(), &id, 8);
         no_busy(&opened);
@@ -2482,7 +2482,7 @@ fn a_retired_attempt_blocks_a_new_submit_until_it_is_terminal_even_on_the_databa
 // ================================================================== queue
 
 fn queue_fx(tasks: usize) -> (TempDir, CoordinatorStore, RunId, Vec<TaskId>) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let store = CoordinatorStore::open(dir.path(), 1).unwrap();
     let run = RunId::generate();
     let ids: Vec<TaskId> = (0..tasks).map(|_| TaskId::generate()).collect();
@@ -2986,7 +2986,7 @@ fn a_task_whose_payload_cannot_be_built_is_refused_alone_and_a_fault_is_a_fault(
 #[test]
 fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() {
     use super::policy::Access;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
     assert_eq!(
@@ -3310,7 +3310,7 @@ fn a_retire_and_its_note_are_written_together_or_not_at_all() {
 #[test]
 fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     use super::policy::Access;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
     assert_eq!(all.len(), 10);
@@ -3380,7 +3380,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
         plan.iter().any(|line| line.contains("task_run_key")),
         "{plan:?}"
     );
-    let fresh = tempfile::tempdir().unwrap();
+    let fresh = crate::test_tmp::tempdir().unwrap();
     let new = CoordinatorStore::open(fresh.path(), 1).unwrap();
     assert_eq!(schema_info(&new).1, migrated.1);
     assert_eq!(
@@ -3392,7 +3392,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
 #[test]
 fn run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate() {
     use crate::service::completion::Target;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let store = CoordinatorStore::open(dir.path(), 1).unwrap();
     let run = RunId::generate();
     let task = TaskId::generate();
@@ -3502,7 +3502,7 @@ fn run_cancel_is_atomic_idempotent_and_preserves_unknown_and_natural_completion(
 fn run_cancel_races_enqueue_and_place_without_losing_the_intent() {
     use crate::service::completion::Target;
     use std::sync::{Arc, Barrier};
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let store = Arc::new(CoordinatorStore::open(dir.path(), 1).unwrap());
     for _ in 0..8 {
         let run = RunId::generate();
@@ -4027,7 +4027,7 @@ fn retry_same_run_rejects_closed_and_unconfirmed_retirement() {
 #[test]
 fn retry_same_run_migration_preserves_v5_cancellation_tombstones() {
     use crate::service::completion::Target;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let run = RunId::generate();
     let steps = schema::steps(DbKind::Coordinator);
     let old = db::open_with(
@@ -4350,7 +4350,7 @@ fn retry_same_run_accepts_each_unsuccessful_terminal_outcome_but_not_unplaced_ca
         );
         assert_eq!(f.store.get_attempt(&a.attempt_id).unwrap().unwrap(), before);
     }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let store = CoordinatorStore::open(dir.path(), 1).unwrap();
     let run = RunId::generate();
     let task = TaskId::generate();
@@ -4472,7 +4472,7 @@ fn control_fence_rejects_old_retry_after_cancel_and_replays_original_cancel_ack(
 #[test]
 fn control_fence_pre_enqueue_revision_is_inherited_and_cancel_receipt_survives_restart() {
     use crate::service::completion::Target;
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let run = RunId::generate();
     let task = TaskId::generate();
     let store = CoordinatorStore::open(dir.path(), 1).unwrap();
@@ -5254,7 +5254,7 @@ fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
     let f = fx();
     let a = retention_ready(&f);
     let files = ResultStore::open(&f._dir.path().join("results")).unwrap();
-    let outside = tempfile::tempdir().unwrap();
+    let outside = crate::test_tmp::tempdir().unwrap();
     std::fs::create_dir(outside.path().join("logs")).unwrap();
     std::fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
     let locator = ResultStore::logs_locator(&a);
@@ -5324,7 +5324,7 @@ fn enqueue_does_not_publish_run_when_reader_pin_cannot_be_secured() {
 fn capability_durable_schema_fence_rejects_old_binaries_and_indexes_placement() {
     use super::policy::{Access, Incompat};
     for kind in [DbKind::Coordinator, DbKind::Worker] {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let path = root.path().join("contract.db");
         let steps = schema::steps(kind);
         let previous = steps.len() - 1;
@@ -5413,7 +5413,7 @@ fn source_preview_guard_fences_retry_commit_and_foreign_guards_without_mutation(
         0
     );
     drop(exclusive);
-    let other = tempfile::tempdir().unwrap();
+    let other = crate::test_tmp::tempdir().unwrap();
     let foreign = crate::source::SourceStore::open(other.path())
         .unwrap()
         .mutation_guard()

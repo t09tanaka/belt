@@ -1834,7 +1834,7 @@ mod tool_validation_tests {
         PreparationRequest,
         adapters::InstallPlan,
     ) {
-        let temp = tempfile::tempdir().unwrap();
+        let temp = crate::test_tmp::tempdir().unwrap();
         let base = std::fs::canonicalize(temp.path()).unwrap();
         let mut cfg = SetupConfig::new(
             base.join("state"),

@@ -108,7 +108,7 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     fn dirs() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
-        let t = tempfile::tempdir().unwrap();
+        let t = crate::test_tmp::tempdir().unwrap();
         let (s, d) = (t.path().join("src"), t.path().join("dest"));
         fs::create_dir(&s).unwrap();
         fs::create_dir(&d).unwrap();

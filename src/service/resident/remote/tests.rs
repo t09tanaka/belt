@@ -19,7 +19,7 @@ fn config(text: &str) -> ResolvedConfig {
 
 #[test]
 fn local_only_startup_does_not_require_private_ssh_registration_config() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let env = BTreeMap::from([("XDG_CONFIG_HOME".into(), root.path().display().to_string())]);
     let dir = root.path().join("remote-task-runner");
     private_dir(&dir).unwrap();
@@ -41,7 +41,7 @@ fn local_only_startup_does_not_require_private_ssh_registration_config() {
 
 #[test]
 fn registration_is_private_bounded_and_snapshotted_from_user_only() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let env = BTreeMap::from([("XDG_CONFIG_HOME".into(), root.path().display().to_string())]);
     let dir = root.path().join("remote-task-runner");
     private_dir(&dir).unwrap();
@@ -120,7 +120,7 @@ async fn connected(
 
 #[tokio::test]
 async fn unregistered_and_wrong_identity_never_attach_and_old_cleanup_preserves_replacement() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let resident = resident(root.path()).await;
     let config = config("schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\n");
     let (wrong, wrong_peer) = connected(&resident, "remote-b").await;
@@ -180,7 +180,7 @@ async fn unregistered_and_wrong_identity_never_attach_and_old_cleanup_preserves_
 
 #[tokio::test]
 async fn stopped_handshake_reaps_only_its_owned_ssh_child() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let resident = resident(root.path()).await;
     let config = config("schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\n");
     let worker = config.workers[0].clone();
@@ -240,7 +240,7 @@ async fn stopped_handshake_reaps_only_its_owned_ssh_child() {
 
 #[tokio::test]
 async fn local_identity_conflict_is_rejected_before_resident_state_changes() {
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let env = BTreeMap::from([("XDG_CONFIG_HOME".into(), root.path().display().to_string())]);
     let dir = root.path().join("remote-task-runner");
     private_dir(&dir).unwrap();
@@ -278,7 +278,7 @@ async fn local_identity_conflict_is_rejected_before_resident_state_changes() {
 #[tokio::test]
 async fn stopping_before_invalidation_rejects_late_ready_and_finishes_nested_verify() {
     use crate::wire::{BlobVerifyResponse, Response, SchemaVersion};
-    let root = tempfile::tempdir_in(std::fs::canonicalize("/tmp").unwrap()).unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let resident = resident(root.path()).await;
     let run = RunId::generate();
     let source = SourceId::generate();

@@ -103,7 +103,7 @@ mod tests {
 
     #[test]
     fn second_acquire_fails_until_the_first_is_dropped() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let first = ProcessLock::acquire(dir.path(), "x.lock").unwrap();
         let err = ProcessLock::acquire(dir.path(), "x.lock").unwrap_err();
         assert!(matches!(err, StorageError::Locked(_)), "{err:?}");
@@ -117,7 +117,7 @@ mod tests {
 
     #[test]
     fn dropping_owner_releases_lock_even_with_an_inherited_description() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
         let owner = ProcessLock::acquire(dir.path(), "x.lock").unwrap();
         // dup and fork share the same open-file description. Keep that
         // description alive without creating a child in the test process.

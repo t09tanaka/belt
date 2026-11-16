@@ -10,10 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn fixture() -> (super::common::DaemonRoot, Spec) {
-    let root = tempfile::Builder::new()
-        .prefix("rtr-boot-")
-        .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
-        .unwrap();
+    let root = crate::test_tmp::prefixed("rtr-boot-").unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state = root.path().join("parent");
     let worker = root.path().join("worker");
@@ -364,7 +361,7 @@ fn panicking_fixture_process() {
 
 #[tokio::test]
 async fn panicking_fixture_test_leaves_no_owner_process() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = crate::test_tmp::tempdir().unwrap();
     let record = dir.path().join("owner");
     let mut helper = Command::new(std::env::current_exe().unwrap())
         .args([
@@ -642,6 +639,48 @@ async fn failed_child_and_interrupted_startup_do_not_keep_startup_lock() {
     drop(lock);
     let client = ensure(spec).await.unwrap();
     shutdown(&client).await;
+}
+
+/// What a prepared template leaves under the worker state: directories
+/// without write permission, which a plain recursive removal cannot empty.
+fn seal_template(worker: &std::path::Path) -> std::path::PathBuf {
+    let template = worker.join("setup/templates/sha256-sealed");
+    std::fs::create_dir_all(template.join("tree")).unwrap();
+    std::fs::write(template.join("tree/prepared.txt"), b"x").unwrap();
+    for dir in [template.join("tree"), template.clone()] {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    }
+    template
+}
+
+#[tokio::test]
+async fn failed_bootstrap_leaves_no_fixture_directory() {
+    let (root, spec) = fixture();
+    let path = root.path().to_path_buf();
+    assert!(path.starts_with(crate::test_tmp::root()));
+    let executable = root.path().join("failed-child");
+    std::fs::write(&executable, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut failed = spec.clone();
+    failed.executable = executable;
+    ensure(failed).await.err().expect("child must fail startup");
+    seal_template(&spec.worker_state_dir);
+    drop(root);
+    assert!(!path.exists(), "the failed fixture left {path:?}");
+}
+
+#[tokio::test]
+async fn stopped_owner_with_sealed_templates_leaves_no_fixture_directory() {
+    let (root, spec) = fixture();
+    let path = root.path().to_path_buf();
+    let client = ensure(spec.clone()).await.unwrap();
+    client.request(Operation::Ping).await.unwrap();
+    // The owner and its worker are running and have written their state.
+    assert!(spec.worker_state_dir.join("worker.db").exists());
+    seal_template(&spec.worker_state_dir);
+    // No explicit shutdown: the root stops the owner, then removes everything.
+    drop(root);
+    assert!(!path.exists(), "the stopped fixture left {path:?}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1263,7 +1302,7 @@ fn command_capture_directory_is_bound_once_and_source_view_reuses_it() {
 
 #[test]
 fn uninitialized_submit_is_typed_without_creating_config_or_state() {
-    let root = tempfile::tempdir().unwrap();
+    let root = crate::test_tmp::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
         .args(["--json", "submit", "--", "true"])
         .env_clear()

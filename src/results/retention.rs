@@ -113,7 +113,7 @@ mod tests {
     use std::time::Duration;
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn aborted_gc_wait_keeps_owner_and_exclusive_pin_until_drain() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_tmp::tempdir().unwrap();
         let store = Arc::new(CoordinatorStore::open(root.path(), 1).unwrap());
         let run = crate::ids::RunId::generate();
         store

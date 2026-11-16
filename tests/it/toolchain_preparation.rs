@@ -278,7 +278,7 @@ impl Drop for Fx {
             if Instant::now() >= deadline {
                 let preserved = self.dir.path().to_path_buf();
                 eprintln!("unsettled tool fixture retained: {}", preserved.display());
-                let old = std::mem::replace(&mut self.dir, tempfile::tempdir().unwrap());
+                let old = std::mem::replace(&mut self.dir, crate::test_tmp::tempdir().unwrap());
                 let _ = old.keep();
                 return;
             }

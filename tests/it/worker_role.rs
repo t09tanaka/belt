@@ -52,10 +52,7 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = tempfile::Builder::new()
-            .prefix("rtr-wr-")
-            .tempdir_in(std::fs::canonicalize("/tmp").unwrap())
-            .unwrap();
+        let root = crate::test_tmp::prefixed("rtr-wr-").unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let state = root.path().join(".remote-task-runner");
         std::fs::create_dir(&state).unwrap();
