@@ -1322,6 +1322,73 @@ fn worktrees_share_a_key() {
 }
 
 #[test]
+fn an_entry_records_the_worktree_and_branch_it_was_queued_from() {
+    let env = TestEnv::new();
+    let repo = env.dir.path().join("repo");
+    fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str], cwd: &Path| {
+        let o = Command::new("git")
+            .args(args)
+            .current_dir(cwd)
+            .env("GIT_AUTHOR_NAME", "t")
+            .env("GIT_AUTHOR_EMAIL", "t@example.com")
+            .env("GIT_COMMITTER_NAME", "t")
+            .env("GIT_COMMITTER_EMAIL", "t@example.com")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    };
+    git(&["init", "-q", "-b", "main"], &repo);
+    git(&["commit", "-q", "--allow-empty", "-m", "init"], &repo);
+    let wt = env.dir.path().join("wt");
+    git(
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feat/x",
+            wt.to_str().unwrap(),
+        ],
+        &repo,
+    );
+    let sub = wt.join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let spawn = |cwd: &Path| {
+        env.cmd()
+            .current_dir(cwd)
+            .args(["exec", "--", "sleep", "30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap()
+    };
+    let mut a = spawn(&repo);
+    let mut b = spawn(&sub);
+    assert!(wait_until(Duration::from_secs(20), || env.entries().len() == 2));
+    let entries = env.entries();
+    let _ = a.kill();
+    let _ = b.kill();
+    let _ = a.wait();
+    let _ = b.wait();
+    let canon = |p: &Path| fs::canonicalize(p).unwrap().to_string_lossy().into_owned();
+    let of = |branch: &str| {
+        entries
+            .iter()
+            .find(|e| e["branch"] == branch)
+            .unwrap_or_else(|| panic!("no entry for {branch}: {entries:?}"))
+            .clone()
+    };
+    let (main_e, wt_e) = (of("main"), of("feat/x"));
+    assert_eq!(main_e["worktree"], canon(&repo));
+    assert_eq!(wt_e["worktree"], canon(&wt));
+    // Both belong to the same repository: the history key still collapses.
+    assert_eq!(main_e["repo"], wt_e["repo"]);
+    assert_eq!(main_e["repo"], canon(&repo));
+}
+
+#[test]
 fn subprojects_of_one_repo_learn_separately() {
     let env = TestEnv::new();
     let repo = env.dir.path().join("mono");

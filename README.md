@@ -183,25 +183,82 @@ Nothing is written to stdout by task-traffic-controller itself.
 ### `task-traffic-controller top [--interval SECS]`
 
 A full-screen live view of the queue (alternate screen, raw mode), refreshed
-every `--interval` seconds (default 1) and redrawn on resize. Quit with `q`,
+every `--interval` seconds (default 1) and redrawn on resize. Switch the colors with `c`. Quit with `q`,
 Esc or Ctrl-C; the terminal is restored on every exit path, a panic included.
 It needs a terminal (use `status` to pipe), and only reads and reaps like
 `status`.
 
-- **CPU budget used/total**: a bar of `budget` slots. Each running entry's
-  charged weight is a colored segment marked with the letter of its row in
-  the table; free slots are dim. Next to it: the machine's CPU busy share and
+- **cores 12/12 in use · 0 free** (the box under the title): a bar of
+  `budget` slots. Each running entry's charged weight is a segment in its
+  worktree's color, led by the `#N` of its row in the table; free slots are
+  dim. On the right of the box's top edge: the machine's CPU busy share and
   available memory.
-- **running**: letter, project (repo name, plus `/subdir`), job (the
-  `--label`, else the script's file name for `bash ... step.sh` commands,
-  else the command line), `cpu` as `weight/using` (`-` until measured), and
-  progress as elapsed over the learned wall time, held at 99% while the
-  command still runs, with the time left (`+` marks an overrun). Without a
-  learned time the gauge shows `?` and the elapsed time. `idle` and
-  `[backfill]` mark the same entries as in `status`.
-- **waiting**: project, job, weight, time waited, why it waits (for example
-  `needs w6, 3 free` or `behind 2`), and the estimated start.
-- **held, owner gone**: shown only when there is such an entry.
+- **queue**: one row per entry, numbered `#1`, `#2`, ... down the screen:
+  the running ones first, soonest to finish first (those with no learned
+  time last), then the waiting ones in queue order. Columns:
+  - a `▌` in the worktree's color, and the number;
+  - `project` (repo name, plus `/subdir`);
+  - `worktree`: the branch (the short commit hash when detached), in the
+    worktree's color, cut in the middle with `…` when it is long (never under 4 characters),
+    and ` (current)` after the one `top` was started in, which is never
+    cut. That worktree's rows are
+    bold. A repository with only one worktree in the queue, and entries
+    queued by an older version (which recorded none), show `-` and a gray
+    band;
+  - `job`: the `--label`, else the script's file name for `bash ... step.sh`
+    commands, else the command line; with `idle`, `[backfill]` or `[front]`
+    after it (`z`, `b`, `f` on a narrow terminal); `idle` marks a run
+    (5:00+) using under 0.2 cores. The cores of each row are in the box on
+    top, not in the table;
+  - `progress`: a bar for how far each running row is, and the text after it.
+
+  **Colors** have two modes, shown at the top (`focus` / `overview`) and
+  switched with `c`. In `focus`, the default when `top` is started inside a
+  git worktree, only the rows of that worktree are colored (one fixed green):
+  the whole row, `#N` to the text after the bar, and its slots in the cores
+  box. Every other row is dim gray, its bar filled with a lighter gray. In
+  `overview`, the default outside a worktree, each worktree of a repository
+  with several gets its own color (a lone worktree stays gray), again for the
+  whole row. The palette has no red or yellow; red is only for an overrun.
+  The bar of a waiting row is the empty track in both.
+
+  `exec` records the worktree (`git rev-parse --show-toplevel`) and branch
+  it was called from, so parallel runs of one repository from different
+  worktrees can be told apart (the history key still collapses them into
+  one). The color is picked from a hash of the worktree's path, moving on to
+  the next free color of the palette when another worktree of the same
+  repository has it; it is not stored.
+
+  On a terminal 80 columns wide or more the bar is never narrower than 20
+  characters (10 on a narrower one). To keep it, a narrow terminal gives up,
+  in this order: the reason for waiting after the bar (`starts ~1:35?`
+  stays), then the project, worktree and job columns are squeezed to 20, 20
+  and 24 characters (the middle of the name goes), the words `idle` and
+  `[backfill]` (they shrink to `z` and `b`; `[front]` to `f`), and only then
+  the three names are cut further (8 characters at the least; the worktree
+  column keeps room for 4 of the branch and ` (current)`). No column is
+  dropped; the bar and the text after it always stay.
+  - `progress`: one bar per row, all the same width, which takes
+    whatever the other columns leave. The track is a pale gray background;
+    the time run over the expected wall time fills it from the left with the
+    worktree's color (a darker gray for a lone worktree), in steps of 1/8 of a
+    cell; past the expected time it stays full. A run with no learned wall
+    time has the track only. A waiting row shows the empty track (0%); its place in
+    the queue is its number. With `NO_COLOR` set (or `TERM=dumb`) the bar is
+    drawn with `█` and `░` instead.
+  - After the bar: `62%  left 0:47` / `over 0:20` / `ran 0:12` (no learned
+    time) for a running entry; `starts ~0:47` (`starts ?` with no estimate,
+    `~0:47?` when it is rough because an entry it depends on has no
+    history) and why it waits (`needs 6, 3 free`, `behind 2`, ...; left out
+    when there is no room) for a waiting one.
+  - When something runs but nobody waits, a dim line under the table says
+    what would start right away (`No one waiting · a command needing ≤8
+    cores starts right away`, or that the next command waits for cores when
+    none are free).
+- **An empty queue** says `Nothing running or waiting` and, dim, how many
+  cores are free (`A new command starts right away · 12 cores free`).
+- **held, owner gone**: one line at the bottom, shown only when there is
+  such an entry.
 
 ### `task-traffic-controller status`
 
@@ -579,7 +636,7 @@ takes over.
 
 State lives in `~/.local/state/task-traffic-controller/` (or `$XDG_STATE_HOME/task-traffic-controller/`):
 
-- `ledger.json` — the queue: id, pid, state, weight, repo, argv, times.
+- `ledger.json` — the queue: id, pid, state, weight, repo, worktree and branch, argv, times.
   Writes are temp-file + rename under `ledger.lock`. A waiting `exec` that
   cannot get the lock skips that poll and tries again; `status`, `jobs`,
   `wait`, `cancel` and `submit` read the file without the lock when it

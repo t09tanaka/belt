@@ -1554,6 +1554,8 @@ mod tests {
                 using: None,
                 backfilled: false,
                 label: None,
+                worktree: None,
+                branch: None,
                 parent: None,
                 nested_cpu_secs: 0.0,
             },

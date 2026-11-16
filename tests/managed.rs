@@ -541,6 +541,8 @@ fn a_plain_entry_keeps_the_old_ledger_readable() {
         using: None,
         backfilled: false,
         label: None,
+        worktree: None,
+        branch: None,
         parent: None,
         nested_cpu_secs: 0.0,
     });
@@ -581,6 +583,8 @@ fn a_nested_entry_whose_parent_was_dropped_from_the_ledger_names_it_again() {
         using: None,
         backfilled: false,
         label: None,
+        worktree: None,
+        branch: None,
         // As an older binary left it.
         parent: None,
         nested_cpu_secs: 0.0,

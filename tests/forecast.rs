@@ -55,6 +55,8 @@ fn entry(id: &str, state: task_traffic_controller::admit::State, seq: u64, key: 
         using: None,
         backfilled: false,
         label: None,
+        worktree: None,
+        branch: None,
         parent: None,
         nested_cpu_secs: 0.0,
     }

@@ -857,6 +857,7 @@ pub(crate) fn push_entry(
                 },
             )?;
         }
+        let wt = crate::gitctx::worktree(&opts.cwd);
         ledger.entries.push(Entry {
             id: id.to_string(),
             pid: std::process::id(),
@@ -875,6 +876,8 @@ pub(crate) fn push_entry(
             using: None,
             backfilled: false,
             label: opts.label.clone(),
+            worktree: wt.as_ref().map(|w| w.path.clone()),
+            branch: wt.map(|w| w.branch).filter(|b| !b.is_empty()),
             parent: opts.parent.clone(),
             nested_cpu_secs: 0.0,
         });
