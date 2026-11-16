@@ -521,8 +521,8 @@ fn no_color(no_color: Option<&str>, term: Option<&str>) -> bool {
     no_color.is_some_and(|v| !v.is_empty()) || term == Some("dumb")
 }
 
-/// The bar's track: a pale gray background.
-const TRACK: Color = Color::Indexed(238);
+/// The bar's track: a faint gray background, close to a dark terminal's own.
+const TRACK: Color = Color::Indexed(236);
 /// What a lone worktree's (gray) rows fill the track with: darker than it.
 const LONE_FILL: Color = Color::Indexed(245);
 /// Left blocks of 1/8 to 7/8 of a cell.
