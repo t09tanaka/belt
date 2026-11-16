@@ -79,6 +79,7 @@ fn record(key: &str, wall: f64) -> Record {
         measurement_id: None,
         worktree: None,
         branch: None,
+        label: None,
     }
 }
 

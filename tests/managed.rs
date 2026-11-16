@@ -218,6 +218,7 @@ fn a_full_run_records_terminal_before_releasing_and_measures_once() {
         measurement_id: None,
         worktree: None,
         branch: None,
+        label: None,
     };
     assert_eq!(
         managed::record_measurement(&ctx, "m-1", &rec).unwrap(),
@@ -262,6 +263,7 @@ fn a_measurement_interrupted_after_the_append_is_not_applied_twice() {
         measurement_id: None,
         worktree: None,
         branch: None,
+        label: None,
     };
     // A crash after the append, before the "applied" marker.
     std::fs::create_dir_all(ctx.paths.measurements_dir()).unwrap();
@@ -270,6 +272,7 @@ fn a_measurement_interrupted_after_the_append_is_not_applied_twice() {
         measurement_id: Some("m".into()),
         worktree: None,
         branch: None,
+        label: None,
         ..rec.clone()
     };
     history::append(ctx.paths.history_file(), &with_id).unwrap();
@@ -317,6 +320,7 @@ fn an_identical_record_under_another_id_or_none_is_not_this_measurement() {
         measurement_id: None,
         worktree: None,
         branch: None,
+        label: None,
     };
     // Two identical records already there: one from another measurement,
     // one from history written before measurement ids existed.
@@ -326,6 +330,7 @@ fn an_identical_record_under_another_id_or_none_is_not_this_measurement() {
             measurement_id: Some("other".into()),
             worktree: None,
             branch: None,
+            label: None,
             ..rec.clone()
         },
     )
@@ -1463,6 +1468,7 @@ fn record_for(key: &str, mid: Option<&str>) -> Record {
         measurement_id: mid.map(String::from),
         worktree: None,
         branch: None,
+        label: None,
     }
 }
 

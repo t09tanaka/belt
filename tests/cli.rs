@@ -1409,12 +1409,13 @@ fn history_records_the_worktree_and_branch() {
     git(&["commit", "-q", "--allow-empty", "-m", "init"]);
     env.cmd()
         .current_dir(&repo)
-        .args(["exec", "--", "true"])
+        .args(["exec", "--label", "the label", "--", "true"])
         .output()
         .unwrap();
     let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
     let rec: serde_json::Value = serde_json::from_str(hist.lines().next().unwrap()).unwrap();
     assert_eq!(rec["branch"], "trunk");
+    assert_eq!(rec["label"], "the label");
     assert_eq!(
         rec["worktree"],
         fs::canonicalize(&repo).unwrap().to_string_lossy().as_ref()

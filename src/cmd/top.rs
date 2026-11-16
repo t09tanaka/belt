@@ -788,6 +788,8 @@ pub struct Wants {
     /// The text after the bar with and without the reason for waiting.
     pub right: usize,
     pub right_short: usize,
+    /// The table has no bar (the list of finished runs).
+    pub no_bar: bool,
 }
 
 /// Fit the columns in `width`, keeping the bar readable.
@@ -799,7 +801,12 @@ pub struct Wants {
 /// worktree and job names are cut (the branch in the middle). The text
 /// after the bar, the bar, the worktree and the job are never dropped.
 pub fn layout(width: usize, w: Wants) -> Cols {
-    let bar_min = if width >= WIDE { BAR_WIDE_MIN } else { BAR_MIN };
+    let bar_min = match (w.no_bar, width >= WIDE) {
+        (true, _) => 0,
+        (false, true) => BAR_WIDE_MIN,
+        (false, false) => BAR_MIN,
+    };
+    let bar_gap = usize::from(!w.no_bar);
     let pw = w.project.clamp(7, PROJECT_CAP);
     // (why, short flags, project, cores), most to least.
     let states = [
@@ -821,7 +828,7 @@ pub fn layout(width: usize, w: Wants) -> Cols {
             project: project.then_some(pw),
             worktree: wt.clamp(1, WT_CAP),
             job: job.clamp(1, JOB_CAP),
-            cores: cores.then_some(w.cores),
+            cores: (cores && w.cores > 0).then_some(w.cores),
             bar: bar_min,
             right: right.clamp(RIGHT_FLOOR, RIGHT_MAX),
             why,
@@ -837,7 +844,7 @@ pub fn layout(width: usize, w: Wants) -> Cols {
             + 1
             + c.cores.map_or(0, |n| n + 1)
             + c.bar
-            + 1
+            + bar_gap
             + c.right
     };
     for st in states {
@@ -1076,7 +1083,10 @@ fn recent_rows(
             } else {
                 key::project_label(&r.repo, &r.subdir)
             },
-            job: job_of_argv(&r.argv),
+            job: match r.label.as_deref().filter(|l| !l.is_empty()) {
+                Some(l) => l.to_string(),
+                None => job_of_argv(&r.argv),
+            },
             took: Duration::from_secs_f64(r.wall_secs.max(0.0)),
             ago: (now - finished(r)).to_std().unwrap_or_default(),
             failed: (r.exit_code != 0).then_some(r.exit_code),
@@ -1264,6 +1274,7 @@ fn table_wants(v: &View, rows: &[TableRow], prefix: usize) -> Wants {
         cores: widest(&|r| r.cores.chars().count()).max(CORES_HEADER),
         right: widest(&|r| r.right.chars().count()),
         right_short: widest(&|r| r.right_short.chars().count()),
+        no_bar: false,
     }
 }
 
@@ -1380,21 +1391,29 @@ fn draw_empty(f: &mut Frame, area: Rect, v: &View) {
         lines.push(Line::styled(format!(" {RUN_HINT}"), dim));
     } else {
         lines.push(Line::styled(format!(" {RECENT_TITLE}"), dim));
-        let wt_text = |r: &RecentRow, max| worktree_text(r.wt.as_ref(), max);
+        let wt_text = |r: &RecentRow, project_col: bool, max| {
+            worktree_cell(r.wt.as_ref(), &r.project, project_col, max)
+        };
         let widest =
             |len: &dyn Fn(&RecentRow) -> usize| v.recent.iter().map(len).max().unwrap_or(0);
+        let time = widest(&|r| recent_time_text(r).chars().count());
         let cols = layout(
             area.width as usize,
             Wants {
                 prefix: 2,
                 project: widest(&|r| r.project.chars().count()),
-                worktree: widest(&|r| wt_text(r, usize::MAX).chars().count()),
-                worktree_without_project: widest(&|r| wt_text(r, usize::MAX).chars().count()),
+                worktree: widest(&|r| wt_text(r, true, usize::MAX).0.chars().count())
+                    .max("worktree".len()),
+                worktree_without_project: widest(&|r| {
+                    wt_text(r, false, usize::MAX).0.chars().count()
+                })
+                .max("worktree".len()),
                 job: widest(&|r| r.job.chars().count()),
                 job_short_flags: widest(&|r| r.job.chars().count()),
-                cores: usize::MAX / 2,
-                right: widest(&|r| recent_time_text(r).chars().count()),
-                right_short: widest(&|r| recent_time_text(r).chars().count()),
+                cores: 0,
+                right: time,
+                right_short: time,
+                no_bar: true,
             },
         );
         for r in &v.recent {
@@ -1403,9 +1422,14 @@ fn draw_empty(f: &mut Frame, area: Rect, v: &View) {
             if let Some(pw) = cols.project {
                 spans.push(Span::raw(fit(&r.project, pw + 1)));
             }
+            let (cell, is_project) = wt_text(r, cols.project.is_some(), cols.worktree);
             spans.push(Span::styled(
-                fit(&wt_text(r, cols.worktree), cols.worktree + 1),
-                Style::new().fg(color),
+                fit(&cell, cols.worktree + 1),
+                if is_project {
+                    dim
+                } else {
+                    Style::new().fg(color)
+                },
             ));
             spans.push(Span::raw(fit(&r.job, cols.job + 1)));
             spans.push(Span::styled(recent_time_text(r), dim));
@@ -2134,6 +2158,7 @@ mod tests {
             cores: 5,
             right: 31,
             right_short: 13,
+            no_bar: false,
         }
     }
 
@@ -2508,6 +2533,7 @@ mod tests {
             measurement_id: None,
             worktree: wt.map(|w| w.0.into()),
             branch: wt.map(|w| w.1.into()),
+            label: None,
         }
     }
 
@@ -2705,6 +2731,53 @@ mod tests {
         // Narrow and tiny terminals do not panic.
         let _ = frame(&v, 40, 10);
         let _ = frame(&v, 10, 4);
+    }
+
+    #[test]
+    fn a_finished_run_is_named_like_a_queued_one_by_label_then_script_then_argv() {
+        let now = Utc::now();
+        let mut labelled = rec("/src/local-ci", "sleep 60", None, 60, 1.0, 0, now);
+        labelled.label = Some("local-ci run".into());
+        let mut empty = rec("/src/local-ci", "sleep 61", None, 50, 1.0, 0, now);
+        empty.label = Some(String::new());
+        let script = rec(
+            "/src/local-ci",
+            "bash /ci/step-3.sh -x",
+            None,
+            40,
+            1.0,
+            0,
+            now,
+        );
+        let plain = rec("/src/local-ci", "sleep 62", None, 30, 1.0, 0, now);
+        let rows = recent_rows(&[labelled, empty, script, plain], now, None, 5);
+        let jobs: Vec<_> = rows.iter().map(|r| r.job.as_str()).collect();
+        assert_eq!(jobs, ["sleep 62", "step-3.sh", "sleep 61", "local-ci run"]);
+    }
+
+    #[test]
+    fn finished_runs_have_a_project_column_or_name_the_project_in_the_worktree_cell() {
+        let now = Utc::now();
+        let v = empty_view(now, &history(now));
+        // Wide enough: the project column is there, `-` stays `-`.
+        let wide = frame(&v, 150, 16);
+        println!("{wide}");
+        let lci = wide.lines().find(|l| l.contains("step-8.sh")).unwrap();
+        assert!(lci.contains("local-ci") && lci.contains(" - "), "{lci}");
+        let rtr = wide.lines().find(|l| l.contains("main (current)")).unwrap();
+        assert!(rtr.contains("remote-task-runner"), "{rtr}");
+        // Too narrow for it: the lone worktree's cell names the project, gray.
+        let t = render(&v, 90, 16);
+        let buf = t.backend().buffer().clone();
+        let y = row_y(&buf, 90, 16, "step-8.sh");
+        let line: String = (0..90u16)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(!line.contains(" - "), "{line}");
+        let at = line.find("local-ci").unwrap();
+        let x = line[..at].chars().count() as u16;
+        assert!(buf[(x, y)].modifier.contains(Modifier::DIM));
+        assert_eq!(buf[(1, y)].fg, Color::Gray);
     }
 
     #[test]

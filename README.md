@@ -249,7 +249,9 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
     none are free).
 - **An empty queue** says `Nothing running or waiting` and how many cores
   are free, then lists the last five finished runs from `history.jsonl`
-  under `recently finished`, newest first: project, worktree, job, how long
+  under `recently finished`, newest first, laid out like the table above (the
+  project column goes first when narrow, and then a `-` shows the project name):
+  project, worktree, job (named the same way, so a `--label` is kept), how long
   it took, how long ago it ended and, for a failure, `exit N`. With no
   history it shows how to start one instead (`Run one with:
   task-traffic-controller exec -- <command>`). History written before the
