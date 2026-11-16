@@ -16,7 +16,7 @@ pub struct Observed {
     inherited: BTreeMap<String, String>,
 }
 fn value(s: &str) -> Result<&str, &'static str> {
-    if s.is_empty() || s.trim() != s || s.chars().any(|c| c.is_control() || "{}\\\"'".contains(c)) {
+    if !super::policy::observable(s) {
         return Err("ambiguous value");
     }
     Ok(s)

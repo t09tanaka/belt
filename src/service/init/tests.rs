@@ -85,6 +85,22 @@ async fn foreign_input_and_relative_config_are_preflight_errors() {
     assert!(!p.journal.exists());
     assert_eq!(fs::read(&p.input).unwrap(), b"foreign");
 }
+#[tokio::test]
+async fn unobservable_service_values_are_refused_before_any_write() {
+    for bad in ["o'brien", "a{b}", "back\\slash", "say\"hi"] {
+        let (t, mut c) = fixture();
+        let config = t.path().join(bad);
+        c.env
+            .insert("XDG_CONFIG_HOME".into(), config.to_str().unwrap().into());
+        let error = initialize(c, &mut Unknown).await.unwrap_err();
+        assert!(error.downcast_ref::<InvalidServiceInput>().is_some(), "{bad}");
+        assert!(!config.exists(), "{bad}");
+    }
+    let (t, mut c) = fixture();
+    c.env.insert("TMPDIR".into(), "/tmp/it's".into());
+    assert!(initialize(c, &mut Unknown).await.is_err());
+    assert!(!t.path().join("config").exists());
+}
 #[test]
 fn pending_publication_is_bound_to_inode_not_matching_bytes() {
     let (_t, c) = fixture();

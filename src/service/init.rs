@@ -23,6 +23,10 @@ use std::{
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
 struct Unconfirmed(&'static str);
+/// A path or environment value the macOS service observer could not parse back.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct InvalidServiceInput(String);
 pub(crate) fn is_unconfirmed(error: &anyhow::Error) -> bool {
     error.downcast_ref::<Unconfirmed>().is_some()
 }
@@ -396,6 +400,22 @@ fn binary_source(path: &Path) -> anyhow::Result<(File, String)> {
     f.seek(SeekFrom::Start(0))?;
     Ok((f, digest))
 }
+fn service_inputs_observable(
+    paths: &Paths,
+    env: &BTreeMap<String, String>,
+) -> anyhow::Result<()> {
+    let strings = [&paths.config, &paths.input].map(|p| p.to_str());
+    let env_values = ENV.iter().filter_map(|k| env.get(*k).map(String::as_str));
+    for value in strings.into_iter().flatten().chain(env_values) {
+        if !macos::policy::observable(value) {
+            return Err(InvalidServiceInput(format!(
+                "cannot install the service: {value:?} contains characters the service observer cannot parse (control characters, braces, backslash, quotes, or edge whitespace); no files were changed"
+            ))
+            .into());
+        }
+    }
+    Ok(())
+}
 fn plan(paths: &Paths, j: &Journal) -> anyhow::Result<macos::policy::Plan> {
     let label = format!(
         "io.github.t09tanaka.rtr.local.{}.{}",
@@ -487,6 +507,9 @@ async fn initialize_with_durability<L: Launcher>(
     let uid = rustix::process::geteuid().as_raw();
     ensure!(uid > 0, "init requires a non-root user");
     let paths = Paths::resolve(&context.env)?;
+    // Values rendered into the service must round-trip through `launchctl print`;
+    // refuse before any file or directory is created.
+    service_inputs_observable(&paths, &context.env)?;
     // Resolve environment and source before writing anything.
     let (mut source, digest) = binary_source(&context.executable)?;
     private_dir_with(&paths.config, durability)?;
@@ -914,6 +937,8 @@ pub fn command() -> Result<ResultReceipt, ApiError> {
                 ApiError::new(
                     if e.downcast_ref::<Unconfirmed>().is_some() {
                         ErrorCode::CommunicationUnknown
+                    } else if e.downcast_ref::<InvalidServiceInput>().is_some() {
+                        ErrorCode::InvalidInput
                     } else {
                         ErrorCode::Conflict
                     },
