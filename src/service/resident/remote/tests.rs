@@ -381,3 +381,102 @@ async fn stopping_before_invalidation_rejects_late_ready_and_finishes_nested_ver
     assert!(gate.snapshot().is_empty());
     assert_ne!(old, gate.generation());
 }
+
+fn write_registration(root: &Path, text: &str) {
+    let dir = root.join(".config/remote-task-runner");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("config.toml");
+    std::fs::write(&path, text).unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[test]
+fn a_reload_reads_the_registration_even_when_startup_had_no_remote_worker() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let env = BTreeMap::from([("HOME".into(), root.path().display().to_string())]);
+    let local = WorkerId::parse("local").unwrap();
+    let started = config("schema_version=1\n");
+    assert!(snapshot(&started, &env, &local).unwrap().workers.is_empty());
+    // Nothing registered yet: an empty reload is not an error.
+    assert!(reload(&started, &env, &local).unwrap().workers.is_empty());
+    write_registration(
+        root.path(),
+        "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\nbinary='/w/bin/current/remote-task-runner'\n",
+    );
+    let fresh = reload(&started, &env, &local).unwrap();
+    assert_eq!(fresh.workers.len(), 1);
+    assert_eq!(
+        fresh.workers[0].binary.as_deref(),
+        Some("/w/bin/current/remote-task-runner")
+    );
+    // The same refusals as startup.
+    write_registration(
+        root.path(),
+        "schema_version=1\n[[workers]]\nid='local'\nssh='peer-a'\n",
+    );
+    assert!(reload(&started, &env, &local).is_err());
+}
+
+#[test]
+fn the_bridge_runs_the_registered_absolute_binary_or_the_bare_name() {
+    let c = config(
+        "schema_version=1\n[[workers]]\nid='a'\nssh='h'\nbinary='/w/my dir/rtr'\n[[workers]]\nid='b'\nssh='h'\n",
+    );
+    let words = |w: &WorkerSpec| bridge_command(w).unwrap().shell_string();
+    assert_eq!(words(&c.workers[0]), "'/w/my dir/rtr' 'worker' '--stdio'");
+    assert_eq!(
+        words(&c.workers[1]),
+        "'remote-task-runner' 'worker' '--stdio'"
+    );
+}
+
+#[tokio::test]
+async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let mut resident = resident(root.path()).await;
+    let dialed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let record = dialed.clone();
+    // No real ssh: the dial only records who it was asked to reach.
+    resident.dial = Arc::new(move |config, worker, _, _, _| {
+        assert!(config.workers.iter().any(|w| w.id == worker.id));
+        record.lock().unwrap().push(worker.id.clone());
+        Box::pin(async {})
+    });
+    let client = resident.client();
+    let runner = tokio::spawn(resident.run());
+    let reload = |client: Client| async move {
+        match client.request(Operation::ReloadWorkers).await.unwrap() {
+            Reply::WorkersReloaded { connecting } => connecting,
+            other => panic!("{other:?}"),
+        }
+    };
+    assert!(reload(client.clone()).await.is_empty());
+    write_registration(
+        root.path(),
+        "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\n",
+    );
+    assert_eq!(reload(client.clone()).await, ["remote-a"]);
+    // Asking again dials nothing twice.
+    assert!(reload(client.clone()).await.is_empty());
+    write_registration(
+        root.path(),
+        "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\n[[workers]]\nid='remote-b'\nssh='peer-b'\n",
+    );
+    assert_eq!(reload(client.clone()).await, ["remote-b"]);
+    assert_eq!(*dialed.lock().unwrap(), ["remote-a", "remote-b"]);
+    // An unusable registration is an answer, not a crash.
+    write_registration(root.path(), "not toml [");
+    match client.request(Operation::ReloadWorkers).await.unwrap() {
+        Reply::ControlError { error } => assert!(error.message.contains("unusable")),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    tokio::time::timeout(Duration::from_secs(10), runner)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

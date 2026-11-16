@@ -599,7 +599,7 @@ fn add_install_records_the_absolute_binary_and_the_bridge_is_checked_with_it() {
     let result = w.add("mini-a", Some("ci@h"), true).unwrap();
     let binary = result.binary.clone().expect("a recorded binary");
     assert!(Path::new(&binary).is_absolute());
-    assert_eq!(w.remote.bridges, [binary.clone()]);
+    assert_eq!(w.remote.bridges, std::slice::from_ref(&binary));
     let user = crate::config::parse::parse_user("t", &w.config_text()).unwrap();
     assert_eq!(user.workers[0].binary.as_deref(), Some(binary.as_str()));
     assert_eq!(w.reloads.borrow().len(), 1);
@@ -756,10 +756,10 @@ fn a_lifecycle_answer_from_another_cluster_is_refused() {
 #[test]
 fn helper_command_runs_a_registered_path_with_its_quoting() {
     let digest = "a".repeat(64);
-    let command = helper_command(Some("/Users/ci/my dir/rtr"), &digest, Lifecycle::Resume, 5);
+    let command = helper_command(Some("/w/my dir/rtr"), &digest, Lifecycle::Resume, 5);
     assert_eq!(
         command,
-        "exec '/Users/ci/my dir/rtr' 'worker-service' 'resume' '--wait-secs' '5'"
+        "exec '/w/my dir/rtr' 'worker-service' 'resume' '--wait-secs' '5'"
     );
 }
 

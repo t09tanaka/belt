@@ -23,6 +23,44 @@ impl Fx {
     fn path(&self, name: &str) -> std::path::PathBuf {
         self.dir.path().join(name)
     }
+    /// An initialized coordinator: the retained input names the cluster, as
+    /// `init` leaves it. Nothing is started.
+    fn init(&self) -> ClusterId {
+        use remote_task_runner::service::bootstrap::{write_input, Spec};
+        let dir = self.path("home/.config/remote-task-runner");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let private = |name: &str| {
+            let path = self.path(name);
+            std::fs::create_dir(&path).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
+            path
+        };
+        remote_task_runner::secrets::key::init(&self.path("cluster.key")).unwrap();
+        for file in ["rtr"] {
+            std::fs::write(self.path(file), b"x").unwrap();
+            std::fs::set_permissions(self.path(file), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let state_dir = private("coordinator");
+        let cluster = remote_task_runner::storage::CoordinatorStore::open(&state_dir, 1)
+            .unwrap()
+            .cluster_id()
+            .clone();
+        let spec = Spec {
+            state_dir,
+            worker_state_dir: private("local-worker"),
+            worker_id: WorkerId::parse("local").unwrap(),
+            cluster_key_path: self.path("cluster.key"),
+            executable: self.path("rtr"),
+            env: Default::default(),
+            repo_root: None,
+            expected_cluster: Some(cluster.clone()),
+            managed_service: None,
+        };
+        write_input(&dir.join("coordinator.json"), &spec).unwrap();
+        cluster
+    }
     fn config(&self, text: &str) {
         let dir = self.path("home/.config/remote-task-runner");
         std::fs::create_dir_all(&dir).unwrap();
@@ -60,14 +98,14 @@ impl Fx {
     }
 }
 
-fn answer(worker: &str, draining: bool) -> String {
+fn answer(cluster: &ClusterId, worker: &str, draining: bool, loaded: bool) -> String {
     format!(
         "printf '%s\\n' '{}'",
         serde_json::json!({"ok": true, "status": {
             "worker_id": WorkerId::parse(worker).unwrap(),
-            "cluster": ClusterId::generate(),
+            "cluster": cluster,
             "binary_sha256": "0".repeat(64),
-            "loaded": true, "ready": true, "draining": draining,
+            "loaded": loaded, "ready": loaded, "draining": draining,
             "cancel_running": false, "live_attempts": 0
         }})
     )
@@ -80,6 +118,7 @@ fn json(out: &Output) -> serde_json::Value {
 #[test]
 fn an_unregistered_worker_is_not_found_and_no_ssh_runs() {
     let fx = Fx::new();
+    fx.init();
     fx.ssh("exit 0");
     for args in [
         &["workers", "drain", "ghost"][..],
@@ -102,7 +141,8 @@ fn an_unregistered_worker_is_not_found_and_no_ssh_runs() {
 fn drain_runs_one_fixed_ssh_command_and_reports_the_helper_answer() {
     let fx = Fx::new();
     fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@mini-a.local\"\n");
-    fx.ssh(&answer("mini-a", true));
+    let cluster = fx.init();
+    fx.ssh(&answer(&cluster, "mini-a", true, true));
     let out = fx.run(&["workers", "drain", "mini-a"]);
     assert_eq!(
         out.status.code(),
@@ -129,7 +169,8 @@ fn drain_runs_one_fixed_ssh_command_and_reports_the_helper_answer() {
 fn stop_with_cancel_running_is_requested_explicitly() {
     let fx = Fx::new();
     fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@h\"\n");
-    fx.ssh(&answer("mini-a", false));
+    let cluster = fx.init();
+    fx.ssh(&answer(&cluster, "mini-a", false, false));
     assert_eq!(
         fx.run(&["workers", "stop", "mini-a"]).status.code(),
         Some(0)
@@ -148,6 +189,7 @@ fn stop_with_cancel_running_is_requested_explicitly() {
 fn an_unreachable_worker_is_never_reported_as_stopped() {
     let fx = Fx::new();
     fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@h\"\n");
+    fx.init();
     fx.ssh("exit 255");
     for args in [
         &["workers", "stop", "mini-a"][..],
@@ -171,6 +213,7 @@ fn an_unreachable_worker_is_never_reported_as_stopped() {
 fn a_silent_ssh_success_is_not_a_success() {
     let fx = Fx::new();
     fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@h\"\n");
+    fx.init();
     fx.ssh("exit 0");
     let out = fx.run(&["workers", "stop", "mini-a"]);
     assert_eq!(
@@ -193,7 +236,8 @@ fn add_needs_an_initialized_coordinator_and_changes_nothing_without_it() {
 fn text_output_goes_to_stdout_on_success_and_stderr_on_failure() {
     let fx = Fx::new();
     fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@h\"\n");
-    fx.ssh(&answer("mini-a", true));
+    let cluster = fx.init();
+    fx.ssh(&answer(&cluster, "mini-a", true, true));
     let run = |args: &[&str]| {
         std::process::Command::new(BIN)
             .args(args)
@@ -213,4 +257,29 @@ fn text_output_goes_to_stdout_on_success_and_stderr_on_failure() {
     );
     let bad = run(&["workers", "drain", "ghost"]);
     assert!(bad.stdout.is_empty() && !bad.stderr.is_empty());
+}
+
+#[test]
+fn an_answer_that_does_not_show_the_requested_state_is_not_reported_as_success() {
+    let fx = Fx::new();
+    fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@h\"\n");
+    let cluster = fx.init();
+    // The host says the service is still loaded after stop, and not draining after drain.
+    fx.ssh(&answer(&cluster, "mini-a", false, true));
+    for args in [
+        &["workers", "stop", "mini-a"][..],
+        &["workers", "drain", "mini-a"],
+    ] {
+        let out = fx.run(args);
+        assert_eq!(
+            out.status.code(),
+            Some(ErrorCode::Conflict.exit_code()),
+            "{args:?}"
+        );
+        assert_eq!(json(&out)["error"]["code"], "CONFLICT");
+    }
+    // An answer from another cluster is refused outright.
+    fx.ssh(&answer(&ClusterId::generate(), "mini-a", true, true));
+    let out = fx.run(&["workers", "drain", "mini-a"]);
+    assert_eq!(out.status.code(), Some(ErrorCode::Conflict.exit_code()));
 }
