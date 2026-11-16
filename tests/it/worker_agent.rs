@@ -4298,3 +4298,56 @@ async fn preparation_probe_is_negotiated_readonly_and_profile_bound() {
     }
     agent.shutdown();
 }
+
+async fn inspect_draining(c: &Client) -> bool {
+    let Response::Inspect(i) = call(
+        c,
+        Request::Inspect(InspectRequest {
+            preparation_observations: None,
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    i.draining
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_operator_drain_is_reported_and_a_cancel_request_stops_the_live_attempt() {
+    use remote_task_runner::worker::control::{self, Control};
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    assert!(!inspect_draining(&c).await);
+
+    // Drain reports at once and leaves accepted work alone.
+    let (script, _marker, pidfile) = stay(&f);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload(&script)).await;
+    wait_for("the command", || read_pid(&pidfile).is_some());
+    control::write(&f.state(), Control::draining()).unwrap();
+    assert!(inspect_draining(&c).await);
+    agent.tick();
+    assert_eq!(f.rec(&a).state, AttemptState::Active);
+    control::write(&f.state(), Control::default()).unwrap();
+    assert!(!inspect_draining(&c).await);
+
+    // An unreadable marker drains but never cancels.
+    std::fs::write(control::path(&f.state()), b"{").unwrap();
+    std::fs::set_permissions(
+        control::path(&f.state()),
+        std::fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+    assert!(inspect_draining(&c).await);
+    agent.tick();
+    assert_eq!(f.rec(&a).state, AttemptState::Active);
+
+    // An explicit cancel request cancels what is live, through the supervisor.
+    control::write(&f.state(), Control::cancelling()).unwrap();
+    agent.tick();
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
+}

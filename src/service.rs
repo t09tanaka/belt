@@ -19,4 +19,9 @@ pub mod init;
 /// Standalone persistent worker role, independent of SSH bridge lifetime.
 pub mod worker;
 
+/// Worker-host install and lifecycle helper (macOS).
+pub mod worker_service;
+/// Parent-side `workers` commands.
+pub mod workers;
+
 pub mod planning;

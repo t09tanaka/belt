@@ -1892,6 +1892,31 @@ impl Agent {
         self.cleanup_terminal(32);
     }
 
+    /// An operator's stop request: cancel whatever is live. Cancellation is
+    /// persisted per attempt (idempotent) and the supervisors act on it.
+    fn apply_control(self: &Arc<Self>) {
+        // Only an explicit, readable request cancels; a broken marker only drains.
+        if !super::control::read(&self.cfg.state_dir).is_ok_and(|c| c.cancel_running) {
+            return;
+        }
+        let Ok(epoch) = self.store.max_coordinator_epoch() else {
+            return;
+        };
+        let Ok(list) = self.store.list_nonterminal() else {
+            return;
+        };
+        for rec in list {
+            if rec.state != AttemptState::Terminal
+                && matches!(
+                    self.store.cancel(&rec.attempt_id, epoch, now()),
+                    Ok(CancelOutcome::Requested(_) | CancelOutcome::AlreadyRequested(_))
+                )
+            {
+                self.kick(&rec.attempt_id);
+            }
+        }
+    }
+
     fn supervise_attempts(self: &Arc<Self>) {
         self.reap();
         if let Ok(list) = self.store.list_nonterminal() {
@@ -1908,6 +1933,7 @@ impl Agent {
             return;
         }
         let _pass = Ticking(&self.ticking);
+        self.apply_control();
         self.supervise_attempts();
         self.clean_ended();
         if let Err(e) = self.gc() {
@@ -2767,7 +2793,7 @@ impl Agent {
             max_active_task: self.cfg.max_active_task,
             prefetch_per_worker: self.cfg.prefetch_per_worker,
             disk_free_bytes: disk,
-            draining: false,
+            draining: super::control::Control::effective(&self.cfg.state_dir).drain,
         })
     }
 }

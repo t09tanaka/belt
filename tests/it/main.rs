@@ -38,3 +38,5 @@ mod worker_role;
 mod remote_links;
 
 mod test_tmp_root;
+
+mod workers_lifecycle;

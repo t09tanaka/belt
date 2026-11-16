@@ -63,6 +63,9 @@ pub enum Command {
     /// Run as a worker (internal).
     #[command(hide = true)]
     Worker(WorkerArgs),
+    /// Install or control the worker service on this host (internal; run over ssh).
+    #[command(hide = true)]
+    WorkerService(WorkerServiceArgs),
     /// Supervise one attempt as its own process (internal).
     #[command(hide = true)]
     Supervise(SuperviseArgs),
@@ -253,6 +256,18 @@ pub enum WorkersSub {
 }
 
 #[derive(Debug, Args)]
+pub struct WorkerServiceArgs {
+    #[arg(value_enum)]
+    pub action: crate::service::worker_service::Action,
+    /// With `stop`: cancel running work instead of waiting for it.
+    #[arg(long)]
+    pub cancel_running: bool,
+    /// With `stop`: seconds to wait for accepted work to finish.
+    #[arg(long, default_value_t = 600)]
+    pub wait_secs: u64,
+}
+
+#[derive(Debug, Args)]
 pub struct WorkerArgs {
     /// Speak the protocol over stdin/stdout.
     #[arg(long)]
@@ -365,6 +380,18 @@ pub fn run(cli: Cli) -> i32 {
     }
     if let Command::Supervise(args) = &cli.command {
         return crate::supervisor::process::main(&args.spec);
+    }
+    if let Command::WorkerService(args) = &cli.command {
+        return crate::service::worker_service::main(
+            args.action,
+            args.cancel_running,
+            args.wait_secs,
+        );
+    }
+    if let Command::Workers(WorkersArgs { sub: Some(sub) }) = &cli.command {
+        if let Some(code) = crate::service::workers::command(sub, cli.json) {
+            return code;
+        }
     }
     if let Command::Submit(args) = &cli.command {
         let result = (|| -> Result<crate::service::submit::Receipt, crate::error::ApiError> {

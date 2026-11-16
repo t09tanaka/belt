@@ -1034,3 +1034,19 @@ restart/in-place/symlink/通常submitとSource captureのintegration44件成功�
 全target/feature strict clippy、fmt/diff check成功。実Rust1.100、専用target、承認済み
 TTC外側→portool内側を使用。full local-ci・MSRV1.89・remoteは親の次gateとし、今回の
 focused成功へ読み替えない。実user stateのGCやnative serviceへの操作はない。
+
+### S22 workers add --install と lifecycle の接続（2026-11-17）
+
+`workers add [--install]`・`start`・`stop [--cancel-running]`・`drain`・`resume` を CLI へ接続した（`Envelope::not_implemented` に落ちなくなった）。実装の分担は次のとおり。
+
+- worker 側の運用意図は state ディレクトリの private な `control.json`（`drain`・`cancel_running`）に永続化する。agent は `inspect` の `draining` にこれを反映し（従来は常に false）、tick ごとに `cancel_running` なら live attempt を既存の cancel 経路（永続化してから supervisor が動く）で止める。読めない marker は drain として扱い cancel はしない。wire の操作は増やしていない。
+- worker host の helper（hidden の `worker-service <install|start|stop|drain|resume|status>`、`src/service/worker_service.rs`）は Launcher を総称にし、版別 directory への binary 配置（sha256 検証・既存と異なれば拒否）、鍵・`WorkerSpec` の noclobber 公開、receipt 付き journal、worker 前景 role（`worker --input`）の plist、起動、agent socket の ready 確認を再開可能に行う。stop は binding で identity を確かめ、drain の後に live attempt が 0 になるまで待ち（`--cancel-running` なら cancel を要求して待つ）、所有確認つきの bootout を行う。待ちが時間切れなら drain のまま残し、再実行で待ちを続ける。すでに unload 済みなら launchctl を触らず報告し、launchd の答えが特定できなければ何も変えず失敗にする。
+- 親側（`src/service/workers.rs`）は ssh の固定 argv（`ssh_exec_argv`）で、probe（Darwin かつ同 arch）→ binary の staging（stdin）→ install（鍵は stdin のみ）を行い、成功後にだけ user config へ `[[workers]]` を追記する（失敗した install は何も登録しない。再実行は冪等）。到達不能・無言・読めない答えは `COMMUNICATION_UNKNOWN`、別 worker の答えは拒否し、停止済みとは報告しない。
+- 試験は偽の Launcher・偽の ssh・一時 HOME のみ。1 台上の install → start → stop は `src/service/workers/tests.rs`、agent の drain と cancel は `tests/it/worker_agent.rs`、実 binary と偽 ssh の CLI 契約は `tests/it/workers_lifecycle.rs`。本物の LaunchAgent・`~/.ssh`・sudo は使っていない。
+
+S22 の残り（必須。この変更で S22 は完了しない）:
+1. 本物の launchd・実 SSH・実機での受入（A34/A35 の native 検証）は未実施。偽の Launcher は launchd の実挙動を確かめない。
+2. 起動中の parent resident は `[[workers]]` を起動時に 1 回だけ読む。`workers add` した worker は resident の再起動まで attach されない。再読込は別途実装する。
+3. worker host の `remote-task-runner` が ssh の非 login PATH にあることが bridge（`worker --stdio`）の前提のまま。helper の呼び出しは staging した同版 binary を優先するが、bridge は PATH 解決であり、PATH に載せる配置（symlink など）は未実装。
+4. `system-user`（LaunchDaemon の `UserName`）の導入、Linux、upgrade・rollback・doctor・`workers forget` は未実装（S23・S24）。
+5. 実 SQLite の live attempt を持つ worker に対する stop の待ち・cancel の end-to-end（agent の cancel は統合試験済みだが、helper の待ちは注入した計数での単体試験）。
