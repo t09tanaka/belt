@@ -891,7 +891,31 @@ fn output_version(name: &str, bytes: &[u8]) -> Result<Version> {
     } else {
         s.strip_prefix('v').unwrap_or(s)
     };
-    Version::parse(value).map_err(|_| "probe_version_invalid")
+    Version::parse(normalize_probe_version(name, value)).map_err(|_| "probe_version_invalid")
+}
+/// Ruby before 3.2 prints `X.Y.ZpN` (patchlevel suffix) and Go before 1.21 prints
+/// `X.Y` for `X.Y.0`; normalize only those two shapes to a strict three-part version.
+fn normalize_probe_version(name: &str, value: &str) -> String {
+    match name {
+        "ruby" => match value.split_once('p') {
+            Some((base, level))
+                if !level.is_empty()
+                    && level.bytes().all(|b| b.is_ascii_digit())
+                    && base.split('.').count() == 3 =>
+            {
+                base.to_owned()
+            }
+            _ => value.to_owned(),
+        },
+        "go" if value.split('.').count() == 2
+            && value
+                .split('.')
+                .all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) =>
+        {
+            format!("{value}.0")
+        }
+        _ => value.to_owned(),
+    }
 }
 /// Explicit install only. This nonblocking publication lock is not a scheduler
 /// or setup singleflight. Partial roots require owned cleanup, never silent reuse.

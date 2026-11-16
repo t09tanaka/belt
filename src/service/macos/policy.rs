@@ -68,6 +68,20 @@ impl Plan {
         format!("{}/{}", self.domain, self.label)
     }
 }
+/// Whether `launchctl print` output for this value can be parsed back by the
+/// strict observer. The observer applies this same predicate to every value.
+pub(crate) fn observable(s: &str) -> bool {
+    !(s.is_empty() || s.trim() != s || s.chars().any(|c| c.is_control() || "{}\\\"'".contains(c)))
+}
+fn checked_observable(s: &str) -> Result<(), String> {
+    if observable(s) {
+        Ok(())
+    } else {
+        Err(format!(
+            "value {s:?} contains characters the service observer cannot parse (control characters, braces, backslash, quotes, or edge whitespace)"
+        ))
+    }
+}
 fn absolute(path: &Path) -> Result<&str, String> {
     let s = path.to_str().ok_or("path must be UTF-8")?;
     if !path.is_absolute()
@@ -78,6 +92,7 @@ fn absolute(path: &Path) -> Result<&str, String> {
         return Err("path must be absolute without traversal".into());
     }
     xml(s)?;
+    checked_observable(s)?;
     Ok(s)
 }
 fn xml(s: &str) -> Result<String, String> {
@@ -136,6 +151,7 @@ pub fn render(def: &Definition) -> Result<Plan, String> {
         ) {
             return Err("only explicit non-secret service environment keys are allowed".into());
         }
+        checked_observable(value)?;
         env.push_str(&format!("<key>{}</key>{}", xml(key)?, string(value)?));
     }
     let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key>{}<key>ProgramArguments</key><array>{argv}</array><key>WorkingDirectory</key>{}<key>EnvironmentVariables</key><dict>{env}</dict>{user}<key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n", string(&def.label)?, string(absolute(&def.working_directory)?)?);
@@ -227,6 +243,17 @@ mod tests {
             d.mode = mode;
             assert!(render(&d).is_err());
         }
+        for path in ["/home/o'brien", "/a{b}", "/a\\b", "/a\"b", "/a/b "] {
+            let mut d = definition();
+            d.executable = path.into();
+            assert!(render(&d).is_err(), "{path}");
+            d = definition();
+            d.working_directory = path.into();
+            assert!(render(&d).is_err(), "{path}");
+        }
+        let mut d = definition();
+        d.environment.insert("HOME".into(), "/home/o'brien".into());
+        assert!(render(&d).is_err());
         for path in ["relative", "/x/../y", "/x/\0"] {
             let mut d = definition();
             d.executable = path.into();
