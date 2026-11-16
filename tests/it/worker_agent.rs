@@ -4351,3 +4351,33 @@ async fn an_operator_drain_is_reported_and_a_cancel_request_stops_the_live_attem
     agent.tick();
     assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_draining_worker_refuses_a_new_attempt_but_answers_a_resend() {
+    use remote_task_runner::worker::control::{self, Control};
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let (script, _marker, pidfile) = stay(&f);
+    let first = AttemptId::generate();
+    let first_payload = payload(&script);
+    submit(&c, &first, &first_payload).await;
+    wait_for("the command", || read_pid(&pidfile).is_some());
+
+    control::write(&f.state(), Control::draining()).unwrap();
+    // A new attempt is refused as overload (the coordinator places it again
+    // elsewhere) and nothing is stored for it.
+    let late = AttemptId::generate();
+    let refused = call(&c, submit_req(&late, &payload("exit 0")))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Overloaded);
+    assert!(refused.message.contains("draining"));
+    // A resend of the accepted attempt is still answered with what is there.
+    submit(&c, &first, &first_payload).await;
+
+    // After resume the same request is accepted.
+    control::write(&f.state(), Control::default()).unwrap();
+    submit(&c, &late, &payload("exit 0")).await;
+    agent.shutdown();
+}

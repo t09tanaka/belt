@@ -2216,6 +2216,16 @@ impl Agent {
                 ));
             }
         }
+        // A draining worker takes no new attempt, whatever the placement said
+        // (stop drains, then counts what is live, then boots the service out).
+        // Checked under the acceptance lock, just before the insert; a resend
+        // of an accepted attempt was answered above and is unaffected.
+        if fresh && super::control::Control::effective(&self.cfg.state_dir).drain {
+            return Err(ApiError::new(
+                ErrorCode::Overloaded,
+                "this worker is draining; no new attempt is accepted",
+            ));
+        }
         let mut spec = serde_json::to_value(&r.payload).map_err(|e| internal("payload", e))?;
         if self.cfg.capability_profile.is_some() {
             spec.as_object_mut().expect("payload object").insert(

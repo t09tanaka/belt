@@ -11,6 +11,8 @@ pub(crate) struct World {
     pub unknown: bool,
     pub fail_start: bool,
     pub calls: Vec<Vec<String>>,
+    /// The operator marker as the service was started (before the agent runs).
+    pub control_at_bootstrap: Vec<Control>,
     pub state: PathBuf,
     listener: Option<UnixListener>,
 }
@@ -25,6 +27,8 @@ impl Launcher for Fake {
                 if w.fail_start {
                     return Err(LaunchError::NotApplied("rejected".into()));
                 }
+                let seen = Control::effective(&w.state);
+                w.control_at_bootstrap.push(seen);
                 w.loaded = true;
                 let socket = w.state.join("agent.sock");
                 let _ = fs::remove_file(&socket);
@@ -372,7 +376,7 @@ fn waiting_for_idle_never_treats_a_failed_read_as_idle() {
     let mut remaining = 3;
     assert!(wait_until_idle(
         || {
-            remaining -= 1;
+            remaining = u32::saturating_sub(remaining, 1);
             Ok(remaining)
         },
         Duration::from_secs(5),
@@ -404,4 +408,167 @@ fn hex_decoding_accepts_only_lower_case_pairs() {
     assert_eq!(hex_decode("abc"), None);
     assert_eq!(hex_decode("AB"), None);
     assert_eq!(hex_decode("zz"), None);
+}
+
+#[test]
+fn install_gives_the_parent_one_absolute_path_that_survives_a_version_change() {
+    let h = Host::new();
+    let status = h.install().unwrap();
+    let paths = h.paths();
+    let bridge = status.bridge_binary.clone().expect("bridge path");
+    assert_eq!(Path::new(&bridge), paths.bridge_binary());
+    assert!(Path::new(&bridge).is_absolute());
+    assert!(!bridge.contains(&h.digest), "the path names no version");
+    // It resolves to the installed binary.
+    assert_eq!(fs::read(&bridge).unwrap(), b"pretend binary");
+    assert_eq!(
+        fs::read_link(paths.current_link()).unwrap(),
+        Path::new(&h.digest)
+    );
+    // Re-running keeps it; status reports it too.
+    assert_eq!(h.install().unwrap().bridge_binary, Some(bridge.clone()));
+    assert_eq!(
+        status_of(&h).bridge_binary,
+        Some(bridge),
+        "status carries the path"
+    );
+    // A link naming another version is never moved by an install.
+    fs::remove_file(paths.current_link()).unwrap();
+    std::os::unix::fs::symlink("0".repeat(64), paths.current_link()).unwrap();
+    assert!(h
+        .install()
+        .unwrap_err()
+        .to_string()
+        .contains("another version"));
+}
+
+fn status_of(h: &Host) -> Status {
+    status(&h.env, h.fake.clone()).unwrap()
+}
+
+#[test]
+fn a_rerun_with_a_different_shell_environment_still_succeeds() {
+    let h = Host::new();
+    h.install().unwrap();
+    let mut other = h.env.clone();
+    other.insert("LANG".into(), "ja_JP.UTF-8".into());
+    other.insert("PATH".into(), "/usr/bin:/bin:/opt/other".into());
+    let again = install(
+        &other,
+        &h.request,
+        &h.exe,
+        h.fake.clone(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    assert!(again.ready);
+    // The installed environment is the first one; the plan did not change.
+    let journal = read_journal(&h.paths()).unwrap().unwrap();
+    assert_eq!(journal.env.get("PATH").unwrap(), "/usr/bin:/bin");
+    assert!(!journal.env.contains_key("LANG"));
+    assert_eq!(h.launchctl_calls(), ["bootstrap"]);
+}
+
+#[test]
+fn an_install_that_never_registered_the_service_can_be_replaced_by_a_rerun() {
+    let h = Host::new();
+    // The services directory cannot be created: the run stops after the key,
+    // the input and the journal, before any receipt.
+    fs::create_dir_all(h.paths().services.parent().unwrap()).unwrap();
+    fs::write(h.paths().services, b"in the way").unwrap();
+    assert!(h.install().is_err());
+    assert!(read_journal(&h.paths()).unwrap().unwrap().receipt.is_none());
+    fs::remove_file(h.paths().services).unwrap();
+    let mut changed = Host::new();
+    changed.env = h.env.clone();
+    changed.exe = h.exe.clone();
+    changed.request = InstallRequest {
+        schema: 1,
+        cluster: h.request.cluster.clone(),
+        worker_id: h.request.worker_id.clone(),
+        key_file_text: format!("{}\n", "cd".repeat(64)),
+        binary_sha256: h.digest.clone(),
+    };
+    changed.env.insert("LANG".into(), "C".into());
+    changed.fake = h.fake.clone();
+    let status = changed.install().unwrap();
+    assert!(status.ready);
+    assert_eq!(
+        fs::read_to_string(h.paths().key).unwrap(),
+        changed.request.key_file_text
+    );
+    assert_eq!(
+        read_journal(&h.paths()).unwrap().unwrap().env.get("LANG"),
+        Some(&"C".to_string())
+    );
+}
+
+#[test]
+fn publishing_replaces_only_when_told_to() {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let path = dir.path().join("f");
+    publish_exact(&path, b"one", 0o600, false).unwrap();
+    publish_exact(&path, b"one", 0o600, false).unwrap();
+    assert!(publish_exact(&path, b"two", 0o600, false)
+        .unwrap_err()
+        .to_string()
+        .contains("refusing to replace"));
+    publish_exact(&path, b"two", 0o600, true).unwrap();
+    assert_eq!(fs::read(&path).unwrap(), b"two");
+    assert_eq!(
+        fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn start_clears_a_stale_cancel_request_before_the_service_runs() {
+    let h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    stop(&h.env, h.fake.clone(), false, Duration::ZERO).unwrap();
+    control::write(&h.paths().state, Control::cancelling()).unwrap();
+    start(&h.env, h.fake.clone(), Duration::from_secs(2)).unwrap();
+    let seen = h.fake.0.borrow().control_at_bootstrap.clone();
+    assert_eq!(seen.len(), 2);
+    assert!(
+        !seen[1].cancel_running,
+        "the restarted agent must never see the old cancel request"
+    );
+}
+
+#[test]
+fn an_unreadable_state_directory_is_an_error_not_zero_attempts() {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let file = dir.path().join("not-a-directory");
+    fs::write(&file, b"x").unwrap();
+    assert!(live_attempts(&file).is_err());
+}
+
+#[test]
+fn idle_must_hold_across_one_more_look() {
+    let interval = Duration::from_millis(1);
+    // Zero, then an acceptance that was still committing, then zero twice.
+    let mut calls = 0;
+    wait_until_idle(
+        || {
+            calls += 1;
+            Ok(if calls == 2 { 1 } else { 0 })
+        },
+        Duration::from_secs(5),
+        interval,
+    )
+    .unwrap();
+    assert_eq!(calls, 4);
+    let mut calls = 0;
+    wait_until_idle(
+        || {
+            calls += 1;
+            Ok(0)
+        },
+        Duration::ZERO,
+        interval,
+    )
+    .unwrap();
+    assert_eq!(calls, 2);
 }

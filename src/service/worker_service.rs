@@ -79,6 +79,12 @@ pub struct Status {
     pub cancel_running: bool,
     /// `None` when the worker database could not be read.
     pub live_attempts: Option<u32>,
+    /// The version-independent absolute path of the installed binary, once
+    /// `install` has created it. The parent stores this path and uses it for
+    /// the ssh bridge and the lifecycle helper, so neither depends on the
+    /// non-login ssh PATH.
+    #[serde(default)]
+    pub bridge_binary: Option<String>,
 }
 
 pub struct Paths {
@@ -113,6 +119,14 @@ impl Paths {
     }
     pub fn executable(&self, digest: &str) -> PathBuf {
         self.config.join("bin").join(digest).join(BINARY)
+    }
+    /// A symlink to the installed version's directory.
+    pub fn current_link(&self) -> PathBuf {
+        self.config.join("bin").join("current")
+    }
+    /// The fixed absolute path the parent runs, whatever version is installed.
+    pub fn bridge_binary(&self) -> PathBuf {
+        self.current_link().join(BINARY)
     }
 }
 
@@ -198,7 +212,9 @@ fn private_dir(home: &Path, leaf: &Path) -> anyhow::Result<()> {
 
 /// Publish `bytes` at `path` unless identical bytes are already there. Any
 /// other existing content is refused: replacing enrollment is not an install.
-fn publish_exact(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
+/// With `replace`, an earlier install that never reached a service
+/// registration (no receipt) may be overwritten, so a re-run can finish.
+fn publish_exact(path: &Path, bytes: &[u8], mode: u32, replace: bool) -> anyhow::Result<()> {
     let parent = path.parent().context("file parent")?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
     temporary.write_all(bytes)?;
@@ -206,6 +222,11 @@ fn publish_exact(path: &Path, bytes: &[u8], mode: u32) -> anyhow::Result<()> {
         .as_file()
         .set_permissions(fs::Permissions::from_mode(mode))?;
     temporary.as_file().sync_all()?;
+    if replace {
+        temporary.persist(path).map_err(|e| e.error)?;
+        File::open(parent)?.sync_all()?;
+        return Ok(());
+    }
     match temporary.persist_noclobber(path) {
         Ok(_) => {
             File::open(parent)?.sync_all()?;
@@ -281,6 +302,34 @@ fn place_binary(paths: &Paths, digest: &str, current: &Path) -> anyhow::Result<P
     Ok(target)
 }
 
+/// `bin/current` -> `<digest>`: the version-independent path. Created once; a
+/// link that already names this version is left alone, any other is refused
+/// (moving it is an upgrade, which is a separate operation).
+fn link_current(paths: &Paths, digest: &str) -> anyhow::Result<()> {
+    let link = paths.current_link();
+    match fs::read_link(&link) {
+        Ok(target) => {
+            ensure!(
+                target == Path::new(digest),
+                "bin/current names another version; refusing to move it"
+            );
+            Ok(())
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match std::os::unix::fs::symlink(digest, &link) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return link_current(paths, digest)
+                }
+                Err(e) => return Err(e.into()),
+            }
+            File::open(link.parent().context("link parent")?)?.sync_all()?;
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
+}
+
 fn worker_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
     env.iter()
         .filter(|(k, _)| ENV.contains(&k.as_str()))
@@ -329,8 +378,12 @@ fn agent_reachable(state: &Path) -> bool {
 
 /// Live attempts according to the worker database; none if it was never created.
 pub fn live_attempts(state: &Path) -> anyhow::Result<u32> {
-    if fs::symlink_metadata(state.join("worker.db")).is_err() {
-        return Ok(0);
+    match fs::symlink_metadata(state.join("worker.db")) {
+        Ok(_) => {}
+        // Only a database that was never created counts as no attempts; an
+        // unreadable state directory is an error, never idle.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
     }
     let store = crate::storage::WorkerStore::open_read_only(state)?;
     Ok(u32::try_from(store.list_nonterminal()?.len()).unwrap_or(u32::MAX))
@@ -343,11 +396,20 @@ pub fn wait_until_idle(
     interval: Duration,
 ) -> anyhow::Result<()> {
     let deadline = Instant::now() + timeout;
+    let mut settling = false;
     loop {
         let live = count()?;
         if live == 0 {
-            return Ok(());
+            // An acceptance that began before the drain marker may still be
+            // committing: only a second zero one interval later is idle.
+            if settling {
+                return Ok(());
+            }
+            settling = true;
+            std::thread::sleep(interval);
+            continue;
         }
+        settling = false;
         if Instant::now() >= deadline {
             anyhow::bail!(
                 "{live} attempt(s) are still live; the worker stays drained, run stop again to keep waiting"
@@ -486,8 +548,31 @@ pub fn install<L: Launcher>(
     crate::secrets::key::ClusterKey::from_bytes(key_bytes).context("cluster key rejected")?;
     private_dir(&paths.home, &paths.config)?;
     private_dir(&paths.home, &paths.state)?;
+    let existing = read_journal(&paths)?;
+    if let Some(existing) = &existing {
+        ensure!(
+            existing.cluster == request.cluster
+                && existing.worker_id == request.worker_id
+                && existing.binary_sha256 == digest,
+            "a different worker or binary is already installed; upgrade or removal is a separate operation"
+        );
+    }
+    // Once a service file was published the installed files are fixed (the
+    // journal's environment included, so a re-run from another shell cannot
+    // trip the comparison). Before that nothing runs yet and a re-run replaces.
+    let registered = existing.as_ref().is_some_and(|j| j.receipt.is_some());
+    let env = match &existing {
+        Some(journal) if registered => journal.env.clone(),
+        _ => worker_env(env),
+    };
     let executable = place_binary(&paths, &digest, current_exe)?;
-    publish_exact(&paths.key, request.key_file_text.as_bytes(), 0o600)?;
+    link_current(&paths, &digest)?;
+    publish_exact(
+        &paths.key,
+        request.key_file_text.as_bytes(),
+        0o600,
+        !registered,
+    )?;
     crate::secrets::key::load(&paths.key).context("cluster key rejected")?;
     let spec = super::worker::WorkerSpec {
         schema: 1,
@@ -496,19 +581,22 @@ pub fn install<L: Launcher>(
         state_dir: paths.state.clone(),
         cluster_key_path: paths.key.clone(),
         executable,
-        env: worker_env(env),
+        env,
         config: "schema_version = 1\n".into(),
     };
-    publish_exact(&paths.input, &serde_json::to_vec(&spec)?, 0o600)?;
-    let mut journal = match read_journal(&paths)? {
-        Some(existing) => {
-            ensure!(
-                existing.cluster == request.cluster
-                    && existing.worker_id == request.worker_id
-                    && existing.binary_sha256 == digest,
-                "a different worker or binary is already installed; upgrade or removal is a separate operation"
-            );
-            existing
+    publish_exact(
+        &paths.input,
+        &serde_json::to_vec(&spec)?,
+        0o600,
+        !registered,
+    )?;
+    let mut journal = match existing {
+        Some(mut journal) => {
+            if journal.env != spec.env {
+                journal.env = spec.env.clone();
+                save_journal(&paths, &journal)?;
+            }
+            journal
         }
         None => {
             let fresh = Journal {
@@ -544,9 +632,10 @@ pub fn install<L: Launcher>(
         );
     }
     let receipt = journal.receipt.clone().context("service receipt missing")?;
-    ensure_started(&mut files, &mut launcher, &plan, &receipt)?;
-    // Starting never resumes a previous stop's cancel request.
+    // Starting never resumes a previous stop's cancel request. It is cleared
+    // before the agent can run, so the new process never sees the old one.
     clear_cancel(&paths.state)?;
+    ensure_started(&mut files, &mut launcher, &plan, &receipt)?;
     let ready = wait_ready(&paths.state, ready_timeout);
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
@@ -591,8 +680,8 @@ pub fn start<L: Launcher>(
     let mut files = services(&paths)?;
     // Only a bounded, identity-checked marker may be cleared here.
     marker(&paths, Duration::ZERO).verify_binding(&identity(&journal))?;
-    ensure_started(&mut files, &mut launcher, &plan, &receipt)?;
     clear_cancel(&paths.state)?;
+    ensure_started(&mut files, &mut launcher, &plan, &receipt)?;
     let ready = wait_ready(&paths.state, ready_timeout);
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
@@ -710,6 +799,9 @@ fn status_with<L: Launcher>(
         draining: current.drain,
         cancel_running: current.cancel_running,
         live_attempts: live_attempts(&paths.state).ok(),
+        bridge_binary: fs::symlink_metadata(paths.current_link())
+            .ok()
+            .and_then(|_| paths.bridge_binary().to_str().map(str::to_owned)),
     })
 }
 
