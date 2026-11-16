@@ -4426,3 +4426,114 @@ fn ci_plan_submodules_and_distinct_capture_bindings_keep_exact_identity() {
     );
     assert!(!spec.state_dir.join("coordinator.db").exists());
 }
+
+/// The project file's output plan reaches the worker through the public
+/// commands: `success`, `failure` and `always` follow the command's outcome,
+/// and globs and several paths select the members of one output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_exec_output_conditions_globs_and_multiple_paths_follow_the_outcome() {
+    let (root, spec, input) = control_fixture();
+    std::fs::write(
+        input.join(".remote-task-runner.toml"),
+        "schema_version=1\n\
+         [[outputs]]\nname='passed'\npaths=['ok/**']\nrequired=true\nwhen='success'\n\
+         [[outputs]]\nname='failed'\npaths=['fail/*.log','extra/note.txt']\nrequired=true\nwhen='failure'\n\
+         [[outputs]]\nname='both'\npaths=['reports/**','coverage/*.txt']\n",
+    )
+    .unwrap();
+    let script = "mkdir ok fail fail/deep extra reports reports/unit coverage || exit 98; \
+                  echo ok > ok/done; echo log > fail/a.log; echo skipped > fail/a.txt; \
+                  echo deep > fail/deep/b.log; echo note > extra/note.txt; \
+                  echo report > reports/unit/r.xml; echo cover > coverage/c.txt; \
+                  echo raw > coverage/c.bin; exit \"$1\"";
+    let temporary = root.path().join("reader-tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = || std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v));
+    for (code, stored, skipped) in [
+        (23, ["both", "failed"], "passed"),
+        (0, ["both", "passed"], "failed"),
+    ] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(&spec.executable)
+                .args(["--json", "exec", "--", "/bin/sh", "-c", script, "sh"])
+                .arg(code.to_string())
+                .env_clear()
+                .envs(profile())
+                .envs(&spec.env)
+                .current_dir(&input)
+                .output(),
+        )
+        .await
+        .unwrap_or_else(|elapsed| {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("output-plan exec did not finish: {elapsed}");
+        })
+        .unwrap();
+        // A required output whose condition does not hold is not a missing one:
+        // the command's own exit code is what the caller sees.
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let done: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let run = done["result"]["target"]["id"].as_str().unwrap().to_string();
+        let task =
+            remote_task_runner::ids::TaskId::parse(done["result"]["task_id"].as_str().unwrap())
+                .unwrap();
+        let attempt = {
+            let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+            let attempts = owner.attempts_of_task(&task).unwrap();
+            assert_eq!(attempts.len(), 1);
+            let names: Vec<String> = owner
+                .persisted_artifacts(&attempts[0].attempt_id)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(names, stored, "exit {code}");
+            attempts[0].attempt_id.clone()
+        };
+
+        let exported = root.path().join(format!("exported-{code}"));
+        let export = tokio::process::Command::new(&spec.executable)
+            .args(["--json", "outputs", &run, "--dir"])
+            .arg(&exported)
+            .env_clear()
+            .envs(profile())
+            .envs(&spec.env)
+            .env("TMPDIR", &temporary)
+            .env("PATH", "/no-programs")
+            .current_dir(root.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            export.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&export.stdout),
+            String::from_utf8_lossy(&export.stderr)
+        );
+        let prefix = exported.join(task.as_str()).join(attempt.as_str());
+        let text = |path: &str| std::fs::read_to_string(prefix.join(path)).unwrap();
+        // `**` descends, `*` stays in one directory, and a literal path is one member.
+        assert_eq!(text("both/reports/unit/r.xml"), "report\n");
+        assert_eq!(text("both/coverage/c.txt"), "cover\n");
+        assert!(!prefix.join("both/coverage/c.bin").exists());
+        assert!(!prefix.join(skipped).exists());
+        if code == 0 {
+            assert_eq!(text("passed/ok/done"), "ok\n");
+        } else {
+            assert_eq!(text("failed/fail/a.log"), "log\n");
+            assert_eq!(text("failed/extra/note.txt"), "note\n");
+            assert!(!prefix.join("failed/fail/a.txt").exists());
+            assert!(!prefix.join("failed/fail/deep").exists());
+        }
+    }
+    shutdown(&load(&spec)).await;
+}
