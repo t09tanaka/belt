@@ -55,6 +55,8 @@ pub struct Wt {
     pub main: bool,
     /// Where `top` was started.
     pub mine: bool,
+    /// The repository's name (its main worktree's directory).
+    pub repo: String,
     pub color: Color,
 }
 
@@ -410,6 +412,7 @@ fn worktrees_of(table: &[&Entry], me: Option<&str>) -> Vec<Wt> {
                     branch,
                     main: e.repo == path,
                     mine: me == Some(path),
+                    repo: key::project_label(&e.repo, ""),
                     color: Color::Gray,
                 },
                 e.seq,
@@ -849,8 +852,9 @@ fn wt_color(v: &View, wt: Option<usize>) -> Color {
 pub fn draw(f: &mut Frame, v: &View, interval: Duration, error: Option<&str>) {
     let area = f.area();
     let held_h = u16::from(!v.held.is_empty());
-    let legend_h = u16::from(!v.worktrees.is_empty());
-    let [head, legend, budget, queue, held] = Layout::vertical([
+    let legend = legend_items(&v.worktrees);
+    let legend_h = u16::from(!legend.is_empty());
+    let [head, legend_area, budget, queue, held] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Length(legend_h),
         Constraint::Length(4),
@@ -860,7 +864,7 @@ pub fn draw(f: &mut Frame, v: &View, interval: Duration, error: Option<&str>) {
     .areas(area);
     draw_header(f, head, v, interval, error);
     if legend_h > 0 {
-        draw_legend(f, legend, v);
+        draw_legend(f, legend_area, &legend);
     }
     draw_budget(f, budget, v);
     draw_queue(f, queue, v);
@@ -894,32 +898,68 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View, interval: Duration, error: O
     );
 }
 
-/// `worktrees ▌main (root) ▌fix/…`: what each color is.
-fn draw_legend(f: &mut Frame, area: Rect, v: &View) {
+/// One legend entry: the color, the name and whether it is where `top` runs.
+#[derive(Debug, Clone, PartialEq)]
+struct LegendItem {
+    color: Color,
+    name: String,
+    mine: bool,
+}
+
+/// What the legend lists: only the worktrees that have a color (a repository
+/// with a single worktree in the queue is gray and needs no key). Names are
+/// `branch`, or `repo:branch` when colored worktrees of more than one
+/// repository are present. Empty when there is nothing to tell apart.
+fn legend_items(worktrees: &[Wt]) -> Vec<LegendItem> {
+    let colored: Vec<&Wt> = worktrees
+        .iter()
+        .filter(|w| w.color != Color::Gray)
+        .collect();
+    let mut repos: Vec<&str> = colored.iter().map(|w| w.repo.as_str()).collect();
+    repos.sort_unstable();
+    repos.dedup();
+    let several = repos.len() > 1;
+    colored
+        .into_iter()
+        .map(|w| {
+            let branch = if w.branch.is_empty() {
+                Path::new(&w.path)
+                    .file_name()
+                    .map_or(w.path.clone(), |n| n.to_string_lossy().into_owned())
+            } else {
+                w.branch.clone()
+            };
+            let mut name = ellipsize_middle(&branch, 28);
+            if several {
+                name = format!("{}:{name}", w.repo);
+            }
+            if w.main {
+                name.push_str(" (root)");
+            }
+            LegendItem {
+                color: w.color,
+                name,
+                mine: w.mine,
+            }
+        })
+        .collect()
+}
+
+/// `worktrees ▌web:main (root) ▌web:fix/…`: what each color is.
+fn draw_legend(f: &mut Frame, area: Rect, items: &[LegendItem]) {
     let mut spans = vec![Span::styled(
         "worktrees",
         Style::new().add_modifier(Modifier::DIM),
     )];
-    for w in &v.worktrees {
+    for it in items {
         spans.push(Span::raw(" "));
-        if w.mine {
+        if it.mine {
             spans.push(Span::raw("›"));
         }
-        spans.push(Span::styled("▌", Style::new().fg(w.color)));
-        let name = if w.branch.is_empty() {
-            Path::new(&w.path)
-                .file_name()
-                .map_or(w.path.clone(), |n| n.to_string_lossy().into_owned())
-        } else {
-            w.branch.clone()
-        };
-        let mut text = ellipsize_middle(&name, 28);
-        if w.main {
-            text.push_str(" (root)");
-        }
+        spans.push(Span::styled("▌", Style::new().fg(it.color)));
         spans.push(Span::styled(
-            text,
-            if w.mine {
+            it.name.clone(),
+            if it.mine {
                 Style::new().add_modifier(Modifier::BOLD)
             } else {
                 Style::new()
@@ -1301,14 +1341,14 @@ mod tests {
             State::Waiting,
             6,
             4,
-            "/src/worker",
+            "/src/web",
             "",
             "cargo test --workspace --all-features",
             now,
             45,
         );
         d.expected_secs = Some(240.0);
-        let d = in_wt(d, "/src/worker", "feat/queue");
+        let d = in_wt(d, "/src/web-wt/perf", "perf/cache");
         let mut e = entry(
             "e",
             State::Waiting,
@@ -1493,7 +1533,7 @@ mod tests {
                 (ME, false, true),
                 ("/src/web", true, false),
                 ("/src/docs", true, false),
-                ("/src/worker", true, false)
+                ("/src/web-wt/perf", false, false)
             ]
         );
         assert_eq!(
@@ -1505,12 +1545,76 @@ mod tests {
         assert_ne!(v.worktrees[0].color, Color::Gray);
         assert_ne!(v.worktrees[1].color, Color::Gray);
         assert_eq!(v.worktrees[2].color, Color::Gray);
-        assert_eq!(v.worktrees[3].color, Color::Gray);
+        assert_ne!(v.worktrees[3].color, Color::Gray);
         // Rows point at their worktree; the cores slots too.
         assert_eq!(v.running[0].wt, Some(0));
         assert_eq!(v.running[1].wt, Some(1));
         assert_eq!(v.waiting[1].wt, Some(0));
         assert_eq!(v.slots[0].wt, Some(0));
+    }
+
+    fn wt(path: &str, repo: &str, branch: &str, color: Color) -> Wt {
+        Wt {
+            path: path.into(),
+            branch: branch.into(),
+            main: path == repo,
+            mine: false,
+            repo: repo.rsplit('/').next().unwrap().into(),
+            color,
+        }
+    }
+
+    #[test]
+    fn the_legend_lists_only_colored_worktrees() {
+        let v = sample_view(Utc::now());
+        // web has three worktrees; docs has one and is gray, so it is left out.
+        let items = legend_items(&v.worktrees);
+        let names: Vec<_> = items.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["fix/login-redi…pired-session", "main (root)", "perf/cache"]
+        );
+        assert_eq!(
+            items.iter().map(|i| i.mine).collect::<Vec<_>>(),
+            [true, false, false]
+        );
+        assert!(items.iter().all(|i| i.color != Color::Gray));
+        // Nothing colored: no legend at all, and no row for it.
+        let gray = vec![wt("/r/docs", "/r/docs", "main", Color::Gray)];
+        assert!(legend_items(&gray).is_empty());
+        assert!(legend_items(&[]).is_empty());
+        let now = Utc::now();
+        let one = entry("a", State::Running, 1, 1, "/r/a", "", "a", now, 5);
+        let one = in_wt(one, "/r/a", "main");
+        let v = View::from_parts(&ledger(vec![one]), vec![], limits(4), None, now, None);
+        assert!(!frame(&v, 100, 14).contains("worktrees"));
+    }
+
+    #[test]
+    fn colored_worktrees_of_two_repositories_are_named_repo_colon_branch() {
+        let tree = [
+            wt("/s/web", "/s/web", "main", Color::Cyan),
+            wt("/s/web-wt/x", "/s/web", "feat/x", Color::Green),
+            wt("/s/api", "/s/api", "main", Color::Blue),
+            wt("/s/api-wt/y", "/s/api", "fix/y", Color::Magenta),
+            wt("/s/docs", "/s/docs", "main", Color::Gray),
+        ];
+        let names: Vec<_> = legend_items(&tree).into_iter().map(|i| i.name).collect();
+        assert_eq!(
+            names,
+            [
+                "web:main (root)",
+                "web:feat/x",
+                "api:main (root)",
+                "api:fix/y"
+            ]
+        );
+        // One repository only: the prefix is not needed.
+        let names: Vec<_> = legend_items(&tree[..2])
+            .into_iter()
+            .map(|i| i.name)
+            .collect();
+        assert_eq!(names, ["main (root)", "feat/x"]);
     }
 
     #[test]
