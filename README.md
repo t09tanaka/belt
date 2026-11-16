@@ -183,7 +183,7 @@ Nothing is written to stdout by task-traffic-controller itself.
 ### `task-traffic-controller top [--interval SECS]`
 
 A full-screen live view of the queue (alternate screen, raw mode), refreshed
-every `--interval` seconds (default 1) and redrawn on resize. Quit with `q`,
+every `--interval` seconds (default 1) and redrawn on resize. Switch the colors with `c`. Quit with `q`,
 Esc or Ctrl-C; the terminal is restored on every exit path, a panic included.
 It needs a terminal (use `status` to pipe), and only reads and reaps like
 `status`.
@@ -211,6 +211,16 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
     (5:00+) using under 0.2 cores. The cores of each row are in the box on
     top, not in the table;
   - `progress`: a bar for how far each running row is, and the text after it.
+
+  **Colors** have two modes, shown at the top (`focus` / `overview`) and
+  switched with `c`. In `focus`, the default when `top` is started inside a
+  git worktree, only the rows of that worktree are colored (one fixed blue):
+  the whole row, `#N` to the text after the bar, and its slots in the cores
+  box. Every other row is dim gray, its bar filled with a lighter gray. In
+  `overview`, the default outside a worktree, each worktree of a repository
+  with several gets its own color (a lone worktree stays gray), again for the
+  whole row. The palette has no red or yellow; red is only for an overrun.
+  The bar of a waiting row is the empty track in both.
 
   `exec` records the worktree (`git rev-parse --show-toplevel`) and branch
   it was called from, so parallel runs of one repository from different

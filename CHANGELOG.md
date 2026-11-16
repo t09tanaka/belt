@@ -19,6 +19,13 @@ the minor version).
   bold, with `(current)` after its branch in a `worktree` column. Held
   entries are one line at the bottom. An empty queue says so and how many
   cores are free; a queue with nobody waiting says what would start at once.
+- **`top` has a `focus` and an `overview` color mode (`c` switches).** In
+  `focus`, the default inside a git worktree, only the rows of the current
+  worktree are colored, in every part of the row (number, project, worktree,
+  job, the text after the bar, the bar, its cores slots); the others are dim
+  gray with a lighter gray bar fill. `overview`, the default outside a
+  worktree, colors each worktree as before, now the whole row. The palette no
+  longer has any red or dark blue.
 - `exec` records the worktree and branch it was called from in the ledger
   (`worktree`, `branch`; absent in older entries, ignored by older
   versions). They are not part of the history key.

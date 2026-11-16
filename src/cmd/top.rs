@@ -122,6 +122,8 @@ pub struct View {
     pub held: Vec<HeldRow>,
     /// No colors (`NO_COLOR` set, or a dumb terminal): bars use `█` and `░`.
     pub plain: bool,
+    /// Which rows get a color: only mine (`Focus`), or one per worktree.
+    pub mode: ColorMode,
 }
 
 impl View {
@@ -272,6 +274,7 @@ impl View {
             waiting: wait_rows,
             held,
             plain: false,
+            mode: default_mode(me),
         }
     }
 }
@@ -366,18 +369,69 @@ fn why(
 
 // ------------------------------------------------------------- worktrees
 
-/// Colors a worktree can get. No red (overruns), yellow (idle) or gray
-/// (a repository with a single worktree).
+/// Colors a worktree can get in the overview. No red or anything that
+/// reads as red (overruns), no yellow (idle), no gray (a repository with a
+/// single worktree), nothing too dark to read on a dark background.
 const WT_COLORS: [Color; 8] = [
-    Color::Cyan,
-    Color::Green,
-    Color::Magenta,
-    Color::Blue,
+    Color::LightBlue,
     Color::LightCyan,
     Color::LightGreen,
     Color::LightMagenta,
-    Color::LightBlue,
+    Color::Cyan,
+    Color::Green,
+    Color::Magenta,
+    Color::Indexed(141),
 ];
+
+/// The color of the current worktree's rows in `Focus`.
+const FOCUS_COLOR: Color = Color::LightBlue;
+/// Text, band and cores of the rows that get no color in `Focus`.
+const MUTED: Color = Color::Indexed(243);
+
+/// How rows are colored: `Focus` colors only the worktree `top` was
+/// started in and mutes the rest; `Overview` gives every worktree (of a
+/// repository with several) its own color. `c` switches between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorMode {
+    Focus,
+    Overview,
+}
+
+impl ColorMode {
+    pub fn toggled(self) -> ColorMode {
+        match self {
+            ColorMode::Focus => ColorMode::Overview,
+            ColorMode::Overview => ColorMode::Focus,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            ColorMode::Focus => "focus",
+            ColorMode::Overview => "overview",
+        }
+    }
+}
+
+/// `Focus` when `top` runs in a git worktree (it knows which is its own),
+/// `Overview` otherwise.
+pub fn default_mode(me: Option<&str>) -> ColorMode {
+    if me.is_some() {
+        ColorMode::Focus
+    } else {
+        ColorMode::Overview
+    }
+}
+
+/// The color of a row of worktree `w`, or `None` when the row has none:
+/// in `Focus` every row but mine, in `Overview` a lone worktree's.
+pub fn tint(mode: ColorMode, w: Option<&Wt>) -> Option<Color> {
+    let w = w?;
+    match mode {
+        ColorMode::Focus => w.mine.then_some(FOCUS_COLOR),
+        ColorMode::Overview => (w.color != Color::Gray).then_some(w.color),
+    }
+}
 
 /// FNV-1a: stable across runs and platforms, unlike `DefaultHasher`.
 fn fnv1a(s: &str) -> u64 {
@@ -523,7 +577,7 @@ fn no_color(no_color: Option<&str>, term: Option<&str>) -> bool {
 
 /// The bar's track: a faint gray background, close to a dark terminal's own.
 const TRACK: Color = Color::Indexed(236);
-/// What a lone worktree's (gray) rows fill the track with: darker than it.
+/// What a row without a color fills the track with: lighter than it.
 const LONE_FILL: Color = Color::Indexed(245);
 /// Left blocks of 1/8 to 7/8 of a cell.
 const EIGHTHS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
@@ -551,15 +605,6 @@ pub fn bar_cells(frac: f64, width: usize) -> BarCells {
         full,
         part,
         rest: width - full - usize::from(part.is_some()),
-    }
-}
-
-/// The task's fill color: the worktree's, a darker gray for a lone one.
-fn fill_color(c: Color) -> Color {
-    if c == Color::Gray {
-        LONE_FILL
-    } else {
-        c
     }
 }
 
@@ -837,9 +882,27 @@ fn nobody_waiting(free: u32) -> String {
 
 // ---------------------------------------------------------------- drawing
 
-fn wt_color(v: &View, wt: Option<usize>) -> Color {
-    wt.and_then(|i| v.worktrees.get(i))
-        .map_or(Color::Gray, |w| w.color)
+fn row_tint(v: &View, wt: Option<usize>) -> Option<Color> {
+    tint(v.mode, wt.and_then(|i| v.worktrees.get(i)))
+}
+
+/// The color of a row's band and cores slots: its tint, else muted (`Focus`)
+/// or plain gray (`Overview`).
+fn band_color(v: &View, wt: Option<usize>) -> Color {
+    row_tint(v, wt).unwrap_or(match v.mode {
+        ColorMode::Focus => MUTED,
+        ColorMode::Overview => Color::Gray,
+    })
+}
+
+/// `base` with the row's color on its text: its tint, muted in `Focus` when
+/// it has none, left alone in `Overview`.
+fn tinted(v: &View, tint: Option<Color>, base: Style) -> Style {
+    match (tint, v.mode) {
+        (Some(c), _) => base.fg(c),
+        (None, ColorMode::Focus) => base.fg(MUTED),
+        (None, ColorMode::Overview) => base,
+    }
 }
 
 pub fn draw(f: &mut Frame, v: &View, interval: Duration, error: Option<&str>) {
@@ -868,6 +931,10 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View, interval: Duration, error: O
             Style::new().add_modifier(Modifier::BOLD),
         ),
         Span::raw(format!("  {clock}  every {}s", interval.as_secs_f64())),
+        Span::styled(
+            format!("  {}", v.mode.label()),
+            Style::new().add_modifier(Modifier::DIM),
+        ),
     ];
     if let Some(e) = error {
         spans.push(Span::styled(
@@ -875,7 +942,7 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View, interval: Duration, error: O
             Style::new().fg(Color::Red),
         ));
     }
-    let hint = "q: quit";
+    let hint = "c: colors  q: quit";
     f.render_widget(Paragraph::new(Line::from(spans)), area);
     f.render_widget(
         Paragraph::new(hint)
@@ -922,7 +989,7 @@ fn bar_line(v: &View, width: u16) -> Line<'static> {
         if s.slots == 0 {
             continue;
         }
-        let c = wt_color(v, s.wt);
+        let c = band_color(v, s.wt);
         let cells = s.slots as usize * w;
         let num: String = format!("#{}", s.num).chars().take(cells).collect();
         let n = num.chars().count();
@@ -1017,22 +1084,21 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
         } else {
             Style::new()
         };
+        let tint = row_tint(v, r.wt);
+        let text = tinted(v, tint, base);
         let mut spans = vec![
-            Span::styled("▌", Style::new().fg(wt_color(v, r.wt))),
-            Span::styled(format!("{:>num_w$} ", format!("#{}", r.num)), base),
+            Span::styled("▌", Style::new().fg(band_color(v, r.wt))),
+            Span::styled(format!("{:>num_w$} ", format!("#{}", r.num)), text),
         ];
-        spans.push(Span::styled(col(&r.project, cols.project), base));
+        spans.push(Span::styled(col(&r.project, cols.project), text));
         let cell = worktree_text(wt, cols.worktree);
-        spans.push(Span::styled(
-            col(&cell, cols.worktree),
-            base.fg(wt_color(v, r.wt)),
-        ));
+        spans.push(Span::styled(col(&cell, cols.worktree), text));
         let flag_text = |f: &Flag| if cols.short_flags { f.1 } else { f.0 };
         let shown = &r.flags;
         let flag_strs: Vec<&str> = shown.iter().map(flag_text).collect();
         let (name, flags) = job_parts(&r.job, &flag_strs, cols.job);
         let used = name.chars().count() + flags.chars().count();
-        spans.push(Span::styled(name, base));
+        spans.push(Span::styled(name, text));
         for flag in shown {
             if flags.contains(flag_text(flag)) {
                 spans.push(Span::styled(
@@ -1040,7 +1106,7 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
                     if *flag == IDLE {
                         Style::new().fg(Color::Yellow)
                     } else {
-                        dim
+                        tinted(v, tint, dim)
                     },
                 ));
             }
@@ -1052,12 +1118,12 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
                 let n = bar_fill(Some(frac), cols.bar).unwrap_or(0);
                 spans.push(Span::styled(
                     FILLED.to_string().repeat(n),
-                    base.fg(wt_color(v, r.wt)),
+                    tinted(v, tint, base),
                 ));
                 spans.push(Span::styled(EMPTY.to_string().repeat(cols.bar - n), dim));
             }
             Some(frac) => {
-                let fill = fill_color(wt_color(v, r.wt));
+                let fill = tint.unwrap_or(LONE_FILL);
                 let cells = bar_cells(frac, cols.bar);
                 spans.push(Span::styled(" ".repeat(cells.full), Style::new().bg(fill)));
                 if let Some(ch) = cells.part {
@@ -1077,7 +1143,7 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
             if r.over {
                 Style::new().fg(Color::Red)
             } else {
-                base
+                text
             },
         ));
         lines.push(Line::from(spans));
@@ -1140,6 +1206,13 @@ fn is_quit(key: &event::KeyEvent) -> bool {
         }
 }
 
+/// `c` (without Ctrl, which quits) switches the color mode.
+fn is_toggle(key: &event::KeyEvent) -> bool {
+    key.kind == KeyEventKind::Press
+        && key.code == KeyCode::Char('c')
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 pub fn run(ctx: &Context, cfg: &Config, interval: f64) -> Result<i32> {
     if !std::io::stdout().is_terminal() || !std::io::stdin().is_terminal() {
         return Err(Error::Spawn(
@@ -1154,6 +1227,7 @@ pub fn run(ctx: &Context, cfg: &Config, interval: f64) -> Result<i32> {
         .and_then(|d| gitctx::worktree(&d))
         .map(|w| w.path);
     let mut view = View::build(ctx, cfg, me.as_deref())?;
+    let mut mode = view.mode;
     let mut error: Option<String> = None;
     let mut terminal = ratatui::init();
     let _restore = Restore;
@@ -1164,6 +1238,11 @@ pub fn run(ctx: &Context, cfg: &Config, interval: f64) -> Result<i32> {
         if event::poll(wait)? {
             match event::read()? {
                 Event::Key(k) if is_quit(&k) => return Ok(0),
+                Event::Key(k) if is_toggle(&k) => {
+                    mode = mode.toggled();
+                    view.mode = mode;
+                    continue;
+                }
                 // A resize (or any other event) redraws with the same data.
                 _ => continue,
             }
@@ -1171,6 +1250,7 @@ pub fn run(ctx: &Context, cfg: &Config, interval: f64) -> Result<i32> {
         match View::build(ctx, cfg, me.as_deref()) {
             Ok(v) => {
                 view = v;
+                view.mode = mode;
                 error = None;
             }
             Err(e) => error = Some(e.to_string()),
@@ -1554,6 +1634,68 @@ mod tests {
     }
 
     #[test]
+    fn no_palette_color_reads_as_red_or_is_too_dark() {
+        // Named reds, the ANSI red slots, and the red-dominant cube/ramp
+        // entries of the 256-color palette.
+        for c in WT_COLORS.iter().chain([&FOCUS_COLOR]) {
+            match *c {
+                Color::Red | Color::LightRed | Color::Black | Color::DarkGray | Color::Gray => {
+                    panic!("{c:?}")
+                }
+                Color::Indexed(i) => {
+                    assert!(![1, 9, 52, 88, 124, 160, 196, 202, 203, 204].contains(&i));
+                    assert!(i >= 16 && !(232..=243).contains(&i), "{i}");
+                    if (16..232).contains(&i) {
+                        let (r, g, b) = ((i - 16) / 36, (i - 16) / 6 % 6, (i - 16) % 6);
+                        assert!(r <= g.max(b), "{i} is red-dominant");
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(WT_COLORS.contains(&FOCUS_COLOR));
+    }
+
+    #[test]
+    fn the_mode_follows_where_top_runs_and_c_switches_it() {
+        assert_eq!(default_mode(Some(ME)), ColorMode::Focus);
+        assert_eq!(default_mode(None), ColorMode::Overview);
+        assert_eq!(ColorMode::Focus.toggled(), ColorMode::Overview);
+        assert_eq!(ColorMode::Focus.toggled().toggled(), ColorMode::Focus);
+        let key = |code, m| event::KeyEvent::new(code, m);
+        assert!(is_toggle(&key(KeyCode::Char('c'), KeyModifiers::NONE)));
+        assert!(!is_toggle(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(!is_toggle(&key(KeyCode::Char('q'), KeyModifiers::NONE)));
+        assert!(is_quit(&key(KeyCode::Char('c'), KeyModifiers::CONTROL)));
+        assert!(!is_quit(&key(KeyCode::Char('c'), KeyModifiers::NONE)));
+    }
+
+    #[test]
+    fn a_row_has_a_color_only_when_the_mode_gives_it_one() {
+        let wt = |mine, color| Wt {
+            path: "/w".into(),
+            branch: "b".into(),
+            mine,
+            color,
+        };
+        let (me, other, lone) = (
+            wt(true, Color::Cyan),
+            wt(false, Color::Green),
+            wt(false, Color::Gray),
+        );
+        // Focus: mine in the fixed color, everything else none.
+        assert_eq!(tint(ColorMode::Focus, Some(&me)), Some(FOCUS_COLOR));
+        assert_eq!(tint(ColorMode::Focus, Some(&other)), None);
+        assert_eq!(tint(ColorMode::Focus, Some(&lone)), None);
+        assert_eq!(tint(ColorMode::Focus, None), None);
+        // Overview: each worktree's own, none for a lone one.
+        assert_eq!(tint(ColorMode::Overview, Some(&me)), Some(Color::Cyan));
+        assert_eq!(tint(ColorMode::Overview, Some(&other)), Some(Color::Green));
+        assert_eq!(tint(ColorMode::Overview, Some(&lone)), None);
+        assert_eq!(tint(ColorMode::Overview, None), None);
+    }
+
+    #[test]
     fn worktrees_of_one_repository_never_share_a_color_until_the_palette_runs_out() {
         let (a, b) = colliding_paths();
         let n = WT_COLORS.len() as u64;
@@ -1807,7 +1949,8 @@ mod tests {
 
     #[test]
     fn bar_cells_are_colored_by_row_with_an_eighth_cell_and_a_gray_track() {
-        let v = sample_view(Utc::now());
+        let mut v = sample_view(Utc::now());
+        v.mode = ColorMode::Overview;
         let rows = table_rows(&v);
         let fix = v.worktrees[0].color;
         // #1 runs in a worktree with a color: that color fills from the left.
@@ -2027,7 +2170,8 @@ mod tests {
 
     #[test]
     fn the_band_is_the_worktree_color_and_my_row_is_bold() {
-        let v = sample_view(Utc::now());
+        let mut v = sample_view(Utc::now());
+        v.mode = ColorMode::Overview;
         let t = render(&v, 120, 16);
         let buf = t.backend().buffer().clone();
         let at = |needle: &str| {
@@ -2059,6 +2203,69 @@ mod tests {
         assert_eq!(buf[(1, by)].bg, v.worktrees[0].color);
     }
 
+    /// The foreground of every non-blank cell of the row with `needle`,
+    /// inside the box.
+    fn row_fgs(buf: &ratatui::buffer::Buffer, needle: &str) -> Vec<Color> {
+        let y = row_y(buf, 120, 16, needle);
+        (1..119u16)
+            .filter(|&x| buf[(x, y)].symbol() != " ")
+            .map(|x| buf[(x, y)].fg)
+            .collect()
+    }
+
+    #[test]
+    fn focus_colors_only_my_rows_in_every_part_and_mutes_the_rest() {
+        let mut v = sample_view(Utc::now());
+        assert_eq!(v.mode, ColorMode::Focus);
+        let t = render(&v, 120, 16);
+        let buf = t.backend().buffer().clone();
+        // Mine (#5): band, number, project, worktree, job and the text after
+        // the bar are all the one fixed color.
+        let mine = row_fgs(&buf, "cargo clippy");
+        assert!(
+            mine.len() > 20 && mine.iter().all(|c| *c == FOCUS_COLOR),
+            "{mine:?}"
+        );
+        // The others (another worktree, a lone worktree): all muted.
+        for needle in ["cargo test --workspace", "local-ci run"] {
+            let fgs = row_fgs(&buf, needle);
+            assert!(
+                fgs.len() > 20 && fgs.iter().all(|c| *c == MUTED),
+                "{needle} {fgs:?}"
+            );
+        }
+        // Their bars fill with the light gray, not a color.
+        let cells = bar_row(&v, 120, 0);
+        let want = bar_cells(table_rows(&v)[0].frac.unwrap(), cells.len());
+        assert!(want.full > 0 && cells[..want.full].iter().all(|c| c.bg == LONE_FILL));
+        let cells = bar_row(&v, 120, 1);
+        assert!(cells[0].bg == LONE_FILL);
+        // A waiting row is the track only.
+        assert!(bar_row(&v, 120, 4).iter().all(|c| c.bg == TRACK));
+        // The cores bar: #1 (not mine) is muted, never a worktree color.
+        let by = row_y(&buf, 120, 16, "cores 12/12") + 1;
+        assert_eq!((buf[(1, by)].symbol(), buf[(1, by)].bg), ("#", MUTED));
+        // The header names the mode and the key.
+        let head: String = (0..120u16)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(
+            head.contains("focus") && head.contains("c: colors  q: quit"),
+            "{head}"
+        );
+
+        // Overview: the first row is its worktree's color, text included.
+        v.mode = v.mode.toggled();
+        let t = render(&v, 120, 16);
+        let buf = t.backend().buffer().clone();
+        let fgs = row_fgs(&buf, "cargo test --workspace");
+        assert!(fgs.iter().all(|c| *c == v.worktrees[0].color), "{fgs:?}");
+        let head: String = (0..120u16)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(head.contains("overview"), "{head}");
+    }
+
     #[test]
     fn only_the_overrun_is_drawn_red() {
         let now = Utc::now();
@@ -2070,7 +2277,7 @@ mod tests {
         let t = render(&v, 80, 12);
         let buf = t.backend().buffer().clone();
         // Only the text of the row that is over is red; its bar is full.
-        let y0 = row_y(&buf, 80, 12, "over");
+        let y0 = row_y(&buf, 80, 12, "over 0");
         let line: String = (0..80u16)
             .map(|x| buf[(x, y0)].symbol().to_string())
             .collect();
@@ -2080,7 +2287,7 @@ mod tests {
         assert!(count(y0, LONE_FILL) >= 10 && count(y0, TRACK) == 0);
         let y1 = row_y(&buf, 80, 12, "left");
         assert!(count(y1, TRACK) > 0 && count(y1, LONE_FILL) > 0);
-        let x = line.find("over").unwrap();
+        let x = line.find("over 0").unwrap();
         let col = line[..x].chars().count() as u16;
         assert_eq!(buf[(col, y0)].fg, Color::Red);
     }
