@@ -39,7 +39,13 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: install fast-worktree
-        run: command -v fast-worktree || cargo install fast-worktree --locked --version 0.4.0
+        # A cached older binary lacks the cross-process worktree registration
+        # lock added in 0.4.0, so check the version, not just the presence.
+        run: |
+          if ! fast-worktree --version 2>/dev/null | grep -qx 'fast-worktree 0\.4\.0'; then
+            cargo install fast-worktree --locked --version 0.4.0 --force
+          fi
+          fast-worktree --version
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.151
@@ -75,7 +81,13 @@ jobs:
           git lfs version || { sudo apt-get update && sudo apt-get install -y git-lfs; }
           git lfs version
       - name: install fast-worktree
-        run: command -v fast-worktree || cargo install fast-worktree --locked --version 0.4.0
+        # A cached older binary lacks the cross-process worktree registration
+        # lock added in 0.4.0, so check the version, not just the presence.
+        run: |
+          if ! fast-worktree --version 2>/dev/null | grep -qx 'fast-worktree 0\.4\.0'; then
+            cargo install fast-worktree --locked --version 0.4.0 --force
+          fi
+          fast-worktree --version
       - name: 100% line coverage on the listed pure modules
         run: ./scripts/coverage-gate.sh
 
