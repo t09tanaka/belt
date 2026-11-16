@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Fix worktree registrations left in the repository when the checkout a run was started from (a linked worktree) is removed while the run goes on. The run ran `git worktree prune` in that checkout, which failed once it was gone, and the failure was not reported; the files were deleted, so nothing in the cache said whose the registration was and `local-ci cache prune` could not drop it. A run now unregisters each worktree in the repository the worktree itself is registered in.
+- `local-ci cache prune`, run in a repository, also drops the registrations there of local-ci worktrees under the cache directory whose files are gone (left by an earlier version, or by a run killed between deleting and unregistering), and says how many. Locked registrations are left alone; like a run, it does so with `git worktree prune`.
+
 ## [0.17.0] - 2026-11-16
 
 - Do not run the same job twice on one machine. The legs of a matrix job that differ only in an OS label (`os: [ubuntu-latest, macos-latest]`) run the same steps on the host, so when one leg is of the host's OS family (`ubuntu-*` and `linux` are Linux, `macos-*` is macOS, `windows-*` is Windows) only that leg runs. The others are listed under `not covered` with the reason (`runs-on ubuntu-latest: Linux is not reproduced on this macOS host; the same steps ran as test (macos-latest)`); they are neither a pass nor a failure, so the run is `incomplete`. Legs are twins only when their other matrix values are equal and nothing the job evaluates reads the differing value. `needs.<id>.result` and the outputs of the matrix job are those of the legs that ran. Self-hosted and unknown labels are run as before.
