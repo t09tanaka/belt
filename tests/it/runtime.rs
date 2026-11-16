@@ -147,6 +147,7 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
     cfg.workers.push(WorkerSpec {
         id: "remote".into(),
         ssh: "host".into(),
+        binary: None,
         service_mode: None,
         labels: vec![],
         ephemeral: true,

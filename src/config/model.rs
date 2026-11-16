@@ -56,6 +56,9 @@ pub struct Defaults {
 pub struct Worker {
     pub id: String,
     pub ssh: String,
+    /// Absolute path of `remote-task-runner` on the worker host, written by
+    /// `workers add --install`. Absent: the name is looked up on ssh's PATH.
+    pub binary: Option<String>,
     pub service_mode: Option<ServiceMode>,
     #[serde(default)]
     pub labels: Vec<String>,

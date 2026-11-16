@@ -96,6 +96,8 @@ pub struct Inputs<'a> {
 pub struct WorkerSpec {
     pub id: String,
     pub ssh: String,
+    /// Absolute path of the binary on the worker host; `None`: look it up on PATH.
+    pub binary: Option<String>,
     /// `None` for an ephemeral worker (it installs no service).
     pub service_mode: Option<ServiceMode>,
     pub labels: Vec<String>,
@@ -527,6 +529,14 @@ fn check_workers(
         if w.ssh.trim().is_empty() {
             problems.push(format!("worker {:?}: ssh is empty", w.id));
         }
+        if let Some(binary) = &w.binary {
+            if !binary.starts_with('/') || binary.chars().any(|c| c.is_control()) {
+                problems.push(format!(
+                    "worker {:?}: binary must be an absolute path without control characters",
+                    w.id
+                ));
+            }
+        }
         if w.labels.iter().any(|l| l.trim().is_empty()) {
             problems.push(format!("worker {:?}: a label is empty", w.id));
         }
@@ -547,6 +557,7 @@ fn check_workers(
         out.push(WorkerSpec {
             id: w.id.clone(),
             ssh: w.ssh.clone(),
+            binary: w.binary.clone(),
             service_mode: if ephemeral {
                 None
             } else {

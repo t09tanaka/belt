@@ -11,6 +11,7 @@ use crate::state::{AttemptState, Observation, Receipts, Termination};
 use crate::storage::CoordinatorStore;
 use crate::worker::{agent::Agent, serve::serve_connection};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -19,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{watch, Mutex, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
 mod delivery;
@@ -73,6 +74,9 @@ pub enum Operation {
     },
     Ping,
     Health,
+    /// Re-read the private worker registration and dial workers added since
+    /// startup. Never disconnects or changes a worker that is already dialed.
+    ReloadWorkers,
     Submit {
         run_id: RunId,
         source_id: SourceId,
@@ -119,6 +123,10 @@ pub enum Reply {
     },
     Ready {
         epoch: CoordinatorEpoch,
+    },
+    WorkersReloaded {
+        /// The workers this request started dialing.
+        connecting: Vec<String>,
     },
     Health {
         cluster_id: ClusterId,
@@ -336,6 +344,9 @@ impl CapturedInputs {
 
 pub struct Resident {
     remote_config: Arc<ResolvedConfig>,
+    /// Where the private registration is re-read from on a reload.
+    remote_env: BTreeMap<String, String>,
+    dial: remote::Dial,
     coordinator: Arc<Coordinator>,
     files: Arc<ResultStore>,
     agent: Arc<Agent>,
@@ -626,6 +637,7 @@ impl Resident {
             config.local_worker.value,
             "local resident requires local worker"
         );
+        let inputs_env = inputs.worker.env.clone();
         let remote_config = Arc::new(remote::snapshot(
             config,
             &inputs.worker.env,
@@ -665,6 +677,8 @@ impl Resident {
             .await;
         Ok(Self {
             remote_config,
+            remote_env: inputs_env,
+            dial: remote::dial(),
             coordinator: parts.coordinator,
             files: parts.files,
             agent: parts.agent,
@@ -701,8 +715,10 @@ impl Resident {
         let mut loops = JoinSet::new();
         // Connection failures stay inside each owner and never terminate the resident.
         let mut remotes = JoinSet::new();
+        let mut dialed = BTreeSet::new();
         for worker in self.remote_config.workers.clone() {
-            remotes.spawn(remote::run(
+            dialed.insert(worker.id.clone());
+            remotes.spawn((self.dial)(
                 self.remote_config.clone(),
                 worker,
                 self.coordinator.clone(),
@@ -710,6 +726,12 @@ impl Resident {
                 rx.clone(),
             ));
         }
+        let (reload_tx, mut reload_rx) = mpsc::channel::<oneshot::Sender<Reply>>(4);
+        let (base, env, local) = (
+            self.remote_config.clone(),
+            self.remote_env.clone(),
+            self.worker_id.clone(),
+        );
         let coordinator = self.coordinator.clone();
         let stop_tick = stop.clone();
         let mut tick_stop = rx.clone();
@@ -826,6 +848,26 @@ impl Resident {
                     match result { Some(Ok(Err(e))) => failure = Some(e), Some(Err(e)) => failure = Some(e.into()), _ => {} }
                     break;
                 },
+                Some(answer) = reload_rx.recv() => {
+                    let (base, env, local) = (base.clone(), env.clone(), local.clone());
+                    let fresh = tokio::task::spawn_blocking(move || remote::reload(&base, &env, &local)).await;
+                    let reply = match fresh {
+                        Ok(Ok(fresh)) => {
+                            let fresh = Arc::new(fresh);
+                            let mut connecting = Vec::new();
+                            for worker in fresh.workers.clone() {
+                                if dialed.insert(worker.id.clone()) {
+                                    connecting.push(worker.id.clone());
+                                    remotes.spawn((self.dial)(fresh.clone(), worker, self.coordinator.clone(), self.captured.clone(), stop.subscribe()));
+                                }
+                            }
+                            Reply::WorkersReloaded { connecting }
+                        }
+                        Ok(Err(e)) => Reply::ControlError { error: crate::error::ApiError::new(crate::error::ErrorCode::InvalidInput, format!("worker registration unusable: {e}")) },
+                        Err(e) => Reply::ControlError { error: crate::error::ApiError::new(crate::error::ErrorCode::Internal, e.to_string()) },
+                    };
+                    let _ = answer.send(reply);
+                },
                 ended = requests.join_next(), if !requests.is_empty() => { if let Some(Err(e)) = ended { failure = Some(anyhow::Error::from(e)); break; } },
                 conn = self.listener.accept() => {
                     let (stream, _) = match conn { Ok(c) => c, Err(e) => { failure = Some(e.into()); break; } };
@@ -839,9 +881,10 @@ impl Resident {
                     let worker_id = self.worker_id.clone();
                     let stop = stop.clone();
                     let admission = admission.clone();
+                    let reload = reload_tx.clone();
                     requests.spawn(async move {
                         let _permit = permit;
-                        let _ = handle(stream, coordinator, sources, captured, worker_client, worker_id, client, admission, stop).await;
+                        let _ = handle(stream, coordinator, sources, captured, worker_client, worker_id, client, admission, stop, reload).await;
                     });
                 }
             }
@@ -1011,6 +1054,7 @@ async fn handle(
     client: Client,
     admission: Arc<Mutex<bool>>,
     stop: watch::Sender<bool>,
+    reload: mpsc::Sender<oneshot::Sender<Reply>>,
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
@@ -1043,6 +1087,23 @@ async fn handle(
             }
         })
         .await?;
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
+    if matches!(request.operation, Operation::ReloadWorkers) {
+        let (answer, wait) = oneshot::channel();
+        let reply = if reload.send(answer).await.is_err() {
+            Reply::Stopping
+        } else {
+            match tokio::time::timeout(Duration::from_secs(4), wait).await {
+                Ok(Ok(reply)) => reply,
+                _ => Reply::ControlError {
+                    error: crate::error::ApiError::new(
+                        crate::error::ErrorCode::CommunicationUnknown,
+                        "the resident did not finish the reload in time",
+                    ),
+                },
+            }
+        };
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
     if let Operation::EstimateTask { task_id } = request.operation {
@@ -1189,6 +1250,10 @@ async fn handle(
                 Err(_) => Reply::Error {
                     message: "resident process identity unknown".into(),
                 },
+            },
+            // Answered before admission; never reaches this match.
+            Operation::ReloadWorkers => Reply::Error {
+                message: "reload is handled outside admission".into(),
             },
             Operation::Ping => Reply::Ready {
                 epoch: coordinator.store().epoch(),
