@@ -383,9 +383,9 @@ const WT_COLORS: [Color; 8] = [
     Color::Indexed(141),
 ];
 
-/// The color of the current worktree's rows in `Focus` (#1f883d), apart from
+/// The color of the current worktree's rows in `Focus` (#3fb950), apart from
 /// the overview palette. Terminals without truecolor get the nearest of 256.
-const FOCUS_COLOR: Color = Color::Rgb(0x1f, 0x88, 0x3d);
+const FOCUS_COLOR: Color = Color::Rgb(0x3f, 0xb9, 0x50);
 /// The cores slots of the rows that get no color in `Focus`.
 const MUTED: Color = Color::Indexed(243);
 /// The style of the text that is not the point: the `No one waiting` line,
