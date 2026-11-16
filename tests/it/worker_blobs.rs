@@ -582,6 +582,10 @@ fn payload(p: &Parcel, script: &str) -> AttemptPayload {
     let mut env = BTreeMap::new();
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
+        toolchains: None,
+        outputs: Vec::new(),
+        requirements: Default::default(),
+        in_place: false,
         setup: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
@@ -1719,7 +1723,11 @@ async fn a_git_source_runs_on_a_worker_that_holds_nothing_and_the_next_one_trave
 
     // The next source of the repository: the worker lists what its clone
     // holds, and the bundle brings only what is new.
-    let lib_manifest = f.worker_store().object_store().manifest_path(&lib_capture);
+    let lib_manifest = f
+        .worker_store()
+        .object_store()
+        .unwrap()
+        .manifest_path(&lib_capture);
     let inode = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
     let before = inode(&lib_manifest);
     let (have, thin) = send_git(&c, &f, &second).await;

@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub struct Machine {
+    in_place: Option<(PathBuf, crate::ids::WorkerId)>,
     state_dir: PathBuf,
     env: BTreeMap<String, String>,
     fw: Arc<CliFastWorktree>,
@@ -68,6 +69,7 @@ impl Machine {
             env.clone(),
         );
         Ok(Machine {
+            in_place: None,
             incoming,
             setups: None,
             env,
@@ -105,6 +107,49 @@ impl Machine {
         Ok(self)
     }
 
+    pub(crate) fn with_in_place(mut self, parent: PathBuf, worker: crate::ids::WorkerId) -> Self {
+        self.in_place = Some((parent, worker));
+        self
+    }
+    fn original(&self, payload: &AttemptPayload) -> Result<PathBuf, ApiError> {
+        let (parent, worker) = self.in_place.as_ref().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::InvalidInput,
+                "in-place requires the parent local worker",
+            )
+        })?;
+        Ok(crate::workspace::in_place::load(
+            parent,
+            &payload.run_id,
+            &payload.source_id,
+            &payload.manifest_digest,
+            worker,
+        )?
+        .root)
+    }
+    fn original_secrets(&self, attempt: &AcceptedAttempt) -> Result<Option<Placed>, ApiError> {
+        let payload: AttemptPayload = serde_json::from_value(attempt.spec.clone())
+            .map_err(|e| internal("stored payload", e))?;
+        if !payload.in_place {
+            return Ok(None);
+        }
+        self.original(&payload)?;
+        let m = self.manifest(attempt)?;
+        let paths = m
+            .secret_files
+            .iter()
+            .map(|s| s.path.display())
+            .collect::<Vec<_>>();
+        let (parent, worker) = self.in_place.as_ref().expect("original checked capability");
+        let binding = crate::workspace::in_place::load(
+            parent,
+            &payload.run_id,
+            &payload.source_id,
+            &payload.manifest_digest,
+            worker,
+        )?;
+        crate::workspace::in_place::read_secrets(&binding, &self.env, &paths).map(Some)
+    }
     pub fn setups(&self) -> Option<&Arc<Setups>> {
         self.setups.as_ref()
     }
@@ -160,6 +205,74 @@ impl BuilderWorkspaces for BuilderWs {
 }
 
 impl Host for Machine {
+    fn setup_owner(&self) -> Option<&Setups> {
+        self.setups.as_deref()
+    }
+    fn preparation_observation_page(
+        &self,
+        request: &crate::setup::observation_transport::ObservationPageRequest,
+    ) -> Option<crate::setup::observation_transport::ObservationPage> {
+        self.setups
+            .as_ref()
+            .map(|setups| setups.preparation_observation_page(request))
+    }
+    fn toolchain_registry(
+        &self,
+        profile: &crate::toolchain::profile::Profile,
+        base: crate::ids::Digest,
+    ) -> Result<Option<crate::toolchain::registry::Registry>, ApiError> {
+        let Some(setups) = &self.setups else {
+            return Ok(None);
+        };
+        let root = setups.private_tool_root()?;
+        crate::toolchain::registry::Registry::load(
+            root.parent().expect("tool root parent"),
+            profile,
+            base,
+        )
+        .map(Some)
+        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))
+    }
+    fn toolchain_poll(
+        &self,
+        attempt: &AttemptId,
+        request: &crate::toolchain::preparation::PreparationRequest,
+    ) -> Result<crate::toolchain::preparation::ToolPreparationPoll, ApiError> {
+        self.setups
+            .as_ref()
+            .ok_or_else(|| {
+                ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "toolchain preparation unavailable",
+                )
+            })?
+            .poll_tool(attempt, request)
+    }
+    fn setup_poll_bound(
+        &self,
+        attempt: &AcceptedAttempt,
+        payload: &AttemptPayload,
+        workspace: &Workspace,
+        binding: Option<&crate::toolchain::contract::ExecutionBinding>,
+    ) -> Result<SetupPoll, ApiError> {
+        match &self.setups {
+            Some(s) => s.poll_bound(&attempt.attempt_id, payload, workspace, binding),
+            None => self.setup_poll(attempt, payload, workspace),
+        }
+    }
+
+    fn admit(&self, payload: &AttemptPayload) -> Result<(), ApiError> {
+        if payload.in_place {
+            self.original(payload)?;
+            if payload.has_secret_bundle {
+                return Err(ApiError::new(
+                    ErrorCode::InvalidInput,
+                    "in-place never accepts placed secrets",
+                ));
+            }
+        }
+        Ok(())
+    }
     fn disable_core_dumps(&self) -> Result<(), ApiError> {
         platform::disable_core_dumps().map_err(|e| internal("core dumps", e))
     }
@@ -222,9 +335,32 @@ impl Host for Machine {
     fn prepare(
         &self,
         attempt: &AcceptedAttempt,
-        _: &AttemptPayload,
+        payload: &AttemptPayload,
     ) -> Result<Workspace, ApiError> {
         let m = self.manifest(attempt)?;
+        if let Some(bundle) = &payload.toolchains {
+            let invalid = |e: &str| ApiError::new(crate::error::ErrorCode::InvalidInput, e);
+            bundle.validate(&payload.manifest_digest).map_err(invalid)?;
+            let project = std::str::from_utf8(&m.cwd_relative.0)
+                .map_err(|_| invalid("toolchain project scope"))?;
+            if bundle.frozen.scope != crate::toolchain::versions::Scope::project(project) {
+                return Err(invalid("toolchain source scope mismatch"));
+            }
+            let declarations =
+                crate::toolchain::snapshot::read_captured(&self.store, &m, project, &[])
+                    .map_err(|e| invalid(&e.code))?;
+            let effective =
+                crate::toolchain::versions::effective(&declarations, &bundle.frozen.scope)
+                    .map_err(|e| invalid(&e.code))?;
+            if effective != bundle.frozen.requirements {
+                return Err(invalid("toolchain source declarations mismatch"));
+            }
+        }
+
+        if payload.in_place {
+            let root = self.original(payload)?;
+            return self.workspaces.open_in_place(&root, Path::new(""), true);
+        }
         let repo = match (&m.execution_commit, &m.repository_id) {
             (Some(_), Some(id)) => Some(self.workspaces.ensure_clone(id, None)?),
             _ => None,
@@ -270,6 +406,12 @@ impl Host for Machine {
         workspace: &Workspace,
         files: &[SecretFile],
     ) -> Result<u32, ApiError> {
+        if workspace.kind == crate::workspace::WorkspaceKind::InPlace {
+            return Err(ApiError::new(
+                ErrorCode::InvalidInput,
+                "in-place never places secrets",
+            ));
+        }
         let m = self.manifest(attempt)?;
         let key = key::load_in_state(&self.state_dir, &self.key_path).map_err(|e| e.to_api())?;
         self.secrets
@@ -284,6 +426,9 @@ impl Host for Machine {
     }
 
     fn secrets_ready(&self, attempt: &AcceptedAttempt) -> Result<bool, ApiError> {
+        if self.original_secrets(attempt)?.is_some() {
+            return Ok(true);
+        }
         let m = self.manifest(attempt)?;
         match self
             .secrets
@@ -297,6 +442,9 @@ impl Host for Machine {
     }
 
     fn placed_secrets(&self, attempt: &AcceptedAttempt) -> Result<Placed, ApiError> {
+        if let Some(placed) = self.original_secrets(attempt)? {
+            return Ok(placed);
+        }
         self.secrets
             .placed(&attempt.attempt_id)
             .map_err(|e| e.to_api())
@@ -308,6 +456,9 @@ impl Host for Machine {
 
     fn cleanup(&self, attempt: &AttemptId, workspace: Option<&Workspace>) -> Result<(), ApiError> {
         self.setup_release(attempt);
+        if workspace.is_some_and(|w| w.kind == crate::workspace::WorkspaceKind::InPlace) {
+            return Ok(());
+        }
         match self.secrets.erase(attempt) {
             Ok(_) => {}
             Err(e @ SecretError::WorkspaceRequired { .. }) => {

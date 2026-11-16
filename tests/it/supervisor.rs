@@ -83,6 +83,8 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
         .unwrap();
     store.transition(&attempt, AttemptState::Ready, 3).unwrap();
     let spec = SuperviseSpec {
+        preparation: None,
+        profile_fingerprint: None,
         state_dir: state,
         worker_id: worker,
         attempt_id: attempt,
@@ -986,6 +988,8 @@ fn artifacts(f: &Fx, files: &[(&str, &str)]) -> ArtifactsSpec {
     let ws = f.path("ws");
     std::fs::create_dir_all(&ws).unwrap();
     ArtifactsSpec {
+        outputs: Vec::new(),
+        secret_paths: Vec::new(),
         workspace: ws,
         source_id: SourceId::generate(),
         plan_digest: Digest::of_bytes(b"plan"),
@@ -2112,4 +2116,141 @@ fn a_bad_spec_is_refused_with_its_own_exit_code() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(code::BAD_SPEC));
+}
+
+#[test]
+fn generic_output_bundles_follow_execution_conditions_and_survive_restart() {
+    use remote_task_runner::wire::{OutputDecl, OutputWhen};
+    for (script, success) in [("exit 0", true), ("exit 7", false)] {
+        let mut f = fx(vec![]);
+        let mut p = artifacts(&f, &[]);
+        for (name, when) in [
+            ("always", OutputWhen::Always),
+            ("success", OutputWhen::Success),
+            ("failure", OutputWhen::Failure),
+        ] {
+            p.outputs.push(OutputDecl {
+                name: name.into(),
+                paths: vec!["reports/**".into(), "coverage/**".into(), "reports".into()],
+                if_missing: MissingPolicy::Required,
+                when,
+            });
+        }
+        p.outputs.push(OutputDecl {
+            name: "missing".into(),
+            paths: vec!["absent/**".into()],
+            if_missing: MissingPolicy::Optional,
+            when: OutputWhen::Always,
+        });
+        f.spec.nodes = vec![in_ws(
+            &f,
+            &format!(
+                "mkdir reports coverage; printf a > reports/a; printf b > coverage/b; {script}"
+            ),
+        )];
+        f.spec.artifacts = Some(p);
+        let term = settled(&run(&f.spec).unwrap());
+        assert_eq!(
+            term.outcome(),
+            if success {
+                Outcome::Succeeded
+            } else {
+                Outcome::Failed
+            }
+        );
+        let result = f.store.get_result(f.attempt()).unwrap().unwrap();
+        let list = result["artifacts"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "{result}");
+        assert!(list.iter().all(|a| a["encoding"] == "tar_v1"));
+        assert_eq!(result["outputs_evaluated"], true);
+        assert!(list
+            .iter()
+            .any(|a| a["name"] == if success { "success" } else { "failure" }));
+        assert_eq!(result["artifacts_not_stored"][0]["name"], "missing");
+        assert_eq!(result["artifacts_not_stored"][0]["if_missing"], "optional");
+        let bundle = f
+            .spec
+            .spool_dir()
+            .join(f.attempt().as_str())
+            .join("artifacts/always");
+        let mut archive = tar::Archive::new(std::fs::File::open(bundle).unwrap());
+        let paths: Vec<_> = archive
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().to_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(paths, ["coverage/b", "reports/a"]);
+        std::fs::remove_dir_all(f.path("ws")).unwrap();
+        assert_eq!(run(&f.spec).unwrap().termination, Some(term));
+        assert_eq!(f.store.get_result(f.attempt()).unwrap(), Some(result));
+        assert_eq!(f.events(f.attempt(), "artifacts_stored").len(), 1);
+    }
+}
+
+#[test]
+fn generic_conditions_cover_timeout_prelaunch_cancel_and_prepared_only() {
+    use remote_task_runner::wire::{OutputDecl, OutputWhen};
+    for mode in ["timeout", "cancel", "prepared", "zero"] {
+        let mut f = fx(vec![]);
+        let mut p = artifacts(&f, &[]);
+        for (name, when) in [
+            ("always", OutputWhen::Always),
+            ("success", OutputWhen::Success),
+            ("failure", OutputWhen::Failure),
+        ] {
+            p.outputs.push(OutputDecl {
+                name: name.into(),
+                paths: vec!["out".into()],
+                if_missing: MissingPolicy::Required,
+                when,
+            });
+        }
+        if mode == "zero" {
+            p.outputs.retain(|d| d.when == OutputWhen::Failure);
+        }
+        std::fs::write(f.path("ws/out"), b"ready").unwrap();
+        f.spec.artifacts = Some(p);
+        match mode {
+            "timeout" => {
+                f.spec.nodes = vec![in_ws(&f, "sleep 10")];
+                f.spec.command_timeout_ms = Some(100);
+                f.spec.term_grace_ms = 20;
+            }
+            "cancel" => {
+                f.spec.nodes = vec![in_ws(&f, "true")];
+                f.store
+                    .cancel(f.attempt(), CoordinatorEpoch(1), platform::wall_ms())
+                    .unwrap();
+            }
+            _ => {
+                f.spec.prepared_only = true;
+            }
+        }
+        let term = settled(&run(&f.spec).unwrap());
+        let result = f.store.get_result(f.attempt()).unwrap().unwrap();
+        let list = result["artifacts"].as_array().unwrap();
+        match mode {
+            "timeout" => {
+                assert_eq!(term.outcome(), Outcome::TimedOut);
+                assert_eq!(list.len(), 2);
+                assert!(list.iter().any(|a| a["name"] == "failure"));
+            }
+            "cancel" => {
+                assert_eq!(term.outcome(), Outcome::Cancelled);
+                assert!(list.is_empty());
+                assert!(result.get("outputs_evaluated").is_none());
+                assert!(f.events(f.attempt(), "artifacts_stored").is_empty());
+            }
+            _ => {
+                assert_eq!(term.outcome(), Outcome::Succeeded);
+                assert_eq!(result["outputs_evaluated"], true);
+                if mode == "zero" {
+                    assert!(list.is_empty());
+                } else {
+                    assert_eq!(list.len(), 2);
+                    assert!(list.iter().any(|a| a["name"] == "success"));
+                }
+            }
+        }
+    }
 }

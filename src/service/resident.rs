@@ -1,5 +1,4 @@
-//! Single-owner local runtime with durable captured input acceptance and local delivery.
-//! Remote connection/reconnection ownership remains a separate layer.
+//! Single-owner runtime with durable acceptance and independent local/remote delivery.
 use crate::config::runtime::{WorkerInputs, WorkerTarget};
 use crate::config::ResolvedConfig;
 use crate::coordinator::{Coordinator, TaskSpec};
@@ -7,7 +6,7 @@ use crate::ids::*;
 use crate::platform::wall_ms;
 use crate::protocol::{connect, ClientConfig, Io};
 use crate::results::{CollectConfig, ResultStore};
-use crate::scheduler::UnknownCosts;
+use crate::scheduler::measured::MeasuredCosts;
 use crate::state::{AttemptState, Observation, Receipts, Termination};
 use crate::storage::CoordinatorStore;
 use crate::worker::{agent::Agent, serve::serve_connection};
@@ -23,6 +22,10 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{watch, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
+mod delivery;
+mod input_retention;
+mod remote;
+
 pub const MAX_REQUEST_BYTES: usize = 262_144;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -35,7 +38,7 @@ pub struct Inputs {
 }
 
 /// Private, versioned IPC. Clients capture into the configured private parent stores.
-/// SubmitCaptured forwards that immutable input; legacy Submit accepts prepositioned
+/// SubmitCaptured durably queues that immutable input; legacy Submit accepts prepositioned
 /// local sources only and explicitly refuses secret-bearing tasks.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -48,7 +51,28 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    ResolveToolchains {
+        bundle: crate::toolchain::contract::FrozenBundle,
+        requirements: crate::toolchain::capability::ExecutionRequirements,
+    },
+    Estimate {
+        query: super::estimate::Query,
+    },
+    EstimateTask {
+        task_id: TaskId,
+    },
+    Cancel {
+        target: super::completion::Target,
+        expected_control_revision: u64,
+        request_id: String,
+    },
+    Retry {
+        target: super::completion::Target,
+        expected_control_revision: u64,
+        request_id: String,
+    },
     Ping,
+    Health,
     Submit {
         run_id: RunId,
         source_id: SourceId,
@@ -78,8 +102,31 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
+    ResolvedToolchains {
+        bundle: crate::toolchain::contract::FrozenBundle,
+    },
+    Estimate {
+        estimate: super::estimate::Estimate,
+    },
+    RetryAccepted {
+        receipt: super::completion::RetryReceipt,
+    },
+    Cancelled {
+        snapshot: super::completion::Snapshot,
+    },
+    ControlError {
+        error: crate::error::ApiError,
+    },
     Ready {
         epoch: CoordinatorEpoch,
+    },
+    Health {
+        cluster_id: ClusterId,
+        coordinator_id: CoordinatorId,
+        worker_id: WorkerId,
+        epoch: CoordinatorEpoch,
+        ready: bool,
+        process: super::macos::RunningIdentity,
     },
     Accepted {
         run_id: RunId,
@@ -106,6 +153,25 @@ pub struct Client {
     socket: PathBuf,
     cluster_id: ClusterId,
     owner_token: String,
+}
+impl Operation {
+    fn requires_toolchains(&self) -> bool {
+        match self {
+            Self::ResolveToolchains { .. } => true,
+            Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
+                tasks.iter().any(|(_, spec)| spec.toolchains.is_some())
+            }
+            _ => false,
+        }
+    }
+    fn requires_capabilities(&self) -> bool {
+        match self {
+            Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
+                tasks.iter().any(|(_, spec)| !spec.requirements.is_empty())
+            }
+            _ => false,
+        }
+    }
 }
 impl Client {
     /// Load credentials without taking writable coordinator ownership.
@@ -173,7 +239,13 @@ impl Client {
             IO_TIMEOUT
         };
         let request = Request {
-            schema_version: 1,
+            schema_version: if operation.requires_toolchains() {
+                4
+            } else if operation.requires_capabilities() {
+                3
+            } else {
+                2
+            },
             cluster_id: self.cluster_id.clone(),
             owner_token: self.owner_token.clone(),
             operation,
@@ -184,20 +256,93 @@ impl Client {
 }
 
 struct CapturedInputs {
+    #[cfg(test)]
+    retention_test: input_retention::TestControl,
     transfer: Arc<Mutex<()>>,
     sources: crate::source::SourceStore,
     vault: crate::secrets::vault::Vault,
     key: crate::secrets::key::ClusterKey,
     env: std::collections::BTreeMap<String, String>,
+    parent_state: std::path::PathBuf,
+    local_worker: WorkerId,
+}
+
+impl CapturedInputs {
+    /// Validate the original run binding and retained bundle without capture.
+    fn validate_retry(
+        &self,
+        prepared: &crate::storage::PreparedRetry,
+    ) -> crate::storage::Result<bool> {
+        use crate::storage::StorageError;
+        let run = &prepared.run_id;
+        let id = crate::source::classify::ci_id_of(&prepared.source_id)
+            .ok_or_else(|| StorageError::Invalid("invalid retained source".into()))?;
+        let unavailable =
+            || StorageError::Immutable("retained source unavailable; submit a new run".into());
+        if self
+            .sources
+            .source_of_run(run)
+            .map_err(|_| unavailable())?
+            .as_deref()
+            != Some(&id)
+        {
+            return Err(unavailable());
+        }
+        let manifest = self
+            .sources
+            .manifest(&id)
+            .map_err(|_| unavailable())?
+            .ok_or_else(unavailable)?;
+        for retained in self.sources.closure(&manifest).map_err(|_| unavailable())? {
+            crate::source::store::verify_manifest(&retained).map_err(|_| unavailable())?;
+            for entry in &retained.object_manifest.entries {
+                if !self.sources.has_blob(&entry.hash)
+                    || self.sources.blob_size(&entry.hash) != Some(entry.size)
+                {
+                    return Err(unavailable());
+                }
+            }
+        }
+        let digest = Digest::parse(&manifest.manifest_digest)
+            .or_else(|_| Digest::parse(&format!("sha256:{}", manifest.manifest_digest)))
+            .map_err(|_| unavailable())?;
+        if prepared.manifest_digest != digest {
+            return Err(unavailable());
+        }
+        if prepared.in_place {
+            let b = crate::workspace::in_place::load(
+                &self.parent_state,
+                run,
+                &prepared.source_id,
+                &digest,
+                &self.local_worker,
+            )
+            .map_err(|_| unavailable())?;
+            let paths = manifest
+                .secret_files
+                .iter()
+                .map(|s| s.path.display())
+                .collect::<Vec<_>>();
+            crate::workspace::in_place::read_secrets(&b, &self.env, &paths)
+                .map_err(|_| StorageError::SecretUnavailable)?;
+            return Ok(false);
+        }
+        self.vault
+            .load(run, &manifest.secret_files, &self.key)
+            .map_err(|_| StorageError::SecretUnavailable)?;
+        Ok(!manifest.secret_files.is_empty())
+    }
 }
 
 pub struct Resident {
+    remote_config: Arc<ResolvedConfig>,
     coordinator: Arc<Coordinator>,
     files: Arc<ResultStore>,
     agent: Arc<Agent>,
     sources: crate::source::SourceStore,
     captured: Arc<CapturedInputs>,
     worker_client: crate::protocol::Client,
+    input_gate: Arc<crate::coordinator::InputGate>,
     worker_id: WorkerId,
     listener: UnixListener,
     worker_connection: tokio::task::JoinHandle<()>,
@@ -205,7 +350,45 @@ pub struct Resident {
     heartbeat: Duration,
     collection_interval: Duration,
     collection: CollectConfig,
+    retention_days: u32,
+    state_root: Arc<StateRoot>,
     _token_file: File,
+}
+
+/// The state directory this owner opened at startup. The open handle keeps
+/// its inode from being reused, so device and inode identify it for as long
+/// as the owner runs.
+struct StateRoot {
+    path: PathBuf,
+    dir: File,
+}
+impl StateRoot {
+    fn open(path: &Path) -> io::Result<Self> {
+        let dir = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            dir,
+        })
+    }
+    /// False once the path no longer names the directory opened at startup:
+    /// it was removed, or something else took its name. An owner without its
+    /// directory can reach neither its clients nor its durable work. A read
+    /// that fails for another reason proves nothing and keeps the owner.
+    fn present(&self) -> bool {
+        let Ok(held) = self.dir.metadata() else {
+            return true;
+        };
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(now) => now.dev() == held.dev() && now.ino() == held.ino(),
+            Err(e) => !matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ),
+        }
+    }
 }
 
 struct StartupParts {
@@ -215,22 +398,35 @@ struct StartupParts {
     captured: Arc<CapturedInputs>,
     agent: Arc<Agent>,
     token_file: File,
+    state_root: StateRoot,
     socket: PathBuf,
     token: String,
     worker_id: WorkerId,
     cluster: ClusterId,
     heartbeat: Duration,
+    worker_timeout: Duration,
     collection_interval: Duration,
     collection: CollectConfig,
+    retention_days: u32,
 }
 impl StartupParts {
-    fn prepare(config: ResolvedConfig, inputs: Inputs) -> anyhow::Result<Self> {
+    fn prepare(
+        config: ResolvedConfig,
+        inputs: Inputs,
+        binding: Option<(ClusterId, CoordinatorId)>,
+    ) -> anyhow::Result<Self> {
         private_dir(&inputs.state_dir)?;
         // Refuse symlinked existing state entries before storage follows them.
         reject_symlinks(&inputs.state_dir)?;
+        let state_root = StateRoot::open(&inputs.state_dir)?;
         let settings = config.runtime_settings()?;
-        let store = CoordinatorStore::open(&inputs.state_dir, wall_ms())?;
-        let coordinator = Arc::new(settings.start_coordinator(store, Arc::new(UnknownCosts))?);
+        let store = CoordinatorStore::open_bound(&inputs.state_dir, wall_ms(), binding)?;
+        private_dir(&inputs.state_dir.join("parent"))?;
+        let costs: Arc<dyn crate::scheduler::CostModel> =
+            MeasuredCosts::open(&inputs.state_dir.join("parent/stats"), inputs.collection)
+                .map(|costs| Arc::new(costs) as Arc<dyn crate::scheduler::CostModel>)
+                .unwrap_or_else(|_| Arc::new(crate::scheduler::UnknownCosts));
+        let coordinator = Arc::new(settings.start_coordinator(store, costs)?);
         let files = Arc::new(ResultStore::open(&inputs.state_dir.join("results"))?);
         let ipc = inputs.state_dir.join("parent");
         private_dir(&ipc)?;
@@ -261,14 +457,24 @@ impl StartupParts {
         reject_symlinks(&inputs.worker.state_dir)?;
         let sources = crate::source::SourceStore::open(&inputs.worker.state_dir)?;
         let captured = Arc::new(CapturedInputs {
+            #[cfg(test)]
+            retention_test: input_retention::TestControl::default(),
             transfer: Arc::new(Mutex::new(())),
             sources: crate::source::SourceStore::open(&inputs.state_dir)?,
             vault: crate::secrets::vault::Vault::open(&inputs.state_dir)?,
             key: crate::secrets::key::load(&inputs.worker.cluster_key_path)?,
             env: inputs.worker.env.clone(),
+            parent_state: inputs.state_dir.clone(),
+            local_worker: worker_id.clone(),
         });
+        coordinator.set_parent_local(worker_id.clone());
         let runtime = config.worker_runtime(inputs.worker)?;
-        let agent = runtime.start().map_err(|e| anyhow::anyhow!(e.message))?;
+        let host = runtime
+            .open_host_in_place(inputs.state_dir.clone())
+            .map_err(|e| anyhow::anyhow!(e.message))?;
+        let agent = runtime
+            .start_with_host(host)
+            .map_err(|e| anyhow::anyhow!(e.message))?;
         let cluster = coordinator.store().cluster_id().clone();
         Ok(StartupParts {
             cluster,
@@ -278,12 +484,15 @@ impl StartupParts {
             captured,
             agent,
             token_file,
+            state_root,
             socket,
             token,
             worker_id,
             heartbeat: Duration::from_millis(settings.heartbeat_ms),
+            worker_timeout: Duration::from_millis(settings.coordinator.worker_budget_ms),
             collection_interval: inputs.collection_interval,
             collection: inputs.collection,
+            retention_days: config.retention_days.value,
         })
     }
 }
@@ -319,6 +528,9 @@ async fn connect_local(
     UnixListener,
     tokio::task::JoinHandle<()>,
     crate::protocol::Client,
+    Arc<crate::coordinator::InputGate>,
+    bool,
+    bool,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
@@ -351,22 +563,61 @@ async fn connect_local(
             return Err(e.into());
         }
     };
+    let probe = connected
+        .negotiated
+        .features
+        .iter()
+        .any(|feature| feature == crate::wire::PREPARATION_PROBE_FEATURE);
+    let observations = connected
+        .negotiated
+        .features
+        .iter()
+        .any(|feature| feature == crate::setup::observation_transport::FEATURE);
     let worker_client = connected.client.clone();
-    if let Err(e) = config.attach_worker(
-        &parts.coordinator,
-        WorkerTarget::Local(&parts.worker_id),
-        connected,
-    ) {
+    let provenance = Digest::of_bytes(&serde_json::to_vec(
+        &serde_json::json!({"transport":"local-private-rpc-v1","protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"timeout_ms":parts.worker_timeout.as_millis()}),
+    )?);
+    let input_gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(
+        provenance.to_string(),
+    ));
+    input_gate
+        .observe(
+            connected.worker.worker_boot_id.clone(),
+            connected.worker.agent_epoch,
+        )
+        .await;
+    if let Err(e) = config
+        .attach_worker(
+            &parts.coordinator,
+            WorkerTarget::Local(&parts.worker_id),
+            connected,
+        )
+        .await
+    {
         worker_connection.abort();
         anyhow::bail!(e.message);
     }
-    Ok((listener, worker_connection, worker_client))
+    Ok((
+        listener,
+        worker_connection,
+        worker_client,
+        input_gate,
+        observations,
+        probe,
+    ))
 }
 
 impl Resident {
     /// Take the process lock before starting a new epoch, then construct exactly
     /// one coordinator and one ResultStore. A second owner fails before mutation.
     pub async fn start(config: &ResolvedConfig, inputs: Inputs) -> anyhow::Result<Self> {
+        Self::start_bound(config, inputs, None).await
+    }
+    pub(crate) async fn start_bound(
+        config: &ResolvedConfig,
+        inputs: Inputs,
+        binding: Option<(ClusterId, CoordinatorId)>,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             !inputs.collection_interval.is_zero(),
             "zero collection interval"
@@ -375,27 +626,52 @@ impl Resident {
             config.local_worker.value,
             "local resident requires local worker"
         );
+        let remote_config = Arc::new(remote::snapshot(
+            config,
+            &inputs.worker.env,
+            &inputs.worker.worker_id,
+        )?);
         let config_owned = config.clone();
         let mut startup = tokio::task::spawn_blocking(move || {
-            StartupParts::prepare(config_owned, inputs).map(|parts| Startup { parts: Some(parts) })
+            StartupParts::prepare(config_owned, inputs, binding)
+                .map(|parts| Startup { parts: Some(parts) })
         })
         .await??;
         let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection, worker_client) = match connected {
-            Ok(value) => value,
-            Err(e) => {
-                tokio::task::spawn_blocking(move || startup.cleanup()).await?;
-                return Err(e);
-            }
-        };
+        let (listener, worker_connection, worker_client, input_gate, observations, probe) =
+            match connected {
+                Ok(value) => value,
+                Err(e) => {
+                    tokio::task::spawn_blocking(move || startup.cleanup()).await?;
+                    return Err(e);
+                }
+            };
         let parts = startup.parts.take().expect("prepared startup");
+
+        parts
+            .coordinator
+            .attach(
+                parts.worker_id.clone(),
+                Arc::new(
+                    crate::coordinator::ClientLink::gated(
+                        worker_client.clone(),
+                        parts.worker_timeout,
+                        input_gate.clone(),
+                    )
+                    .with_preparation_observations(observations)
+                    .with_preparation_probe(probe),
+                ),
+            )
+            .await;
         Ok(Self {
+            remote_config,
             coordinator: parts.coordinator,
             files: parts.files,
             agent: parts.agent,
             sources: parts.sources,
             captured: parts.captured,
             worker_client,
+            input_gate,
             worker_id: parts.worker_id,
             listener,
             worker_connection,
@@ -407,6 +683,8 @@ impl Resident {
             heartbeat: parts.heartbeat,
             collection_interval: parts.collection_interval,
             collection: parts.collection,
+            retention_days: parts.retention_days,
+            state_root: Arc::new(parts.state_root),
             _token_file: parts.token_file,
         })
     }
@@ -414,20 +692,36 @@ impl Resident {
         self.client.clone()
     }
 
-    /// Run until owner-authenticated shutdown or fencing. Disconnecting a
-    /// request never cancels accepted work. All work loops have separate clocks.
+    /// Run until owner-authenticated shutdown, fencing, or the loss of the
+    /// state directory (checked on the heartbeat tick; a clean exit).
+    /// Disconnecting a request never cancels accepted work. All work loops
+    /// have separate clocks.
     pub async fn run(mut self) -> anyhow::Result<()> {
         let (stop, rx) = watch::channel(false);
         let mut loops = JoinSet::new();
+        // Connection failures stay inside each owner and never terminate the resident.
+        let mut remotes = JoinSet::new();
+        for worker in self.remote_config.workers.clone() {
+            remotes.spawn(remote::run(
+                self.remote_config.clone(),
+                worker,
+                self.coordinator.clone(),
+                self.captured.clone(),
+                rx.clone(),
+            ));
+        }
         let coordinator = self.coordinator.clone();
         let stop_tick = stop.clone();
         let mut tick_stop = rx.clone();
         let heartbeat = self.heartbeat;
+        let state_root = self.state_root.clone();
+        let tick_root = state_root.clone();
         loops.spawn(async move {
             let mut timer = tokio::time::interval(heartbeat);
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _ = tick_stop.changed() => return Ok::<(), anyhow::Error>(()), _ = timer.tick() => {} }
+                if !tick_root.present() { let _ = stop_tick.send(true); return Ok(()); }
                 if let Err(e) = coordinator.tick().await { let _ = stop_tick.send(true); return Err(e.into()); }
             }
         });
@@ -442,9 +736,52 @@ impl Resident {
             timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! { _ = collect_stop.changed() => return Ok(()), _ = timer.tick() => {} }
-                if let Err(e) = coordinator.collect(&files, collection).await { let _ = stop_collect.send(true); return Err(e.into()); }
+                if let Err(e) = coordinator.collect_stopping(&files, collection, Some(collect_stop.clone())).await { let _ = stop_collect.send(true); return Err(e.into()); }
             }
         });
+        let gc_coordinator = self.coordinator.clone();
+        let gc_files = self.files.clone();
+        let retention_days = self.retention_days;
+        let mut gc_stop = rx.clone();
+        let gc_failure = stop.clone();
+        loops.spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_secs(60));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut cursor = crate::results::retention::Cursor::default();
+            loop {
+                tokio::select! { _ = gc_stop.changed()=>return Ok(()), _=timer.tick()=>{} }
+                if *gc_stop.borrow() {
+                    return Ok(());
+                }
+                let owner = gc_coordinator.clone();
+                let files = gc_files.clone();
+                // Keep owner + exclusive pin alive inside the blocking job and
+                // await its drain before token/process-owner cleanup on shutdown.
+                let (next, result) =
+                    crate::results::retention::owned_blocking(owner, move |owner| {
+                        let result = crate::results::retention::page(
+                            owner.store(),
+                            &files,
+                            &mut cursor,
+                            retention_days,
+                        );
+                        (cursor, result)
+                    })
+                    .await?;
+                cursor = next;
+                if let Err(error) = result {
+                    let _ = gc_failure.send(true);
+                    return Err(error.into());
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+        loops.spawn(input_retention::run(
+            self.coordinator.clone(),
+            self.captured.clone(),
+            self.retention_days,
+            rx.clone(),
+        ));
         let agent = self.agent.clone();
         let mut maintain_stop = rx.clone();
         loops.spawn(async move {
@@ -456,46 +793,22 @@ impl Resident {
                 tokio::task::spawn_blocking(move || agent.supervise()).await?;
             }
         });
-        let coordinator = self.coordinator.clone();
-        let captured = self.captured.clone();
-        let worker_client = self.worker_client.clone();
-        let worker_id = self.worker_id.clone();
-        let mut secret_stop = rx.clone();
-        loops.spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_millis(100));
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut sent = std::collections::BTreeSet::new();
-            let mut next = 0usize;
-            loop {
-                tokio::select! { _ = secret_stop.changed() => return Ok(()), _ = timer.tick() => {} }
-                let owner = coordinator.clone(); let worker = worker_id.clone();
-                let attempts = tokio::task::spawn_blocking(move || owner.store().live_attempts(Some(&worker))).await??;
-                let active: std::collections::BTreeSet<_> = attempts.iter().map(|a| a.record.attempt_id.clone()).collect();
-                sent.retain(|id| active.contains(id));
-                let start = next.min(attempts.len());
-                next = if start.saturating_add(16) >= attempts.len() { 0 } else { start + 16 };
-                for attempt in attempts.into_iter().skip(start).take(16) {
-                    let Some(placement) = attempt.placement else { continue; };
-                    let payload: crate::wire::AttemptPayload = serde_json::from_value(placement.demand["payload"].clone())?;
-                    if !payload.has_secret_bundle || sent.contains(&attempt.record.attempt_id) { continue; }
-                    let capture = captured.clone(); let run = payload.run_id.clone(); let source = payload.source_id.clone();
-                    let bundle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-                        let id = crate::source::classify::ci_id_of(&source).ok_or_else(|| anyhow::anyhow!("invalid source"))?;
-                        let manifest = capture.sources.manifest(&id)?.ok_or_else(|| anyhow::anyhow!("input source unavailable"))?;
-                        Ok(capture.vault.load(&run, &manifest.secret_files, &capture.key)?)
-                    }).await?;
-                    // Missing/tampered bundles never become an empty bundle. The worker's
-                    // secret gate eventually reports SECRET_UNAVAILABLE without running.
-                    let Ok(bundle) = bundle else { continue; };
-                    let delivered = tokio::select! {
-                        _ = secret_stop.changed() => return Ok(()),
-                        result = crate::secrets::send::send_bundle(&worker_client, &bundle,
-                            coordinator.epoch(), &attempt.record.attempt_id, attempt.record.generation, IO_TIMEOUT) => result.is_ok(),
-                    };
-                    if delivered { sent.insert(attempt.record.attempt_id); }
-                }
-            }
-        });
+        loops.spawn(delivery::sources(
+            self.coordinator.clone(),
+            self.captured.clone(),
+            self.worker_client.clone(),
+            self.worker_id.clone(),
+            self.input_gate.clone(),
+            rx.clone(),
+        ));
+        loops.spawn(delivery::secrets(
+            self.coordinator.clone(),
+            self.captured.clone(),
+            self.worker_client.clone(),
+            self.worker_id.clone(),
+            self.input_gate.clone(),
+            rx.clone(),
+        ));
         let permits = Arc::new(Semaphore::new(32));
         // Serializes acceptance with shutdown, not with placement/collection.
         let admission = Arc::new(Mutex::new(false));
@@ -523,11 +836,12 @@ impl Resident {
                     let captured = self.captured.clone();
                     let worker_client = self.worker_client.clone();
                     let client = self.client.clone();
+                    let worker_id = self.worker_id.clone();
                     let stop = stop.clone();
                     let admission = admission.clone();
                     requests.spawn(async move {
                         let _permit = permit;
-                        let _ = handle(stream, coordinator, sources, captured, worker_client, client, admission, stop).await;
+                        let _ = handle(stream, coordinator, sources, captured, worker_client, worker_id, client, admission, stop).await;
                     });
                 }
             }
@@ -550,14 +864,24 @@ impl Resident {
                 }
             }
         }
+        while let Some(result) = remotes.join_next().await {
+            if let Err(e) = result {
+                failure.get_or_insert(e.into());
+            }
+        }
+        let costs = self.coordinator.scheduler().model();
+        // All telemetry producers are drained, outside actor and admission locks.
+        let _ = tokio::task::spawn_blocking(move || costs.drain()).await;
         // No cancellation or terminal write: supervisors keep running, and a
         // restarted owner adopts the same durable attempts.
         let agent = self.agent.clone();
         tokio::task::spawn_blocking(move || agent.shutdown()).await?;
         self.worker_connection.abort();
         match failure {
-            Some(e) => Err(e),
-            None => Ok(()),
+            // Another loop may meet the missing files before the heartbeat
+            // does; without the directory that is the same clean exit.
+            Some(e) if state_root.present() => Err(e),
+            _ => Ok(()),
         }
     }
 }
@@ -565,11 +889,117 @@ impl Drop for Resident {
     fn drop(&mut self) {
         self.worker_connection.abort();
         self.agent.shutdown();
-        // Only this lock-holding owner's private socket is removed.
-        let _ = std::fs::remove_file(&self.client.socket);
+        // Only this lock-holding owner's private socket is removed: when the
+        // directory was replaced, the name belongs to someone else.
+        if self.state_root.present() {
+            let _ = std::fs::remove_file(&self.client.socket);
+        }
     }
 }
 
+/// Admission stays open while input IO runs. A prepared token is rechecked at commit.
+struct RetryCommand {
+    target: super::completion::Target,
+    expected: u64,
+    request_id: String,
+}
+async fn retry_control<F, L>(
+    coordinator: Arc<Coordinator>,
+    admission: Arc<Mutex<bool>>,
+    command: RetryCommand,
+    lease: Arc<L>,
+    mut stop: watch::Receiver<bool>,
+    validate: F,
+) -> anyhow::Result<Reply>
+where
+    F: FnOnce(&crate::storage::PreparedRetry) -> crate::storage::Result<bool> + Send + 'static,
+    L: Send + Sync + 'static,
+{
+    let error_reply = |error: crate::storage::StorageError| Reply::ControlError {
+        error: if matches!(error, crate::storage::StorageError::SecretUnavailable) {
+            crate::error::ApiError::blocked(
+                crate::error::BlockedReason::SecretUnavailable,
+                error.to_string(),
+            )
+        } else {
+            crate::error::ApiError::new(error.code(), error.to_string())
+        },
+    };
+    let stopping_reply = || Reply::ControlError {
+        error: crate::error::ApiError::new(
+            crate::error::ErrorCode::CommunicationUnknown,
+            "resident is stopping",
+        ),
+    };
+    if *stop.borrow() {
+        return Ok(stopping_reply());
+    }
+    let owner = coordinator.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        owner
+            .store()
+            .prepare_retry(command.target, command.expected, command.request_id)
+    })
+    .await?;
+    let prepared = match prepared {
+        Ok(crate::storage::RetryPreparation::Replay(receipt)) => {
+            return Ok(Reply::RetryAccepted { receipt })
+        }
+        Ok(crate::storage::RetryPreparation::Prepared(prepared)) => prepared,
+        Err(error) => return Ok(error_reply(error)),
+    };
+    let input_lease = lease.clone();
+    // This detached work owns only metadata, captured inputs and the input lease.
+    let inputs = coordinator.clone();
+    let preflight = tokio::task::spawn_blocking(move || {
+        let source = inputs.store().source_mutation_guard_foreground();
+        drop(inputs); // Detached input IO retains only its source guard, never owner metadata.
+        let validated =
+            source.and_then(|source| validate(&prepared).map(|secret| (secret, source)));
+        // The lease leaves with the source guard and behind it. When a stopped
+        // caller has dropped the handle, the runtime drops this output in field
+        // order, so the source lock is released before the lease's ownership.
+        (prepared, validated, input_lease)
+    });
+    let (prepared, validated, _input_lease) = tokio::select! {
+        biased;
+        _=stop.wait_for(|stopped| *stopped)=>return Ok(stopping_reply()),
+        result=preflight=>result?,
+    };
+    let (verified_secret, source) = match validated {
+        Ok(secret) => secret,
+        Err(error) => return Ok(error_reply(error)),
+    };
+    let gate = tokio::select! {
+        biased;
+        _=stop.wait_for(|stopped| *stopped)=>return Ok(stopping_reply()),
+        gate=admission.lock()=>gate,
+    };
+    if *gate || coordinator.is_fenced() {
+        return Ok(Reply::ControlError {
+            error: crate::error::ApiError::new(
+                if coordinator.is_fenced() {
+                    crate::error::ErrorCode::StaleEpoch
+                } else {
+                    crate::error::ErrorCode::CommunicationUnknown
+                },
+                "resident is stopping",
+            ),
+        });
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        coordinator
+            .store()
+            .commit_retry_guarded(prepared, verified_secret, wall_ms(), source)
+    })
+    .await?;
+    drop(gate);
+    Ok(match result {
+        Ok(receipt) => Reply::RetryAccepted { receipt },
+        Err(error) => error_reply(error),
+    })
+}
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: UnixStream,
@@ -577,13 +1007,16 @@ async fn handle(
     sources: crate::source::SourceStore,
     captured: Arc<CapturedInputs>,
     worker_client: crate::protocol::Client,
+    worker_id: WorkerId,
     client: Client,
     admission: Arc<Mutex<bool>>,
     stop: watch::Sender<bool>,
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
-        request.schema_version == 1
+        matches!(request.schema_version, 2..=4)
+            && (request.schema_version >= 3 || !request.operation.requires_capabilities())
+            && (request.schema_version >= 4 || !request.operation.requires_toolchains())
             && request.cluster_id == client.cluster_id
             && request.owner_token == client.owner_token,
         "unauthorized parent request"
@@ -612,13 +1045,151 @@ async fn handle(
         .await?;
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
+    if let Operation::EstimateTask { task_id } = request.operation {
+        let reply = match coordinator.estimate_task(task_id).await {
+            Ok(estimate) => Reply::Estimate { estimate },
+            Err(error) => Reply::ControlError { error },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
+    if let Operation::Estimate { query } = request.operation {
+        let reply = match coordinator.estimate(query).await {
+            Ok(estimate) => Reply::Estimate { estimate },
+            Err(error) => Reply::ControlError { error },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
+    if let Operation::ResolveToolchains {
+        bundle,
+        requirements,
+    } = request.operation
+    {
+        // No admission lock or writable SQLite scope is held during remote IO.
+        let mut stopping = stop.subscribe();
+        let reply = tokio::select! {
+            _ = stopping.changed() => Reply::Stopping,
+            result = coordinator.resolve_toolchains(bundle, requirements) => match result {
+                Ok(bundle) if !*stop.borrow() && !coordinator.is_fenced() => Reply::ResolvedToolchains { bundle },
+                Ok(_) => Reply::Stopping,
+                Err(error) => Reply::ControlError { error },
+            }
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     let mut gate = admission.lock().await;
     let reply = if *gate || coordinator.is_fenced() {
-        Reply::Error {
-            message: "resident is stopping".into(),
+        if matches!(
+            &request.operation,
+            Operation::Cancel { .. } | Operation::Retry { .. }
+        ) {
+            Reply::ControlError {
+                error: crate::error::ApiError::new(
+                    if coordinator.is_fenced() {
+                        crate::error::ErrorCode::StaleEpoch
+                    } else {
+                        crate::error::ErrorCode::CommunicationUnknown
+                    },
+                    "resident is stopping",
+                ),
+            }
+        } else {
+            Reply::Error {
+                message: "resident is stopping".into(),
+            }
         }
     } else {
         match request.operation {
+            Operation::Retry {
+                target,
+                expected_control_revision,
+                request_id,
+            } => {
+                drop(gate);
+                let mut stopping = stop.subscribe();
+                let retained = async {
+                    let ownership = tokio::select! {
+                        biased;
+                        _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
+                        ownership=captured.transfer.clone().lock_owned()=>ownership,
+                    };
+                    super::forward::foreground_lease(&captured.sources, &mut stopping, ownership).await
+                }.await;
+                let lease = match retained {
+                    Ok(lease) => lease,
+                    Err(error) => {
+                        return write_message(
+                            &mut stream,
+                            &Reply::ControlError {
+                                error: if error.is::<crate::source::retention::ForegroundBusy>() {
+                                    crate::source::classify::api_error_of(&error)
+                                } else {
+                                    crate::error::ApiError::new(
+                                        crate::error::ErrorCode::CommunicationUnknown,
+                                        error.to_string(),
+                                    )
+                                },
+                            },
+                        )
+                        .await
+                        .map_err(Into::into)
+                    }
+                };
+                let answer = retry_control(
+                    coordinator,
+                    admission,
+                    RetryCommand {
+                        target,
+                        expected: expected_control_revision,
+                        request_id,
+                    },
+                    lease,
+                    stopping,
+                    move |prepared| captured.validate_retry(prepared),
+                )
+                .await?;
+                return write_message(&mut stream, &answer)
+                    .await
+                    .map_err(Into::into);
+            }
+            Operation::Cancel {
+                target,
+                expected_control_revision,
+                request_id,
+            } => {
+                let clear_target = target.clone();
+                let owner = coordinator.clone();
+                match tokio::task::spawn_blocking(move || {
+                    owner.store().cancel_control(
+                        target,
+                        expected_control_revision,
+                        request_id,
+                        wall_ms(),
+                    )
+                })
+                .await?
+                {
+                    Ok(snapshot) => {
+                        coordinator.clear_prefetch(&clear_target);
+                        Reply::Cancelled { snapshot }
+                    }
+                    Err(error) => Reply::ControlError {
+                        error: crate::error::ApiError::new(error.code(), error.to_string()),
+                    },
+                }
+            }
+            Operation::Health => match super::macos::RunningIdentity::observe(std::process::id()) {
+                Ok(process) => Reply::Health {
+                    cluster_id: coordinator.store().cluster_id().clone(),
+                    coordinator_id: coordinator.store().coordinator_id().clone(),
+                    worker_id,
+                    epoch: coordinator.epoch(),
+                    ready: worker_client.ping(Duration::from_secs(1)).await.is_ok(),
+                    process,
+                },
+                Err(_) => Reply::Error {
+                    message: "resident process identity unknown".into(),
+                },
+            },
             Operation::Ping => Reply::Ready {
                 epoch: coordinator.store().epoch(),
             },
@@ -627,7 +1198,8 @@ async fn handle(
                 source_id,
                 tasks,
             } => {
-                if tasks.is_empty() || tasks.len() > 64 {
+                drop(gate);
+                let answer = if tasks.is_empty() || tasks.len() > 64 {
                     Reply::Error {
                         message: "submit requires 1..64 tasks".into(),
                     }
@@ -650,54 +1222,90 @@ async fn handle(
                         .map_err(Into::into);
                     }
                     let owner = coordinator.clone();
-                    let checked = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                        let ci = crate::source::classify::ci_id_of(&source)
-                            .ok_or_else(|| anyhow::anyhow!("source is not a captured source"))?;
-                        let manifest = sources.manifest(&ci)?.ok_or_else(|| {
-                            anyhow::anyhow!("source has not reached the local worker")
-                        })?;
-                        crate::source::store::verify_manifest(&manifest)?;
-                        let digest = Digest::parse(&manifest.manifest_digest).or_else(|_| {
-                            Digest::parse(&format!("sha256:{}", manifest.manifest_digest))
-                        })?;
-                        anyhow::ensure!(digest == expected, "source manifest digest mismatch");
-                        owner
-                            .store()
-                            .put_source_ref(&source, &expected, wall_ms())?;
-                        Ok(())
-                    })
+                    let checked = tokio::task::spawn_blocking(
+                        move || -> anyhow::Result<crate::source::retention::Guard> {
+                            let mutation = owner.store().source_mutation_guard_foreground()?;
+                            let ci =
+                                crate::source::classify::ci_id_of(&source).ok_or_else(|| {
+                                    anyhow::anyhow!("source is not a captured source")
+                                })?;
+                            let manifest = sources.manifest(&ci)?.ok_or_else(|| {
+                                anyhow::anyhow!("source has not reached the local worker")
+                            })?;
+                            crate::source::store::verify_manifest(&manifest)?;
+                            let digest =
+                                Digest::parse(&manifest.manifest_digest).or_else(|_| {
+                                    Digest::parse(&format!("sha256:{}", manifest.manifest_digest))
+                                })?;
+                            anyhow::ensure!(digest == expected, "source manifest digest mismatch");
+                            owner
+                                .store()
+                                .put_source_ref(&source, &expected, wall_ms())?;
+                            Ok(mutation)
+                        },
+                    )
                     .await?;
-                    if let Err(e) = checked {
-                        return write_message(
-                            &mut stream,
-                            &Reply::Error {
-                                message: e.to_string(),
-                            },
-                        )
+                    let source_guard = match checked {
+                        Ok(guard) => guard,
+                        Err(e)
+                            if e.downcast_ref::<crate::storage::StorageError>()
+                                .is_some_and(|e| {
+                                    matches!(e, crate::storage::StorageError::SourceBusy)
+                                }) =>
+                        {
+                            return write_message(
+                                &mut stream,
+                                &Reply::ControlError {
+                                    error: crate::error::ApiError::new(
+                                        crate::error::ErrorCode::SourceBusy,
+                                        "captured inputs are temporarily busy",
+                                    ),
+                                },
+                            )
+                            .await
+                            .map_err(Into::into);
+                        }
+                        Err(e) => {
+                            return write_message(
+                                &mut stream,
+                                &Reply::Error {
+                                    message: e.to_string(),
+                                },
+                            )
+                            .await
+                            .map_err(Into::into);
+                        }
+                    };
+                    let gate = admission.lock().await;
+                    anyhow::ensure!(!*gate && !coordinator.is_fenced(), "resident is stopping");
+                    match coordinator
+                        .enqueue_guarded(run_id.clone(), source_id, tasks, source_guard)
                         .await
-                        .map_err(Into::into);
-                    }
-                    match coordinator.enqueue(run_id.clone(), source_id, tasks).await {
+                    {
                         Ok(()) => Reply::Accepted { run_id },
                         Err(e) => Reply::Error {
                             message: e.to_string(),
                         },
                     }
-                }
+                };
+                return write_message(&mut stream, &answer)
+                    .await
+                    .map_err(Into::into);
             }
             Operation::SubmitCaptured {
                 run_id,
                 source_id,
                 tasks,
             } => {
-                // Transfer can be slow; admission/shutdown and other RPCs stay responsive.
+                // Capture validation runs outside admission; delivery is a background job.
                 drop(gate);
                 let source = source_id.clone();
                 let run = run_id.clone();
                 let capture = captured.clone();
                 let mut stopping = stop.subscribe();
-                let checked =
-                    tokio::task::spawn_blocking(move || -> anyhow::Result<(Digest, bool)> {
+                let checked = tokio::task::spawn_blocking(
+                    move || -> anyhow::Result<(Digest, bool, crate::source::retention::Guard)> {
+                        let mutation = capture.sources.foreground_guard()?;
                         let id = crate::source::classify::ci_id_of(&source)
                             .ok_or_else(|| anyhow::anyhow!("invalid source"))?;
                         anyhow::ensure!(
@@ -717,10 +1325,12 @@ async fn handle(
                                 Digest::parse(&format!("sha256:{}", manifest.manifest_digest))
                             })?,
                             !manifest.secret_files.is_empty(),
+                            mutation,
                         ))
-                    });
+                    },
+                );
                 let result = async {
-                    let (digest, has_secrets) = tokio::select! {
+                    let (digest, has_secrets, source_guard) = tokio::select! {
                         biased;
                         _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
                         checked=checked=>checked??,
@@ -731,27 +1341,9 @@ async fn handle(
                     );
                     anyhow::ensure!(
                         tasks.iter().all(|(_, task)| task.manifest_digest == digest
-                            && task.has_secret_bundle == has_secrets),
+                            && task.has_secret_bundle == (has_secrets && !task.in_place)),
                         "source digest mismatch"
                     );
-                    let transfer=tokio::select! {
-                        biased;
-                        _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
-                        transfer=captured.transfer.clone().lock_owned()=>transfer,
-                    };
-                    let source=source_id.clone(); let store=captured.sources.clone();
-                    let env=captured.env.clone(); let worker=worker_client.clone();
-                    let epoch=coordinator.epoch(); let transfer_stop=stopping.clone();
-                    // A detached transfer owns only source IO and its locks. It drains any
-                    // current blocking operation before cleanup, never coordinator ownership.
-                    let forwarding=tokio::spawn(async move {
-                        super::forward::source(&worker,epoch,store,&source,env,transfer_stop,transfer).await
-                    });
-                    tokio::select! {
-                        biased;
-                        _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
-                        forwarded=forwarding=>forwarded??,
-                    }
                     let guard = admission.lock().await;
                     anyhow::ensure!(!*guard && !coordinator.is_fenced(), "resident is stopping");
                     let owner = coordinator.clone();
@@ -761,13 +1353,18 @@ async fn handle(
                     })
                     .await??;
                     coordinator
-                        .enqueue(run_id.clone(), source_id, tasks)
+                        .enqueue_guarded(run_id.clone(), source_id, tasks, source_guard)
                         .await?;
                     Ok::<_, anyhow::Error>(())
                 }
                 .await;
                 let answer = match result {
                     Ok(()) => Reply::Accepted { run_id },
+                    Err(e) if e.is::<crate::source::retention::ForegroundBusy>() => {
+                        Reply::ControlError {
+                            error: crate::source::classify::api_error_of(&e),
+                        }
+                    }
                     Err(e) => Reply::Error {
                         message: e.to_string(),
                     },
@@ -800,7 +1397,12 @@ async fn handle(
                     },
                 }
             }
-            Operation::Query { .. } => unreachable!("query handled before admission"),
+            Operation::Query { .. }
+            | Operation::Estimate { .. }
+            | Operation::EstimateTask { .. }
+            | Operation::ResolveToolchains { .. } => {
+                unreachable!("read handled before admission")
+            }
             Operation::Shutdown => {
                 *gate = true;
                 let _ = stop.send(true);
@@ -866,7 +1468,7 @@ pub(super) fn private_dir(path: &Path) -> io::Result<()> {
         Err(e) => Err(e),
     }
 }
-pub(super) fn validate_components(path: &Path) -> io::Result<()> {
+pub(crate) fn validate_components(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,

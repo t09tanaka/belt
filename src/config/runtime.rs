@@ -35,12 +35,36 @@ pub enum WorkerTarget<'a> {
 impl ResolvedConfig {
     /// Only a completed protocol handshake can enter this construction path.
     /// Identity mismatches leave both the scheduler and attached links untouched.
-    pub fn attach_worker(
+    pub async fn attach_worker(
         &self,
         coordinator: &Coordinator,
         target: WorkerTarget<'_>,
         connected: Connected,
     ) -> Result<(), ApiError> {
+        self.attach_worker_link(coordinator, target, connected, None)
+            .await
+            .map(|_| ())
+    }
+
+    /// Verify and install a source-gated session in one placement-fenced operation.
+    pub async fn attach_gated_worker(
+        &self,
+        coordinator: &Coordinator,
+        target: WorkerTarget<'_>,
+        connected: Connected,
+        gate: Arc<crate::coordinator::InputGate>,
+    ) -> Result<Arc<dyn crate::coordinator::WorkerLink>, ApiError> {
+        self.attach_worker_link(coordinator, target, connected, Some(gate))
+            .await
+    }
+
+    async fn attach_worker_link(
+        &self,
+        coordinator: &Coordinator,
+        target: WorkerTarget<'_>,
+        connected: Connected,
+        gate: Option<Arc<crate::coordinator::InputGate>>,
+    ) -> Result<Arc<dyn crate::coordinator::WorkerLink>, ApiError> {
         let invalid = |message| ApiError::new(ErrorCode::InvalidInput, message);
         let settings = self
             .runtime_settings()
@@ -73,14 +97,27 @@ impl ResolvedConfig {
             }
         };
         coordinator.scheduler().set_priority(id, priority);
-        coordinator.attach(
-            id.clone(),
-            Arc::new(ClientLink::new(
-                connected.client,
-                Duration::from_millis(settings.coordinator.worker_budget_ms),
-            )),
+        let timeout = Duration::from_millis(settings.coordinator.worker_budget_ms);
+        let probe = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|feature| feature == crate::wire::PREPARATION_PROBE_FEATURE);
+        let observations = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|feature| feature == crate::setup::observation_transport::FEATURE);
+        let link: Arc<dyn crate::coordinator::WorkerLink> = Arc::new(
+            (match gate {
+                Some(gate) => ClientLink::gated(connected.client, timeout, gate),
+                None => ClientLink::new(connected.client, timeout),
+            })
+            .with_preparation_observations(observations)
+            .with_preparation_probe(probe),
         );
-        Ok(())
+        coordinator.attach(id.clone(), link.clone()).await;
+        Ok(link)
     }
 }
 
@@ -121,14 +158,18 @@ impl ResolvedConfig {
         agent.term_grace_ms = settings.term_grace_ms;
         agent.log_limit_bytes = settings.log_limit_bytes;
         agent.retention_ms = settings.retention_ms;
-        agent.profile = self
-            .profile
-            .value
-            .clone()
-            .unwrap_or_else(|| "default".into());
+        let profile = crate::toolchain::profile::Profile::load(&inputs.state_dir, &inputs.env)
+            .map_err(|e| super::ConfigError::Invalid { problems: vec![e] })?;
+        agent.profile = profile.name().into();
+        agent.profile_fingerprint = profile.startup_report().profile_fingerprint;
+        let profile_definition = profile.definition_digest().clone();
+        let env = profile.environment().clone();
+        agent.capability_profile = Some(Arc::new(profile));
         let mut setup = SetupConfig::new(inputs.state_dir, inputs.worker_id, inputs.supervisor_exe);
-        setup.env = inputs.env.clone();
-        setup.profile = agent.profile.clone();
+        setup.env = env.clone();
+        setup.profile_definition = Some(profile_definition);
+        setup.profile_fingerprint = Some(agent.profile_fingerprint.clone());
+        setup.profile = format!("{}:{}", agent.profile, agent.profile_fingerprint);
         setup.traffic_state_dir = agent.traffic_state_dir.clone();
         setup.traffic_config = agent.traffic_config.clone();
         setup.lease_ms = settings.coordinator.lease_ms;
@@ -140,7 +181,7 @@ impl ResolvedConfig {
         Ok(WorkerRuntime {
             agent,
             setup,
-            env: inputs.env,
+            env,
             cluster_key_path: inputs.cluster_key_path,
         })
     }
@@ -164,8 +205,31 @@ impl WorkerRuntime {
         .map(Arc::new)
     }
 
+    pub(crate) fn open_host_in_place(
+        &self,
+        parent_state: PathBuf,
+    ) -> Result<Arc<Machine>, ApiError> {
+        Machine::open(
+            &self.agent.state_dir,
+            self.env.clone(),
+            self.cluster_key_path.clone(),
+        )
+        .and_then(|machine| machine.with_setup(self.setup.clone()))
+        .map(|machine| Arc::new(machine.with_in_place(parent_state, self.agent.worker_id.clone())))
+    }
+    pub(crate) fn start_with_host(self, host: Arc<Machine>) -> Result<Arc<Agent>, ApiError> {
+        Agent::start(self.agent, host)
+    }
+
     pub fn start(self) -> Result<Arc<Agent>, ApiError> {
         let host = self.open_host()?;
         Agent::start(self.agent, host)
+    }
+
+    /// Keep the enrollment gate continuously held through host preflight and DB open.
+    pub(crate) fn start_owned(self, file: std::fs::File) -> Result<Arc<Agent>, ApiError> {
+        let owner = crate::worker::agent::OwnedAgentLock::new(self.agent.clone(), file)?;
+        let host = self.open_host()?;
+        Agent::start_owned(owner, host)
     }
 }

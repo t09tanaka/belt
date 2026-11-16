@@ -23,10 +23,16 @@
 //! completion belongs to the scheduler.
 
 mod collect;
+mod estimate;
+mod input_gate;
 mod link;
 pub mod policy;
+mod prefetch;
+mod preparation;
+mod preparation_identity;
 
-pub use link::{ClientLink, LinkError, WorkerLink};
+pub use input_gate::{PlacementInputs, ReadyInput};
+pub use link::{ClientLink, InputGate, LinkError, WorkerLink};
 
 use crate::error::{ApiError, ConflictReason, ErrorCode};
 use crate::ids::{
@@ -92,6 +98,16 @@ type Result<T, E = CoordinatorError> = std::result::Result<T, E>;
 /// from this by [`build_payload`] and nowhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchains: Option<crate::toolchain::contract::FrozenBundle>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::toolchain::capability::ExecutionRequirements::is_empty"
+    )]
+    pub requirements: crate::toolchain::capability::ExecutionRequirements,
+    /// Mutable local workspace; source is a comparison baseline only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_place: bool,
     #[serde(default)]
     pub setup: Option<crate::wire::SetupSpec>,
     pub plan_digest: PlanDigest,
@@ -109,6 +125,8 @@ pub struct TaskSpec {
     /// then not written, like in the payload).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactDecl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<crate::wire::OutputDecl>,
 }
 
 /// The one place an [`AttemptPayload`] is made.
@@ -122,6 +140,9 @@ pub fn build_payload(
         .clone()
         .ok_or_else(|| StorageError::Invalid(format!("run {} has no source", input.run_id)))?;
     Ok(AttemptPayload {
+        toolchains: spec.toolchains.clone().map(Box::new),
+        requirements: spec.requirements.clone(),
+        in_place: spec.in_place,
         setup: spec.setup.clone(),
         run_id: input.run_id.clone(),
         task_id: input.task_id.clone(),
@@ -137,6 +158,7 @@ pub fn build_payload(
         resource_wait_timeout_ms: spec.resource_wait_timeout_ms,
         has_secret_bundle: spec.has_secret_bundle,
         artifacts: spec.artifacts.clone(),
+        outputs: spec.outputs.clone(),
     })
 }
 
@@ -192,8 +214,10 @@ impl TickReport {
 
 /// A worker that answered `inspect` in this tick.
 struct Reached {
+    capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     worker_id: WorkerId,
     link: Arc<dyn WorkerLink>,
+    attachment: Arc<dyn WorkerLink>,
     limits: Limits,
     draining: bool,
     /// Who answered: a forecast from another boot or agent is not used.
@@ -283,12 +307,22 @@ pub struct Coordinator {
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
+    parent_local: Mutex<Option<WorkerId>>,
+    preparation_identities: Mutex<BTreeMap<WorkerId, preparation_identity::IdentityContext>>,
+    preparation_query: tokio::sync::Mutex<()>,
+    preparation_cursors: Mutex<BTreeMap<WorkerId, preparation::CursorState>>,
     actor: tokio::sync::Mutex<()>,
     /// One pass of result collection at a time.
-    collecting: tokio::sync::Mutex<()>,
+    collecting: Arc<tokio::sync::Mutex<()>>,
     /// The collections that wait before they are tried again.
     collect_waits: Arc<crate::results::collect::Waits>,
+    cost_tails: Arc<scheduler::measured::Tails>,
+    live_log_waits: Arc<crate::results::collect::Waits>,
+    live_worker_cursor: std::sync::Mutex<Option<WorkerId>>,
+    live_log_cursors: std::sync::Mutex<std::collections::BTreeMap<WorkerId, crate::ids::AttemptId>>,
     lease_seq: AtomicU64,
+    input_cursor: Mutex<Option<crate::storage::InputCursor>>,
+    placement_fence: Arc<tokio::sync::Mutex<()>>,
     fenced: AtomicBool,
     /// The queued tasks no payload could be made for, as this process
     /// already recorded.
@@ -327,10 +361,20 @@ impl Coordinator {
             store: Arc::new(store),
             cfg,
             workers: Mutex::default(),
+            parent_local: Mutex::default(),
+            preparation_identities: Mutex::default(),
+            preparation_query: tokio::sync::Mutex::new(()),
+            preparation_cursors: Mutex::default(),
             actor: tokio::sync::Mutex::new(()),
-            collecting: tokio::sync::Mutex::new(()),
+            collecting: Arc::new(tokio::sync::Mutex::new(())),
             collect_waits: Arc::default(),
+            cost_tails: Arc::default(),
+            live_log_waits: Arc::default(),
+            live_worker_cursor: std::sync::Mutex::default(),
+            live_log_cursors: std::sync::Mutex::default(),
             lease_seq: AtomicU64::new(0),
+            input_cursor: Mutex::default(),
+            placement_fence: Arc::default(),
             fenced: AtomicBool::new(false),
             unplaceable: Mutex::default(),
             sched,
@@ -379,18 +423,105 @@ impl Coordinator {
         }
     }
 
-    /// A worker is reachable through `link` from now on (its `hello` was
-    /// checked by whoever connected). Replaces an earlier link. The next
-    /// placement decision counts it in, also within a running tick.
-    pub fn attach(&self, worker_id: WorkerId, link: Arc<dyn WorkerLink>) {
-        let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
-        workers.insert(worker_id, link);
+    /// Bounded, authenticated metadata calls outside actor/admission/SQLite ownership.
+    pub async fn resolve_toolchains(
+        &self,
+        bundle: crate::toolchain::contract::FrozenBundle,
+        requirements: crate::toolchain::capability::ExecutionRequirements,
+    ) -> std::result::Result<crate::toolchain::contract::FrozenBundle, crate::error::ApiError> {
+        let mut workers: Vec<_> = self
+            .workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(id, link)| (id.clone(), link.clone()))
+            .collect();
+        workers.sort_by(|a, b| {
+            self.sched
+                .priority_of(&b.0)
+                .cmp(&self.sched.priority_of(&a.0))
+                .then(a.0.cmp(&b.0))
+        });
+        let budget = std::time::Duration::from_millis(self.cfg.worker_budget_ms);
+        let epoch = self.epoch();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(4);
+        let source = bundle.frozen.source_manifest.clone();
+        for (_, link) in workers.into_iter().take(32) {
+            if self.is_fenced() {
+                break;
+            }
+            let request =
+                crate::wire::Request::ResolveToolchains(crate::wire::ResolveToolchainsRequest {
+                    schema_version: crate::wire::SchemaVersion::CURRENT,
+                    request_id: crate::ids::RequestId::generate(),
+                    bundle: bundle.clone(),
+                    requirements: requirements.clone(),
+                });
+            if let Ok(Ok(crate::wire::Response::ResolveToolchains(response))) =
+                tokio::time::timeout(
+                    budget.min(deadline.saturating_duration_since(tokio::time::Instant::now())),
+                    link.read_only_call(request),
+                )
+                .await
+            {
+                if self.is_fenced() || self.epoch() != epoch {
+                    break;
+                }
+                let proposed = response.bundle;
+                let mut original = proposed.frozen.clone();
+                original.selections = bundle.frozen.selections.clone();
+                if original != bundle.frozen
+                    || bundle
+                        .evidence
+                        .iter()
+                        .any(|e| !proposed.evidence.contains(e))
+                    || proposed.validate(&source).is_err()
+                {
+                    continue;
+                }
+                return Ok(proposed);
+            }
+        }
+        Err(crate::error::ApiError::blocked(
+            crate::error::BlockedReason::EnvironmentMismatch,
+            "toolchain resolve required: no coherent worker proposal",
+        ))
+    }
+
+    pub fn set_parent_local(&self, worker: WorkerId) {
+        *self.parent_local.lock().unwrap_or_else(|e| e.into_inner()) = Some(worker);
+    }
+
+    /// Install a verified connection. Replacement is linearized with placement
+    /// commits, without holding up forecasts or blocking the async executor.
+    pub async fn attach(&self, worker_id: WorkerId, link: Arc<dyn WorkerLink>) {
+        let _commit = self.placement_fence.lock().await;
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worker_id, link);
+    }
+
+    /// Nonblocking attachment for synchronous construction and cost callbacks.
+    /// Busy means no connection was installed; callers must handle the result.
+    pub fn try_attach(
+        &self,
+        worker_id: WorkerId,
+        link: Arc<dyn WorkerLink>,
+    ) -> std::result::Result<(), tokio::sync::TryLockError> {
+        let _commit = self.placement_fence.try_lock()?;
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(worker_id, link);
+        Ok(())
     }
 
     /// The link is gone. The worker's attempts are `unknown` from here on;
     /// they are kept, and followed again when it is attached again.
     pub async fn detach(&self, worker_id: &WorkerId) -> Result<()> {
         {
+            let _commit = self.placement_fence.lock().await;
             let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
             workers.remove(worker_id);
         }
@@ -404,6 +535,34 @@ impl Coordinator {
         Ok(())
     }
 
+    /// Disconnect only the installed session. Late cleanup must never remove
+    /// a replacement connection or mark its observations unknown.
+    pub async fn detach_link(
+        &self,
+        worker_id: &WorkerId,
+        expected: &Arc<dyn WorkerLink>,
+    ) -> Result<bool> {
+        let _actor = self.actor.lock().await;
+        let _commit = self.placement_fence.lock().await;
+        {
+            let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            if !workers
+                .get(worker_id)
+                .is_some_and(|link| Arc::ptr_eq(link, expected))
+            {
+                return Ok(false);
+            }
+            workers.remove(worker_id);
+        }
+        let w = worker_id.clone();
+        let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
+        for l in live {
+            self.observe(&l.record.attempt_id, Observation::Unknown)
+                .await?;
+        }
+        Ok(true)
+    }
+
     /// Accept a run and its tasks durably (`coordinator accepted`).
     pub async fn enqueue(
         &self,
@@ -411,9 +570,27 @@ impl Coordinator {
         source_id: SourceId,
         tasks: Vec<(TaskId, TaskSpec)>,
     ) -> Result<()> {
+        let owner = self.store.clone();
+        let source = tokio::task::spawn_blocking(move || owner.source_mutation_guard_foreground())
+            .await
+            .map_err(|e| CoordinatorError::Invalid(e.to_string()))??;
+        self.enqueue_guarded(run_id, source_id, tasks, source).await
+    }
+    pub(crate) async fn enqueue_guarded(
+        &self,
+        run_id: RunId,
+        source_id: SourceId,
+        tasks: Vec<(TaskId, TaskSpec)>,
+        source: crate::source::retention::Guard,
+    ) -> Result<()> {
         self.check_fenced()?;
         let mut specs = Vec::with_capacity(tasks.len());
         for (task, spec) in tasks {
+            if let Some(bundle) = &spec.toolchains {
+                bundle
+                    .validate(&spec.manifest_digest)
+                    .map_err(|e| CoordinatorError::Invalid(e.into()))?;
+            }
             if spec.commands.is_empty() {
                 return Err(CoordinatorError::Invalid(format!(
                     "task {task} has no command"
@@ -424,16 +601,46 @@ impl Coordinator {
             check_spec(&run_id, &source_id, &task, &value, self.cfg.lease_ms)?;
             specs.push((task, value));
         }
-        self.db(move |s| s.enqueue(&run_id, Some(&source_id), &json!({}), &specs, wall_ms()))
-            .await
+        self.db(move |s| {
+            s.enqueue_guarded(
+                &run_id,
+                Some(&source_id),
+                &json!({}),
+                &specs,
+                wall_ms(),
+                source,
+            )
+        })
+        .await
     }
 
+    pub(crate) fn clear_prefetch(&self, target: &crate::service::completion::Target) {
+        let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+        for link in workers.values() {
+            match target {
+                crate::service::completion::Target::Task(task) => {
+                    link.clear_preference(Some(task), None)
+                }
+                crate::service::completion::Target::Run(run) => {
+                    link.clear_preference(None, Some(run))
+                }
+            }
+        }
+    }
     /// Cancel a task: durable before anything is sent. A queued task is
     /// never placed; a placed one gets the cancel on the next tick, and on
     /// every later one until its worker answered.
     pub async fn cancel_task(&self, task_id: &TaskId) -> Result<Option<AttemptRecord>> {
+        self.check_fenced()?;
+        self.clear_prefetch(&crate::service::completion::Target::Task(task_id.clone()));
         let task = task_id.clone();
         self.db(move |s| s.cancel_task(&task, wall_ms())).await
+    }
+
+    pub async fn cancel_run(&self, run_id: RunId) -> Result<()> {
+        self.check_fenced()?;
+        self.clear_prefetch(&crate::service::completion::Target::Run(run_id.clone()));
+        self.db(move |s| s.cancel_run(&run_id, wall_ms())).await
     }
 
     /// Ask for an attempt to be taken off its worker so that its task can be
@@ -450,8 +657,9 @@ impl Coordinator {
     /// then place queued tasks. Fails only for a storage fault or when this
     /// coordinator was fenced; a worker that does not answer is not an error.
     pub async fn tick(&self) -> Result<TickReport> {
-        let _actor = self.actor.lock().await;
+        let actor = self.actor.lock().await;
         self.check_fenced()?;
+        let telemetry = Mutex::new(Vec::new());
         let mut report = TickReport::default();
         let attached: Vec<(WorkerId, Arc<dyn WorkerLink>)> = {
             let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
@@ -465,7 +673,7 @@ impl Coordinator {
         let follows: Vec<Pin<Box<dyn Future<Output = Followed> + Send + '_>>> = attached
             .into_iter()
             .map(|(worker_id, link)| {
-                Box::pin(self.follow(worker_id, link, deadline))
+                Box::pin(self.follow(worker_id, link, deadline, &telemetry))
                     as Pin<Box<dyn Future<Output = Followed> + Send + '_>>
             })
             .collect();
@@ -484,7 +692,11 @@ impl Coordinator {
         if let Some(e) = failed {
             return Err(e);
         }
-        self.dispatch(known, reached, &mut report).await?;
+        let result = self.dispatch(known, reached, &mut report, &telemetry).await;
+        drop(actor);
+        // Conversion and the best-effort writer queue never run under the actor.
+        self.ingest_preparation(telemetry.into_inner().unwrap_or_else(|e| e.into_inner()));
+        result?;
         Ok(report)
     }
 
@@ -499,13 +711,50 @@ impl Coordinator {
         worker_id: WorkerId,
         link: Arc<dyn WorkerLink>,
         deadline: Instant,
+        telemetry: &Mutex<Vec<preparation::RawPage>>,
     ) -> Followed {
         let budgeted = Budgeted {
             inner: Arc::clone(&link),
             deadline,
         };
         let mut report = TickReport::default();
-        let inspected = self.inspect(&worker_id, &budgeted).await;
+        let inputs = link.placement_inputs();
+        let requested = self.preparation_request(&worker_id, &link, inputs.as_ref());
+        let sent_boot = crate::platform::boot_id();
+        let sent = crate::platform::monotonic_ms();
+        let mut inspected = self.inspect(&worker_id, &budgeted, requested.clone()).await;
+        let received = crate::platform::monotonic_ms();
+        let received_boot = crate::platform::boot_id();
+        if let (Some(response), Some(inputs), Some(requested), Some(transport), Some(sent_boot)) = (
+            inspected.as_mut(),
+            inputs,
+            requested,
+            link.cost_transport(),
+            sent_boot,
+        ) {
+            if received_boot.as_deref() == Some(sent_boot.as_str())
+                && response.schema_version == SchemaVersion::CURRENT
+            {
+                if let Some(page) = response.preparation_observations.take() {
+                    let mut pending = telemetry.lock().unwrap_or_else(|e| e.into_inner());
+                    if pending.len() < 32 {
+                        pending.push(preparation::RawPage {
+                            worker: worker_id.clone(),
+                            link: link.clone(),
+                            inputs,
+                            transport,
+                            request: requested,
+                            response_boot: response.worker_boot_id.clone(),
+                            response_epoch: response.agent_epoch,
+                            page,
+                            parent_boot: sent_boot,
+                            sent,
+                            received,
+                        });
+                    }
+                }
+            }
+        }
         let w = worker_id.clone();
         let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
         let Some(inspected) = inspected else {
@@ -524,7 +773,9 @@ impl Coordinator {
             return Ok((None, report));
         }
         let reached = Reached {
+            capabilities: inspected.capabilities,
             worker_id,
+            attachment: Arc::clone(&link),
             link,
             limits: self.cfg.limits.stricter(Limits {
                 max_active_task: inspected.max_active_task,
@@ -541,8 +792,12 @@ impl Coordinator {
         &self,
         worker_id: &WorkerId,
         link: &dyn WorkerLink,
+        preparation_observations: Option<
+            crate::setup::observation_transport::ObservationPageRequest,
+        >,
     ) -> Option<InspectResponse> {
         let request = Request::Inspect(InspectRequest {
+            preparation_observations,
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
         });
@@ -944,6 +1199,7 @@ impl Coordinator {
         known: BTreeSet<WorkerId>,
         reached: Vec<Reached>,
         report: &mut TickReport,
+        telemetry: &Mutex<Vec<preparation::RawPage>>,
     ) -> Result<()> {
         let mut round = Round {
             out: BTreeMap::new(),
@@ -963,27 +1219,83 @@ impl Coordinator {
         // that can be placed. A worker that is attached later is not
         // excluded for them, which puts them back in their place by age.
         let attached: Vec<WorkerId> = round.known.iter().cloned().collect();
+        let eligible = {
+            let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            if workers.is_empty() {
+                None
+            } else {
+                workers
+                    .values()
+                    .try_fold(BTreeSet::new(), |mut ids, link| {
+                        let inputs = link.placement_inputs()?;
+                        ids.extend(inputs.ready.into_iter().map(|i| i.run_id));
+                        Some(ids)
+                    })
+                    .map(|ids| ids.into_iter().collect::<Vec<_>>())
+            }
+        };
+        let filtered = eligible.is_some();
+        let cursor = *self.input_cursor.lock().unwrap_or_else(|e| e.into_inner());
         let queued = self
             .db(move |s| {
-                s.queued_tasks_for(
-                    DISPATCH_SCAN,
-                    &attached,
-                    scheduler::REASON_WORKER_CANNOT_RUN,
-                )
+                if let Some(eligible) = eligible {
+                    s.queued_tasks_ready_page(DISPATCH_SCAN, &eligible, cursor)
+                } else {
+                    s.queued_tasks_eligible(
+                        DISPATCH_SCAN,
+                        &attached,
+                        scheduler::REASON_WORKER_CANNOT_RUN,
+                        None,
+                    )
+                }
             })
             .await?;
-        if queued.len() < DISPATCH_SCAN as usize {
+        if !filtered && queued.len() < DISPATCH_SCAN as usize {
             // The whole queue was read: a task that is not in it waits no
             // more.
             let ids = queued.iter().map(|t| t.task_id.clone()).collect();
             self.sched.keep_waiting(&ids);
         }
+        let page_complete = queued.len() < DISPATCH_SCAN as usize;
+        let mut next_cursor = None;
+        let page_len = queued.len();
+        let mut processed = 0;
         for task in queued {
-            self.join_newcomers(&mut round, report).await?;
+            self.join_newcomers(&mut round, report, telemetry).await?;
+            let evaluated: Vec<_> = round
+                .open
+                .iter()
+                .filter_map(|w| {
+                    let snapshot = w.link.placement_inputs()?;
+                    snapshot
+                        .ready
+                        .iter()
+                        .any(|i| {
+                            i.run_id == task.run_id
+                                && Some(&i.source_id) == task.source_id.as_ref()
+                                && task.spec["manifest_digest"].as_str()
+                                    == Some(i.manifest_digest.as_str())
+                        })
+                        .then(|| (Arc::clone(&w.link), snapshot.generation))
+                })
+                .collect();
             self.place_one(&task, &mut round, report).await?;
+            for (link, generation) in evaluated {
+                link.inputs_evaluated(generation, &task.run_id);
+            }
+            processed += 1;
+            next_cursor = Some((task.created_at_ms, task.queue_rowid));
             if round.open.is_empty() || Instant::now() >= round.deadline {
                 break;
             }
+        }
+        if filtered {
+            *self.input_cursor.lock().unwrap_or_else(|e| e.into_inner()) =
+                if page_complete && processed == page_len {
+                    None
+                } else {
+                    next_cursor
+                };
         }
         Ok(())
     }
@@ -991,7 +1303,12 @@ impl Coordinator {
     /// Workers that were attached since this tick began are looked at like
     /// the others (their attempts are followed first), so that the next
     /// decision counts them in.
-    async fn join_newcomers(&self, round: &mut Round, report: &mut TickReport) -> Result<()> {
+    async fn join_newcomers(
+        &self,
+        round: &mut Round,
+        report: &mut TickReport,
+        telemetry: &Mutex<Vec<preparation::RawPage>>,
+    ) -> Result<()> {
         let fresh: Vec<(WorkerId, Arc<dyn WorkerLink>)> = {
             let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
             workers
@@ -1002,7 +1319,9 @@ impl Coordinator {
         };
         for (worker_id, link) in fresh {
             round.known.insert(worker_id.clone());
-            let (reached, part) = self.follow(worker_id.clone(), link, round.deadline).await?;
+            let (reached, part) = self
+                .follow(worker_id.clone(), link, round.deadline, telemetry)
+                .await?;
             report.absorb(part);
             match reached {
                 Some(worker) => round.admit(worker),
@@ -1067,6 +1386,72 @@ impl Coordinator {
             // This task only; the ones behind it are placed.
             Err(e) => return self.note_unplaceable(task, format!("task spec: {e}")).await,
         };
+        let parent_local = self
+            .parent_local
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let readiness = |w: &Reached| {
+            if spec.in_place && parent_local.as_ref() != Some(&w.worker_id) {
+                return None;
+            }
+            match w.link.placement_inputs() {
+                None => Some(None),
+                Some(snapshot) => snapshot
+                    .ready
+                    .iter()
+                    .any(|i| {
+                        i.run_id == task.run_id
+                            && Some(&i.source_id) == task.source_id.as_ref()
+                            && i.manifest_digest == spec.manifest_digest
+                    })
+                    .then_some(Some(snapshot.generation)),
+            }
+        };
+        let ready = |w: &Reached| readiness(w).is_some();
+        let measured_cold = |w: &Reached| {
+            if spec.in_place || !w.link.cold_eligible(&task.task_id) {
+                return false;
+            }
+            let query = scheduler::measured::CostQuery::task(
+                &task.spec,
+                task.source_id.as_ref().map(|s| s.as_str()),
+                w.link.cost_transport(),
+            );
+            let costs = self.sched.query(&w.worker_id, &query);
+            costs.ms[decide::TRANSFER].is_some() && !costs.assumed[decide::TRANSFER]
+        };
+        if !round.open.is_empty() && !round.open.iter().any(&ready) {
+            return Ok(());
+        }
+        let mut toolchain_eligible = BTreeSet::new();
+        if let Some(bundle) = &spec.toolchains {
+            for worker in round
+                .open
+                .iter()
+                .filter(|w| ready(w))
+                .chain(round.open.iter().filter(|w| !ready(w) && measured_cold(w)))
+            {
+                let remaining = round.deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                let wait = Duration::from_millis(self.sched.cfg.forecast_wait_ms).min(remaining);
+                let request = Request::ResolveToolchains(crate::wire::ResolveToolchainsRequest {
+                    schema_version: crate::wire::SchemaVersion::CURRENT,
+                    request_id: RequestId::generate(),
+                    bundle: bundle.clone(),
+                    requirements: spec.requirements.clone(),
+                });
+                if let Ok(Ok(Response::ResolveToolchains(response))) =
+                    tokio::time::timeout(wait, worker.link.read_only_call(request)).await
+                {
+                    if response.bundle == *bundle {
+                        toolchain_eligible.insert(worker.worker_id.clone());
+                    }
+                }
+            }
+        }
         let refused = self.refused_by(&task.task_id).await?;
         loop {
             // Who has room, counted from the parent's own record.
@@ -1094,21 +1479,68 @@ impl Coordinator {
                 .out
                 .iter()
                 .map(|(w, why)| Excluded {
+                    unmet: Vec::new(),
                     worker_id: w.clone(),
                     why: *why,
                 })
                 .collect();
-            let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = round
+            let (compatible, mismatched): (Vec<&Reached>, Vec<&Reached>) = round
                 .open
                 .iter()
+                .filter(|w| ready(w) || measured_cold(w))
+                .partition(|w| {
+                    (spec.toolchains.is_none() || toolchain_eligible.contains(&w.worker_id))
+                        && crate::toolchain::capability::missing_with_installable(
+                            &spec.requirements,
+                            w.capabilities.as_ref(),
+                            spec.toolchains.as_ref(),
+                        )
+                        .is_empty()
+                });
+            excluded.extend(mismatched.into_iter().map(|w| Excluded {
+                unmet: crate::toolchain::capability::missing(
+                    &spec.requirements,
+                    w.capabilities.as_ref(),
+                ),
+                worker_id: w.worker_id.clone(),
+                why: Exclusion::CapabilityMismatch,
+            }));
+            let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = compatible
+                .into_iter()
                 .partition(|w| !refused.contains(&w.worker_id));
             excluded.extend(left_out.into_iter().map(|w| Excluded {
+                unmet: Vec::new(),
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::RefusedTask,
             }));
+            let sessions: BTreeMap<_, _> = asked
+                .iter()
+                .filter_map(|w| readiness(w).map(|generation| (w.worker_id.clone(), generation)))
+                .collect();
+
             let mut costs: Vec<decide::Costs> = asked
                 .iter()
-                .map(|w| self.sched.costs(&w.worker_id, task))
+                .map(|w| {
+                    let mut query = scheduler::measured::CostQuery::task(
+                        &task.spec,
+                        task.source_id.as_ref().map(|s| s.as_str()),
+                        w.link.cost_transport(),
+                    );
+                    query.ready = readiness(w).is_some_and(|generation| generation.is_some());
+                    let mut costs = self.sched.query(&w.worker_id, &query);
+                    // Preserve external injected models' existing task adapter.
+                    let legacy = self.sched.costs(&w.worker_id, task);
+                    for part in 0..3 {
+                        if costs.ms[part].is_none() {
+                            costs.ms[part] = legacy.ms[part];
+                            costs.assumed[part] = legacy.assumed[part];
+                        }
+                    }
+                    costs.transfer_bytes = costs.transfer_bytes.or(legacy.transfer_bytes);
+                    costs.cache_warm = costs.cache_warm.or(legacy.cache_warm);
+                    costs.affinity |= legacy.affinity;
+                    costs
+                })
                 .collect();
             decide::fill_costs(&mut costs);
             let attempt_id = AttemptId::generate();
@@ -1125,6 +1557,7 @@ impl Coordinator {
             let ttl = self.sched.cfg.rules.forecast_ttl_ms;
             let mut candidates = Vec::new();
             let mut silent = Vec::new();
+            let mut forecast_ttl = BTreeMap::new();
             for ((w, c), answer) in asked.iter().zip(&costs).zip(answers) {
                 let outlook = match answer {
                     Forecast::Fenced => return Err(self.fence()),
@@ -1135,6 +1568,11 @@ impl Coordinator {
                     Forecast::Refused => Outlook::unusable(decide::Unusable::Refused),
                     Forecast::Answer(sent, answer) => {
                         let age = now.saturating_duration_since(sent).as_millis();
+                        forecast_ttl.insert(
+                            w.worker_id.clone(),
+                            ttl.min(answer.ttl_ms)
+                                .saturating_sub(u64::try_from(age).unwrap_or(u64::MAX)),
+                        );
                         let asked = Asked {
                             worker_id: &w.worker_id,
                             plan_digest: &spec.plan_digest,
@@ -1149,6 +1587,19 @@ impl Coordinator {
                         )
                     }
                 };
+                // An unusable/expired cold forecast cannot authorize a wait
+                // hint; ready workers retain the existing unknown-outlook rule.
+                if !ready(w)
+                    && (outlook.unusable.is_some()
+                        || forecast_ttl.get(&w.worker_id).copied().unwrap_or(0) == 0)
+                {
+                    excluded.push(Excluded {
+                        worker_id: w.worker_id.clone(),
+                        why: Exclusion::NoForecast,
+                        unmet: vec![],
+                    });
+                    continue;
+                }
                 let load = loads[&w.worker_id];
                 candidates.push(Candidate {
                     worker_id: w.worker_id.clone(),
@@ -1163,6 +1614,7 @@ impl Coordinator {
                 // wait for it again.
                 round.close(worker_id, Exclusion::NoForecast);
                 excluded.push(Excluded {
+                    unmet: Vec::new(),
                     worker_id: worker_id.clone(),
                     why: Exclusion::NoForecast,
                 });
@@ -1171,6 +1623,29 @@ impl Coordinator {
             let Some(winner) = decision.winner.clone() else {
                 return self.note_waiting(task, &decision).await;
             };
+            if let Some(cold) = round
+                .open
+                .iter()
+                .find(|w| w.worker_id == winner && !ready(w))
+            {
+                let query = scheduler::measured::CostQuery::task(
+                    &task.spec,
+                    task.source_id.as_ref().map(|s| s.as_str()),
+                    cold.link.cost_transport(),
+                );
+                if let Some(expected) = self.sched.query(&winner, &query).ms[decide::TRANSFER] {
+                    if cold.link.prefer(
+                        task,
+                        expected,
+                        forecast_ttl.get(&winner).copied().unwrap_or(0),
+                    ) {
+                        return self.note_waiting(task, &decision).await;
+                    }
+                }
+                // First wait expired while forecasts were in flight. Re-run
+                // the same comparison with that cold candidate suppressed.
+                continue;
+            }
             let Some(limits) = round
                 .open
                 .iter()
@@ -1179,15 +1654,84 @@ impl Coordinator {
             else {
                 return Ok(());
             };
+            // Lock order is registry then source generation. Owned guards move
+            // into the blocking DB closure, so dropping this future cannot let a
+            // connection exchange/reset overtake an already-started commit.
+            let registry_guard = self.placement_fence.clone().lock_owned().await;
+            let source_fence = round
+                .open
+                .iter()
+                .find(|w| w.worker_id == winner)
+                .and_then(|w| w.link.placement_fence());
+            let source_guard = match source_fence {
+                Some(fence) => Some(fence.lock_owned().await),
+                None => None,
+            };
+            if !round
+                .open
+                .iter()
+                .any(|w| w.worker_id == winner && readiness(w) == sessions.get(&winner).copied())
+            {
+                return Ok(());
+            }
+            let same_attachment = {
+                let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+                workers.get(&winner).is_some_and(|current| {
+                    round
+                        .open
+                        .iter()
+                        .any(|w| w.worker_id == winner && Arc::ptr_eq(current, &w.attachment))
+                })
+            };
+            if !same_attachment {
+                return Ok(());
+            }
+            if let Some(Some(generation)) = sessions.get(&winner) {
+                let current = self
+                    .workers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&winner)
+                    .and_then(|link| link.placement_inputs())
+                    .map(|inputs| inputs.generation);
+                if current != Some(*generation) {
+                    return Ok(());
+                }
+            }
             let (t, w, a) = (task.task_id.clone(), winner.clone(), attempt_id.clone());
             let lease_ms = self.cfg.lease_ms;
+            let cost_evidence: Vec<_> = decision
+                .compared
+                .iter()
+                .filter_map(|compared| {
+                    let worker = round
+                        .open
+                        .iter()
+                        .find(|w| w.worker_id == compared.worker_id)?;
+                    let mut query = scheduler::measured::CostQuery::task(
+                        &task.spec,
+                        task.source_id.as_ref().map(|s| s.as_str()),
+                        worker.link.cost_transport(),
+                    );
+                    query.ready = readiness(worker).is_some_and(|generation| generation.is_some());
+                    let mut costs = self.sched.evidence(&compared.worker_id, &query)?;
+                    costs.fallback(&compared.costs);
+                    Some(scheduler::measured::WorkerCostEvidence {
+                        worker_id: compared.worker_id.clone(),
+                        costs,
+                    })
+                })
+                .collect();
             let record = json!({
+                "cost_evidence":cost_evidence,
                 "decision": serde_json::to_value(&decision)
                     .map_err(|e| CoordinatorError::Invalid(e.to_string()))?,
                 "decision_seq": self.sched.next_seq(),
             });
             let outcome = self
                 .db(move |s| {
+                    let _registry_guard = registry_guard;
+                    let _source_guard = source_guard;
                     s.place(
                         &t,
                         &w,
@@ -1197,6 +1741,12 @@ impl Coordinator {
                             let (hash, mut demand) = demand_of(input, lease_ms)?;
                             demand["decision"] = record["decision"].clone();
                             demand["decision_seq"] = record["decision_seq"].clone();
+                            if record["cost_evidence"]
+                                .as_array()
+                                .is_some_and(|e| !e.is_empty())
+                            {
+                                demand["cost_evidence"] = record["cost_evidence"].clone();
+                            }
                             Ok((hash, demand))
                         },
                         wall_ms(),
@@ -1213,6 +1763,9 @@ impl Coordinator {
                     return self.note_unplaceable(task, why).await;
                 }
                 PlaceOutcome::Placed(_) => {
+                    self.clear_prefetch(&crate::service::completion::Target::Task(
+                        task.task_id.clone(),
+                    ));
                     self.sched.clear_waiting(&task.task_id);
                     report.placed.push(attempt_id.clone());
                     let link = round
@@ -1244,8 +1797,14 @@ impl Coordinator {
             return Ok(());
         }
         let run = task.run_id.clone();
+        let capability_mismatch = !decision.excluded.is_empty()
+            && decision
+                .excluded
+                .iter()
+                .all(|e| e.why == Exclusion::CapabilityMismatch);
         let payload = json!({
             "task": task.task_id.to_string(),
+            "blocked_reason": capability_mismatch.then_some("no_compatible_worker"),
             "decision": serde_json::to_value(decision)
                 .map_err(|e| CoordinatorError::Invalid(e.to_string()))?,
         });

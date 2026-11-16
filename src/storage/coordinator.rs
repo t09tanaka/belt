@@ -6,9 +6,10 @@ use super::common::{self, from_json, json, parse_state};
 use super::policy::{Access, GcCandidate};
 use super::Db;
 use super::{
-    to_i64, to_u64, BlobRef, DbKind, Event, Finalized, GcReport, NewBlobRef, ProcessLock, Result,
-    StorageError, DEFAULT_GC_BATCH,
+    to_i64, to_u64, DbKind, Event, Finalized, NewBlobRef, ProcessLock, Result, StorageError,
 };
+#[cfg(test)]
+use super::{BlobRef, GcReport, DEFAULT_GC_BATCH};
 use crate::ids::{
     AttemptId, ClusterId, CoordinatorEpoch, CoordinatorId, Digest, Generation, IdError,
     ManifestDigest, PayloadHash, PermitId, RunId, SourceId, TaskId, WorkerId,
@@ -18,11 +19,21 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 use std::path::Path;
 
+mod retention;
+pub use retention::{ResultDeleteClaim, ResultGcPage};
 mod collect;
+mod live_log;
+pub use live_log::{LiveLogTarget, LogProgress};
+mod control;
+mod retry;
+pub use retry::{PreparedRetry, RetryPreparation};
 pub mod query;
 mod queue;
 pub use collect::{Collectable, CollectionRow, ResultRef, RunStanding};
-pub use queue::{LiveAttempt, PlaceInput, PlaceOutcome, QueuedTask, RetireEnd, Seen, WorkerLoad};
+pub use queue::{
+    InputCursor, InputPage, LiveAttempt, LiveAttemptPage, PlaceInput, PlaceOutcome, QueuedTask,
+    RetireEnd, Seen, WorkerLoad,
+};
 
 const ATTEMPT: &str = "attempt";
 
@@ -157,6 +168,12 @@ fn confirm_tombstone(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
 /// The confirmed retire of an attempt that did not end: the attempt is
 /// retired and its task is free for a new one.
 fn free_by_retire(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
+    let in_place: bool = conn.query_row("SELECT coalesce(json_extract(t.spec_json,'$.in_place'),0) FROM task t JOIN attempt a USING(task_id) WHERE a.attempt_id=?1",[aid],|r|r.get(0))?;
+    if in_place {
+        return Err(StorageError::Invalid(
+            "in-place cannot be automatically retried".into(),
+        ));
+    }
     confirm_tombstone(conn, aid, at_ms)?;
     let n = conn.execute(
         "UPDATE attempt SET retired = 1, retired_at_ms = COALESCE(retired_at_ms, ?2)
@@ -238,18 +255,190 @@ pub struct CoordinatorStore {
     /// False for a step-1 file opened read-only: its tasks have no cancel
     /// column (no task of it was ever cancelled before it was placed).
     task_cancel: bool,
+    retry_boundaries: bool,
     /// False for a file from before the third step opened read-only: it has
     /// no `collection` table (no collection of it was ever begun).
     collections: bool,
+    state_dir: std::path::PathBuf,
     _lock: Option<ProcessLock>,
 }
 
 impl CoordinatorStore {
+    /// Source lock is always acquired before entering a coordinator DB operation.
+    /// Nonblocking acquisition never waits under the actor/admission/transaction.
+    pub(crate) fn source_mutation_guard(&self) -> Result<crate::source::retention::Guard> {
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+
+        crate::source::SourceStore::open(&self.state_dir)
+            .and_then(|source| source.mutation_guard())
+            .map_err(|e| StorageError::Invalid(format!("source mutation guard: {e:#}")))
+    }
+    /// Foreground input preflight only: call outside actor/admission ownership.
+    pub(crate) fn source_mutation_guard_foreground(
+        &self,
+    ) -> Result<crate::source::retention::Guard> {
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+        crate::source::SourceStore::open_foreground(&self.state_dir)
+            .map(|(_source, guard)| guard)
+            .map_err(|error| {
+                if error.is::<crate::source::retention::ForegroundBusy>() {
+                    StorageError::SourceBusy
+                } else {
+                    StorageError::Invalid(format!("source mutation guard: {error:#}"))
+                }
+            })
+    }
+    /// Resolve immutable target identity, lock one run, then validate fresh metadata.
+    /// Export/read commands must retain this pin for their whole invocation.
+    pub fn result_read_pin(
+        &self,
+        target: &crate::service::completion::Target,
+        attempt: Option<&AttemptId>,
+    ) -> Result<crate::results::pin::RunPin> {
+        let run = self.result_target_run(target, attempt)?;
+        let pin =
+            crate::results::pin::RunPin::shared(&self.state_dir, &run).map_err(
+                |error| {
+                    match error.kind() {
+                std::io::ErrorKind::NotFound => not_found(
+                    "result reader pin unavailable; compatible owner must backfill legacy state",
+                ),
+                std::io::ErrorKind::WouldBlock => {
+                    StorageError::Locked(self.state_dir.join(format!("reader-pins/{run}.lock")))
+                }
+                _ => StorageError::Io(error),
+            }
+                },
+            )?;
+        if self.result_target_run(target, attempt)? != run {
+            return Err(StorageError::Invalid(
+                "result target changed while acquiring pin".into(),
+            ));
+        }
+        Ok(pin)
+    }
+    fn result_target_run(
+        &self,
+        target: &crate::service::completion::Target,
+        attempt: Option<&AttemptId>,
+    ) -> Result<RunId> {
+        use crate::service::completion::Target;
+        match target {
+            Target::Run(run) if attempt.is_none() => self
+                .query_run(run.clone())?
+                .map(|_| run.clone())
+                .ok_or_else(|| not_found("run")),
+            Target::Task(task) => {
+                let row = self
+                    .query_task(task.clone())?
+                    .ok_or_else(|| not_found("task"))?;
+                if let Some(a) = attempt {
+                    if self.get_attempt(a)?.is_none_or(|a| a.task_id != *task) {
+                        return Err(not_found("attempt of selected task"));
+                    }
+                }
+                Ok(row.run_id)
+            }
+            _ => Err(StorageError::Invalid("attempt requires task".into())),
+        }
+    }
+    pub(crate) fn result_writer_pin(
+        &self,
+        attempt: &AttemptId,
+    ) -> Result<crate::results::pin::RunPin> {
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+        let task = self
+            .get_attempt(attempt)?
+            .ok_or_else(|| not_found("attempt"))?
+            .task_id;
+        let run = self
+            .query_task(task)?
+            .ok_or_else(|| not_found("task"))?
+            .run_id;
+        crate::results::pin::RunPin::ensure(&self.state_dir, &run)?;
+        Ok(crate::results::pin::RunPin::shared(&self.state_dir, &run)?)
+    }
+    /// Prepare a private, fully initialized metadata database without claiming an epoch.
+    /// The publish callback journals the staged inode before its no-replace rename.
+    /// Existing databases are inspected read-only under the owner lock, never migrated.
+    pub(crate) fn initialize_identity(
+        state_dir: &Path,
+        cluster: &ClusterId,
+        coordinator: &CoordinatorId,
+        publish: impl FnOnce(&Path) -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        let _owner = ProcessLock::acquire(state_dir, "coordinator.lock")?;
+        let target = state_dir.join("coordinator.db");
+        if target.try_exists()? {
+            let existing = Self::open_read_only(state_dir)?;
+            anyhow::ensure!(
+                existing.cluster_id() == cluster && existing.coordinator_id() == coordinator,
+                "foreign coordinator metadata; no migration or epoch change applied"
+            );
+            return Ok(());
+        }
+        let stage = tempfile::Builder::new()
+            .prefix(".init-")
+            .tempfile_in(state_dir)?;
+        let db = Db::open(stage.path(), DbKind::Coordinator, Access::ReadWrite)?;
+        let cl = cluster.clone();
+        let co = coordinator.clone();
+        db.write(move |tx| {
+            tx.execute(
+                "INSERT INTO cluster VALUES (?1, ?2, 0)",
+                params![cl.as_str(), co.as_str()],
+            )?;
+            tx.execute(
+                "INSERT INTO coordinator_state (singleton, cluster_id, epoch) VALUES (1, ?1, 0)",
+                [cl.as_str()],
+            )?;
+            Ok(())
+        })?;
+        db.call(|conn| {
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))?;
+            let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0))?;
+            if mode != "delete" {
+                return Err(StorageError::Corrupt(
+                    "metadata checkpoint unconfirmed".into(),
+                ));
+            }
+            Ok(())
+        })?;
+        drop(db);
+        stage.as_file().sync_all()?;
+        // Retain the staged inode when publication/journal outcome is uncertain.
+        let (_file, path) = stage.keep()?;
+        publish(&path)?;
+        Ok(())
+    }
+
     /// Open the coordinator state in `state_dir`: take the process lock (a
     /// second coordinator fails with `Locked`), migrate the database, create
     /// the cluster on first use and start a new coordinator epoch.
     pub fn open(state_dir: &Path, now_ms: u64) -> Result<Self> {
+        Self::open_bound(state_dir, now_ms, None)
+    }
+    pub(crate) fn open_bound(
+        state_dir: &Path,
+        now_ms: u64,
+        binding: Option<(ClusterId, CoordinatorId)>,
+    ) -> Result<Self> {
         let lock = ProcessLock::acquire(state_dir, "coordinator.lock")?;
+        if let Some((cluster, coordinator)) = binding {
+            let existing = Self::open_read_only(state_dir)?;
+            if existing.cluster_id() != &cluster || existing.coordinator_id() != &coordinator {
+                return Err(StorageError::Corrupt(
+                    "managed coordinator metadata binding differs; no migration/epoch change"
+                        .into(),
+                ));
+            }
+        }
         let db = Db::open(
             &state_dir.join("coordinator.db"),
             DbKind::Coordinator,
@@ -301,7 +490,9 @@ impl CoordinatorStore {
             coordinator_id,
             epoch,
             task_cancel: true,
+            retry_boundaries: true,
             collections: true,
+            state_dir: state_dir.to_path_buf(),
             _lock: Some(lock),
         })
     }
@@ -344,13 +535,22 @@ impl CoordinatorStore {
                 collections,
             ))
         })?;
+        let db_has_retry = db.call(|c| {
+            Ok(c.query_row(
+                "SELECT count(*)>0 FROM pragma_table_info('task') WHERE name='min_generation'",
+                [],
+                |r| r.get(0),
+            )?)
+        })?;
         Ok(Self {
             db,
             cluster_id,
             coordinator_id,
             epoch,
             task_cancel,
+            retry_boundaries: db_has_retry,
             collections,
+            state_dir: state_dir.to_path_buf(),
             _lock: None,
         })
     }
@@ -420,6 +620,10 @@ impl CoordinatorStore {
         spec: &Value,
         at_ms: u64,
     ) -> Result<()> {
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+        crate::results::pin::RunPin::ensure(&self.state_dir, run_id)?;
         let run = run_id.to_string();
         let source = source_id.map(ToString::to_string);
         let bundle = secret_bundle_id.map(str::to_string);
@@ -453,6 +657,10 @@ impl CoordinatorStore {
         spec: &Value,
         at_ms: u64,
     ) -> Result<()> {
+        let mutation = self.source_mutation_guard()?;
+        mutation
+            .ensure_run_available(run_id)
+            .map_err(|error| StorageError::Invalid(format!("{error:#}")))?;
         let (task, run, spec) = (task_id.to_string(), run_id.to_string(), spec.to_string());
         self.db.write(move |tx| {
             tx.execute(
@@ -471,6 +679,8 @@ impl CoordinatorStore {
     /// earlier attempt of the same task is neither terminal nor confirmed
     /// retired: a new attempt needs the old one's end (or retire) first.
     pub fn create_attempt(&self, new: NewAttempt, at_ms: u64) -> Result<AttemptRecord> {
+        let retained_mutation = self.source_mutation_guard()?;
+        let mutation = retained_mutation.clone();
         let epoch = self.epoch;
         self.db.write(move |tx| {
             let task = new.task_id.to_string();
@@ -480,6 +690,11 @@ impl CoordinatorStore {
                 })
                 .optional()?
                 .ok_or_else(|| not_found(format!("task {task}")))?;
+            mutation
+                .ensure_run_available(
+                    &RunId::parse(&run).map_err(|e| StorageError::Invalid(e.to_string()))?,
+                )
+                .map_err(|error| StorageError::Invalid(format!("{error:#}")))?;
             let live: Option<String> = tx
                 .query_row(
                     "SELECT attempt_id FROM attempt
@@ -1176,10 +1391,12 @@ impl CoordinatorStore {
     /// and the event journal are never touched. The pass is a series of
     /// transactions of [`DEFAULT_GC_BATCH`] references; a busy database is
     /// [`StorageError::Busy`] and the pass can simply be run again.
+    #[cfg(test)]
     pub fn gc(&self, now_ms: u64, retention_ms: u64) -> Result<GcReport> {
         self.gc_batched(now_ms, retention_ms, DEFAULT_GC_BATCH)
     }
 
+    #[cfg(test)]
     pub(crate) fn gc_batched(
         &self,
         now_ms: u64,

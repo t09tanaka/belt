@@ -1671,7 +1671,7 @@ fn many_connections_opening_a_fresh_worker_database_at_once_all_succeed() {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, "1");
+        assert_eq!(version, "3");
     }
 }
 
@@ -1836,6 +1836,12 @@ fn a_busy_database_is_a_retryable_error_and_changes_nothing() {
         assert!(e.is_retryable());
         assert_eq!(e.code(), ErrorCode::Internal);
         assert!(!StorageError::Closed.is_retryable());
+        assert!(StorageError::SourceBusy.is_retryable());
+        assert_eq!(StorageError::SourceBusy.code(), ErrorCode::SourceBusy);
+        assert_eq!(
+            StorageError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)).code(),
+            ErrorCode::Internal
+        );
         let e = other.gc(1, 1, 1).err().unwrap();
         assert!(e.is_retryable());
         release_tx.send(()).unwrap();
@@ -2985,7 +2991,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     let all = schema::steps(DbKind::Coordinator);
     assert_eq!(
         all.len(),
-        4,
+        10,
         "this test is about step 1 and the steps after it"
     );
     let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
@@ -3098,7 +3104,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opened for writing, it is migrated, and every row is still there.
     let store = CoordinatorStore::open(dir.path(), 10).unwrap();
-    assert_eq!(schema_of(&store), ("4".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("10".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(4));
     assert_eq!(store.cluster_id(), &cluster);
     check_rows(&store);
@@ -3116,7 +3122,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opening again migrates nothing and loses nothing.
     let store = CoordinatorStore::open(dir.path(), 20).unwrap();
-    assert_eq!(schema_of(&store), ("4".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("10".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(5));
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);
@@ -3307,7 +3313,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(all.len(), 4);
+    assert_eq!(all.len(), 10);
     let cluster = ClusterId::generate();
     let co = CoordinatorId::generate();
     let run = RunId::generate();
@@ -3362,7 +3368,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     }
     let owner = CoordinatorStore::open(dir.path(), 2).unwrap();
     let migrated = schema_info(&owner);
-    assert_eq!(migrated.0, "4");
+    assert_eq!(migrated.0, "10");
     assert_eq!(migrated.2, 3);
     assert!(migrated.1.is_some());
     let target_run = run.to_string();
@@ -3381,4 +3387,2108 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
         owner.query_tasks(run, 64, None).unwrap().items.len(),
         tasks.len()
     );
+}
+
+#[test]
+fn run_cancel_intent_precedes_enqueue_and_every_creation_and_place_gate() {
+    use crate::service::completion::Target;
+    let dir = tempfile::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    store.cancel_run(&run, 2).unwrap();
+    store.cancel_run(&run, 3).unwrap();
+    let before = store.completion(Target::Run(run.clone())).unwrap();
+    assert!(!before.accepted);
+    assert!(before.cancel_requested);
+    assert!(before.stop_confirmed());
+    assert_eq!(before.exit_code(), Some(130));
+    store
+        .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 4)
+        .unwrap();
+    let next = TaskId::generate();
+    store.create_task(&next, &run, &json!({}), 5).unwrap();
+    assert!(store.queued_tasks(10).unwrap().is_empty());
+    for task in [&task, &next] {
+        assert!(matches!(
+            store
+                .place(
+                    task,
+                    &WorkerId::parse("local").unwrap(),
+                    &AttemptId::generate(),
+                    |_| true,
+                    |_| panic!("cancelled task reached payload construction"),
+                    6
+                )
+                .unwrap(),
+            PlaceOutcome::NotQueued
+        ));
+        assert!(store
+            .create_attempt(
+                NewAttempt {
+                    attempt_id: AttemptId::generate(),
+                    task_id: task.clone(),
+                    worker_id: WorkerId::parse("local").unwrap(),
+                    payload_hash: hash('a'),
+                    permit_id: None
+                },
+                6
+            )
+            .is_err());
+    }
+    let task_id = task.to_string();
+    store
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE task SET cancel_requested_at_ms=NULL WHERE task_id=?1",
+                [task_id],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(store.task_cancel_requested(&task).unwrap().is_some());
+    let after = store.completion(Target::Run(run)).unwrap();
+    assert_eq!(after.task_count, 2);
+    assert_eq!(after.computed_tasks, 2);
+    assert_eq!(after.exit_code(), Some(130));
+}
+
+#[test]
+fn run_cancel_is_atomic_idempotent_and_preserves_unknown_and_natural_completion() {
+    use crate::service::completion::Target;
+    let f = fx();
+    let attempt = f.attempt('a').unwrap();
+    f.store
+        .set_observation(&attempt.attempt_id, Observation::Unknown)
+        .unwrap();
+    f.store.cancel_run(&f.run, 20).unwrap();
+    f.store.cancel_run(&f.run, 21).unwrap();
+    let snapshot = f.store.completion(Target::Run(f.run.clone())).unwrap();
+    assert!(snapshot.cancel_requested);
+    assert_eq!(snapshot.uncertain_tasks, 1);
+    assert!(!snapshot.stop_confirmed());
+    assert_eq!(snapshot.exit_code(), None);
+    assert_eq!(
+        f.store
+            .get_attempt(&attempt.attempt_id)
+            .unwrap()
+            .unwrap()
+            .cancel_requested_at_ms,
+        Some(20)
+    );
+    let events = f
+        .store
+        .events_of(&attempt.attempt_id, "cancel_requested")
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    f.to_finalizing(&attempt.attempt_id);
+    f.store
+        .finalize_attempt(&attempt.attempt_id, done(Outcome::Succeeded), 30)
+        .unwrap();
+    let snapshot = f.store.completion(Target::Task(f.task.clone())).unwrap();
+    assert!(snapshot.stop_confirmed());
+    assert_eq!(snapshot.collection_pending_tasks, 1);
+    assert_eq!(snapshot.exit_code(), None);
+    let b = TaskId::generate();
+    f.store.create_task(&b, &f.run, &json!({}), 31).unwrap();
+    let snapshot = f.store.completion(Target::Run(f.run.clone())).unwrap();
+    assert_eq!(snapshot.task_count, 2);
+    assert!(snapshot.stop_confirmed());
+    assert_eq!(snapshot.first_compute_failure.unwrap().termination, None);
+}
+
+#[test]
+fn run_cancel_races_enqueue_and_place_without_losing_the_intent() {
+    use crate::service::completion::Target;
+    use std::sync::{Arc, Barrier};
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(CoordinatorStore::open(dir.path(), 1).unwrap());
+    for _ in 0..8 {
+        let run = RunId::generate();
+        let task = TaskId::generate();
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                store.cancel_run(&run, 5).unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                store
+                    .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 4)
+                    .unwrap();
+            });
+        });
+        assert_eq!(
+            store.completion(Target::Run(run)).unwrap().exit_code(),
+            Some(130)
+        );
+        assert!(store.task_cancel_requested(&task).unwrap().is_some());
+        let run = RunId::generate();
+        let task = TaskId::generate();
+        store
+            .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 6)
+            .unwrap();
+        let barrier = Barrier::new(2);
+        let attempt = AttemptId::generate();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                barrier.wait();
+                store.cancel_run(&run, 8).unwrap();
+            });
+            scope.spawn(|| {
+                barrier.wait();
+                store
+                    .place(
+                        &task,
+                        &WorkerId::parse("local").unwrap(),
+                        &attempt,
+                        |_| true,
+                        |_| Ok((hash('a'), json!({}))),
+                        7,
+                    )
+                    .unwrap();
+            });
+        });
+        assert!(store.task_cancel_requested(&task).unwrap().is_some());
+        if let Some(attempt) = store.get_attempt(&attempt).unwrap() {
+            assert_eq!(attempt.cancel_requested_at_ms, Some(8));
+            assert!(attempt.termination.is_none());
+        }
+        assert!(store.queued_tasks(1000).unwrap().is_empty());
+    }
+}
+#[test]
+fn completion_waits_for_closed_collection_and_preserves_compute_error_precedence() {
+    use crate::results::plan::Verdict;
+    use crate::service::completion::Target;
+    for outcome in [Outcome::Succeeded, Outcome::Failed] {
+        for verdict in [Verdict::Complete, Verdict::RequiredMissing, Verdict::GaveUp] {
+            let f = fx();
+            let attempt = f.attempt('a').unwrap();
+            f.to_finalizing(&attempt.attempt_id);
+            f.store
+                .finalize_attempt(&attempt.attempt_id, done(outcome), 30)
+                .unwrap();
+            let target = Target::Task(f.task.clone());
+            assert_eq!(
+                f.store.completion(target.clone()).unwrap().exit_code(),
+                None
+            );
+            let digest = Digest::of_bytes(b"result");
+            f.store
+                .begin_collection(&attempt.attempt_id, &digest, &json!({}), &[], &[], 31)
+                .unwrap();
+            assert_eq!(
+                f.store.completion(target.clone()).unwrap().exit_code(),
+                None,
+                "result receipt alone isn't closed collection"
+            );
+            f.store
+                .close_collection(&attempt.attempt_id, Some(&digest), verdict, false, 32)
+                .unwrap();
+            let snapshot = f.store.completion(target).unwrap();
+            assert!(snapshot.settled());
+            assert_eq!(snapshot.collection_pending_tasks, 0);
+            assert_eq!(
+                snapshot.exit_code(),
+                Some(if outcome == Outcome::Failed {
+                    1
+                } else if verdict == Verdict::Complete {
+                    0
+                } else {
+                    78
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn eligible_queue_filter_accepts_large_worker_and_run_unions_without_sql_variable_growth() {
+    let (_dir, store, run, tasks) = queue_fx(1);
+    let workers: Vec<_> = (0..2000).map(|i| worker(&format!("worker-{i}"))).collect();
+    let mut runs: Vec<_> = (0..2000).map(|_| RunId::generate()).collect();
+    assert!(store
+        .queued_tasks_eligible(10, &workers, "cannot", Some(&runs))
+        .unwrap()
+        .is_empty());
+    runs.push(run);
+    let queued = store
+        .queued_tasks_eligible(10, &workers, "cannot", Some(&runs))
+        .unwrap();
+    assert_eq!(queued.len(), 1);
+    assert_eq!(queued[0].task_id, tasks[0]);
+    assert!(store
+        .queued_tasks_eligible(10, &workers, "cannot", Some(&[]))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn retry_same_run_receipt_fences_cancel_and_preserves_history() {
+    use crate::service::completion::Target;
+    let f = fx();
+    let source = SourceId::generate();
+    f.store
+        .put_source_ref(
+            &source,
+            &ManifestDigest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap(),
+            1,
+        )
+        .unwrap();
+    let source_text = source.to_string();
+    let run_text = f.run.to_string();
+    f.store
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE run SET source_id=?1 WHERE run_id=?2",
+                rusqlite::params![source_text, run_text],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let task = f.task.to_string();
+    f.store.db.write(move |tx| {
+        tx.execute("UPDATE task SET spec_json=?1 WHERE task_id=?2",rusqlite::params![json!({"manifest_digest":format!("sha256:{}","a".repeat(64)),"has_secret_bundle":false}).to_string(),task])?;
+        Ok(())
+    }).unwrap();
+    let attempt = f.attempt('a').unwrap();
+    f.to_finalizing(&attempt.attempt_id);
+    f.store
+        .finalize_attempt(&attempt.attempt_id, done(Outcome::Failed), 30)
+        .unwrap();
+    f.store
+        .cancel_control(
+            Target::Run(f.run.clone()),
+            0,
+            RunId::generate().to_string(),
+            11,
+        )
+        .unwrap();
+    let target = Target::Run(f.run.clone());
+    let receipt = f
+        .store
+        .retry(target.clone(), 1, "request-one".into(), 12, |_, _, _| {
+            Ok(false)
+        })
+        .unwrap();
+    assert_eq!(receipt.control_revision, 2);
+    assert_eq!(receipt.task_count, 1);
+    let snapshot = f.store.completion(target.clone()).unwrap();
+    assert_eq!(snapshot.control_revision, 2);
+    assert!(!snapshot.cancel_requested);
+    assert!(!snapshot.stop_confirmed());
+    assert!(f.store.latest_attempt_of_task(&f.task).unwrap().is_none());
+    assert!(f
+        .store
+        .query_task(f.task.clone())
+        .unwrap()
+        .unwrap()
+        .current_attempt
+        .is_none());
+    assert_eq!(f.store.queued_tasks(10).unwrap().len(), 1);
+    let replay = f
+        .store
+        .retry(target.clone(), 1, "request-one".into(), 13, |_, _, _| {
+            panic!("receipt must precede validation")
+        })
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(receipt).unwrap(),
+        serde_json::to_value(replay).unwrap()
+    );
+    assert!(f
+        .store
+        .retry(target.clone(), 2, "request-one".into(), 14, |_, _, _| Ok(
+            false
+        ))
+        .is_err());
+    assert!(f
+        .store
+        .cancel_control(target.clone(), 0, RunId::generate().to_string(), 15)
+        .is_err());
+    assert!(f
+        .store
+        .cancel_control(
+            Target::Task(f.task.clone()),
+            0,
+            RunId::generate().to_string(),
+            15
+        )
+        .is_err());
+    assert!(!f.store.completion(target.clone()).unwrap().cancel_requested);
+    assert_eq!(f.store.attempts_of_task(&f.task).unwrap().len(), 1);
+    assert_eq!(
+        f.store
+            .get_attempt(&attempt.attempt_id)
+            .unwrap()
+            .unwrap()
+            .termination,
+        Some(done(Outcome::Failed))
+    );
+    f.store
+        .cancel_control(target, 2, RunId::generate().to_string(), 16)
+        .unwrap();
+    assert!(f.store.task_cancel_requested(&f.task).unwrap().is_some());
+}
+
+fn retry_fixture(outcome: Outcome) -> (Fx, AttemptRecord) {
+    let f = fx();
+    let source = SourceId::generate();
+    f.store
+        .put_source_ref(
+            &source,
+            &ManifestDigest::parse(&format!("sha256:{}", "a".repeat(64))).unwrap(),
+            1,
+        )
+        .unwrap();
+    let run = f.run.to_string();
+    let source = source.to_string();
+    f.store
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE run SET source_id=?1 WHERE run_id=?2",
+                rusqlite::params![source, run],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let task = f.task.to_string();
+    f.store.db.write(move |tx| {
+        tx.execute("UPDATE task SET spec_json=?1 WHERE task_id=?2",rusqlite::params![json!({"manifest_digest":format!("sha256:{}","a".repeat(64)),"has_secret_bundle":false}).to_string(),task])?;
+        Ok(())
+    }).unwrap();
+    let attempt = f.attempt('a').unwrap();
+    f.to_finalizing(&attempt.attempt_id);
+    let termination = if outcome == Outcome::TimedOut {
+        Termination::new(
+            outcome,
+            None,
+            Some(crate::state::TimeoutInfo {
+                kind: crate::state::TimeoutKind::Command,
+                phase: crate::state::TimeoutPhase::Running,
+            }),
+        )
+        .unwrap()
+    } else {
+        done(outcome)
+    };
+    f.store
+        .finalize_attempt(&attempt.attempt_id, termination, 30)
+        .unwrap();
+    (f, attempt)
+}
+#[test]
+fn retry_same_run_rejects_unsafe_attempts_and_unavailable_inputs_atomically() {
+    use crate::service::completion::Target;
+    for observation in [Observation::Unknown, Observation::Reconciling] {
+        let (f, a) = retry_fixture(Outcome::Failed);
+        f.store.set_observation(&a.attempt_id, observation).unwrap();
+        assert!(f
+            .store
+            .retry(
+                Target::Task(f.task.clone()),
+                0,
+                "unsafe".into(),
+                40,
+                |_, _, _| panic!("unsafe attempt reached inputs")
+            )
+            .is_err());
+        assert_eq!(
+            f.store
+                .completion(Target::Run(f.run.clone()))
+                .unwrap()
+                .control_revision,
+            0
+        );
+    }
+    let (f, a) = retry_fixture(Outcome::Failed);
+    let before = f.store.get_attempt(&a.attempt_id).unwrap().unwrap();
+    assert!(matches!(
+        f.store.retry(
+            Target::Task(f.task.clone()),
+            0,
+            "missing-secret".into(),
+            40,
+            |_, _, _| Err(StorageError::SecretUnavailable)
+        ),
+        Err(StorageError::SecretUnavailable)
+    ));
+    assert_eq!(
+        f.store
+            .completion(Target::Run(f.run.clone()))
+            .unwrap()
+            .control_revision,
+        0
+    );
+    assert!(f.store.queued_tasks(10).unwrap().is_empty());
+    assert_eq!(f.store.get_attempt(&a.attempt_id).unwrap().unwrap(), before);
+    let receipt = f
+        .store
+        .retry(
+            Target::Task(f.task.clone()),
+            0,
+            "retained".into(),
+            41,
+            |_, _, _| Ok(false),
+        )
+        .unwrap();
+    assert_eq!(receipt.task_count, 1);
+    assert!(f
+        .store
+        .retry(
+            Target::Task(f.task.clone()),
+            1,
+            "queued".into(),
+            42,
+            |_, _, _| panic!("queued retry cannot validate")
+        )
+        .is_err());
+    let placed = f
+        .store
+        .place(
+            &f.task,
+            &f.worker,
+            &AttemptId::generate(),
+            |_| true,
+            |input| {
+                assert_eq!(input.generation, Generation(2));
+                Ok((hash('b'), json!({})))
+            },
+            43,
+        )
+        .unwrap();
+    assert!(matches!(placed, PlaceOutcome::Placed(_)));
+    assert_eq!(f.store.attempts_of_task(&f.task).unwrap().len(), 2);
+    assert!(f
+        .store
+        .retry(
+            Target::Task(f.task.clone()),
+            1,
+            "live".into(),
+            44,
+            |_, _, _| panic!("live retry cannot validate")
+        )
+        .is_err());
+    assert!(f
+        .store
+        .query_task(f.task.clone())
+        .unwrap()
+        .unwrap()
+        .current_attempt
+        .is_some());
+}
+#[test]
+fn retry_same_run_run_selection_preserves_success_and_task_selection_retries_success() {
+    use crate::service::completion::Target;
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let success = TaskId::generate();
+    f.store
+        .create_task(&success, &f.run, &json!({"manifest_digest":format!("sha256:{}","a".repeat(64)),"has_secret_bundle":false}), 31)
+        .unwrap();
+    let a = f
+        .store
+        .create_attempt(
+            NewAttempt {
+                attempt_id: AttemptId::generate(),
+                task_id: success.clone(),
+                worker_id: f.worker.clone(),
+                payload_hash: hash('b'),
+                permit_id: None,
+            },
+            32,
+        )
+        .unwrap();
+    f.to_finalizing(&a.attempt_id);
+    f.store
+        .finalize_attempt(&a.attempt_id, done(Outcome::Succeeded), 33)
+        .unwrap();
+    let before = f.store.get_attempt(&a.attempt_id).unwrap().unwrap();
+    let receipt = f
+        .store
+        .retry(
+            Target::Run(f.run.clone()),
+            0,
+            "mixed".into(),
+            40,
+            |_, _, _| Ok(false),
+        )
+        .unwrap();
+    assert_eq!(receipt.task_count, 1);
+    assert_eq!(f.store.queued_tasks(10).unwrap()[0].task_id, f.task);
+    assert_eq!(f.store.get_attempt(&a.attempt_id).unwrap().unwrap(), before);
+    assert_eq!(
+        f.store
+            .completion(Target::Run(f.run.clone()))
+            .unwrap()
+            .computed_tasks,
+        1
+    );
+    let receipt = f
+        .store
+        .retry(Target::Task(success), 1, "success".into(), 41, |_, _, _| {
+            Ok(false)
+        })
+        .unwrap();
+    assert_eq!(receipt.control_revision, 2);
+    assert_eq!(receipt.min_generation, Some(2));
+}
+#[test]
+fn retry_same_run_concurrent_requests_and_owner_restart_keep_one_boundary() {
+    use crate::service::completion::Target;
+    use std::sync::Barrier;
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let barrier = Barrier::new(2);
+    let results = std::thread::scope(|scope| {
+        let join = scope.spawn(|| {
+            barrier.wait();
+            f.store.retry(
+                Target::Task(f.task.clone()),
+                0,
+                "first".into(),
+                40,
+                |_, _, _| Ok(false),
+            )
+        });
+        barrier.wait();
+        let other = f.store.retry(
+            Target::Task(f.task.clone()),
+            0,
+            "second".into(),
+            40,
+            |_, _, _| Ok(false),
+        );
+        [join.join().unwrap(), other]
+    });
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    let receipt = results.into_iter().find_map(Result::ok).unwrap();
+    let Fx {
+        _dir: dir,
+        store,
+        run,
+        task,
+        ..
+    } = f;
+    drop(store);
+    let owner = CoordinatorStore::open(dir.path(), 50).unwrap();
+    let replay = owner
+        .retry(
+            Target::Task(task),
+            0,
+            receipt.request_id.clone(),
+            51,
+            |_, _, _| panic!("restart replay must not inspect inputs"),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(receipt).unwrap(),
+        serde_json::to_value(replay).unwrap()
+    );
+    assert_eq!(
+        owner.completion(Target::Run(run)).unwrap().control_revision,
+        1
+    );
+}
+#[test]
+fn retry_same_run_rejects_closed_and_unconfirmed_retirement() {
+    use crate::service::completion::Target;
+    let (f, a) = retry_fixture(Outcome::Failed);
+    f.store
+        .begin_retire(&a.attempt_id, "retry test", 31)
+        .unwrap();
+    assert!(f
+        .store
+        .retry(
+            Target::Task(f.task.clone()),
+            0,
+            "retiring".into(),
+            40,
+            |_, _, _| panic!("retirement is not stop proof")
+        )
+        .is_err());
+    let (f, _) = retry_fixture(Outcome::Failed);
+    f.store.close_run(&f.run, 35).unwrap();
+    assert!(f
+        .store
+        .retry(
+            Target::Run(f.run.clone()),
+            0,
+            "closed".into(),
+            40,
+            |_, _, _| panic!("closed run inputs must not be inspected")
+        )
+        .is_err());
+}
+
+#[test]
+fn retry_same_run_migration_preserves_v5_cancellation_tombstones() {
+    use crate::service::completion::Target;
+    let dir = tempfile::tempdir().unwrap();
+    let run = RunId::generate();
+    let steps = schema::steps(DbKind::Coordinator);
+    let old = db::open_with(
+        &dir.path().join("coordinator.db"),
+        "coordinator",
+        &steps[..5],
+        schema::compat(5),
+        policy::Access::ReadWrite,
+    )
+    .unwrap();
+    let old_run = run.to_string();
+    old.write(move |tx| {
+        tx.execute(
+            "INSERT INTO run_cancel_intent(run_id,requested_at_ms) VALUES(?1,7)",
+            [old_run],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    drop(old);
+    let owner = CoordinatorStore::open(dir.path(), 8).unwrap();
+    let before = owner.completion(Target::Run(run.clone())).unwrap();
+    assert_eq!(before.control_revision, 0);
+    assert!(before.cancel_requested);
+    let task = TaskId::generate();
+    owner
+        .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 9)
+        .unwrap();
+    assert_eq!(owner.task_cancel_requested(&task).unwrap(), Some(7));
+    assert!(owner.queued_tasks(10).unwrap().is_empty());
+}
+#[test]
+fn retry_same_run_keeps_old_collection_and_atomic_run_selection() {
+    use crate::results::plan::Verdict;
+    use crate::service::completion::Target;
+    let (f, old) = retry_fixture(Outcome::Failed);
+    let digest = Digest::of_bytes(b"result");
+    f.store
+        .begin_collection(&old.attempt_id, &digest, &json!({}), &[], &[], 31)
+        .unwrap();
+    let next = TaskId::generate();
+    f.store.create_task(&next, &f.run, &json!({}), 32).unwrap();
+    assert!(f
+        .store
+        .retry(
+            Target::Run(f.run.clone()),
+            0,
+            "atomic".into(),
+            40,
+            |_, _, _| Ok(false)
+        )
+        .is_err());
+    assert_eq!(
+        f.store
+            .completion(Target::Run(f.run.clone()))
+            .unwrap()
+            .control_revision,
+        0
+    );
+    let receipt = f
+        .store
+        .retry(
+            Target::Task(f.task.clone()),
+            0,
+            "one".into(),
+            41,
+            |_, _, _| Ok(false),
+        )
+        .unwrap();
+    assert_eq!(receipt.control_revision, 1);
+    f.store
+        .close_collection(&old.attempt_id, Some(&digest), Verdict::Complete, false, 42)
+        .unwrap();
+    let completion = f.store.completion(Target::Task(f.task.clone())).unwrap();
+    assert_eq!(completion.computed_tasks, 0);
+    assert_eq!(completion.collection_pending_tasks, 0);
+    assert!(!completion.settled());
+    assert_eq!(
+        f.store
+            .get_attempt(&old.attempt_id)
+            .unwrap()
+            .unwrap()
+            .termination,
+        Some(done(Outcome::Failed))
+    );
+}
+
+#[test]
+fn retry_same_run_rejects_integer_exhaustion_and_delayed_initial_submit() {
+    use crate::service::completion::Target;
+    for revision_exhausted in [false, true] {
+        let (f, a) = retry_fixture(Outcome::Failed);
+        let run = f.run.to_string();
+        let attempt = a.attempt_id.to_string();
+        f.store
+            .db
+            .write(move |tx| {
+                if revision_exhausted {
+                    tx.execute(
+                        "UPDATE run SET control_revision=?1 WHERE run_id=?2",
+                        rusqlite::params![i64::MAX, run],
+                    )?;
+                } else {
+                    tx.execute(
+                        "UPDATE attempt SET generation=?1 WHERE attempt_id=?2",
+                        rusqlite::params![i64::MAX, attempt],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let expected = if revision_exhausted {
+            i64::MAX as u64
+        } else {
+            0
+        };
+        assert!(f
+            .store
+            .retry(
+                Target::Run(f.run.clone()),
+                expected,
+                "exhausted".into(),
+                40,
+                |_, _, _| panic!("exhausted retry reached inputs")
+            )
+            .is_err());
+        assert_eq!(
+            f.store
+                .completion(Target::Run(f.run.clone()))
+                .unwrap()
+                .control_revision,
+            expected
+        );
+    }
+    let (f, _) = retry_fixture(Outcome::Failed);
+    f.store
+        .retry(
+            Target::Run(f.run.clone()),
+            0,
+            "retry".into(),
+            40,
+            |_, _, _| Ok(false),
+        )
+        .unwrap();
+    let extra = TaskId::generate();
+    assert!(f
+        .store
+        .enqueue(&f.run, None, &json!({}), &[(extra.clone(), json!({}))], 41)
+        .is_err());
+    assert!(f.store.query_task(extra).unwrap().is_none());
+    assert_eq!(
+        f.store
+            .completion(Target::Run(f.run.clone()))
+            .unwrap()
+            .control_revision,
+        1
+    );
+    assert_eq!(f.store.queued_tasks(10).unwrap().len(), 1);
+}
+
+#[test]
+fn retry_same_run_fresh_cancel_races_placement_without_missing_the_attempt() {
+    use crate::service::completion::Target;
+    use std::sync::Barrier;
+    for _ in 0..8 {
+        let (f, _) = retry_fixture(Outcome::Failed);
+        f.store
+            .retry(
+                Target::Run(f.run.clone()),
+                0,
+                "retry".into(),
+                40,
+                |_, _, _| Ok(false),
+            )
+            .unwrap();
+        let barrier = Barrier::new(2);
+        std::thread::scope(|scope| {
+            let placed = scope.spawn(|| {
+                barrier.wait();
+                f.store
+                    .place(
+                        &f.task,
+                        &f.worker,
+                        &AttemptId::generate(),
+                        |_| true,
+                        |_| Ok((hash('b'), json!({}))),
+                        41,
+                    )
+                    .unwrap()
+            });
+            barrier.wait();
+            f.store
+                .cancel_control(
+                    Target::Run(f.run.clone()),
+                    1,
+                    RunId::generate().to_string(),
+                    42,
+                )
+                .unwrap();
+            let _ = placed.join().unwrap();
+        });
+        assert!(f.store.task_cancel_requested(&f.task).unwrap().is_some());
+        assert!(f.store.queued_tasks(10).unwrap().is_empty());
+        for current in f
+            .store
+            .attempts_of_task(&f.task)
+            .unwrap()
+            .into_iter()
+            .filter(|a| a.generation.0 >= 2)
+        {
+            assert_eq!(current.cancel_requested_at_ms, Some(42));
+        }
+    }
+}
+
+#[test]
+fn retry_same_run_pages_large_runs_and_keeps_receipts_constant_size() {
+    use crate::service::completion::Target;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let run = f.run.to_string();
+    let spec =
+        json!({"manifest_digest":format!("sha256:{}","a".repeat(64)),"has_secret_bundle":false})
+            .to_string();
+    let termination = serde_json::to_string(&done(Outcome::Failed)).unwrap();
+    let receipts = serde_json::to_string(&Receipts::default()).unwrap();
+    f.store.db.write(move |tx| {
+        for _ in 1..300 {
+            let task=TaskId::generate().to_string();
+            tx.execute("INSERT INTO task(task_id,run_id,spec_json,created_at_ms) VALUES(?1,?2,?3,1)",rusqlite::params![task,run,spec])?;
+            tx.execute("INSERT INTO attempt(attempt_id,task_id,worker_id,generation,payload_hash,coordinator_epoch,state,termination_json,receipts_json,created_at_ms,terminal_at_ms) VALUES(?1,?2,'local',1,?3,1,'terminal',?4,?5,1,2)",rusqlite::params![AttemptId::generate().as_str(),task,hash('a').as_str(),termination,receipts])?;
+        }
+        Ok(())
+    }).unwrap();
+    let RetryPreparation::Prepared(prepared) = f
+        .store
+        .prepare_retry(Target::Run(f.run.clone()), 0, "changing-input".into())
+        .unwrap()
+    else {
+        panic!("new request")
+    };
+    let run = f.run.to_string();
+    let last=f.store.db.write(move |tx| {
+        let last:String=tx.query_row("SELECT MAX(task_id) FROM task WHERE run_id=?1",[run],|r|r.get(0))?;
+        tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.has_secret_bundle',1) WHERE task_id=?1",[&last])?;
+        Ok(last)
+    }).unwrap();
+    assert!(f.store.commit_retry(prepared, false, 40).is_err());
+    let run = f.run.to_string();
+    let changed: i64 = f
+        .store
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT count(*) FROM task WHERE run_id=?1 AND min_generation<>1",
+                [run],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(
+        changed, 0,
+        "a late-page failure must roll back earlier page updates"
+    );
+    f.store.db.write(move |tx|{tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.has_secret_bundle',0) WHERE task_id=?1",[last])?;Ok(())}).unwrap();
+    let calls = AtomicUsize::new(0);
+    let receipt = f
+        .store
+        .retry(
+            Target::Run(f.run.clone()),
+            0,
+            "large-run".into(),
+            41,
+            |_, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(false)
+            },
+        )
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    assert_eq!(receipt.task_count, 300);
+    assert!(receipt.task_id.is_none());
+    assert!(receipt.min_generation.is_none());
+    assert!(serde_json::to_vec(&receipt).unwrap().len() < 512);
+    let run = f.run.to_string();
+    let authorized:i64=f.store.db.call(move |c|Ok(c.query_row("SELECT count(*) FROM task WHERE run_id=?1 AND min_generation=2 AND authorization_revision=1",[run],|r|r.get(0))?)).unwrap();
+    assert_eq!(authorized, 300);
+}
+
+#[test]
+fn retry_same_run_accepts_each_unsuccessful_terminal_outcome_but_not_unplaced_cancel() {
+    use crate::service::completion::Target;
+    for outcome in [Outcome::Cancelled, Outcome::TimedOut, Outcome::Interrupted] {
+        let (f, a) = retry_fixture(outcome);
+        let before = f.store.get_attempt(&a.attempt_id).unwrap().unwrap();
+        f.store
+            .cancel_control(
+                Target::Run(f.run.clone()),
+                0,
+                RunId::generate().to_string(),
+                31,
+            )
+            .unwrap();
+        let receipt = f
+            .store
+            .retry(
+                Target::Run(f.run.clone()),
+                1,
+                "terminal".into(),
+                40,
+                |_, _, _| Ok(false),
+            )
+            .unwrap();
+        assert_eq!(receipt.task_count, 1);
+        assert!(
+            !f.store
+                .completion(Target::Run(f.run.clone()))
+                .unwrap()
+                .cancel_requested
+        );
+        assert_eq!(f.store.get_attempt(&a.attempt_id).unwrap().unwrap(), before);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let source = SourceId::generate();
+    let digest = Digest::of_bytes(b"retained");
+    store.put_source_ref(&source, &digest, 1).unwrap();
+    store
+        .enqueue(
+            &run,
+            Some(&source),
+            &json!({}),
+            &[(
+                task.clone(),
+                json!({"manifest_digest":digest,"has_secret_bundle":false}),
+            )],
+            1,
+        )
+        .unwrap();
+    store
+        .cancel_control(
+            Target::Run(run.clone()),
+            0,
+            RunId::generate().to_string(),
+            2,
+        )
+        .unwrap();
+    assert!(store
+        .retry(
+            Target::Task(task.clone()),
+            1,
+            "unplaced".into(),
+            3,
+            |_, _, _| panic!("unplaced cancellation is not stopping proof")
+        )
+        .is_err());
+    assert_eq!(
+        store.completion(Target::Run(run)).unwrap().control_revision,
+        1
+    );
+    assert!(store.attempts_of_task(&task).unwrap().is_empty());
+}
+
+#[test]
+fn control_fence_rejects_old_retry_after_cancel_and_replays_original_cancel_ack() {
+    use crate::service::completion::Target;
+    for task_target in [false, true] {
+        let (f, _) = retry_fixture(Outcome::Failed);
+        let target = if task_target {
+            Target::Task(f.task.clone())
+        } else {
+            Target::Run(f.run.clone())
+        };
+        let RetryPreparation::Prepared(old_retry) = f
+            .store
+            .prepare_retry(target.clone(), 0, "delayed-retry".into())
+            .unwrap()
+        else {
+            panic!("new request")
+        };
+        let ack = f
+            .store
+            .cancel_control(target.clone(), 0, "cancel-ack".into(), 40)
+            .unwrap();
+        assert_eq!(ack.control_revision, 1);
+        assert!(f.store.commit_retry(old_retry, false, 41).is_err());
+        assert!(f
+            .store
+            .retry(
+                target.clone(),
+                0,
+                "delayed-transport".into(),
+                41,
+                |_, _, _| panic!("stale retry must not reach inputs")
+            )
+            .is_err());
+        assert!(f.store.completion(target.clone()).unwrap().cancel_requested);
+        let accepted = f
+            .store
+            .retry(target.clone(), 1, "fresh-retry".into(), 42, |_, _, _| {
+                Ok(false)
+            })
+            .unwrap();
+        assert_eq!(accepted.control_revision, 2);
+        let replay = f
+            .store
+            .cancel_control(target.clone(), 0, "cancel-ack".into(), 43)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(ack).unwrap(),
+            serde_json::to_value(replay).unwrap()
+        );
+        let current = f.store.completion(target.clone()).unwrap();
+        assert_eq!(current.control_revision, 2);
+        assert!(!current.cancel_requested);
+        assert!(f
+            .store
+            .cancel_control(target.clone(), 0, "new-stale-cancel".into(), 44)
+            .is_err());
+        assert!(f
+            .store
+            .cancel_control(target.clone(), 1, "cancel-ack".into(), 44)
+            .is_err());
+        let other = if task_target {
+            Target::Run(f.run.clone())
+        } else {
+            Target::Task(f.task.clone())
+        };
+        assert!(f
+            .store
+            .cancel_control(other, 0, "cancel-ack".into(), 44)
+            .is_err());
+        assert!(f
+            .store
+            .prepare_retry(target, 0, "cancel-ack".into())
+            .is_err());
+        assert_eq!(f.store.queued_tasks(10).unwrap().len(), 1);
+    }
+}
+#[test]
+fn control_fence_pre_enqueue_revision_is_inherited_and_cancel_receipt_survives_restart() {
+    use crate::service::completion::Target;
+    let dir = tempfile::tempdir().unwrap();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let ack = store
+        .cancel_control(Target::Run(run.clone()), 0, "before-submit".into(), 2)
+        .unwrap();
+    assert_eq!(ack.control_revision, 1);
+    assert!(!ack.accepted);
+    assert!(ack.cancel_requested);
+    let again = store
+        .cancel_control(Target::Run(run.clone()), 0, "before-submit".into(), 3)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&ack).unwrap(),
+        serde_json::to_value(again).unwrap()
+    );
+    store
+        .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 4)
+        .unwrap();
+    assert_eq!(
+        store
+            .completion(Target::Run(run.clone()))
+            .unwrap()
+            .control_revision,
+        1
+    );
+    assert!(store.task_cancel_requested(&task).unwrap().is_some());
+    assert!(store.queued_tasks(10).unwrap().is_empty());
+    drop(store);
+    let restarted = CoordinatorStore::open(dir.path(), 5).unwrap();
+    let again = restarted
+        .cancel_control(Target::Run(run), 0, "before-submit".into(), 6)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(ack).unwrap(),
+        serde_json::to_value(again).unwrap()
+    );
+}
+#[test]
+fn control_fence_internal_fresh_cancel_advances_once_and_delivery_never_advances() {
+    use crate::service::completion::Target;
+    for task_target in [false, true] {
+        let (f, attempt) = retry_fixture(Outcome::Failed);
+        let RetryPreparation::Prepared(prepared) = f
+            .store
+            .prepare_retry(Target::Run(f.run.clone()), 0, "old-retry".into())
+            .unwrap()
+        else {
+            panic!("new request")
+        };
+        if task_target {
+            f.store.cancel_task(&f.task, 40).unwrap();
+        } else {
+            f.store.cancel_run(&f.run, 40).unwrap();
+        }
+        assert_eq!(
+            f.store
+                .completion(Target::Run(f.run.clone()))
+                .unwrap()
+                .control_revision,
+            1
+        );
+        assert!(f.store.commit_retry(prepared, false, 41).is_err());
+        f.store.request_cancel(&attempt.attempt_id, 42).unwrap();
+        f.store.request_cancel(&attempt.attempt_id, 43).unwrap();
+        assert_eq!(
+            f.store
+                .completion(Target::Run(f.run.clone()))
+                .unwrap()
+                .control_revision,
+            1
+        );
+    }
+}
+#[test]
+fn control_fence_concurrent_cancel_and_retry_have_one_winner() {
+    use crate::service::completion::Target;
+    use std::sync::Barrier;
+    for _ in 0..8 {
+        let (f, _) = retry_fixture(Outcome::Failed);
+        let barrier = Barrier::new(2);
+        let (cancel, retry) = std::thread::scope(|scope| {
+            let pending = scope.spawn(|| {
+                barrier.wait();
+                f.store
+                    .cancel_control(Target::Run(f.run.clone()), 0, "cancel".into(), 40)
+            });
+            barrier.wait();
+            let retry = f.store.retry(
+                Target::Run(f.run.clone()),
+                0,
+                "retry".into(),
+                40,
+                |_, _, _| Ok(false),
+            );
+            (pending.join().unwrap(), retry)
+        });
+        assert_ne!(cancel.is_ok(), retry.is_ok());
+        let snapshot = f.store.completion(Target::Run(f.run.clone())).unwrap();
+        assert_eq!(snapshot.control_revision, 1);
+        assert_eq!(snapshot.cancel_requested, cancel.is_ok());
+    }
+}
+
+#[test]
+fn control_fence_cancel_overflow_and_conflicting_retry_identity_change_nothing() {
+    use crate::service::completion::Target;
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let run = f.run.to_string();
+    f.store
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE run SET control_revision=?1 WHERE run_id=?2",
+                rusqlite::params![i64::MAX, run],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(f
+        .store
+        .cancel_control(
+            Target::Run(f.run.clone()),
+            i64::MAX as u64,
+            "overflow".into(),
+            40
+        )
+        .is_err());
+    let snapshot = f.store.completion(Target::Run(f.run.clone())).unwrap();
+    assert_eq!(snapshot.control_revision, i64::MAX as u64);
+    assert!(!snapshot.cancel_requested);
+    let (f, _) = retry_fixture(Outcome::Failed);
+    f.store
+        .retry(
+            Target::Run(f.run.clone()),
+            0,
+            "accepted-retry".into(),
+            40,
+            |_, _, _| Ok(false),
+        )
+        .unwrap();
+    assert!(f
+        .store
+        .cancel_control(Target::Run(f.run.clone()), 0, "accepted-retry".into(), 41)
+        .is_err());
+    assert_eq!(
+        f.store
+            .completion(Target::Run(f.run.clone()))
+            .unwrap()
+            .control_revision,
+        1
+    );
+    assert!(f.store.queued_tasks(10).unwrap().len() == 1);
+}
+
+#[test]
+fn live_log_progress_registers_ref_cas_metadata_and_survives_final_receipt_reset() {
+    use crate::wire::LogStream::{Stderr, Stdout};
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 0, 3, false, false, 0, 2)
+        .is_err());
+    let progress = f.store.prepare_log_progress(&a, Stdout, 2).unwrap();
+    assert_eq!(progress.committed_bytes, 0);
+    assert!(f.store.collection(&a).unwrap().is_none());
+    let aid = a.to_string();
+    f.store
+        .db
+        .call(move |c| {
+            let row: (String, String, String) = c.query_row(
+                "SELECT attempt_id,kind,locator FROM blob_ref WHERE ref_id=?1",
+                [format!("{aid}:logs")],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            assert_eq!(
+                row,
+                (aid.clone(), "log".into(), format!("results/{aid}/logs"))
+            );
+            Ok(())
+        })
+        .unwrap();
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 0, 3, false, false, 0, 3)
+        .unwrap());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 0, 3, false, false, 0, 4)
+        .unwrap());
+    assert_eq!(
+        f.store
+            .log_progress(&a, Stdout)
+            .unwrap()
+            .unwrap()
+            .updated_at_ms,
+        3
+    );
+    assert!(!f
+        .store
+        .commit_log_progress(&a, Stdout, 0, 4, false, false, 0, 4)
+        .unwrap());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 2, false, false, 0, 4)
+        .is_err());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 3, true, true, 7, 4)
+        .unwrap());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 3, false, true, 7, 5)
+        .is_err());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 4, true, true, 7, 5)
+        .is_err());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 3, true, false, 7, 5)
+        .is_err());
+    assert!(f
+        .store
+        .commit_log_progress(&a, Stdout, 3, 3, true, true, 6, 5)
+        .is_err());
+    assert_eq!(
+        f.store
+            .prepare_log_progress(&a, Stderr, 5)
+            .unwrap()
+            .committed_bytes,
+        0
+    );
+    f.to_finalizing(&a);
+    f.store
+        .finalize_attempt(&a, done(Outcome::Succeeded), 6)
+        .unwrap();
+    f.store
+        .begin_collection(&a, &Digest::of_bytes(b"one"), &json!({}), &[], &[], 7)
+        .unwrap();
+    f.store
+        .set_collection_logs(&a, &Digest::of_bytes(b"one"), &json!({}), 8)
+        .unwrap();
+    f.store
+        .begin_collection(&a, &Digest::of_bytes(b"two"), &json!({}), &[], &[], 9)
+        .unwrap();
+    assert!(f.store.collection(&a).unwrap().unwrap().logs.is_none());
+    let progress = f.store.log_progress(&a, Stdout).unwrap().unwrap();
+    assert_eq!(progress.committed_bytes, 3);
+    assert!(progress.eof);
+}
+
+#[test]
+fn live_log_prepare_rolls_back_on_pending_delete_or_mismatched_reference() {
+    use crate::wire::LogStream::Stdout;
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    let locator = crate::results::ResultStore::logs_locator(&a);
+    let l = locator.clone();
+    f.store
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "INSERT INTO pending_delete(locator,queued_at_ms) VALUES(?1,1)",
+                [l],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(matches!(
+        f.store.prepare_log_progress(&a, Stdout, 2),
+        Err(StorageError::LocatorPendingDelete(_))
+    ));
+    assert!(f.store.log_progress(&a, Stdout).unwrap().is_none());
+    let aid = a.to_string();
+    f.store.db.write(move |tx| {tx.execute("DELETE FROM pending_delete WHERE locator=?1",[locator])?;tx.execute("INSERT INTO blob_ref(ref_id,attempt_id,kind,locator,created_at_ms) VALUES(?1,?2,'result','other',1)",rusqlite::params![format!("{aid}:logs"),aid])?;Ok(())}).unwrap();
+    assert!(matches!(
+        f.store.prepare_log_progress(&a, Stdout, 3),
+        Err(StorageError::Immutable(_))
+    ));
+    assert!(f.store.log_progress(&a, Stdout).unwrap().is_none());
+}
+
+#[test]
+fn live_log_target_pages_are_bounded_current_and_payload_backed() {
+    let (_dir, store, _run, tasks) = queue_fx(68);
+    let worker = worker("w-a");
+    let mut attempts = Vec::new();
+    for (n, task) in tasks.iter().enumerate() {
+        let a = AttemptId::generate();
+        let record = placed(
+            store
+                .place(
+                    task,
+                    &worker,
+                    &a,
+                    |_| true,
+                    move |_| {
+                        Ok((
+                            hash('a'),
+                            if n == 67 {
+                                json!({})
+                            } else {
+                                json!({"payload":{"nodes":[]}})
+                            },
+                        ))
+                    },
+                    10,
+                )
+                .unwrap(),
+        );
+        if n != 66 {
+            store
+                .mark_receipt(&record.attempt_id, Receipt::WorkerAccepted, 11)
+                .unwrap();
+        }
+        attempts.push(record.attempt_id);
+    }
+    let first = store.query_live_log_targets(&worker, None, 1000).unwrap();
+    assert_eq!(first.len(), 64);
+    assert!(first
+        .windows(2)
+        .all(|w| w[0].record.attempt_id < w[1].record.attempt_id));
+    let second = store
+        .query_live_log_targets(&worker, Some(&first[63].record.attempt_id), 1000)
+        .unwrap();
+    assert_eq!(second.len(), 2);
+    assert!(store
+        .query_live_log_targets(&worker, Some(&second[1].record.attempt_id), 64)
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .query_live_log_targets(&worker, None, 0)
+        .unwrap()
+        .is_empty());
+    assert!(store
+        .query_live_log_targets(&WorkerId::parse("other").unwrap(), None, 64)
+        .unwrap()
+        .is_empty());
+    store.begin_retire(&attempts[0], "replaced", 12).unwrap();
+    store.confirm_retire(&attempts[0], 13).unwrap();
+    let all = store.query_live_log_targets(&worker, None, 64).unwrap();
+    assert!(!all.iter().any(|t| t.record.attempt_id == attempts[0]));
+}
+
+#[test]
+fn live_log_legacy_bootstrap_needs_matching_final_receipt_and_keeps_stream_metadata() {
+    use crate::wire::LogStream::Stdout;
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    f.to_finalizing(&a);
+    f.store
+        .finalize_attempt(&a, done(Outcome::Succeeded), 21)
+        .unwrap();
+    let files = crate::results::ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.append_log(&a, Stdout, 0, b"bytes").unwrap();
+    let digest = Digest::of_bytes(b"bytes");
+    let verified = || {
+        files
+            .verify_legacy_log_prefix(&a, Stdout, &digest, 5)
+            .unwrap()
+            .unwrap()
+    };
+    assert!(f
+        .store
+        .bootstrap_log_progress(verified(), 22)
+        .unwrap()
+        .is_none());
+    let result = Digest::of_bytes(b"result");
+    f.store
+        .begin_collection(&a, &result, &json!({}), &[], &[], 23)
+        .unwrap();
+    f.store.set_collection_logs(&a,&result,&json!({"stdout":{"sha256":digest.as_str(),"bytes":4,"complete":true,"log_truncated":true,"dropped_bytes":8}}),24).unwrap();
+    assert!(f
+        .store
+        .bootstrap_log_progress(verified(), 25)
+        .unwrap()
+        .is_none());
+    f.store.set_collection_logs(&a,&result,&json!({"stdout":{"sha256":digest.as_str(),"bytes":5,"complete":false,"log_truncated":true,"dropped_bytes":8}}),26).unwrap();
+    let p = f
+        .store
+        .bootstrap_log_progress(verified(), 27)
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.committed_bytes, 5);
+    assert!(!p.eof);
+    assert!(p.log_truncated);
+    assert_eq!(p.dropped_bytes, 8);
+    assert_eq!(
+        f.store
+            .bootstrap_log_progress(verified(), 28)
+            .unwrap()
+            .unwrap(),
+        p
+    );
+    assert!(f
+        .store
+        .collection(&a)
+        .unwrap()
+        .unwrap()
+        .closed_at_ms
+        .is_none());
+}
+
+#[test]
+fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes() {
+    use crate::wire::LogStream::Stdout;
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    f.to_finalizing(&a);
+    f.store
+        .finalize_attempt(&a, done(Outcome::Succeeded), 21)
+        .unwrap();
+    let files = crate::results::ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.append_log(&a, Stdout, 0, b"old").unwrap();
+    let result = Digest::of_bytes(b"result");
+    let digest = Digest::of_bytes(b"old");
+    let receipt = json!({"stdout":{"sha256":digest.as_str(),"bytes":3,"complete":true,"log_truncated":false,"dropped_bytes":0}});
+    f.store
+        .begin_collection(&a, &result, &json!({"old":true}), &[], &[], 22)
+        .unwrap();
+    f.store
+        .set_collection_logs(&a, &result, &receipt, 23)
+        .unwrap();
+    // Exactly the pre-progress schema: no rows or constraints are skipped.
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    drop(f.store);
+    let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
+    assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
+    assert!(owner.log_progress(&a, Stdout).unwrap().is_none());
+    let token = files
+        .verify_legacy_log_prefix(&a, Stdout, &digest, 3)
+        .unwrap()
+        .unwrap();
+    let progress = owner.bootstrap_log_progress(token, 25).unwrap().unwrap();
+    assert_eq!(progress.committed_bytes, 3);
+    assert!(progress.eof);
+    let reader = CoordinatorStore::open_read_only(f._dir.path()).unwrap();
+    assert_eq!(reader.epoch(), owner.epoch());
+    assert_eq!(reader.log_progress(&a, Stdout).unwrap(), Some(progress));
+}
+
+#[test]
+fn live_log_append_crash_replays_from_committed_offset_without_publishing_tail() {
+    use crate::results::store::{Crash, StoreError};
+    use crate::wire::LogStream::Stdout;
+    let f = fx();
+    let a = f.attempt('a').unwrap().attempt_id;
+    let files = crate::results::ResultStore::open(&f._dir.path().join("results")).unwrap();
+    let reader = crate::results::ResultStore::open_read_only(files.root()).unwrap();
+    assert_eq!(
+        f.store
+            .prepare_log_progress(&a, Stdout, 21)
+            .unwrap()
+            .committed_bytes,
+        0
+    );
+    files.append_log(&a, Stdout, 0, b"first").unwrap();
+    f.store
+        .commit_log_progress(&a, Stdout, 0, 5, false, false, 0, 22)
+        .unwrap();
+    files.crash_once_at(Crash::LogAppended);
+    assert!(matches!(
+        files.append_log(&a, Stdout, 5, b"second"),
+        Err(StoreError::Crash(Crash::LogAppended))
+    ));
+    let progress = f.store.log_progress(&a, Stdout).unwrap().unwrap();
+    assert_eq!(progress.committed_bytes, 5);
+    assert_eq!(
+        reader
+            .read_range(&a, Stdout, progress.committed_bytes, 0, 100)
+            .unwrap(),
+        b"first"
+    );
+    let resumed = crate::results::ResultStore::open(files.root()).unwrap();
+    resumed
+        .recover_log_prefix(&a, Stdout, progress.committed_bytes)
+        .unwrap();
+    resumed.append_log(&a, Stdout, 5, b"second").unwrap();
+    f.store
+        .commit_log_progress(&a, Stdout, 5, 11, false, false, 0, 23)
+        .unwrap();
+    assert_eq!(
+        reader.read_range(&a, Stdout, 11, 0, 100).unwrap(),
+        b"firstsecond"
+    );
+}
+
+// ================================================= guarded result retention
+fn retention_ready(f: &Fx) -> AttemptId {
+    let a = f.attempt('a').unwrap().attempt_id;
+    f.to_finalizing(&a);
+    f.store
+        .finalize_attempt(&a, done(Outcome::Failed), 100)
+        .unwrap();
+    f.store.mark_collected(&a, 101).unwrap();
+    let id = a.to_string();
+    f.store.db.write(move |tx| {tx.execute("INSERT INTO collection(attempt_id,verdict,acked_at_ms,closed_at_ms,updated_at_ms) VALUES(?1,'complete',102,101,102)",[id])?;Ok(())}).unwrap();
+    a
+}
+#[test]
+fn result_retention_claims_bounded_pages_and_replays_only_known_claims() {
+    use crate::results::store::ResultStore;
+    let f = fx();
+    let a = retention_ready(&f);
+    let files = ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.write_result(&a, b"{}").unwrap();
+    let locator = ResultStore::result_locator(&a);
+    for n in 0..70 {
+        f.store
+            .add_blob_ref(
+                &blob(&format!("result-{n:03}"), &a, BlobKind::Result, &locator),
+                102,
+            )
+            .unwrap();
+    }
+    let run = f.run.to_string();
+    let plan=f.store.db.call(move |c| {let mut s=c.prepare("EXPLAIN QUERY PLAN SELECT b.ref_id,b.attempt_id,b.locator,b.pins FROM result_gc_ref g JOIN blob_ref b USING(ref_id) WHERE g.run_id=?1 AND g.ref_id>?2 ORDER BY g.ref_id LIMIT 32")?;let rows=s.query_map(rusqlite::params![run,""],|r|r.get::<_,String>(3))?.collect::<std::result::Result<Vec<_>,_>>()?;Ok(rows)}).unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("result_gc_ref_run")),
+        "{plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|line| line.contains("TEMP B-TREE")),
+        "{plan:?}"
+    );
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    assert!(f
+        .store
+        .claim_result_page(&guard, &f.run, "", 0, 200, 10, Some("boot".into()), 10)
+        .is_err());
+    assert!(f
+        .store
+        .claim_result_page(&guard, &f.run, "", 65, 200, 10, Some("boot".into()), 10)
+        .is_err());
+    assert!(
+        f.store
+            .claim_result_page(&guard, &f.run, "", 32, 200, 10, Some("boot".into()), 10)
+            .unwrap()
+            .clock_held
+    );
+    let first = f
+        .store
+        .claim_result_page(&guard, &f.run, "", 32, 210, 20, Some("boot".into()), 10)
+        .unwrap();
+    assert_eq!((first.examined, first.removed, first.queued), (32, 32, 0));
+    let second = f
+        .store
+        .claim_result_page(
+            &guard,
+            &f.run,
+            first.next.as_ref().unwrap(),
+            32,
+            211,
+            21,
+            Some("boot".into()),
+            10,
+        )
+        .unwrap();
+    assert_eq!(
+        (second.examined, second.removed, second.queued),
+        (32, 32, 0)
+    );
+    let third = f
+        .store
+        .claim_result_page(
+            &guard,
+            &f.run,
+            second.next.as_ref().unwrap(),
+            32,
+            212,
+            22,
+            Some("boot".into()),
+            10,
+        )
+        .unwrap();
+    assert_eq!((third.examined, third.removed, third.queued), (6, 6, 1));
+    assert!(third.next.is_none());
+    assert!(f
+        .store
+        .add_blob_ref(&blob("late", &a, BlobKind::Result, &locator), 212)
+        .is_err());
+    assert!(f.store.pending_result_page(&guard, &f.run, 0).is_err());
+    let claim = f
+        .store
+        .pending_result_page(&guard, &f.run, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    assert_eq!(claim.attempt, a);
+    assert_eq!(claim.run, f.run);
+    files.remove(&claim.locator).unwrap(); // crash after FS, before completion
+    drop(guard);
+    drop(f.store);
+    let restarted = CoordinatorStore::open(f._dir.path(), 300).unwrap();
+    let guard = restarted.result_gc_guard(&f.run).unwrap();
+    let replay = restarted
+        .pending_result_page(&guard, &f.run, 1)
+        .unwrap()
+        .pop()
+        .unwrap();
+    files.remove(&replay.locator).unwrap();
+    restarted.finish_result_delete(&guard, &replay).unwrap();
+    assert!(restarted
+        .pending_result_page(&guard, &f.run, 1)
+        .unwrap()
+        .is_empty());
+    assert!(restarted.finish_result_delete(&guard, &replay).is_err());
+    // Verdict/audit survive physical deletion, including failed compute.
+    assert_eq!(
+        restarted
+            .get_attempt(&a)
+            .unwrap()
+            .unwrap()
+            .termination
+            .unwrap()
+            .outcome(),
+        Outcome::Failed
+    );
+    assert!(restarted
+        .collection(&a)
+        .unwrap()
+        .unwrap()
+        .closed_at_ms
+        .is_some());
+    restarted
+        .db
+        .write(|tx| {
+            tx.execute("INSERT INTO pending_delete VALUES('results/legacy',1)", [])?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(restarted
+        .pending_result_page(&guard, &f.run, 32)
+        .unwrap()
+        .is_empty());
+    assert_eq!(restarted.pending_deletes().unwrap(), vec!["results/legacy"]);
+}
+#[test]
+fn result_retention_reader_writer_and_legacy_backfill_are_fail_closed() {
+    use crate::service::completion::Target;
+    let f = fx();
+    let a = retention_ready(&f);
+    let reader = CoordinatorStore::open_read_only(f._dir.path()).unwrap();
+    let target = Target::Task(f.task.clone());
+    let pin = reader.result_read_pin(&target, Some(&a)).unwrap();
+    assert!(f
+        .store
+        .claim_result_page(&pin, &f.run, "", 1, 200, 10, Some("boot".into()), 0)
+        .is_err());
+    assert!(f.store.result_gc_guard(&f.run).is_err());
+    assert!(reader.result_gc_guard(&f.run).is_err());
+    assert!(reader
+        .result_read_pin(&target, Some(&AttemptId::generate()))
+        .is_err());
+    assert!(reader
+        .result_read_pin(&Target::Run(f.run.clone()), Some(&a))
+        .is_err());
+    drop(pin);
+    let writer = f.store.result_writer_pin(&a).unwrap();
+    assert!(f.store.result_gc_guard(&f.run).is_err());
+    drop(writer);
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    assert_eq!(
+        reader.result_read_pin(&target, None).unwrap_err().code(),
+        ErrorCode::Conflict
+    );
+    drop(guard);
+    let path = f._dir.path().join(format!("reader-pins/{}.lock", f.run));
+    // Legacy fixture only: production never unlinks a pin.
+    std::fs::remove_file(&path).unwrap();
+    assert_eq!(
+        reader.result_read_pin(&target, None).unwrap_err().code(),
+        ErrorCode::NotFound
+    );
+    assert!(!path.exists());
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    drop(guard);
+    reader.result_read_pin(&target, None).unwrap();
+}
+#[test]
+fn result_retention_keeps_unknown_unacked_open_and_pinned_references() {
+    let f = fx();
+    let a = retention_ready(&f);
+    let locator = crate::results::store::ResultStore::result_locator(&a);
+    f.store
+        .add_blob_ref(&blob("ref", &a, BlobKind::Result, &locator), 102)
+        .unwrap();
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    f.store
+        .claim_result_page(&guard, &f.run, "", 1, 200, 10, Some("boot".into()), 10)
+        .unwrap();
+    for mutation in ["UPDATE attempt SET observation='unknown'", "UPDATE attempt SET observation='known'; UPDATE collection SET acked_at_ms=NULL", "UPDATE collection SET acked_at_ms=NULL,closed_at_ms=NULL,verdict=NULL", "UPDATE collection SET acked_at_ms=102,closed_at_ms=101,verdict='complete'; UPDATE blob_ref SET pins=1"] {
+        f.store.db.write(move |tx| {tx.execute_batch(mutation)?;Ok(())}).unwrap();
+        let p=f.store.claim_result_page(&guard,&f.run,"",1,210,20,Some("boot".into()),10).unwrap();assert_eq!(p.removed,0);
+    }
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute_batch(
+                "UPDATE blob_ref SET pins=0; UPDATE attempt SET terminal_at_ms=1000;",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let future = f
+        .store
+        .claim_result_page(&guard, &f.run, "", 1, 210, 20, Some("boot".into()), 0)
+        .unwrap();
+    assert_eq!(future.removed, 0);
+    // Invalid clock must Hold even retention zero.
+    let p = f
+        .store
+        .claim_result_page(&guard, &f.run, "", 1, 500, u64::MAX, Some("boot".into()), 0)
+        .unwrap();
+    assert!(p.clock_held);
+    assert_eq!(p.removed, 0);
+}
+
+#[test]
+fn result_gc_run_selection_is_indexed_and_independent_of_task_facts() {
+    let f = fx();
+    let run = f.run.to_string();
+    f.store
+        .db
+        .write(move |tx| {
+            for _ in 0..2000 {
+                tx.execute(
+                    "INSERT INTO task(task_id,run_id,spec_json,created_at_ms) VALUES(?1,?2,'{}',1)",
+                    rusqlite::params![TaskId::generate().to_string(), run],
+                )?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        f.store.result_gc_next_run(None).unwrap(),
+        Some(f.run.clone())
+    );
+    assert_eq!(
+        f.store.result_gc_next_run(Some(f.run.clone())).unwrap(),
+        None
+    );
+    let plan = f
+        .store
+        .db
+        .call(|c| {
+            let mut q = c.prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                coordinator::query::RESULT_GC_NEXT_RUN
+            ))?;
+            let rows = q
+                .query_map([""], |r| r.get::<_, String>(3))?
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            Ok(rows)
+        })
+        .unwrap();
+    assert_eq!(plan.len(), 1, "{plan:?}");
+    assert!(
+        plan[0].contains("SEARCH run USING COVERING INDEX") && plan[0].contains("run_id>?"),
+        "{plan:?}"
+    );
+    // A facts query would fail; the GC path must never consult task metadata.
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute_batch("ALTER TABLE task RENAME TO unrelated_tasks;")?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(f.store.result_gc_next_run(None).unwrap(), Some(f.run));
+}
+
+#[test]
+fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
+    use crate::results::{retention, ResultStore};
+    use std::os::unix::fs::symlink;
+    let f = fx();
+    let a = retention_ready(&f);
+    let files = ResultStore::open(&f._dir.path().join("results")).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::create_dir(outside.path().join("logs")).unwrap();
+    std::fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
+    let locator = ResultStore::logs_locator(&a);
+    f.store
+        .add_blob_ref(&blob("claimed", &a, BlobKind::Log, &locator), 102)
+        .unwrap();
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    f.store
+        .claim_result_page(&guard, &f.run, "", 32, 200, 10, Some("boot".into()), 10)
+        .unwrap();
+    f.store
+        .claim_result_page(&guard, &f.run, "", 32, 210, 20, Some("boot".into()), 10)
+        .unwrap();
+    drop(guard);
+    symlink(outside.path(), files.root().join(a.as_str())).unwrap();
+    assert!(retention::page(&f.store, &files, &mut retention::Cursor::default(), 7).is_err());
+    assert_eq!(
+        std::fs::read(outside.path().join("logs/sentinel")).unwrap(),
+        b"safe"
+    );
+    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    assert_eq!(
+        f.store
+            .pending_result_page(&guard, &f.run, 32)
+            .unwrap()
+            .len(),
+        1
+    );
+    drop(guard);
+    std::fs::remove_file(files.root().join(a.as_str())).unwrap();
+    // The known claim alone permits a missing object to finish successfully.
+    assert_eq!(
+        retention::page(&f.store, &files, &mut retention::Cursor::default(), 7)
+            .unwrap()
+            .deleted,
+        1
+    );
+}
+
+#[test]
+fn enqueue_does_not_publish_run_when_reader_pin_cannot_be_secured() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let pins = f._dir.path().join("reader-pins");
+    std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(f
+        .store
+        .enqueue(&run, None, &json!({}), &[(task.clone(), json!({}))], 2)
+        .is_err());
+    assert!(f.store.query_run(run.clone()).unwrap().is_none());
+    assert!(f.store.query_task(task.clone()).unwrap().is_none());
+    std::fs::set_permissions(&pins, std::fs::Permissions::from_mode(0o700)).unwrap();
+    f.store
+        .enqueue(&run, None, &json!({}), &[(task, json!({}))], 2)
+        .unwrap();
+    let reader = CoordinatorStore::open_read_only(f._dir.path()).unwrap();
+    let pin = reader
+        .result_read_pin(&crate::service::completion::Target::Run(run.clone()), None)
+        .unwrap();
+    assert!(f.store.result_gc_guard(&run).is_err());
+    drop(pin);
+}
+
+#[test]
+fn capability_durable_schema_fence_rejects_old_binaries_and_indexes_placement() {
+    use super::policy::{Access, Incompat};
+    for kind in [DbKind::Coordinator, DbKind::Worker] {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("contract.db");
+        let steps = schema::steps(kind);
+        let previous = steps.len() - 1;
+        drop(
+            db::open_with(
+                &path,
+                kind.as_str(),
+                &steps[..previous],
+                schema::compat(previous),
+                Access::ReadWrite,
+            )
+            .unwrap(),
+        );
+        let current = Db::open(&path, kind, Access::ReadWrite).unwrap();
+        assert_eq!(
+            current
+                .call(|c| Ok(c.query_row(
+                    "SELECT value FROM schema_meta WHERE key='execution_requirements_v1'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )?))
+                .unwrap(),
+            "1"
+        );
+        assert_eq!(
+            current
+                .call(|c| Ok(c.query_row(
+                    "SELECT value FROM schema_meta WHERE key='frozen_toolchains_v1'",
+                    [],
+                    |r| r.get::<_, String>(0)
+                )?))
+                .unwrap(),
+            "1"
+        );
+        if kind == DbKind::Coordinator {
+            let plan=current.call(|c| {let mut q=c.prepare("EXPLAIN QUERY PLAN SELECT substr(payload_json,1,65537) FROM event WHERE kind='task_waiting' AND json_extract(payload_json,'$.task')=?1 ORDER BY seq DESC LIMIT 1")?;let rows=q.query_map(["task_example"],|r|r.get::<_,String>(3))?.collect::<std::result::Result<Vec<_>,_>>()?;Ok(rows)}).unwrap();
+            assert!(
+                plan.iter().any(|line| line.contains("event_task_waiting")),
+                "{plan:?}"
+            );
+            assert!(
+                !plan.iter().any(|line| line.contains("SCAN event")),
+                "{plan:?}"
+            );
+        }
+        drop(current);
+        for access in [Access::ReadOnly, Access::ReadWrite] {
+            let result = db::open_with(
+                &path,
+                kind.as_str(),
+                &steps[..previous],
+                schema::compat(previous),
+                access,
+            );
+            assert!(matches!(
+                result,
+                Err(StorageError::Incompatible(Incompat::Newer { .. }))
+            ));
+        }
+    }
+}
+
+#[test]
+fn source_preview_guard_fences_retry_commit_and_foreign_guards_without_mutation() {
+    use crate::service::completion::Target;
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let target = Target::Run(f.run.clone());
+    let prepare = || match f
+        .store
+        .prepare_retry(target.clone(), 0, "source-fence".into())
+        .unwrap()
+    {
+        RetryPreparation::Prepared(p) => p,
+        _ => panic!("expected prepare"),
+    };
+    let source = crate::source::SourceStore::open(f._dir.path()).unwrap();
+    let prepared = prepare();
+    let exclusive = source.retention.guard(true).unwrap();
+    assert!(f
+        .store
+        .prepare_retry(target.clone(), 0, "blocked-preflight".into())
+        .is_err());
+    assert!(f.store.commit_retry(prepared, false, 40).is_err());
+    assert_eq!(
+        f.store.completion(target.clone()).unwrap().control_revision,
+        0
+    );
+    drop(exclusive);
+    let other = tempfile::tempdir().unwrap();
+    let foreign = crate::source::SourceStore::open(other.path())
+        .unwrap()
+        .mutation_guard()
+        .unwrap();
+    assert!(f
+        .store
+        .commit_retry_guarded(prepare(), false, 40, foreign)
+        .is_err());
+    assert_eq!(
+        f.store.completion(target.clone()).unwrap().control_revision,
+        0
+    );
+    let shared = source.mutation_guard().unwrap();
+    assert!(source.retention.guard(true).is_err());
+    f.store
+        .commit_retry_guarded(prepare(), false, 40, shared)
+        .unwrap();
+    assert_eq!(f.store.completion(target).unwrap().control_revision, 1);
+    drop(source.retention.guard(true).unwrap());
+}
+
+#[test]
+fn future_run_expiry_fences_retry_preflight_commit_and_enqueue_without_mutation() {
+    use crate::service::completion::Target;
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let target = Target::Run(f.run.clone());
+    let prepared = match f
+        .store
+        .prepare_retry(target.clone(), 0, "before-expiry".into())
+        .unwrap()
+    {
+        RetryPreparation::Prepared(p) => p,
+        _ => panic!("expected prepared retry"),
+    };
+    let sources = crate::source::SourceStore::open(f._dir.path()).unwrap();
+    {
+        let _exclusive = sources.retention.guard(true).unwrap();
+        // Fixture-only insertion: production A exposes no expiry mutator.
+        rusqlite::Connection::open(sources.root().join("retention.db"))
+            .unwrap()
+            .execute(
+                "INSERT INTO run_expiry VALUES(?1,?2,?3)",
+                rusqlite::params![
+                    f.run.as_str(),
+                    prepared.source_id.as_str(),
+                    prepared.manifest_digest.as_str()
+                ],
+            )
+            .unwrap();
+    }
+    match f
+        .store
+        .prepare_retry(target.clone(), 0, "after-expiry".into())
+    {
+        Err(error) => assert!(error.to_string().contains("run expired")),
+        Ok(_) => panic!("expired preflight accepted"),
+    }
+    assert!(f
+        .store
+        .commit_retry(prepared, false, 40)
+        .unwrap_err()
+        .to_string()
+        .contains("run expired"));
+    assert!(f
+        .store
+        .enqueue(
+            &f.run,
+            None,
+            &json!({}),
+            &[(TaskId::generate(), json!({}))],
+            40
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("run expired"));
+    assert_eq!(f.store.completion(target).unwrap().control_revision, 0);
+    assert_eq!(f.store.attempts_of_task(&f.task).unwrap().len(), 1);
 }

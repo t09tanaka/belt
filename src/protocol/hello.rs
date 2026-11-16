@@ -14,7 +14,16 @@ pub const PROTOCOL_VERSIONS: &[u32] = &[1];
 
 /// Features this build implements. `blob_resume` is offset and digest resume of
 /// blob transfer, `log_resume` the offset and sequence resume of logs.
-pub const SUPPORTED_FEATURES: &[&str] = &["blob_resume", "log_resume"];
+pub const SUPPORTED_FEATURES: &[&str] = &[
+    crate::wire::PREPARATION_PROBE_FEATURE,
+    crate::setup::observation_transport::FEATURE,
+    crate::forecast::COMMAND_FEATURE,
+    "blob_resume",
+    "log_resume",
+    "output_bundles_v1",
+    crate::toolchain::capability::FEATURE,
+    crate::toolchain::contract::FEATURE,
+];
 
 /// What one side offers and requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -128,6 +137,7 @@ pub fn verify_response(
 /// What a worker reports about itself in `hello`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerIdentity {
+    pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     pub worker_id: WorkerId,
     pub worker_boot_id: WorkerBootId,
     pub agent_epoch: AgentEpoch,
@@ -140,6 +150,16 @@ pub struct WorkerIdentity {
 impl WorkerIdentity {
     pub fn response(&self, cluster_id: &ClusterId, negotiated: &Negotiated) -> HelloResponse {
         HelloResponse {
+            capabilities: negotiated
+                .features
+                .iter()
+                .any(|v| v == crate::toolchain::capability::FEATURE)
+                .then(|| self.capabilities.clone())
+                .flatten()
+                .map(|mut report| {
+                    report.features.retain(|v| negotiated.features.contains(v));
+                    report
+                }),
             schema_version: SchemaVersion::CURRENT,
             cluster_id: cluster_id.clone(),
             protocol_version: negotiated.version,
@@ -186,6 +206,7 @@ mod tests {
 
     fn identity() -> WorkerIdentity {
         WorkerIdentity {
+            capabilities: None,
             worker_id: WorkerId::parse("w1").unwrap(),
             worker_boot_id: WorkerBootId::parse("boot1").unwrap(),
             agent_epoch: AgentEpoch(4),
@@ -193,6 +214,47 @@ mod tests {
             profile_fingerprint: Digest::of_bytes(b"p"),
             coordinator_epoch: CoordinatorEpoch(9),
         }
+    }
+
+    #[test]
+    fn capabilities_are_reported_only_when_negotiated_and_features_are_intersected() {
+        use crate::toolchain::capability::{WorkerCapabilities, FEATURE};
+        let mut id = identity();
+        id.capabilities = Some(WorkerCapabilities {
+            disk_free_bytes: None,
+            resource_budget: None,
+            schema_version: 1,
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            profile: "p".into(),
+            profile_digest: Digest::of_bytes(b"definition"),
+            execution_uid: 1,
+            protocol_versions: vec![1],
+            profile_fingerprint: Digest::of_bytes(b"p"),
+            tools: Default::default(),
+            features: [FEATURE.into(), "private-feature".into()].into(),
+        });
+        let c = ClusterId::generate();
+        let mut n = Negotiated {
+            version: 1,
+            features: vec![FEATURE.into()],
+        };
+        let response = id.response(&c, &n);
+        assert_eq!(
+            response.capabilities.unwrap().features,
+            [FEATURE.into()].into()
+        );
+        assert!(id
+            .capabilities
+            .as_ref()
+            .unwrap()
+            .features
+            .contains("private-feature"));
+        n.features.clear();
+        assert!(id.response(&c, &n).capabilities.is_none());
+        id.capabilities = None;
+        n.features.push(FEATURE.into());
+        assert!(id.response(&c, &n).capabilities.is_none());
     }
 
     fn code(e: ApiError) -> (ErrorCode, String) {

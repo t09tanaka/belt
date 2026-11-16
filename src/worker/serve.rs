@@ -35,6 +35,7 @@ pub fn identity(agent: &Agent) -> Result<WorkerIdentity, ApiError> {
         .max_coordinator_epoch()
         .map_err(|e| ApiError::new(e.code(), format!("the highest coordinator epoch: {e}")))?;
     Ok(WorkerIdentity {
+        capabilities: agent.capabilities(),
         worker_id: cfg.worker_id.clone(),
         worker_boot_id: cfg.boot_id.clone(),
         agent_epoch: agent.agent_epoch(),
@@ -51,14 +52,33 @@ pub async fn serve_connection(
     cluster_id: ClusterId,
     permits: Arc<Semaphore>,
 ) -> Result<(), ServeError> {
-    let me = identity(&agent).map_err(ServeError::Identity)?;
+    let identity_agent = agent.clone();
+    let me = tokio::task::spawn_blocking(move || identity(&identity_agent))
+        .await
+        .map_err(|e| {
+            ServeError::Identity(ApiError::new(
+                ErrorCode::Internal,
+                format!("worker identity task: {e}"),
+            ))
+        })?
+        .map_err(ServeError::Identity)?;
     let accepted = accept(io, ServerConfig::new(cluster_id, me)).await?;
     let session = Session {
         coordinator_epoch: accepted.coordinator_epoch,
     };
+    let capabilities_negotiated = accepted
+        .negotiated
+        .features
+        .iter()
+        .any(|v| v == crate::toolchain::capability::FEATURE);
+    let negotiated_features = accepted.negotiated.features;
     let mut incoming = accepted.incoming;
     loop {
-        let Some(InboundRequest { request, responder }) = incoming.next().await else {
+        let Some(InboundRequest {
+            mut request,
+            responder,
+        }) = incoming.next().await
+        else {
             return Ok(());
         };
         // No further request is taken from this connection until this one
@@ -68,10 +88,86 @@ pub async fn serve_connection(
             return Ok(());
         };
         let agent = agent.clone();
+        let negotiated_features = negotiated_features.clone();
         tokio::spawn(async move {
+            if matches!(&request, crate::wire::Request::PreparationProbe(_))
+                && !negotiated_features
+                    .iter()
+                    .any(|v| v == crate::wire::PREPARATION_PROBE_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "preparation probe was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
+            if matches!(&request, crate::wire::Request::ForecastCommand(_))
+                && !negotiated_features
+                    .iter()
+                    .any(|v| v == crate::forecast::COMMAND_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "command forecast was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
+            let requires_toolchains = matches!(
+                &request,
+                crate::wire::Request::ResolveToolchains(_)
+            ) || matches!(&request, crate::wire::Request::SubmitAttempt(r) if r.payload.toolchains.is_some());
+            if requires_toolchains
+                && !negotiated_features
+                    .iter()
+                    .any(|v| v == crate::toolchain::contract::FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "frozen toolchains were not negotiated",
+                    ))
+                    .await;
+                return;
+            }
+            if !capabilities_negotiated
+                && matches!(&request, crate::wire::Request::SubmitAttempt(r) if !r.payload.requirements.is_empty())
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "constrained attempt requires worker_capabilities_v1 negotiation",
+                    ))
+                    .await;
+                drop(permit);
+                return;
+            }
+            let observations_negotiated = negotiated_features
+                .iter()
+                .any(|v| v == crate::setup::observation_transport::FEATURE);
+            if !observations_negotiated {
+                if let crate::wire::Request::Inspect(r) = &mut request {
+                    r.preparation_observations = None;
+                }
+            }
             let done = tokio::task::spawn_blocking(move || agent.handle(session, request)).await;
             let _ = match done {
-                Ok(Ok(response)) => responder.respond(response).await,
+                Ok(Ok(mut response)) => {
+                    if let crate::wire::Response::Inspect(r) = &mut response {
+                        if !observations_negotiated {
+                            r.preparation_observations = None;
+                        }
+                        if !capabilities_negotiated {
+                            r.capabilities = None;
+                        } else if let Some(report) = &mut r.capabilities {
+                            report.features.retain(|v| negotiated_features.contains(v));
+                        }
+                    }
+                    responder.respond(response).await
+                }
                 Ok(Err(error)) => responder.fail(error).await,
                 Err(_) => {
                     responder

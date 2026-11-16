@@ -570,7 +570,7 @@ fn concurrent_attempts_of_one_repository_do_not_collide() {
         }
         // every thread asks for the clone itself, as separate processes would
         let results: Vec<_> = std::thread::scope(|s| {
-            let hs: Vec<_> = (0..8)
+            let hs: Vec<_> = (0..16)
                 .map(|i| {
                     let (f, store, b) = (&f, &store, &b);
                     let (m1, m2) = (&m1, &m2);
@@ -596,7 +596,7 @@ fn concurrent_attempts_of_one_repository_do_not_collide() {
         assert_eq!(clones.len(), 1, "{}: one canonical clone", b.name);
         let roots: std::collections::BTreeSet<_> =
             results.iter().map(|(_, w, _)| w.root.clone()).collect();
-        assert_eq!(roots.len(), 8);
+        assert_eq!(roots.len(), 16);
         for (i, w, _) in &results {
             let has_second = w.root.join("second.txt").exists();
             assert_eq!(has_second, i % 2 == 1, "{}: attempt {i}", b.name);
@@ -606,7 +606,7 @@ fn concurrent_attempts_of_one_repository_do_not_collide() {
             );
         }
         let clone = clones.into_iter().next().unwrap();
-        assert_eq!(branches(&f, &clone).len(), 8);
+        assert_eq!(branches(&f, &clone).len(), 16);
         // and they go away together
         std::thread::scope(|s| {
             for (_, w, ws) in &results {
@@ -1199,8 +1199,9 @@ fn in_place_wants_the_top_of_a_worktree_inside_which_the_cwd_stays() {
     // not a Git worktree
     let plain = f.root.join("plain");
     std::fs::create_dir_all(&plain).unwrap();
-    let e = ws.open_in_place(&plain, Path::new(""), true).unwrap_err();
-    assert_eq!(e.code, ErrorCode::InvalidInput);
+    let original = ws.open_in_place(&plain, Path::new(""), true).unwrap();
+    ws.remove(&original).unwrap();
+    assert!(plain.is_dir());
     // inside one, not its top
     let e = ws
         .open_in_place(&f.dir.join("pkg"), Path::new(""), true)

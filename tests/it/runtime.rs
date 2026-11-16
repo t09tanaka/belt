@@ -56,8 +56,18 @@ fn runtime_factory_enables_setup_and_starts_agent() {
         runtime.setup_config().supervisor_exe,
         runtime.agent_config().supervisor_exe
     );
-    assert_eq!(runtime.setup_config().env, input.env);
-    assert_eq!(runtime.setup_config().profile, "custom");
+    for (key, value) in &input.env {
+        assert_eq!(runtime.setup_config().env.get(key), Some(value));
+    }
+    assert_eq!(runtime.agent_config().profile, "default");
+    assert!(runtime
+        .setup_config()
+        .profile
+        .starts_with("default:sha256:"));
+    assert_ne!(
+        runtime.agent_config().profile_fingerprint,
+        Digest::of_bytes(b"")
+    );
     assert_eq!(
         runtime.setup_config().traffic_state_dir,
         runtime.agent_config().traffic_state_dir
@@ -156,12 +166,14 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
         WorkerTarget::Local(&local),
         connected(&c, "local").await,
     )
+    .await
     .unwrap();
     cfg.attach_worker(
         &c,
         WorkerTarget::Remote("remote"),
         connected(&c, "remote").await,
     )
+    .await
     .unwrap();
     assert_eq!(c.scheduler().priority_of(&local), -9);
     assert_eq!(c.scheduler().priority_of(&remote), 21);
@@ -174,6 +186,7 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
     ] {
         assert!(cfg
             .attach_worker(&c, target, connected(&c, "other").await)
+            .await
             .is_err());
     }
     assert_eq!(c.scheduler().priority_of(&other), 0);
@@ -190,6 +203,7 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
             WorkerTarget::Local(&local),
             connected(&foreign, "local").await
         )
+        .await
         .is_err());
     cfg.local_worker.value = false;
     assert!(cfg
@@ -198,6 +212,7 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
             WorkerTarget::Local(&local),
             connected(&c, "local").await
         )
+        .await
         .is_err());
     assert_eq!(c.scheduler().priority_of(&local), -9);
 }

@@ -6,6 +6,7 @@ pub mod coordinator;
 pub mod error;
 pub mod forecast;
 pub mod ids;
+pub mod outputs;
 pub mod platform;
 pub mod protocol;
 pub mod results;
@@ -21,3 +22,8 @@ pub mod toolchain;
 pub mod wire;
 pub mod worker;
 pub mod workspace;
+
+pub mod ci;
+
+#[cfg(test)]
+mod test_child;

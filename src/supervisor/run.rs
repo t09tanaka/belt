@@ -412,6 +412,7 @@ pub(crate) fn keep_artifacts(
     spec: &SuperviseSpec,
     store: &WorkerStore,
     masker: &Masker,
+    termination: &Termination,
 ) -> Result<()> {
     let Some(plan) = &spec.artifacts else {
         return Ok(());
@@ -459,6 +460,21 @@ pub(crate) fn keep_artifacts(
             }
         }
     }
+    let mut remaining = crate::outputs::MAX_ATTEMPT_FILES;
+    for d in &plan.outputs {
+        if !crate::outputs::eligible(d.when, termination.outcome(), true) {
+            continue;
+        }
+        match super::bundles::store_bundle(&root, attempt, plan, d, &forbidden, &mut remaining) {
+            Ok(record) => kept.push(record),
+            Err(e) => not_stored.push(ArtifactNotStored {
+                name: d.name.clone(),
+                path: d.paths.first().cloned().unwrap_or_default(),
+                if_missing: d.if_missing,
+                reason: not_stored_reason(&e),
+            }),
+        }
+    }
     let at = platform::wall_ms();
     store.append_events_unseen(
         Some(&rec.run_id),
@@ -468,15 +484,16 @@ pub(crate) fn keep_artifacts(
         &refused,
         at,
     )?;
+    let mut fixed_event = artifacts_event(&kept, &not_stored);
+    if !plan.outputs.is_empty() {
+        fixed_event["outputs_evaluated"] = json!(true);
+    }
     store.append_events_unseen(
         Some(&rec.run_id),
         attempt,
         ARTIFACTS_EVENT,
         "set",
-        &[(
-            ARTIFACTS_EVENT_KEY.to_string(),
-            artifacts_event(&kept, &not_stored),
-        )],
+        &[(ARTIFACTS_EVENT_KEY.to_string(), fixed_event)],
         at,
     )?;
     Ok(())
@@ -804,7 +821,12 @@ impl Control<'_> {
             label: None,
             weight: node.weight,
             front: false,
-            key: None,
+            key: profile_history_key(
+                &self.traffic.ctx,
+                &node.cwd,
+                &node.argv,
+                spec.profile_fingerprint.as_ref(),
+            )?,
             argv: node.argv.clone(),
             cwd: node.cwd.clone(),
             env: Some(node.env.clone()),
@@ -977,6 +999,13 @@ impl Control<'_> {
         id: &str,
         limits: task_traffic_controller::admit::Limits,
     ) -> Result<NodeEnd> {
+        // Keep the actual registered key and weight, rather than deriving a
+        // second identity after project execution may have changed its files.
+        // An unreadable snapshot loses this sample, never invents one.
+        let measurement_entry =
+            task_traffic_controller::ledger::Ledger::load(&self.traffic.ctx.paths.ledger_file())
+                .ok()
+                .and_then(|ledger| ledger.entries.into_iter().find(|entry| entry.id == id));
         let run_since = platform::monotonic_ms();
         let ctx = self.traffic.ctx.clone();
         let mut watch = Watch::default();
@@ -1054,6 +1083,55 @@ impl Control<'_> {
             (_, None) => TerminalKind::SpawnFailed,
         };
         let confirmed = managed::finish(&self.traffic.ctx, guard, kind).is_ok();
+        if confirmed && reason.is_none() && exit == Some(Exit::Code(0)) {
+            if let Ok(ran) = &ran {
+                if !ran.outcome.tracker_unknown && !ran.outcome.descendants_left {
+                    if let Some(index) = self
+                        .spec
+                        .nodes
+                        .iter()
+                        .position(|n| n.node_id == node.node_id)
+                    {
+                        // Telemetry is best effort and cannot change execution settlement.
+                        let _ = crate::setup::observation::record_node(
+                            self.spec,
+                            index,
+                            ran.outcome.wall_secs,
+                        );
+                    }
+                }
+            }
+        }
+        if confirmed && reason.is_none() {
+            if let (Some(entry), Ok(ran)) = (measurement_entry, &ran) {
+                if !ran.outcome.tracker_unknown && !ran.outcome.descendants_left {
+                    let record = task_traffic_controller::history::Record {
+                        key: entry.key,
+                        repo: entry.repo,
+                        subdir: entry.subdir,
+                        argv: entry.argv,
+                        key_argv: String::new(),
+                        started_at: ran.started_at,
+                        wall_secs: ran.outcome.wall_secs,
+                        cpu_secs: ran.outcome.cpu_secs,
+                        max_rss_bytes: ran.outcome.max_rss_bytes,
+                        exit_code: ran.outcome.exit.code(),
+                        weight_used: entry.weight,
+                        contended: ran.contended,
+                        measurement_id: None,
+                    };
+                    // The command id fences replay. A crash between durable
+                    // finish and this append can lose one sample; recovery
+                    // never executes or appends a second one for this id.
+                    if managed::record_measurement(&self.traffic.ctx, id, &record).is_err() {
+                        eprintln!(
+                            "supervise: runtime history write failed; computation result retained"
+                        );
+                    }
+                }
+            }
+        }
+
         Ok(NodeEnd {
             reason,
             exit,
@@ -1474,15 +1552,17 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
                 )],
                 platform::wall_ms(),
             )?;
-            keep_artifacts(spec, &store, &masker)?;
-            Termination::new(crate::state::Outcome::Succeeded, None, None)
-                .expect("a success without an exit is valid")
+            let term = Termination::new(crate::state::Outcome::Succeeded, None, None)
+                .expect("a success without an exit is valid");
+            keep_artifacts(spec, &store, &masker, &term)?;
+            term
         }
     } else {
+        let term = termination(end.reason, end.exit);
         if !store.launches(attempt)?.is_empty() {
-            keep_artifacts(spec, &store, &masker)?;
+            keep_artifacts(spec, &store, &masker, &term)?;
         }
-        termination(end.reason, end.exit)
+        term
     };
     let (termination, finalized_here) = settle(&store, &root, attempt, &spool, term)?;
     Ok(Report {
@@ -1494,9 +1574,63 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
     })
 }
 
+// TTC's explicit key replaces its command identity rather than extending it.
+// Keep its normalized repo/subdir/work identity and add only an opaque profile
+// namespace: neither raw argv nor profile environment enters the override.
+pub(crate) fn profile_history_key(
+    ctx: &Context,
+    cwd: &Path,
+    argv: &[String],
+    profile: Option<&crate::ids::Digest>,
+) -> Result<Option<String>> {
+    let Some(profile) = profile else {
+        return Ok(None);
+    };
+    let command = task_traffic_controller::exec::command_key(ctx, cwd, None, argv)
+        .map_err(SupervisorError::traffic)?;
+    Ok(Some(format!(
+        "rtr-profile:{profile}:command:{}",
+        command.hash
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn profile_history_preserves_normalized_command_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Context::new(Paths::new(dir.path(), dir.path().join("config.toml")));
+        let profile_a = crate::ids::Digest::of_bytes(b"profile-a");
+        let profile_b = crate::ids::Digest::of_bytes(b"profile-b");
+        let check = vec!["cargo".into(), "check".into()];
+        let test = vec!["cargo".into(), "test".into()];
+        let wrapped = vec!["sh".into(), "-c".into(), "cargo check".into()];
+        let history = |argv: &[String], profile: &crate::ids::Digest| {
+            let override_key = profile_history_key(&ctx, dir.path(), argv, Some(profile)).unwrap();
+            task_traffic_controller::exec::command_key(
+                &ctx,
+                dir.path(),
+                override_key.as_deref(),
+                argv,
+            )
+            .unwrap()
+            .hash
+        };
+        assert_ne!(history(&check, &profile_a), history(&test, &profile_a));
+        assert_ne!(history(&check, &profile_a), history(&check, &profile_b));
+        assert_eq!(history(&check, &profile_a), history(&check, &profile_a));
+        assert_eq!(history(&check, &profile_a), history(&wrapped, &profile_a));
+        assert!(profile_history_key(&ctx, dir.path(), &check, None)
+            .unwrap()
+            .is_none());
+        let secret_argv = vec!["echo".into(), "private-value".into()];
+        let key = profile_history_key(&ctx, dir.path(), &secret_argv, Some(&profile_a))
+            .unwrap()
+            .unwrap();
+        assert!(!key.contains("private-value"));
+    }
 
     #[test]
     fn only_a_new_valid_grant_is_noted_even_when_the_diagnostic_cannot_be_written() {

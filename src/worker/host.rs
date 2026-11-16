@@ -15,6 +15,59 @@ use crate::wire::{AttemptPayload, SecretFile};
 use crate::workspace::Workspace;
 
 pub trait Host: Send + Sync {
+    /// Existing worker-local setup owner; access never initializes it.
+    fn setup_owner(&self) -> Option<&crate::setup::builder::Setups> {
+        None
+    }
+    /// Optional immutable telemetry; unavailable hosts make no cost claims.
+    fn preparation_observation_page(
+        &self,
+        _request: &crate::setup::observation_transport::ObservationPageRequest,
+    ) -> Option<crate::setup::observation_transport::ObservationPage> {
+        None
+    }
+    fn toolchain_registry(
+        &self,
+        _profile: &crate::toolchain::profile::Profile,
+        _base: crate::ids::Digest,
+    ) -> Result<Option<crate::toolchain::registry::Registry>, ApiError> {
+        Ok(None)
+    }
+    fn toolchain_poll(
+        &self,
+        _attempt: &AttemptId,
+        _request: &crate::toolchain::preparation::PreparationRequest,
+    ) -> Result<crate::toolchain::preparation::ToolPreparationPoll, ApiError> {
+        Err(ApiError::blocked(
+            crate::error::BlockedReason::EnvironmentMismatch,
+            "toolchain preparation is unavailable",
+        ))
+    }
+    fn setup_poll_bound(
+        &self,
+        attempt: &AcceptedAttempt,
+        payload: &AttemptPayload,
+        workspace: &Workspace,
+        binding: Option<&crate::toolchain::contract::ExecutionBinding>,
+    ) -> Result<SetupPoll, ApiError> {
+        if binding.is_some() {
+            return Err(ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                "bound setup is unavailable",
+            ));
+        }
+        self.setup_poll(attempt, payload, workspace)
+    }
+
+    fn admit(&self, payload: &AttemptPayload) -> Result<(), ApiError> {
+        if payload.in_place {
+            return Err(ApiError::new(
+                crate::error::ErrorCode::InvalidInput,
+                "in-place requires the parent local worker",
+            ));
+        }
+        Ok(())
+    }
     /// Once, before any secret is read (process-wide).
     fn disable_core_dumps(&self) -> Result<(), ApiError>;
     /// Plaintext secret bundles a crashed capture left in the source store.

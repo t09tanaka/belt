@@ -583,6 +583,18 @@ fn check_outputs(project: &ProjectConfig, problems: &mut Vec<String>) -> Vec<Out
             when: o.when.unwrap_or(OutputWhen::Always),
         });
     }
+    let declarations: Vec<crate::wire::OutputDecl> = out
+        .iter()
+        .map(|o| crate::wire::OutputDecl {
+            name: o.name.clone(),
+            paths: o.paths.clone(),
+            if_missing: crate::wire::MissingPolicy::Optional,
+            when: crate::wire::OutputWhen::Always,
+        })
+        .collect();
+    if let Err(why) = crate::outputs::validate(&[], &declarations) {
+        problems.push(format!("[[outputs]]: {why}"));
+    }
     out
 }
 
@@ -925,6 +937,31 @@ mod tests {
         assert_eq!(MIN_PRIORITY, -100);
         assert_eq!(MAX_PRIORITY, 100);
         assert_eq!(MAX_PRIORITY_STEP_SECONDS, 3600);
+    }
+    #[test]
+    fn generic_output_admission_checks_paths_and_folded_names() {
+        let mut project = ProjectConfig {
+            outputs: vec![crate::config::model::Output {
+                name: "reports".into(),
+                paths: vec!["reports/**".into()],
+                required: Some(true),
+                when: Some(OutputWhen::Success),
+            }],
+            ..ProjectConfig::default()
+        };
+        let mut problems = vec![];
+        assert_eq!(check_outputs(&project, &mut problems).len(), 1);
+        assert!(problems.is_empty());
+        project.outputs[0].paths = vec!["../escape".into()];
+        check_outputs(&project, &mut problems);
+        assert!(!problems.is_empty());
+        project.outputs[0].paths = vec!["reports/**".into()];
+        let mut second = project.outputs[0].clone();
+        second.name = "Reports/child".into();
+        project.outputs.push(second);
+        problems.clear();
+        check_outputs(&project, &mut problems);
+        assert!(!problems.is_empty());
     }
 }
 

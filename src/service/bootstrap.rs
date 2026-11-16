@@ -18,7 +18,7 @@ const STARTUP: Duration = Duration::from_secs(20);
 
 /// Paths, persistent worker identity, and environment are chosen by the caller.
 /// No config/key/identity is implicitly created, and no global environment changes.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Spec {
     pub state_dir: PathBuf,
@@ -29,12 +29,15 @@ pub struct Spec {
     pub env: BTreeMap<String, String>,
     pub repo_root: Option<PathBuf>,
     pub expected_cluster: Option<ClusterId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_service: Option<PathBuf>,
 }
 
 /// A retained service input. The creator owns its lifecycle; retain across service
 /// restarts. A future uninstaller must verify this digest and file identity before
 /// removing it; this module never deletes/replaces an existing input.
-#[derive(Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManagedInput {
     pub path: PathBuf,
     pub sha256: String,
@@ -46,7 +49,7 @@ pub struct ManagedInput {
 /// any other content or unsafe metadata is refused without modification.
 pub fn write_input(path: &Path, spec: &Spec) -> anyhow::Result<ManagedInput> {
     use sha2::{Digest, Sha256};
-    validate(spec)?;
+    validate_paths(spec)?;
     resident::validate_components(path)?;
     resident::check_private_dir(
         path.parent()
@@ -93,6 +96,15 @@ pub fn daemon_argv(input: &Path) -> anyhow::Result<Vec<String>> {
 }
 
 fn validate(spec: &Spec) -> anyhow::Result<()> {
+    if spec.managed_service.is_some() {
+        validate_paths(spec)
+            .and_then(|()| super::init::validate_managed(spec))
+            .map_err(|_| super::init::binding_unconfirmed())
+    } else {
+        validate_paths(spec)
+    }
+}
+fn validate_paths(spec: &Spec) -> anyhow::Result<()> {
     resident::check_private_dir(&spec.state_dir)?;
     resident::check_private_dir(&spec.worker_state_dir)?;
     resident::validate_components(&spec.executable)?;
@@ -158,7 +170,21 @@ fn load_client(spec: &Spec) -> anyhow::Result<Client> {
 
 /// Connect to the owner or start one while holding a separate startup lock.
 /// The child owns the writable store; caller exit does not stop the child.
+pub(crate) async fn connect_managed<L: super::macos::Launcher>(
+    spec: &Spec,
+    launcher: &mut L,
+) -> anyhow::Result<Client> {
+    anyhow::ensure!(spec.managed_service.is_some(), "managed marker required");
+    super::init::managed_health(spec, launcher)
+        .await
+        .map_err(|_| super::init::binding_unconfirmed())?;
+    load_client(spec)
+}
+
 pub async fn ensure(spec: Spec) -> anyhow::Result<Client> {
+    if spec.managed_service.is_some() {
+        return connect_managed(&spec, &mut super::macos::NativeLauncher::default()).await;
+    }
     let copy = spec.clone();
     let lock = tokio::task::spawn_blocking(move || -> anyhow::Result<File> {
         validate(&copy)?;
@@ -275,7 +301,24 @@ pub fn daemon_main(input: Option<&Path>) -> i32 {
         }
         anyhow::ensure!(bytes.len() as u64 <= LIMIT, "bootstrap input too large");
         let spec: Spec = serde_json::from_slice(&bytes)?;
+        if spec.managed_service.is_some() {
+            anyhow::ensure!(
+                input
+                    == spec
+                        .managed_service
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .map(|p| p.join("coordinator.json"))
+                        .as_deref(),
+                "managed daemon requires its retained input path"
+            );
+        }
         validate(&spec)?;
+        let binding = if spec.managed_service.is_some() {
+            Some(super::init::managed_identity(&spec)?)
+        } else {
+            None
+        };
         let config = config::load::load(&spec.env, spec.repo_root.as_deref(), &Overlay::default())?;
         let boot = crate::platform::boot_id()
             .ok_or_else(|| anyhow::anyhow!("OS boot identity unavailable"))?;
@@ -295,7 +338,12 @@ pub fn daemon_main(input: Option<&Path>) -> i32 {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(async { Resident::start(&config, inputs).await?.run().await })
+            .block_on(async {
+                Resident::start_bound(&config, inputs, binding)
+                    .await?
+                    .run()
+                    .await
+            })
     })();
     match result {
         Ok(()) => 0,
@@ -303,5 +351,21 @@ pub fn daemon_main(input: Option<&Path>) -> i32 {
             let _ = writeln!(std::io::stderr(), "error: {e}");
             1
         }
+    }
+}
+
+/// Connect only: service health must never spawn a detached fallback owner.
+pub async fn health(spec: &Spec) -> anyhow::Result<Reply> {
+    validate(spec)?;
+    let client = load_client(spec)?;
+    let reply = client.request(Operation::Health).await?;
+    match &reply {
+        Reply::Health {
+            cluster_id,
+            worker_id,
+            ready: true,
+            ..
+        } if cluster_id == client.cluster_id() && worker_id == &spec.worker_id => Ok(reply),
+        _ => anyhow::bail!("resident identity/readiness unconfirmed"),
     }
 }

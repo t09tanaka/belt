@@ -12,6 +12,23 @@ use remote_task_runner::supervisor::stop::{
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
+/// Inner fixture commands already run inside the harness's shared TTC lease.
+/// Keep their private admission ledger, without depending on unrelated host load.
+pub fn fixture_traffic_config(state: &Path) {
+    let traffic = state.join("traffic");
+    std::fs::create_dir_all(&traffic).unwrap();
+    std::fs::set_permissions(&traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let config = task_traffic_controller::config::Config {
+        budget: 2,
+        cpu_threshold_percent: 100.0,
+        memory_reserve_mib: 0,
+        ..Default::default()
+    };
+    let path = traffic.join("config.toml");
+    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
 /// A temporary directory that can be removed even though the content-addressed
 /// stores under it are read-only by design (`tempfile` would leak it).
 pub struct Tmp(tempfile::TempDir);
@@ -131,9 +148,159 @@ pub fn kill_recorded_group(pid: u32, start: &str) {
     let _ = stop_group(&target, times, &NoEvidence);
 }
 
+/// The pid of the process that listens on the Unix socket at `socket`, as the
+/// kernel reports it for a new connection. None when nothing listens there.
+pub async fn listener_pid(socket: &Path) -> Option<u32> {
+    let stream = tokio::net::UnixStream::connect(socket).await.ok()?;
+    let pid = stream.peer_cred().ok()?.pid()?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 1)
+}
+
+/// A private fixture root that stops the resident daemon of `state` when the
+/// test ends, also while a failed assertion unwinds. The daemon runs detached
+/// in its own process group, so nothing else ends it with the test.
+pub struct DaemonRoot {
+    state: std::path::PathBuf,
+    // Removed after the daemon is stopped: fields drop after `Drop::drop`.
+    dir: tempfile::TempDir,
+}
+
+impl DaemonRoot {
+    pub fn new(dir: tempfile::TempDir, state: &Path) -> Self {
+        Self {
+            state: state.to_path_buf(),
+            dir,
+        }
+    }
+    pub fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for DaemonRoot {
+    fn drop(&mut self) {
+        stop_daemon(&self.state);
+    }
+}
+
+/// Wait up to `limit` until `pid` no longer is the live process that had the
+/// start identity `start`. True when it is gone (or only a zombie remains).
+async fn ended(pid: u32, start: &str, limit: std::time::Duration) -> bool {
+    let same = || process_start_identity(pid) == StartIdentity::Identity(start.to_string());
+    let _ = tokio::time::timeout(limit, async {
+        while same() {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    !same()
+}
+
+/// Stop the resident daemon that owns `state`, if one is listening: ask it to
+/// shut down, wait until its process is gone, and only when it stays, SIGKILL
+/// the listener's pid while it still has the start identity read here.
+/// Never panics (it runs during unwinding) and never searches the process
+/// table: a command line does not say which state directory a daemon owns.
+pub fn stop_daemon(state: &Path) {
+    use std::time::Duration;
+    let socket = state.join("parent/request.sock");
+    if !socket.exists() {
+        return;
+    }
+    let state = state.to_path_buf();
+    // A thread with its own runtime: the caller may be inside one.
+    let worker = std::thread::spawn(move || {
+        let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        runtime.block_on(async {
+            let Some(pid) = listener_pid(&socket).await else {
+                return;
+            };
+            let Some(start) = identity_of(pid) else {
+                return;
+            };
+            let client = remote_task_runner::storage::CoordinatorStore::open_read_only(&state)
+                .ok()
+                .and_then(|store| {
+                    remote_task_runner::service::resident::Client::load(
+                        &state,
+                        store.cluster_id().clone(),
+                    )
+                    .ok()
+                });
+            if let Some(client) = client {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    client.request(remote_task_runner::service::resident::Operation::Shutdown),
+                )
+                .await;
+            }
+            if !ended(pid, &start, Duration::from_secs(10)).await {
+                kill_recorded(pid, &start);
+                ended(pid, &start, Duration::from_secs(5)).await;
+            }
+        });
+    });
+    let _ = worker.join();
+}
+
 /// The pid written in a file, if it holds one.
 pub fn read_pid(path: &Path) -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+/// The host's system command directories as a toolchain registry must name
+/// them: canonical and without repeats. `/bin` is a symlink to `usr/bin` on a
+/// merged-usr Linux, and the registry refuses a search path through a symlink.
+pub fn system_search_path() -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    for dir in ["/usr/bin", "/bin"] {
+        let real = std::fs::canonicalize(dir).unwrap();
+        if !out.contains(&real) {
+            out.push(real);
+        }
+    }
+    out
+}
+
+/// [`system_search_path`] as the tail of a TOML array: `,'/usr/bin','/bin'`.
+pub fn system_search_path_toml() -> String {
+    system_search_path()
+        .iter()
+        .map(|dir| format!(",{:?}", dir.to_str().unwrap()))
+        .collect()
+}
+
+/// A directory to put first in a fixture's PATH: every probed tool that the
+/// fixture does not use is answered there, at once and always the same way,
+/// instead of by whatever the host has under `/usr/bin` or a package manager
+/// and however long that takes to start. `git` is left to the host: the
+/// fixtures run it.
+pub fn tool_stubs(root: &Path) -> std::path::PathBuf {
+    let dir = root.join("tool-stubs");
+    std::fs::create_dir(&dir).unwrap();
+    for tool in [
+        "node",
+        "npm",
+        "pnpm",
+        "yarn",
+        "rustc",
+        "cargo",
+        "flutter",
+        "dart",
+        "xcodebuild",
+        "xcrun",
+        "portool",
+        "fast-worktree",
+        "docker",
+    ] {
+        write_executable(&dir.join(tool), "#!/bin/sh\nexit 1\n");
+    }
+    dir
 }
 
 /// Write `text` to `path` and make it executable, so that it can be run at

@@ -16,7 +16,58 @@ use remote_task_runner::error::{ApiError, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::platform::wall_ms;
 use remote_task_runner::results::plan::{RunVerdict, TaskStanding, Verdict};
-use remote_task_runner::results::retention::sweep;
+// Deterministic clock samples for retention integration; production uses
+// suspend-aware platform samples and a persisted quarantine baseline.
+#[derive(Default)]
+struct Sweep {
+    deleted: Vec<String>,
+}
+fn sweep(
+    store: &remote_task_runner::storage::CoordinatorStore,
+    files: &ResultStore,
+    now: u64,
+    days: u32,
+) -> Result<Sweep, remote_task_runner::results::CollectError> {
+    let retention = remote_task_runner::results::plan::retention_ms(days);
+    let mut report = Sweep::default();
+    for run in store.query_runs(64, None)?.items {
+        let guard = store.result_gc_guard(&run.run_id)?;
+        // Give the fixture a full, known elapsed retention interval.
+        store.claim_result_page(
+            &guard,
+            &run.run_id,
+            "",
+            64,
+            1,
+            1,
+            Some("integration".into()),
+            retention,
+        )?;
+        let mut after = String::new();
+        loop {
+            let page = store.claim_result_page(
+                &guard,
+                &run.run_id,
+                &after,
+                64,
+                now,
+                now,
+                Some("integration".into()),
+                retention,
+            )?;
+            for claim in store.pending_result_page(&guard, &run.run_id, 64)? {
+                files.remove(&claim.locator)?;
+                store.finish_result_delete(&guard, &claim)?;
+                report.deleted.push(claim.locator);
+            }
+            match page.next {
+                Some(next) => after = next,
+                None => break,
+            }
+        }
+    }
+    Ok(report)
+}
 use remote_task_runner::results::{CollectConfig, CollectReport, ResultStore};
 use remote_task_runner::state::{
     AttemptState, Collection, Observation, Outcome, Receipt, Receipts, RunDisplay, Termination,
@@ -48,12 +99,14 @@ enum Lost {
 /// What an ended attempt left on the worker.
 #[derive(Debug, Clone, Default)]
 struct Out {
+    outputs_evaluated: Option<bool>,
     /// A result is stored (otherwise the attempt has its termination only).
     has_result: bool,
     /// The records of the result, each with the bytes the worker serves.
     artifacts: Vec<(ArtifactRecord, Vec<u8>)>,
     not_stored: Vec<ArtifactNotStored>,
     log: Vec<u8>,
+    stderr: Vec<u8>,
     /// The spool is closed: the log has its end mark.
     log_closed: bool,
     dropped: u64,
@@ -78,6 +131,7 @@ struct State {
     corrupt_chunks: u32,
     /// The next chunk says it is from one byte further.
     shift_chunk: bool,
+    shift_log: bool,
     /// What was left behind for an attempt that has no result yet is stored
     /// as its result the moment an acknowledgement arrives.
     result_appears_on_ack: bool,
@@ -98,7 +152,15 @@ fn err(code: ErrorCode) -> ApiError {
 }
 
 fn ended(outcome: Outcome) -> Termination {
-    Termination::new(outcome, None, None).unwrap()
+    Termination::new(
+        outcome,
+        None,
+        (outcome == Outcome::TimedOut).then_some(remote_task_runner::state::TimeoutInfo {
+            kind: remote_task_runner::state::TimeoutKind::ResourceWait,
+            phase: remote_task_runner::state::TimeoutPhase::Waiting,
+        }),
+    )
+    .unwrap()
 }
 
 fn digest_of(job: &Job) -> Digest {
@@ -162,6 +224,10 @@ impl Worker {
     }
 
     fn status(a: &AttemptId, job: &Job) -> AttemptStatus {
+        let mut receipts = Receipts::default();
+        if job.out.outputs_evaluated == Some(false) {
+            receipts.mark(Receipt::CommandRegistered, 1);
+        }
         AttemptStatus {
             schema_version: SchemaVersion::CURRENT,
             attempt_id: a.clone(),
@@ -171,7 +237,7 @@ impl Worker {
             worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
             agent_epoch: AgentEpoch(1),
             state: job.state,
-            receipts: Receipts::default(),
+            receipts,
             spawned_at_ms: None,
             observation: Observation::Known,
             termination: job.termination,
@@ -194,6 +260,8 @@ impl Worker {
         };
         match request {
             Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
+                preparation_observations: None,
+                capabilities: None,
                 schema_version: SchemaVersion::CURRENT,
                 worker_id: self.id.clone(),
                 worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
@@ -242,6 +310,10 @@ impl Worker {
                 let job = &s.jobs[&r.attempt_id];
                 let stored = job.out.has_result;
                 Ok(Response::GetResult(GetResultResponse {
+                    outputs_evaluated: job
+                        .out
+                        .outputs_evaluated
+                        .unwrap_or(stored && !job.payload.outputs.is_empty()),
                     schema_version: SchemaVersion::CURRENT,
                     attempt_id: r.attempt_id.clone(),
                     generation: r.generation,
@@ -261,17 +333,20 @@ impl Worker {
                 }))
             }
             Request::ReadLog(r) => {
-                job_of(&mut s, &r.attempt_id)?;
+                if !s.jobs.contains_key(&r.attempt_id) {
+                    return Err(err(ErrorCode::NotFound));
+                }
+                let shift = std::mem::take(&mut s.shift_log);
                 let out = &s.jobs[&r.attempt_id].out;
                 let log: &[u8] = match r.stream {
                     LogStream::Stdout => &out.log,
-                    LogStream::Stderr => &[],
+                    LogStream::Stderr => &out.stderr,
                 };
                 let from = (r.offset as usize).min(log.len());
                 let to = (from + r.max_bytes.max(1) as usize).min(log.len());
                 Ok(Response::ReadLog(ReadLogResponse {
                     schema_version: SchemaVersion::CURRENT,
-                    offset: r.offset,
+                    offset: r.offset + u64::from(shift),
                     data: Bytes(log[from..to].to_vec()),
                     next_offset: to as u64,
                     eof: out.log_closed && to == log.len(),
@@ -351,6 +426,14 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
 }
 
 impl WorkerLink for Worker {
+    fn cost_transport(&self) -> Option<remote_task_runner::scheduler::measured::Transport> {
+        Some(remote_task_runner::scheduler::measured::Transport {
+            worker_boot: WorkerBootId::parse("boot-1").unwrap(),
+            agent_epoch: AgentEpoch(1),
+            policy: "verified-memory-fixture-v1".into(),
+        })
+    }
+
     fn call(
         &self,
         request: Request,
@@ -410,7 +493,7 @@ struct Fx {
 
 fn fx() -> Fx {
     Fx {
-        dir: tempfile::tempdir().unwrap(),
+        dir: tempfile::tempdir_in(std::fs::canonicalize(std::env::temp_dir()).unwrap()).unwrap(),
         w: Worker::new("w-a"),
     }
 }
@@ -430,6 +513,12 @@ impl Fx {
     /// Start a coordinator and open the result store on the state directory:
     /// the first, or the next after the one before was dropped.
     fn open(&self) -> (Coordinator, Arc<ResultStore>) {
+        self.open_with(Arc::new(remote_task_runner::scheduler::UnknownCosts))
+    }
+    fn open_with(
+        &self,
+        costs: Arc<dyn remote_task_runner::scheduler::CostModel>,
+    ) -> (Coordinator, Arc<ResultStore>) {
         let started = std::time::Instant::now();
         let store = loop {
             match CoordinatorStore::open(self.dir.path(), 1) {
@@ -447,11 +536,14 @@ impl Fx {
             lease_ms: 60_000,
             worker_budget_ms: 10_000,
         };
-        let c = Coordinator::start(store, cfg).unwrap();
-        c.attach(
+        let scheduler =
+            remote_task_runner::scheduler::Scheduler::new(Default::default(), costs).unwrap();
+        let c = Coordinator::start_with(store, cfg, scheduler).unwrap();
+        c.try_attach(
             self.w.id.clone(),
             Arc::clone(&self.w) as Arc<dyn WorkerLink>,
-        );
+        )
+        .unwrap();
         let files = ResultStore::open(&self.dir.path().join("results")).unwrap();
         (c, Arc::new(files))
     }
@@ -467,6 +559,10 @@ fn decl(name: &str, if_missing: MissingPolicy) -> ArtifactDecl {
 
 fn spec(artifacts: Vec<ArtifactDecl>) -> TaskSpec {
     TaskSpec {
+        toolchains: None,
+        outputs: Vec::new(),
+        requirements: Default::default(),
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
@@ -495,6 +591,7 @@ fn stored(
     bytes: &[u8],
 ) -> (ArtifactRecord, Vec<u8>) {
     let record = ArtifactRecord {
+        encoding: remote_task_runner::wire::ArtifactEncoding::Raw,
         name: name.into(),
         path: name.into(),
         size: bytes.len() as u64,
@@ -559,6 +656,7 @@ fn two() -> Vec<ArtifactDecl> {
 fn full(fx: &Fx, a: &AttemptId) -> Out {
     let p = fx.w.payload(a);
     Out {
+        outputs_evaluated: None,
         has_result: true,
         artifacts: vec![
             stored(a, &p, "alpha.txt", ALPHA),
@@ -566,6 +664,7 @@ fn full(fx: &Fx, a: &AttemptId) -> Out {
         ],
         not_stored: vec![],
         log: LOG.to_vec(),
+        stderr: vec![],
         log_closed: true,
         dropped: 0,
     }
@@ -688,7 +787,7 @@ async fn the_outputs_are_fetched_verified_published_and_acknowledged_last() {
     assert_eq!(fx.w.count("result"), 1);
     assert_eq!(fx.w.count("ack"), 1);
     assert_eq!(fx.w.offsets("blob"), vec![0, 4, 8, 0, 4]);
-    assert_eq!(fx.w.offsets("log"), vec![0, 4, 8, 0]);
+    assert_eq!(fx.w.offsets("log"), vec![0, 0, 0, 4, 8, 0]);
     let row = c.store().collection(&a).unwrap().unwrap();
     let logs = row.logs.unwrap();
     assert_eq!(logs["stdout"]["bytes"], 10);
@@ -1253,7 +1352,8 @@ async fn collected_results_are_kept_for_the_retention_and_then_deleted() {
     tokio::time::sleep(Duration::from_millis(20)).await;
     assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
     end(&fx, &c, &b, Outcome::Succeeded, full(&fx, &b)).await;
-    fx.w.set(|s| s.trip = Some(("log", 5, Lost::Request)));
+    let next_log = fx.w.count("log") + 1;
+    fx.w.set(|s| s.trip = Some(("log", next_log, Lost::Request)));
     assert_eq!(collect(&c, &files).await.pending, vec![b.clone()]);
 
     // The retention runs from the later of the end and the collection.
@@ -1350,7 +1450,7 @@ async fn a_parent_that_dies_between_a_file_operation_and_its_record_continues_fr
 }
 
 #[tokio::test]
-async fn what_is_not_on_disk_as_recorded_is_collected_again_before_the_acknowledgement() {
+async fn missing_result_and_artifacts_are_collected_again_before_the_acknowledgement() {
     let fx = fx();
     let (c, files) = fx.open();
     let (_, _, a) = placed(&fx, &c, two()).await;
@@ -1360,10 +1460,9 @@ async fn what_is_not_on_disk_as_recorded_is_collected_again_before_the_acknowled
     assert_eq!(persisted(&c, &a).len(), 2);
 
     // Everything is recorded as collected; then the disk loses the result
-    // and one artifact, and damages the log and the other artifact.
+    // and one artifact, and damages the other artifact.
     let dir = files.root().join(a.as_str());
     std::fs::remove_file(dir.join("result.json")).unwrap();
-    std::fs::write(dir.join("logs").join("stdout.log"), b"HELLO log\n").unwrap();
     std::fs::remove_file(dir.join("artifacts").join(hex(ALPHA))).unwrap();
     std::fs::write(dir.join("artifacts").join(hex(BETA)), b"abcdeX").unwrap();
     fx.w.set(|s| s.offline = false);
@@ -1374,13 +1473,13 @@ async fn what_is_not_on_disk_as_recorded_is_collected_again_before_the_acknowled
     assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
     assert_all_here(&fx, &c, &files, &a);
     assert_eq!(fx.w.count("blob"), blobs + 5);
-    assert!(fx.w.count("log") > logs);
+    assert_eq!(fx.w.count("log"), logs);
     assert_eq!(fx.w.count("result"), 1);
     assert_eq!(fx.w.acks(&a).len(), 1);
     assert_eq!(strikes(&c, &a), 0);
     let events = c.store().events_of(&a, "collection_recollect").unwrap();
     assert_eq!(events.len(), 1);
-    assert_eq!(events[0].payload["logs"], true);
+    assert_eq!(events[0].payload["logs"], false);
     assert_eq!(
         events[0].payload["artifacts"],
         json!(["alpha.txt", "reports/beta.bin"])
@@ -1655,10 +1754,12 @@ async fn names_that_are_one_path_on_the_parent_are_each_collected() {
     let (_, _, a) = placed(&fx, &c, decls.collect()).await;
     let p = fx.w.payload(&a);
     let out = Out {
+        outputs_evaluated: None,
         has_result: true,
         artifacts: all.iter().map(|(n, b)| stored(&a, &p, n, b)).collect(),
         not_stored: vec![],
         log: LOG.to_vec(),
+        stderr: vec![],
         log_closed: true,
         dropped: 0,
     };
@@ -1742,4 +1843,922 @@ async fn a_name_that_is_published_is_not_fetched_over_with_other_bytes() {
     assert!(fx.w.acks(&a).is_empty());
     assert_eq!(published(&files, &a, "alpha.txt").as_deref(), Some(ALPHA));
     assert!(!files.artifact_path(&a, &other).exists());
+}
+
+// ------------------------------------------------ durable active prefixes
+
+#[tokio::test]
+async fn gc_pin_contention_skips_live_poll_without_stopping_coordinator() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (run, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| {
+        let job = s.jobs.get_mut(&a).unwrap();
+        job.state = AttemptState::Active;
+        job.out.log = b"live".to_vec();
+    });
+    c.tick().await.unwrap();
+    let guard = c.store().result_gc_guard(&run).unwrap();
+    let report = c.collect(&files, cfg()).await.unwrap();
+    assert!(report.pending.contains(&a));
+    assert!(report.faults.is_empty());
+    // A fresh coordinator tick and metadata request remain usable under GC.
+    c.tick().await.unwrap();
+    assert_eq!(
+        c.store().get_attempt(&a).unwrap().unwrap().state,
+        AttemptState::Active
+    );
+    assert!(c
+        .store()
+        .log_progress(&a, LogStream::Stdout)
+        .unwrap()
+        .is_none());
+    drop(guard);
+    let report = c.collect(&files, cfg()).await.unwrap();
+    assert!(report.faults.is_empty());
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"live");
+}
+
+#[tokio::test]
+async fn gc_pin_contention_leaves_terminal_collection_pending_and_corruption_errors() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (run, _, a) = placed(&fx, &c, vec![]).await;
+    end(
+        &fx,
+        &c,
+        &a,
+        Outcome::Succeeded,
+        Out {
+            has_result: true,
+            log_closed: true,
+            ..Out::default()
+        },
+    )
+    .await;
+    let guard = c.store().result_gc_guard(&run).unwrap();
+    let report = c.collect(&files, cfg()).await.unwrap();
+    assert!(report.pending.contains(&a));
+    assert!(report.faults.is_empty());
+    drop(guard);
+    assert_eq!(collect(&c, &files).await.collected, vec![a]);
+
+    // A malformed pin is an I/O failure, not ordinary GC contention.
+    let (run, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| s.jobs.get_mut(&a).unwrap().state = AttemptState::Active);
+    c.tick().await.unwrap();
+    drop(c.store().result_gc_guard(&run).unwrap());
+    let pin = fx.dir.path().join(format!("reader-pins/{run}.lock"));
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o666)).unwrap();
+    assert!(c.collect(&files, cfg()).await.is_err());
+    std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+#[tokio::test]
+async fn active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    let raw = b"a\xff\x00bcdef";
+    fx.w.set(|s| {
+        let job = s.jobs.get_mut(&a).unwrap();
+        job.state = AttemptState::Active;
+        job.out.log = raw.to_vec();
+        job.out.stderr = b"\xfe\xff".to_vec();
+    });
+    c.tick().await.unwrap();
+    assert_eq!(
+        c.store().get_attempt(&a).unwrap().unwrap().state,
+        AttemptState::Active
+    );
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&a, LogStream::Stderr).unwrap(), b"\xfe\xff");
+    let p = c
+        .store()
+        .log_progress(&a, LogStream::Stdout)
+        .unwrap()
+        .unwrap();
+    assert_eq!(p.committed_bytes, 4);
+    assert!(!p.eof);
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), &raw[..4]);
+    assert!(c.store().collection(&a).unwrap().is_none());
+    assert!(!is_collected(&c, &a));
+    assert!(fx.w.acks(&a).is_empty());
+    // The same public observer used by CLI follow sees active committed bytes
+    // before termination, and keeps waiting rather than treating file EOF as done.
+    let task = c.store().get_attempt(&a).unwrap().unwrap().task_id;
+    let mut observer = remote_task_runner::service::logs::Observer::new(
+        remote_task_runner::service::query::Reader::Offline(Arc::new(
+            CoordinatorStore::open_read_only(fx.dir.path()).unwrap(),
+        )),
+        fx.dir.path().join("results"),
+        remote_task_runner::service::completion::Target::Task(task),
+        None,
+    )
+    .unwrap();
+    let (mut visible, mut diagnostics) = (Vec::new(), Vec::new());
+    assert!(tokio::time::timeout(
+        Duration::from_millis(300),
+        observer.observe(true, false, &mut visible, &mut diagnostics)
+    )
+    .await
+    .is_err());
+    assert_eq!(visible, &raw[..4]);
+    // Reopening uses the DB prefix, not the physical length, including a
+    // durable append that never reached its paired DB commit.
+    files
+        .append_log(&a, LogStream::Stdout, 4, b"uncommitted")
+        .unwrap();
+    drop(c);
+    let (c, files) = fx.open();
+    fx.w.set(|s| {
+        s.offline = true;
+        s.ops.clear();
+    });
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), &raw[..4]);
+    fx.w.set(|s| s.offline = false);
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), raw);
+    assert!(fx.w.state.lock().unwrap().ops.contains(&("log", 4)));
+    // Empty without an end mark remains active, including repeated polls.
+    for _ in 0..3 {
+        collect(&c, &files).await;
+    }
+    assert!(
+        !c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .eof
+    );
+    end(
+        &fx,
+        &c,
+        &a,
+        Outcome::Succeeded,
+        Out {
+            has_result: true,
+            log: raw.to_vec(),
+            stderr: b"\xfe\xff".to_vec(),
+            log_closed: true,
+            ..Out::default()
+        },
+    )
+    .await;
+    assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), raw);
+    assert_eq!(fx.w.acks(&a).len(), 1);
+    let summary = tokio::time::timeout(
+        Duration::from_secs(5),
+        observer.observe(true, false, &mut visible, &mut diagnostics),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(visible, raw);
+    assert_eq!(summary.pending_tasks, 0);
+    assert_eq!(summary.failed_tasks, 0);
+}
+
+#[tokio::test]
+async fn a_short_published_active_prefix_is_an_error_and_is_never_reset() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| s.jobs.get_mut(&a).unwrap().out.log = b"abcdef".to_vec());
+    collect(&c, &files).await;
+    std::fs::write(files.log_path(&a, LogStream::Stdout), b"a").unwrap();
+    fx.w.set(|s| s.ops.clear());
+    let report = collect(&c, &files).await;
+    assert!(report.faults.iter().any(|(id, _)| id == &a));
+    assert_eq!(
+        c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes,
+        4
+    );
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"a");
+    assert!(!fx.w.state.lock().unwrap().ops.contains(&("log", 4)));
+}
+
+#[tokio::test]
+async fn active_log_response_with_malformed_offset_publishes_no_bytes() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| {
+        s.jobs.get_mut(&a).unwrap().out.log = b"abcdef".to_vec();
+        s.shift_log = true;
+    });
+    let report = collect(&c, &files).await;
+    assert!(report
+        .faults
+        .iter()
+        .any(|(id, why)| id == &a && why.contains("offset")));
+    assert_eq!(
+        c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes,
+        0
+    );
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"");
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"abcd");
+}
+
+#[tokio::test]
+async fn published_log_digest_corruption_fails_closed_before_ack() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    end(
+        &fx,
+        &c,
+        &a,
+        Outcome::Succeeded,
+        Out {
+            has_result: true,
+            log: LOG.to_vec(),
+            log_closed: true,
+            ..Out::default()
+        },
+    )
+    .await;
+    fx.w.set(|s| s.trip = Some(("ack", 1, Lost::Request)));
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    std::fs::write(files.log_path(&a, LogStream::Stdout), b"HELLO log\n").unwrap();
+    fx.w.set(|s| s.offline = false);
+    let report = collect(&c, &files).await;
+    assert!(report
+        .faults
+        .iter()
+        .any(|(id, why)| id == &a && why.contains("published log prefix")));
+    assert!(fx.w.acks(&a).is_empty());
+    assert_eq!(
+        files.read_log(&a, LogStream::Stdout).unwrap(),
+        b"HELLO log\n"
+    );
+    assert_eq!(
+        c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes,
+        LOG.len() as u64
+    );
+}
+
+#[tokio::test]
+async fn active_pages_above_64_and_hot_logs_do_not_starve_terminal_artifacts() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (run, _, first) = placed(&fx, &c, two()).await;
+    let base = fx.w.payload(&first);
+    let mut attempts = vec![first];
+    for _ in 1..70 {
+        let task = TaskId::generate();
+        let a = AttemptId::generate();
+        let mut payload = base.clone();
+        payload.task_id = task.clone();
+        let db = c.store();
+        db.create_task(&task, &run, &json!({}), 1).unwrap();
+        db.create_attempt(
+            remote_task_runner::storage::NewAttempt {
+                attempt_id: a.clone(),
+                task_id: task.clone(),
+                worker_id: fx.w.id.clone(),
+                payload_hash: payload_hash(&payload).unwrap(),
+                permit_id: None,
+            },
+            1,
+        )
+        .unwrap();
+        let placement = db
+            .record_placement(&task, &fx.w.id, Some(&a), &json!({"payload": payload}), 1)
+            .unwrap();
+        db.ack_placement(placement, 1).unwrap();
+        let mut receipts = Receipts::default();
+        receipts.mark(Receipt::WorkerAccepted, 1);
+        db.record_seen(
+            &a,
+            true,
+            Some(Seen {
+                state: AttemptState::Active,
+                termination: None,
+                receipts,
+            }),
+            Observation::Known,
+            1,
+        )
+        .unwrap();
+        fx.w.set(|s| {
+            s.jobs.insert(
+                a.clone(),
+                Job {
+                    payload,
+                    state: AttemptState::Active,
+                    termination: None,
+                    out: Out::default(),
+                    acks: vec![],
+                },
+            );
+        });
+        attempts.push(a);
+    }
+    fx.w.set(|s| {
+        for job in s.jobs.values_mut() {
+            job.out.log = vec![0xff; 140_000];
+        }
+    });
+    let wide = CollectConfig {
+        chunk_bytes: u32::MAX,
+        scan: u32::MAX,
+        ..cfg()
+    };
+    let progress = || {
+        attempts
+            .iter()
+            .map(|a| {
+                c.store()
+                    .log_progress(a, LogStream::Stdout)
+                    .unwrap()
+                    .map_or(0, |p| p.committed_bytes)
+            })
+            .collect::<Vec<_>>()
+    };
+    // The live half of the wall budget can stop a page before its 64th
+    // target, especially when durable writes run under instrumentation.
+    // Follow the cursor across bounded passes instead of requiring a full page.
+    let mut before = progress();
+    for pass in 0..attempts.len() * 2 {
+        let report = c.collect(&files, wide).await.unwrap();
+        assert!(report.faults.is_empty(), "{:?}", report.faults);
+        let after = progress();
+        let changed = before.iter().zip(&after).filter(|(a, b)| a != b).count();
+        assert!(changed > 0, "live collection stalled on pass {pass}");
+        assert!(changed <= 64, "one pass advanced {changed} targets");
+        for (old, new) in before.iter().zip(&after) {
+            assert!(*new >= *old && *new - *old <= 65_536);
+        }
+        if pass == 0 {
+            assert!(after.iter().filter(|bytes| **bytes > 0).count() <= 64);
+            assert!(after.contains(&0));
+        }
+        before = after;
+        if before.iter().all(|bytes| *bytes > 0) {
+            break;
+        }
+    }
+    assert!(before.iter().all(|bytes| *bytes > 0), "{before:?}");
+    for (a, bytes) in attempts.iter().zip(&before) {
+        let stored = c
+            .store()
+            .log_progress(a, LogStream::Stdout)
+            .unwrap()
+            .unwrap();
+        assert!(!stored.eof);
+        assert_eq!(
+            files.read_log(a, LogStream::Stdout).unwrap(),
+            vec![0xff; *bytes as usize]
+        );
+    }
+    // One target turns terminal while the others remain hot. The independent
+    // final quota still fetches its artifact and ACKs in the same pass.
+    let terminal = attempts[0].clone();
+    let mut out = full(&fx, &terminal);
+    out.log = vec![0xff; 140_000];
+    end(&fx, &c, &terminal, Outcome::Succeeded, out).await;
+    let report = c.collect(&files, wide).await.unwrap();
+    assert_eq!(report.collected, vec![terminal.clone()]);
+    assert_eq!(fx.w.acks(&terminal).len(), 1);
+    assert_eq!(
+        published(&files, &terminal, "alpha.txt").as_deref(),
+        Some(ALPHA)
+    );
+    assert_eq!(
+        published(&files, &terminal, "reports/beta.bin").as_deref(),
+        Some(BETA)
+    );
+    assert!(attempts.iter().zip(&before).any(|(a, old)| a != &terminal
+        && c.store()
+            .log_progress(a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes
+            > *old));
+}
+
+#[tokio::test]
+async fn reaching_the_parent_log_cap_does_not_fabricate_an_end_mark() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| s.jobs.get_mut(&a).unwrap().out.log = b"abcdef".to_vec());
+    let cap = CollectConfig {
+        max_log_bytes: 4,
+        ..cfg()
+    };
+    c.collect(&files, cap).await.unwrap();
+    c.collect(&files, cap).await.unwrap();
+    let progress = c
+        .store()
+        .log_progress(&a, LogStream::Stdout)
+        .unwrap()
+        .unwrap();
+    assert_eq!(progress.committed_bytes, 4);
+    assert!(!progress.eof);
+    assert!(c.store().collection(&a).unwrap().is_none());
+    assert!(fx.w.acks(&a).is_empty());
+}
+
+#[tokio::test]
+async fn unpublished_legacy_final_log_corruption_can_be_refetched_before_ack() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, vec![]).await;
+    end(
+        &fx,
+        &c,
+        &a,
+        Outcome::Succeeded,
+        Out {
+            has_result: true,
+            log: LOG.to_vec(),
+            log_closed: true,
+            ..Out::default()
+        },
+    )
+    .await;
+    fx.w.set(|s| s.trip = Some(("ack", 1, Lost::Request)));
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    // Simulate a pre-migration final receipt: no prefix was ever published.
+    sql(
+        &fx,
+        &format!(
+            "DELETE FROM collection_log WHERE attempt_id='{}' AND stream='stdout'",
+            a
+        ),
+    );
+    sql(
+        &fx,
+        &format!(
+            "DELETE FROM collection_log WHERE attempt_id='{}' AND stream='stderr'",
+            a
+        ),
+    );
+    std::fs::write(files.log_path(&a, LogStream::Stdout), b"HELLO log\n").unwrap();
+    fx.w.set(|s| s.offline = false);
+    assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), LOG);
+    assert_eq!(fx.w.acks(&a).len(), 1);
+    assert_eq!(
+        c.store()
+            .log_progress(&a, LogStream::Stdout)
+            .unwrap()
+            .unwrap()
+            .committed_bytes,
+        LOG.len() as u64
+    );
+}
+
+struct DelayedLog {
+    inner: Arc<Worker>,
+    old: AttemptId,
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+}
+impl WorkerLink for DelayedLog {
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            if matches!(&request, Request::ReadLog(r) if r.attempt_id == self.old && r.stream == LogStream::Stdout && r.offset == 0)
+            {
+                self.entered.notify_one();
+                self.resume.notified().await;
+            }
+            self.inner.call(request).await
+        })
+    }
+}
+
+#[tokio::test]
+async fn retirement_and_replacement_during_log_rpc_never_mix_attempt_bytes() {
+    let fx = fx();
+    let (coordinator, files) = fx.open();
+    let c = Arc::new(coordinator);
+    let (_, task, old) = placed(&fx, &c, vec![]).await;
+    fx.w.set(|s| s.jobs.get_mut(&old).unwrap().out.log = b"old!".to_vec());
+    let delayed = Arc::new(DelayedLog {
+        inner: fx.w.clone(),
+        old: old.clone(),
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+    });
+    c.attach(fx.w.id.clone(), delayed.clone()).await;
+    let (collect_c, collect_files) = (c.clone(), files.clone());
+    let pass = tokio::spawn(async move { collect(&collect_c, &collect_files).await });
+    tokio::time::timeout(Duration::from_secs(2), delayed.entered.notified())
+        .await
+        .unwrap();
+    let db = c.store();
+    db.begin_retire(&old, "replace", 2).unwrap();
+    db.confirm_retire(&old, 3).unwrap();
+    let new = AttemptId::generate();
+    let record = db
+        .create_attempt(
+            remote_task_runner::storage::NewAttempt {
+                attempt_id: new.clone(),
+                task_id: task.clone(),
+                worker_id: fx.w.id.clone(),
+                payload_hash: Digest::of_bytes(b"replacement"),
+                permit_id: None,
+            },
+            4,
+        )
+        .unwrap();
+    let mut payload = fx.w.payload(&old);
+    payload.generation = record.generation;
+    let placement = db
+        .record_placement(&task, &fx.w.id, Some(&new), &json!({"payload":payload}), 4)
+        .unwrap();
+    db.ack_placement(placement, 4).unwrap();
+    let mut receipts = Receipts::default();
+    receipts.mark(Receipt::WorkerAccepted, 4);
+    db.record_seen(
+        &new,
+        true,
+        Some(Seen {
+            state: AttemptState::Active,
+            termination: None,
+            receipts,
+        }),
+        Observation::Known,
+        4,
+    )
+    .unwrap();
+    fx.w.set(|s| {
+        s.jobs.insert(
+            new.clone(),
+            Job {
+                payload,
+                state: AttemptState::Active,
+                termination: None,
+                out: Out {
+                    log: b"NEW!".to_vec(),
+                    ..Out::default()
+                },
+                acks: vec![],
+            },
+        );
+    });
+    delayed.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(3), pass)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(files.read_log(&old, LogStream::Stdout).unwrap(), b"old!");
+    assert!(db.log_progress(&old, LogStream::Stderr).unwrap().is_none());
+    assert!(db.log_progress(&new, LogStream::Stdout).unwrap().is_none());
+    collect(&c, &files).await;
+    assert_eq!(files.read_log(&new, LogStream::Stdout).unwrap(), b"NEW!");
+    assert_eq!(files.read_log(&old, LogStream::Stdout).unwrap(), b"old!");
+}
+
+#[tokio::test]
+async fn generic_bundle_encoding_conditions_and_exact_receipt_are_enforced() {
+    use remote_task_runner::supervisor::bundles::store_bundle;
+    use remote_task_runner::supervisor::outcome::Forbidden;
+    use remote_task_runner::supervisor::spec::ArtifactsSpec;
+    for (when, outcome, required, include, wrong_encoding, drop_marker) in [
+        (
+            OutputWhen::Success,
+            Outcome::Succeeded,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Failure,
+            Outcome::Failed,
+            true,
+            true,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Failure,
+            Outcome::Succeeded,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Succeeded,
+            false,
+            false,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Succeeded,
+            true,
+            false,
+            false,
+            false,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Succeeded,
+            true,
+            true,
+            true,
+            false,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Succeeded,
+            true,
+            false,
+            false,
+            true,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::Cancelled,
+            true,
+            false,
+            false,
+            true,
+        ),
+        (
+            OutputWhen::Always,
+            Outcome::TimedOut,
+            true,
+            false,
+            false,
+            true,
+        ),
+    ] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let (run, task) = (RunId::generate(), TaskId::generate());
+        let source = SourceId::generate();
+        c.store()
+            .put_source_ref(&source, &Digest::of_bytes(b"manifest"), 1)
+            .unwrap();
+        let d = OutputDecl {
+            name: "bundle".into(),
+            paths: vec!["reports/**".into(), "coverage/**".into(), "reports".into()],
+            if_missing: if required {
+                MissingPolicy::Required
+            } else {
+                MissingPolicy::Optional
+            },
+            when,
+        };
+        let mut s = spec(vec![]);
+        s.outputs = vec![d.clone()];
+        c.enqueue(run, source, vec![(task, s)]).await.unwrap();
+        let a = c.tick().await.unwrap().placed[0].clone();
+        let p = fx.w.payload(&a);
+        let ws = fx.dir.path().join("ws");
+        std::fs::create_dir_all(ws.join("reports")).unwrap();
+        std::fs::create_dir_all(ws.join("coverage")).unwrap();
+        std::fs::write(ws.join("reports/a"), ALPHA).unwrap();
+        std::fs::write(ws.join("coverage/b"), BETA).unwrap();
+        let plan = ArtifactsSpec {
+            workspace: ws,
+            source_id: p.source_id.clone(),
+            plan_digest: p.plan_digest.clone(),
+            profile_fingerprint: Digest::of_bytes(b"profile"),
+            max_bytes: 1 << 20,
+            files: vec![],
+            outputs: vec![d.clone()],
+            secret_files: vec![],
+            secret_paths: vec![],
+        };
+        let mut records = vec![];
+        let mut bytes = vec![];
+        if include {
+            let mut remaining = 16384;
+            let mut record = store_bundle(
+                &fx.dir.path().join("spool"),
+                &a,
+                &plan,
+                &d,
+                &Forbidden::nothing(),
+                &mut remaining,
+            )
+            .unwrap();
+            bytes = std::fs::read(
+                fx.dir
+                    .path()
+                    .join("spool")
+                    .join(a.as_str())
+                    .join("artifacts/bundle"),
+            )
+            .unwrap();
+            if wrong_encoding || (drop_marker && outcome == Outcome::Succeeded) {
+                record.encoding = ArtifactEncoding::Raw;
+            }
+            records.push((record, bytes.clone()));
+        }
+        end(
+            &fx,
+            &c,
+            &a,
+            outcome,
+            Out {
+                outputs_evaluated: if drop_marker { Some(false) } else { None },
+                has_result: true,
+                artifacts: records,
+                log_closed: true,
+                ..Out::default()
+            },
+        )
+        .await;
+        let mut config = cfg();
+        config.chunk_bytes = 64 << 10;
+        let report = c.collect(&files, config).await.unwrap();
+        if wrong_encoding || (drop_marker && outcome == Outcome::Succeeded) {
+            assert!(report.collected.is_empty());
+            assert!(persisted(&c, &a).is_empty());
+            assert!(fx.w.acks(&a).is_empty());
+            continue;
+        }
+        if !include
+            && required
+            && remote_task_runner::outputs::eligible(when, outcome, !drop_marker)
+        {
+            assert_eq!(report.required_missing, vec![a.clone()]);
+        } else {
+            assert_eq!(report.collected, vec![a.clone()]);
+        }
+        let collection = c.store().collection(&a).unwrap().unwrap();
+        if include {
+            assert_eq!(published(&files, &a, "bundle"), Some(bytes));
+            assert_eq!(persisted(&c, &a), vec!["bundle"]);
+            let result: serde_json::Value =
+                serde_json::from_slice(&files.read_result(&a).unwrap().unwrap()).unwrap();
+            assert_eq!(result["artifacts"][0]["encoding"], "tar_v1");
+        } else if required && remote_task_runner::outputs::eligible(when, outcome, !drop_marker) {
+            assert_eq!(collection.verdict, Some(Verdict::RequiredMissing));
+        }
+        if drop_marker {
+            assert!(c
+                .store()
+                .get_attempt(&a)
+                .unwrap()
+                .unwrap()
+                .receipts
+                .reached(Receipt::CommandRegistered));
+        }
+        assert!(!fx.w.acks(&a).is_empty());
+    }
+}
+
+#[tokio::test]
+async fn measured_terminal_tail_records_real_chunked_complete_collection_after_live_progress() {
+    use remote_task_runner::scheduler::{
+        measured::{collection_policy, CostQuery, MeasuredCosts},
+        CostModel,
+    };
+    let f = fx();
+    let model = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
+    let (c, files) = f.open_with(model.clone());
+    let (_, _, a) = placed(&f, &c, two()).await;
+    f.w.set(|s| s.jobs.get_mut(&a).unwrap().out.log = b"hello ".to_vec());
+    collect(&c, &files).await;
+    assert!(c
+        .store()
+        .log_progress(&a, LogStream::Stdout)
+        .unwrap()
+        .is_some_and(|p| p.committed_bytes > 0));
+    end(&f, &c, &a, Outcome::Succeeded, full(&f, &a)).await;
+    for _ in 0..20 {
+        if is_collected(&c, &a) {
+            break;
+        }
+        collect(&c, &files).await;
+    }
+    assert!(is_collected(&c, &a));
+    assert_eq!(published(&files, &a, "alpha.txt"), Some(ALPHA.to_vec()));
+    model.drain();
+    let payload = f.w.payload(&a);
+    let mut query = CostQuery::task(
+        &serde_json::to_value(&payload).unwrap(),
+        Some(payload.source_id.as_str()),
+        f.w.cost_transport(),
+    );
+    query.collection_policy = Some(collection_policy(cfg()));
+    assert!(model.query(&f.w.id, &query).ms[COLLECTION_PART].is_some());
+    assert_eq!(model.query(&f.w.id, &query).ms[1], None);
+    // A closed receipt is never timed again, nor does a lookup refresh it.
+    let db = rusqlite::Connection::open(f.dir.path().join("stats/costs-v1.sqlite")).unwrap();
+    let before: (i64, i64) = db
+        .query_row("SELECT COUNT(*),SUM(observed) FROM costs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    for _ in 0..100 {
+        let _ = model.query(&f.w.id, &query);
+    }
+    collect(&c, &files).await;
+    let after: (i64, i64) = db
+        .query_row("SELECT COUNT(*),SUM(observed) FROM costs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(before, after);
+    drop(c);
+    let restarted = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
+    let (c, files) = f.open_with(restarted.clone());
+    for _ in 0..3 {
+        collect(&c, &files).await;
+    }
+    assert!(is_collected(&c, &a));
+    restarted.drain();
+    let after_restart: (i64, i64) = db
+        .query_row("SELECT COUNT(*),SUM(observed) FROM costs", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(before, after_restart);
+}
+const COLLECTION_PART: usize = 2;
+
+#[tokio::test]
+async fn measured_terminal_tail_fault_then_recovery_does_not_publish_partial_duration() {
+    use remote_task_runner::scheduler::measured::MeasuredCosts;
+    let f = fx();
+    let model = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
+    let (c, files) = f.open_with(model.clone());
+    let (_, _, a) = placed(&f, &c, two()).await;
+    end(&f, &c, &a, Outcome::Succeeded, full(&f, &a)).await;
+    f.w.set(|s| s.fail = Some(("result", ErrorCode::NotFound, 1)));
+    let failed = collect(&c, &files).await;
+    assert!(failed.pending.contains(&a));
+    assert!(!is_collected(&c, &a));
+    assert_eq!(
+        f.w.state.lock().unwrap().fail,
+        Some(("result", ErrorCode::NotFound, 0))
+    );
+    for _ in 0..20 {
+        if is_collected(&c, &a) {
+            break;
+        }
+        collect(&c, &files).await;
+    }
+    assert!(is_collected(&c, &a));
+    model.drain();
+    let db = rusqlite::Connection::open(f.dir.path().join("stats/costs-v1.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM costs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn measured_terminal_tail_durable_close_failure_keeps_sample_unknown_after_recovery() {
+    use remote_task_runner::scheduler::measured::MeasuredCosts;
+    let f = fx();
+    let model = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
+    let (c, files) = f.open_with(model.clone());
+    let (_, _, a) = placed(&f, &c, two()).await;
+    end(&f, &c, &a, Outcome::Succeeded, full(&f, &a)).await;
+    // Reject only the final durable closure, after all actual result IO and
+    // worker acknowledgement. Recovery must not invent a whole-tail sample.
+    let db = rusqlite::Connection::open(f.dir.path().join("coordinator.db")).unwrap();
+    db.execute_batch("CREATE TRIGGER fixture_deny_close BEFORE UPDATE ON collection WHEN NEW.closed_at_ms IS NOT NULL BEGIN SELECT RAISE(ABORT,'fixture durable close failure'); END;").unwrap();
+    collect(&c, &files).await;
+    assert!(!is_collected(&c, &a));
+    db.execute_batch("DROP TRIGGER fixture_deny_close;")
+        .unwrap();
+    for _ in 0..20 {
+        if is_collected(&c, &a) {
+            break;
+        }
+        collect(&c, &files).await;
+    }
+    assert!(is_collected(&c, &a));
+    model.drain();
+    let db = rusqlite::Connection::open(f.dir.path().join("stats/costs-v1.sqlite")).unwrap();
+    assert_eq!(
+        db.query_row("SELECT COUNT(*) FROM costs", [], |r| r.get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
 }

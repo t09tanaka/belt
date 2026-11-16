@@ -30,33 +30,100 @@ impl Coordinator {
         files: &Arc<ResultStore>,
         cfg: CollectConfig,
     ) -> Result<CollectReport> {
-        let _one = self.collecting.lock().await;
+        self.collect_stopping(files, cfg, None).await
+    }
+
+    pub(crate) async fn collect_stopping(
+        &self,
+        files: &Arc<ResultStore>,
+        cfg: CollectConfig,
+        stop: Option<tokio::sync::watch::Receiver<bool>>,
+    ) -> Result<CollectReport> {
+        let one = Arc::new(Arc::clone(&self.collecting).lock_owned().await);
         self.check_fenced()?;
         let collector = Collector::new(Arc::clone(&self.store), Arc::clone(files), cfg)
-            .with_waits(Arc::clone(&self.collect_waits));
-        let attached: Vec<(WorkerId, Arc<dyn WorkerLink>)> = {
+            .with_costs(self.sched.model(), self.cost_tails.clone())
+            .with_waits(Arc::clone(&self.collect_waits))
+            .with_live_waits(Arc::clone(&self.live_log_waits))
+            .with_stop(stop)
+            .with_collecting(one);
+        let mut attached: Vec<(WorkerId, Arc<dyn WorkerLink>)> = {
             let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            // Use every attached worker before rotating/truncating the page.
+            // Otherwise temporarily unselected peers lose their fair cursors.
+            self.live_log_cursors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|worker, _| workers.contains_key(worker));
             workers
                 .iter()
                 .map(|(w, l)| (w.clone(), Arc::clone(l)))
                 .collect()
         };
+        // Bound concurrent peers and rotate the starting worker, so a large
+        // attachment set cannot create unbounded RPCs or favor the first IDs.
+        {
+            let mut cursor = self
+                .live_worker_cursor
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(after) = cursor.as_ref() {
+                let start = attached.partition_point(|(w, _)| w <= after);
+                let len = attached.len();
+                if len > 0 {
+                    attached.rotate_left(start % len);
+                }
+            }
+            attached.truncate(8);
+            *cursor = attached.last().map(|(w, _)| w.clone());
+        }
         let scan = cfg.scan;
         let open = self.db(move |s| s.collectable(None, scan)).await?;
         let mut others: BTreeSet<WorkerId> = open.into_iter().map(|c| c.record.worker_id).collect();
         let deadline = Instant::now() + Duration::from_millis(cfg.budget_ms);
+        let live_deadline = Instant::now() + Duration::from_millis(cfg.budget_ms / 2);
         let mut passes: Vec<Pin<Box<dyn Future<Output = Collected> + Send + '_>>> = Vec::new();
         let collector = &collector;
         for (worker, link) in attached {
             others.remove(&worker);
+            let after = self
+                .live_log_cursors
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&worker)
+                .cloned();
             passes.push(Box::pin(async move {
+                let live_link = Budgeted {
+                    inner: Arc::clone(&link),
+                    deadline: live_deadline,
+                };
+                let (cursor, mut live) = collector
+                    .collect_live_worker(&worker, &live_link, after, live_deadline)
+                    .await?;
+                {
+                    let mut cursors = self
+                        .live_log_cursors
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    match cursor {
+                        Some(a) => {
+                            cursors.insert(worker.clone(), a);
+                        }
+                        None => {
+                            cursors.remove(&worker);
+                        }
+                    }
+                }
                 let link = Budgeted {
                     inner: link,
                     deadline,
                 };
-                collector
-                    .collect_worker(&worker, Some(&link), deadline)
-                    .await
+                live.merge(
+                    collector
+                        .collect_worker(&worker, Some(&link), deadline)
+                        .await?,
+                );
+                Ok(live)
             }));
         }
         // What no worker is needed for is closed also without a link.
@@ -80,5 +147,61 @@ impl Coordinator {
             Some(CollectError::Aborted) => Err(CoordinatorError::Aborted),
             Some(CollectError::Files(e)) => Err(CoordinatorError::Results(e.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::coordinator::{CoordinatorConfig, LinkError};
+    use crate::ids::AttemptId;
+    use crate::storage::CoordinatorStore;
+    use crate::wire::{Request, Response};
+
+    struct Disconnected;
+    impl WorkerLink for Disconnected {
+        fn call(
+            &self,
+            _: Request,
+        ) -> Pin<Box<dyn Future<Output = std::result::Result<Response, LinkError>> + Send + '_>>
+        {
+            Box::pin(async { Err(LinkError::Unconfirmed) })
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_worker_cursors_are_pruned_before_the_attached_page_is_truncated() {
+        let root = tempfile::tempdir().unwrap();
+        let store = CoordinatorStore::open(root.path(), 1).unwrap();
+        let coordinator = Coordinator::start(store, CoordinatorConfig::default()).unwrap();
+        let files = Arc::new(ResultStore::open(&root.path().join("results")).unwrap());
+        let gone = WorkerId::parse("gone").unwrap();
+        coordinator
+            .live_log_cursors
+            .lock()
+            .unwrap()
+            .insert(gone.clone(), AttemptId::generate());
+        for n in 0..10 {
+            let worker = WorkerId::parse(&format!("worker-{n:02}")).unwrap();
+            coordinator
+                .try_attach(worker.clone(), Arc::new(Disconnected))
+                .unwrap();
+            coordinator
+                .live_log_cursors
+                .lock()
+                .unwrap()
+                .insert(worker, AttemptId::generate());
+        }
+        coordinator
+            .collect(&files, CollectConfig::default())
+            .await
+            .unwrap();
+        let cursors = coordinator.live_log_cursors.lock().unwrap();
+        assert!(!cursors.contains_key(&gone));
+        // The first eight empty workers clear their cursors during polling;
+        // attached workers outside that page must retain theirs for next time.
+        assert_eq!(cursors.len(), 2);
+        assert!(cursors.contains_key(&WorkerId::parse("worker-08").unwrap()));
+        assert!(cursors.contains_key(&WorkerId::parse("worker-09").unwrap()));
     }
 }

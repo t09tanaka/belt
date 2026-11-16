@@ -11,6 +11,7 @@
 //! follows is one transaction, which counts the worker's load again.
 
 pub mod decide;
+pub mod measured;
 
 use crate::forecast::plan::MAX_PENDING_PLANS;
 use crate::ids::{AttemptId, PlanDigest, TaskId, WorkerId};
@@ -87,6 +88,22 @@ impl Default for SchedulerConfig {
 /// the queue and the run.
 pub trait CostModel: Send + Sync {
     fn costs(&self, worker_id: &WorkerId, task: &QueuedTask) -> Costs;
+    fn query(&self, _worker: &WorkerId, _query: &measured::CostQuery) -> Costs {
+        Costs::default()
+    }
+    fn evidence(
+        &self,
+        _worker: &WorkerId,
+        _query: &measured::CostQuery,
+    ) -> Option<measured::CostEvidence> {
+        None
+    }
+    fn record(&self, _sample: measured::Sample) {}
+    fn record_preparation(&self, _sample: measured::PreparationSample) {}
+    fn drain(&self) {}
+    fn collection_policy(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Nothing is known: every part is unknown for every worker, which leaves
@@ -95,6 +112,15 @@ pub trait CostModel: Send + Sync {
 pub struct UnknownCosts;
 
 impl CostModel for UnknownCosts {
+    fn evidence(
+        &self,
+        _worker: &WorkerId,
+        _query: &measured::CostQuery,
+    ) -> Option<measured::CostEvidence> {
+        Some(measured::CostEvidence::unknown(
+            "parent cost measurements unavailable",
+        ))
+    }
     fn costs(&self, _worker_id: &WorkerId, _task: &QueuedTask) -> Costs {
         Costs::default()
     }
@@ -136,6 +162,24 @@ impl Scheduler {
 
     pub fn costs(&self, worker_id: &WorkerId, task: &QueuedTask) -> Costs {
         self.costs.costs(worker_id, task)
+    }
+
+    pub fn query(&self, worker: &WorkerId, query: &measured::CostQuery) -> Costs {
+        let mut query = query.clone();
+        query.collection_policy = self.costs.collection_policy();
+        self.costs.query(worker, &query)
+    }
+    pub fn evidence(
+        &self,
+        worker: &WorkerId,
+        query: &measured::CostQuery,
+    ) -> Option<measured::CostEvidence> {
+        let mut query = query.clone();
+        query.collection_policy = self.costs.collection_policy();
+        self.costs.evidence(worker, &query)
+    }
+    pub(crate) fn model(&self) -> Arc<dyn CostModel> {
+        self.costs.clone()
     }
 
     /// A priority outside the range is taken as the nearest end of it.
@@ -277,4 +321,15 @@ pub fn decision_seq_of(
 ) -> crate::storage::Result<Option<u64>> {
     let demand = store.placement_demand(attempt_id)?;
     Ok(demand.and_then(|d| d.get("decision_seq").and_then(|s| s.as_u64())))
+}
+
+/// Parent component evidence committed with a real placement (not worker wire).
+pub fn cost_evidence_of(
+    store: &CoordinatorStore,
+    attempt_id: &AttemptId,
+) -> crate::storage::Result<Option<Vec<measured::WorkerCostEvidence>>> {
+    Ok(store
+        .placement_demand(attempt_id)?
+        .and_then(|d| d.get("cost_evidence").cloned())
+        .and_then(|value| serde_json::from_value(value).ok()))
 }

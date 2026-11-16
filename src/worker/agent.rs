@@ -67,6 +67,7 @@ pub struct AgentConfig {
     pub supervisor_exe: PathBuf,
     pub traffic_state_dir: PathBuf,
     pub traffic_config: Option<PathBuf>,
+    pub capability_profile: Option<Arc<crate::toolchain::profile::Profile>>,
     pub profile: String,
     pub profile_fingerprint: Digest,
     pub max_active_task: u32,
@@ -130,6 +131,7 @@ impl AgentConfig {
             boot_id,
             supervisor_exe,
             traffic_config: None,
+            capability_profile: None,
             profile: "default".into(),
             profile_fingerprint: Digest::of_bytes(b""),
             max_active_task: 1,
@@ -188,6 +190,7 @@ pub struct StartupReport {
 }
 
 pub struct Agent {
+    toolchains: Option<crate::toolchain::registry::Registry>,
     cfg: AgentConfig,
     store: WorkerStore,
     host: Arc<dyn Host>,
@@ -346,6 +349,18 @@ fn invalid(m: impl Into<String>) -> ApiError {
     ApiError::new(ErrorCode::InvalidInput, m)
 }
 
+/// The identity of the profile shell's real file. A profile may name its shell
+/// through a symlink (`/bin/sh` is one on many Linux hosts) and already
+/// measures the resolved file for its fingerprint, so a retargeted link is
+/// profile drift. The identity is taken from that resolved path, without
+/// following a link again.
+fn shell_identity(
+    profile: &crate::toolchain::profile::Profile,
+) -> Result<crate::toolchain::adapters::FileIdentity, ApiError> {
+    let real = fs::canonicalize(profile.shell()).map_err(|_| invalid("identity_open"))?;
+    crate::toolchain::adapters::FileIdentity::capture(&real).map_err(invalid)
+}
+
 /// Refuse a payload that declares one of the attempt's secret files (the
 /// declared ones and what `.worktreeinclude` matched) as an artifact.
 fn check_artifacts_not_secret(
@@ -393,11 +408,39 @@ type Ended = (
     bool,
 );
 
+/// A validated agent.lock descriptor bound to the configuration it protects.
+/// Fields are private: callers cannot substitute another path/configuration at start.
+pub(crate) struct OwnedAgentLock {
+    config: AgentConfig,
+    lock: ProcessLock,
+}
+impl OwnedAgentLock {
+    pub(crate) fn new(config: AgentConfig, file: std::fs::File) -> Result<Self, ApiError> {
+        let lock =
+            ProcessLock::adopt_private(file, config.state_dir.join("agent.lock")).map_err(api)?;
+        Ok(Self { config, lock })
+    }
+}
+
 impl Agent {
     /// Run the startup steps in [`policy::STARTUP_ORDER`] and return the
     /// running agent. Any failing step refuses the start.
     pub fn start(cfg: AgentConfig, host: Arc<dyn Host>) -> Result<Arc<Agent>, ApiError> {
-        let mut lock = None;
+        Self::start_inner(cfg, host, None)
+    }
+
+    pub(crate) fn start_owned(
+        owner: OwnedAgentLock,
+        host: Arc<dyn Host>,
+    ) -> Result<Arc<Agent>, ApiError> {
+        Self::start_inner(owner.config, host, Some(owner.lock))
+    }
+
+    fn start_inner(
+        cfg: AgentConfig,
+        host: Arc<dyn Host>,
+        mut lock: Option<ProcessLock>,
+    ) -> Result<Arc<Agent>, ApiError> {
         let mut opened: Option<(WorkerStore, AgentEpoch)> = None;
         let mut report = StartupReport::default();
         let mut todo: Vec<AttemptId> = Vec::new();
@@ -411,7 +454,11 @@ impl Agent {
                         .map_err(|e| internal("attempts directory", e))?;
                 }
                 Step::CoreDumps => host.disable_core_dumps()?,
-                Step::Lock => lock = Some(acquire_lock(&cfg)?),
+                Step::Lock => {
+                    if lock.is_none() {
+                        lock = Some(acquire_lock(&cfg)?);
+                    }
+                }
                 Step::Store => {
                     let s = WorkerStore::open(&cfg.state_dir, &cfg.worker_id).map_err(api)?;
                     let e = s.start_agent(now()).map_err(api)?;
@@ -480,7 +527,14 @@ impl Agent {
         let (store, epoch) = opened.expect("the store step ran");
         report.watched = todo.clone();
         let max_prepares = cfg.max_concurrent_prepares.max(1);
+        let toolchains = cfg
+            .capability_profile
+            .as_ref()
+            .map(|profile| host.toolchain_registry(profile, cfg.profile_fingerprint.clone()))
+            .transpose()?
+            .flatten();
         let agent = Arc::new(Agent {
+            toolchains,
             cfg,
             store,
             host,
@@ -872,6 +926,23 @@ impl Agent {
                 json!({ "error": format!("stored payload: {e}") }),
             );
         })?;
+        if let Err(error) = self
+            .check_capabilities(&payload)
+            .and_then(|_| self.check_profile_identity(rec))
+            .and_then(|_| self.check_execution_binding(rec))
+        {
+            self.note_once(a, "agent_environment_changed", json!({ "code": error.code, "blocked_reason": error.blocked_reason, "message": error.message }));
+            settle(
+                &self.cfg,
+                &self.store,
+                a,
+                failed(),
+                Settle::Interrupted,
+                false,
+            )
+            .map_err(|_| ())?;
+            return Ok(None);
+        }
         self.at(ProbePoint::LeaseMeasure, a);
         // The key and the time of its grant, with no renewal in between
         // (`lease_step`): a key read with the time of an earlier grant would
@@ -1097,6 +1168,8 @@ impl Agent {
         let attempt = &rec.attempt_id;
         let payload: AttemptPayload =
             serde_json::from_value(rec.spec.clone()).map_err(|e| internal("stored payload", e))?;
+        self.check_capabilities(&payload)?;
+        self.check_profile_identity(rec)?;
         if rec.state == AttemptState::Accepted {
             self.store
                 .transition(attempt, AttemptState::Preparing, now())
@@ -1118,7 +1191,11 @@ impl Agent {
 
         // The prepared setup steps are copied in (or waited for); the
         // commands that are such a step are left out.
-        let Some(skip) = self.setup_wait(rec, &payload, &ws)? else {
+        let Some(binding) = self.prepare_toolchains(rec, &payload)? else {
+            return Ok(());
+        };
+        let binding = binding.as_ref();
+        let Some(skip) = self.setup_wait(rec, &payload, &ws, binding)? else {
             return Ok(());
         };
         let commands = crate::setup::policy::prune_commands(&payload.commands, &skip);
@@ -1187,7 +1264,7 @@ impl Agent {
         // The declared artifacts, checked again against the secret files of
         // the source (which is here now: the workspace was made from it). An
         // acceptance that came before the source could not look.
-        let artifacts = if payload.artifacts.is_empty() {
+        let artifacts = if payload.artifacts.is_empty() && payload.outputs.is_empty() {
             None
         } else {
             let secrets = self.host.secret_paths(&payload)?.ok_or_else(|| {
@@ -1201,12 +1278,16 @@ impl Agent {
             })?;
             check_artifacts_not_secret(&payload, &secrets)?;
             Some(ArtifactsSpec {
+                outputs: payload.outputs.clone(),
+                secret_paths: secrets,
                 // Declared paths are relative to the workspace root, like
                 // the paths of the secret files they are compared with.
                 workspace: ws.root.clone(),
                 source_id: payload.source_id.clone(),
                 plan_digest: payload.plan_digest.clone(),
-                profile_fingerprint: self.cfg.profile_fingerprint.clone(),
+                profile_fingerprint: binding
+                    .map(|b| b.fingerprint().clone())
+                    .unwrap_or_else(|| self.cfg.profile_fingerprint.clone()),
                 max_bytes: DEFAULT_ARTIFACT_BYTES,
                 files: payload
                     .artifacts
@@ -1229,16 +1310,47 @@ impl Agent {
         for c in order.into_iter().map(|i| &commands[i]) {
             let rel = Path::new(&c.cwd);
             check_cwd_relative(rel)?;
+            let cwd = if ws.kind == crate::workspace::WorkspaceKind::InPlace {
+                // Recheck every command, including recovered preparation and
+                // explicit retry: the original tree is mutable between attempts.
+                let resolved = fs::canonicalize(ws.cwd.join(rel))
+                    .map_err(|_| invalid("in-place command cwd is unavailable"))?;
+                if !resolved.is_dir() || !resolved.starts_with(&ws.root) {
+                    return Err(invalid(
+                        "in-place command cwd leaves the original workspace",
+                    ));
+                }
+                resolved
+            } else {
+                ws.root.join(rel)
+            };
+            let env = match &self.cfg.capability_profile {
+                Some(profile) => {
+                    profile.execution_environment(&c.env).map_err(invalid)?;
+                    match binding {
+                        Some(binding) => binding.environment(&c.env).map_err(invalid)?,
+                        None => profile.execution_environment(&c.env).map_err(invalid)?,
+                    }
+                }
+                None => c.env.clone(),
+            };
             nodes.push(NodeSpec {
                 node_id: c.node_id.clone(),
                 argv: c.argv.clone(),
-                cwd: ws.cwd.join(rel),
-                env: c.env.clone(),
+                cwd,
+                env,
                 weight: None,
                 timeout_ms: c.timeout_ms,
             });
         }
         let spec = SuperviseSpec {
+            preparation: None,
+            profile_fingerprint: binding.map(|b| b.fingerprint().clone()).or_else(|| {
+                self.cfg
+                    .capability_profile
+                    .as_ref()
+                    .map(|_| self.cfg.profile_fingerprint.clone())
+            }),
             state_dir: self.cfg.state_dir.clone(),
             worker_id: self.cfg.worker_id.clone(),
             attempt_id: attempt.clone(),
@@ -1265,6 +1377,7 @@ impl Agent {
             artifacts,
             prepared_only,
         };
+        self.check_capabilities(&payload)?;
         spec.validate().map_err(|e| invalid(e.to_string()))?;
         let bytes = serde_json::to_vec(&spec).map_err(|e| internal("supervisor spec", e))?;
         write_atomic(&self.spec_path(attempt), &bytes)
@@ -1279,6 +1392,293 @@ impl Agent {
         Ok(())
     }
 
+    fn resolve_toolchains(
+        &self,
+        mut bundle: crate::toolchain::contract::FrozenBundle,
+        requirements: &crate::toolchain::capability::ExecutionRequirements,
+    ) -> Result<crate::toolchain::contract::FrozenBundle, ApiError> {
+        bundle
+            .validate_partial(&bundle.frozen.source_manifest)
+            .map_err(invalid)?;
+        requirements.validate().map_err(invalid)?;
+        let report = self
+            .capabilities()
+            .ok_or_else(|| invalid("proposal profile unavailable"))?;
+        let observed = crate::toolchain::contract::observations(&report);
+        for baseline in &bundle.frozen.baseline {
+            if bundle.frozen.policy.compare(
+                &baseline.version,
+                observed
+                    .get(&baseline.tool)
+                    .unwrap_or(&crate::toolchain::versions::VersionObservation::Unknown),
+            ) != crate::toolchain::versions::Match::Match
+            {
+                return Err(ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "proposal baseline mismatch",
+                ));
+            }
+        }
+        let registry = self
+            .toolchains
+            .as_ref()
+            .ok_or_else(|| invalid("proposal registry unavailable"))?;
+        for requirement in bundle.frozen.requirements.clone() {
+            if bundle.evidence.iter().any(|e| e.tool == requirement.tool) {
+                continue;
+            }
+            let request = registry
+                .request(&bundle.frozen, &requirement.tool, None)
+                .map_err(|e| {
+                    ApiError::blocked(
+                        crate::error::BlockedReason::EnvironmentMismatch,
+                        format!("toolchain resolve required: {e:?}"),
+                    )
+                })?;
+            bundle.frozen = request.frozen;
+            bundle.evidence.push(request.evidence);
+        }
+        bundle
+            .validate(&bundle.frozen.source_manifest)
+            .map_err(invalid)?;
+        self.toolchain_requests(&bundle)?;
+        if !crate::toolchain::capability::missing_with_installable(
+            requirements,
+            Some(&report),
+            Some(&bundle),
+        )
+        .is_empty()
+        {
+            return Err(ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                "proposal worker requirements mismatch",
+            ));
+        }
+
+        Ok(bundle)
+    }
+    /// Read-only preparation identity; never readiness or forecast evidence.
+    pub(crate) fn probe_preparation(
+        &self,
+        input: crate::setup::preparation_probe::PreparationProbeInput<'_>,
+    ) -> crate::setup::preparation_probe::PreparationProbe {
+        use crate::setup::preparation_probe::{PreparationProbe, ProbeUnknown};
+        let Some(owner) = self.host.setup_owner() else {
+            return PreparationProbe::Unknown(ProbeUnknown::MissingContext);
+        };
+        owner.probe_preparation(
+            input,
+            self.cfg.capability_profile.as_deref(),
+            Some(&self.cfg.profile_fingerprint),
+            self.toolchains.as_ref(),
+        )
+    }
+
+    fn toolchain_requests(
+        &self,
+        bundle: &crate::toolchain::contract::FrozenBundle,
+    ) -> Result<Vec<crate::toolchain::preparation::PreparationRequest>, ApiError> {
+        let registry = self.toolchains.as_ref().ok_or_else(|| {
+            ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                "toolchain registry unavailable",
+            )
+        })?;
+        bundle
+            .evidence
+            .iter()
+            .map(|e| {
+                registry
+                    .request(&bundle.frozen, &e.tool, Some(e))
+                    .map_err(|e| {
+                        ApiError::blocked(
+                            crate::error::BlockedReason::EnvironmentMismatch,
+                            format!("toolchain unavailable: {e:?}"),
+                        )
+                    })
+            })
+            .collect()
+    }
+    fn execution_binding_path(&self, attempt: &AttemptId) -> PathBuf {
+        self.attempt_dir(attempt).join("execution-binding.json")
+    }
+    fn check_execution_binding(&self, rec: &AcceptedAttempt) -> Result<(), ApiError> {
+        let payload: AttemptPayload =
+            serde_json::from_value(rec.spec.clone()).map_err(|e| internal("stored payload", e))?;
+        let Some(bundle) = payload.toolchains else {
+            return Ok(());
+        };
+        let binding: crate::toolchain::contract::ExecutionBinding = serde_json::from_slice(
+            &fs::read(self.execution_binding_path(&rec.attempt_id))
+                .map_err(|e| internal("execution binding", e))?,
+        )
+        .map_err(|e| internal("execution binding", e))?;
+        use crate::toolchain::{adapters, contract::observations};
+        let requests = self.toolchain_requests(&bundle)?;
+        let registry = self.toolchains.as_ref().expect("requests checked registry");
+        let mut receipts = Vec::with_capacity(requests.len());
+        for request in &requests {
+            match registry.detect(request) {
+                Ok(adapters::Availability::Installed(receipt)) => receipts.push(receipt),
+                _ => {
+                    return Err(ApiError::blocked(
+                        crate::error::BlockedReason::EnvironmentMismatch,
+                        "activated tool identity changed",
+                    ))
+                }
+            }
+        }
+        let profile = self
+            .cfg
+            .capability_profile
+            .as_ref()
+            .ok_or_else(|| invalid("toolchain profile unavailable"))?;
+        let report = self.capabilities().ok_or_else(|| {
+            ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                "accepted base profile changed",
+            )
+        })?;
+        let plans = requests
+            .iter()
+            .map(|r| r.plan(&r.private_root).map_err(invalid))
+            .collect::<Result<Vec<_>, _>>()?;
+        let installed = plans
+            .iter()
+            .zip(receipts.iter().map(|r| r.as_ref()))
+            .collect::<Vec<_>>();
+        let shell = shell_identity(profile)?;
+        let setup_policy = Digest::of_bytes(
+            &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
+        );
+        // A valid same-version replacement receipt is a different execution
+        // identity. Reconstruct the complete activation read-only; never repair
+        // or rewrite the accepted binding during launch/recovery checks.
+        let current = adapters::activate_set(
+            &bundle.frozen,
+            &installed,
+            self.cfg.profile_fingerprint.clone(),
+            &observations(&report),
+            profile.environment(),
+            setup_policy,
+            &shell,
+        )
+        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))?;
+        if current != binding.activation {
+            return Err(ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                "accepted execution binding changed",
+            ));
+        }
+        Ok(())
+    }
+    fn prepare_toolchains(
+        &self,
+        rec: &AcceptedAttempt,
+        payload: &AttemptPayload,
+    ) -> Result<Option<Option<crate::toolchain::contract::ExecutionBinding>>, ApiError> {
+        use crate::toolchain::{
+            adapters,
+            contract::{observations, ExecutionBinding},
+            preparation::ToolPreparationPoll,
+        };
+        let Some(bundle) = &payload.toolchains else {
+            return Ok(Some(None));
+        };
+        let accepted_path = self.execution_binding_path(&rec.attempt_id);
+        if accepted_path.exists() {
+            // Recovery inspects accepted identities; it must not repair drift by reinstalling.
+            self.check_execution_binding(rec)?;
+            let binding = serde_json::from_slice(
+                &fs::read(accepted_path).map_err(|e| internal("execution binding", e))?,
+            )
+            .map_err(|e| internal("execution binding", e))?;
+            return Ok(Some(Some(binding)));
+        }
+        let requests = self.toolchain_requests(bundle)?;
+        let profile = self
+            .cfg
+            .capability_profile
+            .as_ref()
+            .ok_or_else(|| invalid("toolchain profile unavailable"))?;
+        let begun = platform::monotonic_ms();
+        let mut receipts = Vec::new();
+        for request in &requests {
+            loop {
+                match self.host.toolchain_poll(&rec.attempt_id, request)? {
+                    ToolPreparationPoll::Installed(receipt) => {
+                        receipts.push(receipt);
+                        break;
+                    }
+                    ToolPreparationPoll::Failed(reason) => {
+                        return Err(ApiError::blocked(
+                            crate::error::BlockedReason::EnvironmentMismatch,
+                            format!("toolchain preparation failed: {reason:?}"),
+                        ))
+                    }
+                    ToolPreparationPoll::Pending => {
+                        if self.stopping() || self.stop_requested(&rec.attempt_id) {
+                            self.host.setup_release(&rec.attempt_id);
+                            return Ok(None);
+                        }
+                        if platform::monotonic_ms().saturating_sub(begun)
+                            >= self.cfg.prepare_timeout_ms
+                        {
+                            return Err(ApiError::blocked(
+                                crate::error::BlockedReason::EnvironmentMismatch,
+                                "toolchain preparation timed out",
+                            ));
+                        }
+                        self.pause(self.cfg.poll_ms);
+                    }
+                }
+            }
+        }
+        let plans = requests
+            .iter()
+            .map(|r| r.plan(&r.private_root).map_err(invalid))
+            .collect::<Result<Vec<_>, _>>()?;
+        let installed = plans
+            .iter()
+            .zip(receipts.iter().map(|r| r.as_ref()))
+            .collect::<Vec<_>>();
+        let shell = shell_identity(profile)?;
+        let setup_policy = Digest::of_bytes(
+            &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
+        );
+        let activation = adapters::activate_set(
+            &bundle.frozen,
+            &installed,
+            self.cfg.profile_fingerprint.clone(),
+            &observations(&profile.report()),
+            profile.environment(),
+            setup_policy,
+            &shell,
+        )
+        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))?;
+        let binding = ExecutionBinding { activation };
+        let path = self.execution_binding_path(&rec.attempt_id);
+        if path.exists() {
+            let previous: ExecutionBinding = serde_json::from_slice(
+                &fs::read(&path).map_err(|e| internal("execution binding", e))?,
+            )
+            .map_err(|e| internal("execution binding", e))?;
+            if previous != binding {
+                return Err(ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "accepted execution binding changed",
+                ));
+            }
+        } else {
+            write_atomic(
+                &path,
+                &serde_json::to_vec(&binding).map_err(|e| internal("execution binding", e))?,
+            )
+            .map_err(|e| internal("execution binding", e))?;
+        }
+        Ok(Some(Some(binding)))
+    }
+
     /// Wait for the setup of the attempt (`Host::setup_poll`), as long as
     /// the preparation may take. `None`: the agent is stopping or the
     /// attempt is being stopped. An attempt that waited too long, or whose
@@ -1288,11 +1688,12 @@ impl Agent {
         rec: &AcceptedAttempt,
         payload: &AttemptPayload,
         ws: &Workspace,
+        binding: Option<&crate::toolchain::contract::ExecutionBinding>,
     ) -> Result<Option<std::collections::BTreeSet<String>>, ApiError> {
         let attempt = &rec.attempt_id;
         let begun = platform::monotonic_ms();
         loop {
-            match self.host.setup_poll(rec, payload, ws)? {
+            match self.host.setup_poll_bound(rec, payload, ws, binding)? {
                 SetupPoll::Done { skip, note } => {
                     if let Some(why) = note {
                         self.note_once(
@@ -1614,7 +2015,7 @@ impl Agent {
             .map_err(|e| ApiError::new(ErrorCode::ProtocolIncompatible, e.to_string()))?;
         match request {
             Request::Hello(_) => Err(invalid("hello is the first request of a connection")),
-            Request::Inspect(_) => self.inspect().map(Response::Inspect),
+            Request::Inspect(r) => self.inspect(r).map(Response::Inspect),
             Request::SubmitAttempt(r) => self.submit(r).map(Response::SubmitAttempt),
             Request::GetAttempt(r) => {
                 let rec = self.known(&r.attempt_id)?;
@@ -1639,6 +2040,69 @@ impl Agent {
                 blobs::get(&self.store, &self.cfg.attempts_root(), &r).map(Response::BlobGet)
             }
             Request::Forecast(r) => self.forecast(r).map(Response::Forecast),
+            Request::ForecastCommand(r) => {
+                let attempts = self.store.list_nonterminal().map_err(api)?;
+                let max_epoch = self.store.max_coordinator_epoch().map_err(api)?;
+                let ident = crate::forecast::plan::Ident {
+                    worker_id: self.cfg.worker_id.clone(),
+                    boot_id: self.cfg.boot_id.clone(),
+                    agent_epoch: self.epoch,
+                    forecast_ttl_ms: self.cfg.forecast_ttl_ms,
+                };
+                crate::forecast::answer_command(
+                    &self.cfg.traffic_state_dir,
+                    self.cfg.traffic_config.as_deref(),
+                    &self.cfg.state_dir,
+                    self.cfg
+                        .capability_profile
+                        .as_ref()
+                        .map(|_| &self.cfg.profile_fingerprint),
+                    &ident,
+                    &attempts,
+                    max_epoch,
+                    &r,
+                )
+                .map(Response::ForecastCommand)
+            }
+            Request::PreparationProbe(r) => {
+                use crate::setup::preparation_probe::{
+                    PreparationProbe, PreparationProbeInput, ProbeUnknown,
+                };
+                let probe = if r.expected_profile_fingerprint != self.cfg.profile_fingerprint {
+                    PreparationProbe::Unknown(ProbeUnknown::InvalidBinding)
+                } else {
+                    let input = PreparationProbeInput {
+                        manifest_digest: &r.manifest_digest,
+                        source_id: &r.source_id,
+                        run_id: &r.run_id,
+                        setup: &r.setup,
+                        frozen: &r.frozen,
+                        in_place: r.in_place,
+                    };
+                    match crate::setup::preparation_probe::input_budget(&input) {
+                        Ok(()) => self.probe_preparation(input),
+                        Err(reason) => PreparationProbe::Unknown(reason),
+                    }
+                };
+                Ok(Response::PreparationProbe(
+                    crate::wire::PreparationProbeResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        worker_id: self.cfg.worker_id.clone(),
+                        worker_boot_id: self.cfg.boot_id.clone(),
+                        agent_epoch: self.epoch,
+                        probe,
+                    },
+                ))
+            }
+            Request::ResolveToolchains(r) => {
+                let bundle = self.resolve_toolchains(r.bundle, &r.requirements)?;
+                Ok(Response::ResolveToolchains(
+                    crate::wire::ResolveToolchainsResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        bundle,
+                    },
+                ))
+            }
             Request::EnvReport(_) | Request::EnvSync(_) => Err(ApiError::new(
                 ErrorCode::NotImplemented,
                 "this operation is not implemented by the worker agent yet",
@@ -1695,6 +2159,8 @@ impl Agent {
             && self.store.tombstone(&r.attempt_id).map_err(api)?.is_none();
         if fresh {
             policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
+            self.check_capabilities(&r.payload)?;
+            self.host.admit(&r.payload)?;
             for c in &r.payload.commands {
                 check_cwd_relative(Path::new(&c.cwd))?;
             }
@@ -1724,7 +2190,14 @@ impl Agent {
                 ));
             }
         }
-        let spec = serde_json::to_value(&r.payload).map_err(|e| internal("payload", e))?;
+        let mut spec = serde_json::to_value(&r.payload).map_err(|e| internal("payload", e))?;
+        if self.cfg.capability_profile.is_some() {
+            spec.as_object_mut().expect("payload object").insert(
+                "_worker_profile_fingerprint".into(),
+                serde_json::to_value(&self.cfg.profile_fingerprint)
+                    .map_err(|e| internal("profile identity", e))?,
+            );
+        }
         let outcome = self
             .store
             .submit(
@@ -2051,6 +2524,11 @@ impl Agent {
         let (termination, artifacts, artifacts_not_stored, result_digest, _) =
             self.ended(&r.attempt_id, r.generation)?;
         Ok(GetResultResponse {
+            outputs_evaluated: self
+                .store
+                .get_result(&r.attempt_id)
+                .map_err(api)?
+                .is_some_and(|v| v["outputs_evaluated"] == true),
             schema_version: SchemaVersion::CURRENT,
             attempt_id: r.attempt_id,
             generation: r.generation,
@@ -2174,7 +2652,91 @@ impl Agent {
         )
     }
 
-    fn inspect(&self) -> Result<InspectResponse, ApiError> {
+    fn capabilities_with_diagnostic(
+        &self,
+    ) -> Result<Option<crate::toolchain::capability::WorkerCapabilities>, &'static str> {
+        let Some(profile) = &self.cfg.capability_profile else {
+            return Ok(None);
+        };
+        let report = profile.report();
+        if report.profile_fingerprint == self.cfg.profile_fingerprint {
+            Ok(Some(report))
+        } else {
+            Err(profile.identity_failure_message(&report))
+        }
+    }
+    pub(crate) fn capabilities(&self) -> Option<crate::toolchain::capability::WorkerCapabilities> {
+        self.capabilities_with_diagnostic().ok().flatten()
+    }
+    fn check_profile_identity(&self, rec: &AcceptedAttempt) -> Result<(), ApiError> {
+        if let Some(expected) = rec.spec.get("_worker_profile_fingerprint") {
+            if expected
+                != &serde_json::to_value(&self.cfg.profile_fingerprint)
+                    .map_err(|e| internal("profile identity", e))?
+            {
+                return Err(ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "accepted worker profile changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+    fn check_capabilities(&self, payload: &AttemptPayload) -> Result<(), ApiError> {
+        payload.requirements.validate().map_err(invalid)?;
+        if let Some(bundle) = &payload.toolchains {
+            bundle.validate(&payload.manifest_digest).map_err(invalid)?;
+            self.toolchain_requests(bundle)?;
+        }
+        if let Some(profile) = &self.cfg.capability_profile {
+            for command in &payload.commands {
+                profile
+                    .execution_environment(&command.env)
+                    .map_err(invalid)?;
+            }
+            if let Some(setup) = &payload.setup {
+                for step in &setup.steps {
+                    profile.execution_environment(&step.env).map_err(invalid)?;
+                }
+            }
+        }
+        let report = self.capabilities_with_diagnostic().map_err(|message| {
+            ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, message)
+        })?;
+        if let Some(bundle) = &payload.toolchains {
+            crate::toolchain::contract::check_baselines(&bundle.frozen, report.as_ref()).map_err(
+                |e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e),
+            )?;
+        }
+        let mut missing = crate::toolchain::capability::missing_with_installable(
+            &payload.requirements,
+            report.as_ref(),
+            payload.toolchains.as_deref(),
+        );
+        if let Some(profile) = &self.cfg.capability_profile {
+            for tool in profile.required_tools() {
+                if !report.as_ref().is_some_and(|r| {
+                    matches!(
+                        r.tools.get(tool),
+                        Some(crate::toolchain::capability::ToolObservation::Available { .. })
+                    )
+                }) {
+                    missing.push(format!("profile tool {tool}"));
+                }
+            }
+        }
+        if !missing.is_empty() || (self.cfg.capability_profile.is_some() && report.is_none()) {
+            return Err(ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                format!(
+                    "worker capabilities changed or unmet: {}",
+                    missing.join(", ")
+                ),
+            ));
+        }
+        Ok(())
+    }
+    fn inspect(&self, request: InspectRequest) -> Result<InspectResponse, ApiError> {
         let live = self.store.list_nonterminal().map_err(api)?;
         let (active, pending) = policy::load_counts(live.iter().map(|r| r.state));
         let policy_bytes = self
@@ -2187,6 +2749,11 @@ impl Agent {
             .map(|s| s.f_bavail.saturating_mul(s.f_frsize))
             .unwrap_or(0);
         Ok(InspectResponse {
+            preparation_observations: request
+                .preparation_observations
+                .as_ref()
+                .and_then(|request| self.host.preparation_observation_page(request)),
+            capabilities: self.capabilities(),
             schema_version: SchemaVersion::CURRENT,
             worker_id: self.cfg.worker_id.clone(),
             worker_boot_id: self.cfg.boot_id.clone(),

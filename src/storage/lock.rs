@@ -32,6 +32,54 @@ impl ProcessLock {
         }
     }
 
+    /// Transfer an already-held private file descriptor without dropping its lock.
+    /// The path must identify this exact owned regular file, never another gate.
+    pub(crate) fn adopt_private(file: File, path: PathBuf) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let actual = file.metadata()?;
+        let named = std::fs::symlink_metadata(&path)?;
+        if !actual.is_file()
+            || !named.is_file()
+            || actual.nlink() != 1
+            || actual.uid() != rustix::process::geteuid().as_raw()
+            || actual.mode() & 0o077 != 0
+            || actual.dev() != named.dev()
+            || actual.ino() != named.ino()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe transferred agent lock",
+            )
+            .into());
+        }
+        // Re-locking the same descriptor never releases its existing ownership.
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file, path }),
+            Err(TryLockError::WouldBlock) => Err(StorageError::Locked(path)),
+            Err(TryLockError::Error(e)) => Err(e.into()),
+        }
+    }
+
+    /// Check the exact still-named owner inode without opening another file.
+    /// Existing coordinator locks may be 0644 under their private state root.
+    pub(crate) fn check_current(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let actual = self._file.metadata()?;
+        let named = std::fs::symlink_metadata(&self.path)?;
+        if !actual.is_file()
+            || !named.is_file()
+            || actual.uid() != rustix::process::geteuid().as_raw()
+            || actual.nlink() != 1
+            || actual.mode() & 0o022 != 0
+            || (actual.dev(), actual.ino()) != (named.dev(), named.ino())
+        {
+            return Err(StorageError::Invalid(
+                "coordinator ownership lock changed or unsafe".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }

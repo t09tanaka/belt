@@ -2,6 +2,9 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+pub(crate) const RESULT_GC_NEXT_RUN: &str =
+    "SELECT run_id FROM run WHERE run_id > coalesce(?1,'') ORDER BY run_id LIMIT 1";
+
 pub const MAX_QUERY_ROWS: u32 = 64;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Page<T> {
@@ -15,6 +18,40 @@ pub struct Run {
     pub closed_at_ms: Option<u64>,
     pub task_count: u64,
     pub facts: RunFacts,
+}
+/// Public immutable export metadata. Execution identities and declaration paths stay private.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Artifact {
+    pub name: String,
+    pub encoding: crate::wire::ArtifactEncoding,
+    pub digest: crate::ids::Digest,
+    pub size: u64,
+}
+impl From<crate::wire::ArtifactRecord> for Artifact {
+    fn from(record: crate::wire::ArtifactRecord) -> Self {
+        Self {
+            name: record.name,
+            encoding: record.encoding,
+            digest: record.digest,
+            size: record.size,
+        }
+    }
+}
+/// Bounded public output facts. Declaration paths and execution inputs are omitted.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "availability", rename_all = "snake_case")]
+pub enum Output {
+    Artifact {
+        record: Artifact,
+    },
+    Pending {
+        name: String,
+    },
+    NotStored {
+        name: String,
+        reason: crate::wire::NotStoredReason,
+        if_missing: crate::wire::MissingPolicy,
+    },
 }
 /// Whole-run facts from one read snapshot, independently of the displayed page.
 /// A computed attempt can still have pending or failed collection. These facts
@@ -47,7 +84,8 @@ fn run_facts(c: &Connection, run: &str, cancel: bool, collections: bool) -> Resu
     } else {
         ("", "0", "NULL")
     };
-    let sql=format!("SELECT count(*),coalesce(sum(a.termination_json IS NOT NULL OR ({cancelled})),0),coalesce(sum((a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='complete') OR ({cancelled})),0),coalesce(sum(a.observation IN ('unknown','reconciling')),0),coalesce(sum((a.termination_json IS NOT NULL AND json_extract(a.termination_json,'$.outcome')<>'succeeded') OR ({cancelled})),0),coalesce(sum(a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='gave_up'),0),coalesce(sum(a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='required_missing'),0) FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1");
+    let boundary = current_boundary(c)?;
+    let sql=format!("SELECT count(*),coalesce(sum(a.termination_json IS NOT NULL OR ({cancelled})),0),coalesce(sum((a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='complete') OR ({cancelled})),0),coalesce(sum(a.observation IN ('unknown','reconciling')),0),coalesce(sum((a.termination_json IS NOT NULL AND json_extract(a.termination_json,'$.outcome')<>'succeeded') OR ({cancelled})),0),coalesce(sum(a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='gave_up'),0),coalesce(sum(a.termination_json IS NOT NULL AND ({closed}) AND {verdict}='required_missing'),0) FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1");
     let values = c.query_row(&sql, [run], |r| {
         Ok([
             r.get::<_, i64>(0)?,
@@ -78,11 +116,59 @@ fn run_facts(c: &Connection, run: &str, cancel: bool, collections: bool) -> Resu
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placement: Option<PlacementDiagnostics>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_place: bool,
     pub task_id: TaskId,
     pub run_id: RunId,
     pub created_at_ms: u64,
     pub cancel_requested_at_ms: Option<u64>,
     pub current_attempt: Option<CurrentAttempt>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PlacementDiagnostics {
+    pub blocked_reason: Option<crate::error::BlockedReason>,
+    pub excluded: Vec<crate::scheduler::decide::Excluded>,
+    pub truncated: bool,
+}
+fn placement(c: &Connection, task: &str) -> Result<Option<PlacementDiagnostics>> {
+    // Readonly access to an older schema never migrates or scans its journal.
+    if !c.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='index' AND name='event_task_waiting')", [], |r|r.get::<_,bool>(0))? { return Ok(None); }
+
+    let raw = c.query_row("SELECT substr(e.payload_json,1,65537),coalesce(json_extract(e.payload_json,'$.blocked_reason')='no_compatible_worker',0) FROM event e JOIN task t ON t.run_id=e.run_id WHERE t.task_id=?1 AND e.kind='task_waiting' AND json_extract(e.payload_json,'$.task')=?1 ORDER BY e.seq DESC LIMIT 1", [task], |r| Ok((r.get::<_,String>(0)?,r.get::<_,bool>(1)?))).optional()?;
+    let Some((raw, blocked)) = raw else {
+        return Ok(None);
+    };
+    let reason = blocked.then_some(crate::error::BlockedReason::NoCompatibleWorker);
+    let decision = (raw.len() <= 65536)
+        .then(|| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .flatten()
+        .and_then(|v| {
+            serde_json::from_value::<crate::scheduler::decide::Decision>(v["decision"].clone()).ok()
+        });
+    let Some(mut decision) = decision else {
+        return Ok(Some(PlacementDiagnostics {
+            blocked_reason: reason,
+            excluded: vec![],
+            truncated: true,
+        }));
+    };
+    let mut truncated = decision.excluded.len() > 4;
+    decision.excluded.truncate(4);
+    for excluded in &mut decision.excluded {
+        truncated |= excluded.unmet.len() > 4;
+        excluded.unmet.truncate(4);
+        for text in &mut excluded.unmet {
+            truncated |= text.chars().count() > 128;
+            *text = text.chars().take(128).collect();
+        }
+    }
+    Ok(Some(PlacementDiagnostics {
+        blocked_reason: reason,
+        excluded: decision.excluded,
+        truncated,
+    }))
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentAttempt {
@@ -91,8 +177,20 @@ pub struct CurrentAttempt {
     pub observation: Observation,
     pub termination: Option<Termination>,
 }
+fn in_place(c: &Connection, task: &str) -> Result<bool> {
+    Ok(c.query_row(
+        "SELECT coalesce(json_extract(spec_json,'$.in_place'),0) FROM task WHERE task_id=?1",
+        [task],
+        |r| r.get(0),
+    )?)
+}
 fn current(c: &Connection, task: &str) -> Result<Option<CurrentAttempt>> {
-    let aid=c.query_row("SELECT attempt_id FROM attempt WHERE task_id=?1 AND retired=0 ORDER BY generation DESC LIMIT 1",[task],|r|r.get::<_,String>(0)).optional()?;
+    let boundary = if current_boundary(c)?.is_empty() {
+        ""
+    } else {
+        "AND generation >= (SELECT min_generation FROM task WHERE task_id=?1)"
+    };
+    let aid=c.query_row(&format!("SELECT attempt_id FROM attempt WHERE task_id=?1 AND retired=0 {boundary} ORDER BY generation DESC LIMIT 1"),[task],|r|r.get::<_,String>(0)).optional()?;
     aid.map(|aid| {
         let a = load_attempt(c, &aid)?.ok_or_else(|| not_found(format!("attempt {aid}")))?;
         Ok(CurrentAttempt {
@@ -138,6 +236,18 @@ impl CoordinatorStore {
         })
     }
 
+    /// One indexed run-ID step for GC; deliberately performs no task facts or counts.
+    pub(crate) fn result_gc_next_run(&self, after: Option<RunId>) -> Result<Option<RunId>> {
+        self.db.call(move |c| {
+            let raw = c
+                .query_row(RESULT_GC_NEXT_RUN, [after.map(String::from)], |r| {
+                    r.get::<_, String>(0)
+                })
+                .optional()?;
+            raw.map(|run| id("run", RunId::parse(&run))).transpose()
+        })
+    }
+
     pub fn query_runs(&self, n: u32, after: Option<RunId>) -> Result<Page<Run>> {
         let bound = limit(n)?;
         let (cancel, collections) = (self.task_cancel, self.collections);
@@ -165,7 +275,7 @@ impl CoordinatorStore {
             let cancel=if cancel {"cancel_requested_at_ms"}else{"NULL"};
             let mut q=c.prepare(&format!("SELECT task_id,created_at_ms,{cancel} FROM task WHERE run_id=?1 AND task_id>coalesce(?2,'') ORDER BY task_id LIMIT ?3"))?;
             let raw=q.query_map(params![run.as_str(),after.map(String::from),bound],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<i64>>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
-            let items=raw.into_iter().map(|(tid,created,cancel)|Ok(Task{current_attempt:current(c,&tid)?,task_id:id("task",TaskId::parse(&tid))?,run_id:run.clone(),created_at_ms:to_u64(created)?,cancel_requested_at_ms:cancel.map(to_u64).transpose()?})).collect::<Result<Vec<_>>>()?;
+            let items=raw.into_iter().map(|(tid,created,cancel)|Ok(Task{placement: if cancel.is_none() && current(c,&tid)?.is_none() {placement(c,&tid)?} else {None},in_place:in_place(c,&tid)?,current_attempt:current(c,&tid)?,task_id:id("task",TaskId::parse(&tid))?,run_id:run.clone(),created_at_ms:to_u64(created)?,cancel_requested_at_ms:cancel.map(to_u64).transpose()?})).collect::<Result<Vec<_>>>()?;
             Ok(page(items,n,|t|t.task_id.to_string()))
         })
     }
@@ -192,6 +302,12 @@ impl CoordinatorStore {
                 .optional()?;
             raw.map(|(run, created, cancel)| {
                 Ok(Task {
+                    placement: if cancel.is_none() && current(c, task.as_str())?.is_none() {
+                        placement(c, task.as_str())?
+                    } else {
+                        None
+                    },
+                    in_place: in_place(c, task.as_str())?,
                     current_attempt: current(c, task.as_str())?,
                     task_id: task,
                     run_id: id("run", RunId::parse(&run))?,
@@ -218,6 +334,19 @@ impl CoordinatorStore {
             Ok(page(items,n,|a|a.generation.0.to_string()))
         })
     }
+}
+
+pub(super) fn current_boundary(c: &Connection) -> Result<&'static str> {
+    let retry: bool = c.query_row(
+        "SELECT count(*)>0 FROM pragma_table_info('task') WHERE name='min_generation'",
+        [],
+        |r| r.get(0),
+    )?;
+    Ok(if retry {
+        "AND aa.generation>=t.min_generation"
+    } else {
+        ""
+    })
 }
 
 #[cfg(test)]

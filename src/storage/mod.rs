@@ -25,10 +25,12 @@ mod worker;
 
 pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
 pub use coordinator::{
-    ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, LiveAttempt,
-    NewAttempt, Permit, PlaceInput, PlaceOutcome, Placement, QueuedTask, ResultRef, RetireEnd,
-    RunStanding, Seen, WorkerLoad,
+    ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, InputCursor,
+    InputPage, LiveAttempt, LiveAttemptPage, NewAttempt, Permit, PlaceInput, PlaceOutcome,
+    Placement, PreparedRetry, QueuedTask, ResultRef, RetireEnd, RetryPreparation, RunStanding,
+    Seen, WorkerLoad,
 };
+pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
 pub use db::Db;
 pub use lock::ProcessLock;
 pub use worker::{
@@ -102,6 +104,10 @@ pub enum StorageError {
         state: AttemptState,
         why: &'static str,
     },
+    #[error("captured inputs are temporarily busy; retry the request")]
+    SourceBusy,
+    #[error("retained secret bundle unavailable; submit a new run")]
+    SecretUnavailable,
     #[error("invalid input: {0}")]
     Invalid(String),
     #[error("already fixed and different: {0}")]
@@ -126,10 +132,11 @@ impl From<rusqlite::Error> for StorageError {
 }
 
 impl StorageError {
-    /// True when the same call may succeed later without any change (a busy
-    /// database). Everything else is a verdict or a fault.
+    /// True when the same call may succeed later without any input change
+    /// (database or foreground source retention contention). Everything else
+    /// is a verdict or a fault.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, StorageError::Busy)
+        matches!(self, StorageError::Busy | StorageError::SourceBusy)
     }
 
     /// The wire error code this maps to.
@@ -143,6 +150,8 @@ impl StorageError {
             | StorageError::Immutable(_)
             | StorageError::LiveAttemptExists(_)
             | StorageError::LocatorPendingDelete(_) => ErrorCode::Conflict,
+            StorageError::SecretUnavailable => ErrorCode::Blocked,
+            StorageError::SourceBusy => ErrorCode::SourceBusy,
             StorageError::NotFound { .. } => ErrorCode::NotFound,
             StorageError::Retired(_) => ErrorCode::Retired,
             StorageError::StaleEpoch { .. } => ErrorCode::StaleEpoch,

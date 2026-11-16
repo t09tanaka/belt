@@ -24,16 +24,19 @@ globset = "0.4"
 rustix = { version = "1", features = ["fs", "process"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-local-ci = "0.11.0"
+local-ci = "0.13.0"
 memchr = "2"
+node-semver = "=2.2.0"
+serde_yaml = "0.9"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 task-traffic-controller = "0.8.2"
 tempfile = "3"
+tar = { version = "0.4", default-features = false }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "io-std", "sync", "time", "process", "signal"] }
 toml = "0.8"
 ulid = "1"
 unicode-normalization = "0.1.26"
@@ -45,3 +48,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 [[test]]
 name = "it"
 path = "tests/it/main.rs"
+
+# The managed service identity hashes the whole executable (init, daemon
+# startup, health). Unoptimized, SHA-256 of a 100 MB test binary takes about
+# ten seconds per pass, which is the whole startup deadline of the fixtures.
+[profile.dev.package.sha2]
+opt-level = 3

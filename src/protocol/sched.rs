@@ -4,12 +4,35 @@
 
 use super::frame::StreamKind;
 use std::collections::VecDeque;
+use std::sync::Arc;
+
+/// Opaque ownership carried until the encoded frame has drained or is dropped.
+/// Debug never inspects the retained value.
+#[derive(Clone)]
+pub struct Retained(Arc<dyn Send + Sync>);
+impl Retained {
+    pub(crate) fn new(value: impl Send + Sync + 'static) -> Self {
+        Self(Arc::new(value))
+    }
+}
+impl std::fmt::Debug for Retained {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Retained(..)")
+    }
+}
+impl PartialEq for Retained {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for Retained {}
 
 /// A frame already turned into bytes, with the queue it belongs to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outgoing {
     pub kind: StreamKind,
     pub bytes: Vec<u8>,
+    pub retained: Option<Retained>,
 }
 
 #[derive(Debug, Default)]
@@ -87,6 +110,7 @@ mod tests {
 
     fn item(kind: StreamKind, tag: u8) -> Outgoing {
         Outgoing {
+            retained: None,
             kind,
             bytes: vec![tag],
         }
@@ -96,6 +120,48 @@ mod tests {
         std::iter::from_fn(|| s.pop())
             .map(|o| (o.kind, o.bytes[0]))
             .collect()
+    }
+
+    #[test]
+    fn queued_ownership_is_opaque_and_survives_until_the_last_frame_clone() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        #[derive(Debug)]
+        struct Lease {
+            drops: Arc<AtomicUsize>,
+            _private: &'static str,
+        }
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let drops = Arc::new(AtomicUsize::new(0));
+        let held = Retained::new(Lease {
+            drops: drops.clone(),
+            _private: "private-lease-sentinel",
+        });
+        let same = held.clone();
+        assert_eq!(held, same);
+        assert_ne!(held, Retained::new(7_u8));
+        assert_eq!(format!("{held:?}"), "Retained(..)");
+        let mut scheduler = Scheduler::new();
+        scheduler.push(Outgoing {
+            kind: StreamKind::Blob,
+            bytes: b"encoded".to_vec(),
+            retained: Some(same),
+        });
+        drop(held);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let frame = scheduler.pop().unwrap();
+        assert!(scheduler.is_empty());
+        let inflight = frame.clone();
+        drop(frame);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        let diagnostic = format!("{inflight:?}");
+        assert!(diagnostic.contains("Retained(..)"));
+        assert!(!diagnostic.contains("private-lease-sentinel"));
+        drop(inflight);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -120,15 +186,18 @@ mod tests {
         let mut s = Scheduler::new();
         assert_eq!((s.control_len(), s.control_bytes()), (0, 0));
         s.push(Outgoing {
+            retained: None,
             kind: StreamKind::Control,
             bytes: vec![0; 5],
         });
         s.push(Outgoing {
+            retained: None,
             kind: StreamKind::Control,
             bytes: vec![0; 7],
         });
         // Bulk frames are not counted: they have their own backpressure.
         s.push(Outgoing {
+            retained: None,
             kind: StreamKind::Blob,
             bytes: vec![0; 100],
         });

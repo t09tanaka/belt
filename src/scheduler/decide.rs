@@ -198,6 +198,7 @@ pub struct Candidate {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Exclusion {
+    CapabilityMismatch,
     /// It did not answer `inspect` in this tick (or used up its time).
     Unreached,
     Draining,
@@ -213,6 +214,8 @@ pub enum Exclusion {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Excluded {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unmet: Vec<String>,
     pub worker_id: WorkerId,
     pub why: Exclusion,
 }
@@ -467,7 +470,7 @@ impl Exclusion {
     /// slow or silent just now).
     pub fn lasts(self) -> bool {
         match self {
-            Exclusion::RefusedTask | Exclusion::Draining => true,
+            Exclusion::RefusedTask | Exclusion::Draining | Exclusion::CapabilityMismatch => true,
             Exclusion::Unreached
             | Exclusion::Full
             | Exclusion::NoForecast
@@ -844,6 +847,7 @@ mod tests {
     #[test]
     fn the_excluded_are_kept_in_the_order_of_their_ids() {
         let ex = |name: &str, why| Excluded {
+            unmet: Vec::new(),
             worker_id: w(name),
             why,
         };
@@ -897,6 +901,7 @@ mod tests {
         let d = decide(
             vec![a, cand("w-b", unknown())],
             vec![Excluded {
+                unmet: Vec::new(),
                 worker_id: w("w-c"),
                 why: Exclusion::RefusedTask,
             }],
@@ -1150,8 +1155,9 @@ mod tests {
     #[test]
     fn only_exclusions_that_outlive_a_tick_last() {
         use Exclusion::*;
-        let lasting = [RefusedTask, Draining];
+        let lasting = [RefusedTask, Draining, CapabilityMismatch];
         for e in [
+            CapabilityMismatch,
             Unreached,
             Draining,
             Full,
@@ -1169,6 +1175,7 @@ mod tests {
             let excluded = excluded
                 .iter()
                 .map(|(w, why)| Excluded {
+                    unmet: Vec::new(),
                     worker_id: WorkerId::parse(w).unwrap(),
                     why: *why,
                 })

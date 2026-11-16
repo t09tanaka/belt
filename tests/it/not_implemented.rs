@@ -1,17 +1,8 @@
 use assert_cmd::Command;
 
 const CASES: &[&[&str]] = &[
-    &["init"],
     &["ci"],
-    &["ci", "plan"],
     &["ci", "--snapshot", "commit", "--ref", "HEAD"],
-    &["exec", "--in-place", "--", "true"],
-    &["logs", "x", "--follow"],
-    &["wait", "x"],
-    &["cancel", "x"],
-    &["retry", "x"],
-    &["outputs", "x", "--dir", "out"],
-    &["estimate", "--", "true"],
     &["doctor"],
     &["workers"],
     &["workers", "add", "w", "--ssh", "u@h", "--install"],
@@ -23,7 +14,7 @@ const CASES: &[&[&str]] = &[
     &["workers", "diff", "w"],
     &["workers", "sync", "w", "--project", "p"],
     &["workers", "forget", "w"],
-    &["worker", "--stdio", "--ephemeral"],
+    &["worker", "--ephemeral"],
 ];
 
 #[test]
@@ -48,7 +39,7 @@ fn every_command_reports_not_implemented_as_json() {
 fn without_json_stdout_is_empty_and_error_goes_to_stderr() {
     let out = Command::cargo_bin("remote-task-runner")
         .unwrap()
-        .arg("init")
+        .arg("doctor")
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(70));

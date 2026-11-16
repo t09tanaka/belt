@@ -5,6 +5,7 @@ use crate::error::{ApiError, ErrorCode};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+#[derive(Clone)]
 pub struct Context {
     pub env: BTreeMap<String, String>,
     pub cwd: PathBuf,
@@ -18,6 +19,15 @@ impl Context {
         env: BTreeMap<String, String>,
         cwd: PathBuf,
         bootstrap: Spec,
+    ) -> Result<Self, ApiError> {
+        Self::load_with_overlay(env, cwd, bootstrap, &Overlay::default())
+    }
+    /// Apply explicit CLI values through the existing configuration resolver.
+    pub fn load_with_overlay(
+        env: BTreeMap<String, String>,
+        cwd: PathBuf,
+        bootstrap: Spec,
+        overlay: &Overlay,
     ) -> Result<Self, ApiError> {
         if !cwd.is_absolute() {
             return Err(ApiError::new(
@@ -52,7 +62,10 @@ impl Context {
                 "cannot determine the source repository; Git preflight failed",
             ));
         };
-        let config = crate::config::load::load(&env, root.as_deref(), &Overlay::default())
+        // Directory snapshots have project configuration too. Keep their
+        // source identity non-Git, but resolve policy from the capture root.
+        let project = root.as_deref().unwrap_or(&cwd);
+        let config = crate::config::load::load(&env, Some(project), overlay)
             .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
         Ok(Self {
             env,
@@ -63,24 +76,50 @@ impl Context {
         })
     }
     pub fn discover(env: BTreeMap<String, String>, cwd: PathBuf) -> Result<Self, ApiError> {
-        let file = crate::config::paths::user_config_path(&env)
-            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+        let spec = runtime_spec(&env)?;
+        Self::load(env, cwd, spec)
+    }
+    /// Estimate tolerates unavailable Git; absent identity remains unknown.
+    /// Configuration and bootstrap are read without creating any state.
+    pub fn discover_estimate(
+        env: BTreeMap<String, String>,
+        cwd: PathBuf,
+    ) -> Result<Self, ApiError> {
+        let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
+        if !cwd.is_absolute() {
+            return Err(invalid("command directory must be absolute".into()));
+        }
+        let file =
+            crate::config::paths::user_config_path(&env).map_err(|e| invalid(e.to_string()))?;
         let input = file
             .parent()
-            .expect("configuration parent")
+            .expect("config parent")
             .join("coordinator.json");
-        if !input
-            .try_exists()
-            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?
-        {
-            return Err(ApiError::new(
-                ErrorCode::NotFound,
-                "coordinator is not initialized; run remote-task-runner init",
-            ));
-        }
-        let spec = super::bootstrap::read_input(&input)
-            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
-        Self::load(env, cwd, spec)
+        let bootstrap = super::bootstrap::read_input(&input).map_err(|e| invalid(e.to_string()))?;
+        let repo_root = std::process::Command::new("git")
+            .args(["rev-parse", "--show-toplevel"])
+            .current_dir(&cwd)
+            .env_clear()
+            .envs(&env)
+            .env("LC_ALL", "C")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.strip_suffix('\n').map(PathBuf::from));
+        let config = crate::config::load::load(
+            &env,
+            Some(repo_root.as_deref().unwrap_or(&cwd)),
+            &Overlay::default(),
+        )
+        .map_err(|e| invalid(e.to_string()))?;
+        Ok(Self {
+            env,
+            cwd,
+            config,
+            repo_root,
+            bootstrap,
+        })
     }
     pub fn state_dir(&self) -> &Path {
         &self.bootstrap.state_dir
@@ -91,4 +130,34 @@ impl Context {
     pub async fn owner(&self) -> anyhow::Result<super::resident::Client> {
         super::bootstrap::ensure(self.bootstrap.clone()).await
     }
+}
+
+/// Discover only authenticated runtime input; metadata/control do not need Git or project config.
+pub fn runtime_spec(env: &BTreeMap<String, String>) -> Result<Spec, ApiError> {
+    let file = crate::config::paths::user_config_path(env)
+        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+    let input = file
+        .parent()
+        .expect("configuration parent")
+        .join("coordinator.json");
+    if !input
+        .try_exists()
+        .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?
+    {
+        return Err(ApiError::new(
+            ErrorCode::NotFound,
+            "coordinator is not initialized; run remote-task-runner init",
+        ));
+    }
+    let spec = super::bootstrap::read_input(&input).map_err(|e| {
+        ApiError::new(
+            if super::init::is_unconfirmed(&e) {
+                ErrorCode::CommunicationUnknown
+            } else {
+                ErrorCode::InvalidInput
+            },
+            e.to_string(),
+        )
+    })?;
+    Ok(spec)
 }

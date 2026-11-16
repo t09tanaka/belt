@@ -121,6 +121,7 @@ impl Cluster {
 }
 
 pub(crate) struct State {
+    capabilities: Option<remote_task_runner::toolchain::capability::WorkerCapabilities>,
     pub(crate) max_epoch: u64,
     pub(crate) held: BTreeMap<AttemptId, Held>,
     pub(crate) tombstones: BTreeSet<AttemptId>,
@@ -171,6 +172,7 @@ impl FakeWorker {
             id: id.clone(),
             cluster: Arc::clone(cluster),
             state: Mutex::new(State {
+                capabilities: None,
                 max_epoch: 0,
                 held: BTreeMap::new(),
                 tombstones: BTreeSet::new(),
@@ -313,6 +315,8 @@ impl FakeWorker {
             Request::Inspect(_) => {
                 let (active, pending) = load_counts(s.held.values().map(|h| h.state));
                 Ok(Response::Inspect(InspectResponse {
+                    preparation_observations: None,
+                    capabilities: s.capabilities.clone(),
                     schema_version: SchemaVersion::CURRENT,
                     worker_id: s.says.clone(),
                     worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
@@ -652,7 +656,8 @@ impl Fx {
         let sched = Scheduler::new(self.sched, Arc::clone(&self.costs)).unwrap();
         let c = Coordinator::start_with(store, self.cfg, sched).unwrap();
         for w in workers {
-            c.attach(w.id.clone(), Arc::clone(w) as Arc<dyn WorkerLink>);
+            c.try_attach(w.id.clone(), Arc::clone(w) as Arc<dyn WorkerLink>)
+                .unwrap();
         }
         c
     }
@@ -664,6 +669,10 @@ impl Fx {
 
 pub(crate) fn spec() -> TaskSpec {
     TaskSpec {
+        toolchains: None,
+        outputs: Vec::new(),
+        requirements: Default::default(),
+        in_place: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
@@ -766,8 +775,8 @@ async fn dispatch_fills_the_free_active_slots_and_the_prefetch_and_no_more() {
     let b = f.worker("w-b", (9, 9));
     let d = f.worker("w-d", (9, 9));
     d.set(|s| s.draining = true);
-    c.attach(b.id.clone(), b.clone());
-    c.attach(d.id.clone(), d.clone());
+    c.attach(b.id.clone(), b.clone()).await;
+    c.attach(d.id.clone(), d.clone()).await;
     let report = c.tick().await.unwrap();
     assert_eq!(report.placed.len(), 2);
     assert_eq!(only(&c, &tasks[3]).worker_id, b.id);
@@ -1048,7 +1057,7 @@ async fn a_retire_whose_answer_was_lost_frees_the_task_exactly_once_after_a_rest
             c
         };
         a.set(|s| s.draining = true);
-        c.attach(b.id.clone(), b.clone());
+        c.attach(b.id.clone(), b.clone()).await;
 
         // The retire is sent (again). What the worker did is the same in
         // both runs, and so is what the parent concludes.
@@ -1169,7 +1178,7 @@ async fn a21_an_attempt_whose_link_is_gone_is_kept_and_followed_again_on_return(
 
     // Reconnected: the same attempt, known again, its lease renewed with a
     // higher key.
-    c.attach(a.id.clone(), a.clone());
+    c.attach(a.id.clone(), a.clone()).await;
     let report = c.tick().await.unwrap();
     assert!(report.unknown.is_empty());
     let back = only(&c, &tasks[0]);
@@ -1210,7 +1219,7 @@ async fn a22_after_a_long_stop_the_parent_keeps_unknown_until_the_worker_says_it
         assert!(c.tick().await.unwrap().placed.is_empty());
     }
     assert_eq!(only(&c, &tasks[0]).observation, Observation::Reconciling);
-    c.attach(a.id.clone(), a.clone());
+    c.attach(a.id.clone(), a.clone()).await;
     for _ in 0..5 {
         let report = c.tick().await.unwrap();
         assert_eq!(report.unknown, vec![first.attempt_id.clone()]);
@@ -1893,7 +1902,7 @@ async fn a19_a_real_worker_stops_the_retired_run_and_the_resent_retire_frees_the
     w.cluster = c.store().cluster_id().clone();
     let agent = w.start("boot-a");
     let id = WorkerId::parse("w-test").unwrap();
-    c.attach(id.clone(), link_to(&c, &agent, true).await);
+    c.attach(id.clone(), link_to(&c, &agent, true).await).await;
 
     let (script, marker, pidfile) = worker_agent::stay(&w);
     let mut task_spec = spec();
@@ -1942,7 +1951,7 @@ async fn a19_a_real_worker_stops_the_retired_run_and_the_resent_retire_frees_the
     // is what frees the task. It is placed once more, and only once.
     let c = open();
     assert_eq!(c.epoch(), CoordinatorEpoch(2));
-    c.attach(id.clone(), link_to(&c, &agent, false).await);
+    c.attach(id.clone(), link_to(&c, &agent, false).await).await;
     let report = c.tick().await.unwrap();
     assert_eq!(report.retired, vec![first.attempt_id.clone()]);
     assert_eq!(report.placed.len(), 1);
@@ -1990,7 +1999,7 @@ async fn a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_w
     w.cluster = c.store().cluster_id().clone();
     let agent = w.start("boot-a");
     let id = WorkerId::parse("w-test").unwrap();
-    c.attach(id.clone(), link_to(&c, &agent, false).await);
+    c.attach(id.clone(), link_to(&c, &agent, false).await).await;
     let files = Arc::new(ResultStore::open(&dir.path().join("results")).unwrap());
 
     let mut task_spec = spec();
@@ -2047,7 +2056,7 @@ async fn a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_w
         .is_empty());
 
     // A new connection; the collection goes on, in small chunks.
-    c.attach(id, link_to(&c, &agent, false).await);
+    c.attach(id, link_to(&c, &agent, false).await).await;
     let cfg = CollectConfig {
         chunk_bytes: 4,
         ..CollectConfig::default()
@@ -2069,4 +2078,969 @@ async fn a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_w
         c.collect(&files, cfg).await.unwrap(),
         CollectReport::default()
     );
+}
+
+// Readiness constrains only new placements; control traffic still reaches the peer.
+struct InputGatedWorker {
+    worker: Arc<FakeWorker>,
+    gate: Arc<remote_task_runner::coordinator::InputGate>,
+    invalidate_forecast: AtomicBool,
+    attestor: Option<Arc<ToolchainAttestor>>,
+}
+impl WorkerLink for InputGatedWorker {
+    fn read_only_call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        match &self.attestor {
+            Some(attestor) => attestor.read_only_call(request),
+            None => self.call(request),
+        }
+    }
+
+    fn cost_transport(&self) -> Option<remote_task_runner::scheduler::measured::Transport> {
+        self.gate.cost_transport()
+    }
+    fn cold_eligible(&self, task: &TaskId) -> bool {
+        self.gate.cold_eligible(task)
+    }
+    fn prefer(
+        &self,
+        task: &remote_task_runner::storage::QueuedTask,
+        expected: u64,
+        ttl: u64,
+    ) -> bool {
+        self.gate.prefer(task, expected, ttl)
+    }
+    fn clear_preference(&self, task: Option<&TaskId>, run: Option<&RunId>) {
+        self.gate.clear_preference(task, run);
+    }
+
+    fn placement_fence(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        Some(self.gate.placement_fence())
+    }
+    fn inputs_evaluated(&self, generation: u64, run: &RunId) {
+        self.gate.evaluated(generation, run);
+    }
+    fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
+        Some(self.gate.placement_inputs())
+    }
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            let forecast = matches!(request, Request::Forecast(_));
+            let answer = self.worker.call(request).await;
+            if forecast && self.invalidate_forecast.swap(false, Ordering::SeqCst) {
+                let previous = self.gate.snapshot();
+                self.gate
+                    .observe(WorkerBootId::parse("changed-boot").unwrap(), AgentEpoch(5))
+                    .await;
+                for input in previous {
+                    self.gate.publish(self.gate.generation(), input);
+                }
+            }
+            answer
+        })
+    }
+}
+fn gated_worker(worker: &Arc<FakeWorker>) -> Arc<InputGatedWorker> {
+    Arc::new(InputGatedWorker {
+        worker: worker.clone(),
+        gate: Arc::default(),
+        invalidate_forecast: AtomicBool::new(false),
+        attestor: None,
+    })
+}
+fn ready_input(
+    task: &remote_task_runner::storage::QueuedTask,
+) -> remote_task_runner::coordinator::ReadyInput {
+    remote_task_runner::coordinator::ReadyInput {
+        run_id: task.run_id.clone(),
+        source_id: task.source_id.clone().unwrap(),
+        manifest_digest: spec().manifest_digest,
+    }
+}
+#[tokio::test]
+async fn source_gate_requires_exact_input_and_preserves_existing_attempt_control() {
+    let f = fx();
+    let worker = f.worker("w-a", (2, 1));
+    let c = f.open(&[]);
+    let gated = gated_worker(&worker);
+    c.attach(worker.id.clone(), gated.clone()).await;
+    let tasks = enqueue(&c, 1).await;
+    let input = ready_input(&c.store().queued_tasks(1).unwrap()[0]);
+    for _ in 0..3 {
+        assert!(c.tick().await.unwrap().placed.is_empty());
+    }
+    assert!(attempts(&c, &tasks[0]).is_empty());
+    assert!(worker.state.lock().unwrap().asked.is_empty());
+    assert!(c.scheduler().waiting_reason(&tasks[0]).is_none());
+    let mut wrong = input.clone();
+    wrong.run_id = RunId::generate();
+    gated.gate.publish(gated.gate.generation(), wrong);
+    let mut wrong = input.clone();
+    wrong.manifest_digest = Digest::of_bytes(b"wrong");
+    gated.gate.publish(gated.gate.generation(), wrong);
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert!(worker.state.lock().unwrap().asked.is_empty());
+    gated.gate.publish(gated.gate.generation(), input);
+    assert_eq!(c.tick().await.unwrap().placed.len(), 1);
+    let attempt = only(&c, &tasks[0]);
+    gated.gate.retain(|_| false);
+    c.tick().await.unwrap();
+    assert_eq!(only(&c, &tasks[0]).attempt_id, attempt.attempt_id);
+    assert!(worker.state.lock().unwrap().received.contains(&Op::Renew));
+}
+#[tokio::test]
+async fn source_gate_rechecks_after_forecast_and_replacement_starts_empty() {
+    let f = fx();
+    let worker = f.worker("w-a", (2, 1));
+    let c = f.open(&[]);
+    let gated = gated_worker(&worker);
+    c.attach(worker.id.clone(), gated.clone()).await;
+    let tasks = enqueue(&c, 1).await;
+    let input = ready_input(&c.store().queued_tasks(1).unwrap()[0]);
+    gated.gate.publish(gated.gate.generation(), input.clone());
+    let initial = gated.gate.generation();
+    gated.invalidate_forecast.store(true, Ordering::SeqCst);
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert!(attempts(&c, &tasks[0]).is_empty());
+    gated.gate.publish(initial, input.clone());
+    assert_eq!(gated.gate.snapshot().len(), 1);
+    assert!(
+        !gated.gate.evict_evaluated(),
+        "old dispatch cannot evaluate a reset generation"
+    );
+    let replacement = gated_worker(&worker);
+    c.attach(worker.id.clone(), replacement.clone()).await;
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    replacement
+        .gate
+        .publish(replacement.gate.generation(), input);
+    assert_eq!(c.tick().await.unwrap().placed.len(), 1);
+}
+#[tokio::test]
+async fn source_gate_places_later_ready_run_beyond_dispatch_scan_and_keeps_wait_state() {
+    let f = fx();
+    let worker = f.worker("w-a", (1, 0));
+    let c = f.open(&[&worker]);
+    let initial = enqueue(&c, 2).await;
+    c.tick().await.unwrap();
+    c.tick().await.unwrap();
+    let waiting = c.scheduler().waiting_reason(&initial[1]).unwrap();
+    let gated = gated_worker(&worker);
+    c.attach(worker.id.clone(), gated.clone()).await;
+    let _blocked = enqueue(&c, 300).await;
+    let ready_tasks = enqueue(&c, 1).await;
+    let last = c.store().queued_tasks(400).unwrap().last().unwrap().clone();
+    gated
+        .gate
+        .publish(gated.gate.generation(), ready_input(&last));
+    // The occupied worker prevents placement but filtered discovery must not
+    // erase the unrelated wait recorded by the earlier complete scan.
+    c.tick().await.unwrap();
+    assert_eq!(c.scheduler().waiting_reason(&initial[1]), Some(waiting));
+    worker.set(|s| s.limits = (2, 1));
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    assert_eq!(only(&c, &ready_tasks[0]).task_id, ready_tasks[0]);
+    let mut cursor = None;
+    let mut count = 0;
+    loop {
+        let page = c.store().input_page(cursor, 1000, None).unwrap();
+        assert!(page.len() <= 64);
+        if page.is_empty() {
+            break;
+        }
+        count += page.len();
+        cursor = page.last().map(|(cursor, _)| *cursor);
+    }
+    assert_eq!(count, 301);
+}
+
+fn source_gate_exclude_task(c: &Coordinator, task: &TaskId, worker: &WorkerId) {
+    let attempt = AttemptId::generate();
+    let placed = c
+        .store()
+        .place(
+            task,
+            worker,
+            &attempt,
+            |_| true,
+            |_| Ok((Digest::of_bytes(b"demand"), serde_json::json!({}))),
+            1,
+        )
+        .unwrap();
+    assert!(matches!(
+        placed,
+        remote_task_runner::storage::PlaceOutcome::Placed(_)
+    ));
+    c.store()
+        .begin_retire(
+            &attempt,
+            remote_task_runner::scheduler::REASON_WORKER_CANNOT_RUN,
+            2,
+        )
+        .unwrap();
+    c.store().confirm_retire(&attempt, 3).unwrap();
+}
+#[tokio::test]
+async fn source_gate_full_cache_evicts_only_evaluated_inputs_for_later_compatible_run() {
+    let f = fx();
+    let worker = f.worker("w-a", (2, 1));
+    let c = f.open(&[]);
+    let gated = gated_worker(&worker);
+    c.attach(worker.id.clone(), gated.clone()).await;
+    for _ in 0..64 {
+        enqueue(&c, 1).await;
+    }
+    for task in c.store().queued_tasks(64).unwrap() {
+        source_gate_exclude_task(&c, &task.task_id, &worker.id);
+        gated
+            .gate
+            .publish(gated.gate.generation(), ready_input(&task));
+    }
+    assert_eq!(gated.gate.snapshot().len(), 64);
+    assert!(!gated.gate.evict_evaluated());
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    let mut compatible = spec();
+    compatible.plan_digest = Digest::of_bytes(b"compatible");
+    let source_id = source(&c);
+    c.enqueue(
+        run.clone(),
+        source_id.clone(),
+        vec![(task.clone(), compatible)],
+    )
+    .await
+    .unwrap();
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert!(gated.gate.evict_evaluated());
+    let input = remote_task_runner::coordinator::ReadyInput {
+        run_id: run,
+        source_id,
+        manifest_digest: spec().manifest_digest,
+    };
+    gated.gate.publish(gated.gate.generation(), input);
+    assert_eq!(gated.gate.snapshot().len(), 64);
+    assert_eq!(c.tick().await.unwrap().placed.len(), 1);
+    assert_eq!(attempts(&c, &task).len(), 1);
+}
+#[tokio::test]
+async fn source_gate_advances_within_one_ready_run_beyond_dispatch_scan() {
+    let f = fx();
+    let worker = f.worker("w-a", (2, 1));
+    let c = f.open(&[]);
+    let gated = gated_worker(&worker);
+    c.attach(worker.id.clone(), gated.clone()).await;
+    let run = RunId::generate();
+    let source = source(&c);
+    let mut tasks: Vec<_> = (0..300).map(|_| (TaskId::generate(), spec())).collect();
+    tasks.last_mut().unwrap().1.plan_digest = Digest::of_bytes(b"compatible");
+    let compatible = tasks.last().unwrap().0.clone();
+    let incompatible: Vec<_> = tasks[..299].iter().map(|(id, _)| id.clone()).collect();
+    c.enqueue(run.clone(), source.clone(), tasks).await.unwrap();
+    for task in incompatible {
+        source_gate_exclude_task(&c, &task, &worker.id);
+    }
+    gated.gate.publish(
+        gated.gate.generation(),
+        remote_task_runner::coordinator::ReadyInput {
+            run_id: run,
+            source_id: source,
+            manifest_digest: spec().manifest_digest,
+        },
+    );
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert_eq!(c.tick().await.unwrap().placed.len(), 1);
+    assert_eq!(attempts(&c, &compatible).len(), 1);
+}
+
+#[tokio::test]
+async fn source_gate_keeps_unrestricted_draining_and_unreached_wait_reasons() {
+    let f = fx();
+    let worker = f.worker("w-a", (2, 1));
+    let c = f.open(&[&worker]);
+    let tasks = enqueue(&c, 1).await;
+    worker.set(|s| s.draining = true);
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert!(c.scheduler().waiting_reason(&tasks[0]).is_some());
+    worker.set(|s| {
+        s.draining = false;
+        s.offline = true;
+    });
+    c.tick().await.unwrap();
+    assert!(c.scheduler().waiting_reason(&tasks[0]).is_some());
+    assert!(attempts(&c, &tasks[0]).is_empty());
+}
+
+/// The SQLite writer is taken only after forecasting, so all preflight reads
+/// finish and the placement itself has to wait at BEGIN IMMEDIATE.
+struct DbCommitWorker {
+    inner: Arc<InputGatedWorker>,
+    database: std::path::PathBuf,
+    blocker: Mutex<Option<rusqlite::Connection>>,
+    lock_forecast: AtomicBool,
+    commit_entered: tokio::sync::Notify,
+}
+impl WorkerLink for DbCommitWorker {
+    fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
+        self.inner.placement_inputs()
+    }
+    fn placement_fence(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        self.commit_entered.notify_one();
+        self.inner.placement_fence()
+    }
+    fn inputs_evaluated(&self, generation: u64, run: &RunId) {
+        self.inner.inputs_evaluated(generation, run);
+    }
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            let forecast = matches!(request, Request::Forecast(_));
+            let response = self.inner.call(request).await;
+            if forecast && self.lock_forecast.swap(false, Ordering::SeqCst) {
+                let connection = rusqlite::Connection::open(&self.database).unwrap();
+                connection.execute_batch("BEGIN IMMEDIATE").unwrap();
+                *self.blocker.lock().unwrap() = Some(connection);
+            }
+            response
+        })
+    }
+}
+impl DbCommitWorker {
+    fn unlock(&self) {
+        self.blocker
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .execute_batch("ROLLBACK")
+            .unwrap();
+    }
+}
+async fn committing_fixture(
+    f: &Fx,
+) -> (
+    Arc<Coordinator>,
+    Arc<FakeWorker>,
+    Arc<DbCommitWorker>,
+    TaskId,
+) {
+    let worker = f.worker("w-a", (2, 1));
+    let c = Arc::new(f.open(&[]));
+    let tasks = enqueue(&c, 1).await;
+    let inner = gated_worker(&worker);
+    inner.gate.publish(
+        inner.gate.generation(),
+        ready_input(&c.store().queued_tasks(1).unwrap()[0]),
+    );
+    let link = Arc::new(DbCommitWorker {
+        inner,
+        database: f.dir.path().join("coordinator.db"),
+        blocker: Mutex::new(None),
+        lock_forecast: AtomicBool::new(true),
+        commit_entered: tokio::sync::Notify::new(),
+    });
+    c.attach(worker.id.clone(), link.clone()).await;
+    (c, worker, link, tasks[0].clone())
+}
+async fn assert_pending_once<F: Future>(future: Pin<&mut F>) {
+    let mut future = future;
+    std::future::poll_fn(|cx| {
+        assert!(future.as_mut().poll(cx).is_pending());
+        std::task::Poll::Ready(())
+    })
+    .await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_gate_sqlite_commit_linearizes_before_same_worker_replacement() {
+    let f = fx();
+    let (c, worker, link, task) = committing_fixture(&f).await;
+    let tick_owner = c.clone();
+    let tick = tokio::spawn(async move { tick_owner.tick().await });
+    tokio::time::timeout(Duration::from_secs(2), link.commit_entered.notified())
+        .await
+        .unwrap();
+    let replacement = gated_worker(&worker);
+    let mut attaching = Box::pin(c.attach(worker.id.clone(), replacement.clone()));
+    assert_pending_once(attaching.as_mut()).await;
+    assert!(
+        c.try_attach(worker.id.clone(), replacement.clone())
+            .is_err(),
+        "busy attachment must not silently succeed"
+    );
+    link.unlock();
+    assert_eq!(tick.await.unwrap().unwrap().placed.len(), 1);
+    attaching.await;
+    assert!(replacement.gate.snapshot().is_empty());
+    let before = only(&c, &task);
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert_eq!(only(&c, &task).attempt_id, before.attempt_id);
+    assert_eq!(before.generation, Generation(1));
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_gate_sqlite_commit_linearizes_before_detach() {
+    let f = fx();
+    let (c, worker, link, task) = committing_fixture(&f).await;
+    let tick_owner = c.clone();
+    let tick = tokio::spawn(async move { tick_owner.tick().await });
+    tokio::time::timeout(Duration::from_secs(2), link.commit_entered.notified())
+        .await
+        .unwrap();
+    let mut detaching = Box::pin(c.detach(&worker.id));
+    assert_pending_once(detaching.as_mut()).await;
+    link.unlock();
+    assert_eq!(tick.await.unwrap().unwrap().placed.len(), 1);
+    detaching.await.unwrap();
+    let before = only(&c, &task);
+    assert_eq!(before.observation, Observation::Unknown);
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert_eq!(only(&c, &task).attempt_id, before.attempt_id);
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn source_gate_dropped_tick_keeps_registry_and_generation_fences_through_db_commit() {
+    let f = fx();
+    let (c, worker, link, task) = committing_fixture(&f).await;
+    let tick_owner = c.clone();
+    let tick = tokio::spawn(async move { tick_owner.tick().await });
+    tokio::time::timeout(Duration::from_secs(2), link.commit_entered.notified())
+        .await
+        .unwrap();
+    tick.abort();
+    assert!(tick.await.unwrap_err().is_cancelled());
+    let generation = link.inner.gate.generation();
+    let mut resetting = Box::pin(link.inner.gate.observe(
+        WorkerBootId::parse("replacement-boot").unwrap(),
+        AgentEpoch(9),
+    ));
+    assert_pending_once(resetting.as_mut()).await;
+    let replacement = gated_worker(&worker);
+    let mut attaching = Box::pin(c.attach(worker.id.clone(), replacement.clone()));
+    assert_pending_once(attaching.as_mut()).await;
+    assert!(c.try_attach(worker.id.clone(), replacement).is_err());
+    assert_eq!(link.inner.gate.generation(), generation);
+    link.unlock();
+    resetting.await;
+    attaching.await;
+    assert_ne!(link.inner.gate.generation(), generation);
+    let attempt = only(&c, &task);
+    assert_eq!(attempt.generation, Generation(1));
+    assert!(!attempt.receipts.reached(Receipt::WorkerAccepted));
+}
+struct ReplacesDuringForecast {
+    inner: Arc<InputGatedWorker>,
+    owner: std::sync::Weak<Coordinator>,
+    replacement: Arc<InputGatedWorker>,
+    replace: AtomicBool,
+    unrestricted: bool,
+}
+impl WorkerLink for ReplacesDuringForecast {
+    fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
+        if self.unrestricted {
+            None
+        } else {
+            self.inner.placement_inputs()
+        }
+    }
+    fn placement_fence(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        if self.unrestricted {
+            None
+        } else {
+            self.inner.placement_fence()
+        }
+    }
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            let forecast = matches!(request, Request::Forecast(_));
+            let answer = self.inner.call(request).await;
+            if forecast && self.replace.swap(false, Ordering::SeqCst) {
+                self.owner
+                    .upgrade()
+                    .unwrap()
+                    .attach(self.inner.worker.id.clone(), self.replacement.clone())
+                    .await;
+            }
+            answer
+        })
+    }
+}
+#[tokio::test]
+async fn source_gate_replacement_during_forecast_finishes_and_rejects_old_decision() {
+    let f = fx();
+    let c = Arc::new(f.open(&[]));
+    let worker = f.worker("w-a", (2, 1));
+    let tasks = enqueue(&c, 1).await;
+    let inner = gated_worker(&worker);
+    inner.gate.publish(
+        inner.gate.generation(),
+        ready_input(&c.store().queued_tasks(1).unwrap()[0]),
+    );
+    let replacement = gated_worker(&worker);
+    let link = Arc::new(ReplacesDuringForecast {
+        inner,
+        owner: Arc::downgrade(&c),
+        replacement: replacement.clone(),
+        replace: AtomicBool::new(true),
+        unrestricted: false,
+    });
+    c.attach(worker.id.clone(), link).await;
+    assert!(tokio::time::timeout(Duration::from_secs(2), c.tick())
+        .await
+        .unwrap()
+        .unwrap()
+        .placed
+        .is_empty());
+    assert!(attempts(&c, &tasks[0]).is_empty());
+    assert!(replacement.gate.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn source_gate_unrestricted_forecast_cannot_commit_into_a_gated_replacement() {
+    let f = fx();
+    let c = Arc::new(f.open(&[]));
+    let worker = f.worker("w-a", (2, 1));
+    let tasks = enqueue(&c, 1).await;
+    let replacement = gated_worker(&worker);
+    let link = Arc::new(ReplacesDuringForecast {
+        inner: gated_worker(&worker),
+        owner: Arc::downgrade(&c),
+        replacement: replacement.clone(),
+        replace: AtomicBool::new(true),
+        unrestricted: true,
+    });
+    c.attach(worker.id.clone(), link).await;
+    assert!(tokio::time::timeout(Duration::from_secs(2), c.tick())
+        .await
+        .unwrap()
+        .unwrap()
+        .placed
+        .is_empty());
+    assert!(attempts(&c, &tasks[0]).is_empty());
+    assert!(replacement.gate.snapshot().is_empty());
+}
+
+#[tokio::test]
+async fn in_place_scheduler_uses_only_explicit_parent_local_and_never_automatic_retry() {
+    let f = fx();
+    let remote = f.worker("a-remote", (1, 0));
+    let local = f.worker("z-local", (1, 0));
+    let c = f.open(&[&remote, &local]);
+    let task = TaskId::generate();
+    let mut input = spec();
+    input.in_place = true;
+    c.enqueue(RunId::generate(), source(&c), vec![(task.clone(), input)])
+        .await
+        .unwrap();
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert!(remote.holds().is_empty());
+    c.set_parent_local(local.id.clone());
+    c.tick().await.unwrap();
+    let attempt = only(&c, &task);
+    assert_eq!(attempt.worker_id, local.id);
+    assert!(remote.holds().is_empty());
+    c.request_retire(&attempt.attempt_id, "move").await.unwrap();
+    c.tick().await.unwrap();
+    assert_eq!(
+        only(&c, &task).termination.unwrap().outcome(),
+        Outcome::Failed
+    );
+    for _ in 0..3 {
+        assert!(c.tick().await.unwrap().placed.is_empty());
+    }
+    assert_eq!(attempts(&c, &task).len(), 1);
+    assert!(remote.holds().is_empty());
+}
+
+#[tokio::test]
+async fn capability_filter_runs_before_forecast_and_records_unmet_requirements() {
+    use remote_task_runner::toolchain::capability::*;
+    let f = fx();
+    let old = f.worker("old", (1, 1));
+    let capable = f.worker("capable", (1, 1));
+    capable.set(|s| {
+        s.capabilities = Some(WorkerCapabilities {
+            schema_version: 1,
+            os: "linux".into(),
+            arch: "x86_64".into(),
+            profile: "node22".into(),
+            profile_digest: Digest::of_bytes(b"definition"),
+            execution_uid: 1,
+            protocol_versions: vec![1],
+            profile_fingerprint: Digest::of_bytes(b"p"),
+            tools: [(
+                "node".into(),
+                ToolObservation::Available {
+                    version: "v22.0.0".into(),
+                    identity: Digest::of_bytes(b"node"),
+                },
+            )]
+            .into(),
+            features: [FEATURE.into()].into(),
+            disk_free_bytes: None,
+            resource_budget: None,
+        })
+    });
+    let c = f.open(&[&old, &capable]);
+    let task = TaskId::generate();
+    let run = RunId::generate();
+    let mut task_spec = spec();
+    task_spec.requirements =
+        ExecutionRequirements::parse(Some("node22".into()), &["node".into(), "linux".into()])
+            .unwrap();
+    c.enqueue(
+        run.clone(),
+        source(&c),
+        vec![(task.clone(), task_spec.clone())],
+    )
+    .await
+    .unwrap();
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    assert_eq!(old.received(Op::Forecast), 0);
+    assert_eq!(capable.received(Op::Forecast), 1);
+    assert_eq!(only(&c, &task).worker_id, capable.id);
+    assert_eq!(
+        capable
+            .held(&only(&c, &task).attempt_id)
+            .unwrap()
+            .payload
+            .requirements,
+        task_spec.requirements
+    );
+    let mismatch_task = TaskId::generate();
+    task_spec.requirements.profile = Some("unknown".into());
+    c.enqueue(
+        RunId::generate(),
+        source(&c),
+        vec![(mismatch_task.clone(), task_spec)],
+    )
+    .await
+    .unwrap();
+    c.tick().await.unwrap();
+    assert!(attempts(&c, &mismatch_task).is_empty());
+    assert_eq!(old.received(Op::Forecast), 0);
+    let event = c
+        .store()
+        .events_after(0, 100)
+        .unwrap()
+        .into_iter()
+        .find(|e| {
+            e.kind == remote_task_runner::scheduler::EVENT_TASK_WAITING
+                && e.payload["task"] == mismatch_task.to_string()
+        })
+        .unwrap();
+    assert_eq!(event.payload["blocked_reason"], "no_compatible_worker");
+    let public = c
+        .store()
+        .query_task(mismatch_task)
+        .unwrap()
+        .unwrap()
+        .placement
+        .unwrap();
+    assert_eq!(
+        public.blocked_reason,
+        Some(BlockedReason::NoCompatibleWorker)
+    );
+    assert!(!public.truncated);
+    assert!(public.excluded.iter().all(|w| !w.unmet.is_empty()));
+
+    assert!(event.payload["decision"]["excluded"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|e| e["why"] == "capability_mismatch" && !e["unmet"].as_array().unwrap().is_empty()));
+}
+
+struct ToolchainAttestor {
+    worker: Arc<FakeWorker>,
+    stall_resolution: bool,
+}
+impl WorkerLink for ToolchainAttestor {
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        self.worker.call(request)
+    }
+    fn read_only_call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            match request {
+                Request::ResolveToolchains(r) if !self.stall_resolution => {
+                    Ok(Response::ResolveToolchains(ResolveToolchainsResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        bundle: r.bundle,
+                    }))
+                }
+                Request::ResolveToolchains(_) => std::future::pending().await,
+                other => self.worker.call(other).await,
+            }
+        })
+    }
+}
+#[tokio::test]
+async fn slow_toolchain_attestation_respects_round_budget_and_other_lease_progress() {
+    use remote_task_runner::toolchain::{contract::FrozenBundle, versions::*};
+    let mut f = fx();
+    f.cfg.worker_budget_ms = 1500;
+    f.sched.forecast_wait_ms = 50;
+    let healthy = f.worker("w-b", (2, 0));
+    let c = f.open(&[&healthy]);
+    let first = enqueue(&c, 1).await;
+    c.tick().await.unwrap();
+    let active = only(&c, &first[0]);
+    healthy.start(&active.attempt_id);
+    c.tick().await.unwrap();
+    let before = healthy.held(&active.attempt_id).unwrap().renewals;
+    let stalled = f.worker("w-a", (2, 0));
+    c.attach(
+        stalled.id.clone(),
+        Arc::new(ToolchainAttestor {
+            worker: stalled,
+            stall_resolution: true,
+        }),
+    )
+    .await;
+    c.attach(
+        healthy.id.clone(),
+        Arc::new(ToolchainAttestor {
+            worker: healthy.clone(),
+            stall_resolution: false,
+        }),
+    )
+    .await;
+    let mut task_spec = spec();
+    let scope = Scope::project("");
+    task_spec.toolchains = Some(
+        FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                task_spec.manifest_digest.clone(),
+                Digest::of_bytes(b"parent"),
+                scope.clone(),
+                &[Declaration {
+                    tool: ToolId::parse("node").unwrap(),
+                    constraint: Constraint::parse("20.0.0").unwrap(),
+                    scope,
+                    location: Location {
+                        path: ".node-version".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &BTreeMap::new(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    let task = TaskId::generate();
+    c.enqueue(
+        RunId::generate(),
+        source(&c),
+        vec![(task.clone(), task_spec)],
+    )
+    .await
+    .unwrap();
+    let begun = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(3), c.tick())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        begun.elapsed() < Duration::from_secs(1),
+        "a complete attestation cannot spend the full peer budget"
+    );
+    assert_eq!(
+        healthy.held(&active.attempt_id).unwrap().renewals,
+        before + 1
+    );
+    assert_eq!(only(&c, &task).worker_id, healthy.id);
+    healthy.finish(&active.attempt_id, Outcome::Succeeded);
+    c.tick().await.unwrap();
+    assert_eq!(only(&c, &first[0]).state, AttemptState::Terminal);
+}
+
+#[tokio::test]
+async fn measured_cold_choice_waits_without_attempt_then_failed_prefetch_places_healthy_warm() {
+    measured_cold_fixture(true, false, false).await;
+}
+#[tokio::test]
+async fn unknown_cold_candidate_keeps_existing_ready_gate_eligibility() {
+    measured_cold_fixture(false, false, false).await;
+}
+#[tokio::test]
+async fn measured_cold_candidate_cannot_bypass_frozen_toolchain_eligibility() {
+    measured_cold_fixture(true, true, false).await;
+}
+#[tokio::test]
+async fn measured_cold_frozen_attested_candidate_prefetches_before_attempt() {
+    measured_cold_fixture(true, true, true).await;
+}
+async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
+    use remote_task_runner::scheduler::measured::{CostQuery, MeasuredCosts, Phase, Sample};
+    let mut f = fx();
+    let stats = tempfile::tempdir().unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(stats.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let model = Arc::new(
+        MeasuredCosts::open(
+            &std::fs::canonicalize(stats.path()).unwrap(),
+            Default::default(),
+        )
+        .unwrap(),
+    );
+    f.costs = model.clone();
+    let warm = f.worker("warm", (2, 1));
+    let cold = f.worker("cold", (2, 1));
+    warm.set(|s| s.forecasting.run_ms = 100_000);
+    cold.set(|s| s.forecasting.run_ms = 1000);
+    let c = f.open(&[]);
+    let warm_link = Arc::new(InputGatedWorker {
+        worker: warm.clone(),
+        gate: Arc::new(
+            remote_task_runner::coordinator::InputGate::with_transport_policy(
+                "fixture-rpc-v1".into(),
+            ),
+        ),
+        invalidate_forecast: AtomicBool::new(false),
+        attestor: frozen.then(|| {
+            Arc::new(ToolchainAttestor {
+                worker: warm.clone(),
+                stall_resolution: false,
+            })
+        }),
+    });
+    let cold_link = Arc::new(InputGatedWorker {
+        worker: cold.clone(),
+        gate: Arc::new(
+            remote_task_runner::coordinator::InputGate::with_transport_policy(
+                "fixture-rpc-v1".into(),
+            ),
+        ),
+        invalidate_forecast: AtomicBool::new(false),
+        attestor: frozen.then(|| {
+            Arc::new(ToolchainAttestor {
+                worker: cold.clone(),
+                stall_resolution: !cold_attests,
+            })
+        }),
+    });
+    for link in [&warm_link, &cold_link] {
+        link.gate
+            .observe(WorkerBootId::parse("boot-1").unwrap(), AgentEpoch(1))
+            .await;
+    }
+    c.attach(warm.id.clone(), warm_link.clone()).await;
+    c.attach(cold.id.clone(), cold_link.clone()).await;
+    let tasks = if frozen {
+        use remote_task_runner::toolchain::{contract::FrozenBundle, versions::*};
+        let mut task_spec = spec();
+        let scope = Scope::project("");
+        task_spec.toolchains = Some(
+            FrozenBundle::seal_exact(
+                FrozenToolchains::freeze(
+                    task_spec.manifest_digest.clone(),
+                    Digest::of_bytes(b"parent"),
+                    scope.clone(),
+                    &[Declaration {
+                        tool: ToolId::parse("node").unwrap(),
+                        constraint: Constraint::parse("20.0.0").unwrap(),
+                        scope,
+                        location: Location {
+                            path: ".node-version".into(),
+                            first_line: 1,
+                            last_line: 1,
+                        },
+                    }],
+                    &[],
+                    &BTreeMap::new(),
+                    MatchPolicy::Exact,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        );
+        let id = TaskId::generate();
+        c.enqueue(RunId::generate(), source(&c), vec![(id.clone(), task_spec)])
+            .await
+            .unwrap();
+        vec![id]
+    } else {
+        enqueue(&c, 1).await
+    };
+    let task = c.store().queued_tasks(1).unwrap().remove(0);
+    warm_link
+        .gate
+        .publish(warm_link.gate.generation(), ready_input(&task));
+    if known {
+        let query = CostQuery::task(
+            &task.spec,
+            task.source_id.as_ref().map(|s| s.as_str()),
+            cold_link.cost_transport(),
+        );
+        let now = remote_task_runner::platform::monotonic_ms();
+        model.record(
+            Sample::verified(
+                &cold.id,
+                &query,
+                Phase::Transfer,
+                "verified-fixture-exchange".into(),
+                now.saturating_sub(10),
+                10,
+            )
+            .unwrap(),
+        );
+    }
+    model.drain();
+    let report = c.tick().await.unwrap();
+    if known && (!frozen || cold_attests) {
+        assert!(report.placed.is_empty());
+        assert!(attempts(&c, &tasks[0]).is_empty());
+        assert_eq!(cold_link.gate.preferred().unwrap().task_id, task.task_id);
+        assert!(cold.count(Op::Forecast) > 0);
+        // A real delivery error suppresses the cold choice; the next normal
+        // scheduler comparison places the healthy ready worker.
+        cold_link.gate.fail_preference(&task.run_id);
+        assert_eq!(c.tick().await.unwrap().placed.len(), 1);
+    } else {
+        assert_eq!(report.placed.len(), 1);
+        assert_eq!(cold.count(Op::Forecast), 0);
+    }
+    assert_eq!(only(&c, &tasks[0]).worker_id, warm.id);
+    let evidence =
+        remote_task_runner::scheduler::cost_evidence_of(c.store(), &only(&c, &tasks[0]).attempt_id)
+            .unwrap()
+            .unwrap();
+    let warm_evidence = &evidence
+        .iter()
+        .find(|e| e.worker_id == warm.id)
+        .unwrap()
+        .costs;
+    assert_eq!(
+        warm_evidence.transfer.kind,
+        remote_task_runner::scheduler::measured::EvidenceKind::VerifiedReady
+    );
+    assert_eq!(warm_evidence.transfer.sample_count, Some(0));
+    assert_eq!(warm_evidence.setup.ms, None);
+    assert!(cold_link.gate.preferred().is_none());
+    assert_eq!(warm.count(Op::Submit), 1);
+    assert_eq!(cold.count(Op::Submit), 0);
+    if frozen && !cold_attests {
+        assert_eq!(warm.count(Op::Forecast), 1);
+        assert_eq!(cold.count(Op::Forecast), 0);
+    }
 }

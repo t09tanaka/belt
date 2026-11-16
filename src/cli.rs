@@ -21,6 +21,14 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run one admitted private tool installer (internal).
+    #[command(hide = true)]
+    ToolchainInstall {
+        #[arg(long)]
+        request: std::path::PathBuf,
+        #[arg(long)]
+        binding: String,
+    },
     /// Run the parent owner process (internal).
     #[command(hide = true)]
     Daemon(DaemonArgs),
@@ -46,8 +54,8 @@ pub enum Command {
     Retry(IdArgs),
     /// Fetch outputs.
     Outputs(OutputsArgs),
-    /// Estimate a command.
-    Estimate(SubmitArgs),
+    /// Preview placement if a command or a captured task were run again.
+    Estimate(EstimateArgs),
     /// Check the setup.
     Doctor,
     /// Manage workers.
@@ -94,6 +102,8 @@ pub enum CiSub {
 
 #[derive(Debug, Args)]
 pub struct ExecArgs {
+    #[command(flatten)]
+    pub execution: ExecutionArgs,
     /// Run in the current directory instead of a snapshot.
     #[arg(long)]
     pub in_place: bool,
@@ -103,8 +113,53 @@ pub struct ExecArgs {
 
 #[derive(Debug, Args)]
 pub struct SubmitArgs {
+    #[command(flatten)]
+    pub execution: ExecutionArgs,
     #[arg(last = true, required = true)]
     pub command: Vec<String>,
+}
+
+/// A task preview reuses its stored inputs; it does not predict remaining runtime.
+#[derive(Debug, Args)]
+pub struct EstimateArgs {
+    #[command(flatten)]
+    pub execution: ExecutionArgs,
+    /// Task whose frozen commands, environment, setup and output plan would run again.
+    /// Does not capture the current checkout or apply current project settings.
+    /// This previews a hypothetical rerun, not remaining runtime.
+    #[arg(long, conflicts_with_all = ["profile", "requires", "command"])]
+    pub task: Option<String>,
+    #[arg(last = true, required_unless_present = "task")]
+    pub command: Vec<String>,
+}
+
+/// Placement selectors never change the worker's own active environment.
+#[derive(Debug, Args)]
+pub struct ExecutionArgs {
+    #[arg(long)]
+    pub profile: Option<String>,
+    #[arg(long, value_delimiter = ',')]
+    pub requires: Vec<String>,
+}
+impl ExecutionArgs {
+    pub(crate) fn apply(
+        &self,
+        mut context: crate::service::context::Context,
+    ) -> crate::service::context::Context {
+        if let Some(profile) = &self.profile {
+            context.config.profile = crate::config::Value {
+                value: Some(profile.clone()),
+                origin: crate::config::Origin::Cli,
+            };
+        }
+        if !self.requires.is_empty() {
+            context.config.requires = crate::config::Value {
+                value: self.requires.clone(),
+                origin: crate::config::Origin::Cli,
+            };
+        }
+        context
+    }
 }
 
 /// Metadata listing, ordered by canonical identifier. Cursors are exclusive.
@@ -135,11 +190,17 @@ pub struct LogsArgs {
     /// Keep streaming.
     #[arg(long)]
     pub follow: bool,
+    /// Read a specific historical attempt belonging to the task.
+    #[arg(long)]
+    pub attempt: Option<String>,
 }
 
 #[derive(Debug, Args)]
 pub struct OutputsArgs {
     pub id: String,
+    /// Read an exact historical attempt belonging to the task.
+    #[arg(long)]
+    pub attempt: Option<String>,
     /// Destination directory.
     #[arg(long)]
     pub dir: Option<std::path::PathBuf>,
@@ -196,8 +257,12 @@ pub struct WorkerArgs {
     /// Speak the protocol over stdin/stdout.
     #[arg(long)]
     pub stdio: bool,
+    /// Retained private input for a foreground persistent worker.
+    #[arg(long, conflicts_with_all = ["stdio", "ephemeral"])]
+    pub input: Option<std::path::PathBuf>,
     /// Exit when the work is done.
     #[arg(long)]
+    #[arg(conflicts_with = "stdio")]
     pub ephemeral: bool,
 }
 
@@ -230,6 +295,59 @@ impl Envelope {
 
 /// Run a parsed command and return the process exit code.
 pub fn run(cli: Cli) -> i32 {
+    if let Command::ToolchainInstall { request, binding } = &cli.command {
+        return crate::toolchain::preparation::helper_main(request, binding);
+    }
+    if matches!(cli.command, Command::Init) {
+        return match crate::service::init::command() {
+            Ok(receipt) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":true,"result":receipt})
+                    );
+                } else {
+                    println!("initialized {} {}", receipt.cluster_id, receipt.worker_id);
+                }
+                exit::SUCCESS
+            }
+            Err(error) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                    );
+                } else {
+                    eprintln!("error: {}", error.message);
+                }
+                error.code.exit_code()
+            }
+        };
+    }
+
+    if matches!(&cli.command, Command::Ci(args) if matches!(args.sub, Some(CiSub::Plan))) {
+        return run_ci_plan(&cli);
+    }
+
+    if matches!(&cli.command, Command::Exec(_))
+        || matches!(
+            &cli.command,
+            Command::Wait(_) | Command::Cancel(_) | Command::Retry(_)
+        )
+    {
+        return run_control(&cli);
+    }
+
+    if let Command::Estimate(args) = &cli.command {
+        return crate::service::estimate::cli(args, cli.json);
+    }
+    if let Command::Outputs(args) = &cli.command {
+        return crate::service::outputs::command(args, cli.json);
+    }
+    if let Command::Logs(args) = &cli.command {
+        return crate::service::logs::command(args, cli.json);
+    }
+
     if matches!(cli.command, Command::Ls(_) | Command::Show(_)) {
         return run_query(&cli);
     }
@@ -238,6 +356,9 @@ pub fn run(cli: Cli) -> i32 {
         return crate::service::bootstrap::daemon_main(args.input.as_deref());
     }
     if let Command::Worker(args) = &cli.command {
+        if let Some(input) = &args.input {
+            return crate::service::worker::main(input);
+        }
         if args.stdio && !args.ephemeral {
             return run_worker_stdio();
         }
@@ -252,7 +373,9 @@ pub fn run(cli: Cli) -> i32 {
                 .collect();
             let cwd = std::env::current_dir()
                 .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
-            let context = crate::service::context::Context::discover(env, cwd)?;
+            let context = args
+                .execution
+                .apply(crate::service::context::Context::discover(env, cwd)?);
             let runtime = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
@@ -299,6 +422,204 @@ pub fn run(cli: Cli) -> i32 {
         eprintln!("error: {}", envelope.error.message);
     }
     ErrorCode::NotImplemented.exit_code()
+}
+
+fn run_ci_plan(cli: &Cli) -> i32 {
+    let result = (|| -> Result<_, crate::error::ApiError> {
+        use crate::{
+            config::{model::SourceMode, Overlay},
+            service::context::{runtime_spec, Context},
+        };
+        let Command::Ci(args) = &cli.command else {
+            unreachable!()
+        };
+        let invalid = |message| crate::error::ApiError::new(ErrorCode::InvalidInput, message);
+        let source_mode = match args.snapshot.as_deref() {
+            None => None,
+            Some("worktree") => Some(SourceMode::Worktree),
+            Some("commit") => Some(SourceMode::Commit),
+            Some(_) => return Err(invalid("unsupported snapshot kind")),
+        };
+        if source_mode == Some(SourceMode::Worktree) && args.git_ref.is_some() {
+            return Err(invalid("worktree snapshot does not accept a revision"));
+        }
+        let env = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let cwd =
+            std::env::current_dir().map_err(|_| invalid("command directory is unavailable"))?;
+        let spec = runtime_spec(&env)
+            .map_err(|_| invalid("coordinator configuration is unavailable; initialize first"))?;
+        let overlay = Overlay {
+            source_mode,
+            ..Default::default()
+        };
+        let context = Context::load_with_overlay(env, cwd, spec, &overlay)
+            .map_err(|_| invalid("planning configuration is invalid or unavailable"))?;
+        let prepared = crate::service::planning::prepare(context, args.git_ref.as_deref())?;
+        let summary = prepared.plan().summary().clone();
+        prepared.close()?;
+        Ok(summary)
+    })();
+    match result {
+        Ok(summary) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":true,"result":summary})
+                );
+            } else {
+                println!(
+                    "{} workflows, {} tasks, {} nodes\nplan {}",
+                    summary.selected_workflows,
+                    summary.tasks.len(),
+                    summary.nodes.len(),
+                    summary.digest
+                );
+            }
+            exit::SUCCESS
+        }
+        Err(error) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":{"code":error.code,"message":error.message}})
+                );
+            } else {
+                eprintln!("{}", error.message);
+            }
+            error.code.exit_code()
+        }
+    }
+}
+
+fn run_control(cli: &Cli) -> i32 {
+    let result = (|| -> Result<crate::service::control::Report, crate::error::ApiError> {
+        if let Command::Wait(args) | Command::Cancel(args) | Command::Retry(args) = &cli.command {
+            crate::service::completion::Target::parse(&args.id)?;
+        }
+        let env = std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect();
+        let cwd = std::env::current_dir()
+            .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+        let spec = crate::service::context::runtime_spec(&env)?;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| crate::error::ApiError::new(ErrorCode::Internal, e.to_string()))?;
+        let result = runtime.block_on(async {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let mut interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .map_err(|e| crate::error::ApiError::new(ErrorCode::Internal, e.to_string()))?;
+            let watcher = tokio::spawn(async move {
+                while interrupt.recv().await.is_some() {
+                    if sender.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let result = match &cli.command {
+                Command::Exec(args) => {
+                    crate::service::control::exec_mode(
+                        args.execution.apply(crate::service::context::Context::load(
+                            env,
+                            cwd,
+                            spec.clone(),
+                        )?),
+                        args.command.clone(),
+                        args.in_place,
+                        &mut receiver,
+                    )
+                    .await
+                }
+                Command::Wait(args) => {
+                    crate::service::control::wait(
+                        &spec,
+                        crate::service::completion::Target::parse(&args.id)?,
+                        &mut receiver,
+                    )
+                    .await
+                }
+                Command::Retry(args) => {
+                    crate::service::control::retry(
+                        &spec,
+                        crate::service::completion::Target::parse(&args.id)?,
+                    )
+                    .await
+                }
+                Command::Cancel(args) => {
+                    let target = crate::service::completion::Target::parse(&args.id)?;
+                    let snapshot = crate::service::control::cancel(&spec, target.clone()).await?;
+                    Ok(crate::service::control::Report {
+                        schema_version: 1,
+                        retry_receipt: None,
+                        target,
+                        task_id: None,
+                        state: "cancel_requested",
+                        stop_confirmed: snapshot.stop_confirmed(),
+                        collection_pending: Some(snapshot.collection_pending_tasks > 0),
+                        cancel_requested: true,
+                        cancel_acknowledged: true,
+                        snapshot: Some(snapshot),
+                        cli_exit_code: 0,
+                        error: None,
+                    })
+                }
+                _ => unreachable!(),
+            };
+            watcher.abort();
+            let _ = watcher.await;
+            result
+        });
+        runtime.shutdown_background();
+        result
+    })();
+    match result {
+        Ok(report) => {
+            let code = report.cli_exit_code;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":code==0,"result":report})
+                );
+            } else {
+                let id = match &report.target {
+                    crate::service::completion::Target::Run(id) => id.to_string(),
+                    crate::service::completion::Target::Task(id) => id.to_string(),
+                };
+                if report.snapshot.as_ref().is_some_and(|s| s.in_place) {
+                    eprintln!(
+                        "in-place: mutable original workspace; snapshot is a comparison baseline"
+                    );
+                }
+                if let Some(task) = &report.task_id {
+                    println!("{id} {task} {}", report.state);
+                } else {
+                    println!("{id} {}", report.state);
+                }
+                if report.collection_pending == Some(true) {
+                    eprintln!("collection is still pending");
+                }
+                if let Some(error) = &report.error {
+                    eprintln!("error: {}", error.message);
+                }
+            }
+            code
+        }
+        Err(error) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                );
+            } else {
+                eprintln!("error: {}", error.message);
+            }
+            error.code.exit_code()
+        }
+    }
 }
 
 /// `worker --stdio`: relay stdin and stdout to the worker agent's Unix socket.
@@ -405,15 +726,13 @@ fn run_query(cli: &Cli) -> i32 {
         let env = std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
             .collect();
-        let cwd = std::env::current_dir().map_err(|e| invalid(e.to_string()))?;
-        let context = crate::service::context::Context::discover(env, cwd)?;
+        let spec = crate::service::context::runtime_spec(&env)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
         runtime.block_on(async {
-            let client = context
-                .readonly()
+            let client = crate::service::query::Reader::open(spec)
                 .await
                 .map_err(|e| ApiError::new(e.code, e.to_string()))?;
             let value = match &cli.command {
@@ -467,5 +786,41 @@ fn run_query(cli: &Cli) -> i32 {
             }
             error.code.exit_code()
         }
+    }
+}
+
+#[cfg(test)]
+mod estimate_args_tests {
+    use super::*;
+    #[test]
+    fn frozen_task_conflicts_with_execution_overrides_and_raw_command_stays_required() {
+        assert!(
+            Cli::try_parse_from(["rtr", "estimate", "--task", "task_example", "--json"]).is_ok()
+        );
+        assert!(Cli::try_parse_from(["rtr", "estimate", "--", "echo", "hello"]).is_ok());
+        assert!(Cli::try_parse_from(["rtr", "estimate"]).is_err());
+        for extra in [
+            vec!["--profile", "p"],
+            vec!["--requires", "node"],
+            vec!["--", "echo"],
+        ] {
+            let mut args = vec!["rtr", "estimate", "--task", "task_example"];
+            args.extend(extra);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let query = crate::service::estimate::Query {
+            version: 1,
+            argv: vec!["echo".into()],
+            repository_id: None,
+            cwd_relative: String::new(),
+            requirements: Default::default(),
+        };
+        assert_eq!(
+            serde_json::to_value(query).unwrap(),
+            serde_json::json!({
+                "version":1,"argv":["echo"],"repository_id":null,"cwd_relative":"",
+                "requirements": {}
+            })
+        );
     }
 }

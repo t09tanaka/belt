@@ -311,6 +311,7 @@ fn blob_item(i: u32) -> Outgoing {
     });
     let frame = Frame::message(i + 1, Message::Request(req));
     Outgoing {
+        retained: None,
         kind: frame.kind,
         bytes: encode(&frame, MAX_FRAME_LEN).unwrap(),
     }
@@ -1368,4 +1369,69 @@ async fn streamed_upload_detects_file_mutation_between_chunks() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn output_bundle_feature_is_required_even_when_configs_clear_requirements() {
+    let cluster = ClusterId::generate();
+    let (a, mut raw) = duplex_pair(4096);
+    let mut cfg = server_cfg(&cluster);
+    cfg.local.required_features.clear();
+    cfg.local.features.clear();
+    let server = tokio::spawn(async move { accept(a, cfg).await });
+    let h = HelloRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        cluster_id: cluster.clone(),
+        coordinator_id: CoordinatorId::generate(),
+        coordinator_epoch: CoordinatorEpoch(1),
+        protocol_versions: vec![1],
+        features: vec![],
+    };
+    write_frame(
+        &mut raw.writer,
+        &Frame::message(0, Message::Request(Request::Hello(h))),
+        MAX_FRAME_LEN,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(server.await.unwrap(),Err(ConnectError::Incompatible(e)) if e.message.contains("output_bundles_v1"))
+    );
+    let (a, mut raw) = duplex_pair(4096);
+    let mut cfg = client_cfg(&cluster);
+    cfg.required_features.clear();
+    cfg.features.clear();
+    let client = tokio::spawn(async move { connect(a, cfg).await });
+    let frame = read_frame(&mut raw.reader, MAX_FRAME_LEN)
+        .await
+        .unwrap()
+        .unwrap();
+    let Body::Message(Message::Request(Request::Hello(h))) = frame.body else {
+        panic!("hello")
+    };
+    assert!(h.features.iter().any(|f| f == "output_bundles_v1"));
+    let response = identity("w1").response(
+        &cluster,
+        &remote_task_runner::protocol::hello::Negotiated {
+            version: 1,
+            features: vec![],
+        },
+    );
+    write_frame(
+        &mut raw.writer,
+        &Frame::message(
+            0,
+            Message::Response {
+                request_id: h.request_id,
+                response: Response::Hello(response),
+            },
+        ),
+        MAX_FRAME_LEN,
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(client.await.unwrap(),Err(ConnectError::Incompatible(e)) if e.message.contains("output_bundles_v1"))
+    );
 }

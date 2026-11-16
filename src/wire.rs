@@ -243,10 +243,13 @@ pub enum Operation {
     SecretBundlePut,
     EnvReport,
     EnvSync,
+    ForecastCommand,
+    ResolveToolchains,
+    PreparationProbe,
 }
 
 impl Operation {
-    pub const ALL: [Operation; 19] = [
+    pub const ALL: [Operation; 22] = [
         Operation::Hello,
         Operation::Inspect,
         Operation::Forecast,
@@ -266,6 +269,9 @@ impl Operation {
         Operation::SecretBundlePut,
         Operation::EnvReport,
         Operation::EnvSync,
+        Operation::ForecastCommand,
+        Operation::ResolveToolchains,
+        Operation::PreparationProbe,
     ];
 
     pub fn idempotency(self) -> Idempotency {
@@ -281,6 +287,7 @@ impl Operation {
             Operation::Hello
             | Operation::Inspect
             | Operation::Forecast
+            | Operation::ForecastCommand
             | Operation::GetAttempt
             | Operation::ListAttempts
             | Operation::WatchEvents
@@ -288,7 +295,9 @@ impl Operation {
             | Operation::GetResult
             | Operation::BlobGet
             | Operation::BlobVerify
-            | Operation::EnvReport => Idempotency::ReadOnly,
+            | Operation::EnvReport
+            | Operation::ResolveToolchains
+            | Operation::PreparationProbe => Idempotency::ReadOnly,
         }
     }
 }
@@ -348,6 +357,8 @@ pub struct HelloRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     pub schema_version: SchemaVersion,
     /// The cluster this worker belongs to.
     pub cluster_id: ClusterId,
@@ -369,12 +380,19 @@ pub struct HelloResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectRequest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_observations:
+        Option<crate::setup::observation_transport::ObservationPageRequest>,
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation_observations: Option<crate::setup::observation_transport::ObservationPage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     pub schema_version: SchemaVersion,
     pub worker_id: WorkerId,
     pub worker_boot_id: WorkerBootId,
@@ -486,6 +504,21 @@ pub struct ForecastRequest {
     /// to this worker (the overlay); counted once.
     #[serde(default)]
     pub pending: Vec<WorkloadPlan>,
+}
+
+/// Read-only command forecast, negotiated as `forecast_command_v1`.
+/// A repository identity names an existing canonical clone, never a path to create.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForecastCommandRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub coordinator_epoch: CoordinatorEpoch,
+    pub version: u32,
+    pub repository_id: Option<String>,
+    pub cwd_relative: String,
+    pub argv: Vec<String>,
+    pub forecast: ForecastRequest,
 }
 
 /// Which nodes of which plan the worker already accounts for.
@@ -779,10 +812,50 @@ pub struct ArtifactDecl {
     pub if_missing: MissingPolicy,
 }
 
+/// A logical output, stored as one uncompressed TarV1 blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputDecl {
+    pub name: String,
+    pub paths: Vec<String>,
+    pub if_missing: MissingPolicy,
+    pub when: OutputWhen,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputWhen {
+    Always,
+    Success,
+    Failure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactEncoding {
+    #[default]
+    Raw,
+    TarV1,
+}
+impl ArtifactEncoding {
+    pub fn is_raw(&self) -> bool {
+        *self == Self::Raw
+    }
+}
+
 /// What a worker persists on acceptance. Its canonical JSON is hashed into
 /// `payload_hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptPayload {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchains: Option<Box<crate::toolchain::contract::FrozenBundle>>,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::toolchain::capability::ExecutionRequirements::is_empty"
+    )]
+    pub requirements: crate::toolchain::capability::ExecutionRequirements,
+    /// Mutable local workspace; source is a comparison baseline only.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_place: bool,
     pub run_id: RunId,
     pub task_id: TaskId,
     pub generation: Generation,
@@ -812,6 +885,8 @@ pub struct AttemptPayload {
     /// canonical JSON, and the hash, it had before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactDecl>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub outputs: Vec<OutputDecl>,
     /// The setup of the task, to be prepared once by the worker's builder
     /// and shared. Not written when absent, like `artifacts`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1187,6 +1262,8 @@ pub struct ReadLogResponse {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ArtifactRecord {
+    #[serde(default, skip_serializing_if = "ArtifactEncoding::is_raw")]
+    pub encoding: ArtifactEncoding,
     pub name: String,
     /// Relative path.
     pub path: String,
@@ -1231,6 +1308,9 @@ pub struct GetResultRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetResultResponse {
+    /// True only when the immutable collection journal was fixed, including zero eligible outputs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outputs_evaluated: bool,
     pub schema_version: SchemaVersion,
     pub attempt_id: AttemptId,
     pub generation: Generation,
@@ -1604,10 +1684,60 @@ macro_rules! operations {
     };
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveToolchainsRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub bundle: crate::toolchain::contract::FrozenBundle,
+    pub requirements: crate::toolchain::capability::ExecutionRequirements,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResolveToolchainsResponse {
+    pub schema_version: SchemaVersion,
+    pub bundle: crate::toolchain::contract::FrozenBundle,
+}
+
+/// Negotiated, process-free preparation identity queries.
+pub const PREPARATION_PROBE_FEATURE: &str = "preparation_probe_v1";
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationProbeRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub expected_profile_fingerprint: Digest,
+    pub manifest_digest: Digest,
+    pub source_id: SourceId,
+    pub run_id: RunId,
+    pub setup: Option<SetupSpec>,
+    pub frozen: Option<Box<crate::toolchain::contract::FrozenBundle>>,
+    pub in_place: bool,
+}
+impl std::fmt::Debug for PreparationProbeRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparationProbeRequest")
+            .field("schema_version", &self.schema_version)
+            .field("request_id", &self.request_id)
+            .finish_non_exhaustive()
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparationProbeResponse {
+    pub schema_version: SchemaVersion,
+    pub worker_id: WorkerId,
+    pub worker_boot_id: WorkerBootId,
+    pub agent_epoch: AgentEpoch,
+    pub probe: crate::setup::preparation_probe::PreparationProbe,
+}
+
 operations! {
     Hello(HelloRequest, HelloResponse),
     Inspect(InspectRequest, InspectResponse),
     Forecast(ForecastRequest, ForecastResponse),
+    ForecastCommand(ForecastCommandRequest, ForecastResponse),
     SubmitAttempt(SubmitAttemptRequest, SubmitAttemptResponse),
     GetAttempt(GetAttemptRequest, GetAttemptResponse),
     ListAttempts(ListAttemptsRequest, ListAttemptsResponse),
@@ -1624,6 +1754,8 @@ operations! {
     SecretBundlePut(SecretBundlePutRequest, SecretBundlePutResponse),
     EnvReport(EnvReportRequest, EnvReportResponse),
     EnvSync(EnvSyncRequest, EnvSyncResponse),
+    ResolveToolchains(ResolveToolchainsRequest, ResolveToolchainsResponse),
+    PreparationProbe(PreparationProbeRequest, PreparationProbeResponse),
 }
 
 /// An error reply.
@@ -1723,6 +1855,10 @@ mod tests {
 
     fn payload() -> AttemptPayload {
         AttemptPayload {
+            toolchains: None,
+            outputs: Vec::new(),
+            requirements: Default::default(),
+            in_place: false,
             setup: None,
             run_id: RunId::generate(),
             task_id: TaskId::generate(),
@@ -1832,6 +1968,7 @@ mod tests {
 
     fn artifact() -> ArtifactRecord {
         ArtifactRecord {
+            encoding: crate::wire::ArtifactEncoding::Raw,
             name: "out".into(),
             path: "out/a.txt".into(),
             size: 3,
@@ -1868,9 +2005,26 @@ mod tests {
         }
     }
 
+    fn frozen_bundle() -> crate::toolchain::contract::FrozenBundle {
+        crate::toolchain::contract::FrozenBundle {
+            schema_version: 1,
+            frozen: crate::toolchain::versions::FrozenToolchains::freeze(
+                dg("source"),
+                dg("parent"),
+                crate::toolchain::versions::Scope::project(""),
+                &[],
+                &[],
+                &BTreeMap::new(),
+                crate::toolchain::versions::MatchPolicy::Exact,
+            )
+            .unwrap(),
+            evidence: vec![],
+        }
+    }
+
     fn requests() -> Vec<Request> {
         let aid = aid();
-        vec![
+        let mut out = vec![
             Request::Hello(HelloRequest {
                 schema_version: SV,
                 request_id: rid(),
@@ -1881,6 +2035,7 @@ mod tests {
                 features: vec!["secret_bundle".into()],
             }),
             Request::Inspect(InspectRequest {
+                preparation_observations: None,
                 schema_version: SV,
                 request_id: rid(),
             }),
@@ -2018,12 +2173,67 @@ mod tests {
                 }],
                 dry_run: true,
             }),
-        ]
+        ];
+        out.push(Request::ForecastCommand(ForecastCommandRequest {
+            schema_version: SV,
+            request_id: rid(),
+            coordinator_epoch: CoordinatorEpoch(3),
+            version: 1,
+            repository_id: None,
+            cwd_relative: String::new(),
+            argv: vec!["echo".into()],
+            forecast: ForecastRequest {
+                schema_version: SV,
+                request_id: rid(),
+                coordinator_epoch: CoordinatorEpoch(3),
+                workload: plan(),
+                pending: vec![],
+            },
+        }));
+        out.push(Request::ResolveToolchains(ResolveToolchainsRequest {
+            schema_version: SV,
+            request_id: rid(),
+            bundle: frozen_bundle(),
+            requirements: Default::default(),
+        }));
+        out.push(Request::PreparationProbe(preparation_probe_request()));
+        out
+    }
+
+    fn preparation_probe_request() -> PreparationProbeRequest {
+        PreparationProbeRequest {
+            schema_version: SV,
+            request_id: rid(),
+            expected_profile_fingerprint: Digest::of_bytes(b"profile"),
+            manifest_digest: Digest::of_bytes(b"manifest"),
+            source_id: SourceId::generate(),
+            run_id: RunId::generate(),
+            setup: None,
+            frozen: None,
+            in_place: true,
+        }
     }
 
     fn responses() -> Vec<Response> {
-        vec![
+        let forecast = ForecastResponse {
+            schema_version: SV,
+            worker_id: worker(),
+            worker_boot_id: boot(),
+            agent_epoch: AgentEpoch(2),
+            snapshot_digest: dg("s"),
+            policy_digest: dg("p"),
+            ttl_ms: 2000,
+            coverage: vec![Coverage {
+                attempt_id: aid(),
+                plan_digest: dg("prev"),
+                expansion_seq: 1,
+                node_ids: vec![node("setup"), node("test")],
+            }],
+            target: target(),
+        };
+        let mut out = vec![
             Response::Hello(HelloResponse {
+                capabilities: None,
                 schema_version: SV,
                 cluster_id: ClusterId::generate(),
                 protocol_version: 1,
@@ -2036,6 +2246,8 @@ mod tests {
                 coordinator_epoch: CoordinatorEpoch(3),
             }),
             Response::Inspect(InspectResponse {
+                preparation_observations: None,
+                capabilities: None,
                 schema_version: SV,
                 worker_id: worker(),
                 worker_boot_id: boot(),
@@ -2049,22 +2261,7 @@ mod tests {
                 disk_free_bytes: 1 << 30,
                 draining: false,
             }),
-            Response::Forecast(ForecastResponse {
-                schema_version: SV,
-                worker_id: worker(),
-                worker_boot_id: boot(),
-                agent_epoch: AgentEpoch(2),
-                snapshot_digest: dg("s"),
-                policy_digest: dg("p"),
-                ttl_ms: 2000,
-                coverage: vec![Coverage {
-                    attempt_id: aid(),
-                    plan_digest: dg("prev"),
-                    expansion_seq: 1,
-                    node_ids: vec![node("setup"), node("test")],
-                }],
-                target: target(),
-            }),
+            Response::Forecast(forecast.clone()),
             Response::SubmitAttempt(SubmitAttemptResponse {
                 schema_version: SV,
                 attempt_id: aid(),
@@ -2122,6 +2319,7 @@ mod tests {
                 dropped_bytes: 0,
             }),
             Response::GetResult(GetResultResponse {
+                outputs_evaluated: false,
                 schema_version: SV,
                 attempt_id: aid(),
                 generation: Generation(1),
@@ -2197,7 +2395,106 @@ mod tests {
                     message: None,
                 }],
             }),
-        ]
+        ];
+        out.push(Response::ForecastCommand(forecast));
+        out.push(Response::ResolveToolchains(ResolveToolchainsResponse {
+            schema_version: SV,
+            bundle: frozen_bundle(),
+        }));
+        out.push(Response::PreparationProbe(PreparationProbeResponse {
+            schema_version: SV,
+            worker_id: worker(),
+            worker_boot_id: boot(),
+            agent_epoch: AgentEpoch(1),
+            probe: crate::setup::preparation_probe::PreparationProbe::NoManagedPreparation,
+        }));
+        out
+    }
+
+    #[test]
+    fn preparation_probe_debug_redacts_and_states_roundtrip() {
+        use crate::setup::preparation_probe::*;
+        let mut query = preparation_probe_request();
+        query.setup = Some(setup_spec());
+        query.frozen = Some(Box::new(frozen_bundle()));
+        let request = Request::PreparationProbe(query);
+        assert_eq!(
+            serde_json::from_value::<Request>(serde_json::to_value(&request).unwrap()).unwrap(),
+            request
+        );
+        let debug = format!("{request:?}");
+        assert!(debug.contains("PreparationProbeRequest"));
+        assert!(!debug.contains("manifest_digest"));
+        assert!(!debug.contains("setup"));
+        assert!(!debug.contains("frozen"));
+        let reasons = [
+            ProbeUnknown::MissingContext,
+            ProbeUnknown::InvalidBinding,
+            ProbeUnknown::ActivationUnverified,
+            ProbeUnknown::ProfileUnavailable,
+            ProbeUnknown::UnsafePath,
+            ProbeUnknown::IoUnavailable,
+            ProbeUnknown::BudgetExceeded,
+            ProbeUnknown::OwnershipChanged,
+            ProbeUnknown::Barrier,
+        ];
+        for state in [
+            PreparationProbeState::ConcretePlan,
+            PreparationProbeState::VerifiedAvailable {
+                proof: Digest::of_bytes(b"complete sampled tool proof"),
+            },
+            PreparationProbeState::Active {
+                builder_id: BuilderId::generate(),
+                builder_attempt_id: AttemptId::generate(),
+            },
+            PreparationProbeState::Unknown(ProbeUnknown::Barrier),
+        ] {
+            let entry = PreparationProbeEntry {
+                kind: crate::setup::observation::PreparationKind::ToolInstall,
+                key: Some(Digest::of_bytes(b"opaque actual key")),
+                state,
+            };
+            let probe = PreparationProbe::Entries {
+                provenance: ProbeProvenance {
+                    profile: ProfileSample {
+                        native_boot: "native".into(),
+                        sequence: 1,
+                        completed_monotonic_ms: 10,
+                        ttl_ms: 5000,
+                    },
+                    observed_monotonic_ms: 11,
+                    observation_ttl_ms: 5000,
+                    verification_started_monotonic_ms: None,
+                },
+                owner_generation: BuilderId::generate(),
+                entries: vec![entry.clone(); 16],
+            };
+            assert_eq!(
+                serde_json::from_value::<PreparationProbe>(serde_json::to_value(&probe).unwrap())
+                    .unwrap(),
+                probe
+            );
+            let mut invalid = serde_json::to_value(&probe).unwrap();
+            invalid["Entries"]["entries"] = serde_json::json!({});
+            assert!(serde_json::from_value::<PreparationProbe>(invalid)
+                .unwrap_err()
+                .to_string()
+                .contains("at most 16 preparation entries"));
+            let mut value = serde_json::to_value(&probe).unwrap();
+            value["Entries"]["entries"]
+                .as_array_mut()
+                .unwrap()
+                .push(serde_json::to_value(entry).unwrap());
+            assert!(serde_json::from_value::<PreparationProbe>(value).is_err());
+        }
+        for reason in reasons {
+            let probe = PreparationProbe::Unknown(reason);
+            assert_eq!(
+                serde_json::from_value::<PreparationProbe>(serde_json::to_value(&probe).unwrap())
+                    .unwrap(),
+                probe
+            );
+        }
     }
 
     #[test]
@@ -2223,6 +2520,17 @@ mod tests {
             let back: Request = serde_json::from_value(v).unwrap();
             assert_eq!(back, req);
         }
+    }
+
+    #[test]
+    fn legacy_inspect_omits_observation_fields_and_decodes_them_as_unknown() {
+        let response = responses().remove(1);
+        let legacy = serde_json::to_value(&response).unwrap();
+        assert!(legacy.get("preparation_observations").is_none());
+        let decoded = serde_json::from_value::<Response>(legacy).unwrap();
+        assert!(
+            matches!(decoded, Response::Inspect(ref inspect) if inspect.preparation_observations.is_none())
+        );
     }
 
     #[test]
@@ -2352,6 +2660,9 @@ mod tests {
             (Hello, ReadOnly),
             (Inspect, ReadOnly),
             (Forecast, ReadOnly),
+            (ForecastCommand, ReadOnly),
+            (ResolveToolchains, ReadOnly),
+            (PreparationProbe, ReadOnly),
             (SubmitAttempt, AttemptAndPayload),
             (GetAttempt, ReadOnly),
             (ListAttempts, ReadOnly),
@@ -2443,10 +2754,12 @@ mod tests {
     #[test]
     fn content_hash_ignores_request_id_only() {
         let a = Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SV,
             request_id: rid(),
         });
         let b = Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SV,
             request_id: rid(),
         });
@@ -2888,6 +3201,13 @@ mod tests {
             assert_eq!(canonical_json(&v).unwrap(), BEFORE);
             assert_eq!(payload_hash(p).unwrap().to_string(), HASH);
         }
+        let mut mutable = absent.clone();
+        mutable.in_place = true;
+        assert_ne!(
+            payload_hash(&mutable).unwrap(),
+            payload_hash(&absent).unwrap()
+        );
+        assert_eq!(serde_json::to_value(&mutable).unwrap()["in_place"], true);
         // A declaration is written, and is another payload.
         let mut declared = absent.clone();
         declared.artifacts = payload().artifacts;
@@ -3281,5 +3601,61 @@ mod tests {
         };
         assert!(!st.receipts.reached(Receipt::Running));
         assert!(st.spawned_at_ms.is_some());
+    }
+    #[test]
+    fn output_encoding_is_explicit_and_legacy_raw_bytes_are_unchanged() {
+        let raw = artifact();
+        let value = serde_json::to_value(&raw).unwrap();
+        assert!(value.get("encoding").is_none());
+        assert_eq!(
+            serde_json::from_value::<ArtifactRecord>(value.clone())
+                .unwrap()
+                .encoding,
+            ArtifactEncoding::Raw
+        );
+        let digest = payload_hash(&value).unwrap();
+        let mut tar = raw;
+        tar.encoding = ArtifactEncoding::TarV1;
+        let encoded = serde_json::to_value(tar).unwrap();
+        assert_eq!(encoded["encoding"], "tar_v1");
+        assert_ne!(digest, payload_hash(&encoded).unwrap());
+        let mut unknown = encoded;
+        unknown["encoding"] = json!("zip");
+        assert!(serde_json::from_value::<ArtifactRecord>(unknown).is_err());
+        let mut p = payload();
+        let before = payload_hash(&p).unwrap();
+        p.outputs = vec![OutputDecl {
+            name: "reports".into(),
+            paths: vec!["reports/**".into()],
+            if_missing: MissingPolicy::Required,
+            when: OutputWhen::Always,
+        }];
+        assert_ne!(before, payload_hash(&p).unwrap());
+        assert_eq!(
+            serde_json::from_value::<AttemptPayload>(serde_json::to_value(&p).unwrap()).unwrap(),
+            p
+        );
+    }
+    #[test]
+    fn requirements_bind_payload_hash_without_changing_legacy_json() {
+        let old = payload();
+        let legacy = serde_json::to_value(&old).unwrap();
+        assert!(legacy.get("requirements").is_none());
+        let decoded: AttemptPayload = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(payload_hash(&old).unwrap(), payload_hash(&decoded).unwrap());
+        let mut constrained = decoded;
+        constrained.requirements = crate::toolchain::capability::ExecutionRequirements::parse(
+            Some("node22".into()),
+            &["node".into()],
+        )
+        .unwrap();
+        assert_ne!(
+            payload_hash(&old).unwrap(),
+            payload_hash(&constrained).unwrap()
+        );
+        assert_eq!(
+            constrained,
+            serde_json::from_value(serde_json::to_value(&constrained).unwrap()).unwrap()
+        );
     }
 }

@@ -24,7 +24,9 @@ pub const MAX_TASKS_PER_RUN: usize = 10_000;
 
 const QUEUED: &str = "t.cancel_requested_at_ms IS NULL
     AND EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL)
-    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0)";
+    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0 AND (a.generation >= t.min_generation OR a.state <> 'terminal'))";
+
+const QUEUED_V1_CANCEL: &str = "t.cancel_requested_at_ms IS NULL AND EXISTS (SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL) AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0)";
 
 /// [`QUEUED`] for a step-1 file, which has no cancel of a task.
 const QUEUED_V1: &str =
@@ -41,9 +43,16 @@ const EXCLUDES: &str = "a.retired = 1";
 pub struct QueuedTask {
     pub task_id: TaskId,
     pub run_id: RunId,
+    pub source_id: Option<SourceId>,
     pub spec: Value,
     pub created_at_ms: u64,
+    pub queue_rowid: i64,
 }
+
+/// Stable insertion-order cursor for fixed-size input and attempt scans.
+pub type InputCursor = (u64, i64);
+pub type InputPage = Vec<(InputCursor, QueuedTask)>;
+pub type LiveAttemptPage = Vec<(InputCursor, LiveAttempt)>;
 
 /// The attempts of one worker that hold a slot: not terminal and not
 /// confirmed retired. `active` may be running a command (`starting` onward);
@@ -175,12 +184,47 @@ impl CoordinatorStore {
         tasks: &[(TaskId, Value)],
         at_ms: u64,
     ) -> Result<()> {
+        let source = self.source_mutation_guard()?;
+        self.enqueue_guarded(run_id, source_id, run_spec, tasks, at_ms, source)
+    }
+    pub(crate) fn enqueue_guarded(
+        &self,
+        run_id: &RunId,
+        source_id: Option<&SourceId>,
+        run_spec: &Value,
+        tasks: &[(TaskId, Value)],
+        at_ms: u64,
+        source: crate::source::retention::Guard,
+    ) -> Result<()> {
+        if source.root != self.state_dir.join("sources") {
+            return Err(StorageError::Invalid("foreign source guard".into()));
+        }
+        source
+            .ensure_sdk_available()
+            .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        source
+            .ensure_run_available(run_id)
+            .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        if let Some(id) = source_id.and_then(crate::source::classify::ci_id_of) {
+            source
+                .ensure_source_available(&id)
+                .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        }
+        let _source = source;
+
         if tasks.is_empty() || tasks.len() > MAX_TASKS_PER_RUN {
             return Err(StorageError::Invalid(format!(
                 "a run has 1 to {MAX_TASKS_PER_RUN} tasks, not {}",
                 tasks.len()
             )));
         }
+        if self._lock.is_none() {
+            return Err(StorageError::Invalid("read-only owner".into()));
+        }
+        // Like create_run, publish the persistent pin inode durably before
+        // the database can expose this run to read-only CLI invocations.
+        // Coordinator::enqueue already invokes this method in its blocking job.
+        crate::results::pin::RunPin::ensure(&self.state_dir, run_id)?;
         let run = run_id.to_string();
         let source = source_id.map(ToString::to_string);
         let run_spec = run_spec.to_string();
@@ -212,6 +256,28 @@ impl CoordinatorStore {
         })
     }
 
+    /// Private immutable execution input lookup, including completed tasks.
+    /// No queue predicate, ownership, source-store access or filesystem creation.
+    pub(crate) fn estimate_input(&self, task: &TaskId) -> Result<Option<QueuedTask>> {
+        let task = task.clone();
+        self.db.call(move |c| {
+            let row = c.query_row(
+                "SELECT t.run_id,r.source_id,t.spec_json,t.created_at_ms,t.rowid FROM task t JOIN run r USING(run_id) WHERE t.task_id=?1",
+                [task.as_str()],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?, r.get::<_, i64>(3)?, r.get::<_, i64>(4)?)),
+            ).optional()?;
+            row.map(|(run, source, spec, created, rowid)| Ok(QueuedTask {
+                task_id: task,
+                run_id: id("run_id", RunId::parse(&run))?,
+                source_id: source.map(|s| id("source_id", SourceId::parse(&s))).transpose()?,
+                spec: from_json("task spec", &spec)?,
+                created_at_ms: to_u64(created)?,
+                queue_rowid: rowid,
+            })).transpose()
+        })
+    }
+
     /// The tasks that may be placed, oldest first (insertion order within
     /// the same millisecond).
     pub fn queued_tasks(&self, limit: u32) -> Result<Vec<QueuedTask>> {
@@ -229,28 +295,88 @@ impl CoordinatorStore {
         workers: &[WorkerId],
         retire_reason: &str,
     ) -> Result<Vec<QueuedTask>> {
+        self.queued_tasks_eligible(limit, workers, retire_reason, None)
+    }
+
+    pub fn queued_tasks_eligible(
+        &self,
+        limit: u32,
+        workers: &[WorkerId],
+        retire_reason: &str,
+        eligible: Option<&[RunId]>,
+    ) -> Result<Vec<QueuedTask>> {
+        self.queued_tasks_scan(limit, workers, retire_reason, eligible, None)
+    }
+
+    pub fn queued_tasks_ready_page(
+        &self,
+        limit: u32,
+        eligible: &[RunId],
+        after: Option<InputCursor>,
+    ) -> Result<Vec<QueuedTask>> {
+        self.queued_tasks_scan(limit, &[], "", Some(eligible), after)
+    }
+
+    fn queued_tasks_scan(
+        &self,
+        limit: u32,
+        workers: &[WorkerId],
+        retire_reason: &str,
+        eligible: Option<&[RunId]>,
+        after: Option<InputCursor>,
+    ) -> Result<Vec<QueuedTask>> {
         use rusqlite::types::Value as Sql;
-        let queued = if self.task_cancel { QUEUED } else { QUEUED_V1 };
+        let queued = if self.retry_boundaries {
+            QUEUED
+        } else if self.task_cancel {
+            QUEUED_V1_CANCEL
+        } else {
+            QUEUED_V1
+        };
         let mut args = vec![Sql::Integer(i64::from(limit))];
         let stranded = if workers.is_empty() {
             String::new()
         } else {
             args.push(Sql::Text(retire_reason.to_string()));
             args.push(Sql::Integer(to_i64(workers.len() as u64)?));
-            args.extend(workers.iter().map(|w| Sql::Text(w.to_string())));
-            let marks: Vec<String> = (0..workers.len()).map(|i| format!("?{}", i + 4)).collect();
-            let marks = marks.join(",");
+            args.push(Sql::Text(
+                serde_json::to_string(&workers.iter().map(ToString::to_string).collect::<Vec<_>>())
+                    .map_err(|e| StorageError::Invalid(e.to_string()))?,
+            ));
             format!(
                 "(SELECT COUNT(DISTINCT a.worker_id) FROM attempt a
                   JOIN retire_tombstone rt ON rt.attempt_id = a.attempt_id
                   WHERE a.task_id = t.task_id AND {EXCLUDES}
-                    AND rt.reason = ?2 AND a.worker_id IN ({marks})) >= ?3, "
+                    AND rt.reason = ?2 AND a.worker_id IN (SELECT value FROM json_each(?4))) >= ?3, "
             )
+        };
+        let filter = if let Some(ids) = eligible {
+            args.push(Sql::Text(
+                serde_json::to_string(&ids.iter().map(ToString::to_string).collect::<Vec<_>>())
+                    .map_err(|e| StorageError::Invalid(e.to_string()))?,
+            ));
+            format!(
+                " AND t.run_id IN (SELECT value FROM json_each(?{}))",
+                args.len()
+            )
+        } else {
+            String::new()
+        };
+        let cursor = if let Some((created, rowid)) = after {
+            let index = args.len() + 1;
+            args.push(Sql::Integer(to_i64(created)?));
+            args.push(Sql::Integer(rowid));
+            format!(
+                " AND (t.created_at_ms>?{index} OR (t.created_at_ms=?{index} AND t.rowid>?{}))",
+                index + 1
+            )
+        } else {
+            String::new()
         };
         self.db.call(move |c| {
             let mut s = c.prepare(&format!(
-                "SELECT t.task_id, t.run_id, t.spec_json, t.created_at_ms FROM task t
-                 WHERE {queued} ORDER BY {stranded}t.created_at_ms, t.rowid LIMIT ?1"
+                "SELECT t.task_id, t.run_id, t.spec_json, t.created_at_ms, (SELECT source_id FROM run r WHERE r.run_id=t.run_id),t.rowid FROM task t
+                 WHERE {queued}{filter}{cursor} ORDER BY {stranded}t.created_at_ms, t.rowid LIMIT ?1"
             ))?;
             let rows = s.query_map(rusqlite::params_from_iter(args), |r| {
                 Ok((
@@ -258,20 +384,62 @@ impl CoordinatorStore {
                     r.get::<_, String>(1)?,
                     r.get::<_, String>(2)?,
                     r.get::<_, i64>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_,i64>(5)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (task, run, spec, created) = row?;
+                let (task, run, spec, created, source,rowid) = row?;
                 out.push(QueuedTask {
+                    source_id: source.map(|s| id("source_id", SourceId::parse(&s))).transpose()?,
                     task_id: id("task_id", TaskId::parse(&task))?,
                     run_id: id("run_id", RunId::parse(&run))?,
                     spec: from_json("task spec", &spec)?,
                     created_at_ms: to_u64(created)?,
+                    queue_rowid: rowid,
                 });
             }
             Ok(out)
         })
+    }
+
+    /// Fixed-size keyset discovery; neither a stalled oldest source nor queue size
+    /// controls memory use. Live inputs are scanned separately after reconnect.
+    pub fn input_page(
+        &self,
+        after: Option<(u64, i64)>,
+        limit: u32,
+        worker: Option<&WorkerId>,
+    ) -> Result<InputPage> {
+        let predicate = if worker.is_some() {
+            "EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.worker_id=?4 AND a.state <> 'terminal' AND a.retired=0)".to_string()
+        } else {
+            format!(
+                "{} AND ?4 IS NULL",
+                if self.task_cancel { QUEUED } else { QUEUED_V1 }
+            )
+        };
+        let (created, rowid) = after.unwrap_or((0, 0));
+        let created = to_i64(created)?;
+        let worker = worker.map(ToString::to_string);
+        self.db.call(move |c| {
+            let mut query = c.prepare(&format!("SELECT t.task_id,t.run_id,t.spec_json,t.created_at_ms,t.rowid,r.source_id FROM task t JOIN run r ON r.run_id=t.run_id JOIN source_ref sr ON sr.source_id=r.source_id WHERE json_extract(t.spec_json,'$.manifest_digest')=sr.manifest_digest AND {predicate} AND (t.created_at_ms > ?1 OR (t.created_at_ms=?1 AND t.rowid>?2)) ORDER BY t.created_at_ms,t.rowid LIMIT ?3"))?;
+            let rows = query.query_map(params![created,rowid,i64::from(limit.min(64)),worker], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?)))?;
+            rows.map(|row| {
+                let (task,run,spec,created,rowid,source)=row?;
+                let created=to_u64(created)?;
+                Ok(((created,rowid),QueuedTask {task_id:id("task_id",TaskId::parse(&task))?,run_id:id("run_id",RunId::parse(&run))?,source_id:source.map(|s|id("source_id",SourceId::parse(&s))).transpose()?,spec:from_json("task spec",&spec)?,created_at_ms:created,queue_rowid:rowid}))
+            }).collect()
+        })
+    }
+
+    /// A bounded EXISTS check is used for pruning the connection's 64-entry cache.
+    pub fn input_need(&self, run: &RunId, worker: &WorkerId) -> Result<(bool, bool)> {
+        let run = run.to_string();
+        let worker = worker.to_string();
+        let queued = if self.task_cancel { QUEUED } else { QUEUED_V1 };
+        self.db.call(move |c| Ok(c.query_row(&format!("SELECT EXISTS(SELECT 1 FROM task t WHERE t.run_id=?1 AND ({queued})),EXISTS(SELECT 1 FROM attempt a JOIN task t ON t.task_id=a.task_id WHERE t.run_id=?1 AND a.worker_id=?2 AND a.state <> 'terminal' AND a.retired=0)"),params![run,worker],|r|Ok((r.get(0)?,r.get(1)?)))?))
     }
 
     pub fn worker_load(&self, worker_id: &WorkerId) -> Result<WorkerLoad> {
@@ -423,6 +591,43 @@ impl CoordinatorStore {
         })
     }
 
+    /// Bounded cache pruning without materializing the worker's complete live set.
+    pub fn live_attempt_subset(
+        &self,
+        worker: &WorkerId,
+        ids: &[AttemptId],
+    ) -> Result<BTreeSet<AttemptId>> {
+        if ids.len() > 64 {
+            return Err(StorageError::Invalid("live subset exceeds 64".into()));
+        }
+        let worker = worker.to_string();
+        let ids = json(&ids);
+        self.db.call(move |c| {
+            let mut query=c.prepare("SELECT attempt_id FROM attempt WHERE worker_id=?1 AND state <> 'terminal' AND retired=0 AND attempt_id IN (SELECT value FROM json_each(?2))")?;
+            let rows=query.query_map(params![worker,ids],|r|r.get::<_,String>(0))?;
+            rows.map(|row|id("attempt_id",AttemptId::parse(&row?))).collect()
+        })
+    }
+
+    pub fn live_attempt_page(
+        &self,
+        worker: &WorkerId,
+        after: Option<(u64, i64)>,
+        limit: u32,
+    ) -> Result<LiveAttemptPage> {
+        let worker = worker.to_string();
+        let (created, rowid) = after.unwrap_or((0, 0));
+        let created = to_i64(created)?;
+        self.db.call(move |c| {
+            let mut query=c.prepare(&format!("SELECT {ATTEMPT_COLS},rowid FROM attempt WHERE worker_id=?1 AND state <> 'terminal' AND retired=0 AND (created_at_ms>?2 OR (created_at_ms=?2 AND rowid>?3)) ORDER BY created_at_ms,rowid LIMIT ?4"))?;
+            let rows=query.query_map(params![worker,created,rowid,i64::from(limit.min(64))], |r| Ok((attempt_from_row(r),r.get::<_,i64>(ATTEMPT_COLS.split(',').count())?)))?;
+            let mut out=Vec::new();
+            for row in rows { let (record,rowid)=row?; let record=record?; let aid=record.attempt_id.to_string(); let cursor=(record.created_at_ms,rowid);
+                out.push((cursor,LiveAttempt {placement:placement_of(c,&aid)?,retire_reason:c.query_row("SELECT reason FROM retire_tombstone WHERE attempt_id=?1 AND confirmed_at_ms IS NULL",[&aid],|r|r.get(0)).optional()?,record})); }
+            Ok(out)
+        })
+    }
+
     /// Record what is known about an attempt after talking (or failing to
     /// talk) to its worker, in one commit:
     ///
@@ -500,49 +705,6 @@ impl CoordinatorStore {
         })
     }
 
-    /// Persist the cancel of a task before anything is sent: the task is
-    /// never placed again, and its live attempt (if any) carries the request
-    /// to its worker. Returns that attempt. Idempotent.
-    pub fn cancel_task(&self, task_id: &TaskId, at_ms: u64) -> Result<Option<AttemptRecord>> {
-        let task = task_id.to_string();
-        self.db.write(move |tx| {
-            let n = tx.execute(
-                "UPDATE task SET cancel_requested_at_ms = COALESCE(cancel_requested_at_ms, ?1)
-                 WHERE task_id = ?2",
-                params![to_i64(at_ms)?, task],
-            )?;
-            if n != 1 {
-                return Err(not_found(format!("task {task}")));
-            }
-            let live: Option<String> = tx
-                .query_row(
-                    "SELECT attempt_id FROM attempt
-                     WHERE task_id = ?1 AND state <> 'terminal' AND retired = 0",
-                    [&task],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            let Some(aid) = live else { return Ok(None) };
-            let fresh = tx.execute(
-                "UPDATE attempt SET cancel_requested_at_ms = ?1
-                 WHERE attempt_id = ?2 AND cancel_requested_at_ms IS NULL",
-                params![to_i64(at_ms)?, aid],
-            )?;
-            if fresh == 1 {
-                let run = run_of(tx, &aid)?;
-                common::append_event(
-                    tx,
-                    run.as_deref(),
-                    Some(&aid),
-                    "cancel_requested",
-                    &Value::Null,
-                    at_ms,
-                )?;
-            }
-            load_attempt(tx, &aid)
-        })
-    }
-
     /// The retire of an attempt was confirmed by its worker (it never
     /// started there, or it stopped without completing). One commit decides
     /// what that means from what is recorded now, not from what the caller
@@ -577,9 +739,11 @@ impl CoordinatorStore {
                 [&aid],
                 |r| r.get(0),
             )?;
+            let in_place: bool = tx.query_row(
+                "SELECT coalesce(json_extract(t.spec_json,'$.in_place'),0) FROM task t JOIN attempt a USING(task_id) WHERE a.attempt_id=?1", [&aid], |r| r.get(0))?;
             let outcome = if cancelled {
                 Outcome::Cancelled
-            } else if reason == failed_reason {
+            } else if reason == failed_reason || in_place {
                 Outcome::Failed
             } else {
                 super::free_by_retire(tx, &aid, at_ms)?;
@@ -677,9 +841,14 @@ impl CoordinatorStore {
     /// Bounded status query for the resident request API.
     pub fn latest_attempt_of_task(&self, task_id: &TaskId) -> Result<Option<AttemptRecord>> {
         let task = task_id.to_string();
+        let boundary = if self.retry_boundaries {
+            "AND generation >= (SELECT min_generation FROM task WHERE task_id=?1)"
+        } else {
+            ""
+        };
         self.db.call(move |c| {
             c.query_row(
-                &format!("SELECT {ATTEMPT_COLS} FROM attempt WHERE task_id = ?1 ORDER BY generation DESC LIMIT 1"),
+                &format!("SELECT {ATTEMPT_COLS} FROM attempt WHERE task_id = ?1 {boundary} ORDER BY generation DESC LIMIT 1"),
                 [&task],
                 |r| Ok(attempt_from_row(r)),
             ).optional()?.transpose()

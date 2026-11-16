@@ -228,6 +228,21 @@ workerが申告する能力には、OS・arch・実行user・有効なprofile、
 
 配置前に能力を絞る。候補がないときは `blocked: no_compatible_worker` とし、不足能力を表示する。同じリポジトリであってもarm64用の依存cacheをx86_64で使わない。Rosetta等の別実行環境は別profileとする。自動導入で解消できる不足は、第22章の手順で導入してから候補に含める。
 
+## 5.1 worker-local profile と generic requirements の実行契約
+
+worker は private な `<worker_state>/profiles.toml`（schema_version=1、`active`、`[profiles.<name>]`）から resident ごとに 1 つの active profile を選ぶ。ファイルは symlink を追わず同じ FD から読み、所有 UID・private permission・通常ファイル・64KiB 上限を検証する。active が定義されていない場合は起動を拒否する。ファイルが無い場合は既に保存された worker env の PATH・SHELL（省略時 `/bin/bash`）から default を合成して通常どおり hash する。project の `[execution] profile` と CLI の `--profile` は worker の active 名を照合する selector であり、worker identity を指定したり環境へコピーしたりしない。profile 変更は drain/restart を伴う operator 操作とする。
+
+profile は絶対 `path` 配列、絶対 `shell`（bash/sh/zsh）、`env` の非 secret 定数、`allowed_env`、`required_tools`、`cache_namespace` を定義する。`secret_refs` が空でなければ安全な provider が未接続である旨を起動時に返す。任意の source/script probe と install adapter はこの schema では受け付けない。自動導入抑止の env は [Corepack](https://github.com/nodejs/corepack/blob/main/README.md)、[rustup](https://rust-lang.github.io/rustup/environment-variables.html)、[mise](https://mise.jdx.dev/configuration/settings.html) の設定に従う。明示 profile では command/setup env は operator の allowlist に従う。合成 default は既存の通常 command env を許す。いずれも PATH・SHELL・HOME・TMPDIR の異なる上書きを拒否し、同じ値の指定は許す。暗黙の版導入は許可せず、Corepack の network/auto-pin/latest/download-prompt、rustup の auto-install、mise の auto-install を無効化する env を固定し、task から異なる値で上書きできない。probe、Machine、setup、consumer は同じ active PATH/env を使用し、shell を省略した setup は profile の絶対 shell を login/rc 読み込みなしで実行する。
+
+`requires`（CLI は繰返し/カンマ区切り `--requires`）は AND 条件とし、重複を除く。bare の `macos/linux/windows`、`arm64/aarch64/x86_64/amd64`、`node/npm/pnpm/yarn/rustc/cargo/flutter/dart/xcode/git/portool/fast-worktree/docker`、同じ登録済み値の `os:/arch:/tool:`、登録済み protocol feature の `feature:worker_capabilities_v1/blob_resume/log_resume` を受け付ける。arch は aarch64/x86_64 に正規化する。unknown bare/prefix/tool/feature は invalid input とする。ラベルは tool 検査の代わりにならない。この generic requires は version constraint ではなく、版の宣言・照合・導入は §22.1 に従う。
+
+tool は profile PATH で実行可能な実体を解決し、固定 argv・env_clear・private probe cwd・各 300ms・stdout/stderr 各 8KiB の上限で版を検査する。所有する子 process group だけを終了し reap する。resident の起動時（profile 読み込み時の required tool の検査と、baseline を公開する最初の report）だけは、各 tool の結果が確定（available / unavailable / 失敗による unknown）するまで測る。1 回の呼び出しは 2 秒まで待ち、時間切れになった呼び出しだけを tool ごとに最大 3 回、全 tool で共有する 5 秒の範囲で繰り返す。共有時間を使い切った後も各呼び出しは 300ms は待つので、待ちの上限は読み込み・起動 report それぞれ 5 秒 + 固定 14 呼び出し × 300ms = 9.2 秒である。失敗や解析不能は確定した結果であり繰り返さない。それでも時間切れの tool は unknown のまま公開し、baseline の公開後に観測できた場合は profile の drift として扱う（再起動まで worker を block する）。Docker は `info`、Xcode は選択済み SDK path の確認も必要で、binary の存在だけでは available としない。public report へは検証済み版と identity digest を出し、環境の値や private path は出さない。未観測の disk/budget は unknown とし、available/0 を捏造しない。Flutter launcher と Dart の bootstrap wrapper は版の問い合わせでも SDK 導入が発生し得るため、S20 の noninstalling adapter が接続されるまでは Unknown として扱う。native Dart binary は通常の固定 probe を使う。
+
+`worker_capabilities_v1` を hello で交渉し、hello/inspect に optional report を含める。制約がある task は有効な report がない旧 peer へ配置しない。制約は TaskSpec と AttemptPayload に保存し、plan/payload digest に含め、retry は元の条件を保つ。空の条件は JSON から省き、旧 payload の canonical JSON/hash を保つ。durable requirements を知らない旧 binary の再開を防ぐため、coordinator/worker DB の schema version に semantic compatibility fence を設ける。readonly 旧 schema は migrate せず、配置診断用 index が無ければ placement を返さない。constrained submit は private resident IPC v3 を要求し、requirements を知らない旧 owner に条件を落とされないよう受理前に拒否させる。制約なし IPC は v2 のまま保つ。Coordinator は forecast 前に同じ pure predicate で候補を絞り、除外された worker ごとの不足と `no_compatible_worker` を配置記録へ残す。公開 Task metadata に最新の placement を含め、最大 4 worker × 各 4 不足（各 128 文字）へ明示 truncate する。受理済み/取消済み task へ古い待機理由は表示しない。worker も新規受理時と workspace 準備直前、長い setup 後に再検査する。受理済みの同じ attempt/hash の replay は元の応答を保つ。
+
+実測 profile fingerprint は worker-local identity であり、別 host に同じ絶対 path/digest を要求しない。profile 名と実 requirements で照合する。受理時 fingerprint は worker の private durable metadata、setup/template、artifact、TTC history に固定する。tool/report drift は新規 report を無効にし、古い template や異なる実環境で実行を続けない。 startup report で Available だった tool の一時的な Unknown は、shell・PATH 上の実行ファイル identity が不変なら startup fingerprint を保持する。ただし現在の report は Unknown のままで、requires・profile の required_tools・固定 native baseline を満たさない。既知の版/identity の変化、実行ファイルの変化、startup Unknown から Available への変化は新 identity として扱い、同じ owner の既存 fingerprint では受理しない。再起動後も旧 attempt の実 identity を書き換えない。版管理 shim が project の版ファイルを読む場合の具体版 activation と baseline は §22.1 の必須残件であり、この generic probe だけで version matching の完了とはしない。
+
+
 # 6. 入力snapshotと作業ディレクトリ
 
 ## 既定は現在の作業内容
@@ -278,6 +293,12 @@ workerはrepoごとのcanonicalなlocal cloneと、attemptごとの隔離workspa
 Git外のgeneric execにはdirectory snapshotを提供する。sourceが不要な管理コマンドも明示できるが、通常実行から黙って入力を省略しない。元の手元ディレクトリを直接更新する用途には `exec --in-place` を用意し、親local workerだけを適合候補とする。通常の分散実行で、生成物を元worktreeへ自動で上書きしない。
 
 `in-place` は明示的な別workspace modeである。記録するsnapshotは比較用baselineで、実行入力の不変性は保証しない。remote配置、結果cache、既定の自動retryを無効にし、表示・結果でもsnapshot実行と区別する。
+
+`exec --in-place` はGit worktreeとGit外directoryの双方を対象とする。Gitでは元worktreeのrootを保持し、元cwdからの相対pathでcommandを実行する。親local workerのidentityとrun/source/manifest digest、canonical rootのdevice/inodeを親state内の0600 bindingに保持し、rootの差替えや別workerへの配置を拒否する。原本pathは転送payloadや公開queryへ含めず、task/completionの `in_place: true` でmodeを示す。setup templateの適用・builder起動を行わず、prepare commandsは原本で通常commandとして実行する。workspace cleanupで原本を削除しない。
+
+明示 `retry` は通常と同じterminal・停止確定・回収・control revisionの条件を満たした場合だけ、同runの新attemptとして同じ原本を再実行する。baselineは作り直さない。元のsecret globs契約はprivate bindingに保持し、現在のproject configを再loadしない。原本secretはbounded/no-followのread-only処理で実行時の値をmaskし、bundleの配置・chmod・消去を原本へ行わない。元globsと現在の `.worktreeinclude` が選ぶpath集合がbaselineのsecret inventoryと違えば実行・retryを拒否し、新しい `exec` によるbaseline作成を求める。値の変更だけなら現物をmaskして実行でき、元Vault bundleの消去は妨げにならない。
+
+private bindingはowner再起動と明示retryのため親stateとともに保持する。binding自体はbaseline sourceや結果のGC pinではなく、元sourceが消去されたrunはretryできない。現段階ではbindingの個別GCは行わず、親stateの削除まで保持する。bindingやrunの取消・workspace cleanupは原本の削除を意味しない。
 
 依存の準備は、プロジェクトの `.fast-worktree.toml` の `[[clone]]`（と `post_add`）が担う。attempt workspaceをfast-worktreeで作る方針と、`.worktreeinclude` の扱いは22.5で定める。第8章のSetupRecipeとtemplateは、workflowのsetup stepの再利用に限る。`.fast-worktree.toml` を持たないプロジェクトでは、第8章の `[prepare]` が代わりを務める。両方がある場合は `.fast-worktree.toml` を優先し、`ci plan` が準備の出所（`fast-worktree` / `[prepare]` / workflowのsetup step）を表示する。
 
@@ -1071,6 +1092,8 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 版指定ファイルの無いtoolで、workflowやprofileが必要とするもの（例: 版を固定していないFlutter・Xcode）は、親でcapture時に解決された版を、そのrunの `toolchain_baseline` として記録する。照合規則はプロジェクト設定 `[toolchain] match = "exact" | "minor" | "major" | "any"` で選び、既定は `exact` とする。baselineと合わないworkerは候補から外すか、自動導入できるなら導入する。
 
+公開 command submit は検証済み capture から版指定・必要 baseline を固定し、完全な resolution evidence とともに `FrozenBundle` として保持する。worker-local registry・既存 setup admission/singleflight・attempt ごとの activation 経路は [private adapter API](toolchain-adapters.md) に記録する。実 manager による受入確認と installed-version 一覧・diff/sync は別の検証範囲とする。
+
 workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、corepack）を持つ。adapterは `detect`（導入済み版の列挙）、`resolve`（要件を具体版へ）、`install`、`activate`（そのattemptのPATH・envへの反映）を備える。不足版の導入は、第8章のsetupと同じ経路（task-traffic-controllerのadmission、worker内singleflight、導入済み版のworker内再利用）で行い、導入にかかる時間と負荷をforecastの準備時間に含める。導入はattemptのworkspaceではなくworkerのtool領域に行い、同じ版の並行導入を1回にまとめる。
 
 管理者権限・ライセンス同意・GUI操作が必要なもの（Xcode本体の導入とライセンス同意、Docker Desktop、Homebrewのsystem package、macOSの権限）は自動導入しない。`blocked: environment_mismatch` とし、不足内容と実行すべき手順を示す。自動導入に失敗した場合も同じとし、成功扱いや別版での実行に切り替えない。
@@ -1117,3 +1140,279 @@ workerのattempt workspaceは、fast-worktreeで作り、消す（2026-11-10の�
 2. **lib化後の基準**: task-traffic-controller 0.5.0（main `18b2d45`、タグ `v0.5.0`）、local-ci 0.9.0（main `8666da7`、タグ `v0.9.0`）。いずれもcrates.ioに公開済みで、remote-task-runnerはcrates.ioの版へ依存する。2026-11-09の決定時点の基準は local-ci main `7deff5e`（v0.7.0 + PR #21 によるlib化）、task-traffic-controller main `7f095ad`（v0.4.2 + PR #14 によるlib化）で、第3項・第4項の観察はその時点のものである。
 3. **待ち時間の分離**: local-ci v0.7.0は、jobごとに資源待ちを実行時間と分けて記録する。第9章の実行時間には、この待ちを除いた値を使う。
 4. **task-traffic-controllerの既知の窓**: PR #14の後、待ち中のrunnerがSIGTERMを2回続けて受けると、exit fileを書かずに終了し、jobがlostに見える短い窓がある。C3（受理段階のreceiptと終了順序）で、signal handlerを既定へ戻す時点をCLIの再送の直前へ移して閉じる。
+
+
+### 公開ログの読み取り
+
+`logs <run-or-task-id> [--follow]` は親が回収して commit した stdout / stderr の
+prefix を読み、worker 接続・owner 起動・Git/project 設定を必要としない。
+既定は非 retired の最新 generation（task の min_generation 以上）であり、retry 待ちに
+旧 attempt へ戻らない。`logs <task-id> --attempt <attempt-id>` で同 task の履歴を明示できる。
+wire の node_id は公開 CLI の選択単位にせず、attempt 集約 stream を読む。
+
+text は任意 bytes を変換せず対応する stdout / stderr へ出す。識別・回収状態の診断は
+stderr へ出す。stream 間の時系列順序は保証しない。`--json` は snapshot / follow とも
+schema_version=1 の NDJSON で、data.kind は status / replacement / reconnecting / chunk / final。
+chunk は run_id / task_id / attempt_id / generation / stream / offset / next_offset /
+bytes_base64 を持ち、生 bytes は JSON stdout に混ぜない。chunk は最大 64 KiB、
+run は最大 32 task のページで走査する。final は件数・bytes・pending / failure の集計であり、
+全 task の配列を保持しない。読み取りエラーは既存の error envelope を返す。
+
+follow は invocation 専用の mode-0700 一時ディレクトリ / mode-0600 SQLite cursor に
+配信 offset を保存し、メモリは task 数やログ量によらず制限する。終了時に削除し、
+プロセスを跨ぐ resume は提供しない。owner の再起動でも read-only DB から同じ offset
+を継続する。prefix の縮小は CONFLICT、commit 済みファイルの欠損・短縮は INTERNAL とする。
+実行 terminal だけでは終了せず、collection closed と利用可能 prefix の配信完了を待つ。
+closed の不完全ログ・回収失敗は利用可能 bytes を返して COLLECTION_FAILED / 78。
+途中 snapshot は pending を明示して 0。Ctrl-C は cancel を送らず detach / 130。
+出力先が詰まっている場合も detach は待たず、割り込み時の final は出力可能な場合に送る。
+
+retention GC は run ごとの永続 pin の共有/排他 lock で reader と分離する。
+read-only CLI は pin 作成・DB 更新を行わず、owner が準備した inode を検証して保持する。
+active / pending / finalizing と reader 使用中の削除を防ぐ。ログ経路だけで
+source/Vault/private binding GC や output planner の完成を意味しない。
+
+### Generic output bundles (TarV1)
+
+`[[outputs]]` の各論理名は1つの非圧縮 tar blob として回収する。`paths` は
+workspace 相対の globset パターンの和集合であり、`*` は1要素、`**` は再帰、
+`?`・文字クラス・brace alternation は globset の構文とする。literal directory は
+全 regular file descendants を含み、重複は除く。member 名は workspace 相対のまま
+保持する。通常の dotfile は対象となる。`.git` と runner metadata は走査しない。
+選択された symlink、hardlink、FIFO、socket、device、secret path/inode/value、
+case/NFC 名衝突は論理 output 全体を refused にする。source の captured input
+manifest は出力 allowlist として使わず、新しく生成したファイルも回収できる。
+
+`when = success` は Succeeded、`failure` は Failed/TimedOut、`always` は収集可能な
+全 terminal outcome に適用する。Cancelled/Interrupted は always のみ。未起動の
+cancel/prepare failure は収集せず、prepared-only success は収集する。条件に
+合わない required output は required_missing にしない。条件は command outcome
+で判定し、artifact 不足による verdict を再入力しない。
+
+1 attempt は raw artifact と合わせて1024論理出力・1024 patterns、1 bundle は
+4096 files、attempt 全体16384 files、走査は1 bundle 当たり100000 entries、
+path は UTF-8 1024 bytes・16要素、member と serialized bundle は各最大1 GiB
+（worker設定がより小さければその上限）とする。上限超過は切り捨てず refused。
+各 member は held directory fd と NOFOLLOW/NONBLOCK で開き、64 KiB 単位で
+private spool に secret 検査してから archive に追加する。bundle 失敗は他の
+論理 output を妨げず、既存の required/optional 判定を維持する。
+
+wire schema 1 に default/skip-empty の `outputs` を追加し、従来の `artifacts`
+は raw のまま保持する。`ArtifactRecord.encoding` は raw を既定とし省略し、
+TarV1 は明示 `tar_v1` とする。収集段階の到達は `outputs_evaluated` (default false/skipfalse) として journal と
+result に固定する。missing/refused や zero eligible でも収集を評価した場合は true、
+未起動 cancel/prepare failure は false とする。Succeeded/exit/Running receipt/
+Running timeout と marker false が矛盾する結果は拒否する。CommandRegistered は
+admission 前に立つので、その receipt 単独は開始証拠としない。
+encoding と marker を含む immutable result JSON と digest が
+既存の exact name/digest/size receipt・ACK を束縛する。旧 persisted payload/result
+の canonical bytes と digest は変えない。全 live hello で `output_bundles_v1` を
+必須とし、設定の required_features が空でも迂回できない。旧 peer との接続は
+明示的な protocol_incompatible となる。doctor/version で同一 schema だけを見て
+互換と判断せず、hello の必須 feature も確認する。
+
+TarV1 writer は Rust tar crate の GNU regular-file header のみを出力し、mode0600、
+uid/gid/mtime0、名前順とする。100 bytes 超の名前は同 crate が生成する bounded
+GNU `L` (`././@LongLink`, UTF-8 member path + NUL) metadata を許可する。
+compressed data、directory entries、link、special、sparse、PAX/global metadata は
+生成しない。reader/export はこの subset と全構造・外側 digest を再検証し、
+raw bytes を magic sniffing で tar と解釈しない。汎用 unpack は使用しない。
+
+
+### Public collected output export
+
+`outputs <run-or-task-id> --dir <directory>` exports currently receipted outputs. The destination is required. `--attempt <attempt-id>` addresses an exact historical attempt and is valid only with its owning task. Default selection respects the task's latest generation boundary; a retry awaiting placement never exports an old success. Reads work with the owner stopped, without Git or project configuration, and never start a service or change the coordinator epoch.
+
+Legacy raw objects export at `<directory>/<task>/<attempt>/<name>`. Generic `tar_v1` bundles export at `<directory>/<task>/<attempt>/<name>/<workspace-relative-member>`. Encoding comes from immutable result metadata; raw bytes are never sniffed as archives. Durable artifact receipts plus fresh retained result/blob references authorize objects. Reads and private spool copies use bounded buffers, and metadata/task pages contain at most 64 entries.
+
+The exporter verifies outer size and SHA-256, then validates the whole uncompressed GNU tar subset before publishing any bundle member. Only regular files and bounded GNU long names are supported. Unsafe paths, duplicate/case/Unicode/prefix collisions, links, sparse/PAX/special entries, truncation and trailing garbage are refused. Destination ancestors must be real directories; symlinks and existing destination files conflict, even when bytes match. New directories are 0700 and files 0600. Publication never overwrites. Concurrent destination conflicts preserve successful exports and report each failure.
+
+`--json` uses bounded NDJSON: target observation, per-file outcome or artifact error, then exactly one final summary attempt with aggregate counts and a reader exit code. Target execution failure is independent of successful export. Pending collection is reported without claiming run success; closed collection failure exits 78. Expired, unreferenced or deletion-claimed data exits 73 even if the file still exists. Missing/short/corrupt files with live references exit 79, destination conflicts 72, invalid inputs 2. Ctrl-C exits 130 and detaches only the reader, including when stdout is blocked. The shared run pin is held through cooperative worker cancellation/drain and every final write/flush, including backpressure and SIGINT.
+結果 retention GC は run ごとの永続 reader-pins inode と共有/排他 flock を使う。
+read-only logs は対象 run を仮解決し、pin を read-only/nonblocking shared-lock し、
+inode と新しい metadata binding を確認した後に読み始め、follow/detach を含む invocation 全体で保持する。
+missing/legacy pin は明示 unavailable とし、reader は作成・DB 更新・owner 起動を行わない。
+outputs/export CLI も configured read-only store の identity 検証後に CoordinatorStore::result_read_pin を取得し、
+新しい metadata 読取から blocking worker の drain と最終出力/flush 完了まで invocation 外側で保持する。
+owner は create_run/enqueue の両経路で DB transaction に入る前に pin 作成と fsync を行う。
+ref 公開前にも pin を準備し、legacy run は bounded page で backfill する。
+pin inode は parent state とともに保持し、unlink/置換しない。最初の GC 対応版以降の owner と
+reader がこの protocol を共有することが互換条件で、旧 reader と同時利用する GC の安全性は保証しない。
+resident は bounded keyset の結果 ref/claim page だけ処理し、run-exclusive pin を FS delete 完了まで保持する。
+known durable claim のみ NotFound を冪等成功とし、未関連 legacy pending や foreign locator は削除しない。
+run 選択は task facts/count を読まない run ID index の 1 件 keyset query とする。
+削除は open 時の result root inode を確認し、各祖先を NOFOLLOW で開いた FD を基準に行う。
+leaf symlink は参照先を辿らず unlink し、祖先/root の差替えは claim を残して失敗する。
+空親/tmp の cleanup も同じ FD から行い、外部 symlink 先を削除しない。
+GC 排他 pin と writer shared pin の通常競合は対象を pending として次 pass へ送り、
+resident の収集 loop・lease 更新・IPC は継続する。pin 破損や他の I/O error は通常競合にしない。
+時計 cutoff は boot identity と永続 monotonic baseline から導出し、boot 不明/変更後は全 retention の
+quarantine、時計異常は retention 0 でも Hold。壁時計だけを理由に削除を前倒ししない。
+source/Vault/private binding の GC と output planner 完成はこの結果 retention 経路に含まない。
+
+### Source retention roots (nondeleting foundation)
+
+The source store owns a private permanent mutation-lock inode and a separate retention index. Capture takes a shared guard and persists a pending root before local-ci publishes any objects. Graph registration uses persistent manifest positions and at most 32 references per step, including submodule edges and shared blobs. A matching durable run root precedes pending-root handoff. Unsubmitted captures and unknown crash roots remain protected. Legacy registration is bounded and conservative.
+
+Retry/enqueue acquire source guards before admission/actor/DB operations and retain matching guards through actual commit; forwarding retains its guard through blocking IO drain. Preview takes nonblocking exclusive ownership, validates the configured store and source/run binding, checks all generations and trusted monotonic retention, and reports at most 32 unique owned manifest/blob paths. Unknown, pending, malformed or shared roots remain held. Preview never expires a root, writes an unavailable tombstone, claims deletion or removes source/Vault files. The foundation itself enables no deletion; the D resident driver below now schedules Source/Vault retention. Owned Git/bundle cache cleanup and safe legacy abandonment remain follow-up work. Original workspaces and private in-place bindings are excluded.
+
+Registration retains one validated manifest and its file/directory identity across 32-reference pages, finishing that manifest before selecting newly queued children even when their IDs sort before it, so pages never repeatedly parse/hash the full manifest. Foreground producers supply their already-held manifest; run binding copies the completed indexed membership instead of rereading it. Background legacy loads default to the receiver's 64 MiB manifest limit and use a measured-length bounded reader. An oversized legacy manifest produces typed `Preview.manifest_limit` Hold; callers may set `PreviewCursor.manifest_byte_limit` explicitly to resume registration within that chosen bound. Source usage remains available. Arbitrary-size automatic legacy streaming registration remains pending. The preview cursor holds at most one manifest, with memory proportional to that manifest within the chosen byte bound, never a whole source graph. Future expiry of received roots also requires per-import pending ownership instead of relying on the current hash-shared pending blob marker.
+### S20a: captured declaration API boundary
+
+`toolchain::snapshot::read_captured` reads bounded, verified captured objects,
+not the live checkout. `versions::effective` intersects declarations per explicit
+project/workflow/job/step scope; contradictory declarations fail with source
+locations. There is no implicit precedence between project declaration files.
+The setup-node action's nonempty direct node-version does override its own
+node-version-file, including when the direct input is an unresolved expression.
+Action version-file paths are relative to the repository workspace, independently
+of the selected project directory. Captured Node files are decoded as structured
+JSON (Volta/devEngines/engines), mise TOML or node/nodejs-prefixed plain versions.
+Deferred expressions and
+manager channels require explicit resolution; missing observations remain unknown,
+even with `match = "any"`. `FrozenToolchains` retains source/profile identity,
+requirements, baseline provenance and explicit concrete selections for reuse on
+retry. Every declared range/channel needs a concrete selection before the frozen
+contract becomes resolved; a matching range alone cannot float on retry. Declared
+concrete selections always use exact version identity. The configurable match
+policy applies only to baselines for tools without a declaration. This API
+is not yet part of submit/admission payloads.
+
+Node-style ranges use the npm-compatible `node-semver` parser. Pub environment
+constraints use Dart's distinct caret and prerelease-bound rules. Pub concrete
+observations/selections include build metadata in ordering and equality; bounds
+containing build metadata currently return an explicit resolution-required diagnostic. Channel,
+workflow-expression and version-file-expression resolution is deferred, with no
+host env expansion. A selection's authority digest is supplied by the trusted
+parent/adapter; this API verifies its source/profile/scope/requirement binding,
+not the external resolver evidence itself. Snapshot version documents must be
+regular captured objects; secret entries and symlinks are rejected explicitly.
+
+S20 still requires manager adapters (nodenv/rustup/mise/fvm/corepack), private
+installation roots, resolution evidence, activation, installation singleflight
+and submit/worker integration. S21 workers diff/sync/doctor and real service
+environment acceptance remain mandatory. This declaration slice advertises no
+auto-installable capability.
+
+### Source import ownership and future erasure fences (nondeleting stage A)
+
+Source import ownership is per opaque token and physical store identity, never per shared hash.
+Publishing one import only releases its own matching memberships after its immutable graph is durable;
+positive handoff to an exact durable run binding releases memberships in transactions of at most 32 rows.
+Failures, unmatched blobs and unknown crash/legacy roots remain protected. Tokenless legacy intake keeps
+independent protective roots. A does not infer abandonment from absence of coordinator references.
+
+Run expiry and publication incarnation are distinct source-owned records. Content-addressed SourceID/hash
+identity is unchanged: the same immutable input can be republished in a new incarnation after an old claim
+completes, while the old run remains permanently expired. A only adds schema/checks; production creates no
+expiry or deletion claim and removes no source/Vault file. Vault-only SecretUnavailable must remain separate
+from source expiry and from source retention. Actual bounded deletion and resident activation remain B/C work.
+
+Public SDK access is a shared-guard-owning view with no raw ObjectStore Deref/Clone. Trusted crate SDK calls
+use a scoped callback whose entire execution holds SH; pending publication claims conservatively block raw
+SDK operations. Opened upload readers own SH through actual blocking reads and cancellation drain. These
+APIs do not claim to prevent intentional raw filesystem or SDK-handle escape by trusted callers. Publication,
+binding, enqueue, retry preflight/commit, input read and delivery readiness check future availability fences,
+with source ownership acquired before coordinator operations. The permanent lock and SQLite inode safety
+protocols remain unchanged. No automatic source/Vault deletion is enabled by this stage.
+
+
+### Source deletion page (B, scheduled by D below)
+
+The parent source store exposes an explicit synchronous retention page separately from preview. It takes source
+EX before any coordinator actor operation and retains it through unlink, parent fsync and claim completion. The
+writable configured coordinator, current physical state/source directories, actual SQLite main-file identity,
+exact durable run binding and sealed source-ref digest must agree. All execution generations require typed known
+termination and closed mandatory collection, including recorded closed failure verdicts. Eligibility scans the
+run's generation history and is not a constant-time SQL proof. Direct task/attempt creation holds source SH through
+commit and rejects an expired run; worker terminal/result processing is unchanged.
+
+The existing persisted trusted clock policy gates every expiry, claim and physical replay. Hold never consumes
+member cursors. A permanent source-run fence commits before any member release. A page examines at most 32 indexed
+memberships or processes at most 32 pending claim paths. Shared, import/pending, incomplete and unproven roots stay
+protected. Exact claims precede unlink and bind a publication incarnation, held store/ancestor identity, strictly
+owned manifest/blob path, verified content digest and regular owned nlink=1 leaf identity. Source files 0644 and
+owner-controlled 0755 nested directories are legitimate under the private 0700 source root; other permissions
+cannot introduce group/world write. Every configured ancestor is opened NOFOLLOW. Only durable claimed NotFound
+is idempotent, still requiring parent fsync before completion. Unknown/mismatch/permission/IO errors keep data/claim.
+Completion retains the old claim and reserves a higher incarnation; completed claims never replay against a new
+same-hash file. Content-addressed SourceID/hash and the permanent old-run fence are unchanged.
+
+Source content hashing has a shared 64MiB/page budget including replay; larger/unproven legacy files are retained
+as Unknown (new leaves above 32MiB cannot obtain both proof and revalidation within the page). Initial eligibility
+manifest validation has a separate 64MiB cap and remains cached across member pages. Persistent root/graph/object
+metadata is retained; no unbounded metadata cascade, directory removal or filesystem discovery is performed by B.
+Source registration completion remains a prerequisite; the separate preview registers legacy inputs conservatively.
+Only owned `manifests/src-<32lowerhex>.json` and `objects/<2lowerhex>/<64sha256>` are candidates. Git refs/objects,
+bundle caches, unknown entries, originals, keys, source secret copies, run records, lock/index/root identity and
+all Vault state are excluded from this source API. The D resident driver below schedules this page and the separate
+C Vault page after dedicated B+C deletion review. Vault-only secret erasure must
+never create a source-run expiry. Unsupported SQLite identity checks fail closed without opening/closing a live DB
+validation descriptor, preserving unrelated POSIX SQLite writer locks.
+
+
+#### Parent Vault retention (C; scheduled by D below)
+
+`SourceStore::vault_retention_page` synchronously holds source EX then Vault EX through proof, durable claim,
+unlink, directory fsync and completion. It selects at most 32 indexed runs or pending claims and shares a 64MiB
+manifest/secret validation budget. Exact configured owner, immutable private run record, sealed source digest,
+all-generation known terminal state, closed mandatory collection and no queued generation precede a permanent
+`vault_delete_claim`. This row also fences later parent has/load/adopt/capture, returning SecretUnavailable without
+recapture. Vault's separate persisted zero-delay clock has initial/anomaly Holds; every Hold blocks claims and
+physical replay. Source retention and source run-expiry are independent. Unknown/incomplete legacy registration
+blocks new claims. Pending exact claims survive later source-manifest removal; completed claims never replay.
+
+A private Vault-side registration pins the canonical source root and SQLite inode. Every generic Vault constructor
+and direct API honors it; missing/replaced/unreadable registrations or indexes fail closed, using SQLite's live
+HAS_MOVED check without an independent validation database FD. Workers without this registration retain ephemeral
+erase/reupload semantics. Direct APIs and cloneable HeldBundle retain cross-process Vault SH. Encoded secret frames
+carry an opaque lease through queued Outgoing and write/flush/cut, even after caller timeout/cancellation. Writer
+failure or abort drops queued frames; writer-owned buffers die before the in-flight lease. Last-lease drop explicitly
+unlocks. Initial direct adoption uses atomic no-replace publication, preserving the first durable bundle.
+
+Only exact private owned regular nlink=1 mode0600 run.json targets are deletable. Claims pin Vault root identity,
+leaf inode/metadata and content digest; held NOFOLLOW descriptors and current anchors are rechecked before FD-relative
+unlink. Durable claimed absence still requires parent fsync before completion. Changed/recreated/unsafe targets are
+retained. Original workspaces, keys, Git references/caches, source secret copies and unknown entries remain excluded.
+C originally exposed no automatic caller; dedicated B+C+transport review is closed and D scheduling/drain is enabled below.
+
+Secret-free manifests never receive a Vault tombstone: their empty load stays available for source-only retry.
+An unexpected Vault file for such a run is retained as Unknown. Missing bundles for manifests that require secrets
+can receive a permanent exact parent tombstone, preventing later re-adoption or recapture.
+
+
+#### Default resident input retention (D)
+
+The configured parent resident enables Source/Vault retention by default using the existing `retention_days`
+(default 7) for Source only. Vault has no additional age delay after all execution generations have typed known
+terminal evidence, mandatory collection is closed (including valid closed failure), and no queue/retry/delivery
+boundary remains. Its separate zero-retention clock still requires valid initial and subsequent native samples.
+Source keeps its own persisted seven-day policy and quarantine; every clock Hold blocks claims and replay in both
+protocols. A secret-bearing Source membership cannot expire before its exact completed Vault claim exists.
+
+One owned blocking page starts immediately, then at most one every 60 seconds with missed ticks skipped. During
+legacy registration the phases are registration, Vault, Source. New Source/Vault claims hold globally until persisted
+legacy registration is done and no unknown pending root or incomplete graph remains; an unrelated terminal Vault run
+is also held by this reviewed C precondition. Existing exact Vault claims may replay before registration completes,
+but only with a valid trusted clock. Bounded legacy reconciliation remains a separate unfinished plan item. The registration phase examines at most 32 directory entries or registers at most 32 indexed
+references with the existing bounded manifest cursor. Failed directory entries restart conservative discovery;
+oversized/unknown/incomplete inputs remain retained. Registration touches no retention clock or generation proof.
+Once registration completes the driver alternates one Vault page and one Source page, never both on one tick.
+Each deletion invocation selects at most 32 runs/references or exact claimed paths, using the existing 64MiB
+validation limits. No unbounded directory scan or root-sized vector is added. Generation-history eligibility still
+scans the complete selected run and is not a constant-time actor operation; bounded paths/bytes do not imply bounded
+CPU latency. Oversized legacy coverage and arbitrary-history latency are not claimed solved.
+
+Only trusted platform wall/monotonic/native-boot samples enter production. Source EX and Vault EX are nonblocking;
+readers, actual encoded secret sends and retry/publication guards make pages skip. Coordinator and CapturedInputs
+Arcs, cursors and acquired guards remain inside owned blocking work until actual completion. Normal stop/IPC
+cancellation drains accepted work before owner cleanup; no page is detached or overlapped by the loop. The driver
+checks coordinator fencing before accepting work and again inside the closure, and each page checks current
+physical owner/store binding. Unknown/proof/IO failures retain data and exact claims for later retry; optional GC
+errors never shut down accepted user jobs. Diagnostics contain bounded counters and static descriptions, not raw
+errors, paths or secret bytes. Existing result GC behavior is unchanged.
+
+Physical deletion remains limited to the approved indexed private parent Source manifest/blob copies and exact
+private parent Vault run files. Original paths, keys, Git refs/objects, caches, unknown extra files, unproven/pending
+roots, run binding records, lock/index identities and worker Vault erase/reupload behavior are outside this driver.
+Runtime tests invoke only private owned TempDir state; no production user-state invocation is part of validation.

@@ -1376,6 +1376,7 @@ fn a_record_whose_manifest_is_gone_is_an_error_and_not_a_new_capture() {
     std::fs::remove_file(
         store
             .object_store()
+            .unwrap()
             .manifest_path(&first.manifest.ci_source_id),
     )
     .unwrap();
@@ -1491,12 +1492,17 @@ fn the_same_blob_arriving_from_many_connections_at_once_is_stored() {
         },
         size: data.len() as u64,
     };
+    let entered = std::sync::Barrier::new(8);
     std::thread::scope(|sc| {
         for _ in 0..8 {
-            sc.spawn(|| s.ingest_blob(&want, &mut &data[..]).unwrap());
+            sc.spawn(|| {
+                entered.wait();
+                s.ingest_blob(&want, &mut &data[..]).unwrap();
+            });
         }
     });
     assert!(s.has_blob(&want.hash));
+    assert_eq!(s.read_blob(&want.hash).unwrap(), data);
 }
 
 #[test]
@@ -1642,7 +1648,7 @@ fn source_upload_opens_verified_descriptors_without_links_or_whole_reads() {
     let root = tempfile::tempdir().unwrap();
     let store = SourceStore::open(root.path()).unwrap();
     let bytes = vec![37; 3 * 64 * 1024 + 3];
-    let (hash, size) = store.object_store().put_bytes(&bytes).unwrap();
+    let (hash, size) = store.object_store().unwrap().put_bytes(&bytes).unwrap();
     let mut upload = store.open_blob_verified(&hash).unwrap();
     assert_eq!(upload.size, size);
     assert_eq!(
@@ -1654,7 +1660,7 @@ fn source_upload_opens_verified_descriptors_without_links_or_whole_reads() {
     upload.file.read_exact(&mut prefix).unwrap();
     assert_eq!(prefix, [37; 7]);
     assert!(store.open_blob_verified("../escape").is_err());
-    let path = store.object_store().object_path(&hash);
+    let path = store.object_store().unwrap().object_path(&hash);
     std::fs::write(&path, vec![38; bytes.len()]).unwrap();
     assert!(store.open_blob_verified(&hash).is_err());
     std::fs::remove_file(&path).unwrap();
@@ -1677,6 +1683,6 @@ fn source_upload_opens_verified_descriptors_without_links_or_whole_reads() {
     std::fs::remove_file(&bundle).unwrap();
     std::os::unix::fs::symlink(&path, &bundle).unwrap();
     assert!(store.open_bundle_verified(&bundle).is_err());
-    let (empty, _) = store.object_store().put_bytes(b"").unwrap();
+    let (empty, _) = store.object_store().unwrap().put_bytes(b"").unwrap();
     assert_eq!(store.open_blob_verified(&empty).unwrap().size, 0);
 }

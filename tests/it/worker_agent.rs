@@ -81,6 +81,16 @@ impl DirHost {
 }
 
 impl Host for DirHost {
+    fn preparation_observation_page(
+        &self,
+        _request: &remote_task_runner::setup::observation_transport::ObservationPageRequest,
+    ) -> Option<remote_task_runner::setup::observation_transport::ObservationPage> {
+        use remote_task_runner::setup::observation_transport::*;
+        self.log("observation_page");
+        Some(ObservationPage::Unavailable {
+            reason: UnavailableReason::OwnerChanged,
+        })
+    }
     fn disable_core_dumps(&self) -> Result<(), ApiError> {
         self.log("core_dumps");
         if self.fail_core_dumps.load(Ordering::SeqCst) {
@@ -399,6 +409,10 @@ fn payload(script: &str) -> AttemptPayload {
     let mut env = BTreeMap::new();
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
+        toolchains: None,
+        outputs: Vec::new(),
+        requirements: Default::default(),
+        in_place: false,
         setup: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
@@ -1499,6 +1513,7 @@ async fn status_events_logs_lease_and_inspect_answer_from_the_store() {
     let Response::Inspect(i) = call(
         &c,
         Request::Inspect(InspectRequest {
+            preparation_observations: None,
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
         }),
@@ -2090,6 +2105,7 @@ async fn declared_artifacts_reach_the_supervisor_and_the_result_tells_required_f
     };
     // Everything chapter 13 lists, per artifact.
     let record = |name: &str, content: &[u8]| ArtifactRecord {
+        encoding: remote_task_runner::wire::ArtifactEncoding::Raw,
         name: name.to_string(),
         path: name.to_string(),
         size: content.len() as u64,
@@ -3859,4 +3875,408 @@ async fn bounded_terminal_cleanup_progresses_and_retries_without_touching_runnin
     }
     assert_eq!(f.host.count(&format!("cleanup {ended}")), cleaned);
     assert!(f.rec(&ended).acked_at_ms.is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn in_place_is_refused_by_default_worker_admission_before_acceptance() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let mut p = payload("true");
+    p.in_place = true;
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert!(f.store().get(&a).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn capabilities_reject_bypassed_placement_before_acceptance_or_workspace() {
+    use remote_task_runner::toolchain::capability::ExecutionRequirements;
+    let f = fx();
+    let agent = f.start("boot-1");
+    let client = f.connect(&agent).await;
+    let mut p = payload("true");
+    p.requirements = ExecutionRequirements::parse(None, &["node".into()]).unwrap();
+    let a = AttemptId::generate();
+    let error = call(&client, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(
+        error.blocked_reason,
+        Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+    );
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert_eq!(f.host.count("prepare"), 0);
+}
+
+#[tokio::test]
+async fn capabilities_detect_tool_drift_but_keep_accepted_replays_idempotent() {
+    use remote_task_runner::toolchain::{capability::ExecutionRequirements, profile::Profile};
+    let f = fx();
+    let bin = f.path("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let node = bin.join("node");
+    std::fs::write(&node, "#!/bin/sh\necho v22.0.0\n").unwrap();
+    std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = Profile::load(
+        &f.state(),
+        &[
+            ("PATH".into(), bin.to_str().unwrap().into()),
+            ("HOME".into(), f.dir.path().to_str().unwrap().into()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile = profile.name().into();
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = f.start_with(cfg);
+    let client = f.connect(&agent).await;
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    p.requirements =
+        ExecutionRequirements::parse(Some("default".into()), &["node".into()]).unwrap();
+    let a = AttemptId::generate();
+    assert!(!submit(&client, &a, &p).await.duplicate);
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    let original = f.rec(&a).spec["_worker_profile_fingerprint"].clone();
+    assert!(!original.is_null());
+    std::fs::write(&node, "#!/bin/sh\necho v20.0.0\n").unwrap();
+    assert!(submit(&client, &a, &p).await.duplicate);
+    assert_eq!(f.rec(&a).spec["_worker_profile_fingerprint"], original);
+    let b = AttemptId::generate();
+    let error = call(&client, submit_req(&b, &p)).await.unwrap_err();
+    assert_eq!(
+        error.blocked_reason,
+        Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+    );
+    assert!(f.store().get(&b).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed() {
+    use remote_task_runner::toolchain::{capability::ExecutionRequirements, profile::Profile};
+    for required_profile_tool in [false, true] {
+        let f = fx();
+        let bin = f.path("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let marker = f.path("probe-fails");
+        let node = bin.join("node");
+        std::fs::write(
+            &node,
+            format!("#!/bin/sh\nif [ -f {marker:?} ]; then exit 1; fi\necho v22.0.0\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+        if required_profile_tool {
+            let path = f.state().join("profiles.toml");
+            std::fs::create_dir_all(f.state()).unwrap();
+            std::fs::write(&path, format!("schema_version=1\nactive='test'\n[profiles.test]\npath=[{bin:?}]\nshell='/bin/sh'\ncache_namespace='test'\nrequired_tools=['node']\n")).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let profile = Profile::load(
+            &f.state(),
+            &[("PATH".into(), bin.to_str().unwrap().into())].into(),
+        )
+        .unwrap();
+        let mut cfg = f.cfg("boot-1");
+        cfg.profile = profile.name().into();
+        cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+        cfg.capability_profile = Some(Arc::new(profile));
+        let agent = f.start_with(cfg);
+        let client = f.connect(&agent).await;
+        std::fs::write(&marker, "fail").unwrap();
+        let mut p = payload("exit 0");
+        p.commands[0].env.clear();
+        let a = AttemptId::generate();
+        if required_profile_tool {
+            let error = call(&client, submit_req(&a, &p)).await.unwrap_err();
+            assert_eq!(
+                error.blocked_reason,
+                Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+            );
+            assert!(f.store().get(&a).unwrap().is_none());
+        } else {
+            submit(&client, &a, &p).await;
+            assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+            p.requirements = ExecutionRequirements::parse(None, &["node".into()]).unwrap();
+            let b = AttemptId::generate();
+            let error = call(&client, submit_req(&b, &p)).await.unwrap_err();
+            assert_eq!(
+                error.blocked_reason,
+                Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+            );
+            assert!(f.store().get(&b).unwrap().is_none());
+        }
+    }
+}
+
+#[tokio::test]
+async fn capability_negotiation_is_required_even_if_worker_has_the_profile() {
+    use remote_task_runner::toolchain::{
+        capability::{ExecutionRequirements, FEATURE},
+        profile::Profile,
+    };
+    let f = fx();
+    let profile = Profile::load(
+        &f.state(),
+        &[("PATH".into(), f.dir.path().to_str().unwrap().into())].into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = f.start_with(cfg);
+    let (a, b) = duplex_pair(64 * 1024);
+    tokio::spawn(serve_connection(
+        agent,
+        b,
+        f.cluster.clone(),
+        Arc::new(Semaphore::new(4)),
+    ));
+    let mut config = client_cfg(&f.cluster);
+    config.features.retain(|v| v != FEATURE);
+    let connection = connect(a, config).await.unwrap();
+    assert!(connection.worker.capabilities.is_none());
+    let inspect = connection
+        .client
+        .call(
+            Request::Inspect(InspectRequest {
+                preparation_observations: None,
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+            }),
+            T,
+        )
+        .await
+        .unwrap();
+    let Response::Inspect(inspect) = inspect else {
+        panic!()
+    };
+    assert!(inspect.capabilities.is_none());
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    p.requirements = ExecutionRequirements::parse(Some("default".into()), &[]).unwrap();
+    let attempt = AttemptId::generate();
+    let error = call(&connection.client, submit_req(&attempt, &p))
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::ProtocolIncompatible);
+    assert!(f.store().get(&attempt).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn frozen_toolchain_submit_and_readonly_proposal_require_negotiated_feature() {
+    use remote_task_runner::toolchain::{
+        contract::{FrozenBundle, FEATURE},
+        versions::*,
+    };
+    let f = fx();
+    let agent = f.start("boot-1");
+    let (a, b) = duplex_pair(64 * 1024);
+    let server = tokio::spawn(serve_connection(
+        agent.clone(),
+        b,
+        f.cluster.clone(),
+        Arc::new(Semaphore::new(4)),
+    ));
+    let mut config = client_cfg(&f.cluster);
+    config.features.retain(|feature| feature != FEATURE);
+    let client = connect(a, config).await.unwrap().client;
+    let mut p = payload("exit 0");
+    let scope = Scope::project("");
+    let bundle = FrozenBundle::seal_exact(
+        FrozenToolchains::freeze(
+            p.manifest_digest.clone(),
+            Digest::of_bytes(b"parent"),
+            scope.clone(),
+            &[Declaration {
+                tool: ToolId::parse("node").unwrap(),
+                constraint: Constraint::parse("20.0.0").unwrap(),
+                scope,
+                location: Location {
+                    path: ".node-version".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    p.toolchains = Some(Box::new(bundle.clone()));
+    let attempt = AttemptId::generate();
+    let rejected = call(&client, submit_req(&attempt, &p)).await.unwrap_err();
+    assert_eq!(rejected.code, ErrorCode::ProtocolIncompatible);
+    assert!(f.store().get(&attempt).unwrap().is_none());
+    let rejected = call(
+        &client,
+        Request::ResolveToolchains(ResolveToolchainsRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            bundle,
+            requirements: Default::default(),
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(rejected.code, ErrorCode::ProtocolIncompatible);
+    assert!(f.store().list_nonterminal().unwrap().is_empty());
+    server.abort();
+    let _ = server.await;
+    agent.shutdown();
+}
+
+#[tokio::test]
+async fn preparation_observations_are_optional_negotiated_and_never_break_inspect() {
+    use remote_task_runner::setup::observation_transport::*;
+    let f = fx();
+    let agent = f.start("boot-1");
+    for negotiated in [false, true] {
+        let (a, b) = duplex_pair(64 * 1024);
+        tokio::spawn(serve_connection(
+            agent.clone(),
+            b,
+            f.cluster.clone(),
+            Arc::new(Semaphore::new(4)),
+        ));
+        let mut config = client_cfg(&f.cluster);
+        if !negotiated {
+            config.features.retain(|v| v != FEATURE);
+        }
+        let connection = connect(a, config).await.unwrap();
+        assert_eq!(
+            connection.negotiated.features.iter().any(|v| v == FEATURE),
+            negotiated
+        );
+        for requested in [false, true] {
+            let before = f.host.count("observation_page");
+            let Response::Inspect(inspect) = connection
+                .client
+                .call(
+                    Request::Inspect(InspectRequest {
+                        schema_version: SchemaVersion::CURRENT,
+                        request_id: RequestId::generate(),
+                        preparation_observations: requested.then(ObservationPageRequest::default),
+                    }),
+                    T,
+                )
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(inspect.worker_id, f.cfg("boot-1").worker_id);
+            if negotiated && requested {
+                assert_eq!(
+                    inspect.preparation_observations,
+                    Some(ObservationPage::Unavailable {
+                        reason: UnavailableReason::OwnerChanged
+                    })
+                );
+                assert_eq!(f.host.count("observation_page"), before + 1);
+            } else {
+                assert!(inspect.preparation_observations.is_none());
+                assert_eq!(f.host.count("observation_page"), before);
+                assert!(serde_json::to_value(inspect)
+                    .unwrap()
+                    .get("preparation_observations")
+                    .is_none());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn preparation_probe_is_negotiated_readonly_and_profile_bound() {
+    use remote_task_runner::setup::preparation_probe::{PreparationProbe, ProbeUnknown};
+    let f = fx();
+    let cfg = f.cfg("boot-probe");
+    let fingerprint = cfg.profile_fingerprint.clone();
+    let agent = f.start_with(cfg);
+    for negotiated in [false, true] {
+        let (a, b) = duplex_pair(64 * 1024);
+        let server = tokio::spawn(serve_connection(
+            agent.clone(),
+            b,
+            f.cluster.clone(),
+            Arc::new(Semaphore::new(4)),
+        ));
+        let mut config = client_cfg(&f.cluster);
+        if !negotiated {
+            config.features.retain(|v| v != PREPARATION_PROBE_FEATURE);
+        }
+        let connection = connect(a, config).await.unwrap();
+        let calls = f.host.calls();
+        let ledger_epoch = f.store().max_coordinator_epoch().unwrap();
+        let launches = f.store().count_launches().unwrap();
+        let epoch = agent.agent_epoch();
+        for (stale, oversized) in [(false, false), (true, false), (false, true)] {
+            let setup = oversized.then(|| SetupSpec {
+                steps: vec![
+                    SetupStep {
+                        id: "private-id".into(),
+                        dir: String::new(),
+                        run: "private command must never run".into(),
+                        shell: None,
+                        env: BTreeMap::new(),
+                        unresolved_env: vec![]
+                    };
+                    65
+                ],
+                toolchain: vec![],
+                scope: ReuseScope::Persistent,
+                freshness_secs: None,
+                secrets: vec![],
+                no_cache: false,
+                step_timeout_ms: None,
+            });
+            let request = Request::PreparationProbe(PreparationProbeRequest {
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+                expected_profile_fingerprint: if stale {
+                    Digest::of_bytes(b"stale")
+                } else {
+                    fingerprint.clone()
+                },
+                manifest_digest: Digest::of_bytes(b"manifest"),
+                source_id: SourceId::generate(),
+                run_id: RunId::generate(),
+                setup,
+                frozen: None,
+                in_place: true,
+            });
+            let answer = call(&connection.client, request).await;
+            if !negotiated {
+                assert_eq!(answer.unwrap_err().code, ErrorCode::ProtocolIncompatible);
+            } else {
+                let Response::PreparationProbe(answer) = answer.unwrap() else {
+                    panic!()
+                };
+                assert_eq!(answer.worker_id, f.cfg("boot-probe").worker_id);
+                assert_eq!(answer.worker_boot_id, f.cfg("boot-probe").boot_id);
+                assert_eq!(answer.agent_epoch, epoch);
+                assert_eq!(
+                    answer.probe,
+                    PreparationProbe::Unknown(if stale {
+                        ProbeUnknown::InvalidBinding
+                    } else if oversized {
+                        ProbeUnknown::BudgetExceeded
+                    } else {
+                        ProbeUnknown::MissingContext
+                    })
+                );
+            }
+            assert!(f.store().list_nonterminal().unwrap().is_empty());
+            assert_eq!(f.store().max_coordinator_epoch().unwrap(), ledger_epoch);
+            assert_eq!(f.store().count_launches().unwrap(), launches);
+            assert_eq!(f.host.calls(), calls);
+        }
+        server.abort();
+        let _ = server.await;
+    }
+    agent.shutdown();
 }

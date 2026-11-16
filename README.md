@@ -18,6 +18,48 @@ Run the configured CI against committed HEAD:
 local-ci run --include-disabled
 ```
 
+Pure mutation and line coverage share `scripts/pure-modules.txt`. Mutation uses
+`python3 scripts/mutation-run.py --shard 0/4` (repeat shards 1–3), selecting
+module library tests plus the existing `config::` integration tests. Shared
+toolchain parser tests live under `toolchain::tests::`; substring matches also
+include a few library consumers such as `service::outputs::`. Actual integration
+discovery fails if any selected test is outside `config::`. Normal CI on both
+platforms and the coverage gate still execute the full test suite.
+
+The runner pins cargo-schemata 0.4.0, limits baseline/test execution to 60 seconds
+per binary/mutant (compilation is separate), and rejects missing, empty, surviving,
+timed-out or unknown results. `python3 scripts/mutation-policy-test.py` checks the
+real runner's Cargo arguments and rejects workflow bypasses and accidental extra
+integration tests. Each shard uploads selected test names, `selection.json`
+(run identity, counts and timings), `run.log` and the mutation report. Use the
+repository's resource admission and portool entry when running locally.
+
 ## License
 
 MIT
+
+A separately provisioned persistent worker can run in the foreground with
+`remote-task-runner worker --input "$WORKER_INPUT"`. The retained input is private
+and binds the cluster, worker identity, executable, key and captured configuration.
+Its HOME and canonical worker state must match the `worker --stdio` bridge. The
+bridge may disconnect while accepted work and its independent supervisor continue.
+The parent snapshots explicitly registered workers from its private user
+`config.toml` at startup. Each `[[workers]]` entry's `id` is the expected worker
+identity; `ssh` is its SSH destination. The parent verifies cluster, identity and
+protocol before attachment, forwards captured source and secrets on that link,
+and reconnects without creating a replacement attempt. The remote executable is
+`remote-task-runner` on the remote PATH, through the fixed `worker --stdio` bridge.
+SSH connection failures stay isolated from local work and other peers.
+
+Registration changes require a parent restart. Automatic enrollment, worker
+add/install, ephemeral workers, native worker services and upgrade/rollback remain
+required follow-up work. Cluster keys and worker inputs are provisioned privately
+out of band; a hello never enrolls an unknown identity.
+
+
+Worker-link attachment is asynchronous: `Coordinator::attach(...).await` installs
+a verified connection after any in-flight placement commit. `detach` and source
+session resets use the same placement ordering. Forecasts remain outside this
+fence, so a worker may still join during a running tick. Synchronous construction
+and cost callbacks can use checked `try_attach`; a busy result installs nothing
+and must be retried or handled, never treated as a successful attachment.

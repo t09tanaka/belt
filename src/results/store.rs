@@ -39,7 +39,7 @@ use crate::wire::LogStream;
 use sha2::{Digest as _, Sha256};
 use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -101,9 +101,218 @@ pub enum Publish {
 #[derive(Debug, Clone)]
 pub struct ResultStore {
     root: PathBuf,
+    deletion_root: Arc<File>,
     /// The `.part` files this process began at their first byte.
     begun: Arc<Mutex<HashSet<PathBuf>>>,
     crash: Arc<Mutex<Option<Crash>>>,
+    #[cfg(test)]
+    append_pause: Arc<Mutex<Option<AppendPause>>>,
+    #[cfg(test)]
+    remove_pause: Arc<Mutex<Option<AppendPause>>>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct AppendPause {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+/// A read-only handle to the store. Opening it creates no directories and it
+/// exposes only committed-prefix range reads, never recovery or mutation.
+#[derive(Debug, Clone)]
+pub struct LogPrefixReader {
+    root: Arc<File>,
+}
+
+/// Proof that a legacy file matched a specific final receipt on disk. Only the
+/// store can construct it; storage also checks the persisted final receipt.
+#[derive(Debug)]
+pub struct VerifiedLogPrefix {
+    attempt: AttemptId,
+    stream: LogStream,
+    digest: Digest,
+    bytes: u64,
+}
+impl VerifiedLogPrefix {
+    pub fn attempt(&self) -> &AttemptId {
+        &self.attempt
+    }
+    pub fn stream(&self) -> LogStream {
+        self.stream
+    }
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+}
+
+fn open_log(
+    root: &File,
+    attempt: &AttemptId,
+    stream: LogStream,
+    write: bool,
+) -> io::Result<Option<File>> {
+    use rustix::fs::{openat, Mode, OFlags};
+    let directory = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    let open = || -> io::Result<File> {
+        let attempt_dir = openat(root, attempt.as_str(), directory, Mode::empty())?;
+        let logs = openat(&attempt_dir, "logs", directory, Mode::empty())?;
+        let access = if write { OFlags::RDWR } else { OFlags::RDONLY };
+        let file: File = openat(
+            &logs,
+            format!("{}.log", stream_name(stream)),
+            access | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into();
+        if !file.metadata()?.is_file() {
+            return Err(io::Error::other("log is not a regular file"));
+        }
+        Ok(file)
+    };
+    match open() {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+fn open_root(root: &Path) -> io::Result<File> {
+    use rustix::fs::{open, Mode, OFlags};
+    Ok(open(
+        root,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into())
+}
+
+fn delete_dir_flags() -> rustix::fs::OFlags {
+    use rustix::fs::OFlags;
+    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+fn delete_names(dir: &File) -> io::Result<Vec<std::ffi::OsString>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut names = Vec::new();
+    for entry in rustix::fs::Dir::read_from(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_bytes();
+        if name != b"." && name != b".." {
+            names.push(std::ffi::OsStr::from_bytes(name).to_owned());
+        }
+    }
+    Ok(names)
+}
+
+fn unlink_open_dir(parent: &File, name: &std::ffi::OsStr, dir: &File) -> io::Result<()> {
+    use rustix::fs::{fstat, statat, unlinkat, AtFlags};
+    let opened = fstat(dir)?;
+    let named = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino) {
+        return Err(io::Error::other("result directory changed"));
+    }
+    unlinkat(parent, name, AtFlags::REMOVEDIR)?;
+    parent.sync_all()
+}
+
+/// Every recursive step is anchored to a held directory. A symlink leaf is
+/// unlinked, never followed; a concurrent symlink substitution cannot redirect
+/// any traversal, including the temporary-directory cleanup.
+fn remove_entry(parent: &File, name: &std::ffi::OsStr) -> io::Result<()> {
+    use rustix::fs::{openat, statat, unlinkat, AtFlags, FileType, Mode};
+    let stat = match statat(parent, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(stat) => stat,
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if FileType::from_raw_mode(stat.st_mode) == FileType::Directory {
+        let dir = File::from(openat(parent, name, delete_dir_flags(), Mode::empty())?);
+        let opened = rustix::fs::fstat(&dir)?;
+        if (opened.st_dev, opened.st_ino) != (stat.st_dev, stat.st_ino) {
+            return Err(io::Error::other("result directory changed"));
+        }
+        for child in delete_names(&dir)? {
+            remove_entry(&dir, &child)?;
+        }
+        unlink_open_dir(parent, name, &dir)?;
+    } else {
+        unlinkat(parent, name, AtFlags::empty())?;
+    }
+    parent.sync_all()
+}
+
+impl LogPrefixReader {
+    /// Read a receipted opaque object through held, no-follow descriptors.
+    /// Authorization is performed by the caller's metadata/receipt query.
+    pub fn open_artifact(&self, attempt: &AttemptId, digest: &Digest, size: u64) -> Result<File> {
+        use rustix::fs::{openat, Mode, OFlags};
+        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let a =
+            openat(&*self.root, attempt.as_str(), flags, Mode::empty()).map_err(io::Error::from)?;
+        let d = openat(&a, "artifacts", flags, Mode::empty()).map_err(io::Error::from)?;
+        let file: File = openat(
+            &d,
+            digest
+                .as_str()
+                .strip_prefix("sha256:")
+                .ok_or_else(|| io::Error::other("invalid digest"))?,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .map_err(io::Error::from)?
+        .into();
+        let meta = file.metadata()?;
+        if !meta.is_file() || meta.len() != size {
+            return Err(io::Error::other("artifact size/type mismatch").into());
+        }
+        Ok(file)
+    }
+
+    /// Read at most 64 KiB from a DB snapshot's committed prefix. Physical tail
+    /// bytes are invisible. A missing/short prefix fails closed; no read repair.
+    /// Hold the collector/reader exclusion guard or an owner pin while reading.
+    pub fn read_range(
+        &self,
+        attempt: &AttemptId,
+        stream: LogStream,
+        committed: u64,
+        offset: u64,
+        max_bytes: u32,
+    ) -> Result<Vec<u8>> {
+        if offset > committed {
+            return Err(StoreError::Offset {
+                want: offset,
+                have: committed,
+            });
+        }
+        let file = open_log(&self.root, attempt, stream, false)?;
+        let Some(mut file) = file else {
+            return if committed == 0 {
+                Ok(Vec::new())
+            } else {
+                Err(StoreError::Offset {
+                    want: committed,
+                    have: 0,
+                })
+            };
+        };
+        let have = file.metadata()?.len();
+        if have < committed {
+            return Err(StoreError::Offset {
+                want: committed,
+                have,
+            });
+        }
+        let count = (committed - offset).min(u64::from(max_bytes.min(65536))) as usize;
+        file.seek(SeekFrom::Start(offset))?;
+        let mut bytes = vec![0; count];
+        file.read_exact(&mut bytes)?;
+        Ok(bytes)
+    }
 }
 
 fn stream_name(stream: LogStream) -> &'static str {
@@ -213,9 +422,13 @@ fn append_at(path: &Path, offset: u64, data: &[u8]) -> Result<u64> {
         .append(true)
         .create(true)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)?;
-    let have = f.metadata()?.len();
+    let meta = f.metadata()?;
+    if !meta.is_file() {
+        return Err(io::Error::other("append target is not a regular file").into());
+    }
+    let have = meta.len();
     if have != offset {
         return Err(StoreError::Offset { want: offset, have });
     }
@@ -244,9 +457,105 @@ impl ResultStore {
         dir_all(root)?;
         Ok(ResultStore {
             root: root.to_path_buf(),
+            deletion_root: Arc::new(open_root(root)?),
             begun: Arc::default(),
             crash: Arc::default(),
+            #[cfg(test)]
+            append_pause: Arc::default(),
+            #[cfg(test)]
+            remove_pause: Arc::default(),
         })
+    }
+
+    /// Open only the existing root, without creating any filesystem entries.
+    pub fn open_read_only(root: &Path) -> Result<LogPrefixReader> {
+        Ok(LogPrefixReader {
+            root: Arc::new(open_root(root)?),
+        })
+    }
+
+    /// Discard ONLY a durable-but-uncommitted append tail. The caller must own
+    /// the coordinator's collecting guard throughout recovery/append/DB commit.
+    /// A missing or short committed file is corruption, never reset to zero.
+    pub fn recover_log_prefix(
+        &self,
+        attempt: &AttemptId,
+        stream: LogStream,
+        committed: u64,
+    ) -> Result<()> {
+        let root = open_root(&self.root)?;
+        let Some(file) = open_log(&root, attempt, stream, true)? else {
+            return if committed == 0 {
+                Ok(())
+            } else {
+                Err(StoreError::Offset {
+                    want: committed,
+                    have: 0,
+                })
+            };
+        };
+        let have = file.metadata()?.len();
+        if have < committed {
+            return Err(StoreError::Offset {
+                want: committed,
+                have,
+            });
+        }
+        if have > committed {
+            file.set_len(committed)?;
+            file.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Verify a legacy final receipt before allowing its length to bootstrap
+    /// durable progress. The collecting guard must cover verification and DB
+    /// bootstrap, so the immutable receipt and file remain the same stream.
+    pub fn verify_legacy_log_prefix(
+        &self,
+        attempt: &AttemptId,
+        stream: LogStream,
+        digest: &Digest,
+        bytes: u64,
+    ) -> Result<Option<VerifiedLogPrefix>> {
+        let root = open_root(&self.root)?;
+        let file = open_log(&root, attempt, stream, false)?;
+        let actual = match file {
+            None => (Digest::of_bytes(b""), 0),
+            Some(mut file) => {
+                if file.metadata()?.len() != bytes {
+                    return Ok(None);
+                }
+                let mut hash = Sha256::new();
+                let mut size = 0u64;
+                let mut buf = [0u8; 65536];
+                loop {
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        break;
+                    }
+                    hash.update(&buf[..n]);
+                    size += n as u64;
+                    if size > bytes {
+                        return Ok(None);
+                    }
+                }
+                file.sync_all()?;
+                (
+                    sha256_digest(&hash.finalize()).expect("sha256 digest"),
+                    size,
+                )
+            }
+        };
+        if &actual.0 != digest || actual.1 != bytes {
+            return Ok(None);
+        }
+        Ok(Some(VerifiedLogPrefix {
+            attempt: attempt.clone(),
+            stream,
+            digest: digest.clone(),
+            bytes,
+        }))
     }
 
     pub fn root(&self) -> &Path {
@@ -339,6 +648,19 @@ impl ResultStore {
     }
 
     /// Append to a stream at `offset` (its length) and sync.
+    #[cfg(test)]
+    pub(crate) fn pause_next_log_append(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered, receive_entered) = std::sync::mpsc::channel();
+        let (resume, receive_resume) = std::sync::mpsc::channel();
+        *self.append_pause.lock().unwrap() = Some(AppendPause {
+            entered,
+            resume: receive_resume,
+        });
+        (receive_entered, resume)
+    }
+
     pub fn append_log(
         &self,
         attempt: &AttemptId,
@@ -347,6 +669,14 @@ impl ResultStore {
         data: &[u8],
     ) -> Result<u64> {
         let len = append_at(&self.log_path(attempt, stream), offset, data)?;
+        #[cfg(test)]
+        if let Some(pause) = self.append_pause.lock().unwrap().take() {
+            let _ = pause.entered.send(());
+            // A failed test must not leave a detached blocking job forever.
+            let _ = pause
+                .resume
+                .recv_timeout(std::time::Duration::from_secs(15));
+        }
         self.passed(Crash::LogAppended)?;
         Ok(len)
     }
@@ -526,31 +856,54 @@ impl ResultStore {
             .strip_prefix(LOCATOR_PREFIX)
             .and_then(relative_path)
             .ok_or_else(|| StoreError::BadName(locator.to_string()))?;
-        let path = self.root.join(&rel);
-        let gone = match fs::symlink_metadata(&path) {
-            Ok(m) if m.is_dir() => fs::remove_dir_all(&path),
-            Ok(_) => fs::remove_file(&path),
-            Err(e) => Err(e),
-        };
-        match gone {
-            Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-            _ => {}
+        use rustix::fs::{openat, Mode};
+        use std::os::unix::fs::MetadataExt;
+        // Reject a replaced root. Ancestor aliases in the configured path must
+        // still resolve to the directory opened with this store.
+        let current = open_root(&self.root)?;
+        let original = self.deletion_root.metadata()?;
+        let current = current.metadata()?;
+        if (current.dev(), current.ino()) != (original.dev(), original.ino()) {
+            return Err(io::Error::other("result root changed").into());
         }
-        // Empty directories above it, up to the attempt's own.
-        let mut dir = path.parent();
-        while let Some(d) = dir.filter(|d| *d != self.root && d.starts_with(&self.root)) {
-            if d.parent() == Some(self.root.as_path()) {
-                // What is left of an attempt without files is its `tmp`.
-                let only_tmp = fs::read_dir(d)
-                    .is_ok_and(|entries| entries.flatten().all(|e| e.file_name() == "tmp"));
-                if only_tmp {
-                    let _ = fs::remove_dir_all(d.join("tmp"));
+        let names: Vec<_> = rel.iter().collect();
+        let mut dirs = vec![self.deletion_root.try_clone()?];
+        for name in &names[..names.len() - 1] {
+            match openat(
+                dirs.last().unwrap(),
+                *name,
+                delete_dir_flags(),
+                Mode::empty(),
+            ) {
+                Ok(fd) => dirs.push(File::from(fd)),
+                Err(rustix::io::Errno::NOENT) => return Ok(()),
+                Err(e) => return Err(io::Error::from(e).into()),
+            }
+        }
+        #[cfg(test)]
+        if let Some(pause) = self.remove_pause.lock().unwrap().take() {
+            pause.entered.send(()).unwrap();
+            pause
+                .resume
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+        }
+        remove_entry(dirs.last().unwrap(), names.last().unwrap())?;
+        // Cleanup is also relative to the descriptors used for traversal.
+        // Never reopen an ancestor through its mutable pathname.
+        for i in (1..dirs.len()).rev() {
+            let dir = &dirs[i];
+            if i == 1 {
+                let entries = delete_names(dir)?;
+                if entries.iter().all(|n| n == "tmp") {
+                    remove_entry(dir, std::ffi::OsStr::new("tmp"))?;
                 }
             }
-            if fs::remove_dir(d).is_err() {
-                break;
+            match unlink_open_dir(&dirs[i - 1], names[i - 1], dir) {
+                Ok(()) => {}
+                Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTEMPTY | libc::ENOENT)) => break,
+                Err(e) => return Err(e.into()),
             }
-            dir = d.parent();
         }
         Ok(())
     }
@@ -560,6 +913,109 @@ impl ResultStore {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    #[test]
+    fn committed_prefix_reads_hide_tail_and_recovery_truncates_only_uncommitted_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("results");
+        assert!(ResultStore::open_read_only(&root).is_err());
+        assert!(!root.exists());
+        let store = ResultStore::open(&root).unwrap();
+        let a = AttemptId::generate();
+        let reader = ResultStore::open_read_only(&root).unwrap();
+        assert_eq!(
+            reader.read_range(&a, LogStream::Stdout, 0, 0, 10).unwrap(),
+            b""
+        );
+        assert!(reader.read_range(&a, LogStream::Stdout, 1, 0, 10).is_err());
+        store
+            .append_log(&a, LogStream::Stdout, 0, b"a\xffbc")
+            .unwrap();
+        store.crash_once_at(Crash::LogAppended);
+        assert!(matches!(
+            store.append_log(&a, LogStream::Stdout, 4, b"tail"),
+            Err(StoreError::Crash(Crash::LogAppended))
+        ));
+        assert_eq!(
+            reader.read_range(&a, LogStream::Stdout, 4, 1, 2).unwrap(),
+            b"\xffb"
+        );
+        assert_eq!(
+            fs::read(store.log_path(&a, LogStream::Stdout)).unwrap(),
+            b"a\xffbctail"
+        );
+        assert!(reader.read_range(&a, LogStream::Stdout, 9, 0, 1).is_err());
+        assert!(reader.read_range(&a, LogStream::Stdout, 4, 5, 1).is_err());
+        store.recover_log_prefix(&a, LogStream::Stdout, 4).unwrap();
+        assert_eq!(store.log_len(&a, LogStream::Stdout).unwrap(), 4);
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 5).is_err());
+        assert_eq!(store.log_len(&a, LogStream::Stdout).unwrap(), 4);
+        assert!(store.recover_log_prefix(&a, LogStream::Stderr, 1).is_err());
+        store.recover_log_prefix(&a, LogStream::Stderr, 0).unwrap();
+        assert!(!store.log_path(&a, LogStream::Stderr).exists());
+        let big = vec![3; 70000];
+        store.append_log(&a, LogStream::Stderr, 0, &big).unwrap();
+        assert_eq!(
+            reader
+                .read_range(&a, LogStream::Stderr, 70000, 0, u32::MAX)
+                .unwrap()
+                .len(),
+            65536
+        );
+        assert_eq!(
+            reader
+                .read_range(&a, LogStream::Stderr, 70000, 69999, 8)
+                .unwrap(),
+            vec![3]
+        );
+        assert!(store
+            .verify_legacy_log_prefix(&a, LogStream::Stdout, &Digest::of_bytes(b"bad"), 4)
+            .unwrap()
+            .is_none());
+        assert!(store
+            .verify_legacy_log_prefix(&a, LogStream::Stdout, &Digest::of_bytes(b"a\xffbc"), 4)
+            .unwrap()
+            .is_some());
+    }
+
+    #[test]
+    fn prefix_io_refuses_symlink_components_and_nonregular_files_without_mutation() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let store = ResultStore::open(&dir.path().join("results")).unwrap();
+        let a = AttemptId::generate();
+        let outside = dir.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::create_dir(outside.join("logs")).unwrap();
+        fs::write(outside.join("logs/stdout.log"), b"keep").unwrap();
+        symlink(&outside, store.root().join(a.as_str())).unwrap();
+        let reader = ResultStore::open_read_only(store.root()).unwrap();
+        assert!(reader.read_range(&a, LogStream::Stdout, 4, 0, 4).is_err());
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 0).is_err());
+        assert_eq!(fs::read(outside.join("logs/stdout.log")).unwrap(), b"keep");
+        fs::remove_file(store.root().join(a.as_str())).unwrap();
+        fs::create_dir(store.root().join(a.as_str())).unwrap();
+        symlink(
+            outside.join("logs"),
+            store.root().join(a.as_str()).join("logs"),
+        )
+        .unwrap();
+        assert!(reader.read_range(&a, LogStream::Stdout, 4, 0, 4).is_err());
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 0).is_err());
+        fs::remove_file(store.root().join(a.as_str()).join("logs")).unwrap();
+        fs::create_dir(store.root().join(a.as_str()).join("logs")).unwrap();
+        let path = store.log_path(&a, LogStream::Stdout);
+        symlink(outside.join("logs/stdout.log"), &path).unwrap();
+        assert!(reader.read_range(&a, LogStream::Stdout, 4, 0, 4).is_err());
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 0).is_err());
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(reader.read_range(&a, LogStream::Stdout, 0, 0, 4).is_err());
+        assert!(store.recover_log_prefix(&a, LogStream::Stdout, 0).is_err());
+        let alias = dir.path().join("alias");
+        symlink(store.root(), &alias).unwrap();
+        assert!(ResultStore::open_read_only(&alias).is_err());
+    }
 
     const ALPHA: &[u8] = b"0123456789";
 
@@ -972,6 +1428,84 @@ mod tests {
         assert_eq!(
             s.publish_artifact(a, &d, 10).unwrap(),
             Publish::Mismatch { whole: true }
+        );
+    }
+
+    #[test]
+    fn deletion_never_follows_ancestor_root_or_leaf_symlinks() {
+        use std::os::unix::fs::symlink;
+        let f = fx();
+        let store = f.open();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("logs")).unwrap();
+        fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
+        let attempt = store.attempt_dir(&f.a);
+        symlink(outside.path(), &attempt).unwrap();
+        assert!(store.remove(&ResultStore::logs_locator(&f.a)).is_err());
+        fs::remove_file(&attempt).unwrap();
+        fs::create_dir(&attempt).unwrap();
+        symlink(outside.path(), attempt.join("artifacts")).unwrap();
+        assert!(store
+            .remove(&ResultStore::artifact_locator(
+                &f.a,
+                &Digest::of_bytes(b"x")
+            ))
+            .is_err());
+        // A claimed symlink itself may be unlinked, but its destination survives.
+        symlink(outside.path().join("logs"), attempt.join("logs")).unwrap();
+        store.remove(&ResultStore::logs_locator(&f.a)).unwrap();
+        assert_eq!(
+            fs::read(outside.path().join("logs/sentinel")).unwrap(),
+            b"safe"
+        );
+        let old = store.root().with_extension("old");
+        fs::rename(store.root(), &old).unwrap();
+        symlink(outside.path(), store.root()).unwrap();
+        assert!(store.remove(&ResultStore::logs_locator(&f.a)).is_err());
+        fs::remove_file(store.root()).unwrap();
+        fs::create_dir(store.root()).unwrap();
+        assert!(store.remove(&ResultStore::logs_locator(&f.a)).is_err());
+        assert_eq!(
+            fs::read(outside.path().join("logs/sentinel")).unwrap(),
+            b"safe"
+        );
+    }
+
+    #[test]
+    fn deletion_holds_open_ancestor_across_rename_and_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+        use std::sync::mpsc;
+        let f = fx();
+        let store = f.open();
+        store
+            .append_log(&f.a, LogStream::Stdout, 0, b"owned")
+            .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(outside.path().join("logs")).unwrap();
+        fs::write(outside.path().join("logs/sentinel"), b"safe").unwrap();
+        let (entered, got_entered) = mpsc::channel();
+        let (resume, got_resume) = mpsc::channel();
+        *store.remove_pause.lock().unwrap() = Some(AppendPause {
+            entered,
+            resume: got_resume,
+        });
+        let worker = store.clone();
+        let locator = ResultStore::logs_locator(&f.a);
+        let thread = std::thread::spawn(move || worker.remove(&locator));
+        got_entered
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let attempt = store.attempt_dir(&f.a);
+        let moved = store.root().join("moved");
+        fs::rename(&attempt, &moved).unwrap();
+        symlink(outside.path(), &attempt).unwrap();
+        resume.send(()).unwrap();
+        // Cleanup detects the substituted ancestor instead of traversing it.
+        assert!(thread.join().unwrap().is_err());
+        assert!(!moved.join("logs").exists());
+        assert_eq!(
+            fs::read(outside.path().join("logs/sentinel")).unwrap(),
+            b"safe"
         );
     }
 
