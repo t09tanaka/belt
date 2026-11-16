@@ -243,7 +243,7 @@ mod tests {
             d.mode = mode;
             assert!(render(&d).is_err());
         }
-        for path in ["/Users/o'brien", "/a{b}", "/a\\b", "/a\"b", "/a/b "] {
+        for path in ["/home/o'brien", "/a{b}", "/a\\b", "/a\"b", "/a/b "] {
             let mut d = definition();
             d.executable = path.into();
             assert!(render(&d).is_err(), "{path}");
@@ -252,7 +252,7 @@ mod tests {
             assert!(render(&d).is_err(), "{path}");
         }
         let mut d = definition();
-        d.environment.insert("HOME".into(), "/Users/o'brien".into());
+        d.environment.insert("HOME".into(), "/home/o'brien".into());
         assert!(render(&d).is_err());
         for path in ["relative", "/x/../y", "/x/\0"] {
             let mut d = definition();
