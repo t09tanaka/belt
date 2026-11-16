@@ -3675,6 +3675,77 @@ fn replace_private_node_receipt(
     assert_eq!(version.stdout, b"v20.0.0\n");
 }
 
+/// A42, the not-installable half: a pinned version the operator never
+/// authorized leaves no compatible worker (`blocked: no_compatible_worker`,
+/// `capability_mismatch`) before the command or any manager runs, and the base
+/// profile stays as it is.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running() {
+    use remote_task_runner::toolchain::profile::Profile;
+    let (root, spec, input) = control_fixture();
+    let host = root.path().join("private-managers");
+    let stubs = root.path().join("tool-stubs");
+    std::fs::create_dir(&host).unwrap();
+    crate::common::write_executable(&host.join("node"), "#!/bin/sh\nprintf 'v22.0.0\\n'\n");
+    let profile_text = format!("schema_version=1\nactive='base22'\n[profiles.base22]\npath=[{:?},{stubs:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='base22'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
+    let profile_file = spec.worker_state_dir.join("profiles.toml");
+    std::fs::write(&profile_file, &profile_text).unwrap();
+    std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let profile = Profile::load(&spec.worker_state_dir, &spec.env).unwrap();
+    let manager = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$1\" >> '{}/calls'\n",
+        host.display()
+    );
+    crate::common::write_executable(&host.join("manager"), &manager);
+    crate::common::write_executable(&host.join("node-build"), &manager);
+    let registry = format!("schema_version=1\nactive_profile='base22'\nprofile_definition={:?}\n[[recipes]]\ntool='node'\nkind='Nodenv'\nmanager={:?}\ndependencies=[{:?}]\nsearch_path=[{:?}{}]\ninventory=['20.0.0']\n", profile.definition_digest().as_str(), host.join("manager").to_str().unwrap(),host.join("node-build").to_str().unwrap(),host.to_str().unwrap(), crate::common::system_search_path_toml());
+    let registry_file = spec.worker_state_dir.join("toolchains.toml");
+    std::fs::write(&registry_file, registry).unwrap();
+    std::fs::set_permissions(&registry_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let escaped = host.join("consumer-ran");
+    let script = format!("echo unsafe > '{}'", escaped.display());
+    // The pinned Node version is not in the operator inventory.
+    std::fs::write(input.join(".node-version"), "21.0.0\n").unwrap();
+    let context = remote_task_runner::service::context::Context::load(
+        spec.env.clone(),
+        input.clone(),
+        spec.clone(),
+    )
+    .unwrap();
+    let accepted = remote_task_runner::service::submit::command(
+        context,
+        vec!["/bin/sh".into(), "-c".into(), script],
+        None,
+    )
+    .await
+    .unwrap();
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let mut waiting = None;
+    for _ in 0..600 {
+        waiting =
+            owner.events_after(0, 512).unwrap().into_iter().find(|e| {
+                e.kind == "task_waiting" && e.payload["task"] == accepted.task_id.as_str()
+            });
+        if waiting.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let payload = waiting
+        .expect("the task must be reported as blocked")
+        .payload;
+    assert_eq!(payload["blocked_reason"], "no_compatible_worker");
+    assert_eq!(payload["decision"]["winner"], serde_json::Value::Null);
+    assert_eq!(
+        payload["decision"]["excluded"][0]["why"], "capability_mismatch",
+        "{payload}"
+    );
+    assert!(!escaped.exists(), "the command ran anyway");
+    assert!(!host.join("calls").exists(), "a manager ran");
+    assert_eq!(std::fs::read_to_string(profile_file).unwrap(), profile_text);
+    shutdown(&load(&spec)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries() {
     use remote_task_runner::service::{completion::Target, context::Context, control};

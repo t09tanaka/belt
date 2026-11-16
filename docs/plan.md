@@ -512,6 +512,17 @@ S16 の SDK 修正と実行 driver、実測 transfer/collection/setup、S18〜S2
 source/Vault 実削除の具体案は回答待ちで、Docker 利用の回答を削除承認とは扱わない。
 
 
+### S20 受入 A33・A42 の確認（2026-11-17）
+
+main 上で S20 の 4 点（5 adapter の detect/resolve/install/activate、同一 toolchain の setup
+singleflight、凍結契約の submit/admission 接続、`blocked`）が実装済みであることを確かめ、受入テストの
+欠けを補った。A42 の導入できる側は公開 `exec` の nodenv 試験（並行版・retry・復旧）と 5 adapter の
+private process 試験が、A33 の tool 不足側は worker_agent の必須 tool fail-closed 試験が既に担う。
+今回、導入できない側として、operator の inventory にない版を固定した公開 submit が
+`blocked: no_compatible_worker`（`capability_mismatch`）となり、command も manager も起動せず base profile を
+変えない試験を `tests/it/bootstrap.rs` に追加した。実 manager・network の導入、導入中の負荷の forecast、
+installed inventory、diff/sync（S21）は引き続き残件で、S20 全体の完了とは申告しない。
+
 ### 実測モデルと保持ガードの統合（2026-11-15）
 
 PR42は5a990d5のローカル9項目とリモート9項目成功後、2b3078cでマージした。
