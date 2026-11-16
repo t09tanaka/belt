@@ -2,10 +2,14 @@
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-16
+
 - Do not run the same job twice on one machine. The legs of a matrix job that differ only in an OS label (`os: [ubuntu-latest, macos-latest]`) run the same steps on the host, so when one leg is of the host's OS family (`ubuntu-*` and `linux` are Linux, `macos-*` is macOS, `windows-*` is Windows) only that leg runs. The others are listed under `not covered` with the reason (`runs-on ubuntu-latest: Linux is not reproduced on this macOS host; the same steps ran as test (macos-latest)`); they are neither a pass nor a failure, so the run is `incomplete`. Legs are twins only when their other matrix values are equal and nothing the job evaluates reads the differing value. `needs.<id>.result` and the outputs of the matrix job are those of the legs that ran. Self-hosted and unknown labels are run as before.
 - A job whose `runs-on` names another OS and that has no twin runs on the host as before, and says so: the summary line has `[ran on macOS, not Linux (runs-on ubuntu-latest)]` and `result.json` has the optional `os_note` on the job (`JobResult`, `WireJobResult`).
 - Add `--all-os-legs` (or `LOCAL_CI_ALL_OS_LEGS=1`) to run every leg anyway; `RunOptions::all_os_legs`, `exec::Opts::all_os_legs` (library). A cached result of a run without it is not reused by one with it.
 - `Job` (and the wire `JobSpec`) has an optional `runs_on`, left out of the serialized plan when absent; plans made before still verify.
+- Library (breaking for code that builds these structs with a literal or an exhaustive pattern): new fields `Job::runs_on`, `Job::job_exprs` (the job-level expressions that twin detection reads), `JobSpec::runs_on` and `JobSpec::job_exprs` (wire; left out of the serialized plan when empty), `JobResult::os_note`, `WireJobResult::os_note`, `RunOptions::all_os_legs`, `exec::Opts::all_os_legs`; new `cache::Inputs::with_all_os_legs`. New public module `os_legs`.
+- Tests: the Node sharding example installs its dependencies on demand (`npm ci` when `node_modules` is missing or stale) instead of failing, and a listing failure says why.
 
 ## [0.16.0] - 2026-11-16
 
