@@ -101,6 +101,12 @@ pub const SSH_SERVER_ALIVE_COUNT_MAX: u32 = 3;
 /// `ConnectTimeout` and `ServerAlive*` bound a dead host and a dead link (see
 /// the constants).
 pub fn ssh_argv(target: &SshTarget, command: &RemoteCommand) -> Vec<String> {
+    ssh_exec_argv(target, &command.shell_string())
+}
+
+/// [`ssh_argv`] for an arbitrary fixed shell string. The caller builds it only
+/// from constants and [`quote`]d, validated values.
+pub fn ssh_exec_argv(target: &SshTarget, shell_command: &str) -> Vec<String> {
     let mut argv = vec!["ssh".to_string(), "-T".to_string()];
     for option in [
         "BatchMode=yes".to_string(),
@@ -114,7 +120,7 @@ pub fn ssh_argv(target: &SshTarget, command: &RemoteCommand) -> Vec<String> {
     }
     argv.push("--".to_string());
     argv.push(target.as_str().to_string());
-    argv.push(command.shell_string());
+    argv.push(shell_command.to_string());
     argv
 }
 

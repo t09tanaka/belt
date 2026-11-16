@@ -14,6 +14,7 @@
 pub mod agent;
 pub mod blob_policy;
 pub mod blobs;
+pub mod control;
 pub mod host;
 pub mod machine;
 pub mod policy;

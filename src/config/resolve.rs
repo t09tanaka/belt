@@ -96,6 +96,8 @@ pub struct Inputs<'a> {
 pub struct WorkerSpec {
     pub id: String,
     pub ssh: String,
+    /// Absolute path of the binary on the worker host; `None`: look it up on PATH.
+    pub binary: Option<String>,
     /// `None` for an ephemeral worker (it installs no service).
     pub service_mode: Option<ServiceMode>,
     pub labels: Vec<String>,
@@ -527,6 +529,14 @@ fn check_workers(
         if w.ssh.trim().is_empty() {
             problems.push(format!("worker {:?}: ssh is empty", w.id));
         }
+        if let Some(binary) = &w.binary {
+            if !binary.starts_with('/') || binary.chars().any(|c| c.is_control()) {
+                problems.push(format!(
+                    "worker {:?}: binary must be an absolute path without control characters",
+                    w.id
+                ));
+            }
+        }
         if w.labels.iter().any(|l| l.trim().is_empty()) {
             problems.push(format!("worker {:?}: a label is empty", w.id));
         }
@@ -547,6 +557,7 @@ fn check_workers(
         out.push(WorkerSpec {
             id: w.id.clone(),
             ssh: w.ssh.clone(),
+            binary: w.binary.clone(),
             service_mode: if ephemeral {
                 None
             } else {
@@ -962,6 +973,81 @@ mod tests {
         problems.clear();
         check_outputs(&project, &mut problems);
         assert!(!problems.is_empty());
+    }
+
+    fn worker(id: &str) -> crate::config::model::Worker {
+        crate::config::model::Worker {
+            id: id.into(),
+            ssh: "host".into(),
+            binary: None,
+            service_mode: None,
+            labels: vec![],
+            ephemeral: None,
+            priority: None,
+        }
+    }
+
+    /// The problems `check_workers` reports for these workers.
+    fn worker_problems(workers: Vec<crate::config::model::Worker>) -> Vec<String> {
+        let user = UserConfig {
+            workers,
+            ..UserConfig::default()
+        };
+        let layers = Layers {
+            project: Origin::Project(String::new()),
+            legacy: Origin::LegacyLocalCi(String::new()),
+            user: Origin::User(String::new()),
+        };
+        let mut problems = vec![];
+        check_workers(&user, &layers, &mut problems);
+        problems
+    }
+
+    #[test]
+    fn a_plain_worker_is_accepted() {
+        assert!(worker_problems(vec![worker("w-1_a.b")]).is_empty());
+    }
+
+    #[test]
+    fn worker_binary_must_be_an_absolute_path_without_control_characters() {
+        let with_binary = |binary: &str| {
+            let mut w = worker("w");
+            w.binary = Some(binary.into());
+            worker_problems(vec![w])
+        };
+        assert!(with_binary("/usr/local/bin/remote-task-runner").is_empty());
+        assert_eq!(with_binary("remote-task-runner").len(), 1);
+        assert_eq!(with_binary("bin/rtr").len(), 1);
+        assert_eq!(with_binary("/opt/rtr\n").len(), 1);
+        assert_eq!(with_binary("/opt/\u{7}rtr").len(), 1);
+        // Both conditions failing is still one problem for the worker.
+        assert_eq!(with_binary("rel\npath").len(), 1);
+        assert!(with_binary("rel")[0].contains("binary"));
+    }
+
+    #[test]
+    fn worker_id_ssh_labels_and_service_mode_are_checked() {
+        let one = |edit: &dyn Fn(&mut crate::config::model::Worker)| {
+            let mut w = worker("w");
+            edit(&mut w);
+            worker_problems(vec![w])
+        };
+        assert_eq!(one(&|w| w.id = String::new()).len(), 1);
+        assert_eq!(one(&|w| w.id = "a b".into()).len(), 1);
+        assert_eq!(one(&|w| w.ssh = "  ".into()).len(), 1);
+        assert_eq!(one(&|w| w.labels = vec![" ".into()]).len(), 1);
+        assert!(one(&|w| w.labels = vec!["gpu".into()]).is_empty());
+        assert_eq!(
+            one(&|w| {
+                w.ephemeral = Some(true);
+                w.service_mode = Some(ServiceMode::User);
+            })
+            .len(),
+            1
+        );
+        assert!(one(&|w| w.service_mode = Some(ServiceMode::User)).is_empty());
+        assert_eq!(one(&|w| w.priority = Some(MAX_PRIORITY + 1)).len(), 1);
+        assert_eq!(worker_problems(vec![worker("w"), worker("w")]).len(), 1);
     }
 }
 

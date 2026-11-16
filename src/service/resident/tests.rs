@@ -1015,6 +1015,7 @@ async fn captured_submit_losing_admission_race_is_rejected_without_queue_mutatio
         resident.client.clone(),
         Arc::new(Mutex::new(true)),
         stop,
+        mpsc::channel(1).0,
     ));
     write_message(
         &mut client,

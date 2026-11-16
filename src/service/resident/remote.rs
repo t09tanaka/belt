@@ -6,7 +6,8 @@ use crate::protocol::transport::spawn_child_piped_stderr;
 use std::collections::BTreeMap;
 
 /// Re-read only private user registration at startup. Project files cannot
-/// redirect a remote peer, and changes after this snapshot require a restart.
+/// redirect a remote peer. Registrations added later reach a running resident
+/// only through an explicit, authenticated reload request ([`reload`]).
 pub(super) fn snapshot(
     config: &ResolvedConfig,
     env: &BTreeMap<String, String>,
@@ -20,14 +21,30 @@ pub(super) fn snapshot(
     if config.workers.is_empty() {
         return Ok(snapshot);
     }
-    let path = match crate::config::paths::user_config_path(env) {
-        Ok(path) => path,
-        Err(_) if config.workers.is_empty() => return Ok(snapshot),
-        Err(e) => return Err(e.into()),
-    };
+    snapshot.workers = registered(env, local_id)?;
+    Ok(snapshot)
+}
+
+/// The registration as it is now, for a worker added while this resident runs.
+/// Unlike startup, an empty startup set does not skip the read.
+pub(super) fn reload(
+    config: &ResolvedConfig,
+    env: &BTreeMap<String, String>,
+    local_id: &WorkerId,
+) -> anyhow::Result<ResolvedConfig> {
+    let mut fresh = config.clone();
+    fresh.workers = registered(env, local_id)?;
+    Ok(fresh)
+}
+
+fn registered(
+    env: &BTreeMap<String, String>,
+    local_id: &WorkerId,
+) -> anyhow::Result<Vec<WorkerSpec>> {
+    let path = crate::config::paths::user_config_path(env)?;
     let file = match secure_file(&path, false) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(snapshot),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e.into()),
     };
     let mut text = String::new();
@@ -43,6 +60,7 @@ pub(super) fn snapshot(
         legacy: None,
         user: Some(&user),
     })?;
+    let mut workers = Vec::new();
     for worker in registered.workers {
         anyhow::ensure!(
             !worker.ephemeral,
@@ -54,9 +72,18 @@ pub(super) fn snapshot(
             "remote worker identity conflicts with local worker"
         );
         SshTarget::parse(&worker.ssh)?;
-        snapshot.workers.push(worker);
+        bridge_command(&worker)?;
+        workers.push(worker);
     }
-    Ok(snapshot)
+    Ok(workers)
+}
+
+/// The command run on the worker host: the registered absolute binary, or the
+/// bare name for a registration made before the path was recorded.
+fn bridge_command(worker: &WorkerSpec) -> anyhow::Result<RemoteCommand> {
+    Ok(RemoteCommand::worker_stdio(
+        worker.binary.as_deref().unwrap_or("remote-task-runner"),
+    )?)
 }
 
 /// Owned Child plus a captured process-start identity. The fallback cleanup
@@ -111,6 +138,25 @@ impl Drop for OwnedSsh {
     }
 }
 
+/// How a worker is dialed. A resident test replaces it so no real `ssh` runs.
+pub(super) type Dial = Arc<
+    dyn Fn(
+            Arc<ResolvedConfig>,
+            WorkerSpec,
+            Arc<Coordinator>,
+            Arc<CapturedInputs>,
+            watch::Receiver<bool>,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        + Send
+        + Sync,
+>;
+
+pub(super) fn dial() -> Dial {
+    Arc::new(|config, worker, coordinator, captured, stop| {
+        Box::pin(run(config, worker, coordinator, captured, stop))
+    })
+}
+
 pub(super) async fn run(
     config: Arc<ResolvedConfig>,
     worker: WorkerSpec,
@@ -121,7 +167,7 @@ pub(super) async fn run(
     // Registration was validated before startup. Neither identity nor destination
     // is learned from hello. There is no implicit enrollment fallback.
     let target = SshTarget::parse(&worker.ssh).expect("validated registration");
-    let command = RemoteCommand::worker_stdio("remote-task-runner").expect("fixed command");
+    let command = bridge_command(&worker).expect("validated registration");
     let argv = ssh_argv(&target, &command);
     run_with_argv(config, worker, argv, coordinator, captured, stop).await;
 }

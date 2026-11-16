@@ -1045,3 +1045,26 @@ restart/in-place/symlink/通常submitとSource captureのintegration44件成功�
 全target/feature strict clippy、fmt/diff check成功。実Rust1.100、専用target、承認済み
 TTC外側→portool内側を使用。full local-ci・MSRV1.89・remoteは親の次gateとし、今回の
 focused成功へ読み替えない。実user stateのGCやnative serviceへの操作はない。
+
+### S22 workers add --install と lifecycle の接続（2026-11-17）
+
+`workers add [--install]`・`start`・`stop [--cancel-running]`・`drain`・`resume` を CLI へ接続した（`Envelope::not_implemented` に落ちなくなった）。実装の分担は次のとおり。
+
+- worker 側の運用意図は state ディレクトリの private な `control.json`（`drain`・`cancel_running`）に永続化する。agent は `inspect` の `draining` にこれを反映し（従来は常に false）、tick ごとに `cancel_running` なら live attempt を既存の cancel 経路（永続化してから supervisor が動く）で止める。読めない marker は drain として扱い cancel はしない。wire の操作は増やしていない。
+- worker host の helper（hidden の `worker-service <install|start|stop|drain|resume|status>`、`src/service/worker_service.rs`）は Launcher を総称にし、版別 directory への binary 配置（sha256 検証・既存と異なれば拒否）、鍵・`WorkerSpec` の noclobber 公開、receipt 付き journal、worker 前景 role（`worker --input`）の plist、起動、agent socket の ready 確認を再開可能に行う。stop は binding で identity を確かめ、drain の後に live attempt が 0 になるまで待ち（`--cancel-running` なら cancel を要求して待つ）、所有確認つきの bootout を行う。待ちが時間切れなら drain のまま残し、再実行で待ちを続ける。すでに unload 済みなら launchctl を触らず報告し、launchd の答えが特定できなければ何も変えず失敗にする。
+- 親側（`src/service/workers.rs`）は ssh の固定 argv（`ssh_exec_argv`）で、probe（Darwin かつ同 arch）→ binary の staging（stdin）→ install（鍵は stdin のみ）を行い、成功後にだけ user config へ `[[workers]]` を追記する（失敗した install は何も登録しない。再実行は冪等）。到達不能・無言・読めない答えは `COMMUNICATION_UNKNOWN`、別 worker の答えは拒否し、停止済みとは報告しない。
+- 試験は偽の Launcher・偽の ssh・一時 HOME のみ。1 台上の install → start → stop は `src/service/workers/tests.rs`、agent の drain と cancel は `tests/it/worker_agent.rs`、実 binary と偽 ssh の CLI 契約は `tests/it/workers_lifecycle.rs`。本物の LaunchAgent・`~/.ssh`・sudo は使っていない。
+
+レビュー指摘（PR #50）への対応（2026-11-17）:
+
+- bridge の起動: install は worker の設定 dir に版に依らない `bin/current` symlink を作り、その絶対パス（`<config>/bin/current/remote-task-runner`）を応答で返す。親は `[[workers]]` の `binary` に保存し、resident の bridge と lifecycle の helper はそれを使う（`binary` が無い旧登録は従来どおり PATH の名前）。`workers add --install` の再実行で旧登録にも追記する。install の最後に、resident と同じ経路（絶対パスの `worker --stdio` を ssh で起動し hello）を通し、worker_id と cluster の一致を確かめてから登録する。
+- 動いている resident への反映: resident の認証済み control に `ReloadWorkers` を足し、`workers add` の最後に要求する。resident が無ければ何もせず、失敗は結果の `resident` に「再起動まで未接続」として出す。
+- staging と probe は SHA-256 を照合し、部分転送を公開しない。再実行は worker.json の揮発する env を比較から外し、receipt の無い未完了 install は置き換えを許す。local worker 名の衝突は install 前に拒否する。lifecycle は応答の cluster を照合し、start・stop・drain・resume は実状態に合わせて報告する（loaded でなければ start は失敗、停止を確認できなければ stop は失敗）。start は cancel 指示を起動前に消す。状態 dir を読めない場合は 0 件と見なさずエラーにする。
+- agent は drain 中の新規受理を `Overloaded` で拒否する（再送への応答は維持）。stop は 0 件を 2 回続けて確認してから bootout する。
+- 親の OS 判定は注入でき、試験は全 OS で同じに走る。
+
+S22 の残り（必須。この変更で S22 は完了しない）:
+1. 本物の launchd・実 SSH・実機での受入（A34/A35 の native 検証、S26）は未実施。偽の Launcher と偽の ssh は実挙動を確かめない。
+2. drain の確認と受理の間に、非常に短い競合が残る（受理が drain の確認を通った直後に stop が 0 件を 2 回数える）。実機での stop と受理の同時試験は S26 で行う。
+3. `system-user`（LaunchDaemon の `UserName`）の導入、Linux、upgrade・rollback・doctor・`workers forget`、fish / csh のログインシェル対応は未実装（S23・S24）。
+4. 実 SQLite の live attempt を持つ worker に対する stop の待ち・cancel の end-to-end（agent の cancel は統合試験済みだが、helper の待ちは注入した計数での単体試験）。

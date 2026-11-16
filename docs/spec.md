@@ -158,6 +158,7 @@ toolchain_match = "exact"
 id = "mini-a"
 ssh = "ci@mini-a.local"
 service_mode = "user"
+binary = "/srv/ci/.config/remote-task-runner/bin/current/remote-task-runner"  # `workers add --install` が書く、worker上の絶対パス
 priority = 10            # 最優先のworker
 labels = ["macos", "arm64", "node"]
 
