@@ -771,7 +771,7 @@ struct TableRow {
     project: String,
     job: String,
     flags: Vec<Flag>,
-    /// Share of the bar filled; `None` for a waiting row (no bar).
+    /// Share of the bar filled (0 for a waiting row).
     frac: Option<f64>,
     right: String,
     /// `right` without the reason for waiting.
@@ -800,7 +800,7 @@ fn table_rows(v: &View) -> Vec<TableRow> {
         project: w.project.clone(),
         job: w.job.clone(),
         flags: if w.front { vec![FRONT] } else { vec![] },
-        frac: None,
+        frac: Some(0.0),
         right: right_text_wait(w),
         right_short: starts_text(w),
         wt: w.wt,
@@ -942,6 +942,12 @@ fn bar_line(v: &View, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
+/// A column: `s` cut to `w` characters, then padded to `w`, plus one space
+/// that separates it from the next column even when `s` fills the width.
+fn col(s: &str, w: usize) -> String {
+    format!("{} ", fit(s, w))
+}
+
 /// Pad or cut `s` to exactly `w` characters.
 fn fit(s: &str, w: usize) -> String {
     let t = truncate(s, w);
@@ -997,10 +1003,10 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
     let mut lines = Vec::new();
     // Header: column names, then the ruler.
     let mut head = vec![Span::raw(" ".repeat(prefix))];
-    head.push(Span::styled(fit("project", cols.project + 1), dim));
-    head.push(Span::styled(fit("worktree", cols.worktree + 1), dim));
-    head.push(Span::styled(fit("job", cols.job + 1), dim));
-    head.push(Span::styled(fit("progress", cols.bar + 1), dim));
+    head.push(Span::styled(col("project", cols.project), dim));
+    head.push(Span::styled(col("worktree", cols.worktree), dim));
+    head.push(Span::styled(col("job", cols.job), dim));
+    head.push(Span::styled(col("progress", cols.bar), dim));
     lines.push(Line::from(head));
 
     for r in &rows {
@@ -1015,10 +1021,10 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
             Span::styled("▌", Style::new().fg(wt_color(v, r.wt))),
             Span::styled(format!("{:>num_w$} ", format!("#{}", r.num)), base),
         ];
-        spans.push(Span::styled(fit(&r.project, cols.project + 1), base));
+        spans.push(Span::styled(col(&r.project, cols.project), base));
         let cell = worktree_text(wt, cols.worktree);
         spans.push(Span::styled(
-            fit(&cell, cols.worktree + 1),
+            col(&cell, cols.worktree),
             base.fg(wt_color(v, r.wt)),
         ));
         let flag_text = |f: &Flag| if cols.short_flags { f.1 } else { f.0 };
@@ -1656,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn a_waiting_row_has_no_bar_and_says_when_it_starts() {
+    fn a_waiting_row_has_an_empty_bar_and_says_when_it_starts() {
         let w = wait_row(Some(47.0), false);
         assert_eq!(right_text_wait(&w), "starts ~0:47 (needs 6, 0 free)");
         assert_eq!(starts_text(&w), "starts ~0:47");
@@ -1666,15 +1672,15 @@ mod tests {
         assert_eq!(starts_text(&w), "starts ?");
         let w = wait_row(Some(0.0), false);
         assert_eq!(starts_text(&w), "starts now");
-        // A waiting row has no bar at all.
+        // A waiting row has an empty bar (0%).
         let v = View {
             waiting: vec![wait_row(Some(47.0), false), wait_row(None, true)],
             ..sample_view(Utc::now())
         };
         let rows = table_rows(&v);
         for r in rows.iter().rev().take(2) {
-            assert_eq!(r.frac, None);
-            assert_eq!(bar_string(r.frac, 8), "        ");
+            assert_eq!(r.frac, Some(0.0));
+            assert_eq!(bar_string(r.frac, 4), "░░░░");
         }
     }
 
@@ -1831,11 +1837,11 @@ mod tests {
         assert!(cells[..want.full].iter().all(|c| c.bg == LONE_FILL));
         // #3 has no learned time: the track only.
         assert!(bar_row(&v, 120, 2).iter().all(|c| c.bg == TRACK));
-        // Waiting rows draw no bar and no track.
+        // Waiting rows: the track only (0%), as wide as the others.
         for i in [3, 4] {
-            assert!(bar_row(&v, 120, i)
-                .iter()
-                .all(|c| c.bg == Color::Reset && c.symbol() == " "));
+            let cells = bar_row(&v, 120, i);
+            assert_eq!(cells.len(), bar_row(&v, 120, 0).len());
+            assert!(cells.iter().all(|c| c.bg == TRACK && c.symbol() == " "));
         }
     }
 
@@ -1896,6 +1902,41 @@ mod tests {
         assert!(
             !no_color(None, Some("xterm")) && !no_color(Some(""), None) && !no_color(None, None)
         );
+    }
+
+    #[test]
+    fn columns_are_always_separated_even_when_a_name_fills_its_column() {
+        let v = sample_view(Utc::now());
+        let rows = table_rows(&v);
+        let longest = |f: &dyn Fn(&TableRow) -> usize| rows.iter().map(f).max().unwrap();
+        let (mut full_project, mut full_wt, mut full_job) = (false, false, false);
+        for w in 60u16..180 {
+            let c = layout(w as usize - 2, table_wants(&v, &rows, 4));
+            full_project |= c.project == longest(&|r| r.project.chars().count());
+            full_wt |= c.worktree == "main (current)".len();
+            full_job |= c.job == table_wants(&v, &rows, 4).job.min(JOB_SQUEEZED);
+            let t = render(&v, w, 16);
+            let buf = t.backend().buffer().clone();
+            let x_project = 1 + 4;
+            let x_wt = x_project + c.project + 1;
+            let x_job = x_wt + c.worktree + 1;
+            let x_bar = x_job + c.job + 1;
+            for i in 0..rows.len() as u16 {
+                let y = row_y(&buf, w, 16, "worktree") + 1 + i;
+                for x in [x_wt, x_job, x_bar] {
+                    // The cell before each column's start is a space.
+                    assert_eq!(buf[(x as u16 - 1, y)].symbol(), " ", "{w} row {i} x {x}");
+                }
+            }
+        }
+        // The cases above really happened: a name exactly as wide as its
+        // column, for each of the three.
+        assert!(
+            full_project && full_wt && full_job,
+            "{full_project} {full_wt} {full_job}"
+        );
+        assert_eq!(col("remote-task-runner", 18), "remote-task-runner ");
+        assert_eq!(col("remote-task-runner", 17), "remote-task-runn… ");
     }
 
     fn render(v: &View, w: u16, h: u16) -> Terminal<TestBackend> {

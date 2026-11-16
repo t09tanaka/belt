@@ -228,13 +228,13 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
   the three names are cut further (8 characters at the least; the worktree
   column keeps room for 4 of the branch and ` (current)`). No column is
   dropped; the bar and the text after it always stay.
-  - `progress`: one bar per running row, all the same width, which takes
+  - `progress`: one bar per row, all the same width, which takes
     whatever the other columns leave. The track is a pale gray background;
     the time run over the expected wall time fills it from the left with the
     worktree's color (a darker gray for a lone worktree), in steps of 1/8 of a
     cell; past the expected time it stays full. A run with no learned wall
-    time has the track only. A waiting row has no bar: its place in the
-    queue is its number. With `NO_COLOR` set (or `TERM=dumb`) the bar is
+    time has the track only. A waiting row shows the empty track (0%); its place in
+    the queue is its number. With `NO_COLOR` set (or `TERM=dumb`) the bar is
     drawn with `█` and `░` instead.
   - After the bar: `62%  left 0:47` / `over 0:20` / `ran 0:12` (no learned
     time) for a running entry; `starts ~0:47` (`starts ?` with no estimate,
