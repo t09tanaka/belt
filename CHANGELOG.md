@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-11-16
+
 ### Changed
 
 - **`top` shows one table with a progress bar per row, colored by worktree.**
