@@ -351,11 +351,6 @@ impl Workspaces {
             // of the clone's main checkout, which must stay at `commit` until
             // that is done.
             let _held = self.hold_clone_at(clone, commit)?;
-            // `git worktree add` is not safe beside another in one
-            // repository (it reads `.git/worktrees/*` while another add has
-            // not written its `commondir` yet), so the registrations are
-            // taken one at a time. Always after the main lock, never before.
-            let _add = lock_add(clone)?;
             self.fw.add(clone, dest, &branch, commit)
         };
         let made = added
@@ -647,8 +642,6 @@ impl Workspaces {
                 if self.owned_worktree(clone, &dir) && self.clean_worktree(&dir) {
                     // shared: a prune of the clone's worktree list waits for us
                     let _shared = lock_shared(clone)?;
-                    // removing changes `.git/worktrees` as an add reads it
-                    let _add = lock_add(clone)?;
                     self.fw
                         .remove(clone, &dir)
                         .map_err(|f| plan::fw_error("remove", &f))?;
@@ -844,16 +837,6 @@ fn lock_shared(clone: &Path) -> Result<File, ApiError> {
 /// The clone's main lock, exclusive (writer priority: see [`lock_shared`]).
 fn lock_exclusive(clone: &Path) -> Result<File, ApiError> {
     lock_main(clone, File::lock)
-}
-
-/// The clone's worktree-registration lock, exclusive: one `git worktree
-/// add` or `remove` at a time in the clone. Taken only while holding the main
-/// lock (see [`lock_shared`]), so the order is always main, then this.
-fn lock_add(clone: &Path) -> Result<File, ApiError> {
-    let add = open_lock(&clone.join(".git").join("rtr-workspace.add.lock"))?;
-    add.lock()
-        .map_err(|e| io_err("cannot lock the clone's worktree list", e))?;
-    Ok(add)
 }
 
 fn lock_main(clone: &Path, take: fn(&File) -> std::io::Result<()>) -> Result<File, ApiError> {
