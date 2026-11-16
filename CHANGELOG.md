@@ -11,9 +11,9 @@ the minor version).
 
 - **`top` shows one table with a progress bar per row, colored by worktree.**
   The running and waiting tables are now one list, numbered from 1 (running
-  first, soonest to finish first, then the queue), with a `progress` bar for every row
-  (time run over the expected time; empty while waiting) and `need` and `use`
-  columns for the cores held and the cores really used. The colors no longer mark entries; they mark the git worktree
+  first, soonest to finish first, then the queue), with a `progress` bar for every running row
+  (the time run over the expected time fills a gray track in the worktree's
+  color; none for a waiting row; `█`/`░` with `NO_COLOR`). The colors no longer mark entries; they mark the git worktree
   a command was queued from, so two parallel runs of one repository from
   different worktrees can be told apart. The row of your own worktree is
   bold, with `(current)` after its branch in a `worktree` column. Held

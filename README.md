@@ -206,14 +206,11 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
     queued by an older version (which recorded none), show `-` and a gray
     band;
   - `job`: the `--label`, else the script's file name for `bash ... step.sh`
-    commands, else the command line; with `[backfill]` or `[front]` after
-    it (`b`, `f` on a narrow terminal);
-  - `need`: the cores reserved (the weight), running or waiting;
-  - `use`: the cores a running command really uses, to one decimal; `-`
-    for a waiting row or one not measured yet. It is dim when far below
-    `need` (idle: running 5:00+ and using under 0.2 cores). Without the use
-    column, `idle` (`z`) is written after the job instead;
-  - `progress`: a bar for how far each row is, and the text after it.
+    commands, else the command line; with `idle`, `[backfill]` or `[front]`
+    after it (`z`, `b`, `f` on a narrow terminal); `idle` marks a run
+    (5:00+) using under 0.2 cores. The cores of each row are in the box on
+    top, not in the table;
+  - `progress`: a bar for how far each running row is, and the text after it.
 
   `exec` records the worktree (`git rev-parse --show-toplevel`) and branch
   it was called from, so parallel runs of one repository from different
@@ -225,27 +222,25 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
   On a terminal 80 columns wide or more the bar is never narrower than 20
   characters (10 on a narrower one). To keep it, a narrow terminal gives up,
   in this order: the reason for waiting after the bar (`starts ~1:35?`
-  stays), then the worktree and job columns are squeezed to 20 and 24
-  characters (the middle of the name goes), the `use` column, the words
-  `idle` and `[backfill]` (they shrink to `z` and `b`; `[front]` to `f`),
-  the `project` column, the `need` column, and only then the names are cut
-  further (8 characters at the least; the worktree column keeps room for 4
-  of the branch and ` (current)`). The bar and the text after
-  it always stay. With the project column gone, a `-` in the worktree
-  column is replaced by the project's name, in gray, so the rows can still
-  be told apart.
-  - `progress`: one bar per row, all the same width, which takes whatever
-    the other columns leave. A running row fills `█` (in its worktree's
-    color) for the time run over its expected wall time and leaves `░` for
-    the rest; past the expected time the bar stays full. A run with no
-    learned wall time has no bar. A waiting row's bar is always empty
-    (`░`).
+  stays), then the project, worktree and job columns are squeezed to 20, 20
+  and 24 characters (the middle of the name goes), the words `idle` and
+  `[backfill]` (they shrink to `z` and `b`; `[front]` to `f`), and only then
+  the three names are cut further (8 characters at the least; the worktree
+  column keeps room for 4 of the branch and ` (current)`). No column is
+  dropped; the bar and the text after it always stay.
+  - `progress`: one bar per running row, all the same width, which takes
+    whatever the other columns leave. The track is a pale gray background;
+    the time run over the expected wall time fills it from the left with the
+    worktree's color (a darker gray for a lone worktree), in steps of 1/8 of a
+    cell; past the expected time it stays full. A run with no learned wall
+    time has the track only. A waiting row has no bar: its place in the
+    queue is its number. With `NO_COLOR` set (or `TERM=dumb`) the bar is
+    drawn with `█` and `░` instead.
   - After the bar: `62%  left 0:47` / `over 0:20` / `ran 0:12` (no learned
-    time) for a running entry; `waited 0:30 · starts ~0:47` (`starts ?`
-    with no estimate, `~0:47?` when it is rough because an entry it
-    depends on has no history) and why it waits (`needs 6, 3 free`,
-    `behind 2`, ...; left out when there is no room) for a waiting one.
-    `[backfill]` marks the same entries as in `status`.
+    time) for a running entry; `starts ~0:47` (`starts ?` with no estimate,
+    `~0:47?` when it is rough because an entry it depends on has no
+    history) and why it waits (`needs 6, 3 free`, `behind 2`, ...; left out
+    when there is no room) for a waiting one.
   - When something runs but nobody waits, a dim line under the table says
     what would start right away (`No one waiting · a command needing ≤8
     cores starts right away`, or that the next command waits for cores when

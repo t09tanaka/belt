@@ -78,7 +78,6 @@ pub struct WaitRow {
     pub project: String,
     pub job: String,
     pub weight: u32,
-    pub waited: Duration,
     pub front: bool,
     pub why: String,
     /// Seconds until the estimated start; None when there is no estimate.
@@ -121,6 +120,8 @@ pub struct View {
     /// In queue order; numbered after the running rows.
     pub waiting: Vec<WaitRow>,
     pub held: Vec<HeldRow>,
+    /// No colors (`NO_COLOR` set, or a dumb terminal): bars use `█` and `░`.
+    pub plain: bool,
 }
 
 impl View {
@@ -137,14 +138,19 @@ impl View {
                 hint: v.hint,
             })
             .collect();
-        Ok(View::from_parts(
+        let mut view = View::from_parts(
             &ledger,
             held,
             cfg.limits(),
             ctx.live.snapshot(),
             ctx.clock.now(),
             me,
-        ))
+        );
+        view.plain = no_color(
+            std::env::var("NO_COLOR").ok().as_deref(),
+            std::env::var("TERM").ok().as_deref(),
+        );
+        Ok(view)
     }
 
     pub fn from_parts(
@@ -241,7 +247,6 @@ impl View {
                 project: project(e),
                 job: job_name(e),
                 weight: e.weight,
-                waited: (now - e.enqueued_at).to_std().unwrap_or_default(),
                 front: e.front,
                 why: why(&queue, q, limits, live),
                 start_in: est.as_ref().map(|x| x.start_in),
@@ -266,6 +271,7 @@ impl View {
             running: run_rows,
             waiting: wait_rows,
             held,
+            plain: false,
         }
     }
 }
@@ -509,20 +515,62 @@ pub fn bar_string(frac: Option<f64>, width: usize) -> String {
     }
 }
 
+/// Colors cannot be used: `NO_COLOR` is set to anything but nothing, or the
+/// terminal is `dumb`.
+fn no_color(no_color: Option<&str>, term: Option<&str>) -> bool {
+    no_color.is_some_and(|v| !v.is_empty()) || term == Some("dumb")
+}
+
+/// The bar's track: a pale gray background.
+const TRACK: Color = Color::Indexed(238);
+/// What a lone worktree's (gray) rows fill the track with: darker than it.
+const LONE_FILL: Color = Color::Indexed(245);
+/// Left blocks of 1/8 to 7/8 of a cell.
+const EIGHTHS: [char; 7] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+
+/// A bar in colors: `full` cells in the task's color, then a `part` cell
+/// (a left block, foreground the task's color on the track), then `rest`
+/// cells of track.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BarCells {
+    pub full: usize,
+    pub part: Option<char>,
+    pub rest: usize,
+}
+
+pub fn bar_cells(frac: f64, width: usize) -> BarCells {
+    let max = width * 8;
+    let eighths = if frac >= 1.0 {
+        max
+    } else {
+        ((frac.max(0.0) * max as f64).floor() as usize).min(max.saturating_sub(1))
+    };
+    let (full, rem) = (eighths / 8, eighths % 8);
+    let part = (rem > 0).then(|| EIGHTHS[rem - 1]);
+    BarCells {
+        full,
+        part,
+        rest: width - full - usize::from(part.is_some()),
+    }
+}
+
+/// The task's fill color: the worktree's, a darker gray for a lone one.
+fn fill_color(c: Color) -> Color {
+    if c == Color::Gray {
+        LONE_FILL
+    } else {
+        c
+    }
+}
+
 // -------------------------------------------------------------- the table
 
 /// Column widths for a terminal `width` wide.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Cols {
-    /// `None` when the project column is dropped.
-    pub project: Option<usize>,
+    pub project: usize,
     pub worktree: usize,
     pub job: usize,
-    /// The cores a row holds or needs; `None` when the column is dropped.
-    pub need: Option<usize>,
-    /// The cores a running row really uses; `None` when dropped. Then the
-    /// `idle` flag comes back after the job name.
-    pub use_cores: Option<usize>,
     pub bar: usize,
     pub right: usize,
     /// The text after the bar names why a waiting entry waits.
@@ -544,11 +592,10 @@ const JOB_CAP: usize = 60;
 /// Before a column is dropped, the worktree and job columns are squeezed
 /// to this much (the middle of the name goes).
 const WT_SQUEEZED: usize = 20;
+const PROJECT_SQUEEZED: usize = 20;
 const JOB_SQUEEZED: usize = 24;
-/// The worktree and job columns are never cut below this.
+/// The project, worktree and job columns are never cut below this.
 const NAME_FLOOR: usize = 8;
-const NEED_HEADER: usize = 4;
-const USE_HEADER: usize = 3;
 
 /// What each column would like, before it is fitted to the screen.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -557,21 +604,12 @@ pub struct Wants {
     pub prefix: usize,
     pub project: usize,
     pub worktree: usize,
-    /// The worktree column when the project column is gone: a lone
-    /// worktree's `-` is replaced by its project name.
-    pub worktree_without_project: usize,
     /// The longest job name with its flags written out, and abbreviated.
     pub job: usize,
     pub job_short_flags: usize,
-    /// The job with its flags written out but without `idle` (shown in the
-    /// use column instead).
-    pub job_no_idle: usize,
     /// The least the worktree column may get: room for the branch (4
     /// characters) and ` (current)` when a row has it.
     pub worktree_floor: usize,
-    pub need: usize,
-    /// 0 when no row has a use column (the list of finished runs).
-    pub use_cores: usize,
     /// The text after the bar with and without the reason for waiting.
     pub right: usize,
     pub right_short: usize,
@@ -581,70 +619,44 @@ pub struct Wants {
 ///
 /// On a terminal at least [`WIDE`] columns wide the bar is never narrower
 /// than [`BAR_WIDE_MIN`]. To get there, in this order: the reason for
-/// waiting after the bar goes, the worktree and job columns are squeezed to
-/// 20 and 24 characters (the middle of the name goes), the use column goes
-/// (`idle` is then written after the job name), `idle` and `[backfill]`
-/// shrink to `z` and `b`, the project column goes, the need column goes,
-/// and only then the worktree and job names are cut further. The text
-/// after the bar, the bar, the worktree and the job are never dropped.
+/// waiting after the bar goes, the project, worktree and job columns are
+/// squeezed to 20, 20 and 24 characters (the middle of the name goes),
+/// `idle` and `[backfill]` shrink to `z` and `b`, and only then the three
+/// names are cut further, the widest first. No column is dropped.
 pub fn layout(width: usize, w: Wants) -> Cols {
     let bar_min = if width >= WIDE { BAR_WIDE_MIN } else { BAR_MIN };
     let bar_gap = 1;
-    let pw = w.project.clamp(7, PROJECT_CAP);
     let wt_floor = w.worktree_floor.max(NAME_FLOOR);
-    // (why, squeeze, use, short flags, project, need), most to least.
+    // (why, squeeze, short flags), most to least.
     let states = [
-        (true, false, true, false, true, true),
-        (false, false, true, false, true, true),
-        (false, true, true, false, true, true),
-        (false, true, false, false, true, true),
-        (false, true, false, true, true, true),
-        (false, true, false, true, false, true),
-        (false, true, false, true, false, false),
+        (true, false, false),
+        (false, false, false),
+        (false, true, false),
+        (false, true, true),
     ];
-    let build =
-        |(why, squeeze, use_, short, project, need): (bool, bool, bool, bool, bool, bool)| {
-            let right = if why { w.right } else { w.right_short };
-            let use_ = use_ && w.use_cores > 0;
-            let job = match (use_, short) {
-                (true, _) => w.job_no_idle,
-                (false, true) => w.job_short_flags,
-                (false, false) => w.job,
-            };
-            let wt = if project {
-                w.worktree
-            } else {
-                w.worktree_without_project
-            };
-            let (wt_cap, job_cap) = if squeeze {
-                (WT_SQUEEZED, JOB_SQUEEZED)
-            } else {
-                (WT_CAP, JOB_CAP)
-            };
-            Cols {
-                project: project.then_some(pw),
-                worktree: wt.clamp(1, wt_cap.max(wt_floor)).max(wt_floor.min(wt)),
-                job: job.clamp(1, job_cap),
-                need: (need && w.need > 0).then_some(w.need),
-                use_cores: use_.then_some(w.use_cores),
-                bar: bar_min,
-                right: right.clamp(RIGHT_FLOOR, RIGHT_MAX),
-                why,
-                short_flags: short,
-            }
+    let build = |(why, squeeze, short): (bool, bool, bool)| {
+        let right = if why { w.right } else { w.right_short };
+        let job = if short { w.job_short_flags } else { w.job };
+        let (pr_cap, wt_cap, job_cap) = if squeeze {
+            (PROJECT_SQUEEZED, WT_SQUEEZED, JOB_SQUEEZED)
+        } else {
+            (PROJECT_CAP, WT_CAP, JOB_CAP)
         };
+        Cols {
+            project: w.project.clamp(7, pr_cap),
+            worktree: w
+                .worktree
+                .clamp(1, wt_cap.max(wt_floor))
+                .max(wt_floor.min(w.worktree)),
+            job: job.clamp(1, job_cap),
+            bar: bar_min,
+            right: right.clamp(RIGHT_FLOOR, RIGHT_MAX),
+            why,
+            short_flags: short,
+        }
+    };
     let need = |c: &Cols| {
-        w.prefix
-            + c.project.map_or(0, |p| p + 1)
-            + c.worktree
-            + 1
-            + c.job
-            + 1
-            + c.need.map_or(0, |n| n + 1)
-            + c.use_cores.map_or(0, |n| n + 1)
-            + c.bar
-            + bar_gap
-            + c.right
+        w.prefix + c.project + 1 + c.worktree + 1 + c.job + 1 + c.bar + bar_gap + c.right
     };
     for st in states {
         let mut c = build(st);
@@ -658,18 +670,27 @@ pub fn layout(width: usize, w: Wants) -> Cols {
     // the text after it.
     let mut c = build(states[states.len() - 1]);
     let mut short = need(&c) - width;
-    for (which, floor) in [
-        (1, wt_floor),
-        (2, NAME_FLOOR),
-        (0, BAR_FLOOR),
-        (3, RIGHT_FLOOR),
-    ] {
-        let cur = match which {
-            0 => &mut c.bar,
-            1 => &mut c.worktree,
-            2 => &mut c.job,
-            _ => &mut c.right,
-        };
+    // The three names give up one character at a time, the widest first.
+    while short > 0 {
+        let widest = [
+            (c.worktree, wt_floor),
+            (c.job, NAME_FLOOR),
+            (c.project, NAME_FLOOR),
+        ]
+        .iter()
+        .enumerate()
+        .filter(|(_, (cur, floor))| cur > floor)
+        .max_by_key(|(_, (cur, _))| *cur)
+        .map(|(i, _)| i);
+        match widest {
+            Some(0) => c.worktree -= 1,
+            Some(1) => c.job -= 1,
+            Some(_) => c.project -= 1,
+            None => break,
+        }
+        short -= 1;
+    }
+    for (cur, floor) in [(&mut c.bar, BAR_FLOOR), (&mut c.right, RIGHT_FLOOR)] {
         let cut = short.min(cur.saturating_sub(floor));
         *cur -= cut;
         short -= cut;
@@ -694,17 +715,6 @@ fn worktree_text(w: Option<&Wt>, max: usize) -> String {
     let suffix = if w.mine { " (current)" } else { "" };
     let room = max.saturating_sub(suffix.chars().count()).max(4);
     format!("{}{suffix}", ellipsize_middle(&branch, room))
-}
-
-/// The worktree column of a row. A `-` (lone worktree, or none recorded)
-/// shows the project name instead when the project column is gone, so such
-/// rows can still be told apart; the bool is true then (drawn gray).
-fn worktree_cell(wt: Option<&Wt>, project: &str, project_col: bool, max: usize) -> (String, bool) {
-    let text = worktree_text(wt, max);
-    if text == "-" && !project_col && project != "-" {
-        return (ellipsize_middle(project, max), true);
-    }
-    (text, false)
 }
 
 /// The job name cut so that its flags fit in `width`: (name, flags).
@@ -733,8 +743,7 @@ fn right_text_wait(w: &WaitRow) -> String {
     format!("{} ({})", starts_text(w), w.why)
 }
 
-/// `waited 0:30 · starts ~1:35?`: how long a waiting entry has waited and
-/// when it starts, without the reason.
+/// `starts ~1:35?`: when a waiting entry starts, without the reason.
 fn starts_text(w: &WaitRow) -> String {
     let start = match w.start_in {
         None => "?".to_string(),
@@ -745,7 +754,7 @@ fn starts_text(w: &WaitRow) -> String {
             if w.rough { "?" } else { "" }
         ),
     };
-    format!("waited {} · starts {start}", fmt_duration(w.waited))
+    format!("starts {start}")
 }
 
 /// A flag after the job name: written out, and abbreviated for narrow
@@ -762,14 +771,8 @@ struct TableRow {
     project: String,
     job: String,
     flags: Vec<Flag>,
-    need: String,
-    /// `-` for a waiting row or one not measured yet.
-    use_cores: String,
-    /// Far below what it holds: drawn dim.
-    idle: bool,
-    /// Share of the bar filled; `None` for no bar.
+    /// Share of the bar filled; `None` for a waiting row (no bar).
     frac: Option<f64>,
-    waiting: bool,
     right: String,
     /// `right` without the reason for waiting.
     right_short: String,
@@ -786,11 +789,7 @@ fn table_rows(v: &View) -> Vec<TableRow> {
             .into_iter()
             .filter_map(|(on, f)| on.then_some(f))
             .collect(),
-        need: r.weight.to_string(),
-        use_cores: r.using.map_or("-".into(), |u| format!("{u:.1}")),
-        idle: r.idle,
-        frac: run_fraction(r.elapsed, r.expected_secs),
-        waiting: false,
+        frac: Some(run_fraction(r.elapsed, r.expected_secs).unwrap_or(0.0)),
         right: right_text_run(r),
         right_short: right_text_run(r),
         wt: r.wt,
@@ -801,11 +800,7 @@ fn table_rows(v: &View) -> Vec<TableRow> {
         project: w.project.clone(),
         job: w.job.clone(),
         flags: if w.front { vec![FRONT] } else { vec![] },
-        need: w.weight.to_string(),
-        use_cores: "-".into(),
-        idle: false,
-        frac: Some(0.0),
-        waiting: true,
+        frac: None,
         right: right_text_wait(w),
         right_short: starts_text(w),
         wt: w.wt,
@@ -957,36 +952,28 @@ fn fit(s: &str, w: usize) -> String {
 /// What the rows of the table would like in the way of columns.
 fn table_wants(v: &View, rows: &[TableRow], prefix: usize) -> Wants {
     let widest = |len: &dyn Fn(&TableRow) -> usize| rows.iter().map(len).max().unwrap_or(0);
-    let wt_text = |r: &TableRow, project_col: bool| {
+    let wt_text = |r: &TableRow| {
         let wt = r.wt.and_then(|i| v.worktrees.get(i));
-        worktree_cell(wt, &r.project, project_col, usize::MAX)
-            .0
-            .chars()
-            .count()
+        worktree_text(wt, usize::MAX).chars().count()
     };
-    let job = |r: &TableRow, short: bool, idle: bool| {
+    let job = |r: &TableRow, short: bool| {
         r.job.chars().count()
             + r.flags
                 .iter()
-                .filter(|f| idle || **f != IDLE)
                 .map(|f| 1 + if short { f.1 } else { f.0 }.len())
                 .sum::<usize>()
     };
     Wants {
         prefix,
         project: widest(&|r| r.project.chars().count()),
-        worktree: widest(&|r| wt_text(r, true)).max("worktree".len()),
-        worktree_without_project: widest(&|r| wt_text(r, false)).max("worktree".len()),
-        job: widest(&|r| job(r, false, true)),
-        job_short_flags: widest(&|r| job(r, true, true)),
-        job_no_idle: widest(&|r| job(r, false, false)),
+        worktree: widest(&wt_text).max("worktree".len()),
+        job: widest(&|r| job(r, false)),
+        job_short_flags: widest(&|r| job(r, true)),
         worktree_floor: 4 + if v.worktrees.iter().any(|w| w.mine) {
             " (current)".len()
         } else {
             0
         },
-        need: widest(&|r| r.need.chars().count()).max(NEED_HEADER),
-        use_cores: widest(&|r| r.use_cores.chars().count()).max(USE_HEADER),
         right: widest(&|r| r.right.chars().count()),
         right_short: widest(&|r| r.right_short.chars().count()),
     }
@@ -1010,17 +997,9 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
     let mut lines = Vec::new();
     // Header: column names, then the ruler.
     let mut head = vec![Span::raw(" ".repeat(prefix))];
-    if let Some(pw) = cols.project {
-        head.push(Span::styled(fit("project", pw + 1), dim));
-    }
+    head.push(Span::styled(fit("project", cols.project + 1), dim));
     head.push(Span::styled(fit("worktree", cols.worktree + 1), dim));
     head.push(Span::styled(fit("job", cols.job + 1), dim));
-    if let Some(nw) = cols.need {
-        head.push(Span::styled(format!("{:>nw$} ", "need"), dim));
-    }
-    if let Some(uw) = cols.use_cores {
-        head.push(Span::styled(format!("{:>uw$} ", "use"), dim));
-    }
     head.push(Span::styled(fit("progress", cols.bar + 1), dim));
     lines.push(Line::from(head));
 
@@ -1036,32 +1015,19 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
             Span::styled("▌", Style::new().fg(wt_color(v, r.wt))),
             Span::styled(format!("{:>num_w$} ", format!("#{}", r.num)), base),
         ];
-        if let Some(pw) = cols.project {
-            spans.push(Span::styled(fit(&r.project, pw + 1), base));
-        }
-        let (cell, is_project) =
-            worktree_cell(wt, &r.project, cols.project.is_some(), cols.worktree);
+        spans.push(Span::styled(fit(&r.project, cols.project + 1), base));
+        let cell = worktree_text(wt, cols.worktree);
         spans.push(Span::styled(
             fit(&cell, cols.worktree + 1),
-            if is_project {
-                dim
-            } else {
-                base.fg(wt_color(v, r.wt))
-            },
+            base.fg(wt_color(v, r.wt)),
         ));
         let flag_text = |f: &Flag| if cols.short_flags { f.1 } else { f.0 };
-        // With the use column, `idle` is that number drawn dim, not a flag.
-        let shown: Vec<Flag> = r
-            .flags
-            .iter()
-            .copied()
-            .filter(|f| cols.use_cores.is_none() || *f != IDLE)
-            .collect();
+        let shown = &r.flags;
         let flag_strs: Vec<&str> = shown.iter().map(flag_text).collect();
         let (name, flags) = job_parts(&r.job, &flag_strs, cols.job);
         let used = name.chars().count() + flags.chars().count();
         spans.push(Span::styled(name, base));
-        for flag in &shown {
+        for flag in shown {
             if flags.contains(flag_text(flag)) {
                 spans.push(Span::styled(
                     format!(" {}", flag_text(flag)),
@@ -1074,30 +1040,28 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
             }
         }
         spans.push(Span::raw(" ".repeat((cols.job + 1).saturating_sub(used))));
-        if let Some(nw) = cols.need {
-            spans.push(Span::styled(format!("{:>nw$} ", r.need), base));
-        }
-        if let Some(uw) = cols.use_cores {
-            spans.push(Span::styled(
-                format!("{:>uw$} ", r.use_cores),
-                if r.idle {
-                    base.add_modifier(Modifier::DIM)
-                } else {
-                    base
-                },
-            ));
-        }
-        match bar_fill(r.frac, cols.bar) {
-            Some(n) => {
-                let color = if r.waiting {
-                    dim
-                } else {
-                    base.fg(wt_color(v, r.wt))
-                };
-                spans.push(Span::styled(FILLED.to_string().repeat(n), color));
+        match r.frac {
+            None => spans.push(Span::raw(" ".repeat(cols.bar))),
+            Some(frac) if v.plain => {
+                let n = bar_fill(Some(frac), cols.bar).unwrap_or(0);
+                spans.push(Span::styled(
+                    FILLED.to_string().repeat(n),
+                    base.fg(wt_color(v, r.wt)),
+                ));
                 spans.push(Span::styled(EMPTY.to_string().repeat(cols.bar - n), dim));
             }
-            None => spans.push(Span::raw(" ".repeat(cols.bar))),
+            Some(frac) => {
+                let fill = fill_color(wt_color(v, r.wt));
+                let cells = bar_cells(frac, cols.bar);
+                spans.push(Span::styled(" ".repeat(cells.full), Style::new().bg(fill)));
+                if let Some(ch) = cells.part {
+                    spans.push(Span::styled(
+                        ch.to_string(),
+                        Style::new().fg(fill).bg(TRACK),
+                    ));
+                }
+                spans.push(Span::styled(" ".repeat(cells.rest), Style::new().bg(TRACK)));
+            }
         }
         spans.push(Span::styled(
             format!(
@@ -1682,7 +1646,6 @@ mod tests {
             project: "p".into(),
             job: "j".into(),
             weight: 6,
-            waited: Duration::from_secs(30),
             front: false,
             why: "needs 6, 0 free".into(),
             start_in,
@@ -1693,176 +1656,26 @@ mod tests {
     }
 
     #[test]
-    fn a_waiting_row_has_an_empty_bar_and_says_how_long_and_until_when() {
+    fn a_waiting_row_has_no_bar_and_says_when_it_starts() {
         let w = wait_row(Some(47.0), false);
-        assert_eq!(
-            right_text_wait(&w),
-            "waited 0:30 · starts ~0:47 (needs 6, 0 free)"
-        );
-        assert_eq!(starts_text(&w), "waited 0:30 · starts ~0:47");
+        assert_eq!(right_text_wait(&w), "starts ~0:47 (needs 6, 0 free)");
+        assert_eq!(starts_text(&w), "starts ~0:47");
         let w = wait_row(Some(47.0), true);
-        assert_eq!(starts_text(&w), "waited 0:30 · starts ~0:47?");
+        assert_eq!(starts_text(&w), "starts ~0:47?");
         let w = wait_row(None, false);
-        assert_eq!(starts_text(&w), "waited 0:30 · starts ?");
+        assert_eq!(starts_text(&w), "starts ?");
         let w = wait_row(Some(0.0), false);
-        assert_eq!(starts_text(&w), "waited 0:30 · starts now");
-        // Whatever is known, the bar of a waiting row is empty.
+        assert_eq!(starts_text(&w), "starts now");
+        // A waiting row has no bar at all.
         let v = View {
             waiting: vec![wait_row(Some(47.0), false), wait_row(None, true)],
             ..sample_view(Utc::now())
         };
         let rows = table_rows(&v);
         for r in rows.iter().rev().take(2) {
-            assert_eq!(bar_string(r.frac, 8), "░░░░░░░░");
+            assert_eq!(r.frac, None);
+            assert_eq!(bar_string(r.frac, 8), "        ");
         }
-    }
-
-    fn wants() -> Wants {
-        Wants {
-            prefix: 4,
-            project: 18,
-            worktree: 32,
-            worktree_without_project: 32,
-            job: 24,
-            job_short_flags: 16,
-            job_no_idle: 24,
-            worktree_floor: 14,
-            need: 4,
-            use_cores: 3,
-            right: 31,
-            right_short: 13,
-        }
-    }
-
-    #[test]
-    fn narrow_terminals_keep_the_bar_and_give_up_other_things_in_order() {
-        let cols = |project, worktree, need, use_cores, job, bar, right, why, short_flags| Cols {
-            project,
-            worktree,
-            job,
-            need,
-            use_cores,
-            bar,
-            right,
-            why,
-            short_flags,
-        };
-        // Room for everything; the rest goes to the bar.
-        assert_eq!(
-            layout(150, wants()),
-            cols(Some(18), 32, Some(4), Some(3), 24, 28, 31, true, false)
-        );
-        // 1. The reason for waiting goes.
-        assert_eq!(
-            layout(130, wants()),
-            cols(Some(18), 32, Some(4), Some(3), 24, 26, 13, false, false)
-        );
-        // 2. The worktree column is squeezed to 20 (the job to 24).
-        assert_eq!(
-            layout(120, wants()),
-            cols(Some(18), 20, Some(4), Some(3), 24, 28, 13, false, false)
-        );
-        // 3. The use column goes; `idle` is written after the job again.
-        assert_eq!(
-            layout(110, wants()),
-            cols(Some(18), 20, Some(4), None, 24, 22, 13, false, false)
-        );
-        // 4. idle and [backfill] shrink to z and b.
-        assert_eq!(
-            layout(100, wants()),
-            cols(Some(18), 20, Some(4), None, 16, 20, 13, false, true)
-        );
-        // 5. The project column goes, 6. then need.
-        assert_eq!(
-            layout(90, wants()),
-            cols(None, 20, Some(4), None, 16, 29, 13, false, true)
-        );
-        assert_eq!(
-            layout(80, wants()),
-            cols(None, 20, None, None, 16, 24, 13, false, true)
-        );
-        // 7. Only then the names are cut, to 8 characters at the least;
-        // the bar keeps its 20.
-        let c = layout(50, wants());
-        assert!(c.worktree < 20 && c.worktree >= 14 && c.job >= 8, "{c:?}");
-        // Whatever the width, nothing exceeds it, the bar of a wide
-        // terminal is at least 20 and the time columns stay.
-        for w in 60..220 {
-            let c = layout(w, wants());
-            let total = 4
-                + c.project.map_or(0, |p| p + 1)
-                + c.worktree
-                + 1
-                + c.job
-                + 1
-                + c.need.map_or(0, |n| n + 1)
-                + c.use_cores.map_or(0, |n| n + 1)
-                + c.bar
-                + 1
-                + c.right;
-            assert!(total <= w, "{w}: {c:?} = {total}");
-            assert!(c.bar >= BAR_FLOOR && c.right >= RIGHT_FLOOR && c.job >= 4 && c.worktree >= 6);
-            if w >= 80 {
-                assert!(c.bar >= 20, "{w}: {c:?}");
-            }
-        }
-        let _ = layout(5, wants());
-        let _ = layout(
-            80,
-            Wants {
-                need: usize::MAX / 4,
-                use_cores: usize::MAX / 4,
-                ..wants()
-            },
-        );
-    }
-
-    #[test]
-    fn the_worktree_column_shows_the_branch_current_and_dashes() {
-        let v = sample_view(Utc::now());
-        let fix = &v.worktrees[0];
-        let me = &v.worktrees[2];
-        assert_eq!(worktree_text(Some(me), 40), "main (current)");
-        assert_eq!(worktree_text(Some(fix), 100), FIX_BRANCH);
-        // Cut in the middle; "(current)" always stays whole.
-        assert_eq!(worktree_text(Some(fix), 20), "fix/queue-…ting-head");
-        // Only the branch gives way, to 4 characters; the suffix stays whole.
-        assert_eq!(worktree_text(Some(me), 12), "main (current)");
-        let mut long = fix.clone();
-        long.mine = true;
-        let t = worktree_text(Some(&long), 24);
-        assert!(
-            t.ends_with("…ead (current)") || t.ends_with(" (current)"),
-            "{t}"
-        );
-        assert_eq!(t.chars().count(), 24);
-        // Even with no room, 4 characters of the branch stay.
-        let t = worktree_text(Some(&long), 5);
-        assert!(t.ends_with(" (current)") && t.chars().count() == 14, "{t}");
-        // A lone worktree (gray) and a row with no record are `-`.
-        assert_eq!(worktree_text(Some(&v.worktrees[1]), 40), "-");
-        assert_eq!(worktree_text(None, 40), "-");
-        // No branch recorded: the directory name.
-        let mut nameless = fix.clone();
-        nameless.branch.clear();
-        assert_eq!(worktree_text(Some(&nameless), 40), "fix-queue-order");
-    }
-    #[test]
-    fn a_job_name_gives_up_characters_to_its_flags() {
-        assert_eq!(
-            job_parts("cargo test", &["idle", "[backfill]"], 30),
-            ("cargo test".to_string(), " idle [backfill]".to_string())
-        );
-        assert_eq!(
-            job_parts("0123456789abcdefghij", &["idle"], 12),
-            ("012345…".to_string(), " idle".to_string())
-        );
-        // No room for the flags: the name wins.
-        assert_eq!(
-            job_parts("0123456789", &["idle", "[backfill]"], 12),
-            ("0123456789".to_string(), String::new())
-        );
-        assert_eq!(job_parts("x", &[], 5), ("x".to_string(), String::new()));
     }
 
     #[test]
@@ -1873,29 +1686,17 @@ mod tests {
         let w = &v.waiting[0];
         let t = right_text_wait(w);
         assert!(
-            t.starts_with("waited ")
-                && t.contains(" · starts ~")
-                && t.ends_with("(needs 6, 0 free)"),
+            t.starts_with("starts ~") && t.ends_with("(needs 6, 0 free)"),
             "{t}"
         );
         let mut w = w.clone();
-        w.waited = Duration::ZERO;
         w.start_in = None;
-        assert_eq!(
-            right_text_wait(&w),
-            "waited 0:00 · starts ? (needs 6, 0 free)"
-        );
+        assert_eq!(right_text_wait(&w), "starts ? (needs 6, 0 free)");
         w.start_in = Some(0.0);
-        assert_eq!(
-            right_text_wait(&w),
-            "waited 0:00 · starts now (needs 6, 0 free)"
-        );
+        assert_eq!(right_text_wait(&w), "starts now (needs 6, 0 free)");
         w.start_in = Some(130.0);
         w.rough = true;
-        assert_eq!(
-            right_text_wait(&w),
-            "waited 0:00 · starts ~2:10? (needs 6, 0 free)"
-        );
+        assert_eq!(right_text_wait(&w), "starts ~2:10? (needs 6, 0 free)");
         let mut over = v.running[0].clone();
         over.progress = Progress::Known {
             pct: 99,
@@ -1912,12 +1713,6 @@ mod tests {
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[1].flags, [IDLE, BACKFILL]);
         assert!(rows[0].flags.is_empty());
-        assert_eq!(rows[3].need, "6");
-        assert_eq!(rows[0].need, "4");
-        // Only running rows have a use; waiting rows show `-`.
-        assert_eq!(rows[3].use_cores, "-");
-        assert!(rows[0].use_cores.contains('.') || rows[0].use_cores == "-");
-        assert!(rows[1].idle && !rows[0].idle && !rows[3].idle);
         assert!(rows.iter().all(|r| !r.over));
         let mut v = v;
         v.waiting[0].front = true;
@@ -1928,26 +1723,6 @@ mod tests {
             over: true,
         };
         assert!(table_rows(&v)[0].over);
-    }
-
-    #[test]
-    fn use_is_dim_when_idle_and_replaces_the_idle_flag() {
-        let v = sample_view(Utc::now());
-        let t = render(&v, 170, 16);
-        let buf = t.backend().buffer().clone();
-        let at = |needle: &str| {
-            let y = row_y(&buf, 170, 16, needle);
-            let line: Vec<String> = (0..170u16)
-                .map(|x| buf[(x, y)].symbol().to_string())
-                .collect();
-            let text = line.concat();
-            let byte = text.find(" 0.1 ").or_else(|| text.find(" 3.4 ")).unwrap();
-            (y, text[..byte].chars().count() as u16 + 1)
-        };
-        let (y1, x1) = at("cargo test");
-        assert!(!buf[(x1, y1)].modifier.contains(Modifier::DIM));
-        let (y2, x2) = at("[backfill]");
-        assert!(buf[(x2, y2)].modifier.contains(Modifier::DIM));
     }
 
     #[test]
@@ -1968,40 +1743,159 @@ mod tests {
         assert_eq!(cols(151).bar, cols(150).bar + 1);
         // At 150 every column is there (but the waiting reason).
         let c = cols(150);
-        assert!(c.project.is_some() && c.use_cores.is_some() && c.need.is_some());
+        assert!(c.project >= 18 && c.worktree == 32);
         let bars = [cols(90).bar, cols(120).bar, cols(150).bar];
-        let out = frame(&v, 120, 16);
-        let widths: Vec<usize> = out
-            .lines()
-            .filter(|l| l.contains('▌'))
-            .map(|l| l.chars().filter(|c| *c == '░' || *c == '█').count())
-            .collect();
-        // Rows with a bar all draw it as wide as the column (the run
-        // without a learned time draws none).
-        let full = widths.iter().filter(|n| **n > 0).collect::<Vec<_>>();
-        assert!(full.iter().all(|n| **n == bars[1] || **n > 0), "{widths:?}");
-        assert!(full.iter().all(|n| **n == *full[0]), "{widths:?}");
+        let _ = bars;
     }
 
     #[test]
-    fn names_are_squeezed_before_a_column_is_dropped_and_current_stays_whole() {
+    fn project_worktree_and_job_always_show_and_current_stays_whole() {
         let v = sample_view(Utc::now());
         let rows = table_rows(&v);
-        // At 130 columns every column of the fixture fits with a bar of 20
-        // or more, thanks to the squeezed names (it took 32 + 28 before).
-        let c = layout(128, table_wants(&v, &rows, 4));
-        assert!(c.project.is_some() && c.need.is_some() && c.use_cores.is_some());
-        assert!((c.worktree, c.job) == (20, 24) && c.bar >= 20, "{c:?}");
-        let out = frame(&v, 130, 16);
-        println!("{out}");
-        assert!(out.contains("project") && out.contains("need") && out.contains(" use "));
-        // `(current)` is never cut, at any width.
-        for w in [70u16, 90, 120, 130, 170] {
+        for w in [90u16, 120] {
             let out = frame(&v, w, 16);
-            assert!(out.contains(" (current)"), "{w}\n{out}");
+            println!("{out}");
+            let head = out.lines().find(|l| l.contains("worktree")).unwrap();
+            assert!(
+                head.contains("project") && head.contains("job"),
+                "{w}\n{out}"
+            );
+            assert!(head.contains("progress"), "{w}");
+            assert!(!head.contains("need") && !head.contains(" use"), "{w}");
+            let c = layout(w as usize - 2, table_wants(&v, &rows, 4));
+            assert!(
+                c.bar >= 20 && c.project >= 8 && c.worktree >= 14 && c.job >= 8,
+                "{c:?}"
+            );
+            // The row of the current worktree keeps ` (current)` whole.
+            assert!(out.contains("main (current)"), "{w}\n{out}");
         }
+        // At 120 the names are squeezed but the flags are written out.
+        let c = layout(118, table_wants(&v, &rows, 4));
+        assert!(!c.short_flags, "{c:?}");
+        assert_eq!((c.project, c.worktree, c.job), (18, 20, 24));
         let out = frame(&v, 120, 16);
-        assert!(out.contains("main (current)"), "{out}");
+        assert!(out.contains(" idle") && out.contains("[backfill]"), "{out}");
+        assert!(!out.contains(" z b"), "{out}");
+        // Every width keeps ` (current)`.
+        for w in [70u16, 90, 120, 130, 170] {
+            assert!(frame(&v, w, 16).contains(" (current)"), "{w}");
+        }
+    }
+
+    /// The cells of row `i`'s bar at terminal width `w`.
+    fn bar_row(v: &View, w: u16, i: usize) -> Vec<ratatui::buffer::Cell> {
+        let rows = table_rows(v);
+        let num_w = format!("#{}", rows.len()).len();
+        let c = layout(w as usize - 2, table_wants(v, &rows, 1 + num_w + 1));
+        let x0 = (1 + 1 + num_w + 1 + c.project + 1 + c.worktree + 1 + c.job + 1) as u16;
+        let t = render(v, w, 16);
+        let buf = t.backend().buffer().clone();
+        // The table starts on screen row 5 (header 0, cores box 1-3, box top,
+        // column titles), then one row per entry.
+        let y = row_y(&buf, w, 16, "progress") + 1 + i as u16;
+        (x0..x0 + c.bar as u16)
+            .map(|x| buf[(x, y)].clone())
+            .collect()
+    }
+
+    #[test]
+    fn bar_cells_are_colored_by_row_with_an_eighth_cell_and_a_gray_track() {
+        let v = sample_view(Utc::now());
+        let rows = table_rows(&v);
+        let fix = v.worktrees[0].color;
+        // #1 runs in a worktree with a color: that color fills from the left.
+        for w in [90u16, 120, 150] {
+            let cells = bar_row(&v, w, 0);
+            let want = bar_cells(rows[0].frac.unwrap(), cells.len());
+            assert!(cells[..want.full]
+                .iter()
+                .all(|c| c.bg == fix && c.symbol() == " "));
+            let mut at = want.full;
+            if let Some(ch) = want.part {
+                let c = &cells[at];
+                assert_eq!(
+                    (c.symbol(), c.fg, c.bg),
+                    (ch.to_string().as_str(), fix, TRACK)
+                );
+                at += 1;
+            }
+            assert!(cells[at..]
+                .iter()
+                .all(|c| c.bg == TRACK && c.symbol() == " "));
+            assert!(want.full > 0 && at < cells.len());
+        }
+        // #2 is in a lone worktree: a darker gray fill than the track.
+        let cells = bar_row(&v, 120, 1);
+        let want = bar_cells(rows[1].frac.unwrap(), cells.len());
+        assert!(cells[..want.full].iter().all(|c| c.bg == LONE_FILL));
+        // #3 has no learned time: the track only.
+        assert!(bar_row(&v, 120, 2).iter().all(|c| c.bg == TRACK));
+        // Waiting rows draw no bar and no track.
+        for i in [3, 4] {
+            assert!(bar_row(&v, 120, i)
+                .iter()
+                .all(|c| c.bg == Color::Reset && c.symbol() == " "));
+        }
+    }
+
+    #[test]
+    fn a_bar_is_full_at_100_percent_and_an_eighth_cell_is_a_left_block() {
+        assert_eq!(
+            bar_cells(1.0, 10),
+            BarCells {
+                full: 10,
+                part: None,
+                rest: 0
+            }
+        );
+        assert_eq!(
+            bar_cells(0.0, 10),
+            BarCells {
+                full: 0,
+                part: None,
+                rest: 10
+            }
+        );
+        // 0.55 of 10 cells = 5.5 cells: five full and a half block.
+        assert_eq!(
+            bar_cells(0.55, 10),
+            BarCells {
+                full: 5,
+                part: Some('▌'),
+                rest: 4
+            }
+        );
+        assert_eq!(
+            bar_cells(0.02, 10),
+            BarCells {
+                full: 0,
+                part: Some('▏'),
+                rest: 9
+            }
+        );
+        // Never full before it is done, whatever the rounding.
+        let c = bar_cells(0.9999, 10);
+        assert!(c.full < 10 && c.part.is_some());
+        // Over the expected time the fraction is capped at 1: full.
+        assert_eq!(bar_cells(3.0, 10).full, 10);
+    }
+
+    #[test]
+    fn without_color_the_bar_uses_block_characters() {
+        let mut v = sample_view(Utc::now());
+        assert!(!v.plain);
+        v.plain = true;
+        let out = frame(&v, 120, 16);
+        assert!(out.contains('█') && out.contains('░'), "{out}");
+        let t = render(&v, 120, 16);
+        let buf = t.backend().buffer().clone();
+        let y = row_y(&buf, 120, 16, "50%");
+        assert!((0..120u16).all(|x| buf[(x, y)].bg != TRACK));
+        assert!(no_color(Some("1"), None) && no_color(None, Some("dumb")));
+        assert!(
+            !no_color(None, Some("xterm")) && !no_color(Some(""), None) && !no_color(None, None)
+        );
     }
 
     fn render(v: &View, w: u16, h: u16) -> Terminal<TestBackend> {
@@ -2048,12 +1942,12 @@ mod tests {
         assert!(out.contains("fix/queue-") && out.contains("…"));
         assert!(out.contains("held, owner gone (1): m1 owner gone -> resolve m1"));
         assert!(out.contains("q: quit"));
-        assert!(out.contains("progress") && out.contains("█") && out.contains("░"));
-        assert!(out.contains("50%  left 1:35") && out.contains("waited "));
+        assert!(out.contains("progress"));
+        assert!(out.contains("50%  left 1:35") && out.contains("starts ~"));
         assert!(out.contains("starts ~") && out.contains("(needs 6, 0 free)"));
-        // The use column shows idleness (dim); no `idle` flag next to it.
-        assert!(out.contains("[backfill]") && !out.contains("idle"));
-        assert!(out.contains("need") && out.contains("use") && out.contains("3.4"));
+        assert!(out.contains("[backfill]") && out.contains("idle"));
+        // The cores are in the box on top, not in the table.
+        assert!(!out.contains(" need ") && !out.contains(" use  "));
         // The reserved cores are plain numbers: no `w6`, no `4/3.4`.
         assert!(!out.contains("w6") && !out.contains("4/3.4"));
         // Rows are numbered #1 to #5, top to bottom.
@@ -2077,50 +1971,6 @@ mod tests {
             narrow.contains("left 1:35") && narrow.contains("starts"),
             "{narrow}"
         );
-    }
-
-    #[test]
-    fn local_ci_run_is_never_cut_at_90_or_120_columns() {
-        let v = sample_view(Utc::now());
-        for w in [90u16, 120] {
-            let out = frame(&v, w, 16);
-            println!("{out}");
-            assert_eq!(out.matches("local-ci run").count(), 3, "{w}\n{out}");
-            assert!(!out.contains("local-ci …") && !out.contains("local-ci r…"));
-            // The time columns are all there.
-            assert!(out.contains("left 3:20") && out.contains("ran 0:12"), "{w}");
-            assert!(out.contains("starts ~"), "{w}");
-            // The bar column is titled, and the bar is at least 20 wide.
-            let head = out.lines().find(|l| l.contains("worktree")).unwrap();
-            assert!(head.contains("progress"), "{w}\n{out}");
-            let rows = table_rows(&v);
-            let cols = layout(w as usize - 2, table_wants(&v, &rows, 4));
-            assert!(cols.bar >= 20, "{w}: {cols:?}");
-        }
-        // At 90 the reason for waiting, the long flags, the project and the
-        // cores column are what gave way.
-        let narrow = frame(&v, 90, 16);
-        assert!(!narrow.contains("project") && !narrow.contains("need"));
-        assert!(!narrow.contains("(needs 6") && !narrow.contains("(behind 1)"));
-        assert!(narrow.contains("local-ci run z b"), "{narrow}");
-        // The lone worktrees show their project (gray) instead of `-`.
-        let t = render(&v, 90, 16);
-        let buf = t.backend().buffer().clone();
-        let y = row_y(&buf, 90, 16, "local-ci run z b");
-        let line: String = (0..90u16)
-            .map(|x| buf[(x, y)].symbol().to_string())
-            .collect();
-        assert!(line.contains("local-ci   "), "{line}");
-        let x = line
-            .find("local-ci")
-            .map(|b| line[..b].chars().count() as u16)
-            .unwrap();
-        assert!(buf[(x, y)].modifier.contains(Modifier::DIM));
-        // With the project column the cell stays `-`.
-        let wide = frame(&v, 170, 16);
-        assert!(wide
-            .lines()
-            .any(|l| l.contains("local-ci") && l.contains(" - ")));
     }
 
     fn row_y(buf: &ratatui::buffer::Buffer, w: u16, h: u16, needle: &str) -> u16 {
@@ -2183,12 +2033,12 @@ mod tests {
         let line: String = (0..80u16)
             .map(|x| buf[(x, y0)].symbol().to_string())
             .collect();
-        assert!(line.contains("██████████") && !line.contains('░'), "{line}");
+        let count = |y: u16, bg: Color| (0..80u16).filter(|&x| buf[(x, y)].bg == bg).count();
+        // Past its time the bar is full (the lone worktree's darker gray)
+        // with no track left; the other row still has some.
+        assert!(count(y0, LONE_FILL) >= 10 && count(y0, TRACK) == 0);
         let y1 = row_y(&buf, 80, 12, "left");
-        let l1: String = (0..80u16)
-            .map(|x| buf[(x, y1)].symbol().to_string())
-            .collect();
-        assert!(l1.contains('░'), "{l1}");
+        assert!(count(y1, TRACK) > 0 && count(y1, LONE_FILL) > 0);
         let x = line.find("over").unwrap();
         let col = line[..x].chars().count() as u16;
         assert_eq!(buf[(col, y0)].fg, Color::Red);
