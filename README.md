@@ -206,7 +206,7 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
     band;
   - `job`: the `--label`, else the script's file name for `bash ... step.sh`
     commands, else the command line; with `idle`, `[backfill]` or `[front]`
-    after it;
+    after it (`z`, `b`, `f` on a narrow terminal);
   - `cores`: the weight reserved, running or waiting;
   - a bar on a time axis shared by every row, and the text after it.
 
@@ -217,10 +217,15 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
   the next free color of the palette when another worktree of the same
   repository has it; it is not stored.
 
-  On a narrow terminal the `project` column goes first, then `cores`. The
-  worktree and job names keep the room they need before the bar grows past
-  its minimum; when even that is too much the branch is cut in the middle
-  and the job name at the end. The bar and the text after it always stay.
+  On a terminal 80 columns wide or more the bar is never narrower than 20
+  characters. To keep it, a narrow terminal gives up, in this order: the
+  reason for waiting after the bar (`starts ~1:35?` stays), the words
+  `idle` and `[backfill]` (they shrink to `z` and `b`; `[front]` to `f`),
+  the `project` column, the `cores` column, and only then the worktree and
+  job names are cut (the branch in the middle). The bar and the text after
+  it always stay. With the project column gone, a `-` in the worktree
+  column is replaced by the project's name, in gray, so the rows can still
+  be told apart.
   - The axis has a vertical line at `now` and labels such as `+2m` above
     it. The scale is the finest one at which the row that ends last still
     fits; what has already run takes at most a third of the width. Whatever
@@ -236,7 +241,7 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
     only a `→` at its start.
   - After the bar: `left 3:20` / `over 1:00` / `ran 0:12` (no learned
     time) for a running entry; `starts ~2:10` and why it waits (`needs 6, 3
-    free`, `behind 2`, ...) for a waiting one. `idle` and `[backfill]` mark
+    free`, `behind 2`, ...; left out when there is no room) for a waiting one. `idle` and `[backfill]` mark
     the same entries as in `status`.
   - When something runs but nobody waits, a dim line under the table says
     what would start right away (`No one waiting · a command needing ≤8

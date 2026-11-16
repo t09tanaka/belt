@@ -753,9 +753,16 @@ pub struct Cols {
     pub cores: Option<usize>,
     pub bar: usize,
     pub right: usize,
+    /// The text after the bar names why a waiting entry waits.
+    pub why: bool,
+    /// `idle` and `[backfill]` are shown as `z` and `b`.
+    pub short_flags: bool,
 }
 
-const BAR_MIN: usize = 16;
+const BAR_MIN: usize = 12;
+/// On a terminal this wide the bar is never narrower than [`BAR_WIDE_MIN`].
+const WIDE: usize = 80;
+const BAR_WIDE_MIN: usize = 20;
 const BAR_FLOOR: usize = 6;
 const RIGHT_MAX: usize = 34;
 const RIGHT_FLOOR: usize = 8;
@@ -771,69 +778,99 @@ pub struct Wants {
     pub prefix: usize,
     pub project: usize,
     pub worktree: usize,
-    /// The longest job name with its flags.
+    /// The worktree column when the project column is gone: a lone
+    /// worktree's `-` is replaced by its project name.
+    pub worktree_without_project: usize,
+    /// The longest job name with its flags written out, and abbreviated.
     pub job: usize,
+    pub job_short_flags: usize,
     pub cores: usize,
+    /// The text after the bar with and without the reason for waiting.
     pub right: usize,
+    pub right_short: usize,
 }
 
-/// Fit the columns in `width`.
+/// Fit the columns in `width`, keeping the bar readable.
 ///
-/// The worktree and job columns get the room their names need before the
-/// bar gets more than its minimum; the cores column and then the project
-/// are added from what is left over, and the rest goes to the bar. When
-/// even that does not fit, the project and cores columns are gone and the
-/// bar shrinks first, then the worktree and job names are cut (the branch
-/// in the middle), then the text after the bar. The worktree, job, bar and
-/// text after it are never dropped.
+/// On a terminal at least [`WIDE`] columns wide the bar is never narrower
+/// than [`BAR_WIDE_MIN`]. To get there, in this order: the reason for
+/// waiting after the bar goes, `idle` and `[backfill]` shrink to `z` and
+/// `b`, the project column goes, the cores column goes, and only then the
+/// worktree and job names are cut (the branch in the middle). The text
+/// after the bar, the bar, the worktree and the job are never dropped.
 pub fn layout(width: usize, w: Wants) -> Cols {
-    let mut right = w.right.clamp(RIGHT_FLOOR, RIGHT_MAX);
-    let mut wt = w.worktree.clamp(1, WT_CAP);
-    let mut job = w.job.clamp(1, JOB_CAP);
-    let mut bar = BAR_MIN;
-    let need = |wt: usize, job: usize, bar: usize, right: usize| {
-        w.prefix + wt + 1 + job + 1 + bar + 1 + right
+    let bar_min = if width >= WIDE { BAR_WIDE_MIN } else { BAR_MIN };
+    let pw = w.project.clamp(7, PROJECT_CAP);
+    // (why, short flags, project, cores), most to least.
+    let states = [
+        (true, false, true, true),
+        (false, false, true, true),
+        (false, true, true, true),
+        (false, true, false, true),
+        (false, true, false, false),
+    ];
+    let build = |(why, short, project, cores): (bool, bool, bool, bool)| {
+        let right = if why { w.right } else { w.right_short };
+        let job = if short { w.job_short_flags } else { w.job };
+        let wt = if project {
+            w.worktree
+        } else {
+            w.worktree_without_project
+        };
+        Cols {
+            project: project.then_some(pw),
+            worktree: wt.clamp(1, WT_CAP),
+            job: job.clamp(1, JOB_CAP),
+            cores: cores.then_some(w.cores),
+            bar: bar_min,
+            right: right.clamp(RIGHT_FLOOR, RIGHT_MAX),
+            why,
+            short_flags: short,
+        }
     };
-    let mut short = need(wt, job, bar, right).saturating_sub(width);
-    // (what to cut, down to what): the bar first, then the names.
+    let need = |c: &Cols| {
+        w.prefix
+            + c.project.map_or(0, |p| p + 1)
+            + c.worktree
+            + 1
+            + c.job
+            + 1
+            + c.cores.map_or(0, |n| n + 1)
+            + c.bar
+            + 1
+            + c.right
+    };
+    for st in states {
+        let mut c = build(st);
+        let n = need(&c);
+        if n <= width {
+            c.bar += width - n;
+            return c;
+        }
+    }
+    // Nothing fits at the bar's minimum: cut the names, then the bar, then
+    // the text after it.
+    let mut c = build(states[states.len() - 1]);
+    let mut short = need(&c) - width;
     for (which, floor) in [
-        (0, BAR_FLOOR),
         (1, 10),
         (2, 12),
         (1, 6),
         (2, 4),
+        (0, BAR_FLOOR),
         (3, RIGHT_FLOOR),
     ] {
         let cur = match which {
-            0 => &mut bar,
-            1 => &mut wt,
-            2 => &mut job,
-            _ => &mut right,
+            0 => &mut c.bar,
+            1 => &mut c.worktree,
+            2 => &mut c.job,
+            _ => &mut c.right,
         };
         let cut = short.min(cur.saturating_sub(floor));
         *cur -= cut;
         short -= cut;
     }
-    let mut avail = width.saturating_sub(need(wt, job, bar, right));
-    let mut cores = None;
-    if avail > w.cores {
-        cores = Some(w.cores);
-        avail -= w.cores + 1;
-    }
-    let mut project = None;
-    let pw = w.project.clamp(7, PROJECT_CAP);
-    if avail > pw {
-        project = Some(pw);
-        avail -= pw + 1;
-    }
-    Cols {
-        project,
-        worktree: wt,
-        job,
-        cores,
-        bar: bar + avail,
-        right,
-    }
+    c
 }
 
 /// The text of the worktree column: the branch (cut in the middle when
@@ -853,6 +890,17 @@ fn worktree_text(w: Option<&Wt>, max: usize) -> String {
     let suffix = if w.mine { " (current)" } else { "" };
     let room = max.saturating_sub(suffix.chars().count()).max(1);
     format!("{}{suffix}", ellipsize_middle(&branch, room))
+}
+
+/// The worktree column of a row. A `-` (lone worktree, or none recorded)
+/// shows the project name instead when the project column is gone, so such
+/// rows can still be told apart; the bool is true then (drawn gray).
+fn worktree_cell(wt: Option<&Wt>, project: &str, project_col: bool, max: usize) -> (String, bool) {
+    let text = worktree_text(wt, max);
+    if text == "-" && !project_col && project != "-" {
+        return (ellipsize_middle(project, max), true);
+    }
+    (text, false)
 }
 
 /// The job name cut so that its flags fit in `width`: (name, flags).
@@ -877,6 +925,11 @@ fn right_text_run(r: &RunRow) -> String {
 }
 
 fn right_text_wait(w: &WaitRow) -> String {
+    format!("{} ({})", starts_text(w), w.why)
+}
+
+/// `starts ~1:35?`: when a waiting entry starts, without the reason.
+fn starts_text(w: &WaitRow) -> String {
     let start = match w.start_in {
         None => "?".to_string(),
         Some(s) if s <= 0.0 => "now".to_string(),
@@ -886,8 +939,15 @@ fn right_text_wait(w: &WaitRow) -> String {
             if w.rough { "?" } else { "" }
         ),
     };
-    format!("starts {start} ({})", w.why)
+    format!("starts {start}")
 }
+
+/// A flag after the job name: written out, and abbreviated for narrow
+/// terminals.
+type Flag = (&'static str, &'static str);
+const IDLE: Flag = ("idle", "z");
+const BACKFILL: Flag = ("[backfill]", "b");
+const FRONT: Flag = ("[front]", "f");
 
 /// A row, ready to lay out.
 #[derive(Debug, Clone, PartialEq)]
@@ -895,10 +955,12 @@ struct TableRow {
     num: usize,
     project: String,
     job: String,
-    flags: Vec<&'static str>,
+    flags: Vec<Flag>,
     cores: String,
     spec: BarSpec,
     right: String,
+    /// `right` without the reason for waiting.
+    right_short: String,
     wt: Option<usize>,
     over: bool,
 }
@@ -908,13 +970,14 @@ fn table_rows(v: &View) -> Vec<TableRow> {
         num: r.num,
         project: r.project.clone(),
         job: r.job.clone(),
-        flags: [(r.idle, "idle"), (r.backfilled, "[backfill]")]
+        flags: [(r.idle, IDLE), (r.backfilled, BACKFILL)]
             .into_iter()
             .filter_map(|(on, f)| on.then_some(f))
             .collect(),
         cores: r.weight.to_string(),
         spec: BarSpec::of_run(r),
         right: right_text_run(r),
+        right_short: right_text_run(r),
         wt: r.wt,
         over: matches!(r.progress, Progress::Known { over: true, .. }),
     });
@@ -922,10 +985,11 @@ fn table_rows(v: &View) -> Vec<TableRow> {
         num: w.num,
         project: w.project.clone(),
         job: w.job.clone(),
-        flags: if w.front { vec!["[front]"] } else { vec![] },
+        flags: if w.front { vec![FRONT] } else { vec![] },
         cores: w.weight.to_string(),
         spec: BarSpec::of_wait(w),
         right: right_text_wait(w),
+        right_short: starts_text(w),
         wt: w.wt,
         over: false,
     });
@@ -1173,6 +1237,36 @@ fn bar_spans(bar: &str, base: Style) -> Vec<Span<'static>> {
     out
 }
 
+/// What the rows of the table would like in the way of columns.
+fn table_wants(v: &View, rows: &[TableRow], prefix: usize) -> Wants {
+    let widest = |len: &dyn Fn(&TableRow) -> usize| rows.iter().map(len).max().unwrap_or(0);
+    let wt_text = |r: &TableRow, project_col: bool| {
+        let wt = r.wt.and_then(|i| v.worktrees.get(i));
+        worktree_cell(wt, &r.project, project_col, usize::MAX)
+            .0
+            .chars()
+            .count()
+    };
+    let job = |r: &TableRow, short: bool| {
+        r.job.chars().count()
+            + r.flags
+                .iter()
+                .map(|f| 1 + if short { f.1 } else { f.0 }.len())
+                .sum::<usize>()
+    };
+    Wants {
+        prefix,
+        project: widest(&|r| r.project.chars().count()),
+        worktree: widest(&|r| wt_text(r, true)).max("worktree".len()),
+        worktree_without_project: widest(&|r| wt_text(r, false)).max("worktree".len()),
+        job: widest(&|r| job(r, false)),
+        job_short_flags: widest(&|r| job(r, true)),
+        cores: widest(&|r| r.cores.chars().count()).max(CORES_HEADER),
+        right: widest(&|r| r.right.chars().count()),
+        right_short: widest(&|r| r.right_short.chars().count()),
+    }
+}
+
 fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
     let block = Block::bordered().title(" queue ");
     let inner = block.inner(area);
@@ -1185,21 +1279,7 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
     let num_w = format!("#{}", rows.len()).len();
     let prefix = 1 + num_w + 1;
     let wt_of = |r: &TableRow| r.wt.and_then(|i| v.worktrees.get(i));
-    let widest = |len: &dyn Fn(&TableRow) -> usize| rows.iter().map(len).max().unwrap_or(0);
-    let cols = layout(
-        inner.width as usize,
-        Wants {
-            prefix,
-            project: widest(&|r| r.project.chars().count()),
-            worktree: widest(&|r| worktree_text(wt_of(r), usize::MAX).chars().count())
-                .max("worktree".len()),
-            job: widest(&|r| {
-                r.job.chars().count() + r.flags.iter().map(|f| f.len() + 1).sum::<usize>()
-            }),
-            cores: widest(&|r| r.cores.chars().count()).max(CORES_HEADER),
-            right: widest(&|r| r.right.chars().count()),
-        },
-    );
+    let cols = layout(inner.width as usize, table_wants(v, &rows, prefix));
     let specs: Vec<BarSpec> = rows.iter().map(|r| r.spec).collect();
     let scale = compute_scale(&specs, cols.bar);
 
@@ -1233,18 +1313,26 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
         if let Some(pw) = cols.project {
             spans.push(Span::styled(fit(&r.project, pw + 1), base));
         }
+        let (cell, is_project) =
+            worktree_cell(wt, &r.project, cols.project.is_some(), cols.worktree);
         spans.push(Span::styled(
-            fit(&worktree_text(wt, cols.worktree), cols.worktree + 1),
-            base.fg(wt_color(v, r.wt)),
+            fit(&cell, cols.worktree + 1),
+            if is_project {
+                dim
+            } else {
+                base.fg(wt_color(v, r.wt))
+            },
         ));
-        let (name, flags) = job_parts(&r.job, &r.flags, cols.job);
+        let flag_text = |f: &Flag| if cols.short_flags { f.1 } else { f.0 };
+        let flag_strs: Vec<&str> = r.flags.iter().map(flag_text).collect();
+        let (name, flags) = job_parts(&r.job, &flag_strs, cols.job);
         let used = name.chars().count() + flags.chars().count();
         spans.push(Span::styled(name, base));
         for flag in &r.flags {
-            if flags.contains(flag) {
+            if flags.contains(flag_text(flag)) {
                 spans.push(Span::styled(
-                    format!(" {flag}"),
-                    if *flag == "idle" {
+                    format!(" {}", flag_text(flag)),
+                    if *flag == IDLE {
                         Style::new().fg(Color::Yellow)
                     } else {
                         dim
@@ -1258,7 +1346,10 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
         }
         spans.extend(bar_spans(&bar_string(r.spec, scale), base));
         spans.push(Span::styled(
-            format!(" {}", truncate(&r.right, cols.right)),
+            format!(
+                " {}",
+                truncate(if cols.why { &r.right } else { &r.right_short }, cols.right)
+            ),
             if r.over {
                 Style::new().fg(Color::Red)
             } else {
@@ -1298,9 +1389,12 @@ fn draw_empty(f: &mut Frame, area: Rect, v: &View) {
                 prefix: 2,
                 project: widest(&|r| r.project.chars().count()),
                 worktree: widest(&|r| wt_text(r, usize::MAX).chars().count()),
+                worktree_without_project: widest(&|r| wt_text(r, usize::MAX).chars().count()),
                 job: widest(&|r| r.job.chars().count()),
+                job_short_flags: widest(&|r| r.job.chars().count()),
                 cores: usize::MAX / 2,
                 right: widest(&|r| recent_time_text(r).chars().count()),
+                right_short: widest(&|r| recent_time_text(r).chars().count()),
             },
         );
         for r in &v.recent {
@@ -2032,35 +2126,61 @@ mod tests {
     fn wants() -> Wants {
         Wants {
             prefix: 4,
-            project: 12,
-            worktree: 20,
-            job: 30,
+            project: 18,
+            worktree: 32,
+            worktree_without_project: 32,
+            job: 28,
+            job_short_flags: 16,
             cores: 5,
-            right: 30,
+            right: 31,
+            right_short: 13,
         }
     }
 
     #[test]
-    fn narrow_terminals_drop_project_then_cores_and_cut_names_before_the_bar_min() {
-        let cols = |project, worktree, job, cores, bar| Cols {
+    fn narrow_terminals_keep_the_bar_and_give_up_other_things_in_order() {
+        let cols = |project, cores, job, bar, right, why, short_flags| Cols {
             project,
-            worktree,
+            worktree: 32,
             job,
             cores,
             bar,
-            right: 30,
+            right,
+            why,
+            short_flags,
         };
-        // Room for everything: the rest goes to the bar.
-        assert_eq!(layout(140, wants()), cols(Some(12), 20, 30, Some(5), 34));
-        // The project goes first, cores stay.
-        assert_eq!(layout(110, wants()), cols(None, 20, 30, Some(5), 17));
-        assert_eq!(layout(105, wants()), cols(None, 20, 30, None, 18));
-        // The names keep their room; the bar gives way to its floor first.
-        assert_eq!(layout(100, wants()), cols(None, 20, 30, None, 13));
-        assert_eq!(layout(90, wants()), cols(None, 17, 30, None, 6));
-        // Tighter still: the branch and the job are cut, never dropped.
-        assert_eq!(layout(60, wants()), cols(None, 6, 11, None, 6));
-        // Whatever the width, nothing exceeds it and the time columns stay.
+        // Room for everything; the rest goes to the bar.
+        assert_eq!(
+            layout(150, wants()),
+            cols(Some(18), Some(5), 28, 27, 31, true, false)
+        );
+        // 1. The reason for waiting goes.
+        assert_eq!(
+            layout(130, wants()),
+            cols(Some(18), Some(5), 28, 25, 13, false, false)
+        );
+        // 2. idle and [backfill] shrink to z and b.
+        assert_eq!(
+            layout(113, wants()),
+            cols(Some(18), Some(5), 16, 20, 13, false, true)
+        );
+        // 3. The project column goes, 4. then cores.
+        assert_eq!(
+            layout(100, wants()),
+            cols(None, Some(5), 16, 26, 13, false, true)
+        );
+        assert_eq!(
+            layout(90, wants()),
+            cols(None, None, 16, 22, 13, false, true)
+        );
+        // 5. Only then the names are cut; the bar keeps its 20.
+        let c = layout(85, wants());
+        assert_eq!((c.worktree, c.job, c.bar), (29, 16, 20));
+        // Under 80 columns the bar may be narrower.
+        let c = layout(60, wants());
+        assert_eq!((c.worktree, c.job, c.bar, c.right), (12, 16, 12, 13));
+        // Whatever the width, nothing exceeds it, the bar of a wide
+        // terminal is at least 20 and the time columns stay.
         for w in 60..220 {
             let c = layout(w, wants());
             let total = 4
@@ -2075,6 +2195,9 @@ mod tests {
                 + c.right;
             assert!(total <= w, "{w}: {c:?} = {total}");
             assert!(c.bar >= BAR_FLOOR && c.right >= RIGHT_FLOOR && c.job >= 4 && c.worktree >= 6);
+            if w >= 80 {
+                assert!(c.bar >= 20, "{w}: {c:?}");
+            }
         }
         let _ = layout(5, wants());
         let _ = layout(
@@ -2155,14 +2278,14 @@ mod tests {
         let v = sample_view(Utc::now());
         let rows = table_rows(&v);
         assert_eq!(rows.len(), 5);
-        assert_eq!(rows[1].flags, ["idle", "[backfill]"]);
+        assert_eq!(rows[1].flags, [IDLE, BACKFILL]);
         assert!(rows[0].flags.is_empty());
         assert_eq!(rows[3].cores, "6");
         assert_eq!(rows[0].cores, "4");
         assert!(rows.iter().all(|r| !r.over));
         let mut v = v;
         v.waiting[0].front = true;
-        assert_eq!(table_rows(&v)[3].flags, ["[front]"]);
+        assert_eq!(table_rows(&v)[3].flags, [FRONT]);
         v.running[0].progress = Progress::Known {
             pct: 99,
             left: Duration::from_secs(1),
@@ -2202,7 +2325,7 @@ mod tests {
             reason: "owner gone".into(),
             hint: "resolve m1".into(),
         });
-        let out = frame(&v, 120, 16);
+        let out = frame(&v, 170, 16);
         println!("{out}");
         assert!(out.contains("cores 12/12 in use · 0 free"));
         assert!(out.contains("cpu 50% · mem 9.0 GiB free"));
@@ -2248,16 +2371,43 @@ mod tests {
         let v = sample_view(Utc::now());
         for w in [90u16, 120] {
             let out = frame(&v, w, 16);
+            println!("{out}");
             assert_eq!(out.matches("local-ci run").count(), 3, "{w}\n{out}");
             assert!(!out.contains("local-ci …") && !out.contains("local-ci r…"));
-            assert!(out.contains("local-ci run idle [backfill]"), "{w}\n{out}");
             // The time columns are all there.
             assert!(out.contains("left 3:20") && out.contains("ran 0:12"), "{w}");
             assert!(out.contains("starts ~"), "{w}");
+            // The axis has a label, and the bar is at least 20 wide.
+            let head = out.lines().find(|l| l.contains("worktree")).unwrap();
+            assert!(head.contains("+"), "{w}\n{out}");
+            let rows = table_rows(&v);
+            let cols = layout(w as usize - 2, table_wants(&v, &rows, 4));
+            assert!(cols.bar >= 20, "{w}: {cols:?}");
         }
-        // At 90 the project and cores columns are what gave way.
+        // At 90 the reason for waiting, the long flags, the project and the
+        // cores column are what gave way.
         let narrow = frame(&v, 90, 16);
-        assert!(!narrow.contains("project"));
+        assert!(!narrow.contains("project") && !narrow.contains("cores  "));
+        assert!(!narrow.contains("(needs 6") && !narrow.contains("(behind 1)"));
+        assert!(narrow.contains("local-ci run z b"), "{narrow}");
+        // The lone worktrees show their project (gray) instead of `-`.
+        let t = render(&v, 90, 16);
+        let buf = t.backend().buffer().clone();
+        let y = row_y(&buf, 90, 16, "local-ci run z b");
+        let line: String = (0..90u16)
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect();
+        assert!(line.contains("local-ci   "), "{line}");
+        let x = line
+            .find("local-ci")
+            .map(|b| line[..b].chars().count() as u16)
+            .unwrap();
+        assert!(buf[(x, y)].modifier.contains(Modifier::DIM));
+        // With the project column the cell stays `-`.
+        let wide = frame(&v, 170, 16);
+        assert!(wide
+            .lines()
+            .any(|l| l.contains("local-ci") && l.contains(" - ")));
     }
 
     fn row_y(buf: &ratatui::buffer::Buffer, w: u16, h: u16, needle: &str) -> u16 {
@@ -2286,7 +2436,7 @@ mod tests {
         assert_eq!(band.fg, v.worktrees[0].color);
         assert_eq!(num.symbol(), "#");
         assert!(!num.modifier.contains(Modifier::BOLD));
-        let (band, _) = at("idle [backfill]");
+        let (band, _) = at("local-ci run");
         assert_eq!(band.fg, Color::Gray);
         // The row of the worktree top runs in is bold, the others are not.
         let (band, num) = at("cargo clippy");
