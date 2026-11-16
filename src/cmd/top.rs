@@ -380,14 +380,37 @@ fn fnv1a(s: &str) -> u64 {
     })
 }
 
-/// The color of the worktree at `path`, from a hash of the path. Gray when
-/// the repository has only one worktree in the queue (`siblings` <= 1):
-/// there is nothing to tell apart.
-fn worktree_color(path: &str, siblings: usize) -> Color {
-    if siblings <= 1 {
-        return Color::Gray;
+/// The colors of the worktrees of one repository, in the order of `paths`.
+///
+/// Each path starts at the palette slot its hash picks; if a worktree
+/// before it (in sorted path order, so the result does not depend on the
+/// order given) already took that color, it moves on to the next free slot.
+/// Colors repeat only when there are more worktrees than colors. Gray when
+/// there is a single worktree: there is nothing to tell apart.
+fn repo_colors(paths: &[&str]) -> Vec<Color> {
+    if paths.len() <= 1 {
+        return vec![Color::Gray; paths.len()];
     }
-    WT_COLORS[(fnv1a(path) % WT_COLORS.len() as u64) as usize]
+    let mut sorted: Vec<&str> = paths.to_vec();
+    sorted.sort_unstable();
+    let n = WT_COLORS.len();
+    let mut taken = vec![false; n];
+    let mut slot_of: HashMap<&str, usize> = HashMap::new();
+    for p in sorted {
+        let start = (fnv1a(p) % n as u64) as usize;
+        let slot = (0..n)
+            .map(|k| (start + k) % n)
+            .find(|&c| !taken[c])
+            .unwrap_or(start);
+        taken[slot] = true;
+        // Past the palette size every slot is taken: start over, so the
+        // repeats are spread as evenly as the palette allows.
+        if taken.iter().all(|t| *t) {
+            taken.fill(false);
+        }
+        slot_of.insert(p, slot);
+    }
+    paths.iter().map(|p| WT_COLORS[slot_of[p]]).collect()
 }
 
 /// The distinct worktrees of `table` (running first, then waiting), in
@@ -421,13 +444,16 @@ fn worktrees_of(table: &[&Entry], me: Option<&str>) -> Vec<Wt> {
         }
     }
     let repos: Vec<String> = out.iter().map(|(_, _, r)| r.clone()).collect();
-    out.into_iter()
-        .map(|(mut w, _, repo)| {
-            let siblings = repos.iter().filter(|r| **r == repo).count();
-            w.color = worktree_color(&w.path, siblings);
-            w
-        })
-        .collect()
+    let mut result: Vec<Wt> = out.into_iter().map(|(w, _, _)| w).collect();
+    for repo in repos.iter().collect::<std::collections::BTreeSet<_>>() {
+        let idx: Vec<usize> = (0..result.len()).filter(|&i| repos[i] == *repo).collect();
+        let paths: Vec<&str> = idx.iter().map(|&i| result[i].path.as_str()).collect();
+        let colors = repo_colors(&paths);
+        for (&i, c) in idx.iter().zip(colors) {
+            result[i].color = c;
+        }
+    }
+    result
 }
 
 /// `s` cut to `max` characters with the middle replaced by `…`.
@@ -1645,23 +1671,83 @@ mod tests {
         assert!(!v.worktrees[0].main);
     }
 
+    /// Two paths whose hashes pick the same palette slot.
+    fn colliding_paths() -> (String, String) {
+        let n = WT_COLORS.len() as u64;
+        let first = "/w/wt-0".to_string();
+        let want = fnv1a(&first) % n;
+        let other = (1..1000)
+            .map(|i| format!("/w/wt-{i}"))
+            .find(|p| fnv1a(p) % n == want)
+            .unwrap();
+        (first, other)
+    }
+
     #[test]
     fn worktree_colors_are_stable_and_never_the_warning_colors() {
         assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(worktree_color("/w/a", 2), worktree_color("/w/a", 2));
-        assert_eq!(worktree_color("/w/a", 1), Color::Gray);
-        assert_eq!(worktree_color("/w/a", 0), Color::Gray);
-        let mut seen = std::collections::HashSet::new();
-        for i in 0..40 {
-            let c = worktree_color(&format!("/w/wt-{i}"), 3);
-            assert!(WT_COLORS.contains(&c));
-            seen.insert(format!("{c:?}"));
-        }
-        assert!(seen.len() >= 5, "{seen:?}");
+        assert_eq!(repo_colors(&["/w/a"]), [Color::Gray]);
+        assert!(repo_colors(&[]).is_empty());
+        let paths: Vec<String> = (0..6).map(|i| format!("/w/wt-{i}")).collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let c = repo_colors(&refs);
+        assert_eq!(c, repo_colors(&refs));
+        assert!(c.iter().all(|c| WT_COLORS.contains(c)));
         for bad in [Color::Red, Color::Yellow, Color::Gray, Color::DarkGray] {
             assert!(!WT_COLORS.contains(&bad));
         }
+    }
+
+    #[test]
+    fn worktrees_of_one_repository_never_share_a_color_until_the_palette_runs_out() {
+        let (a, b) = colliding_paths();
+        let n = WT_COLORS.len() as u64;
+        assert_eq!(fnv1a(&a) % n, fnv1a(&b) % n);
+        let c = repo_colors(&[&a, &b]);
+        assert_ne!(c[0], c[1]);
+        // Order of the input does not change who gets what.
+        let r = repo_colors(&[&b, &a]);
+        assert_eq!((r[0], r[1]), (c[1], c[0]));
+        // The same for a bigger set, in any rotation.
+        let paths: Vec<String> = (0..WT_COLORS.len()).map(|i| format!("/w/wt-{i}")).collect();
+        let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+        let base = repo_colors(&refs);
+        let distinct: std::collections::HashSet<_> =
+            base.iter().map(|c| format!("{c:?}")).collect();
+        assert_eq!(distinct.len(), WT_COLORS.len());
+        for k in 1..refs.len() {
+            let mut rot = refs.clone();
+            rot.rotate_left(k);
+            let got = repo_colors(&rot);
+            for (p, col) in rot.iter().zip(got) {
+                let at = refs.iter().position(|x| x == p).unwrap();
+                assert_eq!(col, base[at]);
+            }
+        }
+        // More worktrees than colors: repeats are allowed, nothing breaks.
+        let many: Vec<String> = (0..20).map(|i| format!("/m/wt-{i}")).collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        assert_eq!(repo_colors(&many).len(), 20);
+    }
+
+    #[test]
+    fn colliding_worktrees_in_the_view_get_different_colors() {
+        let (a, b) = colliding_paths();
+        let now = Utc::now();
+        let ea = in_wt(
+            entry("a", State::Running, 1, 1, "/r", "", "a", now, 9),
+            &a,
+            "x",
+        );
+        let eb = in_wt(
+            entry("b", State::Running, 1, 2, "/r", "", "b", now, 8),
+            &b,
+            "y",
+        );
+        let v = View::from_parts(&ledger(vec![ea, eb]), vec![], limits(4), None, now, None);
+        assert_ne!(v.worktrees[0].color, v.worktrees[1].color);
+        assert!(v.worktrees.iter().all(|w| w.color != Color::Gray));
     }
 
     #[test]
