@@ -59,6 +59,8 @@ pub enum Action {
     /// The parent has checked the installed version: forget the version the
     /// switch began from and resume a drain the upgrade made (request on stdin).
     Commit,
+    /// Report facts about this host for the parent's `doctor`.
+    Doctor,
 }
 
 /// What the parent sends on stdin for `install`. The key travels only here.
@@ -425,6 +427,29 @@ fn worker_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The environment the service runs with. It never carries a configuration redirect.
+fn service_environment(journal: &Journal) -> BTreeMap<String, String> {
+    journal
+        .env
+        .iter()
+        .filter(|(k, _)| k.as_str() != "XDG_CONFIG_HOME")
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// What `doctor` looks at on this host: the service status, the worker's
+/// state directory and the environment the service runs with.
+pub(crate) fn service_view<L: Launcher>(
+    env: &BTreeMap<String, String>,
+    launcher: L,
+) -> anyhow::Result<(Status, PathBuf, BTreeMap<String, String>)> {
+    let env = worker_env(env);
+    let paths = Paths::resolve(&env)?;
+    let journal = require_journal(&paths)?;
+    let status = status(&env, launcher)?;
+    Ok((status, paths.state, service_environment(&journal)))
+}
+
 fn plan(paths: &Paths, journal: &Journal) -> anyhow::Result<policy::Plan> {
     let label = format!(
         "io.github.t09tanaka.rtr.worker.{}.{}",
@@ -434,13 +459,7 @@ fn plan(paths: &Paths, journal: &Journal) -> anyhow::Result<policy::Plan> {
             Sha256::digest(paths.config.as_os_str().as_encoded_bytes())
         )[..12]
     );
-    // The service environment never carries a configuration redirect.
-    let environment = journal
-        .env
-        .iter()
-        .filter(|(k, _)| k.as_str() != "XDG_CONFIG_HOME")
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let environment = service_environment(journal);
     policy::render(&policy::Definition {
         label,
         mode: policy::Mode::User { uid: journal.uid },
@@ -970,12 +989,16 @@ pub fn handle<L: Launcher>(
             let request = serde_json::from_slice(stdin).context("commit request unreadable")?;
             upgrade::commit(env, &request, launcher)
         }
+        Action::Doctor => anyhow::bail!("doctor reports facts, not a service status"),
     }
 }
 
 /// The hidden `worker-service` command. Drain, resume and status never touch
 /// launchctl; the others use the native launcher.
 pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
+    if action == Action::Doctor {
+        return super::doctor::host_main();
+    }
     let env: BTreeMap<String, String> = ENV
         .iter()
         .filter_map(|k| Some((k.to_string(), std::env::var_os(k)?.into_string().ok()?)))

@@ -1,0 +1,876 @@
+//! `doctor`: what is installed on the parent and on every registered worker,
+//! looked at the way the service sees it, and whether it fits together.
+//!
+//! Each host gathers plain facts in its *service* environment (the retained
+//! environment the LaunchAgent runs with, not the shell that typed the
+//! command): which `task-traffic-controller` binary that environment
+//! resolves and whether it understands managed ownership, the resource scope
+//! the worker uses and the scope that CLI uses, both policy digests, the
+//! Docker engine the environment reaches, and whether the worker profile
+//! loads there. The parent turns the facts into checks in one place
+//! ([`evaluate`], [`shared_engines`]), so a host never grades itself.
+//!
+//! A check is `ok`, `notice`, `fail` or `not_checked`. Something that could
+//! not be looked at is never `ok`: an unreachable worker fails, and a check
+//! that is not implemented yet is listed as `not_checked`.
+use super::bootstrap::Spec;
+use super::worker_service::Status;
+use super::workers::{self, Remote, RemoteOutput};
+use crate::{
+    error::{ApiError, ErrorCode},
+    ids::{ClusterId, WorkerId},
+    protocol::ssh::{quote, SshTarget},
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    os::unix::fs::PermissionsExt,
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
+use task_traffic_controller::{config::Config, ledger::Ledger, Paths};
+
+const TRAFFIC_CLI: &str = "task-traffic-controller";
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const OUTPUT_LIMIT: u64 = 1 << 20;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Level {
+    Ok,
+    Notice,
+    Fail,
+    NotChecked,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Check {
+    /// `parent` or the worker's name.
+    pub host: String,
+    pub id: String,
+    pub level: Level,
+    pub detail: String,
+}
+impl Check {
+    fn new(host: &str, id: &str, level: Level, detail: impl Into<String>) -> Self {
+        Check {
+            host: host.into(),
+            id: id.into(),
+            level,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// One task-traffic-controller resource scope as it is on disk.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    pub state_dir: String,
+    pub config_file: String,
+    /// Something exists at the state directory or the configuration file.
+    pub in_use: bool,
+    /// `None`: the configuration could not be read.
+    pub policy_digest: Option<String>,
+    /// Entries in the ledger. `None`: the ledger could not be read.
+    pub ledger_entries: Option<usize>,
+}
+
+/// The `task-traffic-controller` binary the service environment resolves.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficCli {
+    pub path: String,
+    /// `status --json` ran and printed a JSON object.
+    pub status_readable: bool,
+    /// That object has `ledger_format`: the binary knows managed entries.
+    pub knows_managed: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Docker {
+    /// The `docker` binary the service environment resolves.
+    pub cli: Option<String>,
+    /// Where that client connects (`DOCKER_HOST`, else the current context).
+    pub endpoint: Option<String>,
+    /// The engine's own id. `None`: no engine answered.
+    pub engine_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileFacts {
+    pub name: Option<String>,
+    pub fingerprint: Option<String>,
+    pub error: Option<String>,
+}
+
+/// What one host found. Facts only; the parent decides what they mean.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostFacts {
+    pub schema: u32,
+    pub worker_scope: Scope,
+    pub cli_scope: Scope,
+    pub cli: Option<TrafficCli>,
+    pub docker: Docker,
+    pub profile: ProfileFacts,
+}
+
+/// Runs one bounded command in a given environment. `None`: it could not be
+/// run or did not finish. A test double stands in for the real programs.
+pub trait Runner {
+    fn run(
+        &mut self,
+        program: &Path,
+        arguments: &[&str],
+        env: &BTreeMap<String, String>,
+    ) -> Option<(i32, String)>;
+}
+
+pub struct SystemRunner;
+impl Runner for SystemRunner {
+    fn run(
+        &mut self,
+        program: &Path,
+        arguments: &[&str],
+        env: &BTreeMap<String, String>,
+    ) -> Option<(i32, String)> {
+        let mut child = Command::new(program)
+            .args(arguments)
+            .env_clear()
+            .envs(env)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let pipe = child.stdout.take()?;
+        let reader = std::thread::spawn(move || {
+            let mut text = String::new();
+            let _ = pipe.take(OUTPUT_LIMIT).read_to_string(&mut text);
+            text
+        });
+        let deadline = Instant::now() + COMMAND_TIMEOUT;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                _ => {
+                    // This Child is the process spawned above, never an inferred pid.
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+            }
+        };
+        Some((status.code()?, reader.join().ok()?))
+    }
+}
+
+/// The first executable regular file called `name` on the environment's PATH.
+pub fn find_on_path(env: &BTreeMap<String, String>, name: &str) -> Option<PathBuf> {
+    env.get("PATH")?
+        .split(':')
+        .filter(|directory| directory.starts_with('/'))
+        .map(|directory| Path::new(directory).join(name))
+        .find(|candidate| {
+            std::fs::metadata(candidate)
+                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+        })
+}
+
+/// Where the `task-traffic-controller` command keeps its state and reads its
+/// configuration in this environment (its own rule: XDG, else under HOME).
+pub fn cli_scope_paths(env: &BTreeMap<String, String>) -> (PathBuf, PathBuf) {
+    let home = PathBuf::from(env.get("HOME").map_or("/", String::as_str));
+    let base = |variable: &str, fallback: &str| {
+        env.get(variable)
+            .filter(|value| !value.is_empty())
+            .map_or_else(|| home.join(fallback), PathBuf::from)
+    };
+    (
+        base("XDG_STATE_HOME", ".local/state").join(TRAFFIC_CLI),
+        base("XDG_CONFIG_HOME", ".config")
+            .join(TRAFFIC_CLI)
+            .join("config.toml"),
+    )
+}
+
+/// The scope the worker's supervisors use below its state directory.
+pub fn worker_scope_paths(worker_state: &Path) -> (PathBuf, PathBuf) {
+    let state = worker_state.join("traffic");
+    let config = state.join("config.toml");
+    (state, config)
+}
+
+/// The digest task-traffic-controller itself gives an effective configuration.
+fn policy_digest(config: &Config) -> Option<String> {
+    let bytes = serde_json::to_vec(config).ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
+fn scope(state_dir: &Path, config_file: &Path) -> Scope {
+    let exists = |path: &Path| std::fs::symlink_metadata(path).is_ok();
+    let ledger = Paths::new(state_dir, config_file).ledger_file();
+    Scope {
+        state_dir: state_dir.to_string_lossy().into_owned(),
+        config_file: config_file.to_string_lossy().into_owned(),
+        in_use: exists(state_dir) || exists(config_file),
+        policy_digest: Config::load(config_file)
+            .ok()
+            .as_ref()
+            .and_then(policy_digest),
+        ledger_entries: if exists(&ledger) {
+            Ledger::load(&ledger).ok().map(|l| l.entries.len())
+        } else {
+            Some(0)
+        },
+    }
+}
+
+fn traffic_cli(env: &BTreeMap<String, String>, runner: &mut dyn Runner) -> Option<TrafficCli> {
+    let path = find_on_path(env, TRAFFIC_CLI)?;
+    let answer = runner
+        .run(&path, &["status", "--json"], env)
+        .filter(|(code, _)| *code == 0)
+        .and_then(|(_, text)| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .filter(serde_json::Value::is_object);
+    Some(TrafficCli {
+        path: path.to_string_lossy().into_owned(),
+        status_readable: answer.is_some(),
+        knows_managed: answer.is_some_and(|value| value.get("ledger_format").is_some()),
+    })
+}
+
+fn docker(env: &BTreeMap<String, String>, runner: &mut dyn Runner) -> Docker {
+    let Some(path) = find_on_path(env, "docker") else {
+        return Docker::default();
+    };
+    let mut line = |arguments: &[&str]| {
+        runner
+            .run(&path, arguments, env)
+            .filter(|(code, _)| *code == 0)
+            .map(|(_, text)| text.trim().to_string())
+            .filter(|text| !text.is_empty() && !text.contains('\n'))
+    };
+    let endpoint = env
+        .get("DOCKER_HOST")
+        .filter(|value| !value.is_empty())
+        .cloned()
+        .or_else(|| {
+            line(&[
+                "context",
+                "inspect",
+                "--format",
+                "{{.Endpoints.docker.Host}}",
+            ])
+        });
+    Docker {
+        engine_id: line(&["info", "--format", "{{.ID}}"]),
+        endpoint,
+        cli: Some(path.to_string_lossy().into_owned()),
+    }
+}
+
+fn profile(worker_state: &Path, env: &BTreeMap<String, String>) -> ProfileFacts {
+    match crate::toolchain::profile::Profile::load(worker_state, env) {
+        Ok(profile) => ProfileFacts {
+            name: Some(profile.name().to_string()),
+            fingerprint: Some(profile.startup_report().profile_fingerprint.to_string()),
+            error: None,
+        },
+        Err(error) => ProfileFacts {
+            name: None,
+            fingerprint: None,
+            error: Some(error),
+        },
+    }
+}
+
+/// Look at this host: `worker_state` is the worker's state directory and
+/// `env` the environment its service runs with.
+pub fn gather(
+    worker_state: &Path,
+    env: &BTreeMap<String, String>,
+    runner: &mut dyn Runner,
+) -> HostFacts {
+    let (worker_dir, worker_config) = worker_scope_paths(worker_state);
+    let (cli_dir, cli_config) = cli_scope_paths(env);
+    HostFacts {
+        schema: 1,
+        worker_scope: scope(&worker_dir, &worker_config),
+        cli_scope: scope(&cli_dir, &cli_config),
+        cli: traffic_cli(env, runner),
+        docker: docker(env, runner),
+        profile: profile(worker_state, env),
+    }
+}
+
+/// An endpoint on this host: a Unix socket or a pipe, not a network address.
+fn local_endpoint(endpoint: &str) -> bool {
+    endpoint.starts_with("unix://") || endpoint.starts_with("npipe://")
+}
+
+/// The checks one host's facts give.
+pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
+    let check = |id: &str, level, detail: String| Check::new(host, id, level, detail);
+    let mut out = Vec::new();
+    // The separate CLI matters when it is installed or has left state behind.
+    let cli_present = facts.cli.is_some() || facts.cli_scope.in_use;
+    out.push(match &facts.cli {
+        None => check(
+            "traffic_runtime",
+            Level::Ok,
+            "no separate task-traffic-controller command in the service environment".into(),
+        ),
+        Some(cli) if !cli.status_readable => check(
+            "traffic_runtime",
+            Level::Fail,
+            format!(
+                "{} did not answer `status --json`; its compatibility is unknown",
+                cli.path
+            ),
+        ),
+        Some(cli) if !cli.knows_managed => check(
+            "traffic_runtime",
+            Level::Fail,
+            format!(
+                "{} does not know managed entries (no `ledger_format` in `status --json`); drain its jobs ({}) and update it before it shares a scope with remote-task-runner",
+                cli.path,
+                match facts.cli_scope.ledger_entries {
+                    Some(n) => format!("{n} in its ledger"),
+                    None => "its ledger is unreadable".into(),
+                }
+            ),
+        ),
+        Some(cli) => check(
+            "traffic_runtime",
+            Level::Ok,
+            format!("{} knows managed entries", cli.path),
+        ),
+    });
+    let same_scope = facts.worker_scope.state_dir == facts.cli_scope.state_dir
+        && facts.worker_scope.config_file == facts.cli_scope.config_file;
+    out.push(if same_scope {
+        check(
+            "traffic_state_path",
+            Level::Ok,
+            format!("one scope: {}", facts.worker_scope.state_dir),
+        )
+    } else {
+        check(
+            "traffic_state_path",
+            if cli_present {
+                Level::Fail
+            } else {
+                Level::Notice
+            },
+            format!(
+                "the worker uses {} and the task-traffic-controller command uses {}: two ledgers, so two budgets{}",
+                facts.worker_scope.state_dir,
+                facts.cli_scope.state_dir,
+                if cli_present {
+                    ""
+                } else {
+                    " (the command is not installed and has no state here)"
+                }
+            ),
+        )
+    });
+    out.push(
+        match (
+            &facts.worker_scope.policy_digest,
+            &facts.cli_scope.policy_digest,
+        ) {
+            (Some(worker), Some(cli)) if worker == cli => check(
+                "traffic_policy",
+                Level::Ok,
+                format!("one effective policy: {worker}"),
+            ),
+            (Some(worker), Some(cli)) => check(
+                "traffic_policy",
+                if cli_present {
+                    Level::Fail
+                } else {
+                    Level::Notice
+                },
+                format!("the worker's policy is {worker}, the command's is {cli}"),
+            ),
+            (worker, _) => check(
+                "traffic_policy",
+                Level::Fail,
+                format!(
+                    "the {} configuration could not be read",
+                    if worker.is_none() {
+                        "worker scope's"
+                    } else {
+                        "command's"
+                    }
+                ),
+            ),
+        },
+    );
+    out.push(match (&facts.docker.cli, &facts.docker.engine_id) {
+        (None, _) => check(
+            "docker_resource_domain",
+            Level::Ok,
+            "no docker client in the service environment".into(),
+        ),
+        (Some(_), _)
+            if facts
+                .docker
+                .endpoint
+                .as_deref()
+                .is_some_and(|e| !local_endpoint(e)) =>
+        {
+            check(
+                "docker_resource_domain",
+                Level::Fail,
+                format!(
+                    "the docker client connects to {}: an engine on another host is a resource domain this version does not manage",
+                    facts.docker.endpoint.as_deref().unwrap_or_default()
+                ),
+            )
+        }
+        (Some(cli), None) => check(
+            "docker_resource_domain",
+            Level::Notice,
+            format!("{cli} is installed but no engine answered in the service environment"),
+        ),
+        (Some(_), Some(engine)) => check(
+            "docker_resource_domain",
+            Level::Ok,
+            format!("engine {engine} on this host"),
+        ),
+    });
+    out.push(match &facts.profile {
+        ProfileFacts {
+            error: Some(error), ..
+        } => check(
+            "service_profile",
+            Level::Fail,
+            format!("the worker profile does not load in the service environment: {error}"),
+        ),
+        ProfileFacts {
+            name, fingerprint, ..
+        } => check(
+            "service_profile",
+            Level::Ok,
+            format!(
+                "profile {} ({})",
+                name.as_deref().unwrap_or("?"),
+                fingerprint.as_deref().unwrap_or("?")
+            ),
+        ),
+    });
+    out
+}
+
+/// Hosts that reach the same Docker engine: its capacity would be counted
+/// once per host. `hosts` is `(name, engine id)`.
+pub fn shared_engines(hosts: &[(String, Option<String>)]) -> Vec<Check> {
+    let mut by_engine: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for (host, engine) in hosts {
+        if let Some(engine) = engine {
+            by_engine.entry(engine).or_default().push(host);
+        }
+    }
+    by_engine
+        .into_iter()
+        .filter(|(_, hosts)| hosts.len() > 1)
+        .flat_map(|(engine, hosts)| {
+            let all = hosts.join(", ");
+            hosts.into_iter().map(move |host| {
+                Check::new(
+                    host,
+                    "docker_shared_engine",
+                    Level::Fail,
+                    format!("engine {engine} is also used by: {all}; one engine must not be counted as separate resources"),
+                )
+            })
+        })
+        .collect()
+}
+
+/// The checks a worker's service status gives. `parent_version` is the
+/// digest of the binary that runs `doctor`.
+pub fn service_checks(host: &str, status: &Status, parent_version: &str) -> Vec<Check> {
+    let short = |digest: &str| digest.get(..12).unwrap_or(digest).to_string();
+    let service = if status.switching_from.is_some() {
+        Check::new(
+            host,
+            "service",
+            Level::Fail,
+            "a version switch is unfinished; run workers upgrade",
+        )
+    } else {
+        match (status.loaded, status.ready) {
+            (Some(true), true) if status.draining => {
+                Check::new(host, "service", Level::Notice, "running, draining")
+            }
+            (Some(true), true) => Check::new(host, "service", Level::Ok, "running"),
+            (Some(true), false) => Check::new(
+                host,
+                "service",
+                Level::Fail,
+                "loaded, but the agent does not accept connections",
+            ),
+            (Some(false), _) => Check::new(host, "service", Level::Fail, "not loaded"),
+            (None, _) => Check::new(
+                host,
+                "service",
+                Level::Fail,
+                "the loaded service could not be identified",
+            ),
+        }
+    };
+    let version = if status.binary_sha256 == parent_version {
+        Check::new(
+            host,
+            "version",
+            Level::Ok,
+            format!("same build as the parent ({})", short(parent_version)),
+        )
+    } else {
+        Check::new(
+            host,
+            "version",
+            Level::Notice,
+            format!(
+                "runs {}, the parent is {}; run workers upgrade",
+                short(&status.binary_sha256),
+                short(parent_version)
+            ),
+        )
+    };
+    vec![service, version]
+}
+
+/// What a worker host answers to `worker-service doctor`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HostAnswer {
+    pub status: Status,
+    pub facts: HostFacts,
+}
+
+/// The hidden `worker-service doctor`: facts about this host on stdout.
+pub fn host_main() -> i32 {
+    let env: BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    let answer = super::worker_service::service_view(&env, super::macos::NativeLauncher::default())
+        .map(|(status, state, service_env)| HostAnswer {
+            status,
+            facts: gather(&state, &service_env, &mut SystemRunner),
+        });
+    match answer {
+        Ok(answer) => {
+            println!("{}", serde_json::json!({"ok": true, "doctor": answer}));
+            0
+        }
+        Err(error) => {
+            println!(
+                "{}",
+                serde_json::json!({"ok": false, "error": format!("{error:#}")})
+            );
+            1
+        }
+    }
+}
+
+/// Read a worker's answer. Every way of not getting one is a reason, never
+/// a pass.
+fn parse_answer(output: &RemoteOutput) -> Result<HostAnswer, String> {
+    if output.code == Some(255) {
+        return Err("the worker could not be reached over ssh".into());
+    }
+    let line = output
+        .stdout
+        .split(|b| *b == b'\n')
+        .rfind(|l| !l.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "the worker helper gave no answer (exit {:?}); a helper that predates doctor answers like this, run workers upgrade",
+                output.code
+            )
+        })?;
+    let value: serde_json::Value = serde_json::from_slice(line)
+        .map_err(|_| "the worker helper answer was unreadable".to_string())?;
+    if value["ok"] == true && output.code == Some(0) {
+        return serde_json::from_value(value["doctor"].clone())
+            .map_err(|_| "the worker facts were unreadable; run workers upgrade".to_string());
+    }
+    Err(format!(
+        "the worker helper refused: {}",
+        value["error"].as_str().unwrap_or("unspecified")
+    ))
+}
+
+#[derive(Debug, Serialize)]
+pub struct Report {
+    /// No check failed. `not_checked` entries are listed, not counted as passed.
+    pub healthy: bool,
+    pub failed: usize,
+    pub not_checked: usize,
+    pub checks: Vec<Check>,
+}
+impl Report {
+    fn of(checks: Vec<Check>) -> Self {
+        let count = |level| checks.iter().filter(|c| c.level == level).count();
+        let failed = count(Level::Fail);
+        Report {
+            healthy: failed == 0,
+            failed,
+            not_checked: count(Level::NotChecked),
+            checks,
+        }
+    }
+}
+
+/// Unsupported legacy keys of the project the command was run in. Only keys
+/// that carry a value are said; a project whose configuration could not be
+/// resolved is listed as not looked at.
+pub fn project_checks(notices: Result<&[crate::config::resolve::Notice], String>) -> Vec<Check> {
+    match notices {
+        Ok(notices) => notices
+            .iter()
+            .map(|notice| {
+                Check::new(
+                    "project",
+                    "legacy_config",
+                    Level::Notice,
+                    format!("`{}` in {}: {}", notice.key, notice.file, notice.reason),
+                )
+            })
+            .collect(),
+        Err(why) => vec![Check::new(
+            "project",
+            "legacy_config",
+            Level::NotChecked,
+            format!("the project configuration here could not be resolved ({why}); unsupported legacy keys were not looked for"),
+        )],
+    }
+}
+
+/// Where another line's checks join the report (`workers diff`, §22.2).
+/// `None`: this build has none, and the report says so per worker.
+pub type DiffSource<'a> = Option<&'a mut dyn FnMut(&str) -> Vec<Check>>;
+
+/// Everything `doctor` looks at. `env` is the invoking environment (it
+/// locates the user configuration); `spec` is the initialized coordinator.
+pub fn run(
+    remote: &mut impl Remote,
+    runner: &mut dyn Runner,
+    env: &BTreeMap<String, String>,
+    spec: &Spec,
+    parent_version: &str,
+    mut diff: DiffSource,
+) -> Result<Report, ApiError> {
+    let cluster = spec.expected_cluster.clone().ok_or_else(|| {
+        ApiError::new(
+            ErrorCode::InvalidInput,
+            "the coordinator has no cluster identity; run init",
+        )
+    })?;
+    let mut checks = Vec::new();
+    let mut engines = Vec::new();
+    // The parent's own worker, in the environment its service was given.
+    let retained = spec.env.contains_key("HOME");
+    checks.push(if retained {
+        Check::new(
+            "parent",
+            "service_environment",
+            Level::Ok,
+            "checked in the environment retained for the service",
+        )
+    } else {
+        Check::new(
+            "parent",
+            "service_environment",
+            Level::Notice,
+            "no service environment is retained; checked in this shell's environment, which the service may not share",
+        )
+    });
+    let local = gather(
+        &spec.worker_state_dir,
+        if retained { &spec.env } else { env },
+        runner,
+    );
+    checks.extend(evaluate("parent", &local));
+    engines.push(("parent".to_string(), local.docker.engine_id.clone()));
+    for worker in workers::registrations(env)? {
+        let host = worker.id.as_str();
+        let looked = look_at_worker(remote, &worker, &cluster);
+        match looked {
+            Err(reason) => checks.push(Check::new(host, "reachable", Level::Fail, reason)),
+            Ok((answer, bridge)) => {
+                checks.push(Check::new(
+                    host,
+                    "reachable",
+                    Level::Ok,
+                    "answered over ssh",
+                ));
+                checks.extend(service_checks(host, &answer.status, parent_version));
+                checks.push(match bridge {
+                    Ok(()) => Check::new(
+                        host,
+                        "bridge",
+                        Level::Ok,
+                        "hello completed with every required feature",
+                    ),
+                    Err(reason) => Check::new(host, "bridge", Level::Fail, reason),
+                });
+                checks.extend(evaluate(host, &answer.facts));
+                engines.push((host.to_string(), answer.facts.docker.engine_id.clone()));
+            }
+        }
+        checks.extend(match diff.as_mut() {
+            Some(source) => source(host),
+            None => vec![Check::new(
+                host,
+                "environment_diff",
+                Level::NotChecked,
+                "workers diff is not part of this build; toolchain and tool differences were not compared",
+            )],
+        });
+    }
+    checks.extend(shared_engines(&engines));
+    Ok(Report::of(checks))
+}
+
+/// One worker: its facts and whether its bridge completes `hello`.
+fn look_at_worker(
+    remote: &mut impl Remote,
+    worker: &workers::Registered,
+    cluster: &ClusterId,
+) -> Result<(HostAnswer, Result<(), String>), String> {
+    let target = SshTarget::parse(&worker.ssh).map_err(|e| e.to_string())?;
+    let binary = worker
+        .binary
+        .as_deref()
+        .ok_or("the registration has no binary path; run workers add --install for this worker")?;
+    let shell = format!(
+        "exec {} {} {}",
+        quote(binary),
+        quote("worker-service"),
+        quote("doctor")
+    );
+    let output = remote.run(&target, &shell, &[], Duration::from_secs(120))?;
+    let answer = parse_answer(&output)?;
+    if answer.status.worker_id.as_str() != worker.id || &answer.status.cluster != cluster {
+        return Err("the host answered for a different worker identity or cluster".into());
+    }
+    let bridge = remote
+        .bridge_hello(&target, binary, cluster)
+        .map_err(|m| format!("the worker bridge did not complete hello: {m}"))
+        .and_then(
+            |(answered_cluster, answered_worker): (ClusterId, WorkerId)| {
+                if answered_worker.as_str() == worker.id && &answered_cluster == cluster {
+                    Ok(())
+                } else {
+                    Err("the worker bridge answered for a different worker or cluster".to_string())
+                }
+            },
+        );
+    Ok((answer, bridge))
+}
+
+fn text(report: &Report) -> String {
+    let mut out = String::new();
+    for check in &report.checks {
+        let mark = match check.level {
+            Level::Ok => "ok",
+            Level::Notice => "notice",
+            Level::Fail => "FAIL",
+            Level::NotChecked => "not checked",
+        };
+        out.push_str(&format!(
+            "[{mark}] {} {}: {}\n",
+            check.host, check.id, check.detail
+        ));
+    }
+    out.push_str(&format!(
+        "{} failed, {} not checked, {} checks",
+        report.failed,
+        report.not_checked,
+        report.checks.len()
+    ));
+    out
+}
+
+/// The `doctor` command. Exit 0 only when no check failed.
+pub fn command(json: bool) -> i32 {
+    let env: BTreeMap<String, String> = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    let result = std::env::current_exe()
+        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))
+        .and_then(|exe| {
+            let version = super::worker_service::sha256_file(&exe)
+                .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+            let spec = super::context::runtime_spec(&env)?;
+            let report = run(
+                &mut workers::SshRemote,
+                &mut SystemRunner,
+                &env,
+                &spec,
+                &version,
+                None,
+            )?;
+            let project = std::env::current_dir()
+                .map_err(|e| e.to_string())
+                .and_then(|cwd| {
+                    super::context::Context::load(env.clone(), cwd, spec).map_err(|e| e.message)
+                });
+            let mut checks = report.checks;
+            checks.extend(project_checks(
+                project
+                    .as_ref()
+                    .map(|context| context.config.notices.as_slice())
+                    .map_err(Clone::clone),
+            ));
+            Ok(Report::of(checks))
+        });
+    match result {
+        Ok(report) if report.healthy => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":true,"result":report})
+                );
+            } else {
+                println!("{}", text(&report));
+            }
+            crate::cli::exit::SUCCESS
+        }
+        Ok(report) => {
+            let code = ErrorCode::Blocked;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":{"code":code,"blocked_reason":crate::error::BlockedReason::EnvironmentMismatch,"message":format!("{} check(s) failed", report.failed)},"result":report})
+                );
+            } else {
+                println!("{}", text(&report));
+                eprintln!("error: {} check(s) failed", report.failed);
+            }
+            code.exit_code()
+        }
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":{"code":error.code,"message":error.message}})
+                );
+            } else {
+                eprintln!("error: {}", error.message);
+            }
+            error.code.exit_code()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests;

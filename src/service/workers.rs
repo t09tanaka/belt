@@ -421,6 +421,29 @@ fn registered(
         }))
 }
 
+/// One `[[workers]]` entry of the user configuration.
+pub struct Registered {
+    pub id: String,
+    pub ssh: String,
+    pub binary: Option<String>,
+}
+
+/// Every registered worker, in configuration order.
+pub fn registrations(env: &BTreeMap<String, String>) -> Result<Vec<Registered>, ApiError> {
+    let (path, text) = read_user_config(env)?;
+    let user = crate::config::parse::parse_user(&path.to_string_lossy(), &text)
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok(user
+        .workers
+        .into_iter()
+        .map(|w| Registered {
+            id: w.id,
+            ssh: w.ssh,
+            binary: w.binary,
+        })
+        .collect())
+}
+
 /// Append one `[[workers]]` table, atomically, keeping every other byte.
 fn register(
     env: &BTreeMap<String, String>,
