@@ -329,6 +329,8 @@ mod tests {
             using: None,
             backfilled: false,
             label: None,
+            worktree: None,
+            branch: None,
             parent: parent.map(str::to_string),
             nested_cpu_secs: 0.0,
         }

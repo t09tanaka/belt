@@ -7,6 +7,20 @@ the minor version).
 
 ## [Unreleased]
 
+### Changed
+
+- **`top` shows one table on a shared time axis, colored by worktree.**
+  The running and waiting tables are now one list, numbered from 1 (running
+  first, soonest to finish first, then the queue), with a bar for every row
+  on the same axis (`now` line, `+2m` labels, red overrun, `┄` for rough
+  estimates). The colors no longer mark entries; they mark the git worktree
+  a command was queued from, so two parallel runs of one repository from
+  different worktrees can be told apart. The row of your own worktree is
+  bold with a `›`. Held entries are one line at the bottom.
+- `exec` records the worktree and branch it was called from in the ledger
+  (`worktree`, `branch`; absent in older entries, ignored by older
+  versions). They are not part of the history key.
+
 ## [0.9.0] - 2026-11-16
 
 ### Changed

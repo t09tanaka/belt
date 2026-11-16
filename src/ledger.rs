@@ -46,6 +46,16 @@ pub struct Entry {
     /// and `top` instead of the command line. Never part of the history key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The git worktree (`git rev-parse --show-toplevel`) the command was
+    /// queued from, so `top` can tell apart runs of one repository started
+    /// from different worktrees. Absent outside git and in entries written
+    /// before it existed; never part of the history key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<String>,
+    /// The branch checked out in that worktree when it was queued, or the
+    /// short commit hash when HEAD was detached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
     /// The running entry whose command started this one (a nested `exec`).
     /// Such an entry is admitted against the same budget, and what it takes
     /// is counted inside its parent's share first (see
@@ -295,6 +305,8 @@ mod tests {
             using: None,
             backfilled: false,
             label: None,
+            worktree: None,
+            branch: None,
             parent: None,
             nested_cpu_secs: 0.0,
         }
@@ -381,6 +393,39 @@ mod tests {
         // And a ledger written before labels existed still loads.
         let back = Ledger::load(&d.path().join("ledger.json")).unwrap();
         assert_eq!(back, l);
+    }
+
+    #[test]
+    fn a_worktree_is_additive_and_older_binaries_ignore_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut l = Ledger::default();
+        let mut e = entry("a", 1);
+        e.worktree = Some("/w/feature".into());
+        e.branch = Some("feat/x".into());
+        l.entries.push(e);
+        l.entries.push(entry("b", 2));
+        let json = save_with_sidecars(&l, d.path(), &[]);
+        let v: serde_json::Value = serde_json::from_slice(&json).unwrap();
+        assert_eq!(v["version"], SCHEMA_VERSION);
+        assert_eq!(v["entries"][0]["worktree"], "/w/feature");
+        assert_eq!(v["entries"][0]["branch"], "feat/x");
+        assert!(v["entries"][1].get("worktree").is_none());
+        assert!(v["entries"][1].get("branch").is_none());
+        let old: old::Ledger = serde_json::from_slice(&json).unwrap();
+        assert_eq!(old.entries.len(), 2);
+        // A ledger written before worktrees were recorded still loads.
+        let back = Ledger::load(&d.path().join("ledger.json")).unwrap();
+        assert_eq!(back, l);
+        let mut bare = serde_json::to_value(&l).unwrap();
+        for e in bare["entries"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("worktree");
+            e.as_object_mut().unwrap().remove("branch");
+        }
+        let parsed: Ledger = serde_json::from_value(bare).unwrap();
+        assert!(parsed
+            .entries
+            .iter()
+            .all(|e| e.worktree.is_none() && e.branch.is_none()));
     }
 
     #[test]

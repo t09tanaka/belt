@@ -2,8 +2,12 @@
 //! refreshed every `--interval` seconds and on resize.
 //!
 //! [`View`] is a plain description of what is on screen, built from the
-//! ledger by [`View::build`] (pure) and drawn by [`draw`].
+//! ledger by [`View::build`] (pure) and drawn by [`draw`]. Everything that
+//! decides what a row says (order, numbers, the shared time axis, the bar
+//! strings, worktree colors, column widths) is a pure function below, so it
+//! is tested without a terminal.
 
+use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -13,20 +17,23 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Cell, Paragraph, Row, Table};
+use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use task_traffic_controller::admit::{self, Decision, Limits, LiveSnapshot, Reason, State};
 use task_traffic_controller::config::Config;
 use task_traffic_controller::display::{fmt_bytes, fmt_duration, is_idle, running_for, truncate};
 use task_traffic_controller::error::{Error, Result};
 use task_traffic_controller::ledger::{Entry, Ledger};
-use task_traffic_controller::{eta, exec, key, lock, managed, Context};
+use task_traffic_controller::{eta, exec, gitctx, key, lock, managed, Context};
 
-/// One running entry's share of the budget bar.
+/// One running entry's share of the cores bar.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Slot {
-    pub letter: char,
+    /// The row number in the table.
+    pub num: usize,
     pub slots: u32,
+    /// Index into [`View::worktrees`].
+    pub wt: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -38,21 +45,38 @@ pub enum Progress {
     Known { pct: u8, left: Duration, over: bool },
 }
 
+/// A worktree with something queued or running in it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Wt {
+    pub path: String,
+    /// Branch, or the short commit hash when detached; empty when unknown.
+    pub branch: String,
+    /// The repository's own (main) worktree, as opposed to a linked one.
+    pub main: bool,
+    /// Where `top` was started.
+    pub mine: bool,
+    pub color: Color,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunRow {
-    pub letter: char,
+    /// Position in the table, from 1.
+    pub num: usize,
     pub project: String,
     pub job: String,
     pub weight: u32,
     pub using: Option<f64>,
     pub elapsed: Duration,
+    pub expected_secs: Option<f64>,
     pub progress: Progress,
     pub idle: bool,
     pub backfilled: bool,
+    pub wt: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct WaitRow {
+    pub num: usize,
     pub project: String,
     pub job: String,
     pub weight: u32,
@@ -61,7 +85,10 @@ pub struct WaitRow {
     pub why: String,
     /// Seconds until the estimated start; None when there is no estimate.
     pub start_in: Option<f64>,
+    /// The learned wall time; None when the command has no history.
+    pub expected_secs: Option<f64>,
     pub rough: bool,
+    pub wt: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -82,21 +109,26 @@ pub struct View {
     pub now: DateTime<Utc>,
     pub budget: u32,
     pub used: u32,
-    /// One per running entry, in `running` order. Slots sum to at most
+    /// One per running entry, in table order. Slots sum to at most
     /// `budget`; `slots + free == budget`.
     pub slots: Vec<Slot>,
     pub free: u32,
     /// Slots charged beyond the budget (measured use above the weight).
     pub over: u32,
     pub machine: Option<Machine>,
+    /// In order of first appearance in the table.
+    pub worktrees: Vec<Wt>,
+    /// Soonest to finish first.
     pub running: Vec<RunRow>,
+    /// In queue order; numbered after the running rows.
     pub waiting: Vec<WaitRow>,
     pub held: Vec<HeldRow>,
 }
 
 impl View {
-    /// Read the ledger and the machine, then [`View::from_parts`].
-    pub fn build(ctx: &Context, cfg: &Config) -> Result<View> {
+    /// Read the ledger and the machine, then [`View::from_parts`]. `me` is
+    /// the worktree `top` was started in.
+    pub fn build(ctx: &Context, cfg: &Config, me: Option<&str>) -> Result<View> {
         let ledger = lock::load_reaped(ctx)?;
         let held = managed::views(ctx, &ledger.entries)
             .into_iter()
@@ -113,6 +145,7 @@ impl View {
             cfg.limits(),
             ctx.live.snapshot(),
             ctx.clock.now(),
+            me,
         ))
     }
 
@@ -122,6 +155,7 @@ impl View {
         limits: Limits,
         live: Option<LiveSnapshot>,
         now: DateTime<Utc>,
+        me: Option<&str>,
     ) -> View {
         let queue = ledger.queue_at(now);
         let used = admit::used_budget(&queue);
@@ -137,53 +171,75 @@ impl View {
             })
             .collect();
 
-        let mut running: Vec<&Entry> = ledger
+        // Budget slots are handed out in start order (the oldest run keeps
+        // its share when the total overflows); the table is ordered by
+        // finish. Remember each run's slots by id.
+        let mut by_start: Vec<&Entry> = ledger
             .entries
             .iter()
             .filter(|e| e.state == State::Running)
             .collect();
-        running.sort_by_key(|e| e.started_at);
-
-        let mut slots = Vec::new();
+        by_start.sort_by_key(|e| e.started_at);
+        let mut fits: HashMap<&str, u32> = HashMap::new();
         let mut taken = 0u32;
         let mut over = 0u32;
-        let mut run_rows = Vec::new();
-        for (i, e) in running.iter().enumerate() {
-            let letter = letter(i);
+        for e in &by_start {
             let charged = queue
                 .iter()
                 .find(|q| q.id == e.id)
                 .map(admit::charged)
                 .unwrap_or(e.weight);
-            let fits = charged.min(limits.budget.saturating_sub(taken));
-            over += charged - fits;
-            taken += fits;
+            let fit = charged.min(limits.budget.saturating_sub(taken));
+            over += charged - fit;
+            taken += fit;
+            fits.insert(e.id.as_str(), fit);
+        }
+
+        let mut running = by_start;
+        order_running(&mut running, now);
+        let order = admit::queue_order(&queue);
+        let waiting: Vec<&Entry> = order.iter().filter_map(|q| ledger.find(&q.id)).collect();
+
+        let table: Vec<&Entry> = running.iter().chain(&waiting).copied().collect();
+        let worktrees = worktrees_of(&table, me);
+        let wt_of = |e: &Entry| -> Option<usize> {
+            let p = e.worktree.as_deref()?;
+            worktrees.iter().position(|w| w.path == p)
+        };
+
+        let mut slots = Vec::new();
+        let mut run_rows = Vec::new();
+        for (i, e) in running.iter().enumerate() {
+            let num = i + 1;
             slots.push(Slot {
-                letter,
-                slots: fits,
+                num,
+                slots: fits.get(e.id.as_str()).copied().unwrap_or(0),
+                wt: wt_of(e),
             });
             let elapsed = running_for(e, now);
             run_rows.push(RunRow {
-                letter,
+                num,
                 project: project(e),
                 job: job_name(e),
                 weight: e.weight,
                 using: e.using,
                 elapsed,
+                expected_secs: e.expected_secs.filter(|x| *x > 0.0),
                 progress: progress(elapsed, e.expected_secs),
                 idle: is_idle(e.using, elapsed),
                 backfilled: e.backfilled,
+                wt: wt_of(e),
             });
         }
 
-        let order = admit::queue_order(&queue);
         let mut wait_rows = Vec::new();
-        for q in &order {
-            let Some(e) = ledger.find(&q.id) else {
+        for (i, e) in waiting.iter().enumerate() {
+            let Some(q) = queue.iter().find(|q| q.id == e.id) else {
                 continue;
             };
             let est = eta::estimate(&timed, limits, &e.id);
             wait_rows.push(WaitRow {
+                num: run_rows.len() + i + 1,
                 project: project(e),
                 job: job_name(e),
                 weight: e.weight,
@@ -191,7 +247,9 @@ impl View {
                 front: e.front,
                 why: why(&queue, q, limits, live),
                 start_in: est.as_ref().map(|x| x.start_in),
+                expected_secs: e.expected_secs.filter(|x| *x > 0.0),
                 rough: est.as_ref().is_some_and(|x| x.rough),
+                wt: wt_of(e),
             });
         }
 
@@ -206,6 +264,7 @@ impl View {
                 cpu_busy: s.cpu_busy,
                 available_memory: s.available_memory,
             }),
+            worktrees,
             running: run_rows,
             waiting: wait_rows,
             held,
@@ -213,9 +272,25 @@ impl View {
     }
 }
 
-/// A, B, C, ... Z, then back to A.
-fn letter(i: usize) -> char {
-    (b'A' + (i % 26) as u8) as char
+/// Seconds a running entry is still expected to run, or `None` without a
+/// learned wall time. An overrun counts as 0 (it may end any moment).
+fn remaining_secs(e: &Entry, now: DateTime<Utc>) -> Option<f64> {
+    let exp = e.expected_secs.filter(|x| *x > 0.0)?;
+    Some((exp - running_for(e, now).as_secs_f64()).max(0.0))
+}
+
+/// Soonest to finish first; runs with no learned time last, oldest first.
+fn order_running(running: &mut [&Entry], now: DateTime<Utc>) {
+    running.sort_by(|a, b| {
+        let (x, y) = (remaining_secs(a, now), remaining_secs(b, now));
+        match (x, y) {
+            (Some(x), Some(y)) => x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal),
+            (Some(_), None) => std::cmp::Ordering::Less,
+            (None, Some(_)) => std::cmp::Ordering::Greater,
+            (None, None) => std::cmp::Ordering::Equal,
+        }
+        .then(a.started_at.cmp(&b.started_at))
+    });
 }
 
 /// Repo basename, plus `/subdir` when there is one.
@@ -281,42 +356,514 @@ fn why(
     }
 }
 
-// ---------------------------------------------------------------- drawing
+// ------------------------------------------------------------- worktrees
 
-const PALETTE: [Color; 8] = [
+/// Colors a worktree can get. No red (overruns), yellow (idle) or gray
+/// (a repository with a single worktree).
+const WT_COLORS: [Color; 8] = [
     Color::Cyan,
     Color::Green,
-    Color::Yellow,
     Color::Magenta,
     Color::Blue,
-    Color::LightMagenta,
     Color::LightCyan,
     Color::LightGreen,
+    Color::LightMagenta,
+    Color::LightBlue,
 ];
 
-fn color(letter: char) -> Color {
-    PALETTE[(letter as usize - 'A' as usize) % PALETTE.len()]
+/// FNV-1a: stable across runs and platforms, unlike `DefaultHasher`.
+fn fnv1a(s: &str) -> u64 {
+    s.bytes().fold(0xcbf2_9ce4_8422_2325, |h, b| {
+        (h ^ b as u64).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
+/// The color of the worktree at `path`, from a hash of the path. Gray when
+/// the repository has only one worktree in the queue (`siblings` <= 1):
+/// there is nothing to tell apart.
+fn worktree_color(path: &str, siblings: usize) -> Color {
+    if siblings <= 1 {
+        return Color::Gray;
+    }
+    WT_COLORS[(fnv1a(path) % WT_COLORS.len() as u64) as usize]
+}
+
+/// The distinct worktrees of `table` (running first, then waiting), in
+/// order of first appearance. The branch is the newest entry's.
+fn worktrees_of(table: &[&Entry], me: Option<&str>) -> Vec<Wt> {
+    let mut out: Vec<(Wt, u64, String)> = Vec::new();
+    for e in table {
+        let Some(path) = e.worktree.as_deref() else {
+            continue;
+        };
+        let branch = e.branch.clone().unwrap_or_default();
+        match out.iter_mut().find(|(w, _, _)| w.path == path) {
+            Some((w, seq, _)) => {
+                if e.seq > *seq {
+                    *seq = e.seq;
+                    w.branch = branch;
+                }
+            }
+            None => out.push((
+                Wt {
+                    path: path.to_string(),
+                    branch,
+                    main: e.repo == path,
+                    mine: me == Some(path),
+                    color: Color::Gray,
+                },
+                e.seq,
+                e.repo.clone(),
+            )),
+        }
+    }
+    let repos: Vec<String> = out.iter().map(|(_, _, r)| r.clone()).collect();
+    out.into_iter()
+        .map(|(mut w, _, repo)| {
+            let siblings = repos.iter().filter(|r| **r == repo).count();
+            w.color = worktree_color(&w.path, siblings);
+            w
+        })
+        .collect()
+}
+
+/// `s` cut to `max` characters with the middle replaced by `…`.
+fn ellipsize_middle(s: &str, max: usize) -> String {
+    let n = s.chars().count();
+    if n <= max {
+        return s.to_string();
+    }
+    if max <= 1 {
+        return "…".repeat(max);
+    }
+    let keep = max - 1;
+    let head = keep.div_ceil(2);
+    let tail = keep - head;
+    let h: String = s.chars().take(head).collect();
+    let t: String = s.chars().skip(n - tail).collect();
+    format!("{h}…{t}")
+}
+
+// ------------------------------------------------------- the time axis
+
+/// Seconds per column the axis can use, finest first.
+const SCALES: [f64; 24] = [
+    1.0, 2.0, 3.0, 5.0, 10.0, 15.0, 20.0, 30.0, 45.0, 60.0, 90.0, 120.0, 180.0, 300.0, 450.0,
+    600.0, 900.0, 1200.0, 1800.0, 3600.0, 7200.0, 14400.0, 28800.0, 86400.0,
+];
+
+/// Tick spacings for the labels on top.
+const TICKS: [f64; 14] = [
+    10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1800.0, 3600.0, 7200.0, 14400.0, 28800.0,
+    43200.0, 86400.0,
+];
+
+/// What one bar needs to know. Times in seconds.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum BarSpec {
+    Running {
+        elapsed: f64,
+        expected: Option<f64>,
+    },
+    Waiting {
+        start_in: Option<f64>,
+        expected: Option<f64>,
+        rough: bool,
+    },
+}
+
+impl BarSpec {
+    fn of_run(r: &RunRow) -> BarSpec {
+        BarSpec::Running {
+            elapsed: r.elapsed.as_secs_f64(),
+            expected: r.expected_secs,
+        }
+    }
+
+    fn of_wait(w: &WaitRow) -> BarSpec {
+        BarSpec::Waiting {
+            start_in: w.start_in,
+            expected: w.expected_secs,
+            rough: w.rough,
+        }
+    }
+
+    /// Seconds to the right of "now" this bar needs.
+    fn ahead(&self) -> f64 {
+        match *self {
+            BarSpec::Running { elapsed, expected } => {
+                expected.map_or(0.0, |x| (x - elapsed).max(0.0))
+            }
+            BarSpec::Waiting {
+                start_in, expected, ..
+            } => start_in.unwrap_or(0.0).max(0.0) + expected.unwrap_or(0.0),
+        }
+    }
+
+    /// Seconds to the left of "now".
+    fn behind(&self) -> f64 {
+        match *self {
+            BarSpec::Running { elapsed, .. } => elapsed,
+            BarSpec::Waiting { .. } => 0.0,
+        }
+    }
+}
+
+/// One scale for every row: `now` sits at column `now_col`, a column is
+/// `secs_per_col` seconds wide.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Scale {
+    pub secs_per_col: f64,
+    pub now_col: usize,
+    pub width: usize,
+}
+
+/// Columns needed to show `secs` (at least one when there is any).
+fn cols_for(secs: f64, per_col: f64) -> usize {
+    if secs <= 0.0 {
+        0
+    } else {
+        ((secs / per_col).ceil() as usize).max(1)
+    }
+}
+
+/// The finest scale at which the row that ends last still fits in `width`
+/// columns. What has already run takes at most a third of the width, so an
+/// old run cannot squeeze out the future; the rest is cut with `←`. When
+/// even the coarsest scale is too small, the bar is cut with `→`.
+pub fn compute_scale(specs: &[BarSpec], width: usize) -> Scale {
+    let behind = specs.iter().map(BarSpec::behind).fold(0.0, f64::max);
+    let ahead = specs.iter().map(BarSpec::ahead).fold(0.0, f64::max);
+    let now_col = |per: f64| cols_for(behind, per).min(width / 3);
+    let per_col = SCALES
+        .iter()
+        .copied()
+        .find(|&s| now_col(s) + 1 + cols_for(ahead, s) <= width)
+        .unwrap_or(SCALES[SCALES.len() - 1]);
+    Scale {
+        secs_per_col: per_col,
+        now_col: now_col(per_col),
+        width,
+    }
+}
+
+/// A bar `scale.width` characters wide.
+///
+/// - `█` ran, `▓` ran past its expected time, `▒` expected to run, `┄` the
+///   same when the estimate is rough, `│` now.
+/// - `→` the duration is unknown (just a start), or the bar goes on past
+///   the right edge; `←` a run older than the left edge.
+pub fn bar_string(spec: BarSpec, scale: Scale) -> String {
+    let w = scale.width;
+    if w == 0 {
+        return String::new();
+    }
+    let now = scale.now_col.min(w - 1);
+    let per = scale.secs_per_col;
+    let mut cells = vec![' '; w];
+    cells[now] = '│';
+    let fill = |cells: &mut Vec<char>, from: usize, len: usize, c: char| {
+        let to = (from + len).min(w);
+        for cell in cells.iter_mut().take(to).skip(from) {
+            *cell = c;
+        }
+        if from + len > w && w > 0 {
+            cells[w - 1] = '→';
+        }
+    };
+    match spec {
+        BarSpec::Running { elapsed, expected } => {
+            let want = cols_for(elapsed, per);
+            let drawn = want.min(now);
+            let start = now - drawn;
+            for cell in cells.iter_mut().take(now).skip(start) {
+                *cell = '█';
+            }
+            if let Some(x) = expected.filter(|x| elapsed > *x) {
+                let over = cols_for(elapsed - x, per).min(drawn);
+                for cell in cells.iter_mut().take(now).skip(now - over) {
+                    *cell = '▓';
+                }
+            }
+            if want > now && now > 0 {
+                cells[0] = '←';
+            }
+            match expected {
+                Some(x) if x > elapsed => {
+                    fill(&mut cells, now + 1, cols_for(x - elapsed, per), '▒');
+                }
+                Some(_) => {}
+                None => fill(&mut cells, now + 1, 1, '→'),
+            }
+        }
+        BarSpec::Waiting {
+            start_in,
+            expected,
+            rough,
+        } => {
+            let from = now + 1 + (start_in.unwrap_or(0.0).max(0.0) / per).floor() as usize;
+            if from >= w {
+                cells[w - 1] = '→';
+            } else {
+                match expected {
+                    Some(x) => {
+                        let c = if rough { '┄' } else { '▒' };
+                        fill(&mut cells, from, cols_for(x, per).max(1), c);
+                    }
+                    None => cells[from] = '→',
+                }
+            }
+        }
+    }
+    cells.into_iter().collect()
+}
+
+/// `+45s`, `+2m`, `+1h30m`.
+fn fmt_tick(secs: f64) -> String {
+    let s = secs.round() as u64;
+    let (h, m, sec) = (s / 3600, (s % 3600) / 60, s % 60);
+    let mut out = String::from("+");
+    if h > 0 {
+        out.push_str(&format!("{h}h"));
+    }
+    if m > 0 {
+        out.push_str(&format!("{m}m"));
+    }
+    if sec > 0 || (h == 0 && m == 0) {
+        out.push_str(&format!("{sec}s"));
+    }
+    out
+}
+
+/// The ruler above the bars: `now` at the vertical line, then `+2m`-style
+/// labels to the right, at least 7 columns apart (closer, down to 3, when
+/// nothing would fit otherwise).
+pub fn axis_line(scale: Scale) -> String {
+    let w = scale.width;
+    let put = |cells: &mut [char], at: usize, text: &str| -> bool {
+        let n = text.chars().count();
+        if at + n > w {
+            return false;
+        }
+        for (i, c) in text.chars().enumerate() {
+            cells[at + i] = c;
+        }
+        true
+    };
+    let mut cells = vec![' '; w];
+    let mut next_free = 0;
+    if put(&mut cells, scale.now_col.min(w), "now") {
+        next_free = scale.now_col + 4;
+    }
+    for min_cols in [7.0, 5.0, 3.0] {
+        let tick = TICKS
+            .iter()
+            .copied()
+            .find(|t| t / scale.secs_per_col >= min_cols)
+            .unwrap_or(TICKS[TICKS.len() - 1]);
+        let mut placed = false;
+        let mut free = next_free;
+        let mut line = cells.clone();
+        for k in 1.. {
+            let t = tick * k as f64;
+            let col = scale.now_col + 1 + (t / scale.secs_per_col).floor() as usize;
+            if col >= w {
+                break;
+            }
+            let label = fmt_tick(t);
+            if col >= free && put(&mut line, col, &label) {
+                free = col + label.chars().count() + 1;
+                placed = true;
+            }
+        }
+        if placed || min_cols == 3.0 {
+            cells = line;
+            break;
+        }
+    }
+    cells.into_iter().collect()
+}
+
+// -------------------------------------------------------------- the table
+
+/// Column widths for a terminal `width` wide.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Cols {
+    pub cores: bool,
+    /// `None` when the project column is dropped.
+    pub project: Option<usize>,
+    pub job: usize,
+    pub bar: usize,
+    pub right: usize,
+}
+
+const CORES_W: usize = 7;
+const JOB_MIN: usize = 10;
+const BAR_MIN: usize = 16;
+/// The bar grows to this before the job name gets more room.
+const BAR_PREF: usize = 26;
+const JOB_FLOOR: usize = 3;
+const BAR_FLOOR: usize = 6;
+const RIGHT_MAX: usize = 34;
+
+/// Fit the columns in `width` (`prefix` columns are taken by the color
+/// band, marker and number). The time columns (bar and the text after it)
+/// are never dropped: the cores column goes first, then the project.
+pub fn layout(
+    width: usize,
+    prefix: usize,
+    project_max: usize,
+    job_max: usize,
+    right_max: usize,
+) -> Cols {
+    let mut right = right_max.clamp(8, RIGHT_MAX);
+    let (mut job, mut bar) = (JOB_MIN, BAR_MIN);
+    let need = |job: usize, bar: usize, right: usize| prefix + job + 1 + bar + 1 + right;
+    // Too narrow even for the bare minimum: the job name gives way first,
+    // then the bar, then the text after it.
+    let mut short = need(job, bar, right).saturating_sub(width);
+    let cut = short.min(job - JOB_FLOOR);
+    job -= cut;
+    short -= cut;
+    let cut = short.min(bar - BAR_FLOOR);
+    bar -= cut;
+    short -= cut;
+    right -= short.min(right - 8);
+    let mut avail = width.saturating_sub(need(job, bar, right));
+    let mut project = None;
+    let pw = project_max.clamp(7, 24);
+    if avail > pw {
+        project = Some(pw);
+        avail -= pw + 1;
+    }
+    let mut cores = false;
+    if avail > CORES_W {
+        cores = true;
+        avail -= CORES_W + 1;
+    }
+    // Spare room: the bar up to a comfortable size, then the job name (up
+    // to what it needs), then the bar again.
+    let bar_extra = BAR_PREF.saturating_sub(bar).min(avail);
+    avail -= bar_extra;
+    let job_extra = job_max.saturating_sub(job).min(avail);
+    Cols {
+        cores,
+        project,
+        job: job + job_extra,
+        bar: bar + bar_extra + avail - job_extra,
+        right,
+    }
+}
+
+/// The job name cut so that its flags fit in `width`: (name, flags).
+fn job_parts(job: &str, flags: &[&str], width: usize) -> (String, String) {
+    let tail: String = flags.iter().map(|f| format!(" {f}")).collect();
+    let tail_w = tail.chars().count();
+    if tail_w + 4 > width {
+        return (truncate(job, width), String::new());
+    }
+    (truncate(job, width - tail_w), tail)
+}
+
+fn cores_text_run(r: &RunRow) -> String {
+    match r.using {
+        Some(u) => format!("{}/{u:.1}", r.weight),
+        None => format!("{}/-", r.weight),
+    }
+}
+
+fn right_text_run(r: &RunRow) -> String {
+    match &r.progress {
+        Progress::Unknown => format!("ran {}", fmt_duration(r.elapsed)),
+        Progress::Known { left, over, .. } => format!(
+            "{} {}",
+            if *over { "over" } else { "left" },
+            fmt_duration(*left)
+        ),
+    }
+}
+
+fn right_text_wait(w: &WaitRow) -> String {
+    let start = match w.start_in {
+        None => "?".to_string(),
+        Some(s) if s <= 0.0 => "now".to_string(),
+        Some(s) => format!(
+            "~{}{}",
+            fmt_duration(Duration::from_secs_f64(s)),
+            if w.rough { "?" } else { "" }
+        ),
+    };
+    format!("starts {start} ({})", w.why)
+}
+
+/// A row, ready to lay out.
+#[derive(Debug, Clone, PartialEq)]
+struct TableRow {
+    num: usize,
+    project: String,
+    job: String,
+    flags: Vec<&'static str>,
+    cores: String,
+    spec: BarSpec,
+    right: String,
+    wt: Option<usize>,
+    over: bool,
+}
+
+fn table_rows(v: &View) -> Vec<TableRow> {
+    let run = v.running.iter().map(|r| TableRow {
+        num: r.num,
+        project: r.project.clone(),
+        job: r.job.clone(),
+        flags: [(r.idle, "idle"), (r.backfilled, "[backfill]")]
+            .into_iter()
+            .filter_map(|(on, f)| on.then_some(f))
+            .collect(),
+        cores: cores_text_run(r),
+        spec: BarSpec::of_run(r),
+        right: right_text_run(r),
+        wt: r.wt,
+        over: matches!(r.progress, Progress::Known { over: true, .. }),
+    });
+    let wait = v.waiting.iter().map(|w| TableRow {
+        num: w.num,
+        project: w.project.clone(),
+        job: w.job.clone(),
+        flags: if w.front { vec!["[front]"] } else { vec![] },
+        cores: format!("w{}", w.weight),
+        spec: BarSpec::of_wait(w),
+        right: right_text_wait(w),
+        wt: w.wt,
+        over: false,
+    });
+    run.chain(wait).collect()
+}
+
+// ---------------------------------------------------------------- drawing
+
+fn wt_color(v: &View, wt: Option<usize>) -> Color {
+    wt.and_then(|i| v.worktrees.get(i))
+        .map_or(Color::Gray, |w| w.color)
 }
 
 pub fn draw(f: &mut Frame, v: &View, interval: Duration, error: Option<&str>) {
     let area = f.area();
-    let held_h = if v.held.is_empty() {
-        0
-    } else {
-        v.held.len() as u16 + 3
-    };
-    let [head, budget, running, waiting, held] = Layout::vertical([
+    let held_h = u16::from(!v.held.is_empty());
+    let legend_h = u16::from(!v.worktrees.is_empty());
+    let [head, legend, budget, queue, held] = Layout::vertical([
         Constraint::Length(1),
+        Constraint::Length(legend_h),
         Constraint::Length(4),
-        Constraint::Fill(1),
         Constraint::Fill(1),
         Constraint::Length(held_h),
     ])
     .areas(area);
     draw_header(f, head, v, interval, error);
+    if legend_h > 0 {
+        draw_legend(f, legend, v);
+    }
     draw_budget(f, budget, v);
-    draw_running(f, running, v);
-    draw_waiting(f, waiting, v);
+    draw_queue(f, queue, v);
     if held_h > 0 {
         draw_held(f, held, v);
     }
@@ -347,8 +894,43 @@ fn draw_header(f: &mut Frame, area: Rect, v: &View, interval: Duration, error: O
     );
 }
 
+/// `worktrees ▌main (root) ▌fix/…`: what each color is.
+fn draw_legend(f: &mut Frame, area: Rect, v: &View) {
+    let mut spans = vec![Span::styled(
+        "worktrees",
+        Style::new().add_modifier(Modifier::DIM),
+    )];
+    for w in &v.worktrees {
+        spans.push(Span::raw(" "));
+        if w.mine {
+            spans.push(Span::raw("›"));
+        }
+        spans.push(Span::styled("▌", Style::new().fg(w.color)));
+        let name = if w.branch.is_empty() {
+            Path::new(&w.path)
+                .file_name()
+                .map_or(w.path.clone(), |n| n.to_string_lossy().into_owned())
+        } else {
+            w.branch.clone()
+        };
+        let mut text = ellipsize_middle(&name, 28);
+        if w.main {
+            text.push_str(" (root)");
+        }
+        spans.push(Span::styled(
+            text,
+            if w.mine {
+                Style::new().add_modifier(Modifier::BOLD)
+            } else {
+                Style::new()
+            },
+        ));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
 fn draw_budget(f: &mut Frame, area: Rect, v: &View) {
-    let block = Block::bordered().title(format!(" CPU budget {}/{} ", v.used, v.budget));
+    let block = Block::bordered().title(format!(" cores {}/{} ", v.used, v.budget));
     let inner = block.inner(area);
     f.render_widget(block, area);
     let [bar_row, stat_row] =
@@ -371,8 +953,8 @@ fn draw_budget(f: &mut Frame, area: Rect, v: &View) {
     f.render_widget(Paragraph::new(Line::from(stats)), stat_row);
 }
 
-/// One cell group per slot; each running entry's slots in its own color with
-/// its letter first, free slots dim.
+/// One cell group per slot; each running entry's slots in its worktree's
+/// color with its row number first, free slots dim.
 fn bar_line(v: &View, width: u16) -> Line<'static> {
     let w = (width as u32 / v.budget.max(1)).max(1) as usize;
     let mut spans = Vec::new();
@@ -380,16 +962,18 @@ fn bar_line(v: &View, width: u16) -> Line<'static> {
         if s.slots == 0 {
             continue;
         }
-        let c = color(s.letter);
+        let c = wt_color(v, s.wt);
         let cells = s.slots as usize * w;
+        let num: String = s.num.to_string().chars().take(cells).collect();
+        let n = num.chars().count();
         spans.push(Span::styled(
-            s.letter.to_string(),
+            num,
             Style::new()
                 .fg(Color::Black)
                 .bg(c)
                 .add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled("█".repeat(cells - 1), Style::new().fg(c)));
+        spans.push(Span::styled("█".repeat(cells - n), Style::new().fg(c)));
     }
     spans.push(Span::styled(
         "░".repeat(v.free as usize * w),
@@ -398,156 +982,146 @@ fn bar_line(v: &View, width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-fn gauge(pct: u8, width: usize) -> String {
-    let filled = (pct as usize * width / 100).min(width);
-    format!("{}{}", "█".repeat(filled), "░".repeat(width - filled))
+/// Pad or cut `s` to exactly `w` characters.
+fn fit(s: &str, w: usize) -> String {
+    let t = truncate(s, w);
+    let n = t.chars().count();
+    format!("{t}{}", " ".repeat(w - n))
 }
 
-/// Wide enough for the longest project name (and the header), at most 40.
-fn project_width<'a>(names: impl Iterator<Item = &'a str>) -> u16 {
-    names
-        .map(|n| n.chars().count())
-        .chain(["project".len()])
-        .max()
-        .unwrap_or(0)
-        .min(40) as u16
-}
-
-fn is_over(r: &RunRow) -> bool {
-    matches!(r.progress, Progress::Known { over: true, .. })
-}
-
-fn progress_cell(r: &RunRow) -> String {
-    match &r.progress {
-        Progress::Unknown => format!("{}  ? ran {}", gauge(0, 10), fmt_duration(r.elapsed)),
-        Progress::Known { pct, left, over } => format!(
-            "{} {pct:>2}% {}{}",
-            gauge(*pct, 10),
-            if *over { "over " } else { "left " },
-            fmt_duration(*left)
-        ),
+/// The bar's characters as spans: runs of one character class share a style.
+fn bar_spans(bar: &str, base: Style) -> Vec<Span<'static>> {
+    let style = |c: char| match c {
+        '▓' => base.fg(Color::Red),
+        '▒' | '┄' | '→' | '←' => base.add_modifier(Modifier::DIM),
+        '│' => base.fg(Color::DarkGray),
+        _ => base,
+    };
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut run = String::new();
+    let mut cur: Option<Style> = None;
+    for c in bar.chars() {
+        let s = style(c);
+        if cur.is_some_and(|x| x != s) {
+            out.push(Span::styled(std::mem::take(&mut run), cur.unwrap()));
+        }
+        cur = Some(s);
+        run.push(c);
     }
-}
-
-fn cpu_cell(r: &RunRow) -> String {
-    match r.using {
-        Some(u) => format!("{}/{u:.1}", r.weight),
-        None => format!("{}/-", r.weight),
+    if let Some(s) = cur {
+        out.push(Span::styled(run, s));
     }
+    out
 }
 
-fn draw_running(f: &mut Frame, area: Rect, v: &View) {
-    let rows: Vec<Row> = v
-        .running
-        .iter()
-        .map(|r| {
-            let mut flags = Vec::new();
-            if r.idle {
-                flags.push(Span::styled("idle ", Style::new().fg(Color::Yellow)));
+fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
+    let block = Block::bordered().title(format!(
+        " running {}, waiting {} ",
+        v.running.len(),
+        v.waiting.len()
+    ));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let rows = table_rows(v);
+    if rows.is_empty() {
+        f.render_widget(
+            Paragraph::new("nothing running or waiting")
+                .style(Style::new().add_modifier(Modifier::DIM)),
+            inner,
+        );
+        return;
+    }
+    let num_w = rows.len().to_string().len();
+    let prefix = 2 + num_w + 1;
+    let widest = |len: &dyn Fn(&TableRow) -> usize| rows.iter().map(len).max().unwrap_or(0);
+    let cols = layout(
+        inner.width as usize,
+        prefix,
+        widest(&|r| r.project.chars().count()),
+        widest(&|r| r.job.chars().count() + r.flags.iter().map(|f| f.len() + 1).sum::<usize>()),
+        widest(&|r| r.right.chars().count()),
+    );
+    let specs: Vec<BarSpec> = rows.iter().map(|r| r.spec).collect();
+    let scale = compute_scale(&specs, cols.bar);
+
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    let mut lines = Vec::new();
+    // Header: column names, then the ruler.
+    let mut head = vec![Span::raw(" ".repeat(prefix))];
+    if let Some(pw) = cols.project {
+        head.push(Span::styled(fit("project", pw + 1), dim));
+    }
+    head.push(Span::styled(fit("job", cols.job + 1), dim));
+    if cols.cores {
+        head.push(Span::styled(fit("cores", CORES_W + 1), dim));
+    }
+    head.push(Span::styled(axis_line(scale), dim));
+    lines.push(Line::from(head));
+
+    for r in &rows {
+        let mine =
+            r.wt.and_then(|i| v.worktrees.get(i))
+                .is_some_and(|w| w.mine);
+        let base = if mine {
+            Style::new().add_modifier(Modifier::BOLD)
+        } else {
+            Style::new()
+        };
+        let mut spans = vec![
+            Span::styled("▌", Style::new().fg(wt_color(v, r.wt))),
+            Span::styled(if mine { "›" } else { " " }, base),
+            Span::styled(format!("{:>num_w$} ", r.num), base),
+        ];
+        if let Some(pw) = cols.project {
+            spans.push(Span::styled(fit(&r.project, pw + 1), base));
+        }
+        let (name, flags) = job_parts(&r.job, &r.flags, cols.job);
+        let used = name.chars().count() + flags.chars().count();
+        spans.push(Span::styled(name, base));
+        for flag in &r.flags {
+            if flags.contains(flag) {
+                spans.push(Span::styled(
+                    format!(" {flag}"),
+                    if *flag == "idle" {
+                        Style::new().fg(Color::Yellow)
+                    } else {
+                        dim
+                    },
+                ));
             }
-            if r.backfilled {
-                flags.push(Span::styled("[backfill]", Style::new().fg(Color::DarkGray)));
-            }
-            Row::new(vec![
-                Cell::from(r.letter.to_string()).style(
-                    Style::new()
-                        .fg(Color::Black)
-                        .bg(color(r.letter))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Cell::from(r.project.clone()),
-                Cell::from(r.job.clone()),
-                Cell::from(Line::from(flags)),
-                Cell::from(cpu_cell(r)),
-                Cell::from(progress_cell(r)),
-            ])
-            .style(if is_over(r) {
-                // Past its expected time: the whole row in red.
+        }
+        spans.push(Span::raw(" ".repeat((cols.job + 1).saturating_sub(used))));
+        if cols.cores {
+            spans.push(Span::styled(fit(&r.cores, CORES_W + 1), base));
+        }
+        spans.extend(bar_spans(&bar_string(r.spec, scale), base));
+        let mut right = vec![Span::styled(
+            format!(" {}", truncate(&r.right, cols.right)),
+            if r.over {
                 Style::new().fg(Color::Red)
             } else {
-                Style::new()
-            })
-        })
-        .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(1),
-            Constraint::Length(project_width(v.running.iter().map(|r| r.project.as_str()))),
-            Constraint::Fill(1),
-            Constraint::Length(15),
-            Constraint::Length(9),
-            Constraint::Length(24),
-        ],
-    )
-    .header(
-        Row::new(vec!["", "project", "job", "", "cpu w/use", "progress"])
-            .style(Style::new().add_modifier(Modifier::BOLD)),
-    )
-    .block(Block::bordered().title(format!(" running ({}) ", v.running.len())));
-    f.render_widget(table, area);
-}
-
-fn eta_cell(w: &WaitRow) -> String {
-    match w.start_in {
-        None => "?".into(),
-        Some(s) if s <= 0.0 => "now".into(),
-        Some(s) => format!(
-            "~{}{}",
-            fmt_duration(Duration::from_secs_f64(s)),
-            if w.rough { "?" } else { "" }
-        ),
+                base
+            },
+        )];
+        spans.append(&mut right);
+        lines.push(Line::from(spans));
     }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
-fn draw_waiting(f: &mut Frame, area: Rect, v: &View) {
-    let rows: Vec<Row> = v
-        .waiting
+/// One line: `held, owner gone (2): m1 owner gone -> resolve m1; m2 ...`.
+fn held_text(held: &[HeldRow]) -> String {
+    let items: Vec<String> = held
         .iter()
-        .map(|w| {
-            let job = if w.front {
-                format!("[front] {}", w.job)
-            } else {
-                w.job.clone()
-            };
-            Row::new(vec![
-                Cell::from(w.project.clone()),
-                Cell::from(job),
-                Cell::from(format!("w{}", w.weight)),
-                Cell::from(fmt_duration(w.waited)),
-                Cell::from(w.why.clone()),
-                Cell::from(eta_cell(w)),
-            ])
-        })
+        .map(|h| format!("{} {} -> {}", h.id, h.reason, h.hint))
         .collect();
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Length(project_width(v.waiting.iter().map(|r| r.project.as_str()))),
-            Constraint::Fill(1),
-            Constraint::Length(4),
-            Constraint::Length(8),
-            Constraint::Length(22),
-            Constraint::Length(10),
-        ],
-    )
-    .header(
-        Row::new(vec!["project", "job", "w", "waited", "why", "start in"])
-            .style(Style::new().add_modifier(Modifier::BOLD)),
-    )
-    .block(Block::bordered().title(format!(" waiting ({}) ", v.waiting.len())));
-    f.render_widget(table, area);
+    format!("held, owner gone ({}): {}", held.len(), items.join("; "))
 }
 
 fn draw_held(f: &mut Frame, area: Rect, v: &View) {
-    let lines: Vec<Line> = v
-        .held
-        .iter()
-        .map(|h| Line::from(format!("{}  {}  -> {}", h.id, h.reason, h.hint)))
-        .collect();
     f.render_widget(
-        Paragraph::new(lines)
-            .block(Block::bordered().title(format!(" held, owner gone ({}) ", v.held.len()))),
+        Paragraph::new(truncate(&held_text(&v.held), area.width as usize))
+            .style(Style::new().fg(Color::Yellow)),
         area,
     );
 }
@@ -583,7 +1157,11 @@ pub fn run(ctx: &Context, cfg: &Config, interval: f64) -> Result<i32> {
     let interval = Duration::from_secs_f64(interval.clamp(0.2, 3600.0));
     // Build the first view before touching the terminal, so a ledger that
     // cannot be read is reported on the normal screen.
-    let mut view = View::build(ctx, cfg)?;
+    let me = std::env::current_dir()
+        .ok()
+        .and_then(|d| gitctx::worktree(&d))
+        .map(|w| w.path);
+    let mut view = View::build(ctx, cfg, me.as_deref())?;
     let mut error: Option<String> = None;
     let mut terminal = ratatui::init();
     let _restore = Restore;
@@ -598,7 +1176,7 @@ pub fn run(ctx: &Context, cfg: &Config, interval: f64) -> Result<i32> {
                 _ => continue,
             }
         }
-        match View::build(ctx, cfg) {
+        match View::build(ctx, cfg, me.as_deref()) {
             Ok(v) => {
                 view = v;
                 error = None;
@@ -615,6 +1193,8 @@ mod tests {
     use chrono::Duration as Cd;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    const ME: &str = "/src/web-wt/fix-login";
 
     fn limits(budget: u32) -> Limits {
         let mut l = Config::parse("").unwrap().limits();
@@ -652,9 +1232,17 @@ mod tests {
             using: None,
             backfilled: false,
             label: None,
+            worktree: None,
+            branch: None,
             parent: None,
             nested_cpu_secs: 0.0,
         }
+    }
+
+    fn in_wt(mut e: Entry, path: &str, branch: &str) -> Entry {
+        e.worktree = Some(path.into());
+        e.branch = Some(branch.into());
+        e
     }
 
     fn ledger(entries: Vec<Entry>) -> Ledger {
@@ -664,6 +1252,7 @@ mod tests {
         }
     }
 
+    /// Two worktrees of one repository plus two single-worktree ones.
     fn sample(now: DateTime<Utc>) -> Ledger {
         let mut a = entry(
             "a",
@@ -679,6 +1268,7 @@ mod tests {
         a.expected_secs = Some(190.0);
         a.using = Some(3.4);
         a.label = Some("web/api unit tests".into());
+        let a = in_wt(a, ME, "fix/login-redirect-loop-on-expired-session");
         let mut b = entry(
             "b",
             State::Running,
@@ -693,6 +1283,7 @@ mod tests {
         b.expected_secs = Some(600.0);
         b.using = Some(0.1);
         b.backfilled = true;
+        let b = in_wt(b, "/src/web", "main");
         let c = entry(
             "c",
             State::Running,
@@ -704,7 +1295,8 @@ mod tests {
             now,
             12,
         );
-        let d = entry(
+        let c = in_wt(c, "/src/docs", "main");
+        let mut d = entry(
             "d",
             State::Waiting,
             6,
@@ -715,6 +1307,8 @@ mod tests {
             now,
             45,
         );
+        d.expected_secs = Some(240.0);
+        let d = in_wt(d, "/src/worker", "feat/queue");
         let mut e = entry(
             "e",
             State::Waiting,
@@ -727,7 +1321,27 @@ mod tests {
             20,
         );
         e.label = Some("web/app e2e".into());
+        let e = in_wt(e, ME, "fix/login-redirect-loop-on-expired-session");
         ledger(vec![a, b, c, d, e])
+    }
+
+    fn live() -> LiveSnapshot {
+        LiveSnapshot {
+            available_memory: 9 << 30,
+            cpu_busy: 0.5,
+            load_avg: 1.0,
+        }
+    }
+
+    fn sample_view(now: DateTime<Utc>) -> View {
+        View::from_parts(
+            &sample(now),
+            vec![],
+            limits(12),
+            Some(live()),
+            now,
+            Some(ME),
+        )
     }
 
     #[test]
@@ -791,22 +1405,31 @@ mod tests {
     }
 
     #[test]
-    fn the_model_names_rows_and_assigns_slots() {
+    fn rows_are_numbered_soonest_finish_first_then_the_queue() {
         let now = Utc::now();
-        let live = LiveSnapshot {
-            available_memory: 9 << 30,
-            cpu_busy: 0.5,
-            load_avg: 1.0,
-        };
-        let v = View::from_parts(&sample(now), vec![], limits(12), Some(live), now);
+        let v = sample_view(now);
         assert_eq!(v.budget, 12);
-        // Oldest first: A is the w2 build, B the w4 tests (measured 3.4, charged 4), C is w1.
         assert_eq!(v.used, 7);
-        let letters: Vec<_> = v.running.iter().map(|r| r.letter).collect();
-        assert_eq!(letters, ['A', 'B', 'C']);
+        // Left: a 95 s, b 200 s, c unknown (last).
+        let nums: Vec<_> = v.running.iter().map(|r| (r.num, r.job.as_str())).collect();
         assert_eq!(
-            v.slots.iter().map(|s| s.slots).collect::<Vec<_>>(),
-            [2, 4, 1]
+            nums,
+            [
+                (1, "web/api unit tests"),
+                (2, "npm run build -- --mode production"),
+                (3, "step-8.sh")
+            ]
+        );
+        assert_eq!(v.waiting.iter().map(|w| w.num).collect::<Vec<_>>(), [4, 5]);
+        assert_eq!(v.waiting[0].why, "needs w6, 5 free");
+        assert_eq!(v.waiting[1].job, "web/app e2e");
+        assert_eq!(v.waiting[1].why, "behind 1");
+        assert_eq!(v.waiting[0].expected_secs, Some(240.0));
+        assert_eq!(v.waiting[1].expected_secs, None);
+        // Slots follow the table order and still add up.
+        assert_eq!(
+            v.slots.iter().map(|s| (s.num, s.slots)).collect::<Vec<_>>(),
+            [(1, 4), (2, 2), (3, 1)]
         );
         assert_eq!(v.free, 5);
         assert_eq!(
@@ -814,26 +1437,31 @@ mod tests {
             v.budget
         );
         assert_eq!(v.over, 0);
-        // Oldest started first: B (400 s), A (95 s), C (12 s) -> reorder check.
-        assert_eq!(v.running[0].job, "npm run build -- --mode production");
-        assert_eq!(v.running[2].job, "step-8.sh");
-        assert_eq!(v.running[1].job, "web/api unit tests");
-        assert_eq!(v.running[1].project, "web/api");
         assert_eq!(
-            v.running[0].progress,
+            v.running[1].progress,
             Progress::Known {
                 pct: 66,
                 left: Duration::from_secs(200),
                 over: false
             }
         );
-        assert!(v.running[0].idle && v.running[0].backfilled);
+        assert!(v.running[1].idle && v.running[1].backfilled);
         assert_eq!(v.running[2].progress, Progress::Unknown);
-        assert_eq!(v.waiting.len(), 2);
-        assert_eq!(v.waiting[0].why, "needs w6, 5 free");
-        assert_eq!(v.waiting[1].job, "web/app e2e");
-        assert_eq!(v.waiting[1].why, "behind 1");
         assert!(v.machine.is_some());
+    }
+
+    #[test]
+    fn equal_finish_times_keep_the_older_run_first() {
+        let now = Utc::now();
+        let mut x = entry("x", State::Running, 1, 1, "/r/a", "", "x", now, 30);
+        let mut y = entry("y", State::Running, 1, 2, "/r/b", "", "y", now, 50);
+        x.expected_secs = Some(100.0);
+        y.expected_secs = Some(120.0); // 70 left for both
+        let v = View::from_parts(&ledger(vec![x, y]), vec![], limits(4), None, now, None);
+        assert_eq!(
+            v.running.iter().map(|r| r.job.as_str()).collect::<Vec<_>>(),
+            ["y", "x"]
+        );
     }
 
     #[test]
@@ -843,7 +1471,7 @@ mod tests {
         let mut y = entry("y", State::Running, 3, 2, "/r/b", "", "b", now, 20);
         y.using = Some(7.0); // measured above its weight
         x.using = None;
-        let v = View::from_parts(&ledger(vec![x, y]), vec![], limits(6), None, now);
+        let v = View::from_parts(&ledger(vec![x, y]), vec![], limits(6), None, now, None);
         let total: u32 = v.slots.iter().map(|s| s.slots).sum();
         assert_eq!(total + v.free, 6);
         assert_eq!(v.free, 0);
@@ -851,10 +1479,402 @@ mod tests {
         assert!(v.machine.is_none());
     }
 
-    fn frame(v: &View, w: u16, h: u16) -> String {
+    #[test]
+    fn worktrees_come_in_table_order_with_main_mine_and_color() {
+        let v = sample_view(Utc::now());
+        let w: Vec<_> = v
+            .worktrees
+            .iter()
+            .map(|w| (w.path.as_str(), w.main, w.mine))
+            .collect();
+        assert_eq!(
+            w,
+            [
+                (ME, false, true),
+                ("/src/web", true, false),
+                ("/src/docs", true, false),
+                ("/src/worker", true, false)
+            ]
+        );
+        assert_eq!(
+            v.worktrees[0].branch,
+            "fix/login-redirect-loop-on-expired-session"
+        );
+        // Two worktrees of web: colored, and different from each other by
+        // construction of this sample. docs and worker are alone: gray.
+        assert_ne!(v.worktrees[0].color, Color::Gray);
+        assert_ne!(v.worktrees[1].color, Color::Gray);
+        assert_eq!(v.worktrees[2].color, Color::Gray);
+        assert_eq!(v.worktrees[3].color, Color::Gray);
+        // Rows point at their worktree; the cores slots too.
+        assert_eq!(v.running[0].wt, Some(0));
+        assert_eq!(v.running[1].wt, Some(1));
+        assert_eq!(v.waiting[1].wt, Some(0));
+        assert_eq!(v.slots[0].wt, Some(0));
+    }
+
+    #[test]
+    fn an_entry_without_a_worktree_has_none_and_nobody_is_mine() {
+        let now = Utc::now();
+        let a = entry("a", State::Running, 1, 1, "/r/a", "", "a", now, 5);
+        let v = View::from_parts(&ledger(vec![a]), vec![], limits(4), None, now, Some(ME));
+        assert!(v.worktrees.is_empty());
+        assert_eq!(v.running[0].wt, None);
+    }
+
+    #[test]
+    fn the_newest_entry_names_the_branch() {
+        let now = Utc::now();
+        let old = in_wt(
+            entry("a", State::Running, 1, 1, "/r", "", "a", now, 50),
+            "/r/wt",
+            "old-branch",
+        );
+        let new = in_wt(
+            entry("b", State::Waiting, 1, 2, "/r", "", "b", now, 5),
+            "/r/wt",
+            "new-branch",
+        );
+        let v = View::from_parts(&ledger(vec![old, new]), vec![], limits(4), None, now, None);
+        assert_eq!(v.worktrees.len(), 1);
+        assert_eq!(v.worktrees[0].branch, "new-branch");
+        assert!(!v.worktrees[0].main);
+    }
+
+    #[test]
+    fn worktree_colors_are_stable_and_never_the_warning_colors() {
+        assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(worktree_color("/w/a", 2), worktree_color("/w/a", 2));
+        assert_eq!(worktree_color("/w/a", 1), Color::Gray);
+        assert_eq!(worktree_color("/w/a", 0), Color::Gray);
+        let mut seen = std::collections::HashSet::new();
+        for i in 0..40 {
+            let c = worktree_color(&format!("/w/wt-{i}"), 3);
+            assert!(WT_COLORS.contains(&c));
+            seen.insert(format!("{c:?}"));
+        }
+        assert!(seen.len() >= 5, "{seen:?}");
+        for bad in [Color::Red, Color::Yellow, Color::Gray, Color::DarkGray] {
+            assert!(!WT_COLORS.contains(&bad));
+        }
+    }
+
+    #[test]
+    fn long_names_lose_their_middle() {
+        assert_eq!(ellipsize_middle("main", 10), "main");
+        assert_eq!(ellipsize_middle("abcdefghij", 10), "abcdefghij");
+        assert_eq!(ellipsize_middle("abcdefghijk", 10), "abcde…hijk");
+        assert_eq!(
+            ellipsize_middle("fix/login-redirect-loop-on-expired-session", 20),
+            "fix/login-…d-session"
+        );
+        assert_eq!(ellipsize_middle("abcdef", 2), "a…");
+        assert_eq!(ellipsize_middle("abcdef", 1), "…");
+        assert_eq!(ellipsize_middle("abcdef", 0), "");
+        assert_eq!(ellipsize_middle("日本語のブランチ名", 5), "日本…チ名");
+    }
+
+    fn scale(per: f64, now: usize, width: usize) -> Scale {
+        Scale {
+            secs_per_col: per,
+            now_col: now,
+            width,
+        }
+    }
+
+    #[test]
+    fn the_scale_is_the_finest_one_that_fits_the_row_ending_last() {
+        let run = BarSpec::Running {
+            elapsed: 60.0,
+            expected: Some(180.0),
+        };
+        // 12 columns behind, 24 ahead at 5 s per column; 3 s would not fit.
+        assert_eq!(compute_scale(&[run], 40), scale(5.0, 12, 40));
+        // A waiting row that starts in 2 m and runs 5 m pushes it out.
+        let wait = BarSpec::Waiting {
+            start_in: Some(120.0),
+            expected: Some(300.0),
+            rough: false,
+        };
+        let s = compute_scale(&[run, wait], 40);
+        assert_eq!(s.secs_per_col, 15.0);
+        assert!(s.now_col + 1 + cols_for(420.0, 15.0) <= 40);
+        // Nothing to show: the finest scale, now at the left edge.
+        assert_eq!(compute_scale(&[], 40), scale(1.0, 0, 40));
+        // An old run takes at most a third of the width.
+        let old = BarSpec::Running {
+            elapsed: 36000.0,
+            expected: Some(40000.0),
+        };
+        assert_eq!(compute_scale(&[old], 30).now_col, 10);
+        // Even the coarsest scale cannot hold it: cut, not a panic.
+        let huge = BarSpec::Waiting {
+            start_in: Some(1e9),
+            expected: Some(1.0),
+            rough: false,
+        };
+        assert_eq!(compute_scale(&[huge], 20).secs_per_col, 86400.0);
+    }
+
+    #[test]
+    fn a_running_bar_has_what_ran_left_of_now_and_the_rest_right() {
+        let sc = scale(5.0, 12, 40);
+        let bar = |elapsed, expected| bar_string(BarSpec::Running { elapsed, expected }, sc);
+        assert_eq!(
+            bar(60.0, Some(180.0)),
+            format!("{}│{}{}", "█".repeat(12), "▒".repeat(24), " ".repeat(3))
+        );
+        // Past its expected time: the overrun is its own mark, nothing ahead.
+        assert_eq!(
+            bar(100.0, Some(60.0)),
+            format!("←{}{}│{}", "█".repeat(3), "▓".repeat(8), " ".repeat(27))
+        );
+        // Not long enough to reach the left edge.
+        assert_eq!(
+            bar(30.0, Some(60.0)),
+            format!(
+                "{}{}│{}{}",
+                " ".repeat(6),
+                "█".repeat(6),
+                "▒".repeat(6),
+                " ".repeat(21)
+            )
+        );
+        // No learned time: just an arrow after now.
+        assert_eq!(
+            bar(30.0, None),
+            format!("{}{}│→{}", " ".repeat(6), "█".repeat(6), " ".repeat(26))
+        );
+        // Ends exactly on its expected time: nothing ahead.
+        assert_eq!(
+            bar(60.0, Some(60.0)),
+            format!("{}│{}", "█".repeat(12), " ".repeat(27))
+        );
+        // Too long for the right edge: cut with an arrow.
+        let s = bar(60.0, Some(2000.0));
+        assert_eq!(s.chars().count(), 40);
+        assert!(s.ends_with('→'));
+    }
+
+    #[test]
+    fn a_waiting_bar_starts_where_it_is_expected_to_and_is_as_long_as_it_runs() {
+        let sc = scale(5.0, 12, 40);
+        let wait = |start_in, expected, rough| {
+            bar_string(
+                BarSpec::Waiting {
+                    start_in,
+                    expected,
+                    rough,
+                },
+                sc,
+            )
+        };
+        let pad = |n: usize| " ".repeat(n);
+        // Starts in 50 s (10 columns after the first one past now).
+        assert_eq!(
+            wait(Some(50.0), Some(60.0), false),
+            format!("{}│{}{}{}", pad(12), pad(10), "▒".repeat(12), pad(5))
+        );
+        // A rough estimate is dotted.
+        assert_eq!(
+            wait(Some(50.0), Some(60.0), true),
+            format!("{}│{}{}{}", pad(12), pad(10), "┄".repeat(12), pad(5))
+        );
+        // Unknown duration: only an arrow at the start.
+        assert_eq!(
+            wait(Some(50.0), None, false),
+            format!("{}│{}→{}", pad(12), pad(10), pad(16))
+        );
+        // Unknown start: begins at now.
+        assert_eq!(
+            wait(None, Some(10.0), false),
+            format!("{}│▒▒{}", pad(12), pad(25))
+        );
+        // Starts after the right edge: just the arrow at the edge.
+        let far = wait(Some(5000.0), Some(10.0), false);
+        assert_eq!(far, format!("{}│{}→", pad(12), pad(26)));
+        // Starts in view but runs past the edge.
+        let cut = wait(Some(50.0), Some(600.0), false);
+        assert!(cut.ends_with('→') && cut.contains('▒'));
+        assert_eq!(cut.chars().count(), 40);
+        // A zero-width bar draws nothing.
+        assert_eq!(
+            bar_string(
+                BarSpec::Waiting {
+                    start_in: None,
+                    expected: None,
+                    rough: false
+                },
+                scale(1.0, 0, 0)
+            ),
+            ""
+        );
+    }
+
+    #[test]
+    fn the_axis_labels_the_future_every_so_many_columns() {
+        assert_eq!(
+            axis_line(scale(5.0, 12, 40)),
+            format!(
+                "{}now{}+1m{}+2m",
+                " ".repeat(12),
+                " ".repeat(10),
+                " ".repeat(9)
+            )
+        );
+        // No room for "now" at the right edge: no label, no panic.
+        assert_eq!(axis_line(scale(1.0, 39, 40)).chars().count(), 40);
+        assert_eq!(axis_line(scale(86400.0, 0, 3)).chars().count(), 3);
+        assert_eq!(fmt_tick(45.0), "+45s");
+        assert_eq!(fmt_tick(120.0), "+2m");
+        assert_eq!(fmt_tick(90.0), "+1m30s");
+        assert_eq!(fmt_tick(3600.0), "+1h");
+        assert_eq!(fmt_tick(5400.0), "+1h30m");
+    }
+
+    #[test]
+    fn narrow_terminals_drop_cores_then_project_but_keep_the_time_columns() {
+        let wide = layout(120, 5, 12, 30, 30);
+        assert_eq!(
+            wide,
+            Cols {
+                cores: true,
+                project: Some(12),
+                job: 30,
+                bar: 32,
+                right: 30
+            }
+        );
+        let no_cores = layout(78, 5, 12, 30, 30);
+        assert_eq!(
+            no_cores,
+            Cols {
+                cores: false,
+                project: Some(12),
+                job: 10,
+                bar: 18,
+                right: 30
+            }
+        );
+        let no_project = layout(70, 5, 12, 30, 30);
+        assert_eq!(
+            no_project,
+            Cols {
+                cores: false,
+                project: None,
+                job: 10,
+                bar: 23,
+                right: 30
+            }
+        );
+        // Tighter still: the job name shrinks, then the bar, then the text.
+        let tiny = layout(40, 5, 12, 30, 30);
+        assert_eq!(
+            tiny,
+            Cols {
+                cores: false,
+                project: None,
+                job: 3,
+                bar: 6,
+                right: 24
+            }
+        );
+        // Whatever the width, the columns never exceed it (when it is wide
+        // enough for the floor) and the time columns exist.
+        for w in 40..200 {
+            let c = layout(w, 5, 12, 30, 30);
+            let total = 5
+                + c.project.map_or(0, |p| p + 1)
+                + c.job
+                + 1
+                + if c.cores { CORES_W + 1 } else { 0 }
+                + c.bar
+                + 1
+                + c.right;
+            assert!(total <= w, "{w}: {c:?} = {total}");
+            assert!(c.bar >= 6 && c.right >= 8);
+        }
+        let _ = layout(5, 5, 12, 30, 30);
+    }
+
+    #[test]
+    fn a_job_name_gives_up_characters_to_its_flags() {
+        assert_eq!(
+            job_parts("cargo test", &["idle", "[backfill]"], 30),
+            ("cargo test".to_string(), " idle [backfill]".to_string())
+        );
+        assert_eq!(
+            job_parts("0123456789abcdefghij", &["idle"], 12),
+            ("012345…".to_string(), " idle".to_string())
+        );
+        // No room for the flags: the name wins.
+        assert_eq!(
+            job_parts("0123456789", &["idle", "[backfill]"], 12),
+            ("0123456789".to_string(), String::new())
+        );
+        assert_eq!(job_parts("x", &[], 5), ("x".to_string(), String::new()));
+    }
+
+    #[test]
+    fn the_text_after_the_bar_says_time_left_or_when_it_starts_and_why() {
+        let v = sample_view(Utc::now());
+        assert_eq!(right_text_run(&v.running[0]), "left 1:35");
+        assert_eq!(right_text_run(&v.running[2]), "ran 0:12");
+        assert_eq!(cores_text_run(&v.running[0]), "4/3.4");
+        assert_eq!(cores_text_run(&v.running[2]), "1/-");
+        let w = &v.waiting[0];
+        let t = right_text_wait(w);
+        assert!(
+            t.starts_with("starts ~") && t.ends_with("(needs w6, 5 free)"),
+            "{t}"
+        );
+        let mut w = w.clone();
+        w.start_in = None;
+        assert_eq!(right_text_wait(&w), "starts ? (needs w6, 5 free)");
+        w.start_in = Some(0.0);
+        assert_eq!(right_text_wait(&w), "starts now (needs w6, 5 free)");
+        w.start_in = Some(130.0);
+        w.rough = true;
+        assert_eq!(right_text_wait(&w), "starts ~2:10? (needs w6, 5 free)");
+        let mut over = v.running[0].clone();
+        over.progress = Progress::Known {
+            pct: 99,
+            left: Duration::from_secs(60),
+            over: true,
+        };
+        assert_eq!(right_text_run(&over), "over 1:00");
+    }
+
+    #[test]
+    fn table_rows_carry_the_flags_and_the_overrun() {
+        let v = sample_view(Utc::now());
+        let rows = table_rows(&v);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[1].flags, ["idle", "[backfill]"]);
+        assert!(rows[0].flags.is_empty());
+        assert_eq!(rows[3].cores, "w6");
+        assert!(rows.iter().all(|r| !r.over));
+        let mut v = v;
+        v.waiting[0].front = true;
+        assert_eq!(table_rows(&v)[3].flags, ["[front]"]);
+        v.running[0].progress = Progress::Known {
+            pct: 99,
+            left: Duration::from_secs(1),
+            over: true,
+        };
+        assert!(table_rows(&v)[0].over);
+    }
+
+    fn render(v: &View, w: u16, h: u16) -> Terminal<TestBackend> {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, v, Duration::from_secs(1), None))
             .unwrap();
+        t
+    }
+
+    fn frame(v: &View, w: u16, h: u16) -> String {
+        let t = render(v, w, h);
         let buf = t.backend().buffer().clone();
         (0..h)
             .map(|y| {
@@ -869,67 +1889,132 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_shows_the_budget_bar_and_both_tables() {
+    fn a_frame_is_one_table_on_a_shared_axis() {
         let now = Utc::now();
-        let live = LiveSnapshot {
-            available_memory: 9 << 30,
-            cpu_busy: 0.5,
-            load_avg: 1.0,
-        };
-        let mut v = View::from_parts(&sample(now), vec![], limits(12), Some(live), now);
+        let mut v = sample_view(now);
         v.held.push(HeldRow {
             id: "m1".into(),
             reason: "owner gone".into(),
             hint: "resolve m1".into(),
         });
-        let out = frame(&v, 100, 26);
+        let out = frame(&v, 110, 17);
         println!("{out}");
-        assert!(out.contains("CPU budget 7/12"));
-        assert!(out.contains("running (3)"));
-        assert!(out.contains("waiting (2)"));
-        assert!(out.contains("held, owner gone (1)"));
+        assert!(out.contains("worktrees"));
+        assert!(out.contains("(root)"));
+        assert!(
+            out.contains("fix/login-redirect-l…n-expired-session") || out.contains("fix/login")
+        );
+        assert!(out.contains("cores 7/12"));
+        assert!(out.contains("running 3, waiting 2"));
+        assert!(!out.contains("held, owner gone (1)\n"));
+        assert!(out.contains("held, owner gone (1): m1 owner gone -> resolve m1"));
         assert!(out.contains("q: quit"));
         assert!(out.contains("web/api unit tests"));
-        assert!(out.contains("step-8.sh") && out.contains("4/3.4"));
-        assert!(out.contains("needs w6, 5 free"));
+        assert!(out.contains("4/3.4") && out.contains("w6"));
+        assert!(out.contains("now") && out.contains("│"));
+        assert!(out.contains("starts ~"));
+        assert!(out.contains("(needs w6, 5 free)"));
         assert!(out.contains("machine cpu 50% busy"));
         assert!(out.contains("idle") && out.contains("[backfill]"));
-        // A tiny terminal must not panic.
+        // Only the table's own rows are numbered, 1 to 5, top to bottom.
+        let order: Vec<_> = out
+            .lines()
+            .filter(|l| l.contains('▌') && !l.contains("worktrees"))
+            .map(|l| l.chars().find(|c| c.is_ascii_digit()).unwrap())
+            .collect();
+        assert_eq!(order, ['1', '2', '3', '4', '5']);
+        // Letters are gone.
+        assert!(!out.contains("A "));
+        // Tiny and narrow terminals must not panic; the time columns stay.
         let _ = frame(&v, 20, 5);
+        let _ = frame(&v, 1, 1);
+        let narrow = frame(&v, 62, 17);
+        assert!(
+            narrow.contains("left 1:35") && narrow.contains("starts"),
+            "{narrow}"
+        );
+        assert!(!narrow.contains("cores  "));
+        let empty = View::from_parts(&Ledger::default(), vec![], limits(4), None, now, None);
+        assert!(frame(&empty, 80, 10).contains("nothing running or waiting"));
+    }
+
+    fn row_y(buf: &ratatui::buffer::Buffer, w: u16, h: u16, needle: &str) -> u16 {
+        (0..h)
+            .find(|&y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect::<String>()
+                    .contains(needle)
+            })
+            .unwrap_or_else(|| panic!("no row with {needle}"))
     }
 
     #[test]
-    fn a_run_past_its_expected_time_is_drawn_red() {
-        let now = Utc::now();
-        let mut v = View::from_parts(&sample(now), vec![], limits(12), None, now);
-        v.running[0].progress = Progress::Known {
-            pct: 99,
-            left: Duration::from_secs(60),
-            over: true,
-        };
-        v.running[1].progress = Progress::Known {
-            pct: 50,
-            left: Duration::from_secs(60),
-            over: false,
-        };
-        let mut t = Terminal::new(TestBackend::new(100, 26)).unwrap();
-        t.draw(|f| draw(f, &v, Duration::from_secs(1), None))
-            .unwrap();
+    fn the_band_is_the_worktree_color_and_my_row_is_marked() {
+        let v = sample_view(Utc::now());
+        let t = render(&v, 110, 17);
         let buf = t.backend().buffer().clone();
-        let fg_of = |needle: &str| {
-            (0..26u16)
-                .find_map(|y| {
-                    let line: String = (0..100u16)
-                        .map(|x| buf[(x, y)].symbol().to_string())
-                        .collect();
-                    line.find(needle).map(|_| {
-                        let x = (0..100u16).find(|&x| buf[(x, y)].symbol() == "%").unwrap();
-                        buf[(x, y)].fg
-                    })
-                })
-                .unwrap()
+        let band = |needle: &str| {
+            let y = row_y(&buf, 110, 17, needle);
+            (
+                buf[(1, y)].symbol().to_string(),
+                buf[(1, y)].fg,
+                buf[(2, y)].symbol().to_string(),
+            )
         };
-        assert_eq!(fg_of("over 1:00"), Color::Red);
-        assert_ne!(fg_of("left 1:00"), Color::Red);
+        // Column 0 is the block border; the band is the next column.
+        let (sym, fg, mark) = band("web/api unit tests");
+        assert_eq!(sym, "▌");
+        assert_eq!(fg, v.worktrees[0].color);
+        assert_eq!(mark, "›");
+        let (_, fg, mark) = band("step-8.sh");
+        assert_eq!(fg, Color::Gray);
+        assert_eq!(mark, " ");
+        // The other row of my worktree is marked as well, bold.
+        let y = row_y(&buf, 110, 17, "web/app e2e");
+        assert_eq!(buf[(2, y)].symbol(), "›");
+        assert!(buf[(2, y)].modifier.contains(Modifier::BOLD));
+        // The cores bar uses the same colors, led by the row number.
+        let by = row_y(&buf, 110, 17, "cores 7/12") + 1;
+        assert_eq!(buf[(1, by)].symbol(), "1");
+        assert_eq!(buf[(1, by)].bg, v.worktrees[0].color);
+    }
+
+    #[test]
+    fn only_the_overrun_is_drawn_red() {
+        let now = Utc::now();
+        let mut a = entry("a", State::Running, 1, 1, "/r/a", "", "a", now, 100);
+        a.expected_secs = Some(60.0);
+        let mut b = entry("b", State::Running, 1, 2, "/r/b", "", "b", now, 20);
+        b.expected_secs = Some(60.0);
+        let v = View::from_parts(&ledger(vec![a, b]), vec![], limits(4), None, now, None);
+        let t = render(&v, 80, 12);
+        let buf = t.backend().buffer().clone();
+        let red = (0..12u16)
+            .flat_map(|y| (0..80u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].symbol() == "▓")
+            .collect::<Vec<_>>();
+        assert!(!red.is_empty());
+        assert!(red.iter().all(|&(x, y)| buf[(x, y)].fg == Color::Red));
+        // The overrun is on one row only: the one that is over.
+        let y0 = red[0].1;
+        assert!(red.iter().all(|&(_, y)| y == y0));
+        // And its text says so, in red.
+        let line: String = (0..80u16)
+            .map(|x| buf[(x, y0)].symbol().to_string())
+            .collect();
+        let x = line.find("over").unwrap();
+        let col = line[..x].chars().count() as u16;
+        assert_eq!(buf[(col, y0)].fg, Color::Red);
+    }
+
+    /// The screen drawn for the pull request description. Run with
+    /// `--nocapture` to see it.
+    #[test]
+    fn the_screen_for_the_description() {
+        let now = Utc::now();
+        let out = frame(&sample_view(now), 110, 17);
+        println!("{out}");
+        assert!(out.lines().count() == 17);
     }
 }
