@@ -354,6 +354,7 @@ async fn invocation(
     let outcome = tokio::select! {
         result=async {
             let dir=args.dir.as_ref().ok_or_else(||ApiError::new(ErrorCode::InvalidInput,"--dir is required"))?;
+            if dir.as_os_str().is_empty(){return Err(ApiError::new(ErrorCode::InvalidInput,"--dir must not be empty"));}
             let target=Target::parse(&args.id)?;
             let attempt=args.attempt.as_deref().map(AttemptId::parse).transpose().map_err(|e|ApiError::new(ErrorCode::InvalidInput,e.to_string()))?;
             if attempt.is_some() && matches!(target,Target::Run(_)){return Err(ApiError::new(ErrorCode::InvalidInput,"--attempt requires a task identifier"));}
@@ -363,6 +364,12 @@ async fn invocation(
                 .await.map_err(internal)?.map_err(|e|ApiError::new(ErrorCode::InvalidInput,e.to_string()))?;
             invocation_pin=Some(store.result_read_pin(&target,attempt.as_ref()).map_err(|e|ApiError::new(e.code(),e.to_string()))?);
             let reader=Reader::Offline(Arc::new(store));
+            // Create nothing on disk for a target that does not exist.
+            match reader.query(Query::Completion{target:target.clone()}).await.map_err(query_error)? {
+                Response::Completion{snapshot} if snapshot.accepted=>{}
+                Response::Completion{..}=>return Err(ApiError::new(ErrorCode::NotFound,"target not found")),
+                _=>return Err(internal("unexpected target observation")),
+            }
             let destination=Arc::new(super::output_export::destination(dir)?);
             Exporter{reader,root,destination,target,attempt,cancelled:cancelled.clone(),active:active.clone()}.export(json,out,err).await
         }=>Some(result),
@@ -604,6 +611,48 @@ mod tests {
             .unwrap();
         assert_eq!(summary.unreceipted, 1);
         assert_eq!(error, Some(ErrorCode::CollectionFailed));
+    }
+    #[tokio::test]
+    async fn missing_target_and_empty_dir_create_no_destination() {
+        use std::os::unix::fs::PermissionsExt;
+        let f = Fixture::new();
+        std::fs::set_permissions(f.dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worker = f.dir.path().join("worker");
+        std::fs::create_dir(&worker).unwrap();
+        std::fs::set_permissions(&worker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let key = f.dir.path().join("key");
+        crate::secrets::key::init(&key).unwrap();
+        let spec = || super::super::bootstrap::Spec {
+            state_dir: f.dir.path().into(),
+            worker_state_dir: worker.clone(),
+            worker_id: WorkerId::parse("test").unwrap(),
+            cluster_key_path: key.clone(),
+            executable: std::env::current_exe().unwrap(),
+            env: Default::default(),
+            repo_root: None,
+            expected_cluster: Some(f.db.cluster_id().clone()),
+            managed_service: None,
+        };
+        let mut signal =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt()).unwrap();
+        let typo = f.dir.path().join("typo").join("results");
+        let args = crate::cli::OutputsArgs {
+            id: TaskId::generate().to_string(),
+            attempt: None,
+            dir: Some(typo.clone()),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = invocation(&args, true, &mut out, &mut err, &mut signal, || Ok(spec())).await;
+        assert_eq!(code, ErrorCode::NotFound.exit_code());
+        assert!(!f.dir.path().join("typo").exists());
+        let args = crate::cli::OutputsArgs {
+            id: f.task.to_string(),
+            attempt: None,
+            dir: Some(std::path::PathBuf::new()),
+        };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = invocation(&args, true, &mut out, &mut err, &mut signal, || Ok(spec())).await;
+        assert_eq!(code, ErrorCode::InvalidInput.exit_code());
     }
     #[tokio::test]
     async fn pages_over_64_tasks_retry_gap_and_membership() {
