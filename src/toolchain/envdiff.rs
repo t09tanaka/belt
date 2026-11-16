@@ -391,6 +391,9 @@ mod tests {
     fn identical_reports_are_all_same() {
         let items = diff(&report(), &report());
         assert!(all_same(&items));
+        let mut worker = report();
+        worker.docker = Docker::Unknown;
+        assert!(!all_same(&diff(&report(), &worker)));
         assert_eq!(
             items.iter().map(|i| i.subject.as_str()).collect::<Vec<_>>(),
             [
@@ -475,13 +478,14 @@ mod tests {
     fn a_version_the_manager_may_install_is_auto_installable() {
         let mut have = avail("18.0.0");
         have.managed = managed(&["18.0.0", "20.1.0"], &["18.0.0"]);
-        assert_eq!(
-            class(avail("20.1.0"), Some(have.clone())),
-            Class::AutoInstallable
-        );
+        let item = tool(avail("20.1.0"), Some(have.clone())).unwrap();
+        assert_eq!(item.class, Class::AutoInstallable);
+        assert!(item.steps.unwrap().contains("workers sync"));
         // Not in the inventory and not installed: nothing can fix it.
         have.managed = managed(&["18.0.0"], &["18.0.0"]);
-        assert_eq!(class(avail("20.1.0"), Some(have)), Class::Differs);
+        let item = tool(avail("20.1.0"), Some(have)).unwrap();
+        assert_eq!(item.class, Class::Differs);
+        assert!(item.steps.unwrap().contains("install node"));
     }
 
     #[test]
