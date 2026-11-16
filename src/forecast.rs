@@ -1558,6 +1558,7 @@ mod tests {
                 branch: None,
                 parent: None,
                 nested_cpu_secs: 0.0,
+                extra: Default::default(),
             },
             suspect_dead: false,
         }

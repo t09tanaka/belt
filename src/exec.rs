@@ -476,6 +476,7 @@ pub fn run_gated(
             weight_used: plan.weight,
             contended,
             measurement_id: None,
+            extra: Default::default(),
         },
     );
     Ok(Gated::Finished(out.exit))
@@ -664,6 +665,7 @@ mod tests {
             branch: None,
             parent: parent.map(str::to_string),
             nested_cpu_secs: 0.0,
+            extra: Default::default(),
         };
         let mut ledger = Ledger {
             entries: vec![
@@ -789,6 +791,7 @@ mod tests {
                 branch: None,
                 parent: None,
                 nested_cpu_secs: 0.0,
+                extra: Default::default(),
             });
             ledger.save(&ctx.paths.ledger_file()).unwrap();
 

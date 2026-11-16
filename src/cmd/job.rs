@@ -33,6 +33,7 @@ pub fn submit(ctx: &Context, cfg: &Config, opts: Opts, detach: bool) -> Result<i
         detach,
         orphaned: false,
         finished_at: None,
+        extra: Default::default(),
     };
     jobs::save(ctx, &job)?;
     let mut runner = jobs::spawn_runner(ctx, &std::env::current_exe()?, &job)?;

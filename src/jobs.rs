@@ -31,6 +31,10 @@ pub struct Job {
     pub orphaned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<DateTime<Utc>>,
+    /// Fields this binary does not know, kept so that rewriting the file
+    /// does not drop what a newer binary wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -172,5 +176,34 @@ pub fn remove_files(ctx: &Context, id: &str) {
         ctx.paths.job_waiter(id),
     ] {
         let _ = fs::remove_file(p);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_job_keeps_fields_this_binary_does_not_know() {
+        let v = serde_json::json!({
+            "id": "j", "argv": ["x"], "cwd": "/", "weight": null, "front": false,
+            "key": null, "submitted_at": "2026-01-01T00:00:00Z", "submitter_pid": 1,
+            "future": {"a": [1, {"b": null}]},
+        });
+        let mut job: Job = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(job.extra.len(), 1);
+        job.finished_at = None;
+        job.orphaned = true;
+        let back = serde_json::to_value(&job).unwrap();
+        assert_eq!(back["future"], v["future"]);
+        assert_eq!(back["orphaned"], true);
+        assert_eq!(
+            back.as_object()
+                .unwrap()
+                .keys()
+                .filter(|k| *k == "id")
+                .count(),
+            1
+        );
     }
 }

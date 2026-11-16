@@ -333,6 +333,7 @@ mod tests {
             branch: None,
             parent: parent.map(str::to_string),
             nested_cpu_secs: 0.0,
+            extra: Default::default(),
         }
     }
 
