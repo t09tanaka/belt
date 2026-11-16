@@ -21,6 +21,10 @@ struct FakeRemote {
     /// What the bridge answers instead of the installed worker's own identity.
     bridge_answer: Option<(ClusterId, WorkerId)>,
     bridge_fails: bool,
+    /// Replaces the answer to `worker-service env`.
+    env_answer: Option<Vec<u8>>,
+    /// Answers to `worker-service env`, used first, one per call.
+    env_queue: std::collections::VecDeque<Vec<u8>>,
 }
 impl FakeRemote {
     fn staged(&self) -> PathBuf {
@@ -112,6 +116,27 @@ impl Remote for FakeRemote {
             fs::write(self.staged(), stdin).unwrap();
             fs::set_permissions(self.staged(), fs::Permissions::from_mode(0o700)).unwrap();
             return Ok(ok(String::new()));
+        }
+        if shell.contains("'worker-service' 'env'") {
+            if let Some(answer) = self.env_queue.pop_front() {
+                return Ok(ok(String::from_utf8(answer).unwrap()));
+            }
+            if let Some(answer) = &self.env_answer {
+                return Ok(ok(String::from_utf8(answer.clone()).unwrap()));
+            }
+            // The real helper, as the installed worker's own binary runs it.
+            return Ok(
+                match crate::service::worker_service::env_report(&self.env) {
+                    Ok(report) => ok(format!(
+                        "{}\n",
+                        serde_json::json!({"ok": true, "env": report})
+                    )),
+                    Err(e) => ok(format!(
+                        "{}\n",
+                        serde_json::json!({"ok": false, "error": format!("{e:#}")})
+                    )),
+                },
+            );
         }
         let (action, cancel) = if shell.starts_with("exec \"$HOME/.remote-task-runner-bootstrap/") {
             assert!(shell.ends_with("worker-service install"));
@@ -209,6 +234,8 @@ impl World {
                 bridges: vec![],
                 bridge_answer: None,
                 bridge_fails: false,
+                env_answer: None,
+                env_queue: Default::default(),
             },
             reloads: std::cell::RefCell::new(vec![]),
             _dir: dir,
@@ -848,4 +875,184 @@ async fn hello_names_who_answered_and_fails_when_nothing_does() {
     assert!(hello_through(&["/nonexistent/ssh".to_string()], &cluster)
         .await
         .is_err());
+}
+
+/// The installed worker runs only a directory of fake tools, so no real
+/// tool (and no Xcode launcher) is probed.
+fn quiet(w: &World) {
+    let state = WorkerPaths::resolve(&w.remote.env).unwrap().state;
+    let bin = w.remote.root.join("worker-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let text = format!(
+        "schema_version=1\nactive='t'\n[profiles.t]\npath=[{:?}]\nshell='/bin/sh'\ncache_namespace='t'\n",
+        fs::canonicalize(&bin).unwrap().to_str().unwrap()
+    );
+    let path = state.join("profiles.toml");
+    fs::write(&path, text).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+fn parent_report() -> EnvReport {
+    use crate::toolchain::envdiff::{Docker, Observed, ToolFact};
+    EnvReport {
+        schema_version: 1,
+        os: std::env::consts::OS.into(),
+        arch: std::env::consts::ARCH.into(),
+        tools: BTreeMap::from([(
+            "git".to_string(),
+            ToolFact {
+                observed: Observed::Available,
+                version: Some("0.0.0-parent".into()),
+                managed: None,
+            },
+        )]),
+        helpers: BTreeMap::from([(
+            "remote-task-runner".to_string(),
+            Some(env!("CARGO_PKG_VERSION").to_string()),
+        )]),
+        docker: Docker::NotRunnable,
+        disk_free_bytes: None,
+        profile_digest: None,
+        policy_digest: None,
+    }
+}
+
+#[test]
+fn diff_asks_the_installed_worker_binary_and_compares_with_the_parent() {
+    let mut w = World::new();
+    w.add("mini-a", Some("ci@mini-a.local"), true).unwrap();
+    quiet(&w);
+    w.remote.log.clear();
+    let diffs = diff_workers(&mut w.remote, &w.env, &w.exe, Some("mini-a"), || {
+        Ok(parent_report())
+    })
+    .unwrap();
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0].worker, "mini-a");
+    let get = |name: &str| diffs[0].items.iter().find(|i| i.subject == name).unwrap();
+    // The helper measured the worker itself: its own version and a real disk.
+    assert_eq!(get("remote-task-runner").class, envdiff::Class::Same);
+    assert_ne!(get("git").class, envdiff::Class::Same);
+    assert!(get("disk").worker.is_some());
+    assert!(!diffs[0].all_same);
+    // One fixed command: no worker name, no path from the caller.
+    assert_eq!(w.remote.log.len(), 1);
+    assert!(w.remote.log[0].contains("'worker-service' 'env'"));
+    assert!(!w.remote.log[0].contains("mini-a"));
+    let text = render_diff(&diffs);
+    assert!(text.starts_with("worker mini-a\n"));
+    assert!(text.contains("remote-task-runner"));
+    assert!(text.contains("same"));
+}
+
+#[test]
+fn diff_without_a_name_covers_every_registered_worker_and_names_one_that_is_not() {
+    let mut w = World::new();
+    w.add("mini-a", Some("ci@a"), true).unwrap();
+    quiet(&w);
+    let all = diff_workers(&mut w.remote, &w.env, &w.exe, None, || Ok(parent_report())).unwrap();
+    assert_eq!(
+        all.iter().map(|d| d.worker.as_str()).collect::<Vec<_>>(),
+        ["mini-a"]
+    );
+    let err = diff_workers(&mut w.remote, &w.env, &w.exe, Some("ghost"), || {
+        Ok(parent_report())
+    })
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    let err = diff_workers(&mut w.remote, &w.env, &w.exe, Some("bad name"), || {
+        Ok(parent_report())
+    })
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    // The parent that cannot be measured is an internal error, before any ssh.
+    w.remote.log.clear();
+    let err = diff_workers(&mut w.remote, &w.env, &w.exe, Some("mini-a"), || {
+        Err("no profile".into())
+    })
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal);
+    assert!(w.remote.log.is_empty());
+}
+
+fn reply_error(body: &str) -> ApiError {
+    parse_env_reply(&RemoteOutput {
+        code: Some(1),
+        stdout: body.as_bytes().to_vec(),
+        stderr: vec![],
+    })
+    .unwrap_err()
+}
+
+#[test]
+fn diff_never_turns_a_bad_answer_into_a_difference() {
+    let mut w = World::new();
+    w.add("mini-a", Some("ci@a"), true).unwrap();
+    for answer in [
+        // An older binary: clap's usage error, not JSON.
+        "error: invalid value 'env' for '<ACTION>'\n",
+        "{\"ok\":true,\"env\":{\"schema_version\":1}}\n",
+        "{\"ok\":false,\"error\":\"profile broken\"}\n",
+    ] {
+        w.remote.env_answer = Some(answer.as_bytes().to_vec());
+        let err = diff_workers(&mut w.remote, &w.env, &w.exe, Some("mini-a"), || {
+            Ok(parent_report())
+        })
+        .unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict, "{answer}");
+    }
+    assert!(reply_error("{\"ok\":false,\"error\":\"profile broken\"}")
+        .message
+        .contains("profile broken"));
+    assert!(reply_error("{\"ok\":false}")
+        .message
+        .contains("unspecified"));
+    assert!(reply_error("usage").message.contains("does not support"));
+    w.remote.reachable = false;
+    w.remote.env_answer = None;
+    let err = diff_workers(&mut w.remote, &w.env, &w.exe, Some("mini-a"), || {
+        Ok(parent_report())
+    })
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
+}
+
+#[test]
+fn the_env_command_is_fixed_with_or_without_a_registered_binary() {
+    assert_eq!(
+        env_command(Some("/opt/rtr/bin"), "abc"),
+        "exec '/opt/rtr/bin' 'worker-service' 'env'"
+    );
+    let staged = env_command(None, "abc");
+    assert!(staged.contains("rtr-abc"));
+    assert!(staged.contains("'worker-service' 'env'"));
+}
+
+#[test]
+fn render_lists_each_class_with_its_steps() {
+    let diffs = vec![WorkerDiff {
+        worker: "w".into(),
+        all_same: false,
+        items: vec![
+            Item {
+                subject: "node".into(),
+                class: envdiff::Class::AutoInstallable,
+                parent: Some("20".into()),
+                worker: None,
+                steps: Some("run workers sync".into()),
+            },
+            Item {
+                subject: "docker".into(),
+                class: envdiff::Class::Same,
+                parent: None,
+                worker: None,
+                steps: None,
+            },
+        ],
+    }];
+    let text = render_diff(&diffs);
+    assert_eq!(text.lines().count(), 3);
+    assert!(text.contains("node") && text.contains("auto_installable"));
+    assert!(text.contains("parent=20 worker=-  -> run workers sync"));
+    assert!(text.lines().last().unwrap().ends_with("parent=- worker=-"));
 }
