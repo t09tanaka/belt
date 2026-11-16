@@ -180,6 +180,9 @@ pub struct JobSpec {
     pub services: Vec<ServiceSpec>,
     pub container: bool,
     pub reusable: Option<String>,
+    /// `runs-on`: a label, a list, a mapping, or an expression string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_on: Option<MatrixValue>,
     /// `strategy.matrix`: a mapping, or an expression string.
     pub matrix: Option<MatrixValue>,
     pub fail_fast: bool,
@@ -188,6 +191,9 @@ pub struct JobSpec {
     pub timeout_minutes: Option<f64>,
     pub continue_on_error: bool,
     pub outputs: Vec<(String, String)>,
+    /// See [`Job::job_exprs`]. Absent when empty, so older plans keep their digest.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_exprs: Vec<String>,
 }
 
 /// A selected workflow with the event it runs as.
@@ -283,6 +289,7 @@ impl JobSpec {
             services: j.services.iter().map(ServiceSpec::from_service).collect(),
             container: j.container,
             reusable: j.reusable.clone(),
+            runs_on: j.runs_on.as_ref().map(MatrixValue::from_yaml),
             matrix: j.matrix.as_ref().map(MatrixValue::from_yaml),
             fail_fast: j.fail_fast,
             max_parallel: j.max_parallel,
@@ -290,6 +297,7 @@ impl JobSpec {
             timeout_minutes: j.timeout_minutes,
             continue_on_error: j.continue_on_error,
             outputs: j.outputs.clone(),
+            job_exprs: j.job_exprs.clone(),
         }
     }
     pub fn to_job(&self) -> Job {
@@ -304,6 +312,7 @@ impl JobSpec {
             services: self.services.iter().map(ServiceSpec::to_service).collect(),
             container: self.container,
             reusable: self.reusable.clone(),
+            runs_on: self.runs_on.as_ref().map(MatrixValue::to_yaml),
             matrix: self.matrix.as_ref().map(MatrixValue::to_yaml),
             fail_fast: self.fail_fast,
             max_parallel: self.max_parallel,
@@ -311,6 +320,7 @@ impl JobSpec {
             timeout_minutes: self.timeout_minutes,
             continue_on_error: self.continue_on_error,
             outputs: self.outputs.clone(),
+            job_exprs: self.job_exprs.clone(),
         }
     }
 }
@@ -427,6 +437,48 @@ pub fn check_version(what: &str, version: u32) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn job_expressions_survive_a_wire_round_trip_and_keep_legs_apart() {
+        let w = crate::workflow::parse(
+            "w.yml",
+            "on: push\njobs:\n  t:\n    runs-on: x\n    continue-on-error: ${{ matrix.os == 'macos-latest' }}\n    steps:\n      - run: echo hi\n",
+        )
+        .unwrap();
+        let job = &w.jobs[0];
+        assert!(!job.job_exprs.is_empty());
+        let spec = JobSpec::from_job(job);
+        let text = serde_json::to_string(&spec).unwrap();
+        let back = serde_json::from_str::<JobSpec>(&text).unwrap().to_job();
+        assert_eq!(back.job_exprs, job.job_exprs);
+        let legs = [
+            crate::os_legs::Leg {
+                family: crate::os_legs::family_of_label("ubuntu-latest"),
+                matrix: serde_json::json!({"os": "ubuntu-latest"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+            crate::os_legs::Leg {
+                family: crate::os_legs::family_of_label("macos-latest"),
+                matrix: serde_json::json!({"os": "macos-latest"})
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+            },
+        ];
+        assert_eq!(
+            crate::os_legs::twins(crate::os_legs::Family::MacOs, &back, &legs),
+            vec![None, None]
+        );
+        // an older plan without the key reads as no expressions
+        let mut v = serde_json::to_value(JobSpec::from_job(&w.jobs[0])).unwrap();
+        v.as_object_mut().unwrap().remove("job_exprs");
+        assert!(serde_json::from_value::<JobSpec>(v)
+            .unwrap()
+            .job_exprs
+            .is_empty());
+    }
 
     #[test]
     fn odd_yaml_keys_become_strings_and_survive_a_round_trip() {

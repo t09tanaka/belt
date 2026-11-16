@@ -56,6 +56,8 @@ pub struct Inputs {
     /// local-ci's version and, for builds between releases, its binary.
     binary: String,
     no_cache: Vec<String>,
+    /// `--all-os-legs`: a run that skips the legs of other OSes has another result.
+    all_os_legs: bool,
     /// Output of version commands and contents of blobs, read once.
     seen: Mutex<HashMap<String, Option<String>>>,
 }
@@ -106,8 +108,15 @@ impl Inputs {
             branch: branch.map(String::from),
             binary: format!("{} {exe}", env!("CARGO_PKG_VERSION")),
             no_cache: no_cache.to_vec(),
+            all_os_legs: false,
             seen: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// These inputs for a run that runs every leg of an `os` matrix (or not).
+    pub fn with_all_os_legs(mut self, all: bool) -> Inputs {
+        self.all_os_legs = all;
+        self
     }
 
     /// The fingerprint of `u` (in workflow `w`, run as `event`), or `None`
@@ -159,8 +168,9 @@ impl Inputs {
             _ => true,
         };
         let mut m = format!(
-            "local-ci {}\nnode {}\nevent {event}\nworkflow {}\njobs {}\nbranch {}\nbase {}\n",
+            "local-ci {}\nall-os-legs {}\nnode {}\nevent {event}\nworkflow {}\njobs {}\nbranch {}\nbase {}\n",
             self.binary,
+            self.all_os_legs,
             self.version(&["node", "--version"]),
             w.file,
             u.jobs.join(","),
@@ -328,6 +338,9 @@ struct SavedJob {
     display: String,
     /// Why the job was skipped, when it was.
     skip: Option<String>,
+    /// Set when the job ran on another OS than its `runs-on` names.
+    #[serde(default)]
+    os_note: Option<String>,
     /// Steps that were skipped or noted, which the report lists as not
     /// covered or as warnings.
     #[serde(default)]
@@ -378,6 +391,7 @@ impl Store {
                 cancelled: false,
                 time: None,
                 build_cache: None,
+                os_note: j.os_note,
                 steps: j
                     .steps
                     .into_iter()
@@ -500,6 +514,7 @@ impl Store {
                     job: j.job.clone(),
                     display: j.display.clone(),
                     skip: skip(&j.outcome),
+                    os_note: j.os_note.clone(),
                     steps: j
                         .steps
                         .iter()
@@ -578,6 +593,7 @@ mod tests {
             merge_base: Some("b".repeat(40)),
             branch: Some("feature".into()),
             binary: "0.0.0".into(),
+            all_os_legs: false,
             no_cache: vec!["ci.yml:audit".into()],
             seen: Mutex::new(HashMap::new()),
         };
@@ -712,6 +728,7 @@ jobs:
             cancelled: false,
             time: None,
             build_cache: None,
+            os_note: None,
         };
         let u = |o: Outcome| UnitResult {
             unit: None,

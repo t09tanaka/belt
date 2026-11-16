@@ -22,6 +22,7 @@ pub mod filter;
 pub mod frozen;
 pub mod git;
 pub mod matrix;
+pub mod os_legs;
 pub mod plan;
 pub mod portool;
 pub mod reclaim;

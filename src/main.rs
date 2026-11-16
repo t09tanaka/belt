@@ -111,6 +111,10 @@ struct RunArgs {
     /// Do not restore or save the `target/` of Rust jobs (LOCAL_CI_NO_BUILD_CACHE=1 does the same)
     #[arg(long)]
     no_build_cache: bool,
+    /// Run every leg of an `os` matrix. By default only the leg of this machine's OS runs when
+    /// the legs differ only in the OS label (LOCAL_CI_ALL_OS_LEGS=1 does the same)
+    #[arg(long)]
+    all_os_legs: bool,
 }
 
 #[derive(Subcommand)]
@@ -249,6 +253,7 @@ fn run(ctx: &ExecContext, a: RunArgs) -> Result<i32> {
         job_timeout: a.job_timeout,
         no_cache: a.no_cache,
         no_build_cache: a.no_build_cache,
+        all_os_legs: a.all_os_legs,
         cache_dir: ctx.cache_dir()?,
         source: None,
     };

@@ -7,6 +7,7 @@ use crate::dag::{self, ExecutionTask};
 use crate::expr::{self, Ctx, Status};
 use crate::frozen::FrozenPlan;
 use crate::matrix;
+use crate::os_legs;
 use crate::plan::{self, Plan, Unit};
 use crate::setup::{
     self, PreparedHow, PreparedReceipt, PreparedSetup, PreparedStep, SetupRecipe, TemplateContext,
@@ -72,6 +73,10 @@ pub struct JobResult {
     /// Absent when the cache was not used for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub build_cache: Option<crate::build_cache::JobCache>,
+    /// Set when the job ran on the host although its `runs-on` names another
+    /// OS, and no leg of the host's OS runs the same steps (see [`crate::os_legs`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_note: Option<String>,
 }
 
 /// What a job waited for, and how long it really ran, in seconds.
@@ -161,6 +166,9 @@ pub struct Opts {
     pub keep: bool,
     /// Where removed worktrees go before they are deleted in the background.
     pub trash: PathBuf,
+    /// Run every leg of a matrix over `runs-on` labels, also the ones another
+    /// OS than the host's would run with the same steps (`--all-os-legs`).
+    pub all_os_legs: bool,
 }
 
 /// Where one attempt runs: the host paths the plan is materialized at. The
@@ -1802,6 +1810,7 @@ impl<'a> Runner<'a> {
                 cancelled: false,
                 time: None,
                 build_cache: None,
+                os_note: None,
             })
             .collect()
     }
@@ -2023,6 +2032,7 @@ impl<'a> Runner<'a> {
                         cancelled: false,
                         time: None,
                         build_cache: None,
+                        os_note: None,
                     })
                     .collect();
                 charge(&mut jobs, waited);
@@ -2139,6 +2149,7 @@ impl<'a> Runner<'a> {
                             cancelled: true,
                             time: None,
                             build_cache: None,
+                            os_note: None,
                         };
                         hold.outcomes.push(outcome_of(id, None, &r, &Map::new()));
                         jobs.push(r);
@@ -2226,6 +2237,7 @@ impl<'a> Runner<'a> {
                                 cancelled: false,
                                 time: None,
                                 build_cache: None,
+                                os_note: None,
                             });
                         }
                     }
@@ -2629,6 +2641,7 @@ impl<'a> Runner<'a> {
                     cancelled: false,
                     time: None,
                     build_cache: None,
+                    os_note: None,
                 },
                 Map::new(),
             )
@@ -2651,6 +2664,7 @@ impl<'a> Runner<'a> {
                     cancelled: false,
                     time: None,
                     build_cache: None,
+                    os_note: None,
                 },
                 Map::new(),
             )
@@ -2721,11 +2735,11 @@ impl<'a> Runner<'a> {
             )];
         }
 
-        // Combinations that pass `if:` run after this loop.
-        let mut out: Vec<Option<(JobResult, Map<String, Value>)>> = Vec::new();
-        let mut todo: Vec<(usize, Map<String, Value>, String)> = Vec::new();
+        // The entries of the matrix with their contexts and names.
+        let mut entries: Vec<(usize, Map<String, Value>, String)> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
         let total = combos.len();
+        let mut matrices: Vec<Map<String, Value>> = Vec::new();
         for (idx, combo) in combos.into_iter().enumerate() {
             let mut cm = ctx_map.clone();
             cm.insert("matrix".into(), Value::Object(combo.clone()));
@@ -2756,18 +2770,59 @@ impl<'a> Runner<'a> {
                 display = format!("{display} #{}", idx + 1);
                 seen.insert(display.clone());
             }
-            if only.is_some_and(|o| o != idx) {
+            matrices.push(combo);
+            entries.push((idx, cm, display));
+        }
+
+        // The OS each entry's `runs-on` names. Every job runs on the host: the
+        // entries of another OS that a leg of the host's OS stands in for are
+        // not run, the others run with a note.
+        let host = os_legs::Family::host();
+        let os_of: Vec<Option<(os_legs::Family, String)>> = entries
+            .iter()
+            .map(|(_, cm, _)| os_legs::family_of_leg(job, cm))
+            .collect();
+        let twin_of: Vec<Option<usize>> = if self.opts.all_os_legs {
+            vec![None; entries.len()]
+        } else {
+            let legs: Vec<os_legs::Leg> = os_of
+                .iter()
+                .zip(matrices)
+                .map(|(o, matrix)| os_legs::Leg {
+                    family: o.as_ref().map(|(f, _)| *f),
+                    matrix,
+                })
+                .collect();
+            os_legs::twins(host, job, &legs)
+        };
+
+        // Combinations that pass `if:` run after this loop.
+        let mut out: Vec<Option<(JobResult, Map<String, Value>)>> = Vec::new();
+        let mut todo: Vec<(usize, Map<String, Value>, String)> = Vec::new();
+        let mut notes: Vec<(usize, String)> = Vec::new();
+        for (k, (idx, cm, display)) in entries.iter().enumerate() {
+            if only.is_some_and(|o| o != *idx) {
                 continue;
             }
+            let (cm, display) = (cm.clone(), display.clone());
             let run_it = {
                 let ctx = Ctx::with_fns(&cm, needs_fns);
                 expr::condition(job.cond.as_deref(), &ctx)
             };
             match run_it {
-                Ok(true) => {
-                    todo.push((out.len(), cm, display));
-                    out.push(None);
-                }
+                Ok(true) => match (&os_of[k], twin_of[k]) {
+                    (Some((family, label)), Some(t)) => out.push(Some(skip(
+                        display,
+                        os_legs::not_run_reason(label, *family, host, &entries[t].2),
+                    ))),
+                    (os, _) => {
+                        if let Some((family, label)) = os.as_ref().filter(|(f, _)| *f != host) {
+                            notes.push((out.len(), os_legs::ran_on_note(label, *family, host)));
+                        }
+                        todo.push((out.len(), cm, display));
+                        out.push(None);
+                    }
+                },
                 Ok(false) => out.push(Some(skip(display, why_not().into()))),
                 Err(e) => out.push(Some(error(display, format!("if: {e:#}")))),
             }
@@ -2865,6 +2920,11 @@ impl<'a> Runner<'a> {
                 out[i] = Some(one(ws, cm, display));
             }
         }
+        for (i, note) in notes {
+            if let Some(Some((r, _))) = out.get_mut(i) {
+                r.os_note = Some(note);
+            }
+        }
         out.into_iter().flatten().collect()
     }
 
@@ -2917,6 +2977,7 @@ impl<'a> Runner<'a> {
             cancelled: false,
             time: None,
             build_cache: None,
+            os_note: None,
         };
 
         // services
@@ -4086,7 +4147,7 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
 }
 
 /// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
-fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
+pub(crate) fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
     Ok(match v {
         Value::String(s) if s.contains("${{") => expr::interpolate_value(s, ctx)?,
         Value::Array(a) => Value::Array(
@@ -4240,6 +4301,7 @@ mod tests {
             cancelled: false,
             time: None,
             build_cache: None,
+            os_note: None,
         }
     }
 
@@ -4644,6 +4706,7 @@ mod tests {
             cancelled,
             time,
             build_cache: None,
+            os_note: (display == "c").then(|| "ran on macOS, not Linux (runs-on x)".to_string()),
         };
         let time = JobTime {
             work_secs: 1.0,
@@ -4681,6 +4744,11 @@ mod tests {
         assert!(back.jobs[1].cancelled && !back.jobs[0].cancelled);
         assert_eq!(back.jobs[2].outcome, Outcome::Skip("why".into()));
         assert_eq!(back.jobs[3].outcome, Outcome::Error("boom".into()));
+        assert_eq!(
+            back.jobs[2].os_note.as_deref(),
+            Some("ran on macOS, not Linux (runs-on x)")
+        );
+        assert_eq!(back.jobs[0].os_note, None);
         assert_eq!(back.jobs[0].steps[0].note.as_deref(), Some("a note"));
         assert_eq!(back.jobs[0].steps[1].note, None);
         assert_eq!(back.artifacts, ["bundle"]);

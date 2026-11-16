@@ -387,6 +387,7 @@ fn every_legacy_execution_entry_rejects_captured_plans_before_writes_or_tools() 
         lock_file: area.join("lock"),
     };
     let opts = || local_ci::exec::Opts {
+        all_os_legs: false,
         parallel: 1,
         traffic_controller: Some(area.join("no-controller")),
         executor: Some(std::sync::Arc::new(Sentinel(called.clone()))),

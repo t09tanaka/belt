@@ -60,6 +60,9 @@ pub struct RunOptions {
     pub no_cache: bool,
     /// Do not restore or save the `target/` of Rust jobs (see [`crate::build_cache`]).
     pub no_build_cache: bool,
+    /// Run every leg of an `os` matrix, not only the one of the host's OS
+    /// (`LOCAL_CI_ALL_OS_LEGS=1` does the same; see [`crate::os_legs`]).
+    pub all_os_legs: bool,
     /// Where runs, results, worktrees and locks live (see [`ExecContext::cache_dir`]).
     pub cache_dir: PathBuf,
     /// The captured source the run is over: `target.sha` is its execution
@@ -588,6 +591,10 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             cache.display()
         );
     }
+    let all_os_legs = a.all_os_legs
+        || ctx
+            .var("LOCAL_CI_ALL_OS_LEGS")
+            .is_some_and(crate::build_cache::truthy);
     let key = repo_key(ctx, &root);
     let runs = cache.join("runs").join(&key);
     let stamp = std::time::SystemTime::now()
@@ -613,7 +620,9 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             full.branch.as_deref(),
             &full.config.workflow_dirs,
             &full.config.no_cache,
-        ) {
+        )
+        .map(|i| i.with_all_os_legs(all_os_legs))
+        {
             Ok(inputs) => full_plan
                 .units
                 .iter()
@@ -756,7 +765,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             ctx.find_tool("portool")
         };
         let isolated = portool.is_some() && wt.join(".portool.toml").is_file();
-        let peak = crate::cpu::peak(&fp, gated, isolated, parallel);
+        let peak = crate::cpu::peak(&fp, gated, isolated, parallel, all_os_legs);
         // one job at a time has it all: nothing to ask the controller
         if peak > 1 {
             let budget = match traffic_controller.as_deref() {
@@ -784,6 +793,7 @@ pub fn run(ctx: &ExecContext, a: RunOptions, obs: &mut dyn Observer) -> Result<R
             job_timeout_min: a.job_timeout,
             keep: a.keep,
             trash: cache.join("trash"),
+            all_os_legs,
         };
         let ws = exec::Workspace {
             root: wt.clone(),

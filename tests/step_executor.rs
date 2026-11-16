@@ -143,6 +143,7 @@ fn lab_for(workflow: &str) -> Lab {
 impl Lab {
     fn run(&self, executor: Option<Arc<dyn StepExecutor>>) -> TaskResult {
         let opts = Opts {
+            all_os_legs: false,
             parallel: 1,
             traffic_controller: None,
             executor,
@@ -172,6 +173,7 @@ impl Lab {
         parallel: usize,
     ) -> local_ci::report::RunResult {
         let opts = Opts {
+            all_os_legs: false,
             parallel,
             traffic_controller: None,
             executor: Some(executor),
@@ -322,6 +324,7 @@ fn the_demand_of_a_shard_step_is_the_shell_the_executor_starts() {
     assert_eq!(demand.nodes[0].argv, ["sh", "-e", local_ci::demand::SCRIPT]);
     let rec = Recorder::new(Exit::Code(0), None);
     let opts = Opts {
+        all_os_legs: false,
         parallel: 1,
         traffic_controller: None,
         executor: Some(rec.clone()),
@@ -383,6 +386,7 @@ fn a_task_of_another_wire_version_is_not_started_and_its_result_travels_without_
     let l = lab_for(TWO_STEPS);
     let bad = WIRE_SCHEMA_VERSION + 1;
     let opts = || Opts {
+        all_os_legs: false,
         parallel: 1,
         traffic_controller: None,
         executor: Some(Recorder::new(Exit::Code(0), None)),
@@ -847,6 +851,7 @@ fn run_never_discovers_or_removes_other_runs_containers_at_startup() {
             job_timeout: 5.0,
             no_cache: true,
             no_build_cache: true,
+            all_os_legs: false,
             cache_dir: l.tmp.path().join("startup-run"),
             source: None,
         },

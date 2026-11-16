@@ -105,6 +105,38 @@ fn a_frozen_plan_survives_json_and_keeps_its_digest() {
 }
 
 #[test]
+fn a_plan_written_before_runs_on_was_kept_still_verifies() {
+    let (tmp, dir) = repo("echo hi");
+    let fp = plan_of(&dir, "main", tmp.path());
+    let mut v = serde_json::to_value(&fp).unwrap();
+    // the plan keeps what each job runs on
+    let jobs = |v: &mut serde_json::Value| -> Vec<serde_json::Value> {
+        v["workflows"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|w| w["jobs"].as_array_mut().unwrap().clone())
+            .collect()
+    };
+    assert!(jobs(&mut v)
+        .iter()
+        .all(|j| j["runs_on"]["value"] == "ubuntu-latest"));
+    // what an earlier version wrote has no such key, and a digest of that
+    for w in v["workflows"].as_array_mut().unwrap() {
+        for j in w["jobs"].as_array_mut().unwrap() {
+            j.as_object_mut().unwrap().remove("runs_on");
+        }
+    }
+    let mut old: FrozenPlan = serde_json::from_value(v.clone()).unwrap();
+    old.digest = old.compute_digest().unwrap();
+    v["digest"] = serde_json::Value::String(old.digest.clone());
+    assert!(!v.to_string().contains("runs_on"));
+    let back = FrozenPlan::from_json(&v.to_string()).unwrap();
+    assert_eq!(back, old);
+    assert!(!back.to_canonical_json().unwrap().contains("runs_on"));
+}
+
+#[test]
 fn the_digest_follows_the_input_and_nothing_else() {
     let (tmp, dir) = repo("echo hi");
     let a = plan_of(&dir, "main", tmp.path());
@@ -191,6 +223,7 @@ fn run_options(dir: &Path, cache: &Path) -> RunOptions {
         job_timeout: 5.0,
         no_cache: true,
         no_build_cache: true,
+        all_os_legs: false,
         cache_dir: cache.to_path_buf(),
         source: None,
     }
@@ -225,6 +258,7 @@ fn executing_a_built_plan_gives_what_run_gives() {
     std::fs::create_dir_all(&ws.run_dir).unwrap();
     std::fs::create_dir_all(cache.join("locks")).unwrap();
     let opts = local_ci::exec::Opts {
+        all_os_legs: false,
         parallel: 2,
         traffic_controller: None,
         executor: None,

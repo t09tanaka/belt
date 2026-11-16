@@ -129,6 +129,7 @@ fn lab_ws(jobs: &str) -> (common::Tmp, FrozenPlan, Workspace) {
 
 fn lab_opts(tmp: &common::Tmp, parallel: usize) -> Opts {
     Opts {
+        all_os_legs: false,
         parallel,
         traffic_controller: None,
         executor: None,
@@ -525,6 +526,7 @@ fn cached_opts(tmp: &common::Tmp, dir: &Path, workflows: &[&str]) -> local_ci::R
         job_timeout: 5.0,
         no_cache: false,
         no_build_cache: true,
+        all_os_legs: false,
         cache_dir: tmp.path().join("cache3"),
         source: None,
     }

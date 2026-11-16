@@ -80,7 +80,13 @@ pub fn share(budget: usize, parallel: Option<usize>, gated: bool, peak: usize) -
 /// run gives every job its own ports (portool), so only a unit with
 /// `services:` is locked. A matrix that is only known when it runs counts as
 /// wide as `strategy.max-parallel` lets it be.
-pub fn peak(fp: &FrozenPlan, matrix_at_once: bool, isolated: bool, units_at_once: usize) -> usize {
+pub fn peak(
+    fp: &FrozenPlan,
+    matrix_at_once: bool,
+    isolated: bool,
+    units_at_once: usize,
+    all_os_legs: bool,
+) -> usize {
     let mut widths: Vec<usize> = fp
         .units
         .iter()
@@ -102,7 +108,14 @@ pub fn peak(fp: &FrozenPlan, matrix_at_once: bool, isolated: bool, units_at_once
                     }
                     let entries = match dag::matrix_plan(job) {
                         MatrixPlan::None => 1,
-                        MatrixPlan::Static(v) => v.len(),
+                        // the legs of another OS that a leg of this host stands in
+                        // for do not run (see `os_legs`)
+                        MatrixPlan::Static(v) if all_os_legs => v.len(),
+                        MatrixPlan::Static(v) => crate::os_legs::running_legs(
+                            crate::os_legs::Family::host(),
+                            &job.to_job(),
+                            &v,
+                        ),
                         MatrixPlan::Dynamic(_) => usize::MAX,
                     };
                     entries.min(job.max_parallel.unwrap_or(usize::MAX)).max(1)

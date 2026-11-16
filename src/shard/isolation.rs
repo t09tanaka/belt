@@ -279,6 +279,7 @@ mod tests {
             services: vec![],
             container: false,
             reusable: None,
+            runs_on: None,
             matrix: None,
             fail_fast: false,
             max_parallel: None,
@@ -286,6 +287,7 @@ mod tests {
             timeout_minutes: None,
             continue_on_error: false,
             outputs: vec![],
+            job_exprs: vec![],
         }
     }
 

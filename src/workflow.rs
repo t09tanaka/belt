@@ -39,6 +39,10 @@ pub struct Job {
     pub services: Vec<Service>,
     pub container: bool,
     pub reusable: Option<String>,
+    /// `runs-on`, as YAML (a label, a list of labels, a `group`/`labels` mapping,
+    /// or an expression string such as `${{ matrix.os }}`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runs_on: Option<Y>,
     /// `strategy.matrix`, as YAML (a mapping, or an expression string).
     pub matrix: Option<Y>,
     pub fail_fast: bool,
@@ -48,6 +52,10 @@ pub struct Job {
     pub timeout_minutes: Option<f64>,
     pub continue_on_error: bool,
     pub outputs: Vec<(String, String)>,
+    /// `timeout-minutes`, `continue-on-error` and `container` as written, when
+    /// they hold an expression (the typed fields above read one as unset).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub job_exprs: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -252,6 +260,7 @@ fn parse_job(id: &str, j: &Y) -> Job {
         services,
         container: get(j, "container").is_some(),
         reusable: str_of(j, "uses"),
+        runs_on: get(j, "runs-on").cloned(),
         matrix: get(j, "strategy").and_then(|s| get(s, "matrix")).cloned(),
         fail_fast: !matches!(
             get(j, "strategy").and_then(|s| get(s, "fail-fast")),
@@ -268,6 +277,12 @@ fn parse_job(id: &str, j: &Y) -> Job {
         timeout_minutes: num_of(j, "timeout-minutes"),
         continue_on_error: bool_of(j, "continue-on-error"),
         outputs: pairs(get(j, "outputs")),
+        job_exprs: ["timeout-minutes", "continue-on-error", "container"]
+            .iter()
+            .filter_map(|k| get(j, k))
+            .filter_map(|v| serde_yaml::to_string(v).ok())
+            .filter(|t| t.contains("${{"))
+            .collect(),
     }
 }
 

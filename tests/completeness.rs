@@ -109,6 +109,7 @@ fn plan(tmp: &common::Tmp, dir: &Path) -> FrozenPlan {
 
 fn opts(cache: &Path) -> Opts {
     Opts {
+        all_os_legs: false,
         parallel: 2,
         traffic_controller: None,
         executor: None,
@@ -294,6 +295,7 @@ fn run_opts(dir: &Path, cache: &Path) -> RunOptions {
         job_timeout: 5.0,
         no_cache: false,
         no_build_cache: true,
+        all_os_legs: false,
         cache_dir: cache.to_path_buf(),
         source: None,
     }
