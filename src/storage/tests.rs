@@ -5667,3 +5667,91 @@ fn live_attempts_of_a_worker_are_paged_without_gaps_repeats_or_other_rows() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn live_workflow_artifacts_require_durable_bytes_and_replay_the_original_version() {
+    use local_ci::artifact_io::{FileEntry, Receipt as Manifest};
+    let f = fx();
+    let attempt = f.attempt('a').unwrap().attempt_id;
+    let bytes = b"compiled output";
+    let digest = Digest::of_bytes(bytes);
+    let manifest = Manifest {
+        name: "build".into(),
+        version: 1,
+        files: vec![FileEntry {
+            path: "out/app".into(),
+            size: bytes.len() as u64,
+            sha256: digest.as_str().strip_prefix("sha256:").unwrap().into(),
+        }],
+        plan_digest: "plan".into(),
+        attempt_id: "run".into(),
+        job: "ci::build".into(),
+        display: "build".into(),
+        task: None,
+        retention_days: None,
+        compression_level: None,
+        restored_from: None,
+    };
+    let publish = |store: &CoordinatorStore, workflow: &str, key: &[u8], overwrite| {
+        store.publish_workflow_artifact(
+            WorkflowUpload {
+                run: &f.run,
+                workflow,
+                producer: &attempt,
+                key: &Digest::of_bytes(key),
+                overwrite,
+                receipt: manifest.clone(),
+            },
+            30,
+        )
+    };
+    assert!(publish(&f.store, "ci", b"first", false).is_err());
+    assert!(f.store.workflow_artifacts(&f.run, "ci").unwrap().is_empty());
+    let files = crate::results::ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.append_part(&attempt, &digest, 0, bytes).unwrap();
+    files
+        .publish_artifact(&attempt, &digest, bytes.len() as u64)
+        .unwrap();
+    assert_eq!(
+        publish(&f.store, "ci", b"first", false)
+            .unwrap()
+            .receipt
+            .version,
+        1
+    );
+    assert!(publish(&f.store, "ci", b"second", false).is_err());
+    assert_eq!(
+        publish(&f.store, "ci", b"second", true)
+            .unwrap()
+            .receipt
+            .version,
+        2
+    );
+    assert!(publish(&f.store, "ci", b"first", true).is_err());
+    assert_eq!(
+        publish(&f.store, "lint", b"lint", false)
+            .unwrap()
+            .receipt
+            .version,
+        1
+    );
+    drop(f.store);
+    let store = CoordinatorStore::open(f._dir.path(), 40).unwrap();
+    assert_eq!(
+        publish(&store, "ci", b"first", false)
+            .unwrap()
+            .receipt
+            .version,
+        1
+    );
+    assert_eq!(
+        store.workflow_artifacts(&f.run, "ci").unwrap()[0]
+            .receipt
+            .version,
+        2
+    );
+    assert!(store
+        .workflow_artifacts(&RunId::generate(), "ci")
+        .unwrap()
+        .is_empty());
+}

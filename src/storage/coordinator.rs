@@ -20,7 +20,9 @@ use serde_json::Value;
 use std::path::Path;
 
 mod retention;
+mod workflow_artifact;
 pub use retention::{ResultDeleteClaim, ResultGcPage};
+pub use workflow_artifact::{WorkflowArtifact, WorkflowUpload};
 mod collect;
 mod live_log;
 pub use live_log::{LiveLogTarget, LogProgress};

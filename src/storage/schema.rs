@@ -355,6 +355,18 @@ UPDATE matrix_permit SET held=0,released_at_ms=(
  revision INTEGER NOT NULL CHECK(revision>0), record TEXT NOT NULL,
  PRIMARY KEY(run_id,authorization,revision)
 ) WITHOUT ROWID;"#.into(),
+            r#"CREATE TABLE workflow_artifact (
+ run_id TEXT NOT NULL REFERENCES run(run_id),
+ workflow TEXT NOT NULL,
+ name TEXT NOT NULL,
+ version INTEGER NOT NULL CHECK(version>0),
+ producer TEXT NOT NULL REFERENCES attempt(attempt_id),
+ action_key TEXT NOT NULL,
+ fingerprint TEXT NOT NULL,
+ receipt_json TEXT NOT NULL,
+ PRIMARY KEY(run_id,workflow,name,version),
+ UNIQUE(producer,action_key)
+) WITHOUT ROWID;"#.into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

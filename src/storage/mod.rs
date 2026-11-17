@@ -32,7 +32,7 @@ pub use coordinator::{
     Placement, PreparedRetry, QueuedTask, ResultRef, RetireEnd, RetryPreparation, RunStanding,
     Seen, WorkerLoad, PAGE_MAX,
 };
-pub use coordinator::{CiAttempt, CiTaskRow};
+pub use coordinator::{CiAttempt, CiTaskRow, WorkflowArtifact, WorkflowUpload};
 pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
 pub use db::Db;
 pub use lock::ProcessLock;
