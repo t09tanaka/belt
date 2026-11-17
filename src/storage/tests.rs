@@ -5492,3 +5492,89 @@ fn future_run_expiry_fences_retry_preflight_commit_and_enqueue_without_mutation(
     assert_eq!(f.store.completion(target).unwrap().control_revision, 0);
     assert_eq!(f.store.attempts_of_task(&f.task).unwrap().len(), 1);
 }
+
+/// Secret delivery walks one worker's live attempts by this keyset page, so a
+/// worker with more live attempts than one page is still covered completely.
+#[test]
+fn live_attempts_of_a_worker_are_paged_without_gaps_repeats_or_other_rows() {
+    let f = fx();
+    let on = |name: &str, at_ms: u64| {
+        let task = TaskId::generate();
+        f.store.create_task(&task, &f.run, &json!({}), 1).unwrap();
+        f.store
+            .create_attempt(
+                NewAttempt {
+                    attempt_id: AttemptId::generate(),
+                    task_id: task,
+                    worker_id: worker(name),
+                    payload_hash: hash('a'),
+                    permit_id: None,
+                },
+                at_ms,
+            )
+            .unwrap()
+            .attempt_id
+    };
+    // Rows that never belong to the walk are interleaved with the live ones.
+    let ended = on("mini-a", 10);
+    f.to_finalizing(&ended);
+    f.store
+        .finalize_attempt(&ended, done(Outcome::Succeeded), 30)
+        .unwrap();
+    let retired = on("mini-a", 10);
+    f.store.begin_retire(&retired, "ack lost", 11).unwrap();
+    f.store.confirm_retire(&retired, 12).unwrap();
+    let mut expected = Vec::new();
+    for i in 0..70u64 {
+        // Several attempts share one creation time; the row order breaks the tie.
+        expected.push(on("mini-a", 10 + i / 30));
+        if i % 20 == 0 {
+            on("mini-b", 10 + i / 30);
+        }
+    }
+
+    let mut walked = Vec::new();
+    let mut sizes = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = f.store.live_attempt_page(&f.worker, cursor, 16).unwrap();
+        sizes.push(page.len());
+        let Some((last, _)) = page.last() else { break };
+        cursor = Some(*last);
+        walked.extend(page.into_iter().map(|(_, live)| live.record.attempt_id));
+    }
+    assert_eq!(sizes, [16, 16, 16, 16, 6, 0]);
+    assert_eq!(walked, expected);
+
+    // A caller cannot ask for an unbounded page.
+    let capped = f
+        .store
+        .live_attempt_page(&f.worker, None, u32::MAX)
+        .unwrap();
+    assert_eq!(capped.len(), 64);
+    assert_eq!(
+        capped
+            .iter()
+            .map(|(_, live)| live.record.attempt_id.clone())
+            .collect::<Vec<_>>(),
+        expected[..64]
+    );
+
+    // The cache is pruned against the live set without loading that set.
+    let mut asked = expected[..62].to_vec();
+    asked.push(ended);
+    asked.push(retired);
+    let live = f.store.live_attempt_subset(&f.worker, &asked).unwrap();
+    assert_eq!(live, expected[..62].iter().cloned().collect());
+    asked.push(expected[62].clone());
+    assert!(matches!(
+        f.store.live_attempt_subset(&f.worker, &asked),
+        Err(StorageError::Invalid(_))
+    ));
+    let other = worker("mini-b");
+    assert!(f
+        .store
+        .live_attempt_subset(&other, &expected[..8])
+        .unwrap()
+        .is_empty());
+}
