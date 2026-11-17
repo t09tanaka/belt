@@ -245,7 +245,7 @@ pub(crate) mod tests {
     use crate::ci::execute::tests::fixture;
     use local_ci::dag::ShardRequest;
     use local_ci::shard::adapters::{CargoTest, Safety};
-    use local_ci::shard::{partition_tests, Discovered, History, PartitionOpts, TestResult};
+    use local_ci::shard::{partition_tests, Discovered, History, PartitionOpts};
 
     pub(crate) const SPLIT: &str = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    outputs:\n      v: ${{ steps.t.outputs.v }}\n    steps:\n      - id: t\n        run: cargo test\n  report:\n    needs: test\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo report\n";
 
@@ -309,9 +309,9 @@ pub(crate) mod tests {
             shard_id: group.shards[at].clone(),
             tests: group.assignments[at]
                 .iter()
-                .map(|t| TestResult {
-                    identity: t.clone(),
-                    status,
+                .map(|test| {
+                    serde_json::from_value(serde_json::json!({"identity": test, "status": status}))
+                        .expect("receipt without optional metrics")
                 })
                 .collect(),
             exit_ok: status != TestStatus::Failed,
