@@ -68,10 +68,7 @@ pub(crate) fn calibrate(
             .any(|w| speeds.get(w).is_some_and(|s| *s != 1000))
     {
         let speed = |w: &String| speeds.get(w).copied().unwrap_or(1000);
-        let mut pool = workers.to_vec();
-        pool.sort();
-        pool.dedup();
-        model.slots = pool.iter().cycle().take(capacity).cloned().collect();
+        model.slots = workers.iter().cycle().take(capacity).cloned().collect();
         // The SDK omits empty shards. With faster slots first, only a suffix
         // can be empty and every emitted shard index still names its worker.
         model.slots.sort_by_key(|w| std::cmp::Reverse(speed(w)));

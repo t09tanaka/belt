@@ -290,6 +290,7 @@ pub fn stage(
     plan: &FrozenPlan,
     specs: &mut Vec<(String, crate::coordinator::TaskSpec)>,
     capacity: usize,
+    per_worker: u32,
     project: &str,
     policies: &[crate::config::model::ShardPolicy],
 ) {
@@ -311,7 +312,7 @@ pub fn stage(
         let policy = policies
             .iter()
             .find(|p| p.workflow == step.workflow && p.job == step.job);
-        ci.task.inputs["rtr_discovery"] = serde_json::json!({"original_task":task.id,"capacity": capacity, "project": project, "applied": false, "policy": policy});
+        ci.task.inputs["rtr_discovery"] = serde_json::json!({"original_task":task.id,"capacity": capacity,"per_worker":per_worker, "project": project, "applied": false, "policy": policy});
 
         ci.steps = u32::try_from(step.step + 2).unwrap_or(u32::MAX);
         probes.push((id, probe));
@@ -333,8 +334,7 @@ pub fn active_plan(rows: &[crate::storage::CiTaskRow]) -> Option<&str> {
 pub fn apply(
     plan: &FrozenPlan,
     listings: &[WorkerListing],
-    count: usize,
-    evidence: impl Fn(&WorkerListing) -> anyhow::Result<(History, PartitionOpts)>,
+    evidence: impl Fn(&WorkerListing) -> anyhow::Result<(History, PartitionOpts, usize)>,
     isolation: impl Fn(&DiscoveryStep) -> Isolation,
 ) -> anyhow::Result<FrozenPlan> {
     let expected = candidates(plan);
@@ -348,7 +348,7 @@ pub fn apply(
                 && seen.insert((&expected_step.workflow, &expected_step.job)),
             "unexpected or duplicated discovery step"
         );
-        let (history, costs) = evidence(listing)?;
+        let (history, costs, count) = evidence(listing)?;
         requests.push(listing.partition(
             plan,
             &history,

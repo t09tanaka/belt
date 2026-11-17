@@ -69,8 +69,7 @@ fn an_exact_worker_listing_is_split_with_history_and_bound_to_its_plan() {
     let split = apply(
         &plan,
         std::slice::from_ref(&listing),
-        2,
-        |_| Ok((timing.clone(), costs.clone())),
+        |_| Ok((timing.clone(), costs.clone(), 2)),
         |_| Isolation::None,
     )
     .unwrap();
@@ -83,8 +82,7 @@ fn an_exact_worker_listing_is_split_with_history_and_bound_to_its_plan() {
     assert!(apply(
         &plan,
         &[],
-        2,
-        |_| Ok((timing.clone(), costs.clone())),
+        |_| Ok((timing.clone(), costs.clone(), 2)),
         |_| Isolation::None
     )
     .is_err());

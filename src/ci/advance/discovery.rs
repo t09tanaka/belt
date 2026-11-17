@@ -88,6 +88,10 @@ pub(super) fn advance(
         .and_then(|m| m["capacity"].as_u64())
         .and_then(|n| usize::try_from(n).ok())
         .ok_or_else(|| unrunnable("invalid shard capacity"))?;
+    let per_worker = metadata(first)
+        .and_then(|m| m["per_worker"].as_u64())
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(capacity);
     let mut policies = BTreeMap::new();
     let mut listings = Vec::new();
     let mut ids = Vec::new();
@@ -147,7 +151,12 @@ pub(super) fn advance(
                 let workers = decision
                     .compared
                     .iter()
-                    .map(|c| c.worker_id.to_string())
+                    .map(|c| {
+                        (
+                            c.worker_id.to_string(),
+                            per_worker.saturating_sub(c.load as usize).max(1),
+                        )
+                    })
                     .collect::<Vec<_>>();
                 let transfer = crate::scheduler::decide::TRANSFER;
                 let lower_bound = decision
@@ -181,6 +190,15 @@ pub(super) fn advance(
     // the queue limit even if every discovered job expands at once.
     let max_shards =
         1 + crate::storage::MAX_TASKS_PER_RUN.saturating_sub(rows.len()) / listings.len().max(1);
+    let runnable_siblings = rows
+        .iter()
+        .filter(|row| {
+            !is_probe(row)
+                && !row.cancelled
+                && row.spec.pointer("/ci/hold").and_then(|v| v.as_bool()) != Some(true)
+                && row.attempt.as_ref().is_none_or(|a| a.termination.is_none())
+        })
+        .count();
     let mut histories = BTreeMap::new();
     for listing in &listings {
         let key = listing.history_key(&plan, project).map_err(unrunnable)?;
@@ -191,24 +209,49 @@ pub(super) fn advance(
         let (workers, transfer) = placement
             .map(|(w, t)| (w.as_slice(), *t))
             .unwrap_or((&[], 0));
-        let model = crate::ci::discovery::timing::calibrate(
-            &history,
-            workers,
-            capacity.min(listing.discovered.tests.len()).min(max_shards),
-            transfer,
-        );
-        histories.insert(key, model);
+        let effective = if workers.is_empty() {
+            capacity
+        } else {
+            workers
+                .iter()
+                .fold(0usize, |sum, (_, places)| sum.saturating_add(*places))
+                .min(capacity)
+        };
+        let count = effective
+            .saturating_sub(runnable_siblings)
+            .div_ceil(listings.len())
+            .max(1)
+            .min(max_shards);
+        let count = if listing.discovered.complete {
+            count.min(listing.discovered.tests.len().max(1))
+        } else {
+            count
+        };
+        // Round-robin available slots so one worker cannot consume the
+        // capacity of a different worker when they have unequal loads.
+        let mut slots = Vec::new();
+        for layer in 0..count {
+            for (worker, free) in workers {
+                if *free > layer && slots.len() < count {
+                    slots.push(worker.clone());
+                }
+            }
+            if slots.len() == count {
+                break;
+            }
+        }
+        let model = crate::ci::discovery::timing::calibrate(&history, &slots, count, transfer);
+        histories.insert(key, (model, count));
     }
     let split = apply(
         &plan,
         &listings,
-        capacity.min(max_shards),
         |listing| {
             let key = listing.history_key(&plan, project)?;
-            let model = histories
+            let (model, count) = histories
                 .get(&key)
                 .ok_or_else(|| anyhow::anyhow!("missing discovery timing model"))?;
-            Ok((model.history.clone(), model.costs.clone()))
+            Ok((model.history.clone(), model.costs.clone(), *count))
         },
         |step| {
             policies
@@ -286,7 +329,7 @@ pub(super) fn advance(
                         let key = listing.history_key(&plan, project).map_err(unrunnable)?;
                         ci.shard_preferred_worker = histories
                             .get(&key)
-                            .and_then(|m| m.slots.get(i))
+                            .and_then(|(m, _)| m.slots.get(i))
                             .map(|w| crate::ids::WorkerId::parse(w))
                             .transpose()
                             .map_err(unrunnable)?;

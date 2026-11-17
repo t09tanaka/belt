@@ -216,7 +216,14 @@ pub async fn submit(
             .repository
             .clone()
             .unwrap_or_else(|| Digest::of_bytes(root.as_os_str().as_bytes()).to_string());
-        crate::ci::discovery::stage(&plan, &mut specs, capacity, &project, &policies);
+        crate::ci::discovery::stage(
+            &plan,
+            &mut specs,
+            capacity,
+            context.config.max_active_task.value,
+            &project,
+            &policies,
+        );
     }
     let mut submitted = Vec::with_capacity(specs.len());
     let mut tasks = Vec::with_capacity(specs.len());
