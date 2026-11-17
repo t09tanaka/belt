@@ -272,6 +272,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
     let exported = root.path().join("exported");
     let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
         .env_clear()
+        .envs(super::common::profile_env())
         .env("XDG_CONFIG_HOME", &config_root)
         .env("PATH", "/unavailable")
         .current_dir(&no_git)
@@ -320,6 +321,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
     );
     let conflict = tokio::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
         .env_clear()
+        .envs(super::common::profile_env())
         .env("XDG_CONFIG_HOME", &config_root)
         .current_dir(&no_git)
         .args([
