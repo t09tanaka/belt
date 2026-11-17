@@ -97,7 +97,7 @@ impl Fx {
         let connected = connect(io, super::proto_common::client_cfg(&self.cluster))
             .await
             .unwrap();
-        let answer = (
+        let identity = (
             connected.worker.worker_id.to_string(),
             connected.worker.worker_boot_id.to_string(),
         );
@@ -134,7 +134,7 @@ impl Fx {
         drop(connected);
         let _ = bridge.start_kill();
         let _ = bridge.wait().await;
-        answer
+        identity
     }
     async fn stop(&self, mut child: tokio::process::Child, pid: u32, start: String) {
         assert_eq!(
