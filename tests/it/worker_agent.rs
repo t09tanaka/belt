@@ -266,10 +266,18 @@ pub(crate) struct Fx {
     dir: TempDir,
     host: Arc<DirHost>,
     pub(crate) cluster: ClusterId,
+    /// The id its agents say they are.
+    worker: WorkerId,
     agents: Mutex<Vec<Arc<Agent>>>,
 }
 
 pub(crate) fn fx() -> Fx {
+    fx_named("w-test")
+}
+
+/// [`fx`] for a worker with another id: several of them, each with its own
+/// state directory, are the workers of one machine in `one_host`.
+pub(crate) fn fx_named(worker: &str) -> Fx {
     // Not under the system temp directory: a supervisor a failed test leaves
     // behind must not write into a directory a test runner clears.
     let dir = tempfile::Builder::new()
@@ -302,6 +310,7 @@ pub(crate) fn fx() -> Fx {
         dir,
         host,
         cluster: ClusterId::generate(),
+        worker: WorkerId::parse(worker).unwrap(),
         agents: Mutex::default(),
     }
 }
@@ -380,13 +389,13 @@ impl Fx {
     fn state(&self) -> PathBuf {
         self.dir.path().join("state")
     }
-    fn path(&self, name: &str) -> PathBuf {
+    pub(crate) fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
     fn cfg(&self, boot: &str) -> AgentConfig {
         let mut cfg = AgentConfig::new(
             self.state(),
-            WorkerId::parse("w-test").unwrap(),
+            self.worker.clone(),
             WorkerBootId::parse(boot).unwrap(),
             PathBuf::from(env!("CARGO_BIN_EXE_remote-task-runner")),
         );
@@ -433,7 +442,7 @@ impl Fx {
         cfg.features.push(CI_TASK_FEATURE.to_string());
         connect(a, cfg).await.unwrap().client
     }
-    fn store(&self) -> WorkerStore {
+    pub(crate) fn store(&self) -> WorkerStore {
         WorkerStore::open_read_only(&self.state()).unwrap()
     }
     fn rec(&self, a: &AttemptId) -> AcceptedAttempt {
@@ -460,7 +469,7 @@ impl Fx {
         }
         self.rec(a).termination.unwrap().outcome()
     }
-    fn supervisors(&self, a: &AttemptId) -> Vec<i32> {
+    pub(crate) fn supervisors(&self, a: &AttemptId) -> Vec<i32> {
         pgrep(&supervisor_pattern(a))
     }
     /// The supervisors whose spec is under `dir`.
@@ -470,7 +479,7 @@ impl Fx {
     /// SIGKILL the attempt's supervisors: each only while it still is the
     /// process the search found (its identity and command line are read
     /// again right before the signal).
-    fn kill_supervisors(&self, a: &AttemptId) {
+    pub(crate) fn kill_supervisors(&self, a: &AttemptId) {
         let pattern = supervisor_pattern(a);
         for pid in pgrep(&pattern) {
             crate::common::kill_if_command(pid, &pattern);
