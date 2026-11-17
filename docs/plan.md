@@ -1068,3 +1068,20 @@ S22 の残り（必須。この変更で S22 は完了しない）:
 2. drain の確認と受理の間に、非常に短い競合が残る（受理が drain の確認を通った直後に stop が 0 件を 2 回数える）。実機での stop と受理の同時試験は S26 で行う。
 3. `system-user`（LaunchDaemon の `UserName`）の導入、Linux、upgrade・rollback・doctor・`workers forget`、fish / csh のログインシェル対応は未実装（S23・S24）。
 4. 実 SQLite の live attempt を持つ worker に対する stop の待ち・cancel の end-to-end（agent の cancel は統合試験済みだが、helper の待ちは注入した計数での単体試験）。
+
+### S9a/S10 追補: worker と task-traffic-controller CLI の scope 統一（2026-11-17）
+
+worker は自分専用の scope（`<state>/traffic`）を使っていて、同じ host の CLI（`$XDG_STATE_HOME/task-traffic-controller`、無ければ `~/.local/state/task-traffic-controller`）と別の ledger・budget になっていた（仕様 §14 の「同じ ledger・lock・lease」「nested にも同じ scope」と §18 の「既存の scope を検出して同じ budget を使う」に反する）。CPU を二重に使い、step の中の `task-traffic-controller exec` は自分の run を見つけられず別 job として gate されていた。
+
+- scope の規則は `src/config/traffic.rs` の 1 か所に置いた。task-traffic-controller の library に公開関数は無い（規則は CLI の binary 側にあり、library は `HOME` / XDG を見ない）。`XDG_STATE_HOME`（空は未設定扱い）、無ければ `HOME/.local/state`。config も CLI と同じ `XDG_CONFIG_HOME` / `HOME/.config` の `task-traffic-controller/config.toml` にした（policy を worker だけ別にしない）。CLI より厳しい点が 2 つある。相対パスは拒否する（CLI は自分の cwd で解決するので、worker と step で一致させられない）。`HOME` も無ければ拒否する（CLI は `/` に落ちる）。
+- 適用は `ResolvedConfig::worker_runtime` の 1 か所で、worker 前景 role と resident の local worker の両方が通る。agent・forecast・supervisor・setup builder は同じ値を受け取る。`AgentConfig::new` / `SetupConfig::new` の既定（`<state>/traffic`）は変えていない（直接組み立てる試験が利用者の scope を触らないため）。
+- step の環境: CLI に state directory を直接渡す変数は無く、`HOME` と `XDG_STATE_HOME` だけで決まる。`XDG_STATE_HOME` を profile の保護対象にした。worker が持っていれば明示 profile の allowlist に無くても step へ渡し、step・profile の定数からは設定も変更もできない（worker が持たなければ step も持てない）。`XDG_STATE_HOME` を自分で設定する workflow は配置時に拒否される。
+- 移行: 起動時に旧 `<state>/traffic` を見る。無ければそのまま。ledger が読めない、または reaper が保持する entry（lease 保持中、または process が残りうる managed command）があれば、理由と id を出して起動を拒む。drain して終わってから起動し直す。旧 directory は消さず動かさない（旧 scope で受理した attempt の保存済み spec がその path を持つ）。履歴は取り込まず cold start とする（§18 が許容）。
+- 試験は一時 directory だけを `HOME` / `XDG_STATE_HOME` にする。規則と拒否は `src/config/traffic.rs` の単体試験、profile の保護は `src/toolchain/profile.rs`、worker_runtime の値と旧 scope の拒否は `tests/it/runtime.rs`。nested は `tests/it/supervisor.rs` で、worker_runtime が決めた scope と step 環境で supervisor に test binary 自身を step として実行させ、その中で CLI の規則（試験側に独立に書いたもの）と CLI と同じ `exec::nested_run_id` を使い、同じ ledger に worker の entry が見えて run を継承することを確かめる。旧 scope では見つからないことも対照として確かめる。CI に CLI binary を要求しない。
+- 手元で 1 回だけ、導入済みの CLI 0.10.0 を step から呼んで確かめた（一時 `HOME`、CI には入れていない）: nested の `exec` は worker の entry を `parent` とする子として同じ ledger に登録された。
+
+残り（この変更では直していない）:
+1. RTR の library は 0.8.2、CLI は 0.9 以降で nested を子 entry として登録し、その間 ledger を v3 形（`entries_v3` のみ）で書く。0.8.2 の `Ledger::load` は v3 形を読めない（確認済み）。scope を共有したので、CLI 0.9 以降の nested exec が動いている間、worker の admit・renew・forecast の ledger 読み取りが失敗しうる。RTR の依存を CLI と同じ系列へ上げる変更を別に行う（挙動が変わるので検証を分ける）。それまで CLI 0.9 以降の host では worker と nested exec の同時利用を避ける。
+2. service 環境の allowlist（worker・worker-service・init）に `XDG_STATE_HOME` が無いので、常駐 worker は常に `HOME` の規則になる。利用者の shell だけが `XDG_STATE_HOME` を設定していると scope が割れる。allowlist へ足すか doctor で検出する（S23 の state path・policy digest 検査）。
+3. `XDG_CONFIG_HOME` は step へ強制していない。明示 profile が許可しない場合、worker が `XDG_CONFIG_HOME` で決めた config と nested CLI の config（`~/.config`）が異なりうる。
+4. scope を決める公開関数を task-traffic-controller の library に置き、RTR が追従する（規則の二重持ちを無くす。ツール側と利用側は別 PR）。
