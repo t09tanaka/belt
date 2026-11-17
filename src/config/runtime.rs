@@ -146,12 +146,25 @@ impl ResolvedConfig {
         inputs: WorkerInputs,
     ) -> Result<WorkerRuntime, super::ConfigError> {
         let settings = self.runtime_settings()?;
+        // The scope of the task-traffic-controller CLI in this environment,
+        // never one of the worker's own: one ledger and one budget per user.
+        let traffic = super::traffic::resolve(&inputs.env)
+            .and_then(|scope| {
+                super::traffic::refuse_live_legacy(
+                    &inputs.state_dir.join(super::traffic::LEGACY_DIR),
+                    &scope.state_dir,
+                )?;
+                Ok(scope)
+            })
+            .map_err(|e| super::ConfigError::Invalid { problems: vec![e] })?;
         let mut agent = AgentConfig::new(
             inputs.state_dir.clone(),
             inputs.worker_id.clone(),
             inputs.boot_id,
             inputs.supervisor_exe.clone(),
         );
+        agent.traffic_state_dir = traffic.state_dir;
+        agent.traffic_config = Some(traffic.config_file);
         agent.max_active_task = settings.coordinator.limits.max_active_task;
         agent.prefetch_per_worker = settings.coordinator.limits.prefetch_per_worker;
         agent.forecast_ttl_ms = settings.scheduler.rules.forecast_ttl_ms;

@@ -77,8 +77,11 @@ const INSTALL_GUARDS: &[(&str, &str)] = &[
     ("RUSTUP_AUTO_INSTALL", "0"),
     ("MISE_AUTO_INSTALL", "false"),
 ];
+// `XDG_STATE_HOME` decides (with `HOME`) which task-traffic-controller ledger
+// a nested CLI uses: a command keeps the worker's value, set or unset.
 fn protected_env(key: &str) -> bool {
     matches!(key, "PATH" | "SHELL" | "HOME" | "TMPDIR")
+        || key == crate::config::traffic::STATE_HOME_ENV
         || INSTALL_GUARDS.iter().any(|(name, _)| *name == key)
 }
 
@@ -196,7 +199,9 @@ impl Profile {
             let mut env: BTreeMap<_, _> = retained
                 .iter()
                 .filter(|(k, _)| {
-                    definition.allowed_env.contains(*k) || matches!(k.as_str(), "HOME" | "TMPDIR")
+                    definition.allowed_env.contains(*k)
+                        || matches!(k.as_str(), "HOME" | "TMPDIR")
+                        || k.as_str() == crate::config::traffic::STATE_HOME_ENV
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
@@ -1429,6 +1434,53 @@ mod tests {
             ToolObservation::Available { .. }
         ));
         assert!(at.elapsed() < Duration::from_secs(2));
+    }
+    /// A nested task-traffic-controller finds its ledger through `HOME` and
+    /// `XDG_STATE_HOME`: a command gets the worker's values and cannot
+    /// replace them, with or without an explicit profile.
+    #[test]
+    fn a_command_keeps_the_state_home_of_the_worker() {
+        let set = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let mut with_state = env(dir.path());
+        with_state.insert("XDG_STATE_HOME".into(), "/state".into());
+        // The default profile: the worker has none, so a command has none.
+        let unset = Profile::load(dir.path(), &env(dir.path())).unwrap();
+        assert!(!unset.environment().contains_key("XDG_STATE_HOME"));
+        assert!(unset
+            .execution_environment(&set(&[("XDG_STATE_HOME", "/other")]))
+            .is_err());
+        // The worker has one: passed on, and only as it is.
+        let given = Profile::load(dir.path(), &with_state).unwrap();
+        assert_eq!(given.environment()["XDG_STATE_HOME"], "/state");
+        assert!(given
+            .execution_environment(&set(&[("XDG_STATE_HOME", "/other")]))
+            .is_err());
+        assert_eq!(
+            given
+                .execution_environment(&set(&[("XDG_STATE_HOME", "/state")]))
+                .unwrap()["XDG_STATE_HOME"],
+            "/state"
+        );
+        // An explicit profile that does not list it still passes it on, and
+        // one that lists it cannot give it a value of its own.
+        write_profile(dir.path(), "node22", "allowed_env = [\"OTHER\"]");
+        let explicit = Profile::load(dir.path(), &with_state).unwrap();
+        assert_eq!(explicit.environment()["XDG_STATE_HOME"], "/state");
+        assert!(explicit
+            .execution_environment(&set(&[("XDG_STATE_HOME", "/other")]))
+            .is_err());
+        write_profile(
+            dir.path(),
+            "node22",
+            "allowed_env = [\"XDG_STATE_HOME\"]\n[profiles.node22.env]\nXDG_STATE_HOME = \"/mine\"",
+        );
+        assert!(Profile::load(dir.path(), &with_state).is_err());
     }
     #[test]
     fn private_input_rejects_symlinks_permissions_secrets_and_required_missing() {

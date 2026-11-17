@@ -15,17 +15,30 @@ use std::path::Path;
 /// Inner fixture commands already run inside the harness's shared TTC lease.
 /// Keep their private admission ledger, without depending on unrelated host load.
 pub fn fixture_traffic_config(state: &Path) {
-    let traffic = state.join("traffic");
-    std::fs::create_dir_all(&traffic).unwrap();
-    std::fs::set_permissions(&traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture_traffic_config_file(&state.join("traffic/config.toml"));
+}
+
+/// The same for a worker started from `env`, which reads the configuration
+/// of the task-traffic-controller CLI of that environment.
+pub fn fixture_worker_traffic_config(env: &std::collections::BTreeMap<String, String>) {
+    fixture_traffic_config_file(
+        &remote_task_runner::config::traffic::resolve(env)
+            .unwrap()
+            .config_file,
+    );
+}
+
+fn fixture_traffic_config_file(path: &Path) {
+    let traffic = path.parent().unwrap();
+    std::fs::create_dir_all(traffic).unwrap();
+    std::fs::set_permissions(traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = task_traffic_controller::config::Config {
         budget: 2,
         cpu_threshold_percent: 100.0,
         memory_reserve_mib: 0,
         ..Default::default()
     };
-    let path = traffic.join("config.toml");
-    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 

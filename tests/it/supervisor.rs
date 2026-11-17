@@ -329,6 +329,159 @@ fn a_successful_node_is_recorded_with_its_process_identity() {
     assert!(a.receipts.reached(Receipt::Terminal));
 }
 
+/// Where the `task-traffic-controller` CLI looks, from this process's own
+/// environment. The CLI's rule written out a second time on purpose: it is
+/// what the worker's rule is checked against.
+fn cli_paths() -> task_traffic_controller::Paths {
+    let home = |var: &str, under: &str| {
+        std::env::var_os(var)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(under))
+    };
+    task_traffic_controller::Paths::new(
+        home("XDG_STATE_HOME", ".local/state").join("task-traffic-controller"),
+        home("XDG_CONFIG_HOME", ".config").join("task-traffic-controller/config.toml"),
+    )
+}
+
+/// What a `task-traffic-controller exec` started by a command would decide,
+/// run as that command: does it find the run it is nested in?
+#[test]
+#[ignore = "helper process of the nested scope tests"]
+fn nested_cli_probe() {
+    let Some(out) = std::env::var_os("RTR_NESTED_PROBE_OUT") else {
+        return;
+    };
+    let ctx = task_traffic_controller::Context::new(cli_paths());
+    let var = |name: &str| std::env::var(name).ok();
+    let nested = task_traffic_controller::exec::nested_run_id(
+        &ctx,
+        var("TASK_TRAFFIC_CONTROLLER_LEASE").as_deref(),
+        var(task_traffic_controller::marker::ENV_VAR).as_deref(),
+        var(task_traffic_controller::marker::SCOPE_VAR).as_deref(),
+    )
+    .unwrap();
+    let entries: Vec<String> =
+        task_traffic_controller::ledger::Ledger::load(&ctx.paths.ledger_file())
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+    let report = serde_json::json!({
+        "state_dir": ctx.paths.state_dir(),
+        "config_file": ctx.paths.config_file(),
+        "nested": nested,
+        "entries": entries,
+    });
+    std::fs::write(out, report.to_string()).unwrap();
+}
+
+/// Run the probe as the one command of an attempt whose scope and command
+/// environment are what a worker started with `env` uses.
+fn probe_nested(
+    env: BTreeMap<String, String>,
+    scope: impl Fn(&Path, PathBuf) -> PathBuf,
+) -> (Fx, serde_json::Value) {
+    use remote_task_runner::config::{self, runtime::WorkerInputs};
+    let f = fx(vec![]);
+    let runtime = config::resolve(&config::Inputs {
+        overlay: &Default::default(),
+        project: None,
+        legacy: None,
+        user: None,
+    })
+    .unwrap()
+    .worker_runtime(WorkerInputs {
+        state_dir: f.spec.state_dir.clone(),
+        worker_id: f.spec.worker_id.clone(),
+        boot_id: WorkerBootId::parse("boot-1").unwrap(),
+        supervisor_exe: env!("CARGO_BIN_EXE_remote-task-runner").into(),
+        cluster_key_path: f.path("cluster.key"),
+        env,
+    })
+    .unwrap();
+    let agent = runtime.agent_config();
+    let out = f.path("probe.json");
+    let extra = BTreeMap::from([("RTR_NESTED_PROBE_OUT".into(), out.display().to_string())]);
+    let mut spec = f.spec.clone();
+    spec.traffic_state_dir = scope(&spec.state_dir, agent.traffic_state_dir.clone());
+    spec.traffic_config = agent.traffic_config.clone();
+    spec.nodes = vec![NodeSpec {
+        node_id: NodeId::parse("probe").unwrap(),
+        argv: vec![
+            std::env::current_exe().unwrap().display().to_string(),
+            "--exact".into(),
+            "supervisor::nested_cli_probe".into(),
+            "--ignored".into(),
+        ],
+        cwd: f.dir.path().to_path_buf(),
+        env: agent
+            .capability_profile
+            .as_ref()
+            .unwrap()
+            .execution_environment(&extra)
+            .unwrap(),
+        weight: Some(1),
+        timeout_ms: None,
+    }];
+    let t = settled(&run(&spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded, "{}", f.output());
+    let report = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    (f, report)
+}
+
+fn worker_env(f_home: &Path) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("HOME".into(), f_home.display().to_string()),
+    ])
+}
+
+#[test]
+fn a_nested_cli_shares_the_ledger_of_the_worker_and_inherits_the_run() {
+    // HOME alone, and an XDG_STATE_HOME that moves the scope away from it.
+    for state_home in [false, true] {
+        let home = crate::test_tmp::tempdir().unwrap();
+        let mut env = worker_env(home.path());
+        let base = if state_home {
+            let dir = home.path().join("xdg-state");
+            env.insert("XDG_STATE_HOME".into(), dir.display().to_string());
+            dir
+        } else {
+            home.path().join(".local/state")
+        };
+        let (f, report) = probe_nested(env, |_, scope| scope);
+        let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), 0);
+        // The CLI resolves the directory the worker admitted the command in,
+        assert_eq!(
+            report["state_dir"],
+            serde_json::json!(base.join("task-traffic-controller")),
+        );
+        assert_eq!(
+            report["config_file"],
+            serde_json::json!(home
+                .path()
+                .join(".config/task-traffic-controller/config.toml")),
+        );
+        // sees the worker's entry in its ledger,
+        assert_eq!(report["entries"], serde_json::json!([id]));
+        // and runs under it instead of queueing as a job of its own.
+        assert_eq!(report["nested"], serde_json::json!(id));
+    }
+}
+
+/// The same probe against the scope a worker used to keep for itself
+/// (`<state>/traffic`): the CLI looks elsewhere and would be gated again.
+#[test]
+fn a_nested_cli_does_not_find_a_run_admitted_in_a_private_scope() {
+    let home = crate::test_tmp::tempdir().unwrap();
+    let (_f, report) = probe_nested(worker_env(home.path()), |state, _| state.join("traffic"));
+    assert_eq!(report["entries"], serde_json::json!([]));
+    assert_eq!(report["nested"], serde_json::Value::Null);
+}
+
 #[test]
 fn a_failing_node_stops_the_attempt_and_later_nodes_never_start() {
     let f = fx(vec![
