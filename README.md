@@ -52,8 +52,9 @@ and reconnects without creating a replacement attempt. The remote executable is
 SSH connection failures stay isolated from local work and other peers.
 
 Registration changes require a parent restart. Automatic enrollment, worker
-add/install, ephemeral workers, native worker services and upgrade/rollback remain
-required follow-up work. Cluster keys and worker inputs are provisioned privately
+add/install and a Linux parent remain required follow-up work. The Linux systemd
+user service backend and `worker --ephemeral` exist on the worker side; see
+`docs/linux-and-ephemeral-workers.md`. Cluster keys and worker inputs are provisioned privately
 out of band; a hello never enrolls an unknown identity.
 
 

@@ -42,6 +42,9 @@ fn failing(at: Step) -> impl FnMut(Step) -> anyhow::Result<()> {
 impl Host {
     /// A host with the old version installed, started and bound.
     fn new() -> Self {
+        Self::on(policy::Backend::Launchd)
+    }
+    fn on(backend: policy::Backend) -> Self {
         let dir = crate::test_tmp::tempdir().unwrap();
         let root = dir.path().to_owned();
         let home = root.join("h");
@@ -55,6 +58,7 @@ impl Host {
         ]);
         let fake = Fake::default();
         fake.0.borrow_mut().state = home.join(".remote-task-runner");
+        fake.0.borrow_mut().backend = backend;
         let cluster = ClusterId::generate();
         let old = sha256_file(&old_exe).unwrap();
         let request = InstallRequest {
@@ -72,7 +76,7 @@ impl Host {
             OPTIONS.ready_timeout,
         )
         .unwrap();
-        let paths = Paths::resolve(&env).unwrap();
+        let paths = Paths::resolve_for(&env, backend).unwrap();
         let binding = paths.state.join("worker-binding.json");
         fs::write(
             &binding,
@@ -93,7 +97,7 @@ impl Host {
         }
     }
     fn paths(&self) -> Paths {
-        Paths::resolve(&self.env).unwrap()
+        Paths::resolve_for(&self.env, self.fake.backend()).unwrap()
     }
     fn request(&self, digest: &str) -> SwitchRequest {
         SwitchRequest {
@@ -1078,4 +1082,34 @@ fn a_stop_and_start_before_the_commit_do_not_end_the_drain() {
     // With nothing of an upgrade left, a stop ends its own drain as before.
     h.commit(&h.old).unwrap();
     assert!(!restart(&h, false).draining);
+}
+
+/// The same switch on a systemd host: drain, stop the old unit, replace the
+/// unit file, start the new one, in the order the shared sequence fixes.
+#[test]
+fn a_systemd_upgrade_stops_the_old_unit_then_starts_the_new_one() {
+    let h = Host::on(policy::Backend::Systemd);
+    let status = h.upgrade(&mut |_| Ok(())).unwrap();
+    assert_eq!(status.binary_sha256, h.new);
+    h.assert_serving(&h.new);
+    let calls = h.fake.0.borrow().calls.clone();
+    let verbs: Vec<_> = calls.iter().map(|c| c[1].as_str()).collect();
+    assert_eq!(verbs, ["start", "stop", "start"]);
+    // The unit is replaced between the stop and the second start.
+    let paths = h.paths();
+    let unit = fs::read_to_string(
+        fs::read_dir(&paths.services)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path(),
+    )
+    .unwrap();
+    assert!(unit.contains(&paths.executable(&h.new).display().to_string()));
+    assert!(!unit.contains(&paths.executable(&h.old).display().to_string()));
+    assert_eq!(fs::read_dir(&paths.services).unwrap().count(), 1);
+    assert!(status.draining);
+    let committed = h.commit(&h.new).unwrap();
+    assert!(!committed.draining && committed.switching_from.is_none());
 }

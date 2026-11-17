@@ -13,16 +13,30 @@ pub(crate) struct World {
     pub calls: Vec<Vec<String>>,
     /// The operator marker as the service was started (before the agent runs).
     pub control_at_bootstrap: Vec<Control>,
+    pub backend: policy::Backend,
     pub state: PathBuf,
     listener: Option<UnixListener>,
 }
 #[derive(Clone, Default)]
 pub(crate) struct Fake(pub Rc<RefCell<World>>);
 impl Launcher for Fake {
+    fn backend(&self) -> policy::Backend {
+        self.0.borrow().backend
+    }
     fn launchctl(&mut self, arguments: &[String]) -> Result<(), LaunchError> {
         let mut w = self.0.borrow_mut();
         w.calls.push(arguments.to_vec());
-        match arguments[0].as_str() {
+        // `systemctl` words are `<scope> <verb> <unit>`: start and stop do
+        // what bootstrap and bootout do to the fake world.
+        let verb = match (w.backend, arguments[0].as_str()) {
+            (policy::Backend::Systemd, _) => match arguments[1].as_str() {
+                "start" => "bootstrap",
+                "stop" => "bootout",
+                _ => "unexpected",
+            },
+            (_, verb) => verb,
+        };
+        match verb {
             "bootstrap" => {
                 if w.fail_start {
                     return Err(LaunchError::NotApplied("rejected".into()));
@@ -74,6 +88,9 @@ struct Host {
 }
 impl Host {
     fn new() -> Self {
+        Self::on(policy::Backend::Launchd)
+    }
+    fn on(backend: policy::Backend) -> Self {
         let dir = crate::test_tmp::tempdir().unwrap();
         let root = dir.path().to_owned();
         let home = root.join("h");
@@ -87,6 +104,7 @@ impl Host {
         ]);
         let fake = Fake::default();
         fake.0.borrow_mut().state = home.join(".remote-task-runner");
+        fake.0.borrow_mut().backend = backend;
         Host {
             request: InstallRequest {
                 schema: 1,
@@ -104,7 +122,7 @@ impl Host {
         }
     }
     fn paths(&self) -> Paths {
-        Paths::resolve(&self.env).unwrap()
+        Paths::resolve_for(&self.env, self.fake.backend()).unwrap()
     }
     fn install(&self) -> anyhow::Result<Status> {
         install(
@@ -779,4 +797,101 @@ fn status_says_when_the_worker_waits_for_its_previous_scope() {
     h.bind();
     let stopped = stop(&h.env, h.fake.clone(), false, Duration::ZERO).unwrap();
     assert_eq!(stopped.traffic_hold, None);
+}
+
+/// The Linux backend: the same helper, a systemd user unit and `systemctl`
+/// words. The fake world answers them as it answers launchctl.
+mod systemd {
+    use super::*;
+
+    #[test]
+    fn the_host_launcher_is_the_hosts_own_manager() {
+        assert_eq!(
+            HostLauncher::native().backend(),
+            if cfg!(target_os = "linux") {
+                policy::Backend::Systemd
+            } else {
+                policy::Backend::Launchd
+            }
+        );
+    }
+
+    const UNIT_START: usize = 0;
+
+    fn unit_calls(h: &Host) -> Vec<Vec<String>> {
+        h.fake.0.borrow().calls.clone()
+    }
+
+    #[test]
+    fn install_writes_a_user_unit_and_starts_it() {
+        let h = Host::on(policy::Backend::Systemd);
+        let status = h.install().unwrap();
+        assert_eq!(status.loaded, Some(true));
+        assert!(status.ready && !status.draining);
+        let paths = h.paths();
+        assert_eq!(
+            paths.services,
+            PathBuf::from(&h.env["HOME"]).join(".config/systemd/user")
+        );
+        let units: Vec<_> = fs::read_dir(&paths.services)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .collect();
+        assert_eq!(units.len(), 1);
+        let name = units[0].file_name().unwrap().to_str().unwrap().to_owned();
+        assert!(name.starts_with("io.github.t09tanaka.rtr.worker.") && name.ends_with(".service"));
+        let unit = fs::read_to_string(&units[0]).unwrap();
+        assert!(unit.contains(&format!(
+            "ExecStart=\"{}\" \"worker\" \"--input\" \"{}\"\n",
+            paths.executable(&h.digest).display(),
+            paths.input.display()
+        )));
+        assert!(!unit.contains("daemon") && !unit.contains(&"ab".repeat(64)));
+        assert_eq!(
+            unit_calls(&h)[UNIT_START],
+            ["--user", "start", name.as_str()]
+        );
+        assert_eq!(unit_calls(&h).len(), 1);
+        // Installing again changes nothing.
+        assert_eq!(h.install().unwrap(), status);
+        assert_eq!(unit_calls(&h).len(), 1);
+    }
+
+    #[test]
+    fn stop_then_start_use_the_unit_name_and_the_same_state_rules() {
+        let h = Host::on(policy::Backend::Systemd);
+        h.install().unwrap();
+        h.bind();
+        let status = stop(&h.env, h.fake.clone(), false, Duration::ZERO).unwrap();
+        assert_eq!(status.loaded, Some(false));
+        control::write(&h.paths().state, Control::cancelling()).unwrap();
+        let status = start(&h.env, h.fake.clone(), Duration::from_secs(2)).unwrap();
+        assert_eq!(status.loaded, Some(true));
+        assert!(status.ready && status.draining && !status.cancel_running);
+        let verbs: Vec<_> = unit_calls(&h).iter().map(|c| c[1].clone()).collect();
+        assert_eq!(verbs, ["start", "stop", "start"]);
+        assert!(unit_calls(&h).iter().all(|c| c[0] == "--user"));
+    }
+
+    #[test]
+    fn the_unit_directory_follows_xdg_config_home() {
+        let h = Host::on(policy::Backend::Systemd);
+        let env = with(
+            &h.env,
+            "XDG_CONFIG_HOME",
+            h.root.join("xdg").to_str().unwrap(),
+        );
+        assert_eq!(
+            Paths::resolve_for(&env, policy::Backend::Systemd)
+                .unwrap()
+                .services,
+            h.root.join("xdg/systemd/user")
+        );
+        assert_eq!(
+            Paths::resolve_for(&env, policy::Backend::Launchd)
+                .unwrap()
+                .services,
+            PathBuf::from(&h.env["HOME"]).join("Library/LaunchAgents")
+        );
+    }
 }

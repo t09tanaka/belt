@@ -184,7 +184,7 @@ Standalone worker foreground slice: `worker --input` reads an owner-only retaine
 WorkerSpec (schema 1, enrolled cluster/worker IDs, pinned executable, private key,
 allowlisted environment and captured user TOML). Its state must be the canonical
 HOME worker state so `worker --stdio` reaches the same agent socket. This is a
-persistent role; `--ephemeral` remains a separate required S24 implementation.
+persistent role; the worker side of `--ephemeral` is a separate role (see "S24 Linux の systemd user service と ephemeral worker").
 The runtime owns its agent lock, independent tick/supervision and staged socket
 publication with durable inode receipt. Bridge disconnection never shuts it down.
 Only a dead socket matching the private receipt is reclaimed after a crash;
@@ -1422,3 +1422,21 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - `services:` を持つ task の実行。今は受理で断る。supervisor が失われたとき、core が起動した container と compose project を recover で止める実装（core の `CancelHandle` が持つ名前を attempt に記録し、recover で止める）を入れてから、拒否を外す。
 - 親の側の回収: `ci_task` を持つ payload では、結果の artifact `rtr-ci-task-result.json` を必須（required）として扱う（`results/collect.rs` の `declared_of` は今 `payload.artifacts` だけを見る。worker は `ArtifactDecl` でこの名前を宣言できない）。宣言が 1024 件のとき、結果を足すと 1025 件になる点も合わせて決める。偽の worker がこの artifact だけを返すテストを付ける。
 - 親の側: `ci` の実行（`src/cli.rs` と `tests/it/not_implemented.rs` の 2 行）、`TaskSpec` への `ci_task` の追加と `build_payload`、`ci_task_v1` の無い worker の除外と placement への理由の記録、Driver と同じ形の trait の後ろに置く run の進行（needs の DAG、上流の成功後だけ下流を配置、失敗時の skipped、cancel）、needs output を下流の `inputs` へ入れること（複数の上流の合計が上限を超える場合の扱いを含む）、`plan_task_demand` から `WorkloadPlan` を作って配置時の forecast に渡すこと（A10 の S16 分）、A38 のうち結果と output の分のテスト。
+
+### S24 Linux の systemd user service と ephemeral worker（2026-11-17、worker 側の 1 本目）
+
+作ったもの。
+- `src/service/systemd/`: Linux の service backend。`policy.rs`（純粋: unit の描画、`systemctl` の引数列をデータで返す `steps`、`systemctl show` の厳密な読み取り、`systemctl --user` に渡す環境）と `SystemdLauncher`（command runner を差し込める。実 `systemctl` は `SystemctlRunner` だけ）。`policy.rs` は `scripts/pure-modules.txt` に載せた（mutation・100% 行 coverage の対象）。
+- 既存の worker-host helper（`worker_service`、upgrade・rollback・commit を含む）は分けずに、`Launcher::backend()`（既定は launchd）と `Paths::resolve_for(env, backend)` で manager を選ぶ。managed file の置き場は launchd が `~/Library/LaunchAgents`、systemd が `$XDG_CONFIG_HOME/systemd/user`。journal・receipt の形、version 別 directory、upgrade の順序は変えていない。`HostLauncher::native()` が OS（`cfg!(target_os = "linux")`。両方の枝が全 OS で型検査される）で manager を選び、`worker-service` と doctor の host 側が使う。
+- 起動は `daemon-reload`、`enable`、`start` の順、停止は worker の ack の後の `stop` だけ（unit は enable のまま。launchd の bootout 後に次回 login で読み直されるのと同じ）。`daemon-reload` と `enable` の失敗は NotApplied、最後の `start`・`stop` の失敗と runner の無応答は OutcomeUnknown。`show` の読み取りは `LoadState`・`ActiveState`・`FragmentPath`・`MainPID`・`NeedDaemonReload` だけを受け、他は Unknown にする。
+- `worker --ephemeral --cluster <id> --name <worker> --key-file <abs path>`（`src/service/worker/ephemeral.rs`、純粋な判断は `ephemeral/plan.rs`）。service を登録せず、前景で動く。正準の worker state（`$HOME/.remote-task-runner`、`worker --stdio` の橋が探す場所）が既にあるか、常駐 worker の journal があるときは、何も作らずに拒否する（常駐にならない）。起動ごとに新しい identity: worker 名は親が登録した名前のまま、報告する boot identity が `<OS の boot id>.<起動ごとの ULID>` になる。終了（SIGTERM・interrupt）時は自分が作った state directory（dev・ino を確かめる）を、worker DB に live な attempt が無いときだけ消す。使い方は `docs/linux-and-ephemeral-workers.md`。
+
+試験。systemd 用の偽 Launcher で install・start・stop・start と upgrade の順序（`start`、`stop`、`start`）、unit の描画、`XDG_CONFIG_HOME` の置き場を macOS 上でも確かめる。実バイナリの統合試験（`tests/it/worker_ephemeral.rs`）で、ephemeral が何も導入せず、起動ごとに identity が違い、停止後に state が消え、既存 state と常駐 journal を拒否し、引数が足りなければ exit 2 になることを確かめる。`tests/it/not_implemented.rs` から `worker --ephemeral` を外した（`workers forget` は未実装のまま）。
+
+S24 の残り（必須。この変更で S24 は完了しない）:
+1. 実 systemd・実 Linux 機での受入（A45）は未実施。`systemctl` は偽の runner だけで試験した。実 `systemctl --user` の出力（`show` の書式、`enable` の副作用、linger）は Linux の実機で確かめる必要がある。
+2. system-user mode（`service_mode = "system-user"`、systemd の system service を非 root の `User=`）は unit の描画だけを純粋関数として持つ。登録先（`/etc/systemd/system`）と管理権限の扱いは未実装で、worker-host helper は user mode だけを配線している（macOS の LaunchDaemon と同じ未了）。
+3. 親側の Linux 対応は未着手: `workers add --install` と `workers upgrade` は親が macOS で、worker が同じ OS・arch のときだけ動く（親は自分の binary を送るため、Mac から Linux には送れない）。Linux の binary をどう用意するかは設計判断が要る。`init`（coordinator の常駐）も Linux では拒否のまま。
+4. ephemeral の親側: `ephemeral = true` の worker の接続（現状は `ephemeral remote enrollment is unsupported` で拒否）、到達不能の attempt を unknown のまま保持すること、`workers forget`（unknown を interrupted に確定し identity を退役、tombstone、遅れて戻った identity の submit・renew の拒否）は未実装。boot identity が起動ごとに変わるため、親が「別 boot」として interrupted にする既存の規則との関係は、この親側の作業で決める必要がある（A46）。トンネルの提供は仕様どおり範囲外。
+5. doctor の linger の確認（`loginctl show-user`）は未実装。
+6. ephemeral が消す state は worker DB の live attempt を見て判断する。attempt の supervisor が agent の終了後も生きている場合の扱い（残す）は試験していない。

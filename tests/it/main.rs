@@ -34,6 +34,7 @@ mod bootstrap;
 
 mod init;
 
+mod worker_ephemeral;
 mod worker_role;
 
 mod remote_links;

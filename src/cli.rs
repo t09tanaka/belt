@@ -278,10 +278,20 @@ pub struct WorkerArgs {
     /// Retained private input for a foreground persistent worker.
     #[arg(long, conflicts_with_all = ["stdio", "ephemeral"])]
     pub input: Option<std::path::PathBuf>,
-    /// Exit when the work is done.
-    #[arg(long)]
-    #[arg(conflicts_with = "stdio")]
+    /// A worker that exists only while this process runs: no service is
+    /// installed, it starts clean with a fresh identity and removes its state
+    /// on exit. Needs `--cluster`, `--name` and `--key-file`.
+    #[arg(long, conflicts_with = "stdio", requires_all = ["cluster", "name", "key_file"])]
     pub ephemeral: bool,
+    /// With `--ephemeral`: the cluster the worker belongs to.
+    #[arg(long, requires = "ephemeral")]
+    pub cluster: Option<String>,
+    /// With `--ephemeral`: the worker name the parent registered.
+    #[arg(long, requires = "ephemeral")]
+    pub name: Option<String>,
+    /// With `--ephemeral`: the cluster key file (absolute path, owner-only).
+    #[arg(long, requires = "ephemeral")]
+    pub key_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -379,6 +389,17 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::Worker(args) = &cli.command {
         if let Some(input) = &args.input {
             return crate::service::worker::main(input);
+        }
+        if let (true, Some(cluster), Some(name), Some(key_file)) =
+            (args.ephemeral, &args.cluster, &args.name, &args.key_file)
+        {
+            return crate::service::worker::ephemeral::main(
+                &crate::service::worker::ephemeral::Args {
+                    cluster: cluster.clone(),
+                    name: name.clone(),
+                    key_file: key_file.clone(),
+                },
+            );
         }
         if args.stdio && !args.ephemeral {
             return run_worker_stdio();
