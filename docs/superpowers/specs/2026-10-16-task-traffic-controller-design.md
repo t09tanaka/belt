@@ -193,12 +193,26 @@ machine looks able to take it *now*:
   records for the key (0 when unknown) and `memory_reserve` defaults to
   2 GiB.
 - `cpu_busy ≤ cpu_threshold_percent` (default 85%), where `cpu_busy` is
-  the global CPU usage between two samples 300 ms apart, taken on this
-  poll. The 1-minute load average was tried first and rejected: on macOS
+  the global CPU usage over a short interval that ends on this poll. Each
+  process keeps its last CPU sample, and what a poll does depends on how
+  old that sample is:
+  - none yet, or older than 5 s: two samples 300 ms apart (the poll waits
+    300 ms). An older sample is not used as the start of the interval,
+    because the average over a long stretch would dilute "now". A command
+    that asks once, like `status`, always takes this path.
+  - between the shortest interval the counters can be read over (200 ms)
+    and 5 s: one sample, no wait; the usage since the last sample.
+  - less than 200 ms: the figure of the last sample, no new sample.
+
+  Concurrent polls in one process share the sample: the ones that arrive
+  during the 300 ms wait block until it ends and then use its figure.
+  Memory and the load average are read on every poll. The 1-minute load
+  average was tried first and rejected as the CPU guard: on macOS
   it runs far above the number of cores even with a third of the CPU
   idle, so a per-core threshold would hold the queue almost always.
 
-Both are read from the OS on every poll (the `sysinfo` crate; on macOS
+Both come from the OS (the `sysinfo` crate; memory on every poll, CPU as
+described above; on macOS
 "available" = free + inactive pages). They are brakes, not the budget:
 the budget decides how much task-traffic-controller *plans* to run, the guards delay the
 next start when something outside task-traffic-controller (an IDE, a browser, a Docker

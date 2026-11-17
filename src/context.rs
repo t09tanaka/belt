@@ -89,7 +89,9 @@ pub trait LiveProvider: Send + Sync {
     fn snapshot(&self) -> Option<LiveSnapshot>;
 }
 
-/// This machine, via `sysinfo`. A sample takes a few hundred milliseconds.
+/// This machine, via `sysinfo`. The first sample in a process, or the first
+/// after a pause of more than a few seconds, takes a few hundred
+/// milliseconds; the ones between do not wait (see [`crate::live::snapshot`]).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SystemLive;
 
