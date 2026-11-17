@@ -309,3 +309,89 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
         .is_err());
     assert_eq!(c.scheduler().priority_of(&local), -9);
 }
+
+/// A worker attached the way a remote one is (`attach_worker`): `workers
+/// sync` is sent to a peer whose hello agreed on `env_sync_v1`, and never to
+/// one that did not offer it.
+#[tokio::test]
+async fn runtime_attach_carries_whether_the_worker_answers_env_sync() {
+    use remote_task_runner::error::ErrorCode;
+    use remote_task_runner::ids::RequestId;
+    use remote_task_runner::wire::{ToolRequirement, ENV_SYNC_FEATURE};
+    let root = crate::test_tmp::tempdir().unwrap();
+    let mut cfg = config();
+    for id in ["new", "old"] {
+        cfg.workers.push(WorkerSpec {
+            id: id.into(),
+            ssh: "host".into(),
+            binary: None,
+            service_mode: None,
+            labels: vec![],
+            ephemeral: true,
+            priority: cfg.local_worker_priority.clone(),
+        });
+    }
+    let settings = cfg.runtime_settings().unwrap();
+    let c = settings
+        .start_coordinator(
+            CoordinatorStore::open(root.path(), 1).unwrap(),
+            Arc::new(UnknownCosts),
+        )
+        .unwrap();
+    cfg.attach_worker(&c, WorkerTarget::Remote("new"), connected(&c, "new").await)
+        .await
+        .unwrap();
+    // An older worker: the same hello without the feature.
+    let (near, far) = duplex_pair(65536);
+    let cluster = c.store().cluster_id().clone();
+    let client = ClientConfig::new(
+        cluster.clone(),
+        c.store().coordinator_id().clone(),
+        c.epoch(),
+    );
+    let mut server = ServerConfig::new(cluster, super::proto_common::identity("old"));
+    server.local.features.retain(|f| f != ENV_SYNC_FEATURE);
+    let (connection, accepted) = tokio::join!(connect(near, client), accept(far, server));
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = seen.clone();
+    tokio::spawn(async move {
+        let mut incoming = accepted.unwrap().incoming;
+        while let Some(_request) = incoming.next().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    cfg.attach_worker(&c, WorkerTarget::Remote("old"), connection.unwrap())
+        .await
+        .unwrap();
+    let tools = || {
+        vec![ToolRequirement {
+            name: "node".into(),
+            version: "20.0.0".into(),
+        }]
+    };
+    let old = WorkerId::parse("old").unwrap();
+    let refused = c
+        .env_sync(&old, RequestId::generate(), tools())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::ProtocolIncompatible);
+    assert!(
+        refused.message.contains("workers upgrade old"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // The new one is sent the request (this fixture's worker answers
+    // nothing, so there is no outcome: not the refusal above).
+    let new = WorkerId::parse("new").unwrap();
+    let sent = c
+        .env_sync(&new, RequestId::generate(), tools())
+        .await
+        .unwrap_err();
+    assert_ne!(
+        sent.code,
+        ErrorCode::ProtocolIncompatible,
+        "{}",
+        sent.message
+    );
+}

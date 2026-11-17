@@ -43,6 +43,12 @@ struct Registered {
     host: HostTools,
     catalog: Digest,
 }
+/// What one recipe may install and what is installed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstalledInventory {
+    pub inventory: Vec<String>,
+    pub installed: Vec<String>,
+}
 /// A negative result is deliberately distinct from an installable request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Unavailable {
@@ -318,6 +324,73 @@ impl Registry {
             },
             plan,
         ))
+    }
+    /// The request for one operator-authorized exact version, as a warm-up
+    /// asks for it: no project, no parent evidence. Its install plan (and so
+    /// its singleflight key and private location) is the one an attempt that
+    /// pins the same version gets. Read-only.
+    pub fn inventory_request(
+        &self,
+        tool: &ToolId,
+        version: &Version,
+    ) -> Result<PreparationRequest, Unavailable> {
+        use super::versions::{Declaration, MatchPolicy, Scope};
+        let scope = Scope::project("");
+        let constraint = Constraint::parse(&version.to_string())
+            .map_err(|_| Unavailable::Invalid("inventory_version"))?;
+        let frozen = FrozenToolchains::freeze(
+            Digest::of_bytes(b"installed inventory"),
+            self.profile_definition.clone(),
+            scope.clone(),
+            &[Declaration {
+                tool: tool.clone(),
+                constraint,
+                scope,
+                location: super::versions::Location {
+                    path: "inventory".into(),
+                    first_line: 1,
+                    last_line: 1,
+                },
+            }],
+            &[],
+            &BTreeMap::new(),
+            MatchPolicy::Exact,
+        )
+        .map_err(|_| Unavailable::Invalid("inventory_contract"))?;
+        self.request(&frozen, tool, None)
+    }
+    /// For each configured recipe: the operator-authorized inventory and the
+    /// subset whose private install is present and receipt-valid right now.
+    /// Read-only (the same detect used at admission); a version that cannot be
+    /// proven installed counts as not installed, never as installed.
+    pub fn installed_inventory(&self) -> BTreeMap<String, InstalledInventory> {
+        let mut out = BTreeMap::new();
+        for (tool, entry) in &self.recipes {
+            let mut installed = Vec::new();
+            for version in &entry.recipe.inventory {
+                let present = self
+                    .inventory_request(tool, version)
+                    .ok()
+                    .and_then(|request| self.detect(&request).ok())
+                    .is_some_and(|a| matches!(a, Availability::Installed(_)));
+                if present {
+                    installed.push(version.to_string());
+                }
+            }
+            out.insert(
+                tool.as_str().to_string(),
+                InstalledInventory {
+                    inventory: entry
+                        .recipe
+                        .inventory
+                        .iter()
+                        .map(|v| v.to_string())
+                        .collect(),
+                    installed,
+                },
+            );
+        }
+        out
     }
     /// Detect only the indexed exact artifact using its validated adapter receipt.
     pub fn detect(&self, request: &PreparationRequest) -> Result<Availability, Unavailable> {

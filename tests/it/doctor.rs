@@ -237,3 +237,137 @@ fn a_check_that_was_not_made_is_not_healthy_and_exits_apart_from_a_failure() {
     assert_eq!(out.status.code(), Some(1));
     assert_ne!(ErrorCode::Blocked.exit_code(), 1);
 }
+
+/// The service environment a coordinator retains: what `workers diff` measures
+/// the parent in.
+fn retained_env(fx: &Fx) -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([
+        ("HOME".to_string(), fx.path("home").display().to_string()),
+        (
+            "PATH".to_string(),
+            format!("{}:/usr/bin:/bin", fx.path("bin").display()),
+        ),
+    ])
+}
+
+fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
+    use remote_task_runner::service::doctor::{Docker, HostFacts, ProfileFacts, Scope};
+    use remote_task_runner::toolchain::envdiff::{self, EnvReport};
+    let fx = Fx::new();
+    let cluster = fx.init_with_env(if retained {
+        retained_env(&fx)
+    } else {
+        Default::default()
+    });
+    no_engine(&fx);
+    fx.config(
+        "schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@mini-a.local\"\nbinary = \"/w/bin/current/remote-task-runner\"\n",
+    );
+    let scope = Scope {
+        state_dir: "/s".into(),
+        config_file: "/s/config.toml".into(),
+        in_use: false,
+        policy_digest: Some("sha256:p".into()),
+        ledger_entries: Some(0),
+    };
+    let doctor = serde_json::json!({"ok": true, "doctor": {
+        "status": {
+            "worker_id": "mini-a", "cluster": cluster,
+            "binary_sha256": "0".repeat(64),
+            "loaded": true, "ready": true, "draining": false,
+            "cancel_running": false, "live_attempts": 0
+        },
+        "facts": HostFacts {
+            schema: 1,
+            worker_scope: scope.clone(),
+            cli_scope: scope,
+            cli: None,
+            docker: Docker::default(),
+            profile: ProfileFacts {
+                name: Some("default".into()),
+                fingerprint: Some("sha256:f".into()),
+                error: None,
+            },
+        },
+    }});
+    // No machine that runs this test is this platform.
+    let env = serde_json::json!({"ok": true, "env": EnvReport {
+        schema_version: envdiff::SCHEMA,
+        os: "plan9".into(),
+        arch: "mips".into(),
+        tools: Default::default(),
+        helpers: Default::default(),
+        docker: envdiff::Docker::NotRunnable,
+        disk_free_bytes: Some(envdiff::MIN_DISK_BYTES),
+        profile: "default".into(),
+        required_tools: vec![],
+        profile_digest: None,
+        policy_digest: None,
+    }});
+    fx.ssh(&format!(
+        "case \"$*\" in\n*\"'worker-service' 'doctor'\") printf '%s\\n' '{doctor}';;\n*\"'worker-service' 'env'\") printf '%s\\n' '{env}';;\n*) exit 1;;\nesac"
+    ));
+    let out = fx.run(&["doctor"]);
+    (out.status.code(), json(&out))
+}
+
+#[test]
+fn a_worker_that_answers_has_its_environment_compared_with_the_parent_s() {
+    let (code, report) = answering_worker(true);
+    assert_eq!(code, Some(ErrorCode::Blocked.exit_code()), "{report}");
+    assert_eq!(check(&report, "mini-a", "reachable")["level"], "ok");
+    let compared: Vec<_> = report["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["host"] == "mini-a" && c["id"] == "environment_diff")
+        .collect();
+    let platform: Vec<_> = compared
+        .iter()
+        .filter(|c| c["detail"].as_str().unwrap().starts_with("platform: "))
+        .collect();
+    assert_eq!(platform.len(), 1, "{report}");
+    assert_eq!(platform[0]["level"], "fail");
+    assert!(
+        platform[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("worker=plan9/mips"),
+        "{report}"
+    );
+    // The comparison was made: nothing says it was left out.
+    assert!(
+        compared
+            .iter()
+            .all(|c| !c["detail"].as_str().unwrap().contains("left out")),
+        "{report}"
+    );
+    // The policy digest is not measured by either side yet: listed as a
+    // notice, neither a pass nor a reason to exit 1.
+    assert!(compared.iter().any(|c| c["level"] == "notice"
+        && c["detail"].as_str().unwrap().starts_with("policy_digest: ")
+        && c["detail"].as_str().unwrap().contains("not measured yet")));
+    assert_eq!(report["result"]["not_checked"], 0, "{report}");
+}
+
+#[test]
+fn without_a_retained_service_environment_the_parent_is_not_measured_in_the_shell_s() {
+    let (code, report) = answering_worker(false);
+    // Not compared at all, and said so: one check that was not made.
+    let compared: Vec<_> = report["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["host"] == "mini-a" && c["id"] == "environment_diff")
+        .collect();
+    assert_eq!(compared.len(), 1, "{report}");
+    assert_eq!(compared[0]["level"], "not_checked");
+    assert!(
+        compared[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the parent's environment could not be measured"),
+        "{report}"
+    );
+    assert_ne!(code, Some(0));
+}

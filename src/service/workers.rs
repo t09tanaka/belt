@@ -5,6 +5,8 @@
 //! "stopped". No ssh agent forwarding, no copy of any ssh private key.
 use super::bootstrap::Spec;
 use super::worker_service::{self, InstallRequest, Status};
+use crate::toolchain::envdiff::{self, EnvReport, Item};
+use crate::toolchain::envsync::{self, Blocked, InstallStep};
 use crate::{
     cli::WorkersSub,
     config::paths::user_config_path,
@@ -305,13 +307,26 @@ pub fn helper_command(
     ) {
         words.push(quote("--cancel-running"));
     }
-    let words = words.join(" ");
+    launch(binary, digest, &words.join(" "))
+}
+
+/// `exec` of the worker's own binary (or the staged one) with fixed `words`.
+fn launch(binary: Option<&str>, digest: &str, words: &str) -> String {
     if let Some(binary) = binary {
         return format!("exec {} {words}", quote(binary));
     }
     format!(
         "b=\"{STAGING}/rtr-{digest}\"; if [ -x \"$b\" ]; then exec \"$b\" {words}; else exec {} {words}; fi",
         quote("remote-task-runner")
+    )
+}
+
+/// The shell string asking a worker's binary for its environment report.
+pub fn env_command(binary: Option<&str>, digest: &str) -> String {
+    launch(
+        binary,
+        digest,
+        &format!("{} {}", quote("worker-service"), quote("env")),
     )
 }
 
@@ -905,6 +920,403 @@ pub fn reload_resident(spec: &Spec) -> ResidentReload {
     }
 }
 
+/// A worker-supplied text without control characters (escape sequences,
+/// newlines), so it cannot rewrite the parent's terminal.
+pub(super) fn strip_control(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// [`strip_control`], cut to a length a terminal line can hold.
+fn plain(text: &str) -> String {
+    strip_control(text).chars().take(200).collect()
+}
+
+/// What a worker answered to `worker-service env`. A binary that does not
+/// know the action, a newer or damaged report and a login banner each get
+/// their own message: none is turned into an empty difference.
+fn parse_env_reply(out: &RemoteOutput, name: &str) -> Result<EnvReport, ApiError> {
+    let conflict = |message: String| ApiError::new(ErrorCode::Conflict, message);
+    let upgrade = format!("run workers upgrade {name}");
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let banner = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v.get("ok").is_some());
+        return Err(conflict(if banner {
+            "the worker printed other output (a login banner?) before its environment report; \
+             silence it for non-interactive ssh sessions"
+                .to_string()
+        } else if text.trim().is_empty() {
+            format!("the worker's binary gave no environment report; it may be too old: {upgrade}")
+        } else {
+            format!(
+                "the worker's answer is not an environment report; its binary may be too old: {upgrade}"
+            )
+        }));
+    };
+    if value["ok"] == true {
+        let version = value["env"]["schema_version"].as_u64();
+        return match version {
+            Some(v) if v > u64::from(envdiff::SCHEMA) => Err(conflict(format!(
+                "the worker reports environment schema {v}, newer than this machine understands ({}); upgrade remote-task-runner here",
+                envdiff::SCHEMA
+            ))),
+            Some(v) if v < u64::from(envdiff::SCHEMA) => Err(conflict(format!(
+                "the worker reports environment schema {v}, older than this machine's {}: {upgrade}",
+                envdiff::SCHEMA
+            ))),
+            _ => serde_json::from_value(value["env"].clone()).map_err(|_| {
+                conflict(format!(
+                    "the worker's environment report is damaged; if it persists: {upgrade}"
+                ))
+            }),
+        };
+    }
+    Err(conflict(format!(
+        "worker environment report refused: {}",
+        value["error"]
+            .as_str()
+            .map_or_else(|| "unspecified".to_string(), plain)
+    )))
+}
+
+/// The environment of a registered worker, measured by its own binary.
+pub fn fetch_env(
+    remote: &mut impl Remote,
+    env: &BTreeMap<String, String>,
+    exe: &Path,
+    name: &str,
+) -> Result<EnvReport, ApiError> {
+    check_name(name)?;
+    let registration = registered(env, name)?
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no such worker is registered"))?;
+    let target = target_of(&registration.ssh)?;
+    let digest = worker_service::sha256_file(exe)
+        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    let out = remote
+        .run(
+            &target,
+            &env_command(registration.binary.as_deref(), &digest),
+            &[],
+            Duration::from_secs(60),
+        )
+        .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
+    parse_env_reply(&out, name)
+}
+
+#[derive(Debug, Serialize)]
+pub struct WorkerDiff {
+    pub worker: String,
+    pub all_same: bool,
+    pub items: Vec<Item>,
+    /// Why this worker could not be measured; `items` is empty then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `workers diff [<worker>]`: the parent's environment against each named
+/// (or every registered) worker. `local` measures the parent. Without a name
+/// one worker that cannot be measured does not stop the others: it gets its
+/// own entry with the reason. A named worker that fails is an error.
+pub fn diff_workers(
+    remote: &mut impl Remote,
+    env: &BTreeMap<String, String>,
+    exe: &Path,
+    name: Option<&str>,
+    local: impl FnOnce() -> Result<EnvReport, String>,
+) -> Result<Vec<WorkerDiff>, ApiError> {
+    let names = match name {
+        Some(name) => vec![name.to_string()],
+        None => registered_names(env)?,
+    };
+    if names.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::NotFound,
+            "no workers are registered; add one with workers add",
+        ));
+    }
+    let parent = local().map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
+    let mut out = Vec::new();
+    for worker in names {
+        match fetch_env(remote, env, exe, &worker) {
+            Ok(report) => {
+                let items = envdiff::diff(&parent, &report);
+                out.push(WorkerDiff {
+                    all_same: envdiff::all_same(&items),
+                    worker,
+                    items,
+                    error: None,
+                });
+            }
+            Err(e) if name.is_some() => return Err(e),
+            Err(e) => out.push(WorkerDiff {
+                worker,
+                all_same: false,
+                items: Vec::new(),
+                error: Some(plain(&e.message)),
+            }),
+        }
+    }
+    Ok(out)
+}
+
+/// Why a version was not installed.
+#[derive(Debug)]
+pub enum InstallError {
+    /// This version could not be installed; the other steps go on, and the
+    /// version is reported as blocked.
+    Failed(String),
+    /// Nothing can be installed on this worker now (no resident, a worker
+    /// that must be upgraded first, no answer): the sync ends here.
+    Stop(ApiError),
+}
+
+/// Installs one version on a worker through its version manager, by the same
+/// admitted setup path a placed attempt uses. The production one
+/// ([`warmup::ResidentWarmup`]) asks the running resident, which asks the
+/// worker over the link it already holds.
+pub trait Installer {
+    fn install(&mut self, worker: &str, step: &InstallStep) -> Result<Installed, InstallError>;
+}
+
+/// What an install that did not fail did on the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Installed {
+    /// It installed the version.
+    Now,
+    /// The worker had the version already and did nothing.
+    Already,
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncResult {
+    pub worker: String,
+    pub installed: Vec<InstallStep>,
+    /// The worker now matches the parent in everything `workers diff` shows.
+    /// False only with `--project`: the project's requirements are met while
+    /// a tool the project declares still differs from the parent.
+    pub in_sync: bool,
+}
+
+/// The project's version requirements per tool, read from the version files
+/// directly under `dir` (never followed through a link, bounded in size).
+pub fn read_project_requirements(
+    dir: &Path,
+) -> Result<Vec<crate::toolchain::versions::EffectiveRequirement>, ApiError> {
+    use crate::toolchain::{declarations, versions};
+    let bad = |what: &str| invalid(format!("project version files: {what}"));
+    // Resolved once, so that nothing below follows a link the project holds.
+    let root = std::fs::canonicalize(dir).map_err(|_| bad("the project is not a directory"))?;
+    if !root.is_dir() {
+        return Err(bad("the project is not a directory"));
+    }
+    let mut documents = BTreeMap::new();
+    for name in declarations::VERSION_FILES {
+        // Every directory of the name (`.fvm`) and the file are opened one by
+        // one without following a link.
+        let file = match crate::platform::open_beneath(&root, Path::new(name)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(bad(&format!("{name} is not a small regular file"))),
+        };
+        let meta = file
+            .metadata()
+            .map_err(|_| bad(&format!("{name} is unreadable")))?;
+        if !meta.is_file() || meta.len() > declarations::MAX_DOCUMENT_BYTES as u64 {
+            return Err(bad(&format!("{name} is not a small regular file")));
+        }
+        let mut bytes = Vec::new();
+        file.take(declarations::MAX_DOCUMENT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| bad(&format!("{name} is unreadable")))?;
+        let doc = declarations::Document::new(name, &bytes)
+            .map_err(|d| bad(&format!("{name}: {}", d.code)))?;
+        documents.insert(name.to_string(), doc);
+    }
+    if documents.is_empty() {
+        return Err(bad(&format!("no version files found in {}", dir.display())));
+    }
+    let found = declarations::read_project("", &documents, &[]).map_err(|d| bad(&d.code))?;
+    versions::effective(&found, &versions::Scope::project("")).map_err(|d| bad(&d.code))
+}
+
+fn blocked_error(name: &str, installed: &[InstallStep], blocked: &[Blocked]) -> ApiError {
+    ApiError::blocked(
+        crate::error::BlockedReason::EnvironmentMismatch,
+        envsync::render_blocked(name, installed, blocked),
+    )
+}
+
+/// `workers sync <worker> [--project <dir>]`. Installs what the worker's
+/// version manager may, then reports every difference that still needs a
+/// person. A failed install is never success, and no other version stands in.
+pub fn sync_worker(
+    remote: &mut impl Remote,
+    env: &BTreeMap<String, String>,
+    exe: &Path,
+    name: &str,
+    local: impl FnOnce() -> Result<EnvReport, String>,
+    project: Option<&[crate::toolchain::versions::EffectiveRequirement]>,
+    installer: &mut dyn Installer,
+) -> Result<SyncResult, ApiError> {
+    let parent = local().map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
+    sync_measured(
+        name,
+        &parent,
+        || fetch_env(remote, env, exe, name),
+        project,
+        installer,
+    )
+}
+
+/// `error`, with what was installed before it said first.
+fn after_installing(installed: &[InstallStep], what: &str, error: ApiError) -> ApiError {
+    if installed.is_empty() {
+        return error;
+    }
+    let list: Vec<String> = installed
+        .iter()
+        .map(|s| format!("{} {}", s.tool, s.version))
+        .collect();
+    ApiError {
+        message: format!(
+            "installed {}, but {what}: {}",
+            list.join(", "),
+            error.message
+        ),
+        ..error
+    }
+}
+
+/// [`sync_worker`] with the worker's measurement given: `measure` is asked
+/// once before the installs and once after them.
+pub fn sync_measured(
+    name: &str,
+    parent: &EnvReport,
+    mut measure: impl FnMut() -> Result<EnvReport, ApiError>,
+    project: Option<&[crate::toolchain::versions::EffectiveRequirement]>,
+    installer: &mut dyn Installer,
+) -> Result<SyncResult, ApiError> {
+    let worker = measure()?;
+    let first = envsync::plan(parent, &worker, project);
+    // What this sync installed, and every step the worker now says it has
+    // (a version it had already is there, but was not installed here).
+    let mut installed = Vec::new();
+    let mut settled = Vec::new();
+    let mut blocked = Vec::new();
+    for step in &first.install {
+        match installer.install(name, step) {
+            Ok(how) => {
+                if how == Installed::Now {
+                    installed.push(step.clone());
+                }
+                settled.push(step.clone());
+            }
+            Err(InstallError::Failed(reason)) => blocked.push(Blocked {
+                subject: step.tool.clone(),
+                missing: format!("{} {} was not installed", step.tool, step.version),
+                steps: reason,
+            }),
+            Err(InstallError::Stop(error)) => {
+                return Err(after_installing(
+                    &installed,
+                    &format!("{} {} was not installed", step.tool, step.version),
+                    error,
+                ))
+            }
+        }
+    }
+    let last = if settled.is_empty() {
+        blocked.extend(first.blocked);
+        worker
+    } else {
+        // Look again: what the worker says it has must now be there, whether
+        // it was installed here or not. If the worker cannot be measured,
+        // what was installed so far is still said.
+        let after = measure().map_err(|e| {
+            after_installing(&installed, "the worker could not be measured afterwards", e)
+        })?;
+        blocked.extend(envsync::verify(
+            &settled,
+            envsync::plan(parent, &after, project),
+        ));
+        after
+    };
+    if blocked.is_empty() {
+        Ok(SyncResult {
+            worker: name.into(),
+            installed,
+            in_sync: envdiff::all_same(&envdiff::diff(parent, &last)),
+        })
+    } else {
+        Err(blocked_error(name, &installed, &blocked))
+    }
+}
+
+/// One line for a sync that ended without anything blocked. It says "in
+/// sync" exactly when `in_sync` is true; otherwise it leads with what is
+/// still different, and says the project's requirements are met only when a
+/// project was given.
+pub fn render_sync(done: &SyncResult, project: bool) -> String {
+    let name = &done.worker;
+    let state = match (done.in_sync, project) {
+        (true, _) => format!("worker {name} is in sync"),
+        (false, true) => format!(
+            "worker {name} is not in sync with the parent: it meets the project's requirements, and still differs from the parent where the project declares a tool (see workers diff {name})"
+        ),
+        (false, false) => format!(
+            "worker {name} is not in sync with the parent: nothing is left for sync to install (see workers diff {name})"
+        ),
+    };
+    if done.installed.is_empty() {
+        return state;
+    }
+    let list: Vec<String> = done
+        .installed
+        .iter()
+        .map(|s| format!("{} {}", s.tool, s.version))
+        .collect();
+    format!("{state}; installed {}", list.join(", "))
+}
+
+fn registered_names(env: &BTreeMap<String, String>) -> Result<Vec<String>, ApiError> {
+    let (path, text) = read_user_config(env)?;
+    let user = crate::config::parse::parse_user(&path.to_string_lossy(), &text)
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok(user.workers.into_iter().map(|w| w.id).collect())
+}
+
+/// Plain text for `workers diff`: one line per item.
+pub fn render_diff(diffs: &[WorkerDiff]) -> String {
+    let mut lines = Vec::new();
+    for d in diffs {
+        lines.push(format!("worker {}", d.worker));
+        if let Some(error) = &d.error {
+            lines.push(format!("  could not be measured: {error}"));
+        }
+        for i in &d.items {
+            let class = serde_json::to_value(i.class)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let mut line = format!(
+                "  {:<24} {:<16} parent={} worker={}",
+                i.subject,
+                class,
+                i.parent.as_deref().unwrap_or("-"),
+                i.worker.as_deref().unwrap_or("-")
+            );
+            if let Some(steps) = &i.steps {
+                line.push_str(&format!("  -> {steps}"));
+            }
+            // Values come from the worker's report.
+            lines.push(strip_control(&line));
+        }
+    }
+    lines.join("\n")
+}
+
 /// Ask a running resident which build it is. Missing credentials or a socket
 /// nobody listens on mean no resident runs; a resident that is there and
 /// does not answer the question is said to be unknown, never absent.
@@ -976,7 +1388,7 @@ fn emit(
             if json {
                 println!(
                     "{}",
-                    serde_json::json!({"schema_version":1,"ok":false,"error":{"code":error.code,"message":error.message}})
+                    serde_json::json!({"schema_version":1,"ok":false,"error":error})
                 );
             } else {
                 eprintln!("error: {}", error.message);
@@ -1030,7 +1442,18 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                     (serde_json::to_value(r).expect("serializes"), text)
                 });
             let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
-            return Some(emit(json, result.map(|(v, _)| v), || text));
+            let unmeasured = result.as_ref().is_ok_and(|(v, _)| {
+                v["workers"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|d| d.get("error").is_some()))
+            });
+            let code = emit(json, result.map(|(v, _)| v), || text);
+            // The others were still reported; the exit status says one was not.
+            return Some(if unmeasured && code == crate::cli::exit::SUCCESS {
+                ErrorCode::CommunicationUnknown.exit_code()
+            } else {
+                code
+            });
         }
         WorkersSub::Start { name } => {
             (name, Lifecycle::Start, lifecycle_of(name, Lifecycle::Start))
@@ -1052,6 +1475,61 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
             };
             (name, action, lifecycle_of(name, action))
         }
+        WorkersSub::Diff { name } => {
+            let result = (|| {
+                let exe = exe
+                    .as_ref()
+                    .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+                let spec = super::context::runtime_spec(&env)?;
+                diff_workers(&mut SshRemote, &env, exe, name.as_deref(), || {
+                    crate::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env)
+                })
+            })()
+            .map(|diffs| {
+                let text = render_diff(&diffs);
+                (serde_json::json!({ "workers": diffs }), text)
+            });
+            let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
+            let unmeasured = result.as_ref().is_ok_and(|(v, _)| {
+                v["workers"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|d| d.get("error").is_some()))
+            });
+            let code = emit(json, result.map(|(v, _)| v), || text);
+            // The others were still reported; the exit status says one was not.
+            return Some(if unmeasured && code == crate::cli::exit::SUCCESS {
+                ErrorCode::CommunicationUnknown.exit_code()
+            } else {
+                code
+            });
+        }
+        WorkersSub::Sync { name, project } => {
+            let result = (|| {
+                let exe = exe
+                    .as_ref()
+                    .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+                let spec = super::context::runtime_spec(&env)?;
+                let requirements = project
+                    .as_deref()
+                    .map(|dir| read_project_requirements(Path::new(dir)))
+                    .transpose()?;
+                sync_worker(
+                    &mut SshRemote,
+                    &env,
+                    exe,
+                    name,
+                    || crate::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env),
+                    requirements.as_deref(),
+                    &mut warmup::ResidentWarmup::new(spec.clone()),
+                )
+            })()
+            .map(|done| {
+                let text = render_sync(&done, project.is_some());
+                (serde_json::to_value(&done).expect("serializes"), text)
+            });
+            let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
+            return Some(emit(json, result.map(|(v, _)| v), || text));
+        }
         WorkersSub::Upgrade { name } => return Some(upgrade::command(name, json, &env, exe)),
         _ => return None,
     };
@@ -1067,6 +1545,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
 }
 
 pub mod upgrade;
+pub mod warmup;
 
 #[cfg(test)]
 mod tests;

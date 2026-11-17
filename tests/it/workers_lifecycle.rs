@@ -26,6 +26,13 @@ impl Fx {
     /// An initialized coordinator: the retained input names the cluster, as
     /// `init` leaves it. Nothing is started.
     pub(super) fn init(&self) -> ClusterId {
+        self.init_with_env(Default::default())
+    }
+    /// As `init`, with the service environment the coordinator retained.
+    pub(super) fn init_with_env(
+        &self,
+        env: std::collections::BTreeMap<String, String>,
+    ) -> ClusterId {
         use remote_task_runner::service::bootstrap::{write_input, Spec};
         let dir = self.path("home/.config/remote-task-runner");
         std::fs::create_dir_all(&dir).unwrap();
@@ -50,7 +57,7 @@ impl Fx {
             worker_id: WorkerId::parse("local").unwrap(),
             cluster_key_path: self.path("cluster.key"),
             executable: self.path("rtr"),
-            env: Default::default(),
+            env,
             repo_root: None,
             expected_cluster: Some(cluster.clone()),
             managed_service: None,
@@ -279,4 +286,251 @@ fn an_answer_that_does_not_show_the_requested_state_is_not_reported_as_success()
     fx.ssh(&answer(&ClusterId::generate(), "mini-a", true, true));
     let out = fx.run(&["workers", "drain", "mini-a"]);
     assert_eq!(out.status.code(), Some(ErrorCode::Conflict.exit_code()));
+}
+
+mod a44 {
+    use super::*;
+    use remote_task_runner::toolchain::envdiff::{Docker, EnvReport, Managed, Observed, ToolFact};
+    use std::collections::BTreeMap;
+
+    fn shim(dir: &Path, name: &str, body: &str) {
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The parent is measured through its real profile, which runs only fake
+    /// tools; the worker is whatever the fake ssh prints.
+    fn fixture() -> Fx {
+        let fx = Fx::new();
+        fx.init();
+        let tools = fx.path("tools");
+        std::fs::create_dir(&tools).unwrap();
+        shim(&tools, "node", "echo v20.1.0");
+        shim(&tools, "xcodebuild", "echo 'Xcode 16.0'");
+        let sdk = fx.path("sdk");
+        std::fs::create_dir(&sdk).unwrap();
+        shim(&tools, "xcrun", &format!("printf '%s' '{}'", sdk.display()));
+        shim(&tools, "docker", "echo 27.0.1");
+        let profiles = fx.path("local-worker/profiles.toml");
+        std::fs::write(
+            &profiles,
+            format!(
+                "schema_version=1\nactive='t'\n[profiles.t]\npath=[{:?}]\nshell='/bin/sh'\ncache_namespace='t'\n",
+                std::fs::canonicalize(&tools).unwrap().to_str().unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&profiles, std::fs::Permissions::from_mode(0o600)).unwrap();
+        fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@mini-a.local\"\n");
+        fx
+    }
+
+    fn worker_report() -> EnvReport {
+        let tool = |observed, version: Option<&str>, managed| ToolFact {
+            observed,
+            version: version.map(str::to_string),
+            managed,
+        };
+        EnvReport {
+            schema_version: 1,
+            os: std::env::consts::OS.into(),
+            arch: std::env::consts::ARCH.into(),
+            tools: BTreeMap::from([
+                (
+                    "node".to_string(),
+                    tool(
+                        Observed::Available,
+                        Some("18.0.0"),
+                        Some(Managed {
+                            inventory: vec!["18.0.0".into(), "20.1.0".into()],
+                            installed: vec!["18.0.0".into()],
+                        }),
+                    ),
+                ),
+                ("xcode".to_string(), tool(Observed::Unavailable, None, None)),
+            ]),
+            helpers: BTreeMap::from([(
+                "remote-task-runner".to_string(),
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )]),
+            docker: Docker::NotRunnable,
+            disk_free_bytes: Some(100 << 30),
+            profile: "t".into(),
+            required_tools: Vec::new(),
+            profile_digest: Some("sha256:worker".into()),
+            policy_digest: None,
+        }
+    }
+
+    fn answer(report: &EnvReport) -> String {
+        format!(
+            "printf '%s\\n' '{}'",
+            serde_json::json!({"ok": true, "env": report})
+        )
+    }
+
+    fn has_item(value: &serde_json::Value, subject: &str) -> bool {
+        value["result"]["workers"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["subject"] == subject)
+    }
+
+    fn item(value: &serde_json::Value, subject: &str) -> serde_json::Value {
+        value["result"]["workers"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|i| i["subject"] == subject)
+            .unwrap_or_else(|| panic!("no item {subject}"))
+            .clone()
+    }
+
+    #[test]
+    fn diff_classifies_the_five_ways_a_worker_can_differ() {
+        let fx = fixture();
+        fx.ssh(&answer(&worker_report()));
+        let out = fx.run(&["workers", "diff", "mini-a"]);
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let value = json(&out);
+        assert_eq!(value["ok"], true);
+        assert_eq!(value["result"]["workers"][0]["worker"], "mini-a");
+        assert_eq!(value["result"]["workers"][0]["all_same"], false);
+        // A version the worker's manager may install: automatic.
+        assert_eq!(item(&value, "node")["class"], "auto_installable");
+        assert_eq!(item(&value, "node")["parent"], "20.1.0");
+        assert_eq!(item(&value, "node")["worker"], "18.0.0");
+        // Never installed automatically.
+        let xcode = item(&value, "xcode");
+        assert_eq!(xcode["class"], "manual_required");
+        assert!(xcode["steps"].as_str().unwrap().contains("license"));
+        let docker = item(&value, "docker");
+        assert_eq!(docker["class"], "manual_required");
+        assert!(docker["steps"].as_str().unwrap().contains("Colima"));
+        // The built-in tools are compared by this binary's build, not by an
+        // external `--version`.
+        assert_eq!(item(&value, "remote-task-runner")["class"], "same");
+        assert!(!has_item(&value, "local-ci"));
+        assert!(!has_item(&value, "task-traffic-controller"));
+        assert_eq!(item(&value, "platform")["class"], "same");
+        // Nothing measures a policy digest yet; the profile digest differs by
+        // host and is only shown.
+        assert_eq!(item(&value, "policy_digest")["class"], "not_measured");
+        assert_eq!(item(&value, "profile")["class"], "same");
+        assert_eq!(item(&value, "disk")["class"], "same");
+        // One ssh call, a fixed helper command.
+        let argv = fx.argv().join(" ");
+        assert!(argv.contains("worker-service"), "{argv}");
+    }
+
+    #[test]
+    fn diff_of_every_worker_and_plain_text() {
+        let fx = fixture();
+        fx.ssh(&answer(&worker_report()));
+        let out = std::process::Command::new(BIN)
+            .args(["workers", "diff"])
+            .env_clear()
+            .env("HOME", fx.path("home"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", fx.path("bin").display()),
+            )
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0));
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.starts_with("worker mini-a\n"), "{text}");
+        assert!(text.contains("auto_installable"), "{text}");
+        assert!(text.contains("manual_required"), "{text}");
+    }
+
+    #[test]
+    fn a_worker_that_cannot_answer_is_an_error_never_an_empty_difference() {
+        let fx = fixture();
+        fx.ssh("echo \"error: invalid value 'env'\" >&2; exit 2");
+        let out = fx.run(&["workers", "diff", "mini-a"]);
+        assert_eq!(out.status.code(), Some(ErrorCode::Conflict.exit_code()));
+        assert_eq!(json(&out)["error"]["code"], "CONFLICT");
+        fx.ssh("exit 255");
+        let out = fx.run(&["workers", "diff", "mini-a"]);
+        assert_eq!(out.status.code(), Some(ErrorCode::Conflict.exit_code()));
+        let out = fx.run(&["workers", "diff", "ghost"]);
+        assert_eq!(out.status.code(), Some(ErrorCode::NotFound.exit_code()));
+    }
+
+    #[test]
+    fn sync_blocks_what_needs_a_person_with_the_steps() {
+        let fx = fixture();
+        // The worker's manager has node 20.1.0 installed; only xcode, docker
+        // and the helpers differ.
+        let mut report = worker_report();
+        report.tools.insert(
+            "node".into(),
+            ToolFact {
+                observed: Observed::Available,
+                version: Some("20.1.0".into()),
+                managed: None,
+            },
+        );
+        fx.ssh(&answer(&report));
+        let out = fx.run(&["workers", "sync", "mini-a"]);
+        assert_eq!(out.status.code(), Some(ErrorCode::Blocked.exit_code()));
+        let value = json(&out);
+        assert_eq!(value["ok"], false);
+        assert_eq!(value["error"]["code"], "BLOCKED");
+        assert_eq!(value["error"]["blocked_reason"], "environment_mismatch");
+        let message = value["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("sudo xcodebuild -license accept"),
+            "{message}"
+        );
+        assert!(message.contains("Colima"), "{message}");
+        assert!(!message.contains("task-traffic-controller"), "{message}");
+        assert!(!message.contains("node"), "{message}");
+    }
+
+    #[test]
+    fn sync_without_a_resident_installs_nothing_starts_none_and_says_so() {
+        // The real command: the worker lacks node 20.1.0, its manager may
+        // install it, and no resident runs to carry the request.
+        let fx = fixture();
+        fx.ssh(&answer(&worker_report()));
+        let out = fx.run(&["workers", "sync", "mini-a"]);
+        assert_eq!(
+            out.status.code(),
+            Some(ErrorCode::CommunicationUnknown.exit_code())
+        );
+        let message = json(&out)["error"]["message"].as_str().unwrap().to_string();
+        assert!(message.contains("the resident is not running"), "{message}");
+        assert!(!message.contains("in sync"), "{message}");
+    }
+
+    #[test]
+    fn sync_with_a_project_follows_its_version_files() {
+        let fx = fixture();
+        let project = fx.path("project");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(project.join(".node-version"), "18.0.0\n").unwrap();
+        // The worker already runs 18.0.0: the project is satisfied for node.
+        fx.ssh(&answer(&worker_report()));
+        let out = fx.run(&[
+            "workers",
+            "sync",
+            "mini-a",
+            "--project",
+            project.to_str().unwrap(),
+        ]);
+        let message = json(&out)["error"]["message"].as_str().unwrap().to_string();
+        assert!(!message.contains("node"), "{message}");
+        // A project that is not a directory is refused before any ssh.
+        let out = fx.run(&["workers", "sync", "mini-a", "--project", "/no/such/dir"]);
+        assert_eq!(out.status.code(), Some(ErrorCode::InvalidInput.exit_code()));
+    }
 }

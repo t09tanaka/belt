@@ -1147,6 +1147,121 @@ S22 の残り（必須。この変更で S22 は完了しない）:
 3. `system-user`（LaunchDaemon の `UserName`）の導入、Linux、upgrade・rollback・doctor・`workers forget`、fish / csh のログインシェル対応は未実装（S23・S24）。
 4. 実 SQLite の live attempt を持つ worker に対する stop の待ち・cancel の end-to-end（agent の cancel は統合試験済みだが、helper の待ちは注入した計数での単体試験）。
 
+### S21 `workers diff`（2026-11-17、1 本目: diff と待機理由の手順）
+
+`workers diff [<worker>]` を実装した。親と worker は同じ測定関数（`toolchain::envreport::collect`）で測り、worker 側は登録済みの binary の隠し action `worker-service env` が ssh 越しに JSON の環境 report を返す。測定は resident と同じ永続入力（worker.json の env と profile の PATH）を使い、ssh セッションの PATH は使わない。report は tool ごとの観測（available / unavailable / unknown）と版、版管理 adapter（registry）の導入候補と導入済みの版、remote-task-runner の build 版、`docker info` による実行可否、空き disk、profile の名前・required_tools・digest、policy digest を持つ。
+
+task-traffic-controller と local-ci は RTR の binary に組み込まれている（spec 22.4）ので、外部の `--version` は叩かず、双方の binary の build 版（`remote-task-runner` の版）で比べる。portool・fast-worktree は他の tool と同じ 3 状態（ある・無い・測れない）で測り、測れないものを same にも missing にもしない。`docker info` は profile の HOME と worker env の `DOCKER_HOST`・`DOCKER_CONTEXT` を付けて呼び、エラーは Unknown とする（docker の実体が無いときだけ not runnable）。子は自分の process group に置き、出力は上限（8 KiB）を超えた分を読み捨てて pipe を詰まらせず、時間切れでは group ごと止める（`platform::signal_process_group`）。
+
+差の判定は純粋関数 `toolchain::envdiff::diff(parent, worker) -> Vec<Item>`（`doctor` から呼べるよう公開、PURE 対象）。分類は `same / differs / missing / auto_installable / manual_required / not_measured` で、優先順位は次のとおり。unknown は同じと見なさず（`differs`）、手順は「測れなかった（could not be measured）」と言い、install は案内しない。manual の tool（xcode・docker）は版 manager が候補を持っていても常に `manual_required`。portool・fast-worktree は配布経路（版 manager の導入候補）が無ければ `manual_required`。worker の版 manager に導入済みの版は、既定の版が違っても、PATH に tool が無くても `same`（H1）。導入候補にある版が未導入なら `auto_installable`、候補外なら `missing` か `differs`。profile は名前と required_tools で比べ、digest は host ごとの絶対 path を含むため表示だけにする。policy digest は本物の digest ができるまで `not_measured`（same にしない。`all_same` の判定には入れない）。手順（steps）は項目ごとに付ける。古い binary・新しい schema・壊れた応答・ログインの banner・worker 側の拒否は、それぞれ別の文言の `CONFLICT` で、空の差にはしない。worker から来た文字列は制御文字を除いて出す。
+
+`diff` を worker 省略で呼ぶと、1 台が測れなくても残りを続け、worker ごとに結果（測れなかった理由を含む）を出す。測れない worker があれば終了コードは非 0。登録が 0 台なら、その旨を出して非 0 で終わる。
+
+適合 worker が無い submit の待機理由（`unmet`）には、未充足の tool 要求の直後に `how: …`（128 文字以内、文字数で切る）の 1 行を足す（`envdiff::with_steps`、`task_waiting` と `estimate` の両方）。manual の tool は固定の手順、それ以外は「worker の profile PATH に導入して」、観測が unknown なら「測れなかった」と言う。unmet の行の照合は `capability::unmet_line`（`missing` が行を書く関数）で行う。
+
+A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一時 HOME の `src/service/workers/tests.rs`、実 binary・偽 ssh・偽の tool shim の `tests/it/workers_lifecycle.rs`（`a44`）。ネットワークには出ない。
+
+残り（S21 は完了していない）: `workers sync` の実際の導入は 3 本目で入れた（下の節）。`doctor` への組み込みは 7 本目で入れた（下の「S21 `doctor` への接続」）。`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は RTR の版だけで、組み込んだ crate 個別の build 情報は持たない。
+
+### S21 `workers sync`（2026-11-17、2 本目: 計画と blocked、導入の差し込み口）
+
+`workers sync <worker> [--project <dir>]` を実装した。計画は純粋関数 `toolchain::envsync::plan(parent, worker, project)`（PURE 対象）で、diff の `auto_installable` を版管理 adapter の導入手順にし、それ以外（`manual_required`・`missing`・`differs`。platform・disk・profile を含む）は導入せず `blocked: environment_mismatch` として不足内容と手順を出し、非 0 で終わる。「in sync」と言うのは `diff` が `all_same` のときだけ（`--project` で宣言された tool が親と違うだけなら「プロジェクトの要求を満たす」と言い、`in_sync: false`）。`--project` は dir 直下の版指定ファイル（`.fvm` を含め途中の symlink も辿らない（`platform::open_beneath`）、各 256KiB 以下、1 つも無ければ InvalidInput）を `declarations` で読み、宣言された tool は親ではなくプロジェクトの要求（導入済みか既定の版が満たせば何もしない、満たす最大の許可済み版を導入、無ければ blocked）に従う。alias（`lts` など）・式は版ではないので導入せず、「具体的な版を指定する」と案内する。導入済みの版は PATH に tool が無くても要求を満たす。
+
+実行は自動導入を先に行い、その後で手動分を blocked として報告する。導入後に worker を測り直し（比較は純粋関数 `envsync::verify`、メッセージは `envsync::render_blocked`）、導入が見えなければ blocked とする。途中で止まったとき（測り直しの失敗、残りの blocked）も、それまでに導入したものをメッセージに含める。導入の失敗は成功にせず、別の版へ切り替えない。導入そのものは `Installer` trait の差し込み口に分けた（本番の実装は 3 本目の `ResidentWarmup`。2 本目の時点の `NoWarmup` は削除した）。
+
+残り（S21 は完了していない）:
+1. 導入の本番経路は 3 本目で入れた（下の節）。
+2. `doctor` への組み込みは 7 本目で入れた（下の「S21 `doctor` への接続」）。
+3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
+
+### S21 `workers sync` の導入（2026-11-17、3 本目: warm-up の要求）
+
+`workers sync` が worker に実際に導入するようにした。経路は spec 11 章が名前を挙げている `env_sync` で、wire の型は以前からあり、agent が未実装（`NOT_IMPLEMENTED`）だったものを実装した。
+
+- **経路**: `workers sync` → 動いている resident の control 操作 `env_sync`（`Operation::EnvSync`） → `Coordinator::env_sync` → 既に張ってある認証済みの worker link → wire の `env_sync` → worker の agent。ssh で worker のファイルを読み戻すことはしない。admission の lock も SQLite の書き込みも持たない（`resolve_toolchains` と同じ扱い）。
+- **agent の導入**: 親が渡すのは tool 名と厳密な版だけで、導入の内容はすべて worker 自身の registry（`toolchains.toml`）から作る（`Registry::inventory_request`。recipe が無い tool、inventory に無い版、厳密でない版は導入せず、理由を付けて `failed`）。導入は `Host::toolchain_poll` に warm-up 用の consumer を渡して行うので、配置済みの attempt と同じ setup の supervisor・forecast・task-traffic-controller の gate を通る。install plan の key は project や親の profile に依らないため、同じ版の warm-up どうしも、その版を要する attempt も、既存の singleflight で 1 つの導入にまとまる。
+- **待たない要求**: link と control socket の応答時間は数秒なので、1 回の要求は導入を待たず `pending` を返す（`SyncOutcome::Pending` を追加）。親は同じ `sync_id`（要求の本文に追加。`request_id` は毎回新しい）で聞き直す。agent は `sync_id` ごとに consumer を 1 つ持ち、決着（導入済み・失敗・`prepare_timeout_ms` 超過）で参照を手放す。決着した結果は覚えておき、応答を失った親の聞き直しに同じ答えを返す（失敗した導入をやり直さない）。誰も聞きに来ない warm-up（親が途中で止まった）は、agent の tick が `warmup_idle_ms`（既定 60 秒）で参照を手放す（最後の参照なら導入も止まる）。同時に覚える warm-up は 16 個まで、1 要求の tool は 32 個まで（超える要求は丸ごと断る）。停止中の agent は新しい warm-up を始めない。古い coordinator epoch は `STALE_EPOCH`。`dry_run` は検出だけで何も始めない。
+- **旧 peer の除外**: hello の feature `env_sync_v1` を足した。双方が提供し、どちらも要求しない（`required_features` に入れない）ので、片方だけが新しい組み合わせでも接続と通常の配置はそのまま動く（N/N+1）。合意できなかった link には coordinator が要求を送らず、`workers upgrade <worker>` を案内する `PROTOCOL_INCOMPATIBLE` を返す。agent 側も、合意していない接続からの `env_sync` を agent に渡す前に断る。古い resident（操作を知らない）には「resident を再起動して」と案内する。
+- **CLI**: `NoWarmup` を `ResidentWarmup` に置き換えた。導入する版が 1 つでもあるときだけ resident に繋ぐ（揃っている worker の sync に resident は要らない）。resident が動いていなければ、起動せずに「resident が動いていない」と出して止まる。応答なし・混雑（`COMMUNICATION_UNKNOWN`・`OVERLOADED`）は同じ `sync_id` で聞き直すが、誰も答えない状態が 2 分続いたら打ち切る（link が切れた worker、この操作を知らない古い resident は要求を読めずに接続を閉じるので、ここに当たる。メッセージで resident の再起動を案内する）。worker が `pending` と答え続ける間は 1 時間まで待つ（worker 側は既定 15 分で失敗にする）。導入を始めるときに stderr へ 1 行出す。導入の失敗はその版を blocked にして残りを続け、導入後の測り直しで見えない版は `envsync::verify` が blocked にする。resident なし・旧 peer・応答なしの打ち切りは、その場で sync を終える（それまでに導入したものはメッセージに含める）。worker から来た文字列は制御文字を除いて出す。
+- **表示の食い違いの修正**: 成功時の 1 行は `render_sync` が作り、`in_sync` が true のときだけ「is in sync」と言う。false のときは「is not in sync with the parent」で始め、`--project` を付けたときだけ「プロジェクトの要求は満たしている」と続ける（以前は `in_sync: false` で「meets the project's requirements」とだけ言い、`--project` なしでも project に触れていた）。
+
+A44 の sync 側のテスト（ネットワークに出ない）:
+- `tests/it/bootstrap.rs`: 本物の resident と local worker、偽の nodenv manager で、要求 → 導入 → 測り直し → in sync の往復、2 回目は何も実行しないこと、導入済みは `unchanged`、resident が無いときは導入も起動もしないこと、manager の失敗が blocked になること、同時の 2 回の sync で manager が 1 回しか走らないこと。
+- `tests/it/worker_agent.rs`: feature を合意していない接続の拒否、上限と重複、registry に無いものを導入しないこと、1 つの warm-up が 1 つの consumer であること、決着後の同じ答え、時間切れ、tick による解放、停止中と満杯。
+- `src/coordinator/env_sync.rs`: 旧 peer に要求を 1 回も送らず `workers upgrade` を案内すること、応答なし・拒否・不足した応答の区別。`src/service/workers/warmup.rs`: 応答の解釈（純粋関数 `look`）。`src/toolchain/registry/tests.rs`: warm-up の要求と attempt の要求が同じ install plan になること。
+
+残り（S21 は完了していない）:
+1. （7 本目で解消）`doctor` への組み込み。下の「S21 `doctor` への接続」。
+2. ssh 越しの remote worker に対する `workers sync` の実機での受入（S26）。往復の試験は local worker の link で行った。remote の link を作る `config/runtime.rs` が feature の合意を渡すこと（合意した peer には送り、していない peer には送らない）は `tests/it/runtime.rs` で確かめたが、ssh の bridge を通した導入の往復は試験していない。
+3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
+4. `diff` の worker 省略時の並列化、`installed_inventory` の所要時間の計測（1 本目から継続）。
+5. （4 本目で解消）spec 11 章・18 章・22.2 に `env_sync` の意味、feature `env_sync_v1`、N/N+1 の規則を書いた。
+6. sync の途中で Ctrl-C したとき、worker 側の導入は最長 `warmup_idle_ms` 続いてから止まる（即時の取り消し要求は無い）。
+
+### S21 `workers sync` のレビュー修正（2026-11-17、4 本目: PR #59 の指摘）
+
+- **H1（S20 からの欠陥）**: 失敗した導入・途中で止められた導入が receipt の無い private root を残し、同じ版がその後ずっと失敗していた。原因は 2 か所で、`poll_tool` が導入者を起動する前に `detect` の `installation_incomplete_or_unreceipted` を `Failed` にしていたことと、`install_admitted` が中身のある root を `installation_partial_requires_cleanup` で断っていたこと。直し方: `poll_tool` は「root はあるが receipt が無い」場合に限って導入者を起動する（信用できない receipt・tree の drift・安全でないディレクトリは従来どおり `Failed`）。`install_admitted` は `install.lock` を排他で取り（他の導入者が持っていれば何も消さずに待つ）、receipt があればそれを返し、無ければ root の中身を消してから入れ直す。消す前に root の場所を確かめる（管理ディレクトリの直下、名前が plan identity の 64 桁 16 進、所有者のみの権限、symlink を経由しない）。`install.lock` は残し、symlink は辿らずに外し、ファイルは mode を変えずに外し（外への hard link の先を書き換えない）、receipt のある root（検証できない receipt を含む）は消さない。仕事の中の導入も warm-up も同じ `poll_tool` → helper → `install_admitted` を通るので、両方が直る。修正前に、失敗させた版をもう一度導入するテストが builder と resident 経由の両方で失敗することを確かめた（`installation_incomplete_or_unreceipted`）。
+  - 変わった既存の振る舞い: 導入が失敗した版を次の consumer が要求すると、導入をもう一度試す（以前は 1 回目の失敗を返し続けた）。失敗を見た consumer 自身には同じ失敗を返し続ける。`installation_busy` と `installation_partial_requires_cleanup` は返さなくなった。
+- **M1**: 一度 `pending` を見た後は、resident に繋がらない（接続拒否・socket なし）、resident の「停止中」の答え、`NOT_FOUND`（resident が worker をまだ掴んでいない）を答えなしとして、2 分の上限の中で聞き直す。`pending` を見た後に止める・打ち切るときは、導入が worker で続いている可能性と `workers diff` を添える。resident は起動のたびに token を作り直すので、答えを読めなかったら client を読み直してから聞き直す（これが無いと、再起動後の resident に古い token で聞き続けて打ち切りになる。再起動をまたぐ試験で見つけた）。
+- **M2**: 停止中の worker は新しい warm-up を `CONFLICT` で断り、親はその場で止めて worker の文言を出す（`OVERLOADED` は「混んでいる」だけになった）。error code は増やしていない（古い親が読めない値を返さないため）。resident の再起動の案内は、resident がこの操作に一度も答えなかったときだけ出す。
+- **M3**: 親は worker の答え（`pending` と `OVERLOADED`）で「最後に答えがあった時刻」を更新する。worker の確認は `sync_id` ごとに 1 本の別スレッドで行い、warm-up の lock の外で動く。確認を始めた要求は最長 1.5 秒待って `pending` を返し、確認中に来た同じ `sync_id` の要求は分かっている結果をその場で返す（時間切れになった要求がスレッドを積み上げない）。遅い確認の結果は残り、次の要求に答える。確認中の warm-up は idle でも手放さない（手放すと、確認が consumer を作り直し、誰も解放しなくなる）。
+- **L1**: worker が `unchanged` と答えた版は `installed` に入れない。測り直しと `verify` は、`unchanged` の版にも行う。親が `pending` を見た後の `unchanged`（worker の再起動で warm-up を忘れた場合）は、導入したものとして数える。
+- **L2**: `toolchain_poll` は warm-up の lock の外（上の別スレッド）で呼ぶ。
+- **L3**: resident の client を作れないとき、「resident が動いていない」と言うのは、token か socket が無い・接続拒否のときだけ。それ以外はそのままの理由を出す。
+- **L4（入れない）**: warm-up は `max_concurrent_prepares` に数えない。この上限は workspace の準備（`host.prepare` のスレッド）の数を縛るもので、仕事の中の toolchain の導入もこの枠を持たない。warm-up が枠を持つと、最長 15 分の導入の間、workspace の準備が待たされる。導入の同時数は、版ごとの singleflight、task-traffic-controller の gate、warm-up の上限 16 で縛っている。
+- **テスト（M4）**:
+  - 導入中の worker の再起動: `tests/it/toolchain_preparation.rs`（同じ state を開き直し、古い導入者が片付くまで次を始めず、その後に導入が成功する）。
+  - resident の再起動をまたぐ sync: `tests/it/bootstrap.rs`（local worker は resident の中にあるので、worker の再起動も兼ねる）。
+  - 中断のあとの 2 回目の sync（worker が忘れる前）: `tests/it/bootstrap.rs`（manager は 1 回だけ）。忘れた後（60 秒）は、`warmup_idle_ms` を resident の設定から変えられないため resident 経由では試験していない。同じ経路を 2 段で確かめた: agent が idle で参照を手放し、同じ `sync_id` の聞き直しが新しい warm-up になること（`tests/it/worker_agent.rs`、link の切断が `warmup_idle_ms` を超える場合も同じ）、参照が無くなって止められた導入の後に同じ版が導入できること（`tests/it/toolchain_preparation.rs`）。
+  - gate: `tests/it/bootstrap.rs`（worker の予算を別の entry で埋めると、導入が worker の ledger に並び、manager が走らない。空けると導入される）。
+  - 遅い確認: `tests/it/worker_agent.rs`（確認が戻らなくても要求は `pending` で返り、聞き直しは確認を増やさず、結果は残る）。
+
+残り（S21 は完了していない）: 4 本目の 1〜4 と 6。加えて、`warmup_idle_ms` を超えた後の 2 回目の sync を resident 経由の 1 本の試験で確かめること（設定の口が要る）。owner の read が無く空でないディレクトリを残した root は、rename で空になるので次の導入は進むが、その trash は消せずに残る（手で消す）。root の中を path で名指しして書く生き残りの子孫は、新しい root に書き込める（trash への rename では防げない）。
+
+### S21 `workers sync` のレビュー修正（2026-11-17、5 本目: 削除の経路と失敗の記憶）
+
+PR #59 の H1 修正（4 本目）へのレビューを受けて、toolchain の root を消す経路を固めた。
+
+- **M1（失敗した版のやり直し）**: 導入者が自分で失敗した版を key ごとに 10 分（`SetupConfig::tool_failure_hold_ms`）覚え、新しい consumer には導入をやり直さずに同じ失敗と残り秒数を返す。覚えるのは helper が失敗の exit で終わった場合、成功の後の `detect` が通らなかった場合、制限時間切れだけで、cancel・消失・signal による終了は覚えない（`policy::install_itself_failed`）。HostTools の digest が変わったとき、warm-up の最初の look（`Host::toolchain_retry`）、worker の再起動で解除する。判定は純粋関数 `policy::failure_held`。
+- **L1（fd を基準にした削除）**: `remove_at` は `openat(O_DIRECTORY|O_NOFOLLOW)`・`fstat`・`fchmod`・`unlinkat` だけでたどる。path の chmod と `read_dir` は無い。`st_dev` が root と違うディレクトリは `EXDEV` で止まる。`managed_root` は管理ディレクトリと root を開いたまま返し、clear はその descriptor を使う。読めない（owner の read が無い）ディレクトリは、空なら外し、空でなければ止まる（path で chmod し直さない）。
+- **L2（trash）**: clear は `install.lock` 以外を `.trash-<root名>-<ULID>` へ rename してから消す。rename の失敗は導入の失敗で、何も消さない。rename の後に trash を消し切れなくても導入は続け（別の device に当たった場合だけ失敗）、trash は残す。残った trash は同じ root の次の clear（lock の下）と、起動時の `adapters::sweep_trash`（その root の lock が待たずに取れた場合だけ）で消す。root そのものは rename しない（`install.lock` の inode が排他そのものなので）。
+- **L3（期待する親）**: `install_admitted` と `managed_root` は管理ディレクトリを引数で受け、`root.parent() == expected` を、何かを作る前に確かめる。
+- **L4・L5（緩めた試験）**: helper を殺した後の試験を `calls()==2` と「2 本目が Pending」に戻し、失敗時は理由を出す。「すぐ Failed」の原因は helper の 3 秒固定の承認待ちだった（混んだ全体実行で `installer_not_admitted` が 1 件余分に出て、導入が manager を動かす前に「a setup step exited with 1」で終わった）。待ちを 60 秒にし、承認の記録が別の process を子と名指ししているときだけ即座に諦める（`preparation::admission_step`）。restart の試験は、unsettled が空になった直後に古い子が死んでいることを確かめる。
+- **dry_run**: `env_sync` の dry_run は receipt の無い root を `would_install` と答える（本番の sync と同じ）。
+- spec §22.2 の削除の条件を、上に合わせて直した。
+
+残り: 上の 4 本目の残りと同じ。
+
+### S21 `workers sync` のレビュー修正（2026-11-17、6 本目: 覚える失敗を狭める）
+
+5 本目の M1 は覚える範囲が広すぎた（helper の exit 1 のすべて、phase を問わない時間切れ、helper の成功の後の I/O エラー）。次に狭めた。
+
+- helper は、導入そのものの失敗のときだけ専用の exit code 3（`preparation::INSTALL_FAILED_EXIT`）で終わる: manager のコマンドの失敗（`installation_command_failed`）、probe の不一致（`installed_version_mismatch`）、別の device（`installation_cleanup_other_device`。これまでは `installation_partial_cleanup` と同じ文字列だった）。分類は純粋関数 `preparation::install_exit`。それ以外は今までどおり exit 1。
+- `policy::install_itself_failed` が覚えるのは、その exit code と、phase が Running の時間切れだけ（`BuildEnd::TimedOut` が phase を持つ）。承認待ちの時間切れ、exit 1、helper の成功の後の `private_tool_root`・`detect` の失敗は覚えない。
+- spec §22.2 の覚える条件を、上に合わせて直した。
+
+残り: 上の 4 本目の残りと同じ。probe の出力が読めない（`probe_*`）・出力が長すぎる（`installer_output_limit`）は exit 1 のままで覚えない。Running の時間切れには `install.lock` を待つうちに切れた場合も入る。
+
+### S21 `doctor` への接続（2026-11-17、7 本目。main の取り込み後）
+
+main（S23 の doctor・upgrade、scope の統一、schema v11 など）を merge commit で取り込み、`doctor::command` が `doctor::run` の `diff` に渡す値を `None` から `workers diff` の比較に置き換えた（spec §22.2「`doctor` はこの結果を含む」）。
+
+- 答えた worker ごとに、`workers diff` と同じ経路（`workers::fetch_env` が登録済みの binary の `worker-service env` を ssh で尋ねる）で環境 report を取り、`envdiff::diff` の結果を check にする（`doctor::worker_diff`）。親の測定は 1 回だけで、worker が 1 台も答えなければ測らない。親を測る環境は `workers diff` と同じにした（常に保持した service の env。呼び出した shell の env では測らない。`doctor::measure_parent`）。
+- 項目から check への変換は純粋関数 `doctor::diff_checks`。id はどれも `environment_diff` で、項目ごとに 1 check（detail は `<項目>: <分類> parent=… worker=… -> <手順>`）。`same` は ok、`differs`・`missing`・`manual_required` は fail（利用者が手を動かさないと直らない差）、`auto_installable` は notice（exec の warm-up と `workers sync` が入れる。detail で `remote-task-runner workers sync <worker>` を案内）、`not_measured` も notice（「まだ測っていない」。`not_checked` にしない）。report を取れなかった worker（古い binary、壊れた応答、拒否）と親を測れなかった場合は、理由を添えた `not_checked` 1 つで、空の結果にも ok にもしない。worker から来た文字列は制御文字を除く。
+- ssh で答えなかった worker には環境を尋ね直さない（`reachable` が既に fail を出している。2 回目の待ちを作らない）。`environment_diff` は `not_checked` として列挙する。
+- 試験: `src/service/doctor/tests.rs` の `environment_diff`（全分類、制御文字、取れなかった場合、偽の ssh 越しの差と一致、親を測れない場合、答えない worker）と、実 binary・偽 ssh の `tests/it/doctor.rs`（worker の platform が違う report を返すと `environment_diff` が fail になり、policy digest は notice で `not_checked` は 0）。差の無い親・worker の doctor が exit 0 になること（`a_registered_worker_with_nothing_to_fix_keeps_the_exit_at_zero`）と、親を保持した env で測ること（`the_parent_is_measured_in_the_retained_environment_as_workers_diff_does`）も固定した。
+
+S21 で終わったもの: `workers diff`（1 本目）、`workers sync` の計画・blocked・導入と warm-up（2〜6 本目）、`doctor` への接続（この節）。
+
+S21 の残り（必須。S21 は完了していない）:
+1. policy digest（task-traffic-controller の実効 policy）を `envreport::collect` が測らない（常に `None`）。diff は `not_measured`、doctor は notice（exit に影響しない）になる。測るようにするのは残り。doctor 自身の `traffic_policy` は host ごとの 2 つの scope を比べるだけで、親と worker の間は比べていない。
+2. （解消）doctor の区分は決定済み: fail は `differs`・`missing`・`manual_required` と disk 不足、notice は `auto_installable` と `not_measured`、`not_checked` は到達できなかった worker と親を測れなかった場合。
+3. doctor（`worker-service doctor`）は journal に記録した service の env で事実を集め、diff（`worker-service env`）は worker.json の env で測る。読む場所が 2 つあり、doctor 側は `XDG_CONFIG_HOME`・`XDG_STATE_HOME` を除く。2 つが同じ測定になることは確かめていない。
+4. （解消）親は doctor も `workers diff` も保持した service の env で測る。呼び出した shell の env には落とさない保持された env が無い（PATH が無い）と `workers diff` は測定を拒否し、doctor も同じ理由で「親の環境を測れない」の `not_checked` にする（`tests/it/doctor.rs` の `without_a_retained_service_environment_...`）。
+5. doctor は worker ごとに ssh を 3 回（doctor・hello・env）直列で行う。`diff` の worker 省略時の並列化と合わせて未着手。
+6. 3 本目の節の残り 2〜4 と 6、4〜6 本目の節の残り（上の各節）。`--project` は workflow の `setup-*` 入力を読まない。`installed_inventory` の所要時間は未計測。
+7. 実機での受入（A44 の native 検証、S26）。
+
 ### S9a/S10 追補: worker と task-traffic-controller CLI の scope 統一（2026-11-17）
 
 worker は自分専用の scope（`<state>/traffic`）を使っていて、同じ host の CLI（`$XDG_STATE_HOME/task-traffic-controller`、無ければ `~/.local/state/task-traffic-controller`）と別の ledger・budget になっていた（仕様 §14 の「同じ ledger・lock・lease」「nested にも同じ scope」と §18 の「既存の scope を検出して同じ budget を使う」に反する）。CPU を二重に使い、step の中の `task-traffic-controller exec` は自分の run を見つけられず別 job として gate されていた。
@@ -1226,14 +1341,14 @@ S23 の残り（必須。この変更で S23 は完了しない）:
 | `service_profile` | service の環境で worker profile を load し、起動時と同じ probe を通す | load できない |
 | `reachable`・`service`・`version`・`bridge`（worker のみ） | ssh で helper が答えるか、service が loaded / ready か、版が親と同じか、登録済み binary 経由の `hello` が同じ cluster と worker_id で完了するか（必須 feature の交渉を含む） | 到達不能・別 identity の答え・未 load・切替が未完または commit 待ち・hello 失敗。版の違いと drain 中は notice。host が切替中（`switch_running`）なら `service` は `not_checked` |
 | `legacy_config`（project） | 実行した directory の project の `.local-ci.toml` に、値のある未対応 key（`link-node-modules` など）があれば notice | fail にしない。config を解決できなければ `not_checked` |
-| `environment_diff`（worker ごと） | S21（`workers diff`）の差し込み口。`doctor::run` の `diff` 引数に worker 名から check を返す関数を渡すと、その結果が入る | この build では `not_checked` として列挙する |
+| `environment_diff`（worker ごと） | S21（`workers diff`）の結果。答えた worker ごとに `worker-service env` を尋ね、親との差を項目ごとに 1 check で載せる（上の「S21 `doctor` への接続」） | `differs`・`missing`・`manual_required` の項目。`auto_installable` と `not_measured` は notice（exit に影響しない）。比べられなかった worker は `not_checked` |
 
 受入項目との対応: A05 のうち「未修正 binary を doctor が不適合とする」を、偽の `task-traffic-controller`（`ledger_format` を出さない `status --json`）で、library と実 binary の両方で試験した。A36 のうち S23 の分は、旧い形の `status --json` をそのまま読めること（読めたうえで不適合と判定する）である。
 
 S23 の残り（必須。この変更でも S23 は完了しない）:
 1. **A05 の「同じ budget・policy を共有」は、現状の既定では成り立っていない。** worker の supervisor は `<state>/traffic` を scope にしており（`AgentConfig::new`。設定項目は無い）、同じ user の `task-traffic-controller` command の scope（`~/.local/state/task-traffic-controller`）とは別の ledger になる。doctor はこれを、command が導入済みの host では `traffic_state_path` の fail として報告する（command を日常的に使う host では doctor が必ず fail する）。scope を揃える変更は S9a / S10 の範囲で、ここでは行っていない。A05 はそれが決まるまで未達である。
 2. 「実行中 process」の検査（仕様の既存 state との互換の節）は未実装で、`traffic_processes` を `not_checked` として出す（process の走査はしていない）。command を導入した host では doctor は exit 0 にならない。
-3. S21 の `workers diff` の結果は差し込み口のみ（`not_checked`）。S21 が main に入ったあと、`doctor::command` が `run` に渡す `diff` を `None` から置き換える。それまで、worker を登録した親では doctor は exit 0 にならない（exit 1。`fail` があれば BLOCKED）。
+3. S21 の `workers diff` の結果は接続済み（上の「S21 `doctor` への接続」）。policy digest を親も worker も測らないが notice なので、差の無い親は worker を登録しても exit 0 になる（`fail` があれば BLOCKED、`not_checked` があれば exit 1）。
 4. Linux の linger の確認（仕様 §15）と、system-user mode（LaunchDaemon の `UserName`）の service user での profile 検査は未実装（S24・S22 の残り）。前者は report に項目として出していない。
 5. 本物の docker・実 SSH・実機の launchd 環境での doctor（A35 の「実際の service 環境で doctor が通る」）は未実施（S26）。偽の runner と偽の ssh は実挙動を確かめない。
 6. 親の local worker の service 環境は、`coordinator.json` の env が空のとき呼び出し shell の env で代用する（notice を出す）。

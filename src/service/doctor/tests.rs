@@ -697,6 +697,8 @@ struct FakeRemote {
     hosts: BTreeMap<String, Option<(String, HostFacts, Status)>>,
     bridge_fails: bool,
     bridge_worker: Option<String>,
+    /// What a reachable host prints for `worker-service env`.
+    env_answer: String,
     shells: Vec<String>,
 }
 impl Remote for FakeRemote {
@@ -717,6 +719,7 @@ impl Remote for FakeRemote {
             .expect("a known destination");
         Ok(match host {
             None => out(255, ""),
+            Some(_) if shell.ends_with("'worker-service' 'env'") => out(0, &self.env_answer),
             Some((_, facts, status)) => out(0, &answer_line(status, facts)),
         })
     }
@@ -790,6 +793,7 @@ impl World {
                 hosts,
                 bridge_fails: false,
                 bridge_worker: None,
+                env_answer: String::new(),
                 shells: vec![],
             },
             runner: FakeRunner::default(),
@@ -1237,4 +1241,292 @@ fn running_processes_of_the_command_are_said_to_be_unexamined() {
     let checks = evaluate("mini-a", &facts);
     assert_eq!(level(&checks, "traffic_processes"), Level::Ok);
     assert!(detail(&checks, "traffic_processes").contains("none of its jobs can be running"));
+}
+
+mod environment_diff {
+    use super::*;
+    use crate::toolchain::envdiff::{Class, Docker, EnvReport, Item, Observed, ToolFact};
+
+    fn item(subject: &str, class: Class) -> Item {
+        Item {
+            subject: subject.into(),
+            class,
+            parent: Some("22.1.0".into()),
+            worker: None,
+            steps: (class != Class::Same).then(|| "do this".to_string()),
+        }
+    }
+
+    fn environment(node: &str) -> EnvReport {
+        EnvReport {
+            schema_version: envdiff::SCHEMA,
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            tools: BTreeMap::from([(
+                "node".to_string(),
+                ToolFact {
+                    observed: Observed::Available,
+                    version: Some(node.into()),
+                    managed: None,
+                },
+            )]),
+            helpers: BTreeMap::new(),
+            docker: Docker::NotRunnable,
+            disk_free_bytes: Some(envdiff::MIN_DISK_BYTES),
+            profile: "default".into(),
+            required_tools: vec![],
+            profile_digest: None,
+            policy_digest: Some("sha256:t".into()),
+        }
+    }
+
+    fn answer(report: &EnvReport) -> String {
+        serde_json::json!({"ok": true, "env": report}).to_string()
+    }
+
+    #[test]
+    fn every_class_becomes_one_check_and_only_what_a_person_must_fix_fails() {
+        let items = [
+            item("platform", Class::Same),
+            item("node", Class::Differs),
+            item("ruby", Class::Missing),
+            item("flutter", Class::AutoInstallable),
+            item("xcode", Class::ManualRequired),
+            item("policy_digest", Class::NotMeasured),
+        ];
+        let checks = diff_checks("mini-a", Ok(&items));
+        assert!(checks
+            .iter()
+            .all(|c| c.host == "mini-a" && c.id == "environment_diff"));
+        let levels: Vec<_> = checks.iter().map(|c| c.level).collect();
+        assert_eq!(
+            levels,
+            [
+                Level::Ok,
+                Level::Fail,
+                Level::Fail,
+                Level::Notice,
+                Level::Fail,
+                Level::Notice
+            ]
+        );
+        assert_eq!(checks[0].detail, "platform: same parent=22.1.0 worker=-");
+        assert_eq!(
+            checks[3].detail,
+            "flutter: auto_installable parent=22.1.0 worker=- -> do this (an exec installs it; `remote-task-runner workers sync mini-a` installs it now)"
+        );
+        assert_eq!(
+            checks[5].detail,
+            "policy_digest: not_measured parent=22.1.0 worker=- -> do this (not measured yet)"
+        );
+    }
+
+    #[test]
+    fn a_registered_worker_with_nothing_to_fix_keeps_the_exit_at_zero() {
+        let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
+        // No separate task-traffic-controller on the worker: nothing else is left out.
+        let (_, facts, _) = w
+            .remote
+            .hosts
+            .get_mut("ci@mini-a.local")
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        facts.cli = None;
+        facts.cli_scope.in_use = false;
+        let mut source = |host: &str| {
+            diff_checks(
+                host,
+                Ok(&[
+                    item("platform", Class::Same),
+                    item("flutter", Class::AutoInstallable),
+                    item("policy_digest", Class::NotMeasured),
+                ]),
+            )
+        };
+        let report = run(
+            &mut w.remote,
+            &mut w.runner,
+            &w.host.env,
+            &w.spec,
+            &w.version,
+            Some(&mut source),
+        )
+        .unwrap();
+        let left: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|c| c.level == Level::NotChecked)
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        assert!(report.problem().is_none(), "{:?}", report.problem());
+        // The same list with something a person must fix does fail.
+        let mut source = |host: &str| diff_checks(host, Ok(&[item("node", Class::Missing)]));
+        let report = run(
+            &mut w.remote,
+            &mut w.runner,
+            &w.host.env,
+            &w.spec,
+            &w.version,
+            Some(&mut source),
+        )
+        .unwrap();
+        assert!(report.problem().is_some());
+    }
+
+    #[test]
+    fn the_parent_is_measured_in_the_retained_environment_as_workers_diff_does() {
+        let w = World::new(&[]);
+        let mut seen = None;
+        let result = measure_parent(&w.spec, |state, env| {
+            seen = Some((state.to_path_buf(), env.clone()));
+            Err("no profile".into())
+        });
+        assert_eq!(result.unwrap_err(), "no profile");
+        assert_eq!(
+            seen,
+            Some((w.spec.worker_state_dir.clone(), w.spec.env.clone()))
+        );
+    }
+
+    #[test]
+    fn what_the_worker_reported_cannot_rewrite_the_terminal() {
+        let mut one = item("node", Class::Differs);
+        one.worker = Some("20\u{1b}[2J\n[ok] parent".into());
+        let checks = diff_checks("mini-a", Ok(&[one]));
+        assert_eq!(
+            checks[0].detail,
+            "node: differs parent=22.1.0 worker=20[2J[ok] parent -> do this"
+        );
+        let refused = diff_checks("mini-a", Err("refused\u{7}\nnow"));
+        assert_eq!(
+            refused[0].detail,
+            "the environments were not compared: refusednow"
+        );
+    }
+
+    #[test]
+    fn a_difference_that_was_not_taken_is_never_an_empty_list_or_a_pass() {
+        for measured in [Err("no answer"), Ok(&[][..])] {
+            let checks = diff_checks("mini-a", measured);
+            assert_eq!(checks.len(), 1, "{measured:?}");
+            assert_eq!(checks[0].level, Level::NotChecked);
+            assert_eq!(
+                (checks[0].host.as_str(), checks[0].id.as_str()),
+                ("mini-a", "environment_diff")
+            );
+        }
+        assert_eq!(
+            diff_checks("mini-a", Err("no answer"))[0].detail,
+            "the environments were not compared: no answer"
+        );
+        assert_eq!(
+            diff_checks("mini-a", Ok(&[]))[0].detail,
+            "the environments were not compared: the comparison listed nothing"
+        );
+    }
+
+    #[test]
+    fn the_worker_is_asked_for_its_environment_and_the_difference_is_listed() {
+        let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
+        let exe = w.host.home.join("rtr");
+        fs::write(&exe, "binary").unwrap();
+        let parent = environment("22.1.0");
+        w.remote.env_answer = answer(&environment("20.0.0"));
+        let checks = worker_diff(&mut w.remote, &w.host.env, &exe, Ok(&parent), "mini-a");
+        assert_eq!(
+            w.remote.shells,
+            ["exec '/w/bin/current/remote-task-runner' 'worker-service' 'env'"]
+        );
+        let subject = |name: &str| {
+            let found: Vec<_> = checks
+                .iter()
+                .filter(|c| c.detail.starts_with(&format!("{name}: ")))
+                .collect();
+            assert_eq!(found.len(), 1, "{name}: {checks:?}");
+            found[0]
+        };
+        assert_eq!(subject("platform").level, Level::Ok);
+        let node = subject("node");
+        assert_eq!(node.level, Level::Fail);
+        assert!(
+            node.detail
+                .starts_with("node: differs parent=22.1.0 worker=20.0.0 -> "),
+            "{}",
+            node.detail
+        );
+        // The same environment on both sides: nothing fails.
+        w.remote.env_answer = answer(&parent);
+        let same = worker_diff(&mut w.remote, &w.host.env, &exe, Ok(&parent), "mini-a");
+        assert!(same.len() > 1);
+        assert!(same.iter().all(|c| c.level == Level::Ok), "{same:?}");
+    }
+
+    #[test]
+    fn a_worker_that_gives_no_report_is_listed_as_not_compared() {
+        let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
+        let exe = w.host.home.join("rtr");
+        fs::write(&exe, "binary").unwrap();
+        let parent = environment("22.1.0");
+        // A binary that predates the action prints nothing.
+        let checks = worker_diff(&mut w.remote, &w.host.env, &exe, Ok(&parent), "mini-a");
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::NotChecked);
+        assert!(
+            checks[0].detail.starts_with(
+                "the environments were not compared: the worker's binary gave no environment report"
+            ),
+            "{}",
+            checks[0].detail
+        );
+    }
+
+    #[test]
+    fn without_the_parent_s_measurement_no_worker_is_asked() {
+        let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
+        let exe = w.host.home.join("rtr");
+        let checks = worker_diff(
+            &mut w.remote,
+            &w.host.env,
+            &exe,
+            Err("profile unreadable"),
+            "mini-a",
+        );
+        assert!(w.remote.shells.is_empty());
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].level, Level::NotChecked);
+        assert_eq!(
+            checks[0].detail,
+            "the environments were not compared: the parent's environment could not be measured (profile unreadable)"
+        );
+    }
+
+    #[test]
+    fn a_worker_that_did_not_answer_is_not_asked_for_its_environment_again() {
+        let mut w = World::new(&[
+            ("mini-a", "ci@mini-a.local", true),
+            ("mini-b", "ci@mini-b.local", true),
+        ]);
+        *w.remote.hosts.get_mut("ci@mini-b.local").unwrap() = None;
+        let mut asked = Vec::new();
+        let mut source = |host: &str| {
+            asked.push(host.to_string());
+            diff_checks(host, Ok(&[item("platform", Class::Same)]))
+        };
+        let report = run(
+            &mut w.remote,
+            &mut w.runner,
+            &w.host.env,
+            &w.spec,
+            &w.version,
+            Some(&mut source),
+        )
+        .unwrap();
+        assert_eq!(asked, ["mini-a"]);
+        assert_eq!(of(&report, "mini-a", "environment_diff").level, Level::Ok);
+        let unreachable = of(&report, "mini-b", "environment_diff");
+        assert_eq!(unreachable.level, Level::NotChecked);
+        assert!(unreachable.detail.starts_with("the worker did not answer"));
+        assert_eq!(of(&report, "mini-b", "reachable").level, Level::Fail);
+    }
 }

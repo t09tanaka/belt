@@ -154,6 +154,11 @@ impl Coordinator {
                         inspect.capabilities.as_ref(),
                         bundle.filter(|_| bundle_valid),
                     );
+                    unmet = crate::toolchain::envdiff::with_steps(
+                        unmet,
+                        &query.requirements.requires,
+                        inspect.capabilities.as_ref(),
+                    );
                     if !bundle_valid {
                         unmet.push("stored frozen toolchains are not proven eligible on this worker".into());
                     }
