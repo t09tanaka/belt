@@ -586,7 +586,7 @@ fn components(rel: &str) -> Vec<&str> {
 /// A regular file of the workspace, read through descriptors: its bytes and
 /// mode. A symlink at any component, a directory, a device or a pipe is
 /// refused, whatever it was when the files were listed.
-fn read_nofollow(root: &File, rel: &str) -> Result<(Vec<u8>, u32)> {
+fn read_nofollow(root: &File, rel: &str) -> Result<(Vec<u8>, fs::Metadata)> {
     let comps = components(rel);
     let (name, dirs) = comps.split_last().context("no file named")?;
     let dir = open_dirs(root, dirs, false, rel)?;
@@ -604,7 +604,7 @@ fn read_nofollow(root: &File, rel: &str) -> Result<(Vec<u8>, u32)> {
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     f.read_to_end(&mut bytes)
         .with_context(|| format!("read `{rel}`"))?;
-    Ok((bytes, meta.permissions().mode()))
+    Ok((bytes, meta))
 }
 
 /// Write `bytes` as `name` of `dir`: into a temp file made new, under a name
@@ -677,10 +677,28 @@ pub fn upload(
     ws: &Path,
     with: &[(String, String)],
 ) -> Result<String, String> {
-    upload_inner(area, who, ws, with).map_err(|e| format!("{e:#}"))
+    upload_checked(area, who, ws, with, |_, _, _| Ok(()))
 }
 
-fn upload_inner(area: &Area, who: &Who, ws: &Path, with: &[(String, String)]) -> Result<String> {
+/// Upload with a host policy applied to the exact opened file and bytes,
+/// before they are written into the artifact area. An error aborts publication.
+pub fn upload_checked(
+    area: &Area,
+    who: &Who,
+    ws: &Path,
+    with: &[(String, String)],
+    check: impl FnMut(&str, &fs::Metadata, &[u8]) -> Result<(), String>,
+) -> Result<String, String> {
+    upload_inner(area, who, ws, with, check).map_err(|e| format!("{e:#}"))
+}
+
+fn upload_inner(
+    area: &Area,
+    who: &Who,
+    ws: &Path,
+    with: &[(String, String)],
+    mut check: impl FnMut(&str, &fs::Metadata, &[u8]) -> Result<(), String>,
+) -> Result<String> {
     artifact::validate_run(Kind::Upload, with).map_err(|e| anyhow!(e))?;
     let get = |k: &str| {
         with.iter()
@@ -753,7 +771,9 @@ fn upload_inner(area: &Area, who: &Who, ws: &Path, with: &[(String, String)]) ->
     let mut files = Vec::new();
     for (src, stored) in artifact::stored_paths(&lines, &selected) {
         // one read: what is hashed is what is stored
-        let (bytes, mode) = read_nofollow(&root, &src)?;
+        let (bytes, meta) = read_nofollow(&root, &src)?;
+        check(&src, &meta, &bytes).map_err(anyhow::Error::msg)?;
+        let mode = meta.permissions().mode();
         let to = vdir.join("files").join(&stored);
         fs::create_dir_all(to.parent().expect("a file has a parent"))?;
         write_atomic(&to, &bytes, mode & 0o555)?;
@@ -913,7 +933,7 @@ mod tests {
         let r = root(&ws);
         let (bytes, mode) = read_nofollow(&r, "d/f").unwrap();
         assert_eq!(bytes, b"data");
-        assert_eq!(mode & 0o200, 0o200);
+        assert_eq!(mode.permissions().mode() & 0o200, 0o200);
         let e = read_nofollow(&r, "d/leaf").unwrap_err().to_string();
         assert!(e.contains("symlink `leaf`"), "{e}");
         let e = read_nofollow(&r, "mid/secret").unwrap_err().to_string();
