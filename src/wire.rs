@@ -1631,6 +1631,8 @@ pub struct EnvReportResponse {
     pub arch: String,
     pub profile_fingerprint: Digest,
     pub tools: Vec<ToolStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::toolchain::envdiff::EnvReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2425,6 +2427,7 @@ mod tests {
                 os: "macos".into(),
                 arch: "aarch64".into(),
                 profile_fingerprint: dg("p"),
+                environment: None,
                 tools: vec![ToolStatus {
                     name: "node".into(),
                     required: "22".into(),

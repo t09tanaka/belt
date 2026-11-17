@@ -337,8 +337,13 @@ impl WorkerLink for ClientLink {
 
     fn read_only_call(&self, request: Request) -> LinkFuture<'_> {
         Box::pin(async move {
+            let timeout = if matches!(request, Request::EnvReport(_)) {
+                Duration::from_secs(60)
+            } else {
+                self.timeout
+            };
             self.client
-                .call(request, self.timeout)
+                .call(request, timeout)
                 .await
                 .map_err(|e| match e {
                     CallError::Remote(e) => LinkError::Remote(e),

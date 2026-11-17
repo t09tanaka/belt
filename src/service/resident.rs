@@ -54,6 +54,9 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    EnvReport {
+        worker: WorkerId,
+    },
     ResolveToolchains {
         bundle: crate::toolchain::contract::FrozenBundle,
         requirements: crate::toolchain::capability::ExecutionRequirements,
@@ -129,6 +132,9 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
+    EnvReport {
+        environment: crate::toolchain::envdiff::EnvReport,
+    },
     ResolvedToolchains {
         bundle: crate::toolchain::contract::FrozenBundle,
     },
@@ -320,6 +326,8 @@ impl Client {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "parent connect timeout"))??;
         let response_timeout = if matches!(&operation, Operation::SubmitCaptured { .. }) {
             Duration::from_secs(300)
+        } else if matches!(&operation, Operation::EnvReport { .. }) {
+            Duration::from_secs(65)
         } else {
             IO_TIMEOUT
         };
@@ -1253,6 +1261,17 @@ async fn handle(
         };
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
+    if let Operation::EnvReport { worker } = request.operation {
+        let mut stopping = stop.subscribe();
+        let reply = tokio::select! {
+            _ = stopping.changed() => Reply::Stopping,
+            result = coordinator.env_report(&worker) => match result {
+                Ok(environment) => Reply::EnvReport { environment },
+                Err(error) => Reply::ControlError { error },
+            }
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     if let Operation::EnvSync {
         worker,
         sync_id,
@@ -1619,6 +1638,7 @@ async fn handle(
             Operation::Query { .. }
             | Operation::Estimate { .. }
             | Operation::EstimateTask { .. }
+            | Operation::EnvReport { .. }
             | Operation::EnvSync { .. }
             | Operation::ResolveToolchains { .. } => {
                 unreachable!("read handled before admission")

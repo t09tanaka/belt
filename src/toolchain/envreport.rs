@@ -198,10 +198,27 @@ fn collect_with(
     docker_timeout: Duration,
 ) -> Result<EnvReport, String> {
     let profile = Profile::load(state, env)?;
+    Ok(measure(state, &profile, env, docker_timeout))
+}
+
+pub(crate) fn collect_profile(
+    state: &Path,
+    profile: &Profile,
+    env: &BTreeMap<String, String>,
+) -> EnvReport {
+    measure(state, profile, env, DOCKER_TIMEOUT)
+}
+
+fn measure(
+    state: &Path,
+    profile: &Profile,
+    env: &BTreeMap<String, String>,
+    docker_timeout: Duration,
+) -> EnvReport {
     let report = profile.startup_report();
     // No private tool root: no adapters, which is a fact and not an error.
     let managed = if state.join("toolchains").is_dir() {
-        Registry::load(state, &profile, report.profile_fingerprint.clone())
+        Registry::load(state, profile, report.profile_fingerprint.clone())
             .map(|r| r.installed_inventory())
             .unwrap_or_default()
     } else {
@@ -235,8 +252,8 @@ fn collect_with(
         "remote-task-runner".to_string(),
         Some(env!("CARGO_PKG_VERSION").to_string()),
     )]);
-    let docker = docker_state(profile.path_dirs(), &profile, env, docker_timeout);
-    Ok(EnvReport {
+    let docker = docker_state(profile.path_dirs(), profile, env, docker_timeout);
+    EnvReport {
         schema_version: SCHEMA,
         os: report.os,
         arch: report.arch,
@@ -249,7 +266,7 @@ fn collect_with(
         profile_digest: Some(report.profile_digest.to_string()),
         // No digest of the task-traffic-controller policy exists yet.
         policy_digest: None,
-    })
+    }
 }
 
 #[cfg(test)]

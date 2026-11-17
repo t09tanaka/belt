@@ -1115,7 +1115,10 @@ pub fn describe_forget(result: &ForgetResult) -> String {
             result.id
         ),
         1 => format!("forgot worker {}: {identity}; 1 attempt ended", result.id),
-        n => format!("forgot worker {}: {identity}; {n} attempts ended", result.id),
+        n => format!(
+            "forgot worker {}: {identity}; {n} attempts ended",
+            result.id
+        ),
     }
 }
 
@@ -1190,6 +1193,20 @@ pub fn fetch_env(
     check_name(name)?;
     let registration = registered(env, name)?
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no such worker is registered"))?;
+    if registration.ephemeral {
+        let spec = super::context::runtime_spec(env)?;
+        let worker = WorkerId::parse(name)
+            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+        return match resident_request(&spec, super::resident::Operation::EnvReport { worker }) {
+            Ok(super::resident::Reply::EnvReport { environment }) => Ok(environment),
+            Ok(super::resident::Reply::ControlError { error }) => Err(error),
+            Ok(_) => Err(ApiError::new(
+                ErrorCode::ProtocolIncompatible,
+                "resident did not return the worker environment",
+            )),
+            Err(message) => Err(ApiError::new(ErrorCode::CommunicationUnknown, message)),
+        };
+    }
     let target = target_of(&registration.ssh)?;
     let digest = worker_service::sha256_file(exe)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;

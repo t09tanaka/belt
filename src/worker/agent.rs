@@ -54,6 +54,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod environment;
 mod warmup;
 
 /// What an agent is started with. Nothing is read from the process
@@ -2179,10 +2180,7 @@ impl Agent {
                 ))
             }
             Request::EnvSync(r) => self.env_sync(r).map(Response::EnvSync),
-            Request::EnvReport(_) => Err(ApiError::new(
-                ErrorCode::NotImplemented,
-                "this operation is not implemented by the worker agent yet",
-            )),
+            Request::EnvReport(r) => self.env_report(r).map(Response::EnvReport),
         }
     }
 
