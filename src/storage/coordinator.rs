@@ -32,10 +32,28 @@ mod queue;
 pub use collect::{Collectable, CollectionRow, ResultRef, RunStanding};
 pub use queue::{
     InputCursor, InputPage, LiveAttempt, LiveAttemptPage, PlaceInput, PlaceOutcome, QueuedTask,
-    RetireEnd, Seen, WorkerLoad,
+    RetireEnd, Seen, WorkerLoad, PAGE_MAX,
 };
 
 const ATTEMPT: &str = "attempt";
+
+const PLACEMENT_COLS: &str =
+    "placement_id, task_id, worker_id, attempt_id, demand_json, created_at_ms, acked_at_ms";
+
+fn placement_from_row(r: &rusqlite::Row<'_>) -> Result<Placement> {
+    Ok(Placement {
+        placement_id: to_u64(r.get(0)?)?,
+        task_id: id("task_id", TaskId::parse(&r.get::<_, String>(1)?))?,
+        worker_id: id("worker_id", WorkerId::parse(&r.get::<_, String>(2)?))?,
+        attempt_id: r
+            .get::<_, Option<String>>(3)?
+            .map(|a| id("attempt_id", AttemptId::parse(&a)))
+            .transpose()?,
+        demand: from_json("demand", &r.get::<_, String>(4)?)?,
+        created_at_ms: to_u64(r.get(5)?)?,
+        acked_at_ms: r.get::<_, Option<i64>>(6)?.map(to_u64).transpose()?,
+    })
+}
 
 fn id<T>(what: &str, r: std::result::Result<T, IdError>) -> Result<T> {
     r.map_err(|e| StorageError::Corrupt(format!("{what}: {e}")))
@@ -967,40 +985,44 @@ impl CoordinatorStore {
     /// The demand of placements no worker acknowledged yet. A placement
     /// leaves this list when its worker accepted the attempt, and also when
     /// the attempt ended or its retire was confirmed without that.
+    ///
+    /// Everything at once, in memory: for tests and diagnostics. The
+    /// coordinator walks [`Self::unacked_demand_page`] instead.
     pub fn unacked_demand(&self) -> Result<Vec<Placement>> {
         self.db.call(|c| {
-            let mut s = c.prepare(
-                "SELECT placement_id, task_id, worker_id, attempt_id, demand_json,
-                        created_at_ms, acked_at_ms
-                 FROM placement WHERE acked_at_ms IS NULL ORDER BY placement_id",
+            let mut s = c.prepare(&format!(
+                "SELECT {PLACEMENT_COLS} FROM placement
+                 WHERE acked_at_ms IS NULL ORDER BY placement_id"
+            ))?;
+            let rows = s.query_map([], |r| Ok(placement_from_row(r)))?;
+            rows.map(|row| row?).collect()
+        })
+    }
+
+    /// A page of [`Self::unacked_demand`] for one worker: its placements
+    /// after `after` (a `placement_id`; 0 starts), oldest first, at most
+    /// [`PAGE_MAX`] rows. Ids only grow, so passing the last id back yields
+    /// every placement that stays unacknowledged for the whole walk exactly
+    /// once; one acknowledged or made during the walk is yielded at most once.
+    pub fn unacked_demand_page(
+        &self,
+        worker_id: &WorkerId,
+        after: u64,
+        limit: u32,
+    ) -> Result<Vec<Placement>> {
+        let worker = worker_id.to_string();
+        let after = to_i64(after)?;
+        self.db.call(move |c| {
+            let mut s = c.prepare(&format!(
+                "SELECT {PLACEMENT_COLS} FROM placement
+                 WHERE worker_id = ?1 AND acked_at_ms IS NULL AND placement_id > ?2
+                 ORDER BY placement_id LIMIT ?3"
+            ))?;
+            let rows = s.query_map(
+                params![worker, after, i64::from(limit.min(PAGE_MAX))],
+                |r| Ok(placement_from_row(r)),
             )?;
-            let rows = s.query_map([], |r| {
-                Ok((
-                    r.get::<_, i64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                    r.get::<_, Option<String>>(3)?,
-                    r.get::<_, String>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, Option<i64>>(6)?,
-                ))
-            })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (pid, task, w, a, d, created, acked) = row?;
-                out.push(Placement {
-                    placement_id: to_u64(pid)?,
-                    task_id: id("task_id", TaskId::parse(&task))?,
-                    worker_id: id("worker_id", WorkerId::parse(&w))?,
-                    attempt_id: a
-                        .map(|a| id("attempt_id", AttemptId::parse(&a)))
-                        .transpose()?,
-                    demand: from_json("demand", &d)?,
-                    created_at_ms: to_u64(created)?,
-                    acked_at_ms: acked.map(to_u64).transpose()?,
-                });
-            }
-            Ok(out)
+            rows.map(|row| row?).collect()
         })
     }
 

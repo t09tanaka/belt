@@ -3044,3 +3044,75 @@ async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
         assert_eq!(cold.count(Op::Forecast), 0);
     }
 }
+
+// ------------------------------------------- more live attempts than a page
+
+/// The live attempts of a worker are walked a page at a time (64). With more
+/// than that, every one is still followed, and one that ends while the walk
+/// is under way neither hides another nor is settled twice.
+#[tokio::test]
+async fn a_worker_with_more_live_attempts_than_a_page_is_followed_completely() {
+    const MANY: usize = 150;
+    let mut f = fx();
+    f.cfg.limits = Limits {
+        max_active_task: MANY as u32,
+        prefetch_per_worker: 0,
+    };
+    let a = f.worker("w-a", (MANY as u32, 0));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, MANY).await;
+    // A tick places what fits in its time: a loaded machine takes several.
+    let mut placed = Vec::new();
+    for _ in 0..MANY {
+        placed.extend(c.tick().await.unwrap().placed);
+        if placed.len() == MANY {
+            break;
+        }
+    }
+    assert_eq!(placed.len(), MANY);
+    assert_eq!(a.holds().len(), MANY);
+
+    // Each of them is seen running, the ones of the later pages too. A tick
+    // that runs out of time leaves the rest for the next: tick until all are.
+    for id in &placed {
+        a.start(id);
+    }
+    let mut early = Vec::new();
+    for _ in 0..MANY {
+        early.extend(c.tick().await.unwrap().settled);
+        if tasks
+            .iter()
+            .all(|t| only(&c, t).state == AttemptState::Active)
+        {
+            break;
+        }
+    }
+    assert!(early.is_empty());
+    for task in &tasks {
+        assert_eq!(only(&c, task).state, AttemptState::Active);
+    }
+
+    // All end at once: each page read finds the earlier ones gone already.
+    // Every one is settled exactly once, in whatever tick reaches it.
+    for id in &placed {
+        a.finish(id, Outcome::Succeeded);
+    }
+    let mut settled = Vec::new();
+    for _ in 0..MANY {
+        settled.extend(c.tick().await.unwrap().settled);
+        if settled.len() >= MANY {
+            break;
+        }
+    }
+    assert_eq!(settled.len(), MANY, "settled twice or not at all");
+    let (settled, placed): (std::collections::HashSet<_>, std::collections::HashSet<_>) =
+        (settled.into_iter().collect(), placed.into_iter().collect());
+    assert_eq!(settled, placed);
+    assert!(c.tick().await.unwrap().settled.is_empty());
+    for task in &tasks {
+        assert_eq!(
+            only(&c, task).termination.unwrap().outcome(),
+            Outcome::Succeeded
+        );
+    }
+}

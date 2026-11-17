@@ -44,14 +44,14 @@ use crate::scheduler::decide::{self, Asked, Candidate, Decision, Excluded, Exclu
 use crate::scheduler::{self, Scheduler};
 use crate::state::{AttemptState, Observation, Outcome, Termination};
 use crate::storage::{
-    AttemptRecord, CoordinatorStore, LiveAttempt, PlaceInput, PlaceOutcome, Placement, QueuedTask,
-    RetireEnd, Seen, StorageError, WorkerLoad,
+    AttemptRecord, CoordinatorStore, InputCursor, LiveAttempt, LiveAttemptPage, PlaceInput,
+    PlaceOutcome, QueuedTask, RetireEnd, Seen, StorageError, WorkerLoad, PAGE_MAX,
 };
 use crate::wire::{
     payload_hash, ArtifactDecl, AttemptPayload, AttemptStatus, CancelAttemptRequest, CommandSpec,
     ForecastRequest, ForecastResponse, GetAttemptRequest, InspectRequest, InspectResponse,
     RenewLeaseRequest, Request, Response, RetireAttemptRequest, RetireStatus, SchemaVersion,
-    SubmitAttemptRequest,
+    SubmitAttemptRequest, WorkloadPlan,
 };
 use link::Budgeted;
 use policy::{Answer, Ended, Facts, Limits, Refusal, RetireVerdict, Step};
@@ -526,13 +526,43 @@ impl Coordinator {
             workers.remove(worker_id);
         }
         let _actor = self.actor.lock().await;
-        let w = worker_id.clone();
-        let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
-        for l in live {
-            self.observe(&l.record.attempt_id, Observation::Unknown)
-                .await?;
-        }
+        self.unknown_all(worker_id).await?;
         Ok(())
+    }
+
+    /// Every live attempt of a detached worker is `unknown`. The caller holds
+    /// the actor, so no tick places on the worker while its attempts are
+    /// walked, and the walk holds one page of them at a time.
+    async fn unknown_all(&self, worker_id: &WorkerId) -> Result<()> {
+        let mut after = None;
+        loop {
+            let page = self.live_page(worker_id, after).await?;
+            let Some((last, _)) = page.last() else {
+                return Ok(());
+            };
+            after = Some(*last);
+            let last_page = page.len() < PAGE_MAX as usize;
+            for (_, l) in page {
+                self.observe(&l.record.attempt_id, Observation::Unknown)
+                    .await?;
+            }
+            if last_page {
+                return Ok(());
+            }
+        }
+    }
+
+    /// The next page of a worker's live attempts (at most
+    /// [`PAGE_MAX`](crate::storage::PAGE_MAX)): what a walk over them holds
+    /// in memory, however many the worker has.
+    async fn live_page(
+        &self,
+        worker_id: &WorkerId,
+        after: Option<InputCursor>,
+    ) -> Result<LiveAttemptPage> {
+        let w = worker_id.clone();
+        self.db(move |s| s.live_attempt_page(&w, after, PAGE_MAX))
+            .await
     }
 
     /// Disconnect only the installed session. Late cleanup must never remove
@@ -554,12 +584,7 @@ impl Coordinator {
             }
             workers.remove(worker_id);
         }
-        let w = worker_id.clone();
-        let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
-        for l in live {
-            self.observe(&l.record.attempt_id, Observation::Unknown)
-                .await?;
-        }
+        self.unknown_all(worker_id).await?;
         Ok(true)
     }
 
@@ -755,19 +780,32 @@ impl Coordinator {
                 }
             }
         }
-        let w = worker_id.clone();
-        let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
-        let Some(inspected) = inspected else {
-            for l in live {
-                self.unknown(&l.record.attempt_id, &mut report).await?;
+        // The worker's live attempts, one page in memory at a time. The tick
+        // holds the actor, and it places on this worker only after this walk.
+        let mut after = None;
+        loop {
+            let page = self.live_page(&worker_id, after).await?;
+            let Some((last, _)) = page.last() else { break };
+            after = Some(*last);
+            // A short page is the end: the cursor is stable, so a row that
+            // would arrive behind it is not part of this walk either way.
+            let last_page = page.len() < PAGE_MAX as usize;
+            for (_, l) in page {
+                if inspected.is_none() {
+                    self.unknown(&l.record.attempt_id, &mut report).await?;
+                    continue;
+                }
+                // Another worker may have said that this coordinator is replaced.
+                self.check_fenced()?;
+                self.drive(&budgeted, l, &mut report).await?;
             }
+            if last_page {
+                break;
+            }
+        }
+        let Some(inspected) = inspected else {
             return Ok((None, report));
         };
-        for l in live {
-            // Another worker may have said that this coordinator is replaced.
-            self.check_fenced()?;
-            self.drive(&budgeted, l, &mut report).await?;
-        }
         if Instant::now() >= deadline {
             // It used up its time: nothing new goes there in this tick.
             return Ok((None, report));
@@ -1349,7 +1387,7 @@ impl Coordinator {
         attempt_id: &AttemptId,
         spec: &TaskSpec,
         costs: &decide::Costs,
-        unacked: &[Placement],
+        pending: Vec<WorkloadPlan>,
     ) -> Forecast {
         let request = Request::Forecast(ForecastRequest {
             schema_version: SchemaVersion::CURRENT,
@@ -1361,7 +1399,7 @@ impl Coordinator {
                 &spec.commands,
                 decide::ready_delay_ms(costs),
             ),
-            pending: scheduler::pending_of(unacked, &worker.worker_id),
+            pending,
         });
         let wait = Duration::from_millis(self.sched.cfg.forecast_wait_ms);
         // The age of the answer counts from before the question left.
@@ -1456,14 +1494,18 @@ impl Coordinator {
         loop {
             // Who has room, counted from the parent's own record.
             let ids: Vec<WorkerId> = round.open.iter().map(|w| w.worker_id.clone()).collect();
-            let (loads, unacked) = self
+            // Of the unacknowledged placements only the plans a question may
+            // carry are kept, per worker; their demand stays in the store.
+            let (loads, pending) = self
                 .db(move |s| {
                     let mut loads: BTreeMap<WorkerId, WorkerLoad> = BTreeMap::new();
+                    let mut pending: BTreeMap<WorkerId, Vec<WorkloadPlan>> = BTreeMap::new();
                     for w in ids {
                         let load = s.worker_load(&w)?;
+                        pending.insert(w.clone(), scheduler::pending_plans(s, &w)?);
                         loads.insert(w, load);
                     }
-                    Ok((loads, s.unacked_demand()?))
+                    Ok((loads, pending))
                 })
                 .await?;
             let full: Vec<WorkerId> = round
@@ -1548,7 +1590,8 @@ impl Coordinator {
                 .iter()
                 .zip(&costs)
                 .map(|(w, c)| {
-                    Box::pin(self.forecast(w, &attempt_id, &spec, c, &unacked))
+                    let pending = pending.get(&w.worker_id).cloned().unwrap_or_default();
+                    Box::pin(self.forecast(w, &attempt_id, &spec, c, pending))
                         as Pin<Box<dyn Future<Output = Forecast> + Send + '_>>
                 })
                 .collect();
@@ -1831,12 +1874,8 @@ impl Coordinator {
         attempt_id: &AttemptId,
         report: &mut TickReport,
     ) -> Result<Sent> {
-        let w = worker_id.clone();
-        let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
-        let Some(placed) = live
-            .into_iter()
-            .find(|l| &l.record.attempt_id == attempt_id)
-        else {
+        let (w, a) = (worker_id.clone(), attempt_id.clone());
+        let Some(placed) = self.db(move |s| s.live_attempt(&w, &a)).await? else {
             return Ok(Sent::NotTaken);
         };
         let facts = Facts {
@@ -1917,5 +1956,7 @@ fn demand_of(
     Ok((hash, json!({ "payload": stored })))
 }
 
+#[cfg(test)]
+mod paging_tests;
 #[cfg(test)]
 mod tests;

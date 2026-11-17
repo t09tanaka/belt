@@ -17,6 +17,8 @@ mod coordinator;
 pub use coordinator::query;
 mod db;
 mod lock;
+#[cfg(test)]
+mod paging_tests;
 pub mod policy;
 mod schema;
 #[cfg(test)]
@@ -28,7 +30,7 @@ pub use coordinator::{
     ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, InputCursor,
     InputPage, LiveAttempt, LiveAttemptPage, NewAttempt, Permit, PlaceInput, PlaceOutcome,
     Placement, PreparedRetry, QueuedTask, ResultRef, RetireEnd, RetryPreparation, RunStanding,
-    Seen, WorkerLoad,
+    Seen, WorkerLoad, PAGE_MAX,
 };
 pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
 pub use db::Db;

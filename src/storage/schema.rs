@@ -336,6 +336,10 @@ CREATE INDEX attempt_task_key ON attempt(task_id,attempt_id);"#.to_string(),
             r#"CREATE INDEX event_task_waiting ON event(json_extract(payload_json,'$.task'),seq DESC) WHERE kind='task_waiting';
 INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');"#.to_string(),
             "INSERT INTO schema_meta(key,value) VALUES('frozen_toolchains_v1','1');".into(),
+            // Bounded reads: the paged walks seek instead of scanning a
+            // worker's whole history. Performance only; it adds no feature
+            // marker, the version bump alone makes an older binary refuse.
+            "CREATE INDEX placement_unacked ON placement(worker_id,placement_id) WHERE acked_at_ms IS NULL;\nCREATE INDEX attempt_worker_live ON attempt(worker_id,created_at_ms) WHERE state <> 'terminal' AND retired=0;".into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.
