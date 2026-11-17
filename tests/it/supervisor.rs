@@ -106,6 +106,7 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
         mask: Default::default(),
         artifacts: None,
         prepared_only: false,
+        ci: None,
     };
     Fx {
         strays: Default::default(),

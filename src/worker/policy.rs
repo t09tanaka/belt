@@ -53,7 +53,9 @@ fn has_nul(s: &str) -> bool {
 /// often this worker's supervisors look at the lease; a lease that is not
 /// longer could never be seen valid.
 pub fn check_payload(p: &AttemptPayload, poll_ms: u64) -> Result<(), &'static str> {
-    if p.commands.is_empty() {
+    // A CI task has no command of its own: its steps are in the plan.
+    super::ci_task::check_payload(p)?;
+    if p.commands.is_empty() && p.ci_task.is_none() {
         return Err("the attempt has no command");
     }
     if p.commands.len() > MAX_COMMANDS {
@@ -615,6 +617,7 @@ mod tests {
     fn payload() -> AttemptPayload {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
+            ci_task: None,
             toolchains: None,
             outputs: Vec::new(),
             requirements: Default::default(),

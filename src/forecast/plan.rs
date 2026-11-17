@@ -876,6 +876,7 @@ mod tests {
     fn payload_of(commands: Vec<CommandSpec>) -> AttemptPayload {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
+            ci_task: None,
             toolchains: None,
             outputs: Vec::new(),
             requirements: Default::default(),

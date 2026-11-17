@@ -339,6 +339,14 @@ Shardの結果は `job_id / shard_id / test_identity` で集約し、assertion�
 
 単一Jobのステップ間で生成された書込み可能workspace、常駐service、プロセス内状態を自動移送することはしない。複数ExecutionTaskへ切り離す境界は、immutable artifactと明示依存だけで再現できる位置に限定する。
 
+### workerでのCI taskの実行
+
+CIのExecutionTaskは、通常のattemptのpayloadの一種（`ci_task`: FrozenPlanのdigest、task ID、needsの結果であるinputs）として配置する。commandのattemptと同じplacement・admission・lease・retry・結果回収の経路を使い、`hello` のfeature `ci_task_v1` を交渉したworkerにだけ送る（提供するが要求しない）。FrozenPlanの本体はcontent-addressedなblobとして届け、workerはdigestが一致したbytesだけを使う。
+
+workerではsupervisorがlocal-ci-coreのtask実行を呼び、coreが求める各stepを、commandと同じ経路（task-traffic-controllerの登録とadmission、launchの記録、mask済みのログ、timeout、停止と停止確認）でnodeとして実行する。coreはstepのprocessを起動せず、signalも送らない（service containerのdockerやgitなど、step以外の補助processはcoreが起動する）。停止理由（cancel・lease失効・timeout）が出た後は、`if: always()` のstepも起動しない。taskの結果（Jobごとの結果とoutput）はattemptのartifactとして親へ返し、親が後続taskのinputsに入れる。
+
+coreはworkspaceがcaptured sourceとbyte単位で一致するときだけ実行を束縛する。そのため、secret_filesを配置するsource、prepared setupを伴うattempt、in-placeのworkspaceではCI taskを受理しない（制約と解消の選択肢は docs/plan.md のS16節）。
+
 ## matrix・自動テストsharding・明示shard
 
 独立workspaceと明示input／outputで実行できるmatrix variantやtest shardは、初回実用版から複数workerへ分散できるようにする。共有workspaceの任意のfile依存を自動的に推論して切断する仕様にはしない。

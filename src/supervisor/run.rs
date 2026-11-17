@@ -460,6 +460,35 @@ pub(crate) fn keep_artifacts(
             }
         }
     }
+    if let Some(ci) = spec.ci.as_ref().filter(|ci| ci.result_path().is_file()) {
+        // The result of a CI task (the outcomes and outputs of its jobs),
+        // kept like a file the task declared: refused when it holds a
+        // secret value, and then missing for the parent.
+        let name = super::ci_task::RESULT_ARTIFACT;
+        let input = ArtifactInput {
+            name,
+            source: ci.result_source(),
+            source_id: plan.source_id.clone(),
+            plan_digest: plan.plan_digest.clone(),
+            profile_fingerprint: plan.profile_fingerprint.clone(),
+            forbidden: &forbidden,
+        };
+        match store_artifact(&root, attempt, &ci.scratch, &input, plan.max_bytes) {
+            Ok(record) => kept.push(record),
+            Err(OutcomeError::Storage(e)) => return Err(e.into()),
+            Err(e) => {
+                not_stored.push(ArtifactNotStored {
+                    name: name.to_string(),
+                    path: name.to_string(),
+                    if_missing: crate::wire::MissingPolicy::Required,
+                    reason: not_stored_reason(&e),
+                });
+                let why =
+                    String::from_utf8_lossy(&masker.mask(e.to_string().as_bytes())).into_owned();
+                refused.push((name.to_string(), json!({ "name": name, "why": why })));
+            }
+        }
+    }
     let mut remaining = crate::outputs::MAX_ATTEMPT_FILES;
     for d in &plan.outputs {
         if !crate::outputs::eligible(d.when, termination.outcome(), true) {
@@ -701,8 +730,8 @@ impl Drop for SetOnDrop<'_> {
     }
 }
 
-struct Control<'a> {
-    spec: &'a SuperviseSpec,
+pub(super) struct Control<'a> {
+    pub(super) spec: &'a SuperviseSpec,
     store: &'a WorkerStore,
     traffic: Traffic,
     lease: LeaseClock,
@@ -714,6 +743,9 @@ struct Control<'a> {
     beat: SpoolBeat,
     /// The first failure of a thread feeding the spool.
     pump_error: Arc<Mutex<Option<String>>>,
+    /// A file that gets a copy of the masked output of the node being run
+    /// (the step log of a CI task); `None` for a command of `exec`.
+    pub(super) tee: Option<std::fs::File>,
 }
 
 /// Notify only after a new grant was accepted by the clock. Diagnostics are
@@ -796,7 +828,7 @@ impl Control<'_> {
         Ok(())
     }
 
-    fn run_node(&mut self, index: usize, node: &NodeSpec) -> Result<NodeEnd> {
+    pub(super) fn run_node(&mut self, index: usize, node: &NodeSpec) -> Result<NodeEnd> {
         let spec = self.spec;
         self.node_timeout_ms = node.timeout_ms;
         let attempt = spec.attempt_id.clone();
@@ -932,9 +964,11 @@ impl Control<'_> {
         let out = self.spool.writer(LogStream::Stdout);
         let error = Arc::clone(&self.pump_error);
         let done = AtomicBool::new(false);
+        // The copy of the output of this node, when one was asked for.
+        let tee = self.tee.take();
         let end = std::thread::scope(|s| {
             let mask = self.masker.stream();
-            let feeder = s.spawn(|| pump(pipe, out, mask, &done, &error));
+            let feeder = s.spawn(|| pump(pipe, out, mask, &done, &error, tee.as_ref()));
             // The command is over (or given up on) when this is dropped, also
             // by a panic on the way: what it wrote is read to the end, within
             // a bound, and the reader never waits for a supervisor that is gone.
@@ -1486,6 +1520,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         node_timeout_ms: None,
         beat: SpoolBeat::default(),
         pump_error: Arc::default(),
+        tee: None,
     };
     let mut end = NodeEnd {
         reason: None,
@@ -1494,6 +1529,13 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         identity_unknown: false,
     };
     let mut last_node = String::new();
+    // A CI task could not be run to a result, and nothing stopped it.
+    let mut ci_failure = None;
+    if let Some(ci) = &spec.ci {
+        // The steps are not known here: the core of the plan asks for each.
+        let ran = super::ci_task::drive(&mut ctl, ci)?;
+        (end, last_node, ci_failure) = (ran.end, ran.last_node, ran.failure);
+    }
     for (index, node) in spec.nodes.iter().enumerate() {
         last_node = node.node_id.to_string();
         end = ctl.run_node(index, node)?;
@@ -1524,7 +1566,43 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
     account_for_reader(&store, attempt, &ctl.beat, ctl.pump_failure())?;
     // Every command that was started has ended and is confirmed stopped.
     // With none started (a cancel got in first) there is nothing to keep.
-    let term = if spec.nodes.is_empty() {
+    let term = if spec.ci.is_some() {
+        // With no step asked for (every job skipped by its condition, or a
+        // task that could not be run) nothing above looked for a cancel.
+        // One that is recorded wins, as for an attempt without a command.
+        let cancelled = end.reason.is_none()
+            && store.launches(attempt)?.is_empty()
+            && store
+                .get(attempt)?
+                .is_none_or(|r| r.cancel_requested_at_ms.is_some() || r.retired);
+        let term = match &ci_failure {
+            _ if cancelled => {
+                move_to(&store, attempt, AttemptState::Cancelling)?;
+                termination(Some(StopReason::Cancel), None)
+            }
+            Some(why) => {
+                let why = String::from_utf8_lossy(&masker.mask(why.as_bytes())).into_owned();
+                store.append_events_unseen(
+                    Some(&rec.run_id),
+                    attempt,
+                    "ci_task_failed",
+                    "what",
+                    &[(
+                        "task".to_string(),
+                        json!({ "what": "task", "message": why }),
+                    )],
+                    platform::wall_ms(),
+                )?;
+                Termination::new(crate::state::Outcome::Failed, None, None)
+                    .expect("a failure without an exit is valid")
+            }
+            None => termination(end.reason, end.exit),
+        };
+        // Also with no step started: jobs skipped by their own condition
+        // have outcomes the jobs that need them wait for.
+        keep_artifacts(spec, &store, &masker, &term)?;
+        term
+    } else if spec.nodes.is_empty() {
         // `prepared_only`: no command, so nothing above looked for a cancel.
         // One that is recorded wins. Otherwise the attempt succeeded by what
         // the template put into its workspace: it has no exit status (no

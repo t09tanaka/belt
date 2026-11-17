@@ -1938,7 +1938,7 @@ fn pumped_masked(
     let done = AtomicBool::new(false);
     let error = Mutex::new(None);
     std::thread::scope(|sc| {
-        let feeder = sc.spawn(|| pump(pipe, s.writer(Stdout), mask.stream(), &done, &error));
+        let feeder = sc.spawn(|| pump(pipe, s.writer(Stdout), mask.stream(), &done, &error, None));
         let out = fs::OpenOptions::new()
             .append(true)
             .custom_flags(libc::O_NONBLOCK)

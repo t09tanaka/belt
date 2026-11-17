@@ -1159,3 +1159,30 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - Driver に依らず公開済みの API（`execute_pinned_task`・`TaskInputs`・`StepExecutor`・`plan_task_demand`）で作れるが、設計が未決定: (a) worker 側の CI task 実行。FrozenPlan・task id・`TaskInputs` を worker へどう渡すか（wire の新しい payload か別の形か）、step を task-traffic-controller に載せる `StepExecutor` を supervisor のどこに置くか。worker の admission と supervisor の spec に及ぶ。(b) FrozenPlan の task を `WorkloadPlan` にして配置時の forecast へ渡す接続（A10 の S16 分）。(c) 実行中の中間 artifact を親へ送り、receipt を別 host の download へ返す経路。
 
 この変更では、どちらも実装していない。再開の順序の案は、(a)〜(c) の設計を決める、local-ci の Driver を現在の main へ載せ直して公開し RTR の依存を別の変更で上げる、その上で (1) `ci` の実行 driver と worker 側の CI task 実行・needs output・A10 の接続・A38 のうち結果と output の分、(2) matrix の permit・max-parallel・fail-fast・join・集約と展開 event・A27、(3) 中間 artifact の receipt と A38 の artifact の分、である。(a) は Driver の公開を待たずに始められる。S16 の必須範囲は変えない。
+
+### S16 (1) の前半: worker 側の CI task の実行（2026-11-17、main `cc4cc9c` 起点）
+
+上の (a) の設計の決定（payload `CiTask`、feature `ci_task_v1`、supervisor が `execute_pinned_task` を呼ぶ）のうち、worker 側を実装した。親の側（`ci` の実行、DAG の進行、needs output の受け渡し、forecast への接続）は次の変更で行う。
+
+実装したもの:
+
+- wire: `AttemptPayload.ci_task`（`CiTask { plan_digest, task_id, inputs }`）。無いときは書き出さないので、既存の payload の canonical JSON と hash は変わらない。`hello` の feature `ci_task_v1` は提供するが要求しない。交渉していない接続からの CI task は `PROTOCOL_INCOMPATIBLE` で断る。
+- worker の受理: CI task は `commands` を持たない。`in_place`・secret bundle・prepared setup を伴う CI task は、受理の時点で理由を付けて断る（下の制約）。
+- agent（`src/worker/agent.rs` は振り分けの分岐だけ。本体は `src/worker/ci_task.rs`）: 届いている FrozenPlan の bytes を digest で照合し、task がその plan に有ること・inputs が読めることを確かめてから、supervisor の spec に `ci` を入れる。`commands` が空でも `prepared_only`（command 無しの成功）にはしない。
+- supervisor（`src/supervisor/ci_task.rs`、local-ci との接続は `src/ci/execute.rs`）: `execute_pinned_task` を別 thread で呼び、`StepExecutor` として受けた各 step を、exec の command と同じ `run_node`（task-traffic-controller の登録と admission、launch の claim、spool への mask 済みの出力、timeout、停止と停止確認）で 1 つずつ node として実行する。local-ci は step の process を起動も signal もしない（cancel handle には process group を渡さないので、cancel は flag を立てるだけになる）。service container の docker や git など、step 以外の補助 process は local-ci が自分で起動する。停止理由（cancel・lease 失効・timeout）か停止未確認が 1 度出たら、`if: always()` の step も含めて以後の step は起動しない。
+- 結果: task の結果（`WireTaskResult`。job ごとの結果と `outputs`）を、attempt の artifact `rtr-ci-task-result.json` として既存の artifact と collection の経路で親へ返す。secret の値を含む結果は artifact として残さない。attempt の終了は、停止理由が有ればそれ、無ければ job の結果（failure か cancelled が 1 つでも有れば exit 1 の failed、skipped は失敗にしない）、task を実行できなかったとき（plan の digest 不一致、workspace が source と一致しない等）は exit 無しの failed と event `ci_task_failed`。
+
+テスト（偽の network 無し・時計に依らない。実際の workflow ファイルと実 process）: `ci::execute` 3 件、`supervisor::ci_task` 4 件と `run_tests` 6 件（needs の連鎖を別 attempt・別 workspace で実行して output が渡ること、mask、失敗、source と一致しない workspace、digest 不一致、開始前の cancel）、`worker::ci_task` 4 件、wire 1 件、agent の統合 2 件。
+
+この変更で分かった制約（local-ci 0.13.0 の公開 API による。設計の判断が要る）:
+
+- `PinnedExecution::verify_workspace` は、workspace が captured source と byte 単位で一致するときだけ束縛する（secret の配置と setup の前に呼ぶ契約）。束縛（`PinnedWorkspace`）は process 内の値で、supervisor の process でしか作れない。RTR は agent が secret bundle の配置と prepared setup の複製を済ませてから supervisor を起動するので、secret_files を持つ source・prepared setup・fast-worktree の `[[clone]]` で依存を複製する worktree では束縛できない。この変更では、そういう CI task を受理しない。解くには、local-ci に「宣言済みの secret の path を除いて照合する束縛」を足すか、CI task に限って supervisor が束縛した後に secret を配置する順序に変えるかを決める必要がある。
+- step の script を pipe から読む step（GitHub token を持つ script）は、task-traffic-controller の起動経路で fd を渡せないので実行できず、その step は error になる。
+- matrix の variant ごとの workspace（`PinnedWorkspaceProvider::fork`）は `RefusePinnedForks` で断る（(2) の区切り）。portool と service container の同時実行数は local-ci の既定に任せていない（`portool: None`・`containers: 1`）。
+- step が admission を待った時間を `queue_wait_secs` として local-ci へ返していない（job の時間に待ちが含まれる）。
+- supervisor が再起動した CI task は、既存の recover の経路で終わる（step の続きからは再開しない）。
+
+残り（S16 (1) の後半、次の変更）:
+
+- FrozenPlan の bytes の配送。worker は `<state_dir>/ci-plans/<sha256>.json` に置かれた bytes を使う（`worker::ci_task::store_plan`）。`blob_put` の経路に plan 用の種類を足して親から届けるところは未実装で、届いていない plan の attempt は準備で失敗する（`NOT_FOUND`）。
+- 親の側: `ci` の実行（`src/cli.rs` と `tests/it/not_implemented.rs` の 2 行）、`TaskSpec` への `ci_task` の追加と `build_payload`、`ci_task_v1` の無い worker の除外と placement への理由の記録、Driver と同じ形の trait の後ろに置く run の進行（needs の DAG、上流の成功後だけ下流を配置、失敗時の skipped、cancel）、needs output を下流の `inputs` へ入れること、`plan_task_demand` から `WorkloadPlan` を作って配置時の forecast に渡すこと（A10 の S16 分）、A38 のうち結果と output の分のテスト。

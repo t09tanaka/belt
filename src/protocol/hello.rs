@@ -23,6 +23,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     "output_bundles_v1",
     crate::toolchain::capability::FEATURE,
     crate::toolchain::contract::FEATURE,
+    crate::wire::CI_TASK_FEATURE,
 ];
 
 /// What one side offers and requires.
@@ -380,5 +381,8 @@ mod tests {
     fn the_shipped_constants_are_consistent() {
         assert!(!PROTOCOL_VERSIONS.is_empty());
         assert!(SUPPORTED_FEATURES.contains(&"blob_resume"));
+        // Offered, so that a worker of this build is given CI tasks.
+        assert!(SUPPORTED_FEATURES.contains(&"ci_task_v1"));
+        assert_eq!(crate::wire::CI_TASK_FEATURE, "ci_task_v1");
     }
 }

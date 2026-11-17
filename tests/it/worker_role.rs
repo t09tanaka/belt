@@ -202,6 +202,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     let release = f.root.path().join("release");
     let command_path = f.root.path().join("command-path");
     let payload = AttemptPayload {
+        ci_task: None,
         toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),

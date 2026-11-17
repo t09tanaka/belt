@@ -1202,7 +1202,24 @@ impl Agent {
         // Every command was a prepared setup step (an install-only task with
         // its template there): the supervisor settles it as succeeded
         // without a command. The journal says which steps were not run.
-        let prepared_only = commands.is_empty();
+        // One task of a frozen CI plan has no command either: the plan has
+        // its steps, and the supervisor runs them as the plan's core asks.
+        let ci = match &payload.ci_task {
+            Some(task) => {
+                let env = super::ci_task::base_env(self.cfg.capability_profile.as_deref(), binding)
+                    .map_err(invalid)?;
+                Some(super::ci_task::prepare(
+                    &self.cfg.state_dir,
+                    &dir,
+                    &payload,
+                    task,
+                    &ws,
+                    env,
+                )?)
+            }
+            None => None,
+        };
+        let prepared_only = commands.is_empty() && ci.is_none();
         if prepared_only {
             self.note_once(
                 attempt,
@@ -1264,7 +1281,11 @@ impl Agent {
         // The declared artifacts, checked again against the secret files of
         // the source (which is here now: the workspace was made from it). An
         // acceptance that came before the source could not look.
-        let artifacts = if payload.artifacts.is_empty() && payload.outputs.is_empty() {
+        let artifacts = if payload.artifacts.is_empty()
+            && payload.outputs.is_empty()
+            && ci.is_none()
+        {
+            // (The result of a CI task leaves as an artifact.)
             None
         } else {
             let secrets = self.host.secret_paths(&payload)?.ok_or_else(|| {
@@ -1376,6 +1397,7 @@ impl Agent {
             mask: MaskValues(mask),
             artifacts,
             prepared_only,
+            ci,
         };
         self.check_capabilities(&payload)?;
         spec.validate().map_err(|e| invalid(e.to_string()))?;

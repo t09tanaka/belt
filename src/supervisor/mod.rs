@@ -1,6 +1,7 @@
 //! Process supervision, leases and cancellation.
 
 pub mod bundles;
+pub mod ci_task;
 pub mod error;
 pub mod escalation;
 pub mod identity;

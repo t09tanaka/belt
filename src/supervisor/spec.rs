@@ -216,12 +216,29 @@ pub struct SuperviseSpec {
     /// nodes by mistake is still refused.
     #[serde(default)]
     pub prepared_only: bool,
+    /// The attempt is one task of a frozen CI plan: there is no node here
+    /// either, the core of the plan asks for each step while it runs. Not
+    /// written when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<super::ci_task::CiTaskSpec>,
 }
 
 impl SuperviseSpec {
     pub fn validate(&self) -> Result<()> {
         let bad = |m: &str| Err(SupervisorError::Spec(m.to_string()));
-        if self.nodes.is_empty() != self.prepared_only {
+        if let Some(ci) = &self.ci {
+            // Its steps come from the plan, and its result leaves as an
+            // artifact: neither nodes nor a missing artifact plan.
+            if !self.nodes.is_empty() || self.prepared_only {
+                return bad("a CI task with nodes or prepared_only");
+            }
+            if self.artifacts.is_none() {
+                return bad("a CI task without an artifact plan for its result");
+            }
+            if let Err(why) = ci.validate() {
+                return bad(why);
+            }
+        } else if self.nodes.is_empty() != self.prepared_only {
             return bad(if self.prepared_only {
                 "prepared_only with nodes"
             } else {
@@ -400,6 +417,7 @@ mod tests {
             mask: MaskValues::default(),
             artifacts: None,
             prepared_only: false,
+            ci: None,
         }
     }
 

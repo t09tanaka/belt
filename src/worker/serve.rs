@@ -133,6 +133,19 @@ pub async fn serve_connection(
                     .await;
                 return;
             }
+            if matches!(&request, crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.is_some())
+                && !negotiated_features
+                    .iter()
+                    .any(|v| v == crate::wire::CI_TASK_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "CI tasks were not negotiated",
+                    ))
+                    .await;
+                return;
+            }
             if !capabilities_negotiated
                 && matches!(&request, crate::wire::Request::SubmitAttempt(r) if !r.payload.requirements.is_empty())
             {

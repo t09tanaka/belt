@@ -427,6 +427,7 @@ fn payload(script: &str) -> AttemptPayload {
     let mut env = BTreeMap::new();
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
+        ci_task: None,
         toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),
@@ -4384,4 +4385,57 @@ async fn a_draining_worker_refuses_a_new_attempt_but_answers_a_resend() {
     control::write(&f.state(), Control::default()).unwrap();
     submit(&c, &late, &payload("exit 0")).await;
     agent.shutdown();
+}
+
+fn ci_payload() -> AttemptPayload {
+    let mut p = payload("true");
+    p.commands.clear();
+    p.ci_task = Some(remote_task_runner::wire::CiTask {
+        plan_digest: Digest::of_bytes(b"a plan this worker was never sent"),
+        task_id: "ci.yml/build".into(),
+        inputs: serde_json::json!({ "needs": {} }),
+    });
+    p
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ci_task_without_its_plan_fails_and_is_never_settled_as_a_prepared_setup() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    // No command: without the CI task this would be refused, and with every
+    // command pruned it would be a success without a command.
+    submit(&c, &a, &ci_payload()).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Failed);
+    assert_eq!(events(&f, &a, "agent_prepare_failed"), 1);
+    assert_eq!(events(&f, &a, "prepared_only"), 0);
+    assert_eq!(events(&f, &a, "agent_setup_satisfied"), 0);
+    assert!(f.store().launches(&a).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ci_task_that_cannot_be_run_yet_is_refused_before_it_is_stored() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let refused = |change: fn(&mut AttemptPayload)| {
+        let mut p = ci_payload();
+        change(&mut p);
+        p
+    };
+    for p in [
+        // commands beside the plan
+        refused(|p| p.commands = payload("true").commands),
+        // secret files would be placed into the workspace the core verifies
+        refused(|p| p.has_secret_bundle = true),
+        refused(|p| p.in_place = true),
+        refused(|p| p.ci_task.as_mut().unwrap().task_id.clear()),
+        refused(|p| p.ci_task.as_mut().unwrap().inputs = serde_json::json!([])),
+    ] {
+        let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{}", e.message);
+    }
+    assert!(f.store().get(&a).unwrap().is_none());
 }

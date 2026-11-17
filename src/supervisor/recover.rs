@@ -106,7 +106,16 @@ fn recover_using(
     let mut unresolved_nodes: Vec<String> = Vec::new();
     let mut hidden: Vec<serde_json::Value> = Vec::new();
     for (node, _intent_at, ident) in store.launches(attempt)? {
-        let index = spec.nodes.iter().position(|n| n.node_id == node);
+        // A step of a CI task is no node of the spec: its number is in its name.
+        let index = spec
+            .nodes
+            .iter()
+            .position(|n| n.node_id == node)
+            .or_else(|| {
+                spec.ci
+                    .as_ref()
+                    .and_then(|_| super::ci_task::step_index(node.as_str()))
+            });
         let id = index.map(|i| command_id(attempt, i));
         // What a gone leader left under its group number is signalled only
         // with evidence that a member is the command's own.
@@ -341,6 +350,7 @@ mod tests {
             mask: Default::default(),
             artifacts: None,
             prepared_only: false,
+            ci: None,
         };
         Fx {
             _dir: dir,
