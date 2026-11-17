@@ -612,11 +612,9 @@ mod tests {
     fn manual_tools_are_manual_whatever_the_version_manager_says() {
         let mut parent = report();
         parent.tools.insert("xcode".into(), avail("16.0"));
-        for have in [Some(avail("15.0")), Some(fact(Observed::Unavailable, None))] {
+        for have in [avail("15.0"), fact(Observed::Unavailable, None)] {
             let mut worker = report();
-            if let Some(h) = have {
-                worker.tools.insert("xcode".into(), h);
-            }
+            worker.tools.insert("xcode".into(), have);
             let item = diff(&parent, &worker)
                 .into_iter()
                 .find(|i| i.subject == "xcode")
