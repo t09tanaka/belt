@@ -484,6 +484,7 @@ home=$2
 [ "$3" = "'remote-task-runner' 'worker' '--stdio'" ] || exit 91
 [ ! -e "$home/offline" ] || exit 92
 echo $$ > "$home/bridge.pid"
+echo $$ >> "$home/bridge-dials"
 HOME="$home" exec {} worker --stdio
 "#,
             remote_task_runner::protocol::ssh::quote(BIN)
@@ -519,7 +520,16 @@ HOME="$home" exec {} worker --stdio
     })
     .await;
     let identity = WorkerBootId::parse(&store.worker_identity(&worker).unwrap().unwrap()).unwrap();
-    let task = submit(&client, &state, &spec.env, &key, root, "ephemeral", 4).await;
+    let task = submit(
+        &client,
+        &state,
+        &spec.env,
+        &key,
+        root,
+        "ephemeral",
+        u32::MAX,
+    )
+    .await;
     wait_for("ephemeral execution", || {
         root.join("count-ephemeral").exists()
     })
@@ -560,13 +570,26 @@ HOME="$home" exec {} worker --stdio
             .outcome(),
         Outcome::Interrupted
     );
+    // The dial loop starts the next bridge only after it has reaped the
+    // previous one. Two new dials prove the returning worker's first
+    // connection was actually closed while its process was still alive.
+    let previous_dials = std::fs::read_to_string(home.join("bridge-dials"))
+        .unwrap()
+        .lines()
+        .count();
     std::fs::remove_file(home.join("offline")).unwrap();
-    wait_for("late bridge dial", || {
-        std::fs::read_to_string(home.join("bridge.pid"))
-            .ok()
-            .is_some_and(|v| v.trim() != pid.to_string() && !v.trim().is_empty())
+    wait_for("returning worker connection closed and redialed", || {
+        std::fs::read_to_string(home.join("bridge-dials"))
+            .unwrap()
+            .lines()
+            .count()
+            >= previous_dials + 2
     })
     .await;
+    assert_eq!(
+        super::common::identity_of(agent.pid).as_deref(),
+        Some(agent.start.as_str())
+    );
     assert_eq!(store.worker_identity(&worker).unwrap(), None);
     assert_eq!(store.attempts_of_task(&task).unwrap().len(), 1);
     assert_eq!(
