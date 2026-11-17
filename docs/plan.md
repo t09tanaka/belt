@@ -842,7 +842,7 @@ S15e（実装済みだがテストが無かったもの。この変更でテス�
 - state path の symlink を拒否する方針のため、home が symlink 配下にある利用者は `init` できない。path を解決して受け入れる方針への変更は、managed service の結び付け（state path の一致）と全入口に及ぶため、この行では行っていない。
 - `sweep_orphan_tmp` は新しい unlink の経路である。削除専任のレビューは受けていない。
 
-検証（手元、rustc 1.100.0）: VERIFY_PLACEHOLDER
+検証（手元、rustc 1.100.0）: `cargo fmt --check` と `cargo clippy --all-targets -- -D warnings`（`-A` なし、tests/it を含む）は成功。`cargo test` は unit 1258 件が成功（ignored 7）。integration は 588 件中 579 件が成功し、9 件が失敗した。9 件はすべて `bootstrap::` の実 CLI・実 owner を使うテストの待ち時間切れで、この変更が触れていないテストである。実行時の load average は 20〜25 だった（同じホストで他の作業が並行していた）。`bootstrap::` だけを再実行すると 8 件は成功した。残る `control_exec_succeeded_compute_but_missing_collection_exits_78`（20 秒の期限）は単独でも 3 回中 2 回失敗し、src と tests を main `7cbe913` に戻した状態でも 4 回中 1 回失敗した（成功時も 14〜20 秒かかる）。この変更に由来しない、負荷下の既存の時間依存として別件に分ける。したがって、負荷の無い状態での `cargo test` 全体の 1 回通しは未確認である。追加・変更したテスト 10 件は focused 実行ですべて成功した。
 
 ### 準備 identity の元 sample freshness と stored-task preview 接続
 
