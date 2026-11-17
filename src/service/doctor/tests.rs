@@ -381,6 +381,7 @@ fn healthy() -> HostFacts {
             fingerprint: Some("sha256:f".into()),
             error: None,
         },
+        linger: None,
     }
 }
 fn level(checks: &[Check], id: &str) -> Level {
@@ -808,6 +809,7 @@ impl World {
             &self.host.env,
             &self.spec,
             &self.version,
+            Backend::Launchd,
             None,
         )
         .unwrap()
@@ -995,6 +997,7 @@ fn an_answer_for_another_worker_or_cluster_is_refused() {
         &w.host.env,
         &w.spec,
         &w.version,
+        Backend::Launchd,
         None,
     )
     .unwrap_err();
@@ -1059,6 +1062,7 @@ fn another_line_can_put_its_checks_where_the_slot_is() {
         &w.host.env,
         &w.spec,
         &w.version,
+        Backend::Launchd,
         Some(&mut source),
     )
     .unwrap();
@@ -1350,6 +1354,7 @@ mod environment_diff {
             &w.host.env,
             &w.spec,
             &w.version,
+            Backend::Launchd,
             Some(&mut source),
         )
         .unwrap();
@@ -1368,6 +1373,7 @@ mod environment_diff {
             &w.host.env,
             &w.spec,
             &w.version,
+            Backend::Launchd,
             Some(&mut source),
         )
         .unwrap();
@@ -1519,6 +1525,7 @@ mod environment_diff {
             &w.host.env,
             &w.spec,
             &w.version,
+            Backend::Launchd,
             Some(&mut source),
         )
         .unwrap();
@@ -1529,4 +1536,271 @@ mod environment_diff {
         assert!(unreachable.detail.starts_with("the worker did not answer"));
         assert_eq!(of(&report, "mini-b", "reachable").level, Level::Fail);
     }
+}
+
+#[test]
+fn only_a_systemd_host_is_asked_about_lingering_and_no_answer_is_not_a_pass() {
+    let h = Host::new();
+    // launchd has no lingering: nothing is run, nothing is reported.
+    let mut runner = FakeRunner::default();
+    assert_eq!(
+        linger_fact(Backend::Launchd, 501, &h.env, &mut runner),
+        None
+    );
+    assert!(runner.asked.is_empty());
+    // systemd: one question, in the service environment, about this user.
+    let mut runner = FakeRunner::default();
+    runner.answer("loginctl", "show-user", 0, "Linger=no\n");
+    assert_eq!(
+        linger_fact(Backend::Systemd, 1000, &h.env, &mut runner),
+        Some(Linger {
+            uid: 1000,
+            enabled: Some(false)
+        })
+    );
+    assert_eq!(
+        runner.asked,
+        [(
+            "/usr/bin/loginctl".to_string(),
+            vec![
+                "show-user".to_string(),
+                "1000".to_string(),
+                "--property=Linger".to_string()
+            ]
+        )]
+    );
+    runner.answer("loginctl", "show-user", 0, "Linger=yes\n");
+    assert_eq!(
+        linger_fact(Backend::Systemd, 1000, &h.env, &mut runner)
+            .unwrap()
+            .enabled,
+        Some(true)
+    );
+    // The one on the service PATH is the one that is asked.
+    h.tool("loginctl", 0o755);
+    let mut runner = FakeRunner::default();
+    runner.answer("loginctl", "show-user", 1, "Linger=yes\n");
+    let failed = linger_fact(Backend::Systemd, 7, &h.env, &mut runner).unwrap();
+    assert_eq!((failed.uid, failed.enabled), (7, None));
+    assert_eq!(
+        runner.asked[0].0,
+        h.bin.join("loginctl").to_string_lossy().into_owned()
+    );
+    // A loginctl that cannot be run at all.
+    let silent = linger_fact(Backend::Systemd, 7, &h.env, &mut FakeRunner::default()).unwrap();
+    assert_eq!(silent.enabled, None);
+}
+
+#[test]
+fn lingering_is_one_more_check_of_a_host_that_reported_it() {
+    assert!(evaluate("mini-l", &healthy())
+        .iter()
+        .all(|c| c.id != "linger"));
+    let mut facts = healthy();
+    facts.linger = Some(Linger {
+        uid: 1000,
+        enabled: Some(false),
+    });
+    let checks = evaluate("mini-l", &facts);
+    assert_eq!(level(&checks, "linger"), Level::Notice);
+    assert!(detail(&checks, "linger").contains("loginctl enable-linger 1000"));
+    // A warning changes neither count of the report; an unanswered
+    // question is one more check that was not made.
+    let base = Report::of(evaluate("mini-l", &healthy()));
+    let warned = Report::of(checks);
+    assert_eq!(
+        (warned.failed, warned.not_checked, warned.healthy),
+        (base.failed, base.not_checked, base.healthy)
+    );
+    facts.linger = Some(Linger {
+        uid: 1000,
+        enabled: None,
+    });
+    let report = Report::of(evaluate("mini-l", &facts));
+    assert_eq!(
+        (report.failed, report.not_checked),
+        (base.failed, base.not_checked + 1)
+    );
+    assert!(!report.healthy);
+    // A helper that predates the check sends no such field, and a host
+    // without the fact sends none either.
+    let line = answer_line(&status(Some(true), true, false), &healthy());
+    assert!(!line.contains("linger"));
+    assert_eq!(parse_answer(&out(0, &line)).unwrap().facts.linger, None);
+    let line = answer_line(&status(Some(true), true, false), &facts);
+    assert_eq!(
+        parse_answer(&out(0, &line)).unwrap().facts.linger,
+        facts.linger
+    );
+}
+
+#[test]
+fn the_parent_is_asked_about_lingering_only_when_init_registered_its_service_with_systemd() {
+    let run_as = |backend: Backend, managed: bool| {
+        let mut w = World::new(&[]);
+        w.runner.answer("loginctl", "show-user", 0, "Linger=no\n");
+        if managed {
+            w.spec.managed_service = Some(w.host.home.join("init.json"));
+        }
+        let report = run(
+            &mut w.remote,
+            &mut w.runner,
+            &w.host.env,
+            &w.spec,
+            &w.version,
+            backend,
+            None,
+        )
+        .unwrap();
+        let asked = w.runner.asked.iter().any(|(_, a)| a[0] == "show-user");
+        (report, asked)
+    };
+    let (report, asked) = run_as(Backend::Systemd, true);
+    assert!(asked);
+    let linger = of(&report, "parent", "linger");
+    assert_eq!(linger.level, Level::Notice);
+    assert!(
+        linger.detail.contains("loginctl enable-linger"),
+        "{}",
+        linger.detail
+    );
+    assert!(report.healthy);
+    for (backend, managed) in [
+        (Backend::Systemd, false),
+        (Backend::Launchd, true),
+        (Backend::Launchd, false),
+    ] {
+        let (report, asked) = run_as(backend, managed);
+        assert!(!asked, "{backend:?} {managed}");
+        assert!(report.checks.iter().all(|c| c.id != "linger"));
+    }
+}
+
+#[test]
+fn a_linux_worker_whose_lingering_is_off_is_warned_about_with_the_fix() {
+    let mut w = World::new(&[("mini-l", "ci@mini-l.local", true)]);
+    if let Some(Some((_, facts, _))) = w.remote.hosts.get_mut("ci@mini-l.local") {
+        facts.linger = Some(Linger {
+            uid: 1001,
+            enabled: Some(false),
+        });
+    }
+    let report = w.run();
+    let linger = of(&report, "mini-l", "linger");
+    assert_eq!(linger.level, Level::Notice);
+    assert!(
+        linger.detail.ends_with("run: loginctl enable-linger 1001"),
+        "{}",
+        linger.detail
+    );
+    assert!(report
+        .checks
+        .iter()
+        .all(|c| c.host != "parent" || c.id != "linger"));
+    assert_eq!(report.failed, 0);
+}
+
+fn ephemeral_world() -> World {
+    let w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
+    let config = w.host.home.join(".config/remote-task-runner/config.toml");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("[[workers]]\nid = \"colab-1\"\nssh = \"colab-tunnel\"\nephemeral = true\n");
+    fs::write(&config, text).unwrap();
+    w
+}
+
+#[test]
+fn an_ephemeral_worker_is_only_asked_for_hello_and_never_for_its_service() {
+    let mut w = ephemeral_world();
+    w.remote.hosts.insert(
+        "colab-tunnel".into(),
+        Some(("colab-1".into(), healthy(), status(Some(true), true, false))),
+    );
+    let report = w.run();
+    assert_eq!(of(&report, "colab-1", "service").level, Level::Notice);
+    assert!(of(&report, "colab-1", "service")
+        .detail
+        .contains("no service"));
+    assert_eq!(of(&report, "colab-1", "bridge").level, Level::Ok);
+    // Nothing else is said about it: no reachability, version or host facts.
+    let said: Vec<&str> = report
+        .checks
+        .iter()
+        .filter(|c| c.host == "colab-1")
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(said, ["service", "bridge"]);
+    // The helper of the persistent worker ran; none ran on the ephemeral one.
+    assert_eq!(w.remote.shells.len(), 1);
+    assert_eq!(report.failed, 0);
+    assert_eq!(of(&report, "mini-a", "service").level, Level::Ok);
+
+    // It answers as somebody else: that is wrong, not merely absent.
+    let mut w = ephemeral_world();
+    w.remote.hosts.insert(
+        "colab-tunnel".into(),
+        Some(("other".into(), healthy(), status(Some(true), true, false))),
+    );
+    let report = w.run();
+    assert_eq!(of(&report, "colab-1", "bridge").level, Level::Fail);
+}
+
+#[test]
+fn an_ephemeral_worker_that_is_not_running_is_a_notice_and_its_environment_is_not_compared() {
+    let mut w = ephemeral_world();
+    w.remote.hosts.insert("colab-tunnel".into(), None);
+    w.remote.bridge_fails = true;
+    let mut asked = Vec::new();
+    let mut source = |host: &str| {
+        asked.push(host.to_string());
+        Vec::new()
+    };
+    let report = run(
+        &mut w.remote,
+        &mut w.runner,
+        &w.host.env,
+        &w.spec,
+        &w.version,
+        Backend::Launchd,
+        Some(&mut source),
+    )
+    .unwrap();
+    let bridge = of(&report, "colab-1", "bridge");
+    assert_eq!(bridge.level, Level::Notice);
+    assert!(
+        bridge.detail.contains("workers forget colab-1"),
+        "{}",
+        bridge.detail
+    );
+    assert!(report
+        .checks
+        .iter()
+        .all(|c| c.host != "colab-1" || c.id != "environment_diff"));
+    // The persistent worker's bridge fails the report; the ephemeral one adds nothing to it.
+    assert_eq!(report.failed, 1);
+    assert_eq!(of(&report, "mini-a", "bridge").level, Level::Fail);
+    assert_eq!(asked, ["mini-a"]);
+
+    // One that answers is compared like any other worker.
+    let mut w = ephemeral_world();
+    w.remote.hosts.insert(
+        "colab-tunnel".into(),
+        Some(("colab-1".into(), healthy(), status(Some(true), true, false))),
+    );
+    let mut asked = Vec::new();
+    let mut source = |host: &str| {
+        asked.push(host.to_string());
+        Vec::new()
+    };
+    run(
+        &mut w.remote,
+        &mut w.runner,
+        &w.host.env,
+        &w.spec,
+        &w.version,
+        Backend::Launchd,
+        Some(&mut source),
+    )
+    .unwrap();
+    assert_eq!(asked, ["mini-a", "colab-1"]);
 }
