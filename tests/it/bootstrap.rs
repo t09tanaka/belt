@@ -1402,7 +1402,7 @@ fn open_sources(state: &std::path::Path) -> remote_task_runner::source::SourceSt
         }
     }
 }
-fn control_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
+pub(super) fn control_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
     let (root, spec) = fixture();
     let config = root.path().join(".config/remote-task-runner");
     std::fs::create_dir_all(&config).unwrap();
@@ -5161,7 +5161,11 @@ async fn public_exec_output_conditions_globs_and_multiple_paths_follow_the_outco
 /// A project of one workflow in the directory `ci` is run from. Every step
 /// leaves a line in `marks/<job>`, outside the workspace: what ran, and how
 /// often, is read from there.
-fn ci_project(root: &std::path::Path, input: &std::path::Path, jobs: &str) -> std::path::PathBuf {
+pub(super) fn ci_project(
+    root: &std::path::Path,
+    input: &std::path::Path,
+    jobs: &str,
+) -> std::path::PathBuf {
     let marks = root.join("marks");
     std::fs::create_dir_all(&marks).unwrap();
     std::fs::create_dir_all(input.join(".github/workflows")).unwrap();
@@ -5170,7 +5174,7 @@ fn ci_project(root: &std::path::Path, input: &std::path::Path, jobs: &str) -> st
     marks
 }
 
-fn ci_command(spec: &Spec, input: &std::path::Path) -> tokio::process::Command {
+pub(super) fn ci_command(spec: &Spec, input: &std::path::Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(&spec.executable);
     command
         .args(["--json", "ci"])
