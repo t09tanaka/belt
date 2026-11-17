@@ -5579,3 +5579,61 @@ fn live_attempts_of_a_worker_are_paged_without_gaps_repeats_or_other_rows() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn the_github_status_of_a_run_is_kept_in_its_journal_and_the_last_one_is_shown() {
+    let f = fx();
+    assert_eq!(f.store.github_status_of(&f.run).unwrap(), None);
+    assert!(f
+        .store
+        .query_run(f.run.clone())
+        .unwrap()
+        .unwrap()
+        .github_status
+        .is_none());
+    let other = RunId::generate();
+    f.store
+        .create_run(&other, None, None, &json!({}), 1)
+        .unwrap();
+    let first = json!({"computed": "success", "posting": "failed", "error": "e"});
+    let last = json!({"computed": "success", "posting": "posted"});
+    f.store.record_github_status(&f.run, &first, 5).unwrap();
+    f.store
+        .record_github_status(&other, &json!({"posting": "skipped"}), 6)
+        .unwrap();
+    f.store.record_github_status(&f.run, &last, 7).unwrap();
+    // An event of another kind, and one of an attempt, are not the status.
+    f.store
+        .append_event(
+            Some(&f.run),
+            None,
+            "task_waiting",
+            &json!({"posting": "no"}),
+            8,
+        )
+        .unwrap();
+    assert_eq!(
+        f.store.github_status_of(&f.run).unwrap(),
+        Some(last.clone())
+    );
+    let shown = f.store.query_run(f.run.clone()).unwrap().unwrap();
+    assert_eq!(shown.github_status, Some(last));
+    assert_eq!(
+        f.store.github_status_of(&other).unwrap(),
+        Some(json!({"posting": "skipped"}))
+    );
+    // The list of runs stays without it.
+    let listed = f.store.query_runs(8, None).unwrap();
+    assert!(listed.items.iter().all(|run| run.github_status.is_none()));
+    // A run that does not exist keeps nothing.
+    let unknown = RunId::generate();
+    let refused = f
+        .store
+        .record_github_status(&unknown, &json!({}), 9)
+        .unwrap_err();
+    assert!(
+        matches!(refused, StorageError::NotFound { .. }),
+        "{refused}"
+    );
+    assert_eq!(f.store.github_status_of(&unknown).unwrap(), None);
+}

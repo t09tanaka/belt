@@ -95,6 +95,12 @@ pub struct CiArgs {
     /// Git ref to run.
     #[arg(long = "ref")]
     pub git_ref: Option<String>,
+    /// Do not post the result as a GitHub commit status.
+    #[arg(long)]
+    pub no_status: bool,
+    /// The context of the GitHub commit status.
+    #[arg(long, default_value = crate::ci::status::DEFAULT_CONTEXT)]
+    pub status_context: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -517,8 +523,18 @@ fn run_ci(cli: &Cli) -> i32 {
                     }
                 }
             });
-            let result =
-                crate::service::ci_run::run(context, args.git_ref.clone(), &mut receiver).await;
+            let status = crate::service::github_status::Options {
+                enabled: !args.no_status,
+                context: args.status_context.clone(),
+            };
+            let result = crate::service::ci_run::run(
+                context,
+                args.git_ref.clone(),
+                &mut receiver,
+                status,
+                std::sync::Arc::new(crate::service::github_status::Gh),
+            )
+            .await;
             watcher.abort();
             let _ = watcher.await;
             result
@@ -540,6 +556,9 @@ fn run_ci(cli: &Cli) -> i32 {
                     unreachable!("ci waits for a run")
                 };
                 println!("{run} {}", ci.report.state);
+                if let Some(status) = &ci.github_status {
+                    println!("{}", crate::ci::status::render(status));
+                }
                 if ci.report.collection_pending == Some(true) {
                     eprintln!("collection is still pending");
                 }

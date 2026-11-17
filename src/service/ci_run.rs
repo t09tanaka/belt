@@ -64,6 +64,10 @@ pub struct CiReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_digest: Option<Digest>,
     pub jobs: Vec<JobLine>,
+    /// The GitHub status of the run: what was computed and what became of
+    /// the post, kept apart. A post that failed changes nothing else here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_status: Option<crate::ci::status::Record>,
 }
 
 fn invalid(message: impl Into<String>) -> ApiError {
@@ -234,12 +238,14 @@ pub async fn run(
     context: Context,
     revision: Option<String>,
     signals: &mut mpsc::UnboundedReceiver<()>,
+    status: super::github_status::Options,
+    poster: std::sync::Arc<dyn super::github_status::Poster>,
 ) -> Result<CiReport, ApiError> {
     let run_id = RunId::generate();
     let target = Target::Run(run_id.clone());
     let budget = Duration::from_secs(30);
     let submitted = submit(context.clone(), revision, run_id.clone());
-    let (report, plan_digest) = tokio::select! {biased;
+    let (report, receipt) = tokio::select! {biased;
         _ = control::interrupted(signals) => {
             (control::cancel_and_stop(&context.bootstrap, target.clone(), signals, budget).await, None)
         }
@@ -254,20 +260,82 @@ pub async fn run(
             } else {
                 observed
             };
-            (report, Some(receipt.plan_digest))
+            (report, Some(receipt))
         }
     };
-    let spec = context.bootstrap.clone();
-    let jobs = tokio::task::spawn_blocking(move || jobs(&spec, &run_id))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    let (spec, settled) = (context.bootstrap.clone(), context.clone());
+    let end = (
+        report.state == "settled",
+        report.cancel_requested || report.snapshot.as_ref().is_some_and(|s| s.cancel_requested),
+        report.collection_pending,
+        report.cli_exit_code,
+    );
+    let expected = receipt.as_ref().map(|receipt| {
+        let tasks = receipt.tasks.iter();
+        tasks.map(|task| task.plan_task.clone()).collect::<Vec<_>>()
+    });
+    // Decided only here, after the wait: on the parent, from what it collected.
+    let (jobs, github_status) = tokio::task::spawn_blocking(move || {
+        let jobs = jobs(&spec, &run_id).unwrap_or_default();
+        let record = expected.map(|expected| {
+            let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+            let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
+            let end = crate::ci::status::RunEnd {
+                settled: end.0,
+                cancel_requested: end.1,
+                collection_pending: end.2,
+                exit_code: end.3,
+                expected: &expected,
+                jobs: &lines,
+            };
+            super::github_status::settle(&settled, &run_id, &end, &status, poster.as_ref())
+        });
+        (jobs, record.map(|record| (run_id, record)))
+    })
+    .await
+    .unwrap_or_default();
+    let github_status = match github_status {
+        Some((run_id, record)) => {
+            if let Err(why) = keep_status(&context, run_id, record.clone()).await {
+                eprintln!("warning: the status of the run was not recorded: {why}");
+            }
+            Some(record)
+        }
+        None => None,
+    };
     Ok(CiReport {
         report,
-        plan_digest,
+        plan_digest: receipt.map(|receipt| receipt.plan_digest),
         jobs,
+        github_status,
     })
+}
+
+/// Keep the status with the run, so that `show` says it later. The resident
+/// owns the journal; an older one does not know the request and says so.
+async fn keep_status(
+    context: &Context,
+    run_id: RunId,
+    record: crate::ci::status::Record,
+) -> Result<(), String> {
+    let owner = context.owner().await.map_err(|e| e.to_string())?;
+    let request = Operation::RecordStatus { run_id, record };
+    match owner.request(request).await.map_err(|e| e.to_string())? {
+        Reply::Accepted { .. } => Ok(()),
+        Reply::Error { message } => Err(message),
+        Reply::ControlError { error } => Err(error.message),
+        _ => Err("unexpected reply".into()),
+    }
+}
+
+impl JobLine {
+    /// The line as the status decision reads it.
+    fn status_line(&self) -> crate::ci::status::Job<'_> {
+        crate::ci::status::Job {
+            plan_task: &self.plan_task,
+            status: &self.status,
+        }
+    }
 }
 
 /// How the jobs of a run ended, read from what the parent collected. Reads
