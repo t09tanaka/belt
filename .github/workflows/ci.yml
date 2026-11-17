@@ -51,8 +51,8 @@ jobs:
         # pinned to 0.10.x and the CLI must write the ledger it reads, so
         # check the version, not just the presence.
         run: |
-          if ! task-traffic-controller --version 2>/dev/null | grep -qx 'task-traffic-controller 0\.10\.1'; then
-            cargo install task-traffic-controller --locked --version 0.10.1 --force
+          if ! task-traffic-controller --version 2>/dev/null | grep -qx 'task-traffic-controller 0\.10\.2'; then
+            cargo install task-traffic-controller --locked --version 0.10.2 --force
           fi
           task-traffic-controller --version
       - uses: taiki-e/install-action@v2
