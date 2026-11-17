@@ -37,6 +37,8 @@ struct Scan {
     fingerprint: [u8; 32],
 }
 struct TaskRow {
+    /// It was cancelled by fail-fast before it was ever placed.
+    stopped_unplaced: bool,
     task: String,
     min: i64,
     generation: Option<i64>,
@@ -227,6 +229,20 @@ impl CoordinatorStore {
     }
 }
 
+/// A shard of a split job runs again: the job has no outcome any more, for
+/// any of its shards, until all of them ended again. Nothing changes for a
+/// task that is no shard.
+fn unjoin(c: &Connection, task: &str) -> Result<()> {
+    c.execute(
+        "UPDATE task SET spec_json=json_remove(spec_json,'$.ci.joined','$.ci.join_failure')
+         WHERE run_id=(SELECT run_id FROM task WHERE task_id=?1)
+         AND json_extract(spec_json,'$.ci.shard_group')=
+             (SELECT json_extract(spec_json,'$.ci.shard_group') FROM task WHERE task_id=?1)",
+        [task],
+    )?;
+    Ok(())
+}
+
 fn binding(c: &Connection, target: &Target, expected: u64) -> Result<Binding> {
     let (run, selected) = resolve(c, target)?;
     let (closed, source, digest): (Option<i64>, Option<String>, Option<String>) = c.query_row(
@@ -269,12 +285,19 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
             let mut stmt = c.prepare(
                 "SELECT t.task_id,t.min_generation,a.generation,a.state,a.observation,a.termination_json,a.retired,
                  EXISTS(SELECT 1 FROM attempt x LEFT JOIN retire_tombstone z USING(attempt_id) WHERE x.task_id=t.task_id AND x.retired=0 AND (x.state<>'terminal' OR (z.attempt_id IS NOT NULL AND z.confirmed_at_ms IS NULL))),
-                 json_extract(t.spec_json,'$.manifest_digest'),json_extract(t.spec_json,'$.has_secret_bundle'),coalesce(json_extract(t.spec_json,'$.in_place'),0)
+                 json_extract(t.spec_json,'$.manifest_digest'),json_extract(t.spec_json,'$.has_secret_bundle'),coalesce(json_extract(t.spec_json,'$.in_place'),0),
+                 t.cancel_requested_at_ms IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.unrunnable'),'')=?5
                  FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id ORDER BY aa.generation DESC LIMIT 1)
                  WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) AND t.task_id>?3 ORDER BY t.task_id LIMIT ?4",
             )?;
             let rows = stmt.query_map(
-                params![binding.run.as_str(), binding.selected, after, PAGE],
+                params![
+                    binding.run.as_str(),
+                    binding.selected,
+                    after,
+                    PAGE,
+                    crate::ci::shards::FAIL_FAST_REASON
+                ],
                 |r| {
                     Ok(TaskRow {
                         task: r.get(0)?,
@@ -288,6 +311,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                         manifest: r.get(8)?,
                         secret: r.get(9)?,
                         in_place: r.get(10)?,
+                        stopped_unplaced: r.get(11)?,
                     })
                 },
             )?;
@@ -298,6 +322,35 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
         }
         after = page.last().expect("nonempty page").task.clone();
         for row in page {
+            // A shard that fail-fast cancelled before it was ever placed has
+            // no attempt to prove a stop: nothing of it ever ran. A retry
+            // lets it into the queue again (its cancel and the reason are
+            // taken away). Any other task without an attempt is refused.
+            if row.generation.is_none() && row.stopped_unplaced {
+                let flag = row
+                    .secret
+                    .ok_or_else(|| StorageError::Corrupt("task secret flag missing".into()))?;
+                if secret.is_some_and(|v| v != flag) {
+                    return Err(StorageError::Immutable(
+                        "task secret binding changed".into(),
+                    ));
+                }
+                secret = Some(flag);
+                hash.update((row.task.len() as u64).to_be_bytes());
+                hash.update(row.task.as_bytes());
+                hash.update(b"stopped-unplaced");
+                hash.update(row.min.to_be_bytes());
+                hash.update([u8::from(flag), u8::from(row.in_place)]);
+                count = count
+                    .checked_add(1)
+                    .ok_or_else(|| StorageError::Invalid("task count exhausted".into()))?;
+                if let Some(revision) = authorize {
+                    c.execute("UPDATE task SET authorization_revision=?1,cancel_requested_at_ms=NULL,spec_json=json_remove(spec_json,'$.ci.unrunnable') WHERE task_id=?2",
+                        params![to_i64(revision)?, row.task])?;
+                    unjoin(c, &row.task)?;
+                }
+                continue;
+            }
             let generation = row.generation.ok_or_else(|| {
                 StorageError::Immutable(
                     "retry requires a terminal attempt; submit a new run".into(),
@@ -360,6 +413,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
             if let Some(revision) = authorize {
                 c.execute("UPDATE task SET min_generation=?1,authorization_revision=?2,cancel_requested_at_ms=NULL WHERE task_id=?3",
                     params![next, to_i64(revision)?, row.task])?;
+                unjoin(c, &row.task)?;
             }
         }
     }

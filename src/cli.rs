@@ -528,7 +528,7 @@ fn run_ci(cli: &Cli) -> i32 {
     })();
     match result {
         Ok(ci) => {
-            let code = crate::service::ci_run::exit_code(ci.report.cli_exit_code, &ci.jobs);
+            let code = ci.report.cli_exit_code;
             if cli.json {
                 println!(
                     "{}",

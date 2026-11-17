@@ -191,6 +191,8 @@ pub struct Pass {
     /// Shards that were stopped because another shard of their job failed
     /// (fail-fast).
     pub stopped: Vec<TaskId>,
+    /// Split jobs (by their id in the plan) that got their one outcome.
+    pub joined: Vec<String>,
     /// Runs that can never go on, with the reason: their tasks that were
     /// not placed yet were cancelled (and are in `unrunnable`).
     pub failed: Vec<(RunId, String)>,
@@ -242,6 +244,9 @@ pub fn fail_run(
     why: &str,
     now_ms: u64,
 ) -> crate::storage::Result<Vec<TaskId>> {
+    // A split job whose shards will never be put together is a failure:
+    // the run must not wait for its outcome.
+    store.fail_ci_joins(run, why, now_ms)?;
     store.fail_ci_tasks(run, None, why, now_ms)
 }
 
@@ -286,6 +291,33 @@ fn advance_run(
     let mut progress = replay(store, results, &plan, |task| {
         members.get(task).map(|member| &member.row)
     })?;
+    // A split job whose shards all ended has its one outcome: it is kept
+    // with the shards, where the result of the run is read. A job that is a
+    // failure says so even when the attempt of every shard succeeded.
+    for group in plan.shard_groups.iter().filter(|g| g.split) {
+        let job = group.source_jobs.join("+");
+        let Some(outcome) = progress.outcome(&group.workflow, &job) else {
+            continue;
+        };
+        let marked = |id: &String| members.get(id).and_then(|m| m.spec.ci.as_ref());
+        if group
+            .shards
+            .iter()
+            .all(|id| marked(id).is_some_and(|ci| ci.joined))
+        {
+            continue;
+        }
+        let failure = (outcome.status == JobStatus::Failure).then(|| {
+            let problems = progress.split_job_problems(&group.id);
+            problems.unwrap_or("a shard of the job failed").to_string()
+        });
+        let changed = store
+            .join_ci_shards(run, &group.id, failure.as_deref(), now_ms)
+            .map_err(fault)?;
+        if changed {
+            pass.joined.push(group.id.clone());
+        }
+    }
     for action in progress.pending_actions().to_vec() {
         let member = |task: &String| {
             members

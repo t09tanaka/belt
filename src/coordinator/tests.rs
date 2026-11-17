@@ -268,7 +268,9 @@ fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
             hold,
             steps,
             unrunnable: None,
-            fail_fast_group: None,
+            shard_group: None,
+            joined: false,
+            join_failure: None,
         }),
         commands: vec![],
         ..spec()

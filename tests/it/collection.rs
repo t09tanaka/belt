@@ -3648,7 +3648,17 @@ async fn a39_file_shards_cover_every_test_once_and_add_up_to_one_job() {
         assert_eq!(job[0].status, expected);
         assert_eq!(job[0].plan_task, group.id);
         assert_eq!(job[0].job.as_deref(), Some("test"));
-        let code = remote_task_runner::service::ci_run::exit_code(0, &lines);
+        // The run itself says so, wherever its result is read: report ends
+        // as a success, and the run is a failure only when the job is.
+        let sent = worker.payload(b);
+        let done = ci_result(&ci_task_of(&plan, "report"), "report", "success", json!({}));
+        worker.finish(b, Outcome::Succeeded, ci_out(b, &sent, &done));
+        assert_eq!(c.tick().await.unwrap().settled, vec![b.clone()]);
+        ci_collect(&c, &files, b).await;
+        let target = remote_task_runner::service::completion::Target::Run(run.clone());
+        let snapshot = c.store().completion(target).unwrap();
+        assert!(snapshot.settled());
+        let code = snapshot.exit_code().unwrap();
         match leave_out {
             None => {
                 assert_eq!((&job[0].skipped, &job[0].reason), (&None, &None));
@@ -3828,7 +3838,7 @@ async fn a41_a_job_that_cannot_be_split_says_why_and_runs_as_one_job() {
         let (c, files) = fx.open();
         let (run, ids) = ci_run(&fx, &c, &plan).await;
         let spec = c.store().ci_run_tasks(&run).unwrap()[0].spec.clone();
-        assert!(spec["ci"].get("fail_fast_group").is_none());
+        assert!(spec["ci"].get("shard_group").is_none());
         assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
         let a = c.tick().await.unwrap().placed[0].clone();
         let p = fx.w.payload(&a);
@@ -4200,10 +4210,151 @@ async fn a41_fail_fast_reaches_a_shard_that_was_never_placed_in_a_job_nothing_wa
     let snapshot = c.store().completion(target.clone()).unwrap();
     assert!(snapshot.settled());
     assert!(snapshot.exit_code().is_some_and(|code| code != 0));
-    // The shard that never ran has no attempt to retry.
-    let refused = c
-        .store()
-        .prepare_retry(target, snapshot.control_revision, "again".into());
-    let why = refused.err().map(|e| e.to_string()).unwrap_or_default();
-    assert!(why.contains("terminal attempt"), "{why}");
+    // A retry of the run takes the shard that never ran back into the
+    // queue, with the failed one and the ones that were stopped.
+    let prepared =
+        match c
+            .store()
+            .prepare_retry(target.clone(), snapshot.control_revision, "again".into())
+        {
+            Ok(remote_task_runner::storage::RetryPreparation::Prepared(prepared)) => prepared,
+            Ok(_) => panic!("a first request is no replay"),
+            Err(e) => panic!("{e}"),
+        };
+    let receipt = c.store().commit_retry(prepared, false, wall_ms()).unwrap();
+    assert_eq!(receipt.task_count, 18);
+    let rows = c.store().ci_run_tasks(&run).unwrap();
+    for row in &rows {
+        assert!(!row.cancelled && row.attempt.is_none(), "{}", row.task_id);
+        assert!(row.spec["ci"].get("unrunnable").is_none());
+        assert!(row.spec["ci"].get("joined").is_none());
+        assert!(row.spec["ci"].get("join_failure").is_none());
+    }
+    assert!(!c.store().completion(target).unwrap().settled());
+    assert_eq!(c.store().ci_waiting_runs(8).unwrap(), vec![run.clone()]);
+    let again = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
+    assert_eq!(again.len(), 16);
+    let first_time: Vec<&String> = again.keys().filter(|id| ids[*id] == waiting).collect();
+    assert!(first_time.len() <= 1);
+    assert!(ci_advance(&fx, &c).stopped.is_empty(), "nothing failed now");
+}
+
+/// A run whose split job is a failure only as a whole (every shard passed,
+/// one test was reported by none) is a failed run wherever its result is
+/// read. It is not settled before the job is joined, so no reader sees a
+/// success first. A run that can never go on does not wait for the job.
+#[tokio::test]
+async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_it() {
+    use remote_task_runner::service::completion::Target;
+    let discovered = listed(&["a", "b", "c", "d"]);
+    let adapter = CargoTest::new("1.91.0", &[], Safety::default());
+    let opts = PartitionOpts::default();
+    let only = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+    for omit in [false, true] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let whole = ci_plan(only);
+        let shards = partition_tests(&adapter, &discovered, &History::default(), 2, &opts);
+        let plan = whole
+            .with_shards(&[split_request(&whole, shards, &discovered, false)])
+            .unwrap();
+        let group = split_group(&plan);
+        let (run, ids) = ci_run_by_task(&fx, &c, &plan).await;
+        let target = Target::Run(run.clone());
+        let placed = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
+        let left_out = omit.then(|| group.assignments[1][0].clone());
+        for at in [0, 1] {
+            let leave = left_out.as_deref().filter(|_| at == 1);
+            let result = shard_result(&group, at, "success", "passed", leave);
+            end_shard(
+                &c,
+                &files,
+                &placed[&group.shards[at]],
+                Outcome::Succeeded,
+                &result,
+            )
+            .await;
+        }
+        // Every attempt ended and is collected, but the job has no outcome
+        // yet: the run is not settled, as a whole. A shard alone is.
+        let before = c.store().completion(target.clone()).unwrap();
+        assert!(before.stop_confirmed() && !before.settled());
+        assert_eq!(before.exit_code(), None);
+        let shard = Target::Task(ids[&group.shards[0]].clone());
+        assert_eq!(
+            c.store().completion(shard.clone()).unwrap().exit_code(),
+            Some(0)
+        );
+        assert_eq!(c.store().ci_waiting_runs(8).unwrap(), vec![run.clone()]);
+
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.joined, vec![group.id.clone()]);
+        assert!(ci_advance(&fx, &c).joined.is_empty(), "joined once");
+        assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
+        let after = c.store().completion(target.clone()).unwrap();
+        assert!(after.settled());
+        let rows = c.store().ci_run_tasks(&run).unwrap();
+        assert!(rows.iter().all(|row| row.spec["ci"]["joined"] == true));
+        let joined: Vec<_> = c
+            .store()
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "ci_job_joined")
+            .collect();
+        assert_eq!(joined.len(), 1);
+        assert_eq!(joined[0].payload["job"], group.id.as_str());
+        if omit {
+            assert_eq!(after.exit_code(), Some(1));
+            let failure = after.first_compute_failure.clone().unwrap();
+            assert_eq!(failure.task_id, *ids.values().min().unwrap());
+            let why = rows[0].spec["ci"]["join_failure"].as_str().unwrap();
+            assert!(why.contains("not reported"), "{why}");
+            assert_eq!(joined[0].payload["failure"], why);
+            // The shard itself passed.
+            assert_eq!(c.store().completion(shard).unwrap().exit_code(), Some(0));
+        } else {
+            assert_eq!(after.exit_code(), Some(0));
+            assert!(rows
+                .iter()
+                .all(|row| row.spec["ci"].get("join_failure").is_none()));
+            assert!(joined[0].payload["failure"].is_null());
+        }
+    }
+
+    // A run that can never go on does not wait for its split job either.
+    let fx = fx();
+    let (c, files) = fx.open();
+    let whole = ci_plan(only);
+    let shards = partition_tests(&adapter, &discovered, &History::default(), 2, &opts);
+    let plan = whole
+        .with_shards(&[split_request(&whole, shards, &discovered, false)])
+        .unwrap();
+    let group = split_group(&plan);
+    let (run, _ids) = ci_run_by_task(&fx, &c, &plan).await;
+    let placed = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
+    for at in [0, 1] {
+        let result = shard_result(&group, at, "success", "passed", None);
+        end_shard(
+            &c,
+            &files,
+            &placed[&group.shards[at]],
+            Outcome::Succeeded,
+            &result,
+        )
+        .await;
+    }
+    let rows = c.store().ci_run_tasks(&run).unwrap();
+    let digest = Digest::parse(rows[0].spec["plan_digest"].as_str().unwrap()).unwrap();
+    std::fs::remove_file(remote_task_runner::worker::ci_task::plan_path(
+        fx.dir.path(),
+        &digest,
+    ))
+    .unwrap();
+    let pass = ci_advance(&fx, &c);
+    assert_eq!(pass.failed.len(), 1, "{pass:?}");
+    let after = c.store().completion(Target::Run(run.clone())).unwrap();
+    assert!(after.settled());
+    assert_eq!(after.exit_code(), Some(1));
+    assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
 }

@@ -84,18 +84,6 @@ pub enum Part {
     Job,
 }
 
-/// The exit code of `ci`: the run's, and a failure when the run is a
-/// success but a split job is not (its shards all passed, yet together they
-/// do not hold every test once).
-pub fn exit_code(run: i32, jobs: &[JobLine]) -> i32 {
-    let failed = |line: &JobLine| line.part == Some(Part::Job) && line.status == "failure";
-    if run == 0 && jobs.iter().any(failed) {
-        1
-    } else {
-        run
-    }
-}
-
 /// The tasks of `plan` as they are queued: one spec per task, in plan order.
 /// A task that depends on another waits (`hold`) and has no inputs yet.
 pub fn task_specs(
@@ -130,9 +118,10 @@ pub fn task_specs(
                     hold: !task.depends_on.is_empty(),
                     steps: u32::try_from(demand.nodes.len()).unwrap_or(u32::MAX),
                     unrunnable: None,
-                    fail_fast_group: crate::ci::shards::group_of(plan, task)
-                        .filter(|group| group.fail_fast)
+                    shard_group: crate::ci::shards::group_of(plan, task)
                         .map(|group| group.id.clone()),
+                    joined: false,
+                    join_failure: None,
                 }),
                 toolchains: None,
                 requirements: requirements.clone(),
@@ -525,17 +514,7 @@ mod tests {
             "ci.yml/deploy: success\ntest: failure (missing: shard x)\n"
         );
 
-        // The exit code of `ci` is the run's; a split job that is a failure
-        // although every shard passed makes a successful run a failure.
-        let plain = line(Some("build"), "failure", None);
         let shard = part(Part::Shard, "failure", None);
-        let passed = part(Part::Job, "success", None);
-        let failed = part(Part::Job, "failure", None);
-        assert_eq!(exit_code(0, &[]), 0);
-        assert_eq!(exit_code(0, &[plain.clone(), shard.clone(), passed]), 0);
-        assert_eq!(exit_code(0, &[plain.clone(), failed.clone()]), 1);
-        assert_eq!(exit_code(7, &[failed]), 7);
-        assert_eq!(exit_code(7, &[plain]), 7);
         let json = serde_json::to_value(&shard).unwrap();
         assert_eq!(json["part"], "shard");
         let json = serde_json::to_value(line(None, "no_result", None)).unwrap();
@@ -543,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shard_of_a_fail_fast_job_is_queued_at_once_and_says_which_job_it_stops_with() {
+    fn a_shard_is_queued_at_once_and_says_which_split_job_it_is_of() {
         let d = Digest::of_bytes(b"x");
         for fail_fast in [true, false] {
             let plan = crate::ci::shards::tests::split_plan(fail_fast);
@@ -554,8 +533,9 @@ mod tests {
                 let ci = spec.ci.as_ref().unwrap();
                 let shard = group.shards.contains(task);
                 assert_eq!(ci.hold, !shard, "{task}");
-                let stops_with = (shard && fail_fast).then(|| group.id.clone());
-                assert_eq!(ci.fail_fast_group, stops_with, "{task}");
+                let of = shard.then(|| group.id.clone());
+                assert_eq!(ci.shard_group, of, "{task} {fail_fast}");
+                assert!(!ci.joined && ci.join_failure.is_none());
             }
         }
     }

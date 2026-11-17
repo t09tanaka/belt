@@ -240,8 +240,11 @@ fn completion_on(
     } else {
         ("", "NULL")
     };
-    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0) FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
+    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
     let mut stmt = c.prepare(&sql)?;
+    // The first shard of a split job that is a failure (see below).
+    let mut job_failed = None;
+    let whole_run = task.is_none();
     let mut rows = stmt.query(params![run, task])?;
     while let Some(row) = rows.next()? {
         let task = id("task_id", TaskId::parse(&row.get::<_, String>(0)?))?;
@@ -268,14 +271,19 @@ fn completion_on(
             return Err(StorageError::Corrupt("invalid collection verdict".into()));
         }
         snapshot.cancel_requested |= cancel;
-        snapshot.task(
-            task,
-            state,
-            observation,
-            termination,
-            cancel,
-            collection.as_deref(),
-        );
+        // A shard whose split job has no outcome yet is not done with: the
+        // run is settled only when the job is joined (the progression of
+        // the run does that once every shard ended). A job that is joined
+        // as a failure makes the run one.
+        let unjoined: bool = row.get(7)?;
+        if whole_run && row.get::<_, bool>(8)? && job_failed.is_none() {
+            job_failed = Some((task.clone(), termination));
+        }
+        let collection = collection.as_deref().filter(|_| !(whole_run && unjoined));
+        snapshot.task(task, state, observation, termination, cancel, collection);
+    }
+    if let Some((task, termination)) = job_failed {
+        snapshot.job_failure(task, termination);
     }
     if snapshot.task_count == 0 && cancelled {
         snapshot.cancel_requested = true;

@@ -31,26 +31,24 @@ pub struct CiAttempt {
 }
 
 const HELD: &str = "coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=1";
-/// A shard of a fail-fast split job that has not ended: the attempt that
-/// counts for it is not terminal, or its collection is not closed.
-const OPEN_FAIL_FAST_SHARD: &str = "json_extract(t.spec_json,'$.ci.fail_fast_group') IS NOT NULL
-    AND NOT EXISTS (SELECT 1 FROM attempt a JOIN collection x ON x.attempt_id=a.attempt_id
-        WHERE a.attempt_id=(SELECT aa.attempt_id FROM attempt aa
-            WHERE aa.task_id=t.task_id AND aa.retired=0 AND aa.generation>=t.min_generation
-            ORDER BY aa.generation DESC LIMIT 1)
-        AND a.state='terminal' AND x.closed_at_ms IS NOT NULL)";
+/// A shard of a split job that has not been joined yet: its job has no
+/// outcome, whether the shard was cancelled or not.
+const UNJOINED_SHARD: &str = "json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL
+    AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0";
 
 impl CoordinatorStore {
     /// The runs that have a task waiting for the jobs it needs, or a shard
-    /// of a fail-fast split job that has not ended (a failed shard of the
-    /// job is to stop it), oldest first. A task that was cancelled, or whose
-    /// run is closed, waits for nothing.
+    /// of a split job that is not joined yet (a failed shard may have to
+    /// stop the others, and the job needs its one outcome before the run is
+    /// settled), oldest first. A waiting task that was cancelled waits for
+    /// nothing; a shard is joined even when it was. A closed run has
+    /// neither.
     pub fn ci_waiting_runs(&self, limit: u32) -> Result<Vec<RunId>> {
         self.db.call(move |c| {
             let mut query = c.prepare(&format!(
                 "SELECT t.run_id FROM task t JOIN run r ON r.run_id=t.run_id
-                 WHERE ({HELD} OR ({OPEN_FAIL_FAST_SHARD}))
-                 AND t.cancel_requested_at_ms IS NULL AND r.closed_at_ms IS NULL
+                 WHERE (({HELD} AND t.cancel_requested_at_ms IS NULL) OR ({UNJOINED_SHARD}))
+                 AND r.closed_at_ms IS NULL
                  GROUP BY t.run_id ORDER BY min(t.created_at_ms), min(t.rowid) LIMIT ?1"
             ))?;
             let rows = query.query_map([i64::from(limit)], |r| r.get::<_, String>(0))?;
@@ -102,6 +100,76 @@ impl CoordinatorStore {
                 });
             }
             Ok(out)
+        })
+    }
+
+    /// The split job `group` of `run` has its one outcome: mark every shard
+    /// of it as joined, with what is wrong when the job is a failure, and
+    /// record the event `ci_job_joined`, in one transaction. Returns whether
+    /// anything changed (a job that is joined already is left as it is).
+    pub fn join_ci_shards(
+        &self,
+        run: &RunId,
+        group: &str,
+        failure: Option<&str>,
+        at_ms: u64,
+    ) -> Result<bool> {
+        let (run, group, failure) = (
+            run.to_string(),
+            group.to_string(),
+            failure.map(str::to_string),
+        );
+        self.db.write(move |tx| {
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE task AS t SET spec_json=CASE WHEN ?3 IS NULL
+                        THEN json_set(t.spec_json,'$.ci.joined',json('true'))
+                        ELSE json_set(t.spec_json,'$.ci.joined',json('true'),'$.ci.join_failure',?3) END
+                     WHERE t.run_id=?1 AND json_extract(t.spec_json,'$.ci.shard_group')=?2
+                     AND {UNJOINED_SHARD}"
+                ),
+                params![run, group, failure],
+            )?;
+            if changed == 0 {
+                return Ok(false);
+            }
+            common::append_event(
+                tx,
+                Some(&run),
+                None,
+                "ci_job_joined",
+                &serde_json::json!({ "job": group, "failure": failure }),
+                at_ms,
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// The run can never go on (`why`): every split job of it that is not
+    /// joined yet is a failure with that reason, so the run does not wait
+    /// for an outcome nobody can make. Returns how many shards changed.
+    pub fn fail_ci_joins(&self, run: &RunId, why: &str, at_ms: u64) -> Result<usize> {
+        let (run, why) = (run.to_string(), why.to_string());
+        self.db.write(move |tx| {
+            let changed = tx.execute(
+                &format!(
+                    "UPDATE task AS t SET spec_json=json_set(t.spec_json,
+                        '$.ci.joined',json('true'),'$.ci.join_failure',?2)
+                     WHERE t.run_id=?1 AND {UNJOINED_SHARD}"
+                ),
+                params![run, why],
+            )?;
+            if changed > 0 {
+                common::append_event(
+                    tx,
+                    Some(&run),
+                    None,
+                    "ci_job_joined",
+                    &serde_json::json!({ "job": Value::Null, "failure": why }),
+                    at_ms,
+                )?;
+            }
+            Ok(changed)
         })
     }
 
