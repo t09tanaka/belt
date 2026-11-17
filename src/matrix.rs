@@ -80,50 +80,28 @@ fn expand_with_limit(
             }
         };
         if let Some(bytes) = byte_limit {
-            let old_bytes = combos
-                .iter()
-                .try_fold(0usize, |sum, combo| -> Result<usize> {
-                    sum.checked_add(crate::expr::serialized_size(combo, bytes)?)
-                        .ok_or_else(|| {
-                            anyhow::Error::new(crate::expr::EvaluationBudgetExceeded(
-                                "matrix byte budget exceeded",
-                            ))
-                        })
-                })?;
-            let value_bytes = values
-                .iter()
-                .try_fold(0usize, |sum, value| -> Result<usize> {
-                    sum.checked_add(crate::expr::serialized_size(value, bytes)?)
-                        .ok_or_else(|| {
-                            anyhow::Error::new(crate::expr::EvaluationBudgetExceeded(
-                                "matrix byte budget exceeded",
-                            ))
-                        })
-                })?;
+            // What the product with this key holds: each combination once per
+            // value, each value once per combination, the key in all of them.
+            // A size above the budget is an error of its own; the sums saturate.
+            let mut old_bytes = 0usize;
+            for combo in &combos {
+                old_bytes = old_bytes.saturating_add(crate::expr::serialized_size(combo, bytes)?);
+            }
+            let mut value_bytes = 0usize;
+            for value in values {
+                value_bytes =
+                    value_bytes.saturating_add(crate::expr::serialized_size(value, bytes)?);
+            }
             let key_bytes = crate::expr::serialized_size(k, bytes)?;
             let next_bytes = old_bytes
-                .checked_mul(values.len())
-                .and_then(|n| {
-                    value_bytes
-                        .checked_mul(combos.len())
-                        .and_then(|v| n.checked_add(v))
-                })
-                .and_then(|n| {
+                .saturating_mul(values.len())
+                .saturating_add(value_bytes.saturating_mul(combos.len()))
+                .saturating_add(
                     combos
                         .len()
-                        .checked_mul(values.len())
-                        .and_then(|count| {
-                            key_bytes
-                                .checked_add(2)
-                                .and_then(|overhead| count.checked_mul(overhead))
-                        })
-                        .and_then(|overhead| n.checked_add(overhead))
-                })
-                .ok_or_else(|| {
-                    anyhow::Error::new(crate::expr::EvaluationBudgetExceeded(
-                        "matrix byte budget exceeded",
-                    ))
-                })?;
+                        .saturating_mul(values.len())
+                        .saturating_mul(key_bytes.saturating_add(2)),
+                );
             if next_bytes > bytes {
                 return Err(
                     crate::expr::EvaluationBudgetExceeded("matrix byte budget exceeded").into(),
@@ -163,9 +141,9 @@ fn expand_with_limit(
                 let existing = crate::expr::serialized_size(&combos, bytes)?;
                 let item_bytes = crate::expr::serialized_size(item, bytes)?;
                 let additional = item_bytes
-                    .checked_mul(base_len.max(1))
-                    .and_then(|n| n.checked_add(existing));
-                if additional.is_none_or(|n| n > bytes) {
+                    .saturating_mul(base_len.max(1))
+                    .saturating_add(existing);
+                if additional > bytes {
                     return Err(crate::expr::EvaluationBudgetExceeded(
                         "matrix include byte budget exceeded",
                     )
@@ -313,11 +291,63 @@ mod bounded_tests {
 #[cfg(test)]
 mod output_budget_tests {
     use super::*;
+    use serde_json::json;
     #[test]
     fn portable_byte_budget_rejects_cartesian_copies_before_construction() {
         let value =
             serde_json::json!({"blob":["x".repeat(16*1024)],"n":(0..32).collect::<Vec<_>>()});
         assert!(expand_portable(&value, 4096, 32 * 1024).is_err());
         assert_eq!(expand_bounded(&value, 4096).unwrap().len(), 32);
+    }
+
+    fn budget(result: Result<Vec<Map<String, Value>>>) -> bool {
+        result
+            .unwrap_err()
+            .downcast_ref::<crate::expr::EvaluationBudgetExceeded>()
+            .is_some()
+    }
+
+    #[test]
+    fn a_portable_expansion_needs_a_positive_count_and_fits_its_bytes_exactly() {
+        let m = json!({"a": ["x", "y"], "b": [1, 2, 3]});
+        assert!(budget(expand_portable(&m, 0, 1 << 20)));
+        assert!(budget(expand_portable(&m, 5, 1 << 20)));
+        assert_eq!(expand_portable(&m, 6, 1 << 20).unwrap().len(), 6);
+        // `a`: one empty combination `{}` (2 bytes) for each of two values,
+        // the values `"x"` and `"y"` (3 bytes each), and `"a"` + 2 twice
+        let a = 2 * 2 + (3 + 3) + 2 * (3 + 2);
+        assert_eq!(a, 20);
+        let one = json!({"a": ["x", "y"]});
+        assert_eq!(expand_portable(&one, 2, a).unwrap().len(), 2);
+        assert!(budget(expand_portable(&one, 2, a - 1)));
+        // `b`: the two combinations `{"a":"x"}` (9 bytes each) for each of
+        // three values, three one-byte values for each of the two, and
+        // `"b"` + 2 six times
+        let b = (9 + 9) * 3 + (1 + 1 + 1) * 2 + 6 * (3 + 2);
+        assert_eq!(b, 90);
+        assert_eq!(expand_portable(&m, 6, b).unwrap().len(), 6);
+        assert!(budget(expand_portable(&m, 6, b - 1)));
+        // a scalar is one value; a value larger than the budget is refused as such
+        assert_eq!(expand_portable(&json!({"a": "x"}), 1, 10).unwrap().len(), 1);
+        assert!(budget(expand_portable(&json!({"a": "x"}), 1, 9)));
+        assert!(budget(expand_portable(&json!({"a": ["0123456789"]}), 1, 8)));
+    }
+
+    #[test]
+    fn a_portable_include_is_counted_once_for_each_combination_it_may_extend() {
+        // the base `[{"a":"x"},{"a":"y"}]` is 21 bytes, the item `{"c":"z"}` 9
+        let m = json!({"a": ["x", "y"], "include": [{"c": "z"}]});
+        let need = 21 + 9 * 2;
+        let all = expand_portable(&m, 2, need).unwrap();
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().all(|c| c["c"] == "z"));
+        assert!(budget(expand_portable(&m, 2, need - 1)));
+        // with no base the item is one combination of its own: `[]` and itself
+        let only = json!({"include": [{"c": "z"}]});
+        assert_eq!(expand_portable(&only, 1, 2 + 9).unwrap().len(), 1);
+        assert!(budget(expand_portable(&only, 1, 2 + 9 - 1)));
+        // an item that is not a mapping is passed over, as without a budget
+        let odd = json!({"a": ["x"], "include": ["text"]});
+        assert_eq!(expand_portable(&odd, 1, 64).unwrap().len(), 1);
     }
 }
