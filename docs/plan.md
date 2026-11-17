@@ -261,7 +261,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A29 | 自動 | `non_utf8_bytes_round_trip_per_stream`・`reads_resume_from_any_offset_without_duplicates`・`limit_is_shared_and_the_rest_is_counted_as_dropped`（`src/supervisor/tests.rs`）、`collection::active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset` | |
 | A30 | 自動 | `collection::a30_a_worker_that_disappears_while_collecting_is_continued_where_it_stopped`、`coordinator::a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_worker_is_told` | |
 | A31 | 自動 | `collection::a31_an_empty_or_short_set_of_results_is_told_apart_and_never_a_success` | |
-| A32 | 未実装 | | S19 |
+| A32 | 統合検証待ち | `ci::status::a32_a_dirty_or_synthetic_snapshot_is_not_posted_to_the_original_head`、`the_outcome_says_posted_skipped_or_failed_and_posts_at_most_once` | 統合後の CI |
 | A33 | 自動 | `worker_agent::capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed`、`worker_agent::a_secret_that_cannot_be_masked_keeps_the_command_from_starting`、`secrets::a_run_that_lost_its_bundle_is_blocked_not_resumed_with_something_else` | |
 | A34 | 自動＋残り | 偽の Launcher・偽の ssh: `upgrade_switches_checks_the_bridge_and_commits`・`an_interrupted_switch_is_finished_by_running_upgrade_again`（`src/service/workers/upgrade/tests.rs`） | 本物の launchd・実 SSH での install / upgrade / rollback（S26） |
 | A35 | 一部 | macOS の計画と偽の launchctl: `proven_start_rejection_rolls_back_but_unknown_preserves_evidence`（`src/service/macos/tests.rs`） | Linux の systemd は偽の runner での試験まで（user mode。実機は S26）、system-user mode の配線（S24 の残り）、実際の service 環境での doctor（S26） |
@@ -269,13 +269,13 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A37 | S26 | | 実際のプロジェクトの CI を親のみと複数 worker で比べる |
 | A38 | 一部 | worker の側だけ: `a_job_that_needs_another_runs_in_another_attempt_from_the_first_ones_result`（`src/supervisor/ci_task/run_tests.rs`） | 親が先行 Job の output・artifact を確定してから別 host で後続を始める経路（S16 が未了） |
 | A39〜A41 | 未実装 | | S18（RTR の配置と集約）。adapter の分割・合算は local-ci 側の試験（L2・L3） |
-| A42 | 一部 | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts` | 導入中の負荷を forecast に含めること（S20 の残件）、実 manager と network での導入 |
+| A42 | 一部 | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts` | 導入中の負荷は `worker_agent::a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for` の統合検証待ち。実 manager と network での導入は S26 |
 | A43 | 自動 | `secrets::a43_the_secret_files_reach_the_worker_as_0600_and_are_gone_after_the_attempt` | |
 | A44 | 自動＋残り | 偽の ssh と偽の tool: `diff_classifies_the_five_ways_a_worker_can_differ`・`sync_blocks_what_needs_a_person_with_the_steps`（`tests/it/workers_lifecycle.rs` の `a44`）、`bootstrap::workers_sync_installs_through_the_resident_then_measures_again_and_needs_the_resident` | 実際の worker との差（S26） |
 | A45 | 一部 | OS 依存部分は CI の ubuntu と macOS の両方で同じ試験が走る（`src/platform` の単体試験、`tests/it/supervisor.rs`） | 実 systemd での導入・起動・停止（偽の runner での試験は S24 で済み）、system-user mode の配線（S24 の残り）、x86_64 と arm64 の実 worker（S26 の Docker） |
 | A46 | 一部 | worker の側: `tests/it/worker_ephemeral.rs`（起動ごとの identity）。親の側: `coordinator::forget::tests::an_unreachable_ephemeral_worker_keeps_its_attempt_unknown_until_it_is_forgotten`・`a_new_start_retires_the_identity_before_it_and_is_sent_none_of_its_attempts`、`service::resident::remote::tests::an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_resident` | トンネル越しの実 SSH で一時 worker に配置し、切断して forget するまでの通し（S26） |
 | A47 | 自動 | `secrets::worktreeinclude_picks_only_ignored_untracked_files_and_the_store_never_holds_them`、`worker_agent::the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_any_name` | |
-| A48 | 一部 | `workspace::add_and_remove_a_commit_workspace`、`workspace::the_original_is_never_written`（CI は `RTR_REQUIRE_FAST_WORKTREE` で fast-worktree を必須にする） | terminal 後に portool の割当が消えることを確かめる試験が無い |
+| A48 | 一部 | `workspace::add_and_remove_a_commit_workspace`、`workspace::the_original_is_never_written`（CI は `RTR_REQUIRE_FAST_WORKTREE` で fast-worktree を必須にする） | `workspace::removing_an_attempt_releases_only_its_portool_allocation` の統合検証待ち（同じ worker にある別 attempt の割当も確認） |
 | A49 | 自動 | `scheduler::a_preferred_worker_is_taken_while_the_others_are_not_faster_by_the_correction`、`collection_is_added_to_the_forecast_and_the_priority_correction_to_that`（`src/scheduler/decide.rs`）、設定から scheduler まで: `runtime::runtime_attach_applies_only_verified_identity_priorities` | |
 
 件数（A39〜A41 は 3 件と数える）: 自動 29、自動＋残り 7、一部 6、未実装 6、S26 のみ 1。
