@@ -2571,7 +2571,7 @@ async fn public_outputs_retained_corruption_is_internal_before_publication() {
             8,
         )
         .unwrap();
-        let guard = db.result_gc_guard(&run).unwrap();
+        let guard = crate::test_tmp::gc_guard(&db, &run);
         assert!(
             db.claim_result_page(&guard, &run, "", 64, 100, 10, Some("boot".into()), 10)
                 .unwrap()
@@ -2607,7 +2607,7 @@ async fn public_outputs_retained_corruption_is_internal_before_publication() {
             if phase == 0 {
                 assert!(files.artifact_path(&attempt, &artifact.digest).exists());
                 let restarted = CoordinatorStore::open(&spec.state_dir, 30).unwrap();
-                let guard = restarted.result_gc_guard(&run).unwrap();
+                let guard = crate::test_tmp::gc_guard(&restarted, &run);
                 for claim in &claims {
                     files.remove(&claim.locator).unwrap();
                     restarted.finish_result_delete(&guard, claim).unwrap();

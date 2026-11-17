@@ -31,7 +31,7 @@ fn sweep(
     let retention = remote_task_runner::results::plan::retention_ms(days);
     let mut report = Sweep::default();
     for run in store.query_runs(64, None)?.items {
-        let guard = store.result_gc_guard(&run.run_id)?;
+        let guard = crate::test_tmp::gc_guard(store, &run.run_id);
         // Give the fixture a full, known elapsed retention interval.
         store.claim_result_page(
             &guard,
@@ -1858,7 +1858,7 @@ async fn gc_pin_contention_skips_live_poll_without_stopping_coordinator() {
         job.out.log = b"live".to_vec();
     });
     c.tick().await.unwrap();
-    let guard = c.store().result_gc_guard(&run).unwrap();
+    let guard = crate::test_tmp::gc_guard(c.store(), &run);
     let report = c.collect(&files, cfg()).await.unwrap();
     assert!(report.pending.contains(&a));
     assert!(report.faults.is_empty());
@@ -1896,7 +1896,7 @@ async fn gc_pin_contention_leaves_terminal_collection_pending_and_corruption_err
         },
     )
     .await;
-    let guard = c.store().result_gc_guard(&run).unwrap();
+    let guard = crate::test_tmp::gc_guard(c.store(), &run);
     let report = c.collect(&files, cfg()).await.unwrap();
     assert!(report.pending.contains(&a));
     assert!(report.faults.is_empty());
@@ -1907,7 +1907,7 @@ async fn gc_pin_contention_leaves_terminal_collection_pending_and_corruption_err
     let (run, _, a) = placed(&fx, &c, vec![]).await;
     fx.w.set(|s| s.jobs.get_mut(&a).unwrap().state = AttemptState::Active);
     c.tick().await.unwrap();
-    drop(c.store().result_gc_guard(&run).unwrap());
+    drop(crate::test_tmp::gc_guard(c.store(), &run));
     let pin = fx.dir.path().join(format!("reader-pins/{run}.lock"));
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&pin, std::fs::Permissions::from_mode(0o666)).unwrap();
