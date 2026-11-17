@@ -91,9 +91,7 @@ nested cwd は標準実行の cwd 合成との一致を別途修正・検証す�
 
 この slice で S15f は完了しない。転送・setup・成果物回収は実測モデル未接続のため unknown と明示する。source-ready・setup receipt・collection-complete の検証済み境界で、identity・TTL・sample count・provenance を保つ bounded な観測を記録し、実配置と estimate が同じ CostModel を使う接続を必須残件として維持する。queue wait を転送時間へ混ぜず、結果の総 byte 数が不明なら回収コストも unknown のままにする。
 
-### S15f: 見積と配置の一致、配置理由の表示（2026-11-17、main `4a6ec25` 起点）
-
-保存済み task の `estimate --task` が、同じ状態の配置と違う worker を答えることがあった。原因は 3 つである。(1) 配置は親の実測と cost model（`CostModel::costs`）の値を合成して比べるが、見積は実測の照会（`query`）だけを使っていた。(2) 配置は不明な部分へ最悪の既知値を入れてから forecast を照会するが、見積は照会のあとに入れていたので、worker へ渡す ready の遅れが違った。(3) error で答えた worker を、配置は数値の無い候補として比べ、見積は除外していた。
+S15f の追加 slice（2026-11-17、main `4a6ec25` 起点）は、見積と配置の一致と配置理由の表示である。保存済み task の `estimate --task` が、同じ状態の配置と違う worker を答えることがあった。原因は 3 つである。(1) 配置は親の実測と cost model（`CostModel::costs`）の値を合成して比べるが、見積は実測の照会（`query`）だけを使っていた。(2) 配置は不明な部分へ最悪の既知値を入れてから forecast を照会するが、見積は照会のあとに入れていたので、worker へ渡す ready の遅れが違った。(3) error で答えた worker を、配置は数値の無い候補として比べ、見積は除外していた。
 
 対応:
 
@@ -105,7 +103,7 @@ nested cwd は標準実行の cwd 合成との一致を別途修正・検証す�
 
 検証（手元、rustc 1.100.0）:
 
-- `tests/it/scheduler.rs` `a_preview_names_the_worker_the_placement_then_takes_and_moves_nothing`: busy な worker と cold な worker で、cold の setup が長い場合と短い場合（勝者が入れ替わる）のそれぞれについて、queue にある task の見積を 100 回取り、queue・attempt 数・待機理由・各 worker の保持 attempt と submit の受信数が変わらないこと、続く配置の配置理由（worker・理由・順序・内訳の全フィールド）が 100 回の見積の `decision` と等しいことを確かめる。修正前はこのテストが失敗した（見積が cost model の値を持たず、cold を選んだ）。
+- `tests/it/scheduler.rs` `a_preview_names_the_worker_the_placement_then_takes_and_moves_nothing`: busy な worker と cold な worker で、cold の setup が長い場合と短い場合（勝者が入れ替わる）のそれぞれについて、queue にある task の見積を 100 回取り、queue・attempt 数・待機理由・run の event 数・各 worker の保持 attempt と submit／cancel／retire／renew の受信数が変わらないこと、続く配置の配置理由（worker・理由・順序・内訳の全フィールド）が 100 回の見積の `decision` と等しいことを確かめる。修正前はこのテストが失敗した（見積が cost model の値を持たず、cold を選んだ）。
 - 既存の `coordinator::estimate::tests::estimate_100_calls_preserve_every_durable_row_epoch_and_actor_state`（DB 全行・epoch・lease seq 不変）と、準備 identity・resident・bootstrap の見積のテストはそのまま通る。
 - `scheduler::preview` の unit test は出力の全文を比べる。
 
@@ -114,13 +112,14 @@ nested cwd は標準実行の cwd 合成との一致を別途修正・検証す�
 - 見積は source が worker で ready かどうかで候補を絞らない。仮の追加実行を答えるためで、配置の `ready || measured_cold` の絞り込みと、誰も ready でないときの決定の見送りは写さない。
 - error で答えた worker は、ready かどうかに関わらず数値の無い候補として比べる（配置は ready な worker だけをそう扱い、cold な worker は外す）。
 - 古い epoch を理由に断られた forecast で、見積は fence しない。答えの無い worker として外す。
+- 保留中の CI task（`ci.hold`）は配置が飛ばすが、見積は仮の実行として比べる。満杯で能力も合わない worker は、配置が満杯、見積が能力不一致として外す（外す結論は同じ）。
 - 未投入の command の見積は従来どおり（cost model の task adapter は task が無いので呼ばない。error の答えは除外）。
 
 S15f の残り（この変更では閉じていない。行は未完了のままとする）:
 
 - setup の実測モデル: 観測を setup の秒数・ready の遅れ・warm の判定へ変換する接続（実 TTC の ledger identity と依存・resource graph の対応、artifact の完全検証と正確な activation の証明）。それまで setup は unknown。
 - 上の「決めたこと」で写していない配置の条件（source ready と実測 cold の絞り込み、入力を断った worker の `InputRefused`）を見積へ写すかどうか。queue にある task に限れば写せるが、終了済み task の仮の追加実行と両立する表示が要る。
-- 実 worker・実 owner を通した利用者経路で、見積と配置の一致を確かめる受入（今回は in-memory の worker）。Docker 受入。
+- 実 worker・実 owner を通した利用者経路で、見積と配置の一致を確かめる受入（今回の一致の証明は、入力 gate を持たない in-memory の worker に対するもの。入力 gate のある接続で、source が一部の worker だけで ready な queue 中の task は、上の「決めたこと」の 1 点目により配置と違う答えになり得る）。Docker 受入。
 - 変更後の pure coverage と全体の mutation は親の gate で確かめる（今回は `src/scheduler/preview.rs` だけを `cargo schemata` にかけた）。
 
 S15c の常駐入力は既存 user config の隣にある private `coordinator.json` に保存し、既存 bootstrap input を再利用する。`config.toml` の文法や暗黙の環境変数は追加しない。未初期化は明示エラーとし、`ls` / `show` は停止中でも読み取り専用 DB を使い、起動・epoch 更新・migration を行わない。`submit` だけが必要な owner 起動を要求する。

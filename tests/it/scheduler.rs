@@ -314,21 +314,27 @@ async fn busy_and_cold(cold_setup_ms: u64) -> (Fx, Coordinator, Arc<FakeWorker>,
 }
 
 /// Everything a preview could have moved: the queue, the attempts, the
-/// reason a task waits for, and what each worker holds and was told.
+/// reason a task waits for, the events, and what each worker holds and was
+/// told to do.
 #[derive(Debug, PartialEq)]
 struct Demand {
     queued: Vec<TaskId>,
     attempts: usize,
     waiting: Option<Decision>,
-    workers: Vec<(Vec<AttemptId>, usize)>,
+    events: usize,
+    workers: Vec<(Vec<AttemptId>, [usize; 4])>,
 }
 
 fn demand(c: &Coordinator, task: &TaskId, workers: &[&Arc<FakeWorker>]) -> Demand {
-    let told = |w: &&Arc<FakeWorker>| (w.holds(), w.received(Op::Submit));
+    let told = |w: &&Arc<FakeWorker>| {
+        let received = [Op::Submit, Op::Cancel, Op::Retire, Op::Renew].map(|op| w.received(op));
+        (w.holds(), received)
+    };
     Demand {
         queued: queued(c),
         attempts: attempts(c, task).len(),
         waiting: c.scheduler().waiting_reason(task),
+        events: c.store().events_after(0, 10_000).unwrap().len(),
         workers: workers.iter().map(told).collect(),
     }
 }
