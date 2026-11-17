@@ -86,7 +86,7 @@ impl DiscoveryStep {
             }
             let path = ran.log.as_ref()?;
             let relative = path.strip_prefix(run_dir).ok()?;
-            let file = crate::platform::open_beneath(run_dir,relative).ok()?;
+            let file = crate::platform::open_beneath(run_dir, relative).ok()?;
             if !file.metadata().ok()?.is_file() {
                 return None;
             }

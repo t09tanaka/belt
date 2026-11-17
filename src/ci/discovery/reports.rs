@@ -64,9 +64,15 @@ pub(super) fn job_requirement(plan: &FrozenPlan, step: &DiscoveryStep) -> Option
 }
 
 pub(super) fn reason(
-    plan: &FrozenPlan, step: &DiscoveryStep, workspace: &Path,root: &Path,info: &local_ci::shard::RunnerInfo,
+    plan: &FrozenPlan,
+    step: &DiscoveryStep,
+    workspace: &Path,
+    root: &Path,
+    info: &local_ci::shard::RunnerInfo,
 ) -> Option<NotSplit> {
-    if let Some(reason) = job_requirement(plan,step) {return Some(reason);}
+    if let Some(reason) = job_requirement(plan, step) {
+        return Some(reason);
+    }
     if info.runner == "cargo-test" {
         return None;
     }
@@ -128,8 +134,19 @@ pub(super) fn reason(
             Some(text) => reported(&text).or_else(|| {
                 // An imported or inherited project configuration can install a
                 // reporter whose output cannot be seen from this file.
-                ["from './", "from "./", "from '../", "from "../", "require(", "import(", "...", "extends:"].iter()
-                    .any(|token| text.contains(token)).then_some(NotSplit::InexactAggregation)
+                [
+                    "from './",
+                    r#"from "./"#,
+                    "from '../",
+                    r#"from "../"#,
+                    "require(",
+                    "import(",
+                    "...",
+                    "extends:",
+                ]
+                .iter()
+                .any(|token| text.contains(token))
+                .then_some(NotSplit::InexactAggregation)
             }),
             None => Some(NotSplit::InexactAggregation),
         })

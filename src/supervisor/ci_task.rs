@@ -351,7 +351,7 @@ pub(crate) fn run_task(
             .map_err(|e| e.to_string())?;
         let mut json = serde_json::to_vec(&listing).map_err(|e| e.to_string())?;
         if json.len() as u64 > crate::ci::advance::MAX_RESULT_BYTES {
-            json = serde_json::to_vec(&listing.step.failed()).map_err(|e|e.to_string())?;
+            json = serde_json::to_vec(&listing.step.failed()).map_err(|e| e.to_string())?;
         }
         std::fs::write(ci.result_path(), json).map_err(|e| e.to_string())?;
         return Ok(vec![JobStatus::Success]);
