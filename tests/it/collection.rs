@@ -455,6 +455,9 @@ impl WorkerLink for Worker {
     fn matrix_dispatch_negotiated(&self) -> bool {
         self.ci_task_negotiated()
     }
+    fn ci_discovery_negotiated(&self) -> bool {
+        self.ci_task_negotiated()
+    }
     fn ci_task_negotiated(&self) -> bool {
         !self.state.lock().unwrap().no_ci
     }
@@ -5039,4 +5042,91 @@ jobs:
             .exit_code(),
         Some(0)
     );
+}
+
+/// The parent starts from the unpartitioned job. A separate discovery
+/// attempt yields a collected listing and only then do the two shards
+/// become eligible. Repeated progression cannot create a second copy.
+#[tokio::test]
+async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed() {
+    use remote_task_runner::ci::discovery::{candidates, stage, WorkerListing};
+    let fx = fx();
+    let (c, files) = fx.open();
+    let whole = ci_plan(
+        "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npx jest\n",
+    );
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &whole).unwrap();
+    let manifest = Digest::of_bytes(b"manifest");
+    let mut specs = remote_task_runner::service::ci_run::task_specs(
+        &whole,
+        &digest,
+        &manifest,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    stage(&whole, &mut specs, 2, "example/project", &[]);
+    let run = RunId::generate();
+    let source = SourceId::generate();
+    c.store().put_source_ref(&source, &manifest, 1).unwrap();
+    let steps = candidates(&whole);
+    let discovery = steps[0].task_id();
+    let task_id = TaskId::generate();
+    c.enqueue(
+        run.clone(),
+        source,
+        specs
+            .into_iter()
+            .map(|(name, spec)| {
+                (
+                    if name == discovery {
+                        TaskId::generate()
+                    } else {
+                        task_id.clone()
+                    },
+                    spec,
+                )
+            })
+            .collect(),
+    )
+    .await
+    .unwrap();
+    let placed = c.tick().await.unwrap().placed;
+    assert_eq!(placed.len(), 1);
+    assert_eq!(fx.w.payload(&placed[0]).ci_task.unwrap().task_id, discovery);
+    assert!(c.store().attempts_of_task(&task_id).unwrap().is_empty());
+    let listing = WorkerListing {
+        setup_ms: None,
+        step: steps[0].clone(),
+        runner_version: "30.2".into(),
+        discovered: listed(&["a.js", "b.js", "c.js", "d.js"]),
+    };
+    end_shard(
+        &c,
+        &files,
+        &(placed[0].clone(), fx.w.clone()),
+        Outcome::Succeeded,
+        &serde_json::to_vec(&listing).unwrap(),
+    )
+    .await;
+    for _ in 0..3 {
+        let pass = ci_advance(&fx, &c);
+        assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
+    }
+    let rows = c.store().ci_run_tasks(&run).unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.spec["ci"]["shard_group"].is_string())
+            .count(),
+        2
+    );
+    let placed = c.tick().await.unwrap().placed;
+    assert_eq!(placed.len(), 2);
+    assert_eq!(c.store().attempts_of_task(&task_id).unwrap().len(), 1);
+    let changed = fx.w.payload(&placed[0]).ci_task.unwrap().plan_digest;
+    assert_ne!(changed, digest);
+    let bytes = remote_task_runner::ci::advance::read_plan(fx.dir.path(), &changed).unwrap();
+    let split: local_ci::FrozenPlan = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(split_group(&split).manifest, listing.discovered.tests);
 }

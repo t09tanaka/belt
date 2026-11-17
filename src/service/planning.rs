@@ -92,10 +92,10 @@ fn captured_text(
     }
     Ok(Some(text))
 }
-fn captured_workflow_dirs(
+fn captured_ci_config(
     store: &SourceStore,
     manifest: &SourceManifest,
-) -> Result<Vec<String>, ApiError> {
+) -> Result<(Vec<String>, Vec<crate::config::model::ShardPolicy>), ApiError> {
     use crate::config::{self, resolve::Loaded, Inputs, Overlay};
     let project = captured_text(store, manifest, ".remote-task-runner.toml")?
         .map(|text| {
@@ -110,14 +110,46 @@ fn captured_workflow_dirs(
         .map(|text| config::legacy::from_text(".local-ci.toml", &text))
         .transpose()
         .map_err(|_| failure("captured legacy configuration is invalid"))?;
+    let policies = project
+        .as_ref()
+        .and_then(|p| p.value.ci.as_ref())
+        .map(|ci| ci.sharding.clone())
+        .unwrap_or_default();
     config::resolve(&Inputs {
         overlay: &Overlay::default(),
         project: project.as_ref(),
         legacy: legacy.as_ref(),
         user: None,
     })
-    .map(|resolved| resolved.workflows_dirs.value)
+    .map(|resolved| (resolved.workflows_dirs.value, policies))
     .map_err(|_| failure("captured planning configuration is invalid"))
+}
+
+/// Read the exact plan currently bound to this run. A run still discovering
+/// its tests shows its initial plan; once applied it shows the partition.
+pub fn stored(context: &Context, run: &RunId) -> Result<crate::ci::summary::PlanSummary, ApiError> {
+    let store = super::bootstrap::read_only_store(&context.bootstrap)
+        .map_err(|_| failure("coordinator state is unavailable"))?;
+    let rows = store
+        .ci_run_tasks(run)
+        .map_err(|_| failure("cannot read the stored run"))?;
+    let digest = rows
+        .iter()
+        .filter(|r| r.spec.pointer("/ci/task/inputs/rtr_discovery").is_none())
+        .find_map(|r| {
+            r.spec
+                .pointer("/ci/task/plan_digest")
+                .and_then(|v| v.as_str())
+        })
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no stored CI plan for this run"))?;
+    let digest =
+        crate::ids::Digest::parse(digest).map_err(|_| failure("invalid stored plan digest"))?;
+    let bytes = crate::ci::advance::read_plan(context.state_dir(), &digest)
+        .map_err(|_| failure("stored CI plan is unavailable"))?;
+    let plan = serde_json::from_slice(&bytes).map_err(|_| failure("stored CI plan is invalid"))?;
+    let ci = CiPlan::from_frozen(plan)
+        .map_err(|_| failure("stored CI plan cannot be summarized safely"))?;
+    Ok(ci.summary().clone())
 }
 
 /// Capture once. The core reads only verified objects and owns its secret-free view.
@@ -153,7 +185,15 @@ pub(super) fn freeze(
     store: &SourceStore,
     manifest: &SourceManifest,
 ) -> Result<local_ci::FrozenPlan, ApiError> {
-    let workflow_dirs = captured_workflow_dirs(store, manifest)?;
+    freeze_with_policies(store, manifest).map(|(plan, _)| plan)
+}
+
+pub(super) fn freeze_with_policies(
+    store: &SourceStore,
+    manifest: &SourceManifest,
+) -> Result<(local_ci::FrozenPlan, Vec<crate::config::model::ShardPolicy>), ApiError> {
+    let (workflow_dirs, policies) = captured_ci_config(store, manifest)?;
+
     let options = PinnedPlanOptions {
         workflow_dirs_override: Some(workflow_dirs),
         filters: Filters {
@@ -177,6 +217,7 @@ pub(super) fn freeze(
             })
         })
         .map_err(|_| failure("captured planning input is unavailable"))?
+        .map(|plan| (plan, policies))
         .map_err(|error| ApiError::new(ErrorCode::InvalidInput, error.to_string()))
 }
 

@@ -1285,3 +1285,26 @@ fn runtime_settings_refuse_invalid_timing_and_overflow() {
     assert_eq!(s.coordinator.limits.prefetch_per_worker, 0);
     assert_eq!(s.scheduler.rules.priority_step_ms, 0);
 }
+
+#[test]
+fn captured_shard_policy_names_one_job_and_its_fixture_boundary() {
+    let header = "schema_version=1\n";
+    let policy="[[ci.sharding]]\nworkflow='.github/workflows/check.yml'\njob='browser'\nisolation='database per attempt'\nallow_retry=true\n";
+    let parsed = parse_project("cfg", &format!("{header}{policy}")).unwrap();
+    let policy_row = &parsed.ci.unwrap().sharding[0];
+    assert_eq!(
+        policy_row.isolation.as_deref(),
+        Some("database per attempt")
+    );
+    assert_eq!(policy_row.allow_retry, Some(true));
+    for denied in [
+        format!("{header}{policy}{policy}"),
+        format!("{header}{}", policy.replace("database per attempt", " ")),
+        format!(
+            "{header}{}",
+            policy.replace(".github/workflows/check.yml", "../check.yml")
+        ),
+    ] {
+        assert!(parse_project("cfg", &denied).is_err());
+    }
+}

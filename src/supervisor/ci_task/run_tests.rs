@@ -24,7 +24,10 @@ struct Sup {
 }
 
 fn sup(workflow: &str) -> Sup {
-    let f = fixture(workflow);
+    sup_from(fixture(workflow))
+}
+
+fn sup_from(f: Fixture) -> Sup {
     let state = f.area.join("state");
     let worker = WorkerId::parse("w-ci").unwrap();
     let store = WorkerStore::open(&state, &worker).unwrap();
@@ -856,4 +859,45 @@ fn recovery_of_a_ci_task_whose_supervisor_was_lost_during_a_step_settles_it_and_
     // Nothing of the plan ran after the loss, not even the `always()` step.
     assert_eq!(s.steps(&spec), ["step-0"]);
     assert_eq!(made(&spec, &["always.txt"]), [false]);
+}
+
+#[test]
+fn worker_discovery_lists_real_cargo_tests_without_executing_their_bodies() {
+    use crate::ci::discovery::{candidates, WorkerListing};
+    let workflow="on: push\njobs:\n  rust:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+    let f = crate::ci::execute::tests::fixture_with(workflow, |root| {
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname='listed'\nversion='0.0.0'\nedition='2021'\n[lib]\npath='lib.rs'\ndoctest=false\n").unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "#[test] fn slow() { panic!(\"must not run\") } #[test] fn fast() {}",
+        )
+        .unwrap();
+    });
+    let sup = sup_from(f);
+    let step = candidates(&sup.f.plan).pop().unwrap();
+    let mut spec = sup.attempt("rust", &TaskInputs::default());
+    let ci = spec.ci.as_mut().unwrap();
+    ci.task_id = step.task_id();
+    // Resolve rustup at test setup; the service environment has a private HOME.
+    let toolchain = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(toolchain.status.success());
+    let bin = Path::new(std::str::from_utf8(&toolchain.stdout).unwrap().trim()).join("bin");
+    let path = format!("{}:{}", bin.display(), ci.env["PATH"]);
+    ci.env.insert("PATH".into(), path);
+    ci.env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+    let report = run(&spec).unwrap();
+    assert_eq!(report.termination.unwrap().outcome(), Outcome::Succeeded);
+    let file = spec
+        .spool_dir()
+        .join(spec.attempt_id.as_str())
+        .join("artifacts")
+        .join(RESULT_ARTIFACT);
+    let listing: WorkerListing = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(listing.step, step);
+    assert!(listing.runner_version.starts_with("cargo "));
+    assert_eq!(listing.discovered.tests, ["fast", "slow"]);
+    assert!(listing.discovered.complete);
 }

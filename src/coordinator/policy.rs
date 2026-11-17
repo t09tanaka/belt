@@ -230,8 +230,12 @@ pub fn may_send(facts: Facts) -> bool {
 /// What a worker that cannot be given a CI task lacks, as a placement
 /// records it for the worker it left out.
 pub fn unmet_ci(spec: &super::TaskSpec, link: &dyn super::WorkerLink) -> Option<&'static str> {
-    if lacks_ci_task(spec, link.ci_task_negotiated()) {
-        return Some(CI_TASK_UNMET);
+    if let Some(reason) = missing_ci_feature(
+        spec,
+        link.ci_task_negotiated(),
+        link.ci_discovery_negotiated(),
+    ) {
+        return Some(reason);
     }
     if spec
         .ci
@@ -250,6 +254,22 @@ pub const CI_TASK_UNMET: &str = "protocol feature ci_task_v1";
 /// task and its connection did not negotiate `ci_task_v1`?
 pub fn lacks_ci_task(spec: &super::TaskSpec, negotiated: bool) -> bool {
     spec.ci.is_some() && !negotiated
+}
+
+pub fn missing_ci_feature(
+    spec: &super::TaskSpec,
+    ci: bool,
+    discovery: bool,
+) -> Option<&'static str> {
+    if lacks_ci_task(spec, ci) {
+        return Some(CI_TASK_UNMET);
+    }
+    (spec
+        .ci
+        .as_ref()
+        .is_some_and(|s| crate::wire::is_discovery_task(&s.task))
+        && !discovery)
+        .then_some("protocol feature ci_discovery_v1")
 }
 
 /// The result of a CI task is one more required artifact of its attempt: do
@@ -320,6 +340,8 @@ mod tests {
                 dynamic_origin: false,
                 core_outcome: None,
                 matrix: None,
+                shard_retry_forbidden: false,
+                shard_preferred_worker: None,
                 task: crate::wire::CiTask {
                     dispatch: None,
                     plan_digest: digest.clone(),

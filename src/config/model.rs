@@ -192,12 +192,27 @@ pub enum ToolchainMatch {
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ci {
+    /// Replay and fixture declarations for one captured job.
+    #[serde(default)]
+    pub sharding: Vec<ShardPolicy>,
     pub workflows_dirs: Option<Vec<String>>,
     /// Workflows (`ci.yml`) or jobs (`ci.yml:e2e`) whose results are never
     /// reused. Same format as `no-cache` in `.local-ci.toml`.
     pub no_cache: Option<Vec<String>>,
     pub status_context: Option<String>,
     pub unsupported: Option<Unsupported>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShardPolicy {
+    /// Repository-relative workflow file and job id.
+    pub workflow: String,
+    pub job: String,
+    /// How databases, ports, containers and browser profiles are isolated.
+    pub isolation: Option<String>,
+    /// False vetoes retry; browser runners require an explicit true.
+    pub allow_retry: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

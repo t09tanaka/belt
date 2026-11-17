@@ -389,6 +389,7 @@ UPDATE matrix_permit SET held=0,released_at_ms=(
  PRIMARY KEY(run_id,workflow,name,version),
  UNIQUE(producer,action_key)
 ) WITHOUT ROWID;"#.into(),
+            "CREATE TABLE ci_test_timing(scope TEXT NOT NULL, worker TEXT NOT NULL, identity TEXT NOT NULL, millis INTEGER NOT NULL CHECK(millis>=0), PRIMARY KEY(scope,identity,worker)) WITHOUT ROWID;".into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

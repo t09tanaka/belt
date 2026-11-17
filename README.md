@@ -34,6 +34,26 @@ integration tests. Each shard uploads selected test names, `selection.json`
 (run identity, counts and timings), `run.log` and the mutation report. Use the
 repository's resource admission and portool entry when running locally.
 
+## Distributed test jobs
+
+`remote-task-runner ci plan` identifies jobs that a worker can enumerate.
+`remote-task-runner ci plan --run <run-id>` reads the stored plan, including
+the assigned tests and reasons a job stayed whole. Discovery runs against the
+captured source with the job's setup. After the parent receives the listing,
+it releases the tests to run and keeps each shard's identity for retries.
+
+Playwright and Cypress projects can declare their independent fixtures for
+a specific job in the captured `.remote-task-runner.toml`. Set `allow_retry`
+when running a failed shard again is safe for the external resources it uses.
+
+```toml
+[[ci.sharding]]
+workflow = ".github/workflows/browser.yml"
+job = "browser"
+isolation = "Each attempt creates a private database and browser profile."
+allow_retry = true
+```
+
 ## License
 
 MIT

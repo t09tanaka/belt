@@ -248,11 +248,16 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn fixture(workflow: &str) -> Fixture {
+        fixture_with(workflow, |_| {})
+    }
+
+    pub(crate) fn fixture_with(workflow: &str, add_files: impl FnOnce(&Path)) -> Fixture {
         let root = crate::test_tmp::tempdir().unwrap();
         let area = std::fs::canonicalize(root.path()).unwrap();
         let project = area.join("project");
         std::fs::create_dir_all(project.join(".github/workflows")).unwrap();
         std::fs::write(project.join(".github/workflows/ci.yml"), workflow).unwrap();
+        add_files(&project);
         let store = SourceStore::open(&area.join("state")).unwrap();
         let captured = capture(
             &std::env::vars().collect(),

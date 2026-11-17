@@ -30,5 +30,21 @@ pub fn parse_user(path: &str, text: &str) -> Result<UserConfig, ConfigError> {
 pub fn parse_project(path: &str, text: &str) -> Result<ProjectConfig, ConfigError> {
     let c: ProjectConfig = toml::from_str(text).map_err(|e| syntax(path, e))?;
     check_version(path, c.schema_version)?;
+    if let Some(ci) = &c.ci {
+        let mut jobs = std::collections::BTreeSet::new();
+        for policy in &ci.sharding {
+            if crate::ci::summary::validate_path(&policy.workflow).is_err()
+                || policy.job.trim().is_empty()
+                || policy.job.chars().any(char::is_control)
+                || policy
+                    .isolation
+                    .as_ref()
+                    .is_some_and(|s| s.trim().is_empty())
+                || !jobs.insert((&policy.workflow, &policy.job))
+            {
+                return Err(ConfigError::Parse {path:path.into(),message:"ci.sharding needs a unique workflow and job and a nonempty isolation declaration".into()});
+            }
+        }
+    }
     Ok(c)
 }

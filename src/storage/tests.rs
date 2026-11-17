@@ -5005,7 +5005,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
@@ -5844,4 +5844,31 @@ fn live_workflow_artifacts_require_durable_bytes_and_replay_the_original_version
         .workflow_artifacts(&RunId::generate(), "ci")
         .unwrap()
         .is_empty());
+}
+
+#[test]
+fn retry_of_a_non_idempotent_shard_requires_its_captured_permission() {
+    use crate::service::completion::Target;
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let id = f.task.to_string();
+    f.store.db.write(move|tx| {
+        tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.shard_retry_forbidden',json('true')) WHERE task_id=?1",[id])?;
+        Ok(())
+    }).unwrap();
+    for target in [Target::Task(f.task.clone()), Target::Run(f.run.clone())] {
+        let refused = f
+            .store
+            .retry(target, 0, "protected".into(), 40, |_, _, _| {
+                panic!("protected retry reached input validation")
+            })
+            .unwrap_err();
+        assert!(refused.to_string().contains("allow_retry"));
+    }
+    assert_eq!(
+        f.store
+            .completion(Target::Run(f.run.clone()))
+            .unwrap()
+            .control_revision,
+        0
+    );
 }

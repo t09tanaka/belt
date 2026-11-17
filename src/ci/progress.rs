@@ -194,6 +194,44 @@ impl NeedsProgression {
         self.reruns.get(group).map_or(&[], Vec::as_slice)
     }
 
+    /// Times from a complete, successful join. Partial receipts, skipped
+    /// tests and absent measurements do not become observations.
+    pub fn timing_samples(&self, group: &ShardGroup) -> BTreeMap<String, local_ci::shard::History> {
+        let mut history = BTreeMap::<String, local_ci::shard::History>::new();
+        if self
+            .joins
+            .get(&group.id)
+            .is_none_or(|j| j.status != JobStatus::Success)
+        {
+            return history;
+        }
+        for (shard, test) in group
+            .shards
+            .iter()
+            .filter_map(|id| self.receipts.get(id).map(|r| (id, r)))
+            .flat_map(|(id, r)| r.tests.iter().map(move |test| (id, test)))
+        {
+            if test.status != local_ci::shard::TestStatus::Passed {
+                continue;
+            }
+            let millis = serde_json::to_value(test)
+                .ok()
+                .and_then(|v| v["millis"].as_u64());
+            // The SDK sums weights as u64; even a maximal manifest of such
+            // values must fit. A physically impossible duration is missing.
+            if let Some(ms) =
+                millis.filter(|n| *n <= u64::MAX / crate::supervisor::ci_task::MAX_PLAN_BYTES)
+            {
+                history
+                    .entry(shard.clone())
+                    .or_default()
+                    .millis
+                    .insert(test.identity.clone(), ms);
+            }
+        }
+        history
+    }
+
     pub fn is_settled(&self, task: &str) -> bool {
         self.settled.contains_key(task)
     }

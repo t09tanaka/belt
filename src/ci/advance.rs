@@ -21,6 +21,7 @@ mod matrix;
 
 /// An unstarted variant stopped by matrix fail-fast can participate in a run retry.
 pub const MATRIX_FAIL_FAST_REASON: &str = "another variant of its matrix job failed (fail-fast)";
+mod discovery;
 
 use super::progress::{ActionKind, Input, NeedsProgression, Progression};
 use crate::coordinator::TaskSpec;
@@ -285,7 +286,19 @@ fn advance_run(
     let fault = transient;
     let mut members: BTreeMap<String, Member> = BTreeMap::new();
     let mut digest = None;
-    for row in store.ci_run_tasks(run).map_err(fault)? {
+    let rows = store.ci_run_tasks(run).map_err(fault)?;
+    if discovery::advance(store, state_dir, results, run, &rows, now_ms, pass)? {
+        return Ok(());
+    }
+    let project = rows
+        .iter()
+        .find_map(|r| {
+            r.spec
+                .pointer("/ci/task/inputs/rtr_discovery/project")
+                .and_then(|v| v.as_str())
+        })
+        .map(str::to_owned);
+    for row in rows.into_iter().filter(|r| !discovery::is_probe(r)) {
         let spec: TaskSpec = serde_json::from_value(row.spec.clone())
             .map_err(|e| unrunnable(format!("task {}: {e}", row.task_id)))?;
         let Some(ci) = &spec.ci else {
@@ -336,8 +349,27 @@ fn advance_run(
             problems.unwrap_or("a shard of the job failed").to_string()
         });
         let rerun = progress.split_job_rerun(&group.id);
+        let timings = (|| {
+            let first = plan.task(group.shards.first()?)?.shard.as_ref()?;
+            let scope = super::discovery::timing_key(
+                project.as_deref()?,
+                &group.workflow,
+                group.source_jobs.first()?,
+                &first.dir,
+                group.runner.as_ref()?,
+            );
+            let observations = progress
+                .timing_samples(group)
+                .into_iter()
+                .filter_map(|(shard, history)| {
+                    let worker = &members.get(&shard)?.row.attempt.as_ref()?.worker;
+                    Some((worker.clone(), history))
+                })
+                .collect();
+            Some((scope, observations))
+        })();
         let changed = store
-            .join_ci_shards(run, &group.id, failure.as_deref(), rerun, now_ms)
+            .join_ci_shards_with_timings(run, &group.id, failure.as_deref(), rerun, now_ms, timings)
             .map_err(fault)?;
         if changed {
             pass.joined.push(group.id.clone());

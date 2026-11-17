@@ -158,6 +158,8 @@ pub fn task_specs(
                     dynamic_origin: task.dynamic_matrix,
                     core_outcome: None,
                     matrix: matrix_admission(plan, task)?,
+                    shard_retry_forbidden: false,
+                    shard_preferred_worker: None,
                     task: CiTask {
                         dispatch: None,
                         plan_digest: plan_digest.clone(),
@@ -235,25 +237,36 @@ pub async fn submit(
                     invalid(error.to_string())
                 }
             })?;
-        let plan = super::planning::freeze(&store, &manifest)?;
+        let (plan, policies) = super::planning::freeze_with_policies(&store, &manifest)?;
         let (plan_digest, _) = crate::ci::advance::keep_plan(context.state_dir(), &plan)
             .map_err(|e| invalid(format!("cannot keep the frozen plan: {e}")))?;
-        Ok((captured, plan, plan_digest))
+        Ok((captured, plan, plan_digest, policies))
     })
     .await
     .map_err(|e| invalid(e.to_string()))?;
-    let (captured, plan, plan_digest) = frozen?;
+    let (captured, plan, plan_digest, policies) = frozen?;
     let source_id = captured.manifest.source_id.clone();
     let manifest_digest = Digest::parse(&captured.manifest.manifest_digest)
         .or_else(|_| Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest)))
         .map_err(|e| invalid(e.to_string()))?;
-    let specs = task_specs(
+    let mut specs = task_specs(
         &plan,
         &plan_digest,
         &manifest_digest,
         &requirements,
         timeout,
     )?;
+    let capacity = context.config.workers.len() + usize::from(context.config.local_worker.value);
+    let capacity = capacity.saturating_mul(context.config.max_active_task.value as usize);
+    if capacity > 1 {
+        use std::os::unix::ffi::OsStrExt;
+        let root = context.repo_root.as_deref().unwrap_or(&context.cwd);
+        let project = plan
+            .repository
+            .clone()
+            .unwrap_or_else(|| Digest::of_bytes(root.as_os_str().as_bytes()).to_string());
+        crate::ci::discovery::stage(&plan, &mut specs, capacity, &project, &policies);
+    }
     let mut submitted = Vec::with_capacity(specs.len());
     let mut tasks = Vec::with_capacity(specs.len());
     for (plan_task, spec) in specs {
@@ -335,15 +348,26 @@ pub async fn run(
     });
     // Decided only here, after the wait: on the parent, from the result of
     // the run and what it collected.
-    let (jobs, github_status) = tokio::task::spawn_blocking(move || {
-        let jobs = jobs(&spec, &run_id).unwrap_or_default();
+    let (executed_digest, jobs, github_status) = tokio::task::spawn_blocking(move || {
+        let (executed_digest, jobs) = super::bootstrap::read_only_store(&spec)
+            .ok()
+            .and_then(|store| {
+                job_report(
+                    &store,
+                    &spec.state_dir,
+                    &spec.state_dir.join("results"),
+                    &run_id,
+                )
+                .ok()
+            })
+            .unwrap_or_default();
         let record = expected.map(|expected| {
             let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
             let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
             let end = end.with(&expected, &lines);
             super::github_status::settle(&settled, &run_id, &end, &status, poster.as_ref())
         });
-        (jobs, record.map(|record| (run_id, record)))
+        (executed_digest, jobs, record.map(|record| (run_id, record)))
     })
     .await
     .unwrap_or_default();
@@ -358,7 +382,7 @@ pub async fn run(
     };
     Ok(CiReport {
         report,
-        plan_digest: receipt.map(|receipt| receipt.plan_digest),
+        plan_digest: executed_digest.or_else(|| receipt.map(|receipt| receipt.plan_digest)),
         jobs,
         github_status,
     })
@@ -516,6 +540,15 @@ pub fn job_lines(
     results: &std::path::Path,
     run: &RunId,
 ) -> Result<Vec<JobLine>, String> {
+    job_report(store, state_dir, results, run).map(|(_, lines)| lines)
+}
+
+fn job_report(
+    store: &crate::storage::CoordinatorStore,
+    state_dir: &std::path::Path,
+    results: &std::path::Path,
+    run: &RunId,
+) -> Result<(Option<Digest>, Vec<JobLine>), String> {
     let mut lines = Vec::new();
     let rows = store.ci_run_tasks(run).map_err(|e| e.to_string())?;
     let mut by_plan_task = std::collections::BTreeMap::new();
@@ -527,6 +560,9 @@ pub fn job_lines(
         else {
             continue;
         };
+        if ci.task.inputs.get("rtr_discovery").is_some() {
+            continue;
+        }
         by_plan_task.insert(ci.task.task_id.clone(), row);
         digest.get_or_insert_with(|| ci.task.plan_digest.clone());
         let result = row.attempt.as_ref().and_then(|attempt| {
@@ -560,7 +596,8 @@ pub fn job_lines(
         }
     }
     let plan = digest
-        .and_then(|digest| crate::ci::advance::read_plan(state_dir, &digest).ok())
+        .as_ref()
+        .and_then(|digest| crate::ci::advance::read_plan(state_dir, digest).ok())
         .and_then(|bytes| serde_json::from_slice::<local_ci::FrozenPlan>(&bytes).ok())
         .filter(|plan| plan.shard_groups.iter().any(|group| group.split));
     if let Some(plan) = plan {
@@ -569,7 +606,7 @@ pub fn job_lines(
             mark_split_jobs(&mut lines, &plan, &progress);
         }
     }
-    Ok(lines)
+    Ok((digest, lines))
 }
 
 /// One line per job, as `ci` prints it.

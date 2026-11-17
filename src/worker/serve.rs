@@ -176,6 +176,19 @@ pub async fn serve_connection_offering(
                     .await;
                 return;
             }
+            if matches!(&request,crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.as_ref().is_some_and(crate::wire::is_discovery_task))
+                && !negotiated_features
+                    .iter()
+                    .any(|f| f == crate::wire::CI_DISCOVERY_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "runner discovery was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
             if matches!(&request, crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.is_some())
                 && !negotiated_features
                     .iter()

@@ -266,6 +266,8 @@ fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
             dynamic_origin: false,
             core_outcome: None,
             matrix: None,
+            shard_retry_forbidden: false,
+            shard_preferred_worker: None,
             task: crate::wire::CiTask {
                 dispatch: None,
                 plan_digest: Digest::of_bytes(b"plan"),

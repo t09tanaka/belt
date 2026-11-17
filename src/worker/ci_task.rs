@@ -435,6 +435,9 @@ fn delivered_plan(state_dir: &Path, digest: &Digest) -> Result<FrozenPlan, ApiEr
 
 /// What a task of the plan may not have, from the plan.
 pub fn check_task(plan: &FrozenPlan, task_id: &str) -> Result<(), &'static str> {
+    if crate::ci::discovery::DiscoveryStep::from_task(plan, task_id).is_some() {
+        return Ok(());
+    }
     let Some(task) = plan.task(task_id) else {
         return Err("the frozen plan has no such task");
     };

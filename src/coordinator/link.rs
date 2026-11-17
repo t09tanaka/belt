@@ -37,6 +37,7 @@ pub struct InputGate {
     /// The connection negotiated `ci_task_v1`: the frozen plan of a CI run
     /// is delivered with its source.
     ci_task: std::sync::atomic::AtomicBool,
+    ci_discovery: std::sync::atomic::AtomicBool,
 }
 impl Default for InputGate {
     fn default() -> Self {
@@ -46,6 +47,7 @@ impl Default for InputGate {
             transport_policy: None,
             preferences: std::sync::Mutex::default(),
             ci_task: std::sync::atomic::AtomicBool::new(false),
+            ci_discovery: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -55,6 +57,13 @@ impl InputGate {
             transport_policy: Some(policy),
             ..Self::default()
         }
+    }
+    pub fn set_ci_discovery(&self, negotiated: bool) {
+        self.ci_discovery
+            .store(negotiated, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn ci_discovery(&self) -> bool {
+        self.ci_discovery.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn set_ci_task(&self, negotiated: bool) {
         self.ci_task
@@ -210,6 +219,9 @@ pub trait WorkerLink: Send + Sync {
         false
     }
 
+    fn ci_discovery_negotiated(&self) -> bool {
+        false
+    }
     fn cold_eligible(&self, _task: &crate::ids::TaskId) -> bool {
         false
     }
@@ -260,6 +272,7 @@ pub struct ClientLink {
     env_sync: bool,
     ci_task: bool,
     matrix_dispatch: bool,
+    ci_discovery: bool,
 }
 
 impl ClientLink {
@@ -273,6 +286,7 @@ impl ClientLink {
             env_sync: false,
             ci_task: false,
             matrix_dispatch: false,
+            ci_discovery: false,
         }
     }
 }
@@ -288,6 +302,7 @@ impl ClientLink {
             env_sync: false,
             ci_task: false,
             matrix_dispatch: false,
+            ci_discovery: false,
         }
     }
 }
@@ -306,6 +321,11 @@ impl ClientLink {
     }
     pub fn with_matrix_dispatch(mut self, negotiated: bool) -> Self {
         self.matrix_dispatch = negotiated;
+        self
+    }
+
+    pub fn with_ci_discovery(mut self, negotiated: bool) -> Self {
+        self.ci_discovery = negotiated;
         self
     }
     pub fn with_ci_task(mut self, negotiated: bool) -> Self {
@@ -330,6 +350,9 @@ impl WorkerLink for ClientLink {
         self.ci_task
     }
 
+    fn ci_discovery_negotiated(&self) -> bool {
+        self.ci_discovery
+    }
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
         self.gate.as_ref().is_some_and(|g| g.cold_eligible(task))
     }
@@ -425,6 +448,9 @@ impl WorkerLink for Budgeted {
         self.inner.ci_task_negotiated()
     }
 
+    fn ci_discovery_negotiated(&self) -> bool {
+        self.inner.ci_discovery_negotiated()
+    }
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
         self.inner.cold_eligible(task)
     }

@@ -36,6 +36,7 @@ pub use retry::{PreparedRetry, RetryPreparation};
 pub mod query;
 mod queue;
 pub use collect::{Collectable, CollectionRow, ResultRef, RunStanding};
+pub(crate) use queue::MAX_TASKS_PER_RUN;
 pub use queue::{
     InputCursor, InputPage, LiveAttempt, LiveAttemptPage, PlaceInput, PlaceOutcome, QueuedTask,
     RetireEnd, Seen, WorkerLoad, PAGE_MAX,
