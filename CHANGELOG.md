@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-11-17
+
 ### Changed
 
 - **`live::snapshot()` no longer waits 300 ms on every call.** Each process
