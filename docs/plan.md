@@ -264,7 +264,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A32 | 未実装 | | S19 |
 | A33 | 自動 | `worker_agent::capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed`、`worker_agent::a_secret_that_cannot_be_masked_keeps_the_command_from_starting`、`secrets::a_run_that_lost_its_bundle_is_blocked_not_resumed_with_something_else` | |
 | A34 | 自動＋残り | 偽の Launcher・偽の ssh: `upgrade_switches_checks_the_bridge_and_commits`・`an_interrupted_switch_is_finished_by_running_upgrade_again`（`src/service/workers/upgrade/tests.rs`） | 本物の launchd・実 SSH での install / upgrade / rollback（S26） |
-| A35 | 一部 | macOS の計画と偽の launchctl: `proven_start_rejection_rolls_back_but_unknown_preserves_evidence`（`src/service/macos/tests.rs`） | Linux の systemd user / system-user（S24 が未了）、実際の service 環境での doctor（S26） |
+| A35 | 一部 | macOS の計画と偽の launchctl: `proven_start_rejection_rolls_back_but_unknown_preserves_evidence`（`src/service/macos/tests.rs`） | Linux の systemd は偽の runner での試験まで（user mode。実機は S26）、system-user mode の配線（S24 の残り）、実際の service 環境での doctor（S26） |
 | A36 | 自動＋残り | `doctor::an_updated_task_traffic_controller_passes_the_runtime_check`（旧い形の `status --json` を読む） | 旧コマンドと主要 workflow の互換は local-ci・task-traffic-controller 側の CI が担う（L1a〜L3・T1） |
 | A37 | S26 | | 実際のプロジェクトの CI を親のみと複数 worker で比べる |
 | A38 | 一部 | worker の側だけ: `a_job_that_needs_another_runs_in_another_attempt_from_the_first_ones_result`（`src/supervisor/ci_task/run_tests.rs`） | 親が先行 Job の output・artifact を確定してから別 host で後続を始める経路（S16 が未了） |
@@ -272,8 +272,8 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A42 | 一部 | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts` | 導入中の負荷を forecast に含めること（S20 の残件）、実 manager と network での導入 |
 | A43 | 自動 | `secrets::a43_the_secret_files_reach_the_worker_as_0600_and_are_gone_after_the_attempt` | |
 | A44 | 自動＋残り | 偽の ssh と偽の tool: `diff_classifies_the_five_ways_a_worker_can_differ`・`sync_blocks_what_needs_a_person_with_the_steps`（`tests/it/workers_lifecycle.rs` の `a44`）、`bootstrap::workers_sync_installs_through_the_resident_then_measures_again_and_needs_the_resident` | 実際の worker との差（S26） |
-| A45 | 一部 | OS 依存部分は CI の ubuntu と macOS の両方で同じ試験が走る（`src/platform` の単体試験、`tests/it/supervisor.rs`） | systemd user service での導入・起動・停止、system-user mode（S24 が未了）、x86_64 と arm64 の実 worker（S26 の Docker） |
-| A46 | 未実装 | | S24（`worker --ephemeral` と `workers forget`）、S26 |
+| A45 | 一部 | OS 依存部分は CI の ubuntu と macOS の両方で同じ試験が走る（`src/platform` の単体試験、`tests/it/supervisor.rs`） | 実 systemd での導入・起動・停止（偽の runner での試験は S24 で済み）、system-user mode の配線（S24 の残り）、x86_64 と arm64 の実 worker（S26 の Docker） |
+| A46 | 一部 | worker の側: `tests/it/worker_ephemeral.rs`（起動ごとの identity）。親の側: `coordinator::forget::tests::an_unreachable_ephemeral_worker_keeps_its_attempt_unknown_until_it_is_forgotten`・`a_new_start_retires_the_identity_before_it_and_is_sent_none_of_its_attempts`、`service::resident::remote::tests::an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_resident` | トンネル越しの実 SSH で一時 worker に配置し、切断して forget するまでの通し（S26） |
 | A47 | 自動 | `secrets::worktreeinclude_picks_only_ignored_untracked_files_and_the_store_never_holds_them`、`worker_agent::the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_any_name` | |
 | A48 | 一部 | `workspace::add_and_remove_a_commit_workspace`、`workspace::the_original_is_never_written`（CI は `RTR_REQUIRE_FAST_WORKTREE` で fast-worktree を必須にする） | terminal 後に portool の割当が消えることを確かめる試験が無い |
 | A49 | 自動 | `scheduler::a_preferred_worker_is_taken_while_the_others_are_not_faster_by_the_correction`、`collection_is_added_to_the_forecast_and_the_priority_correction_to_that`（`src/scheduler/decide.rs`）、設定から scheduler まで: `runtime::runtime_attach_applies_only_verified_identity_priorities` | |
@@ -297,7 +297,7 @@ S25 の完了条件「実機不要の A がすべて自動で緑」は、まだ�
 
 ### S15 public init integration
 
-Mac user init wires one LaunchAgent to the foreground combined coordinator/local-worker resident, using private retained input, a receipt journal, hash-addressed binary and authenticated connect-only readiness. Initialization never starts a detached fallback. Journaled pending publication binds device/inode/digest before publication; foreign or uncertain state requires reconciliation. Ordinary init retains its pinned binary and requires the separate upgrade flow for changed bytes. Native launchd acceptance is still required: fake transport and owned-child tests do not establish real launchd behavior. Linux public init requires S24 systemd backend and currently refuses before filesystem changes. System-user installation, runtime WorkerControl stop/drain/resume, SSH remote enrollment and upgrade/rollback remain required S22/S24 dependencies, not completion exclusions.
+Mac user init wires one LaunchAgent to the foreground combined coordinator/local-worker resident, using private retained input, a receipt journal, hash-addressed binary and authenticated connect-only readiness. Initialization never starts a detached fallback. Journaled pending publication binds device/inode/digest before publication; foreign or uncertain state requires reconciliation. Ordinary init retains its pinned binary and requires the separate upgrade flow for changed bytes. Native launchd acceptance is still required: fake transport and owned-child tests do not establish real launchd behavior. Linux public init uses the systemd user backend since S24 (the journal records which service manager it was written for; see "S24 親の側"); real systemd acceptance is still required (S26). System-user installation, runtime WorkerControl stop/drain/resume, SSH remote enrollment and upgrade/rollback remain required S22/S24 dependencies, not completion exclusions.
 
 Managed init binds planned cluster/coordinator IDs before preparing a staged metadata database at epoch 0; the first daemon claim advances it to epoch 1. A private optional managed-service reference in the immutable input makes normal bootstrap connect-only, validates journal/input/key/database receipts and refuses incomplete or foreign bindings. Readiness compares authenticated resident PID/start/boot identity with fresh running launchd observations. Stage parent directories and newly created directory ancestry are synced before a pending journal may reference them; uncertain journal/publication errors retain the exact staged inode for reconciliation. Legacy unmanaged bootstrap keeps its prior behavior.
 
@@ -319,8 +319,8 @@ replacement. Provisioning must retain this input/identity and the canonical HOME
 binding when native worker services are added. This slice does not complete S22:
 workers add/install, SSH bootstrap/key enrollment, versioned deployment,
 launchd/system-user and systemd worker roles, upgrade/rollback, worker lifecycle
-controls and native platform acceptance remain required. S24 ephemeral identity
-and forget semantics also remain required.
+controls and native platform acceptance remain required. The parent's side of
+the S24 ephemeral identity and forget semantics is described under "S24 親の側".
 Native worker service plans must select the worker foreground role rather than
 reuse the combined parent's `daemon --input` role. Parent remote-link attachment
 now uses independent owners and the shared source/secret delivery helpers for
@@ -1268,7 +1268,7 @@ focused成功へ読み替えない。実user stateのGCやnative serviceへの�
 S22 の残り（必須。この変更で S22 は完了しない）:
 1. 本物の launchd・実 SSH・実機での受入（A34/A35 の native 検証、S26）は未実施。偽の Launcher と偽の ssh は実挙動を確かめない。
 2. drain の確認と受理の間に、非常に短い競合が残る（受理が drain の確認を通った直後に stop が 0 件を 2 回数える）。実機での stop と受理の同時試験は S26 で行う。
-3. `system-user`（LaunchDaemon の `UserName`）の導入、Linux、upgrade・rollback・doctor・`workers forget`、fish / csh のログインシェル対応は未実装（S23・S24）。
+3. `system-user`（LaunchDaemon の `UserName`）の導入、fish / csh のログインシェル対応は未実装。Linux・`workers forget` は S24、upgrade・rollback・doctor は S23 で入った。
 4. 実 SQLite の live attempt を持つ worker に対する stop の待ち・cancel の end-to-end（agent の cancel は統合試験済みだが、helper の待ちは注入した計数での単体試験）。
 
 ### S21 `workers diff`（2026-11-17、1 本目: diff と待機理由の手順）
@@ -1473,7 +1473,7 @@ S23 の残り（必須。この変更でも S23 は完了しない）:
 1. **A05 の「同じ budget・policy を共有」は、現状の既定では成り立っていない。** worker の supervisor は `<state>/traffic` を scope にしており（`AgentConfig::new`。設定項目は無い）、同じ user の `task-traffic-controller` command の scope（`~/.local/state/task-traffic-controller`）とは別の ledger になる。doctor はこれを、command が導入済みの host では `traffic_state_path` の fail として報告する（command を日常的に使う host では doctor が必ず fail する）。scope を揃える変更は S9a / S10 の範囲で、ここでは行っていない。A05 はそれが決まるまで未達である。
 2. 「実行中 process」の検査（仕様の既存 state との互換の節）は未実装で、`traffic_processes` を `not_checked` として出す（process の走査はしていない）。command を導入した host では doctor は exit 0 にならない。
 3. S21 の `workers diff` の結果は接続済み（上の「S21 `doctor` への接続」）。policy digest を親も worker も測らないが notice なので、差の無い親は worker を登録しても exit 0 になる（`fail` があれば BLOCKED、`not_checked` があれば exit 1）。
-4. Linux の linger の確認（仕様 §15）と、system-user mode（LaunchDaemon の `UserName`）の service user での profile 検査は未実装（S24・S22 の残り）。前者は report に項目として出していない。
+4. system-user mode（LaunchDaemon の `UserName`）の service user での profile 検査は未実装（S22 の残り）。Linux の linger の確認（仕様 §15）は S24 の親の側で入った（check `linger`）。
 5. 本物の docker・実 SSH・実機の launchd 環境での doctor（A35 の「実際の service 環境で doctor が通る」）は未実施（S26）。偽の runner と偽の ssh は実挙動を確かめない。
 6. 親の local worker の service 環境は、`coordinator.json` の env が空のとき呼び出し shell の env で代用する（notice を出す）。
 7. レビュー指摘の残り: worker の task-traffic-controller の scope（M4。上の 1）は別の変更で worker 側を CLI と同じ規則に揃える。doctor の判定は変えていない。profile と command の検査は ssh の helper が journal の env で行い、launchd のドメインや Keychain の可否は再現しない（L3）。実際の launchd 環境での検査は S26 の実機受入の残件とする。
@@ -1557,13 +1557,42 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 
 試験。systemd 用の偽 Launcher で install・start・stop・start と upgrade の順序（`start`、`stop`、`start`）、unit の描画、`XDG_CONFIG_HOME` の置き場を macOS 上でも確かめる。実バイナリの統合試験（`tests/it/worker_ephemeral.rs`）で、ephemeral が何も導入せず、起動ごとに identity が違い、停止後に state が消え、既存 state と常駐 journal を拒否し、引数が足りなければ exit 2 になることを確かめる。`tests/it/not_implemented.rs` から `worker --ephemeral` を外した（`workers forget` は未実装のまま）。
 
-S24 の残り（必須。この変更で S24 は完了しない）:
-1. 実 systemd・実 Linux 機での受入（A45）は未実施。`systemctl` は偽の runner だけで試験した。実 `systemctl --user` の出力（`show` の書式、`enable` の副作用、linger）は Linux の実機で確かめる必要がある。
-2. system-user mode（`service_mode = "system-user"`、systemd の system service を非 root の `User=`）は unit の描画だけを純粋関数として持つ。登録先（`/etc/systemd/system`）と管理権限の扱いは未実装で、worker-host helper は user mode だけを配線している（macOS の LaunchDaemon と同じ未了）。
-3. 親側の Linux 対応は未着手: `workers add --install` と `workers upgrade` は親が macOS で、worker が同じ OS・arch のときだけ動く（親は自分の binary を送るため、Mac から Linux には送れない）。Linux の binary をどう用意するかは設計判断が要る。`init`（coordinator の常駐）も Linux では拒否のまま。
-4. ephemeral の親側: `ephemeral = true` の worker の接続（現状は `ephemeral remote enrollment is unsupported` で拒否）、到達不能の attempt を unknown のまま保持すること、`workers forget`（unknown を interrupted に確定し identity を退役、tombstone、遅れて戻った identity の submit・renew の拒否）は未実装。boot identity が起動ごとに変わるため、親が「別 boot」として interrupted にする既存の規則との関係は、この親側の作業で決める必要がある（A46）。トンネルの提供は仕様どおり範囲外。
-5. doctor の linger の確認（`loginctl show-user`）は未実装。
-6. ephemeral が消す state は worker DB の live attempt を見て判断する。attempt の supervisor が agent の終了後も生きている場合の扱い（残す）は試験していない。
+S24 の残りは、次の「S24 親の側」の末尾にまとめた（worker 側の 1 本目の時点で挙げた 3〜5 は親の側で実装した）。
+
+### S24 親の側（2026-11-17、2 本目）
+
+worker 側（上の節）に対する親の側を実装した。決めたことは 4 つ。
+
+1. **OS・arch の違う worker へ送る binary**。`workers add --install` と `workers upgrade` に `--binary <path>` を足した。指定が無いとき、親は自分の binary を、worker の OS と arch が親と同じときだけ送る。違うときは何も送らずに断り、必要な target triple（例 `x86_64-unknown-linux-gnu`）と `--binary` を message に書く。release の成果物を自動で取ってくることはしない（S26 で足してよい）。判断は純粋関数（`src/service/workers/target.rs`: `uname` と Rust の名前の対応、triple、probe の読み取り、version の一致）。「macOS の親と worker だけ」という制限は外した（Linux の親は同じ arch の Linux へ自分の binary を送れる）。
+   - 切り替える前の確認: staging の直後、install・switch の要求より前に、送った binary の `--version` を worker の上で実行し、親が出す文字列（clap の `render_version`）と同じであることを確かめる。違う・実行できないときは staging の copy を消して断る（この時点で worker の導入済みの版には何も触れていない）。ssh 自体の失敗（exit 255）は copy を消さずに `COMMUNICATION_UNKNOWN`。切り替えた後の hello（protocol と feature）の確認と rollback は S23 のまま。
+   - `workers upgrade` が動いている resident と比べる digest は、送る binary ではなく親自身の binary のもの（`--binary` の build は resident の build と一致しないため）。
+   - staging と probe の shell は、`sha256sum`（Linux）が在ればそれを、無ければ `shasum -a 256`（macOS）を使う。
+2. **Linux での `init`**。service backend 以外に妨げは見つからなかったので、拒否を外した。`init` は `HostLauncher::native()`（Linux は systemd user、他は launchd）を使い、unit を `$XDG_CONFIG_HOME/systemd/user/` に置く。init の journal（`init.json`）に、どの service manager のために書いたかを持たせた（`systemd: true`。launchd のときは書かないので、macOS の journal は今までと同じ bytes）。managed service を確かめる側（daemon・CLI）は、動いている機械の OS ではなく journal に従って managed file を探す。別の manager のための journal は引き継がない（`another service manager`）。
+3. **一時 worker の親の側**。
+   - `ephemeral = true` の worker を接続する（`workers add <name> --ssh <dest> --ephemeral` で登録できる）。install・upgrade・start・stop・drain・resume は断り、ssh も実行しない。`doctor` は bridge の hello だけを見る（service・version・host の事実は見ない。答えないときは notice）。
+   - identity の記録（coordinator DB の step 12: `worker_identity`・`worker_identity_tombstone`）。hello の boot identity（`<OS の boot id>.<起動ごとの ULID>`）を、attach の前に判定する（純粋関数 `coordinator::identity::admit`）: 初めて・同じ → 通す。別の identity（新しい起動）→ 前の identity を退役させ、それが持っていた attempt を同じ commit で `interrupted` に確定してから通す。退役済み → attach しない。
+   - 「別 boot の attempt は interrupted」という既存の規則は worker の側（`worker/policy.rs`）にあり、worker が自分の DB から確定して親に伝える。一時 worker は毎回 state が空なので、この規則は働かない（新しい起動は `not_found` と答え、未 ack の attempt は再送されてしまう）。そこで親の側に同じ意味の規則を置いた: 同じ名前で新しい identity が接続したことを、前の起動が置き換えられた証拠として扱う。新しい起動へ前の起動の attempt を送ることは無い。
+   - 到達不能の間は、attempt は unknown のまま保持する（既存の `KeepUnknown`。別の worker に空きがあっても配置し直さない）。
+   - `workers forget <name>`: resident への要求（`ForgetWorker`。CLI は DB を書かない）。登録が ephemeral で、かつ接続していないときだけ通る（`may_forget`）。identity を退役（tombstone は cluster の寿命の間消せない）、その worker の live な attempt を `interrupted`（cancel 済みなら `cancelled`）に確定、demand を閉じ、待っていた retire を確定、回収を `gave_up` で閉じる（消えた worker からは回収できないので、run が回収待ちで止まらない）。1 つの transaction。もう一度実行しても何も変わらない。再実行は自動ではなく、明示の retry による。
+   - 退役した identity が遅れて戻ったとき、親は attach しないので、submit も renew も送らない。worker 側の attempt は、renew が来ないことで既存の lease の規則どおり止まる。
+4. **doctor の linger**。systemd user service の host は `loginctl show-user <uid> --property=Linger` を service 環境で実行し、事実（`HostFacts.linger`）を返す。off は notice（警告）で、直す command（`loginctl enable-linger <uid>`）を detail に書く。答えが無いときは `not_checked`（pass にしない）。launchd の host は聞かれない。親自身は、`init` が systemd に登録した service を持つときだけ聞く。純粋部分は `src/service/doctor/linger.rs`、command の実行は既存の `doctor::Runner` の後ろ（試験は偽の runner）。
+
+`scripts/pure-modules.txt` に足したもの: `src/coordinator/identity.rs`・`src/service/workers/target.rs`・`src/service/doctor/linger.rs`。
+
+試験（どれも実 `systemctl`・実 `ssh`・実 `loginctl` を使わない）:
+- 1: `src/service/workers/tests.rs`（`the_own_binary_is_not_sent_to_a_host_of_another_platform`・`a_named_build_is_what_is_sent_to_a_host_of_another_platform`・`a_build_that_does_not_report_the_parents_version_is_removed_before_any_install`・`a_linux_parent_sends_its_own_binary_to_a_linux_host_of_its_architecture`）、`src/service/workers/upgrade/tests.rs`（`a_worker_of_another_platform_is_upgraded_with_the_named_build`・`a_build_of_another_version_is_removed_and_the_worker_is_not_switched`）。
+- 2: `src/service/init/tests.rs`（`init_with_a_systemd_manager_writes_a_user_unit_and_no_launch_agent`・`a_launchd_journal_does_not_say_systemd_and_reads_as_before`）、`tests/it/init.rs`（`init_with_a_systemd_manager_registers_one_real_combined_resident`: 偽の manager が持つ子 process で init の全体。Linux だけ: `linux_public_init_reaches_the_systemd_backend_and_claims_nothing_without_a_manager`）。
+- 3: `src/coordinator/forget.rs` の試験（A46 の親の半分）、`src/service/resident/remote/tests.rs`（resident 経由の forget と admission）、`src/service/workers/tests.rs`（`an_ephemeral_worker_is_registered_and_never_installed_or_controlled`・`forget_reports_only_what_the_resident_confirmed`）、`src/service/doctor/tests.rs`（ephemeral の 2 本）。
+- 4: `src/service/doctor/linger.rs` と `src/service/doctor/tests.rs`（linger の 4 本）。
+
+S24 の残り（必須。この変更でも S24 は完了しない）:
+1. 実 systemd・実 Linux 機での受入（A45）は未実施（S26）。`systemctl`・`loginctl` は偽の runner だけで試験した。実 `systemctl --user` の出力（`show` の書式、`enable` の副作用）、Linux での `init`（coordinator の unit の起動と health）、linger の実際の答えは実機で確かめる必要がある。Linux の `init` を実 binary で通す試験は、manager に届かない runtime directory で「未実装ではなく、成功も主張しない」ことだけを確かめている。
+2. system-user mode（`service_mode = "system-user"`、systemd の system service を非 root の `User=`）は unit の描画だけを純粋関数として持つ。登録先（`/etc/systemd/system`）と管理権限の扱いは未実装（macOS の LaunchDaemon と同じ未了）。
+3. 違う platform の worker 用の binary を用意する手段は利用者に任せている（`--binary`）。release の成果物から取ってくることは S26 で決める。`doctor` の `version` は digest の比較なので、違う platform の worker は常に「別の digest」と出る（detail にその旨を書いた。版の文字列での比較は未実装）。
+4. トンネル越しの実 SSH で一時 worker に配置し、切断し、forget するまでの通し（A46 の残り、S26）。トンネルの提供は仕様どおり範囲外。
+5. 退役した identity の worker へ「cleanup せよ」と伝える wire の message は足していない。親が attach しないことと、worker 側の lease 切れで止まることに任せている。
+6. ephemeral が消す state は worker DB の live attempt を見て判断する。attempt の supervisor が agent の終了後も生きている場合の扱い（残す）は試験していない（worker 側の 1 本目から持ち越し）。
+7. `workers`（一覧）は未実装のまま。一時 worker の接続状態と記録された identity を見る command は無い（`doctor` の bridge の check で分かる）。
 
 ### S16 (1) の後半: 親の側の `ci` の実行（2026-11-17、main `b673327` 起点）
 
