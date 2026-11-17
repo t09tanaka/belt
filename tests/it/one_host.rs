@@ -165,6 +165,9 @@ pub(crate) struct Worker {
 impl Worker {
     fn new(name: &str) -> Worker {
         let fx = worker_agent::fx_named(name);
+        // What a test asserts is what the parent and the worker do, so no
+        // command of a worker waits for the cores of the machine.
+        fx.admit_commands(4);
         let agent = fx.start("boot-1");
         Worker {
             id: WorkerId::parse(name).unwrap(),

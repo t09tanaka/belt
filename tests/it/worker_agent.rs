@@ -413,6 +413,14 @@ impl Fx {
         self.agents.lock().unwrap().push(agent.clone());
         agent
     }
+    /// The commands of this worker are admitted by their own budget, not by
+    /// the cores and the load of the machine the test runs on: by default
+    /// the budget is the number of logical CPUs, and a command weighs 2, so a
+    /// small CI machine admits one command at a time and the next waits.
+    /// `commands` is how many may run at once.
+    pub(crate) fn admit_commands(&self, commands: u32) {
+        crate::common::fixture_traffic_budget(&self.state(), commands * 2);
+    }
     pub(crate) fn start(&self, boot: &str) -> Arc<Agent> {
         self.start_with(self.cfg(boot))
     }
