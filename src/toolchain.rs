@@ -10,6 +10,7 @@ pub mod registry;
 pub mod declarations;
 pub mod envdiff;
 pub mod envreport;
+pub mod envsync;
 pub mod snapshot;
 pub mod versions;
 

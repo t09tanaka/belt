@@ -164,7 +164,8 @@ pub(crate) fn read_only_store(spec: &Spec) -> anyhow::Result<CoordinatorStore> {
     validate(spec)?;
     read_store(spec)
 }
-fn load_client(spec: &Spec) -> anyhow::Result<Client> {
+/// The running owner's client; never starts one.
+pub(crate) fn load_client(spec: &Spec) -> anyhow::Result<Client> {
     Client::load(&spec.state_dir, read_cluster(spec)?)
 }
 

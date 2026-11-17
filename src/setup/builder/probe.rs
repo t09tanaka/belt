@@ -759,8 +759,12 @@ mod preparation_probe_tests {
             .request(&bundle.frozen, &evidence.tool, Some(evidence))
             .unwrap();
         let plan = request.plan(&request.private_root).unwrap();
-        let receipt =
-            adapters::install_admitted(&plan, &mut SmallTool { plan: plan.clone() }).unwrap();
+        let receipt = adapters::install_admitted(
+            &plan,
+            &request.private_root,
+            &mut SmallTool { plan: plan.clone() },
+        )
+        .unwrap();
         f.frozen = Some(Box::new(bundle));
         // Installation writes preceded the normal report sample; a query must
         // never refresh that sample itself.

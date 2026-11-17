@@ -4497,3 +4497,429 @@ fn ci_plan_submodules_and_distinct_capture_bindings_keep_exact_identity() {
     );
     assert!(!spec.state_dir.join("coordinator.db").exists());
 }
+
+// ---------------------------------------------------------------------------
+// `workers sync`: the warm-up through the running resident (A44, sync half)
+// ---------------------------------------------------------------------------
+
+/// A local worker whose registry may install node 20.0.0 and 22.0.0 with a
+/// fixture manager. The manager writes each version it is asked for to
+/// `calls`, fails while `fail` exists and waits while `hold` exists. Nothing
+/// leaves the fixture's directory.
+fn sync_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
+    use remote_task_runner::toolchain::profile::Profile;
+    let (root, spec, _input) = control_fixture();
+    let host = root.path().join("private-managers");
+    let stubs = root.path().join("tool-stubs");
+    std::fs::create_dir(&host).unwrap();
+    crate::common::write_executable(&host.join("node"), "#!/bin/sh\nprintf 'v18.0.0\\n'\n");
+    let traffic = spec.worker_state_dir.join("traffic");
+    std::fs::create_dir(&traffic).unwrap();
+    std::fs::set_permissions(&traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        traffic.join("config.toml"),
+        "budget = 8\ncpu_threshold_percent = 100.0\nmemory_reserve_mib = 0\n",
+    )
+    .unwrap();
+    let profile_text = format!("schema_version=1\nactive='base18'\n[profiles.base18]\npath=[{:?},{stubs:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='base18'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
+    let profile_file = spec.worker_state_dir.join("profiles.toml");
+    std::fs::write(&profile_file, &profile_text).unwrap();
+    std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let profile = Profile::load(&spec.worker_state_dir, &spec.env).unwrap();
+    let manager = format!(
+        r#"#!/bin/sh
+set -eu
+printf '%s\n' "$1" >> '{host}/calls'
+if [ -e '{host}/fail' ]; then exit 19; fi
+while [ -e '{host}/hold' ]; do /bin/sleep 0.05; done
+version="$1"
+bin="$NODENV_ROOT/versions/$version/bin"
+/bin/mkdir -p "$bin"
+/usr/bin/printf '#!/bin/sh\necho v%s\n' "$version" > "$bin/node"
+/bin/chmod 700 "$bin/node"
+"#,
+        host = host.display()
+    );
+    crate::common::write_executable(&host.join("manager"), &manager);
+    crate::common::write_executable(&host.join("node-build"), &manager);
+    let registry = format!("schema_version=1\nactive_profile='base18'\nprofile_definition={:?}\n[[recipes]]\ntool='node'\nkind='Nodenv'\nmanager={:?}\ndependencies=[{:?}]\nsearch_path=[{:?}{}]\ninventory=['20.0.0','22.0.0']\n", profile.definition_digest().as_str(), host.join("manager").to_str().unwrap(),host.join("node-build").to_str().unwrap(),host.to_str().unwrap(), crate::common::system_search_path_toml());
+    let registry_file = spec.worker_state_dir.join("toolchains.toml");
+    std::fs::write(&registry_file, registry).unwrap();
+    std::fs::set_permissions(&registry_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    (root, spec, host)
+}
+
+fn node_requirement(
+    version: &str,
+) -> Vec<remote_task_runner::toolchain::versions::EffectiveRequirement> {
+    use remote_task_runner::toolchain::versions::{Constraint, EffectiveRequirement, ToolId};
+    vec![EffectiveRequirement {
+        tool: ToolId::parse("node").unwrap(),
+        constraints: vec![Constraint::parse(version).unwrap()],
+        provenance: vec![],
+    }]
+}
+
+/// The real measurement of the local worker, reduced to node: the other
+/// tools are stubs that answer nothing here, so they cannot be measured, and
+/// what cannot be measured is (rightly) never called in sync.
+fn measure(spec: &Spec) -> remote_task_runner::toolchain::envdiff::EnvReport {
+    let mut report =
+        remote_task_runner::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env)
+            .unwrap();
+    report.tools.retain(|name, _| name == "node");
+    report
+}
+
+/// `workers sync` for the local worker, the way the command runs it: measure,
+/// install through the running resident, measure again.
+async fn sync_node(
+    spec: &Spec,
+    version: &str,
+) -> Result<remote_task_runner::service::workers::SyncResult, remote_task_runner::error::ApiError> {
+    use remote_task_runner::service::workers::{sync_measured, warmup::ResidentWarmup};
+    let (spec, version) = (spec.clone(), version.to_string());
+    tokio::task::spawn_blocking(move || {
+        let parent = measure(&spec);
+        let mut installer = ResidentWarmup::new(spec.clone())
+            .paced(Duration::from_millis(50), Duration::from_secs(60));
+        sync_measured(
+            spec.worker_id.as_str(),
+            &parent,
+            || Ok(measure(&spec)),
+            Some(&node_requirement(&version)),
+            &mut installer,
+        )
+    })
+    .await
+    .unwrap()
+}
+
+fn calls_of(host: &std::path::Path, version: &str) -> usize {
+    std::fs::read_to_string(host.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|line| *line == version)
+        .count()
+}
+
+fn installed_node(spec: &Spec) -> Vec<String> {
+    measure(spec).tools["node"]
+        .managed
+        .as_ref()
+        .expect("the registry manages node")
+        .installed
+        .clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workers_sync_installs_through_the_resident_then_measures_again_and_needs_the_resident() {
+    let (_root, spec, host) = sync_fixture();
+    let client = ensure(spec.clone()).await.unwrap();
+    assert!(installed_node(&spec).is_empty());
+    // The request reaches the worker, the worker installs, the second
+    // measurement sees it.
+    let done = sync_node(&spec, "20.0.0").await.unwrap();
+    assert_eq!(done.installed.len(), 1);
+    assert_eq!(done.installed[0].tool, "node");
+    assert_eq!(done.installed[0].version, "20.0.0");
+    assert_eq!(installed_node(&spec), ["20.0.0"]);
+    assert_eq!(calls_of(&host, "20.0.0"), 1);
+    assert!(done.in_sync);
+    let line = remote_task_runner::service::workers::render_sync(&done, true);
+    assert_eq!(
+        line,
+        format!(
+            "worker {} is in sync; installed node 20.0.0",
+            spec.worker_id
+        )
+    );
+    // Again: nothing to install, nothing is run.
+    let again = sync_node(&spec, "20.0.0").await.unwrap();
+    assert!(again.installed.is_empty());
+    assert_eq!(calls_of(&host, "20.0.0"), 1);
+    // A warm-up of what is installed answers `unchanged` and runs no manager.
+    let Reply::EnvSync { results } = client
+        .request(Operation::EnvSync {
+            worker: spec.worker_id.clone(),
+            sync_id: remote_task_runner::ids::RequestId::generate(),
+            tools: vec![remote_task_runner::wire::ToolRequirement {
+                name: "node".into(),
+                version: "20.0.0".into(),
+            }],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the resident must answer the warm-up")
+    };
+    assert_eq!(
+        results[0].outcome,
+        remote_task_runner::wire::SyncOutcome::Unchanged
+    );
+    assert_eq!(calls_of(&host, "20.0.0"), 1);
+    // A worker the resident does not hold is said.
+    let Reply::ControlError { error } = client
+        .request(Operation::EnvSync {
+            worker: WorkerId::parse("nobody").unwrap(),
+            sync_id: remote_task_runner::ids::RequestId::generate(),
+            tools: vec![],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("an unknown worker is an error")
+    };
+    assert_eq!(error.code, remote_task_runner::error::ErrorCode::NotFound);
+    // Without a resident nothing is installed, none is started, and it is said.
+    shutdown(&client).await;
+    let error = sync_node(&spec, "22.0.0").await.unwrap_err();
+    assert!(
+        error.message.contains("the resident is not running"),
+        "{}",
+        error.message
+    );
+    assert_eq!(calls_of(&host, "22.0.0"), 0);
+    assert!(!client.socket_path().exists(), "sync started a resident");
+    assert_eq!(installed_node(&spec), ["20.0.0"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_warm_up_is_blocked_and_two_syncs_at_once_share_one_install() {
+    let (_root, spec, host) = sync_fixture();
+    let client = ensure(spec.clone()).await.unwrap();
+    // The manager fails: blocked with what was not installed, never success.
+    std::fs::write(host.join("fail"), "").unwrap();
+    let error = sync_node(&spec, "20.0.0").await.unwrap_err();
+    assert_eq!(error.code, remote_task_runner::error::ErrorCode::Blocked);
+    assert_eq!(
+        error.blocked_reason,
+        Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+    );
+    assert!(
+        error.message.contains("node 20.0.0 was not installed"),
+        "{}",
+        error.message
+    );
+    assert!(installed_node(&spec).is_empty());
+    std::fs::remove_file(host.join("fail")).unwrap();
+    // H1: the failed install left a private root without a receipt. The
+    // same version installs on the next sync; it is not blocked for good.
+    let again = sync_node(&spec, "20.0.0").await.unwrap();
+    assert_eq!(again.installed.len(), 1);
+    assert_eq!(again.installed[0].version, "20.0.0");
+    assert_eq!(calls_of(&host, "20.0.0"), 2);
+    assert_eq!(installed_node(&spec), ["20.0.0"]);
+    // Two syncs of the same version at once: one manager run, both done.
+    std::fs::write(host.join("hold"), "").unwrap();
+    let first = tokio::spawn({
+        let spec = spec.clone();
+        async move { sync_node(&spec, "22.0.0").await }
+    });
+    let second = tokio::spawn({
+        let spec = spec.clone();
+        async move { sync_node(&spec, "22.0.0").await }
+    });
+    for _ in 0..600 {
+        if calls_of(&host, "22.0.0") > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(calls_of(&host, "22.0.0"), 1, "the install must have begun");
+    // Both are asking by now; the second one joins instead of installing.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(!first.is_finished() && !second.is_finished());
+    assert_eq!(calls_of(&host, "22.0.0"), 1);
+    std::fs::remove_file(host.join("hold")).unwrap();
+    for done in [first.await.unwrap(), second.await.unwrap()] {
+        let done = done.unwrap();
+        assert_eq!(done.installed.len(), 1);
+        assert_eq!(done.installed[0].version, "22.0.0");
+    }
+    assert_eq!(calls_of(&host, "22.0.0"), 1);
+    assert_eq!(installed_node(&spec), ["20.0.0", "22.0.0"]);
+    shutdown(&client).await;
+}
+
+async fn wait_calls(host: &std::path::Path, version: &str, wanted: usize) {
+    for _ in 0..1200 {
+        if calls_of(host, version) >= wanted {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the manager was not asked for {version} {wanted} time(s)");
+}
+
+/// M4 (c), and a worker that restarts in the middle of an install: the local
+/// worker lives in the resident, so both go away and come back together.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sync_goes_on_over_a_restart_of_the_resident_in_the_middle_of_an_install() {
+    let (_root, spec, host) = sync_fixture();
+    let client = ensure(spec.clone()).await.unwrap();
+    std::fs::write(host.join("hold"), "").unwrap();
+    let sync = tokio::spawn({
+        let spec = spec.clone();
+        async move { sync_node(&spec, "22.0.0").await }
+    });
+    // The manager runs: the sync was answered `pending` well before that.
+    wait_calls(&host, "22.0.0", 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!sync.is_finished());
+    shutdown(&client).await;
+    // While nothing listens, the sync asks again instead of ending.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        !sync.is_finished(),
+        "the sync ended while the resident was away"
+    );
+    let client = ensure(spec.clone()).await.unwrap();
+    std::fs::remove_file(host.join("hold")).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(120), sync)
+        .await
+        .expect("the sync must end after the resident is back")
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.installed.len(), 1);
+    assert_eq!(done.installed[0].version, "22.0.0");
+    assert_eq!(installed_node(&spec), ["22.0.0"]);
+    // The stopped installer left a root without a receipt; it was cleared
+    // and the version installed again, or the first one finished: never
+    // more than one installer at a time, never a failure.
+    assert!((1..=2).contains(&calls_of(&host, "22.0.0")));
+    shutdown(&client).await;
+}
+
+/// M4 (d), before the worker forgets the interrupted warm-up: the install
+/// the first sync started goes on, and the second sync does not start
+/// another one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_sync_after_an_interrupted_one_finds_or_joins_the_same_install() {
+    let (_root, spec, host) = sync_fixture();
+    let client = ensure(spec.clone()).await.unwrap();
+    std::fs::write(host.join("hold"), "").unwrap();
+    // The first sync: one look, then nobody asks any more (Ctrl-C).
+    let Reply::EnvSync { results } = client
+        .request(Operation::EnvSync {
+            worker: spec.worker_id.clone(),
+            sync_id: remote_task_runner::ids::RequestId::generate(),
+            tools: vec![remote_task_runner::wire::ToolRequirement {
+                name: "node".into(),
+                version: "20.0.0".into(),
+            }],
+        })
+        .await
+        .unwrap()
+    else {
+        panic!("the resident must answer the warm-up")
+    };
+    assert_eq!(
+        results[0].outcome,
+        remote_task_runner::wire::SyncOutcome::Pending
+    );
+    wait_calls(&host, "20.0.0", 1).await;
+    let second = tokio::spawn({
+        let spec = spec.clone();
+        async move { sync_node(&spec, "20.0.0").await }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!second.is_finished());
+    assert_eq!(calls_of(&host, "20.0.0"), 1);
+    std::fs::remove_file(host.join("hold")).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(120), second)
+        .await
+        .expect("the second sync must end")
+        .unwrap()
+        .unwrap();
+    assert!(done.in_sync);
+    assert!(done.installed.len() <= 1);
+    assert_eq!(calls_of(&host, "20.0.0"), 1, "one install, shared");
+    assert_eq!(installed_node(&spec), ["20.0.0"]);
+    shutdown(&client).await;
+}
+
+/// M4 (e): the install of a warm-up passes the worker's
+/// task-traffic-controller gate. With the budget taken, its entry waits in
+/// the worker's ledger and the manager is not run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_install_of_a_warm_up_waits_for_the_traffic_gate_of_the_worker() {
+    use task_traffic_controller::config::Config;
+    use task_traffic_controller::{managed, Context};
+    let (_root, spec, host) = sync_fixture();
+    let client = ensure(spec.clone()).await.unwrap();
+    let traffic = spec.worker_state_dir.join("traffic");
+    let cfg = Config {
+        budget: 8,
+        cpu_threshold_percent: 100.0,
+        memory_reserve_mib: 0,
+        ..Config::default()
+    };
+    let ctx = Context::new(task_traffic_controller::paths::Paths::new(
+        &traffic,
+        traffic.join("config.toml"),
+    ));
+    // The whole budget of the worker is taken by something else.
+    let id = "warm-up-admission-blocker".to_string();
+    let command = managed::CommandSpec {
+        command_id: id.clone(),
+        spec_digest: "private-fixture".into(),
+        opts: task_traffic_controller::exec::Opts {
+            label: None,
+            weight: Some(8),
+            front: false,
+            key: None,
+            argv: vec!["/usr/bin/true".into()],
+            cwd: host.clone(),
+            env: None,
+            stdout_log: None,
+        },
+        attempt: None,
+        services: vec![],
+    };
+    let managed::Registration::Registered(_, guard) =
+        managed::register(&ctx, &cfg, &command).unwrap()
+    else {
+        panic!("fresh blocker")
+    };
+    assert!(matches!(
+        managed::try_admit(&ctx, cfg.limits(), &id, 0.0).unwrap(),
+        managed::TryAdmit::Admitted
+    ));
+    let entries = || {
+        task_traffic_controller::ledger::Ledger::load(&ctx.paths.ledger_file())
+            .map(|ledger| ledger.entries.len())
+            .unwrap_or(0)
+    };
+    assert_eq!(entries(), 1);
+    let sync = tokio::spawn({
+        let spec = spec.clone();
+        async move { sync_node(&spec, "20.0.0").await }
+    });
+    // The installer registers in the worker's ledger, behind the blocker.
+    for _ in 0..1200 {
+        if entries() == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        entries(),
+        2,
+        "the install did not enter the worker's ledger"
+    );
+    // It is not admitted: the manager cannot start during this wait.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert_eq!(calls_of(&host, "20.0.0"), 0);
+    assert!(!sync.is_finished());
+    managed::finish(&ctx, guard, managed::TerminalKind::Cancelled).unwrap();
+    let done = tokio::time::timeout(Duration::from_secs(120), sync)
+        .await
+        .expect("the sync must end once the gate opens")
+        .unwrap()
+        .unwrap();
+    assert_eq!(done.installed.len(), 1);
+    assert_eq!(calls_of(&host, "20.0.0"), 1);
+    assert_eq!(installed_node(&spec), ["20.0.0"]);
+    shutdown(&client).await;
+}

@@ -173,6 +173,10 @@ pub trait WorkerLink: Send + Sync {
     fn preparation_observations_negotiated(&self) -> bool {
         false
     }
+    /// The worker answers `env_sync` (hello feature `env_sync_v1`).
+    fn env_sync_negotiated(&self) -> bool {
+        false
+    }
 
     fn cold_eligible(&self, _task: &crate::ids::TaskId) -> bool {
         false
@@ -215,6 +219,7 @@ pub struct ClientLink {
     gate: Option<std::sync::Arc<InputGate>>,
     preparation_observations: bool,
     preparation_probe: bool,
+    env_sync: bool,
 }
 
 impl ClientLink {
@@ -225,6 +230,7 @@ impl ClientLink {
             gate: None,
             preparation_observations: false,
             preparation_probe: false,
+            env_sync: false,
         }
     }
 }
@@ -237,6 +243,7 @@ impl ClientLink {
             gate: Some(gate),
             preparation_observations: false,
             preparation_probe: false,
+            env_sync: false,
         }
     }
 }
@@ -249,6 +256,10 @@ impl ClientLink {
         self.preparation_observations = negotiated;
         self
     }
+    pub fn with_env_sync(mut self, negotiated: bool) -> Self {
+        self.env_sync = negotiated;
+        self
+    }
 }
 impl WorkerLink for ClientLink {
     fn preparation_probe_negotiated(&self) -> bool {
@@ -256,6 +267,9 @@ impl WorkerLink for ClientLink {
     }
     fn preparation_observations_negotiated(&self) -> bool {
         self.preparation_observations
+    }
+    fn env_sync_negotiated(&self) -> bool {
+        self.env_sync
     }
 
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
@@ -331,6 +345,9 @@ impl WorkerLink for Budgeted {
     }
     fn preparation_observations_negotiated(&self) -> bool {
         self.inner.preparation_observations_negotiated()
+    }
+    fn env_sync_negotiated(&self) -> bool {
+        self.inner.env_sync_negotiated()
     }
 
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
