@@ -950,7 +950,10 @@ fn a_system_service_installs_stops_restores_and_upgrades_without_replacing_the_a
             let version = fs::canonicalize(paths.executable(&host.digest)).unwrap();
             // Automatic startup is legitimate as soon as the administrator
             // publishes the first definition, before the parent retries.
-            system_user::check_boot(&paths, account, &version).unwrap();
+            assert_eq!(
+                system_user::check_boot(&paths, account, &paths.bridge_binary()).unwrap(),
+                version
+            );
             assert!(system_user::check_boot(&paths, "another-account", &version).is_err());
             assert!(system_user::check_boot(&paths, account, &host.exe).is_err());
             let up = host.install().unwrap();
@@ -992,7 +995,10 @@ fn a_system_service_installs_stops_restores_and_upgrades_without_replacing_the_a
             )
             .unwrap();
             let new = fs::canonicalize(paths.executable(&update.binary_sha256)).unwrap();
-            system_user::check_boot(&paths, account, &new).unwrap();
+            assert_eq!(
+                system_user::check_boot(&paths, account, &paths.bridge_binary()).unwrap(),
+                new
+            );
             assert!(system_user::check_boot(&paths, account, &version).is_err());
             assert!(switched.system_user && switched.ready);
             assert_eq!(switched.binary_sha256, update.binary_sha256);

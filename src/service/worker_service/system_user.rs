@@ -262,7 +262,8 @@ impl ManagedFiles for ServiceFiles {
 /// The system definition remains enabled across upgrades. After a power
 /// loss it may run only a version for which input and registration have
 /// already been committed. During an unfinished switch the drain is kept.
-pub(crate) fn check_start(input: &Path) -> anyhow::Result<()> {
+pub(crate) fn start(input: &Path) -> anyhow::Result<()> {
+    use std::os::unix::process::CommandExt;
     let config = input.parent().context("worker input directory missing")?;
     let (name, home) = passwd(euid())?;
     let env = BTreeMap::from([
@@ -279,10 +280,22 @@ pub(crate) fn check_start(input: &Path) -> anyhow::Result<()> {
     ]);
     let paths = Paths::resolve_for(&env, HostLauncher::native().backend())?;
     ensure!(paths.input == input, "unexpected system worker input path");
-    check_boot(&paths, &name, &std::env::current_exe()?)
+    let pinned = check_boot(&paths, &name, &std::env::current_exe()?)?;
+    // macOS current_exe preserves the invocation symlink. Enter the pinned
+    // version directly, so the foreground worker and its supervisor retain
+    // an immutable path even across a later replacement of bin/current.
+    Err(std::process::Command::new(&pinned)
+        .args(["worker", "--input"])
+        .arg(input)
+        .exec())
+    .with_context(|| format!("start pinned worker {}", pinned.display()))
 }
 
-pub(super) fn check_boot(paths: &Paths, username: &str, executable: &Path) -> anyhow::Result<()> {
+pub(super) fn check_boot(
+    paths: &Paths,
+    username: &str,
+    executable: &Path,
+) -> anyhow::Result<PathBuf> {
     let journal = require_journal(paths)?;
     ensure!(
         journal.system_user.as_deref() == Some(username),
@@ -301,11 +314,12 @@ pub(super) fn check_boot(paths: &Paths, username: &str, executable: &Path) -> an
             "worker version switch has not published its receipt"
         );
     }
+    let pinned = fs::canonicalize(paths.executable(&journal.binary_sha256))?;
     ensure!(
-        fs::canonicalize(paths.executable(&journal.binary_sha256))? == executable,
+        pinned == fs::canonicalize(executable)?,
         "worker binary differs from the installed version"
     );
-    Ok(())
+    Ok(pinned)
 }
 
 #[cfg(test)]

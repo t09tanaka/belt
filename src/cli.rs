@@ -423,11 +423,13 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::Worker(args) = &cli.command {
         if let Some(input) = &args.input {
             if args.system_service {
-                if let Err(error) = crate::service::worker_service::system_user::check_start(input)
-                {
-                    eprintln!("{error:#}");
-                    return 1;
-                }
+                return match crate::service::worker_service::system_user::start(input) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("{error:#}");
+                        1
+                    }
+                };
             }
             return crate::service::worker::main(input);
         }
