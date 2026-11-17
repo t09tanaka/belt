@@ -26,6 +26,9 @@ pub struct SubmittedTask {
     pub plan_task: String,
     /// It waits for the jobs it needs.
     pub waits: bool,
+    /// Discovery is listed in the submit receipt but produces no public job line.
+    #[serde(skip)]
+    discovery: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -288,6 +291,10 @@ pub async fn submit(
             task_id: task_id.clone(),
             plan_task,
             waits: spec.ci.as_ref().is_some_and(|ci| ci.hold),
+            discovery: spec
+                .ci
+                .as_ref()
+                .is_some_and(|ci| crate::wire::is_discovery_task(&ci.task)),
         });
         tasks.push((task_id, spec));
     }
@@ -356,7 +363,7 @@ pub async fn run(
     let (spec, settled) = (context.bootstrap.clone(), context.clone());
     let end = Ended::of(&report);
     let expected = receipt.as_ref().map(|receipt| {
-        let tasks = receipt.tasks.iter();
+        let tasks = receipt.tasks.iter().filter(|task| !task.discovery);
         tasks.map(|task| task.plan_task.clone()).collect::<Vec<_>>()
     });
     // Decided only here, after the wait: on the parent, from the result of
