@@ -879,7 +879,7 @@ fn recovery_of_a_ci_task_whose_supervisor_was_lost_during_a_step_settles_it_and_
 }
 
 #[test]
-fn worker_discovery_lists_real_cargo_tests_without_executing_their_bodies() {
+fn worker_discovery_lists_real_cargo_tests_then_runs_only_each_shards_assigned_test() {
     use crate::ci::discovery::{candidates, WorkerListing};
     let workflow="on: push\njobs:\n  rust:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
     let f = crate::ci::execute::tests::fixture_with(workflow, |root| {
@@ -903,7 +903,7 @@ fn worker_discovery_lists_real_cargo_tests_without_executing_their_bodies() {
     assert!(toolchain.status.success());
     let bin = Path::new(std::str::from_utf8(&toolchain.stdout).unwrap().trim()).join("bin");
     let path = format!("{}:{}", bin.display(), ci.env["PATH"]);
-    ci.env.insert("PATH".into(), path);
+    ci.env.insert("PATH".into(), path.clone());
     ci.env.insert("CARGO_NET_OFFLINE".into(), "true".into());
     let report = run(&spec).unwrap();
     assert_eq!(report.termination.unwrap().outcome(), Outcome::Succeeded);
@@ -917,4 +917,52 @@ fn worker_discovery_lists_real_cargo_tests_without_executing_their_bodies() {
     assert!(listing.runner_version.starts_with("cargo "));
     assert_eq!(listing.discovered.tests, ["fast", "slow"]);
     assert!(listing.discovered.complete);
+
+    let plan = crate::ci::discovery::apply(
+        &sup.f.plan,
+        &[listing],
+        |_| Ok((Default::default(), Default::default(), 2)),
+        |_| local_ci::shard::Isolation::None,
+    )
+    .unwrap();
+    let group = plan.shard_groups.iter().find(|g| g.split).unwrap();
+    let digest =
+        crate::worker::ci_task::store_plan(&sup.state(), &serde_json::to_vec(&plan).unwrap())
+            .unwrap();
+    for (task, tests) in group.shards.iter().zip(&group.assignments) {
+        let mut spec = sup.attempt("rust", &TaskInputs::default());
+        let ci = spec.ci.as_mut().unwrap();
+        ci.plan_path = crate::worker::ci_task::plan_path(&sup.state(), &digest);
+        ci.plan_digest = digest.clone();
+        ci.task_id = task.clone();
+        ci.verify_shard_version = true;
+        ci.env.insert("PATH".into(), path.clone());
+        ci.env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+        assert_eq!(tests.len(), 1);
+        let passed = tests[0] == "fast";
+        let end = run(&spec).unwrap().termination.unwrap().outcome();
+        assert_eq!(
+            end,
+            if passed {
+                Outcome::Succeeded
+            } else {
+                Outcome::Failed
+            },
+            "{}",
+            sup.output(&spec)
+        );
+        let receipt = sup.result(&spec).unwrap().shard.unwrap();
+        assert!(receipt.parsed);
+        assert_eq!(receipt.exit_ok, passed);
+        assert_eq!(receipt.tests.len(), 1);
+        assert_eq!(receipt.tests[0].identity, tests[0]);
+        assert_eq!(
+            receipt.tests[0].status,
+            if passed {
+                local_ci::shard::TestStatus::Passed
+            } else {
+                local_ci::shard::TestStatus::Failed
+            }
+        );
+    }
 }
