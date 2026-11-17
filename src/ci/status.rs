@@ -150,8 +150,9 @@ pub struct Lookup<'a> {
     pub enabled: bool,
     pub context: &'a str,
     pub description: &'a str,
-    /// `owner/name` of the repository's `origin`.
-    pub repository: Option<&'a str>,
+    /// `owner/name` on GitHub ([`repository`]), or why there is none to
+    /// post to.
+    pub repository: Result<&'a str, &'a str>,
     /// The tree of `original_head` in the repository, `None` when it is not
     /// a commit there.
     pub tree_of_head: Option<&'a str>,
@@ -174,8 +175,9 @@ pub fn decide(computed: Computed, source: &Source<'_>, lookup: &Lookup<'_>) -> D
     let Some(state) = computed.github_state() else {
         return skip(format!("the run is {}", computed.as_str()));
     };
-    let Some(repository) = lookup.repository else {
-        return skip("no origin remote".into());
+    let repository = match lookup.repository {
+        Ok(repository) => repository,
+        Err(why) => return skip(why.to_string()),
     };
     let Some(head) = source.original_head else {
         return skip("the run tested a directory snapshot, not a commit".into());
@@ -265,22 +267,59 @@ pub fn outcome(decision: Decision, post: impl FnOnce(&Post) -> Result<(), String
 /// What a failed post says. A commit GitHub does not know (not pushed yet)
 /// is named as that; anything else is the first line of what was answered.
 pub fn post_error(sha: &str, raw: &str) -> String {
-    if raw.contains("No commit found") || raw.contains("422") {
+    if raw.contains("No commit found") {
         return format!("{} is not on GitHub yet", short(sha));
     }
     raw.lines().next().unwrap_or("").trim().to_string()
 }
 
-/// `owner/name` of a remote URL (`git@host:owner/name.git`,
-/// `https://host/owner/name`), as local-ci reads it.
-pub fn repo_slug(url: &str) -> Option<String> {
+/// The host GitHub is reached at when `GH_HOST` does not name another.
+pub const GITHUB_HOST: &str = "github.com";
+
+/// Host and `owner/name` of a remote URL: `[user@]host:owner/name[.git]`
+/// or `scheme://[user@]host[:port]/owner/name[.git]`. A local path, or a
+/// path that is not exactly owner and name, is no such remote.
+pub fn remote(url: &str) -> Option<(&str, String)> {
     let url = url.trim();
-    let url = url.strip_suffix('/').unwrap_or(url);
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    let tail = url.rsplit_once(':').map_or(url, |(_, tail)| tail);
-    let mut parts = tail.rsplit('/');
-    let (name, owner) = (parts.next()?, parts.next()?);
-    (!name.is_empty() && !owner.is_empty()).then(|| format!("{owner}/{name}"))
+    let (authority, path) = match url.split_once("://") {
+        Some((_, rest)) => rest.split_once('/')?,
+        None => url
+            .split_once(':')
+            .filter(|(host, _)| !host.contains('/'))?,
+    };
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = host.split_once(':').map_or(host, |(host, _)| host);
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let (owner, name) = path.split_once('/')?;
+    (!host.is_empty() && !name.is_empty() && !name.contains('/'))
+        .then(|| (host, format!("{owner}/{name}")))
+}
+
+/// The repository on GitHub a status of this run may go to, or why there is
+/// none. `origin` must be on the GitHub host (`gh_host`, else github.com),
+/// and it must still be the repository the input was captured from
+/// (`captured`, the manifest's `github:<owner>/<name>`): what is posted
+/// goes where the tested content came from, not where `origin` points now.
+pub fn repository(
+    captured: Option<&str>,
+    origin: Option<&str>,
+    gh_host: Option<&str>,
+) -> Result<String, String> {
+    let origin = origin.ok_or("no origin remote")?;
+    let (host, slug) = remote(origin).ok_or("origin is not a repository on GitHub")?;
+    let wanted = gh_host.unwrap_or(GITHUB_HOST);
+    if !host.eq_ignore_ascii_case(wanted) {
+        return Err(format!("origin is on {host}, not on {wanted}"));
+    }
+    if captured != Some(format!("github:{slug}").as_str()) {
+        return Err(format!(
+            "origin is {slug} now, not the repository the input was captured from"
+        ));
+    }
+    Ok(slug)
 }
 
 /// The status of a run as it is reported and kept: the computed result, the
@@ -461,7 +500,7 @@ mod tests {
             enabled: true,
             context: DEFAULT_CONTEXT,
             description: "success: pass 1 / fail 0 / error 0 / skip 0",
-            repository: Some("owner/name"),
+            repository: Ok("owner/name"),
             tree_of_head: Some("tree1"),
         }
     }
@@ -557,7 +596,7 @@ mod tests {
             "the run is pending"
         );
         let local = Lookup {
-            repository: None,
+            repository: Err("no origin remote"),
             ..lookup()
         };
         assert_eq!(
@@ -634,29 +673,86 @@ mod tests {
             post_error(HEAD, "gh: No commit found for SHA: 0123 (HTTP 404)"),
             "0123456 is not on GitHub yet"
         );
+        // Another refusal with the same code is said as it was answered.
         assert_eq!(
-            post_error(HEAD, "gh: Validation Failed (HTTP 422)"),
-            "0123456 is not on GitHub yet"
+            post_error(HEAD, "gh: Validation Failed (HTTP 422)\nmore"),
+            "gh: Validation Failed (HTTP 422)"
         );
         assert_eq!(post_error(HEAD, ""), "");
         assert_eq!(post_error(HEAD, "\nsecond"), "");
     }
 
     #[test]
-    fn a_remote_url_names_owner_and_repository() {
-        for url in [
-            "git@example.com:owner/name.git",
-            "https://example.com/owner/name",
-            "https://example.com/owner/name.git/",
-            "ssh://git@example.com:22/owner/name.git\n",
+    fn a_remote_url_names_its_host_owner_and_repository() {
+        for (url, host) in [
+            ("git@github.com:owner/name.git", "github.com"),
+            ("github.com:owner/name", "github.com"),
+            ("https://example.com/owner/name", "example.com"),
+            ("https://user@example.com/owner/name.git/", "example.com"),
+            ("ssh://git@example.com:22/owner/name.git\n", "example.com"),
+            ("git@example.com:/owner/name", "example.com"),
         ] {
-            assert_eq!(repo_slug(url).as_deref(), Some("owner/name"), "{url}");
+            assert_eq!(remote(url), Some((host, "owner/name".to_string())), "{url}");
         }
-        assert_eq!(repo_slug("name"), None);
-        assert_eq!(repo_slug(""), None);
-        assert_eq!(repo_slug("/name"), None);
-        assert_eq!(repo_slug("owner/"), None);
-        assert_eq!(repo_slug("owner//"), None);
+        for url in [
+            "",
+            "name",
+            "/srv/git/owner/name.git",
+            "../owner/name",
+            "/srv/git:owner/name",
+            "file:///owner/name",
+            "https://example.com",
+            "https://example.com/name",
+            "https://example.com/group/owner/name",
+            "git@example.com:name",
+            "git@example.com:owner/.git",
+        ] {
+            assert_eq!(remote(url), None, "{url}");
+        }
+    }
+
+    #[test]
+    fn only_the_github_repository_the_input_came_from_is_posted_to() {
+        let captured = Some("github:owner/name");
+        let origin = Some("git@github.com:owner/name.git");
+        assert_eq!(
+            repository(captured, origin, None).as_deref(),
+            Ok("owner/name")
+        );
+        assert_eq!(
+            repository(captured, Some("https://GitHub.com/owner/name"), None).as_deref(),
+            Ok("owner/name")
+        );
+        assert_eq!(
+            repository(captured, None, None).unwrap_err(),
+            "no origin remote"
+        );
+        assert_eq!(
+            repository(captured, Some("/srv/git/owner/name"), None).unwrap_err(),
+            "origin is not a repository on GitHub"
+        );
+        // Another forge with the same owner and name is not GitHub.
+        let other = Some("git@example.com:owner/name.git");
+        assert_eq!(
+            repository(captured, other, None).unwrap_err(),
+            "origin is on example.com, not on github.com"
+        );
+        // ... unless it is the GitHub host that was asked for.
+        assert_eq!(
+            repository(captured, other, Some("example.com")).as_deref(),
+            Ok("owner/name")
+        );
+        assert_eq!(
+            repository(captured, origin, Some("example.com")).unwrap_err(),
+            "origin is on github.com, not on example.com"
+        );
+        // The origin was changed after the capture, or there was none then.
+        for captured in [Some("github:owner/other"), Some("root:0123"), None] {
+            assert_eq!(
+                repository(captured, origin, None).unwrap_err(),
+                "origin is owner/name now, not the repository the input was captured from"
+            );
+        }
     }
 
     #[test]
