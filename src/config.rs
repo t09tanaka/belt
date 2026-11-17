@@ -15,6 +15,7 @@ pub mod parse;
 pub mod paths;
 pub mod resolve;
 pub mod runtime;
+pub mod traffic;
 
 pub use error::ConfigError;
 pub use resolve::{resolve, Inputs, Origin, Overlay, ResolvedConfig, Value};

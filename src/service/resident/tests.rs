@@ -1845,7 +1845,8 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
     let _source_gc_pin = resident.captured.sources.mutation_guard().unwrap();
     let before_rows = rows(&coordinator);
     let before_sources = files(&root.path().join("parent/sources"));
-    let before_traffic = files(&root.path().join("worker/traffic"));
+    let traffic = root.path().join(".local/state/task-traffic-controller");
+    let before_traffic = files(&traffic);
     let before_epoch = coordinator.epoch();
     let runner = tokio::spawn(resident.run());
     // One read holds its worker inspection for a live CPU sample of 300 ms
@@ -1937,7 +1938,7 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
     assert_eq!(before_generation, gate.generation());
     assert_eq!(before_readiness, gate.snapshot());
     assert_eq!(before_sources, files(&root.path().join("parent/sources")));
-    assert_eq!(before_traffic, files(&root.path().join("worker/traffic")));
+    assert_eq!(before_traffic, files(&traffic));
     assert!(!root.path().join("worker/clones").exists());
     client.request(Operation::Shutdown).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), runner)

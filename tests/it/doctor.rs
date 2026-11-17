@@ -50,10 +50,10 @@ fn a_parent_without_a_separate_command_is_healthy() {
     assert_eq!(report["result"]["healthy"], true);
     assert_eq!(check(&report, "parent", "traffic_runtime")["level"], "ok");
     assert_eq!(check(&report, "parent", "service_profile")["level"], "ok");
-    // The worker's private scope is said, not hidden.
+    // The worker shares the command's scope.
     assert_eq!(
         check(&report, "parent", "traffic_state_path")["level"],
-        "notice"
+        "ok"
     );
 }
 
@@ -81,10 +81,10 @@ fn an_unpatched_task_traffic_controller_fails_doctor() {
         .as_str()
         .unwrap()
         .contains("does not know managed entries"));
-    // With the command installed, the two scopes are two budgets.
+    // The scope check passes: the worker uses the command's scope.
     assert_eq!(
         check(&report, "parent", "traffic_state_path")["level"],
-        "fail"
+        "ok"
     );
 }
 

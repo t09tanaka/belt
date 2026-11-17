@@ -525,6 +525,8 @@ fn status_with(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
         cancel_running: false,
         live_attempts: Some(0),
         bridge_binary: None,
+        traffic_scope: None,
+        traffic_hold: None,
         switching_from: None,
         drained_by_upgrade: false,
         switch_running: false,

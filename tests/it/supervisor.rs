@@ -329,6 +329,213 @@ fn a_successful_node_is_recorded_with_its_process_identity() {
     assert!(a.receipts.reached(Receipt::Terminal));
 }
 
+/// Where the `task-traffic-controller` CLI looks, from this process's own
+/// environment. The CLI's rule written out a second time on purpose: it is
+/// what the worker's rule is checked against.
+fn cli_paths() -> task_traffic_controller::Paths {
+    let home = |var: &str, under: &str| {
+        std::env::var_os(var)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(under))
+    };
+    task_traffic_controller::Paths::new(
+        home("XDG_STATE_HOME", ".local/state").join("task-traffic-controller"),
+        home("XDG_CONFIG_HOME", ".config").join("task-traffic-controller/config.toml"),
+    )
+}
+
+/// What a `task-traffic-controller exec` started by a command would decide,
+/// run as that command and decided as the CLI does (`exec::nesting`, with the
+/// mode read from `TASK_TRAFFIC_CONTROLLER_NESTED`): does it run under the
+/// entry of the command it is nested in (`inherit`), queue as a child entry
+/// of it (`child`, the CLI's default mode `admit`), or not find it (`top`)?
+#[test]
+#[ignore = "helper process of the nested scope tests"]
+fn nested_cli_probe() {
+    use task_traffic_controller::exec::{nesting, NestedMode, Nesting};
+    let Some(out) = std::env::var_os("RTR_NESTED_PROBE_OUT") else {
+        return;
+    };
+    let ctx = task_traffic_controller::Context::new(cli_paths());
+    let var = |name: &str| std::env::var(name).ok();
+    let mode = var(remote_task_runner::config::traffic::NESTED_ENV);
+    let decided = nesting(
+        &ctx,
+        mode.as_deref().map_or(NestedMode::default(), |text| {
+            NestedMode::parse(text).expect("a nesting mode")
+        }),
+        var("TASK_TRAFFIC_CONTROLLER_LEASE").as_deref(),
+        var(task_traffic_controller::marker::ENV_VAR).as_deref(),
+        var(task_traffic_controller::marker::SCOPE_VAR).as_deref(),
+    )
+    .unwrap();
+    let (nesting, under) = match decided {
+        Nesting::Inherit(id) => ("inherit", Some(id)),
+        Nesting::Child(id) => ("child", Some(id)),
+        Nesting::Top => ("top", None),
+    };
+    let entries: Vec<String> =
+        task_traffic_controller::ledger::Ledger::load(&ctx.paths.ledger_file())
+            .unwrap()
+            .entries
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+    let report = serde_json::json!({
+        "state_dir": ctx.paths.state_dir(),
+        "config_file": ctx.paths.config_file(),
+        "mode": mode,
+        "nesting": nesting,
+        "under": under,
+        "entries": entries,
+    });
+    std::fs::write(out, report.to_string()).unwrap();
+}
+
+/// A fixture whose spec has the scope of a worker started with `env`, and
+/// what that worker gives every command (`extra` on top).
+fn worker_fx(
+    env: BTreeMap<String, String>,
+    extra: &BTreeMap<String, String>,
+) -> (Fx, BTreeMap<String, String>) {
+    use remote_task_runner::config::{self, runtime::WorkerInputs};
+    let mut f = fx(vec![]);
+    let runtime = config::resolve(&config::Inputs {
+        overlay: &Default::default(),
+        project: None,
+        legacy: None,
+        user: None,
+    })
+    .unwrap()
+    .worker_runtime(WorkerInputs {
+        state_dir: f.spec.state_dir.clone(),
+        worker_id: f.spec.worker_id.clone(),
+        boot_id: WorkerBootId::parse("boot-1").unwrap(),
+        supervisor_exe: env!("CARGO_BIN_EXE_remote-task-runner").into(),
+        cluster_key_path: f.path("cluster.key"),
+        env,
+    })
+    .unwrap();
+    let agent = runtime.agent_config();
+    f.spec.traffic_state_dir = agent.traffic_state_dir.clone();
+    f.spec.traffic_config = agent.traffic_config.clone();
+    let step = agent
+        .capability_profile
+        .as_ref()
+        .unwrap()
+        .execution_environment(extra)
+        .unwrap();
+    (f, step)
+}
+
+/// Run the probe as the one command of an attempt whose scope and command
+/// environment are what a worker started with `env` uses; `adjust` changes
+/// the spec before it runs.
+fn probe_nested(
+    env: BTreeMap<String, String>,
+    adjust: impl Fn(&mut SuperviseSpec),
+) -> (Fx, serde_json::Value) {
+    let home = PathBuf::from(&env["HOME"]);
+    let out = home.join("probe.json");
+    let extra = BTreeMap::from([("RTR_NESTED_PROBE_OUT".into(), out.display().to_string())]);
+    let (f, step) = worker_fx(env, &extra);
+    let mut spec = f.spec.clone();
+    spec.nodes = vec![NodeSpec {
+        node_id: NodeId::parse("probe").unwrap(),
+        argv: vec![
+            std::env::current_exe().unwrap().display().to_string(),
+            "--exact".into(),
+            "supervisor::nested_cli_probe".into(),
+            "--ignored".into(),
+        ],
+        cwd: f.dir.path().to_path_buf(),
+        env: step,
+        weight: Some(1),
+        timeout_ms: None,
+    }];
+    adjust(&mut spec);
+    let t = settled(&run(&spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded, "{}", f.output());
+    let report = serde_json::from_slice(&std::fs::read(out).unwrap()).unwrap();
+    (f, report)
+}
+
+fn worker_env(f_home: &Path) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("HOME".into(), f_home.display().to_string()),
+    ])
+}
+
+#[test]
+fn a_nested_cli_shares_the_ledger_of_the_worker_and_inherits_the_run() {
+    // HOME alone, and an XDG_STATE_HOME that moves the scope away from it.
+    for state_home in [false, true] {
+        let home = crate::test_tmp::tempdir().unwrap();
+        let mut env = worker_env(home.path());
+        let base = if state_home {
+            let dir = home.path().join("xdg-state");
+            env.insert("XDG_STATE_HOME".into(), dir.display().to_string());
+            dir
+        } else {
+            home.path().join(".local/state")
+        };
+        let (f, report) = probe_nested(env, |_| {});
+        let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), 0);
+        // The CLI resolves the directory the worker admitted the command in,
+        assert_eq!(
+            report["state_dir"],
+            serde_json::json!(base.join("task-traffic-controller")),
+        );
+        assert_eq!(
+            report["config_file"],
+            serde_json::json!(home
+                .path()
+                .join(".config/task-traffic-controller/config.toml")),
+        );
+        // sees the worker's entry in its ledger,
+        assert_eq!(report["entries"], serde_json::json!([id]));
+        // and, told so by the worker, runs under that entry at once instead
+        // of queueing for the budget a second time (spec chapter 14).
+        assert_eq!(report["mode"], "inherit");
+        assert_eq!(report["nesting"], "inherit");
+        assert_eq!(report["under"], serde_json::json!(id));
+    }
+}
+
+/// What the worker's `TASK_TRAFFIC_CONTROLLER_NESTED=inherit` changes: left
+/// to the CLI's own default (`admit`), the same nested call would queue as a
+/// child entry of the command.
+#[test]
+fn without_the_workers_mode_a_nested_cli_would_queue_as_a_child() {
+    let home = crate::test_tmp::tempdir().unwrap();
+    let (f, report) = probe_nested(worker_env(home.path()), |spec| {
+        spec.nodes[0]
+            .env
+            .remove(remote_task_runner::config::traffic::NESTED_ENV)
+            .expect("the worker sets the mode");
+    });
+    let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), 0);
+    assert_eq!(report["mode"], serde_json::Value::Null);
+    assert_eq!(report["nesting"], "child");
+    assert_eq!(report["under"], serde_json::json!(id));
+}
+
+/// The same probe against the scope a worker used to keep for itself
+/// (`<state>/traffic`): the CLI looks elsewhere and would be gated again.
+#[test]
+fn a_nested_cli_does_not_find_a_run_admitted_in_a_private_scope() {
+    let home = crate::test_tmp::tempdir().unwrap();
+    let (_f, report) = probe_nested(worker_env(home.path()), |spec| {
+        spec.traffic_state_dir = spec.state_dir.join("traffic");
+        spec.traffic_config = None;
+    });
+    assert_eq!(report["entries"], serde_json::json!([]));
+    assert_eq!(report["nesting"], "top");
+    assert_eq!(report["under"], serde_json::Value::Null);
+}
+
 #[test]
 fn a_failing_node_stops_the_attempt_and_later_nodes_never_start() {
     let f = fx(vec![
@@ -2252,5 +2459,198 @@ fn generic_conditions_cover_timeout_prelaunch_cancel_and_prepared_only() {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------- a ledger in the v3 shape
+
+/// A nested entry as `task-traffic-controller` 0.9 and later write it: it
+/// names the entry it runs under, which makes `Ledger::save` write the file in
+/// the v3 shape that a 0.8 library cannot read.
+fn nested_entry(id: &str, parent: &str) -> task_traffic_controller::ledger::Entry {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "pid": std::process::id(), "state": "running", "front": false,
+        "weight": 1, "predicted_rss": 0, "repo": "", "argv": "x", "key": "k",
+        "seq": 1, "enqueued_at": "2030-01-01T00:00:00Z", "parent": parent,
+    }))
+    .unwrap()
+}
+
+/// Put a v3 ledger with one live nested entry into `scope`. The returned
+/// lease keeps the entry alive (the reaper keeps what holds one).
+fn seed_v3_ledger(scope: &Path) -> task_traffic_controller::lock::Lock {
+    let ctx = task_traffic_controller::Context::new(task_traffic_controller::Paths::new(
+        scope,
+        scope.join("config.toml"),
+    ));
+    let ledger = task_traffic_controller::ledger::Ledger {
+        entries: vec![nested_entry("cli-nested", "cli-outer")],
+        ..Default::default()
+    };
+    ledger.save(&ctx.paths.ledger_file()).unwrap();
+    assert_eq!(
+        task_traffic_controller::ledger::Ledger::file_format(&ctx.paths.ledger_file()),
+        task_traffic_controller::ledger::NESTED_SCHEMA_VERSION,
+    );
+    task_traffic_controller::lock::take_lease(&ctx, "cli-nested").unwrap()
+}
+
+#[test]
+fn a_run_goes_on_while_the_scope_holds_a_v3_ledger() {
+    let f = fx(vec![node("build", "exit 0")]);
+    // The seeded entry counts against the budget, and the default guards
+    // follow the load of the machine: fix the admission, this test is about
+    // the shape of the ledger.
+    crate::common::fixture_traffic_config(f.dir.path());
+    assert!(f.spec.traffic_state_dir.join("config.toml").is_file());
+    let _lease = seed_v3_ledger(&f.spec.traffic_state_dir);
+    let r = run(&f.spec).unwrap();
+    assert_eq!(settled(&r).outcome(), Outcome::Succeeded, "{}", f.output());
+    // The other command's entry is still there, still in the v3 shape.
+    let path =
+        task_traffic_controller::Paths::new(&f.spec.traffic_state_dir, "unused").ledger_file();
+    assert_eq!(
+        task_traffic_controller::ledger::Ledger::file_format(&path),
+        task_traffic_controller::ledger::NESTED_SCHEMA_VERSION,
+    );
+    let ledger = task_traffic_controller::ledger::Ledger::load(&path).unwrap();
+    assert!(ledger.entries.iter().any(|e| e.id == "cli-nested"));
+}
+
+/// The installed `task-traffic-controller`. Without one the real-CLI test
+/// cannot run: that is a failure where it is required (`RTR_REQUIRE_TTC_CLI`,
+/// set in CI), and said aloud elsewhere.
+fn ttc_cli() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let found = std::env::split_paths(&path)
+        .map(|d| d.join("task-traffic-controller"))
+        .find(|p| p.is_file());
+    if found.is_none() {
+        assert!(
+            std::env::var_os("RTR_REQUIRE_TTC_CLI").is_none(),
+            "task-traffic-controller is required here and is not installed"
+        );
+        eprintln!("task-traffic-controller is not installed: the real CLI is not run from a step");
+    }
+    found
+}
+
+/// Lets the nested command of the real-CLI test end, whatever happens to the
+/// test: a failed assertion must not leave it (and the threads waiting for
+/// it) running.
+struct Release(PathBuf);
+impl Drop for Release {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, "");
+    }
+}
+
+/// The real thing: a step of a worker calls the installed CLI (0.10.x).
+///
+/// First as the worker starts every step, with the worker's scope and
+/// `TASK_TRAFFIC_CONTROLLER_NESTED=inherit`: the nested command runs under
+/// the step's own entry, and no entry is added for it.
+///
+/// Then with `--nested admit` (the CLI's default outside a worker), which
+/// makes the CLI keep the ledger in the v3 shape while the nested command
+/// runs: the worker's library still inspects the scope and supervises
+/// another attempt meanwhile.
+///
+/// The CLI reads the configuration the worker reads (budget 2, or 3 where
+/// the nested command is admitted on its own; no CPU or memory guard, so the
+/// load of the machine decides nothing).
+#[test]
+fn a_real_nested_cli_runs_under_its_step_and_shares_the_ledger() {
+    let Some(cli) = ttc_cli() else {
+        return;
+    };
+    for mode in ["inherit", "admit"] {
+        let home = crate::test_tmp::tempdir().unwrap();
+        let env = worker_env(home.path());
+        // With `admit` the nested command takes a unit of the budget next
+        // to its step (what `inherit` avoids), so a third unit is needed for
+        // the other attempt to be admitted meanwhile.
+        crate::common::fixture_worker_traffic_budget(&env, if mode == "admit" { 3 } else { 2 });
+        let started = home.path().join("started");
+        let release = home.path().join("release");
+        let inner = format!(
+            "touch {}; while [ ! -e {} ]; do sleep 0.05; done",
+            started.display(),
+            release.display()
+        );
+        let extra = BTreeMap::from([
+            ("RTR_TEST_CLI".to_string(), cli.display().to_string()),
+            ("RTR_TEST_INNER".to_string(), inner),
+        ]);
+        let (mut outer, step) = worker_fx(env.clone(), &extra);
+        assert_eq!(step["TASK_TRAFFIC_CONTROLLER_NESTED"], "inherit");
+        let scope = outer.spec.traffic_state_dir.clone();
+        let config = outer.spec.traffic_config.clone().unwrap();
+        assert_eq!(
+            config,
+            home.path()
+                .join(".config/task-traffic-controller/config.toml")
+        );
+        assert!(config.is_file());
+        // The flag wins over the variable the worker sets.
+        let script = match mode {
+            "inherit" => "\"$RTR_TEST_CLI\" exec -- /bin/sh -c \"$RTR_TEST_INNER\"",
+            _ => "\"$RTR_TEST_CLI\" exec --nested admit -- /bin/sh -c \"$RTR_TEST_INNER\"",
+        };
+        outer.spec.nodes = vec![NodeSpec {
+            env: step,
+            ..node("outer", script)
+        }];
+        let outer_id = remote_task_runner::supervisor::spec::command_id(outer.attempt(), 0);
+        let (mut other, _) = worker_fx(env, &BTreeMap::new());
+        other.spec.nodes = vec![node("other", "exit 0")];
+        assert_eq!(other.spec.traffic_state_dir, scope);
+        let ctx = task_traffic_controller::Context::new(task_traffic_controller::Paths::new(
+            &scope, &config,
+        ));
+        let ledger_file = ctx.paths.ledger_file();
+        std::thread::scope(|s| {
+            // Dropped before the scope joins its threads, also on a panic.
+            let _release = Release(release.clone());
+            let runner = s.spawn(|| run(&outer.spec).unwrap());
+            wait_for("the nested command to start", || started.exists());
+            let seen = task_traffic_controller::inspect::inspect(&ctx).unwrap();
+            let entries: Vec<(&str, Option<&str>)> = seen
+                .entries
+                .iter()
+                .map(|e| (e.entry.id.as_str(), e.entry.parent.as_deref()))
+                .collect();
+            if mode == "inherit" {
+                // Only the step's entry: the nested command is not a job.
+                assert_eq!(entries, [(outer_id.as_str(), None)], "{mode}");
+            } else {
+                // A child entry of the step, in the shape a 0.8 library
+                // could not read.
+                assert_eq!(entries.len(), 2, "{entries:?}");
+                assert!(entries.contains(&(outer_id.as_str(), None)), "{entries:?}");
+                assert!(
+                    entries
+                        .iter()
+                        .any(|(_, parent)| *parent == Some(outer_id.as_str())),
+                    "{entries:?}"
+                );
+                assert_eq!(
+                    task_traffic_controller::ledger::Ledger::file_format(&ledger_file),
+                    task_traffic_controller::ledger::NESTED_SCHEMA_VERSION,
+                );
+            }
+            // Another attempt of the worker is supervised meanwhile. It is
+            // waited for with a limit: if it could not be admitted the test
+            // fails here, and the nested command is released by the guard.
+            let second = s.spawn(|| run(&other.spec).unwrap());
+            wait_for(&format!("the other attempt to end ({mode})"), || {
+                second.is_finished()
+            });
+            let t = settled(&second.join().unwrap());
+            assert_eq!(t.outcome(), Outcome::Succeeded, "{}", other.output());
+            std::fs::write(&release, "").unwrap();
+            let t = settled(&runner.join().unwrap());
+            assert_eq!(t.outcome(), Outcome::Succeeded, "{}", outer.output());
+        });
     }
 }

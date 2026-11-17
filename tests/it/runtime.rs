@@ -76,6 +76,19 @@ fn runtime_factory_enables_setup_and_starts_agent() {
         runtime.setup_config().traffic_config,
         runtime.agent_config().traffic_config
     );
+    // The scope of the task-traffic-controller CLI under this HOME, for the
+    // agent, its forecasts, the supervisors and the setup builders alike.
+    assert_eq!(
+        runtime.agent_config().traffic_state_dir,
+        root.path().join(".local/state/task-traffic-controller")
+    );
+    assert_eq!(
+        runtime.agent_config().traffic_config,
+        Some(
+            root.path()
+                .join(".config/task-traffic-controller/config.toml")
+        )
+    );
     assert_eq!(runtime.setup_config().term_grace_ms, 4000);
     assert_eq!(runtime.setup_config().log_limit_bytes, 8192);
     assert_eq!(runtime.setup_config().lease_ms, 60_000);
@@ -99,6 +112,85 @@ fn runtime_factory_enables_setup_and_starts_agent() {
     assert_eq!(agent.config().log_limit_bytes, 8192);
     assert_eq!(agent.config().forecast_ttl_ms, 2000);
     agent.shutdown();
+}
+
+#[test]
+fn the_worker_scope_follows_the_state_home_and_reaches_every_command() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let mut input = inputs(root.path());
+    let state_home = root.path().join("xdg-state");
+    input
+        .env
+        .insert("XDG_STATE_HOME".into(), state_home.display().to_string());
+    let runtime = config().worker_runtime(input.clone()).unwrap();
+    let scope = state_home.join("task-traffic-controller");
+    assert_eq!(runtime.agent_config().traffic_state_dir, scope);
+    assert_eq!(runtime.setup_config().traffic_state_dir, scope);
+    assert_eq!(
+        runtime.setup_config().traffic_config,
+        runtime.agent_config().traffic_config
+    );
+    // What a nested task-traffic-controller needs to find the same ledger.
+    let profile = runtime.agent_config().capability_profile.clone().unwrap();
+    let step = profile.execution_environment(&BTreeMap::new()).unwrap();
+    assert_eq!(step["XDG_STATE_HOME"], input.env["XDG_STATE_HOME"]);
+    assert_eq!(step["HOME"], input.env["HOME"]);
+    assert_eq!(step["TASK_TRAFFIC_CONTROLLER_NESTED"], "inherit");
+    // A setup step gets the same, on top of the toolchain environment (which
+    // the keys of prepared work are made from, and which does not hold it).
+    let setup = runtime.setup_config();
+    assert_eq!(setup.scope_env.as_ref(), Some(profile.scope_environment()));
+    assert_eq!(
+        setup.scope_env.as_ref().unwrap()["XDG_STATE_HOME"],
+        input.env["XDG_STATE_HOME"]
+    );
+    assert!(!setup.env.contains_key("XDG_STATE_HOME"));
+    // The worker's own helpers (git, the workspace tools, the tool probes)
+    // run with what a step gets.
+    assert_eq!(profile.host_environment(), step);
+
+    // Without anything to resolve the scope from, there is no worker.
+    input.env.remove("XDG_STATE_HOME");
+    input.env.remove("HOME");
+    let error = config().worker_runtime(input).err().unwrap().to_string();
+    assert!(error.contains("task-traffic-controller scope"), "{error}");
+}
+
+#[test]
+fn a_live_command_in_the_former_worker_scope_refuses_the_start() {
+    use task_traffic_controller::{ledger::Ledger, lock, Context, Paths};
+    let root = crate::test_tmp::tempdir().unwrap();
+    let input = inputs(root.path());
+    let legacy = input.state_dir.join("traffic");
+    let ctx = Context::new(Paths::new(&legacy, legacy.join("config.toml")));
+    let mut ledger = Ledger::default();
+    ledger.entries.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "old-run", "pid": std::process::id(), "state": "running", "front": false,
+            "weight": 1, "predicted_rss": 0, "repo": "", "argv": "x", "key": "k",
+            "seq": 1, "enqueued_at": "2030-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    );
+    ledger.save(&ctx.paths.ledger_file()).unwrap();
+    let lease = lock::take_lease(&ctx, "old-run").unwrap();
+    let error = config()
+        .worker_runtime(input.clone())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("live commands (old-run)"), "{error}");
+    assert!(error.contains(&legacy.display().to_string()), "{error}");
+    // Nothing was started in the shared scope behind the refusal.
+    assert!(!root.path().join(".local").exists());
+    // Once the old command is over the worker moves; the old scope stays.
+    drop(lease);
+    let runtime = config().worker_runtime(input).unwrap();
+    assert_eq!(
+        runtime.agent_config().traffic_state_dir,
+        root.path().join(".local/state/task-traffic-controller")
+    );
+    assert!(legacy.join("ledger.json").exists());
 }
 
 #[test]

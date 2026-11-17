@@ -681,6 +681,13 @@ impl Resident {
             &inputs.worker.env,
             &inputs.worker.worker_id,
         )?);
+        // The local worker's commands that still run in another scope: wait
+        // for them instead of failing into a restart loop.
+        anyhow::ensure!(
+            super::traffic_hold::wait_until_clear(&inputs.worker.state_dir, &inputs.worker.env)
+                .await?,
+            "stopped while waiting for another task-traffic-controller scope to drain"
+        );
         let config_owned = config.clone();
         let mut startup = tokio::task::spawn_blocking(move || {
             StartupParts::prepare(config_owned, inputs, binding)

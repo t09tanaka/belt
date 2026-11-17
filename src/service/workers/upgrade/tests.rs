@@ -1195,6 +1195,8 @@ fn status(version: &str, from: Option<&str>) -> Status {
         switching_from: from.map(str::to_owned),
         drained_by_upgrade: false,
         switch_running: false,
+        traffic_scope: None,
+        traffic_hold: None,
     }
 }
 

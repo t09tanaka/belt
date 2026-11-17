@@ -359,6 +359,11 @@ fn panicking_fixture_process() {
     panic!("fixture test failed with a live owner");
 }
 
+/// The task-traffic-controller scope of a worker started from `env`.
+fn worker_traffic(env: &BTreeMap<String, String>) -> remote_task_runner::config::traffic::Scope {
+    remote_task_runner::config::traffic::resolve(env).unwrap()
+}
+
 #[tokio::test]
 async fn panicking_fixture_test_leaves_no_owner_process() {
     let dir = crate::test_tmp::tempdir().unwrap();
@@ -3332,6 +3337,7 @@ async fn estimate_offline_100_calls_without_git_leave_db_epoch_and_source_roots_
     assert!(!spec.state_dir.join("startup.lock").exists());
     assert!(!spec.state_dir.join("sources").exists());
     assert!(!spec.worker_state_dir.join("traffic").exists());
+    assert!(!worker_traffic(&spec.env).state_dir.exists());
     assert!(!spec.worker_state_dir.join("clones").exists());
 }
 
@@ -3360,6 +3366,7 @@ async fn estimate_known_task_without_database_does_not_initialize_state() {
     assert!(!spec.state_dir.join("startup.lock").exists());
     assert!(!spec.state_dir.join("sources").exists());
     assert!(!spec.worker_state_dir.join("traffic").exists());
+    assert!(!worker_traffic(&spec.env).state_dir.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3507,7 +3514,7 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     // Remove intentionally invalid config before exercising the original raw-command path.
     std::fs::remove_file(repo.join(".remote-task-runner.toml")).unwrap();
     let history = task_traffic_controller::history::read_all(
-        &spec.worker_state_dir.join("traffic/history.jsonl"),
+        &worker_traffic(&spec.env).state_dir.join("history.jsonl"),
     )
     .unwrap();
     assert_eq!(history.len(), 2);
@@ -3762,11 +3769,12 @@ async fn frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and
     // first stays ready until the second gave up; a busy host holds a start
     // as well. This test is about toolchains, so its admission is fixed here
     // instead of taken from the host.
-    let traffic = spec.worker_state_dir.join("traffic");
-    std::fs::create_dir(&traffic).unwrap();
-    std::fs::set_permissions(&traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let traffic_config = worker_traffic(&spec.env).config_file;
+    let traffic = traffic_config.parent().unwrap();
+    std::fs::create_dir_all(traffic).unwrap();
+    std::fs::set_permissions(traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(
-        traffic.join("config.toml"),
+        &traffic_config,
         "budget = 8\ncpu_threshold_percent = 100.0\nmemory_reserve_mib = 0\n",
     )
     .unwrap();

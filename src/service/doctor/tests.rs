@@ -128,18 +128,66 @@ fn the_command_scope_follows_xdg_and_falls_back_to_home() {
         PathBuf::from("/.local/state/task-traffic-controller")
     );
     assert_eq!(
-        worker_scope_paths(Path::new("/w")),
+        worker_scope_paths(&env(&[("HOME", "/h"), ("XDG_STATE_HOME", "/s")])),
         (
-            PathBuf::from("/w/traffic"),
-            PathBuf::from("/w/traffic/config.toml")
+            PathBuf::from("/s/task-traffic-controller"),
+            PathBuf::from("/h/.config/task-traffic-controller/config.toml")
         )
     );
 }
 
 #[test]
+fn the_worker_scope_is_the_one_the_agent_gives_its_supervisors() {
+    // The environment the journal records at install decides the scope: what
+    // doctor looks at as the worker's is what the agent hands its supervisors
+    // and setup steps, whatever the variables are.
+    let host = Host::new();
+    let state_home = host.home.join("xdg-state");
+    let config_home = host.home.join("xdg-config");
+    let variants: [Vec<(&str, String)>; 4] = [
+        vec![],
+        vec![("XDG_STATE_HOME", state_home.display().to_string())],
+        vec![("XDG_CONFIG_HOME", config_home.display().to_string())],
+        vec![
+            ("XDG_STATE_HOME", state_home.display().to_string()),
+            ("XDG_CONFIG_HOME", config_home.display().to_string()),
+        ],
+    ];
+    for extra in variants {
+        let mut recorded = host.env.clone();
+        recorded.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
+        let config = crate::config::resolve(&crate::config::Inputs {
+            overlay: &crate::config::Overlay::default(),
+            project: None,
+            legacy: None,
+            user: None,
+        })
+        .unwrap();
+        let runtime = config
+            .worker_runtime(crate::config::runtime::WorkerInputs {
+                state_dir: host.state.clone(),
+                worker_id: WorkerId::parse("mini-a").unwrap(),
+                boot_id: crate::ids::WorkerBootId::parse("boot").unwrap(),
+                supervisor_exe: PathBuf::from("/bin/rtr"),
+                cluster_key_path: host.home.join("cluster.key"),
+                env: recorded.clone(),
+            })
+            .unwrap();
+        let (state, config_file) = worker_scope_paths(&recorded);
+        let agent = runtime.agent_config();
+        assert_eq!(state, agent.traffic_state_dir, "{recorded:?}");
+        assert_eq!(Some(&config_file), agent.traffic_config.as_ref());
+        let setup = runtime.setup_config();
+        assert_eq!(state, setup.traffic_state_dir);
+        assert_eq!(setup.traffic_config, agent.traffic_config);
+    }
+}
+
+#[test]
 fn the_policy_digest_is_the_one_task_traffic_controller_reports() {
     let h = Host::new();
-    let (state, config) = worker_scope_paths(&h.state);
+    let state = h.state.join("traffic");
+    let config = state.join("config.toml");
     fs::create_dir(&state).unwrap();
     fs::write(&config, "budget = 3\n").unwrap();
     let ours = scope(&state, &config).policy_digest.unwrap();
@@ -181,14 +229,17 @@ fn gathering_asks_the_tools_the_service_environment_resolves() {
     let h = Host::new();
     let mut runner = FakeRunner::default();
     // Nothing installed: nothing is asked.
-    let facts = gather(&h.state, &h.env, &mut runner);
+    let facts = gather(&h.state, &h.env, &h.env, &mut runner);
     assert_eq!(facts.schema, 1);
     assert_eq!(facts.cli, None);
     assert_eq!(facts.docker, Docker::default());
     assert!(runner.asked.is_empty());
     assert_eq!(
         facts.worker_scope.state_dir,
-        h.state.join("traffic").to_str().unwrap()
+        h.home
+            .join(".local/state/task-traffic-controller")
+            .to_str()
+            .unwrap()
     );
     assert_eq!(
         facts.cli_scope.state_dir,
@@ -210,7 +261,7 @@ fn gathering_asks_the_tools_the_service_environment_resolves() {
     );
     runner.answer("docker", "info", 0, "ENGINE-1\n");
     runner.answer("docker", "context", 0, "unix:///var/run/docker.sock\n");
-    let facts = gather(&h.state, &h.env, &mut runner);
+    let facts = gather(&h.state, &h.env, &h.env, &mut runner);
     assert_eq!(
         facts.cli,
         Some(TrafficCli {
@@ -551,6 +602,8 @@ fn status(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
         switching_from: None,
         drained_by_upgrade: false,
         switch_running: false,
+        traffic_scope: None,
+        traffic_hold: None,
     }
 }
 
@@ -773,10 +826,7 @@ fn a_parent_alone_reports_its_own_worker_and_nothing_about_others() {
     assert!(report.checks.iter().all(|c| c.host == "parent"));
     // Nothing is installed in the temporary HOME: one scope in use, no CLI.
     assert_eq!(of(&report, "parent", "traffic_runtime").level, Level::Ok);
-    assert_eq!(
-        of(&report, "parent", "traffic_state_path").level,
-        Level::Notice
-    );
+    assert_eq!(of(&report, "parent", "traffic_state_path").level, Level::Ok);
     assert_eq!(of(&report, "parent", "service_profile").level, Level::Ok);
     // The coordinator retains no service environment in this fixture.
     assert_eq!(
@@ -818,13 +868,10 @@ fn an_unpatched_command_on_the_parent_makes_the_report_unhealthy() {
     let check = of(&report, "parent", "traffic_runtime");
     assert_eq!(check.level, Level::Fail);
     assert!(check.detail.contains("does not know managed entries"));
-    // And with it installed, the two scopes are two budgets.
-    assert_eq!(
-        of(&report, "parent", "traffic_state_path").level,
-        Level::Fail
-    );
-    assert_eq!(report.failed, 2);
-    // The updated command passes the runtime check; the scopes still differ.
+    // The worker shares the command's scope, so the scope check passes.
+    assert_eq!(of(&report, "parent", "traffic_state_path").level, Level::Ok);
+    assert_eq!(report.failed, 1);
+    // The updated command passes the runtime check.
     w.runner.answer(
         "task-traffic-controller",
         "status",
@@ -833,7 +880,7 @@ fn an_unpatched_command_on_the_parent_makes_the_report_unhealthy() {
     );
     let report = w.run();
     assert_eq!(of(&report, "parent", "traffic_runtime").level, Level::Ok);
-    assert_eq!(report.failed, 1);
+    assert_eq!(report.failed, 0);
 }
 
 #[test]
@@ -1070,13 +1117,13 @@ fn a_worker_host_is_viewed_through_its_recorded_service_environment() {
         binary_sha256: crate::service::worker_service::sha256_file(&exe).unwrap(),
     };
     install(&env, &request, &exe, fake.clone(), Duration::from_secs(2)).unwrap();
-    let (status, state, service_env) = service_view(&env, fake).unwrap();
+    let (status, state, service_env, recorded) = service_view(&env, fake).unwrap();
     assert_eq!(status.worker_id.as_str(), "mini-a");
     assert_eq!(status.loaded, Some(true));
     assert_eq!(state, h.state);
     // What the LaunchAgent was given: nothing else from the calling shell.
     assert_eq!(service_env, h.env);
-    let facts = gather(&state, &service_env, &mut FakeRunner::default());
+    let facts = gather(&state, &service_env, &recorded, &mut FakeRunner::default());
     assert_eq!(facts.profile.error, None);
     let line = answer_line(&status, &facts);
     let parsed = parse_answer(&out(0, &line)).unwrap();
@@ -1131,21 +1178,6 @@ fn a_command_that_does_not_finish_is_stopped_and_counts_as_unanswered() {
         runner.run(Path::new("/bin/sh"), &["-c", "exit 0"], &BTreeMap::new()),
         Some((0, String::new()))
     );
-}
-
-#[test]
-fn the_worker_scope_is_the_one_the_agent_gives_its_supervisors() {
-    let agent = crate::worker::agent::AgentConfig::new(
-        PathBuf::from("/w"),
-        WorkerId::parse("mini-a").unwrap(),
-        crate::ids::WorkerBootId::parse("boot").unwrap(),
-        PathBuf::from("/bin/rtr"),
-    );
-    let (state, config) = worker_scope_paths(&agent.state_dir);
-    assert_eq!(state, agent.traffic_state_dir);
-    // No separate configuration file is set: the default lies in the scope.
-    assert_eq!(agent.traffic_config, None);
-    assert_eq!(config, agent.traffic_state_dir.join("config.toml"));
 }
 
 #[test]

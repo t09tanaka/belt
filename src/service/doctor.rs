@@ -208,11 +208,15 @@ pub fn cli_scope_paths(env: &BTreeMap<String, String>) -> (PathBuf, PathBuf) {
     )
 }
 
-/// The scope the worker's supervisors use below its state directory.
-pub fn worker_scope_paths(worker_state: &Path) -> (PathBuf, PathBuf) {
-    let state = worker_state.join("traffic");
-    let config = state.join("config.toml");
-    (state, config)
+/// The scope the worker uses: the task-traffic-controller rule applied to
+/// the environment recorded at install, which is where the worker reads it
+/// from (not from its process environment). An environment that resolves to
+/// no scope is looked at by the command's own rule.
+pub fn worker_scope_paths(recorded: &BTreeMap<String, String>) -> (PathBuf, PathBuf) {
+    match crate::config::traffic::resolve(recorded) {
+        Ok(scope) => (scope.state_dir, scope.config_file),
+        Err(_) => cli_scope_paths(recorded),
+    }
 }
 
 /// The digest task-traffic-controller itself gives an effective configuration.
@@ -299,15 +303,18 @@ fn profile(worker_state: &Path, env: &BTreeMap<String, String>) -> ProfileFacts 
     }
 }
 
-/// Look at this host: `worker_state` is the worker's state directory and
-/// `env` the environment its service runs with.
+/// Look at this host: `worker_state` is the worker's state directory, `env`
+/// the environment its service runs with and `recorded` the environment
+/// recorded at install, which places the task-traffic-controller scope.
 pub fn gather(
     worker_state: &Path,
     env: &BTreeMap<String, String>,
+    recorded: &BTreeMap<String, String>,
     runner: &mut dyn Runner,
 ) -> HostFacts {
-    let (worker_dir, worker_config) = worker_scope_paths(worker_state);
-    let (cli_dir, cli_config) = cli_scope_paths(env);
+    let (worker_dir, worker_config) = worker_scope_paths(recorded);
+    // The command the worker's steps run sees the recorded environment.
+    let (cli_dir, cli_config) = cli_scope_paths(recorded);
     HostFacts {
         schema: 1,
         worker_scope: scope(&worker_dir, &worker_config),
@@ -608,9 +615,14 @@ pub fn host_main() -> i32 {
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
     let answer = super::worker_service::service_view(&env, super::macos::NativeLauncher::default())
-        .map(|(status, state, service_env)| HostAnswer {
+        .map(|(status, state, service_env, recorded)| HostAnswer {
             status,
-            facts: gather(&state, &service_env, &mut SystemRunner::default()),
+            facts: gather(
+                &state,
+                &service_env,
+                &recorded,
+                &mut SystemRunner::default(),
+            ),
         });
     match answer {
         Ok(answer) => {
@@ -763,6 +775,7 @@ pub fn run(
     });
     let local = gather(
         &spec.worker_state_dir,
+        if retained { &spec.env } else { env },
         if retained { &spec.env } else { env },
         runner,
     );
