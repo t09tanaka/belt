@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 mod delivery;
 mod input_retention;
 mod remote;
+mod result_retention;
 
 pub const MAX_REQUEST_BYTES: usize = 262_144;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -55,6 +56,13 @@ pub enum Operation {
     ResolveToolchains {
         bundle: crate::toolchain::contract::FrozenBundle,
         requirements: crate::toolchain::capability::ExecutionRequirements,
+    },
+    /// One look at a warm-up on one worker (`workers sync`); the first look
+    /// starts it. Asked again with the same `sync_id` until nothing is pending.
+    EnvSync {
+        worker: WorkerId,
+        sync_id: crate::ids::RequestId,
+        tools: Vec<crate::wire::ToolRequirement>,
     },
     Estimate {
         query: super::estimate::Query,
@@ -112,6 +120,9 @@ pub struct Attempt {
 pub enum Reply {
     ResolvedToolchains {
         bundle: crate::toolchain::contract::FrozenBundle,
+    },
+    EnvSync {
+        results: Vec<crate::wire::ToolSyncResult>,
     },
     Estimate {
         estimate: super::estimate::Estimate,
@@ -578,6 +589,7 @@ async fn connect_local(
     Arc<crate::coordinator::InputGate>,
     bool,
     bool,
+    bool,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
@@ -620,6 +632,11 @@ async fn connect_local(
         .features
         .iter()
         .any(|feature| feature == crate::setup::observation_transport::FEATURE);
+    let env_sync = connected
+        .negotiated
+        .features
+        .iter()
+        .any(|feature| feature == crate::wire::ENV_SYNC_FEATURE);
     let worker_client = connected.client.clone();
     let provenance = Digest::of_bytes(&serde_json::to_vec(
         &serde_json::json!({"transport":"local-private-rpc-v1","protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"timeout_ms":parts.worker_timeout.as_millis()}),
@@ -651,6 +668,7 @@ async fn connect_local(
         input_gate,
         observations,
         probe,
+        env_sync,
     ))
 }
 
@@ -680,6 +698,13 @@ impl Resident {
             &inputs.worker.env,
             &inputs.worker.worker_id,
         )?);
+        // The local worker's commands that still run in another scope: wait
+        // for them instead of failing into a restart loop.
+        anyhow::ensure!(
+            super::traffic_hold::wait_until_clear(&inputs.worker.state_dir, &inputs.worker.env)
+                .await?,
+            "stopped while waiting for another task-traffic-controller scope to drain"
+        );
         let config_owned = config.clone();
         let mut startup = tokio::task::spawn_blocking(move || {
             StartupParts::prepare(config_owned, inputs, binding)
@@ -687,7 +712,7 @@ impl Resident {
         })
         .await??;
         let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection, worker_client, input_gate, observations, probe) =
+        let (listener, worker_connection, worker_client, input_gate, observations, probe, env_sync) =
             match connected {
                 Ok(value) => value,
                 Err(e) => {
@@ -708,7 +733,8 @@ impl Resident {
                         input_gate.clone(),
                     )
                     .with_preparation_observations(observations)
-                    .with_preparation_probe(probe),
+                    .with_preparation_probe(probe)
+                    .with_env_sync(env_sync),
                 ),
             )
             .await;
@@ -798,43 +824,17 @@ impl Resident {
                 if let Err(e) = coordinator.collect_stopping(&files, collection, Some(collect_stop.clone())).await { let _ = stop_collect.send(true); return Err(e.into()); }
             }
         });
-        let gc_coordinator = self.coordinator.clone();
-        let gc_files = self.files.clone();
-        let retention_days = self.retention_days;
-        let mut gc_stop = rx.clone();
-        let gc_failure = stop.clone();
-        loops.spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_secs(60));
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut cursor = crate::results::retention::Cursor::default();
-            loop {
-                tokio::select! { _ = gc_stop.changed()=>return Ok(()), _=timer.tick()=>{} }
-                if *gc_stop.borrow() {
-                    return Ok(());
-                }
-                let owner = gc_coordinator.clone();
-                let files = gc_files.clone();
-                // Keep owner + exclusive pin alive inside the blocking job and
-                // await its drain before token/process-owner cleanup on shutdown.
-                let (next, result) =
-                    crate::results::retention::owned_blocking(owner, move |owner| {
-                        let result = crate::results::retention::page(
-                            owner.store(),
-                            &files,
-                            &mut cursor,
-                            retention_days,
-                        );
-                        (cursor, result)
-                    })
-                    .await?;
-                cursor = next;
-                if let Err(error) = result {
-                    let _ = gc_failure.send(true);
-                    return Err(error.into());
-                }
-                tokio::task::yield_now().await;
-            }
-        });
+        #[cfg(not(test))]
+        let gc_cadence = Duration::from_secs(60);
+        #[cfg(test)]
+        let gc_cadence = self.captured.retention_test.cadence();
+        loops.spawn(result_retention::run(
+            self.coordinator.clone(),
+            self.files.clone(),
+            self.retention_days,
+            gc_cadence,
+            rx.clone(),
+        ));
         loops.spawn(input_retention::run(
             self.coordinator.clone(),
             self.captured.clone(),
@@ -1161,6 +1161,24 @@ async fn handle(
         let reply = match coordinator.estimate(query).await {
             Ok(estimate) => Reply::Estimate { estimate },
             Err(error) => Reply::ControlError { error },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
+    if let Operation::EnvSync {
+        worker,
+        sync_id,
+        tools,
+    } = request.operation
+    {
+        // Like the resolution below: one bounded call to the worker, no
+        // admission lock and no writable SQLite scope.
+        let mut stopping = stop.subscribe();
+        let reply = tokio::select! {
+            _ = stopping.changed() => Reply::Stopping,
+            result = coordinator.env_sync(&worker, sync_id, tools) => match result {
+                Ok(results) => Reply::EnvSync { results },
+                Err(error) => Reply::ControlError { error },
+            }
         };
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
@@ -1509,6 +1527,7 @@ async fn handle(
             Operation::Query { .. }
             | Operation::Estimate { .. }
             | Operation::EstimateTask { .. }
+            | Operation::EnvSync { .. }
             | Operation::ResolveToolchains { .. } => {
                 unreachable!("read handled before admission")
             }
@@ -1597,10 +1616,15 @@ pub(crate) fn validate_components(path: &Path) -> io::Result<()> {
         }
         match std::fs::symlink_metadata(&current) {
             Ok(m) if m.file_type().is_symlink() => {
+                // Name the refused component and the way out: nothing here is
+                // resolved for the caller, so the real path has to be given.
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "symlinked resident path",
-                ))
+                    format!(
+                        "symlinked resident path: {} is a symbolic link; give the real path instead (for the state directory, set HOME or XDG_STATE_HOME to the real path)",
+                        current.display()
+                    ),
+                ));
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}

@@ -1037,6 +1037,9 @@ fn a_status_at_rest_keeps_the_shape_the_first_release_reads() {
             "live_attempts",
             "loaded",
             "ready",
+            // Added with the shared task-traffic-controller scope; an older
+            // reader ignores it (`Status` does not deny unknown fields).
+            "traffic_scope",
             "worker_id"
         ]
     );

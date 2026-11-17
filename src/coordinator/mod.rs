@@ -23,6 +23,7 @@
 //! completion belongs to the scheduler.
 
 mod collect;
+mod env_sync;
 mod estimate;
 mod input_gate;
 mod link;
@@ -1541,8 +1542,12 @@ impl Coordinator {
                         .is_empty()
                 });
             excluded.extend(mismatched.into_iter().map(|w| Excluded {
-                unmet: crate::toolchain::capability::missing(
-                    &spec.requirements,
+                unmet: crate::toolchain::envdiff::with_steps(
+                    crate::toolchain::capability::missing(
+                        &spec.requirements,
+                        w.capabilities.as_ref(),
+                    ),
+                    &spec.requirements.requires,
                     w.capabilities.as_ref(),
                 ),
                 worker_id: w.worker_id.clone(),

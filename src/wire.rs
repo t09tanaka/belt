@@ -1632,6 +1632,9 @@ pub struct EnvReportResponse {
 pub struct EnvSyncRequest {
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
+    /// One warm-up, asked about again with the same id until every tool has
+    /// an outcome other than `pending`. Each poll has its own `request_id`.
+    pub sync_id: RequestId,
     pub coordinator_epoch: CoordinatorEpoch,
     pub tools: Vec<ToolRequirement>,
     pub dry_run: bool,
@@ -1645,6 +1648,9 @@ pub enum SyncOutcome {
     Failed,
     /// Dry run: would be installed.
     WouldInstall,
+    /// The install is running (or waits for its turn); ask again with the
+    /// same `sync_id`.
+    Pending,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1728,6 +1734,12 @@ pub struct ResolveToolchainsResponse {
 
 /// Negotiated, process-free preparation identity queries.
 pub const PREPARATION_PROBE_FEATURE: &str = "preparation_probe_v1";
+/// `env_sync` is answered (a warm-up install through the worker's own
+/// registry). Offered, never required: a peer without it is only refused
+/// `workers sync`.
+pub const ENV_SYNC_FEATURE: &str = "env_sync_v1";
+/// The most tools one `env_sync` names; more is refused whole.
+pub const MAX_ENV_SYNC_TOOLS: usize = 32;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -2194,6 +2206,7 @@ mod tests {
             Request::EnvSync(EnvSyncRequest {
                 schema_version: SV,
                 request_id: rid(),
+                sync_id: rid(),
                 coordinator_epoch: CoordinatorEpoch(3),
                 tools: vec![ToolRequirement {
                     name: "node".into(),
@@ -2916,6 +2929,7 @@ mod tests {
             Request::EnvSync(EnvSyncRequest {
                 schema_version: SV,
                 request_id: rid(),
+                sync_id: rid(),
                 coordinator_epoch: CoordinatorEpoch(1),
                 tools: vec![],
                 dry_run,

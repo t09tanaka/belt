@@ -76,6 +76,19 @@ fn runtime_factory_enables_setup_and_starts_agent() {
         runtime.setup_config().traffic_config,
         runtime.agent_config().traffic_config
     );
+    // The scope of the task-traffic-controller CLI under this HOME, for the
+    // agent, its forecasts, the supervisors and the setup builders alike.
+    assert_eq!(
+        runtime.agent_config().traffic_state_dir,
+        root.path().join(".local/state/task-traffic-controller")
+    );
+    assert_eq!(
+        runtime.agent_config().traffic_config,
+        Some(
+            root.path()
+                .join(".config/task-traffic-controller/config.toml")
+        )
+    );
     assert_eq!(runtime.setup_config().term_grace_ms, 4000);
     assert_eq!(runtime.setup_config().log_limit_bytes, 8192);
     assert_eq!(runtime.setup_config().lease_ms, 60_000);
@@ -99,6 +112,85 @@ fn runtime_factory_enables_setup_and_starts_agent() {
     assert_eq!(agent.config().log_limit_bytes, 8192);
     assert_eq!(agent.config().forecast_ttl_ms, 2000);
     agent.shutdown();
+}
+
+#[test]
+fn the_worker_scope_follows_the_state_home_and_reaches_every_command() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let mut input = inputs(root.path());
+    let state_home = root.path().join("xdg-state");
+    input
+        .env
+        .insert("XDG_STATE_HOME".into(), state_home.display().to_string());
+    let runtime = config().worker_runtime(input.clone()).unwrap();
+    let scope = state_home.join("task-traffic-controller");
+    assert_eq!(runtime.agent_config().traffic_state_dir, scope);
+    assert_eq!(runtime.setup_config().traffic_state_dir, scope);
+    assert_eq!(
+        runtime.setup_config().traffic_config,
+        runtime.agent_config().traffic_config
+    );
+    // What a nested task-traffic-controller needs to find the same ledger.
+    let profile = runtime.agent_config().capability_profile.clone().unwrap();
+    let step = profile.execution_environment(&BTreeMap::new()).unwrap();
+    assert_eq!(step["XDG_STATE_HOME"], input.env["XDG_STATE_HOME"]);
+    assert_eq!(step["HOME"], input.env["HOME"]);
+    assert_eq!(step["TASK_TRAFFIC_CONTROLLER_NESTED"], "inherit");
+    // A setup step gets the same, on top of the toolchain environment (which
+    // the keys of prepared work are made from, and which does not hold it).
+    let setup = runtime.setup_config();
+    assert_eq!(setup.scope_env.as_ref(), Some(profile.scope_environment()));
+    assert_eq!(
+        setup.scope_env.as_ref().unwrap()["XDG_STATE_HOME"],
+        input.env["XDG_STATE_HOME"]
+    );
+    assert!(!setup.env.contains_key("XDG_STATE_HOME"));
+    // The worker's own helpers (git, the workspace tools, the tool probes)
+    // run with what a step gets.
+    assert_eq!(profile.host_environment(), step);
+
+    // Without anything to resolve the scope from, there is no worker.
+    input.env.remove("XDG_STATE_HOME");
+    input.env.remove("HOME");
+    let error = config().worker_runtime(input).err().unwrap().to_string();
+    assert!(error.contains("task-traffic-controller scope"), "{error}");
+}
+
+#[test]
+fn a_live_command_in_the_former_worker_scope_refuses_the_start() {
+    use task_traffic_controller::{ledger::Ledger, lock, Context, Paths};
+    let root = crate::test_tmp::tempdir().unwrap();
+    let input = inputs(root.path());
+    let legacy = input.state_dir.join("traffic");
+    let ctx = Context::new(Paths::new(&legacy, legacy.join("config.toml")));
+    let mut ledger = Ledger::default();
+    ledger.entries.push(
+        serde_json::from_value(serde_json::json!({
+            "id": "old-run", "pid": std::process::id(), "state": "running", "front": false,
+            "weight": 1, "predicted_rss": 0, "repo": "", "argv": "x", "key": "k",
+            "seq": 1, "enqueued_at": "2030-01-01T00:00:00Z",
+        }))
+        .unwrap(),
+    );
+    ledger.save(&ctx.paths.ledger_file()).unwrap();
+    let lease = lock::take_lease(&ctx, "old-run").unwrap();
+    let error = config()
+        .worker_runtime(input.clone())
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.contains("live commands (old-run)"), "{error}");
+    assert!(error.contains(&legacy.display().to_string()), "{error}");
+    // Nothing was started in the shared scope behind the refusal.
+    assert!(!root.path().join(".local").exists());
+    // Once the old command is over the worker moves; the old scope stays.
+    drop(lease);
+    let runtime = config().worker_runtime(input).unwrap();
+    assert_eq!(
+        runtime.agent_config().traffic_state_dir,
+        root.path().join(".local/state/task-traffic-controller")
+    );
+    assert!(legacy.join("ledger.json").exists());
 }
 
 #[test]
@@ -216,4 +308,90 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
         .await
         .is_err());
     assert_eq!(c.scheduler().priority_of(&local), -9);
+}
+
+/// A worker attached the way a remote one is (`attach_worker`): `workers
+/// sync` is sent to a peer whose hello agreed on `env_sync_v1`, and never to
+/// one that did not offer it.
+#[tokio::test]
+async fn runtime_attach_carries_whether_the_worker_answers_env_sync() {
+    use remote_task_runner::error::ErrorCode;
+    use remote_task_runner::ids::RequestId;
+    use remote_task_runner::wire::{ToolRequirement, ENV_SYNC_FEATURE};
+    let root = crate::test_tmp::tempdir().unwrap();
+    let mut cfg = config();
+    for id in ["new", "old"] {
+        cfg.workers.push(WorkerSpec {
+            id: id.into(),
+            ssh: "host".into(),
+            binary: None,
+            service_mode: None,
+            labels: vec![],
+            ephemeral: true,
+            priority: cfg.local_worker_priority.clone(),
+        });
+    }
+    let settings = cfg.runtime_settings().unwrap();
+    let c = settings
+        .start_coordinator(
+            CoordinatorStore::open(root.path(), 1).unwrap(),
+            Arc::new(UnknownCosts),
+        )
+        .unwrap();
+    cfg.attach_worker(&c, WorkerTarget::Remote("new"), connected(&c, "new").await)
+        .await
+        .unwrap();
+    // An older worker: the same hello without the feature.
+    let (near, far) = duplex_pair(65536);
+    let cluster = c.store().cluster_id().clone();
+    let client = ClientConfig::new(
+        cluster.clone(),
+        c.store().coordinator_id().clone(),
+        c.epoch(),
+    );
+    let mut server = ServerConfig::new(cluster, super::proto_common::identity("old"));
+    server.local.features.retain(|f| f != ENV_SYNC_FEATURE);
+    let (connection, accepted) = tokio::join!(connect(near, client), accept(far, server));
+    let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = seen.clone();
+    tokio::spawn(async move {
+        let mut incoming = accepted.unwrap().incoming;
+        while let Some(_request) = incoming.next().await {
+            count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    });
+    cfg.attach_worker(&c, WorkerTarget::Remote("old"), connection.unwrap())
+        .await
+        .unwrap();
+    let tools = || {
+        vec![ToolRequirement {
+            name: "node".into(),
+            version: "20.0.0".into(),
+        }]
+    };
+    let old = WorkerId::parse("old").unwrap();
+    let refused = c
+        .env_sync(&old, RequestId::generate(), tools())
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::ProtocolIncompatible);
+    assert!(
+        refused.message.contains("workers upgrade old"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(seen.load(std::sync::atomic::Ordering::SeqCst), 0);
+    // The new one is sent the request (this fixture's worker answers
+    // nothing, so there is no outcome: not the refusal above).
+    let new = WorkerId::parse("new").unwrap();
+    let sent = c
+        .env_sync(&new, RequestId::generate(), tools())
+        .await
+        .unwrap_err();
+    assert_ne!(
+        sent.code,
+        ErrorCode::ProtocolIncompatible,
+        "{}",
+        sent.message
+    );
 }

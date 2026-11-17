@@ -79,8 +79,8 @@ F2 は登録と hook を分離する案も調査したが、`core.hooksPath` の
 | S15a | 設定から Coordinator・Scheduler・Agent・Setup への checked 変換、検証済み worker identity と priority、`TaskSpec.setup` の転送、`Machine::with_setup` 必須の共通 factory | 非既定値・単位変換の境界・lease/budget/TTL・identity の不一致・旧 task JSON・setup payload 転送・factory の関連テスト | PR #40 を merge `8939ef25c877448f3ae428caf6f666bebd6afad3` で統合済み。対象 `87f8df2` は Rust 1.100 のローカル実行 9 ジョブ成功（native installers は未検証）、リモート 9 ジョブ成功（Linux・macOS・MSRV 1.89） |
 | S15b | 親の常駐 loop、local worker、hello 検証済み remote link、再接続、独立した回収 loop、単一の ResultStore、ローカル IPC | 呼出元 CLI 終了後も durable task が実行・回収され、再起動で同じ attempt を引き継ぐ。遅い回収が lease 更新を止めない | S15a |
 | S15c | `init`・source/secret capture と durable `submit`・`ls`・`show`、run/task の問い合わせ API | 同時 CLI でも coordinator epoch が増殖しない。capture 失敗時は配置せず、完了済み run も正しく列挙する。JSON と stderr の契約を検証 | S15b、起動方式は S22 と整合。本体は PR #42（merge `2b3078c`）と PR #45 で main に統合済み。残件 5 項目は実装済みで、根拠は下の「S15c 残件の確認」に記す。全体 local-ci とリモート CI は親の gate |
-| S15d | `exec`・`wait`・`cancel`・Ctrl-C・明示 `retry`・local-only `--in-place` | exit code を透過し、停止不明を cancelled にしない。unknown の retry を拒否し、元 snapshot と履歴を保つ。in-place を remote に配置しない | S15c |
-| S15e | `logs --follow`・再接続・`outputs`・retention の常駐 loop への接続 | 非 UTF-8・offset・切断再開、出力 path 衝突と部分失敗、回収失敗、実行中・回収中・保持対象を消さない GC を検証。自動削除に件数上限と時計跳躍の保護を付ける | S15d・S14 |
+| S15d | `exec`・`wait`・`cancel`・Ctrl-C・明示 `retry`・local-only `--in-place` | exit code を透過し、停止不明を cancelled にしない。unknown の retry を拒否し、元 snapshot と履歴を保つ。in-place を remote に配置しない | S15c。実装とテストは main にあり、根拠は下の「S15d・S15e の確認」に記す。統合 HEAD の全体 local-ci・リモート CI・remote worker での検証は親の gate で、未了 |
+| S15e | `logs --follow`・再接続・`outputs`・retention の常駐 loop への接続 | 非 UTF-8・offset・切断再開、出力 path 衝突と部分失敗、回収失敗、実行中・回収中・保持対象を消さない GC を検証。自動削除に件数上限と時計跳躍の保護を付ける | S15d・S14。接続は main にあり、Vault の公開途中の停止からの回復と不足していた検証を足した。根拠と未了は下の「S15d・S15e の確認」に記す |
 | S15f | 読み取り専用 `estimate`、配置理由、転送・setup・回収の実測値の接続 | estimate が queue・attempt・ledger 需要を増やさない。measured/fallback/unknown・TTL・priority の説明を保つ。S15 の受入条件を利用者経路で閉じる | S15b〜S15e、S11・S13 |
 
 S15f の最初の slice は読み取り専用 `estimate` とする。既に起動している認証済み owner にだけ照会し、停止時は unknown を返す。command forecast は `forecast_command_v1` の交渉が必要で、既存 canonical clone と実際の profile fingerprint から TTC の正規化 command history を参照する。clone・workspace・source・attempt は作成せず、履歴がない場合の fallback は順位付け専用で ETA として表示しない。source の repository identity が判明しない場合や clone が存在しない場合は、別の cwd の履歴で代用しない。
@@ -799,6 +799,70 @@ D 最終 focused 検証: resident 23件成功 (88.35s)、retention filter 69件�
 1.287625ms のサンプルで、任意履歴の最悪時間や定数CPUを保証しない。既存 estimate readonly fixture は Source SH
 で背景 GC を隔離した上で whole-source-file/DB snapshot を維持確認する。原本や実 user state は一切対象にしていない。
 
+### S15d・S15e の確認（2026-11-17、main `7cbe913` 起点）
+
+行の完了条件を句ごとに「実装済みかつテスト済み／実装済みだがテストが無かった／未実装」に分けた。未実装は 1 件（Vault の公開途中の停止からの回復）で、この変更で実装した。テストが無かった 4 件にはテストを足した。それ以外の src は変更していない。
+
+S15d（すべて実装済みかつテスト済み。この変更では触っていない）
+
+- `exec`・`wait` の exit code の透過: `tests/it/bootstrap.rs:1396` `configured_control_exec_exit_and_offline_wait_ignore_current_project_and_git`、計算は成功で回収が欠けた場合の 78 は `:1765` `control_exec_succeeded_compute_but_missing_collection_exits_78`、判定の純粋部分は `src/service/completion.rs:277` `observes_pending_unknown_cancel_and_closed_collection_separately`。
+- `cancel`・Ctrl-C で停止不明を cancelled にしない: `tests/it/bootstrap.rs:1609` `control_exec_sigint`（通常と in-place の 2 件）、`:1567` `control_wait_interrupt_detaches_without_cancelling_work`、`src/storage/tests.rs:3458` `run_cancel_is_atomic_idempotent_and_preserves_unknown_and_natural_completion`。
+- unknown の retry を拒否し、元 snapshot と履歴を保つ: `src/storage/tests.rs:3786` `retry_same_run_rejects_unsafe_attempts_and_unavailable_inputs_atomically`、実 CLI は `tests/it/bootstrap.rs:1803` `retry_same_run_cli_uses_original_inputs_and_restart_receipt`。
+- `--in-place` を remote に配置しない: `tests/it/coordinator.rs:2631` `in_place_scheduler_uses_only_explicit_parent_local_and_never_automatic_retry`、`tests/it/worker_agent.rs:3899` `in_place_is_refused_by_default_worker_admission_before_acceptance`、実 CLI は `tests/it/bootstrap.rs:2616` `in_place_exec_updates_original_directory_and_retries_mutable_input_after_restart`。
+- 未了（親の gate）: 統合 HEAD の全体 local-ci とリモート CI、remote worker を使った検証。S15d1 に記した owner 再起動後の `wait`（`tests/it/bootstrap.rs:1698`）の並行実行時の timeout は未帰属のままである。
+
+S15e（実装済みかつテスト済み）
+
+- `logs` の非 UTF-8・offset・切断再開: `src/service/logs.rs:687` `snapshot_raw_bytes_prefix_boundary_ndjson_and_readonly`、`:749` `follow_sweeps_resume_without_duplicates_and_close_incomplete`、回収側は `tests/it/collection.rs:1919` `active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset`。
+- `outputs` の path 衝突・部分失敗・回収失敗: `src/service/output_export.rs:427` `tar_long_paths_dotfiles_and_partial_conflicts`、`:609` `concurrent_publish_has_exactly_one_winner`、`src/service/outputs.rs:593` `closed_failed_collection_with_unreceipted_output_exits_collection_failed`。
+- output planner（条件・glob・複数 path）: 純粋部分は `src/outputs.rs:101` `conditions` と `:124` `paths_and_globs`、実 CLI は PR #57 の `tests/it/bootstrap.rs:4505` `public_exec_output_conditions_globs_and_multiple_paths_follow_the_outcome`。重複するテストは足していない。
+- 結果 GC と reader の寿命: 常駐 loop は `src/service/resident.rs:772` から `src/results/retention.rs:33` の `page` を呼ぶ。reader との排他は `src/results/pin.rs:118` `shared_readers_exclude_gc_and_inode_survives_release`、`src/service/outputs.rs:876` `invocation_pin_excludes_gc_during_raw_tar_export_and_final_write_flush`、`src/service/resident/tests.rs:1421` `offline_submit_publishes_reader_pin_before_immediate_logs_follow`、実 resident での競合は `:92` `gc_pin_contention_keeps_resident_ipc_and_lease_renewal_alive`。claim 済みの読み出し拒否は `src/service/logs.rs:1113` と `src/service/outputs.rs:1011`。
+- 実行中・回収中・保持対象を消さない: 結果は `src/storage/tests.rs:5158` `result_retention_keeps_unknown_unacked_open_and_pinned_references` と `tests/it/collection.rs:1344` `collected_results_are_kept_for_the_retention_and_then_deleted`。Source は `src/source/retention.rs:2807` `deletion_rejects_foreign_owner_moved_database_and_shared_reader`、Vault は `:4004` `vault_fresh_exact_owner_digest_queue_and_collection_proofs_are_required`。
+- 件数上限: 結果は 1 ページ 32 件（`src/storage/tests.rs:4978` `result_retention_claims_bounded_pages_and_replays_only_known_claims`）、Source は `src/source/retention.rs:2628` `deletion_pages_33_and_65_preserve_original_and_metadata`、Vault は `:3741` `vault_page_is_bounded_and_requires_terminal_exact_proof`、常駐の driver は `src/service/resident/input_retention.rs:361` `default_source_seven_days_and_vault_zero_have_independent_clocks_and_exact_scope`（65 files を 1 ページ最大 32）。
+- 時計の跳躍: 純粋部分は `src/results/clock_policy.rs:209` `forward_jump_requarantines_then_follows_the_new_wall` ほか 6 件、Source は `src/source/retention.rs:2719` `deletion_clock_holds_also_stop_physical_claim_replay`、Vault は `:3685` `vault_claim_replay_clock_holds_and_changed_target_stays`。
+- Source と Vault の削除の常駐への接続: `src/service/resident.rs:801` が `src/service/resident/input_retention.rs:47` の `Driver::page` を 60 秒ごとに 1 ページ呼ぶ。実 loop 経由は `:408` `automatic_loop_registers_and_erases_only_closed_vault_copies`（Vault）と `src/service/resident/tests.rs:97` `input_gc_blocking_page_keeps_ipc_renewals_and_owner_until_stop_drain`。Source の 7 日経過は実 loop では待てないため、loop が呼ぶ `Driver::page` に時計の sample を渡す `:361` で確かめている。
+- 削除前の所有確認と途中の停止からの再開: Source は `src/source/retention.rs:2681` `deletion_claim_crash_boundaries_replay_only_durable_exact_claims` と `:3046` `deletion_ancestor_swap_claim_identity_and_missing_notfound_rules`、Vault は `src/secrets/vault/guard.rs:550` `vault_exact_leaf_rejects_symlink_hardlink_and_missing_claim_recreation`、秘密付き run の Source を Vault より先に消さないことは `src/source/retention.rs:3373` `source_gc_preserves_secret_proof_before_vault_and_pending_claim`。
+
+S15e（未実装だったもの。この変更で実装）
+
+- retention L1（PR #45 のレビューで先送り）: 親が `Lease::publish` の途中で止まると、Vault に平文の一時ファイルが残り、link 後なら bundle の名前が 2 つになって読み取りがすべて拒否され、その run の Vault と Source の削除も永久に進まなかった。親では一時ファイルの掃除（`sweep_stale_tmp`）が一度も呼ばれていなかった。`src/secrets/vault/guard.rs:352` の `Lease::sweep_orphan_tmp` を足し、`vault_retention_page` が排他 lease・祖先・owner・登録の確認の後、時計の Hold と旧入力の保留より前に、1 ページ最大 32 件を消す。Vault の一時ファイルを作るのは lease を持つ `publish` だけなので、排他 lease を取れた時点の残りは書き手のいない残骸であり、経過時間と時計を条件にしない（C 節の「clock Hold は物理 replay も止める」は保持対象の claim の話で、どの run にも属さない未公開の一時ファイルには当てはめない）。消すのは、名前が `.<run>.json.<ulid>.tmp` か `.parent-retention.json.<ulid>.tmp` に厳密に一致し、symlink を辿らずに見て自分が所有する 0600 の通常ファイルで、link が 1 つ、または 2 つでもう一方がその公開先と同じ inode のものだけである（2 つの場合に実際に回復できるのは run の bundle だけで、理由は下に記す）。root FD 相対で unlink し、root を fsync する。それ以外は残して数え（当初は unknown に含めた。レビュー対応の L1 で別の数に分けた）、一時ファイルを bundle へ昇格させない。
+  - テスト: 名前の判定 `:677` `orphan_tmp_target_accepts_only_publication_temporaries`、link の前後で止まった 2 通りからの回復と共有 lease での拒否 `:707` `orphan_sweep_recovers_a_publication_that_died_before_or_after_the_link`、symlink・directory・別 inode の hard link・別の公開名への link・0644 を残すこと `:744` `orphan_sweep_retains_whatever_is_not_provably_a_dead_publication`、33 件が 32 件と 1 件に分かれること `:783` `orphan_sweep_is_bounded_per_call_and_resumes`（以上 `src/secrets/vault/guard.rs`）。ページ経由は `src/source/retention.rs:3770` `vault_page_recovers_crashed_publication_despite_holds_and_then_claims`（reader がいる間は busy で 0 件、時計の Hold 中でも回復し、回復後に通常どおり claim して消す）。実 loop 経由は `src/service/resident/input_retention.rs:536` `automatic_loop_recovers_a_crashed_vault_publication_while_deletion_is_held`。
+  - 再起動から最初の Vault ページ（最大で約 60 秒後）までの間、名前が 2 つの bundle の読み取りは拒否される。コードを読んだ限りでは、delivery は成立せずに次へ回り（`src/service/resident/delivery.rs` の `fail_preference`）、retry は `SecretUnavailable` になる（`src/service/resident.rs` の `vault.load`）。この窓の挙動を直接確かめるテストは足していない。
+  - 親の分類を記録する `parent-retention.json` が名前 2 つのまま残った場合（初回の登録の公開途中で止まった場合だけ）は、当初は回復できず常駐の起動も失敗した。PR #61 のレビュー対応（下の節の M1）で回復できるようにした。
+
+S15e（実装済みだがテストが無かったもの。この変更でテストを追加）
+
+- retention L5（同じく先送り）: state dir の祖先に symlink があると Source と Vault の削除が止まる、という指摘。止まるのは仕様どおりである（削除は祖先を NOFOLLOW で開き直して対象を確かめる。path を解決して受け入れると、起動後の差し替えと区別できない）。正しい直し方は「起動時に明示して拒否する」で、これは `validate_components`（`src/service/resident.rs:1536`）として、常駐の起動（`private_dir`）と `init` の directory 作成（`directory_with`）にすでに入っていた。bootstrap の `validate_paths`（`src/service/bootstrap.rs:108`）と `init` の path 解決（`src/service/init.rs:66`）も同じ関数を呼ぶが、こちらはコードを読んで確かめただけで、テストは足していない。したがって指摘の筋書き（symlink 配下で常駐が動き続け、削除だけが永久に止まる）は公開の経路からは起きない。祖先が symlink の場合のテストだけが無かった（既存は state dir 自体が symlink の場合）。src は変更していない。
+  - 追加: `tests/it/resident.rs:476` `resident_rejects_a_symlinked_state_ancestor_before_creating_any_state`（親と worker の state、新規と既存の両方で拒否し、実体側に何も作らない。同じ場所を symlink なしで指せば起動する）、`src/service/init/tests.rs:137` `directories_are_never_created_through_a_symlinked_ancestor`。
+  - 起動後に差し替わった場合: Source は既存の `src/source/retention.rs:3201` `deletion_symlinked_state_ancestor_never_creates_expiry`。Vault 側が無かったため `:3822` `vault_symlinked_state_ancestor_holds_the_page_and_keeps_every_file` を足した（claim も unlink も一時ファイルの掃除も行わず、元に戻せば次のページで再開する）。
+  - spec 第 22 章と結果 retention の節に、上の 2 点（公開途中の停止からの回復、state path の symlink の扱い）を書いた。
+- 常駐の driver での時計の跳躍: ページ単位の検証はあったが、常駐が呼ぶ `Driver::page` で Source の 7 日が短くならないことの検証が無かった。`src/service/resident/input_retention.rs:477` `wall_jump_unknown_boot_and_reboot_never_shorten_automatic_source_retention` を足した（最初の quarantine が明けた直後に終わった run を使い、壁時計だけの前進、boot 不明、再起動のいずれでも消さず、再起動後に一貫した時計で 7 日経てば消す）。
+
+未了（この確認で完了と扱わないもの）
+
+- 統合 HEAD の全体 local-ci・mutation・リモート CI と remote worker での検証（親の gate）。
+- 既存の節に記した残件: 未登録の旧入力（unknown legacy）の bounded reconciliation（残っている間は Source と Vault の新規 claim を全体で保留する）、received root の永久保持、private in-place binding の GC。
+- PR #45 のレビューの L2〜L4（retire 済みで非 terminal の attempt と結果 GC、旧版の `pending_delete` 行、`retention.lock` の書き込み途中の停止）はこの行の依頼に含まれておらず、扱っていない。
+- state path の symlink を拒否する方針のため、`HOME` が symlink を経由する利用者は、`HOME` を実体の path にしないと `init` できない（LaunchAgents が常に `HOME` の下にあり、service の directory は symlink 越しに作らないため、`XDG_STATE_HOME`・`XDG_CONFIG_HOME` を実体の path にしても回避できない）。path を解決して受け入れる方針への変更は、managed service の結び付け（state path の一致）と全入口に及ぶため、この行では行っていない。
+- 結果 GC のページは最初に失敗した claim で抜けるため、消せない claim が 1 つある run では、同じ run の後続の claim も進まない（ほかの run は進む）。
+- worker 側の `init`（`src/service/worker_service.rs` の `Paths::resolve`）は `HOME` と `XDG_CONFIG_HOME` を従来どおり直接検証する。この行の範囲外で、変更していない。
+
+PR #61 のレビュー対応（2026-11-17。削除専任のレビューの medium 2 件・low 3 件。この節より上の行番号は対応前のもの）
+
+- M1（`parent-retention.json` が名前 2 つで残ると常駐も CLI も起動できない）: `src/secrets/vault/guard.rs` の `Lease::marker` を足し、`parent_registration` と `register` の両方がこれで marker を読む。pin（`retention.lock` の中身。marker の公開より前に書いて fsync してある）がある場合に限り、marker の link が 2 つで、もう一方の名前が同じ directory の `.parent-retention.json.<ulid>.tmp` で、symlink を辿らずに見て同じ inode のときだけ読む。内容が pin と一致することは従来どおり確かめる。読むだけで、`Vault::open` に unlink の経路は足していない。一時名は、その後の Vault ページの `sweep_orphan_tmp`（位置は変えていない）が消す。run bundle は名前 2 つのままでは読まない。`Vault::open` は `check_parent` の原因を捨てず、`Unavailable` の文言に理由（marker が名前 2 つ、pin と不一致など）を含める。
+  - テスト: ページ経由 `src/source/retention.rs` `vault_registration_marker_left_with_two_names_opens_and_the_next_page_repairs_it`（開くだけでは何も消えず、次のページで一時名が消えて link が 1 つに戻り、同じページで保持の削除も進む）。拒否のまま残る 7 通り `vault_registration_marker_with_any_other_second_name_stays_refused`（一時名の形でない名前、Vault の外の名前、一時名の形の symlink、一時名の形の別 inode、名前 3 つ、0644、pin なし。どれも理由つきで拒否し、何も消さない）。link 数の許容の単体 `src/secrets/vault/guard.rs` `a_file_with_two_names_is_read_only_where_two_links_are_allowed`。実際の常駐 `src/service/resident/tests.rs` `resident_starts_on_a_registration_marker_left_with_two_names_and_repairs_it`（1 回目の常駐が登録し、名前 2 つにしてから 2 回目の常駐が起動でき、起動では消えず、Vault ページで一時名が消える）。
+- M2（結果 GC のページのエラーで常駐全体が止まる）: loop を `src/service/resident/result_retention.rs` の `run` に切り出し、入力側の loop に揃えた。ページのエラーでは止めず、claim とデータを残して失敗を数え、原因（path や locator を含みうる）を出さずに件数だけログし、次の周回で再試行する。fence を失ったら入力側と同じく loop を終える（常駐を止めるのは tick の loop）。fence を失った分岐を通すテストは、入力側と同じく無い（テストから fence する手段が無い）。
+  - テスト: `src/service/resident/result_retention.rs` `a_claim_that_cannot_be_deleted_neither_stops_the_loop_nor_the_other_runs`（attempt の directory が symlink に差し替わって消せない claim が 1 つあっても loop は止まらず、ほかの run の結果は消え、消せない claim・元のデータ・symlink の先は残る。loop を作り直しても止まらず、directory を戻せば claim が完了する）、`a_failed_page_is_counted_without_its_cause`、`a_stopped_resident_ends_the_loop_without_a_page`。実際の常駐 `src/service/resident/tests.rs` `result_gc_claim_that_cannot_be_deleted_keeps_the_resident_and_its_work_running`（消せない claim がある状態で、ほかの run の GC・lease の更新・回収・IPC が続き、shutdown まで常駐がエラーで終わらない。実タスクの実行ではなく、制御した worker link での lease 更新と回収の継続で確かめている）。
+- L1（消せない一時名の残骸が保持の失敗として数え続けられる）: `VaultPage` に `tmp_retained` を足し、`unknown` に混ぜるのをやめた。常駐の loop は `Tally` で残骸の数を失敗とは別に持ち、ログは最初の 1 回だけ出す。テスト: `src/service/resident/input_retention.rs` `leftover_temporaries_are_counted_apart_from_failures_and_logged_once`、`vault_page_reports_a_leftover_temporary_as_a_leftover_not_a_failure`。
+- L2（1 つのエントリの失敗で Vault の削除が全部止まる）: `sweep_orphan_tmp` は、エントリごとの stat・unlink の失敗を「残したもの」に数えて続ける。ページを失敗にするのは `current()`、directory の列挙、root の fsync の失敗だけ。テスト: `src/secrets/vault/guard.rs` `orphan_sweep_counts_an_entry_it_cannot_examine_or_unlink_and_goes_on`、ページ経由 `src/source/retention.rs` `vault_page_goes_on_past_a_temporary_it_cannot_unlink`（消せない 1 件を残し、ほかの一時ファイルの掃除と保持の削除が同じページで進む）。
+- L3（symlink の拒否が対象も対処も示さない、`HOME` を一律に検証する）: `validate_components` のエラーに、symlink だった要素の path と「実体の path を指定する（state なら `HOME` か `XDG_STATE_HOME`）」という案内を足した。`init` の `Paths::resolve` は `HOME` そのものではなく、実際に使う path（LaunchAgents、設定、state）を検証する。受け入れる・拒否する path の範囲は対応前と同じで、変わったのはエラーの文言と、検証の対象を使う path として明示したことだけである（`XDG_STATE_HOME`・`XDG_CONFIG_HOME` を実体の path にすれば、使わない `HOME` 配下の既定の path が symlink でも `init` できる点は対応前から同じで、テストで固定した）。state path の symlink を拒否する範囲は変えていない。テスト: `src/service/init/tests.rs` `a_symlinked_path_is_refused_by_name_with_the_way_out`、`home_is_checked_only_through_the_paths_made_from_it`、`initialize_through_a_symlinked_home_creates_nothing`。
+  - 残る制限: `HOME` 自体が symlink を経由する場合は、XDG を実体の path にしても拒否する（未了の節に記した）。この対応で新しく `init` できるようになる利用者はいない。LaunchAgents を symlink 越しに許すかどうかは未決定である。相対の `XDG_CONFIG_HOME` を `init` が拒否する点は変えていない。
+- spec: 第 22 章の「公開途中の停止からの回復」、結果 retention の節、state path の symlink の節を上の内容に合わせた。
+
+検証（レビュー対応後、手元、rustc 1.100.0）: `cargo fmt --check` と `cargo clippy --all-targets -- -D warnings`（`-A` なし、tests/it を含む）は成功。`cargo test` を 1 回通しで実行し、lib は 1272 件成功・1 件失敗（ignored 7）、失敗は `supervisor::tests::another_process_writes_while_this_one_reads_then_crashes_and_resumes`（別プロセスの spool 書き込みを 10 秒待つテストの時間切れ。この変更が触れていない箇所で、同じホストでほかの作業が並行していた）。lib の失敗で `cargo test` が止まったため、integration（`cargo test --test it`）は続けて別に 1 回実行し、588 件すべて成功（ignored 3）。bin と doctest は実行していない。レビュー対応で追加・変更したテストはすべて成功した。mutation と全体 local-ci・リモート CI は親の gate で、この対応では回していない。
+
+検証（レビュー対応前の HEAD `7a1658c`、手元、rustc 1.100.0）: `cargo fmt --check` と `cargo clippy --all-targets -- -D warnings`（`-A` なし、tests/it を含む）は成功。`cargo test --lib` は 1259 件すべて成功（ignored 7）。integration（`cargo test --test it`、588 件）は 1 回通しでの全件成功を得られていない。実行中の load average は 20〜25 だった（同じホストで他の作業が並行していた）。1 回目（既定の並列度）は 9 件、2 回目（`--test-threads=4`）は 1 件が失敗し、失敗はすべて `bootstrap::` の実 CLI・実 owner を使うテストの待ち時間切れ（`Elapsed`）で、この変更が触れていないテストである。1 回目の 9 件のうち 8 件は `bootstrap::` だけの再実行で成功し、2 回目の 1 件（`public_exec_nested_git_cwd_uses_snapshot_root_and_preserves_in_place`）も単独では成功した。`control_exec_succeeded_compute_but_missing_collection_exits_78`（20 秒の期限）は単独でも 3 回中 2 回失敗し、src と tests を main `7cbe913` に戻した状態でも 4 回中 1 回失敗した（成功時も 7〜20 秒かかる）。この変更に由来しない、負荷下の既存の時間依存として別件に分ける。追加・変更したテスト 11 件はすべて成功した。
+
 ### 準備 identity の元 sample freshness と stored-task preview 接続
 
 未公開の `preparation_probe_v1` を、normal profile report 完了時だけ採番する非再利用 sample sequence・native boot・元の completed monotonic stamp/5000ms TTL と、probe 最終 observed stamp を含む契約へ拡張した。completed snapshot が一時的に無くても sequence は戻さず、overflow は Unknown とする。二度の resolver が同じ実 sample を使い、全 IO 後も native boot・clock・元 TTL を再確認する。query は report/native command を呼ばず、sample を更新しない。
@@ -1083,6 +1147,160 @@ S22 の残り（必須。この変更で S22 は完了しない）:
 3. `system-user`（LaunchDaemon の `UserName`）の導入、Linux、upgrade・rollback・doctor・`workers forget`、fish / csh のログインシェル対応は未実装（S23・S24）。
 4. 実 SQLite の live attempt を持つ worker に対する stop の待ち・cancel の end-to-end（agent の cancel は統合試験済みだが、helper の待ちは注入した計数での単体試験）。
 
+### S21 `workers diff`（2026-11-17、1 本目: diff と待機理由の手順）
+
+`workers diff [<worker>]` を実装した。親と worker は同じ測定関数（`toolchain::envreport::collect`）で測り、worker 側は登録済みの binary の隠し action `worker-service env` が ssh 越しに JSON の環境 report を返す。測定は resident と同じ永続入力（worker.json の env と profile の PATH）を使い、ssh セッションの PATH は使わない。report は tool ごとの観測（available / unavailable / unknown）と版、版管理 adapter（registry）の導入候補と導入済みの版、remote-task-runner の build 版、`docker info` による実行可否、空き disk、profile の名前・required_tools・digest、policy digest を持つ。
+
+task-traffic-controller と local-ci は RTR の binary に組み込まれている（spec 22.4）ので、外部の `--version` は叩かず、双方の binary の build 版（`remote-task-runner` の版）で比べる。portool・fast-worktree は他の tool と同じ 3 状態（ある・無い・測れない）で測り、測れないものを same にも missing にもしない。`docker info` は profile の HOME と worker env の `DOCKER_HOST`・`DOCKER_CONTEXT` を付けて呼び、エラーは Unknown とする（docker の実体が無いときだけ not runnable）。子は自分の process group に置き、出力は上限（8 KiB）を超えた分を読み捨てて pipe を詰まらせず、時間切れでは group ごと止める（`platform::signal_process_group`）。
+
+差の判定は純粋関数 `toolchain::envdiff::diff(parent, worker) -> Vec<Item>`（`doctor` から呼べるよう公開、PURE 対象）。分類は `same / differs / missing / auto_installable / manual_required / not_measured` で、優先順位は次のとおり。unknown は同じと見なさず（`differs`）、手順は「測れなかった（could not be measured）」と言い、install は案内しない。manual の tool（xcode・docker）は版 manager が候補を持っていても常に `manual_required`。portool・fast-worktree は配布経路（版 manager の導入候補）が無ければ `manual_required`。worker の版 manager に導入済みの版は、既定の版が違っても、PATH に tool が無くても `same`（H1）。導入候補にある版が未導入なら `auto_installable`、候補外なら `missing` か `differs`。profile は名前と required_tools で比べ、digest は host ごとの絶対 path を含むため表示だけにする。policy digest は本物の digest ができるまで `not_measured`（same にしない。`all_same` の判定には入れない）。手順（steps）は項目ごとに付ける。古い binary・新しい schema・壊れた応答・ログインの banner・worker 側の拒否は、それぞれ別の文言の `CONFLICT` で、空の差にはしない。worker から来た文字列は制御文字を除いて出す。
+
+`diff` を worker 省略で呼ぶと、1 台が測れなくても残りを続け、worker ごとに結果（測れなかった理由を含む）を出す。測れない worker があれば終了コードは非 0。登録が 0 台なら、その旨を出して非 0 で終わる。
+
+適合 worker が無い submit の待機理由（`unmet`）には、未充足の tool 要求の直後に `how: …`（128 文字以内、文字数で切る）の 1 行を足す（`envdiff::with_steps`、`task_waiting` と `estimate` の両方）。manual の tool は固定の手順、それ以外は「worker の profile PATH に導入して」、観測が unknown なら「測れなかった」と言う。unmet の行の照合は `capability::unmet_line`（`missing` が行を書く関数）で行う。
+
+A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一時 HOME の `src/service/workers/tests.rs`、実 binary・偽 ssh・偽の tool shim の `tests/it/workers_lifecycle.rs`（`a44`）。ネットワークには出ない。
+
+残り（S21 は完了していない）: `workers sync` の実際の導入は 3 本目で入れた（下の節）。`doctor` への組み込みは 7 本目で入れた（下の「S21 `doctor` への接続」）。`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は RTR の版だけで、組み込んだ crate 個別の build 情報は持たない。
+
+### S21 `workers sync`（2026-11-17、2 本目: 計画と blocked、導入の差し込み口）
+
+`workers sync <worker> [--project <dir>]` を実装した。計画は純粋関数 `toolchain::envsync::plan(parent, worker, project)`（PURE 対象）で、diff の `auto_installable` を版管理 adapter の導入手順にし、それ以外（`manual_required`・`missing`・`differs`。platform・disk・profile を含む）は導入せず `blocked: environment_mismatch` として不足内容と手順を出し、非 0 で終わる。「in sync」と言うのは `diff` が `all_same` のときだけ（`--project` で宣言された tool が親と違うだけなら「プロジェクトの要求を満たす」と言い、`in_sync: false`）。`--project` は dir 直下の版指定ファイル（`.fvm` を含め途中の symlink も辿らない（`platform::open_beneath`）、各 256KiB 以下、1 つも無ければ InvalidInput）を `declarations` で読み、宣言された tool は親ではなくプロジェクトの要求（導入済みか既定の版が満たせば何もしない、満たす最大の許可済み版を導入、無ければ blocked）に従う。alias（`lts` など）・式は版ではないので導入せず、「具体的な版を指定する」と案内する。導入済みの版は PATH に tool が無くても要求を満たす。
+
+実行は自動導入を先に行い、その後で手動分を blocked として報告する。導入後に worker を測り直し（比較は純粋関数 `envsync::verify`、メッセージは `envsync::render_blocked`）、導入が見えなければ blocked とする。途中で止まったとき（測り直しの失敗、残りの blocked）も、それまでに導入したものをメッセージに含める。導入の失敗は成功にせず、別の版へ切り替えない。導入そのものは `Installer` trait の差し込み口に分けた（本番の実装は 3 本目の `ResidentWarmup`。2 本目の時点の `NoWarmup` は削除した）。
+
+残り（S21 は完了していない）:
+1. 導入の本番経路は 3 本目で入れた（下の節）。
+2. `doctor` への組み込みは 7 本目で入れた（下の「S21 `doctor` への接続」）。
+3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
+
+### S21 `workers sync` の導入（2026-11-17、3 本目: warm-up の要求）
+
+`workers sync` が worker に実際に導入するようにした。経路は spec 11 章が名前を挙げている `env_sync` で、wire の型は以前からあり、agent が未実装（`NOT_IMPLEMENTED`）だったものを実装した。
+
+- **経路**: `workers sync` → 動いている resident の control 操作 `env_sync`（`Operation::EnvSync`） → `Coordinator::env_sync` → 既に張ってある認証済みの worker link → wire の `env_sync` → worker の agent。ssh で worker のファイルを読み戻すことはしない。admission の lock も SQLite の書き込みも持たない（`resolve_toolchains` と同じ扱い）。
+- **agent の導入**: 親が渡すのは tool 名と厳密な版だけで、導入の内容はすべて worker 自身の registry（`toolchains.toml`）から作る（`Registry::inventory_request`。recipe が無い tool、inventory に無い版、厳密でない版は導入せず、理由を付けて `failed`）。導入は `Host::toolchain_poll` に warm-up 用の consumer を渡して行うので、配置済みの attempt と同じ setup の supervisor・forecast・task-traffic-controller の gate を通る。install plan の key は project や親の profile に依らないため、同じ版の warm-up どうしも、その版を要する attempt も、既存の singleflight で 1 つの導入にまとまる。
+- **待たない要求**: link と control socket の応答時間は数秒なので、1 回の要求は導入を待たず `pending` を返す（`SyncOutcome::Pending` を追加）。親は同じ `sync_id`（要求の本文に追加。`request_id` は毎回新しい）で聞き直す。agent は `sync_id` ごとに consumer を 1 つ持ち、決着（導入済み・失敗・`prepare_timeout_ms` 超過）で参照を手放す。決着した結果は覚えておき、応答を失った親の聞き直しに同じ答えを返す（失敗した導入をやり直さない）。誰も聞きに来ない warm-up（親が途中で止まった）は、agent の tick が `warmup_idle_ms`（既定 60 秒）で参照を手放す（最後の参照なら導入も止まる）。同時に覚える warm-up は 16 個まで、1 要求の tool は 32 個まで（超える要求は丸ごと断る）。停止中の agent は新しい warm-up を始めない。古い coordinator epoch は `STALE_EPOCH`。`dry_run` は検出だけで何も始めない。
+- **旧 peer の除外**: hello の feature `env_sync_v1` を足した。双方が提供し、どちらも要求しない（`required_features` に入れない）ので、片方だけが新しい組み合わせでも接続と通常の配置はそのまま動く（N/N+1）。合意できなかった link には coordinator が要求を送らず、`workers upgrade <worker>` を案内する `PROTOCOL_INCOMPATIBLE` を返す。agent 側も、合意していない接続からの `env_sync` を agent に渡す前に断る。古い resident（操作を知らない）には「resident を再起動して」と案内する。
+- **CLI**: `NoWarmup` を `ResidentWarmup` に置き換えた。導入する版が 1 つでもあるときだけ resident に繋ぐ（揃っている worker の sync に resident は要らない）。resident が動いていなければ、起動せずに「resident が動いていない」と出して止まる。応答なし・混雑（`COMMUNICATION_UNKNOWN`・`OVERLOADED`）は同じ `sync_id` で聞き直すが、誰も答えない状態が 2 分続いたら打ち切る（link が切れた worker、この操作を知らない古い resident は要求を読めずに接続を閉じるので、ここに当たる。メッセージで resident の再起動を案内する）。worker が `pending` と答え続ける間は 1 時間まで待つ（worker 側は既定 15 分で失敗にする）。導入を始めるときに stderr へ 1 行出す。導入の失敗はその版を blocked にして残りを続け、導入後の測り直しで見えない版は `envsync::verify` が blocked にする。resident なし・旧 peer・応答なしの打ち切りは、その場で sync を終える（それまでに導入したものはメッセージに含める）。worker から来た文字列は制御文字を除いて出す。
+- **表示の食い違いの修正**: 成功時の 1 行は `render_sync` が作り、`in_sync` が true のときだけ「is in sync」と言う。false のときは「is not in sync with the parent」で始め、`--project` を付けたときだけ「プロジェクトの要求は満たしている」と続ける（以前は `in_sync: false` で「meets the project's requirements」とだけ言い、`--project` なしでも project に触れていた）。
+
+A44 の sync 側のテスト（ネットワークに出ない）:
+- `tests/it/bootstrap.rs`: 本物の resident と local worker、偽の nodenv manager で、要求 → 導入 → 測り直し → in sync の往復、2 回目は何も実行しないこと、導入済みは `unchanged`、resident が無いときは導入も起動もしないこと、manager の失敗が blocked になること、同時の 2 回の sync で manager が 1 回しか走らないこと。
+- `tests/it/worker_agent.rs`: feature を合意していない接続の拒否、上限と重複、registry に無いものを導入しないこと、1 つの warm-up が 1 つの consumer であること、決着後の同じ答え、時間切れ、tick による解放、停止中と満杯。
+- `src/coordinator/env_sync.rs`: 旧 peer に要求を 1 回も送らず `workers upgrade` を案内すること、応答なし・拒否・不足した応答の区別。`src/service/workers/warmup.rs`: 応答の解釈（純粋関数 `look`）。`src/toolchain/registry/tests.rs`: warm-up の要求と attempt の要求が同じ install plan になること。
+
+残り（S21 は完了していない）:
+1. （7 本目で解消）`doctor` への組み込み。下の「S21 `doctor` への接続」。
+2. ssh 越しの remote worker に対する `workers sync` の実機での受入（S26）。往復の試験は local worker の link で行った。remote の link を作る `config/runtime.rs` が feature の合意を渡すこと（合意した peer には送り、していない peer には送らない）は `tests/it/runtime.rs` で確かめたが、ssh の bridge を通した導入の往復は試験していない。
+3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
+4. `diff` の worker 省略時の並列化、`installed_inventory` の所要時間の計測（1 本目から継続）。
+5. （4 本目で解消）spec 11 章・18 章・22.2 に `env_sync` の意味、feature `env_sync_v1`、N/N+1 の規則を書いた。
+6. sync の途中で Ctrl-C したとき、worker 側の導入は最長 `warmup_idle_ms` 続いてから止まる（即時の取り消し要求は無い）。
+
+### S21 `workers sync` のレビュー修正（2026-11-17、4 本目: PR #59 の指摘）
+
+- **H1（S20 からの欠陥）**: 失敗した導入・途中で止められた導入が receipt の無い private root を残し、同じ版がその後ずっと失敗していた。原因は 2 か所で、`poll_tool` が導入者を起動する前に `detect` の `installation_incomplete_or_unreceipted` を `Failed` にしていたことと、`install_admitted` が中身のある root を `installation_partial_requires_cleanup` で断っていたこと。直し方: `poll_tool` は「root はあるが receipt が無い」場合に限って導入者を起動する（信用できない receipt・tree の drift・安全でないディレクトリは従来どおり `Failed`）。`install_admitted` は `install.lock` を排他で取り（他の導入者が持っていれば何も消さずに待つ）、receipt があればそれを返し、無ければ root の中身を消してから入れ直す。消す前に root の場所を確かめる（管理ディレクトリの直下、名前が plan identity の 64 桁 16 進、所有者のみの権限、symlink を経由しない）。`install.lock` は残し、symlink は辿らずに外し、ファイルは mode を変えずに外し（外への hard link の先を書き換えない）、receipt のある root（検証できない receipt を含む）は消さない。仕事の中の導入も warm-up も同じ `poll_tool` → helper → `install_admitted` を通るので、両方が直る。修正前に、失敗させた版をもう一度導入するテストが builder と resident 経由の両方で失敗することを確かめた（`installation_incomplete_or_unreceipted`）。
+  - 変わった既存の振る舞い: 導入が失敗した版を次の consumer が要求すると、導入をもう一度試す（以前は 1 回目の失敗を返し続けた）。失敗を見た consumer 自身には同じ失敗を返し続ける。`installation_busy` と `installation_partial_requires_cleanup` は返さなくなった。
+- **M1**: 一度 `pending` を見た後は、resident に繋がらない（接続拒否・socket なし）、resident の「停止中」の答え、`NOT_FOUND`（resident が worker をまだ掴んでいない）を答えなしとして、2 分の上限の中で聞き直す。`pending` を見た後に止める・打ち切るときは、導入が worker で続いている可能性と `workers diff` を添える。resident は起動のたびに token を作り直すので、答えを読めなかったら client を読み直してから聞き直す（これが無いと、再起動後の resident に古い token で聞き続けて打ち切りになる。再起動をまたぐ試験で見つけた）。
+- **M2**: 停止中の worker は新しい warm-up を `CONFLICT` で断り、親はその場で止めて worker の文言を出す（`OVERLOADED` は「混んでいる」だけになった）。error code は増やしていない（古い親が読めない値を返さないため）。resident の再起動の案内は、resident がこの操作に一度も答えなかったときだけ出す。
+- **M3**: 親は worker の答え（`pending` と `OVERLOADED`）で「最後に答えがあった時刻」を更新する。worker の確認は `sync_id` ごとに 1 本の別スレッドで行い、warm-up の lock の外で動く。確認を始めた要求は最長 1.5 秒待って `pending` を返し、確認中に来た同じ `sync_id` の要求は分かっている結果をその場で返す（時間切れになった要求がスレッドを積み上げない）。遅い確認の結果は残り、次の要求に答える。確認中の warm-up は idle でも手放さない（手放すと、確認が consumer を作り直し、誰も解放しなくなる）。
+- **L1**: worker が `unchanged` と答えた版は `installed` に入れない。測り直しと `verify` は、`unchanged` の版にも行う。親が `pending` を見た後の `unchanged`（worker の再起動で warm-up を忘れた場合）は、導入したものとして数える。
+- **L2**: `toolchain_poll` は warm-up の lock の外（上の別スレッド）で呼ぶ。
+- **L3**: resident の client を作れないとき、「resident が動いていない」と言うのは、token か socket が無い・接続拒否のときだけ。それ以外はそのままの理由を出す。
+- **L4（入れない）**: warm-up は `max_concurrent_prepares` に数えない。この上限は workspace の準備（`host.prepare` のスレッド）の数を縛るもので、仕事の中の toolchain の導入もこの枠を持たない。warm-up が枠を持つと、最長 15 分の導入の間、workspace の準備が待たされる。導入の同時数は、版ごとの singleflight、task-traffic-controller の gate、warm-up の上限 16 で縛っている。
+- **テスト（M4）**:
+  - 導入中の worker の再起動: `tests/it/toolchain_preparation.rs`（同じ state を開き直し、古い導入者が片付くまで次を始めず、その後に導入が成功する）。
+  - resident の再起動をまたぐ sync: `tests/it/bootstrap.rs`（local worker は resident の中にあるので、worker の再起動も兼ねる）。
+  - 中断のあとの 2 回目の sync（worker が忘れる前）: `tests/it/bootstrap.rs`（manager は 1 回だけ）。忘れた後（60 秒）は、`warmup_idle_ms` を resident の設定から変えられないため resident 経由では試験していない。同じ経路を 2 段で確かめた: agent が idle で参照を手放し、同じ `sync_id` の聞き直しが新しい warm-up になること（`tests/it/worker_agent.rs`、link の切断が `warmup_idle_ms` を超える場合も同じ）、参照が無くなって止められた導入の後に同じ版が導入できること（`tests/it/toolchain_preparation.rs`）。
+  - gate: `tests/it/bootstrap.rs`（worker の予算を別の entry で埋めると、導入が worker の ledger に並び、manager が走らない。空けると導入される）。
+  - 遅い確認: `tests/it/worker_agent.rs`（確認が戻らなくても要求は `pending` で返り、聞き直しは確認を増やさず、結果は残る）。
+
+残り（S21 は完了していない）: 4 本目の 1〜4 と 6。加えて、`warmup_idle_ms` を超えた後の 2 回目の sync を resident 経由の 1 本の試験で確かめること（設定の口が要る）。owner の read が無く空でないディレクトリを残した root は、rename で空になるので次の導入は進むが、その trash は消せずに残る（手で消す）。root の中を path で名指しして書く生き残りの子孫は、新しい root に書き込める（trash への rename では防げない）。
+
+### S21 `workers sync` のレビュー修正（2026-11-17、5 本目: 削除の経路と失敗の記憶）
+
+PR #59 の H1 修正（4 本目）へのレビューを受けて、toolchain の root を消す経路を固めた。
+
+- **M1（失敗した版のやり直し）**: 導入者が自分で失敗した版を key ごとに 10 分（`SetupConfig::tool_failure_hold_ms`）覚え、新しい consumer には導入をやり直さずに同じ失敗と残り秒数を返す。覚えるのは helper が失敗の exit で終わった場合、成功の後の `detect` が通らなかった場合、制限時間切れだけで、cancel・消失・signal による終了は覚えない（`policy::install_itself_failed`）。HostTools の digest が変わったとき、warm-up の最初の look（`Host::toolchain_retry`）、worker の再起動で解除する。判定は純粋関数 `policy::failure_held`。
+- **L1（fd を基準にした削除）**: `remove_at` は `openat(O_DIRECTORY|O_NOFOLLOW)`・`fstat`・`fchmod`・`unlinkat` だけでたどる。path の chmod と `read_dir` は無い。`st_dev` が root と違うディレクトリは `EXDEV` で止まる。`managed_root` は管理ディレクトリと root を開いたまま返し、clear はその descriptor を使う。読めない（owner の read が無い）ディレクトリは、空なら外し、空でなければ止まる（path で chmod し直さない）。
+- **L2（trash）**: clear は `install.lock` 以外を `.trash-<root名>-<ULID>` へ rename してから消す。rename の失敗は導入の失敗で、何も消さない。rename の後に trash を消し切れなくても導入は続け（別の device に当たった場合だけ失敗）、trash は残す。残った trash は同じ root の次の clear（lock の下）と、起動時の `adapters::sweep_trash`（その root の lock が待たずに取れた場合だけ）で消す。root そのものは rename しない（`install.lock` の inode が排他そのものなので）。
+- **L3（期待する親）**: `install_admitted` と `managed_root` は管理ディレクトリを引数で受け、`root.parent() == expected` を、何かを作る前に確かめる。
+- **L4・L5（緩めた試験）**: helper を殺した後の試験を `calls()==2` と「2 本目が Pending」に戻し、失敗時は理由を出す。「すぐ Failed」の原因は helper の 3 秒固定の承認待ちだった（混んだ全体実行で `installer_not_admitted` が 1 件余分に出て、導入が manager を動かす前に「a setup step exited with 1」で終わった）。待ちを 60 秒にし、承認の記録が別の process を子と名指ししているときだけ即座に諦める（`preparation::admission_step`）。restart の試験は、unsettled が空になった直後に古い子が死んでいることを確かめる。
+- **dry_run**: `env_sync` の dry_run は receipt の無い root を `would_install` と答える（本番の sync と同じ）。
+- spec §22.2 の削除の条件を、上に合わせて直した。
+
+残り: 上の 4 本目の残りと同じ。
+
+### S21 `workers sync` のレビュー修正（2026-11-17、6 本目: 覚える失敗を狭める）
+
+5 本目の M1 は覚える範囲が広すぎた（helper の exit 1 のすべて、phase を問わない時間切れ、helper の成功の後の I/O エラー）。次に狭めた。
+
+- helper は、導入そのものの失敗のときだけ専用の exit code 3（`preparation::INSTALL_FAILED_EXIT`）で終わる: manager のコマンドの失敗（`installation_command_failed`）、probe の不一致（`installed_version_mismatch`）、別の device（`installation_cleanup_other_device`。これまでは `installation_partial_cleanup` と同じ文字列だった）。分類は純粋関数 `preparation::install_exit`。それ以外は今までどおり exit 1。
+- `policy::install_itself_failed` が覚えるのは、その exit code と、phase が Running の時間切れだけ（`BuildEnd::TimedOut` が phase を持つ）。承認待ちの時間切れ、exit 1、helper の成功の後の `private_tool_root`・`detect` の失敗は覚えない。
+- spec §22.2 の覚える条件を、上に合わせて直した。
+
+残り: 上の 4 本目の残りと同じ。probe の出力が読めない（`probe_*`）・出力が長すぎる（`installer_output_limit`）は exit 1 のままで覚えない。Running の時間切れには `install.lock` を待つうちに切れた場合も入る。
+
+### S21 `doctor` への接続（2026-11-17、7 本目。main の取り込み後）
+
+main（S23 の doctor・upgrade、scope の統一、schema v11 など）を merge commit で取り込み、`doctor::command` が `doctor::run` の `diff` に渡す値を `None` から `workers diff` の比較に置き換えた（spec §22.2「`doctor` はこの結果を含む」）。
+
+- 答えた worker ごとに、`workers diff` と同じ経路（`workers::fetch_env` が登録済みの binary の `worker-service env` を ssh で尋ねる）で環境 report を取り、`envdiff::diff` の結果を check にする（`doctor::worker_diff`）。親の測定は 1 回だけで、worker が 1 台も答えなければ測らない。親を測る環境は `workers diff` と同じにした（常に保持した service の env。呼び出した shell の env では測らない。`doctor::measure_parent`）。
+- 項目から check への変換は純粋関数 `doctor::diff_checks`。id はどれも `environment_diff` で、項目ごとに 1 check（detail は `<項目>: <分類> parent=… worker=… -> <手順>`）。`same` は ok、`differs`・`missing`・`manual_required` は fail（利用者が手を動かさないと直らない差）、`auto_installable` は notice（exec の warm-up と `workers sync` が入れる。detail で `remote-task-runner workers sync <worker>` を案内）、`not_measured` も notice（「まだ測っていない」。`not_checked` にしない）。report を取れなかった worker（古い binary、壊れた応答、拒否）と親を測れなかった場合は、理由を添えた `not_checked` 1 つで、空の結果にも ok にもしない。worker から来た文字列は制御文字を除く。
+- ssh で答えなかった worker には環境を尋ね直さない（`reachable` が既に fail を出している。2 回目の待ちを作らない）。`environment_diff` は `not_checked` として列挙する。
+- 試験: `src/service/doctor/tests.rs` の `environment_diff`（全分類、制御文字、取れなかった場合、偽の ssh 越しの差と一致、親を測れない場合、答えない worker）と、実 binary・偽 ssh の `tests/it/doctor.rs`（worker の platform が違う report を返すと `environment_diff` が fail になり、policy digest は notice で `not_checked` は 0）。差の無い親・worker の doctor が exit 0 になること（`a_registered_worker_with_nothing_to_fix_keeps_the_exit_at_zero`）と、親を保持した env で測ること（`the_parent_is_measured_in_the_retained_environment_as_workers_diff_does`）も固定した。
+
+S21 で終わったもの: `workers diff`（1 本目）、`workers sync` の計画・blocked・導入と warm-up（2〜6 本目）、`doctor` への接続（この節）。
+
+S21 の残り（必須。S21 は完了していない）:
+1. policy digest（task-traffic-controller の実効 policy）を `envreport::collect` が測らない（常に `None`）。diff は `not_measured`、doctor は notice（exit に影響しない）になる。測るようにするのは残り。doctor 自身の `traffic_policy` は host ごとの 2 つの scope を比べるだけで、親と worker の間は比べていない。
+2. （解消）doctor の区分は決定済み: fail は `differs`・`missing`・`manual_required` と disk 不足、notice は `auto_installable` と `not_measured`、`not_checked` は到達できなかった worker と親を測れなかった場合。
+3. doctor（`worker-service doctor`）は journal に記録した service の env で事実を集め、diff（`worker-service env`）は worker.json の env で測る。読む場所が 2 つあり、doctor 側は `XDG_CONFIG_HOME`・`XDG_STATE_HOME` を除く。2 つが同じ測定になることは確かめていない。
+4. （解消）親は doctor も `workers diff` も保持した service の env で測る。呼び出した shell の env には落とさない保持された env が無い（PATH が無い）と `workers diff` は測定を拒否し、doctor も同じ理由で「親の環境を測れない」の `not_checked` にする（`tests/it/doctor.rs` の `without_a_retained_service_environment_...`）。
+5. doctor は worker ごとに ssh を 3 回（doctor・hello・env）直列で行う。`diff` の worker 省略時の並列化と合わせて未着手。
+6. 3 本目の節の残り 2〜4 と 6、4〜6 本目の節の残り（上の各節）。`--project` は workflow の `setup-*` 入力を読まない。`installed_inventory` の所要時間は未計測。
+7. 実機での受入（A44 の native 検証、S26）。
+
+### S9a/S10 追補: worker と task-traffic-controller CLI の scope 統一（2026-11-17）
+
+worker は自分専用の scope（`<state>/traffic`）を使っていて、同じ host の CLI（`$XDG_STATE_HOME/task-traffic-controller`、無ければ `~/.local/state/task-traffic-controller`）と別の ledger・budget になっていた（仕様 §14 の「同じ ledger・lock・lease」「nested にも同じ scope」と §18 の「既存の scope を検出して同じ budget を使う」に反する）。CPU を二重に使い、step の中の `task-traffic-controller exec` は自分の run を見つけられず別 job として gate されていた。
+
+- scope の規則は `src/config/traffic.rs` の 1 か所に置いた（0.8.2 の時点では library に公開関数が無く、ここに書き写した。0.10.1 で `Paths::from_env` に置き換えた。下の「依存更新」）。`XDG_STATE_HOME`（空は未設定扱い）、無ければ `HOME/.local/state`。config も CLI と同じ `XDG_CONFIG_HOME` / `HOME/.config` の `task-traffic-controller/config.toml` にした（policy を worker だけ別にしない）。CLI より厳しい点が 2 つある。相対パスは拒否する（CLI は自分の cwd で解決するので、worker と step で一致させられない）。`HOME` も無ければ拒否する（CLI は `/` に落ちる）。
+- 適用は `ResolvedConfig::worker_runtime` の 1 か所で、worker 前景 role と resident の local worker の両方が通る。agent・forecast・supervisor・setup builder は同じ値を受け取る。`AgentConfig::new` / `SetupConfig::new` の既定（`<state>/traffic`）は変えていない（直接組み立てる試験が利用者の scope を触らないため）。
+- step の環境: CLI に state directory を直接渡す変数は無く、`HOME` と `XDG_STATE_HOME` だけで決まる。`XDG_STATE_HOME` を profile の保護対象にした。worker が持っていれば明示 profile の allowlist に無くても step へ渡し、step・profile の定数からは設定も変更もできない（worker が持たなければ step も持てない。worker と同じ値を書くことだけは通る）。worker と違う値を設定する workflow は配置時に拒否される。持ち方は下の「レビュー指摘の修正」で変えた（toolchain の環境とは別に持つ）。
+- 移行: 起動時に旧 `<state>/traffic` を見る。無ければそのまま。ledger が読めない、または reaper が保持する entry（lease 保持中、または process が残りうる managed command）があるあいだは serve しない。旧 directory は消さず動かさない（旧 scope で開始した attempt の保存済み spec がその path を持つ）。履歴は取り込まず cold start とする（§18 が許容）。待ち方と、未開始の attempt の扱いは下の「レビュー指摘の修正」。
+- 試験は一時 directory だけを `HOME` / `XDG_STATE_HOME` にする。規則と保留の判定は `src/config/traffic.rs` の単体試験、profile の保護は `src/toolchain/profile.rs`、worker_runtime の値と旧 scope の拒否は `tests/it/runtime.rs`。nested は `tests/it/supervisor.rs` で、worker_runtime が決めた scope と step 環境で supervisor に test binary 自身を step として実行させ（`nested_cli_probe`）、その中で CLI の規則（試験側に独立に書いたもの）と CLI と同じ `exec::nesting` を使い、同じ ledger に worker の entry が見えて、その entry の下で動く（inherit）と判定されることを確かめる。旧 scope では見つからないこと（top）も対照として確かめる。
+- 実際の CLI を step から呼ぶ試験は `a_real_nested_cli_runs_under_its_step_and_shares_the_ledger`（下の「レビュー指摘の修正」の 6・8）。
+
+依存更新（task-traffic-controller 0.8.2 から 0.10.1、2026-11-17）で直したこと:
+- 0.10.1 の library は `Paths::from_env(home, xdg_state_home, xdg_config_home)` を公開した（CLI が呼ぶのと同じ関数）。`src/config/traffic.rs` の `resolve` はこれを呼ぶだけにして、規則を二重に持たない。RTR 側の制約（相対パスと `HOME` 無しの拒否）だけを呼ぶ前の検査として残した。
+- 0.9 以降の CLI は nested exec の間 ledger を v3 形（`entries_v3` のみ）で書く。0.10.1 の `Ledger::load` はこれを読めるので、supervisor の `run` と forecast の inspect が `Traffic("ledger: ...")` で失敗する問題は解消した。試験: v3 形の ledger を scope に置いて run が成功し v3 形のまま残ること（`tests/it/supervisor.rs`）、forecast が読んで何も変えないこと（`tests/it/forecast.rs`）。導入済みの CLI を step から実際に呼ぶ試験は、下の「レビュー指摘の修正」の 8 で CI に入れた。
+- service 環境の allowlist（worker・worker-service・init）に `XDG_STATE_HOME` を足した。install と init の時点で利用者の shell の値を journal の env に取り込み、常駐 worker が同じ scope を使う。launchd の plist は `PATH`・`HOME` などの固定の鍵しか受けないので、`XDG_CONFIG_HOME` と同じく plist には渡さない（worker は journal の env から読む）。install と init は、worker が起動時に拒む env（相対パスの XDG と `HOME`）をその場で拒む。
+- step への環境: `XDG_CONFIG_HOME` も `XDG_STATE_HOME` と同じく profile の保護対象にした（worker の値を明示 profile の allowlist に無くても渡し、step・profile からは変更できない）。toolchain adapter の `activation_env` は `XDG_*` をすべて無視する。
+
+レビュー指摘の修正（#56・#58、2026-11-17）:
+1. 受理済みで未開始の attempt（high）。保存済みの `supervise.json` は受理・準備の時点の scope（`traffic_state_dir`・`traffic_config`・node の env）を持つ。**書き換える方を選んだ**。この 3 つは worker が spec を書くときに自分で決める値で、payload にも plan digest にも execution binding にも入っていないので、書き換えても受理した契約は変わらない。agent は Ready の attempt を起動する直前（`rewrite_start`、lease の seed と残り deadline を書くのと同じ場所）に `SuperviseSpec::rescope` で今の scope に合わせる。install 後に `XDG_STATE_HOME` が変わって scope が A から B に移った場合も同じ経路で B になる。試験: `tests/it/worker_agent.rs` の `an_attempt_stored_for_another_scope_starts_in_the_scope_of_the_worker`（起動直前に保存済み spec を旧 scope の形に戻し、command が worker の scope の ledger で admit され、環境が worker の値になることを確かめる）。
+   - 書き換えないもの: command を開始した可能性のある attempt（`Recovery::Supervise`）。その supervisor は command を二度と起動せず、admit された ledger から残った process を探して止めるだけなので、保存された scope のまま回復させる（書き換えると探せなくなる）。setup builder の `spec.json` は書いた直後に同じ owner が起動し、再起動をまたいで起動し直すことは無い（前の owner の builder は `settle_old` が止めて片付ける）ので、書き換えの対象は無い。新しく書く spec は agent・builder とも今の scope になる。
+   - 旧 scope のまま生きている supervisor（agent が落ちても動き続け、残りの node を旧 scope で起動しうる）があるあいだは serve しない（下の 3）。旧 `<state>/traffic` の ledger だけでなく、保存済み spec の `traffic_state_dir` が今の scope と違い、supervisor lock が取れない attempt・builder を数える。
+2. env が最初の install で固定される（medium）。service file を登録したあとの `install` は journal の env を使い回すので、「install し直せば直る」は誤りだった。直し方: `worker-service stop` のあと同じ binary で `install` し直すと、未終了の attempt が無い場合に限り、journal と `worker.json` の `XDG_STATE_HOME` / `XDG_CONFIG_HOME` だけを呼び出し側の値（未設定を含む）に置き換える。`PATH` などほかの値と service file は変えない。動作中の worker、未終了の attempt がある worker は元の値のまま。`worker-service status` は journal の env から解決した scope を `traffic_scope`（`state_dir`・`config_file`）で返す（呼び出し側の shell の値ではない）。
+3. 拒否で worker が終了し launchd が再起動を繰り返す（medium）。終了しない。worker 役と resident は `worker_runtime` の前で待ち（`src/service/traffic_hold.rs`）、1 秒から倍にして 30 秒までの間隔で見直し、解けたら起動を続ける。記録は状態が変わったときだけ出す。SIGTERM / SIGINT では待ちをやめて終了する。待つあいだ `<state>/traffic-hold.json` を毎回書き直し、`worker-service status` が `traffic_hold`（`reason`: `waiting_for_previous_scope`）で返す。90 秒更新されていない記録と、service が load されていないときの記録は、いなくなった worker のものとして返さない。ledger が読めない場合は待っても直らないので別の `reason`（`previous_scope_unreadable`）と別の文面にし、手順（worker が起動した command が残っていないことを確かめ、`<state>/traffic` を別名へ動かす）を示す。動かせば次の見直しで起動する。`worker_runtime` 自身の検査は、待たない呼び出し側のための最後の確認として残した。
+   - 待っているあいだは agent が動かないので lease を更新する相手がいない。旧 scope で動いている attempt は、自分で終わるか、lease が切れた時点で supervisor に止められる。supervisor が生きているかぎり、待ちが lease より長く続くことは無い。supervisor が死んで command だけが旧 ledger に残っている場合は、その process が終わるまで待つ（回復する agent が動いていないため。以前の拒否でも同じだった）。
+4. scope の変数と toolchain の環境（medium）。`XDG_STATE_HOME`・`XDG_CONFIG_HOME`・`TASK_TRAFFIC_CONTROLLER_NESTED` は profile の digest と fingerprint、execution binding の activation から常に外す。scope の場所を伝える値で toolchain の環境ではなく、入れると scope を動かしただけで受理済みの binding と計測履歴が無効になるため。profile は toolchain の環境（`environment()`）と scope の変数（`scope_environment()`）を別に持ち、command の環境は `command_environment` が両方から作る（binding があれば activation の上に worker の今の scope を載せる）。worker 自身が使う補助（tool の probe・git・workspace の道具）には、step と同じく両方を渡す（`host_environment()`。`XDG_CONFIG_HOME` を読む tool が probe と step で違う答えを返さないため）。setup の key を作る `SetupConfig.env` には入れず、`scope_env` として setup step へ載せる（tool の installer は plan が決めた専用の `XDG_*` を持つので載せない）。RTR は未公開で配備済みの worker がいないので、`XDG_CONFIG_HOME` を持っていた worker の fingerprint が 1 回変わることは受け入れた。試験: profile の digest・fingerprint・環境が scope の変数の有無で変わらないこと（`src/toolchain/profile.rs`）、受理時の activation と、worker が scope の変数を持つようになったあとに作り直した activation が等しいこと（launch と回復が行う比較。`src/toolchain/adapters/tests.rs` の `an_accepted_binding_stays_valid_when_the_worker_gains_scope_variables`）。
+5. #56 と #58 は一緒に main へ入れる（#56 だけでは CLI 0.9 以降の v3 ledger を 0.8 の library が読めない）。
+6. nested exec（low）。仕様 §14（763 行）は「同じ scope の lease を検証して継承し、二重課金を避ける」で、inherit である（773・775 行は scope と policy の一致を述べるだけで、どちらとも決めていない）。CLI は 0.9 から既定が admit（step の entry の子として budget に並ぶ）なので、worker は全 step に `TASK_TRAFFIC_CONTROLLER_NESTED=inherit` を渡し、profile・step からは変えられないようにした。nested の command は step の entry の下ですぐ動き、自分の entry を持たない。試験: probe が inherit と判定すること、worker の変数を外すと child（admit）になること（対照）、実 CLI で nested 実行中の ledger に step の entry しか無いこと。
+7. `src/forecast/plan.rs` の `overrunning()` は `parent` を持つ entry を数えない（親の中で動く。利用者の CLI が admit で作る子 entry は履歴を持たないことが多く、数えると overrun の理由が誤って出る）。
+8. 実 CLI の試験（low）。`#[ignore]` をやめ、`RTR_REQUIRE_FAST_WORKTREE` と同じ規約にした（CLI が PATH に無ければ理由を出して skip、`RTR_REQUIRE_TTC_CLI=1` なら失敗）。設定は CLI が読む `HOME/.config/task-traffic-controller/config.toml` に書き（budget 2、CPU・memory の guard 無し。admit の回だけ budget 3: admit では nested の command が step とは別に budget を 1 つ使うので、2 のままだと並行する別の attempt が admit されない。inherit が避けているのはこの二重計上である）、同じ file を worker の `traffic_config` に渡す。worker が step に渡す環境（inherit）と、`--nested admit`（v3 形の ledger を worker の library が読み、別の attempt を並行して supervise できること）の 2 通りを回す。別の attempt は期限付きで待ち、nested の command は試験が失敗しても必ず解放する（解放前に `run` を呼んで止まる順序を無くした）。CI は test job（ubuntu・macos）に CLI 0.10.1 を入れ、`RTR_REQUIRE_TTC_CLI=1` を設定する。coverage job と mutation job には入れない: coverage の gate は `scripts/pure-modules.txt` の module の行だけを見ていて、この試験が通る supervisor の経路は対象外であり、mutation は `--lib` と `config::` の統合試験だけを選ぶ。どちらでも CLI が無ければ skip され、gate の値は変わらない。
+9. `traffic::resolve` の検査は `worker-service install` と `init` だけに掛ける。stop・drain・resume・status・start は、呼び出し側の shell の `XDG_STATE_HOME` が相対でも動く。
+10. `Cargo.toml` は `~0.10.1`、README は「0.10.x」。ledger を同じ user の CLI と共有するので、ledger の形式が変わりうる次の minor へ library だけ、または CLI だけが進まないようにする。
+11. 既知の制約: worker は利用者の CLI の設定 file を読む。0.10 の library の検査が拒む key や値があると、直すまで worker が起動する command はすべて失敗する（README に記載）。
+
+残り:
+1. `worker-service status` の `traffic_scope` と、実行した shell が解決する scope・policy digest を比べて警告する処理は doctor（S23）の残件。status は値を返すだけで比べない。
+2. resident（`init` で入れた親側）: 待ち（上の 3）は入っているが、`traffic_hold` を返す status が無く、`init` のやり直しで journal の scope を更新する経路も無い。`workers` の親側の表示も `traffic_scope` / `traffic_hold` をまだ出さない。
+3. 待ちの SIGTERM / SIGINT の経路は試験していない（試験 process へ signal を送らないため）。
+4. 実機での upgrade（旧 scope で attempt が動いている worker を入れ替える）は S26 の受入で確かめる。
+
 ### S23 workers upgrade と rollback（2026-11-17）
 
 `workers upgrade <worker>` を CLI へ接続した（`Envelope::not_implemented` に落ちなくなった）。`doctor` は次の変更で接続する。
@@ -1110,7 +1328,7 @@ S23 の残り（必須。この変更で S23 は完了しない）:
 
 ### S23 doctor（2026-11-17）
 
-`doctor` を CLI へ接続した（`src/service/doctor.rs`）。各 host は事実だけを集め、判定は親が 1 か所（`evaluate`・`shared_engines`・`service_checks`）で行う。worker host の事実は hidden の `worker-service doctor` が、journal に記録した service の環境（LaunchAgent に渡した env。`XDG_CONFIG_HOME` を除く）で集める。親自身の local worker は `coordinator.json` に保持した env で調べ、保持が無ければ呼び出した shell の env で調べたことを notice として出す。check の結果は `ok`・`notice`・`fail`・`not_checked` の 4 つで、見られなかったものを `ok` にしない。`healthy` は `fail` も `not_checked` も 1 つも無いときだけ true である。1 つでも `fail` があれば exit は BLOCKED（`blocked_reason = environment_mismatch`）、`fail` は無いが `not_checked` があれば exit 1（`COMMAND_FAILED`、`blocked_reason` なし）で、両者を exit code で区別できる（仕様に doctor の exit code の定めは無い）。`--json` はどの場合も `result` に全 check を載せる。
+`doctor` を CLI へ接続した（`src/service/doctor.rs`）。各 host は事実だけを集め、判定は親が 1 か所（`evaluate`・`shared_engines`・`service_checks`）で行う。worker host の事実は hidden の `worker-service doctor` が、journal に記録した service の環境（LaunchAgent に渡した env。`XDG_CONFIG_HOME`・`XDG_STATE_HOME` を除く）で集める。親自身の local worker は `coordinator.json` に保持した env で調べ、保持が無ければ呼び出した shell の env で調べたことを notice として出す。check の結果は `ok`・`notice`・`fail`・`not_checked` の 4 つで、見られなかったものを `ok` にしない。`healthy` は `fail` も `not_checked` も 1 つも無いときだけ true である。1 つでも `fail` があれば exit は BLOCKED（`blocked_reason = environment_mismatch`）、`fail` は無いが `not_checked` があれば exit 1（`COMMAND_FAILED`、`blocked_reason` なし）で、両者を exit code で区別できる（仕様に doctor の exit code の定めは無い）。`--json` はどの場合も `result` に全 check を載せる。
 
 | check | 内容 | fail にする条件 |
 |---|---|---|
@@ -1123,19 +1341,21 @@ S23 の残り（必須。この変更で S23 は完了しない）:
 | `service_profile` | service の環境で worker profile を load し、起動時と同じ probe を通す | load できない |
 | `reachable`・`service`・`version`・`bridge`（worker のみ） | ssh で helper が答えるか、service が loaded / ready か、版が親と同じか、登録済み binary 経由の `hello` が同じ cluster と worker_id で完了するか（必須 feature の交渉を含む） | 到達不能・別 identity の答え・未 load・切替が未完または commit 待ち・hello 失敗。版の違いと drain 中は notice。host が切替中（`switch_running`）なら `service` は `not_checked` |
 | `legacy_config`（project） | 実行した directory の project の `.local-ci.toml` に、値のある未対応 key（`link-node-modules` など）があれば notice | fail にしない。config を解決できなければ `not_checked` |
-| `environment_diff`（worker ごと） | S21（`workers diff`）の差し込み口。`doctor::run` の `diff` 引数に worker 名から check を返す関数を渡すと、その結果が入る | この build では `not_checked` として列挙する |
+| `environment_diff`（worker ごと） | S21（`workers diff`）の結果。答えた worker ごとに `worker-service env` を尋ね、親との差を項目ごとに 1 check で載せる（上の「S21 `doctor` への接続」） | `differs`・`missing`・`manual_required` の項目。`auto_installable` と `not_measured` は notice（exit に影響しない）。比べられなかった worker は `not_checked` |
 
 受入項目との対応: A05 のうち「未修正 binary を doctor が不適合とする」を、偽の `task-traffic-controller`（`ledger_format` を出さない `status --json`）で、library と実 binary の両方で試験した。A36 のうち S23 の分は、旧い形の `status --json` をそのまま読めること（読めたうえで不適合と判定する）である。
 
 S23 の残り（必須。この変更でも S23 は完了しない）:
 1. **A05 の「同じ budget・policy を共有」は、現状の既定では成り立っていない。** worker の supervisor は `<state>/traffic` を scope にしており（`AgentConfig::new`。設定項目は無い）、同じ user の `task-traffic-controller` command の scope（`~/.local/state/task-traffic-controller`）とは別の ledger になる。doctor はこれを、command が導入済みの host では `traffic_state_path` の fail として報告する（command を日常的に使う host では doctor が必ず fail する）。scope を揃える変更は S9a / S10 の範囲で、ここでは行っていない。A05 はそれが決まるまで未達である。
 2. 「実行中 process」の検査（仕様の既存 state との互換の節）は未実装で、`traffic_processes` を `not_checked` として出す（process の走査はしていない）。command を導入した host では doctor は exit 0 にならない。
-3. S21 の `workers diff` の結果は差し込み口のみ（`not_checked`）。S21 が main に入ったあと、`doctor::command` が `run` に渡す `diff` を `None` から置き換える。それまで、worker を登録した親では doctor は exit 0 にならない（exit 1。`fail` があれば BLOCKED）。
+3. S21 の `workers diff` の結果は接続済み（上の「S21 `doctor` への接続」）。policy digest を親も worker も測らないが notice なので、差の無い親は worker を登録しても exit 0 になる（`fail` があれば BLOCKED、`not_checked` があれば exit 1）。
 4. Linux の linger の確認（仕様 §15）と、system-user mode（LaunchDaemon の `UserName`）の service user での profile 検査は未実装（S24・S22 の残り）。前者は report に項目として出していない。
 5. 本物の docker・実 SSH・実機の launchd 環境での doctor（A35 の「実際の service 環境で doctor が通る」）は未実施（S26）。偽の runner と偽の ssh は実挙動を確かめない。
 6. 親の local worker の service 環境は、`coordinator.json` の env が空のとき呼び出し shell の env で代用する（notice を出す）。
 7. レビュー指摘の残り: worker の task-traffic-controller の scope（M4。上の 1）は別の変更で worker 側を CLI と同じ規則に揃える。doctor の判定は変えていない。profile と command の検査は ssh の helper が journal の env で行い、launchd のドメインや Keychain の可否は再現しない（L3）。実際の launchd 環境での検査は S26 の実機受入の残件とする。
 8. doctor は resident の build・feature と各 worker の照合をしていない（`workers upgrade` は行う）。bridge の `hello` は doctor を実行した binary の必須 feature で行う。
+9. worker の traffic scope（`worker-service status` の `traffic_scope`）と実行 shell の scope の比較は doctor の残件（上の S9a/S10 追補の 1）。
+10. 上の 1 と 7 の「worker の scope は別 ledger」は S9a/S10 追補で解消済み。merge で doctor の worker の scope を `traffic::resolve`（journal に記録した env）に合わせた。service の環境からは `XDG_CONFIG_HOME` に加えて `XDG_STATE_HOME` も外す（worker は journal から読む）。
 
 
 ### S16 の残件の分類（2026-11-17、main `22bbdcc` 起点）

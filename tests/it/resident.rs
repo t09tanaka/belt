@@ -474,6 +474,55 @@ async fn resident_rejects_symlinked_or_shared_state_before_opening_database() {
     assert!(Resident::start(&config(), input).await.is_err());
 }
 
+#[tokio::test]
+async fn resident_rejects_a_symlinked_state_ancestor_before_creating_any_state() {
+    // Retention opens every ancestor of the state directory without following
+    // a link, so a state path through one could never delete anything. Such a
+    // path is refused at startup instead of running with deletion held forever.
+    use std::os::unix::fs::DirBuilderExt;
+    let root = root();
+    let real = root.path().join("real");
+    std::fs::create_dir(&real).unwrap();
+    let alias = root.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    let listing = |dir: &Path| -> Vec<std::ffi::OsString> {
+        let mut names: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        names.sort();
+        names
+    };
+    // Neither a new nor an existing private state directory is accepted
+    // through the alias, for the parent's state and for the worker's.
+    for existing in [false, true] {
+        let mut input = inputs(root.path());
+        input.state_dir = alias.join("parent-state");
+        if existing {
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(real.join("parent-state"))
+                .unwrap();
+        }
+        assert!(Resident::start(&config(), input).await.is_err());
+        if existing {
+            assert!(listing(&real.join("parent-state")).is_empty());
+            std::fs::remove_dir(real.join("parent-state")).unwrap();
+        }
+        assert!(listing(&real).is_empty());
+    }
+    let mut input = inputs(root.path());
+    input.worker.state_dir = alias.join("worker");
+    assert!(Resident::start(&config(), input).await.is_err());
+    assert!(listing(&real).is_empty());
+    // The same directories named without the alias start.
+    let mut input = inputs(root.path());
+    input.state_dir = real.join("parent-state");
+    input.worker.state_dir = real.join("worker");
+    drop(Resident::start(&config(), input).await.unwrap());
+    assert!(real.join("parent-state/coordinator.db").exists());
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn resident_startup_does_not_block_the_executor_during_git_preflight() {
     use std::io::{Read, Write};

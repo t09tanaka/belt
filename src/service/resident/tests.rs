@@ -80,25 +80,35 @@ impl WorkerLink for Slow {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn slow_collection_does_not_block_lease_renewals_and_shutdown_preserves_unknown() {
-    collection_shutdown_fixture(false, false, false).await;
+    collection_shutdown_fixture(false, false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn shutdown_drains_log_append_and_commit_before_releasing_owner() {
-    collection_shutdown_fixture(true, false, false).await;
+    collection_shutdown_fixture(true, false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gc_pin_contention_keeps_resident_ipc_and_lease_renewal_alive() {
-    collection_shutdown_fixture(false, true, false).await;
+    collection_shutdown_fixture(false, true, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn input_gc_blocking_page_keeps_ipc_renewals_and_owner_until_stop_drain() {
-    collection_shutdown_fixture(false, false, true).await;
+    collection_shutdown_fixture(false, false, true, false).await;
 }
 
-async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool, input_pause: bool) {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn result_gc_claim_that_cannot_be_deleted_keeps_the_resident_and_its_work_running() {
+    collection_shutdown_fixture(false, false, false, true).await;
+}
+
+async fn collection_shutdown_fixture(
+    append_bytes: bool,
+    gc_contention: bool,
+    input_pause: bool,
+    gc_stuck: bool,
+) {
     let root = crate::test_tmp::prefixed("rtr-clocks-").unwrap();
     let mut config = crate::config::resolve(&crate::config::Inputs {
         overlay: &crate::config::Overlay::default(),
@@ -265,6 +275,22 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool, in
         resident.captured.retention_test.fast();
         resident.captured.sources.pause_retention_page()
     });
+    // Two runs have a durable deletion claim, which the loop replays even
+    // while its clock is quarantined. One can never be finished: its attempt
+    // directory became a link, which deletion does not follow.
+    let stuck = gc_stuck.then(|| {
+        let expired =
+            || result_retention::tests::claimed(resident.coordinator.store(), &resident.files).1;
+        let directory = |attempt: &AttemptId| state.join("results").join(attempt.as_str());
+        let (stuck, other) = (directory(&expired()), directory(&expired()));
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("kept"), b"outside").unwrap();
+        std::fs::rename(&stuck, root.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, &stuck).unwrap();
+        resident.captured.retention_test.fast();
+        (stuck, other, outside)
+    });
     let input_sources = resident.captured.sources.clone();
     let client = resident.client();
     let guard = gc_contention.then(|| resident.coordinator.store().result_gc_guard(&run).unwrap());
@@ -281,7 +307,18 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool, in
         .await
         .unwrap();
     }
-    if gc_contention || input_pause.is_some() {
+    if let Some((_, other, _)) = &stuck {
+        // The other run is collected only after the stuck one has failed at
+        // least one page or was passed by the cursor; both must keep going.
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while other.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("result GC of the other run stopped");
+    }
+    if gc_contention || input_pause.is_some() || gc_stuck {
         tokio::time::timeout(Duration::from_secs(4), async {
             while slow.renewals.load(Ordering::SeqCst) < 2 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -419,6 +456,19 @@ async fn collection_shutdown_fixture(append_bytes: bool, gc_contention: bool, in
         .unwrap()
         .unwrap()
         .unwrap();
+    if let Some((stuck, _, outside)) = &stuck {
+        // The resident ended by the shutdown above, not by the failing page,
+        // and the claim's data is where it was.
+        assert!(std::fs::symlink_metadata(stuck)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read(outside.join("kept")).unwrap(), b"outside");
+        assert_eq!(
+            std::fs::read(root.path().join("moved/logs/stdout.log")).unwrap(),
+            b"retained"
+        );
+    }
     let record = CoordinatorStore::open_read_only(&state)
         .unwrap()
         .get_attempt(&slow.active.attempt_id)
@@ -739,6 +789,72 @@ pub(super) async fn delivery_resident(root: &Path) -> Resident {
 /// `path` is the tool search path of the worker profile. Every worker
 /// inspection measures the native tools found there, one bounded subprocess
 /// each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resident_starts_on_a_registration_marker_left_with_two_names_and_repairs_it() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let secrets = root.path().join("parent/secrets");
+    let marker = secrets.join("parent-retention.json");
+    let launch = |resident: Resident| async move {
+        let client = resident.client();
+        let runner = tokio::spawn(resident.run());
+        (client, runner)
+    };
+    let wait = |what: &'static str, done: Box<dyn Fn() -> bool + Send>| async move {
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out: {what}"));
+    };
+    // A first life registers the parent Vault: pin first, then the marker.
+    let resident = delivery_resident_on(root.path(), "/usr/bin:/bin").await;
+    resident.captured.retention_test.fast();
+    let (client, runner) = launch(resident).await;
+    let published = marker.clone();
+    wait(
+        "the marker is published",
+        Box::new(move || published.exists()),
+    )
+    .await;
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    runner.await.unwrap().unwrap();
+    // As if that registration had died between its link and its unlink.
+    let orphan = secrets.join(format!(".parent-retention.json.{}.tmp", ulid::Ulid::new()));
+    std::fs::hard_link(&marker, &orphan).unwrap();
+    let bytes = std::fs::read(&marker).unwrap();
+    // The resident and the command-line input path both open this Vault.
+    assert!(crate::secrets::vault::Vault::open(&root.path().join("parent")).is_ok());
+    let resident = delivery_resident_on(root.path(), "/usr/bin:/bin").await;
+    // Starting read the marker and removed nothing.
+    assert!(orphan.exists());
+    assert_eq!(std::fs::metadata(&marker).unwrap().nlink(), 2);
+    resident.captured.retention_test.fast();
+    let (client, runner) = launch(resident).await;
+    let leftover = orphan.clone();
+    wait(
+        "the Vault page removes the temporary name",
+        Box::new(move || !leftover.exists()),
+    )
+    .await;
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    runner.await.unwrap().unwrap();
+    assert_eq!(std::fs::metadata(&marker).unwrap().nlink(), 1);
+    assert_eq!(std::fs::read(&marker).unwrap(), bytes);
+    let mut names: Vec<_> = std::fs::read_dir(&secrets)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    assert_eq!(names, ["parent-retention.json", "retention.lock"]);
+}
 async fn delivery_resident_on(root: &Path, path: &str) -> Resident {
     crate::secrets::key::init(&root.join("key")).unwrap();
     let config = crate::config::resolve(&crate::config::Inputs {
@@ -1731,8 +1847,17 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
     let _source_gc_pin = resident.captured.sources.mutation_guard().unwrap();
     let before_rows = rows(&coordinator);
     let before_sources = files(&root.path().join("parent/sources"));
-    let before_traffic = files(&root.path().join("worker/traffic"));
+    let traffic = root.path().join(".local/state/task-traffic-controller");
+    let before_traffic = files(&traffic);
     let before_epoch = coordinator.epoch();
+    // Every read asks the worker's inspection, which runs a subprocess per
+    // tool and lasts a third of a second at best. On a loaded machine a read
+    // can take longer than the production wait of one second, and the worker
+    // is then left out as unreached: this test is about what the reads
+    // preserve, not about that wait.
+    coordinator
+        .scheduler()
+        .set_forecast_wait_for_test(Duration::from_secs(60));
     let runner = tokio::spawn(resident.run());
     // One read holds its worker inspection for a live CPU sample of 300 ms
     // (task-traffic-controller), so 200 reads one after another cannot take
@@ -1823,7 +1948,7 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
     assert_eq!(before_generation, gate.generation());
     assert_eq!(before_readiness, gate.snapshot());
     assert_eq!(before_sources, files(&root.path().join("parent/sources")));
-    assert_eq!(before_traffic, files(&root.path().join("worker/traffic")));
+    assert_eq!(before_traffic, files(&traffic));
     assert!(!root.path().join("worker/clones").exists());
     client.request(Operation::Shutdown).await.unwrap();
     tokio::time::timeout(Duration::from_secs(10), runner)

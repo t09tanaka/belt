@@ -133,6 +133,19 @@ pub async fn serve_connection_offering(
                     .await;
                 return;
             }
+            if matches!(&request, crate::wire::Request::EnvSync(_))
+                && !negotiated_features
+                    .iter()
+                    .any(|v| v == crate::wire::ENV_SYNC_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "env_sync was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
             let requires_toolchains = matches!(
                 &request,
                 crate::wire::Request::ResolveToolchains(_)

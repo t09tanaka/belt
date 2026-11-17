@@ -164,6 +164,7 @@ fn register(ctx: &Context, attempt: &AttemptId, work: &Path) -> managed::OwnerGu
         opts: Opts {
             label: None,
             weight: Some(1),
+            parent: None,
             front: false,
             key: None,
             argv: vec!["true".into()],
@@ -251,6 +252,54 @@ fn a06_a_hundred_forecasts_add_no_entry_lease_job_or_reservation() {
     assert_eq!(after.snapshot_digest, ledger_before.snapshot_digest);
 }
 
+/// The CLI (0.9 and later) writes the ledger in the v3 shape while a command
+/// runs nested under another. The forecast must read it, and still change
+/// nothing.
+#[test]
+fn a06_a_ledger_with_a_nested_entry_is_read_and_left_alone() {
+    let f = fx();
+    let state = f.dir.path().join("state");
+    let store = WorkerStore::open(&state, &WorkerId::parse("w-test").unwrap()).unwrap();
+    store.start_agent(1).unwrap();
+    let a = AttemptId::generate();
+    let b = AttemptId::generate();
+    let rec = accept(&store, &b, "work");
+    let ctx = f.ctx();
+    let work = f.dir.path().join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let _guard = register(&ctx, &b, &work);
+    let attempts = store.list_nonterminal().unwrap();
+    assert_eq!(attempts, vec![rec]);
+    let path = ctx.paths.ledger_file();
+    let mut ledger = task_traffic_controller::ledger::Ledger::load(&path).unwrap();
+    let mut nested = ledger.entries[0].clone();
+    nested.id = "cli-nested".into();
+    nested.pid = std::process::id();
+    nested.parent = Some(ledger.entries[0].id.clone());
+    ledger.entries.push(nested);
+    ledger.save(&path).unwrap();
+    assert_eq!(
+        task_traffic_controller::ledger::Ledger::file_format(&path),
+        task_traffic_controller::ledger::NESTED_SCHEMA_VERSION,
+    );
+    let _lease = task_traffic_controller::lock::take_lease(&ctx, "cli-nested").unwrap();
+
+    let traffic_before = tree(&f.traffic());
+    let seen = inspect_with(&ctx, &cfg()).unwrap();
+    assert_eq!(seen.entries.len(), 2);
+    let req = request(
+        plan(&a, vec![node(&a, "main", 10_000)]),
+        vec![plan(&b, vec![node(&b, "work", 20_000)])],
+        1,
+    );
+    answer_with(&ctx, &cfg(), &ident(), &attempts, CoordinatorEpoch(1), &req).unwrap();
+    assert_eq!(
+        tree(&f.traffic()),
+        traffic_before,
+        "the traffic state changed"
+    );
+}
+
 #[test]
 fn a06_a_state_directory_that_does_not_exist_stays_absent() {
     let f = fx();
@@ -309,6 +358,7 @@ fn a08_a_node_is_one_demand_before_it_registers_after_and_once_finished() {
             weight_used: 1,
             contended: false,
             measurement_id: None,
+            extra: Default::default(),
         },
     )
     .unwrap();
@@ -427,6 +477,7 @@ fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
         front: false,
         key: None,
         label: None,
+        parent: None,
         argv: req.argv.clone(),
         cwd: clone.clone(),
         env: None,
@@ -450,6 +501,7 @@ fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
                 weight_used: 1,
                 contended: false,
                 measurement_id: None,
+                extra: Default::default(),
             },
         )
         .unwrap();

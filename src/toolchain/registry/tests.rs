@@ -554,3 +554,91 @@ fn preparation_probe_request_budget_and_replaced_manager_fail_closed() {
         .is_err());
     assert!(!f.state.join("manager-ran").exists());
 }
+
+struct Populate(adapters::InstallPlan);
+impl adapters::AdmittedExecutor for Populate {
+    fn execute(
+        &mut self,
+        _: &adapters::CommandSpec,
+    ) -> Result<adapters::CommandOutput, &'static str> {
+        for (_, probe) in self.0.probes() {
+            std::fs::create_dir_all(probe.program.parent().unwrap()).unwrap();
+            std::fs::write(&probe.program, b"private fake executable").unwrap();
+            std::fs::set_permissions(&probe.program, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        Ok(adapters::CommandOutput {
+            success: true,
+            stdout: b"1.2.3".to_vec(),
+        })
+    }
+}
+
+#[test]
+fn installed_inventory_lists_the_authorized_versions_and_the_ones_present() {
+    let f = Fixture::new(AdapterKind::Nodenv, "node");
+    let registry = f.load().unwrap();
+    let tool = f.config.recipes[0].tool.clone();
+    let before = registry.installed_inventory();
+    assert_eq!(
+        before["node"],
+        InstalledInventory {
+            inventory: vec!["1.2.3".into(), "1.3.0".into()],
+            installed: vec![],
+        }
+    );
+    let request = registry
+        .request(&f.frozen("1.2.3", b"source"), &tool, None)
+        .unwrap();
+    let plan = request.plan(&f.state.join("toolchains")).unwrap();
+    adapters::install_admitted(
+        &plan,
+        &f.state.join("toolchains"),
+        &mut Populate(plan.clone()),
+    )
+    .unwrap();
+    let after = registry.installed_inventory();
+    assert_eq!(after["node"].installed, ["1.2.3"]);
+    assert_eq!(after["node"].inventory.len(), 2);
+}
+
+#[test]
+fn installed_inventory_is_empty_without_recipes() {
+    let f = Fixture::new(AdapterKind::Nodenv, "node");
+    std::fs::remove_file(f.state.join("toolchains.toml")).unwrap();
+    assert!(f.load().unwrap().installed_inventory().is_empty());
+}
+
+#[test]
+fn a_warm_up_request_is_the_install_an_attempt_pinning_the_version_gets() {
+    let f = Fixture::new(AdapterKind::Nodenv, "node");
+    let registry = f.load().unwrap();
+    let tool = f.config.recipes[0].tool.clone();
+    let warm = registry
+        .inventory_request(&tool, &"1.2.3".parse().unwrap())
+        .unwrap();
+    // Another source and another parent profile: the same plan, so the same
+    // singleflight key and the same private location.
+    let attempt = registry
+        .request(&f.frozen("1.2.3", b"some project"), &tool, None)
+        .unwrap();
+    assert_eq!(warm.expected_plan, attempt.expected_plan);
+    assert_ne!(warm.digest(), attempt.digest());
+    let other = registry
+        .inventory_request(&tool, &"1.3.0".parse().unwrap())
+        .unwrap();
+    assert_ne!(other.expected_plan, warm.expected_plan);
+    // Only what the operator authorized.
+    assert_eq!(
+        registry
+            .inventory_request(&tool, &"9.9.9".parse().unwrap())
+            .unwrap_err(),
+        Unavailable::NotInInventory
+    );
+    assert_eq!(
+        registry
+            .inventory_request(&ToolId::parse("rust").unwrap(), &"1.2.3".parse().unwrap())
+            .unwrap_err(),
+        Unavailable::Unsupported
+    );
+}

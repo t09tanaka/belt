@@ -5270,7 +5270,10 @@ fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
         .unwrap();
     drop(guard);
     symlink(outside.path(), files.root().join(a.as_str())).unwrap();
-    assert!(retention::page(&f.store, &files, &mut retention::Cursor::default(), 7).is_err());
+    // The entry cannot be removed through the link: it is counted, stays
+    // pending and is never recorded as done.
+    let report = retention::page(&f.store, &files, &mut retention::Cursor::default(), 7).unwrap();
+    assert_eq!((report.deleted, report.failed), (0, 1));
     assert_eq!(
         std::fs::read(outside.path().join("logs/sentinel")).unwrap(),
         b"safe"

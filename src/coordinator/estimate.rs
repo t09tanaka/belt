@@ -112,7 +112,7 @@ impl Coordinator {
                 let parent_local = &parent_local;
                 let question = async move {
                     let response = tokio::time::timeout(
-                        Duration::from_millis(self.sched.cfg.forecast_wait_ms),
+                        self.sched.forecast_wait(),
                         link.read_only_call(Request::Inspect(crate::wire::InspectRequest {
                             preparation_observations: None,
                             schema_version: SchemaVersion::CURRENT,
@@ -139,7 +139,7 @@ impl Coordinator {
                     let mut bundle_valid = bundle.is_none();
                     if let Some(bundle) = bundle {
                         let response = tokio::time::timeout(
-                            Duration::from_millis(self.sched.cfg.forecast_wait_ms),
+                            self.sched.forecast_wait(),
                             link.read_only_call(Request::ResolveToolchains(crate::wire::ResolveToolchainsRequest {
                                 schema_version: SchemaVersion::CURRENT,
                                 request_id: RequestId::generate(),
@@ -153,6 +153,11 @@ impl Coordinator {
                         &query.requirements,
                         inspect.capabilities.as_ref(),
                         bundle.filter(|_| bundle_valid),
+                    );
+                    unmet = crate::toolchain::envdiff::with_steps(
+                        unmet,
+                        &query.requirements.requires,
+                        inspect.capabilities.as_ref(),
                     );
                     if !bundle_valid {
                         unmet.push("stored frozen toolchains are not proven eligible on this worker".into());
@@ -247,7 +252,7 @@ impl Coordinator {
                     }) };
                     let sent = Instant::now();
                     let answer = tokio::time::timeout(
-                        Duration::from_millis(self.sched.cfg.forecast_wait_ms),
+                        self.sched.forecast_wait(),
                         link.read_only_call(request),
                     )
                     .await;

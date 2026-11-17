@@ -12,7 +12,9 @@
 //!
 //! A check is `ok`, `notice`, `fail` or `not_checked`. Something that could
 //! not be looked at is never `ok`: an unreachable worker fails, and a check
-//! that is not implemented yet is listed as `not_checked`.
+//! that is not implemented yet is listed as `not_checked`. What a person has
+//! to fix fails; what an exec or `workers sync` installs by itself, or what
+//! neither side measures yet, is a `notice` and does not change the exit.
 use super::bootstrap::Spec;
 use super::worker_service::Status;
 use super::workers::{self, Remote, RemoteOutput};
@@ -20,6 +22,7 @@ use crate::{
     error::{ApiError, ErrorCode},
     ids::{ClusterId, WorkerId},
     protocol::ssh::{quote, SshTarget},
+    toolchain::envdiff::{self, Class, EnvReport, Item},
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -208,11 +211,15 @@ pub fn cli_scope_paths(env: &BTreeMap<String, String>) -> (PathBuf, PathBuf) {
     )
 }
 
-/// The scope the worker's supervisors use below its state directory.
-pub fn worker_scope_paths(worker_state: &Path) -> (PathBuf, PathBuf) {
-    let state = worker_state.join("traffic");
-    let config = state.join("config.toml");
-    (state, config)
+/// The scope the worker uses: the task-traffic-controller rule applied to
+/// the environment recorded at install, which is where the worker reads it
+/// from (not from its process environment). An environment that resolves to
+/// no scope is looked at by the command's own rule.
+pub fn worker_scope_paths(recorded: &BTreeMap<String, String>) -> (PathBuf, PathBuf) {
+    match crate::config::traffic::resolve(recorded) {
+        Ok(scope) => (scope.state_dir, scope.config_file),
+        Err(_) => cli_scope_paths(recorded),
+    }
 }
 
 /// The digest task-traffic-controller itself gives an effective configuration.
@@ -299,15 +306,18 @@ fn profile(worker_state: &Path, env: &BTreeMap<String, String>) -> ProfileFacts 
     }
 }
 
-/// Look at this host: `worker_state` is the worker's state directory and
-/// `env` the environment its service runs with.
+/// Look at this host: `worker_state` is the worker's state directory, `env`
+/// the environment its service runs with and `recorded` the environment
+/// recorded at install, which places the task-traffic-controller scope.
 pub fn gather(
     worker_state: &Path,
     env: &BTreeMap<String, String>,
+    recorded: &BTreeMap<String, String>,
     runner: &mut dyn Runner,
 ) -> HostFacts {
-    let (worker_dir, worker_config) = worker_scope_paths(worker_state);
-    let (cli_dir, cli_config) = cli_scope_paths(env);
+    let (worker_dir, worker_config) = worker_scope_paths(recorded);
+    // The command the worker's steps run sees the recorded environment.
+    let (cli_dir, cli_config) = cli_scope_paths(recorded);
     HostFacts {
         schema: 1,
         worker_scope: scope(&worker_dir, &worker_config),
@@ -608,9 +618,14 @@ pub fn host_main() -> i32 {
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
     let answer = super::worker_service::service_view(&env, super::macos::NativeLauncher::default())
-        .map(|(status, state, service_env)| HostAnswer {
+        .map(|(status, state, service_env, recorded)| HostAnswer {
             status,
-            facts: gather(&state, &service_env, &mut SystemRunner::default()),
+            facts: gather(
+                &state,
+                &service_env,
+                &recorded,
+                &mut SystemRunner::default(),
+            ),
         });
     match answer {
         Ok(answer) => {
@@ -722,9 +737,98 @@ pub fn project_checks(notices: Result<&[crate::config::resolve::Notice], String>
     }
 }
 
-/// Where another line's checks join the report (`workers diff`, §22.2).
-/// `None`: this build has none, and the report says so per worker.
+/// Where the checks of `workers diff` (§22.2) join the report: asked once
+/// for every worker that answered. `None` leaves the comparison out, and the
+/// report says so per worker.
 pub type DiffSource<'a> = Option<&'a mut dyn FnMut(&str) -> Vec<Check>>;
+
+/// The difference `workers diff` found for one worker, as checks: one per
+/// item. `same` is ok. Only what a person has to fix fails (`differs`,
+/// `missing`, `manual_required`). `auto_installable` is a notice: an exec's
+/// warm-up and `workers sync` install it. An item neither side measured is a
+/// notice too. A difference that could not be taken at all is a check that
+/// was not made: never a pass, never an empty list.
+pub fn diff_checks(host: &str, measured: Result<&[Item], &str>) -> Vec<Check> {
+    let left_out = |why: &str| {
+        vec![Check::new(
+            host,
+            "environment_diff",
+            Level::NotChecked,
+            workers::strip_control(&format!("the environments were not compared: {why}")),
+        )]
+    };
+    let items = match measured {
+        Ok([]) => return left_out("the comparison listed nothing"),
+        Ok(items) => items,
+        Err(why) => return left_out(why),
+    };
+    items
+        .iter()
+        .map(|item| {
+            let level = match item.class {
+                Class::Same => Level::Ok,
+                Class::AutoInstallable | Class::NotMeasured => Level::Notice,
+                Class::Differs | Class::Missing | Class::ManualRequired => Level::Fail,
+            };
+            let class = serde_json::to_value(item.class)
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let mut detail = format!(
+                "{}: {class} parent={} worker={}",
+                item.subject,
+                item.parent.as_deref().unwrap_or("-"),
+                item.worker.as_deref().unwrap_or("-")
+            );
+            if let Some(steps) = &item.steps {
+                detail.push_str(&format!(" -> {steps}"));
+            }
+            match item.class {
+                Class::AutoInstallable => detail.push_str(&format!(
+                    " (an exec installs it; `remote-task-runner workers sync {host}` installs it now)"
+                )),
+                Class::NotMeasured => detail.push_str(" (not measured yet)"),
+                _ => {}
+            }
+            // Values come from the worker's report.
+            Check::new(
+                host,
+                "environment_diff",
+                level,
+                workers::strip_control(&detail),
+            )
+        })
+        .collect()
+}
+
+/// The parent's own measurement, in the retained service environment and
+/// never in the invoking shell's: the rule `workers diff` follows.
+fn measure_parent(
+    spec: &Spec,
+    collect: impl FnOnce(&Path, &BTreeMap<String, String>) -> Result<EnvReport, String>,
+) -> Result<EnvReport, String> {
+    collect(&spec.worker_state_dir, &spec.env)
+}
+
+/// `workers diff` for one worker, as doctor's checks. `parent` is the
+/// parent's own measurement, taken once for all workers; when it failed no
+/// worker is asked.
+pub fn worker_diff(
+    remote: &mut impl Remote,
+    env: &BTreeMap<String, String>,
+    exe: &Path,
+    parent: Result<&EnvReport, &str>,
+    host: &str,
+) -> Vec<Check> {
+    let items = parent
+        .map_err(|why| format!("the parent's environment could not be measured ({why})"))
+        .and_then(|parent| {
+            workers::fetch_env(remote, env, exe, host)
+                .map(|worker| envdiff::diff(parent, &worker))
+                .map_err(|error| error.message)
+        });
+    diff_checks(host, items.as_deref().map_err(String::as_str))
+}
 
 /// Everything `doctor` looks at. `env` is the invoking environment (it
 /// locates the user configuration); `spec` is the initialized coordinator.
@@ -764,6 +868,7 @@ pub fn run(
     let local = gather(
         &spec.worker_state_dir,
         if retained { &spec.env } else { env },
+        if retained { &spec.env } else { env },
         runner,
     );
     checks.extend(evaluate("parent", &local));
@@ -771,6 +876,7 @@ pub fn run(
     for worker in workers::registrations(env)? {
         let host = worker.id.as_str();
         let looked = look_at_worker(remote, &worker, &cluster);
+        let answered = looked.is_ok();
         match looked {
             Err(reason) => checks.push(Check::new(host, "reachable", Level::Fail, reason)),
             Ok((answer, bridge)) => {
@@ -794,13 +900,20 @@ pub fn run(
                 engines.push((host.to_string(), answer.facts.docker.engine_id.clone()));
             }
         }
-        checks.extend(match diff.as_mut() {
-            Some(source) => source(host),
-            None => vec![Check::new(
+        checks.extend(match (answered, diff.as_mut()) {
+            // Its own check already says why; a second ssh would wait again.
+            (false, _) => vec![Check::new(
                 host,
                 "environment_diff",
                 Level::NotChecked,
-                "workers diff is not part of this build; toolchain and tool differences were not compared",
+                "the worker did not answer; its environment was not compared with the parent's",
+            )],
+            (true, Some(source)) => source(host),
+            (true, None) => vec![Check::new(
+                host,
+                "environment_diff",
+                Level::NotChecked,
+                "the comparison of workers diff was left out; toolchain and tool differences were not compared",
             )],
         });
     }
@@ -880,13 +993,28 @@ pub fn command(json: bool) -> i32 {
             let version = super::worker_service::sha256_file(&exe)
                 .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
             let spec = super::context::runtime_spec(&env)?;
+            // Measured as `workers diff` measures it, once, and only when a
+            // worker answers.
+            let mut parent: Option<Result<EnvReport, String>> = None;
+            let mut source = |host: &str| {
+                let parent = parent.get_or_insert_with(|| {
+                    measure_parent(&spec, crate::toolchain::envreport::collect)
+                });
+                worker_diff(
+                    &mut workers::SshRemote,
+                    &env,
+                    &exe,
+                    parent.as_ref().map_err(String::as_str),
+                    host,
+                )
+            };
             let report = run(
                 &mut workers::SshRemote,
                 &mut SystemRunner::default(),
                 &env,
                 &spec,
                 &version,
-                None,
+                Some(&mut source),
             )?;
             let project = std::env::current_dir()
                 .map_err(|e| e.to_string())

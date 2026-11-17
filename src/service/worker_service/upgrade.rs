@@ -611,6 +611,9 @@ pub(super) fn unsettled_status(paths: &Paths, journal: &Journal) -> anyhow::Resu
         switching_from: Some(switch.from.clone()),
         drained_by_upgrade: journal.drained_by_upgrade,
         switch_running: false,
+        // Nothing of the target version is registered: no scope is claimed.
+        traffic_scope: None,
+        traffic_hold: None,
     })
 }
 

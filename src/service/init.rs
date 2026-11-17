@@ -43,6 +43,9 @@ const ENV: &[&str] = &[
     "LC_ALL",
     "LC_CTYPE",
     "XDG_CONFIG_HOME",
+    // The scope of the task-traffic-controller CLI follows these two, so the
+    // worker takes the values of the user's shell at install or init.
+    "XDG_STATE_HOME",
 ];
 
 #[derive(Clone)]
@@ -63,10 +66,13 @@ struct Paths {
 impl Paths {
     fn resolve(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
         let home = PathBuf::from(env.get("HOME").context("HOME is required")?);
-        resident::validate_components(&home)?;
+        // A relative XDG_CONFIG_HOME is refused here, not silently ignored.
         if let Some(x) = env.get("XDG_CONFIG_HOME") {
             resident::validate_components(Path::new(x))?;
         }
+        // The worker will share the scope of the user's CLI: refuse here, at
+        // install, an environment it would refuse at start.
+        crate::config::traffic::resolve(env).map_err(anyhow::Error::msg)?;
         let user = crate::config::paths::user_config_path(env)?;
         let config = user.parent().context("configuration parent")?.to_owned();
         let root = env
@@ -75,13 +81,19 @@ impl Paths {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/state"))
             .join("rtr");
-        resident::validate_components(&root)?;
+        let services = home.join("Library/LaunchAgents");
+        // Every path that is used is checked, before anything is created. HOME
+        // is judged only through the paths made from it: a state or
+        // configuration directory named by XDG_* stands on its own components.
+        for used in [&services, &config, &root] {
+            resident::validate_components(used)?;
+        }
         Ok(Self {
             state: root.join("coordinator"),
             worker: root.join("local-worker"),
             key: config.join("cluster.key"),
             input: config.join("coordinator.json"),
-            services: home.join("Library/LaunchAgents"),
+            services,
             journal: config.join("init.json"),
             config,
         })
@@ -426,7 +438,7 @@ fn plan(paths: &Paths, j: &Journal) -> anyhow::Result<macos::policy::Plan> {
         .spec
         .env
         .iter()
-        .filter(|(k, _)| k.as_str() != "XDG_CONFIG_HOME")
+        .filter(|(k, _)| !matches!(k.as_str(), "XDG_CONFIG_HOME" | "XDG_STATE_HOME"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     macos::policy::render(&macos::policy::Definition {

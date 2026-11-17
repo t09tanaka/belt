@@ -17,6 +17,8 @@ pub mod submit;
 
 pub mod init;
 
+/// A worker waits here while its commands still run in another scope.
+mod traffic_hold;
 /// Standalone persistent worker role, independent of SSH bridge lifetime.
 pub mod worker;
 

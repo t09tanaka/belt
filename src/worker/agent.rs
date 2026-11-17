@@ -54,6 +54,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod warmup;
+
 /// What an agent is started with. Nothing is read from the process
 /// environment: the boot ID and the supervisor binary are inputs.
 #[derive(Debug, Clone)]
@@ -106,6 +108,9 @@ pub struct AgentConfig {
     /// How long the preparation of one workspace may take before the attempt
     /// fails (the default of the workspace tool: 15 minutes).
     pub prepare_timeout_ms: u64,
+    /// How long a warm-up (`env_sync`) nobody asks about keeps its reference
+    /// to an install.
+    pub warmup_idle_ms: u64,
     /// Supervisor starts that may fail in a row before the agent gives up.
     pub max_spawn_failures: u32,
     /// Attempts in one `list_attempts` answer; more is an error.
@@ -151,6 +156,7 @@ impl AgentConfig {
             max_live_attempts: policy::DEFAULT_MAX_LIVE_ATTEMPTS,
             max_concurrent_prepares: policy::DEFAULT_MAX_PREPARES,
             prepare_timeout_ms: crate::workspace::DEFAULT_PREPARE_TIMEOUT.as_millis() as u64,
+            warmup_idle_ms: 60_000,
             max_spawn_failures: policy::DEFAULT_MAX_SPAWN_FAILURES,
             max_list_attempts: policy::MAX_LIST_ATTEMPTS,
             max_event_scan: policy::MAX_EVENT_SCAN,
@@ -227,6 +233,8 @@ pub struct Agent {
     /// One new acceptance at a time: the live cap and the insert are one step.
     submitting: Mutex<()>,
     ticking: AtomicBool,
+    /// Warm-ups in progress or just answered, by `sync_id`.
+    warmups: Mutex<BTreeMap<String, warmup::Warmup>>,
     /// Directory enumeration continues across bounded terminal cleanup passes.
     cleanup_scan: Mutex<Option<fs::ReadDir>>,
 }
@@ -557,6 +565,7 @@ impl Agent {
             noted: Mutex::default(),
             submitting: Mutex::default(),
             ticking: AtomicBool::new(false),
+            warmups: Mutex::default(),
             cleanup_scan: Mutex::new(None),
         });
         for a in todo {
@@ -1039,6 +1048,15 @@ impl Agent {
         let mut spec: SuperviseSpec = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         spec.deadline_ms = deadline_left_ms;
         spec.lease_seed = Some(seed);
+        // Stored when the attempt was prepared, maybe under another scope.
+        spec.rescope(
+            &self.cfg.traffic_state_dir,
+            self.cfg.traffic_config.as_deref(),
+            self.cfg
+                .capability_profile
+                .as_ref()
+                .map(|profile| profile.scope_environment()),
+        );
         let bytes = serde_json::to_vec(&spec).map_err(|e| e.to_string())?;
         write_atomic(&path, &bytes).map_err(|e| e.to_string())
     }
@@ -1346,13 +1364,9 @@ impl Agent {
                 ws.root.join(rel)
             };
             let env = match &self.cfg.capability_profile {
-                Some(profile) => {
-                    profile.execution_environment(&c.env).map_err(invalid)?;
-                    match binding {
-                        Some(binding) => binding.environment(&c.env).map_err(invalid)?,
-                        None => profile.execution_environment(&c.env).map_err(invalid)?,
-                    }
-                }
+                Some(profile) => profile
+                    .command_environment(binding, &c.env)
+                    .map_err(invalid)?,
                 None => c.env.clone(),
             };
             nodes.push(NodeSpec {
@@ -1958,6 +1972,7 @@ impl Agent {
         }
         let _pass = Ticking(&self.ticking);
         self.apply_control();
+        self.reap_warmups();
         self.supervise_attempts();
         self.clean_ended();
         if let Err(e) = self.gc() {
@@ -2153,7 +2168,8 @@ impl Agent {
                     },
                 ))
             }
-            Request::EnvReport(_) | Request::EnvSync(_) => Err(ApiError::new(
+            Request::EnvSync(r) => self.env_sync(r).map(Response::EnvSync),
+            Request::EnvReport(_) => Err(ApiError::new(
                 ErrorCode::NotImplemented,
                 "this operation is not implemented by the worker agent yet",
             )),
