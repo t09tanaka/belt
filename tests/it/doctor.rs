@@ -209,3 +209,31 @@ fn a_legacy_key_of_the_project_is_noticed() {
         .unwrap()
         .contains("link-node-modules"));
 }
+
+#[test]
+fn a_check_that_was_not_made_is_not_healthy_and_exits_apart_from_a_failure() {
+    let fx = Fx::new();
+    fx.init();
+    // An engine answers, but the client does not say where it connects.
+    tool(
+        &fx,
+        "docker",
+        "case \"$1\" in info) echo ENGINE1;; *) exit 1;; esac",
+    );
+    let out = fx.run(&["doctor"]);
+    let report = json(&out);
+    let domain = check(&report, "parent", "docker_resource_domain");
+    assert_eq!(domain["level"], "not_checked", "{report}");
+    assert!(domain["detail"]
+        .as_str()
+        .unwrap()
+        .contains("could not be determined"));
+    assert_eq!(report["ok"], false);
+    assert_eq!(report["result"]["healthy"], false);
+    assert_eq!(report["result"]["failed"], 0);
+    assert_eq!(report["result"]["not_checked"], 1);
+    assert_eq!(report["error"]["code"], "COMMAND_FAILED");
+    assert!(report["error"].get("blocked_reason").is_none());
+    assert_eq!(out.status.code(), Some(1));
+    assert_ne!(ErrorCode::Blocked.exit_code(), 1);
+}

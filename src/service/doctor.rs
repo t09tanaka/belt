@@ -361,6 +361,29 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
             format!("{} knows managed entries", cli.path),
         ),
     });
+    // A job started by an older command keeps running that older code
+    // whatever the PATH resolves now. Such a job leaves state in the
+    // command's scope, so without a command and without state there is
+    // none; otherwise the processes would have to be examined, and are not.
+    out.push(if cli_present {
+        check(
+            "traffic_processes",
+            Level::NotChecked,
+            format!(
+                "running task-traffic-controller processes are not examined ({}); a job started by an older build may still be running",
+                match facts.cli_scope.ledger_entries {
+                    Some(n) => format!("{n} entries in the command's ledger"),
+                    None => "the command's ledger is unreadable".into(),
+                }
+            ),
+        )
+    } else {
+        check(
+            "traffic_processes",
+            Level::Ok,
+            "no separate task-traffic-controller command or state, so none of its jobs can be running".into(),
+        )
+    });
     let same_scope = facts.worker_scope.state_dir == facts.cli_scope.state_dir
         && facts.worker_scope.config_file == facts.cli_scope.config_file;
     out.push(if same_scope {
@@ -449,6 +472,13 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
             Level::Notice,
             format!("{cli} is installed but no engine answered in the service environment"),
         ),
+        (Some(_), Some(engine)) if facts.docker.endpoint.is_none() => check(
+            "docker_resource_domain",
+            Level::NotChecked,
+            format!(
+                "engine {engine} answered, but where the docker client connects could not be determined (no DOCKER_HOST and no single endpoint from `docker context inspect`); it is not confirmed to be on this host"
+            ),
+        ),
         (Some(_), Some(engine)) => check(
             "docker_resource_domain",
             Level::Ok,
@@ -508,12 +538,19 @@ pub fn shared_engines(hosts: &[(String, Option<String>)]) -> Vec<Check> {
 /// digest of the binary that runs `doctor`.
 pub fn service_checks(host: &str, status: &Status, parent_version: &str) -> Vec<Check> {
     let short = |digest: &str| digest.get(..12).unwrap_or(digest).to_string();
-    let service = if status.switching_from.is_some() {
+    let service = if status.switch_running {
+        Check::new(
+            host,
+            "service",
+            Level::NotChecked,
+            "a version switch is running on the host; run doctor again when it has finished",
+        )
+    } else if status.switching_from.is_some() {
         Check::new(
             host,
             "service",
             Level::Fail,
-            "a version switch is unfinished; run workers upgrade",
+            "a version switch is unfinished or awaits its commit; run workers upgrade",
         )
     } else {
         match (status.loaded, status.ready) {
@@ -620,7 +657,8 @@ fn parse_answer(output: &RemoteOutput) -> Result<HostAnswer, String> {
 
 #[derive(Debug, Serialize)]
 pub struct Report {
-    /// No check failed. `not_checked` entries are listed, not counted as passed.
+    /// No check failed and none was left out. A check that was not made is
+    /// not a pass: with any `not_checked` entry the report is not healthy.
     pub healthy: bool,
     pub failed: usize,
     pub not_checked: usize,
@@ -631,11 +669,31 @@ impl Report {
         let count = |level| checks.iter().filter(|c| c.level == level).count();
         let failed = count(Level::Fail);
         Report {
-            healthy: failed == 0,
+            healthy: failed == 0 && count(Level::NotChecked) == 0,
             failed,
             not_checked: count(Level::NotChecked),
             checks,
         }
+    }
+    /// Why the command does not exit 0, if it does not. A failed check is
+    /// `BLOCKED`. A report with nothing failed but something left out exits
+    /// differently (1), so a caller can tell "wrong" from "not known".
+    pub fn problem(&self) -> Option<(ErrorCode, String)> {
+        if self.failed > 0 {
+            return Some((
+                ErrorCode::Blocked,
+                format!("{} check(s) failed", self.failed),
+            ));
+        }
+        (self.not_checked > 0).then(|| {
+            (
+                ErrorCode::CommandFailed,
+                format!(
+                    "{} check(s) were not made; nothing failed, but the report is incomplete",
+                    self.not_checked
+                ),
+            )
+        })
     }
 }
 
@@ -810,7 +868,8 @@ fn text(report: &Report) -> String {
     out
 }
 
-/// The `doctor` command. Exit 0 only when no check failed.
+/// The `doctor` command. Exit 0 only when no check failed and none was left
+/// out; a failed check and a check that was not made exit differently.
 pub fn command(json: bool) -> i32 {
     let env: BTreeMap<String, String> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
@@ -843,8 +902,8 @@ pub fn command(json: bool) -> i32 {
             ));
             Ok(Report::of(checks))
         });
-    match result {
-        Ok(report) if report.healthy => {
+    match result.map(|report| (report.problem(), report)) {
+        Ok((None, report)) => {
             if json {
                 println!(
                     "{}",
@@ -855,16 +914,20 @@ pub fn command(json: bool) -> i32 {
             }
             crate::cli::exit::SUCCESS
         }
-        Ok(report) => {
-            let code = ErrorCode::Blocked;
+        Ok((Some((code, message)), report)) => {
             if json {
+                let mut error = serde_json::json!({"code": code, "message": message});
+                if code == ErrorCode::Blocked {
+                    error["blocked_reason"] =
+                        serde_json::json!(crate::error::BlockedReason::EnvironmentMismatch);
+                }
                 println!(
                     "{}",
-                    serde_json::json!({"schema_version":1,"ok":false,"error":{"code":code,"blocked_reason":crate::error::BlockedReason::EnvironmentMismatch,"message":format!("{} check(s) failed", report.failed)},"result":report})
+                    serde_json::json!({"schema_version":1,"ok":false,"error":error,"result":report})
                 );
             } else {
                 println!("{}", text(&report));
-                eprintln!("error: {} check(s) failed", report.failed);
+                eprintln!("error: {message}");
             }
             code.exit_code()
         }

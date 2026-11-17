@@ -1096,17 +1096,18 @@ S23 の残り（必須。この変更で S23 は完了しない）:
 
 ### S23 doctor（2026-11-17）
 
-`doctor` を CLI へ接続した（`src/service/doctor.rs`）。各 host は事実だけを集め、判定は親が 1 か所（`evaluate`・`shared_engines`・`service_checks`）で行う。worker host の事実は hidden の `worker-service doctor` が、journal に記録した service の環境（LaunchAgent に渡した env。`XDG_CONFIG_HOME` を除く）で集める。親自身の local worker は `coordinator.json` に保持した env で調べ、保持が無ければ呼び出した shell の env で調べたことを notice として出す。check の結果は `ok`・`notice`・`fail`・`not_checked` の 4 つで、見られなかったものを `ok` にしない。1 つでも `fail` があれば exit は BLOCKED（`blocked_reason = environment_mismatch`）で、`--json` は `result` に全 check を載せる。
+`doctor` を CLI へ接続した（`src/service/doctor.rs`）。各 host は事実だけを集め、判定は親が 1 か所（`evaluate`・`shared_engines`・`service_checks`）で行う。worker host の事実は hidden の `worker-service doctor` が、journal に記録した service の環境（LaunchAgent に渡した env。`XDG_CONFIG_HOME` を除く）で集める。親自身の local worker は `coordinator.json` に保持した env で調べ、保持が無ければ呼び出した shell の env で調べたことを notice として出す。check の結果は `ok`・`notice`・`fail`・`not_checked` の 4 つで、見られなかったものを `ok` にしない。`healthy` は `fail` も `not_checked` も 1 つも無いときだけ true である。1 つでも `fail` があれば exit は BLOCKED（`blocked_reason = environment_mismatch`）、`fail` は無いが `not_checked` があれば exit 1（`COMMAND_FAILED`、`blocked_reason` なし）で、両者を exit code で区別できる（仕様に doctor の exit code の定めは無い）。`--json` はどの場合も `result` に全 check を載せる。
 
 | check | 内容 | fail にする条件 |
 |---|---|---|
 | `traffic_runtime` | service の PATH が解決する `task-traffic-controller` に `status --json` を尋ね、`ledger_format`（managed entry を知っている binary だけが出す field）の有無を見る | field が無い（未修正の binary）、答えが読めない。command が無ければ ok |
 | `traffic_state_path` | worker の scope（`<state>/traffic`）と、その環境で command が使う scope（XDG、無ければ HOME の下）を比べる | scope が違い、かつ command が導入済みか state を残している。どちらも無ければ notice |
 | `traffic_policy` | 両 scope の実効 config の digest（task-traffic-controller 自身の `policy_digest` と同じ計算）を比べる | digest が違い command がある、config が読めない |
-| `docker_resource_domain` | service の環境の docker client の接続先と engine ID | 接続先が unix socket / pipe 以外（別 host の engine）。engine が答えなければ notice、client が無ければ ok |
+| `traffic_processes` | 実行中の task-traffic-controller process（旧い build が起動した job）の検査。この build では実装していない | fail にしない。command があるか state が残っていれば `not_checked`（ledger の entry 数を添える）。どちらも無ければ ok |
+| `docker_resource_domain` | service の環境の docker client の接続先と engine ID | 接続先が unix socket / pipe 以外（別 host の engine）。engine が答えなければ notice、client が無ければ ok。engine は答えたが接続先が分からない（`DOCKER_HOST` が無く `docker context inspect` が 1 行を返さない）ときは `not_checked` |
 | `docker_shared_engine` | 親と全 worker の engine ID を突き合わせる | 同じ engine を 2 host 以上が使う（両方に fail） |
 | `service_profile` | service の環境で worker profile を load し、起動時と同じ probe を通す | load できない |
-| `reachable`・`service`・`version`・`bridge`（worker のみ） | ssh で helper が答えるか、service が loaded / ready か、版が親と同じか、登録済み binary 経由の `hello` が同じ cluster と worker_id で完了するか（必須 feature の交渉を含む） | 到達不能・別 identity の答え・未 load・切替が未完・hello 失敗。版の違いと drain 中は notice |
+| `reachable`・`service`・`version`・`bridge`（worker のみ） | ssh で helper が答えるか、service が loaded / ready か、版が親と同じか、登録済み binary 経由の `hello` が同じ cluster と worker_id で完了するか（必須 feature の交渉を含む） | 到達不能・別 identity の答え・未 load・切替が未完または commit 待ち・hello 失敗。版の違いと drain 中は notice。host が切替中（`switch_running`）なら `service` は `not_checked` |
 | `legacy_config`（project） | 実行した directory の project の `.local-ci.toml` に、値のある未対応 key（`link-node-modules` など）があれば notice | fail にしない。config を解決できなければ `not_checked` |
 | `environment_diff`（worker ごと） | S21（`workers diff`）の差し込み口。`doctor::run` の `diff` 引数に worker 名から check を返す関数を渡すと、その結果が入る | この build では `not_checked` として列挙する |
 
@@ -1114,8 +1115,10 @@ S23 の残り（必須。この変更で S23 は完了しない）:
 
 S23 の残り（必須。この変更でも S23 は完了しない）:
 1. **A05 の「同じ budget・policy を共有」は、現状の既定では成り立っていない。** worker の supervisor は `<state>/traffic` を scope にしており（`AgentConfig::new`。設定項目は無い）、同じ user の `task-traffic-controller` command の scope（`~/.local/state/task-traffic-controller`）とは別の ledger になる。doctor はこれを、command が導入済みの host では `traffic_state_path` の fail として報告する（command を日常的に使う host では doctor が必ず fail する）。scope を揃える変更は S9a / S10 の範囲で、ここでは行っていない。A05 はそれが決まるまで未達である。
-2. 「実行中 process」の検査は、command の scope の ledger にある entry 数を示すだけで、process の走査はしていない。
-3. S21 の `workers diff` の結果は差し込み口のみ（`not_checked`）。S21 が main に入ったあと、`doctor::command` が `run` に渡す `diff` を `None` から置き換える。
+2. 「実行中 process」の検査（仕様の既存 state との互換の節）は未実装で、`traffic_processes` を `not_checked` として出す（process の走査はしていない）。command を導入した host では doctor は exit 0 にならない。
+3. S21 の `workers diff` の結果は差し込み口のみ（`not_checked`）。S21 が main に入ったあと、`doctor::command` が `run` に渡す `diff` を `None` から置き換える。それまで、worker を登録した親では doctor は exit 0 にならない（exit 1。`fail` があれば BLOCKED）。
 4. Linux の linger の確認（仕様 §15）と、system-user mode（LaunchDaemon の `UserName`）の service user での profile 検査は未実装（S24・S22 の残り）。前者は report に項目として出していない。
 5. 本物の docker・実 SSH・実機の launchd 環境での doctor（A35 の「実際の service 環境で doctor が通る」）は未実施（S26）。偽の runner と偽の ssh は実挙動を確かめない。
 6. 親の local worker の service 環境は、`coordinator.json` の env が空のとき呼び出し shell の env で代用する（notice を出す）。
+7. レビュー指摘の残り: worker の task-traffic-controller の scope（M4。上の 1）は別の変更で worker 側を CLI と同じ規則に揃える。doctor の判定は変えていない。profile と command の検査は ssh の helper が journal の env で行い、launchd のドメインや Keychain の可否は再現しない（L3）。実際の launchd 環境での検査は S26 の実機受入の残件とする。
+8. doctor は resident の build・feature と各 worker の照合をしていない（`workers upgrade` は行う）。bridge の `hello` は doctor を実行した binary の必須 feature で行う。

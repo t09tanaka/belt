@@ -348,15 +348,21 @@ fn a_host_that_fits_together_passes_every_check() {
         checks.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
         [
             "traffic_runtime",
+            "traffic_processes",
             "traffic_state_path",
             "traffic_policy",
             "docker_resource_domain",
             "service_profile"
         ]
     );
-    assert!(checks
-        .iter()
-        .all(|c| c.level == Level::Ok && c.host == "mini-a"));
+    // Everything that was looked at passes; what was not is said, not passed.
+    assert!(checks.iter().all(|c| c.host == "mini-a"
+        && c.level
+            == if c.id == "traffic_processes" {
+                Level::NotChecked
+            } else {
+                Level::Ok
+            }));
     assert!(detail(&checks, "service_profile").contains("default (sha256:f)"));
     assert!(detail(&checks, "docker_resource_domain").contains("E1"));
 }
@@ -468,7 +474,16 @@ fn a_docker_engine_on_another_host_is_a_domain_this_version_does_not_manage() {
     let checks = evaluate("mini-a", &facts);
     assert_eq!(level(&checks, "docker_resource_domain"), Level::Notice);
     assert!(detail(&checks, "docker_resource_domain").contains("no engine answered"));
+    // An engine that answers through an endpoint nobody could name is not
+    // "on this host": the current context may point anywhere.
     facts.docker.engine_id = Some("E".into());
+    let checks = evaluate("mini-a", &facts);
+    assert_eq!(level(&checks, "docker_resource_domain"), Level::NotChecked);
+    assert!(
+        detail(&checks, "docker_resource_domain").contains("engine E answered")
+            && detail(&checks, "docker_resource_domain").contains("could not be determined")
+    );
+    facts.docker.endpoint = Some("unix:///var/run/docker.sock".into());
     assert_eq!(
         level(&evaluate("mini-a", &facts), "docker_resource_domain"),
         Level::Ok
@@ -534,6 +549,8 @@ fn status(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
         live_attempts: Some(0),
         bridge_binary: Some("/w/bin/current/remote-task-runner".into()),
         switching_from: None,
+        drained_by_upgrade: false,
+        switch_running: false,
     }
 }
 
@@ -555,6 +572,17 @@ fn the_service_check_says_what_the_host_showed() {
     let checks = service_checks("mini-a", &switching, &me);
     assert_eq!(level(&checks, "service"), Level::Fail);
     assert!(detail(&checks, "service").contains("unfinished"));
+    // While a switch runs, what the status shows is about to change.
+    switching.switch_running = true;
+    let checks = service_checks("mini-a", &switching, &me);
+    assert_eq!(level(&checks, "service"), Level::NotChecked);
+    assert!(detail(&checks, "service").contains("a version switch is running"));
+    let mut running = status(Some(true), true, false);
+    running.switch_running = true;
+    assert_eq!(
+        level(&service_checks("mini-a", &running, &me), "service"),
+        Level::NotChecked
+    );
     // Another build is worth saying, not a failure.
     let checks = service_checks("mini-a", &status(Some(true), true, false), &"b".repeat(64));
     assert_eq!(level(&checks, "version"), Level::Notice);
@@ -833,10 +861,28 @@ fn every_registered_worker_is_asked_through_its_registered_binary() {
         let slot = of(&report, host, "environment_diff");
         assert_eq!(slot.level, Level::NotChecked);
     }
-    assert!(report.healthy);
-    assert_eq!((report.failed, report.not_checked), (0, 2));
+    // Nothing failed, and the report is still not healthy: checks are missing.
+    assert!(!report.healthy);
+    let left_out = |id: &str| {
+        report
+            .checks
+            .iter()
+            .filter(|c| c.level == Level::NotChecked && c.id == id)
+            .count()
+    };
+    assert_eq!(left_out("environment_diff"), 2);
+    assert_eq!(
+        (report.failed, report.not_checked),
+        (
+            0,
+            left_out("environment_diff") + left_out("traffic_processes")
+        )
+    );
+    let (code, message) = report.problem().unwrap();
+    assert_eq!(code, ErrorCode::CommandFailed);
+    assert!(message.starts_with(&format!("{} check(s) were not made", report.not_checked)));
     let json = serde_json::to_value(&report).unwrap();
-    assert_eq!(json["healthy"], true);
+    assert_eq!(json["healthy"], false);
     assert_eq!(json["checks"][0]["level"], "notice");
     assert!(json["checks"]
         .as_array()
@@ -848,7 +894,8 @@ fn every_registered_worker_is_asked_through_its_registered_binary() {
     assert!(printed.contains("[ok] mini-b bridge: "));
     assert!(printed.contains("[notice] parent service_environment: "));
     assert!(printed.ends_with(&format!(
-        "0 failed, 2 not checked, {} checks",
+        "0 failed, {} not checked, {} checks",
+        report.not_checked,
         report.checks.len()
     )));
 }
@@ -970,10 +1017,12 @@ fn another_line_can_put_its_checks_where_the_slot_is() {
         (check.level, check.detail.as_str()),
         (Level::Fail, "node differs")
     );
-    assert_eq!(
-        (report.failed, report.not_checked, report.healthy),
-        (1, 0, false)
-    );
+    assert_eq!((report.failed, report.healthy), (1, false));
+    assert!(!report
+        .checks
+        .iter()
+        .any(|c| c.id == "environment_diff" && c.level == Level::NotChecked));
+    assert_eq!(report.problem().unwrap().0, ErrorCode::Blocked);
 }
 
 #[test]
@@ -1097,4 +1146,63 @@ fn the_worker_scope_is_the_one_the_agent_gives_its_supervisors() {
     // No separate configuration file is set: the default lies in the scope.
     assert_eq!(agent.traffic_config, None);
     assert_eq!(config, agent.traffic_state_dir.join("config.toml"));
+}
+
+#[test]
+fn a_report_is_healthy_only_when_nothing_failed_and_nothing_was_left_out() {
+    let check = |level| Check::new("h", "c", level, "d");
+    let report = Report::of(vec![check(Level::Ok), check(Level::Notice)]);
+    assert!(report.healthy);
+    assert_eq!(report.problem(), None);
+    // One check that was not made is enough, and it is not called a failure.
+    let report = Report::of(vec![check(Level::Ok), check(Level::NotChecked)]);
+    assert!(!report.healthy);
+    assert_eq!((report.failed, report.not_checked), (0, 1));
+    assert_eq!(
+        report.problem(),
+        Some((
+            ErrorCode::CommandFailed,
+            "1 check(s) were not made; nothing failed, but the report is incomplete".into()
+        ))
+    );
+    // A failure is the answer whatever else is missing.
+    let report = Report::of(vec![
+        check(Level::Fail),
+        check(Level::NotChecked),
+        check(Level::Fail),
+    ]);
+    assert!(!report.healthy);
+    assert_eq!(
+        report.problem(),
+        Some((ErrorCode::Blocked, "2 check(s) failed".into()))
+    );
+    assert_ne!(
+        ErrorCode::Blocked.exit_code(),
+        ErrorCode::CommandFailed.exit_code()
+    );
+    let report = Report::of(vec![check(Level::Fail)]);
+    assert!(!report.healthy && report.not_checked == 0);
+}
+
+#[test]
+fn running_processes_of_the_command_are_said_to_be_unexamined() {
+    // The command is installed: its jobs may run, and nobody looked.
+    let mut facts = healthy();
+    facts.cli_scope.ledger_entries = Some(3);
+    let checks = evaluate("mini-a", &facts);
+    assert_eq!(level(&checks, "traffic_processes"), Level::NotChecked);
+    assert!(detail(&checks, "traffic_processes").contains("are not examined (3 entries"));
+    facts.cli_scope.ledger_entries = None;
+    assert!(detail(&evaluate("mini-a", &facts), "traffic_processes").contains("unreadable"));
+    // No command, but it left state behind: the same.
+    facts.cli = None;
+    assert_eq!(
+        level(&evaluate("mini-a", &facts), "traffic_processes"),
+        Level::NotChecked
+    );
+    // Neither a command nor state: there is nothing that could be running.
+    facts.cli_scope.in_use = false;
+    let checks = evaluate("mini-a", &facts);
+    assert_eq!(level(&checks, "traffic_processes"), Level::Ok);
+    assert!(detail(&checks, "traffic_processes").contains("none of its jobs can be running"));
 }
