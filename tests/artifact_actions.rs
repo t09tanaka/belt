@@ -1657,7 +1657,11 @@ fn an_external_artifact_host_finishes_the_step_only_after_its_receipt() {
             self.entered
                 .send((req.workflow.to_owned(), req.step_index, note.clone()))
                 .unwrap();
-            self.reply.lock().unwrap().recv().unwrap()?;
+            self.reply
+                .lock()
+                .unwrap()
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .map_err(|e| format!("test host did not receive the parent decision: {e}"))??;
             Ok(note)
         }
     }
