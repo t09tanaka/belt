@@ -676,13 +676,6 @@ mod tests {
         }
     }
 
-    fn skipped(computed: Computed, source: &Source<'_>, lookup: &Lookup<'_>) -> String {
-        match decide(computed, source, lookup) {
-            Decision::Skip(why) => why,
-            Decision::Post(post) => panic!("posted {post:?}"),
-        }
-    }
-
     #[test]
     fn a_run_of_exactly_what_the_commit_holds_is_posted_to_it() {
         for (computed, state) in [
@@ -713,8 +706,8 @@ mod tests {
         };
         for computed in [Computed::Success, Computed::Failure, Computed::Error] {
             assert_eq!(
-                skipped(computed, &dirty, &lookup()),
-                "the run tested uncommitted or synthetic content (source src_1), not what 0123456 holds"
+                decide(computed, &dirty, &lookup()),
+                Decision::Skip("the run tested uncommitted or synthetic content (source src_1), not what 0123456 holds".into())
             );
         }
         let submodule = Source {
@@ -722,32 +715,34 @@ mod tests {
             ..source()
         };
         assert_eq!(
-            skipped(Computed::Success, &submodule, &lookup()),
-            "the run tested a submodule with uncommitted content (source src_1)"
+            decide(Computed::Success, &submodule, &lookup()),
+            Decision::Skip(
+                "the run tested a submodule with uncommitted content (source src_1)".into()
+            )
         );
         let directory = Source {
             original_head: None,
             ..source()
         };
         assert_eq!(
-            skipped(Computed::Success, &directory, &lookup()),
-            "the run tested a directory snapshot, not a commit"
+            decide(Computed::Success, &directory, &lookup()),
+            Decision::Skip("the run tested a directory snapshot, not a commit".into())
         );
         let no_tree = Source {
             worktree_tree: None,
             ..source()
         };
         assert_eq!(
-            skipped(Computed::Success, &no_tree, &lookup()),
-            "the run recorded no tree of its input"
+            decide(Computed::Success, &no_tree, &lookup()),
+            Decision::Skip("the run recorded no tree of its input".into())
         );
         let unknown = Lookup {
             tree_of_head: None,
             ..lookup()
         };
         assert_eq!(
-            skipped(Computed::Success, &source(), &unknown),
-            "0123456 is not a commit of this repository"
+            decide(Computed::Success, &source(), &unknown),
+            Decision::Skip("0123456 is not a commit of this repository".into())
         );
     }
 
@@ -757,22 +752,25 @@ mod tests {
             enabled: false,
             ..lookup()
         };
-        assert_eq!(skipped(Computed::Success, &source(), &off), "--no-status");
         assert_eq!(
-            skipped(Computed::Cancelled, &source(), &lookup()),
-            "the run is cancelled"
+            decide(Computed::Success, &source(), &off),
+            Decision::Skip("--no-status".into())
         );
         assert_eq!(
-            skipped(Computed::Pending, &source(), &lookup()),
-            "the run is pending"
+            decide(Computed::Cancelled, &source(), &lookup()),
+            Decision::Skip("the run is cancelled".into())
+        );
+        assert_eq!(
+            decide(Computed::Pending, &source(), &lookup()),
+            Decision::Skip("the run is pending".into())
         );
         let local = Lookup {
             repository: Err("no origin remote"),
             ..lookup()
         };
         assert_eq!(
-            skipped(Computed::Success, &source(), &local),
-            "no origin remote"
+            decide(Computed::Success, &source(), &local),
+            Decision::Skip("no origin remote".into())
         );
     }
 
@@ -787,25 +785,30 @@ mod tests {
             ..lookup()
         };
         assert_eq!(
-            skipped(Computed::Success, &source, &unknown),
-            "abc is not a commit of this repository"
+            decide(Computed::Success, &source, &unknown),
+            Decision::Skip("abc is not a commit of this repository".into())
         );
     }
 
     fn post() -> Post {
-        match decide(Computed::Success, &source(), &lookup()) {
-            Decision::Post(post) => post,
-            Decision::Skip(why) => panic!("{why}"),
+        Post {
+            repository: "owner/name".into(),
+            sha: HEAD.into(),
+            state: "success",
+            context: "local-ci".into(),
+            description: "tested".into(),
         }
     }
 
     #[test]
     fn the_outcome_says_posted_skipped_or_failed_and_posts_at_most_once() {
         let mut calls = Vec::new();
-        let posted = outcome(Decision::Post(post()), |request| {
+        let mut record = |request: &Post| {
             calls.push(request.clone());
             Ok(())
-        });
+        };
+        let posted = outcome(Decision::Post(post()), &mut record);
+        let skipped = outcome(Decision::Skip("why".into()), record);
         assert_eq!(calls, [post()]);
         assert_eq!(
             posted,
@@ -815,9 +818,6 @@ mod tests {
                 context: "local-ci".into(),
             }
         );
-        let skipped = outcome(Decision::Skip("why".into()), |_| {
-            panic!("a skipped decision posts nothing")
-        });
         assert_eq!(
             skipped,
             Posting::Skipped {
