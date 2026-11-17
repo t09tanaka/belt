@@ -13,6 +13,19 @@ pub struct RunPin {
     exclusive: bool,
 }
 
+impl Drop for RunPin {
+    fn drop(&mut self) {
+        // A concurrent fork in this process (a supervisor spawn) can retain this
+        // open file description until its exec. Closing the descriptor alone
+        // would then keep the flock, and the next nonblocking GC pass or reader
+        // would see a spurious WouldBlock. Unlock explicitly, like the source
+        // mutation guard does.
+        use std::os::fd::AsRawFd;
+        // SAFETY: flock only borrows this live descriptor.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 fn checked(file: &File, path: &Path) -> io::Result<()> {
     let a = file.metadata()?;
     let b = fs::symlink_metadata(path)?;
@@ -139,6 +152,21 @@ mod tests {
         drop(gc);
         RunPin::ensure(dir.path(), &run).unwrap();
         assert_eq!(fs::metadata(path).unwrap().ino(), inode);
+    }
+    #[test]
+    fn a_dropped_pin_releases_its_lock_while_a_forked_copy_of_the_descriptor_lives() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let run = RunId::generate();
+        RunPin::ensure(dir.path(), &run).unwrap();
+        for exclusive in [false, true] {
+            let pin = RunPin::acquire(dir.path(), &run, exclusive).unwrap();
+            // What a child forked by a parallel thread holds until its exec.
+            let inherited = pin._file.try_clone().unwrap();
+            drop(pin);
+            let gc = RunPin::exclusive(dir.path(), &run).unwrap();
+            drop(gc);
+            drop(inherited);
+        }
     }
     #[test]
     #[ignore = "owned subprocess helper"]

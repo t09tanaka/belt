@@ -175,7 +175,7 @@ pub fn upgrade<L: Launcher>(
     options: Options,
     hook: Hook,
 ) -> anyhow::Result<Status> {
-    let paths = Paths::resolve(env)?;
+    let paths = Paths::resolve_for(env, launcher.backend())?;
     let _lock = exclusive_lock(&paths)?;
     let mut journal = require_journal(&paths)?;
     check_request(&journal, request)?;
@@ -312,7 +312,7 @@ pub fn rollback<L: Launcher>(
     options: Options,
     hook: Hook,
 ) -> anyhow::Result<Status> {
-    let paths = Paths::resolve(env)?;
+    let paths = Paths::resolve_for(env, launcher.backend())?;
     let _lock = exclusive_lock(&paths)?;
     let journal = require_journal(&paths)?;
     check_request(&journal, request)?;
@@ -559,7 +559,7 @@ pub fn commit<L: Launcher>(
     request: &SwitchRequest,
     mut launcher: L,
 ) -> anyhow::Result<Status> {
-    let paths = Paths::resolve(env)?;
+    let paths = Paths::resolve_for(env, launcher.backend())?;
     let _lock = exclusive_lock(&paths)?;
     let mut journal = require_journal(&paths)?;
     check_request(&journal, request)?;

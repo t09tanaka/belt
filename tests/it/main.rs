@@ -14,6 +14,7 @@ mod coordinator;
 mod doctor;
 mod forecast;
 mod not_implemented;
+mod one_host;
 mod protocol;
 mod scheduler;
 mod secrets;
@@ -34,6 +35,7 @@ mod bootstrap;
 
 mod init;
 
+mod worker_ephemeral;
 mod worker_role;
 
 mod remote_links;

@@ -13,6 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
 
+pub mod ephemeral;
+
 const LIMIT: u64 = 262_144;
 const ENV: &[&str] = &[
     "HOME",
@@ -302,7 +304,13 @@ impl Drop for Worker {
     }
 }
 
-async fn run(spec: WorkerSpec, config: config::ResolvedConfig) -> anyhow::Result<()> {
+/// `boot_id` replaces the OS boot identity: a worker that has no boot of its
+/// own to be told apart by (an ephemeral one) names its start instead.
+async fn run(
+    spec: WorkerSpec,
+    config: config::ResolvedConfig,
+    boot_id: Option<WorkerBootId>,
+) -> anyhow::Result<()> {
     let owner = private_lock(&spec.state_dir, "worker-owner.lock")?;
     // Serialize enrollment against every Agent, including the combined resident.
     // Transfer the same descriptor into Agent; enrollment through DB open has no unlock gap.
@@ -311,8 +319,14 @@ async fn run(spec: WorkerSpec, config: config::ResolvedConfig) -> anyhow::Result
     // Enrollment is checked before any recorded old listener can be removed.
     bind(&spec)?;
     reconcile_socket(&spec, &socket)?;
-    let boot = crate::platform::boot_id()
-        .ok_or_else(|| anyhow::anyhow!("OS boot identity unavailable"))?;
+    let boot = match boot_id {
+        Some(boot) => boot,
+        None => {
+            let os = crate::platform::boot_id()
+                .ok_or_else(|| anyhow::anyhow!("OS boot identity unavailable"))?;
+            WorkerBootId::parse(&os)?
+        }
+    };
     let settings = config.runtime_settings()?;
     // Commands of this worker that still run in another scope: wait for
     // them, not serving, instead of failing into a restart loop.
@@ -322,7 +336,7 @@ async fn run(spec: WorkerSpec, config: config::ResolvedConfig) -> anyhow::Result
     let runtime = config.worker_runtime(WorkerInputs {
         state_dir: spec.state_dir.clone(),
         worker_id: spec.worker_id.clone(),
-        boot_id: WorkerBootId::parse(&boot)?,
+        boot_id: boot,
         supervisor_exe: spec.executable.clone(),
         cluster_key_path: spec.cluster_key_path.clone(),
         env: spec.env.clone(),
@@ -422,7 +436,7 @@ pub fn main(input: &Path) -> i32 {
         tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()?
-            .block_on(run(spec, config))
+            .block_on(run(spec, config, None))
     })();
     match result {
         Ok(()) => 0,

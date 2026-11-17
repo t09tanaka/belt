@@ -127,7 +127,9 @@ mod tests {
         (root, store)
     }
     fn entered(store: &SourceStore) {
-        let until = Instant::now() + Duration::from_secs(1);
+        // Only a bound for a broken test: the waiter thread may need a long
+        // time to be scheduled under load, and a pass returns at once.
+        let until = Instant::now() + Duration::from_secs(30);
         while store.foreground_wait_count() == 0 {
             assert!(
                 Instant::now() < until,
@@ -205,28 +207,47 @@ mod tests {
         assert!(!vault.has(&run));
         assert_eq!(std::fs::read(input.join("sentinel")).unwrap(), b"unchanged");
     }
+    /// The tests that change the lock while a waiter holds the old inode give
+    /// the waiter far more than the production [`WAIT`]: the budget there is
+    /// meant for a request, while here the test thread must first be scheduled
+    /// (coverage-instrumented, many tests in parallel) before it changes the
+    /// lock, and a waiter that timed out first would fail for a reason that has
+    /// nothing to do with the lock check under test.
+    const TEST_WAIT: Duration = Duration::from_secs(60);
     #[test]
     fn foreground_wait_rejects_replaced_permanent_lock_instead_of_reopening() {
         let (_root, store) = store();
         let _exclusive = store.retention.guard(true).unwrap();
         std::thread::scope(|scope| {
-            let waiting = scope.spawn(|| store.foreground_guard());
+            let waiting = scope.spawn(|| store.retention.foreground_guard_for(TEST_WAIT));
             entered(&store);
             let lock = store.root().join("mutation.lock");
-            let retained = store.root().join("old-mutation.lock");
-            std::fs::rename(&lock, &retained).unwrap();
+            let replacement = store.root().join("replacement-mutation.lock");
             let file = std::fs::OpenOptions::new()
                 .create_new(true)
                 .write(true)
                 .mode(0o600)
-                .open(&lock)
+                .open(&replacement)
                 .unwrap();
             drop(file);
+            // One atomic swap: the name is never absent, so the waiter cannot
+            // observe a half-replaced lock and fail with some other error.
+            let swap = || {
+                rustix::fs::renameat_with(
+                    rustix::fs::CWD,
+                    &lock,
+                    rustix::fs::CWD,
+                    &replacement,
+                    rustix::fs::RenameFlags::EXCHANGE,
+                )
+                .unwrap()
+            };
+            swap();
             let error = waiting.join().unwrap().unwrap_err();
             assert!(!error.is::<ForegroundBusy>());
             assert!(format!("{error:#}").contains("source lock changed"));
-            std::fs::remove_file(&lock).unwrap();
-            std::fs::rename(retained, lock).unwrap();
+            swap();
+            std::fs::remove_file(&replacement).unwrap();
         });
     }
     #[test]
@@ -235,7 +256,7 @@ mod tests {
             let (root, store) = store();
             let _exclusive = store.retention.guard(true).unwrap();
             std::thread::scope(|scope| {
-                let waiting = scope.spawn(|| store.foreground_guard());
+                let waiting = scope.spawn(|| store.retention.foreground_guard_for(TEST_WAIT));
                 entered(&store);
                 if drift == "root replacement" {
                     std::fs::rename(store.root(), root.path().join("old-sources")).unwrap();

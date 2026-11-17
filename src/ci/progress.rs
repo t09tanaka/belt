@@ -13,9 +13,17 @@
 //! they ended, and the core of the plan evaluates the job's `if:` on the
 //! worker from the inputs (`success()` by default, `failure()`, `always()`):
 //! a job that is not to run comes back as `skipped` without a step started.
-//! Matrix variants, dynamic matrices and shards are the driver's.
+//! Matrix variants and dynamic matrices are the driver's.
+//!
+//! The shards of a split job are tasks like the others, placed side by side.
+//! The job they are has one outcome, made when the last of them ended
+//! ([`super::shards::join`]): only then do the jobs that need it get its
+//! result. With fail-fast, a shard that failed makes the host stop the
+//! shards that have not ended ([`ActionKind::Cancel`]).
 
-use local_ci::dag::ExecutionTask;
+use super::shards;
+use local_ci::dag::{ExecutionTask, ShardGroup};
+use local_ci::shard::ShardOutcome;
 use local_ci::task::{JobOutcome, JobStatus, TaskInputs};
 use local_ci::{FrozenPlan, WireTaskResult};
 use std::collections::{BTreeMap, BTreeSet};
@@ -48,6 +56,9 @@ pub enum Input {
 pub enum ActionKind {
     /// The task may be placed, with these inputs.
     Ready { task: String, inputs: TaskInputs },
+    /// The task is to be stopped (cancelled where it runs, never placed
+    /// where it does not yet): a shard of its job failed.
+    Cancel { task: String, reason: String },
     /// Every task of the run ended.
     Finished,
 }
@@ -85,20 +96,19 @@ pub trait Progression {
 /// Why a plan cannot be run by [`NeedsProgression`] (and by the workers of
 /// this build), or `None`.
 pub fn unsupported(plan: &FrozenPlan) -> Option<String> {
-    plan.tasks.iter().find_map(|t| {
+    let task = plan.tasks.iter().find_map(|t| {
         let what = if t.variant.is_some() {
             "is a variant of a matrix"
         } else if t.dynamic_matrix {
             "has a matrix that is an expression"
-        } else if t.shard.is_some() {
-            "is a shard of a split job"
         } else if !t.services.is_empty() {
             "has service containers"
         } else {
             return None;
         };
         Some(format!("task `{}` {what}", t.id))
-    })
+    });
+    task.or_else(|| shards::shape_fault(plan))
 }
 
 /// The `needs` of the plan as a DAG over its tasks.
@@ -108,6 +118,18 @@ pub struct NeedsProgression {
     settled: BTreeMap<String, Vec<JobOutcome>>,
     /// The tasks a `Ready` action was made for.
     readied: BTreeSet<String>,
+    /// The split jobs of the plan.
+    groups: Vec<ShardGroup>,
+    /// What the tests of each shard that ended with a result did.
+    receipts: BTreeMap<String, ShardOutcome>,
+    /// The one outcome of each split job whose shards all ended.
+    joins: BTreeMap<String, JobOutcome>,
+    /// What is wrong with the shards of such a job taken together.
+    diagnostics: BTreeMap<String, String>,
+    /// The shards of such a job a retry of the run runs again.
+    reruns: BTreeMap<String, Vec<String>>,
+    /// The shards a `Cancel` action was made for.
+    stopped: BTreeSet<String>,
     cancelled: bool,
     finished: bool,
     actions: Vec<Action>,
@@ -128,6 +150,17 @@ impl NeedsProgression {
             tasks: plan.tasks.clone(),
             settled: BTreeMap::new(),
             readied: BTreeSet::new(),
+            groups: plan
+                .shard_groups
+                .iter()
+                .filter(|g| g.split)
+                .cloned()
+                .collect(),
+            receipts: BTreeMap::new(),
+            joins: BTreeMap::new(),
+            diagnostics: BTreeMap::new(),
+            reruns: BTreeMap::new(),
+            stopped: BTreeSet::new(),
             cancelled: false,
             finished: false,
             actions: Vec::new(),
@@ -147,17 +180,109 @@ impl NeedsProgression {
             .is_ok_and(|t| t.depends_on.iter().all(|d| self.settled.contains_key(d)))
     }
 
+    /// What is wrong with the shards of the split job `group` together
+    /// (a failed test, a test that is missing or there twice, a shard
+    /// without a result), once all of them ended. `None` when nothing is.
+    pub fn split_job_problems(&self, group: &str) -> Option<&str> {
+        self.diagnostics.get(group).map(String::as_str)
+    }
+
+    /// The shards of the split job `group` that a retry of the run runs
+    /// again although their attempts may have succeeded
+    /// ([`shards::rerun`]); none before the job has its outcome.
+    pub fn split_job_rerun(&self, group: &str) -> &[String] {
+        self.reruns.get(group).map_or(&[], Vec::as_slice)
+    }
+
     pub fn is_settled(&self, task: &str) -> bool {
         self.settled.contains_key(task)
     }
 
+    fn group_of(&self, task: &str) -> Option<&ShardGroup> {
+        self.groups
+            .iter()
+            .find(|g| g.shards.iter().any(|s| s == task))
+    }
+
+    /// The outcomes of the jobs the tasks `ids` are: those of a task that
+    /// ended, and for the shards of a split job the one outcome of the job,
+    /// once, when all of them ended.
+    fn jobs_of<'a, 'b>(&'a self, ids: impl Iterator<Item = &'b String>) -> Vec<&'a JobOutcome> {
+        let mut joined = BTreeSet::new();
+        let mut out = Vec::new();
+        for id in ids {
+            match self.group_of(id) {
+                Some(group) if joined.insert(&group.id) => out.extend(self.joins.get(&group.id)),
+                Some(_) => {}
+                None => out.extend(self.settled.get(id).into_iter().flatten()),
+            }
+        }
+        out
+    }
+
     /// The outcomes of the jobs of the tasks `task` depends on.
     fn needs_of(&self, task: &ExecutionTask) -> Vec<&JobOutcome> {
-        task.depends_on
-            .iter()
-            .filter_map(|d| self.settled.get(d))
-            .flatten()
-            .collect()
+        self.jobs_of(task.depends_on.iter())
+    }
+
+    /// Give every split job whose shards all ended its one outcome, and
+    /// stop the shards a failed one stops.
+    fn settle_groups(&mut self) {
+        for group in &self.groups {
+            let all_ended = group.shards.iter().all(|s| self.settled.contains_key(s));
+            if all_ended && !self.joins.contains_key(&group.id) {
+                let parts: Vec<JobOutcome> = group
+                    .shards
+                    .iter()
+                    .filter_map(|s| self.settled.get(s))
+                    .flatten()
+                    .cloned()
+                    .collect();
+                let receipts: Vec<ShardOutcome> = group
+                    .shards
+                    .iter()
+                    .filter_map(|s| self.receipts.get(s))
+                    .cloned()
+                    .collect();
+                let job = shards::join(group, &parts, &receipts);
+                let verified: Vec<bool> = group
+                    .shards
+                    .iter()
+                    .enumerate()
+                    .map(|(at, s)| {
+                        let outcomes = self.settled.get(s).map_or(&[][..], Vec::as_slice);
+                        shards::verified(group, at, outcomes, self.receipts.get(s))
+                    })
+                    .collect();
+                let rerun = shards::rerun(group, &verified, job.status);
+                self.reruns.insert(group.id.clone(), rerun);
+                self.joins.insert(group.id.clone(), job);
+                let problems = shards::problems(group, &parts, &receipts);
+                if let Some(why) = shards::diagnostic(&problems) {
+                    self.diagnostics.insert(group.id.clone(), why);
+                }
+            }
+            let failed: BTreeMap<String, bool> = group
+                .shards
+                .iter()
+                .filter_map(|s| Some((s, self.settled.get(s)?)))
+                .map(|(s, outcomes)| {
+                    let failed = shards::shard_failed(outcomes, self.receipts.get(s));
+                    (s.clone(), failed)
+                })
+                .collect();
+            for task in shards::to_cancel(group, &failed) {
+                if self.stopped.insert(task.clone()) {
+                    self.actions.push(Action {
+                        id: format!("cancel:{task}"),
+                        kind: ActionKind::Cancel {
+                            task,
+                            reason: shards::FAIL_FAST_REASON.into(),
+                        },
+                    });
+                }
+            }
+        }
     }
 
     fn unsettled(&self, task: &str) -> Result<&ExecutionTask, ProgressError> {
@@ -169,6 +294,7 @@ impl NeedsProgression {
     }
 
     fn advance(&mut self) {
+        self.settle_groups();
         let ready: Vec<(String, TaskInputs)> = self
             .tasks
             .iter()
@@ -176,7 +302,7 @@ impl NeedsProgression {
             .filter(|t| !self.readied.contains(&t.id) && !self.settled.contains_key(&t.id))
             .filter(|t| t.depends_on.iter().all(|d| self.settled.contains_key(d)))
             .map(|t| {
-                let finished = self.settled.values().flatten();
+                let finished = self.jobs_of(self.tasks.iter().map(|t| &t.id));
                 (
                     t.id.clone(),
                     TaskInputs::new(self.needs_of(t), finished, false),
@@ -248,6 +374,9 @@ impl Progression for NeedsProgression {
                 if let Some(why) = result_fault(found, &result) {
                     return Err(ProgressError::Result { task, why });
                 }
+                if let Some(receipt) = shards::receipt(found, &result) {
+                    self.receipts.insert(task.clone(), receipt.clone());
+                }
                 self.settled.insert(task, result.outcomes);
             }
             Input::Fence {
@@ -276,11 +405,9 @@ impl Progression for NeedsProgression {
     }
 
     fn outcome(&self, workflow: &str, job: &str) -> Option<&JobOutcome> {
-        self.tasks
-            .iter()
-            .filter(|t| t.workflow == workflow)
-            .filter_map(|t| self.settled.get(&t.id))
-            .flatten()
+        let of = self.tasks.iter().filter(|t| t.workflow == workflow);
+        self.jobs_of(of.map(|t| &t.id))
+            .into_iter()
             .find(|o| o.job == job)
     }
 }
@@ -320,7 +447,7 @@ mod tests {
             .iter()
             .filter_map(|a| match &a.kind {
                 ActionKind::Ready { task, .. } => Some(task.clone()),
-                ActionKind::Finished => None,
+                ActionKind::Cancel { .. } | ActionKind::Finished => None,
             })
             .collect()
     }
@@ -418,7 +545,8 @@ mod tests {
         })
         .unwrap();
         assert_eq!(ready(&p), [id("report")]);
-        let ActionKind::Ready { inputs, .. } = &p.pending_actions()[0].kind else {
+        let last = p.pending_actions().last().unwrap();
+        let ActionKind::Ready { inputs, .. } = &last.kind else {
             panic!()
         };
         assert_eq!(inputs.needs.len(), 2, "only the jobs it needs directly");
@@ -583,5 +711,193 @@ mod tests {
             NeedsProgression::new(&plan).err(),
             Some(ProgressError::UnknownTask("gone".into()))
         );
+        // A shard that is not what its split job names.
+        let mut plan = crate::ci::shards::tests::split_plan(false);
+        assert_eq!(unsupported(&plan), None);
+        let at = plan.tasks.iter().position(|t| t.shard.is_some()).unwrap();
+        plan.tasks[at].shard.as_mut().unwrap().count = 9;
+        let why = unsupported(&plan).unwrap();
+        assert!(why.contains("is not shard"), "{why}");
+    }
+
+    use crate::ci::shards::tests::{group, receipt_of, split_plan};
+    use local_ci::shard::TestStatus;
+
+    fn cancels(p: &NeedsProgression) -> Vec<(String, String)> {
+        p.pending_actions()
+            .iter()
+            .filter_map(|a| match &a.kind {
+                ActionKind::Cancel { task, reason } => Some((task.clone(), reason.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn shard_result(plan: &FrozenPlan, at: usize, status: JobStatus, tests: TestStatus) -> Input {
+        let g = group(plan);
+        let mut result = result(&g.shards[at], vec![outcome("test", status)]);
+        result.shard = Some(receipt_of(g, at, tests));
+        Input::Settle {
+            task: g.shards[at].clone(),
+            result,
+        }
+    }
+
+    #[test]
+    fn the_shards_of_a_job_start_together_and_the_job_has_its_outcome_when_all_ended() {
+        let plan = split_plan(false);
+        let g = group(&plan).clone();
+        let report = task_of(&plan, "report").to_string();
+        let mut p = NeedsProgression::new(&plan).unwrap();
+        p.step(Input::Advance).unwrap();
+        // Both shards may be placed at once; what needs the job waits.
+        assert_eq!(ready(&p), g.shards);
+        ack_all(&mut p);
+
+        p.step(shard_result(
+            &plan,
+            0,
+            JobStatus::Success,
+            TestStatus::Passed,
+        ))
+        .unwrap();
+        // One shard is not the job: nothing is published, nothing is ready.
+        assert!(p.pending_actions().is_empty());
+        assert_eq!(p.outcome(&g.workflow, "test"), None);
+        assert!(!p.dependencies_settled(&report));
+
+        p.step(shard_result(
+            &plan,
+            1,
+            JobStatus::Success,
+            TestStatus::Passed,
+        ))
+        .unwrap();
+        let job = p.outcome(&g.workflow, "test").unwrap().clone();
+        assert_eq!(job.status, JobStatus::Success);
+        assert_eq!(p.split_job_problems(&g.id), None);
+        assert!(p.split_job_rerun(&g.id).is_empty());
+        assert_eq!(job.outputs["v"], "1");
+        let actions = p.pending_actions().to_vec();
+        assert_eq!(actions.len(), 1);
+        let ActionKind::Ready { task, inputs } = &actions[0].kind else {
+            panic!("{actions:?}")
+        };
+        assert_eq!(task, &report);
+        // The job is there once, as the one job it is.
+        let expected = TaskInputs::new([&job], [&job], false);
+        assert_eq!(inputs, &expected);
+        assert!(cancels(&p).is_empty());
+    }
+
+    #[test]
+    fn shards_that_passed_are_still_a_failed_job_when_a_test_is_missing() {
+        let plan = split_plan(false);
+        let g = group(&plan).clone();
+        let mut p = NeedsProgression::new(&plan).unwrap();
+        p.step(shard_result(
+            &plan,
+            0,
+            JobStatus::Success,
+            TestStatus::Passed,
+        ))
+        .unwrap();
+        // The second shard says it passed, but leaves no receipt of its
+        // tests (or one of another shard, which does not count).
+        let mut forged = result(&g.shards[1], vec![outcome("test", JobStatus::Success)]);
+        forged.shard = Some(receipt_of(&g, 0, TestStatus::Passed));
+        p.step(Input::Settle {
+            task: g.shards[1].clone(),
+            result: forged,
+        })
+        .unwrap();
+        let job = p.outcome(&g.workflow, "test").unwrap();
+        assert_eq!(job.status, JobStatus::Failure);
+        let why = job.skipped.clone().unwrap();
+        assert!(why.contains("missing: shard"), "{why}");
+        assert_eq!(p.split_job_problems(&g.id), Some(why.as_str()));
+        // The shard without a receipt of its own is the one to run again.
+        assert_eq!(p.split_job_rerun(&g.id), [g.shards[1].clone()]);
+        assert!(p.split_job_rerun("another").is_empty());
+        assert_eq!(p.split_job_problems("another"), None);
+        // What needs the job is given the failure.
+        let last = p.pending_actions().last().unwrap();
+        let ActionKind::Ready { inputs, .. } = &last.kind else {
+            panic!()
+        };
+        let expected = TaskInputs::new([job], [job], false);
+        assert_eq!(inputs, &expected);
+    }
+
+    #[test]
+    fn with_fail_fast_a_failed_shard_stops_the_ones_that_have_not_ended_once() {
+        let plan = split_plan(true);
+        let g = group(&plan).clone();
+        let mut p = NeedsProgression::new(&plan).unwrap();
+        p.step(Input::Advance).unwrap();
+        ack_all(&mut p);
+        p.step(shard_result(
+            &plan,
+            0,
+            JobStatus::Failure,
+            TestStatus::Failed,
+        ))
+        .unwrap();
+        assert_eq!(
+            cancels(&p),
+            [(
+                g.shards[1].clone(),
+                crate::ci::shards::FAIL_FAST_REASON.to_string()
+            )]
+        );
+        assert_eq!(p.pending_actions()[0].id, format!("cancel:{}", g.shards[1]));
+        // Asked once, however often the run is looked at.
+        ack_all(&mut p);
+        p.step(Input::Advance).unwrap();
+        assert!(p.pending_actions().is_empty());
+        // The stopped shard ends without a result: the job is a failure,
+        // and what needs it goes on.
+        p.step(Input::Fence {
+            task: g.shards[1].clone(),
+            status: JobStatus::Cancelled,
+            reason: "cancelled".into(),
+        })
+        .unwrap();
+        let job = p.outcome(&g.workflow, "test").unwrap();
+        assert_eq!(job.status, JobStatus::Failure);
+        assert_eq!(ready(&p), [task_of(&plan, "report").to_string()]);
+
+        // A shard that fails only by its tests (the job step did not fail)
+        // stops the others too; one that passed stops nothing.
+        let mut p = NeedsProgression::new(&plan).unwrap();
+        p.step(shard_result(
+            &plan,
+            1,
+            JobStatus::Success,
+            TestStatus::Failed,
+        ))
+        .unwrap();
+        assert_eq!(cancels(&p).len(), 1);
+        assert_eq!(cancels(&p)[0].0, g.shards[0]);
+        let mut p = NeedsProgression::new(&plan).unwrap();
+        p.step(shard_result(
+            &plan,
+            1,
+            JobStatus::Success,
+            TestStatus::Passed,
+        ))
+        .unwrap();
+        assert!(cancels(&p).is_empty());
+        // Without fail-fast the other shard goes on.
+        let plain = split_plan(false);
+        let mut p = NeedsProgression::new(&plain).unwrap();
+        p.step(shard_result(
+            &plain,
+            0,
+            JobStatus::Failure,
+            TestStatus::Failed,
+        ))
+        .unwrap();
+        assert!(cancels(&p).is_empty());
     }
 }

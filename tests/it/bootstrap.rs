@@ -1080,7 +1080,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
         !log.is_empty(),
         "collected masked stdout must survive workspace cleanup"
     );
-    let sources = remote_task_runner::source::SourceStore::open(&spec.state_dir).unwrap();
+    let sources = open_sources(&spec.state_dir);
     let id =
         remote_task_runner::ids::RunId::parse(value["result"]["run_id"].as_str().unwrap()).unwrap();
     let ci = sources.source_of_run(&id).unwrap().unwrap();
@@ -1380,6 +1380,28 @@ fn command_commit_capture_requires_and_preserves_explicit_revision() {
     );
 }
 
+/// Opens the source store of a state directory a daemon is running on. The open
+/// is nonblocking by design and the daemon takes the exclusive source guard for
+/// its retention passes, so a test that looks at the store while the daemon is
+/// up sees a transient `WouldBlock`; only a guard that stays held fails it.
+fn open_sources(state: &std::path::Path) -> remote_task_runner::source::SourceStore {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        match remote_task_runner::source::SourceStore::open(state) {
+            Err(error)
+                if std::time::Instant::now() < deadline
+                    && error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::WouldBlock)
+                    }) =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            other => return other.unwrap(),
+        }
+    }
+}
 fn control_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
     let (root, spec) = fixture();
     let config = root.path().join(".config/remote-task-runner");
@@ -1781,8 +1803,12 @@ async fn control_exec_succeeded_compute_but_missing_collection_exits_78() {
             when: remote_task_runner::config::model::OutputWhen::Always,
         });
     let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    // The outer bound must exceed the 20s the exec itself allows for the
+    // resident to start (and the run after it): with an equal bound a slow
+    // start on a loaded or instrumented runner trips this unwrap before the
+    // exec can report anything.
     let report = tokio::time::timeout(
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         control::exec(
             context,
             vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
@@ -1938,7 +1964,7 @@ async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
         panic!("{replay:?}")
     };
     assert_eq!(serde_json::to_value(replayed).unwrap(), receipt);
-    let sources = remote_task_runner::source::SourceStore::open(&spec.state_dir).unwrap();
+    let sources = open_sources(&spec.state_dir);
     let source = sources.source_of_run(&run).unwrap().unwrap();
     let manifest = sources.manifest(&source).unwrap().unwrap();
     let blob = &manifest.object_manifest.entries[0].hash;
@@ -2682,7 +2708,7 @@ async fn in_place_exec_updates_original_directory_and_retries_mutable_input_afte
     let public = serde_json::to_string(&store.query_task(task).unwrap()).unwrap();
     assert!(public.contains("\"in_place\":true"));
     assert!(!public.contains(input.to_str().unwrap()));
-    let source = remote_task_runner::source::SourceStore::open(&spec.state_dir).unwrap();
+    let source = open_sources(&spec.state_dir);
     let source_id = source.source_of_run(&run).unwrap().unwrap();
     let manifest = source.manifest(&source_id).unwrap().unwrap();
     let baseline = input.parent().unwrap().join("baseline-check");

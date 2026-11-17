@@ -165,6 +165,89 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A48 | S7 | |
 | A49 | S13（配置）・S27（設定） | |
 
+### S25: 1 台上の試験ハーネスと A01〜A49 の自動試験の対応（2026-11-17）
+
+上の表は担当行を示す。この表は、各 A を今どの自動試験が確かめているか、何が S26（Docker・実機）に残るか、どの A は担当行が未了で試験が無いかを示す。「自動試験」の列の試験は、試験名と冒頭の説明を仕様 §19 の期待結果と突き合わせて選んだ。期待結果の一部しか試験が無いと分かった A は「一部」にした。assert まで読んだのは `one_host` の全件と A16・A33・A49 の試験で、A05・A26・A42 は試験の説明とこの計画の該当節を読んだ。ほかの行は試験名と説明までで、S26 の受入で期待結果の句ごとに確かめ直す。試験名は代表で、同じ A を確かめる試験がほかにもある。
+
+ハーネスは `tests/it/one_host.rs` にある。1 つの親（`Coordinator`）と、worker ごとに別の state directory・別の supervisor process・別の protocol 接続を持つ本物の agent を、1 つの試験 process の中に立てる。既存の fixture（`worker_agent::Fx`、`coordinator` の `spec`・`only`・`Lost` など）を使い、別の仕組みは作っていない。障害の注入口は 3 つで、どれも試験 crate の中にあり、library と release binary には注入用のコードを足していない。
+
+| 注入口 | 内容 |
+|---|---|
+| `Faults::lose` / `Faults::offline` | 親と 1 worker の間で、指定した操作の request か応答を 1 回失う。または link を切ったままにする。親・agent の再起動で接続を作り直しても同じ設定が続く |
+| `Faults::skew_wall` | worker の壁時計が親とずれている状態を作る。worker が返す時刻（receipt の時刻と `spawned_at_ms`）を、親が受け取る前にずらす |
+| `Kill`（`Agent`・`Supervisor`・`Machine`）と親の drop | agent だけを止めて起動し直す、attempt の supervisor を kill する、worker の process をすべて止めて別の boot ID で起動する、親を落として次の epoch で開き直す |
+
+時計について: 判断に使う単調時計（`platform::monotonic_ms`）を差し替える口は作っていない。呼び出しが 20 ファイル以上にあり、差し替えるには本体に試験用の経路を足す必要があるためである。単調時計の側は、時刻を引数で受ける純粋関数（`supervisor/lease.rs`、`results/clock_policy.rs`）の単体試験が担う。実際の sleep は実機に残る。
+
+区分の意味:
+
+- **自動**: 実機が無くても確かめられる範囲を、自動試験がすべて確かめている。
+- **自動＋残り**: 1 台で確かめられる範囲は自動試験にある。残りは S26（Docker・実機）か、他リポジトリの試験が担う。
+- **一部**: 自動試験は一部だけで、残りは担当行が未了、または試験が無い。
+- **未実装**: 担当行が未了で、期待結果を確かめる試験が無い。
+- **S26**: 実際のプロジェクトと複数 host が要り、ここでは試験しない。
+
+| A | 区分 | 自動試験（代表） | 残り |
+|---|---|---|---|
+| A01 | 自動＋残り | `scheduler::a01_tasks_given_to_no_host_run_on_the_parent_and_on_both_children`、`one_host::a01_three_real_workers_on_one_machine_each_run_one_of_three_tasks` | 別 host の worker（S26 の Docker） |
+| A02 | 自動＋残り | `scheduler::a02_a_worker_that_joins_takes_the_backlog_the_parent_kept`、`one_host::a02_a_real_worker_that_joins_later_starts_the_backlog_the_parent_kept` | 別 host の worker（S26 の Docker） |
+| A03 | 自動 | `scheduler::a03_a_busy_worker_beats_a_cold_one_and_the_reason_shows_queue_setup_and_transfer`、`scheduler::a03_a_cold_worker_that_is_set_up_quickly_beats_the_queue` | |
+| A04 | 自動 | `scheduler::a04_submits_from_many_sides_are_decided_one_at_a_time`、`scheduler::a04_a_placement_no_worker_acknowledged_is_counted_by_the_next_decision` | |
+| A05 | 自動 | `doctor::an_unpatched_task_traffic_controller_fails_doctor`、`supervisor::a_real_nested_cli_runs_under_its_step_and_shares_the_ledger`（scope の統一後。S23 doctor の節の「既定では成り立っていない」はその前の記述） | |
+| A06 | 自動 | `forecast::a06_a_hundred_forecasts_add_no_entry_lease_job_or_reservation` | |
+| A07 | 自動 | `a07_ready_delay_queue_and_runtime_make_the_finish`（`src/forecast/mod.rs`） | |
+| A08 | 自動 | `forecast::a08_a_node_is_one_demand_before_it_registers_after_and_once_finished` | |
+| A09 | 自動 | `a09_the_three_cases_stay_distinct` ほか 3 件（`src/forecast/mod.rs`） | |
+| A10 | 一部 | forecast の側: `a10_a_chain_reports_the_end_of_the_last_step`、`a10_parallel_nodes_end_with_the_longest_not_the_sum`（`src/forecast/mod.rs`） | `ci` の実行経路での複数 step・matrix の ETA（S16 が未了） |
+| A11 | 自動 | `source_capture::a11_every_kind_of_change_is_captured_and_unpacks_to_the_same_content` | |
+| A12 | 自動 | `source_capture::a12_an_input_that_keeps_moving_is_source_busy_and_nothing_is_published` | |
+| A13 | 自動 | `source_capture::a13_a_capture_cut_off_before_publication_leaves_nothing_visible_and_resumes_as_the_same_id` | |
+| A14 | 自動 | `source_capture::a14_unpushed_commits_travel_in_a_bundle_and_a_worker_never_fetches_origin`、`a14_a_dirty_submodule_…`、`a14_an_lfs_file_…` | |
+| A15 | 自動 | `setup::each_worker_builds_its_own_template` | |
+| A16 | 自動 | `the_key_changes_with_everything_that_decides_what_is_made`（`src/setup/policy.rs`） | |
+| A17 | 自動 | `setup::building_a_plus_b_leaves_template_a_alone_and_one_cancel_breaks_no_other` | |
+| A18 | 自動 | `worker_agent::a18_an_attempt_resent_100_times_starts_its_command_once` | |
+| A19 | 自動 | `coordinator::a19_the_task_moves_only_after_the_retire_and_the_late_submit_is_refused`、`worker_agent::a19_a_submit_that_arrives_after_the_retire_is_refused`、`one_host::a19_a21_a_lost_ack_and_a_gone_link_never_start_the_task_on_the_free_worker` | |
+| A20 | 自動 | `supervisor::after_a_supervisor_crash_the_same_process_is_stopped_and_never_respawned`、`supervisor::a_launch_without_an_identity_is_investigated_not_respawned`、`supervisor::a_crash_between_the_termination_and_the_result_is_completed_by_the_next_start`、`one_host::a20_a_killed_supervisor_ends_the_attempt_once_and_nothing_is_started_again` | |
+| A21 | 自動 | `supervisor::the_supervisor_finishes_the_attempt_after_its_agent_is_killed`、`coordinator::a21_an_attempt_whose_link_is_gone_is_kept_and_followed_again_on_return`、`one_host::a19_a21_…` | |
+| A22 | 自動 | `supervisor::lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it`、`coordinator::a22_after_a_long_stop_the_parent_keeps_unknown_until_the_worker_says_it_stopped` | |
+| A23 | 自動 | `worker_agent::a23_a_restarted_agent_adopts_the_living_supervisor`、`coordinator::a23_a_restarted_parent_adopts_what_runs_and_starts_nothing_again`、`one_host::a23_a_killed_parent_is_followed_by_one_that_adopts_what_two_real_workers_run`、`one_host::a23_a_restarted_agent_of_one_worker_keeps_its_command_and_the_parent_follows_it` | |
+| A24 | 自動＋残り | 擬似（process を止めて boot ID を変える）: `worker_agent::a24_a_changed_boot_id_interrupts_everything_and_a_retry_runs`、`one_host::a24_a_restart_of_one_workers_machine_interrupts_its_attempt_and_spares_the_other` | 本物の reboot と OS の boot ID（S26、Mac は実機待ち） |
+| A25 | 自動 | `supervisor::cancel_terms_then_kills_the_group_and_records_only_after_it_is_gone`、`supervisor::natural_end_and_cancel_racing_still_give_one_terminal` | |
+| A26 | 自動＋残り | lease は単調時計の値だけを受ける純粋関数で、長い suspend に当たる飛びを試験する: `a_long_suspend_expires_the_lease`・`a_late_renewal_does_not_revive_an_expired_lease`（`src/supervisor/lease.rs`）。壁時計の前後への飛びは保持期間の判定で試験する: `forward_jump_requarantines_then_follows_the_new_wall`・`backward_step_holds_briefly_or_requarantines`（`src/results/clock_policy.rs`）。worker 間の壁時計のずれ: `one_host::a26_workers_whose_wall_clocks_are_off_keep_their_leases_and_end_normally` | 実行中に OS の壁時計を変える試験と、実際の Mac sleep からの復帰は無い（実機待ち） |
+| A27 | 未実装 | | S16（max-parallel・fail-fast・join・集約の進行が無い） |
+| A28 | 自動 | `bootstrap::ci_plan_shows_why_a_shared_workspace_task_is_not_split` | |
+| A29 | 自動 | `non_utf8_bytes_round_trip_per_stream`・`reads_resume_from_any_offset_without_duplicates`・`limit_is_shared_and_the_rest_is_counted_as_dropped`（`src/supervisor/tests.rs`）、`collection::active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset` | |
+| A30 | 自動 | `collection::a30_a_worker_that_disappears_while_collecting_is_continued_where_it_stopped`、`coordinator::a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_worker_is_told` | |
+| A31 | 自動 | `collection::a31_an_empty_or_short_set_of_results_is_told_apart_and_never_a_success` | |
+| A32 | 未実装 | | S19 |
+| A33 | 自動 | `worker_agent::capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed`、`worker_agent::a_secret_that_cannot_be_masked_keeps_the_command_from_starting`、`secrets::a_run_that_lost_its_bundle_is_blocked_not_resumed_with_something_else` | |
+| A34 | 自動＋残り | 偽の Launcher・偽の ssh: `upgrade_switches_checks_the_bridge_and_commits`・`an_interrupted_switch_is_finished_by_running_upgrade_again`（`src/service/workers/upgrade/tests.rs`） | 本物の launchd・実 SSH での install / upgrade / rollback（S26） |
+| A35 | 一部 | macOS の計画と偽の launchctl: `proven_start_rejection_rolls_back_but_unknown_preserves_evidence`（`src/service/macos/tests.rs`） | Linux の systemd user / system-user（S24 が未了）、実際の service 環境での doctor（S26） |
+| A36 | 自動＋残り | `doctor::an_updated_task_traffic_controller_passes_the_runtime_check`（旧い形の `status --json` を読む） | 旧コマンドと主要 workflow の互換は local-ci・task-traffic-controller 側の CI が担う（L1a〜L3・T1） |
+| A37 | S26 | | 実際のプロジェクトの CI を親のみと複数 worker で比べる |
+| A38 | 一部 | worker の側だけ: `a_job_that_needs_another_runs_in_another_attempt_from_the_first_ones_result`（`src/supervisor/ci_task/run_tests.rs`） | 親が先行 Job の output・artifact を確定してから別 host で後続を始める経路（S16 が未了） |
+| A39〜A41 | 未実装 | | S18（RTR の配置と集約）。adapter の分割・合算は local-ci 側の試験（L2・L3） |
+| A42 | 一部 | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts` | 導入中の負荷を forecast に含めること（S20 の残件）、実 manager と network での導入 |
+| A43 | 自動 | `secrets::a43_the_secret_files_reach_the_worker_as_0600_and_are_gone_after_the_attempt` | |
+| A44 | 自動＋残り | 偽の ssh と偽の tool: `diff_classifies_the_five_ways_a_worker_can_differ`・`sync_blocks_what_needs_a_person_with_the_steps`（`tests/it/workers_lifecycle.rs` の `a44`）、`bootstrap::workers_sync_installs_through_the_resident_then_measures_again_and_needs_the_resident` | 実際の worker との差（S26） |
+| A45 | 一部 | OS 依存部分は CI の ubuntu と macOS の両方で同じ試験が走る（`src/platform` の単体試験、`tests/it/supervisor.rs`） | systemd user service での導入・起動・停止、system-user mode（S24 が未了）、x86_64 と arm64 の実 worker（S26 の Docker） |
+| A46 | 未実装 | | S24（`worker --ephemeral` と `workers forget`）、S26 |
+| A47 | 自動 | `secrets::worktreeinclude_picks_only_ignored_untracked_files_and_the_store_never_holds_them`、`worker_agent::the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_any_name` | |
+| A48 | 一部 | `workspace::add_and_remove_a_commit_workspace`、`workspace::the_original_is_never_written`（CI は `RTR_REQUIRE_FAST_WORKTREE` で fast-worktree を必須にする） | terminal 後に portool の割当が消えることを確かめる試験が無い |
+| A49 | 自動 | `scheduler::a_preferred_worker_is_taken_while_the_others_are_not_faster_by_the_correction`、`collection_is_added_to_the_forecast_and_the_priority_correction_to_that`（`src/scheduler/decide.rs`）、設定から scheduler まで: `runtime::runtime_attach_applies_only_verified_identity_priorities` | |
+
+件数（A39〜A41 は 3 件と数える）: 自動 29、自動＋残り 7、一部 6、未実装 6、S26 のみ 1。
+
+S25 の完了条件「実機不要の A がすべて自動で緑」は、まだ満たしていない。区分が「一部」と「未実装」の 12 件（A10・A27・A32・A35・A38・A39〜A41・A42・A45・A46・A48）は、S16・S18・S19・S20・S24 の実装か、試験の追加が先に要る。これらの行が入ったら、この表を更新し、複数 worker が関わるものは `one_host` に試験を足す。
+
+この変更の残件:
+
+1. `tests/it/coordinator.rs` の `LoseRetireAnswer`（retire の応答を 1 回失う link）は `one_host` の `Faults` と同じ役目だが、そのままにした。そのファイルは S16 の変更（PR #70）が編集中で、競合を避けた。S16 の統合後に `Faults` へ寄せる。
+2. A48 の portool の割当の解放は、試験が無いことを見つけただけで、足していない（S7 の範囲）。
+3. 単調時計を試験から進める口は無い（上の「時計について」）。lease の失効を agent・supervisor の実 process で確かめる試験は、実時間の短い lease を使う既存の試験のままである。
+4. kill の注入は、worker が launch と process identity を記録した後に限った（`OneHost::launched` で待つ）。spawn の直後で identity を記録する前に supervisor を kill すると、worker は仕様どおり起動不明として未解決のまま保持し、その command は同じ user のほかの attempt の回復からも「隠れた process」に見えて、同じ試験 process のほかの試験の回復を止める（最初の版で 6 回中 1 回起きた）。記録前の kill は `tests/it/supervisor.rs` の `a_launch_without_an_identity_is_investigated_not_respawned` が担い、ここでは注入していない。記録前の地点で確実に止める口は本体に試験用の経路が要るため、足していない。
+
 ## 確定事項（仕様 v1.2 に反映済み）
 
 - Linux（x86_64・arm64）を正式対応する（systemd user service）。Google Colab は常駐なしの一時 worker とする。OS 依存部分（suspend を含む単調時計、boot ID、process identity、sleep 抑止）は platform module に macOS と Linux の実装を置き、S9a・S10 から両方で動かす。
@@ -184,7 +267,7 @@ Standalone worker foreground slice: `worker --input` reads an owner-only retaine
 WorkerSpec (schema 1, enrolled cluster/worker IDs, pinned executable, private key,
 allowlisted environment and captured user TOML). Its state must be the canonical
 HOME worker state so `worker --stdio` reaches the same agent socket. This is a
-persistent role; `--ephemeral` remains a separate required S24 implementation.
+persistent role; the worker side of `--ephemeral` is a separate role (see "S24 Linux の systemd user service と ephemeral worker").
 The runtime owns its agent lock, independent tick/supervision and staged socket
 publication with durable inode receipt. Bridge disconnection never shuts it down.
 Only a dead socket matching the private receipt is reclaimed after a crash;
@@ -1423,6 +1506,24 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - 親の側の回収: `ci_task` を持つ payload では、結果の artifact `rtr-ci-task-result.json` を必須（required）として扱う（`results/collect.rs` の `declared_of` は今 `payload.artifacts` だけを見る。worker は `ArtifactDecl` でこの名前を宣言できない）。宣言が 1024 件のとき、結果を足すと 1025 件になる点も合わせて決める。偽の worker がこの artifact だけを返すテストを付ける。
 - 親の側: `ci` の実行（`src/cli.rs` と `tests/it/not_implemented.rs` の 2 行）、`TaskSpec` への `ci_task` の追加と `build_payload`、`ci_task_v1` の無い worker の除外と placement への理由の記録、Driver と同じ形の trait の後ろに置く run の進行（needs の DAG、上流の成功後だけ下流を配置、失敗時の skipped、cancel）、needs output を下流の `inputs` へ入れること（複数の上流の合計が上限を超える場合の扱いを含む）、`plan_task_demand` から `WorkloadPlan` を作って配置時の forecast に渡すこと（A10 の S16 分）、A38 のうち結果と output の分のテスト。
 
+### S24 Linux の systemd user service と ephemeral worker（2026-11-17、worker 側の 1 本目）
+
+作ったもの。
+- `src/service/systemd/`: Linux の service backend。`policy.rs`（純粋: unit の描画、`systemctl` の引数列をデータで返す `steps`、`systemctl show` の厳密な読み取り、`systemctl --user` に渡す環境）と `SystemdLauncher`（command runner を差し込める。実 `systemctl` は `SystemctlRunner` だけ）。`policy.rs` は `scripts/pure-modules.txt` に載せた（mutation・100% 行 coverage の対象）。
+- 既存の worker-host helper（`worker_service`、upgrade・rollback・commit を含む）は分けずに、`Launcher::backend()`（既定は launchd）と `Paths::resolve_for(env, backend)` で manager を選ぶ。managed file の置き場は launchd が `~/Library/LaunchAgents`、systemd が `$XDG_CONFIG_HOME/systemd/user`。journal・receipt の形、version 別 directory、upgrade の順序は変えていない。`HostLauncher::native()` が OS（`cfg!(target_os = "linux")`。両方の枝が全 OS で型検査される）で manager を選び、`worker-service` と doctor の host 側が使う。
+- 起動は `daemon-reload`、`enable`、`start` の順、停止は worker の ack の後の `stop` だけ（unit は enable のまま。launchd の bootout 後に次回 login で読み直されるのと同じ）。`daemon-reload` と `enable` の失敗は NotApplied、最後の `start`・`stop` の失敗と runner の無応答は OutcomeUnknown。`show` の読み取りは `LoadState`・`ActiveState`・`FragmentPath`・`MainPID`・`NeedDaemonReload` だけを受け、他は Unknown にする。
+- `worker --ephemeral --cluster <id> --name <worker> --key-file <abs path>`（`src/service/worker/ephemeral.rs`、純粋な判断は `ephemeral/plan.rs`）。service を登録せず、前景で動く。正準の worker state（`$HOME/.remote-task-runner`、`worker --stdio` の橋が探す場所）が既にあるか、常駐 worker の journal があるときは、何も作らずに拒否する（常駐にならない）。起動ごとに新しい identity: worker 名は親が登録した名前のまま、報告する boot identity が `<OS の boot id>.<起動ごとの ULID>` になる。終了（SIGTERM・interrupt）時は自分が作った state directory（dev・ino を確かめる）を、worker DB に live な attempt が無いときだけ消す。使い方は `docs/linux-and-ephemeral-workers.md`。
+
+試験。systemd 用の偽 Launcher で install・start・stop・start と upgrade の順序（`start`、`stop`、`start`）、unit の描画、`XDG_CONFIG_HOME` の置き場を macOS 上でも確かめる。実バイナリの統合試験（`tests/it/worker_ephemeral.rs`）で、ephemeral が何も導入せず、起動ごとに identity が違い、停止後に state が消え、既存 state と常駐 journal を拒否し、引数が足りなければ exit 2 になることを確かめる。`tests/it/not_implemented.rs` から `worker --ephemeral` を外した（`workers forget` は未実装のまま）。
+
+S24 の残り（必須。この変更で S24 は完了しない）:
+1. 実 systemd・実 Linux 機での受入（A45）は未実施。`systemctl` は偽の runner だけで試験した。実 `systemctl --user` の出力（`show` の書式、`enable` の副作用、linger）は Linux の実機で確かめる必要がある。
+2. system-user mode（`service_mode = "system-user"`、systemd の system service を非 root の `User=`）は unit の描画だけを純粋関数として持つ。登録先（`/etc/systemd/system`）と管理権限の扱いは未実装で、worker-host helper は user mode だけを配線している（macOS の LaunchDaemon と同じ未了）。
+3. 親側の Linux 対応は未着手: `workers add --install` と `workers upgrade` は親が macOS で、worker が同じ OS・arch のときだけ動く（親は自分の binary を送るため、Mac から Linux には送れない）。Linux の binary をどう用意するかは設計判断が要る。`init`（coordinator の常駐）も Linux では拒否のまま。
+4. ephemeral の親側: `ephemeral = true` の worker の接続（現状は `ephemeral remote enrollment is unsupported` で拒否）、到達不能の attempt を unknown のまま保持すること、`workers forget`（unknown を interrupted に確定し identity を退役、tombstone、遅れて戻った identity の submit・renew の拒否）は未実装。boot identity が起動ごとに変わるため、親が「別 boot」として interrupted にする既存の規則との関係は、この親側の作業で決める必要がある（A46）。トンネルの提供は仕様どおり範囲外。
+5. doctor の linger の確認（`loginctl show-user`）は未実装。
+6. ephemeral が消す state は worker DB の live attempt を見て判断する。attempt の supervisor が agent の終了後も生きている場合の扱い（残す）は試験していない。
+
 ### S16 (1) の後半: 親の側の `ci` の実行（2026-11-17、main `b673327` 起点）
 
 設計の決定 (a)・(b) の親の側と、FrozenPlan の配送を実装した。`ci`（`plan` 以外）は `NOT_IMPLEMENTED` ではなくなった。matrix・中間 artifact・`services:` は含めていない。
@@ -1449,7 +1550,7 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - inputs の上限は 1 MiB（worker の上限 4 MiB、接続の frame 2 MiB より小さく）。超えた task は event `ci_task_unrunnable` を残して cancel する（run は成功にならない）。
 - 宣言が 1024 件のとき結果を足すと 1025 件になる点: CI task が宣言できる artifact と output は合わせて 1023 件まで。`ci` は今、artifact も output も宣言しない。
 - 除外の理由は新しい `Exclusion` を足さず、`CapabilityMismatch` と `unmet` で表した。 plan を受け取らなかった worker だけは別で、`CapabilityMismatch` にすると全員がそうのとき `no_compatible_worker` になってしまう（一時的な理由なのに）ので、`Exclusion::InputRefused` を足した。
-- 提出で断るもの: matrix の variant・式の matrix・shard・`services:` を持つ plan、secret_files を持つ source、task が 1 つも無い plan。64 個を超える task は resident が断る（既存の上限）。
+- 提出で断るもの: matrix の variant・式の matrix・`services:` を持つ plan、secret_files を持つ source、task が 1 つも無い plan。64 個を超える task は resident が断る（既存の上限）。 split 済みの Shard は S18 から受け付ける（plan の ShardGroup と形が合わないものだけを断る）。
 - `ci` は toolchain の凍結（`exec` の `freeze_toolchains`）をしない。profile と requires は `exec` と同じく task に入れる。
 
 テスト:
@@ -1482,6 +1583,42 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - 自分で決めたこと: (a) は run 全体の cancel ではなく、未配置の task だけを cancel する（実行中の Job は結果を残させる。plan が無くても worker は自分の写しで実行できる）。(b) は fail にせず除外にした（worker の GC で空けば解ける一時的な状態で、ほかの worker が取れる）。全 worker が断っている間は、理由付きで待つ。待つ時間に上限は設けていない。
 - テスト: lib（`coordinator::tests` 2 件、`input_gate` 2 件、`policy` 4 件、`ci_runs` 2 件、`advance` の分類）。`tests/it/collection.rs` 2 件（plan が消えた run、plan を受け取らない代役の worker）。`tests/it/bootstrap.rs` 1 件（実 binary・resident・local worker で、worker の `ci-plans/` を 256 件で埋めると `ci` が理由を残して待ち、空けると完了する）。
 - 残り: 配送の側で親が plan を読めない場合（待機中の task を持たない run）は、分類の単体テストだけで、実 binary のテストは無い。`ci_run_stalled` は event に残すだけで、`show` には出していない（DB が使えない間は event も書けない）。すでに worker に配置された attempt が plan を待っている場合（cold placement）の扱いは変えていない。`fail_ci_tasks` が cancel するのは attempt を 1 つも持たない task だけなので、`retry` で queue に戻った task（retire 済みの attempt を持つ）は、親の plan が消えていても cancel されず、配送が失敗し続ける（event も出ない）。どの worker でも ready でなく、1 台が plan を断っている run では、転送時間の実測がある worker に prefetch の hint が出るようになった（以前は何もせず戻っていた。配置はしない）。
+
+### S18: sharding の配置（2026-11-17、main `979fec2` 起点）
+
+FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard を配置し、集約し、fail-fast で止め、失敗した Shard だけを retry できるようにした。local-ci は 0.13.0 のままで、変更していない。
+
+- 判断は pure module `src/ci/shards.rs` に置いた（`scripts/pure-modules.txt` に登録）。Shard と ShardGroup の対応（`group_of`）、親が配置できる形かの検査（`shape_fault`）、receipt の本物判定（task と Job の名前が一致するものだけ。`receipt`）、Shard の失敗（`shard_failed`）、fail-fast で止める Shard（`to_cancel`）、Shard の outcome から Job の outcome を作る規則（`combine`・`conflicting_outputs`・`join`）、問題の要約（512 文字まで。`diagnostic`）。規則は local-ci の共有 Driver（0.18 の `driver/shards.rs`）と同じで、test の集合の検査は `local_ci::complete::aggregate_shard_group` を呼ぶ。`combine` と `conflicting_outputs` は 0.13.0 で非公開のため、同じ規則を写した。
+- 配置: `ci::progress::unsupported` は Shard を断らなくなり、形が plan と合わないものだけを断る。Shard は依存を持たないので、提出の時点で全部が queue に入り、同じ tick で並んで配置される。
+- 集約: `NeedsProgression` は、ShardGroup の全 Shard が終わったときに Job の outcome を 1 つ作る。後続の task の inputs と `outcome()` には、Shard ごとの outcome ではなくこの 1 つだけを出す。全 Shard が成功でも、receipt の無い Shard・報告されなかった test・二重に報告された test・Shard 間で値の違う output があれば Job は failure になり、理由を持つ。
+- fail-fast: ShardGroup が `fail_fast` で、終わった Shard に失敗が有ると、進行は終わっていない Shard に `ActionKind::Cancel` を出す。host（`ci::advance`）は、未配置なら `fail_ci_tasks`（理由を `ci.unrunnable` に書いて cancel）、配置済みなら `cancel_task`（coordinator が tick で worker に届ける）で止める。cancel 要求済みの行には何もしないので、pass を繰り返しても 1 回だけになる。失敗した Shard の結果は残る。
+- pass が見る run: `ci_waiting_runs` は、待機中の task を持つ run に加えて、まだ集約されていない split Job の Shard（`CiSpec.shard_group` が有り `joined` が無い）を持つ run を返す。cancel 済みの Shard も数える（cancel された run の Job も集約して run を確定させるため）。後続の Job を持たない split Job でも fail-fast と集約が働く。
+- retry: run の retry は成功した task を飛ばすので、失敗した Shard と止められた Shard だけが同じ FrozenPlan の新しい attempt になり、通過した Shard は attempt も結果もそのまま残る。S15 の規則を 1 点だけ広げた: fail-fast で一度も配置されないまま cancel された Shard（attempt が無く、cancel 済みで、`ci.unrunnable` が fail-fast の理由のもの）は retry の対象になり、cancel と理由を外して queue に戻る。attempt を持たないそれ以外の task は従来どおり断る。Shard を retry すると、その ShardGroup の全 Shard から `joined`・`join_failure` を外し、全部が終わったら残した結果と新しい結果から Job の outcome を作り直す。 attempt が成功でも「単独で通過」と言えない Shard はやり直す: Job が failure で集約されたとき、receipt が無い・test が失敗した・渡された test をちょうど 1 回ずつ報告していない Shard に `ci.rerun` を付け（全 Shard が単独では通過していて集約だけが failure のときは全 Shard。`ci::shards::verified`・`rerun`）、run の retry はこれを成功扱いにしない。集約の書き込み（`join_ci_shards`）は、同じ transaction の中で全 Shard が終了していることを確かめ、読んだ後に retry が入った場合は何も書かない。
+- 報告: `ci` の Job の行に `part` を足した。Shard は `shard`（名前は plan の task id）、split Job は全 Shard が終わった後に `job` の行が 1 つ付き、failure のときは `reason` に問題の要約が入る。
+- run の結果: split Job の outcome は、進行の pass が全 Shard の終了を見た時点で Shard の行に書く（`CoordinatorStore::join_ci_shards`。`ci.joined`、failure なら `ci.join_failure` に理由、event `ci_job_joined`）。run の結果（`CoordinatorStore::completion`）はこれを読む。集約前の Shard は「回収待ち」と同じ扱いで run は確定せず、集約が failure なら attempt が全部成功でも run は失敗（exit code 1。attempt 自体の失敗が有ればその exit code が先）になる。`ci`・`wait`・`show`・JSON・status（S19）は同じ run の結果を読むので、どこでも同じになる。task 単位の結果（`wait <task>`）は Shard 自身の結果のままである。進められない run（plan が消えた等）は、未集約の split Job を理由付きの failure として閉じる（`fail_ci_joins`）。 run が何で失敗したか（exit code）は、fail-fast で止められただけの Shard ではなく実際に失敗した task のものにする（run 全体の cancel が無いとき。task id の順に依らない）。attempt は成功で test だけが失敗した Shard が原因のときは Job の失敗（exit code 1）になる。
+- 分割できない Job（A41）: 分割の要求が断られた plan は元の task 1 件のままで、ほかの Job と同じ経路で動く。理由は `ci plan` の `shard_groups[].not_split` と text の `is not split: [...]` に出る（S16 で実装済み）。
+
+自分で決めたこと:
+
+- Job の outcome は Shard の順（plan の `shards` の順）で作る。到着順は使わない。
+- receipt の名前が合わない結果は、進行を止める誤りにせず「receipt 無し」として扱う（Job は failure になり、`missing: shard …` と出る）。
+- fail-fast の「失敗」は、Shard の Job が failure か、receipt に失敗した test が有るか exit が失敗のとき。cancel された Shard と skipped は失敗に数えない。
+- receipt に失敗した test が有れば、Shard の step が成功で、ほかの Shard が止められて cancelled でも、Job は failure にする（共有 Driver は success のときだけ failure に変える。fail-fast で止めた結果が「cancelled」になり失敗が隠れるため、ここは変えた）。
+- split Job の行の `reason` は Driver と同じ要約を出すが、failure のときは Shard 個別の skip 理由（`skipped`）を出さない。
+
+テスト: `tests/it/collection.rs` に 8 件（A39: Vitest と Jest の file 単位の分割を worker 2 台の構成で同じ tick に配置し、全 file が 1 回ずつで Job が 1 つになること、報告されない file が有ると Job が failure になること。A40: 履歴で遅い test が 1 Shard になり最長の Shard が短くなること、履歴無しでも同じ分割になり実行できること。A41: 分割できない理由の表示と単一 Job への fallback、fail-fast の cancel の配送と停止確認と報告、後続を持たない Job で一度に配置しきれない Shard が未配置のまま止まること、retry、全 Shard が成功で集約だけが failure の run が集約まで確定せず失敗で確定すること）。失敗の原因と retry の対象は、止められた Shard の id が先に並ぶ場合、attempt が成功で test だけ失敗した場合、報告漏れの Shard だけをやり直す場合、retry の後の古い集約が書かれない場合を含む。lib は `ci::shards` 11 件、`ci::progress` 3 件、`ci_run` 1 件（ほかに既存の 2 件へ追記）。mutation は `src/ci/shards.rs` と `src/service/completion.rs` を手元で回した。
+
+残り（S18 の必須範囲として維持する）:
+
+- 本番の `ci` は分割の要求（`ShardRequest`）を作らない。`service::planning::freeze` は test の列挙（adapter の discover）を走らせないので、実際の `ci` の plan は今も Shard を持たない。上のテストは `FrozenPlan::with_shards` で作った plan を使う。列挙をどこで走らせるか（親か worker か、どの workspace か）は未決定で、adapter 本体の側の作業である。
+- 履歴の入力元が無い（A40）。worker が返す `TestResult` は所要時間を持たず、`History` と `PartitionOpts.speed_permille`（worker の性能補正）に入れる値を RTR は記録していない。Shard 数を worker の実効容量と残りの DAG から決める処理も無い。
+- worker が Shard を実際に実行する経路（`execute_pinned_task` が Shard の command を作り `ShardOutcome` を返す）は local-ci の側のテストに任せていて、RTR では実 runner を動かしていない。テストの worker は receipt を手で作る。
+- retry しても、すでに failure の inputs で release された後続の task はやり直さない（S16 の plain な Job と同じ）。
+- 非冪等な runner の明示的な retry 許可（`ExecutionTask.retry`）は見ていない。
+- coverage の merge、JUnit などの artifact の重複・欠落の検査、assertion 数の集約は無い（local-ci は coverage を集める Job を分割しない）。
+- `ci plan` は split 済みの ShardGroup を JSON の `shard_groups` に出すが、text では数だけである。
+- 集約は resident の進行の pass が行う。resident が止まっている間は、全 Shard が終わっていても run は確定しない（待機中の task を持つ run と同じ）。
+- fail-fast で止めた実行中の Shard には理由を記録していない（未配置で止めたものだけ `ci.unrunnable` に理由が残る）。
 
 ### S19 GitHub status（2026-11-17、main `979fec2` 起点）
 

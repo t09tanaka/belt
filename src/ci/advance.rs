@@ -10,6 +10,12 @@
 //! the inputs into the waiting task and lets it into the queue, in one
 //! transaction that a cancel wins. A parent that restarts goes on from the
 //! same rows, and a task is never made, or run, twice.
+//!
+//! The shards of a split job are rows like the others. With fail-fast, a
+//! pass that finds a failed shard stops the shards that have not ended: one
+//! that was never placed is cancelled with the reason, one that runs gets a
+//! cancel that the coordinator delivers. A shard a cancel was requested for
+//! is not asked again.
 
 use super::progress::{ActionKind, Input, NeedsProgression, Progression};
 use crate::coordinator::TaskSpec;
@@ -182,6 +188,11 @@ pub struct Pass {
     pub released: Vec<TaskId>,
     /// Tasks that cannot be run (and were cancelled), with the reason.
     pub unrunnable: Vec<(TaskId, String)>,
+    /// Shards that were stopped because another shard of their job failed
+    /// (fail-fast).
+    pub stopped: Vec<TaskId>,
+    /// Split jobs (by their id in the plan) that got their one outcome.
+    pub joined: Vec<String>,
     /// Runs that can never go on, with the reason: their tasks that were
     /// not placed yet were cancelled (and are in `unrunnable`).
     pub failed: Vec<(RunId, String)>,
@@ -233,6 +244,9 @@ pub fn fail_run(
     why: &str,
     now_ms: u64,
 ) -> crate::storage::Result<Vec<TaskId>> {
+    // A split job whose shards will never be put together is a failure:
+    // the run must not wait for its outcome.
+    store.fail_ci_joins(run, why, now_ms)?;
     store.fail_ci_tasks(run, None, why, now_ms)
 }
 
@@ -274,22 +288,86 @@ fn advance_run(
     pass.plans.insert(digest.clone());
     let plan: FrozenPlan = serde_json::from_slice(&read_plan(state_dir, &digest)?)
         .map_err(|e| unrunnable(format!("the frozen plan {digest}: {e}")))?;
-    let mut progress = NeedsProgression::new(&plan).map_err(unrunnable)?;
+    let mut progress = replay(store, results, &plan, |task| {
+        members.get(task).map(|member| &member.row)
+    })?;
+    // A split job whose shards all ended has its one outcome: it is kept
+    // with the shards, where the result of the run is read. A job that is a
+    // failure says so even when the attempt of every shard succeeded.
+    for group in plan.shard_groups.iter().filter(|g| g.split) {
+        let job = group.source_jobs.join("+");
+        let Some(outcome) = progress.outcome(&group.workflow, &job) else {
+            continue;
+        };
+        let marked = |id: &String| members.get(id).and_then(|m| m.spec.ci.as_ref());
+        if group
+            .shards
+            .iter()
+            .all(|id| marked(id).is_some_and(|ci| ci.joined))
+        {
+            continue;
+        }
+        let failure = (outcome.status == JobStatus::Failure).then(|| {
+            let problems = progress.split_job_problems(&group.id);
+            problems.unwrap_or("a shard of the job failed").to_string()
+        });
+        let rerun = progress.split_job_rerun(&group.id);
+        let changed = store
+            .join_ci_shards(run, &group.id, failure.as_deref(), rerun, now_ms)
+            .map_err(fault)?;
+        if changed {
+            pass.joined.push(group.id.clone());
+        }
+    }
+    for action in progress.pending_actions().to_vec() {
+        let member = |task: &String| {
+            members
+                .get(task)
+                .ok_or_else(|| unrunnable("the plan changed"))
+        };
+        match &action.kind {
+            ActionKind::Ready { task, inputs } => {
+                let member = member(task)?;
+                if member.spec.ci.as_ref().is_some_and(|ci| ci.hold) {
+                    release(store, run, member, inputs, now_ms, pass).map_err(fault)?;
+                }
+            }
+            ActionKind::Cancel { task, reason } => {
+                stop(store, run, &member(task)?.row, reason, now_ms, pass).map_err(fault)?;
+            }
+            ActionKind::Finished => {}
+        }
+        progress
+            .step(Input::Ack { action: action.id })
+            .map_err(unrunnable)?;
+    }
+    Ok(())
+}
 
-    // What ended, the tasks a task depends on before the task itself.
+/// The progression of a run of `plan` with everything that ended taken in:
+/// the tasks a task depends on before the task itself. `row_of` gives the
+/// row of a task of the plan. What is pending afterwards is what the run
+/// may go on with now.
+pub fn replay<'a>(
+    store: &CoordinatorStore,
+    results: &Path,
+    plan: &FrozenPlan,
+    row_of: impl Fn(&str) -> Option<&'a CiTaskRow>,
+) -> Result<NeedsProgression, Fault> {
+    let mut progress = NeedsProgression::new(plan).map_err(unrunnable)?;
     loop {
         let mut settled = false;
         for task in &plan.tasks {
             if progress.is_settled(&task.id) || !progress.dependencies_settled(&task.id) {
                 continue;
             }
-            let Some(member) = members.get(&task.id) else {
+            let Some(row) = row_of(&task.id) else {
                 return Err(unrunnable(format!(
                     "the run has no task `{}` of its plan",
                     task.id
                 )));
             };
-            let Some(input) = ended(store, results, &task.id, &member.row).map_err(fault)? else {
+            let Some(input) = ended(store, results, &task.id, row).map_err(transient)? else {
                 continue;
             };
             progress.step(input).map_err(unrunnable)?;
@@ -300,20 +378,7 @@ fn advance_run(
         }
     }
     progress.step(Input::Advance).map_err(unrunnable)?;
-    for action in progress.pending_actions().to_vec() {
-        if let ActionKind::Ready { task, inputs } = &action.kind {
-            let member = members
-                .get(task)
-                .ok_or_else(|| unrunnable("the plan changed"))?;
-            if member.spec.ci.as_ref().is_some_and(|ci| ci.hold) {
-                release(store, run, member, inputs, now_ms, pass).map_err(fault)?;
-            }
-        }
-        progress
-            .step(Input::Ack { action: action.id })
-            .map_err(unrunnable)?;
-    }
-    Ok(())
+    Ok(progress)
 }
 
 /// How the task of `row` ended, as an input of the progression; `None`
@@ -352,6 +417,31 @@ fn ended(
         }
         _ => None,
     })
+}
+
+/// Stop a shard that has not ended. One a cancel was requested for already
+/// is left alone, so a pass that sees it again writes nothing. One that was
+/// never placed is cancelled with the reason; if it was placed in between,
+/// nothing changes here and the next pass cancels its attempt.
+fn stop(
+    store: &CoordinatorStore,
+    run: &RunId,
+    row: &CiTaskRow,
+    reason: &str,
+    now_ms: u64,
+    pass: &mut Pass,
+) -> crate::storage::Result<()> {
+    if row.cancelled {
+        return Ok(());
+    }
+    if row.attempt.is_none() {
+        let stopped = store.fail_ci_tasks(run, Some(&row.task_id), reason, now_ms)?;
+        pass.stopped.extend(stopped);
+    } else {
+        store.cancel_task(&row.task_id, now_ms)?;
+        pass.stopped.push(row.task_id.clone());
+    }
+    Ok(())
 }
 
 fn release(
