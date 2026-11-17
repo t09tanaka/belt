@@ -293,7 +293,8 @@ async fn collection_shutdown_fixture(
     });
     let input_sources = resident.captured.sources.clone();
     let client = resident.client();
-    let guard = gc_contention.then(|| resident.coordinator.store().result_gc_guard(&run).unwrap());
+    let guard =
+        gc_contention.then(|| crate::test_tmp::gc_guard(resident.coordinator.store(), &run));
     let mut runner = tokio::spawn(resident.run());
     if let Some((entered, _)) = &input_pause {
         tokio::time::timeout(Duration::from_secs(4), async {

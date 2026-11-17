@@ -65,3 +65,64 @@ pub fn tempdir() -> std::io::Result<tempfile::TempDir> {
 pub fn prefixed(prefix: &str) -> std::io::Result<tempfile::TempDir> {
     tempfile::Builder::new().prefix(prefix).tempdir_in(root())
 }
+
+/// How long a test waits for a run's GC lock that only a forked child of
+/// another test can still hold.
+const GC_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Retry `try_once` while it fails with `WouldBlock` (the lock is held).
+///
+/// The run lock is an `flock` and the guard's descriptor is close-on-exec,
+/// but a test thread that forks (to start a child process) hands a copy of
+/// every descriptor to the child until its `exec`. A lock dropped by one test
+/// therefore stays held for that short moment, and the next non-blocking
+/// acquisition sees `WouldBlock`. Production still declines and moves on;
+/// only a test that never meant to contend waits here. Other errors and a
+/// lock that stays held for [`GC_LOCK_WAIT`] still fail the test.
+fn until_free<T>(
+    mut try_once: impl FnMut() -> Result<T, remote_task_runner::storage::StorageError>,
+) -> Result<T, remote_task_runner::storage::StorageError> {
+    use remote_task_runner::storage::StorageError;
+    let start = std::time::Instant::now();
+    loop {
+        match try_once() {
+            Err(StorageError::Io(e))
+                if e.kind() == std::io::ErrorKind::WouldBlock && start.elapsed() < GC_LOCK_WAIT =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// `result_gc_guard` for a test that does not itself hold the lock: waits
+/// out a copy of it that a forked child of another test still holds.
+pub fn gc_guard(
+    store: &remote_task_runner::storage::CoordinatorStore,
+    run: &remote_task_runner::ids::RunId,
+) -> remote_task_runner::results::pin::RunPin {
+    until_free(|| store.result_gc_guard(run)).unwrap()
+}
+
+// Shared with the integration tests through `#[path]`, which do not page.
+#[allow(dead_code)]
+/// One retention page with a fresh cursor, retried while its run's lock is
+/// held by such a copy (the page reports `skipped` then, and did nothing).
+pub fn settled_page(
+    store: &remote_task_runner::storage::CoordinatorStore,
+    files: &remote_task_runner::results::ResultStore,
+    retention_days: u32,
+) -> remote_task_runner::results::retention::PageReport {
+    let start = std::time::Instant::now();
+    loop {
+        let mut cursor = remote_task_runner::results::retention::Cursor::default();
+        let report =
+            remote_task_runner::results::retention::page(store, files, &mut cursor, retention_days)
+                .unwrap();
+        if !report.skipped || start.elapsed() >= GC_LOCK_WAIT {
+            return report;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+}

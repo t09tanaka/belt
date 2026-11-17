@@ -1114,7 +1114,7 @@ mod tests {
         let f = Fixture::new();
         f.append(LogStream::Stdout, b"retained", true);
         f.terminal(true);
-        let guard = f.db.result_gc_guard(&f.run).unwrap();
+        let guard = crate::test_tmp::gc_guard(&f.db, &f.run);
         assert!(
             f.db.claim_result_page(&guard, &f.run, "", 64, 100, 10, Some("boot".into()), 10)
                 .unwrap()
@@ -1133,7 +1133,7 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::NotFound);
-        let guard = f.db.result_gc_guard(&f.run).unwrap();
+        let guard = crate::test_tmp::gc_guard(&f.db, &f.run);
         for claim in f.db.pending_result_page(&guard, &f.run, 64).unwrap() {
             f.files.remove(&claim.locator).unwrap();
             f.db.finish_result_delete(&guard, &claim).unwrap();

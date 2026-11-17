@@ -56,3 +56,9 @@ path = "tests/it/main.rs"
 # ten seconds per pass, which is the whole startup deadline of the fixtures.
 [profile.dev.package.sha2]
 opt-level = 3
+
+# The measured-cost cap tests and the resident fixtures run SQLite thousands of
+# times (sorting a 4096-row table per insert). The bundled C library built at
+# opt-level 0 made one such test take over a minute.
+[profile.dev.package.libsqlite3-sys]
+opt-level = 3
