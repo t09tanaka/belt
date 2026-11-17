@@ -922,7 +922,7 @@ pub fn reload_resident(spec: &Spec) -> ResidentReload {
 
 /// A worker-supplied text without control characters (escape sequences,
 /// newlines), so it cannot rewrite the parent's terminal.
-fn strip_control(text: &str) -> String {
+pub(super) fn strip_control(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }
 
@@ -1544,8 +1544,8 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
     ))
 }
 
-pub mod warmup;
 pub mod upgrade;
+pub mod warmup;
 
 #[cfg(test)]
 mod tests;

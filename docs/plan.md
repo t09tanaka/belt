@@ -1161,7 +1161,7 @@ task-traffic-controller と local-ci は RTR の binary に組み込まれてい
 
 A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一時 HOME の `src/service/workers/tests.rs`、実 binary・偽 ssh・偽の tool shim の `tests/it/workers_lifecycle.rs`（`a44`）。ネットワークには出ない。
 
-残り（S21 は完了していない）: `workers sync` の実際の導入は 3 本目で入れた（下の節）。`doctor` への組み込み（S23）、`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は RTR の版だけで、組み込んだ crate 個別の build 情報は持たない。
+残り（S21 は完了していない）: `workers sync` の実際の導入は 3 本目で入れた（下の節）。`doctor` への組み込みは 7 本目で入れた（下の「S21 `doctor` への接続」）。`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は RTR の版だけで、組み込んだ crate 個別の build 情報は持たない。
 
 ### S21 `workers sync`（2026-11-17、2 本目: 計画と blocked、導入の差し込み口）
 
@@ -1171,7 +1171,7 @@ A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一
 
 残り（S21 は完了していない）:
 1. 導入の本番経路は 3 本目で入れた（下の節）。
-2. `doctor` への組み込み（S23。`envdiff::diff` は公開済み）。
+2. `doctor` への組み込みは 7 本目で入れた（下の「S21 `doctor` への接続」）。
 3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
 
 ### S21 `workers sync` の導入（2026-11-17、3 本目: warm-up の要求）
@@ -1191,7 +1191,7 @@ A44 の sync 側のテスト（ネットワークに出ない）:
 - `src/coordinator/env_sync.rs`: 旧 peer に要求を 1 回も送らず `workers upgrade` を案内すること、応答なし・拒否・不足した応答の区別。`src/service/workers/warmup.rs`: 応答の解釈（純粋関数 `look`）。`src/toolchain/registry/tests.rs`: warm-up の要求と attempt の要求が同じ install plan になること。
 
 残り（S21 は完了していない）:
-1. `doctor` への組み込み（S23）。
+1. （7 本目で解消）`doctor` への組み込み。下の「S21 `doctor` への接続」。
 2. ssh 越しの remote worker に対する `workers sync` の実機での受入（S26）。往復の試験は local worker の link で行った。remote の link を作る `config/runtime.rs` が feature の合意を渡すこと（合意した peer には送り、していない peer には送らない）は `tests/it/runtime.rs` で確かめたが、ssh の bridge を通した導入の往復は試験していない。
 3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
 4. `diff` の worker 省略時の並列化、`installed_inventory` の所要時間の計測（1 本目から継続）。
@@ -1241,6 +1241,26 @@ PR #59 の H1 修正（4 本目）へのレビューを受けて、toolchain の
 - spec §22.2 の覚える条件を、上に合わせて直した。
 
 残り: 上の 4 本目の残りと同じ。probe の出力が読めない（`probe_*`）・出力が長すぎる（`installer_output_limit`）は exit 1 のままで覚えない。Running の時間切れには `install.lock` を待つうちに切れた場合も入る。
+
+### S21 `doctor` への接続（2026-11-17、7 本目。main の取り込み後）
+
+main（S23 の doctor・upgrade、scope の統一、schema v11 など）を merge commit で取り込み、`doctor::command` が `doctor::run` の `diff` に渡す値を `None` から `workers diff` の比較に置き換えた（spec §22.2「`doctor` はこの結果を含む」）。
+
+- 答えた worker ごとに、`workers diff` と同じ経路（`workers::fetch_env` が登録済みの binary の `worker-service env` を ssh で尋ねる）で環境 report を取り、`envdiff::diff` の結果を check にする（`doctor::worker_diff`）。親の測定は 1 回だけで、worker が 1 台も答えなければ測らない。親を測る環境は doctor が親を調べる環境と同じにした（保持した service の env。無ければ呼び出した shell の env で、その場合 doctor は既に notice を出している）。
+- 項目から check への変換は純粋関数 `doctor::diff_checks`。id はどれも `environment_diff` で、項目ごとに 1 check（detail は `<項目>: <分類> parent=… worker=… -> <手順>`）。`same` は ok、`differs`・`missing`・`auto_installable`・`manual_required` は fail、`not_measured` は `not_checked`。report を取れなかった worker（古い binary、壊れた応答、拒否）と親を測れなかった場合は、理由を添えた `not_checked` 1 つで、空の結果にも ok にもしない。worker から来た文字列は制御文字を除く。
+- ssh で答えなかった worker には環境を尋ね直さない（`reachable` が既に fail を出している。2 回目の待ちを作らない）。`environment_diff` は `not_checked` として列挙する。
+- 試験: `src/service/doctor/tests.rs` の `environment_diff`（全分類、制御文字、取れなかった場合、偽の ssh 越しの差と一致、親を測れない場合、答えない worker）と、実 binary・偽 ssh の `tests/it/doctor.rs`（worker の platform が違う report を返すと `environment_diff` が fail になり、policy digest は `not_checked`）。
+
+S21 で終わったもの: `workers diff`（1 本目）、`workers sync` の計画・blocked・導入と warm-up（2〜6 本目）、`doctor` への接続（この節）。
+
+S21 の残り（必須。S21 は完了していない）:
+1. policy digest（task-traffic-controller の実効 policy）を `envreport::collect` が測らない（常に `None`）。diff は `not_measured`、doctor は `not_checked` になり、worker を登録した親の doctor は差が無くても exit 0 にならない。doctor 自身の `traffic_policy` は host ごとの 2 つの scope を比べるだけで、親と worker の間は比べていない。
+2. doctor の `fail` の範囲は仕様に定めが無い。`auto_installable`（`workers sync` で直る差）と disk の不足も fail にした。notice に下げるかは未決定。
+3. doctor（`worker-service doctor`）は journal に記録した service の env で事実を集め、diff（`worker-service env`）は worker.json の env で測る。install が同じ値を書くが、読む場所は 2 つある。
+4. 親の service の env が保持されていないとき、`workers diff` は測定を拒否し（PATH が要る）、doctor は呼び出した shell の env で測る。
+5. doctor は worker ごとに ssh を 3 回（doctor・hello・env）直列で行う。`diff` の worker 省略時の並列化と合わせて未着手。
+6. 3 本目の節の残り 2〜4 と 6、4〜6 本目の節の残り（上の各節）。`--project` は workflow の `setup-*` 入力を読まない。`installed_inventory` の所要時間は未計測。
+7. 実機での受入（A44 の native 検証、S26）。
 
 ### S9a/S10 追補: worker と task-traffic-controller CLI の scope 統一（2026-11-17）
 
@@ -1321,14 +1341,14 @@ S23 の残り（必須。この変更で S23 は完了しない）:
 | `service_profile` | service の環境で worker profile を load し、起動時と同じ probe を通す | load できない |
 | `reachable`・`service`・`version`・`bridge`（worker のみ） | ssh で helper が答えるか、service が loaded / ready か、版が親と同じか、登録済み binary 経由の `hello` が同じ cluster と worker_id で完了するか（必須 feature の交渉を含む） | 到達不能・別 identity の答え・未 load・切替が未完または commit 待ち・hello 失敗。版の違いと drain 中は notice。host が切替中（`switch_running`）なら `service` は `not_checked` |
 | `legacy_config`（project） | 実行した directory の project の `.local-ci.toml` に、値のある未対応 key（`link-node-modules` など）があれば notice | fail にしない。config を解決できなければ `not_checked` |
-| `environment_diff`（worker ごと） | S21（`workers diff`）の差し込み口。`doctor::run` の `diff` 引数に worker 名から check を返す関数を渡すと、その結果が入る | この build では `not_checked` として列挙する |
+| `environment_diff`（worker ごと） | S21（`workers diff`）の結果。答えた worker ごとに `worker-service env` を尋ね、親との差を項目ごとに 1 check で載せる（上の「S21 `doctor` への接続」） | `differs`・`missing`・`auto_installable`・`manual_required` の項目。`not_measured` の項目と、比べられなかった worker は `not_checked` |
 
 受入項目との対応: A05 のうち「未修正 binary を doctor が不適合とする」を、偽の `task-traffic-controller`（`ledger_format` を出さない `status --json`）で、library と実 binary の両方で試験した。A36 のうち S23 の分は、旧い形の `status --json` をそのまま読めること（読めたうえで不適合と判定する）である。
 
 S23 の残り（必須。この変更でも S23 は完了しない）:
 1. **A05 の「同じ budget・policy を共有」は、現状の既定では成り立っていない。** worker の supervisor は `<state>/traffic` を scope にしており（`AgentConfig::new`。設定項目は無い）、同じ user の `task-traffic-controller` command の scope（`~/.local/state/task-traffic-controller`）とは別の ledger になる。doctor はこれを、command が導入済みの host では `traffic_state_path` の fail として報告する（command を日常的に使う host では doctor が必ず fail する）。scope を揃える変更は S9a / S10 の範囲で、ここでは行っていない。A05 はそれが決まるまで未達である。
 2. 「実行中 process」の検査（仕様の既存 state との互換の節）は未実装で、`traffic_processes` を `not_checked` として出す（process の走査はしていない）。command を導入した host では doctor は exit 0 にならない。
-3. S21 の `workers diff` の結果は差し込み口のみ（`not_checked`）。S21 が main に入ったあと、`doctor::command` が `run` に渡す `diff` を `None` から置き換える。それまで、worker を登録した親では doctor は exit 0 にならない（exit 1。`fail` があれば BLOCKED）。
+3. S21 の `workers diff` の結果は接続済み（上の「S21 `doctor` への接続」）。policy digest を親も worker も測らないので `not_checked` が 1 つ残り、worker を登録した親では doctor はまだ exit 0 にならない（exit 1。`fail` があれば BLOCKED）。
 4. Linux の linger の確認（仕様 §15）と、system-user mode（LaunchDaemon の `UserName`）の service user での profile 検査は未実装（S24・S22 の残り）。前者は report に項目として出していない。
 5. 本物の docker・実 SSH・実機の launchd 環境での doctor（A35 の「実際の service 環境で doctor が通る」）は未実施（S26）。偽の runner と偽の ssh は実挙動を確かめない。
 6. 親の local worker の service 環境は、`coordinator.json` の env が空のとき呼び出し shell の env で代用する（notice を出す）。
