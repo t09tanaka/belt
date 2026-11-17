@@ -25,6 +25,12 @@ pub struct VaultPage {
     pub paths: u32,
     pub removed: u32,
     pub unknown: u32,
+    /// Orphaned publication temporaries unlinked (separate bound of 32).
+    pub tmp_removed: u32,
+    /// Entries named like a publication temporary that the sweep left in
+    /// place: not provably ours, or not removable. Leftovers, not retention
+    /// failures, so they are not part of `unknown`.
+    pub tmp_retained: u32,
     pub errors: Vec<String>,
 }
 // st_dev is signed on macOS and u64 on Linux.
@@ -291,6 +297,15 @@ impl SourceStore {
             [&raw],
         )?;
         lease.register(&registration)?;
+        // A crashed publication is not retained data: no run owns the
+        // temporary name, and the exclusive lease proves no writer is alive.
+        // So this runs before, and regardless of, the clock and legacy Holds.
+        let swept = lease.sweep_orphan_tmp(32)?;
+        let swept = VaultPage {
+            tmp_removed: swept.removed,
+            tmp_retained: swept.retained,
+            ..Default::default()
+        };
         let previous: Option<String> = c
             .query_row("SELECT value FROM meta WHERE key='vault_clock'", [], |r| {
                 r.get(0)
@@ -308,10 +323,10 @@ impl SourceStore {
         let Some(now) = step.cutoff else {
             return Ok(VaultPage {
                 held: true,
-                ..Default::default()
+                ..swept
             });
         };
-        let mut report = VaultPage::default();
+        let mut report = swept;
         let mut budget = 64 * 1024 * 1024u64;
         let pending: Vec<(String, String)> = {
             let mut s=c.prepare("SELECT run_id,claim_json FROM vault_delete_claim WHERE done=0 ORDER BY run_id LIMIT 32")?;
@@ -346,7 +361,7 @@ impl SourceStore {
         if unknown {
             return Ok(VaultPage {
                 held: true,
-                ..Default::default()
+                ..report
             });
         }
         let candidates: Vec<(String, String)> = {

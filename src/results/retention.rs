@@ -24,6 +24,9 @@ pub struct PageReport {
     pub removed: u32,
     pub deleted: u32,
     pub foreign: u32,
+    /// Claims whose entry could not be removed (an I/O error on that entry):
+    /// they stay pending with their data and are tried again by a later page.
+    pub failed: u32,
     pub skipped: bool,
     pub clock_held: bool,
 }
@@ -82,7 +85,17 @@ pub fn page(
             )
             .into());
         }
-        files.remove(&pending.locator)?;
+        match files.remove(&pending.locator) {
+            Ok(()) => {}
+            // One entry that cannot be removed (permissions, a replaced
+            // ancestor) must not hold back the claims behind it. It stays
+            // pending and is never recorded as done.
+            Err(super::store::StoreError::Io(_)) => {
+                report.failed += 1;
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
         store.finish_result_delete(&guard, &pending)?;
         report.deleted += 1;
     }

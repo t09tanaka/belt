@@ -499,13 +499,7 @@ fn run_ci_plan(cli: &Cli) -> i32 {
                     serde_json::json!({"schema_version":1,"ok":true,"result":summary})
                 );
             } else {
-                println!(
-                    "{} workflows, {} tasks, {} nodes\nplan {}",
-                    summary.selected_workflows,
-                    summary.tasks.len(),
-                    summary.nodes.len(),
-                    summary.digest
-                );
+                println!("{}", crate::ci::summary::render_text(&summary));
             }
             exit::SUCCESS
         }

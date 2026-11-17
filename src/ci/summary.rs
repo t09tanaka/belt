@@ -229,9 +229,89 @@ pub(crate) fn summarize(fp: &FrozenPlan) -> Result<PlanSummary, PlanError> {
     })
 }
 
+fn reason_name<T: Serialize>(reason: &T) -> String {
+    // Core's own snake_case name, never a local paraphrase of it.
+    serde_json::to_string(reason)
+        .unwrap_or_default()
+        .trim_matches('"')
+        .to_string()
+}
+
+/// The human view of [`PlanSummary`] (spec 7): how many tasks can be placed on
+/// their own, what each waits for, the widest dependency layer, and why jobs
+/// stay together or a task is not split. Structural facts only, as in JSON.
+pub fn render_text(s: &PlanSummary) -> String {
+    let mut lines = vec![
+        format!(
+            "{} workflows, {} tasks, {} nodes",
+            s.selected_workflows,
+            s.tasks.len(),
+            s.nodes.len()
+        ),
+        format!("plan {}", s.digest),
+        format!(
+            "{} tasks can be placed independently, widest dependency layer {}",
+            s.tasks.len(),
+            s.dependency_layer_width
+        ),
+    ];
+    for t in &s.tasks {
+        if !t.depends_on.is_empty() {
+            lines.push(format!(
+                "task {} waits for {}",
+                t.id,
+                t.depends_on.join(", ")
+            ));
+        }
+        if let Some(grouping) = &t.grouping {
+            lines.push(format!(
+                "task {} keeps {} jobs on one host: {}",
+                t.id,
+                t.jobs.len(),
+                reason_name(grouping)
+            ));
+        }
+        if t.dynamic_matrix {
+            lines.push(format!(
+                "task {} expands its matrix when it runs: variants unknown",
+                t.id
+            ));
+        }
+    }
+    for g in s.shard_groups.iter().filter(|g| !g.split) {
+        let reasons: Vec<_> = g.not_split.iter().map(reason_name).collect();
+        lines.push(format!(
+            "task {} is not split: [{}]",
+            g.id,
+            reasons.join(", ")
+        ));
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SHARED: &str = "on: push\njobs:\n  first:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one > shared.txt\n  second:\n    needs: first\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo two > shared.txt\n  list:\n    runs-on: ubuntu-latest\n    outputs:\n      v: ${{ steps.l.outputs.v }}\n    steps:\n      - id: l\n        run: echo PRIVATE_SCRIPT\n  each:\n    needs: list\n    runs-on: ubuntu-latest\n    strategy:\n      matrix: ${{ fromJSON(needs.list.outputs.v) }}\n    steps:\n      - run: echo PRIVATE_SCRIPT\n";
+
+    #[test]
+    fn text_shows_placement_dependencies_width_and_why_jobs_stay_together() {
+        let fp = plan(&[(".github/workflows/ci.yml", SHARED)]);
+        let mut summary = summarize(&fp).unwrap();
+        let w = ".github/workflows/ci.yml";
+        let head = format!("1 workflows, 3 tasks, 4 nodes\nplan {}\n3 tasks can be placed independently, widest dependency layer 2\ntask {w}::first+second keeps 2 jobs on one host: shared_outputs\ntask {w}::each waits for {w}::list\ntask {w}::each expands its matrix when it runs: variants unknown\n", fp.digest);
+        let list = format!("task {w}::list is not split: [no_runner_adapter]\n");
+        let rest = format!("task {w}::each is not split: [no_runner_adapter]");
+        assert_eq!(
+            render_text(&summary),
+            format!("{head}task {w}::first+second is not split: [no_runner_adapter, shared_workspace]\n{list}{rest}")
+        );
+        assert!(!render_text(&summary).contains("PRIVATE_SCRIPT"));
+        // A group core did split has no reason to show.
+        summary.shard_groups[0].split = true;
+        assert_eq!(render_text(&summary), format!("{head}{list}{rest}"));
+    }
     use local_ci::frozen::{DisabledRecord, Filters, FrozenConfig, PlanParts, SourceRef};
 
     fn plan(workflows: &[(&str, &str)]) -> FrozenPlan {
