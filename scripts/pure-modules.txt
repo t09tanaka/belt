@@ -49,5 +49,6 @@ src/service/macos/policy.rs
 src/service/macos/observe.rs
 src/toolchain/versions.rs
 src/toolchain/declarations.rs
+src/ci/shards.rs
 src/service/systemd/policy.rs
 src/service/worker/ephemeral/plan.rs

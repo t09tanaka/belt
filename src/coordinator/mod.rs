@@ -154,6 +154,27 @@ pub struct CiSpec {
     /// shown where the task is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unrunnable: Option<String>,
+    /// The task is a shard of this split job of the plan. The progression
+    /// looks at the run until the job is joined
+    /// (`CoordinatorStore::ci_waiting_runs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_group: Option<String>,
+    /// The split job this shard belongs to has its one outcome: every shard
+    /// of it ended and the progression put them together. Until then the run
+    /// is not settled (`CoordinatorStore::completion`). A retry of a shard of
+    /// the job takes it away again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub joined: bool,
+    /// The split job is a failure, with what is wrong: the run is no success
+    /// even when the attempt of every shard is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub join_failure: Option<String>,
+    /// The split job is a failure and this shard is one a retry of the run
+    /// runs again although its attempt succeeded: its tests failed, it left
+    /// no receipt, or it did not report exactly the tests it was given
+    /// (`ci::shards::rerun`). A retry takes it away.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rerun: bool,
 }
 
 /// The one place an [`AttemptPayload`] is made.

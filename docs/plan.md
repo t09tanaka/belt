@@ -1550,7 +1550,7 @@ S24 の残り（必須。この変更で S24 は完了しない）:
 - inputs の上限は 1 MiB（worker の上限 4 MiB、接続の frame 2 MiB より小さく）。超えた task は event `ci_task_unrunnable` を残して cancel する（run は成功にならない）。
 - 宣言が 1024 件のとき結果を足すと 1025 件になる点: CI task が宣言できる artifact と output は合わせて 1023 件まで。`ci` は今、artifact も output も宣言しない。
 - 除外の理由は新しい `Exclusion` を足さず、`CapabilityMismatch` と `unmet` で表した。 plan を受け取らなかった worker だけは別で、`CapabilityMismatch` にすると全員がそうのとき `no_compatible_worker` になってしまう（一時的な理由なのに）ので、`Exclusion::InputRefused` を足した。
-- 提出で断るもの: matrix の variant・式の matrix・shard・`services:` を持つ plan、secret_files を持つ source、task が 1 つも無い plan。64 個を超える task は resident が断る（既存の上限）。
+- 提出で断るもの: matrix の variant・式の matrix・`services:` を持つ plan、secret_files を持つ source、task が 1 つも無い plan。64 個を超える task は resident が断る（既存の上限）。 split 済みの Shard は S18 から受け付ける（plan の ShardGroup と形が合わないものだけを断る）。
 - `ci` は toolchain の凍結（`exec` の `freeze_toolchains`）をしない。profile と requires は `exec` と同じく task に入れる。
 
 テスト:
@@ -1583,3 +1583,39 @@ S24 の残り（必須。この変更で S24 は完了しない）:
 - 自分で決めたこと: (a) は run 全体の cancel ではなく、未配置の task だけを cancel する（実行中の Job は結果を残させる。plan が無くても worker は自分の写しで実行できる）。(b) は fail にせず除外にした（worker の GC で空けば解ける一時的な状態で、ほかの worker が取れる）。全 worker が断っている間は、理由付きで待つ。待つ時間に上限は設けていない。
 - テスト: lib（`coordinator::tests` 2 件、`input_gate` 2 件、`policy` 4 件、`ci_runs` 2 件、`advance` の分類）。`tests/it/collection.rs` 2 件（plan が消えた run、plan を受け取らない代役の worker）。`tests/it/bootstrap.rs` 1 件（実 binary・resident・local worker で、worker の `ci-plans/` を 256 件で埋めると `ci` が理由を残して待ち、空けると完了する）。
 - 残り: 配送の側で親が plan を読めない場合（待機中の task を持たない run）は、分類の単体テストだけで、実 binary のテストは無い。`ci_run_stalled` は event に残すだけで、`show` には出していない（DB が使えない間は event も書けない）。すでに worker に配置された attempt が plan を待っている場合（cold placement）の扱いは変えていない。`fail_ci_tasks` が cancel するのは attempt を 1 つも持たない task だけなので、`retry` で queue に戻った task（retire 済みの attempt を持つ）は、親の plan が消えていても cancel されず、配送が失敗し続ける（event も出ない）。どの worker でも ready でなく、1 台が plan を断っている run では、転送時間の実測がある worker に prefetch の hint が出るようになった（以前は何もせず戻っていた。配置はしない）。
+
+### S18: sharding の配置（2026-11-17、main `979fec2` 起点）
+
+FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard を配置し、集約し、fail-fast で止め、失敗した Shard だけを retry できるようにした。local-ci は 0.13.0 のままで、変更していない。
+
+- 判断は pure module `src/ci/shards.rs` に置いた（`scripts/pure-modules.txt` に登録）。Shard と ShardGroup の対応（`group_of`）、親が配置できる形かの検査（`shape_fault`）、receipt の本物判定（task と Job の名前が一致するものだけ。`receipt`）、Shard の失敗（`shard_failed`）、fail-fast で止める Shard（`to_cancel`）、Shard の outcome から Job の outcome を作る規則（`combine`・`conflicting_outputs`・`join`）、問題の要約（512 文字まで。`diagnostic`）。規則は local-ci の共有 Driver（0.18 の `driver/shards.rs`）と同じで、test の集合の検査は `local_ci::complete::aggregate_shard_group` を呼ぶ。`combine` と `conflicting_outputs` は 0.13.0 で非公開のため、同じ規則を写した。
+- 配置: `ci::progress::unsupported` は Shard を断らなくなり、形が plan と合わないものだけを断る。Shard は依存を持たないので、提出の時点で全部が queue に入り、同じ tick で並んで配置される。
+- 集約: `NeedsProgression` は、ShardGroup の全 Shard が終わったときに Job の outcome を 1 つ作る。後続の task の inputs と `outcome()` には、Shard ごとの outcome ではなくこの 1 つだけを出す。全 Shard が成功でも、receipt の無い Shard・報告されなかった test・二重に報告された test・Shard 間で値の違う output があれば Job は failure になり、理由を持つ。
+- fail-fast: ShardGroup が `fail_fast` で、終わった Shard に失敗が有ると、進行は終わっていない Shard に `ActionKind::Cancel` を出す。host（`ci::advance`）は、未配置なら `fail_ci_tasks`（理由を `ci.unrunnable` に書いて cancel）、配置済みなら `cancel_task`（coordinator が tick で worker に届ける）で止める。cancel 要求済みの行には何もしないので、pass を繰り返しても 1 回だけになる。失敗した Shard の結果は残る。
+- pass が見る run: `ci_waiting_runs` は、待機中の task を持つ run に加えて、まだ集約されていない split Job の Shard（`CiSpec.shard_group` が有り `joined` が無い）を持つ run を返す。cancel 済みの Shard も数える（cancel された run の Job も集約して run を確定させるため）。後続の Job を持たない split Job でも fail-fast と集約が働く。
+- retry: run の retry は成功した task を飛ばすので、失敗した Shard と止められた Shard だけが同じ FrozenPlan の新しい attempt になり、通過した Shard は attempt も結果もそのまま残る。S15 の規則を 1 点だけ広げた: fail-fast で一度も配置されないまま cancel された Shard（attempt が無く、cancel 済みで、`ci.unrunnable` が fail-fast の理由のもの）は retry の対象になり、cancel と理由を外して queue に戻る。attempt を持たないそれ以外の task は従来どおり断る。Shard を retry すると、その ShardGroup の全 Shard から `joined`・`join_failure` を外し、全部が終わったら残した結果と新しい結果から Job の outcome を作り直す。 attempt が成功でも「単独で通過」と言えない Shard はやり直す: Job が failure で集約されたとき、receipt が無い・test が失敗した・渡された test をちょうど 1 回ずつ報告していない Shard に `ci.rerun` を付け（全 Shard が単独では通過していて集約だけが failure のときは全 Shard。`ci::shards::verified`・`rerun`）、run の retry はこれを成功扱いにしない。集約の書き込み（`join_ci_shards`）は、同じ transaction の中で全 Shard が終了していることを確かめ、読んだ後に retry が入った場合は何も書かない。
+- 報告: `ci` の Job の行に `part` を足した。Shard は `shard`（名前は plan の task id）、split Job は全 Shard が終わった後に `job` の行が 1 つ付き、failure のときは `reason` に問題の要約が入る。
+- run の結果: split Job の outcome は、進行の pass が全 Shard の終了を見た時点で Shard の行に書く（`CoordinatorStore::join_ci_shards`。`ci.joined`、failure なら `ci.join_failure` に理由、event `ci_job_joined`）。run の結果（`CoordinatorStore::completion`）はこれを読む。集約前の Shard は「回収待ち」と同じ扱いで run は確定せず、集約が failure なら attempt が全部成功でも run は失敗（exit code 1。attempt 自体の失敗が有ればその exit code が先）になる。`ci`・`wait`・`show`・JSON・status（S19）は同じ run の結果を読むので、どこでも同じになる。task 単位の結果（`wait <task>`）は Shard 自身の結果のままである。進められない run（plan が消えた等）は、未集約の split Job を理由付きの failure として閉じる（`fail_ci_joins`）。 run が何で失敗したか（exit code）は、fail-fast で止められただけの Shard ではなく実際に失敗した task のものにする（run 全体の cancel が無いとき。task id の順に依らない）。attempt は成功で test だけが失敗した Shard が原因のときは Job の失敗（exit code 1）になる。
+- 分割できない Job（A41）: 分割の要求が断られた plan は元の task 1 件のままで、ほかの Job と同じ経路で動く。理由は `ci plan` の `shard_groups[].not_split` と text の `is not split: [...]` に出る（S16 で実装済み）。
+
+自分で決めたこと:
+
+- Job の outcome は Shard の順（plan の `shards` の順）で作る。到着順は使わない。
+- receipt の名前が合わない結果は、進行を止める誤りにせず「receipt 無し」として扱う（Job は failure になり、`missing: shard …` と出る）。
+- fail-fast の「失敗」は、Shard の Job が failure か、receipt に失敗した test が有るか exit が失敗のとき。cancel された Shard と skipped は失敗に数えない。
+- receipt に失敗した test が有れば、Shard の step が成功で、ほかの Shard が止められて cancelled でも、Job は failure にする（共有 Driver は success のときだけ failure に変える。fail-fast で止めた結果が「cancelled」になり失敗が隠れるため、ここは変えた）。
+- split Job の行の `reason` は Driver と同じ要約を出すが、failure のときは Shard 個別の skip 理由（`skipped`）を出さない。
+
+テスト: `tests/it/collection.rs` に 8 件（A39: Vitest と Jest の file 単位の分割を worker 2 台の構成で同じ tick に配置し、全 file が 1 回ずつで Job が 1 つになること、報告されない file が有ると Job が failure になること。A40: 履歴で遅い test が 1 Shard になり最長の Shard が短くなること、履歴無しでも同じ分割になり実行できること。A41: 分割できない理由の表示と単一 Job への fallback、fail-fast の cancel の配送と停止確認と報告、後続を持たない Job で一度に配置しきれない Shard が未配置のまま止まること、retry、全 Shard が成功で集約だけが failure の run が集約まで確定せず失敗で確定すること）。失敗の原因と retry の対象は、止められた Shard の id が先に並ぶ場合、attempt が成功で test だけ失敗した場合、報告漏れの Shard だけをやり直す場合、retry の後の古い集約が書かれない場合を含む。lib は `ci::shards` 11 件、`ci::progress` 3 件、`ci_run` 1 件（ほかに既存の 2 件へ追記）。mutation は `src/ci/shards.rs` と `src/service/completion.rs` を手元で回した。
+
+残り（S18 の必須範囲として維持する）:
+
+- 本番の `ci` は分割の要求（`ShardRequest`）を作らない。`service::planning::freeze` は test の列挙（adapter の discover）を走らせないので、実際の `ci` の plan は今も Shard を持たない。上のテストは `FrozenPlan::with_shards` で作った plan を使う。列挙をどこで走らせるか（親か worker か、どの workspace か）は未決定で、adapter 本体の側の作業である。
+- 履歴の入力元が無い（A40）。worker が返す `TestResult` は所要時間を持たず、`History` と `PartitionOpts.speed_permille`（worker の性能補正）に入れる値を RTR は記録していない。Shard 数を worker の実効容量と残りの DAG から決める処理も無い。
+- worker が Shard を実際に実行する経路（`execute_pinned_task` が Shard の command を作り `ShardOutcome` を返す）は local-ci の側のテストに任せていて、RTR では実 runner を動かしていない。テストの worker は receipt を手で作る。
+- retry しても、すでに failure の inputs で release された後続の task はやり直さない（S16 の plain な Job と同じ）。
+- 非冪等な runner の明示的な retry 許可（`ExecutionTask.retry`）は見ていない。
+- coverage の merge、JUnit などの artifact の重複・欠落の検査、assertion 数の集約は無い（local-ci は coverage を集める Job を分割しない）。
+- `ci plan` は split 済みの ShardGroup を JSON の `shard_groups` に出すが、text では数だけである。
+- 集約は resident の進行の pass が行う。resident が止まっている間は、全 Shard が終わっていても run は確定しない（待機中の task を持つ run と同じ）。
+- fail-fast で止めた実行中の Shard には理由を記録していない（未配置で止めたものだけ `ci.unrunnable` に理由が残る）。

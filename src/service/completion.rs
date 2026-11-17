@@ -117,6 +117,34 @@ impl Snapshot {
             }
         }
     }
+    /// A job of the run is a failure although the attempt of every task of
+    /// it succeeded (the shards of a split job do not hold every test once):
+    /// the run is no success. A failure of an attempt, which has an exit
+    /// code of its own, comes first.
+    pub fn job_failure(&mut self, id: TaskId, termination: Option<Termination>) {
+        if self.first_compute_failure.is_none() {
+            self.first_compute_failure = Some(Failure {
+                task_id: id,
+                code: ErrorCode::CommandFailed,
+                exit_code: ErrorCode::CommandFailed.exit_code_with(Some(1)),
+                termination,
+            });
+        }
+    }
+    /// The failure of the run is this task's instead of the one found first:
+    /// a shard that was only stopped because another failed (fail-fast) is
+    /// not what the run failed of, wherever its id sorts. Nothing changes
+    /// when the termination is no failure.
+    pub fn prefer_failure(&mut self, id: TaskId, termination: Termination) {
+        if let Some((code, exit_code)) = compute_failure(termination) {
+            self.first_compute_failure = Some(Failure {
+                task_id: id,
+                code,
+                exit_code,
+                termination: Some(termination),
+            });
+        }
+    }
     pub fn stop_confirmed(&self) -> bool {
         if self.accepted {
             (self.task_count > 0 && self.computed_tasks == self.task_count)
@@ -202,6 +230,70 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    #[test]
+    fn a_failed_job_fails_a_run_of_successful_attempts_and_an_attempt_failure_comes_first() {
+        let done = Some(term(Outcome::Succeeded, Some(Exit::Code(0))));
+        let mut s = Snapshot::new(target(), true, false);
+        let passed = TaskId::generate();
+        s.task(
+            passed.clone(),
+            Some(AttemptState::Terminal),
+            Some(Observation::Known),
+            done,
+            false,
+            Some("complete"),
+        );
+        assert_eq!(s.exit_code(), Some(0));
+        s.job_failure(passed.clone(), done);
+        assert_eq!(s.exit_code(), Some(1));
+        let failure = s.first_compute_failure.clone().unwrap();
+        assert_eq!(failure.task_id, passed);
+        assert_eq!(failure.code, ErrorCode::CommandFailed);
+        assert_eq!(failure.termination, done);
+        // The exit code of an attempt that failed is kept.
+        let mut s = Snapshot::new(target(), true, false);
+        let failed = TaskId::generate();
+        s.task(
+            failed.clone(),
+            Some(AttemptState::Terminal),
+            Some(Observation::Known),
+            Some(term(Outcome::Failed, Some(Exit::Code(7)))),
+            false,
+            Some("complete"),
+        );
+        s.job_failure(passed, done);
+        assert_eq!(s.exit_code(), Some(7));
+        assert_eq!(s.first_compute_failure.unwrap().task_id, failed);
+    }
+    #[test]
+    fn the_failure_of_a_run_is_the_real_one_and_not_a_shard_that_was_only_stopped() {
+        let mut s = Snapshot::new(target(), true, false);
+        let (stopped, failed) = (TaskId::generate(), TaskId::generate());
+        // The stopped shard is read first: it was never placed.
+        s.task(stopped.clone(), None, None, None, true, None);
+        let real = term(Outcome::Failed, Some(Exit::Code(7)));
+        s.task(
+            failed.clone(),
+            Some(AttemptState::Terminal),
+            Some(Observation::Known),
+            Some(real),
+            false,
+            Some("complete"),
+        );
+        assert_eq!(s.exit_code(), Some(crate::error::exit::CANCELLED));
+        // A termination that is no failure changes nothing.
+        s.prefer_failure(
+            failed.clone(),
+            term(Outcome::Succeeded, Some(Exit::Code(0))),
+        );
+        assert_eq!(s.first_compute_failure.clone().unwrap().task_id, stopped);
+        s.prefer_failure(failed.clone(), real);
+        assert_eq!(s.exit_code(), Some(7));
+        let failure = s.first_compute_failure.unwrap();
+        assert_eq!(failure.task_id, failed);
+        assert_eq!(failure.code, ErrorCode::CommandFailed);
+        assert_eq!(failure.termination, Some(real));
     }
     #[test]
     fn parses_exact_typed_targets() {
