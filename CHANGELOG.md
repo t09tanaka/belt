@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.10.4] - 2026-11-17
+
 ### Changed
 - `top`: the `▌` band at the left of a queue row now marks only the running
   rows; a waiting row leaves that column blank, so the running ones stand out.
