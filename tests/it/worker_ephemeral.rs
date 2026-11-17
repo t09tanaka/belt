@@ -9,7 +9,9 @@ use std::process::Stdio;
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
-const T: Duration = Duration::from_secs(20);
+/// Generous: a coverage-instrumented binary under a loaded runner starts and
+/// exits slowly, and these only bound a hang.
+const T: Duration = Duration::from_secs(60);
 
 struct Fx {
     root: tempfile::TempDir,
@@ -39,6 +41,9 @@ impl Fx {
             .arg(self.home().join("key"))
             .args(extra)
             .env("HOME", self.home())
+            // The resident journal is found through the config home; an
+            // inherited one would point past this private HOME.
+            .env_remove("XDG_CONFIG_HOME")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
@@ -83,6 +88,7 @@ impl Fx {
         let mut bridge = tokio::process::Command::new(BIN)
             .args(["worker", "--stdio"])
             .env("HOME", self.home())
+            .env_remove("XDG_CONFIG_HOME")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
