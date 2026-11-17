@@ -1,7 +1,7 @@
 //! Durable transition from discovery attempts to a fully partitioned run.
 use super::*;
 use crate::ci::discovery::{apply, DiscoveryStep, WorkerListing};
-use local_ci::shard::{adapters::Isolation, PartitionOpts};
+use local_ci::shard::adapters::Isolation;
 
 fn metadata(row: &CiTaskRow) -> Option<&serde_json::Value> {
     row.spec.pointer("/ci/task/inputs/rtr_discovery")
@@ -80,6 +80,7 @@ pub(super) fn advance(
     let mut policies = BTreeMap::new();
     let mut listings = Vec::new();
     let mut ids = Vec::new();
+    let mut placements = BTreeMap::new();
     for probe in std::iter::once(first).chain(probes) {
         let id = probe
             .spec
@@ -102,28 +103,72 @@ pub(super) fn advance(
             }
             policies.insert((p.workflow.clone(), p.job.clone()), p);
         }
+        if let Some(attempt) = &probe.attempt {
+            if let Some(decision) =
+                crate::scheduler::reason_of(store, &attempt.attempt_id).map_err(transient)?
+            {
+                let workers = decision
+                    .compared
+                    .iter()
+                    .map(|c| c.worker_id.to_string())
+                    .collect::<Vec<_>>();
+                let transfer = crate::scheduler::decide::TRANSFER;
+                let lower_bound = decision
+                    .compared
+                    .iter()
+                    .map(|candidate| {
+                        if candidate.costs.assumed[transfer] {
+                            0
+                        } else {
+                            candidate.costs.ms[transfer].unwrap_or(0)
+                        }
+                    })
+                    .min()
+                    .unwrap_or(0);
+                placements.insert(
+                    (listing.step.workflow.clone(), listing.step.job.clone()),
+                    (workers, lower_bound),
+                );
+            }
+        }
         ids.push(probe.task_id.clone());
         listings.push(listing);
     }
     let project = metadata(first)
         .and_then(|m| m["project"].as_str())
         .ok_or_else(|| unrunnable("missing timing scope"))?;
+    // Keep the original jobs, probes and their replacement members inside
+    // the queue limit even if every discovered job expands at once.
+    let max_shards =
+        1 + crate::storage::MAX_TASKS_PER_RUN.saturating_sub(rows.len()) / listings.len().max(1);
     let mut histories = BTreeMap::new();
     for listing in &listings {
         let key = listing.history_key(&plan, project).map_err(unrunnable)?;
         let history = store
             .ci_test_timings(key.clone(), listing.discovered.tests.clone())
             .map_err(transient)?;
-        histories.insert(key, history);
+        let placement = placements.get(&(listing.step.workflow.clone(), listing.step.job.clone()));
+        let (workers, transfer) = placement
+            .map(|(w, t)| (w.as_slice(), *t))
+            .unwrap_or((&[], 0));
+        let model = crate::ci::discovery::timing::calibrate(
+            &history,
+            workers,
+            capacity.min(listing.discovered.tests.len()).min(max_shards),
+            transfer,
+        );
+        histories.insert(key, model);
     }
     let split = apply(
         &plan,
         &listings,
-        capacity,
-        &PartitionOpts::default(),
+        capacity.min(max_shards),
         |listing| {
             let key = listing.history_key(&plan, project)?;
-            Ok(histories.get(&key).cloned().unwrap_or_default())
+            let model = histories
+                .get(&key)
+                .ok_or_else(|| anyhow::anyhow!("missing discovery timing model"))?;
+            Ok((model.history.clone(), model.costs.clone()))
         },
         |step| {
             policies
@@ -188,6 +233,18 @@ pub(super) fn advance(
                     .unwrap_or(!matches!(runner, "playwright" | "cypress"));
                 if let Some(ci) = &mut spec.ci {
                     ci.shard_retry_forbidden = !allowed;
+                    if let Some(listing) = listings.iter().find(|listing| {
+                        listing.step.workflow == original.workflow
+                            && listing.step.job == original.jobs[0]
+                    }) {
+                        let key = listing.history_key(&plan, project).map_err(unrunnable)?;
+                        ci.shard_preferred_worker = histories
+                            .get(&key)
+                            .and_then(|m| m.slots.get(i))
+                            .map(|w| crate::ids::WorkerId::parse(w))
+                            .transpose()
+                            .map_err(unrunnable)?;
+                    }
                 }
             }
             parts.push((task, serde_json::to_value(spec).map_err(unrunnable)?));

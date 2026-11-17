@@ -111,6 +111,7 @@ pub fn task_specs(
             let spec = TaskSpec {
                 ci: Some(CiSpec {
                     shard_retry_forbidden: false,
+                    shard_preferred_worker: None,
                     task: CiTask {
                         plan_digest: plan_digest.clone(),
                         task_id: task.id.clone(),

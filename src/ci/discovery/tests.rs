@@ -55,12 +55,22 @@ fn an_exact_worker_listing_is_split_with_history_and_bound_to_its_plan() {
             .basis,
         Basis::Fallback
     );
+    let mut expensive = listing.clone();
+    expensive.setup_ms = Some(120);
+    assert_eq!(
+        expensive
+            .partition(&plan, &timing, 2, &costs, Isolation::None)
+            .unwrap()
+            .plan
+            .shards
+            .len(),
+        1
+    );
     let split = apply(
         &plan,
         std::slice::from_ref(&listing),
         2,
-        &costs,
-        |_| Ok(timing.clone()),
+        |_| Ok((timing.clone(), costs.clone())),
         |_| Isolation::None,
     )
     .unwrap();
@@ -74,8 +84,7 @@ fn an_exact_worker_listing_is_split_with_history_and_bound_to_its_plan() {
         &plan,
         &[],
         2,
-        &costs,
-        |_| Ok(timing.clone()),
+        |_| Ok((timing.clone(), costs.clone())),
         |_| Isolation::None
     )
     .is_err());

@@ -2100,6 +2100,7 @@ fn a_run_of_ci_tasks_is_a_request_an_older_resident_refuses() {
     let ci = TaskSpec {
         ci: Some(crate::coordinator::CiSpec {
             shard_retry_forbidden: false,
+            shard_preferred_worker: None,
             task: crate::wire::CiTask {
                 plan_digest: Digest::of_bytes(b"plan"),
                 task_id: "t".into(),

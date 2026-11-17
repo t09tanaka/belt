@@ -196,8 +196,8 @@ impl NeedsProgression {
 
     /// Times from a complete, successful join. Partial receipts, skipped
     /// tests and absent measurements do not become observations.
-    pub fn timing_samples(&self, group: &ShardGroup) -> local_ci::shard::History {
-        let mut history = local_ci::shard::History::default();
+    pub fn timing_samples(&self, group: &ShardGroup) -> BTreeMap<String, local_ci::shard::History> {
+        let mut history = BTreeMap::<String, local_ci::shard::History>::new();
         if self
             .joins
             .get(&group.id)
@@ -205,11 +205,11 @@ impl NeedsProgression {
         {
             return history;
         }
-        for test in group
+        for (shard, test) in group
             .shards
             .iter()
-            .filter_map(|id| self.receipts.get(id))
-            .flat_map(|r| &r.tests)
+            .filter_map(|id| self.receipts.get(id).map(|r| (id, r)))
+            .flat_map(|(id, r)| r.tests.iter().map(move |test| (id, test)))
         {
             if test.status != local_ci::shard::TestStatus::Passed {
                 continue;
@@ -222,7 +222,11 @@ impl NeedsProgression {
             if let Some(ms) =
                 millis.filter(|n| *n <= u64::MAX / crate::supervisor::ci_task::MAX_PLAN_BYTES)
             {
-                history.millis.insert(test.identity.clone(), ms);
+                history
+                    .entry(shard.clone())
+                    .or_default()
+                    .millis
+                    .insert(test.identity.clone(), ms);
             }
         }
         history

@@ -23,6 +23,7 @@ pub struct CiTaskRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CiAttempt {
     pub attempt_id: AttemptId,
+    pub worker: String,
     /// How it ended; `None` while it has not.
     pub termination: Option<Termination>,
     /// The verdict of its collection, once the collection is closed
@@ -75,7 +76,7 @@ impl CoordinatorStore {
             let mut query = c.prepare(
                 "SELECT t.task_id,t.spec_json,t.cancel_requested_at_ms IS NOT NULL,
                         a.attempt_id,a.state,a.termination_json,
-                        CASE WHEN x.closed_at_ms IS NOT NULL THEN x.verdict ELSE NULL END
+                        CASE WHEN x.closed_at_ms IS NOT NULL THEN x.verdict ELSE NULL END,a.worker_id
                  FROM task t
                  LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa
                      WHERE aa.task_id=t.task_id AND aa.retired=0 AND aa.generation>=t.min_generation
@@ -101,6 +102,7 @@ impl CoordinatorStore {
                                 .map(|t| from_json("termination", &t))
                                 .transpose()?,
                             collection: row.get(6)?,
+                            worker: row.get(7)?,
                         })
                     }
                 };
@@ -146,7 +148,7 @@ impl CoordinatorStore {
         failure: Option<&str>,
         rerun: &[String],
         at_ms: u64,
-        timings: Option<(String, local_ci::shard::History)>,
+        timings: Option<(String, Vec<(String, local_ci::shard::History)>)>,
     ) -> Result<bool> {
         let (run, group, failure, rerun) = (
             run.to_string(),
@@ -171,10 +173,12 @@ impl CoordinatorStore {
                 return Ok(false);
             }
             if let Some((scope, history)) = timings {
-                let mut insert = tx.prepare_cached("INSERT INTO ci_test_timing(scope,identity,millis) VALUES(?1,?2,?3)
-                    ON CONFLICT(scope,identity) DO UPDATE SET millis=excluded.millis")?;
-                for (identity, millis) in history.millis {
-                    insert.execute(params![scope, identity, to_i64(millis)?])?;
+                let mut insert = tx.prepare_cached("INSERT INTO ci_test_timing(scope,worker,identity,millis) VALUES(?1,?2,?3,?4)
+                    ON CONFLICT(scope,identity,worker) DO UPDATE SET millis=excluded.millis")?;
+                for (worker, shard) in history {
+                    for (identity, millis) in shard.millis {
+                        insert.execute(params![scope, worker, identity, to_i64(millis)?])?;
+                    }
                 }
             }
             for task in &rerun {
@@ -231,20 +235,23 @@ impl CoordinatorStore {
         &self,
         scope: String,
         identities: Vec<String>,
-    ) -> Result<local_ci::shard::History> {
+    ) -> Result<std::collections::BTreeMap<String, local_ci::shard::History>> {
         self.db.call(move |c| {
             let tx = c.unchecked_transaction()?;
-            let mut history = local_ci::shard::History::default();
+            let mut history = std::collections::BTreeMap::<String, local_ci::shard::History>::new();
             {
                 let mut query = tx.prepare_cached(
-                    "SELECT millis FROM ci_test_timing WHERE scope=?1 AND identity=?2",
+                    "SELECT worker,millis FROM ci_test_timing WHERE scope=?1 AND identity=?2",
                 )?;
                 for identity in identities {
-                    let millis: Option<i64> = query
-                        .query_row(params![scope, identity], |r| r.get(0))
-                        .optional()?;
-                    if let Some(millis) = millis {
-                        history.millis.insert(identity, to_u64(millis)?);
+                    let mut rows = query.query(params![scope, identity])?;
+                    while let Some(row) = rows.next()? {
+                        let worker: String = row.get(0)?;
+                        history
+                            .entry(worker)
+                            .or_default()
+                            .millis
+                            .insert(identity.clone(), to_u64(row.get(1)?)?);
                     }
                 }
             }

@@ -141,6 +141,9 @@ pub struct CiSpec {
     /// explicitly allow retry for a non-idempotent runner.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub shard_retry_forbidden: bool,
+    /// Final tie-break for a manifest balanced with this worker's measured speed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shard_preferred_worker: Option<WorkerId>,
 
     /// What the worker is sent: the plan by its digest, the task, and the
     /// results of the jobs it needs.
@@ -1740,7 +1743,14 @@ impl Coordinator {
                     why: Exclusion::NoForecast,
                 });
             }
-            let decision = decide::decide(candidates, excluded, self.sched.cfg.rules);
+            let decision = decide::decide_for_shard(
+                candidates,
+                excluded,
+                self.sched.cfg.rules,
+                spec.ci
+                    .as_ref()
+                    .and_then(|c| c.shard_preferred_worker.as_ref()),
+            );
             let Some(winner) = decision.winner.clone() else {
                 return self.note_waiting(task, &decision).await;
             };

@@ -210,6 +210,19 @@ pub struct Client {
     cluster_id: ClusterId,
     owner_token: String,
 }
+fn submit_count_is_valid(tasks: &[(TaskId, TaskSpec)]) -> bool {
+    let discovery = tasks
+        .iter()
+        .filter(|(_, spec)| {
+            spec.ci
+                .as_ref()
+                .is_some_and(|ci| crate::wire::is_discovery_task(&ci.task))
+        })
+        .count();
+    let jobs = tasks.len() - discovery;
+    (1..=64).contains(&jobs) && discovery <= jobs
+}
+
 impl Operation {
     fn requires_toolchains(&self) -> bool {
         match self {
@@ -1378,7 +1391,7 @@ async fn handle(
                 tasks,
             } => {
                 drop(gate);
-                let answer = if tasks.is_empty() || tasks.len() > 64 {
+                let answer = if !submit_count_is_valid(&tasks) {
                     Reply::Error {
                         message: "submit requires 1..64 tasks".into(),
                     }
@@ -1515,7 +1528,7 @@ async fn handle(
                         checked=checked=>checked??,
                     };
                     anyhow::ensure!(
-                        !tasks.is_empty() && tasks.len() <= 64,
+                        submit_count_is_valid(&tasks),
                         "submit requires 1..64 tasks"
                     );
                     anyhow::ensure!(

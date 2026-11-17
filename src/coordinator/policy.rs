@@ -319,6 +319,7 @@ mod tests {
         crate::coordinator::TaskSpec {
             ci: ci.then(|| crate::coordinator::CiSpec {
                 shard_retry_forbidden: false,
+                shard_preferred_worker: None,
                 task: crate::wire::CiTask {
                     plan_digest: digest.clone(),
                     task_id: "ci.yml/build".into(),

@@ -1,6 +1,7 @@
 //! Bind a worker's listing to the frozen job and use the same runner adapter
 //! for listing, partitioning and execution. The listing carries no worker paths.
 
+pub(crate) mod timing;
 mod worker;
 
 use local_ci::dag::{NotSplit, ShardRequest};
@@ -320,8 +321,7 @@ pub fn apply(
     plan: &FrozenPlan,
     listings: &[WorkerListing],
     count: usize,
-    costs: &PartitionOpts,
-    history: impl Fn(&WorkerListing) -> anyhow::Result<History>,
+    evidence: impl Fn(&WorkerListing) -> anyhow::Result<(History, PartitionOpts)>,
     isolation: impl Fn(&DiscoveryStep) -> Isolation,
 ) -> anyhow::Result<FrozenPlan> {
     let expected = candidates(plan);
@@ -335,11 +335,12 @@ pub fn apply(
             .iter()
             .find(|r| r.step == expected_step)
             .ok_or_else(|| anyhow::anyhow!("discovery step missing from batch"))?;
+        let (history, costs) = evidence(listing)?;
         requests.push(listing.partition(
             plan,
-            &history(listing)?,
+            &history,
             count,
-            costs,
+            &costs,
             isolation(&expected_step),
         )?);
     }

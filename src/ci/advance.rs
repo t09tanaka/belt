@@ -335,7 +335,15 @@ fn advance_run(
                 &first.dir,
                 group.runner.as_ref()?,
             );
-            Some((scope, progress.timing_samples(group)))
+            let observations = progress
+                .timing_samples(group)
+                .into_iter()
+                .filter_map(|(shard, history)| {
+                    let worker = &members.get(&shard)?.row.attempt.as_ref()?.worker;
+                    Some((worker.clone(), history))
+                })
+                .collect();
+            Some((scope, observations))
         })();
         let changed = store
             .join_ci_shards_with_timings(run, &group.id, failure.as_deref(), rerun, now_ms, timings)

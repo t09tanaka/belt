@@ -26,6 +26,7 @@ mod tests;
 mod worker;
 
 pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
+pub(crate) use coordinator::MAX_TASKS_PER_RUN;
 pub use coordinator::{
     ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, InputCursor,
     InputPage, LiveAttempt, LiveAttemptPage, NewAttempt, Permit, PlaceInput, PlaceOutcome,

@@ -544,7 +544,14 @@ impl Coordinator {
                 outlook,
             });
         }
-        let decision = decide::decide(candidates, excluded, self.sched.cfg.rules);
+        let decision = decide::decide_for_shard(
+            candidates,
+            excluded,
+            self.sched.cfg.rules,
+            spec.as_ref()
+                .and_then(|s| s.ci.as_ref())
+                .and_then(|c| c.shard_preferred_worker.as_ref()),
+        );
         let components = decision
             .compared
             .iter()

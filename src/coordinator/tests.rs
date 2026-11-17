@@ -261,6 +261,7 @@ fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
     TaskSpec {
         ci: Some(CiSpec {
             shard_retry_forbidden: false,
+            shard_preferred_worker: None,
             task: crate::wire::CiTask {
                 plan_digest: Digest::of_bytes(b"plan"),
                 task_id: "ci.yml/build".into(),
