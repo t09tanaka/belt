@@ -504,6 +504,7 @@ mod tests {
         let d = Digest::of_bytes(b"x");
         let payload = AttemptPayload {
             ci_task: Some(crate::wire::CiTask {
+                verify_shard_version: false,
                 artifact_workflow: None,
                 dispatch: None,
                 plan_digest: Digest::of_bytes(&bytes),

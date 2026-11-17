@@ -193,7 +193,7 @@ pub async fn serve_connection_offering(
                     .await;
                 return;
             }
-            if matches!(&request,crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.as_ref().is_some_and(crate::wire::is_discovery_task))
+            if matches!(&request,crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.as_ref().is_some_and(crate::wire::requires_discovery_feature))
                 && !negotiated_features
                     .iter()
                     .any(|f| f == crate::wire::CI_DISCOVERY_FEATURE)

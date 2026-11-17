@@ -4468,6 +4468,7 @@ fn ci_payload() -> AttemptPayload {
     let mut p = payload("true");
     p.commands.clear();
     p.ci_task = Some(remote_task_runner::wire::CiTask {
+        verify_shard_version: false,
         artifact_workflow: None,
         dispatch: None,
         plan_digest: Digest::of_bytes(b"a plan this worker was never sent"),
@@ -4739,6 +4740,7 @@ fn ci_fx(workflow: &str) -> CiFx {
         .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
         .unwrap();
     base.ci_task = Some(CiTask {
+        verify_shard_version: false,
         artifact_workflow: None,
         dispatch: None,
         plan_digest,

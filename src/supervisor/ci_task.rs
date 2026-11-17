@@ -60,6 +60,8 @@ const RESULT_FILE: &str = "result.json";
 /// names of `env` only.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTaskSpec {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_shard_version: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_workflow: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -257,11 +259,16 @@ struct StepJob {
 /// The executor the core is given: it only queues the step for the thread
 /// that owns the supervisor's state and waits for the answer.
 struct Queue {
+    verify_shard_version: bool,
     sender: Mutex<Sender<StepJob>>,
     artifacts: crate::ci::artifact_exchange::worker::Host,
 }
 
 impl StepExecutor for Queue {
+    fn verify_shard_runner(&self) -> bool {
+        self.verify_shard_version
+    }
+
     fn artifact(
         &self,
         req: &local_ci::step_executor::ArtifactRequest<'_>,
@@ -507,6 +514,7 @@ pub(super) fn drive(ctl: &mut Control<'_>, ci: &CiTaskSpec, core: Core<'_>) -> R
         .map_err(|e| SupervisorError::State(format!("the CI scratch directory: {e}")))?;
     let (send, steps) = channel();
     let executor: Arc<dyn StepExecutor> = Arc::new(Queue {
+        verify_shard_version: ci.verify_shard_version,
         sender: Mutex::new(send),
         artifacts: crate::ci::artifact_exchange::worker::Host {
             root: ci.scratch.join("exchange"),
@@ -729,6 +737,7 @@ mod tests {
     #[test]
     fn the_spec_shows_no_value_of_its_environment_and_needs_absolute_paths() {
         let mut ci = CiTaskSpec {
+            verify_shard_version: false,
             artifact_workflow: None,
             history_scope: None,
             dispatch: None,

@@ -977,6 +977,7 @@ mod tests {
         let a = AttemptId::generate();
         let mut payload = payload_of(vec![]);
         payload.ci_task = Some(crate::wire::CiTask {
+            verify_shard_version: false,
             artifact_workflow: None,
             dispatch: None,
             plan_digest: Digest::of_bytes(b"plan"),

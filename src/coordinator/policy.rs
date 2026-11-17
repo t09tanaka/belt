@@ -275,7 +275,7 @@ pub fn missing_ci_feature(
     (spec
         .ci
         .as_ref()
-        .is_some_and(|s| crate::wire::is_discovery_task(&s.task))
+        .is_some_and(|s| crate::wire::requires_discovery_feature(&s.task))
         && !discovery)
         .then_some("protocol feature ci_discovery_v1")
 }
@@ -358,6 +358,7 @@ mod tests {
                 shard_retry_forbidden: false,
                 shard_preferred_worker: None,
                 task: crate::wire::CiTask {
+                    verify_shard_version: false,
                     artifact_workflow: None,
                     dispatch: None,
                     plan_digest: digest.clone(),
@@ -386,6 +387,18 @@ mod tests {
             has_secret_bundle: false,
             artifacts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_version_bound_shard_requires_the_discovery_protocol_on_its_execution_worker() {
+        let mut spec = task_spec(true);
+        assert_eq!(missing_ci_feature(&spec, true, false), None);
+        spec.ci.as_mut().unwrap().task.verify_shard_version = true;
+        assert_eq!(
+            missing_ci_feature(&spec, true, false),
+            Some("protocol feature ci_discovery_v1")
+        );
+        assert_eq!(missing_ci_feature(&spec, true, true), None);
     }
 
     #[test]

@@ -24,14 +24,8 @@ impl DiscoveryStep {
         let runner = adapter(target.command, "", "", Isolation::None)?;
         let listing = adapters::script_of(&runner.discover_command())
             .ok_or_else(|| anyhow::anyhow!("runner listing cannot be represented as a step"))?;
-        let version = match runner.info().runner.as_str() {
-            "cargo-test" => "cargo --version",
-            "vitest" => "node -p \"require('vitest/package.json').version\"",
-            "jest" => "node -p \"require('jest/package.json').version\"",
-            "playwright" => "node -p \"require('playwright/package.json').version\"",
-            "cypress" => "node -p \"require('cypress/package.json').version\"",
-            name => anyhow::bail!("unknown runner {name}"),
-        };
+        let version = adapters::version_command(&runner.info().runner)
+            .ok_or_else(|| anyhow::anyhow!("unknown runner {}", runner.info().runner))?;
         let mut probe = plan.to_plan();
         let job = probe
             .selected
@@ -97,7 +91,7 @@ impl DiscoveryStep {
         let Some(version) = step_log(self.step, 4096) else {
             return Ok(self.failed());
         };
-        let Some(list) = step_log(self.step + 1, super::advance::MAX_RESULT_BYTES) else {
+        let Some(list) = step_log(self.step + 1, crate::ci::advance::MAX_RESULT_BYTES) else {
             return Ok(self.failed());
         };
         let version = version.trim();

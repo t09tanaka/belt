@@ -174,6 +174,7 @@ pub fn task_specs(
                     shard_retry_forbidden: false,
                     shard_preferred_worker: None,
                     task: CiTask {
+                        verify_shard_version: false,
                         artifact_workflow: plan
                             .workflows
                             .iter()

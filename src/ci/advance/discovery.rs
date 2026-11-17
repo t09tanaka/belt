@@ -329,6 +329,7 @@ pub(super) fn advance(
                     .unwrap_or(!matches!(runner, "playwright" | "cypress"));
                 if let Some(ci) = &mut spec.ci {
                     ci.shard_retry_forbidden = !allowed;
+                    ci.task.verify_shard_version = true;
                     if let Some(listing) = listings.iter().find(|listing| {
                         listing.step.workflow == original.workflow
                             && listing.step.job == original.jobs[0]
