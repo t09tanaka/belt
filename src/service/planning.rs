@@ -127,8 +127,11 @@ fn captured_ci_config(
 
 /// Read the exact plan currently bound to this run. A run still discovering
 /// its tests shows its initial plan; once applied it shows the partition.
-pub fn stored(context: &Context, run: &RunId) -> Result<crate::ci::summary::PlanSummary, ApiError> {
-    let store = super::bootstrap::read_only_store(&context.bootstrap)
+pub fn stored(
+    spec: &super::bootstrap::Spec,
+    run: &RunId,
+) -> Result<crate::ci::summary::PlanSummary, ApiError> {
+    let store = super::bootstrap::read_only_store(spec)
         .map_err(|_| failure("coordinator state is unavailable"))?;
     let rows = store
         .ci_run_tasks(run)
@@ -144,7 +147,7 @@ pub fn stored(context: &Context, run: &RunId) -> Result<crate::ci::summary::Plan
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no stored CI plan for this run"))?;
     let digest =
         crate::ids::Digest::parse(digest).map_err(|_| failure("invalid stored plan digest"))?;
-    let bytes = crate::ci::advance::read_plan(context.state_dir(), &digest)
+    let bytes = crate::ci::advance::read_plan(&spec.state_dir, &digest)
         .map_err(|_| failure("stored CI plan is unavailable"))?;
     let plan = serde_json::from_slice(&bytes).map_err(|_| failure("stored CI plan is invalid"))?;
     let ci = CiPlan::from_frozen(plan)

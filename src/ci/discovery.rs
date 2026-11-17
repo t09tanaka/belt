@@ -202,9 +202,27 @@ impl DiscoveryStep {
             step: self,
             runner_version: version,
             setup_ms: None,
-            discovered,
+            discovered: validated_listing(discovered, &runner.info().runner),
         })
     }
+}
+
+fn validated_listing(discovered: Discovered, runner: &str) -> Discovered {
+    let files = matches!(runner, "vitest" | "jest" | "cypress");
+    if discovered.tests.iter().any(|identity| {
+        identity.is_empty()
+            || identity.chars().any(char::is_control)
+            || (files
+                && !Path::new(identity)
+                    .components()
+                    .all(|p| matches!(p, Component::Normal(_) | Component::CurDir)))
+    }) {
+        return Discovered {
+            blocked: vec![NotSplit::ManifestMismatch],
+            ..Default::default()
+        };
+    }
+    discovered
 }
 
 impl WorkerListing {
@@ -230,21 +248,7 @@ impl WorkerListing {
     ) -> anyhow::Result<ShardRequest> {
         let target = self.step.target(plan)?;
         let runner = adapter(target.command, &self.runner_version, "", isolation)?;
-        let mut discovered = self.discovered.clone();
-        let files = matches!(runner.info().runner.as_str(), "vitest" | "jest" | "cypress");
-        if discovered.tests.iter().any(|identity| {
-            identity.is_empty()
-                || identity.chars().any(char::is_control)
-                || (files
-                    && !Path::new(identity)
-                        .components()
-                        .all(|p| matches!(p, Component::Normal(_) | Component::CurDir)))
-        }) {
-            discovered = Discovered {
-                blocked: vec![NotSplit::ManifestMismatch],
-                ..Default::default()
-            };
-        }
+        let discovered = validated_listing(self.discovered.clone(), &runner.info().runner);
         let mut costs = costs.clone();
         costs.fixed_cost_ms = costs
             .fixed_cost_ms
