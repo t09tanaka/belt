@@ -25,12 +25,12 @@ pub use crate::supervisor::ci_task::MAX_INPUT_BYTES;
 use crate::supervisor::ci_task::{CiTaskSpec, MAX_PLAN_BYTES, RESULT_ARTIFACT};
 use crate::toolchain::contract::ExecutionBinding;
 use crate::toolchain::profile::Profile;
-use crate::wire::{AttemptPayload, CiTask};
+use crate::wire::{AttemptPayload, BlobPutRequest, BlobPutResponse, CiTask, SchemaVersion};
 use crate::workspace::{Workspace, WorkspaceKind};
 use local_ci::{FrozenPlan, TaskInputs};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// A worker keeps at most this many plans, of at most this many bytes
@@ -101,6 +101,18 @@ fn digest_of_name(path: &Path) -> Option<Digest> {
     Digest::try_from(format!("sha256:{hex}")).ok()
 }
 
+/// The directory of the plans, made if it is not there, private either way.
+fn private_plans_dir(state_dir: &Path) -> std::io::Result<PathBuf> {
+    let dir = plans_dir(state_dir);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)?;
+    // A directory that was there keeps the mode it had: make it private.
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(dir)
+}
+
 fn store_plan_within(
     state_dir: &Path,
     bytes: &[u8],
@@ -113,13 +125,7 @@ fn store_plan_within(
         ));
     }
     let digest = Digest::of_bytes(bytes);
-    let dir = plans_dir(state_dir);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)?;
-    // A directory that was there keeps the mode it had: make it private.
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+    let dir = private_plans_dir(state_dir)?;
     let target = plan_path(state_dir, &digest);
     if !target.is_file() {
         let held = kept_plans(&dir);
@@ -136,6 +142,108 @@ fn store_plan_within(
     tmp.as_file().sync_all()?;
     tmp.persist(target).map_err(|e| e.error)?;
     Ok(digest)
+}
+
+/// A worker holds at most this many plans part-way.
+const MAX_PLAN_PARTS: usize = 8;
+
+/// Where the bytes of a plan wait until the last of them arrived. Not a
+/// name of a plan ([`digest_of_name`]): it is never read as one, and
+/// [`sweep_plans`] removes it when the delivery was cut.
+fn part_path(dir: &Path, digest: &Digest, size: u64) -> PathBuf {
+    dir.join(format!("incoming-{}-{size}.part", hex_of(digest)))
+}
+
+fn parts_in(dir: &Path) -> usize {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|e| e.path().extension().is_some_and(|x| x == "part"))
+        .count()
+}
+
+/// May another plan start to arrive while `parts` are part-way?
+fn may_start_part(parts: usize) -> bool {
+    parts < MAX_PLAN_PARTS
+}
+
+fn put_fault(e: std::io::Error) -> ApiError {
+    match e.kind() {
+        std::io::ErrorKind::StorageFull => ApiError::new(ErrorCode::Overloaded, e.to_string()),
+        std::io::ErrorKind::InvalidInput => invalid(e.to_string()),
+        _ => ApiError::new(ErrorCode::Internal, format!("frozen plan: {e}")),
+    }
+}
+
+/// `blob_put` of a frozen plan: one chunk of its bytes (the caller checked
+/// the chunk against the announced size and the largest plan). The bytes are
+/// kept under their digest only when all of them arrived and hash to it. A
+/// plan that is held already is answered as complete, and counts as
+/// delivered now (the GC keeps it for the retention time from here).
+pub fn put_plan(state_dir: &Path, r: &BlobPutRequest) -> Result<BlobPutResponse, ApiError> {
+    use crate::worker::blob_policy::{plan_chunk, ChunkStep};
+    let answer = |received, complete| BlobPutResponse {
+        schema_version: SchemaVersion::CURRENT,
+        digest: r.digest.clone(),
+        received,
+        complete,
+    };
+    let target = plan_path(state_dir, &r.digest);
+    if target.is_file() {
+        if let Ok(file) = std::fs::OpenOptions::new().append(true).open(&target) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+        return Ok(answer(r.total_size, true));
+    }
+    let dir = private_plans_dir(state_dir).map_err(put_fault)?;
+    let part = part_path(&dir, &r.digest, r.total_size);
+    let held = match std::fs::symlink_metadata(&part) {
+        Ok(meta) if meta.is_file() => Some(meta.len()),
+        Ok(_) => return Err(invalid("the staged plan is not a file")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(put_fault(e)),
+    };
+    let data = &r.data.0;
+    let at = held.unwrap_or(0);
+    let (skip, complete) = match plan_chunk(at, r.total_size, r.offset, data.len()) {
+        ChunkStep::Behind => return Ok(answer(at, false)),
+        ChunkStep::Overlong => {
+            let _ = std::fs::remove_file(&part);
+            return Err(invalid(
+                "the staged bytes are not this plan's; send it again from the start",
+            ));
+        }
+        ChunkStep::Append { skip, complete } => (skip, complete),
+    };
+    let mut open = std::fs::OpenOptions::new();
+    open.append(true).custom_flags(libc::O_NOFOLLOW);
+    if held.is_none() {
+        if !may_start_part(parts_in(&dir)) {
+            return Err(ApiError::new(
+                ErrorCode::Overloaded,
+                "too many frozen plans are part-way",
+            ));
+        }
+        open.create_new(true).mode(0o600);
+    }
+    let mut file = open.open(&part).map_err(put_fault)?;
+    file.write_all(&data[skip..]).map_err(put_fault)?;
+    if !complete {
+        return Ok(answer(at.max(r.offset + data.len() as u64), false));
+    }
+    file.sync_all().map_err(put_fault)?;
+    drop(file);
+    let bytes = std::fs::read(&part).map_err(put_fault)?;
+    let _ = std::fs::remove_file(&part);
+    if Digest::of_bytes(&bytes) != r.digest {
+        return Err(invalid(format!(
+            "the bytes of {} do not have that digest; send it again from the start",
+            r.digest
+        )));
+    }
+    store_plan(state_dir, &bytes).map_err(put_fault)?;
+    Ok(answer(r.total_size, true))
 }
 
 /// May the file of a plan go? Not while an unfinished attempt names it, and
@@ -408,6 +516,111 @@ mod tests {
         let other = store_plan(dir.path(), b"{}").unwrap();
         assert_ne!(plan_path(dir.path(), &other), path);
         assert_eq!(std::fs::read_dir(plans_dir(dir.path())).unwrap().count(), 2);
+    }
+
+    fn chunk(bytes: &[u8], digest: &Digest, offset: usize, len: usize) -> BlobPutRequest {
+        BlobPutRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: crate::ids::RequestId::generate(),
+            coordinator_epoch: crate::ids::CoordinatorEpoch(1),
+            source_id: crate::ids::SourceId::parse("src_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            kind: crate::wire::SourceBlobKind::Plan,
+            digest: digest.clone(),
+            total_size: bytes.len() as u64,
+            offset: offset as u64,
+            data: crate::wire::Bytes(bytes[offset..offset + len].to_vec()),
+        }
+    }
+
+    #[test]
+    fn a_delivered_plan_is_kept_only_when_every_byte_arrived_and_hashes_to_its_name() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let bytes = b"{\"a\":\"frozen plan\"}";
+        let digest = Digest::of_bytes(bytes);
+        let first = put_plan(dir.path(), &chunk(bytes, &digest, 0, 5)).unwrap();
+        assert_eq!((first.received, first.complete), (5, false));
+        assert!(!plan_path(dir.path(), &digest).exists());
+        // A chunk ahead of what is held writes nothing and says where to
+        // go on; a repeated one is harmless.
+        let ahead = put_plan(dir.path(), &chunk(bytes, &digest, 9, 3)).unwrap();
+        assert_eq!((ahead.received, ahead.complete), (5, false));
+        let again = put_plan(dir.path(), &chunk(bytes, &digest, 0, 5)).unwrap();
+        assert_eq!((again.received, again.complete), (5, false));
+        let last = put_plan(dir.path(), &chunk(bytes, &digest, 5, bytes.len() - 5)).unwrap();
+        assert_eq!((last.received, last.complete), (bytes.len() as u64, true));
+        assert_eq!(std::fs::read(plan_path(dir.path(), &digest)).unwrap(), bytes);
+        assert_eq!(parts_in(&plans_dir(dir.path())), 0, "nothing stays staged");
+        let mode = std::fs::metadata(plans_dir(dir.path())).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
+
+        // Held already: complete at once, whatever the chunk.
+        let held = put_plan(dir.path(), &chunk(bytes, &digest, 0, 1)).unwrap();
+        assert_eq!((held.received, held.complete), (bytes.len() as u64, true));
+
+        // Bytes that do not hash to the name are not kept, and nothing of
+        // them stays.
+        let wrong = Digest::of_bytes(b"another plan");
+        let e = put_plan(dir.path(), &chunk(bytes, &wrong, 0, bytes.len())).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidInput);
+        assert!(e.message.contains("digest"), "{}", e.message);
+        assert!(!plan_path(dir.path(), &wrong).exists());
+        assert_eq!(parts_in(&plans_dir(dir.path())), 0);
+    }
+
+    #[test]
+    fn a_plan_that_is_held_counts_as_delivered_again_when_it_is_sent_again() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let bytes = b"{}";
+        let digest = store_plan(dir.path(), bytes).unwrap();
+        let path = plan_path(dir.path(), &digest);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        // An hour old: the GC with a minute of retention would take it.
+        put_plan(dir.path(), &chunk(bytes, &digest, 0, 2)).unwrap();
+        let none = std::collections::BTreeSet::new();
+        assert_eq!(sweep_plans(dir.path(), &none, 60_000), 0);
+        assert!(path.is_file());
+    }
+
+    #[test]
+    fn only_a_few_plans_are_part_way_at_once_and_a_cut_delivery_goes_with_the_gc() {
+        assert!(may_start_part(MAX_PLAN_PARTS - 1));
+        assert!(!may_start_part(MAX_PLAN_PARTS));
+        let dir = crate::test_tmp::tempdir().unwrap();
+        for n in 0..MAX_PLAN_PARTS {
+            let bytes = format!("plan {n}").into_bytes();
+            let digest = Digest::of_bytes(&bytes);
+            put_plan(dir.path(), &chunk(&bytes, &digest, 0, 1)).unwrap();
+        }
+        let bytes = b"one more";
+        let digest = Digest::of_bytes(bytes);
+        let e = put_plan(dir.path(), &chunk(bytes, &digest, 0, 1)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Overloaded);
+        // One that is part-way already goes on.
+        let bytes = b"plan 0";
+        let digest = Digest::of_bytes(bytes);
+        let done = put_plan(dir.path(), &chunk(bytes, &digest, 1, 5)).unwrap();
+        assert!(done.complete);
+        // What a cut delivery left goes with the GC; the plan stays while it
+        // is young.
+        let none = std::collections::BTreeSet::new();
+        assert_eq!(sweep_plans(dir.path(), &none, 0), MAX_PLAN_PARTS);
+        assert_eq!(parts_in(&plans_dir(dir.path())), 0);
+    }
+
+    #[test]
+    fn a_worker_that_holds_too_many_plans_refuses_one_more_as_overloaded() {
+        let full = std::io::Error::new(std::io::ErrorKind::StorageFull, "full");
+        assert_eq!(put_fault(full).code, ErrorCode::Overloaded);
+        let large = std::io::Error::new(std::io::ErrorKind::InvalidInput, "large");
+        assert_eq!(put_fault(large).code, ErrorCode::InvalidInput);
+        let other = std::io::Error::other("disk");
+        assert_eq!(put_fault(other).code, ErrorCode::Internal);
     }
 
     fn payload_for(f: &Fixture, digest: &Digest, job: &str) -> AttemptPayload {

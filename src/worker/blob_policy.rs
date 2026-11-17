@@ -76,6 +76,7 @@ pub fn cap_of(limits: &BlobLimits, kind: SourceBlobKind) -> u64 {
         SourceBlobKind::Content => limits.max_blob_bytes,
         SourceBlobKind::Manifest => limits.max_manifest_bytes,
         SourceBlobKind::Bundle => limits.max_bundle_bytes,
+        SourceBlobKind::Plan => crate::supervisor::ci_task::MAX_PLAN_BYTES,
     }
 }
 
@@ -137,6 +138,7 @@ fn kind_word(kind: SourceBlobKind) -> &'static str {
         SourceBlobKind::Content => "content",
         SourceBlobKind::Manifest => "manifest",
         SourceBlobKind::Bundle => "bundle",
+        SourceBlobKind::Plan => "plan",
     }
 }
 
@@ -206,6 +208,8 @@ pub fn displaces(new: &StagedName<'_>, root_staged: bool, old: &StagedName<'_>) 
         SourceBlobKind::Bundle => true,
         SourceBlobKind::Manifest => !old.done && (!root_staged || new.hex == old.hex),
         SourceBlobKind::Content => !old.done && new.hex == old.hex,
+        // A plan is never staged with a source.
+        SourceBlobKind::Plan => false,
     }
 }
 
