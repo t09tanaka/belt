@@ -901,6 +901,7 @@ fn helper_commands_are_fixed_strings_without_names_or_paths() {
 
 fn status_with(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
     Status {
+        system_user: false,
         worker_id: WorkerId::parse("mini-a").unwrap(),
         cluster: ClusterId::generate(),
         binary_sha256: "0".repeat(64),
@@ -2530,4 +2531,24 @@ fn the_staging_commands_run_in_a_real_shell() {
     let (code, _) = sh(&unstage_command(&digest), b"");
     assert_eq!(code, Some(0));
     assert!(!staged.exists());
+}
+
+#[test]
+fn a_preconfigured_system_worker_asks_for_the_system_manager_and_never_installs_a_user_service() {
+    let mut w = World::new();
+    w.add("mini-a", Some("ci@h"), false).unwrap();
+    let config = w.config_text() + "service_mode = \"system-user\"\n";
+    fs::write(&w.config, &config).unwrap();
+    // The host is an ordinary temp HOME with no administrator registration.
+    assert!(w.add("mini-a", Some("ci@h"), true).is_err());
+    assert!(w
+        .remote
+        .stdins
+        .iter()
+        .filter_map(|bytes| serde_json::from_slice::<InstallRequest>(bytes).ok())
+        .any(|request| request.system_user));
+    assert!(w.calls().is_empty());
+    assert_eq!(w.config_text(), config);
+    let paths = WorkerPaths::resolve(&w.remote.env).unwrap();
+    assert!(!paths.services.exists());
 }

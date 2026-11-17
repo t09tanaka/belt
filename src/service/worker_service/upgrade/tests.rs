@@ -62,6 +62,7 @@ impl Host {
         let cluster = ClusterId::generate();
         let old = sha256_file(&old_exe).unwrap();
         let request = InstallRequest {
+            system_user: false,
             schema: 1,
             cluster: cluster.clone(),
             worker_id: WorkerId::parse("mini-a").unwrap(),
@@ -929,6 +930,8 @@ fn every_changing_action_is_refused_while_another_helper_holds_the_switch_lock()
         h.upgrade(&mut |_| Ok(())),
         h.rollback(&mut |_| Ok(())),
         h.commit(&h.new),
+        start(&h.env, h.fake.clone(), Duration::ZERO),
+        stop(&h.env, h.fake.clone(), false, Duration::ZERO),
         drain(&h.env, h.fake.clone()),
         resume(&h.env, h.fake.clone()),
     ];

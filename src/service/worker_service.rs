@@ -72,6 +72,8 @@ pub enum Action {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system_user: bool,
     pub schema: u32,
     pub cluster: ClusterId,
     pub worker_id: WorkerId,
@@ -83,6 +85,8 @@ pub struct InstallRequest {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub system_user: bool,
     pub worker_id: WorkerId,
     pub cluster: ClusterId,
     pub binary_sha256: String,
@@ -208,6 +212,9 @@ impl Paths {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
+    /// Pinned non-root execution account of an administrator-registered service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_user: Option<String>,
     schema_version: u32,
     uid: u32,
     cluster: ClusterId,
@@ -529,43 +536,63 @@ pub(crate) fn service_view<L: Launcher>(
     let paths = Paths::resolve_for(&env, launcher.backend())?;
     let journal = require_journal(&paths)?;
     let status = status(&env, launcher)?;
-    Ok((
-        status,
-        paths.state,
-        service_environment(&journal),
-        journal.env.clone(),
-    ))
+    let environment = plan(&paths, &journal)?.environment().clone();
+    Ok((status, paths.state, environment, journal.env.clone()))
 }
 
 fn plan(paths: &Paths, journal: &Journal) -> anyhow::Result<policy::Plan> {
+    if let Some(username) = &journal.system_user {
+        return system_user::plan_for(paths.backend, &paths.config, username, journal.uid);
+    }
+    service_plan(
+        paths.backend,
+        &paths.config,
+        policy::Mode::User { uid: journal.uid },
+        paths.executable(&journal.binary_sha256),
+        service_environment(journal),
+    )
+}
+
+fn service_plan(
+    backend: policy::Backend,
+    config: &Path,
+    mode: policy::Mode,
+    executable: PathBuf,
+    environment: Environment,
+) -> anyhow::Result<policy::Plan> {
     let label = format!(
         "io.github.t09tanaka.rtr.worker.{}.{}",
-        journal.uid,
+        match &mode {
+            policy::Mode::User { uid } | policy::Mode::SystemUser { uid, .. } => uid,
+        },
         &format!(
             "{:x}",
-            Sha256::digest(paths.config.as_os_str().as_encoded_bytes())
+            Sha256::digest(config.as_os_str().as_encoded_bytes())
         )[..12]
     );
-    let environment = service_environment(journal);
-    let render = match paths.backend {
+    let render = match backend {
         policy::Backend::Launchd => policy::render,
         policy::Backend::Systemd => super::systemd::policy::render,
     };
+    let mut arguments = vec!["worker".into()];
+    if matches!(mode, policy::Mode::SystemUser { .. }) {
+        arguments.push("--system-service".into());
+    }
+    arguments.push("--input".into());
+    arguments.push(
+        config
+            .join("worker.json")
+            .to_str()
+            .context("input path must be UTF-8")?
+            .to_owned(),
+    );
     render(&policy::Definition {
         label,
-        mode: policy::Mode::User { uid: journal.uid },
-        executable: paths.executable(&journal.binary_sha256),
-        arguments: vec![
-            "worker".into(),
-            "--input".into(),
-            paths
-                .input
-                .to_str()
-                .context("input path must be UTF-8")?
-                .into(),
-        ],
+        mode,
+        executable,
+        arguments,
         environment,
-        working_directory: paths.config.clone(),
+        working_directory: config.to_owned(),
     })
     .map_err(anyhow::Error::msg)
 }
@@ -692,7 +719,7 @@ fn wait_ready(state: &Path, timeout: Duration) -> bool {
 }
 
 fn ensure_started<L: Launcher>(
-    files: &mut DirectoryFiles,
+    files: &mut system_user::ServiceFiles,
     launcher: &mut L,
     plan: &policy::Plan,
     receipt: &macos::Receipt,
@@ -714,7 +741,12 @@ fn ensure_started<L: Launcher>(
     }
 }
 
-fn services(paths: &Paths) -> anyhow::Result<DirectoryFiles> {
+fn services(paths: &Paths, journal: &Journal) -> anyhow::Result<system_user::ServiceFiles> {
+    if journal.system_user.is_some() {
+        return Ok(system_user::ServiceFiles::System(Box::new(plan(
+            paths, journal,
+        )?)));
+    }
     if fs::symlink_metadata(&paths.services).is_err() {
         // Created user-private-ish (0755) like the system's own directory.
         fs::DirBuilder::new()
@@ -722,7 +754,7 @@ fn services(paths: &Paths) -> anyhow::Result<DirectoryFiles> {
             .mode(0o755)
             .create(&paths.services)?;
     }
-    DirectoryFiles::open(&paths.services)
+    DirectoryFiles::open(&paths.services).map(system_user::ServiceFiles::User)
 }
 
 /// Resumable: every step either completes or verifies what an earlier run left.
@@ -748,21 +780,31 @@ pub fn install<L: Launcher>(
     let key_bytes = hex_decode(request.key_file_text.trim_end_matches('\n'))
         .context("cluster key is not lower-case hex")?;
     crate::secrets::key::ClusterKey::from_bytes(key_bytes).context("cluster key rejected")?;
+    let account = request
+        .system_user
+        .then(system_user::current_account)
+        .transpose()?;
     private_dir(&paths.home, &paths.config)?;
     private_dir(&paths.home, &paths.state)?;
+    let _lock = switch_lock(&paths, true, LOCK_PATIENCE)?
+        .context("a version switch is running on this host; retry installation when it finishes")?;
     let existing = read_journal(&paths)?;
     if let Some(existing) = &existing {
         ensure!(
-            existing.cluster == request.cluster
+            existing.system_user == account && existing.cluster == request.cluster
                 && existing.worker_id == request.worker_id
                 && existing.binary_sha256 == digest,
-            "a different worker or binary is already installed; upgrade or removal is a separate operation"
+            "a different worker, service mode or binary is already installed; upgrade or removal is a separate operation"
         );
     }
     // Once a service file was published the installed files are fixed (the
     // journal's environment included, so a re-run from another shell cannot
     // trip the comparison). Before that nothing runs yet and a re-run replaces.
-    let registered = existing.as_ref().is_some_and(|j| j.receipt.is_some());
+    // An administrator can activate the system definition before the SSH
+    // helper records its first receipt. Its input is already fixed.
+    let registered = existing
+        .as_ref()
+        .is_some_and(|j| j.receipt.is_some() || j.system_user.is_some());
     let env = match &existing {
         Some(journal) if registered => {
             // The one exception is the scope of task-traffic-controller,
@@ -817,6 +859,7 @@ pub fn install<L: Launcher>(
         }
         None => {
             let fresh = Journal {
+                system_user: account,
                 schema_version: 1,
                 uid: euid(),
                 cluster: request.cluster.clone(),
@@ -832,7 +875,7 @@ pub fn install<L: Launcher>(
         }
     };
     let plan = plan(&paths, &journal)?;
-    let mut files = services(&paths)?;
+    let mut files = services(&paths, &journal)?;
     if journal.receipt.is_none() {
         let _lease = files.lifecycle_lock()?;
         let receipt = files
@@ -890,13 +933,14 @@ pub fn start<L: Launcher>(
     ready_timeout: Duration,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve_for(env, launcher.backend())?;
+    let _lock = exclusive_lock(&paths)?;
     let journal = require_journal(&paths)?;
     let plan = plan(&paths, &journal)?;
     let receipt = journal
         .receipt
         .clone()
         .context("service was never installed")?;
-    let mut files = services(&paths)?;
+    let mut files = services(&paths, &journal)?;
     // Only a bounded, identity-checked marker may be cleared here.
     marker(&paths, Duration::ZERO).verify_binding(&identity(&journal))?;
     clear_cancel(&paths.state)?;
@@ -915,13 +959,14 @@ pub fn stop<L: Launcher>(
     wait: Duration,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve_for(env, launcher.backend())?;
+    let _lock = exclusive_lock(&paths)?;
     let journal = require_journal(&paths)?;
     let plan = plan(&paths, &journal)?;
     let receipt = journal
         .receipt
         .clone()
         .context("service was never installed")?;
-    let files = services(&paths)?;
+    let files = services(&paths, &journal)?;
     match launcher.loaded_state(&plan, &receipt) {
         LoadedState::Absent => {}
         LoadedState::Unknown => anyhow::bail!(
@@ -1033,13 +1078,20 @@ fn status_with<L: Launcher>(
     launcher: &mut L,
     ready: bool,
 ) -> anyhow::Result<Status> {
-    let loaded = match launcher.loaded_state(plan, receipt) {
+    let state =
+        if journal.system_user.is_some() && services(paths, journal)?.verify(receipt).is_err() {
+            LoadedState::Unknown
+        } else {
+            launcher.loaded_state(plan, receipt)
+        };
+    let loaded = match state {
         LoadedState::Match => Some(true),
         LoadedState::Absent => Some(false),
         LoadedState::Unknown => None,
     };
     let current = Control::effective(&paths.state);
     Ok(Status {
+        system_user: journal.system_user.is_some(),
         worker_id: journal.worker_id.clone(),
         cluster: journal.cluster.clone(),
         binary_sha256: journal.binary_sha256.clone(),
@@ -1261,3 +1313,5 @@ pub mod upgrade;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub(crate) mod system_user;

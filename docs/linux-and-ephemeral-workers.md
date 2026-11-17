@@ -52,6 +52,40 @@ remote-task-runner workers upgrade mini-l \
   shows "another build"; upgrade it with `--binary` when the parent's version
   changes.
 
+### Dedicated worker available before login
+
+In the parent's `[[workers]]` entry, set `service_mode = "system-user"` and use
+the non-root build account for SSH. Running `workers add NAME --ssh DEST --install`
+stages the worker under that account and reports the configuration directory
+and the expected system service file. Supply `--binary` as above for another
+platform.
+
+On the worker host, an administrator registers the system definition with an
+administrator-controlled copy of the same CLI. For a Linux account named
+`build`, an example is
+
+```sh
+sudo /usr/local/sbin/remote-task-runner register-system-worker \
+    --account build --config-dir /home/build/.config/remote-task-runner
+```
+
+Use the configuration directory reported by the SSH helper. The command prints
+the installed definition's full path. On Linux, run `systemctl daemon-reload`
+and `systemctl enable --now <printed-unit-filename>` with administrator rights.
+On macOS, run `launchctl bootstrap system <printed-plist-path>` with
+administrator rights. Repeat the parent's install command to verify the
+running worker and finish enrollment.
+
+The system definition starts the non-root account at boot and follows the
+worker's installed version across upgrades. On Linux the unit must be enabled
+for boot. The helper checks the unit's effective user, activation and drop-ins.
+Start and stop use the system manager. The SSH account needs host authorization
+for those operations on its own unit, including the stop and start performed
+by upgrades. Keep the administrator's registration binary and system definition
+under administrator ownership. `doctor` checks the configured service mode and
+the worker's service environment. Linux system services run independently of
+user-session lingering.
+
 ### The coordinator on Linux
 
 `init` registers the coordinator (with its local worker) as a systemd user

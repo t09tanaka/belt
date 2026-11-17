@@ -541,12 +541,6 @@ fn parse_reply(output: &RemoteOutput) -> Result<Status, ApiError> {
     ))
 }
 
-struct Registration {
-    ssh: String,
-    binary: Option<String>,
-    ephemeral: bool,
-}
-
 fn read_user_config(
     env: &BTreeMap<String, String>,
 ) -> Result<(std::path::PathBuf, String), ApiError> {
@@ -560,26 +554,15 @@ fn read_user_config(
     }
 }
 
-fn registered(
-    env: &BTreeMap<String, String>,
-    name: &str,
-) -> Result<Option<Registration>, ApiError> {
-    let (path, text) = read_user_config(env)?;
-    let user = crate::config::parse::parse_user(&path.to_string_lossy(), &text)
-        .map_err(|e| invalid(e.to_string()))?;
-    Ok(user
-        .workers
+fn registered(env: &BTreeMap<String, String>, name: &str) -> Result<Option<Registered>, ApiError> {
+    Ok(registrations(env)?
         .into_iter()
-        .find(|w| w.id == name)
-        .map(|w| Registration {
-            ssh: w.ssh,
-            binary: w.binary,
-            ephemeral: w.ephemeral.unwrap_or(false),
-        }))
+        .find(|worker| worker.id == name))
 }
 
 /// One `[[workers]]` entry of the user configuration.
 pub struct Registered {
+    pub system_user: bool,
     pub id: String,
     pub ssh: String,
     pub binary: Option<String>,
@@ -596,6 +579,7 @@ pub fn registrations(env: &BTreeMap<String, String>) -> Result<Vec<Registered>, 
         .workers
         .into_iter()
         .map(|w| Registered {
+            system_user: w.service_mode == Some(crate::config::model::ServiceMode::SystemUser),
             id: w.id,
             ssh: w.ssh,
             binary: w.binary,
@@ -839,7 +823,17 @@ pub fn add(
         ));
     }
     let (status, binary) = if install {
-        let status = install_remote(remote, spec, exe, options.binary, name, &target)?;
+        let status = install_remote(
+            remote,
+            spec,
+            options.binary.unwrap_or(exe),
+            options.binary.is_some(),
+            name,
+            &target,
+            existing
+                .as_ref()
+                .is_some_and(|registration| registration.system_user),
+        )?;
         let binary = status.bridge_binary.clone();
         (Some(status), binary)
     } else {
@@ -963,14 +957,14 @@ fn ensure_staged(
 fn install_remote(
     remote: &mut impl Remote,
     spec: &Spec,
-    exe: &Path,
-    binary: Option<&Path>,
+    ship: &Path,
+    explicit_binary: bool,
     name: &str,
     target: &SshTarget,
+    system_user: bool,
 ) -> Result<Status, ApiError> {
     let internal = |e: &dyn std::fmt::Display| ApiError::new(ErrorCode::Internal, e.to_string());
     // What is sent: the build named with `--binary`, else this binary.
-    let ship = binary.unwrap_or(exe);
     let cluster = spec
         .expected_cluster
         .clone()
@@ -978,8 +972,9 @@ fn install_remote(
     let cluster_expected = cluster.clone();
     let key = crate::secrets::key::load(&spec.cluster_key_path).map_err(|e| internal(&e))?;
     let digest = worker_service::sha256_file(ship).map_err(|e| internal(&e))?;
-    ensure_staged(remote, target, ship, &digest, binary.is_some())?;
+    ensure_staged(remote, target, ship, &digest, explicit_binary)?;
     let request = InstallRequest {
+        system_user,
         schema: 1,
         cluster,
         worker_id: WorkerId::parse(name).map_err(|e| invalid(e.to_string()))?,
@@ -996,6 +991,12 @@ fn install_remote(
         )
         .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
     let status = parse_reply(&out)?;
+    if status.system_user != system_user {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "installed service mode differs from the worker registration",
+        ));
+    }
     if !status.ready || status.loaded != Some(true) {
         return Err(ApiError::new(
             ErrorCode::CommunicationUnknown,
@@ -1801,7 +1802,7 @@ fn resident_answer(answer: anyhow::Result<super::resident::Reply>) -> ResidentBu
     }
 }
 
-fn emit(
+pub(super) fn emit(
     json: bool,
     result: Result<serde_json::Value, ApiError>,
     text: impl FnOnce() -> String,

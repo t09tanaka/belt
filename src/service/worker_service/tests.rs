@@ -107,6 +107,7 @@ impl Host {
         fake.0.borrow_mut().backend = backend;
         Host {
             request: InstallRequest {
+                system_user: false,
                 schema: 1,
                 cluster: ClusterId::generate(),
                 worker_id: WorkerId::parse("mini-a").unwrap(),
@@ -223,6 +224,7 @@ fn install_refuses_a_wrong_digest_a_changed_key_and_another_identity() {
     changed_key.env = h.env.clone();
     changed_key.exe = h.exe.clone();
     changed_key.request = InstallRequest {
+        system_user: false,
         key_file_text: format!("{}\n", "cd".repeat(64)),
         cluster: h.request.cluster.clone(),
         worker_id: h.request.worker_id.clone(),
@@ -501,6 +503,7 @@ fn an_install_that_never_registered_the_service_can_be_replaced_by_a_rerun() {
     changed.env = h.env.clone();
     changed.exe = h.exe.clone();
     changed.request = InstallRequest {
+        system_user: false,
         schema: 1,
         cluster: h.request.cluster.clone(),
         worker_id: h.request.worker_id.clone(),
@@ -922,4 +925,96 @@ fn the_journal_is_where_every_service_manager_keeps_it() {
     // An unusable home is an error, not "no journal".
     assert!(Paths::journal_path(&env(&[])).is_err());
     assert!(Paths::journal_path(&env(&[("HOME", "relative")])).is_err());
+}
+
+#[test]
+fn a_system_service_installs_stops_restores_and_upgrades_without_replacing_the_admin_file() {
+    for backend in [policy::Backend::Launchd, policy::Backend::Systemd] {
+        let mut host = Host::on(backend);
+        host.request.system_user = true;
+        let system_dir = host.root.join("system");
+        fs::create_dir(&system_dir).unwrap();
+        system_user::with_fixture_directory(&system_dir, || {
+            let error = host.install().unwrap_err(); // the administrator hasn't registered it
+            assert!(!host.fake.0.borrow().loaded);
+            if euid() == 0 {
+                assert!(error.to_string().contains("non-root"));
+                return;
+            }
+            let paths = host.paths();
+            let journal = require_journal(&paths).unwrap();
+            let system_plan = plan(&paths, &journal).unwrap();
+            let file = system_user::publish_definition(&system_dir, &system_plan, euid()).unwrap();
+            let bytes = fs::read(&file).unwrap();
+            let account = journal.system_user.as_deref().unwrap();
+            let version = fs::canonicalize(paths.executable(&host.digest)).unwrap();
+            // Automatic startup is legitimate as soon as the administrator
+            // publishes the first definition, before the parent retries.
+            assert_eq!(
+                system_user::check_boot(&paths, account, &paths.bridge_binary()).unwrap(),
+                version
+            );
+            assert!(system_user::check_boot(&paths, "another-account", &version).is_err());
+            assert!(system_user::check_boot(&paths, account, &host.exe).is_err());
+            let up = host.install().unwrap();
+            assert!(up.system_user && up.ready && up.loaded == Some(true));
+            let first = require_journal(&paths).unwrap().receipt.unwrap();
+            host.bind();
+            let stopped = stop(&host.env, host.fake.clone(), false, Duration::ZERO).unwrap();
+            assert_eq!(stopped.loaded, Some(false));
+            let started = start(&host.env, host.fake.clone(), Duration::ZERO).unwrap();
+            assert!(started.ready && started.system_user);
+            let new_binary = host.root.join("new");
+            fs::write(&new_binary, b"another build").unwrap();
+            let update = upgrade::SwitchRequest {
+                schema: 1,
+                cluster: host.request.cluster.clone(),
+                worker_id: host.request.worker_id.clone(),
+                binary_sha256: sha256_file(&new_binary).unwrap(),
+            };
+            let options = Options {
+                cancel_running: false,
+                wait: Duration::ZERO,
+                ready_timeout: Duration::ZERO,
+            };
+            let switched = upgrade::upgrade(
+                &host.env,
+                &update,
+                &new_binary,
+                host.fake.clone(),
+                options,
+                &mut |step| {
+                    if step == upgrade::Step::Input {
+                        assert!(system_user::check_boot(&paths, account, &version)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("switch has not published"));
+                    }
+                    Ok(())
+                },
+            )
+            .unwrap();
+            let new = fs::canonicalize(paths.executable(&update.binary_sha256)).unwrap();
+            assert_eq!(
+                system_user::check_boot(&paths, account, &paths.bridge_binary()).unwrap(),
+                new
+            );
+            assert!(system_user::check_boot(&paths, account, &version).is_err());
+            assert!(switched.system_user && switched.ready);
+            assert_eq!(switched.binary_sha256, update.binary_sha256);
+            let installed = upgrade::commit(&host.env, &update, host.fake.clone()).unwrap();
+            assert!(installed.switching_from.is_none() && installed.ready);
+            assert_eq!(require_journal(&paths).unwrap().receipt.unwrap(), first);
+            assert_eq!(fs::read(file).unwrap(), bytes);
+            assert!(!paths.services.exists());
+            let (_, _, env, _) = service_view(&host.env, host.fake.clone()).unwrap();
+            assert_eq!(&env, system_plan.environment());
+            for call in &host.fake.0.borrow().calls {
+                match backend {
+                    policy::Backend::Launchd => assert_eq!(call[1], "system"),
+                    policy::Backend::Systemd => assert_eq!(call[0], "--system"),
+                }
+            }
+        });
+    }
 }

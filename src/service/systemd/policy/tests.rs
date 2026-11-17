@@ -177,6 +177,10 @@ fn a_start_reloads_enables_then_starts_and_a_stop_only_stops() {
         ]
     );
     assert_eq!(
+        steps(&words(&["--system", "start", unit])).unwrap(),
+        [words(&["--system", "start", unit])]
+    );
+    assert_eq!(
         steps(&words(&["--system", "stop", unit])).unwrap(),
         [words(&["--system", "stop", unit])]
     );
@@ -254,6 +258,7 @@ fn show_output_is_read_strictly() {
     assert_eq!(
         ok,
         Show {
+            system: false,
             load: "loaded".into(),
             active: "active".into(),
             fragment: FILE.into(),
@@ -329,4 +334,45 @@ fn a_running_pid_is_named_only_for_an_active_unit_with_a_real_process() {
     assert_eq!(pid("active", 0), None);
     assert_eq!(pid("activating", 99), None);
     assert_eq!(pid("inactive", 99), None);
+}
+
+#[test]
+fn a_system_worker_requires_the_effective_account_and_persistent_activation() {
+    let show = show("loaded", "active", FILE, 3, "no");
+    let mut reply = String::from_utf8(show).unwrap();
+    reply.push_str("User=build\nDropInPaths=\nUnitFileState=enabled\n");
+    let read = |s: &str| parse_show_for(s.as_bytes(), Some("build"));
+    assert_eq!(
+        read(&reply).unwrap().classify(Path::new(FILE)),
+        LoadedState::Match
+    );
+    for foreign in [
+        reply.replace("User=build", "User=root"),
+        reply.replace("DropInPaths=", "DropInPaths=/run/override.conf"),
+        reply.replace("UnitFileState=enabled", "UnitFileState=enabled-runtime"),
+        reply.replace("User=build\n", ""),
+        reply.replace("DropInPaths=\n", ""),
+        reply.replace("UnitFileState=enabled\n", ""),
+    ] {
+        assert!(read(&foreign).is_err(), "{foreign}");
+    }
+    let inactive = reply.replace("ActiveState=active", "ActiveState=inactive");
+    assert_eq!(
+        read(&inactive).unwrap().classify(Path::new(FILE)),
+        LoadedState::Absent
+    );
+    for stale in [
+        inactive.replace(FILE, "/run/other"),
+        inactive.replace("NeedDaemonReload=no", "NeedDaemonReload=yes"),
+    ] {
+        assert_eq!(
+            read(&stale).unwrap().classify(Path::new(FILE)),
+            LoadedState::Unknown
+        );
+    }
+    let args = show_arguments("--system", "a.service");
+    assert_eq!(
+        args.last().unwrap(),
+        &format!("--property={PROPERTIES},User,DropInPaths,UnitFileState")
+    );
 }

@@ -656,12 +656,14 @@ pub fn host_main() -> i32 {
         |(status, state, service_env, recorded)| {
             let mut runner = SystemRunner::default();
             let mut facts = gather(&state, &service_env, &recorded, &mut runner);
-            facts.linger = linger_fact(
-                backend,
-                rustix::process::geteuid().as_raw(),
-                &service_env,
-                &mut runner,
-            );
+            if !status.system_user {
+                facts.linger = linger_fact(
+                    backend,
+                    rustix::process::geteuid().as_raw(),
+                    &service_env,
+                    &mut runner,
+                );
+            }
             HostAnswer { status, facts }
         },
     );
@@ -1078,6 +1080,9 @@ fn ask_worker(
     let answer = parse_answer(&output)?;
     if answer.status.worker_id.as_str() != worker.id || &answer.status.cluster != cluster {
         return Err("the host answered for a different worker identity or cluster".into());
+    }
+    if worker.system_user != answer.status.system_user {
+        return Err("the installed service mode differs from the worker registration".into());
     }
     Ok(answer)
 }
