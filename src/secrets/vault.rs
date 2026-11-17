@@ -10,6 +10,8 @@
 mod guard;
 #[cfg(test)]
 pub(crate) use guard::set_retention_fault;
+#[cfg(test)]
+pub(crate) use guard::set_sweep_fault;
 pub(crate) use guard::{retention_fault, Claim, Lease};
 use std::sync::Arc;
 
@@ -259,9 +261,12 @@ impl Vault {
         );
         let vault = Vault { dir, root };
         let lease = vault.lease(false)?;
-        lease.check_parent().map_err(|_| SecretError::Unavailable {
-            what: "registered parent Vault".into(),
-        })?;
+        // Keep the cause: "unavailable" alone does not say which file to look at.
+        lease
+            .check_parent()
+            .map_err(|error| SecretError::Unavailable {
+                what: format!("registered parent Vault ({error:#})"),
+            })?;
         drop(lease);
         Ok(vault)
     }

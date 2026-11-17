@@ -15,6 +15,8 @@ const READ: OFlags = OFlags::RDONLY
     .union(OFlags::NONBLOCK)
     .union(OFlags::CLOEXEC);
 const MAX: u64 = 32 * 1024 * 1024;
+/// The parent registration marker (the classification pin is the lock file).
+const MARKER: &str = "parent-retention.json";
 
 #[derive(Debug)]
 pub(crate) struct Lease {
@@ -39,7 +41,7 @@ fn orphan_tmp_target(name: &str) -> Option<&str> {
     let body = name.strip_prefix('.')?.strip_suffix(".tmp")?;
     let (published, id) = body.rsplit_once('.')?;
     ulid::Ulid::from_string(id).ok()?;
-    let known = published == "parent-retention.json"
+    let known = published == MARKER
         || published
             .strip_suffix(".json")
             .is_some_and(|run| RunId::parse(run).is_ok());
@@ -76,9 +78,12 @@ impl Identity {
         })
     }
     fn private(&self) -> bool {
+        self.links == 1 && self.owned()
+    }
+    /// A regular 0600 file of this user, whatever its number of names.
+    fn owned(&self) -> bool {
         self.mode & 0o170000 == 0o100000
             && self.uid == rustix::process::geteuid().as_raw()
-            && self.links == 1
             && self.mode & 0o7777 == 0o600
     }
 }
@@ -170,6 +175,15 @@ impl Lease {
         Ok(())
     }
     fn read_open(&self, name: &str) -> anyhow::Result<Option<(Vec<u8>, Identity, File)>> {
+        self.read_open_links(name, 1)
+    }
+    /// `read_open`, for a file that may have up to `links` names. Only the
+    /// parent registration is ever read with more than one.
+    fn read_open_links(
+        &self,
+        name: &str,
+        links: u64,
+    ) -> anyhow::Result<Option<(Vec<u8>, Identity, File)>> {
         self.current()?;
         let file: File = match rustix::fs::openat(&*self.root, name, READ, Mode::empty()) {
             Ok(fd) => fd.into(),
@@ -177,12 +191,8 @@ impl Lease {
             Err(e) => return Err(e.into()),
         };
         let before = Identity::of(&file)?;
-        let limit = if name == "parent-retention.json" {
-            65536
-        } else {
-            MAX
-        };
-        if !before.private() {
+        let limit = if name == MARKER { 65536 } else { MAX };
+        if !(before.owned() && (1..=links).contains(&before.links)) {
             return Err(SecretError::Insecure {
                 what: "secret bundle",
                 path: self.path.join(name),
@@ -208,6 +218,48 @@ impl Lease {
             .read_open(name)?
             .map(|(bytes, identity, _)| (bytes, identity)))
     }
+    /// The parent registration marker. The first registration that dies
+    /// between its link and its unlink leaves the marker with two names, and
+    /// the sweep that repairs that only runs after the marker was read. So
+    /// with a classification pin, which is written and synced before the
+    /// marker is published and which the marker must equal anyway, exactly
+    /// that shape is read: the only other name is this directory's own
+    /// publication temporary of the marker. Nothing is unlinked here.
+    fn marker(&self, pinned: bool) -> anyhow::Result<Option<Vec<u8>>> {
+        let Some((bytes, identity, _)) = self.read_open_links(MARKER, 2)? else {
+            return Ok(None);
+        };
+        if identity.links != 1 {
+            ensure!(
+                pinned,
+                "Vault parent registration {MARKER} has two names and no classification pin"
+            );
+            ensure!(
+                self.marker_twin(&identity)?,
+                "Vault parent registration {MARKER} has two names and the other is not its own publication temporary .{MARKER}.<ulid>.tmp"
+            );
+        }
+        Ok(Some(bytes))
+    }
+    /// Whether a name of this directory is a publication temporary of the
+    /// marker and, without following a link, the marker's own inode. The
+    /// marker has exactly two names and was opened as a regular 0600 file of
+    /// this user, so the same inode needs no second look at type or mode.
+    fn marker_twin(&self, marker: &Identity) -> anyhow::Result<bool> {
+        for entry in rustix::fs::Dir::read_from(&*self.root)? {
+            let entry = entry?;
+            let Ok(name) = entry.file_name().to_str() else {
+                continue;
+            };
+            if orphan_tmp_target(name) == Some(MARKER)
+                && rustix::fs::statat(&*self.root, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .is_ok_and(|s| (s.st_dev as u64, s.st_ino) == (marker.dev, marker.ino))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
     fn parent_registration(
         &self,
     ) -> anyhow::Result<Option<crate::source::retention::VaultRegistration>> {
@@ -219,7 +271,7 @@ impl Lease {
                 registration.matches_parent(state),
                 "Vault pinned source path mismatch"
             );
-            if let Some((bytes, _)) = self.read("parent-retention.json")? {
+            if let Some(bytes) = self.marker(true)? {
                 ensure!(
                     serde_json::from_slice::<crate::source::retention::VaultRegistration>(&bytes)?
                         == registration,
@@ -228,7 +280,7 @@ impl Lease {
             }
             return Ok(Some(registration));
         }
-        if let Some((bytes, _)) = self.read("parent-retention.json")? {
+        if let Some(bytes) = self.marker(false)? {
             let registration: crate::source::retention::VaultRegistration =
                 serde_json::from_slice(&bytes)?;
             ensure!(
@@ -349,6 +401,10 @@ impl Lease {
     /// consulted. A crash after the link and before the unlink leaves the
     /// published file with two links, which every reader refuses; removing
     /// the temporary name restores it. A temporary is never published here.
+    ///
+    /// One entry that cannot be examined or unlinked is retained and counted,
+    /// and the rest of the page goes on: only a root that is no longer this
+    /// Vault, an unreadable directory and a failed directory sync fail the page.
     pub(crate) fn sweep_orphan_tmp(&self, limit: u32) -> anyhow::Result<TmpSweep> {
         ensure!(
             self.exclusive,
@@ -370,7 +426,10 @@ impl Lease {
         let mut sweep = TmpSweep::default();
         for name in names {
             let published = orphan_tmp_target(&name).context("Vault temporary name")?;
-            let stat = rustix::fs::statat(&*self.root, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            let Ok(stat) = self.sweep_stat(&name) else {
+                sweep.retained += 1;
+                continue;
+            };
             let ours = stat.st_mode as u32 & 0o170000 == 0o100000
                 && stat.st_uid == euid
                 && stat.st_mode as u32 & 0o7777 == 0o600;
@@ -389,14 +448,26 @@ impl Lease {
             if sweep.removed == limit {
                 break;
             }
-            rustix::fs::unlinkat(&*self.root, name.as_str(), AtFlags::empty())
-                .context("unlink orphaned Vault temporary")?;
+            if self.sweep_unlink(&name).is_err() {
+                sweep.retained += 1;
+                continue;
+            }
             sweep.removed += 1;
         }
         if sweep.removed > 0 {
             self.root.sync_all()?;
         }
         Ok(sweep)
+    }
+    fn sweep_stat(&self, name: &str) -> rustix::io::Result<rustix::fs::Stat> {
+        #[cfg(test)]
+        sweep_fault("stat", name)?;
+        rustix::fs::statat(&*self.root, name, AtFlags::SYMLINK_NOFOLLOW)
+    }
+    fn sweep_unlink(&self, name: &str) -> rustix::io::Result<()> {
+        #[cfg(test)]
+        sweep_fault("unlink", name)?;
+        rustix::fs::unlinkat(&*self.root, name, AtFlags::empty())
     }
     pub(crate) fn register(
         &self,
@@ -413,17 +484,17 @@ impl Lease {
                 .write_all_at(&serde_json::to_vec(registration)?, 0)?;
             self.lock.sync_all()?;
         }
-        if let Some((bytes, _)) = self.read("parent-retention.json")? {
+        // The pin is durable from here on, so a marker whose own publication
+        // died half way is read, and the sweep that follows this repairs it.
+        if let Some(bytes) = self.marker(true)? {
             ensure!(
                 serde_json::from_slice::<crate::source::retention::VaultRegistration>(&bytes)?
                     == *registration,
                 "Vault parent registration changed"
             );
         } else {
-            self.publish("parent-retention.json", &serde_json::to_vec(registration)?)?;
-            let (bytes, _) = self
-                .read("parent-retention.json")?
-                .context("missing parent registration")?;
+            self.publish(MARKER, &serde_json::to_vec(registration)?)?;
+            let (bytes, _) = self.read(MARKER)?.context("missing parent registration")?;
             ensure!(
                 serde_json::from_slice::<crate::source::retention::VaultRegistration>(&bytes)?
                     == *registration,
@@ -508,6 +579,24 @@ impl Lease {
 thread_local! {static PUBLISH_HOOK:std::cell::RefCell<Option<Box<dyn Fn()>>>=const{std::cell::RefCell::new(None)};}
 #[cfg(test)]
 thread_local! {static FAULT:std::cell::Cell<Option<&'static str>>=const{std::cell::Cell::new(None)};}
+#[cfg(test)]
+thread_local! {static SWEEP_FAULT:std::cell::RefCell<Option<(&'static str,String)>>=const{std::cell::RefCell::new(None)};}
+/// Fail one step (`stat` or `unlink`) of the sweep for one entry name.
+#[cfg(test)]
+pub(crate) fn set_sweep_fault(fault: Option<(&'static str, String)>) {
+    SWEEP_FAULT.with(|f| *f.borrow_mut() = fault);
+}
+#[cfg(test)]
+fn sweep_fault(step: &str, name: &str) -> rustix::io::Result<()> {
+    if SWEEP_FAULT.with(|f| {
+        f.borrow()
+            .as_ref()
+            .is_some_and(|(s, n)| *s == step && n == name)
+    }) {
+        return Err(rustix::io::Errno::PERM);
+    }
+    Ok(())
+}
 #[cfg(test)]
 pub(crate) fn set_retention_fault(stage: Option<&'static str>) {
     FAULT.with(|f| f.set(stage));
@@ -794,5 +883,69 @@ mod tests {
         assert_eq!(lease.sweep_orphan_tmp(32).unwrap().removed, 1);
         assert_eq!(lease.sweep_orphan_tmp(0).unwrap(), TmpSweep::default());
         assert_eq!(lease.bundle(&r).unwrap().unwrap(), b"owned-fixture");
+    }
+    #[test]
+    fn orphan_sweep_counts_an_entry_it_cannot_examine_or_unlink_and_goes_on() {
+        let (_tmp, v, r) = fixture();
+        let mut names: Vec<_> = (0..3)
+            .map(|_| tmp_name(&format!("{}.json", RunId::generate())))
+            .collect();
+        names.sort();
+        for name in &names {
+            private_file(&v.dir.join(name), b"never-published-private");
+        }
+        let lease = v.lease(true).unwrap();
+        // A failed unlink of the first entry neither ends the page nor hides
+        // the entries after it.
+        set_sweep_fault(Some(("unlink", names[0].clone())));
+        assert_eq!(
+            lease.sweep_orphan_tmp(32).unwrap(),
+            TmpSweep {
+                removed: 2,
+                retained: 1
+            }
+        );
+        assert!(v.dir.join(&names[0]).exists());
+        assert!(!v.dir.join(&names[1]).exists() && !v.dir.join(&names[2]).exists());
+        // Nor does an entry that cannot be examined: it is never unlinked.
+        set_sweep_fault(Some(("stat", names[0].clone())));
+        assert_eq!(
+            lease.sweep_orphan_tmp(32).unwrap(),
+            TmpSweep {
+                removed: 0,
+                retained: 1
+            }
+        );
+        assert!(v.dir.join(&names[0]).exists());
+        // A fault on another name or step does not match.
+        set_sweep_fault(Some(("stat", names[1].clone())));
+        assert_eq!(lease.sweep_orphan_tmp(32).unwrap().removed, 1);
+        set_sweep_fault(None);
+        assert_eq!(lease.sweep_orphan_tmp(32).unwrap(), TmpSweep::default());
+        assert_eq!(lease.bundle(&r).unwrap().unwrap(), b"owned-fixture");
+    }
+    #[test]
+    fn a_file_with_two_names_is_read_only_where_two_links_are_allowed() {
+        let (tmp, v, r) = fixture();
+        let bundle = format!("{r}.json");
+        std::fs::hard_link(v.path(&r), tmp.path().join("second-name")).unwrap();
+        let lease = v.lease(false).unwrap();
+        assert!(lease.read_open(&bundle).is_err());
+        assert!(lease.read_open_links(&bundle, 1).is_err());
+        let (bytes, identity, _) = lease.read_open_links(&bundle, 2).unwrap().unwrap();
+        assert_eq!(
+            (bytes.as_slice(), identity.links),
+            (&b"owned-fixture"[..], 2)
+        );
+        std::fs::hard_link(v.path(&r), tmp.path().join("third-name")).unwrap();
+        assert!(lease.read_open_links(&bundle, 2).is_err());
+        std::fs::remove_file(tmp.path().join("third-name")).unwrap();
+        // Mode and owner checks do not depend on the number of names.
+        std::fs::set_permissions(v.path(&r), std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(lease.read_open_links(&bundle, 2).is_err());
+        // A run bundle is never read with two names.
+        std::fs::set_permissions(v.path(&r), std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(lease.bundle(&r).is_err());
+        assert!(!v.has(&r));
     }
 }

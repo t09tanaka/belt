@@ -27,6 +27,10 @@ pub struct VaultPage {
     pub unknown: u32,
     /// Orphaned publication temporaries unlinked (separate bound of 32).
     pub tmp_removed: u32,
+    /// Entries named like a publication temporary that the sweep left in
+    /// place: not provably ours, or not removable. Leftovers, not retention
+    /// failures, so they are not part of `unknown`.
+    pub tmp_retained: u32,
     pub errors: Vec<String>,
 }
 // st_dev is signed on macOS and u64 on Linux.
@@ -299,7 +303,7 @@ impl SourceStore {
         let swept = lease.sweep_orphan_tmp(32)?;
         let swept = VaultPage {
             tmp_removed: swept.removed,
-            unknown: swept.retained,
+            tmp_retained: swept.retained,
             ..Default::default()
         };
         let previous: Option<String> = c

@@ -3796,9 +3796,16 @@ mod tests {
             // The first sample always holds the clock; recovery does not wait for it.
             let page = tick(&f, &v, &k, &mut c, 100, 10);
             assert!(page.held);
+            // The link named like a temporary is a leftover, not a retention failure.
             assert_eq!(
-                (page.tmp_removed, page.unknown, page.claimed, page.removed),
-                (2, 1, 0, 0)
+                (
+                    page.tmp_removed,
+                    page.tmp_retained,
+                    page.unknown,
+                    page.claimed,
+                    page.removed
+                ),
+                (2, 1, 0, 0, 0)
             );
             assert!(!linked.exists() && !unpublished.exists());
             assert!(std::fs::symlink_metadata(&link).is_ok());
@@ -3812,8 +3819,14 @@ mod tests {
             // Readable again, the terminal run's copy is claimed and erased as usual.
             let page = tick(&f, &v, &k, &mut c, 101, 11);
             assert_eq!(
-                (page.tmp_removed, page.unknown, page.claimed, page.removed),
-                (0, 1, 1, 1)
+                (
+                    page.tmp_removed,
+                    page.tmp_retained,
+                    page.unknown,
+                    page.claimed,
+                    page.removed
+                ),
+                (0, 1, 0, 1, 1)
             );
             assert!(!bundle.exists());
             assert!(std::fs::symlink_metadata(&link).is_ok());
@@ -3858,33 +3871,179 @@ mod tests {
             assert_eq!((page.tmp_removed, page.claimed, page.removed), (1, 1, 1));
             assert!(!orphan.exists());
         }
+        fn marker_tmp(secrets: &Path) -> PathBuf {
+            secrets.join(format!(".parent-retention.json.{}.tmp", ulid::Ulid::new()))
+        }
         #[test]
-        fn vault_registration_marker_left_with_two_names_fails_closed() {
-            // Known limit: the marker is read before the sweep can run, so a
-            // crash between its link and unlink is not repaired here. Nothing
-            // is deleted and nothing becomes readable by mistake.
+        fn vault_registration_marker_left_with_two_names_opens_and_the_next_page_repairs_it() {
+            // The first registration died between linking the marker and
+            // unlinking its temporary name. The classification pin was synced
+            // before that, so the marker is read as it is; only the page's
+            // sweep, under the exclusive lease, removes the leftover name.
             let (f, r, v, k) = prepared();
             let mut c = VaultCursor::default();
             assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
             let secrets = f.state.join("secrets");
-            let orphan = secrets.join(format!(".parent-retention.json.{}.tmp", ulid::Ulid::new()));
-            std::fs::hard_link(secrets.join("parent-retention.json"), &orphan).unwrap();
-            let page = f.store.vault_retention_page(
-                &f.owner,
-                &v,
-                &k,
-                &mut c,
-                101,
-                11,
-                Some("boot".into()),
+            let marker = secrets.join("parent-retention.json");
+            let bytes = std::fs::read(&marker).unwrap();
+            let orphan = marker_tmp(&secrets);
+            std::fs::hard_link(&marker, &orphan).unwrap();
+            let files = entries(&f, &r);
+            for _ in 0..2 {
+                let opened = Vault::open(&f.state).unwrap();
+                assert!(opened.has(&r));
+                assert_eq!(opened.load(&r, &files, &k).unwrap().files.len(), 1);
+                // Opening and reading unlink nothing.
+                assert!(orphan.exists());
+                assert_eq!(std::fs::metadata(&marker).unwrap().nlink(), 2);
+            }
+            let page = tick(&f, &v, &k, &mut c, 101, 11);
+            assert_eq!(
+                (page.tmp_removed, page.tmp_retained, page.unknown),
+                (1, 0, 0)
             );
-            assert!(page.is_err());
-            assert!(Vault::open(&f.state).is_err());
-            assert!(orphan.exists());
-            assert!(secrets.join(format!("{r}.json")).exists());
-            // Removing the leftover name by hand restores the Vault.
-            std::fs::remove_file(&orphan).unwrap();
-            assert!(Vault::open(&f.state).unwrap().has(&r));
+            assert!(!orphan.exists());
+            assert_eq!(std::fs::metadata(&marker).unwrap().nlink(), 1);
+            assert_eq!(std::fs::read(&marker).unwrap(), bytes);
+            // Retention went on in the same page: the terminal run's copy is erased.
+            assert_eq!((page.claimed, page.removed), (1, 1));
+            assert!(Vault::open(&f.state).is_ok());
+        }
+        #[test]
+        fn vault_registration_marker_with_any_other_second_name_stays_refused() {
+            use std::os::unix::fs::{symlink, PermissionsExt};
+            type Break = fn(&Path, &Path, &Path);
+            let cases: [(&str, Break, &str); 7] = [
+                (
+                    "a second name that is not a temporary",
+                    |secrets, marker, _| {
+                        std::fs::hard_link(marker, secrets.join("parent-retention.json.bak"))
+                            .unwrap()
+                    },
+                    "has two names and the other is not its own publication temporary",
+                ),
+                (
+                    "a second name outside the Vault",
+                    |_, marker, state| std::fs::hard_link(marker, state.join("elsewhere")).unwrap(),
+                    "has two names and the other is not its own publication temporary",
+                ),
+                (
+                    "a link named like the temporary",
+                    |secrets, marker, state| {
+                        symlink(marker, marker_tmp(secrets)).unwrap();
+                        std::fs::hard_link(marker, state.join("elsewhere")).unwrap();
+                    },
+                    "has two names and the other is not its own publication temporary",
+                ),
+                (
+                    "another file named like the temporary",
+                    |secrets, marker, state| {
+                        let copy = marker_tmp(secrets);
+                        std::fs::copy(marker, &copy).unwrap();
+                        std::fs::set_permissions(&copy, std::fs::Permissions::from_mode(0o600))
+                            .unwrap();
+                        std::fs::hard_link(marker, state.join("elsewhere")).unwrap();
+                    },
+                    "has two names and the other is not its own publication temporary",
+                ),
+                (
+                    "three names",
+                    |secrets, marker, state| {
+                        std::fs::hard_link(marker, marker_tmp(secrets)).unwrap();
+                        std::fs::hard_link(marker, state.join("elsewhere")).unwrap();
+                    },
+                    "must be a regular file readable by its owner only",
+                ),
+                (
+                    "a readable marker",
+                    |secrets, marker, _| {
+                        std::fs::hard_link(marker, marker_tmp(secrets)).unwrap();
+                        std::fs::set_permissions(marker, std::fs::Permissions::from_mode(0o644))
+                            .unwrap();
+                    },
+                    "must be a regular file readable by its owner only",
+                ),
+                (
+                    "no classification pin",
+                    |secrets, marker, _| {
+                        std::fs::hard_link(marker, marker_tmp(secrets)).unwrap();
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .truncate(true)
+                            .open(secrets.join("retention.lock"))
+                            .unwrap();
+                    },
+                    "has two names and no classification pin",
+                ),
+            ];
+            for (case, break_marker, reason) in cases {
+                let (f, r, v, k) = prepared();
+                let mut c = VaultCursor::default();
+                assert!(tick(&f, &v, &k, &mut c, 100, 10).held, "{case}");
+                let secrets = f.state.join("secrets");
+                let marker = secrets.join("parent-retention.json");
+                break_marker(&secrets, &marker, &f.state);
+                let names = |dir: &Path| {
+                    let mut names: Vec<_> = std::fs::read_dir(dir)
+                        .unwrap()
+                        .map(|e| e.unwrap().file_name())
+                        .collect();
+                    names.sort();
+                    names
+                };
+                let before = (names(&secrets), names(&f.state));
+                let error = match Vault::open(&f.state) {
+                    Ok(_) => panic!("{case}: opened"),
+                    Err(error) => error.to_string(),
+                };
+                assert!(error.contains("registered parent Vault"), "{case}: {error}");
+                assert!(error.contains(reason), "{case}: {error}");
+                assert!(v.load(&r, &entries(&f, &r), &k).is_err(), "{case}");
+                // Refusing removed and repaired nothing.
+                assert_eq!((names(&secrets), names(&f.state)), before, "{case}");
+                assert!(secrets.join(format!("{r}.json")).exists(), "{case}");
+            }
+        }
+        #[test]
+        fn vault_page_goes_on_past_a_temporary_it_cannot_unlink() {
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            let secrets = f.state.join("secrets");
+            let mut stuck = Vec::new();
+            for _ in 0..3 {
+                let name = format!(".{}.json.{}.tmp", RunId::generate(), ulid::Ulid::new());
+                std::fs::write(secrets.join(&name), b"TOKEN=never-published-fixture\n").unwrap();
+                std::fs::set_permissions(
+                    secrets.join(&name),
+                    std::fs::Permissions::from_mode(0o600),
+                )
+                .unwrap();
+                stuck.push(name);
+            }
+            stuck.sort();
+            // The first entry of the page cannot be unlinked (an immutable
+            // flag, say). The other temporaries and the retention go on.
+            crate::secrets::vault::set_sweep_fault(Some(("unlink", stuck[0].clone())));
+            let page = tick(&f, &v, &k, &mut c, 101, 11);
+            assert_eq!(
+                (
+                    page.tmp_removed,
+                    page.tmp_retained,
+                    page.unknown,
+                    page.claimed,
+                    page.removed
+                ),
+                (2, 1, 0, 1, 1)
+            );
+            assert!(secrets.join(&stuck[0]).exists());
+            assert!(!secrets.join(&stuck[1]).exists() && !secrets.join(&stuck[2]).exists());
+            assert!(!secrets.join(format!("{r}.json")).exists());
+            // Once it can be removed, a later page removes it.
+            crate::secrets::vault::set_sweep_fault(None);
+            let page = tick(&f, &v, &k, &mut c, 102, 12);
+            assert_eq!((page.tmp_removed, page.tmp_retained), (1, 0));
+            assert!(!secrets.join(&stuck[0]).exists());
         }
         #[test]
         fn vault_secret_free_terminal_run_keeps_source_only_retry_available() {

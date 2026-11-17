@@ -24,6 +24,52 @@ enum Phase {
 struct Report {
     paths: u32,
     unknown: u32,
+    /// Leftover Vault publication temporaries the sweep kept (not failures).
+    tmp_retained: u32,
+}
+
+/// What the loop counted so far, and the lines it logs: counts only, never a
+/// path or a raw error (both can hold private paths or manifest bytes).
+#[derive(Default)]
+struct Tally {
+    /// Retention targets and pages held by validation or I/O.
+    failures: u64,
+    /// Leftover temporaries seen by the latest Vault page that had any. They
+    /// stay until someone removes them, so they are counted apart from
+    /// `failures` and logged once, not on every page.
+    leftovers: u32,
+    leftovers_logged: bool,
+}
+impl Tally {
+    fn page(&mut self, report: &Report) -> Vec<String> {
+        let mut lines = Vec::new();
+        if report.unknown > 0 {
+            self.failures = self.failures.saturating_add(u64::from(report.unknown));
+            lines.push(format!(
+                "input retention targets retained; failures={}",
+                self.failures
+            ));
+        }
+        if report.tmp_retained > 0 {
+            self.leftovers = report.tmp_retained;
+            if !self.leftovers_logged {
+                self.leftovers_logged = true;
+                lines.push(format!(
+                    "Vault publication temporaries left in place (not provably ours, or not removable); leftovers={}",
+                    self.leftovers
+                ));
+            }
+        }
+        lines
+    }
+    /// A page that failed for a reason other than a busy lock.
+    fn held(&mut self) -> String {
+        self.failures = self.failures.saturating_add(1);
+        format!(
+            "input retention page held (validation/I/O); failures={}",
+            self.failures
+        )
+    }
 }
 
 struct Sample {
@@ -81,6 +127,7 @@ impl Driver {
                 )?;
                 report.paths = page.paths;
                 report.unknown = page.unknown;
+                report.tmp_retained = page.tmp_retained;
             }
             Phase::Source => {
                 let page = captured.sources.retention_page(
@@ -112,7 +159,7 @@ pub(super) async fn run(
     let mut timer = tokio::time::interval(cadence);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut driver = Driver::default();
-    let mut errors = 0u64;
+    let mut tally = Tally::default();
     loop {
         tokio::select! { _ = stop.changed() => return Ok(()), _ = timer.tick() => {} }
         if *stop.borrow() || coordinator.is_fenced() {
@@ -135,9 +182,8 @@ pub(super) async fn run(
         driver = next;
         if let Ok(report) = &result {
             debug_assert!(report.paths <= 32);
-            if report.unknown > 0 {
-                errors = errors.saturating_add(u64::from(report.unknown));
-                eprintln!("input retention targets retained; failures={errors}");
+            for line in tally.page(report) {
+                eprintln!("{line}");
             }
         }
         if let Err(error) = result {
@@ -150,8 +196,7 @@ pub(super) async fn run(
                 // GC is optional. Any uncertain identity/index/proof/I/O error
                 // retains data and retries on a later bounded tick. Never print
                 // raw errors that can contain private paths or manifest bytes.
-                errors = errors.saturating_add(1);
-                eprintln!("input retention page held (validation/I/O); failures={errors}");
+                eprintln!("{}", tally.held());
             }
         }
         tokio::task::yield_now().await;
@@ -165,7 +210,7 @@ pub(super) struct TestControl {
 }
 #[cfg(test)]
 impl TestControl {
-    fn cadence(&self) -> Duration {
+    pub(super) fn cadence(&self) -> Duration {
         let ms = self.cadence_ms.load(std::sync::atomic::Ordering::SeqCst);
         if ms == 0 {
             Duration::from_secs(60)
@@ -357,6 +402,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn leftover_temporaries_are_counted_apart_from_failures_and_logged_once() {
+        let mut tally = Tally::default();
+        assert!(tally.page(&Report::default()).is_empty());
+        let leftover = Report {
+            tmp_retained: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            tally.page(&leftover),
+            ["Vault publication temporaries left in place (not provably ours, or not removable); leftovers=2"]
+        );
+        // The same leftovers on every later page add no line and no failure.
+        for _ in 0..3 {
+            assert!(tally.page(&leftover).is_empty());
+        }
+        assert_eq!((tally.failures, tally.leftovers), (0, 2));
+        let both = Report {
+            paths: 0,
+            unknown: 3,
+            tmp_retained: 1,
+        };
+        assert_eq!(
+            tally.page(&both),
+            ["input retention targets retained; failures=3"]
+        );
+        assert_eq!((tally.failures, tally.leftovers), (3, 1));
+        // A page without leftovers keeps the last count that had any.
+        assert!(tally.page(&Report::default()).is_empty());
+        assert_eq!(tally.leftovers, 1);
+        assert_eq!(
+            tally.held(),
+            "input retention page held (validation/I/O); failures=4"
+        );
+        tally.failures = u64::MAX;
+        tally.held();
+        tally.page(&both);
+        assert_eq!(tally.failures, u64::MAX);
+    }
+    #[test]
+    fn vault_page_reports_a_leftover_temporary_as_a_leftover_not_a_failure() {
+        let f = Fixture::new();
+        let run = f.bind(true);
+        // Named like a publication temporary, but a link: never ours to remove.
+        let leftover = f
+            .captured
+            .parent_state
+            .join("secrets")
+            .join(format!(".{run}.json.{}.tmp", ulid::Ulid::new()));
+        std::os::unix::fs::symlink(f.input.join(".env"), &leftover).unwrap();
+        let mut driver = Driver::default();
+        let mut seen = 0;
+        for i in 0..6 {
+            let report = driver
+                .page(
+                    f.owner.store(),
+                    &f.captured,
+                    7,
+                    Sample {
+                        wall: 100 + i,
+                        mono: 10 + i,
+                        boot: Some("fixture-boot".into()),
+                    },
+                )
+                .unwrap();
+            assert_eq!(report.unknown, 0);
+            assert!(report.tmp_retained <= 1);
+            seen += report.tmp_retained;
+        }
+        // Every Vault page of the six ticks saw it; none removed it.
+        assert!(seen >= 2, "{seen}");
+        assert!(std::fs::symlink_metadata(&leftover).is_ok());
+        assert_eq!(
+            std::fs::read(f.input.join(".env")).unwrap(),
+            b"TOKEN=private-fixture\n"
+        );
+    }
     #[test]
     fn default_source_seven_days_and_vault_zero_have_independent_clocks_and_exact_scope() {
         let f = Fixture::new();
