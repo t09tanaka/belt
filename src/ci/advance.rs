@@ -267,7 +267,6 @@ fn advance_run(
 ) -> Result<(), Fault> {
     let fault = transient;
     let mut members: BTreeMap<String, Member> = BTreeMap::new();
-    let mut digest = None;
     let rows = store.ci_run_tasks(run).map_err(fault)?;
     if discovery::advance(store, state_dir, results, run, &rows, now_ms, pass)? {
         return Ok(());
@@ -280,13 +279,42 @@ fn advance_run(
                 .and_then(|v| v.as_str())
         })
         .map(str::to_owned);
+    let mut digest = super::discovery::active_plan(&rows)
+        .map(Digest::parse)
+        .transpose()
+        .map_err(unrunnable)?;
+    let mut allowable = std::collections::BTreeSet::new();
+    let mut probes = BTreeMap::new();
+    for row in rows.iter().filter(|r| discovery::is_probe(r)) {
+        let meta = discovery::metadata(row).expect("discovery row");
+        let spec: TaskSpec = serde_json::from_value(row.spec.clone()).map_err(unrunnable)?;
+        allowable.insert(spec.plan_digest.clone());
+        if let Some(id) = meta["applied_plan"].as_str() {
+            allowable.insert(Digest::parse(id).map_err(unrunnable)?);
+        }
+        if meta["applied"] == false {
+            let original = meta["original_task"]
+                .as_str()
+                .ok_or_else(|| unrunnable("missing discovery target"))?;
+            probes.insert(
+                original.to_owned(),
+                Member {
+                    row: row.clone(),
+                    spec,
+                },
+            );
+        }
+    }
     for row in rows.into_iter().filter(|r| !discovery::is_probe(r)) {
         let spec: TaskSpec = serde_json::from_value(row.spec.clone())
             .map_err(|e| unrunnable(format!("task {}: {e}", row.task_id)))?;
         let Some(ci) = &spec.ci else {
             return Err(unrunnable(format!("task {} is not a CI task", row.task_id)));
         };
-        if digest.get_or_insert_with(|| ci.task.plan_digest.clone()) != &ci.task.plan_digest {
+        pass.plans.insert(ci.task.plan_digest.clone());
+        if digest.get_or_insert_with(|| ci.task.plan_digest.clone()) != &ci.task.plan_digest
+            && !allowable.contains(&ci.task.plan_digest)
+        {
             return Err(unrunnable("the tasks of the run name different plans"));
         }
         if members
@@ -360,7 +388,10 @@ fn advance_run(
         };
         match &action.kind {
             ActionKind::Ready { task, inputs } => {
-                let member = member(task)?;
+                let member = match probes.get(task) {
+                    Some(probe) => probe,
+                    None => member(task)?,
+                };
                 if member.spec.ci.as_ref().is_some_and(|ci| ci.hold) {
                     release(store, run, member, inputs, now_ms, pass).map_err(fault)?;
                 }

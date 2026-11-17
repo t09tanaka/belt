@@ -311,7 +311,13 @@ pub(crate) fn run_task(
     let run_dir = paths.run_dir.clone();
     if let Some(step) = crate::ci::discovery::DiscoveryStep::from_task(&plan, &ci.task_id) {
         let probe = step.execution_plan(&plan).map_err(|e| e.to_string())?;
-        let task = probe.tasks.first().ok_or("empty runner discovery plan")?;
+        let task = probe
+            .tasks
+            .iter()
+            .find(|t| {
+                t.workflow == step.workflow && t.jobs.as_slice() == std::slice::from_ref(&step.job)
+            })
+            .ok_or("missing runner discovery task")?;
         let result = execute_task(
             &store, &manifest, &probe, &task.id, &inputs, paths, executor,
         )

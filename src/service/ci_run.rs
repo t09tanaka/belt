@@ -382,7 +382,10 @@ fn job_report(
     let mut lines = Vec::new();
     let rows = store.ci_run_tasks(run).map_err(|e| e.to_string())?;
     let mut by_plan_task = std::collections::BTreeMap::new();
-    let mut digest = None;
+    let mut digest = crate::ci::discovery::active_plan(&rows)
+        .map(Digest::parse)
+        .transpose()
+        .map_err(|e| e.to_string())?;
     for row in &rows {
         let Some(ci) = serde_json::from_value::<TaskSpec>(row.spec.clone())
             .ok()

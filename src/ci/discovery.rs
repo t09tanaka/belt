@@ -94,7 +94,7 @@ pub fn candidates(plan: &FrozenPlan) -> Vec<DiscoveryStep> {
         let Some(j) = w.jobs.iter().find(|j| &j.id == id) else {
             continue;
         };
-        if !j.needs.is_empty() || j.matrix.is_some() || j.container || j.reusable.is_some() {
+        if j.matrix.is_some() || j.container || j.reusable.is_some() {
             continue;
         }
         let mut runners = j
@@ -296,31 +296,36 @@ pub fn stage(
         }) else {
             continue;
         };
-        let Some((_, spec)) = specs.iter().find(|(name, _)| name == &task.id) else {
+        let Some((_, spec)) = specs.iter_mut().find(|(name, _)| name == &task.id) else {
             continue;
         };
         let mut probe = spec.clone();
+        spec.ci.as_mut().expect("CI task").hold = true;
         let ci = probe.ci.as_mut().expect("specs came from a CI plan");
         let id = step.task_id();
         ci.task.task_id = id.clone();
         let policy = policies
             .iter()
             .find(|p| p.workflow == step.workflow && p.job == step.job);
-        ci.task.inputs["rtr_discovery"] = serde_json::json!({"capacity": capacity, "project": project, "applied": false, "policy": policy});
-        ci.hold = false;
+        ci.task.inputs["rtr_discovery"] = serde_json::json!({"original_task":task.id,"capacity": capacity, "project": project, "applied": false, "policy": policy});
+
         ci.steps = u32::try_from(step.step + 2).unwrap_or(u32::MAX);
         probes.push((id, probe));
     }
-    if !probes.is_empty() {
-        for (_, spec) in specs.iter_mut() {
-            spec.ci.as_mut().expect("CI task").hold = true;
-        }
-        specs.extend(probes);
-    }
+    specs.extend(probes);
 }
 
-/// Freeze all worker listings together, preserving already split jobs. A
-/// partial or duplicated batch cannot replace a previously frozen decision.
+/// The immutable version of the DAG that contains all committed discoveries.
+pub fn active_plan(rows: &[crate::storage::CiTaskRow]) -> Option<&str> {
+    rows.iter().find_map(|r| {
+        r.spec
+            .pointer("/ci/task/inputs/rtr_discovery/active_plan")
+            .and_then(|v| v.as_str())
+    })
+}
+
+/// Freeze the listings ready in this pass. A prior decision stays attached
+/// to its job as downstream jobs become ready to be listed.
 pub fn apply(
     plan: &FrozenPlan,
     listings: &[WorkerListing],
@@ -329,26 +334,39 @@ pub fn apply(
     isolation: impl Fn(&DiscoveryStep) -> Isolation,
 ) -> anyhow::Result<FrozenPlan> {
     let expected = candidates(plan);
-    anyhow::ensure!(
-        expected.len() == listings.len(),
-        "incomplete discovery batch"
-    );
+    anyhow::ensure!(!listings.is_empty(), "empty discovery batch");
     let mut requests = plan.shard_requests();
-    for expected_step in expected {
-        let listing = listings
-            .iter()
-            .find(|r| r.step == expected_step)
-            .ok_or_else(|| anyhow::anyhow!("discovery step missing from batch"))?;
+    let mut seen = std::collections::BTreeSet::new();
+    for listing in listings {
+        let expected_step = &listing.step;
+        anyhow::ensure!(
+            expected.contains(expected_step)
+                && seen.insert((&expected_step.workflow, &expected_step.job)),
+            "unexpected or duplicated discovery step"
+        );
         let (history, costs) = evidence(listing)?;
         requests.push(listing.partition(
             plan,
             &history,
             count,
             &costs,
-            isolation(&expected_step),
+            isolation(expected_step),
         )?);
     }
-    plan.with_shards(&requests)
+    let mut next = plan.with_shards(&requests)?;
+    // The SDK exports requests only for split groups. Earlier single-job
+    // decisions still explain why a runner had to keep its job together.
+    for group in &mut next.shard_groups {
+        if let Some(previous) = plan
+            .shard_groups
+            .iter()
+            .find(|old| old.id == group.id && !old.split && old.runner.is_some())
+        {
+            *group = previous.clone();
+        }
+    }
+    next.digest = next.compute_digest()?;
+    Ok(next)
 }
 
 #[cfg(test)]

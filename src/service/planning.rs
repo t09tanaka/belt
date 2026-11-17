@@ -136,13 +136,15 @@ pub fn stored(
     let rows = store
         .ci_run_tasks(run)
         .map_err(|_| failure("cannot read the stored run"))?;
-    let digest = rows
-        .iter()
-        .filter(|r| r.spec.pointer("/ci/task/inputs/rtr_discovery").is_none())
-        .find_map(|r| {
-            r.spec
-                .pointer("/ci/task/plan_digest")
-                .and_then(|v| v.as_str())
+    let digest = crate::ci::discovery::active_plan(&rows)
+        .or_else(|| {
+            rows.iter()
+                .filter(|r| r.spec.pointer("/ci/task/inputs/rtr_discovery").is_none())
+                .find_map(|r| {
+                    r.spec
+                        .pointer("/ci/task/plan_digest")
+                        .and_then(|v| v.as_str())
+                })
         })
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no stored CI plan for this run"))?;
     let digest =

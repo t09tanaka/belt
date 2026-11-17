@@ -266,17 +266,20 @@ impl CoordinatorStore {
     pub fn apply_ci_discovery(
         &self,
         run: &RunId,
+        previous: &Digest,
+        next: &Digest,
         probe_ids: Vec<TaskId>,
         replacements: Vec<(TaskId, Vec<(TaskId, Value)>)>,
         at_ms: u64,
     ) -> Result<bool> {
         let run = run.to_string();
+        let (previous, next) = (previous.to_string(), next.to_string());
         self.db.write(move |tx| {
             for id in &probe_ids {
                 let pending: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM task WHERE run_id=?1 AND task_id=?2
-                     AND json_extract(spec_json,'$.ci.task.inputs.rtr_discovery.applied')=0)",
-                    params![run, id.as_str()], |r| r.get(0))?;
+                     AND json_extract(spec_json,'$.ci.task.inputs.rtr_discovery.applied')=0 AND coalesce(json_extract(spec_json,'$.ci.task.inputs.rtr_discovery.active_plan'),json_extract(spec_json,'$.plan_digest'))=?3)",
+                    params![run, id.as_str(),previous], |r| r.get(0))?;
                 if !pending { return Ok(false); }
             }
             for (old, parts) in replacements {
@@ -296,9 +299,10 @@ impl CoordinatorStore {
                 }
             }
             for id in probe_ids {
-                tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.rtr_discovery.applied',json('true')) WHERE run_id=?1 AND task_id=?2",
-                    params![run, id.as_str()])?;
+                tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.rtr_discovery.applied',json('true'),'$.ci.task.inputs.rtr_discovery.applied_plan',?3) WHERE run_id=?1 AND task_id=?2",
+                    params![run, id.as_str(),next])?;
             }
+            tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.rtr_discovery.active_plan',?2) WHERE run_id=?1 AND json_type(spec_json,'$.ci.task.inputs.rtr_discovery')='object'",params![run,next])?;
             common::append_event(tx,Some(&run),None,"ci_discovery_applied",&serde_json::json!({}),at_ms)?;
             Ok(true)
         })
@@ -320,7 +324,9 @@ impl CoordinatorStore {
         self.db.write(move |tx| {
             let changed = tx.execute(
                 &format!(
-                    "UPDATE task AS t SET spec_json=?2 WHERE t.task_id=?1 AND {HELD}
+                    "UPDATE task AS t SET spec_json=CASE WHEN json_type(t.spec_json,'$.ci.task.inputs.rtr_discovery')='object'
+                        THEN json_set(?2,'$.ci.task.inputs.rtr_discovery',json_extract(t.spec_json,'$.ci.task.inputs.rtr_discovery'))
+                        ELSE ?2 END WHERE t.task_id=?1 AND {HELD}
                      AND t.cancel_requested_at_ms IS NULL
                      AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)"
                 ),
