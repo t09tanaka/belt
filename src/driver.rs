@@ -484,6 +484,16 @@ impl Driver {
                 }
             }
         }
+        // The members of a dynamic matrix are named after their origin when it
+        // expands. A frozen task there would fail the matrix in the middle of a
+        // run: refuse the plan instead.
+        for origin in plan.tasks.iter().filter(|t| t.dynamic_matrix) {
+            ensure!(
+                !ids.iter()
+                    .any(|id| dispatch::names_member_of(&origin.id, id)),
+                "task id is reserved for the members of a dynamic matrix"
+            );
+        }
         atomic::validate_readiness(plan, &producers)?;
         let phases = plan
             .tasks
@@ -794,15 +804,10 @@ impl Driver {
                     *reason != HostFailureReason::WorkerFenced,
                     "a fence has its own input"
                 );
-                if self.release_without_receipt(&mut s, task, token, *reason, false)? {
-                    return self.checked(s);
-                }
+                return self.release(s, task, token, *reason, false);
             }
             Input::Fence { task, token } => {
-                let reason = HostFailureReason::WorkerFenced;
-                if self.release_without_receipt(&mut s, task, token, reason, true)? {
-                    return self.checked(s);
-                }
+                return self.release(s, task, token, HostFailureReason::WorkerFenced, true);
             }
             Input::Settle {
                 task,
@@ -903,18 +908,51 @@ impl Driver {
         self.progress(&mut s)?;
         self.checked(s)
     }
-    /// Release a claim on the host's word. Says whether this repeats a
-    /// committed release, which changes nothing. Only a fence may release a
-    /// dispatched claim.
-    fn release_without_receipt(
+    /// A release on the host's word is not refused for the capacity of what
+    /// it makes ready: when the state cannot hold that, the claim is released
+    /// all the same and the run halts with a typed storage failure, as a
+    /// settlement does.
+    fn release(
         &self,
-        s: &mut State,
+        mut s: State,
         task: &str,
         token: &str,
         reason: HostFailureReason,
         fenced: bool,
-    ) -> Result<bool> {
-        let t = self.task(s, task).context("unknown task")?;
+    ) -> Result<State> {
+        let t = self.task(&s, task).context("unknown task")?;
+        let Some(fail_fast) = self.release_without_receipt(&mut s, &t, token, reason, fenced)?
+        else {
+            return self.checked(s);
+        };
+        let mut normal = s.clone();
+        let candidate = (|| {
+            if fail_fast {
+                self.fail_fast(&mut normal, &t)?;
+            }
+            self.progress(&mut normal)?;
+            self.checked(normal)
+        })();
+        if let Some(normal) = classify_settlement_candidate(candidate)? {
+            return Ok(normal);
+        }
+        s.infrastructure_failure = Some(ResultStorageFailure::DriverCapacity);
+        self.halt_progress(&mut s);
+        self.checked(s)
+    }
+    /// Release a claim on the host's word: `None` when this repeats a
+    /// committed release, which changes nothing, else whether the release is
+    /// a failure that `fail-fast` acts on. Only a fence may release a
+    /// dispatched claim.
+    fn release_without_receipt(
+        &self,
+        s: &mut State,
+        t: &ExecutionTask,
+        token: &str,
+        reason: HostFailureReason,
+        fenced: bool,
+    ) -> Result<Option<bool>> {
+        let task = t.id.as_str();
         if let Phase::Terminal(Terminal::HostAbort {
             token: old,
             reason: old_reason,
@@ -925,7 +963,7 @@ impl Driver {
                 old == token && *old_reason == reason,
                 "conflicting duplicate host abort"
             );
-            return Ok(true);
+            return Ok(None);
         }
         let Phase::Claimed {
             token: owner,
@@ -994,10 +1032,7 @@ impl Driver {
         );
         s.outbox
             .retain(|a| !matches!(&a.kind, ActionKind::Cancel { task: id, .. } if id == task));
-        if !cancelled {
-            self.fail_fast(s, &t)?;
-        }
-        Ok(false)
+        Ok(Some(!cancelled))
     }
     /// Entered only after the complete, single genuine Settle validation path.
     fn settle_validated(
