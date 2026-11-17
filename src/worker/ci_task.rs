@@ -624,11 +624,20 @@ mod tests {
         let digest = Digest::of_bytes(bytes);
         let done = put_plan(dir.path(), &chunk(bytes, &digest, 1, 5)).unwrap();
         assert!(done.complete);
-        // What a cut delivery left goes with the GC; the plan stays while it
-        // is young.
+        // What a cut delivery left goes with the GC once it is old enough
+        // (here: at once), like a plan nothing names: the seven that are
+        // still part-way and the plan that arrived.
+        assert_eq!(parts_in(&plans_dir(dir.path())), MAX_PLAN_PARTS - 1);
+        assert!(plan_path(dir.path(), &digest).is_file());
         let none = std::collections::BTreeSet::new();
+        assert_eq!(
+            sweep_plans(dir.path(), &none, u64::MAX),
+            0,
+            "nothing is old yet"
+        );
         assert_eq!(sweep_plans(dir.path(), &none, 0), MAX_PLAN_PARTS);
         assert_eq!(parts_in(&plans_dir(dir.path())), 0);
+        assert!(!plan_path(dir.path(), &digest).exists());
     }
 
     #[test]

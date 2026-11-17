@@ -5156,7 +5156,18 @@ fn ci_command(spec: &Spec, input: &std::path::Path) -> tokio::process::Command {
 }
 
 async fn ci_output(spec: &Spec, input: &std::path::Path) -> (Option<i32>, serde_json::Value) {
-    let waited = tokio::time::timeout(Duration::from_secs(240), ci_command(spec, input).output());
+    ci_output_with(spec, input, &[]).await
+}
+
+/// [`ci_output`] with more arguments after `ci`.
+async fn ci_output_with(
+    spec: &Spec,
+    input: &std::path::Path,
+    more: &[&str],
+) -> (Option<i32>, serde_json::Value) {
+    let mut command = ci_command(spec, input);
+    command.args(more);
+    let waited = tokio::time::timeout(Duration::from_secs(240), command.output());
     let output = match waited.await {
         Ok(output) => output.unwrap(),
         Err(elapsed) => {
@@ -5348,5 +5359,68 @@ async fn ci_sigint_cancels_the_running_job_and_the_ones_that_wait() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(ci_marks(&marks, "second").is_empty());
     assert_eq!(ci_marks(&marks, "first"), ["started"]);
+    shutdown(&load(&spec)).await;
+}
+
+/// `ci` on a Git repository: the worktree as it is (with what is not
+/// committed), and a commit named on the command line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_runs_the_worktree_of_a_git_repository_and_a_named_commit() {
+    let (root, mut spec) = fixture();
+    // The worker makes the workspace of a Git source with fast-worktree.
+    spec.env.insert(
+        "PATH".into(),
+        private_tool_path(root.path(), &["git", "fast-worktree"]),
+    );
+    let config = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "schema_version = 1\n[coordinator]\nheartbeat_seconds = 1\nstale_seconds = 3\n",
+    )
+    .unwrap();
+    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
+        .unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let jobs = |word: &str| {
+        format!(
+            "  build:\n    runs-on: ubuntu-latest\n    outputs:\n      word: ${{{{ steps.w.outputs.word }}}}\n    steps:\n      - id: w\n        run: echo \"word={word}\" >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${{{{ needs.build.outputs.word }}}}\" >> MARKS/test\n"
+        )
+    };
+    let marks = ci_project(root.path(), &repo, &jobs("committed"));
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "first"]);
+    // Not committed: the worktree says another word.
+    ci_project(root.path(), &repo, &jobs("dirty"));
+
+    let (code, value) = ci_output(&spec, &repo).await;
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(ci_marks(&marks, "test"), ["dirty"]);
+    let more = ["--snapshot", "commit", "--ref", "HEAD"];
+    let (code, value) = ci_output_with(&spec, &repo, &more).await;
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(ci_marks(&marks, "test"), ["dirty", "committed"]);
+    let jobs = ci_jobs(&value);
+    assert_eq!(jobs["build"].0, "success");
+    assert_eq!(jobs["test"].0, "success");
     shutdown(&load(&spec)).await;
 }

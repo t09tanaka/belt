@@ -562,6 +562,15 @@ mod tests {
             }]
         });
         assert!(services.contains("service"), "{services}");
+        let shard = broken(&|t| {
+            let mut shard: local_ci::dag::TaskShard = serde_json::from_value(serde_json::json!({
+                "group": "g", "index": 0, "count": 2, "mode": "single", "tests": [],
+            }))
+            .unwrap_or_else(|e| panic!("the shape of a shard changed: {e}"));
+            shard.index = 1;
+            t.shard = Some(shard);
+        });
+        assert!(shard.contains("shard"), "{shard}");
         let mut plan = f.plan.clone();
         plan.tasks[at].dynamic_matrix = true;
         assert!(matches!(

@@ -1454,7 +1454,7 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 
 テスト:
 
-- 実 binary・resident・local worker・実際の workflow file・実 process（`tests/it/bootstrap.rs`）: 3 段の needs の連鎖で output が 2 段先まで渡り、各 Job が 1 回だけ実行されること。失敗した Job の下流が step を起動せず skipped になり（その先も）、`if: always()` と `if: failure()` は動き、`if: success()` は動かず、run が失敗になること。Ctrl-C で実行中の Job が止まり、待機中の Job（`if: always()` 付き）が配置されないこと。
+- 実 binary・resident・local worker・実際の workflow file・実 process（`tests/it/bootstrap.rs`）: Git の repository の worktree（未 commit の変更込み）と、`--snapshot commit --ref HEAD` の両方で needs の連鎖が通ること（worker は実物の fast-worktree で workspace を作る）。 3 段の needs の連鎖で output が 2 段先まで渡り、各 Job が 1 回だけ実行されること。失敗した Job の下流が step を起動せず skipped になり（その先も）、`if: always()` と `if: failure()` は動き、`if: success()` は動かず、run が失敗になること。Ctrl-C で実行中の Job が止まり、待機中の Job（`if: always()` 付き）が配置されないこと。
 - A38（`tests/it/collection.rs`、worker は memory 上の代役 2 台、plan と回収は実物）: 下流は上流の結果が回収されるまで配置されず、回収後に別の worker へ output 付きで配置され、何度見直しても attempt は 1 つずつ。`ci_task_v1` の無い worker には配置されず、理由が decision に残る。forecast の demand が step の数ぶん有る（A10）。結果が無い・読めない task は成功にならず、下流に `failure` が渡る。結果だけを返す worker は回収される。cancel した run は何も release しない。
 - 単体: `ci::progress` 5 件、`ci::advance` 4 件、`service::ci_run` 3 件、`worker::ci_task` の配送 4 件、coordinator 4 件、ほか。worker への配送は `tests/it/worker_agent.rs` で実接続（追加の offer 無し）を通している。
 
@@ -1468,4 +1468,9 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - 親の plan は、release 済みで未配置の task が参照していても、保持日数を過ぎれば消える（run が保持日数より長く止まっている場合だけ）。worker の plan も、届いてから保持期間（既定 7 日）を過ぎて配置された task は準備で `NOT_FOUND` になる。入力の gate が run を忘れたあとの再配送では、もう一度送られて保持期間が延びる。
 - `ci` の終了コードは最初に失敗した task のもの（`exec` と同じ計算）で、Job の失敗は attempt の exit 1 として現れる。
 - CI task の実行中の log は `logs --follow` に流れない（終了後に回収される）。
-- toolchain の凍結を `ci` に入れること。
+- `ci` は、`exec` が project の設定から入れるもののうち、toolchain の凍結・`prepare_commands` と fast-worktree の setup（prepared setup は CI task で断られる）・`outputs` の宣言・`pass_env` を task に入れない。
+- worker が持てる plan は 256 件・保持 7 日で、source の状態が違えば plan も違う。上限に達した worker は plan の `blob_put` を `OVERLOADED` で断り、その worker では入力が ready にならない（run は event 無しで待つ）。
+- `estimate`（`coordinator/estimate.rs`）は workload を `commands` から作るままで、CI task の step を見ない。
+- host の loop（`ci::advance`）は `NeedsProgression` の `is_settled`・`dependencies_settled` を trait の外で呼んでいる。Driver に差し替えるときは host の loop も直す。
+- run が受理される前に記録された cancel（`run_cancel_intent` だけが有る状態）と待機中の task の release の関係は、command の task と同じ経路（配置の側の扱い）に任せていて、CI 用のテストは無い。
+- mutation のテストは手元で回していない（`advance_run`・`ended`・`release`・`job_lines`・`Collector::judged` を殺すのは `tests/it` のテスト）。
