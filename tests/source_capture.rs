@@ -1353,6 +1353,19 @@ fn a_clean_repository_with_converted_line_endings_is_head_and_posts_its_status()
         .map(|(k, v)| (k.to_string(), v))
         .collect(),
     );
+    // origin is a local path (not a host a status may go to) until it is
+    // given the address of a repository on GitHub; gh here is the fake above
+    assert!(local_ci::status(&gc, &w.worker, &head, &w.home).is_err());
+    assert!(!log.exists());
+    git(
+        &w.worker,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "https://github.com/example/example.git",
+        ],
+    );
     let (state, short) = local_ci::status(&gc, &w.worker, &head, &w.home).unwrap();
     assert_eq!(state, "success");
     assert_eq!(short, &head[..7]);
