@@ -207,6 +207,7 @@ mod survivor_tests {
                     parsed: true,
                     exit_ok,
                     tests: vec![TestResult {
+                        millis: None,
                         identity: "case".into(),
                         status,
                     }],

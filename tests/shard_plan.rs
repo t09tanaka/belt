@@ -342,6 +342,7 @@ fn outcome(job: &str, shard: &str, ok: bool, tests: &[(&str, TestStatus)]) -> Sh
         tests: tests
             .iter()
             .map(|(i, s)| TestResult {
+                millis: None,
                 identity: i.to_string(),
                 status: *s,
             })

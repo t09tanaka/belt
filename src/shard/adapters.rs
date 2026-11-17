@@ -634,6 +634,7 @@ impl RunnerAdapter for CargoTest {
                     _ => return None,
                 };
                 Some(TestResult {
+                    millis: None,
                     identity: name.strip_suffix(" - should panic").unwrap_or(name).into(),
                     status,
                 })
@@ -718,6 +719,16 @@ fn file_status(file: &str, tests: &[&str]) -> TestStatus {
     }
 }
 
+/// Jest and Vitest report suite start/end as epoch milliseconds. Round
+/// their difference once to preserve sub-millisecond timestamps. Reports
+/// without a completed interval contribute no timing sample.
+fn js_file_millis(file: &Value) -> Option<u64> {
+    let start = file.get("startTime")?.as_f64()?;
+    let end = file.get("endTime")?.as_f64()?;
+    let millis = (end - start).round();
+    (start > 0.0 && end >= start && millis < u64::MAX as f64).then_some(millis as u64)
+}
+
 /// The files of a Vitest or Jest JSON report, by the name they are listed by.
 fn collect_js(root: &str, job_id: &str, shard_id: &str, out: &CommandOutput) -> ShardOutcome {
     let report = json_of(&out.stdout);
@@ -740,6 +751,7 @@ fn collect_js(root: &str, job_id: &str, shard_id: &str, out: &CommandOutput) -> 
                 .filter_map(|t| t.get("status").and_then(Value::as_str))
                 .collect();
             Some(TestResult {
+                millis: js_file_millis(r),
                 identity: relative(root, name),
                 status: file_status(own, &tests),
             })
@@ -1002,6 +1014,7 @@ impl PwTest {
             _ => TestStatus::Failed,
         };
         TestResult {
+            millis: None,
             identity: self.identity(),
             status,
         }
@@ -1219,7 +1232,11 @@ fn pw_fold(results: Vec<TestResult>, given: &[String]) -> Vec<TestResult> {
             } else {
                 TestStatus::Passed
             };
-            TestResult { identity, status }
+            TestResult {
+                identity,
+                status,
+                millis: None,
+            }
         })
         .collect()
 }
@@ -1446,6 +1463,7 @@ fn cypress_report(stdout: &str) -> Option<Vec<TestResult>> {
                 TestStatus::Skipped
             };
             Some(TestResult {
+                millis: None,
                 identity: r.get("spec")?.as_str()?.to_string(),
                 status,
             })
@@ -1740,6 +1758,37 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
             ["npx", "vitest", "run", "--reporter=json", "--config=v.js"]
         );
         assert!(v.capabilities().native_shard);
+    }
+
+    #[test]
+    fn js_file_timings_survive_receipts_and_bad_intervals_remain_missing() {
+        let report = r#"{"testResults":[
+          {"name":"/p/a","startTime":100.5,"endTime":119.1},
+          {"name":"/p/b","startTime":75,"endTime":75},
+          {"name":"/p/c","startTime":100,"endTime":99},
+          {"name":"/p/d","endTime":110},
+          {"name":"/p/e","startTime":0,"endTime":110},
+          {"name":"/p/f","startTime":1,"endTime":1e30}]}"#;
+        for result in [
+            Jest::new("1", "/p", &[], Safety::default()).collect("j", "s", &out(report, true)),
+            Vitest::new("1", "/p", &[], Safety::default()).collect("j", "s", &out(report, true)),
+        ] {
+            assert_eq!(
+                result.tests.iter().map(|r| r.millis).collect::<Vec<_>>(),
+                [Some(19), Some(0), None, None, None, None]
+            );
+            assert_eq!(result.tests[0].identity, "a");
+            let encoded = serde_json::to_value(&result).unwrap();
+            assert_eq!(encoded["tests"][0]["millis"], 19);
+            assert!(encoded["tests"][2].get("millis").is_none());
+            assert_eq!(
+                serde_json::from_value::<ShardOutcome>(encoded).unwrap(),
+                result
+            );
+        }
+        let old: TestResult =
+            serde_json::from_str(r#"{"identity":"old","status":"passed"}"#).unwrap();
+        assert_eq!(old.millis, None);
     }
 
     #[test]
@@ -2913,6 +2962,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         // a file whose name starts like a given file is not part of it
         let r = pw_fold(
             vec![TestResult {
+                millis: None,
                 identity: "[d] › a.spec.jsx › t".into(),
                 status: Passed,
             }],
