@@ -907,8 +907,17 @@ impl Control<'_> {
     }
 
     pub(super) fn run_node(&mut self, index: usize, node: &NodeSpec) -> Result<NodeEnd> {
+        self.run_node_with_ci_history(index, node, None)
+    }
+
+    pub(super) fn run_node_with_ci_history(
+        &mut self,
+        index: usize,
+        node: &NodeSpec,
+        history: Option<&crate::ids::Digest>,
+    ) -> Result<NodeEnd> {
         (self.waiting_since_ms, self.running_since_ms) = (None, None);
-        let mut end = self.run_node_once(index, node)?;
+        let mut end = self.run_node_once(index, node, history)?;
         end.times = node_times(
             self.waiting_since_ms,
             self.running_since_ms,
@@ -917,7 +926,12 @@ impl Control<'_> {
         Ok(end)
     }
 
-    fn run_node_once(&mut self, index: usize, node: &NodeSpec) -> Result<NodeEnd> {
+    fn run_node_once(
+        &mut self,
+        index: usize,
+        node: &NodeSpec,
+        history: Option<&crate::ids::Digest>,
+    ) -> Result<NodeEnd> {
         let spec = self.spec;
         self.node_timeout_ms = node.timeout_ms;
         let attempt = spec.attempt_id.clone();
@@ -944,12 +958,20 @@ impl Control<'_> {
             parent: None,
             weight: node.weight,
             front: false,
-            key: profile_history_key(
-                &self.traffic.ctx,
-                &node.cwd,
-                &node.argv,
-                spec.profile_fingerprint.as_ref(),
-            )?,
+            key: match history.zip(
+                spec.artifacts
+                    .as_ref()
+                    .map(|a| &a.profile_fingerprint)
+                    .or(spec.profile_fingerprint.as_ref()),
+            ) {
+                Some((step, profile)) => Some(crate::ci::timing::profile_key(step, profile)),
+                None => profile_history_key(
+                    &self.traffic.ctx,
+                    &node.cwd,
+                    &node.argv,
+                    spec.profile_fingerprint.as_ref(),
+                )?,
+            },
             argv: node.argv.clone(),
             cwd: node.cwd.clone(),
             env: Some(node.env.clone()),
@@ -1240,7 +1262,12 @@ impl Control<'_> {
                         repo: entry.repo,
                         subdir: entry.subdir,
                         argv: entry.argv,
-                        key_argv: String::new(),
+                        key_argv: opts
+                            .key
+                            .as_deref()
+                            .filter(|key| key.starts_with("rtr-ci-step:"))
+                            .unwrap_or_default()
+                            .to_owned(),
                         started_at: ran.started_at,
                         wall_secs: ran.outcome.wall_secs,
                         cpu_secs: ran.outcome.cpu_secs,

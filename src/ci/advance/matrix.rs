@@ -367,6 +367,11 @@ pub(super) fn advance(
         ci.dynamic_origin = false;
         ci.core_outcome = None;
         ci.task.task_id = dispatch.task_id().to_string();
+        let demand = local_ci::plan_task_demand(plan, dispatch.origin()).map_err(unrunnable)?;
+        ci.history_keys = crate::ci::timing::keys(
+            &demand,
+            &crate::ci::timing::task_scope(plan, &ci.task.task_id),
+        );
         ci.task.inputs = serde_json::to_value(inputs).map_err(unrunnable)?;
         ci.task.dispatch = Some(serde_json::to_value(dispatch).map_err(unrunnable)?);
         ci.matrix = Some(crate::coordinator::MatrixAdmission {

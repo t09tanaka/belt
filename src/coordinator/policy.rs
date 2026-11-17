@@ -311,12 +311,18 @@ pub fn workload_of_spec(
     ready_delay_ms: Option<u64>,
 ) -> crate::wire::WorkloadPlan {
     match &spec.ci {
-        Some(ci) => crate::scheduler::ci_workload_of(
-            attempt_id,
-            &spec.plan_digest,
-            ci.steps,
-            ready_delay_ms,
-        ),
+        Some(ci) => {
+            let mut workload = crate::scheduler::ci_workload_of(
+                attempt_id,
+                &spec.plan_digest,
+                ci.steps,
+                ready_delay_ms,
+            );
+            for (node, key) in workload.nodes.iter_mut().zip(&ci.history_keys) {
+                node.ci_history_key.clone_from(key);
+            }
+            workload
+        }
         None => crate::scheduler::workload_of(
             attempt_id,
             &spec.plan_digest,
@@ -345,6 +351,7 @@ mod tests {
         let digest = crate::ids::Digest::of_bytes(b"plan");
         crate::coordinator::TaskSpec {
             ci: ci.then(|| crate::coordinator::CiSpec {
+                history_keys: Vec::new(),
                 dynamic_origin: false,
                 core_outcome: None,
                 matrix: None,

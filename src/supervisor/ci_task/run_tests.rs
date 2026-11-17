@@ -79,6 +79,10 @@ impl Sup {
             .unwrap();
         let ci = CiTaskSpec {
             artifact_workflow: None,
+            history_scope: Some(crate::ci::timing::task_scope(
+                &self.f.plan,
+                task_of(&self.f.plan, job),
+            )),
             dispatch: None,
             plan_path: crate::worker::ci_task::plan_path(&self.state(), &self.plan_digest),
             plan_digest: self.plan_digest.clone(),
@@ -200,6 +204,17 @@ fn a_job_that_needs_another_runs_in_another_attempt_from_the_first_ones_result()
     assert_eq!(term.outcome(), Outcome::Succeeded);
     assert_eq!(term.exit(), Some(Exit::Code(0)));
     assert_eq!(s.steps(&build), ["step-0"], "one node per step that ran");
+    let ci = ci_of(&build);
+    let demand = local_ci::plan_task_demand(&s.f.plan, &ci.task_id).unwrap();
+    let keys = crate::ci::timing::keys(&demand, ci.history_scope.as_ref().unwrap());
+    let profile = &build.artifacts.as_ref().unwrap().profile_fingerprint;
+    let expected = crate::ci::timing::profile_key(keys[0].as_ref().unwrap(), profile);
+    let records =
+        task_traffic_controller::history::read_all(&build.traffic_state_dir.join("history.jsonl"))
+            .unwrap();
+    assert!(records
+        .iter()
+        .any(|record| record.key_argv == expected && record.measurement_id.is_some()));
     let built = s.result(&build).expect("the result is kept as an artifact");
     assert_eq!(built.outcomes.len(), 1);
     assert_eq!(built.outcomes[0].job, "build");

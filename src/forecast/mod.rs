@@ -260,6 +260,7 @@ pub fn answer(
         traffic_state_dir,
         traffic_config,
         worker_state,
+        None,
         ident,
         AcceptedWork::without_registry(attempts),
         max_epoch,
@@ -267,10 +268,12 @@ pub fn answer(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn answer_worker(
     traffic_state_dir: &Path,
     traffic_config: Option<&Path>,
     worker_state: &Path,
+    profile: Option<&crate::ids::Digest>,
     ident: &Ident,
     work: AcceptedWork<'_>,
     max_epoch: CoordinatorEpoch,
@@ -282,15 +285,67 @@ pub(crate) fn answer_worker(
     let paths = Paths::new(traffic_state_dir, config_path);
     let cfg = Config::load(paths.config_file()).map_err(|e| internal("traffic config", e))?;
     let steps = ci_steps_in(worker_state);
-    answer_with_work(
-        &Context::new(paths),
-        &cfg,
-        ident,
-        work,
-        max_epoch,
-        req,
-        &steps,
-    )
+    let ctx = Context::new(paths);
+    if req.coordinator_epoch < max_epoch {
+        return Err(ApiError::new(ErrorCode::StaleEpoch, "stale forecast epoch"));
+    }
+    plan::check_request(req).map_err(plan::RequestError::into_api)?;
+    let mut req = req.clone();
+    if let Some(profile) = profile {
+        apply_ci_history(&ctx, profile, &mut req)?;
+    }
+    answer_with_work(&ctx, &cfg, ident, work, max_epoch, &req, &steps)
+}
+
+/// Match samples in the worker's ledger against the requested steps once.
+fn apply_ci_history(
+    ctx: &Context,
+    profile: &crate::ids::Digest,
+    req: &mut ForecastRequest,
+) -> Result<(), ApiError> {
+    use std::collections::HashMap;
+    let mut samples = HashMap::new();
+    for plan in std::iter::once(&req.workload).chain(&req.pending) {
+        for key in plan
+            .nodes
+            .iter()
+            .filter(|node| node.predicted_runtime_ms.is_none())
+            .filter_map(|node| node.ci_history_key.as_ref())
+        {
+            samples
+                .entry(crate::ci::timing::profile_key(key, profile))
+                .or_insert_with(Vec::new);
+        }
+    }
+    if samples.is_empty() {
+        return Ok(());
+    }
+    for record in task_traffic_controller::history::read_all(ctx.paths.history_file())
+        .map_err(|e| internal("CI step history", e))?
+    {
+        if let Some(walls) = samples.get_mut(&record.key_argv) {
+            if record.exit_code == 0 && record.wall_secs.is_finite() {
+                walls.push(record.wall_secs);
+            }
+        }
+    }
+    for plan in std::iter::once(&mut req.workload).chain(&mut req.pending) {
+        for node in &mut plan.nodes {
+            if node.predicted_runtime_ms.is_some() {
+                continue;
+            }
+            let Some(step) = &node.ci_history_key else {
+                continue;
+            };
+            let key = crate::ci::timing::profile_key(step, profile);
+            node.predicted_runtime_ms = samples
+                .get(&key)
+                .and_then(|walls| task_traffic_controller::eta::expected_wall(walls))
+                .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
+                .and_then(|time| u64::try_from(time.as_millis()).ok());
+        }
+    }
+    Ok(())
 }
 
 /// Derive command history only from an existing canonical clone, without preparing it.
@@ -615,6 +670,7 @@ mod tests {
 
     fn node(attempt: &AttemptId, id: &str, runtime_ms: Option<u64>) -> WorkloadNode {
         WorkloadNode {
+            ci_history_key: None,
             node_id: NodeId::parse(id).unwrap(),
             depends_on: vec![],
             priority: 0,
@@ -918,6 +974,94 @@ mod tests {
         assert_eq!(overrun.target.runtime_source, RuntimeSource::Measured);
         assert_eq!(measured.target.finish_in_ms, Some(1_000));
         assert!(measured.target.null_reasons.is_empty());
+    }
+
+    #[test]
+    fn a10_matrix_variants_forecast_the_final_step_after_preparation() {
+        let fixture = crate::ci::execute::tests::fixture(
+            r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [debug, release]
+    steps:
+      - run: echo configure
+      - run: echo compile
+      - run: echo verify
+"#,
+        );
+        let digest = Digest::of_bytes(&serde_json::to_vec(&fixture.plan).unwrap());
+        let specs = crate::service::ci_run::task_specs(
+            &fixture.plan,
+            &digest,
+            &Digest::of_bytes(b"manifest"),
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 2);
+        let traffic = tempfile::tempdir().unwrap();
+        let context = Context::new(Paths::new(
+            traffic.path(),
+            traffic.path().join("config.toml"),
+        ));
+        let profile = Digest::of_bytes(b"profile");
+        for (task, spec) in specs {
+            assert!(fixture
+                .plan
+                .tasks
+                .iter()
+                .any(|t| t.id == task && t.variant.is_some()));
+            let attempt = AttemptId::generate();
+            let workload =
+                crate::coordinator::policy::workload_of_spec(&attempt, &spec, Some(4_000));
+            assert_eq!(workload.nodes.len(), 3);
+            let mut req = request(workload, vec![]);
+            apply_ci_history(&context, &profile, &mut req).unwrap();
+            assert!(req
+                .workload
+                .nodes
+                .iter()
+                .all(|node| node.predicted_runtime_ms.is_none()));
+            let (cold, _) = run(&insp(4, calm(), vec![]), &req, &[]);
+            assert_eq!(cold.target.runtime_source, RuntimeSource::Fallback);
+            for (node, seconds) in req.workload.nodes.iter().zip([10.0, 20.0, 5.0]) {
+                let step = node.ci_history_key.as_ref().unwrap();
+                let record = task_traffic_controller::history::Record {
+                    key: "ttc".into(),
+                    repo: String::new(),
+                    subdir: String::new(),
+                    argv: String::new(),
+                    key_argv: crate::ci::timing::profile_key(step, &profile),
+                    started_at: t0(),
+                    wall_secs: seconds,
+                    cpu_secs: 0.0,
+                    max_rss_bytes: 0,
+                    exit_code: 0,
+                    weight_used: 1,
+                    contended: false,
+                    measurement_id: None,
+                    extra: Default::default(),
+                };
+                task_traffic_controller::history::append(context.paths.history_file(), &record)
+                    .unwrap();
+            }
+            apply_ci_history(&context, &Digest::of_bytes(b"other-profile"), &mut req).unwrap();
+            assert!(req
+                .workload
+                .nodes
+                .iter()
+                .all(|node| node.predicted_runtime_ms.is_none()));
+            apply_ci_history(&context, &profile, &mut req).unwrap();
+            let (answer, _) = run(&insp(4, calm(), vec![]), &req, &[]);
+            assert_eq!(answer.target.runtime_source, RuntimeSource::Measured);
+            assert_eq!(answer.target.ready_in_ms, Some(4_000));
+            assert_eq!(answer.target.execution_ms, Some(35_000));
+            assert_eq!(answer.target.finish_in_ms, Some(39_000));
+            assert_eq!(answer.coverage[0].node_ids.len(), 3);
+        }
     }
 
     #[test]

@@ -514,6 +514,7 @@ pub fn prepare(
         .ok_or_else(|| invalid("the source of the attempt has no captured id"))?;
     Ok(CiTaskSpec {
         artifact_workflow: task.artifact_workflow.clone(),
+        history_scope: Some(crate::ci::timing::task_scope(&plan, &task.task_id)),
         dispatch: task.dispatch.clone(),
         plan_path,
         plan_digest: task.plan_digest.clone(),
