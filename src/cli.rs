@@ -226,6 +226,14 @@ pub enum WorkersSub {
         /// Install the worker over SSH.
         #[arg(long)]
         install: bool,
+        /// With `--install`: the build to send, for a worker whose OS or
+        /// architecture differs from this machine's.
+        #[arg(long, requires = "install", value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
+        /// Register an ephemeral worker: started on its own host with
+        /// `worker --ephemeral`, reached over SSH, never installed.
+        #[arg(long, conflicts_with_all = ["install", "binary"])]
+        ephemeral: bool,
     },
     /// Start a worker.
     Start { name: String },
@@ -241,7 +249,13 @@ pub enum WorkersSub {
         cancel_running: bool,
     },
     /// Upgrade a worker.
-    Upgrade { name: String },
+    Upgrade {
+        name: String,
+        /// The build to send, for a worker whose OS or architecture differs
+        /// from this machine's.
+        #[arg(long, value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
+    },
     /// Show differences from the project requirements.
     Diff {
         /// A registered worker; every registered worker when omitted.
@@ -254,7 +268,7 @@ pub enum WorkersSub {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Forget a worker.
+    /// Declare an ephemeral worker gone: its attempts end as interrupted.
     Forget { name: String },
 }
 

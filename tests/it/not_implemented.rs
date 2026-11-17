@@ -1,6 +1,6 @@
 use assert_cmd::Command;
 
-const CASES: &[&[&str]] = &[&["workers"], &["workers", "forget", "w"]];
+const CASES: &[&[&str]] = &[&["workers"]];
 
 #[test]
 fn every_command_reports_not_implemented_as_json() {
@@ -24,7 +24,7 @@ fn every_command_reports_not_implemented_as_json() {
 fn without_json_stdout_is_empty_and_error_goes_to_stderr() {
     let out = Command::cargo_bin("remote-task-runner")
         .unwrap()
-        .args(["workers", "forget", "w"])
+        .args(["workers"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(70));

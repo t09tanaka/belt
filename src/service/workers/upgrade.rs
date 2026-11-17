@@ -312,33 +312,39 @@ pub fn upgrade(
     env: &BTreeMap<String, String>,
     spec: &Spec,
     exe: &Path,
+    binary: Option<&Path>,
     name: &str,
     resident: impl FnOnce(&Spec) -> ResidentBuild,
 ) -> Result<UpgradeResult, ApiError> {
     check_name(name)?;
     let registration = registered(env, name)?
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no such worker is registered"))?;
+    if registration.ephemeral {
+        return Err(invalid(EPHEMERAL_NO_SERVICE));
+    }
     let cluster = spec
         .expected_cluster
         .clone()
         .ok_or_else(|| invalid("the coordinator has no cluster identity; run init"))?;
-    if remote.parent_os() != "macos" {
-        return Err(invalid(
-            "upgrading a worker is implemented for macOS parents and workers only",
-        ));
-    }
     let target = target_of(&registration.ssh)?;
-    let new = worker_service::sha256_file(exe)
-        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
-    // Before anything is sent to the host.
-    let required = resident_requirement(&new, resident(spec)).map_err(|why| {
+    let digest_of = |path: &Path| {
+        worker_service::sha256_file(path)
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))
+    };
+    // What is sent: the build named with `--binary` (for a worker whose OS
+    // or architecture is not the parent's), else this binary.
+    let ship = binary.unwrap_or(exe);
+    let new = digest_of(ship)?;
+    // Before anything is sent to the host. The resident is compared with
+    // this binary, whatever build goes to the worker.
+    let required = resident_requirement(&digest_of(exe)?, resident(spec)).map_err(|why| {
         ApiError::new(
             ErrorCode::Conflict,
             format!("worker {name} was not upgraded: {why}; restart the resident so that it runs this binary, then run workers upgrade again (nothing was changed)"),
         )
     })?;
     // Staging writes only the bootstrap directory; the installed worker is untouched.
-    ensure_staged(remote, &target, exe, &new)?;
+    ensure_staged(remote, &target, ship, &new, binary.is_some())?;
     let mut session = Session {
         remote,
         target,
@@ -513,6 +519,7 @@ fn describe(name: &str, result: &UpgradeResult) -> String {
 
 pub(super) fn command(
     name: &str,
+    binary: Option<&Path>,
     json: bool,
     env: &BTreeMap<String, String>,
     exe: std::io::Result<std::path::PathBuf>,
@@ -521,7 +528,15 @@ pub(super) fn command(
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))
         .and_then(|exe| {
             let spec = crate::service::context::runtime_spec(env)?;
-            upgrade(&mut SshRemote, env, &spec, &exe, name, resident_build)
+            upgrade(
+                &mut SshRemote,
+                env,
+                &spec,
+                &exe,
+                binary,
+                name,
+                resident_build,
+            )
         });
     let text = result
         .as_ref()

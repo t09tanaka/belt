@@ -52,6 +52,11 @@ pub trait Remote {
         std::env::consts::OS
     }
 
+    /// The parent's architecture, as `std::env::consts::ARCH` names it.
+    fn parent_arch(&self) -> &str {
+        std::env::consts::ARCH
+    }
+
     /// Run the worker bridge exactly as the resident will (`binary worker
     /// --stdio` over ssh), complete one `hello`, and report who answered.
     /// A probe hello carries a throwaway coordinator identity and persists
@@ -334,14 +339,36 @@ pub fn env_command(binary: Option<&str>, digest: &str) -> String {
 /// SHA-256 is the expected digest; a short or damaged transfer is removed.
 fn stage_command(digest: &str) -> String {
     format!(
-        "set -eu; umask 077; d=\"{STAGING}\"; mkdir -p \"$d\"; p=\"$d/rtr-{digest}.part\"; cat > \"$p\"; chmod 700 \"$p\"; got=$(shasum -a 256 \"$p\" | cut -d' ' -f1); if [ \"$got\" != \"{digest}\" ]; then rm -f \"$p\"; echo 'staged binary digest mismatch' >&2; exit 3; fi; mv \"$p\" \"$d/rtr-{digest}\""
+        "set -eu; umask 077; {SHA256}; d=\"{STAGING}\"; mkdir -p \"$d\"; p=\"$d/rtr-{digest}.part\"; cat > \"$p\"; chmod 700 \"$p\"; got=$(sha \"$p\"); if [ \"$got\" != \"{digest}\" ]; then rm -f \"$p\"; echo 'staged binary digest mismatch' >&2; exit 3; fi; mv \"$p\" \"$d/rtr-{digest}\""
     )
 }
+
+/// The SHA-256 of a file with whichever tool the host has: `sha256sum` on
+/// Linux, `shasum` on macOS.
+const SHA256: &str = "sha() { if command -v sha256sum >/dev/null 2>&1; then sha256sum \"$1\"; else shasum -a 256 \"$1\"; fi | cut -d' ' -f1; }";
+
+/// What the staged binary says its version is. Nothing on the host changes.
+fn version_command(digest: &str) -> String {
+    format!("exec \"{STAGING}/rtr-{digest}\" --version")
+}
+
+/// Remove a staged binary that must not be used.
+fn unstage_command(digest: &str) -> String {
+    format!("rm -f \"{STAGING}/rtr-{digest}\"")
+}
+
+/// What this parent prints for `--version`: what a binary sent to a worker
+/// must print too.
+fn own_version() -> String {
+    <crate::cli::Cli as clap::CommandFactory>::command().render_version()
+}
+
+const EPHEMERAL_NO_SERVICE: &str = "an ephemeral worker has no service: it is started on its own host with `worker --ephemeral` and is never installed, upgraded, started, stopped, drained or resumed from the parent";
 
 /// `staged` only for an executable whose content is the expected digest.
 fn probe_command(digest: &str) -> String {
     format!(
-        "uname -s; uname -m; f=\"{STAGING}/rtr-{digest}\"; if [ -x \"$f\" ] && [ \"$(shasum -a 256 \"$f\" | cut -d' ' -f1)\" = \"{digest}\" ]; then echo staged; else echo absent; fi"
+        "uname -s; uname -m; {SHA256}; f=\"{STAGING}/rtr-{digest}\"; if [ -x \"$f\" ] && [ \"$(sha \"$f\")\" = \"{digest}\" ]; then echo staged; else echo absent; fi"
     )
 }
 
@@ -349,6 +376,7 @@ fn install_command(digest: &str) -> String {
     format!("exec \"{STAGING}/rtr-{digest}\" worker-service install")
 }
 
+#[cfg(test)]
 fn local_arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -404,6 +432,7 @@ fn parse_reply(output: &RemoteOutput) -> Result<Status, ApiError> {
 struct Registration {
     ssh: String,
     binary: Option<String>,
+    ephemeral: bool,
 }
 
 fn read_user_config(
@@ -433,6 +462,7 @@ fn registered(
         .map(|w| Registration {
             ssh: w.ssh,
             binary: w.binary,
+            ephemeral: w.ephemeral.unwrap_or(false),
         }))
 }
 
@@ -441,6 +471,8 @@ pub struct Registered {
     pub id: String,
     pub ssh: String,
     pub binary: Option<String>,
+    /// Started on its own host with `worker --ephemeral`; it has no service.
+    pub ephemeral: bool,
 }
 
 /// Every registered worker, in configuration order.
@@ -455,6 +487,7 @@ pub fn registrations(env: &BTreeMap<String, String>) -> Result<Vec<Registered>, 
             id: w.id,
             ssh: w.ssh,
             binary: w.binary,
+            ephemeral: w.ephemeral.unwrap_or(false),
         })
         .collect())
 }
@@ -465,6 +498,7 @@ fn register(
     name: &str,
     ssh: &str,
     binary: Option<&str>,
+    ephemeral: bool,
 ) -> Result<(), ApiError> {
     let (path, mut text) = read_user_config(env)?;
     if !text.ends_with('\n') {
@@ -480,6 +514,9 @@ fn register(
             "binary = {}\n",
             toml::Value::String(binary.into())
         ));
+    }
+    if ephemeral {
+        text.push_str("ephemeral = true\n");
     }
     write_config(&path, &text)
 }
@@ -583,6 +620,9 @@ pub struct AddResult {
     /// The user configuration gained this entry now (false: it was already there).
     pub registered: bool,
     pub installed: bool,
+    /// Registered as an ephemeral worker: nothing is installed on it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub ephemeral: bool,
     /// The absolute binary path recorded for this worker.
     pub binary: Option<String>,
     pub status: Option<Status>,
@@ -616,6 +656,17 @@ fn hex(bytes: &[u8]) -> String {
     })
 }
 
+/// What `workers add` was asked to do beyond registering the name.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct AddOptions<'a> {
+    /// Install the worker over SSH.
+    pub install: bool,
+    /// Register an ephemeral worker (`ephemeral = true`).
+    pub ephemeral: bool,
+    /// The build to send instead of the parent's own binary (`--binary`).
+    pub binary: Option<&'a Path>,
+}
+
 /// `workers add`. Without `--install` only the registration is written.
 /// With it, the parent stages its own binary, runs the helper's install on
 /// the worker host (resumable), proves the exact bridge the resident will use
@@ -631,10 +682,19 @@ pub fn add(
     exe: &Path,
     name: &str,
     ssh: Option<&str>,
-    install: bool,
+    options: AddOptions<'_>,
     reload: impl FnOnce(&Spec) -> ResidentReload,
 ) -> Result<AddResult, ApiError> {
     check_name(name)?;
+    let install = options.install;
+    if options.ephemeral && (install || options.binary.is_some()) {
+        return Err(invalid(EPHEMERAL_NO_SERVICE));
+    }
+    if options.binary.is_some() && !install {
+        return Err(invalid(
+            "--binary names the build that --install sends; use it together with --install",
+        ));
+    }
     let ssh = ssh.ok_or_else(|| invalid("--ssh is required"))?;
     let target = target_of(ssh)?;
     let existing = registered(env, name)?;
@@ -646,6 +706,19 @@ pub fn add(
             ));
         }
     }
+    let ephemeral = match &existing {
+        Some(existing) if existing.ephemeral && install => {
+            return Err(invalid(EPHEMERAL_NO_SERVICE))
+        }
+        Some(existing) if !existing.ephemeral && options.ephemeral => {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                "the worker is already registered as a persistent worker",
+            ))
+        }
+        Some(existing) => existing.ephemeral,
+        None => options.ephemeral,
+    };
     // Before any remote step: a name that cannot be registered must not cost an install.
     if existing.is_none() && spec.worker_id.as_str() == name {
         return Err(ApiError::new(
@@ -654,14 +727,14 @@ pub fn add(
         ));
     }
     let (status, binary) = if install {
-        let status = install_remote(remote, spec, exe, name, &target)?;
+        let status = install_remote(remote, spec, exe, options.binary, name, &target)?;
         let binary = status.bridge_binary.clone();
         (Some(status), binary)
     } else {
         (None, existing.as_ref().and_then(|e| e.binary.clone()))
     };
     match &existing {
-        None => register(env, name, ssh, binary.as_deref())?,
+        None => register(env, name, ssh, binary.as_deref(), ephemeral)?,
         Some(old) if old.binary != binary => {
             if let (Some(_), Some(new)) = (&old.binary, &binary) {
                 return Err(ApiError::new(
@@ -682,24 +755,31 @@ pub fn add(
         ssh: ssh.into(),
         registered: newly,
         installed: install,
+        ephemeral,
         binary,
         status,
         resident,
     })
 }
 
-/// Make sure the binary `exe` (whose SHA-256 is `digest`) is staged on a
-/// macOS host of this architecture. An already staged copy is not sent again.
+/// Make sure the binary `ship` (whose SHA-256 is `digest`) is staged on the
+/// worker host and reports this parent's version. `explicit`: it was named
+/// with `--binary`; without that the parent's own binary goes only to a
+/// host of the parent's own OS and architecture. An already staged copy is
+/// not sent again. A copy that does not report the parent's version is
+/// removed again; nothing else on the host was touched by then.
 fn ensure_staged(
     remote: &mut impl Remote,
     target: &SshTarget,
-    exe: &Path,
+    ship: &Path,
     digest: &str,
+    explicit: bool,
 ) -> Result<(), ApiError> {
     let internal = |e: &dyn std::fmt::Display| ApiError::new(ErrorCode::Internal, e.to_string());
+    let unknown = |m: String| ApiError::new(ErrorCode::CommunicationUnknown, m);
     let probe = remote
         .run(target, &probe_command(digest), &[], Duration::from_secs(60))
-        .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
+        .map_err(unknown)?;
     if probe.code != Some(0) {
         return Err(ApiError::new(
             ErrorCode::CommunicationUnknown,
@@ -707,21 +787,11 @@ fn ensure_staged(
         ));
     }
     let probe_text = String::from_utf8_lossy(&probe.stdout).into_owned();
-    let mut lines = probe_text.lines();
-    let (os, arch, staged) = (
-        lines.next().unwrap_or(""),
-        lines.next().unwrap_or(""),
-        lines.next().unwrap_or(""),
-    );
-    if os != "Darwin" || arch != local_arch() {
-        return Err(invalid(format!(
-            "the worker is {os}/{arch}; this parent installs only a matching macOS build ({}/{})",
-            "Darwin",
-            local_arch()
-        )));
-    }
-    if staged != "staged" {
-        let binary = std::fs::read(exe).map_err(|e| internal(&e))?;
+    let probe = target::parse_probe(&probe_text);
+    let parent = target::Platform::from_rust(remote.parent_os(), remote.parent_arch());
+    target::decide(parent, probe.system, probe.machine, explicit).map_err(invalid)?;
+    if !probe.staged {
+        let binary = std::fs::read(ship).map_err(|e| internal(&e))?;
         let out = remote
             .run(
                 target,
@@ -729,7 +799,7 @@ fn ensure_staged(
                 &binary,
                 Duration::from_secs(600),
             )
-            .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
+            .map_err(unknown)?;
         if out.code != Some(0) {
             return Err(ApiError::new(
                 ErrorCode::CommunicationUnknown,
@@ -737,30 +807,66 @@ fn ensure_staged(
             ));
         }
     }
-    Ok(())
+    // Before anything is installed or switched: the copy runs there and is
+    // this parent's version.
+    let expected = own_version();
+    let reported = remote
+        .run(
+            target,
+            &version_command(digest),
+            &[],
+            Duration::from_secs(60),
+        )
+        .map_err(unknown)?;
+    if reported.code == Some(255) {
+        return Err(ApiError::new(
+            ErrorCode::CommunicationUnknown,
+            "the worker could not be asked for the version of the staged binary",
+        ));
+    }
+    if reported.code == Some(0) && target::version_matches(&expected, &reported.stdout) {
+        return Ok(());
+    }
+    let removed = remote
+        .run(
+            target,
+            &unstage_command(digest),
+            &[],
+            Duration::from_secs(60),
+        )
+        .is_ok_and(|out| out.code == Some(0));
+    Err(invalid(format!(
+        "the binary sent to the worker does not run there as this parent's version: it reported {} (exit {}), this parent is {}; a worker must run the parent's version, so nothing was installed or switched{}",
+        target::shown_version(&reported.stdout),
+        reported.code.map_or("unknown".to_string(), |code| code.to_string()),
+        expected.trim(),
+        if removed {
+            " and the staged copy was removed"
+        } else {
+            "; the staged copy could not be removed"
+        }
+    )))
 }
 
 fn install_remote(
     remote: &mut impl Remote,
     spec: &Spec,
     exe: &Path,
+    binary: Option<&Path>,
     name: &str,
     target: &SshTarget,
 ) -> Result<Status, ApiError> {
     let internal = |e: &dyn std::fmt::Display| ApiError::new(ErrorCode::Internal, e.to_string());
-    if remote.parent_os() != "macos" {
-        return Err(invalid(
-            "installing a worker is implemented for macOS parents and workers only",
-        ));
-    }
+    // What is sent: the build named with `--binary`, else this binary.
+    let ship = binary.unwrap_or(exe);
     let cluster = spec
         .expected_cluster
         .clone()
         .ok_or_else(|| invalid("the coordinator has no cluster identity; run init"))?;
     let cluster_expected = cluster.clone();
     let key = crate::secrets::key::load(&spec.cluster_key_path).map_err(|e| internal(&e))?;
-    let digest = worker_service::sha256_file(exe).map_err(|e| internal(&e))?;
-    ensure_staged(remote, target, exe, &digest)?;
+    let digest = worker_service::sha256_file(ship).map_err(|e| internal(&e))?;
+    ensure_staged(remote, target, ship, &digest, binary.is_some())?;
     let request = InstallRequest {
         schema: 1,
         cluster,
@@ -859,6 +965,9 @@ pub fn lifecycle(
     check_name(name)?;
     let registration = registered(env, name)?
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no such worker is registered"))?;
+    if registration.ephemeral {
+        return Err(invalid(EPHEMERAL_NO_SERVICE));
+    }
     let cluster = spec
         .expected_cluster
         .as_ref()
@@ -917,6 +1026,91 @@ pub fn reload_resident(spec: &Spec) -> ResidentReload {
         Ok(super::resident::Reply::ControlError { error }) => restart(error.message),
         Ok(_) => restart("the resident did not understand the request".into()),
         Err(e) => restart(format!("the resident did not answer: {e}")),
+    }
+}
+
+/// What `workers forget` did.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+pub struct ForgetResult {
+    pub id: String,
+    /// An identity was recorded for the worker and is retired now: a worker
+    /// that comes back with it is refused.
+    pub identity_retired: bool,
+    /// The attempts that were ended as `interrupted` (`cancelled` when
+    /// their cancel had been asked for), oldest first.
+    pub ended: Vec<crate::ids::AttemptId>,
+}
+
+/// `workers forget <name>`: declare an ephemeral worker gone. The running
+/// resident decides and does it (`ask`); this side only reads its answer and
+/// never reports a forget the resident did not confirm.
+pub fn forget(
+    name: &str,
+    ask: impl FnOnce(WorkerId) -> Result<super::resident::Reply, String>,
+) -> Result<ForgetResult, ApiError> {
+    use super::resident::Reply;
+    check_name(name)?;
+    let worker = WorkerId::parse(name).map_err(|e| invalid(e.to_string()))?;
+    match ask(worker) {
+        Ok(Reply::WorkerForgotten {
+            identity_retired,
+            ended,
+        }) => Ok(ForgetResult {
+            id: name.into(),
+            identity_retired,
+            ended,
+        }),
+        Ok(Reply::ControlError { error }) => Err(error),
+        Ok(Reply::Stopping) => Err(ApiError::new(
+            ErrorCode::CommunicationUnknown,
+            "the coordinator resident is stopping; nothing was forgotten, run workers forget again when it runs",
+        )),
+        Ok(_) => Err(ApiError::new(
+            ErrorCode::Conflict,
+            "the coordinator resident did not understand the request; restart it so that it runs this binary, then run workers forget again (nothing was changed)",
+        )),
+        Err(why) => Err(ApiError::new(
+            ErrorCode::CommunicationUnknown,
+            format!("the coordinator resident did not answer ({why}); the resident carries out a forget, so whether anything changed is not known: run workers forget again while it runs"),
+        )),
+    }
+}
+
+/// Ask the running resident. Nothing is started for it.
+pub fn ask_resident_to_forget(
+    spec: &Spec,
+    worker: WorkerId,
+) -> Result<super::resident::Reply, String> {
+    let cluster = spec
+        .expected_cluster
+        .clone()
+        .ok_or("the coordinator has no cluster identity; run init")?;
+    let client = super::resident::Client::load(&spec.state_dir, cluster)
+        .map_err(|_| "it is not running".to_string())?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?;
+    runtime
+        .block_on(client.request(super::resident::Operation::ForgetWorker { worker }))
+        .map_err(|e| e.to_string())
+}
+
+pub fn describe_forget(result: &ForgetResult) -> String {
+    let identity = if result.identity_retired {
+        "its identity is retired and is refused if it comes back"
+    } else {
+        "no identity was recorded for it"
+    };
+    match result.ended.len() {
+        0 => format!(
+            "forgot worker {}: {identity}; it held no attempt",
+            result.id
+        ),
+        n => format!(
+            "forgot worker {}: {identity}; {n} attempt(s) ended as interrupted and can be retried",
+            result.id
+        ),
     }
 }
 
@@ -1412,7 +1606,23 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
         lifecycle(&mut SshRemote, &env, &spec, exe, name, action)
     };
     let (name, action, result): (&str, Lifecycle, Result<Status, ApiError>) = match sub {
-        WorkersSub::Add { name, ssh, install } => {
+        WorkersSub::Forget { name } => {
+            let result = super::context::runtime_spec(&env)
+                .and_then(|spec| forget(name, |worker| ask_resident_to_forget(&spec, worker)));
+            let text = result.as_ref().map(describe_forget).unwrap_or_default();
+            return Some(emit(
+                json,
+                result.map(|r| serde_json::to_value(r).expect("serializes")),
+                || text,
+            ));
+        }
+        WorkersSub::Add {
+            name,
+            ssh,
+            install,
+            binary,
+            ephemeral,
+        } => {
             let result = exe
                 .as_ref()
                 .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))
@@ -1425,7 +1635,11 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                         exe,
                         name,
                         ssh.as_deref(),
-                        *install,
+                        AddOptions {
+                            install: *install,
+                            ephemeral: *ephemeral,
+                            binary: binary.as_deref(),
+                        },
                         reload_resident,
                     )
                 })
@@ -1530,8 +1744,9 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
             let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
             return Some(emit(json, result.map(|(v, _)| v), || text));
         }
-        WorkersSub::Upgrade { name } => return Some(upgrade::command(name, json, &env, exe)),
-        _ => return None,
+        WorkersSub::Upgrade { name, binary } => {
+            return Some(upgrade::command(name, binary.as_deref(), json, &env, exe))
+        }
     };
     let text = result
         .as_ref()
@@ -1544,6 +1759,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
     ))
 }
 
+pub mod target;
 pub mod upgrade;
 pub mod warmup;
 

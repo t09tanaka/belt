@@ -28,42 +28,43 @@ fn an_unreachable_worker_is_never_reported_as_upgraded() {
     let out = fx.run(&["workers", "upgrade", "mini-a"]);
     let value = json(&out);
     assert_eq!(value["ok"], false);
-    if cfg!(target_os = "macos") {
-        assert_eq!(
-            out.status.code(),
-            Some(ErrorCode::CommunicationUnknown.exit_code())
-        );
-        assert_eq!(value["error"]["code"], "COMMUNICATION_UNKNOWN");
-        // Only the read-only probe ran: one fixed command, no helper action.
-        let argv = fx.argv();
-        assert!(argv.last().unwrap().starts_with("uname -s; uname -m;"));
-        assert!(!argv.iter().any(|a| a.contains("worker-service")));
-    } else {
-        // Only macOS parents upgrade workers; nothing is sent from elsewhere.
-        assert_eq!(out.status.code(), Some(ErrorCode::InvalidInput.exit_code()));
-        assert!(!fx.path("argv").exists());
-    }
+    // A parent of any OS asks the host what it is before it sends anything.
+    assert_eq!(
+        out.status.code(),
+        Some(ErrorCode::CommunicationUnknown.exit_code())
+    );
+    assert_eq!(value["error"]["code"], "COMMUNICATION_UNKNOWN");
+    // Only the read-only probe ran: one fixed command, no helper action.
+    let argv = fx.argv();
+    assert!(argv.last().unwrap().starts_with("uname -s; uname -m;"));
+    assert!(!argv.iter().any(|a| a.contains("worker-service")));
 }
 
 #[test]
 fn a_host_that_answers_garbage_to_the_first_question_changes_nothing() {
-    if !cfg!(target_os = "macos") {
-        return;
-    }
     let fx = Fx::new();
     fx.init();
     fx.config(REGISTERED);
-    // Staged already, then every helper action prints something unreadable.
-    let arch = if cfg!(target_arch = "aarch64") {
-        "arm64"
+    // A host of this parent's own platform, with this build staged already
+    // and reporting this version; every helper action prints something
+    // unreadable.
+    let system = if cfg!(target_os = "macos") {
+        "Darwin"
     } else {
-        std::env::consts::ARCH
+        "Linux"
     };
+    let arch = std::env::consts::ARCH;
+    let version = std::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
     fx.ssh(&format!(
         "cat >/dev/null; for a in \"$@\"; do last=$a; done\n\
          printf '%s\\n' \"$last\" >> {}\n\
-         case \"$last\" in uname*) printf 'Darwin\\n{arch}\\nstaged\\n';; *) echo 'not json';; esac",
-        fx.path("commands").display()
+         case \"$last\" in uname*) printf '{system}\\n{arch}\\nstaged\\n';; *--version) echo '{}';; *) echo 'not json';; esac",
+        fx.path("commands").display(),
+        version.trim()
     ));
     let out = fx.run(&["workers", "upgrade", "mini-a"]);
     assert_eq!(
@@ -72,9 +73,10 @@ fn a_host_that_answers_garbage_to_the_first_question_changes_nothing() {
     );
     let commands = std::fs::read_to_string(fx.path("commands")).unwrap();
     let commands: Vec<&str> = commands.lines().collect();
-    assert_eq!(commands.len(), 2, "{commands:?}");
-    assert!(commands[1].ends_with(" worker-service status --wait-secs 600"));
-    assert!(commands[1].starts_with("exec \"$HOME/.remote-task-runner-bootstrap/rtr-"));
+    assert_eq!(commands.len(), 3, "{commands:?}");
+    assert!(commands[1].ends_with(" --version"));
+    assert!(commands[2].ends_with(" worker-service status --wait-secs 600"));
+    assert!(commands[2].starts_with("exec \"$HOME/.remote-task-runner-bootstrap/rtr-"));
 }
 
 #[test]
