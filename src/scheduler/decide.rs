@@ -299,7 +299,7 @@ pub struct Decision {
     pub rules: Rules,
 }
 
-fn word<T: Serialize>(t: &T) -> String {
+pub(crate) fn word<T: Serialize>(t: &T) -> String {
     let value = serde_json::to_value(t).ok();
     let text = value.as_ref().and_then(|v| v.as_str());
     text.unwrap_or_default().to_string()

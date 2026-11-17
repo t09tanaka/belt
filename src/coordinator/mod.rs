@@ -1642,19 +1642,12 @@ impl Coordinator {
                         w.link.cost_transport(),
                     );
                     query.ready = readiness(w).is_some_and(|generation| generation.is_some());
-                    let mut costs = self.sched.query(&w.worker_id, &query);
-                    // Preserve external injected models' existing task adapter.
-                    let legacy = self.sched.costs(&w.worker_id, task);
-                    for part in 0..3 {
-                        if costs.ms[part].is_none() {
-                            costs.ms[part] = legacy.ms[part];
-                            costs.assumed[part] = legacy.assumed[part];
-                        }
-                    }
-                    costs.transfer_bytes = costs.transfer_bytes.or(legacy.transfer_bytes);
-                    costs.cache_warm = costs.cache_warm.or(legacy.cache_warm);
-                    costs.affinity |= legacy.affinity;
-                    costs
+                    // Preserve external injected models through the existing
+                    // task adapter; a preview assembles the same costs.
+                    scheduler::preview::merge_costs(
+                        self.sched.query(&w.worker_id, &query),
+                        self.sched.costs(&w.worker_id, task),
+                    )
                 })
                 .collect();
             decide::fill_costs(&mut costs);

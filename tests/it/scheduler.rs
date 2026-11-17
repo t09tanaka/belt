@@ -267,7 +267,9 @@ async fn a02_a_worker_that_joins_during_a_tick_is_counted_in_from_the_next_decis
 
 /// A worker that runs two tasks (20 s of queue) and has everything
 /// prepared, and an idle one that must be set up first.
-async fn busy_and_cold(cold_setup_ms: u64) -> (Fx, Coordinator, Arc<FakeWorker>, Decision) {
+async fn busy_and_cold_queued(
+    cold_setup_ms: u64,
+) -> (Fx, Coordinator, Arc<FakeWorker>, Arc<FakeWorker>, TaskId) {
     let mut f = fx();
     let model = Arc::new(Fixed::default());
     model.set(
@@ -301,9 +303,61 @@ async fn busy_and_cold(cold_setup_ms: u64) -> (Fx, Coordinator, Arc<FakeWorker>,
     c.attach(cold.id.clone(), Arc::clone(&cold) as Arc<dyn WorkerLink>)
         .await;
     let task = enqueue(&c, 1).await.remove(0);
+    (f, c, busy, cold, task)
+}
+
+async fn busy_and_cold(cold_setup_ms: u64) -> (Fx, Coordinator, Arc<FakeWorker>, Decision) {
+    let (f, c, _busy, cold, task) = busy_and_cold_queued(cold_setup_ms).await;
     c.tick().await.unwrap();
     let d = reason(&c, &only(&c, &task).attempt_id);
     (f, c, cold, d)
+}
+
+/// Everything a preview could have moved: the queue, the attempts, the
+/// reason a task waits for, and what each worker holds and was told.
+#[derive(Debug, PartialEq)]
+struct Demand {
+    queued: Vec<TaskId>,
+    attempts: usize,
+    waiting: Option<Decision>,
+    workers: Vec<(Vec<AttemptId>, usize)>,
+}
+
+fn demand(c: &Coordinator, task: &TaskId, workers: &[&Arc<FakeWorker>]) -> Demand {
+    let told = |w: &&Arc<FakeWorker>| (w.holds(), w.received(Op::Submit));
+    Demand {
+        queued: queued(c),
+        attempts: attempts(c, task).len(),
+        waiting: c.scheduler().waiting_reason(task),
+        workers: workers.iter().map(told).collect(),
+    }
+}
+
+/// `estimate --task` and the placement that follows are the same judgement
+/// of the same facts: the worker, the rule, the order and every compared
+/// figure. The preview itself leaves the queue, the attempts and what the
+/// workers hold as they were, however often it is asked.
+#[tokio::test]
+async fn a_preview_names_the_worker_the_placement_then_takes_and_moves_nothing() {
+    for (cold_setup_ms, winner) in [(45_000, "w-busy"), (5000, "w-cold")] {
+        let (_f, c, busy, cold, task) = busy_and_cold_queued(cold_setup_ms).await;
+        let before = demand(&c, &task, &[&busy, &cold]);
+        assert_eq!((&before.queued, before.attempts), (&vec![task.clone()], 0));
+        let mut previews = Vec::new();
+        for _ in 0..100 {
+            let preview = c.estimate_task(task.clone()).await.unwrap();
+            assert!(preview.online && preview.conditional);
+            previews.push(preview.decision.expect("an online preview decides"));
+        }
+        assert_eq!(demand(&c, &task, &[&busy, &cold]), before);
+        c.tick().await.unwrap();
+        let placed = reason(&c, &only(&c, &task).attempt_id);
+        assert_eq!(placed.winner.as_ref().unwrap().as_str(), winner);
+        assert_eq!(worker_of(&c, &task), winner);
+        for preview in previews {
+            assert_eq!(preview, placed);
+        }
+    }
 }
 
 #[tokio::test]

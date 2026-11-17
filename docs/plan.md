@@ -91,6 +91,38 @@ nested cwd は標準実行の cwd 合成との一致を別途修正・検証す�
 
 この slice で S15f は完了しない。転送・setup・成果物回収は実測モデル未接続のため unknown と明示する。source-ready・setup receipt・collection-complete の検証済み境界で、identity・TTL・sample count・provenance を保つ bounded な観測を記録し、実配置と estimate が同じ CostModel を使う接続を必須残件として維持する。queue wait を転送時間へ混ぜず、結果の総 byte 数が不明なら回収コストも unknown のままにする。
 
+### S15f: 見積と配置の一致、配置理由の表示（2026-11-17、main `4a6ec25` 起点）
+
+保存済み task の `estimate --task` が、同じ状態の配置と違う worker を答えることがあった。原因は 3 つである。(1) 配置は親の実測と cost model（`CostModel::costs`）の値を合成して比べるが、見積は実測の照会（`query`）だけを使っていた。(2) 配置は不明な部分へ最悪の既知値を入れてから forecast を照会するが、見積は照会のあとに入れていたので、worker へ渡す ready の遅れが違った。(3) error で答えた worker を、配置は数値の無い候補として比べ、見積は除外していた。
+
+対応:
+
+- 合成を pure な `scheduler::preview::merge_costs` に出し、配置（`place_one`）と見積の両方から呼ぶ。配置の挙動は変えていない（同じ式を移しただけ）。
+- 見積を 2 段にした。1 段目で全 worker を `inspect` して候補と cost を決め、`fill_costs` のあと、2 段目で forecast を照会する。workload は配置と同じ `policy::workload_of_spec` で作る（CI task の step を含む）。forecast の年齢は全員の答えが揃った時点で測る。
+- 見積でも、その task を断った worker（`worker_cannot_run`）と CI task を受け取れない worker を、配置と同じ理由で外す。どちらも読み取りだけである。
+- 人向けの表示を pure な `scheduler::preview::human` に移し、選んだ worker と理由に加えて、規則の数値、worker ごとの priority と補正量・load・待ち・実行、転送・setup・回収それぞれの種別（実測は標本数と残り TTL、確認済み ready、cost model、順位付け専用の仮の値、unknown と理由）、除外した worker の理由と unmet を出す。仮の値と fallback の順位は時間として表示しない。`--json` の形は変えていない（古い owner の応答もそのまま読める）。
+- `src/scheduler/preview.rs` を `scripts/pure-modules.txt` に追加した。
+
+検証（手元、rustc 1.100.0）:
+
+- `tests/it/scheduler.rs` `a_preview_names_the_worker_the_placement_then_takes_and_moves_nothing`: busy な worker と cold な worker で、cold の setup が長い場合と短い場合（勝者が入れ替わる）のそれぞれについて、queue にある task の見積を 100 回取り、queue・attempt 数・待機理由・各 worker の保持 attempt と submit の受信数が変わらないこと、続く配置の配置理由（worker・理由・順序・内訳の全フィールド）が 100 回の見積の `decision` と等しいことを確かめる。修正前はこのテストが失敗した（見積が cost model の値を持たず、cold を選んだ）。
+- 既存の `coordinator::estimate::tests::estimate_100_calls_preserve_every_durable_row_epoch_and_actor_state`（DB 全行・epoch・lease seq 不変）と、準備 identity・resident・bootstrap の見積のテストはそのまま通る。
+- `scheduler::preview` の unit test は出力の全文を比べる。
+
+決めたこと（未決定だった点。spec 第 9 章「読み取り専用の見積」に記した）:
+
+- 見積は source が worker で ready かどうかで候補を絞らない。仮の追加実行を答えるためで、配置の `ready || measured_cold` の絞り込みと、誰も ready でないときの決定の見送りは写さない。
+- error で答えた worker は、ready かどうかに関わらず数値の無い候補として比べる（配置は ready な worker だけをそう扱い、cold な worker は外す）。
+- 古い epoch を理由に断られた forecast で、見積は fence しない。答えの無い worker として外す。
+- 未投入の command の見積は従来どおり（cost model の task adapter は task が無いので呼ばない。error の答えは除外）。
+
+S15f の残り（この変更では閉じていない。行は未完了のままとする）:
+
+- setup の実測モデル: 観測を setup の秒数・ready の遅れ・warm の判定へ変換する接続（実 TTC の ledger identity と依存・resource graph の対応、artifact の完全検証と正確な activation の証明）。それまで setup は unknown。
+- 上の「決めたこと」で写していない配置の条件（source ready と実測 cold の絞り込み、入力を断った worker の `InputRefused`）を見積へ写すかどうか。queue にある task に限れば写せるが、終了済み task の仮の追加実行と両立する表示が要る。
+- 実 worker・実 owner を通した利用者経路で、見積と配置の一致を確かめる受入（今回は in-memory の worker）。Docker 受入。
+- 変更後の pure coverage と全体の mutation は親の gate で確かめる（今回は `src/scheduler/preview.rs` だけを `cargo schemata` にかけた）。
+
 S15c の常駐入力は既存 user config の隣にある private `coordinator.json` に保存し、既存 bootstrap input を再利用する。`config.toml` の文法や暗黙の環境変数は追加しない。未初期化は明示エラーとし、`ls` / `show` は停止中でも読み取り専用 DB を使い、起動・epoch 更新・migration を行わない。`submit` だけが必要な owner 起動を要求する。
 
 S15c の残件のうちメモリ上限の 3 点（下の段落の file/reader 転送と active attempt のページ走査に当たる分）を直した。(1) Coordinator の `live_attempts` 4 箇所は全件読みをやめた。`detach`・`detach_link`・tick の worker ごとの走査は `live_attempt_page` を 64 件ずつ、64 件に満たないページが返るまで読み（空のページまで読まない。cursor は安定しているので、短いページのあとに増えた行はどのみちこの走査の対象外）、1 ページずつ処理する。`send_placed` は attempt 1 件を探すだけなので、ページ化ではなく id と worker での 1 件読み（`live_attempt`）にした。(2) `unacked_demand` は worker ごとの `unacked_demand_page`（`placement_id` の keyset、64 件）に置き換えた。配置と estimate が持つのは forecast に載せる plan（worker ごとに最大 64 件）だけで、demand の JSON は持ち出さない。読めない placement を飛ばしてから 64 件を数える従来の規則は変えていない。(3) manifest の上限は worker 側の既定 64 MiB（`BlobLimits::max_manifest_bytes`）で、全体をメモリに持ってよい大きさではない。上限の強制だけで済ませず、compact JSON を source store の private な `tmp`（state と同じディスク）に作る名前の無い一時ファイルへ 64 KiB の buffer で書き出し、blob/bundle と同じ reader 転送で 64 KiB ずつ送る。wire の bytes と digest は従来と同じである。書き出しが 64 MiB を超えた manifest は送る前に失敗させる。保証は、走査の間ずっと対象である行はちょうど 1 回、走査中に増減した行は高々 1 回である。ページ境界での増減、0・64・65 件、3000 件で 1 回の読み取りが 64 件以下であることを storage のテストで、ページを超える件数の detach・tick・settle を Coordinator のテストで確かめた。全件を読む `live_attempts`・`unacked_demand` はテストと診断用に残し、Coordinator からは呼ばない。
