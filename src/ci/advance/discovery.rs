@@ -3,7 +3,7 @@ use super::*;
 use crate::ci::discovery::{apply, DiscoveryStep, WorkerListing};
 use local_ci::shard::adapters::Isolation;
 
-fn metadata(row: &CiTaskRow) -> Option<&serde_json::Value> {
+pub(super) fn metadata(row: &CiTaskRow) -> Option<&serde_json::Value> {
     row.spec.pointer("/ci/task/inputs/rtr_discovery")
 }
 
@@ -71,8 +71,19 @@ pub(super) fn advance(
     let first_spec: TaskSpec = serde_json::from_value(first.spec.clone()).map_err(unrunnable)?;
     let base = first_spec.plan_digest.clone();
     pass.plans.insert(base.clone());
-    let plan: FrozenPlan =
+    let initial: FrozenPlan =
         serde_json::from_slice(&read_plan(state_dir, &base)?).map_err(unrunnable)?;
+    let current = crate::ci::discovery::active_plan(rows)
+        .map(Digest::parse)
+        .transpose()
+        .map_err(unrunnable)?
+        .unwrap_or_else(|| base.clone());
+    let plan = if current == base {
+        initial.clone()
+    } else {
+        serde_json::from_slice(&read_plan(state_dir, &current)?).map_err(unrunnable)?
+    };
+    pass.plans.insert(current.clone());
     let capacity = metadata(first)
         .and_then(|m| m["capacity"].as_u64())
         .and_then(|n| usize::try_from(n).ok())
@@ -82,16 +93,42 @@ pub(super) fn advance(
     let mut ids = Vec::new();
     let mut placements = BTreeMap::new();
     for probe in std::iter::once(first).chain(probes) {
+        if !probe.cancelled
+            && metadata(probe)
+                .and_then(|m| m["original_task"].as_str())
+                .is_some_and(|target| {
+                    rows.iter().any(|row| {
+                        row.cancelled
+                            && row
+                                .spec
+                                .pointer("/ci/task/task_id")
+                                .and_then(|v| v.as_str())
+                                == Some(target)
+                    })
+                })
+        {
+            stop(
+                store,
+                run,
+                probe,
+                "discovery target was cancelled",
+                now_ms,
+                pass,
+            )
+            .map_err(transient)?;
+            continue;
+        }
         let id = probe
             .spec
             .pointer("/ci/task/task_id")
             .and_then(|v| v.as_str())
             .ok_or_else(|| unrunnable("missing discovery task id"))?;
-        let step = DiscoveryStep::from_task(&plan, id)
+        let step = DiscoveryStep::from_task(&initial, id)
             .ok_or_else(|| unrunnable("unexpected discovery task"))?;
-        let Some(listing) = read_listing(store, results, probe, step)? else {
-            return Ok(true);
+        let Some(mut listing) = read_listing(store, results, probe, step)? else {
+            continue;
         };
+        listing.step.plan_digest = plan.digest.clone();
         let policy = metadata(probe)
             .and_then(|m| m.get("policy"))
             .filter(|v| !v.is_null());
@@ -133,6 +170,9 @@ pub(super) fn advance(
         }
         ids.push(probe.task_id.clone());
         listings.push(listing);
+    }
+    if listings.is_empty() {
+        return Ok(false);
     }
     let project = metadata(first)
         .and_then(|m| m["project"].as_str())
@@ -199,6 +239,12 @@ pub(super) fn advance(
         let original = plan
             .task(id)
             .ok_or_else(|| unrunnable("original task missing from plan"))?;
+        if !listings.iter().any(|l| {
+            l.step.workflow == original.workflow
+                && original.jobs.as_slice() == std::slice::from_ref(&l.step.job)
+        }) {
+            continue;
+        }
         let names: Vec<&str> = if split.task(id).is_some() {
             vec![id]
         } else {
@@ -252,7 +298,7 @@ pub(super) fn advance(
         replacements.push((row.task_id.clone(), parts));
     }
     store
-        .apply_ci_discovery(run, ids, replacements, now_ms)
+        .apply_ci_discovery(run, &current, &digest, ids, replacements, now_ms)
         .map_err(transient)?;
     Ok(true)
 }

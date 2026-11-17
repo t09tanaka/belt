@@ -33,13 +33,15 @@ impl DiscoveryStep {
             name => anyhow::bail!("unknown runner {name}"),
         };
         let mut probe = plan.to_plan();
-        probe.selected.retain(|s| s.wf.file == self.workflow);
-        let workflow = &mut probe.selected[0].wf;
-        workflow.jobs.retain(|job| job.id == self.job);
-        let job = &mut workflow.jobs[0];
+        let job = probe
+            .selected
+            .iter_mut()
+            .find(|selected| selected.wf.file == self.workflow)
+            .and_then(|selected| selected.wf.jobs.iter_mut().find(|job| job.id == self.job))
+            .ok_or_else(|| anyhow::anyhow!("missing discovery job"))?;
         anyhow::ensure!(
-            job.needs.is_empty() && job.matrix.is_none() && job.services.is_empty(),
-            "discovery needs an independent prepared job"
+            job.matrix.is_none() && job.services.is_empty(),
+            "discovery needs a prepared job"
         );
         job.outputs.clear();
         job.steps.truncate(self.step + 1);
@@ -49,11 +51,9 @@ impl DiscoveryStep {
         listing_step.id = None;
         listing_step.run = Some(listing);
         job.steps.push(listing_step);
-        probe.units = vec![local_ci::plan::Unit {
-            wf: 0,
-            jobs: vec![self.job.clone()],
-            exclusive: false,
-        }];
+        // Keep predecessors in the graph so the SDK resolves needs and job
+        // conditions exactly as the ordinary task does. The host executes
+        // only this job, supplying the already collected predecessor outputs.
         plan.with_plan(probe)
     }
 
