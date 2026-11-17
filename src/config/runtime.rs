@@ -113,6 +113,11 @@ impl ResolvedConfig {
             .features
             .iter()
             .any(|feature| feature == crate::wire::ENV_SYNC_FEATURE);
+        let matrix_dispatch = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|f| f == crate::wire::MATRIX_DISPATCH_FEATURE);
         let ci_task = connected
             .negotiated
             .features
@@ -129,7 +134,8 @@ impl ResolvedConfig {
             .with_preparation_observations(observations)
             .with_preparation_probe(probe)
             .with_env_sync(env_sync)
-            .with_ci_task(ci_task),
+            .with_ci_task(ci_task)
+            .with_matrix_dispatch(matrix_dispatch),
         );
         if ephemeral {
             use crate::coordinator::identity::Admission;

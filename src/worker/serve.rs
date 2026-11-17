@@ -163,6 +163,19 @@ pub async fn serve_connection_offering(
                     .await;
                 return;
             }
+            if matches!(&request, crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.as_ref().is_some_and(|ci| ci.dispatch.is_some()))
+                && !negotiated_features
+                    .iter()
+                    .any(|f| f == crate::wire::MATRIX_DISPATCH_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "derived matrix dispatch was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
             if matches!(&request, crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.is_some())
                 && !negotiated_features
                     .iter()

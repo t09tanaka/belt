@@ -492,6 +492,40 @@ fn creating_an_attempt_with_a_bad_permit_leaves_no_attempt() {
     );
     assert!(r.is_err());
     assert!(f.store.list_nonterminal_attempts().unwrap().is_empty());
+    let other = RunId::generate();
+    f.store
+        .create_run(&other, None, None, &json!({}), 1)
+        .unwrap();
+    f.store.create_matrix_group("other", &other, 1, 1).unwrap();
+    f.store.create_matrix_group("mine", &f.run, 1, 1).unwrap();
+    let permit = PermitId::generate();
+    f.store
+        .acquire_permit("other", &permit, 1)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        f.store.acquire_permit("mine", &permit, 1),
+        Err(StorageError::Invalid(_))
+    ));
+    let wrong_run = f.store.create_attempt(
+        NewAttempt {
+            attempt_id: AttemptId::generate(),
+            task_id: f.task.clone(),
+            worker_id: f.worker.clone(),
+            payload_hash: hash('a'),
+            permit_id: Some(permit.clone()),
+        },
+        1,
+    );
+    assert!(matches!(wrong_run, Err(StorageError::Invalid(_))));
+    assert!(f
+        .store
+        .get_permit(&permit)
+        .unwrap()
+        .unwrap()
+        .attempt_id
+        .is_none());
+    assert!(f.store.list_nonterminal_attempts().unwrap().is_empty());
     // The failed commit did not use up the task.
     f.attempt('a').unwrap();
 }
@@ -2569,6 +2603,60 @@ fn a_run_is_queued_whole_or_not_at_all_and_in_the_order_given() {
         .call(|c| Ok(c.query_row("SELECT count(*) FROM run", [], |r| r.get(0))?))
         .unwrap();
     assert_eq!(runs, 1);
+}
+
+#[test]
+fn matrix_placement_holds_the_global_slot_until_proven_stopped() {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let run = RunId::generate();
+    let a = TaskId::generate();
+    let b = TaskId::generate();
+    let spec = json!({"ci":{"matrix":{"group":"ci.yml::test","max_parallel":1}}});
+    store
+        .enqueue(
+            &run,
+            None,
+            &json!({}),
+            &[(a.clone(), spec.clone()), (b.clone(), spec)],
+            1,
+        )
+        .unwrap();
+    let first = placed(place_on(&store, &a, "w-a", 1));
+    let permit = first.permit_id.unwrap();
+    assert_eq!(
+        store
+            .get_permit(&permit)
+            .unwrap()
+            .unwrap()
+            .attempt_id
+            .as_ref(),
+        Some(&first.attempt_id)
+    );
+    store
+        .record_seen(&first.attempt_id, false, None, Observation::Unknown, 20)
+        .unwrap();
+    drop(store);
+    let store = CoordinatorStore::open(dir.path(), 21).unwrap();
+    assert_eq!(place_on(&store, &b, "w-b", 1), PlaceOutcome::MatrixFull);
+    assert!(store.attempts_of_task(&b).unwrap().is_empty());
+    store.begin_retire(&first.attempt_id, "move", 22).unwrap();
+    assert_eq!(place_on(&store, &b, "w-b", 1), PlaceOutcome::MatrixFull);
+    store.confirm_retire(&first.attempt_id, 23).unwrap();
+    assert!(!store.get_permit(&permit).unwrap().unwrap().held);
+    let second = placed(place_on(&store, &b, "w-b", 1));
+    let second_permit = second.permit_id.unwrap();
+    assert_ne!(second_permit, permit);
+    store
+        .record_seen(
+            &second.attempt_id,
+            true,
+            seen(AttemptState::Terminal, Some(done(Outcome::Succeeded))),
+            Observation::Known,
+            24,
+        )
+        .unwrap();
+    assert!(!store.get_permit(&second_permit).unwrap().unwrap().held);
 }
 
 #[test]
@@ -4917,7 +5005,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
@@ -5668,4 +5756,92 @@ fn the_github_status_of_a_run_is_kept_in_its_journal_and_the_last_one_is_shown()
         plan.iter().any(|line| line.contains("event_attempt")),
         "{plan:?}"
     );
+}
+
+#[test]
+fn live_workflow_artifacts_require_durable_bytes_and_replay_the_original_version() {
+    use local_ci::artifact_io::{FileEntry, Receipt as Manifest};
+    let f = fx();
+    let attempt = f.attempt('a').unwrap().attempt_id;
+    let bytes = b"compiled output";
+    let digest = Digest::of_bytes(bytes);
+    let manifest = Manifest {
+        name: "build".into(),
+        version: 1,
+        files: vec![FileEntry {
+            path: "out/app".into(),
+            size: bytes.len() as u64,
+            sha256: digest.as_str().strip_prefix("sha256:").unwrap().into(),
+        }],
+        plan_digest: "plan".into(),
+        attempt_id: "run".into(),
+        job: "ci::build".into(),
+        display: "build".into(),
+        task: None,
+        retention_days: None,
+        compression_level: None,
+        restored_from: None,
+    };
+    let publish = |store: &CoordinatorStore, workflow: &str, key: &[u8], overwrite| {
+        store.publish_workflow_artifact(
+            WorkflowUpload {
+                run: &f.run,
+                workflow,
+                producer: &attempt,
+                key: &Digest::of_bytes(key),
+                overwrite,
+                receipt: manifest.clone(),
+            },
+            30,
+        )
+    };
+    assert!(publish(&f.store, "ci", b"first", false).is_err());
+    assert!(f.store.workflow_artifacts(&f.run, "ci").unwrap().is_empty());
+    let files = crate::results::ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.append_part(&attempt, &digest, 0, bytes).unwrap();
+    files
+        .publish_artifact(&attempt, &digest, bytes.len() as u64)
+        .unwrap();
+    assert_eq!(
+        publish(&f.store, "ci", b"first", false)
+            .unwrap()
+            .receipt
+            .version,
+        1
+    );
+    assert!(publish(&f.store, "ci", b"second", false).is_err());
+    assert_eq!(
+        publish(&f.store, "ci", b"second", true)
+            .unwrap()
+            .receipt
+            .version,
+        2
+    );
+    assert!(publish(&f.store, "ci", b"first", true).is_err());
+    assert_eq!(
+        publish(&f.store, "lint", b"lint", false)
+            .unwrap()
+            .receipt
+            .version,
+        1
+    );
+    drop(f.store);
+    let store = CoordinatorStore::open(f._dir.path(), 40).unwrap();
+    assert_eq!(
+        publish(&store, "ci", b"first", false)
+            .unwrap()
+            .receipt
+            .version,
+        1
+    );
+    assert_eq!(
+        store.workflow_artifacts(&f.run, "ci").unwrap()[0]
+            .receipt
+            .version,
+        2
+    );
+    assert!(store
+        .workflow_artifacts(&RunId::generate(), "ci")
+        .unwrap()
+        .is_empty());
 }

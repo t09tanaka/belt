@@ -4467,6 +4467,7 @@ fn ci_payload() -> AttemptPayload {
     let mut p = payload("true");
     p.commands.clear();
     p.ci_task = Some(remote_task_runner::wire::CiTask {
+        dispatch: None,
         plan_digest: Digest::of_bytes(b"a plan this worker was never sent"),
         task_id: "ci.yml/build".into(),
         inputs: serde_json::json!({ "needs": {} }),
@@ -4736,6 +4737,7 @@ fn ci_fx(workflow: &str) -> CiFx {
         .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
         .unwrap();
     base.ci_task = Some(CiTask {
+        dispatch: None,
         plan_digest,
         task_id: String::new(),
         inputs: serde_json::to_value(local_ci::TaskInputs::default()).unwrap(),

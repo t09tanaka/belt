@@ -29,7 +29,7 @@ use super::error::{Result, SupervisorError};
 use super::run::{Control, NodeEnd, NodeTimes};
 use super::spec::NodeSpec;
 use super::termination::StopReason;
-use crate::ci::execute::{execute_task, TaskPaths};
+use crate::ci::execute::{execute_selected, SelectedTask, TaskPaths};
 use crate::ids::{Digest, NodeId};
 use crate::source::SourceStore;
 use crate::state::{Exit, TimeoutKind};
@@ -60,6 +60,8 @@ const RESULT_FILE: &str = "result.json";
 /// names of `env` only.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTaskSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<serde_json::Value>,
     /// The bytes of the frozen plan. Used only when they hash to
     /// `plan_digest`.
     pub plan_path: PathBuf,
@@ -309,16 +311,16 @@ pub(crate) fn run_task(
         .ok_or_else(|| "the source of the attempt is not in this worker's store".to_string())?;
     let paths = ci.paths(cancel);
     let run_dir = paths.run_dir.clone();
-    let result = execute_task(
-        &store,
-        &manifest,
-        &plan,
-        &ci.task_id,
-        &inputs,
-        paths,
-        executor,
-    )
-    .map_err(|e| e.to_string())?;
+    let dispatch = ci
+        .dispatch
+        .as_ref()
+        .map(|value| crate::ci::execute::decode_dispatch(value, &ci.task_id))
+        .transpose()?;
+    let selected = dispatch
+        .as_ref()
+        .map_or(SelectedTask::Plan(&ci.task_id), SelectedTask::Derived);
+    let result = execute_selected(&store, &manifest, &plan, selected, &inputs, paths, executor)
+        .map_err(|e| e.to_string())?;
     let outcomes =
         serde_json::to_vec(&result.outcomes).map_err(|e| format!("the result of the task: {e}"))?;
     outcomes_fit(outcomes.len(), MAX_INPUT_BYTES)?;
@@ -653,6 +655,7 @@ mod tests {
     #[test]
     fn the_spec_shows_no_value_of_its_environment_and_needs_absolute_paths() {
         let mut ci = CiTaskSpec {
+            dispatch: None,
             plan_path: "/a/plan.json".into(),
             plan_digest: Digest::of_bytes(b"plan"),
             task_id: "t".into(),

@@ -206,6 +206,9 @@ pub trait WorkerLink: Send + Sync {
     fn ci_task_negotiated(&self) -> bool {
         false
     }
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        false
+    }
 
     fn cold_eligible(&self, _task: &crate::ids::TaskId) -> bool {
         false
@@ -256,6 +259,7 @@ pub struct ClientLink {
     preparation_probe: bool,
     env_sync: bool,
     ci_task: bool,
+    matrix_dispatch: bool,
 }
 
 impl ClientLink {
@@ -268,6 +272,7 @@ impl ClientLink {
             preparation_probe: false,
             env_sync: false,
             ci_task: false,
+            matrix_dispatch: false,
         }
     }
 }
@@ -282,6 +287,7 @@ impl ClientLink {
             preparation_probe: false,
             env_sync: false,
             ci_task: false,
+            matrix_dispatch: false,
         }
     }
 }
@@ -298,6 +304,10 @@ impl ClientLink {
         self.env_sync = negotiated;
         self
     }
+    pub fn with_matrix_dispatch(mut self, negotiated: bool) -> Self {
+        self.matrix_dispatch = negotiated;
+        self
+    }
     pub fn with_ci_task(mut self, negotiated: bool) -> Self {
         self.ci_task = negotiated;
         self
@@ -312,6 +322,9 @@ impl WorkerLink for ClientLink {
     }
     fn env_sync_negotiated(&self) -> bool {
         self.env_sync
+    }
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.matrix_dispatch
     }
     fn ci_task_negotiated(&self) -> bool {
         self.ci_task
@@ -404,6 +417,9 @@ impl WorkerLink for Budgeted {
     }
     fn env_sync_negotiated(&self) -> bool {
         self.inner.env_sync_negotiated()
+    }
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.inner.matrix_dispatch_negotiated()
     }
     fn ci_task_negotiated(&self) -> bool {
         self.inner.ci_task_negotiated()

@@ -88,6 +88,43 @@ pub enum Part {
     Job,
 }
 
+/// A matrix variant reserves one slot shared by every worker running this job.
+fn matrix_admission(
+    plan: &local_ci::FrozenPlan,
+    task: &local_ci::dag::ExecutionTask,
+) -> Result<Option<crate::coordinator::MatrixAdmission>, ApiError> {
+    use local_ci::dag::NodeKind;
+    let Some(variant) = &task.variant else {
+        return Ok(None);
+    };
+    let group = plan
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.id == variant.group)
+        .ok_or_else(|| invalid(format!("missing matrix group for task {}", task.id)))?;
+    let NodeKind::MatrixGroup {
+        variants,
+        max_parallel,
+        ..
+    } = &group.kind
+    else {
+        return Err(invalid(format!(
+            "invalid matrix group for task {}",
+            task.id
+        )));
+    };
+    let limit = max_parallel.unwrap_or(variants.len());
+    let max_parallel = u32::try_from(limit)
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| invalid(format!("invalid matrix parallelism for task {}", task.id)))?;
+    Ok(Some(crate::coordinator::MatrixAdmission {
+        group: group.id.clone(),
+        max_parallel,
+    }))
+}
+
 /// The tasks of `plan` as they are queued: one spec per task, in plan order.
 /// A task that depends on another waits (`hold`) and has no inputs yet.
 pub fn task_specs(
@@ -97,7 +134,7 @@ pub fn task_specs(
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     command_timeout_ms: Option<u64>,
 ) -> Result<Vec<(String, TaskSpec)>, ApiError> {
-    if let Some(why) = crate::ci::progress::unsupported(plan) {
+    if let Some(why) = crate::ci::advance::unsupported(plan) {
         return Err(invalid(format!("this plan cannot be run yet: {why}")));
     }
     if plan.tasks.is_empty() {
@@ -105,6 +142,10 @@ pub fn task_specs(
             "the plan has no task: no workflow has a job to run",
         ));
     }
+    let distributed_matrix = plan
+        .tasks
+        .iter()
+        .any(|t| t.variant.is_some() || t.dynamic_matrix);
     let no_inputs = serde_json::to_value(local_ci::TaskInputs::default())
         .map_err(|e| invalid(e.to_string()))?;
     plan.tasks
@@ -114,12 +155,16 @@ pub fn task_specs(
                 .map_err(|e| invalid(format!("task `{}`: {e:#}", task.id)))?;
             let spec = TaskSpec {
                 ci: Some(CiSpec {
+                    dynamic_origin: task.dynamic_matrix,
+                    core_outcome: None,
+                    matrix: matrix_admission(plan, task)?,
                     task: CiTask {
+                        dispatch: None,
                         plan_digest: plan_digest.clone(),
                         task_id: task.id.clone(),
                         inputs: no_inputs.clone(),
                     },
-                    hold: !task.depends_on.is_empty(),
+                    hold: distributed_matrix || !task.depends_on.is_empty(),
                     steps: u32::try_from(demand.nodes.len()).unwrap_or(u32::MAX),
                     unrunnable: None,
                     shard_group: crate::ci::shards::group_of(plan, task)
@@ -507,7 +552,11 @@ pub fn job_lines(
                     .into_iter()
                     .map(|o| line(Some(o.job), o.status.as_str(), o.skipped)),
             ),
-            None => lines.push(line(None, "no_result", None)),
+            None => lines.push(line(
+                None,
+                ci.core_outcome.as_deref().unwrap_or("no_result"),
+                None,
+            )),
         }
     }
     let plan = digest

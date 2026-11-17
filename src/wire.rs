@@ -903,6 +903,7 @@ pub struct AttemptPayload {
 /// no build's `SUPPORTED_FEATURES`, and a CI task that was not negotiated is
 /// refused.
 pub const CI_TASK_FEATURE: &str = "ci_task_v1";
+pub const MATRIX_DISPATCH_FEATURE: &str = "ci_matrix_dispatch_v1";
 
 /// One task of a frozen CI plan (spec chapter 7). The plan itself is not
 /// here: its bytes reach the worker as a content-addressed blob, and the
@@ -910,6 +911,9 @@ pub const CI_TASK_FEATURE: &str = "ci_task_v1";
 /// the task as the plan says and never plans again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTask {
+    /// Sealed SDK dispatch for one member derived from a dynamic matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<serde_json::Value>,
     /// SHA-256 of the bytes of the frozen plan.
     pub plan_digest: Digest,
     /// The task of the plan to run.
@@ -3278,6 +3282,7 @@ mod tests {
             .get("ci_task")
             .is_none());
         let task = |inputs: serde_json::Value| CiTask {
+            dispatch: None,
             plan_digest: dg("frozen plan"),
             task_id: "ci.yml/build".into(),
             inputs,
