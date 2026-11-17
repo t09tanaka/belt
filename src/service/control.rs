@@ -28,6 +28,14 @@ pub struct Report {
     pub cli_exit_code: i32,
     pub error: Option<ApiError>,
 }
+impl Report {
+    /// The report of a target that settled by itself, with the exit code its
+    /// completion gives. `None` until it has.
+    pub fn settled(target: Target, snapshot: &Snapshot) -> Option<Self> {
+        let exit = snapshot.exit_code()?;
+        Some(report(target, Some(snapshot.clone()), "settled", exit))
+    }
+}
 pub(super) async fn interrupted(signals: &mut mpsc::UnboundedReceiver<()>) {
     if signals.recv().await.is_none() {
         std::future::pending::<()>().await;
@@ -125,12 +133,10 @@ pub async fn wait(
             return Ok(report(target,last,"wait_interrupted",130));
         },status=read(spec,target.clone())=>status};
         match status {
-            Ok(snapshot) => {
-                if let Some(exit) = snapshot.exit_code() {
-                    return Ok(report(target, Some(snapshot), "settled", exit));
-                }
-                last = Some(snapshot);
-            }
+            Ok(snapshot) => match Report::settled(target.clone(), &snapshot) {
+                Some(report) => return Ok(report),
+                None => last = Some(snapshot),
+            },
             Err(error)
                 if matches!(
                     error.code,
