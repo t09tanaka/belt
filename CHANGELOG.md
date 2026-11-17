@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.18.2] - 2026-11-17
+
 - Post the `local-ci` commit status only when origin is on github.com, or on the host named by `GH_HOST`. Before, `owner/name` was taken from any origin URL, so a GitLab, GitHub Enterprise or local-path origin could post to an unrelated repository on github.com. Any other origin is skipped with the reason, not a failure of the run.
 - A failed status post says "not on GitHub yet" only for GitHub's "No commit found" reply. Any other HTTP 422 is reported as a `gh api` error with its first line.
 
