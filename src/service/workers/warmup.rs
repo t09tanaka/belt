@@ -15,9 +15,13 @@ use std::time::{Duration, Instant};
 
 /// Between two looks at a running install.
 const POLL: Duration = Duration::from_millis(1000);
-/// How long one version may take in all. The worker gives up earlier (its
-/// preparation timeout); this only ends a wait nobody answers.
+/// How long one version may take in all while the worker says it is still
+/// installing. The worker gives up earlier (its preparation timeout).
 const LIMIT: Duration = Duration::from_secs(3600);
+/// How long nobody may answer (the resident, or the worker behind it) before
+/// the sync ends: a dead link or a resident that does not know the request
+/// is not waited for like an install.
+const QUIET: Duration = Duration::from_secs(120);
 
 /// Why the resident gave no reply.
 #[derive(Debug, PartialEq, Eq)]
@@ -32,7 +36,9 @@ pub enum NoReply {
 #[derive(Debug)]
 pub enum Look {
     Done,
-    /// Not decided yet: look again (the reason is said if time runs out).
+    /// The worker answered: the install is running. Look again.
+    Pending,
+    /// Nobody answered this time (the reason is said if that goes on).
     Again(String),
     Failed(String),
     Stop(ApiError),
@@ -54,7 +60,7 @@ pub fn look(step: &InstallStep, reply: Result<Reply, NoReply>) -> Look {
             match results.iter().find(|r| r.name == step.tool) {
                 Some(r) => match r.outcome {
                     SyncOutcome::Installed | SyncOutcome::Unchanged => Look::Done,
-                    SyncOutcome::Pending => Look::Again("the install is still running".into()),
+                    SyncOutcome::Pending => Look::Pending,
                     SyncOutcome::Failed => Look::Failed(plain(
                         r.message.as_deref().unwrap_or("the worker gave no reason"),
                     )),
@@ -107,6 +113,30 @@ pub struct ResidentWarmup {
     spec: Spec,
     poll: Duration,
     limit: Duration,
+    quiet: Duration,
+}
+
+/// Pure: whether a wait that began `waited` ago and was last answered
+/// `unanswered` ago ends now, and why.
+pub fn give_up(
+    waited: Duration,
+    unanswered: Duration,
+    limit: Duration,
+    quiet: Duration,
+    last: &str,
+) -> Option<String> {
+    if unanswered >= quiet {
+        return Some(format!(
+            "no answer for {} s ({last}); if the running resident is older than this command, restart it. An install may still be running on the worker, so look with workers diff before running workers sync again",
+            quiet.as_secs()
+        ));
+    }
+    (waited >= limit).then(|| {
+        format!(
+            "the install is still running after {} s; look with workers diff before running workers sync again",
+            limit.as_secs()
+        )
+    })
 }
 
 impl ResidentWarmup {
@@ -115,13 +145,16 @@ impl ResidentWarmup {
             spec,
             poll: POLL,
             limit: LIMIT,
+            quiet: QUIET,
         }
     }
-    /// For the tests: how often to look and for how long.
+    /// For the tests: how often to look, and for how long in all and
+    /// without an answer.
     #[doc(hidden)]
     pub fn paced(mut self, poll: Duration, limit: Duration) -> Self {
         self.poll = poll;
         self.limit = limit;
+        self.quiet = limit;
         self
     }
 }
@@ -149,6 +182,11 @@ impl Installer for ResidentWarmup {
         // One warm-up for this step, asked about until it is decided.
         let sync_id = RequestId::generate();
         let begun = Instant::now();
+        let mut answered = begun;
+        eprintln!(
+            "installing {} {} on worker {worker}",
+            step.tool, step.version
+        );
         loop {
             let reply = runtime
                 .block_on(client.request(Operation::EnvSync {
@@ -160,23 +198,26 @@ impl Installer for ResidentWarmup {
                     }],
                 }))
                 .map_err(|e| no_reply(&e));
-            match look(step, reply) {
+            let last = match look(step, reply) {
                 Look::Done => return Ok(()),
                 Look::Failed(reason) => return Err(InstallError::Failed(reason)),
                 Look::Stop(error) => return Err(stop(error)),
-                Look::Again(why) => {
-                    if begun.elapsed() >= self.limit {
-                        return Err(stop(ApiError::new(
-                            ErrorCode::CommunicationUnknown,
-                            format!(
-                                "no outcome after {} s ({why}); the install may still be running on the worker, so look with workers diff before running workers sync again",
-                                self.limit.as_secs()
-                            ),
-                        )));
-                    }
-                    std::thread::sleep(self.poll);
+                Look::Pending => {
+                    answered = Instant::now();
+                    String::new()
                 }
+                Look::Again(why) => why,
+            };
+            if let Some(why) = give_up(
+                begun.elapsed(),
+                answered.elapsed(),
+                self.limit,
+                self.quiet,
+                &last,
+            ) {
+                return Err(stop(ApiError::new(ErrorCode::CommunicationUnknown, why)));
             }
+            std::thread::sleep(self.poll);
         }
     }
 }
@@ -219,8 +260,30 @@ mod tests {
         ));
         assert!(matches!(
             look(&step(), answered(SyncOutcome::Pending, None)),
-            Look::Again(_)
+            Look::Pending
         ));
+    }
+
+    #[test]
+    fn a_wait_ends_when_nobody_answers_or_the_install_runs_too_long() {
+        let s = Duration::from_secs;
+        assert_eq!(give_up(s(10), s(5), s(3600), s(120), "x"), None);
+        // Answered all along: only the long limit ends it.
+        assert_eq!(give_up(s(3599), s(0), s(3600), s(120), ""), None);
+        let long = give_up(s(3600), s(0), s(3600), s(120), "").unwrap();
+        assert!(long.contains("still running after 3600 s"), "{long}");
+        // Not answered: ended early, with the last reason and the restart hint.
+        assert_eq!(give_up(s(119), s(119), s(3600), s(120), "x"), None);
+        let quiet = give_up(s(120), s(120), s(3600), s(120), "connection closed").unwrap();
+        assert!(
+            quiet.contains("no answer for 120 s (connection closed)"),
+            "{quiet}"
+        );
+        assert!(quiet.contains("restart it"), "{quiet}");
+        // Both at once: the missing answer is what is said.
+        assert!(give_up(s(4000), s(200), s(3600), s(120), "x")
+            .unwrap()
+            .contains("no answer"));
     }
 
     #[test]

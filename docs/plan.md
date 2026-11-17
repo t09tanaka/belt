@@ -1104,7 +1104,7 @@ A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一
 - **agent の導入**: 親が渡すのは tool 名と厳密な版だけで、導入の内容はすべて worker 自身の registry（`toolchains.toml`）から作る（`Registry::inventory_request`。recipe が無い tool、inventory に無い版、厳密でない版は導入せず、理由を付けて `failed`）。導入は `Host::toolchain_poll` に warm-up 用の consumer を渡して行うので、配置済みの attempt と同じ setup の supervisor・forecast・task-traffic-controller の gate を通る。install plan の key は project や親の profile に依らないため、同じ版の warm-up どうしも、その版を要する attempt も、既存の singleflight で 1 つの導入にまとまる。
 - **待たない要求**: link と control socket の応答時間は数秒なので、1 回の要求は導入を待たず `pending` を返す（`SyncOutcome::Pending` を追加）。親は同じ `sync_id`（要求の本文に追加。`request_id` は毎回新しい）で聞き直す。agent は `sync_id` ごとに consumer を 1 つ持ち、決着（導入済み・失敗・`prepare_timeout_ms` 超過）で参照を手放す。決着した結果は覚えておき、応答を失った親の聞き直しに同じ答えを返す（失敗した導入をやり直さない）。誰も聞きに来ない warm-up（親が途中で止まった）は、agent の tick が `warmup_idle_ms`（既定 60 秒）で参照を手放す（最後の参照なら導入も止まる）。同時に覚える warm-up は 16 個まで、1 要求の tool は 32 個まで（超える要求は丸ごと断る）。停止中の agent は新しい warm-up を始めない。古い coordinator epoch は `STALE_EPOCH`。`dry_run` は検出だけで何も始めない。
 - **旧 peer の除外**: hello の feature `env_sync_v1` を足した。双方が提供し、どちらも要求しない（`required_features` に入れない）ので、片方だけが新しい組み合わせでも接続と通常の配置はそのまま動く（N/N+1）。合意できなかった link には coordinator が要求を送らず、`workers upgrade <worker>` を案内する `PROTOCOL_INCOMPATIBLE` を返す。agent 側も、合意していない接続からの `env_sync` を agent に渡す前に断る。古い resident（操作を知らない）には「resident を再起動して」と案内する。
-- **CLI**: `NoWarmup` を `ResidentWarmup` に置き換えた。導入する版が 1 つでもあるときだけ resident に繋ぐ（揃っている worker の sync に resident は要らない）。resident が動いていなければ、起動せずに「resident が動いていない」と出して止まる。応答なし・混雑（`COMMUNICATION_UNKNOWN`・`OVERLOADED`）は同じ `sync_id` で聞き直し、1 時間で打ち切る（worker 側は既定 15 分で失敗にする）。導入の失敗はその版を blocked にして残りを続け、導入後の測り直しで見えない版は `envsync::verify` が blocked にする。resident なし・旧 peer・応答なしの打ち切りは、その場で sync を終える（それまでに導入したものはメッセージに含める）。worker から来た文字列は制御文字を除いて出す。
+- **CLI**: `NoWarmup` を `ResidentWarmup` に置き換えた。導入する版が 1 つでもあるときだけ resident に繋ぐ（揃っている worker の sync に resident は要らない）。resident が動いていなければ、起動せずに「resident が動いていない」と出して止まる。応答なし・混雑（`COMMUNICATION_UNKNOWN`・`OVERLOADED`）は同じ `sync_id` で聞き直すが、誰も答えない状態が 2 分続いたら打ち切る（link が切れた worker、この操作を知らない古い resident は要求を読めずに接続を閉じるので、ここに当たる。メッセージで resident の再起動を案内する）。worker が `pending` と答え続ける間は 1 時間まで待つ（worker 側は既定 15 分で失敗にする）。導入を始めるときに stderr へ 1 行出す。導入の失敗はその版を blocked にして残りを続け、導入後の測り直しで見えない版は `envsync::verify` が blocked にする。resident なし・旧 peer・応答なしの打ち切りは、その場で sync を終える（それまでに導入したものはメッセージに含める）。worker から来た文字列は制御文字を除いて出す。
 - **表示の食い違いの修正**: 成功時の 1 行は `render_sync` が作り、`in_sync` が true のときだけ「is in sync」と言う。false のときは「is not in sync with the parent」で始め、`--project` を付けたときだけ「プロジェクトの要求は満たしている」と続ける（以前は `in_sync: false` で「meets the project's requirements」とだけ言い、`--project` なしでも project に触れていた）。
 
 A44 の sync 側のテスト（ネットワークに出ない）:
@@ -1114,7 +1114,8 @@ A44 の sync 側のテスト（ネットワークに出ない）:
 
 残り（S21 は完了していない）:
 1. `doctor` への組み込み（S23）。
-2. ssh 越しの remote worker に対する `workers sync` の実機での受入（S26）。往復の試験は local worker の link で行った。remote の link も同じ `ClientLink` で、feature の合意は `config/runtime.rs` で同じように渡している。
+2. ssh 越しの remote worker に対する `workers sync` の実機での受入（S26）。往復の試験は local worker の link で行った。remote の link を作る `config/runtime.rs` が feature の合意を渡すこと（合意した peer には送り、していない peer には送らない）は `tests/it/runtime.rs` で確かめたが、ssh の bridge を通した導入の往復は試験していない。
 3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
 4. `diff` の worker 省略時の並列化、`installed_inventory` の所要時間の計測（1 本目から継続）。
-5. sync の途中で Ctrl-C したとき、worker 側の導入は最長 `warmup_idle_ms` 続いてから止まる（即時の取り消し要求は無い）。
+5. spec 11 章は `env_sync` の名前だけを挙げており、`pending` と `sync_id` による聞き直し、feature `env_sync_v1` は spec に書いていない（spec の追記は未実施）。
+6. sync の途中で Ctrl-C したとき、worker 側の導入は最長 `warmup_idle_ms` 続いてから止まる（即時の取り消し要求は無い）。

@@ -25,7 +25,7 @@ impl Coordinator {
                 ApiError::new(
                     ErrorCode::NotFound,
                     format!(
-                        "worker {worker} is not connected to the resident (see workers status {worker})"
+                        "worker {worker} is not connected to the resident: it is not registered (workers add), or the resident has not reached it yet"
                     ),
                 )
             })?;

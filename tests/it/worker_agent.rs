@@ -4733,13 +4733,13 @@ fn a_warm_up_keeps_one_consumer_until_it_is_decided_and_then_repeats_its_answer(
 
 #[test]
 fn a_warm_up_that_takes_too_long_fails_and_gives_up_its_reference() {
-    let (f, agent) = warm_fx(|cfg| cfg.prepare_timeout_ms = 150);
+    let (f, agent) = warm_fx(|cfg| cfg.prepare_timeout_ms = 3_000);
     *f.host.tool_poll.lock().unwrap() = Some(None);
     let sync = RequestId::generate();
     let first = env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
     assert_eq!(first[0].outcome, SyncOutcome::Pending);
     assert!(f.host.releases().is_empty());
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(3_200));
     let late = env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
     assert_eq!(late[0].outcome, SyncOutcome::Failed);
     assert!(late[0].message.as_deref().unwrap().contains("in time"));
@@ -4748,28 +4748,31 @@ fn a_warm_up_that_takes_too_long_fails_and_gives_up_its_reference() {
 
 #[test]
 fn a_warm_up_nobody_asks_about_is_released_by_the_tick() {
-    let (f, agent) = warm_fx(|cfg| cfg.warmup_idle_ms = 150);
+    // Seconds, not milliseconds: a loaded machine must not turn "asked a
+    // moment ago" into "forgotten".
+    let (f, agent) = warm_fx(|cfg| cfg.warmup_idle_ms = 3_000);
     *f.host.tool_poll.lock().unwrap() = Some(None);
     let sync = RequestId::generate();
     env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
     agent.tick();
     assert!(f.host.releases().is_empty(), "asked about a moment ago");
-    std::thread::sleep(Duration::from_millis(200));
+    std::thread::sleep(Duration::from_millis(3_200));
     agent.tick();
     let first = f.host.tool_polls()[0].clone();
     assert_eq!(f.host.releases(), vec![first.clone()]);
     // Released once; asking again is a new warm-up with its own consumer.
     agent.tick();
     assert_eq!(f.host.releases().len(), 1);
-    env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
-    assert_ne!(f.host.tool_polls()[1], first);
-    // A decided warm-up that is forgotten later is not released twice.
     *f.host.tool_poll.lock().unwrap() = Some(Some("no".into()));
     env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
-    assert_eq!(f.host.releases().len(), 2);
-    std::thread::sleep(Duration::from_millis(200));
+    let second = f.host.tool_polls()[1].clone();
+    assert_ne!(second, first);
+    // It was decided (failed), so its reference went then; forgetting it
+    // later does not release it a second time.
+    assert_eq!(f.host.releases(), vec![first.clone(), second.clone()]);
+    std::thread::sleep(Duration::from_millis(3_200));
     agent.tick();
-    assert_eq!(f.host.releases().len(), 2);
+    assert_eq!(f.host.releases(), vec![first, second]);
 }
 
 #[test]
