@@ -480,9 +480,12 @@ mod a44 {
         assert_eq!(value["error"]["code"], "BLOCKED");
         assert_eq!(value["error"]["blocked_reason"], "environment_mismatch");
         let message = value["error"]["message"].as_str().unwrap();
-        assert!(message.contains("accept its license"), "{message}");
-        assert!(message.contains("Docker Desktop"), "{message}");
-        assert!(message.contains("task-traffic-controller"), "{message}");
+        assert!(
+            message.contains("sudo xcodebuild -license accept"),
+            "{message}"
+        );
+        assert!(message.contains("Colima"), "{message}");
+        assert!(!message.contains("task-traffic-controller"), "{message}");
         assert!(!message.contains("node"), "{message}");
     }
 
@@ -497,7 +500,7 @@ mod a44 {
             message.contains("node 20.1.0 was not installed"),
             "{message}"
         );
-        assert!(message.contains("no warm-up request yet"), "{message}");
+        assert!(message.contains("cannot install on a worker"), "{message}");
     }
 
     #[test]

@@ -1250,7 +1250,60 @@ mod sync {
         let mut installer = Recorder::default();
         let done = run(&mut w, &mut installer, None).unwrap();
         assert!(done.installed.is_empty() && installer.calls.is_empty());
+        assert!(done.in_sync);
         assert_eq!(w.remote.log.len(), 1);
+    }
+
+    #[test]
+    fn a_difference_sync_cannot_change_is_never_called_in_sync() {
+        // Another architecture and no free disk: `diff` shows both.
+        let mut w = world();
+        let mut r: serde_json::Value =
+            serde_json::from_slice(&worker("20.1.0", &["20.1.0"], Docker::Runnable)).unwrap();
+        r["env"]["arch"] = "other-arch".into();
+        r["env"]["disk_free_bytes"] = 0.into();
+        w.remote.env_queue = [serde_json::to_vec(&r).unwrap()].into();
+        let mut installer = Recorder::default();
+        let err = run(&mut w, &mut installer, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Blocked);
+        assert!(err.message.contains("platform"), "{}", err.message);
+        assert!(
+            err.message.contains("free at least 2 GiB"),
+            "{}",
+            err.message
+        );
+        assert!(installer.calls.is_empty());
+    }
+
+    #[test]
+    fn what_was_installed_is_said_when_the_second_measurement_fails_or_a_rest_is_blocked() {
+        let mut w = world();
+        w.remote.env_queue = [
+            worker("18.0.0", &["18.0.0"], Docker::Runnable),
+            b"not json".to_vec(),
+        ]
+        .into();
+        let mut installer = Recorder::default();
+        let err = run(&mut w, &mut installer, None).unwrap_err();
+        assert!(
+            err.message.contains("installed node 20.1.0"),
+            "{}",
+            err.message
+        );
+        assert_eq!(err.code, ErrorCode::Conflict);
+        let mut w = world();
+        w.remote.env_queue = [
+            worker("18.0.0", &["18.0.0"], Docker::NotRunnable),
+            worker("18.0.0", &["18.0.0", "20.1.0"], Docker::NotRunnable),
+        ]
+        .into();
+        let err = run(&mut w, &mut Recorder::default(), None).unwrap_err();
+        assert!(
+            err.message
+                .contains("installed before stopping: node 20.1.0"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]
@@ -1265,7 +1318,7 @@ mod sync {
             Some(crate::error::BlockedReason::EnvironmentMismatch)
         );
         assert!(err.message.contains("environment_mismatch"));
-        assert!(err.message.contains("Docker Desktop"), "{}", err.message);
+        assert!(err.message.contains("Colima"), "{}", err.message);
         assert!(installer.calls.is_empty());
     }
 
@@ -1280,7 +1333,7 @@ mod sync {
         let mut installer = Recorder::default();
         let err = run(&mut w, &mut installer, None).unwrap_err();
         assert_eq!(installer.calls.len(), 1);
-        assert!(err.message.contains("Docker Desktop"));
+        assert!(err.message.contains("Colima"));
         assert!(!err.message.contains("node 20.1.0 was not installed"));
         assert_eq!(err.message.matches("\n- ").count(), 1);
     }
@@ -1321,7 +1374,7 @@ mod sync {
         let mut w = world();
         w.remote.env_queue = [worker("18.0.0", &["18.0.0"], Docker::Runnable)].into();
         let err = run(&mut w, &mut NoWarmup, None).unwrap_err();
-        assert!(err.message.contains("no warm-up request yet"));
+        assert!(err.message.contains("cannot install on a worker"));
         let other = Recorder::default();
         assert!(NoWarmup
             .install(
@@ -1389,6 +1442,7 @@ mod sync {
     fn the_blocked_message_lists_every_line() {
         let err = blocked_error(
             "w",
+            &[],
             &[
                 Blocked {
                     subject: "a".into(),
@@ -1413,7 +1467,14 @@ mod sync {
         let dir = crate::test_tmp::tempdir().unwrap();
         let root = dir.path();
         assert!(read_project_requirements(&root.join("missing")).is_err());
-        assert!(read_project_requirements(root).unwrap().is_empty());
+        // A directory without any version file is said, not "in sync".
+        let err = read_project_requirements(root).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        assert!(
+            err.message.contains("no version files found"),
+            "{}",
+            err.message
+        );
         fs::write(root.join(".node-version"), "20.1.0\n").unwrap();
         let reqs = read_project_requirements(root).unwrap();
         assert_eq!(reqs.len(), 1);
@@ -1434,6 +1495,23 @@ mod sync {
         // Not text.
         fs::write(root.join(".nvmrc"), [0xff, 0xfe]).unwrap();
         assert!(read_project_requirements(root).is_err());
+        // A linked `.fvm` directory is not followed to a file outside.
+        fs::remove_file(root.join(".nvmrc")).unwrap();
+        let outside = crate::test_tmp::tempdir().unwrap();
+        fs::write(
+            outside.path().join("fvm_config.json"),
+            "{\"flutterSdkVersion\":\"3.0.0\"}",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join(".fvm")).unwrap();
+        let err = read_project_requirements(root).unwrap_err();
+        assert!(
+            err.message.contains(".fvm/fvm_config.json"),
+            "{}",
+            err.message
+        );
+        fs::remove_file(root.join(".fvm")).unwrap();
+        fs::write(root.join(".nvmrc"), "18\n").unwrap();
         // Contradicting requirements.
         fs::write(root.join(".nvmrc"), "18\n").unwrap();
         fs::write(root.join(".node-version"), "20\n").unwrap();

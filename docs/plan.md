@@ -1087,9 +1087,9 @@ A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一
 
 ### S21 `workers sync`（2026-11-17、2 本目: 計画と blocked、導入の差し込み口）
 
-`workers sync <worker> [--project <dir>]` を実装した。計画は純粋関数 `toolchain::envsync::plan(parent, worker, project)`（PURE 対象）で、diff の `auto_installable` を版管理 adapter の導入手順にし、それ以外（`manual_required`・`missing`・`differs`）は導入せず `blocked: environment_mismatch` として不足内容と手順を出す。platform・disk・digest は sync の対象外。`--project` は dir 直下の版指定ファイル（symlink は辿らない、各 256KiB 以下）を `declarations` で読み、宣言された tool は親ではなくプロジェクトの要求（導入済みか既定の版が満たせば何もしない、満たす最大の許可済み版を導入、無ければ blocked）に従う。alias・式は版ではないので導入しない。
+`workers sync <worker> [--project <dir>]` を実装した。計画は純粋関数 `toolchain::envsync::plan(parent, worker, project)`（PURE 対象）で、diff の `auto_installable` を版管理 adapter の導入手順にし、それ以外（`manual_required`・`missing`・`differs`。platform・disk・profile を含む）は導入せず `blocked: environment_mismatch` として不足内容と手順を出し、非 0 で終わる。「in sync」と言うのは `diff` が `all_same` のときだけ（`--project` で宣言された tool が親と違うだけなら「プロジェクトの要求を満たす」と言い、`in_sync: false`）。`--project` は dir 直下の版指定ファイル（`.fvm` を含め途中の symlink も辿らない（`platform::open_beneath`）、各 256KiB 以下、1 つも無ければ InvalidInput）を `declarations` で読み、宣言された tool は親ではなくプロジェクトの要求（導入済みか既定の版が満たせば何もしない、満たす最大の許可済み版を導入、無ければ blocked）に従う。alias（`lts` など）・式は版ではないので導入せず、「具体的な版を指定する」と案内する。導入済みの版は PATH に tool が無くても要求を満たす。
 
-実行は自動導入を先に行い、その後で手動分を blocked として報告する。導入後に worker を測り直し、導入が見えなければ blocked とする。導入の失敗は成功にせず、別の版へ切り替えない。導入そのものは `Installer` trait の差し込み口に分け、現在の本番実装 `NoWarmup` は「warm-up 要求がまだ無い」と報告して何も導入しない。
+実行は自動導入を先に行い、その後で手動分を blocked として報告する。導入後に worker を測り直し（比較は純粋関数 `envsync::verify`、メッセージは `envsync::render_blocked`）、導入が見えなければ blocked とする。途中で止まったとき（測り直しの失敗、残りの blocked）も、それまでに導入したものをメッセージに含める。導入の失敗は成功にせず、別の版へ切り替えない。導入そのものは `Installer` trait の差し込み口に分け、現在の本番実装 `NoWarmup` は「この版の RTR は worker に導入できない。その版を要求する最初の仕事が導入する、または worker の manager で手で入れる」と報告して何も導入しない（warm-up の PR が入れば使われなくなる）。
 
 残り（S21 は完了していない）:
 1. 導入の本番経路。導入は admitted な setup builder の `poll_tool` が配置済み attempt を consumer にしてのみ始まる（`install_admitted` は admission 前提で、ssh helper から直接呼べない）。warm-up 要求を既存の認証済み経路（resident の control → coordinator の worker link → wire request → agent が合成 consumer で `toolchain_poll`）へ 1 つ足し、旧 peer は hello の feature 交渉で外す。wire・protocol・coordinator・resident・agent に及ぶため別の作業にする。

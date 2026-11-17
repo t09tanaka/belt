@@ -964,7 +964,7 @@ pub trait Installer {
 pub struct NoWarmup;
 impl Installer for NoWarmup {
     fn install(&mut self, _: &str, _: &InstallStep) -> Result<(), String> {
-        Err("the worker accepts no warm-up request yet, so nothing was installed".into())
+        Err("this version of remote-task-runner cannot install on a worker; the first attempt that needs the version installs it, or install it by hand with the worker's version manager".into())
     }
 }
 
@@ -972,6 +972,10 @@ impl Installer for NoWarmup {
 pub struct SyncResult {
     pub worker: String,
     pub installed: Vec<InstallStep>,
+    /// The worker now matches the parent in everything `workers diff` shows.
+    /// False only with `--project`: the project's requirements are met while
+    /// a tool the project declares still differs from the parent.
+    pub in_sync: bool,
 }
 
 /// The project's version requirements per tool, read from the version files
@@ -980,49 +984,46 @@ pub fn read_project_requirements(
     dir: &Path,
 ) -> Result<Vec<crate::toolchain::versions::EffectiveRequirement>, ApiError> {
     use crate::toolchain::{declarations, versions};
-    use std::os::unix::fs::OpenOptionsExt;
     let bad = |what: &str| invalid(format!("project version files: {what}"));
-    if !dir.is_dir() {
+    // Resolved once, so that nothing below follows a link the project holds.
+    let root = std::fs::canonicalize(dir).map_err(|_| bad("the project is not a directory"))?;
+    if !root.is_dir() {
         return Err(bad("the project is not a directory"));
     }
     let mut documents = BTreeMap::new();
     for name in declarations::VERSION_FILES {
-        let path = dir.join(name);
-        let Ok(meta) = std::fs::symlink_metadata(&path) else {
-            continue;
+        // Every directory of the name (`.fvm`) and the file are opened one by
+        // one without following a link.
+        let file = match crate::platform::open_beneath(&root, Path::new(name)) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(bad(&format!("{name} is not a small regular file"))),
         };
+        let meta = file
+            .metadata()
+            .map_err(|_| bad(&format!("{name} is unreadable")))?;
         if !meta.is_file() || meta.len() > declarations::MAX_DOCUMENT_BYTES as u64 {
             return Err(bad(&format!("{name} is not a small regular file")));
         }
         let mut bytes = Vec::new();
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&path)
-            .and_then(|f| {
-                f.take(declarations::MAX_DOCUMENT_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes)
-            })
+        file.take(declarations::MAX_DOCUMENT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
             .map_err(|_| bad(&format!("{name} is unreadable")))?;
         let doc = declarations::Document::new(name, &bytes)
             .map_err(|d| bad(&format!("{name}: {}", d.code)))?;
         documents.insert(name.to_string(), doc);
     }
+    if documents.is_empty() {
+        return Err(bad(&format!("no version files found in {}", dir.display())));
+    }
     let found = declarations::read_project("", &documents, &[]).map_err(|d| bad(&d.code))?;
     versions::effective(&found, &versions::Scope::project("")).map_err(|d| bad(&d.code))
 }
 
-fn blocked_error(name: &str, blocked: &[Blocked]) -> ApiError {
-    let lines: Vec<String> = blocked
-        .iter()
-        .map(|b| format!("- {}: {}", b.missing, b.steps))
-        .collect();
+fn blocked_error(name: &str, installed: &[InstallStep], blocked: &[Blocked]) -> ApiError {
     ApiError::blocked(
         crate::error::BlockedReason::EnvironmentMismatch,
-        format!(
-            "worker {name} is not in sync (environment_mismatch):\n{}",
-            lines.join("\n")
-        ),
+        envsync::render_blocked(name, installed, blocked),
     )
 }
 
@@ -1053,33 +1054,40 @@ pub fn sync_worker(
             }),
         }
     }
-    if installed.is_empty() {
+    let last = if installed.is_empty() {
         blocked.extend(first.blocked);
+        worker
     } else {
-        // Look again: what was installed must now be there.
-        let after = fetch_env(remote, env, exe, name)?;
-        let again = envsync::plan(&parent, &after, project);
-        for step in again.install {
-            if installed.contains(&step) {
-                blocked.push(Blocked {
-                    subject: step.tool.clone(),
-                    missing: format!(
-                        "{} {} is still missing after its install",
-                        step.tool, step.version
-                    ),
-                    steps: "run workers diff and check the worker's toolchain directory".into(),
-                });
-            }
-        }
-        blocked.extend(again.blocked);
-    }
+        // Look again: what was installed must now be there. If the worker
+        // cannot be measured, what was installed so far is still said.
+        let after = fetch_env(remote, env, exe, name).map_err(|e| {
+            let list: Vec<String> = installed
+                .iter()
+                .map(|s| format!("{} {}", s.tool, s.version))
+                .collect();
+            ApiError::new(
+                e.code,
+                format!(
+                    "installed {}, but the worker could not be measured afterwards: {}",
+                    list.join(", "),
+                    e.message
+                ),
+            )
+        })?;
+        blocked.extend(envsync::verify(
+            &installed,
+            envsync::plan(&parent, &after, project),
+        ));
+        after
+    };
     if blocked.is_empty() {
         Ok(SyncResult {
             worker: name.into(),
             installed,
+            in_sync: envdiff::all_same(&envdiff::diff(&parent, &last)),
         })
     } else {
-        Err(blocked_error(name, &blocked))
+        Err(blocked_error(name, &installed, &blocked))
     }
 }
 
@@ -1277,15 +1285,20 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                 )
             })()
             .map(|done| {
+                let state = if done.in_sync {
+                    "is in sync"
+                } else {
+                    "meets the project's requirements (it still differs from the parent where the project declares a tool; see workers diff)"
+                };
                 let text = if done.installed.is_empty() {
-                    format!("worker {name} is in sync")
+                    format!("worker {name} {state}")
                 } else {
                     let list: Vec<String> = done
                         .installed
                         .iter()
                         .map(|s| format!("{} {}", s.tool, s.version))
                         .collect();
-                    format!("worker {name} is in sync; installed {}", list.join(", "))
+                    format!("worker {name} {state}; installed {}", list.join(", "))
                 };
                 (serde_json::to_value(&done).expect("serializes"), text)
             });

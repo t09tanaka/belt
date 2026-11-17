@@ -3,12 +3,9 @@
 //! rest. Pure: reports in, a plan out; the installing itself is injected.
 use super::contract::canonical_tool;
 use super::envdiff::{self, Class, EnvReport, ToolFact};
-use super::versions::{EffectiveRequirement, Match, ToolId, VersionObservation};
+use super::versions::{Constraint, EffectiveRequirement, Match, ToolId, VersionObservation};
 use node_semver::Version;
 use serde::{Deserialize, Serialize};
-
-/// Reported by `diff`, but nothing `sync` could change.
-const NOT_SYNCED: &[&str] = &["platform", "disk", "profile_digest", "policy_digest"];
 
 /// One version to install through the worker's version manager.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,7 +44,7 @@ fn worker_fact<'a>(worker: &'a EnvReport, tool: &str) -> Option<&'a ToolFact> {
         .copied()
 }
 
-fn satisfies(tool: &ToolId, constraints: &[super::versions::Constraint], version: &str) -> bool {
+fn satisfies(tool: &ToolId, constraints: &[Constraint], version: &str) -> bool {
     let observed = VersionObservation::parse_for(tool, version);
     constraints
         .iter()
@@ -68,17 +65,31 @@ fn project_step(worker: &EnvReport, req: &EffectiveRequirement, plan: &mut SyncP
     let name = tool.as_str();
     let fact = worker_fact(worker, name);
     if let Some(fact) = fact {
-        let present = fact
+        // The default version counts only when it was measured; a version
+        // installed under the manager counts wherever the PATH points.
+        let active = fact
             .version
             .iter()
-            .chain(fact.managed.iter().flat_map(|m| m.installed.iter()));
-        if fact.observed == envdiff::Observed::Available
-            && present
-                .into_iter()
-                .any(|v| satisfies(tool, &req.constraints, v))
+            .filter(|_| fact.observed == envdiff::Observed::Available);
+        let installed = fact.managed.iter().flat_map(|m| m.installed.iter());
+        if active
+            .chain(installed)
+            .any(|v| satisfies(tool, &req.constraints, v))
         {
             return;
         }
+    }
+    // An alias or channel names no concrete version: nothing to install.
+    if let Some(alias) = req.constraints.iter().find_map(|c| match c {
+        Constraint::Resolve(alias) => Some(alias),
+        _ => None,
+    }) {
+        plan.blocked.push(blocked(
+            name,
+            format!("the project requires the alias {alias} for {name}, which names no concrete version"),
+            format!("specify a concrete {name} version in the project's version file, then rerun workers sync"),
+        ));
+        return;
     }
     let candidates = fact
         .and_then(|f| f.managed.as_ref())
@@ -107,7 +118,7 @@ fn project_step(worker: &EnvReport, req: &EffectiveRequirement, plan: &mut SyncP
             format!("the worker has no {name} for the project requirement and no version manager for it"),
             envdiff::manual_steps(name).map_or_else(
                 || format!("install {name} on the worker, then rerun workers sync"),
-                str::to_string,
+                |manual| format!("{manual}, then rerun workers sync"),
             ),
         )),
     }
@@ -119,9 +130,55 @@ fn add_install(plan: &mut SyncPlan, step: InstallStep) {
     }
 }
 
+/// What is still wrong after `installed` was installed: `again` is the plan
+/// made from a fresh measurement of the worker. Anything that was installed
+/// and is still planned for install did not take effect; the rest of the
+/// plan is blocked as it stands.
+pub fn verify(installed: &[InstallStep], again: SyncPlan) -> Vec<Blocked> {
+    let mut left: Vec<Blocked> = again
+        .install
+        .iter()
+        .filter(|step| installed.contains(step))
+        .map(|step| {
+            blocked(
+                &step.tool,
+                format!(
+                    "{} {} is still missing after its install",
+                    step.tool, step.version
+                ),
+                "run workers diff and check the worker's toolchain directory".into(),
+            )
+        })
+        .collect();
+    left.extend(again.blocked);
+    left
+}
+
+/// The message of a sync that stopped: what was installed before it stopped
+/// (so it is not lost), then every difference that remains with its steps.
+pub fn render_blocked(worker: &str, installed: &[InstallStep], blocked: &[Blocked]) -> String {
+    let mut lines = vec![format!(
+        "worker {worker} is not in sync (environment_mismatch):"
+    )];
+    if !installed.is_empty() {
+        let list: Vec<String> = installed
+            .iter()
+            .map(|s| format!("{} {}", s.tool, s.version))
+            .collect();
+        lines.push(format!("installed before stopping: {}", list.join(", ")));
+    }
+    lines.extend(
+        blocked
+            .iter()
+            .map(|b| format!("- {}: {}", b.missing, b.steps)),
+    );
+    lines.join("\n")
+}
+
 /// The plan for bringing `worker` to `parent`, or, with `project`, to the
 /// project's requirements for each tool it declares. Tools the project does
-/// not declare, helpers and docker still follow the parent.
+/// not declare, helpers, docker, platform, disk and profile still follow the
+/// parent: those that cannot be installed come back as blocked, with steps.
 pub fn plan(
     parent: &EnvReport,
     worker: &EnvReport,
@@ -135,12 +192,12 @@ pub fn plan(
         })
     };
     for item in envdiff::diff(parent, worker) {
-        if NOT_SYNCED.contains(&item.subject.as_str()) || declared(&item.subject) {
+        if declared(&item.subject) {
             continue;
         }
         let steps = item.steps.clone().unwrap_or_default();
         match item.class {
-            Class::Same => {}
+            Class::Same | Class::NotMeasured => {}
             Class::AutoInstallable => add_install(
                 &mut plan,
                 InstallStep {
@@ -182,6 +239,8 @@ mod tests {
             helpers: BTreeMap::new(),
             docker: Docker::Runnable,
             disk_free_bytes: Some(envdiff::MIN_DISK_BYTES),
+            profile: "default".into(),
+            required_tools: vec![],
             profile_digest: Some("sha256:p".into()),
             policy_digest: Some("sha256:t".into()),
         }
@@ -274,6 +333,11 @@ mod tests {
             .helpers
             .insert("local-ci".into(), Some("0.13.0".into()));
         let mut worker = report();
+        for name in ["xcode", "git"] {
+            worker
+                .tools
+                .insert(name.into(), fact(Observed::Unavailable, None, None));
+        }
         worker.docker = Docker::NotRunnable;
         parent.docker = Docker::Runnable;
         let got = plan(&parent, &worker, None);
@@ -281,20 +345,27 @@ mod tests {
         let subjects: Vec<&str> = got.blocked.iter().map(|b| b.subject.as_str()).collect();
         assert_eq!(subjects, ["git", "xcode", "local-ci", "docker"]);
         let xcode = got.blocked.iter().find(|b| b.subject == "xcode").unwrap();
-        assert!(xcode.steps.contains("accept its license"));
+        assert!(xcode.steps.contains("sudo xcodebuild -license accept"));
         assert!(xcode.missing.contains("parent 16.0.0, worker -"));
         let docker = got.blocked.iter().find(|b| b.subject == "docker").unwrap();
-        assert!(docker.steps.contains("Docker Desktop"));
+        assert!(docker.steps.contains("Colima"));
     }
 
     #[test]
-    fn platform_disk_and_digests_are_not_synced() {
+    fn what_cannot_be_installed_is_blocked_with_steps_not_dropped() {
         let mut worker = report();
         worker.arch = "x86_64".into();
         worker.disk_free_bytes = Some(0);
-        worker.profile_digest = Some("sha256:other".into());
-        worker.policy_digest = None;
-        assert_eq!(plan(&report(), &worker, None), SyncPlan::default());
+        worker.profile = "other".into();
+        let got = plan(&report(), &worker, None);
+        assert!(got.install.is_empty());
+        let subjects: Vec<_> = got.blocked.iter().map(|b| b.subject.as_str()).collect();
+        assert_eq!(subjects, ["platform", "disk", "profile"]);
+        assert!(got.blocked.iter().all(|b| !b.steps.is_empty()));
+        // A digest that was not measured is no difference.
+        let mut parent = report();
+        parent.policy_digest = None;
+        assert_eq!(plan(&parent, &report(), None), SyncPlan::default());
     }
 
     #[test]
@@ -404,7 +475,10 @@ mod tests {
         assert!(got.blocked[0].missing.contains("no version manager"));
         assert!(got.blocked[0].steps.contains("install node on the worker"));
         let got = plan(&report(), &report(), Some(&[req("xcode", "^16")]));
-        assert!(got.blocked[0].steps.contains("accept its license"));
+        assert!(got.blocked[0]
+            .steps
+            .contains("sudo xcodebuild -license accept"));
+        assert!(got.blocked[0].steps.ends_with("then rerun workers sync"));
     }
 
     #[test]
@@ -426,6 +500,78 @@ mod tests {
         let got = plan(&report(), &worker, Some(&[alias]));
         assert!(got.install.is_empty());
         assert_eq!(got.blocked.len(), 1);
+        assert!(got.blocked[0].missing.contains("alias lts"));
+        assert!(got.blocked[0].steps.contains("concrete node version"));
+    }
+
+    #[test]
+    fn an_installed_version_meets_the_project_even_off_the_profile_path() {
+        for observed in [Observed::Unavailable, Observed::Unknown] {
+            let mut worker = report();
+            worker.tools.insert(
+                "node".into(),
+                fact(observed, None, Some((&["20.1.0"], &["20.1.0"]))),
+            );
+            assert_eq!(
+                plan(&report(), &worker, Some(&[req("node", "^20")])),
+                SyncPlan::default(),
+                "{observed:?}"
+            );
+        }
+        // A default version that was not measured does not count.
+        let mut worker = report();
+        worker.tools.insert(
+            "node".into(),
+            fact(Observed::Unknown, Some("20.1.0"), Some((&["20.1.0"], &[]))),
+        );
+        assert_eq!(
+            plan(&report(), &worker, Some(&[req("node", "^20")])).install,
+            [step("node", "20.1.0")]
+        );
+    }
+
+    #[test]
+    fn verify_blocks_an_install_that_did_not_take_and_everything_still_blocked() {
+        let installed = [step("node", "20.1.0"), step("rust", "1.80.0")];
+        let again = SyncPlan {
+            install: vec![step("node", "20.1.0"), step("node", "22.0.0")],
+            blocked: vec![blocked(
+                "xcode",
+                "xcode: parent 16, worker -".into(),
+                "x".into(),
+            )],
+        };
+        let got = verify(&installed, again);
+        let subjects: Vec<_> = got.iter().map(|b| b.subject.as_str()).collect();
+        // node 22 was not installed by this sync, so it is not "still missing".
+        assert_eq!(subjects, ["node", "xcode"]);
+        assert!(got[0]
+            .missing
+            .contains("node 20.1.0 is still missing after its install"));
+        assert!(verify(&installed, SyncPlan::default()).is_empty());
+        assert!(verify(
+            &[],
+            SyncPlan {
+                install: vec![step("node", "1.0.0")],
+                blocked: vec![]
+            }
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn the_blocked_message_keeps_what_was_installed() {
+        let b = [blocked(
+            "xcode",
+            "xcode: parent 16, worker -".into(),
+            "install it".into(),
+        )];
+        assert_eq!(
+            render_blocked("w", &[], &b),
+            "worker w is not in sync (environment_mismatch):\n- xcode: parent 16, worker -: install it"
+        );
+        let text = render_blocked("w", &[step("node", "20.1.0"), step("rust", "1.80.0")], &b);
+        assert!(text.contains("\ninstalled before stopping: node 20.1.0, rust 1.80.0\n- xcode"));
     }
 
     #[test]
