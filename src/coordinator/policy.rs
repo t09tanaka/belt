@@ -313,6 +313,7 @@ mod tests {
                 shard_group: None,
                 joined: false,
                 join_failure: None,
+                rerun: false,
             }),
             toolchains: None,
             outputs: Vec::new(),

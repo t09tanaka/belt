@@ -36,6 +36,18 @@ const HELD: &str = "coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=1";
 const UNJOINED_SHARD: &str = "json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL
     AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0";
 
+/// The task `s` ended, as the progression reads it (`ci::advance::standing`):
+/// it was cancelled and no attempt counts for it, or the attempt that counts
+/// is terminal and its collection is closed.
+const ENDED_S: &str =
+    "((s.cancel_requested_at_ms IS NOT NULL AND NOT EXISTS (SELECT 1 FROM attempt aa
+        WHERE aa.task_id=s.task_id AND aa.retired=0 AND aa.generation>=s.min_generation))
+    OR EXISTS (SELECT 1 FROM attempt a JOIN collection x ON x.attempt_id=a.attempt_id
+        WHERE a.attempt_id=(SELECT aa.attempt_id FROM attempt aa
+            WHERE aa.task_id=s.task_id AND aa.retired=0 AND aa.generation>=s.min_generation
+            ORDER BY aa.generation DESC LIMIT 1)
+        AND a.state='terminal' AND x.closed_at_ms IS NOT NULL))";
+
 impl CoordinatorStore {
     /// The runs that have a task waiting for the jobs it needs, or a shard
     /// of a split job that is not joined yet (a failed shard may have to
@@ -107,17 +119,26 @@ impl CoordinatorStore {
     /// of it as joined, with what is wrong when the job is a failure, and
     /// record the event `ci_job_joined`, in one transaction. Returns whether
     /// anything changed (a job that is joined already is left as it is).
+    /// `rerun` names the shards (by their id in the plan) a retry of the run
+    /// runs again although their attempts succeeded.
+    ///
+    /// The caller read the shards before this: nothing is written unless
+    /// every shard of the job has ended now, in this transaction (a retry
+    /// in between let some run again, and the outcome that was read is of
+    /// attempts that no longer count).
     pub fn join_ci_shards(
         &self,
         run: &RunId,
         group: &str,
         failure: Option<&str>,
+        rerun: &[String],
         at_ms: u64,
     ) -> Result<bool> {
-        let (run, group, failure) = (
+        let (run, group, failure, rerun) = (
             run.to_string(),
             group.to_string(),
             failure.map(str::to_string),
+            rerun.to_vec(),
         );
         self.db.write(move |tx| {
             let changed = tx.execute(
@@ -126,19 +147,29 @@ impl CoordinatorStore {
                         THEN json_set(t.spec_json,'$.ci.joined',json('true'))
                         ELSE json_set(t.spec_json,'$.ci.joined',json('true'),'$.ci.join_failure',?3) END
                      WHERE t.run_id=?1 AND json_extract(t.spec_json,'$.ci.shard_group')=?2
-                     AND {UNJOINED_SHARD}"
+                     AND {UNJOINED_SHARD}
+                     AND NOT EXISTS (SELECT 1 FROM task s WHERE s.run_id=?1
+                        AND json_extract(s.spec_json,'$.ci.shard_group')=?2 AND NOT {ENDED_S})"
                 ),
                 params![run, group, failure],
             )?;
             if changed == 0 {
                 return Ok(false);
             }
+            for task in &rerun {
+                tx.execute(
+                    "UPDATE task SET spec_json=json_set(spec_json,'$.ci.rerun',json('true'))
+                     WHERE run_id=?1 AND json_extract(spec_json,'$.ci.shard_group')=?2
+                     AND json_extract(spec_json,'$.ci.task.task_id')=?3",
+                    params![run, group, task],
+                )?;
+            }
             common::append_event(
                 tx,
                 Some(&run),
                 None,
                 "ci_job_joined",
-                &serde_json::json!({ "job": group, "failure": failure }),
+                &serde_json::json!({ "job": group, "failure": failure, "rerun": rerun }),
                 at_ms,
             )?;
             Ok(true)

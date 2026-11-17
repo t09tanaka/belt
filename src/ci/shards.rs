@@ -93,6 +93,49 @@ pub fn shard_failed(outcomes: &[JobOutcome], receipt: Option<&ShardOutcome>) -> 
     outcomes.iter().any(|o| o.status == JobStatus::Failure) || receipt.is_some_and(receipt_failed)
 }
 
+/// Shard `at` of `group` passed, checked on its own: its job is a success,
+/// it left a receipt, no test of it failed, and (when it was given a list
+/// of tests) it reported exactly those, each once.
+pub fn verified(
+    group: &ShardGroup,
+    at: usize,
+    outcomes: &[JobOutcome],
+    receipt: Option<&ShardOutcome>,
+) -> bool {
+    let Some(receipt) = receipt else {
+        return false;
+    };
+    let mut reported: Vec<&String> = receipt.tests.iter().map(|t| &t.identity).collect();
+    reported.sort();
+    let own = group.assignments.get(at).filter(|given| !given.is_empty());
+    let exact = own.is_none_or(|given| {
+        let mut given: Vec<&String> = given.iter().collect();
+        given.sort();
+        given == reported
+    });
+    exact && !receipt_failed(receipt) && outcomes.iter().all(|o| o.status == JobStatus::Success)
+}
+
+/// The shards of a split job that ended as `job` which a retry of the run
+/// runs again whatever their attempts say: none when the job is no
+/// failure; else those that are not `verified` (in the order of the
+/// group's shards), and all of them when each one is (the shards disagree
+/// only together, so no one of them can be kept).
+pub fn rerun(group: &ShardGroup, verified: &[bool], job: JobStatus) -> Vec<String> {
+    if job != JobStatus::Failure {
+        return Vec::new();
+    }
+    let kept = |at: usize| verified.get(at) == Some(&true);
+    let all_kept = (0..group.shards.len()).all(kept);
+    group
+        .shards
+        .iter()
+        .enumerate()
+        .filter(|(at, _)| all_kept || !kept(*at))
+        .map(|(_, id)| id.clone())
+        .collect()
+}
+
 /// The shards of `group` to stop: with fail-fast, once a shard of it failed,
 /// every shard that has not ended. `ended` says of each shard that ended
 /// whether it failed.
@@ -182,7 +225,12 @@ pub fn diagnostic(problems: &[String]) -> Option<String> {
 /// together, and says what.
 pub fn join(group: &ShardGroup, parts: &[JobOutcome], receipts: &[ShardOutcome]) -> JobOutcome {
     let mut outcome = combine(&group.source_jobs.join("+"), parts);
-    if outcome.status == JobStatus::Success {
+    // A test that failed is a failure of the job, also when the step of its
+    // shard did not fail and the other shards were stopped for it.
+    let tests_failed = receipts.iter().any(receipt_failed);
+    if outcome.status == JobStatus::Success
+        || (tests_failed && outcome.status != JobStatus::Failure)
+    {
         if let Some(why) = diagnostic(&problems(group, parts, receipts)) {
             outcome.status = JobStatus::Failure;
             outcome.skipped = Some(why);
@@ -435,6 +483,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_shard_is_kept_by_a_retry_only_when_it_passed_on_its_own() {
+        let plan = split_plan(false);
+        let g = group(&plan);
+        let ok = [outcome("test", JobStatus::Success)];
+        let passed = receipt_of(g, 0, TestStatus::Passed);
+        assert!(verified(g, 0, &ok, Some(&passed)));
+        assert!(verified(g, 0, &[], Some(&passed)));
+        assert!(!verified(g, 0, &ok, None));
+        assert!(!verified(
+            g,
+            0,
+            &ok,
+            Some(&receipt_of(g, 0, TestStatus::Failed))
+        ));
+        for status in [JobStatus::Failure, JobStatus::Cancelled, JobStatus::Skipped] {
+            assert!(!verified(g, 0, &[outcome("test", status)], Some(&passed)));
+        }
+        // It did not report exactly what it was given: one test less, one
+        // more, one twice, or the tests of another shard.
+        let mut less = passed.clone();
+        less.tests.pop();
+        assert!(!verified(g, 0, &ok, Some(&less)));
+        let mut twice = passed.clone();
+        twice.tests.push(twice.tests[0].clone());
+        assert!(!verified(g, 0, &ok, Some(&twice)));
+        let mut other = receipt_of(g, 1, TestStatus::Passed);
+        assert!(!verified(g, 0, &ok, Some(&other)));
+        // The order of the report does not matter.
+        let mut turned = passed.clone();
+        turned.tests.reverse();
+        assert!(verified(g, 0, &ok, Some(&turned)));
+        // A shard that was given no list (the runner divides the tests
+        // itself) is not checked against one.
+        let mut native = g.clone();
+        native.assignments = vec![vec![], vec![]];
+        other.tests.pop();
+        assert!(verified(&native, 0, &ok, Some(&other)));
+        native.assignments.clear();
+        assert!(verified(&native, 0, &ok, Some(&other)));
+    }
+
+    #[test]
+    fn a_retry_runs_again_the_shards_that_did_not_pass_or_all_when_only_the_job_fails() {
+        let plan = split_plan(false);
+        let g = group(&plan);
+        let (a, b) = (g.shards[0].clone(), g.shards[1].clone());
+        assert_eq!(rerun(g, &[true, false], JobStatus::Failure), [b.as_str()]);
+        assert_eq!(rerun(g, &[false, true], JobStatus::Failure), [a.as_str()]);
+        let both = [a.as_str(), b.as_str()];
+        assert_eq!(rerun(g, &[false, false], JobStatus::Failure), both);
+        assert_eq!(rerun(g, &[true, true], JobStatus::Failure), both);
+        // A shard nothing is known of is not kept.
+        assert_eq!(rerun(g, &[true], JobStatus::Failure), [b.as_str()]);
+        assert_eq!(rerun(g, &[], JobStatus::Failure), both);
+        for job in [JobStatus::Success, JobStatus::Cancelled, JobStatus::Skipped] {
+            assert!(rerun(g, &[false, false], job).is_empty());
+        }
+    }
+
+    #[test]
     fn fail_fast_stops_the_shards_that_have_not_ended_once_one_failed() {
         let plan = split_plan(true);
         let g = group(&plan);
@@ -585,6 +693,17 @@ pub(crate) mod tests {
             receipt_of(g, 0, TestStatus::Failed),
             receipt_of(g, 1, TestStatus::Passed),
         ];
+        // A shard whose tests failed although its step did not, while the
+        // other was stopped: the job is a failure, and says of what.
+        let job = join(g, &cancelled, &failed[..1]);
+        assert_eq!(job.status, JobStatus::Failure);
+        assert!(job.skipped.unwrap().contains("failed: "));
+        let mut skipped = ok.clone();
+        skipped
+            .iter_mut()
+            .for_each(|o| o.status = JobStatus::Skipped);
+        assert_eq!(join(g, &skipped, &failed).status, JobStatus::Failure);
+        assert_eq!(join(g, &skipped, &both[..1]).status, JobStatus::Skipped);
         let mut parts = ok.clone();
         parts[0].status = JobStatus::Failure;
         let job = join(g, &parts, &failed);

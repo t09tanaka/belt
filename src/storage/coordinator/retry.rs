@@ -39,6 +39,9 @@ struct Scan {
 struct TaskRow {
     /// It was cancelled by fail-fast before it was ever placed.
     stopped_unplaced: bool,
+    /// A shard of a failed split job that did not pass on its own, whatever
+    /// its attempt says (`ci.rerun`).
+    rerun: bool,
     task: String,
     min: i64,
     generation: Option<i64>,
@@ -234,7 +237,7 @@ impl CoordinatorStore {
 /// task that is no shard.
 fn unjoin(c: &Connection, task: &str) -> Result<()> {
     c.execute(
-        "UPDATE task SET spec_json=json_remove(spec_json,'$.ci.joined','$.ci.join_failure')
+        "UPDATE task SET spec_json=json_remove(spec_json,'$.ci.joined','$.ci.join_failure','$.ci.rerun')
          WHERE run_id=(SELECT run_id FROM task WHERE task_id=?1)
          AND json_extract(spec_json,'$.ci.shard_group')=
              (SELECT json_extract(spec_json,'$.ci.shard_group') FROM task WHERE task_id=?1)",
@@ -286,7 +289,8 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                 "SELECT t.task_id,t.min_generation,a.generation,a.state,a.observation,a.termination_json,a.retired,
                  EXISTS(SELECT 1 FROM attempt x LEFT JOIN retire_tombstone z USING(attempt_id) WHERE x.task_id=t.task_id AND x.retired=0 AND (x.state<>'terminal' OR (z.attempt_id IS NOT NULL AND z.confirmed_at_ms IS NULL))),
                  json_extract(t.spec_json,'$.manifest_digest'),json_extract(t.spec_json,'$.has_secret_bundle'),coalesce(json_extract(t.spec_json,'$.in_place'),0),
-                 t.cancel_requested_at_ms IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.unrunnable'),'')=?5
+                 t.cancel_requested_at_ms IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.unrunnable'),'')=?5,
+                 coalesce(json_extract(t.spec_json,'$.ci.rerun'),0)
                  FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id ORDER BY aa.generation DESC LIMIT 1)
                  WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) AND t.task_id>?3 ORDER BY t.task_id LIMIT ?4",
             )?;
@@ -312,6 +316,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                         secret: r.get(9)?,
                         in_place: r.get(10)?,
                         stopped_unplaced: r.get(11)?,
+                        rerun: r.get(12)?,
                     })
                 },
             )?;
@@ -398,7 +403,10 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
             hash.update(generation.to_be_bytes());
             hash.update(row.min.to_be_bytes());
             hash.update([u8::from(flag), u8::from(row.in_place)]);
-            if binding.selected.is_none() && term.outcome() == Outcome::Succeeded {
+            // A shard whose attempt succeeded is kept only when it passed on
+            // its own: one whose tests failed, or that did not report them
+            // all, runs again with the rest of its failed job.
+            if binding.selected.is_none() && term.outcome() == Outcome::Succeeded && !row.rerun {
                 continue;
             }
             let next = generation

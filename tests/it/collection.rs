@@ -4210,6 +4210,32 @@ async fn a41_fail_fast_reaches_a_shard_that_was_never_placed_in_a_job_nothing_wa
     let snapshot = c.store().completion(target.clone()).unwrap();
     assert!(snapshot.settled());
     assert!(snapshot.exit_code().is_some_and(|code| code != 0));
+    // A retry of that shard alone: it has no attempt, so the retry names no
+    // generation, and the result of the run can still be read. While the
+    // failure stands, fail-fast stops it again (still never placed).
+    let alone = Target::Task(waiting.clone());
+    let prepared = match c
+        .store()
+        .prepare_retry(alone, snapshot.control_revision, "alone".into())
+    {
+        Ok(remote_task_runner::storage::RetryPreparation::Prepared(prepared)) => prepared,
+        Ok(_) => panic!("a first request is no replay"),
+        Err(e) => panic!("{e}"),
+    };
+    let receipt = c.store().commit_retry(prepared, false, wall_ms()).unwrap();
+    assert_eq!((receipt.task_count, receipt.min_generation), (1, None));
+    let open = c.store().completion(target.clone()).unwrap();
+    assert!(!open.settled() && open.exit_code().is_none());
+    let rows = c.store().ci_run_tasks(&run).unwrap();
+    let row = rows.iter().find(|r| r.task_id == waiting).unwrap();
+    assert!(!row.cancelled && row.attempt.is_none());
+    let pass = ci_advance(&fx, &c);
+    assert_eq!(pass.stopped, vec![waiting.clone()]);
+    // The pass after sees it ended, and the job has its outcome again.
+    assert_eq!(ci_advance(&fx, &c).joined, vec![group.id.clone()]);
+    let snapshot = c.store().completion(target.clone()).unwrap();
+    assert!(snapshot.settled());
+
     // A retry of the run takes the shard that never ran back into the
     // queue, with the failed one and the ones that were stopped.
     let prepared =
@@ -4313,6 +4339,62 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
             assert_eq!(joined[0].payload["failure"], why);
             // The shard itself passed.
             assert_eq!(c.store().completion(shard).unwrap().exit_code(), Some(0));
+
+            // A retry of the run: every attempt succeeded, yet the shard
+            // that did not report all of its tests runs again. The other,
+            // which passed on its own, is kept.
+            let of = |at: usize| {
+                let rows = c.store().ci_run_tasks(&run).unwrap();
+                let row = rows
+                    .into_iter()
+                    .find(|r| r.task_id == ids[&group.shards[at]]);
+                row.unwrap()
+            };
+            assert!(of(0).spec["ci"].get("rerun").is_none());
+            assert_eq!(of(1).spec["ci"]["rerun"], true);
+            let prepared = match c.store().prepare_retry(
+                target.clone(),
+                after.control_revision,
+                "again".into(),
+            ) {
+                Ok(remote_task_runner::storage::RetryPreparation::Prepared(p)) => p,
+                Ok(_) => panic!("a first request is no replay"),
+                Err(e) => panic!("{e}"),
+            };
+            let receipt = c.store().commit_retry(prepared, false, wall_ms()).unwrap();
+            assert_eq!(receipt.task_count, 1);
+            assert!(of(0).attempt.is_some() && of(1).attempt.is_none());
+            for at in [0, 1] {
+                let ci = &of(at).spec["ci"];
+                assert!(ci.get("joined").is_none() && ci.get("join_failure").is_none());
+                assert!(ci.get("rerun").is_none());
+            }
+            assert!(!c.store().completion(target.clone()).unwrap().settled());
+            // An outcome that was read before the retry is not written over
+            // the shard that runs again.
+            let stale = c
+                .store()
+                .join_ci_shards(&run, &group.id, Some("stale"), &[], wall_ms())
+                .unwrap();
+            assert!(!stale);
+            assert!(of(0).spec["ci"].get("joined").is_none());
+            assert!(ci_advance(&fx, &c).joined.is_empty());
+            let again = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
+            assert_eq!(again.keys().collect::<Vec<_>>(), [&group.shards[1]]);
+            let result = shard_result(&group, 1, "success", "passed", None);
+            end_shard(
+                &c,
+                &files,
+                &again[&group.shards[1]],
+                Outcome::Succeeded,
+                &result,
+            )
+            .await;
+            assert_eq!(ci_advance(&fx, &c).joined, vec![group.id.clone()]);
+            let done = c.store().completion(target.clone()).unwrap();
+            assert_eq!(done.exit_code(), Some(0));
+            assert!(of(1).spec["ci"].get("rerun").is_none());
+            continue;
         } else {
             assert_eq!(after.exit_code(), Some(0));
             assert!(rows
@@ -4357,4 +4439,93 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
     assert!(after.settled());
     assert_eq!(after.exit_code(), Some(1));
     assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
+}
+
+/// A41: what a run failed of is the shard that failed, not a shard that
+/// fail-fast only stopped, wherever their ids sort. When the failed shard's
+/// attempt succeeded and only its tests failed, the run is a failure of the
+/// job, and a retry of the run runs that shard again with the stopped ones
+/// (it would otherwise stop them again for ever).
+#[tokio::test]
+async fn a41_a_run_fails_of_the_failed_shard_and_a_retry_runs_a_shard_whose_tests_failed_again() {
+    use remote_task_runner::service::completion::Target;
+    let discovered = listed(&["a", "b", "c", "d", "e", "f"]);
+    let adapter = CargoTest::new("1.91.0", &[], Safety::default());
+    let opts = PartitionOpts::default();
+    let only = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+    for tests_only in [false, true] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let whole = ci_plan(only);
+        let shards = partition_tests(&adapter, &discovered, &History::default(), 3, &opts);
+        let plan = whole
+            .with_shards(&[split_request(&whole, shards, &discovered, true)])
+            .unwrap();
+        let group = split_group(&plan);
+        let (run, ids) = ci_run_by_task(&fx, &c, &plan).await;
+        let target = Target::Run(run.clone());
+        let placed = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
+        // The shard that fails is the one whose task id sorts last: the
+        // stopped ones are read first.
+        let at = (0..3)
+            .max_by_key(|at| ids[&group.shards[*at]].clone())
+            .unwrap();
+        let failing = ids[&group.shards[at]].clone();
+        let (outcome, job) = if tests_only {
+            (Outcome::Succeeded, "success")
+        } else {
+            (Outcome::Failed, "failure")
+        };
+        let failed = shard_result(&group, at, job, "failed", None);
+        end_shard(&c, &files, &placed[&group.shards[at]], outcome, &failed).await;
+        assert_eq!(ci_advance(&fx, &c).stopped.len(), 2);
+        let mut joined = false;
+        for _ in 0..4 {
+            c.tick().await.unwrap();
+            collect(&c, &files).await;
+            joined |= !ci_advance(&fx, &c).joined.is_empty();
+        }
+        assert!(joined);
+        let snapshot = c.store().completion(target.clone()).unwrap();
+        assert!(snapshot.settled());
+        let own = c.store().completion(Target::Task(failing.clone())).unwrap();
+        if !tests_only {
+            // The exit code of the attempt that failed.
+            let failure = snapshot.first_compute_failure.clone().unwrap();
+            assert_eq!(failure.task_id, failing);
+            assert_eq!(snapshot.exit_code(), own.exit_code());
+            assert!(own.exit_code().is_some_and(|code| code != 0));
+            continue;
+        }
+        assert_eq!(own.exit_code(), Some(0));
+        assert_eq!(snapshot.exit_code(), Some(1));
+
+        let prepared =
+            match c
+                .store()
+                .prepare_retry(target.clone(), snapshot.control_revision, "again".into())
+            {
+                Ok(remote_task_runner::storage::RetryPreparation::Prepared(p)) => p,
+                Ok(_) => panic!("a first request is no replay"),
+                Err(e) => panic!("{e}"),
+            };
+        let receipt = c.store().commit_retry(prepared, false, wall_ms()).unwrap();
+        assert_eq!(receipt.task_count, 3, "the failed shard too");
+        let pass = ci_advance(&fx, &c);
+        assert!(
+            pass.stopped.is_empty(),
+            "the failure does not stand any more"
+        );
+        let again = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
+        assert_eq!(again.len(), 3);
+        for (n, id) in group.shards.iter().enumerate() {
+            let result = shard_result(&group, n, "success", "passed", None);
+            end_shard(&c, &files, &again[id], Outcome::Succeeded, &result).await;
+        }
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.joined, vec![group.id.clone()]);
+        assert!(pass.stopped.is_empty());
+        let done = c.store().completion(target).unwrap();
+        assert_eq!(done.exit_code(), Some(0));
+    }
 }

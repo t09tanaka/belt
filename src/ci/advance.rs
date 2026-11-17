@@ -311,8 +311,9 @@ fn advance_run(
             let problems = progress.split_job_problems(&group.id);
             problems.unwrap_or("a shard of the job failed").to_string()
         });
+        let rerun = progress.split_job_rerun(&group.id);
         let changed = store
-            .join_ci_shards(run, &group.id, failure.as_deref(), now_ms)
+            .join_ci_shards(run, &group.id, failure.as_deref(), rerun, now_ms)
             .map_err(fault)?;
         if changed {
             pass.joined.push(group.id.clone());

@@ -169,6 +169,12 @@ pub struct CiSpec {
     /// even when the attempt of every shard is.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub join_failure: Option<String>,
+    /// The split job is a failure and this shard is one a retry of the run
+    /// runs again although its attempt succeeded: its tests failed, it left
+    /// no receipt, or it did not report exactly the tests it was given
+    /// (`ci::shards::rerun`). A retry takes it away.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub rerun: bool,
 }
 
 /// The one place an [`AttemptPayload`] is made.

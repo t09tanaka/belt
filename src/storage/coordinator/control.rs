@@ -240,10 +240,15 @@ fn completion_on(
     } else {
         ("", "NULL")
     };
-    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
+    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
     let mut stmt = c.prepare(&sql)?;
     // The first shard of a split job that is a failure (see below).
     let mut job_failed = None;
+    // Shards that were cancelled (stopped by fail-fast), and the first task
+    // that failed of itself: unless the run was cancelled as a whole, the
+    // run failed of the latter, wherever the ids of the former sort.
+    let mut stopped_shards = std::collections::BTreeSet::new();
+    let mut real_failure = None;
     let whole_run = task.is_none();
     let mut rows = stmt.query(params![run, task])?;
     while let Some(row) = rows.next()? {
@@ -261,7 +266,7 @@ fn completion_on(
                     .map_err(|e| StorageError::Corrupt(e.to_string()))
             })
             .transpose()?;
-        let termination = termination
+        let termination: Option<Termination> = termination
             .map(|value| from_json("termination", &value))
             .transpose()?;
         if collection
@@ -279,8 +284,33 @@ fn completion_on(
         if whole_run && row.get::<_, bool>(8)? && job_failed.is_none() {
             job_failed = Some((task.clone(), termination));
         }
+        let shard: bool = row.get(9)?;
+        let was_cancelled = match (&state, &termination) {
+            (None, _) => cancel,
+            (_, Some(t)) => t.outcome() == crate::state::Outcome::Cancelled,
+            _ => false,
+        };
+        if shard && was_cancelled {
+            stopped_shards.insert(task.clone());
+        } else if real_failure.is_none() {
+            let failed =
+                termination.filter(|t| crate::service::completion::compute_failure(*t).is_some());
+            real_failure = failed.map(|t| (task.clone(), t));
+        }
         let collection = collection.as_deref().filter(|_| !(whole_run && unjoined));
         snapshot.task(task, state, observation, termination, cancel, collection);
+    }
+    let first_is_stopped_shard = snapshot
+        .first_compute_failure
+        .as_ref()
+        .is_some_and(|f| stopped_shards.contains(&f.task_id));
+    if whole_run && !cancelled && first_is_stopped_shard {
+        match real_failure {
+            Some((task, termination)) => snapshot.prefer_failure(task, termination),
+            // No attempt failed of itself: the job did (its tests).
+            None if job_failed.is_some() => snapshot.first_compute_failure = None,
+            None => {}
+        }
     }
     if let Some((task, termination)) = job_failed {
         snapshot.job_failure(task, termination);

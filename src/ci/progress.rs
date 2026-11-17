@@ -126,6 +126,8 @@ pub struct NeedsProgression {
     joins: BTreeMap<String, JobOutcome>,
     /// What is wrong with the shards of such a job taken together.
     diagnostics: BTreeMap<String, String>,
+    /// The shards of such a job a retry of the run runs again.
+    reruns: BTreeMap<String, Vec<String>>,
     /// The shards a `Cancel` action was made for.
     stopped: BTreeSet<String>,
     cancelled: bool,
@@ -157,6 +159,7 @@ impl NeedsProgression {
             receipts: BTreeMap::new(),
             joins: BTreeMap::new(),
             diagnostics: BTreeMap::new(),
+            reruns: BTreeMap::new(),
             stopped: BTreeSet::new(),
             cancelled: false,
             finished: false,
@@ -182,6 +185,13 @@ impl NeedsProgression {
     /// without a result), once all of them ended. `None` when nothing is.
     pub fn split_job_problems(&self, group: &str) -> Option<&str> {
         self.diagnostics.get(group).map(String::as_str)
+    }
+
+    /// The shards of the split job `group` that a retry of the run runs
+    /// again although their attempts may have succeeded
+    /// ([`shards::rerun`]); none before the job has its outcome.
+    pub fn split_job_rerun(&self, group: &str) -> &[String] {
+        self.reruns.get(group).map_or(&[], Vec::as_slice)
     }
 
     pub fn is_settled(&self, task: &str) -> bool {
@@ -235,6 +245,17 @@ impl NeedsProgression {
                     .cloned()
                     .collect();
                 let job = shards::join(group, &parts, &receipts);
+                let verified: Vec<bool> = group
+                    .shards
+                    .iter()
+                    .enumerate()
+                    .map(|(at, s)| {
+                        let outcomes = self.settled.get(s).map_or(&[][..], Vec::as_slice);
+                        shards::verified(group, at, outcomes, self.receipts.get(s))
+                    })
+                    .collect();
+                let rerun = shards::rerun(group, &verified, job.status);
+                self.reruns.insert(group.id.clone(), rerun);
                 self.joins.insert(group.id.clone(), job);
                 let problems = shards::problems(group, &parts, &receipts);
                 if let Some(why) = shards::diagnostic(&problems) {
@@ -755,6 +776,7 @@ mod tests {
         let job = p.outcome(&g.workflow, "test").unwrap().clone();
         assert_eq!(job.status, JobStatus::Success);
         assert_eq!(p.split_job_problems(&g.id), None);
+        assert!(p.split_job_rerun(&g.id).is_empty());
         assert_eq!(job.outputs["v"], "1");
         let actions = p.pending_actions().to_vec();
         assert_eq!(actions.len(), 1);
@@ -794,6 +816,9 @@ mod tests {
         let why = job.skipped.clone().unwrap();
         assert!(why.contains("missing: shard"), "{why}");
         assert_eq!(p.split_job_problems(&g.id), Some(why.as_str()));
+        // The shard without a receipt of its own is the one to run again.
+        assert_eq!(p.split_job_rerun(&g.id), [g.shards[1].clone()]);
+        assert!(p.split_job_rerun("another").is_empty());
         assert_eq!(p.split_job_problems("another"), None);
         // What needs the job is given the failure.
         let last = p.pending_actions().last().unwrap();

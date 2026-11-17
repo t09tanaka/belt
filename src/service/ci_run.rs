@@ -122,6 +122,7 @@ pub fn task_specs(
                         .map(|group| group.id.clone()),
                     joined: false,
                     join_failure: None,
+                    rerun: false,
                 }),
                 toolchains: None,
                 requirements: requirements.clone(),

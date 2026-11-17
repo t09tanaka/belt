@@ -271,6 +271,7 @@ fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
             shard_group: None,
             joined: false,
             join_failure: None,
+            rerun: false,
         }),
         commands: vec![],
         ..spec()
