@@ -2329,16 +2329,15 @@ fn diff_of_every_worker_asks_them_at_the_same_time_and_keeps_the_order() {
         // service installation in the shared fixture home.
         w.add(name, Some(host), false).unwrap();
     }
-    let reply = format!(
-        "{}\n",
-        serde_json::json!({"ok": true, "env": parent_report()})
-    );
+    let mut measured = parent_report();
+    measured.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
+    let reply = format!("{}\n", serde_json::json!({"ok": true, "env": &measured}));
     let mut together = Together {
         // Nobody is answered before all three are asking: a serial run fails.
         gate: Some(meeting::Gate::new(3)),
         reply: reply.into_bytes(),
     };
-    let all = diff_workers(&mut together, &w.env, &w.exe, None, || Ok(parent_report())).unwrap();
+    let all = diff_workers(&mut together, &w.env, &w.exe, None, || Ok(measured.clone())).unwrap();
     assert_eq!(
         all.iter().map(|d| d.worker.as_str()).collect::<Vec<_>>(),
         ["mini-a", "mini-b", "mini-c"]
@@ -2350,7 +2349,7 @@ fn diff_of_every_worker_asks_them_at_the_same_time_and_keeps_the_order() {
     // A named worker is one ask: no gate of three is waited for.
     together.gate = None;
     let one = diff_workers(&mut together, &w.env, &w.exe, Some("mini-b"), || {
-        Ok(parent_report())
+        Ok(measured)
     })
     .unwrap();
     assert_eq!(one.len(), 1);
