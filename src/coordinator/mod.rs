@@ -1945,6 +1945,34 @@ impl Coordinator {
     /// No worker could be chosen for a task: keep why, and record it on the
     /// run when it is news.
     async fn note_waiting(&self, task: &QueuedTask, decision: &Decision) -> Result<()> {
+        // Old CI workers can still run the original job. An explicit fleet-wide
+        // discovery feature refusal settles its optional probe; a transient
+        // outage, full worker or missing forecast leaves it waiting.
+        if !decision.excluded.is_empty()
+            && decision.excluded.iter().all(|worker| {
+                worker.why == Exclusion::CapabilityMismatch
+                    && worker
+                        .unmet
+                        .iter()
+                        .any(|why| why == policy::DISCOVERY_UNMET)
+            })
+            && task
+                .spec
+                .pointer("/ci/task")
+                .and_then(|t| serde_json::from_value::<crate::wire::CiTask>(t.clone()).ok())
+                .is_some_and(|task| crate::wire::is_discovery_task(&task))
+        {
+            let (run, id) = (task.run_id.clone(), task.task_id.clone());
+            self.db(move |s| {
+                s.fail_ci_tasks(
+                    &run,
+                    Some(&id),
+                    "workers do not support runner discovery",
+                    wall_ms(),
+                )
+            })
+            .await?;
+        }
         if !self.sched.note_waiting(&task.task_id, decision) {
             return Ok(());
         }

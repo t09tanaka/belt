@@ -256,6 +256,7 @@ pub fn unmet_ci(spec: &super::TaskSpec, link: &dyn super::WorkerLink) -> Option<
     None
 }
 
+pub const DISCOVERY_UNMET: &str = "protocol feature ci_discovery_v1";
 pub const CI_TASK_UNMET: &str = "protocol feature ci_task_v1";
 
 /// Is a worker left out of the placement of `spec` because the task is a CI
@@ -277,7 +278,7 @@ pub fn missing_ci_feature(
         .as_ref()
         .is_some_and(|s| crate::wire::requires_discovery_feature(&s.task))
         && !discovery)
-        .then_some("protocol feature ci_discovery_v1")
+        .then_some(DISCOVERY_UNMET)
 }
 
 /// The result of a CI task is one more required artifact of its attempt: do
