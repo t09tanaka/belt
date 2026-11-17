@@ -117,6 +117,7 @@ pub fn execute_task(
                 job_timeout_min: JOB_TIMEOUT_MINUTES,
                 keep: true,
                 trash: paths.trash.clone(),
+                all_os_legs: false,
             };
             local_ci::source_execute::execute_pinned_task(
                 &ctx,
