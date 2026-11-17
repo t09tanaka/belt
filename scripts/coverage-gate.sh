@@ -10,13 +10,23 @@ mkdir -p target
 # fails, dropped when it passes.
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
-if ! cargo llvm-cov --json --output-path target/llvm-cov.json >"$log"; then
+# Measure first, report after: a test may stop an instrumented child (the
+# daemon, a worker, a supervisor) while it is still writing its .profraw at
+# exit, and one such truncated file makes the whole merge fail. The corrupt
+# files are named and dropped between the two steps, within a bound.
+if ! cargo llvm-cov --no-report >"$log"; then
   echo "coverage run failed" >&2
   grep -E '^test .* \.\.\. FAILED$' "$log" >&2 || true
   # each "failures:" section: the output of every failed test, then its list
   awk '/^failures:$/ { show = 1 } show { print } /^test result:/ { show = 0 }' "$log" >&2
   # no failed test in the log: the build or the harness failed, say how
   grep -q '^test result: FAILED' "$log" || tail -n 40 "$log" >&2
+  exit 1
+fi
+scripts/drop-corrupt-profraw.sh
+if ! cargo llvm-cov report --json --output-path target/llvm-cov.json >"$log" 2>&1; then
+  echo "coverage report failed" >&2
+  tail -n 40 "$log" >&2
   exit 1
 fi
 python3 - <<'PY'
