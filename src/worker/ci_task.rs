@@ -510,6 +510,7 @@ pub fn prepare(
     let ci_source_id = ci_id_of(&payload.source_id)
         .ok_or_else(|| invalid("the source of the attempt has no captured id"))?;
     Ok(CiTaskSpec {
+        artifact_workflow: task.artifact_workflow.clone(),
         dispatch: task.dispatch.clone(),
         plan_path,
         plan_digest: task.plan_digest.clone(),
@@ -666,6 +667,7 @@ mod tests {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
             ci_task: Some(CiTask {
+                artifact_workflow: None,
                 dispatch: None,
                 plan_digest: digest.clone(),
                 task_id: task_of(&f.plan, job).to_string(),

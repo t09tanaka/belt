@@ -107,6 +107,23 @@ pub async fn serve_connection_offering(
         let agent = agent.clone();
         let negotiated_features = negotiated_features.clone();
         tokio::spawn(async move {
+            let uses_workflow_artifacts = matches!(
+                &request,
+                crate::wire::Request::WorkflowArtifact(_)
+            ) || matches!(&request, crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.as_ref().is_some_and(|ci| ci.artifact_workflow.is_some()));
+            if uses_workflow_artifacts
+                && !negotiated_features
+                    .iter()
+                    .any(|f| f == crate::wire::WORKFLOW_ARTIFACTS_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "workflow artifact exchange was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
             if matches!(&request, crate::wire::Request::PreparationProbe(_))
                 && !negotiated_features
                     .iter()

@@ -23,6 +23,116 @@ pub struct WorkflowUpload<'a> {
 }
 
 impl CoordinatorStore {
+    pub(crate) fn reserve_workflow_files(
+        &self,
+        producer: &AttemptId,
+        files: Vec<Digest>,
+        at_ms: u64,
+    ) -> Result<()> {
+        let producer = producer.clone();
+        self.db.write(move |tx| {
+            for digest in files {
+                let locator = ResultStore::artifact_locator(&producer, &digest);
+                add_ref(
+                    tx,
+                    producer.as_str(),
+                    &ResultRef {
+                        ref_id: format!("ci-artifact/{producer}/{digest}"),
+                        kind: BlobKind::Result,
+                        locator,
+                    },
+                    at_ms,
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) fn state_dir(&self) -> &std::path::Path {
+        &self.state_dir
+    }
+
+    pub(crate) fn workflow_download(
+        &self,
+        run: &RunId,
+        workflow: &str,
+        consumer: &AttemptId,
+        key: &Digest,
+        name: Option<String>,
+        pattern: Option<String>,
+    ) -> Result<Vec<serde_json::Value>> {
+        let (run, workflow, consumer, key) = (
+            run.to_string(),
+            workflow.to_owned(),
+            consumer.to_string(),
+            key.to_string(),
+        );
+        self.db.write(move|tx| {
+            let fp=serde_json::to_string(&(&run,&workflow,&name,&pattern)).map_err(|e|StorageError::Invalid(e.to_string()))?;
+            if let Some((prior,selection))=tx.query_row(
+                "SELECT fingerprint,selection_json FROM workflow_download WHERE consumer=?1 AND action_key=?2",
+                params![consumer,key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
+                if prior!=fp {return Err(StorageError::Invalid("artifact download replay changed".into()));}
+                return serde_json::from_str(&selection).map_err(|e|StorageError::Corrupt(e.to_string()));
+            }
+            let mut q=tx.prepare("SELECT name,producer,receipt_json FROM workflow_artifact a
+                WHERE run_id=?1 AND workflow=?2 AND version=(SELECT max(version) FROM workflow_artifact v
+                WHERE v.run_id=a.run_id AND v.workflow=a.workflow AND v.name=a.name) ORDER BY name LIMIT 1025")?;
+            let mut all=std::collections::BTreeMap::new();
+            for row in q.query_map(params![run,workflow],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?)))? {
+                let (name,producer,receipt)=row?;
+                all.insert(name,(producer,receipt));
+            }
+            if all.len()>1024 {return Err(StorageError::Invalid("too many artifacts in workflow".into()));}
+            let names=all.keys().cloned().collect::<Vec<_>>();
+            let selected=local_ci::artifact::select_artifacts(&names,name.as_deref(),pattern.as_deref()).map_err(StorageError::Invalid)?;
+            let mut entries=Vec::new();
+            let mut bytes=0usize;
+            for n in selected {
+                let (producer,receipt)=&all[&n];
+                bytes+=receipt.len()+producer.len()+64;
+                if bytes>crate::ci::artifact_exchange::MAX_MESSAGE/2 {return Err(StorageError::Invalid("selected artifact catalog exceeds transfer limit".into()));}
+                let receipt:serde_json::Value=serde_json::from_str(receipt).map_err(|e|StorageError::Corrupt(e.to_string()))?;
+                entries.push(serde_json::json!({"producer":producer,"receipt":receipt}));
+            }
+            let json=serde_json::to_string(&entries).map_err(|e|StorageError::Corrupt(e.to_string()))?;
+            tx.execute("INSERT INTO workflow_download VALUES(?1,?2,?3,?4)",params![consumer,key,fp,json])?;
+            Ok(entries)
+        })
+    }
+
+    pub(crate) fn workflow_version(
+        &self,
+        run: &RunId,
+        workflow: &str,
+        name: &str,
+        version: u32,
+        producer: &AttemptId,
+    ) -> Result<Receipt> {
+        let (run, workflow, name, producer) = (
+            run.to_string(),
+            workflow.to_owned(),
+            name.to_owned(),
+            producer.to_string(),
+        );
+        self.db.call(move |c| {
+            let raw: Option<String> = c
+                .query_row(
+                    "SELECT receipt_json FROM workflow_artifact
+                WHERE run_id=?1 AND workflow=?2 AND name=?3 AND version=?4 AND producer=?5",
+                    params![run, workflow, name, version, producer],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            serde_json::from_str(
+                &raw.ok_or_else(|| {
+                    StorageError::Invalid("no such workflow artifact version".into())
+                })?,
+            )
+            .map_err(|e| StorageError::Corrupt(e.to_string()))
+        })
+    }
+
     /// Called only after the collector has sealed every file in the result
     /// store. The version, action replay identity and GC references are one
     /// transaction, including across coordinator restarts.

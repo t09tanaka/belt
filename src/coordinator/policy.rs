@@ -241,6 +241,14 @@ pub fn unmet_ci(spec: &super::TaskSpec, link: &dyn super::WorkerLink) -> Option<
     {
         return Some("protocol feature ci_matrix_dispatch_v1");
     }
+    if spec
+        .ci
+        .as_ref()
+        .is_some_and(|ci| ci.task.artifact_workflow.is_some())
+        && !link.workflow_artifacts_negotiated()
+    {
+        return Some("protocol feature ci_workflow_artifacts_v1");
+    }
     None
 }
 
@@ -321,6 +329,7 @@ mod tests {
                 core_outcome: None,
                 matrix: None,
                 task: crate::wire::CiTask {
+                    artifact_workflow: None,
                     dispatch: None,
                     plan_digest: digest.clone(),
                     task_id: "ci.yml/build".into(),

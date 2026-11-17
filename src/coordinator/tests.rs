@@ -267,6 +267,7 @@ fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
             core_outcome: None,
             matrix: None,
             task: crate::wire::CiTask {
+                artifact_workflow: None,
                 dispatch: None,
                 plan_digest: Digest::of_bytes(b"plan"),
                 task_id: "ci.yml/build".into(),

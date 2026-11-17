@@ -113,6 +113,11 @@ impl ResolvedConfig {
             .features
             .iter()
             .any(|feature| feature == crate::wire::ENV_SYNC_FEATURE);
+        let workflow_artifacts = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|f| f == crate::wire::WORKFLOW_ARTIFACTS_FEATURE);
         let matrix_dispatch = connected
             .negotiated
             .features
@@ -135,7 +140,8 @@ impl ResolvedConfig {
             .with_preparation_probe(probe)
             .with_env_sync(env_sync)
             .with_ci_task(ci_task)
-            .with_matrix_dispatch(matrix_dispatch),
+            .with_matrix_dispatch(matrix_dispatch)
+            .with_workflow_artifacts(workflow_artifacts),
         );
         coordinator.attach(id.clone(), link.clone()).await;
         Ok(link)

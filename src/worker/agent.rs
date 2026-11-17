@@ -2087,6 +2087,41 @@ impl Agent {
                 self.status(&rec).map(Response::GetAttempt)
             }
             Request::ListAttempts(r) => self.list(r).map(Response::ListAttempts),
+            Request::WorkflowArtifact(r) => {
+                let rec = self.known(&r.attempt_id)?;
+                Self::generation(&rec, r.generation)?;
+                if r.coordinator_epoch != session.coordinator_epoch
+                    || r.coordinator_epoch < self.store.max_coordinator_epoch().map_err(api)?
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::StaleEpoch,
+                        "artifact exchange from a stale coordinator",
+                    ));
+                }
+                if rec.retired
+                    || rec.cancel_requested_at_ms.is_some()
+                    || rec.state == AttemptState::Terminal
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::Conflict,
+                        "artifact attempt is no longer live",
+                    ));
+                }
+                let root = self
+                    .cfg
+                    .attempts_root()
+                    .join(r.attempt_id.as_str())
+                    .join("ci")
+                    .join("exchange");
+                crate::ci::artifact_exchange::respond(&root, r.command)
+                    .map(|result| {
+                        Response::WorkflowArtifact(crate::wire::WorkflowArtifactResponse {
+                            schema_version: SchemaVersion::CURRENT,
+                            result,
+                        })
+                    })
+                    .map_err(|e| invalid(e.to_string()))
+            }
             Request::RenewLease(r) => self.renew(r).map(Response::RenewLease),
             Request::CancelAttempt(r) => self.cancel(r).map(Response::CancelAttempt),
             Request::RetireAttempt(r) => self.retire(r).map(Response::RetireAttempt),

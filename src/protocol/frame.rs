@@ -78,7 +78,10 @@ impl Frame {
 pub fn kind_of_operation(op: Operation) -> StreamKind {
     match op {
         Operation::ReadLog => StreamKind::Log,
-        Operation::BlobPut | Operation::BlobGet | Operation::SecretBundlePut => StreamKind::Blob,
+        Operation::WorkflowArtifact
+        | Operation::BlobPut
+        | Operation::BlobGet
+        | Operation::SecretBundlePut => StreamKind::Blob,
         Operation::Hello
         | Operation::Inspect
         | Operation::Forecast
