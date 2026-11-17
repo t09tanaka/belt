@@ -2107,6 +2107,7 @@ fn a_run_of_ci_tasks_is_a_request_an_older_resident_refuses() {
             hold: false,
             steps: 1,
             unrunnable: None,
+            fail_fast_group: None,
         }),
         commands: vec![],
         ..delivery_spec(Digest::of_bytes(b"manifest"), false)

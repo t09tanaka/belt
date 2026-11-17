@@ -268,6 +268,7 @@ fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
             hold,
             steps,
             unrunnable: None,
+            fail_fast_group: None,
         }),
         commands: vec![],
         ..spec()
@@ -528,7 +529,7 @@ async fn a_ci_run_whose_plan_is_gone_ends_with_the_reason_instead_of_waiting() {
     let page = store.query_tasks(run.clone(), 16, None).unwrap();
     let reasons = page.items.iter().filter(|t| t.unrunnable.is_some()).count();
     assert_eq!(reasons, 2);
-    let lines = crate::service::ci_run::job_lines(store, &results, &run).unwrap();
+    let lines = crate::service::ci_run::job_lines(store, &state, &results, &run).unwrap();
     let line = |task: &TaskId| lines.iter().find(|line| &line.task_id == task).unwrap();
     assert_eq!(line(&held).reason.as_deref(), Some(why.as_str()));
     assert_eq!(line(&placed).reason, None);

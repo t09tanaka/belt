@@ -310,6 +310,7 @@ mod tests {
                 hold: false,
                 steps: 1,
                 unrunnable: None,
+                fail_fast_group: None,
             }),
             toolchains: None,
             outputs: Vec::new(),

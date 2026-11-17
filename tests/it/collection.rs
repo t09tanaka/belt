@@ -411,6 +411,24 @@ impl Worker {
             // It has no estimate to give: the scheduler then places by what
             // the parent itself holds.
             Request::Forecast(_) => Err(err(ErrorCode::Internal)),
+            // A cancel stops the attempt at once; it leaves no result.
+            Request::CancelAttempt(r) => {
+                let job = s
+                    .jobs
+                    .get_mut(&r.attempt_id)
+                    .ok_or_else(|| err(ErrorCode::NotFound))?;
+                if job.state != AttemptState::Terminal {
+                    job.state = AttemptState::Terminal;
+                    job.termination = Some(ended(Outcome::Cancelled));
+                }
+                Ok(Response::CancelAttempt(CancelAttemptResponse {
+                    schema_version: SchemaVersion::CURRENT,
+                    attempt_id: r.attempt_id,
+                    phase: CancelPhase::Completed,
+                    state: Some(AttemptState::Terminal),
+                    tombstone: false,
+                }))
+            }
             other => panic!("not sent to this worker: {other:?}"),
         }
     }
@@ -427,6 +445,7 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
         Request::BlobGet(r) => ("blob", r.offset),
         Request::AckCollected(_) => ("ack", 0),
         Request::Forecast(_) => ("forecast", 0),
+        Request::CancelAttempt(_) => ("cancel", 0),
         other => panic!("{other:?}"),
     }
 }
@@ -3020,8 +3039,13 @@ async fn a38_a_job_that_needs_another_starts_elsewhere_once_the_result_is_here_a
     assert_eq!(ci_collect(&c, &files, &b).await.collected, vec![b]);
     let target = remote_task_runner::service::completion::Target::Run(run.clone());
     assert_eq!(c.store().completion(target).unwrap().exit_code(), Some(0));
-    let lines =
-        remote_task_runner::service::ci_run::job_lines(c.store(), files.root(), &run).unwrap();
+    let lines = remote_task_runner::service::ci_run::job_lines(
+        c.store(),
+        fx.dir.path(),
+        files.root(),
+        &run,
+    )
+    .unwrap();
     let seen: Vec<_> = lines
         .iter()
         .map(|l| (l.job.as_deref(), l.status.as_str()))
@@ -3093,8 +3117,13 @@ async fn a_ci_task_without_a_usable_result_is_no_success_and_the_next_job_sees_a
         let target = remote_task_runner::service::completion::Target::Run(run.clone());
         let exit = c.store().completion(target).unwrap().exit_code();
         assert!(exit.is_some_and(|code| code != 0), "{exit:?}");
-        let lines =
-            remote_task_runner::service::ci_run::job_lines(c.store(), files.root(), &run).unwrap();
+        let lines = remote_task_runner::service::ci_run::job_lines(
+            c.store(),
+            fx.dir.path(),
+            files.root(),
+            &run,
+        )
+        .unwrap();
         let test = lines
             .iter()
             .find(|l| l.job.as_deref() == Some("test"))
@@ -3218,8 +3247,13 @@ async fn a_ci_run_whose_plan_is_gone_cancels_what_waits_and_says_why() {
     let target = remote_task_runner::service::completion::Target::Run(run.clone());
     let snapshot = c.store().completion(target).unwrap();
     assert!(snapshot.settled());
-    let lines =
-        remote_task_runner::service::ci_run::job_lines(c.store(), files.root(), &run).unwrap();
+    let lines = remote_task_runner::service::ci_run::job_lines(
+        c.store(),
+        fx.dir.path(),
+        files.root(),
+        &run,
+    )
+    .unwrap();
     let seen: Vec<_> = lines
         .iter()
         .map(|l| (l.job.as_deref(), l.status.as_str(), l.reason.as_deref()))
@@ -3322,4 +3356,611 @@ async fn a_worker_that_did_not_take_the_plan_is_left_out_with_the_reason_until_i
         .excluded
         .iter()
         .all(|e| e.why != Exclusion::InputRefused));
+}
+
+// ---- S18: the shards of a split job (A39 to A41) ----
+
+use local_ci::dag::{NotSplit, ShardGroup, ShardRequest};
+use local_ci::shard::adapters::{CargoTest, Jest, Safety, Vitest};
+use local_ci::shard::{
+    partition_tests, Basis, Discovered, History, PartitionOpts, RunnerAdapter, ShardPlan,
+};
+
+fn split_workflow(run: &str) -> String {
+    format!(
+        "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: {run}\n  report:\n    needs: test\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo report\n"
+    )
+}
+
+fn listed(tests: &[&str]) -> Discovered {
+    Discovered {
+        tests: tests.iter().map(|t| t.to_string()).collect(),
+        complete: true,
+        blocked: vec![],
+    }
+}
+
+/// A request to split job `test` of `plan` as `shards` divides what was
+/// listed.
+fn split_request(
+    plan: &local_ci::FrozenPlan,
+    shards: ShardPlan,
+    discovered: &Discovered,
+    fail_fast: bool,
+) -> ShardRequest {
+    let task = plan.tasks.iter().find(|t| t.jobs == ["test"]).unwrap();
+    ShardRequest {
+        workflow: task.workflow.clone(),
+        job: "test".into(),
+        plan: shards,
+        step: 0,
+        dir: String::new(),
+        discovered: discovered.clone(),
+        fail_fast,
+    }
+}
+
+/// The one split job of `plan`. Fails the test when the request was
+/// refused: a test of shards must not pass on a job that was not split.
+fn split_group(plan: &local_ci::FrozenPlan) -> ShardGroup {
+    let split: Vec<&ShardGroup> = plan.shard_groups.iter().filter(|g| g.split).collect();
+    let reasons: Vec<_> = plan.shard_groups.iter().map(|g| &g.not_split).collect();
+    assert_eq!(split.len(), 1, "not split: {reasons:?}");
+    split[0].clone()
+}
+
+/// The result of shard `at` of `group`: its job with `status`, and its
+/// tests (those it was given, without `leave_out`) with `tests`.
+fn shard_result(
+    group: &ShardGroup,
+    at: usize,
+    status: &str,
+    tests: &str,
+    leave_out: Option<&str>,
+) -> Vec<u8> {
+    let task = &group.shards[at];
+    let mut result: serde_json::Value =
+        serde_json::from_slice(&ci_result(task, "test", status, json!({}))).unwrap();
+    let reported: Vec<serde_json::Value> = group.assignments[at]
+        .iter()
+        .filter(|t| Some(t.as_str()) != leave_out)
+        .map(|t| json!({"identity": t, "status": tests}))
+        .collect();
+    result["shard"] = json!({
+        "job_id": "test", "shard_id": task, "tests": reported,
+        "exit_ok": tests != "failed", "parsed": true,
+    });
+    serde_json::to_vec(&result).unwrap()
+}
+
+/// [`ci_run`], with the task ids by the id of the task in the plan.
+async fn ci_run_by_task(
+    fx: &Fx,
+    c: &Coordinator,
+    plan: &local_ci::FrozenPlan,
+) -> (RunId, BTreeMap<String, TaskId>) {
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
+    let manifest = Digest::of_bytes(b"manifest");
+    let none = Default::default();
+    let specs =
+        remote_task_runner::service::ci_run::task_specs(plan, &digest, &manifest, &none, None)
+            .unwrap();
+    let (run, source) = (RunId::generate(), SourceId::generate());
+    c.store().put_source_ref(&source, &manifest, 1).unwrap();
+    let mut ids = BTreeMap::new();
+    let mut tasks = Vec::new();
+    for (plan_task, spec) in specs {
+        let id = TaskId::generate();
+        ids.insert(plan_task, id.clone());
+        tasks.push((id, spec));
+    }
+    c.enqueue(run.clone(), source, tasks).await.unwrap();
+    (run, ids)
+}
+
+/// The attempts a tick placed, by the task of the plan each runs, and the
+/// worker that has it.
+fn placed_by_task(
+    workers: &[&Arc<Worker>],
+    placed: &[AttemptId],
+) -> BTreeMap<String, (AttemptId, Arc<Worker>)> {
+    let mut out = BTreeMap::new();
+    for a in placed {
+        let worker = workers
+            .iter()
+            .find(|w| w.state.lock().unwrap().jobs.contains_key(a))
+            .unwrap();
+        let task = worker.payload(a).ci_task.unwrap().task_id;
+        out.insert(task, (a.clone(), Arc::clone(worker)));
+    }
+    out
+}
+
+/// End the attempt of a shard on its worker with `result`, and collect it.
+async fn end_shard(
+    c: &Coordinator,
+    files: &Arc<ResultStore>,
+    placed: &(AttemptId, Arc<Worker>),
+    outcome: Outcome,
+    result: &[u8],
+) {
+    let (a, worker) = placed;
+    let p = worker.payload(a);
+    worker.finish(a, outcome, ci_out(a, &p, result));
+    assert_eq!(c.tick().await.unwrap().settled, vec![a.clone()]);
+    ci_collect(c, files, a).await;
+}
+
+fn ci_lines(
+    fx: &Fx,
+    c: &Coordinator,
+    files: &Arc<ResultStore>,
+    run: &RunId,
+) -> Vec<remote_task_runner::service::ci_run::JobLine> {
+    remote_task_runner::service::ci_run::job_lines(c.store(), fx.dir.path(), files.root(), run)
+        .unwrap()
+}
+
+/// A39: a job of Vitest (and of Jest) files is split by file. Every listed
+/// file is in exactly one shard and each shard is told its own files; the
+/// shards are placed side by side as tasks of their own; the job has one
+/// outcome only when all of them ended, made of every file exactly once;
+/// what needs the job starts then, once. A file that no shard reported
+/// makes the job a failure although every shard passed.
+#[tokio::test]
+async fn a39_file_shards_cover_every_test_once_and_add_up_to_one_job() {
+    use remote_task_runner::service::ci_run::Part;
+    let files_listed = [
+        "src/a.test.ts",
+        "src/b.test.ts",
+        "src/c.test.ts",
+        "src/d.test.ts",
+        "src/e.test.ts",
+    ];
+    let discovered = listed(&files_listed);
+    let runners: [(&str, Box<dyn RunnerAdapter>); 2] = [
+        (
+            "npx vitest run",
+            Box::new(Vitest::new("3.2.4", "/project", &[], Safety::default())),
+        ),
+        (
+            "npx jest",
+            Box::new(Jest::new("29.7.0", "/project", &[], Safety::default())),
+        ),
+    ];
+    for (omit, (command, adapter)) in [false, true].into_iter().zip(runners) {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let other = Worker::new("w-b");
+        c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+            .unwrap();
+        let whole = ci_plan(&split_workflow(command));
+        let opts = PartitionOpts::default();
+        let shards = partition_tests(adapter.as_ref(), &discovered, &History::default(), 2, &opts);
+        assert!(shards.verify(&discovered).is_ok());
+        let plan = whole
+            .with_shards(&[split_request(&whole, shards, &discovered, false)])
+            .unwrap();
+        let group = split_group(&plan);
+        assert_eq!(group.shards.len(), 2, "{command}");
+        // The file the second shard does not report, in the second round.
+        let left_out = omit.then(|| group.assignments[1][0].clone());
+        let leave_out = left_out.as_deref();
+
+        // The discovery and what each shard is told to run are the same
+        // files: every one in exactly one shard, and the task of a shard
+        // carries exactly its own.
+        let mut all: Vec<&str> = group
+            .assignments
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
+        all.sort();
+        assert_eq!(all, files_listed);
+        for (id, given) in group.shards.iter().zip(&group.assignments) {
+            let task = plan.task(id).unwrap();
+            assert_eq!(&task.shard.as_ref().unwrap().tests, given);
+            let demand = local_ci::plan_task_demand(&plan, id).unwrap();
+            let tests: Vec<usize> = demand.nodes.iter().filter_map(|n| n.weight.tests).collect();
+            assert_eq!(tests, [given.len()], "{id}");
+        }
+
+        // Both shards are placed at once; what needs the job waits.
+        let (run, ids) = ci_run_by_task(&fx, &c, &plan).await;
+        let report_task = ids[&ci_task_of(&plan, "report")].clone();
+        let report = c.tick().await.unwrap();
+        let placed = placed_by_task(&[&fx.w, &other], &report.placed);
+        assert_eq!(
+            placed.keys().collect::<Vec<_>>(),
+            group.shards.iter().collect::<Vec<_>>()
+        );
+        for id in &group.shards {
+            let sent = placed[id].1.payload(&placed[id].0).ci_task.unwrap();
+            assert_eq!(&sent.task_id, id);
+        }
+
+        // One shard ended: the job has no outcome yet and nothing starts.
+        let first = shard_result(&group, 0, "success", "passed", None);
+        end_shard(
+            &c,
+            &files,
+            &placed[&group.shards[0]],
+            Outcome::Succeeded,
+            &first,
+        )
+        .await;
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        let lines = ci_lines(&fx, &c, &files, &run);
+        assert!(lines.iter().all(|l| l.part != Some(Part::Job)), "{lines:?}");
+
+        // The other ended: the job is made of both, and report starts once.
+        let second = shard_result(&group, 1, "success", "passed", leave_out);
+        end_shard(
+            &c,
+            &files,
+            &placed[&group.shards[1]],
+            Outcome::Succeeded,
+            &second,
+        )
+        .await;
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.released, vec![report_task.clone()]);
+        assert!(pass.stopped.is_empty() && pass.unrunnable.is_empty());
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        let next = c.tick().await.unwrap();
+        assert_eq!(next.placed.len(), 1);
+        let placed = placed_by_task(&[&fx.w, &other], &next.placed);
+        let (b, worker) = &placed[&ci_task_of(&plan, "report")];
+        let inputs = worker.payload(b).ci_task.unwrap().inputs;
+        let expected = if leave_out.is_some() {
+            "failure"
+        } else {
+            "success"
+        };
+        assert_eq!(inputs["needs"]["test"]["status"], expected, "{command}");
+        assert_eq!(inputs["needs"].as_object().unwrap().len(), 1);
+
+        // The report: a line per shard, and one for the job they are.
+        let lines = ci_lines(&fx, &c, &files, &run);
+        let shard_lines = lines.iter().filter(|l| l.part == Some(Part::Shard)).count();
+        assert_eq!(shard_lines, 2);
+        let job: Vec<_> = lines.iter().filter(|l| l.part == Some(Part::Job)).collect();
+        assert_eq!(job.len(), 1);
+        assert_eq!(job[0].status, expected);
+        assert_eq!(job[0].plan_task, group.id);
+        assert_eq!(job[0].job.as_deref(), Some("test"));
+        let code = remote_task_runner::service::ci_run::exit_code(0, &lines);
+        match leave_out {
+            None => {
+                assert_eq!((&job[0].skipped, &job[0].reason), (&None, &None));
+                assert_eq!(code, 0);
+            }
+            Some(file) => {
+                let why = job[0].reason.clone().unwrap();
+                assert!(why.contains(file) && why.contains("not reported"), "{why}");
+                assert_eq!(code, 1, "every shard passed, the job did not");
+            }
+        }
+        assert_eq!(c.store().attempts_of_task(&report_task).unwrap().len(), 1);
+    }
+}
+
+/// A40: with the times of earlier runs a slow test gets a shard of its own
+/// and the rest share the other, so the longest shard (what the job takes
+/// when the shards run side by side) is shorter than with an even count.
+/// The uneven shards are placed in one tick, each as its own task. Without
+/// any history the split is still made, the same way every time, and runs.
+#[tokio::test]
+async fn a40_history_shortens_the_longest_shard_and_no_history_is_a_stable_split_that_runs() {
+    let names = ["slow", "t1", "t2", "t3", "t4", "t5"];
+    let discovered = listed(&names);
+    let adapter = CargoTest::new("1.91.0", &[], Safety::default());
+    let opts = PartitionOpts::default();
+    let mut history = History::default();
+    history.millis.insert("slow".into(), 50_000);
+    for name in &names[1..] {
+        history.millis.insert(name.to_string(), 10_000);
+    }
+    let weighed = partition_tests(&adapter, &discovered, &history, 2, &opts);
+    assert_eq!(weighed.basis, Basis::History);
+    let loads: Vec<u64> = weighed.shards.iter().map(|s| s.load).collect();
+    assert_eq!(loads.iter().sum::<u64>(), 100_000);
+    assert_eq!(loads.iter().max(), Some(&50_000), "{loads:?}");
+    // Three tests a shard, as a count would divide them, takes 70 seconds.
+    let slow_shard = weighed
+        .shards
+        .iter()
+        .find(|s| s.tests.contains(&"slow".to_string()));
+    assert_eq!(slow_shard.unwrap().tests, ["slow"]);
+
+    let fx = fx();
+    let (c, files) = fx.open();
+    let whole = ci_plan(&split_workflow("cargo test"));
+    let plan = whole
+        .with_shards(&[split_request(&whole, weighed, &discovered, false)])
+        .unwrap();
+    let group = split_group(&plan);
+    let sizes: Vec<usize> = group.assignments.iter().map(Vec::len).collect();
+    assert!(sizes.contains(&1) && sizes.contains(&5), "{sizes:?}");
+    let (run, _ids) = ci_run_by_task(&fx, &c, &plan).await;
+    let report = c.tick().await.unwrap();
+    assert_eq!(
+        report.placed.len(),
+        2,
+        "side by side, not one after the other"
+    );
+    let placed = placed_by_task(&[&fx.w], &report.placed);
+    for (at, id) in group.shards.iter().enumerate() {
+        let result = shard_result(&group, at, "success", "passed", None);
+        end_shard(&c, &files, &placed[id], Outcome::Succeeded, &result).await;
+    }
+    assert_eq!(ci_advance(&fx, &c).released.len(), 1);
+    let lines = ci_lines(&fx, &c, &files, &run);
+    let job = lines.iter().find(|l| l.plan_task == group.id).unwrap();
+    assert_eq!(job.status, "success");
+
+    // No history: every test weighs the same, and the same input gives the
+    // same shards, the same plan and the same tasks.
+    let fallback = || {
+        let shards = partition_tests(&adapter, &discovered, &History::default(), 2, &opts);
+        assert_eq!(shards.basis, Basis::Fallback);
+        whole
+            .with_shards(&[split_request(&whole, shards, &discovered, false)])
+            .unwrap()
+    };
+    let (one, two) = (fallback(), fallback());
+    assert_eq!(one.digest, two.digest);
+    let group = split_group(&one);
+    assert_eq!(group, split_group(&two));
+    let sizes: Vec<usize> = group.assignments.iter().map(Vec::len).collect();
+    assert_eq!(sizes, [3, 3]);
+    let fx = crate::collection::fx();
+    let (c, files) = fx.open();
+    let (run, _ids) = ci_run_by_task(&fx, &c, &one).await;
+    let report = c.tick().await.unwrap();
+    let placed = placed_by_task(&[&fx.w], &report.placed);
+    assert_eq!(placed.len(), 2);
+    for (at, id) in group.shards.iter().enumerate() {
+        let result = shard_result(&group, at, "success", "passed", None);
+        end_shard(&c, &files, &placed[id], Outcome::Succeeded, &result).await;
+    }
+    assert_eq!(ci_advance(&fx, &c).released.len(), 1);
+    let lines = ci_lines(&fx, &c, &files, &run);
+    let job = lines.iter().find(|l| l.plan_task == group.id).unwrap();
+    assert_eq!(job.status, "success");
+}
+
+/// A41, a job that must not be split: the request is refused, the plan
+/// says why, and the job is one task that runs like any other. A job whose
+/// tests use a port of their own (a server the shards would share) and one
+/// with a name filter are examples; a job with service containers is
+/// explained the same way.
+#[tokio::test]
+async fn a41_a_job_that_cannot_be_split_says_why_and_runs_as_one_job() {
+    let discovered = listed(&["a", "b", "c", "d"]);
+    let opts = PartitionOpts::default();
+    let two = |adapter: &dyn RunnerAdapter| {
+        partition_tests(adapter, &discovered, &History::default(), 2, &opts)
+    };
+    let plain = CargoTest::new("1.91.0", &[], Safety::default());
+    // The job starts a server on a port: its shards would share it.
+    let with_port = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    env:\n      API_PORT: 4000\n    steps:\n      - run: cargo test\n";
+    // The tests update state they share (declared by the caller).
+    let shared = CargoTest::new(
+        "1.91.0",
+        &[],
+        Safety {
+            shared_state: true,
+            isolated_fixtures: false,
+        },
+    );
+    let with_services = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    services:\n      db:\n        image: postgres:16\n    steps:\n      - run: cargo test\n";
+    let plain_workflow = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+    let cases: [(&str, ShardPlan, &[NotSplit], &str); 3] = [
+        (
+            with_port,
+            two(&plain),
+            &[NotSplit::NoIsolation],
+            "no_isolation",
+        ),
+        (
+            plain_workflow,
+            two(&shared),
+            &[NotSplit::SharedState, NotSplit::NoIsolation],
+            "shared_state",
+        ),
+        (
+            with_services,
+            two(&plain),
+            &[NotSplit::HasServices],
+            "has_services",
+        ),
+    ];
+    for (workflow, shards, reasons, shown) in cases {
+        let whole = ci_plan(workflow);
+        let plan = whole
+            .with_shards(&[split_request(&whole, shards, &discovered, true)])
+            .unwrap();
+        // It fell back to the one task of the job, and says why.
+        assert_eq!(plan.tasks.len(), 1, "{shown}");
+        assert!(plan.tasks[0].shard.is_none());
+        let group = &plan.shard_groups[0];
+        assert!(!group.split);
+        for reason in reasons {
+            assert!(group.not_split.contains(reason), "{:?}", group.not_split);
+        }
+        let digest = plan.digest.clone();
+        let ci = remote_task_runner::ci::CiPlan::from_frozen(plan).unwrap();
+        let text = remote_task_runner::ci::summary::render_text(ci.summary());
+        assert!(
+            text.contains("is not split") && text.contains(shown),
+            "{text}"
+        );
+        let plan = ci.into_frozen();
+        assert_eq!(plan.digest, digest);
+        if !plan.tasks[0].services.is_empty() {
+            // Service containers are not run yet at all (not a matter of
+            // shards): the plan explains, the run is refused.
+            continue;
+        }
+
+        // The single job runs and ends like any job: no shard, no stop.
+        let fx = fx();
+        let (c, files) = fx.open();
+        let (run, ids) = ci_run(&fx, &c, &plan).await;
+        let spec = c.store().ci_run_tasks(&run).unwrap()[0].spec.clone();
+        assert!(spec["ci"].get("fail_fast_group").is_none());
+        assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
+        let a = c.tick().await.unwrap().placed[0].clone();
+        let p = fx.w.payload(&a);
+        let result = ci_result(&ci_task_of(&plan, "test"), "test", "success", json!({}));
+        end(&fx, &c, &a, Outcome::Succeeded, ci_out(&a, &p, &result)).await;
+        ci_collect(&c, &files, &a).await;
+        assert_eq!(ci_advance(&fx, &c), Default::default());
+        let lines = ci_lines(&fx, &c, &files, &run);
+        assert_eq!(lines.len(), 1);
+        assert_eq!((lines[0].status.as_str(), lines[0].part), ("success", None));
+        assert_eq!(lines[0].task_id, ids["test"]);
+        let target = remote_task_runner::service::completion::Target::Run(run);
+        assert_eq!(c.store().completion(target).unwrap().exit_code(), Some(0));
+    }
+}
+
+/// A41, fail-fast: a shard fails while the others run. The parent asks for
+/// their cancel once, the coordinator delivers it, the stop is confirmed
+/// and what the failed shard left is kept; the job is a failure, what needs
+/// it is told so, and the report names each shard and the job. Without
+/// fail-fast the other shards go on to their end.
+#[tokio::test]
+async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_report() {
+    use remote_task_runner::service::ci_run::Part;
+    let names = ["a", "b", "c", "d", "e", "f"];
+    let discovered = listed(&names);
+    let adapter = CargoTest::new("1.91.0", &[], Safety::default());
+    let opts = PartitionOpts::default();
+    for fail_fast in [true, false] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let whole = ci_plan(&split_workflow("cargo test"));
+        let shards = partition_tests(&adapter, &discovered, &History::default(), 3, &opts);
+        let plan = whole
+            .with_shards(&[split_request(&whole, shards, &discovered, fail_fast)])
+            .unwrap();
+        let group = split_group(&plan);
+        assert_eq!((group.shards.len(), group.fail_fast), (3, fail_fast));
+        let (run, ids) = ci_run_by_task(&fx, &c, &plan).await;
+        let report = c.tick().await.unwrap();
+        let placed = placed_by_task(&[&fx.w], &report.placed);
+        assert_eq!(placed.len(), 3);
+        // Nothing failed: a pass stops nothing.
+        assert!(ci_advance(&fx, &c).stopped.is_empty());
+
+        let failed = shard_result(&group, 0, "failure", "failed", None);
+        end_shard(
+            &c,
+            &files,
+            &placed[&group.shards[0]],
+            Outcome::Failed,
+            &failed,
+        )
+        .await;
+        let pass = ci_advance(&fx, &c);
+        let others = [ids[&group.shards[1]].clone(), ids[&group.shards[2]].clone()];
+        if !fail_fast {
+            assert!(pass.stopped.is_empty());
+            c.tick().await.unwrap();
+            assert_eq!(fx.w.count("cancel"), 0);
+            for task in &others {
+                assert_eq!(c.store().task_cancel_requested(task).unwrap(), None);
+            }
+            // The others end on their own, and the job is still a failure.
+            for at in [1, 2] {
+                let result = shard_result(&group, at, "success", "passed", None);
+                end_shard(
+                    &c,
+                    &files,
+                    &placed[&group.shards[at]],
+                    Outcome::Succeeded,
+                    &result,
+                )
+                .await;
+            }
+            assert_eq!(ci_advance(&fx, &c).released.len(), 1);
+            let lines = ci_lines(&fx, &c, &files, &run);
+            let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
+            assert_eq!(job.status, "failure");
+            continue;
+        }
+        assert_eq!(pass.stopped, others);
+        assert!(pass.released.is_empty(), "the job has not ended yet");
+        for task in &others {
+            assert!(c.store().task_cancel_requested(task).unwrap().is_some());
+        }
+        // Asked once: a pass that sees the same again writes nothing.
+        let again = ci_advance(&fx, &c);
+        assert!(again.stopped.is_empty() && again.released.is_empty());
+        // The coordinator delivers the cancels; the stop is confirmed.
+        for _ in 0..4 {
+            c.tick().await.unwrap();
+            collect(&c, &files).await;
+        }
+        assert_eq!(fx.w.count("cancel"), 2);
+        for id in &group.shards[1..] {
+            let rec = c.store().get_attempt(&placed[id].0).unwrap().unwrap();
+            let ended = rec.termination.map(|t| t.outcome());
+            assert_eq!(ended, Some(Outcome::Cancelled));
+        }
+        // What the failed shard left is still there.
+        let kept = c
+            .store()
+            .persisted_artifacts(&placed[&group.shards[0]].0)
+            .unwrap();
+        assert!(kept.iter().any(|(name, _)| name == RESULT_ARTIFACT));
+
+        // The job ended as a failure; report (`if: always()`) is told so.
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(
+            pass.released,
+            vec![ids[&ci_task_of(&plan, "report")].clone()]
+        );
+        assert!(pass.stopped.is_empty());
+        let next = c.tick().await.unwrap();
+        let b = next.placed[0].clone();
+        let inputs = fx.w.payload(&b).ci_task.unwrap().inputs;
+        assert_eq!(inputs["needs"]["test"]["status"], "failure");
+        assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
+
+        let lines = ci_lines(&fx, &c, &files, &run);
+        let of = |part: Part| -> Vec<(&str, &str)> {
+            lines
+                .iter()
+                .filter(|l| l.part == Some(part))
+                .map(|l| (l.plan_task.as_str(), l.status.as_str()))
+                .collect()
+        };
+        assert_eq!(
+            of(Part::Shard),
+            [
+                (group.shards[0].as_str(), "failure"),
+                (group.shards[1].as_str(), "no_result"),
+                (group.shards[2].as_str(), "no_result"),
+            ]
+        );
+        assert_eq!(of(Part::Job), [(group.id.as_str(), "failure")]);
+        let text = remote_task_runner::service::ci_run::render_jobs(&lines);
+        assert!(
+            text.contains(&format!("{}: failure\n", group.shards[0])),
+            "{text}"
+        );
+        let said = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
+        let why = said.reason.clone().unwrap();
+        let first_failed = &group.assignments[0][0];
+        assert!(why.contains(&format!("failed: {first_failed}")), "{why}");
+        assert!(
+            why.contains(&format!("missing: shard {}", group.shards[1])),
+            "{why}"
+        );
+        assert!(text.contains(&format!("test: failure ({why})\n")), "{text}");
+    }
 }

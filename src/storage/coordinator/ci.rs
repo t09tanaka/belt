@@ -31,16 +31,26 @@ pub struct CiAttempt {
 }
 
 const HELD: &str = "coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=1";
+/// A shard of a fail-fast split job that has not ended: the attempt that
+/// counts for it is not terminal, or its collection is not closed.
+const OPEN_FAIL_FAST_SHARD: &str = "json_extract(t.spec_json,'$.ci.fail_fast_group') IS NOT NULL
+    AND NOT EXISTS (SELECT 1 FROM attempt a JOIN collection x ON x.attempt_id=a.attempt_id
+        WHERE a.attempt_id=(SELECT aa.attempt_id FROM attempt aa
+            WHERE aa.task_id=t.task_id AND aa.retired=0 AND aa.generation>=t.min_generation
+            ORDER BY aa.generation DESC LIMIT 1)
+        AND a.state='terminal' AND x.closed_at_ms IS NOT NULL)";
 
 impl CoordinatorStore {
-    /// The runs that have a task waiting for the jobs it needs, oldest
-    /// first. A task that was cancelled, or whose run is closed, waits for
-    /// nothing.
+    /// The runs that have a task waiting for the jobs it needs, or a shard
+    /// of a fail-fast split job that has not ended (a failed shard of the
+    /// job is to stop it), oldest first. A task that was cancelled, or whose
+    /// run is closed, waits for nothing.
     pub fn ci_waiting_runs(&self, limit: u32) -> Result<Vec<RunId>> {
         self.db.call(move |c| {
             let mut query = c.prepare(&format!(
                 "SELECT t.run_id FROM task t JOIN run r ON r.run_id=t.run_id
-                 WHERE {HELD} AND t.cancel_requested_at_ms IS NULL AND r.closed_at_ms IS NULL
+                 WHERE ({HELD} OR ({OPEN_FAIL_FAST_SHARD}))
+                 AND t.cancel_requested_at_ms IS NULL AND r.closed_at_ms IS NULL
                  GROUP BY t.run_id ORDER BY min(t.created_at_ms), min(t.rowid) LIMIT ?1"
             ))?;
             let rows = query.query_map([i64::from(limit)], |r| r.get::<_, String>(0))?;

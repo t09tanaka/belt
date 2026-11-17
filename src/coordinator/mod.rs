@@ -154,6 +154,12 @@ pub struct CiSpec {
     /// shown where the task is shown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unrunnable: Option<String>,
+    /// The task is a shard of this split job of the plan, and a failed
+    /// shard of the job stops the others (fail-fast). The progression looks
+    /// at the run while such a task has not ended
+    /// (`CoordinatorStore::ci_waiting_runs`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fail_fast_group: Option<String>,
 }
 
 /// The one place an [`AttemptPayload`] is made.
