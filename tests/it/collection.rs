@@ -4805,9 +4805,10 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     use remote_task_runner::ci::discovery::{candidates, stage, WorkerListing};
     let fx = fx();
     let (c, files) = fx.open();
-    let whole = ci_plan(
-        "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npx jest\n",
-    );
+    let whole =
+        ci_plan(&CI_CHAIN.replace("- run: echo one\n      - run: echo two", "- run: npx jest"));
+    let build = ci_task_of(&whole, "build");
+    let test = ci_task_of(&whole, "test");
     let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &whole).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
     let mut specs = remote_task_runner::service::ci_run::task_specs(
@@ -4832,10 +4833,10 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
             .into_iter()
             .map(|(name, spec)| {
                 (
-                    if name == discovery {
-                        TaskId::generate()
-                    } else {
+                    if name == test {
                         task_id.clone()
+                    } else {
+                        TaskId::generate()
                     },
                     spec,
                 )
@@ -4846,7 +4847,25 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     .unwrap();
     let placed = c.tick().await.unwrap().placed;
     assert_eq!(placed.len(), 1);
+    assert_eq!(fx.w.payload(&placed[0]).ci_task.unwrap().task_id, build);
+    let result = ci_result(&build, "build", "success", json!({"version":"1.2.3"}));
+    end_shard(
+        &c,
+        &files,
+        &(placed[0].clone(), fx.w.clone()),
+        Outcome::Succeeded,
+        &result,
+    )
+    .await;
+    let pass = ci_advance(&fx, &c);
+    assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
+    let placed = c.tick().await.unwrap().placed;
+    assert_eq!(placed.len(), 1);
     assert_eq!(fx.w.payload(&placed[0]).ci_task.unwrap().task_id, discovery);
+    assert_eq!(
+        fx.w.payload(&placed[0]).ci_task.unwrap().inputs["needs"]["build"]["outputs"]["version"],
+        "1.2.3"
+    );
     assert!(c.store().attempts_of_task(&task_id).unwrap().is_empty());
     let listing = WorkerListing {
         setup_ms: None,
@@ -4867,7 +4886,7 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
         assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
     }
     let rows = c.store().ci_run_tasks(&run).unwrap();
-    assert_eq!(rows.len(), 3);
+    assert_eq!(rows.len(), 4);
     assert_eq!(
         rows.iter()
             .filter(|r| r.spec["ci"]["shard_group"].is_string())
@@ -4877,6 +4896,12 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     let placed = c.tick().await.unwrap().placed;
     assert_eq!(placed.len(), 2);
     assert_eq!(c.store().attempts_of_task(&task_id).unwrap().len(), 1);
+    for attempt in &placed {
+        assert_eq!(
+            fx.w.payload(attempt).ci_task.unwrap().inputs["needs"]["build"]["outputs"]["version"],
+            "1.2.3"
+        );
+    }
     let changed = fx.w.payload(&placed[0]).ci_task.unwrap().plan_digest;
     assert_ne!(changed, digest);
     let bytes = remote_task_runner::ci::advance::read_plan(fx.dir.path(), &changed).unwrap();
