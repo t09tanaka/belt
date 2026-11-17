@@ -11,7 +11,7 @@ use crate::source::SourceStore;
 use local_ci::exec::{Opts, Workspace};
 use local_ci::source::SourceManifest;
 use local_ci::source_execute::{PinnedExecution, RefusePinnedForks};
-use local_ci::{ExecContext, FrozenPlan, StepExecutor, TaskInputs, TaskResult};
+use local_ci::{CancelHandle, ExecContext, FrozenPlan, StepExecutor, TaskInputs, TaskResult};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -44,6 +44,10 @@ pub struct TaskPaths {
     pub lock_file: PathBuf,
     pub trash: PathBuf,
     pub env: BTreeMap<String, String>,
+    /// Stops the task: once it is cancelled the core starts nothing more
+    /// (no step, no helper process of its own) and takes down what it has
+    /// up. The host keeps a clone and cancels through it.
+    pub cancel: CancelHandle,
 }
 
 /// Run task `task_id` of `plan` in `paths.root` with `inputs` as the results
@@ -63,7 +67,9 @@ pub fn execute_task(
         .object_store()
         .map_err(|e| ExecuteError::Binding(e.to_string()))?;
     let ran = view.with_sdk(|objects| {
-        let ctx = ExecContext::new(paths.env.clone());
+        let mut ctx = ExecContext::new(paths.env.clone());
+        // The handle the host holds, not one of the context's own.
+        ctx.cancel = paths.cancel.clone();
         let run = || -> Result<TaskResult, ExecuteError> {
             let input = PinnedExecution::new(plan, manifest, objects)
                 .map_err(|e| ExecuteError::Binding(format!("{e:#}")))?;
@@ -215,6 +221,7 @@ pub(crate) mod tests {
             lock_file: at.join("lock"),
             trash: at.join("trash"),
             env: env(),
+            cancel: CancelHandle::new(),
         }
     }
 
@@ -489,6 +496,7 @@ pub(crate) mod tests {
                 lock_file: at.join("lock"),
                 trash: at.join("trash"),
                 env,
+                cancel: CancelHandle::new(),
             },
             exec.clone(),
         )

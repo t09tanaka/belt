@@ -106,6 +106,35 @@ pub(crate) struct NodeEnd {
     /// It could not be confirmed because the identity of the command's
     /// process could not be read: nothing was signalled.
     pub identity_unknown: bool,
+    /// How long the node waited to be admitted and how long its command ran.
+    pub times: NodeTimes,
+}
+
+/// The two times of a node, kept apart: waiting for admission is never
+/// counted as running (spec chapter 12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct NodeTimes {
+    pub waited_ms: u64,
+    pub ran_ms: u64,
+}
+
+/// The times of a node that began to wait at `waiting_since` and whose
+/// command started at `running_since`, as of `now` (all on the monotonic
+/// clock). A node that was never started waited until now and ran for
+/// nothing; one that never got to wait has neither.
+pub(crate) fn node_times(
+    waiting_since: Option<u64>,
+    running_since: Option<u64>,
+    now: u64,
+) -> NodeTimes {
+    let Some(waiting) = waiting_since else {
+        return NodeTimes::default();
+    };
+    let admitted = running_since.unwrap_or(now);
+    NodeTimes {
+        waited_ms: admitted.saturating_sub(waiting),
+        ran_ms: running_since.map_or(0, |since| now.saturating_sub(since)),
+    }
 }
 
 pub(crate) fn exit_of(e: TtcExit) -> Option<Exit> {
@@ -435,7 +464,11 @@ pub(crate) fn keep_artifacts(
         files: plan.secret_files.clone(),
         values: masker.clone(),
     };
-    for f in &plan.files {
+    // A CI task that started no command keeps its result only (the jobs
+    // that need it wait for the outcomes): what was declared is looked for
+    // only after a command ran, as for any attempt (spec chapter 13).
+    let declared = spec.ci.is_none() || !store.launches(attempt)?.is_empty();
+    for f in plan.files.iter().filter(|_| declared) {
         let input = ArtifactInput {
             name: &f.name,
             source: &f.source,
@@ -490,7 +523,7 @@ pub(crate) fn keep_artifacts(
         }
     }
     let mut remaining = crate::outputs::MAX_ATTEMPT_FILES;
-    for d in &plan.outputs {
+    for d in plan.outputs.iter().filter(|_| declared) {
         if !crate::outputs::eligible(d.when, termination.outcome(), true) {
             continue;
         }
@@ -596,7 +629,7 @@ pub(crate) fn complete_terminal(
 ) -> Result<()> {
     let attempt = &spec.attempt_id;
     let root = spec.spool_dir();
-    remove_fifos(spec);
+    remove_fifos(spec, store);
     let without_spool = store
         .events_of(attempt, "spool_failed")?
         .iter()
@@ -620,10 +653,19 @@ fn settled_without_spool_at(stage: Option<&str>) -> bool {
 /// Remove the FIFOs the attempt's nodes got their output through. Only when
 /// no command of the attempt is alive: they have no writer and no reader
 /// then. Best effort: one that stays goes with the attempt's directory.
-pub(crate) fn remove_fifos(spec: &SuperviseSpec) {
+pub(crate) fn remove_fifos(spec: &SuperviseSpec, store: &WorkerStore) {
     use std::os::unix::fs::FileTypeExt;
     let root = spec.spool_dir();
-    for index in 0..spec.nodes.len() {
+    // The steps of a CI task are no nodes of the spec: the ones that were
+    // launched are in the database, numbered by their names.
+    let launched: Vec<String> = match &spec.ci {
+        Some(_) => store
+            .launches(&spec.attempt_id)
+            .map(|l| l.into_iter().map(|(node, _, _)| node.to_string()).collect())
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    for index in fifo_indices(spec.nodes.len(), &launched) {
         let path = Pipe::path_for(&root, &spec.attempt_id, index);
         // Never anything but a FIFO: the name is ours, but a file found
         // there is not removed on the name alone.
@@ -631,6 +673,18 @@ pub(crate) fn remove_fifos(spec: &SuperviseSpec) {
             let _ = std::fs::remove_file(&path);
         }
     }
+}
+
+/// The numbers of the nodes that may have left a FIFO: every node of the
+/// spec, and every launched step of a CI task.
+pub(crate) fn fifo_indices(nodes: usize, launched: &[String]) -> Vec<usize> {
+    let steps = launched
+        .iter()
+        .filter_map(|node| super::ci_task::step_index(node));
+    let mut all: Vec<usize> = (0..nodes).chain(steps).collect();
+    all.sort_unstable();
+    all.dedup();
+    all
 }
 
 /// What the reader thread reported (`pump`) when the heartbeat did not get
@@ -740,6 +794,10 @@ pub(super) struct Control<'a> {
     masker: Masker,
     /// The run-time limit of the node being run, when it has its own.
     node_timeout_ms: Option<u64>,
+    /// When the node being run began to wait for admission, and when its
+    /// command started (monotonic).
+    waiting_since_ms: Option<u64>,
+    running_since_ms: Option<u64>,
     beat: SpoolBeat,
     /// The first failure of a thread feeding the spool.
     pump_error: Arc<Mutex<Option<String>>>,
@@ -770,6 +828,27 @@ fn observe_lease(
 impl Control<'_> {
     /// One look at the cancel request, the lease and the timeouts.
     fn look(&mut self, stage: timeouts::Stage) -> Result<Option<StopReason>> {
+        let policy = self.spec.timeout_policy().for_command(self.node_timeout_ms);
+        self.look_under(policy, stage)
+    }
+
+    /// [`Self::look`] while no node is run or waits (a CI task between its
+    /// steps): the lease is observed and renewed all the same, and only a
+    /// cancel, its expiry or the deadline of the attempt is a reason to
+    /// stop. A busy database is no reason and no error.
+    pub(super) fn look_between_nodes(&mut self) -> Result<Option<StopReason>> {
+        let policy = self.spec.timeout_policy().between_commands();
+        let stage = timeouts::Stage::Running {
+            since_ms: platform::monotonic_ms(),
+        };
+        absorb_retryable(self.look_under(policy, stage))
+    }
+
+    fn look_under(
+        &mut self,
+        policy: timeouts::TimeoutPolicy,
+        stage: timeouts::Stage,
+    ) -> Result<Option<StopReason>> {
         let attempt = &self.spec.attempt_id;
         let now = platform::monotonic_ms();
         let Some(rec) = self.store.get(attempt)? else {
@@ -800,7 +879,6 @@ impl Control<'_> {
             // can be claimed.
             self.store.expire_lease(attempt, platform::wall_ms())?;
         }
-        let policy = self.spec.timeout_policy().for_command(self.node_timeout_ms);
         let timeout = timeouts::fired(&policy, self.started_ms, stage, now);
         Ok(pick_reason(
             rec.cancel_requested_at_ms.is_some() || rec.retired,
@@ -809,7 +887,7 @@ impl Control<'_> {
         ))
     }
 
-    fn begin_stop(&self, reason: StopReason) -> Result<()> {
+    pub(super) fn begin_stop(&self, reason: StopReason) -> Result<()> {
         let attempt = &self.spec.attempt_id;
         if reason == StopReason::Cancel {
             // The cancel was persisted by whoever asked; now the attempt shows
@@ -829,6 +907,17 @@ impl Control<'_> {
     }
 
     pub(super) fn run_node(&mut self, index: usize, node: &NodeSpec) -> Result<NodeEnd> {
+        (self.waiting_since_ms, self.running_since_ms) = (None, None);
+        let mut end = self.run_node_once(index, node)?;
+        end.times = node_times(
+            self.waiting_since_ms,
+            self.running_since_ms,
+            platform::monotonic_ms(),
+        );
+        Ok(end)
+    }
+
+    fn run_node_once(&mut self, index: usize, node: &NodeSpec) -> Result<NodeEnd> {
         let spec = self.spec;
         self.node_timeout_ms = node.timeout_ms;
         let attempt = spec.attempt_id.clone();
@@ -846,6 +935,7 @@ impl Control<'_> {
                     exit: None,
                     unconfirmed: false,
                     identity_unknown: false,
+                    times: NodeTimes::default(),
                 });
             }
         };
@@ -889,6 +979,7 @@ impl Control<'_> {
                     exit: None,
                     unconfirmed: false,
                     identity_unknown: false,
+                    times: NodeTimes::default(),
                 })
             }
         };
@@ -898,6 +989,7 @@ impl Control<'_> {
         // Admission. Nothing has been started yet, so any stop reason just
         // withdraws the registration.
         let waiting_since = platform::monotonic_ms();
+        self.waiting_since_ms = Some(waiting_since);
         loop {
             let stage = timeouts::Stage::Waiting {
                 since_ms: waiting_since,
@@ -1022,6 +1114,7 @@ impl Control<'_> {
             exit: None,
             unconfirmed: false,
             identity_unknown: false,
+            times: NodeTimes::default(),
         })
     }
 
@@ -1041,6 +1134,7 @@ impl Control<'_> {
                 .ok()
                 .and_then(|ledger| ledger.entries.into_iter().find(|entry| entry.id == id));
         let run_since = platform::monotonic_ms();
+        self.running_since_ms = Some(run_since);
         let ctx = self.traffic.ctx.clone();
         let mut watch = Watch::default();
         // What the command leaves under its group number once its leader has
@@ -1108,6 +1202,7 @@ impl Control<'_> {
                 exit,
                 unconfirmed: true,
                 identity_unknown: watch.identity_unknown,
+                times: NodeTimes::default(),
             });
         }
         let kind = match (reason, exit) {
@@ -1171,6 +1266,7 @@ impl Control<'_> {
             exit,
             unconfirmed: !confirmed,
             identity_unknown: false,
+            times: NodeTimes::default(),
         })
     }
 
@@ -1405,6 +1501,12 @@ fn child_target(ctx: &Context, id: &str) -> Option<StopTarget> {
 /// has a launch intent is never started again: it goes to
 /// [`super::recover::recover`].
 pub fn run(spec: &SuperviseSpec) -> Result<Report> {
+    run_using(spec, &super::ci_task::run_task)
+}
+
+/// [`run`]; `core` is what runs a CI task and asks for its steps (a test
+/// gives one that takes its time between them).
+pub(crate) fn run_using(spec: &SuperviseSpec, core: super::ci_task::Core<'_>) -> Result<Report> {
     spec.validate()?;
     let store = WorkerStore::open(&spec.state_dir, &spec.worker_id)?;
     let attempt = &spec.attempt_id;
@@ -1518,6 +1620,8 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         spool: &spool,
         masker: masker.clone(),
         node_timeout_ms: None,
+        waiting_since_ms: None,
+        running_since_ms: None,
         beat: SpoolBeat::default(),
         pump_error: Arc::default(),
         tee: None,
@@ -1527,13 +1631,14 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         exit: Some(Exit::Code(0)),
         unconfirmed: false,
         identity_unknown: false,
+        times: NodeTimes::default(),
     };
     let mut last_node = String::new();
     // A CI task could not be run to a result, and nothing stopped it.
     let mut ci_failure = None;
     if let Some(ci) = &spec.ci {
         // The steps are not known here: the core of the plan asks for each.
-        let ran = super::ci_task::drive(&mut ctl, ci)?;
+        let ran = super::ci_task::drive(&mut ctl, ci, core)?;
         (end, last_node, ci_failure) = (ran.end, ran.last_node, ran.failure);
     }
     for (index, node) in spec.nodes.iter().enumerate() {
@@ -1746,6 +1851,45 @@ mod tests {
                 "expired in database"
             )),
             LeaseStatus::Expired
+        );
+    }
+
+    #[test]
+    fn waiting_for_admission_is_never_counted_as_running() {
+        // Never got to wait (no pipe, or its id had ended already).
+        assert_eq!(node_times(None, None, 900), NodeTimes::default());
+        assert_eq!(node_times(None, Some(5), 900), NodeTimes::default());
+        // Withdrawn while waiting: waited until now, ran for nothing.
+        assert_eq!(
+            node_times(Some(100), None, 900),
+            NodeTimes {
+                waited_ms: 800,
+                ran_ms: 0
+            }
+        );
+        // Admitted at 400: the wait ends there and the run begins.
+        assert_eq!(
+            node_times(Some(100), Some(400), 900),
+            NodeTimes {
+                waited_ms: 300,
+                ran_ms: 500
+            }
+        );
+        assert_eq!(node_times(Some(100), Some(100), 100), NodeTimes::default());
+        // A clock that is behind never underflows.
+        assert_eq!(node_times(Some(500), Some(400), 300), NodeTimes::default());
+    }
+
+    #[test]
+    fn the_pipes_of_the_launched_steps_of_a_ci_task_are_found_by_their_numbers() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(fifo_indices(0, &[]), Vec::<usize>::new());
+        assert_eq!(fifo_indices(3, &[]), [0, 1, 2]);
+        assert_eq!(fifo_indices(0, &names(&["step-2", "step-0"])), [0, 2]);
+        // A launch that is no step has no number of its own.
+        assert_eq!(
+            fifo_indices(2, &names(&["main", "step-1", "step-7"])),
+            [0, 1, 7]
         );
     }
 

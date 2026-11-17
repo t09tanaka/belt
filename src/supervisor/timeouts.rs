@@ -30,6 +30,16 @@ impl TimeoutPolicy {
             ..self
         }
     }
+
+    /// The limits while no command runs or waits (a CI task between its
+    /// steps): only the deadline of the attempt counts then.
+    pub fn between_commands(self) -> TimeoutPolicy {
+        TimeoutPolicy {
+            command_ms: None,
+            resource_wait_ms: None,
+            deadline_ms: self.deadline_ms,
+        }
+    }
 }
 
 /// What the attempt is doing now.
@@ -104,6 +114,26 @@ mod tests {
 
     fn info(kind: TimeoutKind, phase: TimeoutPhase) -> Option<TimeoutInfo> {
         Some(TimeoutInfo { kind, phase })
+    }
+
+    #[test]
+    fn between_commands_only_the_deadline_counts() {
+        let p = policy(Some(1), Some(2), Some(30)).between_commands();
+        assert_eq!(p, policy(None, None, Some(30)));
+        for stage in [
+            Stage::Running { since_ms: 0 },
+            Stage::Waiting { since_ms: 0 },
+        ] {
+            assert_eq!(fired(&p, 0, stage, 29), None);
+            assert_eq!(
+                fired(&p, 0, stage, 30).map(|t| t.kind),
+                Some(TimeoutKind::Deadline)
+            );
+        }
+        assert_eq!(
+            policy(Some(1), Some(2), None).between_commands(),
+            policy(None, None, None)
+        );
     }
 
     #[test]

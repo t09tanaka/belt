@@ -6,21 +6,33 @@
 //! admitted by task-traffic-controller, claimed in the database, its output
 //! masked into the spool, stopped and confirmed stopped by the supervisor.
 //! The core starts no process of a step and signals none: its cancel handle
-//! is never given a process group, so all it does is stop asking for steps.
+//! is never given a process group, so cancelling it only makes the core
+//! stop (no further step, no further helper process of its own).
 //!
-//! Once the supervisor has a reason to stop (a cancel, an expired lease, a
-//! timeout) or could not confirm a stop, no further step is started,
-//! whatever the plan would still run (`if: always()` included): the attempt
-//! is over.
+//! While the core works outside a step (verifying the workspace, between
+//! two steps) the supervisor keeps looking, every `poll_ms`, at the cancel
+//! request, the lease and the deadline of the attempt, exactly as while a
+//! command runs: the lease is renewed all along, and a reason to stop
+//! cancels the core at once instead of waiting for its next step.
+//!
+//! What ends the attempt is a cancel, an expired lease, the deadline of the
+//! attempt, a timeout while waiting for resources, a spool that failed and
+//! a stop that could not be confirmed. After any of them no further step is
+//! started, whatever the plan would still run (`if: always()` included).
+//! A step that ran into its own time limit (`timeout-minutes` of the step
+//! or of its job, never more than the `command_timeout_ms` of the attempt)
+//! is stopped and confirmed stopped like any command, and is then only a
+//! result of that step: the core decides what follows (`continue-on-error`,
+//! `if: failure()`, `if: always()`).
 
 use super::error::{Result, SupervisorError};
-use super::run::{Control, NodeEnd};
+use super::run::{Control, NodeEnd, NodeTimes};
 use super::spec::NodeSpec;
 use super::termination::StopReason;
 use crate::ci::execute::{execute_task, TaskPaths};
 use crate::ids::{Digest, NodeId};
 use crate::source::SourceStore;
-use crate::state::Exit;
+use crate::state::{Exit, TimeoutKind};
 use local_ci::exec::Exit as StepEnd;
 use local_ci::{
     CancelHandle, FrozenPlan, JobStatus, StepExecutor, StepExit, StepRequest, TaskInputs,
@@ -29,15 +41,19 @@ use local_ci::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, sync_channel, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{channel, sync_channel, Receiver, RecvTimeoutError, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 /// The name the task's result is kept under, as an artifact of the attempt:
 /// the parent reads the outcomes and outputs of the task's jobs from it.
 pub const RESULT_ARTIFACT: &str = "rtr-ci-task-result.json";
 /// The frozen plan is JSON of at most this many bytes.
 pub const MAX_PLAN_BYTES: u64 = 64 << 20;
+/// The inputs of a task (the outcomes of the jobs it needs) are JSON of at
+/// most this many bytes. A task whose own outcomes are larger than that is
+/// failed where it ran: no task that needs it could be given them.
+pub const MAX_INPUT_BYTES: usize = 4 << 20;
 const RESULT_FILE: &str = "result.json";
 
 /// What the agent hands the supervisor for a CI task. `Debug` shows the
@@ -101,7 +117,7 @@ impl CiTaskSpec {
         Path::new(RESULT_FILE)
     }
 
-    fn paths(&self) -> TaskPaths {
+    fn paths(&self, cancel: CancelHandle) -> TaskPaths {
         TaskPaths {
             root: self.workspace.clone(),
             run_dir: self.scratch.join("run"),
@@ -109,6 +125,7 @@ impl CiTaskSpec {
             lock_file: self.scratch.join("lock"),
             trash: self.scratch.join("trash"),
             env: self.env.clone(),
+            cancel,
         }
     }
 }
@@ -160,10 +177,65 @@ pub(crate) fn step_reply(end: &NodeEnd) -> std::result::Result<StepEnd, String> 
     }
 }
 
-/// Does this end of a step end the attempt?
+/// Does this end of a step end the attempt? Every stop does, and a stop
+/// that could not be confirmed, but one: the step ran into its own time
+/// limit. That is a result of the step, and the core decides what follows.
 pub(crate) fn ends_attempt(end: &NodeEnd) -> bool {
-    end.reason.is_some() || end.unconfirmed
+    let own_limit = matches!(
+        end.reason,
+        Some(StopReason::Timeout(t)) if t.kind == TimeoutKind::Command
+    );
+    end.unconfirmed || (end.reason.is_some() && !own_limit)
 }
+
+/// The run-time limit of a step: what the plan gives it, never more than
+/// the limit the attempt has for a command.
+pub(crate) fn step_timeout_ms(step: Option<Duration>, cap_ms: Option<u64>) -> Option<u64> {
+    let own = step.map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX).max(1));
+    match (own, cap_ms) {
+        (Some(own), Some(cap)) => Some(own.min(cap)),
+        (own, cap) => own.or(cap),
+    }
+}
+
+/// What the core is told about the time of a step: the time its command
+/// ran, and apart from it the time it waited to be admitted (which the core
+/// does not count against `timeout-minutes`).
+pub(crate) fn step_exit(exit: StepEnd, times: NodeTimes) -> StepExit {
+    let secs = |ms: u64| Duration::from_millis(ms).as_secs_f64();
+    StepExit {
+        exit,
+        run_secs: secs(times.ran_ms),
+        queue_wait_secs: Some(secs(times.waited_ms)),
+    }
+}
+
+/// The outcomes of a task are what the tasks that need it get as inputs:
+/// larger than an attempt accepts as inputs, they are refused here.
+pub(crate) fn outcomes_fit(json_len: usize, max: usize) -> std::result::Result<(), String> {
+    if json_len > max {
+        return Err(format!(
+            "the outputs of the task are too large to be given to the tasks that need them \
+             ({json_len} bytes, at most {max})"
+        ));
+    }
+    Ok(())
+}
+
+/// The message a step whose script comes through a pipe is refused with.
+pub(crate) const SCRIPT_PIPE_REFUSED: &str =
+    "a step whose script is read from a pipe (it holds the GitHub token) cannot be run by a worker";
+
+/// What runs the task and asks `executor` for its steps: the core of the
+/// plan ([`run_task`]). The handle stops it. Returns the statuses of the
+/// jobs of the task.
+pub(crate) type Core<'a> = &'a (dyn Fn(
+    &Path,
+    &CiTaskSpec,
+    Arc<dyn StepExecutor>,
+    CancelHandle,
+) -> std::result::Result<Vec<JobStatus>, String>
+         + Sync);
 
 struct StepJob {
     argv: Vec<String>,
@@ -172,7 +244,6 @@ struct StepJob {
     log: PathBuf,
     timeout: Option<Duration>,
     script_pipe: bool,
-    cancel: CancelHandle,
     reply: SyncSender<std::result::Result<StepExit, String>>,
 }
 
@@ -190,7 +261,6 @@ impl StepExecutor for Queue {
             log: req.log.clone(),
             timeout: req.timeout,
             script_pipe: req.script_pipe.is_some(),
-            cancel: req.cancel.clone(),
             reply,
         };
         self.0
@@ -223,10 +293,11 @@ fn read_plan(ci: &CiTaskSpec) -> std::result::Result<FrozenPlan, String> {
 
 /// Run the task through the core and write its result file. Returns the
 /// statuses of its jobs.
-fn run_task(
+pub(crate) fn run_task(
     state_dir: &Path,
     ci: &CiTaskSpec,
     executor: Arc<dyn StepExecutor>,
+    cancel: CancelHandle,
 ) -> std::result::Result<Vec<JobStatus>, String> {
     let plan = read_plan(ci)?;
     let inputs: TaskInputs = serde_json::from_value(ci.inputs.clone())
@@ -236,7 +307,7 @@ fn run_task(
         .manifest(&ci.ci_source_id)
         .map_err(|e| format!("the source of the attempt: {e}"))?
         .ok_or_else(|| "the source of the attempt is not in this worker's store".to_string())?;
-    let paths = ci.paths();
+    let paths = ci.paths(cancel);
     let run_dir = paths.run_dir.clone();
     let result = execute_task(
         &store,
@@ -248,6 +319,9 @@ fn run_task(
         executor,
     )
     .map_err(|e| e.to_string())?;
+    let outcomes =
+        serde_json::to_vec(&result.outcomes).map_err(|e| format!("the result of the task: {e}"))?;
+    outcomes_fit(outcomes.len(), MAX_INPUT_BYTES)?;
     let wire = WireTaskResult::from_task_result(&result, &run_dir)
         .map_err(|e| format!("the result of the task: {e:#}"))?;
     let json = serde_json::to_vec(&wire).map_err(|e| format!("the result of the task: {e}"))?;
@@ -255,7 +329,7 @@ fn run_task(
     Ok(result.outcomes.iter().map(|o| o.status).collect())
 }
 
-fn node_of(index: usize, job: &StepJob) -> Result<NodeSpec> {
+fn node_of(index: usize, job: &StepJob, cap_ms: Option<u64>) -> Result<NodeSpec> {
     Ok(NodeSpec {
         node_id: NodeId::parse(&step_node_name(index))
             .map_err(|e| SupervisorError::Spec(e.to_string()))?,
@@ -263,41 +337,78 @@ fn node_of(index: usize, job: &StepJob) -> Result<NodeSpec> {
         cwd: job.cwd.clone(),
         env: job.env.iter().cloned().collect(),
         weight: None,
-        timeout_ms: job
-            .timeout
-            .map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX).max(1)),
+        timeout_ms: step_timeout_ms(job.timeout, cap_ms),
     })
 }
 
-/// Serve the steps the core asks for until it has finished the task.
+/// A step that is not started: the attempt is over.
+fn not_started() -> StepExit {
+    step_exit(StepEnd::Cancelled, NodeTimes::default())
+}
+
+/// The end of an attempt that was stopped while no step ran.
+fn stopped_between(reason: StopReason) -> NodeEnd {
+    NodeEnd {
+        reason: Some(reason),
+        exit: None,
+        unconfirmed: false,
+        identity_unknown: false,
+        times: NodeTimes::default(),
+    }
+}
+
+/// Serve the steps the core asks for until it has finished the task. While
+/// it asks for none, look at the cancel request, the lease and the deadline
+/// every `poll_ms`; a reason to stop cancels the core through `cancel`.
 fn serve(
     ctl: &mut Control<'_>,
     steps: Receiver<StepJob>,
+    cancel: &CancelHandle,
 ) -> (Option<NodeEnd>, String, Option<SupervisorError>) {
     let mut over: Option<NodeEnd> = None;
     let mut fatal: Option<SupervisorError> = None;
     let mut last_node = String::new();
     let mut index = 0usize;
-    for job in steps {
+    let poll = Duration::from_millis(ctl.spec.poll_ms.max(1));
+    let cap_ms = ctl.spec.command_timeout_ms;
+    loop {
+        let job = match steps.recv_timeout(poll) {
+            Ok(job) => job,
+            // The core returned (or panicked): the task is over.
+            Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {
+                if over.is_none() && fatal.is_none() {
+                    // The core works outside a step. The look renews the
+                    // lease; a reason to stop is acted on now.
+                    match ctl.look_between_nodes() {
+                        Ok(None) => {}
+                        Ok(Some(reason)) => {
+                            // First the core: it starts nothing from here.
+                            cancel.cancel();
+                            match ctl.begin_stop(reason) {
+                                Ok(()) => over = Some(stopped_between(reason)),
+                                Err(e) => fatal = Some(e),
+                            }
+                        }
+                        Err(e) => {
+                            cancel.cancel();
+                            fatal = Some(e);
+                        }
+                    }
+                }
+                continue;
+            }
+        };
         if over.is_some() || fatal.is_some() {
             // The attempt is over: nothing is started any more.
-            let _ = job.reply.send(Ok(StepExit {
-                exit: StepEnd::Cancelled,
-                run_secs: 0.0,
-                queue_wait_secs: None,
-            }));
+            let _ = job.reply.send(Ok(not_started()));
             continue;
         }
         if job.script_pipe {
-            let _ = job.reply.send(Err(
-                "a step whose script is read from a pipe (it holds the GitHub token) cannot \
-                 be run by a worker"
-                    .into(),
-            ));
+            let _ = job.reply.send(Err(SCRIPT_PIPE_REFUSED.into()));
             continue;
         }
-        let since = Instant::now();
-        let ran = node_of(index, &job).and_then(|node| {
+        let ran = node_of(index, &job, cap_ms).and_then(|node| {
             last_node = node.node_id.to_string();
             // What the step prints is kept beside the core's own files too,
             // masked like the spool.
@@ -315,17 +426,13 @@ fn serve(
             Ok(end) => {
                 if ends_attempt(&end) {
                     // Only a flag: the handle holds no process group.
-                    job.cancel.cancel();
+                    cancel.cancel();
                     over = Some(end);
                 }
-                step_reply(&end).map(|exit| StepExit {
-                    exit,
-                    run_secs: since.elapsed().as_secs_f64(),
-                    queue_wait_secs: None,
-                })
+                step_reply(&end).map(|exit| step_exit(exit, end.times))
             }
             Err(e) => {
-                job.cancel.cancel();
+                cancel.cancel();
                 let why = e.to_string();
                 fatal = Some(e);
                 Err(why)
@@ -338,24 +445,34 @@ fn serve(
 
 /// Run the CI task of the attempt: the core on a thread of its own, its
 /// steps on this one.
-pub(super) fn drive(ctl: &mut Control<'_>, ci: &CiTaskSpec) -> Result<CiEnd> {
+pub(super) fn drive(ctl: &mut Control<'_>, ci: &CiTaskSpec, core: Core<'_>) -> Result<CiEnd> {
     let state_dir = ctl.spec.state_dir.clone();
     std::fs::create_dir_all(&ci.scratch)
         .map_err(|e| SupervisorError::State(format!("the CI scratch directory: {e}")))?;
     let (send, steps) = channel();
     let executor: Arc<dyn StepExecutor> = Arc::new(Queue(Mutex::new(send)));
+    // The one handle of the attempt: the core watches it, this side cancels.
+    let cancel = CancelHandle::new();
     let (served, ran) = std::thread::scope(|s| {
         // The executor goes with the core: when the core returns (or
         // panics) the queue closes and the loop below ends.
-        let core = s.spawn(move || run_task(&state_dir, ci, executor));
-        let served = serve(ctl, steps);
-        (served, core.join())
+        let handle = cancel.clone();
+        let running = s.spawn(move || core(&state_dir, ci, executor, handle));
+        let served = serve(ctl, steps, &cancel);
+        (served, running.join())
     });
     let (over, last_node, fatal) = served;
     if let Some(e) = fatal {
         return Err(e);
     }
     let ran = ran.unwrap_or_else(|_| Err("the CI core panicked".into()));
+    let ended = |exit| NodeEnd {
+        reason: None,
+        exit,
+        unconfirmed: false,
+        identity_unknown: false,
+        times: NodeTimes::default(),
+    };
     Ok(match (over, ran) {
         (Some(end), _) => CiEnd {
             end,
@@ -363,22 +480,12 @@ pub(super) fn drive(ctl: &mut Control<'_>, ci: &CiTaskSpec) -> Result<CiEnd> {
             failure: None,
         },
         (None, Ok(statuses)) => CiEnd {
-            end: NodeEnd {
-                reason: None,
-                exit: Some(exit_of_outcomes(statuses)),
-                unconfirmed: false,
-                identity_unknown: false,
-            },
+            end: ended(Some(exit_of_outcomes(statuses))),
             last_node,
             failure: None,
         },
         (None, Err(why)) => CiEnd {
-            end: NodeEnd {
-                reason: None,
-                exit: None,
-                unconfirmed: false,
-                identity_unknown: false,
-            },
+            end: ended(None),
             last_node,
             failure: Some(why),
         },
@@ -399,6 +506,7 @@ mod tests {
             exit,
             unconfirmed,
             identity_unknown: false,
+            times: NodeTimes::default(),
         }
     }
 
@@ -461,12 +569,85 @@ mod tests {
         }
     }
 
+    fn timed_out(kind: TimeoutKind, phase: TimeoutPhase) -> Option<StopReason> {
+        Some(StopReason::Timeout(TimeoutInfo { kind, phase }))
+    }
+
     #[test]
-    fn only_a_stop_or_an_unconfirmed_end_ends_the_attempt() {
+    fn a_step_over_its_own_limit_is_a_result_and_every_other_stop_ends_the_attempt() {
         assert!(!ends_attempt(&end(None, Some(Exit::Code(1)), false)));
         assert!(!ends_attempt(&end(None, None, false)));
-        assert!(ends_attempt(&end(Some(StopReason::Cancel), None, false)));
+        // `timeout-minutes` (or the cap of the attempt on a command): the
+        // core decides what follows.
+        let own = timed_out(TimeoutKind::Command, TimeoutPhase::Running);
+        assert!(!ends_attempt(&end(own, Some(Exit::Signal(15)), false)));
+        // ... unless the stop could not be confirmed.
+        assert!(ends_attempt(&end(own, None, true)));
+        for reason in [
+            Some(StopReason::Cancel),
+            Some(StopReason::LeaseExpired),
+            Some(StopReason::SpoolFailed),
+            timed_out(TimeoutKind::Deadline, TimeoutPhase::Running),
+            timed_out(TimeoutKind::Deadline, TimeoutPhase::Waiting),
+            timed_out(TimeoutKind::ResourceWait, TimeoutPhase::Waiting),
+        ] {
+            assert!(ends_attempt(&end(reason, None, false)), "{reason:?}");
+        }
         assert!(ends_attempt(&end(None, Some(Exit::Code(0)), true)));
+    }
+
+    #[test]
+    fn a_step_never_gets_more_time_than_the_attempt_allows_a_command() {
+        let ms = |n| Some(Duration::from_millis(n));
+        assert_eq!(step_timeout_ms(None, None), None);
+        assert_eq!(step_timeout_ms(ms(700), None), Some(700));
+        assert_eq!(step_timeout_ms(None, Some(500)), Some(500));
+        assert_eq!(step_timeout_ms(ms(700), Some(500)), Some(500));
+        assert_eq!(step_timeout_ms(ms(300), Some(500)), Some(300));
+        assert_eq!(step_timeout_ms(ms(500), Some(500)), Some(500));
+        // Never 0 (which would be no time at all), never an overflow.
+        assert_eq!(
+            step_timeout_ms(Some(Duration::from_nanos(1)), None),
+            Some(1)
+        );
+        assert_eq!(step_timeout_ms(Some(Duration::MAX), None), Some(u64::MAX));
+        assert_eq!(step_timeout_ms(Some(Duration::MAX), Some(9)), Some(9));
+    }
+
+    #[test]
+    fn the_core_is_told_the_running_time_and_the_waiting_time_apart() {
+        let told = step_exit(
+            StepEnd::Code(0),
+            NodeTimes {
+                waited_ms: 1_500,
+                ran_ms: 250,
+            },
+        );
+        assert_eq!(told.exit, StepEnd::Code(0));
+        assert_eq!(told.run_secs, 0.25);
+        assert_eq!(told.queue_wait_secs, Some(1.5));
+        let none = not_started();
+        assert_eq!(none.exit, StepEnd::Cancelled);
+        assert_eq!((none.run_secs, none.queue_wait_secs), (0.0, Some(0.0)));
+    }
+
+    #[test]
+    fn outcomes_larger_than_an_attempt_takes_as_inputs_are_refused() {
+        assert_eq!(outcomes_fit(0, 10), Ok(()));
+        assert_eq!(outcomes_fit(10, 10), Ok(()));
+        let why = outcomes_fit(11, 10).unwrap_err();
+        assert!(why.contains("too large") && why.contains("11") && why.contains("10"));
+        // What a task writes and what the next one may be given are one limit.
+        assert_eq!(MAX_INPUT_BYTES, 4 << 20);
+    }
+
+    #[test]
+    fn a_stop_between_steps_has_no_exit_and_is_confirmed() {
+        let end = stopped_between(StopReason::LeaseExpired);
+        assert_eq!(end.reason, Some(StopReason::LeaseExpired));
+        assert_eq!(end.exit, None);
+        assert!(!end.unconfirmed && !end.identity_unknown);
+        assert!(ends_attempt(&end));
     }
 
     #[test]
