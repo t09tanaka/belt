@@ -73,14 +73,14 @@ impl ResolvedConfig {
             return Err(invalid("worker hello cluster does not match coordinator"));
         }
         let id = &connected.worker.worker_id;
-        let priority = match target {
+        let (priority, ephemeral) = match target {
             WorkerTarget::Local(expected) => {
                 if !self.local_worker.value || expected != id {
                     return Err(invalid(
                         "local worker identity does not match configuration",
                     ));
                 }
-                self.local_worker_priority.value
+                (self.local_worker_priority.value, false)
             }
             WorkerTarget::Remote(name) => {
                 let worker = self
@@ -93,7 +93,7 @@ impl ResolvedConfig {
                         "worker hello identity does not match configured name",
                     ));
                 }
-                worker.priority.value
+                (worker.priority.value, worker.ephemeral)
             }
         };
         coordinator.scheduler().set_priority(id, priority);
@@ -131,7 +131,18 @@ impl ResolvedConfig {
             .with_env_sync(env_sync)
             .with_ci_task(ci_task),
         );
-        coordinator.attach(id.clone(), link.clone()).await;
+        if ephemeral {
+            use crate::coordinator::identity::Admission;
+            match coordinator.attach_ephemeral(id.clone(), &connected.worker.worker_boot_id, link.clone())
+                .await.map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))? {
+                Admission::First | Admission::Same => {}
+                Admission::Retired => return Err(ApiError::new(ErrorCode::Conflict, "the worker identity was retired")),
+                Admission::Conflict => return Err(ApiError::new(ErrorCode::Conflict,
+                    "another identity holds this worker name; use workers forget once the previous worker is gone")),
+            }
+        } else {
+            coordinator.attach(id.clone(), link.clone()).await;
+        }
         Ok(link)
     }
 }

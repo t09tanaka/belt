@@ -533,6 +533,12 @@ async fn an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_res
     assert!(ephemeral.ephemeral && !persistent.ephemeral);
     let (mut first, peer) = connected(&resident, "colab-1").await;
     first.worker.worker_boot_id = WorkerBootId::parse("os-boot.start-1").unwrap();
+    let (mut second, second_peer) = connected(&resident, "colab-1").await;
+    second.worker.worker_boot_id = WorkerBootId::parse("os-boot.start-2").unwrap();
+    let (mut late, late_peer) = connected(&resident, "colab-1").await;
+    late.worker.worker_boot_id = first.worker.worker_boot_id.clone();
+    let (mut fresh, fresh_peer) = connected(&resident, "colab-1").await;
+    fresh.worker.worker_boot_id = second.worker.worker_boot_id.clone();
     let hello = first.worker.clone();
     // No real ssh: nothing is dialed.
     resident.dial = Arc::new(|_, _, _, _, _| Box::pin(async {}));
@@ -557,7 +563,6 @@ async fn an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_res
     assert_eq!(refused(forget("remote-a").await), ErrorCode::InvalidInput);
 
     let id = WorkerId::parse("colab-1").unwrap();
-    admit(&coordinator, &ephemeral, &hello).await.unwrap();
     let link = config
         .attach_gated_worker(
             &coordinator,
@@ -593,12 +598,19 @@ async fn an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_res
         .await
         .unwrap());
     assert!(coordinator.detach_link(&id, &link).await.unwrap());
-    let mut restarted = hello.clone();
-    restarted.worker_boot_id = WorkerBootId::parse("os-boot.start-2").unwrap();
-    let conflict = admit(&coordinator, &ephemeral, &restarted)
+    let attach = |connection| {
+        config.attach_gated_worker(
+            &coordinator,
+            WorkerTarget::Remote("colab-1"),
+            connection,
+            Arc::default(),
+        )
+    };
+    let conflict = attach(second)
         .await
-        .unwrap_err();
-    assert!(conflict.to_string().contains("use workers forget"));
+        .err()
+        .expect("old identity still holds name");
+    assert!(conflict.message.contains("use workers forget"));
     assert_eq!(
         observe().await,
         (false, Some(hello.worker_boot_id.to_string()))
@@ -612,30 +624,18 @@ async fn an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_res
     }
     assert_eq!(observe().await, (false, None));
     // The forgotten identity comes back late: refused before it is attached.
-    let late = admit(&coordinator, &ephemeral, &hello).await.unwrap_err();
-    assert!(late.to_string().contains("retired"), "{late}");
-    // A new start of the same worker is let in.
-    let mut restarted = hello.clone();
-    restarted.worker_boot_id = WorkerBootId::parse("os-boot.start-2").unwrap();
-    admit(&coordinator, &ephemeral, &restarted).await.unwrap();
-    assert_eq!(
-        coordinator.store().worker_identity(&id).unwrap().as_deref(),
-        Some("os-boot.start-2")
-    );
-    // An identity is recorded under the registered name only.
-    let mut renamed = restarted.clone();
-    renamed.worker_id = WorkerId::parse("remote-a").unwrap();
-    let wrong = admit(&coordinator, &ephemeral, &renamed).await.unwrap_err();
-    assert!(wrong.to_string().contains("another name"), "{wrong}");
-    // A persistent worker has one identity: it is not asked, nothing is recorded.
-    admit(&coordinator, &persistent, &renamed).await.unwrap();
-    assert_eq!(
-        coordinator
-            .store()
-            .worker_identity(&renamed.worker_id)
-            .unwrap(),
-        None
-    );
+    let refusal = attach(late)
+        .await
+        .err()
+        .expect("forgotten identity is retired");
+    assert!(refusal.message.contains("retired"));
+    assert_eq!(observe().await, (false, None));
+    let fresh_link = attach(fresh).await.unwrap();
+    assert_eq!(observe().await, (true, Some("os-boot.start-2".into())));
+    assert!(coordinator.detach_link(&id, &fresh_link).await.unwrap());
+    for peer in [second_peer, late_peer, fresh_peer] {
+        peer.abort();
+    }
     // Forgetting once more retires the new identity as well; then nothing is left.
     assert!(matches!(
         forget("colab-1").await,

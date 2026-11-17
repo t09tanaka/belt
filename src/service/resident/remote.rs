@@ -128,33 +128,6 @@ pub(super) async fn forget(
     }
 }
 
-/// An ephemeral worker is let in by the identity it reports (spec chapter
-/// 15): a retired identity is refused, and a new start retires the one
-/// before it. A persistent worker has one identity and is not asked.
-pub(super) async fn admit(
-    coordinator: &Coordinator,
-    worker: &WorkerSpec,
-    hello: &crate::wire::HelloResponse,
-) -> anyhow::Result<()> {
-    if !worker.ephemeral {
-        return Ok(());
-    }
-    // Recorded under the registered name, never under a name the peer chose.
-    anyhow::ensure!(
-        hello.worker_id.as_str() == worker.id,
-        "the worker answered under another name"
-    );
-    let admission = coordinator
-        .admit_identity(&hello.worker_id, &hello.worker_boot_id)
-        .await?;
-    use crate::coordinator::identity::Admission;
-    match admission {
-        Admission::First | Admission::Same => Ok(()),
-        Admission::Retired => anyhow::bail!("the worker identity was retired"),
-        Admission::Conflict => anyhow::bail!("another identity holds this worker name; use workers forget once the previous worker is gone"),
-    }
-}
-
 /// The command run on the worker host: the registered absolute binary, or the
 /// bare name for a registration made before the path was recorded.
 fn bridge_command(worker: &WorkerSpec) -> anyhow::Result<RemoteCommand> {
@@ -317,17 +290,10 @@ async fn session(
         let connected = connected?;
         let client = connected.client.clone();
         let worker_id = connected.worker.worker_id.clone();
-        let boot = connected.worker.worker_boot_id.clone();
-        admit(&coordinator, worker, &connected.worker).await?;
         let gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(format!("ssh-private-rpc-v1:{}",Digest::of_bytes(&serde_json::to_vec(&serde_json::json!({"argv":argv,"protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"policy":"source-64k-v1"}))?))));
         gate.observe(connected.worker.worker_boot_id.clone(),connected.worker.agent_epoch).await;
         let link = config.attach_gated_worker(&coordinator, WorkerTarget::Remote(&worker.id), connected, gate.clone())
             .await.map_err(|e| anyhow::anyhow!(e.message))?;
-        // A forget that ran between the admission and the attachment.
-        if worker.ephemeral && coordinator.identity_retired(&worker_id, &boot).await? {
-            coordinator.detach_link(&worker_id, &link).await?;
-            anyhow::bail!("the worker identity was retired");
-        }
         let (cancel, cancelled) = watch::channel(false);
         let mut jobs = JoinSet::new();
         jobs.spawn(delivery::sources(coordinator.clone(), captured.clone(), client.clone(), worker_id.clone(), gate.clone(), cancelled.clone()));

@@ -53,6 +53,29 @@ impl Coordinator {
             .await
     }
 
+    /// Publish the link under the same fence that protects forget. A handshake
+    /// accepted before forget must never expose its link after the tombstone.
+    pub(crate) async fn attach_ephemeral(
+        &self,
+        worker: WorkerId,
+        boot: &WorkerBootId,
+        link: std::sync::Arc<dyn super::WorkerLink>,
+    ) -> Result<Admission> {
+        let _actor = self.actor.lock().await;
+        let _commit = self.placement_fence.lock().await;
+        let (name, identity) = (worker.clone(), boot.clone());
+        let admission = self
+            .db(move |s| s.admit_worker_identity(&name, &identity, wall_ms()))
+            .await?;
+        if matches!(admission, Admission::First | Admission::Same) {
+            self.workers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(worker, link);
+        }
+        Ok(admission)
+    }
+
     /// Whether `boot` was retired for `worker`. Asked again after a session
     /// was attached: a `forget` that ran between the admission and the
     /// attachment is seen here.
