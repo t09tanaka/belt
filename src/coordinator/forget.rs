@@ -13,9 +13,7 @@ use crate::storage::Forgotten;
 
 impl Coordinator {
     /// An ephemeral worker reported `boot` at `hello`. A retired identity is
-    /// refused (`Admission::Retired`) and must not be attached. A new
-    /// identity under the same name retires the one before it; what that
-    /// one held ended in the same commit.
+    /// refused (`Admission::Retired`) and must not be attached. A different identity must wait for explicit forget.
     pub async fn admit_identity(
         &self,
         worker: &WorkerId,
@@ -23,10 +21,8 @@ impl Coordinator {
     ) -> Result<Admission> {
         let _actor = self.actor.lock().await;
         let (w, b) = (worker.clone(), boot.clone());
-        let (admission, _ended) = self
-            .db(move |s| s.admit_worker_identity(&w, &b, wall_ms()))
-            .await?;
-        Ok(admission)
+        self.db(move |s| s.admit_worker_identity(&w, &b, wall_ms()))
+            .await
     }
 
     /// Whether `boot` was retired for `worker`. Asked again after a session
@@ -152,6 +148,21 @@ mod tests {
         assert_eq!(spare.submits.load(Ordering::SeqCst), 0);
         assert!(!f.c.identity_retired(&f.worker, &first).await.unwrap());
 
+        // A different boot cannot claim this name or settle the old attempt.
+        let second = boot("os-boot.start-2");
+        assert_eq!(
+            f.c.admit_identity(&f.worker, &second).await.unwrap(),
+            Admission::Conflict
+        );
+        assert_eq!(
+            f.c.admit_identity(&f.worker, &first).await.unwrap(),
+            Admission::Same
+        );
+        f.c.tick().await.unwrap();
+        let kept = attempt_of(&f, &attempt);
+        assert_eq!(kept.observation, Observation::Unknown);
+        assert!(kept.termination.is_none());
+
         // The user declares it gone.
         let forgotten =
             f.c.forget_worker(&f.worker, Some(true))
@@ -194,8 +205,7 @@ mod tests {
             );
         }
         assert_eq!(f.c.store().worker_identity(&f.worker).unwrap(), None);
-        // A new start of the same worker is a new identity and is let in.
-        let second = boot("os-boot.start-2");
+        // The waiting identity can now use the name.
         assert_eq!(
             f.c.admit_identity(&f.worker, &second).await.unwrap(),
             Admission::First
@@ -218,55 +228,6 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(nothing.identity, None);
-    }
-
-    /// A new start under the same name is not a reconnect: what the
-    /// previous identity held is never sent to the new one. It ends as
-    /// `interrupted` when the new identity is let in, and the previous
-    /// identity is refused from then on.
-    #[tokio::test]
-    async fn a_new_start_retires_the_identity_before_it_and_is_sent_none_of_its_attempts() {
-        let f = fx();
-        let (first, second) = (boot("os-boot.start-1"), boot("os-boot.start-2"));
-        f.c.admit_identity(&f.worker, &first).await.unwrap();
-        let old: Arc<dyn WorkerLink> = Arc::new(Clean::default());
-        f.c.attach(f.worker.clone(), old.clone()).await;
-        // Placed and never acknowledged: a reconnect would be sent it again.
-        let (task, attempt) = f.placed().await;
-        f.c.detach_link(&f.worker, &old).await.unwrap();
-
-        assert_eq!(
-            f.c.admit_identity(&f.worker, &second).await.unwrap(),
-            Admission::Replaced
-        );
-        let fresh = Arc::new(Clean::default());
-        f.c.attach(f.worker.clone(), fresh.clone()).await;
-        f.c.tick().await.unwrap();
-        assert_eq!(fresh.submits.load(Ordering::SeqCst), 0);
-        let ended = attempt_of(&f, &attempt);
-        assert_eq!(
-            ended.termination.map(|t| t.outcome()),
-            Some(Outcome::Interrupted)
-        );
-        assert_eq!(f.c.store().attempts_of_task(&task).unwrap().len(), 1);
-        let events =
-            f.c.store()
-                .events_of(&attempt, "worker_identity_retired")
-                .unwrap();
-        assert_eq!(events[0].payload["reason"], "replaced");
-        assert_eq!(
-            f.c.store().worker_identity(&f.worker).unwrap().as_deref(),
-            Some(second.as_str())
-        );
-        assert_eq!(
-            f.c.admit_identity(&f.worker, &first).await.unwrap(),
-            Admission::Retired
-        );
-        // The refusal changed nothing: the new identity is still the one.
-        assert_eq!(
-            f.c.admit_identity(&f.worker, &second).await.unwrap(),
-            Admission::Same
-        );
     }
 
     /// A cancel that was asked for before the worker vanished is what the

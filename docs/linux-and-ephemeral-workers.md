@@ -107,9 +107,9 @@ the entry.
 - While the worker cannot be reached, the tasks it held stay `unknown`. They
   are not given to another worker and not failed, however long it takes.
 - When the same worker is started again, it comes back with a new identity.
-  The parent takes that as the previous start being gone: what the previous
-  start held ends as `interrupted`, and nothing of it is sent to the new one.
-- When the worker is gone and will not be started again, say so:
+  The parent refuses the new identity until you forget the previous one.
+  The previous identity can reconnect and report its attempts in the meantime.
+- When the previous worker is gone, say so:
 
   ```
   remote-task-runner workers forget colab-1

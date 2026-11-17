@@ -15,24 +15,6 @@ use crate::storage::{to_i64, Result, StorageError};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::json;
 
-/// Why an identity was retired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RetireReason {
-    /// The user declared the worker gone (`workers forget`).
-    Forgotten,
-    /// The worker started again under the same name.
-    Replaced,
-}
-
-impl RetireReason {
-    fn as_str(self) -> &'static str {
-        match self {
-            RetireReason::Forgotten => "forgotten",
-            RetireReason::Replaced => "replaced",
-        }
-    }
-}
-
 /// What `forget_worker` did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Forgotten {
@@ -68,14 +50,14 @@ fn retired(conn: &Connection, worker: &str, boot: &str) -> Result<bool> {
 /// cancel was asked for), its demand is closed, a retire that was waiting
 /// for the worker is confirmed, and its collection is closed as given up,
 /// since nothing can be fetched from a worker that is gone.
-fn retire(tx: &Connection, worker: &str, reason: RetireReason, at_ms: u64) -> Result<Forgotten> {
+fn retire(tx: &Connection, worker: &str, at_ms: u64) -> Result<Forgotten> {
     let at = to_i64(at_ms)?;
     let identity = recorded(tx, worker)?;
     if let Some(boot) = &identity {
         tx.execute(
             "INSERT OR IGNORE INTO worker_identity_tombstone
                 (worker_id, boot_id, reason, recorded_at_ms) VALUES (?1,?2,?3,?4)",
-            params![worker, boot, reason.as_str(), at],
+            params![worker, boot, "forgotten", at],
         )?;
         tx.execute("DELETE FROM worker_identity WHERE worker_id = ?1", [worker])?;
     }
@@ -125,7 +107,7 @@ fn retire(tx: &Connection, worker: &str, reason: RetireReason, at_ms: u64) -> Re
             run.as_deref(),
             Some(&aid),
             "worker_identity_retired",
-            &json!({"worker": worker, "reason": reason.as_str()}),
+            &json!({"worker": worker, "reason": "forgotten"}),
             at_ms,
         )?;
         close_collection_in(tx, &aid, None, Verdict::GaveUp, false, at_ms)?;
@@ -135,17 +117,13 @@ fn retire(tx: &Connection, worker: &str, reason: RetireReason, at_ms: u64) -> Re
 }
 
 impl CoordinatorStore {
-    /// An ephemeral worker presented `boot` at `hello`. One commit decides
-    /// what that means and records it: a retired identity is refused and
-    /// nothing changes; the first or the same identity is recorded; a new
-    /// identity retires the one before it and ends what that one held
-    /// (returned, oldest first).
+    /// Record the first identity. Only explicit forget can release its name.
     pub fn admit_worker_identity(
         &self,
         worker: &WorkerId,
         boot: &WorkerBootId,
         at_ms: u64,
-    ) -> Result<(Admission, Vec<AttemptId>)> {
+    ) -> Result<Admission> {
         let (worker, boot) = (worker.to_string(), boot.to_string());
         self.db.write(move |tx| {
             let admission = admit(
@@ -153,17 +131,15 @@ impl CoordinatorStore {
                 &boot,
                 retired(tx, &worker, &boot)?,
             );
-            let ended = match admission {
-                Admission::Retired | Admission::Same => return Ok((admission, Vec::new())),
-                Admission::First => Vec::new(),
-                Admission::Replaced => retire(tx, &worker, RetireReason::Replaced, at_ms)?.ended,
-            };
+            if admission != Admission::First {
+                return Ok(admission);
+            }
             tx.execute(
                 "INSERT INTO worker_identity (worker_id, boot_id, first_seen_at_ms)
                  VALUES (?1,?2,?3)",
                 params![worker, boot, to_i64(at_ms)?],
             )?;
-            Ok((admission, ended))
+            Ok(admission)
         })
     }
 
@@ -184,7 +160,6 @@ impl CoordinatorStore {
     /// it again changes nothing.
     pub fn forget_worker(&self, worker: &WorkerId, at_ms: u64) -> Result<Forgotten> {
         let worker = worker.to_string();
-        self.db
-            .write(move |tx| retire(tx, &worker, RetireReason::Forgotten, at_ms))
+        self.db.write(move |tx| retire(tx, &worker, at_ms))
     }
 }

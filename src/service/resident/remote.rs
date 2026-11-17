@@ -147,11 +147,12 @@ pub(super) async fn admit(
     let admission = coordinator
         .admit_identity(&hello.worker_id, &hello.worker_boot_id)
         .await?;
-    anyhow::ensure!(
-        admission != crate::coordinator::identity::Admission::Retired,
-        "the worker identity was retired"
-    );
-    Ok(())
+    use crate::coordinator::identity::Admission;
+    match admission {
+        Admission::First | Admission::Same => Ok(()),
+        Admission::Retired => anyhow::bail!("the worker identity was retired"),
+        Admission::Conflict => anyhow::bail!("another identity holds this worker name; use workers forget once the previous worker is gone"),
+    }
 }
 
 /// The command run on the worker host: the registered absolute binary, or the

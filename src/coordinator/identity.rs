@@ -5,8 +5,7 @@
 //! connection.
 //!
 //! * the first identity, and the same identity again, are let in;
-//! * a new identity under the same name replaces the one before it: that
-//!   one is retired, and what it held ends as `interrupted`;
+//! * a different identity must wait until the user forgets the previous one;
 //! * a retired identity is never let in again, whatever else is recorded;
 //! * `workers forget` is for an ephemeral worker that is not connected.
 
@@ -19,9 +18,8 @@ pub enum Admission {
     First,
     /// The identity seen last: a reconnect.
     Same,
-    /// Another identity than the one seen last: a new start. The previous
-    /// identity is retired.
-    Replaced,
+    /// Another identity holds this name until explicitly forgotten.
+    Conflict,
     /// The identity was retired. It is refused.
     Retired,
 }
@@ -35,7 +33,7 @@ pub fn admit(recorded: Option<&str>, presented: &str, retired: bool) -> Admissio
     match recorded {
         None => Admission::First,
         Some(seen) if seen == presented => Admission::Same,
-        Some(_) => Admission::Replaced,
+        Some(_) => Admission::Conflict,
     }
 }
 
@@ -101,7 +99,7 @@ mod tests {
     fn the_first_the_same_and_a_new_identity_are_told_apart() {
         assert_eq!(admit(None, "a", false), Admission::First);
         assert_eq!(admit(Some("a"), "a", false), Admission::Same);
-        assert_eq!(admit(Some("a"), "b", false), Admission::Replaced);
+        assert_eq!(admit(Some("a"), "b", false), Admission::Conflict);
     }
 
     #[test]
