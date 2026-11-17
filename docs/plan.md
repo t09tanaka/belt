@@ -79,8 +79,8 @@ F2 は登録と hook を分離する案も調査したが、`core.hooksPath` の
 | S15a | 設定から Coordinator・Scheduler・Agent・Setup への checked 変換、検証済み worker identity と priority、`TaskSpec.setup` の転送、`Machine::with_setup` 必須の共通 factory | 非既定値・単位変換の境界・lease/budget/TTL・identity の不一致・旧 task JSON・setup payload 転送・factory の関連テスト | PR #40 を merge `8939ef25c877448f3ae428caf6f666bebd6afad3` で統合済み。対象 `87f8df2` は Rust 1.100 のローカル実行 9 ジョブ成功（native installers は未検証）、リモート 9 ジョブ成功（Linux・macOS・MSRV 1.89） |
 | S15b | 親の常駐 loop、local worker、hello 検証済み remote link、再接続、独立した回収 loop、単一の ResultStore、ローカル IPC | 呼出元 CLI 終了後も durable task が実行・回収され、再起動で同じ attempt を引き継ぐ。遅い回収が lease 更新を止めない | S15a |
 | S15c | `init`・source/secret capture と durable `submit`・`ls`・`show`、run/task の問い合わせ API | 同時 CLI でも coordinator epoch が増殖しない。capture 失敗時は配置せず、完了済み run も正しく列挙する。JSON と stderr の契約を検証 | S15b、起動方式は S22 と整合。本体は PR #42（merge `2b3078c`）と PR #45 で main に統合済み。残件 5 項目は実装済みで、根拠は下の「S15c 残件の確認」に記す。全体 local-ci とリモート CI は親の gate |
-| S15d | `exec`・`wait`・`cancel`・Ctrl-C・明示 `retry`・local-only `--in-place` | exit code を透過し、停止不明を cancelled にしない。unknown の retry を拒否し、元 snapshot と履歴を保つ。in-place を remote に配置しない | S15c |
-| S15e | `logs --follow`・再接続・`outputs`・retention の常駐 loop への接続 | 非 UTF-8・offset・切断再開、出力 path 衝突と部分失敗、回収失敗、実行中・回収中・保持対象を消さない GC を検証。自動削除に件数上限と時計跳躍の保護を付ける | S15d・S14 |
+| S15d | `exec`・`wait`・`cancel`・Ctrl-C・明示 `retry`・local-only `--in-place` | exit code を透過し、停止不明を cancelled にしない。unknown の retry を拒否し、元 snapshot と履歴を保つ。in-place を remote に配置しない | S15c。実装とテストは main にあり、根拠は下の「S15d・S15e の確認」に記す。統合 HEAD の全体 local-ci・リモート CI・remote worker での検証は親の gate で、未了 |
+| S15e | `logs --follow`・再接続・`outputs`・retention の常駐 loop への接続 | 非 UTF-8・offset・切断再開、出力 path 衝突と部分失敗、回収失敗、実行中・回収中・保持対象を消さない GC を検証。自動削除に件数上限と時計跳躍の保護を付ける | S15d・S14。接続は main にあり、Vault の公開途中の停止からの回復と不足していた検証を足した。根拠と未了は下の「S15d・S15e の確認」に記す |
 | S15f | 読み取り専用 `estimate`、配置理由、転送・setup・回収の実測値の接続 | estimate が queue・attempt・ledger 需要を増やさない。measured/fallback/unknown・TTL・priority の説明を保つ。S15 の受入条件を利用者経路で閉じる | S15b〜S15e、S11・S13 |
 
 S15f の最初の slice は読み取り専用 `estimate` とする。既に起動している認証済み owner にだけ照会し、停止時は unknown を返す。command forecast は `forecast_command_v1` の交渉が必要で、既存 canonical clone と実際の profile fingerprint から TTC の正規化 command history を参照する。clone・workspace・source・attempt は作成せず、履歴がない場合の fallback は順位付け専用で ETA として表示しない。source の repository identity が判明しない場合や clone が存在しない場合は、別の cwd の履歴で代用しない。
@@ -794,6 +794,55 @@ D 最終 focused 検証: resident 23件成功 (88.35s)、retention filter 69件�
 (28.36s)、strict all-target/all-feature clippy 成功 (12.35s)。128 terminal-task fixture の最大 status+tick latency は
 1.287625ms のサンプルで、任意履歴の最悪時間や定数CPUを保証しない。既存 estimate readonly fixture は Source SH
 で背景 GC を隔離した上で whole-source-file/DB snapshot を維持確認する。原本や実 user state は一切対象にしていない。
+
+### S15d・S15e の確認（2026-11-17、main `7cbe913` 起点）
+
+行の完了条件を句ごとに「実装済みかつテスト済み／実装済みだがテストが無かった／未実装」に分けた。未実装は 1 件（Vault の公開途中の停止からの回復）で、この変更で実装した。テストが無かった 4 件にはテストを足した。それ以外の src は変更していない。
+
+S15d（すべて実装済みかつテスト済み。この変更では触っていない）
+
+- `exec`・`wait` の exit code の透過: `tests/it/bootstrap.rs:1396` `configured_control_exec_exit_and_offline_wait_ignore_current_project_and_git`、計算は成功で回収が欠けた場合の 78 は `:1765` `control_exec_succeeded_compute_but_missing_collection_exits_78`、判定の純粋部分は `src/service/completion.rs:277` `observes_pending_unknown_cancel_and_closed_collection_separately`。
+- `cancel`・Ctrl-C で停止不明を cancelled にしない: `tests/it/bootstrap.rs:1609` `control_exec_sigint`（通常と in-place の 2 件）、`:1567` `control_wait_interrupt_detaches_without_cancelling_work`、`src/storage/tests.rs:3458` `run_cancel_is_atomic_idempotent_and_preserves_unknown_and_natural_completion`。
+- unknown の retry を拒否し、元 snapshot と履歴を保つ: `src/storage/tests.rs:3786` `retry_same_run_rejects_unsafe_attempts_and_unavailable_inputs_atomically`、実 CLI は `tests/it/bootstrap.rs:1803` `retry_same_run_cli_uses_original_inputs_and_restart_receipt`。
+- `--in-place` を remote に配置しない: `tests/it/coordinator.rs:2631` `in_place_scheduler_uses_only_explicit_parent_local_and_never_automatic_retry`、`tests/it/worker_agent.rs:3899` `in_place_is_refused_by_default_worker_admission_before_acceptance`、実 CLI は `tests/it/bootstrap.rs:2616` `in_place_exec_updates_original_directory_and_retries_mutable_input_after_restart`。
+- 未了（親の gate）: 統合 HEAD の全体 local-ci とリモート CI、remote worker を使った検証。S15d1 に記した owner 再起動後の `wait`（`tests/it/bootstrap.rs:1698`）の並行実行時の timeout は未帰属のままである。
+
+S15e（実装済みかつテスト済み）
+
+- `logs` の非 UTF-8・offset・切断再開: `src/service/logs.rs:687` `snapshot_raw_bytes_prefix_boundary_ndjson_and_readonly`、`:749` `follow_sweeps_resume_without_duplicates_and_close_incomplete`、回収側は `tests/it/collection.rs:1919` `active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset`。
+- `outputs` の path 衝突・部分失敗・回収失敗: `src/service/output_export.rs:427` `tar_long_paths_dotfiles_and_partial_conflicts`、`:609` `concurrent_publish_has_exactly_one_winner`、`src/service/outputs.rs:593` `closed_failed_collection_with_unreceipted_output_exits_collection_failed`。
+- output planner（条件・glob・複数 path）: 純粋部分は `src/outputs.rs:101` `conditions` と `:124` `paths_and_globs`、実 CLI は PR #57 の `tests/it/bootstrap.rs:4505` `public_exec_output_conditions_globs_and_multiple_paths_follow_the_outcome`。重複するテストは足していない。
+- 結果 GC と reader の寿命: 常駐 loop は `src/service/resident.rs:772` から `src/results/retention.rs:33` の `page` を呼ぶ。reader との排他は `src/results/pin.rs:118` `shared_readers_exclude_gc_and_inode_survives_release`、`src/service/outputs.rs:876` `invocation_pin_excludes_gc_during_raw_tar_export_and_final_write_flush`、`src/service/resident/tests.rs:1421` `offline_submit_publishes_reader_pin_before_immediate_logs_follow`、実 resident での競合は `:92` `gc_pin_contention_keeps_resident_ipc_and_lease_renewal_alive`。claim 済みの読み出し拒否は `src/service/logs.rs:1113` と `src/service/outputs.rs:1011`。
+- 実行中・回収中・保持対象を消さない: 結果は `src/storage/tests.rs:5158` `result_retention_keeps_unknown_unacked_open_and_pinned_references` と `tests/it/collection.rs:1344` `collected_results_are_kept_for_the_retention_and_then_deleted`。Source は `src/source/retention.rs:2807` `deletion_rejects_foreign_owner_moved_database_and_shared_reader`、Vault は `:3976` `vault_fresh_exact_owner_digest_queue_and_collection_proofs_are_required`。
+- 件数上限: 結果は 1 ページ 32 件（`src/storage/tests.rs:4978` `result_retention_claims_bounded_pages_and_replays_only_known_claims`）、Source は `src/source/retention.rs:2628` `deletion_pages_33_and_65_preserve_original_and_metadata`、Vault は `:3741` `vault_page_is_bounded_and_requires_terminal_exact_proof`、常駐の driver は `src/service/resident/input_retention.rs:357` `default_source_seven_days_and_vault_zero_have_independent_clocks_and_exact_scope`（65 files を 1 ページ最大 32）。
+- 時計の跳躍: 純粋部分は `src/results/clock_policy.rs:209` `forward_jump_requarantines_then_follows_the_new_wall` ほか 6 件、Source は `src/source/retention.rs:2719` `deletion_clock_holds_also_stop_physical_claim_replay`、Vault は `:3685` `vault_claim_replay_clock_holds_and_changed_target_stays`。
+- Source と Vault の削除の常駐への接続: `src/service/resident.rs:801` が `src/service/resident/input_retention.rs:47` の `Driver::page` を 60 秒ごとに 1 ページ呼ぶ。実 loop 経由は `:404` `automatic_loop_registers_and_erases_only_closed_vault_copies`（Vault）と `src/service/resident/tests.rs:97` `input_gc_blocking_page_keeps_ipc_renewals_and_owner_until_stop_drain`。Source の 7 日経過は実 loop では待てないため、loop が呼ぶ `Driver::page` に時計の sample を渡す `:357` で確かめている。
+- 削除前の所有確認と途中の停止からの再開: Source は `src/source/retention.rs:2681` `deletion_claim_crash_boundaries_replay_only_durable_exact_claims` と `:3046` `deletion_ancestor_swap_claim_identity_and_missing_notfound_rules`、Vault は `src/secrets/vault/guard.rs:550` `vault_exact_leaf_rejects_symlink_hardlink_and_missing_claim_recreation`、秘密付き run の Source を Vault より先に消さないことは `src/source/retention.rs:3373` `source_gc_preserves_secret_proof_before_vault_and_pending_claim`。
+
+S15e（未実装だったもの。この変更で実装）
+
+- retention L1（PR #45 のレビューで先送り）: 親が `Lease::publish` の途中で止まると、Vault に平文の一時ファイルが残り、link 後なら bundle の名前が 2 つになって読み取りがすべて拒否され、その run の Vault と Source の削除も永久に進まなかった。親では一時ファイルの掃除（`sweep_stale_tmp`）が一度も呼ばれていなかった。`src/secrets/vault/guard.rs:352` の `Lease::sweep_orphan_tmp` を足し、`vault_retention_page` が排他 lease・祖先・owner・登録の確認の後、時計の Hold と旧入力の保留より前に、1 ページ最大 32 件を消す。Vault の一時ファイルを作るのは lease を持つ `publish` だけなので、排他 lease を取れた時点の残りは書き手のいない残骸であり、経過時間と時計を条件にしない（C 節の「clock Hold は物理 replay も止める」は保持対象の claim の話で、どの run にも属さない未公開の一時ファイルには当てはめない）。消すのは、名前が `.<run>.json.<ulid>.tmp` か `.parent-retention.json.<ulid>.tmp` に厳密に一致し、symlink を辿らずに見て自分が所有する 0600 の通常ファイルで、link が 1 つ、または 2 つでもう一方がその公開先と同じ inode のものだけである。root FD 相対で unlink し、root を fsync する。それ以外は残して unknown に数え、一時ファイルを bundle へ昇格させない。
+  - テスト: 名前の判定 `:677` `orphan_tmp_target_accepts_only_publication_temporaries`、link の前後で止まった 2 通りからの回復と共有 lease での拒否 `:707` `orphan_sweep_recovers_a_publication_that_died_before_or_after_the_link`、symlink・directory・別 inode の hard link・別の公開名への link・0644 を残すこと `:744` `orphan_sweep_retains_whatever_is_not_provably_a_dead_publication`、33 件が 32 件と 1 件に分かれること `:783` `orphan_sweep_is_bounded_per_call_and_resumes`（以上 `src/secrets/vault/guard.rs`）。ページ経由は `src/source/retention.rs:3770` `vault_page_recovers_crashed_publication_despite_holds_and_then_claims`（reader がいる間は busy で 0 件、時計の Hold 中でも回復し、回復後に通常どおり claim して消す）。実 loop 経由は `src/service/resident/input_retention.rs:527` `automatic_loop_recovers_a_crashed_vault_publication_while_deletion_is_held`。
+  - 再起動から最初の Vault ページ（最大で約 60 秒後）までの間、名前が 2 つの bundle に当たった delivery は成立せずに再試行され、retry は `SecretUnavailable` で拒否する。どちらも run の状態を変えない。
+
+S15e（実装済みだがテストが無かったもの。この変更でテストを追加）
+
+- retention L5（同じく先送り）: state dir の祖先に symlink があると Source と Vault の削除が止まる、という指摘。止まるのは仕様どおりである（削除は祖先を NOFOLLOW で開き直して対象を確かめる。path を解決して受け入れると、起動後の差し替えと区別できない）。正しい直し方は「起動時に明示して拒否する」で、これは `validate_components`（`src/service/resident.rs:1536`）として `init`・常駐の起動・bootstrap の読み取りにすでに入っていた。したがって指摘の筋書き（symlink 配下で常駐が動き続け、削除だけが永久に止まる）は公開の経路からは起きない。祖先が symlink の場合のテストだけが無かった（既存は state dir 自体が symlink の場合）。src は変更していない。
+  - 追加: `tests/it/resident.rs:476` `resident_rejects_a_symlinked_state_ancestor_before_creating_any_state`（親と worker の state、新規と既存の両方で拒否し、実体側に何も作らない。同じ場所を symlink なしで指せば起動する）、`src/service/init/tests.rs:137` `directories_are_never_created_through_a_symlinked_ancestor`。
+  - 起動後に差し替わった場合: Source は既存の `src/source/retention.rs:3201` `deletion_symlinked_state_ancestor_never_creates_expiry`。Vault 側が無かったため `:3822` `vault_symlinked_state_ancestor_holds_the_page_and_keeps_every_file` を足した（claim も unlink も一時ファイルの掃除も行わず、元に戻せば次のページで再開する）。
+  - spec 第 22 章と結果 retention の節に、上の 2 点（公開途中の停止からの回復、state path の symlink の扱い）を書いた。
+- 常駐の driver での時計の跳躍: ページ単位の検証はあったが、常駐が呼ぶ `Driver::page` で Source の 7 日が短くならないことの検証が無かった。`src/service/resident/input_retention.rs:473` `wall_jump_unknown_boot_and_reboot_never_shorten_automatic_source_retention` を足した（壁時計だけの前進、boot 不明、再起動のいずれでも消さず、一貫した時計で 7 日経てば消す）。
+
+未了（この確認で完了と扱わないもの）
+
+- 統合 HEAD の全体 local-ci・mutation・リモート CI と remote worker での検証（親の gate）。
+- 既存の節に記した残件: 未登録の旧入力（unknown legacy）の bounded reconciliation（残っている間は Source と Vault の新規 claim を全体で保留する）、received root の永久保持、private in-place binding の GC。
+- PR #45 のレビューの L2〜L4（retire 済みで非 terminal の attempt と結果 GC、旧版の `pending_delete` 行、`retention.lock` の書き込み途中の停止）はこの行の依頼に含まれておらず、扱っていない。
+- 結果 GC の loop（`src/service/resident.rs:772`）は、ページがエラーを返すと常駐全体を止める。入力側の loop はエラーを数えて次の tick に再試行する。どちらに揃えるかは未決定で、変更していない。
+- state path の symlink を拒否する方針のため、home が symlink 配下にある利用者は `init` できない。path を解決して受け入れる方針への変更は、managed service の結び付け（state path の一致）と全入口に及ぶため、この行では行っていない。
+- `sweep_orphan_tmp` は新しい unlink の経路である。削除専任のレビューは受けていない。
+
+検証（手元、rustc 1.100.0）: VERIFY_PLACEHOLDER
 
 ### 準備 identity の元 sample freshness と stored-task preview 接続
 

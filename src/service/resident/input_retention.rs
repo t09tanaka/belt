@@ -187,6 +187,9 @@ mod tests {
     use crate::storage::NewAttempt;
     use std::collections::BTreeMap;
 
+    // `run` is also the usual name of a run identifier in these tests.
+    use super::run as run_loop;
+
     struct Fixture {
         root: tempfile::TempDir,
         input: PathBuf,
@@ -465,6 +468,93 @@ mod tests {
             std::fs::read(f.input.join(".env")).unwrap(),
             b"TOKEN=private-fixture\n"
         );
+    }
+    #[test]
+    fn wall_jump_unknown_boot_and_reboot_never_shorten_automatic_source_retention() {
+        const WEEK: u64 = 7 * 24 * 60 * 60 * 1000;
+        let f = Fixture::new();
+        let run = f.bind(false);
+        f.terminal(&run, true);
+        let manifest = f.manifest_path(&run);
+        let mut driver = Driver::default();
+        // Twelve consecutive pages reach every phase several times.
+        let mut pages = |wall: u64, mono: u64, boot: Option<&str>| {
+            for i in 0..12 {
+                let report = driver
+                    .page(
+                        f.owner.store(),
+                        &f.captured,
+                        7,
+                        Sample {
+                            wall: wall + i,
+                            mono: mono + i,
+                            boot: boot.map(str::to_owned),
+                        },
+                    )
+                    .unwrap();
+                assert!(report.paths <= 32);
+            }
+        };
+        pages(1_000, 10, Some("first-boot"));
+        assert!(manifest.exists());
+        // The wall clock alone moves past the retention.
+        pages(1_000 + 2 * WEEK, 100, Some("first-boot"));
+        assert!(manifest.exists(), "a wall jump authorized deletion");
+        // No boot identity: the monotonic clock proves nothing.
+        pages(1_000 + 4 * WEEK, 100 + 2 * WEEK, None);
+        assert!(manifest.exists(), "an unknown boot authorized deletion");
+        // A reboot starts the quarantine again, whatever the wall clock says.
+        pages(1_000 + 6 * WEEK, 50, Some("second-boot"));
+        pages(
+            1_000 + 7 * WEEK - 1_000,
+            50 + WEEK - 1_000,
+            Some("second-boot"),
+        );
+        assert!(manifest.exists(), "a reboot shortened the quarantine");
+        pages(
+            1_000 + 7 * WEEK + 1_000,
+            50 + WEEK + 1_000,
+            Some("second-boot"),
+        );
+        assert!(
+            !manifest.exists(),
+            "a consistent clock never resumed deletion"
+        );
+        assert_eq!(std::fs::read(f.input.join("file")).unwrap(), b"original");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_loop_recovers_a_crashed_vault_publication_while_deletion_is_held() {
+        let f = Fixture::new();
+        let run = f.bind(true);
+        f.terminal(&run, true);
+        // Unknown legacy input holds every new claim of both stores.
+        let unknown = f.captured.sources.root().join("manifests/unknown-entry");
+        std::fs::write(&unknown, b"unknown").unwrap();
+        // The parent died between linking the bundle and unlinking its
+        // temporary name: the bundle has two names and no reader accepts it.
+        let secrets = f.captured.parent_state.join("secrets");
+        let bundle = secrets.join(format!("{run}.json"));
+        let orphan = secrets.join(format!(".{run}.json.{}.tmp", ulid::Ulid::new()));
+        std::fs::hard_link(&bundle, &orphan).unwrap();
+        assert!(!f.captured.vault.has(&run));
+        f.captured.retention_test.fast();
+        let (stop, rx) = watch::channel(false);
+        let task = tokio::spawn(run_loop(f.owner.clone(), f.captured.clone(), 7, rx));
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            while orphan.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        recovered.unwrap();
+        // Readable again, and still retained: the hold stays in force.
+        assert!(f.captured.vault.has(&run));
+        assert!(bundle.exists());
+        assert!(f.manifest_path(&run).exists());
+        assert_eq!(std::fs::read(unknown).unwrap(), b"unknown");
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn automatic_unknown_legacy_is_retained_without_stopping_runtime() {
