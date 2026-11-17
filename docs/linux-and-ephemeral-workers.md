@@ -109,6 +109,9 @@ the entry.
 - When the same worker is started again, it comes back with a new identity.
   The parent refuses the new identity until you forget the previous one.
   The previous identity can reconnect and report its attempts in the meantime.
+  Run `remote-task-runner workers` to see the registered SSH destination,
+  connection state and recorded identity. If the resident cannot answer, the
+  connection state is `unknown`. Add `--json` for the same fields as JSON.
 - When the previous worker is gone, say so:
 
   ```

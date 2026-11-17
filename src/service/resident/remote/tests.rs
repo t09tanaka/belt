@@ -567,6 +567,25 @@ async fn an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_res
         )
         .await
         .unwrap();
+    let observe = || {
+        let (client, id) = (client.clone(), id.clone());
+        async move {
+            let reply = client
+                .request(Operation::ListWorkers {
+                    names: vec![id.clone()],
+                })
+                .await
+                .unwrap();
+            let Reply::WorkersListed { mut observations } = reply else {
+                panic!("{reply:?}")
+            };
+            observations.remove(&id).unwrap()
+        }
+    };
+    assert_eq!(
+        observe().await,
+        (true, Some(hello.worker_boot_id.to_string()))
+    );
     // Connected: it answers for itself.
     assert_eq!(refused(forget("colab-1").await), ErrorCode::Conflict);
     assert!(!coordinator
@@ -574,6 +593,16 @@ async fn an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_res
         .await
         .unwrap());
     assert!(coordinator.detach_link(&id, &link).await.unwrap());
+    let mut restarted = hello.clone();
+    restarted.worker_boot_id = WorkerBootId::parse("os-boot.start-2").unwrap();
+    let conflict = admit(&coordinator, &ephemeral, &restarted)
+        .await
+        .unwrap_err();
+    assert!(conflict.to_string().contains("use workers forget"));
+    assert_eq!(
+        observe().await,
+        (false, Some(hello.worker_boot_id.to_string()))
+    );
     match forget("colab-1").await {
         Reply::WorkerForgotten {
             identity_retired,
@@ -581,6 +610,7 @@ async fn an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_res
         } => assert!(identity_retired && ended.is_empty()),
         other => panic!("{other:?}"),
     }
+    assert_eq!(observe().await, (false, None));
     // The forgotten identity comes back late: refused before it is attached.
     let late = admit(&coordinator, &ephemeral, &hello).await.unwrap_err();
     assert!(late.to_string().contains("retired"), "{late}");
