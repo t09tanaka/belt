@@ -2093,3 +2093,34 @@ async fn retry_rpc_waits_for_source_gc_before_input_lease_and_reports_typed_expi
     ));
     owner.await.unwrap().unwrap();
 }
+
+#[test]
+fn a_run_of_ci_tasks_is_a_request_an_older_resident_refuses() {
+    let ci = TaskSpec {
+        ci: Some(crate::coordinator::CiSpec {
+            task: crate::wire::CiTask {
+                plan_digest: Digest::of_bytes(b"plan"),
+                task_id: "t".into(),
+                inputs: serde_json::json!({}),
+            },
+            hold: false,
+            steps: 1,
+        }),
+        commands: vec![],
+        ..delivery_spec(Digest::of_bytes(b"manifest"), false)
+    };
+    let submit = |spec: TaskSpec| Operation::SubmitCaptured {
+        run_id: RunId::generate(),
+        source_id: SourceId::generate(),
+        tasks: vec![(TaskId::generate(), spec)],
+    };
+    assert!(submit(ci.clone()).requires_ci());
+    assert!(!submit(delivery_spec(Digest::of_bytes(b"manifest"), false)).requires_ci());
+    assert!(!Operation::Ping.requires_ci());
+    let plain = Operation::Submit {
+        run_id: RunId::generate(),
+        source_id: SourceId::generate(),
+        tasks: vec![(TaskId::generate(), ci)],
+    };
+    assert!(plain.requires_ci());
+}

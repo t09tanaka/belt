@@ -253,3 +253,154 @@ fn setup_survives_queue_serialization_and_payload_construction() {
         serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
     assert_eq!(roundtrip.setup, task.setup);
 }
+
+// ------------------------------------------------------------- CI tasks
+
+/// A task of a CI plan, with `steps` commands in the plan.
+fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
+    TaskSpec {
+        ci: Some(CiSpec {
+            task: crate::wire::CiTask {
+                plan_digest: Digest::of_bytes(b"plan"),
+                task_id: "ci.yml/build".into(),
+                inputs: serde_json::json!({"needs": {}}),
+            },
+            hold,
+            steps,
+        }),
+        commands: vec![],
+        ..spec()
+    }
+}
+
+#[test]
+fn a_worker_without_ci_tasks_is_left_out_of_ci_tasks_only() {
+    assert!(policy::lacks_ci_task(&ci_spec(false, 1), false));
+    assert!(!policy::lacks_ci_task(&ci_spec(false, 1), true));
+    assert!(!policy::lacks_ci_task(&spec(), false));
+    assert!(!policy::lacks_ci_task(&spec(), true));
+    assert_eq!(policy::CI_TASK_UNMET, "protocol feature ci_task_v1");
+}
+
+#[test]
+fn the_declarations_of_a_ci_task_leave_room_for_its_result() {
+    let max = crate::outputs::MAX_OUTPUTS;
+    assert!(policy::ci_declarations_fit(0, 0));
+    assert!(policy::ci_declarations_fit(max - 1, 0));
+    assert!(policy::ci_declarations_fit(1, max - 2));
+    assert!(!policy::ci_declarations_fit(max, 0));
+    assert!(!policy::ci_declarations_fit(1, max - 1));
+    assert!(!policy::ci_declarations_fit(usize::MAX, 1));
+}
+
+#[test]
+fn the_forecast_of_a_ci_task_is_asked_for_every_step_of_the_plan() {
+    let a = AttemptId::generate();
+    let plan = policy::workload_of_spec(&a, &ci_spec(false, 3), Some(40));
+    let names: Vec<&str> = plan.nodes.iter().map(|n| n.node_id.as_str()).collect();
+    assert_eq!(names, ["step-0", "step-1", "step-2"]);
+    assert_eq!(plan.plan_digest, Digest::of_bytes(b"plan"));
+    assert_eq!(plan.attempt_id, a);
+    assert!(plan.nodes[0].depends_on.is_empty());
+    assert_eq!(plan.nodes[1].depends_on, [plan.nodes[0].node_id.clone()]);
+    assert_eq!(plan.nodes[2].depends_on, [plan.nodes[1].node_id.clone()]);
+    // Only the first step waits for the workspace.
+    let delays: Vec<_> = plan.nodes.iter().map(|n| n.external_delay_ms).collect();
+    assert_eq!(delays, [Some(40), None, None]);
+    assert!(plan.nodes.iter().all(|n| n.correlation.attempt_id == a));
+    assert_eq!(plan.nodes[2].correlation.node_id, plan.nodes[2].node_id);
+    assert!(policy::workload_of_spec(&a, &ci_spec(false, 0), None).nodes.is_empty());
+    // A task of commands is asked for its commands, as before.
+    let commands = policy::workload_of_spec(&a, &spec(), Some(40));
+    assert_eq!(commands.nodes.len(), 1);
+    assert_eq!(commands.nodes[0].node_id.as_str(), "main");
+    assert_eq!(commands.nodes[0].external_delay_ms, Some(40));
+}
+
+#[tokio::test]
+async fn a_ci_task_is_queued_without_commands_and_what_no_worker_takes_is_refused() {
+    let f = fx();
+    let source = SourceId::generate();
+    let store = f.c.store();
+    store.put_source_ref(&source, &Digest::of_bytes(b"manifest"), 1).unwrap();
+    let enqueue = |spec: TaskSpec| {
+        let (c, source) = (&f.c, source.clone());
+        async move {
+            let task = TaskId::generate();
+            let run = RunId::generate();
+            let result = c.enqueue(run, source, vec![(task.clone(), spec)]).await;
+            result.map(|()| task).map_err(|e| e.to_string())
+        }
+    };
+    // A task of commands still needs one.
+    let mut bare = spec();
+    bare.commands.clear();
+    assert!(enqueue(bare).await.unwrap_err().contains("no command"));
+    let mut both = ci_spec(false, 1);
+    both.commands = spec().commands;
+    assert!(enqueue(both).await.unwrap_err().contains("no commands"));
+    let mut secrets = ci_spec(false, 1);
+    secrets.has_secret_bundle = true;
+    assert!(enqueue(secrets).await.unwrap_err().contains("secret files"));
+    let mut reserved = ci_spec(false, 1);
+    reserved.artifacts = vec![ArtifactDecl {
+        name: "rtr-ci-task-result.json".into(),
+        path: "x".into(),
+        if_missing: crate::wire::MissingPolicy::Optional,
+    }];
+    assert!(enqueue(reserved).await.unwrap_err().contains("reserved"));
+    let mut many = ci_spec(false, 1);
+    many.artifacts = (0..crate::outputs::MAX_OUTPUTS)
+        .map(|n| ArtifactDecl {
+            name: format!("a{n}"),
+            path: format!("a{n}"),
+            if_missing: crate::wire::MissingPolicy::Optional,
+        })
+        .collect();
+    assert!(enqueue(many).await.unwrap_err().contains("too many"));
+
+    // A task that waits is a task of its run, and is not in the queue.
+    let ready = enqueue(ci_spec(false, 2)).await.unwrap();
+    let held = enqueue(ci_spec(true, 2)).await.unwrap();
+    let queued: Vec<TaskId> = store.queued_tasks(16).unwrap().into_iter().map(|t| t.task_id).collect();
+    assert_eq!(queued, [ready.clone()]);
+    let waiting = store.ci_waiting_runs(16).unwrap();
+    assert_eq!(waiting.len(), 1);
+    let rows = store.ci_run_tasks(&waiting[0]).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].task_id, held);
+    assert!(rows[0].attempt.is_none() && !rows[0].cancelled);
+    // It cannot be placed while it waits.
+    let attempt = AttemptId::generate();
+    let place = |task: &TaskId, attempt: &AttemptId| {
+        store
+            .place(task, &f.worker, attempt, |_| true, |input| demand_of(input, 60_000), 2)
+            .unwrap()
+    };
+    assert!(!matches!(place(&held, &attempt), PlaceOutcome::Placed(_)));
+    // Released with its inputs, it is queued like any other.
+    let released = serde_json::to_value(ci_spec(false, 2)).unwrap();
+    assert!(store.release_ci_task(&held, &released, 5).unwrap());
+    assert!(!store.release_ci_task(&held, &released, 6).unwrap(), "once");
+    assert_eq!(store.queued_tasks(16).unwrap().len(), 2);
+    assert!(store.ci_waiting_runs(16).unwrap().is_empty());
+
+    // The placement keeps the number of steps: the payload does not say
+    // it, and the next forecast question carries the work that was placed.
+    assert!(matches!(place(&held, &attempt), PlaceOutcome::Placed(_)));
+    let demand = store.placement_demand(&attempt).unwrap().unwrap();
+    assert_eq!(demand["ci_steps"], 2);
+    assert!(demand["payload"]["ci_task"].is_object());
+    let pending = crate::scheduler::pending_plans(store, &f.worker).unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].attempt_id, attempt);
+    let names: Vec<&str> = pending[0].nodes.iter().map(|n| n.node_id.as_str()).collect();
+    assert_eq!(names, ["step-0", "step-1"]);
+    // A task of commands has no such number.
+    let (_task, other) = f.placed().await;
+    let demand = store.placement_demand(&other).unwrap().unwrap();
+    assert!(demand.get("ci_steps").is_none());
+    let pending = crate::scheduler::pending_plans(store, &f.worker).unwrap();
+    assert_eq!(pending.len(), 2);
+    assert_eq!(pending[1].nodes[0].node_id.as_str(), "main");
+}

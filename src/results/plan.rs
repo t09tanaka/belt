@@ -508,6 +508,12 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_result_of_a_ci_task_is_complete_only_when_it_can_be_used() {
+        assert_eq!(judge_ci_result(true), Verdict::Complete);
+        assert_eq!(judge_ci_result(false), Verdict::RequiredMissing);
+    }
+
+    #[test]
     fn the_constants_are_what_the_spec_says() {
         assert_eq!(MAX_STRIKES, 3);
         assert_eq!(MAX_ARTIFACTS, 1024);
