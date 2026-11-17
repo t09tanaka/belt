@@ -2109,7 +2109,7 @@ mod sync {
         let err = read_project_requirements(root).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidInput);
         assert!(
-            err.message.contains("no version files found"),
+            err.message.contains("no version files or workflows found"),
             "{}",
             err.message
         );
@@ -2154,6 +2154,311 @@ mod sync {
         fs::write(root.join(".nvmrc"), "18\n").unwrap();
         fs::write(root.join(".node-version"), "20\n").unwrap();
         assert!(read_project_requirements(root).is_err());
+    }
+
+    fn workflow(root: &Path, dir: &str, name: &str, text: &str) {
+        fs::create_dir_all(root.join(dir)).unwrap();
+        fs::write(root.join(dir).join(name), text).unwrap();
+    }
+    fn job(version: &str) -> String {
+        format!(
+            "name: t\non: push\njobs:\n  a:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version: {version}\n"
+        )
+    }
+
+    #[test]
+    fn project_requirements_include_the_setup_inputs_of_the_workflows() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let root = dir.path();
+        // Only a workflow: its setup input is the requirement.
+        workflow(root, ".github/workflows", "ci.yml", &job("20.1.0"));
+        let reqs = read_project_requirements(root).unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].tool.as_str(), "node");
+        // `.ci/workflows` is read as well, and a second version of the tool
+        // is a requirement of its own.
+        workflow(root, ".ci/workflows", "other.yaml", &job("18.2.0"));
+        assert_eq!(read_project_requirements(root).unwrap().len(), 2);
+        // Files that are not workflows are not read.
+        workflow(root, ".ci/workflows", "notes.txt", "not yaml: [");
+        assert_eq!(read_project_requirements(root).unwrap().len(), 2);
+        // A version file the workflow names is read from the project.
+        workflow(
+            root,
+            ".github/workflows",
+            "file.yml",
+            "name: t\non: push\njobs:\n  a:\n    runs-on: x\n    steps:\n      - uses: actions/setup-node@v4\n        with:\n          node-version-file: .tool-node\n",
+        );
+        let err = read_project_requirements(root).unwrap_err();
+        assert!(
+            err.message.contains("missing_version_file"),
+            "{}",
+            err.message
+        );
+        fs::write(root.join(".tool-node"), "16.5.0\n").unwrap();
+        assert_eq!(read_project_requirements(root).unwrap().len(), 3);
+        // An unresolved expression stays an expression, for the plan to say.
+        workflow(
+            root,
+            ".github/workflows",
+            "m.yml",
+            &job("${{ matrix.node }}"),
+        );
+        let reqs = read_project_requirements(root).unwrap();
+        assert!(reqs.iter().any(|r| r
+            .constraints
+            .iter()
+            .any(|c| matches!(c, crate::toolchain::versions::Constraint::Expression(_)))));
+    }
+
+    #[test]
+    fn project_workflows_contradicting_the_project_files_fail_with_a_location() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".node-version"), "18.0.0\n").unwrap();
+        // The workflow's own step is narrower than the project's file, and
+        // they cannot both hold.
+        workflow(root, ".github/workflows", "ci.yml", &job("20.1.0"));
+        let err = read_project_requirements(root).unwrap_err();
+        assert!(
+            err.message.contains("conflicting_versions"),
+            "{}",
+            err.message
+        );
+        // A workflow that does not parse is said with its name.
+        fs::remove_file(root.join(".node-version")).unwrap();
+        workflow(root, ".github/workflows", "ci.yml", "jobs: [");
+        let err = read_project_requirements(root).unwrap_err();
+        assert!(err.message.contains("ci.yml"), "{}", err.message);
+    }
+
+    #[test]
+    fn project_workflows_are_not_read_through_links() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let root = dir.path();
+        let outside = crate::test_tmp::tempdir().unwrap();
+        fs::write(outside.path().join("ci.yml"), job("20.1.0")).unwrap();
+        // A linked workflow directory is not followed: nothing is found.
+        fs::create_dir_all(root.join(".github")).unwrap();
+        std::os::unix::fs::symlink(outside.path(), root.join(".github/workflows")).unwrap();
+        let err = read_project_requirements(root).unwrap_err();
+        assert!(
+            err.message.contains("no version files or workflows"),
+            "{}",
+            err.message
+        );
+        // A linked workflow file is refused.
+        fs::remove_file(root.join(".github/workflows")).unwrap();
+        fs::create_dir(root.join(".github/workflows")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path().join("ci.yml"),
+            root.join(".github/workflows/ci.yml"),
+        )
+        .unwrap();
+        let err = read_project_requirements(root).unwrap_err();
+        assert!(
+            err.message.contains("not a small regular file"),
+            "{}",
+            err.message
+        );
+        // Too many workflows.
+        fs::remove_file(root.join(".github/workflows/ci.yml")).unwrap();
+        for n in 0..=crate::toolchain::declarations::MAX_DOCUMENTS {
+            fs::write(root.join(format!(".github/workflows/w{n}.yml")), "").unwrap();
+        }
+        let err = read_project_requirements(root).unwrap_err();
+        assert!(
+            err.message.contains("too many workflow files"),
+            "{}",
+            err.message
+        );
+    }
+}
+
+/// Hands out copies of itself, so the asks of `fan_out` run together; every
+/// ask for an env measurement meets the others first, and is answered with
+/// `reply`.
+struct Together {
+    gate: Option<std::sync::Arc<meeting::Gate>>,
+    reply: Vec<u8>,
+}
+impl Remote for Together {
+    fn split(&self) -> Option<Box<dyn Remote + Send>> {
+        Some(Box::new(Together {
+            gate: self.gate.clone(),
+            reply: self.reply.clone(),
+        }))
+    }
+    fn run(
+        &mut self,
+        _: &SshTarget,
+        shell: &str,
+        _: &[u8],
+        _: Duration,
+    ) -> Result<RemoteOutput, String> {
+        assert!(shell.contains("'worker-service' 'env'"), "{shell}");
+        if let Some(gate) = &self.gate {
+            gate.meet()?;
+        }
+        Ok(RemoteOutput {
+            code: Some(0),
+            stdout: self.reply.clone(),
+            stderr: vec![],
+        })
+    }
+    fn bridge_hello(
+        &mut self,
+        _: &SshTarget,
+        _: &str,
+        _: &ClusterId,
+    ) -> Result<(ClusterId, WorkerId), String> {
+        Err("unused".into())
+    }
+}
+
+#[test]
+fn diff_of_every_worker_asks_them_at_the_same_time_and_keeps_the_order() {
+    let mut w = World::new();
+    for (name, host) in [
+        ("mini-a", "ci@host-a"),
+        ("mini-b", "ci@host-b"),
+        ("mini-c", "ci@host-c"),
+    ] {
+        w.add(name, Some(host), true).unwrap();
+    }
+    let reply = format!(
+        "{}\n",
+        serde_json::json!({"ok": true, "env": parent_report()})
+    );
+    let mut together = Together {
+        // Nobody is answered before all three are asking: a serial run fails.
+        gate: Some(meeting::Gate::new(3)),
+        reply: reply.into_bytes(),
+    };
+    let all = diff_workers(&mut together, &w.env, &w.exe, None, || Ok(parent_report())).unwrap();
+    assert_eq!(
+        all.iter().map(|d| d.worker.as_str()).collect::<Vec<_>>(),
+        ["mini-a", "mini-b", "mini-c"]
+    );
+    assert!(
+        all.iter().all(|d| d.error.is_none() && d.all_same),
+        "{all:?}"
+    );
+    // A named worker is one ask: no gate of three is waited for.
+    together.gate = None;
+    let one = diff_workers(&mut together, &w.env, &w.exe, Some("mini-b"), || {
+        Ok(parent_report())
+    })
+    .unwrap();
+    assert_eq!(one.len(), 1);
+}
+
+/// Counts how many asks are inside `run` at once.
+struct Counting {
+    inside: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    most: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    splits: bool,
+}
+impl Remote for Counting {
+    fn split(&self) -> Option<Box<dyn Remote + Send>> {
+        self.splits.then(|| {
+            Box::new(Counting {
+                inside: self.inside.clone(),
+                most: self.most.clone(),
+                splits: true,
+            }) as Box<dyn Remote + Send>
+        })
+    }
+    fn run(
+        &mut self,
+        _: &SshTarget,
+        _: &str,
+        _: &[u8],
+        _: Duration,
+    ) -> Result<RemoteOutput, String> {
+        use std::sync::atomic::Ordering::SeqCst;
+        let now = self.inside.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(now, SeqCst);
+        std::thread::sleep(Duration::from_millis(40));
+        self.inside.fetch_sub(1, SeqCst);
+        Ok(RemoteOutput {
+            code: Some(0),
+            stdout: vec![],
+            stderr: vec![],
+        })
+    }
+    fn bridge_hello(
+        &mut self,
+        _: &SshTarget,
+        _: &str,
+        _: &ClusterId,
+    ) -> Result<(ClusterId, WorkerId), String> {
+        Err("unused".into())
+    }
+}
+
+#[test]
+fn fan_out_is_bounded_ordered_and_serial_when_the_remote_cannot_split() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let target = SshTarget::parse("ci@host").unwrap();
+    let ask = |remote: &mut dyn Remote, n: usize| {
+        remote
+            .run(&target, "x", &[], Duration::from_secs(1))
+            .unwrap();
+        n
+    };
+    let counting = |splits| Counting {
+        inside: Default::default(),
+        most: Default::default(),
+        splits,
+    };
+    let mut wide = counting(true);
+    let got = fan_out(&mut wide, (0..20).collect(), &ask);
+    assert_eq!(got, (0..20).collect::<Vec<_>>());
+    let most = wide.most.load(SeqCst);
+    assert!((2..=MAX_PARALLEL_WORKERS).contains(&most), "{most} at once");
+    let mut serial = counting(false);
+    assert_eq!(
+        fan_out(&mut serial, (0..5).collect(), &ask),
+        (0..5).collect::<Vec<_>>()
+    );
+    assert_eq!(serial.most.load(SeqCst), 1);
+    // One item, and none, are not split.
+    let mut one = counting(true);
+    assert_eq!(fan_out(&mut one, vec![7], &ask), [7]);
+    assert_eq!(one.most.load(SeqCst), 1);
+    assert!(fan_out(&mut one, Vec::<usize>::new(), &ask).is_empty());
+}
+
+#[test]
+fn both_runs_the_two_at_the_same_time_when_it_can_and_in_order_when_it_cannot() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let target = SshTarget::parse("ci@host").unwrap();
+    let ask = |remote: &mut dyn Remote| {
+        remote
+            .run(&target, "x", &[], Duration::from_secs(1))
+            .unwrap();
+    };
+    for (splits, expected) in [(true, 2), (false, 1)] {
+        let mut remote = Counting {
+            inside: Default::default(),
+            most: Default::default(),
+            splits,
+        };
+        let most = remote.most.clone();
+        let (a, b) = both(
+            &mut remote,
+            |r| {
+                ask(r);
+                1
+            },
+            |r| {
+                ask(r);
+                2
+            },
+        );
+        assert_eq!((a, b), (1, 2));
+        assert_eq!(most.load(SeqCst), expected, "splits: {splits}");
     }
 }
 

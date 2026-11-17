@@ -51,6 +51,9 @@ pub(super) struct Warmup {
     /// The first look was taken: only that one lifts a remembered install
     /// failure of the versions asked for.
     looked: bool,
+    /// The parent ended the sync while a look was under way: the look that is
+    /// running lets go of the install and forgets the warm-up when it ends.
+    cancelled: bool,
 }
 
 /// What a request is answered from: what is decided, the rest `pending`.
@@ -204,6 +207,12 @@ impl Agent {
                     result(&tool.name, (outcome, message))
                 })
                 .collect()
+        } else if r.tools.is_empty() {
+            // Asking about no tool at all ends the warm-up of that id: the
+            // parent is not waiting for it any more. (A worker that does not
+            // know this answers a conflict, and lets the idle time end it.)
+            self.end_warm_up(&r.sync_id.to_string());
+            Vec::new()
         } else {
             self.warm_up(&r)?
         };
@@ -211,6 +220,24 @@ impl Agent {
             schema_version: SchemaVersion::CURRENT,
             results,
         })
+    }
+
+    /// Let go of the reference of the warm-up `id` now, as the idle time would
+    /// later: the last reference stops the install. A look that is under way
+    /// ends it when it comes back.
+    fn end_warm_up(&self, id: &str) {
+        let mut warmups = lock(&self.warmups);
+        let Some(warmup) = warmups.get_mut(id) else {
+            return;
+        };
+        if warmup.looking {
+            warmup.cancelled = true;
+            return;
+        }
+        if !warmup.released {
+            self.host.setup_release(&warmup.consumer);
+        }
+        warmups.remove(id);
     }
 
     fn warm_up(self: &Arc<Self>, r: &EnvSyncRequest) -> Result<Vec<ToolSyncResult>, ApiError> {
@@ -246,6 +273,7 @@ impl Agent {
                         released: false,
                         looking: false,
                         looked: false,
+                        cancelled: false,
                     },
                 );
             }
@@ -344,8 +372,13 @@ impl Agent {
             }
             // Nothing is waited for any more (a timed-out install loses this
             // reference, and stops if it was the last one).
-            let release = warmup.done.len() == warmup.tools.len() && !warmup.released;
+            let cancelled = warmup.cancelled;
+            let release =
+                (warmup.done.len() == warmup.tools.len() || cancelled) && !warmup.released;
             warmup.released |= release;
+            if cancelled {
+                warmups.remove(id);
+            }
             release
         };
         if release {
@@ -453,6 +486,7 @@ mod tests {
             released: false,
             looking: true,
             looked: true,
+            cancelled: false,
         };
         assert_eq!(
             known(&warmup),

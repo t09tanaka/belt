@@ -69,6 +69,14 @@ pub fn apply_step_env(env: &mut BTreeMap<String, String>, scope: &BTreeMap<Strin
     env.extend(scope.iter().map(|(k, v)| (k.clone(), v.clone())));
 }
 
+/// The digest of an effective configuration (the policy of its scope).
+/// `None` only when the configuration cannot be serialized.
+pub fn policy_digest(config: &task_traffic_controller::config::Config) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = serde_json::to_vec(config).ok()?;
+    Some(format!("sha256:{:x}", Sha256::digest(bytes)))
+}
+
 /// The state directory and the configuration file of one scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scope {

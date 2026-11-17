@@ -21,6 +21,7 @@ pub const DEFAULT_HEARTBEAT_SECONDS: u64 = 5;
 pub const DEFAULT_STALE_SECONDS: u64 = 15;
 pub const DEFAULT_LEASE_SECONDS: u64 = 60;
 pub const DEFAULT_TERM_GRACE_SECONDS: u64 = 10;
+pub const DEFAULT_WARMUP_IDLE_SECONDS: u64 = 60;
 pub const DEFAULT_FORECAST_TTL_MS: u64 = 2000;
 pub const DEFAULT_PREFETCH_PER_WORKER: u32 = 1;
 pub const DEFAULT_MAX_ACTIVE_TASK: u32 = 2;
@@ -122,6 +123,7 @@ pub struct ResolvedConfig {
     pub stale_seconds: Value<u64>,
     pub lease_seconds: Value<u64>,
     pub term_grace_seconds: Value<u64>,
+    pub warmup_idle_seconds: Value<u64>,
     pub max_active_task: Value<u32>,
     pub log_spool_limit_bytes: Value<u64>,
     pub retention_days: Value<u32>,
@@ -205,6 +207,11 @@ impl ResolvedConfig {
             e(
                 "coordinator.term_grace_seconds",
                 &self.term_grace_seconds,
+                |v| v.to_string(),
+            ),
+            e(
+                "coordinator.warmup_idle_seconds",
+                &self.warmup_idle_seconds,
                 |v| v.to_string(),
             ),
             e("coordinator.max_active_task", &self.max_active_task, |v| {
@@ -433,6 +440,12 @@ fn check_timing(r: &ResolvedConfig, problems: &mut Vec<String>) {
         "term_grace_seconds",
         r.term_grace_seconds.value,
         &r.term_grace_seconds.origin,
+    );
+    check_nonzero(
+        problems,
+        "warmup_idle_seconds",
+        r.warmup_idle_seconds.value,
+        &r.warmup_idle_seconds.origin,
     );
     check_nonzero(
         problems,
@@ -780,6 +793,14 @@ pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
             coord.term_grace_seconds,
             DEFAULT_TERM_GRACE_SECONDS,
         ),
+        warmup_idle_seconds: pick(
+            &layers,
+            None,
+            None,
+            None,
+            coord.warmup_idle_seconds,
+            DEFAULT_WARMUP_IDLE_SECONDS,
+        ),
         max_active_task: pick(
             &layers,
             None,
@@ -1059,6 +1080,7 @@ pub struct RuntimeSettings {
     pub heartbeat_ms: u64,
     pub stale_ms: u64,
     pub term_grace_ms: u64,
+    pub warmup_idle_ms: u64,
     pub retention_ms: u64,
     pub log_limit_bytes: u64,
 }
@@ -1107,6 +1129,7 @@ impl ResolvedConfig {
             heartbeat_ms: millis("heartbeat_seconds", self.heartbeat_seconds.value)?,
             stale_ms: millis("stale_seconds", self.stale_seconds.value)?,
             term_grace_ms: millis("term_grace_seconds", self.term_grace_seconds.value)?,
+            warmup_idle_ms: millis("warmup_idle_seconds", self.warmup_idle_seconds.value)?,
             retention_ms: millis(
                 "retention_days",
                 u64::from(self.retention_days.value) * 86400,

@@ -197,6 +197,7 @@ impl ResolvedConfig {
         agent.prefetch_per_worker = settings.coordinator.limits.prefetch_per_worker;
         agent.forecast_ttl_ms = settings.scheduler.rules.forecast_ttl_ms;
         agent.term_grace_ms = settings.term_grace_ms;
+        agent.warmup_idle_ms = settings.warmup_idle_ms;
         agent.log_limit_bytes = settings.log_limit_bytes;
         agent.retention_ms = settings.retention_ms;
         let profile = crate::toolchain::profile::Profile::load(&inputs.state_dir, &inputs.env)
