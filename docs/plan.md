@@ -1083,15 +1083,38 @@ task-traffic-controller と local-ci は RTR の binary に組み込まれてい
 
 A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一時 HOME の `src/service/workers/tests.rs`、実 binary・偽 ssh・偽の tool shim の `tests/it/workers_lifecycle.rs`（`a44`）。ネットワークには出ない。
 
-残り（S21 は完了していない）: `workers sync` の実際の導入（worker 側の warm-up 要求。導入は admitted な setup builder の poll_tool 経由でしか始まらないため、既存の認証済み経路へ要求を足す必要がある。diff が `auto_installable` で「`workers sync`」を案内するのは、この warm-up と一緒に入れる前提）、`doctor` への組み込み（S23）、`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は RTR の版だけで、組み込んだ crate 個別の build 情報は持たない。
+残り（S21 は完了していない）: `workers sync` の実際の導入は 3 本目で入れた（下の節）。`doctor` への組み込み（S23）、`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は RTR の版だけで、組み込んだ crate 個別の build 情報は持たない。
 
 ### S21 `workers sync`（2026-11-17、2 本目: 計画と blocked、導入の差し込み口）
 
 `workers sync <worker> [--project <dir>]` を実装した。計画は純粋関数 `toolchain::envsync::plan(parent, worker, project)`（PURE 対象）で、diff の `auto_installable` を版管理 adapter の導入手順にし、それ以外（`manual_required`・`missing`・`differs`。platform・disk・profile を含む）は導入せず `blocked: environment_mismatch` として不足内容と手順を出し、非 0 で終わる。「in sync」と言うのは `diff` が `all_same` のときだけ（`--project` で宣言された tool が親と違うだけなら「プロジェクトの要求を満たす」と言い、`in_sync: false`）。`--project` は dir 直下の版指定ファイル（`.fvm` を含め途中の symlink も辿らない（`platform::open_beneath`）、各 256KiB 以下、1 つも無ければ InvalidInput）を `declarations` で読み、宣言された tool は親ではなくプロジェクトの要求（導入済みか既定の版が満たせば何もしない、満たす最大の許可済み版を導入、無ければ blocked）に従う。alias（`lts` など）・式は版ではないので導入せず、「具体的な版を指定する」と案内する。導入済みの版は PATH に tool が無くても要求を満たす。
 
-実行は自動導入を先に行い、その後で手動分を blocked として報告する。導入後に worker を測り直し（比較は純粋関数 `envsync::verify`、メッセージは `envsync::render_blocked`）、導入が見えなければ blocked とする。途中で止まったとき（測り直しの失敗、残りの blocked）も、それまでに導入したものをメッセージに含める。導入の失敗は成功にせず、別の版へ切り替えない。導入そのものは `Installer` trait の差し込み口に分け、現在の本番実装 `NoWarmup` は「この版の RTR は worker に導入できない。その版を要求する最初の仕事が導入する、または worker の manager で手で入れる」と報告して何も導入しない（warm-up の PR が入れば使われなくなる）。
+実行は自動導入を先に行い、その後で手動分を blocked として報告する。導入後に worker を測り直し（比較は純粋関数 `envsync::verify`、メッセージは `envsync::render_blocked`）、導入が見えなければ blocked とする。途中で止まったとき（測り直しの失敗、残りの blocked）も、それまでに導入したものをメッセージに含める。導入の失敗は成功にせず、別の版へ切り替えない。導入そのものは `Installer` trait の差し込み口に分けた（本番の実装は 3 本目の `ResidentWarmup`。2 本目の時点の `NoWarmup` は削除した）。
 
 残り（S21 は完了していない）:
-1. 導入の本番経路。導入は admitted な setup builder の `poll_tool` が配置済み attempt を consumer にしてのみ始まる（`install_admitted` は admission 前提で、ssh helper から直接呼べない）。warm-up 要求を既存の認証済み経路（resident の control → coordinator の worker link → wire request → agent が合成 consumer で `toolchain_poll`）へ 1 つ足し、旧 peer は hello の feature 交渉で外す。wire・protocol・coordinator・resident・agent に及ぶため別の作業にする。
+1. 導入の本番経路は 3 本目で入れた（下の節）。
 2. `doctor` への組み込み（S23。`envdiff::diff` は公開済み）。
 3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
+
+### S21 `workers sync` の導入（2026-11-17、3 本目: warm-up の要求）
+
+`workers sync` が worker に実際に導入するようにした。経路は spec 11 章が名前を挙げている `env_sync` で、wire の型は以前からあり、agent が未実装（`NOT_IMPLEMENTED`）だったものを実装した。
+
+- **経路**: `workers sync` → 動いている resident の control 操作 `env_sync`（`Operation::EnvSync`） → `Coordinator::env_sync` → 既に張ってある認証済みの worker link → wire の `env_sync` → worker の agent。ssh で worker のファイルを読み戻すことはしない。admission の lock も SQLite の書き込みも持たない（`resolve_toolchains` と同じ扱い）。
+- **agent の導入**: 親が渡すのは tool 名と厳密な版だけで、導入の内容はすべて worker 自身の registry（`toolchains.toml`）から作る（`Registry::inventory_request`。recipe が無い tool、inventory に無い版、厳密でない版は導入せず、理由を付けて `failed`）。導入は `Host::toolchain_poll` に warm-up 用の consumer を渡して行うので、配置済みの attempt と同じ setup の supervisor・forecast・task-traffic-controller の gate を通る。install plan の key は project や親の profile に依らないため、同じ版の warm-up どうしも、その版を要する attempt も、既存の singleflight で 1 つの導入にまとまる。
+- **待たない要求**: link と control socket の応答時間は数秒なので、1 回の要求は導入を待たず `pending` を返す（`SyncOutcome::Pending` を追加）。親は同じ `sync_id`（要求の本文に追加。`request_id` は毎回新しい）で聞き直す。agent は `sync_id` ごとに consumer を 1 つ持ち、決着（導入済み・失敗・`prepare_timeout_ms` 超過）で参照を手放す。決着した結果は覚えておき、応答を失った親の聞き直しに同じ答えを返す（失敗した導入をやり直さない）。誰も聞きに来ない warm-up（親が途中で止まった）は、agent の tick が `warmup_idle_ms`（既定 60 秒）で参照を手放す（最後の参照なら導入も止まる）。同時に覚える warm-up は 16 個まで、1 要求の tool は 32 個まで（超える要求は丸ごと断る）。停止中の agent は新しい warm-up を始めない。古い coordinator epoch は `STALE_EPOCH`。`dry_run` は検出だけで何も始めない。
+- **旧 peer の除外**: hello の feature `env_sync_v1` を足した。双方が提供し、どちらも要求しない（`required_features` に入れない）ので、片方だけが新しい組み合わせでも接続と通常の配置はそのまま動く（N/N+1）。合意できなかった link には coordinator が要求を送らず、`workers upgrade <worker>` を案内する `PROTOCOL_INCOMPATIBLE` を返す。agent 側も、合意していない接続からの `env_sync` を agent に渡す前に断る。古い resident（操作を知らない）には「resident を再起動して」と案内する。
+- **CLI**: `NoWarmup` を `ResidentWarmup` に置き換えた。導入する版が 1 つでもあるときだけ resident に繋ぐ（揃っている worker の sync に resident は要らない）。resident が動いていなければ、起動せずに「resident が動いていない」と出して止まる。応答なし・混雑（`COMMUNICATION_UNKNOWN`・`OVERLOADED`）は同じ `sync_id` で聞き直し、1 時間で打ち切る（worker 側は既定 15 分で失敗にする）。導入の失敗はその版を blocked にして残りを続け、導入後の測り直しで見えない版は `envsync::verify` が blocked にする。resident なし・旧 peer・応答なしの打ち切りは、その場で sync を終える（それまでに導入したものはメッセージに含める）。worker から来た文字列は制御文字を除いて出す。
+- **表示の食い違いの修正**: 成功時の 1 行は `render_sync` が作り、`in_sync` が true のときだけ「is in sync」と言う。false のときは「is not in sync with the parent」で始め、`--project` を付けたときだけ「プロジェクトの要求は満たしている」と続ける（以前は `in_sync: false` で「meets the project's requirements」とだけ言い、`--project` なしでも project に触れていた）。
+
+A44 の sync 側のテスト（ネットワークに出ない）:
+- `tests/it/bootstrap.rs`: 本物の resident と local worker、偽の nodenv manager で、要求 → 導入 → 測り直し → in sync の往復、2 回目は何も実行しないこと、導入済みは `unchanged`、resident が無いときは導入も起動もしないこと、manager の失敗が blocked になること、同時の 2 回の sync で manager が 1 回しか走らないこと。
+- `tests/it/worker_agent.rs`: feature を合意していない接続の拒否、上限と重複、registry に無いものを導入しないこと、1 つの warm-up が 1 つの consumer であること、決着後の同じ答え、時間切れ、tick による解放、停止中と満杯。
+- `src/coordinator/env_sync.rs`: 旧 peer に要求を 1 回も送らず `workers upgrade` を案内すること、応答なし・拒否・不足した応答の区別。`src/service/workers/warmup.rs`: 応答の解釈（純粋関数 `look`）。`src/toolchain/registry/tests.rs`: warm-up の要求と attempt の要求が同じ install plan になること。
+
+残り（S21 は完了していない）:
+1. `doctor` への組み込み（S23）。
+2. ssh 越しの remote worker に対する `workers sync` の実機での受入（S26）。往復の試験は local worker の link で行った。remote の link も同じ `ClientLink` で、feature の合意は `config/runtime.rs` で同じように渡している。
+3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
+4. `diff` の worker 省略時の並列化、`installed_inventory` の所要時間の計測（1 本目から継続）。
+5. sync の途中で Ctrl-C したとき、worker 側の導入は最長 `warmup_idle_ms` 続いてから止まる（即時の取り消し要求は無い）。
