@@ -73,10 +73,13 @@ fn check_stop(stop: &watch::Receiver<bool>) -> anyhow::Result<()> {
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-/// One manifest as the wire carries it (compact JSON), at most. It is what a
-/// worker accepts by default (`BlobLimits::max_manifest_bytes`, spec chapter
-/// 11): a larger one is refused here, before anything of the source is sent.
-const MAX_MANIFEST_BYTES: u64 = 64 << 20;
+/// One manifest as the wire carries it (compact JSON) is at most what a
+/// worker accepts by default (`BlobLimits::default().max_manifest_bytes`,
+/// spec chapter 11): a larger one is refused here, before anything of the
+/// source is sent.
+fn max_manifest_bytes() -> u64 {
+    crate::worker::blob_policy::BlobLimits::default().max_manifest_bytes
+}
 
 /// Counts and hashes what passes, and refuses the byte that exceeds `limit`.
 struct Capped<W> {
@@ -390,7 +393,7 @@ async fn source_inner(
         let scratch = store.root().join("tmp");
         let spooled = tokio::task::spawn_blocking(move || {
             let _ownership = ownership;
-            spool_json(&items[index], &scratch, MAX_MANIFEST_BYTES)
+            spool_json(&items[index], &scratch, max_manifest_bytes())
         })
         .await??;
         check_stop(stop)?;
@@ -765,7 +768,7 @@ mod spool_tests {
                 "{error:#}"
             );
         }
-        assert_eq!(MAX_MANIFEST_BYTES, 67_108_864);
+        assert_eq!(max_manifest_bytes(), 67_108_864);
     }
 
     #[test]

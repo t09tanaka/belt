@@ -355,3 +355,73 @@ fn no_read_exceeds_the_page_bound_with_thousands_of_live_attempts() {
         assert_eq!(page.len(), bound);
     }
 }
+
+// ------------------------------------------------------------ the indexes
+
+/// The plan of `sql` (one `?1`..`?3` per parameter) as one string.
+fn plan_of(db: &Db, sql: &str, params: usize) -> String {
+    let sql = format!("EXPLAIN QUERY PLAN {sql}");
+    db.call(move |c| {
+        let mut q = c.prepare(&sql)?;
+        let args: Vec<&dyn rusqlite::ToSql> = (0..params).map(|_| &1i64 as _).collect();
+        let rows = q
+            .query_map(args.as_slice(), |r| r.get::<_, String>(3))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows.join("\n"))
+    })
+    .unwrap()
+}
+
+const UNACKED_SQL: &str = "SELECT placement_id FROM placement WHERE worker_id = ?1 AND acked_at_ms IS NULL AND placement_id > ?2 ORDER BY placement_id LIMIT ?3";
+const LIVE_SQL: &str = "SELECT attempt_id FROM attempt WHERE worker_id=?1 AND state <> 'terminal' AND retired=0 AND (created_at_ms>?2 OR (created_at_ms=?2 AND rowid>?3)) ORDER BY created_at_ms,rowid LIMIT ?4";
+
+fn assert_indexed(store: &CoordinatorStore) {
+    let unacked = plan_of(&store.db, UNACKED_SQL, 3);
+    assert!(unacked.contains("placement_unacked"), "{unacked}");
+    assert!(!unacked.contains("SCAN"), "{unacked}");
+    let live = plan_of(&store.db, LIVE_SQL, 4);
+    assert!(live.contains("attempt_worker_live"), "{live}");
+    assert!(!live.contains("SCAN"), "{live}");
+    assert!(!live.contains("TEMP B-TREE"), "{live}");
+}
+
+#[test]
+fn the_page_queries_seek_by_partial_indexes_not_by_scanning_history() {
+    assert_indexed(&fx().store);
+}
+
+#[test]
+fn a_database_without_the_page_indexes_is_upgraded_to_have_them() {
+    use super::policy::Access;
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let path = dir.path().join("coordinator.db");
+    let all = schema::steps(DbKind::Coordinator);
+    let before = all.len() - 1;
+    let old = db::open_with(
+        &path,
+        "coordinator",
+        &all[..before],
+        schema::compat(before),
+        Access::ReadWrite,
+    )
+    .unwrap();
+    let plan = plan_of(&old, UNACKED_SQL, 3);
+    assert!(!plan.contains("placement_unacked"), "{plan}");
+    drop(old);
+    let store = CoordinatorStore::open(dir.path(), 2).unwrap();
+    let version = store
+        .db
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT value FROM schema_meta WHERE key='schema_version'",
+                [],
+                |r| r.get::<_, String>(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(version, all.len().to_string());
+    assert_indexed(&store);
+    // Opening again runs nothing.
+    drop(store);
+    assert_indexed(&CoordinatorStore::open(dir.path(), 3).unwrap());
+}

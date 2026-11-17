@@ -541,9 +541,13 @@ impl Coordinator {
                 return Ok(());
             };
             after = Some(*last);
+            let last_page = page.len() < PAGE_MAX as usize;
             for (_, l) in page {
                 self.observe(&l.record.attempt_id, Observation::Unknown)
                     .await?;
+            }
+            if last_page {
+                return Ok(());
             }
         }
     }
@@ -783,6 +787,9 @@ impl Coordinator {
             let page = self.live_page(&worker_id, after).await?;
             let Some((last, _)) = page.last() else { break };
             after = Some(*last);
+            // A short page is the end: the cursor is stable, so a row that
+            // would arrive behind it is not part of this walk either way.
+            let last_page = page.len() < PAGE_MAX as usize;
             for (_, l) in page {
                 if inspected.is_none() {
                     self.unknown(&l.record.attempt_id, &mut report).await?;
@@ -791,6 +798,9 @@ impl Coordinator {
                 // Another worker may have said that this coordinator is replaced.
                 self.check_fenced()?;
                 self.drive(&budgeted, l, &mut report).await?;
+            }
+            if last_page {
+                break;
             }
         }
         let Some(inspected) = inspected else {

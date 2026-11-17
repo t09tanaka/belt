@@ -297,6 +297,9 @@ pub fn pending_plans(
         after = last.placement_id;
         let room = MAX_PENDING_PLANS - plans.len();
         plans.extend(page.iter().filter_map(plan_of).take(room));
+        if page.len() < PAGE_MAX as usize {
+            break;
+        }
     }
     Ok(plans)
 }

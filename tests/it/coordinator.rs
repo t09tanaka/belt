@@ -3072,22 +3072,42 @@ async fn a_worker_with_more_live_attempts_than_a_page_is_followed_completely() {
     assert_eq!(placed.len(), MANY);
     assert_eq!(a.holds().len(), MANY);
 
-    // Each of them is seen running, the ones of the later pages too.
+    // Each of them is seen running, the ones of the later pages too. A tick
+    // that runs out of time leaves the rest for the next: tick until all are.
     for id in &placed {
         a.start(id);
     }
-    assert!(c.tick().await.unwrap().settled.is_empty());
+    let mut early = Vec::new();
+    for _ in 0..MANY {
+        early.extend(c.tick().await.unwrap().settled);
+        if tasks
+            .iter()
+            .all(|t| only(&c, t).state == AttemptState::Active)
+        {
+            break;
+        }
+    }
+    assert!(early.is_empty());
     for task in &tasks {
         assert_eq!(only(&c, task).state, AttemptState::Active);
     }
 
     // All end at once: each page read finds the earlier ones gone already.
+    // Every one is settled exactly once, in whatever tick reaches it.
     for id in &placed {
         a.finish(id, Outcome::Succeeded);
     }
-    let report = c.tick().await.unwrap();
-    assert_eq!(report.settled, placed);
-    assert!(report.unknown.is_empty());
+    let mut settled = Vec::new();
+    for _ in 0..MANY {
+        settled.extend(c.tick().await.unwrap().settled);
+        if settled.len() >= MANY {
+            break;
+        }
+    }
+    assert_eq!(settled.len(), MANY, "settled twice or not at all");
+    let (settled, placed): (std::collections::HashSet<_>, std::collections::HashSet<_>) =
+        (settled.into_iter().collect(), placed.into_iter().collect());
+    assert_eq!(settled, placed);
     assert!(c.tick().await.unwrap().settled.is_empty());
     for task in &tasks {
         assert_eq!(
