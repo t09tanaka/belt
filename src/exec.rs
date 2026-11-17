@@ -3067,9 +3067,8 @@ impl<'a> Runner<'a> {
             );
         }
         let mut bc = self.build_cache_start(ws, w, job, &cm, &env_ctx);
-        let job_timeout = Duration::from_secs_f64(
-            60.0 * job.timeout_minutes.unwrap_or(self.opts.job_timeout_min),
-        );
+        let job_min = job.timeout_minutes.unwrap_or(self.opts.job_timeout_min);
+        let job_timeout = Duration::from_secs_f64(60.0 * job_min);
         let mut steps_ctx = Map::new();
         let mut extra_env: Vec<(String, String)> = Vec::new();
         let mut extra_path: Vec<String> = Vec::new();
@@ -3409,12 +3408,28 @@ impl<'a> Runner<'a> {
                 env.push((k.clone(), expr::to_string(v)));
             }
             let log = self.log_path(&w.file, &display, n + 1, &label);
-            let remaining = job_timeout.saturating_sub(t0.elapsed());
-            let timeout = s
-                .timeout_minutes
-                .map(|m| Duration::from_secs_f64(m * 60.0))
-                .map(|t| t.min(remaining))
-                .unwrap_or(remaining);
+            // The job's time is used up by its running, not by its steps
+            // waiting for task-traffic-controller: a step's own timeout starts when it
+            // gets its turn, and so does the job's share of it.
+            let remaining = job_timeout.saturating_sub(t0.elapsed().saturating_sub(queue));
+            if remaining.is_zero() {
+                // nothing is left: a step started now would be stopped at once
+                let _ = fs::remove_dir_all(&files_dir);
+                push(
+                    &mut steps,
+                    Outcome::Error(format!("not started: the job timed out ({job_min} min)")),
+                    None,
+                    None,
+                    None,
+                );
+                record(&mut steps_ctx, &s.id, "failure", "failure", Map::new());
+                errored.get_or_insert(format!("{label}: the job timed out"));
+                continue;
+            }
+            let own = s.timeout_minutes.map(|m| Duration::from_secs_f64(m * 60.0));
+            // stopped at the job's limit, not at the step's own
+            let by_job = own.is_none_or(|t| remaining < t);
+            let timeout = own.map_or(remaining, |t| t.min(remaining));
             let key = crate::demand::history_key(
                 &self.fp.config.default_workflows_dir,
                 &w.file,
@@ -3507,7 +3522,19 @@ impl<'a> Runner<'a> {
                 Ok(Exit::Timeout) => {
                     push(
                         &mut steps,
-                        Outcome::Error(format!("timed out after {}s", timeout.as_secs())),
+                        Outcome::Error(if by_job {
+                            // under 10 seconds with a decimal: never "after 0s"
+                            let left = if timeout < Duration::from_secs(10) {
+                                format!("{:.1}", timeout.as_secs_f64())
+                            } else {
+                                timeout.as_secs().to_string()
+                            };
+                            format!(
+                                "timed out after {left}s (what was left of the job's {job_min} min)"
+                            )
+                        } else {
+                            format!("timed out after {}s", timeout.as_secs())
+                        }),
                         None,
                         Some(log),
                         None,
