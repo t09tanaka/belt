@@ -5538,3 +5538,156 @@ async fn ci_runs_the_worktree_of_a_git_repository_and_a_named_commit() {
     assert_eq!(jobs["test"].0, "success");
     shutdown(&load(&spec)).await;
 }
+
+/// A32, end to end with the real binary and a fake `gh` (a script that
+/// writes down how it was called; nothing here reaches GitHub): the success
+/// of a dirty worktree is not posted to the original HEAD, a run of exactly
+/// what the commit holds is posted to it once, and a post that fails leaves
+/// the result and the exit code as they were and is shown with the run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_changes_no_result()
+{
+    let (root, mut spec) = fixture();
+    spec.env.insert(
+        "PATH".into(),
+        private_tool_path(root.path(), &["git", "fast-worktree"]),
+    );
+    let (calls, refuse) = (root.path().join("gh-calls"), root.path().join("gh-refuse"));
+    let gh = root.path().join("bin/gh");
+    std::fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nprintf \x27%s\\n\x27 \"$*\" >> {calls:?}\nif [ -e {refuse:?} ]; then echo \x27gh: Bad credentials (HTTP 401)\x27 >&2; exit 1; fi\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let config = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "schema_version = 1\n[coordinator]\nheartbeat_seconds = 1\nstale_seconds = 3\n",
+    )
+    .unwrap();
+    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
+        .unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let jobs = |word: &str| {
+        format!("  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo {word} >> MARKS/build\n")
+    };
+    ci_project(root.path(), &repo, &jobs("committed"));
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["remote", "add", "origin", "git@github.com:owner/name.git"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "first"]);
+    let head = git(&["rev-parse", "HEAD"]);
+    let called = || std::fs::read_to_string(&calls).unwrap_or_default();
+    let status = |value: &serde_json::Value| value["result"]["github_status"].clone();
+
+    // A tracked file changed and nothing committed: computed, never posted.
+    ci_project(root.path(), &repo, &jobs("dirty"));
+    let (code, value) = ci_output(&spec, &repo).await;
+    assert_eq!(code, Some(0), "{value}");
+    let dirty = status(&value);
+    assert_eq!(dirty["computed"], "success", "{value}");
+    assert_eq!(dirty["posting"], "skipped", "{value}");
+    assert_eq!(dirty["original_head"], head.as_str());
+    assert!(dirty["source_digest"].is_string());
+    let why = dirty["reason"].as_str().unwrap();
+    assert!(why.contains("uncommitted or synthetic content"), "{why}");
+    assert_eq!(called(), "", "a dirty snapshot posts nothing");
+
+    // Only a file Git does not know yet: the same.
+    git(&["checkout", "-q", "."]);
+    std::fs::write(repo.join("untracked.txt"), "new\n").unwrap();
+    let (code, value) = ci_output(&spec, &repo).await;
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(status(&value)["computed"], "success", "{value}");
+    assert_eq!(status(&value)["posting"], "skipped", "{value}");
+    let why = status(&value)["reason"].as_str().unwrap().to_string();
+    assert!(why.contains("uncommitted or synthetic content"), "{why}");
+    assert_eq!(called(), "");
+
+    // The commit itself, while the worktree is still dirty: posted to it.
+    let more = ["--snapshot", "commit", "--ref", "HEAD"];
+    let (code, value) = ci_output_with(&spec, &repo, &more).await;
+    assert_eq!(code, Some(0), "{value}");
+    let posted = status(&value);
+    assert_eq!(posted["posting"], "posted", "{value}");
+    assert_eq!(posted["sha"], head.as_str());
+    assert_eq!(posted["state"], "success");
+    assert_eq!(
+        called(),
+        format!(
+            "api repos/owner/name/statuses/{head} -f state=success -f context=local-ci -f description=success: pass 1 / fail 0 / error 0 / skip 0\n"
+        )
+    );
+
+    // A clean worktree is what its HEAD holds; `--no-status` posts nothing.
+    std::fs::remove_file(repo.join("untracked.txt")).unwrap();
+    let (code, value) = ci_output_with(&spec, &repo, &["--no-status"]).await;
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(status(&value)["reason"], "--no-status", "{value}");
+    assert_eq!(called().lines().count(), 1);
+
+    // The post is refused: the result and the exit code stay, and the
+    // failure is said apart from them and kept with the run.
+    std::fs::write(&refuse, "").unwrap();
+    let more = ["--status-context", "other"];
+    let (code, value) = ci_output_with(&spec, &repo, &more).await;
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["result"]["state"], "settled");
+    let failed = status(&value);
+    assert_eq!(failed["computed"], "success", "{value}");
+    assert_eq!(failed["posting"], "failed", "{value}");
+    assert_eq!(failed["sha"], head.as_str());
+    assert_eq!(failed["context"], "other");
+    assert_eq!(failed["error"], "gh: Bad credentials (HTTP 401)");
+    let last = called();
+    let last = last.lines().last().unwrap();
+    assert!(last.contains("-f context=other"), "{last}");
+    assert_eq!(called().lines().count(), 2, "one attempt, no retry");
+    let run = value["result"]["target"]["id"].as_str().unwrap();
+    let shown = Command::new(&spec.executable)
+        .args(["--json", "show", run])
+        .current_dir(&repo)
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
+        .envs(&spec.env)
+        .output()
+        .unwrap();
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    assert_eq!(shown["data"]["run"]["github_status"], failed, "{shown}");
+
+    // No task a worker was given carries anything of the status.
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let run = remote_task_runner::ids::RunId::parse(run).unwrap();
+    for row in store.ci_run_tasks(&run).unwrap() {
+        let text = row.spec.to_string();
+        assert!(
+            !text.contains("statuses") && !text.contains("other"),
+            "{text}"
+        );
+    }
+    shutdown(&load(&spec)).await;
+}

@@ -7,6 +7,7 @@ pub mod advance;
 pub mod execute;
 pub mod progress;
 pub mod shards;
+pub mod status;
 pub mod summary;
 
 use local_ci::FrozenPlan;

@@ -70,6 +70,10 @@ pub struct CiReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_digest: Option<Digest>,
     pub jobs: Vec<JobLine>,
+    /// The GitHub status of the run: what was computed and what became of
+    /// the post, kept apart. A post that failed changes nothing else here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_status: Option<crate::ci::status::Record>,
 }
 
 fn invalid(message: impl Into<String>) -> ApiError {
@@ -253,12 +257,14 @@ pub async fn run(
     context: Context,
     revision: Option<String>,
     signals: &mut mpsc::UnboundedReceiver<()>,
+    status: super::github_status::Options,
+    poster: std::sync::Arc<dyn super::github_status::Poster>,
 ) -> Result<CiReport, ApiError> {
     let run_id = RunId::generate();
     let target = Target::Run(run_id.clone());
     let budget = Duration::from_secs(30);
     let submitted = submit(context.clone(), revision, run_id.clone());
-    let (report, plan_digest) = tokio::select! {biased;
+    let (report, receipt) = tokio::select! {biased;
         _ = control::interrupted(signals) => {
             (control::cancel_and_stop(&context.bootstrap, target.clone(), signals, budget).await, None)
         }
@@ -273,20 +279,136 @@ pub async fn run(
             } else {
                 observed
             };
-            (report, Some(receipt.plan_digest))
+            (report, Some(receipt))
         }
     };
-    let spec = context.bootstrap.clone();
-    let jobs = tokio::task::spawn_blocking(move || jobs(&spec, &run_id))
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or_default();
+    let (spec, settled) = (context.bootstrap.clone(), context.clone());
+    let end = Ended::of(&report);
+    let expected = receipt.as_ref().map(|receipt| {
+        let tasks = receipt.tasks.iter();
+        tasks.map(|task| task.plan_task.clone()).collect::<Vec<_>>()
+    });
+    // Decided only here, after the wait: on the parent, from the result of
+    // the run and what it collected.
+    let (jobs, github_status) = tokio::task::spawn_blocking(move || {
+        let jobs = jobs(&spec, &run_id).unwrap_or_default();
+        let record = expected.map(|expected| {
+            let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+            let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
+            let end = end.with(&expected, &lines);
+            super::github_status::settle(&settled, &run_id, &end, &status, poster.as_ref())
+        });
+        (jobs, record.map(|record| (run_id, record)))
+    })
+    .await
+    .unwrap_or_default();
+    let github_status = match github_status {
+        Some((run_id, record)) => {
+            if let Err(why) = keep_status(&context, run_id, record.clone()).await {
+                eprintln!("warning: the status of the run was not recorded: {why}");
+            }
+            Some(record)
+        }
+        None => None,
+    };
     Ok(CiReport {
         report,
-        plan_digest,
+        plan_digest: receipt.map(|receipt| receipt.plan_digest),
         jobs,
+        github_status,
     })
+}
+
+/// Keep the status with the run, so that `show` says it later. The resident
+/// owns the journal; an older one does not know the request and says so.
+async fn keep_status(
+    context: &Context,
+    run_id: RunId,
+    record: crate::ci::status::Record,
+) -> Result<(), String> {
+    let owner = context.owner().await.map_err(|e| e.to_string())?;
+    let request = Operation::RecordStatus { run_id, record };
+    match owner.request(request).await.map_err(|e| e.to_string())? {
+        Reply::Accepted { .. } => Ok(()),
+        Reply::Error { message } => Err(message),
+        Reply::ControlError { error } => Err(error.message),
+        _ => Err("unexpected reply".into()),
+    }
+}
+
+/// How the run ended, as the status of the run reads it: the result of the
+/// run that its completion made (`CoordinatorStore::completion`), which the
+/// exit code of `ci` and `show` read too. Nothing is judged again here.
+#[derive(Debug, Clone, Copy)]
+pub struct Ended {
+    settled: bool,
+    cancel_requested: bool,
+    collection_pending: Option<bool>,
+    exit_code: i32,
+    failed: Option<crate::ci::status::Cause>,
+}
+
+/// The failure of a run in the plain values the status decides from.
+fn fault(failure: &super::completion::Failure) -> crate::ci::status::Fault {
+    use crate::state::{Exit, Outcome};
+    let end = failure.termination;
+    crate::ci::status::Fault {
+        exit_code: failure.exit_code,
+        own_exit: end
+            .and_then(super::completion::compute_failure)
+            .map(|(_, exit)| exit),
+        exited: matches!(end.and_then(|t| t.exit()), Some(Exit::Code(code)) if code != 0),
+        cancelled: end.is_none_or(|t| t.outcome() == Outcome::Cancelled),
+    }
+}
+
+impl Ended {
+    pub fn of(report: &Report) -> Self {
+        let snapshot = report.snapshot.as_ref();
+        Self {
+            settled: report.state == "settled",
+            cancel_requested: report.cancel_requested
+                || snapshot.is_some_and(|s| s.cancel_requested),
+            collection_pending: report.collection_pending,
+            exit_code: report.cli_exit_code,
+            failed: snapshot
+                .and_then(|s| s.first_compute_failure.as_ref())
+                .map(|failure| crate::ci::status::cause(&fault(failure))),
+        }
+    }
+
+    fn with<'a>(
+        &self,
+        expected: &'a [&'a str],
+        jobs: &'a [crate::ci::status::Job<'a>],
+    ) -> crate::ci::status::RunEnd<'a> {
+        crate::ci::status::RunEnd {
+            settled: self.settled,
+            cancel_requested: self.cancel_requested,
+            collection_pending: self.collection_pending,
+            exit_code: self.exit_code,
+            failed: self.failed,
+            expected,
+            jobs,
+        }
+    }
+
+    /// What the run computed, with the tasks that were submitted and the
+    /// lines of the run.
+    pub fn computed(&self, expected: &[&str], jobs: &[JobLine]) -> crate::ci::status::Computed {
+        let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
+        crate::ci::status::computed(&self.with(expected, &lines))
+    }
+}
+
+impl JobLine {
+    /// The line as the status decision reads it.
+    fn status_line(&self) -> crate::ci::status::Job<'_> {
+        crate::ci::status::Job {
+            plan_task: &self.plan_task,
+            status: &self.status,
+        }
+    }
 }
 
 /// How the jobs of a run ended, read from what the parent collected. Reads

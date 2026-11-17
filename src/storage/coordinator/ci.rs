@@ -68,6 +68,30 @@ impl CoordinatorStore {
         })
     }
 
+    /// Keep what became of the GitHub status of `run` in its journal. The
+    /// journal is append-only: a later record is the current one.
+    pub fn record_github_status(&self, run: &RunId, record: &Value, at_ms: u64) -> Result<()> {
+        let (run, record) = (run.to_string(), record.clone());
+        self.db.write(move |tx| {
+            let known = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run WHERE run_id=?1)",
+                [&run],
+                |r| r.get::<_, bool>(0),
+            )?;
+            if !known {
+                return Err(StorageError::NotFound { what: "run".into() });
+            }
+            common::append_event(tx, Some(&run), None, GITHUB_STATUS_EVENT, &record, at_ms)?;
+            Ok(())
+        })
+    }
+
+    /// The last recorded GitHub status of `run`.
+    pub fn github_status_of(&self, run: &RunId) -> Result<Option<Value>> {
+        let run = run.to_string();
+        self.db.call(move |c| github_status(c, &run))
+    }
+
     /// Every task of `run`, in the order they were made.
     pub fn ci_run_tasks(&self, run: &RunId) -> Result<Vec<CiTaskRow>> {
         let run = run.to_string();
@@ -244,4 +268,21 @@ impl CoordinatorStore {
             Ok(true)
         })
     }
+}
+
+/// The kind of the run-level event that keeps a GitHub status.
+pub const GITHUB_STATUS_EVENT: &str = "github_status";
+
+/// The newest status event of `run`. Only the events of no attempt are
+/// walked (`event_attempt` seeks them), newest first.
+pub(crate) fn github_status(c: &Connection, run: &str) -> Result<Option<Value>> {
+    let raw = c
+        .query_row(
+            "SELECT payload_json FROM event
+             WHERE attempt_id IS NULL AND run_id=?1 AND kind=?2 ORDER BY seq DESC LIMIT 1",
+            params![run, GITHUB_STATUS_EVENT],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok(raw.and_then(|text| serde_json::from_str(&text).ok()))
 }

@@ -119,6 +119,12 @@ pub enum Operation {
     Query {
         query: super::query::Query,
     },
+    /// Keep what became of the GitHub status of a run (posted by the caller,
+    /// on the parent). The record holds no credential.
+    RecordStatus {
+        run_id: RunId,
+        record: crate::ci::status::Record,
+    },
     Shutdown,
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -1630,6 +1636,25 @@ async fn handle(
                             })
                             .collect(),
                     },
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
+            Operation::RecordStatus { run_id, record } => {
+                let (coordinator, run) = (coordinator.clone(), run_id.clone());
+                let kept = tokio::task::spawn_blocking(move || {
+                    let record = serde_json::to_value(&record)
+                        .map_err(|e| crate::storage::StorageError::Invalid(e.to_string()))?;
+                    coordinator.store().record_github_status(
+                        &run,
+                        &record,
+                        crate::platform::clock::wall_ms(),
+                    )
+                })
+                .await?;
+                match kept {
+                    Ok(()) => Reply::Accepted { run_id },
                     Err(e) => Reply::Error {
                         message: e.to_string(),
                     },

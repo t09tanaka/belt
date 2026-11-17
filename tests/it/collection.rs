@@ -8,6 +8,7 @@
 //! No process is started here. A "crash" is the coordinator dropped where
 //! it stands and its database and result store opened again.
 
+use remote_task_runner::ci::status::Computed;
 use remote_task_runner::coordinator::policy::Limits;
 use remote_task_runner::coordinator::{
     Coordinator, CoordinatorConfig, LinkError, TaskSpec, WorkerLink,
@@ -3117,6 +3118,9 @@ async fn a_ci_task_without_a_usable_result_is_no_success_and_the_next_job_sees_a
         let target = remote_task_runner::service::completion::Target::Run(run.clone());
         let exit = c.store().completion(target).unwrap().exit_code();
         assert!(exit.is_some_and(|code| code != 0), "{exit:?}");
+        // No job failed: a result that is lost is an error of the run.
+        let status = ci_computed(&fx, &c, &files, &run);
+        assert_eq!(status, Computed::Error, "{unreadable}");
         let lines = remote_task_runner::service::ci_run::job_lines(
             c.store(),
             fx.dir.path(),
@@ -3163,10 +3167,11 @@ async fn a_cancelled_ci_run_releases_nothing_more_and_settles() {
     }
     assert!(c.store().attempts_of_task(&ids["test"]).unwrap().is_empty());
     assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
-    let target = remote_task_runner::service::completion::Target::Run(run);
+    let target = remote_task_runner::service::completion::Target::Run(run.clone());
     let snapshot = c.store().completion(target).unwrap();
     assert!(snapshot.settled());
     assert!(snapshot.exit_code().is_some_and(|code| code != 0));
+    assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Cancelled);
     // A released spec that still waits is never written.
     let waiting = serde_json::json!({"ci": {"hold": true}});
     assert!(c
@@ -3499,6 +3504,28 @@ fn ci_lines(
 ) -> Vec<remote_task_runner::service::ci_run::JobLine> {
     remote_task_runner::service::ci_run::job_lines(c.store(), fx.dir.path(), files.root(), run)
         .unwrap()
+}
+
+/// What the status of the run says it computed (S19): from the completion of
+/// the run, as `ci` reads it after its wait, and the lines of the run.
+fn ci_computed(
+    fx: &Fx,
+    c: &Coordinator,
+    files: &Arc<ResultStore>,
+    run: &RunId,
+) -> remote_task_runner::ci::status::Computed {
+    use remote_task_runner::service::{ci_run, completion::Target, control::Report};
+    let target = Target::Run(run.clone());
+    let snapshot = c.store().completion(target.clone()).unwrap();
+    let report = Report::settled(target, &snapshot).expect("the run settled");
+    let lines = ci_lines(fx, c, files, run);
+    let expected: Vec<String> = lines
+        .iter()
+        .filter(|l| l.part != Some(ci_run::Part::Job))
+        .map(|l| l.plan_task.clone())
+        .collect();
+    let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+    ci_run::Ended::of(&report).computed(&expected, &lines)
 }
 
 /// A39: a job of Vitest (and of Jest) files is split by file. Every listed
@@ -3990,6 +4017,20 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
             "{why}"
         );
         assert!(text.contains(&format!("test: failure ({why})\n")), "{text}");
+
+        // Once report ended too, the status of the run (S19) is its
+        // failure: the stop of the other shards makes it no cancelled run.
+        let p = fx.w.payload(&b);
+        let task = ci_task_of(&plan, "report");
+        let result = ci_result(&task, "report", "success", serde_json::json!({}));
+        fx.w.finish(&b, Outcome::Succeeded, ci_out(&b, &p, &result));
+        for _ in 0..3 {
+            c.tick().await.unwrap();
+            collect(&c, &files).await;
+        }
+        let target = remote_task_runner::service::completion::Target::Run(run.clone());
+        assert!(c.store().completion(target).unwrap().cancel_requested);
+        assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Failure);
     }
 }
 
@@ -4332,6 +4373,7 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
         assert_eq!(joined[0].payload["job"], group.id.as_str());
         if omit {
             assert_eq!(after.exit_code(), Some(1));
+            assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Failure);
             let failure = after.first_compute_failure.clone().unwrap();
             assert_eq!(failure.task_id, *ids.values().min().unwrap());
             let why = rows[0].spec["ci"]["join_failure"].as_str().unwrap();
@@ -4393,10 +4435,12 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
             assert_eq!(ci_advance(&fx, &c).joined, vec![group.id.clone()]);
             let done = c.store().completion(target.clone()).unwrap();
             assert_eq!(done.exit_code(), Some(0));
+            assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Success);
             assert!(of(1).spec["ci"].get("rerun").is_none());
             continue;
         } else {
             assert_eq!(after.exit_code(), Some(0));
+            assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Success);
             assert!(rows
                 .iter()
                 .all(|row| row.spec["ci"].get("join_failure").is_none()));
@@ -4438,6 +4482,8 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
     let after = c.store().completion(Target::Run(run.clone())).unwrap();
     assert!(after.settled());
     assert_eq!(after.exit_code(), Some(1));
+    // The plan is gone, so no line of the job says it: the run does.
+    assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Failure);
     assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
 }
 
@@ -4777,6 +4823,9 @@ async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed(
             c.cancel_run(run.clone()).await.unwrap();
             let after = c.store().completion(target).unwrap();
             assert_eq!(after.exit_code(), code, "{said}");
+            // A cancel that stopped nothing: the status is the failure.
+            let status = ci_computed(&fx, &c, &files, &run);
+            assert_eq!(status, Computed::Failure, "{said}");
             continue;
         }
         c.cancel_run(run.clone()).await.unwrap();
@@ -4791,5 +4840,8 @@ async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed(
         let lines = ci_lines(&fx, &c, &files, &run);
         let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
         assert_eq!(job.status, "failure", "{said}");
+        // Yet the run is cancelled: its status is no failure and no success.
+        let status = ci_computed(&fx, &c, &files, &run);
+        assert_eq!(status, Computed::Cancelled, "{said}");
     }
 }
