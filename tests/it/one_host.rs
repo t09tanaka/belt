@@ -122,6 +122,23 @@ struct FaultLink {
     faults: Arc<Faults>,
 }
 
+pub(crate) async fn connect_agent(
+    c: &Coordinator,
+    agent: Arc<Agent>,
+    faults: Arc<Faults>,
+) -> Arc<dyn WorkerLink> {
+    let (near, far) = duplex_pair(64 * 1024);
+    let cluster = c.store().cluster_id().clone();
+    let permits = Arc::new(Semaphore::new(64));
+    tokio::spawn(serve_connection(agent, far, cluster.clone(), permits));
+    let cfg = ClientConfig::new(cluster, c.store().coordinator_id().clone(), c.epoch());
+    let client = connect(near, cfg).await.unwrap().client;
+    Arc::new(FaultLink {
+        inner: ClientLink::new(client, Duration::from_secs(30)),
+        faults,
+    })
+}
+
 impl WorkerLink for FaultLink {
     fn call(
         &self,
@@ -300,16 +317,7 @@ impl OneHost {
 
     /// A new connection of this parent to the worker's agent of now.
     pub(crate) async fn attach(&self, c: &Coordinator, w: &Worker) {
-        let (near, far) = duplex_pair(64 * 1024);
-        let cluster = c.store().cluster_id().clone();
-        let permits = Arc::new(Semaphore::new(64));
-        tokio::spawn(serve_connection(w.agent(), far, cluster.clone(), permits));
-        let cfg = ClientConfig::new(cluster, c.store().coordinator_id().clone(), c.epoch());
-        let client = connect(near, cfg).await.unwrap().client;
-        let link = Arc::new(FaultLink {
-            inner: ClientLink::new(client, Duration::from_secs(30)),
-            faults: w.faults.clone(),
-        });
+        let link = connect_agent(c, w.agent(), w.faults.clone()).await;
         c.attach(w.id.clone(), link).await;
     }
 

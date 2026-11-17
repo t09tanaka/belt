@@ -52,6 +52,11 @@ jobs:
             cargo install fast-worktree --locked --version 0.4.0 --force
           fi
           fast-worktree --version
+      - name: install portool for workspace release acceptance
+        run: |
+          if ! portool --version 2>/dev/null | grep -Fxq 'portool 0.10.2'; then
+            cargo install portool --locked --version 0.10.2 --force
+          fi
       - name: install task-traffic-controller
         # The nested-scope test runs the real CLI from a step. The library is
         # pinned to 0.10.x and the CLI must write the ledger it reads, so
@@ -105,6 +110,11 @@ jobs:
             cargo install fast-worktree --locked --version 0.4.0 --force
           fi
           fast-worktree --version
+      - name: install portool for workspace release acceptance
+        run: |
+          if ! portool --version 2>/dev/null | grep -Fxq 'portool 0.10.2'; then
+            cargo install portool --locked --version 0.10.2 --force
+          fi
       - name: 100% line coverage on the listed pure modules
         run: ./scripts/coverage-gate.sh
 
