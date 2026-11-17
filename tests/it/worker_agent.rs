@@ -4583,7 +4583,22 @@ fn ci_fx(workflow: &str) -> CiFx {
     let machine =
         remote_task_runner::worker::machine::Machine::open(&state, env, state.join("cluster.key"))
             .unwrap();
-    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    // A measured environment of the fixture's own: the core and the steps
+    // get its HOME, never the HOME of whoever runs the tests.
+    let profile = remote_task_runner::toolchain::profile::Profile::load(
+        &state,
+        &[
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("HOME".into(), f.path("home").to_str().unwrap().into()),
+        ]
+        .into(),
+    )
+    .unwrap();
+    let mut cfg = f.cfg("boot-a");
+    cfg.profile = profile.name().into();
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    let agent = Agent::start(cfg, Arc::new(RealButCore(machine))).unwrap();
     f.agents.lock().unwrap().push(agent.clone());
 
     let mut base = payload("true");
@@ -4713,4 +4728,19 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         }
     }
     found
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_gc_of_the_agent_removes_the_plans_no_unfinished_attempt_names() {
+    use remote_task_runner::worker::ci_task::{plan_path, store_plan};
+    let f = fx();
+    let state = f.state();
+    let mut cfg = f.cfg("boot-a");
+    // (No time to keep what nobody names: the pass below decides at once.)
+    cfg.retention_ms = 0;
+    let agent = f.start_with(cfg);
+    let digest = store_plan(&state, b"{\"a plan\":1}").unwrap();
+    assert!(plan_path(&state, &digest).exists());
+    agent.gc().unwrap();
+    assert!(!plan_path(&state, &digest).exists());
 }

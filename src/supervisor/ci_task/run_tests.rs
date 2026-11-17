@@ -1,6 +1,8 @@
 //! A CI task under a real supervisor: a captured directory source, a real
 //! workflow file, real step processes behind task-traffic-controller (its
-//! state in the test's own directory). No network, no clock.
+//! state in the test's own directory). No network. A test that needs time
+//! to pass (a lease, a deadline, a time limit) only asserts what holds
+//! however slow the machine is: a stop is waited for, never raced.
 
 use super::*;
 use crate::ci::execute::tests::{fixture, task_of, Fixture, WORKFLOW};
@@ -377,19 +379,20 @@ fn renew_until(s: &Sup, spec: &SuperviseSpec, stop: &AtomicBool) {
 fn a_renewed_lease_holds_while_the_core_works_outside_a_step_for_longer_than_it() {
     let s = sup(WORKFLOW);
     let mut spec = s.attempt("build", &TaskInputs::default());
-    spec.lease_ms = 600;
-    let told = Mutex::new(None);
-    // Three leases long before the first step (a large workspace to verify).
-    let core =
-        |_: &Path, ci: &CiTaskSpec, steps: Arc<dyn StepExecutor>, cancel: CancelHandle| -> Ran {
-            std::thread::sleep(Duration::from_millis(1_800));
-            let asked = Instant::now();
-            let exit = steps
-                .run(&step_of(ci, &cancel, "sleep 0.3; echo late > late.txt"))
-                .map_err(|e| e.to_string())?;
-            *told.lock().unwrap() = Some((exit, asked.elapsed().as_secs_f64()));
-            Ok(vec![JobStatus::Success])
-        };
+    spec.lease_ms = 1_500;
+    // More than two leases long without a step (a large workspace to
+    // verify), while the coordinator renews every 100 ms. No step follows:
+    // only the time outside a step is looked at here.
+    let core = |_: &Path, _: &CiTaskSpec, _: Arc<dyn StepExecutor>, cancel: CancelHandle| -> Ran {
+        let since = Instant::now();
+        while since.elapsed() < Duration::from_millis(4_000) {
+            if cancel.is_cancelled() {
+                return Err("cancelled while the lease was renewed".into());
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Ok(vec![JobStatus::Success])
+    };
     let stop = AtomicBool::new(false);
     let report = std::thread::scope(|t| {
         t.spawn(|| renew_until(&s, &spec, &stop));
@@ -399,12 +402,41 @@ fn a_renewed_lease_holds_while_the_core_works_outside_a_step_for_longer_than_it(
     })
     .unwrap();
     let term = report.termination.unwrap();
+    assert_eq!(
+        term.outcome(),
+        Outcome::Succeeded,
+        "{term:?}: stops {:?}, {} renewals seen",
+        s.events(&spec, "supervisor_stop"),
+        s.events(&spec, "lease_renewal_observed").len()
+    );
+    assert!(s.events(&spec, "supervisor_stop").is_empty());
+    assert!(s.events(&spec, "ci_task_failed").is_empty());
+    // The renewals were noticed outside any step: none was ever asked for.
+    assert!(s.steps(&spec).is_empty());
+    assert!(s.events(&spec, "lease_renewal_observed").len() >= 2);
+}
+
+#[test]
+fn the_core_is_told_what_a_step_ran_and_what_it_waited_and_not_the_time_before_it() {
+    let s = sup(WORKFLOW);
+    let spec = s.attempt("build", &TaskInputs::default());
+    let told = Mutex::new(None);
+    let core =
+        |_: &Path, ci: &CiTaskSpec, steps: Arc<dyn StepExecutor>, cancel: CancelHandle| -> Ran {
+            // Time of the core's own before the step: no time of the step.
+            std::thread::sleep(Duration::from_millis(500));
+            let asked = Instant::now();
+            let exit = steps
+                .run(&step_of(ci, &cancel, "sleep 0.3; echo late > late.txt"))
+                .map_err(|e| e.to_string())?;
+            *told.lock().unwrap() = Some((exit, asked.elapsed().as_secs_f64()));
+            Ok(vec![JobStatus::Success])
+        };
+    let report = run_using(&spec, &core).unwrap();
+    let term = report.termination.unwrap();
     assert_eq!(term.outcome(), Outcome::Succeeded, "{term:?}");
     assert_eq!(s.steps(&spec), ["step-0"]);
     assert!(ci_of(&spec).workspace.join("late.txt").exists());
-    assert!(s.events(&spec, "supervisor_stop").is_empty());
-    // The time of the step: what its command ran, and apart from it what
-    // it waited. Neither holds the time the core spent before asking.
     let (told, answered_in) = told.lock().unwrap().expect("the step was answered");
     assert_eq!(told.exit, StepEnd::Code(0));
     assert!(told.run_secs >= 0.25, "{told:?}");
@@ -667,9 +699,18 @@ fn a_cancel_during_a_step_stops_it_and_no_always_step_follows() {
 #[test]
 fn a_lease_that_expires_during_a_step_stops_it_and_no_always_step_follows() {
     let s = sup(LONG_THEN_ALWAYS);
-    let mut spec = s.attempt("job", &TaskInputs::default());
-    spec.lease_ms = 1_500;
-    let report = run(&spec).unwrap();
+    let spec = s.attempt("job", &TaskInputs::default());
+    let report = std::thread::scope(|t| {
+        t.spawn(|| {
+            // Once the step runs, the lease is marked expired where the
+            // supervisor reads it (as the agent does when it runs out).
+            wait_for_file(&ci_of(&spec).workspace.join("started.txt"));
+            let store = WorkerStore::open(&s.state(), &s.worker).unwrap();
+            store.expire_lease(&spec.attempt_id, 20).unwrap();
+        });
+        run(&spec)
+    })
+    .unwrap();
     assert_eq!(report.termination.unwrap().outcome(), Outcome::Interrupted);
     assert_eq!(s.steps(&spec), ["step-0"]);
     assert_eq!(made(&spec, &["started.txt", "always.txt"]), [true, false]);

@@ -1179,7 +1179,7 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - 回復: lost した supervisor の step の FIFO は、`launches` の step の番号から引いて消す。step の command id は `step-N` の番号から引く（`recover::launched_index`）。
 - forecast: 受理済みで未開始の CI task は、plan の `plan_task_demand` が挙げる command の数だけ `step-N` の future demand を出す（worker 側）。
 
-テスト（network に出ない。実際の workflow ファイルと実 process）: `ci::execute` 4 件、`supervisor::ci_task` 9 件と `run_tests` 24 件（needs の連鎖、mask、失敗、digest 不一致、開始前の cancel、skipped、step の外で lease の 3 倍かかっても更新された lease が保たれること、step の外での cancel・lease 失効・deadline、step の最中の cancel・lease 失効・deadline の後に `always()` が動かないこと、`timeout-minutes` の後に `if: failure()` と `if: always()` が動くこと、親の上限、`script_pipe` の step の error、secret を含む結果の拒否、step 無しの task の artifact、回復での FIFO と `step-N`）、`worker::ci_task` 14 件（services の拒否、予約名、inputs の上限、plan の上限・mode・GC、profile と binding の `base_env`）、forecast 2 件、wire 1 件、agent の統合 6 件（未交渉の拒否、実際の agent と host から supervisor の binary まで通して needs の 2 task を成功させる 1 件、supervisor を kill した後の回復、services の拒否）。
+テスト（network に出ない。実際の workflow ファイルと実 process）: `ci::execute` 4 件、`supervisor::ci_task` 9 件と `run_tests` 25 件（needs の連鎖、mask、失敗、digest 不一致、開始前の cancel、skipped、step の外で lease の 2 倍を超えてかかっても更新された lease が保たれること、待ちと実行の時間が分けて返ること、step の外での cancel・lease 失効・deadline、step の最中の cancel・lease 失効・deadline の後に `always()` が動かないこと、`timeout-minutes` の後に `if: failure()` と `if: always()` が動くこと、親の上限、`script_pipe` の step の error、secret を含む結果の拒否、step 無しの task の artifact、回復での FIFO と `step-N`）、`worker::ci_task` 14 件（services の拒否、予約名、inputs の上限、plan の上限・mode・GC、profile と binding の `base_env`）、forecast 2 件、wire 1 件、agent の統合 7 件（`Agent::gc` が plan を消すこと、未交渉の拒否、実際の agent と host から supervisor の binary まで通して needs の 2 task を成功させる 1 件、supervisor を kill した後の回復、services の拒否）。
 
 この変更で分かった制約（local-ci 0.13.0 の公開 API による）:
 
@@ -1187,6 +1187,7 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - Git worktree の source のテストは、fast-worktree の代わりに Git だけの代役（依存を複製しない）で workspace を作っている。実物の fast-worktree が `[[clone]]` や `post_add` で workspace に何かを足した場合は束縛できず、テストもしていない。
 - core を止められるのは、core が cancel handle を見る箇所だけである。`verify_workspace` の途中など handle を見ない区間は止まらず、supervisor は core の thread が戻るのを待つ。取消要求の永続化から handle の cancel までは最大 `poll_ms` かかり、その間に core が補助 process（git など）を起動しうる（step は database の claim が断るので起動しない）。
 - `timeout-minutes` が切れた step に `continue-on-error: true` が付いていても、local-ci 0.13.0 の core は job を失敗として扱う（GitHub Actions とは違う）。RTR は step の結果を返すだけで、この扱いは変えていない。
+- step を node として登録する間（履歴の key の計算と task-traffic-controller への登録。admission の最初の look の前）は、exec の command と同じく lease を見ない。負荷の高い機械では、この区間が 1 秒を超えることがあった（lease 1.5 秒のテストで観測）。既定の lease（60 秒）では問題にならないが、step ごとに起きる。
 - 資源待ちの timeout（`resource_wait_timeout_ms`）は plan の `timeout-minutes` ではなく attempt の予算なので、attempt を終わらせる扱いにしている。
 - step の script を pipe から読む step（GitHub token を持つ script）は、task-traffic-controller の起動経路で fd を渡せないので実行できず、その step は error になる。
 - matrix の variant ごとの workspace（`PinnedWorkspaceProvider::fork`）は `RefusePinnedForks` で断る（(2) の区切り）。portool と service container の同時実行数は local-ci の既定に任せていない（`portool: None`・`containers: 1`）。
