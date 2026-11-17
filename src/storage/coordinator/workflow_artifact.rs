@@ -22,16 +22,38 @@ pub struct WorkflowUpload<'a> {
     pub receipt: Receipt,
 }
 
+impl WorkflowUpload<'_> {
+    fn fingerprint(&self) -> Result<String> {
+        let bytes = serde_json::to_vec(&(self.overwrite, &self.receipt))
+            .map_err(|e| StorageError::Invalid(e.to_string()))?;
+        Ok(Digest::of_bytes(&bytes).to_string())
+    }
+}
+
 impl CoordinatorStore {
     pub(crate) fn reserve_workflow_files(
         &self,
-        producer: &AttemptId,
-        files: Vec<Digest>,
+        upload: WorkflowUpload<'_>,
         at_ms: u64,
     ) -> Result<()> {
-        let producer = producer.clone();
+        let producer = upload.producer.clone();
+        let key = upload.key.to_string();
+        let workflow = upload.workflow.to_owned();
+        let fingerprint = upload.fingerprint()?;
+        let receipt = upload.receipt;
         self.db.write(move |tx| {
-            for digest in files {
+            let inserted=tx.execute(
+                "INSERT INTO workflow_upload_inflight(producer,action_key,workflow,name,fingerprint)
+                 VALUES(?1,?2,?3,?4,?5) ON CONFLICT(producer,action_key) DO NOTHING",
+                params![producer.as_str(),key,workflow,receipt.name,fingerprint])?;
+            if inserted==0 {
+                let same:bool=tx.query_row("SELECT workflow=?3 AND fingerprint=?4 FROM workflow_upload_inflight WHERE producer=?1 AND action_key=?2",
+                    params![producer.as_str(),key,workflow,fingerprint],|r|r.get(0))?;
+                if !same {return Err(StorageError::Invalid("artifact proposal changed during transfer".into()));}
+                return Ok(());
+            }
+            for f in receipt.files {
+                let digest=Digest::parse(&format!("sha256:{}",f.sha256)).map_err(|e|StorageError::Invalid(e.to_string()))?;
                 let locator = ResultStore::artifact_locator(&producer, &digest);
                 add_ref(
                     tx,
@@ -60,7 +82,7 @@ impl CoordinatorStore {
         key: &Digest,
         name: Option<String>,
         pattern: Option<String>,
-    ) -> Result<Vec<serde_json::Value>> {
+    ) -> Result<Option<Vec<serde_json::Value>>> {
         let (run, workflow, consumer, key) = (
             run.to_string(),
             workflow.to_owned(),
@@ -73,7 +95,7 @@ impl CoordinatorStore {
                 "SELECT fingerprint,selection_json FROM workflow_download WHERE consumer=?1 AND action_key=?2",
                 params![consumer,key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?))).optional()? {
                 if prior!=fp {return Err(StorageError::Invalid("artifact download replay changed".into()));}
-                return serde_json::from_str(&selection).map_err(|e|StorageError::Corrupt(e.to_string()));
+                return serde_json::from_str(&selection).map(Some).map_err(|e|StorageError::Corrupt(e.to_string()));
             }
             let mut q=tx.prepare("SELECT name,producer,receipt_json FROM workflow_artifact a
                 WHERE run_id=?1 AND workflow=?2 AND version=(SELECT max(version) FROM workflow_artifact v
@@ -85,7 +107,18 @@ impl CoordinatorStore {
             }
             if all.len()>1024 {return Err(StorageError::Invalid("too many artifacts in workflow".into()));}
             let names=all.keys().cloned().collect::<Vec<_>>();
-            let selected=local_ci::artifact::select_artifacts(&names,name.as_deref(),pattern.as_deref()).map_err(StorageError::Invalid)?;
+            let selected=match local_ci::artifact::select_artifacts(&names,name.as_deref(),pattern.as_deref()) {
+                Ok(selected)=>selected,
+                Err(missing)=>{
+                    let mut pending=tx.prepare("SELECT DISTINCT u.name FROM workflow_upload_inflight u JOIN attempt a ON a.attempt_id=u.producer
+                        JOIN task t USING(task_id) WHERE t.run_id=?1 AND u.workflow=?2 AND u.producer<>?3 AND a.retired=0 AND a.state<>'terminal'
+                        AND a.cancel_requested_at_ms IS NULL AND t.cancel_requested_at_ms IS NULL AND NOT EXISTS(
+                        SELECT 1 FROM workflow_artifact w WHERE w.producer=u.producer AND w.action_key=u.action_key) LIMIT 1025")?;
+                    let names=pending.query_map(params![run,workflow,consumer],|r|r.get::<_,String>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;
+                    if local_ci::artifact::select_artifacts(&names,name.as_deref(),pattern.as_deref()).is_ok(){return Ok(None);}
+                    return Err(StorageError::Invalid(missing));
+                }
+            };
             let mut entries=Vec::new();
             let mut bytes=0usize;
             for n in selected {
@@ -97,7 +130,7 @@ impl CoordinatorStore {
             }
             let json=serde_json::to_string(&entries).map_err(|e|StorageError::Corrupt(e.to_string()))?;
             tx.execute("INSERT INTO workflow_download VALUES(?1,?2,?3,?4)",params![consumer,key,fp,json])?;
-            Ok(entries)
+            Ok(Some(entries))
         })
     }
 
@@ -141,6 +174,7 @@ impl CoordinatorStore {
         upload: WorkflowUpload<'_>,
         at_ms: u64,
     ) -> Result<WorkflowArtifact> {
+        let fingerprint = upload.fingerprint()?;
         let WorkflowUpload {
             run,
             workflow,
@@ -187,9 +221,6 @@ impl CoordinatorStore {
             key.to_string(),
         );
         local_ci::artifact::validate_name(&receipt.name).map_err(StorageError::Invalid)?;
-        let encoded = serde_json::to_vec(&(overwrite, &receipt))
-            .map_err(|e| StorageError::Invalid(e.to_string()))?;
-        let fingerprint = Digest::of_bytes(&encoded).to_string();
         self.db.write(move |tx| {
             let active: bool = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM attempt a JOIN task t USING(task_id)

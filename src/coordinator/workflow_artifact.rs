@@ -109,7 +109,7 @@ impl Coordinator {
                         s.workflow_download(&run, &workflow, &attempt, &action.key, name, pattern)
                     })
                     .await?;
-                Ok(Some(ArtifactAnswer::Catalog { artifacts: entries }))
+                Ok(entries.map(|artifacts| ArtifactAnswer::Catalog { artifacts }))
             }
             ArtifactIntent::Fetch {
                 producer,
@@ -160,15 +160,25 @@ impl Coordinator {
                 })
                 .await
                 .map_err(|_| CoordinatorError::Aborted)??;
-                let digests = receipt
-                    .files
-                    .iter()
-                    .map(|f| Digest::parse(&format!("sha256:{}", f.sha256)))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                    .map_err(|e| CoordinatorError::Invalid(e.to_string()))?;
+                let declarations = receipt.clone();
+                let scope = workflow.clone();
+                let run_id = run.clone();
+                let key = action.key.clone();
                 let producer = attempt.clone();
-                self.db(move |s| s.reserve_workflow_files(&producer, digests, wall_ms()))
-                    .await?;
+                self.db(move |s| {
+                    s.reserve_workflow_files(
+                        WorkflowUpload {
+                            run: &run_id,
+                            workflow: &scope,
+                            producer: &producer,
+                            key: &key,
+                            overwrite,
+                            receipt: declarations,
+                        },
+                        wall_ms(),
+                    )
+                })
+                .await?;
                 // Take at most one chunk this pass so lease renewal of other
                 // attempts always gets a turn. The synced part determines the
                 // next offset after a lost reply or parent restart.

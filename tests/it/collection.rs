@@ -5110,12 +5110,32 @@ jobs:
         .unwrap()
         .is_empty());
     assert_eq!(up.offsets("workflow_read"), [0]);
+    let catalog = ArtifactAction {
+        key: Digest::of_bytes(b"catalog"),
+        intent: ArtifactIntent::Catalog {
+            name: Some("package".into()),
+            pattern: None,
+        },
+    };
+    down.set(|s| {
+        s.pending_artifacts
+            .insert(consumer.clone(), catalog.clone());
+    });
     drop(c);
     drop(files);
     (c, _) = fx.open();
     c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
         .unwrap();
     c.tick().await.unwrap();
+    assert!(
+        !down
+            .state
+            .lock()
+            .unwrap()
+            .artifact_answers
+            .contains_key(&catalog.key),
+        "the upload's last chunk has arrived but the parent has not published the receipt"
+    );
     c.tick().await.unwrap();
     assert_eq!(up.offsets("workflow_read"), [0, 128 * 1024]);
     assert_eq!(
@@ -5129,17 +5149,6 @@ jobs:
     );
     up.set(|s| {
         s.pending_artifacts.remove(&producer);
-    });
-    let catalog = ArtifactAction {
-        key: Digest::of_bytes(b"catalog"),
-        intent: ArtifactIntent::Catalog {
-            name: Some("package".into()),
-            pattern: None,
-        },
-    };
-    down.set(|s| {
-        s.pending_artifacts
-            .insert(consumer.clone(), catalog.clone());
     });
     c.tick().await.unwrap();
     assert!(
