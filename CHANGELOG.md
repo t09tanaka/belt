@@ -7,6 +7,8 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-11-17
+
 ### Changed
 - `top`'s `overview` palette is now five clearly different hues (blue, pink,
   cyan, purple, green) instead of eight with light/normal pairs of the same
