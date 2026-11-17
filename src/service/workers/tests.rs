@@ -1193,11 +1193,20 @@ mod sync {
     struct Recorder {
         calls: Vec<(String, InstallStep)>,
         fail: Option<String>,
+        /// Stops the sync at the install of this version.
+        stop_at: Option<(String, ApiError)>,
     }
     impl Installer for Recorder {
-        fn install(&mut self, worker: &str, step: &InstallStep) -> Result<(), String> {
+        fn install(&mut self, worker: &str, step: &InstallStep) -> Result<(), InstallError> {
             self.calls.push((worker.into(), step.clone()));
-            self.fail.clone().map_or(Ok(()), Err)
+            if let Some((version, error)) = &self.stop_at {
+                if *version == step.version {
+                    return Err(InstallError::Stop(error.clone()));
+                }
+            }
+            self.fail
+                .clone()
+                .map_or(Ok(()), |reason| Err(InstallError::Failed(reason)))
         }
     }
 
@@ -1370,22 +1379,117 @@ mod sync {
     }
 
     #[test]
-    fn without_a_warm_up_request_nothing_is_installed_and_it_is_said() {
+    fn an_installer_that_cannot_go_on_ends_the_sync_with_its_own_error() {
+        // No resident, an old worker: not a blocked version, the sync stops.
         let mut w = world();
-        w.remote.env_queue = [worker("18.0.0", &["18.0.0"], Docker::Runnable)].into();
-        let err = run(&mut w, &mut NoWarmup, None).unwrap_err();
-        assert!(err.message.contains("cannot install on a worker"));
-        let other = Recorder::default();
-        assert!(NoWarmup
-            .install(
-                "w",
-                &InstallStep {
+        w.remote.env_queue = [worker("18.0.0", &["18.0.0"], Docker::NotRunnable)].into();
+        let mut installer = Recorder {
+            stop_at: Some((
+                "20.1.0".into(),
+                ApiError::new(
+                    ErrorCode::ProtocolIncompatible,
+                    "run workers upgrade mini-a",
+                ),
+            )),
+            ..Default::default()
+        };
+        let err = run(&mut w, &mut installer, None).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ProtocolIncompatible);
+        assert_eq!(err.message, "run workers upgrade mini-a");
+        // Nothing was installed: nothing is measured again, nothing is listed.
+        assert_eq!(w.remote.log.len(), 1);
+    }
+
+    #[test]
+    fn a_stop_after_an_install_still_says_what_was_installed() {
+        let mut r = parent();
+        r.tools.insert("node".into(), node("18.0.0", &["18.0.0"]));
+        r.tools.insert(
+            "python".into(),
+            ToolFact {
+                observed: Observed::Available,
+                version: Some("3.11.0".into()),
+                managed: Some(Managed {
+                    inventory: vec!["3.12.0".into()],
+                    installed: vec![],
+                }),
+            },
+        );
+        let mut p = parent();
+        p.tools.insert(
+            "python".into(),
+            ToolFact {
+                observed: Observed::Available,
+                version: Some("3.12.0".into()),
+                managed: None,
+            },
+        );
+        let mut installer = Recorder {
+            stop_at: Some((
+                "3.12.0".into(),
+                ApiError::new(ErrorCode::CommunicationUnknown, "no answer"),
+            )),
+            ..Default::default()
+        };
+        let mut measured = 0;
+        let err = sync_measured(
+            "mini-a",
+            &p,
+            || {
+                measured += 1;
+                Ok(r.clone())
+            },
+            None,
+            &mut installer,
+        )
+        .unwrap_err();
+        assert_eq!(installer.calls.len(), 2);
+        assert_eq!(err.code, ErrorCode::CommunicationUnknown);
+        assert_eq!(
+            err.message,
+            "installed node 20.1.0, but python 3.12.0 was not installed: no answer"
+        );
+        assert_eq!(measured, 1);
+    }
+
+    #[test]
+    fn the_line_of_a_finished_sync_says_in_sync_exactly_when_the_result_does() {
+        let done = |in_sync, installed: &[&str]| SyncResult {
+            worker: "mini-a".into(),
+            installed: installed
+                .iter()
+                .map(|v| InstallStep {
                     tool: "node".into(),
-                    version: "1".into()
-                }
-            )
-            .is_err());
-        assert!(other.calls.is_empty());
+                    version: v.to_string(),
+                })
+                .collect(),
+            in_sync,
+        };
+        for project in [false, true] {
+            assert_eq!(
+                render_sync(&done(true, &[]), project),
+                "worker mini-a is in sync"
+            );
+            let not = render_sync(&done(false, &[]), project);
+            assert!(
+                not.starts_with("worker mini-a is not in sync with the parent"),
+                "{not}"
+            );
+            assert!(!not.contains("is in sync"), "{not}");
+            assert!(not.contains("workers diff mini-a"), "{not}");
+            // The project is only named when one was given.
+            assert_eq!(not.contains("project"), project, "{not}");
+            // The JSON says the same as the line.
+            assert_eq!(
+                serde_json::to_value(done(false, &[])).unwrap()["in_sync"],
+                false
+            );
+        }
+        assert_eq!(
+            render_sync(&done(true, &["20.1.0", "22.0.0"]), false),
+            "worker mini-a is in sync; installed node 20.1.0, node 22.0.0"
+        );
+        assert!(render_sync(&done(false, &["20.1.0"]), true).ends_with("; installed node 20.1.0"));
     }
 
     #[test]

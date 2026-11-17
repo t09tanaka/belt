@@ -23,6 +23,7 @@
 //! completion belongs to the scheduler.
 
 mod collect;
+mod env_sync;
 mod estimate;
 mod input_gate;
 mod link;

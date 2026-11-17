@@ -603,3 +603,37 @@ fn installed_inventory_is_empty_without_recipes() {
     std::fs::remove_file(f.state.join("toolchains.toml")).unwrap();
     assert!(f.load().unwrap().installed_inventory().is_empty());
 }
+
+#[test]
+fn a_warm_up_request_is_the_install_an_attempt_pinning_the_version_gets() {
+    let f = Fixture::new(AdapterKind::Nodenv, "node");
+    let registry = f.load().unwrap();
+    let tool = f.config.recipes[0].tool.clone();
+    let warm = registry
+        .inventory_request(&tool, &"1.2.3".parse().unwrap())
+        .unwrap();
+    // Another source and another parent profile: the same plan, so the same
+    // singleflight key and the same private location.
+    let attempt = registry
+        .request(&f.frozen("1.2.3", b"some project"), &tool, None)
+        .unwrap();
+    assert_eq!(warm.expected_plan, attempt.expected_plan);
+    assert_ne!(warm.digest(), attempt.digest());
+    let other = registry
+        .inventory_request(&tool, &"1.3.0".parse().unwrap())
+        .unwrap();
+    assert_ne!(other.expected_plan, warm.expected_plan);
+    // Only what the operator authorized.
+    assert_eq!(
+        registry
+            .inventory_request(&tool, &"9.9.9".parse().unwrap())
+            .unwrap_err(),
+        Unavailable::NotInInventory
+    );
+    assert_eq!(
+        registry
+            .inventory_request(&ToolId::parse("rust").unwrap(), &"1.2.3".parse().unwrap())
+            .unwrap_err(),
+        Unavailable::Unsupported
+    );
+}

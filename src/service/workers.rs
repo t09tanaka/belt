@@ -953,19 +953,23 @@ pub fn diff_workers(
     Ok(out)
 }
 
-/// Installs one version on a worker through its version manager, by the same
-/// admitted setup path a placed attempt uses. The production path is a warm-up
-/// request to the worker's resident over the authenticated link; until that
-/// request exists, `NoWarmup` says so and nothing is installed.
-pub trait Installer {
-    fn install(&mut self, worker: &str, step: &InstallStep) -> Result<(), String>;
+/// Why a version was not installed.
+#[derive(Debug)]
+pub enum InstallError {
+    /// This version could not be installed; the other steps go on, and the
+    /// version is reported as blocked.
+    Failed(String),
+    /// Nothing can be installed on this worker now (no resident, a worker
+    /// that must be upgraded first, no answer): the sync ends here.
+    Stop(ApiError),
 }
 
-pub struct NoWarmup;
-impl Installer for NoWarmup {
-    fn install(&mut self, _: &str, _: &InstallStep) -> Result<(), String> {
-        Err("this version of remote-task-runner cannot install on a worker; the first attempt that needs the version installs it, or install it by hand with the worker's version manager".into())
-    }
+/// Installs one version on a worker through its version manager, by the same
+/// admitted setup path a placed attempt uses. The production one
+/// ([`warmup::ResidentWarmup`]) asks the running resident, which asks the
+/// worker over the link it already holds.
+pub trait Installer {
+    fn install(&mut self, worker: &str, step: &InstallStep) -> Result<(), InstallError>;
 }
 
 #[derive(Debug, Serialize)]
@@ -1040,18 +1044,62 @@ pub fn sync_worker(
     installer: &mut dyn Installer,
 ) -> Result<SyncResult, ApiError> {
     let parent = local().map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
-    let worker = fetch_env(remote, env, exe, name)?;
-    let first = envsync::plan(&parent, &worker, project);
+    sync_measured(
+        name,
+        &parent,
+        || fetch_env(remote, env, exe, name),
+        project,
+        installer,
+    )
+}
+
+/// `error`, with what was installed before it said first.
+fn after_installing(installed: &[InstallStep], what: &str, error: ApiError) -> ApiError {
+    if installed.is_empty() {
+        return error;
+    }
+    let list: Vec<String> = installed
+        .iter()
+        .map(|s| format!("{} {}", s.tool, s.version))
+        .collect();
+    ApiError {
+        message: format!(
+            "installed {}, but {what}: {}",
+            list.join(", "),
+            error.message
+        ),
+        ..error
+    }
+}
+
+/// [`sync_worker`] with the worker's measurement given: `measure` is asked
+/// once before the installs and once after them.
+pub fn sync_measured(
+    name: &str,
+    parent: &EnvReport,
+    mut measure: impl FnMut() -> Result<EnvReport, ApiError>,
+    project: Option<&[crate::toolchain::versions::EffectiveRequirement]>,
+    installer: &mut dyn Installer,
+) -> Result<SyncResult, ApiError> {
+    let worker = measure()?;
+    let first = envsync::plan(parent, &worker, project);
     let mut installed = Vec::new();
     let mut blocked = Vec::new();
     for step in &first.install {
         match installer.install(name, step) {
             Ok(()) => installed.push(step.clone()),
-            Err(reason) => blocked.push(Blocked {
+            Err(InstallError::Failed(reason)) => blocked.push(Blocked {
                 subject: step.tool.clone(),
                 missing: format!("{} {} was not installed", step.tool, step.version),
                 steps: reason,
             }),
+            Err(InstallError::Stop(error)) => {
+                return Err(after_installing(
+                    &installed,
+                    &format!("{} {} was not installed", step.tool, step.version),
+                    error,
+                ))
+            }
         }
     }
     let last = if installed.is_empty() {
@@ -1060,23 +1108,12 @@ pub fn sync_worker(
     } else {
         // Look again: what was installed must now be there. If the worker
         // cannot be measured, what was installed so far is still said.
-        let after = fetch_env(remote, env, exe, name).map_err(|e| {
-            let list: Vec<String> = installed
-                .iter()
-                .map(|s| format!("{} {}", s.tool, s.version))
-                .collect();
-            ApiError::new(
-                e.code,
-                format!(
-                    "installed {}, but the worker could not be measured afterwards: {}",
-                    list.join(", "),
-                    e.message
-                ),
-            )
+        let after = measure().map_err(|e| {
+            after_installing(&installed, "the worker could not be measured afterwards", e)
         })?;
         blocked.extend(envsync::verify(
             &installed,
-            envsync::plan(&parent, &after, project),
+            envsync::plan(parent, &after, project),
         ));
         after
     };
@@ -1084,11 +1121,37 @@ pub fn sync_worker(
         Ok(SyncResult {
             worker: name.into(),
             installed,
-            in_sync: envdiff::all_same(&envdiff::diff(&parent, &last)),
+            in_sync: envdiff::all_same(&envdiff::diff(parent, &last)),
         })
     } else {
         Err(blocked_error(name, &installed, &blocked))
     }
+}
+
+/// One line for a sync that ended without anything blocked. It says "in
+/// sync" exactly when `in_sync` is true; otherwise it leads with what is
+/// still different, and says the project's requirements are met only when a
+/// project was given.
+pub fn render_sync(done: &SyncResult, project: bool) -> String {
+    let name = &done.worker;
+    let state = match (done.in_sync, project) {
+        (true, _) => format!("worker {name} is in sync"),
+        (false, true) => format!(
+            "worker {name} is not in sync with the parent: it meets the project's requirements, and still differs from the parent where the project declares a tool (see workers diff {name})"
+        ),
+        (false, false) => format!(
+            "worker {name} is not in sync with the parent: nothing is left for sync to install (see workers diff {name})"
+        ),
+    };
+    if done.installed.is_empty() {
+        return state;
+    }
+    let list: Vec<String> = done
+        .installed
+        .iter()
+        .map(|s| format!("{} {}", s.tool, s.version))
+        .collect();
+    format!("{state}; installed {}", list.join(", "))
 }
 
 fn registered_names(env: &BTreeMap<String, String>) -> Result<Vec<String>, ApiError> {
@@ -1281,25 +1344,11 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                     name,
                     || crate::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env),
                     requirements.as_deref(),
-                    &mut NoWarmup,
+                    &mut warmup::ResidentWarmup::new(spec.clone()),
                 )
             })()
             .map(|done| {
-                let state = if done.in_sync {
-                    "is in sync"
-                } else {
-                    "meets the project's requirements (it still differs from the parent where the project declares a tool; see workers diff)"
-                };
-                let text = if done.installed.is_empty() {
-                    format!("worker {name} {state}")
-                } else {
-                    let list: Vec<String> = done
-                        .installed
-                        .iter()
-                        .map(|s| format!("{} {}", s.tool, s.version))
-                        .collect();
-                    format!("worker {name} {state}; installed {}", list.join(", "))
-                };
+                let text = render_sync(&done, project.is_some());
                 (serde_json::to_value(&done).expect("serializes"), text)
             });
             let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
@@ -1317,6 +1366,8 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
         || text,
     ))
 }
+
+pub mod warmup;
 
 #[cfg(test)]
 mod tests;
