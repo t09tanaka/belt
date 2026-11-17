@@ -7,6 +7,24 @@ the minor version).
 
 ## [Unreleased]
 
+### Changed
+
+- **`live::snapshot()` no longer waits 300 ms on every call.** Each process
+  keeps its last CPU sample. A call between 200 ms
+  (`sysinfo::MINIMUM_CPU_UPDATE_INTERVAL`) and 5 s (`CPU_SAMPLE_MAX_AGE`,
+  new) after it samples once without waiting and reports the usage since
+  then; a call sooner than that returns the previous figure; the first call
+  in a process, and a call after a longer pause, still take two samples
+  300 ms apart. A long-lived process that links the crate and asks for a
+  forecast or an estimate on every request used to pay the 300 ms each time.
+  A command that asks once (`status`, `inspect`) measures as before. Within
+  one `exec` or `wait`, the polls after the first now measure over the time
+  since the previous poll (up to 5 s) instead of over a fresh 300 ms, and the
+  "contended" sample right before a start may reuse the admission sample
+  taken a moment earlier. Callers that arrive while another thread of the
+  same process is in the 300 ms wait block until it ends and share its
+  figure. Memory and the load average are still read on every call.
+
 ## [0.10.1] - 2026-11-17
 
 ### Added
