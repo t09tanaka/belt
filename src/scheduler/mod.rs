@@ -132,6 +132,11 @@ pub struct Scheduler {
     costs: Arc<dyn CostModel>,
     priorities: Mutex<BTreeMap<WorkerId, i64>>,
     seq: AtomicU64,
+    /// A longer wait for a forecast that a test sets (0: none). A test that
+    /// asks many workers' inspections at once on a loaded machine cannot
+    /// rely on the production wait.
+    #[cfg(test)]
+    forecast_wait_override_ms: AtomicU64,
     /// The last decision for each task that waits, so that a task that
     /// waits for the same reason is recorded once.
     waiting: Mutex<BTreeMap<TaskId, Decision>>,
@@ -156,8 +161,30 @@ impl Scheduler {
             costs,
             priorities: Mutex::default(),
             seq: AtomicU64::new(0),
+            #[cfg(test)]
+            forecast_wait_override_ms: AtomicU64::new(0),
             waiting: Mutex::default(),
         }
+    }
+
+    /// How long one question to a worker is waited for
+    /// ([`SchedulerConfig::forecast_wait_ms`]).
+    pub fn forecast_wait(&self) -> std::time::Duration {
+        #[cfg(test)]
+        {
+            let over = self.forecast_wait_override_ms.load(Ordering::Relaxed);
+            if over != 0 {
+                return std::time::Duration::from_millis(over);
+            }
+        }
+        std::time::Duration::from_millis(self.cfg.forecast_wait_ms)
+    }
+
+    /// Test only: wait this long instead of the production default.
+    #[cfg(test)]
+    pub(crate) fn set_forecast_wait_for_test(&self, wait: std::time::Duration) {
+        self.forecast_wait_override_ms
+            .store(wait.as_millis() as u64, Ordering::Relaxed);
     }
 
     pub fn costs(&self, worker_id: &WorkerId, task: &QueuedTask) -> Costs {

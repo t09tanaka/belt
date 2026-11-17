@@ -1096,19 +1096,21 @@ fn the_command_timeout_stops_a_running_command() {
 #[test]
 fn a_node_s_own_timeout_replaces_the_default_for_that_node_only() {
     // The first node outlives the default and may: its own limit is longer.
-    // The second has a shorter one of its own and is stopped by it.
+    // The second has a shorter one of its own and is stopped by it. A limit
+    // counts from the launch, so the second must be long enough for a loaded
+    // machine to start the shell and write the marker before it is stopped.
     let mut f = fx(vec![]);
     let marker = f.path("stuck-started");
     f.spec.nodes = vec![
-        node("slow", "sleep 1.2; echo slow-done"),
+        node("slow", "sleep 3; echo slow-done"),
         node(
             "stuck",
             &format!("touch {}; sleep 30; echo stuck-done", marker.display()),
         ),
     ];
-    f.spec.command_timeout_ms = Some(400);
+    f.spec.command_timeout_ms = Some(2_000);
     f.spec.nodes[0].timeout_ms = Some(20_000);
-    f.spec.nodes[1].timeout_ms = Some(300);
+    f.spec.nodes[1].timeout_ms = Some(1_500);
     f.spec.term_grace_ms = 2_000;
     let t = run_from_command_start(&f, &marker);
     assert!(f.output().contains("slow-done"), "{}", f.output());
@@ -1131,7 +1133,8 @@ fn a_node_without_its_own_timeout_keeps_the_default() {
             &format!("touch {}; sleep 30; echo stuck-done", marker.display()),
         ),
     ];
-    f.spec.command_timeout_ms = Some(400);
+    // Long enough for the shell to write the marker on a loaded machine.
+    f.spec.command_timeout_ms = Some(2_000);
     // The limit of the node before it does not stay in force.
     f.spec.nodes[0].timeout_ms = Some(60_000);
     f.spec.term_grace_ms = 2_000;
