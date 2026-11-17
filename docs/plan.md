@@ -1081,7 +1081,7 @@ worker は自分専用の scope（`<state>/traffic`）を使っていて、同�
 - 手元で 1 回だけ、導入済みの CLI 0.10.0 を step から呼んで確かめた（一時 `HOME`、CI には入れていない）: nested の `exec` は worker の entry を `parent` とする子として同じ ledger に登録された。
 
 残り（この変更では直していない）:
-1. RTR の library は 0.8.2、CLI は 0.9 以降で nested を子 entry として登録し、その間 ledger を v3 形（`entries_v3` のみ）で書く。0.8.2 の `Ledger::load` は v3 形を読めない（確認済み）。scope を共有したので、CLI 0.9 以降の nested exec が動いている間、worker の admit・renew・forecast の ledger 読み取りが失敗しうる。RTR の依存を CLI と同じ系列へ上げる変更を別に行う（挙動が変わるので検証を分ける）。それまで CLI 0.9 以降の host では worker と nested exec の同時利用を避ける。
+1. RTR の library は 0.8.2、CLI は 0.9 以降で nested を子 entry として登録し、その間 ledger を v3 形（`entries_v3` のみ）で書く。0.8.2 の `Ledger::load` は v3 形を読めない（確認済み）。scope を共有したので、CLI 0.9 以降の nested exec が動いている間は worker が ledger を読めない。手元で v3 形の ledger を置いて確かめた結果、supervisor の `run` は `Traffic("ledger: ...")` で即座に失敗し（attempt は `ready` のまま）、forecast が使う inspect も同じ error になった。RTR の依存を CLI と同じ系列へ上げる変更を別に行う（挙動が変わるので検証を分ける）。この変更は、その依存更新より先に CLI 0.9 以降の host へ出さない。
 2. service 環境の allowlist（worker・worker-service・init）に `XDG_STATE_HOME` が無いので、常駐 worker は常に `HOME` の規則になる。利用者の shell だけが `XDG_STATE_HOME` を設定していると scope が割れる。allowlist へ足すか doctor で検出する（S23 の state path・policy digest 検査）。
 3. `XDG_CONFIG_HOME` は step へ強制していない。明示 profile が許可しない場合、worker が `XDG_CONFIG_HOME` で決めた config と nested CLI の config（`~/.config`）が異なりうる。
 4. scope を決める公開関数を task-traffic-controller の library に置き、RTR が追従する（規則の二重持ちを無くす。ツール側と利用側は別 PR）。
