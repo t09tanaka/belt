@@ -246,7 +246,8 @@ mod tests {
         std::fs::write(&gh, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
         Gh {
-            path: Some(format!("relative:{}:/bin:/usr/bin", bin.display())),
+            // Only directories of the test: the host may have a real gh.
+            path: Some(format!("relative:{}:{}", cwd.display(), bin.display())),
             cwd,
             deadline,
         }
