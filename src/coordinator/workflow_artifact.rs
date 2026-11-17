@@ -22,6 +22,7 @@ impl Coordinator {
         a: &AttemptRecord,
         command: WorkflowArtifactCommand,
     ) -> Result<Option<ArtifactExchangeResult>> {
+        let reading = matches!(&command, WorkflowArtifactCommand::Read { .. });
         let req = WorkflowArtifactRequest {
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
@@ -33,6 +34,9 @@ impl Coordinator {
         match link.call(Request::WorkflowArtifact(req)).await {
             Ok(Response::WorkflowArtifact(r)) => Ok(Some(r.result)),
             Err(LinkError::Remote(e)) if e.code == ErrorCode::StaleEpoch => Err(self.fence()),
+            Err(LinkError::Remote(e)) if reading && e.code == ErrorCode::InvalidInput => Err(
+                CoordinatorError::Invalid("worker could not read the staged artifact".into()),
+            ),
             _ => Ok(None),
         }
     }

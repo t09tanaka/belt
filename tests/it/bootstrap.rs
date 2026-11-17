@@ -5695,3 +5695,49 @@ async fn a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_
     }
     shutdown(&load(&spec)).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a27_public_ci_expands_from_a_needs_output_and_joins_in_variant_order() {
+    let (root, spec, input) = control_fixture();
+    let jobs = r#"  shape:
+    runs-on: ubuntu-latest
+    outputs:
+      legs: ${{ steps.out.outputs.legs }}
+    steps:
+      - id: out
+        run: echo 'legs={"include":[{"n":0},{"n":1},{"n":2}]}' >> "$GITHUB_OUTPUT"
+  leg:
+    needs: shape
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.shape.outputs.legs) }}
+    outputs:
+      last: ${{ steps.out.outputs.n }}
+    steps:
+      - id: out
+        run: |
+          mkdir MARKS/permit
+          echo "${{ matrix.n }}" >> MARKS/leg
+          echo "n=${{ matrix.n }}" >> "$GITHUB_OUTPUT"
+          rmdir MARKS/permit
+  report:
+    needs: leg
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.leg.outputs.last }}" >> MARKS/report
+"#;
+    let marks = ci_project(root.path(), &input, jobs);
+    let (exit, report) = ci_output(&spec, &input).await;
+    assert_eq!(exit, Some(0), "{report}");
+    assert_eq!(ci_marks(&marks, "leg"), ["0", "1", "2"]);
+    assert_eq!(ci_marks(&marks, "report"), ["2"]);
+    let attempts = ci_attempts(&spec, &report);
+    assert_eq!(
+        attempts.values().filter(|n| **n == 0).count(),
+        1,
+        "only the logical matrix origin has no execution"
+    );
+    assert_eq!(attempts.values().sum::<usize>(), 5);
+    shutdown(&load(&spec)).await;
+}
