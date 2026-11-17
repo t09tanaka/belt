@@ -353,6 +353,9 @@ pub fn run(cli: Cli) -> i32 {
         return run_control(&cli);
     }
 
+    if matches!(cli.command, Command::Doctor) {
+        return crate::service::doctor::command(cli.json);
+    }
     if let Command::Estimate(args) = &cli.command {
         return crate::service::estimate::cli(args, cli.json);
     }
