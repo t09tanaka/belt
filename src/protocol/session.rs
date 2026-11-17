@@ -120,9 +120,33 @@ pub struct Connected {
     pub negotiated: Negotiated,
 }
 
-pub async fn connect(mut io: Io, mut cfg: ClientConfig) -> Result<Connected, ConnectError> {
+/// The features a coordinator of this build offers in `hello`.
+pub fn offered_features() -> Vec<String> {
+    SUPPORTED_FEATURES
+        .iter()
+        .map(|f| f.to_string())
+        .chain([crate::outputs::FEATURE.to_string()])
+        .collect()
+}
+
+/// The features without which a coordinator of this build refuses a worker.
+pub fn required_features() -> Vec<String> {
+    vec![crate::outputs::FEATURE.to_string()]
+}
+
+pub async fn connect(io: Io, mut cfg: ClientConfig) -> Result<Connected, ConnectError> {
+    cfg.required_features.extend(required_features());
+    connect_requiring(io, cfg).await
+}
+
+/// `connect` that requires only what `cfg` lists. A check of a worker on
+/// another version uses it: what that version must have is decided by the
+/// caller, not by this build.
+pub async fn connect_requiring(
+    mut io: Io,
+    mut cfg: ClientConfig,
+) -> Result<Connected, ConnectError> {
     cfg.features.push(crate::outputs::FEATURE.into());
-    cfg.required_features.push(crate::outputs::FEATURE.into());
     let hello = HelloRequest {
         schema_version: SchemaVersion::CURRENT,
         request_id: RequestId::generate(),

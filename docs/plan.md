@@ -1078,3 +1078,57 @@ S22 の残り（必須。この変更で S22 は完了しない）:
 2. drain の確認と受理の間に、非常に短い競合が残る（受理が drain の確認を通った直後に stop が 0 件を 2 回数える）。実機での stop と受理の同時試験は S26 で行う。
 3. `system-user`（LaunchDaemon の `UserName`）の導入、Linux、upgrade・rollback・doctor・`workers forget`、fish / csh のログインシェル対応は未実装（S23・S24）。
 4. 実 SQLite の live attempt を持つ worker に対する stop の待ち・cancel の end-to-end（agent の cancel は統合試験済みだが、helper の待ちは注入した計数での単体試験）。
+
+### S23 workers upgrade と rollback（2026-11-17）
+
+`workers upgrade <worker>` を CLI へ接続した（`Envelope::not_implemented` に落ちなくなった）。`doctor` は次の変更で接続する。
+
+- worker host の helper に hidden の `worker-service upgrade`・`rollback`・`commit` を足した（`src/service/worker_service/upgrade.rs`）。`upgrade` と `rollback` は「目標の版へ切り替える」同じ再開可能な手順で、順序は drain（upgrade が drain したことを journal に記録）→ 配置（版別 directory、既存 file は上書きしない）→ 互換検査（新しい版が worker.json・identity binding・worker DB を読めるか。DB は互換表つきの read-only open で、その場で migrate しない）→ live attempt が 0 になるのを待って旧 service を bootout → worker DB を checkpoint して `bin/<切替元>/worker.db.saved` へ退避 → journal へ切替を記録 → 旧 plist を receipt で確かめて削除 → worker.json → `bin/current` を rename で付け替え → 新 plist を journal つきで公開 → 起動、である。途中のどの step で落ちても、`upgrade` の再実行で完了し、`rollback` で元に戻る（全 step への失敗注入で確認）。版ごとの worker.json は `bin/<digest>/worker.json` に bytes のまま残し、戻すときはその bytes を使う。
+- **切替の記録は commit まで残す。** journal の `switch`（切替元の版、まだ消していない旧 plist の receipt、DB を退避したか）は、新しい版を起動しても消さない。親が health を確かめた後に送る `commit` だけが、記録と退避した DB を消し、upgrade が行った drain を resume する。commit の前なら、親が落ちた後の再実行でも前の版へ rollback できる。rollback は、前の版を起動する前に退避した DB を戻す（新しい版が migrate していても前の版が開ける）。戻し終えた rollback は記録を自分で消す。commit の後は rollback できない（helper が拒否する）。静止時（commit 後）の journal と status は S22 の版がそのまま読める形のままである。
+- **drain の持ち主を host に残す。** `upgrade` は、worker が drain 中でなければ journal に `drained_by_upgrade` を書いてから drain marker を書く。すでに drain 中ならそれは利用者のもので、記録しない。`commit` は記録があるときだけ resume する。利用者が `workers drain` / `workers resume` を打てば、その drain は利用者のものになる（記録を消す）。切替が commit 待ちの間の `workers resume` は拒否する（退避した DB へ rollback し得る間に仕事を受けると、その記録を失うため）。
+- **host の排他。** `upgrade`・`rollback`・`commit`・`drain`・`resume` は、journal を読む前から答えるまで `worker-service.lock` の排他 flock を持つ。取れなければ何も変えずに「切替中」と失敗する。`status` は共有 lock を試し、取れなければ `switch_running` を付けて答える。
+- 親側（`src/service/workers/upgrade.rs`）は、resident の確認 → staging（digest 照合。壊れた転送は公開されない）→ status → helper の `upgrade`（drain を含む）→ health → `commit` → 登録の更新、の順に行う。失敗の報告は 3 つに分ける。切替が始まる前の失敗は rollback を呼ばず、前の版に `hello` を通してから「upgrade されていない、前の版が動いている」と報告する。切替が始まった後の失敗は `rollback` し、前の版にも health を通してから「rollback して前の版が動いている」と報告する（exit は CONFLICT）。rollback も失敗したとき・host を観測できないときは、最後に観測した状態（版・commit 待ちの切替・service が loaded か・agent が ready か・drain とその持ち主）をそのまま言い、「upgraded」「stopped」「serving again」のどれも言わない。health を通っていない版では drain を解かない。host が「切替中」と答えたときは、rollback も resume も送らずに失敗を報告する（待たない）。利用者が先に drain していた worker は upgrade 後も drain のままにし、そう報告する。
+- **resident との整合。** `workers upgrade` は最初に、動いている resident へ build（起動時に読んだ実行ファイルの digest）と、`hello` で提供・要求する feature を尋ねる（resident の IPC に `Build` を追加）。resident が親の binary と違う build のとき、または答えられないとき（この問いを知らない古い resident を含む）は、何も送らずに拒否し、resident の再起動を案内する。resident が動いていなければ進む。health の `hello` は resident が要求する feature で行う。前の版は、upgrade の前に `hello` で合意していた feature だけを要求して検査する（前の版に尋ねられなかった再実行では何も要求しない）。互換の方針（N／N+1）は仕様 §18 に書いた。
+- 親自身の更新との順序: この実装は「親の binary（この CLI 自身）を worker へ配る」ので、親を更新し、resident を新しい binary で起動し直してから `workers upgrade` を実行する。
+
+受入項目との対応: A34 のうち upgrade・rollback・失敗からの再開・実行中 binary を上書きしないこと（`bin/<旧 digest>/` の bytes が全経路で変わらないこと）を、偽の Launcher・偽の ssh・一時 HOME で試験した。A36 のうち S23 の分は「静止時の worker-service journal と status JSON が S22 の版でも読める形のままであること」（旧 schema の厳格な読み取りで検証）と、既存の `workers` 系コマンドの統合試験が変わらず通ることである。
+
+S23 の残り（必須。この変更で S23 は完了しない）:
+1. `doctor` と A05（次の節）。
+2. 本物の launchd・実 SSH・実機での upgrade / rollback（A34 の native 検証、S26）は未実施。
+3. resident 自身の更新手順（init の「changed bytes は別の upgrade flow」）は未実装で、S23 の範囲外として残る。`workers upgrade` は build の違う resident が動いていると拒否して再起動を案内するだけで、resident を再起動しない。
+4. rollback で戻した版の plist は、新しい版の helper が描いた内容である。plist の描き方が版の間で変わると、戻した先の古い helper は「installed plan differs」で start / stop を拒否する（現時点では描き方は変わっていない）。
+5. live attempt があるあいだ upgrade は待ち（既定 600 秒）、時間切れなら何も切り替えずに失敗する。稼働中の attempt を旧版の supervisor のまま残して agent だけを切り替えることはしない。実 SQLite に live attempt を持つ worker での待ちと「切り替えていない」報告の end-to-end 試験は無い（文言の組み立てだけを単体で試験）。
+6. rollback は commit の前に限る。試用中（起動から commit まで）の版が worker DB に書いた記録（ack・GC の進み）は、rollback で切替前へ巻き戻る。その間 worker は drain 中で新しい attempt は来ないので、これは許容する（仕様 §18 に明記）。退避は worker.db だけで、state directory のほかの file は戻さない。
+7. host が「切替中」のとき、親は待たずに失敗を報告する。ssh が切れた後も helper が動き続けた場合は、終わってから `workers upgrade` を打ち直す。
+8. lock を取らない旧版の helper（S22 の `start` / `stop`、この変更より前の `upgrade`）とは排他にならない。`install`・`start`・`stop` も lock を取らない。
+9. レビュー指摘のうち、worker の task-traffic-controller の scope（M4）は別の変更で直す。実際の launchd 環境での検査（L3）は S26 の実機受入の残件とする。
+
+### S23 doctor（2026-11-17）
+
+`doctor` を CLI へ接続した（`src/service/doctor.rs`）。各 host は事実だけを集め、判定は親が 1 か所（`evaluate`・`shared_engines`・`service_checks`）で行う。worker host の事実は hidden の `worker-service doctor` が、journal に記録した service の環境（LaunchAgent に渡した env。`XDG_CONFIG_HOME` を除く）で集める。親自身の local worker は `coordinator.json` に保持した env で調べ、保持が無ければ呼び出した shell の env で調べたことを notice として出す。check の結果は `ok`・`notice`・`fail`・`not_checked` の 4 つで、見られなかったものを `ok` にしない。`healthy` は `fail` も `not_checked` も 1 つも無いときだけ true である。1 つでも `fail` があれば exit は BLOCKED（`blocked_reason = environment_mismatch`）、`fail` は無いが `not_checked` があれば exit 1（`COMMAND_FAILED`、`blocked_reason` なし）で、両者を exit code で区別できる（仕様に doctor の exit code の定めは無い）。`--json` はどの場合も `result` に全 check を載せる。
+
+| check | 内容 | fail にする条件 |
+|---|---|---|
+| `traffic_runtime` | service の PATH が解決する `task-traffic-controller` に `status --json` を尋ね、`ledger_format`（managed entry を知っている binary だけが出す field）の有無を見る | field が無い（未修正の binary）、答えが読めない。command が無ければ ok |
+| `traffic_state_path` | worker の scope（`<state>/traffic`）と、その環境で command が使う scope（XDG、無ければ HOME の下）を比べる | scope が違い、かつ command が導入済みか state を残している。どちらも無ければ notice |
+| `traffic_policy` | 両 scope の実効 config の digest（task-traffic-controller 自身の `policy_digest` と同じ計算）を比べる | digest が違い command がある、config が読めない |
+| `traffic_processes` | 実行中の task-traffic-controller process（旧い build が起動した job）の検査。この build では実装していない | fail にしない。command があるか state が残っていれば `not_checked`（ledger の entry 数を添える）。どちらも無ければ ok |
+| `docker_resource_domain` | service の環境の docker client の接続先と engine ID | 接続先が unix socket / pipe 以外（別 host の engine）。engine が答えなければ notice、client が無ければ ok。engine は答えたが接続先が分からない（`DOCKER_HOST` が無く `docker context inspect` が 1 行を返さない）ときは `not_checked` |
+| `docker_shared_engine` | 親と全 worker の engine ID を突き合わせる | 同じ engine を 2 host 以上が使う（両方に fail） |
+| `service_profile` | service の環境で worker profile を load し、起動時と同じ probe を通す | load できない |
+| `reachable`・`service`・`version`・`bridge`（worker のみ） | ssh で helper が答えるか、service が loaded / ready か、版が親と同じか、登録済み binary 経由の `hello` が同じ cluster と worker_id で完了するか（必須 feature の交渉を含む） | 到達不能・別 identity の答え・未 load・切替が未完または commit 待ち・hello 失敗。版の違いと drain 中は notice。host が切替中（`switch_running`）なら `service` は `not_checked` |
+| `legacy_config`（project） | 実行した directory の project の `.local-ci.toml` に、値のある未対応 key（`link-node-modules` など）があれば notice | fail にしない。config を解決できなければ `not_checked` |
+| `environment_diff`（worker ごと） | S21（`workers diff`）の差し込み口。`doctor::run` の `diff` 引数に worker 名から check を返す関数を渡すと、その結果が入る | この build では `not_checked` として列挙する |
+
+受入項目との対応: A05 のうち「未修正 binary を doctor が不適合とする」を、偽の `task-traffic-controller`（`ledger_format` を出さない `status --json`）で、library と実 binary の両方で試験した。A36 のうち S23 の分は、旧い形の `status --json` をそのまま読めること（読めたうえで不適合と判定する）である。
+
+S23 の残り（必須。この変更でも S23 は完了しない）:
+1. **A05 の「同じ budget・policy を共有」は、現状の既定では成り立っていない。** worker の supervisor は `<state>/traffic` を scope にしており（`AgentConfig::new`。設定項目は無い）、同じ user の `task-traffic-controller` command の scope（`~/.local/state/task-traffic-controller`）とは別の ledger になる。doctor はこれを、command が導入済みの host では `traffic_state_path` の fail として報告する（command を日常的に使う host では doctor が必ず fail する）。scope を揃える変更は S9a / S10 の範囲で、ここでは行っていない。A05 はそれが決まるまで未達である。
+2. 「実行中 process」の検査（仕様の既存 state との互換の節）は未実装で、`traffic_processes` を `not_checked` として出す（process の走査はしていない）。command を導入した host では doctor は exit 0 にならない。
+3. S21 の `workers diff` の結果は差し込み口のみ（`not_checked`）。S21 が main に入ったあと、`doctor::command` が `run` に渡す `diff` を `None` から置き換える。それまで、worker を登録した親では doctor は exit 0 にならない（exit 1。`fail` があれば BLOCKED）。
+4. Linux の linger の確認（仕様 §15）と、system-user mode（LaunchDaemon の `UserName`）の service user での profile 検査は未実装（S24・S22 の残り）。前者は report に項目として出していない。
+5. 本物の docker・実 SSH・実機の launchd 環境での doctor（A35 の「実際の service 環境で doctor が通る」）は未実施（S26）。偽の runner と偽の ssh は実挙動を確かめない。
+6. 親の local worker の service 環境は、`coordinator.json` の env が空のとき呼び出し shell の env で代用する（notice を出す）。
+7. レビュー指摘の残り: worker の task-traffic-controller の scope（M4。上の 1）は別の変更で worker 側を CLI と同じ規則に揃える。doctor の判定は変えていない。profile と command の検査は ssh の helper が journal の env で行い、launchd のドメインや Keychain の可否は再現しない（L3）。実際の launchd 環境での検査は S26 の実機受入の残件とする。
+8. doctor は resident の build・feature と各 worker の照合をしていない（`workers upgrade` は行う）。bridge の `hello` は doctor を実行した binary の必須 feature で行う。

@@ -525,6 +525,9 @@ fn status_with(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
         cancel_running: false,
         live_attempts: Some(0),
         bridge_binary: None,
+        switching_from: None,
+        drained_by_upgrade: false,
+        switch_running: false,
     }
 }
 
@@ -836,16 +839,135 @@ async fn hello_names_who_answered_and_fails_when_nothing_does() {
                 .unwrap();
         std::future::pending::<()>().await;
     });
-    let (got_cluster, got_worker) = hello_on(parent, &cluster).await.unwrap();
+    let hello = hello_on(parent, &cluster, None).await.unwrap();
     assert_eq!(
-        (got_cluster, got_worker.as_str()),
+        (hello.cluster, hello.worker.as_str()),
         (cluster.clone(), "mini-a")
     );
+    assert!(hello
+        .features
+        .contains(&crate::outputs::FEATURE.to_string()));
     server.abort();
     // A child that exits at once (ssh could not run the binary) is an error.
     let argv: Vec<String> = ["/bin/sh", "-c", "exit 127"].map(String::from).into();
-    assert!(hello_through(&argv, &cluster).await.is_err());
-    assert!(hello_through(&["/nonexistent/ssh".to_string()], &cluster)
-        .await
-        .is_err());
+    assert!(hello_through(&argv, &cluster, None).await.is_err());
+    assert!(
+        hello_through(&["/nonexistent/ssh".to_string()], &cluster, None)
+            .await
+            .is_err()
+    );
+}
+
+/// A worker of another version: it speaks the protocol and offers `features`.
+fn worker_offering(
+    cluster: &ClusterId,
+    features: &[&str],
+) -> (crate::protocol::Io, tokio::task::JoinHandle<()>) {
+    let (parent, peer) = crate::protocol::transport::duplex_pair(4096);
+    let identity = crate::protocol::hello::WorkerIdentity {
+        capabilities: None,
+        worker_id: WorkerId::parse("mini-a").unwrap(),
+        worker_boot_id: crate::ids::WorkerBootId::parse("boot1").unwrap(),
+        agent_epoch: crate::ids::AgentEpoch(1),
+        profile: "p".into(),
+        profile_fingerprint: crate::ids::Digest::of_bytes(b"p"),
+        coordinator_epoch: CoordinatorEpoch(0),
+    };
+    let mut config = crate::protocol::ServerConfig::new(cluster.clone(), identity);
+    config.local.features = features.iter().map(|f| f.to_string()).collect();
+    let server = tokio::spawn(async move {
+        if let Ok(_accepted) = crate::protocol::accept(peer, config).await {
+            std::future::pending::<()>().await;
+        }
+    });
+    (parent, server)
+}
+
+#[tokio::test]
+async fn a_probe_requires_exactly_what_the_caller_lists() {
+    let cluster = ClusterId::generate();
+    // A version that lacks some of what this build offers.
+    let older = ["log_resume", "blob_resume"];
+    let lacking = crate::forecast::COMMAND_FEATURE.to_string();
+    let (io, server) = worker_offering(&cluster, &older);
+    let hello = hello_on(io, &cluster, None).await.unwrap();
+    assert_eq!(hello.worker.as_str(), "mini-a");
+    // It says what it agreed to: nothing it lacks.
+    assert!(hello.features.contains(&"log_resume".to_string()));
+    assert!(!hello.features.contains(&lacking));
+    server.abort();
+    // Asked for nothing, or for what it has, it passes.
+    let (io, server) = worker_offering(&cluster, &older);
+    assert!(hello_on(io, &cluster, Some(&[])).await.is_ok());
+    server.abort();
+    let (io, server) = worker_offering(&cluster, &older);
+    let has = ["log_resume".to_string()];
+    assert!(hello_on(io, &cluster, Some(&has)).await.is_ok());
+    server.abort();
+    // Asked for what it lacks, it is refused.
+    let (io, server) = worker_offering(&cluster, &older);
+    let error = hello_on(io, &cluster, Some(&[lacking])).await.unwrap_err();
+    assert!(error.contains("required features missing"), "{error}");
+    server.abort();
+}
+
+#[test]
+fn what_this_build_offers_and_requires_is_one_list() {
+    let offered = crate::protocol::session::offered_features();
+    let required = crate::protocol::session::required_features();
+    assert_eq!(required, [crate::outputs::FEATURE]);
+    assert!(required.iter().all(|f| offered.contains(f)));
+    for feature in crate::protocol::hello::SUPPORTED_FEATURES {
+        assert!(offered.iter().any(|f| f == feature));
+    }
+}
+
+#[test]
+fn a_resident_that_is_not_there_is_not_running_and_one_that_is_silent_is_unknown() {
+    use crate::service::resident::Reply;
+    let io = |kind| Err(anyhow::Error::from(std::io::Error::from(kind)));
+    assert_eq!(
+        resident_answer(io(std::io::ErrorKind::ConnectionRefused)),
+        ResidentBuild::NotRunning
+    );
+    assert_eq!(
+        resident_answer(io(std::io::ErrorKind::NotFound)),
+        ResidentBuild::NotRunning
+    );
+    // It accepted the connection and closed it: a resident older than the question.
+    let silent = resident_answer(io(std::io::ErrorKind::UnexpectedEof));
+    assert!(
+        matches!(&silent, ResidentBuild::Unknown { reason } if reason.starts_with("it did not answer: ")),
+        "{silent:?}"
+    );
+    assert!(matches!(
+        resident_answer(Err(anyhow::anyhow!("not an io error"))),
+        ResidentBuild::Unknown { .. }
+    ));
+    assert_eq!(
+        resident_answer(Ok(Reply::Build {
+            binary_sha256: "d".into(),
+            features: vec!["f".into()],
+            required_features: vec!["r".into()],
+        })),
+        ResidentBuild::Running {
+            binary_sha256: "d".into(),
+            features: vec!["f".into()],
+            required_features: vec!["r".into()],
+        }
+    );
+    assert_eq!(
+        resident_answer(Ok(Reply::Error {
+            message: "why".into()
+        })),
+        ResidentBuild::Unknown {
+            reason: "why".into()
+        }
+    );
+    assert_eq!(
+        resident_answer(Ok(Reply::Stopping)),
+        ResidentBuild::Unknown {
+            reason: "it did not understand the question".into()
+        }
+    );
 }
