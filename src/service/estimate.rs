@@ -63,41 +63,12 @@ impl Estimate {
         }
     }
     pub fn human(&self) -> String {
-        let mut text = format!(
-            "estimate: {} (conditional)\n",
-            if self.online {
-                "online"
-            } else {
-                "offline; unknown"
-            }
-        );
-        if let Some(decision) = &self.decision {
-            text.push_str(&format!("{}\n", decision.summary()));
-            for worker in &decision.compared {
-                let time = |value: Option<u64>| {
-                    value
-                        .map(|ms| format!("{ms} ms"))
-                        .unwrap_or_else(|| "unknown".into())
-                };
-                let label = match worker.label {
-                    crate::scheduler::decide::Label::Measured => "measured",
-                    crate::scheduler::decide::Label::Fallback => "fallback (ranking only)",
-                    crate::scheduler::decide::Label::Unknown => "unknown",
-                };
-                text.push_str(&format!(
-                    "{}: {}; execution {}; queue {}; conditional={}\n",
-                    worker.worker_id,
-                    label,
-                    time(worker.outlook.execution_ms),
-                    time(worker.outlook.wait_ms),
-                    worker.outlook.conditional
-                ));
-            }
-        }
-        for note in &self.assumptions {
-            text.push_str(&format!("{note}\n"));
-        }
-        text
+        crate::scheduler::preview::human(
+            self.online,
+            self.decision.as_ref(),
+            &self.components,
+            &self.assumptions,
+        )
     }
 }
 /// Mirror local-ci source identity lookup without capture or object-store creation.

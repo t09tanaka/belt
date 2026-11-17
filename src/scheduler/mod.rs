@@ -12,6 +12,7 @@
 
 pub mod decide;
 pub mod measured;
+pub mod preview;
 
 use crate::forecast::plan::MAX_PENDING_PLANS;
 use crate::ids::{AttemptId, NodeId, PlanDigest, TaskId, WorkerId};
