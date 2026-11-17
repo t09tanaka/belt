@@ -26,6 +26,7 @@ use tokio::task::JoinSet;
 mod delivery;
 mod input_retention;
 mod remote;
+mod result_retention;
 
 pub const MAX_REQUEST_BYTES: usize = 262_144;
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
@@ -761,43 +762,17 @@ impl Resident {
                 if let Err(e) = coordinator.collect_stopping(&files, collection, Some(collect_stop.clone())).await { let _ = stop_collect.send(true); return Err(e.into()); }
             }
         });
-        let gc_coordinator = self.coordinator.clone();
-        let gc_files = self.files.clone();
-        let retention_days = self.retention_days;
-        let mut gc_stop = rx.clone();
-        let gc_failure = stop.clone();
-        loops.spawn(async move {
-            let mut timer = tokio::time::interval(Duration::from_secs(60));
-            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut cursor = crate::results::retention::Cursor::default();
-            loop {
-                tokio::select! { _ = gc_stop.changed()=>return Ok(()), _=timer.tick()=>{} }
-                if *gc_stop.borrow() {
-                    return Ok(());
-                }
-                let owner = gc_coordinator.clone();
-                let files = gc_files.clone();
-                // Keep owner + exclusive pin alive inside the blocking job and
-                // await its drain before token/process-owner cleanup on shutdown.
-                let (next, result) =
-                    crate::results::retention::owned_blocking(owner, move |owner| {
-                        let result = crate::results::retention::page(
-                            owner.store(),
-                            &files,
-                            &mut cursor,
-                            retention_days,
-                        );
-                        (cursor, result)
-                    })
-                    .await?;
-                cursor = next;
-                if let Err(error) = result {
-                    let _ = gc_failure.send(true);
-                    return Err(error.into());
-                }
-                tokio::task::yield_now().await;
-            }
-        });
+        #[cfg(not(test))]
+        let gc_cadence = Duration::from_secs(60);
+        #[cfg(test)]
+        let gc_cadence = self.captured.retention_test.cadence();
+        loops.spawn(result_retention::run(
+            self.coordinator.clone(),
+            self.files.clone(),
+            self.retention_days,
+            gc_cadence,
+            rx.clone(),
+        ));
         loops.spawn(input_retention::run(
             self.coordinator.clone(),
             self.captured.clone(),
@@ -1553,10 +1528,15 @@ pub(crate) fn validate_components(path: &Path) -> io::Result<()> {
         }
         match std::fs::symlink_metadata(&current) {
             Ok(m) if m.file_type().is_symlink() => {
+                // Name the refused component and the way out: nothing here is
+                // resolved for the caller, so the real path has to be given.
                 return Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
-                    "symlinked resident path",
-                ))
+                    format!(
+                        "symlinked resident path: {} is a symbolic link; give the real path instead (for the state directory, set HOME or XDG_STATE_HOME to the real path)",
+                        current.display()
+                    ),
+                ));
             }
             Ok(_) => {}
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}

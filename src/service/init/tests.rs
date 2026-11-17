@@ -147,6 +147,142 @@ fn directories_are_never_created_through_a_symlinked_ancestor() {
     assert!(private_dir(&alias.join("nested/state")).is_err());
 }
 
+/// `real` and a link `alias` to it, both private directories of one root.
+fn aliased() -> (tempfile::TempDir, PathBuf, PathBuf) {
+    let t = crate::test_tmp::tempdir().unwrap();
+    let (real, alias) = (t.path().join("real"), t.path().join("alias"));
+    fs::create_dir(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    (t, real, alias)
+}
+fn env_of(pairs: &[(&str, &Path)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_str().unwrap().to_string()))
+        .collect()
+}
+fn refusal(env: &BTreeMap<String, String>) -> String {
+    match Paths::resolve(env) {
+        Ok(_) => panic!("accepted {env:?}"),
+        Err(error) => format!("{error:#}"),
+    }
+}
+
+#[test]
+fn a_symlinked_path_is_refused_by_name_with_the_way_out() {
+    let (_t, real, alias) = aliased();
+    // HOME itself is a link: LaunchAgents and the default state go through it.
+    let error = refusal(&env_of(&[("HOME", &alias)]));
+    assert!(
+        error.contains(&format!("{} is a symbolic link", alias.display())),
+        "{error}"
+    );
+    assert!(
+        error.contains("set HOME or XDG_STATE_HOME to the real path"),
+        "{error}"
+    );
+    // The link is named, not the path below it and not what it points at.
+    assert!(!error.contains("Library/LaunchAgents"), "{error}");
+    assert!(!error.contains(real.to_str().unwrap()), "{error}");
+    // A link further down is named as that component.
+    let home = real.join("home");
+    fs::create_dir_all(home.join("target")).unwrap();
+    std::os::unix::fs::symlink(home.join("target"), home.join(".local")).unwrap();
+    let error = refusal(&env_of(&[("HOME", &home)]));
+    assert!(
+        error.contains(&format!(
+            "{} is a symbolic link",
+            home.join(".local").display()
+        )),
+        "{error}"
+    );
+    assert_eq!(fs::read_dir(home.join("target")).unwrap().count(), 0);
+}
+
+#[test]
+fn home_is_checked_only_through_the_paths_made_from_it() {
+    let (_t, real, alias) = aliased();
+    let home = real.join("home");
+    fs::create_dir_all(&home).unwrap();
+    let elsewhere = real.join("elsewhere");
+    fs::create_dir_all(elsewhere.join("target")).unwrap();
+    // The default state and configuration directories of this HOME are links.
+    for name in [".local", ".config"] {
+        std::os::unix::fs::symlink(elsewhere.join("target"), home.join(name)).unwrap();
+    }
+    assert!(refusal(&env_of(&[("HOME", &home)])).contains("is a symbolic link"));
+    let (state, config) = (elsewhere.join("state"), elsewhere.join("config"));
+    // One of the two given as a real path is not enough: the other default is used.
+    assert!(
+        refusal(&env_of(&[("HOME", &home), ("XDG_STATE_HOME", &state)])).contains(&format!(
+            "{} is a symbolic link",
+            home.join(".config").display()
+        ))
+    );
+    assert!(
+        refusal(&env_of(&[("HOME", &home), ("XDG_CONFIG_HOME", &config)])).contains(&format!(
+            "{} is a symbolic link",
+            home.join(".local").display()
+        ))
+    );
+    // Both given as real paths: the unused defaults under HOME do not matter.
+    let paths = Paths::resolve(&env_of(&[
+        ("HOME", &home),
+        ("XDG_STATE_HOME", &state),
+        ("XDG_CONFIG_HOME", &config),
+    ]))
+    .unwrap();
+    assert_eq!(paths.state, state.join("rtr/coordinator"));
+    assert_eq!(paths.worker, state.join("rtr/local-worker"));
+    assert!(paths.config.starts_with(&config));
+    assert_eq!(paths.services, home.join("Library/LaunchAgents"));
+    // XDG_* paths are held to the same rule on their own components.
+    for (variable, through) in [
+        ("XDG_STATE_HOME", alias.join("elsewhere/state")),
+        ("XDG_CONFIG_HOME", alias.join("elsewhere/config")),
+    ] {
+        let mut env = env_of(&[
+            ("HOME", &home),
+            ("XDG_STATE_HOME", &state),
+            ("XDG_CONFIG_HOME", &config),
+        ]);
+        env.insert(variable.into(), through.to_str().unwrap().into());
+        assert!(
+            refusal(&env).contains(&format!("{} is a symbolic link", alias.display())),
+            "{variable}"
+        );
+    }
+    // LaunchAgents is always under HOME, so a HOME that is a link is refused
+    // whatever XDG_* say; the service directory is never reached through one.
+    let linked_home = alias.join("home");
+    let error = refusal(&env_of(&[
+        ("HOME", &linked_home),
+        ("XDG_STATE_HOME", &state),
+        ("XDG_CONFIG_HOME", &config),
+    ]));
+    assert!(
+        error.contains(&format!("{} is a symbolic link", alias.display())),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn initialize_through_a_symlinked_home_creates_nothing() {
+    let (t, real, alias) = aliased();
+    let executable = t.path().join("source");
+    fs::write(&executable, b"test executable").unwrap();
+    let mut env = env_of(&[("HOME", &alias)]);
+    env.insert("PATH".into(), "/usr/bin:/bin".into());
+    let error = initialize(ContextInput { env, executable }, &mut Unknown)
+        .await
+        .unwrap_err();
+    assert!(
+        format!("{error:#}").contains(&format!("{} is a symbolic link", alias.display())),
+        "{error:#}"
+    );
+    assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
+}
+
 #[tokio::test]
 async fn journal_recovers_before_and_after_no_replace_publication() {
     for already_published in [false, true] {

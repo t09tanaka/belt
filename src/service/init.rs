@@ -63,7 +63,7 @@ struct Paths {
 impl Paths {
     fn resolve(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
         let home = PathBuf::from(env.get("HOME").context("HOME is required")?);
-        resident::validate_components(&home)?;
+        // A relative XDG_CONFIG_HOME is refused here, not silently ignored.
         if let Some(x) = env.get("XDG_CONFIG_HOME") {
             resident::validate_components(Path::new(x))?;
         }
@@ -75,13 +75,19 @@ impl Paths {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/state"))
             .join("rtr");
-        resident::validate_components(&root)?;
+        let services = home.join("Library/LaunchAgents");
+        // Every path that is used is checked, before anything is created. HOME
+        // is judged only through the paths made from it: a state or
+        // configuration directory named by XDG_* stands on its own components.
+        for used in [&services, &config, &root] {
+            resident::validate_components(used)?;
+        }
         Ok(Self {
             state: root.join("coordinator"),
             worker: root.join("local-worker"),
             key: config.join("cluster.key"),
             input: config.join("coordinator.json"),
-            services: home.join("Library/LaunchAgents"),
+            services,
             journal: config.join("init.json"),
             config,
         })
