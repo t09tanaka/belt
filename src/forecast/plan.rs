@@ -242,6 +242,46 @@ pub fn accepted_nodes(
         .collect())
 }
 
+/// The node id of the `index`th toolchain install an accepted attempt waits
+/// for.
+pub fn install_node_name(index: usize) -> String {
+    format!("toolchain-install-{index}")
+}
+
+/// Whether the node is one of an attempt's toolchain installs.
+pub fn is_install_node(node: &NodeId) -> bool {
+    node.as_str()
+        .strip_prefix("toolchain-install-")
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// The installs an accepted attempt still waits for, as demand ahead. An
+/// install is a command the worker runs under the traffic controller before
+/// the attempt's own commands, so its load counts from acceptance on, not
+/// only once it registers. `missing` is how many of the attempt's tools are
+/// not yet installed (0 when none is, or none is needed). The id it would
+/// register under is not known here, so a running install is counted twice
+/// (once in the ledger, once as this demand): the answer is later, never
+/// earlier.
+pub fn install_nodes(
+    attempt: &AttemptId,
+    plan_digest: &PlanDigest,
+    missing: usize,
+) -> Result<Vec<AcceptedNode>, &'static str> {
+    (0..missing)
+        .map(|index| {
+            Ok(AcceptedNode {
+                attempt_id: attempt.clone(),
+                plan_digest: plan_digest.clone(),
+                node_id: NodeId::parse(&install_node_name(index))
+                    .map_err(|_| "an install has no node id")?,
+                command_id: format!("rtr-{attempt}-install-{index}"),
+                terminal: false,
+            })
+        })
+        .collect()
+}
+
 fn demand_of_accepted(a: &AcceptedNode, d: Defaults) -> ttc::FutureDemand {
     ttc::FutureDemand {
         attempt_id: a.attempt_id.to_string(),
@@ -894,6 +934,41 @@ mod tests {
         assert_eq!(nodes[0].plan_digest, payload.plan_digest);
         payload.commands[1].depends_on = vec![NodeId::parse("test").unwrap()];
         assert!(accepted_nodes(&a, &payload, 0).is_err());
+    }
+
+    #[test]
+    fn the_installs_an_attempt_waits_for_are_numbered_nodes_of_its_own() {
+        let a = AttemptId::generate();
+        let digest = Digest::of_bytes(b"plan");
+        assert_eq!(install_nodes(&a, &digest, 0), Ok(vec![]));
+        let nodes = install_nodes(&a, &digest, 2).unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(names, ["toolchain-install-0", "toolchain-install-1"]);
+        for (index, node) in nodes.iter().enumerate() {
+            assert_eq!(node.attempt_id, a);
+            assert_eq!(node.plan_digest, digest);
+            assert!(!node.terminal);
+            assert!(is_install_node(&node.node_id));
+            // Not the id of any command the attempt registers.
+            assert_ne!(
+                node.command_id,
+                crate::supervisor::spec::command_id(&a, index)
+            );
+        }
+        assert_eq!(nodes[0].command_id, format!("rtr-{a}-install-0"));
+        assert_ne!(nodes[0].command_id, nodes[1].command_id);
+    }
+
+    #[test]
+    fn only_the_numbered_install_nodes_are_install_nodes() {
+        let node = |s: &str| NodeId::parse(s).unwrap();
+        assert!(is_install_node(&node("toolchain-install-0")));
+        assert!(is_install_node(&node("toolchain-install-12")));
+        assert!(!is_install_node(&node("toolchain-install-")));
+        assert!(!is_install_node(&node("toolchain-install-x")));
+        assert!(!is_install_node(&node("toolchain-install-1x")));
+        assert!(!is_install_node(&node("step-0")));
+        assert!(!is_install_node(&node("my-toolchain-install-0")));
     }
 
     #[test]
