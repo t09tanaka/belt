@@ -154,7 +154,7 @@ async fn submit(
     );
     let wait = if delay == u32::MAX {
         let release = remote_task_runner::protocol::ssh::quote(
-            &root.join("release-local").display().to_string(),
+            &root.join(format!("release-{name}")).display().to_string(),
         );
         let fixture = remote_task_runner::protocol::ssh::quote(&root.display().to_string());
         format!("while [ -d {fixture} ] && [ ! -e {release} ]; do sleep 0.05; done")
@@ -169,7 +169,7 @@ async fn submit(
         manifest_digest: Digest::parse(manifest).or_else(|_| Digest::parse(&format!("sha256:{manifest}"))).unwrap(),
         commands: vec![CommandSpec { node_id: NodeId::parse("main").unwrap(),
             argv: vec!["/bin/sh".into(), "-c".into(), format!("test \"$(cat .env)\" = \"TOKEN=$(cat ordinary)-private\" && echo once >> {count} && {wait}")],
-            cwd: String::new(), env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            cwd: String::new(), env: BTreeMap::new(),
             depends_on: vec![], timeout_ms: None, setup_step: None }],
         command_timeout_ms: None, deadline_ms: None, resource_wait_timeout_ms: None,
         has_secret_bundle: true, artifacts: vec![],
@@ -384,7 +384,7 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
         attempt(&state, &first).is_some_and(|a| a.observation == Observation::Unknown)
     })
     .await;
-    std::fs::write(root.join("release-local"), "release fixture task").unwrap();
+    std::fs::write(root.join("release-blocker"), "release fixture task").unwrap();
     wait_for("local blocker collection", || {
         attempt(&state, &blocker).is_some_and(|a| a.receipts.collected_at_ms.is_some())
     })
@@ -500,6 +500,8 @@ HOME="$home" exec {} worker --stdio
             .arg(&key)
             .env("HOME", &home)
             .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env("PATH", "/bin:/usr/bin")
             .env("TOKIO_WORKER_THREADS", "2")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -538,7 +540,21 @@ HOME="$home" exec {} worker --stdio
     .is_err()
     {
         let attempts = store.attempts_of_task(&task).unwrap();
-        panic!("ephemeral command did not start; placements and states: {:?}; bridge dials: {:?}; parent log: {}",
+        let worker_events = remote_task_runner::storage::WorkerStore::open_read_only(
+            &home.join(".remote-task-runner"),
+        )
+        .and_then(|worker| worker.events_after(0, 200))
+        .map(|events| events.into_iter().map(|e| e.kind).collect::<Vec<_>>());
+        let refused: Vec<_> = attempts
+            .iter()
+            .flat_map(|attempt| {
+                store
+                    .events_of(&attempt.attempt_id, "submit_refused")
+                    .unwrap()
+            })
+            .map(|event| event.payload)
+            .collect();
+        panic!("ephemeral command did not start; placements and states: {:?}; worker events: {worker_events:?}; submit refusals: {refused:?}; bridge dials: {:?}; parent log: {}",
             attempts.iter().map(|a| (&a.worker_id, a.state, a.observation, &a.termination)).collect::<Vec<_>>(),
             std::fs::read_to_string(home.join("bridge-dials")).ok(),
             std::fs::read_to_string(state.join("fixture-parent.stderr")).unwrap_or_default());
@@ -552,7 +568,7 @@ HOME="$home" exec {} worker --stdio
         attempt(&state, &task).is_some_and(|a| a.observation == Observation::Unknown)
     })
     .await;
-    std::fs::write(root.join("release-local"), "").unwrap();
+    std::fs::write(root.join("release-blocker"), "").unwrap();
     wait_for("available local slot", || {
         attempt(&state, &blocker).is_some_and(|a| a.receipts.collected_at_ms.is_some())
     })
@@ -609,6 +625,7 @@ HOME="$home" exec {} worker --stdio
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
     ));
+    std::fs::write(root.join("release-ephemeral"), "").unwrap();
     owner.wait().await;
     agent.stop().await;
 }
