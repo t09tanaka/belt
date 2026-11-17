@@ -492,6 +492,119 @@ jobs:
     );
 }
 
+/// The steps of the one job of a `local-ci run --json`.
+fn job_steps(o: &Output) -> Vec<serde_json::Value> {
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&o.stdout)));
+    v["units"][0]["jobs"][0]["steps"]
+        .as_array()
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn waiting_for_the_traffic_controller_does_not_use_up_the_jobs_timeout() {
+    let d = demo("app/lib.sh");
+    // 6 seconds for the job; its steps run for about one
+    add_workflow(
+        &d,
+        "queue.yml",
+        r#"name: Queue
+on: pull_request
+jobs:
+  waiter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 0.1
+    steps:
+      - run: echo one
+      - run: sleep 1
+"#,
+    );
+    // a task-traffic-controller that lets every command start 7 seconds late:
+    // the first step alone waits longer than the job may run
+    let bin = d.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("task-traffic-controller");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nsleep 7\nexec \"$@\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let o = local_ci_path(
+        &d,
+        &path,
+        &[
+            "run",
+            "--no-status",
+            "--no-cache",
+            "--json",
+            "-w",
+            "queue.yml",
+        ],
+    );
+    let steps = job_steps(&o);
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    for s in &steps {
+        assert_eq!(s["result"], "pass", "{steps:?}");
+    }
+    let t = &job_times(&o)["waiter"];
+    assert!(t["wait_queue_secs"].as_f64().unwrap() > 12.0, "{t}");
+    assert!(t["work_secs"].as_f64().unwrap() < 6.0, "{t}");
+}
+
+#[test]
+fn the_running_of_the_steps_still_uses_up_the_jobs_timeout() {
+    let d = demo("app/lib.sh");
+    // 6 seconds for the job: the second step is stopped when they are over,
+    // and the third, which would run after a failure, is not started
+    add_workflow(
+        &d,
+        "over.yml",
+        r#"name: Over
+on: pull_request
+jobs:
+  slow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 0.1
+    steps:
+      - run: sleep 2
+      - run: sleep 30
+      - if: always()
+        run: echo cleanup
+"#,
+    );
+    let o = local_ci(
+        &d,
+        &[
+            "run",
+            "--no-status",
+            "--no-cache",
+            "--no-traffic-controller",
+            "--json",
+            "-w",
+            "over.yml",
+        ],
+    );
+    let steps = job_steps(&o);
+    assert_eq!(steps.len(), 3, "{steps:?}");
+    assert_eq!(steps[0]["result"], "pass", "{steps:?}");
+    let second = steps[1]["reason"].to_string();
+    assert!(
+        second.contains("timed out after ")
+            && second.contains("s (what was left of the job's 0.1 min)"),
+        "{steps:?}"
+    );
+    assert!(steps[1]["secs"].as_f64().unwrap() < 20.0, "{steps:?}");
+    let third = steps[2]["reason"].to_string();
+    assert!(
+        third.contains("not started: the job timed out (0.1 min)"),
+        "{steps:?}"
+    );
+}
+
 #[test]
 fn container_slot_and_repository_lock_waits_are_counted() {
     use fs2::FileExt;

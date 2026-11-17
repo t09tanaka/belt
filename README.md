@@ -78,7 +78,8 @@ Common options (`plan` and `run`):
 | `-C <dir>` | Repository directory. |
 
 `run` also takes `--parallel <n>`, `--containers <n>`, `--no-traffic-controller`, `--no-portool`, `--no-status`, `--keep`
-(keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>`, `--all-os-legs` (below) and `--json`.
+(keep the worktrees), `--tail <lines>`, `--job-timeout <minutes>` (for jobs without `timeout-minutes`; waiting for
+task-traffic-controller is not counted), `--all-os-legs` (below) and `--json`.
 
 `--parallel <n>` is the number of units that run at once. Without it, every
 unit (up to 16) starts when task-traffic-controller is installed, as each
@@ -506,7 +507,13 @@ into a prefix of the run, so neither changes your machine.
 
 - **[task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller)**: when it is installed,
   every `run:` step, setup included, is wrapped in `task-traffic-controller exec`, so heavy steps
-  wait for CPU instead of piling up. Timeouts start when the step gets its turn.
+  wait for CPU instead of piling up. Timeouts start when the step gets its turn,
+  and the wait does not count against the job's `timeout-minutes` (or
+  `--job-timeout`) either: a job is over its time when its setup and the
+  running of its steps add up to more than that. A step that is stopped at the
+  job's limit, not its own, says so (`timed out after 40s (what was left of the
+  job's 15 min)`), and a step that would run after the job's time is used up
+  (an `if: always()` step) is not started (`not started: the job timed out (15 min)`).
   The steps of jobs that run at once ask for the job's
   [CPU share](#the-cpu-share-of-a-job) as their weight. Running `local-ci`
   itself under it needs task-traffic-controller 0.9 or later, where a nested
