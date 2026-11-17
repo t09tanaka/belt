@@ -144,10 +144,11 @@ fn accepted_of(
         let nodes = plan::accepted_nodes(&rec.attempt_id, &payload, steps)
             .map_err(|e| internal(&format!("attempt {}", rec.attempt_id), e))?;
         out.extend(nodes);
-        let waiting =
-            plan::install_nodes(&rec.attempt_id, &payload.plan_digest, installs(&payload))
-                .map_err(|e| internal(&format!("attempt {}", rec.attempt_id), e))?;
-        out.extend(waiting);
+        out.extend(plan::install_nodes(
+            &rec.attempt_id,
+            &payload.plan_digest,
+            installs(&payload),
+        ));
     }
     Ok(out)
 }
