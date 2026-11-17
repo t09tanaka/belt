@@ -260,8 +260,16 @@ mod bounded_tests {
     use serde_json::json;
     #[test]
     fn bounds_intermediate_products_before_exclusion_and_include_growth() {
-        let axis = json!((0..1000).collect::<Vec<_>>());
+        // 17 * 17 * 17 is just over the limit: a mutant that drops the check
+        // builds 4913 combinations, not enough to exhaust a CI runner
+        let axis = json!((0..17).collect::<Vec<_>>());
         assert!(expand_bounded(&json!({"a": axis, "b": axis, "c": axis}), 4096).is_err());
+        assert_eq!(
+            expand_bounded(&json!({"a": axis, "b": axis, "c": axis}), 4913)
+                .unwrap()
+                .len(),
+            4913
+        );
         assert!(
             expand_bounded(&json!({"a": [1,2], "b": [1,2], "exclude": [{"a": 1}]}), 3).is_err()
         );
