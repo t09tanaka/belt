@@ -268,24 +268,24 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A36 | 自動＋残り | `doctor::an_updated_task_traffic_controller_passes_the_runtime_check`（旧い形の `status --json` を読む） | 旧コマンドと主要 workflow の互換は local-ci・task-traffic-controller 側の CI が担う（L1a〜L3・T1） |
 | A37 | S26 | | 実際のプロジェクトの CI を親のみと複数 worker で比べる |
 | A38 | 一部 | worker の側だけ: `a_job_that_needs_another_runs_in_another_attempt_from_the_first_ones_result`（`src/supervisor/ci_task/run_tests.rs`） | 親が先行 Job の output・artifact を確定してから別 host で後続を始める経路（S16 が未了） |
-| A39〜A41 | 未実装 | | S18（RTR の配置と集約）。adapter の分割・合算は local-ci 側の試験（L2・L3） |
+| A39〜A41 | 統合検証待ち | `collection::a39_discovery_collection_expands_the_run_once_before_any_test_is_placed`、`a40_history_shortens_the_longest_shard_and_no_history_is_a_stable_split_that_runs`、`a41_a_run_fails_of_the_failed_shard_and_a_retry_runs_a_shard_whose_tests_failed_again` | 実行結果と runner ごとの集約条件の照合 |
 | A42 | 一部 | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts` | 導入中の負荷は `worker_agent::a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for` の統合検証待ち。実 manager と network での導入は S26 |
 | A43 | 自動 | `secrets::a43_the_secret_files_reach_the_worker_as_0600_and_are_gone_after_the_attempt` | |
 | A44 | 自動＋残り | 偽の ssh と偽の tool: `diff_classifies_the_five_ways_a_worker_can_differ`・`sync_blocks_what_needs_a_person_with_the_steps`（`tests/it/workers_lifecycle.rs` の `a44`）、`bootstrap::workers_sync_installs_through_the_resident_then_measures_again_and_needs_the_resident` | 実際の worker との差（S26） |
 | A45 | 一部 | OS 依存部分は CI の ubuntu と macOS の両方で同じ試験が走る（`src/platform` の単体試験、`tests/it/supervisor.rs`） | 実 systemd での導入・起動・停止（偽の runner での試験は S24 で済み）、system-user mode の配線（S24 の残り）、x86_64 と arm64 の実 worker（S26 の Docker） |
-| A46 | 一部 | worker の側: `tests/it/worker_ephemeral.rs`（起動ごとの identity）。親の側: `coordinator::forget::tests::an_unreachable_ephemeral_worker_keeps_its_attempt_unknown_until_it_is_forgotten`・`a_new_start_retires_the_identity_before_it_and_is_sent_none_of_its_attempts`、`service::resident::remote::tests::an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_resident` | トンネル越しの実 SSH で一時 worker に配置し、切断して forget するまでの通し（S26） |
+| A46 | 統合検証待ち | `remote_links::a46_a_tunnel_disconnect_keeps_the_ephemeral_attempt_until_explicit_forget`（切断後に実行状態を保持し、明示的な forget で retire する） | 1 台上のトンネル試験の再検証。実 SSH 環境は S26 |
 | A47 | 自動 | `secrets::worktreeinclude_picks_only_ignored_untracked_files_and_the_store_never_holds_them`、`worker_agent::the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_any_name` | |
 | A48 | 一部 | `workspace::add_and_remove_a_commit_workspace`、`workspace::the_original_is_never_written`（CI は `RTR_REQUIRE_FAST_WORKTREE` で fast-worktree を必須にする） | `workspace::removing_an_attempt_releases_only_its_portool_allocation` の統合検証待ち（同じ worker にある別 attempt の割当も確認） |
 | A49 | 自動 | `scheduler::a_preferred_worker_is_taken_while_the_others_are_not_faster_by_the_correction`、`collection_is_added_to_the_forecast_and_the_priority_correction_to_that`（`src/scheduler/decide.rs`）、設定から scheduler まで: `runtime::runtime_attach_applies_only_verified_identity_priorities` | |
 
-件数（A39〜A41 は 3 件と数える）: 自動 29、自動＋残り 7、一部 6、未実装 6、S26 のみ 1。
+2026-11-17 の調査時点では、自動 29、自動＋残り 7、一部 6、未実装 6、S26 のみ 1 件だった。上表の「統合検証待ち」は、その後に試験が統合された項目を示す。
 
-S25 の完了条件「実機不要の A がすべて自動で緑」は、まだ満たしていない。区分が「一部」と「未実装」の 12 件（A10・A27・A32・A35・A38・A39〜A41・A42・A45・A46・A48）は、S16・S18・S19・S20・S24 の実装か、試験の追加が先に要る。これらの行が入ったら、この表を更新し、複数 worker が関わるものは `one_host` に試験を足す。
+S25 の完了条件は「実機不要の A がすべて自動で緑」。A10・A27・A32・A35・A38〜A42・A45・A46・A48 は、統合したコミットで各受入条件を確認し、結果を上表に記録する。
 
 この変更の残件:
 
-1. `tests/it/coordinator.rs` の `LoseRetireAnswer`（retire の応答を 1 回失う link）は `one_host` の `Faults` と同じ役目だが、そのままにした。そのファイルは S16 の変更（PR #70）が編集中で、競合を避けた。S16 の統合後に `Faults` へ寄せる。
-2. A48 の portool の割当の解放は、試験が無いことを見つけただけで、足していない（S7 の範囲）。
+1. retire の応答消失には、coordinator の試験でも `one_host` の `Faults` を使う。
+2. A48 は同じ worker の 2 つの attempt に portool の資源を割り当て、片方の終了後にもう片方の割当が残ることを検証する。
 3. 単調時計を試験から進める口は無い（上の「時計について」）。lease の失効を agent・supervisor の実 process で確かめる試験は、実時間の短い lease を使う既存の試験のままである。
 4. kill の注入は、worker が launch と process identity を記録した後に限った（`OneHost::launched` で待つ）。spawn の直後で identity を記録する前に supervisor を kill すると、worker は仕様どおり起動不明として未解決のまま保持し、その command は同じ user のほかの attempt の回復からも「隠れた process」に見えて、同じ試験 process のほかの試験の回復を止める（最初の版で 6 回中 1 回起きた）。記録前の kill は `tests/it/supervisor.rs` の `a_launch_without_an_identity_is_investigated_not_respawned` が担い、ここでは注入していない。記録前の地点で確実に止める口は本体に試験用の経路が要るため、足していない。
 
