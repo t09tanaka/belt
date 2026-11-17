@@ -19,9 +19,10 @@ the minor version).
   forecast or an estimate on every request used to pay the 300 ms each time.
   A command that asks once (`status`, `inspect`) measures as before. Within
   one `exec` or `wait`, the polls after the first now measure over the time
-  since the previous poll (up to 5 s) instead of over a fresh 300 ms, and the
-  "contended" sample right before a start may reuse the admission sample
-  taken a moment earlier. Callers that arrive while another thread of the
+  since the previous poll (they are 500 ms apart) instead of over a fresh
+  300 ms, and the "contended" sample right before a start may reuse the
+  admission sample taken a moment earlier. `top` likewise shows the usage
+  since its previous refresh when that was at most 5 s ago. Callers that arrive while another thread of the
   same process is in the 300 ms wait block until it ends and share its
   figure. Memory and the load average are still read on every call.
 

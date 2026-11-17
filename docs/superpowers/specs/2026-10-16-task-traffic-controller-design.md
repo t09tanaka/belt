@@ -211,7 +211,8 @@ machine looks able to take it *now*:
   it runs far above the number of cores even with a third of the CPU
   idle, so a per-core threshold would hold the queue almost always.
 
-Both are read from the OS on every poll (the `sysinfo` crate; on macOS
+Both come from the OS (the `sysinfo` crate; memory on every poll, CPU as
+described above; on macOS
 "available" = free + inactive pages). They are brakes, not the budget:
 the budget decides how much task-traffic-controller *plans* to run, the guards delay the
 next start when something outside task-traffic-controller (an IDE, a browser, a Docker

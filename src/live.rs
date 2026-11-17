@@ -102,14 +102,26 @@ impl<P: CpuProbe> CpuState<P> {
 static CPU: Mutex<Option<CpuState<SysinfoCpu>>> = Mutex::new(None);
 
 fn cpu_busy() -> f64 {
+    shared_busy(
+        &CPU,
+        || CpuState::new(SysinfoCpu::new(), sysinfo::MINIMUM_CPU_UPDATE_INTERVAL),
+        Instant::now,
+        std::thread::sleep,
+    )
+}
+
+/// [`CpuState::busy`] on the state behind `shared`, made by `init` on the
+/// first call. The lock is held for the whole call, the wait included.
+fn shared_busy<P: CpuProbe>(
+    shared: &Mutex<Option<CpuState<P>>>,
+    init: impl FnOnce() -> CpuState<P>,
+    now: impl Fn() -> Instant,
+    sleep: impl FnOnce(Duration),
+) -> f64 {
     // A panic while sampling leaves nothing half-written that matters: the
     // next call measures again from whatever the counters hold.
-    let mut guard = CPU.lock().unwrap_or_else(|e| e.into_inner());
-    guard
-        .get_or_insert_with(|| {
-            CpuState::new(SysinfoCpu::new(), sysinfo::MINIMUM_CPU_UPDATE_INTERVAL)
-        })
-        .busy(Instant::now, std::thread::sleep)
+    let mut guard = shared.lock().unwrap_or_else(|e| e.into_inner());
+    guard.get_or_insert_with(init).busy(now, sleep)
 }
 
 /// The machine right now. Memory and load average are read on every call.
@@ -344,16 +356,71 @@ mod cpu_tests {
     }
 
     #[test]
-    fn the_process_wide_state_survives_concurrent_callers() {
-        // Real counters, real clock: the callers that find the lock held
-        // wait for the one measurement and reuse it.
-        let started = Instant::now();
+    fn concurrent_callers_share_one_measurement() {
+        use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+        // The clock stands still, so every caller after the one that
+        // measures finds a sample taken "just now" and reuses it. A probe
+        // asked for a third figure would panic.
+        let shared: Mutex<Option<CpuState<Scripted>>> = Mutex::new(None);
+        let start = Instant::now();
+        let slept_ms = AtomicU64::new(0);
+        let sleeps = AtomicUsize::new(0);
+        let inits = AtomicUsize::new(0);
         let figures: Vec<f64> = std::thread::scope(|scope| {
-            let handles: Vec<_> = (0..8).map(|_| scope.spawn(cpu_busy)).collect();
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        shared_busy(
+                            &shared,
+                            || {
+                                inits.fetch_add(1, Ordering::SeqCst);
+                                state(&[0.0, 0.4])
+                            },
+                            || start,
+                            |d| {
+                                sleeps.fetch_add(1, Ordering::SeqCst);
+                                slept_ms.fetch_add(d.as_millis() as u64, Ordering::SeqCst);
+                            },
+                        )
+                    })
+                })
+                .collect();
             handles.into_iter().map(|h| h.join().unwrap()).collect()
         });
-        assert!(figures.iter().all(|f| (0.0..=1.0).contains(f)));
-        // Eight waits in a row would take 2.4 s.
-        assert!(started.elapsed() < CPU_SAMPLE_INTERVAL * 6);
+        assert_eq!(figures, vec![0.4; 8]);
+        assert_eq!(inits.load(Ordering::SeqCst), 1);
+        assert_eq!(sleeps.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            slept_ms.load(Ordering::SeqCst),
+            CPU_SAMPLE_INTERVAL.as_millis() as u64
+        );
+        let guard = shared.lock().unwrap();
+        assert_eq!(guard.as_ref().unwrap().probe.calls, 2);
+    }
+
+    #[test]
+    fn a_caller_that_panicked_under_the_lock_does_not_stop_the_next() {
+        let shared: Mutex<Option<CpuState<Scripted>>> = Mutex::new(None);
+        let start = Instant::now();
+        let panicked = std::thread::scope(|scope| {
+            scope
+                .spawn(|| shared_busy(&shared, || state(&[]), || start, |_| {}))
+                .join()
+                .is_err()
+        });
+        assert!(panicked);
+        assert!(shared.is_poisoned());
+        // The state made by the first caller is still there (no sample yet),
+        // so this one measures from scratch on a refilled probe.
+        shared
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+            .unwrap()
+            .probe
+            .figures = vec![0.0, 0.3];
+        let busy = shared_busy(&shared, || unreachable!(), || start, |_| {});
+        assert_eq!(busy, 0.3);
     }
 }

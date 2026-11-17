@@ -847,6 +847,8 @@ State is `$XDG_STATE_HOME/task-traffic-controller` (else
 `$HOME/.config/...`). An empty XDG value counts as unset, a relative one is
 used as given, and without `HOME` the root is `/`.
 
+### Reading the machine from a long-lived process
+
 The machine snapshot behind the live guards (`live::snapshot()`, which
 `forecast` and admission read through `SystemLive`) waits 300 ms between two
 CPU samples only when the process has no CPU sample from the last 5 seconds.
