@@ -145,17 +145,40 @@ fn receipt(plan: &policy::Plan) -> anyhow::Result<Receipt> {
 /// Only an administrator-installed copy of the CLI should be used for this
 /// operation. It renders the unit from explicit inputs and the OS account
 /// database. It never reads a service definition from the worker account.
-pub(crate) fn register(username: &str, config: &Path) -> anyhow::Result<PathBuf> {
+fn register(username: &str, config: &Path) -> anyhow::Result<PathBuf> {
     ensure!(euid() == 0, "system registration requires an administrator running a trusted copy of remote-task-runner");
     let account = macos::NativeAccounts
         .lookup(username)
         .map_err(anyhow::Error::msg)?
         .context("unknown execution account")?;
     let backend = HostLauncher::native().backend();
+    let (_, home) = passwd(account.uid)?;
+    ensure!(
+        config.starts_with(home)
+            && config
+                .file_name()
+                .is_some_and(|name| name == crate::config::paths::USER_DIR),
+        "give the worker configuration directory under the execution account's home"
+    );
     let plan = plan_for(backend, config, username, account.uid)?;
     let root = directory(backend);
     verify_directory(root, 0)?;
     publish_definition(root, &plan, 0)
+}
+
+pub(crate) fn command(username: &str, config: &Path, json: bool) -> i32 {
+    let result = register(username, config).map_err(|e| {
+        crate::error::ApiError::new(crate::error::ErrorCode::Conflict, format!("{e:#}"))
+    });
+    let path = result
+        .as_ref()
+        .map(|path| path.display().to_string())
+        .unwrap_or_default();
+    super::super::workers::emit(
+        json,
+        result.map(|path| serde_json::json!({"path": path})),
+        || path,
+    )
 }
 
 pub(super) fn publish_definition(
@@ -297,6 +320,39 @@ mod tests {
             Environment::new(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn a_system_definition_preserves_a_literal_specifier_and_refuses_an_injected_line() {
+        let dir = Path::new("/home/build/100%/remote-task-runner");
+        for backend in [policy::Backend::Launchd, policy::Backend::Systemd] {
+            let plan = fixture_plan(backend, dir);
+            let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(plan.arguments()).unwrap();
+            let crate::cli::Command::Worker(args) = cli.command else {
+                panic!("expected worker service command")
+            };
+            assert!(args.system_service);
+            assert_eq!(args.input, Some(dir.join("worker.json")));
+            let represented = match backend {
+                policy::Backend::Launchd => "100%",
+                policy::Backend::Systemd => "100%%",
+            };
+            assert!(plan
+                .plist()
+                .contains(&format!("/{represented}/remote-task-runner/worker.json")));
+            let injected = Path::new("/home/build/injected\nUser=root/remote-task-runner");
+            assert!(service_plan(
+                backend,
+                injected,
+                policy::Mode::SystemUser {
+                    uid: 501,
+                    username: "build".into()
+                },
+                injected.join("bin/current").join(BINARY),
+                Environment::new()
+            )
+            .is_err());
+        }
     }
 
     #[test]

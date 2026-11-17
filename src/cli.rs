@@ -418,16 +418,7 @@ pub fn run(cli: Cli) -> i32 {
         config_dir,
     } = &cli.command
     {
-        return match crate::service::worker_service::system_user::register(account, config_dir) {
-            Ok(path) => {
-                println!("{}", path.display());
-                0
-            }
-            Err(error) => {
-                eprintln!("{error:#}");
-                1
-            }
-        };
+        return crate::service::worker_service::system_user::command(account, config_dir, cli.json);
     }
     if let Command::Worker(args) = &cli.command {
         if let Some(input) = &args.input {

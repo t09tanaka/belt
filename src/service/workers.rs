@@ -1569,7 +1569,7 @@ fn resident_answer(answer: anyhow::Result<super::resident::Reply>) -> ResidentBu
     }
 }
 
-fn emit(
+pub(super) fn emit(
     json: bool,
     result: Result<serde_json::Value, ApiError>,
     text: impl FnOnce() -> String,

@@ -206,6 +206,7 @@ pub fn systemctl_env(
 /// One reading of `systemctl show`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Show {
+    system: bool,
     load: String,
     active: String,
     fragment: String,
@@ -254,6 +255,7 @@ pub fn parse_show_for(bytes: &[u8], username: Option<&str>) -> Result<Show, &'st
         }
     }
     Ok(Show {
+        system: username.is_some(),
         load: load.to_owned(),
         active: get("ActiveState")?.to_owned(),
         fragment: get("FragmentPath")?.to_owned(),
@@ -270,6 +272,12 @@ impl Show {
     /// A stopped unit, or one systemd has not read yet, is `Absent`. A running
     /// one is `Match` only from this exact file and without a pending reload.
     pub fn classify(&self, file: &Path) -> LoadedState {
+        if self.system
+            && self.load == "loaded"
+            && (Path::new(&self.fragment) != file || self.need_reload)
+        {
+            return LoadedState::Unknown;
+        }
         match (self.load.as_str(), self.active.as_str()) {
             ("not-found", "inactive") => LoadedState::Absent,
             ("loaded", "inactive" | "failed") => LoadedState::Absent,

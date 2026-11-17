@@ -355,6 +355,20 @@ fn a_system_worker_requires_the_effective_account_and_persistent_activation() {
     ] {
         assert!(read(&foreign).is_err(), "{foreign}");
     }
+    let inactive = reply.replace("ActiveState=active", "ActiveState=inactive");
+    assert_eq!(
+        read(&inactive).unwrap().classify(Path::new(FILE)),
+        LoadedState::Absent
+    );
+    for stale in [
+        inactive.replace(FILE, "/run/other"),
+        inactive.replace("NeedDaemonReload=no", "NeedDaemonReload=yes"),
+    ] {
+        assert_eq!(
+            read(&stale).unwrap().classify(Path::new(FILE)),
+            LoadedState::Unknown
+        );
+    }
     let args = show_arguments("--system", "a.service");
     assert_eq!(
         args.last().unwrap(),
