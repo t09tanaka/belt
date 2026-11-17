@@ -901,6 +901,7 @@ mod tests {
         let a = AttemptId::generate();
         let mut payload = payload_of(vec![]);
         payload.ci_task = Some(crate::wire::CiTask {
+            dispatch: None,
             plan_digest: Digest::of_bytes(b"plan"),
             task_id: "t".into(),
             inputs: serde_json::json!({}),

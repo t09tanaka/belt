@@ -192,6 +192,9 @@ pub fn unsupported(plan: &FrozenPlan) -> Option<String> {
         if let Some(task) = plan.tasks.iter().find(|t| !t.services.is_empty()) {
             return Some(format!("task `{}` has service containers", task.id));
         }
+        if plan.tasks.iter().any(|t| t.dynamic_matrix) {
+            return plan.verify().err().map(|e| e.to_string());
+        }
         return matrix::driver(plan).err().map(|e| e.to_string());
     }
     super::progress::unsupported(plan)
@@ -305,7 +308,9 @@ fn advance_run(
     let plan: FrozenPlan = serde_json::from_slice(&read_plan(state_dir, &digest)?)
         .map_err(|e| unrunnable(format!("the frozen plan {digest}: {e}")))?;
     if matrix::applies(&plan) {
-        return matrix::advance(store, results, run, &plan, &members, now_ms, pass);
+        return matrix::advance(
+            store, state_dir, results, run, &plan, &members, now_ms, pass,
+        );
     }
     let mut progress = replay(store, results, &plan, |task| {
         members.get(task).map(|member| &member.row)

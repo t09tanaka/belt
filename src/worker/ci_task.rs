@@ -448,6 +448,17 @@ pub fn check_task(plan: &FrozenPlan, task_id: &str) -> Result<(), &'static str> 
     Ok(())
 }
 
+fn origin_task(task: &CiTask) -> Result<String, ApiError> {
+    task.dispatch
+        .as_ref()
+        .map(|value| {
+            crate::ci::execute::decode_dispatch(value, &task.task_id)
+                .map(|dispatch| dispatch.origin().to_string())
+                .map_err(invalid)
+        })
+        .unwrap_or_else(|| Ok(task.task_id.clone()))
+}
+
 /// What is checked of a CI task when its attempt is accepted, beyond the
 /// payload: the task in the plan, when the plan is here already. A plan
 /// that has not been delivered is no reason to refuse here (the attempt
@@ -457,7 +468,7 @@ pub fn check_accepted(state_dir: &Path, payload: &AttemptPayload) -> Result<(), 
         return Ok(());
     };
     match delivered_plan(state_dir, &task.plan_digest) {
-        Ok(plan) => check_task(&plan, &task.task_id).map_err(invalid),
+        Ok(plan) => check_task(&plan, &origin_task(task)?).map_err(invalid),
         Err(e) if e.code == ErrorCode::NotFound => Ok(()),
         Err(e) => Err(e),
     }
@@ -469,7 +480,7 @@ pub fn check_accepted(state_dir: &Path, payload: &AttemptPayload) -> Result<(), 
 pub fn planned_steps(state_dir: &Path, task: &CiTask) -> usize {
     delivered_plan(state_dir, &task.plan_digest)
         .ok()
-        .and_then(|plan| local_ci::plan_task_demand(&plan, &task.task_id).ok())
+        .and_then(|plan| local_ci::plan_task_demand(&plan, &origin_task(task).ok()?).ok())
         .map_or(0, |demand| demand.nodes.len())
 }
 
@@ -489,7 +500,7 @@ pub fn prepare(
     }
     let plan_path = plan_path(state_dir, &task.plan_digest);
     let plan = delivered_plan(state_dir, &task.plan_digest)?;
-    check_task(&plan, &task.task_id).map_err(invalid)?;
+    check_task(&plan, &origin_task(task)?).map_err(invalid)?;
     let inputs = serde_json::to_vec(&task.inputs)
         .ok()
         .filter(|json| json.len() <= MAX_INPUT_BYTES)
@@ -499,6 +510,7 @@ pub fn prepare(
     let ci_source_id = ci_id_of(&payload.source_id)
         .ok_or_else(|| invalid("the source of the attempt has no captured id"))?;
     Ok(CiTaskSpec {
+        dispatch: task.dispatch.clone(),
         plan_path,
         plan_digest: task.plan_digest.clone(),
         task_id: task.task_id.clone(),
@@ -654,6 +666,7 @@ mod tests {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
             ci_task: Some(CiTask {
+                dispatch: None,
                 plan_digest: digest.clone(),
                 task_id: task_of(&f.plan, job).to_string(),
                 inputs: serde_json::to_value(TaskInputs::default()).unwrap(),

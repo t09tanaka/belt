@@ -229,6 +229,21 @@ pub fn may_send(facts: Facts) -> bool {
 
 /// What a worker that cannot be given a CI task lacks, as a placement
 /// records it for the worker it left out.
+pub fn unmet_ci(spec: &super::TaskSpec, link: &dyn super::WorkerLink) -> Option<&'static str> {
+    if lacks_ci_task(spec, link.ci_task_negotiated()) {
+        return Some(CI_TASK_UNMET);
+    }
+    if spec
+        .ci
+        .as_ref()
+        .is_some_and(|ci| ci.task.dispatch.is_some())
+        && !link.matrix_dispatch_negotiated()
+    {
+        return Some("protocol feature ci_matrix_dispatch_v1");
+    }
+    None
+}
+
 pub const CI_TASK_UNMET: &str = "protocol feature ci_task_v1";
 
 /// Is a worker left out of the placement of `spec` because the task is a CI
@@ -302,8 +317,11 @@ mod tests {
         let digest = crate::ids::Digest::of_bytes(b"plan");
         crate::coordinator::TaskSpec {
             ci: ci.then(|| crate::coordinator::CiSpec {
+                dynamic_origin: false,
+                core_outcome: None,
                 matrix: None,
                 task: crate::wire::CiTask {
+                    dispatch: None,
                     plan_digest: digest.clone(),
                     task_id: "ci.yml/build".into(),
                     inputs: serde_json::json!({"needs": {}}),

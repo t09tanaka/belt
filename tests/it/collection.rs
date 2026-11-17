@@ -451,6 +451,9 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
 }
 
 impl WorkerLink for Worker {
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.ci_task_negotiated()
+    }
     fn ci_task_negotiated(&self) -> bool {
         !self.state.lock().unwrap().no_ci
     }
@@ -2818,6 +2821,11 @@ use remote_task_runner::supervisor::ci_task::RESULT_ARTIFACT;
 /// The frozen plan of a workflow, made from a capture of its own (in a
 /// directory of its own: the parent of these tests holds no source).
 fn ci_plan(workflow: &str) -> local_ci::FrozenPlan {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    ci_plan_at(workflow, dir.path(), &RunId::generate())
+}
+
+fn ci_plan_at(workflow: &str, state_dir: &std::path::Path, run: &RunId) -> local_ci::FrozenPlan {
     use local_ci::frozen::Filters;
     use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
     let dir = crate::test_tmp::tempdir().unwrap();
@@ -2835,11 +2843,11 @@ fn ci_plan(workflow: &str) -> local_ci::FrozenPlan {
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
-    let store = SourceStore::open(&dir.path().join("state")).unwrap();
+    let store = SourceStore::open(state_dir).unwrap();
     let captured = capture_for_run(
         &env,
         &store,
-        &RunId::generate(),
+        run,
         &SourceRequest::Directory { dir: project },
         &CaptureParams::default(),
     )
@@ -3439,13 +3447,22 @@ async fn ci_run_by_task(
     c: &Coordinator,
     plan: &local_ci::FrozenPlan,
 ) -> (RunId, BTreeMap<String, TaskId>) {
+    ci_run_by_id(fx, c, plan, RunId::generate()).await
+}
+
+async fn ci_run_by_id(
+    fx: &Fx,
+    c: &Coordinator,
+    plan: &local_ci::FrozenPlan,
+    run: RunId,
+) -> (RunId, BTreeMap<String, TaskId>) {
     let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
     let none = Default::default();
     let specs =
         remote_task_runner::service::ci_run::task_specs(plan, &digest, &manifest, &none, None)
             .unwrap();
-    let (run, source) = (RunId::generate(), SourceId::generate());
+    let source = SourceId::generate();
     c.store().put_source_ref(&source, &manifest, 1).unwrap();
     let mut ids = BTreeMap::new();
     let mut tasks = Vec::new();
@@ -4903,4 +4920,71 @@ jobs:
         );
         assert!(ci_advance(&fx, &c).released.is_empty());
     }
+}
+
+#[tokio::test]
+async fn a27_dynamic_members_are_persisted_once_and_join_after_verified_receipts() {
+    let workflow = r#"on: push
+jobs:
+  leg:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix: ${{ fromJSON('{"include":[{"n":0},{"n":1}]}') }}
+    steps:
+      - run: echo ${{ matrix.n }}
+"#;
+    let fx = fx();
+    let (c, files) = fx.open();
+    let run = RunId::generate();
+    let plan = ci_plan_at(workflow, fx.dir.path(), &run);
+    assert!(plan.tasks.iter().any(|t| t.dynamic_matrix));
+    let (_, ids) = ci_run_by_id(&fx, &c, &plan, run.clone()).await;
+    let origin = ci_task_of(&plan, "leg");
+    let pass = ci_advance(&fx, &c);
+    assert!(pass.failed.is_empty() && pass.faults.is_empty(), "{pass:?}");
+    assert_eq!(c.store().ci_run_tasks(&run).unwrap().len(), 3);
+    for index in 0..2 {
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.released.len(), 1, "{pass:?}");
+        let report = c.tick().await.unwrap();
+        assert_eq!(report.placed.len(), 1, "{report:?}");
+        let attempt = &report.placed[0];
+        let sent = fx.w.payload(attempt);
+        let ci = sent.ci_task.as_ref().unwrap();
+        let dispatch = ci.dispatch.as_ref().unwrap();
+        assert_eq!(dispatch["origin"], origin);
+        assert_eq!(dispatch["task"], ci.task_id);
+        assert_eq!(dispatch["index"], index);
+        assert!(sent.permit_id.is_some());
+        let receipt=serde_json::to_vec(&json!({"schema_version":1,"task":ci.task_id,"jobs":[{
+            "workflow":plan.tasks[0].workflow,"job":"leg","display":"leg","result":"pass","secs":0,"steps":[]
+        }],"outcomes":[{"job":"leg","variant":index,"status":"success","outputs":{},"skipped":null,"ancestor_failed":false}],
+        "receipt_ignored":null,"artifacts":[]})).unwrap();
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        end(
+            &fx,
+            &c,
+            attempt,
+            Outcome::Succeeded,
+            ci_out(attempt, &sent, &receipt),
+        )
+        .await;
+        ci_collect(&c, &files, attempt).await;
+    }
+    let pass = ci_advance(&fx, &c);
+    assert!(pass.joined.contains(&origin), "{pass:?}");
+    assert_eq!(c.store().ci_run_tasks(&run).unwrap().len(), 3);
+    assert!(c
+        .store()
+        .attempts_of_task(&ids[&origin])
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        c.store()
+            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .unwrap()
+            .exit_code(),
+        Some(0)
+    );
 }

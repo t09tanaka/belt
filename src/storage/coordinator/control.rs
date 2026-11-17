@@ -54,7 +54,7 @@ impl CoordinatorStore {
                 let mut query = tx.prepare(
                     "SELECT t.task_id FROM task t WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2)
                      AND t.cancel_requested_at_ms IS NULL
-                     AND json_type(t.spec_json,'$.ci')='object'
+                     AND json_type(t.spec_json,'$.ci')='object' AND json_extract(t.spec_json,'$.ci.core_outcome') IS NULL
                      AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))
                      ORDER BY t.created_at_ms,t.rowid",
                 )?;
@@ -248,7 +248,7 @@ fn completion_on(
     } else {
         ("", "NULL")
     };
-    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL,{cancel_at} FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
+    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL,{cancel_at},json_extract(t.spec_json,'$.ci.core_outcome') FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
     let mut stmt = c.prepare(&sql)?;
     // The first shard of a split job that is a failure (see below).
     let mut job_failed = None;
@@ -271,6 +271,24 @@ fn completion_on(
     let mut rows = stmt.query(params![run, task])?;
     while let Some(row) = rows.next()? {
         let task = id("task_id", TaskId::parse(&row.get::<_, String>(0)?))?;
+        if let Some(status) = row.get::<_, Option<String>>(11)? {
+            snapshot.task_count += 1;
+            snapshot.computed_tasks += 1;
+            if status == "failure" {
+                snapshot.job_failure(task, None);
+            } else if status == "cancelled" {
+                snapshot.cancel_requested = true;
+                snapshot
+                    .first_compute_failure
+                    .get_or_insert(crate::service::completion::Failure {
+                        task_id: task,
+                        code: crate::error::ErrorCode::CommandFailed,
+                        exit_code: crate::error::exit::CANCELLED,
+                        termination: None,
+                    });
+            }
+            continue;
+        }
         snapshot.in_place |= row.get::<_, bool>(6)?;
         let cancel: bool = row.get(1)?;
         let state: Option<String> = row.get(2)?;

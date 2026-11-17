@@ -138,7 +138,10 @@ pub fn task_specs(
             "the plan has no task: no workflow has a job to run",
         ));
     }
-    let distributed_matrix = plan.tasks.iter().any(|t| t.variant.is_some());
+    let distributed_matrix = plan
+        .tasks
+        .iter()
+        .any(|t| t.variant.is_some() || t.dynamic_matrix);
     let no_inputs = serde_json::to_value(local_ci::TaskInputs::default())
         .map_err(|e| invalid(e.to_string()))?;
     plan.tasks
@@ -148,8 +151,11 @@ pub fn task_specs(
                 .map_err(|e| invalid(format!("task `{}`: {e:#}", task.id)))?;
             let spec = TaskSpec {
                 ci: Some(CiSpec {
+                    dynamic_origin: task.dynamic_matrix,
+                    core_outcome: None,
                     matrix: matrix_admission(plan, task)?,
                     task: CiTask {
+                        dispatch: None,
                         plan_digest: plan_digest.clone(),
                         task_id: task.id.clone(),
                         inputs: no_inputs.clone(),
@@ -424,7 +430,11 @@ pub fn job_lines(
                     .into_iter()
                     .map(|o| line(Some(o.job), o.status.as_str(), o.skipped)),
             ),
-            None => lines.push(line(None, "no_result", None)),
+            None => lines.push(line(
+                None,
+                ci.core_outcome.as_deref().unwrap_or("no_result"),
+                None,
+            )),
         }
     }
     let plan = digest

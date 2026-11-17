@@ -144,6 +144,11 @@ pub struct MatrixAdmission {
 /// A task of a frozen CI plan, as it is queued.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiSpec {
+    /// A dynamic origin waits on derived variants and never executes itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic_origin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub matrix: Option<MatrixAdmission>,
     /// What the worker is sent: the plan by its digest, the task, and the
@@ -1484,7 +1489,7 @@ impl Coordinator {
             // It waits for the jobs it needs; the queue does not list it.
             return Ok(());
         }
-        let lacks_ci = |w: &Reached| policy::lacks_ci_task(&spec, w.link.ci_task_negotiated());
+        let unmet_ci = |w: &Reached| policy::unmet_ci(&spec, w.link.as_ref());
         let parent_local = self
             .parent_local
             .lock()
@@ -1604,7 +1609,7 @@ impl Coordinator {
                 .iter()
                 .filter(|w| refusal(w).is_none() && (ready(w) || measured_cold(w)))
                 .partition(|w| {
-                    !lacks_ci(w)
+                    unmet_ci(w).is_none()
                         && (spec.toolchains.is_none() || toolchain_eligible.contains(&w.worker_id))
                         && crate::toolchain::capability::missing_with_installable(
                             &spec.requirements,
@@ -1614,8 +1619,8 @@ impl Coordinator {
                         .is_empty()
                 });
             excluded.extend(mismatched.into_iter().map(|w| Excluded {
-                unmet: if lacks_ci(w) {
-                    vec![policy::CI_TASK_UNMET.to_string()]
+                unmet: if let Some(why) = unmet_ci(w) {
+                    vec![why.to_string()]
                 } else {
                     crate::toolchain::envdiff::with_steps(
                         crate::toolchain::capability::missing(

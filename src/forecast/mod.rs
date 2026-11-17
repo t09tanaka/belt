@@ -351,6 +351,7 @@ mod tests {
         let d = Digest::of_bytes(b"x");
         let payload = AttemptPayload {
             ci_task: Some(crate::wire::CiTask {
+                dispatch: None,
                 plan_digest: Digest::of_bytes(&bytes),
                 task_id: task_of(&f.plan, "build").to_string(),
                 inputs: serde_json::json!({}),
