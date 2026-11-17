@@ -23,6 +23,7 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     "output_bundles_v1",
     crate::toolchain::capability::FEATURE,
     crate::toolchain::contract::FEATURE,
+    crate::wire::ENV_SYNC_FEATURE,
 ];
 
 /// What one side offers and requires.

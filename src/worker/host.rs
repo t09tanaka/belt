@@ -33,6 +33,9 @@ pub trait Host: Send + Sync {
     ) -> Result<Option<crate::toolchain::registry::Registry>, ApiError> {
         Ok(None)
     }
+    /// An explicit request for this version (a warm-up): a remembered
+    /// install failure of it no longer holds the next install back.
+    fn toolchain_retry(&self, _request: &crate::toolchain::preparation::PreparationRequest) {}
     fn toolchain_poll(
         &self,
         _attempt: &AttemptId,

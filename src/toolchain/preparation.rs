@@ -17,6 +17,10 @@ use task_traffic_controller::{managed, process, Context};
 const MAX_REQUEST: u64 = 1024 * 1024;
 const MAX_OUTPUT: usize = 8192;
 pub(crate) const REQUEST_FILE: &str = "tool-request.json";
+/// The exit of a helper whose install failed by itself (`install_exit`).
+/// Every other failure of the helper exits with 1. Not a code of `error.rs`,
+/// of sysexits, or of a shell.
+pub(crate) const INSTALL_FAILED_EXIT: i32 = 3;
 
 /// Trusted worker input, never a wire/project installer specification.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,7 +197,78 @@ fn admitted(ctx: &Context, spec: &SuperviseSpec, node: &NodeSpec) -> bool {
         && crate::platform::read_process(pid).ppid == Some(sidecar.owner_pid)
 }
 
-fn run_helper(path: &Path, binding: &str) -> Result<(), String> {
+/// How long a helper waits for the records of its own admission (the
+/// ledger entry, the sidecar, the launch in the worker store). Its
+/// supervisor writes them after it started the helper, and on a busy machine
+/// that takes seconds: a short wait here failed installs that were admitted.
+/// A helper that is never admitted is stopped by its supervisor's deadline
+/// before this, or leaves here.
+const ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, PartialEq, Eq)]
+enum AdmissionStep {
+    Go,
+    Wait,
+    GiveUp,
+}
+
+/// What a helper does next. It runs the manager only once it is admitted.
+/// When the admission of this command names another process as its child,
+/// this helper was started beside it and never will be: it leaves at once.
+fn admission_step(admitted: bool, another_is_the_child: bool, waited: Duration) -> AdmissionStep {
+    if admitted {
+        AdmissionStep::Go
+    } else if another_is_the_child || waited >= ADMISSION_WAIT {
+        AdmissionStep::GiveUp
+    } else {
+        AdmissionStep::Wait
+    }
+}
+
+/// The admission of this builder's command records a child, and it is not
+/// this process.
+fn another_is_the_child(ctx: &Context, spec: &SuperviseSpec) -> bool {
+    let id = command_id(&spec.attempt_id, 0);
+    match managed::assess(ctx, &id).sidecar {
+        managed::Loaded::Ok(sidecar) => sidecar
+            .child
+            .is_some_and(|child| child.pid != std::process::id()),
+        _ => false,
+    }
+}
+
+/// The exit of a helper whose install ended with `error`:
+/// `INSTALL_FAILED_EXIT` when the install failed by itself, in a way the same
+/// version would meet again (a command of the manager failed, a probe did
+/// not answer the version, another device is mounted in the root), and 1
+/// for everything else (a lock, a cleanup, a receipt that could not be
+/// written, an executor that could not start).
+pub(crate) fn install_exit(error: &str) -> i32 {
+    match error {
+        adapters::COMMAND_FAILED | adapters::VERSION_MISMATCH | adapters::OTHER_DEVICE => {
+            INSTALL_FAILED_EXIT
+        }
+        _ => 1,
+    }
+}
+
+/// Why a helper failed, and what it exits with.
+struct HelperFailure {
+    exit: i32,
+    why: String,
+}
+impl From<String> for HelperFailure {
+    fn from(why: String) -> Self {
+        HelperFailure { exit: 1, why }
+    }
+}
+impl From<&str> for HelperFailure {
+    fn from(why: &str) -> Self {
+        why.to_string().into()
+    }
+}
+
+fn run_helper(path: &Path, binding: &str) -> Result<(), HelperFailure> {
     let dir = path.parent().ok_or("missing_builder_directory")?;
     if path != dir.join(REQUEST_FILE)
         || std::fs::canonicalize(dir).map_err(|e| e.to_string())? != dir
@@ -238,22 +313,32 @@ fn run_helper(path: &Path, binding: &str) -> Result<(), String> {
     if !dir.join("worker.db").is_file() {
         return Err("preparation_acceptance_missing".into());
     }
-    let plan = request.plan(&state.join("toolchains"))?;
+    let toolchains = state.join("toolchains");
+    let plan = request.plan(&toolchains)?;
     let ctx = Context::new(task_traffic_controller::paths::Paths::new(
         &spec.traffic_state_dir,
         spec.traffic_config_path(),
     ));
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let began = Instant::now();
     loop {
-        if admitted(&ctx, &spec, &node) {
-            break;
+        let admitted = admitted(&ctx, &spec, &node);
+        match admission_step(
+            admitted,
+            !admitted && another_is_the_child(&ctx, &spec),
+            began.elapsed(),
+        ) {
+            AdmissionStep::Go => break,
+            AdmissionStep::GiveUp => return Err("installer_not_admitted".into()),
+            AdmissionStep::Wait => std::thread::sleep(Duration::from_millis(10)),
         }
-        if Instant::now() >= deadline {
-            return Err("installer_not_admitted".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
-    adapters::install_admitted(&plan, &mut HelperExecutor).map_err(str::to_string)?;
+    // Only the install itself can fail "by itself".
+    adapters::install_admitted(&plan, &toolchains, &mut HelperExecutor).map_err(|e| {
+        HelperFailure {
+            exit: install_exit(e),
+            why: e.into(),
+        }
+    })?;
     Ok(())
 }
 
@@ -261,8 +346,8 @@ pub(crate) fn helper_main(path: &Path, binding: &str) -> i32 {
     match run_helper(path, binding) {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("private tool preparation: {e}");
-            1
+            eprintln!("private tool preparation: {}", e.why);
+            e.exit
         }
     }
 }
@@ -346,5 +431,85 @@ mod tests {
         std::fs::write(&file, vec![b' '; MAX_REQUEST as usize + 1]).unwrap();
         assert!(private_json::<serde_json::Value>(&file).is_err());
         assert!(private_json::<serde_json::Value>(temp.path()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{admission_step, AdmissionStep, ADMISSION_WAIT};
+    use std::time::Duration;
+
+    #[test]
+    fn only_an_install_that_failed_by_itself_has_its_own_exit() {
+        use super::{adapters, install_exit, HelperFailure, INSTALL_FAILED_EXIT};
+        assert_eq!(INSTALL_FAILED_EXIT, 3);
+        for by_itself in [
+            adapters::COMMAND_FAILED,
+            adapters::VERSION_MISMATCH,
+            adapters::OTHER_DEVICE,
+        ] {
+            assert_eq!(install_exit(by_itself), INSTALL_FAILED_EXIT, "{by_itself}");
+        }
+        assert_eq!(adapters::COMMAND_FAILED, "installation_command_failed");
+        assert_eq!(adapters::VERSION_MISMATCH, "installed_version_mismatch");
+        assert_eq!(adapters::OTHER_DEVICE, "installation_cleanup_other_device");
+        for other in [
+            "installation_partial_cleanup",
+            "install_lock_wait",
+            "receipt_write",
+            "installer_not_admitted",
+            "installer_spawn",
+            "installer_output_limit",
+            "preparation_request_binding",
+            "",
+        ] {
+            assert_eq!(install_exit(other), 1, "{other}");
+        }
+        // What fails before or around the install exits with 1, whatever
+        // it says.
+        let before: HelperFailure = adapters::COMMAND_FAILED.into();
+        assert_eq!(
+            (before.exit, before.why.as_str()),
+            (1, adapters::COMMAND_FAILED)
+        );
+        let before: HelperFailure = String::from("x").into();
+        assert_eq!((before.exit, before.why.as_str()), (1, "x"));
+    }
+
+    #[test]
+    fn a_helper_runs_only_admitted_waits_for_its_records_and_leaves_when_another_is_the_child() {
+        let just_under = ADMISSION_WAIT - Duration::from_millis(1);
+        // Admitted: it goes, whatever else.
+        assert_eq!(
+            admission_step(true, false, Duration::ZERO),
+            AdmissionStep::Go
+        );
+        assert_eq!(
+            admission_step(true, false, ADMISSION_WAIT),
+            AdmissionStep::Go
+        );
+        // Not yet: it waits well beyond the few seconds a busy machine
+        // takes to write the records, then gives up.
+        assert_eq!(
+            admission_step(false, false, Duration::ZERO),
+            AdmissionStep::Wait
+        );
+        assert_eq!(
+            admission_step(false, false, Duration::from_secs(30)),
+            AdmissionStep::Wait
+        );
+        assert_eq!(
+            admission_step(false, false, just_under),
+            AdmissionStep::Wait
+        );
+        assert_eq!(
+            admission_step(false, false, ADMISSION_WAIT),
+            AdmissionStep::GiveUp
+        );
+        // Another process is the admitted child: never this one.
+        assert_eq!(
+            admission_step(false, true, Duration::ZERO),
+            AdmissionStep::GiveUp
+        );
     }
 }

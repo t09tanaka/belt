@@ -5,7 +5,7 @@
 //! come from. Covered by the coverage and mutation gates.
 
 use crate::ids::{BuilderId, Digest};
-use crate::state::{Exit, Outcome, Termination};
+use crate::state::{Exit, Outcome, Termination, TimeoutPhase};
 use crate::wire::{
     canonical_json, CommandSpec, PreparedArtifact, PreparedChange, PreparedRemoval,
     PreparedTemplateReceipt, ReuseScope, SchemaVersion, SetupSpec, SetupStep,
@@ -651,7 +651,8 @@ pub enum BuildEnd {
     Built,
     /// A step failed.
     Failed(Option<Exit>),
-    TimedOut,
+    /// With the phase the time ran out in, when the settlement says it.
+    TimedOut(Option<TimeoutPhase>),
     /// Stopped because no consumer needed it any more, or asked to stop.
     Cancelled,
     /// It could not be seen to end properly: the supervisor died, the
@@ -674,7 +675,7 @@ impl BuildEnd {
                 format!("a setup step was killed by signal {s}")
             }
             BuildEnd::Failed(None) => "a setup step failed".into(),
-            BuildEnd::TimedOut => "the setup builder timed out".into(),
+            BuildEnd::TimedOut(_) => "the setup builder timed out".into(),
             BuildEnd::Cancelled => "the setup builder was cancelled".into(),
             BuildEnd::Crashed(why) => format!("the setup builder was lost: {why}"),
             BuildEnd::NotKept(why) => {
@@ -693,7 +694,7 @@ pub fn end_of(t: Option<Termination>) -> BuildEnd {
     match t.outcome() {
         Outcome::Succeeded => BuildEnd::Built,
         Outcome::Failed => BuildEnd::Failed(t.exit()),
-        Outcome::TimedOut => BuildEnd::TimedOut,
+        Outcome::TimedOut => BuildEnd::TimedOut(t.timeout().map(|t| t.phase)),
         Outcome::Cancelled => BuildEnd::Cancelled,
         Outcome::Interrupted => BuildEnd::Crashed("it was interrupted".into()),
     }
@@ -708,6 +709,40 @@ pub enum Leave {
     Keep,
     /// That was the last reference of a builder that is still working.
     StopBuilder,
+}
+
+/// Whether the install of a tool ended in a way that asking again would
+/// repeat: its helper said that the install failed by itself (it exited with
+/// `by_itself_exit`: a command of the manager failed, a probe did not answer
+/// the version, another device is mounted in the root), or the time ran out
+/// while the installer was running. Any other failing exit of the helper (it
+/// was not admitted, a lock, a cleanup, a receipt that could not be
+/// written), a time that ran out before the installer ran (waiting to be
+/// admitted), and an install that was cancelled (the last consumer left),
+/// lost, interrupted or killed by a signal say nothing about the next one,
+/// and are not remembered.
+pub fn install_itself_failed(end: &BuildEnd, by_itself_exit: i32) -> bool {
+    match end {
+        BuildEnd::Failed(Some(Exit::Code(code))) => *code == by_itself_exit,
+        BuildEnd::TimedOut(phase) => *phase == Some(TimeoutPhase::Running),
+        _ => false,
+    }
+}
+
+/// How long a remembered install failure still stands, in milliseconds:
+/// `None` once `hold_ms` have passed since it was recorded at `at_ms`, or
+/// when the host tools (`same_host`) are no longer the ones that failed.
+pub fn failure_held(same_host: bool, now_ms: u64, at_ms: u64, hold_ms: u64) -> Option<u64> {
+    let left = hold_ms.checked_sub(now_ms.saturating_sub(at_ms))?;
+    (same_host && left > 0).then_some(left)
+}
+
+/// What a consumer is told while a remembered install failure stands.
+pub fn failure_held_message(why: &str, left_ms: u64) -> String {
+    format!(
+        "{why} (this version failed to install a short while ago; it is tried again in {} s, or at once by `workers sync`)",
+        left_ms.div_ceil(1000)
+    )
 }
 
 /// A consumer takes a reference. Returns whether it is the first.
@@ -815,6 +850,62 @@ pub fn prepare_spec(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_install_that_failed_by_itself_is_remembered_and_only_for_the_hold() {
+        use super::{failure_held, failure_held_message, install_itself_failed, BuildEnd, Exit};
+        use crate::state::TimeoutPhase;
+        // The helper's own exit for an install that failed by itself, and a
+        // time that ran out while the installer ran.
+        assert!(install_itself_failed(
+            &BuildEnd::Failed(Some(Exit::Code(3))),
+            3
+        ));
+        assert!(install_itself_failed(
+            &BuildEnd::TimedOut(Some(TimeoutPhase::Running)),
+            3
+        ));
+        for end in [
+            // Any other exit of the helper: not admitted in time, a lock, a
+            // cleanup, a receipt that could not be written.
+            BuildEnd::Failed(Some(Exit::Code(0))),
+            BuildEnd::Failed(Some(Exit::Code(1))),
+            BuildEnd::Failed(Some(Exit::Code(2))),
+            BuildEnd::Failed(Some(Exit::Code(4))),
+            BuildEnd::Failed(Some(Exit::Signal(3))),
+            // The time ran out before the installer ran (waiting to be
+            // admitted), after it, or nobody knows when.
+            BuildEnd::TimedOut(Some(TimeoutPhase::Preparing)),
+            BuildEnd::TimedOut(Some(TimeoutPhase::Waiting)),
+            BuildEnd::TimedOut(Some(TimeoutPhase::Collecting)),
+            BuildEnd::TimedOut(None),
+            BuildEnd::Built,
+            BuildEnd::Failed(Some(Exit::Signal(9))),
+            BuildEnd::Failed(None),
+            BuildEnd::Cancelled,
+            BuildEnd::Crashed("lost".into()),
+            BuildEnd::NotKept("why".into()),
+        ] {
+            assert!(!install_itself_failed(&end, 3), "{end:?}");
+        }
+        // 10 minutes from 1000 ms on.
+        assert_eq!(failure_held(true, 1_000, 1_000, 600_000), Some(600_000));
+        assert_eq!(failure_held(true, 1_001, 1_000, 600_000), Some(599_999));
+        assert_eq!(failure_held(true, 600_999, 1_000, 600_000), Some(1));
+        assert_eq!(failure_held(true, 601_000, 1_000, 600_000), None);
+        assert_eq!(failure_held(true, 601_001, 1_000, 600_000), None);
+        assert_eq!(failure_held(true, u64::MAX, 0, 600_000), None);
+        // A clock that reads earlier than the record: the whole hold.
+        assert_eq!(failure_held(true, 0, 1_000, 600_000), Some(600_000));
+        // Other host tools: not held at any time.
+        assert_eq!(failure_held(false, 1_000, 1_000, 600_000), None);
+        assert_eq!(failure_held(true, 5, 5, 0), None);
+        assert_eq!(
+            failure_held_message("a setup step exited with 1", 600_000),
+            "a setup step exited with 1 (this version failed to install a short while ago; it is tried again in 600 s, or at once by `workers sync`)"
+        );
+        assert!(failure_held_message("x", 1).contains("in 1 s"));
+        assert!(failure_held_message("x", 1_001).contains("in 2 s"));
+    }
     use super::*;
     use crate::ids::{NodeId, RunId};
     use crate::wire::{SecretVersion, ToolRequirement};
@@ -1811,7 +1902,23 @@ mod tests {
             end_of(term(Outcome::Failed, Some(Exit::Code(3)))),
             BuildEnd::Failed(Some(Exit::Code(3)))
         );
-        assert_eq!(end_of(term(Outcome::TimedOut, None)), BuildEnd::TimedOut);
+        assert_eq!(
+            end_of(term(Outcome::TimedOut, None)),
+            BuildEnd::TimedOut(Some(crate::state::TimeoutPhase::Running))
+        );
+        let waiting = Termination::new(
+            Outcome::TimedOut,
+            None,
+            Some(crate::state::TimeoutInfo {
+                kind: crate::state::TimeoutKind::ResourceWait,
+                phase: crate::state::TimeoutPhase::Waiting,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            end_of(Some(waiting)),
+            BuildEnd::TimedOut(Some(crate::state::TimeoutPhase::Waiting))
+        );
         assert_eq!(end_of(term(Outcome::Cancelled, None)), BuildEnd::Cancelled);
         assert!(matches!(
             end_of(term(Outcome::Interrupted, None)),
@@ -1820,7 +1927,7 @@ mod tests {
         assert!(matches!(end_of(None), BuildEnd::Crashed(_)));
         for e in [
             BuildEnd::Failed(None),
-            BuildEnd::TimedOut,
+            BuildEnd::TimedOut(None),
             BuildEnd::Cancelled,
             BuildEnd::Crashed("x".into()),
         ] {
@@ -1835,7 +1942,7 @@ mod tests {
             BuildEnd::Failed(Some(Exit::Code(3))),
             BuildEnd::Failed(Some(Exit::Signal(9))),
             BuildEnd::Failed(None),
-            BuildEnd::TimedOut,
+            BuildEnd::TimedOut(None),
             BuildEnd::Cancelled,
             BuildEnd::Crashed("why".into()),
             BuildEnd::NotKept("because".into()),
@@ -1853,7 +1960,7 @@ mod tests {
             .describe()
             .contains("because"));
         assert!(!BuildEnd::NotKept("because".into()).is_built());
-        assert!(BuildEnd::TimedOut.describe().contains("timed out"));
+        assert!(BuildEnd::TimedOut(None).describe().contains("timed out"));
         assert!(BuildEnd::Cancelled.describe().contains("cancelled"));
     }
 
