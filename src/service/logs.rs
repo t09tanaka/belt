@@ -80,6 +80,39 @@ impl Cursors {
         Ok((replaced, changed))
     }
 }
+/// The status record of a task that has no attempt: whether it still waits,
+/// why it cannot be run (`reason`, a CI task that was cancelled before it
+/// was placed), and which workers it was not placed on and why
+/// (`placement`). A key is there only when there is something to say.
+fn waiting_status(task: &Task) -> serde_json::Value {
+    let mut status = serde_json::json!({
+        "kind": "status",
+        "task_id": task.task_id,
+        "run_id": task.run_id,
+        "attempt_id": null,
+        "pending": task.cancel_requested_at_ms.is_none(),
+    });
+    if let Some(reason) = &task.unrunnable {
+        status["reason"] = serde_json::json!(reason);
+    }
+    if let Some(placement) = &task.placement {
+        status["placement"] = serde_json::json!(placement);
+    }
+    status
+}
+
+/// Is what the task says about its wait news to this observer? `notes`
+/// keeps what was told last per task; a task with nothing to say is
+/// forgotten.
+fn note_news(notes: &mut std::collections::BTreeMap<TaskId, String>, task: &Task) -> bool {
+    if task.unrunnable.is_none() && task.placement.is_none() {
+        notes.remove(&task.task_id);
+        return false;
+    }
+    let note = serde_json::json!([task.unrunnable, task.placement]).to_string();
+    notes.insert(task.task_id.clone(), note.clone()) != Some(note)
+}
+
 #[derive(Default, Debug, Serialize)]
 pub struct Summary {
     pub tasks: u64,
@@ -124,6 +157,8 @@ pub struct Observer {
     root: PathBuf,
     target: Target,
     attempt: Option<AttemptId>,
+    /// What each waiting task last said about its wait (see [`note_news`]).
+    notes: std::collections::BTreeMap<TaskId, String>,
     cursors: Cursors,
     delivered: u64,
     reconnect_spec: Option<super::bootstrap::Spec>,
@@ -156,6 +191,7 @@ impl Observer {
             target,
             attempt,
             cursors: Cursors::new()?,
+            notes: std::collections::BTreeMap::new(),
             delivered: 0,
             reconnect_spec: None,
         })
@@ -242,8 +278,11 @@ impl Observer {
             sink.status(serde_json::json!({"kind":"replacement","task_id":task.task_id,"previous_attempt_id":old,"attempt_id":aid})).await?;
         }
         let Some(attempt_id) = aid else {
-            if changed {
-                sink.status(serde_json::json!({"kind":"status","task_id":task.task_id,"run_id":task.run_id,"attempt_id":null,"pending":task.cancel_requested_at_ms.is_none(),"reason":task.unrunnable})).await?;
+            // Told again when why it waits (or why it cannot be run) is news:
+            // a follower that saw the task pending learns the reason.
+            let news = note_news(&mut self.notes, &task);
+            if changed || news {
+                sink.status(waiting_status(&task)).await?;
             }
             if task.cancel_requested_at_ms.is_none() {
                 summary.pending_tasks += 1;
@@ -683,6 +722,74 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn a_waiting_task_says_why_it_waits_or_cannot_run_once_per_change() {
+        use crate::scheduler::decide::{Excluded, Exclusion};
+        use crate::storage::query::PlacementDiagnostics;
+        let mut task = Task {
+            unrunnable: None,
+            placement: None,
+            in_place: false,
+            task_id: TaskId::generate(),
+            run_id: RunId::generate(),
+            created_at_ms: 1,
+            cancel_requested_at_ms: None,
+            current_attempt: None,
+        };
+        let mut notes = std::collections::BTreeMap::new();
+        let plain = waiting_status(&task);
+        assert_eq!(plain["kind"], "status");
+        assert_eq!(plain["pending"], true);
+        assert!(plain["attempt_id"].is_null());
+        assert!(plain.get("reason").is_none() && plain.get("placement").is_none());
+        assert!(!note_news(&mut notes, &task));
+        assert!(notes.is_empty());
+
+        // A worker did not take the plan of the run.
+        task.placement = Some(PlacementDiagnostics {
+            blocked_reason: None,
+            excluded: vec![Excluded {
+                unmet: vec!["frozen plan not taken".into()],
+                worker_id: crate::ids::WorkerId::parse("w-a").unwrap(),
+                why: Exclusion::InputRefused,
+            }],
+            truncated: false,
+        });
+        let waiting = waiting_status(&task);
+        assert_eq!(waiting["placement"]["excluded"][0]["why"], "input_refused");
+        assert_eq!(
+            waiting["placement"]["excluded"][0]["unmet"][0],
+            "frozen plan not taken"
+        );
+        assert!(waiting.get("reason").is_none());
+        assert!(note_news(&mut notes, &task));
+        assert!(!note_news(&mut notes, &task), "told once");
+
+        // It was cancelled because its run cannot go on: news again.
+        task.placement = None;
+        task.unrunnable = Some("the frozen plan is gone".into());
+        task.cancel_requested_at_ms = Some(2);
+        let ended = waiting_status(&task);
+        assert_eq!(ended["reason"], "the frozen plan is gone");
+        assert_eq!(ended["pending"], false);
+        assert!(ended.get("placement").is_none());
+        assert!(note_news(&mut notes, &task));
+        assert!(!note_news(&mut notes, &task));
+        // Another task is told on its own.
+        let other = Task {
+            task_id: TaskId::generate(),
+            ..task.clone()
+        };
+        assert!(note_news(&mut notes, &other));
+        assert_eq!(notes.len(), 2);
+        // Nothing to say any more: forgotten, so the same reason later is news.
+        task.unrunnable = None;
+        assert!(!note_news(&mut notes, &task));
+        assert_eq!(notes.len(), 1);
+        task.unrunnable = Some("the frozen plan is gone".into());
+        assert!(note_news(&mut notes, &task));
+    }
+
     #[tokio::test]
     async fn snapshot_raw_bytes_prefix_boundary_ndjson_and_readonly() {
         let f = Fixture::new();
