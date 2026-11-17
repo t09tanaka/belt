@@ -1803,8 +1803,12 @@ async fn control_exec_succeeded_compute_but_missing_collection_exits_78() {
             when: remote_task_runner::config::model::OutputWhen::Always,
         });
     let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    // The outer bound must exceed the 20s the exec itself allows for the
+    // resident to start (and the run after it): with an equal bound a slow
+    // start on a loaded or instrumented runner trips this unwrap before the
+    // exec can report anything.
     let report = tokio::time::timeout(
-        Duration::from_secs(20),
+        Duration::from_secs(60),
         control::exec(
             context,
             vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
