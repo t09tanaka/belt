@@ -105,20 +105,56 @@ impl Launcher for OwnedLauncher {
         assert!(plist.contains("<key>RunAtLoad</key><true/>"));
         assert!(!plist.contains("SECRET_TOKEN"));
         // Read only the input selected by this test's private config path, never shell parsing.
-        let input = self_input(&args[2]);
-        let spec = bootstrap::read_input(&input).unwrap();
-        let mut c = test_command(&spec.executable);
-        c.args(bootstrap::daemon_argv(&input).unwrap())
-            .envs(&spec.env)
-            .current_dir(spec.repo_root.as_ref().unwrap())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-        let mut state = self.0.lock().unwrap();
-        c.stderr(state.stderr());
-        assert!(state.child.is_none());
-        state.child = Some(c.spawn().unwrap());
-        state.starts += 1;
+        start_owned(&self.0, &self_input(&args[2]));
+        Ok(())
+    }
+}
+/// Start the daemon the managed file names, as the service manager would.
+fn start_owned(state: &Mutex<State>, input: &std::path::Path) {
+    let spec = bootstrap::read_input(input).unwrap();
+    let mut c = test_command(&spec.executable);
+    c.args(bootstrap::daemon_argv(input).unwrap())
+        .envs(&spec.env)
+        .current_dir(spec.repo_root.as_ref().unwrap())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let mut state = state.lock().unwrap();
+    c.stderr(state.stderr());
+    assert!(state.child.is_none());
+    state.child = Some(c.spawn().unwrap());
+    state.starts += 1;
+}
+/// A systemd user manager that owns one child: no `systemctl` runs.
+struct OwnedSystemd(Arc<Mutex<State>>, std::path::PathBuf);
+impl Launcher for OwnedSystemd {
+    fn backend(&self) -> remote_task_runner::service::macos::policy::Backend {
+        remote_task_runner::service::macos::policy::Backend::Systemd
+    }
+    fn running_identity(
+        &mut self,
+        plan: &Plan,
+        receipt: &Receipt,
+    ) -> Result<remote_task_runner::service::macos::RunningIdentity, LaunchError> {
+        OwnedLauncher(self.0.clone()).running_identity(plan, receipt)
+    }
+    fn loaded_state(&mut self, plan: &Plan, receipt: &Receipt) -> LoadedState {
+        OwnedLauncher(self.0.clone()).loaded_state(plan, receipt)
+    }
+    fn verify_loaded(&mut self, _: &Plan, _: &Receipt) -> Result<(), LaunchError> {
+        Ok(())
+    }
+    fn launchctl(&mut self, args: &[String]) -> Result<(), LaunchError> {
+        assert_eq!((args[0].as_str(), args[1].as_str()), ("--user", "start"));
+        // The unit is where systemd reads a user's units, under this test's root.
+        let unit =
+            std::fs::read_to_string(self.1.join("config/systemd/user").join(&args[2])).unwrap();
+        assert!(unit.contains("Restart=always") && unit.contains("WantedBy=default.target"));
+        assert!(!unit.contains("SECRET_TOKEN"));
+        start_owned(
+            &self.0,
+            &self.1.join("config/remote-task-runner/coordinator.json"),
+        );
         Ok(())
     }
 }
@@ -238,17 +274,89 @@ fn concurrent_init_reuses_one_real_combined_resident_and_epoch() {
     assert_eq!(after.cluster_id(), &foreign_id);
     assert_eq!(after.epoch(), foreign_epoch);
 }
-#[cfg(not(target_os = "macos"))]
+/// On Linux `init` goes to the systemd user manager. With a runtime
+/// directory that has no manager behind it, the real `systemctl` (or its
+/// absence) can only fail to answer: the command reaches the service
+/// backend, is not "not implemented", reports no success and starts nothing.
+#[cfg(target_os = "linux")]
 #[test]
-fn linux_public_init_refuses_without_filesystem_changes() {
+fn linux_public_init_reaches_the_systemd_backend_and_claims_nothing_without_a_manager() {
     let root = crate::test_tmp::tempdir().unwrap();
+    let runtime = root.path().join("run");
+    std::fs::create_dir(&runtime).unwrap();
     let out = test_command(env!("CARGO_BIN_EXE_remote-task-runner"))
         .args(["--json", "init"])
         .env("HOME", root.path())
+        .env("PATH", "/usr/bin:/bin")
+        .env("XDG_RUNTIME_DIR", &runtime)
+        .env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            format!("unix:path={}", runtime.join("bus").display()),
+        )
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(70));
-    assert!(std::fs::read_dir(root.path()).unwrap().next().is_none());
+    assert!(!out.status.success());
+    assert_ne!(out.status.code(), Some(70));
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(value["ok"], false);
+    assert_ne!(value["error"]["code"], "NOT_IMPLEMENTED");
+    assert!(value["error"]["message"]
+        .as_str()
+        .unwrap()
+        .starts_with("init: "));
+    // The Linux form was prepared, and no LaunchAgent directory was made.
+    assert!(root.path().join(".config/systemd/user").is_dir());
+    assert!(!root.path().join("Library").exists());
+}
+
+/// The whole of `init` with a systemd manager that owns one child, on every
+/// OS: the unit is written where systemd reads it, the daemon it names
+/// becomes the registered resident, and running `init` again starts nothing.
+#[test]
+fn init_with_a_systemd_manager_registers_one_real_combined_resident() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let state = Arc::new(Mutex::new(State::default()));
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut manager = OwnedSystemd(state.clone(), root.path().to_owned());
+    let run = |manager: &mut OwnedSystemd| {
+        runtime
+            .block_on(initialize(context(root.path()), manager))
+            .unwrap_or_else(|error| {
+                state.lock().unwrap().diagnose();
+                panic!("initialization failed: {error}");
+            })
+    };
+    let first = run(&mut manager);
+    assert!(first.initialized);
+    let again = run(&mut manager);
+    assert_eq!(
+        (first.cluster_id, first.worker_id, first.epoch),
+        (again.cluster_id, again.worker_id, again.epoch)
+    );
+    assert_eq!(state.lock().unwrap().starts, 1);
+    let units: Vec<_> = std::fs::read_dir(root.path().join("config/systemd/user"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|name| name.ends_with(".service"))
+        .collect();
+    assert_eq!(units.len(), 1, "{units:?}");
+    assert!(!root.path().join("Library").exists());
+    // The daemon checked its own managed registration from the journal, and
+    // answers as the registered resident.
+    let input = root
+        .path()
+        .join("config/remote-task-runner/coordinator.json");
+    let spec = bootstrap::read_input(&input).unwrap();
+    runtime.block_on(async {
+        assert!(matches!(
+            bootstrap::health(&spec).await.unwrap(),
+            Reply::Health { ready: true, .. }
+        ));
+    });
 }
 
 #[test]
