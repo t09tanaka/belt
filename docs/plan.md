@@ -1148,11 +1148,14 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 | 分割できない理由の表示（A28） | JSON は実装済みで、実 CLI のテストと text 表示が無かった。この変更で両方を足した | JSON は `PlanSummary` の `grouping`・`shard_groups[].not_split`・`depends_on`・`dependency_layer_width`。text は workflow・task・node の件数と digest だけだった。`ci::summary::render_text` と実 CLI の `ci_plan_shows_why_a_shared_workspace_task_is_not_split` を追加 |
 | 複数 step・setup・matrix の forecast（A10 の S16 分） | 部品は実装もテストも済み、接続は未実装 | forecast の A10 は `forecast` の unit 4 件（`a10_*`）。`ci plan` は `plan_task_demand` の command step 数を出す。FrozenPlan の task を `WorkloadPlan` にして配置時の forecast へ渡す経路は無い（実行 driver と同時に要る） |
 | matrix の global permit | 永続層は実装もテストも済み、利用側は未実装 | `matrix_group`・`matrix_permit` と `create_matrix_group`・`acquire_permit`・`release_permit`・attempt への束縛は storage の unit 2 件で検証済み。Coordinator は常に `permit_id: None` で submit し、group を作る呼び出しも無い |
-| `ci`（実行）、Job DAG の配置、needs output | 未実装 | `CiSub` は `Plan` だけで、subcommand 無しの `ci` は `NOT_IMPLEMENTED`。worker と supervisor は argv の command だけを実行し、`execute_pinned_task`・`TaskInputs` を呼ぶ経路が無い |
-| dynamic matrix の展開 event | 未実装 | 展開を記録する event も、展開後の node を forecast へ足す経路も無い（wire の `Uncertainty::DynamicMatrix` は表示用の印だけ） |
-| max-parallel・fail-fast・join・決定的な集約（A27） | 未実装 | group の進行を持つコードが無い。集約の `aggregate_matrix` は local-ci にあるが呼び出していない |
-| host をまたぐ中間 artifact の receipt（A38） | 未実装 | worker の upload を親が検証・保存して receipt を返す経路が無い。既存の回収は attempt が終わった後の最終回収だけ |
+| `ci`（実行）、Job DAG の配置、needs output | 未実装 | `CiSub` は `Plan` だけで、subcommand 無しの `ci` は `NOT_IMPLEMENTED`。worker と supervisor は argv の command だけを実行し、`src/ci/` の外で `execute_pinned_task`・`execute_task`・`execute_setup`・`TaskInputs`・`derive_job_dag`・`WireTaskResult`・`StepExecutor` を使う箇所は grep で 0 件 |
+| dynamic matrix の展開 event | 受け皿だけ実装もテストも済み、展開そのものは未実装 | wire の `WorkloadPlan`・coverage と forecast は `expansion_seq` を運び、照合する（`forecast::plan` の unit）。展開を行って event に固定するコードは無く、scheduler が作る plan の `expansion_seq` は常に 0 |
+| max-parallel・fail-fast・join・決定的な集約（A27） | 未実装 | group の進行を持つコードが無い。`fail-fast` は wire の skip 理由の文字列としてテストに出るだけで、`aggregate_matrix` の呼び出しは grep で 0 件 |
+| host をまたぐ中間 artifact の receipt（A38） | 未実装 | `artifact_receipt` は attempt が終わった後の最終回収と `outputs` の書き出しだけが使う。実行中の upload を親が検証・保存して receipt を返し、別 host の download が待つ経路は無い |
 
-未実装の行はすべて、local-ci の shared Driver（進行・動的 matrix の展開・permit・join・cancel を host に依存しない形で持つ。上の 2026-11-15 の記録）を前提にしている。Driver は 2026-11-17 の時点で未公開で、crates.io の最新 0.17.1 にも `driver`・`job_evaluate` の module は無い。RTR の依存は 0.13.0 のままである。公開済みの API（`derive_job_dag`・`TaskInputs`・`aggregate_matrix`・`expr`・`matrix::expand`）だけで RTR 側に進行を書くと、決定済みの shared Driver と同じものを二重に持つことになるので、この変更では実装しない。
+未実装の分は、止まっている理由で 2 つに分かれる。
 
-再開の順序は、local-ci の Driver を現在の main へ載せ直して公開する、RTR の local-ci を別の変更で上げる、その上で (1) `ci` の実行 driver と worker 側の CI task 実行・needs output・A10 の接続・A38 のうち結果と output の分、(2) matrix の permit・max-parallel・fail-fast・join・集約と展開 event・A27、(3) 中間 artifact の receipt と A38 の artifact の分、の順とする。worker 側の CI task 実行は worker の admission と supervisor の spec に及ぶ。S16 の必須範囲は変えない。
+- local-ci の shared Driver 待ち: run の進行、動的 matrix の展開と event、permit の利用、max-parallel・fail-fast・join、cancel。上の 2026-11-15 の記録のとおり Driver が host に依存しない形で持つ。Driver は 2026-11-17 の時点で未公開で、crates.io の最新 0.17.1 にも `driver`・`job_evaluate` の module は無い。RTR の依存は 0.13.0 のままである。公開済みの API だけで RTR 側に進行を書くと、同じものを二重に持つことになる。
+- Driver に依らず公開済みの API（`execute_pinned_task`・`TaskInputs`・`StepExecutor`・`plan_task_demand`）で作れるが、設計が未決定: (a) worker 側の CI task 実行。FrozenPlan・task id・`TaskInputs` を worker へどう渡すか（wire の新しい payload か別の形か）、step を task-traffic-controller に載せる `StepExecutor` を supervisor のどこに置くか。worker の admission と supervisor の spec に及ぶ。(b) FrozenPlan の task を `WorkloadPlan` にして配置時の forecast へ渡す接続（A10 の S16 分）。(c) 実行中の中間 artifact を親へ送り、receipt を別 host の download へ返す経路。
+
+この変更では、どちらも実装していない。再開の順序の案は、(a)〜(c) の設計を決める、local-ci の Driver を現在の main へ載せ直して公開し RTR の依存を別の変更で上げる、その上で (1) `ci` の実行 driver と worker 側の CI task 実行・needs output・A10 の接続・A38 のうち結果と output の分、(2) matrix の permit・max-parallel・fail-fast・join・集約と展開 event・A27、(3) 中間 artifact の receipt と A38 の artifact の分、である。(a) は Driver の公開を待たずに始められる。S16 の必須範囲は変えない。
