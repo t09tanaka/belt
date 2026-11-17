@@ -61,6 +61,19 @@ fn retire(tx: &Connection, worker: &str, at_ms: u64) -> Result<Forgotten> {
         )?;
         tx.execute("DELETE FROM worker_identity WHERE worker_id = ?1", [worker])?;
     }
+    // The worker may disappear after reporting an outcome but before collection.
+    // Close only the outstanding collection and preserve the recorded outcome.
+    let mut pending = tx.prepare(
+        "SELECT a.attempt_id FROM attempt a LEFT JOIN collection c USING (attempt_id)
+         WHERE a.worker_id = ?1 AND a.state = 'terminal' AND a.retired = 0
+         AND c.closed_at_ms IS NULL",
+    )?;
+    let pending_ids = pending
+        .query_map([worker], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in pending_ids {
+        close_collection_in(tx, &id, None, Verdict::GaveUp, false, at_ms)?;
+    }
     let live: Vec<String> = {
         let mut query = tx.prepare(
             "SELECT attempt_id FROM attempt

@@ -608,6 +608,24 @@ fn an_attempt_without_required_artifacts_is_collected_at_terminal() {
     assert!(f.store.mark_collected(&a.attempt_id, 3).unwrap());
 }
 
+#[test]
+fn forget_closes_pending_collection_and_preserves_a_reported_outcome() {
+    let f = fx();
+    let attempt = f.attempt('a').unwrap().attempt_id;
+    f.to_finalizing(&attempt);
+    f.store
+        .finalize_attempt(&attempt, done(Outcome::Succeeded), 30)
+        .unwrap();
+    for now in [40, 50] {
+        let forgotten = f.store.forget_worker(&f.worker, now).unwrap();
+        assert!(forgotten.ended.is_empty());
+        let row = f.store.collection(&attempt).unwrap().unwrap();
+        assert_eq!(row.closed_at_ms, Some(40));
+        let saved = f.store.get_attempt(&attempt).unwrap().unwrap();
+        assert_eq!(saved.termination, Some(done(Outcome::Succeeded)));
+    }
+}
+
 fn blob(r: &str, a: &AttemptId, kind: BlobKind, loc: &str) -> NewBlobRef {
     NewBlobRef {
         ref_id: r.into(),
