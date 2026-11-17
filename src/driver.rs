@@ -1852,6 +1852,8 @@ mod tests {
                     steps: vec![],
                     cancelled: false,
                     time: None,
+                    build_cache: None,
+                    os_note: None,
                 })
                 .collect(),
             outcomes,

@@ -31,9 +31,6 @@ pub struct Workflow {
 pub struct Job {
     pub id: String,
     pub name: Option<String>,
-    /// Source-only scheduling requirement; frozen wire projections stay unchanged.
-    #[serde(skip)]
-    pub runs_on: Option<Y>,
     pub needs: Vec<String>,
     pub cond: Option<String>,
     pub env: Vec<(String, String)>,
@@ -255,7 +252,6 @@ fn parse_job(id: &str, j: &Y) -> Job {
     Job {
         id: id.to_string(),
         name: str_of(j, "name"),
-        runs_on: get(j, "runs-on").cloned(),
         needs: list_of(j, "needs"),
         cond: str_of(j, "if"),
         env: pairs(get(j, "env")),

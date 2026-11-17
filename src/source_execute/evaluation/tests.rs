@@ -155,19 +155,10 @@ fn captured_directory_and_git_recompute_scheduling_provenance() {
         unknown["unchecked_verified"] = Value::Bool(true);
         assert!(EvaluationSource::from_json(&unknown.to_string()).is_err());
         assert!(EvaluationSource::from_json(&" ".repeat(MAX_SOURCE_BYTES + 1)).is_err());
-        // Frozen wire projection and original canonical bytes are unchanged.
+        // Reading the source leaves the frozen plan as it was. The plan carries
+        // `runs-on` itself; the verified source rereads it from the original bytes.
         assert_eq!(serde_json::to_vec(&plan).unwrap(), before);
-        assert!(!String::from_utf8(before).unwrap().contains("runs_on"));
         plan.verify().unwrap();
-        let parsed = crate::workflow::parse(".github/workflows/ci.yml", WORKFLOW).unwrap();
-        let mut stripped = parsed.clone();
-        for job in &mut stripped.jobs {
-            job.runs_on = None;
-        }
-        assert_eq!(
-            serde_json::to_value(parsed).unwrap(),
-            serde_json::to_value(stripped).unwrap()
-        );
         // A validly rehashed plan cannot silently reinterpret original bytes.
         let mut retargeted = plan.clone();
         retargeted.workflows[0].jobs[0].name = Some("changed projection".into());

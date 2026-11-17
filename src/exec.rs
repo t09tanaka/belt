@@ -2707,6 +2707,16 @@ impl<'a> Runner<'a> {
             )
         };
 
+        // The OS each entry's `runs-on` names. Every job runs on the host: the
+        // entries of another OS that a leg of the host's OS stands in for are
+        // not run, the others run with a note. The shared evaluation stays
+        // free of the host; a member a driver selected was placed by its host.
+        let host = os_legs::Family::host();
+        let legs = if self.selected.is_none() {
+            self.os_legs_of(job, &gh, needs, shard)
+        } else {
+            None
+        };
         let evaluated = match &self.selected {
             Some((selection, facts)) => {
                 selection.worker_evaluation(gh, self.runner_ctx(), needs, facts)
@@ -2723,13 +2733,30 @@ impl<'a> Runner<'a> {
             ),
         };
         let mut out = Vec::new();
-        let notes: Vec<(usize, String)> = Vec::new();
+        let mut notes: Vec<(usize, String)> = Vec::new();
         let mut todo = Vec::new();
-        for entry in evaluated.entries {
+        for (k, entry) in evaluated.entries.into_iter().enumerate() {
             match entry.decision {
                 crate::job_evaluate::Decision::Run(cm) => {
-                    todo.push((out.len(), cm, entry.display));
-                    out.push(None);
+                    let leg = legs.as_ref().and_then(|l| l.get(only.unwrap_or(k)));
+                    match leg {
+                        Some(OsLeg {
+                            os: Some((family, label)),
+                            twin: Some(twin),
+                        }) => out.push(Some(skip(
+                            entry.display,
+                            os_legs::not_run_reason(label, *family, host, twin),
+                        ))),
+                        _ => {
+                            if let Some((family, label)) =
+                                leg.and_then(|l| l.os.as_ref()).filter(|(f, _)| *f != host)
+                            {
+                                notes.push((out.len(), os_legs::ran_on_note(label, *family, host)));
+                            }
+                            todo.push((out.len(), cm, entry.display));
+                            out.push(None);
+                        }
+                    }
                 }
                 crate::job_evaluate::Decision::Skip(reason) => {
                     out.push(Some(skip(entry.display, reason)))
@@ -2838,6 +2865,75 @@ impl<'a> Runner<'a> {
             }
         }
         out.into_iter().flatten().collect()
+    }
+
+    /// The OS of every entry of the job's matrix, and the name of the entry
+    /// of the host's OS that stands in for it. `None` when the job has no
+    /// entries to tell apart (its matrix does not expand, or it is not run).
+    fn os_legs_of(
+        &self,
+        job: &Job,
+        gh: &Value,
+        needs: &Map<String, Value>,
+        shard: Option<&dag::TaskShard>,
+    ) -> Option<Vec<OsLeg>> {
+        job.runs_on.as_ref()?;
+        // every entry with its contexts and name, whatever its `if:` says
+        let mut all = job.clone();
+        all.cond = None;
+        let entries = crate::job_evaluate::evaluate_job(
+            &all,
+            gh.clone(),
+            self.runner_ctx(),
+            needs,
+            false,
+            false,
+            None,
+            shard,
+        )
+        .entries;
+        let mut contexts = Vec::new();
+        let mut displays = Vec::new();
+        for entry in entries {
+            match entry.decision {
+                crate::job_evaluate::Decision::Run(cm) => {
+                    contexts.push(cm);
+                    displays.push(entry.display);
+                }
+                _ => return None,
+            }
+        }
+        let os_of: Vec<Option<(os_legs::Family, String)>> = contexts
+            .iter()
+            .map(|cm| os_legs::family_of_leg(job, cm))
+            .collect();
+        let twin_of: Vec<Option<usize>> = if self.opts.all_os_legs {
+            vec![None; contexts.len()]
+        } else {
+            let legs: Vec<os_legs::Leg> = os_of
+                .iter()
+                .zip(&contexts)
+                .map(|(o, cm)| os_legs::Leg {
+                    family: o.as_ref().map(|(f, _)| *f),
+                    matrix: cm
+                        .get("matrix")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .collect();
+            os_legs::twins(os_legs::Family::host(), job, &legs)
+        };
+        Some(
+            os_of
+                .into_iter()
+                .zip(twin_of)
+                .map(|(os, twin)| OsLeg {
+                    os,
+                    twin: twin.map(|t| displays[t].clone()),
+                })
+                .collect(),
+        )
     }
 
     /// Evaluate `pairs` into `into`. Says whether a secret that cannot be
@@ -4073,22 +4169,12 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     f.write_all(content.as_bytes())
 }
 
-/// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
-pub(crate) fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
-    Ok(match v {
-        Value::String(s) if s.contains("${{") => expr::interpolate_value(s, ctx)?,
-        Value::Array(a) => Value::Array(
-            a.iter()
-                .map(|x| eval_strings(x, ctx))
-                .collect::<Result<_>>()?,
-        ),
-        Value::Object(o) => Value::Object(
-            o.iter()
-                .map(|(k, x)| Ok((k.clone(), eval_strings(x, ctx)?)))
-                .collect::<Result<_>>()?,
-        ),
-        other => other.clone(),
-    })
+/// What the OS legs say of one entry of a matrix.
+struct OsLeg {
+    /// the OS its `runs-on` names, with the label
+    os: Option<(os_legs::Family, String)>,
+    /// the name of the entry of the host's OS that stands in for it
+    twin: Option<String>,
 }
 
 fn record(
@@ -4229,6 +4315,7 @@ mod tests {
             job_timeout_min: 1.,
             keep: false,
             trash: root.join("trash"),
+            all_os_legs: false,
         };
         let a = Runner::new(&ctx, &fp, &workspace("one"), opts()).unwrap();
         let b = Runner::new(&other_ctx, &fp, &workspace("two"), opts()).unwrap();

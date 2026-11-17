@@ -270,7 +270,6 @@ mod tests {
             .collect();
         Job {
             id: "t".into(),
-            runs_on: None,
             name: None,
             needs: vec![],
             cond: None,

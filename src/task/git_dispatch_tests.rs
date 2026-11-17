@@ -196,6 +196,7 @@ impl Fixture {
             job_timeout_min: 1.,
             keep: false,
             trash: self.area.path().join("trash"),
+            all_os_legs: false,
         }
     }
     fn refusal_opts(&self) -> Opts {

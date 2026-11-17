@@ -352,10 +352,11 @@ mod tests {
     #[ignore = "explicit private installed TTC wrapper acceptance"]
     // This explicitly invoked acceptance fixture selects an installed binary;
     // production commands and their environments still use ExecContext.
-    #[allow(clippy::disallowed_methods)]
     fn native_real_ttc_wrapper_keeps_external_stop_unconfirmed() {
-        let bin =
-            std::env::var_os("SDK_TEST_TTC_BIN").expect("set installed TTC binary explicitly");
+        // read when the test is built: the library does not read the process environment
+        let Some(bin) = option_env!("SDK_TEST_TTC_BIN") else {
+            panic!("set installed TTC binary explicitly")
+        };
         let root = tempfile::tempdir().unwrap();
         let config = root.path().join(".config/task-traffic-controller");
         std::fs::create_dir_all(&config).unwrap();

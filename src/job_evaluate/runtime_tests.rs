@@ -74,6 +74,7 @@ fn options(area: &Path) -> Opts {
         job_timeout_min: 1.,
         keep: false,
         trash: area.join("trash"),
+        all_os_legs: false,
     }
 }
 fn workspace(area: &Path, name: &str) -> Workspace {
