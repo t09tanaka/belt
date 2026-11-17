@@ -5112,6 +5112,22 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     c.store().put_source_ref(&source, &manifest, 1).unwrap();
     let steps = candidates(&whole);
     let discovery = steps[0].task_id();
+    let probe = specs
+        .iter()
+        .find(|(id, _)| id == &discovery)
+        .and_then(|(_, spec)| spec.ci.as_ref())
+        .unwrap();
+    assert_eq!(probe.steps, 2, "runner version and test listing");
+    assert_eq!(probe.history_keys.len(), 2);
+    assert!(probe.history_keys.iter().all(Option::is_some));
+    let job = specs
+        .iter()
+        .find(|(id, _)| id != &discovery)
+        .and_then(|(_, spec)| spec.ci.as_ref())
+        .unwrap();
+    for key in &probe.history_keys {
+        assert!(!job.history_keys.contains(key));
+    }
     let task_id = TaskId::generate();
     c.enqueue(
         run.clone(),

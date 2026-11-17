@@ -5547,6 +5547,7 @@ fn a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for() {
                             weight: Some(1),
                             predicted_rss_bytes: Some(1),
                             predicted_runtime_ms: Some(5_000),
+                            ci_history_key: None,
                             external_delay_ms: None,
                             ready_in_ms: Some(0),
                             concurrency: ConcurrencyLimits::default(),
