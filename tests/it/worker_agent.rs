@@ -377,6 +377,20 @@ impl Fx {
         ));
         connect(a, client_cfg(&self.cluster)).await.unwrap().client
     }
+    /// [`Fx::connect`] with `ci_task_v1` offered by both sides: no build
+    /// offers it yet (it ships with the delivery of the frozen plan).
+    async fn connect_ci(&self, agent: &Arc<Agent>) -> Client {
+        use remote_task_runner::worker::serve::serve_connection_offering;
+        let (a, b) = duplex_pair(64 * 1024);
+        let permits = Arc::new(Semaphore::new(64));
+        let (agent, cluster) = (agent.clone(), self.cluster.clone());
+        tokio::spawn(async move {
+            serve_connection_offering(agent, b, cluster, permits, &[CI_TASK_FEATURE]).await
+        });
+        let mut cfg = client_cfg(&self.cluster);
+        cfg.features.push(CI_TASK_FEATURE.to_string());
+        connect(a, cfg).await.unwrap().client
+    }
     fn store(&self) -> WorkerStore {
         WorkerStore::open_read_only(&self.state()).unwrap()
     }
@@ -4402,7 +4416,7 @@ fn ci_payload() -> AttemptPayload {
 async fn a_ci_task_without_its_plan_fails_and_is_never_settled_as_a_prepared_setup() {
     let f = fx();
     let agent = f.start("boot-a");
-    let c = f.connect(&agent).await;
+    let c = f.connect_ci(&agent).await;
     let a = AttemptId::generate();
     // No command: without the CI task this would be refused, and with every
     // command pruned it would be a success without a command.
@@ -4418,7 +4432,7 @@ async fn a_ci_task_without_its_plan_fails_and_is_never_settled_as_a_prepared_set
 async fn a_ci_task_that_cannot_be_run_yet_is_refused_before_it_is_stored() {
     let f = fx();
     let agent = f.start("boot-a");
-    let c = f.connect(&agent).await;
+    let c = f.connect_ci(&agent).await;
     let a = AttemptId::generate();
     let refused = |change: fn(&mut AttemptPayload)| {
         let mut p = ci_payload();
@@ -4433,9 +4447,270 @@ async fn a_ci_task_that_cannot_be_run_yet_is_refused_before_it_is_stored() {
         refused(|p| p.in_place = true),
         refused(|p| p.ci_task.as_mut().unwrap().task_id.clear()),
         refused(|p| p.ci_task.as_mut().unwrap().inputs = serde_json::json!([])),
+        // the name the result of the task is kept under
+        refused(|p| {
+            p.artifacts = vec![decl(
+                "rtr-ci-task-result.json",
+                "out.txt",
+                MissingPolicy::Optional,
+            )]
+        }),
+        refused(|p| {
+            p.artifacts = vec![decl(
+                "rtr-ci-task-result.json/part",
+                "out.txt",
+                MissingPolicy::Optional,
+            )]
+        }),
     ] {
         let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidInput, "{}", e.message);
     }
     assert!(f.store().get(&a).unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ci_task_that_was_not_negotiated_is_refused_and_no_build_offers_it_yet() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    // What a coordinator and a worker of this build negotiate.
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let e = call(&c, submit_req(&a, &ci_payload())).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::ProtocolIncompatible, "{}", e.message);
+    assert!(e.message.contains("not negotiated"), "{}", e.message);
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(!remote_task_runner::protocol::hello::SUPPORTED_FEATURES.contains(&CI_TASK_FEATURE));
+    // An attempt of commands is taken on the same connection.
+    submit(&c, &a, &payload("exit 0")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+}
+
+/// A real agent with the real host, the source of a run captured into its
+/// store, and the frozen plan of that source kept where a delivery puts it.
+struct CiFx {
+    f: Fx,
+    agent: Arc<Agent>,
+    base: AttemptPayload,
+    plan: local_ci::FrozenPlan,
+}
+
+impl CiFx {
+    fn payload(&self, job: &str) -> AttemptPayload {
+        let task = self
+            .plan
+            .tasks
+            .iter()
+            .find(|t| t.jobs.iter().any(|j| j == job))
+            .expect("a task of the job");
+        let mut p = self.base.clone();
+        p.task_id = TaskId::generate();
+        p.ci_task.as_mut().unwrap().task_id = task.id.clone();
+        p
+    }
+    /// The result the attempt kept for its coordinator, when it kept one.
+    fn result(&self, a: &AttemptId) -> Option<local_ci::WireTaskResult> {
+        let kept = self
+            .f
+            .state()
+            .join("attempts")
+            .join(a.as_str())
+            .join("artifacts")
+            .join(remote_task_runner::supervisor::ci_task::RESULT_ARTIFACT);
+        let text = std::fs::read_to_string(kept).ok()?;
+        Some(local_ci::WireTaskResult::from_json(&text).unwrap())
+    }
+    fn steps(&self, a: &AttemptId) -> Vec<String> {
+        let launches = self.f.store().launches(a).unwrap();
+        launches
+            .into_iter()
+            .map(|(n, _, _)| n.to_string())
+            .collect()
+    }
+}
+
+fn ci_fx(workflow: &str) -> CiFx {
+    use local_ci::frozen::Filters;
+    use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    let f = fx();
+    let state = f.state();
+    std::fs::create_dir_all(f.path("home")).unwrap();
+    let env: BTreeMap<String, String> = [
+        ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+        ("HOME", f.path("home").to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let project = f.path("project");
+    std::fs::create_dir_all(project.join(".github/workflows")).unwrap();
+    std::fs::write(project.join(".github/workflows/ci.yml"), workflow).unwrap();
+
+    let run = RunId::generate();
+    let store = SourceStore::open(&state).unwrap();
+    let captured = capture_for_run(
+        &env,
+        &store,
+        &run,
+        &SourceRequest::Directory { dir: project },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let manifest = store
+        .manifest(&captured.manifest.ci_source_id)
+        .unwrap()
+        .unwrap();
+    let options = local_ci::PinnedPlanOptions {
+        workflow_dirs_override: None,
+        filters: Filters {
+            all: true,
+            include_disabled: false,
+            workflows_dirs: vec![],
+            workflows: vec![],
+            jobs: vec![],
+        },
+        disabled: vec![],
+        base_branch: None,
+        changed_files: None,
+    };
+    let plan = remote_task_runner::ci::execute::freeze_plan(&store, &manifest, &options).unwrap();
+    // Where the delivery of the plan (the next step of S16) will put it.
+    let bytes = serde_json::to_vec(&plan).unwrap();
+    let plan_digest = remote_task_runner::worker::ci_task::store_plan(&state, &bytes).unwrap();
+
+    let machine =
+        remote_task_runner::worker::machine::Machine::open(&state, env, state.join("cluster.key"))
+            .unwrap();
+    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+
+    let mut base = payload("true");
+    base.commands.clear();
+    base.run_id = run;
+    base.source_id = captured.manifest.source_id.clone();
+    let digest = &captured.manifest.manifest_digest;
+    base.manifest_digest = Digest::parse(digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
+        .unwrap();
+    base.ci_task = Some(CiTask {
+        plan_digest,
+        task_id: String::new(),
+        inputs: serde_json::to_value(local_ci::TaskInputs::default()).unwrap(),
+    });
+    CiFx {
+        f,
+        agent,
+        base,
+        plan,
+    }
+}
+
+const CI_WORKFLOW: &str = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    outputs:\n      version: ${{ steps.v.outputs.version }}\n    steps:\n      - id: v\n        run: echo \"version=1.2.3\" >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: test \"${{ needs.build.outputs.version }}\" = 1.2.3 && echo checked\n";
+
+/// From the acceptance by a real agent to the supervisor binary and back:
+/// a task of a frozen plan runs in the workspace the host makes of the
+/// captured source, and the task that needs it runs from its result.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ci_task_runs_under_the_agent_and_its_supervisor_and_hands_its_result_to_the_next() {
+    use local_ci::JobStatus;
+    let ci = ci_fx(CI_WORKFLOW);
+    let c = ci.f.connect_ci(&ci.agent).await;
+
+    let build = AttemptId::generate();
+    submit(&c, &build, &ci.payload("build")).await;
+    assert_eq!(ci.f.wait_terminal(&build), Outcome::Succeeded);
+    assert_eq!(ci.steps(&build), ["step-0"], "one node per step that ran");
+    assert_eq!(events(&ci.f, &build, "prepared_only"), 0);
+    let built = ci
+        .result(&build)
+        .expect("the result is kept as an artifact");
+    assert_eq!(built.outcomes.len(), 1);
+    assert_eq!(built.outcomes[0].job, "build");
+    assert_eq!(built.outcomes[0].status, JobStatus::Success);
+    assert_eq!(built.outcomes[0].outputs["version"], "1.2.3");
+
+    // The next task, as its coordinator will send it: the outcomes of the
+    // jobs it needs are its inputs.
+    let mut next = ci.payload("test");
+    let inputs = local_ci::TaskInputs::new(&built.outcomes, &built.outcomes, false);
+    next.ci_task.as_mut().unwrap().inputs = serde_json::to_value(inputs).unwrap();
+    let test = AttemptId::generate();
+    submit(&c, &test, &next).await;
+    assert_eq!(ci.f.wait_terminal(&test), Outcome::Succeeded);
+    assert_eq!(ci.steps(&test), ["step-0"]);
+    assert_eq!(
+        ci.result(&test).unwrap().outcomes[0].status,
+        JobStatus::Success
+    );
+
+    // Without the output of the job it needs, the same task fails: the
+    // result above was what made it pass.
+    let alone = AttemptId::generate();
+    submit(&c, &alone, &ci.payload("test")).await;
+    assert_eq!(ci.f.wait_terminal(&alone), Outcome::Failed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ci_task_with_service_containers_is_refused_before_it_is_stored() {
+    let ci = ci_fx(
+        "on: push\njobs:\n  db:\n    runs-on: ubuntu-latest\n    services:\n      postgres:\n        image: postgres:16\n    steps:\n      - run: echo hi\n",
+    );
+    let c = ci.f.connect_ci(&ci.agent).await;
+    let a = AttemptId::generate();
+    let e = call(&c, submit_req(&a, &ci.payload("db")))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{}", e.message);
+    assert!(e.message.contains("service containers"), "{}", e.message);
+    assert!(ci.f.store().get(&a).unwrap().is_none());
+}
+
+/// The supervisor of a CI task is killed while a step runs: the next one
+/// recovers the attempt, stops the step, and starts nothing more of the plan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_ci_task_whose_supervisor_is_lost_during_a_step_is_recovered_as_interrupted() {
+    let ci = ci_fx(
+        "on: push\njobs:\n  job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 300\n      - if: always()\n        run: echo always > always.txt\n",
+    );
+    let f = &ci.f;
+    let c = f.connect_ci(&ci.agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &ci.payload("job")).await;
+    wait_for("the step", || ci.steps(&a) == ["step-0"]);
+    wait_for("the running state", || {
+        f.rec(&a).state == AttemptState::Active
+    });
+    ci.agent.shutdown();
+    f.kill_supervisors(&a);
+    wait_for("the supervisor to die", || f.supervisors(&a).is_empty());
+    assert_eq!(f.rec(&a).state, AttemptState::Active);
+
+    let _agent = f.start("boot-a");
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    assert_eq!(ci.steps(&a), ["step-0"], "no step is started by recovery");
+    // The pipe of the step went with the recovery.
+    let logs = f.state().join("attempts").join(a.as_str());
+    let pipes: Vec<_> = walk(&logs)
+        .into_iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "pipe"))
+        .collect();
+    assert!(pipes.is_empty(), "{pipes:?}");
+}
+
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                todo.push(path);
+            } else {
+                found.push(path);
+            }
+        }
+    }
+    found
 }

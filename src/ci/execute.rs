@@ -11,7 +11,9 @@ use crate::source::SourceStore;
 use local_ci::exec::{Opts, Workspace};
 use local_ci::source::SourceManifest;
 use local_ci::source_execute::{PinnedExecution, RefusePinnedForks};
-use local_ci::{CancelHandle, ExecContext, FrozenPlan, StepExecutor, TaskInputs, TaskResult};
+use local_ci::{
+    CancelHandle, ExecContext, FrozenPlan, PinnedPlanOptions, StepExecutor, TaskInputs, TaskResult,
+};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -48,6 +50,25 @@ pub struct TaskPaths {
     /// (no step, no helper process of its own) and takes down what it has
     /// up. The host keeps a clone and cancels through it.
     pub cancel: CancelHandle,
+}
+
+/// Freeze the plan of a captured source: the workflows `options` select,
+/// read from the objects of the capture and from nothing else.
+pub fn freeze_plan(
+    store: &SourceStore,
+    manifest: &SourceManifest,
+    options: &PinnedPlanOptions,
+) -> Result<FrozenPlan, ExecuteError> {
+    let view = store
+        .object_store()
+        .map_err(|e| ExecuteError::Binding(e.to_string()))?;
+    view.with_sdk(|objects| {
+        Ok(local_ci::build_frozen_plan_from_source(
+            objects, manifest, options,
+        ))
+    })
+    .map_err(|e| ExecuteError::Binding(e.to_string()))?
+    .map_err(|e| ExecuteError::Binding(format!("{e:#}")))
 }
 
 /// Run task `task_id` of `plan` in `paths.root` with `inputs` as the results
@@ -193,16 +214,7 @@ pub(crate) mod tests {
             base_branch: None,
             changed_files: None,
         };
-        let plan = store
-            .object_store()
-            .unwrap()
-            .with_sdk(|objects| {
-                Ok(local_ci::build_frozen_plan_from_source(
-                    objects, &manifest, &options,
-                ))
-            })
-            .unwrap()
-            .unwrap();
+        let plan = freeze_plan(&store, &manifest, &options).unwrap();
         Fixture {
             _root: root,
             store,

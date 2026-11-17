@@ -335,6 +335,79 @@ mod tests {
     //! simulation task-traffic-controller runs, fed with exact numbers.
     use super::*;
     use crate::ids::{AgentEpoch, AttemptId, BuilderId, Digest, NodeId, WorkerBootId, WorkerId};
+
+    /// An accepted CI task is demand before any of its steps is registered:
+    /// its nodes are the steps of the plan the worker holds.
+    #[test]
+    fn the_accepted_nodes_of_a_ci_task_come_from_the_plan_the_worker_keeps() {
+        use crate::ci::execute::tests::{fixture, task_of, WORKFLOW};
+        let f = fixture(WORKFLOW);
+        let state = f.area.join("state");
+        let worker = WorkerId::parse("w-fc").unwrap();
+        let store = crate::storage::WorkerStore::open(&state, &worker).unwrap();
+        let bytes = serde_json::to_vec(&f.plan).unwrap();
+        let attempt = AttemptId::generate();
+        let d = Digest::of_bytes(b"x");
+        let payload = AttemptPayload {
+            ci_task: Some(crate::wire::CiTask {
+                plan_digest: Digest::of_bytes(&bytes),
+                task_id: task_of(&f.plan, "build").to_string(),
+                inputs: serde_json::json!({}),
+            }),
+            toolchains: None,
+            outputs: Vec::new(),
+            requirements: Default::default(),
+            in_place: false,
+            setup: None,
+            run_id: crate::ids::RunId::generate(),
+            task_id: crate::ids::TaskId::generate(),
+            generation: crate::ids::Generation(1),
+            source_id: crate::ids::SourceId::generate(),
+            plan_digest: d.clone(),
+            manifest_digest: d,
+            permit_id: None,
+            commands: vec![],
+            lease_ms: 60_000,
+            command_timeout_ms: None,
+            deadline_ms: None,
+            resource_wait_timeout_ms: None,
+            has_secret_bundle: false,
+            artifacts: Vec::new(),
+        };
+        store
+            .submit(
+                crate::storage::NewAcceptance {
+                    attempt_id: attempt.clone(),
+                    run_id: payload.run_id.clone(),
+                    task_id: payload.task_id.clone(),
+                    generation: crate::ids::Generation(1),
+                    payload_hash: crate::ids::PayloadHash::parse(&format!(
+                        "sha256:{}",
+                        "a".repeat(64)
+                    ))
+                    .unwrap(),
+                    coordinator_epoch: CoordinatorEpoch(1),
+                    spec: serde_json::to_value(&payload).unwrap(),
+                },
+                1,
+            )
+            .unwrap();
+        let attempts = store.list_nonterminal().unwrap();
+        // The plan has not arrived: the task has no known step yet.
+        assert_eq!(accepted_of(&attempts, &ci_steps_in(&state)).unwrap(), []);
+        crate::worker::ci_task::store_plan(&state, &bytes).unwrap();
+        let nodes = accepted_of(&attempts, &ci_steps_in(&state)).unwrap();
+        assert_eq!(nodes.len(), 1, "the one `run:` step of the job");
+        assert_eq!(nodes[0].node_id.as_str(), "step-0");
+        assert_eq!(nodes[0].attempt_id, attempt);
+        assert_eq!(
+            nodes[0].command_id,
+            crate::supervisor::spec::command_id(&attempt, 0)
+        );
+        // What says how many steps a task has is asked for CI tasks only.
+        assert_eq!(accepted_of(&attempts, &|_| 3).unwrap().len(), 3);
+        assert_eq!(accepted_of(&attempts, &|_| 0).unwrap(), []);
+    }
     use crate::wire::{
         ConcurrencyLimits, Correlation, ForecastField, RuntimeSource, SchemaVersion, Uncertainty,
         WaitReason, WorkloadNode, WorkloadPlan,

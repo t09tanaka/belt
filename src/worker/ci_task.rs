@@ -750,7 +750,10 @@ mod tests {
         let full = store_plan_within(dir.path(), b"d", limits).unwrap_err();
         assert_eq!(full.kind(), std::io::ErrorKind::StorageFull);
         // A plan that is held already is no new plan.
-        assert_eq!(store_plan_within(dir.path(), b"aaaa", limits).unwrap(), first);
+        assert_eq!(
+            store_plan_within(dir.path(), b"aaaa", limits).unwrap(),
+            first
+        );
         assert_eq!(kept_plans(&plans_dir(dir.path())).len(), 2);
         assert_eq!(
             std::fs::read_dir(plans_dir(dir.path())).unwrap().count(),
@@ -777,7 +780,10 @@ mod tests {
         assert!(plan_is_garbage(false, Some(11), 10));
         assert!(!plan_is_garbage(false, Some(9), 10), "delivered just now");
         assert!(!plan_is_garbage(true, Some(1_000), 10), "in use");
-        assert!(!plan_is_garbage(false, None, 0), "an age that cannot be told");
+        assert!(
+            !plan_is_garbage(false, None, 0),
+            "an age that cannot be told"
+        );
 
         let dir = crate::test_tmp::tempdir().unwrap();
         let used = store_plan(dir.path(), b"{\"used\":1}").unwrap();
@@ -805,9 +811,7 @@ mod tests {
     fn the_plans_in_use_are_those_the_unfinished_attempts_name() {
         let a = Digest::of_bytes(b"a");
         let b = Digest::of_bytes(b"b");
-        let ci = |d: &Digest| {
-            serde_json::json!({ "ci_task": { "plan_digest": d, "task_id": "t", "inputs": {} } })
-        };
+        let ci = |d: &Digest| serde_json::json!({ "ci_task": { "plan_digest": d, "task_id": "t", "inputs": {} } });
         let specs = [
             ci(&a),
             serde_json::json!({ "commands": [] }),
@@ -857,7 +861,10 @@ mod tests {
         .into();
         let profile = Profile::load(dir.path(), &measured).unwrap();
         let env = base_env(Some(&profile), None).unwrap();
-        assert_eq!(env, profile.execution_environment(&BTreeMap::new()).unwrap());
+        assert_eq!(
+            env,
+            profile.execution_environment(&BTreeMap::new()).unwrap()
+        );
         assert_eq!(env.get("PATH"), Some(&home), "not the PATH of the agent");
 
         let d = Digest::of_bytes(b"x");
@@ -884,7 +891,10 @@ mod tests {
         assert_eq!(base_env(Some(&profile), Some(&binding)).unwrap(), activated);
         // Without a profile a binding is not looked at.
         let plain = base_env(None, Some(&binding)).unwrap();
-        assert_ne!(plain.get("PATH").map(String::as_str), Some("/activated/bin"));
+        assert_ne!(
+            plain.get("PATH").map(String::as_str),
+            Some("/activated/bin")
+        );
     }
 
     #[test]
