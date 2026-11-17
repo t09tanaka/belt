@@ -41,8 +41,16 @@ extern "C" fn remove_root() {
 pub fn root() -> &'static Path {
     &ROOT
         .get_or_init(|| {
-            let parent = std::fs::canonicalize("/tmp").expect("/tmp exists");
-            sweep(&parent, PREFIX);
+            let parent = match std::env::var_os("RTR_MUTATION_FIXTURE_PARENT") {
+                // The mutation driver removes its private parent after the shard.
+                // PID classification itself can be under mutation here.
+                Some(private) => std::fs::canonicalize(private).expect("mutation fixture parent"),
+                None => {
+                    let shared = std::fs::canonicalize("/tmp").expect("/tmp exists");
+                    sweep(&shared, PREFIX);
+                    shared
+                }
+            };
             let owned = OwnedTemp::new_in(&parent, PREFIX).expect("test root");
             let path = owned.path().to_path_buf();
             // The test harness ends through `exit`, which runs this.
