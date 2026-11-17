@@ -46,7 +46,9 @@ pub(crate) fn calibrate(
         speeds.insert(worker, speed);
         for (identity, &ms) in &history.millis {
             let normalized = u128::from(ms) * u128::from(speed) / 1000;
-            if normalized <= u128::from(u64::MAX / crate::supervisor::ci_task::MAX_PLAN_BYTES) {
+            if normalized
+                <= u128::from(u64::MAX / crate::supervisor::ci_task::MAX_PLAN_BYTES / 1000)
+            {
                 weights.entry(identity).or_default().push(normalized as u64);
             }
         }

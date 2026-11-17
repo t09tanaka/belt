@@ -156,3 +156,26 @@ fn configured_reporters_and_post_test_uploads_keep_the_whole_job() {
         Some(NotSplit::InexactAggregation)
     );
 }
+
+#[test]
+fn timing_scope_follows_captured_config_but_survives_changes_to_test_code() {
+    let fixture = fixture(WORKFLOW);
+    let entry = |name: &str, hash: &str| local_ci::source::FileEntry {
+        path: local_ci::source::RelPath::new(name),
+        mode: 0o100644,
+        size: 1,
+        hash: hash.into(),
+    };
+    let scope = |config, test| {
+        history_project(
+            "project",
+            &fixture.plan,
+            &[
+                entry("jest.config.js", config),
+                entry("example.test.js", test),
+            ],
+        )
+    };
+    assert_eq!(scope("1", "a"), scope("1", "b"));
+    assert_ne!(scope("1", "a"), scope("2", "a"));
+}
