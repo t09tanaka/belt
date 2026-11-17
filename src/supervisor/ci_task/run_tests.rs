@@ -922,7 +922,7 @@ fn worker_discovery_lists_real_cargo_tests_then_runs_only_each_shards_assigned_t
         &sup.f.plan,
         &[listing],
         |_| Ok((Default::default(), Default::default(), 2)),
-        |_| local_ci::shard::Isolation::None,
+        |_| local_ci::shard::adapters::Isolation::None,
     )
     .unwrap();
     let group = plan.shard_groups.iter().find(|g| g.split).unwrap();
