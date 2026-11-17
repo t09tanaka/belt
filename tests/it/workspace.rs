@@ -411,6 +411,70 @@ fn add_and_remove_a_commit_workspace() {
     });
 }
 
+/// A48: terminal cleanup runs the project's release hook for this attempt.
+#[test]
+fn removing_an_attempt_releases_only_its_portool_allocation() {
+    let f = fixture();
+    let allocations = || {
+        let out = Command::new("portool")
+            .args(["ls", "--json"])
+            .env_clear()
+            .envs(f.env())
+            .current_dir(&f.dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        json["allocations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| PathBuf::from(entry["path"].as_str().unwrap()))
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    let portool = Command::new("portool")
+        .arg("--version")
+        .env_clear()
+        .envs(f.env())
+        .output();
+    if !real_available(&f.root.join("home")) || !portool.is_ok_and(|out| out.status.success()) {
+        assert!(
+            std::env::var_os("RTR_REQUIRE_FAST_WORKTREE").is_none(),
+            "A48 needs fast-worktree and portool"
+        );
+        return;
+    }
+    f.commit(".portool.toml", "[ports]\nweb = 0\n");
+    f.commit(".fast-worktree.toml", "[[post_add]]\nrun = \"portool sync --quiet && portool check\"\n[[pre_remove]]\nrun = \"portool release\"\n");
+    assert!(allocations().is_empty());
+    let store = f.store();
+    let manifest = f.capture_commit(&store, "HEAD");
+    let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
+    let ws = f.workspaces(&fw);
+    let repo = f.clone_of(&ws);
+    f.deliver(&store, &repo, &manifest);
+    let create = || {
+        ws.create(&AttemptId::generate(), &store, &manifest, Some(&repo))
+            .unwrap()
+    };
+    let first = create();
+    let second = create();
+    let roots = [
+        first.root.canonicalize().unwrap(),
+        second.root.canonicalize().unwrap(),
+    ];
+    assert_eq!(allocations(), roots.clone().into_iter().collect());
+    ws.remove(&first).unwrap();
+    assert!(!first.root.exists());
+    assert_eq!(allocations(), [roots[1].clone()].into_iter().collect());
+    ws.remove(&second).unwrap();
+    assert!(allocations().is_empty());
+}
+
 fn common_home() -> PathBuf {
     // a home for the stand-in checks that never exists: only the PATH matters
     PathBuf::from("/nonexistent-home")
