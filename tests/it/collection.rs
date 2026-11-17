@@ -4849,6 +4849,7 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     assert_eq!(fx.w.payload(&placed[0]).ci_task.unwrap().task_id, discovery);
     assert!(c.store().attempts_of_task(&task_id).unwrap().is_empty());
     let listing = WorkerListing {
+        setup_ms: None,
         step: steps[0].clone(),
         runner_version: "30.2".into(),
         discovered: listed(&["a.js", "b.js", "c.js", "d.js"]),

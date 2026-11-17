@@ -86,6 +86,7 @@ fn browser_shards_require_a_fixture_isolation_declaration() {
     let f = fixture(&WORKFLOW.replace("npx jest", "npx cypress run"));
     let step = candidates(&f.plan).pop().unwrap();
     let listing = WorkerListing {
+        setup_ms: None,
         step,
         runner_version: "13.0.0".into(),
         discovered: Discovered {

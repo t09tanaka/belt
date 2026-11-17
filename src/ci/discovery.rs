@@ -163,6 +163,9 @@ fn adapter(
 pub struct WorkerListing {
     pub step: DiscoveryStep,
     pub runner_version: String,
+    /// Lower bound on repeated preparation work, excluding admission waits.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_ms: Option<u64>,
     pub discovered: Discovered,
 }
 
@@ -197,6 +200,7 @@ impl DiscoveryStep {
         Ok(WorkerListing {
             step: self,
             runner_version: version,
+            setup_ms: None,
             discovered,
         })
     }
@@ -240,7 +244,11 @@ impl WorkerListing {
                 ..Default::default()
             };
         }
-        let partition = partition_tests(runner.as_ref(), &discovered, history, count, costs);
+        let mut costs = costs.clone();
+        costs.fixed_cost_ms = costs
+            .fixed_cost_ms
+            .saturating_add(self.setup_ms.unwrap_or(0));
+        let partition = partition_tests(runner.as_ref(), &discovered, history, count, &costs);
         Ok(ShardRequest {
             workflow: self.step.workflow.clone(),
             job: self.step.job.clone(),

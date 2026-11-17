@@ -63,6 +63,7 @@ impl DiscoveryStep {
         WorkerListing {
             step: self,
             runner_version: "unavailable".into(),
+            setup_ms: None,
             discovered: Discovered {
                 blocked: vec![NotSplit::DiscoveryFailed],
                 ..Default::default()
@@ -112,7 +113,17 @@ impl DiscoveryStep {
         }
         // The supervisor tees both streams into the one step log. The cargo
         // adapter counts harness summaries in stdout and target lines in stderr.
-        self.parse_listing(
+        let setup_ms = result.jobs.first().and_then(|job| {
+            let elapsed: f64 = job
+                .steps
+                .get(..self.step)?
+                .iter()
+                .map(|step| step.secs)
+                .sum();
+            let wait = job.time.as_ref()?.wait_queue_secs;
+            preparation_ms(elapsed, wait)
+        });
+        let mut listing = self.parse_listing(
             plan,
             workspace,
             version.to_owned(),
@@ -122,6 +133,29 @@ impl DiscoveryStep {
                 success: true,
                 exit: Some(0),
             },
-        )
+        )?;
+        listing.setup_ms = setup_ms;
+        Ok(listing)
+    }
+}
+
+// Only a job-wide admission wait is available. Subtracting all of it gives
+// a lower bound on the preparation work repeated by each shard.
+fn preparation_ms(elapsed: f64, wait: f64) -> Option<u64> {
+    let elapsed = std::time::Duration::try_from_secs_f64(elapsed).ok()?;
+    let wait = std::time::Duration::try_from_secs_f64(wait).ok()?;
+    elapsed.saturating_sub(wait).as_millis().try_into().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preparation_ms;
+
+    #[test]
+    fn preparation_excludes_admission_wait_and_rejects_invalid_measurements() {
+        assert_eq!(preparation_ms(2.5, 1.25), Some(1250));
+        assert_eq!(preparation_ms(2.0, 3.0), Some(0));
+        assert_eq!(preparation_ms(f64::NAN, 0.0), None);
+        assert_eq!(preparation_ms(0.0, -1.0), None);
     }
 }
