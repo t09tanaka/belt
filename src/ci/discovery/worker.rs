@@ -91,7 +91,7 @@ impl DiscoveryStep {
         let Some(version) = step_log(self.step, 4096) else {
             return Ok(self.failed());
         };
-        let Some(list) = step_log(self.step + 1, super::advance::MAX_RESULT_BYTES) else {
+        let Some(list) = step_log(self.step + 1, crate::ci::advance::MAX_RESULT_BYTES) else {
             return Ok(self.failed());
         };
         let version = version.trim();

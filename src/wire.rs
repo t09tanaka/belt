@@ -2349,7 +2349,7 @@ mod tests {
             schema_version: SV,
             request_id: rid(),
             coordinator_epoch: CoordinatorEpoch(3),
-            attempt_id: aid(),
+            attempt_id: AttemptId::generate(),
             generation: Generation(1),
             command: WorkflowArtifactCommand::Poll,
         }));
