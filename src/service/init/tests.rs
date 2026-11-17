@@ -133,6 +133,20 @@ fn destination_links_and_unsafe_permissions_refuse() {
     assert!(Proof::read(&t.path().join("link")).is_err());
 }
 
+#[test]
+fn directories_are_never_created_through_a_symlinked_ancestor() {
+    let t = crate::test_tmp::tempdir().unwrap();
+    let real = t.path().join("real");
+    fs::create_dir(&real).unwrap();
+    let alias = t.path().join("alias");
+    std::os::unix::fs::symlink(&real, &alias).unwrap();
+    assert!(private_dir(&alias.join("state")).is_err());
+    assert!(private_dir(&alias.join("nested/state")).is_err());
+    assert_eq!(fs::read_dir(&real).unwrap().count(), 0);
+    private_dir(&real.join("nested/state")).unwrap();
+    assert!(private_dir(&alias.join("nested/state")).is_err());
+}
+
 #[tokio::test]
 async fn journal_recovers_before_and_after_no_replace_publication() {
     for already_published in [false, true] {

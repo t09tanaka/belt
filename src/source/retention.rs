@@ -3767,6 +3767,98 @@ mod tests {
             assert!(v.load(&active, &[], &k).is_ok());
         }
         #[test]
+        fn vault_page_recovers_crashed_publication_despite_holds_and_then_claims() {
+            let (f, r, v, k) = prepared();
+            let secrets = f.state.join("secrets");
+            let bundle = secrets.join(format!("{r}.json"));
+            let bytes = std::fs::read(&bundle).unwrap();
+            let tmp =
+                |published: &str| secrets.join(format!(".{published}.{}.tmp", ulid::Ulid::new()));
+            // The parent died after linking the bundle and before unlinking
+            // the temporary name, and once more before linking another one.
+            let linked = tmp(&format!("{r}.json"));
+            std::fs::hard_link(&bundle, &linked).unwrap();
+            let unpublished = tmp(&format!("{}.json", RunId::generate()));
+            std::fs::write(&unpublished, b"TOKEN=never-published-fixture\n").unwrap();
+            std::fs::set_permissions(&unpublished, std::fs::Permissions::from_mode(0o600)).unwrap();
+            let link = tmp(&format!("{r}.json"));
+            std::os::unix::fs::symlink(f.input.join(".env"), &link).unwrap();
+            assert!(!v.has(&r));
+            assert!(v.load(&r, &entries(&f, &r), &k).is_err());
+            let mut c = VaultCursor::default();
+            // A reader of the Vault keeps the page, and the sweep, away.
+            let reader = v.lease(false).unwrap();
+            let page = tick(&f, &v, &k, &mut c, 100, 10);
+            assert!(page.busy);
+            assert_eq!(page.tmp_removed, 0);
+            assert!(linked.exists() && unpublished.exists());
+            drop(reader);
+            // The first sample always holds the clock; recovery does not wait for it.
+            let page = tick(&f, &v, &k, &mut c, 100, 10);
+            assert!(page.held);
+            assert_eq!(
+                (page.tmp_removed, page.unknown, page.claimed, page.removed),
+                (2, 1, 0, 0)
+            );
+            assert!(!linked.exists() && !unpublished.exists());
+            assert!(std::fs::symlink_metadata(&link).is_ok());
+            assert_eq!(
+                std::fs::read(f.input.join(".env")).unwrap(),
+                b"TOKEN=original-private-fixture\n"
+            );
+            assert_eq!(std::fs::read(&bundle).unwrap(), bytes);
+            assert!(v.has(&r));
+            assert_eq!(v.load(&r, &entries(&f, &r), &k).unwrap().files.len(), 1);
+            // Readable again, the terminal run's copy is claimed and erased as usual.
+            let page = tick(&f, &v, &k, &mut c, 101, 11);
+            assert_eq!(
+                (page.tmp_removed, page.unknown, page.claimed, page.removed),
+                (0, 1, 1, 1)
+            );
+            assert!(!bundle.exists());
+            assert!(std::fs::symlink_metadata(&link).is_ok());
+        }
+        #[test]
+        fn vault_symlinked_state_ancestor_holds_the_page_and_keeps_every_file() {
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            let orphan = f
+                .state
+                .join("secrets")
+                .join(format!(".{r}.json.{}.tmp", ulid::Ulid::new()));
+            std::fs::write(&orphan, b"TOKEN=never-published-fixture\n").unwrap();
+            std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o600)).unwrap();
+            // After startup the state directory becomes reachable only through a link.
+            let moved = f.state.with_extension("saved");
+            std::fs::rename(&f.state, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &f.state).unwrap();
+            assert!(f
+                .store
+                .vault_retention_page(&f.owner, &v, &k, &mut c, 101, 11, Some("boot".into()))
+                .is_err());
+            let bundle = moved.join("secrets").join(format!("{r}.json"));
+            assert!(bundle.exists());
+            assert!(moved
+                .join("secrets")
+                .join(orphan.file_name().unwrap())
+                .exists());
+            // Restoring the real directory resumes on the next page.
+            std::fs::remove_file(&f.state).unwrap();
+            std::fs::rename(&moved, &f.state).unwrap();
+            let db = f.store.retention.connect().unwrap();
+            assert_eq!(
+                db.query_row("SELECT count(*) FROM vault_delete_claim", [], |r| r
+                    .get::<_, u32>(0))
+                    .unwrap(),
+                0
+            );
+            drop(db);
+            let page = tick(&f, &v, &k, &mut c, 101, 11);
+            assert_eq!((page.tmp_removed, page.claimed, page.removed), (1, 1, 1));
+            assert!(!orphan.exists());
+        }
+        #[test]
         fn vault_secret_free_terminal_run_keeps_source_only_retry_available() {
             let f = Fixture::new();
             let r = RunId::generate();

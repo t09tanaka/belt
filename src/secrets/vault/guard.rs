@@ -21,6 +21,29 @@ pub(crate) struct Lease {
     root: Arc<File>,
     path: PathBuf,
     lock: File,
+    exclusive: bool,
+}
+/// What one bounded sweep of crashed publications did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct TmpSweep {
+    /// Orphaned temporaries unlinked.
+    pub(crate) removed: u32,
+    /// Entries named like a temporary that are not provably one of ours
+    /// (a link, a directory, another owner or mode, an unrelated hard link).
+    pub(crate) retained: u32,
+}
+/// The name a publication temporary `.<published>.<ulid>.tmp` was going to be
+/// published as. Only the two names `publish` is ever called with qualify: a
+/// run bundle and the parent registration.
+fn orphan_tmp_target(name: &str) -> Option<&str> {
+    let body = name.strip_prefix('.')?.strip_suffix(".tmp")?;
+    let (published, id) = body.rsplit_once('.')?;
+    ulid::Ulid::from_string(id).ok()?;
+    let known = published == "parent-retention.json"
+        || published
+            .strip_suffix(".json")
+            .is_some_and(|run| RunId::parse(run).is_ok());
+    known.then_some(published)
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -108,6 +131,7 @@ impl Lease {
             root,
             path: path.into(),
             lock,
+            exclusive,
         };
         lease.current()?;
         let named = rustix::fs::statat(&*lease.root, "retention.lock", AtFlags::SYMLINK_NOFOLLOW)?;
@@ -317,6 +341,62 @@ impl Lease {
             let _ = rustix::fs::unlinkat(&*self.root, tmp.as_str(), AtFlags::empty());
         }
         result
+    }
+    /// Unlink what a `publish` that died left behind: at most `limit`
+    /// plaintext temporaries per call. Every temporary of this directory is
+    /// created and removed by a `publish` holding a lease, so under the
+    /// exclusive lease none belongs to a live writer and no age or clock is
+    /// consulted. A crash after the link and before the unlink leaves the
+    /// published file with two links, which every reader refuses; removing
+    /// the temporary name restores it. A temporary is never published here.
+    pub(crate) fn sweep_orphan_tmp(&self, limit: u32) -> anyhow::Result<TmpSweep> {
+        ensure!(
+            self.exclusive,
+            "Vault temporary sweep requires exclusive ownership"
+        );
+        self.current()?;
+        let euid = rustix::process::geteuid().as_raw();
+        // Names first: unlinking while a directory stream is open may skip entries.
+        let mut names = Vec::new();
+        for entry in rustix::fs::Dir::read_from(&*self.root)? {
+            let entry = entry?;
+            if let Ok(name) = entry.file_name().to_str() {
+                if orphan_tmp_target(name).is_some() {
+                    names.push(name.to_owned());
+                }
+            }
+        }
+        names.sort();
+        let mut sweep = TmpSweep::default();
+        for name in names {
+            let published = orphan_tmp_target(&name).context("Vault temporary name")?;
+            let stat = rustix::fs::statat(&*self.root, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            let ours = stat.st_mode as u32 & 0o170000 == 0o100000
+                && stat.st_uid == euid
+                && stat.st_mode as u32 & 0o7777 == 0o600;
+            let orphan = ours
+                && match stat.st_nlink as u64 {
+                    1 => true,
+                    // Only the publication this temporary was linked to.
+                    2 => rustix::fs::statat(&*self.root, published, AtFlags::SYMLINK_NOFOLLOW)
+                        .is_ok_and(|p| (p.st_dev, p.st_ino) == (stat.st_dev, stat.st_ino)),
+                    _ => false,
+                };
+            if !orphan {
+                sweep.retained += 1;
+                continue;
+            }
+            if sweep.removed == limit {
+                break;
+            }
+            rustix::fs::unlinkat(&*self.root, name.as_str(), AtFlags::empty())
+                .context("unlink orphaned Vault temporary")?;
+            sweep.removed += 1;
+        }
+        if sweep.removed > 0 {
+            self.root.sync_all()?;
+        }
+        Ok(sweep)
     }
     pub(crate) fn register(
         &self,
@@ -585,5 +665,134 @@ mod tests {
         drop(lease);
         assert!(v.lease(true).is_ok());
         drop(inherited);
+    }
+    fn private_file(path: &std::path::Path, bytes: &[u8]) {
+        std::fs::write(path, bytes).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    fn tmp_name(published: &str) -> String {
+        format!(".{published}.{}.tmp", ulid::Ulid::new())
+    }
+    #[test]
+    fn orphan_tmp_target_accepts_only_publication_temporaries() {
+        let run = RunId::generate();
+        let id = ulid::Ulid::new();
+        let bundle = format!("{run}.json");
+        assert_eq!(
+            orphan_tmp_target(&format!(".{bundle}.{id}.tmp")),
+            Some(bundle.as_str())
+        );
+        assert_eq!(
+            orphan_tmp_target(&format!(".parent-retention.json.{id}.tmp")),
+            Some("parent-retention.json")
+        );
+        for other in [
+            format!("{bundle}.{id}.tmp"),
+            format!(".{bundle}.{id}"),
+            format!(".{bundle}.{id}.tmp2"),
+            format!(".{bundle}.not-a-ulid.tmp"),
+            format!(".{bundle}.tmp"),
+            format!(".{run}.{id}.tmp"),
+            format!(".{run}.txt.{id}.tmp"),
+            format!(".other.json.{id}.tmp"),
+            format!(".retention.lock.{id}.tmp"),
+            format!(".{id}.tmp"),
+            ".tmp".into(),
+            bundle.clone(),
+        ] {
+            assert_eq!(orphan_tmp_target(&other), None, "{other}");
+        }
+    }
+    #[test]
+    fn orphan_sweep_recovers_a_publication_that_died_before_or_after_the_link() {
+        let (_tmp, v, r) = fixture();
+        let bundle = format!("{r}.json");
+        // Died before the link: plaintext that was never published.
+        let unpublished = v.dir.join(tmp_name(&format!("{}.json", RunId::generate())));
+        private_file(&unpublished, b"never-published-private");
+        // Died after the link and before the unlink: one inode, two names.
+        let linked = v.dir.join(tmp_name(&bundle));
+        std::fs::hard_link(v.path(&r), &linked).unwrap();
+        assert!(!v.has(&r));
+        let shared = v.lease(false).unwrap();
+        assert!(shared.bundle(&r).is_err());
+        // A shared holder cannot prove that no writer is alive.
+        assert!(shared.sweep_orphan_tmp(32).is_err());
+        assert!(unpublished.exists() && linked.exists());
+        drop(shared);
+        let lease = v.lease(true).unwrap();
+        assert_eq!(
+            lease.sweep_orphan_tmp(32).unwrap(),
+            TmpSweep {
+                removed: 2,
+                retained: 0
+            }
+        );
+        assert!(!unpublished.exists() && !linked.exists());
+        assert_eq!(lease.bundle(&r).unwrap().unwrap(), b"owned-fixture");
+        assert_eq!(lease.sweep_orphan_tmp(32).unwrap(), TmpSweep::default());
+        drop(lease);
+        assert!(v.has(&r));
+        let mut names: Vec<_> = std::fs::read_dir(&v.dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        assert_eq!(names, ["retention.lock".to_string(), bundle]);
+    }
+    #[test]
+    fn orphan_sweep_retains_whatever_is_not_provably_a_dead_publication() {
+        let (tmp, v, r) = fixture();
+        let bundle = format!("{r}.json");
+        let outside = tmp.path().join("outside");
+        private_file(&outside, b"outside-private");
+        // A link named like a temporary is neither followed nor removed.
+        let link = v.dir.join(tmp_name(&bundle));
+        std::os::unix::fs::symlink(&outside, &link).unwrap();
+        let directory = v.dir.join(tmp_name(&bundle));
+        std::fs::create_dir(&directory).unwrap();
+        // Two links, but the other name is not this temporary's publication.
+        let foreign = v.dir.join(tmp_name(&bundle));
+        std::fs::hard_link(&outside, &foreign).unwrap();
+        // Linked to a publication of another name.
+        let other = v.dir.join(tmp_name(&format!("{}.json", RunId::generate())));
+        std::fs::hard_link(v.path(&r), &other).unwrap();
+        let readable = v.dir.join(tmp_name(&format!("{}.json", RunId::generate())));
+        std::fs::write(&readable, b"shared-mode").unwrap();
+        std::fs::set_permissions(&readable, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // Not a publication temporary at all: not even counted.
+        let unrelated = v.dir.join(".unrelated.tmp");
+        private_file(&unrelated, b"unrelated");
+        let lease = v.lease(true).unwrap();
+        assert_eq!(
+            lease.sweep_orphan_tmp(32).unwrap(),
+            TmpSweep {
+                removed: 0,
+                retained: 5
+            }
+        );
+        for kept in [&link, &directory, &foreign, &other, &readable, &unrelated] {
+            assert!(std::fs::symlink_metadata(kept).is_ok(), "{kept:?}");
+        }
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside-private");
+        assert_eq!(std::fs::read(v.path(&r)).unwrap(), b"owned-fixture");
+        // The three-name inode is still refused: nothing was promoted or repaired.
+        assert!(lease.bundle(&r).is_err());
+    }
+    #[test]
+    fn orphan_sweep_is_bounded_per_call_and_resumes() {
+        let (_tmp, v, r) = fixture();
+        for _ in 0..33 {
+            private_file(
+                &v.dir.join(tmp_name(&format!("{}.json", RunId::generate()))),
+                b"never-published-private",
+            );
+        }
+        let lease = v.lease(true).unwrap();
+        assert_eq!(lease.sweep_orphan_tmp(32).unwrap().removed, 32);
+        assert_eq!(std::fs::read_dir(&v.dir).unwrap().count(), 3);
+        assert_eq!(lease.sweep_orphan_tmp(32).unwrap().removed, 1);
+        assert_eq!(lease.sweep_orphan_tmp(0).unwrap(), TmpSweep::default());
+        assert_eq!(lease.bundle(&r).unwrap().unwrap(), b"owned-fixture");
     }
 }
