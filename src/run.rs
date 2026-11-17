@@ -327,6 +327,46 @@ fn repo_key(ctx: &ExecContext, root: &std::path::Path) -> String {
     format!("{name}-{:08x}", h.finish() as u32)
 }
 
+/// The repository to post a commit status to, from origin's URL: `Ok(slug)`
+/// only when origin is on github.com, or on `gh_host` (the `GH_HOST` value, if
+/// set). Any other host, or no host (a local path), is `Err` with the reason:
+/// `owner/name` of another host is not a repository on GitHub.
+fn status_target(origin_url: Option<&str>, gh_host: Option<&str>) -> Result<String, String> {
+    let Some(url) = origin_url else {
+        return Err("no origin remote".into());
+    };
+    let Some((host, slug)) = git::remote_host_and_slug(url) else {
+        return Err("origin is not a remote with a host (a local path?); not posting".into());
+    };
+    let allowed = match gh_host.map(str::trim).filter(|h| !h.is_empty()) {
+        Some(h) => h.to_ascii_lowercase(),
+        None => "github.com".to_string(),
+    };
+    if host == allowed {
+        Ok(slug)
+    } else {
+        Err(format!(
+            "origin host {host} is not {allowed}; not posting a commit status (set GH_HOST to post to a GitHub Enterprise host)"
+        ))
+    }
+}
+
+/// What a failed `gh api` status post means. Only GitHub's "No commit found"
+/// reply says the commit is not there yet; any other 422 is a real error.
+fn status_failure(sha: &str, output: &str) -> String {
+    if output.contains("No commit found") {
+        format!(
+            "{} is not on GitHub yet; run `local-ci status` after pushing",
+            &sha[..7.min(sha.len())]
+        )
+    } else {
+        format!(
+            "gh api failed: {}",
+            output.lines().next().unwrap_or("").trim()
+        )
+    }
+}
+
 /// Post the `local-ci` commit status with gh. Err explains why it was not posted.
 pub fn post_status(
     ctx: &ExecContext,
@@ -335,7 +375,11 @@ pub fn post_status(
     state: &str,
     description: &str,
 ) -> Result<()> {
-    let slug = git::repo_slug(ctx, root).context("no origin remote")?;
+    let slug = status_target(
+        git::origin_url(ctx, root).as_deref(),
+        ctx.env().get("GH_HOST").map(String::as_str),
+    )
+    .map_err(|e| anyhow::anyhow!(e))?;
     let gh = ctx.find_tool("gh").context("gh is not installed")?;
     let out = ctx
         .command(gh)
@@ -355,13 +399,7 @@ pub fn post_status(
     }
     let err =
         String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
-    if err.contains("No commit found") || err.contains("422") {
-        bail!(
-            "{} is not on GitHub yet; run `local-ci status` after pushing",
-            &sha[..7]
-        );
-    }
-    bail!("gh api failed: {}", err.lines().next().unwrap_or("").trim())
+    bail!("{}", status_failure(sha, &err))
 }
 
 /// A new directory for a run of `sha7` started at `stamp`: `<stamp>-<sha7>`,
@@ -948,6 +986,52 @@ pub fn status(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn status_target_host_rules() {
+        let t = |u: &str, h: Option<&str>| status_target(Some(u), h);
+        assert_eq!(t("git@github.com:o/n.git", None), Ok("o/n".to_string()));
+        assert_eq!(t("https://GitHub.com/o/n", Some("")), Ok("o/n".to_string()));
+        assert!(t("git@gitlab.com:o/n.git", None)
+            .unwrap_err()
+            .contains("gitlab.com"));
+        assert!(t("https://ghe.example.com/o/n", None).is_err());
+        assert_eq!(
+            t("https://ghe.example.com/o/n", Some("ghe.example.com")),
+            Ok("o/n".to_string())
+        );
+        assert_eq!(
+            t("git@GHE.example.com:o/n", Some("ghe.example.com")),
+            Ok("o/n".to_string())
+        );
+        // GH_HOST names another host: github.com is not the target any more
+        assert!(t("git@github.com:o/n", Some("ghe.example.com")).is_err());
+        assert!(t("/srv/git/o/n.git", None)
+            .unwrap_err()
+            .contains("local path"));
+        assert!(t("/srv/git/o/n.git", Some("github.com")).is_err());
+        assert_eq!(status_target(None, None), Err("no origin remote".into()));
+    }
+
+    #[test]
+    fn status_failure_only_no_commit_found_is_not_on_github() {
+        let sha = "0123456789abcdef";
+        let m = status_failure(sha, "gh: No commit found for SHA: 0123456 (HTTP 422)\n");
+        assert_eq!(
+            m,
+            "0123456 is not on GitHub yet; run `local-ci status` after pushing"
+        );
+        assert_eq!(
+            status_failure(sha, "{\"message\":\"No commit found for SHA\"}"),
+            m
+        );
+        let other = status_failure(sha, "gh: Validation Failed (HTTP 422)\nmore");
+        assert_eq!(other, "gh api failed: gh: Validation Failed (HTTP 422)");
+        assert_eq!(
+            status_failure(sha, "HTTP 500 body mentions 422 in passing"),
+            "gh api failed: HTTP 500 body mentions 422 in passing"
+        );
+    }
+
     use super::*;
 
     #[test]
