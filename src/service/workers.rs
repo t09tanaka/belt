@@ -969,7 +969,16 @@ pub enum InstallError {
 /// ([`warmup::ResidentWarmup`]) asks the running resident, which asks the
 /// worker over the link it already holds.
 pub trait Installer {
-    fn install(&mut self, worker: &str, step: &InstallStep) -> Result<(), InstallError>;
+    fn install(&mut self, worker: &str, step: &InstallStep) -> Result<Installed, InstallError>;
+}
+
+/// What an install that did not fail did on the worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Installed {
+    /// It installed the version.
+    Now,
+    /// The worker had the version already and did nothing.
+    Already,
 }
 
 #[derive(Debug, Serialize)]
@@ -1083,11 +1092,19 @@ pub fn sync_measured(
 ) -> Result<SyncResult, ApiError> {
     let worker = measure()?;
     let first = envsync::plan(parent, &worker, project);
+    // What this sync installed, and every step the worker now says it has
+    // (a version it had already is there, but was not installed here).
     let mut installed = Vec::new();
+    let mut settled = Vec::new();
     let mut blocked = Vec::new();
     for step in &first.install {
         match installer.install(name, step) {
-            Ok(()) => installed.push(step.clone()),
+            Ok(how) => {
+                if how == Installed::Now {
+                    installed.push(step.clone());
+                }
+                settled.push(step.clone());
+            }
             Err(InstallError::Failed(reason)) => blocked.push(Blocked {
                 subject: step.tool.clone(),
                 missing: format!("{} {} was not installed", step.tool, step.version),
@@ -1102,17 +1119,18 @@ pub fn sync_measured(
             }
         }
     }
-    let last = if installed.is_empty() {
+    let last = if settled.is_empty() {
         blocked.extend(first.blocked);
         worker
     } else {
-        // Look again: what was installed must now be there. If the worker
-        // cannot be measured, what was installed so far is still said.
+        // Look again: what the worker says it has must now be there, whether
+        // it was installed here or not. If the worker cannot be measured,
+        // what was installed so far is still said.
         let after = measure().map_err(|e| {
             after_installing(&installed, "the worker could not be measured afterwards", e)
         })?;
         blocked.extend(envsync::verify(
-            &installed,
+            &settled,
             envsync::plan(parent, &after, project),
         ));
         after

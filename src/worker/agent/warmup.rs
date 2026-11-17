@@ -11,6 +11,14 @@
 //! A request never waits for an install. It answers `pending`, and the
 //! coordinator asks again with the same `sync_id`. A warm-up nobody asks
 //! about any more is released by the agent's tick.
+//!
+//! A request does not wait long for the look either. The look (the registry,
+//! receipts, the setup owner) runs on its own thread, one per `sync_id` at a
+//! time and outside the lock of the warm-ups. The request that started it
+//! waits `LOOK_WAIT` for it; a request that finds one under way answers at
+//! once from what is known. A coordinator that gave up on a slow answer and
+//! asks again therefore queues nothing here, and what the slow look found is
+//! kept for the next request.
 
 use super::*;
 use crate::toolchain::preparation::{PreparationRequest, ToolPreparationPoll};
@@ -19,6 +27,9 @@ use crate::toolchain::versions::ToolId;
 
 /// Warm-ups remembered at once; a new one beyond that is refused.
 const MAX_WARMUPS: usize = 16;
+/// How long a request waits for the look it started. Well under the time the
+/// coordinator waits for the answer.
+const LOOK_WAIT: std::time::Duration = std::time::Duration::from_millis(1_500);
 
 pub(super) struct Warmup {
     /// What holds the reference to the installs of this warm-up.
@@ -33,6 +44,42 @@ pub(super) struct Warmup {
     /// Decided outcomes, repeated to a later poll.
     done: BTreeMap<String, ToolSyncResult>,
     released: bool,
+    /// A look is under way on its own thread. No second one is started, and
+    /// the warm-up is not forgotten under it.
+    looking: bool,
+}
+
+/// What a request is answered from: what is decided, the rest `pending`.
+fn known(warmup: &Warmup) -> Vec<ToolSyncResult> {
+    warmup
+        .tools
+        .iter()
+        .map(|tool| {
+            warmup
+                .done
+                .get(&tool.name)
+                .cloned()
+                .unwrap_or_else(|| result(&tool.name, (SyncOutcome::Pending, None)))
+        })
+        .collect()
+}
+
+/// Whether a warm-up last asked about at `asked_ms` is kept at `now`.
+fn kept(looking: bool, asked_ms: u64, now: u64, idle: u64) -> bool {
+    looking || now.saturating_sub(asked_ms) < idle
+}
+
+/// Ends the look when its thread ends, however it ends.
+struct Looking {
+    agent: Arc<Agent>,
+    id: String,
+}
+impl Drop for Looking {
+    fn drop(&mut self) {
+        if let Some(warmup) = lock(&self.agent.warmups).get_mut(&self.id) {
+            warmup.looking = false;
+        }
+    }
 }
 
 /// Why this worker will not install the version, for a person.
@@ -98,7 +145,10 @@ fn result(name: &str, (outcome, message): (SyncOutcome, Option<String>)) -> Tool
 }
 
 impl Agent {
-    pub(super) fn env_sync(&self, r: EnvSyncRequest) -> Result<EnvSyncResponse, ApiError> {
+    pub(super) fn env_sync(
+        self: &Arc<Self>,
+        r: EnvSyncRequest,
+    ) -> Result<EnvSyncResponse, ApiError> {
         if r.tools.len() > MAX_ENV_SYNC_TOOLS {
             return Err(invalid("env_sync names too many tools"));
         }
@@ -151,81 +201,142 @@ impl Agent {
         })
     }
 
-    fn warm_up(&self, r: &EnvSyncRequest) -> Result<Vec<ToolSyncResult>, ApiError> {
+    fn warm_up(self: &Arc<Self>, r: &EnvSyncRequest) -> Result<Vec<ToolSyncResult>, ApiError> {
         let now = platform::monotonic_ms();
-        // One warm-up request at a time: a look reads receipts, it never
-        // waits for an install.
-        let mut warmups = lock(&self.warmups);
-        self.reap_warmups_locked(&mut warmups, now);
         let id = r.sync_id.to_string();
-        if !warmups.contains_key(&id) {
-            if self.stopping() {
+        {
+            let mut warmups = lock(&self.warmups);
+            self.reap_warmups_locked(&mut warmups, now);
+            if !warmups.contains_key(&id) {
+                if self.stopping() {
+                    // Not `OVERLOADED`: asking again does not help, and the
+                    // coordinator must say so instead of waiting.
+                    return Err(ApiError::new(
+                        ErrorCode::Conflict,
+                        "the worker is stopping; no install is started",
+                    ));
+                }
+                if warmups.len() >= MAX_WARMUPS {
+                    return Err(ApiError::new(
+                        ErrorCode::Overloaded,
+                        "too many warm-ups are in progress on this worker",
+                    ));
+                }
+                warmups.insert(
+                    id.clone(),
+                    Warmup {
+                        consumer: AttemptId::generate(),
+                        tools: r.tools.clone(),
+                        begun_ms: now,
+                        asked_ms: now,
+                        waited: BTreeSet::new(),
+                        done: BTreeMap::new(),
+                        released: false,
+                        looking: false,
+                    },
+                );
+            }
+            let warmup = warmups.get_mut(&id).expect("inserted above");
+            if warmup.tools != r.tools {
                 return Err(ApiError::new(
-                    ErrorCode::Overloaded,
-                    "the worker is stopping; no install is started",
+                    ErrorCode::Conflict,
+                    "this sync_id was used for other tools",
                 ));
             }
-            if warmups.len() >= MAX_WARMUPS {
-                return Err(ApiError::new(
-                    ErrorCode::Overloaded,
-                    "too many warm-ups are in progress on this worker",
-                ));
+            warmup.asked_ms = now;
+            if warmup.looking || warmup.done.len() == warmup.tools.len() {
+                // A look is under way, or nothing is left to look at.
+                return Ok(known(warmup));
             }
-            warmups.insert(
-                id.clone(),
-                Warmup {
-                    consumer: AttemptId::generate(),
-                    tools: r.tools.clone(),
-                    begun_ms: now,
-                    asked_ms: now,
-                    waited: BTreeSet::new(),
-                    done: BTreeMap::new(),
-                    released: false,
-                },
-            );
+            warmup.looking = true;
         }
-        let warmup = warmups.get_mut(&id).expect("inserted above");
-        if warmup.tools != r.tools {
-            return Err(ApiError::new(
-                ErrorCode::Conflict,
-                "this sync_id was used for other tools",
-            ));
+        // Outside the lock: the guard takes it when it is dropped, also when
+        // the thread could not be started.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let looking = Looking {
+            agent: self.clone(),
+            id: id.clone(),
+        };
+        std::thread::Builder::new()
+            .name("warm-up".into())
+            .spawn(move || {
+                looking.agent.look(&looking.id);
+                drop(looking);
+                let _ = tx.send(());
+            })
+            .map_err(|e| internal("warm-up thread", e))?;
+        // Bounded: a slow look is answered `pending`, and goes on.
+        let _ = rx.recv_timeout(LOOK_WAIT);
+        match lock(&self.warmups).get(&id) {
+            Some(warmup) => Ok(known(warmup)),
+            None => Err(ApiError::new(
+                ErrorCode::CommunicationUnknown,
+                "the warm-up was forgotten while it was looked at",
+            )),
         }
-        warmup.asked_ms = now;
-        let timed_out = now.saturating_sub(warmup.begun_ms) >= self.cfg.prepare_timeout_ms;
-        let mut results = Vec::new();
-        for tool in &r.tools {
-            if let Some(done) = warmup.done.get(&tool.name) {
-                results.push(done.clone());
-                continue;
-            }
+    }
+
+    /// One look at what is undecided of the warm-up `id`, outside the lock.
+    fn look(&self, id: &str) {
+        let (consumer, todo, waited, begun_ms) = {
+            let warmups = lock(&self.warmups);
+            let Some(warmup) = warmups.get(id) else {
+                return;
+            };
+            let todo: Vec<ToolRequirement> = warmup
+                .tools
+                .iter()
+                .filter(|tool| !warmup.done.contains_key(&tool.name))
+                .cloned()
+                .collect();
+            (
+                warmup.consumer.clone(),
+                todo,
+                warmup.waited.clone(),
+                warmup.begun_ms,
+            )
+        };
+        let mut seen = Vec::with_capacity(todo.len());
+        for tool in &todo {
             let poll = request(self.toolchains.as_ref(), tool).and_then(|request| {
                 self.host
-                    .toolchain_poll(&warmup.consumer, &request)
+                    .toolchain_poll(&consumer, &request)
                     .map_err(|e| e.message)
             });
-            let waited = warmup.waited.contains(&tool.name);
-            let one = result(&tool.name, outcome(poll, waited, timed_out));
-            if one.outcome == SyncOutcome::Pending {
-                warmup.waited.insert(tool.name.clone());
-            } else {
-                warmup.done.insert(tool.name.clone(), one.clone());
-            }
-            results.push(one);
+            let timed_out =
+                platform::monotonic_ms().saturating_sub(begun_ms) >= self.cfg.prepare_timeout_ms;
+            seen.push(result(
+                &tool.name,
+                outcome(poll, waited.contains(&tool.name), timed_out),
+            ));
         }
-        if warmup.done.len() == r.tools.len() && !warmup.released {
+        let release = {
+            let mut warmups = lock(&self.warmups);
+            let Some(warmup) = warmups.get_mut(id) else {
+                return;
+            };
+            for one in seen {
+                if one.outcome == SyncOutcome::Pending {
+                    warmup.waited.insert(one.name.clone());
+                } else {
+                    warmup.done.insert(one.name.clone(), one);
+                }
+            }
             // Nothing is waited for any more (a timed-out install loses this
             // reference, and stops if it was the last one).
-            self.host.setup_release(&warmup.consumer);
-            warmup.released = true;
+            let release = warmup.done.len() == warmup.tools.len() && !warmup.released;
+            warmup.released |= release;
+            release
+        };
+        if release {
+            self.host.setup_release(&consumer);
         }
-        Ok(results)
     }
 
     fn reap_warmups_locked(&self, warmups: &mut BTreeMap<String, Warmup>, now: u64) {
         let idle = self.cfg.warmup_idle_ms;
         warmups.retain(|_, w| {
-            let keep = now.saturating_sub(w.asked_ms) < idle;
+            let keep = kept(w.looking, w.asked_ms, now, idle);
             if !keep && !w.released {
                 self.host.setup_release(&w.consumer);
             }
@@ -274,6 +385,47 @@ mod tests {
             outcome(Err("no recipe".into()), false, false),
             (SyncOutcome::Failed, Some("no recipe".into()))
         );
+    }
+
+    #[test]
+    fn an_answer_is_what_is_decided_and_pending_for_the_rest_in_the_order_asked() {
+        let tool = |name: &str| ToolRequirement {
+            name: name.into(),
+            version: "1.0.0".into(),
+        };
+        let failed = result("b", (SyncOutcome::Failed, Some("exit 19".into())));
+        let warmup = Warmup {
+            consumer: AttemptId::generate(),
+            tools: vec![tool("c"), tool("b"), tool("a")],
+            begun_ms: 0,
+            asked_ms: 0,
+            waited: BTreeSet::new(),
+            done: BTreeMap::from([("b".to_string(), failed.clone())]),
+            released: false,
+            looking: true,
+        };
+        assert_eq!(
+            known(&warmup),
+            vec![
+                result("c", (SyncOutcome::Pending, None)),
+                failed,
+                result("a", (SyncOutcome::Pending, None)),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_warm_up_is_kept_while_it_is_asked_about_or_looked_at() {
+        assert!(kept(false, 100, 100, 60));
+        assert!(kept(false, 100, 159, 60));
+        assert!(!kept(false, 100, 160, 60));
+        assert!(!kept(false, 100, 1_000, 60));
+        // A clock that went back is not "long ago".
+        assert!(kept(false, 100, 50, 60));
+        // Never forgotten under a look, however long nobody asked.
+        assert!(kept(true, 100, 1_000, 60));
+        assert!(!kept(false, 0, 0, 0));
+        assert!(kept(true, 0, 0, 0));
     }
 
     #[test]

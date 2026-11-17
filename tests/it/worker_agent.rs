@@ -64,6 +64,8 @@ struct DirHost {
     /// What `toolchain_poll` answers: `Some(None)` pending, `Some(Some(why))`
     /// failed. `None`: this host prepares no toolchains.
     tool_poll: Mutex<Option<Option<String>>>,
+    /// While set, `toolchain_poll` does not come back (a slow disk).
+    tool_poll_hold: AtomicBool,
 }
 
 type MaskHook = Box<dyn Fn(&AttemptId) + Send + Sync>;
@@ -177,6 +179,9 @@ impl Host for DirHost {
     ) -> Result<remote_task_runner::toolchain::preparation::ToolPreparationPoll, ApiError> {
         use remote_task_runner::toolchain::preparation::{PreparationFailure, ToolPreparationPoll};
         self.log(format!("tool_poll {a} {}", request.tool.as_str()));
+        while self.tool_poll_hold.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
         match self.tool_poll.lock().unwrap().clone() {
             None => Err(ApiError::new(ErrorCode::Internal, "no toolchains here")),
             Some(None) => Ok(ToolPreparationPoll::Pending),
@@ -285,6 +290,7 @@ pub(crate) fn fx() -> Fx {
         setup_pending: AtomicBool::new(false),
         setup_skip: Mutex::default(),
         tool_poll: Mutex::new(None),
+        tool_poll_hold: AtomicBool::new(false),
     });
     Fx {
         dir,
@@ -4760,13 +4766,21 @@ fn a_warm_up_nobody_asks_about_is_released_by_the_tick() {
     agent.tick();
     let first = f.host.tool_polls()[0].clone();
     assert_eq!(f.host.releases(), vec![first.clone()]);
-    // Released once; asking again is a new warm-up with its own consumer.
+    // Released once.
     agent.tick();
     assert_eq!(f.host.releases().len(), 1);
-    *f.host.tool_poll.lock().unwrap() = Some(Some("no".into()));
-    env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    // The parent was only cut off (a link that was down for longer than the
+    // idle time) and still asks with the same id: not an error, but a new
+    // warm-up of the same question with its own consumer, pending again.
+    let back = env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(back[0].outcome, SyncOutcome::Pending);
     let second = f.host.tool_polls()[1].clone();
     assert_ne!(second, first);
+    assert_eq!(f.host.releases().len(), 1, "the new one is waited for");
+    *f.host.tool_poll.lock().unwrap() = Some(Some("no".into()));
+    let decided = env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(decided[0].outcome, SyncOutcome::Failed);
+    assert_eq!(f.host.tool_polls()[2], second);
     // It was decided (failed), so its reference went then; forgetting it
     // later does not release it a second time.
     assert_eq!(f.host.releases(), vec![first.clone(), second.clone()]);
@@ -4802,7 +4816,85 @@ fn a_stopping_or_crowded_worker_starts_no_new_warm_up() {
         vec![tool("node", "20.0.0")],
     )
     .unwrap_err();
-    assert_eq!(error.code, ErrorCode::Overloaded);
+    // Not the code of "busy, ask again": the parent must stop and say so.
+    assert_eq!(error.code, ErrorCode::Conflict);
     assert!(error.message.contains("stopping"), "{}", error.message);
     assert_eq!(g.host.tool_polls().len(), 1);
+    // The one that was running is still answered.
+    let known = env_sync(&stopping, &running, vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(known[0].outcome, SyncOutcome::Pending);
+}
+
+#[test]
+fn a_slow_look_is_answered_pending_and_asking_meanwhile_starts_no_second_look() {
+    let (f, agent) = warm_fx(|cfg| cfg.warmup_idle_ms = 3_000);
+    *f.host.tool_poll.lock().unwrap() = Some(Some("the manager exited 19".into()));
+    f.host.tool_poll_hold.store(true, Ordering::SeqCst);
+    let sync = RequestId::generate();
+    let tools = || vec![tool("node", "20.0.0"), tool("python", "3.12.0")];
+    // The look does not come back: the request still does, with `pending`
+    // for everything that is not decided.
+    let first = env_sync(&agent, &sync, tools()).unwrap();
+    assert_eq!(first.len(), 2);
+    assert_eq!(first[0].name, "node");
+    assert!(first.iter().all(|r| r.outcome == SyncOutcome::Pending));
+    assert_eq!(f.host.tool_polls().len(), 1);
+    // Asked again while it hangs (the parent gave up on a slow answer and
+    // repeats): answered from what is known, and no second look is queued.
+    for _ in 0..5 {
+        let again = env_sync(&agent, &sync, tools()).unwrap();
+        assert!(again.iter().all(|r| r.outcome == SyncOutcome::Pending));
+    }
+    assert_eq!(f.host.tool_polls().len(), 1);
+    // Another warm-up is not held up by it: its own look starts.
+    let other = RequestId::generate();
+    env_sync(&agent, &other, vec![tool("node", "22.0.0")]).unwrap();
+    assert_eq!(f.host.tool_polls().len(), 2);
+    assert_ne!(f.host.tool_polls()[1], f.host.tool_polls()[0]);
+    // Nobody asks for longer than the idle time: a warm-up that is being
+    // looked at is not forgotten under the look (its consumer would be
+    // created again by the look, and never released).
+    std::thread::sleep(Duration::from_millis(3_200));
+    agent.tick();
+    let consumer = f.host.tool_polls()[0].clone();
+    assert!(!f.host.releases().contains(&consumer));
+    assert!(env_sync(&agent, &sync, tools())
+        .unwrap()
+        .iter()
+        .all(|r| r.outcome == SyncOutcome::Pending));
+    assert_eq!(
+        f.host
+            .tool_polls()
+            .iter()
+            .filter(|c| **c == consumer)
+            .count(),
+        1
+    );
+    // The look comes back: what it found is kept and answered, without
+    // looking again.
+    f.host.tool_poll_hold.store(false, Ordering::SeqCst);
+    let last = std::cell::RefCell::new(Vec::new());
+    wait_for("the slow look", || {
+        let seen = env_sync(&agent, &sync, tools()).unwrap();
+        let all = seen.iter().all(|r| r.outcome != SyncOutcome::Pending);
+        *last.borrow_mut() = seen;
+        all
+    });
+    let decided = last.into_inner();
+    assert_eq!(decided[0].outcome, SyncOutcome::Failed);
+    assert_eq!(decided[0].message.as_deref(), Some("the manager exited 19"));
+    assert_eq!(decided[1].outcome, SyncOutcome::Failed);
+    assert_eq!(
+        f.host
+            .tool_polls()
+            .iter()
+            .filter(|c| **c == consumer)
+            .count(),
+        1,
+        "the slow look's own answer must be the one that is kept"
+    );
+    assert_eq!(
+        f.host.releases().iter().filter(|c| **c == consumer).count(),
+        1
+    );
 }

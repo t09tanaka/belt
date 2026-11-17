@@ -1195,18 +1195,25 @@ mod sync {
         fail: Option<String>,
         /// Stops the sync at the install of this version.
         stop_at: Option<(String, ApiError)>,
+        /// The worker says it had the version already.
+        already: bool,
     }
     impl Installer for Recorder {
-        fn install(&mut self, worker: &str, step: &InstallStep) -> Result<(), InstallError> {
+        fn install(&mut self, worker: &str, step: &InstallStep) -> Result<Installed, InstallError> {
             self.calls.push((worker.into(), step.clone()));
             if let Some((version, error)) = &self.stop_at {
                 if *version == step.version {
                     return Err(InstallError::Stop(error.clone()));
                 }
             }
+            let how = if self.already {
+                Installed::Already
+            } else {
+                Installed::Now
+            };
             self.fail
                 .clone()
-                .map_or(Ok(()), |reason| Err(InstallError::Failed(reason)))
+                .map_or(Ok(how), |reason| Err(InstallError::Failed(reason)))
         }
     }
 
@@ -1249,6 +1256,51 @@ mod sync {
         assert_eq!(installer.calls[0].1.tool, "node");
         assert_eq!(installer.calls[0].1.version, "20.1.0");
         // Measured before and after, nothing else asked of the host.
+        assert_eq!(w.remote.log.len(), 2);
+    }
+
+    #[test]
+    fn a_version_the_worker_had_already_is_checked_again_and_not_said_to_be_installed() {
+        // The parent's measurement missed it; the worker says it is there.
+        let mut w = world();
+        w.remote.env_queue = [
+            worker("18.0.0", &["18.0.0"], Docker::Runnable),
+            worker("18.0.0", &["18.0.0", "20.1.0"], Docker::Runnable),
+        ]
+        .into();
+        let mut installer = Recorder {
+            already: true,
+            ..Recorder::default()
+        };
+        let done = run(&mut w, &mut installer, None).unwrap();
+        assert_eq!(installer.calls.len(), 1);
+        assert!(done.installed.is_empty(), "nothing was installed here");
+        assert!(!render_sync(&done, false).contains("installed"));
+        // Measured again all the same: what the worker says must be seen.
+        assert_eq!(w.remote.log.len(), 2);
+        // And when it is not seen afterwards, that is blocked, not success.
+        let mut w = world();
+        w.remote.env_queue = [
+            worker("18.0.0", &["18.0.0"], Docker::Runnable),
+            worker("18.0.0", &["18.0.0"], Docker::Runnable),
+        ]
+        .into();
+        let mut installer = Recorder {
+            already: true,
+            ..Recorder::default()
+        };
+        let error = run(&mut w, &mut installer, None).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Blocked);
+        assert!(
+            error.message.contains("node 20.1.0 is still missing"),
+            "{}",
+            error.message
+        );
+        assert!(
+            !error.message.contains("installed node"),
+            "{}",
+            error.message
+        );
         assert_eq!(w.remote.log.len(), 2);
     }
 
