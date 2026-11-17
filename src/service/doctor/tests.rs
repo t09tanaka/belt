@@ -137,6 +137,53 @@ fn the_command_scope_follows_xdg_and_falls_back_to_home() {
 }
 
 #[test]
+fn the_worker_scope_is_the_one_the_agent_gives_its_supervisors() {
+    // The environment the journal records at install decides the scope: what
+    // doctor looks at as the worker's is what the agent hands its supervisors
+    // and setup steps, whatever the variables are.
+    let host = Host::new();
+    let state_home = host.home.join("xdg-state");
+    let config_home = host.home.join("xdg-config");
+    let variants: [Vec<(&str, String)>; 4] = [
+        vec![],
+        vec![("XDG_STATE_HOME", state_home.display().to_string())],
+        vec![("XDG_CONFIG_HOME", config_home.display().to_string())],
+        vec![
+            ("XDG_STATE_HOME", state_home.display().to_string()),
+            ("XDG_CONFIG_HOME", config_home.display().to_string()),
+        ],
+    ];
+    for extra in variants {
+        let mut recorded = host.env.clone();
+        recorded.extend(extra.into_iter().map(|(k, v)| (k.to_string(), v)));
+        let config = crate::config::resolve(&crate::config::Inputs {
+            overlay: &crate::config::Overlay::default(),
+            project: None,
+            legacy: None,
+            user: None,
+        })
+        .unwrap();
+        let runtime = config
+            .worker_runtime(crate::config::runtime::WorkerInputs {
+                state_dir: host.state.clone(),
+                worker_id: WorkerId::parse("mini-a").unwrap(),
+                boot_id: crate::ids::WorkerBootId::parse("boot").unwrap(),
+                supervisor_exe: PathBuf::from("/bin/rtr"),
+                cluster_key_path: host.home.join("cluster.key"),
+                env: recorded.clone(),
+            })
+            .unwrap();
+        let (state, config_file) = worker_scope_paths(&recorded);
+        let agent = runtime.agent_config();
+        assert_eq!(state, agent.traffic_state_dir, "{recorded:?}");
+        assert_eq!(Some(&config_file), agent.traffic_config.as_ref());
+        let setup = runtime.setup_config();
+        assert_eq!(state, setup.traffic_state_dir);
+        assert_eq!(setup.traffic_config, agent.traffic_config);
+    }
+}
+
+#[test]
 fn the_policy_digest_is_the_one_task_traffic_controller_reports() {
     let h = Host::new();
     let state = h.state.join("traffic");
