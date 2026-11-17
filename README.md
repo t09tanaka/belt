@@ -221,7 +221,14 @@ Workflows outside `.github/workflows` are never seen as disabled on GitHub.
    seconds: `work_secs` (the job running: its services' start and its steps), `wait_lock_secs` (the
    per-repository lock), `wait_slot_secs` (one of the `--containers` slots),
    `wait_queue_secs` (task-traffic-controller letting a step start, summed over the steps) and
-   `wait_parallel_secs` (one of the `--parallel` places). The job's `secs`
+   `wait_parallel_secs` (one of the `--parallel` places). It also has absolute wall-clock
+   times in UNIX epoch milliseconds, to line a job up against other runs and the
+   task-traffic-controller ledger: `requested_at_ms` (the run began to handle the
+   job, before any lock, slot or parallel wait; for the jobs of a unit, when the
+   unit began to wait), `started_at_ms` (the job's own execution began) and
+   `finished_at_ms` (it ended), so that `requested_at_ms <= started_at_ms <=
+   finished_at_ms` and `finished_at_ms - started_at_ms` is about `work_secs +
+   wait_queue_secs`. They are 0 in a result written by an older version. The job's `secs`
    still counts from its first step and so includes `wait_queue_secs`; the
    other waits come before it. The waits of a unit before its jobs start go to
    its first job. Jobs that did not run, and reused results, have no `time`. Steps of a shell

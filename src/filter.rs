@@ -23,19 +23,22 @@ pub enum Decision {
 
 fn matcher(pat: &str) -> Option<GlobMatcher> {
     // GitHub lets `**` glue onto a name (`**.md`, `docs/**.md`); globset wants it as its own component.
+    // One pass over the places where `**` starts: no loop whose exit depends on
+    // an index that is moved by hand, so no edit of the arithmetic can make it
+    // endless.
     let mut p = String::new();
-    let mut rest = pat;
-    while let Some(i) = rest.find("**") {
-        p.push_str(&rest[..i]);
-        let after = &rest[i + 2..];
+    let mut from = 0;
+    for (i, _) in pat.match_indices("**") {
+        p.push_str(&pat[from..i]);
+        from = i + 2;
+        let after = &pat[from..];
         if after.is_empty() || after.starts_with('/') {
             p.push_str("**");
         } else {
             p.push_str("**/*");
         }
-        rest = after;
     }
-    p.push_str(rest);
+    p.push_str(&pat[from..]);
     GlobBuilder::new(&p)
         .literal_separator(true)
         .backslash_escape(true)
@@ -230,6 +233,21 @@ mod tests {
             changed: changed.iter().map(|s| s.to_string()).collect(),
             all: false,
         }
+    }
+
+    /// `**` glued onto a name becomes its own component wherever it sits in the
+    /// pattern, and every `**` of one pattern is handled.
+    #[test]
+    fn double_star_glued_to_a_name_is_its_own_component() {
+        let p = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let m = |pat: &str, path: &str| last_match(&p(&[pat]), path);
+        assert_eq!(m("docs/**.md", "docs/a/b.md"), Some(true));
+        assert_eq!(m("docs/**.md", "docs/b.md"), Some(true));
+        assert_eq!(m("docs/**.md", "docs/b.txt"), None);
+        assert_eq!(m("a/**b/**c", "a/x/b/y/c"), Some(true));
+        assert_eq!(m("a/**b/**c", "a/x/b/y/d"), None);
+        assert_eq!(m("a/**/**.md", "a/x/y/b.md"), Some(true));
+        assert_eq!(m("a/**/**.md", "a/x/y/b.txt"), None);
     }
 
     #[test]

@@ -158,12 +158,7 @@ jobs:
       - name: zero survivors in matrix / filter / source gate
         # two at a time: the unit tests that reach the matrix now include those
         # of the driver, and one test process at a time took three times as long
-        # 120 seconds for a mutant: one mutant of `filter::matcher` never ends and
-        # grows a string until it is stopped. The default is five times the whole
-        # baseline, which the tests of the driver made long enough (297s) for
-        # that mutant to use up the runner's memory. The slowest mutant that is
-        # caught takes under 30 seconds.
-        run: cargo schemata -j 2 -t 120 --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
+        run: cargo schemata -j 2 --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
 
   mutants-artifact:
     name: mutation gate (artifact)
@@ -253,11 +248,19 @@ jobs:
       - name: every target file has mutants
         run: scripts/mutation-targets-check.sh src/wire.rs src/result_wire.rs src/digest.rs
       - name: zero survivors in wire, result_wire and digest
-        run: cargo schemata --file src/wire.rs --file src/result_wire.rs --file src/digest.rs -E 'replace wire_version -> u32 with 1' -- --lib --test wire_api --test frozen_plan --test shard_plan --test job_dag
+        run: cargo schemata -j 2 --file src/wire.rs --file src/result_wire.rs --file src/digest.rs -E 'replace wire_version -> u32 with 1' -- --lib --test wire_api --test frozen_plan --test shard_plan --test job_dag
 
+  # The 300 mutants of these files take about 26 minutes in one process, almost
+  # all of it the tests that run for each of them. Three parts side by side
+  # (`--shard`, round-robin, so the slow mutants are spread) run every mutant
+  # exactly once; each part fails on its own survivors.
   mutants-driver:
-    name: mutation gate (driver and shared job evaluation)
+    name: mutation gate (driver and shared job evaluation, part ${{ matrix.part }} of 3)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [0, 1, 2]
     env:
       CARGO_BUILD_JOBS: 2
       RUST_TEST_THREADS: 2
@@ -275,4 +278,4 @@ jobs:
         run: scripts/mutation-targets-check.sh src/driver.rs src/driver/atomic.rs src/driver/dispatch.rs src/driver/shards.rs src/job_evaluate.rs
       - name: zero survivors in transactional driver and shared evaluation
         run: |
-          cargo schemata -j 2 --file src/driver.rs --file src/driver/atomic.rs --file src/driver/dispatch.rs --file src/driver/shards.rs --file src/job_evaluate.rs -- --lib -- driver:: job_evaluate::
+          cargo schemata -j 2 --shard ${{ matrix.part }}/3 --file src/driver.rs --file src/driver/atomic.rs --file src/driver/dispatch.rs --file src/driver/shards.rs --file src/job_evaluate.rs -- --lib -- driver:: job_evaluate::

@@ -1498,8 +1498,12 @@ impl Driver {
             self.halt_progress(s);
             return Ok(());
         }
-        loop {
-            let mut changed = false;
+        // Run until a pass changes nothing. Written as `while changed` so the
+        // exit is one condition, not a `break` that an edit can invert into a loop
+        // that never ends.
+        let mut changed = true;
+        while changed {
+            changed = false;
             for t in &self.plan.tasks {
                 if t.variant.is_some() || t.shard.is_some() {
                     continue;
@@ -1727,9 +1731,6 @@ impl Driver {
                 // Each new Ready copies bounded needs into its phase/outbox.
                 // Never materialize the entire fanout before detecting overflow.
                 self.check_progress_storage(s)?;
-            }
-            if !changed {
-                break;
             }
         }
         self.finish_if_drained(s);
