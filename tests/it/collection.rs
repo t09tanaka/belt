@@ -5472,6 +5472,10 @@ jobs:
         let mut report: serde_json::Value =
             serde_json::from_slice(&shard_result(&group, index, "success", "passed", None))
                 .unwrap();
+        report["jobs"] = json!([{
+            "workflow": listing.step.workflow, "job": "test", "display": "test",
+            "result": "pass", "secs": 0.035, "steps": []
+        }]);
         for test in report["shard"]["tests"].as_array_mut().unwrap() {
             test["millis"] = json!(35);
         }
