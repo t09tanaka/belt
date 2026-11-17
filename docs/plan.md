@@ -1499,9 +1499,69 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - inputs の上限 4 MiB は、接続の frame の上限（2 MiB）より大きい。今の wire では、2 MiB を超える inputs は frame で断られる。
 - テストしていないもの: step の停止を確認できなかった場合の end to end（`ends_attempt` の単体だけ）、core が handle を見ない区間で止まらないこと。
 
-残り（S16 (1) の後半、次の変更）:
+残り（この時点のもの。配送と親の側は次の節で実装した。`services:` は残っている）:
 
 - FrozenPlan の bytes の配送と、feature `ci_task_v1` の提供。worker は `<state_dir>/ci-plans/<sha256>.json` に置かれた bytes を使う（`worker::ci_task::store_plan`）。`blob_put` の経路に plan 用の種類を足して親から届けるところは未実装で、届いていない plan の attempt は準備で失敗する（`NOT_FOUND`）。配送を入れる変更で `ci_task_v1` を `SUPPORTED_FEATURES` に入れる。
 - `services:` を持つ task の実行。今は受理で断る。supervisor が失われたとき、core が起動した container と compose project を recover で止める実装（core の `CancelHandle` が持つ名前を attempt に記録し、recover で止める）を入れてから、拒否を外す。
 - 親の側の回収: `ci_task` を持つ payload では、結果の artifact `rtr-ci-task-result.json` を必須（required）として扱う（`results/collect.rs` の `declared_of` は今 `payload.artifacts` だけを見る。worker は `ArtifactDecl` でこの名前を宣言できない）。宣言が 1024 件のとき、結果を足すと 1025 件になる点も合わせて決める。偽の worker がこの artifact だけを返すテストを付ける。
 - 親の側: `ci` の実行（`src/cli.rs` と `tests/it/not_implemented.rs` の 2 行）、`TaskSpec` への `ci_task` の追加と `build_payload`、`ci_task_v1` の無い worker の除外と placement への理由の記録、Driver と同じ形の trait の後ろに置く run の進行（needs の DAG、上流の成功後だけ下流を配置、失敗時の skipped、cancel）、needs output を下流の `inputs` へ入れること（複数の上流の合計が上限を超える場合の扱いを含む）、`plan_task_demand` から `WorkloadPlan` を作って配置時の forecast に渡すこと（A10 の S16 分）、A38 のうち結果と output の分のテスト。
+
+### S16 (1) の後半: 親の側の `ci` の実行（2026-11-17、main `b673327` 起点）
+
+設計の決定 (a)・(b) の親の側と、FrozenPlan の配送を実装した。`ci`（`plan` 以外）は `NOT_IMPLEMENTED` ではなくなった。matrix・中間 artifact・`services:` は含めていない。
+
+実装したもの:
+
+- FrozenPlan の配送: wire の `SourceBlobKind::Plan`。親は run の source を worker に届けたあと、同じ gate の中で plan の bytes を `blob_put`（64 KiB ずつ）で送り、それから入力を ready として公開する（`service::forward::plan`、`resident::delivery`）。worker は source の受け口とは別に受け取り（`worker::ci_task::put_plan`。source が公開済みかどうかに依らない）、全 bytes が届いて digest が合うときだけ `<state_dir>/ci-plans/` に置く。途中の file は 8 件まで。既に持つ plan をもう一度送られたら完了と答え、置かれた時刻を更新する（GC の保持期間が延びる）。
+- feature `ci_task_v1` を `SUPPORTED_FEATURES` に入れた（required には入れない）。交渉していない worker には CI task を配置せず、除外の理由（`protocol feature ci_task_v1`）を placement の decision に残す（`Exclusion::CapabilityMismatch` と `unmet`。全員がそうなら `task_waiting` の `blocked_reason` は `no_compatible_worker`）。plan も送らない。
+- `TaskSpec.ci`（`CiSpec { task, hold, steps }`）。`build_payload` が `ci_task` を作る。CI task は `commands` を持たない。提出のとき、worker が断るもの（`worker::ci_task::check_payload`）と、宣言が結果の 1 件ぶんの余地を残さないものを断る。
+- 親の側の `ci`（`service::ci_run`）: capture 1 回、`service::planning::freeze`（`ci plan` と同じ関数）で FrozenPlan を 1 回作り、bytes を親の `<state_dir>/ci-plans/` に置く。plan の task をすべて 1 つの run の task として `SubmitCaptured` で提出する。task の ID はここで決まる。needs を持つ task は `hold` 付きで提出する。resident への要求の schema_version は 5（CI task を知らない resident は断る）。提出のあとは `exec` と同じ待ち方をし、Ctrl-C で run を cancel する。終了コードは run のもの。JSON と text に Job ごとの結果（`success`・`failure`・`skipped` と理由・`cancelled`、結果を残さなかった task は `no_result`）を出す。
+- 待機: `hold` の task は run の task の行として存在するが、queue の述語（`QUEUED`）から外れるので配置されない。run の完了（`Snapshot`）・cancel・`ls`・`show` は既存の経路のまま待機中の task を数える。schema の変更は無い（task の spec の JSON で表す）。
+- 進行（`ci::progress` と `ci::advance`、resident の `ci_runs`）: `Progression` trait（`step(Input)`・`pending_actions()`・`outcome()`。入力は `Advance`・`Cancel`・`Settle`・`Fence`・`Ack`、action は `Ready { task, inputs }`・`Finished`）の後ろに `NeedsProgression` を置いた。local-ci の shared Driver が公開されたら、この trait の実装を差し替える。resident は heartbeat ごとに、待機中の task を持つ run について、run の task の行・plan の file・回収済みの結果から進行を組み立て直し、`Ready` になった task に inputs を書いて queue に入れる（`release_ci_task`。cancel の確認と同じ transaction）。process の中に状態を持たないので、再起動しても続きから進み、task を二度作らない。
+- skipped・`always()`・`failure()`: 親は Job を実行するかどうかを決めない。上流がすべて終わったら（成功・失敗・skipped を問わず）下流を配置し、worker の core が inputs から `if:` を評価する。実行しない Job は step を起動せずに `skipped` の結果を返し、attempt は成功で終わる。
+- 結果の artifact を required にした（`results::collect::declared_of`）。無いときは `required_missing`。有っても、その task の結果として読めないとき（JSON でない、別の task のもの、digest が合わない、16 MiB 超）は、回収を閉じるときに `required_missing` にする（`Collector::judged`）。どちらも command が成功していても task は成功にならず、下流の inputs にはその Job が `failure` として入る。
+- forecast（A10 の S16 分）: 提出のとき `plan_task_demand` の node の数を `CiSpec.steps` に入れる。配置時の forecast の質問は `step-0`〜`step-(N-1)` の node（前の step に依存）を持つ `WorkloadPlan` になる（`scheduler::ci_workload_of`）。placement の demand にも `ci_steps` を残し、未 ACK の placement を次の質問に載せるとき（`pending_plans`）も同じ node になる。
+- 親の plan の片付け: 待機中の task が参照せず、結果の保持日数（最短 1 日）を過ぎた plan を消す。
+- live の log の polling は CI task では行わない（step ごとに node が違う）。終了後の回収は既存のまま。
+
+自分で決めたこと（仕様に無かった点）:
+
+- 親の側では skip しない。引き継ぎメモは「失敗なら下流は skipped」としていたが、`if:` の評価（`success_gated`）は local-ci 0.13.0 では公開されておらず、親で真似ると core と食い違いうる。下流を inputs 付きで配置し、core に決めさせる。そのぶん、skip される Job にも配置と workspace の準備が 1 回かかる。Driver に置き換えると core が配置前に決める。
+- 進行の入力は、attempt の終了ではなく回収が閉じたことにした（結果が親に来る前に下流は作れない）。
+- 使える結果を残さなかった task の Job は、下流には `failure`（attempt が cancelled、または配置前に cancel されたものは `cancelled`）として渡す。
+- inputs の上限は 1 MiB（worker の上限 4 MiB、接続の frame 2 MiB より小さく）。超えた task は event `ci_task_unrunnable` を残して cancel する（run は成功にならない）。
+- 宣言が 1024 件のとき結果を足すと 1025 件になる点: CI task が宣言できる artifact と output は合わせて 1023 件まで。`ci` は今、artifact も output も宣言しない。
+- 除外の理由は新しい `Exclusion` を足さず、`CapabilityMismatch` と `unmet` で表した。 plan を受け取らなかった worker だけは別で、`CapabilityMismatch` にすると全員がそうのとき `no_compatible_worker` になってしまう（一時的な理由なのに）ので、`Exclusion::InputRefused` を足した。
+- 提出で断るもの: matrix の variant・式の matrix・shard・`services:` を持つ plan、secret_files を持つ source、task が 1 つも無い plan。64 個を超える task は resident が断る（既存の上限）。
+- `ci` は toolchain の凍結（`exec` の `freeze_toolchains`）をしない。profile と requires は `exec` と同じく task に入れる。
+
+テスト:
+
+- 実 binary・resident・local worker・実際の workflow file・実 process（`tests/it/bootstrap.rs`）: Git の repository の worktree（未 commit の変更込み）と、`--snapshot commit --ref HEAD` の両方で needs の連鎖が通ること（worker は実物の fast-worktree で workspace を作る）。 3 段の needs の連鎖で output が 2 段先まで渡り、各 Job が 1 回だけ実行されること。失敗した Job の下流が step を起動せず skipped になり（その先も）、`if: always()` と `if: failure()` は動き、`if: success()` は動かず、run が失敗になること。Ctrl-C で実行中の Job が止まり、待機中の Job（`if: always()` 付き）が配置されないこと。
+- A38（`tests/it/collection.rs`、worker は memory 上の代役 2 台、plan と回収は実物）: 下流は上流の結果が回収されるまで配置されず、回収後に別の worker へ output 付きで配置され、何度見直しても attempt は 1 つずつ。`ci_task_v1` の無い worker には配置されず、理由が decision に残る。forecast の demand が step の数ぶん有る（A10）。結果が無い・読めない task は成功にならず、下流に `failure` が渡る。結果だけを返す worker は回収される。cancel した run は何も release しない。
+- 単体: `ci::progress` 5 件、`ci::advance` 4 件、`service::ci_run` 3 件、`worker::ci_task` の配送 4 件、coordinator 4 件、ほか。worker への配送は `tests/it/worker_agent.rs` で実接続（追加の offer 無し）を通している。
+
+制約と残り:
+
+- A38 の「別 host」は、代役の worker 2 台で確かめた。実 process の worker 2 台での確認は S25（1 台上の試験ハーネス）に残る。artifact の分（設計 (c)）は未実装。
+- matrix の展開・permit・max-parallel・fail-fast・join・集約と A27（(2) の区切り）は Driver の公開待ち。今は提出で断る。
+- `services:` を持つ task（worker の回復で container を止める実装が先）。secret_files・prepared setup・fast-worktree の `[[clone]]` を伴う CI task（local-ci の束縛の API 待ち）。
+- `retry` で上流の task をやり直しても、すでに release された下流の inputs は変わらない。下流を作り直す経路は無い。
+- 親の plan は、release 済みで未配置の task が参照していても、保持日数を過ぎれば消える（run が保持日数より長く止まっている場合だけ）。worker の plan も、届いてから保持期間（既定 7 日）を過ぎて配置された task は準備で `NOT_FOUND` になる。入力の gate が run を忘れたあとの再配送では、もう一度送られて保持期間が延びる。
+- `ci` の終了コードは最初に失敗した task のもの（`exec` と同じ計算）で、Job の失敗は attempt の exit 1 として現れる。
+- CI task の実行中の log は `logs --follow` に流れない（終了後に回収される）。
+- `ci` は、`exec` が project の設定から入れるもののうち、toolchain の凍結・`prepare_commands` と fast-worktree の setup（prepared setup は CI task で断られる）・`outputs` の宣言・`pass_env` を task に入れない。
+- `estimate`（`coordinator/estimate.rs`）は workload を `commands` から作るままで、CI task の step を見ない。
+- host の loop（`ci::advance`）は `NeedsProgression` の `is_settled`・`dependencies_settled` を trait の外で呼んでいる。Driver に差し替えるときは host の loop も直す。
+- run が受理される前に記録された cancel（`run_cancel_intent` だけが有る状態）と待機中の task の release の関係は、command の task と同じ経路（配置の側の扱い）に任せていて、CI 用のテストは無い。
+- mutation のテストは、変更した pure module（`coordinator/policy.rs`・`coordinator/input_gate.rs`・`scheduler/decide.rs`）だけを手元で回した。`advance_run`・`ended`・`release`・`job_lines`・`Collector::judged` は mutation の対象（`scripts/pure-modules.txt`）に入っていない file に有り、`tests/it` と lib のテストで確かめている。
+
+### S16 (1) の後半の追補: 黙って待つ 2 つの場合を無くした（2026-11-17、PR #70）
+
+- 進められない run: `ci::advance` の失敗を `Fault::Unrunnable`（親の持つ状態から決まる。plan の file が無い・digest が違う・読めない、task が plan と対応しない、進行の規則が拒む）と `Fault::Transient`（store の error、plan の file のその他の読み取り失敗）に分けた。前者は `CoordinatorStore::fail_ci_tasks` で、その run のまだ配置されていない CI task を理由付きで cancel する（spec の `ci.unrunnable`、event `ci_task_unrunnable`、cancel を 1 つの transaction で）。cancel 後は `ci_waiting_runs` に出ないので、同じ run を二度扱わない。inputs が上限を超えた task の cancel も同じ関数に寄せた（以前は event と cancel が別の書き込みだった）。後者はやり直し、resident が event `ci_run_stalled` を障害ごとに 1 回残す。
+- 配送の側（`resident::delivery`）でも親が plan を読めなければ同じ `fail_ci_tasks` を呼ぶ。待機中の task を持たない run（Job が 1 つだけ等）は進行の pass に現れないため。
+- 表示: `show`・`ls` の task の `unrunnable`、`logs` の attempt を持たない task の status（`reason` と `placement`。follow 中に内容が変わったら出し直す）、`ci` の Job の行の `reason`。
+- plan を受け取らない worker: `forward::plan` の失敗を、worker の答え（`Refused`）・親が読めない（`Unrunnable`）・その他（`Retry`）に分けた。`Refused` は接続の `InputGate` に run ごとの理由として持ち（64 件まで、受け取ったら消える、worker が別の boot / epoch になったら消える）、run に event `ci_plan_refused` を 1 回残す。配置はその worker を `Exclusion::InputRefused`（理由は `unmet`）で外す。tick が見る run（どこかで ready な run）に、断られた run も加えた。そうしないと、どの worker でも ready でない run は `place_one` に届かず、`task_waiting` が残らない。
+- 自分で決めたこと: (a) は run 全体の cancel ではなく、未配置の task だけを cancel する（実行中の Job は結果を残させる。plan が無くても worker は自分の写しで実行できる）。(b) は fail にせず除外にした（worker の GC で空けば解ける一時的な状態で、ほかの worker が取れる）。全 worker が断っている間は、理由付きで待つ。待つ時間に上限は設けていない。
+- テスト: lib（`coordinator::tests` 2 件、`input_gate` 2 件、`policy` 4 件、`ci_runs` 2 件、`advance` の分類）。`tests/it/collection.rs` 2 件（plan が消えた run、plan を受け取らない代役の worker）。`tests/it/bootstrap.rs` 1 件（実 binary・resident・local worker で、worker の `ci-plans/` を 256 件で埋めると `ci` が理由を残して待ち、空けると完了する）。
+- 残り: 配送の側で親が plan を読めない場合（待機中の task を持たない run）は、分類の単体テストだけで、実 binary のテストは無い。`ci_run_stalled` は event に残すだけで、`show` には出していない（DB が使えない間は event も書けない）。すでに worker に配置された attempt が plan を待っている場合（cold placement）の扱いは変えていない。`fail_ci_tasks` が cancel するのは attempt を 1 つも持たない task だけなので、`retry` で queue に戻った task（retire 済みの attempt を持つ）は、親の plan が消えていても cancel されず、配送が失敗し続ける（event も出ない）。どの worker でも ready でなく、1 台が plan を断っている run では、転送時間の実測がある worker に prefetch の hint が出るようになった（以前は何もせず戻っていた。配置はしない）。

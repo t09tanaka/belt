@@ -428,8 +428,8 @@ impl Fx {
         ));
         connect(a, client_cfg(&self.cluster)).await.unwrap().client
     }
-    /// [`Fx::connect`] with `ci_task_v1` offered by both sides: no build
-    /// offers it yet (it ships with the delivery of the frozen plan).
+    /// [`Fx::connect`] with `ci_task_v1` offered by both sides explicitly
+    /// (every build that delivers the frozen plan offers it anyway).
     async fn connect_ci(&self, agent: &Arc<Agent>) -> Client {
         use remote_task_runner::worker::serve::serve_connection_offering;
         let (a, b) = duplex_pair(64 * 1024);
@@ -4521,20 +4521,84 @@ async fn a_ci_task_that_cannot_be_run_yet_is_refused_before_it_is_stored() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_ci_task_that_was_not_negotiated_is_refused_and_no_build_offers_it_yet() {
+async fn a_ci_task_that_was_not_negotiated_is_refused_and_this_build_offers_it() {
     let f = fx();
     let agent = f.start("boot-a");
-    // What a coordinator and a worker of this build negotiate.
-    let c = f.connect(&agent).await;
+    // A coordinator of a build before the feature: it does not offer it.
+    let (near, far) = duplex_pair(64 * 1024);
+    let permits = Arc::new(Semaphore::new(64));
+    tokio::spawn(serve_connection(
+        agent.clone(),
+        far,
+        f.cluster.clone(),
+        permits,
+    ));
+    let mut cfg = client_cfg(&f.cluster);
+    cfg.features.retain(|v| v != CI_TASK_FEATURE);
+    let c = connect(near, cfg).await.unwrap().client;
     let a = AttemptId::generate();
     let e = call(&c, submit_req(&a, &ci_payload())).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::ProtocolIncompatible, "{}", e.message);
     assert!(e.message.contains("not negotiated"), "{}", e.message);
     assert!(f.store().get(&a).unwrap().is_none());
-    assert!(!remote_task_runner::protocol::hello::SUPPORTED_FEATURES.contains(&CI_TASK_FEATURE));
+    assert!(remote_task_runner::protocol::hello::SUPPORTED_FEATURES.contains(&CI_TASK_FEATURE));
     // An attempt of commands is taken on the same connection.
     submit(&c, &a, &payload("exit 0")).await;
     assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+}
+
+/// The frozen plan reaches the worker as a blob of its own kind, 64 KiB (here
+/// fewer) at a time, on the connection a coordinator of this build makes:
+/// the task runs from the bytes that arrived, and bytes that do not hash to
+/// the digest are not kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_frozen_plan_is_delivered_as_a_blob_and_the_task_runs_from_it() {
+    use remote_task_runner::protocol::transfer::put_blob_reader_as;
+    use remote_task_runner::worker::ci_task::{plan_path, plans_dir};
+    let ci = ci_fx(CI_WORKFLOW);
+    let state = ci.f.state();
+    let task = ci.base.ci_task.clone().unwrap();
+    let held = plan_path(&state, &task.plan_digest);
+    let bytes = std::fs::read(&held).unwrap();
+    // The fixture put it there; this test delivers it.
+    std::fs::remove_file(&held).unwrap();
+    // No extra offer: what both sides of this build negotiate.
+    let c = ci.f.connect(&ci.agent).await;
+    let epoch = CoordinatorEpoch(1);
+    let put = |bytes: Vec<u8>, digest: Digest| {
+        let (c, source) = (c.clone(), ci.base.source_id.clone());
+        async move {
+            let size = bytes.len() as u64;
+            put_blob_reader_as(
+                &c,
+                epoch,
+                &source,
+                SourceBlobKind::Plan,
+                std::io::Cursor::new(bytes),
+                digest,
+                size,
+                0,
+                97,
+                Duration::from_secs(10),
+            )
+            .await
+        }
+    };
+    let wrong = Digest::of_bytes(b"not these bytes");
+    assert!(put(bytes.clone(), wrong.clone()).await.is_err());
+    assert!(!plan_path(&state, &wrong).exists());
+    assert!(!held.exists());
+
+    let answer = put(bytes.clone(), task.plan_digest.clone()).await.unwrap();
+    assert!(answer.complete);
+    assert_eq!(std::fs::read(&held).unwrap(), bytes);
+    let staged = std::fs::read_dir(plans_dir(&state)).unwrap().count();
+    assert_eq!(staged, 1, "only the plan itself stays");
+
+    let build = AttemptId::generate();
+    submit(&c, &build, &ci.payload("build")).await;
+    assert_eq!(ci.f.wait_terminal(&build), Outcome::Succeeded);
+    assert_eq!(ci.steps(&build), ["step-0"]);
 }
 
 /// A real agent with the real host, the source of a run captured into its

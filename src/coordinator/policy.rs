@@ -227,6 +227,62 @@ pub fn may_send(facts: Facts) -> bool {
     !facts.cancel_requested && !facts.retire_requested
 }
 
+/// What a worker that cannot be given a CI task lacks, as a placement
+/// records it for the worker it left out.
+pub const CI_TASK_UNMET: &str = "protocol feature ci_task_v1";
+
+/// Is a worker left out of the placement of `spec` because the task is a CI
+/// task and its connection did not negotiate `ci_task_v1`?
+pub fn lacks_ci_task(spec: &super::TaskSpec, negotiated: bool) -> bool {
+    spec.ci.is_some() && !negotiated
+}
+
+/// The result of a CI task is one more required artifact of its attempt: do
+/// the declarations of the task leave room for it?
+pub fn ci_declarations_fit(artifacts: usize, outputs: usize) -> bool {
+    artifacts.saturating_add(outputs) < crate::outputs::MAX_OUTPUTS
+}
+
+/// Why a worker is left out of the placement of a task of `run` although
+/// it is attached: it did not take the input of the run. A worker where the
+/// input is ready was not refused (a refusal that is still listed is stale).
+pub fn input_refusal(
+    ready: bool,
+    refusals: Vec<(crate::ids::RunId, String)>,
+    run: &crate::ids::RunId,
+) -> Option<String> {
+    if ready {
+        return None;
+    }
+    refusals
+        .into_iter()
+        .find(|(refused, _)| refused == run)
+        .map(|(_, why)| why)
+}
+
+/// The work a forecast is asked for: the commands of the task, or for a CI
+/// task the commands its plan says it starts (one node per step, in order).
+pub fn workload_of_spec(
+    attempt_id: &crate::ids::AttemptId,
+    spec: &super::TaskSpec,
+    ready_delay_ms: Option<u64>,
+) -> crate::wire::WorkloadPlan {
+    match &spec.ci {
+        Some(ci) => crate::scheduler::ci_workload_of(
+            attempt_id,
+            &spec.plan_digest,
+            ci.steps,
+            ready_delay_ms,
+        ),
+        None => crate::scheduler::workload_of(
+            attempt_id,
+            &spec.plan_digest,
+            &spec.commands,
+            ready_delay_ms,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -240,6 +296,104 @@ mod tests {
             max_active_task,
             prefetch_per_worker,
         }
+    }
+
+    fn task_spec(ci: bool) -> crate::coordinator::TaskSpec {
+        let digest = crate::ids::Digest::of_bytes(b"plan");
+        crate::coordinator::TaskSpec {
+            ci: ci.then(|| crate::coordinator::CiSpec {
+                task: crate::wire::CiTask {
+                    plan_digest: digest.clone(),
+                    task_id: "ci.yml/build".into(),
+                    inputs: serde_json::json!({"needs": {}}),
+                },
+                hold: false,
+                steps: 1,
+                unrunnable: None,
+            }),
+            toolchains: None,
+            outputs: Vec::new(),
+            requirements: Default::default(),
+            in_place: false,
+            setup: None,
+            plan_digest: digest.clone(),
+            manifest_digest: digest,
+            commands: Vec::new(),
+            command_timeout_ms: None,
+            deadline_ms: None,
+            resource_wait_timeout_ms: None,
+            has_secret_bundle: false,
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_a_ci_task_is_kept_from_a_worker_that_did_not_negotiate_ci_tasks() {
+        assert!(lacks_ci_task(&task_spec(true), false));
+        assert!(!lacks_ci_task(&task_spec(true), true));
+        assert!(!lacks_ci_task(&task_spec(false), false));
+        assert!(!lacks_ci_task(&task_spec(false), true));
+        assert_eq!(CI_TASK_UNMET, "protocol feature ci_task_v1");
+    }
+
+    #[test]
+    fn a_worker_is_left_out_for_the_input_it_refused_only_while_it_is_not_ready() {
+        let (a, b) = (crate::ids::RunId::generate(), crate::ids::RunId::generate());
+        let refusals = || {
+            vec![
+                (a.clone(), "full".to_string()),
+                (b.clone(), "part-way".to_string()),
+            ]
+        };
+        assert_eq!(
+            input_refusal(false, refusals(), &a).as_deref(),
+            Some("full")
+        );
+        assert_eq!(
+            input_refusal(false, refusals(), &b).as_deref(),
+            Some("part-way")
+        );
+        assert_eq!(input_refusal(true, refusals(), &a), None);
+        assert_eq!(input_refusal(false, Vec::new(), &a), None);
+        let other = crate::ids::RunId::generate();
+        assert_eq!(input_refusal(false, refusals(), &other), None);
+    }
+
+    #[test]
+    fn the_declarations_of_a_ci_task_leave_room_for_its_result() {
+        let max = crate::outputs::MAX_OUTPUTS;
+        assert_eq!(max, 1024);
+        assert!(ci_declarations_fit(0, 0));
+        // 1023 declarations and the result are 1024.
+        assert!(ci_declarations_fit(max - 2, 0));
+        assert!(ci_declarations_fit(max - 1, 0));
+        assert!(ci_declarations_fit(0, max - 1));
+        assert!(ci_declarations_fit(1000, 23));
+        assert!(!ci_declarations_fit(max, 0));
+        assert!(!ci_declarations_fit(0, max));
+        assert!(!ci_declarations_fit(1000, 24));
+        assert!(!ci_declarations_fit(max + 1, 0));
+        assert!(!ci_declarations_fit(1, max));
+        assert!(!ci_declarations_fit(usize::MAX, 1));
+        assert!(!ci_declarations_fit(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn a_forecast_is_asked_for_the_steps_of_a_ci_task_or_the_commands_of_another() {
+        let attempt = crate::ids::AttemptId::generate();
+        let mut ci = task_spec(true);
+        ci.ci.as_mut().unwrap().steps = 3;
+        let plan = workload_of_spec(&attempt, &ci, Some(40));
+        assert_eq!(
+            plan,
+            crate::scheduler::ci_workload_of(&attempt, &ci.plan_digest, 3, Some(40))
+        );
+        assert_eq!(plan.nodes.len(), 3);
+        let plain = task_spec(false);
+        assert_eq!(
+            workload_of_spec(&attempt, &plain, None),
+            crate::scheduler::workload_of(&attempt, &plain.plan_digest, &plain.commands, None)
+        );
     }
 
     #[test]

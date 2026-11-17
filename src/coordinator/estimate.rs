@@ -453,6 +453,7 @@ mod tests {
         let task = TaskId::generate();
         let run = RunId::generate();
         let mut spec = TaskSpec {
+            ci: None,
             toolchains: None,
             outputs: vec![],
             requirements: Default::default(),

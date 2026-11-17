@@ -24,19 +24,25 @@ pub const MAX_TASKS_PER_RUN: usize = 10_000;
 
 const QUEUED: &str = "t.cancel_requested_at_ms IS NULL
     AND EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL)
-    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0 AND (a.generation >= t.min_generation OR a.state <> 'terminal'))";
+    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0 AND (a.generation >= t.min_generation OR a.state <> 'terminal'))
+    AND coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=0";
 
-const QUEUED_V1_CANCEL: &str = "t.cancel_requested_at_ms IS NULL AND EXISTS (SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL) AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0)";
+const QUEUED_V1_CANCEL: &str = "t.cancel_requested_at_ms IS NULL AND EXISTS (SELECT 1 FROM run r WHERE r.run_id=t.run_id AND r.closed_at_ms IS NULL) AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0) AND coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=0";
 
 /// [`QUEUED`] for a step-1 file, which has no cancel of a task.
 const QUEUED_V1: &str =
     "EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL)
-    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0)";
+    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0)
+    AND coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=0";
 
 /// The attempts (`a`) that leave their worker out for their task, given the
 /// reason of their tombstone: the ones whose retire was confirmed. The scan
 /// of the queue and the placement of one task read the same condition.
 const EXCLUDES: &str = "a.retired = 1";
+
+// A task of a CI run that waits for the jobs it needs (`ci.hold` in its spec)
+// is not queued: it is a task of its run, and it is placed once the
+// progression of the run wrote its inputs ([`super::ci`]).
 
 /// A task that may be placed now.
 #[derive(Debug, Clone, PartialEq)]

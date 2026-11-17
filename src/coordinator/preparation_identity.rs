@@ -449,6 +449,7 @@ mod tests {
             });
             c.attach(worker.clone(), link.clone()).await;
             let spec = TaskSpec {
+                ci: None,
                 toolchains: None,
                 requirements: Default::default(),
                 in_place: false,

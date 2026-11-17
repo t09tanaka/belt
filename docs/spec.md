@@ -341,11 +341,34 @@ Shardの結果は `job_id / shard_id / test_identity` で集約し、assertion�
 
 ### workerでのCI taskの実行
 
-CIのExecutionTaskは、通常のattemptのpayloadの一種（`ci_task`: FrozenPlanのdigest、task ID、needsの結果であるinputs）として配置する。commandのattemptと同じplacement・admission・lease・retry・結果回収の経路を使い、`hello` のfeature `ci_task_v1` を交渉したworkerにだけ送る（提供するが要求しない）。workerがこのfeatureを提供するのは、FrozenPlanの本体を受け取れるbuildからである。受け取れないbuildは提供せず、交渉していない接続からのCI taskは `PROTOCOL_INCOMPATIBLE` で断る。FrozenPlanの本体はcontent-addressedなblobとして届け、workerはdigestが一致したbytesだけを使う。workerが保持するplanは件数と合計bytesに上限を持ち、未完了のattemptが参照しなくなったplanは、保持期間を過ぎたらattemptのGCと一緒に消す。
+CIのExecutionTaskは、通常のattemptのpayloadの一種（`ci_task`: FrozenPlanのdigest、task ID、needsの結果であるinputs）として配置する。commandのattemptと同じplacement・admission・lease・retry・結果回収の経路を使い、`hello` のfeature `ci_task_v1` を交渉したworkerにだけ送る（提供するが要求しない）。workerがこのfeatureを提供するのは、FrozenPlanの本体を受け取れるbuildからである。受け取れないbuildは提供せず、交渉していない接続からのCI taskは `PROTOCOL_INCOMPATIBLE` で断る。FrozenPlanの本体はcontent-addressedなblobとして届ける。`blob_put` の種類 `plan` で、sourceの転送と同じ接続・同じ64 KiBのchunkで送り、runのsourceがworkerで使えるようになったあと、そのrunのtaskを配置する前に届ける（sourceとは別に保持し、sourceが揃っているかどうかに依らず受け取る）。この種類は `ci_task_v1` を交渉した接続にだけ送る。workerは全bytesが届いてdigestが一致したときだけ `<state_dir>/ci-plans/` に置き、digestが一致したbytesだけを使う。既に持っているplanをもう一度送られたworkerは、完了と答えて、そのplanを今届いたものとして扱う。workerが保持するplanは件数と合計bytesに上限を持ち、未完了のattemptが参照しなくなったplanは、保持期間を過ぎたらattemptのGCと一緒に消す。
 
 workerではsupervisorがlocal-ci-coreのtask実行を呼び、coreが求める各stepを、commandと同じ経路（task-traffic-controllerの登録とadmission、launchの記録、mask済みのログ、timeout、停止と停止確認）でnodeとして実行する。coreはstepのprocessを起動せず、signalも送らない（service containerのdockerやgitなど、step以外の補助processはcoreが起動する）。taskの結果（Jobごとの結果とoutput）はattemptのartifact `rtr-ci-task-result.json` として親へ返し、親が後続taskのinputsに入れる。この名前とその配下は予約で、CI taskのpayloadが同じ名前のartifactやoutputを宣言すると `INVALID_INPUT` で断る。後続taskのinputsの上限（4 MiB）を超えるoutputを持つtaskは、実行したworkerで失敗にする。
 
 supervisorは、coreがstepの外で作業している間（workspaceの照合、stepとstepの間）も、commandの実行中と同じ間隔で取消要求・lease・attemptのdeadlineを見る。leaseの更新はstepの外でも反映し、止める理由が出たらcoreのcancel handleでcoreを止める（次のstepの要求を待たない）。attemptを終わらせるのは、cancel・lease失効・attemptのdeadline・資源待ちのtimeout・spoolの失敗・停止を確認できなかった場合だけで、その後は `if: always()` のstepも起動しない。stepやJobの `timeout-minutes` が切れた場合は、そのstepを止めて停止を確認したうえで、stepの結果（timeout）としてcoreへ返し、続けるかどうか（`continue-on-error`、`if: failure()`、`if: always()`）はcoreが決める。stepの実行時間の上限は、planの値とattemptの `command_timeout_ms` の小さい方である。stepがadmissionを待った時間は実行時間に含めず、待ち時間として別にcoreへ返す。
+
+### 親でのCI runの進行
+
+`ci` は入力を1回captureし、FrozenPlanを1回だけ作り、planのExecutionTaskをすべて1つのrunのtaskとして提出する。taskのIDは提出のときに決まり、あとから作り直さない。他のJobを必要としないtaskはそのままqueueに入る。他のJobを必要とするtaskは、同じrunのtaskとして受理されるが、inputsが決まるまで配置しない（待機）。待機中のtaskもrunの完了・cancel・表示の対象である。
+
+親は、taskが必要とするtaskがすべて終わり、その結果の回収が閉じたときに、結果のartifactから下流のinputs（直接必要とするJobの結果とoutput）を作り、待機中のtaskに書き込んでqueueに入れる。この書き込みとcancelの確認は1つのtransactionで行い、先に来たcancelが勝つ。上流がどう終わったかに依らず下流は配置する。Jobを実行するかどうか（既定の `success()`、`failure()`、`always()`、その他の `if:`）は親では決めず、workerのcoreがinputsから評価する。実行しないJobは、stepを1つも起動せずに `skipped` として結果に残る。
+
+上流が使える結果を残さなかった場合（cancelされて配置されなかった、attemptが結果なしで終わった、結果が読めない）は、親がそのtaskのJobを `failure`（cancelによる場合は `cancelled`）として下流のinputsに入れる。inputsは1 MiBまでとし（payloadは接続の1 frameに収める）、超えるtaskは実行できないものとして理由をeventに残してcancelする。
+
+親が進められないrunは、黙って待たせない。次の2つを区別する。
+
+- 進められないことが親の持つ状態から決まる場合（FrozenPlanのfileが無い、digestが一致しない、planとして読めない、runのtaskがplanのtaskと対応しない、進行の規則が入力を拒む）は、何度見直しても同じなので、そのrunのまだ配置されていないCI task（待機中のものと、queueにあるもの）をすべてcancelする。理由はtaskのspecの `ci.unrunnable` に書き、taskごとにevent `ci_task_unrunnable`（`task`、`reason`）を残す。理由の書き込み・cancel・eventは1つのtransactionで行う。すでにattemptを持つtaskには触れず、そのまま終わらせる。runは成功にならずに完了する。inputsが上限を超えたtaskも同じ手順でcancelする。親がplanを読めないことは、workerへplanを届けるとき（待機中のtaskを持たないrunを含む）にも同じ扱いにする。
+- その時だけ読めなかった場合（親のDBが使用中、planのfileの読み取りがその他の理由で失敗）は、runを変えずに次のheartbeatでやり直す。理由はrunのevent `ci_run_stalled`（`reason`）に、障害が始まったときと理由が変わったときに1回だけ残す（親のprocessの中で数えるので、再起動すると同じ理由をもう一度残すことがある）。
+
+cancelした理由は、`show`・`ls` のtaskの `unrunnable`、`logs` のそのtaskのstatus（`reason`。followの途中でcancelされた場合も、理由が付いたstatusをもう一度出す）、`ci` のJobごとの結果（`reason`、textでは `no_result (理由)`）に出す。
+
+workerがFrozenPlanを受け取らなかった場合（保持できるplanの件数・合計bytesの上限、途中のfileの上限に達していて `blob_put` を断った。workerがerrorを答えた場合に限り、接続の失敗は含めない）は、そのworkerではrunの入力がreadyにならない。親はそのworkerを、runのtaskの配置から理由付きで外す（`input_refused`、理由は `unmet`）。ほかのworkerがplanを受け取っていれば、そこへ配置する。外したことは配置の判断に残り、どのworkerにも配置できない間は `task_waiting` に残るので、`show` のtaskの `placement` と、`logs` のそのtaskのstatus（`placement`。followの途中で変わったらもう一度出す）に出る。runにはevent `ci_plan_refused`（`worker`、`reason`）を、接続ごと・理由ごとに1回残す。配送は同じworkerへ繰り返し試し、workerが受け取った時点（GCで空きができた後など）で除外は終わる。workerが別のboot・agent epochになったときも終わる。この除外は一時的なもので、`worker_cannot_run` の記録は作らず、`blocked_reason` も付けない。
+
+進行の状態は親のprocessに持たない。runのtaskの行、FrozenPlanのfile、回収済みの結果のartifactから毎回組み立て直すので、親が再起動しても同じところから続き、同じtaskを二度作ることも二度配置することもない。進行の規則は、local-ci-coreの共有driverと同じ形（入力を渡し、保留中のactionを実行して確認する）のtraitの後ろに置く。matrixの展開・permit・max-parallel・fail-fast・集約は共有driverに置き換えてから扱い、それまで、matrixのvariant・式のmatrix・shard・service containerを持つplanと、secret_filesを持つsourceのCI runは、提出の時点で理由を付けて断る。
+
+`ci_task_v1` を交渉していないworkerにはCI taskを配置しない。除外したworkerと理由（`protocol feature ci_task_v1`）は配置の判断に記録する。配置のときのforecastには、planがそのtaskについて挙げるcommandの数だけのnode（`step-N`、実行の順）を渡す。最初のstepだけをtask全体として尋ねない。
+
+CI taskの結果のartifactは、payloadが宣言できない名前だが、親は必須（required）として回収する。無い場合と、そのtaskの結果として読めない場合は、回収を `required_missing` で閉じ、commandが成功していてもtaskを成功にしない。CI taskが宣言できるartifactとoutputは、結果の1件を除いた数までである。
 
 service containerを持つtaskは受理しない（supervisorが失われたとき、coreが起動したcontainerを回復で止める仕組みがまだ無いため。理由を付けて `INVALID_INPUT` で断る）。
 
@@ -421,7 +444,7 @@ coordinator内の1つのscheduler actorが、配置のcommitを直列化する�
 - 親の側の見積（転送・setup・回収）がworkerによって不明のときは、その部分について候補の中で最も大きい既知の値を仮に入れて比べ、仮の値であることを配置理由に残す。全員が不明の部分は比較に入れない。
 - forecastを制限時間（1秒。設定fileのkeyではなく実装の定数で、`forecast_ttl_ms` より短くなければならない。短くない組み合わせではschedulerを起動しない）までに答えなかったworkerは、そのtickの残りの配置から外す。他のworkerの配置はそれを待たない。
 - tickの途中でattachされたworkerは、次の1件の決定の前にほかのworkerと同じ確認（`inspect` と、そのworker上のattemptの確認）を受け、その決定から候補に入る。
-- 決定ごとの配置理由（比べたworker、それぞれの予測と内訳・出所・補正量、勝った理由、外したworkerとその理由）は、配置と同じtransactionで親DBに記録する。どのworkerも選べなかったときの理由は、runのevent `task_waiting` に記録する。同じtaskについて書き直すのは、結論か、tickをまたいで続く除外（そのtaskを断ったworker、drain中のworker）が変わったときだけとする。そのtickだけの事情（満杯、forecastやsubmitに答えなかった、確認できなかった）が入れ替わっても書き直さない。決定に付ける番号 `decision_seq` は親processの中での順番で、再起動すると1から数え直す（DB上の識別子ではない）。
+- 決定ごとの配置理由（比べたworker、それぞれの予測と内訳・出所・補正量、勝った理由、外したworkerとその理由）は、配置と同じtransactionで親DBに記録する。どのworkerも選べなかったときの理由は、runのevent `task_waiting` に記録する。同じtaskについて書き直すのは、結論か、tickをまたいで続く除外（そのtaskを断ったworker、drain中のworker、能力が合わないworker、runの入力を受け取らなかったworker）が変わったときだけとする。そのtickだけの事情（満杯、forecastやsubmitに答えなかった、確認できなかった）が入れ替わっても書き直さない。決定に付ける番号 `decision_seq` は親processの中での順番で、再起動すると1から数え直す（DB上の識別子ではない）。
 - 配置は古いtaskから順に、1回のtickで決まった件数まで見る。attach中のworker全員から外されたtask（下の `worker_cannot_run`）は、その順番の最後に回す。そのようなtaskが何件待っていても、配置できるtaskが後回しにならない。外していないworkerがattachされると、元の順番に戻る。
 
 利用者は設定でworkerに好みを付けられる（`[[workers]]` の `priority`、親のlocal workerは `[coordinator] local_worker_priority`。整数、既定0、大きいほど優先、範囲は -100〜100。範囲の外の値は近い方の端として扱う）。比較値は次のとおりとする。
