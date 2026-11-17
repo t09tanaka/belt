@@ -492,6 +492,40 @@ fn creating_an_attempt_with_a_bad_permit_leaves_no_attempt() {
     );
     assert!(r.is_err());
     assert!(f.store.list_nonterminal_attempts().unwrap().is_empty());
+    let other = RunId::generate();
+    f.store
+        .create_run(&other, None, None, &json!({}), 1)
+        .unwrap();
+    f.store.create_matrix_group("other", &other, 1, 1).unwrap();
+    f.store.create_matrix_group("mine", &f.run, 1, 1).unwrap();
+    let permit = PermitId::generate();
+    f.store
+        .acquire_permit("other", &permit, 1)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        f.store.acquire_permit("mine", &permit, 1),
+        Err(StorageError::Invalid(_))
+    ));
+    let wrong_run = f.store.create_attempt(
+        NewAttempt {
+            attempt_id: AttemptId::generate(),
+            task_id: f.task.clone(),
+            worker_id: f.worker.clone(),
+            payload_hash: hash('a'),
+            permit_id: Some(permit.clone()),
+        },
+        1,
+    );
+    assert!(matches!(wrong_run, Err(StorageError::Invalid(_))));
+    assert!(f
+        .store
+        .get_permit(&permit)
+        .unwrap()
+        .unwrap()
+        .attempt_id
+        .is_none());
+    assert!(f.store.list_nonterminal_attempts().unwrap().is_empty());
     // The failed commit did not use up the task.
     f.attempt('a').unwrap();
 }

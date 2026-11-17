@@ -751,7 +751,7 @@ impl CoordinatorStore {
                 ],
             )?;
             if let Some(p) = &new.permit_id {
-                bind_permit(tx, p.as_str(), &aid)?;
+                bind_permit(tx, p.as_str(), &aid, &run)?;
             }
             common::append_event(
                 tx,
@@ -1063,6 +1063,11 @@ impl CoordinatorStore {
         let (g, p) = (group_id.to_string(), permit_id.clone());
         self.db.write(move |tx| {
             if let Some(existing) = load_permit(tx, p.as_str())? {
+                if existing.group_id != g {
+                    return Err(StorageError::Invalid(format!(
+                        "permit {p} belongs to another group"
+                    )));
+                }
                 return Ok(Some(existing));
             }
             let max: i64 = tx
@@ -1521,7 +1526,7 @@ fn load_permit(conn: &Connection, permit_id: &str) -> Result<Option<Permit>> {
     .transpose()
 }
 
-fn bind_permit(conn: &Connection, permit_id: &str, attempt_id: &str) -> Result<()> {
+fn bind_permit(conn: &Connection, permit_id: &str, attempt_id: &str, run: &str) -> Result<()> {
     let permit =
         load_permit(conn, permit_id)?.ok_or_else(|| not_found(format!("permit {permit_id}")))?;
     if !permit.held || permit.attempt_id.is_some() {
@@ -1529,9 +1534,15 @@ fn bind_permit(conn: &Connection, permit_id: &str, attempt_id: &str) -> Result<(
             "permit {permit_id} is released or already bound"
         )));
     }
-    conn.execute(
-        "UPDATE matrix_permit SET attempt_id = ?1 WHERE permit_id = ?2",
-        params![attempt_id, permit_id],
+    let bound = conn.execute(
+        "UPDATE matrix_permit SET attempt_id = ?1 WHERE permit_id = ?2
+         AND group_id IN (SELECT group_id FROM matrix_group WHERE run_id = ?3)",
+        params![attempt_id, permit_id, run],
     )?;
+    if bound == 0 {
+        return Err(StorageError::Invalid(format!(
+            "permit {permit_id} belongs to another run"
+        )));
+    }
     Ok(())
 }
