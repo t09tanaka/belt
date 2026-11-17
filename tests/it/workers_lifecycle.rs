@@ -490,17 +490,19 @@ mod a44 {
     }
 
     #[test]
-    fn sync_does_not_pretend_to_install_without_a_warm_up_request() {
+    fn sync_without_a_resident_installs_nothing_starts_none_and_says_so() {
+        // The real command: the worker lacks node 20.1.0, its manager may
+        // install it, and no resident runs to carry the request.
         let fx = fixture();
         fx.ssh(&answer(&worker_report()));
         let out = fx.run(&["workers", "sync", "mini-a"]);
-        assert_eq!(out.status.code(), Some(ErrorCode::Blocked.exit_code()));
-        let message = json(&out)["error"]["message"].as_str().unwrap().to_string();
-        assert!(
-            message.contains("node 20.1.0 was not installed"),
-            "{message}"
+        assert_eq!(
+            out.status.code(),
+            Some(ErrorCode::CommunicationUnknown.exit_code())
         );
-        assert!(message.contains("cannot install on a worker"), "{message}");
+        let message = json(&out)["error"]["message"].as_str().unwrap().to_string();
+        assert!(message.contains("the resident is not running"), "{message}");
+        assert!(!message.contains("in sync"), "{message}");
     }
 
     #[test]
