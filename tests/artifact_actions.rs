@@ -1633,3 +1633,68 @@ fn a_workflow_directory_name_stays_inside_the_area_and_tells_files_apart() {
     sorted.dedup();
     assert_eq!(sorted.len(), names.len(), "{names:?}");
 }
+
+#[test]
+fn an_external_artifact_host_finishes_the_step_only_after_its_receipt() {
+    use local_ci::{ArtifactRequest, StepExecutor, StepExit, StepRequest};
+    use std::sync::{mpsc, Arc, Mutex};
+
+    struct Host {
+        entered: mpsc::SyncSender<(String, usize, String)>,
+        reply: Mutex<mpsc::Receiver<Result<(), String>>>,
+    }
+    impl StepExecutor for Host {
+        fn run(&self, _: &StepRequest) -> anyhow::Result<StepExit> {
+            panic!("this workflow uses artifact actions only")
+        }
+
+        fn artifact(&self, req: &ArtifactRequest<'_>) -> Result<String, String> {
+            assert_eq!(req.kind, local_ci::artifact::Kind::Upload);
+            assert_eq!(req.who.job, format!("{W1}::build"));
+            assert_eq!(req.variant, None);
+            assert!(!req.cancel.is_cancelled());
+            let note = req.run_local()?;
+            self.entered
+                .send((req.workflow.to_owned(), req.step_index, note.clone()))
+                .unwrap();
+            self.reply.lock().unwrap().recv().unwrap()?;
+            Ok(note)
+        }
+    }
+
+    let jobs = r#"
+  build:
+    runs-on: x
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bundle
+          path: x/f
+"#;
+    for reply in [Ok(()), Err("parent rejected artifact digest".to_owned())] {
+        let (tmp, fp, ws) = lab_ws(jobs);
+        let (entered, observed) = mpsc::sync_channel(0);
+        let (grant, wait) = mpsc::sync_channel(0);
+        let mut opts = lab_opts(&tmp, 1);
+        opts.executor = Some(Arc::new(Host {
+            entered,
+            reply: Mutex::new(wait),
+        }));
+        let result = std::thread::scope(|scope| {
+            let thread =
+                scope.spawn(|| local_ci::execute_plan(&ctx(tmp.path()), &fp, &ws, opts).unwrap());
+            let (workflow, step, note) = observed
+                .recv_timeout(std::time::Duration::from_secs(15))
+                .unwrap();
+            assert_eq!((workflow.as_str(), step), (W1, 0));
+            assert!(note.contains("uploaded `bundle`"));
+            assert!(!thread.is_finished());
+            grant.send(reply.clone()).unwrap();
+            thread.join().unwrap()
+        });
+        match reply {
+            Ok(()) => assert_eq!(result.state, "success"),
+            Err(reason) => assert!(why(&result, "build").contains(&reason)),
+        }
+    }
+}

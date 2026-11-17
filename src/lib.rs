@@ -55,7 +55,7 @@ pub use run::{
     publish_target, resolve, resolve_with, run, status, Observer, Quiet, Repo, RunOptions,
     RunReport, Target,
 };
-pub use step_executor::{ScriptPipe, StepExecutor, StepExit, StepRequest};
+pub use step_executor::{ArtifactRequest, ScriptPipe, StepExecutor, StepExit, StepRequest};
 pub use task::{
     aggregate_matrix, execute_git_dispatch, execute_setup, execute_task, JobOutcome, JobStatus,
     TaskInputs, TaskResult,
