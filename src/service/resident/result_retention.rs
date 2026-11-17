@@ -109,7 +109,7 @@ pub(super) mod tests {
         }
         fn pending(&self, run: &RunId) -> usize {
             let db = self.owner.store();
-            let guard = db.result_gc_guard(run).unwrap();
+            let guard = crate::test_tmp::gc_guard(db, run);
             db.pending_result_page(&guard, run, 32).unwrap().len()
         }
     }
@@ -182,7 +182,7 @@ pub(super) mod tests {
         files: &ResultStore,
     ) -> (RunId, AttemptId) {
         let (run, attempt) = expired(db, files);
-        let guard = db.result_gc_guard(&run).unwrap();
+        let guard = crate::test_tmp::gc_guard(db, &run);
         let page = |wall, mono| {
             db.claim_result_page(&guard, &run, "", 32, wall, mono, Some("earlier".into()), 0)
                 .unwrap()
@@ -235,7 +235,7 @@ pub(super) mod tests {
             expired_attempt(db, &f.files, &run),
             expired_attempt(db, &f.files, &run),
         ];
-        let guard = db.result_gc_guard(&run).unwrap();
+        let guard = crate::test_tmp::gc_guard(db, &run);
         let claim = |wall, mono| {
             db.claim_result_page(&guard, &run, "", 32, wall, mono, Some("earlier".into()), 0)
                 .unwrap()
@@ -255,16 +255,14 @@ pub(super) mod tests {
         let _restore = Restore(stuck.clone());
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
         drop(guard);
-        let mut cursor = Cursor::default();
-        let report = page(db, &f.files, &mut cursor, RETENTION_DAYS).unwrap();
+        let report = crate::test_tmp::settled_page(db, &f.files, RETENTION_DAYS);
         assert_eq!((report.deleted, report.failed), (1, 1));
         assert!(!f.directory(second).exists());
         assert!(stuck.exists());
         assert_eq!(f.pending(&run), 1);
         // Once it can be removed, a later page finishes it.
         std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut cursor = Cursor::default();
-        let report = page(db, &f.files, &mut cursor, RETENTION_DAYS).unwrap();
+        let report = crate::test_tmp::settled_page(db, &f.files, RETENTION_DAYS);
         assert_eq!((report.deleted, report.failed), (1, 0));
         assert_eq!(f.pending(&run), 0);
         assert!(!stuck.exists());
@@ -283,8 +281,7 @@ pub(super) mod tests {
         assert!(!ResultStore::owns(outside.to_str().unwrap()));
         assert!(!ResultStore::owns("../x"));
         // The claim that is ours is removed without following anything else.
-        let mut cursor = Cursor::default();
-        let report = page(db, &f.files, &mut cursor, RETENTION_DAYS).unwrap();
+        let report = crate::test_tmp::settled_page(db, &f.files, RETENTION_DAYS);
         assert_eq!((report.deleted, report.failed), (1, 0));
         assert!(!f.directory(&attempt).exists());
         assert_eq!(f.pending(&run), 0);
@@ -301,8 +298,7 @@ pub(super) mod tests {
         std::fs::write(outside.join("kept"), b"outside").unwrap();
         std::fs::rename(f.directory(&attempt), f.root.path().join("moved")).unwrap();
         std::os::unix::fs::symlink(&outside, f.directory(&attempt)).unwrap();
-        let mut cursor = Cursor::default();
-        let report = page(db, &f.files, &mut cursor, RETENTION_DAYS).unwrap();
+        let report = crate::test_tmp::settled_page(db, &f.files, RETENTION_DAYS);
         assert_eq!((report.deleted, report.failed), (0, 1));
         assert_eq!(f.pending(&run), 1);
         assert_eq!(std::fs::read(outside.join("kept")).unwrap(), b"outside");

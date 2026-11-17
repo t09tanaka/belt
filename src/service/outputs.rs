@@ -983,7 +983,7 @@ mod tests {
                 });
                 assert_eq!(code, 0, "{}", String::from_utf8_lossy(&out.bytes));
                 assert!(out.seen);
-                drop(f.db.result_gc_guard(&f.run).unwrap());
+                drop(crate::test_tmp::gc_guard(&f.db, &f.run));
                 let path = f
                     .dir
                     .path()
@@ -1027,7 +1027,7 @@ mod tests {
             8,
         )
         .unwrap();
-        let guard = f.db.result_gc_guard(&f.run).unwrap();
+        let guard = crate::test_tmp::gc_guard(&f.db, &f.run);
         assert!(
             f.db.claim_result_page(&guard, &f.run, "", 64, 100, 10, Some("boot".into()), 10)
                 .unwrap()
@@ -1060,7 +1060,7 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, ErrorCode::NotFound);
         drop(pin);
-        let guard = f.db.result_gc_guard(&f.run).unwrap();
+        let guard = crate::test_tmp::gc_guard(&f.db, &f.run);
         for claim in claims {
             files.remove(&claim.locator).unwrap();
             f.db.finish_result_delete(&guard, &claim).unwrap();

@@ -137,7 +137,7 @@ mod tests {
         let (drained, receive_drained) = mpsc::channel();
         let id = run.clone();
         let task = tokio::spawn(owned_blocking(store, move |owner| {
-            let guard = owner.result_gc_guard(&id).unwrap();
+            let guard = crate::test_tmp::gc_guard(owner, &id);
             entered.send(()).unwrap();
             receive_resume
                 .recv_timeout(Duration::from_secs(10))

@@ -996,24 +996,43 @@ fn lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it() {
 
 #[test]
 fn renewals_keep_the_attempt_alive_past_one_lease_period() {
-    let mut f = fx(vec![node("n", "sleep 1.6")]);
-    f.spec.lease_ms = 800;
+    // The command outlives one lease period (3.5 s > 2 s) and lives on only
+    // by the renewals. A renewal every 100 ms leaves a twenty-fold margin: a
+    // loaded runner (coverage instrumentation) that stalls this thread or
+    // its commit for a few hundred ms must not let the lease lapse.
+    let mut f = fx(vec![node("n", "sleep 3.5")]);
+    f.spec.lease_ms = 2000;
     let second = f.open_second();
     let attempt = f.attempt().clone();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let flag = stop.clone();
+    // Every failed renewal and the longest gap between two successful ones
+    // are kept, so a lapse is explained by the assertion that reports it.
     let renewer = std::thread::spawn(move || {
         let mut seq = 1;
+        let (mut errors, mut longest) = (Vec::new(), Duration::ZERO);
+        let mut last = Instant::now();
         while !flag.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = second.renew_lease(&attempt, key(seq), platform::wall_ms());
+            match second.renew_lease(&attempt, key(seq), platform::wall_ms()) {
+                Ok(_) => {
+                    longest = longest.max(last.elapsed());
+                    last = Instant::now();
+                }
+                Err(e) => errors.push(format!("renewal {seq} at {:?}: {e}", last.elapsed())),
+            }
             seq += 1;
-            std::thread::sleep(Duration::from_millis(150));
+            std::thread::sleep(Duration::from_millis(100));
         }
+        (errors, longest)
     });
     let t = settled(&run(&f.spec).unwrap());
     stop.store(true, std::sync::atomic::Ordering::SeqCst);
-    renewer.join().unwrap();
-    assert_eq!(t.outcome(), Outcome::Succeeded);
+    let (errors, longest) = renewer.join().unwrap();
+    assert_eq!(
+        t.outcome(),
+        Outcome::Succeeded,
+        "longest gap between renewals {longest:?}; failed renewals: {errors:?}"
+    );
 }
 
 #[test]

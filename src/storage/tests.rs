@@ -5000,7 +5000,7 @@ fn result_retention_claims_bounded_pages_and_replays_only_known_claims() {
         !plan.iter().any(|line| line.contains("TEMP B-TREE")),
         "{plan:?}"
     );
-    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    let guard = crate::test_tmp::gc_guard(&f.store, &f.run);
     assert!(f
         .store
         .claim_result_page(&guard, &f.run, "", 0, 200, 10, Some("boot".into()), 10)
@@ -5069,7 +5069,7 @@ fn result_retention_claims_bounded_pages_and_replays_only_known_claims() {
     drop(guard);
     drop(f.store);
     let restarted = CoordinatorStore::open(f._dir.path(), 300).unwrap();
-    let guard = restarted.result_gc_guard(&f.run).unwrap();
+    let guard = crate::test_tmp::gc_guard(&restarted, &f.run);
     let replay = restarted
         .pending_result_page(&guard, &f.run, 1)
         .unwrap()
@@ -5136,7 +5136,7 @@ fn result_retention_reader_writer_and_legacy_backfill_are_fail_closed() {
     let writer = f.store.result_writer_pin(&a).unwrap();
     assert!(f.store.result_gc_guard(&f.run).is_err());
     drop(writer);
-    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    let guard = crate::test_tmp::gc_guard(&f.store, &f.run);
     assert_eq!(
         reader.result_read_pin(&target, None).unwrap_err().code(),
         ErrorCode::Conflict
@@ -5150,7 +5150,7 @@ fn result_retention_reader_writer_and_legacy_backfill_are_fail_closed() {
         ErrorCode::NotFound
     );
     assert!(!path.exists());
-    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    let guard = crate::test_tmp::gc_guard(&f.store, &f.run);
     drop(guard);
     reader.result_read_pin(&target, None).unwrap();
 }
@@ -5162,7 +5162,7 @@ fn result_retention_keeps_unknown_unacked_open_and_pinned_references() {
     f.store
         .add_blob_ref(&blob("ref", &a, BlobKind::Result, &locator), 102)
         .unwrap();
-    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    let guard = crate::test_tmp::gc_guard(&f.store, &f.run);
     f.store
         .claim_result_page(&guard, &f.run, "", 1, 200, 10, Some("boot".into()), 10)
         .unwrap();
@@ -5249,7 +5249,7 @@ fn result_gc_run_selection_is_indexed_and_independent_of_task_facts() {
 
 #[test]
 fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
-    use crate::results::{retention, ResultStore};
+    use crate::results::ResultStore;
     use std::os::unix::fs::symlink;
     let f = fx();
     let a = retention_ready(&f);
@@ -5261,7 +5261,7 @@ fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
     f.store
         .add_blob_ref(&blob("claimed", &a, BlobKind::Log, &locator), 102)
         .unwrap();
-    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    let guard = crate::test_tmp::gc_guard(&f.store, &f.run);
     f.store
         .claim_result_page(&guard, &f.run, "", 32, 200, 10, Some("boot".into()), 10)
         .unwrap();
@@ -5272,13 +5272,13 @@ fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
     symlink(outside.path(), files.root().join(a.as_str())).unwrap();
     // The entry cannot be removed through the link: it is counted, stays
     // pending and is never recorded as done.
-    let report = retention::page(&f.store, &files, &mut retention::Cursor::default(), 7).unwrap();
+    let report = crate::test_tmp::settled_page(&f.store, &files, 7);
     assert_eq!((report.deleted, report.failed), (0, 1));
     assert_eq!(
         std::fs::read(outside.path().join("logs/sentinel")).unwrap(),
         b"safe"
     );
-    let guard = f.store.result_gc_guard(&f.run).unwrap();
+    let guard = crate::test_tmp::gc_guard(&f.store, &f.run);
     assert_eq!(
         f.store
             .pending_result_page(&guard, &f.run, 32)
@@ -5290,9 +5290,7 @@ fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
     std::fs::remove_file(files.root().join(a.as_str())).unwrap();
     // The known claim alone permits a missing object to finish successfully.
     assert_eq!(
-        retention::page(&f.store, &files, &mut retention::Cursor::default(), 7)
-            .unwrap()
-            .deleted,
+        crate::test_tmp::settled_page(&f.store, &files, 7).deleted,
         1
     );
 }
