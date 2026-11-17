@@ -78,6 +78,7 @@ impl Sup {
             .materialize(&self.f.manifest, &workspace)
             .unwrap();
         let ci = CiTaskSpec {
+            artifact_workflow: None,
             dispatch: None,
             plan_path: crate::worker::ci_task::plan_path(&self.state(), &self.plan_digest),
             plan_digest: self.plan_digest.clone(),

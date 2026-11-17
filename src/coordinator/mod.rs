@@ -33,6 +33,7 @@ pub mod policy;
 mod prefetch;
 mod preparation;
 mod preparation_identity;
+mod workflow_artifact;
 
 pub use input_gate::{PlacementInputs, ReadyInput};
 pub use link::{ClientLink, InputGate, LinkError, WorkerLink};
@@ -1056,7 +1057,14 @@ impl Coordinator {
             (Step::Settle, Some(status)) => self.mirror(&status, report).await,
             (Step::Follow, Some(status)) => {
                 self.mirror(&status, report).await?;
-                self.renew(link, a, status.state, report).await
+                self.renew(link, a, status.state, report).await?;
+                if !matches!(
+                    status.state,
+                    AttemptState::Cancelling | AttemptState::Finalizing
+                ) {
+                    self.follow_artifacts(link, &live).await?;
+                }
+                Ok(())
             }
             // A step that needs a status always comes with one; without it
             // nothing is known.

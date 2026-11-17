@@ -246,10 +246,11 @@ pub enum Operation {
     ForecastCommand,
     ResolveToolchains,
     PreparationProbe,
+    WorkflowArtifact,
 }
 
 impl Operation {
-    pub const ALL: [Operation; 22] = [
+    pub const ALL: [Operation; 23] = [
         Operation::Hello,
         Operation::Inspect,
         Operation::Forecast,
@@ -272,12 +273,14 @@ impl Operation {
         Operation::ForecastCommand,
         Operation::ResolveToolchains,
         Operation::PreparationProbe,
+        Operation::WorkflowArtifact,
     ];
 
     pub fn idempotency(self) -> Idempotency {
         match self {
             Operation::SubmitAttempt => Idempotency::AttemptAndPayload,
-            Operation::RenewLease
+            Operation::WorkflowArtifact
+            | Operation::RenewLease
             | Operation::CancelAttempt
             | Operation::RetireAttempt
             | Operation::AckCollected
@@ -903,6 +906,7 @@ pub struct AttemptPayload {
 /// no build's `SUPPORTED_FEATURES`, and a CI task that was not negotiated is
 /// refused.
 pub const CI_TASK_FEATURE: &str = "ci_task_v1";
+pub const WORKFLOW_ARTIFACTS_FEATURE: &str = "ci_workflow_artifacts_v1";
 pub const MATRIX_DISPATCH_FEATURE: &str = "ci_matrix_dispatch_v1";
 /// The worker can run dedicated listing attempts before the CI plan is partitioned.
 pub const CI_DISCOVERY_FEATURE: &str = "ci_discovery_v1";
@@ -919,6 +923,8 @@ pub fn is_discovery_task(task: &CiTask) -> bool {
 /// the task as the plan says and never plans again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTask {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_workflow: Option<String>,
     /// Sealed SDK dispatch for one member derived from a dynamic matrix.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<serde_json::Value>,
@@ -1791,6 +1797,76 @@ pub struct PreparationProbeResponse {
     pub probe: crate::setup::preparation_probe::PreparationProbe,
 }
 
+/// Exchange for a live artifact action. Commands and replies are scoped to
+/// the accepted generation. Only digest identifiers cross the filesystem boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowArtifactRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub coordinator_epoch: CoordinatorEpoch,
+    pub attempt_id: AttemptId,
+    pub generation: Generation,
+    pub command: WorkflowArtifactCommand,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowArtifactCommand {
+    Poll,
+    Read {
+        key: Digest,
+        digest: Digest,
+        offset: u64,
+    },
+    Answer {
+        key: Digest,
+        answer: ArtifactAnswer,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactAction {
+    pub key: Digest,
+    pub intent: ArtifactIntent,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactIntent {
+    Upload {
+        receipt: serde_json::Value,
+        overwrite: bool,
+    },
+    Catalog {
+        name: Option<String>,
+        pattern: Option<String>,
+    },
+    Fetch {
+        producer: AttemptId,
+        name: String,
+        version: u32,
+        digest: Digest,
+        offset: u64,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactAnswer {
+    Uploaded { version: u32 },
+    Catalog { artifacts: Vec<serde_json::Value> },
+    Chunk { data: Bytes },
+    Failed { reason: String },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowArtifactResponse {
+    pub schema_version: SchemaVersion,
+    pub result: ArtifactExchangeResult,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactExchangeResult {
+    Pending { action: Option<ArtifactAction> },
+    Chunk { data: Bytes },
+    Accepted,
+}
+
 operations! {
     Hello(HelloRequest, HelloResponse),
     Inspect(InspectRequest, InspectResponse),
@@ -1814,6 +1890,7 @@ operations! {
     EnvSync(EnvSyncRequest, EnvSyncResponse),
     ResolveToolchains(ResolveToolchainsRequest, ResolveToolchainsResponse),
     PreparationProbe(PreparationProbeRequest, PreparationProbeResponse),
+    WorkflowArtifact(WorkflowArtifactRequest, WorkflowArtifactResponse),
 }
 
 /// An error reply.
@@ -2257,6 +2334,14 @@ mod tests {
             requirements: Default::default(),
         }));
         out.push(Request::PreparationProbe(preparation_probe_request()));
+        out.push(Request::WorkflowArtifact(WorkflowArtifactRequest {
+            schema_version: SV,
+            request_id: rid(),
+            coordinator_epoch: CoordinatorEpoch(3),
+            attempt_id: aid(),
+            generation: Generation(1),
+            command: WorkflowArtifactCommand::Poll,
+        }));
         out
     }
 
@@ -2468,6 +2553,10 @@ mod tests {
             worker_boot_id: boot(),
             agent_epoch: AgentEpoch(1),
             probe: crate::setup::preparation_probe::PreparationProbe::NoManagedPreparation,
+        }));
+        out.push(Response::WorkflowArtifact(WorkflowArtifactResponse {
+            schema_version: SV,
+            result: ArtifactExchangeResult::Pending { action: None },
         }));
         out
     }
@@ -2727,6 +2816,7 @@ mod tests {
             (SubmitAttempt, AttemptAndPayload),
             (GetAttempt, ReadOnly),
             (ListAttempts, ReadOnly),
+            (WorkflowArtifact, RequestId),
             (RenewLease, RequestId),
             (CancelAttempt, RequestId),
             (RetireAttempt, RequestId),
@@ -3290,6 +3380,7 @@ mod tests {
             .get("ci_task")
             .is_none());
         let task = |inputs: serde_json::Value| CiTask {
+            artifact_workflow: None,
             dispatch: None,
             plan_digest: dg("frozen plan"),
             task_id: "ci.yml/build".into(),

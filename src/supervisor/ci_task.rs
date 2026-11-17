@@ -61,6 +61,8 @@ const RESULT_FILE: &str = "result.json";
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTaskSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<serde_json::Value>,
     /// The bytes of the frozen plan. Used only when they hash to
     /// `plan_digest`.
@@ -251,9 +253,19 @@ struct StepJob {
 
 /// The executor the core is given: it only queues the step for the thread
 /// that owns the supervisor's state and waits for the answer.
-struct Queue(Mutex<Sender<StepJob>>);
+struct Queue {
+    sender: Mutex<Sender<StepJob>>,
+    artifacts: crate::ci::artifact_exchange::worker::Host,
+}
 
 impl StepExecutor for Queue {
+    fn artifact(
+        &self,
+        req: &local_ci::step_executor::ArtifactRequest<'_>,
+    ) -> std::result::Result<String, String> {
+        self.artifacts.run(req).map_err(|e| format!("{e:#}"))
+    }
+
     fn run(&self, req: &StepRequest) -> anyhow::Result<StepExit> {
         let (reply, answer) = sync_channel(1);
         let job = StepJob {
@@ -265,7 +277,7 @@ impl StepExecutor for Queue {
             script_pipe: req.script_pipe.is_some(),
             reply,
         };
-        self.0
+        self.sender
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .send(job)
@@ -472,7 +484,27 @@ pub(super) fn drive(ctl: &mut Control<'_>, ci: &CiTaskSpec, core: Core<'_>) -> R
     std::fs::create_dir_all(&ci.scratch)
         .map_err(|e| SupervisorError::State(format!("the CI scratch directory: {e}")))?;
     let (send, steps) = channel();
-    let executor: Arc<dyn StepExecutor> = Arc::new(Queue(Mutex::new(send)));
+    let executor: Arc<dyn StepExecutor> = Arc::new(Queue {
+        sender: Mutex::new(send),
+        artifacts: crate::ci::artifact_exchange::worker::Host {
+            root: ci.scratch.join("exchange"),
+            workflow: ci.artifact_workflow.clone(),
+            secret_files: ctl
+                .spec
+                .artifacts
+                .as_ref()
+                .map(|s| s.secret_files.clone())
+                .unwrap_or_default(),
+            secret_paths: ctl
+                .spec
+                .artifacts
+                .as_ref()
+                .map(|s| s.secret_paths.clone())
+                .unwrap_or_default(),
+            masker: ctl.spec.mask.masker(),
+            serial: Mutex::new(()),
+        },
+    });
     // The one handle of the attempt: the core watches it, this side cancels.
     let cancel = CancelHandle::new();
     let (served, ran) = std::thread::scope(|s| {
@@ -675,6 +707,7 @@ mod tests {
     #[test]
     fn the_spec_shows_no_value_of_its_environment_and_needs_absolute_paths() {
         let mut ci = CiTaskSpec {
+            artifact_workflow: None,
             dispatch: None,
             plan_path: "/a/plan.json".into(),
             plan_digest: Digest::of_bytes(b"plan"),

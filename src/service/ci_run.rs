@@ -161,6 +161,19 @@ pub fn task_specs(
                     shard_retry_forbidden: false,
                     shard_preferred_worker: None,
                     task: CiTask {
+                        artifact_workflow: plan
+                            .workflows
+                            .iter()
+                            .find(|w| w.file == task.workflow)
+                            .filter(|w| {
+                                w.jobs
+                                    .iter()
+                                    .filter(|j| task.jobs.contains(&j.id))
+                                    .flat_map(|j| &j.steps)
+                                    .filter_map(|s| s.uses.as_deref())
+                                    .any(|u| local_ci::artifact::parse_uses(u).is_some())
+                            })
+                            .map(|w| w.file.clone()),
                         dispatch: None,
                         plan_digest: plan_digest.clone(),
                         task_id: task.id.clone(),

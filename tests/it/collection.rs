@@ -125,6 +125,10 @@ struct Job {
 #[derive(Default)]
 struct State {
     jobs: BTreeMap<AttemptId, Job>,
+    one_slot: bool,
+    pending_artifacts: BTreeMap<AttemptId, ArtifactAction>,
+    artifact_answers: BTreeMap<Digest, ArtifactAnswer>,
+    artifact_data: BTreeMap<Digest, Vec<u8>>,
     offline: bool,
     /// Lose the n-th request (from 1) of a kind, and be gone after it.
     trip: Option<(&'static str, usize, Lost)>,
@@ -266,6 +270,34 @@ impl Worker {
             }
         };
         match request {
+            Request::WorkflowArtifact(r) => {
+                let result = match r.command {
+                    WorkflowArtifactCommand::Poll => ArtifactExchangeResult::Pending {
+                        action: s.pending_artifacts.get(&r.attempt_id).cloned(),
+                    },
+                    WorkflowArtifactCommand::Answer { key, answer } => {
+                        assert_eq!(&s.pending_artifacts[&r.attempt_id].key, &key);
+                        s.artifact_answers.insert(key, answer);
+                        ArtifactExchangeResult::Accepted
+                    }
+                    WorkflowArtifactCommand::Read {
+                        key,
+                        digest,
+                        offset,
+                    } => {
+                        assert_eq!(&s.pending_artifacts[&r.attempt_id].key, &key);
+                        let blob = &s.artifact_data[&digest];
+                        let start = offset as usize;
+                        ArtifactExchangeResult::Chunk {
+                            data: Bytes(blob[start..blob.len().min(start + 128 * 1024)].to_vec()),
+                        }
+                    }
+                };
+                Ok(Response::WorkflowArtifact(WorkflowArtifactResponse {
+                    schema_version: SchemaVersion::CURRENT,
+                    result,
+                }))
+            }
             Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
                 preparation_observations: None,
                 capabilities: None,
@@ -277,8 +309,8 @@ impl Worker {
                 policy_digest: Digest::of_bytes(b"p"),
                 active_task: 0,
                 prefetch_pending: 0,
-                max_active_task: 8,
-                prefetch_per_worker: 8,
+                max_active_task: if s.one_slot { 1 } else { 8 },
+                prefetch_per_worker: if s.one_slot { 0 } else { 8 },
                 disk_free_bytes: 1,
                 draining: false,
             })),
@@ -437,6 +469,11 @@ impl Worker {
 
 fn kind_of(request: &Request) -> (&'static str, u64) {
     match request {
+        Request::WorkflowArtifact(r) => match &r.command {
+            WorkflowArtifactCommand::Read { offset, .. } => ("workflow_read", *offset),
+            WorkflowArtifactCommand::Answer { .. } => ("workflow_ack", 0),
+            WorkflowArtifactCommand::Poll => ("workflow_poll", 0),
+        },
         Request::Inspect(_) => ("inspect", 0),
         Request::GetAttempt(_) => ("get", 0),
         Request::SubmitAttempt(_) => ("submit", 0),
@@ -452,6 +489,10 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
 }
 
 impl WorkerLink for Worker {
+    fn workflow_artifacts_negotiated(&self) -> bool {
+        self.ci_task_negotiated()
+    }
+
     fn matrix_dispatch_negotiated(&self) -> bool {
         self.ci_task_negotiated()
     }
@@ -5129,4 +5170,141 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     let bytes = remote_task_runner::ci::advance::read_plan(fx.dir.path(), &changed).unwrap();
     let split: local_ci::FrozenPlan = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(split_group(&split).manifest, listing.discovered.tests);
+}
+
+#[tokio::test]
+async fn a38_live_artifact_transfer_resumes_before_either_worker_finishes() {
+    let fx = fx();
+    let (mut c, files) = fx.open();
+    let other = Worker::new("w-b");
+    fx.w.set(|s| s.one_slot = true);
+    other.set(|s| s.one_slot = true);
+    c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+        .unwrap();
+    let workflow = r#"on: push
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: result.dat
+          if-no-files-found: error
+      - run: echo still-running
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+"#;
+    let plan = ci_plan(workflow);
+    // Separate admission keeps each live job on a known worker without
+    // introducing a dependency on the producer's terminal result.
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    let first = &ids["produce"];
+    let second = &ids["consume"];
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 2);
+    let producer = c.store().attempts_of_task(first).unwrap()[0]
+        .attempt_id
+        .clone();
+    let consumer = c.store().attempts_of_task(second).unwrap()[0]
+        .attempt_id
+        .clone();
+    let worker_of = |id: &AttemptId| {
+        if fx.w.state.lock().unwrap().jobs.contains_key(id) {
+            fx.w.clone()
+        } else {
+            other.clone()
+        }
+    };
+    let up = worker_of(&producer);
+    let down = worker_of(&consumer);
+    assert_ne!(up.id, down.id);
+    let contents = vec![b'c'; 128 * 1024 + 17];
+    let digest = Digest::of_bytes(&contents);
+    let logical = &plan
+        .tasks
+        .iter()
+        .find(|t| t.jobs.iter().any(|j| j == "produce"))
+        .unwrap()
+        .workflow;
+    let upload = ArtifactAction {
+        key: Digest::of_bytes(b"upload"),
+        intent: ArtifactIntent::Upload {
+            overwrite: false,
+            receipt: json!({
+                "name":"package","version":1,"files":[{"path":"result.dat","size":contents.len(),"sha256":digest.as_str().strip_prefix("sha256:").unwrap()}],
+                "plan_digest":plan.digest,"attempt_id":"run","job":format!("{logical}::produce"),"display":"produce","task":null,"retention_days":null,
+            }),
+        },
+    };
+    up.set(|s| {
+        s.artifact_data.insert(digest.clone(), contents.clone());
+        s.pending_artifacts.insert(producer.clone(), upload.clone());
+    });
+    c.tick().await.unwrap();
+    assert!(c
+        .store()
+        .workflow_artifacts(&run, logical)
+        .unwrap()
+        .is_empty());
+    assert_eq!(up.offsets("workflow_read"), [0]);
+    drop(c);
+    drop(files);
+    (c, _) = fx.open();
+    c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+        .unwrap();
+    c.tick().await.unwrap();
+    c.tick().await.unwrap();
+    assert_eq!(up.offsets("workflow_read"), [0, 128 * 1024]);
+    assert_eq!(
+        up.state.lock().unwrap().artifact_answers[&upload.key],
+        ArtifactAnswer::Uploaded { version: 1 }
+    );
+    c.tick().await.unwrap();
+    assert_eq!(
+        c.store().workflow_artifacts(&run, logical).unwrap().len(),
+        1
+    );
+    up.set(|s| {
+        s.pending_artifacts.remove(&producer);
+    });
+    let catalog = ArtifactAction {
+        key: Digest::of_bytes(b"catalog"),
+        intent: ArtifactIntent::Catalog {
+            name: Some("package".into()),
+            pattern: None,
+        },
+    };
+    down.set(|s| {
+        s.pending_artifacts
+            .insert(consumer.clone(), catalog.clone());
+    });
+    c.tick().await.unwrap();
+    assert!(
+        matches!(&down.state.lock().unwrap().artifact_answers[&catalog.key],ArtifactAnswer::Catalog{artifacts} if artifacts.len()==1)
+    );
+    let fetch = ArtifactAction {
+        key: Digest::of_bytes(b"download"),
+        intent: ArtifactIntent::Fetch {
+            producer: producer.clone(),
+            name: "package".into(),
+            version: 1,
+            digest,
+            offset: 128 * 1024,
+        },
+    };
+    down.set(|s| {
+        s.pending_artifacts.insert(consumer, fetch.clone());
+    });
+    c.tick().await.unwrap();
+    assert_eq!(
+        down.state.lock().unwrap().artifact_answers[&fetch.key],
+        ArtifactAnswer::Chunk {
+            data: Bytes(vec![b'c'; 17])
+        }
+    );
 }
