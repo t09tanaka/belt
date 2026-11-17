@@ -244,10 +244,13 @@ fn completion_on(
     let mut stmt = c.prepare(&sql)?;
     // The first shard of a split job that is a failure (see below).
     let mut job_failed = None;
-    // Shards that were cancelled (stopped by fail-fast), and the first task
-    // that failed of itself: unless the run was cancelled as a whole, the
-    // run failed of the latter, wherever the ids of the former sort.
-    let mut stopped_shards = std::collections::BTreeSet::new();
+    // Whether a shard was cancelled (stopped by fail-fast), the tasks that
+    // were cancelled, and the first task that failed of itself: unless the
+    // run was cancelled as a whole, a run with a stopped shard failed of the
+    // latter, wherever the ids of the cancelled ones sort. A task of another
+    // job that was cancelled did not fail of itself either.
+    let mut stopped_shard = false;
+    let mut cancelled_tasks = std::collections::BTreeSet::new();
     let mut real_failure = None;
     let whole_run = task.is_none();
     let mut rows = stmt.query(params![run, task])?;
@@ -290,8 +293,9 @@ fn completion_on(
             (_, Some(t)) => t.outcome() == crate::state::Outcome::Cancelled,
             _ => false,
         };
-        if shard && was_cancelled {
-            stopped_shards.insert(task.clone());
+        if was_cancelled {
+            stopped_shard |= shard;
+            cancelled_tasks.insert(task.clone());
         } else if real_failure.is_none() {
             let failed =
                 termination.filter(|t| crate::service::completion::compute_failure(*t).is_some());
@@ -300,11 +304,11 @@ fn completion_on(
         let collection = collection.as_deref().filter(|_| !(whole_run && unjoined));
         snapshot.task(task, state, observation, termination, cancel, collection);
     }
-    let first_is_stopped_shard = snapshot
+    let first_was_cancelled = snapshot
         .first_compute_failure
         .as_ref()
-        .is_some_and(|f| stopped_shards.contains(&f.task_id));
-    if whole_run && !cancelled && first_is_stopped_shard {
+        .is_some_and(|f| cancelled_tasks.contains(&f.task_id));
+    if whole_run && !cancelled && stopped_shard && first_was_cancelled {
         match real_failure {
             Some((task, termination)) => snapshot.prefer_failure(task, termination),
             // No attempt failed of itself: the job did (its tests).

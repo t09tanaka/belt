@@ -42,6 +42,8 @@ struct TaskRow {
     /// A shard of a failed split job that did not pass on its own, whatever
     /// its attempt says (`ci.rerun`).
     rerun: bool,
+    /// The split job it is a shard of.
+    shard_group: Option<String>,
     task: String,
     min: i64,
     generation: Option<i64>,
@@ -232,16 +234,17 @@ impl CoordinatorStore {
     }
 }
 
-/// A shard of a split job runs again: the job has no outcome any more, for
-/// any of its shards, until all of them ended again. Nothing changes for a
-/// task that is no shard.
-fn unjoin(c: &Connection, task: &str) -> Result<()> {
+/// A shard of the split job `group` of `run` runs again: the job has no
+/// outcome any more, for any of its shards, until all of them ended again.
+///
+/// Only after the scan of a retry read every task: the mark that a shard
+/// did not pass on its own (`ci.rerun`) goes with the outcome, and a shard
+/// on a later page of the scan is still to be chosen by it.
+fn unjoin(c: &Connection, run: &RunId, group: &str) -> Result<()> {
     c.execute(
         "UPDATE task SET spec_json=json_remove(spec_json,'$.ci.joined','$.ci.join_failure','$.ci.rerun')
-         WHERE run_id=(SELECT run_id FROM task WHERE task_id=?1)
-         AND json_extract(spec_json,'$.ci.shard_group')=
-             (SELECT json_extract(spec_json,'$.ci.shard_group') FROM task WHERE task_id=?1)",
-        [task],
+         WHERE run_id=?1 AND json_extract(spec_json,'$.ci.shard_group')=?2",
+        params![run.as_str(), group],
     )?;
     Ok(())
 }
@@ -277,12 +280,15 @@ fn binding(c: &Connection, target: &Target, expected: u64) -> Result<Binding> {
 }
 
 /// Pages are fully read and dropped before task updates on the same connection.
+/// What a later page is chosen by (`ci.rerun`) is not written before the last.
 fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Scan> {
     let mut after = String::new();
     let mut count = 0_u64;
     let mut boundary = None;
     let mut secret = None;
     let mut hash = Sha256::new();
+    // The split jobs a shard of which runs again.
+    let mut unjoined = std::collections::BTreeSet::new();
     loop {
         let page = {
             let mut stmt = c.prepare(
@@ -290,7 +296,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                  EXISTS(SELECT 1 FROM attempt x LEFT JOIN retire_tombstone z USING(attempt_id) WHERE x.task_id=t.task_id AND x.retired=0 AND (x.state<>'terminal' OR (z.attempt_id IS NOT NULL AND z.confirmed_at_ms IS NULL))),
                  json_extract(t.spec_json,'$.manifest_digest'),json_extract(t.spec_json,'$.has_secret_bundle'),coalesce(json_extract(t.spec_json,'$.in_place'),0),
                  t.cancel_requested_at_ms IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.unrunnable'),'')=?5,
-                 coalesce(json_extract(t.spec_json,'$.ci.rerun'),0)
+                 coalesce(json_extract(t.spec_json,'$.ci.rerun'),0),json_extract(t.spec_json,'$.ci.shard_group')
                  FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id ORDER BY aa.generation DESC LIMIT 1)
                  WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) AND t.task_id>?3 ORDER BY t.task_id LIMIT ?4",
             )?;
@@ -317,6 +323,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                         in_place: r.get(10)?,
                         stopped_unplaced: r.get(11)?,
                         rerun: r.get(12)?,
+                        shard_group: r.get(13)?,
                     })
                 },
             )?;
@@ -352,7 +359,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                 if let Some(revision) = authorize {
                     c.execute("UPDATE task SET authorization_revision=?1,cancel_requested_at_ms=NULL,spec_json=json_remove(spec_json,'$.ci.unrunnable') WHERE task_id=?2",
                         params![to_i64(revision)?, row.task])?;
-                    unjoin(c, &row.task)?;
+                    unjoined.extend(row.shard_group);
                 }
                 continue;
             }
@@ -421,9 +428,12 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
             if let Some(revision) = authorize {
                 c.execute("UPDATE task SET min_generation=?1,authorization_revision=?2,cancel_requested_at_ms=NULL WHERE task_id=?3",
                     params![next, to_i64(revision)?, row.task])?;
-                unjoin(c, &row.task)?;
+                unjoined.extend(row.shard_group);
             }
         }
+    }
+    for group in &unjoined {
+        unjoin(c, &binding.run, group)?;
     }
     if count == 0 {
         return Err(StorageError::Invalid(
