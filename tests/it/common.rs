@@ -340,3 +340,13 @@ pub fn write_executable(path: &Path, text: &str) {
         .unwrap();
     assert!(child.wait().unwrap().success(), "writing {path:?}");
 }
+
+/// `LLVM_PROFILE_FILE` when this test run is measured for coverage. A child
+/// started with an emptied environment does not inherit it and would write
+/// `default_*.profraw` into its working directory, unmeasured; pass this on
+/// to such a child. Only tests use it: production keeps its environment.
+pub fn profile_env() -> Option<(String, String)> {
+    std::env::var("LLVM_PROFILE_FILE")
+        .ok()
+        .map(|v| ("LLVM_PROFILE_FILE".to_string(), v))
+}

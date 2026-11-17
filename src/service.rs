@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod completion;
 pub mod context;
 pub mod control;
+pub mod doctor;
 pub mod estimate;
 mod forward;
 pub mod input;

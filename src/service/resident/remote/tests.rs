@@ -480,3 +480,38 @@ async fn a_worker_added_after_startup_is_dialed_without_a_restart() {
         .unwrap()
         .unwrap();
 }
+
+#[tokio::test]
+async fn the_resident_says_which_build_it_is_and_what_it_negotiates() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let resident = resident(root.path()).await;
+    let client = resident.client();
+    let runner = tokio::spawn(resident.run());
+    let own =
+        crate::service::worker_service::sha256_file(&std::env::current_exe().unwrap()).unwrap();
+    match client.request(Operation::Build).await.unwrap() {
+        Reply::Build {
+            binary_sha256,
+            features,
+            required_features,
+        } => {
+            assert_eq!(binary_sha256, own);
+            assert_eq!(features, crate::protocol::session::offered_features());
+            assert_eq!(
+                required_features,
+                crate::protocol::session::required_features()
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    runner.await.unwrap().unwrap();
+    // A resident that cannot read its executable says so instead of guessing.
+    assert!(matches!(
+        build_reply(None),
+        Reply::Error { message } if message.contains("its own executable")
+    ));
+}

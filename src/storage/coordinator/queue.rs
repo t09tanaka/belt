@@ -54,6 +54,10 @@ pub type InputCursor = (u64, i64);
 pub type InputPage = Vec<(InputCursor, QueuedTask)>;
 pub type LiveAttemptPage = Vec<(InputCursor, LiveAttempt)>;
 
+/// Rows one paged read returns at most ([`CoordinatorStore::live_attempt_page`],
+/// [`CoordinatorStore::unacked_demand_page`]), whatever the caller asks for.
+pub const PAGE_MAX: u32 = 64;
+
 /// The attempts of one worker that hold a slot: not terminal and not
 /// confirmed retired. `active` may be running a command (`starting` onward);
 /// `pending` were placed and have not started, acknowledged or not.
@@ -425,7 +429,7 @@ impl CoordinatorStore {
         let worker = worker.map(ToString::to_string);
         self.db.call(move |c| {
             let mut query = c.prepare(&format!("SELECT t.task_id,t.run_id,t.spec_json,t.created_at_ms,t.rowid,r.source_id FROM task t JOIN run r ON r.run_id=t.run_id JOIN source_ref sr ON sr.source_id=r.source_id WHERE json_extract(t.spec_json,'$.manifest_digest')=sr.manifest_digest AND {predicate} AND (t.created_at_ms > ?1 OR (t.created_at_ms=?1 AND t.rowid>?2)) ORDER BY t.created_at_ms,t.rowid LIMIT ?3"))?;
-            let rows = query.query_map(params![created,rowid,i64::from(limit.min(64)),worker], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?)))?;
+            let rows = query.query_map(params![created,rowid,i64::from(limit.min(PAGE_MAX)),worker], |r| Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,i64>(3)?,r.get::<_,i64>(4)?,r.get::<_,Option<String>>(5)?)))?;
             rows.map(|row| {
                 let (task,run,spec,created,rowid,source)=row?;
                 let created=to_u64(created)?;
@@ -556,6 +560,49 @@ impl CoordinatorStore {
         })
     }
 
+    /// One live attempt of a worker, read by its id: what
+    /// [`Self::live_attempt_page`] would yield for it, without the rest.
+    pub fn live_attempt(
+        &self,
+        worker: &WorkerId,
+        attempt_id: &AttemptId,
+    ) -> Result<Option<LiveAttempt>> {
+        let (worker, aid) = (worker.to_string(), attempt_id.to_string());
+        self.db.call(move |c| {
+            let record = c
+                .query_row(
+                    &format!(
+                        "SELECT {ATTEMPT_COLS} FROM attempt
+                         WHERE attempt_id = ?1 AND worker_id = ?2
+                           AND state <> 'terminal' AND retired = 0"
+                    ),
+                    params![aid, worker],
+                    |r| Ok(attempt_from_row(r)),
+                )
+                .optional()?
+                .transpose()?;
+            let Some(record) = record else {
+                return Ok(None);
+            };
+            let retire_reason: Option<String> = c
+                .query_row(
+                    "SELECT reason FROM retire_tombstone
+                     WHERE attempt_id = ?1 AND confirmed_at_ms IS NULL",
+                    [&aid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(Some(LiveAttempt {
+                placement: placement_of(c, &aid)?,
+                retire_reason,
+                record,
+            }))
+        })
+    }
+
+    /// Every live attempt at once, in memory: for tests and diagnostics. The
+    /// coordinator walks [`Self::live_attempt_page`] instead.
+    ///
     /// The attempts that are not terminal and not confirmed retired (of one
     /// worker, or of all), oldest first.
     pub fn live_attempts(&self, worker_id: Option<&WorkerId>) -> Result<Vec<LiveAttempt>> {
@@ -609,6 +656,11 @@ impl CoordinatorStore {
         })
     }
 
+    /// A page of one worker's live attempts after `after`, oldest first, at
+    /// most [`PAGE_MAX`] rows. The cursor is the row itself, so a walk that
+    /// passes the last cursor back yields every attempt that stays live for
+    /// the whole walk exactly once, whatever ends, retires or is placed in
+    /// between; one that changes during the walk is yielded at most once.
     pub fn live_attempt_page(
         &self,
         worker: &WorkerId,
@@ -620,7 +672,7 @@ impl CoordinatorStore {
         let created = to_i64(created)?;
         self.db.call(move |c| {
             let mut query=c.prepare(&format!("SELECT {ATTEMPT_COLS},rowid FROM attempt WHERE worker_id=?1 AND state <> 'terminal' AND retired=0 AND (created_at_ms>?2 OR (created_at_ms=?2 AND rowid>?3)) ORDER BY created_at_ms,rowid LIMIT ?4"))?;
-            let rows=query.query_map(params![worker,created,rowid,i64::from(limit.min(64))], |r| Ok((attempt_from_row(r),r.get::<_,i64>(ATTEMPT_COLS.split(',').count())?)))?;
+            let rows=query.query_map(params![worker,created,rowid,i64::from(limit.min(PAGE_MAX))], |r| Ok((attempt_from_row(r),r.get::<_,i64>(ATTEMPT_COLS.split(',').count())?)))?;
             let mut out=Vec::new();
             for row in rows { let (record,rowid)=row?; let record=record?; let aid=record.attempt_id.to_string(); let cursor=(record.created_at_ms,rowid);
                 out.push((cursor,LiveAttempt {placement:placement_of(c,&aid)?,retire_reason:c.query_row("SELECT reason FROM retire_tombstone WHERE attempt_id=?1 AND confirmed_at_ms IS NULL",[&aid],|r|r.get(0)).optional()?,record})); }

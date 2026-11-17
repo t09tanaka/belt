@@ -76,10 +76,12 @@ impl Coordinator {
         let (loads, pending) = self
             .db(move |s| {
                 let mut loads = BTreeMap::new();
+                let mut pending = BTreeMap::new();
                 for id in ids {
                     loads.insert(id.clone(), s.worker_load(&id)?);
+                    pending.insert(id.clone(), scheduler::pending_plans(s, &id)?);
                 }
-                Ok((loads, s.unacked_demand()?))
+                Ok((loads, pending))
             })
             .await
             .map_err(invalid)?;
@@ -229,7 +231,7 @@ impl Coordinator {
                         request_id: RequestId::generate(),
                         coordinator_epoch: self.epoch(),
                         workload,
-                        pending: scheduler::pending_of(pending, &worker_id),
+                        pending: pending.get(&worker_id).cloned().unwrap_or_default(),
                     };
                     let request = if spec.is_some() {
                         Request::Forecast(forecast)

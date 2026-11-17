@@ -77,6 +77,10 @@ pub enum Operation {
     /// Re-read the private worker registration and dial workers added since
     /// startup. Never disconnects or changes a worker that is already dialed.
     ReloadWorkers,
+    /// Which binary this resident runs and what it offers and requires of a
+    /// worker in `hello`. A resident older than this operation cannot read
+    /// the request and closes the connection.
+    Build,
     Submit {
         run_id: RunId,
         source_id: SourceId,
@@ -128,6 +132,12 @@ pub enum Reply {
         /// The workers this request started dialing.
         connecting: Vec<String>,
     },
+    Build {
+        /// SHA-256 of the executable, read when the resident started.
+        binary_sha256: String,
+        features: Vec<String>,
+        required_features: Vec<String>,
+    },
     Health {
         cluster_id: ClusterId,
         coordinator_id: CoordinatorId,
@@ -153,6 +163,32 @@ pub enum Reply {
     Error {
         message: String,
     },
+}
+
+/// The digest of this process's executable, read once. The resident begins
+/// reading it when it starts (on a thread of its own: startup does not wait
+/// for it), so a binary replaced on disk later does not change it.
+pub(crate) fn own_build() -> Option<&'static str> {
+    static BUILD: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    BUILD
+        .get_or_init(|| {
+            let executable = std::env::current_exe().ok()?;
+            super::worker_service::sha256_file(&executable).ok()
+        })
+        .as_deref()
+}
+
+fn build_reply(build: Option<&str>) -> Reply {
+    match build {
+        Some(digest) => Reply::Build {
+            binary_sha256: digest.to_string(),
+            features: crate::protocol::session::offered_features(),
+            required_features: crate::protocol::session::required_features(),
+        },
+        None => Reply::Error {
+            message: "the resident could not read its own executable".into(),
+        },
+    }
 }
 
 /// No store is exposed: callers only receive socket credentials.
@@ -633,6 +669,7 @@ impl Resident {
             !inputs.collection_interval.is_zero(),
             "zero collection interval"
         );
+        std::thread::spawn(own_build);
         anyhow::ensure!(
             config.local_worker.value,
             "local resident requires local worker"
@@ -1096,6 +1133,13 @@ async fn handle(
         .await?;
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
+    if matches!(request.operation, Operation::Build) {
+        // The digest may still be being read; the runtime does not wait for it.
+        let build = tokio::task::spawn_blocking(own_build).await?;
+        return write_message(&mut stream, &build_reply(build))
+            .await
+            .map_err(Into::into);
+    }
     if matches!(request.operation, Operation::ReloadWorkers) {
         let (answer, wait) = oneshot::channel();
         let reply = if reload.send(answer).await.is_err() {
@@ -1259,8 +1303,8 @@ async fn handle(
                 },
             },
             // Answered before admission; never reaches this match.
-            Operation::ReloadWorkers => Reply::Error {
-                message: "reload is handled outside admission".into(),
+            Operation::ReloadWorkers | Operation::Build => Reply::Error {
+                message: "handled outside admission".into(),
             },
             Operation::Ping => Reply::Ready {
                 epoch: coordinator.store().epoch(),
