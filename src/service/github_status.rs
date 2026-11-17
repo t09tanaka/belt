@@ -79,6 +79,18 @@ impl Poster for Gh {
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| format!("gh cannot be run: {e}"))?;
+        // Both pipes are read while gh runs: output larger than a pipe
+        // holds must not stop gh and look like a hang.
+        fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                if let Some(mut pipe) = pipe {
+                    let _ = pipe.read_to_end(&mut bytes);
+                }
+                bytes
+            })
+        }
+        let (stderr, stdout) = (drain(child.stderr.take()), drain(child.stdout.take()));
         let started = Instant::now();
         let exit = loop {
             match child.try_wait() {
@@ -100,14 +112,9 @@ impl Poster for Gh {
         if exit.success() {
             return Ok(());
         }
-        let mut said = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut said);
-        }
-        if let Some(mut stdout) = child.stdout.take() {
-            let _ = stdout.read_to_string(&mut said);
-        }
-        Err(said)
+        let mut said = stderr.join().unwrap_or_default();
+        said.extend(stdout.join().unwrap_or_default());
+        Err(String::from_utf8_lossy(&said).into_owned())
     }
 }
 
@@ -270,6 +277,24 @@ mod tests {
         assert_eq!(
             gh.post(&post()),
             Err("gh: Bad credentials (HTTP 401)\nbody\n".into())
+        );
+    }
+
+    #[test]
+    fn a_refusal_larger_than_a_pipe_is_read_whole_and_is_no_timeout() {
+        let root = crate::test_tmp::tempdir().unwrap();
+        // 4000 lines of 50 bytes on each pipe: 200 KiB each.
+        let line = "x".repeat(49);
+        let script = format!(
+            "echo 'gh: Server Error (HTTP 500)' >&2\ni=0\nwhile [ $i -lt 4000 ]; do echo {line}; echo {line} >&2; i=$((i+1)); done\nexit 1"
+        );
+        let gh = fake(root.path(), &script, Duration::from_secs(60));
+        let said = gh.post(&post()).unwrap_err();
+        assert!(said.len() > 2 * 128 * 1024, "{}", said.len());
+        assert_eq!(said.lines().next(), Some("gh: Server Error (HTTP 500)"));
+        assert_eq!(
+            status::post_error("0123456789abcdef", &said),
+            "gh: Server Error (HTTP 500)"
         );
     }
 

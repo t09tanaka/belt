@@ -1504,5 +1504,6 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - 後からの投稿: `ci` を待たずに終わった run（interrupt、`submit` だけ、wait の中断）や、push 前で `failed`（`... is not on GitHub yet`）になった run に、後で投稿し直す command は無い（local-ci の `local-ci status` に当たるもの）。`retry` で結果が変わった run の status も更新しない。
 - `logs` には status の行を出していない（`ci` の出力と `show <run>` だけ）。
 - status を決めるとき source store を foreground で開く。別の capture と重なって開けなければ `skipped`（`the input of the run cannot be read`）になり、投稿されない。
+- `gh` の時間切れで止めるのは直接の子 process だけ。`gh` が起こした孫 process（credential helper など）は残り得る。孫が pipe を持ったまま `gh` が失敗で終わると、出力の読み取りが孫の終了まで待つ。
 - `local-ci status` 側に同じ検証を適用する件（仕様の一文）は local-ci の側に既に有り（`publishable`）、この行では local-ci を変えていない。
 - tracked file の exclude や追加 input の扱いは `worktree_tree` の一致に任せている（ignored の secret_files は仕様どおり一致判定に入れない）。CI task は secret_files を伴う source をまだ断るので、その組み合わせの実 binary のテストは無い。
