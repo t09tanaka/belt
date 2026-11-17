@@ -82,6 +82,9 @@ pub struct ShardSummary {
     pub workflow: String,
     pub source_jobs: Vec<String>,
     pub shards: Vec<String>,
+    /// Native partitions have no file assignments until the runner finishes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assigned_test_counts: Vec<usize>,
     pub split: bool,
     /// This unpartitioned candidate has to be listed on a worker.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -217,6 +220,11 @@ pub(crate) fn summarize(fp: &FrozenPlan) -> Result<PlanSummary, PlanError> {
             workflow: g.workflow.clone(),
             source_jobs: g.source_jobs.clone(),
             shards: g.shards.clone(),
+            assigned_test_counts: if g.split && g.assignments.iter().any(|a| !a.is_empty()) {
+                g.assignments.iter().map(|tests| tests.len()).collect()
+            } else {
+                Vec::new()
+            },
             split: g.split,
             discovery_candidate: g
                 .source_jobs
@@ -287,6 +295,11 @@ pub fn render_text(s: &PlanSummary) -> String {
                 "task {} expands its matrix when it runs: variants unknown",
                 t.id
             ));
+        }
+    }
+    for g in s.shard_groups.iter().filter(|g| g.split) {
+        for (id, count) in g.shards.iter().zip(&g.assigned_test_counts) {
+            lines.push(format!("shard {id} has {count} assigned tests"));
         }
     }
     for g in s.shard_groups.iter().filter(|g| !g.split) {

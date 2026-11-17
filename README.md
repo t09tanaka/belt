@@ -38,7 +38,7 @@ repository's resource admission and portool entry when running locally.
 
 `remote-task-runner ci plan` identifies jobs that a worker can enumerate.
 `remote-task-runner ci plan --run <run-id>` reads the stored plan, including
-the assigned tests and reasons a job stayed whole. Discovery runs against the
+the shard task IDs, test counts and reasons a job stayed whole. Discovery runs against the
 captured source with the job's setup. After the parent receives the listing,
 it releases the tests to run and keeps each shard's identity for retries.
 

@@ -592,7 +592,6 @@ fn run_ci_plan(cli: &Cli) -> i32 {
         let Command::Ci(args) = &cli.command else {
             unreachable!()
         };
-        let context = ci_context(args)?;
         if let Some(CiSub::Plan { run: Some(id) }) = &args.sub {
             let invalid =
                 |e: String| crate::error::ApiError::new(crate::error::ErrorCode::InvalidInput, e);
@@ -600,9 +599,14 @@ fn run_ci_plan(cli: &Cli) -> i32 {
                 return Err(invalid("a stored run already selects its source".into()));
             }
             let run = crate::ids::RunId::parse(id).map_err(|e| invalid(e.to_string()))?;
-            return crate::service::planning::stored(&context, &run);
+            let env = std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect();
+            let spec = crate::service::context::runtime_spec(&env)?;
+            return crate::service::planning::stored(&spec, &run);
         }
-        let prepared = crate::service::planning::prepare(context, args.git_ref.as_deref())?;
+        let prepared =
+            crate::service::planning::prepare(ci_context(args)?, args.git_ref.as_deref())?;
         let summary = prepared.plan().summary().clone();
         prepared.close()?;
         Ok(summary)
