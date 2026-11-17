@@ -790,6 +790,10 @@ impl Driver {
                 token,
                 reason,
             } => {
+                ensure!(
+                    *reason != HostFailureReason::WorkerFenced,
+                    "a fence has its own input"
+                );
                 if self.release_without_receipt(&mut s, task, token, *reason, false)? {
                     return self.checked(s);
                 }
@@ -2122,6 +2126,21 @@ mod tests {
         // only an admitted owner can be fenced
         assert!(d.propose(fence(&a, &a)).is_err());
         records.push(claim(&mut d, &a));
+        // an abort cannot record a fence, even before dispatch
+        assert!(d
+            .propose(Input::AbortBeforeExecution {
+                task: a.clone(),
+                token: a.clone(),
+                reason: HostFailureReason::WorkerFenced,
+            })
+            .is_err());
+        assert!(d
+            .propose(Input::AbortBeforeExecution {
+                task: a.clone(),
+                token: a.clone(),
+                reason: HostFailureReason::Setup,
+            })
+            .is_ok());
         records.push(mark(&mut d, &a));
         // a dispatched claim is beyond a host abort, and holds the only permit
         assert!(d

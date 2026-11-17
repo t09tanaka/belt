@@ -31,8 +31,10 @@ actual escaped owner and immutable job count, including after dispatch and
 cancellation ACK. Admission rejects before consuming these guarantees. The
 reserve also covers unstarted terminals, outstanding cancellation actions and
 the final completion envelope. It also keeps, through dispatch, the capacity of
-a release without a receipt, so a fence of an admitted claim is never refused
-for state capacity. State capacity rejection cannot prove that a worker
+a release without a receipt (the terminal, its publication and its join). What
+that release makes ready is checked like any other progress: a fence refused
+with `DriverStorageError` leaves the claim held, and is admissible after
+`Input::Cancel`, which makes nothing ready. State capacity rejection cannot prove that a worker
 stopped; only the validated receipt or the host fence releases that owner.
 
 ## Required host adapter behavior

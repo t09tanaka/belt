@@ -2,6 +2,17 @@
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-17
+
+- Add `local_ci::driver::Driver`, a host-neutral state machine that advances a run over a frozen plan: the order of the job graph, the members of a matrix (static, or named by another job's output and derived from verified source), `max-parallel`, `fail-fast`, matrix and shard joins, and run cancellation. A host proposes each input, stores the returned `Transition`, then applies it; replaying the stored records gives the same state. The driver keeps its state within a fixed size and settles a result it cannot hold as a typed infrastructure failure, never as invented outputs. See "Driving a run from another host" in the README and `tests/driver_host.rs`.
+- A claimed task holds a permit until its real result (`Input::Settle`), a host abort before dispatch (`Input::AbortBeforeExecution`), or a host fence (`Input::Fence`). A fence releases a claim whose worker will not answer, fails the job with no outputs, and makes the driver refuse a result that arrives later under that token. A cancel request or its acknowledgement never releases a permit.
+- The Runner and the driver evaluate a job (`if:`, the matrix, names) with the same code. The Runner alone decides which legs of another OS a leg of the host's OS stands in for; what `local-ci run` does is unchanged.
+- Add `execute_git_dispatch` and `source_execute::execute_pinned_dispatch`, which run one member of a dynamic matrix after deriving its dispatch again from verified source, and `source_execute::git_evaluation_source`, which reads the scheduling facts of a plan from its exact commit with bounded reads.
+- Planning from Git keeps the exact bytes of a workflow (the trailing newline of a block scalar is no longer trimmed), needs a Git with `--no-lazy-fetch`, and reads at most 4096 workflows and 4 MiB of them. A plan frozen by an earlier version from a workflow that ends in a block scalar has to be frozen again.
+- Native steps stay owned until their matrix entry ends, and are drained before the entry's services and Compose projects are removed. A Compose project named by `COMPOSE_PROJECT_NAME` from outside, or by a script local-ci did not rewrite, is no longer brought down by cleanup. A container is removed by the full id its creation returned.
+- Timing floats keep their exact bits across a receipt replay (`serde_json`'s `float_roundtrip`).
+- Not in this version: `local-ci run` does not schedule through the driver yet; retrying a shard under a new attempt and moving artifacts between workers remain the host's work, with no driver API.
+
 ## [0.17.1] - 2026-11-16
 
 - Fix worktree registrations left in the repository when the checkout a run was started from (a linked worktree) is removed while the run goes on. The run ran `git worktree prune` in that checkout, which failed once it was gone, and the failure was not reported; the files were deleted, so nothing in the cache said whose the registration was and `local-ci cache prune` could not drop it. A run now unregisters each worktree in the repository the worktree itself is registered in.

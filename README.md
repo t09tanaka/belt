@@ -702,6 +702,99 @@ workspace after checking each against its HMAC.
   killed during the write can leave a `.secrets.tmp-*` file (0600, the secret
   files in plain) next to the path: sweep those when you keep the directory.
 
+## Driving a run from another host (library)
+
+`local_ci::driver::Driver` advances one run over a frozen plan without doing
+any work itself: it decides what is ready, how many tasks may be held at once,
+when a matrix or a set of shards is complete, and what a cancel reaches. It
+reads no clock, file or process, so a host that distributes tasks to workers
+and a host that runs them in place share the same progression. Tasks are
+executed with the existing Runner (`execute_task`, `execute_git_dispatch`,
+`execute_pinned_task`, `execute_pinned_dispatch`), which evaluates jobs with
+the same code the driver uses to expand a matrix.
+
+```rust
+use local_ci::driver::{ActionKind, Driver, DriverConfig, Input, DRIVER_VERSION};
+
+let config = DriverConfig { schema_version: DRIVER_VERSION, max_parallel: 4 };
+// `Driver::new(&plan, config)` when no matrix depends on another job's output
+let mut driver = Driver::with_evaluation(&plan, config, &source, facts)?;
+
+// every change is proposed, stored by the host, then applied
+let record = driver.propose(Input::Advance)?;
+journal.append(serde_json::to_string(&record)?)?;
+driver.apply(&record)?;
+
+for action in driver.pending_actions() {
+    match &action.kind {
+        ActionKind::Ready { task, inputs } => { /* a task of the plan */ }
+        ActionKind::DerivedReady { dispatch, inputs } => { /* a member of a dynamic matrix */ }
+        ActionKind::Cancel { task, token } => { /* tell that worker to stop, then Ack */ }
+        ActionKind::Finished => { /* every task is decided */ }
+    }
+}
+```
+
+**Progress.** `propose(input)` computes a `Transition` and changes nothing;
+`apply(&transition)` recomputes it and refuses a record that was altered, is
+out of order, or belongs to another plan or configuration. Replaying the stored
+records into a new `Driver` gives the same state (`Transition::from_json`), so
+the journal is the only thing a host has to keep. `Input::Advance` makes the
+first tasks ready; later inputs advance the run by themselves.
+
+**Events.** `pending_actions()` is the outbox: `Ready`, `DerivedReady`,
+`Cancel` and `Finished`, each with a stable `id`. A ready action leaves the
+outbox when its task is claimed; a `Cancel` when the host sends
+`Input::Ack { action }` or the task ends. An action that is still there after a
+restart has to be delivered again, so delivery must be idempotent on `id`.
+The members of a matrix that is an expression over `needs` appear as
+`DerivedReady` once the job that names them has settled: the driver derives
+them from the verified source (`git_evaluation_source` or
+`PinnedExecution::evaluation_source`) and the host's `PortableFacts`, and the
+worker derives the same dispatch again before it runs anything.
+`requirements(task)` gives the `runs-on` of a task for placement.
+
+**Permits.** `Input::Claim { task, token }` admits one attempt and takes a
+permit; it is refused when `max_parallel` or the `max-parallel` of the job's
+matrix is used up (`admitted()` counts the claims held). The host commits
+`Input::MarkDispatched` before it sends the work. The permit is released by
+exactly one of:
+
+- `Input::Settle { task, token, result_digest, result }`, the worker's
+  `WireTaskResult`. The driver checks it against the task before it publishes
+  outcomes, joins the matrix (`fail-fast` included) or the shards
+  (`shard_join`), and makes the jobs that need them ready.
+- `Input::AbortBeforeExecution { task, token, reason }`: the host could not
+  start a claim that was never dispatched.
+- `Input::Fence { task, token }`: the host has revoked a claim that will not
+  answer (a lost worker). The job fails with no outputs, and a result that
+  arrives later under that token is refused. The driver cannot know that the
+  worker stopped; the host answers for what it still holds.
+
+**Cancel.** `Input::Cancel` cancels the run: tasks nobody claimed are decided
+as cancelled, and each claimed task gets a `Cancel` action. A claim keeps its
+permit until its result, abort or fence arrives; an acknowledged `Cancel` is
+not a stop. `fail-fast` uses the same requests for the other members of a
+matrix or a set of shards.
+
+**Results.** `outcome(workflow, job)` is the published outcome of a job (a
+matrix joined as on GitHub), `core_decision(task)` says when the driver decided
+a task without a worker (skipped, cancelled, host failure), and
+`infrastructure_failure()` must be checked before a run is reported as passed:
+a result too large for the driver's bounded state is kept as its digest and
+statuses (`unavailable_worker_receipt`) and stops the run instead of
+publishing outputs it does not have. The bounds and what a host has to do
+about them are in the module documentation (`cargo doc`, `local_ci::driver`).
+
+`tests/driver_host.rs` is a complete host in about two hundred lines: a
+dynamic matrix run through the driver and the Runner, a replay of its journal,
+and a lost worker that is fenced.
+
+Not in this version: the `local-ci` command still schedules with its own
+Runner loop, retrying a shard under a new attempt is the host's work (a fenced
+or failed shard fails its join), and artifacts move through the host's own
+storage (`artifact_io`), not through the driver.
+
 ## Files
 
 The cache directory is `~/Library/Caches/local-ci` on macOS and
@@ -780,7 +873,7 @@ cargo test --features browser-tests   # without the feature, the tests that star
 The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
 `src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`, `src/shard.rs`, `src/shard/adapters.rs`,
 `src/shard/coverage.rs`, `src/shard/isolation.rs`, `src/demand.rs`, `src/result_wire.rs`) are gated on 100% line coverage over the whole test suite (`src/wire.rs` and `src/digest.rs` are held to the mutation gate only: the line counts of their generic and per-crate code are not stable enough for a 100% line gate).
-All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
+All of them but `src/dag.rs` are also gated on zero surviving mutants. The shared driver and the job evaluation it shares with the Runner (`src/driver.rs`, `src/driver/atomic.rs`, `src/driver/dispatch.rs`, `src/driver/shards.rs`, `src/job_evaluate.rs`) are held to both gates as well. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
 component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
 
 ```sh
@@ -852,8 +945,8 @@ namespace. Hosts retain workspace, secret restoration and cleanup ownership via
 
 `source_execute::git_evaluation_source(ctx, repository, frozen_plan)` reads the
 ordinary Git plan's exact full commit and returns `VerifiedEvaluationSource`.
-It preserves the original `runs-on` facts omitted from the frozen workflow
-projection. Each workflow must be a regular blob at the exact literal path,
+It rereads the original `runs-on` facts from the source instead of trusting
+the frozen workflow projection. Each workflow must be a regular blob at the exact literal path,
 match the frozen projection, and pass raw-byte Git OID and SHA-256 checks.
 Working-tree edits and replacement refs cannot retarget these reads.
 
