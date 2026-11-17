@@ -46,13 +46,13 @@ fn spec() -> TaskSpec {
     }
 }
 
-struct Fx {
+pub(super) struct Fx {
     _dir: tempfile::TempDir,
-    c: Coordinator,
-    worker: WorkerId,
+    pub(super) c: Coordinator,
+    pub(super) worker: WorkerId,
 }
 
-fn fx() -> Fx {
+pub(super) fn fx() -> Fx {
     let dir = crate::test_tmp::tempdir().unwrap();
     let store = CoordinatorStore::open(dir.path(), 1).unwrap();
     let c = Coordinator::start(store, CoordinatorConfig::default()).unwrap();
@@ -66,7 +66,7 @@ fn fx() -> Fx {
 impl Fx {
     /// Queue one task and commit its placement, as `dispatch` does before it
     /// sends anything.
-    async fn placed(&self) -> (TaskId, AttemptId) {
+    pub(super) async fn placed(&self) -> (TaskId, AttemptId) {
         let source = SourceId::generate();
         self.c
             .store()

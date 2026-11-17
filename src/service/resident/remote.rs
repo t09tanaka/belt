@@ -62,10 +62,6 @@ fn registered(
     })?;
     let mut workers = Vec::new();
     for worker in registered.workers {
-        anyhow::ensure!(
-            !worker.ephemeral,
-            "ephemeral remote enrollment is unsupported"
-        );
         let id = WorkerId::parse(&worker.id)?;
         anyhow::ensure!(
             &id != local_id,
@@ -76,6 +72,86 @@ fn registered(
         workers.push(worker);
     }
     Ok(workers)
+}
+
+/// `workers forget`, answered by the resident: the registration says whether
+/// the worker is ephemeral, the coordinator whether it is connected.
+pub(super) async fn forget(
+    coordinator: &Coordinator,
+    config: &ResolvedConfig,
+    env: &BTreeMap<String, String>,
+    local_id: &WorkerId,
+    worker: &WorkerId,
+) -> Reply {
+    use crate::coordinator::identity::ForgetRefusal;
+    use crate::error::{ApiError, ErrorCode};
+    let (config, env, local_id) = (config.clone(), env.clone(), local_id.clone());
+    let fresh = tokio::task::spawn_blocking(move || reload(&config, &env, &local_id)).await;
+    let ephemeral = match fresh {
+        Ok(Ok(fresh)) => fresh
+            .workers
+            .iter()
+            .find(|registered| registered.id == worker.as_str())
+            .map(|registered| registered.ephemeral),
+        Ok(Err(e)) => {
+            return Reply::ControlError {
+                error: ApiError::new(
+                    ErrorCode::InvalidInput,
+                    format!("worker registration unusable: {e}"),
+                ),
+            }
+        }
+        Err(e) => {
+            return Reply::ControlError {
+                error: ApiError::new(ErrorCode::Internal, e.to_string()),
+            }
+        }
+    };
+    match coordinator.forget_worker(worker, ephemeral).await {
+        Ok(Ok(forgotten)) => Reply::WorkerForgotten {
+            identity_retired: forgotten.identity.is_some(),
+            ended: forgotten.ended,
+        },
+        Ok(Err(refusal)) => Reply::ControlError {
+            error: ApiError::new(
+                match refusal {
+                    ForgetRefusal::NotRegistered => ErrorCode::NotFound,
+                    ForgetRefusal::NotEphemeral => ErrorCode::InvalidInput,
+                    ForgetRefusal::Connected => ErrorCode::Conflict,
+                },
+                refusal.message(),
+            ),
+        },
+        Err(e) => Reply::ControlError {
+            error: ApiError::new(ErrorCode::Internal, e.to_string()),
+        },
+    }
+}
+
+/// An ephemeral worker is let in by the identity it reports (spec chapter
+/// 15): a retired identity is refused, and a new start retires the one
+/// before it. A persistent worker has one identity and is not asked.
+pub(super) async fn admit(
+    coordinator: &Coordinator,
+    worker: &WorkerSpec,
+    hello: &crate::wire::HelloResponse,
+) -> anyhow::Result<()> {
+    if !worker.ephemeral {
+        return Ok(());
+    }
+    // Recorded under the registered name, never under a name the peer chose.
+    anyhow::ensure!(
+        hello.worker_id.as_str() == worker.id,
+        "the worker answered under another name"
+    );
+    let admission = coordinator
+        .admit_identity(&hello.worker_id, &hello.worker_boot_id)
+        .await?;
+    anyhow::ensure!(
+        admission != crate::coordinator::identity::Admission::Retired,
+        "the worker identity was retired"
+    );
+    Ok(())
 }
 
 /// The command run on the worker host: the registered absolute binary, or the
@@ -240,10 +316,17 @@ async fn session(
         let connected = connected?;
         let client = connected.client.clone();
         let worker_id = connected.worker.worker_id.clone();
+        let boot = connected.worker.worker_boot_id.clone();
+        admit(&coordinator, worker, &connected.worker).await?;
         let gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(format!("ssh-private-rpc-v1:{}",Digest::of_bytes(&serde_json::to_vec(&serde_json::json!({"argv":argv,"protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"policy":"source-64k-v1"}))?))));
         gate.observe(connected.worker.worker_boot_id.clone(),connected.worker.agent_epoch).await;
         let link = config.attach_gated_worker(&coordinator, WorkerTarget::Remote(&worker.id), connected, gate.clone())
             .await.map_err(|e| anyhow::anyhow!(e.message))?;
+        // A forget that ran between the admission and the attachment.
+        if worker.ephemeral && coordinator.identity_retired(&worker_id, &boot).await? {
+            coordinator.detach_link(&worker_id, &link).await?;
+            anyhow::bail!("the worker identity was retired");
+        }
         let (cancel, cancelled) = watch::channel(false);
         let mut jobs = JoinSet::new();
         jobs.spawn(delivery::sources(coordinator.clone(), captured.clone(), client.clone(), worker_id.clone(), gate.clone(), cancelled.clone()));

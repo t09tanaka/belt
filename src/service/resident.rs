@@ -86,6 +86,13 @@ pub enum Operation {
     /// Re-read the private worker registration and dial workers added since
     /// startup. Never disconnects or changes a worker that is already dialed.
     ReloadWorkers,
+    /// `workers forget`: the user declared an ephemeral worker gone. Refused
+    /// for a persistent worker and for one that is connected. A resident
+    /// older than this operation cannot read the request and closes the
+    /// connection.
+    ForgetWorker {
+        worker: WorkerId,
+    },
     /// Which binary this resident runs and what it offers and requires of a
     /// worker in `hello`. A resident older than this operation cannot read
     /// the request and closes the connection.
@@ -143,6 +150,12 @@ pub enum Reply {
     WorkersReloaded {
         /// The workers this request started dialing.
         connecting: Vec<String>,
+    },
+    WorkerForgotten {
+        /// Whether an identity was recorded for the worker and is retired now.
+        identity_retired: bool,
+        /// The attempts that were ended, oldest first.
+        ended: Vec<AttemptId>,
     },
     Build {
         /// SHA-256 of the executable, read when the resident started.
@@ -810,7 +823,7 @@ impl Resident {
                 rx.clone(),
             ));
         }
-        let (reload_tx, mut reload_rx) = mpsc::channel::<oneshot::Sender<Reply>>(4);
+        let (reload_tx, mut reload_rx) = mpsc::channel::<Control>(4);
         let (base, env, local) = (
             self.remote_config.clone(),
             self.remote_env.clone(),
@@ -913,8 +926,19 @@ impl Resident {
                     match result { Some(Ok(Err(e))) => failure = Some(e), Some(Err(e)) => failure = Some(e.into()), _ => {} }
                     break;
                 },
-                Some(answer) = reload_rx.recv() => {
+                Some(control) = reload_rx.recv() => {
                     let (base, env, local) = (base.clone(), env.clone(), local.clone());
+                    let answer = match control {
+                        Control::Reload(answer) => answer,
+                        Control::Forget(worker, answer) => {
+                            // Off this loop: it waits for the coordinator's actor.
+                            let coordinator = self.coordinator.clone();
+                            requests.spawn(async move {
+                                let _ = answer.send(remote::forget(&coordinator, &base, &env, &local, &worker).await);
+                            });
+                            continue;
+                        }
+                    };
                     let fresh = tokio::task::spawn_blocking(move || remote::reload(&base, &env, &local)).await;
                     let reply = match fresh {
                         Ok(Ok(fresh)) => {
@@ -1108,6 +1132,12 @@ where
         Err(error) => error_reply(error),
     })
 }
+/// What a request asks of the resident's own loop, which holds the worker
+/// registration.
+enum Control {
+    Reload(oneshot::Sender<Reply>),
+    Forget(WorkerId, oneshot::Sender<Reply>),
+}
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: UnixStream,
@@ -1119,7 +1149,7 @@ async fn handle(
     client: Client,
     admission: Arc<Mutex<bool>>,
     stop: watch::Sender<bool>,
-    reload: mpsc::Sender<oneshot::Sender<Reply>>,
+    reload: mpsc::Sender<Control>,
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
@@ -1162,9 +1192,21 @@ async fn handle(
             .await
             .map_err(Into::into);
     }
-    if matches!(request.operation, Operation::ReloadWorkers) {
+    let control = match &request.operation {
+        Operation::ReloadWorkers => Some((None, "the resident did not finish the reload in time")),
+        Operation::ForgetWorker { worker } => Some((
+            Some(worker.clone()),
+            "the resident did not answer in time; whether the worker was forgotten is not known, run workers forget again",
+        )),
+        _ => None,
+    };
+    if let Some((forget, late)) = control {
         let (answer, wait) = oneshot::channel();
-        let reply = if reload.send(answer).await.is_err() {
+        let control = match forget {
+            Some(worker) => Control::Forget(worker, answer),
+            None => Control::Reload(answer),
+        };
+        let reply = if reload.send(control).await.is_err() {
             Reply::Stopping
         } else {
             match tokio::time::timeout(Duration::from_secs(4), wait).await {
@@ -1172,7 +1214,7 @@ async fn handle(
                 _ => Reply::ControlError {
                     error: crate::error::ApiError::new(
                         crate::error::ErrorCode::CommunicationUnknown,
-                        "the resident did not finish the reload in time",
+                        late,
                     ),
                 },
             }
@@ -1343,9 +1385,11 @@ async fn handle(
                 },
             },
             // Answered before admission; never reaches this match.
-            Operation::ReloadWorkers | Operation::Build => Reply::Error {
-                message: "handled outside admission".into(),
-            },
+            Operation::ReloadWorkers | Operation::ForgetWorker { .. } | Operation::Build => {
+                Reply::Error {
+                    message: "handled outside admission".into(),
+                }
+            }
             Operation::Ping => Reply::Ready {
                 epoch: coordinator.store().epoch(),
             },

@@ -340,6 +340,28 @@ INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');"#.to
             // worker's whole history. Performance only; it adds no feature
             // marker, the version bump alone makes an older binary refuse.
             "CREATE INDEX placement_unacked ON placement(worker_id,placement_id) WHERE acked_at_ms IS NULL;\nCREATE INDEX attempt_worker_live ON attempt(worker_id,created_at_ms) WHERE state <> 'terminal' AND retired=0;".into(),
+            // The identity an ephemeral worker reported last, and the
+            // identities that were retired (`workers forget`, or a new start
+            // under the same name). A retired identity is kept for the life
+            // of the cluster: it is what refuses a worker that comes back
+            // late.
+            r#"CREATE TABLE worker_identity (
+    worker_id        TEXT PRIMARY KEY,
+    boot_id          TEXT NOT NULL,
+    first_seen_at_ms INTEGER NOT NULL
+);
+CREATE TABLE worker_identity_tombstone (
+    worker_id      TEXT NOT NULL,
+    boot_id        TEXT NOT NULL,
+    reason         TEXT NOT NULL CHECK (reason IN ('forgotten','replaced')),
+    recorded_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (worker_id, boot_id)
+);
+CREATE TRIGGER worker_identity_tombstone_no_delete BEFORE DELETE ON worker_identity_tombstone
+BEGIN SELECT RAISE(ABORT, 'identity tombstones are kept for the life of the cluster'); END;
+CREATE TRIGGER worker_identity_tombstone_fixed BEFORE UPDATE ON worker_identity_tombstone
+BEGIN SELECT RAISE(ABORT, 'an identity tombstone never changes'); END;"#
+                .to_string(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

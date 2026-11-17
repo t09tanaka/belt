@@ -25,6 +25,8 @@
 mod collect;
 mod env_sync;
 mod estimate;
+mod forget;
+pub mod identity;
 mod input_gate;
 mod link;
 pub mod policy;
