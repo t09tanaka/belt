@@ -1,7 +1,7 @@
 
 ## Fixed state budget and genuine results
 
-Driver V7 keeps the 64 MiB state and Wire budgets. A Wire and its bounded
+Driver V8 keeps the 64 MiB state and Wire budgets. A Wire and its bounded
 ownership/replay envelope have separate size limits. After all existing genuine
 receipt checks pass, a settlement whose resident receipt, outcome publication,
 join or derived input copies exceed state capacity commits a typed
@@ -19,7 +19,8 @@ empty successful outputs in place of unavailable values.
 The failure halts the whole run: unclaimed work becomes
 `CoreDecision::InfrastructureBlocked`, new readiness and joins stop, and other
 claimed owners receive normal cancellation requests. Their permits remain held
-through ACK until an actual receipt or an exact never-dispatched host abort.
+through ACK until an actual receipt, an exact never-dispatched host abort or a
+host fence of that claim.
 Already expanded origins close without publishing a synthetic matrix aggregate.
 `shard_join_availability` explicitly reports unavailable aggregation; this is not
 missing genuine test coverage. Existing settled workers and published outcomes
@@ -29,8 +30,10 @@ Every admitted claim reserves its bounded receipt-status terminal using the
 actual escaped owner and immutable job count, including after dispatch and
 cancellation ACK. Admission rejects before consuming these guarantees. The
 reserve also covers unstarted terminals, outstanding cancellation actions and
-the final completion envelope. State capacity rejection cannot prove that a
-worker stopped; only the validated receipt releases that owner.
+the final completion envelope. It also keeps, through dispatch, the capacity of
+a release without a receipt, so a fence of an admitted claim is never refused
+for state capacity. State capacity rejection cannot prove that a worker
+stopped; only the validated receipt or the host fence releases that owner.
 
 ## Required host adapter behavior
 
@@ -48,5 +51,7 @@ worker joining and the original host cleanup/report responsibilities remain.
 
 This explicit fixed-budget failure policy may stop unrelated pending work. It
 does not supply durable-reference hydration, success-preserving progress for
-arbitrarily large valid results, codec support beyond the Wire limit, or fenced
-termination of unreachable workers. No legacy scheduler fallback is implied.
+arbitrarily large valid results, codec support beyond the Wire limit, or proof
+that a fenced worker stopped: `Input::Fence` records the host revoking a claim,
+and the host answers for what that worker still holds. No legacy scheduler
+fallback is implied.

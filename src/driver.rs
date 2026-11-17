@@ -7,11 +7,12 @@
 //! starting task execution, hosts MUST durably commit/apply MarkDispatched. Its marker
 //! means may-have-started, not authenticated delivery. Hosts serialize dispatch
 //! with cancellation and reconcile crash/replay without sending twice.
-//! Admission releases on a real terminal Wire receipt, or a typed host abort
-//! asserting execution was never dispatched. The latter trusts the host:
-//! drain preparation and queued senders first. Cancel/ACK never proves stopping.
+//! Admission releases on a real terminal Wire receipt, a typed host abort
+//! asserting execution was never dispatched, or a host fence of the exact claim.
+//! The latter two trust the host: drain preparation and queued senders before an
+//! abort; revoke the attempt before a fence. Cancel/ACK never proves stopping.
 //! After dispatch, errors (including run_task errors after partial execution) need
-//! a real receipt or a separately designed authenticated fenced-stop path.
+//! a real receipt or a fence. Core rejects any later receipt under a fenced token.
 //! Worker ownership/source/receipt authentication remains the host's duty.
 
 #![doc = include_str!("driver/RESULT_STORAGE.md")]
@@ -30,7 +31,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-pub const DRIVER_VERSION: u32 = 7;
+pub const DRIVER_VERSION: u32 = 8;
 mod shards;
 pub use shards::{FrozenShardUnsupported, ShardJoin};
 mod atomic;
@@ -75,6 +76,15 @@ pub enum Input {
         task: String,
         token: String,
         reason: HostFailureReason,
+    },
+    /// Trusted host assertion that this exact claim is fenced: the host has
+    /// durably revoked the attempt, so it will deliver no receipt under this
+    /// token, and it accounts for whatever the worker still holds. Releases
+    /// the claim without a receipt, dispatched or not; core rejects a later
+    /// Settle under the token. This is not proof that the worker stopped.
+    Fence {
+        task: String,
+        token: String,
     },
     /// A real worker result. Host must fence/verify attempt ownership first.
     /// Accepted even without a dispatch marker: the real terminal is stronger.
@@ -200,7 +210,7 @@ fn storage_error(error: anyhow::Error) -> anyhow::Error {
     .into()
 }
 
-/// Bounded host preparation categories; detailed errors remain in host storage.
+/// Bounded host failure categories; detailed errors remain in host storage.
 /// None of these categories attests that an already-dispatched worker stopped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,6 +220,8 @@ pub enum HostFailureReason {
     Setup,
     Provenance,
     ExecutorPreparation,
+    /// Recorded by `Input::Fence`: the host revoked a claim without a receipt.
+    WorkerFenced,
 }
 impl HostFailureReason {
     fn diagnostic(self) -> &'static str {
@@ -219,6 +231,7 @@ impl HostFailureReason {
             Self::Setup => "host setup preparation failed",
             Self::Provenance => "host provenance preparation failed",
             Self::ExecutorPreparation => "host executor preparation failed",
+            Self::WorkerFenced => "host fenced the claim without a worker receipt",
         }
     }
 }
@@ -777,86 +790,14 @@ impl Driver {
                 token,
                 reason,
             } => {
-                let t = self.task(&s, task).context("unknown task")?;
-                if let Phase::Terminal(Terminal::HostAbort {
-                    token: old,
-                    reason: old_reason,
-                    ..
-                }) = &s.phases[task]
-                {
-                    ensure!(
-                        old == token && old_reason == reason,
-                        "conflicting duplicate host abort"
-                    );
+                if self.release_without_receipt(&mut s, task, token, *reason, false)? {
                     return self.checked(s);
                 }
-                let Phase::Claimed {
-                    token: owner,
-                    inputs,
-                    dispatched,
-                    cancel_requested,
-                } = &s.phases[task]
-                else {
-                    bail!("host abort has no admitted owner")
-                };
-                ensure!(owner == token, "host abort owner mismatch");
-                ensure!(
-                    !dispatched,
-                    "host abort cannot release dispatched execution"
-                );
-                let cancelled = s.cancelled || *cancel_requested;
-                let decision = if cancelled {
-                    CoreDecision::UnstartedCancelled
-                } else {
-                    CoreDecision::HostFailure
-                };
-                let wf = self
-                    .plan
-                    .workflows
-                    .iter()
-                    .find(|w| w.file == t.workflow)
-                    .context("missing workflow")?;
-                let mut outcomes: Vec<JobOutcome> = Vec::new();
-                for job in &t.jobs {
-                    let ancestor_failed =
-                        wf.job(job)
-                            .context("missing job")?
-                            .needs
-                            .iter()
-                            .any(|need| {
-                                outcomes
-                                    .iter()
-                                    .find(|o| &o.job == need)
-                                    .or_else(|| inputs.needs.get(need))
-                                    .is_some_and(JobOutcome::failed_or_ancestor_failed)
-                            });
-                    outcomes.push(JobOutcome {
-                        job: job.clone(),
-                        variant: t.variant.as_ref().map(|v| v.index),
-                        status: if cancelled {
-                            JobStatus::Cancelled
-                        } else {
-                            JobStatus::Failure
-                        },
-                        outputs: BTreeMap::new(),
-                        skipped: cancelled.then(|| "run cancelled before dispatch".into()),
-                        ancestor_failed,
-                    });
-                }
-                s.phases.insert(
-                    task.clone(),
-                    Phase::Terminal(Terminal::HostAbort {
-                        token: token.clone(),
-                        reason: *reason,
-                        decision,
-                        outcomes,
-                    }),
-                );
-                s.outbox.retain(
-                    |a| !matches!(&a.kind, ActionKind::Cancel { task: id, .. } if id == task),
-                );
-                if !cancelled {
-                    self.fail_fast(&mut s, &t)?;
+            }
+            Input::Fence { task, token } => {
+                let reason = HostFailureReason::WorkerFenced;
+                if self.release_without_receipt(&mut s, task, token, reason, true)? {
+                    return self.checked(s);
                 }
             }
             Input::Settle {
@@ -957,6 +898,102 @@ impl Driver {
         }
         self.progress(&mut s)?;
         self.checked(s)
+    }
+    /// Release a claim on the host's word. Says whether this repeats a
+    /// committed release, which changes nothing. Only a fence may release a
+    /// dispatched claim.
+    fn release_without_receipt(
+        &self,
+        s: &mut State,
+        task: &str,
+        token: &str,
+        reason: HostFailureReason,
+        fenced: bool,
+    ) -> Result<bool> {
+        let t = self.task(s, task).context("unknown task")?;
+        if let Phase::Terminal(Terminal::HostAbort {
+            token: old,
+            reason: old_reason,
+            ..
+        }) = &s.phases[task]
+        {
+            ensure!(
+                old == token && *old_reason == reason,
+                "conflicting duplicate host abort"
+            );
+            return Ok(true);
+        }
+        let Phase::Claimed {
+            token: owner,
+            inputs,
+            dispatched,
+            cancel_requested,
+        } = &s.phases[task]
+        else {
+            bail!("host abort has no admitted owner")
+        };
+        ensure!(owner == token, "host abort owner mismatch");
+        let dispatched = *dispatched;
+        ensure!(
+            fenced || !dispatched,
+            "host abort cannot release dispatched execution"
+        );
+        let cancelled = s.cancelled || *cancel_requested;
+        // A dispatched claim may have run: it is never reported as unstarted.
+        let unstarted = cancelled && !dispatched;
+        let decision = if unstarted {
+            CoreDecision::UnstartedCancelled
+        } else {
+            CoreDecision::HostFailure
+        };
+        let wf = self
+            .plan
+            .workflows
+            .iter()
+            .find(|w| w.file == t.workflow)
+            .context("missing workflow")?;
+        let mut outcomes: Vec<JobOutcome> = Vec::new();
+        for job in &t.jobs {
+            let ancestor_failed = wf
+                .job(job)
+                .context("missing job")?
+                .needs
+                .iter()
+                .any(|need| {
+                    outcomes
+                        .iter()
+                        .find(|o| &o.job == need)
+                        .or_else(|| inputs.needs.get(need))
+                        .is_some_and(JobOutcome::failed_or_ancestor_failed)
+                });
+            outcomes.push(JobOutcome {
+                job: job.clone(),
+                variant: t.variant.as_ref().map(|v| v.index),
+                status: if cancelled {
+                    JobStatus::Cancelled
+                } else {
+                    JobStatus::Failure
+                },
+                outputs: BTreeMap::new(),
+                skipped: unstarted.then(|| "run cancelled before dispatch".into()),
+                ancestor_failed,
+            });
+        }
+        s.phases.insert(
+            task.into(),
+            Phase::Terminal(Terminal::HostAbort {
+                token: token.into(),
+                reason,
+                decision,
+                outcomes,
+            }),
+        );
+        s.outbox
+            .retain(|a| !matches!(&a.kind, ActionKind::Cancel { task: id, .. } if id == task));
+        if !cancelled {
+            self.fail_fast(s, &t)?;
+        }
+        Ok(false)
     }
     /// Entered only after the complete, single genuine Settle validation path.
     fn settle_validated(
@@ -1188,7 +1225,6 @@ impl Driver {
                 Phase::Claimed {
                     token,
                     cancel_requested,
-                    dispatched,
                     ..
                 } => {
                     let cancel = if !*cancel_requested {
@@ -1198,15 +1234,11 @@ impl Driver {
                     } else {
                         0
                     };
-                    // Keep never-dispatched abort terminal/publication/join capacity
-                    // through Cancel and ACK. The abort retains its original token.
-                    let abort = if !*dispatched {
-                        Self::unstarted_cancel_reserve(task)?
-                            .saturating_add(crate::expr::serialized_size(token, MAX_WIRE_BYTES)?)
-                            .saturating_add(1024)
-                    } else {
-                        0
-                    };
+                    // Keep abort/fence terminal/publication/join capacity through
+                    // dispatch, Cancel and ACK. The release retains its original token.
+                    let abort = Self::unstarted_cancel_reserve(task)?
+                        .saturating_add(crate::expr::serialized_size(token, MAX_WIRE_BYTES)?)
+                        .saturating_add(1024);
                     // Keep this reserve after dispatch and through cancellation
                     // ACKs. All jobs are known at claim time; Cancelled/false are
                     // the longest serialized genuine status/ancestor variants.
@@ -2052,6 +2084,211 @@ mod tests {
                 token: b
             })
             .is_err());
+    }
+    fn claim(d: &mut Driver, id: &str) -> Transition {
+        commit(
+            d,
+            Input::Claim {
+                task: id.into(),
+                token: id.into(),
+            },
+        )
+    }
+    fn mark(d: &mut Driver, id: &str) -> Transition {
+        commit(
+            d,
+            Input::MarkDispatched {
+                task: id.into(),
+                token: id.into(),
+            },
+        )
+    }
+    fn fence(id: &str, token: &str) -> Input {
+        Input::Fence {
+            task: id.into(),
+            token: token.into(),
+        }
+    }
+    fn released(d: &Driver, id: &str) -> Vec<JobOutcome> {
+        d.state.phases[id].terminal_outcomes().unwrap().to_vec()
+    }
+    const FENCED: &str = "host fenced the claim without a worker receipt";
+    #[test]
+    fn fence_releases_a_dispatched_claim_and_refuses_its_late_receipt() {
+        let mut d = driver(false, 1);
+        let mut records = vec![commit(&mut d, Input::Advance)];
+        let a = ready(&d, ".github/workflows/a.yml")[0].clone();
+        let b = ready(&d, ".github/workflows/b.yml")[0].clone();
+        // only an admitted owner can be fenced
+        assert!(d.propose(fence(&a, &a)).is_err());
+        records.push(claim(&mut d, &a));
+        records.push(mark(&mut d, &a));
+        // a dispatched claim is beyond a host abort, and holds the only permit
+        assert!(d
+            .propose(Input::AbortBeforeExecution {
+                task: a.clone(),
+                token: a.clone(),
+                reason: HostFailureReason::Setup,
+            })
+            .is_err());
+        assert!(d.propose(fence(&a, "another attempt")).is_err());
+        assert!(d.propose(fence("no such task", &a)).is_err());
+        assert_eq!(d.admitted(), 1);
+        let late = result(&d, &a, JobStatus::Success, "late");
+        records.push(commit(&mut d, fence(&a, &a)));
+        assert_eq!(d.admitted(), 0);
+        assert_eq!(
+            d.core_decision(&a),
+            Some((CoreDecision::HostFailure, Some(FENCED)))
+        );
+        assert_eq!(
+            d.host_failure_reason(&a),
+            Some(HostFailureReason::WorkerFenced)
+        );
+        let outcomes = released(&d, &a);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].status, JobStatus::Failure);
+        assert_eq!(outcomes[0].skipped, None);
+        assert!(outcomes[0].outputs.is_empty());
+        assert_eq!(
+            d.outcome(".github/workflows/a.yml", "first")
+                .unwrap()
+                .status,
+            JobStatus::Failure
+        );
+        // the fenced token no longer settles, whatever the worker reports
+        let before = d.clone();
+        assert!(d
+            .propose(Input::Settle {
+                task: a.clone(),
+                token: a.clone(),
+                result_digest: late.digest().unwrap(),
+                result: Box::new(late),
+            })
+            .is_err());
+        // the same fence again changes nothing; another release conflicts
+        let again = commit(&mut d, fence(&a, &a));
+        assert_eq!(
+            digest(&d.state.phases).unwrap(),
+            digest(&before.state.phases).unwrap()
+        );
+        assert_eq!(d.pending_actions(), before.pending_actions());
+        records.push(again);
+        assert!(d.propose(fence(&a, "another attempt")).is_err());
+        assert!(d
+            .propose(Input::AbortBeforeExecution {
+                task: a.clone(),
+                token: a.clone(),
+                reason: HostFailureReason::Setup,
+            })
+            .is_err());
+        // the permit is free for the next claim
+        records.push(claim(&mut d, &b));
+        assert_eq!(d.admitted(), 1);
+        let mut replay = driver(false, 1);
+        for record in &records {
+            let text = serde_json::to_string(record).unwrap();
+            replay
+                .apply(&Transition::from_json(&text).unwrap())
+                .unwrap();
+        }
+        assert_eq!(digest(&replay.state).unwrap(), digest(&d.state).unwrap());
+    }
+    #[test]
+    fn fence_after_cancel_reports_only_a_never_dispatched_claim_as_unstarted() {
+        let mut d = driver(false, 2);
+        commit(&mut d, Input::Advance);
+        let a = ready(&d, ".github/workflows/a.yml")[0].clone();
+        let b = ready(&d, ".github/workflows/b.yml")[0].clone();
+        claim(&mut d, &a);
+        claim(&mut d, &b);
+        mark(&mut d, &a);
+        commit(&mut d, Input::Cancel);
+        let cancels = |d: &Driver| {
+            d.pending_actions()
+                .iter()
+                .filter(|a| matches!(a.kind, ActionKind::Cancel { .. }))
+                .count()
+        };
+        assert_eq!(cancels(&d), 2);
+        assert_eq!(d.admitted(), 2);
+        commit(&mut d, fence(&a, &a));
+        // it may have run: cancelled, not unstarted
+        assert_eq!(
+            d.core_decision(&a),
+            Some((CoreDecision::HostFailure, Some(FENCED)))
+        );
+        assert_eq!(released(&d, &a)[0].status, JobStatus::Cancelled);
+        assert_eq!(released(&d, &a)[0].skipped, None);
+        assert_eq!(cancels(&d), 1);
+        assert_eq!(d.admitted(), 1);
+        assert!(!d.state.finished);
+        commit(&mut d, fence(&b, &b));
+        assert_eq!(
+            d.core_decision(&b),
+            Some((
+                CoreDecision::UnstartedCancelled,
+                Some("run cancelled before dispatch")
+            ))
+        );
+        assert_eq!(released(&d, &b)[0].status, JobStatus::Cancelled);
+        assert_eq!(
+            released(&d, &b)[0].skipped.as_deref(),
+            Some("run cancelled before dispatch")
+        );
+        assert_eq!(
+            d.host_failure_reason(&b),
+            Some(HostFailureReason::WorkerFenced)
+        );
+        assert_eq!(cancels(&d), 0);
+        assert_eq!(d.admitted(), 0);
+        assert!(d.state.finished);
+    }
+    #[test]
+    fn fence_of_a_matrix_member_fails_fast_and_keeps_the_sibling_owner() {
+        let mut d = driver(true, 2);
+        commit(&mut d, Input::Advance);
+        let ids = ready(&d, ".github/workflows/a.yml");
+        claim(&mut d, &ids[0]);
+        claim(&mut d, &ids[1]);
+        mark(&mut d, &ids[0]);
+        mark(&mut d, &ids[1]);
+        commit(&mut d, fence(&ids[0], &ids[0]));
+        assert_eq!(d.admitted(), 1);
+        assert_eq!(
+            d.core_decision(&ids[2]),
+            Some((CoreDecision::UnstartedSkipped, Some("fail-fast")))
+        );
+        assert!(d.pending_actions().iter().any(|a| matches!(
+            &a.kind,
+            ActionKind::Cancel { task, .. } if task == &ids[1]
+        )));
+        assert!(d.outcome(".github/workflows/a.yml", "first").is_none());
+        // the sibling still owns its permit until its receipt or its own fence
+        commit(&mut d, fence(&ids[1], &ids[1]));
+        assert_eq!(d.admitted(), 0);
+        assert_eq!(released(&d, &ids[1])[0].status, JobStatus::Cancelled);
+        assert_eq!(
+            d.outcome(".github/workflows/a.yml", "first")
+                .unwrap()
+                .status,
+            JobStatus::Failure
+        );
+    }
+    #[test]
+    fn a_dispatched_claim_keeps_the_capacity_of_its_fence() {
+        let mut d = driver(false, 2);
+        commit(&mut d, Input::Advance);
+        let a = ready(&d, ".github/workflows/a.yml")[0].clone();
+        claim(&mut d, &a);
+        let before = d.cancel_reserve(&d.state).unwrap();
+        mark(&mut d, &a);
+        // dispatch does not give up what a release without a receipt needs
+        assert_eq!(d.cancel_reserve(&d.state).unwrap(), before);
+        let need = crate::expr::serialized_size(&d.state, MAX_WIRE_BYTES).unwrap() + before;
+        d.state_byte_limit = need;
+        commit(&mut d, fence(&a, &a));
+        assert_eq!(d.admitted(), 0);
     }
     #[test]
     fn refuses_modified_frozen_plan_and_config_binding() {

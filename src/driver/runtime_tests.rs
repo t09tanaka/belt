@@ -1931,6 +1931,9 @@ fn host_abort_typed_identity_cancel_orders_and_replay() {
                     HostFailureReason::Setup => "host setup preparation failed",
                     HostFailureReason::Provenance => "host provenance preparation failed",
                     HostFailureReason::ExecutorPreparation => "host executor preparation failed",
+                    HostFailureReason::WorkerFenced => {
+                        "host fenced the claim without a worker receipt"
+                    }
                 }
             };
             assert_eq!(d.core_decision(&task), Some((expected, Some(diagnostic))));
@@ -1983,6 +1986,9 @@ fn host_abort_typed_identity_cancel_orders_and_replay() {
                     HostFailureReason::Setup => "host setup preparation failed",
                     HostFailureReason::Provenance => "host provenance preparation failed",
                     HostFailureReason::ExecutorPreparation => "host executor preparation failed",
+                    HostFailureReason::WorkerFenced => {
+                        "host fenced the claim without a worker receipt"
+                    }
                 }
             };
             assert_eq!(d.core_decision(&task), Some((expected, Some(diagnostic))));
