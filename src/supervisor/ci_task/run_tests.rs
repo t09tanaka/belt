@@ -78,6 +78,7 @@ impl Sup {
             .materialize(&self.f.manifest, &workspace)
             .unwrap();
         let ci = CiTaskSpec {
+            verify_shard_version: false,
             artifact_workflow: None,
             history_scope: Some(crate::ci::timing::task_scope(
                 &self.f.plan,

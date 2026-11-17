@@ -920,12 +920,19 @@ pub fn is_discovery_task(task: &CiTask) -> bool {
         .is_some_and(|id| Digest::parse(id).is_ok())
 }
 
+pub fn requires_discovery_feature(task: &CiTask) -> bool {
+    is_discovery_task(task) || task.verify_shard_version
+}
+
 /// One task of a frozen CI plan (spec chapter 7). The plan itself is not
 /// here: its bytes reach the worker as a content-addressed blob, and the
 /// worker uses them only when they hash to `plan_digest`. The worker runs
 /// the task as the plan says and never plans again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTask {
+    /// An enumerated shard checks the discovered runner version after setup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_shard_version: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artifact_workflow: Option<String>,
     /// Sealed SDK dispatch for one member derived from a dynamic matrix.
@@ -3384,6 +3391,7 @@ mod tests {
             .get("ci_task")
             .is_none());
         let task = |inputs: serde_json::Value| CiTask {
+            verify_shard_version: false,
             artifact_workflow: None,
             dispatch: None,
             plan_digest: dg("frozen plan"),

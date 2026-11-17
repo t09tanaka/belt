@@ -272,7 +272,7 @@ impl Operation {
                 tasks.iter().any(|(_, spec)| {
                     spec.ci
                         .as_ref()
-                        .is_some_and(|ci| crate::wire::is_discovery_task(&ci.task))
+                        .is_some_and(|ci| crate::wire::requires_discovery_feature(&ci.task))
                 })
             }
             _ => false,

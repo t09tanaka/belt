@@ -504,6 +504,16 @@ pub fn prepare(
     let plan_path = plan_path(state_dir, &task.plan_digest);
     let plan = delivered_plan(state_dir, &task.plan_digest)?;
     check_task(&plan, &origin_task(task)?).map_err(invalid)?;
+    if task.verify_shard_version
+        && plan
+            .task(&task.task_id)
+            .and_then(|t| t.shard.as_ref())
+            .is_none()
+    {
+        return Err(invalid(
+            "runner version verification requires a frozen test shard",
+        ));
+    }
     let inputs = serde_json::to_vec(&task.inputs)
         .ok()
         .filter(|json| json.len() <= MAX_INPUT_BYTES)
@@ -513,6 +523,7 @@ pub fn prepare(
     let ci_source_id = ci_id_of(&payload.source_id)
         .ok_or_else(|| invalid("the source of the attempt has no captured id"))?;
     Ok(CiTaskSpec {
+        verify_shard_version: task.verify_shard_version,
         artifact_workflow: task.artifact_workflow.clone(),
         history_scope: Some(crate::ci::timing::task_scope(&plan, &task.task_id)),
         dispatch: task.dispatch.clone(),
@@ -671,6 +682,7 @@ mod tests {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
             ci_task: Some(CiTask {
+                verify_shard_version: false,
                 artifact_workflow: None,
                 dispatch: None,
                 plan_digest: digest.clone(),

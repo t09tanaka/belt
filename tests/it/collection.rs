@@ -5201,6 +5201,7 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     assert_eq!(placed.len(), 2);
     assert_eq!(c.store().attempts_of_task(&task_id).unwrap().len(), 1);
     for attempt in &placed {
+        assert!(fx.w.payload(attempt).ci_task.unwrap().verify_shard_version);
         assert_eq!(
             fx.w.payload(attempt).ci_task.unwrap().inputs["needs"]["build"]["outputs"]["version"],
             "1.2.3"
