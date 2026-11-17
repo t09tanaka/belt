@@ -591,7 +591,12 @@ fn installed_inventory_lists_the_authorized_versions_and_the_ones_present() {
         .request(&f.frozen("1.2.3", b"source"), &tool, None)
         .unwrap();
     let plan = request.plan(&f.state.join("toolchains")).unwrap();
-    adapters::install_admitted(&plan, &mut Populate(plan.clone())).unwrap();
+    adapters::install_admitted(
+        &plan,
+        &f.state.join("toolchains"),
+        &mut Populate(plan.clone()),
+    )
+    .unwrap();
     let after = registry.installed_inventory();
     assert_eq!(after["node"].installed, ["1.2.3"]);
     assert_eq!(after["node"].inventory.len(), 2);

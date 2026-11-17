@@ -308,6 +308,10 @@ impl Setups {
             leftover_dirs: Mutex::new(HashMap::new()),
         };
         s.recover();
+        // What a clear renamed aside and did not get to remove. An installer
+        // of an earlier run that still works holds the lock of its root, and
+        // its trash is left alone.
+        adapters::sweep_trash(&s.cfg.state_dir.join("toolchains"));
         let s = Arc::new(s);
         // A builder that could not be settled now (its supervisor is still
         // alive and was asked to stop) is looked at again until it is.
@@ -1961,8 +1965,12 @@ mod tool_validation_tests {
             let (_temp, setups, request, plan) = fixture();
             let checked_consumer = AttemptId::generate();
             if receipt_path {
-                let receipt =
-                    adapters::install_admitted(&plan, &mut Populate(plan.clone())).unwrap();
+                let receipt = adapters::install_admitted(
+                    &plan,
+                    &request.private_root,
+                    &mut Populate(plan.clone()),
+                )
+                .unwrap();
                 let builder = BuilderId::generate();
                 let consumer_key = format!("{checked_consumer}/tool:node");
                 let mut inner = lock(&setups.inner);

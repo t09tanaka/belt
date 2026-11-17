@@ -1,6 +1,14 @@
 use super::*;
 use crate::toolchain::versions::{Declaration, Location, MatchPolicy, Scope};
 use std::os::unix::fs::{symlink, PermissionsExt};
+/// Install where the fixture put the root: its parent is the toolchain
+/// directory. The tests of a root elsewhere name the directory themselves.
+fn install_admitted(
+    plan: &InstallPlan,
+    executor: &mut impl AdmittedExecutor,
+) -> Result<InstallationReceipt> {
+    super::install_admitted(plan, plan.root.parent().unwrap(), executor)
+}
 fn base_env(plan: &InstallPlan) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("HOME".into(), text(plan.root.parent().unwrap()).unwrap()),
@@ -308,8 +316,10 @@ fn a_failed_or_stopped_install_is_cleared_and_the_same_version_installs_again() 
         fs::create_dir_all(&sealed).unwrap();
         fs::write(sealed.join("left"), b"partial").unwrap();
         fs::set_permissions(sealed.join("left"), fs::Permissions::from_mode(0o400)).unwrap();
+        // Sealed as a read-only tree is (a module cache): it can be read,
+        // not written. One nobody may read is another test.
         for dir in [&sealed, sealed.parent().unwrap()] {
-            fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).unwrap();
         }
         fs::write(f.plan.root.join("home/stale"), b"old").unwrap();
         let lock_inode = fs::metadata(f.plan.root.join("install.lock"))
@@ -321,6 +331,7 @@ fn a_failed_or_stopped_install_is_cleared_and_the_same_version_installs_again() 
         assert!(!f.plan.root.join("receipt.pending").exists());
         assert!(!f.plan.root.join("cache/sealed").exists());
         assert!(!f.plan.root.join("home/stale").exists());
+        assert!(trash(f.plan.root.parent().unwrap()).is_empty());
         // The lock is the same file: its inode is the exclusion.
         assert_eq!(
             fs::metadata(f.plan.root.join("install.lock"))
@@ -436,6 +447,24 @@ fn a_root_with_a_receipt_is_never_cleared_valid_or_not() {
         assert_eq!(listing(&f.plan.root), before, "{error}");
     }
 }
+/// What the check of a root says for the toolchain directory `toolchains`.
+fn checked(plan: &InstallPlan, toolchains: &Path) -> Result<()> {
+    managed_root(plan, toolchains).map(|_| ())
+}
+/// Check the root, then clear it, as an installer holding the lock does.
+fn cleared(plan: &InstallPlan, toolchains: &Path) -> Result<()> {
+    clear_unreceipted(&managed_root(plan, toolchains)?)
+}
+/// The trash directories in the toolchain directory.
+fn trash(state: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(state)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.starts_with(".trash-"))
+        .collect();
+    names.sort();
+    names
+}
 #[test]
 fn a_root_that_is_not_where_a_managed_root_must_be_is_refused_untouched() {
     // The root is a link to a directory elsewhere.
@@ -451,7 +480,7 @@ fn a_root_that_is_not_where_a_managed_root_must_be_is_refused_untouched() {
         Err("unsafe_private_directory")
     );
     assert!(never.calls.is_empty());
-    assert_eq!(clear_unreceipted(&f.plan), Err("unsafe_private_directory"));
+    assert_eq!(cleared(&f.plan, &state), Err("unsafe_private_directory"));
     assert_eq!(listing(&elsewhere), ["sentinel"]);
     fs::remove_file(&f.plan.root).unwrap();
     // The check itself. Each root below holds something; none of it goes.
@@ -460,7 +489,7 @@ fn a_root_that_is_not_where_a_managed_root_must_be_is_refused_untouched() {
         ..f.plan.clone()
     };
     mkdir(&f.plan.root).unwrap();
-    assert_eq!(managed_root(&f.plan), Ok(()));
+    assert_eq!(checked(&f.plan, &state), Ok(()));
     fs::write(f.plan.root.join("left"), b"partial").unwrap();
     // Not named by a plan identity: too short, too long, not lower hex.
     let name = f
@@ -483,42 +512,77 @@ fn a_root_that_is_not_where_a_managed_root_must_be_is_refused_untouched() {
         mkdir(&other).unwrap();
         fs::write(other.join("left"), b"partial").unwrap();
         assert_eq!(
-            managed_root(&placed(other.clone())),
+            checked(&placed(other.clone()), &state),
             Err("private_root_misplaced"),
             "{bad}"
         );
         assert_eq!(
-            clear_unreceipted(&placed(other.clone())),
+            cleared(&placed(other.clone()), &state),
             Err("private_root_misplaced")
         );
         assert!(other.join("left").exists(), "{bad}");
     }
-    // Reached through a link: the same directory by another path.
+    // Reached through a link: the same directory by another path. It is not
+    // in the expected directory, and a link is no toolchain directory either.
     let alias = state.join("alias");
     symlink(&state, &alias).unwrap();
     let through = placed(alias.join(&name));
-    assert_eq!(managed_root(&through), Err("unsafe_private_directory"));
-    assert_eq!(clear_unreceipted(&through), Err("unsafe_private_directory"));
+    assert_eq!(checked(&through, &state), Err("private_root_misplaced"));
+    assert_eq!(checked(&through, &alias), Err("unsafe_private_directory"));
+    assert_eq!(cleared(&through, &alias), Err("unsafe_private_directory"));
     assert!(f.plan.root.join("left").exists());
-    // The link is further up: every directory looks right where it is
-    // named, and the path is still not the one the root really has.
+    // Outside the expected toolchain directory. Every directory looks right
+    // where it is named (owned, private, a plan identity), and the root is
+    // still refused: only the directory the caller names holds roots.
     let deeper = state.join("deeper");
     mkdir(&deeper).unwrap();
-    mkdir(&deeper.join(&name)).unwrap();
-    fs::write(deeper.join(&name).join("left"), b"partial").unwrap();
-    assert_eq!(managed_root(&placed(deeper.join(&name))), Ok(()));
+    let outside = placed(deeper.join(&name));
+    mkdir(&outside.root).unwrap();
+    fs::write(outside.root.join("left"), b"partial").unwrap();
+    assert_eq!(checked(&outside, &state), Err("private_root_misplaced"));
+    assert_eq!(cleared(&outside, &state), Err("private_root_misplaced"));
+    let mut never = Fake::default();
+    assert_eq!(
+        super::install_admitted(&outside, &state, &mut never),
+        Err("private_root_misplaced")
+    );
+    assert!(never.calls.is_empty());
+    assert_eq!(listing(&outside.root), ["left"]);
+    assert!(!outside.root.join("install.lock").exists());
+    // Nothing is made for a root outside that is not there yet.
+    let first = if name.starts_with("0") { "1" } else { "0" };
+    let absent = placed(deeper.join(format!("{first}{}", &name[1..])));
+    assert_eq!(
+        super::install_admitted(&absent, &state, &mut never),
+        Err("private_root_misplaced")
+    );
+    assert!(!absent.root.exists());
+    // The expected directory is a parent of the parent, or a sibling.
+    assert_eq!(
+        checked(&outside, state.parent().unwrap()),
+        Err("private_root_misplaced")
+    );
+    assert_eq!(checked(&f.plan, &deeper), Err("private_root_misplaced"));
+    // The link is further up: the path is not the one the root really has.
     let far = placed(alias.join("deeper").join(&name));
-    assert_eq!(managed_root(&far), Err("private_root_misplaced"));
-    assert_eq!(clear_unreceipted(&far), Err("private_root_misplaced"));
-    assert!(deeper.join(&name).join("left").exists());
+    assert_eq!(
+        checked(&far, &alias.join("deeper")),
+        Err("private_root_misplaced")
+    );
+    assert_eq!(
+        cleared(&far, &alias.join("deeper")),
+        Err("private_root_misplaced")
+    );
+    assert!(outside.root.join("left").exists());
     // Not a clean absolute path, or no parent and no name.
     for bad in [
         PathBuf::from(&name),
         state.join("x").join("..").join(&name),
         PathBuf::from("/"),
     ] {
+        let parent = bad.parent().unwrap_or(&state).to_path_buf();
         assert_eq!(
-            managed_root(&placed(bad.clone())),
+            checked(&placed(bad.clone()), &parent),
             Err("private_root_misplaced"),
             "{}",
             bad.display()
@@ -526,26 +590,275 @@ fn a_root_that_is_not_where_a_managed_root_must_be_is_refused_untouched() {
     }
     // A parent others may enter, then a root others may enter.
     fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(managed_root(&f.plan), Err("unsafe_private_directory"));
-    assert_eq!(clear_unreceipted(&f.plan), Err("unsafe_private_directory"));
+    assert_eq!(checked(&f.plan, &state), Err("unsafe_private_directory"));
+    assert_eq!(cleared(&f.plan, &state), Err("unsafe_private_directory"));
     fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
     fs::set_permissions(&f.plan.root, fs::Permissions::from_mode(0o750)).unwrap();
-    assert_eq!(clear_unreceipted(&f.plan), Err("unsafe_private_directory"));
+    assert_eq!(cleared(&f.plan, &state), Err("unsafe_private_directory"));
     fs::set_permissions(&f.plan.root, fs::Permissions::from_mode(0o700)).unwrap();
     assert!(f.plan.root.join("left").exists());
-    // A receipt that is there is never removed, and stops the removal.
+    // A receipt that is there is never removed, and stops the removal
+    // before anything else moves.
     fs::write(f.plan.root.join("receipt.json"), b"{}").unwrap();
     assert_eq!(
-        clear_unreceipted(&f.plan),
+        cleared(&f.plan, &state),
         Err("installation_receipt_present")
     );
-    assert!(f.plan.root.join("receipt.json").exists());
+    assert_eq!(listing(&f.plan.root), ["left", "receipt.json"]);
+    assert!(trash(&state).is_empty());
     fs::remove_file(f.plan.root.join("receipt.json")).unwrap();
-    // And the plain case: everything but the lock goes.
+    // And the plain case: everything but the lock goes, trash included.
     fs::write(f.plan.root.join("install.lock"), b"").unwrap();
-    assert_eq!(clear_unreceipted(&f.plan), Ok(()));
+    assert_eq!(cleared(&f.plan, &state), Ok(()));
     assert!(listing(&f.plan.root).is_empty());
     assert!(f.plan.root.join("install.lock").exists());
+    assert!(trash(&state).is_empty());
+    // A root that holds only the lock: nothing to do, no trash is made.
+    assert_eq!(cleared(&f.plan, &state), Ok(()));
+    assert!(trash(&state).is_empty());
+}
+/// The check and the removal are tied by descriptors: a root (or its parent
+/// entry) that is replaced by a link after the check sends the removal
+/// nowhere else.
+#[test]
+fn a_root_replaced_by_a_link_after_the_check_sends_the_removal_nowhere_else() {
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let state = f.plan.root.parent().unwrap().to_path_buf();
+    let victim = state.join("victim");
+    fs::create_dir_all(victim.join("sub")).unwrap();
+    fs::write(victim.join("sub/sentinel"), b"keep").unwrap();
+    fs::write(victim.join("sentinel"), b"keep").unwrap();
+    mkdir(&f.plan.root).unwrap();
+    fs::create_dir(f.plan.root.join("home")).unwrap();
+    fs::write(f.plan.root.join("home/partial"), b"partial").unwrap();
+    let managed = managed_root(&f.plan, &state).unwrap();
+    // After the check: the checked directory is moved aside and its name is
+    // a link to a directory that must survive.
+    let aside = state.join("aside");
+    fs::rename(&f.plan.root, &aside).unwrap();
+    symlink(&victim, &f.plan.root).unwrap();
+    let before = listing(&victim);
+    assert_eq!(clear_unreceipted(&managed), Ok(()));
+    assert_eq!(listing(&victim), before);
+    assert_eq!(fs::read(victim.join("sub/sentinel")).unwrap(), b"keep");
+    // What was checked is what was emptied.
+    assert!(listing(&aside).is_empty());
+    assert!(trash(&state).is_empty());
+    // The walk itself opens a directory without following: a name that was a
+    // directory when it was looked at and is a link when it is opened is
+    // refused, not entered.
+    let dir = open_dir_at(CWD, &state).unwrap();
+    assert!(open_dir_at(&dir, "victim").is_ok());
+    let name = f.plan.root.file_name().unwrap();
+    assert!(open_dir_at(&dir, name).is_err());
+    symlink("victim/sentinel", state.join("to-file")).unwrap();
+    assert!(open_dir_at(&dir, "to-file").is_err());
+    // Removing the link by name unlinks it; the directory behind it stays.
+    let dev = fstat(&dir).unwrap().st_dev;
+    let link = CString::new(name.as_encoded_bytes()).unwrap();
+    assert_eq!(remove_at(dir.as_fd(), &link, dev), Ok(()));
+    assert!(fs::symlink_metadata(&f.plan.root).is_err());
+    assert_eq!(listing(&victim), before);
+}
+/// Nothing on another device is entered. A mount cannot be made here, so the
+/// walk is told the root is on another device than the tree really is.
+#[test]
+fn a_directory_on_another_device_stops_the_removal_before_anything_in_it_goes() {
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let state = f.plan.root.parent().unwrap().to_path_buf();
+    let tree = state.join("tree");
+    fs::create_dir_all(tree.join("a/b")).unwrap();
+    fs::write(tree.join("a/b/file"), b"x").unwrap();
+    fs::write(tree.join("file"), b"x").unwrap();
+    let before = listing(&tree);
+    let dir = open_dir_at(CWD, &state).unwrap();
+    let dev = fstat(&dir).unwrap().st_dev;
+    let name = CString::new("tree").unwrap();
+    assert_eq!(remove_at(dir.as_fd(), &name, dev + 1), Err(Errno::XDEV));
+    assert_eq!(listing(&tree), before);
+    // A file is not entered: it is unlinked whatever device is expected.
+    let file = CString::new("file").unwrap();
+    let inner = open_dir_at(&dir, "tree").unwrap();
+    assert_eq!(remove_at(inner.as_fd(), &file, dev + 1), Ok(()));
+    assert!(!tree.join("file").exists());
+    // On the device of the root everything goes.
+    assert_eq!(remove_at(dir.as_fd(), &name, dev), Ok(()));
+    assert!(!tree.exists());
+    // Something that is not there is an error, not a success.
+    assert_eq!(remove_at(dir.as_fd(), &name, dev), Err(Errno::NOENT));
+
+    // The same through a clear: the entries are renamed aside first, so the
+    // root is empty; the removal of the trash stops, the clear fails, and
+    // the trash stays as it is for the next clear.
+    mkdir(&f.plan.root).unwrap();
+    fs::create_dir_all(f.plan.root.join("home/deep")).unwrap();
+    fs::write(f.plan.root.join("home/deep/partial"), b"partial").unwrap();
+    fs::write(f.plan.root.join("install.lock"), b"").unwrap();
+    let mut managed = managed_root(&f.plan, &state).unwrap();
+    managed.dev += 1;
+    assert_eq!(
+        clear_unreceipted(&managed),
+        Err("installation_partial_cleanup")
+    );
+    assert!(listing(&f.plan.root).is_empty());
+    assert!(f.plan.root.join("install.lock").exists());
+    let left = trash(&state);
+    assert_eq!(left.len(), 1);
+    assert_eq!(
+        listing(&state.join(&left[0])),
+        ["home", "home/deep", "home/deep/partial"]
+    );
+    // The next clear of the same root removes what was left.
+    assert_eq!(cleared(&f.plan, &state), Ok(()));
+    assert!(trash(&state).is_empty());
+}
+#[test]
+fn trash_names_belong_to_one_root() {
+    let root = "0123456789abcdef".repeat(4);
+    assert_eq!(trash_prefix(&root), format!(".trash-{root}-"));
+    assert_eq!(trash_owner(&format!(".trash-{root}-01J")), Some(&*root));
+    assert_eq!(trash_owner(&format!(".trash-{root}-x")), Some(&*root));
+    for bad in [
+        format!(".trash-{root}-"),
+        format!(".trash-{root}"),
+        format!(".trash-{root}x1"),
+        format!(".trash-{}-1", &root[1..]),
+        format!(".trash-G{}-1", &root[1..]),
+        format!("trash-{root}-1"),
+        format!("{root}-1"),
+        root.clone(),
+        ".trash-".into(),
+        String::new(),
+    ] {
+        assert_eq!(trash_owner(&bad), None, "{bad}");
+    }
+}
+/// Trash that an earlier clear left (the installer died between the rename
+/// and the removal) goes with the next clear of the same root, and at the
+/// start of the worker. Trash of a root an installer works in is left alone.
+#[test]
+fn trash_left_behind_goes_with_the_next_clear_and_at_the_start() {
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let state = f.plan.root.parent().unwrap().to_path_buf();
+    let name = f
+        .plan
+        .root
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let first = if name.starts_with("0") { "1" } else { "0" };
+    let other = format!("{first}{}", &name[1..]);
+    let fill = |dir: &Path| {
+        fs::create_dir_all(dir.join("sealed/deep")).unwrap();
+        fs::write(dir.join("sealed/deep/left"), b"partial").unwrap();
+        fs::set_permissions(dir.join("sealed"), fs::Permissions::from_mode(0o500)).unwrap();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    };
+    let mine = state.join(format!(".trash-{name}-01A"));
+    let theirs = state.join(format!(".trash-{other}-01B"));
+    let unrelated = state.join(".trash-not-a-root");
+    for dir in [&mine, &theirs, &unrelated] {
+        fill(dir);
+    }
+    // A clear of this root removes its own trash and no other, also when the
+    // root itself holds nothing.
+    mkdir(&f.plan.root).unwrap();
+    assert_eq!(cleared(&f.plan, &state), Ok(()));
+    assert!(!mine.exists());
+    assert!(theirs.exists() && unrelated.exists());
+    // An install does the same.
+    fill(&mine);
+    install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    assert!(!mine.exists());
+    assert!(theirs.exists() && unrelated.exists());
+
+    // The start of the worker. `theirs` has no root: nobody clears it now.
+    fill(&mine);
+    let held = held_lock(&f.plan);
+    sweep_trash(&state);
+    assert!(mine.exists(), "an installer holds the lock of this root");
+    assert!(!theirs.exists());
+    assert!(unrelated.exists(), "not a trash name: never touched");
+    assert!(f.plan.root.join("receipt.json").exists());
+    drop(held);
+    sweep_trash(&state);
+    assert!(!mine.exists());
+    assert!(unrelated.exists());
+    assert!(f.plan.root.join("receipt.json").exists());
+    // A root without a lock file, or with one that cannot be trusted, is
+    // not swept at the start: the lock is what says nobody works there.
+    let bare = state.join(&other);
+    mkdir(&bare).unwrap();
+    fill(&theirs);
+    sweep_trash(&state);
+    assert!(theirs.exists());
+    assert!(!bare.join("install.lock").exists(), "nothing is created");
+    fs::write(bare.join("install.lock"), b"").unwrap();
+    fs::set_permissions(bare.join("install.lock"), fs::Permissions::from_mode(0o644)).unwrap();
+    sweep_trash(&state);
+    assert!(theirs.exists());
+    fs::set_permissions(bare.join("install.lock"), fs::Permissions::from_mode(0o600)).unwrap();
+    sweep_trash(&state);
+    assert!(!theirs.exists());
+    // A toolchain directory that is not there, or not private: nothing.
+    sweep_trash(&state.join("absent"));
+    fill(&mine);
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+    sweep_trash(&state);
+    assert!(mine.exists());
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+}
+/// A rename that fails is the failure, and nothing is removed. A directory
+/// that cannot be read is never opened up by its path: empty it goes, with
+/// something in it the removal stops.
+#[test]
+fn a_clear_that_cannot_rename_removes_nothing_and_an_unreadable_directory_is_not_forced() {
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let state = f.plan.root.parent().unwrap().to_path_buf();
+    mkdir(&f.plan.root).unwrap();
+    fs::create_dir_all(f.plan.root.join("home/deep")).unwrap();
+    fs::write(f.plan.root.join("home/deep/partial"), b"partial").unwrap();
+    let before = listing(&f.plan.root);
+    // No trash directory can be made: nothing in the root moves.
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o500)).unwrap();
+    assert_eq!(
+        cleared(&f.plan, &state),
+        Err("installation_partial_cleanup")
+    );
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(listing(&f.plan.root), before);
+    assert!(trash(&state).is_empty());
+
+    // An empty directory nobody may read goes as it is.
+    let empty = f.plan.root.join("home/deep/empty");
+    fs::create_dir(&empty).unwrap();
+    fs::set_permissions(&empty, fs::Permissions::from_mode(0o000)).unwrap();
+    assert_eq!(cleared(&f.plan, &state), Ok(()));
+    assert!(listing(&f.plan.root).is_empty());
+    assert!(trash(&state).is_empty());
+
+    // One with something in it: the root is empty afterwards (the rename
+    // came first), the clear fails, and the trash keeps the directory with
+    // its mode. The next install does not wait for it.
+    let closed = f.plan.root.join("closed");
+    fs::create_dir(&closed).unwrap();
+    fs::write(closed.join("left"), b"partial").unwrap();
+    fs::set_permissions(&closed, fs::Permissions::from_mode(0o300)).unwrap();
+    assert_eq!(
+        cleared(&f.plan, &state),
+        Err("installation_partial_cleanup")
+    );
+    assert!(listing(&f.plan.root).is_empty());
+    let left = trash(&state);
+    assert_eq!(left.len(), 1);
+    let kept = state.join(&left[0]).join("closed");
+    assert_eq!(fs::metadata(&kept).unwrap().mode() & 0o7777, 0o300);
+    install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    assert_eq!(trash(&state), left);
+    // So that the fixture can be removed.
+    fs::set_permissions(&kept, fs::Permissions::from_mode(0o700)).unwrap();
 }
 #[test]
 fn while_another_installer_holds_the_lock_nothing_is_removed_and_this_one_waits() {
@@ -584,7 +897,8 @@ fn while_another_installer_holds_the_lock_nothing_is_removed_and_this_one_waits(
         let done = install_admitted(&plan, &mut never);
         (done, never.calls.len())
     });
-    let published = install_holding(&g.plan, &mut Fake::for_plan(&g.plan)).unwrap();
+    let held = managed_root(&g.plan, g.plan.root.parent().unwrap()).unwrap();
+    let published = install_holding(&g.plan, &held, &mut Fake::for_plan(&g.plan)).unwrap();
     drop(lock);
     let (done, calls) = waiter.join().unwrap();
     assert_eq!(done.unwrap(), published);

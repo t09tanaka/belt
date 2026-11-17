@@ -238,7 +238,8 @@ fn run_helper(path: &Path, binding: &str) -> Result<(), String> {
     if !dir.join("worker.db").is_file() {
         return Err("preparation_acceptance_missing".into());
     }
-    let plan = request.plan(&state.join("toolchains"))?;
+    let toolchains = state.join("toolchains");
+    let plan = request.plan(&toolchains)?;
     let ctx = Context::new(task_traffic_controller::paths::Paths::new(
         &spec.traffic_state_dir,
         spec.traffic_config_path(),
@@ -253,7 +254,7 @@ fn run_helper(path: &Path, binding: &str) -> Result<(), String> {
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    adapters::install_admitted(&plan, &mut HelperExecutor).map_err(str::to_string)?;
+    adapters::install_admitted(&plan, &toolchains, &mut HelperExecutor).map_err(str::to_string)?;
     Ok(())
 }
 
