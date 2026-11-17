@@ -285,10 +285,10 @@ fn fixture() -> Fixture {
 }
 
 /// Everything under `dir`, `.git` included: relative path, type, mode, and
-/// the bytes (or link target).
-fn tree_hash(dir: &Path) -> String {
+/// the bytes (or link target), one digest per path.
+fn tree_snapshot(dir: &Path) -> std::collections::BTreeMap<String, String> {
     use std::os::unix::fs::PermissionsExt;
-    fn walk(root: &Path, rel: &Path, h: &mut Sha256) {
+    fn walk(root: &Path, rel: &Path, out: &mut std::collections::BTreeMap<String, String>) {
         let mut names: Vec<_> = std::fs::read_dir(root.join(rel))
             .unwrap()
             .map(|e| e.unwrap().file_name())
@@ -298,12 +298,15 @@ fn tree_hash(dir: &Path) -> String {
             let p = rel.join(&n);
             let full = root.join(&p);
             let meta = std::fs::symlink_metadata(&full).unwrap();
-            h.update(p.to_string_lossy().as_bytes());
-            h.update(format!(":{:o}:", meta.permissions().mode()).as_bytes());
+            let mut h = Sha256::new();
+            h.update(format!("{:o}:", meta.permissions().mode()).as_bytes());
             if meta.is_dir() {
                 h.update(b"d");
-                walk(root, &p, h);
-            } else if meta.file_type().is_symlink() {
+                out.insert(p.to_string_lossy().into_owned(), hex(&h.finalize()));
+                walk(root, &p, out);
+                continue;
+            }
+            if meta.file_type().is_symlink() {
                 h.update(
                     std::fs::read_link(&full)
                         .unwrap()
@@ -313,11 +316,36 @@ fn tree_hash(dir: &Path) -> String {
             } else {
                 h.update(std::fs::read(&full).unwrap());
             }
+            out.insert(p.to_string_lossy().into_owned(), hex(&h.finalize()));
         }
     }
-    let mut h = Sha256::new();
-    walk(dir, Path::new(""), &mut h);
-    h.finalize().iter().map(|b| format!("{b:02x}")).collect()
+    fn hex(d: &[u8]) -> String {
+        d.iter().map(|b| format!("{b:02x}")).collect()
+    }
+    let mut out = std::collections::BTreeMap::new();
+    walk(dir, Path::new(""), &mut out);
+    out
+}
+
+/// Fails naming the paths that were added, removed or changed since `before`.
+fn assert_tree_unchanged(
+    dir: &Path,
+    before: &std::collections::BTreeMap<String, String>,
+    what: &str,
+) {
+    let after = tree_snapshot(dir);
+    let mut diff = Vec::new();
+    for (p, h) in before {
+        match after.get(p) {
+            None => diff.push(format!("removed {p}")),
+            Some(a) if a != h => diff.push(format!("changed {p}")),
+            _ => {}
+        }
+    }
+    for p in after.keys().filter(|p| !before.contains_key(*p)) {
+        diff.push(format!("added {p}"));
+    }
+    assert!(diff.is_empty(), "{what}: the original changed: {diff:?}");
 }
 
 fn worktrees(f: &Fixture, clone: &Path) -> Vec<String> {
@@ -438,7 +466,7 @@ fn the_original_is_never_written() {
         let repo = f.clone_of(&ws);
         // the synthetic commit reaches the worker as a bundle
         f.deliver(&store, &repo, &m);
-        let before = tree_hash(&f.dir);
+        let before = tree_snapshot(&f.dir);
         let w = ws
             .create(&AttemptId::generate(), &store, &m, Some(&repo))
             .unwrap();
@@ -459,12 +487,7 @@ fn the_original_is_never_written() {
         std::fs::write(w.root.join("a.txt"), "wrecked\n").unwrap();
         std::fs::remove_file(w.root.join("pkg/lib.txt")).unwrap();
         ws.remove(&w).unwrap();
-        assert_eq!(
-            tree_hash(&f.dir),
-            before,
-            "{}: the original changed",
-            b.name
-        );
+        assert_tree_unchanged(&f.dir, &before, b.name);
     });
 }
 
@@ -662,7 +685,7 @@ fn in_place_uses_the_original_and_never_removes_it() {
     let b = &backends(&common_home())[0];
     let f = fixture();
     let ws = f.workspaces(&b.fw(&f));
-    let before = tree_hash(&f.dir);
+    let before = tree_snapshot(&f.dir);
     // only the parent's local worker
     let e = ws.open_in_place(&f.dir, Path::new(""), false).unwrap_err();
     assert_eq!(e.blocked_reason, Some(BlockedReason::NoCompatibleWorker));
@@ -671,7 +694,7 @@ fn in_place_uses_the_original_and_never_removes_it() {
     assert_eq!(w.root, std::fs::canonicalize(&f.dir).unwrap());
     assert_eq!(w.cwd, w.root.join("pkg"));
     ws.remove(&w).unwrap();
-    assert_eq!(tree_hash(&f.dir), before, "the original changed");
+    assert_tree_unchanged(&f.dir, &before, "in place");
     assert!(f.dir.join(".git").exists());
     // the runner's own state is not an in-place directory
     std::fs::create_dir_all(&f.state).unwrap();
@@ -699,7 +722,7 @@ fn only_attempt_workspaces_can_be_removed() {
     let b = &backends(&common_home())[0];
     let f = fixture();
     let ws = f.workspaces(&b.fw(&f));
-    let before = tree_hash(&f.dir);
+    let before = tree_snapshot(&f.dir);
     for root in [f.dir.clone(), f.state.join("workspaces"), f.root.clone()] {
         let w = Workspace {
             cwd: root.clone(),
@@ -711,7 +734,7 @@ fn only_attempt_workspaces_can_be_removed() {
         let e = ws.remove(&w).unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidInput);
     }
-    assert_eq!(tree_hash(&f.dir), before);
+    assert_tree_unchanged(&f.dir, &before, "removal");
 }
 
 #[test]
@@ -1052,7 +1075,7 @@ fn a_forged_record_is_refused() {
     let w = ws
         .create(&AttemptId::generate(), &store, &m, Some(&repo))
         .unwrap();
-    let before = tree_hash(&f.dir);
+    let before = tree_snapshot(&f.dir);
     let good = w.kind.clone();
     let WorkspaceKind::Worktree { clone, branch } = good else {
         panic!()
@@ -1077,7 +1100,7 @@ fn a_forged_record_is_refused() {
         let e = ws.remove(&forged).unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidInput, "{forged:?}");
     }
-    assert_eq!(tree_hash(&f.dir), before);
+    assert_tree_unchanged(&f.dir, &before, "removal");
     assert!(w.root.exists());
     ws.remove(&w).unwrap();
 }
