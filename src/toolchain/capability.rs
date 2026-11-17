@@ -163,6 +163,10 @@ impl WorkerCapabilities {
             && self.features.iter().all(|v| FEATURES.contains(&v.as_str()))
     }
 }
+/// The line `missing` writes for an unmet requirement.
+pub fn unmet_line(requirement: &Requirement) -> String {
+    format!("{requirement:?} unavailable")
+}
 /// Missing reports and unknown probes never satisfy a constrained task.
 pub fn missing(req: &ExecutionRequirements, report: Option<&WorkerCapabilities>) -> Vec<String> {
     if let Err(e) = req.validate() {
@@ -190,7 +194,7 @@ pub fn missing(req: &ExecutionRequirements, report: Option<&WorkerCapabilities>)
             Requirement::Feature(v) => r.features.contains(v),
         };
         if !available {
-            missing.push(format!("{v:?} unavailable"));
+            missing.push(unmet_line(v));
         }
     }
     missing

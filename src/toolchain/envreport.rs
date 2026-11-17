@@ -2,24 +2,25 @@
 //! on the parent and, through `worker-service env`, on a worker. Every
 //! measurement uses the worker's persisted profile (its PATH), never the PATH
 //! of the ssh session that asked.
-use super::capability::{valid_version, ToolObservation, TOOLS};
+use super::capability::{ToolObservation, TOOLS};
 use super::contract::canonical_tool;
 use super::envdiff::{Docker, EnvReport, Managed, Observed, ToolFact, SCHEMA};
 use super::profile::Profile;
 use super::registry::Registry;
-use crate::ids::Digest;
 use std::collections::BTreeMap;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-const HELPER_TIMEOUT: Duration = Duration::from_secs(2);
 const DOCKER_TIMEOUT: Duration = Duration::from_secs(5);
-const OUTPUT_LIMIT: u64 = 8192;
-/// Helpers probed by a fixed `--version` call on the profile PATH.
-const HELPERS: &[&str] = &["task-traffic-controller", "local-ci"];
+const OUTPUT_LIMIT: usize = 8192;
+/// Variables the docker CLI needs to find its daemon, taken from the
+/// worker's own environment when it has them.
+const DOCKER_ENV: &[&str] = &["DOCKER_HOST", "DOCKER_CONTEXT"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Run {
@@ -29,10 +30,36 @@ pub enum Run {
     TimedOut,
 }
 
+/// Read what is there without waiting; keep the first `OUTPUT_LIMIT` bytes
+/// and throw the rest away, so a chatty child never blocks on a full pipe.
+/// False when the stream broke.
+fn drain(out: &mut impl Read, kept: &mut Vec<u8>) -> bool {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match out.read(&mut chunk) {
+            Ok(0) => return true,
+            Ok(n) => {
+                let room = OUTPUT_LIMIT.saturating_sub(kept.len()).min(n);
+                kept.extend_from_slice(&chunk[..room]);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return true,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => return false,
+        }
+    }
+}
+
 /// One fixed call of an executable found in `dirs`, with a cleared
-/// environment whose only variable is that PATH. The child is this function's
-/// own handle: killed and reaped by handle on a timeout.
-pub fn run_fixed(dirs: &[PathBuf], program: &str, args: &[&str], timeout: Duration) -> Run {
+/// environment of that PATH and `extra`. The child leads its own process
+/// group, which is killed (with every descendant) when the call ends, and the
+/// child is reaped by its handle.
+pub fn run_fixed(
+    dirs: &[PathBuf],
+    program: &str,
+    args: &[&str],
+    extra: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Run {
     let Some(path) = dirs.iter().map(|d| d.join(program)).find(|p| {
         std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     }) else {
@@ -42,47 +69,75 @@ pub fn run_fixed(dirs: &[PathBuf], program: &str, args: &[&str], timeout: Durati
     let Ok(mut child) = Command::new(path)
         .args(args)
         .env_clear()
+        .envs(extra)
         .env("PATH", search)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
+        .process_group(0)
         .spawn()
     else {
         return Run::Failed;
     };
-    let deadline = Instant::now() + timeout;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Run::TimedOut;
-            }
-        }
-    };
-    let mut text = String::new();
-    if let Some(out) = child.stdout.take() {
-        let _ = out.take(OUTPUT_LIMIT).read_to_string(&mut text);
+    let pid = child.id();
+    let mut text = Vec::new();
+    let finished = wait_draining(&mut child, pid, timeout, &mut text);
+    // Our unreaped Child owns pid, so this group number cannot be recycled.
+    if let Ok(group) = i32::try_from(pid) {
+        crate::platform::signal_process_group(group, libc::SIGKILL);
     }
-    if status.success() {
-        Run::Output(text)
-    } else {
-        Run::Failed
+    let status = child.wait();
+    match (finished, status) {
+        (Some(true), Ok(status)) if status.success() => {
+            Run::Output(String::from_utf8_lossy(&text).into_owned())
+        }
+        (Some(false), _) => Run::TimedOut,
+        _ => Run::Failed,
     }
 }
 
-/// The first token of the output that starts with a digit (after an optional
-/// `v`), when it is a plausible version.
-pub fn parse_version(output: &str) -> Option<String> {
-    output
-        .lines()
-        .next()?
-        .split_whitespace()
-        .map(|t| t.strip_prefix('v').unwrap_or(t))
-        .find(|t| t.starts_with(|c: char| c.is_ascii_digit()) && valid_version(t))
-        .map(str::to_string)
+/// Read the child's output until it exits. `Some(true)`: it exited in time;
+/// `Some(false)`: it did not; `None`: the pipe or the wait failed.
+fn wait_draining(
+    child: &mut std::process::Child,
+    pid: u32,
+    timeout: Duration,
+    kept: &mut Vec<u8>,
+) -> Option<bool> {
+    let mut out = child.stdout.take()?;
+    let fd = out.as_raw_fd();
+    // SAFETY: plain fcntl calls on a descriptor this function owns.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        return None;
+    }
+    let started = Instant::now();
+    loop {
+        if !drain(&mut out, kept) {
+            return None;
+        }
+        // SAFETY: waitid on our own child; WNOWAIT leaves it unreaped.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let observed = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if observed != 0 {
+            return None;
+        }
+        // SAFETY: reads the field waitid filled in.
+        if unsafe { info.si_pid() } == pid as i32 {
+            return drain(&mut out, kept).then_some(true);
+        }
+        if started.elapsed() >= timeout {
+            return Some(false);
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn observed(o: &ToolObservation) -> (Observed, Option<String>) {
@@ -103,14 +158,43 @@ fn free_disk(state: &Path) -> Option<u64> {
         .map(|s| s.f_bavail.saturating_mul(s.f_frsize))
 }
 
+/// What `docker info` says, run the way the worker's own jobs would: with the
+/// profile's HOME and the worker's docker variables. An error says only that
+/// it could not be measured; just a missing docker is "not runnable".
+fn docker_state(
+    dirs: &[PathBuf],
+    profile: &Profile,
+    env: &BTreeMap<String, String>,
+    timeout: Duration,
+) -> Docker {
+    let mut extra: BTreeMap<String, String> = env
+        .iter()
+        .filter(|(k, _)| DOCKER_ENV.contains(&k.as_str()))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if let Some(home) = profile.environment().get("HOME") {
+        extra.insert("HOME".into(), home.clone());
+    }
+    match run_fixed(
+        dirs,
+        "docker",
+        &["info", "--format", "{{.ServerVersion}}"],
+        &extra,
+        timeout,
+    ) {
+        Run::Output(text) if !text.trim().is_empty() => Docker::Runnable,
+        Run::Absent => Docker::NotRunnable,
+        _ => Docker::Unknown,
+    }
+}
+
 pub fn collect(state: &Path, env: &BTreeMap<String, String>) -> Result<EnvReport, String> {
-    collect_with(state, env, HELPER_TIMEOUT, DOCKER_TIMEOUT)
+    collect_with(state, env, DOCKER_TIMEOUT)
 }
 
 fn collect_with(
     state: &Path,
     env: &BTreeMap<String, String>,
-    helper_timeout: Duration,
     docker_timeout: Duration,
 ) -> Result<EnvReport, String> {
     let profile = Profile::load(state, env)?;
@@ -144,31 +228,14 @@ fn collect_with(
             )
         })
         .collect();
-    let dirs = profile.path_dirs();
-    let mut helpers: BTreeMap<String, Option<String>> = HELPERS
-        .iter()
-        .map(|h| {
-            let version = match run_fixed(dirs, h, &["--version"], helper_timeout) {
-                Run::Output(text) => parse_version(&text),
-                _ => None,
-            };
-            (h.to_string(), version)
-        })
-        .collect();
-    helpers.insert(
-        "remote-task-runner".into(),
-        Some(env!("CARGO_PKG_VERSION").into()),
-    );
-    let docker = match run_fixed(
-        dirs,
-        "docker",
-        &["info", "--format", "{{.ServerVersion}}"],
-        docker_timeout,
-    ) {
-        Run::Output(text) if !text.trim().is_empty() => Docker::Runnable,
-        Run::TimedOut => Docker::Unknown,
-        _ => Docker::NotRunnable,
-    };
+    // task-traffic-controller and local-ci are built into this binary (spec
+    // 22.4): its build identity stands for them, and no external `--version`
+    // is run.
+    let helpers = BTreeMap::from([(
+        "remote-task-runner".to_string(),
+        Some(env!("CARGO_PKG_VERSION").to_string()),
+    )]);
+    let docker = docker_state(profile.path_dirs(), &profile, env, docker_timeout);
     Ok(EnvReport {
         schema_version: SCHEMA,
         os: report.os,
@@ -177,10 +244,11 @@ fn collect_with(
         helpers,
         docker,
         disk_free_bytes: free_disk(state),
+        profile: profile.name().to_string(),
+        required_tools: profile.required_tools().iter().cloned().collect(),
         profile_digest: Some(report.profile_digest.to_string()),
-        // The agent reports the digest of its configured policy bytes; the
-        // service configures none, so it is the digest of nothing.
-        policy_digest: Some(Digest::of_bytes(&[]).to_string()),
+        // No digest of the task-traffic-controller policy exists yet.
+        policy_digest: None,
     })
 }
 
@@ -215,21 +283,8 @@ mod tests {
         (temp, state, bin)
     }
     const SHORT: Duration = Duration::from_millis(300);
-
-    #[test]
-    fn versions_are_the_first_numeric_token_of_the_first_line() {
-        assert_eq!(parse_version("local-ci 0.13.0\n"), Some("0.13.0".into()));
-        assert_eq!(parse_version("v20.1.0"), Some("20.1.0".into()));
-        assert_eq!(
-            parse_version("task-traffic-controller v0.8.2 (abc)"),
-            Some("0.8.2".into())
-        );
-        assert_eq!(parse_version("no version here"), None);
-        assert_eq!(parse_version(""), None);
-        // Only the first line counts.
-        assert_eq!(parse_version("banner\n1.2.3"), None);
-        // Not a plausible version.
-        assert_eq!(parse_version("1.2.3;rm"), None);
+    fn none() -> BTreeMap<String, String> {
+        BTreeMap::new()
     }
 
     #[test]
@@ -242,78 +297,182 @@ mod tests {
         shim(&bin, "env", "echo \"[$PATH][$HOME]\"");
         std::fs::write(bin.join("plain"), "not executable").unwrap();
         assert_eq!(
-            run_fixed(&dirs, "ok", &[], SHORT * 10),
+            run_fixed(&dirs, "ok", &[], &none(), SHORT * 10),
             Run::Output("hello\n".into())
         );
-        assert_eq!(run_fixed(&dirs, "bad", &[], SHORT * 10), Run::Failed);
-        assert_eq!(run_fixed(&dirs, "missing", &[], SHORT), Run::Absent);
-        assert_eq!(run_fixed(&dirs, "plain", &[], SHORT), Run::Absent);
+        assert_eq!(
+            run_fixed(&dirs, "bad", &[], &none(), SHORT * 10),
+            Run::Failed
+        );
+        assert_eq!(
+            run_fixed(&dirs, "missing", &[], &none(), SHORT),
+            Run::Absent
+        );
+        assert_eq!(run_fixed(&dirs, "plain", &[], &none(), SHORT), Run::Absent);
         let started = Instant::now();
         assert_eq!(
-            run_fixed(&dirs, "slow", &[], Duration::from_millis(100)),
+            run_fixed(&dirs, "slow", &[], &none(), Duration::from_millis(100)),
             Run::TimedOut
         );
         assert!(started.elapsed() < Duration::from_secs(3));
         // The environment is cleared: only the profile PATH is passed.
         assert_eq!(
-            run_fixed(&dirs, "env", &[], SHORT * 10),
+            run_fixed(&dirs, "env", &[], &none(), SHORT * 10),
             Run::Output(format!("[{}][]\n", bin.display()))
         );
         // A program that cannot be started.
         std::fs::write(bin.join("broken"), "\u{1}").unwrap();
         std::fs::set_permissions(bin.join("broken"), std::fs::Permissions::from_mode(0o755))
             .unwrap();
-        assert_eq!(run_fixed(&dirs, "broken", &[], SHORT), Run::Failed);
+        assert_eq!(run_fixed(&dirs, "broken", &[], &none(), SHORT), Run::Failed);
     }
 
     #[test]
     fn collect_measures_with_the_profile_path() {
         let (_t, state, bin) = state();
         shim(&bin, "node", "echo v20.1.0");
-        shim(&bin, "local-ci", "echo local-ci 0.13.0");
+        // Built-in tools are never asked: this shim would be seen if they were.
+        shim(&bin, "local-ci", "echo local-ci 9.9.9");
         shim(&bin, "docker", "echo 27.0.1");
-        let report = collect_with(&state, &BTreeMap::new(), SHORT * 10, SHORT * 10).unwrap();
+        let report = collect_with(&state, &BTreeMap::new(), SHORT * 10).unwrap();
         assert_eq!(report.schema_version, SCHEMA);
         assert_eq!(report.os, std::env::consts::OS);
         assert_eq!(report.tools["node"].observed, Observed::Available);
         assert_eq!(report.tools["node"].version.as_deref(), Some("20.1.0"));
         assert_eq!(report.tools["cargo"].observed, Observed::Unavailable);
         assert_eq!(report.tools["node"].managed, None);
-        assert_eq!(report.helpers["local-ci"].as_deref(), Some("0.13.0"));
-        assert_eq!(report.helpers["task-traffic-controller"], None);
+        assert_eq!(
+            report.helpers.keys().collect::<Vec<_>>(),
+            ["remote-task-runner"]
+        );
         assert_eq!(
             report.helpers["remote-task-runner"].as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
         assert_eq!(report.docker, Docker::Runnable);
         assert!(report.disk_free_bytes.is_some_and(|b| b > 0));
+        assert_eq!(report.profile, "t");
+        assert!(report.required_tools.is_empty());
         assert!(report.profile_digest.unwrap().starts_with("sha256:"));
-        assert_eq!(
-            report.policy_digest.unwrap(),
-            Digest::of_bytes(&[]).to_string()
-        );
+        assert_eq!(report.policy_digest, None);
     }
 
     #[test]
     fn docker_runnability_follows_the_daemon_answer() {
         let (_t, state, bin) = state();
         let docker = |state: &Path| {
-            collect_with(
-                state,
-                &BTreeMap::new(),
-                SHORT * 10,
-                Duration::from_millis(400),
-            )
-            .unwrap()
-            .docker
+            collect_with(state, &BTreeMap::new(), Duration::from_millis(400))
+                .unwrap()
+                .docker
         };
+        // No docker program at all: not runnable.
         assert_eq!(docker(&state), Docker::NotRunnable);
+        // An error or an empty answer says only that it could not be measured.
         shim(&bin, "docker", "exit 1");
-        assert_eq!(docker(&state), Docker::NotRunnable);
+        assert_eq!(docker(&state), Docker::Unknown);
         shim(&bin, "docker", "true");
-        assert_eq!(docker(&state), Docker::NotRunnable);
+        assert_eq!(docker(&state), Docker::Unknown);
         shim(&bin, "docker", "/bin/sleep 3");
         assert_eq!(docker(&state), Docker::Unknown);
+        shim(&bin, "docker", "echo 27.0.1");
+        assert_eq!(docker(&state), Docker::Runnable);
+    }
+
+    #[test]
+    fn docker_gets_the_profile_home_and_the_workers_docker_variables() {
+        let (_t, state, bin) = state();
+        // Succeeds only with the daemon location the worker configured.
+        shim(
+            &bin,
+            "docker",
+            "[ \"$DOCKER_HOST\" = unix:///colima.sock ] && [ \"$DOCKER_CONTEXT\" = colima ] && [ \"$HOME\" = /worker/home ] && [ -z \"$OTHER\" ] && echo 27",
+        );
+        let env = BTreeMap::from([
+            ("HOME".to_string(), "/worker/home".to_string()),
+            ("DOCKER_HOST".to_string(), "unix:///colima.sock".to_string()),
+            ("DOCKER_CONTEXT".to_string(), "colima".to_string()),
+            ("OTHER".to_string(), "x".to_string()),
+        ]);
+        let got = collect_with(&state, &env, SHORT * 10).unwrap();
+        assert_eq!(got.docker, Docker::Runnable);
+        let got = collect_with(&state, &BTreeMap::new(), SHORT * 10).unwrap();
+        assert_eq!(got.docker, Docker::Unknown);
+    }
+
+    #[test]
+    fn output_beyond_the_limit_is_discarded_and_never_blocks_the_child() {
+        let (_t, _state, bin) = state();
+        let dirs = vec![bin.clone()];
+        // Far more than a pipe holds, then a clean exit.
+        shim(
+            &bin,
+            "chatty",
+            "/usr/bin/yes abcdefgh | /usr/bin/head -c 400000",
+        );
+        let started = Instant::now();
+        let got = run_fixed(&dirs, "chatty", &[], &none(), Duration::from_secs(20));
+        let Run::Output(text) = got else {
+            panic!("{got:?}");
+        };
+        assert_eq!(text.len(), OUTPUT_LIMIT);
+        assert!(text.starts_with("abcdefgh\n"));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // Exactly the limit and one byte more.
+        shim(
+            &bin,
+            "exact",
+            &format!("/usr/bin/head -c {OUTPUT_LIMIT} /dev/zero | /usr/bin/tr '\\0' x"),
+        );
+        assert_eq!(
+            run_fixed(&dirs, "exact", &[], &none(), SHORT * 10),
+            Run::Output("x".repeat(OUTPUT_LIMIT))
+        );
+        shim(
+            &bin,
+            "over",
+            &format!(
+                "/usr/bin/head -c {} /dev/zero | /usr/bin/tr '\\0' x",
+                OUTPUT_LIMIT + 1
+            ),
+        );
+        assert_eq!(
+            run_fixed(&dirs, "over", &[], &none(), SHORT * 10),
+            Run::Output("x".repeat(OUTPUT_LIMIT))
+        );
+    }
+
+    #[test]
+    fn a_timeout_stops_the_whole_process_group_of_the_child() {
+        let (_t, state, bin) = state();
+        let dirs = vec![bin.clone()];
+        let pidfile = state.join("grandchild.pid");
+        shim(
+            &bin,
+            "spawner",
+            &format!(
+                "/bin/sleep 30 &\necho $! > {}\n/bin/sleep 30",
+                pidfile.display()
+            ),
+        );
+        assert_eq!(
+            run_fixed(&dirs, "spawner", &[], &none(), Duration::from_millis(500)),
+            Run::TimedOut
+        );
+        let grandchild: u32 = std::fs::read_to_string(&pidfile)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(grandchild > 1);
+        let gone = (0..100).any(|_| {
+            let gone = crate::platform::process_start_identity(grandchild)
+                == crate::platform::StartIdentity::NoProcess;
+            if !gone {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            gone
+        });
+        assert!(gone, "the descendant outlived the timeout");
     }
 
     #[test]
@@ -336,7 +495,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o700),
         )
         .unwrap();
-        let report = collect_with(&state, &BTreeMap::new(), SHORT, SHORT).unwrap();
+        let report = collect_with(&state, &BTreeMap::new(), SHORT).unwrap();
         assert!(report.tools.values().all(|t| t.managed.is_none()));
         // A configuration that does not load is no adapters either.
         std::fs::write(state.join("toolchains.toml"), "garbage [").unwrap();
@@ -345,7 +504,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        let report = collect_with(&state, &BTreeMap::new(), SHORT, SHORT).unwrap();
+        let report = collect_with(&state, &BTreeMap::new(), SHORT).unwrap();
         assert!(report.tools.values().all(|t| t.managed.is_none()));
     }
 
@@ -380,7 +539,7 @@ mod tests {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        let report = collect_with(&state, &BTreeMap::new(), SHORT, SHORT).unwrap();
+        let report = collect_with(&state, &BTreeMap::new(), SHORT).unwrap();
         let managed = |tool: &str| report.tools[tool].managed.clone();
         let node = Managed {
             inventory: vec!["20.1.0".into()],

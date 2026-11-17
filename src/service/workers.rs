@@ -811,26 +811,65 @@ pub fn reload_resident(spec: &Spec) -> ResidentReload {
     }
 }
 
-/// What a worker answered to `worker-service env`. An older binary does not
-/// know the action: that is said, never turned into an empty difference.
-fn parse_env_reply(out: &RemoteOutput) -> Result<EnvReport, ApiError> {
-    let unreadable = || {
-        ApiError::new(
-            ErrorCode::Conflict,
-            "the worker's binary does not support environment reports; reinstall it with workers add --install",
-        )
+/// A worker-supplied text without control characters (escape sequences,
+/// newlines), so it cannot rewrite the parent's terminal.
+fn strip_control(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+/// [`strip_control`], cut to a length a terminal line can hold.
+fn plain(text: &str) -> String {
+    strip_control(text).chars().take(200).collect()
+}
+
+/// What a worker answered to `worker-service env`. A binary that does not
+/// know the action, a newer or damaged report and a login banner each get
+/// their own message: none is turned into an empty difference.
+fn parse_env_reply(out: &RemoteOutput, name: &str) -> Result<EnvReport, ApiError> {
+    let conflict = |message: String| ApiError::new(ErrorCode::Conflict, message);
+    let upgrade = format!("run workers upgrade {name}");
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
+        let text = String::from_utf8_lossy(&out.stdout);
+        let banner = text
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .any(|v| v.get("ok").is_some());
+        return Err(conflict(if banner {
+            "the worker printed other output (a login banner?) before its environment report; \
+             silence it for non-interactive ssh sessions"
+                .to_string()
+        } else if text.trim().is_empty() {
+            format!("the worker's binary gave no environment report; it may be too old: {upgrade}")
+        } else {
+            format!(
+                "the worker's answer is not an environment report; its binary may be too old: {upgrade}"
+            )
+        }));
     };
-    let value: serde_json::Value = serde_json::from_slice(&out.stdout).map_err(|_| unreadable())?;
     if value["ok"] == true {
-        return serde_json::from_value(value["env"].clone()).map_err(|_| unreadable());
+        let version = value["env"]["schema_version"].as_u64();
+        return match version {
+            Some(v) if v > u64::from(envdiff::SCHEMA) => Err(conflict(format!(
+                "the worker reports environment schema {v}, newer than this machine understands ({}); upgrade remote-task-runner here",
+                envdiff::SCHEMA
+            ))),
+            Some(v) if v < u64::from(envdiff::SCHEMA) => Err(conflict(format!(
+                "the worker reports environment schema {v}, older than this machine's {}: {upgrade}",
+                envdiff::SCHEMA
+            ))),
+            _ => serde_json::from_value(value["env"].clone()).map_err(|_| {
+                conflict(format!(
+                    "the worker's environment report is damaged; if it persists: {upgrade}"
+                ))
+            }),
+        };
     }
-    Err(ApiError::new(
-        ErrorCode::Conflict,
-        format!(
-            "worker environment report refused: {}",
-            value["error"].as_str().unwrap_or("unspecified")
-        ),
-    ))
+    Err(conflict(format!(
+        "worker environment report refused: {}",
+        value["error"]
+            .as_str()
+            .map_or_else(|| "unspecified".to_string(), plain)
+    )))
 }
 
 /// The environment of a registered worker, measured by its own binary.
@@ -854,7 +893,7 @@ pub fn fetch_env(
             Duration::from_secs(60),
         )
         .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
-    parse_env_reply(&out)
+    parse_env_reply(&out, name)
 }
 
 #[derive(Debug, Serialize)]
@@ -862,10 +901,15 @@ pub struct WorkerDiff {
     pub worker: String,
     pub all_same: bool,
     pub items: Vec<Item>,
+    /// Why this worker could not be measured; `items` is empty then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 /// `workers diff [<worker>]`: the parent's environment against each named
-/// (or every registered) worker. `local` measures the parent.
+/// (or every registered) worker. `local` measures the parent. Without a name
+/// one worker that cannot be measured does not stop the others: it gets its
+/// own entry with the reason. A named worker that fails is an error.
 pub fn diff_workers(
     remote: &mut impl Remote,
     env: &BTreeMap<String, String>,
@@ -877,19 +921,35 @@ pub fn diff_workers(
         Some(name) => vec![name.to_string()],
         None => registered_names(env)?,
     };
+    if names.is_empty() {
+        return Err(ApiError::new(
+            ErrorCode::NotFound,
+            "no workers are registered; add one with workers add",
+        ));
+    }
     let parent = local().map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
-    names
-        .into_iter()
-        .map(|worker| {
-            let report = fetch_env(remote, env, exe, &worker)?;
-            let items = envdiff::diff(&parent, &report);
-            Ok(WorkerDiff {
-                all_same: envdiff::all_same(&items),
+    let mut out = Vec::new();
+    for worker in names {
+        match fetch_env(remote, env, exe, &worker) {
+            Ok(report) => {
+                let items = envdiff::diff(&parent, &report);
+                out.push(WorkerDiff {
+                    all_same: envdiff::all_same(&items),
+                    worker,
+                    items,
+                    error: None,
+                });
+            }
+            Err(e) if name.is_some() => return Err(e),
+            Err(e) => out.push(WorkerDiff {
                 worker,
-                items,
-            })
-        })
-        .collect()
+                all_same: false,
+                items: Vec::new(),
+                error: Some(plain(&e.message)),
+            }),
+        }
+    }
+    Ok(out)
 }
 
 fn registered_names(env: &BTreeMap<String, String>) -> Result<Vec<String>, ApiError> {
@@ -904,6 +964,9 @@ pub fn render_diff(diffs: &[WorkerDiff]) -> String {
     let mut lines = Vec::new();
     for d in diffs {
         lines.push(format!("worker {}", d.worker));
+        if let Some(error) = &d.error {
+            lines.push(format!("  could not be measured: {error}"));
+        }
         for i in &d.items {
             let class = serde_json::to_value(i.class)
                 .ok()
@@ -919,7 +982,8 @@ pub fn render_diff(diffs: &[WorkerDiff]) -> String {
             if let Some(steps) = &i.steps {
                 line.push_str(&format!("  -> {steps}"));
             }
-            lines.push(line);
+            // Values come from the worker's report.
+            lines.push(strip_control(&line));
         }
     }
     lines.join("\n")
@@ -1000,7 +1064,18 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                     (serde_json::to_value(r).expect("serializes"), text)
                 });
             let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
-            return Some(emit(json, result.map(|(v, _)| v), || text));
+            let unmeasured = result.as_ref().is_ok_and(|(v, _)| {
+                v["workers"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|d| d.get("error").is_some()))
+            });
+            let code = emit(json, result.map(|(v, _)| v), || text);
+            // The others were still reported; the exit status says one was not.
+            return Some(if unmeasured && code == crate::cli::exit::SUCCESS {
+                ErrorCode::CommunicationUnknown.exit_code()
+            } else {
+                code
+            });
         }
         WorkersSub::Start { name } => {
             (name, Lifecycle::Start, lifecycle_of(name, Lifecycle::Start))
@@ -1037,7 +1112,18 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                 (serde_json::json!({ "workers": diffs }), text)
             });
             let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
-            return Some(emit(json, result.map(|(v, _)| v), || text));
+            let unmeasured = result.as_ref().is_ok_and(|(v, _)| {
+                v["workers"]
+                    .as_array()
+                    .is_some_and(|w| w.iter().any(|d| d.get("error").is_some()))
+            });
+            let code = emit(json, result.map(|(v, _)| v), || text);
+            // The others were still reported; the exit status says one was not.
+            return Some(if unmeasured && code == crate::cli::exit::SUCCESS {
+                ErrorCode::CommunicationUnknown.exit_code()
+            } else {
+                code
+            });
         }
         _ => return None,
     };

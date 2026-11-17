@@ -1,9 +1,9 @@
 //! Environment difference between the parent and a worker (`workers diff`).
 //! Pure: two serializable reports in, classified items out. No process, file or
 //! network access, so `doctor` can call `diff` on reports it already holds.
-use super::capability::Requirement;
+use super::capability::{self, Requirement, ToolObservation, WorkerCapabilities};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 pub const SCHEMA: u32 = 1;
 /// Below this much free disk a worker is reported as `differs`.
@@ -11,6 +11,10 @@ pub const MIN_DISK_BYTES: u64 = 2 << 30;
 /// Tools that are never installed automatically (administrator rights, a
 /// license acceptance or a GUI is involved).
 const MANUAL_TOOLS: &[&str] = &["xcode", "docker"];
+/// Separately distributed tools: automatic only when the worker's version
+/// manager lists the wanted version, which means a distribution path is
+/// configured. Without one, a person installs them.
+const DISTRIBUTED_TOOLS: &[&str] = &["portool", "fast-worktree"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -51,12 +55,21 @@ pub struct EnvReport {
     pub os: String,
     pub arch: String,
     pub tools: BTreeMap<String, ToolFact>,
-    /// Versions of portool-adjacent helpers: task-traffic-controller,
-    /// local-ci and remote-task-runner itself. `None`: not found.
+    /// Build identity of what is built into this binary. The
+    /// task-traffic-controller runtime and local-ci core are part of the
+    /// remote-task-runner binary (spec 22.4), so the version of that binary
+    /// stands for all three and no external `--version` is asked. Separately
+    /// distributed helpers (portool, fast-worktree) are in `tools`.
     pub helpers: BTreeMap<String, Option<String>>,
     pub docker: Docker,
     pub disk_free_bytes: Option<u64>,
+    /// The active profile's name and required tools are compared; its digest
+    /// covers absolute paths that differ between hosts, so it is shown only.
+    pub profile: String,
+    pub required_tools: Vec<String>,
     pub profile_digest: Option<String>,
+    /// `None` until a real digest of the task-traffic-controller policy
+    /// exists: then it is `not_measured`, never `same`.
     pub policy_digest: Option<String>,
 }
 
@@ -68,6 +81,8 @@ pub enum Class {
     Missing,
     AutoInstallable,
     ManualRequired,
+    /// Nothing could be compared; there is nothing to act on either.
+    NotMeasured,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -83,20 +98,36 @@ pub struct Item {
     pub steps: Option<String>,
 }
 
-/// The manual procedure for a tool that is never installed automatically.
+/// The manual procedure for a tool that is never installed automatically
+/// (without the closing "then rerun" clause).
 pub fn manual_steps(tool: &str) -> Option<&'static str> {
     match tool {
-        "xcode" => Some("install Xcode and accept its license on the worker"),
-        "docker" => Some("install and start Docker Desktop on the worker"),
+        "xcode" => Some("on the worker, install Xcode (App Store or developer.apple.com), then run `sudo xcodebuild -license accept`"),
+        "docker" => Some("on the worker, start Docker (Docker Desktop, OrbStack or Colima) so that `docker info` succeeds for the worker user"),
         _ => None,
     }
 }
 
-fn steps_for(tool: &str) -> String {
-    manual_steps(tool).map_or_else(
-        || format!("install {tool} on the worker, then rerun workers diff"),
-        str::to_string,
-    )
+const RERUN: &str = ", then rerun workers diff";
+
+/// The procedure for a tool a person has to put right. `differs`: it is on
+/// the worker in another version; otherwise it is not there.
+fn install_steps(tool: &str, version: Option<&str>, differs: bool) -> String {
+    if let Some(manual) = manual_steps(tool) {
+        return format!("{manual}{RERUN}");
+    }
+    let spec = version.map_or_else(|| tool.to_string(), |v| format!("{tool} {v}"));
+    if differs {
+        format!(
+            "install {spec} on the worker (or authorize it in the worker's toolchains.toml){RERUN}"
+        )
+    } else {
+        format!("install {spec} on the worker so that it is on the profile PATH{RERUN}")
+    }
+}
+
+fn unmeasured_steps(name: &str, side: &str) -> String {
+    format!("{name} could not be measured on {side}; check its profile PATH and rerun workers diff")
 }
 
 fn item(
@@ -121,82 +152,64 @@ fn tool_item(name: &str, want: &ToolFact, have: Option<&ToolFact>) -> Option<Ite
         return None;
     }
     let wanted = want.version.as_deref();
-    let manual = MANUAL_TOOLS.contains(&name);
-    let auto = steps_for_auto();
+    let have_version = have.and_then(|h| h.version.as_deref());
     let unmeasured = |side: &str| {
         item(
             name,
             Class::Differs,
             wanted,
-            have.and_then(|h| h.version.as_deref()),
-            Some(format!(
-                "{side} could not measure {name}; rerun workers diff"
-            )),
+            have_version,
+            Some(unmeasured_steps(name, side)),
         )
     };
     if want.observed == Observed::Unknown {
-        return Some(unmeasured("the parent"));
+        return Some(unmeasured("this machine"));
     }
-    let Some(have) = have.filter(|h| h.observed != Observed::Unavailable) else {
-        // Not on the worker (or not reported at all).
-        let managed = have.and_then(|h| h.managed.as_ref());
-        let class = if manual {
-            Class::ManualRequired
-        } else if wanted
-            .is_some_and(|v| managed.is_some_and(|m| m.inventory.iter().any(|i| i == v)))
-        {
-            Class::AutoInstallable
-        } else {
-            Class::Missing
-        };
-        let steps = if class == Class::AutoInstallable {
-            auto
-        } else {
-            steps_for(name)
-        };
-        return Some(item(name, class, wanted, None, Some(steps)));
-    };
-    if have.observed == Observed::Unknown {
+    // A worker that did not report the tool at all was not measured either.
+    let Some(have) = have else {
         return Some(unmeasured("the worker"));
-    }
-    if have.version.as_deref() == wanted {
+    };
+    if have.observed == Observed::Available && have.version.as_deref() == wanted {
         return Some(item(name, Class::Same, wanted, wanted, None));
     }
     let managed = have.managed.as_ref();
-    if wanted.is_some_and(|v| managed.is_some_and(|m| m.installed.iter().any(|i| i == v))) {
-        // Installed under the version manager: an attempt activates it.
-        return Some(item(
-            name,
-            Class::Same,
-            wanted,
-            have.version.as_deref(),
-            None,
-        ));
+    let listed = |pick: fn(&Managed) -> &Vec<String>| {
+        wanted
+            .zip(managed)
+            .is_some_and(|(v, m)| pick(m).iter().any(|i| i == v))
+    };
+    // Installed under the version manager: an attempt activates it, whether
+    // or not it is the default on the profile PATH (or measurable there).
+    if listed(|m| &m.installed) {
+        return Some(item(name, Class::Same, wanted, have_version, None));
     }
-    let class = if manual {
+    if have.observed == Observed::Unknown {
+        return Some(unmeasured("the worker"));
+    }
+    let present = have.observed == Observed::Available;
+    let class = if MANUAL_TOOLS.contains(&name) {
         Class::ManualRequired
-    } else if wanted.is_some_and(|v| managed.is_some_and(|m| m.inventory.iter().any(|i| i == v))) {
+    } else if listed(|m| &m.inventory) {
         Class::AutoInstallable
-    } else {
+    } else if DISTRIBUTED_TOOLS.contains(&name) {
+        Class::ManualRequired
+    } else if present {
         Class::Differs
+    } else {
+        Class::Missing
     };
     let steps = match class {
-        Class::AutoInstallable => auto,
-        _ => steps_for(name),
+        Class::AutoInstallable => steps_for_auto(),
+        _ => install_steps(name, wanted, present),
     };
-    Some(item(
-        name,
-        class,
-        wanted,
-        have.version.as_deref(),
-        Some(steps),
-    ))
+    Some(item(name, class, wanted, have_version, Some(steps)))
 }
 
 fn steps_for_auto() -> String {
     "run workers sync to install it with the version manager".into()
 }
 
+/// A built-in identity compared by value.
 fn value_item(subject: &str, want: Option<&str>, have: Option<&str>) -> Option<Item> {
     let want = want?;
     Some(match have {
@@ -205,7 +218,7 @@ fn value_item(subject: &str, want: Option<&str>, have: Option<&str>) -> Option<I
             Class::Missing,
             Some(want),
             None,
-            Some(format!("the worker did not report {subject}")),
+            Some(format!("install {subject} {want} on the worker")),
         ),
         Some(h) if h == want => item(subject, Class::Same, Some(want), Some(h), None),
         Some(h) => item(
@@ -213,15 +226,73 @@ fn value_item(subject: &str, want: Option<&str>, have: Option<&str>) -> Option<I
             Class::Differs,
             Some(want),
             Some(h),
-            Some(format!("align {subject} on the worker")),
+            Some(format!(
+                "install {subject} {want} on the worker, or run workers upgrade for remote-task-runner"
+            )),
         ),
     })
 }
 
+fn profile_text(r: &EnvReport) -> String {
+    let digest = r
+        .profile_digest
+        .as_deref()
+        .map(|d| d.chars().take(19).collect::<String>());
+    format!(
+        "{} requires [{}]{}",
+        r.profile,
+        r.required_tools.join(", "),
+        digest.map_or_else(String::new, |d| format!(" ({d})"))
+    )
+}
+
+fn profile_item(want: &EnvReport, have: &EnvReport) -> Item {
+    let set = |r: &EnvReport| {
+        r.required_tools
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<String>>()
+    };
+    let (pw, ph) = (profile_text(want), profile_text(have));
+    if want.profile == have.profile && set(want) == set(have) {
+        return item("profile", Class::Same, Some(&pw), Some(&ph), None);
+    }
+    item(
+        "profile",
+        Class::Differs,
+        Some(&pw),
+        Some(&ph),
+        Some(format!(
+            "make the worker's active profile name and required_tools match the parent's{RERUN}"
+        )),
+    )
+}
+
+fn policy_item(want: &EnvReport, have: &EnvReport) -> Item {
+    match (&want.policy_digest, &have.policy_digest) {
+        (Some(w), Some(h)) if w == h => item("policy_digest", Class::Same, Some(w), Some(h), None),
+        (Some(w), Some(h)) => item(
+            "policy_digest",
+            Class::Differs,
+            Some(w),
+            Some(h),
+            Some(format!(
+                "align the task-traffic-controller policy on the worker{RERUN}"
+            )),
+        ),
+        _ => item(
+            "policy_digest",
+            Class::NotMeasured,
+            None,
+            None,
+            Some("the task-traffic-controller policy digest is not measured yet".into()),
+        ),
+    }
+}
+
 /// Difference between the parent (`want`) and a worker (`have`), in a fixed
-/// order: platform, tools by name, helpers by name, docker, disk, profile
-/// digest, policy digest. Every item carries one class; `Unknown` is never
-/// `Same`.
+/// order: platform, tools by name, helpers by name, docker, disk, profile,
+/// policy digest. Every item carries one class; `Unknown` is never `Same`.
 pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
     let mut items = Vec::new();
     let platform = |r: &EnvReport| format!("{}/{}", r.os, r.arch);
@@ -234,7 +305,7 @@ pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
             Class::Differs,
             Some(&pw),
             Some(&ph),
-            Some("use a worker with the same OS and architecture".into()),
+            Some("use a worker with the same OS and architecture (a different architecture needs its own profile)".into()),
         )
     });
     for (name, fact) in &want.tools {
@@ -262,14 +333,14 @@ pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
                 Class::ManualRequired,
                 Some("runnable"),
                 Some("not runnable"),
-                manual_steps("docker").map(str::to_string),
+                Some(install_steps("docker", None, false)),
             ),
             Docker::Unknown => item(
                 "docker",
                 Class::Differs,
                 Some("runnable"),
                 Some("unknown"),
-                Some("the worker could not tell; rerun workers diff".into()),
+                Some(unmeasured_steps("docker", "the worker")),
             ),
         });
     }
@@ -279,51 +350,63 @@ pub fn diff(want: &EnvReport, have: &EnvReport) -> Vec<Item> {
             Class::Missing,
             None,
             None,
-            Some("the worker did not report free disk".into()),
+            Some("free disk could not be measured on the worker; rerun workers diff".into()),
         ),
         Some(b) if b < MIN_DISK_BYTES => item(
             "disk",
             Class::Differs,
             None,
             Some(&b.to_string()),
-            Some("free disk on the worker".into()),
+            Some(format!(
+                "free at least {} GiB on the worker's state volume",
+                MIN_DISK_BYTES >> 30
+            )),
         ),
         Some(b) => item("disk", Class::Same, None, Some(&b.to_string()), None),
     });
-    items.extend(value_item(
-        "profile_digest",
-        want.profile_digest.as_deref(),
-        have.profile_digest.as_deref(),
-    ));
-    items.extend(value_item(
-        "policy_digest",
-        want.policy_digest.as_deref(),
-        have.policy_digest.as_deref(),
-    ));
+    items.push(profile_item(want, have));
+    items.push(policy_item(want, have));
     items
 }
 
-/// True when nothing needs attention.
+/// True when nothing needs attention. A `not_measured` item is no
+/// difference: it says only that nothing could be compared.
 pub fn all_same(items: &[Item]) -> bool {
-    items.iter().all(|i| i.class == Class::Same)
+    items
+        .iter()
+        .all(|i| matches!(i.class, Class::Same | Class::NotMeasured))
 }
 
 /// One short line (at most 128 characters) saying how to resolve an unmet
 /// tool requirement a worker cannot install by itself, for the waiting reason
-/// of a task.
-pub fn waiting_hint(tool: &str) -> String {
-    let steps = steps_for(tool);
+/// of a task. `unknown`: the worker could not measure the tool, which is no
+/// reason to install it.
+pub fn waiting_hint(tool: &str, unknown: bool) -> String {
+    let steps = if unknown {
+        format!("{tool} could not be measured on the worker; rerun workers diff, or check its profile PATH")
+    } else {
+        install_steps(tool, None, false)
+            .strip_suffix(RERUN)
+            .map(str::to_string)
+            .unwrap_or_default()
+    };
     let line = format!("how: {steps}");
     line.chars().take(128).collect()
 }
 
 /// `unmet` as `capability::missing` produced it, with one hint inserted after
 /// the first line naming an unmet tool requirement (so the display cap of four
-/// lines keeps it). Requirements other than tools carry no procedure.
-pub fn with_steps(mut unmet: Vec<String>, requires: &[Requirement]) -> Vec<String> {
+/// lines keeps it). Requirements other than tools carry no procedure. The
+/// lines are matched through `capability::unmet_line`, the function `missing`
+/// writes them with.
+pub fn with_steps(
+    mut unmet: Vec<String>,
+    requires: &[Requirement],
+    report: Option<&WorkerCapabilities>,
+) -> Vec<String> {
     let named = requires.iter().find_map(|r| match r {
         Requirement::Tool(name) => {
-            let line = format!("{r:?} unavailable");
+            let line = capability::unmet_line(r);
             unmet
                 .iter()
                 .position(|u| *u == line)
@@ -332,8 +415,8 @@ pub fn with_steps(mut unmet: Vec<String>, requires: &[Requirement]) -> Vec<Strin
         _ => None,
     });
     if let Some((at, tool)) = named {
-        let hint = waiting_hint(tool);
-        unmet.insert(at + 1, hint);
+        let unknown = report.is_some_and(|r| r.tools.get(tool) == Some(&ToolObservation::Unknown));
+        unmet.insert(at + 1, waiting_hint(tool, unknown));
     }
     unmet
 }
@@ -364,6 +447,8 @@ mod tests {
             helpers: BTreeMap::new(),
             docker: Docker::Runnable,
             disk_free_bytes: Some(MIN_DISK_BYTES),
+            profile: "default".into(),
+            required_tools: vec!["node".into()],
             profile_digest: Some("sha256:p".into()),
             policy_digest: Some("sha256:t".into()),
         }
@@ -396,13 +481,7 @@ mod tests {
         assert!(!all_same(&diff(&report(), &worker)));
         assert_eq!(
             items.iter().map(|i| i.subject.as_str()).collect::<Vec<_>>(),
-            [
-                "platform",
-                "docker",
-                "disk",
-                "profile_digest",
-                "policy_digest"
-            ]
+            ["platform", "docker", "disk", "profile", "policy_digest"]
         );
         assert!(items.iter().all(|i| i.steps.is_none()));
     }
@@ -425,10 +504,25 @@ mod tests {
         );
         assert_eq!(class(unknown.clone(), None), Class::Differs);
         assert_eq!(class(avail("1.0.0"), Some(unknown)), Class::Differs);
-        let item = tool(avail("1.0.0"), Some(fact(Observed::Unknown, None))).unwrap();
-        assert!(item.steps.unwrap().contains("the worker could not measure"));
-        let item = tool(fact(Observed::Unknown, None), None).unwrap();
-        assert!(item.steps.unwrap().contains("the parent could not measure"));
+        // A worker that did not report the tool was not measured either.
+        assert_eq!(class(avail("1.0.0"), None), Class::Differs);
+        // Said as "could not be measured", never as an install instruction.
+        for (want, have, side) in [
+            (
+                avail("1.0.0"),
+                Some(fact(Observed::Unknown, None)),
+                "the worker",
+            ),
+            (avail("1.0.0"), None, "the worker"),
+            (fact(Observed::Unknown, None), None, "this machine"),
+        ] {
+            let steps = tool(want, have).unwrap().steps.unwrap();
+            assert!(
+                steps.contains(&format!("node could not be measured on {side}")),
+                "{steps}"
+            );
+            assert!(!steps.contains("install"), "{steps}");
+        }
     }
 
     #[test]
@@ -441,12 +535,16 @@ mod tests {
         let item = tool(avail("20.1.0"), Some(avail("18.0.0"))).unwrap();
         assert_eq!(item.parent.as_deref(), Some("20.1.0"));
         assert_eq!(item.worker.as_deref(), Some("18.0.0"));
-        assert!(item.steps.unwrap().contains("install node"));
+        let steps = item.steps.unwrap();
+        assert!(
+            steps.contains("install node 20.1.0 on the worker"),
+            "{steps}"
+        );
+        assert!(steps.contains("toolchains.toml"), "{steps}");
     }
 
     #[test]
     fn a_missing_tool_is_missing_auto_installable_or_manual() {
-        assert_eq!(class(avail("20.1.0"), None), Class::Missing);
         let unavailable = fact(Observed::Unavailable, None);
         assert_eq!(
             class(avail("20.1.0"), Some(unavailable.clone())),
@@ -455,7 +553,12 @@ mod tests {
         // A manager that may install it, but not this version.
         let mut other = unavailable.clone();
         other.managed = managed(&["18.0.0"], &[]);
-        assert_eq!(class(avail("20.1.0"), Some(other)), Class::Missing);
+        let item = tool(avail("20.1.0"), Some(other)).unwrap();
+        assert_eq!(item.class, Class::Missing);
+        assert_eq!(
+            item.steps.as_deref(),
+            Some("install node 20.1.0 on the worker so that it is on the profile PATH, then rerun workers diff")
+        );
         let mut capable = unavailable;
         capable.managed = managed(&["18.0.0", "20.1.0"], &[]);
         let item = tool(avail("20.1.0"), Some(capable)).unwrap();
@@ -475,6 +578,23 @@ mod tests {
     }
 
     #[test]
+    fn a_version_installed_under_the_manager_is_same_even_off_the_profile_path() {
+        // The normal case when adapters install privately: no default tool.
+        for observed in [Observed::Unavailable, Observed::Unknown] {
+            let mut have = fact(observed, None);
+            have.managed = managed(&["20.1.0"], &["20.1.0"]);
+            let item = tool(avail("20.1.0"), Some(have)).unwrap();
+            assert_eq!(item.class, Class::Same, "{observed:?}");
+            assert_eq!(item.worker, None);
+            assert_eq!(item.steps, None);
+        }
+        // Another installed version does not count.
+        let mut have = fact(Observed::Unavailable, None);
+        have.managed = managed(&["18.0.0", "20.1.0"], &["18.0.0"]);
+        assert_eq!(class(avail("20.1.0"), Some(have)), Class::AutoInstallable);
+    }
+
+    #[test]
     fn a_version_the_manager_may_install_is_auto_installable() {
         let mut have = avail("18.0.0");
         have.managed = managed(&["18.0.0", "20.1.0"], &["18.0.0"]);
@@ -485,18 +605,14 @@ mod tests {
         have.managed = managed(&["18.0.0"], &["18.0.0"]);
         let item = tool(avail("20.1.0"), Some(have)).unwrap();
         assert_eq!(item.class, Class::Differs);
-        assert!(item.steps.unwrap().contains("install node"));
+        assert!(item.steps.unwrap().contains("install node 20.1.0"));
     }
 
     #[test]
     fn manual_tools_are_manual_whatever_the_version_manager_says() {
         let mut parent = report();
         parent.tools.insert("xcode".into(), avail("16.0"));
-        for have in [
-            None,
-            Some(avail("15.0")),
-            Some(fact(Observed::Unavailable, None)),
-        ] {
+        for have in [Some(avail("15.0")), Some(fact(Observed::Unavailable, None))] {
             let mut worker = report();
             if let Some(h) = have {
                 worker.tools.insert("xcode".into(), h);
@@ -506,7 +622,12 @@ mod tests {
                 .find(|i| i.subject == "xcode")
                 .unwrap();
             assert_eq!(item.class, Class::ManualRequired);
-            assert_eq!(item.steps.as_deref(), manual_steps("xcode"));
+            assert_eq!(
+                item.steps,
+                Some(format!("{}{RERUN}", manual_steps("xcode").unwrap()))
+            );
+            let steps = item.steps.unwrap();
+            assert!(steps.contains("sudo xcodebuild -license accept"), "{steps}");
         }
         // Even an offered version cannot make it automatic.
         let mut worker = report();
@@ -536,6 +657,41 @@ mod tests {
     }
 
     #[test]
+    fn distributed_tools_are_manual_unless_a_distribution_path_lists_them() {
+        for name in ["portool", "fast-worktree"] {
+            let mut parent = report();
+            parent.tools.insert(name.into(), avail("0.5.0"));
+            let find = |worker: &EnvReport| {
+                diff(&parent, worker)
+                    .into_iter()
+                    .find(|i| i.subject == name)
+                    .unwrap()
+            };
+            // Absent and another version: no automatic path is configured.
+            let mut worker = report();
+            worker
+                .tools
+                .insert(name.into(), fact(Observed::Unavailable, None));
+            let item = find(&worker);
+            assert_eq!(item.class, Class::ManualRequired);
+            assert!(item
+                .steps
+                .unwrap()
+                .contains(&format!("install {name} 0.5.0 on the worker")),);
+            worker.tools.insert(name.into(), avail("0.4.0"));
+            assert_eq!(find(&worker).class, Class::ManualRequired);
+            // A configured distribution path lists the version.
+            let mut have = fact(Observed::Unavailable, None);
+            have.managed = managed(&["0.5.0"], &[]);
+            worker.tools.insert(name.into(), have);
+            assert_eq!(find(&worker).class, Class::AutoInstallable);
+            // Same version is same.
+            worker.tools.insert(name.into(), avail("0.5.0"));
+            assert_eq!(find(&worker).class, Class::Same);
+        }
+    }
+
+    #[test]
     fn the_docker_tool_entry_is_covered_by_the_docker_field() {
         let mut parent = report();
         parent.tools.insert("docker".into(), avail("27.0.0"));
@@ -550,11 +706,19 @@ mod tests {
         let items = diff(&report(), &worker);
         let item = items.iter().find(|i| i.subject == "docker").unwrap();
         assert_eq!(item.class, Class::ManualRequired);
-        assert_eq!(item.steps.as_deref(), manual_steps("docker"));
+        let steps = item.steps.as_deref().unwrap();
+        assert!(steps.contains("OrbStack or Colima"), "{steps}");
+        assert!(steps.contains("`docker info` succeeds"), "{steps}");
         worker.docker = Docker::Unknown;
         let items = diff(&report(), &worker);
         let item = items.iter().find(|i| i.subject == "docker").unwrap();
         assert_eq!(item.class, Class::Differs);
+        let steps = item.steps.as_deref().unwrap();
+        assert!(
+            steps.contains("docker could not be measured on the worker"),
+            "{steps}"
+        );
+        assert!(!steps.contains("install"), "{steps}");
         // The parent does not run docker: nothing to compare.
         let mut parent = report();
         parent.docker = Docker::NotRunnable;
@@ -564,66 +728,122 @@ mod tests {
     }
 
     #[test]
-    fn helpers_compare_by_version() {
+    fn the_built_in_build_identity_compares_by_version() {
         let mut parent = report();
         parent
             .helpers
-            .insert("local-ci".into(), Some("0.13.0".into()));
-        parent
-            .helpers
-            .insert("task-traffic-controller".into(), Some("0.8.2".into()));
+            .insert("remote-task-runner".into(), Some("0.13.0".into()));
         parent.helpers.insert("absent-here".into(), None);
         let mut worker = report();
+        let find = |parent: &EnvReport, worker: &EnvReport| {
+            diff(parent, worker)
+                .into_iter()
+                .find(|i| i.subject == "remote-task-runner")
+                .unwrap()
+        };
+        assert_eq!(find(&parent, &worker).class, Class::Missing);
         worker
             .helpers
-            .insert("local-ci".into(), Some("0.12.0".into()));
-        let items = diff(&parent, &worker);
-        let get = |name: &str| items.iter().find(|i| i.subject == name).unwrap();
-        assert_eq!(get("local-ci").class, Class::Differs);
-        assert_eq!(get("task-traffic-controller").class, Class::Missing);
-        assert!(items.iter().all(|i| i.subject != "absent-here"));
+            .insert("remote-task-runner".into(), Some("0.12.0".into()));
+        let item = find(&parent, &worker);
+        assert_eq!(item.class, Class::Differs);
+        assert!(item
+            .steps
+            .unwrap()
+            .contains("install remote-task-runner 0.13.0 on the worker"));
+        assert!(diff(&parent, &worker)
+            .iter()
+            .all(|i| i.subject != "absent-here"));
         worker
             .helpers
-            .insert("local-ci".into(), Some("0.13.0".into()));
-        worker
-            .helpers
-            .insert("task-traffic-controller".into(), None);
-        let items = diff(&parent, &worker);
-        let get = |name: &str| items.iter().find(|i| i.subject == name).unwrap();
-        assert_eq!(get("local-ci").class, Class::Same);
-        assert_eq!(get("task-traffic-controller").class, Class::Missing);
+            .insert("remote-task-runner".into(), Some("0.13.0".into()));
+        assert_eq!(find(&parent, &worker).class, Class::Same);
     }
 
     #[test]
-    fn platform_disk_and_digests() {
+    fn platform_and_disk() {
         let mut worker = report();
         worker.arch = "x86_64".into();
         worker.disk_free_bytes = Some(MIN_DISK_BYTES - 1);
-        worker.profile_digest = Some("sha256:other".into());
-        worker.policy_digest = None;
         let items = diff(&report(), &worker);
         let get = |name: &str| items.iter().find(|i| i.subject == name).unwrap();
         assert_eq!(get("platform").class, Class::Differs);
         assert_eq!(get("platform").worker.as_deref(), Some("macos/x86_64"));
+        assert!(get("platform")
+            .steps
+            .as_deref()
+            .unwrap()
+            .contains("needs its own profile"));
         assert_eq!(get("disk").class, Class::Differs);
-        assert_eq!(get("profile_digest").class, Class::Differs);
-        assert_eq!(get("policy_digest").class, Class::Missing);
-        worker.disk_free_bytes = None;
         assert_eq!(
-            diff(&report(), &worker)
-                .iter()
-                .find(|i| i.subject == "disk")
-                .unwrap()
-                .class,
-            Class::Missing
+            get("disk").steps.as_deref(),
+            Some("free at least 2 GiB on the worker's state volume")
         );
-        // A parent without a digest has nothing to compare.
+        worker.disk_free_bytes = None;
+        let items = diff(&report(), &worker);
+        let item = items.iter().find(|i| i.subject == "disk").unwrap();
+        assert_eq!(item.class, Class::Missing);
+        assert!(!item.steps.as_deref().unwrap().contains("install"));
+    }
+
+    #[test]
+    fn the_profile_is_compared_by_name_and_required_tools_and_its_digest_is_shown_only() {
+        let mut worker = report();
+        // Hosts never share absolute paths, so the digest alone is no difference.
+        worker.profile_digest = Some("sha256:other".into());
+        let items = diff(&report(), &worker);
+        let item = items.iter().find(|i| i.subject == "profile").unwrap();
+        assert_eq!(item.class, Class::Same);
+        assert!(item.parent.as_deref().unwrap().contains("sha256:p"));
+        assert!(item.worker.as_deref().unwrap().contains("sha256:other"));
+        assert!(all_same(&items));
+        // The same tools in another order are the same set.
         let mut parent = report();
-        parent.profile_digest = None;
-        parent.policy_digest = None;
-        assert!(diff(&parent, &worker)
-            .iter()
-            .all(|i| i.subject != "profile_digest" && i.subject != "policy_digest"));
+        parent.required_tools = vec!["git".into(), "node".into()];
+        worker.required_tools = vec!["node".into(), "git".into()];
+        assert!(all_same(&diff(&parent, &worker)));
+        // A different name or tool set differs, with a step.
+        worker.required_tools = vec!["node".into()];
+        let items = diff(&parent, &worker);
+        let item = items.iter().find(|i| i.subject == "profile").unwrap();
+        assert_eq!(item.class, Class::Differs);
+        assert!(item.steps.is_some());
+        worker.required_tools = parent.required_tools.clone();
+        worker.profile = "other".into();
+        assert!(!all_same(&diff(&parent, &worker)));
+        // A report without a digest still compares.
+        worker.profile = "default".into();
+        worker.profile_digest = None;
+        assert!(all_same(&diff(&parent, &worker)));
+    }
+
+    #[test]
+    fn the_policy_digest_is_not_measured_until_a_real_digest_exists() {
+        let policy = |parent: Option<&str>, worker: Option<&str>| {
+            let mut p = report();
+            p.policy_digest = parent.map(str::to_string);
+            let mut w = report();
+            w.policy_digest = worker.map(str::to_string);
+            let items = diff(&p, &w);
+            let found = items.iter().find(|i| i.subject == "policy_digest").unwrap();
+            (found.clone(), all_same(&items))
+        };
+        // Neither side has one: never `same`, but nothing to act on.
+        let (item, green) = policy(None, None);
+        assert_eq!(item.class, Class::NotMeasured);
+        assert!(item.steps.is_some());
+        assert!(green);
+        assert_eq!(policy(Some("a"), None).0.class, Class::NotMeasured);
+        assert_eq!(policy(None, Some("a")).0.class, Class::NotMeasured);
+        // Real digests compare.
+        assert_eq!(policy(Some("a"), Some("a")).0.class, Class::Same);
+        let (item, green) = policy(Some("a"), Some("b"));
+        assert_eq!(item.class, Class::Differs);
+        assert!(!green);
+        assert_eq!(
+            serde_json::to_value(Class::NotMeasured).unwrap(),
+            "not_measured"
+        );
     }
 
     #[test]
@@ -652,54 +872,121 @@ mod tests {
     #[test]
     fn waiting_hints_name_a_procedure_within_128_characters() {
         for tool in crate::toolchain::capability::TOOLS {
-            let hint = waiting_hint(tool);
-            assert!(hint.starts_with("how: "), "{hint}");
-            assert!(hint.chars().count() <= 128, "{hint}");
+            for unknown in [false, true] {
+                let hint = waiting_hint(tool, unknown);
+                assert!(hint.starts_with("how: "), "{hint}");
+                assert!(hint.chars().count() <= 128, "{hint}");
+            }
         }
-        assert!(waiting_hint("xcode").contains("accept its license"));
-        assert!(waiting_hint("docker").contains("Docker Desktop"));
-        assert!(waiting_hint("node").contains("install node"));
+        assert!(waiting_hint("xcode", false).contains("sudo xcodebuild -license accept"));
+        assert!(waiting_hint("docker", false).contains("Colima"));
+        assert_eq!(
+            waiting_hint("node", false),
+            "how: install node on the worker so that it is on the profile PATH"
+        );
+        // Not measured is no reason to install.
+        assert_eq!(
+            waiting_hint("node", true),
+            "how: node could not be measured on the worker; rerun workers diff, or check its profile PATH"
+        );
         // Counted in characters, not bytes.
         let long = "é".repeat(200);
-        let hint = waiting_hint(&long);
+        let hint = waiting_hint(&long, false);
         assert_eq!(hint.chars().count(), 128);
-        let exact = "é".repeat(
-            128 - "how: install  on the worker, then rerun workers diff"
-                .chars()
-                .count(),
-        );
-        assert_eq!(waiting_hint(&exact).chars().count(), 128);
-        let short = "é".repeat(
-            127 - "how: install  on the worker, then rerun workers diff"
-                .chars()
-                .count(),
-        );
-        assert_eq!(waiting_hint(&short).chars().count(), 127);
+        let fixed = "how: install  on the worker so that it is on the profile PATH"
+            .chars()
+            .count();
+        let exact = "é".repeat(128 - fixed);
+        assert_eq!(waiting_hint(&exact, false).chars().count(), 128);
+        let short = "é".repeat(127 - fixed);
+        assert_eq!(waiting_hint(&short, false).chars().count(), 127);
+    }
+
+    fn capabilities(tools: &[(&str, ToolObservation)]) -> WorkerCapabilities {
+        use crate::ids::Digest;
+        WorkerCapabilities {
+            disk_free_bytes: None,
+            resource_budget: None,
+            schema_version: 1,
+            os: "macos".into(),
+            arch: "aarch64".into(),
+            profile: "default".into(),
+            profile_digest: Digest::of_bytes(b"definition"),
+            execution_uid: 1,
+            protocol_versions: vec![1],
+            profile_fingerprint: Digest::of_bytes(b"p"),
+            tools: tools
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
+            features: [capability::FEATURE.to_string()].into(),
+        }
     }
 
     #[test]
     fn with_steps_adds_one_hint_after_the_unmet_tool() {
+        use capability::ExecutionRequirements;
         let requires = vec![
-            Requirement::Os("macos".into()),
+            Requirement::Os("windows".into()),
             Requirement::Tool("xcode".into()),
             Requirement::Tool("docker".into()),
         ];
-        let unmet = vec![
-            "Os(\"macos\") unavailable".to_string(),
-            "Tool(\"xcode\") unavailable".to_string(),
-            "Tool(\"docker\") unavailable".to_string(),
-        ];
-        let out = with_steps(unmet.clone(), &requires);
+        let req = ExecutionRequirements {
+            requires: requires.clone(),
+            ..Default::default()
+        };
+        let caps = capabilities(&[]);
+        // The lines of the real `missing`, not a copy of its format.
+        let unmet = capability::missing(&req, Some(&caps));
+        assert_eq!(unmet.len(), 3);
+        let out = with_steps(unmet.clone(), &requires, Some(&caps));
         assert_eq!(out.len(), 4);
         assert_eq!(out[..2], unmet[..2]);
-        assert_eq!(out[2], waiting_hint("xcode"));
+        assert_eq!(out[2], waiting_hint("xcode", false));
         assert_eq!(out[3], unmet[2]);
         // A tool that is not in the unmet lines gets no hint.
-        let out = with_steps(vec!["Os(\"macos\") unavailable".into()], &requires);
+        let out = with_steps(unmet[..1].to_vec(), &requires, Some(&caps));
         assert_eq!(out.len(), 1);
-        assert_eq!(with_steps(Vec::new(), &requires), Vec::<String>::new());
+        assert_eq!(
+            with_steps(Vec::new(), &requires, Some(&caps)),
+            Vec::<String>::new()
+        );
         // The hint follows the first requirement that is unmet, in order.
-        let out = with_steps(vec!["Tool(\"docker\") unavailable".into()], &requires);
-        assert_eq!(out[1], waiting_hint("docker"));
+        let out = with_steps(unmet[2..].to_vec(), &requires, Some(&caps));
+        assert_eq!(out[1], waiting_hint("docker", false));
+        // No report: the single "report unavailable" line has no tool to name.
+        let out = with_steps(capability::missing(&req, None), &requires, None);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn with_steps_says_not_measured_for_an_unknown_observation() {
+        use capability::ExecutionRequirements;
+        let requires = vec![Requirement::Tool("node".into())];
+        let req = ExecutionRequirements {
+            requires: requires.clone(),
+            ..Default::default()
+        };
+        for (observation, unknown) in [
+            (ToolObservation::Unknown, true),
+            (ToolObservation::Unavailable, false),
+        ] {
+            let caps = capabilities(&[("node", observation)]);
+            let out = with_steps(
+                capability::missing(&req, Some(&caps)),
+                &requires,
+                Some(&caps),
+            );
+            assert_eq!(out.len(), 2);
+            assert_eq!(out[1], waiting_hint("node", unknown));
+        }
+        // A tool the report lacks entirely is not "unknown".
+        let caps = capabilities(&[]);
+        let out = with_steps(
+            capability::missing(&req, Some(&caps)),
+            &requires,
+            Some(&caps),
+        );
+        assert_eq!(out[1], waiting_hint("node", false));
     }
 }

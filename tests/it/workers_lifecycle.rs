@@ -305,12 +305,6 @@ mod a44 {
         std::fs::create_dir(&sdk).unwrap();
         shim(&tools, "xcrun", &format!("printf '%s' '{}'", sdk.display()));
         shim(&tools, "docker", "echo 27.0.1");
-        shim(&tools, "local-ci", "echo local-ci 0.13.0");
-        shim(
-            &tools,
-            "task-traffic-controller",
-            "echo task-traffic-controller 0.8.2",
-        );
         let profiles = fx.path("local-worker/profiles.toml");
         std::fs::write(
             &profiles,
@@ -349,18 +343,16 @@ mod a44 {
                 ),
                 ("xcode".to_string(), tool(Observed::Unavailable, None, None)),
             ]),
-            helpers: BTreeMap::from([
-                ("local-ci".to_string(), Some("0.12.0".to_string())),
-                ("task-traffic-controller".to_string(), None),
-                (
-                    "remote-task-runner".to_string(),
-                    Some(env!("CARGO_PKG_VERSION").to_string()),
-                ),
-            ]),
+            helpers: BTreeMap::from([(
+                "remote-task-runner".to_string(),
+                Some(env!("CARGO_PKG_VERSION").to_string()),
+            )]),
             docker: Docker::NotRunnable,
             disk_free_bytes: Some(100 << 30),
+            profile: "t".into(),
+            required_tools: Vec::new(),
             profile_digest: Some("sha256:worker".into()),
-            policy_digest: Some(remote_task_runner::ids::Digest::of_bytes(&[]).to_string()),
+            policy_digest: None,
         }
     }
 
@@ -369,6 +361,14 @@ mod a44 {
             "printf '%s\\n' '{}'",
             serde_json::json!({"ok": true, "env": report})
         )
+    }
+
+    fn has_item(value: &serde_json::Value, subject: &str) -> bool {
+        value["result"]["workers"][0]["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|i| i["subject"] == subject)
     }
 
     fn item(value: &serde_json::Value, subject: &str) -> serde_json::Value {
@@ -406,14 +406,17 @@ mod a44 {
         assert!(xcode["steps"].as_str().unwrap().contains("license"));
         let docker = item(&value, "docker");
         assert_eq!(docker["class"], "manual_required");
-        assert!(docker["steps"].as_str().unwrap().contains("Docker Desktop"));
-        // Helper versions.
-        assert_eq!(item(&value, "local-ci")["class"], "differs");
-        assert_eq!(item(&value, "task-traffic-controller")["class"], "missing");
+        assert!(docker["steps"].as_str().unwrap().contains("Colima"));
+        // The built-in tools are compared by this binary's build, not by an
+        // external `--version`.
         assert_eq!(item(&value, "remote-task-runner")["class"], "same");
+        assert!(!has_item(&value, "local-ci"));
+        assert!(!has_item(&value, "task-traffic-controller"));
         assert_eq!(item(&value, "platform")["class"], "same");
-        assert_eq!(item(&value, "policy_digest")["class"], "same");
-        assert_eq!(item(&value, "profile_digest")["class"], "differs");
+        // Nothing measures a policy digest yet; the profile digest differs by
+        // host and is only shown.
+        assert_eq!(item(&value, "policy_digest")["class"], "not_measured");
+        assert_eq!(item(&value, "profile")["class"], "same");
         assert_eq!(item(&value, "disk")["class"], "same");
         // One ssh call, a fixed helper command.
         let argv = fx.argv().join(" ");

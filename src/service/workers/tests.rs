@@ -912,6 +912,8 @@ fn parent_report() -> EnvReport {
         )]),
         docker: Docker::NotRunnable,
         disk_free_bytes: None,
+        profile: "default".into(),
+        required_tools: Vec::new(),
         profile_digest: None,
         policy_digest: None,
     }
@@ -976,11 +978,14 @@ fn diff_without_a_name_covers_every_registered_worker_and_names_one_that_is_not(
 }
 
 fn reply_error(body: &str) -> ApiError {
-    parse_env_reply(&RemoteOutput {
-        code: Some(1),
-        stdout: body.as_bytes().to_vec(),
-        stderr: vec![],
-    })
+    parse_env_reply(
+        &RemoteOutput {
+            code: Some(1),
+            stdout: body.as_bytes().to_vec(),
+            stderr: vec![],
+        },
+        "mini-a",
+    )
     .unwrap_err()
 }
 
@@ -1007,7 +1012,42 @@ fn diff_never_turns_a_bad_answer_into_a_difference() {
     assert!(reply_error("{\"ok\":false}")
         .message
         .contains("unspecified"));
-    assert!(reply_error("usage").message.contains("does not support"));
+    // An older binary (nothing on stdout, or a usage text) is told to upgrade.
+    for body in ["", "usage"] {
+        let message = reply_error(body).message;
+        assert!(message.contains("too old"), "{message}");
+        assert!(message.contains("workers upgrade mini-a"), "{message}");
+    }
+    // A login banner before the report is not a missing feature.
+    let message = reply_error("Welcome!\n{\"ok\":true,\"env\":{}}\n").message;
+    assert!(message.contains("login banner"), "{message}");
+    assert!(!message.contains("upgrade"), "{message}");
+    // A newer or older schema is named, a damaged report of this schema too.
+    let newer = reply_error(&format!(
+        "{{\"ok\":true,\"env\":{{\"schema_version\":{}}}}}",
+        envdiff::SCHEMA + 1
+    ))
+    .message;
+    assert!(
+        newer.contains("newer") && !newer.contains("workers upgrade"),
+        "{newer}"
+    );
+    let older = reply_error("{\"ok\":true,\"env\":{\"schema_version\":0}}").message;
+    assert!(
+        older.contains("older") && older.contains("workers upgrade mini-a"),
+        "{older}"
+    );
+    let damaged = reply_error(&format!(
+        "{{\"ok\":true,\"env\":{{\"schema_version\":{}}}}}",
+        envdiff::SCHEMA
+    ))
+    .message;
+    assert!(damaged.contains("damaged"), "{damaged}");
+    // Text the worker sent is shown without control characters.
+    let message = reply_error("{\"ok\":false,\"error\":\"bad\\u001b[31m red\\nnext\"}").message;
+    assert!(!message.chars().any(char::is_control), "{message:?}");
+    assert!(message.contains("bad[31m rednext"), "{message}");
+    assert!(plain(&"x".repeat(500)).len() == 200);
     w.remote.reachable = false;
     w.remote.env_answer = None;
     let err = diff_workers(&mut w.remote, &w.env, &w.exe, Some("mini-a"), || {
@@ -1033,6 +1073,7 @@ fn render_lists_each_class_with_its_steps() {
     let diffs = vec![WorkerDiff {
         worker: "w".into(),
         all_same: false,
+        error: None,
         items: vec![
             Item {
                 subject: "node".into(),
@@ -1055,4 +1096,57 @@ fn render_lists_each_class_with_its_steps() {
     assert!(text.contains("node") && text.contains("auto_installable"));
     assert!(text.contains("parent=20 worker=-  -> run workers sync"));
     assert!(text.lines().last().unwrap().ends_with("parent=- worker=-"));
+    // A worker that could not be measured says why; control characters from
+    // the worker's report never reach the terminal.
+    let diffs = vec![
+        WorkerDiff {
+            worker: "down".into(),
+            all_same: false,
+            error: Some("unreachable".into()),
+            items: Vec::new(),
+        },
+        WorkerDiff {
+            worker: "odd".into(),
+            all_same: false,
+            error: None,
+            items: vec![Item {
+                subject: "node".into(),
+                class: envdiff::Class::Differs,
+                parent: Some("20".into()),
+                worker: Some("\u{1b}[2J18".into()),
+                steps: None,
+            }],
+        },
+    ];
+    let text = render_diff(&diffs);
+    assert!(text.contains("worker down\n  could not be measured: unreachable\n"));
+    assert!(!text.contains('\u{1b}'));
+    assert!(text.contains("worker=[2J18"));
+}
+
+#[test]
+fn diff_of_every_worker_goes_on_after_one_that_fails_and_says_when_there_is_none() {
+    let mut w = World::new();
+    // No workers: said, and an error rather than an empty success.
+    let err =
+        diff_workers(&mut w.remote, &w.env, &w.exe, None, || Ok(parent_report())).unwrap_err();
+    assert_eq!(err.code, ErrorCode::NotFound);
+    assert!(err.message.contains("no workers are registered"));
+    w.add("mini-a", Some("ci@host-a"), true).unwrap();
+    w.add("mini-b", Some("ci@host-b"), false).unwrap();
+    quiet(&w);
+    // The first answers nonsense; the second is measured.
+    w.remote.env_queue.push_back(b"not json".to_vec());
+    let all = diff_workers(&mut w.remote, &w.env, &w.exe, None, || Ok(parent_report())).unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all[0].error.as_deref().unwrap().contains("too old"));
+    assert!(all[0].items.is_empty() && !all[0].all_same);
+    assert!(all[1].error.is_none() && !all[1].items.is_empty());
+    // A worker named on the command line that fails is an error.
+    w.remote.env_queue.push_back(b"not json".to_vec());
+    let err = diff_workers(&mut w.remote, &w.env, &w.exe, Some("mini-a"), || {
+        Ok(parent_report())
+    })
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict);
 }

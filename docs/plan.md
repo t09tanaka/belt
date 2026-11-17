@@ -1071,12 +1071,16 @@ S22 の残り（必須。この変更で S22 は完了しない）:
 
 ### S21 `workers diff`（2026-11-17、1 本目: diff と待機理由の手順）
 
-`workers diff [<worker>]` を実装した。親と worker は同じ測定関数（`toolchain::envreport::collect`）で測り、worker 側は登録済みの binary の隠し action `worker-service env` が ssh 越しに JSON の環境 report を返す。測定は resident と同じ永続入力（worker.json の env と profile の PATH）を使い、ssh セッションの PATH は使わない。report は tool ごとの観測（available / unavailable / unknown）と版、版管理 adapter（registry）の導入候補と導入済みの版、task-traffic-controller・local-ci・remote-task-runner の版、`docker info` による実行可否、空き disk、profile digest、policy digest を持つ。
+`workers diff [<worker>]` を実装した。親と worker は同じ測定関数（`toolchain::envreport::collect`）で測り、worker 側は登録済みの binary の隠し action `worker-service env` が ssh 越しに JSON の環境 report を返す。測定は resident と同じ永続入力（worker.json の env と profile の PATH）を使い、ssh セッションの PATH は使わない。report は tool ごとの観測（available / unavailable / unknown）と版、版管理 adapter（registry）の導入候補と導入済みの版、remote-task-runner の build 版、`docker info` による実行可否、空き disk、profile の名前・required_tools・digest、policy digest を持つ。
 
-差の判定は純粋関数 `toolchain::envdiff::diff(parent, worker) -> Vec<Item>`（`doctor` から呼べるよう公開、PURE 対象）。分類は `same / differs / missing / auto_installable / manual_required` で、優先順位は次のとおり。unknown は同じと見なさない（`differs`）。manual の tool（xcode・docker）は版 manager が候補を持っていても常に `manual_required`。worker の版 manager に導入済みの版は、既定の版が違っても `same`。導入候補にある版が未導入なら `auto_installable`、候補外なら `missing` か `differs`。手順（steps）は項目ごとに付ける。古い binary が action を知らない場合や応答が読めない場合は `CONFLICT` で、空の差にはしない。
+task-traffic-controller と local-ci は RTR の binary に組み込まれている（spec 22.4）ので、外部の `--version` は叩かず、双方の binary の build 版（`remote-task-runner` の版）で比べる。portool・fast-worktree は他の tool と同じ 3 状態（ある・無い・測れない）で測り、測れないものを same にも missing にもしない。`docker info` は profile の HOME と worker env の `DOCKER_HOST`・`DOCKER_CONTEXT` を付けて呼び、エラーは Unknown とする（docker の実体が無いときだけ not runnable）。子は自分の process group に置き、出力は上限（8 KiB）を超えた分を読み捨てて pipe を詰まらせず、時間切れでは group ごと止める（`platform::signal_process_group`）。
 
-適合 worker が無い submit の待機理由（`unmet`）には、未充足の tool 要求の直後に `how: …`（128 文字以内、文字数で切る）の 1 行を足す（`envdiff::with_steps`、`task_waiting` と `estimate` の両方）。manual の tool は固定の手順、それ以外は「worker に導入して `workers diff` を再実行」とする。
+差の判定は純粋関数 `toolchain::envdiff::diff(parent, worker) -> Vec<Item>`（`doctor` から呼べるよう公開、PURE 対象）。分類は `same / differs / missing / auto_installable / manual_required / not_measured` で、優先順位は次のとおり。unknown は同じと見なさず（`differs`）、手順は「測れなかった（could not be measured）」と言い、install は案内しない。manual の tool（xcode・docker）は版 manager が候補を持っていても常に `manual_required`。portool・fast-worktree は配布経路（版 manager の導入候補）が無ければ `manual_required`。worker の版 manager に導入済みの版は、既定の版が違っても、PATH に tool が無くても `same`（H1）。導入候補にある版が未導入なら `auto_installable`、候補外なら `missing` か `differs`。profile は名前と required_tools で比べ、digest は host ごとの絶対 path を含むため表示だけにする。policy digest は本物の digest ができるまで `not_measured`（same にしない。`all_same` の判定には入れない）。手順（steps）は項目ごとに付ける。古い binary・新しい schema・壊れた応答・ログインの banner・worker 側の拒否は、それぞれ別の文言の `CONFLICT` で、空の差にはしない。worker から来た文字列は制御文字を除いて出す。
+
+`diff` を worker 省略で呼ぶと、1 台が測れなくても残りを続け、worker ごとに結果（測れなかった理由を含む）を出す。測れない worker があれば終了コードは非 0。登録が 0 台なら、その旨を出して非 0 で終わる。
+
+適合 worker が無い submit の待機理由（`unmet`）には、未充足の tool 要求の直後に `how: …`（128 文字以内、文字数で切る）の 1 行を足す（`envdiff::with_steps`、`task_waiting` と `estimate` の両方）。manual の tool は固定の手順、それ以外は「worker の profile PATH に導入して」、観測が unknown なら「測れなかった」と言う。unmet の行の照合は `capability::unmet_line`（`missing` が行を書く関数）で行う。
 
 A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一時 HOME の `src/service/workers/tests.rs`、実 binary・偽 ssh・偽の tool shim の `tests/it/workers_lifecycle.rs`（`a44`）。ネットワークには出ない。
 
-残り（S21 は完了していない）: `workers sync` の実際の導入（worker 側の warm-up 要求。導入は admitted な setup builder の poll_tool 経由でしか始まらないため、既存の認証済み経路へ要求を足す必要がある）、`doctor` への組み込み（S23）、`diff` の worker 省略時の並列化、実機での受入（S26）。
+残り（S21 は完了していない）: `workers sync` の実際の導入（worker 側の warm-up 要求。導入は admitted な setup builder の poll_tool 経由でしか始まらないため、既存の認証済み経路へ要求を足す必要がある。diff が `auto_installable` で「`workers sync`」を案内するのは、この warm-up と一緒に入れる前提）、`doctor` への組み込み（S23）、`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は RTR の版だけで、組み込んだ crate 個別の build 情報は持たない。

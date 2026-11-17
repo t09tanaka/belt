@@ -1504,6 +1504,7 @@ impl Coordinator {
                         w.capabilities.as_ref(),
                     ),
                     &spec.requirements.requires,
+                    w.capabilities.as_ref(),
                 ),
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::CapabilityMismatch,
