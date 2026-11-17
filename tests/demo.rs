@@ -419,6 +419,18 @@ fn job_time_counts_the_running_and_no_waits_on_an_idle_machine() {
     ] {
         assert!(t[k].as_f64().unwrap() < 1.0, "{k}: {t}");
     }
+    // absolute timestamps: requested <= started <= finished, and they agree
+    // with the seconds
+    let (r, st, f) = (
+        t["requested_at_ms"].as_u64().unwrap(),
+        t["started_at_ms"].as_u64().unwrap(),
+        t["finished_at_ms"].as_u64().unwrap(),
+    );
+    assert!(r > 0 && r <= st && st <= f, "{t}");
+    let ran_ms = (f - st) as f64;
+    let secs_ms =
+        (t["work_secs"].as_f64().unwrap() + t["wait_queue_secs"].as_f64().unwrap()) * 1000.0;
+    assert!((ran_ms - secs_ms).abs() < 1000.0, "{t}");
     // the fields that were there keep their place
     let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
     assert!(v["units"][0]["jobs"][0]["secs"].is_number());
