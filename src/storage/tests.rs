@@ -5636,4 +5636,18 @@ fn the_github_status_of_a_run_is_kept_in_its_journal_and_the_last_one_is_shown()
         "{refused}"
     );
     assert_eq!(f.store.github_status_of(&unknown).unwrap(), None);
+    // The read seeks the events of no attempt; it does not scan the journal.
+    let plan = f
+        .store
+        .db
+        .call(|c| {
+            let mut q = c.prepare("EXPLAIN QUERY PLAN SELECT payload_json FROM event WHERE attempt_id IS NULL AND run_id=?1 AND kind=?2 ORDER BY seq DESC LIMIT 1")?;
+            let rows = q.query_map(["r", "k"], |r| r.get::<_, String>(3))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("event_attempt")),
+        "{plan:?}"
+    );
 }

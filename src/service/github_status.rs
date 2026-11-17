@@ -100,7 +100,10 @@ pub fn settle(
         output.status.success().then(|| text.trim().to_string())
     };
     let repository = git(&["remote", "get-url", "origin"]).and_then(|url| status::repo_slug(&url));
-    let tree = manifest.original_head.as_deref().and_then(|head| {
+    // A directory is no commit, whatever its manifest says.
+    let directory = manifest.source_kind == local_ci::source::SourceKind::Directory;
+    let head = manifest.original_head.as_deref().filter(|_| !directory);
+    let tree = head.and_then(|head| {
         git(&[
             "rev-parse",
             "--verify",
@@ -113,7 +116,7 @@ pub fn settle(
         computed,
         &Source {
             source_id: &manifest.source_id,
-            original_head: manifest.original_head.as_deref(),
+            original_head: head,
             worktree_tree: manifest.worktree_tree.as_deref(),
             dirty_submodule: manifest.submodules.iter().any(|sub| sub.dirty),
         },

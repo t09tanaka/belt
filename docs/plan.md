@@ -1491,12 +1491,13 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - 投稿は親の `ci` の process だけが行う（`src/service/github_status.rs`）。`gh api repos/<owner>/<name>/statuses/<sha>` に `state`・`context`・`description` を渡す、local-ci と同じ呼び出し。既定の context は `local-ci`（`--status-context` で変える）、`--no-status` で投稿しない。state は success / failure / error。description は `<state>: pass P / fail F / error E / skip S`。credential は親の `gh` が持つものだけで、task・plan・resident への要求のどれにも入れない。network は trait `Poster` の後ろに置き、テストは偽物（lib は closure、実 binary のテストは PATH に置いた偽の `gh`）を使う。
 - 表示: `ci` の text に `status: ...` の 1 行、`--json` の `result.github_status`（`computed`、`posting` = `posted` / `skipped` / `failed`、`sha`・`state`・`context`・`reason`・`error`、`source_digest`、`original_head`）。同じ record を resident への `RecordStatus` で run の journal（`github_status` の event、attempt 無し）に残し、`show <run>` の `run.github_status` に最後の 1 件を出す。記録に失敗しても（古い resident など）warning だけで、結果は変えない。
 - 自分で決めたこと: (a) 投稿するのは resident ではなく `ci` の process（wait して結果を受け取る側。credential を常駐 process に持たせない）。(b) 門は success だけでなく全 state に掛ける（local-ci と同じ。dirty の failure を元 HEAD の failure にもしない）。(c) origin が無い repository は失敗ではなく `skipped`（`no origin remote`）。(d) schema は変えない。`show` は attempt を持たない event だけを新しい順に辿る（既存の `event_attempt` index）。(e) `ls` には出さない。
-- テスト: `ci::status` の単体 14 件（A32 を含む）、`storage::tests` 1 件（記録と `show` の読み出し）、`tests/it/bootstrap.rs` 1 件（A32。実 binary・resident・local worker・偽の `gh`: 追跡 file の変更と未追跡 file だけの worktree は投稿 0 回で computed は success、`--snapshot commit` は HEAD に 1 回、`--no-status` は 0 回、`gh` が失敗しても終了コード 0・`settled`・`computed: success` のままで `show` に `failed` が出る、1 回だけ試して再試行しない）。mutation は `src/ci/status.rs` だけを手元で回し missed 0。
+- テスト: `ci::status` の単体 13 件（A32 を含む）、`storage::tests` 1 件（記録と `show` の読み出し）、`tests/it/bootstrap.rs` 1 件（A32。実 binary・resident・local worker・偽の `gh`: 追跡 file の変更と未追跡 file だけの worktree は投稿 0 回で computed は success、`--snapshot commit` は HEAD に 1 回、`--no-status` は 0 回、`gh` が失敗しても終了コード 0・`settled`・`computed: success` のままで `show` に `failed` が出る、1 回だけ試して再試行しない）。mutation は `src/ci/status.rs` だけを手元で回し missed 0。
 
 残り:
 
 - 後からの投稿: `ci` を待たずに終わった run（interrupt、`submit` だけ、wait の中断）や、push 前で `failed`（`... is not on GitHub yet`）になった run に、後で投稿し直す command は無い（local-ci の `local-ci status` に当たるもの）。`retry` で結果が変わった run の status も更新しない。
 - `logs` には status の行を出していない（`ci` の出力と `show <run>` だけ）。
+- status を決めるとき source store を foreground で開く。別の capture と重なって開けなければ `skipped`（`the input of the run cannot be read`）になり、投稿されない。
 - `gh` の呼び出しに時間切れは無い（`gh` が止まると `ci` は結果を計算した後で止まる）。
 - `local-ci status` 側に同じ検証を適用する件（仕様の一文）は local-ci の側に既に有り（`publishable`）、この行では local-ci を変えていない。
 - tracked file の exclude や追加 input の扱いは `worktree_tree` の一致に任せている（ignored の secret_files は仕様どおり一致判定に入れない）。CI task は secret_files を伴う source をまだ断るので、その組み合わせの実 binary のテストは無い。

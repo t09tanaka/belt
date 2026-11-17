@@ -5602,6 +5602,8 @@ async fn a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_
     assert_eq!(code, Some(0), "{value}");
     assert_eq!(status(&value)["computed"], "success", "{value}");
     assert_eq!(status(&value)["posting"], "skipped", "{value}");
+    let why = status(&value)["reason"].as_str().unwrap().to_string();
+    assert!(why.contains("uncommitted or synthetic content"), "{why}");
     assert_eq!(called(), "");
 
     // The commit itself, while the worktree is still dirty: posted to it.
