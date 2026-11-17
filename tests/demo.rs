@@ -606,6 +606,40 @@ jobs:
 }
 
 #[test]
+fn a_step_stopped_at_its_own_timeout_does_not_name_the_job() {
+    let d = demo("app/lib.sh");
+    // the job has 5 minutes (the default is 60), the step 1.2 seconds
+    add_workflow(
+        &d,
+        "own.yml",
+        r#"name: Own
+on: pull_request
+jobs:
+  slow:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - timeout-minutes: 0.02
+        run: sleep 30
+"#,
+    );
+    let o = local_ci(
+        &d,
+        &[
+            "run",
+            "--no-status",
+            "--no-cache",
+            "--no-traffic-controller",
+            "--json",
+            "-w",
+            "own.yml",
+        ],
+    );
+    let steps = job_steps(&o);
+    assert_eq!(steps[0]["reason"], "timed out after 1s", "{steps:?}");
+}
+
+#[test]
 fn container_slot_and_repository_lock_waits_are_counted() {
     use fs2::FileExt;
     let d = demo("app/lib.sh");

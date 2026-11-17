@@ -3057,9 +3057,8 @@ impl<'a> Runner<'a> {
             );
         }
         let mut bc = self.build_cache_start(ws, w, job, &cm, &env_ctx);
-        let job_timeout = Duration::from_secs_f64(
-            60.0 * job.timeout_minutes.unwrap_or(self.opts.job_timeout_min),
-        );
+        let job_min = job.timeout_minutes.unwrap_or(self.opts.job_timeout_min);
+        let job_timeout = Duration::from_secs_f64(60.0 * job_min);
         let mut steps_ctx = Map::new();
         let mut extra_env: Vec<(String, String)> = Vec::new();
         let mut extra_path: Vec<String> = Vec::new();
@@ -3391,7 +3390,6 @@ impl<'a> Runner<'a> {
             // waiting for task-traffic-controller: a step's own timeout starts when it
             // gets its turn, and so does the job's share of it.
             let remaining = job_timeout.saturating_sub(t0.elapsed().saturating_sub(queue));
-            let job_min = job_timeout.as_secs_f64() / 60.0;
             if remaining.is_zero() {
                 // nothing is left: a step started now would be stopped at once
                 let _ = fs::remove_dir_all(&files_dir);
