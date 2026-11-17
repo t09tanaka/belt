@@ -498,7 +498,8 @@ impl WorkerLink for Worker {
         self.ci_task_negotiated()
     }
     fn ci_discovery_negotiated(&self) -> bool {
-        self.ci_task_negotiated()
+        let worker = self.state.lock().unwrap();
+        !worker.no_ci && !worker.no_discovery
     }
     fn ci_task_negotiated(&self) -> bool {
         !self.state.lock().unwrap().no_ci
