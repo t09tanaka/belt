@@ -1081,6 +1081,13 @@ pub fn ask_resident_to_forget(
     spec: &Spec,
     worker: WorkerId,
 ) -> Result<super::resident::Reply, String> {
+    resident_request(spec, super::resident::Operation::ForgetWorker { worker })
+}
+
+fn resident_request(
+    spec: &Spec,
+    operation: super::resident::Operation,
+) -> Result<super::resident::Reply, String> {
     let cluster = spec
         .expected_cluster
         .clone()
@@ -1092,7 +1099,7 @@ pub fn ask_resident_to_forget(
         .build()
         .map_err(|e| e.to_string())?;
     runtime
-        .block_on(client.request(super::resident::Operation::ForgetWorker { worker }))
+        .block_on(client.request(operation))
         .map_err(|e| e.to_string())
 }
 
@@ -1589,6 +1596,75 @@ fn emit(
             }
             error.code.exit_code()
         }
+    }
+}
+
+/// List registrations even when no resident is running. Only a resident
+/// observation can establish that a worker is connected or disconnected.
+pub fn list_command(json: bool) -> i32 {
+    let env = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    let result = registrations(&env).and_then(|entries| {
+        let ids = entries
+            .iter()
+            .map(|entry| WorkerId::parse(&entry.id).map_err(|e| invalid(e.to_string())))
+            .collect::<Result<Vec<_>, _>>()?;
+        let observations = if ids.is_empty() {
+            None
+        } else {
+            match super::context::runtime_spec(&env) {
+                Ok(spec) => match resident_request(
+                    &spec,
+                    super::resident::Operation::ListWorkers { names: ids },
+                ) {
+                    Ok(super::resident::Reply::WorkersListed { observations }) => {
+                        Some(observations)
+                    }
+                    Ok(super::resident::Reply::ControlError { error }) => return Err(error),
+                    _ => None,
+                },
+                Err(e) if e.code == ErrorCode::NotFound => None,
+                Err(e) => return Err(e),
+            }
+        };
+        let mut text = Vec::new();
+        let mut rows = Vec::new();
+        for entry in entries {
+            let key = WorkerId::parse(&entry.id).map_err(|e| invalid(e.to_string()))?;
+            let observed = observations.as_ref().and_then(|m| m.get(&key));
+            let connection = match observed {
+                Some((true, _)) => "connected",
+                Some((false, _)) => "disconnected",
+                None => "unknown",
+            };
+            let identity = observed.and_then(|(_, id)| id.as_deref());
+            let kind = if entry.ephemeral {
+                "ephemeral"
+            } else {
+                "persistent"
+            };
+            text.push(format!(
+                "{}  {}  {}  {}  {}",
+                entry.id,
+                entry.ssh,
+                kind,
+                connection,
+                identity.unwrap_or("-")
+            ));
+            rows.push(
+                serde_json::json!({"id":entry.id, "ssh":entry.ssh, "ephemeral":entry.ephemeral,
+                "connection":connection, "identity":identity}),
+            );
+        }
+        if text.is_empty() {
+            text.push("no registered workers".into());
+        }
+        Ok((serde_json::json!({"workers":rows}), text.join("\n")))
+    });
+    match result {
+        Ok((value, text)) => emit(json, Ok(value), || text),
+        Err(error) => emit(json, Err(error), String::new),
     }
 }
 

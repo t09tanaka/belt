@@ -86,6 +86,9 @@ pub enum Operation {
     /// Re-read the private worker registration and dial workers added since
     /// startup. Never disconnects or changes a worker that is already dialed.
     ReloadWorkers,
+    ListWorkers {
+        names: Vec<WorkerId>,
+    },
     /// `workers forget`: the user declared an ephemeral worker gone. Refused
     /// for a persistent worker and for one that is connected. A resident
     /// older than this operation cannot read the request and closes the
@@ -146,6 +149,9 @@ pub enum Reply {
     },
     Ready {
         epoch: CoordinatorEpoch,
+    },
+    WorkersListed {
+        observations: BTreeMap<WorkerId, (bool, Option<String>)>,
     },
     WorkersReloaded {
         /// The workers this request started dialing.
@@ -1185,6 +1191,18 @@ async fn handle(
         .await?;
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
+    if let Operation::ListWorkers { names } = &request.operation {
+        let reply = match coordinator.worker_observations(names.clone()).await {
+            Ok(observations) => Reply::WorkersListed { observations },
+            Err(error) => Reply::ControlError {
+                error: crate::error::ApiError::new(
+                    crate::error::ErrorCode::Internal,
+                    error.to_string(),
+                ),
+            },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     if matches!(request.operation, Operation::Build) {
         // The digest may still be being read; the runtime does not wait for it.
         let build = tokio::task::spawn_blocking(own_build).await?;
@@ -1385,11 +1403,12 @@ async fn handle(
                 },
             },
             // Answered before admission; never reaches this match.
-            Operation::ReloadWorkers | Operation::ForgetWorker { .. } | Operation::Build => {
-                Reply::Error {
-                    message: "handled outside admission".into(),
-                }
-            }
+            Operation::ListWorkers { .. }
+            | Operation::ReloadWorkers
+            | Operation::ForgetWorker { .. }
+            | Operation::Build => Reply::Error {
+                message: "handled outside admission".into(),
+            },
             Operation::Ping => Reply::Ready {
                 epoch: coordinator.store().epoch(),
             },

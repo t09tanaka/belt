@@ -12,6 +12,34 @@ use crate::platform::wall_ms;
 use crate::storage::Forgotten;
 
 impl Coordinator {
+    /// Read the currently attached names and the durable ephemeral identity
+    /// without dialing or renewing any worker.
+    pub(crate) async fn worker_observations(
+        &self,
+        names: Vec<WorkerId>,
+    ) -> Result<std::collections::BTreeMap<WorkerId, (bool, Option<String>)>> {
+        let _actor = self.actor.lock().await;
+        let _commit = self.placement_fence.lock().await;
+        let attached: std::collections::BTreeSet<_> = self
+            .workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
+        self.db(move |store| {
+            names
+                .into_iter()
+                .map(|name| {
+                    let id = store.worker_identity(&name)?;
+                    let connected = attached.contains(&name);
+                    Ok((name, (connected, id)))
+                })
+                .collect()
+        })
+        .await
+    }
+
     /// An ephemeral worker reported `boot` at `hello`. A retired identity is
     /// refused (`Admission::Retired`) and must not be attached. A different identity must wait for explicit forget.
     pub async fn admit_identity(
@@ -117,6 +145,12 @@ mod tests {
         f.c.attach(f.worker.clone(), link.clone()).await;
         let (task, attempt) = f.placed().await;
 
+        let observations =
+            f.c.worker_observations(vec![f.worker.clone()])
+                .await
+                .unwrap();
+        assert_eq!(observations[&f.worker], (true, Some(first.to_string())));
+
         // Connected: forget is refused and changes nothing.
         assert_eq!(
             f.c.forget_worker(&f.worker, Some(true)).await.unwrap(),
@@ -134,6 +168,11 @@ mod tests {
 
         // The tunnel is gone. Another worker has room the whole time.
         assert!(f.c.detach_link(&f.worker, &link).await.unwrap());
+        let observations =
+            f.c.worker_observations(vec![f.worker.clone()])
+                .await
+                .unwrap();
+        assert_eq!(observations[&f.worker], (false, Some(first.to_string())));
         let other = WorkerId::parse("w-b").unwrap();
         let spare = Arc::new(Clean::default());
         f.c.attach(other.clone(), spare.clone()).await;

@@ -432,6 +432,9 @@ pub fn run(cli: Cli) -> i32 {
             args.wait_secs,
         );
     }
+    if matches!(&cli.command, Command::Workers(WorkersArgs { sub: None })) {
+        return crate::service::workers::list_command(cli.json);
+    }
     if let Command::Workers(WorkersArgs { sub: Some(sub) }) = &cli.command {
         if let Some(code) = crate::service::workers::command(sub, cli.json) {
             return code;
