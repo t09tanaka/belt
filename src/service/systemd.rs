@@ -10,9 +10,9 @@
 //! the stop.
 pub mod policy;
 
-use super::macos::native::{run_bounded, CommandOutput, CommandRunner, OUTPUT_LIMIT};
 use super::macos::policy::{Backend, Plan};
 use super::macos::{LaunchError, Launcher, LoadedState, Receipt, RunningIdentity};
+use super::manager_command::{run_bounded, CommandOutput, CommandRunner, OUTPUT_LIMIT};
 use std::time::Duration;
 
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
