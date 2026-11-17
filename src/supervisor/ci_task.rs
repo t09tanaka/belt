@@ -309,6 +309,20 @@ pub(crate) fn run_task(
         .ok_or_else(|| "the source of the attempt is not in this worker's store".to_string())?;
     let paths = ci.paths(cancel);
     let run_dir = paths.run_dir.clone();
+    if let Some(step) = crate::ci::discovery::DiscoveryStep::from_task(&plan, &ci.task_id) {
+        let probe = step.execution_plan(&plan).map_err(|e| e.to_string())?;
+        let task = probe.tasks.first().ok_or("empty runner discovery plan")?;
+        let result = execute_task(
+            &store, &manifest, &probe, &task.id, &inputs, paths, executor,
+        )
+        .map_err(|e| e.to_string())?;
+        let listing = step
+            .result(&plan, &ci.workspace, &run_dir, &result)
+            .map_err(|e| e.to_string())?;
+        let json = serde_json::to_vec(&listing).map_err(|e| e.to_string())?;
+        std::fs::write(ci.result_path(), json).map_err(|e| e.to_string())?;
+        return Ok(vec![JobStatus::Success]);
+    }
     let result = execute_task(
         &store,
         &manifest,
