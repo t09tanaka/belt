@@ -544,7 +544,7 @@ SSH上でversion付きの長さprefix JSON frameを使う。stdoutはprotocol専
 
 worker 側の確認（registry・receipt・setup の照会）は、`sync_id` ごとに同時に1本だけ、要求とは別のスレッドで行う。確認を始めた要求は最長1.5秒だけそれを待ち、終わらなければ `pending` を返す。確認中に同じ `sync_id` で来た要求は、分かっている結果（未決着は `pending`）をその場で返し、確認を重ねない。遅い確認の結果は捨てず、次の要求に答える。60秒（`warmup_idle_ms`）聞かれない `sync_id` は参照を手放し、最後の参照なら導入を止める（確認中のものは手放さない）。手放した後に同じ `sync_id` で聞かれたら、同じ内容の新しい導入として扱う。
 
-親は `COMMUNICATION_UNKNOWN` を答えなしとして、`OVERLOADED` を「worker は居るが混んでいる」という答えとして、どちらも同じ `sync_id` で聞き直す。worker の答え（`pending`・`OVERLOADED`）の無い状態が2分続いたら打ち切る。一度 `pending` を見た後は、resident に繋がらないこと、resident が worker をまだ掴んでいないこと（`NOT_FOUND`）も答えなしとして同じ2分の中で聞き直す（resident の再起動をまたぐ）。`pending` を見る前のそれらは、その場で止める。`pending` が続く間は最長1時間待つ（worker は準備の timeout 15分で `failed` にする）。`pending` を見た後に打ち切る・止めるときは、worker で導入が続いている可能性と、`workers diff` で確かめられることを伝える。
+親は `COMMUNICATION_UNKNOWN` を答えなしとして、`OVERLOADED` を「worker は居るが混んでいる」という答えとして、どちらも同じ `sync_id` で聞き直す。worker の答え（`pending`・`OVERLOADED`）の無い状態が2分続いたら打ち切る。一度 `pending` を見た後は、resident に繋がらないこと、resident が停止中と答えること、resident が worker をまだ掴んでいないこと（`NOT_FOUND`）も答えなしとして同じ2分の中で聞き直す（resident の再起動をまたぐ）。`pending` を見る前のそれらは、その場で止める。`pending` が続く間は最長1時間待つ（worker は準備の timeout 15分で `failed` にする）。`pending` を見た後に打ち切る・止めるときは、worker で導入が続いている可能性と、`workers diff` で確かめられることを伝える。
 
 `hello` でprotocol version、feature、worker identity、profile、epochを確認する。互換性のないworkerにはdispatchしない。要求は固定バイナリへ構造化データで渡し、利用者のargvやpathをSSHのshell文字列へ直接連結しない。
 
@@ -1121,7 +1121,7 @@ workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、co
 
 - 消すのは receipt の無い root の中身だけで、`install.lock` は残す。receipt のある root は、receipt が検証できない場合（壊れている、他人が読める、symlink である等）も含めて消さず、error にする。
 - 消す前に、root が worker の toolchain 管理ディレクトリの直下にあり、名前が導入計画の identity（64桁の小文字16進）で、自分だけが読み書きできるディレクトリであり、途中に symlink を挟まない path であることを確かめる。満たさなければ何も消さない。
-- root の中の symlink は辿らずに外す。root の外は書き換えない。
+- root の中の symlink は辿らずに外す。ファイルは mode を変えずに外す（root の外のファイルへの hard link でも、外のファイルは mode も中身も変わらない）。mode を変えるのは、中身を消すために開ける root の中のディレクトリだけとする。
 - 別の導入者が lock を持っている間は、何も消さずに lock を待つ。待った後に receipt があれば、それを結果とする。
 - worker 内では、同じ版の導入者は同時に1つだけで、止めた導入者とその子プロセスの終了を確かめるまで次を始めない（第8章の setup と同じ）。
 

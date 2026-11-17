@@ -107,6 +107,10 @@ pub fn look(step: &InstallStep, reply: Result<Reply, NoReply>, begun: bool) -> L
             message: plain(&error.message),
             ..error
         }),
+        // Stopping after the install was seen running: it may come back.
+        Ok(Reply::Stopping) if begun => {
+            Look::Again("the resident is stopping; it may be restarting".into())
+        }
         Ok(Reply::Stopping) => Look::Stop(ApiError::new(
             ErrorCode::CommunicationUnknown,
             "the resident is stopping; run workers sync again once it is back",
@@ -122,6 +126,16 @@ pub fn look(step: &InstallStep, reply: Result<Reply, NoReply>, begun: bool) -> L
             ErrorCode::Internal,
             "the resident answered something else",
         )),
+    }
+}
+
+/// Pure: whether a look is an answer of the worker (it is there), and whether
+/// it shows the install running.
+pub fn answer_of(look: &Look) -> (bool, bool) {
+    match look {
+        Look::Pending => (true, true),
+        Look::Busy(_) => (true, false),
+        _ => (false, false),
     }
 }
 
@@ -267,21 +281,19 @@ impl Installer for ResidentWarmup {
                 // next look is asked of the one that runs now.
                 client = fresh;
             }
-            let last = match look(step, reply, begun) {
+            let what = look(step, reply, begun);
+            let (is_answer, running) = answer_of(&what);
+            if is_answer {
+                answered = Instant::now();
+            }
+            let last = match what {
                 Look::Done(how) => return Ok(how),
                 Look::Failed(reason) => return Err(InstallError::Failed(reason)),
                 Look::Stop(error) => return Err(stop(ended(error, begun))),
-                Look::Pending => {
-                    answered = Instant::now();
-                    begun = true;
-                    String::new()
-                }
-                Look::Busy(why) => {
-                    answered = Instant::now();
-                    why
-                }
-                Look::Again(why) => why,
+                Look::Pending => String::new(),
+                Look::Busy(why) | Look::Again(why) => why,
             };
+            begun |= running;
             if let Some(why) = give_up(
                 start.elapsed(),
                 answered.elapsed(),
@@ -386,6 +398,19 @@ mod tests {
         assert!(give_up(s(4000), s(200), s(3600), s(120), "x", true)
             .unwrap()
             .contains("no answer"));
+    }
+
+    #[test]
+    fn pending_and_busy_are_answers_of_the_worker_and_only_pending_shows_the_install() {
+        assert_eq!(answer_of(&Look::Pending), (true, true));
+        assert_eq!(answer_of(&Look::Busy("crowded".into())), (true, false));
+        assert_eq!(answer_of(&Look::Again("quiet".into())), (false, false));
+        assert_eq!(answer_of(&Look::Failed("no".into())), (false, false));
+        assert_eq!(answer_of(&Look::Done(Installed::Now)), (false, false));
+        assert_eq!(
+            answer_of(&Look::Stop(ApiError::new(ErrorCode::Internal, "x"))),
+            (false, false)
+        );
     }
 
     #[test]
@@ -584,10 +609,16 @@ mod tests {
 
     #[test]
     fn a_stopping_or_older_resident_stops_the_sync() {
-        let Look::Stop(e) = look(&step(), Ok(Reply::Stopping), true) else {
+        let Look::Stop(e) = look(&step(), Ok(Reply::Stopping), false) else {
             panic!()
         };
         assert!(e.message.contains("stopping"));
+        // After the install was seen running, a resident that stops may be
+        // restarting: asked again, like one that is away.
+        let Look::Again(why) = look(&step(), Ok(Reply::Stopping), true) else {
+            panic!("a resident that stops in the middle of an install is asked again")
+        };
+        assert!(why.contains("may be restarting"), "{why}");
         let Look::Stop(e) = look(
             &step(),
             Ok(Reply::Error {
