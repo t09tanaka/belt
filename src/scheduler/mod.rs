@@ -14,7 +14,7 @@ pub mod decide;
 pub mod measured;
 
 use crate::forecast::plan::MAX_PENDING_PLANS;
-use crate::ids::{AttemptId, PlanDigest, TaskId, WorkerId};
+use crate::ids::{AttemptId, NodeId, PlanDigest, TaskId, WorkerId};
 use crate::storage::{CoordinatorStore, Placement, QueuedTask, PAGE_MAX};
 use crate::wire::{
     AttemptPayload, CommandSpec, ConcurrencyLimits, Correlation, WorkloadNode, WorkloadPlan,
@@ -278,21 +278,54 @@ pub fn workload_of(
 ) -> WorkloadPlan {
     let nodes = commands
         .iter()
-        .map(|c| WorkloadNode {
-            node_id: c.node_id.clone(),
-            depends_on: c.depends_on.clone(),
+        .map(|c| (c.node_id.clone(), c.depends_on.clone()));
+    workload_of_nodes(attempt_id, plan_digest, nodes, ready_delay_ms)
+}
+
+/// The id of the node step `index` of a CI task runs as, on the worker too
+/// (`forecast::plan::accepted_nodes`, the supervisor's launches).
+pub fn ci_step_node(index: u32) -> NodeId {
+    NodeId::parse(&format!("step-{index}")).expect("a step id is a node id")
+}
+
+/// The work of a CI task of `steps` commands: one node per step, each after
+/// the one before it, so the forecast is of the whole task and not of its
+/// first step.
+pub fn ci_workload_of(
+    attempt_id: &AttemptId,
+    plan_digest: &PlanDigest,
+    steps: u32,
+    ready_delay_ms: Option<u64>,
+) -> WorkloadPlan {
+    let nodes = (0..steps).map(|i| {
+        let before = i.checked_sub(1).map(ci_step_node);
+        (ci_step_node(i), before.into_iter().collect())
+    });
+    workload_of_nodes(attempt_id, plan_digest, nodes, ready_delay_ms)
+}
+
+fn workload_of_nodes(
+    attempt_id: &AttemptId,
+    plan_digest: &PlanDigest,
+    nodes: impl Iterator<Item = (NodeId, Vec<NodeId>)>,
+    ready_delay_ms: Option<u64>,
+) -> WorkloadPlan {
+    let nodes = nodes
+        .map(|(node_id, depends_on)| WorkloadNode {
+            external_delay_ms: ready_delay_ms.filter(|_| depends_on.is_empty()),
+            depends_on,
             priority: 0,
             weight: None,
             predicted_rss_bytes: None,
             predicted_runtime_ms: None,
-            external_delay_ms: ready_delay_ms.filter(|_| c.depends_on.is_empty()),
             ready_in_ms: None,
             concurrency: ConcurrencyLimits::default(),
             correlation: Correlation {
                 attempt_id: attempt_id.clone(),
-                node_id: c.node_id.clone(),
+                node_id: node_id.clone(),
                 ledger_entry: None,
             },
+            node_id,
             shared_builder: None,
         })
         .collect();
@@ -336,6 +369,17 @@ pub fn pending_plans(
 fn plan_of(p: &Placement) -> Option<WorkloadPlan> {
     let attempt_id = p.attempt_id.as_ref()?;
     let payload: AttemptPayload = serde_json::from_value(p.demand.get("payload")?.clone()).ok()?;
+    if payload.ci_task.is_some() {
+        // The steps of a CI task are in its plan; the placement kept their number.
+        let steps = p.demand.get("ci_steps").and_then(|n| n.as_u64());
+        let steps = u32::try_from(steps.unwrap_or(0)).unwrap_or(u32::MAX);
+        return Some(ci_workload_of(
+            attempt_id,
+            &payload.plan_digest,
+            steps,
+            None,
+        ));
+    }
     Some(workload_of(
         attempt_id,
         &payload.plan_digest,

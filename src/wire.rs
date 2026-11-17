@@ -1393,6 +1393,11 @@ pub enum SourceBlobKind {
     /// of dirty submodules too). It is built on the commits the worker said
     /// it has ([`BlobVerifyResponse::have`]).
     Bundle,
+    /// The JSON of the frozen CI plan the tasks of the source's run name by
+    /// its digest ([`CiTask::plan_digest`]). It is not part of the source:
+    /// it is taken whether or not the source is whole, and kept apart from
+    /// it. Sent only on a connection that negotiated [`CI_TASK_FEATURE`].
+    Plan,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

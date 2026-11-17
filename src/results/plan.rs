@@ -264,6 +264,16 @@ impl Verdict {
     }
 }
 
+/// The result of a CI task that is here: complete only when it can be read
+/// as the result of that task.
+pub fn judge_ci_result(usable: bool) -> Verdict {
+    if usable {
+        Verdict::Complete
+    } else {
+        Verdict::RequiredMissing
+    }
+}
+
 /// A missing `optional` artifact changes nothing; a `required` one that is
 /// not stored (missing, refused or not even reported) is never complete.
 pub fn judge_artifacts(declared: &[(bool, Standing)]) -> Verdict {
@@ -496,6 +506,12 @@ pub fn run_verdict(expected: u32, tasks: &[TaskStanding]) -> RunVerdict {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_result_of_a_ci_task_is_complete_only_when_it_can_be_used() {
+        assert_eq!(judge_ci_result(true), Verdict::Complete);
+        assert_eq!(judge_ci_result(false), Verdict::RequiredMissing);
+    }
 
     #[test]
     fn the_constants_are_what_the_spec_says() {

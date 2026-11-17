@@ -5129,3 +5129,386 @@ async fn public_exec_output_conditions_globs_and_multiple_paths_follow_the_outco
     }
     shutdown(&load(&spec)).await;
 }
+
+// ---------------------------------------------------------------- `ci`
+
+/// A project of one workflow in the directory `ci` is run from. Every step
+/// leaves a line in `marks/<job>`, outside the workspace: what ran, and how
+/// often, is read from there.
+fn ci_project(root: &std::path::Path, input: &std::path::Path, jobs: &str) -> std::path::PathBuf {
+    let marks = root.join("marks");
+    std::fs::create_dir_all(&marks).unwrap();
+    std::fs::create_dir_all(input.join(".github/workflows")).unwrap();
+    let workflow = format!("on: push\njobs:\n{jobs}").replace("MARKS", marks.to_str().unwrap());
+    std::fs::write(input.join(".github/workflows/ci.yml"), workflow).unwrap();
+    marks
+}
+
+fn ci_command(spec: &Spec, input: &std::path::Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(&spec.executable);
+    command
+        .args(["--json", "ci"])
+        .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
+        .envs(&spec.env)
+        .current_dir(input);
+    command
+}
+
+async fn ci_output(spec: &Spec, input: &std::path::Path) -> (Option<i32>, serde_json::Value) {
+    ci_output_with(spec, input, &[]).await
+}
+
+/// [`ci_output`] with more arguments after `ci`.
+async fn ci_output_with(
+    spec: &Spec,
+    input: &std::path::Path,
+    more: &[&str],
+) -> (Option<i32>, serde_json::Value) {
+    let mut command = ci_command(spec, input);
+    command.args(more);
+    let waited = tokio::time::timeout(Duration::from_secs(240), command.output());
+    let output = match waited.await {
+        Ok(output) => output.unwrap(),
+        Err(elapsed) => {
+            diagnose_coordinator(spec);
+            diagnose_worker(spec);
+            panic!("ci did not end: {elapsed}");
+        }
+    };
+    let value = serde_json::from_slice(&output.stdout).unwrap_or_else(|e| {
+        panic!(
+            "{e}: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    });
+    (output.status.code(), value)
+}
+
+/// The jobs of the report, by name: status and why it did not run.
+fn ci_jobs(value: &serde_json::Value) -> BTreeMap<String, (String, Option<String>)> {
+    let jobs = value["result"]["jobs"].as_array().unwrap();
+    jobs.iter()
+        .map(|job| {
+            let text = |key: &str| job[key].as_str().map(str::to_string);
+            let name = text("job").unwrap_or_else(|| text("plan_task").unwrap());
+            (name, (text("status").unwrap(), text("skipped")))
+        })
+        .collect()
+}
+
+fn ci_marks(marks: &std::path::Path, job: &str) -> Vec<String> {
+    let text = std::fs::read_to_string(marks.join(job)).unwrap_or_default();
+    text.lines().map(str::to_string).collect()
+}
+
+/// How many attempts each task of the run had, by the task of the plan.
+fn ci_attempts(spec: &Spec, value: &serde_json::Value) -> BTreeMap<String, usize> {
+    let run =
+        remote_task_runner::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap())
+            .unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let rows = store.ci_run_tasks(&run).unwrap();
+    rows.into_iter()
+        .map(|row| {
+            let task = row.spec["ci"]["task"]["task_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            (task, store.attempts_of_task(&row.task_id).unwrap().len())
+        })
+        .collect()
+}
+
+/// `ci` end to end with the real binary, the resident and its local worker:
+/// a workflow file, real processes, three jobs in a chain of `needs`. Each
+/// job is a task of its own, runs once, and the next one gets the outputs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_runs_a_chain_of_needs_with_outputs_and_every_job_once() {
+    let (root, spec, input) = control_fixture();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    outputs:\n      version: ${{ steps.v.outputs.version }}\n    steps:\n      - run: echo ran >> MARKS/build\n      - id: v\n        run: echo \"version=1.2.3\" >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: build\n    runs-on: ubuntu-latest\n    outputs:\n      seen: ${{ steps.s.outputs.seen }}\n    steps:\n      - id: s\n        run: |\n          echo \"got ${{ needs.build.outputs.version }}\" >> MARKS/test\n          echo \"seen=${{ needs.build.outputs.version }}\" >> \"$GITHUB_OUTPUT\"\n  deploy:\n    needs: test\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"deploy ${{ needs.test.outputs.seen }}\" >> MARKS/deploy\n",
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(value["ok"], true);
+    assert_eq!(value["result"]["state"], "settled");
+    assert_eq!(value["result"]["snapshot"]["task_count"], 3);
+    assert!(value["result"]["plan_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
+    let jobs = ci_jobs(&value);
+    for job in ["build", "test", "deploy"] {
+        assert_eq!(jobs[job], ("success".to_string(), None), "{job}: {value}");
+    }
+    assert_eq!(ci_marks(&marks, "build"), ["ran"]);
+    assert_eq!(ci_marks(&marks, "test"), ["got 1.2.3"]);
+    assert_eq!(ci_marks(&marks, "deploy"), ["deploy 1.2.3"]);
+    let attempts = ci_attempts(&spec, &value);
+    assert_eq!(attempts.len(), 3, "a task per job: {attempts:?}");
+    assert!(attempts.values().all(|n| *n == 1), "{attempts:?}");
+    shutdown(&load(&spec)).await;
+}
+
+/// A worker that holds as many frozen plans as it may does not take one
+/// more. The run does not wait without a word: it gets the event
+/// `ci_plan_refused` once, the worker is left out of the placement by name
+/// (shown with the task), and when the worker has room again the plan is
+/// delivered and the run goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_says_why_it_waits_for_a_worker_whose_plan_store_is_full_and_goes_on_after() {
+    let (root, spec, input) = control_fixture();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/build\n",
+    );
+    // As many plans as a worker keeps, none of them the plan of this run.
+    let plans = remote_task_runner::worker::ci_task::plans_dir(&spec.worker_state_dir);
+    std::fs::create_dir_all(&plans).unwrap();
+    let fillers: Vec<std::path::PathBuf> = (0..remote_task_runner::worker::ci_task::MAX_PLANS)
+        .map(|n| {
+            let digest =
+                remote_task_runner::ids::Digest::of_bytes(format!("filler {n}").as_bytes());
+            let path =
+                remote_task_runner::worker::ci_task::plan_path(&spec.worker_state_dir, &digest);
+            std::fs::write(&path, b"{}").unwrap();
+            path
+        })
+        .collect();
+
+    let mut command = ci_command(&spec, &input);
+    command.kill_on_drop(true);
+    let running = tokio::spawn(async move { command.output().await.unwrap() });
+    let events = |kind: &str| -> Vec<remote_task_runner::storage::Event> {
+        let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) else {
+            return Vec::new();
+        };
+        let all = store.events_after(0, 10_000).unwrap_or_default();
+        all.into_iter().filter(|e| e.kind == kind).collect()
+    };
+    let started = std::time::Instant::now();
+    let (refused, waiting) = loop {
+        let (refused, waiting) = (events("ci_plan_refused"), events("task_waiting"));
+        if !refused.is_empty() && !waiting.is_empty() {
+            break (refused, waiting);
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("the run did not say why it waits");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(!running.is_finished());
+    let reason = refused[0].payload["reason"].as_str().unwrap().to_string();
+    assert!(reason.contains("OVERLOADED"), "{reason}");
+    assert!(refused[0].payload["worker"].is_string());
+    let excluded = &waiting[0].payload["decision"]["excluded"];
+    assert_eq!(excluded[0]["why"], "input_refused", "{excluded}");
+    assert_eq!(excluded[0]["unmet"], serde_json::json!([reason]));
+    // As `show` reads it.
+    let run = remote_task_runner::ids::RunId::parse(refused[0].run_id.as_deref().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let tasks = store.query_tasks(run, 16, None).unwrap();
+    assert_eq!(tasks.items.len(), 1);
+    let placement = tasks.items[0].placement.clone().unwrap();
+    assert_eq!(placement.excluded[0].unmet, std::slice::from_ref(&reason));
+    drop(store);
+    assert!(ci_marks(&marks, "build").is_empty());
+
+    // The worker has room again: the delivery that is tried again arrives.
+    for path in &fillers {
+        std::fs::remove_file(path).unwrap();
+    }
+    let output = match tokio::time::timeout(Duration::from_secs(240), running).await {
+        Ok(output) => output.unwrap(),
+        Err(elapsed) => {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("ci did not end: {elapsed}");
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{value}");
+    assert_eq!(ci_jobs(&value)["build"].0, "success", "{value}");
+    assert_eq!(ci_marks(&marks, "build"), ["ran"]);
+    // Told once, however often the delivery was tried.
+    assert_eq!(events("ci_plan_refused").len(), 1);
+    shutdown(&load(&spec)).await;
+}
+
+/// A job that fails: the jobs that need it are skipped without a step
+/// started (and so is what needs those), `if: always()` and `if: failure()`
+/// run, and the run is a failure.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_skips_what_needs_a_failed_job_and_runs_always_and_failure() {
+    let (root, spec, input) = control_fixture();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/build; exit 3\n  test:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/test\n  deploy:\n    needs: test\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/deploy\n  report:\n    needs: test\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"test was ${{ needs.test.result }}\" >> MARKS/report\n  alarm:\n    needs: build\n    if: failure()\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/alarm\n  calm:\n    needs: build\n    if: success()\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/calm\n",
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    assert!(code.is_some_and(|code| code != 0), "{code:?} {value}");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["result"]["state"], "settled");
+    assert_eq!(value["result"]["snapshot"]["task_count"], 6);
+    let jobs = ci_jobs(&value);
+    assert_eq!(jobs["build"].0, "failure", "{value}");
+    assert_eq!(
+        jobs["test"],
+        ("skipped".to_string(), Some("needs failed".to_string()))
+    );
+    assert_eq!(jobs["deploy"].0, "skipped", "{value}");
+    assert_eq!(jobs["calm"].0, "skipped", "{value}");
+    assert_eq!(jobs["report"].0, "success", "{value}");
+    assert_eq!(jobs["alarm"].0, "success", "{value}");
+    assert_eq!(ci_marks(&marks, "build"), ["ran"]);
+    assert_eq!(ci_marks(&marks, "report"), ["test was skipped"]);
+    assert_eq!(ci_marks(&marks, "alarm"), ["ran"]);
+    for skipped in ["test", "deploy", "calm"] {
+        assert!(ci_marks(&marks, skipped).is_empty(), "{skipped} ran");
+    }
+    let attempts = ci_attempts(&spec, &value);
+    assert_eq!(attempts.len(), 6);
+    assert!(attempts.values().all(|n| *n == 1), "{attempts:?}");
+    shutdown(&load(&spec)).await;
+}
+
+/// Ctrl-C on `ci`: the job that runs is stopped, the job that waits for it
+/// is never placed, and the run settles as cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_sigint_cancels_the_running_job_and_the_ones_that_wait() {
+    let (root, spec, input) = control_fixture();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  first:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo started >> MARKS/first; sleep 60\n  second:\n    needs: first\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/second\n",
+    );
+    let mut child = ci_command(&spec, &input)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let pid = child.id().unwrap();
+    assert!(pid > 1);
+    let identity = remote_task_runner::platform::process_start_identity(pid);
+    assert!(identity.identity().is_some());
+    let started = tokio::time::timeout(Duration::from_secs(120), async {
+        while ci_marks(&marks, "first").is_empty() {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "ci exited before its job started"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    });
+    started.await.unwrap_or_else(|elapsed| {
+        diagnose_coordinator(&spec);
+        diagnose_worker(&spec);
+        panic!("the first job did not start: {elapsed}");
+    });
+    assert_eq!(
+        remote_task_runner::platform::process_start_identity(pid),
+        identity
+    );
+    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
+    let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(output.status.code(), Some(130 | 143)),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"]["state"], "stop_confirmed");
+    assert_eq!(value["result"]["cancel_acknowledged"], true);
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    assert!(store.list_nonterminal_attempts().unwrap().is_empty());
+    assert!(store.ci_waiting_runs(8).unwrap().is_empty());
+    let attempts = ci_attempts(&spec, &value);
+    let mut counts: Vec<usize> = attempts.values().copied().collect();
+    counts.sort();
+    assert_eq!(
+        counts,
+        [0, 1],
+        "the job that waited was never placed: {attempts:?}"
+    );
+    // Not even `always()` runs after the run was cancelled before it was placed.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(ci_marks(&marks, "second").is_empty());
+    assert_eq!(ci_marks(&marks, "first"), ["started"]);
+    shutdown(&load(&spec)).await;
+}
+
+/// `ci` on a Git repository: the worktree as it is (with what is not
+/// committed), and a commit named on the command line.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_runs_the_worktree_of_a_git_repository_and_a_named_commit() {
+    let (root, mut spec) = fixture();
+    // The worker makes the workspace of a Git source with fast-worktree.
+    spec.env.insert(
+        "PATH".into(),
+        private_tool_path(root.path(), &["git", "fast-worktree"]),
+    );
+    let config = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "schema_version = 1\n[coordinator]\nheartbeat_seconds = 1\nstale_seconds = 3\n",
+    )
+    .unwrap();
+    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
+        .unwrap();
+    let repo = root.path().join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let jobs = |word: &str| {
+        format!(
+            "  build:\n    runs-on: ubuntu-latest\n    outputs:\n      word: ${{{{ steps.w.outputs.word }}}}\n    steps:\n      - id: w\n        run: echo \"word={word}\" >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"${{{{ needs.build.outputs.word }}}}\" >> MARKS/test\n"
+        )
+    };
+    let marks = ci_project(root.path(), &repo, &jobs("committed"));
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["add", "."]);
+    git(&["commit", "-qm", "first"]);
+    // Not committed: the worktree says another word.
+    ci_project(root.path(), &repo, &jobs("dirty"));
+
+    let (code, value) = ci_output(&spec, &repo).await;
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(ci_marks(&marks, "test"), ["dirty"]);
+    let more = ["--snapshot", "commit", "--ref", "HEAD"];
+    let (code, value) = ci_output_with(&spec, &repo, &more).await;
+    assert_eq!(code, Some(0), "{value}");
+    assert_eq!(ci_marks(&marks, "test"), ["dirty", "committed"]);
+    let jobs = ci_jobs(&value);
+    assert_eq!(jobs["build"].0, "success");
+    assert_eq!(jobs["test"].0, "success");
+    shutdown(&load(&spec)).await;
+}

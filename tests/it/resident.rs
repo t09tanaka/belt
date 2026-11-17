@@ -108,6 +108,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
     let task = TaskId::generate();
     let manifest = &captured.manifest.manifest_digest;
     let spec = TaskSpec {
+        ci: None,
         toolchains: None,
         outputs: vec![
             remote_task_runner::wire::OutputDecl {
@@ -680,6 +681,7 @@ async fn resident_measured_fixture(metrics_fail: bool) {
     .unwrap();
     let manifest = &captured.manifest.manifest_digest;
     let spec = TaskSpec {
+        ci: None,
         toolchains: None,
         outputs: vec![],
         requirements: Default::default(),

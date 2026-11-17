@@ -2095,8 +2095,11 @@ impl Agent {
             Request::GetResult(r) => self.result(r).map(Response::GetResult),
             Request::AckCollected(r) => self.ack(session, r).map(Response::AckCollected),
             Request::SecretBundlePut(r) => self.secrets(r).map(Response::SecretBundlePut),
-            Request::BlobPut(r) => blobs::put(&self.store, self.host.as_ref(), &self.cfg.blobs, &r)
-                .map(Response::BlobPut),
+            Request::BlobPut(r) => {
+                let (host, limits) = (self.host.as_ref(), &self.cfg.blobs);
+                blobs::put(&self.store, host, limits, &self.cfg.state_dir, &r)
+                    .map(Response::BlobPut)
+            }
             Request::BlobVerify(r) => {
                 blobs::verify(self.host.as_ref(), &self.cfg.blobs, &r).map(Response::BlobVerify)
             }

@@ -94,6 +94,11 @@ fn invalid(m: impl Into<String>) -> ApiError {
     ApiError::new(ErrorCode::InvalidInput, m)
 }
 
+/// A frozen plan is kept apart from the sources ([`super::ci_task::put_plan`]).
+fn not_of_a_source() -> ApiError {
+    invalid("a frozen plan is not a blob of a source")
+}
+
 fn overloaded(m: impl Into<String>) -> ApiError {
     ApiError::new(ErrorCode::Overloaded, m)
 }
@@ -1538,6 +1543,7 @@ impl Incoming {
                     }
                 }
             }
+            SourceBlobKind::Plan => return Err(not_of_a_source()),
         }
         self.complete(limits, &r.source_id, root_id, st)?;
         Ok(None)
@@ -1596,6 +1602,7 @@ impl Incoming {
                             && !commits_missing);
                     staged_verdict(done, settled, partial, b.total_size)
                 }
+                SourceBlobKind::Plan => return Err(not_of_a_source()),
             };
             match verdict {
                 Verdict::Present => out.present.push(b.digest.clone()),
@@ -1612,6 +1619,9 @@ impl Incoming {
 
 impl BlobSink for Incoming {
     fn put(&self, limits: &BlobLimits, r: &BlobPutRequest) -> Result<BlobPutResponse, ApiError> {
+        if r.kind == SourceBlobKind::Plan {
+            return Err(not_of_a_source());
+        }
         check_put(limits, r.kind, r.total_size, r.offset, r.data.0.len()).map_err(invalid)?;
         let root_id =
             ci_id_of(&r.source_id).ok_or_else(|| invalid("the source id is malformed"))?;
@@ -1671,15 +1681,20 @@ fn sink(host: &dyn Host) -> Result<&dyn BlobSink, ApiError> {
     })
 }
 
-/// `blob_put`: a chunk of a blob of a source. A coordinator of an epoch
-/// older than one this worker has seen is refused.
+/// `blob_put`: a chunk of a blob of a source, or of the frozen plan of its
+/// run (kept under `state_dir`, apart from the sources and whether or not
+/// the source is whole). A coordinator of an epoch older than one this
+/// worker has seen is refused.
 pub fn put(
     store: &WorkerStore,
     host: &dyn Host,
     limits: &BlobLimits,
+    state_dir: &Path,
     r: &BlobPutRequest,
 ) -> Result<BlobPutResponse, ApiError> {
-    let sink = sink(host)?;
+    let sink = (r.kind != SourceBlobKind::Plan)
+        .then(|| sink(host))
+        .transpose()?;
     let seen = store
         .max_coordinator_epoch()
         .map_err(|e| ApiError::new(e.code(), e.to_string()))?;
@@ -1692,7 +1707,13 @@ pub fn put(
             ),
         ));
     }
-    sink.put(limits, r)
+    match sink {
+        Some(sink) => sink.put(limits, r),
+        None => {
+            check_put(limits, r.kind, r.total_size, r.offset, r.data.0.len()).map_err(invalid)?;
+            super::ci_task::put_plan(state_dir, r)
+        }
+    }
 }
 
 /// `blob_verify`: what of a source this worker holds. Changes nothing.

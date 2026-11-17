@@ -244,6 +244,80 @@ pub(super) async fn verify(
         _ => anyhow::bail!("unexpected source verification answer"),
     }
 }
+/// Why the frozen plan of a CI run was not delivered to a worker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum PlanFault {
+    /// The parent does not have the plan any more, or what it has is not the
+    /// plan: no worker can be sent it, the run cannot go on.
+    Unrunnable(String),
+    /// The worker answered that it does not take it (it holds as many plans
+    /// as it may, or as many part-way ones): another worker may.
+    Refused(String),
+    /// Anything that says nothing about the plan or the worker (the link,
+    /// a read that failed): the delivery is tried again.
+    Retry(String),
+}
+
+/// How a failed transfer of a plan counts: only an answer of the worker
+/// itself is a refusal.
+pub(super) fn plan_transfer_fault(e: &crate::protocol::transfer::TransferError) -> PlanFault {
+    match e {
+        crate::protocol::transfer::TransferError::Call(crate::protocol::CallError::Remote(
+            answer,
+        )) => PlanFault::Refused(format!(
+            "frozen plan not taken: {} ({})",
+            answer.message, answer.code
+        )),
+        other => PlanFault::Retry(other.to_string()),
+    }
+}
+
+/// How a plan the parent could not read counts.
+pub(super) fn plan_read_fault(fault: crate::ci::advance::Fault) -> PlanFault {
+    match fault {
+        crate::ci::advance::Fault::Unrunnable(why) => PlanFault::Unrunnable(why),
+        crate::ci::advance::Fault::Transient(why) => PlanFault::Retry(why),
+    }
+}
+
+/// Deliver the frozen plan of a CI run: the bytes the parent keeps under
+/// `digest` in `state`, as a blob of its own kind, 64 KiB at a time. The
+/// worker keeps them only when they hash to the digest; one that holds the
+/// plan already answers at once (and counts it as delivered now). Only for a
+/// connection that negotiated `ci_task_v1`.
+pub(super) async fn plan(
+    client: &Client,
+    epoch: CoordinatorEpoch,
+    state: &std::path::Path,
+    source: &SourceId,
+    digest: &Digest,
+) -> Result<(), PlanFault> {
+    let (dir, wanted) = (state.to_owned(), digest.clone());
+    let bytes = tokio::task::spawn_blocking(move || crate::ci::advance::read_plan(&dir, &wanted))
+        .await
+        .map_err(|e| PlanFault::Retry(e.to_string()))?
+        .map_err(plan_read_fault)?;
+    let size = bytes.len() as u64;
+    let answer = put_blob_reader_as(
+        client,
+        epoch,
+        source,
+        SourceBlobKind::Plan,
+        std::io::Cursor::new(bytes),
+        digest.clone(),
+        size,
+        0,
+        64 * 1024,
+        TIMEOUT,
+    )
+    .await
+    .map_err(|e| plan_transfer_fault(&e))?;
+    if !answer.complete {
+        return Err(PlanFault::Retry("plan transfer incomplete".into()));
+    }
+    Ok(())
+}
+
 /// Shared by source forwarding and retry. Future source/Vault GC must hold this
 /// same cross-process lease; blocking IO retains an Arc until it has drained.
 pub(super) async fn lease(
