@@ -239,7 +239,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A07 | 自動 | `a07_ready_delay_queue_and_runtime_make_the_finish`（`src/forecast/mod.rs`） | |
 | A08 | 自動 | `forecast::a08_a_node_is_one_demand_before_it_registers_after_and_once_finished` | |
 | A09 | 自動 | `a09_the_three_cases_stay_distinct` ほか 3 件（`src/forecast/mod.rs`） | |
-| A10 | 一部 | forecast の側: `a10_a_chain_reports_the_end_of_the_last_step`、`a10_parallel_nodes_end_with_the_longest_not_the_sum`（`src/forecast/mod.rs`） | `ci` の実行経路での複数 step・matrix の ETA（S16 が未了） |
+| A10 | 統合検証待ち | `forecast::tests::a10_matrix_variants_forecast_the_final_step_after_preparation`、`a10_parallel_nodes_end_with_the_longest_not_the_sum` | 統合時の実測履歴・未計測時の予測 |
 | A11 | 自動 | `source_capture::a11_every_kind_of_change_is_captured_and_unpacks_to_the_same_content` | |
 | A12 | 自動 | `source_capture::a12_an_input_that_keeps_moving_is_source_busy_and_nothing_is_published` | |
 | A13 | 自動 | `source_capture::a13_a_capture_cut_off_before_publication_leaves_nothing_visible_and_resumes_as_the_same_id` | |
@@ -256,7 +256,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A24 | 自動＋残り | 擬似（process を止めて boot ID を変える）: `worker_agent::a24_a_changed_boot_id_interrupts_everything_and_a_retry_runs`、`one_host::a24_a_restart_of_one_workers_machine_interrupts_its_attempt_and_spares_the_other` | 本物の reboot と OS の boot ID（S26、Mac は実機待ち） |
 | A25 | 自動 | `supervisor::cancel_terms_then_kills_the_group_and_records_only_after_it_is_gone`、`supervisor::natural_end_and_cancel_racing_still_give_one_terminal` | |
 | A26 | 自動＋残り | lease は単調時計の値だけを受ける純粋関数で、長い suspend に当たる飛びを試験する: `a_long_suspend_expires_the_lease`・`a_late_renewal_does_not_revive_an_expired_lease`（`src/supervisor/lease.rs`）。壁時計の前後への飛びは保持期間の判定で試験する: `forward_jump_requarantines_then_follows_the_new_wall`・`backward_step_holds_briefly_or_requarantines`（`src/results/clock_policy.rs`）。worker 間の壁時計のずれ: `one_host::a26_workers_whose_wall_clocks_are_off_keep_their_leases_and_end_normally` | 実行中に OS の壁時計を変える試験と、実際の Mac sleep からの復帰は無い（実機待ち） |
-| A27 | 未実装 | | S16（max-parallel・fail-fast・join・集約の進行が無い） |
+| A27 | 統合検証待ち | `bootstrap::a27_public_ci_expands_from_a_needs_output_and_joins_in_variant_order` | 実 CLI の動的展開と join、複数 worker での permit・fail-fast |
 | A28 | 自動 | `bootstrap::ci_plan_shows_why_a_shared_workspace_task_is_not_split` | |
 | A29 | 自動 | `non_utf8_bytes_round_trip_per_stream`・`reads_resume_from_any_offset_without_duplicates`・`limit_is_shared_and_the_rest_is_counted_as_dropped`（`src/supervisor/tests.rs`）、`collection::active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset` | |
 | A30 | 自動 | `collection::a30_a_worker_that_disappears_while_collecting_is_continued_where_it_stopped`、`coordinator::a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_worker_is_told` | |
@@ -267,7 +267,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A35 | 一部 | macOS の計画と偽の launchctl: `proven_start_rejection_rolls_back_but_unknown_preserves_evidence`（`src/service/macos/tests.rs`） | Linux の systemd は偽の runner での試験まで（user mode。実機は S26）、system-user mode の配線（S24 の残り）、実際の service 環境での doctor（S26） |
 | A36 | 自動＋残り | `doctor::an_updated_task_traffic_controller_passes_the_runtime_check`（旧い形の `status --json` を読む） | 旧コマンドと主要 workflow の互換は local-ci・task-traffic-controller 側の CI が担う（L1a〜L3・T1） |
 | A37 | S26 | | 実際のプロジェクトの CI を親のみと複数 worker で比べる |
-| A38 | 一部 | worker の側だけ: `a_job_that_needs_another_runs_in_another_attempt_from_the_first_ones_result`（`src/supervisor/ci_task/run_tests.rs`） | 親が先行 Job の output・artifact を確定してから別 host で後続を始める経路（S16 が未了） |
+| A38 | 統合検証待ち | `remote_links::a38_public_ci_delivers_needs_outputs_and_a_verified_multifile_artifact_to_another_worker`、`collection::a38_live_artifact_transfer_resumes_before_either_worker_finishes` | 実 CLI の 2 worker 間転送、ACK 再送と親再起動 |
 | A39〜A41 | 統合検証待ち | `collection::a39_discovery_collection_expands_the_run_once_before_any_test_is_placed`、`a40_history_shortens_the_longest_shard_and_no_history_is_a_stable_split_that_runs`、`a41_a_run_fails_of_the_failed_shard_and_a_retry_runs_a_shard_whose_tests_failed_again` | 実行結果と runner ごとの集約条件の照合 |
 | A42 | 一部 | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts` | 導入中の負荷は `worker_agent::a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for` の統合検証待ち。実 manager と network での導入は S26 |
 | A43 | 自動 | `secrets::a43_the_secret_files_reach_the_worker_as_0600_and_are_gone_after_the_attempt` | |
