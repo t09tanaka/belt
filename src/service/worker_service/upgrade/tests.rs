@@ -1046,3 +1046,33 @@ fn a_status_at_rest_keeps_the_shape_the_first_release_reads() {
     assert_eq!(value["switching_from"], h.old.as_str());
     assert!(value.get("switch_running").is_none());
 }
+
+#[test]
+fn a_stop_and_start_before_the_commit_do_not_end_the_drain() {
+    let restart = |h: &Host, cancel_running| {
+        stop(&h.env, h.fake.clone(), cancel_running, Duration::ZERO).unwrap();
+        start(&h.env, h.fake.clone(), OPTIONS.ready_timeout).unwrap()
+    };
+    // The switch awaits its commit and the upgrade owns the drain.
+    let h = Host::new();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    for cancel_running in [false, true] {
+        let status = restart(&h, cancel_running);
+        assert_eq!(status.loaded, Some(true));
+        assert!(status.draining && !status.cancel_running && status.drained_by_upgrade);
+    }
+    assert!(!h.commit(&h.new).unwrap().draining);
+    // The operator drained before the upgrade: the same while it is uncommitted.
+    let h = Host::new();
+    drain(&h.env, h.fake.clone()).unwrap();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    assert!(restart(&h, false).draining);
+    // The upgrade drained and died before any switch was recorded.
+    let h = Host::new();
+    h.upgrade(&mut failing(Step::Compat)).unwrap_err();
+    let status = restart(&h, false);
+    assert!(status.draining && status.drained_by_upgrade);
+    // With nothing of an upgrade left, a stop ends its own drain as before.
+    h.commit(&h.old).unwrap();
+    assert!(!restart(&h, false).draining);
+}

@@ -806,7 +806,19 @@ pub fn stop<L: Launcher>(
                 worker: marker(&paths, wait),
             };
             manager.stop(&plan, &receipt, cancel_running)?;
-            control::write(&paths.state, Control::default())?;
+            // A stop ends its own drain. While a switch awaits its commit,
+            // or the upgrade owns the drain, the drain is not this stop's to
+            // end: the next start must not take work that a rollback to the
+            // saved database would lose.
+            let keep = journal.switch.is_some() || journal.drained_by_upgrade;
+            control::write(
+                &paths.state,
+                if keep {
+                    Control::draining()
+                } else {
+                    Control::default()
+                },
+            )?;
             let mut launcher = manager.launcher;
             return status_with(&paths, &journal, &plan, &receipt, &mut launcher, false);
         }
