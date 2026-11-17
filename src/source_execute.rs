@@ -56,10 +56,30 @@ pub struct PinnedWorkspace {
     inode: u64,
     pub(crate) namespace: String,
     pub(crate) sequence: Arc<AtomicUsize>,
+    unverified: Vec<crate::source::RelPath>,
 }
+
+/// What a host placed in a workspace before binding it, and so asks
+/// [`PinnedExecution::verify_workspace_with_overlay`] not to compare with the
+/// captured source. Paths are relative to the workspace root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceOverlay {
+    /// Files or directories: the output of a prepared setup, dependency
+    /// directories copied in. Everything below a directory is left out.
+    pub paths: Vec<crate::source::RelPath>,
+    /// Restored secret files. Each must be one the manifest declares.
+    pub secret_files: Vec<crate::source::RelPath>,
+}
+
 impl PinnedWorkspace {
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+    /// The paths that were left out when this workspace was verified, sorted:
+    /// what [`WorkspaceOverlay`] declared. Empty for a workspace that was
+    /// materialized, verified whole, or restored from a receipt.
+    pub fn unverified_paths(&self) -> &[crate::source::RelPath] {
+        &self.unverified
     }
     pub(crate) fn validate(&self, input: &PinnedExecution<'_>) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
@@ -135,6 +155,42 @@ impl<'a> PinnedExecution<'a> {
         crate::source::verify_materialized_from(self.store, self.manifest, &workspace.root)?;
         self.verify_git(ctx, &workspace.root, false)?;
         self.bind_verified_workspace(workspace)
+    }
+
+    /// [`Self::verify_workspace`] for a workspace the host has already put
+    /// secrets, setup output or dependencies into. Only what `overlay`
+    /// declares, and what lies below it, is left out; every other byte must
+    /// match the captured source, and the Git HEAD and index are checked as
+    /// before. The declared paths are refused when they are not normalized
+    /// relative paths, are or lead through a symbolic link, touch a submodule,
+    /// or name a secret file the manifest does not declare. The bound
+    /// workspace records them ([`PinnedWorkspace::unverified_paths`]).
+    ///
+    /// The content of the declared paths is the host's word: nothing here
+    /// checks it, and steps run with it.
+    pub fn verify_workspace_with_overlay(
+        &self,
+        ctx: &ExecContext,
+        workspace: Workspace,
+        overlay: &WorkspaceOverlay,
+    ) -> Result<PinnedWorkspace> {
+        self.validate(self.plan)?;
+        let unverified = crate::source::check_unverified_paths(
+            self.manifest,
+            &workspace.root,
+            &overlay.paths,
+            &overlay.secret_files,
+        )?;
+        crate::source::verify_materialized_except(
+            self.store,
+            self.manifest,
+            &workspace.root,
+            &unverified,
+        )?;
+        self.verify_git(ctx, &workspace.root, false)?;
+        let mut bound = self.bind_verified_workspace(workspace)?;
+        bound.unverified = unverified;
+        Ok(bound)
     }
 
     /// SDK-owned legacy Git materialization: HEAD is the execution commit and
@@ -235,6 +291,7 @@ impl<'a> PinnedExecution<'a> {
             root,
             device: metadata.dev(),
             inode: metadata.ino(),
+            unverified: vec![],
         })
     }
 

@@ -962,3 +962,164 @@ fn plain_directory_provider_accepts_a_git_ancestor_but_rejects_its_own_git_metad
     std::fs::write(workspace.root.join(".git"), "gitdir: elsewhere").unwrap();
     assert!(input.verify_workspace(&git_context(&f), workspace).is_err());
 }
+
+#[test]
+fn a_workspace_binds_with_declared_overlays_and_everything_else_is_compared() {
+    use local_ci::source::RelPath;
+    use local_ci::source_execute::WorkspaceOverlay;
+    let rel = |paths: &[&str]| -> Vec<RelPath> { paths.iter().map(RelPath::new).collect() };
+    let f = Fixture::new(WORKFLOW);
+    std::fs::write(f.root.join("payload"), "captured").unwrap();
+    std::fs::create_dir_all(f.root.join("pkg")).unwrap();
+    std::fs::write(f.root.join("pkg/lib"), "captured").unwrap();
+    std::fs::write(f.root.join("secret"), "private").unwrap();
+    let m = source::capture_directory(
+        &f.ctx,
+        &f.root,
+        &CaptureOptions {
+            store: Some(f.store.root().into()),
+            secret_files: vec![source::SecretSpec {
+                glob: "secret".into(),
+                required: true,
+            }],
+            secret_key: vec![3; 32],
+            ..Default::default()
+        },
+    )
+    .unwrap()
+    .manifest;
+    let p = build(&f.store, &m, &options()).unwrap();
+    let input = PinnedExecution::new(&p, &m, &f.store).unwrap();
+    let ctx = git_context(&f);
+    let workspace = ws(&f, "provided");
+    source::materialize_from(&f.store, &m, &workspace.root).unwrap();
+    let root = workspace.root.clone();
+    let none = WorkspaceOverlay::default();
+    assert!(input
+        .verify_workspace_with_overlay(&ctx, workspace.clone(), &none)
+        .unwrap()
+        .unverified_paths()
+        .is_empty());
+
+    // what a host places before it binds: a secret, dependencies, setup output
+    std::fs::write(root.join("secret"), "private").unwrap();
+    std::fs::create_dir_all(root.join("node_modules/dep")).unwrap();
+    std::fs::write(root.join("node_modules/dep/index.js"), "dep").unwrap();
+    std::fs::create_dir_all(root.join("pkg/out")).unwrap();
+    std::fs::write(root.join("pkg/out/built"), "built").unwrap();
+    assert!(input.verify_workspace(&ctx, workspace.clone()).is_err());
+    assert!(input
+        .verify_workspace_with_overlay(&ctx, workspace.clone(), &none)
+        .is_err());
+    let overlay = WorkspaceOverlay {
+        paths: rel(&["pkg/out", "node_modules", "pkg/out"]),
+        secret_files: rel(&["secret"]),
+    };
+    let verify = |overlay: &WorkspaceOverlay| {
+        input.verify_workspace_with_overlay(&ctx, workspace.clone(), overlay)
+    };
+    let bound = verify(&overlay).unwrap();
+    let recorded: Vec<String> = bound
+        .unverified_paths()
+        .iter()
+        .map(|p| p.display())
+        .collect();
+    assert_eq!(recorded, ["node_modules", "pkg/out", "secret"]);
+    // each declaration is needed
+    for missing in 0..3 {
+        let mut part = overlay.clone();
+        match missing {
+            0 => part.paths.retain(|p| p.display() != "node_modules"),
+            1 => part.paths.retain(|p| p.display() != "pkg/out"),
+            _ => part.secret_files.clear(),
+        }
+        assert!(verify(&part).is_err(), "{missing}");
+    }
+
+    // one byte outside the declared paths
+    std::fs::write(root.join("payload"), "capturee").unwrap();
+    assert!(verify(&overlay).is_err());
+    std::fs::write(root.join("payload"), "captured").unwrap();
+    std::fs::write(root.join("pkg/lib"), "capturee").unwrap();
+    assert!(verify(&overlay).is_err());
+    // a captured file below a declared directory is the host's to change
+    let mut wide = overlay.clone();
+    wide.paths = rel(&["pkg", "node_modules"]);
+    assert_eq!(verify(&wide).unwrap().unverified_paths().len(), 3);
+    std::fs::write(root.join("pkg/lib"), "captured").unwrap();
+    verify(&overlay).unwrap();
+    // a file nobody declared, and a captured file that is gone
+    std::fs::write(root.join("extra"), "x").unwrap();
+    assert!(verify(&overlay).is_err());
+    std::fs::remove_file(root.join("extra")).unwrap();
+    std::fs::remove_file(root.join("payload")).unwrap();
+    assert!(verify(&overlay).is_err());
+    std::fs::write(root.join("payload"), "captured").unwrap();
+    verify(&overlay).unwrap();
+
+    // declarations that are not normalized relative paths
+    for bad in [
+        "../outside",
+        "..",
+        "pkg/../payload",
+        "./pkg",
+        ".",
+        "pkg/",
+        "pkg//out",
+        "",
+        ".git",
+        ".git/hooks",
+    ] {
+        let mut o = overlay.clone();
+        o.paths.push(RelPath::new(bad));
+        assert!(verify(&o).is_err(), "{bad:?}");
+        let mut o = overlay.clone();
+        o.secret_files.push(RelPath::new(bad));
+        assert!(verify(&o).is_err(), "secret {bad:?}");
+    }
+    let mut o = overlay.clone();
+    o.paths.push(RelPath::new(root.join("payload")));
+    assert!(verify(&o).is_err(), "absolute");
+    // only the secret files of the manifest
+    for not_secret in ["payload", "node_modules/dep/index.js", "other-secret"] {
+        let mut o = overlay.clone();
+        o.secret_files.push(RelPath::new(not_secret));
+        assert!(verify(&o).is_err(), "{not_secret}");
+    }
+    // a path through a file
+    let mut o = overlay.clone();
+    o.paths.push(RelPath::new("payload/below"));
+    assert!(verify(&o).is_err());
+
+    // symbolic links: the declared path itself, a directory on the way, a secret
+    let outside = f._tmp.path().join("outside");
+    std::fs::create_dir_all(outside.join("dep")).unwrap();
+    std::fs::rename(root.join("node_modules"), f._tmp.path().join("moved")).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("node_modules")).unwrap();
+    assert!(verify(&overlay).is_err());
+    let mut o = overlay.clone();
+    o.paths = rel(&["pkg/out", "node_modules/dep"]);
+    assert!(verify(&o).is_err());
+    std::fs::remove_file(root.join("node_modules")).unwrap();
+    std::fs::rename(f._tmp.path().join("moved"), root.join("node_modules")).unwrap();
+    verify(&overlay).unwrap();
+    std::fs::remove_file(root.join("secret")).unwrap();
+    std::os::unix::fs::symlink(outside.join("secret"), root.join("secret")).unwrap();
+    assert!(verify(&overlay).is_err());
+    std::fs::remove_file(root.join("secret")).unwrap();
+    std::fs::create_dir(root.join("secret")).unwrap();
+    assert!(verify(&overlay).is_err());
+    std::fs::remove_dir(root.join("secret")).unwrap();
+    // a declared path with nothing there is still recorded
+    assert_eq!(verify(&overlay).unwrap().unverified_paths().len(), 3);
+
+    // the whole verification is as it was
+    assert!(input.verify_workspace(&ctx, workspace.clone()).is_err());
+    std::fs::remove_dir_all(root.join("node_modules")).unwrap();
+    std::fs::remove_dir_all(root.join("pkg/out")).unwrap();
+    assert!(input
+        .verify_workspace(&ctx, workspace.clone())
+        .unwrap()
+        .unverified_paths()
+        .is_empty());
+}

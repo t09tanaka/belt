@@ -256,6 +256,7 @@ impl PinnedExecution<'_> {
             inode: receipt.inode,
             namespace: super::new_namespace()?,
             sequence: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            unverified: vec![],
         };
         restored.validate(self)?;
         Ok(restored)

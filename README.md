@@ -941,6 +941,34 @@ namespace. Hosts retain workspace, secret restoration and cleanup ownership via
 `PinnedWorkspaceProvider`.
 
 
+### Binding a workspace the host has added to (library)
+
+`PinnedExecution::verify_workspace` binds a workspace only when it equals the
+captured source byte for byte. A host that restores secret files, copies
+dependency directories in or keeps the output of a prepared setup before it
+binds declares those paths instead:
+
+```rust
+use local_ci::source::RelPath;
+use local_ci::source_execute::WorkspaceOverlay;
+
+let overlay = WorkspaceOverlay {
+    paths: vec![RelPath::new("node_modules"), RelPath::new("packages/app/dist")],
+    secret_files: vec![RelPath::new(".env")],
+};
+let workspace = input.verify_workspace_with_overlay(&ctx, workspace, &overlay)?;
+audit(workspace.unverified_paths()); // sorted, what was not compared
+```
+
+A declared path and everything below it is not compared; every other file must
+still match, an undeclared extra file is refused, and the Git HEAD and index
+are checked as before. A path has to be relative and normalized (no empty, `.`,
+`..` or `.git` component), must not be a symbolic link or lead through one or
+through a file, and must not touch a submodule. A secret file has to be one the
+manifest declares, and a regular file when it is there. The content of the
+declared paths is the host's word: steps run with it unchecked. A workspace
+restored from a worker receipt does not carry the list.
+
 ### Verified scheduling source (library, in development)
 
 `source_execute::git_evaluation_source(ctx, repository, frozen_plan)` reads the
