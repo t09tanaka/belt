@@ -233,6 +233,11 @@ impl Host for Machine {
         .map(Some)
         .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))
     }
+    fn toolchain_retry(&self, request: &crate::toolchain::preparation::PreparationRequest) {
+        if let Some(s) = &self.setups {
+            s.retry_tool(request);
+        }
+    }
     fn toolchain_poll(
         &self,
         attempt: &AttemptId,

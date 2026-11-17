@@ -1138,4 +1138,18 @@ A44 の sync 側のテスト（ネットワークに出ない）:
   - gate: `tests/it/bootstrap.rs`（worker の予算を別の entry で埋めると、導入が worker の ledger に並び、manager が走らない。空けると導入される）。
   - 遅い確認: `tests/it/worker_agent.rs`（確認が戻らなくても要求は `pending` で返り、聞き直しは確認を増やさず、結果は残る）。
 
-残り（S21 は完了していない）: 上の 1〜4 と 6。加えて、`warmup_idle_ms` を超えた後の 2 回目の sync を resident 経由の 1 本の試験で確かめること（設定の口が要る）。`dry_run` の `env_sync` は receipt の無い root を `failed` と答える（導入すれば直るが、表示は直していない。CLI は `dry_run` を使っていない）。
+残り（S21 は完了していない）: 4 本目の 1〜4 と 6。加えて、`warmup_idle_ms` を超えた後の 2 回目の sync を resident 経由の 1 本の試験で確かめること（設定の口が要る）。owner の read が無く空でないディレクトリを残した root は、rename で空になるので次の導入は進むが、その trash は消せずに残る（手で消す）。root の中を path で名指しして書く生き残りの子孫は、新しい root に書き込める（trash への rename では防げない）。
+
+### S21 `workers sync` のレビュー修正（2026-11-17、5 本目: 削除の経路と失敗の記憶）
+
+PR #59 の H1 修正（4 本目）へのレビューを受けて、toolchain の root を消す経路を固めた。
+
+- **M1（失敗した版のやり直し）**: 導入者が自分で失敗した版を key ごとに 10 分（`SetupConfig::tool_failure_hold_ms`）覚え、新しい consumer には導入をやり直さずに同じ失敗と残り秒数を返す。覚えるのは helper が失敗の exit で終わった場合、成功の後の `detect` が通らなかった場合、制限時間切れだけで、cancel・消失・signal による終了は覚えない（`policy::install_itself_failed`）。HostTools の digest が変わったとき、warm-up の最初の look（`Host::toolchain_retry`）、worker の再起動で解除する。判定は純粋関数 `policy::failure_held`。
+- **L1（fd を基準にした削除）**: `remove_at` は `openat(O_DIRECTORY|O_NOFOLLOW)`・`fstat`・`fchmod`・`unlinkat` だけでたどる。path の chmod と `read_dir` は無い。`st_dev` が root と違うディレクトリは `EXDEV` で止まる。`managed_root` は管理ディレクトリと root を開いたまま返し、clear はその descriptor を使う。読めない（owner の read が無い）ディレクトリは、空なら外し、空でなければ止まる（path で chmod し直さない）。
+- **L2（trash）**: clear は `install.lock` 以外を `.trash-<root名>-<ULID>` へ rename してから消す。rename の失敗は導入の失敗で、何も消さない。残った trash は同じ root の次の clear（lock の下）と、起動時の `adapters::sweep_trash`（その root の lock が待たずに取れた場合だけ）で消す。root そのものは rename しない（`install.lock` の inode が排他そのものなので）。
+- **L3（期待する親）**: `install_admitted` と `managed_root` は管理ディレクトリを引数で受け、`root.parent() == expected` を、何かを作る前に確かめる。
+- **L4・L5（緩めた試験）**: helper を殺した後の試験を `calls()==2` と「2 本目が Pending」に戻し、失敗時は理由を出す。restart の試験は、unsettled が空になった直後に古い子が死んでいることを確かめる。
+- **dry_run**: `env_sync` の dry_run は receipt の無い root を `would_install` と答える（本番の sync と同じ）。
+- spec §22.2 の削除の条件を、上に合わせて直した。
+
+残り: 上の 4 本目の残りと同じ。

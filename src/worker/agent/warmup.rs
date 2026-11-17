@@ -21,6 +21,7 @@
 //! kept for the next request.
 
 use super::*;
+use crate::toolchain::adapters::{self, Availability};
 use crate::toolchain::preparation::{PreparationRequest, ToolPreparationPoll};
 use crate::toolchain::registry::{Registry, Unavailable};
 use crate::toolchain::versions::ToolId;
@@ -47,6 +48,9 @@ pub(super) struct Warmup {
     /// A look is under way on its own thread. No second one is started, and
     /// the warm-up is not forgotten under it.
     looking: bool,
+    /// The first look was taken: only that one lifts a remembered install
+    /// failure of the versions asked for.
+    looked: bool,
 }
 
 /// What a request is answered from: what is decided, the rest `pending`.
@@ -117,6 +121,20 @@ pub(super) fn request(
         .map_err(|e| why(&tool.name, &tool.version, &e))
 }
 
+/// What a sync would do about what a look without an install found
+/// (`Pending`: it would install). A root without a receipt is what a failed
+/// or stopped install left: the sync clears it and installs again, so the
+/// dry run says the same as for a version that is not there.
+pub(super) fn would(found: Availability) -> Result<ToolPreparationPoll, String> {
+    match found {
+        Availability::Installed(receipt) => Ok(ToolPreparationPoll::Installed(receipt)),
+        Availability::Missing | Availability::Unknown(adapters::UNRECEIPTED) => {
+            Ok(ToolPreparationPoll::Pending)
+        }
+        Availability::Unknown(e) | Availability::ManualRequired(e) => Err(e.to_string()),
+    }
+}
+
 /// One look at one tool. `waited` says whether an earlier look saw it pending.
 pub(super) fn outcome(
     poll: Result<ToolPreparationPoll, String>,
@@ -172,17 +190,11 @@ impl Agent {
                 .iter()
                 .map(|tool| {
                     let poll = request(registry, tool).and_then(|request| {
-                        use crate::toolchain::adapters::Availability;
-                        match registry.expect("a request has a registry").detect(&request) {
-                            Ok(Availability::Installed(receipt)) => {
-                                Ok(ToolPreparationPoll::Installed(receipt))
-                            }
-                            Ok(Availability::Missing) => Ok(ToolPreparationPoll::Pending),
-                            Ok(Availability::Unknown(e) | Availability::ManualRequired(e)) => {
-                                Err(e.to_string())
-                            }
-                            Err(e) => Err(why(&tool.name, &tool.version, &e)),
-                        }
+                        registry
+                            .expect("a request has a registry")
+                            .detect(&request)
+                            .map_err(|e| why(&tool.name, &tool.version, &e))
+                            .and_then(would)
                     });
                     let (outcome, message) = outcome(poll, false, false);
                     let outcome = match outcome {
@@ -233,6 +245,7 @@ impl Agent {
                         done: BTreeMap::new(),
                         released: false,
                         looking: false,
+                        looked: false,
                     },
                 );
             }
@@ -278,11 +291,12 @@ impl Agent {
 
     /// One look at what is undecided of the warm-up `id`, outside the lock.
     fn look(&self, id: &str) {
-        let (consumer, todo, waited, begun_ms) = {
-            let warmups = lock(&self.warmups);
-            let Some(warmup) = warmups.get(id) else {
+        let (consumer, todo, waited, begun_ms, first) = {
+            let mut warmups = lock(&self.warmups);
+            let Some(warmup) = warmups.get_mut(id) else {
                 return;
             };
+            let first = !std::mem::replace(&mut warmup.looked, true);
             let todo: Vec<ToolRequirement> = warmup
                 .tools
                 .iter()
@@ -294,11 +308,17 @@ impl Agent {
                 todo,
                 warmup.waited.clone(),
                 warmup.begun_ms,
+                first,
             )
         };
         let mut seen = Vec::with_capacity(todo.len());
         for tool in &todo {
             let poll = request(self.toolchains.as_ref(), tool).and_then(|request| {
+                if first {
+                    // A sync is an explicit request to install: a failure
+                    // remembered from an earlier install does not answer it.
+                    self.host.toolchain_retry(&request);
+                }
                 self.host
                     .toolchain_poll(&consumer, &request)
                     .map_err(|e| e.message)
@@ -388,6 +408,35 @@ mod tests {
     }
 
     #[test]
+    fn a_dry_run_says_would_install_for_what_a_sync_installs_again() {
+        assert_eq!(
+            would(Availability::Missing),
+            Ok(ToolPreparationPoll::Pending)
+        );
+        assert_eq!(
+            would(Availability::Unknown(adapters::UNRECEIPTED)),
+            Ok(ToolPreparationPoll::Pending)
+        );
+        // Anything else a sync fails on, the dry run fails on.
+        assert_eq!(
+            would(Availability::Unknown("unsafe_receipt")),
+            Err("unsafe_receipt".into())
+        );
+        assert_eq!(
+            would(Availability::ManualRequired("needs a person")),
+            Err("needs a person".into())
+        );
+        assert_eq!(
+            outcome(
+                would(Availability::Unknown(adapters::UNRECEIPTED)),
+                false,
+                false
+            ),
+            (SyncOutcome::Pending, None)
+        );
+    }
+
+    #[test]
     fn an_answer_is_what_is_decided_and_pending_for_the_rest_in_the_order_asked() {
         let tool = |name: &str| ToolRequirement {
             name: name.into(),
@@ -403,6 +452,7 @@ mod tests {
             done: BTreeMap::from([("b".to_string(), failed.clone())]),
             released: false,
             looking: true,
+            looked: true,
         };
         assert_eq!(
             known(&warmup),

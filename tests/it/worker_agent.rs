@@ -172,6 +172,12 @@ impl Host for DirHost {
             .map(Some)
             .map_err(|e| ApiError::new(ErrorCode::Internal, e))
     }
+    fn toolchain_retry(
+        &self,
+        request: &remote_task_runner::toolchain::preparation::PreparationRequest,
+    ) {
+        self.log(format!("tool_retry {}", request.tool.as_str()));
+    }
     fn toolchain_poll(
         &self,
         a: &AttemptId,
@@ -4511,6 +4517,15 @@ impl DirHost {
             .map(|c| c.split(' ').next().unwrap().to_string())
             .collect()
     }
+    /// The tools whose remembered install failure a warm-up lifted, with
+    /// what was asked next, in order.
+    fn tool_retries(&self) -> Vec<String> {
+        self.calls()
+            .iter()
+            .filter_map(|c| c.strip_prefix("tool_retry "))
+            .map(Into::into)
+            .collect()
+    }
     fn releases(&self) -> Vec<String> {
         self.calls()
             .iter()
@@ -4641,6 +4656,7 @@ fn env_sync_installs_only_what_the_workers_own_registry_names() {
     assert_eq!(dry.results[0].outcome, SyncOutcome::WouldInstall);
     assert_eq!(dry.results[1].outcome, SyncOutcome::Failed);
     assert!(f.host.tool_polls().is_empty());
+    assert!(f.host.tool_retries().is_empty(), "a dry run lifts nothing");
     // A coordinator older than one this worker has heard from is refused.
     let session = Session {
         coordinator_epoch: CoordinatorEpoch(5),
@@ -4711,6 +4727,12 @@ fn a_warm_up_keeps_one_consumer_until_it_is_decided_and_then_repeats_its_answer(
     let polls = f.host.tool_polls();
     assert_eq!(polls.len(), 2);
     assert_eq!(polls[0], polls[1], "one warm-up is one consumer");
+    // A sync asks for the install explicitly: a failure remembered from an
+    // earlier install is lifted, once, before the first look and not again.
+    assert_eq!(f.host.tool_retries(), ["node"]);
+    let calls = f.host.calls();
+    let at = |what: &str| calls.iter().position(|c| c.starts_with(what)).unwrap();
+    assert!(at("tool_retry ") < at("tool_poll "));
     assert!(f.host.releases().is_empty(), "still waited for");
     // A tick while it is asked about takes nothing away.
     agent.tick();
@@ -4722,6 +4744,7 @@ fn a_warm_up_keeps_one_consumer_until_it_is_decided_and_then_repeats_its_answer(
     let other = RequestId::generate();
     env_sync(&agent, &other, vec![tool("node", "20.0.0")]).unwrap();
     assert_ne!(f.host.tool_polls()[2], polls[0]);
+    assert_eq!(f.host.tool_retries(), ["node", "node"]);
     // The install fails: said with its reason, and the reference goes once.
     *f.host.tool_poll.lock().unwrap() = Some(Some("the manager exited 19".into()));
     let results = env_sync(&agent, &sync, tools()).unwrap();

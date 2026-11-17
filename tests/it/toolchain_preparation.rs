@@ -389,15 +389,82 @@ fn manager_failures_probe_mismatch_and_output_limit_fail_closed_for_each_consume
         // for it.
         assert!(matches!(f.poll(&a), ToolPreparationPoll::Failed(_)));
         assert_eq!(f.setups.builds_started(), 1);
-        // A later consumer does not inherit the partial root as a failure:
-        // the install is tried again from a cleared root (and this manager
-        // fails again), never reused.
+        // A later consumer is told the same failure at once, with when the
+        // version is tried again: the install that just failed by itself is
+        // not run again for everybody who asks.
+        let calls = f.calls();
         let other = f.consumer();
-        assert!(matches!(f.done(&other), ToolPreparationPoll::Failed(_)));
+        let ToolPreparationPoll::Failed(held) = f.poll(&other) else {
+            panic!("{mode}: a failed install was started again")
+        };
+        assert!(held.0.contains("it is tried again in 600 s"), "{held:?}");
+        let ToolPreparationPoll::Failed(first) = f.poll(&a) else {
+            panic!("{mode}")
+        };
+        assert!(held.0.starts_with(&first.0), "{held:?} / {first:?}");
+        assert_eq!(f.poll(&other), ToolPreparationPoll::Failed(held));
+        assert_eq!(f.setups.builds_started(), 1, "{mode}");
+        assert_eq!(f.calls(), calls, "{mode}");
+        // An explicit request (a warm-up) lifts it: the install runs again
+        // from a cleared root, and this manager fails again.
+        f.setups.retry_tool(&f.request);
+        let third = f.consumer();
+        assert!(matches!(f.done(&third), ToolPreparationPoll::Failed(_)));
         assert_eq!(f.setups.builds_started(), 2, "{mode}");
+        assert!(f.calls() > calls, "{mode}");
         assert!(!f.plan().root().join("receipt.json").exists());
         assert!(f.setups.preparation_observations(64).is_empty());
     }
+}
+
+/// The failure of an install is held for a time, not for ever: afterwards
+/// the next consumer starts the install again.
+#[test]
+fn a_failed_install_is_tried_again_for_a_new_consumer_once_the_hold_is_over() {
+    let mut f = Fx::new(AdapterKind::Nodenv, "node", "flaky");
+    f.cfg.tool_failure_hold_ms = 1500;
+    f.setups = Setups::open(f.cfg.clone(), Arc::new(NoWorkspace)).unwrap();
+    let fail = f.dir.path().join("host/fail");
+    std::fs::write(&fail, b"").unwrap();
+    let a = f.consumer();
+    assert!(matches!(f.done(&a), ToolPreparationPoll::Failed(_)));
+    let failed = Instant::now();
+    std::fs::remove_file(&fail).unwrap();
+    let b = f.consumer();
+    let first = f.poll(&b);
+    if failed.elapsed() < Duration::from_millis(1000) {
+        let ToolPreparationPoll::Failed(held) = first else {
+            panic!("the hold was not kept: {first:?}")
+        };
+        assert!(
+            held.0.contains("tried again in 1 s") || held.0.contains("tried again in 2 s"),
+            "{held:?}"
+        );
+        assert_eq!(f.setups.builds_started(), 1);
+    }
+    // The same consumer asks again after the hold: the manager, repaired
+    // by now, installs the version.
+    assert!(
+        matches!(
+            {
+                let deadline = Instant::now() + Duration::from_secs(90);
+                loop {
+                    match f.poll(&b) {
+                        ToolPreparationPoll::Failed(held) if held.0.contains("tried again in") => {
+                            assert!(Instant::now() < deadline, "the hold never ended");
+                            std::thread::sleep(Duration::from_millis(50));
+                        }
+                        other => break other,
+                    }
+                }
+            },
+            ToolPreparationPoll::Pending | ToolPreparationPoll::Installed(_)
+        ),
+        "after the hold a new installer is started"
+    );
+    assert!(matches!(f.done(&b), ToolPreparationPoll::Installed(_)));
+    assert_eq!(f.setups.builds_started(), 2);
+    assert_eq!(f.calls(), 2);
 }
 
 fn builders_settled(f: &Fx) -> bool {
@@ -425,6 +492,9 @@ fn a_failed_or_stopped_install_does_not_block_the_same_version_afterwards() {
     assert!(!root.join("receipt.json").exists());
     std::fs::write(root.join("home/stale"), b"left by the failed install").unwrap();
     std::fs::remove_file(&fail).unwrap();
+    // The failure is held for a while; the explicit request of a warm-up
+    // lifts it, and the repaired manager is run at once.
+    f.setups.retry_tool(&f.request);
     let b = f.consumer();
     assert!(
         matches!(f.done(&b), ToolPreparationPoll::Installed(_)),
@@ -622,7 +692,12 @@ fn restart_keeps_same_key_barrier_until_old_writer_settles_then_installs_again()
     );
     assert_eq!(reopened.builds_started(), 0);
     wait_until(|| reopened.unsettled().is_empty());
-    wait_until(|| !same_live(pid, start));
+    // The barrier goes only after the old writer is seen gone: at the moment
+    // nothing is unsettled any more, its child is not alive.
+    assert!(
+        !same_live(pid, start),
+        "the old installer was settled while its child was alive"
+    );
     assert_eq!(f.calls(), 1);
     assert!(f.plan().root().exists());
     assert!(!f.plan().root().join("receipt.json").exists());
@@ -743,10 +818,23 @@ fn helper_death_still_drains_recorded_owned_manager_children() {
     // A later consumer is not failed by the root the dead helper left: a
     // new installer is started, clears it and runs the manager again.
     let b = f.consumer();
-    wait_until(|| {
-        f.poll(&b);
-        f.setups.builds_started() == 2
-    });
+    let second = f.poll(&b);
+    assert_eq!(second, ToolPreparationPoll::Pending, "{second:?}");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while f.calls() < 2 {
+        let now = f.poll(&b);
+        assert_eq!(
+            now,
+            ToolPreparationPoll::Pending,
+            "the second installer ended before the manager ran: {now:?}"
+        );
+        assert!(Instant::now() < deadline, "the manager did not run again");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(f.setups.builds_started(), 2);
+    assert_eq!(f.calls(), 2);
+    f.setups.release(&b);
+    wait_until(|| builders_settled(&f));
 }
 
 #[test]

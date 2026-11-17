@@ -106,6 +106,9 @@ pub struct SetupConfig {
     /// A run-scope template whose run has no attempt here any more goes
     /// after this long without use.
     pub run_template_idle_ms: u64,
+    /// How long a tool version whose install failed by itself is not
+    /// installed again for a new consumer.
+    pub tool_failure_hold_ms: u64,
 }
 
 impl SetupConfig {
@@ -135,6 +138,8 @@ impl SetupConfig {
             template_max_bytes: 21_474_836_480,
             template_max_age_ms: 1_209_600_000,
             run_template_idle_ms: 3_600_000,
+            // 10 minutes
+            tool_failure_hold_ms: 600_000,
         }
     }
 
@@ -268,6 +273,23 @@ struct Inner {
     /// the reason: building again would end the same way, so the next
     /// consumer is told at once. Forgotten when the agent restarts.
     unkept: HashMap<String, String>,
+    /// Tool keys whose install failed by itself: for `tool_failure_hold_ms`
+    /// a new consumer is told the failure and no installer is started.
+    /// Forgotten when the host tools change, when a warm-up asks for the
+    /// version, and when the agent restarts.
+    failed_tools: HashMap<String, FailedTool>,
+}
+
+/// The last failed install of a tool key.
+struct FailedTool {
+    why: String,
+    at_ms: u64,
+    /// The host tools the install ran with.
+    host: Digest,
+}
+
+fn host_digest(request: &PreparationRequest) -> Digest {
+    Digest::of_bytes(&serde_json::to_vec(&request.host).expect("trusted request serializes"))
 }
 
 pub struct Setups {
@@ -616,6 +638,26 @@ impl Setups {
         if checked != ToolPreparationPoll::Pending {
             return Ok(checked);
         }
+        // An install of this version that failed by itself a short while ago
+        // is not repeated for every consumer that asks.
+        if let Some(failed) = inner.failed_tools.get(&key) {
+            let held = policy::failure_held(
+                failed.host == host_digest(request),
+                platform::monotonic_ms(),
+                failed.at_ms,
+                self.cfg.tool_failure_hold_ms,
+            );
+            match held {
+                Some(left) => {
+                    return Ok(ToolPreparationPoll::Failed(PreparationFailure(
+                        policy::failure_held_message(&failed.why, left),
+                    )))
+                }
+                None => {
+                    inner.failed_tools.remove(&key);
+                }
+            }
+        }
         let id = BuilderId::generate();
         let builder_attempt = AttemptId::generate();
         inner.tool_versions.insert(key.clone(), id.clone());
@@ -663,6 +705,14 @@ impl Setups {
         true
     }
 
+    /// Forget that the install of this version failed: the next consumer
+    /// starts an installer at once. For an explicit request (a warm-up).
+    pub fn retry_tool(&self, request: &PreparationRequest) {
+        lock(&self.inner)
+            .failed_tools
+            .remove(&format!("tool:{}", request.expected_plan));
+    }
+
     fn clear_barrier(&self, attempt: &AttemptId) {
         lock(&self.inner).barriers.retain(|_, old| old != attempt);
     }
@@ -677,7 +727,9 @@ impl Setups {
         let dir = std::fs::canonicalize(self.cfg.builders())
             .map_err(|e| PreparationFailure(e.to_string()))?
             .join(id.as_str());
-        let work = || -> Result<InstallationReceipt, String> {
+        // Whether a failure is one the installer made by itself.
+        let mut by_itself = false;
+        let mut work = || -> Result<InstallationReceipt, String> {
             private_dir(&dir).map_err(|e| e.to_string())?;
             let meta = Meta {
                 kind: BuilderKind::ToolInstall,
@@ -706,9 +758,13 @@ impl Setups {
                 return Err("tool preparation cancelled".into());
             }
             let end = self.supervised(id, attempt, &dir, &store);
+            by_itself = policy::install_itself_failed(&end);
             if !end.is_built() {
                 return Err(end.describe());
             }
+            // The installer said it was done, and what it left is not an
+            // installation.
+            by_itself = true;
             let plan = request.plan(&self.private_tool_root().map_err(|e| e.message)?)?;
             match adapters::detect(&plan) {
                 Availability::Installed(receipt) => Ok(*receipt),
@@ -717,8 +773,26 @@ impl Setups {
             }
         };
         let result = work().map(Box::new).map_err(PreparationFailure);
-        if result.is_ok() {
-            self.handoff_observation(id, attempt, key, BuilderKind::ToolInstall, &dir);
+        match &result {
+            Ok(_) => {
+                lock(&self.inner).failed_tools.remove(key);
+                self.handoff_observation(id, attempt, key, BuilderKind::ToolInstall, &dir);
+            }
+            Err(failure) if by_itself => {
+                let mut inner = lock(&self.inner);
+                if inner.failed_tools.len() >= MAX_UNKEPT {
+                    inner.failed_tools.clear();
+                }
+                inner.failed_tools.insert(
+                    key.into(),
+                    FailedTool {
+                        why: failure.0.clone(),
+                        at_ms: platform::monotonic_ms(),
+                        host: host_digest(request),
+                    },
+                );
+            }
+            Err(_) => {}
         }
         if !lock(&self.leftover).contains(attempt) {
             let _ = remove_tree(&dir);
@@ -1908,6 +1982,63 @@ mod tool_validation_tests {
             base_profile: Digest::of_bytes(b"execution"),
         };
         (temp, setups, request, plan)
+    }
+    #[test]
+    fn a_remembered_install_failure_is_held_for_the_same_host_tools_and_can_be_lifted() {
+        let (_temp, setups, request, _plan) = fixture();
+        let key = format!("tool:{}", request.expected_plan);
+        let remember = |host: Digest| {
+            lock(&setups.inner).failed_tools.insert(
+                key.clone(),
+                FailedTool {
+                    why: "exit 19".into(),
+                    at_ms: platform::monotonic_ms(),
+                    host,
+                },
+            );
+        };
+        // The same host tools: a new consumer is told, nothing is started.
+        remember(host_digest(&request));
+        let a = AttemptId::generate();
+        let ToolPreparationPoll::Failed(held) = setups.poll_tool(&a, &request).unwrap() else {
+            panic!("an installer was started")
+        };
+        assert!(
+            held.0.starts_with("exit 19 (this version failed"),
+            "{held:?}"
+        );
+        assert_eq!(setups.builds_started(), 0);
+        assert!(lock(&setups.inner).failed_tools.contains_key(&key));
+        // Lifting another version leaves it; lifting this one removes it.
+        let mut other = request.clone();
+        other.expected_plan = Digest::of_bytes(b"another plan");
+        setups.retry_tool(&other);
+        assert!(lock(&setups.inner).failed_tools.contains_key(&key));
+        setups.retry_tool(&request);
+        assert!(lock(&setups.inner).failed_tools.is_empty());
+        // Recorded with other host tools (the manager was replaced since):
+        // forgotten at the first look, and an installer is started.
+        remember(Digest::of_bytes(b"other host tools"));
+        assert_ne!(host_digest(&request), Digest::of_bytes(b"other host tools"));
+        let b = AttemptId::generate();
+        assert_eq!(
+            setups.poll_tool(&b, &request).unwrap(),
+            ToolPreparationPoll::Pending
+        );
+        assert_eq!(setups.builds_started(), 1);
+        setups.release(&a);
+        setups.release(&b);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while !lock(&setups.inner).flights.is_empty() || !lock(&setups.inner).by_key.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the builder did not end"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        // That installer was lost before it ran (no supervisor here): not a
+        // failure of the install itself, so nothing is remembered.
+        assert!(lock(&setups.inner).failed_tools.is_empty());
     }
     struct Populate(adapters::InstallPlan);
     impl AdmittedExecutor for Populate {

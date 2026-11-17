@@ -710,6 +710,34 @@ pub enum Leave {
     StopBuilder,
 }
 
+/// Whether the install of a tool ended in a way that asking again would
+/// repeat: the installer ran to its own failing end (its helper exited with
+/// a failure), or it used up its whole time. An install that was cancelled
+/// (the last consumer left), lost, interrupted or killed by a signal says
+/// nothing about the next one, and is not remembered.
+pub fn install_itself_failed(end: &BuildEnd) -> bool {
+    matches!(
+        end,
+        BuildEnd::Failed(Some(Exit::Code(_))) | BuildEnd::TimedOut
+    )
+}
+
+/// How long a remembered install failure still stands, in milliseconds:
+/// `None` once `hold_ms` have passed since it was recorded at `at_ms`, or
+/// when the host tools (`same_host`) are no longer the ones that failed.
+pub fn failure_held(same_host: bool, now_ms: u64, at_ms: u64, hold_ms: u64) -> Option<u64> {
+    let left = hold_ms.checked_sub(now_ms.saturating_sub(at_ms))?;
+    (same_host && left > 0).then_some(left)
+}
+
+/// What a consumer is told while a remembered install failure stands.
+pub fn failure_held_message(why: &str, left_ms: u64) -> String {
+    format!(
+        "{why} (this version failed to install a short while ago; it is tried again in {} s, or at once by `workers sync`)",
+        left_ms.div_ceil(1000)
+    )
+}
+
 /// A consumer takes a reference. Returns whether it is the first.
 pub fn join(refs: &mut BTreeSet<String>, consumer: &str) -> bool {
     let first = refs.is_empty();
@@ -815,6 +843,42 @@ pub fn prepare_spec(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_install_that_failed_by_itself_is_remembered_and_only_for_the_hold() {
+        use super::{failure_held, failure_held_message, install_itself_failed, BuildEnd, Exit};
+        assert!(install_itself_failed(&BuildEnd::Failed(Some(Exit::Code(
+            1
+        )))));
+        assert!(install_itself_failed(&BuildEnd::TimedOut));
+        for end in [
+            BuildEnd::Built,
+            BuildEnd::Failed(Some(Exit::Signal(9))),
+            BuildEnd::Failed(None),
+            BuildEnd::Cancelled,
+            BuildEnd::Crashed("lost".into()),
+            BuildEnd::NotKept("why".into()),
+        ] {
+            assert!(!install_itself_failed(&end), "{end:?}");
+        }
+        // 10 minutes from 1000 ms on.
+        assert_eq!(failure_held(true, 1_000, 1_000, 600_000), Some(600_000));
+        assert_eq!(failure_held(true, 1_001, 1_000, 600_000), Some(599_999));
+        assert_eq!(failure_held(true, 600_999, 1_000, 600_000), Some(1));
+        assert_eq!(failure_held(true, 601_000, 1_000, 600_000), None);
+        assert_eq!(failure_held(true, 601_001, 1_000, 600_000), None);
+        assert_eq!(failure_held(true, u64::MAX, 0, 600_000), None);
+        // A clock that reads earlier than the record: the whole hold.
+        assert_eq!(failure_held(true, 0, 1_000, 600_000), Some(600_000));
+        // Other host tools: not held at any time.
+        assert_eq!(failure_held(false, 1_000, 1_000, 600_000), None);
+        assert_eq!(failure_held(true, 5, 5, 0), None);
+        assert_eq!(
+            failure_held_message("a setup step exited with 1", 600_000),
+            "a setup step exited with 1 (this version failed to install a short while ago; it is tried again in 600 s, or at once by `workers sync`)"
+        );
+        assert!(failure_held_message("x", 1).contains("in 1 s"));
+        assert!(failure_held_message("x", 1_001).contains("in 2 s"));
+    }
     use super::*;
     use crate::ids::{NodeId, RunId};
     use crate::wire::{SecretVersion, ToolRequirement};
