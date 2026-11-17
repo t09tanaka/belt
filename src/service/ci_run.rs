@@ -287,10 +287,16 @@ pub async fn submit(
     if capacity > 1 {
         use std::os::unix::ffi::OsStrExt;
         let root = context.repo_root.as_deref().unwrap_or(&context.cwd);
-        let project = plan
-            .repository
+        let project = captured
+            .manifest
+            .repository_id
             .clone()
             .unwrap_or_else(|| Digest::of_bytes(root.as_os_str().as_bytes()).to_string());
+        let project = crate::ci::discovery::history_project(
+            &project,
+            &plan,
+            &captured.manifest.object_manifest.entries,
+        );
         crate::ci::discovery::stage(
             &plan,
             &mut specs,

@@ -263,7 +263,12 @@ impl WorkerListing {
     ) -> anyhow::Result<ShardRequest> {
         let target = self.step.target(plan)?;
         let runner = adapter(target.command, &self.runner_version, "", isolation)?;
-        let discovered = validated_listing(self.discovered.clone(), &runner.info().runner);
+        let mut discovered = validated_listing(self.discovered.clone(), &runner.info().runner);
+        if let Some(reason) = reports::job_requirement(plan, &self.step) {
+            if !discovered.blocked.contains(&reason) {
+                discovered.blocked.push(reason);
+            }
+        }
         let mut costs = costs.clone();
         costs.fixed_cost_ms = costs
             .fixed_cost_ms
@@ -279,6 +284,77 @@ impl WorkerListing {
             discovered,
         })
     }
+}
+
+/// Retain history across edits to test bodies, but not across changes to
+/// captured runner configuration, package resolution or workflow steps.
+pub(crate) fn history_project(
+    project: &str,
+    plan: &FrozenPlan,
+    entries: &[local_ci::source::FileEntry],
+) -> String {
+    let mut selected = std::collections::BTreeSet::new();
+    for step in candidates(plan) {
+        let Ok(target) = step.target(plan) else {
+            continue;
+        };
+        let Some(parsed) = adapters::parse_command(target.command) else {
+            continue;
+        };
+        for (index, arg) in parsed.args.iter().enumerate() {
+            let path = arg
+                .strip_prefix("--config=")
+                .or_else(|| arg.strip_prefix("--config-file="))
+                .or_else(|| {
+                    matches!(
+                        arg.as_str(),
+                        "--config" | "--config-file" | "-c" | "--manifest-path"
+                    )
+                    .then(|| parsed.args.get(index + 1).map(String::as_str))
+                    .flatten()
+                });
+            if let Some(path) = path {
+                selected.insert(Path::new(&target.dir).join(path));
+            }
+        }
+    }
+    let configs: Vec<_> = entries
+        .iter()
+        .filter(|entry| {
+            let path = entry.path.to_path();
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("");
+            selected.contains(&path)
+                || matches!(
+                    name,
+                    "package.json"
+                        | "Cargo.toml"
+                        | "Cargo.lock"
+                        | "yarn.lock"
+                        | "pnpm-lock.yaml"
+                        | "package-lock.json"
+                        | "rust-toolchain"
+                        | "rust-toolchain.toml"
+                )
+                || [
+                    "jest.config.",
+                    "vitest.config.",
+                    "vitest.workspace.",
+                    "vite.config.",
+                    "playwright.config.",
+                    "cypress.config.",
+                ]
+                .iter()
+                .any(|prefix| name.starts_with(prefix))
+        })
+        .collect();
+    crate::ids::Digest::of_bytes(
+        &serde_json::to_vec(&(project, configs, &plan.workflows))
+            .expect("frozen runner configuration serializes"),
+    )
+    .to_string()
 }
 
 pub fn timing_key(

@@ -44,13 +44,7 @@ fn read_config(workspace: &Path, file: &Path) -> Option<String> {
     (text.len() as u64 <= MAX_CONFIG_BYTES).then_some(text)
 }
 
-pub(super) fn reason(
-    plan: &FrozenPlan,
-    step: &DiscoveryStep,
-    workspace: &Path,
-    root: &Path,
-    info: &local_ci::shard::RunnerInfo,
-) -> Option<NotSplit> {
+pub(super) fn job_requirement(plan: &FrozenPlan, step: &DiscoveryStep) -> Option<NotSplit> {
     let workflow = plan.workflows.iter().find(|w| w.file == step.workflow)?;
     let job = workflow.jobs.iter().find(|j| j.id == step.job)?;
     if job.steps.len() > step.step + 1 {
@@ -64,6 +58,19 @@ pub(super) fn reason(
         .chain(&job.steps[step.step].env)
         .find_map(|(key, value)| reported(key).or_else(|| reported(value)))
     {
+        return Some(reason);
+    }
+    None
+}
+
+pub(super) fn reason(
+    plan: &FrozenPlan,
+    step: &DiscoveryStep,
+    workspace: &Path,
+    root: &Path,
+    info: &local_ci::shard::RunnerInfo,
+) -> Option<NotSplit> {
+    if let Some(reason) = job_requirement(plan, step) {
         return Some(reason);
     }
     if info.runner == "cargo-test" {
@@ -124,7 +131,23 @@ pub(super) fn reason(
     files
         .iter()
         .find_map(|path| match read_config(workspace, path) {
-            Some(text) => reported(&text),
+            Some(text) => reported(&text).or_else(|| {
+                // An imported or inherited project configuration can install a
+                // reporter whose output cannot be seen from this file.
+                [
+                    "from './",
+                    r#"from "./"#,
+                    "from '../",
+                    r#"from "../"#,
+                    "require(",
+                    "import(",
+                    "...",
+                    "extends:",
+                ]
+                .iter()
+                .any(|token| text.contains(token))
+                .then_some(NotSplit::InexactAggregation)
+            }),
             None => Some(NotSplit::InexactAggregation),
         })
 }
