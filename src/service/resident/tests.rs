@@ -2099,6 +2099,7 @@ async fn retry_rpc_waits_for_source_gc_before_input_lease_and_reports_typed_expi
 fn a_run_of_ci_tasks_is_a_request_an_older_resident_refuses() {
     let ci = TaskSpec {
         ci: Some(crate::coordinator::CiSpec {
+            matrix: None,
             task: crate::wire::CiTask {
                 plan_digest: Digest::of_bytes(b"plan"),
                 task_id: "t".into(),

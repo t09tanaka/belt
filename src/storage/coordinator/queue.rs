@@ -77,6 +77,7 @@ pub struct WorkerLoad {
 /// transaction.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlaceInput {
+    pub permit_id: Option<PermitId>,
     pub run_id: RunId,
     pub task_id: TaskId,
     pub generation: Generation,
@@ -93,6 +94,8 @@ pub enum PlaceOutcome {
     NotQueued,
     /// The worker has no room; nothing was written.
     WorkerFull(WorkerLoad),
+    /// The matrix already has its allowed number of live variants across all workers.
+    MatrixFull,
     /// No payload can be made from what the task holds (the reason);
     /// nothing was written.
     Unbuildable(String),
@@ -536,14 +539,25 @@ impl CoordinatorStore {
                 [&task],
                 |r| r.get(0),
             )?;
+            let spec: Value = from_json("task spec", &spec)?;
+            let matrix = spec
+                .pointer("/ci/matrix")
+                .filter(|value| !value.is_null())
+                .map(|value| {
+                    serde_json::from_value::<crate::coordinator::MatrixAdmission>(value.clone())
+                })
+                .transpose()
+                .map_err(|e| StorageError::Invalid(format!("invalid matrix admission: {e}")))?;
+            let permit_id = matrix.as_ref().map(|_| PermitId::generate());
             let input = PlaceInput {
+                permit_id: permit_id.clone(),
                 run_id: id("run_id", RunId::parse(&run))?,
                 task_id,
                 generation: Generation(to_u64(generation)?),
                 source_id: source
                     .map(|s| id("source_id", SourceId::parse(&s)))
                     .transpose()?,
-                spec: from_json("task spec", &spec)?,
+                spec,
             };
             let (hash, demand) = match build(&input) {
                 Ok(built) => built,
@@ -551,12 +565,33 @@ impl CoordinatorStore {
                 Err(StorageError::Invalid(why)) => return Ok(PlaceOutcome::Unbuildable(why)),
                 Err(e) => return Err(e),
             };
+            if let (Some(matrix), Some(permit)) = (&matrix, &permit_id) {
+                let group = format!("{run}:{}", matrix.group);
+                tx.execute(
+                    "INSERT INTO matrix_group(group_id,run_id,max_parallel,created_at_ms)
+                    VALUES (?1,?2,?3,?4) ON CONFLICT(group_id) DO NOTHING",
+                    params![group, run, matrix.max_parallel.get(), to_i64(at_ms)?],
+                )?;
+                let matches: bool = tx.query_row(
+                    "SELECT run_id=?2 AND max_parallel=?3 FROM matrix_group WHERE group_id=?1",
+                    params![group, run, matrix.max_parallel.get()],
+                    |r| r.get(0),
+                )?;
+                if !matches {
+                    return Err(StorageError::Invalid(
+                        "inconsistent matrix admission".into(),
+                    ));
+                }
+                if super::reserve_permit(tx, &group, permit, at_ms)?.is_none() {
+                    return Ok(PlaceOutcome::MatrixFull);
+                }
+            }
             let mut receipts = Receipts::default();
             receipts.mark(Receipt::CoordinatorAccepted, at_ms);
             tx.execute(
                 "INSERT INTO attempt (attempt_id, task_id, worker_id, generation, payload_hash,
-                    coordinator_epoch, state, receipts_json, created_at_ms)
-                 VALUES (?1,?2,?3,?4,?5,?6,'accepted',?7,?8)",
+                    coordinator_epoch, state, receipts_json, created_at_ms, permit_id)
+                 VALUES (?1,?2,?3,?4,?5,?6,'accepted',?7,?8,?9)",
                 params![
                     aid,
                     task,
@@ -565,9 +600,13 @@ impl CoordinatorStore {
                     hash.as_str(),
                     to_i64(epoch.0)?,
                     json(&receipts),
-                    to_i64(at_ms)?
+                    to_i64(at_ms)?,
+                    permit_id.as_ref().map(PermitId::as_str)
                 ],
             )?;
+            if let Some(permit) = &permit_id {
+                super::bind_permit(tx, permit.as_str(), &aid, &run)?;
+            }
             tx.execute(
                 "INSERT INTO placement (task_id, worker_id, attempt_id, demand_json, created_at_ms)
                  VALUES (?1,?2,?3,?4,?5)",

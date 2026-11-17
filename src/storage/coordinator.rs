@@ -1061,37 +1061,7 @@ impl CoordinatorStore {
         at_ms: u64,
     ) -> Result<Option<Permit>> {
         let (g, p) = (group_id.to_string(), permit_id.clone());
-        self.db.write(move |tx| {
-            if let Some(existing) = load_permit(tx, p.as_str())? {
-                if existing.group_id != g {
-                    return Err(StorageError::Invalid(format!(
-                        "permit {p} belongs to another group"
-                    )));
-                }
-                return Ok(Some(existing));
-            }
-            let max: i64 = tx
-                .query_row(
-                    "SELECT max_parallel FROM matrix_group WHERE group_id = ?1",
-                    [&g],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .ok_or_else(|| not_found(format!("matrix group {g}")))?;
-            let held: i64 = tx.query_row(
-                "SELECT count(*) FROM matrix_permit WHERE group_id = ?1 AND held = 1",
-                [&g],
-                |r| r.get(0),
-            )?;
-            if held >= max {
-                return Ok(None);
-            }
-            tx.execute(
-                "INSERT INTO matrix_permit (permit_id, group_id, created_at_ms) VALUES (?1,?2,?3)",
-                params![p.as_str(), g, to_i64(at_ms)?],
-            )?;
-            load_permit(tx, p.as_str())
-        })
+        self.db.write(move |tx| reserve_permit(tx, &g, &p, at_ms))
     }
 
     /// Give the permit back. Refused while its attempt is neither terminal nor
@@ -1524,6 +1494,38 @@ fn load_permit(conn: &Connection, permit_id: &str) -> Result<Option<Permit>> {
         })
     })
     .transpose()
+}
+
+fn reserve_permit(tx: &Connection, g: &str, p: &PermitId, at_ms: u64) -> Result<Option<Permit>> {
+    if let Some(existing) = load_permit(tx, p.as_str())? {
+        if existing.group_id != g {
+            return Err(StorageError::Invalid(format!(
+                "permit {p} belongs to another group"
+            )));
+        }
+        return Ok(Some(existing));
+    }
+    let max: i64 = tx
+        .query_row(
+            "SELECT max_parallel FROM matrix_group WHERE group_id = ?1",
+            [g],
+            |r| r.get(0),
+        )
+        .optional()?
+        .ok_or_else(|| not_found(format!("matrix group {g}")))?;
+    let held: i64 = tx.query_row(
+        "SELECT count(*) FROM matrix_permit WHERE group_id = ?1 AND held = 1",
+        [g],
+        |r| r.get(0),
+    )?;
+    if held >= max {
+        return Ok(None);
+    }
+    tx.execute(
+        "INSERT INTO matrix_permit (permit_id, group_id, created_at_ms) VALUES (?1,?2,?3)",
+        params![p.as_str(), g, to_i64(at_ms)?],
+    )?;
+    load_permit(tx, p.as_str())
 }
 
 fn bind_permit(conn: &Connection, permit_id: &str, attempt_id: &str, run: &str) -> Result<()> {

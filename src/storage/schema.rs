@@ -340,6 +340,16 @@ INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');"#.to
             // worker's whole history. Performance only; it adds no feature
             // marker, the version bump alone makes an older binary refuse.
             "CREATE INDEX placement_unacked ON placement(worker_id,placement_id) WHERE acked_at_ms IS NULL;\nCREATE INDEX attempt_worker_live ON attempt(worker_id,created_at_ms) WHERE state <> 'terminal' AND retired=0;".into(),
+            r#"CREATE INDEX matrix_permit_held ON matrix_permit(group_id) WHERE held=1;
+CREATE TRIGGER matrix_attempt_ended AFTER UPDATE OF state,retired ON attempt
+WHEN NEW.permit_id IS NOT NULL AND (NEW.state='terminal' OR NEW.retired=1)
+BEGIN
+UPDATE matrix_permit SET held=0,released_at_ms=coalesce(NEW.terminal_at_ms,NEW.retired_at_ms)
+WHERE permit_id=NEW.permit_id AND held=1;
+END;
+UPDATE matrix_permit SET held=0,released_at_ms=(
+  SELECT coalesce(terminal_at_ms,retired_at_ms) FROM attempt WHERE attempt.attempt_id=matrix_permit.attempt_id
+) WHERE held=1 AND attempt_id IN (SELECT attempt_id FROM attempt WHERE permit_id IS NOT NULL AND (state='terminal' OR retired=1));"#.into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

@@ -2588,6 +2588,60 @@ fn a_run_is_queued_whole_or_not_at_all_and_in_the_order_given() {
 }
 
 #[test]
+fn matrix_placement_holds_the_global_slot_until_proven_stopped() {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let run = RunId::generate();
+    let a = TaskId::generate();
+    let b = TaskId::generate();
+    let spec = json!({"ci":{"matrix":{"group":"ci.yml::test","max_parallel":1}}});
+    store
+        .enqueue(
+            &run,
+            None,
+            &json!({}),
+            &[(a.clone(), spec.clone()), (b.clone(), spec)],
+            1,
+        )
+        .unwrap();
+    let first = placed(place_on(&store, &a, "w-a", 1));
+    let permit = first.permit_id.unwrap();
+    assert_eq!(
+        store
+            .get_permit(&permit)
+            .unwrap()
+            .unwrap()
+            .attempt_id
+            .as_ref(),
+        Some(&first.attempt_id)
+    );
+    store
+        .record_seen(&first.attempt_id, false, None, Observation::Unknown, 20)
+        .unwrap();
+    drop(store);
+    let store = CoordinatorStore::open(dir.path(), 21).unwrap();
+    assert_eq!(place_on(&store, &b, "w-b", 1), PlaceOutcome::MatrixFull);
+    assert!(store.attempts_of_task(&b).unwrap().is_empty());
+    store.begin_retire(&first.attempt_id, "move", 22).unwrap();
+    assert_eq!(place_on(&store, &b, "w-b", 1), PlaceOutcome::MatrixFull);
+    store.confirm_retire(&first.attempt_id, 23).unwrap();
+    assert!(!store.get_permit(&permit).unwrap().unwrap().held);
+    let second = placed(place_on(&store, &b, "w-b", 1));
+    let second_permit = second.permit_id.unwrap();
+    assert_ne!(second_permit, permit);
+    store
+        .record_seen(
+            &second.attempt_id,
+            true,
+            seen(AttemptState::Terminal, Some(done(Outcome::Succeeded))),
+            Observation::Known,
+            24,
+        )
+        .unwrap();
+    assert!(!store.get_permit(&second_permit).unwrap().unwrap().held);
+}
+
+#[test]
 fn placing_commits_the_attempt_and_its_unacked_demand_together() {
     let (_d, store, _run, ids) = queue_fx(2);
     let a = placed(place_on(&store, &ids[0], "w-a", 1));

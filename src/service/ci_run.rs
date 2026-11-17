@@ -84,6 +84,43 @@ pub enum Part {
     Job,
 }
 
+/// A matrix variant reserves one slot shared by every worker running this job.
+fn matrix_admission(
+    plan: &local_ci::FrozenPlan,
+    task: &local_ci::dag::ExecutionTask,
+) -> Result<Option<crate::coordinator::MatrixAdmission>, ApiError> {
+    use local_ci::dag::NodeKind;
+    let Some(variant) = &task.variant else {
+        return Ok(None);
+    };
+    let group = plan
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.id == variant.group)
+        .ok_or_else(|| invalid(format!("missing matrix group for task {}", task.id)))?;
+    let NodeKind::MatrixGroup {
+        variants,
+        max_parallel,
+        ..
+    } = &group.kind
+    else {
+        return Err(invalid(format!(
+            "invalid matrix group for task {}",
+            task.id
+        )));
+    };
+    let limit = max_parallel.unwrap_or(variants.len());
+    let max_parallel = u32::try_from(limit)
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| invalid(format!("invalid matrix parallelism for task {}", task.id)))?;
+    Ok(Some(crate::coordinator::MatrixAdmission {
+        group: group.id.clone(),
+        max_parallel,
+    }))
+}
+
 /// The tasks of `plan` as they are queued: one spec per task, in plan order.
 /// A task that depends on another waits (`hold`) and has no inputs yet.
 pub fn task_specs(
@@ -110,6 +147,7 @@ pub fn task_specs(
                 .map_err(|e| invalid(format!("task `{}`: {e:#}", task.id)))?;
             let spec = TaskSpec {
                 ci: Some(CiSpec {
+                    matrix: matrix_admission(plan, task)?,
                     task: CiTask {
                         plan_digest: plan_digest.clone(),
                         task_id: task.id.clone(),

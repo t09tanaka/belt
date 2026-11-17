@@ -134,9 +134,18 @@ pub struct TaskSpec {
     pub outputs: Vec<crate::wire::OutputDecl>,
 }
 
+/// The shared permit pool of a matrix job within this run. An unknown attempt keeps its permit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixAdmission {
+    pub group: String,
+    pub max_parallel: std::num::NonZeroU32,
+}
+
 /// A task of a frozen CI plan, as it is queued.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<MatrixAdmission>,
     /// What the worker is sent: the plan by its digest, the task, and the
     /// results of the jobs it needs.
     pub task: crate::wire::CiTask,
@@ -199,7 +208,7 @@ pub fn build_payload(
         source_id,
         plan_digest: spec.plan_digest.clone(),
         manifest_digest: spec.manifest_digest.clone(),
-        permit_id: None,
+        permit_id: input.permit_id.clone(),
         commands: spec.commands.clone(),
         lease_ms,
         command_timeout_ms: spec.command_timeout_ms,
@@ -1867,7 +1876,7 @@ impl Coordinator {
                 // Counted again in the commit, it has no room after all:
                 // decide once more without it.
                 PlaceOutcome::WorkerFull(_) => round.close(&winner, Exclusion::Full),
-                PlaceOutcome::NotQueued => return Ok(()),
+                PlaceOutcome::NotQueued | PlaceOutcome::MatrixFull => return Ok(()),
                 PlaceOutcome::Unbuildable(why) => {
                     // This task only; the ones behind it are placed.
                     return self.note_unplaceable(task, why).await;
@@ -1988,6 +1997,7 @@ fn check_spec(
     lease_ms: u64,
 ) -> Result<()> {
     let input = PlaceInput {
+        permit_id: None,
         run_id: run_id.clone(),
         task_id: task_id.clone(),
         generation: Generation(1),
