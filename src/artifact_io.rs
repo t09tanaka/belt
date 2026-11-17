@@ -920,6 +920,36 @@ mod tests {
     }
 
     #[test]
+    fn a_host_rejection_keeps_the_selected_file_out_of_the_artifact_area() {
+        let scratch = tempfile::tempdir().unwrap();
+        let workspace = scratch.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        fs::write(workspace.join("secret.env"), b"protected").unwrap();
+        let area = Area::of_run(&scratch.path().join("run"), "plan", "ci");
+        let who = Who {
+            job: "ci::build".into(),
+            display: "build".into(),
+            task: None,
+        };
+        let reason = upload_checked(
+            &area,
+            &who,
+            &workspace,
+            &[("path".into(), "secret.env".into())],
+            |path, meta, bytes| {
+                assert_eq!(path, "secret.env");
+                assert!(meta.is_file());
+                assert_eq!(bytes, b"protected");
+                Err("protected file".into())
+            },
+        )
+        .unwrap_err();
+        assert!(reason.contains("protected file"));
+        assert!(!area.root.join("artifact/v1/files/secret.env").exists());
+        assert!(published_names_in(&area.root).is_empty());
+    }
+
+    #[test]
     fn a_read_refuses_a_symlink_at_the_end_in_the_middle_or_a_non_file() {
         let t = tempfile::tempdir().unwrap();
         let ws = t.path().join("ws");

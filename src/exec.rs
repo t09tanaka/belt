@@ -3941,8 +3941,10 @@ impl<'a> Runner<'a> {
             workspace: ws,
             with: &with,
             step_index,
-            variant: cm
-                .get("strategy")
+            variant: job
+                .matrix
+                .as_ref()
+                .and_then(|_| cm.get("strategy"))
                 .and_then(|s| s.get("job-index"))
                 .and_then(Value::as_u64),
             cancel: &self.ctx.cancel,
