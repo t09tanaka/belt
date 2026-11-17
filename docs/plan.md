@@ -1160,32 +1160,44 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 
 この変更では、どちらも実装していない。再開の順序の案は、(a)〜(c) の設計を決める、local-ci の Driver を現在の main へ載せ直して公開し RTR の依存を別の変更で上げる、その上で (1) `ci` の実行 driver と worker 側の CI task 実行・needs output・A10 の接続・A38 のうち結果と output の分、(2) matrix の permit・max-parallel・fail-fast・join・集約と展開 event・A27、(3) 中間 artifact の receipt と A38 の artifact の分、である。(a) は Driver の公開を待たずに始められる。S16 の必須範囲は変えない。
 
-### S16 (1) の前半: worker 側の CI task の実行（2026-11-17、main `cc4cc9c` 起点）
+### S16 (1) の前半: worker 側の CI task の実行（2026-11-17、main `cc4cc9c` 起点。同日、PR #64 のレビュー指摘を反映）
 
-上の (a) の設計の決定（payload `CiTask`、feature `ci_task_v1`、supervisor が `execute_pinned_task` を呼ぶ）のうち、worker 側を実装した。親の側（`ci` の実行、DAG の進行、needs output の受け渡し、forecast への接続）は次の変更で行う。
+上の (a) の設計の決定（payload `CiTask`、feature `ci_task_v1`、supervisor が `execute_pinned_task` を呼ぶ）のうち、worker 側を実装した。親の側（`ci` の実行、DAG の進行、needs output の受け渡し、forecast への接続）と FrozenPlan の配送は次の変更で行う。
 
 実装したもの:
 
-- wire: `AttemptPayload.ci_task`（`CiTask { plan_digest, task_id, inputs }`）。無いときは書き出さないので、既存の payload の canonical JSON と hash は変わらない。`hello` の feature `ci_task_v1` は提供するが要求しない。交渉していない接続からの CI task は `PROTOCOL_INCOMPATIBLE` で断る。
-- worker の受理: CI task は `commands` を持たない。`in_place`・secret bundle・prepared setup を伴う CI task は、受理の時点で理由を付けて断る（下の制約）。
-- agent（`src/worker/agent.rs` は振り分けの分岐だけ。本体は `src/worker/ci_task.rs`）: 届いている FrozenPlan の bytes を digest で照合し、task がその plan に有ること・inputs が読めることを確かめてから、supervisor の spec に `ci` を入れる。`commands` が空でも `prepared_only`（command 無しの成功）にはしない。
-- supervisor（`src/supervisor/ci_task.rs`、local-ci との接続は `src/ci/execute.rs`）: `execute_pinned_task` を別 thread で呼び、`StepExecutor` として受けた各 step を、exec の command と同じ `run_node`（task-traffic-controller の登録と admission、launch の claim、spool への mask 済みの出力、timeout、停止と停止確認）で 1 つずつ node として実行する。local-ci は step の process を起動も signal もしない（cancel handle には process group を渡さないので、cancel は flag を立てるだけになる）。service container の docker や git など、step 以外の補助 process は local-ci が自分で起動する。停止理由（cancel・lease 失効・timeout）か停止未確認が 1 度出たら、`if: always()` の step も含めて以後の step は起動しない。
-- 結果: task の結果（`WireTaskResult`。job ごとの結果と `outputs`）を、attempt の artifact `rtr-ci-task-result.json` として既存の artifact と collection の経路で親へ返す。secret の値を含む結果は artifact として残さない。attempt の終了は、停止理由が有ればそれ、無ければ job の結果（failure か cancelled が 1 つでも有れば exit 1 の failed、skipped は失敗にしない）、task を実行できなかったとき（plan の digest 不一致、workspace が source と一致しない等）は exit 無しの failed と event `ci_task_failed`。
+- wire: `AttemptPayload.ci_task`（`CiTask { plan_digest, task_id, inputs }`）。無いときは書き出さないので、既存の payload の canonical JSON と hash は変わらない。交渉していない接続からの CI task は `PROTOCOL_INCOMPATIBLE` で断る。
+- feature `ci_task_v1` は、この変更では `SUPPORTED_FEATURES` に入れない。FrozenPlan の配送と一緒に次の変更で提供する（plan を受け取れない worker が CI task を引き受けないようにするため）。worker 側の実装とテストは残し、テストは `worker::serve::serve_connection_offering` で feature を有効にした接続を組み立てて行う。
+- worker の受理: CI task は `commands` を持たない。次のものは受理の時点で理由を付けて断る（`INVALID_INPUT`）。`in_place`・secret bundle・prepared setup（下の制約）。4 MiB を超える inputs。結果の artifact の名前 `rtr-ci-task-result.json`（とその配下）を名前に持つ artifact・output の宣言。plan が届いていれば、`services:` を持つ task（下の残件）と、digest に合わない plan。
+- agent（`src/worker/agent.rs` は振り分けの分岐 3 か所と、受理の `check_accepted`・GC の `gc_plans`・forecast の `answer` に state dir を渡す各 1 行。本体は `src/worker/ci_task.rs`）: 届いている FrozenPlan の bytes を digest で照合し、task がその plan に有ること・inputs が読めることを確かめてから、supervisor の spec に `ci` を入れる。`commands` が空でも `prepared_only`（command 無しの成功）にはしない。
+- supervisor（`src/supervisor/ci_task.rs`、local-ci との接続は `src/ci/execute.rs`）: `execute_pinned_task` を別 thread で呼び、`StepExecutor` として受けた各 step を、exec の command と同じ `run_node`（task-traffic-controller の登録と admission、launch の claim、spool への mask 済みの出力、timeout、停止と停止確認）で 1 つずつ node として実行する。local-ci は step の process を起動も signal もしない（cancel handle には process group を渡さない）。service container の docker や git など、step 以外の補助 process は local-ci が自分で起動する。
+- step の外の監視: core が step を求めていない間も、`poll_ms` ごとに取消要求・lease・attempt の deadline を見る（`Control::look_between_nodes`）。lease の更新は step の外でも反映するので、step の外の作業が lease より長くても、更新されている attempt は失効しない。止める理由が出たら、`ExecContext` に入れた `CancelHandle` で core を止める。
+- attempt を終わらせるもの: cancel・lease 失効・attempt の deadline・資源待ちの timeout・spool の失敗・停止未確認。これらの後は `if: always()` の step も起動しない。step や job の `timeout-minutes`（と、上限としての親の `command_timeout_ms`。小さい方）が切れた step は、止めて停止を確認したうえで `StepEnd::Timeout` として core に返し、続けるかどうかは core が決める。
+- 時間: `NodeEnd` が待ちの時間と実行の時間を分けて持つ。core へは `run_secs`（実行だけ）と `queue_wait_secs` を返す。
+- 結果: task の結果（`WireTaskResult`。job ごとの結果と `outputs`）を、attempt の artifact `rtr-ci-task-result.json` として既存の artifact と collection の経路で親へ返す。secret の値を含む結果は artifact として残さない。outcomes が下流の inputs の上限（`MAX_INPUT_BYTES`、4 MiB）を超える task は、実行した worker で失敗にする。step を 1 つも開始しなかった task は結果だけを残し、宣言済みの artifact と output は探さない（spec 13 章に例外として記載）。attempt の終了は、止める理由が有ればそれ、無ければ job の結果（failure か cancelled が 1 つでも有れば exit 1 の failed、skipped は失敗にしない）、task を実行できなかったときは exit 無しの failed と event `ci_task_failed`。
+- plan の置き場 `<state_dir>/ci-plans/`: mode 0700（既に有るディレクトリも揃える）、256 件・合計 1 GiB まで。未完了の attempt が参照せず、置かれてから保持期間（`retention_ms`）を過ぎた plan は、attempt の GC（`Agent::gc`）と一緒に消す。
+- 回復: lost した supervisor の step の FIFO は、`launches` の step の番号から引いて消す。step の command id は `step-N` の番号から引く（`recover::launched_index`）。
+- forecast: 受理済みで未開始の CI task は、plan の `plan_task_demand` が挙げる command の数だけ `step-N` の future demand を出す（worker 側）。
 
-テスト（network に出ない・時計に依らない。実際の workflow ファイルと実 process）: `ci::execute` 4 件（Directory の source、dirty な Git worktree の source を worker と同じ手順（clone・bundle・worktree・HEAD と index の再現）で作った workspace、source と一致しない workspace、別の source の plan）、`supervisor::ci_task` 5 件と `run_tests` 8 件（needs の連鎖を別 attempt・別 workspace で実行して output が渡ること、mask、失敗、source と一致しない workspace、digest 不一致、開始前の cancel、条件で skipped になった job の結果、step が 1 つも無いときの cancel）、`worker::ci_task` 5 件、wire 1 件、agent の統合 2 件。
+テスト（network に出ない。実際の workflow ファイルと実 process）: `ci::execute` 4 件、`supervisor::ci_task` 9 件と `run_tests` 24 件（needs の連鎖、mask、失敗、digest 不一致、開始前の cancel、skipped、step の外で lease の 3 倍かかっても更新された lease が保たれること、step の外での cancel・lease 失効・deadline、step の最中の cancel・lease 失効・deadline の後に `always()` が動かないこと、`timeout-minutes` の後に `if: failure()` と `if: always()` が動くこと、親の上限、`script_pipe` の step の error、secret を含む結果の拒否、step 無しの task の artifact、回復での FIFO と `step-N`）、`worker::ci_task` 14 件（services の拒否、予約名、inputs の上限、plan の上限・mode・GC、profile と binding の `base_env`）、forecast 2 件、wire 1 件、agent の統合 6 件（未交渉の拒否、実際の agent と host から supervisor の binary まで通して needs の 2 task を成功させる 1 件、supervisor を kill した後の回復、services の拒否）。
 
-この変更で分かった制約（local-ci 0.13.0 の公開 API による。設計の判断が要る）:
+この変更で分かった制約（local-ci 0.13.0 の公開 API による）:
 
-- `PinnedExecution::verify_workspace` は、workspace が captured source と byte 単位で一致するときだけ束縛する（secret の配置と setup の前に呼ぶ契約）。束縛（`PinnedWorkspace`）は process 内の値で、supervisor の process でしか作れない。RTR は agent が secret bundle の配置と prepared setup の複製を済ませてから supervisor を起動するので、secret_files を持つ source・prepared setup・fast-worktree の `[[clone]]` で依存を複製する worktree では束縛できない。この変更では、secret bundle・prepared setup・in-place を伴う CI task を受理の時点で断り（理由の文言に local-ci の束縛の拡張待ちであることを入れた）、束縛できない workspace は step を起動せずに failed にする。決定（2026-11-17、親）: local-ci の側に、宣言された上書き（manifest の secret_files の path、prepared setup の出力、`[[clone]]` で複製した依存の path）を除いて照合する束縛を足す。RTR の側で順序を変える回避はしない。その API が出たら、受理の拒否を外して束縛を差し替える。
-- Git worktree の source のテストは、fast-worktree の代わりに Git だけの代役（依存を複製しない）で workspace を作っている。実物の fast-worktree が `[[clone]]` や `post_add` で workspace に何かを足した場合は束縛できず（上の拡張待ち）、テストもしていない。
-- step や job の `timeout-minutes` が切れると、その step を失敗にして `if: failure()` の step を続けるのではなく、attempt 全体が timed_out で終わる（timeout を supervisor の停止理由として扱うため）。cancel・lease・deadline は step の実行中と次の step の admission で見ており、step と step の間では見ていない。
-- テストしていないもの: 交渉していない接続からの CI task を `worker/serve.rs` が断ること、再起動した supervisor の recover が `step-N` の node を引くこと（名前の解析だけテスト済み）、profile や toolchain の binding が有るときの `base_env`、plan と inputs の大きさの上限（`store_plan` の上限だけテスト済み）。
+- `PinnedExecution::verify_workspace` は、workspace が captured source と byte 単位で一致するときだけ束縛する（secret の配置と setup の前に呼ぶ契約）。束縛（`PinnedWorkspace`）は process 内の値で、supervisor の process でしか作れない。RTR は agent が secret bundle の配置と prepared setup の複製を済ませてから supervisor を起動するので、secret_files を持つ source・prepared setup・fast-worktree の `[[clone]]` で依存を複製する worktree では束縛できない。この変更では、secret bundle・prepared setup・in-place を伴う CI task を受理の時点で断り、束縛できない workspace は step を起動せずに failed にする。決定（2026-11-17、親）: local-ci の側に、宣言された上書きを除いて照合する束縛を足す。RTR の側で順序を変える回避はしない。その API が出たら、受理の拒否を外して束縛を差し替える。
+- Git worktree の source のテストは、fast-worktree の代わりに Git だけの代役（依存を複製しない）で workspace を作っている。実物の fast-worktree が `[[clone]]` や `post_add` で workspace に何かを足した場合は束縛できず、テストもしていない。
+- core を止められるのは、core が cancel handle を見る箇所だけである。`verify_workspace` の途中など handle を見ない区間は止まらず、supervisor は core の thread が戻るのを待つ。取消要求の永続化から handle の cancel までは最大 `poll_ms` かかり、その間に core が補助 process（git など）を起動しうる（step は database の claim が断るので起動しない）。
+- `timeout-minutes` が切れた step に `continue-on-error: true` が付いていても、local-ci 0.13.0 の core は job を失敗として扱う（GitHub Actions とは違う）。RTR は step の結果を返すだけで、この扱いは変えていない。
+- 資源待ちの timeout（`resource_wait_timeout_ms`）は plan の `timeout-minutes` ではなく attempt の予算なので、attempt を終わらせる扱いにしている。
 - step の script を pipe から読む step（GitHub token を持つ script）は、task-traffic-controller の起動経路で fd を渡せないので実行できず、その step は error になる。
 - matrix の variant ごとの workspace（`PinnedWorkspaceProvider::fork`）は `RefusePinnedForks` で断る（(2) の区切り）。portool と service container の同時実行数は local-ci の既定に任せていない（`portool: None`・`containers: 1`）。
-- step が admission を待った時間を `queue_wait_secs` として local-ci へ返していない（job の時間に待ちが含まれる）。
 - supervisor が再起動した CI task は、既存の recover の経路で終わる（step の続きからは再開しない）。
+- forecast の `step-N` の数は plan から数える。`if:` で飛ばされた step が有ると、実際の番号とずれる（余った demand は attempt の終了まで残る）。forecast の要求のたびに、未完了の CI task の plan を読み直す（cache は無い）。
+- inputs の上限 4 MiB は、接続の frame の上限（2 MiB）より大きい。今の wire では、2 MiB を超える inputs は frame で断られる。
+- テストしていないもの: step の停止を確認できなかった場合の end to end（`ends_attempt` の単体だけ）、core が handle を見ない区間で止まらないこと。
 
 残り（S16 (1) の後半、次の変更）:
 
-- FrozenPlan の bytes の配送。worker は `<state_dir>/ci-plans/<sha256>.json` に置かれた bytes を使う（`worker::ci_task::store_plan`）。`blob_put` の経路に plan 用の種類を足して親から届けるところは未実装で、届いていない plan の attempt は準備で失敗する（`NOT_FOUND`）。
-- 親の側: `ci` の実行（`src/cli.rs` と `tests/it/not_implemented.rs` の 2 行）、`TaskSpec` への `ci_task` の追加と `build_payload`、`ci_task_v1` の無い worker の除外と placement への理由の記録、Driver と同じ形の trait の後ろに置く run の進行（needs の DAG、上流の成功後だけ下流を配置、失敗時の skipped、cancel）、needs output を下流の `inputs` へ入れること、`plan_task_demand` から `WorkloadPlan` を作って配置時の forecast に渡すこと（A10 の S16 分）、A38 のうち結果と output の分のテスト。
+- FrozenPlan の bytes の配送と、feature `ci_task_v1` の提供。worker は `<state_dir>/ci-plans/<sha256>.json` に置かれた bytes を使う（`worker::ci_task::store_plan`）。`blob_put` の経路に plan 用の種類を足して親から届けるところは未実装で、届いていない plan の attempt は準備で失敗する（`NOT_FOUND`）。配送を入れる変更で `ci_task_v1` を `SUPPORTED_FEATURES` に入れる。
+- `services:` を持つ task の実行。今は受理で断る。supervisor が失われたとき、core が起動した container と compose project を recover で止める実装（core の `CancelHandle` が持つ名前を attempt に記録し、recover で止める）を入れてから、拒否を外す。
+- 親の側の回収: `ci_task` を持つ payload では、結果の artifact `rtr-ci-task-result.json` を必須（required）として扱う（`results/collect.rs` の `declared_of` は今 `payload.artifacts` だけを見る。worker は `ArtifactDecl` でこの名前を宣言できない）。宣言が 1024 件のとき、結果を足すと 1025 件になる点も合わせて決める。偽の worker がこの artifact だけを返すテストを付ける。
+- 親の側: `ci` の実行（`src/cli.rs` と `tests/it/not_implemented.rs` の 2 行）、`TaskSpec` への `ci_task` の追加と `build_payload`、`ci_task_v1` の無い worker の除外と placement への理由の記録、Driver と同じ形の trait の後ろに置く run の進行（needs の DAG、上流の成功後だけ下流を配置、失敗時の skipped、cancel）、needs output を下流の `inputs` へ入れること（複数の上流の合計が上限を超える場合の扱いを含む）、`plan_task_demand` から `WorkloadPlan` を作って配置時の forecast に渡すこと（A10 の S16 分）、A38 のうち結果と output の分のテスト。
