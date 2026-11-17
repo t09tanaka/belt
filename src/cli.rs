@@ -21,6 +21,13 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Register the root-owned service definition for a non-root worker.
+    RegisterSystemWorker {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        config_dir: std::path::PathBuf,
+    },
     /// Run one admitted private tool installer (internal).
     #[command(hide = true)]
     ToolchainInstall {
@@ -286,6 +293,9 @@ pub struct WorkerServiceArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkerArgs {
+    /// Start from the administrator-registered, version-independent definition.
+    #[arg(long, requires = "input")]
+    pub system_service: bool,
     /// Speak the protocol over stdin/stdout.
     #[arg(long)]
     pub stdio: bool,
@@ -403,8 +413,31 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::Daemon(args) = &cli.command {
         return crate::service::bootstrap::daemon_main(args.input.as_deref());
     }
+    if let Command::RegisterSystemWorker {
+        account,
+        config_dir,
+    } = &cli.command
+    {
+        return match crate::service::worker_service::system_user::register(account, config_dir) {
+            Ok(path) => {
+                println!("{}", path.display());
+                0
+            }
+            Err(error) => {
+                eprintln!("{error:#}");
+                1
+            }
+        };
+    }
     if let Command::Worker(args) = &cli.command {
         if let Some(input) = &args.input {
+            if args.system_service {
+                if let Err(error) = crate::service::worker_service::system_user::check_start(input)
+                {
+                    eprintln!("{error:#}");
+                    return 1;
+                }
+            }
             return crate::service::worker::main(input);
         }
         if let (true, Some(cluster), Some(name), Some(key_file)) =

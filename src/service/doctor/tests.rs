@@ -591,6 +591,7 @@ fn one_engine_reached_from_two_hosts_fails_on_both() {
 
 fn status(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
     Status {
+        system_user: false,
         worker_id: WorkerId::parse("mini-a").unwrap(),
         cluster: ClusterId::generate(),
         binary_sha256: "a".repeat(64),
@@ -1118,6 +1119,7 @@ fn a_worker_host_is_viewed_through_its_recorded_service_environment() {
     // Nothing installed: there is no service to look at.
     assert!(service_view(&env, fake.clone()).is_err());
     let request = InstallRequest {
+        system_user: false,
         schema: 1,
         cluster: ClusterId::generate(),
         worker_id: WorkerId::parse("mini-a").unwrap(),
@@ -1803,4 +1805,21 @@ fn an_ephemeral_worker_that_is_not_running_is_a_notice_and_its_environment_is_no
     )
     .unwrap();
     assert_eq!(asked, ["mini-a"]);
+}
+
+#[test]
+fn doctor_reports_a_mismatch_between_registered_and_installed_service_modes() {
+    let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
+    w.remote
+        .hosts
+        .get_mut("ci@mini-a.local")
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .2
+        .system_user = true;
+    let report = w.run();
+    let reachable = of(&report, "mini-a", "reachable");
+    assert_eq!(reachable.level, Level::Fail);
+    assert!(reachable.detail.contains("installed service mode differs"));
 }

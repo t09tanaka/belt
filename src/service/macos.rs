@@ -122,6 +122,17 @@ pub struct Receipt {
     digest: [u8; 32],
 }
 impl Receipt {
+    /// A system definition independently checked against the expected plan and
+    /// the root-owned file on disk. It remains under administrator ownership.
+    pub(super) fn system(path: PathBuf, metadata: &std::fs::Metadata, digest: [u8; 32]) -> Self {
+        Self {
+            path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            uid: metadata.uid(),
+            digest,
+        }
+    }
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -418,7 +429,7 @@ pub struct InstallStartError {
     source: anyhow::Error,
 }
 impl InstallStartError {
-    fn without_receipt(source: anyhow::Error) -> Self {
+    pub(super) fn without_receipt(source: anyhow::Error) -> Self {
         Self {
             receipt: None,
             source,

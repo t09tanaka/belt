@@ -276,6 +276,7 @@ impl World {
         fake.0.borrow_mut().state = paths.state.clone();
         let old = sha256_file(&old_exe).unwrap();
         let request = InstallRequest {
+            system_user: false,
             schema: 1,
             cluster: cluster.clone(),
             worker_id: WorkerId::parse("mini-a").unwrap(),
@@ -1339,6 +1340,7 @@ fn a_registration_without_a_binary_path_gains_it_after_the_check() {
 
 fn status(version: &str, from: Option<&str>) -> Status {
     Status {
+        system_user: false,
         worker_id: WorkerId::parse("mini-a").unwrap(),
         cluster: ClusterId::generate(),
         binary_sha256: version.into(),
