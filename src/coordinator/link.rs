@@ -34,6 +34,9 @@ pub struct InputGate {
     commit: std::sync::Arc<tokio::sync::Mutex<()>>,
     transport_policy: Option<String>,
     preferences: std::sync::Mutex<super::prefetch::Preferences>,
+    /// The connection negotiated `ci_task_v1`: the frozen plan of a CI run
+    /// is delivered with its source.
+    ci_task: std::sync::atomic::AtomicBool,
 }
 impl Default for InputGate {
     fn default() -> Self {
@@ -42,6 +45,7 @@ impl Default for InputGate {
             commit: std::sync::Arc::default(),
             transport_policy: None,
             preferences: std::sync::Mutex::default(),
+            ci_task: std::sync::atomic::AtomicBool::new(false),
         }
     }
 }
@@ -51,6 +55,13 @@ impl InputGate {
             transport_policy: Some(policy),
             ..Self::default()
         }
+    }
+    pub fn set_ci_task(&self, negotiated: bool) {
+        self.ci_task
+            .store(negotiated, std::sync::atomic::Ordering::Relaxed);
+    }
+    pub fn ci_task(&self) -> bool {
+        self.ci_task.load(std::sync::atomic::Ordering::Relaxed)
     }
     pub fn cost_transport(&self) -> Option<crate::scheduler::measured::Transport> {
         let (worker_boot, agent_epoch) = self.placement_inputs().identity?;
@@ -177,6 +188,11 @@ pub trait WorkerLink: Send + Sync {
     fn env_sync_negotiated(&self) -> bool {
         false
     }
+    /// The worker takes CI tasks and the frozen plan they name (hello
+    /// feature `ci_task_v1`). A worker that does not is given none.
+    fn ci_task_negotiated(&self) -> bool {
+        false
+    }
 
     fn cold_eligible(&self, _task: &crate::ids::TaskId) -> bool {
         false
@@ -220,6 +236,7 @@ pub struct ClientLink {
     preparation_observations: bool,
     preparation_probe: bool,
     env_sync: bool,
+    ci_task: bool,
 }
 
 impl ClientLink {
@@ -231,6 +248,7 @@ impl ClientLink {
             preparation_observations: false,
             preparation_probe: false,
             env_sync: false,
+            ci_task: false,
         }
     }
 }
@@ -244,6 +262,7 @@ impl ClientLink {
             preparation_observations: false,
             preparation_probe: false,
             env_sync: false,
+            ci_task: false,
         }
     }
 }
@@ -260,6 +279,10 @@ impl ClientLink {
         self.env_sync = negotiated;
         self
     }
+    pub fn with_ci_task(mut self, negotiated: bool) -> Self {
+        self.ci_task = negotiated;
+        self
+    }
 }
 impl WorkerLink for ClientLink {
     fn preparation_probe_negotiated(&self) -> bool {
@@ -270,6 +293,9 @@ impl WorkerLink for ClientLink {
     }
     fn env_sync_negotiated(&self) -> bool {
         self.env_sync
+    }
+    fn ci_task_negotiated(&self) -> bool {
+        self.ci_task
     }
 
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {
@@ -348,6 +374,9 @@ impl WorkerLink for Budgeted {
     }
     fn env_sync_negotiated(&self) -> bool {
         self.inner.env_sync_negotiated()
+    }
+    fn ci_task_negotiated(&self) -> bool {
+        self.inner.ci_task_negotiated()
     }
 
     fn cold_eligible(&self, task: &crate::ids::TaskId) -> bool {

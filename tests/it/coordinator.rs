@@ -669,6 +669,7 @@ impl Fx {
 
 pub(crate) fn spec() -> TaskSpec {
     TaskSpec {
+        ci: None,
         toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),

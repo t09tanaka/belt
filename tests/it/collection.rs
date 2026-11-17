@@ -559,6 +559,7 @@ fn decl(name: &str, if_missing: MissingPolicy) -> ArtifactDecl {
 
 fn spec(artifacts: Vec<ArtifactDecl>) -> TaskSpec {
     TaskSpec {
+        ci: None,
         toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),

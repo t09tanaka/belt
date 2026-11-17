@@ -554,6 +554,7 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
             tasks: vec![(
                 TaskId::generate(),
                 TaskSpec {
+                    ci: None,
                     toolchains: None,
                     outputs: Vec::new(),
                     requirements: Default::default(),
@@ -888,6 +889,7 @@ async fn delivery_resident_on(root: &Path, path: &str) -> Resident {
 }
 pub(super) fn delivery_spec(digest: Digest, secrets: bool) -> TaskSpec {
     TaskSpec {
+        ci: None,
         toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),

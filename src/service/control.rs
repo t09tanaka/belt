@@ -28,7 +28,7 @@ pub struct Report {
     pub cli_exit_code: i32,
     pub error: Option<ApiError>,
 }
-async fn interrupted(signals: &mut mpsc::UnboundedReceiver<()>) {
+pub(super) async fn interrupted(signals: &mut mpsc::UnboundedReceiver<()>) {
     if signals.recv().await.is_none() {
         std::future::pending::<()>().await;
     }

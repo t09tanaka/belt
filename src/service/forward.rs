@@ -244,6 +244,40 @@ pub(super) async fn verify(
         _ => anyhow::bail!("unexpected source verification answer"),
     }
 }
+/// Deliver the frozen plan of a CI run: the bytes the parent keeps under
+/// `digest` in `state`, as a blob of its own kind, 64 KiB at a time. The
+/// worker keeps them only when they hash to the digest; one that holds the
+/// plan already answers at once (and counts it as delivered now). Only for a
+/// connection that negotiated `ci_task_v1`.
+pub(super) async fn plan(
+    client: &Client,
+    epoch: CoordinatorEpoch,
+    state: &std::path::Path,
+    source: &SourceId,
+    digest: &Digest,
+) -> anyhow::Result<()> {
+    let (dir, wanted) = (state.to_owned(), digest.clone());
+    let bytes = tokio::task::spawn_blocking(move || crate::ci::advance::plan_bytes(&dir, &wanted))
+        .await?
+        .map_err(anyhow::Error::msg)?;
+    let size = bytes.len() as u64;
+    let answer = put_blob_reader_as(
+        client,
+        epoch,
+        source,
+        SourceBlobKind::Plan,
+        std::io::Cursor::new(bytes),
+        digest.clone(),
+        size,
+        0,
+        64 * 1024,
+        TIMEOUT,
+    )
+    .await?;
+    anyhow::ensure!(answer.complete, "plan transfer incomplete");
+    Ok(())
+}
+
 /// Shared by source forwarding and retry. Future source/Vault GC must hold this
 /// same cross-process lease; blocking IO retains an Arc until it has drained.
 pub(super) async fn lease(

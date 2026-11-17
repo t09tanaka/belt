@@ -69,6 +69,18 @@ pub fn store_plan(state_dir: &Path, bytes: &[u8]) -> std::io::Result<Digest> {
     store_plan_within(state_dir, bytes, limits)
 }
 
+/// [`store_plan`] for the parent's own copy of the plans of its runs: one
+/// per run that is retained, so their number is not bounded here (the
+/// parent removes them with [`sweep_plans`]).
+pub fn keep_plan(state_dir: &Path, bytes: &[u8]) -> std::io::Result<Digest> {
+    let limits = PlanLimits {
+        one: MAX_PLAN_BYTES,
+        count: usize::MAX,
+        total: u64::MAX,
+    };
+    store_plan_within(state_dir, bytes, limits)
+}
+
 #[derive(Debug, Clone, Copy)]
 struct PlanLimits {
     one: u64,

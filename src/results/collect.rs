@@ -182,10 +182,22 @@ fn declared_of(payload: &Option<Value>) -> std::result::Result<Declared, &'stati
             .artifacts
             .iter()
             .map(|d| (d.name.clone(), d.if_missing == MissingPolicy::Required))
+            .chain(ci_result_of(&payload))
             .collect(),
         node: payload.commands.first().map(|c| c.node_id.clone()),
         payload,
     })
+}
+
+/// The result of a CI task (the outcomes and outputs of its jobs) is an
+/// artifact its payload cannot declare (the name is reserved) and the parent
+/// requires: without it the jobs that need the task's cannot be given their
+/// inputs, so the task is not a success.
+fn ci_result_of(payload: &AttemptPayload) -> Option<(String, bool)> {
+    payload
+        .ci_task
+        .as_ref()
+        .map(|_| (crate::supervisor::ci_task::RESULT_ARTIFACT.to_string(), true))
 }
 
 impl Declared {

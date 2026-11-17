@@ -113,6 +113,14 @@ impl ResolvedConfig {
             .features
             .iter()
             .any(|feature| feature == crate::wire::ENV_SYNC_FEATURE);
+        let ci_task = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|feature| feature == crate::wire::CI_TASK_FEATURE);
+        if let Some(gate) = &gate {
+            gate.set_ci_task(ci_task);
+        }
         let link: Arc<dyn crate::coordinator::WorkerLink> = Arc::new(
             (match gate {
                 Some(gate) => ClientLink::gated(connected.client, timeout, gate),
@@ -120,7 +128,8 @@ impl ResolvedConfig {
             })
             .with_preparation_observations(observations)
             .with_preparation_probe(probe)
-            .with_env_sync(env_sync),
+            .with_env_sync(env_sync)
+            .with_ci_task(ci_task),
         );
         coordinator.attach(id.clone(), link.clone()).await;
         Ok(link)

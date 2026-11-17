@@ -180,6 +180,23 @@ pub(super) async fn sources(
                     }
                 }
             };
+            // The frozen plan of a CI run goes with its source, before a task
+            // of the run can be placed here. A worker that does not take CI
+            // tasks is sent none (and is given no task of the run).
+            let delivered = delivered
+                && match spec.ci.as_ref().filter(|_| gate.ci_task()) {
+                    None => true,
+                    Some(ci) => {
+                        let sent = super::super::forward::plan(
+                            &worker,
+                            coordinator.epoch(),
+                            &capture.parent_state,
+                            &input.source_id,
+                            &ci.task.plan_digest,
+                        );
+                        tokio::select! { _=input_stop.changed()=>return Ok(()), sent=sent=>sent.is_ok() }
+                    }
+                };
             if !delivered {
                 gate.fail_preference(&input.run_id);
             }

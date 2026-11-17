@@ -23,6 +23,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot, watch, Mutex, Semaphore};
 use tokio::task::JoinSet;
 
+mod ci_runs;
 mod delivery;
 mod input_retention;
 mod remote;
@@ -219,6 +220,16 @@ impl Operation {
             _ => false,
         }
     }
+    /// A run of CI tasks: a resident that does not know them must refuse the
+    /// request, not read the tasks as tasks without commands.
+    fn requires_ci(&self) -> bool {
+        match self {
+            Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
+                tasks.iter().any(|(_, spec)| spec.ci.is_some())
+            }
+            _ => false,
+        }
+    }
     fn requires_capabilities(&self) -> bool {
         match self {
             Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
@@ -294,7 +305,9 @@ impl Client {
             IO_TIMEOUT
         };
         let request = Request {
-            schema_version: if operation.requires_toolchains() {
+            schema_version: if operation.requires_ci() {
+                5
+            } else if operation.requires_toolchains() {
                 4
             } else if operation.requires_capabilities() {
                 3
@@ -644,6 +657,13 @@ async fn connect_local(
     let input_gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(
         provenance.to_string(),
     ));
+    input_gate.set_ci_task(
+        connected
+            .negotiated
+            .features
+            .iter()
+            .any(|feature| feature == crate::wire::CI_TASK_FEATURE),
+    );
     input_gate
         .observe(
             connected.worker.worker_boot_id.clone(),
@@ -734,7 +754,8 @@ impl Resident {
                     )
                     .with_preparation_observations(observations)
                     .with_preparation_probe(probe)
-                    .with_env_sync(env_sync),
+                    .with_env_sync(env_sync)
+                    .with_ci_task(input_gate.ci_task()),
                 ),
             )
             .await;
@@ -824,6 +845,13 @@ impl Resident {
                 if let Err(e) = coordinator.collect_stopping(&files, collection, Some(collect_stop.clone())).await { let _ = stop_collect.send(true); return Err(e.into()); }
             }
         });
+        loops.spawn(ci_runs::run(
+            self.coordinator.clone(),
+            self.captured.parent_state.clone(),
+            heartbeat,
+            self.retention_days,
+            rx.clone(),
+        ));
         #[cfg(not(test))]
         let gc_cadence = Duration::from_secs(60);
         #[cfg(test)]
@@ -1095,7 +1123,8 @@ async fn handle(
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
-        matches!(request.schema_version, 2..=4)
+        matches!(request.schema_version, 2..=5)
+            && (request.schema_version >= 5 || !request.operation.requires_ci())
             && (request.schema_version >= 3 || !request.operation.requires_capabilities())
             && (request.schema_version >= 4 || !request.operation.requires_toolchains())
             && request.cluster_id == client.cluster_id

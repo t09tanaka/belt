@@ -210,6 +210,7 @@ pub async fn command_with_mode(
         .collect();
     crate::outputs::validate(&[], &outputs).map_err(|e| invalid(e.into()))?;
     let mut spec = TaskSpec {
+        ci: None,
         toolchains: toolchains.clone(),
         requirements: requirements.clone(),
         in_place,

@@ -227,6 +227,45 @@ pub fn may_send(facts: Facts) -> bool {
     !facts.cancel_requested && !facts.retire_requested
 }
 
+/// What a worker that cannot be given a CI task lacks, as a placement
+/// records it for the worker it left out.
+pub const CI_TASK_UNMET: &str = "protocol feature ci_task_v1";
+
+/// Is a worker left out of the placement of `spec` because the task is a CI
+/// task and its connection did not negotiate `ci_task_v1`?
+pub fn lacks_ci_task(spec: &super::TaskSpec, negotiated: bool) -> bool {
+    spec.ci.is_some() && !negotiated
+}
+
+/// The result of a CI task is one more required artifact of its attempt: do
+/// the declarations of the task leave room for it?
+pub fn ci_declarations_fit(artifacts: usize, outputs: usize) -> bool {
+    artifacts.saturating_add(outputs) < crate::outputs::MAX_OUTPUTS
+}
+
+/// The work a forecast is asked for: the commands of the task, or for a CI
+/// task the commands its plan says it starts (one node per step, in order).
+pub fn workload_of_spec(
+    attempt_id: &crate::ids::AttemptId,
+    spec: &super::TaskSpec,
+    ready_delay_ms: Option<u64>,
+) -> crate::wire::WorkloadPlan {
+    match &spec.ci {
+        Some(ci) => crate::scheduler::ci_workload_of(
+            attempt_id,
+            &spec.plan_digest,
+            ci.steps,
+            ready_delay_ms,
+        ),
+        None => crate::scheduler::workload_of(
+            attempt_id,
+            &spec.plan_digest,
+            &spec.commands,
+            ready_delay_ms,
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
