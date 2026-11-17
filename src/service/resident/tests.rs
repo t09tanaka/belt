@@ -1848,6 +1848,14 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
     let traffic = root.path().join(".local/state/task-traffic-controller");
     let before_traffic = files(&traffic);
     let before_epoch = coordinator.epoch();
+    // Every read asks the worker's inspection, which runs a subprocess per
+    // tool and lasts a third of a second at best. On a loaded machine a read
+    // can take longer than the production wait of one second, and the worker
+    // is then left out as unreached: this test is about what the reads
+    // preserve, not about that wait.
+    coordinator
+        .scheduler()
+        .set_forecast_wait_for_test(Duration::from_secs(60));
     let runner = tokio::spawn(resident.run());
     // One read holds its worker inspection for a live CPU sample of 300 ms
     // (task-traffic-controller), so 200 reads one after another cannot take
