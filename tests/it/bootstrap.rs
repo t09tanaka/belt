@@ -5661,7 +5661,10 @@ async fn a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_
     let run = remote_task_runner::ids::RunId::parse(run).unwrap();
     for row in store.ci_run_tasks(&run).unwrap() {
         let text = row.spec.to_string();
-        assert!(!text.contains("statuses") && !text.contains("other"), "{text}");
+        assert!(
+            !text.contains("statuses") && !text.contains("other"),
+            "{text}"
+        );
     }
     shutdown(&load(&spec)).await;
 }
