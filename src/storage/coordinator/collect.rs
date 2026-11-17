@@ -765,7 +765,7 @@ impl CoordinatorStore {
                 "0"
             };
             let mut s = c.prepare(&format!(
-                "SELECT task_id, {cancelled} FROM task WHERE run_id = ?1 ORDER BY rowid"
+                "SELECT task_id, {cancelled} FROM task WHERE run_id = ?1 AND coalesce(json_extract(spec_json,'$.ci.task.inputs.rtr_discovery.applied'),0)=0 ORDER BY rowid"
             ))?;
             let rows = s
                 .query_map([&run], |r| {
