@@ -267,17 +267,15 @@ pub fn install_nodes(
     attempt: &AttemptId,
     plan_digest: &PlanDigest,
     missing: usize,
-) -> Result<Vec<AcceptedNode>, &'static str> {
+) -> Vec<AcceptedNode> {
     (0..missing)
-        .map(|index| {
-            Ok(AcceptedNode {
-                attempt_id: attempt.clone(),
-                plan_digest: plan_digest.clone(),
-                node_id: NodeId::parse(&install_node_name(index))
-                    .map_err(|_| "an install has no node id")?,
-                command_id: format!("rtr-{attempt}-install-{index}"),
-                terminal: false,
-            })
+        .map(|index| AcceptedNode {
+            attempt_id: attempt.clone(),
+            plan_digest: plan_digest.clone(),
+            node_id: NodeId::parse(&install_node_name(index))
+                .expect("a fixed prefix and a decimal index form a valid node ID"),
+            command_id: format!("rtr-{attempt}-install-{index}"),
+            terminal: false,
         })
         .collect()
 }
@@ -940,8 +938,8 @@ mod tests {
     fn the_installs_an_attempt_waits_for_are_numbered_nodes_of_its_own() {
         let a = AttemptId::generate();
         let digest = Digest::of_bytes(b"plan");
-        assert_eq!(install_nodes(&a, &digest, 0), Ok(vec![]));
-        let nodes = install_nodes(&a, &digest, 2).unwrap();
+        assert!(install_nodes(&a, &digest, 0).is_empty());
+        let nodes = install_nodes(&a, &digest, 2);
         let names: Vec<&str> = nodes.iter().map(|n| n.node_id.as_str()).collect();
         assert_eq!(names, ["toolchain-install-0", "toolchain-install-1"]);
         for (index, node) in nodes.iter().enumerate() {
