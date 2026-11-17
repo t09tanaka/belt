@@ -927,6 +927,13 @@ fn normalize_probe_version(name: &str, value: &str) -> String {
 /// What `detect` answers for a root that holds no receipt: an installer began
 /// there and never published. Only an installer under `install.lock` may clear it.
 pub const UNRECEIPTED: &str = "installation_incomplete_or_unreceipted";
+/// The three ends of an install that the same version would meet again, and
+/// that are remembered for a while (`preparation::install_exit`): a command
+/// of the manager failed, a probe of what it installed did not answer the
+/// version, or something is mounted where an installer wrote.
+pub const COMMAND_FAILED: &str = "installation_command_failed";
+pub const VERSION_MISMATCH: &str = "installed_version_mismatch";
+pub const OTHER_DEVICE: &str = "installation_cleanup_other_device";
 
 /// A managed root, held by descriptors from the check to the last removal:
 /// what is done to it afterwards names nothing by path.
@@ -1110,16 +1117,20 @@ fn clear_unreceipted(managed: &ManagedRoot) -> Result<()> {
         return Ok(());
     }
     let failed = |_| "installation_partial_cleanup";
+    let other_device = |e| match e {
+        Errno::XDEV => OTHER_DEVICE,
+        _ => "installation_partial_cleanup",
+    };
     let trash = format!("{}{}", trash_prefix(&managed.name), ulid::Ulid::new());
     mkdirat(toolchains, &trash, Mode::RWXU).map_err(failed)?;
     let trash_fd = open_dir_at(toolchains, &trash).map_err(failed)?;
     for name in &entries {
-        renameat(&managed.root, name, &trash_fd, name).map_err(failed)?;
+        renameat(&managed.root, name, &trash_fd, name).map_err(other_device)?;
     }
     drop(trash_fd);
     let trash = CString::new(trash).map_err(|_| "installation_partial_cleanup")?;
     match remove_at(toolchains, &trash, managed.dev) {
-        Err(Errno::XDEV) => Err("installation_partial_cleanup"),
+        Err(e @ Errno::XDEV) => Err(other_device(e)),
         Ok(()) | Err(_) => Ok(()),
     }
 }
@@ -1249,7 +1260,7 @@ fn install_holding(
     for command in &plan.commands {
         let out = executor.execute(command)?;
         if !out.success {
-            return Err("installation_command_failed");
+            return Err(COMMAND_FAILED);
         }
         if out.stdout.len() > 8192 {
             return Err("installer_output_limit");
@@ -1259,7 +1270,7 @@ fn install_holding(
     for (name, command) in &plan.probes {
         let out = executor.execute(command)?;
         if !out.success || output_version(name, &out.stdout)? != plan.version {
-            return Err("installed_version_mismatch");
+            return Err(VERSION_MISMATCH);
         }
         probe_outputs.insert(name.clone(), Digest::of_bytes(&out.stdout));
     }

@@ -273,7 +273,8 @@ struct Inner {
     /// the reason: building again would end the same way, so the next
     /// consumer is told at once. Forgotten when the agent restarts.
     unkept: HashMap<String, String>,
-    /// Tool keys whose install failed by itself: for `tool_failure_hold_ms`
+    /// Tool keys whose install failed by itself (`policy::install_itself_failed`):
+    /// for `tool_failure_hold_ms`
     /// a new consumer is told the failure and no installer is started.
     /// Forgotten when the host tools change, when a warm-up asks for the
     /// version, and when the agent restarts.
@@ -727,7 +728,8 @@ impl Setups {
         let dir = std::fs::canonicalize(self.cfg.builders())
             .map_err(|e| PreparationFailure(e.to_string()))?
             .join(id.as_str());
-        // Whether a failure is one the installer made by itself.
+        // Whether a failure is one the installer made by itself: only what
+        // its helper's end says.
         let mut by_itself = false;
         let mut work = || -> Result<InstallationReceipt, String> {
             private_dir(&dir).map_err(|e| e.to_string())?;
@@ -758,13 +760,12 @@ impl Setups {
                 return Err("tool preparation cancelled".into());
             }
             let end = self.supervised(id, attempt, &dir, &store);
-            by_itself = policy::install_itself_failed(&end);
+            by_itself = policy::install_itself_failed(&end, preparation::INSTALL_FAILED_EXIT);
             if !end.is_built() {
                 return Err(end.describe());
             }
-            // The installer said it was done, and what it left is not an
-            // installation.
-            by_itself = true;
+            // What fails from here on (the root cannot be read, the receipt
+            // is not there) is not what the helper said: not remembered.
             let plan = request.plan(&self.private_tool_root().map_err(|e| e.message)?)?;
             match adapters::detect(&plan) {
                 Availability::Installed(receipt) => Ok(*receipt),

@@ -1153,3 +1153,13 @@ PR #59 の H1 修正（4 本目）へのレビューを受けて、toolchain の
 - spec §22.2 の削除の条件を、上に合わせて直した。
 
 残り: 上の 4 本目の残りと同じ。
+
+### S21 `workers sync` のレビュー修正（2026-11-17、6 本目: 覚える失敗を狭める）
+
+5 本目の M1 は覚える範囲が広すぎた（helper の exit 1 のすべて、phase を問わない時間切れ、helper の成功の後の I/O エラー）。次に狭めた。
+
+- helper は、導入そのものの失敗のときだけ専用の exit code 3（`preparation::INSTALL_FAILED_EXIT`）で終わる: manager のコマンドの失敗（`installation_command_failed`）、probe の不一致（`installed_version_mismatch`）、別の device（`installation_cleanup_other_device`。これまでは `installation_partial_cleanup` と同じ文字列だった）。分類は純粋関数 `preparation::install_exit`。それ以外は今までどおり exit 1。
+- `policy::install_itself_failed` が覚えるのは、その exit code と、phase が Running の時間切れだけ（`BuildEnd::TimedOut` が phase を持つ）。承認待ちの時間切れ、exit 1、helper の成功の後の `private_tool_root`・`detect` の失敗は覚えない。
+- spec §22.2 の覚える条件を、上に合わせて直した。
+
+残り: 上の 4 本目の残りと同じ。probe の出力が読めない（`probe_*`）・出力が長すぎる（`installer_output_limit`）は exit 1 のままで覚えない。Running の時間切れには `install.lock` を待つうちに切れた場合も入る。

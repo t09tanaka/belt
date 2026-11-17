@@ -721,10 +721,7 @@ fn a_directory_on_another_device_stops_the_removal_before_anything_in_it_goes() 
     fs::write(f.plan.root.join("install.lock"), b"").unwrap();
     let mut managed = managed_root(&f.plan, &state).unwrap();
     managed.dev += 1;
-    assert_eq!(
-        clear_unreceipted(&managed),
-        Err("installation_partial_cleanup")
-    );
+    assert_eq!(clear_unreceipted(&managed), Err(OTHER_DEVICE));
     assert!(listing(&f.plan.root).is_empty());
     assert!(f.plan.root.join("install.lock").exists());
     let left = trash(&state);

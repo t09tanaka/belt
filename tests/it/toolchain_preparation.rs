@@ -387,8 +387,39 @@ fn manager_failures_probe_mismatch_and_output_limit_fail_closed_for_each_consume
         assert!(f.setups.preparation_observations(64).is_empty());
         // The consumer that saw the failure keeps it; nothing is run again
         // for it.
-        assert!(matches!(f.poll(&a), ToolPreparationPoll::Failed(_)));
+        let ToolPreparationPoll::Failed(why) = f.poll(&a) else {
+            panic!("{mode}")
+        };
         assert_eq!(f.setups.builds_started(), 1);
+        // The helper has its own exit for a manager that failed and for a
+        // probe that does not answer the version. Too much output is any
+        // other failure of the helper (exit 1).
+        assert_eq!(
+            why.0,
+            if mode == "long" {
+                "a setup step exited with 1"
+            } else {
+                "a setup step exited with 3"
+            },
+            "{mode}"
+        );
+        if mode == "long" {
+            // Not a failure of the install itself: nothing is remembered,
+            // and the next consumer starts the install again, with no word
+            // about a later try.
+            let calls = f.calls();
+            let other = f.consumer();
+            let ToolPreparationPoll::Failed(again) = f.done(&other) else {
+                panic!("{mode}")
+            };
+            assert_eq!(again, why, "{mode}");
+            assert!(!again.0.contains("tried again"), "{again:?}");
+            assert_eq!(f.setups.builds_started(), 2, "{mode}");
+            assert!(f.calls() > calls, "{mode}");
+            assert!(!f.plan().root().join("receipt.json").exists());
+            assert!(f.setups.preparation_observations(64).is_empty());
+            continue;
+        }
         // A later consumer is told the same failure at once, with when the
         // version is tried again: the install that just failed by itself is
         // not run again for everybody who asks.
