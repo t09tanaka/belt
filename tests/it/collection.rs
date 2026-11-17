@@ -4793,3 +4793,114 @@ async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed(
         assert_eq!(job.status, "failure", "{said}");
     }
 }
+
+/// A27. Drive the durable queue, worker receipts and local-ci matrix driver,
+/// including replay between settlements. The job's outputs follow variant
+/// order even when collection completes in the opposite order.
+#[tokio::test]
+async fn a27_matrix_permits_join_and_fail_fast_across_workers() {
+    let workflow = r#"on: push
+jobs:
+  leg:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 2
+      fail-fast: true
+      matrix:
+        n: [0, 1, 2]
+    outputs:
+      value: ${{ steps.out.outputs.value }}
+    steps:
+      - id: out
+        run: echo "value=${{ matrix.n }}" >> "$GITHUB_OUTPUT"
+  report:
+    if: always()
+    needs: leg
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.leg.outputs.value }}"
+"#;
+    for fail in [false, true] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let other = Worker::new("w-b");
+        c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+            .unwrap();
+        let plan = ci_plan(workflow);
+        let variants: Vec<_> = plan.tasks.iter().filter(|t| t.variant.is_some()).collect();
+        assert_eq!(variants.len(), 3);
+        let (_, ids) = ci_run_by_task(&fx, &c, &plan).await;
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.released.len(), 2, "{pass:?}");
+        let placements = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
+        assert_eq!(placements.len(), 2);
+        let group = &variants[0].variant.as_ref().unwrap().group;
+        for (a, w) in placements.values() {
+            assert!(w.payload(a).permit_id.is_some());
+        }
+        let result = |t: &local_ci::dag::ExecutionTask, success: bool| {
+            let index = t.variant.as_ref().unwrap().index;
+            serde_json::to_vec(&json!({"schema_version":1,"task":t.id,"jobs":[{
+                "workflow":t.workflow,"job":"leg","display":"leg","result":if success{"pass"}else{"fail"},"secs":0,"steps":[]
+            }],"outcomes":[{"job":"leg","variant":index,"status":if success{"success"}else{"failure"},
+                "outputs":{"value":index.to_string()},"skipped":null,"ancestor_failed":false}],
+                "receipt_ignored":null,"artifacts":[]})).unwrap()
+        };
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        end_shard(
+            &c,
+            &files,
+            &placements[&variants[1].id],
+            if fail {
+                Outcome::Failed
+            } else {
+                Outcome::Succeeded
+            },
+            &result(variants[1], !fail),
+        )
+        .await;
+        let pass = ci_advance(&fx, &c);
+        assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
+        if fail {
+            assert!(pass.released.is_empty());
+            assert!(pass.stopped.contains(&ids[&variants[0].id]), "{pass:?}");
+            assert!(pass.stopped.contains(&ids[&variants[2].id]), "{pass:?}");
+            assert!(c
+                .store()
+                .attempts_of_task(&ids[&variants[2].id])
+                .unwrap()
+                .is_empty());
+            continue;
+        }
+        assert_eq!(pass.released, [ids[&variants[2].id].clone()]);
+        let more = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
+        end_shard(
+            &c,
+            &files,
+            &more[&variants[2].id],
+            Outcome::Succeeded,
+            &result(variants[2], true),
+        )
+        .await;
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        end_shard(
+            &c,
+            &files,
+            &placements[&variants[0].id],
+            Outcome::Succeeded,
+            &result(variants[0], true),
+        )
+        .await;
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.joined, [group.clone()]);
+        let next = ci_task_of(&plan, "report");
+        assert_eq!(pass.released, [ids[&next].clone()]);
+        let last = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
+        let (a, w) = &last[&next];
+        assert_eq!(
+            w.payload(a).ci_task.unwrap().inputs["needs"]["leg"]["outputs"]["value"],
+            "2"
+        );
+        assert!(ci_advance(&fx, &c).released.is_empty());
+    }
+}

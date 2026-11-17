@@ -130,7 +130,7 @@ pub fn task_specs(
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     command_timeout_ms: Option<u64>,
 ) -> Result<Vec<(String, TaskSpec)>, ApiError> {
-    if let Some(why) = crate::ci::progress::unsupported(plan) {
+    if let Some(why) = crate::ci::advance::unsupported(plan) {
         return Err(invalid(format!("this plan cannot be run yet: {why}")));
     }
     if plan.tasks.is_empty() {
@@ -138,6 +138,7 @@ pub fn task_specs(
             "the plan has no task: no workflow has a job to run",
         ));
     }
+    let distributed_matrix = plan.tasks.iter().any(|t| t.variant.is_some());
     let no_inputs = serde_json::to_value(local_ci::TaskInputs::default())
         .map_err(|e| invalid(e.to_string()))?;
     plan.tasks
@@ -153,7 +154,7 @@ pub fn task_specs(
                         task_id: task.id.clone(),
                         inputs: no_inputs.clone(),
                     },
-                    hold: !task.depends_on.is_empty(),
+                    hold: distributed_matrix || !task.depends_on.is_empty(),
                     steps: u32::try_from(demand.nodes.len()).unwrap_or(u32::MAX),
                     unrunnable: None,
                     shard_group: crate::ci::shards::group_of(plan, task)

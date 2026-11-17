@@ -17,6 +17,11 @@
 //! cancel that the coordinator delivers. A shard a cancel was requested for
 //! is not asked again.
 
+mod matrix;
+
+/// An unstarted variant stopped by matrix fail-fast can participate in a run retry.
+pub const MATRIX_FAIL_FAST_REASON: &str = "another variant of its matrix job failed (fail-fast)";
+
 use super::progress::{ActionKind, Input, NeedsProgression, Progression};
 use crate::coordinator::TaskSpec;
 use crate::ids::{AttemptId, Digest, RunId, TaskId};
@@ -181,6 +186,17 @@ pub fn inputs_fit(inputs: &TaskInputs) -> bool {
     serde_json::to_vec(inputs).is_ok_and(|json| json.len() <= MAX_RELEASED_INPUT_BYTES)
 }
 
+/// Check the executor and the progression actually selected for this plan.
+pub fn unsupported(plan: &FrozenPlan) -> Option<String> {
+    if matrix::applies(plan) {
+        if let Some(task) = plan.tasks.iter().find(|t| !t.services.is_empty()) {
+            return Some(format!("task `{}` has service containers", task.id));
+        }
+        return matrix::driver(plan).err().map(|e| e.to_string());
+    }
+    super::progress::unsupported(plan)
+}
+
 /// What one pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Pass {
@@ -288,6 +304,9 @@ fn advance_run(
     pass.plans.insert(digest.clone());
     let plan: FrozenPlan = serde_json::from_slice(&read_plan(state_dir, &digest)?)
         .map_err(|e| unrunnable(format!("the frozen plan {digest}: {e}")))?;
+    if matrix::applies(&plan) {
+        return matrix::advance(store, results, run, &plan, &members, now_ms, pass);
+    }
     let mut progress = replay(store, results, &plan, |task| {
         members.get(task).map(|member| &member.row)
     })?;

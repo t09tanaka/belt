@@ -350,6 +350,11 @@ END;
 UPDATE matrix_permit SET held=0,released_at_ms=(
   SELECT coalesce(terminal_at_ms,retired_at_ms) FROM attempt WHERE attempt.attempt_id=matrix_permit.attempt_id
 ) WHERE held=1 AND attempt_id IN (SELECT attempt_id FROM attempt WHERE permit_id IS NOT NULL AND (state='terminal' OR retired=1));"#.into(),
+            r#"CREATE TABLE ci_driver_transition (
+ run_id TEXT NOT NULL REFERENCES run(run_id), authorization INTEGER NOT NULL CHECK(authorization>=0),
+ revision INTEGER NOT NULL CHECK(revision>0), record TEXT NOT NULL,
+ PRIMARY KEY(run_id,authorization,revision)
+) WITHOUT ROWID;"#.into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

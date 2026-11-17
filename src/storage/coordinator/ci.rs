@@ -33,7 +33,7 @@ pub struct CiAttempt {
 const HELD: &str = "coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=1";
 /// A shard of a split job that has not been joined yet: its job has no
 /// outcome, whether the shard was cancelled or not.
-const UNJOINED_SHARD: &str = "json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL
+const UNJOINED_SHARD: &str = "coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL
     AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0";
 
 /// The task `s` ended, as the progression reads it (`ci::advance::standing`):
@@ -49,6 +49,49 @@ const ENDED_S: &str =
         AND a.state='terminal' AND x.closed_at_ms IS NOT NULL))";
 
 impl CoordinatorStore {
+    /// A retry creates a new progression for the resulting set of task generations.
+    pub(crate) fn ci_driver_authorization(&self, run: &RunId) -> Result<u64> {
+        let run = run.to_string();
+        self.db.call(move |c| {
+            to_u64(c.query_row(
+                "SELECT coalesce(max(authorization_revision),0) FROM task WHERE run_id=?1",
+                [run],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
+    /// Read one revision at a time. A transition can contain a whole validated result.
+    pub(crate) fn ci_driver_record(
+        &self,
+        run: &RunId,
+        authorization: u64,
+        revision: u64,
+    ) -> Result<Option<String>> {
+        let run = run.to_string();
+        self.db.call(move |c| Ok(c.query_row(
+            "SELECT record FROM ci_driver_transition WHERE run_id=?1 AND authorization=?2 AND revision=?3",
+            params![run,to_i64(authorization)?,to_i64(revision)?], |r| r.get(0)).optional()?))
+    }
+
+    /// Commit only the next revision of the current task generations. A second
+    /// observer of an older revision must reconstruct the winner before acting.
+    pub(crate) fn append_ci_driver_record(
+        &self,
+        run: &RunId,
+        authorization: u64,
+        revision: u64,
+        record: String,
+    ) -> Result<bool> {
+        let run = run.to_string();
+        self.db.write(move |tx| Ok(tx.execute(
+            "INSERT INTO ci_driver_transition(run_id,authorization,revision,record)
+             SELECT ?1,?2,?3,?4 WHERE ?3=(SELECT coalesce(max(revision),0)+1 FROM ci_driver_transition WHERE run_id=?1 AND authorization=?2)
+             AND ?2=(SELECT max(authorization_revision) FROM task WHERE run_id=?1)
+             AND EXISTS (SELECT 1 FROM run WHERE run_id=?1 AND closed_at_ms IS NULL)",
+            params![run,to_i64(authorization)?,to_i64(revision)?,record])? == 1))
+    }
+
     /// The runs that have a task waiting for the jobs it needs, or a shard
     /// of a split job that is not joined yet (a failed shard may have to
     /// stop the others, and the job needs its one outcome before the run is
@@ -146,10 +189,10 @@ impl CoordinatorStore {
                     "UPDATE task AS t SET spec_json=CASE WHEN ?3 IS NULL
                         THEN json_set(t.spec_json,'$.ci.joined',json('true'))
                         ELSE json_set(t.spec_json,'$.ci.joined',json('true'),'$.ci.join_failure',?3) END
-                     WHERE t.run_id=?1 AND json_extract(t.spec_json,'$.ci.shard_group')=?2
+                     WHERE t.run_id=?1 AND coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group'))=?2
                      AND {UNJOINED_SHARD}
                      AND NOT EXISTS (SELECT 1 FROM task s WHERE s.run_id=?1
-                        AND json_extract(s.spec_json,'$.ci.shard_group')=?2 AND NOT {ENDED_S})"
+                        AND coalesce(json_extract(s.spec_json,'$.ci.shard_group'),json_extract(s.spec_json,'$.ci.matrix.group'))=?2 AND NOT {ENDED_S})"
                 ),
                 params![run, group, failure],
             )?;
@@ -159,7 +202,7 @@ impl CoordinatorStore {
             for task in &rerun {
                 tx.execute(
                     "UPDATE task SET spec_json=json_set(spec_json,'$.ci.rerun',json('true'))
-                     WHERE run_id=?1 AND json_extract(spec_json,'$.ci.shard_group')=?2
+                     WHERE run_id=?1 AND coalesce(json_extract(spec_json,'$.ci.shard_group'),json_extract(spec_json,'$.ci.matrix.group'))=?2
                      AND json_extract(spec_json,'$.ci.task.task_id')=?3",
                     params![run, group, task],
                 )?;
@@ -222,7 +265,7 @@ impl CoordinatorStore {
                 &format!(
                     "UPDATE task AS t SET spec_json=?2 WHERE t.task_id=?1 AND {HELD}
                      AND t.cancel_requested_at_ms IS NULL
-                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)"
+                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))"
                 ),
                 params![task, spec],
             )?;

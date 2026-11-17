@@ -55,7 +55,7 @@ impl CoordinatorStore {
                     "SELECT t.task_id FROM task t WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2)
                      AND t.cancel_requested_at_ms IS NULL
                      AND json_type(t.spec_json,'$.ci')='object'
-                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)
+                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))
                      ORDER BY t.created_at_ms,t.rowid",
                 )?;
                 let rows = query.query_map(params![run, only], |row| row.get(0))?;
@@ -248,7 +248,7 @@ fn completion_on(
     } else {
         ("", "NULL")
     };
-    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL,{cancel_at} FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
+    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL,{cancel_at} FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
     let mut stmt = c.prepare(&sql)?;
     // The first shard of a split job that is a failure (see below).
     let mut job_failed = None;
