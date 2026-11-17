@@ -695,7 +695,7 @@ fn forget_reports_only_what_the_resident_confirmed() {
         text.contains("colab-1") && text.contains("is retired"),
         "{text}"
     );
-    assert!(text.contains("1 attempt(s) ended as interrupted"), "{text}");
+    assert!(text.ends_with("1 attempt ended"), "{text}");
     let nothing = describe_forget(&ForgetResult {
         id: "colab-1".into(),
         identity_retired: false,
