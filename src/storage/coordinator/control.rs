@@ -202,15 +202,18 @@ fn completion_on(
         [&run],
         |row| row.get(0),
     )?;
-    let cancelled = if has_intents {
+    // When the run was cancelled as a whole, if it was.
+    let cancelled_at: Option<i64> = if has_intents {
         c.query_row(
-            "SELECT EXISTS(SELECT 1 FROM run_cancel_intent WHERE run_id=?1)",
+            "SELECT requested_at_ms FROM run_cancel_intent WHERE run_id=?1",
             [&run],
-            |row| row.get::<_, bool>(0),
-        )?
+            |row| row.get(0),
+        )
+        .optional()?
     } else {
-        false
+        None
     };
+    let cancelled = cancelled_at.is_some();
     if !accepted && !cancelled {
         return Err(not_found(format!("run {run}")));
     }
@@ -232,6 +235,11 @@ fn completion_on(
     } else {
         "0"
     };
+    let cancel_at = if task_cancel {
+        "t.cancel_requested_at_ms"
+    } else {
+        "NULL"
+    };
     let (join, verdict) = if collections {
         (
             "LEFT JOIN collection x ON x.attempt_id=a.attempt_id",
@@ -240,18 +248,25 @@ fn completion_on(
     } else {
         ("", "NULL")
     };
-    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
+    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL,{cancel_at} FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
     let mut stmt = c.prepare(&sql)?;
     // The first shard of a split job that is a failure (see below).
     let mut job_failed = None;
     // Whether a shard was cancelled (stopped by fail-fast), the tasks that
-    // were cancelled, and the first task that failed of itself: unless the
-    // run was cancelled as a whole, a run with a stopped shard failed of the
+    // were cancelled, and the first task that failed of itself: unless a
+    // cancel of the whole run stopped a task, a run with a stopped shard failed of the
     // latter, wherever the ids of the cancelled ones sort. A task of another
     // job that was cancelled did not fail of itself either.
     let mut stopped_shard = false;
     let mut cancelled_tasks = std::collections::BTreeSet::new();
     let mut real_failure = None;
+    // A run that was cancelled as a whole while a shard of it was still to
+    // end is cancelled, whatever a task of it had failed of before: whether
+    // that cancel stopped a shard, and the first task it stopped. A shard
+    // fail-fast had stopped before, or a cancel that came when everything
+    // had ended, changes nothing.
+    let mut run_stopped_shard = false;
+    let mut first_run_stopped = None;
     let whole_run = task.is_none();
     let mut rows = stmt.query(params![run, task])?;
     while let Some(row) = rows.next()? {
@@ -293,6 +308,15 @@ fn completion_on(
             (_, Some(t)) => t.outcome() == crate::state::Outcome::Cancelled,
             _ => false,
         };
+        let cancel_at: Option<i64> = row.get(10)?;
+        let by_run_cancel =
+            was_cancelled && cancelled_at.is_some_and(|run| cancel_at.is_some_and(|at| at >= run));
+        if whole_run && by_run_cancel {
+            run_stopped_shard |= shard;
+            if first_run_stopped.is_none() {
+                first_run_stopped = Some((task.clone(), termination));
+            }
+        }
         if was_cancelled {
             stopped_shard |= shard;
             cancelled_tasks.insert(task.clone());
@@ -308,13 +332,22 @@ fn completion_on(
         .first_compute_failure
         .as_ref()
         .is_some_and(|f| cancelled_tasks.contains(&f.task_id));
-    if whole_run && !cancelled && stopped_shard && first_was_cancelled {
+    // A cancel of the whole run that stopped nothing is as none here.
+    if whole_run && first_run_stopped.is_none() && stopped_shard && first_was_cancelled {
         match real_failure {
             Some((task, termination)) => snapshot.prefer_failure(task, termination),
             // No attempt failed of itself: the job did (its tests).
             None if job_failed.is_some() => snapshot.first_compute_failure = None,
             None => {}
         }
+    }
+    if let Some((task_id, termination)) = first_run_stopped.filter(|_| run_stopped_shard) {
+        snapshot.first_compute_failure = Some(crate::service::completion::Failure {
+            task_id,
+            code: crate::error::ErrorCode::CommandFailed,
+            exit_code: crate::error::exit::CANCELLED,
+            termination,
+        });
     }
     if let Some((task, termination)) = job_failed {
         snapshot.job_failure(task, termination);

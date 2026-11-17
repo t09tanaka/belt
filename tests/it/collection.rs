@@ -4706,10 +4706,12 @@ async fn a41_a_run_fails_of_the_failed_shard_and_not_of_a_cancelled_task_of_anot
     }
 }
 
-/// A41: a run that was cancelled as a whole is cancelled, whatever a shard
-/// had found before: a shard whose attempt succeeded with a failed test
-/// makes its job a failure, and the run still ends as cancelled (its exit
-/// code and the failure it names say the same), wherever that shard sorts.
+/// A41: a run that was cancelled as a whole while a shard of it still ran
+/// is cancelled, whatever a shard had found before: a shard with a failed
+/// test (its attempt failed of it, or succeeded) makes its job a failure,
+/// and the run still ends as cancelled (its exit code and the failure it
+/// names say the same), wherever that shard sorts. A cancel that comes when
+/// fail-fast had stopped the rest and the run had failed changes nothing.
 #[tokio::test]
 async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed() {
     use remote_task_runner::service::ci_run::Part;
@@ -4719,13 +4721,16 @@ async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed(
     let adapter = CargoTest::new("1.91.0", &[], Safety::default());
     let opts = PartitionOpts::default();
     let only = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
-    for failed_last in [false, true] {
+    for case in 0..8 {
+        let (failed_last, attempt_failed, late) = (case & 1 != 0, case & 2 != 0, case & 4 != 0);
+        let said = format!("last {failed_last}, attempt {attempt_failed}, late {late}");
         let fx = fx();
         let (c, files) = fx.open();
         let whole = ci_plan(only);
         let shards = partition_tests(&adapter, &discovered, &History::default(), 3, &opts);
+        // Only fail-fast ends the run before the cancel comes late.
         let plan = whole
-            .with_shards(&[split_request(&whole, shards, &discovered, false)])
+            .with_shards(&[split_request(&whole, shards, &discovered, late)])
             .unwrap();
         let group = split_group(&plan);
         let failed_task = group.shards[1].clone();
@@ -4743,21 +4748,48 @@ async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed(
         assert_eq!(edge, Some(&ids[&failed_task]));
         let target = Target::Run(run.clone());
         let placed = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
-        let failed = shard_result(&group, 1, "success", "failed", None);
+        let (outcome, job) = if attempt_failed {
+            (Outcome::Failed, "failure")
+        } else {
+            (Outcome::Succeeded, "success")
+        };
+        let failed = shard_result(&group, 1, job, "failed", None);
         let at = &placed[&failed_task];
-        end_shard(&c, &files, at, Outcome::Succeeded, &failed).await;
-        assert!(ci_advance(&fx, &c).stopped.is_empty(), "no fail-fast");
+        end_shard(&c, &files, at, outcome, &failed).await;
+        let stopped = ci_advance(&fx, &c).stopped.len();
+        assert_eq!(stopped, if late { 2 } else { 0 }, "{said}");
+        if late {
+            until_joined(&fx, &c, &files).await;
+            let before = c.store().completion(target.clone()).unwrap();
+            assert!(before.settled(), "{said}");
+            let own = c
+                .store()
+                .completion(Target::Task(ids[&failed_task].clone()))
+                .unwrap();
+            let code = if attempt_failed {
+                own.exit_code()
+            } else {
+                Some(1)
+            };
+            assert_eq!(before.exit_code(), code, "{said}");
+            // The cancel is of a later millisecond than the fail-fast stop.
+            tokio::time::sleep(Duration::from_millis(3)).await;
+            c.cancel_run(run.clone()).await.unwrap();
+            let after = c.store().completion(target).unwrap();
+            assert_eq!(after.exit_code(), code, "{said}");
+            continue;
+        }
         c.cancel_run(run.clone()).await.unwrap();
         until_joined(&fx, &c, &files).await;
         let snapshot = c.store().completion(target).unwrap();
-        assert!(snapshot.settled() && snapshot.cancel_requested);
-        assert_eq!(snapshot.exit_code(), Some(cancelled));
+        assert!(snapshot.settled() && snapshot.cancel_requested, "{said}");
+        assert_eq!(snapshot.exit_code(), Some(cancelled), "{said}");
         let failure = snapshot.first_compute_failure.clone().unwrap();
-        assert_eq!(failure.exit_code, cancelled);
-        assert_ne!(failure.task_id, ids[&failed_task]);
+        assert_eq!(failure.exit_code, cancelled, "{said}");
+        assert_ne!(failure.task_id, ids[&failed_task], "{said}");
         // The job is still a failure of its own, and says so.
         let lines = ci_lines(&fx, &c, &files, &run);
         let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
-        assert_eq!(job.status, "failure");
+        assert_eq!(job.status, "failure", "{said}");
     }
 }
