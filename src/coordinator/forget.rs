@@ -115,6 +115,7 @@ mod tests {
     use super::super::tests::{fx, Fx};
     use super::super::*;
     use super::*;
+    use crate::ids::Digest;
     use crate::service::completion::Target;
     use std::sync::atomic::AtomicUsize;
 
@@ -225,6 +226,26 @@ mod tests {
         assert_eq!(kept.observation, Observation::Unknown);
         assert!(kept.termination.is_none());
 
+        let target = Target::Task(task.clone());
+        let revision =
+            f.c.store()
+                .completion(target.clone())
+                .unwrap()
+                .control_revision;
+        let request = "retry-after-forget".to_string();
+        let refused =
+            f.c.store()
+                .retry(target.clone(), revision, request.clone(), 1, |_, _, _| {
+                    panic!("an unknown attempt cannot reach retry validation")
+                })
+                .unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("retry requires known terminal stopping"),
+            "{refused}"
+        );
+
         // The user declares it gone.
         let forgotten =
             f.c.forget_worker(&f.worker, Some(true))
@@ -290,6 +311,35 @@ mod tests {
                 .unwrap()
                 .unwrap();
         assert_eq!(nothing.identity, None);
+
+        let receipt =
+            f.c.store()
+                .retry(
+                    target.clone(),
+                    snapshot.control_revision,
+                    request.clone(),
+                    2,
+                    |_, _, digest| {
+                        assert_eq!(digest, &Digest::of_bytes(b"manifest"));
+                        Ok(false)
+                    },
+                )
+                .unwrap();
+        let replay =
+            f.c.store()
+                .retry(target, snapshot.control_revision, request, 3, |_, _, _| {
+                    panic!("replaying a committed retry must reuse its receipt")
+                })
+                .unwrap();
+        assert_eq!(receipt.task_count, 1);
+        assert_eq!(receipt.task_id.as_ref(), Some(&task));
+        assert_eq!(receipt.control_revision, snapshot.control_revision + 1);
+        assert_eq!(receipt.control_revision, replay.control_revision);
+        assert_eq!(receipt.min_generation, replay.min_generation);
+        assert_eq!(
+            attempt_of(&f, &attempt).termination.unwrap().outcome(),
+            Outcome::Interrupted
+        );
     }
 
     /// A cancel that was asked for before the worker vanished is what the
