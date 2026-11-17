@@ -3711,7 +3711,7 @@ fn pure_static_requirements_and_receipt_rejections_preserve_admitted_state() {
 }
 
 #[test]
-fn pure_dispatch_label_errors_and_existing_task_collisions_are_core_failures() {
+fn pure_dispatch_label_errors_are_core_failures() {
     let bad_label = Fixture::new(&WORKFLOW.replace(
         "labels: [self-hosted, '${{ matrix.os }}']",
         "labels: '${{ fromJSON(\"broken\") }}'",
@@ -3732,35 +3732,80 @@ fn pure_dispatch_label_errors_and_existing_task_collisions_are_core_failures() {
         .1
         .unwrap()
         .starts_with("runs-on:"));
-    let mut f = Fixture::new(WORKFLOW);
-    let origin = f
+}
+
+fn driver_of(f: &Fixture) -> Result<Driver> {
+    Driver::with_evaluation(
+        &f.plan,
+        DriverConfig {
+            schema_version: DRIVER_VERSION,
+            max_parallel: 2,
+        },
+        &f.input().evaluation_source().unwrap(),
+        f.facts.clone(),
+    )
+}
+const RESERVED: &str = "task id is reserved for the members of a dynamic matrix";
+
+/// The planner takes any key of `jobs:` as a job id, so a plan can hold a task
+/// named like a member of a dynamic matrix. The driver refuses that plan when
+/// it is built, before a claim exists that the collision could strand.
+#[test]
+fn a_plan_with_a_task_named_like_a_dynamic_member_is_refused_before_it_runs() {
+    let extra = "  'dynamic#0':\n    runs-on: x\n    steps:\n      - run: 'true'\n";
+    let f = Fixture::new(&format!("{WORKFLOW}{extra}"));
+    let origin = f.plan.tasks.iter().find(|t| t.dynamic_matrix).unwrap();
+    assert!(f
         .plan
         .tasks
         .iter()
-        .find(|t| t.dynamic_matrix)
-        .unwrap()
-        .id
-        .clone();
+        .any(|t| t.id == format!("{}#0", origin.id)));
+    assert_eq!(driver_of(&f).unwrap_err().to_string(), RESERVED);
+    // the same for a plan that was put together by hand
+    let origin = origin.id.clone();
+    let mut f = Fixture::new(WORKFLOW);
+    driver_of(&f).unwrap();
     f.plan
         .tasks
         .iter_mut()
         .find(|t| t.jobs == ["consumer"])
         .unwrap()
-        .id = format!("{origin}#0");
+        .id = format!("{origin}#7");
     f.plan.digest = f.plan.compute_digest().unwrap();
-    let mut d = f.driver(2);
-    let records = seed(&f, &mut d);
-    assert!(d
-        .core_decision(&origin)
+    assert_eq!(driver_of(&f).unwrap_err().to_string(), RESERVED);
+    // a worker that derives the members again from such a plan refuses too
+    let good = Fixture::new(WORKFLOW);
+    let mut d = good.driver(2);
+    seed(&good, &mut d);
+    let inputs = &d.state.expansions[&origin].inputs;
+    let evaluation = d.evaluation.as_ref().unwrap();
+    let dynamic = good.plan.task(&origin).unwrap();
+    let derive = |plan: &FrozenPlan| {
+        dispatch::derive(plan, evaluation, dynamic, inputs, 4, MAX_WIRE_BYTES).map(|_| ())
+    };
+    derive(&good.plan).unwrap();
+    let mut colliding = good.plan.clone();
+    colliding
+        .tasks
+        .iter_mut()
+        .find(|t| t.jobs == ["consumer"])
         .unwrap()
-        .1
-        .unwrap()
-        .contains("collides with frozen task"));
-    let mut replay = f.driver(2);
-    for record in records {
-        replay.apply(&record).unwrap();
-    }
-    assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+        .id = format!("{origin}#1");
+    assert!(derive(&colliding)
+        .unwrap_err()
+        .to_string()
+        .contains("derived member collides with frozen task"));
+    // a static matrix names its members the same way: its plan has two tasks
+    // of one id, which no driver takes either
+    let f = Fixture::new(
+        "on: push\njobs:\n  m:\n    runs-on: x\n    strategy:\n      matrix:\n        n: [0, 1]\n    steps:\n      - run: 'true'\n  'm#0':\n    runs-on: x\n    steps:\n      - run: 'true'\n",
+    );
+    let ids: Vec<_> = f.plan.tasks.iter().map(|t| t.id.as_str()).collect();
+    assert_eq!(ids.iter().filter(|id| id.ends_with("::m#0")).count(), 2);
+    assert_eq!(
+        driver_of(&f).unwrap_err().to_string(),
+        "empty/duplicate task"
+    );
 }
 
 #[test]
@@ -4495,4 +4540,246 @@ fn pure_expanded_reserve_composition_funds_actual_halt_phase_growth() {
         .checked_sub(d.cancel_reserve(&after).unwrap())
         .unwrap();
     assert!(funding >= growth);
+}
+
+/// `big` has a large output, `gate` is the claim to release, and each
+/// `consumer` needs both: releasing `gate` makes every consumer ready with a
+/// copy of `big`'s output, which is what the state has no room for.
+fn release_fanout_fixture(consumers: usize) -> Fixture {
+    let payload = "x".repeat(8192);
+    let mut workflow = format!("on: push\njobs:\n  big:\n    runs-on: x\n    outputs:\n      value: ${{{{ steps.out.outputs.value }}}}\n    steps:\n      - id: out\n        run: echo value={payload} >> \"$GITHUB_OUTPUT\"\n  gate:\n    runs-on: x\n    steps:\n      - run: true\n");
+    for i in 0..consumers {
+        workflow.push_str(&format!("  consumer{i}:\n    runs-on: x\n    needs: [big, gate]\n    steps:\n      - run: exit 99\n"));
+    }
+    Fixture::new(&workflow)
+}
+/// `big` settled, `gate` claimed (and dispatched when asked), and the state
+/// limit set to the least a committed state may have: its bytes and reserve.
+fn release_fanout_at_capacity(f: &Fixture, dispatched: bool) -> (Driver, Vec<Transition>, String) {
+    let mut d = f.driver(2);
+    let mut records = vec![commit(&mut d, Input::Advance)];
+    let action = |d: &Driver, job: &str| {
+        ready(d)
+            .into_iter()
+            .find(|a| f.plan.task(ready_task(a).unwrap()).unwrap().jobs == [job])
+            .unwrap()
+    };
+    let big = action(&d, "big");
+    let gate = action(&d, "gate");
+    let task = |a: &ActionKind| ready_task(a).unwrap().to_string();
+    records.push(commit(
+        &mut d,
+        Input::Claim {
+            task: task(&big),
+            token: task(&big),
+        },
+    ));
+    let (wire, _) = f.execute(&big, "release-fanout-big");
+    records.push(settle(&mut d, &big, wire));
+    let gate = task(&gate);
+    records.push(commit(
+        &mut d,
+        Input::Claim {
+            task: gate.clone(),
+            token: gate.clone(),
+        },
+    ));
+    if dispatched {
+        records.push(commit(&mut d, mark_input(&gate)));
+    }
+    d.state_byte_limit = crate::expr::serialized_size(&d.state, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&d.state).unwrap();
+    (d, records, gate)
+}
+fn assert_released_with_storage_halt(
+    f: &Fixture,
+    mut d: Driver,
+    mut records: Vec<Transition>,
+    gate: &str,
+    release: Input,
+    reason: HostFailureReason,
+) {
+    // with room, the same release makes every consumer ready
+    let mut roomy = d.clone();
+    roomy.state_byte_limit = MAX_WIRE_BYTES;
+    commit(&mut roomy, release.clone());
+    assert_eq!(ready(&roomy).len(), f.plan.tasks.len() - 2);
+    assert!(roomy.infrastructure_failure().is_none());
+    assert!(
+        crate::expr::serialized_size(&roomy.state, MAX_WIRE_BYTES).unwrap() > d.state_byte_limit
+    );
+    let limit = d.state_byte_limit;
+    records.push(commit(&mut d, release.clone()));
+    // the permit is released, and the run fails for the reason it has
+    assert_eq!(d.admitted(), 0);
+    assert_eq!(
+        d.core_decision(gate).unwrap(),
+        (CoreDecision::HostFailure, Some(reason.diagnostic()))
+    );
+    assert_eq!(d.host_failure_reason(gate), Some(reason));
+    assert_eq!(
+        d.infrastructure_failure(),
+        Some(ResultStorageFailure::DriverCapacity)
+    );
+    assert!(ready(&d).is_empty());
+    assert!(d.outcome(FILE, "gate").is_none());
+    assert_eq!(d.outcome(FILE, "big").unwrap().status, JobStatus::Success);
+    for task in f
+        .plan
+        .tasks
+        .iter()
+        .filter(|t| t.jobs[0].starts_with("consumer"))
+    {
+        assert_eq!(
+            d.core_decision(&task.id).unwrap().0,
+            CoreDecision::InfrastructureBlocked
+        );
+    }
+    assert!(finished(&d));
+    assert!(!d.cancelled());
+    assert!(crate::expr::serialized_size(&d.state, limit).is_ok());
+    // repeating the release changes nothing
+    let before = digest(&d.state.phases).unwrap();
+    records.push(commit(&mut d, release));
+    assert_eq!(digest(&d.state.phases).unwrap(), before);
+    // the limit was set once the claim was held: the replay does the same
+    let held = records.len() - 2;
+    let mut replay = f.driver(2);
+    for (index, record) in records.into_iter().enumerate() {
+        if index == held {
+            replay.state_byte_limit = limit;
+        }
+        let decoded = Transition::from_json(&serde_json::to_string(&record).unwrap()).unwrap();
+        replay.apply(&decoded).unwrap();
+    }
+    assert_eq!(digest(&d.state).unwrap(), digest(&replay.state).unwrap());
+}
+
+#[test]
+fn fence_is_never_refused_for_the_capacity_of_what_it_makes_ready() {
+    let f = release_fanout_fixture(12);
+    let (d, records, gate) = release_fanout_at_capacity(&f, true);
+    let release = Input::Fence {
+        task: gate.clone(),
+        token: gate.clone(),
+    };
+    assert_released_with_storage_halt(
+        &f,
+        d,
+        records,
+        &gate,
+        release,
+        HostFailureReason::WorkerFenced,
+    );
+}
+
+#[test]
+fn abort_before_execution_is_never_refused_for_the_capacity_of_what_it_makes_ready() {
+    let f = release_fanout_fixture(12);
+    let (d, records, gate) = release_fanout_at_capacity(&f, false);
+    let release = abort_input(&gate, HostFailureReason::Provenance);
+    assert_released_with_storage_halt(
+        &f,
+        d,
+        records,
+        &gate,
+        release,
+        HostFailureReason::Provenance,
+    );
+}
+
+/// Both `big` (dispatched) and `gate` (not dispatched) are held, and the state
+/// limit goes from the least a committed state may have to one with room for
+/// everything. At every limit, in every order, with and without a cancel, each
+/// release commits and gives its permit back: what a limit decides is whether
+/// the run halts, never whether a claim can end.
+#[test]
+fn no_release_is_refused_at_any_state_limit() {
+    let f = release_fanout_fixture(6);
+    let mut d = f.driver(2);
+    commit(&mut d, Input::Advance);
+    let actions = ready(&d);
+    let by_job = |job: &str| {
+        actions
+            .iter()
+            .find(|a| f.plan.task(ready_task(a).unwrap()).unwrap().jobs == [job])
+            .unwrap()
+            .clone()
+    };
+    let (big, gate) = (by_job("big"), by_job("gate"));
+    claim(&mut d, &big);
+    claim(&mut d, &gate);
+    mark(&mut d, &big);
+    let (wire, _) = f.execute(&big, "release-sweep-big");
+    let (big, gate) = (
+        ready_task(&big).unwrap().to_string(),
+        ready_task(&gate).unwrap().to_string(),
+    );
+    let settle_big = Input::Settle {
+        task: big.clone(),
+        token: big.clone(),
+        result_digest: wire.digest().unwrap(),
+        result: Box::new(wire),
+    };
+    let fence_big = Input::Fence {
+        task: big.clone(),
+        token: big.clone(),
+    };
+    let fence_gate = Input::Fence {
+        task: gate.clone(),
+        token: gate.clone(),
+    };
+    let abort_gate = abort_input(&gate, HostFailureReason::Setup);
+    let orders = [
+        [settle_big.clone(), abort_gate.clone()],
+        [abort_gate, settle_big.clone()],
+        [fence_gate.clone(), settle_big],
+        [fence_big.clone(), fence_gate.clone()],
+        [fence_gate, fence_big],
+    ];
+    let least = crate::expr::serialized_size(&d.state, MAX_WIRE_BYTES).unwrap()
+        + d.cancel_reserve(&d.state).unwrap();
+    let mut roomy = d.clone();
+    for input in &orders[0] {
+        commit(&mut roomy, input.clone());
+    }
+    assert!(roomy.infrastructure_failure().is_none());
+    let most = crate::expr::serialized_size(&roomy.state, MAX_WIRE_BYTES).unwrap()
+        + roomy.cancel_reserve(&roomy.state).unwrap();
+    assert!(most > least);
+    let (mut halted, mut passed) = (0, 0);
+    // both ends to the byte, and eight limits between them
+    let limits = [least, least + 1, most - 1, most, most + 1]
+        .into_iter()
+        .chain((least..most).step_by((most - least) / 8).skip(1));
+    for limit in limits {
+        for order in &orders {
+            for cancel in [false, true] {
+                let mut d = d.clone();
+                d.state_byte_limit = limit;
+                if cancel {
+                    commit(&mut d, Input::Cancel);
+                    for action in cancel_actions(&d) {
+                        commit(&mut d, Input::Ack { action: action.id });
+                    }
+                }
+                for (released, input) in order.iter().enumerate() {
+                    let record = d.propose(input.clone()).unwrap_or_else(|error| {
+                        panic!("limit {limit}, cancel {cancel}: {input:?} refused: {error:#}")
+                    });
+                    d.apply(&record).unwrap();
+                    assert_eq!(d.admitted(), 1 - released);
+                    assert!(crate::expr::serialized_size(&d.state, limit).is_ok());
+                }
+                match d.infrastructure_failure() {
+                    Some(_) => halted += 1,
+                    None => passed += 1,
+                }
+                // consumers wait for a worker only in a run that goes on
+                assert_eq!(finished(&d), cancel || d.infrastructure_failure().is_some());
+            }
+        }
+    }
+    // the sweep crosses the boundary: both ends of it were seen
+    assert!(halted > 0 && passed > 0, "{halted} halted, {passed} passed");
 }

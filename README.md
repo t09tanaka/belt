@@ -786,6 +786,10 @@ exactly one of:
   arrives later under that token is refused. The driver cannot know that the
   worker stopped; the host answers for what it still holds.
 
+A release is never refused because the driver's state is full. When the
+jobs it would make ready do not fit, the claim is released all the same and
+the run stops with `infrastructure_failure()`, as below.
+
 **Cancel.** `Input::Cancel` cancels the run: tasks nobody claimed are decided
 as cancelled, and each claimed task gets a `Cancel` action. A claim keeps its
 permit until its result, abort or fence arrives; an acknowledged `Cancel` is

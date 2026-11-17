@@ -347,7 +347,7 @@ pub(crate) fn derive(
             .context("expansion byte budget exhausted")?;
         ensure_expansion_budget(charged, byte_limit)?;
         let mut task = origin.clone();
-        task.id = format!("{}#{index}", origin.id);
+        task.id = member_id(&origin.id, index);
         ensure!(
             !plan.tasks.iter().any(|t| t.id == task.id),
             "derived member collides with frozen task"
@@ -409,6 +409,18 @@ pub(crate) fn derive(
     })))
 }
 
+/// The id of one member of the dynamic matrix of an origin. The index has no
+/// `#`, so the members of two origins never share an id.
+fn member_id(origin: &str, index: usize) -> String {
+    format!("{origin}#{index}")
+}
+/// Whether a task id lies where the members of the dynamic matrix of an
+/// origin are named. A plan with such a task is refused before anything runs.
+pub(crate) fn names_member_of(origin: &str, id: &str) -> bool {
+    id.strip_prefix(origin)
+        .is_some_and(|rest| rest.starts_with('#'))
+}
+
 pub(crate) fn validate(
     plan: &FrozenPlan,
     source: &VerifiedEvaluationSource,
@@ -441,6 +453,24 @@ pub(crate) fn validate(
 
 #[cfg(test)]
 mod survivor_tests {
+    #[test]
+    fn member_ids_of_distinct_origins_never_coincide() {
+        // origins chosen so that one is a member id of another
+        let origins = ["w::a", "w::a#0", "w::a#0#1", "w::a#", "w::a#1", "w::a1"];
+        let mut seen = std::collections::BTreeMap::new();
+        for origin in origins {
+            for index in [0, 1, 10, 11, 100] {
+                let id = super::member_id(origin, index);
+                assert!(super::names_member_of(origin, &id));
+                assert_eq!(seen.insert(id.clone(), (origin, index)), None, "{id}");
+            }
+        }
+        assert_eq!(super::member_id("w::a", 12), "w::a#12");
+        assert!(!super::names_member_of("w::a", "w::a"));
+        assert!(!super::names_member_of("w::a", "w::ab#0"));
+        assert!(!super::names_member_of("w::a", "x#w::a#0"));
+        assert!(super::names_member_of("w::a", "w::a#x"));
+    }
     #[test]
     fn expansion_budget_accepts_boundary_and_rejects_next_byte() {
         super::ensure_expansion_budget(4096, 4096).unwrap();
