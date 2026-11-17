@@ -164,6 +164,7 @@ async fn collection_shutdown_fixture(
         let task = TaskId::generate();
         let attempt = AttemptId::generate();
         let payload = AttemptPayload {
+            ci_task: None,
             toolchains: None,
             outputs: Vec::new(),
             requirements: Default::default(),
@@ -1032,6 +1033,7 @@ async fn per_worker_secret_jobs_route_exact_attempts_and_resend_after_session_re
         )
         .unwrap();
         let payload = AttemptPayload {
+            ci_task: None,
             toolchains: None,
             outputs: Vec::new(),
             requirements: Default::default(),

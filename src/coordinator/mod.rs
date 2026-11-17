@@ -141,6 +141,7 @@ pub fn build_payload(
         .clone()
         .ok_or_else(|| StorageError::Invalid(format!("run {} has no source", input.run_id)))?;
     Ok(AttemptPayload {
+        ci_task: None,
         toolchains: spec.toolchains.clone().map(Box::new),
         requirements: spec.requirements.clone(),
         in_place: spec.in_place,

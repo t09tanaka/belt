@@ -73,6 +73,20 @@ pub(crate) fn recover_on(
     })
 }
 
+/// The number a launched node was registered under with
+/// task-traffic-controller: its position in the spec, or, for a step of a
+/// CI task (no node of the spec), the number in its name.
+pub(crate) fn launched_index(spec: &SuperviseSpec, node: &str) -> Option<usize> {
+    spec.nodes
+        .iter()
+        .position(|n| n.node_id.as_str() == node)
+        .or_else(|| {
+            spec.ci
+                .as_ref()
+                .and_then(|_| super::ci_task::step_index(node))
+        })
+}
+
 fn recover_using(
     spec: &SuperviseSpec,
     store: &WorkerStore,
@@ -106,7 +120,7 @@ fn recover_using(
     let mut unresolved_nodes: Vec<String> = Vec::new();
     let mut hidden: Vec<serde_json::Value> = Vec::new();
     for (node, _intent_at, ident) in store.launches(attempt)? {
-        let index = spec.nodes.iter().position(|n| n.node_id == node);
+        let index = launched_index(spec, node.as_str());
         let id = index.map(|i| command_id(attempt, i));
         // What a gone leader left under its group number is signalled only
         // with evidence that a member is the command's own.
@@ -230,7 +244,7 @@ fn recover_using(
     let root = spec.spool_dir();
     // No command of the attempt is alive any more: the FIFOs the lost
     // supervisor made for them have no writer and no reader.
-    remove_fifos(spec);
+    remove_fifos(spec, store);
     let (t, here) = match open_spool(spec, store)? {
         Ok(spool) => settle(store, &root, attempt, spool.end(), term)?,
         Err(e) => settle_without_spool(store, &root, attempt, "open", &e.to_string(), term)?,
@@ -341,6 +355,7 @@ mod tests {
             mask: Default::default(),
             artifacts: None,
             prepared_only: false,
+            ci: None,
         };
         Fx {
             _dir: dir,

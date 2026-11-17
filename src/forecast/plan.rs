@@ -205,10 +205,29 @@ pub struct AcceptedNode {
 /// The nodes of an accepted attempt with the command id each is registered
 /// under. The supervisor numbers nodes in execution order, not in the order
 /// of the payload, so this uses the same order.
+///
+/// A CI task has no command in its payload: its nodes are the `ci_steps`
+/// commands its frozen plan says it starts, named and numbered as the
+/// supervisor runs them (`step-0`, `step-1`, ...).
 pub fn accepted_nodes(
     attempt: &AttemptId,
     payload: &AttemptPayload,
+    ci_steps: usize,
 ) -> Result<Vec<AcceptedNode>, &'static str> {
+    if payload.ci_task.is_some() {
+        return (0..ci_steps)
+            .map(|index| {
+                let name = crate::supervisor::ci_task::step_node_name(index);
+                Ok(AcceptedNode {
+                    attempt_id: attempt.clone(),
+                    plan_digest: payload.plan_digest.clone(),
+                    node_id: NodeId::parse(&name).map_err(|_| "a step has no node id")?,
+                    command_id: crate::supervisor::spec::command_id(attempt, index),
+                    terminal: false,
+                })
+            })
+            .collect();
+    }
     let order = crate::worker::policy::execution_order(&payload.commands)?;
     Ok(order
         .into_iter()
@@ -859,7 +878,8 @@ mod tests {
         };
         // `test` is listed first but runs after `setup`.
         let mut payload = payload_of(vec![cmd("test", &["setup"]), cmd("setup", &[])]);
-        let nodes = accepted_nodes(&a, &payload).unwrap();
+        // (How many steps a plan would have says nothing without a CI task.)
+        let nodes = accepted_nodes(&a, &payload, 7).unwrap();
         assert_eq!(nodes[0].node_id.as_str(), "setup");
         assert_eq!(
             nodes[0].command_id,
@@ -873,12 +893,39 @@ mod tests {
         assert!(nodes.iter().all(|n| !n.terminal && n.attempt_id == a));
         assert_eq!(nodes[0].plan_digest, payload.plan_digest);
         payload.commands[1].depends_on = vec![NodeId::parse("test").unwrap()];
-        assert!(accepted_nodes(&a, &payload).is_err());
+        assert!(accepted_nodes(&a, &payload, 0).is_err());
+    }
+
+    #[test]
+    fn the_nodes_of_an_accepted_ci_task_are_the_steps_of_its_plan() {
+        let a = AttemptId::generate();
+        let mut payload = payload_of(vec![]);
+        payload.ci_task = Some(crate::wire::CiTask {
+            plan_digest: Digest::of_bytes(b"plan"),
+            task_id: "t".into(),
+            inputs: serde_json::json!({}),
+        });
+        let nodes = accepted_nodes(&a, &payload, 2).unwrap();
+        let names: Vec<&str> = nodes.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(names, ["step-0", "step-1"]);
+        for (index, node) in nodes.iter().enumerate() {
+            // The id the supervisor registers the step under.
+            assert_eq!(
+                node.command_id,
+                crate::supervisor::spec::command_id(&a, index)
+            );
+            assert_eq!(node.attempt_id, a);
+            assert_eq!(node.plan_digest, payload.plan_digest);
+            assert!(!node.terminal);
+        }
+        // A plan that is not here (or tells nothing) leaves no demand.
+        assert_eq!(accepted_nodes(&a, &payload, 0), Ok(vec![]));
     }
 
     fn payload_of(commands: Vec<CommandSpec>) -> AttemptPayload {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
+            ci_task: None,
             toolchains: None,
             outputs: Vec::new(),
             requirements: Default::default(),

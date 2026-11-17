@@ -92,13 +92,15 @@ impl Drop for Pipe {
 /// Read `pipe` into `out` until `done` is set and the pipe is empty (or
 /// [`LAST_DRAIN`] has passed since). The first failure to store goes to
 /// `error`, where the supervisor's heartbeat finds it; reading goes on.
-/// Everything passes through `mask` on its way to `out`.
+/// Everything passes through `mask` on its way to `out` (and to `tee`, a
+/// file that gets the same masked bytes appended, best effort).
 pub(crate) fn pump(
     pipe: &Pipe,
     out: &StreamWriter,
     mut mask: StreamMasker,
     done: &AtomicBool,
     error: &Mutex<Option<String>>,
+    tee: Option<&std::fs::File>,
 ) {
     let mut buf = vec![0u8; CHUNK];
     let mut failed = false;
@@ -109,6 +111,12 @@ pub(crate) fn pump(
             .get_or_insert(why);
     };
     let mut store = |bytes: Vec<u8>| {
+        if let Some(mut copy) = tee {
+            // A copy for whoever reads the step's log beside the spool:
+            // the same masked bytes. The spool is the record; a copy that
+            // cannot be written loses nothing of it.
+            let _ = std::io::Write::write_all(&mut copy, &bytes);
+        }
         if !failed {
             if let Err(e) = out.append(&bytes) {
                 failed = true;

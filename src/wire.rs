@@ -891,6 +891,33 @@ pub struct AttemptPayload {
     /// and shared. Not written when absent, like `artifacts`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub setup: Option<SetupSpec>,
+    /// The attempt is one task of a frozen CI plan, not a list of commands
+    /// (`commands` is then empty). Only sent to a worker that negotiated
+    /// [`CI_TASK_FEATURE`]. Not written when absent, like `artifacts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_task: Option<CiTask>,
+}
+
+/// The `hello` feature of [`CiTask`]: never required. A worker offers it
+/// only once it can also be sent the frozen plan; until that ships it is in
+/// no build's `SUPPORTED_FEATURES`, and a CI task that was not negotiated is
+/// refused.
+pub const CI_TASK_FEATURE: &str = "ci_task_v1";
+
+/// One task of a frozen CI plan (spec chapter 7). The plan itself is not
+/// here: its bytes reach the worker as a content-addressed blob, and the
+/// worker uses them only when they hash to `plan_digest`. The worker runs
+/// the task as the plan says and never plans again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiTask {
+    /// SHA-256 of the bytes of the frozen plan.
+    pub plan_digest: Digest,
+    /// The task of the plan to run.
+    pub task_id: String,
+    /// What the task is given about the jobs it needs (their results and
+    /// outputs), as the core of the plan reads it. The parent fills it in
+    /// when the jobs it names have ended; the worker hands it on unchanged.
+    pub inputs: serde_json::Value,
 }
 
 /// Submit an attempt. If the attempt was retired, or cancelled before this
@@ -1867,6 +1894,7 @@ mod tests {
 
     fn payload() -> AttemptPayload {
         AttemptPayload {
+            ci_task: None,
             toolchains: None,
             outputs: Vec::new(),
             requirements: Default::default(),
@@ -3232,6 +3260,33 @@ mod tests {
             serde_json::from_value::<AttemptPayload>(v).unwrap(),
             declared
         );
+    }
+
+    #[test]
+    fn a_ci_task_is_part_of_the_payload_hash_and_not_written_when_absent() {
+        let base = payload();
+        assert!(serde_json::to_value(&base)
+            .unwrap()
+            .get("ci_task")
+            .is_none());
+        let task = |inputs: serde_json::Value| CiTask {
+            plan_digest: dg("frozen plan"),
+            task_id: "ci.yml/build".into(),
+            inputs,
+        };
+        let mut ci = base.clone();
+        ci.ci_task = Some(task(json!({ "needs": {} })));
+        assert_ne!(payload_hash(&ci).unwrap(), payload_hash(&base).unwrap());
+        let wire = serde_json::to_value(&ci).unwrap();
+        assert_eq!(wire["ci_task"]["task_id"], "ci.yml/build");
+        assert_eq!(serde_json::from_value::<AttemptPayload>(wire).unwrap(), ci);
+        // The results of the jobs a task needs are part of what it runs.
+        let mut other = ci.clone();
+        other.ci_task = Some(task(json!({ "needs": { "build": {} } })));
+        assert_ne!(payload_hash(&other).unwrap(), payload_hash(&ci).unwrap());
+        let mut plan = ci.clone();
+        plan.ci_task.as_mut().unwrap().plan_digest = dg("another plan");
+        assert_ne!(payload_hash(&plan).unwrap(), payload_hash(&ci).unwrap());
     }
 
     #[test]

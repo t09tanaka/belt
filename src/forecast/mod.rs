@@ -89,15 +89,28 @@ fn compute_target(
     Ok((answer, fc.overlay))
 }
 
+/// How many commands an accepted CI task starts, as far as the frozen plan
+/// the worker holds tells (0 when it does not).
+pub type CiSteps<'a> = &'a dyn Fn(&crate::wire::CiTask) -> usize;
+
+/// The steps of the CI tasks, read from the plans kept under `worker_state`.
+fn ci_steps_in(worker_state: &Path) -> impl Fn(&crate::wire::CiTask) -> usize + '_ {
+    move |task| crate::worker::ci_task::planned_steps(worker_state, task)
+}
+
 /// The nodes of the attempts the worker has not finished. An attempt whose
 /// record cannot be read is an error: leaving its demand out would show a
 /// busy worker as free.
-fn accepted_of(attempts: &[AcceptedAttempt]) -> Result<Vec<AcceptedNode>, ApiError> {
+fn accepted_of(
+    attempts: &[AcceptedAttempt],
+    ci_steps: CiSteps<'_>,
+) -> Result<Vec<AcceptedNode>, ApiError> {
     let mut out = Vec::new();
     for rec in attempts {
         let payload: AttemptPayload = serde_json::from_value(rec.spec.clone())
             .map_err(|e| internal(&format!("attempt {} payload", rec.attempt_id), e))?;
-        let nodes = plan::accepted_nodes(&rec.attempt_id, &payload)
+        let steps = payload.ci_task.as_ref().map_or(0, ci_steps);
+        let nodes = plan::accepted_nodes(&rec.attempt_id, &payload, steps)
             .map_err(|e| internal(&format!("attempt {}", rec.attempt_id), e))?;
         out.extend(nodes);
     }
@@ -138,6 +151,21 @@ pub fn answer_with(
     max_epoch: CoordinatorEpoch,
     req: &ForecastRequest,
 ) -> Result<ForecastResponse, ApiError> {
+    // Without the worker's plans an accepted CI task has no known step.
+    answer_with_ci(ctx, cfg, ident, attempts, max_epoch, req, &|_| 0)
+}
+
+/// [`answer_with`]; `ci_steps` says how many commands an accepted CI task
+/// starts, so that its steps are demand before they are registered.
+pub fn answer_with_ci(
+    ctx: &Context,
+    cfg: &Config,
+    ident: &Ident,
+    attempts: &[AcceptedAttempt],
+    max_epoch: CoordinatorEpoch,
+    req: &ForecastRequest,
+    ci_steps: CiSteps<'_>,
+) -> Result<ForecastResponse, ApiError> {
     if req.coordinator_epoch < max_epoch {
         return Err(ApiError::new(
             ErrorCode::StaleEpoch,
@@ -150,7 +178,7 @@ pub fn answer_with(
     // Refuse an oversized request before any file is read.
     plan::check_request(req).map_err(plan::RequestError::into_api)?;
     let (accepted, insp) = gather(
-        || accepted_of(attempts),
+        || accepted_of(attempts, ci_steps),
         || inspect_with(ctx, cfg).map_err(|e| internal("inspect", e)),
         |node| {
             // A sidecar that cannot be read keeps the demand.
@@ -167,6 +195,7 @@ pub fn answer_with(
 pub fn answer(
     traffic_state_dir: &Path,
     traffic_config: Option<&Path>,
+    worker_state: &Path,
     ident: &Ident,
     attempts: &[AcceptedAttempt],
     max_epoch: CoordinatorEpoch,
@@ -177,7 +206,16 @@ pub fn answer(
         .unwrap_or_else(|| traffic_state_dir.join("config.toml"));
     let paths = Paths::new(traffic_state_dir, config_path);
     let cfg = Config::load(paths.config_file()).map_err(|e| internal("traffic config", e))?;
-    answer_with(&Context::new(paths), &cfg, ident, attempts, max_epoch, req)
+    let steps = ci_steps_in(worker_state);
+    answer_with_ci(
+        &Context::new(paths),
+        &cfg,
+        ident,
+        attempts,
+        max_epoch,
+        req,
+        &steps,
+    )
 }
 
 /// Derive command history only from an existing canonical clone, without preparing it.
@@ -277,7 +315,7 @@ pub fn answer_command(
         })
         .transpose()?;
     let (accepted, insp) = gather(
-        || accepted_of(attempts),
+        || accepted_of(attempts, &ci_steps_in(worker_state)),
         || inspect_with(&ctx, &cfg).map_err(|e| internal("inspect", e)),
         |node| {
             if let Loaded::Ok(sc) = managed::load_sidecar(&ctx, &node.command_id) {
@@ -298,6 +336,79 @@ mod tests {
     //! simulation task-traffic-controller runs, fed with exact numbers.
     use super::*;
     use crate::ids::{AgentEpoch, AttemptId, BuilderId, Digest, NodeId, WorkerBootId, WorkerId};
+
+    /// An accepted CI task is demand before any of its steps is registered:
+    /// its nodes are the steps of the plan the worker holds.
+    #[test]
+    fn the_accepted_nodes_of_a_ci_task_come_from_the_plan_the_worker_keeps() {
+        use crate::ci::execute::tests::{fixture, task_of, WORKFLOW};
+        let f = fixture(WORKFLOW);
+        let state = f.area.join("state");
+        let worker = WorkerId::parse("w-fc").unwrap();
+        let store = crate::storage::WorkerStore::open(&state, &worker).unwrap();
+        let bytes = serde_json::to_vec(&f.plan).unwrap();
+        let attempt = AttemptId::generate();
+        let d = Digest::of_bytes(b"x");
+        let payload = AttemptPayload {
+            ci_task: Some(crate::wire::CiTask {
+                plan_digest: Digest::of_bytes(&bytes),
+                task_id: task_of(&f.plan, "build").to_string(),
+                inputs: serde_json::json!({}),
+            }),
+            toolchains: None,
+            outputs: Vec::new(),
+            requirements: Default::default(),
+            in_place: false,
+            setup: None,
+            run_id: crate::ids::RunId::generate(),
+            task_id: crate::ids::TaskId::generate(),
+            generation: crate::ids::Generation(1),
+            source_id: crate::ids::SourceId::generate(),
+            plan_digest: d.clone(),
+            manifest_digest: d,
+            permit_id: None,
+            commands: vec![],
+            lease_ms: 60_000,
+            command_timeout_ms: None,
+            deadline_ms: None,
+            resource_wait_timeout_ms: None,
+            has_secret_bundle: false,
+            artifacts: Vec::new(),
+        };
+        store
+            .submit(
+                crate::storage::NewAcceptance {
+                    attempt_id: attempt.clone(),
+                    run_id: payload.run_id.clone(),
+                    task_id: payload.task_id.clone(),
+                    generation: crate::ids::Generation(1),
+                    payload_hash: crate::ids::PayloadHash::parse(&format!(
+                        "sha256:{}",
+                        "a".repeat(64)
+                    ))
+                    .unwrap(),
+                    coordinator_epoch: CoordinatorEpoch(1),
+                    spec: serde_json::to_value(&payload).unwrap(),
+                },
+                1,
+            )
+            .unwrap();
+        let attempts = store.list_nonterminal().unwrap();
+        // The plan has not arrived: the task has no known step yet.
+        assert_eq!(accepted_of(&attempts, &ci_steps_in(&state)).unwrap(), []);
+        crate::worker::ci_task::store_plan(&state, &bytes).unwrap();
+        let nodes = accepted_of(&attempts, &ci_steps_in(&state)).unwrap();
+        assert_eq!(nodes.len(), 1, "the one `run:` step of the job");
+        assert_eq!(nodes[0].node_id.as_str(), "step-0");
+        assert_eq!(nodes[0].attempt_id, attempt);
+        assert_eq!(
+            nodes[0].command_id,
+            crate::supervisor::spec::command_id(&attempt, 0)
+        );
+        // What says how many steps a task has is asked for CI tasks only.
+        assert_eq!(accepted_of(&attempts, &|_| 3).unwrap().len(), 3);
+        assert_eq!(accepted_of(&attempts, &|_| 0).unwrap(), []);
+    }
     use crate::wire::{
         ConcurrencyLimits, Correlation, ForecastField, RuntimeSource, SchemaVersion, Uncertainty,
         WaitReason, WorkloadNode, WorkloadPlan,

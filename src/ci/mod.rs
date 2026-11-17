@@ -3,6 +3,7 @@
 //! Snapshot capture and CLI wiring belong to the caller. This module never
 //! interprets CLI arguments, captures source, registers demand or runs steps.
 
+pub mod execute;
 pub mod summary;
 
 use local_ci::FrozenPlan;

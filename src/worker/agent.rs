@@ -1220,7 +1220,24 @@ impl Agent {
         // Every command was a prepared setup step (an install-only task with
         // its template there): the supervisor settles it as succeeded
         // without a command. The journal says which steps were not run.
-        let prepared_only = commands.is_empty();
+        // One task of a frozen CI plan has no command either: the plan has
+        // its steps, and the supervisor runs them as the plan's core asks.
+        let ci = match &payload.ci_task {
+            Some(task) => {
+                let env = super::ci_task::base_env(self.cfg.capability_profile.as_deref(), binding)
+                    .map_err(invalid)?;
+                Some(super::ci_task::prepare(
+                    &self.cfg.state_dir,
+                    &dir,
+                    &payload,
+                    task,
+                    &ws,
+                    env,
+                )?)
+            }
+            None => None,
+        };
+        let prepared_only = commands.is_empty() && ci.is_none();
         if prepared_only {
             self.note_once(
                 attempt,
@@ -1282,7 +1299,11 @@ impl Agent {
         // The declared artifacts, checked again against the secret files of
         // the source (which is here now: the workspace was made from it). An
         // acceptance that came before the source could not look.
-        let artifacts = if payload.artifacts.is_empty() && payload.outputs.is_empty() {
+        let artifacts = if payload.artifacts.is_empty()
+            && payload.outputs.is_empty()
+            && ci.is_none()
+        {
+            // (The result of a CI task leaves as an artifact.)
             None
         } else {
             let secrets = self.host.secret_paths(&payload)?.ok_or_else(|| {
@@ -1390,6 +1411,7 @@ impl Agent {
             mask: MaskValues(mask),
             artifacts,
             prepared_only,
+            ci,
         };
         self.check_capabilities(&payload)?;
         spec.validate().map_err(|e| invalid(e.to_string()))?;
@@ -1892,6 +1914,8 @@ impl Agent {
                 json!({ "locator": locator }),
             );
         }
+        // The frozen plans no unfinished attempt names go with the attempts.
+        super::ci_task::gc_plans(&self.cfg.state_dir, &self.store, self.cfg.retention_ms);
         Ok(report)
     }
 
@@ -2201,6 +2225,7 @@ impl Agent {
             && self.store.tombstone(&r.attempt_id).map_err(api)?.is_none();
         if fresh {
             policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
+            super::ci_task::check_accepted(&self.cfg.state_dir, &r.payload)?;
             self.check_capabilities(&r.payload)?;
             self.host.admit(&r.payload)?;
             for c in &r.payload.commands {
@@ -2697,6 +2722,7 @@ impl Agent {
         crate::forecast::answer(
             &self.cfg.traffic_state_dir,
             self.cfg.traffic_config.as_deref(),
+            &self.cfg.state_dir,
             &ident,
             &attempts,
             max_epoch,

@@ -1682,6 +1682,7 @@ impl Setups {
             mask: MaskValues(Vec::new()),
             artifacts: None,
             prepared_only: false,
+            ci: None,
         };
         sup.validate().map_err(|e| e.to_string())?;
         let bytes = serde_json::to_vec(&sup).map_err(|e| e.to_string())?;
