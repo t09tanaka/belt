@@ -299,7 +299,7 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                  t.cancel_requested_at_ms IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.unrunnable'),'') IN (?5,?6),
                  coalesce(json_extract(t.spec_json,'$.ci.rerun'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')),coalesce(json_extract(t.spec_json,'$.ci.shard_retry_forbidden'),0)
                  FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id ORDER BY aa.generation DESC LIMIT 1)
-                 WHERE t.run_id=?1 AND coalesce(json_extract(t.spec_json,'$.ci.dynamic_origin'),0)=0 AND (?2 IS NULL OR t.task_id=?2) AND t.task_id>?3 ORDER BY t.task_id LIMIT ?4",
+                 WHERE t.run_id=?1 AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.rtr_discovery.applied'),0)=0 AND coalesce(json_extract(t.spec_json,'$.ci.dynamic_origin'),0)=0 AND (?2 IS NULL OR t.task_id=?2) AND t.task_id>?3 ORDER BY t.task_id LIMIT ?4",
             )?;
             let rows = stmt.query_map(
                 params![
