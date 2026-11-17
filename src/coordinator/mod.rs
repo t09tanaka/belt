@@ -99,6 +99,10 @@ type Result<T, E = CoordinatorError> = std::result::Result<T, E>;
 /// from this by [`build_payload`] and nowhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
+    /// The task of a frozen CI plan this is. It has no `commands` then: its
+    /// steps are in the plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci: Option<CiSpec>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub toolchains: Option<crate::toolchain::contract::FrozenBundle>,
     #[serde(
@@ -130,6 +134,28 @@ pub struct TaskSpec {
     pub outputs: Vec<crate::wire::OutputDecl>,
 }
 
+/// A task of a frozen CI plan, as it is queued.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CiSpec {
+    /// What the worker is sent: the plan by its digest, the task, and the
+    /// results of the jobs it needs.
+    pub task: crate::wire::CiTask,
+    /// The jobs the task needs have not all ended: it has no inputs yet, and
+    /// it is not placed. The progression of its run takes this away when it
+    /// writes the inputs (`CoordinatorStore::release_ci_task`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub hold: bool,
+    /// How many commands the plan says the task starts
+    /// (`local_ci::plan_task_demand`): the demand a forecast is asked for.
+    #[serde(default)]
+    pub steps: u32,
+    /// Why the task cannot be run. Written together with the cancel of a
+    /// task that was never placed (`CoordinatorStore::fail_ci_tasks`), and
+    /// shown where the task is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrunnable: Option<String>,
+}
+
 /// The one place an [`AttemptPayload`] is made.
 pub fn build_payload(
     input: &PlaceInput,
@@ -141,7 +167,7 @@ pub fn build_payload(
         .clone()
         .ok_or_else(|| StorageError::Invalid(format!("run {} has no source", input.run_id)))?;
     Ok(AttemptPayload {
-        ci_task: None,
+        ci_task: spec.ci.as_ref().map(|ci| ci.task.clone()),
         toolchains: spec.toolchains.clone().map(Box::new),
         requirements: spec.requirements.clone(),
         in_place: spec.in_place,
@@ -618,7 +644,7 @@ impl Coordinator {
                     .validate(&spec.manifest_digest)
                     .map_err(|e| CoordinatorError::Invalid(e.into()))?;
             }
-            if spec.commands.is_empty() {
+            if spec.ci.is_none() && spec.commands.is_empty() {
                 return Err(CoordinatorError::Invalid(format!(
                     "task {task} has no command"
                 )));
@@ -1269,6 +1295,9 @@ impl Coordinator {
                     .try_fold(BTreeSet::new(), |mut ids, link| {
                         let inputs = link.placement_inputs()?;
                         ids.extend(inputs.ready.into_iter().map(|i| i.run_id));
+                        // A run whose input a worker refused is looked at
+                        // too: its wait gets a reason.
+                        ids.extend(link.input_refusals().into_iter().map(|(run, _)| run));
                         Some(ids)
                     })
                     .map(|ids| ids.into_iter().collect::<Vec<_>>())
@@ -1395,12 +1424,7 @@ impl Coordinator {
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
             coordinator_epoch: self.epoch(),
-            workload: scheduler::workload_of(
-                attempt_id,
-                &spec.plan_digest,
-                &spec.commands,
-                decide::ready_delay_ms(costs),
-            ),
+            workload: policy::workload_of_spec(attempt_id, spec, decide::ready_delay_ms(costs)),
             pending,
         });
         let wait = Duration::from_millis(self.sched.cfg.forecast_wait_ms);
@@ -1426,6 +1450,11 @@ impl Coordinator {
             // This task only; the ones behind it are placed.
             Err(e) => return self.note_unplaceable(task, format!("task spec: {e}")).await,
         };
+        if spec.ci.as_ref().is_some_and(|ci| ci.hold) {
+            // It waits for the jobs it needs; the queue does not list it.
+            return Ok(());
+        }
+        let lacks_ci = |w: &Reached| policy::lacks_ci_task(&spec, w.link.ci_task_negotiated());
         let parent_local = self
             .parent_local
             .lock()
@@ -1449,6 +1478,11 @@ impl Coordinator {
             }
         };
         let ready = |w: &Reached| readiness(w).is_some();
+        // A worker that did not take the input of the run (the frozen plan
+        // of a CI run it has no room for) is left out by name, so the wait
+        // has a reason where the task is shown.
+        let refusal =
+            |w: &Reached| policy::input_refusal(ready(w), w.link.input_refusals(), &task.run_id);
         let measured_cold = |w: &Reached| {
             if spec.in_place || !w.link.cold_eligible(&task.task_id) {
                 return false;
@@ -1461,7 +1495,7 @@ impl Coordinator {
             let costs = self.sched.query(&w.worker_id, &query);
             costs.ms[decide::TRANSFER].is_some() && !costs.assumed[decide::TRANSFER]
         };
-        if !round.open.is_empty() && !round.open.iter().any(&ready) {
+        if !round.open.is_empty() && !round.open.iter().any(|w| ready(w) || refusal(w).is_some()) {
             return Ok(());
         }
         let mut toolchain_eligible = BTreeSet::new();
@@ -1528,12 +1562,20 @@ impl Coordinator {
                     why: *why,
                 })
                 .collect();
+            excluded.extend(round.open.iter().filter_map(|w| {
+                refusal(w).map(|why| Excluded {
+                    unmet: vec![why],
+                    worker_id: w.worker_id.clone(),
+                    why: Exclusion::InputRefused,
+                })
+            }));
             let (compatible, mismatched): (Vec<&Reached>, Vec<&Reached>) = round
                 .open
                 .iter()
-                .filter(|w| ready(w) || measured_cold(w))
+                .filter(|w| refusal(w).is_none() && (ready(w) || measured_cold(w)))
                 .partition(|w| {
-                    (spec.toolchains.is_none() || toolchain_eligible.contains(&w.worker_id))
+                    !lacks_ci(w)
+                        && (spec.toolchains.is_none() || toolchain_eligible.contains(&w.worker_id))
                         && crate::toolchain::capability::missing_with_installable(
                             &spec.requirements,
                             w.capabilities.as_ref(),
@@ -1542,14 +1584,18 @@ impl Coordinator {
                         .is_empty()
                 });
             excluded.extend(mismatched.into_iter().map(|w| Excluded {
-                unmet: crate::toolchain::envdiff::with_steps(
-                    crate::toolchain::capability::missing(
-                        &spec.requirements,
+                unmet: if lacks_ci(w) {
+                    vec![policy::CI_TASK_UNMET.to_string()]
+                } else {
+                    crate::toolchain::envdiff::with_steps(
+                        crate::toolchain::capability::missing(
+                            &spec.requirements,
+                            w.capabilities.as_ref(),
+                        ),
+                        &spec.requirements.requires,
                         w.capabilities.as_ref(),
-                    ),
-                    &spec.requirements.requires,
-                    w.capabilities.as_ref(),
-                ),
+                    )
+                },
                 worker_id: w.worker_id.clone(),
                 why: Exclusion::CapabilityMismatch,
             }));
@@ -1933,10 +1979,22 @@ fn check_spec(
         source_id: Some(source_id.clone()),
         spec: spec.clone(),
     };
-    match demand_of(&input, lease_ms) {
-        Ok(_) => Ok(()),
-        Err(e) => Err(CoordinatorError::Invalid(format!("task {task_id}: {e}"))),
+    let invalid = |e: String| CoordinatorError::Invalid(format!("task {task_id}: {e}"));
+    demand_of(&input, lease_ms).map_err(|e| invalid(e.to_string()))?;
+    let parsed: TaskSpec =
+        serde_json::from_value(spec.clone()).map_err(|e| invalid(e.to_string()))?;
+    if parsed.ci.is_some() {
+        // What every worker would refuse is refused here, before the run exists.
+        let payload =
+            build_payload(&input, &parsed, lease_ms).map_err(|e| invalid(e.to_string()))?;
+        crate::worker::ci_task::check_payload(&payload).map_err(|why| invalid(why.into()))?;
+        if !policy::ci_declarations_fit(payload.artifacts.len(), payload.outputs.len()) {
+            return Err(invalid(
+                "a CI task declares too many artifacts and outputs: its result is one more".into(),
+            ));
+        }
     }
+    Ok(())
 }
 
 /// The payload hash and the demand recorded with a placement: the payload
@@ -1959,7 +2017,12 @@ fn demand_of(
             "the payload does not read back as it was written".into(),
         ));
     }
-    Ok((hash, json!({ "payload": stored })))
+    let mut demand = json!({ "payload": stored });
+    if let Some(ci) = &spec.ci {
+        // The payload does not say how many commands the task starts.
+        demand["ci_steps"] = json!(ci.steps);
+    }
+    Ok((hash, demand))
 }
 
 #[cfg(test)]

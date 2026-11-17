@@ -24,6 +24,8 @@ pub use retention::{ResultDeleteClaim, ResultGcPage};
 mod collect;
 mod live_log;
 pub use live_log::{LiveLogTarget, LogProgress};
+mod ci;
+pub use ci::{CiAttempt, CiTaskRow};
 mod control;
 mod retry;
 pub use retry::{PreparedRetry, RetryPreparation};

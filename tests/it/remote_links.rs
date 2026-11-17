@@ -163,6 +163,7 @@ async fn submit(
         format!("sleep {delay}")
     };
     let spec = TaskSpec {
+        ci: None,
         toolchains: None,
         in_place: false, outputs: Vec::new(), requirements: Default::default(),
         setup: None, plan_digest: Digest::of_bytes(b"plan"),

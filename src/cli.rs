@@ -346,6 +346,9 @@ pub fn run(cli: Cli) -> i32 {
     if matches!(&cli.command, Command::Ci(args) if matches!(args.sub, Some(CiSub::Plan))) {
         return run_ci_plan(&cli);
     }
+    if matches!(&cli.command, Command::Ci(_)) {
+        return run_ci(&cli);
+    }
 
     if matches!(&cli.command, Command::Exec(_))
         || matches!(
@@ -457,38 +460,115 @@ pub fn run(cli: Cli) -> i32 {
     ErrorCode::NotImplemented.exit_code()
 }
 
-fn run_ci_plan(cli: &Cli) -> i32 {
-    let result = (|| -> Result<_, crate::error::ApiError> {
-        use crate::{
-            config::{model::SourceMode, Overlay},
-            service::context::{runtime_spec, Context},
-        };
+/// The context `ci` and `ci plan` capture and plan in: the snapshot kind and
+/// revision of the command line over the configuration.
+fn ci_context(args: &CiArgs) -> Result<crate::service::context::Context, crate::error::ApiError> {
+    use crate::{
+        config::{model::SourceMode, Overlay},
+        service::context::{runtime_spec, Context},
+    };
+    let invalid = |message| crate::error::ApiError::new(ErrorCode::InvalidInput, message);
+    let source_mode = match args.snapshot.as_deref() {
+        None => None,
+        Some("worktree") => Some(SourceMode::Worktree),
+        Some("commit") => Some(SourceMode::Commit),
+        Some(_) => return Err(invalid("unsupported snapshot kind")),
+    };
+    if source_mode == Some(SourceMode::Worktree) && args.git_ref.is_some() {
+        return Err(invalid("worktree snapshot does not accept a revision"));
+    }
+    let env = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect();
+    let cwd = std::env::current_dir().map_err(|_| invalid("command directory is unavailable"))?;
+    let spec = runtime_spec(&env)
+        .map_err(|_| invalid("coordinator configuration is unavailable; initialize first"))?;
+    let overlay = Overlay {
+        source_mode,
+        ..Default::default()
+    };
+    Context::load_with_overlay(env, cwd, spec, &overlay)
+        .map_err(|_| invalid("planning configuration is invalid or unavailable"))
+}
+
+/// `ci`: run the frozen plan of the captured input as one run and wait for
+/// it. The exit code is the run's, as with `exec`.
+fn run_ci(cli: &Cli) -> i32 {
+    let result = (|| -> Result<crate::service::ci_run::CiReport, crate::error::ApiError> {
         let Command::Ci(args) = &cli.command else {
             unreachable!()
         };
-        let invalid = |message| crate::error::ApiError::new(ErrorCode::InvalidInput, message);
-        let source_mode = match args.snapshot.as_deref() {
-            None => None,
-            Some("worktree") => Some(SourceMode::Worktree),
-            Some("commit") => Some(SourceMode::Commit),
-            Some(_) => return Err(invalid("unsupported snapshot kind")),
-        };
-        if source_mode == Some(SourceMode::Worktree) && args.git_ref.is_some() {
-            return Err(invalid("worktree snapshot does not accept a revision"));
+        let context = ci_context(args)?;
+        let internal =
+            |e: std::io::Error| crate::error::ApiError::new(ErrorCode::Internal, e.to_string());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(internal)?;
+        let result = runtime.block_on(async {
+            let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+            let mut interrupt =
+                tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+                    .map_err(internal)?;
+            let watcher = tokio::spawn(async move {
+                while interrupt.recv().await.is_some() {
+                    if sender.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+            let result =
+                crate::service::ci_run::run(context, args.git_ref.clone(), &mut receiver).await;
+            watcher.abort();
+            let _ = watcher.await;
+            result
+        });
+        runtime.shutdown_background();
+        result
+    })();
+    match result {
+        Ok(ci) => {
+            let code = ci.report.cli_exit_code;
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":code==0,"result":ci})
+                );
+            } else {
+                print!("{}", crate::service::ci_run::render_jobs(&ci.jobs));
+                let crate::service::completion::Target::Run(run) = &ci.report.target else {
+                    unreachable!("ci waits for a run")
+                };
+                println!("{run} {}", ci.report.state);
+                if ci.report.collection_pending == Some(true) {
+                    eprintln!("collection is still pending");
+                }
+                if let Some(error) = &ci.report.error {
+                    eprintln!("error: {}", error.message);
+                }
+            }
+            code
         }
-        let env = std::env::vars_os()
-            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-            .collect();
-        let cwd =
-            std::env::current_dir().map_err(|_| invalid("command directory is unavailable"))?;
-        let spec = runtime_spec(&env)
-            .map_err(|_| invalid("coordinator configuration is unavailable; initialize first"))?;
-        let overlay = Overlay {
-            source_mode,
-            ..Default::default()
+        Err(error) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                );
+            } else {
+                eprintln!("error: {}", error.message);
+            }
+            error.code.exit_code()
+        }
+    }
+}
+
+fn run_ci_plan(cli: &Cli) -> i32 {
+    let result = (|| -> Result<_, crate::error::ApiError> {
+        let Command::Ci(args) = &cli.command else {
+            unreachable!()
         };
-        let context = Context::load_with_overlay(env, cwd, spec, &overlay)
-            .map_err(|_| invalid("planning configuration is invalid or unavailable"))?;
+        let context = ci_context(args)?;
         let prepared = crate::service::planning::prepare(context, args.git_ref.as_deref())?;
         let summary = prepared.plan().summary().clone();
         prepared.close()?;

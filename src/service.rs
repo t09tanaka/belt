@@ -1,5 +1,6 @@
 //! Resident processes and authenticated local command composition.
 pub mod bootstrap;
+pub mod ci_run;
 pub mod completion;
 pub mod context;
 pub mod control;

@@ -210,6 +210,9 @@ pub enum Exclusion {
     NoForecast,
     /// It did not take a submit earlier in this tick.
     NotTaking,
+    /// It did not take the input of the run (why is in `unmet`): the frozen
+    /// plan of a CI run it has no room for. Over when the input arrives.
+    InputRefused,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -470,7 +473,10 @@ impl Exclusion {
     /// slow or silent just now).
     pub fn lasts(self) -> bool {
         match self {
-            Exclusion::RefusedTask | Exclusion::Draining | Exclusion::CapabilityMismatch => true,
+            Exclusion::RefusedTask
+            | Exclusion::Draining
+            | Exclusion::CapabilityMismatch
+            | Exclusion::InputRefused => true,
             Exclusion::Unreached
             | Exclusion::Full
             | Exclusion::NoForecast
@@ -1155,8 +1161,13 @@ mod tests {
     #[test]
     fn only_exclusions_that_outlive_a_tick_last() {
         use Exclusion::*;
-        let lasting = [RefusedTask, Draining, CapabilityMismatch];
+        let lasting = [RefusedTask, Draining, CapabilityMismatch, InputRefused];
+        assert_eq!(
+            serde_json::to_value(InputRefused).unwrap(),
+            serde_json::json!("input_refused")
+        );
         for e in [
+            InputRefused,
             CapabilityMismatch,
             Unreached,
             Draining,

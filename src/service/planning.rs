@@ -134,7 +134,26 @@ pub fn prepare(context: Context, revision: Option<&str>) -> Result<Prepared, Api
         .map_err(|_| failure("captured planning input is unavailable"))?;
     let manifest = super::input::source_manifest_in(draft.path(), &run)
         .map_err(|_| failure("captured planning input is unavailable"))?;
-    let workflow_dirs = captured_workflow_dirs(&store, &manifest)?;
+    let frozen = freeze(&store, &manifest)?;
+    let plan = CiPlan::from_frozen(frozen)
+        .map_err(|_| failure("captured plan cannot be summarized safely"))?;
+    Ok(Prepared {
+        plan,
+        manifest,
+        store,
+        run,
+        draft,
+    })
+}
+
+/// Freeze the plan of a captured source, once: the workflows its own
+/// captured configuration selects, read from verified objects only. `ci
+/// plan` shows this plan and `ci` runs it.
+pub(super) fn freeze(
+    store: &SourceStore,
+    manifest: &SourceManifest,
+) -> Result<local_ci::FrozenPlan, ApiError> {
+    let workflow_dirs = captured_workflow_dirs(store, manifest)?;
     let options = PinnedPlanOptions {
         workflow_dirs_override: Some(workflow_dirs),
         filters: Filters {
@@ -148,26 +167,17 @@ pub fn prepare(context: Context, revision: Option<&str>) -> Result<Prepared, Api
         base_branch: None,
         changed_files: None,
     };
-    let frozen = store
+    store
         .object_store()
         .and_then(|view| {
             view.with_sdk(|objects| {
                 Ok(local_ci::build_frozen_plan_from_source(
-                    objects, &manifest, &options,
+                    objects, manifest, &options,
                 ))
             })
         })
         .map_err(|_| failure("captured planning input is unavailable"))?
-        .map_err(|error| ApiError::new(ErrorCode::InvalidInput, error.to_string()))?;
-    let plan = CiPlan::from_frozen(frozen)
-        .map_err(|_| failure("captured plan cannot be summarized safely"))?;
-    Ok(Prepared {
-        plan,
-        manifest,
-        store,
-        run,
-        draft,
-    })
+        .map_err(|error| ApiError::new(ErrorCode::InvalidInput, error.to_string()))
 }
 
 #[cfg(test)]

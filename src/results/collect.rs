@@ -182,9 +182,23 @@ fn declared_of(payload: &Option<Value>) -> std::result::Result<Declared, &'stati
             .artifacts
             .iter()
             .map(|d| (d.name.clone(), d.if_missing == MissingPolicy::Required))
+            .chain(ci_result_of(&payload))
             .collect(),
         node: payload.commands.first().map(|c| c.node_id.clone()),
         payload,
+    })
+}
+
+/// The result of a CI task (the outcomes and outputs of its jobs) is an
+/// artifact its payload cannot declare (the name is reserved) and the parent
+/// requires: without it the jobs that need the task's cannot be given their
+/// inputs, so the task is not a success.
+fn ci_result_of(payload: &AttemptPayload) -> Option<(String, bool)> {
+    payload.ci_task.as_ref().map(|_| {
+        (
+            crate::supervisor::ci_task::RESULT_ARTIFACT.to_string(),
+            true,
+        )
     })
 }
 
@@ -1173,6 +1187,11 @@ impl Collector {
                     continue;
                 }
             };
+            if declared.payload.ci_task.is_some() {
+                // The steps of a CI task are nodes of their own; their logs
+                // are read when the attempt ended.
+                continue;
+            }
             let Some(node) = declared.node else {
                 report
                     .faults
@@ -1411,6 +1430,39 @@ impl Collector {
         Ok(Flow::Again)
     }
 
+    /// The verdict a collection is closed with. For a CI task the result of
+    /// the task has to be more than here: a result that cannot be read as
+    /// the result of that task is as good as none (the jobs that need the
+    /// task's cannot be given it), so the task is not a success.
+    async fn judged(
+        &self,
+        rec: &AttemptRecord,
+        declared: &Declared,
+        result: &GetResultResponse,
+    ) -> Result<Verdict> {
+        let verdict = verdict_of(&declared.names(result), result);
+        let name = crate::supervisor::ci_task::RESULT_ARTIFACT;
+        let record = result.artifacts.iter().find(|r| r.name == name);
+        let (Some(ci), Some(record), Verdict::Complete) =
+            (&declared.payload.ci_task, record, verdict)
+        else {
+            return Ok(verdict);
+        };
+        let (attempt, digest, task) = (
+            rec.attempt_id.clone(),
+            record.digest.clone(),
+            ci.task_id.clone(),
+        );
+        let usable = self
+            .fs(move |files| {
+                let path = files.artifact_path(&attempt, &digest);
+                let read = crate::ci::advance::read_result_at(&path, &digest);
+                Ok(read.is_ok_and(|result| result.task == task))
+            })
+            .await?;
+        Ok(plan::judge_ci_result(usable))
+    }
+
     /// Everything of the recorded result is verified and durable here: tell
     /// the worker, by digest, and close on its answer.
     async fn ack(
@@ -1431,7 +1483,7 @@ impl Collector {
         });
         match link.call(request).await {
             Ok(Response::AckCollected(r)) if r.attempt_id == a && r.released => {
-                let verdict = verdict_of(&declared.names(result), result);
+                let verdict = self.judged(rec, declared, result).await?;
                 let digest = digest.clone();
                 self.db(move |s| s.close_collection(&a, Some(&digest), verdict, true, wall_ms()))
                     .await?;
@@ -1454,7 +1506,7 @@ impl Collector {
                 // the worker deleted what it released). Everything is here,
                 // verified: the collection is closed, as not acknowledged.
                 AckRefusal::Gone => {
-                    let verdict = verdict_of(&declared.names(result), result);
+                    let verdict = self.judged(rec, declared, result).await?;
                     let digest = digest.clone();
                     self.db(move |s| {
                         s.close_collection(&a, Some(&digest), verdict, false, wall_ms())

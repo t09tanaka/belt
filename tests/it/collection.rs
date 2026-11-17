@@ -140,6 +140,12 @@ struct State {
     fail: Option<(&'static str, ErrorCode, u32)>,
     /// Every request that arrived: its kind and (for bytes) its offset.
     ops: Vec<(&'static str, u64)>,
+    /// The connection did not negotiate `ci_task_v1`.
+    no_ci: bool,
+    /// The worker did not take the frozen plan of any run, for this reason:
+    /// no input is ready there.
+    refused_plan: Option<String>,
+    refused_runs: Vec<RunId>,
 }
 
 struct Worker {
@@ -426,6 +432,28 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
 }
 
 impl WorkerLink for Worker {
+    fn ci_task_negotiated(&self) -> bool {
+        !self.state.lock().unwrap().no_ci
+    }
+    fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
+        let refused = self.state.lock().unwrap().refused_plan.is_some();
+        refused.then(|| remote_task_runner::coordinator::PlacementInputs {
+            generation: 1,
+            ready: Vec::new(),
+            identity: None,
+        })
+    }
+    fn input_refusals(&self) -> Vec<(RunId, String)> {
+        let state = self.state.lock().unwrap();
+        let why = state.refused_plan.iter();
+        why.flat_map(|why| {
+            state
+                .refused_runs
+                .iter()
+                .map(|run| (run.clone(), why.clone()))
+        })
+        .collect()
+    }
     fn cost_transport(&self) -> Option<remote_task_runner::scheduler::measured::Transport> {
         Some(remote_task_runner::scheduler::measured::Transport {
             worker_boot: WorkerBootId::parse("boot-1").unwrap(),
@@ -559,6 +587,7 @@ fn decl(name: &str, if_missing: MissingPolicy) -> ArtifactDecl {
 
 fn spec(artifacts: Vec<ArtifactDecl>) -> TaskSpec {
     TaskSpec {
+        ci: None,
         toolchains: None,
         outputs: Vec::new(),
         requirements: Default::default(),
@@ -2761,4 +2790,536 @@ async fn measured_terminal_tail_durable_close_failure_keeps_sample_unknown_after
             .unwrap(),
         0
     );
+}
+
+// ------------------------------------------------------------- CI tasks
+
+use remote_task_runner::supervisor::ci_task::RESULT_ARTIFACT;
+
+/// The frozen plan of a workflow, made from a capture of its own (in a
+/// directory of its own: the parent of these tests holds no source).
+fn ci_plan(workflow: &str) -> local_ci::FrozenPlan {
+    use local_ci::frozen::Filters;
+    use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(project.join(".github/workflows")).unwrap();
+    std::fs::write(project.join(".github/workflows/ci.yml"), workflow).unwrap();
+    let env: BTreeMap<String, String> = [
+        ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+        ("HOME", home.to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let store = SourceStore::open(&dir.path().join("state")).unwrap();
+    let captured = capture_for_run(
+        &env,
+        &store,
+        &RunId::generate(),
+        &SourceRequest::Directory { dir: project },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let manifest = store
+        .manifest(&captured.manifest.ci_source_id)
+        .unwrap()
+        .unwrap();
+    let options = local_ci::PinnedPlanOptions {
+        workflow_dirs_override: None,
+        filters: Filters {
+            all: true,
+            include_disabled: false,
+            workflows_dirs: vec![],
+            workflows: vec![],
+            jobs: vec![],
+        },
+        disabled: vec![],
+        base_branch: None,
+        changed_files: None,
+    };
+    remote_task_runner::ci::execute::freeze_plan(&store, &manifest, &options).unwrap()
+}
+
+const CI_CHAIN: &str = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    outputs:\n      version: ${{ steps.v.outputs.version }}\n    steps:\n      - id: v\n        run: echo \"version=1.2.3\" >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one\n      - run: echo two\n";
+
+/// The id of the task of `plan` that runs `job`.
+fn ci_task_of(plan: &local_ci::FrozenPlan, job: &str) -> String {
+    let task = plan.tasks.iter().find(|t| t.jobs.iter().any(|j| j == job));
+    task.unwrap().id.clone()
+}
+
+/// The result of a task of one job, as its worker keeps it.
+fn ci_result(task: &str, job: &str, status: &str, outputs: serde_json::Value) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "schema_version": 1, "task": task, "jobs": [], "receipt_ignored": null, "artifacts": [],
+        "outcomes": [{
+            "job": job, "variant": null, "status": status, "outputs": outputs,
+            "skipped": null, "ancestor_failed": false,
+        }],
+    }))
+    .unwrap()
+}
+
+/// Queue the tasks of `plan` as one run, as `ci` does. The task ids, by the
+/// job each runs.
+async fn ci_run(
+    fx: &Fx,
+    c: &Coordinator,
+    plan: &local_ci::FrozenPlan,
+) -> (RunId, BTreeMap<String, TaskId>) {
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
+    let manifest = Digest::of_bytes(b"manifest");
+    let none = Default::default();
+    let specs =
+        remote_task_runner::service::ci_run::task_specs(plan, &digest, &manifest, &none, None)
+            .unwrap();
+    let (run, source) = (RunId::generate(), SourceId::generate());
+    c.store().put_source_ref(&source, &manifest, 1).unwrap();
+    let mut ids = BTreeMap::new();
+    let mut tasks = Vec::new();
+    for (plan_task, spec) in specs {
+        let id = TaskId::generate();
+        let task = plan.tasks.iter().find(|t| t.id == plan_task).unwrap();
+        ids.insert(task.jobs[0].clone(), id.clone());
+        tasks.push((id, spec));
+    }
+    c.enqueue(run.clone(), source, tasks).await.unwrap();
+    (run, ids)
+}
+
+fn ci_advance(fx: &Fx, c: &Coordinator) -> remote_task_runner::ci::advance::Pass {
+    let results = fx.dir.path().join("results");
+    remote_task_runner::ci::advance::advance_runs(c.store(), fx.dir.path(), &results, wall_ms())
+        .unwrap()
+}
+
+/// Collect until the collection of `a` is closed (a pass has a budget, and
+/// the result of a task is many chunks here). What the passes reported.
+async fn ci_collect(c: &Coordinator, files: &Arc<ResultStore>, a: &AttemptId) -> CollectReport {
+    let mut all = CollectReport::default();
+    for _ in 0..50 {
+        let report = collect(c, files).await;
+        all.collected.extend(report.collected);
+        all.required_missing.extend(report.required_missing);
+        all.gave_up.extend(report.gave_up);
+        let row = c.store().collection(a).unwrap();
+        if row.is_some_and(|row| row.verdict.is_some()) {
+            break;
+        }
+    }
+    all
+}
+
+fn ci_out(a: &AttemptId, p: &AttemptPayload, result: &[u8]) -> Out {
+    Out {
+        has_result: true,
+        artifacts: vec![stored(a, p, RESULT_ARTIFACT, result)],
+        log_closed: true,
+        ..Out::default()
+    }
+}
+
+/// A38, with the workers in memory: the job that needs another is not
+/// placed before the other's result is on the parent, it then starts on
+/// another worker with the outputs, and neither task is ever run twice. A
+/// worker that did not negotiate `ci_task_v1` is given no CI task, and the
+/// placement says why it was left out. A10: the forecast is asked for every
+/// step of the task.
+#[tokio::test]
+async fn a38_a_job_that_needs_another_starts_elsewhere_once_the_result_is_here_and_runs_once() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let other = Worker::new("w-b");
+    other.set(|s| s.no_ci = true);
+    c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+        .unwrap();
+    let plan = ci_plan(CI_CHAIN);
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    let (build, test) = (ids["build"].clone(), ids["test"].clone());
+    let attempts = |task: &TaskId| c.store().attempts_of_task(task).unwrap();
+
+    // Only the task that needs nothing is placed, and only where CI tasks
+    // are taken.
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let a = report.placed[0].clone();
+    assert_eq!(attempts(&build)[0].attempt_id, a);
+    assert_eq!(other.count("submit"), 0);
+    let decision = remote_task_runner::scheduler::reason_of(c.store(), &a)
+        .unwrap()
+        .unwrap();
+    let left_out = decision.excluded.iter().find(|e| e.worker_id == other.id);
+    assert_eq!(left_out.unwrap().unmet, ["protocol feature ci_task_v1"]);
+    let demand = c.store().placement_demand(&a).unwrap().unwrap();
+    assert_eq!(demand["ci_steps"], 1);
+    // While build runs nothing is released, and test is not placed.
+    assert!(ci_advance(&fx, &c).released.is_empty());
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    assert!(attempts(&test).is_empty());
+
+    // build ends. Its result is on the parent only after the collection.
+    let p = fx.w.payload(&a);
+    assert_eq!(
+        p.ci_task.as_ref().unwrap().task_id,
+        ci_task_of(&plan, "build")
+    );
+    assert!(p.commands.is_empty());
+    let outputs = serde_json::json!({"version": "1.2.3"});
+    let result = ci_result(&ci_task_of(&plan, "build"), "build", "success", outputs);
+    end(&fx, &c, &a, Outcome::Succeeded, ci_out(&a, &p, &result)).await;
+    assert!(
+        ci_advance(&fx, &c).released.is_empty(),
+        "not before it is collected"
+    );
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    let report = ci_collect(&c, &files, &a).await;
+    assert_eq!(report.collected, vec![a.clone()], "{report:?}");
+    let pass = ci_advance(&fx, &c);
+    assert_eq!(pass.released, vec![test.clone()]);
+    assert_eq!(pass.plans.len(), 1);
+    assert!(pass.faults.is_empty() && pass.unrunnable.is_empty());
+    assert!(ci_advance(&fx, &c).released.is_empty(), "released once");
+
+    // The worker that ran build is away; the other one takes CI tasks now.
+    fx.w.set(|s| s.offline = true);
+    other.set(|s| s.no_ci = false);
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let b = report.placed[0].clone();
+    assert_eq!(attempts(&test)[0].attempt_id, b);
+    let sent = other.payload(&b);
+    let ci = sent.ci_task.clone().unwrap();
+    assert_eq!(ci.task_id, ci_task_of(&plan, "test"));
+    assert_eq!(ci.inputs["needs"]["build"]["status"], "success");
+    assert_eq!(ci.inputs["needs"]["build"]["outputs"]["version"], "1.2.3");
+    let demand = c.store().placement_demand(&b).unwrap().unwrap();
+    assert_eq!(demand["ci_steps"], 2, "both steps of test are asked for");
+
+    // Whatever is looked at again, neither task gets a second attempt.
+    for _ in 0..3 {
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        assert!(c.tick().await.unwrap().placed.is_empty());
+    }
+    assert_eq!(attempts(&build).len(), 1);
+    assert_eq!(attempts(&test).len(), 1);
+
+    // test ends on the other worker and the run is settled as a success.
+    let result = ci_result(
+        &ci_task_of(&plan, "test"),
+        "test",
+        "success",
+        serde_json::json!({}),
+    );
+    other.finish(&b, Outcome::Succeeded, ci_out(&b, &sent, &result));
+    assert_eq!(c.tick().await.unwrap().settled, vec![b.clone()]);
+    assert_eq!(ci_collect(&c, &files, &b).await.collected, vec![b]);
+    let target = remote_task_runner::service::completion::Target::Run(run.clone());
+    assert_eq!(c.store().completion(target).unwrap().exit_code(), Some(0));
+    let lines =
+        remote_task_runner::service::ci_run::job_lines(c.store(), files.root(), &run).unwrap();
+    let seen: Vec<_> = lines
+        .iter()
+        .map(|l| (l.job.as_deref(), l.status.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [(Some("build"), "success"), (Some("test"), "success")]
+    );
+}
+
+/// The result of a CI task is required by the parent although no payload
+/// can declare it. A worker that leaves none, or one that cannot be read
+/// as the result of that task, does not make the task a success; the job
+/// that needs it is given a failure. A worker that returns only this
+/// artifact is collected.
+#[tokio::test]
+async fn a_ci_task_without_a_usable_result_is_no_success_and_the_next_job_sees_a_failure() {
+    for unreadable in [false, true] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let plan = ci_plan(CI_CHAIN);
+        let (run, ids) = ci_run(&fx, &c, &plan).await;
+        let a = c.tick().await.unwrap().placed[0].clone();
+        let p = fx.w.payload(&a);
+        // The command "succeeded" on the worker.
+        let out = if unreadable {
+            // The result of another task under the reserved name.
+            let other = ci_result("another task", "build", "success", serde_json::json!({}));
+            ci_out(&a, &p, &other)
+        } else {
+            Out {
+                has_result: true,
+                log_closed: true,
+                ..Out::default()
+            }
+        };
+        end(&fx, &c, &a, Outcome::Succeeded, out).await;
+        let report = ci_collect(&c, &files, &a).await;
+        assert_eq!(report.required_missing, vec![a.clone()], "{unreadable}");
+        assert!(report.collected.is_empty());
+        let rec = c.store().get_attempt(&a).unwrap().unwrap();
+        assert!(rec.collection_failed_at_ms.is_some(), "{unreadable}");
+        assert!(!rec.receipts.reached(Receipt::Collected));
+
+        // The job that needs it is told that it failed; whether it runs is
+        // for the core on the worker to say.
+        assert_eq!(ci_advance(&fx, &c).released, vec![ids["test"].clone()]);
+        let b = c.tick().await.unwrap().placed[0].clone();
+        let sent = fx.w.payload(&b);
+        let inputs = &sent.ci_task.as_ref().unwrap().inputs;
+        assert_eq!(
+            inputs["needs"]["build"]["status"], "failure",
+            "{unreadable}"
+        );
+        assert_eq!(inputs["needs"]["build"]["outputs"], serde_json::json!({}));
+
+        // It comes back skipped, with nothing but its result: collected.
+        let mut skipped: serde_json::Value = serde_json::from_slice(&ci_result(
+            &ci_task_of(&plan, "test"),
+            "test",
+            "skipped",
+            serde_json::json!({}),
+        ))
+        .unwrap();
+        skipped["outcomes"][0]["skipped"] = "needs failed".into();
+        let result = serde_json::to_vec(&skipped).unwrap();
+        end(&fx, &c, &b, Outcome::Succeeded, ci_out(&b, &sent, &result)).await;
+        assert_eq!(ci_collect(&c, &files, &b).await.collected, vec![b]);
+        let target = remote_task_runner::service::completion::Target::Run(run.clone());
+        let exit = c.store().completion(target).unwrap().exit_code();
+        assert!(exit.is_some_and(|code| code != 0), "{exit:?}");
+        let lines =
+            remote_task_runner::service::ci_run::job_lines(c.store(), files.root(), &run).unwrap();
+        let test = lines
+            .iter()
+            .find(|l| l.job.as_deref() == Some("test"))
+            .unwrap();
+        assert_eq!(test.status, "skipped");
+        assert_eq!(test.skipped.as_deref(), Some("needs failed"));
+        if !unreadable {
+            assert!(lines
+                .iter()
+                .any(|l| l.job.is_none() && l.status == "no_result"));
+        }
+    }
+}
+
+/// A cancel of the run reaches the tasks that wait: they are never
+/// released, and the run settles as cancelled.
+#[tokio::test]
+async fn a_cancelled_ci_run_releases_nothing_more_and_settles() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let plan = ci_plan(CI_CHAIN);
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    let a = c.tick().await.unwrap().placed[0].clone();
+    c.cancel_run(run.clone()).await.unwrap();
+    let p = fx.w.payload(&a);
+    let result = ci_result(
+        &ci_task_of(&plan, "build"),
+        "build",
+        "success",
+        serde_json::json!({}),
+    );
+    fx.w.finish(&a, Outcome::Cancelled, ci_out(&a, &p, &result));
+    for _ in 0..3 {
+        c.tick().await.unwrap();
+        collect(&c, &files).await;
+        assert!(ci_advance(&fx, &c).released.is_empty());
+    }
+    assert!(c.store().attempts_of_task(&ids["test"]).unwrap().is_empty());
+    assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
+    let target = remote_task_runner::service::completion::Target::Run(run);
+    let snapshot = c.store().completion(target).unwrap();
+    assert!(snapshot.settled());
+    assert!(snapshot.exit_code().is_some_and(|code| code != 0));
+    // A released spec that still waits is never written.
+    let waiting = serde_json::json!({"ci": {"hold": true}});
+    assert!(c
+        .store()
+        .release_ci_task(&ids["test"], &waiting, 1)
+        .is_err());
+    assert!(!c
+        .store()
+        .release_ci_task(&ids["test"], &serde_json::json!({}), 1)
+        .unwrap());
+}
+
+/// A run whose frozen plan the parent does not have any more does not wait
+/// for it: the job that was not placed yet is cancelled with the reason,
+/// the job that runs ends, and the run settles as no success.
+#[tokio::test]
+async fn a_ci_run_whose_plan_is_gone_cancels_what_waits_and_says_why() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let plan = ci_plan(CI_CHAIN);
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    let (build, test) = (ids["build"].clone(), ids["test"].clone());
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let a = report.placed[0].clone();
+    assert!(ci_advance(&fx, &c).failed.is_empty());
+
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
+    std::fs::remove_file(remote_task_runner::worker::ci_task::plan_path(
+        fx.dir.path(),
+        &digest,
+    ))
+    .unwrap();
+    let pass = ci_advance(&fx, &c);
+    assert_eq!(pass.failed.len(), 1, "{pass:?}");
+    assert_eq!(pass.failed[0].0, run);
+    let why = pass.failed[0].1.clone();
+    assert_eq!(pass.unrunnable, vec![(test.clone(), why.clone())]);
+    assert!(pass.faults.is_empty() && pass.released.is_empty());
+    let events: Vec<_> = c
+        .store()
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "ci_task_unrunnable")
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].run_id.as_deref(), Some(run.as_str()));
+    assert_eq!(events[0].payload["task"], test.as_str());
+    assert_eq!(events[0].payload["reason"], why.as_str());
+    let shown = c.store().query_task(test.clone()).unwrap().unwrap();
+    assert_eq!(shown.unrunnable.as_deref(), Some(why.as_str()));
+    assert!(shown.cancel_requested_at_ms.is_some());
+
+    // The job that runs is not touched, and ends as it would have.
+    assert!(c
+        .store()
+        .query_task(build.clone())
+        .unwrap()
+        .unwrap()
+        .cancel_requested_at_ms
+        .is_none());
+    let p = fx.w.payload(&a);
+    let result = ci_result(
+        &ci_task_of(&plan, "build"),
+        "build",
+        "success",
+        serde_json::json!({"version": "1"}),
+    );
+    end(&fx, &c, &a, Outcome::Succeeded, ci_out(&a, &p, &result)).await;
+    assert_eq!(ci_collect(&c, &files, &a).await.collected, vec![a]);
+    // Nothing is looked at, released or placed any more.
+    for _ in 0..2 {
+        assert_eq!(ci_advance(&fx, &c), Default::default());
+        assert!(c.tick().await.unwrap().placed.is_empty());
+    }
+    assert!(c.store().attempts_of_task(&test).unwrap().is_empty());
+    let target = remote_task_runner::service::completion::Target::Run(run.clone());
+    let snapshot = c.store().completion(target).unwrap();
+    assert!(snapshot.settled());
+    let lines =
+        remote_task_runner::service::ci_run::job_lines(c.store(), files.root(), &run).unwrap();
+    let seen: Vec<_> = lines
+        .iter()
+        .map(|l| (l.job.as_deref(), l.status.as_str(), l.reason.as_deref()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (Some("build"), "success", None),
+            (None, "no_result", Some(why.as_str()))
+        ]
+    );
+}
+
+/// A worker that did not take the frozen plan of a run is left out of the
+/// placement of its tasks by name: the wait has a reason where the task is
+/// shown, another worker takes the task, and the exclusion is over when the
+/// worker takes the plan.
+#[tokio::test]
+async fn a_worker_that_did_not_take_the_plan_is_left_out_with_the_reason_until_it_does() {
+    use remote_task_runner::scheduler::decide::Exclusion;
+    const WHY: &str = "frozen plan not taken: the worker holds 256 frozen plans (OVERLOADED)";
+    let fx = fx();
+    let (c, _files) = fx.open();
+    fx.w.set(|s| s.refused_plan = Some(WHY.into()));
+    let plan = ci_plan(CI_CHAIN);
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    // Before the worker was asked to take the plan nothing is known, and
+    // nothing is said.
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    fx.w.set(|s| s.refused_runs.push(run.clone()));
+    let build = ids["build"].clone();
+    let waits = || -> Vec<remote_task_runner::storage::Event> {
+        let events = c.store().events_after(0, 1000).unwrap();
+        events
+            .into_iter()
+            .filter(|e| e.kind == remote_task_runner::scheduler::EVENT_TASK_WAITING)
+            .collect()
+    };
+
+    // The only worker did not take the plan: nothing is placed, and the run
+    // says why, once.
+    for _ in 0..3 {
+        assert!(c.tick().await.unwrap().placed.is_empty());
+    }
+    let recorded = waits();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].run_id.as_deref(), Some(run.as_str()));
+    assert_eq!(recorded[0].payload["task"], build.as_str());
+    assert!(recorded[0].payload["blocked_reason"].is_null());
+    let excluded = &recorded[0].payload["decision"]["excluded"];
+    assert_eq!(excluded.as_array().unwrap().len(), 1);
+    assert_eq!(excluded[0]["worker_id"], "w-a");
+    assert_eq!(excluded[0]["why"], "input_refused");
+    assert_eq!(excluded[0]["unmet"], serde_json::json!([WHY]));
+    let shown = c.store().query_task(build.clone()).unwrap().unwrap();
+    let placement = shown.placement.unwrap();
+    assert_eq!(placement.blocked_reason, None);
+    assert_eq!(placement.excluded.len(), 1);
+    assert_eq!(placement.excluded[0].why, Exclusion::InputRefused);
+    assert_eq!(placement.excluded[0].unmet, [WHY]);
+
+    // Another worker takes it; the placement keeps who was left out and why.
+    let other = Worker::new("w-b");
+    c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+        .unwrap();
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let a = report.placed[0].clone();
+    assert_eq!(other.count("submit"), 1);
+    assert_eq!(fx.w.count("submit"), 0);
+    let decision = remote_task_runner::scheduler::reason_of(c.store(), &a)
+        .unwrap()
+        .unwrap();
+    let left_out: Vec<_> = decision
+        .excluded
+        .iter()
+        .filter(|e| e.worker_id == fx.w.id)
+        .collect();
+    assert_eq!(left_out.len(), 1);
+    assert_eq!(left_out[0].why, Exclusion::InputRefused);
+    assert_eq!(left_out[0].unmet, [WHY]);
+
+    // The other worker is away. The next run waits again, until the first
+    // worker has taken the plan: then it is a candidate like any other.
+    other.set(|s| s.offline = true);
+    let (run_2, ids_2) = ci_run(&fx, &c, &plan).await;
+    fx.w.set(|s| s.refused_runs.push(run_2.clone()));
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    fx.w.set(|s| s.refused_plan = None);
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let b = report.placed[0].clone();
+    let attempts = c.store().attempts_of_task(&ids_2["build"]).unwrap();
+    assert_eq!(attempts[0].attempt_id, b);
+    assert_eq!(fx.w.count("submit"), 1);
+    let decision = remote_task_runner::scheduler::reason_of(c.store(), &b)
+        .unwrap()
+        .unwrap();
+    assert!(decision
+        .excluded
+        .iter()
+        .all(|e| e.why != Exclusion::InputRefused));
 }
