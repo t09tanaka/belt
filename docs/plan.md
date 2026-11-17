@@ -1256,7 +1256,7 @@ S21 で終わったもの: `workers diff`（1 本目）、`workers sync` の計�
 S21 の残り（必須。S21 は完了していない）:
 1. policy digest（task-traffic-controller の実効 policy）を `envreport::collect` が測らない（常に `None`）。diff は `not_measured`、doctor は `not_checked` になり、worker を登録した親の doctor は差が無くても exit 0 にならない。doctor 自身の `traffic_policy` は host ごとの 2 つの scope を比べるだけで、親と worker の間は比べていない。
 2. doctor の `fail` の範囲は仕様に定めが無い。`auto_installable`（`workers sync` で直る差）と disk の不足も fail にした。notice に下げるかは未決定。
-3. doctor（`worker-service doctor`）は journal に記録した service の env で事実を集め、diff（`worker-service env`）は worker.json の env で測る。install が同じ値を書くが、読む場所は 2 つある。
+3. doctor（`worker-service doctor`）は journal に記録した service の env で事実を集め、diff（`worker-service env`）は worker.json の env で測る。読む場所が 2 つあり、doctor 側は `XDG_CONFIG_HOME`・`XDG_STATE_HOME` を除く。2 つが同じ測定になることは確かめていない。
 4. 親の service の env が保持されていないとき、`workers diff` は測定を拒否し（PATH が要る）、doctor は呼び出した shell の env で測る。
 5. doctor は worker ごとに ssh を 3 回（doctor・hello・env）直列で行う。`diff` の worker 省略時の並列化と合わせて未着手。
 6. 3 本目の節の残り 2〜4 と 6、4〜6 本目の節の残り（上の各節）。`--project` は workflow の `setup-*` 入力を読まない。`installed_inventory` の所要時間は未計測。
