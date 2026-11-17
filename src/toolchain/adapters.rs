@@ -946,6 +946,28 @@ fn managed_root(plan: &InstallPlan) -> Result<()> {
     Ok(())
 }
 
+/// Remove `path` and what is below it. A link is unlinked, never followed.
+/// Only the mode of a directory is changed (to enter and empty a sealed one):
+/// a file is unlinked as it is, because it may be a hard link to something
+/// outside, whose mode is not ours to change.
+fn remove_unfollowed(path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let meta = fs::symlink_metadata(path)?;
+    if !meta.is_dir() {
+        return fs::remove_file(path);
+    }
+    if meta.mode() & 0o700 != 0o700 {
+        fs::set_permissions(
+            path,
+            fs::Permissions::from_mode(meta.mode() & 0o7777 | 0o700),
+        )?;
+    }
+    for entry in fs::read_dir(path)? {
+        remove_unfollowed(&entry?.path())?;
+    }
+    fs::remove_dir(path)
+}
+
 /// Remove what an installer that never published a receipt left in the root.
 /// The caller holds `install.lock` exclusively and has seen that there is no
 /// receipt. Only entries of `plan.root` go; the lock file stays (its inode is
@@ -963,10 +985,7 @@ fn clear_unreceipted(plan: &InstallPlan) -> Result<()> {
         if name == "receipt.json" {
             return Err("installation_receipt_present");
         }
-        // `remove_tree` looks with `symlink_metadata`: a link is unlinked,
-        // a directory is opened up (a sealed one too) and removed below it.
-        crate::setup::store::remove_tree(&plan.root.join(name))
-            .map_err(|_| "installation_partial_cleanup")?;
+        remove_unfollowed(&plan.root.join(name)).map_err(|_| "installation_partial_cleanup")?;
     }
     Ok(())
 }

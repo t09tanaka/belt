@@ -351,6 +351,19 @@ fn clearing_a_partial_root_unlinks_links_and_never_follows_them() {
     fs::create_dir_all(f.plan.root.join("data/a/b")).unwrap();
     symlink(outside.join("sub"), f.plan.root.join("data/a/b/deep")).unwrap();
     symlink("/nonexistent/target", f.plan.root.join("dangling")).unwrap();
+    // Hard links to files outside, one of them in a sealed directory: the
+    // names go, the files and their modes stay.
+    for (name, mode) in [("locked", 0o400), ("closed", 0o000)] {
+        let file = outside.join(name);
+        fs::write(&file, b"keep").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    fs::hard_link(outside.join("locked"), f.plan.root.join("cache/hard")).unwrap();
+    let sealed = f.plan.root.join("data/sealed");
+    fs::create_dir(&sealed).unwrap();
+    fs::hard_link(outside.join("closed"), sealed.join("hard")).unwrap();
+    fs::hard_link(outside.join("sentinel"), sealed.join("plain")).unwrap();
+    fs::set_permissions(&sealed, fs::Permissions::from_mode(0o500)).unwrap();
     let before = listing(&outside);
     let host = listing(&state.join("host"));
     let modes = |p: &Path| fs::metadata(p).unwrap().mode();
@@ -362,12 +375,19 @@ fn clearing_a_partial_root_unlinks_links_and_never_follows_them() {
     assert_eq!(fs::read(outside.join("sub/sentinel")).unwrap(), b"keep");
     assert_eq!(modes(&outside), dir_mode);
     assert_eq!(modes(&outside.join("sentinel")), file_mode);
+    assert_eq!(modes(&outside.join("locked")) & 0o7777, 0o400);
+    assert_eq!(modes(&outside.join("closed")) & 0o7777, 0o000);
+    assert_eq!(fs::metadata(outside.join("sentinel")).unwrap().nlink(), 1);
+    assert_eq!(fs::metadata(outside.join("locked")).unwrap().nlink(), 1);
+    assert_eq!(fs::metadata(outside.join("closed")).unwrap().nlink(), 1);
     for gone in [
         "link-to-dir",
         "link-to-file",
         "cache/up",
         "data/a",
         "dangling",
+        "cache/hard",
+        "data/sealed",
     ] {
         assert!(
             fs::symlink_metadata(f.plan.root.join(gone)).is_err(),
