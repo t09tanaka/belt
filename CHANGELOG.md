@@ -7,6 +7,13 @@ the minor version).
 
 ## [Unreleased]
 
+### Changed
+- `top`'s `overview` palette is now five clearly different hues (blue, pink,
+  cyan, purple, green) instead of eight with light/normal pairs of the same
+  hue, and the order a worktree falls back through when its hash slot is
+  taken keeps neighbors far apart. With more worktrees than colors, a
+  repeated color has its worktree name underlined.
+
 ## [0.10.2] - 2026-11-17
 
 ### Changed
