@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+- Fix a job's `timeout-minutes` (and `--job-timeout`) being used up by its steps waiting for task-traffic-controller. The time left for a step was the job's limit minus the wall-clock time since the job started, so on a busy machine the steps of a job could wait longer than the job may run, and the next step was started with nothing left and stopped at once (`timed out after 0s`, no output). The time left is now the limit minus the time since the job started without the waits for task-traffic-controller (the job's `work_secs`); a job whose setup and steps really run for longer than its limit times out as before.
+- A step that is stopped at the job's limit, not at its own `timeout-minutes`, says so: `timed out after 4.0s (what was left of the job's 0.1 min)` (under 10 seconds the figure has a decimal).
+- A step that would start when the job's time is used up (a step with `if: always()` or `if: failure()` after the one that timed out) is no longer started with a timeout of 0 seconds, where it ran only if it was over within a fraction of a second. It is not started, and reported as `not started: the job timed out (0.1 min)`.
+
 ## [0.17.1] - 2026-11-16
 
 - Fix worktree registrations left in the repository when the checkout a run was started from (a linked worktree) is removed while the run goes on. The run ran `git worktree prune` in that checkout, which failed once it was gone, and the failure was not reported; the files were deleted, so nothing in the cache said whose the registration was and `local-ci cache prune` could not drop it. A run now unregisters each worktree in the repository the worktree itself is registered in.
