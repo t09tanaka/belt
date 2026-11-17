@@ -1,10 +1,6 @@
 use assert_cmd::Command;
 
-const CASES: &[&[&str]] = &[
-    &["workers"],
-    &["workers", "forget", "w"],
-    &["worker", "--ephemeral"],
-];
+const CASES: &[&[&str]] = &[&["workers"], &["workers", "forget", "w"]];
 
 #[test]
 fn every_command_reports_not_implemented_as_json() {

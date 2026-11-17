@@ -2,6 +2,14 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
+/// Which service manager a plan is for. The worker-host helper is generic over
+/// the manager; only the rendering and the manager's own commands differ.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Backend {
+    #[default]
+    Launchd,
+    Systemd,
+}
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Mode {
     User { uid: u32 },
@@ -19,8 +27,10 @@ pub struct Definition {
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Plan {
+    backend: Backend,
     label: String,
     domain: String,
+    /// The managed file's text: a launchd plist or a systemd unit.
     plist: String,
     domain_identity: Mode,
     executable: PathBuf,
@@ -29,6 +39,30 @@ pub struct Plan {
     environment: BTreeMap<String, String>,
 }
 impl Plan {
+    /// A plan whose managed file is a systemd unit (see `service::systemd`).
+    /// `domain` is the `systemctl` scope flag.
+    pub(crate) fn systemd(def: &Definition, domain: &str, unit: String) -> Self {
+        Plan {
+            backend: Backend::Systemd,
+            label: def.label.clone(),
+            domain: domain.into(),
+            plist: unit,
+            domain_identity: def.mode.clone(),
+            executable: def.executable.clone(),
+            arguments: std::iter::once(def.executable.to_string_lossy().into_owned())
+                .chain(def.arguments.clone())
+                .collect(),
+            working_directory: def.working_directory.clone(),
+            environment: def.environment.clone(),
+        }
+    }
+    pub fn backend(&self) -> Backend {
+        self.backend
+    }
+    /// The launchd domain, or the `systemctl` scope flag.
+    pub fn domain(&self) -> &str {
+        &self.domain
+    }
     pub fn mode(&self) -> &Mode {
         &self.domain_identity
     }
@@ -51,21 +85,30 @@ impl Plan {
         &self.plist
     }
     pub fn filename(&self) -> String {
-        format!("{}.plist", self.label)
+        match self.backend {
+            Backend::Launchd => format!("{}.plist", self.label),
+            Backend::Systemd => format!("{}.service", self.label),
+        }
     }
     pub fn start_arguments(&self, installed_path: &Path) -> Result<Vec<String>, String> {
         let path = absolute(installed_path)?;
-        Ok(vec!["bootstrap".into(), self.domain.clone(), path.into()])
+        Ok(match self.backend {
+            Backend::Launchd => vec!["bootstrap".into(), self.domain.clone(), path.into()],
+            Backend::Systemd => vec![self.domain.clone(), "start".into(), self.filename()],
+        })
     }
     pub fn stop_arguments(&self, installed_path: &Path) -> Result<Vec<String>, String> {
-        Ok(vec![
-            "bootout".into(),
-            self.domain.clone(),
-            absolute(installed_path)?.into(),
-        ])
+        let path = absolute(installed_path)?;
+        Ok(match self.backend {
+            Backend::Launchd => vec!["bootout".into(), self.domain.clone(), path.into()],
+            Backend::Systemd => vec![self.domain.clone(), "stop".into(), self.filename()],
+        })
     }
     pub fn service_target(&self) -> String {
-        format!("{}/{}", self.domain, self.label)
+        match self.backend {
+            Backend::Launchd => format!("{}/{}", self.domain, self.label),
+            Backend::Systemd => self.filename(),
+        }
     }
 }
 /// Whether `launchctl print` output for this value can be parsed back by the
@@ -156,6 +199,7 @@ pub fn render(def: &Definition) -> Result<Plan, String> {
     }
     let plist = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n<plist version=\"1.0\"><dict><key>Label</key>{}<key>ProgramArguments</key><array>{argv}</array><key>WorkingDirectory</key>{}<key>EnvironmentVariables</key><dict>{env}</dict>{user}<key>RunAtLoad</key><true/><key>KeepAlive</key><true/></dict></plist>\n", string(&def.label)?, string(absolute(&def.working_directory)?)?);
     Ok(Plan {
+        backend: Backend::Launchd,
         label: def.label.clone(),
         domain,
         plist,
@@ -212,6 +256,32 @@ mod tests {
             ["bootout", "system", "/tmp/example.plist"]
         );
         assert_eq!(xml("\t\n\r😀").unwrap(), "\t\n\r😀");
+    }
+    #[test]
+    fn a_systemd_plan_speaks_systemctl_and_a_launchd_plan_does_not() {
+        let d = definition();
+        let launchd = render(&d).unwrap();
+        assert_eq!(launchd.backend(), Backend::Launchd);
+        assert_eq!(launchd.domain(), "gui/501");
+        assert_eq!(launchd.service_target(), "gui/501/org.example.worker");
+        let unit = Plan::systemd(&d, "--user", "[Unit]\n".into());
+        assert_eq!(unit.backend(), Backend::Systemd);
+        assert_eq!(unit.domain(), "--user");
+        assert_eq!(unit.plist(), "[Unit]\n");
+        assert_eq!(unit.filename(), "org.example.worker.service");
+        assert_eq!(unit.service_target(), "org.example.worker.service");
+        let file = Path::new("/tmp/x/org.example.worker.service");
+        assert_eq!(
+            unit.start_arguments(file).unwrap(),
+            ["--user", "start", "org.example.worker.service"]
+        );
+        assert_eq!(
+            unit.stop_arguments(file).unwrap(),
+            ["--user", "stop", "org.example.worker.service"]
+        );
+        assert!(unit.start_arguments(Path::new("rel")).is_err());
+        assert_eq!(unit.arguments(), ["/opt/example/bin/runner", "a<&>\"'"]);
+        assert_eq!(Backend::default(), Backend::Launchd);
     }
     #[test]
     fn invalid_inputs() {

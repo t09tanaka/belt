@@ -82,6 +82,11 @@ impl RunningIdentity {
     }
 }
 pub trait Launcher {
+    /// The service manager this launcher drives. Plans, the managed file's
+    /// place and the command words follow it.
+    fn backend(&self) -> policy::Backend {
+        policy::Backend::Launchd
+    }
     fn running_identity(&mut self, _: &Plan, _: &Receipt) -> Result<RunningIdentity, LaunchError> {
         Err(LaunchError::NotApplied(
             "running service identity unavailable".into(),
@@ -100,7 +105,7 @@ pub trait Launcher {
     /// receipt alone is insufficient. Must reject missing/foreign/unknown jobs.
     fn verify_loaded(&mut self, plan: &Plan, receipt: &Receipt) -> Result<(), LaunchError>;
 }
-mod native;
+pub(crate) mod native;
 pub mod observe;
 pub use native::{
     Account, AccountLookup, CommandOutput, CommandRunner, NativeAccounts, NativeLauncher,
