@@ -9,6 +9,38 @@ use rusqlite::OptionalExtension;
 use serde_json::json;
 use tempfile::TempDir;
 
+impl CoordinatorStore {
+    pub(crate) fn snapshot_rows_for_test(&self) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
+        self.db
+            .call(|db| {
+                let tables = db
+                    .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
+                    .query_map([], |r| r.get::<_, String>(0))?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+                let mut all = vec![];
+                for table in tables {
+                    let select = format!("SELECT * FROM \"{}\"", table.replace('"', "\"\""));
+                    let columns = db.prepare(&select)?.column_count();
+                    let order = (1..=columns)
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let mut statement = db.prepare(&format!("{select} ORDER BY {order}"))?;
+                    let rows = statement
+                        .query_map([], |row| {
+                            (0..columns)
+                                .map(|i| row.get(i))
+                                .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
+                        })?
+                        .collect::<rusqlite::Result<Vec<_>>>()?;
+                    all.push((table, rows));
+                }
+                Ok(all)
+            })
+            .unwrap()
+    }
+}
+
 const DAY: u64 = 86_400_000;
 
 fn hash(c: char) -> PayloadHash {
@@ -3095,11 +3127,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     let dir = crate::test_tmp::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(
-        all.len(),
-        12,
-        "this test is about step 1 and the steps after it"
-    );
+    let current_version = all.len().to_string();
     let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
     let (run, queued_task, placed_task) =
         (RunId::generate(), TaskId::generate(), TaskId::generate());
@@ -3210,7 +3238,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opened for writing, it is migrated, and every row is still there.
     let store = CoordinatorStore::open(dir.path(), 10).unwrap();
-    assert_eq!(schema_of(&store), ("12".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), (current_version.clone(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(4));
     assert_eq!(store.cluster_id(), &cluster);
     check_rows(&store);
@@ -3228,7 +3256,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opening again migrates nothing and loses nothing.
     let store = CoordinatorStore::open(dir.path(), 20).unwrap();
-    assert_eq!(schema_of(&store), ("12".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), (current_version.clone(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(5));
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);
@@ -3419,7 +3447,6 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     let dir = crate::test_tmp::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(all.len(), 12);
     let cluster = ClusterId::generate();
     let co = CoordinatorId::generate();
     let run = RunId::generate();
@@ -3474,7 +3501,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     }
     let owner = CoordinatorStore::open(dir.path(), 2).unwrap();
     let migrated = schema_info(&owner);
-    assert_eq!(migrated.0, "12");
+    assert_eq!(migrated.0, all.len().to_string());
     assert_eq!(migrated.2, 3);
     assert!(migrated.1.is_some());
     let target_run = run.to_string();
