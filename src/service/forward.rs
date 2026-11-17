@@ -110,16 +110,23 @@ struct Spooled {
     size: u64,
 }
 
-/// Write `value` as compact JSON to an unnamed temporary file, hashing it on
-/// the way. The JSON is never held in memory: the serializer writes through
-/// one 64 KiB buffer, and the upload reads the file back in chunks of that
-/// size. Synchronous IO; callers run it off the executor threads.
-fn spool_json<T: serde::Serialize>(value: &T, limit: u64) -> anyhow::Result<Spooled> {
+/// Write `value` as compact JSON to an unnamed temporary file in `dir`,
+/// hashing it on the way. The JSON is never held in memory: the serializer
+/// writes through one 64 KiB buffer, and the upload reads the file back in
+/// chunks of that size. `dir` is the private scratch directory of the source
+/// store, on the disk of the state, so the spool is not memory either (the
+/// system temporary directory may be). Synchronous IO; callers run it off
+/// the executor threads.
+fn spool_json<T: serde::Serialize>(
+    value: &T,
+    dir: &std::path::Path,
+    limit: u64,
+) -> anyhow::Result<Spooled> {
     use std::io::{Seek, Write};
     let mut out = std::io::BufWriter::with_capacity(
         64 * 1024,
         Capped {
-            inner: tempfile::tempfile()?,
+            inner: tempfile::tempfile_in(dir)?,
             hasher: <sha2::Sha256 as sha2::Digest>::new(),
             written: 0,
             limit,
@@ -380,9 +387,10 @@ async fn source_inner(
     let closure = Arc::new(closure);
     for index in (0..closure.len()).rev() {
         let (items, ownership) = (closure.clone(), lease.clone());
+        let scratch = store.root().join("tmp");
         let spooled = tokio::task::spawn_blocking(move || {
             let _ownership = ownership;
-            spool_json(&items[index], MAX_MANIFEST_BYTES)
+            spool_json(&items[index], &scratch, MAX_MANIFEST_BYTES)
         })
         .await??;
         check_stop(stop)?;
@@ -730,22 +738,28 @@ mod spool_tests {
         let v = value(20_000);
         let want = serde_json::to_vec(&v).unwrap();
         assert!(want.len() > 3 * 64 * 1024);
-        let mut spooled = spool_json(&v, want.len() as u64).unwrap();
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let mut spooled = spool_json(&v, dir.path(), want.len() as u64).unwrap();
         assert_eq!(spooled.size, want.len() as u64);
         assert_eq!(spooled.digest, Digest::of_bytes(&want));
         // It is rewound: the upload reads it from the start.
         let mut got = Vec::new();
         spooled.file.read_to_end(&mut got).unwrap();
         assert_eq!(got, want);
+        // It has no name: nothing is left to clean up, whatever happens.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        // Without the directory there is no spool (it is not made elsewhere).
+        assert!(spool_json(&v, &dir.path().join("absent"), u64::MAX).is_err());
     }
 
     #[test]
     fn a_manifest_one_byte_over_the_limit_is_refused() {
+        let dir = crate::test_tmp::tempdir().unwrap();
         for len in [1, 20_000] {
             let v = value(len);
             let size = serde_json::to_vec(&v).unwrap().len() as u64;
-            assert_eq!(spool_json(&v, size).unwrap().size, size);
-            let error = spool_json(&v, size - 1).err().unwrap();
+            assert_eq!(spool_json(&v, dir.path(), size).unwrap().size, size);
+            let error = spool_json(&v, dir.path(), size - 1).err().unwrap();
             assert!(
                 format!("{error:#}").contains(&format!("larger than {} bytes", size - 1)),
                 "{error:#}"
