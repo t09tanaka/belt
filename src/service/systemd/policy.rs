@@ -6,7 +6,7 @@
 //! A value that would need escaping beyond systemd's own quoting is refused
 //! instead (control characters, NUL). `%` and `$` are live in unit files, so
 //! they are escaped where systemd reads them.
-use crate::service::macos::policy::{Definition, Mode, Plan};
+use crate::service::macos::policy::{valid_system_account, Definition, Mode, Plan};
 use crate::service::macos::LoadedState;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -89,14 +89,7 @@ pub fn render(def: &Definition) -> Result<Plan, String> {
     }
     let (user, target) = match &def.mode {
         Mode::User { uid } if *uid > 0 => (String::new(), "default.target"),
-        Mode::SystemUser { uid, username }
-            if *uid > 0
-                && !username.is_empty()
-                && username != "root"
-                && username
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)) =>
-        {
+        Mode::SystemUser { uid, username } if valid_system_account(*uid, username) => {
             (format!("User={username}\n"), "multi-user.target")
         }
         _ => return Err("service requires a non-root user identity".into()),

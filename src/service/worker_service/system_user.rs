@@ -32,8 +32,8 @@ fn passwd(uid: u32) -> anyhow::Result<(String, String)> {
         .to_str()?
         .to_owned();
     ensure!(
-        !name.bytes().all(|b| b.is_ascii_digit()),
-        "numeric service account names are ambiguous"
+        policy::valid_system_account(uid, &name),
+        "unsupported non-root service account name"
     );
     Ok((name, home))
 }
