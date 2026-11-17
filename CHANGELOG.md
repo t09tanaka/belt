@@ -7,6 +7,17 @@ the minor version).
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-11-17
+
+### Added
+
+- **`Paths::from_env` and `Paths::from_process_env` give a library the CLI's
+  scope.** The rule (`XDG_STATE_HOME` or `HOME/.local/state`, and
+  `XDG_CONFIG_HOME` or `HOME/.config`, plus `task-traffic-controller`) used to
+  live only in the binary; the binary now calls the library function, so a
+  program that links the crate shares the CLI's ledger without a second copy
+  of the rule. Behavior of the command is unchanged.
+
 ## [0.10.0] - 2026-11-16
 
 ### Changed

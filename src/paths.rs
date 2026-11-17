@@ -2,6 +2,7 @@
 //! XDG variables itself: whoever builds the [`crate::Context`] decides the
 //! state directory, so tests and embedders get their own scope.
 
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 /// The state directory, the config file and the history file.
@@ -23,6 +24,46 @@ impl Paths {
             config_file: config_file.into(),
             history_file,
         }
+    }
+
+    /// The scope the `task-traffic-controller` command uses, decided from the
+    /// given environment values (pass what the process would see):
+    ///
+    /// - state: `$XDG_STATE_HOME/task-traffic-controller`, else
+    ///   `$HOME/.local/state/task-traffic-controller`;
+    /// - config: `$XDG_CONFIG_HOME/task-traffic-controller/config.toml`, else
+    ///   `$HOME/.config/task-traffic-controller/config.toml`.
+    ///
+    /// An empty XDG value counts as unset; a relative value is used as given;
+    /// without `HOME` the fallback root is `/`.
+    pub fn from_env(
+        home: Option<&OsStr>,
+        xdg_state_home: Option<&OsStr>,
+        xdg_config_home: Option<&OsStr>,
+    ) -> Self {
+        let home = home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        let pick = |xdg: Option<&OsStr>, fallback: &str| {
+            xdg.filter(|v| !v.is_empty())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(fallback))
+        };
+        Paths::new(
+            pick(xdg_state_home, ".local/state").join("task-traffic-controller"),
+            pick(xdg_config_home, ".config").join("task-traffic-controller/config.toml"),
+        )
+    }
+
+    /// [`Paths::from_env`] with `HOME`, `XDG_STATE_HOME` and
+    /// `XDG_CONFIG_HOME` read from this process's environment. This is the
+    /// only function of the library that reads them.
+    pub fn from_process_env() -> Self {
+        Paths::from_env(
+            std::env::var_os("HOME").as_deref(),
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        )
     }
 
     /// Keep the history somewhere else than `<state_dir>/history.jsonl`.
@@ -122,5 +163,68 @@ mod tests {
         let p = Paths::new("/s", "/c").with_history_file("/h/h.jsonl");
         assert_eq!(p.history_file(), Path::new("/h/h.jsonl"));
         assert_eq!(p.ledger_file(), Path::new("/s/ledger.json"));
+    }
+
+    fn os(s: &str) -> Option<&OsStr> {
+        Some(OsStr::new(s))
+    }
+
+    #[test]
+    fn from_env_prefers_the_xdg_homes() {
+        let p = Paths::from_env(os("/h"), os("/xs"), os("/xc"));
+        assert_eq!(p.state_dir(), Path::new("/xs/task-traffic-controller"));
+        assert_eq!(
+            p.config_file(),
+            Path::new("/xc/task-traffic-controller/config.toml")
+        );
+    }
+
+    #[test]
+    fn from_env_falls_back_to_home() {
+        let p = Paths::from_env(os("/h"), None, None);
+        assert_eq!(
+            p.state_dir(),
+            Path::new("/h/.local/state/task-traffic-controller")
+        );
+        assert_eq!(
+            p.config_file(),
+            Path::new("/h/.config/task-traffic-controller/config.toml")
+        );
+    }
+
+    #[test]
+    fn from_env_treats_empty_xdg_as_unset_and_keeps_relative() {
+        let p = Paths::from_env(os("/h"), os(""), os("rel"));
+        assert_eq!(
+            p.state_dir(),
+            Path::new("/h/.local/state/task-traffic-controller")
+        );
+        assert_eq!(
+            p.config_file(),
+            Path::new("rel/task-traffic-controller/config.toml")
+        );
+    }
+
+    #[test]
+    fn from_env_without_home_roots_at_slash() {
+        let p = Paths::from_env(None, None, None);
+        assert_eq!(
+            p.state_dir(),
+            Path::new("/.local/state/task-traffic-controller")
+        );
+        assert_eq!(
+            p.config_file(),
+            Path::new("/.config/task-traffic-controller/config.toml")
+        );
+    }
+
+    #[test]
+    fn from_process_env_matches_from_env_of_the_same_values() {
+        let want = Paths::from_env(
+            std::env::var_os("HOME").as_deref(),
+            std::env::var_os("XDG_STATE_HOME").as_deref(),
+            std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+        );
+        assert_eq!(Paths::from_process_env(), want);
     }
 }
