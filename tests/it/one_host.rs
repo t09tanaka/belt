@@ -430,6 +430,11 @@ impl OneHost {
     /// that follows (not after [`Kill::Supervisor`], where the same one
     /// lives on) is connected to `c` again.
     pub(crate) async fn kill(&self, c: &Coordinator, w: &Worker, a: &AttemptId, kill: Kill) {
+        assert!(
+            self.launched(w, a),
+            "{a} is cut off before {} has its launch on record: wait for `launched`",
+            w.id
+        );
         if kill == Kill::Supervisor {
             w.fx.kill_supervisors(a);
             return;

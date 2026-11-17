@@ -167,7 +167,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 
 ### S25: 1 台上の試験ハーネスと A01〜A49 の自動試験の対応（2026-11-17）
 
-上の表は担当行を示す。この表は、各 A を今どの自動試験が確かめているか、何が S26（Docker・実機）に残るか、どの A は担当行が未了で試験が無いかを示す。「自動試験」の列には、試験の assert が仕様 §19 の期待結果と合っていることを読んで確かめたものだけを書いた。試験名は代表で、同じ A を確かめる試験がほかにもある。
+上の表は担当行を示す。この表は、各 A を今どの自動試験が確かめているか、何が S26（Docker・実機）に残るか、どの A は担当行が未了で試験が無いかを示す。「自動試験」の列の試験は、試験名と冒頭の説明を仕様 §19 の期待結果と突き合わせて選んだ。期待結果の一部しか試験が無いと分かった A は「一部」にした。assert まで読んだのは `one_host` の全件と A16・A33・A49 の試験で、A05・A26・A42 は試験の説明とこの計画の該当節を読んだ。ほかの行は試験名と説明までで、S26 の受入で期待結果の句ごとに確かめ直す。試験名は代表で、同じ A を確かめる試験がほかにもある。
 
 ハーネスは `tests/it/one_host.rs` にある。1 つの親（`Coordinator`）と、worker ごとに別の state directory・別の supervisor process・別の protocol 接続を持つ本物の agent を、1 つの試験 process の中に立てる。既存の fixture（`worker_agent::Fx`、`coordinator` の `spec`・`only`・`Lost` など）を使い、別の仕組みは作っていない。障害の注入口は 3 つで、どれも試験 crate の中にあり、library と release binary には注入用のコードを足していない。
 
@@ -193,7 +193,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A02 | 自動＋残り | `scheduler::a02_a_worker_that_joins_takes_the_backlog_the_parent_kept`、`one_host::a02_a_real_worker_that_joins_later_starts_the_backlog_the_parent_kept` | 別 host の worker（S26 の Docker） |
 | A03 | 自動 | `scheduler::a03_a_busy_worker_beats_a_cold_one_and_the_reason_shows_queue_setup_and_transfer`、`scheduler::a03_a_cold_worker_that_is_set_up_quickly_beats_the_queue` | |
 | A04 | 自動 | `scheduler::a04_submits_from_many_sides_are_decided_one_at_a_time`、`scheduler::a04_a_placement_no_worker_acknowledged_is_counted_by_the_next_decision` | |
-| A05 | 自動 | `doctor::an_unpatched_task_traffic_controller_fails_doctor`、`supervisor::a_real_nested_cli_runs_under_its_step_and_shares_the_ledger` | |
+| A05 | 自動 | `doctor::an_unpatched_task_traffic_controller_fails_doctor`、`supervisor::a_real_nested_cli_runs_under_its_step_and_shares_the_ledger`（scope の統一後。S23 doctor の節の「既定では成り立っていない」はその前の記述） | |
 | A06 | 自動 | `forecast::a06_a_hundred_forecasts_add_no_entry_lease_job_or_reservation` | |
 | A07 | 自動 | `a07_ready_delay_queue_and_runtime_make_the_finish`（`src/forecast/mod.rs`） | |
 | A08 | 自動 | `forecast::a08_a_node_is_one_demand_before_it_registers_after_and_once_finished` | |
@@ -214,7 +214,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A23 | 自動 | `worker_agent::a23_a_restarted_agent_adopts_the_living_supervisor`、`coordinator::a23_a_restarted_parent_adopts_what_runs_and_starts_nothing_again`、`one_host::a23_a_killed_parent_is_followed_by_one_that_adopts_what_two_real_workers_run`、`one_host::a23_a_restarted_agent_of_one_worker_keeps_its_command_and_the_parent_follows_it` | |
 | A24 | 自動＋残り | 擬似（process を止めて boot ID を変える）: `worker_agent::a24_a_changed_boot_id_interrupts_everything_and_a_retry_runs`、`one_host::a24_a_restart_of_one_workers_machine_interrupts_its_attempt_and_spares_the_other` | 本物の reboot と OS の boot ID（S26、Mac は実機待ち） |
 | A25 | 自動 | `supervisor::cancel_terms_then_kills_the_group_and_records_only_after_it_is_gone`、`supervisor::natural_end_and_cancel_racing_still_give_one_terminal` | |
-| A26 | 自動＋残り | `a_long_suspend_expires_the_lease`・`a_late_renewal_does_not_revive_an_expired_lease`（`src/supervisor/lease.rs`）、`one_host::a26_workers_whose_wall_clocks_are_off_keep_their_leases_and_end_normally`（worker の壁時計がずれても親は自分の時計だけを使う） | 実際の Mac sleep と OS の時計変更からの復帰（実機待ち） |
+| A26 | 自動＋残り | lease は単調時計の値だけを受ける純粋関数で、長い suspend に当たる飛びを試験する: `a_long_suspend_expires_the_lease`・`a_late_renewal_does_not_revive_an_expired_lease`（`src/supervisor/lease.rs`）。壁時計の前後への飛びは保持期間の判定で試験する: `forward_jump_requarantines_then_follows_the_new_wall`・`backward_step_holds_briefly_or_requarantines`（`src/results/clock_policy.rs`）。worker 間の壁時計のずれ: `one_host::a26_workers_whose_wall_clocks_are_off_keep_their_leases_and_end_normally` | 実行中に OS の壁時計を変える試験と、実際の Mac sleep からの復帰は無い（実機待ち） |
 | A27 | 未実装 | | S16（max-parallel・fail-fast・join・集約の進行が無い） |
 | A28 | 自動 | `bootstrap::ci_plan_shows_why_a_shared_workspace_task_is_not_split` | |
 | A29 | 自動 | `non_utf8_bytes_round_trip_per_stream`・`reads_resume_from_any_offset_without_duplicates`・`limit_is_shared_and_the_rest_is_counted_as_dropped`（`src/supervisor/tests.rs`）、`collection::active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset` | |
@@ -228,18 +228,18 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A37 | S26 | | 実際のプロジェクトの CI を親のみと複数 worker で比べる |
 | A38 | 一部 | worker の側だけ: `a_job_that_needs_another_runs_in_another_attempt_from_the_first_ones_result`（`src/supervisor/ci_task/run_tests.rs`） | 親が先行 Job の output・artifact を確定してから別 host で後続を始める経路（S16 が未了） |
 | A39〜A41 | 未実装 | | S18（RTR の配置と集約）。adapter の分割・合算は local-ci 側の試験（L2・L3） |
-| A42 | 自動 | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts` | |
+| A42 | 一部 | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts` | 導入中の負荷を forecast に含めること（S20 の残件）、実 manager と network での導入 |
 | A43 | 自動 | `secrets::a43_the_secret_files_reach_the_worker_as_0600_and_are_gone_after_the_attempt` | |
 | A44 | 自動＋残り | 偽の ssh と偽の tool: `diff_classifies_the_five_ways_a_worker_can_differ`・`sync_blocks_what_needs_a_person_with_the_steps`（`tests/it/workers_lifecycle.rs` の `a44`）、`bootstrap::workers_sync_installs_through_the_resident_then_measures_again_and_needs_the_resident` | 実際の worker との差（S26） |
 | A45 | 一部 | OS 依存部分は CI の ubuntu と macOS の両方で同じ試験が走る（`src/platform` の単体試験、`tests/it/supervisor.rs`） | systemd user service での導入・起動・停止、system-user mode（S24 が未了）、x86_64 と arm64 の実 worker（S26 の Docker） |
 | A46 | 未実装 | | S24（`worker --ephemeral` と `workers forget`）、S26 |
 | A47 | 自動 | `secrets::worktreeinclude_picks_only_ignored_untracked_files_and_the_store_never_holds_them`、`worker_agent::the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_any_name` | |
 | A48 | 一部 | `workspace::add_and_remove_a_commit_workspace`、`workspace::the_original_is_never_written`（CI は `RTR_REQUIRE_FAST_WORKTREE` で fast-worktree を必須にする） | terminal 後に portool の割当が消えることを確かめる試験が無い |
-| A49 | 自動 | `scheduler::a_preferred_worker_is_taken_while_the_others_are_not_faster_by_the_correction`、`collection_is_added_to_the_forecast_and_the_priority_correction_to_that`（`src/scheduler/decide.rs`）、`config::priority_defaults_and_origins` | |
+| A49 | 自動 | `scheduler::a_preferred_worker_is_taken_while_the_others_are_not_faster_by_the_correction`、`collection_is_added_to_the_forecast_and_the_priority_correction_to_that`（`src/scheduler/decide.rs`）、設定から scheduler まで: `runtime::runtime_attach_applies_only_verified_identity_priorities` | |
 
-件数（A39〜A41 は 3 件と数える）: 自動 30、自動＋残り 7、一部 5、未実装 6、S26 のみ 1。
+件数（A39〜A41 は 3 件と数える）: 自動 29、自動＋残り 7、一部 6、未実装 6、S26 のみ 1。
 
-S25 の完了条件「実機不要の A がすべて自動で緑」は、まだ満たしていない。区分が「一部」と「未実装」の 11 件（A10・A27・A32・A35・A38・A39〜A41・A45・A46・A48）は、S16・S18・S19・S24 の実装か、試験の追加が先に要る。これらの行が入ったら、この表を更新し、複数 worker が関わるものは `one_host` に試験を足す。
+S25 の完了条件「実機不要の A がすべて自動で緑」は、まだ満たしていない。区分が「一部」と「未実装」の 12 件（A10・A27・A32・A35・A38・A39〜A41・A42・A45・A46・A48）は、S16・S18・S19・S20・S24 の実装か、試験の追加が先に要る。これらの行が入ったら、この表を更新し、複数 worker が関わるものは `one_host` に試験を足す。
 
 この変更の残件:
 
