@@ -740,8 +740,9 @@ pub fn project_checks(notices: Result<&[crate::config::resolve::Notice], String>
 
 /// Where the checks of `workers diff` (§22.2) join the report: asked once
 /// for every worker that answered. `None` leaves the comparison out, and the
-/// report says so per worker.
-pub type DiffSource<'a> = Option<&'a mut dyn FnMut(&str) -> Vec<Check>>;
+/// report says so per worker. It is called from the thread that looks at that
+/// worker, with the handle to ask over, so workers are looked at together.
+pub type DiffSource<'a> = Option<&'a (dyn Fn(&mut dyn Remote, &str) -> Vec<Check> + Sync)>;
 
 /// The difference `workers diff` found for one worker, as checks: one per
 /// item. `same` is ok. Only what a person has to fix fails (`differs`,
@@ -815,7 +816,7 @@ fn measure_parent(
 /// parent's own measurement, taken once for all workers; when it failed no
 /// worker is asked.
 pub fn worker_diff(
-    remote: &mut impl Remote,
+    remote: &mut (impl Remote + ?Sized),
     env: &BTreeMap<String, String>,
     exe: &Path,
     parent: Result<&EnvReport, &str>,
@@ -839,7 +840,7 @@ pub fn run(
     env: &BTreeMap<String, String>,
     spec: &Spec,
     parent_version: &str,
-    mut diff: DiffSource,
+    diff: DiffSource,
 ) -> Result<Report, ApiError> {
     let cluster = spec.expected_cluster.clone().ok_or_else(|| {
         ApiError::new(
@@ -874,60 +875,95 @@ pub fn run(
     );
     checks.extend(evaluate("parent", &local));
     engines.push(("parent".to_string(), local.docker.engine_id.clone()));
-    for worker in workers::registrations(env)? {
-        let host = worker.id.as_str();
-        let looked = look_at_worker(remote, &worker, &cluster);
-        let answered = looked.is_ok();
-        match looked {
-            Err(reason) => checks.push(Check::new(host, "reachable", Level::Fail, reason)),
-            Ok((answer, bridge)) => {
-                checks.push(Check::new(
-                    host,
-                    "reachable",
-                    Level::Ok,
-                    "answered over ssh",
-                ));
-                checks.extend(service_checks(host, &answer.status, parent_version));
-                checks.push(match bridge {
-                    Ok(()) => Check::new(
-                        host,
-                        "bridge",
-                        Level::Ok,
-                        "hello completed with every required feature",
-                    ),
-                    Err(reason) => Check::new(host, "bridge", Level::Fail, reason),
-                });
-                checks.extend(evaluate(host, &answer.facts));
-                engines.push((host.to_string(), answer.facts.docker.engine_id.clone()));
-            }
-        }
-        checks.extend(match (answered, diff.as_mut()) {
-            // Its own check already says why; a second ssh would wait again.
-            (false, _) => vec![Check::new(
-                host,
-                "environment_diff",
-                Level::NotChecked,
-                "the worker did not answer; its environment was not compared with the parent's",
-            )],
-            (true, Some(source)) => source(host),
-            (true, None) => vec![Check::new(
-                host,
-                "environment_diff",
-                Level::NotChecked,
-                "the comparison of workers diff was left out; toolchain and tool differences were not compared",
-            )],
-        });
+    // Every worker is looked at at the same time (up to a bound), each on its
+    // own ssh processes; what is printed keeps the order of the registrations.
+    let registered = workers::registrations(env)?;
+    let looked = workers::fan_out(remote, registered.iter().collect(), &|handle, worker| {
+        look_at(handle, worker, &cluster, parent_version, diff)
+    });
+    for one in looked {
+        checks.extend(one.checks);
+        engines.extend(one.engine);
     }
     checks.extend(shared_engines(&engines));
     Ok(Report::of(checks))
 }
 
-/// One worker: its facts and whether its bridge completes `hello`.
-fn look_at_worker(
-    remote: &mut impl Remote,
+/// What one worker contributes to the report.
+struct Looked {
+    checks: Vec<Check>,
+    /// The worker's Docker engine, for the check that workers do not share one.
+    engine: Option<(String, Option<String>)>,
+}
+
+/// One worker, with every question it is asked. The doctor helper answers
+/// first; the bridge `hello` and the environment comparison then depend only
+/// on that answer, so they are asked at the same time.
+fn look_at(
+    remote: &mut dyn Remote,
     worker: &workers::Registered,
     cluster: &ClusterId,
-) -> Result<(HostAnswer, Result<(), String>), String> {
+    parent_version: &str,
+    diff: DiffSource,
+) -> Looked {
+    let host = worker.id.as_str();
+    let mut checks = Vec::new();
+    let mut engine = None;
+    match ask_worker(remote, worker, cluster) {
+        // Its own check says why; a second ssh would only wait again.
+        Err(reason) => {
+            checks.push(Check::new(host, "reachable", Level::Fail, reason));
+            checks.push(Check::new(
+                host,
+                "environment_diff",
+                Level::NotChecked,
+                "the worker did not answer; its environment was not compared with the parent's",
+            ));
+        }
+        Ok(answer) => {
+            let (bridge, compared) = workers::both(
+                remote,
+                |handle| probe_bridge(handle, worker, cluster),
+                |handle| diff.map(|source| source(handle, host)),
+            );
+            checks.push(Check::new(
+                host,
+                "reachable",
+                Level::Ok,
+                "answered over ssh",
+            ));
+            checks.extend(service_checks(host, &answer.status, parent_version));
+            checks.push(match bridge {
+                Ok(()) => Check::new(
+                    host,
+                    "bridge",
+                    Level::Ok,
+                    "hello completed with every required feature",
+                ),
+                Err(reason) => Check::new(host, "bridge", Level::Fail, reason),
+            });
+            checks.extend(evaluate(host, &answer.facts));
+            engine = Some((host.to_string(), answer.facts.docker.engine_id.clone()));
+            checks.extend(compared.unwrap_or_else(|| {
+                vec![Check::new(
+                    host,
+                    "environment_diff",
+                    Level::NotChecked,
+                    "the comparison of workers diff was left out; toolchain and tool differences were not compared",
+                )]
+            }));
+        }
+    }
+    Looked { checks, engine }
+}
+
+/// The worker's own doctor helper, over ssh: its facts and status, for the
+/// worker the registration names.
+fn ask_worker(
+    remote: &mut dyn Remote,
+    worker: &workers::Registered,
+    cluster: &ClusterId,
+) -> Result<HostAnswer, String> {
     let target = SshTarget::parse(&worker.ssh).map_err(|e| e.to_string())?;
     let binary = worker
         .binary
@@ -944,7 +980,21 @@ fn look_at_worker(
     if answer.status.worker_id.as_str() != worker.id || &answer.status.cluster != cluster {
         return Err("the host answered for a different worker identity or cluster".into());
     }
-    let bridge = remote
+    Ok(answer)
+}
+
+/// Whether the worker's bridge completes `hello`, as the resident runs it.
+fn probe_bridge(
+    remote: &mut dyn Remote,
+    worker: &workers::Registered,
+    cluster: &ClusterId,
+) -> Result<(), String> {
+    let target = SshTarget::parse(&worker.ssh).map_err(|e| e.to_string())?;
+    let binary = worker
+        .binary
+        .as_deref()
+        .ok_or("the registration has no binary path")?;
+    remote
         .bridge_hello(&target, binary, cluster)
         .map_err(|m| format!("the worker bridge did not complete hello: {m}"))
         .and_then(
@@ -955,8 +1005,7 @@ fn look_at_worker(
                     Err("the worker bridge answered for a different worker or cluster".to_string())
                 }
             },
-        );
-    Ok((answer, bridge))
+        )
 }
 
 fn text(report: &Report) -> String {
@@ -996,13 +1045,12 @@ pub fn command(json: bool) -> i32 {
             let spec = super::context::runtime_spec(&env)?;
             // Measured as `workers diff` measures it, once, and only when a
             // worker answers.
-            let mut parent: Option<Result<EnvReport, String>> = None;
-            let mut source = |host: &str| {
-                let parent = parent.get_or_insert_with(|| {
-                    measure_parent(&spec, crate::toolchain::envreport::collect)
-                });
+            let parent: std::sync::OnceLock<Result<EnvReport, String>> = std::sync::OnceLock::new();
+            let source = |remote: &mut dyn Remote, host: &str| {
+                let parent = parent
+                    .get_or_init(|| measure_parent(&spec, crate::toolchain::envreport::collect));
                 worker_diff(
-                    &mut workers::SshRemote,
+                    remote,
                     &env,
                     &exe,
                     parent.as_ref().map_err(String::as_str),
@@ -1015,7 +1063,7 @@ pub fn command(json: bool) -> i32 {
                 &env,
                 &spec,
                 &version,
-                Some(&mut source),
+                Some(&source),
             )?;
             let project = std::env::current_dir()
                 .map_err(|e| e.to_string())

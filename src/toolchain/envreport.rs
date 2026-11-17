@@ -247,9 +247,20 @@ fn collect_with(
         profile: profile.name().to_string(),
         required_tools: profile.required_tools().iter().cloned().collect(),
         profile_digest: Some(report.profile_digest.to_string()),
-        // No digest of the task-traffic-controller policy exists yet.
-        policy_digest: None,
+        policy_digest: policy_digest(env),
     })
+}
+
+/// The digest of the task-traffic-controller policy in effect for `env`: the
+/// scope that environment resolves to, and the effective configuration read
+/// from it (a missing file is the default policy). The same formula is the
+/// one `doctor` gives a scope. `None` when the scope cannot be resolved or
+/// the configuration cannot be read, which is "not measured", never a digest
+/// of nothing.
+fn policy_digest(env: &BTreeMap<String, String>) -> Option<String> {
+    let scope = crate::config::traffic::resolve(env).ok()?;
+    let config = task_traffic_controller::config::Config::load(&scope.config_file).ok()?;
+    crate::config::traffic::policy_digest(&config)
 }
 
 #[cfg(test)]
@@ -327,6 +338,52 @@ mod tests {
         assert_eq!(run_fixed(&dirs, "broken", &[], &none(), SHORT), Run::Failed);
     }
 
+    fn policy_env(home: &Path, config: Option<&str>) -> BTreeMap<String, String> {
+        let dir = home.join(".config").join("task-traffic-controller");
+        std::fs::create_dir_all(&dir).unwrap();
+        if let Some(text) = config {
+            std::fs::write(dir.join("config.toml"), text).unwrap();
+        }
+        BTreeMap::from([("HOME".to_string(), home.to_str().unwrap().to_string())])
+    }
+
+    #[test]
+    fn the_policy_digest_follows_the_effective_configuration_of_the_scope() {
+        let temp = crate::test_tmp::tempdir().unwrap();
+        let home = |n: &str| {
+            let h = std::fs::canonicalize(temp.path()).unwrap().join(n);
+            std::fs::create_dir_all(&h).unwrap();
+            h
+        };
+        let digest = |n: &str, config: Option<&str>| policy_digest(&policy_env(&home(n), config));
+        let default = digest("a", None);
+        assert!(default.as_deref().unwrap().starts_with("sha256:"));
+        // A missing file is the default policy, the same as an explicit one.
+        assert_eq!(digest("b", None), default);
+        let four = digest("d", Some("budget = 4\n"));
+        assert_eq!(digest("e", Some("budget = 4\n")), four);
+        assert_ne!(four, default);
+        assert_ne!(digest("f", Some("budget = 5\n")), four);
+        // A configuration that cannot be read is not measured.
+        assert_eq!(digest("g", Some("budget = 0\n")), None);
+        assert_eq!(digest("h", Some("not toml [")), None);
+        // So is an environment that resolves to no scope.
+        assert_eq!(policy_digest(&BTreeMap::new()), None);
+        let relative = BTreeMap::from([("HOME".to_string(), "relative".to_string())]);
+        assert_eq!(policy_digest(&relative), None);
+    }
+
+    #[test]
+    fn collect_reports_the_policy_digest_of_the_workers_scope() {
+        let (t, state, _bin) = state();
+        let home = std::fs::canonicalize(t.path()).unwrap().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let env = policy_env(&home, Some("budget = 3\n"));
+        let report = collect_with(&state, &env, SHORT).unwrap();
+        assert_eq!(report.policy_digest, policy_digest(&env));
+        assert!(report.policy_digest.is_some());
+    }
+
     #[test]
     fn collect_measures_with_the_profile_path() {
         let (_t, state, bin) = state();
@@ -354,6 +411,8 @@ mod tests {
         assert_eq!(report.profile, "t");
         assert!(report.required_tools.is_empty());
         assert!(report.profile_digest.unwrap().starts_with("sha256:"));
+        // Nothing to resolve the scope from: not measured.
+        // Nothing to resolve the scope from: not measured.
         assert_eq!(report.policy_digest, None);
     }
 

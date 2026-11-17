@@ -1043,9 +1043,9 @@ fn workers_that_share_an_engine_with_each_other_or_the_parent_fail() {
 #[test]
 fn another_line_can_put_its_checks_where_the_slot_is() {
     let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
-    let mut asked = Vec::new();
-    let mut source = |host: &str| {
-        asked.push(host.to_string());
+    let asked = std::sync::Mutex::new(Vec::new());
+    let source = |_: &mut dyn Remote, host: &str| {
+        asked.lock().unwrap().push(host.to_string());
         vec![Check::new(
             host,
             "environment_diff",
@@ -1059,10 +1059,10 @@ fn another_line_can_put_its_checks_where_the_slot_is() {
         &w.host.env,
         &w.spec,
         &w.version,
-        Some(&mut source),
+        Some(&source),
     )
     .unwrap();
-    assert_eq!(asked, ["mini-a"]);
+    assert_eq!(*asked.lock().unwrap(), ["mini-a"]);
     let check = of(&report, "mini-a", "environment_diff");
     assert_eq!(
         (check.level, check.detail.as_str()),
@@ -1334,7 +1334,7 @@ mod environment_diff {
             .unwrap();
         facts.cli = None;
         facts.cli_scope.in_use = false;
-        let mut source = |host: &str| {
+        let source = |_: &mut dyn Remote, host: &str| {
             diff_checks(
                 host,
                 Ok(&[
@@ -1350,7 +1350,7 @@ mod environment_diff {
             &w.host.env,
             &w.spec,
             &w.version,
-            Some(&mut source),
+            Some(&source),
         )
         .unwrap();
         let left: Vec<_> = report
@@ -1361,14 +1361,15 @@ mod environment_diff {
         assert!(left.is_empty(), "{left:?}");
         assert!(report.problem().is_none(), "{:?}", report.problem());
         // The same list with something a person must fix does fail.
-        let mut source = |host: &str| diff_checks(host, Ok(&[item("node", Class::Missing)]));
+        let source =
+            |_: &mut dyn Remote, host: &str| diff_checks(host, Ok(&[item("node", Class::Missing)]));
         let report = run(
             &mut w.remote,
             &mut w.runner,
             &w.host.env,
             &w.spec,
             &w.version,
-            Some(&mut source),
+            Some(&source),
         )
         .unwrap();
         assert!(report.problem().is_some());
@@ -1508,9 +1509,9 @@ mod environment_diff {
             ("mini-b", "ci@mini-b.local", true),
         ]);
         *w.remote.hosts.get_mut("ci@mini-b.local").unwrap() = None;
-        let mut asked = Vec::new();
-        let mut source = |host: &str| {
-            asked.push(host.to_string());
+        let asked = std::sync::Mutex::new(Vec::new());
+        let source = |_: &mut dyn Remote, host: &str| {
+            asked.lock().unwrap().push(host.to_string());
             diff_checks(host, Ok(&[item("platform", Class::Same)]))
         };
         let report = run(
@@ -1519,14 +1520,129 @@ mod environment_diff {
             &w.host.env,
             &w.spec,
             &w.version,
-            Some(&mut source),
+            Some(&source),
         )
         .unwrap();
-        assert_eq!(asked, ["mini-a"]);
+        assert_eq!(*asked.lock().unwrap(), ["mini-a"]);
         assert_eq!(of(&report, "mini-a", "environment_diff").level, Level::Ok);
         let unreachable = of(&report, "mini-b", "environment_diff");
         assert_eq!(unreachable.level, Level::NotChecked);
         assert!(unreachable.detail.starts_with("the worker did not answer"));
         assert_eq!(of(&report, "mini-b", "reachable").level, Level::Fail);
     }
+}
+
+/// Hands out copies of itself so workers are asked together, and holds each
+/// kind of ask until all of that kind are in flight: a run that asks one
+/// at a time fails the meeting instead of passing.
+struct Together {
+    doctor: std::sync::Arc<crate::service::workers::meeting::Gate>,
+    after: std::sync::Arc<crate::service::workers::meeting::Gate>,
+    inner: std::sync::Arc<std::sync::Mutex<FakeRemote>>,
+}
+impl Remote for Together {
+    fn split(&self) -> Option<Box<dyn Remote + Send>> {
+        Some(Box::new(Together {
+            doctor: self.doctor.clone(),
+            after: self.after.clone(),
+            inner: self.inner.clone(),
+        }))
+    }
+    fn run(
+        &mut self,
+        target: &SshTarget,
+        shell: &str,
+        stdin: &[u8],
+        timeout: Duration,
+    ) -> Result<RemoteOutput, String> {
+        if shell.ends_with("'worker-service' 'doctor'") {
+            self.doctor.meet()?;
+        } else if shell == "env-probe" {
+            self.after.meet()?;
+            return Ok(out(0, ""));
+        }
+        self.inner
+            .lock()
+            .unwrap()
+            .run(target, shell, stdin, timeout)
+    }
+    fn bridge_hello(
+        &mut self,
+        target: &SshTarget,
+        binary: &str,
+        cluster: &ClusterId,
+    ) -> Result<(ClusterId, WorkerId), String> {
+        self.after.meet()?;
+        self.inner
+            .lock()
+            .unwrap()
+            .bridge_hello(target, binary, cluster)
+    }
+}
+
+#[test]
+fn workers_and_the_questions_after_the_first_one_are_asked_at_the_same_time() {
+    use crate::service::workers::meeting::Gate;
+    let mut w = World::new(&[
+        ("mini-a", "ci@mini-a.local", true),
+        ("mini-b", "ci@mini-b.local", true),
+        ("mini-c", "ci@mini-c.local", true),
+    ]);
+    let mut together = Together {
+        // Three doctor asks, then three hello asks and three comparisons.
+        doctor: Gate::new(3),
+        after: Gate::new(6),
+        inner: std::sync::Arc::new(std::sync::Mutex::new(std::mem::replace(
+            &mut w.remote,
+            FakeRemote {
+                cluster: ClusterId::generate(),
+                hosts: BTreeMap::new(),
+                bridge_fails: false,
+                bridge_worker: None,
+                env_answer: String::new(),
+                shells: vec![],
+            },
+        ))),
+    };
+    let target = SshTarget::parse("ci@x").unwrap();
+    let source = |remote: &mut dyn Remote, host: &str| {
+        let met = remote.run(&target, "env-probe", &[], Duration::from_secs(1));
+        vec![Check::new(
+            host,
+            "environment_diff",
+            if met.is_ok() { Level::Ok } else { Level::Fail },
+            "compared",
+        )]
+    };
+    let report = run(
+        &mut together,
+        &mut w.runner,
+        &w.host.env,
+        &w.spec,
+        &w.version,
+        Some(&source),
+    )
+    .unwrap();
+    for name in ["mini-a", "mini-b", "mini-c"] {
+        assert_eq!(of(&report, name, "reachable").level, Level::Ok, "{name}");
+        assert_eq!(of(&report, name, "bridge").level, Level::Ok, "{name}");
+        assert_eq!(
+            of(&report, name, "environment_diff").level,
+            Level::Ok,
+            "{name}"
+        );
+    }
+    // The order of the report is the order of the registrations.
+    let hosts: Vec<_> =
+        report
+            .checks
+            .iter()
+            .map(|c| c.host.as_str())
+            .fold(Vec::new(), |mut seen, h| {
+                if seen.last() != Some(&h) {
+                    seen.push(h);
+                }
+                seen
+            });
+    assert_eq!(hosts[..4], ["parent", "mini-a", "mini-b", "mini-c"][..]);
 }

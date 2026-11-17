@@ -23,6 +23,79 @@ const LIMIT: Duration = Duration::from_secs(3600);
 /// is not waited for like an install.
 const QUIET: Duration = Duration::from_secs(120);
 
+/// Ctrl-C during `workers sync`. While an install is being waited for, the
+/// interrupt is a request to stop waiting (the loop sees it, lets go of the
+/// warm-up on the worker, and ends); at any other time the command ends at
+/// once, as an interrupt does by default.
+pub mod interrupt {
+    use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+
+    static REQUESTED: AtomicBool = AtomicBool::new(false);
+    static HELD: AtomicBool = AtomicBool::new(false);
+
+    /// Only an atomic store and `_exit`, which a handler may do.
+    extern "C" fn on_interrupt(_: libc::c_int) {
+        REQUESTED.store(true, SeqCst);
+        if !HELD.load(SeqCst) {
+            // SAFETY: `_exit` is async-signal-safe and touches no state.
+            unsafe { libc::_exit(130) }
+        }
+    }
+
+    /// The interrupt handler of the command; the previous one comes back when
+    /// this is dropped.
+    pub struct Guard {
+        previous: libc::sigaction,
+    }
+    impl Guard {
+        pub fn new() -> Option<Guard> {
+            // SAFETY: plain `sigaction` calls with zeroed, then filled,
+            // structures; the handler is the function above.
+            unsafe {
+                let mut handler: libc::sigaction = std::mem::zeroed();
+                handler.sa_sigaction = on_interrupt as extern "C" fn(libc::c_int) as usize;
+                libc::sigemptyset(&mut handler.sa_mask);
+                handler.sa_flags = 0;
+                let mut previous: libc::sigaction = std::mem::zeroed();
+                (libc::sigaction(libc::SIGINT, &handler, &mut previous) == 0)
+                    .then_some(Guard { previous })
+            }
+        }
+    }
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            // SAFETY: puts back what `new` read.
+            unsafe {
+                libc::sigaction(libc::SIGINT, &self.previous, std::ptr::null_mut());
+            }
+            REQUESTED.store(false, SeqCst);
+        }
+    }
+
+    /// While this lives an interrupt is only noted (see `requested`).
+    pub struct Held;
+    impl Held {
+        pub fn new() -> Held {
+            HELD.store(true, SeqCst);
+            Held
+        }
+    }
+    impl Default for Held {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+    impl Drop for Held {
+        fn drop(&mut self) {
+            HELD.store(false, SeqCst);
+        }
+    }
+
+    pub fn requested() -> bool {
+        REQUESTED.load(SeqCst)
+    }
+}
+
 /// Why the resident gave no reply.
 #[derive(Debug, PartialEq, Eq)]
 pub enum NoReply {
@@ -167,6 +240,8 @@ pub struct ResidentWarmup {
     poll: Duration,
     limit: Duration,
     quiet: Duration,
+    /// Whether the person interrupted the sync. The process's Ctrl-C by default.
+    interrupted: fn() -> bool,
 }
 
 /// Pure: whether a wait that began `waited` ago and was last answered
@@ -207,7 +282,14 @@ impl ResidentWarmup {
             poll: POLL,
             limit: LIMIT,
             quiet: QUIET,
+            interrupted: interrupt::requested,
         }
+    }
+    /// For the tests: what stands for Ctrl-C.
+    #[doc(hidden)]
+    pub fn interrupted_by(mut self, interrupted: fn() -> bool) -> Self {
+        self.interrupted = interrupted;
+        self
     }
     /// For the tests: how often to look, and for how long in all and
     /// without an answer.
@@ -263,6 +345,7 @@ impl Installer for ResidentWarmup {
             "installing {} {} on worker {worker}",
             step.tool, step.version
         );
+        let _held = interrupt::Held::new();
         loop {
             let reply = runtime
                 .block_on(client.request(Operation::EnvSync {
@@ -305,6 +388,23 @@ impl Installer for ResidentWarmup {
                 return Err(stop(ApiError::new(ErrorCode::CommunicationUnknown, why)));
             }
             std::thread::sleep(self.poll);
+            if (self.interrupted)() {
+                // Asking about no tool lets go of this warm-up at once; a
+                // worker that does not know this lets its idle time end it.
+                // One try: the person is waiting to get the terminal back.
+                let _ = runtime.block_on(client.request(Operation::EnvSync {
+                    worker: worker_id.clone(),
+                    sync_id: sync_id.clone(),
+                    tools: Vec::new(),
+                }));
+                return Err(stop(ApiError::new(
+                    ErrorCode::Signal,
+                    format!(
+                        "interrupted: {} {} on worker {worker} is no longer waited for; an install that nothing else waits for stops. {MAY_GO_ON}",
+                        step.tool, step.version
+                    ),
+                )));
+            }
         }
     }
 }

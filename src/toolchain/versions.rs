@@ -267,6 +267,17 @@ pub struct EffectiveRequirement {
     pub constraints: Vec<Constraint>,
     pub provenance: Vec<Location>,
 }
+/// The scopes a worker has to serve for `declarations`: each project as a
+/// whole, and every narrower scope (workflow, job, step) a declaration names.
+/// A requirement of a narrow scope is taken together with the project's own.
+pub fn requirement_scopes(declarations: &[Declaration]) -> Vec<Scope> {
+    let mut scopes = std::collections::BTreeSet::new();
+    for d in declarations {
+        scopes.insert(Scope::project(&d.scope.project));
+        scopes.insert(d.scope.clone());
+    }
+    scopes.into_iter().collect()
+}
 /// Reject contradictory constraints in the selected scope. No file wins by
 /// accidental read order. Ranges intersect; unresolved aliases stay unresolved.
 pub fn effective(
