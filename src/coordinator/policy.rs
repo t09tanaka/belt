@@ -237,6 +237,22 @@ pub fn lacks_ci_task(spec: &super::TaskSpec, negotiated: bool) -> bool {
     spec.ci.is_some() && !negotiated
 }
 
+pub fn missing_ci_feature(
+    spec: &super::TaskSpec,
+    ci: bool,
+    discovery: bool,
+) -> Option<&'static str> {
+    if lacks_ci_task(spec, ci) {
+        return Some(CI_TASK_UNMET);
+    }
+    (spec
+        .ci
+        .as_ref()
+        .is_some_and(|s| crate::wire::is_discovery_task(&s.task))
+        && !discovery)
+        .then_some("protocol feature ci_discovery_v1")
+}
+
 /// The result of a CI task is one more required artifact of its attempt: do
 /// the declarations of the task leave room for it?
 pub fn ci_declarations_fit(artifacts: usize, outputs: usize) -> bool {

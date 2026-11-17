@@ -903,6 +903,14 @@ pub struct AttemptPayload {
 /// no build's `SUPPORTED_FEATURES`, and a CI task that was not negotiated is
 /// refused.
 pub const CI_TASK_FEATURE: &str = "ci_task_v1";
+/// The worker can run dedicated listing attempts before the CI plan is partitioned.
+pub const CI_DISCOVERY_FEATURE: &str = "ci_discovery_v1";
+
+pub fn is_discovery_task(task: &CiTask) -> bool {
+    task.task_id
+        .strip_prefix("rtr-discover-")
+        .is_some_and(|id| Digest::parse(id).is_ok())
+}
 
 /// One task of a frozen CI plan (spec chapter 7). The plan itself is not
 /// here: its bytes reach the worker as a content-addressed blob, and the

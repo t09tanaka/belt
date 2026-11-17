@@ -113,6 +113,11 @@ impl ResolvedConfig {
             .features
             .iter()
             .any(|feature| feature == crate::wire::ENV_SYNC_FEATURE);
+        let discovery = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|f| f == crate::wire::CI_DISCOVERY_FEATURE);
         let ci_task = connected
             .negotiated
             .features
@@ -120,6 +125,7 @@ impl ResolvedConfig {
             .any(|feature| feature == crate::wire::CI_TASK_FEATURE);
         if let Some(gate) = &gate {
             gate.set_ci_task(ci_task);
+            gate.set_ci_discovery(discovery);
         }
         let link: Arc<dyn crate::coordinator::WorkerLink> = Arc::new(
             (match gate {
@@ -129,7 +135,8 @@ impl ResolvedConfig {
             .with_preparation_observations(observations)
             .with_preparation_probe(probe)
             .with_env_sync(env_sync)
-            .with_ci_task(ci_task),
+            .with_ci_task(ci_task)
+            .with_ci_discovery(discovery),
         );
         coordinator.attach(id.clone(), link.clone()).await;
         Ok(link)

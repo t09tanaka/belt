@@ -134,6 +134,20 @@ impl CoordinatorStore {
         rerun: &[String],
         at_ms: u64,
     ) -> Result<bool> {
+        self.join_ci_shards_with_timings(run, group, failure, rerun, at_ms, None)
+    }
+
+    /// Keep verified runner times in the very transaction that accepts the
+    /// group. Replaying a join cannot write older observations back.
+    pub fn join_ci_shards_with_timings(
+        &self,
+        run: &RunId,
+        group: &str,
+        failure: Option<&str>,
+        rerun: &[String],
+        at_ms: u64,
+        timings: Option<(String, local_ci::shard::History)>,
+    ) -> Result<bool> {
         let (run, group, failure, rerun) = (
             run.to_string(),
             group.to_string(),
@@ -155,6 +169,13 @@ impl CoordinatorStore {
             )?;
             if changed == 0 {
                 return Ok(false);
+            }
+            if let Some((scope, history)) = timings {
+                let mut insert = tx.prepare_cached("INSERT INTO ci_test_timing(scope,identity,millis) VALUES(?1,?2,?3)
+                    ON CONFLICT(scope,identity) DO UPDATE SET millis=excluded.millis")?;
+                for (identity, millis) in history.millis {
+                    insert.execute(params![scope, identity, to_i64(millis)?])?;
+                }
             }
             for task in &rerun {
                 tx.execute(
@@ -201,6 +222,78 @@ impl CoordinatorStore {
                 )?;
             }
             Ok(changed)
+        })
+    }
+
+    /// The timings used to make one partition. Read only the identities in
+    /// this listing: obsolete files in a repository cannot grow the snapshot.
+    pub fn ci_test_timings(
+        &self,
+        scope: String,
+        identities: Vec<String>,
+    ) -> Result<local_ci::shard::History> {
+        self.db.call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            let mut history = local_ci::shard::History::default();
+            {
+                let mut query = tx.prepare_cached(
+                    "SELECT millis FROM ci_test_timing WHERE scope=?1 AND identity=?2",
+                )?;
+                for identity in identities {
+                    let millis: Option<i64> = query
+                        .query_row(params![scope, identity], |r| r.get(0))
+                        .optional()?;
+                    if let Some(millis) = millis {
+                        history.millis.insert(identity, to_u64(millis)?);
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(history)
+        })
+    }
+
+    /// Commit a frozen partition once. The first shard keeps the submitter's
+    /// task id. Later shards inherit any per-task cancellation that won the
+    /// race. The run-cancel trigger also applies to every inserted row.
+    pub fn apply_ci_discovery(
+        &self,
+        run: &RunId,
+        probe_ids: Vec<TaskId>,
+        replacements: Vec<(TaskId, Vec<(TaskId, Value)>)>,
+        at_ms: u64,
+    ) -> Result<bool> {
+        let run = run.to_string();
+        self.db.write(move |tx| {
+            for id in &probe_ids {
+                let pending: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task WHERE run_id=?1 AND task_id=?2
+                     AND json_extract(spec_json,'$.ci.task.inputs.rtr_discovery.applied')=0)",
+                    params![run, id.as_str()], |r| r.get(0))?;
+                if !pending { return Ok(false); }
+            }
+            for (old, parts) in replacements {
+                let cancelled: Option<i64> = tx.query_row(
+                    "SELECT cancel_requested_at_ms FROM task t WHERE run_id=?1 AND task_id=?2
+                     AND json_extract(spec_json,'$.ci.hold')=1
+                     AND NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)",
+                    params![run, old.as_str()], |r| r.get(0))?;
+                for (id, spec) in parts {
+                    if id == old {
+                        tx.execute("UPDATE task SET spec_json=?3 WHERE run_id=?1 AND task_id=?2",
+                            params![run, id.as_str(), spec.to_string()])?;
+                    } else {
+                        tx.execute("INSERT INTO task(task_id,run_id,spec_json,created_at_ms,cancel_requested_at_ms) VALUES(?1,?2,?3,?4,?5)",
+                            params![id.as_str(),run,spec.to_string(),to_i64(at_ms)?,cancelled])?;
+                    }
+                }
+            }
+            for id in probe_ids {
+                tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.rtr_discovery.applied',json('true')) WHERE run_id=?1 AND task_id=?2",
+                    params![run, id.as_str()])?;
+            }
+            common::append_event(tx,Some(&run),None,"ci_discovery_applied",&serde_json::json!({}),at_ms)?;
+            Ok(true)
         })
     }
 

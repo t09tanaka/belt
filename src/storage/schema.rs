@@ -340,6 +340,7 @@ INSERT INTO schema_meta(key,value) VALUES('execution_requirements_v1','1');"#.to
             // worker's whole history. Performance only; it adds no feature
             // marker, the version bump alone makes an older binary refuse.
             "CREATE INDEX placement_unacked ON placement(worker_id,placement_id) WHERE acked_at_ms IS NULL;\nCREATE INDEX attempt_worker_live ON attempt(worker_id,created_at_ms) WHERE state <> 'terminal' AND retired=0;".into(),
+            "CREATE TABLE ci_test_timing(scope TEXT NOT NULL, identity TEXT NOT NULL, millis INTEGER NOT NULL CHECK(millis>=0), PRIMARY KEY(scope,identity)) WITHOUT ROWID;".into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

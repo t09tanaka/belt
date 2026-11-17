@@ -1475,7 +1475,13 @@ impl Coordinator {
             // It waits for the jobs it needs; the queue does not list it.
             return Ok(());
         }
-        let lacks_ci = |w: &Reached| policy::lacks_ci_task(&spec, w.link.ci_task_negotiated());
+        let lacks_ci = |w: &Reached| {
+            policy::missing_ci_feature(
+                &spec,
+                w.link.ci_task_negotiated(),
+                w.link.ci_discovery_negotiated(),
+            )
+        };
         let parent_local = self
             .parent_local
             .lock()
@@ -1595,7 +1601,7 @@ impl Coordinator {
                 .iter()
                 .filter(|w| refusal(w).is_none() && (ready(w) || measured_cold(w)))
                 .partition(|w| {
-                    !lacks_ci(w)
+                    lacks_ci(w).is_none()
                         && (spec.toolchains.is_none() || toolchain_eligible.contains(&w.worker_id))
                         && crate::toolchain::capability::missing_with_installable(
                             &spec.requirements,
@@ -1605,8 +1611,8 @@ impl Coordinator {
                         .is_empty()
                 });
             excluded.extend(mismatched.into_iter().map(|w| Excluded {
-                unmet: if lacks_ci(w) {
-                    vec![policy::CI_TASK_UNMET.to_string()]
+                unmet: if let Some(reason) = lacks_ci(w) {
+                    vec![reason.to_string()]
                 } else {
                     crate::toolchain::envdiff::with_steps(
                         crate::toolchain::capability::missing(

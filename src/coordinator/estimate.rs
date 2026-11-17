@@ -209,10 +209,14 @@ impl Coordinator {
                     {
                         unmet.push("in-place task requires the parent-local worker".into());
                     }
-                    if spec
-                        .is_some_and(|spec| policy::lacks_ci_task(spec, link.ci_task_negotiated()))
-                    {
-                        unmet.push(policy::CI_TASK_UNMET.to_string());
+                    if let Some(reason) = spec.and_then(|spec| {
+                        policy::missing_ci_feature(
+                            spec,
+                            link.ci_task_negotiated(),
+                            link.ci_discovery_negotiated(),
+                        )
+                    }) {
+                        unmet.push(reason.to_owned());
                     }
                     let command_supported = inspect
                         .capabilities

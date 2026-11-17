@@ -1,10 +1,12 @@
 //! Bind a worker's listing to the frozen job and use the same runner adapter
 //! for listing, partitioning and execution. The listing carries no worker paths.
 
+mod worker;
+
 use local_ci::dag::{NotSplit, ShardRequest};
 use local_ci::shard::{
     adapters::{self, CargoTest, Cypress, Isolation, Jest, Playwright, Safety, Vitest},
-    partition_tests, CommandOutput, Discovered, History, Invocation, PartitionOpts, RunnerAdapter,
+    partition_tests, CommandOutput, Discovered, History, PartitionOpts, RunnerAdapter,
 };
 use local_ci::FrozenPlan;
 use serde::{Deserialize, Serialize};
@@ -105,7 +107,25 @@ pub fn candidates(plan: &FrozenPlan) -> Vec<DiscoveryStep> {
                 job: id.clone(),
                 step,
             };
-            if candidate.target(plan).is_ok() {
+            // These steps will also precede every actual shard. Only a
+            // reproducible setup may be replayed for discovery.
+            let safe_setup = j.steps[..step].iter().all(|s| {
+                s.run.as_deref().is_some_and(local_ci::plan::is_installer)
+                    || s.uses
+                        .as_deref()
+                        .and_then(|u| u.split_once('@'))
+                        .is_some_and(|(action, _)| {
+                            matches!(
+                                action,
+                                "actions/checkout"
+                                    | "actions/setup-node"
+                                    | "actions/setup-python"
+                                    | "actions/setup-java"
+                                    | "dtolnay/rust-toolchain"
+                            )
+                        })
+            });
+            if safe_setup && candidate.target(plan).is_ok() {
                 steps.push(candidate);
             }
         }
@@ -146,13 +166,13 @@ pub struct WorkerListing {
 }
 
 impl DiscoveryStep {
-    /// Invoke through the worker's supervised executor in its prepared workspace.
-    pub fn discover(
+    /// Parse the output of the supervised listing in the worker workspace.
+    pub fn parse_listing(
         self,
         plan: &FrozenPlan,
         workspace: &Path,
         version: String,
-        invoke: impl FnOnce(&Invocation, &Path) -> anyhow::Result<CommandOutput>,
+        output: CommandOutput,
     ) -> anyhow::Result<WorkerListing> {
         let target = self.target(plan)?;
         let workspace = workspace.canonicalize()?;
@@ -169,7 +189,6 @@ impl DiscoveryStep {
                 .ok_or_else(|| anyhow::anyhow!("runner directory is not UTF-8"))?,
             Isolation::None,
         )?;
-        let output = invoke(&runner.discover_command(), &root)?;
         let discovered = runner.discover(&output).unwrap_or_else(|_| Discovered {
             blocked: vec![NotSplit::DiscoveryFailed],
             ..Default::default()
@@ -183,6 +202,18 @@ impl DiscoveryStep {
 }
 
 impl WorkerListing {
+    pub fn history_key(&self, plan: &FrozenPlan, project: &str) -> anyhow::Result<String> {
+        let target = self.step.target(plan)?;
+        let runner = adapter(target.command, &self.runner_version, "", Isolation::None)?;
+        Ok(timing_key(
+            project,
+            &self.step.workflow,
+            &self.step.job,
+            &target.dir,
+            runner.info(),
+        ))
+    }
+
     pub fn partition(
         &self,
         plan: &FrozenPlan,
@@ -193,7 +224,22 @@ impl WorkerListing {
     ) -> anyhow::Result<ShardRequest> {
         let target = self.step.target(plan)?;
         let runner = adapter(target.command, &self.runner_version, "", isolation)?;
-        let partition = partition_tests(runner.as_ref(), &self.discovered, history, count, costs);
+        let mut discovered = self.discovered.clone();
+        let files = matches!(runner.info().runner.as_str(), "vitest" | "jest" | "cypress");
+        if discovered.tests.iter().any(|identity| {
+            identity.is_empty()
+                || identity.chars().any(char::is_control)
+                || (files
+                    && !Path::new(identity)
+                        .components()
+                        .all(|p| matches!(p, Component::Normal(_) | Component::CurDir)))
+        }) {
+            discovered = Discovered {
+                blocked: vec![NotSplit::ManifestMismatch],
+                ..Default::default()
+            };
+        }
+        let partition = partition_tests(runner.as_ref(), &discovered, history, count, costs);
         Ok(ShardRequest {
             workflow: self.step.workflow.clone(),
             job: self.step.job.clone(),
@@ -201,8 +247,60 @@ impl WorkerListing {
             dir: target.dir,
             fail_fast: target.fail_fast,
             plan: partition,
-            discovered: self.discovered.clone(),
+            discovered,
         })
+    }
+}
+
+pub fn timing_key(
+    project: &str,
+    workflow: &str,
+    job: &str,
+    dir: &str,
+    runner: &local_ci::shard::RunnerInfo,
+) -> String {
+    crate::ids::Digest::of_bytes(
+        &serde_json::to_vec(&(project, workflow, job, dir, runner)).expect("timing key serializes"),
+    )
+    .to_string()
+}
+
+/// Put the original tasks on hold until every listing is available. The
+/// coordinate lives in a separate task so a retry can never run an uncertain
+/// test again just to discover it.
+pub fn stage(
+    plan: &FrozenPlan,
+    specs: &mut Vec<(String, crate::coordinator::TaskSpec)>,
+    capacity: usize,
+    project: &str,
+) {
+    let mut probes = Vec::new();
+    for step in candidates(plan) {
+        let Some(task) = plan
+            .tasks
+            .iter()
+            .find(|t| t.workflow == step.workflow && t.jobs == [step.job.clone()])
+        else {
+            continue;
+        };
+        let Some((_, spec)) = specs.iter().find(|(name, _)| name == &task.id) else {
+            continue;
+        };
+        let mut probe = spec.clone();
+        let ci = probe.ci.as_mut().expect("specs came from a CI plan");
+        let id = step.task_id();
+        ci.task.task_id = id.clone();
+        ci.task.inputs["rtr_discovery"] =
+            serde_json::json!({"capacity": capacity, "project": project, "applied": false});
+        ci.hold = false;
+        ci.steps = u32::try_from(step.step + 2).unwrap_or(u32::MAX);
+        probes.push((id, probe));
+    }
+    if !probes.is_empty() {
+        for (_, spec) in specs.iter_mut() {
+            spec.ci.as_mut().expect("CI task").hold = true;
+        }
+        specs.extend(probes);
     }
 }
 
@@ -239,212 +337,4 @@ pub fn apply(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::ci::execute::tests::fixture;
-    use local_ci::shard::Basis;
-
-    const WORKFLOW: &str =
-        "on: push\njobs:\n  js:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npx jest\n";
-
-    #[test]
-    fn an_exact_worker_listing_is_split_with_history_and_bound_to_its_plan() {
-        let fixture = fixture(WORKFLOW);
-        let plan = fixture.plan;
-        let candidate = candidates(&plan).pop().unwrap();
-        let listing = candidate
-            .discover(&plan, &fixture.area, "30.2".into(), |inv, root| {
-                assert!(inv.argv.iter().any(|s| s == "--listTests"));
-                Ok(CommandOutput {
-                    stdout: ["a.js", "b.js", "c.js", "d.js"]
-                        .iter()
-                        .map(|n| root.join(n).display().to_string())
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                    stderr: String::new(),
-                    success: true,
-                    exit: Some(0),
-                })
-            })
-            .unwrap();
-        assert_eq!(listing.discovered.tests, ["a.js", "b.js", "c.js", "d.js"]);
-        let costs = PartitionOpts::default();
-        let timing = History {
-            millis: [("a.js", 90), ("b.js", 30), ("c.js", 30), ("d.js", 30)]
-                .into_iter()
-                .map(|(s, n)| (s.to_owned(), n))
-                .collect(),
-        };
-        let request = listing
-            .partition(&plan, &timing, 2, &costs, Isolation::None)
-            .unwrap();
-        assert_eq!(request.plan.basis, Basis::History);
-        assert!(request.plan.shards.iter().all(|s| s.load == 90));
-        assert_eq!(
-            listing
-                .partition(&plan, &History::default(), 2, &costs, Isolation::None)
-                .unwrap()
-                .plan
-                .basis,
-            Basis::Fallback
-        );
-        let split = apply(
-            &plan,
-            std::slice::from_ref(&listing),
-            2,
-            &costs,
-            |_| Ok(timing.clone()),
-            |_| Isolation::None,
-        )
-        .unwrap();
-        split.verify().unwrap();
-        assert!(split.shard_groups[0].split);
-        assert_eq!(split.shard_groups[0].manifest, listing.discovered.tests);
-        assert!(listing
-            .partition(&split, &timing, 2, &costs, Isolation::None)
-            .is_err());
-        assert!(apply(
-            &plan,
-            &[],
-            2,
-            &costs,
-            |_| Ok(timing.clone()),
-            |_| Isolation::None
-        )
-        .is_err());
-    }
-}
-
-impl DiscoveryStep {
-    /// No ordinary task can have this id: all ordinary ids contain the
-    /// workflow/job separator. An older worker refuses an unknown id.
-    pub fn task_id(&self) -> String {
-        let bytes = serde_json::to_vec(self).expect("discovery coordinates serialize");
-        format!("rtr-discover-{}", crate::ids::Digest::of_bytes(&bytes))
-    }
-
-    pub fn from_task(plan: &FrozenPlan, id: &str) -> Option<Self> {
-        if !id.starts_with("rtr-discover-") {
-            return None;
-        }
-        candidates(plan).into_iter().find(|c| c.task_id() == id)
-    }
-
-    /// The source binding and setup steps are those of the actual job. The
-    /// final two commands measure the installed version and enumerate tests;
-    /// the tests themselves and post-test steps do not run in this attempt.
-    pub fn execution_plan(&self, plan: &FrozenPlan) -> anyhow::Result<FrozenPlan> {
-        let target = self.target(plan)?;
-        let runner = adapter(target.command, "", "", Isolation::None)?;
-        let listing = adapters::script_of(&runner.discover_command())
-            .ok_or_else(|| anyhow::anyhow!("runner listing cannot be represented as a step"))?;
-        let version = match runner.info().runner.as_str() {
-            "cargo-test" => "cargo --version",
-            "vitest" => "node -p \"require('vitest/package.json').version\"",
-            "jest" => "node -p \"require('jest/package.json').version\"",
-            "playwright" => "node -p \"require('playwright/package.json').version\"",
-            "cypress" => "node -p \"require('cypress/package.json').version\"",
-            name => anyhow::bail!("unknown runner {name}"),
-        };
-        let mut probe = plan.to_plan();
-        probe.selected.retain(|s| s.wf.file == self.workflow);
-        let workflow = &mut probe.selected[0].wf;
-        workflow.jobs.retain(|job| job.id == self.job);
-        let job = &mut workflow.jobs[0];
-        anyhow::ensure!(
-            job.needs.is_empty() && job.matrix.is_none() && job.services.is_empty(),
-            "discovery needs an independent prepared job"
-        );
-        job.outputs.clear();
-        job.steps.truncate(self.step + 1);
-        let test = &mut job.steps[self.step];
-        test.run = Some(version.to_owned());
-        let mut listing_step = test.clone();
-        listing_step.id = None;
-        listing_step.run = Some(listing);
-        job.steps.push(listing_step);
-        probe.units = vec![local_ci::plan::Unit {
-            wf: 0,
-            jobs: vec![self.job.clone()],
-            exclusive: false,
-        }];
-        plan.with_plan(probe)
-    }
-
-    // The listing is optional planning evidence. A failed version probe,
-    // setup, or listing yields an explanation and leaves the real job whole.
-    pub fn failed(self) -> WorkerListing {
-        WorkerListing {
-            step: self,
-            runner_version: "unavailable".into(),
-            discovered: Discovered {
-                blocked: vec![NotSplit::DiscoveryFailed],
-                ..Default::default()
-            },
-        }
-    }
-
-    pub fn result(
-        self,
-        plan: &FrozenPlan,
-        workspace: &Path,
-        run_dir: &Path,
-        result: &local_ci::TaskResult,
-    ) -> anyhow::Result<WorkerListing> {
-        use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
-        let step_log = |index: usize, cap: u64| -> Option<String> {
-            let ran = result.jobs.first()?.steps.get(index)?;
-            if ran.exit != Some(0) {
-                return None;
-            }
-            let path = ran.log.as_ref()?;
-            if !path.starts_with(run_dir) {
-                return None;
-            }
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-                .ok()?;
-            if !file.metadata().ok()?.is_file() {
-                return None;
-            }
-            let mut buf = String::new();
-            file.take(cap + 1).read_to_string(&mut buf).ok()?;
-            (buf.len() as u64 <= cap).then_some(buf)
-        };
-        let Some(version) = step_log(self.step, 4096) else {
-            return Ok(self.failed());
-        };
-        let Some(list) = step_log(self.step + 1, super::advance::MAX_RESULT_BYTES) else {
-            return Ok(self.failed());
-        };
-        let version = version.trim();
-        if version.is_empty() || version.len() > 256 || version.chars().any(char::is_control) {
-            return Ok(self.failed());
-        }
-        // The supervisor tees both streams into the one step log. The cargo
-        // adapter counts harness summaries in stdout and target lines in stderr.
-        self.parse_listing(
-            plan,
-            workspace,
-            version.to_owned(),
-            CommandOutput {
-                stdout: list.clone(),
-                stderr: list,
-                success: true,
-                exit: Some(0),
-            },
-        )
-    }
-    pub fn parse_listing(
-        self,
-        plan: &FrozenPlan,
-        workspace: &Path,
-        version: String,
-        output: CommandOutput,
-    ) -> anyhow::Result<WorkerListing> {
-        self.discover(plan, workspace, version, |_, _| Ok(output))
-    }
-}
+mod tests;

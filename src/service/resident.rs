@@ -222,6 +222,18 @@ impl Operation {
     }
     /// A run of CI tasks: a resident that does not know them must refuse the
     /// request, not read the tasks as tasks without commands.
+    fn requires_discovery(&self) -> bool {
+        match self {
+            Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
+                tasks.iter().any(|(_, spec)| {
+                    spec.ci
+                        .as_ref()
+                        .is_some_and(|ci| crate::wire::is_discovery_task(&ci.task))
+                })
+            }
+            _ => false,
+        }
+    }
     fn requires_ci(&self) -> bool {
         match self {
             Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
@@ -305,7 +317,9 @@ impl Client {
             IO_TIMEOUT
         };
         let request = Request {
-            schema_version: if operation.requires_ci() {
+            schema_version: if operation.requires_discovery() {
+                6
+            } else if operation.requires_ci() {
                 5
             } else if operation.requires_toolchains() {
                 4
@@ -657,6 +671,13 @@ async fn connect_local(
     let input_gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(
         provenance.to_string(),
     ));
+    input_gate.set_ci_discovery(
+        connected
+            .negotiated
+            .features
+            .iter()
+            .any(|f| f == crate::wire::CI_DISCOVERY_FEATURE),
+    );
     input_gate.set_ci_task(
         connected
             .negotiated
@@ -755,7 +776,8 @@ impl Resident {
                     .with_preparation_observations(observations)
                     .with_preparation_probe(probe)
                     .with_env_sync(env_sync)
-                    .with_ci_task(input_gate.ci_task()),
+                    .with_ci_task(input_gate.ci_task())
+                    .with_ci_discovery(input_gate.ci_discovery()),
                 ),
             )
             .await;
@@ -1123,7 +1145,8 @@ async fn handle(
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
-        matches!(request.schema_version, 2..=5)
+        matches!(request.schema_version, 2..=6)
+            && (request.schema_version >= 6 || !request.operation.requires_discovery())
             && (request.schema_version >= 5 || !request.operation.requires_ci())
             && (request.schema_version >= 3 || !request.operation.requires_capabilities())
             && (request.schema_version >= 4 || !request.operation.requires_toolchains())
