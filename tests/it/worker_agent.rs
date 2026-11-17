@@ -61,6 +61,9 @@ struct DirHost {
     /// with the setup steps of `setup_skip` in the workspace.
     setup_pending: AtomicBool,
     setup_skip: Mutex<std::collections::BTreeSet<String>>,
+    /// What `toolchain_poll` answers: `Some(None)` pending, `Some(Some(why))`
+    /// failed. `None`: this host prepares no toolchains.
+    tool_poll: Mutex<Option<Option<String>>>,
 }
 
 type MaskHook = Box<dyn Fn(&AttemptId) + Send + Sync>;
@@ -153,6 +156,32 @@ impl Host for DirHost {
     }
     fn setup_release(&self, a: &AttemptId) {
         self.log(format!("setup_release {a}"));
+    }
+    fn toolchain_registry(
+        &self,
+        profile: &remote_task_runner::toolchain::profile::Profile,
+        base: Digest,
+    ) -> Result<Option<remote_task_runner::toolchain::registry::Registry>, ApiError> {
+        let state = self.base.join("state");
+        if !state.join("toolchains.toml").exists() {
+            return Ok(None);
+        }
+        remote_task_runner::toolchain::registry::Registry::load(&state, profile, base)
+            .map(Some)
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e))
+    }
+    fn toolchain_poll(
+        &self,
+        a: &AttemptId,
+        request: &remote_task_runner::toolchain::preparation::PreparationRequest,
+    ) -> Result<remote_task_runner::toolchain::preparation::ToolPreparationPoll, ApiError> {
+        use remote_task_runner::toolchain::preparation::{PreparationFailure, ToolPreparationPoll};
+        self.log(format!("tool_poll {a} {}", request.tool.as_str()));
+        match self.tool_poll.lock().unwrap().clone() {
+            None => Err(ApiError::new(ErrorCode::Internal, "no toolchains here")),
+            Some(None) => Ok(ToolPreparationPoll::Pending),
+            Some(Some(why)) => Ok(ToolPreparationPoll::Failed(PreparationFailure(why))),
+        }
     }
     fn secret_paths(&self, _: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
         if let Some(e) = self.secret_paths_error.lock().unwrap().clone() {
@@ -255,6 +284,7 @@ pub(crate) fn fx() -> Fx {
         secret_paths_error: Mutex::new(None),
         setup_pending: AtomicBool::new(false),
         setup_skip: Mutex::default(),
+        tool_poll: Mutex::new(None),
     });
     Fx {
         dir,
@@ -4384,4 +4414,392 @@ async fn a_draining_worker_refuses_a_new_attempt_but_answers_a_resend() {
     control::write(&f.state(), Control::default()).unwrap();
     submit(&c, &late, &payload("exit 0")).await;
     agent.shutdown();
+}
+
+// ---------------------------------------------------------------------------
+// env_sync: the warm-up of `workers sync`
+// ---------------------------------------------------------------------------
+
+/// A fixture whose worker has a registry: node 20.0.0 and 22.0.0 may be
+/// installed. The managers are never run here (the host's poll is scripted).
+fn warm_fx(configure: impl FnOnce(&mut AgentConfig)) -> (Fx, Arc<Agent>) {
+    use remote_task_runner::toolchain::profile::Profile;
+    let f = fx();
+    let state = f.state();
+    let private = |path: &Path, mode| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    std::fs::create_dir_all(state.join("toolchains")).unwrap();
+    private(&state, 0o700);
+    private(&state.join("toolchains"), 0o700);
+    let host = std::fs::canonicalize(f.dir.path())
+        .unwrap()
+        .join("managers");
+    std::fs::create_dir(&host).unwrap();
+    for name in ["manager", "node-build", "node"] {
+        crate::common::write_executable(&host.join(name), "#!/bin/sh\nexit 91\n");
+    }
+    let profiles = format!(
+        "schema_version=1\nactive='warm'\n[profiles.warm]\npath=[{:?}]\nshell='/bin/sh'\ncache_namespace='warm'\n",
+        host.to_str().unwrap()
+    );
+    std::fs::write(state.join("profiles.toml"), profiles).unwrap();
+    private(&state.join("profiles.toml"), 0o600);
+    let profile = Profile::load(&state, &BTreeMap::new()).unwrap();
+    let registry = format!(
+        "schema_version=1\nactive_profile='warm'\nprofile_definition={:?}\n[[recipes]]\ntool='node'\nkind='Nodenv'\nmanager={:?}\ndependencies=[{:?}]\nsearch_path=[{:?}{}]\ninventory=['20.0.0','22.0.0']\n",
+        profile.definition_digest().as_str(),
+        host.join("manager").to_str().unwrap(),
+        host.join("node-build").to_str().unwrap(),
+        host.to_str().unwrap(),
+        crate::common::system_search_path_toml()
+    );
+    std::fs::write(state.join("toolchains.toml"), registry).unwrap();
+    private(&state.join("toolchains.toml"), 0o600);
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    configure(&mut cfg);
+    let agent = f.start_with(cfg);
+    (f, agent)
+}
+
+fn tool(name: &str, version: &str) -> ToolRequirement {
+    ToolRequirement {
+        name: name.into(),
+        version: version.into(),
+    }
+}
+
+fn env_sync_req(sync: &RequestId, tools: Vec<ToolRequirement>, dry_run: bool) -> Request {
+    Request::EnvSync(EnvSyncRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        sync_id: sync.clone(),
+        coordinator_epoch: CoordinatorEpoch(1),
+        tools,
+        dry_run,
+    })
+}
+
+fn env_sync(
+    agent: &Arc<Agent>,
+    sync: &RequestId,
+    tools: Vec<ToolRequirement>,
+) -> Result<Vec<ToolSyncResult>, ApiError> {
+    let session = Session {
+        coordinator_epoch: CoordinatorEpoch(1),
+    };
+    match agent.handle(session, env_sync_req(sync, tools, false))? {
+        Response::EnvSync(r) => Ok(r.results),
+        other => panic!("{other:?}"),
+    }
+}
+
+impl DirHost {
+    /// The consumers `toolchain_poll` was asked for, in order.
+    fn tool_polls(&self) -> Vec<String> {
+        self.calls()
+            .iter()
+            .filter_map(|c| c.strip_prefix("tool_poll "))
+            .map(|c| c.split(' ').next().unwrap().to_string())
+            .collect()
+    }
+    fn releases(&self) -> Vec<String> {
+        self.calls()
+            .iter()
+            .filter_map(|c| c.strip_prefix("setup_release "))
+            .map(Into::into)
+            .collect()
+    }
+}
+
+#[tokio::test]
+async fn env_sync_is_refused_on_a_connection_that_did_not_negotiate_it() {
+    let (f, agent) = warm_fx(|_| {});
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let sync = RequestId::generate();
+    for negotiated in [false, true] {
+        let (a, b) = duplex_pair(64 * 1024);
+        tokio::spawn(serve_connection(
+            agent.clone(),
+            b,
+            f.cluster.clone(),
+            Arc::new(Semaphore::new(4)),
+        ));
+        let mut config = client_cfg(&f.cluster);
+        if !negotiated {
+            config.features.retain(|v| v != ENV_SYNC_FEATURE);
+        }
+        let connection = connect(a, config).await.unwrap();
+        assert_eq!(
+            connection
+                .negotiated
+                .features
+                .iter()
+                .any(|v| v == ENV_SYNC_FEATURE),
+            negotiated
+        );
+        let answer = call(
+            &connection.client,
+            env_sync_req(&sync, vec![tool("node", "20.0.0")], false),
+        )
+        .await;
+        if negotiated {
+            let Response::EnvSync(r) = answer.unwrap() else {
+                panic!()
+            };
+            assert_eq!(r.results[0].outcome, SyncOutcome::Pending);
+            assert_eq!(f.host.tool_polls().len(), 1);
+        } else {
+            assert_eq!(answer.unwrap_err().code, ErrorCode::ProtocolIncompatible);
+            // Refused before the agent: nothing was started.
+            assert!(f.host.tool_polls().is_empty());
+        }
+    }
+}
+
+#[test]
+fn env_sync_installs_only_what_the_workers_own_registry_names() {
+    let (f, agent) = warm_fx(|_| {});
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    // Over the limit and a tool named twice: refused whole.
+    let many: Vec<_> = (0..=MAX_ENV_SYNC_TOOLS)
+        .map(|i| tool(&format!("tool{i}"), "1.0.0"))
+        .collect();
+    let error = env_sync(&agent, &RequestId::generate(), many).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    let at_the_limit: Vec<_> = (0..MAX_ENV_SYNC_TOOLS)
+        .map(|i| tool(&format!("tool{i}"), "1.0.0"))
+        .collect();
+    assert_eq!(
+        env_sync(&agent, &RequestId::generate(), at_the_limit)
+            .unwrap()
+            .len(),
+        MAX_ENV_SYNC_TOOLS
+    );
+    let error = env_sync(
+        &agent,
+        &RequestId::generate(),
+        vec![tool("node", "20.0.0"), tool("node", "22.0.0")],
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert!(f.host.tool_polls().is_empty());
+    // What the registry does not name is failed with the reason, one by one;
+    // what it names goes on.
+    let results = env_sync(
+        &agent,
+        &RequestId::generate(),
+        vec![
+            tool("node", "21.0.0"),
+            tool("node2", "20.0.0"),
+            tool("python", "20"),
+            tool("Not A Tool", "1.0.0"),
+            tool("rust", "1.80.0"),
+        ],
+    )
+    .unwrap();
+    let said = |i: usize| results[i].message.clone().unwrap_or_default();
+    assert!(results.iter().all(|r| r.outcome == SyncOutcome::Failed));
+    assert!(
+        said(0).contains("node 21.0.0 is not in the inventory"),
+        "{}",
+        said(0)
+    );
+    assert!(said(1).contains("no recipe for node2"), "{}", said(1));
+    assert!(
+        said(2).contains("20 is not an exact version"),
+        "{}",
+        said(2)
+    );
+    assert!(said(3).contains("not a tool name"), "{}", said(3));
+    assert!(said(4).contains("no recipe for rust"), "{}", said(4));
+    assert!(f.host.tool_polls().is_empty());
+    // A dry run looks and never starts anything.
+    let Response::EnvSync(dry) = agent
+        .handle(
+            Session {
+                coordinator_epoch: CoordinatorEpoch(1),
+            },
+            env_sync_req(
+                &RequestId::generate(),
+                vec![tool("node", "20.0.0"), tool("node9", "1.0.0")],
+                true,
+            ),
+        )
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(dry.results[0].outcome, SyncOutcome::WouldInstall);
+    assert_eq!(dry.results[1].outcome, SyncOutcome::Failed);
+    assert!(f.host.tool_polls().is_empty());
+    // A coordinator older than one this worker has heard from is refused.
+    let session = Session {
+        coordinator_epoch: CoordinatorEpoch(5),
+    };
+    let mut newer = payload("exit 0");
+    newer.commands[0].env.clear();
+    agent
+        .handle(
+            session,
+            Request::SubmitAttempt(
+                SubmitAttemptRequest::new(
+                    RequestId::generate(),
+                    CoordinatorEpoch(5),
+                    AttemptId::generate(),
+                    newer,
+                )
+                .unwrap(),
+            ),
+        )
+        .unwrap();
+    let at = |epoch| {
+        Request::EnvSync(EnvSyncRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            sync_id: RequestId::generate(),
+            coordinator_epoch: CoordinatorEpoch(epoch),
+            tools: vec![tool("node", "20.0.0")],
+            dry_run: false,
+        })
+    };
+    assert_eq!(
+        agent.handle(session, at(4)).unwrap_err().code,
+        ErrorCode::StaleEpoch
+    );
+    assert!(f.host.tool_polls().is_empty());
+    agent.handle(session, at(5)).unwrap();
+    assert_eq!(f.host.tool_polls().len(), 1);
+}
+
+#[test]
+fn env_sync_without_a_registry_installs_nothing_and_says_what_is_missing() {
+    let f = fx();
+    let agent = f.start("boot-1");
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let results = env_sync(&agent, &RequestId::generate(), vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(results[0].outcome, SyncOutcome::Failed);
+    assert!(results[0]
+        .message
+        .as_deref()
+        .unwrap()
+        .contains("no version manager is configured"));
+    assert!(f.host.tool_polls().is_empty());
+}
+
+#[test]
+fn a_warm_up_keeps_one_consumer_until_it_is_decided_and_then_repeats_its_answer() {
+    let (f, agent) = warm_fx(|_| {});
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let sync = RequestId::generate();
+    let tools = || vec![tool("node", "20.0.0"), tool("python", "3.12.0")];
+    for _ in 0..2 {
+        let results = env_sync(&agent, &sync, tools()).unwrap();
+        assert_eq!(results[0].name, "node");
+        assert_eq!(results[0].outcome, SyncOutcome::Pending);
+        // The tool nobody authorized is decided at once, in its place.
+        assert_eq!(results[1].outcome, SyncOutcome::Failed);
+    }
+    let polls = f.host.tool_polls();
+    assert_eq!(polls.len(), 2);
+    assert_eq!(polls[0], polls[1], "one warm-up is one consumer");
+    assert!(f.host.releases().is_empty(), "still waited for");
+    // A tick while it is asked about takes nothing away.
+    agent.tick();
+    assert!(f.host.releases().is_empty());
+    // The same id never changes its question.
+    let error = env_sync(&agent, &sync, vec![tool("node", "22.0.0")]).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    // Another sync is another consumer (the setup owner joins their flights).
+    let other = RequestId::generate();
+    env_sync(&agent, &other, vec![tool("node", "20.0.0")]).unwrap();
+    assert_ne!(f.host.tool_polls()[2], polls[0]);
+    // The install fails: said with its reason, and the reference goes once.
+    *f.host.tool_poll.lock().unwrap() = Some(Some("the manager exited 19".into()));
+    let results = env_sync(&agent, &sync, tools()).unwrap();
+    assert_eq!(results[0].outcome, SyncOutcome::Failed);
+    assert_eq!(results[0].message.as_deref(), Some("the manager exited 19"));
+    assert_eq!(f.host.releases(), vec![polls[0].clone()]);
+    // A late look (a lost answer) gets the same outcome and starts nothing.
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let asked = f.host.tool_polls().len();
+    let again = env_sync(&agent, &sync, tools()).unwrap();
+    assert_eq!(again, results);
+    assert_eq!(f.host.tool_polls().len(), asked);
+    assert_eq!(f.host.releases().len(), 1);
+}
+
+#[test]
+fn a_warm_up_that_takes_too_long_fails_and_gives_up_its_reference() {
+    let (f, agent) = warm_fx(|cfg| cfg.prepare_timeout_ms = 150);
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let sync = RequestId::generate();
+    let first = env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(first[0].outcome, SyncOutcome::Pending);
+    assert!(f.host.releases().is_empty());
+    std::thread::sleep(Duration::from_millis(200));
+    let late = env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(late[0].outcome, SyncOutcome::Failed);
+    assert!(late[0].message.as_deref().unwrap().contains("in time"));
+    assert_eq!(f.host.releases(), vec![f.host.tool_polls()[0].clone()]);
+}
+
+#[test]
+fn a_warm_up_nobody_asks_about_is_released_by_the_tick() {
+    let (f, agent) = warm_fx(|cfg| cfg.warmup_idle_ms = 150);
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let sync = RequestId::generate();
+    env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    agent.tick();
+    assert!(f.host.releases().is_empty(), "asked about a moment ago");
+    std::thread::sleep(Duration::from_millis(200));
+    agent.tick();
+    let first = f.host.tool_polls()[0].clone();
+    assert_eq!(f.host.releases(), vec![first.clone()]);
+    // Released once; asking again is a new warm-up with its own consumer.
+    agent.tick();
+    assert_eq!(f.host.releases().len(), 1);
+    env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert_ne!(f.host.tool_polls()[1], first);
+    // A decided warm-up that is forgotten later is not released twice.
+    *f.host.tool_poll.lock().unwrap() = Some(Some("no".into()));
+    env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(f.host.releases().len(), 2);
+    std::thread::sleep(Duration::from_millis(200));
+    agent.tick();
+    assert_eq!(f.host.releases().len(), 2);
+}
+
+#[test]
+fn a_stopping_or_crowded_worker_starts_no_new_warm_up() {
+    let (f, agent) = warm_fx(|_| {});
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let known = RequestId::generate();
+    env_sync(&agent, &known, vec![tool("node", "20.0.0")]).unwrap();
+    for _ in 1..16 {
+        env_sync(&agent, &RequestId::generate(), vec![tool("node", "20.0.0")]).unwrap();
+    }
+    let error = env_sync(&agent, &RequestId::generate(), vec![tool("node", "20.0.0")]).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Overloaded);
+    assert!(error.message.contains("too many"), "{}", error.message);
+    assert_eq!(f.host.tool_polls().len(), 16);
+    // One it already knows is still answered.
+    env_sync(&agent, &known, vec![tool("node", "20.0.0")]).unwrap();
+
+    let (g, stopping) = warm_fx(|_| {});
+    *g.host.tool_poll.lock().unwrap() = Some(None);
+    let running = RequestId::generate();
+    env_sync(&stopping, &running, vec![tool("node", "20.0.0")]).unwrap();
+    stopping.shutdown();
+    let error = env_sync(
+        &stopping,
+        &RequestId::generate(),
+        vec![tool("node", "20.0.0")],
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Overloaded);
+    assert!(error.message.contains("stopping"), "{}", error.message);
+    assert_eq!(g.host.tool_polls().len(), 1);
 }
