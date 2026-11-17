@@ -269,7 +269,7 @@ fn advance_run(
     let mut members: BTreeMap<String, Member> = BTreeMap::new();
     let mut digest = None;
     let rows = store.ci_run_tasks(run).map_err(fault)?;
-    if discovery::advance(store, state_dir, results, run, &rows, now_ms)? {
+    if discovery::advance(store, state_dir, results, run, &rows, now_ms, pass)? {
         return Ok(());
     }
     let project = rows

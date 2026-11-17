@@ -54,7 +54,8 @@ impl DiscoveryStep {
             .as_deref()
             .or(job.working_directory.as_deref())
             .or(workflow.working_directory.as_deref())
-            .unwrap_or("");
+            .unwrap_or("")
+            .trim();
         anyhow::ensure!(
             Path::new(raw)
                 .components()

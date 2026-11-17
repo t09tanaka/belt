@@ -60,6 +60,7 @@ pub(super) fn advance(
     run: &RunId,
     rows: &[CiTaskRow],
     now_ms: u64,
+    pass: &mut Pass,
 ) -> Result<bool, Fault> {
     let mut probes = rows
         .iter()
@@ -69,6 +70,7 @@ pub(super) fn advance(
     };
     let first_spec: TaskSpec = serde_json::from_value(first.spec.clone()).map_err(unrunnable)?;
     let base = first_spec.plan_digest.clone();
+    pass.plans.insert(base.clone());
     let plan: FrozenPlan =
         serde_json::from_slice(&read_plan(state_dir, &base)?).map_err(unrunnable)?;
     let capacity = metadata(first)
@@ -103,17 +105,25 @@ pub(super) fn advance(
         ids.push(probe.task_id.clone());
         listings.push(listing);
     }
+    let project = metadata(first)
+        .and_then(|m| m["project"].as_str())
+        .ok_or_else(|| unrunnable("missing timing scope"))?;
+    let mut histories = BTreeMap::new();
+    for listing in &listings {
+        let key = listing.history_key(&plan, project).map_err(unrunnable)?;
+        let history = store
+            .ci_test_timings(key.clone(), listing.discovered.tests.clone())
+            .map_err(transient)?;
+        histories.insert(key, history);
+    }
     let split = apply(
         &plan,
         &listings,
         capacity,
         &PartitionOpts::default(),
         |listing| {
-            let project = metadata(first)
-                .and_then(|m| m["project"].as_str())
-                .ok_or_else(|| anyhow::anyhow!("missing timing scope"))?;
             let key = listing.history_key(&plan, project)?;
-            Ok(store.ci_test_timings(key, listing.discovered.tests.clone())?)
+            Ok(histories.get(&key).cloned().unwrap_or_default())
         },
         |step| {
             policies
