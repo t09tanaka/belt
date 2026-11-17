@@ -2129,6 +2129,7 @@ impl Agent {
                     &attempts,
                     max_epoch,
                     &r,
+                    &|payload| self.pending_tool_installs(payload),
                 )
                 .map(Response::ForecastCommand)
             }
@@ -2730,7 +2731,30 @@ impl Agent {
             &attempts,
             max_epoch,
             &r,
+            &|payload| self.pending_tool_installs(payload),
         )
+    }
+
+    /// How many of an accepted attempt's tools are not installed yet (read
+    /// only: the same detect admission uses). A tool whose state cannot be
+    /// read counts as waiting; an attempt that needs no tool, or a worker with
+    /// no registry, counts as none (admission blocks the latter).
+    fn pending_tool_installs(&self, payload: &AttemptPayload) -> usize {
+        let (Some(bundle), Some(registry)) = (&payload.toolchains, &self.toolchains) else {
+            return 0;
+        };
+        let Ok(requests) = self.toolchain_requests(bundle) else {
+            return 0;
+        };
+        requests
+            .iter()
+            .filter(|r| {
+                !matches!(
+                    registry.detect(r),
+                    Ok(crate::toolchain::adapters::Availability::Installed(_))
+                )
+            })
+            .count()
     }
 
     fn capabilities_with_diagnostic(

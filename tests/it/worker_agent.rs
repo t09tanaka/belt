@@ -5446,3 +5446,100 @@ async fn an_attempt_stored_for_another_scope_starts_in_the_scope_of_the_worker()
     assert!(!seen.contains("XDG_CONFIG_HOME="), "{seen}");
     agent.shutdown();
 }
+
+/// A forecast counts the installs an accepted attempt still waits for: they
+/// are demand ahead from acceptance on, and the answer says so. An attempt
+/// that needs no tool adds none.
+#[test]
+fn a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for() {
+    use remote_task_runner::toolchain::{contract::FrozenBundle, versions::*};
+    let (f, agent) = warm_fx(|_| {});
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let session = Session {
+        coordinator_epoch: CoordinatorEpoch(1),
+    };
+    let ask = || {
+        let a = AttemptId::generate();
+        let n = NodeId::parse("main").unwrap();
+        let Response::Forecast(r) = agent
+            .handle(
+                session,
+                Request::Forecast(ForecastRequest {
+                    schema_version: SchemaVersion::CURRENT,
+                    request_id: RequestId::generate(),
+                    coordinator_epoch: CoordinatorEpoch(1),
+                    workload: WorkloadPlan {
+                        attempt_id: a.clone(),
+                        plan_digest: Digest::of_bytes(b"plan"),
+                        expansion_seq: 0,
+                        nodes: vec![WorkloadNode {
+                            node_id: n.clone(),
+                            depends_on: vec![],
+                            priority: 0,
+                            weight: Some(1),
+                            predicted_rss_bytes: Some(1),
+                            predicted_runtime_ms: Some(5_000),
+                            external_delay_ms: None,
+                            ready_in_ms: Some(0),
+                            concurrency: ConcurrencyLimits::default(),
+                            correlation: Correlation {
+                                attempt_id: a.clone(),
+                                node_id: n,
+                                ledger_entry: None,
+                            },
+                            shared_builder: None,
+                        }],
+                    },
+                    pending: vec![],
+                }),
+            )
+            .unwrap()
+        else {
+            panic!("a forecast answer")
+        };
+        r
+    };
+    let said = |r: &ForecastResponse| r.target.assumptions.join("\n");
+    assert!(!said(&ask()).contains("toolchain installs"));
+    // An attempt without a frozen toolchain adds no install.
+    let mut plain = payload("exit 0");
+    plain.commands[0].env.clear();
+    agent
+        .handle(session, submit_req(&AttemptId::generate(), &plain))
+        .unwrap();
+    assert!(!said(&ask()).contains("toolchain installs"));
+    // One that waits for node 20.0.0 (not installed: the manager is never run).
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    let scope = Scope::project("");
+    p.toolchains = Some(Box::new(
+        FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                p.manifest_digest.clone(),
+                Digest::of_bytes(b"parent"),
+                scope.clone(),
+                &[Declaration {
+                    tool: ToolId::parse("node").unwrap(),
+                    constraint: Constraint::parse("20.0.0").unwrap(),
+                    scope,
+                    location: Location {
+                        path: ".node-version".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &BTreeMap::new(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    ));
+    agent
+        .handle(session, submit_req(&AttemptId::generate(), &p))
+        .unwrap();
+    let r = ask();
+    assert!(said(&r).contains("toolchain installs"), "{}", said(&r));
+    assert!(r.target.conditional);
+}
