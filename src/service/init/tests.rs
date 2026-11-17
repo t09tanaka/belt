@@ -78,6 +78,12 @@ async fn foreign_input_and_relative_config_are_preflight_errors() {
     c.env.insert("XDG_CONFIG_HOME".into(), "relative".into());
     assert!(initialize(c.clone(), &mut Unknown).await.is_err());
     c.env.remove("XDG_CONFIG_HOME");
+    // The worker would refuse a relative state home at start: not after install.
+    c.env.insert("XDG_STATE_HOME".into(), "relative".into());
+    let e = Paths::resolve(&c.env).err().unwrap().to_string();
+    assert!(e.contains("XDG_STATE_HOME"), "{e}");
+    assert!(initialize(c.clone(), &mut Unknown).await.is_err());
+    c.env.remove("XDG_STATE_HOME");
     let p = Paths::resolve(&c.env).unwrap();
     private_dir(&p.config).unwrap();
     fs::write(&p.input, b"foreign").unwrap();
@@ -188,10 +194,18 @@ async fn uncertain_bootstrap_keeps_exact_managed_receipts() {
             Err(LaunchError::OutcomeUnknown("owned test uncertainty".into()))
         }
     }
-    let (_t, c) = fixture();
+    let (t, mut c) = fixture();
+    let state_home = t.path().join("state-home");
+    c.env
+        .insert("XDG_STATE_HOME".into(), state_home.to_str().unwrap().into());
     let p = Paths::resolve(&c.env).unwrap();
     let err = initialize(c, &mut Uncertain).await.unwrap_err();
     assert!(err.downcast_ref::<Unconfirmed>().is_some());
+    // The user's state home reaches the worker through the input, so the
+    // worker shares the scope of the user's task-traffic-controller; the
+    // service definition itself does not carry it (it rendered).
+    let spec = bootstrap::read_input(&p.input).unwrap();
+    assert_eq!(spec.env["XDG_STATE_HOME"], state_home.to_str().unwrap());
     let j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
     assert!(j.plist.is_some());
     for f in &j.files {

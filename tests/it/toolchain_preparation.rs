@@ -784,6 +784,7 @@ fn preparation_observation_excludes_actual_ttc_admission_wait() {
         opts: task_traffic_controller::exec::Opts {
             label: None,
             weight: Some(1),
+            parent: None,
             front: false,
             key: None,
             argv: vec!["/usr/bin/true".into()],

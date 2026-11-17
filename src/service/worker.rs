@@ -22,6 +22,9 @@ const ENV: &[&str] = &[
     "LC_ALL",
     "LC_CTYPE",
     "XDG_CONFIG_HOME",
+    // The scope of the task-traffic-controller CLI follows these two, so the
+    // worker takes the values of the user's shell at install or init.
+    "XDG_STATE_HOME",
 ];
 
 /// Provisioned out of band; never generated from an unverified peer hello.
@@ -311,6 +314,11 @@ async fn run(spec: WorkerSpec, config: config::ResolvedConfig) -> anyhow::Result
     let boot = crate::platform::boot_id()
         .ok_or_else(|| anyhow::anyhow!("OS boot identity unavailable"))?;
     let settings = config.runtime_settings()?;
+    // Commands of this worker that still run in another scope: wait for
+    // them, not serving, instead of failing into a restart loop.
+    if !super::traffic_hold::wait_until_clear(&spec.state_dir, &spec.env).await? {
+        return Ok(());
+    }
     let runtime = config.worker_runtime(WorkerInputs {
         state_dir: spec.state_dir.clone(),
         worker_id: spec.worker_id.clone(),

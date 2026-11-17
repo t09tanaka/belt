@@ -1133,16 +1133,11 @@ fn compose_activation(
         }
         paths.push(plan.activation_bin.clone());
         for (key, value) in &plan.activation_env {
-            if matches!(
-                key.as_str(),
-                "PATH"
-                    | "HOME"
-                    | "XDG_CONFIG_HOME"
-                    | "XDG_CACHE_HOME"
-                    | "XDG_DATA_HOME"
-                    | "TMPDIR"
-                    | "CI"
-            ) {
+            // Every XDG_* variable stays the worker's: XDG_STATE_HOME and
+            // XDG_CONFIG_HOME decide which task-traffic-controller scope a
+            // nested CLI uses.
+            if matches!(key.as_str(), "PATH" | "HOME" | "TMPDIR" | "CI") || key.starts_with("XDG_")
+            {
                 continue;
             }
             if let Some(previous) = overrides.insert(key.clone(), value.clone()) {

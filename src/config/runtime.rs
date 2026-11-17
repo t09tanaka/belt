@@ -148,13 +148,15 @@ impl ResolvedConfig {
         let settings = self.runtime_settings()?;
         // The scope of the task-traffic-controller CLI in this environment,
         // never one of the worker's own: one ledger and one budget per user.
+        // A role waits for whatever still runs in another scope before it
+        // comes here (`service::traffic_hold`); this is the last look, and
+        // the only one of a caller that does not wait.
         let traffic = super::traffic::resolve(&inputs.env)
             .and_then(|scope| {
-                super::traffic::refuse_live_legacy(
-                    &inputs.state_dir.join(super::traffic::LEGACY_DIR),
-                    &scope.state_dir,
-                )?;
-                Ok(scope)
+                match super::traffic::hold(&inputs.state_dir, &scope.state_dir).message() {
+                    Some(held) => Err(held.to_string()),
+                    None => Ok(scope),
+                }
             })
             .map_err(|e| super::ConfigError::Invalid { problems: vec![e] })?;
         let mut agent = AgentConfig::new(
@@ -177,9 +179,13 @@ impl ResolvedConfig {
         agent.profile_fingerprint = profile.startup_report().profile_fingerprint;
         let profile_definition = profile.definition_digest().clone();
         let env = profile.environment().clone();
+        let scope_env = profile.scope_environment().clone();
+        // git and the workspace tools read `XDG_CONFIG_HOME` as a step does.
+        let host_env = profile.host_environment();
         agent.capability_profile = Some(Arc::new(profile));
         let mut setup = SetupConfig::new(inputs.state_dir, inputs.worker_id, inputs.supervisor_exe);
-        setup.env = env.clone();
+        setup.env = env;
+        setup.scope_env = Some(scope_env);
         setup.profile_definition = Some(profile_definition);
         setup.profile_fingerprint = Some(agent.profile_fingerprint.clone());
         setup.profile = format!("{}:{}", agent.profile, agent.profile_fingerprint);
@@ -194,7 +200,7 @@ impl ResolvedConfig {
         Ok(WorkerRuntime {
             agent,
             setup,
-            env,
+            env: host_env,
             cluster_key_path: inputs.cluster_key_path,
         })
     }
