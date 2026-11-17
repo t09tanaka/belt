@@ -410,14 +410,14 @@ pub fn version_command(runner: &str) -> Option<&'static str> {
 pub(crate) fn guard_version(info: &RunnerInfo, script: String) -> Result<String, String> {
     let command = version_command(&info.runner)
         .ok_or_else(|| format!("unknown shard runner {}", info.runner))?;
+    let expected = shlex::try_quote(&info.version)
+        .map_err(|_| "invalid discovery runner version".to_owned())?;
     if info.version.is_empty()
         || info.version.len() > 256
         || info.version.chars().any(char::is_control)
     {
         return Err("invalid discovery runner version".into());
     }
-    let expected = shlex::try_quote(&info.version)
-        .map_err(|_| "invalid discovery runner version".to_owned())?;
     let runner = &info.runner;
     Ok(format!(
         r#"if ! actual=$({command}); then
@@ -1629,6 +1629,46 @@ impl RunnerAdapter for Cypress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_guard_checks_each_local_runner_and_rejects_invalid_receipts() {
+        for (runner, command) in [
+            ("cargo-test", "cargo --version"),
+            ("jest", r#"node -p "require('jest/package.json').version""#),
+            (
+                "vitest",
+                r#"node -p "require('vitest/package.json').version""#,
+            ),
+            (
+                "playwright",
+                r#"node -p "require('playwright/package.json').version""#,
+            ),
+            (
+                "cypress",
+                r#"node -p "require('cypress/package.json').version""#,
+            ),
+        ] {
+            assert_eq!(version_command(runner), Some(command));
+        }
+        let mut info = RunnerInfo {
+            runner: "unknown".into(),
+            version: "v1".into(),
+            ..Default::default()
+        };
+        assert!(guard_version(&info, String::new())
+            .unwrap_err()
+            .contains("unknown shard runner"));
+        info.runner = "cargo-test".into();
+        for invalid in [String::new(), "x".repeat(257), "v1\n".into(), "v1\0".into()] {
+            info.version = invalid;
+            assert_eq!(
+                guard_version(&info, String::new()).unwrap_err(),
+                "invalid discovery runner version"
+            );
+        }
+        info.version = "x".repeat(256);
+        assert!(guard_version(&info, String::new()).is_ok());
+    }
 
     #[test]
     fn distributed_shard_version_guard_runs_tests_only_on_the_discovered_version() {
