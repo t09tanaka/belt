@@ -1,9 +1,6 @@
 //! Chunked immutable source delivery on an independent multiplexed worker link.
 use crate::ids::*;
-use crate::protocol::{
-    transfer::{put_blob_as, put_blob_reader_as},
-    Client,
-};
+use crate::protocol::{transfer::put_blob_reader_as, Client};
 use crate::source::{store::UploadFile, SourceStore};
 use crate::wire::*;
 use std::collections::BTreeMap;
@@ -76,19 +73,121 @@ fn check_stop(stop: &watch::Receiver<bool>) -> anyhow::Result<()> {
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-async fn put(
+/// One manifest as the wire carries it (compact JSON) is at most what a
+/// worker accepts by default (`BlobLimits::default().max_manifest_bytes`,
+/// spec chapter 11): a larger one is refused here, before anything of the
+/// source is sent.
+fn max_manifest_bytes() -> u64 {
+    crate::worker::blob_policy::BlobLimits::default().max_manifest_bytes
+}
+
+/// Counts and hashes what passes, and refuses the byte that exceeds `limit`.
+struct Capped<W> {
+    inner: W,
+    hasher: sha2::Sha256,
+    written: u64,
+    limit: u64,
+}
+impl<W: std::io::Write> std::io::Write for Capped<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.limit - self.written < bytes.len() as u64 {
+            return Err(std::io::Error::other(format!(
+                "the manifest is larger than {} bytes",
+                self.limit
+            )));
+        }
+        let count = self.inner.write(bytes)?;
+        sha2::Digest::update(&mut self.hasher, &bytes[..count]);
+        self.written += count as u64;
+        Ok(count)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A spooled manifest: an unnamed private file with its digest and size.
+struct Spooled {
+    file: File,
+    digest: Digest,
+    size: u64,
+}
+
+/// Write `value` as compact JSON to an unnamed temporary file in `dir`,
+/// hashing it on the way. The JSON is never held in memory: the serializer
+/// writes through one 64 KiB buffer, and the upload reads the file back in
+/// chunks of that size. `dir` is the private scratch directory of the source
+/// store, on the disk of the state, so the spool is not memory either (the
+/// system temporary directory may be). Synchronous IO; callers run it off
+/// the executor threads.
+fn spool_json<T: serde::Serialize>(
+    value: &T,
+    dir: &std::path::Path,
+    limit: u64,
+) -> anyhow::Result<Spooled> {
+    use std::io::{Seek, Write};
+    let mut out = std::io::BufWriter::with_capacity(
+        64 * 1024,
+        Capped {
+            inner: tempfile::tempfile_in(dir)?,
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
+            written: 0,
+            limit,
+        },
+    );
+    serde_json::to_writer(&mut out, value)?;
+    out.flush()?;
+    let Capped {
+        inner: mut file,
+        hasher,
+        written: size,
+        ..
+    } = out.into_inner().map_err(|e| e.into_error())?;
+    let hash: String = sha2::Digest::finalize(hasher)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    file.rewind()?;
+    Ok(Spooled {
+        file,
+        digest: Digest::parse(&format!("sha256:{hash}"))?,
+        size,
+    })
+}
+
+/// Keeps the transfer lease through the last blocking read of a spooled
+/// manifest, as [`OwnedUpload`] does for a file of the store.
+struct SpooledUpload {
+    file: File,
+    _lease: Arc<Lease>,
+}
+impl std::io::Read for SpooledUpload {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(&mut self.file, buf)
+    }
+}
+impl std::io::Seek for SpooledUpload {
+    fn seek(&mut self, from: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(&mut self.file, from)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn put_reader<R: std::io::Read + std::io::Seek + Send + 'static>(
     client: &Client,
     epoch: CoordinatorEpoch,
     source: &SourceId,
     kind: SourceBlobKind,
-    bytes: &[u8],
+    reader: R,
+    digest: Digest,
+    size: u64,
     stop: &mut watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
     check_stop(stop)?;
     let answer = tokio::select! {
         biased;
         _=stopped(stop)=>anyhow::bail!("resident is stopping"),
-        answer=put_blob_as(client, epoch, source, kind, bytes, 0, 64 * 1024, TIMEOUT)=>answer?,
+        answer=put_blob_reader_as(client,epoch,source,kind,reader,digest,size,0,64*1024,TIMEOUT)=>answer?,
     };
     anyhow::ensure!(answer.complete, "source transfer incomplete");
     Ok(())
@@ -102,20 +201,23 @@ async fn put_file(
     stop: &mut watch::Receiver<bool>,
     lease: Arc<Lease>,
 ) -> anyhow::Result<()> {
-    check_stop(stop)?;
     let reader = OwnedUpload {
         file: upload.file,
         _lease: lease,
         read: 0,
         size: upload.size,
     };
-    let answer = tokio::select! {
-        biased;
-        _=stopped(stop)=>anyhow::bail!("resident is stopping"),
-        answer=put_blob_reader_as(client,epoch,source,kind,reader,upload.digest,upload.size,0,64*1024,TIMEOUT)=>answer?,
-    };
-    anyhow::ensure!(answer.complete, "source transfer incomplete");
-    Ok(())
+    put_reader(
+        client,
+        epoch,
+        source,
+        kind,
+        reader,
+        upload.digest,
+        upload.size,
+        stop,
+    )
+    .await
 }
 pub(super) async fn verify(
     client: &Client,
@@ -284,25 +386,40 @@ async fn source_inner(
     }
     // The wire requires the root manifest first; remaining manifests are its closure.
     // Secrets are metadata only.
-    for item in closure.iter().rev() {
-        let bytes = serde_json::to_vec(item)?;
-        if bytes.len() > 64 * 1024 {
+    // The JSON of a manifest goes through a spool file, 64 KiB at a time.
+    let closure = Arc::new(closure);
+    for index in (0..closure.len()).rev() {
+        let (items, ownership) = (closure.clone(), lease.clone());
+        let scratch = store.root().join("tmp");
+        let spooled = tokio::task::spawn_blocking(move || {
+            let _ownership = ownership;
+            spool_json(&items[index], &scratch, max_manifest_bytes())
+        })
+        .await??;
+        check_stop(stop)?;
+        if spooled.size > 64 * 1024 {
             lease
                 .measurable
                 .store(false, std::sync::atomic::Ordering::Relaxed);
         }
-        put(
+        let reader = SpooledUpload {
+            file: spooled.file,
+            _lease: lease.clone(),
+        };
+        put_reader(
             client,
             epoch,
             source,
             SourceBlobKind::Manifest,
-            &bytes,
+            reader,
+            spooled.digest,
+            spooled.size,
             stop,
         )
         .await?;
     }
     let mut hashes = BTreeMap::new();
-    for item in &closure {
+    for item in closure.iter() {
         for entry in &item.object_manifest.entries {
             if let Some(size) = hashes.insert(entry.hash.clone(), entry.size) {
                 anyhow::ensure!(size == entry.size, "source blob has conflicting sizes");
@@ -606,5 +723,67 @@ mod measured_lease_tests {
             .unwrap()
             .unwrap()
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod spool_tests {
+    use super::*;
+    use std::io::Read;
+
+    fn value(len: usize) -> serde_json::Value {
+        serde_json::json!({"entries": vec!["0123456789abcdef"; len]})
+    }
+
+    #[test]
+    fn the_spool_holds_the_compact_json_with_its_digest_and_size() {
+        // Larger than the 64 KiB buffer, so it reaches the file in pieces.
+        let v = value(20_000);
+        let want = serde_json::to_vec(&v).unwrap();
+        assert!(want.len() > 3 * 64 * 1024);
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let mut spooled = spool_json(&v, dir.path(), want.len() as u64).unwrap();
+        assert_eq!(spooled.size, want.len() as u64);
+        assert_eq!(spooled.digest, Digest::of_bytes(&want));
+        // It is rewound: the upload reads it from the start.
+        let mut got = Vec::new();
+        spooled.file.read_to_end(&mut got).unwrap();
+        assert_eq!(got, want);
+        // It has no name: nothing is left to clean up, whatever happens.
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        // Without the directory there is no spool (it is not made elsewhere).
+        assert!(spool_json(&v, &dir.path().join("absent"), u64::MAX).is_err());
+    }
+
+    #[test]
+    fn a_manifest_one_byte_over_the_limit_is_refused() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        for len in [1, 20_000] {
+            let v = value(len);
+            let size = serde_json::to_vec(&v).unwrap().len() as u64;
+            assert_eq!(spool_json(&v, dir.path(), size).unwrap().size, size);
+            let error = spool_json(&v, dir.path(), size - 1).err().unwrap();
+            assert!(
+                format!("{error:#}").contains(&format!("larger than {} bytes", size - 1)),
+                "{error:#}"
+            );
+        }
+        assert_eq!(max_manifest_bytes(), 67_108_864);
+    }
+
+    #[test]
+    fn the_cap_counts_what_was_written_across_calls() {
+        use std::io::Write;
+        let mut out = Capped {
+            inner: Vec::new(),
+            hasher: <sha2::Sha256 as sha2::Digest>::new(),
+            written: 0,
+            limit: 5,
+        };
+        assert_eq!(out.write(b"abc").unwrap(), 3);
+        assert!(out.write(b"def").is_err());
+        assert_eq!(out.write(b"de").unwrap(), 2);
+        assert!(out.write(b"f").is_err());
+        assert_eq!((out.written, out.inner.as_slice()), (5, &b"abcde"[..]));
     }
 }

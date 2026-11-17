@@ -359,6 +359,11 @@ fn panicking_fixture_process() {
     panic!("fixture test failed with a live owner");
 }
 
+/// The task-traffic-controller scope of a worker started from `env`.
+fn worker_traffic(env: &BTreeMap<String, String>) -> remote_task_runner::config::traffic::Scope {
+    remote_task_runner::config::traffic::resolve(env).unwrap()
+}
+
 #[tokio::test]
 async fn panicking_fixture_test_leaves_no_owner_process() {
     let dir = crate::test_tmp::tempdir().unwrap();
@@ -709,7 +714,7 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
     // feature markers as well as tables so every migration can run again.
     let db = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
     db.execute_batch(
-        "DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; DROP INDEX event_task_waiting; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='3' WHERE key='schema_version';",
+        "DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='3' WHERE key='schema_version';",
     )
     .unwrap();
     let old_epoch: i64 = db
@@ -3332,6 +3337,7 @@ async fn estimate_offline_100_calls_without_git_leave_db_epoch_and_source_roots_
     assert!(!spec.state_dir.join("startup.lock").exists());
     assert!(!spec.state_dir.join("sources").exists());
     assert!(!spec.worker_state_dir.join("traffic").exists());
+    assert!(!worker_traffic(&spec.env).state_dir.exists());
     assert!(!spec.worker_state_dir.join("clones").exists());
 }
 
@@ -3360,6 +3366,7 @@ async fn estimate_known_task_without_database_does_not_initialize_state() {
     assert!(!spec.state_dir.join("startup.lock").exists());
     assert!(!spec.state_dir.join("sources").exists());
     assert!(!spec.worker_state_dir.join("traffic").exists());
+    assert!(!worker_traffic(&spec.env).state_dir.exists());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3507,7 +3514,7 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     // Remove intentionally invalid config before exercising the original raw-command path.
     std::fs::remove_file(repo.join(".remote-task-runner.toml")).unwrap();
     let history = task_traffic_controller::history::read_all(
-        &spec.worker_state_dir.join("traffic/history.jsonl"),
+        &worker_traffic(&spec.env).state_dir.join("history.jsonl"),
     )
     .unwrap();
     assert_eq!(history.len(), 2);
@@ -3762,11 +3769,12 @@ async fn frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and
     // first stays ready until the second gave up; a busy host holds a start
     // as well. This test is about toolchains, so its admission is fixed here
     // instead of taken from the host.
-    let traffic = spec.worker_state_dir.join("traffic");
-    std::fs::create_dir(&traffic).unwrap();
-    std::fs::set_permissions(&traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let traffic_config = worker_traffic(&spec.env).config_file;
+    let traffic = traffic_config.parent().unwrap();
+    std::fs::create_dir_all(traffic).unwrap();
+    std::fs::set_permissions(traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(
-        traffic.join("config.toml"),
+        &traffic_config,
         "budget = 8\ncpu_threshold_percent = 100.0\nmemory_reserve_mib = 0\n",
     )
     .unwrap();
@@ -4280,6 +4288,90 @@ fn ci_plan_public_cli_frozen_worktree_commit_directory_and_private_failures() {
             .iter()
             .any(|n| n.starts_with("ci-plan-") || n.ends_with(".sock")),
         "{names:?}"
+    );
+}
+
+// A28: jobs that write the same file stay one task on one host, and the plan
+// says why in both output forms without printing scripts or host paths.
+#[test]
+fn ci_plan_shows_why_a_shared_workspace_task_is_not_split() {
+    let (root, spec) = fixture();
+    let config = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
+        .unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir_all(project.join(".github/workflows")).unwrap();
+    std::fs::write(
+        project.join(".github/workflows/ci.yml"),
+        "on: push\njobs:\n  first:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo PRIVATE_SCRIPT_SENTINEL > shared.txt\n  second:\n    needs: first\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo PRIVATE_SCRIPT_SENTINEL > shared.txt\n  alone:\n    needs: second\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo PRIVATE_SCRIPT_SENTINEL\n",
+    )
+    .unwrap();
+    let call = |args: &[&str]| {
+        let output = Command::new(&spec.executable)
+            .args(args)
+            .current_dir(&project)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success() && output.stderr.is_empty(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let text = String::from_utf8(output.stdout).unwrap();
+        for hidden in ["PRIVATE_SCRIPT_SENTINEL", root.path().to_str().unwrap()] {
+            assert!(!text.contains(hidden), "{text}");
+        }
+        text
+    };
+    let value: serde_json::Value = serde_json::from_str(&call(&["--json", "ci", "plan"])).unwrap();
+    let result = &value["result"];
+    let tasks = result["tasks"].as_array().unwrap();
+    assert_eq!(tasks.len(), 2, "{value}");
+    let shared = &tasks[0];
+    assert_eq!(shared["jobs"], serde_json::json!(["first", "second"]));
+    assert_eq!(shared["grouping"], "shared_outputs");
+    assert_eq!(shared["shared_by_jobs"], true);
+    assert_eq!(tasks[1]["jobs"], serde_json::json!(["alone"]));
+    assert_eq!(tasks[1]["grouping"], serde_json::Value::Null);
+    assert_eq!(tasks[1]["depends_on"], serde_json::json!([shared["id"]]));
+    assert_eq!(result["dependency_layer_width"], 1);
+    let group = result["shard_groups"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|g| g["shards"] == serde_json::json!([shared["id"]]))
+        .unwrap();
+    assert_eq!(group["split"], false);
+    assert!(group["not_split"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("shared_workspace")));
+
+    let text = call(&["ci", "plan"]);
+    let (shared, alone) = (
+        shared["id"].as_str().unwrap(),
+        tasks[1]["id"].as_str().unwrap(),
+    );
+    for line in [
+        "1 workflows, 2 tasks, 3 nodes".to_string(),
+        "2 tasks can be placed independently, widest dependency layer 1".to_string(),
+        format!("task {shared} keeps 2 jobs on one host: shared_outputs"),
+        format!("task {alone} waits for {shared}"),
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line}\n{text}");
+    }
+    assert!(
+        text.lines().any(|l| l
+            .strip_prefix(&format!(
+                "task {} is not split: [",
+                group["id"].as_str().unwrap()
+            ))
+            .is_some_and(|rest| rest.contains("shared_workspace"))),
+        "{text}"
     );
 }
 
@@ -4873,6 +4965,7 @@ async fn the_install_of_a_warm_up_waits_for_the_traffic_gate_of_the_worker() {
             cwd: host.clone(),
             env: None,
             stdout_log: None,
+            parent: None,
         },
         attempt: None,
         services: vec![],
@@ -4922,4 +5015,115 @@ async fn the_install_of_a_warm_up_waits_for_the_traffic_gate_of_the_worker() {
     assert_eq!(calls_of(&host, "20.0.0"), 1);
     assert_eq!(installed_node(&spec), ["20.0.0"]);
     shutdown(&client).await;
+}
+
+/// The project file's output plan reaches the worker through the public
+/// commands: `success`, `failure` and `always` follow the command's outcome,
+/// and globs and several paths select the members of one output.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn public_exec_output_conditions_globs_and_multiple_paths_follow_the_outcome() {
+    let (root, spec, input) = control_fixture();
+    std::fs::write(
+        input.join(".remote-task-runner.toml"),
+        "schema_version=1\n\
+         [[outputs]]\nname='passed'\npaths=['ok/**']\nrequired=true\nwhen='success'\n\
+         [[outputs]]\nname='failed'\npaths=['fail/*.log','extra/note.txt']\nrequired=true\nwhen='failure'\n\
+         [[outputs]]\nname='both'\npaths=['reports/**','coverage/*.txt']\n",
+    )
+    .unwrap();
+    let script = "mkdir ok fail fail/deep extra reports reports/unit coverage || exit 98; \
+                  echo ok > ok/done; echo log > fail/a.log; echo skipped > fail/a.txt; \
+                  echo deep > fail/deep/b.log; echo note > extra/note.txt; \
+                  echo report > reports/unit/r.xml; echo cover > coverage/c.txt; \
+                  echo raw > coverage/c.bin; exit \"$1\"";
+    let temporary = root.path().join("reader-tmp");
+    std::fs::create_dir(&temporary).unwrap();
+    std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = || std::env::var_os("LLVM_PROFILE_FILE").map(|v| ("LLVM_PROFILE_FILE", v));
+    for (code, stored, skipped) in [
+        (23, ["both", "failed"], "passed"),
+        (0, ["both", "passed"], "failed"),
+    ] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(30),
+            tokio::process::Command::new(&spec.executable)
+                .args(["--json", "exec", "--", "/bin/sh", "-c", script, "sh"])
+                .arg(code.to_string())
+                .env_clear()
+                .envs(profile())
+                .envs(&spec.env)
+                .current_dir(&input)
+                .output(),
+        )
+        .await
+        .unwrap_or_else(|elapsed| {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("output-plan exec did not finish: {elapsed}");
+        })
+        .unwrap();
+        // A required output whose condition does not hold is not a missing one:
+        // the command's own exit code is what the caller sees.
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let done: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let run = done["result"]["target"]["id"].as_str().unwrap().to_string();
+        let task =
+            remote_task_runner::ids::TaskId::parse(done["result"]["task_id"].as_str().unwrap())
+                .unwrap();
+        let attempt = {
+            let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+            let attempts = owner.attempts_of_task(&task).unwrap();
+            assert_eq!(attempts.len(), 1);
+            let names: Vec<String> = owner
+                .persisted_artifacts(&attempts[0].attempt_id)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(names, stored, "exit {code}");
+            attempts[0].attempt_id.clone()
+        };
+
+        let exported = root.path().join(format!("exported-{code}"));
+        let export = tokio::process::Command::new(&spec.executable)
+            .args(["--json", "outputs", &run, "--dir"])
+            .arg(&exported)
+            .env_clear()
+            .envs(profile())
+            .envs(&spec.env)
+            .env("TMPDIR", &temporary)
+            .env("PATH", "/no-programs")
+            .current_dir(root.path())
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            export.status.success(),
+            "{} {}",
+            String::from_utf8_lossy(&export.stdout),
+            String::from_utf8_lossy(&export.stderr)
+        );
+        let prefix = exported.join(task.as_str()).join(attempt.as_str());
+        let text = |path: &str| std::fs::read_to_string(prefix.join(path)).unwrap();
+        // `**` descends, `*` stays in one directory, and a literal path is one member.
+        assert_eq!(text("both/reports/unit/r.xml"), "report\n");
+        assert_eq!(text("both/coverage/c.txt"), "cover\n");
+        assert!(!prefix.join("both/coverage/c.bin").exists());
+        assert!(!prefix.join(skipped).exists());
+        if code == 0 {
+            assert_eq!(text("passed/ok/done"), "ok\n");
+        } else {
+            assert_eq!(text("failed/fail/a.log"), "log\n");
+            assert_eq!(text("failed/extra/note.txt"), "note\n");
+            assert!(!prefix.join("failed/fail/a.txt").exists());
+            assert!(!prefix.join("failed/fail/deep").exists());
+        }
+    }
+    shutdown(&load(&spec)).await;
 }

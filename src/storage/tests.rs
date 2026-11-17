@@ -2991,7 +2991,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     let all = schema::steps(DbKind::Coordinator);
     assert_eq!(
         all.len(),
-        10,
+        11,
         "this test is about step 1 and the steps after it"
     );
     let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
@@ -3104,7 +3104,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opened for writing, it is migrated, and every row is still there.
     let store = CoordinatorStore::open(dir.path(), 10).unwrap();
-    assert_eq!(schema_of(&store), ("10".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("11".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(4));
     assert_eq!(store.cluster_id(), &cluster);
     check_rows(&store);
@@ -3122,7 +3122,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opening again migrates nothing and loses nothing.
     let store = CoordinatorStore::open(dir.path(), 20).unwrap();
-    assert_eq!(schema_of(&store), ("10".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("11".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(5));
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);
@@ -3313,7 +3313,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     let dir = crate::test_tmp::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(all.len(), 10);
+    assert_eq!(all.len(), 11);
     let cluster = ClusterId::generate();
     let co = CoordinatorId::generate();
     let run = RunId::generate();
@@ -3368,7 +3368,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     }
     let owner = CoordinatorStore::open(dir.path(), 2).unwrap();
     let migrated = schema_info(&owner);
-    assert_eq!(migrated.0, "10");
+    assert_eq!(migrated.0, "11");
     assert_eq!(migrated.2, 3);
     assert!(migrated.1.is_some());
     let target_run = run.to_string();
@@ -4899,7 +4899,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
@@ -5270,7 +5270,10 @@ fn result_retention_claim_is_retained_when_ancestor_points_outside_root() {
         .unwrap();
     drop(guard);
     symlink(outside.path(), files.root().join(a.as_str())).unwrap();
-    assert!(retention::page(&f.store, &files, &mut retention::Cursor::default(), 7).is_err());
+    // The entry cannot be removed through the link: it is counted, stays
+    // pending and is never recorded as done.
+    let report = retention::page(&f.store, &files, &mut retention::Cursor::default(), 7).unwrap();
+    assert_eq!((report.deleted, report.failed), (0, 1));
     assert_eq!(
         std::fs::read(outside.path().join("logs/sentinel")).unwrap(),
         b"safe"
@@ -5491,4 +5494,90 @@ fn future_run_expiry_fences_retry_preflight_commit_and_enqueue_without_mutation(
         .contains("run expired"));
     assert_eq!(f.store.completion(target).unwrap().control_revision, 0);
     assert_eq!(f.store.attempts_of_task(&f.task).unwrap().len(), 1);
+}
+
+/// Secret delivery walks one worker's live attempts by this keyset page, so a
+/// worker with more live attempts than one page is still covered completely.
+#[test]
+fn live_attempts_of_a_worker_are_paged_without_gaps_repeats_or_other_rows() {
+    let f = fx();
+    let on = |name: &str, at_ms: u64| {
+        let task = TaskId::generate();
+        f.store.create_task(&task, &f.run, &json!({}), 1).unwrap();
+        f.store
+            .create_attempt(
+                NewAttempt {
+                    attempt_id: AttemptId::generate(),
+                    task_id: task,
+                    worker_id: worker(name),
+                    payload_hash: hash('a'),
+                    permit_id: None,
+                },
+                at_ms,
+            )
+            .unwrap()
+            .attempt_id
+    };
+    // Rows that never belong to the walk are interleaved with the live ones.
+    let ended = on("mini-a", 10);
+    f.to_finalizing(&ended);
+    f.store
+        .finalize_attempt(&ended, done(Outcome::Succeeded), 30)
+        .unwrap();
+    let retired = on("mini-a", 10);
+    f.store.begin_retire(&retired, "ack lost", 11).unwrap();
+    f.store.confirm_retire(&retired, 12).unwrap();
+    let mut expected = Vec::new();
+    for i in 0..70u64 {
+        // Several attempts share one creation time; the row order breaks the tie.
+        expected.push(on("mini-a", 10 + i / 30));
+        if i % 20 == 0 {
+            on("mini-b", 10 + i / 30);
+        }
+    }
+
+    let mut walked = Vec::new();
+    let mut sizes = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = f.store.live_attempt_page(&f.worker, cursor, 16).unwrap();
+        sizes.push(page.len());
+        let Some((last, _)) = page.last() else { break };
+        cursor = Some(*last);
+        walked.extend(page.into_iter().map(|(_, live)| live.record.attempt_id));
+    }
+    assert_eq!(sizes, [16, 16, 16, 16, 6, 0]);
+    assert_eq!(walked, expected);
+
+    // A caller cannot ask for an unbounded page.
+    let capped = f
+        .store
+        .live_attempt_page(&f.worker, None, u32::MAX)
+        .unwrap();
+    assert_eq!(capped.len(), 64);
+    assert_eq!(
+        capped
+            .iter()
+            .map(|(_, live)| live.record.attempt_id.clone())
+            .collect::<Vec<_>>(),
+        expected[..64]
+    );
+
+    // The cache is pruned against the live set without loading that set.
+    let mut asked = expected[..62].to_vec();
+    asked.push(ended);
+    asked.push(retired);
+    let live = f.store.live_attempt_subset(&f.worker, &asked).unwrap();
+    assert_eq!(live, expected[..62].iter().cloned().collect());
+    asked.push(expected[62].clone());
+    assert!(matches!(
+        f.store.live_attempt_subset(&f.worker, &asked),
+        Err(StorageError::Invalid(_))
+    ));
+    let other = worker("mini-b");
+    assert!(f
+        .store
+        .live_attempt_subset(&other, &expected[..8])
+        .unwrap()
+        .is_empty());
 }

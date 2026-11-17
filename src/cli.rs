@@ -356,6 +356,9 @@ pub fn run(cli: Cli) -> i32 {
         return run_control(&cli);
     }
 
+    if matches!(cli.command, Command::Doctor) {
+        return crate::service::doctor::command(cli.json);
+    }
     if let Command::Estimate(args) = &cli.command {
         return crate::service::estimate::cli(args, cli.json);
     }
@@ -499,13 +502,7 @@ fn run_ci_plan(cli: &Cli) -> i32 {
                     serde_json::json!({"schema_version":1,"ok":true,"result":summary})
                 );
             } else {
-                println!(
-                    "{} workflows, {} tasks, {} nodes\nplan {}",
-                    summary.selected_workflows,
-                    summary.tasks.len(),
-                    summary.nodes.len(),
-                    summary.digest
-                );
+                println!("{}", crate::ci::summary::render_text(&summary));
             }
             exit::SUCCESS
         }

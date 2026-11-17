@@ -219,6 +219,30 @@ pub struct SuperviseSpec {
 }
 
 impl SuperviseSpec {
+    /// Move a spec whose commands have not been started to the scope the
+    /// worker uses now: where the commands are admitted, and (with
+    /// `step_env`, see `config::traffic::step_env`) the variables that lead
+    /// a command's own `task-traffic-controller` to the same place. A spec
+    /// stored before the worker's scope changed would otherwise start its
+    /// commands in the old one, under a second budget.
+    ///
+    /// Never for an attempt that may have started a command: its recovery
+    /// looks for that command in the scope it was admitted in.
+    pub fn rescope(
+        &mut self,
+        traffic_state_dir: &Path,
+        traffic_config: Option<&Path>,
+        step_env: Option<&BTreeMap<String, String>>,
+    ) {
+        self.traffic_state_dir = traffic_state_dir.to_path_buf();
+        self.traffic_config = traffic_config.map(Path::to_path_buf);
+        if let Some(step_env) = step_env {
+            for node in &mut self.nodes {
+                crate::config::traffic::apply_step_env(&mut node.env, step_env);
+            }
+        }
+    }
+
     pub fn validate(&self) -> Result<()> {
         let bad = |m: &str| Err(SupervisorError::Spec(m.to_string()));
         if self.nodes.is_empty() != self.prepared_only {
@@ -373,6 +397,68 @@ mod tests {
             weight: None,
             timeout_ms: None,
         }
+    }
+
+    #[test]
+    fn rescope_moves_where_commands_are_admitted_and_what_they_resolve() {
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let mut stored = spec();
+        stored.traffic_config = Some("/t/config.toml".into());
+        stored.nodes[0].env = env(&[
+            ("PATH", "/bin"),
+            ("XDG_STATE_HOME", "/old"),
+            ("XDG_CONFIG_HOME", "/old-config"),
+        ]);
+        stored.nodes[1].env = env(&[("FLAG", "1")]);
+        let before = stored.clone();
+        let scope = env(&[
+            ("XDG_STATE_HOME", "/new"),
+            ("TASK_TRAFFIC_CONTROLLER_NESTED", "inherit"),
+        ]);
+        stored.rescope(
+            Path::new("/new/task-traffic-controller"),
+            Some(Path::new("/c/config.toml")),
+            Some(&scope),
+        );
+        assert_eq!(
+            stored.traffic_state_dir,
+            Path::new("/new/task-traffic-controller")
+        );
+        assert_eq!(stored.traffic_config, Some("/c/config.toml".into()));
+        assert_eq!(
+            stored.nodes[0].env,
+            env(&[
+                ("PATH", "/bin"),
+                ("XDG_STATE_HOME", "/new"),
+                ("TASK_TRAFFIC_CONTROLLER_NESTED", "inherit"),
+            ])
+        );
+        assert_eq!(
+            stored.nodes[1].env,
+            env(&[
+                ("FLAG", "1"),
+                ("XDG_STATE_HOME", "/new"),
+                ("TASK_TRAFFIC_CONTROLLER_NESTED", "inherit"),
+            ])
+        );
+        // Nothing else of the spec is touched.
+        let mut same = stored.clone();
+        same.traffic_state_dir = before.traffic_state_dir.clone();
+        same.traffic_config = before.traffic_config.clone();
+        same.nodes = before.nodes.clone();
+        assert_eq!(same, before);
+        // A worker without a profile decides the place only: the commands
+        // keep their environment. No configuration means the default one.
+        let mut plain = before.clone();
+        plain.rescope(Path::new("/new"), None, None);
+        assert_eq!(plain.traffic_state_dir, Path::new("/new"));
+        assert_eq!(plain.traffic_config, None);
+        assert_eq!(plain.nodes, before.nodes);
     }
 
     fn spec() -> SuperviseSpec {

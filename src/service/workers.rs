@@ -62,25 +62,82 @@ pub trait Remote {
         binary: &str,
         cluster: &ClusterId,
     ) -> Result<(ClusterId, WorkerId), String>;
+
+    /// The same probe, requiring exactly `required` instead of what this
+    /// build requires, and reporting the features that were agreed. A double
+    /// that does not model features answers as `bridge_hello` does.
+    fn bridge_hello_with(
+        &mut self,
+        target: &SshTarget,
+        binary: &str,
+        cluster: &ClusterId,
+        required: &[String],
+    ) -> Result<BridgeHello, String> {
+        let _ = required;
+        let (cluster, worker) = self.bridge_hello(target, binary, cluster)?;
+        Ok(BridgeHello {
+            cluster,
+            worker,
+            features: Vec::new(),
+        })
+    }
+}
+
+/// Who answered a probe `hello`, and the features agreed with them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BridgeHello {
+    pub cluster: ClusterId,
+    pub worker: WorkerId,
+    pub features: Vec<String>,
+}
+
+/// What `workers upgrade` learns about the coordinator resident before it
+/// changes anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResidentBuild {
+    /// No resident runs; the next one starts from this binary.
+    NotRunning,
+    Running {
+        binary_sha256: String,
+        features: Vec<String>,
+        required_features: Vec<String>,
+    },
+    /// A resident runs but did not say which build it is (one older than the
+    /// question, or one that failed to answer).
+    Unknown { reason: String },
 }
 
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// One `hello` over an already open transport.
+/// One `hello` over an already open transport. `required`: the features the
+/// worker must agree to; `None` requires what this build requires.
 async fn hello_on(
     io: crate::protocol::Io,
     cluster: &ClusterId,
-) -> Result<(ClusterId, WorkerId), String> {
-    let config = crate::protocol::ClientConfig::new(
+    required: Option<&[String]>,
+) -> Result<BridgeHello, String> {
+    let mut config = crate::protocol::ClientConfig::new(
         cluster.clone(),
         CoordinatorId::generate(),
         CoordinatorEpoch(1),
     );
-    let connected = tokio::time::timeout(HELLO_TIMEOUT, crate::protocol::connect(io, config))
-        .await
-        .map_err(|_| "the worker bridge did not answer hello in time".to_string())?
-        .map_err(|e| format!("the worker bridge refused hello: {e}"))?;
-    Ok((connected.worker.cluster_id, connected.worker.worker_id))
+    let connected = tokio::time::timeout(HELLO_TIMEOUT, async {
+        match required {
+            None => crate::protocol::connect(io, config).await,
+            Some(required) => {
+                config.required_features = required.to_vec();
+                crate::protocol::connect_requiring(io, config).await
+            }
+        }
+    })
+    .await
+    .map_err(|_| "the worker bridge did not answer hello in time".to_string())?
+    .map_err(|e| format!("the worker bridge refused hello: {e}"))?;
+    Ok(BridgeHello {
+        cluster: connected.worker.cluster_id,
+        worker: connected.worker.worker_id,
+        features: connected.negotiated.features,
+    })
 }
 
 /// `hello` through a child process. The child is this function's own `Child`:
@@ -88,12 +145,13 @@ async fn hello_on(
 async fn hello_through(
     argv: &[String],
     cluster: &ClusterId,
-) -> Result<(ClusterId, WorkerId), String> {
+    required: Option<&[String]>,
+) -> Result<BridgeHello, String> {
     let transport = crate::protocol::transport::spawn_child_piped_stderr(argv)
         .map_err(|_| "ssh could not be started".to_string())?;
     let mut child = transport.child;
     drop(child.stderr.take());
-    let answer = hello_on(transport.io, cluster).await;
+    let answer = hello_on(transport.io, cluster, required).await;
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     answer
@@ -172,14 +230,33 @@ impl Remote for SshRemote {
         binary: &str,
         cluster: &ClusterId,
     ) -> Result<(ClusterId, WorkerId), String> {
-        let command = RemoteCommand::worker_stdio(binary).map_err(|e| e.to_string())?;
-        let argv = ssh_argv(target, &command);
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| e.to_string())?
-            .block_on(hello_through(&argv, cluster))
+        ssh_hello(target, binary, cluster, None).map(|hello| (hello.cluster, hello.worker))
     }
+
+    fn bridge_hello_with(
+        &mut self,
+        target: &SshTarget,
+        binary: &str,
+        cluster: &ClusterId,
+        required: &[String],
+    ) -> Result<BridgeHello, String> {
+        ssh_hello(target, binary, cluster, Some(required))
+    }
+}
+
+fn ssh_hello(
+    target: &SshTarget,
+    binary: &str,
+    cluster: &ClusterId,
+    required: Option<&[String]>,
+) -> Result<BridgeHello, String> {
+    let command = RemoteCommand::worker_stdio(binary).map_err(|e| e.to_string())?;
+    let argv = ssh_argv(target, &command);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| e.to_string())?
+        .block_on(hello_through(&argv, cluster, required))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -357,6 +434,29 @@ fn registered(
             ssh: w.ssh,
             binary: w.binary,
         }))
+}
+
+/// One `[[workers]]` entry of the user configuration.
+pub struct Registered {
+    pub id: String,
+    pub ssh: String,
+    pub binary: Option<String>,
+}
+
+/// Every registered worker, in configuration order.
+pub fn registrations(env: &BTreeMap<String, String>) -> Result<Vec<Registered>, ApiError> {
+    let (path, text) = read_user_config(env)?;
+    let user = crate::config::parse::parse_user(&path.to_string_lossy(), &text)
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok(user
+        .workers
+        .into_iter()
+        .map(|w| Registered {
+            id: w.id,
+            ssh: w.ssh,
+            binary: w.binary,
+        })
+        .collect())
 }
 
 /// Append one `[[workers]]` table, atomically, keeping every other byte.
@@ -588,33 +688,17 @@ pub fn add(
     })
 }
 
-fn install_remote(
+/// Make sure the binary `exe` (whose SHA-256 is `digest`) is staged on a
+/// macOS host of this architecture. An already staged copy is not sent again.
+fn ensure_staged(
     remote: &mut impl Remote,
-    spec: &Spec,
-    exe: &Path,
-    name: &str,
     target: &SshTarget,
-) -> Result<Status, ApiError> {
+    exe: &Path,
+    digest: &str,
+) -> Result<(), ApiError> {
     let internal = |e: &dyn std::fmt::Display| ApiError::new(ErrorCode::Internal, e.to_string());
-    if remote.parent_os() != "macos" {
-        return Err(invalid(
-            "installing a worker is implemented for macOS parents and workers only",
-        ));
-    }
-    let cluster = spec
-        .expected_cluster
-        .clone()
-        .ok_or_else(|| invalid("the coordinator has no cluster identity; run init"))?;
-    let cluster_expected = cluster.clone();
-    let key = crate::secrets::key::load(&spec.cluster_key_path).map_err(|e| internal(&e))?;
-    let digest = worker_service::sha256_file(exe).map_err(|e| internal(&e))?;
     let probe = remote
-        .run(
-            target,
-            &probe_command(&digest),
-            &[],
-            Duration::from_secs(60),
-        )
+        .run(target, &probe_command(digest), &[], Duration::from_secs(60))
         .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
     if probe.code != Some(0) {
         return Err(ApiError::new(
@@ -641,7 +725,7 @@ fn install_remote(
         let out = remote
             .run(
                 target,
-                &stage_command(&digest),
+                &stage_command(digest),
                 &binary,
                 Duration::from_secs(600),
             )
@@ -653,6 +737,30 @@ fn install_remote(
             ));
         }
     }
+    Ok(())
+}
+
+fn install_remote(
+    remote: &mut impl Remote,
+    spec: &Spec,
+    exe: &Path,
+    name: &str,
+    target: &SshTarget,
+) -> Result<Status, ApiError> {
+    let internal = |e: &dyn std::fmt::Display| ApiError::new(ErrorCode::Internal, e.to_string());
+    if remote.parent_os() != "macos" {
+        return Err(invalid(
+            "installing a worker is implemented for macOS parents and workers only",
+        ));
+    }
+    let cluster = spec
+        .expected_cluster
+        .clone()
+        .ok_or_else(|| invalid("the coordinator has no cluster identity; run init"))?;
+    let cluster_expected = cluster.clone();
+    let key = crate::secrets::key::load(&spec.cluster_key_path).map_err(|e| internal(&e))?;
+    let digest = worker_service::sha256_file(exe).map_err(|e| internal(&e))?;
+    ensure_staged(remote, target, exe, &digest)?;
     let request = InstallRequest {
         schema: 1,
         cluster,
@@ -1209,6 +1317,56 @@ pub fn render_diff(diffs: &[WorkerDiff]) -> String {
     lines.join("\n")
 }
 
+/// Ask a running resident which build it is. Missing credentials or a socket
+/// nobody listens on mean no resident runs; a resident that is there and
+/// does not answer the question is said to be unknown, never absent.
+pub fn resident_build(spec: &Spec) -> ResidentBuild {
+    let Some(cluster) = spec.expected_cluster.clone() else {
+        return ResidentBuild::NotRunning;
+    };
+    let Ok(client) = super::resident::Client::load(&spec.state_dir, cluster) else {
+        return ResidentBuild::NotRunning;
+    };
+    let unknown = |reason: String| ResidentBuild::Unknown { reason };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(e) => return unknown(e.to_string()),
+    };
+    resident_answer(runtime.block_on(client.request(super::resident::Operation::Build)))
+}
+
+fn resident_answer(answer: anyhow::Result<super::resident::Reply>) -> ResidentBuild {
+    use std::io::ErrorKind::{ConnectionRefused, NotFound};
+    match answer {
+        Ok(super::resident::Reply::Build {
+            binary_sha256,
+            features,
+            required_features,
+        }) => ResidentBuild::Running {
+            binary_sha256,
+            features,
+            required_features,
+        },
+        Ok(super::resident::Reply::Error { message }) => ResidentBuild::Unknown { reason: message },
+        Ok(_) => ResidentBuild::Unknown {
+            reason: "it did not understand the question".into(),
+        },
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| matches!(e.kind(), ConnectionRefused | NotFound)) =>
+        {
+            ResidentBuild::NotRunning
+        }
+        Err(error) => ResidentBuild::Unknown {
+            reason: format!("it did not answer: {error}"),
+        },
+    }
+}
+
 fn emit(
     json: bool,
     result: Result<serde_json::Value, ApiError>,
@@ -1372,6 +1530,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
             let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
             return Some(emit(json, result.map(|(v, _)| v), || text));
         }
+        WorkersSub::Upgrade { name } => return Some(upgrade::command(name, json, &env, exe)),
         _ => return None,
     };
     let text = result
@@ -1386,6 +1545,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
 }
 
 pub mod warmup;
+pub mod upgrade;
 
 #[cfg(test)]
 mod tests;

@@ -24,6 +24,52 @@ enum Phase {
 struct Report {
     paths: u32,
     unknown: u32,
+    /// Leftover Vault publication temporaries the sweep kept (not failures).
+    tmp_retained: u32,
+}
+
+/// What the loop counted so far, and the lines it logs: counts only, never a
+/// path or a raw error (both can hold private paths or manifest bytes).
+#[derive(Default)]
+struct Tally {
+    /// Retention targets and pages held by validation or I/O.
+    failures: u64,
+    /// Leftover temporaries seen by the latest Vault page that had any. They
+    /// stay until someone removes them, so they are counted apart from
+    /// `failures` and logged once, not on every page.
+    leftovers: u32,
+    leftovers_logged: bool,
+}
+impl Tally {
+    fn page(&mut self, report: &Report) -> Vec<String> {
+        let mut lines = Vec::new();
+        if report.unknown > 0 {
+            self.failures = self.failures.saturating_add(u64::from(report.unknown));
+            lines.push(format!(
+                "input retention targets retained; failures={}",
+                self.failures
+            ));
+        }
+        if report.tmp_retained > 0 {
+            self.leftovers = report.tmp_retained;
+            if !self.leftovers_logged {
+                self.leftovers_logged = true;
+                lines.push(format!(
+                    "Vault publication temporaries left in place (not provably ours, or not removable); leftovers={}",
+                    self.leftovers
+                ));
+            }
+        }
+        lines
+    }
+    /// A page that failed for a reason other than a busy lock.
+    fn held(&mut self) -> String {
+        self.failures = self.failures.saturating_add(1);
+        format!(
+            "input retention page held (validation/I/O); failures={}",
+            self.failures
+        )
+    }
 }
 
 struct Sample {
@@ -81,6 +127,7 @@ impl Driver {
                 )?;
                 report.paths = page.paths;
                 report.unknown = page.unknown;
+                report.tmp_retained = page.tmp_retained;
             }
             Phase::Source => {
                 let page = captured.sources.retention_page(
@@ -112,7 +159,7 @@ pub(super) async fn run(
     let mut timer = tokio::time::interval(cadence);
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut driver = Driver::default();
-    let mut errors = 0u64;
+    let mut tally = Tally::default();
     loop {
         tokio::select! { _ = stop.changed() => return Ok(()), _ = timer.tick() => {} }
         if *stop.borrow() || coordinator.is_fenced() {
@@ -135,9 +182,8 @@ pub(super) async fn run(
         driver = next;
         if let Ok(report) = &result {
             debug_assert!(report.paths <= 32);
-            if report.unknown > 0 {
-                errors = errors.saturating_add(u64::from(report.unknown));
-                eprintln!("input retention targets retained; failures={errors}");
+            for line in tally.page(report) {
+                eprintln!("{line}");
             }
         }
         if let Err(error) = result {
@@ -150,8 +196,7 @@ pub(super) async fn run(
                 // GC is optional. Any uncertain identity/index/proof/I/O error
                 // retains data and retries on a later bounded tick. Never print
                 // raw errors that can contain private paths or manifest bytes.
-                errors = errors.saturating_add(1);
-                eprintln!("input retention page held (validation/I/O); failures={errors}");
+                eprintln!("{}", tally.held());
             }
         }
         tokio::task::yield_now().await;
@@ -165,7 +210,7 @@ pub(super) struct TestControl {
 }
 #[cfg(test)]
 impl TestControl {
-    fn cadence(&self) -> Duration {
+    pub(super) fn cadence(&self) -> Duration {
         let ms = self.cadence_ms.load(std::sync::atomic::Ordering::SeqCst);
         if ms == 0 {
             Duration::from_secs(60)
@@ -186,6 +231,9 @@ mod tests {
     use crate::state::{AttemptState, Outcome, Termination};
     use crate::storage::NewAttempt;
     use std::collections::BTreeMap;
+
+    // `run` is also the usual name of a run identifier in these tests.
+    use super::run as run_loop;
 
     struct Fixture {
         root: tempfile::TempDir,
@@ -265,6 +313,10 @@ mod tests {
             self.terminal_tasks(run, closed, 1);
         }
         fn terminal_tasks(&self, run: &RunId, closed: bool, count: usize) {
+            self.terminal_tasks_at(run, closed, count, 0);
+        }
+        /// Every recorded time of the run is `at` plus a few milliseconds.
+        fn terminal_tasks_at(&self, run: &RunId, closed: bool, count: usize, at: u64) {
             let db = self.owner.store();
             let source = self.captured.sources.source_of_run(run).unwrap().unwrap();
             let manifest = self.captured.sources.manifest(&source).unwrap().unwrap();
@@ -272,13 +324,13 @@ mod tests {
             let digest = Digest::parse(&manifest.manifest_digest)
                 .or_else(|_| Digest::parse(&format!("sha256:{}", manifest.manifest_digest)))
                 .unwrap();
-            db.put_source_ref(&id, &digest, 1).unwrap();
-            db.create_run(run, Some(&id), None, &serde_json::json!({}), 1)
+            db.put_source_ref(&id, &digest, at + 1).unwrap();
+            db.create_run(run, Some(&id), None, &serde_json::json!({}), at + 1)
                 .unwrap();
             for _ in 0..count {
                 let task = TaskId::generate();
                 let attempt = AttemptId::generate();
-                db.create_task(&task, run, &serde_json::json!({}), 1)
+                db.create_task(&task, run, &serde_json::json!({}), at + 1)
                     .unwrap();
                 db.create_attempt(
                     NewAttempt {
@@ -288,7 +340,7 @@ mod tests {
                         payload_hash: Digest::of_bytes(b"payload"),
                         permit_id: None,
                     },
-                    2,
+                    at + 2,
                 )
                 .unwrap();
                 for state in [
@@ -298,13 +350,13 @@ mod tests {
                     AttemptState::Active,
                     AttemptState::Finalizing,
                 ] {
-                    db.transition_attempt(&attempt, state, 3).unwrap();
+                    db.transition_attempt(&attempt, state, at + 3).unwrap();
                 }
                 db.finalize_attempt(
                     &attempt,
                     Termination::new(Outcome::Failed, Some(crate::state::Exit::Code(9)), None)
                         .unwrap(),
-                    4,
+                    at + 4,
                 )
                 .unwrap();
                 if closed {
@@ -313,7 +365,7 @@ mod tests {
                         None,
                         crate::results::plan::Verdict::GaveUp,
                         false,
-                        5,
+                        at + 5,
                     )
                     .unwrap();
                 }
@@ -350,6 +402,83 @@ mod tests {
         }
     }
 
+    #[test]
+    fn leftover_temporaries_are_counted_apart_from_failures_and_logged_once() {
+        let mut tally = Tally::default();
+        assert!(tally.page(&Report::default()).is_empty());
+        let leftover = Report {
+            tmp_retained: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            tally.page(&leftover),
+            ["Vault publication temporaries left in place (not provably ours, or not removable); leftovers=2"]
+        );
+        // The same leftovers on every later page add no line and no failure.
+        for _ in 0..3 {
+            assert!(tally.page(&leftover).is_empty());
+        }
+        assert_eq!((tally.failures, tally.leftovers), (0, 2));
+        let both = Report {
+            paths: 0,
+            unknown: 3,
+            tmp_retained: 1,
+        };
+        assert_eq!(
+            tally.page(&both),
+            ["input retention targets retained; failures=3"]
+        );
+        assert_eq!((tally.failures, tally.leftovers), (3, 1));
+        // A page without leftovers keeps the last count that had any.
+        assert!(tally.page(&Report::default()).is_empty());
+        assert_eq!(tally.leftovers, 1);
+        assert_eq!(
+            tally.held(),
+            "input retention page held (validation/I/O); failures=4"
+        );
+        tally.failures = u64::MAX;
+        tally.held();
+        tally.page(&both);
+        assert_eq!(tally.failures, u64::MAX);
+    }
+    #[test]
+    fn vault_page_reports_a_leftover_temporary_as_a_leftover_not_a_failure() {
+        let f = Fixture::new();
+        let run = f.bind(true);
+        // Named like a publication temporary, but a link: never ours to remove.
+        let leftover = f
+            .captured
+            .parent_state
+            .join("secrets")
+            .join(format!(".{run}.json.{}.tmp", ulid::Ulid::new()));
+        std::os::unix::fs::symlink(f.input.join(".env"), &leftover).unwrap();
+        let mut driver = Driver::default();
+        let mut seen = 0;
+        for i in 0..6 {
+            let report = driver
+                .page(
+                    f.owner.store(),
+                    &f.captured,
+                    7,
+                    Sample {
+                        wall: 100 + i,
+                        mono: 10 + i,
+                        boot: Some("fixture-boot".into()),
+                    },
+                )
+                .unwrap();
+            assert_eq!(report.unknown, 0);
+            assert!(report.tmp_retained <= 1);
+            seen += report.tmp_retained;
+        }
+        // Every Vault page of the six ticks saw it; none removed it.
+        assert!(seen >= 2, "{seen}");
+        assert!(std::fs::symlink_metadata(&leftover).is_ok());
+        assert_eq!(
+            std::fs::read(f.input.join(".env")).unwrap(),
+            b"TOKEN=private-fixture\n"
+        );
+    }
     #[test]
     fn default_source_seven_days_and_vault_zero_have_independent_clocks_and_exact_scope() {
         let f = Fixture::new();
@@ -465,6 +594,98 @@ mod tests {
             std::fs::read(f.input.join(".env")).unwrap(),
             b"TOKEN=private-fixture\n"
         );
+    }
+    #[test]
+    fn wall_jump_unknown_boot_and_reboot_never_shorten_automatic_source_retention() {
+        const WEEK: u64 = 7 * 24 * 60 * 60 * 1000;
+        let f = Fixture::new();
+        let run = f.bind(false);
+        // The run ends just after the first quarantine is over.
+        f.terminal_tasks_at(&run, true, 1, 1_000 + WEEK);
+        let manifest = f.manifest_path(&run);
+        let mut driver = Driver::default();
+        // Twelve consecutive pages reach every phase several times.
+        let mut pages = |wall: u64, mono: u64, boot: Option<&str>| {
+            for i in 0..12 {
+                let report = driver
+                    .page(
+                        f.owner.store(),
+                        &f.captured,
+                        7,
+                        Sample {
+                            wall: wall + i,
+                            mono: mono + i,
+                            boot: boot.map(str::to_owned),
+                        },
+                    )
+                    .unwrap();
+                assert!(report.paths <= 32);
+            }
+        };
+        pages(1_000, 10, Some("first-boot"));
+        pages(1_000 + WEEK + 100, 10 + WEEK + 100, Some("first-boot"));
+        assert!(
+            manifest.exists(),
+            "retention did not start at the run's end"
+        );
+        // The quarantine is over; the wall clock alone moves past the retention.
+        pages(1_000 + 3 * WEEK, 10 + WEEK + 200, Some("first-boot"));
+        assert!(manifest.exists(), "a wall jump authorized deletion");
+        // No boot identity: the monotonic clock proves nothing.
+        pages(1_000 + 5 * WEEK, 10 + 3 * WEEK, None);
+        assert!(manifest.exists(), "an unknown boot authorized deletion");
+        // A reboot starts the quarantine again, whatever the wall clock says.
+        pages(1_000 + 6 * WEEK, 50, Some("second-boot"));
+        pages(
+            1_000 + 7 * WEEK - 1_000,
+            50 + WEEK - 1_000,
+            Some("second-boot"),
+        );
+        assert!(manifest.exists(), "a reboot shortened the quarantine");
+        pages(
+            1_000 + 7 * WEEK + 1_000,
+            50 + WEEK + 1_000,
+            Some("second-boot"),
+        );
+        assert!(
+            !manifest.exists(),
+            "a consistent clock never resumed deletion"
+        );
+        assert_eq!(std::fs::read(f.input.join("file")).unwrap(), b"original");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_loop_recovers_a_crashed_vault_publication_while_deletion_is_held() {
+        let f = Fixture::new();
+        let run = f.bind(true);
+        f.terminal(&run, true);
+        // Unknown legacy input holds every new claim of both stores.
+        let unknown = f.captured.sources.root().join("manifests/unknown-entry");
+        std::fs::write(&unknown, b"unknown").unwrap();
+        // The parent died between linking the bundle and unlinking its
+        // temporary name: the bundle has two names and no reader accepts it.
+        let secrets = f.captured.parent_state.join("secrets");
+        let bundle = secrets.join(format!("{run}.json"));
+        let orphan = secrets.join(format!(".{run}.json.{}.tmp", ulid::Ulid::new()));
+        std::fs::hard_link(&bundle, &orphan).unwrap();
+        assert!(!f.captured.vault.has(&run));
+        f.captured.retention_test.fast();
+        let (stop, rx) = watch::channel(false);
+        let task = tokio::spawn(run_loop(f.owner.clone(), f.captured.clone(), 7, rx));
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            while orphan.exists() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        recovered.unwrap();
+        // Readable again, and still retained: the hold stays in force.
+        assert!(f.captured.vault.has(&run));
+        assert!(bundle.exists());
+        assert!(f.manifest_path(&run).exists());
+        assert_eq!(std::fs::read(unknown).unwrap(), b"unknown");
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn automatic_unknown_legacy_is_retained_without_stopping_runtime() {

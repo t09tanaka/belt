@@ -1048,6 +1048,15 @@ impl Agent {
         let mut spec: SuperviseSpec = serde_json::from_str(&text).map_err(|e| e.to_string())?;
         spec.deadline_ms = deadline_left_ms;
         spec.lease_seed = Some(seed);
+        // Stored when the attempt was prepared, maybe under another scope.
+        spec.rescope(
+            &self.cfg.traffic_state_dir,
+            self.cfg.traffic_config.as_deref(),
+            self.cfg
+                .capability_profile
+                .as_ref()
+                .map(|profile| profile.scope_environment()),
+        );
         let bytes = serde_json::to_vec(&spec).map_err(|e| e.to_string())?;
         write_atomic(&path, &bytes).map_err(|e| e.to_string())
     }
@@ -1334,13 +1343,9 @@ impl Agent {
                 ws.root.join(rel)
             };
             let env = match &self.cfg.capability_profile {
-                Some(profile) => {
-                    profile.execution_environment(&c.env).map_err(invalid)?;
-                    match binding {
-                        Some(binding) => binding.environment(&c.env).map_err(invalid)?,
-                        None => profile.execution_environment(&c.env).map_err(invalid)?,
-                    }
-                }
+                Some(profile) => profile
+                    .command_environment(binding, &c.env)
+                    .map_err(invalid)?,
                 None => c.env.clone(),
             };
             nodes.push(NodeSpec {

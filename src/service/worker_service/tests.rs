@@ -572,3 +572,211 @@ fn idle_must_hold_across_one_more_look() {
     .unwrap();
     assert_eq!(calls, 2);
 }
+
+fn with(env: &BTreeMap<String, String>, key: &str, value: &str) -> BTreeMap<String, String> {
+    let mut env = env.clone();
+    env.insert(key.into(), value.into());
+    env
+}
+
+#[test]
+fn status_reports_the_scope_the_installed_worker_resolves() {
+    let h = Host::new();
+    let home = PathBuf::from(&h.env["HOME"]);
+    let state_home = h.root.join("xdg-state");
+    let env = with(&h.env, "XDG_STATE_HOME", state_home.to_str().unwrap());
+    install(
+        &env,
+        &h.request,
+        &h.exe,
+        h.fake.clone(),
+        Duration::from_secs(2),
+    )
+    .unwrap();
+    // From the recorded environment, whatever shell asks: a doctor compares
+    // this with what its own shell resolves.
+    let scope = status(&h.env, h.fake.clone())
+        .unwrap()
+        .traffic_scope
+        .unwrap();
+    assert_eq!(
+        scope,
+        TrafficScope {
+            state_dir: state_home.join("task-traffic-controller"),
+            config_file: home.join(".config/task-traffic-controller/config.toml"),
+        }
+    );
+    let json = serde_json::to_value(status(&h.env, h.fake.clone()).unwrap()).unwrap();
+    assert_eq!(
+        json["traffic_scope"]["state_dir"],
+        serde_json::json!(state_home.join("task-traffic-controller"))
+    );
+    assert!(json.get("traffic_hold").is_none());
+    // An answer of a helper that does not know the fields still reads.
+    let mut old = json.clone();
+    old.as_object_mut().unwrap().remove("traffic_scope");
+    let old: Status = serde_json::from_value(old).unwrap();
+    assert_eq!(old.traffic_scope, None);
+    assert_eq!(old.traffic_hold, None);
+}
+
+/// Only `install` decides the scope. A caller whose own shell has a relative
+/// XDG_STATE_HOME can still stop, drain, resume and look at the worker.
+#[test]
+fn only_install_checks_the_scope_of_the_calling_shell() {
+    let h = Host::new();
+    let relative = with(&h.env, "XDG_STATE_HOME", "relative/state");
+    let refused = install(
+        &relative,
+        &h.request,
+        &h.exe,
+        h.fake.clone(),
+        Duration::from_secs(2),
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(refused.contains("XDG_STATE_HOME must be"), "{refused}");
+    assert!(read_journal(&h.paths()).unwrap().is_none());
+
+    h.install().unwrap();
+    h.bind();
+    let seen = status(&relative, h.fake.clone()).unwrap();
+    assert_eq!(seen.loaded, Some(true));
+    // The scope of the worker, not of the caller.
+    assert_eq!(
+        seen.traffic_scope.unwrap().state_dir,
+        PathBuf::from(&h.env["HOME"]).join(".local/state/task-traffic-controller")
+    );
+    assert!(drain(&relative, h.fake.clone()).unwrap().draining);
+    assert!(!resume(&relative, h.fake.clone()).unwrap().draining);
+    let stopped = stop(&relative, h.fake.clone(), false, Duration::ZERO).unwrap();
+    assert_eq!(stopped.loaded, Some(false));
+    assert_eq!(
+        start(&relative, h.fake.clone(), Duration::from_secs(2))
+            .unwrap()
+            .loaded,
+        Some(true)
+    );
+    // The same binary installed again from that shell is still refused.
+    assert!(install(
+        &relative,
+        &h.request,
+        &h.exe,
+        h.fake.clone(),
+        Duration::from_secs(2),
+    )
+    .is_err());
+}
+
+#[test]
+fn a_stopped_idle_worker_takes_the_scope_of_a_new_install_and_nothing_else() {
+    let h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    let state_home = h.root.join("moved-state");
+    let mut moved = with(&h.env, "XDG_STATE_HOME", state_home.to_str().unwrap());
+    moved.insert("PATH".into(), "/usr/bin:/bin:/opt/other".into());
+    let reinstall = |env: &BTreeMap<String, String>| {
+        install(
+            env,
+            &h.request,
+            &h.exe,
+            h.fake.clone(),
+            Duration::from_secs(2),
+        )
+        .unwrap()
+    };
+    let recorded = || read_journal(&h.paths()).unwrap().unwrap().env;
+    let input = || -> super::super::worker::WorkerSpec {
+        serde_json::from_slice(&fs::read(h.paths().input).unwrap()).unwrap()
+    };
+    let home_scope = PathBuf::from(&h.env["HOME"]).join(".local/state/task-traffic-controller");
+
+    // Running: it keeps what it started with, and status says so.
+    let running = reinstall(&moved);
+    assert_eq!(running.traffic_scope.unwrap().state_dir, home_scope);
+    assert_eq!(recorded(), h.env);
+    assert_eq!(input().env, h.env);
+
+    // Stopped and idle: the scope follows the caller; PATH does not, and
+    // the service file is the one that was registered.
+    stop(&h.env, h.fake.clone(), false, Duration::ZERO).unwrap();
+    let after = reinstall(&moved);
+    assert_eq!(
+        after.traffic_scope.unwrap().state_dir,
+        state_home.join("task-traffic-controller")
+    );
+    assert_eq!(after.loaded, Some(true));
+    let expected = with(&h.env, "XDG_STATE_HOME", state_home.to_str().unwrap());
+    assert_eq!(recorded(), expected);
+    // What the worker reads at its start says the same.
+    assert_eq!(input().env, expected);
+    assert_eq!(h.launchctl_calls(), ["bootstrap", "bootout", "bootstrap"]);
+
+    // And back, when the caller has none any more.
+    stop(&h.env, h.fake.clone(), false, Duration::ZERO).unwrap();
+    let back = reinstall(&h.env);
+    assert_eq!(back.traffic_scope.unwrap().state_dir, home_scope);
+    assert_eq!(recorded(), h.env);
+    assert_eq!(input().env, h.env);
+}
+
+#[test]
+fn the_scope_refresh_touches_only_the_two_scope_variables_of_an_idle_worker() {
+    let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let recorded = env(&[("HOME", "/h"), ("PATH", "/bin"), ("XDG_STATE_HOME", "/old")]);
+    let caller = env(&[
+        ("HOME", "/other"),
+        ("PATH", "/other/bin"),
+        ("LANG", "C"),
+        ("XDG_CONFIG_HOME", "/c"),
+    ]);
+    // An unfinished attempt (or a running worker) keeps the recorded scope.
+    assert_eq!(scope_refreshed(&recorded, &caller, false), recorded);
+    assert_eq!(
+        scope_refreshed(&recorded, &caller, true),
+        env(&[("HOME", "/h"), ("PATH", "/bin"), ("XDG_CONFIG_HOME", "/c")])
+    );
+    let caller = env(&[("XDG_STATE_HOME", "/new")]);
+    assert_eq!(
+        scope_refreshed(&recorded, &caller, true),
+        env(&[("HOME", "/h"), ("PATH", "/bin"), ("XDG_STATE_HOME", "/new")])
+    );
+}
+
+#[test]
+fn status_says_when_the_worker_waits_for_its_previous_scope() {
+    use crate::config::traffic::{record_hold, Hold, HOLD_STALE_MS};
+    let h = Host::new();
+    h.install().unwrap();
+    let state = h.paths().state;
+    assert_eq!(status_of(&h).traffic_hold, None);
+    let now = crate::platform::wall_ms();
+    record_hold(&state, &Hold::Draining("old commands".into()), now).unwrap();
+    let held = status_of(&h).traffic_hold.unwrap();
+    assert_eq!(held.reason, "waiting_for_previous_scope");
+    assert_eq!(held.message, "old commands");
+    record_hold(&state, &Hold::Unreadable("broken".into()), now).unwrap();
+    assert_eq!(
+        status_of(&h).traffic_hold.unwrap().reason,
+        "previous_scope_unreadable"
+    );
+    // A record nobody renewed is from a worker that is gone.
+    record_hold(
+        &state,
+        &Hold::Draining("left behind".into()),
+        now - HOLD_STALE_MS - 60_000,
+    )
+    .unwrap();
+    assert_eq!(status_of(&h).traffic_hold, None);
+    // So is the record of a service that is not loaded.
+    record_hold(&state, &Hold::Draining("old commands".into()), now).unwrap();
+    h.bind();
+    let stopped = stop(&h.env, h.fake.clone(), false, Duration::ZERO).unwrap();
+    assert_eq!(stopped.traffic_hold, None);
+}

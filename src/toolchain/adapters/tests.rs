@@ -1685,3 +1685,87 @@ fn preparation_probe_activation_cannot_mix_verification_queries() {
         Err("probe_verification_query_mismatch")
     );
 }
+/// An adapter cannot move the worker's task-traffic-controller scope for the
+/// commands that run under its activation.
+#[test]
+fn an_activation_never_replaces_the_xdg_scope_of_the_worker() {
+    let mut f = fixture(AdapterKind::Corepack, "pnpm");
+    for var in ["XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
+        f.plan.activation_env.insert(var.into(), "/adapter".into());
+    }
+    let mut fake = Fake::for_plan(&f.plan);
+    let receipt = install_admitted(&f.plan, &mut fake).unwrap();
+    let mut base = base_env(&f.plan);
+    base.insert("XDG_STATE_HOME".into(), "/private/worker-state".into());
+    let activation = activate(
+        &f.plan,
+        &receipt,
+        Digest::of_bytes(b"base"),
+        &base,
+        Digest::of_bytes(b"setup"),
+        &f.shell,
+    )
+    .unwrap();
+    assert_eq!(
+        activation.environment["XDG_STATE_HOME"],
+        base["XDG_STATE_HOME"]
+    );
+    assert_eq!(
+        activation.environment["XDG_CONFIG_HOME"],
+        base["XDG_CONFIG_HOME"]
+    );
+    assert!(!activation.environment.contains_key("XDG_DATA_HOME"));
+}
+/// The comparison a launch and a recovery make (`current != binding.activation`,
+/// "accepted execution binding changed"), across the change that made a
+/// worker carry `XDG_STATE_HOME` and hand both scope variables to every
+/// command: the activation is made from the worker's toolchain environment
+/// and its fingerprint, neither of which holds a scope variable, so a binding
+/// accepted before is the one computed after. The command still gets the
+/// worker's present scope.
+#[test]
+fn an_accepted_binding_stays_valid_when_the_worker_gains_scope_variables() {
+    use crate::toolchain::contract::ExecutionBinding;
+    use crate::toolchain::profile::Profile;
+    let f = fixture(AdapterKind::Corepack, "pnpm");
+    let mut fake = Fake::for_plan(&f.plan);
+    let receipt = install_admitted(&f.plan, &mut fake).unwrap();
+    let state = crate::test_tmp::tempdir().unwrap();
+    let mut before = base_env(&f.plan);
+    before.remove("XDG_CONFIG_HOME");
+    let mut after = before.clone();
+    after.insert("XDG_STATE_HOME".into(), "/private/worker-state".into());
+    after.insert("XDG_CONFIG_HOME".into(), "/private/worker-config".into());
+    let activation_of = |worker: &BTreeMap<String, String>| {
+        let profile = Profile::load(state.path(), worker).unwrap();
+        let activation = activate(
+            &f.plan,
+            &receipt,
+            profile.startup_report().profile_fingerprint,
+            profile.environment(),
+            Digest::of_bytes(b"setup"),
+            &f.shell,
+        )
+        .unwrap();
+        (profile, activation)
+    };
+    let (_, accepted) = activation_of(&before);
+    let (profile, current) = activation_of(&after);
+    assert_eq!(current, accepted);
+    assert!(!accepted.environment.contains_key("XDG_STATE_HOME"));
+    assert!(!accepted.environment.contains_key("XDG_CONFIG_HOME"));
+    // What a command of the accepted binding is started with now.
+    let binding = ExecutionBinding {
+        activation: accepted,
+    };
+    let env = profile
+        .command_environment(Some(&binding), &BTreeMap::new())
+        .unwrap();
+    assert_eq!(env["XDG_STATE_HOME"], "/private/worker-state");
+    assert_eq!(env["XDG_CONFIG_HOME"], "/private/worker-config");
+    assert_eq!(env["PATH"], binding.activation.environment["PATH"]);
+    // An ordinary variable is part of the binding as before.
+    let mut other = before.clone();
+    other.insert("ORDINARY".into(), "x".into());
+    assert_ne!(activation_of(&other).1, binding.activation);
+}

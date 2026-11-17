@@ -11,6 +11,7 @@ mod bridge;
 mod collection;
 mod config;
 mod coordinator;
+mod doctor;
 mod forecast;
 mod not_implemented;
 mod protocol;
@@ -40,3 +41,4 @@ mod remote_links;
 mod test_tmp_root;
 
 mod workers_lifecycle;
+mod workers_upgrade;

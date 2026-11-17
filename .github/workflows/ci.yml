@@ -46,6 +46,15 @@ jobs:
             cargo install fast-worktree --locked --version 0.4.0 --force
           fi
           fast-worktree --version
+      - name: install task-traffic-controller
+        # The nested-scope test runs the real CLI from a step. The library is
+        # pinned to 0.10.x and the CLI must write the ledger it reads, so
+        # check the version, not just the presence.
+        run: |
+          if ! task-traffic-controller --version 2>/dev/null | grep -qx 'task-traffic-controller 0\.10\.1'; then
+            cargo install task-traffic-controller --locked --version 0.10.1 --force
+          fi
+          task-traffic-controller --version
       - uses: taiki-e/install-action@v2
         with:
           tool: nextest@0.9.151
@@ -53,6 +62,8 @@ jobs:
         env:
           # the workspace tests run the real tool; its absence is a failure
           RTR_REQUIRE_FAST_WORKTREE: "1"
+          # the same for the task-traffic-controller CLI a step calls
+          RTR_REQUIRE_TTC_CLI: "1"
         # every failing test is listed in one run; a failure still fails the job
         run: cargo nextest run --workspace --all-targets --no-fail-fast
 

@@ -3,9 +3,7 @@ use assert_cmd::Command;
 const CASES: &[&[&str]] = &[
     &["ci"],
     &["ci", "--snapshot", "commit", "--ref", "HEAD"],
-    &["doctor"],
     &["workers"],
-    &["workers", "upgrade", "w"],
     &["workers", "forget", "w"],
     &["worker", "--ephemeral"],
 ];
@@ -32,7 +30,7 @@ fn every_command_reports_not_implemented_as_json() {
 fn without_json_stdout_is_empty_and_error_goes_to_stderr() {
     let out = Command::cargo_bin("remote-task-runner")
         .unwrap()
-        .arg("doctor")
+        .args(["workers", "forget", "w"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(70));

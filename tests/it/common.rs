@@ -15,17 +15,39 @@ use std::path::Path;
 /// Inner fixture commands already run inside the harness's shared TTC lease.
 /// Keep their private admission ledger, without depending on unrelated host load.
 pub fn fixture_traffic_config(state: &Path) {
-    let traffic = state.join("traffic");
-    std::fs::create_dir_all(&traffic).unwrap();
-    std::fs::set_permissions(&traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
+    fixture_traffic_config_file(&state.join("traffic/config.toml"), 2);
+}
+
+/// The same for a worker started from `env`, which reads the configuration
+/// of the task-traffic-controller CLI of that environment.
+pub fn fixture_worker_traffic_config(env: &std::collections::BTreeMap<String, String>) {
+    fixture_worker_traffic_budget(env, 2);
+}
+
+/// The same with another budget than the usual 2.
+pub fn fixture_worker_traffic_budget(
+    env: &std::collections::BTreeMap<String, String>,
+    budget: u32,
+) {
+    fixture_traffic_config_file(
+        &remote_task_runner::config::traffic::resolve(env)
+            .unwrap()
+            .config_file,
+        budget,
+    );
+}
+
+fn fixture_traffic_config_file(path: &Path, budget: u32) {
+    let traffic = path.parent().unwrap();
+    std::fs::create_dir_all(traffic).unwrap();
+    std::fs::set_permissions(traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = task_traffic_controller::config::Config {
-        budget: 2,
+        budget,
         cpu_threshold_percent: 100.0,
         memory_reserve_mib: 0,
         ..Default::default()
     };
-    let path = traffic.join("config.toml");
-    std::fs::write(&path, toml::to_string(&config).unwrap()).unwrap();
+    std::fs::write(path, toml::to_string(&config).unwrap()).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
@@ -317,4 +339,14 @@ pub fn write_executable(path: &Path, text: &str) {
         .write_all(text.as_bytes())
         .unwrap();
     assert!(child.wait().unwrap().success(), "writing {path:?}");
+}
+
+/// `LLVM_PROFILE_FILE` when this test run is measured for coverage. A child
+/// started with an emptied environment does not inherit it and would write
+/// `default_*.profraw` into its working directory, unmeasured; pass this on
+/// to such a child. Only tests use it: production keeps its environment.
+pub fn profile_env() -> Option<(String, String)> {
+    std::env::var("LLVM_PROFILE_FILE")
+        .ok()
+        .map(|v| ("LLVM_PROFILE_FILE".to_string(), v))
 }

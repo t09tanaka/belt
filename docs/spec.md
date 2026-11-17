@@ -239,7 +239,7 @@ profile は絶対 `path` 配列、絶対 `shell`（bash/sh/zsh）、`env` の非
 
 tool は profile PATH で実行可能な実体を解決し、固定 argv・env_clear・private probe cwd・各 300ms・stdout/stderr 各 8KiB の上限で版を検査する。所有する子 process group だけを終了し reap する。resident の起動時（profile 読み込み時の required tool の検査と、baseline を公開する最初の report）だけは、各 tool の結果が確定（available / unavailable / 失敗による unknown）するまで測る。1 回の呼び出しは 2 秒まで待ち、時間切れになった呼び出しだけを tool ごとに最大 3 回、全 tool で共有する 5 秒の範囲で繰り返す。共有時間を使い切った後も各呼び出しは 300ms は待つので、待ちの上限は読み込み・起動 report それぞれ 5 秒 + 固定 14 呼び出し × 300ms = 9.2 秒である。失敗や解析不能は確定した結果であり繰り返さない。それでも時間切れの tool は unknown のまま公開し、baseline の公開後に観測できた場合は profile の drift として扱う（再起動まで worker を block する）。Docker は `info`、Xcode は選択済み SDK path の確認も必要で、binary の存在だけでは available としない。public report へは検証済み版と identity digest を出し、環境の値や private path は出さない。未観測の disk/budget は unknown とし、available/0 を捏造しない。Flutter launcher と Dart の bootstrap wrapper は版の問い合わせでも SDK 導入が発生し得るため、S20 の noninstalling adapter が接続されるまでは Unknown として扱う。native Dart binary は通常の固定 probe を使う。
 
-`worker_capabilities_v1` を hello で交渉し、hello/inspect に optional report を含める。制約がある task は有効な report がない旧 peer へ配置しない。制約は TaskSpec と AttemptPayload に保存し、plan/payload digest に含め、retry は元の条件を保つ。空の条件は JSON から省き、旧 payload の canonical JSON/hash を保つ。durable requirements を知らない旧 binary の再開を防ぐため、coordinator/worker DB の schema version に semantic compatibility fence を設ける。readonly 旧 schema は migrate せず、配置診断用 index が無ければ placement を返さない。constrained submit は private resident IPC v3 を要求し、requirements を知らない旧 owner に条件を落とされないよう受理前に拒否させる。制約なし IPC は v2 のまま保つ。Coordinator は forecast 前に同じ pure predicate で候補を絞り、除外された worker ごとの不足と `no_compatible_worker` を配置記録へ残す。公開 Task metadata に最新の placement を含め、最大 4 worker × 各 4 不足（各 128 文字）へ明示 truncate する。受理済み/取消済み task へ古い待機理由は表示しない。worker も新規受理時と workspace 準備直前、長い setup 後に再検査する。受理済みの同じ attempt/hash の replay は元の応答を保つ。
+`worker_capabilities_v1` を hello で交渉し、hello/inspect に optional report を含める。制約がある task は有効な report がない旧 peer へ配置しない。制約は TaskSpec と AttemptPayload に保存し、plan/payload digest に含め、retry は元の条件を保つ。空の条件は JSON から省き、旧 payload の canonical JSON/hash を保つ。durable requirements を知らない旧 binary の再開を防ぐため、coordinator/worker DB の schema version に semantic compatibility fence を設ける。readonly 旧 schema は migrate せず、配置診断用 index が無ければ placement を返さない。性能だけのための index（placement の未 ACK、attempt の生存）は feature marker を持たない。version の増加で旧 binary が拒否され、readonly の旧 schema は index が無いだけで同じ結果を返す。constrained submit は private resident IPC v3 を要求し、requirements を知らない旧 owner に条件を落とされないよう受理前に拒否させる。制約なし IPC は v2 のまま保つ。Coordinator は forecast 前に同じ pure predicate で候補を絞り、除外された worker ごとの不足と `no_compatible_worker` を配置記録へ残す。公開 Task metadata に最新の placement を含め、最大 4 worker × 各 4 不足（各 128 文字）へ明示 truncate する。受理済み/取消済み task へ古い待機理由は表示しない。worker も新規受理時と workspace 準備直前、長い setup 後に再検査する。受理済みの同じ attempt/hash の replay は元の応答を保つ。
 
 実測 profile fingerprint は worker-local identity であり、別 host に同じ絶対 path/digest を要求しない。profile 名と実 requirements で照合する。受理時 fingerprint は worker の private durable metadata、setup/template、artifact、TTC history に固定する。tool/report drift は新規 report を無効にし、古い template や異なる実環境で実行を続けない。 startup report で Available だった tool の一時的な Unknown は、shell・PATH 上の実行ファイル identity が不変なら startup fingerprint を保持する。ただし現在の report は Unknown のままで、requires・profile の required_tools・固定 native baseline を満たさない。既知の版/identity の変化、実行ファイルの変化、startup Unknown から Available への変化は新 identity として扱い、同じ owner の既存 fingerprint では受理しない。再起動後も旧 attempt の実 identity を書き換えない。版管理 shim が project の版ファイルを読む場合の具体版 activation と baseline は §22.1 の必須残件であり、この generic probe だけで version matching の完了とはしない。
 
@@ -556,6 +556,7 @@ workerは受け取る量に上限を持ち、超える要求は一部だけ処�
 - workspaceの準備は同時に4個まで（`max_concurrent_prepares`）。1つの準備は15分（fast-worktreeの既定timeoutと同じ）を超えたらattemptをfailedにする。
 - `list_attempts`: `states` の絞り込みはDB側で行う。該当が500件を超えるときは先頭だけを返さず `INVALID_INPUT` とし、呼び出し側が `states` を絞る。
 - `blob_put`（sourceの受け取り）: sourceは、manifest（そのsource自身のものが最初、続いてそれが名指しするsubmodule captureのもの）、content（manifestが名指しするファイル）、Git bundle（Git sourceに1つ）の3種類のblobで届く。必要なものが全部そろうまで、workerのobject storeにもcloneにも何も入れない。そろったあとも、sourceを断り得る検査（storeに既にあるファイルのサイズ、submodule captureの有無、bundleが展開できてmanifestの名指すcommitを運ぶこと）を全部先に済ませ、bundleはcloneの隣の作業用repository（cloneのrefを持ち、objectsは借りるだけ）で試す。断ったsource・途中で捨てたsourceは、storeにもcloneにも何も残さない。上限は次のとおりで、どれも書き込む前に、相手が申告したサイズで判定する。
+  - 1つのmanifestは、workerの `max_manifest_bytes`（既定64 MiB）まで。送る側も同じ既定値（`BlobLimits::default()`）を守り、超えるmanifestはsourceの何も送る前に断る。
   - 1つのsourceが使う量は、manifestの申告サイズ、bundleの申告サイズ、manifestが名指しするファイルのサイズ（同じhashは1回）の合計で、32 GiBまで。超えるものは `INVALID_INPUT`。
   - 受け取り途中のsource全体では64 GiBまで。ディスクは、受け取り途中の全source（要求したsource自身を含む）が予約してまだ書いていない分と、今回増える分を引いたあとの空きが1 GiB以上。1つのsourceがディスクに予約する量は、置く分（上の合計）に、公開のときに一時的に重なる分（manifestをもう1回、bundleをもう1回、最大のファイルを2回）を足したもの。空きは、受け取り用ディレクトリ・store・clonesの3か所のうち最小の値を使う。超える要求は `OVERLOADED`（後で送り直せる）。受け取り途中のsourceは16個まで。この数と量の判定は、全source共通の1つのlockの下で行う。
   - 1つのsourceが持つbundleは1つ（別のbundleを送り始めたら前のものを捨てる）。そのsource自身のmanifestが置かれる前は、途中のmanifestも1つ。
@@ -987,6 +988,10 @@ runの結果にはsource digestと元HEADを併記する。入力が一致する
 
 protocol／storage migrationは互換表を持ち、未知versionをその場で書き換えない。更新前にjob状態を保護し、稼働中attemptを旧versionのまま追跡できる。親DBのcopyを別Macで同時起動してactive-activeにする操作はサポートしない。
 
+版の間の互換はN／N+1とする。新しいfeatureは、まず「提供するが要求しない」版をすべてのpeer（親のresidentとworker）へ配り、要求（required）へ変えるのはその次の版からにする。`workers upgrade` は、動いているresidentが親のbinaryと同じbuildのときだけ進め、healthの `hello` はresidentが要求するfeatureで行う。rollbackで戻した版は、その版がupgrade前に合意していたfeatureだけで検査する。
+
+workerの `upgrade` をrollbackできるのは、親が新しい版のhealthを確かめてcommitするまでである。その間workerはdrainのままで、切替前に退避したworker DBをrollbackで戻す。したがって試用中の版が書いた記録（ackやGCの進み）はrollbackで切替前へ巻き戻る。commitの後は戻せない。
+
 # 19. 受入条件
 
 以下をすべて通した時点を初回実用版の完成とする。単体テストだけでなく、実際の2台以上のMac、既存ツールとの共存、障害注入を含める。
@@ -1137,6 +1142,7 @@ workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、co
 
 - **capture**: source captureと同じ検証手順（再検証と最大3回の再試行）で内容を読み、通常のobject storeとは別の `SecretBundle` にする。manifestにはpath一覧と、clusterごとの鍵によるHMAC digestだけを記録し、平文のhashは記録しない。一致するファイルが無い `secret_files` のglobは警告し、`required = true` を付けたものが無ければcaptureを失敗させる（`.worktreeinclude` の一致が0件でも失敗にはしない）。
 - **親での保持**: 親のstate directory内に0600で保存し、runがterminalかつ必須回収が終わった時点で削除する。retryは同じbundleを使い、現在のファイルを読み直さない（snapshotの不変性を保つ）。
+- **公開途中の停止からの回復**: 親はbundleを一時ファイル（`.<公開名>.<ulid>.tmp`、0600）に書き、同じdirectory内のlinkで公開してから一時名を消す。この途中で親が止まると、平文の一時ファイルが残る。link後に止まった場合は公開済みbundleの名前が2つになり、読み取りは安全でないものとして拒否し、次のVaultの保持ページで回復する。親の常駐loopは、Vaultの排他lockを取った保持ページの先頭で、この一時ファイルを1ページ最大32件消す。一時ファイルを書く処理は必ずVaultのlockを持つため、排他lockを取れた時点で残っているものは書き手のいない残骸であり、経過時間や時計は条件にしない（時計のHoldや未登録の旧入力による保留より前に行う）。消すのは、名前が厳密に一致し、symlinkを辿らずに見て自分が所有する0600の通常ファイルで、名前が1つ、または2つでもう一方がその一時ファイルの公開先であるものだけとする。それ以外は残して数え、一時ファイルをbundleへ昇格させない。1件を調べられない・消せない場合も、その1件を残して数え、同じページの残りと保持の処理を続ける（ページを失敗にするのは、Vaultのrootが開いた時のものでなくなった場合と、directoryの列挙・fsyncの失敗だけ）。残した一時ファイルの数は保持の失敗とは別に数え、常駐のログには最初の1回だけ出す。親の分類を記録するファイル（`parent-retention.json`）は、初回の登録の公開途中で親が止まると名前2つのまま残る。分類の正本はVaultのlockファイルに書いたpinで、これはファイルの公開より前に書いてfsyncしてある。そのため、pinがあり、もう一方の名前が同じdirectoryの自分の一時名（`.parent-retention.json.<ulid>.tmp`）で、symlinkを辿らずに見て同じinodeである場合に限り、このファイルは名前2つのまま読む（内容がpinと一致することは従来どおり確かめる）。Vaultを開く処理は読むだけで何も消さず、一時名は次のVaultの保持ページが上の規則で消す。pinが無い、もう一方がこの形の名前でない、名前が3つ以上、0600でない、のいずれかなら従来どおり拒否し、Vaultを開くエラーにその理由を含める。run bundleは名前2つのままでは読まない。
 - **転送**: 認証済みSSH接続上のprotocol操作で、attemptごとに送る。workerは受け取った内容をHMAC digestで検証する。
 - **workerでの配置**: attempt workspaceの該当pathに0600で配置する。workerのobject store、prepared template、cache、log spool、artifact、outputsに保存しない。template keyやcache keyにはHMAC digestを含め、内容の違うbundle間でcacheを共有しない（第8章）。
 - **消去**: attemptがterminalになった時点で、ログ回収の完了を待たずに削除する。worker起動時のreconcileでも、terminal済みattemptに残るsecret_filesを削除する。
@@ -1271,9 +1277,21 @@ leaf symlink は参照先を辿らず unlink し、祖先/root の差替えは c
 空親/tmp の cleanup も同じ FD から行い、外部 symlink 先を削除しない。
 GC 排他 pin と writer shared pin の通常競合は対象を pending として次 pass へ送り、
 resident の収集 loop・lease 更新・IPC は継続する。pin 破損や他の I/O error は通常競合にしない。
+通常競合でない結果 GC のページの失敗（消せないファイル、祖先の差替え、foreign locator など）でも resident は止めない。
+claim とデータを残して失敗を数え、原因の path を出さずにログし、その run を次の周回で再試行する。その間もほかの run の
+GC・収集 loop・lease 更新・IPC は続く。resident を止めるのは fence と owner を失った場合だけである。
 時計 cutoff は boot identity と永続 monotonic baseline から導出し、boot 不明/変更後は全 retention の
 quarantine、時計異常は retention 0 でも Hold。壁時計だけを理由に削除を前倒ししない。
 source/Vault/private binding の GC と output planner 完成はこの結果 retention 経路に含まない。
+
+state directory の path は、どの要素にも symlink を許さない。`init` と常駐の起動は、祖先を含めて 1 つでも
+symlink があれば、state を作る前・DB を開く前に拒否する（path を解決して受け入れることはしない）。
+エラーには symlink だった要素の path と、実体の path を指定する（state なら `HOME` か `XDG_STATE_HOME` を実体の
+path にする）という案内を含める。`init` が調べるのは実際に使う path（LaunchAgents、設定、state）で、`XDG_STATE_HOME`・
+`XDG_CONFIG_HOME` を指定した場合、使わない `HOME` 配下の既定の path は調べない。LaunchAgents は常に `HOME` の下に
+あるため、`HOME` 自体が symlink を経由する場合は `HOME` を実体の path にする必要がある。
+Source・Vault・結果の削除は root から祖先を NOFOLLOW で開き直して対象を確かめるため、起動後に祖先が
+symlink へ差し替わった場合は、その保持ページは claim も unlink も行わずに失敗し、元に戻るまで何も消さない。
 
 ### Source retention roots (nondeleting foundation)
 

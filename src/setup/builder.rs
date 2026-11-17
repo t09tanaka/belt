@@ -90,6 +90,11 @@ pub struct SetupConfig {
     /// The environment the steps start from (`PATH`, `HOME`, ...). Nothing
     /// of this process's own environment is inherited.
     pub env: BTreeMap<String, String>,
+    /// The worker's scope variables (`config::traffic::step_env`), put on
+    /// top of every setup step's environment (not a tool installer's). They
+    /// are no part of `env`, which the keys of the prepared work are made
+    /// from. `None`: a step keeps what `env` and its own declaration give it.
+    pub scope_env: Option<BTreeMap<String, String>>,
     pub poll_ms: u64,
     pub lease_ms: u64,
     pub term_grace_ms: u64,
@@ -128,6 +133,7 @@ impl SetupConfig {
             profile_definition: None,
             log_limit_bytes: crate::supervisor::spec::DEFAULT_LOG_LIMIT_BYTES,
             env: BTreeMap::new(),
+            scope_env: None,
             poll_ms: 200,
             lease_ms: crate::supervisor::spec::DEFAULT_LEASE_MS,
             term_grace_ms: crate::supervisor::spec::DEFAULT_TERM_GRACE_MS,
@@ -1569,7 +1575,14 @@ impl Setups {
                 }
             }
             let env = match binding {
-                Some(b) => b.environment(&s.env).map_err(str::to_string)?,
+                // The scope variables are not the activation's: the step's
+                // (checked against the worker's at acceptance) are replaced
+                // by the worker's own when the spec is written.
+                Some(b) => {
+                    let mut own = s.env.clone();
+                    own.retain(|key, _| !crate::config::traffic::is_step_env(key));
+                    b.environment(&own).map_err(str::to_string)?
+                }
                 None => {
                     let mut env = base_env.clone();
                     env.extend(s.env.clone());
@@ -1588,10 +1601,23 @@ impl Setups {
         self.write_nodes_bound(
             dir,
             attempt,
-            nodes,
+            self.scoped(nodes),
             ws.warnings.clone(),
             binding.map(|b| b.fingerprint().clone()),
         )
+    }
+
+    /// Setup steps with the worker's scope variables on top of their
+    /// environment, so that a step's own task-traffic-controller finds the
+    /// scope the step was admitted in. Only setup steps: a tool installer
+    /// keeps the private environment of its plan (its own `XDG_*` homes).
+    fn scoped(&self, mut nodes: Vec<NodeSpec>) -> Vec<NodeSpec> {
+        if let Some(scope) = &self.cfg.scope_env {
+            for node in &mut nodes {
+                crate::config::traffic::apply_step_env(&mut node.env, scope);
+            }
+        }
+        nodes
     }
 
     fn write_nodes(
@@ -2275,6 +2301,73 @@ mod tool_validation_tests {
             .unwrap();
         assert_eq!(polled, ToolPreparationPoll::Pending);
         assert_eq!(setups.builds_started(), 0);
+    }
+    /// A setup step's own task-traffic-controller must find the scope its
+    /// step was admitted in: the spec of a builder names the worker's scope,
+    /// and a setup step gets the worker's scope variables whatever its
+    /// environment was made from. A tool installer keeps the private
+    /// environment of its plan.
+    #[test]
+    fn a_setup_step_carries_the_scope_of_the_worker_and_an_installer_its_own() {
+        let temp = crate::test_tmp::tempdir().unwrap();
+        let base = std::fs::canonicalize(temp.path()).unwrap();
+        let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let own = env(&[
+            ("PATH", "/bin"),
+            ("XDG_STATE_HOME", "/stale"),
+            ("XDG_CONFIG_HOME", "/private-config"),
+        ]);
+        let node = |dir: &Path| NodeSpec {
+            node_id: NodeId::parse("setup-0").unwrap(),
+            argv: vec!["/usr/bin/true".into()],
+            cwd: dir.to_path_buf(),
+            env: own.clone(),
+            weight: None,
+            timeout_ms: None,
+        };
+        let owner = |scope_env: Option<BTreeMap<String, String>>, name: &str| {
+            let mut cfg = SetupConfig::new(
+                base.join(name),
+                crate::ids::WorkerId::parse("w-scope").unwrap(),
+                "/bin/sh".into(),
+            );
+            cfg.traffic_state_dir = base.join("scope");
+            cfg.traffic_config = Some(base.join("config.toml"));
+            cfg.scope_env = scope_env;
+            Setups::open(cfg, Arc::new(NoWorkspace)).unwrap()
+        };
+        let scope = env(&[
+            ("XDG_STATE_HOME", "/state"),
+            ("TASK_TRAFFIC_CONTROLLER_NESTED", "inherit"),
+        ]);
+        let setups = owner(Some(scope), "with");
+        let dir = base.join("with").join("builder");
+        private_dir(&dir).unwrap();
+        assert_eq!(
+            setups.scoped(vec![node(&dir)])[0].env,
+            env(&[
+                ("PATH", "/bin"),
+                ("XDG_STATE_HOME", "/state"),
+                ("TASK_TRAFFIC_CONTROLLER_NESTED", "inherit"),
+            ])
+        );
+        // The installer's spec: the worker's scope to be admitted in, and
+        // its own environment untouched.
+        setups
+            .write_nodes(&dir, &AttemptId::generate(), vec![node(&dir)], vec![])
+            .unwrap();
+        let spec = SuperviseSpec::from_file(&dir.join("spec.json")).unwrap();
+        assert_eq!(spec.traffic_state_dir, base.join("scope"));
+        assert_eq!(spec.traffic_config, Some(base.join("config.toml")));
+        assert_eq!(spec.nodes[0].env, own);
+        // An owner that was given no scope variables leaves a step as it is.
+        let plain = owner(None, "without");
+        assert_eq!(plain.scoped(vec![node(&dir)])[0].env, own);
     }
     #[test]
     fn observation_handoff_checks_generation_cancel_barriers_and_bounded_cache() {

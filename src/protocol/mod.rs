@@ -28,5 +28,8 @@ pub mod transport;
 
 pub use frame::{Body, Frame, FrameError, StreamKind, MAX_FRAME_LEN};
 pub use mux::{CallError, Client, InboundRequest, Incoming, Responder, SendError, Unconfirmed};
-pub use session::{accept, connect, Accepted, ClientConfig, ConnectError, Connected, ServerConfig};
+pub use session::{
+    accept, connect, connect_requiring, Accepted, ClientConfig, ConnectError, Connected,
+    ServerConfig,
+};
 pub use transport::Io;

@@ -3,6 +3,7 @@ pub mod bootstrap;
 pub mod completion;
 pub mod context;
 pub mod control;
+pub mod doctor;
 pub mod estimate;
 mod forward;
 pub mod input;
@@ -16,6 +17,8 @@ pub mod submit;
 
 pub mod init;
 
+/// A worker waits here while its commands still run in another scope.
+mod traffic_hold;
 /// Standalone persistent worker role, independent of SSH bridge lifetime.
 pub mod worker;
 

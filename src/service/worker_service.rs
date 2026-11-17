@@ -38,6 +38,9 @@ const ENV: &[&str] = &[
     "LC_ALL",
     "LC_CTYPE",
     "XDG_CONFIG_HOME",
+    // The scope of the task-traffic-controller CLI follows these two, so the
+    // worker takes the values of the user's shell at install or init.
+    "XDG_STATE_HOME",
 ];
 const BINARY: &str = "remote-task-runner";
 /// How long `install` and `start` wait for the agent socket to accept.
@@ -53,6 +56,16 @@ pub enum Action {
     Status,
     /// Print this host's environment report (read-only; `workers diff`).
     Env,
+    /// Switch this host to the binary that runs the action (request on stdin).
+    Upgrade,
+    /// Switch this host back to the version an uncommitted switch began from
+    /// (request on stdin).
+    Rollback,
+    /// The parent has checked the installed version: forget the version the
+    /// switch began from and resume a drain the upgrade made (request on stdin).
+    Commit,
+    /// Report facts about this host for the parent's `doctor`.
+    Doctor,
 }
 
 /// What the parent sends on stdin for `install`. The key travels only here.
@@ -87,6 +100,35 @@ pub struct Status {
     /// non-login ssh PATH.
     #[serde(default)]
     pub bridge_binary: Option<String>,
+    /// The task-traffic-controller scope the worker uses: resolved from the
+    /// environment recorded at install, which is what the worker starts
+    /// with. `None` when that environment does not resolve to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_scope: Option<TrafficScope>,
+    /// Set while the worker is up but not serving, because commands it
+    /// started in another scope have not ended (`reason`:
+    /// `waiting_for_previous_scope`), or because that scope cannot be read
+    /// (`previous_scope_unreadable`; `message` says what to do).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_hold: Option<crate::config::traffic::HoldRecord>,
+    /// The version an unfinished switch started from. While this is set the
+    /// host is between versions and `upgrade` or `rollback` must finish it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switching_from: Option<String>,
+    /// The drain marker was written by an upgrade that has not been committed
+    /// yet; `commit` resumes it. An operator's drain never sets this.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub drained_by_upgrade: bool,
+    /// Another helper holds the host's switch lock: a version switch is
+    /// running right now and what this status shows is about to change.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub switch_running: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrafficScope {
+    pub state_dir: PathBuf,
+    pub config_file: PathBuf,
 }
 
 pub struct Paths {
@@ -142,6 +184,74 @@ struct Journal {
     binary_sha256: String,
     env: BTreeMap<String, String>,
     receipt: Option<macos::Receipt>,
+    /// An unfinished version switch. Omitted when there is none, so a journal
+    /// at rest keeps the exact shape every earlier version reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    switch: Option<upgrade::Switch>,
+    /// An upgrade wrote the drain marker and has not been committed. Omitted
+    /// when false, for the same reason.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    drained_by_upgrade: bool,
+}
+
+/// How long an action waits for the host's switch lock before it says a
+/// switch is running. Long enough to outlast a concurrent `status`.
+const LOCK_PATIENCE: Duration = Duration::from_millis(if cfg!(test) { 250 } else { 2000 });
+/// How long `status` waits before it reports a running switch. Not zero: a
+/// lock outlives its holder for a moment in any child that was forked while
+/// the descriptor was open and has not reached its `exec` yet.
+const STATUS_PATIENCE: Duration = Duration::from_millis(250);
+
+/// The host's switch lock, held for as long as this value lives.
+pub(crate) struct SwitchLock(#[allow(dead_code)] File);
+
+/// Take the switch lock, waiting no longer than `patience`. `None`: another
+/// helper holds it. Every action that changes the journal holds it
+/// exclusively from before it reads the journal until it has answered.
+pub(crate) fn switch_lock(
+    paths: &Paths,
+    exclusive: bool,
+    patience: Duration,
+) -> anyhow::Result<Option<SwitchLock>> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(paths.config.join("worker-service.lock"))?;
+    let kind = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    let deadline = Instant::now() + patience;
+    loop {
+        // SAFETY: `file` is an open descriptor owned by this function.
+        if unsafe { libc::flock(file.as_raw_fd(), kind | libc::LOCK_NB) } == 0 {
+            return Ok(Some(SwitchLock(file)));
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::WouldBlock {
+            return Err(error.into());
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// The exclusive switch lock, or the reason nothing was done.
+fn exclusive_lock(paths: &Paths) -> anyhow::Result<SwitchLock> {
+    // A host without an install has no lock to take, and says so as before.
+    require_journal(paths)?;
+    switch_lock(paths, true, LOCK_PATIENCE)?.context(
+        "a version switch is running on this host; nothing was changed, try again when it has finished",
+    )
 }
 
 fn euid() -> u32 {
@@ -339,6 +449,63 @@ fn worker_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The recorded environment of an installed worker, with the two variables
+/// that place the task-traffic-controller scope taken from `caller` (set or
+/// unset) when `idle`; unchanged otherwise.
+fn scope_refreshed(
+    recorded: &BTreeMap<String, String>,
+    caller: &BTreeMap<String, String>,
+    idle: bool,
+) -> BTreeMap<String, String> {
+    use crate::config::traffic::{CONFIG_HOME_ENV, STATE_HOME_ENV};
+    let mut env = recorded.clone();
+    if idle {
+        for key in [STATE_HOME_ENV, CONFIG_HOME_ENV] {
+            match caller.get(key) {
+                Some(value) => env.insert(key.into(), value.clone()),
+                None => env.remove(key),
+            };
+        }
+    }
+    env
+}
+
+/// The environment the service runs with. It never carries a configuration
+/// or state redirect: the worker reads both from the journal, not from its
+/// process.
+fn service_environment(journal: &Journal) -> BTreeMap<String, String> {
+    journal
+        .env
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "XDG_CONFIG_HOME" | "XDG_STATE_HOME"))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
+}
+
+/// The service status, the worker's state directory, the environment the
+/// service runs with and the environment recorded at install.
+pub(crate) type ServiceView = (Status, PathBuf, Environment, Environment);
+type Environment = BTreeMap<String, String>;
+
+/// What `doctor` looks at on this host: the service status, the worker's
+/// state directory, the environment the service runs with and the
+/// environment recorded at install.
+pub(crate) fn service_view<L: Launcher>(
+    env: &BTreeMap<String, String>,
+    launcher: L,
+) -> anyhow::Result<ServiceView> {
+    let env = worker_env(env);
+    let paths = Paths::resolve(&env)?;
+    let journal = require_journal(&paths)?;
+    let status = status(&env, launcher)?;
+    Ok((
+        status,
+        paths.state,
+        service_environment(&journal),
+        journal.env.clone(),
+    ))
+}
+
 fn plan(paths: &Paths, journal: &Journal) -> anyhow::Result<policy::Plan> {
     let label = format!(
         "io.github.t09tanaka.rtr.worker.{}.{}",
@@ -348,13 +515,7 @@ fn plan(paths: &Paths, journal: &Journal) -> anyhow::Result<policy::Plan> {
             Sha256::digest(paths.config.as_os_str().as_encoded_bytes())
         )[..12]
     );
-    // The service environment never carries a configuration redirect.
-    let environment = journal
-        .env
-        .iter()
-        .filter(|(k, _)| k.as_str() != "XDG_CONFIG_HOME")
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
+    let environment = service_environment(journal);
     policy::render(&policy::Definition {
         label,
         mode: policy::Mode::User { uid: journal.uid },
@@ -539,6 +700,10 @@ pub fn install<L: Launcher>(
 ) -> anyhow::Result<Status> {
     ensure!(request.schema == 1, "unsupported install request schema");
     let paths = Paths::resolve(env)?;
+    // The worker will share the scope of the user's CLI: refuse here, at
+    // install, an environment it would refuse at start. Only here: stop,
+    // drain and status do not depend on the caller's scope.
+    crate::config::traffic::resolve(env).map_err(anyhow::Error::msg)?;
     let digest = sha256_file(current_exe)?;
     ensure!(
         digest == request.binary_sha256,
@@ -564,9 +729,24 @@ pub fn install<L: Launcher>(
     // trip the comparison). Before that nothing runs yet and a re-run replaces.
     let registered = existing.as_ref().is_some_and(|j| j.receipt.is_some());
     let env = match &existing {
-        Some(journal) if registered => journal.env.clone(),
+        Some(journal) if registered => {
+            // The one exception is the scope of task-traffic-controller,
+            // which is no part of the service file: a stopped worker without
+            // an unfinished attempt takes the caller's, so that `stop` and
+            // `install` again is how a worker follows a changed
+            // XDG_STATE_HOME. A running one keeps what it started with.
+            let stopped = match &journal.receipt {
+                Some(receipt) => {
+                    launcher.loaded_state(&plan(&paths, journal)?, receipt) == LoadedState::Absent
+                }
+                None => false,
+            };
+            let idle = stopped && live_attempts(&paths.state).is_ok_and(|n| n == 0);
+            scope_refreshed(&journal.env, env, idle)
+        }
         _ => worker_env(env),
     };
+    let moved = existing.as_ref().is_some_and(|j| j.env != env);
     let executable = place_binary(&paths, &digest, current_exe)?;
     link_current(&paths, &digest)?;
     publish_exact(
@@ -590,7 +770,7 @@ pub fn install<L: Launcher>(
         &paths.input,
         &serde_json::to_vec(&spec)?,
         0o600,
-        !registered,
+        !registered || moved,
     )?;
     let mut journal = match existing {
         Some(mut journal) => {
@@ -609,6 +789,8 @@ pub fn install<L: Launcher>(
                 binary_sha256: digest.clone(),
                 env: spec.env.clone(),
                 receipt: None,
+                switch: None,
+                drained_by_upgrade: false,
             };
             save_journal(&paths, &fresh)?;
             fresh
@@ -718,7 +900,19 @@ pub fn stop<L: Launcher>(
                 worker: marker(&paths, wait),
             };
             manager.stop(&plan, &receipt, cancel_running)?;
-            control::write(&paths.state, Control::default())?;
+            // A stop ends its own drain. While a switch awaits its commit,
+            // or the upgrade owns the drain, the drain is not this stop's to
+            // end: the next start must not take work that a rollback to the
+            // saved database would lose.
+            let keep = journal.switch.is_some() || journal.drained_by_upgrade;
+            control::write(
+                &paths.state,
+                if keep {
+                    Control::draining()
+                } else {
+                    Control::default()
+                },
+            )?;
             let mut launcher = manager.launcher;
             return status_with(&paths, &journal, &plan, &receipt, &mut launcher, false);
         }
@@ -746,13 +940,26 @@ fn lifecycle_marker<L: Launcher>(
     request: WorkerRequest,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve(env)?;
-    let journal = require_journal(&paths)?;
+    let _lock = exclusive_lock(&paths)?;
+    let mut journal = require_journal(&paths)?;
     let plan = plan(&paths, &journal)?;
     let receipt = journal
         .receipt
         .clone()
         .context("service was never installed")?;
+    // Until the parent commits, the host can still return to the previous
+    // version with the database saved before the switch. Work placed in
+    // between would be lost by that return, so the drain stays.
+    ensure!(
+        !(matches!(request, WorkerRequest::Resume) && journal.switch.is_some()),
+        "a version switch awaits its commit, so the worker stays drained; run workers upgrade again to finish it"
+    );
     marker(&paths, Duration::ZERO).request(&identity(&journal), request)?;
+    // The operator has decided about the drain: it is no longer the upgrade's.
+    if journal.drained_by_upgrade {
+        journal.drained_by_upgrade = false;
+        save_journal(&paths, &journal)?;
+    }
     status_with(
         &paths,
         &journal,
@@ -768,14 +975,19 @@ pub fn status<L: Launcher>(
     mut launcher: L,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve(env)?;
+    // The journal is replaced by rename, so it reads whole even mid-switch.
     let journal = require_journal(&paths)?;
+    let lock = switch_lock(&paths, false, STATUS_PATIENCE)?;
     let plan = plan(&paths, &journal)?;
-    let receipt = journal
-        .receipt
-        .clone()
-        .context("service was never installed")?;
-    let ready = agent_reachable(&paths.state);
-    status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
+    let mut status = match journal.receipt.clone() {
+        None => upgrade::unsettled_status(&paths, &journal)?,
+        Some(receipt) => {
+            let ready = agent_reachable(&paths.state);
+            status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)?
+        }
+    };
+    status.switch_running = lock.is_none();
+    Ok(status)
 }
 
 fn status_with<L: Launcher>(
@@ -804,6 +1016,22 @@ fn status_with<L: Launcher>(
         bridge_binary: fs::symlink_metadata(paths.current_link())
             .ok()
             .and_then(|_| paths.bridge_binary().to_str().map(str::to_owned)),
+        traffic_scope: crate::config::traffic::resolve(&journal.env)
+            .ok()
+            .map(|scope| TrafficScope {
+                state_dir: scope.state_dir,
+                config_file: scope.config_file,
+            }),
+        // Only a worker that may be running waits; what a stopped one left
+        // behind is not its state now.
+        traffic_hold: crate::config::traffic::recorded_hold(
+            &paths.state,
+            crate::platform::wall_ms(),
+        )
+        .filter(|_| loaded != Some(false)),
+        switching_from: journal.switch.as_ref().map(|s| s.from.clone()),
+        drained_by_upgrade: journal.drained_by_upgrade,
+        switch_running: false,
     })
 }
 
@@ -836,6 +1064,21 @@ pub fn handle<L: Launcher>(
         Action::Resume => resume(env, launcher),
         Action::Status => status(env, launcher),
         Action::Env => anyhow::bail!("env is answered by env_main"),
+        Action::Upgrade => {
+            let request = serde_json::from_slice(stdin).context("upgrade request unreadable")?;
+            upgrade::upgrade(env, &request, current_exe, launcher, options, &mut |_| {
+                Ok(())
+            })
+        }
+        Action::Rollback => {
+            let request = serde_json::from_slice(stdin).context("rollback request unreadable")?;
+            upgrade::rollback(env, &request, launcher, options, &mut |_| Ok(()))
+        }
+        Action::Commit => {
+            let request = serde_json::from_slice(stdin).context("commit request unreadable")?;
+            upgrade::commit(env, &request, launcher)
+        }
+        Action::Doctor => anyhow::bail!("doctor reports facts, not a service status"),
     }
 }
 
@@ -855,6 +1098,9 @@ pub fn env_report(
 /// The hidden `worker-service` command. Drain, resume and status never touch
 /// launchctl; the others use the native launcher.
 pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
+    if action == Action::Doctor {
+        return super::doctor::host_main();
+    }
     let env: BTreeMap<String, String> = ENV
         .iter()
         .filter_map(|k| Some((k.to_string(), std::env::var_os(k)?.into_string().ok()?)))
@@ -875,15 +1121,17 @@ pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
         };
     }
     let mut stdin = Vec::new();
-    if action == Action::Install
-        && std::io::stdin()
-            .take(LIMIT + 1)
-            .read_to_end(&mut stdin)
-            .map_or(true, |_| stdin.len() as u64 > LIMIT)
+    if matches!(
+        action,
+        Action::Install | Action::Upgrade | Action::Rollback | Action::Commit
+    ) && std::io::stdin()
+        .take(LIMIT + 1)
+        .read_to_end(&mut stdin)
+        .map_or(true, |_| stdin.len() as u64 > LIMIT)
     {
         println!(
             "{}",
-            serde_json::json!({"ok": false, "error": "install request unreadable"})
+            serde_json::json!({"ok": false, "error": "request unreadable"})
         );
         return 2;
     }
@@ -917,6 +1165,8 @@ pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
         }
     }
 }
+
+pub mod upgrade;
 
 #[cfg(test)]
 pub(crate) mod tests;

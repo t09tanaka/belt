@@ -4921,3 +4921,88 @@ fn a_slow_look_is_answered_pending_and_asking_meanwhile_starts_no_second_look() 
         1
     );
 }
+
+/// A spec stored before the worker changed its task-traffic-controller scope
+/// (an upgrade from the worker-private `<state>/traffic`, or an
+/// `XDG_STATE_HOME` that moved) names the old one. An attempt that was
+/// accepted and not started must not start its command there, under a second
+/// budget: at the start the stored spec is moved to the worker's scope, the
+/// ledger and what the command's own task-traffic-controller would resolve.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_stored_for_another_scope_starts_in_the_scope_of_the_worker() {
+    use remote_task_runner::toolchain::profile::Profile;
+    let f = fx();
+    let home = f.path("home");
+    std::fs::create_dir(&home).unwrap();
+    let state_home = f.path("xdg-state");
+    let env: BTreeMap<String, String> = [
+        ("PATH".into(), "/usr/bin:/bin".into()),
+        ("HOME".into(), home.display().to_string()),
+        ("XDG_STATE_HOME".into(), state_home.display().to_string()),
+    ]
+    .into();
+    crate::common::fixture_worker_traffic_config(&env);
+    let scope = remote_task_runner::config::traffic::resolve(&env).unwrap();
+    let profile = Profile::load(&f.state(), &env).unwrap();
+    let mut cfg = f.cfg("boot-1");
+    cfg.profile = profile.name().into();
+    cfg.profile_fingerprint = profile.startup_report().profile_fingerprint;
+    cfg.capability_profile = Some(Arc::new(profile));
+    cfg.traffic_state_dir = scope.state_dir.clone();
+    cfg.traffic_config = Some(scope.config_file.clone());
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+
+    // Right before the start, the stored spec is made what an earlier worker
+    // would have left: its private scope, no scope variable of today, and
+    // one of a configuration home the worker does not have.
+    let legacy = f.state().join("traffic");
+    let attempts = f.state().join("attempts");
+    let stored_scope = Arc::new(Mutex::new(Vec::<String>::new()));
+    {
+        let (legacy, seen) = (legacy.clone(), stored_scope.clone());
+        agent.set_probe(Arc::new(move |point, a| {
+            if !matches!(point, ProbePoint::LeaseMeasure) {
+                return;
+            }
+            let file = attempts.join(a.as_str()).join("supervise.json");
+            let mut spec: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            seen.lock()
+                .unwrap()
+                .push(spec["traffic_state_dir"].as_str().unwrap().to_string());
+            spec["traffic_state_dir"] = serde_json::json!(legacy);
+            spec["traffic_config"] = serde_json::Value::Null;
+            for node in spec["nodes"].as_array_mut().unwrap() {
+                let env = node["env"].as_object_mut().unwrap();
+                assert!(env.remove("XDG_STATE_HOME").is_some());
+                assert!(env.remove("TASK_TRAFFIC_CONTROLLER_NESTED").is_some());
+                env.insert("XDG_CONFIG_HOME".into(), "/old-config".into());
+            }
+            std::fs::write(&file, serde_json::to_vec(&spec).unwrap()).unwrap();
+        }));
+    }
+    let out = f.path("env.out");
+    let p = payload(&format!("env > {}", out.display()));
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    // The spec was prepared for the worker's scope, and rewritten by the probe.
+    assert_eq!(
+        *stored_scope.lock().unwrap(),
+        [scope.state_dir.display().to_string()]
+    );
+    // The command was admitted in the worker's scope, not in the stored one.
+    assert!(scope.state_dir.join("ledger.json").exists());
+    assert!(!legacy.exists(), "nothing was started in the stored scope");
+    // And its own task-traffic-controller would find that scope and nest.
+    let seen = std::fs::read_to_string(&out).unwrap();
+    let has = |line: &str| seen.lines().any(|l| l == line);
+    assert!(
+        has(&format!("XDG_STATE_HOME={}", state_home.display())),
+        "{seen}"
+    );
+    assert!(has("TASK_TRAFFIC_CONTROLLER_NESTED=inherit"), "{seen}");
+    assert!(!seen.contains("XDG_CONFIG_HOME="), "{seen}");
+    agent.shutdown();
+}
