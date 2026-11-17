@@ -537,12 +537,13 @@ fn stop(
     if row.cancelled {
         return Ok(());
     }
-    if row.attempt.is_none() {
+    if let Some(attempt) = &row.attempt {
+        if store.stop_ci_attempt(run, &row.task_id, &attempt.attempt_id, reason, now_ms)? {
+            pass.stopped.push(row.task_id.clone());
+        }
+    } else {
         let stopped = store.fail_ci_tasks(run, Some(&row.task_id), reason, now_ms)?;
         pass.stopped.extend(stopped);
-    } else {
-        store.cancel_task(&row.task_id, now_ms)?;
-        pass.stopped.push(row.task_id.clone());
     }
     Ok(())
 }

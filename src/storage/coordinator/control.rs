@@ -30,6 +30,55 @@ impl CoordinatorStore {
         })
     }
 
+    /// Bind a fail-fast decision to the live attempt seen by the CI pass.
+    /// Concurrent passes, user cancellation and a terminal/retried attempt
+    /// cannot acquire a second or incorrect reason.
+    pub(crate) fn stop_ci_attempt(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        attempt: &AttemptId,
+        reason: &str,
+        at_ms: u64,
+    ) -> Result<bool> {
+        let (run, task, attempt, reason) = (
+            run.to_string(),
+            task.clone(),
+            attempt.to_string(),
+            reason.to_owned(),
+        );
+        self.db.write(move |tx| {
+            let live: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id)
+                 WHERE t.run_id=?1 AND t.task_id=?2 AND a.attempt_id=?3
+                 AND t.cancel_requested_at_ms IS NULL AND a.generation>=t.min_generation
+                 AND a.state<>'terminal' AND a.retired=0)",
+                params![run, task.as_str(), attempt],
+                |r| r.get(0),
+            )?;
+            if !live {
+                return Ok(false);
+            }
+            let expected = revision(tx, &run)?;
+            apply_cancel(
+                tx,
+                Target::Task(task.clone()),
+                expected,
+                RunId::generate().to_string(),
+                at_ms,
+            )?;
+            common::append_event(
+                tx,
+                Some(&run),
+                Some(&attempt),
+                "ci_fail_fast_requested",
+                &serde_json::json!({"task": task, "reason": reason}),
+                at_ms,
+            )?;
+            Ok(true)
+        })
+    }
+
     /// The CI tasks of `run` that were never placed (only `only`, when one
     /// is named) cannot be run: write why into each (`ci.unrunnable` of its
     /// spec), cancel it, and record the event `ci_task_unrunnable`, all in

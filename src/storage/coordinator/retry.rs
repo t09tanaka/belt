@@ -440,10 +440,12 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
     }
     if let Some(revision) = authorize {
         c.execute("UPDATE task SET spec_json=json_remove(spec_json,'$.ci.core_outcome') WHERE run_id=?1 AND json_extract(spec_json,'$.ci.dynamic_origin')=1", [binding.run.as_str()])?;
-        // A matrix run's driver binds the inputs again before each retried task is released.
+        // Rebind predecessor results before a retried dependent may run.
+        // The matrix driver additionally claims every task, including roots.
         c.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.hold',json('true'))
-            WHERE run_id=?1 AND authorization_revision=?2 AND EXISTS(
-                SELECT 1 FROM task m WHERE m.run_id=?1 AND (json_type(m.spec_json,'$.ci.matrix')='object' OR json_extract(m.spec_json,'$.ci.dynamic_origin')=1))",
+            WHERE run_id=?1 AND authorization_revision=?2 AND (
+                EXISTS(SELECT 1 FROM json_each(task.spec_json,'$.ci.task.inputs.needs')) OR EXISTS(
+                SELECT 1 FROM task m WHERE m.run_id=?1 AND (json_type(m.spec_json,'$.ci.matrix')='object' OR json_extract(m.spec_json,'$.ci.dynamic_origin')=1)))",
             params![binding.run.as_str(),to_i64(revision)?])?;
     }
     for group in &unjoined {

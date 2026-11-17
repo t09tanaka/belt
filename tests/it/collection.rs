@@ -4018,6 +4018,25 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
         // Asked once: a pass that sees the same again writes nothing.
         let again = ci_advance(&fx, &c);
         assert!(again.stopped.is_empty() && again.released.is_empty());
+        let stops = c
+            .store()
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "ci_fail_fast_requested")
+            .collect::<Vec<_>>();
+        assert_eq!(stops.len(), 2);
+        for id in &group.shards[1..] {
+            let event = stops
+                .iter()
+                .find(|e| e.attempt_id.as_deref() == Some(placed[id].0.as_str()))
+                .unwrap();
+            assert_eq!(event.payload["task"], ids[id].as_str());
+            assert_eq!(
+                event.payload["reason"],
+                remote_task_runner::ci::shards::FAIL_FAST_REASON
+            );
+        }
         // The coordinator delivers the cancels; the stop is confirmed.
         for _ in 0..4 {
             c.tick().await.unwrap();
@@ -4103,6 +4122,15 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
 /// kept: the job becomes a success from the kept result and the new ones.
 #[tokio::test]
 async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the_rest() {
+    retry_shards_with_report(true).await;
+}
+
+#[tokio::test]
+async fn a41_retry_rebinds_failed_downstream_needs_after_the_shards_rejoin() {
+    retry_shards_with_report(false).await;
+}
+
+async fn retry_shards_with_report(report_passes: bool) {
     use remote_task_runner::service::ci_run::Part;
     use remote_task_runner::service::completion::Target;
     use remote_task_runner::storage::RetryPreparation;
@@ -4150,14 +4178,23 @@ async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the
     let lines = ci_lines(&fx, &c, &files, &run);
     let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
     assert_eq!(job.status, "failure");
-    // report runs (it is `if: always()`) and ends.
+    let report = ci_task_of(&plan, "report");
     let b = c.tick().await.unwrap().placed[0].clone();
     let sent = fx.w.payload(&b);
-    let done = ci_result(&ci_task_of(&plan, "report"), "report", "success", json!({}));
-    end(&fx, &c, &b, Outcome::Succeeded, ci_out(&b, &sent, &done)).await;
+    assert_eq!(
+        sent.ci_task.as_ref().unwrap().inputs["needs"]["test"]["status"],
+        "failure"
+    );
+    let status = if report_passes { "success" } else { "failure" };
+    let outcome = if report_passes {
+        Outcome::Succeeded
+    } else {
+        Outcome::Failed
+    };
+    let done = ci_result(&report, "report", status, json!({}));
+    end(&fx, &c, &b, outcome, ci_out(&b, &sent, &done)).await;
     ci_collect(&c, &files, &b).await;
 
-    // Retry the run: only the two shards that did not pass.
     let target = Target::Run(run.clone());
     let revision = c
         .store()
@@ -4170,7 +4207,7 @@ async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the
         Err(e) => panic!("{e}"),
     };
     let receipt = c.store().commit_retry(prepared, false, wall_ms()).unwrap();
-    assert_eq!(receipt.task_count, 2);
+    assert_eq!(receipt.task_count, if report_passes { 2 } else { 3 });
     let rows = c.store().ci_run_tasks(&run).unwrap();
     let row = |at: usize| rows.iter().find(|r| r.task_id == task(at)).unwrap();
     let kept = row(0).attempt.clone().unwrap();
@@ -4220,7 +4257,28 @@ async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the
         (attempts(0).len(), attempts(1).len(), attempts(2).len()),
         (1, 2, 2)
     );
-    ci_advance(&fx, &c);
+    let joined = ci_advance(&fx, &c);
+    if !report_passes {
+        assert_eq!(joined.released, vec![ids[&report].clone()]);
+        let placements = c.tick().await.unwrap().placed;
+        assert_eq!(placements.len(), 1);
+        let attempt = &placements[0];
+        let sent = fx.w.payload(attempt);
+        assert_eq!(
+            sent.ci_task.as_ref().unwrap().inputs["needs"]["test"]["status"],
+            "success"
+        );
+        let done = ci_result(&report, "report", "success", json!({}));
+        end(
+            &fx,
+            &c,
+            attempt,
+            Outcome::Succeeded,
+            ci_out(attempt, &sent, &done),
+        )
+        .await;
+        ci_collect(&c, &files, attempt).await;
+    }
     assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
     let lines = ci_lines(&fx, &c, &files, &run);
     let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
