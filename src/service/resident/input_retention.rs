@@ -268,6 +268,10 @@ mod tests {
             self.terminal_tasks(run, closed, 1);
         }
         fn terminal_tasks(&self, run: &RunId, closed: bool, count: usize) {
+            self.terminal_tasks_at(run, closed, count, 0);
+        }
+        /// Every recorded time of the run is `at` plus a few milliseconds.
+        fn terminal_tasks_at(&self, run: &RunId, closed: bool, count: usize, at: u64) {
             let db = self.owner.store();
             let source = self.captured.sources.source_of_run(run).unwrap().unwrap();
             let manifest = self.captured.sources.manifest(&source).unwrap().unwrap();
@@ -275,13 +279,13 @@ mod tests {
             let digest = Digest::parse(&manifest.manifest_digest)
                 .or_else(|_| Digest::parse(&format!("sha256:{}", manifest.manifest_digest)))
                 .unwrap();
-            db.put_source_ref(&id, &digest, 1).unwrap();
-            db.create_run(run, Some(&id), None, &serde_json::json!({}), 1)
+            db.put_source_ref(&id, &digest, at + 1).unwrap();
+            db.create_run(run, Some(&id), None, &serde_json::json!({}), at + 1)
                 .unwrap();
             for _ in 0..count {
                 let task = TaskId::generate();
                 let attempt = AttemptId::generate();
-                db.create_task(&task, run, &serde_json::json!({}), 1)
+                db.create_task(&task, run, &serde_json::json!({}), at + 1)
                     .unwrap();
                 db.create_attempt(
                     NewAttempt {
@@ -291,7 +295,7 @@ mod tests {
                         payload_hash: Digest::of_bytes(b"payload"),
                         permit_id: None,
                     },
-                    2,
+                    at + 2,
                 )
                 .unwrap();
                 for state in [
@@ -301,13 +305,13 @@ mod tests {
                     AttemptState::Active,
                     AttemptState::Finalizing,
                 ] {
-                    db.transition_attempt(&attempt, state, 3).unwrap();
+                    db.transition_attempt(&attempt, state, at + 3).unwrap();
                 }
                 db.finalize_attempt(
                     &attempt,
                     Termination::new(Outcome::Failed, Some(crate::state::Exit::Code(9)), None)
                         .unwrap(),
-                    4,
+                    at + 4,
                 )
                 .unwrap();
                 if closed {
@@ -316,7 +320,7 @@ mod tests {
                         None,
                         crate::results::plan::Verdict::GaveUp,
                         false,
-                        5,
+                        at + 5,
                     )
                     .unwrap();
                 }
@@ -474,7 +478,8 @@ mod tests {
         const WEEK: u64 = 7 * 24 * 60 * 60 * 1000;
         let f = Fixture::new();
         let run = f.bind(false);
-        f.terminal(&run, true);
+        // The run ends just after the first quarantine is over.
+        f.terminal_tasks_at(&run, true, 1, 1_000 + WEEK);
         let manifest = f.manifest_path(&run);
         let mut driver = Driver::default();
         // Twelve consecutive pages reach every phase several times.
@@ -496,12 +501,16 @@ mod tests {
             }
         };
         pages(1_000, 10, Some("first-boot"));
-        assert!(manifest.exists());
-        // The wall clock alone moves past the retention.
-        pages(1_000 + 2 * WEEK, 100, Some("first-boot"));
+        pages(1_000 + WEEK + 100, 10 + WEEK + 100, Some("first-boot"));
+        assert!(
+            manifest.exists(),
+            "retention did not start at the run's end"
+        );
+        // The quarantine is over; the wall clock alone moves past the retention.
+        pages(1_000 + 3 * WEEK, 10 + WEEK + 200, Some("first-boot"));
         assert!(manifest.exists(), "a wall jump authorized deletion");
         // No boot identity: the monotonic clock proves nothing.
-        pages(1_000 + 4 * WEEK, 100 + 2 * WEEK, None);
+        pages(1_000 + 5 * WEEK, 10 + 3 * WEEK, None);
         assert!(manifest.exists(), "an unknown boot authorized deletion");
         // A reboot starts the quarantine again, whatever the wall clock says.
         pages(1_000 + 6 * WEEK, 50, Some("second-boot"));

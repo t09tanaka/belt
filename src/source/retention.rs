@@ -3859,6 +3859,34 @@ mod tests {
             assert!(!orphan.exists());
         }
         #[test]
+        fn vault_registration_marker_left_with_two_names_fails_closed() {
+            // Known limit: the marker is read before the sweep can run, so a
+            // crash between its link and unlink is not repaired here. Nothing
+            // is deleted and nothing becomes readable by mistake.
+            let (f, r, v, k) = prepared();
+            let mut c = VaultCursor::default();
+            assert!(tick(&f, &v, &k, &mut c, 100, 10).held);
+            let secrets = f.state.join("secrets");
+            let orphan = secrets.join(format!(".parent-retention.json.{}.tmp", ulid::Ulid::new()));
+            std::fs::hard_link(secrets.join("parent-retention.json"), &orphan).unwrap();
+            let page = f.store.vault_retention_page(
+                &f.owner,
+                &v,
+                &k,
+                &mut c,
+                101,
+                11,
+                Some("boot".into()),
+            );
+            assert!(page.is_err());
+            assert!(Vault::open(&f.state).is_err());
+            assert!(orphan.exists());
+            assert!(secrets.join(format!("{r}.json")).exists());
+            // Removing the leftover name by hand restores the Vault.
+            std::fs::remove_file(&orphan).unwrap();
+            assert!(Vault::open(&f.state).unwrap().has(&r));
+        }
+        #[test]
         fn vault_secret_free_terminal_run_keeps_source_only_retry_available() {
             let f = Fixture::new();
             let r = RunId::generate();
