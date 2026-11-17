@@ -1682,7 +1682,9 @@ FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard �
 
 テスト: `tests/it/collection.rs` に 8 件（A39: Vitest と Jest の file 単位の分割を worker 2 台の構成で同じ tick に配置し、全 file が 1 回ずつで Job が 1 つになること、報告されない file が有ると Job が failure になること。A40: 履歴で遅い test が 1 Shard になり最長の Shard が短くなること、履歴無しでも同じ分割になり実行できること。A41: 分割できない理由の表示と単一 Job への fallback、fail-fast の cancel の配送と停止確認と報告、後続を持たない Job で一度に配置しきれない Shard が未配置のまま止まること、retry、全 Shard が成功で集約だけが failure の run が集約まで確定せず失敗で確定すること）。失敗の原因と retry の対象は、止められた Shard の id が先に並ぶ場合、attempt が成功で test だけ失敗した場合、報告漏れの Shard だけをやり直す場合、retry の後の古い集約が書かれない場合を含む。lib は `ci::shards` 11 件、`ci::progress` 3 件、`ci_run` 1 件（ほかに既存の 2 件へ追記）。mutation は `src/ci/shards.rs` と `src/service/completion.rs` を手元で回した。
 
-残り（S18 の必須範囲として維持する）:
+以下は 2026-11-17 の初回実装で残っていた項目。11 月 18 日の統合では、worker の workspace で runner を列挙し、結果と runner の版を固定してから分割する。時間計測・worker 間の速度差・準備費を配置に使い、非冪等な shard の retry は捕捉済みの許可を確認する。独自 reporter や後続の成果物公開を分割で再現できない場合には理由を示し、元の Job を実行する。対象試験の進捗は上の A39〜A41 の行に記録する。
+
+初回実装時点の残件は次のとおり。
 
 - 本番の `ci` は分割の要求（`ShardRequest`）を作らない。`service::planning::freeze` は test の列挙（adapter の discover）を走らせないので、実際の `ci` の plan は今も Shard を持たない。上のテストは `FrozenPlan::with_shards` で作った plan を使う。列挙をどこで走らせるか（親か worker か、どの workspace か）は未決定で、adapter 本体の側の作業である。
 - 履歴の入力元が無い（A40）。worker が返す `TestResult` は所要時間を持たず、`History` と `PartitionOpts.speed_permille`（worker の性能補正）に入れる値を RTR は記録していない。Shard 数を worker の実効容量と残りの DAG から決める処理も無い。
