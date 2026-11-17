@@ -527,12 +527,13 @@ fn run_ci(cli: &Cli) -> i32 {
                 enabled: !args.no_status,
                 context: args.status_context.clone(),
             };
+            let poster = std::sync::Arc::new(crate::service::github_status::Gh::new(&context));
             let result = crate::service::ci_run::run(
                 context,
                 args.git_ref.clone(),
                 &mut receiver,
                 status,
-                std::sync::Arc::new(crate::service::github_status::Gh),
+                poster,
             )
             .await;
             watcher.abort();

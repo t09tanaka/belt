@@ -5570,12 +5570,7 @@ async fn a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_
     git(&["init", "-q"]);
     git(&["config", "user.name", "Fixture"]);
     git(&["config", "user.email", "fixture@example.invalid"]);
-    git(&[
-        "remote",
-        "add",
-        "origin",
-        "git@example.invalid:owner/name.git",
-    ]);
+    git(&["remote", "add", "origin", "git@github.com:owner/name.git"]);
     git(&["add", "."]);
     git(&["commit", "-qm", "first"]);
     let head = git(&["rev-parse", "HEAD"]);
