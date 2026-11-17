@@ -158,7 +158,12 @@ jobs:
       - name: zero survivors in matrix / filter / source gate
         # two at a time: the unit tests that reach the matrix now include those
         # of the driver, and one test process at a time took three times as long
-        run: cargo schemata -j 2 --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
+        # 120 seconds for a mutant: one mutant of `filter::matcher` never ends and
+        # grows a string until it is stopped. The default is five times the whole
+        # baseline, which the tests of the driver made long enough (297s) for
+        # that mutant to use up the runner's memory. The slowest mutant that is
+        # caught takes under 30 seconds.
+        run: cargo schemata -j 2 -t 120 --file src/matrix.rs --file src/filter.rs --file src/source/gate.rs -- --lib --test job_dag --test source_capture
 
   mutants-artifact:
     name: mutation gate (artifact)
