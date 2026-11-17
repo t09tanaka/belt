@@ -644,6 +644,31 @@ fn a_root_replaced_by_a_link_after_the_check_sends_the_removal_nowhere_else() {
     // What was checked is what was emptied.
     assert!(listing(&aside).is_empty());
     assert!(trash(&state).is_empty());
+    // The descriptor and the path must name the same directory: one that
+    // was opened and then replaced at its path is not the checked one.
+    let moved = state.join("moved");
+    fs::create_dir(&moved).unwrap();
+    fs::set_permissions(&moved, fs::Permissions::from_mode(0o700)).unwrap();
+    let opened = open_dir_at(CWD, &moved).unwrap();
+    assert!(owned_open_dir(&opened, &moved).is_ok());
+    fs::rename(&moved, state.join("moved-aside")).unwrap();
+    assert_eq!(
+        owned_open_dir(&opened, &moved).map(|_| ()),
+        Err("private_directory_missing")
+    );
+    fs::create_dir(&moved).unwrap();
+    fs::set_permissions(&moved, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        owned_open_dir(&opened, &moved).map(|_| ()),
+        Err("private_root_misplaced")
+    );
+    assert!(owned_open_dir(&opened, &state.join("moved-aside")).is_ok());
+    fs::set_permissions(&moved, fs::Permissions::from_mode(0o750)).unwrap();
+    let open_to_others = open_dir_at(CWD, &moved).unwrap();
+    assert_eq!(
+        owned_open_dir(&open_to_others, &moved).map(|_| ()),
+        Err("unsafe_private_directory")
+    );
     // The walk itself opens a directory without following: a name that was a
     // directory when it was looked at and is a link when it is opened is
     // refused, not entered.
@@ -840,16 +865,13 @@ fn a_clear_that_cannot_rename_removes_nothing_and_an_unreadable_directory_is_not
     assert!(trash(&state).is_empty());
 
     // One with something in it: the root is empty afterwards (the rename
-    // came first), the clear fails, and the trash keeps the directory with
-    // its mode. The next install does not wait for it.
+    // came first), so the clear is done; the trash keeps the directory with
+    // its mode, and no later clear or install is held up by it.
     let closed = f.plan.root.join("closed");
     fs::create_dir(&closed).unwrap();
     fs::write(closed.join("left"), b"partial").unwrap();
     fs::set_permissions(&closed, fs::Permissions::from_mode(0o300)).unwrap();
-    assert_eq!(
-        cleared(&f.plan, &state),
-        Err("installation_partial_cleanup")
-    );
+    assert_eq!(cleared(&f.plan, &state), Ok(()));
     assert!(listing(&f.plan.root).is_empty());
     let left = trash(&state);
     assert_eq!(left.len(), 1);

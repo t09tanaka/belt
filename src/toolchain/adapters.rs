@@ -1089,9 +1089,12 @@ fn sweep_own_trash(toolchains: BorrowedFd<'_>, root: &str, dev: Dev) {
 ///   renamed into a new trash directory beside the root. A rename that fails
 ///   is the failure, and nothing is removed. A writer that outlived its
 ///   installer keeps writing into the trash, not into the new install.
-/// - Then the trash is removed by descriptor (`remove_at`). If that fails the
-///   install fails, and the trash is left for the next clear or the next
-///   start of the worker.
+/// - Then the trash is removed by descriptor (`remove_at`). The root is empty
+///   by then, so a trash that cannot be removed (a writer still fills it, a
+///   directory in it cannot be read) is left for the next clear or the next
+///   start of the worker and the install goes on. Only a directory on
+///   another device is the failure: something is mounted where an installer
+///   wrote, and that is for a person to look at.
 fn clear_unreceipted(managed: &ManagedRoot) -> Result<()> {
     let toolchains = managed.toolchains.as_fd();
     sweep_own_trash(toolchains, &managed.name, managed.dev);
@@ -1115,7 +1118,10 @@ fn clear_unreceipted(managed: &ManagedRoot) -> Result<()> {
     }
     drop(trash_fd);
     let trash = CString::new(trash).map_err(|_| "installation_partial_cleanup")?;
-    remove_at(toolchains, &trash, managed.dev).map_err(failed)
+    match remove_at(toolchains, &trash, managed.dev) {
+        Err(Errno::XDEV) => Err("installation_partial_cleanup"),
+        Ok(()) | Err(_) => Ok(()),
+    }
 }
 
 /// Remove the trash directories that clears left in `toolchains` (an

@@ -1123,7 +1123,7 @@ workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、co
 - 消す前に、root が worker の toolchain 管理ディレクトリ（`<state>/toolchains`。導入者が呼び出し元から受け取り、root の親がこれと一致することを確かめる）の直下にあり、名前が導入計画の identity（64桁の小文字16進）で、自分だけが読み書きできるディレクトリであり、途中に symlink を挟まない path であることを確かめる。満たさなければ何も作らず、何も消さない。確かめた管理ディレクトリと root は開いたまま持ち、以後の操作はその descriptor を基準に行う。確認のあとで root の名前が symlink に差し替えられても、消すのは確かめたディレクトリの中身だけである。
 - 中身は、まず管理ディレクトリの中の trash（`.trash-<root名>-<ULID>`）へ rename し、そのあとで消す。`install.lock` は rename しない。rename できなければ何も消さずに導入を失敗にする。こうすると、止めた導入者の process group を抜けて生き残った子孫がまだ書いていても、それは trash 側に書き、新しい導入は空の root から始まる（root の中を path で名指しして新しく作る書き込みまでは防げない）。
 - trash は descriptor を基準に消す（symlink を辿らない `openat`、`fstat`、`unlinkat`）。path を使った chmod とディレクトリの読み取りはしない。symlink は辿らずに外す。ファイルは mode を変えずに外す（root の外のファイルへの hard link でも、外のファイルは mode も中身も変わらない）。mode を変えるのは、中身を消すために開けたディレクトリだけで、開いた descriptor に対して行う。読めないディレクトリは、空なら外し、空でなければそこで止める。root と違う device のディレクトリ（mount）に当たったら、中に入らずにそこで止める。
-- trash を消し切れなかった導入は失敗にし、trash は残す。残った trash は、同じ root の次の clear と worker の起動時にもう一度消す（起動時は、その root の `install.lock` を待たずに取れた場合だけ）。このとき消せなくても導入は止めない。
+- rename が済めば root は空なので、trash を消し切れなくても（生き残りがまだ書いている、読めないディレクトリがある）導入は続け、trash は残す。別の device に当たった場合だけは導入を失敗にする。残った trash は、同じ root の次の clear と worker の起動時にもう一度消す（起動時は、その root の `install.lock` を待たずに取れた場合だけ）。
 - 別の導入者が lock を持っている間は、何も消さずに lock を待つ。待った後に receipt があれば、それを結果とする。
 - worker 内では、同じ版の導入者は同時に1つだけで、止めた導入者とその子プロセスの終了を確かめるまで次を始めない（第8章の setup と同じ）。
 

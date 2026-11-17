@@ -1146,9 +1146,9 @@ PR #59 の H1 修正（4 本目）へのレビューを受けて、toolchain の
 
 - **M1（失敗した版のやり直し）**: 導入者が自分で失敗した版を key ごとに 10 分（`SetupConfig::tool_failure_hold_ms`）覚え、新しい consumer には導入をやり直さずに同じ失敗と残り秒数を返す。覚えるのは helper が失敗の exit で終わった場合、成功の後の `detect` が通らなかった場合、制限時間切れだけで、cancel・消失・signal による終了は覚えない（`policy::install_itself_failed`）。HostTools の digest が変わったとき、warm-up の最初の look（`Host::toolchain_retry`）、worker の再起動で解除する。判定は純粋関数 `policy::failure_held`。
 - **L1（fd を基準にした削除）**: `remove_at` は `openat(O_DIRECTORY|O_NOFOLLOW)`・`fstat`・`fchmod`・`unlinkat` だけでたどる。path の chmod と `read_dir` は無い。`st_dev` が root と違うディレクトリは `EXDEV` で止まる。`managed_root` は管理ディレクトリと root を開いたまま返し、clear はその descriptor を使う。読めない（owner の read が無い）ディレクトリは、空なら外し、空でなければ止まる（path で chmod し直さない）。
-- **L2（trash）**: clear は `install.lock` 以外を `.trash-<root名>-<ULID>` へ rename してから消す。rename の失敗は導入の失敗で、何も消さない。残った trash は同じ root の次の clear（lock の下）と、起動時の `adapters::sweep_trash`（その root の lock が待たずに取れた場合だけ）で消す。root そのものは rename しない（`install.lock` の inode が排他そのものなので）。
+- **L2（trash）**: clear は `install.lock` 以外を `.trash-<root名>-<ULID>` へ rename してから消す。rename の失敗は導入の失敗で、何も消さない。rename の後に trash を消し切れなくても導入は続け（別の device に当たった場合だけ失敗）、trash は残す。残った trash は同じ root の次の clear（lock の下）と、起動時の `adapters::sweep_trash`（その root の lock が待たずに取れた場合だけ）で消す。root そのものは rename しない（`install.lock` の inode が排他そのものなので）。
 - **L3（期待する親）**: `install_admitted` と `managed_root` は管理ディレクトリを引数で受け、`root.parent() == expected` を、何かを作る前に確かめる。
-- **L4・L5（緩めた試験）**: helper を殺した後の試験を `calls()==2` と「2 本目が Pending」に戻し、失敗時は理由を出す。restart の試験は、unsettled が空になった直後に古い子が死んでいることを確かめる。
+- **L4・L5（緩めた試験）**: helper を殺した後の試験を `calls()==2` と「2 本目が Pending」に戻し、失敗時は理由を出す。「すぐ Failed」の原因は helper の 3 秒固定の承認待ちだった（混んだ全体実行で `installer_not_admitted` が 1 件余分に出て、導入が manager を動かす前に「a setup step exited with 1」で終わった）。待ちを 60 秒にし、承認の記録が別の process を子と名指ししているときだけ即座に諦める（`preparation::admission_step`）。restart の試験は、unsettled が空になった直後に古い子が死んでいることを確かめる。
 - **dry_run**: `env_sync` の dry_run は receipt の無い root を `would_install` と答える（本番の sync と同じ）。
 - spec §22.2 の削除の条件を、上に合わせて直した。
 
