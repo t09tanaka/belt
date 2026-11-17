@@ -3564,6 +3564,24 @@ async fn a39_file_shards_cover_every_test_once_and_add_up_to_one_job() {
             let demand = local_ci::plan_task_demand(&plan, id).unwrap();
             let tests: Vec<usize> = demand.nodes.iter().filter_map(|n| n.weight.tests).collect();
             assert_eq!(tests, [given.len()], "{id}");
+            // The command the shard's worker builds from the plan names
+            // exactly those files.
+            let shard = task.shard.as_ref().unwrap();
+            let runner = local_ci::shard::adapters::from_info(&shard.runner, "/project").unwrap();
+            let listed = local_ci::shard::Shard {
+                index: shard.index,
+                tests: shard.tests.clone(),
+                load: 0,
+            };
+            let argv = runner.invoke(&listed, shard.count, shard.mode).argv;
+            let named: Vec<&str> = files_listed
+                .iter()
+                .copied()
+                .filter(|file| argv.iter().any(|arg| arg.ends_with(file)))
+                .collect();
+            let mut own: Vec<&str> = given.iter().map(String::as_str).collect();
+            own.sort();
+            assert_eq!(named, own, "{argv:?}");
         }
 
         // Both shards are placed at once; what needs the job waits.
@@ -4099,4 +4117,93 @@ async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the
         .map(|l| l.status.as_str())
         .collect();
     assert_eq!(shards, ["success", "success", "success"]);
+}
+
+/// A41, fail-fast for a job nothing waits for, with more shards than are
+/// placed at once: the run is looked at although no task of it waits, the
+/// shards that run are cancelled and the one that was never placed is
+/// cancelled with the reason and never starts. Such a shard has no attempt,
+/// so the existing rule refuses a retry of the run.
+#[tokio::test]
+async fn a41_fail_fast_reaches_a_shard_that_was_never_placed_in_a_job_nothing_waits_for() {
+    use remote_task_runner::service::ci_run::Part;
+    use remote_task_runner::service::completion::Target;
+    let names: Vec<String> = (0..36).map(|i| format!("t{i:02}")).collect();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let discovered = listed(&names);
+    let adapter = CargoTest::new("1.91.0", &[], Safety::default());
+    let opts = PartitionOpts::default();
+    let fx = fx();
+    let (c, files) = fx.open();
+    let only = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+    let whole = ci_plan(only);
+    let shards = partition_tests(&adapter, &discovered, &History::default(), 18, &opts);
+    let plan = whole
+        .with_shards(&[split_request(&whole, shards, &discovered, true)])
+        .unwrap();
+    let group = split_group(&plan);
+    assert_eq!((group.shards.len(), plan.tasks.len()), (18, 18));
+    let (run, ids) = ci_run_by_task(&fx, &c, &plan).await;
+    // No task waits for a job, yet the run is one a pass looks at.
+    assert_eq!(c.store().ci_waiting_runs(8).unwrap(), vec![run.clone()]);
+    let placed = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
+    assert_eq!(placed.len(), 16, "what one worker holds at once");
+    let queued: Vec<&String> = group
+        .shards
+        .iter()
+        .filter(|s| !placed.contains_key(*s))
+        .collect();
+    assert_eq!(queued.len(), 2);
+
+    let failing = placed.keys().next().unwrap().clone();
+    let at = group.shards.iter().position(|s| s == &failing).unwrap();
+    let failed = shard_result(&group, at, "failure", "failed", None);
+    end_shard(&c, &files, &placed[&failing], Outcome::Failed, &failed).await;
+    // The slot that came free took one of the two; the other still waits.
+    let unplaced = |s: &&&String| c.store().attempts_of_task(&ids[**s]).unwrap().is_empty();
+    let still: Vec<&&String> = queued.iter().filter(unplaced).collect();
+    assert_eq!(still.len(), 1);
+    let waiting = ids[*still[0]].clone();
+    let pass = ci_advance(&fx, &c);
+    assert_eq!(
+        pass.stopped.len(),
+        17,
+        "those that run and the one that waits"
+    );
+    assert!(pass.stopped.contains(&waiting));
+    let rows = c.store().ci_run_tasks(&run).unwrap();
+    let row = rows.iter().find(|r| r.task_id == waiting).unwrap();
+    assert!(row.cancelled && row.attempt.is_none());
+    assert_eq!(
+        row.spec["ci"]["unrunnable"],
+        remote_task_runner::ci::shards::FAIL_FAST_REASON
+    );
+    for _ in 0..4 {
+        c.tick().await.unwrap();
+        collect(&c, &files).await;
+        assert!(ci_advance(&fx, &c).stopped.is_empty(), "asked once");
+    }
+    assert_eq!(fx.w.count("cancel"), 16);
+    assert!(c.store().attempts_of_task(&waiting).unwrap().is_empty());
+    assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
+
+    let lines = ci_lines(&fx, &c, &files, &run);
+    let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
+    assert_eq!(job.status, "failure");
+    let never = lines.iter().find(|l| l.task_id == waiting).unwrap();
+    assert_eq!(never.status, "no_result");
+    assert_eq!(
+        never.reason.as_deref(),
+        Some(remote_task_runner::ci::shards::FAIL_FAST_REASON)
+    );
+    let target = Target::Run(run.clone());
+    let snapshot = c.store().completion(target.clone()).unwrap();
+    assert!(snapshot.settled());
+    assert!(snapshot.exit_code().is_some_and(|code| code != 0));
+    // The shard that never ran has no attempt to retry.
+    let refused = c
+        .store()
+        .prepare_retry(target, snapshot.control_revision, "again".into());
+    let why = refused.err().map(|e| e.to_string()).unwrap_or_default();
+    assert!(why.contains("terminal attempt"), "{why}");
 }

@@ -1503,15 +1503,17 @@ FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard �
 - fail-fast の「失敗」は、Shard の Job が failure か、receipt に失敗した test が有るか exit が失敗のとき。cancel された Shard と skipped は失敗に数えない。
 - split Job の行の `reason` は Driver と同じ要約を出すが、failure のときは Shard 個別の skip 理由（`skipped`）を出さない。
 
-テスト: `tests/it/collection.rs` に 5 件（A39: Vitest と Jest の file 単位の分割を worker 2 台の構成で同じ tick に配置し、全 file が 1 回ずつで Job が 1 つになること、報告されない file が有ると Job が failure になること。A40: 履歴で遅い test が 1 Shard になり最長の Shard が短くなること、履歴無しでも同じ分割になり実行できること。A41: 分割できない理由の表示と単一 Job への fallback、fail-fast の cancel の配送と停止確認と報告、retry）。lib は `ci::shards` 9 件、`ci::progress` 3 件、`ci_run` 1 件（ほかに既存の 2 件へ追記）。mutation は `src/ci/shards.rs` だけを手元で回した。
+テスト: `tests/it/collection.rs` に 6 件（A39: Vitest と Jest の file 単位の分割を worker 2 台の構成で同じ tick に配置し、全 file が 1 回ずつで Job が 1 つになること、報告されない file が有ると Job が failure になること。A40: 履歴で遅い test が 1 Shard になり最長の Shard が短くなること、履歴無しでも同じ分割になり実行できること。A41: 分割できない理由の表示と単一 Job への fallback、fail-fast の cancel の配送と停止確認と報告、後続を持たない Job で一度に配置しきれない Shard が未配置のまま止まること、retry）。lib は `ci::shards` 9 件、`ci::progress` 3 件、`ci_run` 1 件（ほかに既存の 2 件へ追記）。mutation は `src/ci/shards.rs` だけを手元で回した。
 
 残り（S18 の必須範囲として維持する）:
 
 - 本番の `ci` は分割の要求（`ShardRequest`）を作らない。`service::planning::freeze` は test の列挙（adapter の discover）を走らせないので、実際の `ci` の plan は今も Shard を持たない。上のテストは `FrozenPlan::with_shards` で作った plan を使う。列挙をどこで走らせるか（親か worker か、どの workspace か）は未決定で、adapter 本体の側の作業である。
 - 履歴の入力元が無い（A40）。worker が返す `TestResult` は所要時間を持たず、`History` と `PartitionOpts.speed_permille`（worker の性能補正）に入れる値を RTR は記録していない。Shard 数を worker の実効容量と残りの DAG から決める処理も無い。
 - worker が Shard を実際に実行する経路（`execute_pinned_task` が Shard の command を作り `ShardOutcome` を返す）は local-ci の側のテストに任せていて、RTR では実 runner を動かしていない。テストの worker は receipt を手で作る。
-- fail-fast で未配置のまま cancel された Shard は attempt を持たないので、既存の規則（`retry requires a terminal attempt`）で run の retry が断られる。配置済みで止められた Shard は retry できる。未配置の Shard を retry で queue に戻すかは S15 の retry の規則の変更になるため、決めていない。
+- fail-fast で未配置のまま cancel された Shard は attempt を持たないので、既存の規則（`retry requires a terminal attempt`）で run の retry が断られる。配置済みで止められた Shard は retry できる（どちらもテストで固定した）。未配置の Shard を retry で queue に戻すかは S15 の retry の規則の変更になるため、決めていない。
 - retry しても、すでに failure の inputs で release された後続の task はやり直さない（S16 の plain な Job と同じ）。
 - 非冪等な runner の明示的な retry 許可（`ExecutionTask.retry`）は見ていない。
 - coverage の merge、JUnit などの artifact の重複・欠落の検査、assertion 数の集約は無い（local-ci は coverage を集める Job を分割しない）。
 - `ci plan` は split 済みの ShardGroup を JSON の `shard_groups` に出すが、text では数だけである。
+- `ci` の exit code の補正（`ci_run::exit_code`）は foreground の `ci` だけに効く。`wait`・`show` と run 自体の exit code は attempt の終了だけから決まるので、全 Shard が成功で集約だけが failure の run は 0 のままである。status（S19）は run の exit code ではなく Job の行から判定する必要がある。
+- fail-fast で止めた実行中の Shard には理由を記録していない（未配置で止めたものだけ `ci.unrunnable` に理由が残る）。
