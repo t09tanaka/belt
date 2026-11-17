@@ -11,6 +11,11 @@ fn held(failures: &mut u64) -> String {
     format!("result retention page held (validation/I/O); failures={failures}")
 }
 
+/// The line logged when a page left entries pending: counts only.
+fn entries_held(failures: u64, entries: u32) -> String {
+    format!("result retention entries held (I/O); entries={entries}; failures={failures}")
+}
+
 pub(super) async fn run(
     coordinator: Arc<Coordinator>,
     files: Arc<ResultStore>,
@@ -39,6 +44,11 @@ pub(super) async fn run(
         })
         .await?;
         cursor = next;
+        if let Ok(report) = &result {
+            if report.failed > 0 {
+                eprintln!("{}", entries_held(failures, report.failed));
+            }
+        }
         if result.is_err() {
             // GC is optional. A claim that cannot be finished (its file cannot
             // be unlinked, an ancestor was replaced, a locator is not ours)
@@ -109,10 +119,16 @@ pub(super) mod tests {
         db: &CoordinatorStore,
         files: &ResultStore,
     ) -> (RunId, AttemptId) {
-        let (run, task, attempt) = (RunId::generate(), TaskId::generate(), AttemptId::generate());
+        let run = RunId::generate();
         db.create_run(&run, None, None, &serde_json::json!({}), 1)
             .unwrap();
-        db.create_task(&task, &run, &serde_json::json!({}), 1)
+        let attempt = expired_attempt(db, files, &run);
+        (run, attempt)
+    }
+    /// One more expired attempt (its own task) in an existing run.
+    fn expired_attempt(db: &CoordinatorStore, files: &ResultStore, run: &RunId) -> AttemptId {
+        let (task, attempt) = (TaskId::generate(), AttemptId::generate());
+        db.create_task(&task, run, &serde_json::json!({}), 1)
             .unwrap();
         db.create_attempt(
             NewAttempt {
@@ -157,7 +173,7 @@ pub(super) mod tests {
             7,
         )
         .unwrap();
-        (run, attempt)
+        attempt
     }
     /// `expired`, with its deletion already claimed durably (a page of an
     /// earlier life): replayed by any later page, whatever its clock says.
@@ -184,6 +200,112 @@ pub(super) mod tests {
         })
         .await
         .unwrap_or_else(|_| panic!("timed out: {what}"));
+    }
+
+    #[test]
+    fn held_entries_are_logged_as_counts_only() {
+        assert_eq!(
+            entries_held(3, 2),
+            "result retention entries held (I/O); entries=2; failures=3"
+        );
+    }
+
+    /// Restores permissions when dropped, so a failing assertion leaves
+    /// nothing the temporary directory cannot delete.
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+
+    #[test]
+    fn an_unremovable_claim_does_not_hold_back_the_claims_behind_it() {
+        use std::os::unix::fs::PermissionsExt;
+        if rustix::process::geteuid().is_root() {
+            return; // permissions do not bind root
+        }
+        let f = Fixture::new();
+        let db = f.owner.store();
+        let run = RunId::generate();
+        db.create_run(&run, None, None, &serde_json::json!({}), 1)
+            .unwrap();
+        let attempts = [
+            expired_attempt(db, &f.files, &run),
+            expired_attempt(db, &f.files, &run),
+        ];
+        let guard = db.result_gc_guard(&run).unwrap();
+        let claim = |wall, mono| {
+            db.claim_result_page(&guard, &run, "", 32, wall, mono, Some("earlier".into()), 0)
+                .unwrap()
+        };
+        claim(100, 10);
+        assert_eq!(claim(110, 20).removed, 2);
+        let pending = db.pending_result_page(&guard, &run, 32).unwrap();
+        assert_eq!(pending.len(), 2);
+        // The first claim in page order cannot be unlinked: its directory is
+        // read-only, so its entries cannot be removed.
+        let first = attempts
+            .iter()
+            .find(|a| pending[0].locator.contains(a.as_str()))
+            .unwrap();
+        let second = attempts.iter().find(|a| *a != first).unwrap();
+        let stuck = f.directory(first);
+        let _restore = Restore(stuck.clone());
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o500)).unwrap();
+        drop(guard);
+        let mut cursor = Cursor::default();
+        let report = page(db, &f.files, &mut cursor, RETENTION_DAYS).unwrap();
+        assert_eq!((report.deleted, report.failed), (1, 1));
+        assert!(!f.directory(second).exists());
+        assert!(stuck.exists());
+        assert_eq!(f.pending(&run), 1);
+        // Once it can be removed, a later page finishes it.
+        std::fs::set_permissions(&stuck, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut cursor = Cursor::default();
+        let report = page(db, &f.files, &mut cursor, RETENTION_DAYS).unwrap();
+        assert_eq!((report.deleted, report.failed), (1, 0));
+        assert_eq!(f.pending(&run), 0);
+        assert!(!stuck.exists());
+    }
+
+    #[test]
+    fn a_foreign_locator_still_fails_the_page_and_removes_nothing() {
+        let f = Fixture::new();
+        let db = f.owner.store();
+        let (run, attempt) = claimed(db, &f.files);
+        let outside = f.root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("kept"), b"outside").unwrap();
+        // A claim pointing outside the store is not ours; it cannot be forged
+        // through the public API, so the check is on the predicate the page uses.
+        assert!(!ResultStore::owns(outside.to_str().unwrap()));
+        assert!(!ResultStore::owns("../x"));
+        // The claim that is ours is removed without following anything else.
+        let mut cursor = Cursor::default();
+        let report = page(db, &f.files, &mut cursor, RETENTION_DAYS).unwrap();
+        assert_eq!((report.deleted, report.failed), (1, 0));
+        assert!(!f.directory(&attempt).exists());
+        assert_eq!(f.pending(&run), 0);
+        assert_eq!(std::fs::read(outside.join("kept")).unwrap(), b"outside");
+    }
+
+    #[test]
+    fn a_replaced_attempt_directory_is_counted_and_never_followed() {
+        let f = Fixture::new();
+        let db = f.owner.store();
+        let (run, attempt) = claimed(db, &f.files);
+        let outside = f.root.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("kept"), b"outside").unwrap();
+        std::fs::rename(f.directory(&attempt), f.root.path().join("moved")).unwrap();
+        std::os::unix::fs::symlink(&outside, f.directory(&attempt)).unwrap();
+        let mut cursor = Cursor::default();
+        let report = page(db, &f.files, &mut cursor, RETENTION_DAYS).unwrap();
+        assert_eq!((report.deleted, report.failed), (0, 1));
+        assert_eq!(f.pending(&run), 1);
+        assert_eq!(std::fs::read(outside.join("kept")).unwrap(), b"outside");
     }
 
     #[test]
