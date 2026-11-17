@@ -4703,6 +4703,13 @@ async fn a_failed_warm_up_is_blocked_and_two_syncs_at_once_share_one_install() {
     );
     assert!(installed_node(&spec).is_empty());
     std::fs::remove_file(host.join("fail")).unwrap();
+    // H1: the failed install left a private root without a receipt. The
+    // same version installs on the next sync; it is not blocked for good.
+    let again = sync_node(&spec, "20.0.0").await.unwrap();
+    assert_eq!(again.installed.len(), 1);
+    assert_eq!(again.installed[0].version, "20.0.0");
+    assert_eq!(calls_of(&host, "20.0.0"), 2);
+    assert_eq!(installed_node(&spec), ["20.0.0"]);
     // Two syncs of the same version at once: one manager run, both done.
     std::fs::write(host.join("hold"), "").unwrap();
     let first = tokio::spawn({
@@ -4731,6 +4738,6 @@ async fn a_failed_warm_up_is_blocked_and_two_syncs_at_once_share_one_install() {
         assert_eq!(done.installed[0].version, "22.0.0");
     }
     assert_eq!(calls_of(&host, "22.0.0"), 1);
-    assert_eq!(installed_node(&spec), ["22.0.0"]);
+    assert_eq!(installed_node(&spec), ["20.0.0", "22.0.0"]);
     shutdown(&client).await;
 }

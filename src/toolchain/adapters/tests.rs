@@ -227,7 +227,7 @@ fn all_five_closed_lifecycles_and_identical_setup_consumer_environment() {
     }
 }
 #[test]
-fn crashes_wrong_versions_and_concurrency_never_publish_success() {
+fn crashes_and_wrong_versions_never_publish_success() {
     let f = fixture(AdapterKind::Nodenv, "node");
     let mut fake = Fake::for_plan(&f.plan);
     fake.wrong = true;
@@ -236,30 +236,339 @@ fn crashes_wrong_versions_and_concurrency_never_publish_success() {
         Err("installed_version_mismatch")
     );
     assert!(!f.plan.root.join("receipt.json").exists());
-    assert_eq!(
-        install_admitted(&f.plan, &mut fake),
-        Err("installation_partial_requires_cleanup")
-    );
+    assert_eq!(detect(&f.plan), Availability::Unknown(UNRECEIPTED));
     let f = fixture(AdapterKind::Fvm, "flutter");
     let mut fake = Fake::for_plan(&f.plan);
     fake.fail = true;
     assert_eq!(install_admitted(&f.plan, &mut fake), Err("fake_cancelled"));
-    assert!(matches!(detect(&f.plan), Availability::Unknown(_)));
-    let f = fixture(AdapterKind::Rustup, "rust");
-    mkdir(&f.plan.root).unwrap();
+    assert_eq!(detect(&f.plan), Availability::Unknown(UNRECEIPTED));
+}
+/// Everything below `root` except the lock, as sorted relative names. Links
+/// are named, never entered.
+fn listing(root: &Path) -> Vec<String> {
+    let mut todo = vec![root.to_path_buf()];
+    let mut out = vec![];
+    while let Some(dir) = todo.pop() {
+        for e in fs::read_dir(&dir).unwrap() {
+            let e = e.unwrap();
+            let m = fs::symlink_metadata(e.path()).unwrap();
+            out.push(
+                e.path()
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+            if m.is_dir() {
+                todo.push(e.path());
+            }
+        }
+    }
+    out.retain(|n| n != "install.lock");
+    out.sort();
+    out
+}
+fn held_lock(plan: &InstallPlan) -> File {
+    mkdir(&plan.root).unwrap();
     let lock = OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
-        .open(f.plan.root.join("install.lock"))
+        .open(plan.root.join("install.lock"))
         .unwrap();
     lock.lock().unwrap();
+    lock
+}
+/// H1: an install that failed or was stopped leaves a root without a
+/// receipt. The next install of the same version clears it and succeeds.
+#[test]
+fn a_failed_or_stopped_install_is_cleared_and_the_same_version_installs_again() {
+    for stopped in [false, true] {
+        let f = fixture(AdapterKind::Nodenv, "node");
+        let mut fake = Fake::for_plan(&f.plan);
+        if stopped {
+            // Stopped at the first command: only the skeleton is there.
+            fake.fail = true;
+            assert_eq!(install_admitted(&f.plan, &mut fake), Err("fake_cancelled"));
+        } else {
+            // Ran to the end with the wrong version: a payload is there.
+            fake.wrong = true;
+            assert_eq!(
+                install_admitted(&f.plan, &mut fake),
+                Err("installed_version_mismatch")
+            );
+            assert!(f.plan.payload.exists());
+        }
+        // What a killed installer may leave: a half-written receipt, a
+        // sealed directory, a file nobody may write.
+        fs::write(f.plan.root.join("receipt.pending"), b"{").unwrap();
+        let sealed = f.plan.root.join("cache/sealed/deep");
+        fs::create_dir_all(&sealed).unwrap();
+        fs::write(sealed.join("left"), b"partial").unwrap();
+        fs::set_permissions(sealed.join("left"), fs::Permissions::from_mode(0o400)).unwrap();
+        for dir in [&sealed, sealed.parent().unwrap()] {
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        fs::write(f.plan.root.join("home/stale"), b"old").unwrap();
+        let lock_inode = fs::metadata(f.plan.root.join("install.lock"))
+            .unwrap()
+            .ino();
+        let receipt = install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+        assert_eq!(detect(&f.plan), Availability::Installed(Box::new(receipt)));
+        // Nothing of the earlier installer is reused.
+        assert!(!f.plan.root.join("receipt.pending").exists());
+        assert!(!f.plan.root.join("cache/sealed").exists());
+        assert!(!f.plan.root.join("home/stale").exists());
+        // The lock is the same file: its inode is the exclusion.
+        assert_eq!(
+            fs::metadata(f.plan.root.join("install.lock"))
+                .unwrap()
+                .ino(),
+            lock_inode
+        );
+    }
+}
+#[test]
+fn clearing_a_partial_root_unlinks_links_and_never_follows_them() {
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let state = f.plan.root.parent().unwrap().to_path_buf();
+    // Outside the root: a directory and files that must survive.
+    let outside = state.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("sentinel"), b"keep").unwrap();
+    fs::create_dir(outside.join("sub")).unwrap();
+    fs::write(outside.join("sub/sentinel"), b"keep").unwrap();
+    let mut fake = Fake::for_plan(&f.plan);
+    fake.fail = true;
+    assert_eq!(install_admitted(&f.plan, &mut fake), Err("fake_cancelled"));
+    // Links at the top of the root and deep inside it: to a directory, to a
+    // file, to the root's own parent, to nothing.
+    symlink(&outside, f.plan.root.join("link-to-dir")).unwrap();
+    symlink(outside.join("sentinel"), f.plan.root.join("link-to-file")).unwrap();
+    symlink(&state, f.plan.root.join("cache/up")).unwrap();
+    fs::create_dir_all(f.plan.root.join("data/a/b")).unwrap();
+    symlink(outside.join("sub"), f.plan.root.join("data/a/b/deep")).unwrap();
+    symlink("/nonexistent/target", f.plan.root.join("dangling")).unwrap();
+    let before = listing(&outside);
+    let host = listing(&state.join("host"));
+    let modes = |p: &Path| fs::metadata(p).unwrap().mode();
+    let (dir_mode, file_mode) = (modes(&outside), modes(&outside.join("sentinel")));
+    install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    assert_eq!(listing(&outside), before);
+    assert_eq!(listing(&state.join("host")), host);
+    assert_eq!(fs::read(outside.join("sentinel")).unwrap(), b"keep");
+    assert_eq!(fs::read(outside.join("sub/sentinel")).unwrap(), b"keep");
+    assert_eq!(modes(&outside), dir_mode);
+    assert_eq!(modes(&outside.join("sentinel")), file_mode);
+    for gone in [
+        "link-to-dir",
+        "link-to-file",
+        "cache/up",
+        "data/a",
+        "dangling",
+    ] {
+        assert!(
+            fs::symlink_metadata(f.plan.root.join(gone)).is_err(),
+            "{gone}"
+        );
+    }
+}
+#[test]
+fn a_root_with_a_receipt_is_never_cleared_valid_or_not() {
+    // A valid receipt: the answer as it is, nothing runs, nothing is removed.
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let receipt = install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    let before = listing(&f.plan.root);
+    assert!(before.len() > 2);
+    let mut never = Fake::default();
+    assert_eq!(install_admitted(&f.plan, &mut never).unwrap(), receipt);
+    assert!(never.calls.is_empty());
+    assert_eq!(listing(&f.plan.root), before);
+    // A receipt that cannot be trusted (invalid, open to others, a link, a
+    // directory): an error, and nothing is removed either.
+    type Spoil = fn(&Path);
+    let cases: [(&str, Spoil); 4] = [
+        ("receipt_invalid", |r| fs::write(r, b"{}").unwrap()),
+        ("unsafe_receipt", |r| {
+            fs::set_permissions(r, fs::Permissions::from_mode(0o644)).unwrap()
+        }),
+        ("receipt_open", |r| {
+            let kept = r.with_extension("kept");
+            fs::rename(r, &kept).unwrap();
+            symlink(&kept, r).unwrap()
+        }),
+        ("unsafe_receipt", |r| {
+            fs::remove_file(r).unwrap();
+            fs::create_dir(r).unwrap();
+            fs::set_permissions(r, fs::Permissions::from_mode(0o700)).unwrap()
+        }),
+    ];
+    for (error, spoil) in cases {
+        let f = fixture(AdapterKind::Nodenv, "node");
+        install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+        spoil(&f.plan.root.join("receipt.json"));
+        let before = listing(&f.plan.root);
+        let mut never = Fake::default();
+        assert_eq!(install_admitted(&f.plan, &mut never), Err(error));
+        assert!(never.calls.is_empty(), "{error}");
+        assert_eq!(listing(&f.plan.root), before, "{error}");
+    }
+}
+#[test]
+fn a_root_that_is_not_where_a_managed_root_must_be_is_refused_untouched() {
+    // The root is a link to a directory elsewhere.
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let state = f.plan.root.parent().unwrap().to_path_buf();
+    let elsewhere = state.join("elsewhere");
+    mkdir(&elsewhere).unwrap();
+    fs::write(elsewhere.join("sentinel"), b"keep").unwrap();
+    symlink(&elsewhere, &f.plan.root).unwrap();
+    let mut never = Fake::default();
     assert_eq!(
-        install_admitted(&f.plan, &mut Fake::default()),
-        Err("installation_busy")
+        install_admitted(&f.plan, &mut never),
+        Err("unsafe_private_directory")
     );
+    assert!(never.calls.is_empty());
+    assert_eq!(clear_unreceipted(&f.plan), Err("unsafe_private_directory"));
+    assert_eq!(listing(&elsewhere), ["sentinel"]);
+    fs::remove_file(&f.plan.root).unwrap();
+    // The check itself. Each root below holds something; none of it goes.
+    let placed = |root: PathBuf| InstallPlan {
+        root,
+        ..f.plan.clone()
+    };
+    mkdir(&f.plan.root).unwrap();
+    assert_eq!(managed_root(&f.plan), Ok(()));
+    fs::write(f.plan.root.join("left"), b"partial").unwrap();
+    // Not named by a plan identity: too short, too long, not lower hex.
+    let name = f
+        .plan
+        .root
+        .file_name()
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(name.len(), 64);
+    for bad in [
+        name[1..].to_owned(),
+        format!("{name}0"),
+        format!("g{}", &name[1..]),
+        format!("A{}", &name[1..]),
+        format!("/{}", &name[1..]).replace('/', ":"),
+    ] {
+        let other = state.join(&bad);
+        mkdir(&other).unwrap();
+        fs::write(other.join("left"), b"partial").unwrap();
+        assert_eq!(
+            managed_root(&placed(other.clone())),
+            Err("private_root_misplaced"),
+            "{bad}"
+        );
+        assert_eq!(
+            clear_unreceipted(&placed(other.clone())),
+            Err("private_root_misplaced")
+        );
+        assert!(other.join("left").exists(), "{bad}");
+    }
+    // Reached through a link: the same directory by another path.
+    let alias = state.join("alias");
+    symlink(&state, &alias).unwrap();
+    let through = placed(alias.join(&name));
+    assert_eq!(managed_root(&through), Err("unsafe_private_directory"));
+    assert_eq!(clear_unreceipted(&through), Err("unsafe_private_directory"));
+    assert!(f.plan.root.join("left").exists());
+    // The link is further up: every directory looks right where it is
+    // named, and the path is still not the one the root really has.
+    let deeper = state.join("deeper");
+    mkdir(&deeper).unwrap();
+    mkdir(&deeper.join(&name)).unwrap();
+    fs::write(deeper.join(&name).join("left"), b"partial").unwrap();
+    assert_eq!(managed_root(&placed(deeper.join(&name))), Ok(()));
+    let far = placed(alias.join("deeper").join(&name));
+    assert_eq!(managed_root(&far), Err("private_root_misplaced"));
+    assert_eq!(clear_unreceipted(&far), Err("private_root_misplaced"));
+    assert!(deeper.join(&name).join("left").exists());
+    // Not a clean absolute path, or no parent and no name.
+    for bad in [
+        PathBuf::from(&name),
+        state.join("x").join("..").join(&name),
+        PathBuf::from("/"),
+    ] {
+        assert_eq!(
+            managed_root(&placed(bad.clone())),
+            Err("private_root_misplaced"),
+            "{}",
+            bad.display()
+        );
+    }
+    // A parent others may enter, then a root others may enter.
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(managed_root(&f.plan), Err("unsafe_private_directory"));
+    assert_eq!(clear_unreceipted(&f.plan), Err("unsafe_private_directory"));
+    fs::set_permissions(&state, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&f.plan.root, fs::Permissions::from_mode(0o750)).unwrap();
+    assert_eq!(clear_unreceipted(&f.plan), Err("unsafe_private_directory"));
+    fs::set_permissions(&f.plan.root, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(f.plan.root.join("left").exists());
+    // A receipt that is there is never removed, and stops the removal.
+    fs::write(f.plan.root.join("receipt.json"), b"{}").unwrap();
+    assert_eq!(
+        clear_unreceipted(&f.plan),
+        Err("installation_receipt_present")
+    );
+    assert!(f.plan.root.join("receipt.json").exists());
+    fs::remove_file(f.plan.root.join("receipt.json")).unwrap();
+    // And the plain case: everything but the lock goes.
+    fs::write(f.plan.root.join("install.lock"), b"").unwrap();
+    assert_eq!(clear_unreceipted(&f.plan), Ok(()));
+    assert!(listing(&f.plan.root).is_empty());
+    assert!(f.plan.root.join("install.lock").exists());
+}
+#[test]
+fn while_another_installer_holds_the_lock_nothing_is_removed_and_this_one_waits() {
+    // The other installer holds the lock over a root it is filling.
+    let f = fixture(AdapterKind::Rustup, "rust");
+    let lock = held_lock(&f.plan);
+    mkdir(&f.plan.root.join("home")).unwrap();
+    fs::write(f.plan.root.join("home/in-progress"), b"theirs").unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let plan = f.plan.clone();
+    let waiter = std::thread::spawn(move || {
+        let done = install_admitted(&plan, &mut Fake::for_plan(&plan));
+        let _ = tx.send(());
+        done
+    });
+    // It does not come back and removes nothing while the lock is held.
+    assert!(rx
+        .recv_timeout(std::time::Duration::from_millis(300))
+        .is_err());
+    assert_eq!(
+        fs::read(f.plan.root.join("home/in-progress")).unwrap(),
+        b"theirs"
+    );
+    // The other one ends without a receipt: now this one clears and installs.
     drop(lock);
+    let receipt = waiter.join().unwrap().unwrap();
+    assert!(!f.plan.root.join("home/in-progress").exists());
+    assert_eq!(detect(&f.plan), Availability::Installed(Box::new(receipt)));
+    // The other one publishes while this one waits: its receipt is the
+    // answer, and nothing runs here.
+    let g = fixture(AdapterKind::Rustup, "rust");
+    let lock = held_lock(&g.plan);
+    let plan = g.plan.clone();
+    let waiter = std::thread::spawn(move || {
+        let mut never = Fake::default();
+        let done = install_admitted(&plan, &mut never);
+        (done, never.calls.len())
+    });
+    let published = install_holding(&g.plan, &mut Fake::for_plan(&g.plan)).unwrap();
+    drop(lock);
+    let (done, calls) = waiter.join().unwrap();
+    assert_eq!(done.unwrap(), published);
+    assert_eq!(calls, 0);
 }
 #[test]
 fn symlink_escape_receipt_corruption_external_drift_and_manual_reasons() {

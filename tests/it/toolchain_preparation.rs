@@ -95,6 +95,7 @@ done
             host = host.display(),
             mode = match mode {
                 "fail" => "exit 19".to_string(),
+                "flaky" => format!("if [ -e '{}/fail' ]; then exit 19; fi", host.display()),
                 "wrong" => "# wrong probe is injected below".to_string(),
                 "long" => "/usr/bin/yes x | /usr/bin/head -c 9000; exit 0".to_string(),
                 "hang" => format!(
@@ -374,7 +375,7 @@ fn all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipt
 }
 
 #[test]
-fn manager_failures_probe_mismatch_output_limit_and_partial_roots_fail_closed() {
+fn manager_failures_probe_mismatch_and_output_limit_fail_closed_for_each_consumer() {
     for mode in ["fail", "wrong", "long"] {
         let mut f = Fx::new(AdapterKind::Nodenv, "node", mode);
         let a = f.consumer();
@@ -384,10 +385,113 @@ fn manager_failures_probe_mismatch_output_limit_and_partial_roots_fail_closed() 
         );
         assert!(!f.plan().root().join("receipt.json").exists());
         assert!(f.setups.preparation_observations(64).is_empty());
+        // The consumer that saw the failure keeps it; nothing is run again
+        // for it.
+        assert!(matches!(f.poll(&a), ToolPreparationPoll::Failed(_)));
+        assert_eq!(f.setups.builds_started(), 1);
+        // A later consumer does not inherit the partial root as a failure:
+        // the install is tried again from a cleared root (and this manager
+        // fails again), never reused.
         let other = f.consumer();
         assert!(matches!(f.done(&other), ToolPreparationPoll::Failed(_)));
-        assert_eq!(f.setups.builds_started(), 1);
+        assert_eq!(f.setups.builds_started(), 2, "{mode}");
+        assert!(!f.plan().root().join("receipt.json").exists());
+        assert!(f.setups.preparation_observations(64).is_empty());
     }
+}
+
+fn builders_settled(f: &Fx) -> bool {
+    f.dir
+        .path()
+        .join("state/setup/builders")
+        .read_dir()
+        .unwrap()
+        .next()
+        .is_none()
+}
+
+/// H1: a failed install, and one stopped half-way, leave a private root
+/// without a receipt. The next consumer of the same version installs it.
+#[test]
+fn a_failed_or_stopped_install_does_not_block_the_same_version_afterwards() {
+    // Failed by the manager, which is then repaired.
+    let mut f = Fx::new(AdapterKind::Nodenv, "node", "flaky");
+    let fail = f.dir.path().join("host/fail");
+    std::fs::write(&fail, b"").unwrap();
+    let a = f.consumer();
+    assert!(matches!(f.done(&a), ToolPreparationPoll::Failed(_)));
+    let root = f.plan().root().to_path_buf();
+    assert!(root.join("home").exists(), "the failed install left a root");
+    assert!(!root.join("receipt.json").exists());
+    std::fs::write(root.join("home/stale"), b"left by the failed install").unwrap();
+    std::fs::remove_file(&fail).unwrap();
+    let b = f.consumer();
+    assert!(
+        matches!(f.done(&b), ToolPreparationPoll::Installed(_)),
+        "the same version must install after a failed install"
+    );
+    assert!(!root.join("home/stale").exists(), "the root was reused");
+    assert_eq!(f.setups.builds_started(), 2);
+    assert_eq!(f.calls(), 2);
+    drop(f);
+
+    // Stopped while the manager ran (the last consumer went away).
+    let mut f = Fx::new(AdapterKind::Nodenv, "node", "gate");
+    let a = f.consumer();
+    assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
+    wait_until(|| f.calls() == 1);
+    let root = f.plan().root().to_path_buf();
+    f.setups.release(&a);
+    wait_until(|| builders_settled(&f));
+    assert!(
+        root.join("home").exists(),
+        "the stopped install left a root"
+    );
+    assert!(!root.join("receipt.json").exists());
+    std::fs::write(root.join("home/stale"), b"left by the stopped install").unwrap();
+    std::fs::write(f.dir.path().join("host/release"), b"").unwrap();
+    let b = f.consumer();
+    assert!(matches!(f.done(&b), ToolPreparationPoll::Installed(_)));
+    assert!(!root.join("home/stale").exists(), "the root was reused");
+    assert_eq!(f.setups.builds_started(), 2);
+    assert_eq!(f.calls(), 2);
+}
+
+/// A worker that restarts in the middle of an install: the old installer is
+/// stopped and settled first, then the version is installed for whoever asks.
+#[test]
+fn a_restart_in_the_middle_of_an_install_ends_with_the_version_installed() {
+    let mut f = Fx::new(AdapterKind::Nodenv, "node", "gate");
+    let a = f.consumer();
+    assert_eq!(f.poll(&a), ToolPreparationPoll::Pending);
+    wait_until(|| f.calls() == 1);
+    let reopened = Setups::open(f.cfg.clone(), Arc::new(NoWorkspace)).unwrap();
+    let b = AttemptId::generate();
+    // The old writer still works in the root: no second one beside it.
+    assert_eq!(
+        reopened.poll_tool(&b, &f.request).unwrap(),
+        ToolPreparationPoll::Pending
+    );
+    assert_eq!(reopened.builds_started(), 0);
+    wait_until(|| reopened.unsettled().is_empty());
+    assert!(!f.plan().root().join("receipt.json").exists());
+    std::fs::write(f.dir.path().join("host/release"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(90);
+    let done = loop {
+        let poll = reopened.poll_tool(&b, &f.request).unwrap();
+        if poll != ToolPreparationPoll::Pending {
+            break poll;
+        }
+        assert!(Instant::now() < deadline, "tool builder timed out");
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    assert!(
+        matches!(done, ToolPreparationPoll::Installed(_)),
+        "{done:?}"
+    );
+    assert_eq!(reopened.builds_started(), 1);
+    assert_eq!(f.calls(), 2);
+    reopened.release(&b);
 }
 
 #[test]
@@ -491,19 +595,20 @@ fn releasing_one_consumer_preserves_install_and_final_release_drains_owned_child
     let b = f.consumer();
     assert_eq!(f.poll(&b), ToolPreparationPoll::Pending);
     assert_eq!(f.setups.builds_started(), 1);
-    assert!(matches!(f.done(&b), ToolPreparationPoll::Failed(_)));
     wait_until(|| !same_live(pid, start));
+    wait_until(|| builders_settled(&f));
     assert_eq!(f.calls(), 1);
+    assert_eq!(f.setups.builds_started(), 1);
     assert!(
         f.plan().root().exists(),
-        "partial private root must survive cancellation"
+        "the stopped installer does not remove its own root"
     );
     assert!(!f.plan().root().join("receipt.json").exists());
     assert!(f.setups.preparation_observations(64).is_empty());
 }
 
 #[test]
-fn restart_keeps_same_key_barrier_until_old_writer_settles_then_reports_partial_state() {
+fn restart_keeps_same_key_barrier_until_old_writer_settles_then_installs_again() {
     let mut f = Fx::new(AdapterKind::Nodenv, "node", "hang");
     let a = f.consumer();
     f.poll(&a);
@@ -517,13 +622,18 @@ fn restart_keeps_same_key_barrier_until_old_writer_settles_then_reports_partial_
     );
     assert_eq!(reopened.builds_started(), 0);
     wait_until(|| reopened.unsettled().is_empty());
-    assert!(matches!(
-        reopened.poll_tool(&b, &f.request).unwrap(),
-        ToolPreparationPoll::Failed(_)
-    ));
     wait_until(|| !same_live(pid, start));
     assert_eq!(f.calls(), 1);
     assert!(f.plan().root().exists());
+    assert!(!f.plan().root().join("receipt.json").exists());
+    // Only now a new installer is started for the consumer that waited.
+    assert_eq!(
+        reopened.poll_tool(&b, &f.request).unwrap(),
+        ToolPreparationPoll::Pending
+    );
+    assert_eq!(reopened.builds_started(), 1);
+    reopened.release(&b);
+    wait_until(|| builders_settled(&f));
     assert!(f.setups.preparation_observations(64).is_empty());
     assert!(reopened.preparation_observations(64).is_empty());
 }
@@ -630,9 +740,13 @@ fn helper_death_still_drains_recorded_owned_manager_children() {
     wait_until(|| !same_live(pid, start));
     assert_eq!(f.calls(), 1);
     assert!(!f.plan().root().join("receipt.json").exists());
+    // A later consumer is not failed by the root the dead helper left: a
+    // new installer is started, clears it and runs the manager again.
     let b = f.consumer();
-    assert!(matches!(f.done(&b), ToolPreparationPoll::Failed(_)));
-    assert_eq!(f.setups.builds_started(), 1);
+    wait_until(|| {
+        f.poll(&b);
+        f.setups.builds_started() == 2
+    });
 }
 
 #[test]

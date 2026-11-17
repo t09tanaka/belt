@@ -856,7 +856,7 @@ pub fn detect(plan: &InstallPlan) -> Availability {
     }
     match read_receipt(plan) {
         Ok(Some(r)) => Availability::Installed(Box::new(r)),
-        Ok(None) => Availability::Unknown("installation_incomplete_or_unreceipted"),
+        Ok(None) => Availability::Unknown(UNRECEIPTED),
         Err(e) => Availability::Unknown(e),
     }
 }
@@ -917,8 +917,65 @@ fn normalize_probe_version(name: &str, value: &str) -> String {
         _ => value.to_owned(),
     }
 }
-/// Explicit install only. This nonblocking publication lock is not a scheduler
-/// or setup singleflight. Partial roots require owned cleanup, never silent reuse.
+/// What `detect` answers for a root that holds no receipt: an installer began
+/// there and never published. Only an installer under `install.lock` may clear it.
+pub const UNRECEIPTED: &str = "installation_incomplete_or_unreceipted";
+
+/// The private root of `plan` is where a managed root must be: a directory of
+/// this user, not a link, named by a plan identity, directly inside an owned
+/// directory, and reached through no link.
+fn managed_root(plan: &InstallPlan) -> Result<()> {
+    let misplaced = "private_root_misplaced";
+    let parent = plan.root.parent().ok_or(misplaced)?;
+    let name = plan
+        .root
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or(misplaced)?;
+    if !clean_absolute(&plan.root)
+        || name.len() != 64
+        || !name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return Err(misplaced);
+    }
+    owned_dir(parent)?;
+    owned_dir(&plan.root)?;
+    if fs::canonicalize(&plan.root).map_err(|_| misplaced)? != plan.root {
+        return Err(misplaced);
+    }
+    Ok(())
+}
+
+/// Remove what an installer that never published a receipt left in the root.
+/// The caller holds `install.lock` exclusively and has seen that there is no
+/// receipt. Only entries of `plan.root` go; the lock file stays (its inode is
+/// the exclusion), a link is unlinked and never followed, and a receipt that
+/// is there after all stops the removal.
+fn clear_unreceipted(plan: &InstallPlan) -> Result<()> {
+    managed_root(plan)?;
+    let entries = fs::read_dir(&plan.root).map_err(|_| "install_directory_read")?;
+    for entry in entries {
+        let entry = entry.map_err(|_| "install_directory_read")?;
+        let name = entry.file_name();
+        if name == "install.lock" {
+            continue;
+        }
+        if name == "receipt.json" {
+            return Err("installation_receipt_present");
+        }
+        // `remove_tree` looks with `symlink_metadata`: a link is unlinked,
+        // a directory is opened up (a sealed one too) and removed below it.
+        crate::setup::store::remove_tree(&plan.root.join(name))
+            .map_err(|_| "installation_partial_cleanup")?;
+    }
+    Ok(())
+}
+
+/// Explicit install only. The publication lock is not a scheduler or setup
+/// singleflight: it says whether another installer works in this root. While
+/// one does, this one waits and removes nothing. Holding the lock, a root
+/// with a receipt is the answer as it is; a root without one (an installer
+/// failed or was stopped) is cleared and installed again, never reused.
 pub fn install_admitted(
     plan: &InstallPlan,
     executor: &mut impl AdmittedExecutor,
@@ -944,16 +1001,22 @@ pub fn install_admitted(
     {
         return Err("unsafe_install_lock");
     }
-    lock.try_lock().map_err(|_| "installation_busy")?;
+    lock.lock().map_err(|_| "install_lock_wait")?;
+    let receipt = install_holding(plan, executor)?;
+    drop(lock);
+    Ok(receipt)
+}
+/// The install itself. The caller holds `install.lock` of the root.
+fn install_holding(
+    plan: &InstallPlan,
+    executor: &mut impl AdmittedExecutor,
+) -> Result<InstallationReceipt> {
+    // A receipt that is there but cannot be trusted is an error here: such a
+    // root is never cleared.
     if let Some(receipt) = read_receipt(plan)? {
         return Ok(receipt);
     }
-    if fs::read_dir(&plan.root)
-        .map_err(|_| "install_directory_read")?
-        .any(|e| e.map_or(true, |e| e.file_name() != "install.lock"))
-    {
-        return Err("installation_partial_requires_cleanup");
-    }
+    clear_unreceipted(plan)?;
     for sub in [
         "home",
         "config",
@@ -1012,7 +1075,6 @@ pub fn install_admitted(
     File::open(&plan.root)
         .and_then(|f| f.sync_all())
         .map_err(|_| "receipt_directory_sync")?;
-    drop(lock);
     Ok(receipt)
 }
 /// Internal worker activation, never a TaskSpec PATH override.

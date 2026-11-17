@@ -501,10 +501,16 @@ impl Setups {
             },
             None => match adapters::detect(&plan) {
                 Availability::Installed(receipt) => ToolPreparationPoll::Installed(receipt),
+                // An installer failed or was stopped in this root and none
+                // of this worker works there now (a live or unsettled one
+                // answers before this look): a new installer is started, and
+                // it clears the root under the install lock.
+                Availability::Unknown(adapters::UNRECEIPTED) | Availability::Missing => {
+                    ToolPreparationPoll::Pending
+                }
                 Availability::Unknown(e) | Availability::ManualRequired(e) => {
                     ToolPreparationPoll::Failed(PreparationFailure(e.into()))
                 }
-                Availability::Missing => ToolPreparationPoll::Pending,
             },
         })
     }
