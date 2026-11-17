@@ -37,7 +37,7 @@ pub fn identity(agent: &Agent) -> Result<WorkerIdentity, ApiError> {
     Ok(WorkerIdentity {
         capabilities: agent.capabilities(),
         worker_id: cfg.worker_id.clone(),
-        worker_boot_id: cfg.boot_id.clone(),
+        worker_boot_id: cfg.advertised_boot().clone(),
         agent_epoch: agent.agent_epoch(),
         profile: cfg.profile.clone(),
         profile_fingerprint: cfg.profile_fingerprint.clone(),

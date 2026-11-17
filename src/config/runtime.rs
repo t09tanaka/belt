@@ -233,6 +233,11 @@ impl ResolvedConfig {
 }
 
 impl WorkerRuntime {
+    pub(crate) fn with_instance(mut self, instance: Option<WorkerBootId>) -> Self {
+        self.agent.instance_id = instance;
+        self
+    }
+
     pub fn agent_config(&self) -> &AgentConfig {
         &self.agent
     }

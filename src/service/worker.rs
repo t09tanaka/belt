@@ -304,8 +304,8 @@ impl Drop for Worker {
     }
 }
 
-/// `boot_id` replaces the OS boot identity: a worker that has no boot of its
-/// own to be told apart by (an ephemeral one) names its start instead.
+/// An ephemeral worker advertises its per-start identity to the coordinator.
+/// Process recovery always compares against the actual OS boot.
 async fn run(
     spec: WorkerSpec,
     config: config::ResolvedConfig,
@@ -319,28 +319,24 @@ async fn run(
     // Enrollment is checked before any recorded old listener can be removed.
     bind(&spec)?;
     reconcile_socket(&spec, &socket)?;
-    let boot = match boot_id {
-        Some(boot) => boot,
-        None => {
-            let os = crate::platform::boot_id()
-                .ok_or_else(|| anyhow::anyhow!("OS boot identity unavailable"))?;
-            WorkerBootId::parse(&os)?
-        }
-    };
+    let os_boot = crate::platform::boot_id()
+        .ok_or_else(|| anyhow::anyhow!("OS boot identity unavailable"))?;
     let settings = config.runtime_settings()?;
     // Commands of this worker that still run in another scope: wait for
     // them, not serving, instead of failing into a restart loop.
     if !super::traffic_hold::wait_until_clear(&spec.state_dir, &spec.env).await? {
         return Ok(());
     }
-    let runtime = config.worker_runtime(WorkerInputs {
-        state_dir: spec.state_dir.clone(),
-        worker_id: spec.worker_id.clone(),
-        boot_id: boot,
-        supervisor_exe: spec.executable.clone(),
-        cluster_key_path: spec.cluster_key_path.clone(),
-        env: spec.env.clone(),
-    })?;
+    let runtime = config
+        .worker_runtime(WorkerInputs {
+            state_dir: spec.state_dir.clone(),
+            worker_id: spec.worker_id.clone(),
+            boot_id: WorkerBootId::parse(&os_boot)?,
+            supervisor_exe: spec.executable.clone(),
+            cluster_key_path: spec.cluster_key_path.clone(),
+            env: spec.env.clone(),
+        })?
+        .with_instance(boot_id);
     let agent = tokio::task::spawn_blocking(move || runtime.start_owned(agent_gate))
         .await?
         .map_err(|e| anyhow::anyhow!(e.message))?;
