@@ -2498,6 +2498,11 @@ fn seed_v3_ledger(scope: &Path) -> task_traffic_controller::lock::Lock {
 #[test]
 fn a_run_goes_on_while_the_scope_holds_a_v3_ledger() {
     let f = fx(vec![node("build", "exit 0")]);
+    // The seeded entry counts against the budget, and the default guards
+    // follow the load of the machine: fix the admission, this test is about
+    // the shape of the ledger.
+    crate::common::fixture_traffic_config(f.dir.path());
+    assert!(f.spec.traffic_state_dir.join("config.toml").is_file());
     let _lease = seed_v3_ledger(&f.spec.traffic_state_dir);
     let r = run(&f.spec).unwrap();
     assert_eq!(settled(&r).outcome(), Outcome::Succeeded, "{}", f.output());

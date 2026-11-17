@@ -29,8 +29,9 @@ async fn wait_with(
     pause_ms: fn(u32) -> u64,
 ) -> anyhow::Result<bool> {
     let scope = traffic::resolve(env).map_err(anyhow::Error::msg)?.state_dir;
-    let mut terminate = signal(SignalKind::terminate())?;
-    let mut interrupt = signal(SignalKind::interrupt())?;
+    // Listened to only once there is something to wait for: a worker that
+    // starts at once leaves the signals to the role's own handling.
+    let mut signals = None;
     let mut said: Option<Hold> = None;
     let mut looks = 0u32;
     loop {
@@ -51,6 +52,13 @@ async fn wait_with(
             eprintln!("worker: not serving yet: {message}");
             said = Some(hold.clone());
         }
+        if signals.is_none() {
+            signals = Some((
+                signal(SignalKind::terminate())?,
+                signal(SignalKind::interrupt())?,
+            ));
+        }
+        let (terminate, interrupt) = signals.as_mut().expect("just set");
         let stopped = tokio::select! {
             _ = terminate.recv() => true,
             _ = interrupt.recv() => true,

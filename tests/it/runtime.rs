@@ -145,6 +145,9 @@ fn the_worker_scope_follows_the_state_home_and_reaches_every_command() {
         input.env["XDG_STATE_HOME"]
     );
     assert!(!setup.env.contains_key("XDG_STATE_HOME"));
+    // The worker's own helpers (git, the workspace tools, the tool probes)
+    // run with what a step gets.
+    assert_eq!(profile.host_environment(), step);
 
     // Without anything to resolve the scope from, there is no worker.
     input.env.remove("XDG_STATE_HOME");

@@ -360,6 +360,15 @@ impl Profile {
     pub fn scope_environment(&self) -> &BTreeMap<String, String> {
         &self.scope_env
     }
+    /// What the worker's own helpers run with (tool probes, git, the
+    /// workspace tools): the toolchain environment and the scope variables,
+    /// as a command without an environment of its own gets them. A tool that
+    /// reads `XDG_CONFIG_HOME` answers a probe as it will answer in a step.
+    pub fn host_environment(&self) -> BTreeMap<String, String> {
+        let mut env = self.env.clone();
+        env.extend(self.scope_env.clone());
+        env
+    }
     pub fn execution_environment(
         &self,
         extra: &BTreeMap<String, String>,
@@ -376,8 +385,7 @@ impl Profile {
                     .into(),
             );
         }
-        let mut env = self.env.clone();
-        env.extend(self.scope_env.clone());
+        let mut env = self.host_environment();
         env.extend(extra.clone());
         Ok(env)
     }
@@ -770,7 +778,7 @@ impl Profile {
             "xcode" => &["-version"],
             _ => &["--version"],
         };
-        let version = bounded_probe(&path, args, &self.env, deadline())?;
+        let version = bounded_probe(&path, args, &self.host_environment(), deadline())?;
         let Some(version) = measured_version(tool, &version) else {
             return Ok(ToolObservation::Unknown);
         };
@@ -784,7 +792,12 @@ impl Profile {
             else {
                 return Ok(ToolObservation::Unknown);
             };
-            let sdk = bounded_probe(&xcrun, &["--show-sdk-path"], &self.env, deadline())?;
+            let sdk = bounded_probe(
+                &xcrun,
+                &["--show-sdk-path"],
+                &self.host_environment(),
+                deadline(),
+            )?;
             let sdk = PathBuf::from(sdk.trim());
             if !sdk.is_absolute() || !sdk.is_dir() {
                 return Ok(ToolObservation::Unknown);
@@ -1510,9 +1523,12 @@ mod tests {
         // The worker has one: passed on, and only as it is.
         let given = Profile::load(dir.path(), &with_state).unwrap();
         assert_eq!(step(&given)["XDG_STATE_HOME"], "/state");
-        // It is the scope's, not the toolchain's.
+        // It is the scope's, not the toolchain's; the worker's own helpers
+        // run with both.
         assert!(!given.environment().contains_key("XDG_STATE_HOME"));
         assert_eq!(given.scope_environment()["XDG_STATE_HOME"], "/state");
+        assert_eq!(given.host_environment(), step(&given));
+        assert_eq!(given.host_environment()["XDG_STATE_HOME"], "/state");
         assert!(given
             .execution_environment(&set(&[("XDG_STATE_HOME", "/other")]))
             .is_err());

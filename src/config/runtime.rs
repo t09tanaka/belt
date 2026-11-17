@@ -180,9 +180,11 @@ impl ResolvedConfig {
         let profile_definition = profile.definition_digest().clone();
         let env = profile.environment().clone();
         let scope_env = profile.scope_environment().clone();
+        // git and the workspace tools read `XDG_CONFIG_HOME` as a step does.
+        let host_env = profile.host_environment();
         agent.capability_profile = Some(Arc::new(profile));
         let mut setup = SetupConfig::new(inputs.state_dir, inputs.worker_id, inputs.supervisor_exe);
-        setup.env = env.clone();
+        setup.env = env;
         setup.scope_env = Some(scope_env);
         setup.profile_definition = Some(profile_definition);
         setup.profile_fingerprint = Some(agent.profile_fingerprint.clone());
@@ -198,7 +200,7 @@ impl ResolvedConfig {
         Ok(WorkerRuntime {
             agent,
             setup,
-            env,
+            env: host_env,
             cluster_key_path: inputs.cluster_key_path,
         })
     }
