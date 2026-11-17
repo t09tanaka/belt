@@ -2082,9 +2082,9 @@ async fn a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_w
 }
 
 // Readiness constrains only new placements; control traffic still reaches the peer.
-struct InputGatedWorker {
+pub(crate) struct InputGatedWorker {
     worker: Arc<FakeWorker>,
-    gate: Arc<remote_task_runner::coordinator::InputGate>,
+    pub(crate) gate: Arc<remote_task_runner::coordinator::InputGate>,
     invalidate_forecast: AtomicBool,
     attestor: Option<Arc<ToolchainAttestor>>,
 }
@@ -2126,6 +2126,9 @@ impl WorkerLink for InputGatedWorker {
     fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
         Some(self.gate.placement_inputs())
     }
+    fn input_refusals(&self) -> Vec<(RunId, String)> {
+        self.gate.input_refusals()
+    }
     fn call(
         &self,
         request: Request,
@@ -2146,7 +2149,7 @@ impl WorkerLink for InputGatedWorker {
         })
     }
 }
-fn gated_worker(worker: &Arc<FakeWorker>) -> Arc<InputGatedWorker> {
+pub(crate) fn gated_worker(worker: &Arc<FakeWorker>) -> Arc<InputGatedWorker> {
     Arc::new(InputGatedWorker {
         worker: worker.clone(),
         gate: Arc::default(),
@@ -2154,7 +2157,7 @@ fn gated_worker(worker: &Arc<FakeWorker>) -> Arc<InputGatedWorker> {
         attestor: None,
     })
 }
-fn ready_input(
+pub(crate) fn ready_input(
     task: &remote_task_runner::storage::QueuedTask,
 ) -> remote_task_runner::coordinator::ReadyInput {
     remote_task_runner::coordinator::ReadyInput {

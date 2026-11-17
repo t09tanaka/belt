@@ -28,6 +28,46 @@ pub fn merge_costs(measured: Costs, model: Costs) -> Costs {
     costs
 }
 
+/// How a worker stands for a task that waits in the queue, by the input of
+/// its run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Gate {
+    /// It is asked for a forecast: the source is ready there, or the parent
+    /// measured what sending it there takes.
+    Asked,
+    /// It did not take the input of the run; left out by name, with why.
+    InputRefused(String),
+    /// It does not hold the source and nothing is measured: not asked, and
+    /// not named in the decision.
+    NotReady,
+}
+
+/// The gate a placement puts before the forecast of a queued task.
+/// `refusal` is the reason of a refusal that still holds (none for a worker
+/// where the input is ready).
+pub fn source_gate(ready: bool, refusal: Option<String>, measured_cold: bool) -> Gate {
+    match refusal {
+        Some(why) => Gate::InputRefused(why),
+        None if ready || measured_cold => Gate::Asked,
+        None => Gate::NotReady,
+    }
+}
+
+/// A placement makes no decision for a queued task while workers are
+/// attached and none of them holds the source or refused the input:
+/// `(ready, refused the input)` of every worker the tick may place on.
+pub fn waits_for_input(open: &[(bool, bool)]) -> bool {
+    !open.is_empty() && !open.iter().any(|(ready, refused)| *ready || *refused)
+}
+
+/// Whether a forecast makes its worker a candidate. A worker that holds the
+/// source is compared whatever it said (without a number, as unknown); one
+/// that does not is compared only by an answer that is usable and not yet
+/// expired.
+pub fn forecast_counts(ready: bool, unusable: bool, ttl_left_ms: u64) -> bool {
+    ready || (!unusable && ttl_left_ms > 0)
+}
+
 fn time(ms: Option<u64>) -> String {
     match ms {
         Some(ms) => format!("{ms} ms"),
@@ -263,6 +303,43 @@ mod tests {
             merge_costs(Costs::default(), Costs::default()),
             Costs::default()
         );
+    }
+
+    #[test]
+    fn a_refusal_names_the_worker_and_only_a_ready_or_measured_worker_is_asked() {
+        let why = || Some("no room".to_string());
+        assert_eq!(
+            source_gate(false, why(), false),
+            Gate::InputRefused("no room".to_string())
+        );
+        assert_eq!(
+            source_gate(false, why(), true),
+            Gate::InputRefused("no room".to_string())
+        );
+        assert_eq!(source_gate(true, None, false), Gate::Asked);
+        assert_eq!(source_gate(false, None, true), Gate::Asked);
+        assert_eq!(source_gate(true, None, true), Gate::Asked);
+        assert_eq!(source_gate(false, None, false), Gate::NotReady);
+    }
+
+    #[test]
+    fn no_decision_is_made_only_while_workers_are_there_and_none_holds_or_refused_the_input() {
+        assert!(!waits_for_input(&[]));
+        assert!(waits_for_input(&[(false, false)]));
+        assert!(waits_for_input(&[(false, false), (false, false)]));
+        assert!(!waits_for_input(&[(false, false), (true, false)]));
+        assert!(!waits_for_input(&[(false, true), (false, false)]));
+        assert!(!waits_for_input(&[(true, true)]));
+    }
+
+    #[test]
+    fn a_worker_without_the_source_counts_only_by_a_usable_answer_that_has_not_expired() {
+        assert!(forecast_counts(true, true, 0));
+        assert!(forecast_counts(true, false, 0));
+        assert!(forecast_counts(false, false, 1));
+        assert!(!forecast_counts(false, false, 0));
+        assert!(!forecast_counts(false, true, 1));
+        assert!(!forecast_counts(false, true, 0));
     }
 
     #[test]

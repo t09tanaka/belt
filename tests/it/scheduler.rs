@@ -8,7 +8,9 @@
 //!
 //! No process is started here.
 
-use crate::coordinator::{attempts, enqueue, fx, only, queued, FakeWorker, Fx, Lost, Op, Says};
+use crate::coordinator::{
+    attempts, enqueue, fx, gated_worker, only, queued, ready_input, FakeWorker, Fx, Lost, Op, Says,
+};
 use remote_task_runner::coordinator::{Coordinator, CoordinatorError, WorkerLink};
 use remote_task_runner::error::{ApiError, BlockedReason, ErrorCode};
 use remote_task_runner::ids::*;
@@ -410,6 +412,67 @@ async fn a03_a_cold_worker_that_is_set_up_quickly_beats_the_queue() {
     assert_eq!(d.compared[0].predicted_ms, Some(21_000));
     assert_eq!(d.compared[1].predicted_ms, Some(31_000));
     assert_eq!(d.why, Why::Earliest);
+}
+
+/// With input gates, the preview of a queued task follows the input of its
+/// run as the placement does: no decision while no worker holds the source,
+/// only the workers that hold it are asked, and a worker that refused the
+/// input is left out by name.
+#[tokio::test]
+async fn a_preview_of_a_queued_task_follows_the_input_of_its_run_as_the_placement_does() {
+    for refuses in [false, true] {
+        let f = fx();
+        let (a, b) = (f.worker("w-a", (2, 1)), f.worker("w-b", (2, 1)));
+        let c = f.open(&[]);
+        let (gate_a, gate_b) = (gated_worker(&a), gated_worker(&b));
+        c.attach(a.id.clone(), gate_a.clone()).await;
+        c.attach(b.id.clone(), gate_b.clone()).await;
+        let task = enqueue(&c, 1).await.remove(0);
+        let input = c.store().queued_tasks(1).unwrap().remove(0);
+
+        // Nobody holds the source: a tick decides nothing, and so does the preview.
+        let before = demand(&c, &task, &[&a, &b]);
+        let preview = c.estimate_task(task.clone()).await.unwrap();
+        assert!(preview.online && preview.conditional);
+        assert_eq!(preview.decision, None);
+        let waits = |note: &String| note.starts_with("no decision yet");
+        assert!(preview.assumptions.iter().any(waits), "{}", preview.human());
+        assert_eq!(demand(&c, &task, &[&a, &b]), before);
+        assert!(c.tick().await.unwrap().placed.is_empty());
+        assert_eq!(c.scheduler().waiting_reason(&task), None);
+
+        // The source is ready on `w-b` only; `w-a` (the lower id, which
+        // would win a tie) does not hold it, or refused it.
+        if refuses {
+            let generation = gate_a.gate.generation();
+            assert!(gate_a
+                .gate
+                .refuse_input(generation, &input.run_id, "no room for the plan"));
+        }
+        gate_b
+            .gate
+            .publish(gate_b.gate.generation(), ready_input(&input));
+        let before = demand(&c, &task, &[&a, &b]);
+        let mut previews = Vec::new();
+        for _ in 0..10 {
+            previews.push(c.estimate_task(task.clone()).await.unwrap());
+        }
+        assert_eq!(demand(&c, &task, &[&a, &b]), before);
+        c.tick().await.unwrap();
+        let placed = reason(&c, &only(&c, &task).attempt_id);
+        assert_eq!(compared(&placed), ["w-b"]);
+        let out: &[(&str, Exclusion)] = if refuses {
+            &[("w-a", Exclusion::InputRefused)]
+        } else {
+            &[]
+        };
+        assert_eq!(excluded(&placed), out);
+        for preview in previews {
+            let not_asked = |note: &String| note.starts_with("w-a: not asked");
+            assert_eq!(preview.assumptions.iter().any(not_asked), !refuses);
+            assert_eq!(preview.decision, Some(placed.clone()));
+        }
+    }
 }
 
 // ------------------------------------------------------------------- A04

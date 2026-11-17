@@ -463,7 +463,7 @@ workerはactive task数と未開始prefetch数の両方を制限する。既定�
 
 ## 読み取り専用の見積（`estimate`）
 
-`estimate -- <command>` は未投入のcommandを、`estimate --task <ID>` は保存済みtaskの入力（commands・env・requirements・toolchains・出力計画・source）を使う仮の追加実行を見積もる。どちらも、既に起動している認証済みownerにだけ照会する。ownerを起動せず、停止中は `online: false` とし、実行・待ち・転送・setup・回収をすべてunknownと答える。
+`estimate -- <command>` は未投入のcommandを、`estimate --task <ID>` は保存済みtaskの入力（commands・env・requirements・toolchains・出力計画・source）を使って見積もる（queueで配置を待っているtaskならその配置、それ以外なら仮の追加実行）。どちらも、既に起動している認証済みownerにだけ照会する。ownerを起動せず、停止中は `online: false` とし、実行・待ち・転送・setup・回収をすべてunknownと答える。
 
 見積は読み取り専用である。親のqueue・task・attempt・配置・未ACK需要・待機理由（`task_waiting`）・coordinator epochを変えず、workerへは `inspect`、frozen toolchainの照合、forecastの読み取り照会だけを送る。workerのledger entry・lease・job・受理予約も増えない。実測の転送でcoldなworkerを選んでも、配置のときのprefetchは起こさない。何回実行しても同じである（A06）。
 
@@ -475,13 +475,24 @@ workerはactive task数と未開始prefetch数の両方を制限する。既定�
 - そのtaskを断ったworker（`worker_cannot_run`）、CI taskを受け取れないworker、drain中・満杯・能力が合わないworkerは、配置と同じ理由で外す。
 - 比較・同点規則・priorityの補正は配置と同じ `decide` を使う。
 
-したがって、同じ状態（同じworker・同じ負荷・同じcost model・同じforecastの答え）なら、見積が示すworker・勝った理由・比べた順序・内訳は、続けて行う配置の配置理由と一致する。ただし次の点は配置と異なり、これらに当たる状態では答えが違うことがある。
+queueで配置を待っているtask（配置が今拾える状態のtask）の見積は、続けて行う配置が実際に決めることを答える。そのため、runの入力についても配置と同じ条件を写す。
 
-- 見積は、sourceがそのworkerでreadyかどうかで候補を絞らない。仮の追加実行を答えるためで、終了済みtaskの入力がworkerに残っていなくても比べる。readyを確認できた転送だけ、標本数0の「確認済みready」として0にする。
-- どのworkerもreadyでないために配置が決定を見送る場合や、古いcoordinator epochを理由にforecastを断られた場合、見積はfenceせず、答えの無いworkerとして外す。
-- 依存するjobを待って保留されているCI taskは、配置は飛ばすが、見積は仮の実行として比べる。
-- 複数の理由で外れるworker（たとえば満杯で、能力も合わない）は、外す結論は同じだが、記録する理由が配置と違うことがある（配置は満杯、見積は能力不一致を先に見る）。
-- 未投入のcommandにはsourceも出力計画も無いので、転送・setup・回収はunknownのままである。
+- sourceがreadyなworkerと、readyではないが親がそこへの転送を実測済みのworkerだけにforecastを照会する。どちらでもないworkerは照会せず、配置理由にも載らない。見積は前提の欄に「照会しなかった」と理由を示す。
+- runの入力を受け取らなかったworkerは、配置と同じく理由付き（`input_refused`）で外す。
+- attach中のworkerがあり、そのどれもsourceを持たず入力も断っていない間、配置はそのtaskについて決定をしない（待機理由も記録しない）。見積も決定を返さず（`decision` は `null`）、まだ決定が無いこととその理由を前提の欄に示す。
+- sourceを持たないworkerは、使えて期限内のforecastの答えがあるときだけ比べる。errorの答えや期限切れなら、forecast無しとして外す。sourceを持つworkerは、errorの答えでも数値の無い候補として比べる。
+- sourceを持たないworkerが選ばれたときは、配置がまずsourceをそこへ送り、readyになってから決め直すことを前提の欄に示す。見積はその転送を始めない。
+- 外す理由を調べる順序は配置に合わせ、到達不能・drain中、満杯、入力の拒否、sourceの有無、能力、そのtaskの拒否の順とする。
+
+したがって、同じ状態（同じworker・同じ負荷・同じ入力の状態・同じcost model・同じforecastの答え）なら、queueにあるtaskの見積が示すworker・勝った理由・比べた順序・内訳・外したworkerは、続けて行う配置の配置理由と一致し、配置が決定をしない状態では見積も決定を返さない。
+
+queueに無い保存済みtask（実行中・終了済み・取消済み、依存するjobを待って保留されているCI task）の見積は、その入力を使う仮の追加実行を答える。配置はこれらのtaskを拾わないので、比べる相手の配置は無い。この場合はsourceがworkerでreadyかどうかで候補を絞らず、errorで答えたworkerを数値の無い候補として比べ、readyを確認できた転送だけを標本数0の「確認済みready」として0にする。
+
+次の点は、queueにあるtaskでも配置と異なる。
+
+- 古いcoordinator epochを理由にforecastを断られたとき、配置は自分を止める（fence）が、見積は止めず、答えの無いworkerとして外す。
+- 能力が合わないworkerの `unmet` の文言は、見積の方が詳しいことがある（frozen toolchainの照合結果など）。外す結論は同じである。
+- 未投入のcommandにはsourceも出力計画も無いので、上の入力の条件は使わず、転送・setup・回収はunknownのままである。
 
 setupの見積は、実測の観測を数値へ変換するモデルが無いため、保存済みtaskでもunknownとする（cost modelが値を持つ場合を除く）。確認できた準備identityは前提として表示するだけで、setupの時間・readyの遅れ・admissionを変えない。
 

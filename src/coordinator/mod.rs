@@ -1698,10 +1698,11 @@ impl Coordinator {
                 };
                 // An unusable/expired cold forecast cannot authorize a wait
                 // hint; ready workers retain the existing unknown-outlook rule.
-                if !ready(w)
-                    && (outlook.unusable.is_some()
-                        || forecast_ttl.get(&w.worker_id).copied().unwrap_or(0) == 0)
-                {
+                if !scheduler::preview::forecast_counts(
+                    ready(w),
+                    outlook.unusable.is_some(),
+                    forecast_ttl.get(&w.worker_id).copied().unwrap_or(0),
+                ) {
                     excluded.push(Excluded {
                         worker_id: w.worker_id.clone(),
                         why: Exclusion::NoForecast,
