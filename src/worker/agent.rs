@@ -1900,6 +1900,8 @@ impl Agent {
                 json!({ "locator": locator }),
             );
         }
+        // The frozen plans no unfinished attempt names go with the attempts.
+        super::ci_task::gc_plans(&self.cfg.state_dir, &self.store, self.cfg.retention_ms);
         Ok(report)
     }
 
@@ -2207,6 +2209,7 @@ impl Agent {
             && self.store.tombstone(&r.attempt_id).map_err(api)?.is_none();
         if fresh {
             policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
+            super::ci_task::check_accepted(&self.cfg.state_dir, &r.payload)?;
             self.check_capabilities(&r.payload)?;
             self.host.admit(&r.payload)?;
             for c in &r.payload.commands {
@@ -2703,6 +2706,7 @@ impl Agent {
         crate::forecast::answer(
             &self.cfg.traffic_state_dir,
             self.cfg.traffic_config.as_deref(),
+            &self.cfg.state_dir,
             &ident,
             &attempts,
             max_epoch,

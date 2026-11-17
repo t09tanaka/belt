@@ -898,7 +898,10 @@ pub struct AttemptPayload {
     pub ci_task: Option<CiTask>,
 }
 
-/// The `hello` feature of [`CiTask`]: offered, never required.
+/// The `hello` feature of [`CiTask`]: never required. A worker offers it
+/// only once it can also be sent the frozen plan; until that ships it is in
+/// no build's `SUPPORTED_FEATURES`, and a CI task that was not negotiated is
+/// refused.
 pub const CI_TASK_FEATURE: &str = "ci_task_v1";
 
 /// One task of a frozen CI plan (spec chapter 7). The plan itself is not

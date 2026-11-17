@@ -328,6 +328,7 @@ fn a08_a_node_is_one_demand_before_it_registers_after_and_once_finished() {
     let nodes = remote_task_runner::forecast::plan::accepted_nodes(
         &b,
         &serde_json::from_value(attempts[0].spec.clone()).unwrap(),
+        0,
     )
     .unwrap();
     let (_, report) =

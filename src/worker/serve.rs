@@ -52,6 +52,20 @@ pub async fn serve_connection(
     cluster_id: ClusterId,
     permits: Arc<Semaphore>,
 ) -> Result<(), ServeError> {
+    serve_connection_offering(agent, io, cluster_id, permits, &[]).await
+}
+
+/// [`serve_connection`] with `more_features` offered in `hello` beside the
+/// ones every worker of this build offers. For a feature whose worker side
+/// is built and tested before the build offers it (`ci_task_v1`, until the
+/// frozen plan can be delivered).
+pub async fn serve_connection_offering(
+    agent: Arc<Agent>,
+    io: Io,
+    cluster_id: ClusterId,
+    permits: Arc<Semaphore>,
+    more_features: &[&str],
+) -> Result<(), ServeError> {
     let identity_agent = agent.clone();
     let me = tokio::task::spawn_blocking(move || identity(&identity_agent))
         .await
@@ -62,7 +76,10 @@ pub async fn serve_connection(
             ))
         })?
         .map_err(ServeError::Identity)?;
-    let accepted = accept(io, ServerConfig::new(cluster_id, me)).await?;
+    let mut config = ServerConfig::new(cluster_id, me);
+    let offered = &mut config.local.features;
+    offered.extend(more_features.iter().map(|f| f.to_string()));
+    let accepted = accept(io, config).await?;
     let session = Session {
         coordinator_epoch: accepted.coordinator_epoch,
     };

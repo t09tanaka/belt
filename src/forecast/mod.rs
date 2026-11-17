@@ -89,15 +89,28 @@ fn compute_target(
     Ok((answer, fc.overlay))
 }
 
+/// How many commands an accepted CI task starts, as far as the frozen plan
+/// the worker holds tells (0 when it does not).
+pub type CiSteps<'a> = &'a dyn Fn(&crate::wire::CiTask) -> usize;
+
+/// The steps of the CI tasks, read from the plans kept under `worker_state`.
+fn ci_steps_in(worker_state: &Path) -> impl Fn(&crate::wire::CiTask) -> usize + '_ {
+    move |task| crate::worker::ci_task::planned_steps(worker_state, task)
+}
+
 /// The nodes of the attempts the worker has not finished. An attempt whose
 /// record cannot be read is an error: leaving its demand out would show a
 /// busy worker as free.
-fn accepted_of(attempts: &[AcceptedAttempt]) -> Result<Vec<AcceptedNode>, ApiError> {
+fn accepted_of(
+    attempts: &[AcceptedAttempt],
+    ci_steps: CiSteps<'_>,
+) -> Result<Vec<AcceptedNode>, ApiError> {
     let mut out = Vec::new();
     for rec in attempts {
         let payload: AttemptPayload = serde_json::from_value(rec.spec.clone())
             .map_err(|e| internal(&format!("attempt {} payload", rec.attempt_id), e))?;
-        let nodes = plan::accepted_nodes(&rec.attempt_id, &payload)
+        let steps = payload.ci_task.as_ref().map_or(0, ci_steps);
+        let nodes = plan::accepted_nodes(&rec.attempt_id, &payload, steps)
             .map_err(|e| internal(&format!("attempt {}", rec.attempt_id), e))?;
         out.extend(nodes);
     }
@@ -138,6 +151,21 @@ pub fn answer_with(
     max_epoch: CoordinatorEpoch,
     req: &ForecastRequest,
 ) -> Result<ForecastResponse, ApiError> {
+    // Without the worker's plans an accepted CI task has no known step.
+    answer_with_ci(ctx, cfg, ident, attempts, max_epoch, req, &|_| 0)
+}
+
+/// [`answer_with`]; `ci_steps` says how many commands an accepted CI task
+/// starts, so that its steps are demand before they are registered.
+pub fn answer_with_ci(
+    ctx: &Context,
+    cfg: &Config,
+    ident: &Ident,
+    attempts: &[AcceptedAttempt],
+    max_epoch: CoordinatorEpoch,
+    req: &ForecastRequest,
+    ci_steps: CiSteps<'_>,
+) -> Result<ForecastResponse, ApiError> {
     if req.coordinator_epoch < max_epoch {
         return Err(ApiError::new(
             ErrorCode::StaleEpoch,
@@ -150,7 +178,7 @@ pub fn answer_with(
     // Refuse an oversized request before any file is read.
     plan::check_request(req).map_err(plan::RequestError::into_api)?;
     let (accepted, insp) = gather(
-        || accepted_of(attempts),
+        || accepted_of(attempts, ci_steps),
         || inspect_with(ctx, cfg).map_err(|e| internal("inspect", e)),
         |node| {
             // A sidecar that cannot be read keeps the demand.
@@ -167,6 +195,7 @@ pub fn answer_with(
 pub fn answer(
     traffic_state_dir: &Path,
     traffic_config: Option<&Path>,
+    worker_state: &Path,
     ident: &Ident,
     attempts: &[AcceptedAttempt],
     max_epoch: CoordinatorEpoch,
@@ -177,7 +206,16 @@ pub fn answer(
         .unwrap_or_else(|| traffic_state_dir.join("config.toml"));
     let paths = Paths::new(traffic_state_dir, config_path);
     let cfg = Config::load(paths.config_file()).map_err(|e| internal("traffic config", e))?;
-    answer_with(&Context::new(paths), &cfg, ident, attempts, max_epoch, req)
+    let steps = ci_steps_in(worker_state);
+    answer_with_ci(
+        &Context::new(paths),
+        &cfg,
+        ident,
+        attempts,
+        max_epoch,
+        req,
+        &steps,
+    )
 }
 
 /// Derive command history only from an existing canonical clone, without preparing it.
@@ -276,7 +314,7 @@ pub fn answer_command(
         })
         .transpose()?;
     let (accepted, insp) = gather(
-        || accepted_of(attempts),
+        || accepted_of(attempts, &ci_steps_in(worker_state)),
         || inspect_with(&ctx, &cfg).map_err(|e| internal("inspect", e)),
         |node| {
             if let Loaded::Ok(sc) = managed::load_sidecar(&ctx, &node.command_id) {
