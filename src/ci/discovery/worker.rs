@@ -79,21 +79,14 @@ impl DiscoveryStep {
         result: &local_ci::TaskResult,
     ) -> anyhow::Result<WorkerListing> {
         use std::io::Read;
-        use std::os::unix::fs::OpenOptionsExt;
         let step_log = |index: usize, cap: u64| -> Option<String> {
             let ran = result.jobs.first()?.steps.get(index)?;
             if ran.exit != Some(0) {
                 return None;
             }
             let path = ran.log.as_ref()?;
-            if !path.starts_with(run_dir) {
-                return None;
-            }
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-                .open(path)
-                .ok()?;
+            let relative = path.strip_prefix(run_dir).ok()?;
+            let file = crate::platform::open_beneath(run_dir,relative).ok()?;
             if !file.metadata().ok()?.is_file() {
                 return None;
             }

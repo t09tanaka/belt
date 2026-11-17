@@ -263,7 +263,10 @@ impl WorkerListing {
     ) -> anyhow::Result<ShardRequest> {
         let target = self.step.target(plan)?;
         let runner = adapter(target.command, &self.runner_version, "", isolation)?;
-        let discovered = validated_listing(self.discovered.clone(), &runner.info().runner);
+        let mut discovered = validated_listing(self.discovered.clone(), &runner.info().runner);
+        if let Some(reason) = reports::job_requirement(plan,&self.step) {
+            if !discovered.blocked.contains(&reason) {discovered.blocked.push(reason);}
+        }
         let mut costs = costs.clone();
         costs.fixed_cost_ms = costs
             .fixed_cost_ms
