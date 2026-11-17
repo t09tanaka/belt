@@ -2117,7 +2117,7 @@ impl Agent {
                     agent_epoch: self.epoch,
                     forecast_ttl_ms: self.cfg.forecast_ttl_ms,
                 };
-                crate::forecast::answer_command(
+                crate::forecast::answer_worker_command(
                     &self.cfg.traffic_state_dir,
                     self.cfg.traffic_config.as_deref(),
                     &self.cfg.state_dir,
@@ -2126,10 +2126,12 @@ impl Agent {
                         .as_ref()
                         .map(|_| &self.cfg.profile_fingerprint),
                     &ident,
-                    &attempts,
+                    crate::forecast::AcceptedWork {
+                        attempts: &attempts,
+                        installs: &|payload| self.pending_tool_installs(payload),
+                    },
                     max_epoch,
                     &r,
-                    &|payload| self.pending_tool_installs(payload),
                 )
                 .map(Response::ForecastCommand)
             }
@@ -2723,15 +2725,17 @@ impl Agent {
             agent_epoch: self.epoch,
             forecast_ttl_ms: self.cfg.forecast_ttl_ms,
         };
-        crate::forecast::answer(
+        crate::forecast::answer_worker(
             &self.cfg.traffic_state_dir,
             self.cfg.traffic_config.as_deref(),
             &self.cfg.state_dir,
             &ident,
-            &attempts,
+            crate::forecast::AcceptedWork {
+                attempts: &attempts,
+                installs: &|payload| self.pending_tool_installs(payload),
+            },
             max_epoch,
             &r,
-            &|payload| self.pending_tool_installs(payload),
         )
     }
 

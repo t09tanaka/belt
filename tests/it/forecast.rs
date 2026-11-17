@@ -531,7 +531,6 @@ fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
             &[],
             CoordinatorEpoch(1),
             &req,
-            &|_| 0,
         )
         .unwrap();
         assert_eq!(result.target.runtime_source, RuntimeSource::Measured);
@@ -551,7 +550,6 @@ fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
         &[],
         CoordinatorEpoch(1),
         &missing,
-        &|_| 0,
     )
     .unwrap();
     assert_ne!(result.target.runtime_source, RuntimeSource::Measured);
@@ -566,8 +564,7 @@ fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
         &ident(),
         &[],
         CoordinatorEpoch(1),
-        &missing,
-        &|_| 0,
+        &missing
     )
     .is_err());
 }

@@ -108,6 +108,21 @@ pub type CiSteps<'a> = &'a dyn Fn(&crate::wire::CiTask) -> usize;
 /// needs none or the worker cannot tell).
 pub type ToolInstalls<'a> = &'a dyn Fn(&AttemptPayload) -> usize;
 
+/// Snapshot of accepted work, including installation demand from the worker registry.
+pub(crate) struct AcceptedWork<'a> {
+    pub attempts: &'a [AcceptedAttempt],
+    pub installs: ToolInstalls<'a>,
+}
+
+impl<'a> AcceptedWork<'a> {
+    fn without_registry(attempts: &'a [AcceptedAttempt]) -> Self {
+        Self {
+            attempts,
+            installs: &|_| 0,
+        }
+    }
+}
+
 /// The steps of the CI tasks, read from the plans kept under `worker_state`.
 fn ci_steps_in(worker_state: &Path) -> impl Fn(&crate::wire::CiTask) -> usize + '_ {
     move |task| crate::worker::ci_task::planned_steps(worker_state, task)
@@ -172,7 +187,7 @@ pub fn answer_with(
     req: &ForecastRequest,
 ) -> Result<ForecastResponse, ApiError> {
     // Without the worker's plans an accepted CI task has no known step.
-    answer_with_ci(ctx, cfg, ident, attempts, max_epoch, req, &|_| 0, &|_| 0)
+    answer_with_ci(ctx, cfg, ident, attempts, max_epoch, req, &|_| 0)
 }
 
 /// [`answer_with`]; `ci_steps` says how many commands an accepted CI task
@@ -185,7 +200,26 @@ pub fn answer_with_ci(
     max_epoch: CoordinatorEpoch,
     req: &ForecastRequest,
     ci_steps: CiSteps<'_>,
-    installs: ToolInstalls<'_>,
+) -> Result<ForecastResponse, ApiError> {
+    answer_with_work(
+        ctx,
+        cfg,
+        ident,
+        AcceptedWork::without_registry(attempts),
+        max_epoch,
+        req,
+        ci_steps,
+    )
+}
+
+pub(crate) fn answer_with_work(
+    ctx: &Context,
+    cfg: &Config,
+    ident: &Ident,
+    work: AcceptedWork<'_>,
+    max_epoch: CoordinatorEpoch,
+    req: &ForecastRequest,
+    ci_steps: CiSteps<'_>,
 ) -> Result<ForecastResponse, ApiError> {
     if req.coordinator_epoch < max_epoch {
         return Err(ApiError::new(
@@ -199,7 +233,7 @@ pub fn answer_with_ci(
     // Refuse an oversized request before any file is read.
     plan::check_request(req).map_err(plan::RequestError::into_api)?;
     let (accepted, insp) = gather(
-        || accepted_of(attempts, ci_steps, installs),
+        || accepted_of(work.attempts, ci_steps, work.installs),
         || inspect_with(ctx, cfg).map_err(|e| internal("inspect", e)),
         |node| {
             // A sidecar that cannot be read keeps the demand.
@@ -221,7 +255,26 @@ pub fn answer(
     attempts: &[AcceptedAttempt],
     max_epoch: CoordinatorEpoch,
     req: &ForecastRequest,
-    installs: ToolInstalls<'_>,
+) -> Result<ForecastResponse, ApiError> {
+    answer_worker(
+        traffic_state_dir,
+        traffic_config,
+        worker_state,
+        ident,
+        AcceptedWork::without_registry(attempts),
+        max_epoch,
+        req,
+    )
+}
+
+pub(crate) fn answer_worker(
+    traffic_state_dir: &Path,
+    traffic_config: Option<&Path>,
+    worker_state: &Path,
+    ident: &Ident,
+    work: AcceptedWork<'_>,
+    max_epoch: CoordinatorEpoch,
+    req: &ForecastRequest,
 ) -> Result<ForecastResponse, ApiError> {
     let config_path = traffic_config
         .map(Path::to_path_buf)
@@ -229,15 +282,14 @@ pub fn answer(
     let paths = Paths::new(traffic_state_dir, config_path);
     let cfg = Config::load(paths.config_file()).map_err(|e| internal("traffic config", e))?;
     let steps = ci_steps_in(worker_state);
-    answer_with_ci(
+    answer_with_work(
         &Context::new(paths),
         &cfg,
         ident,
-        attempts,
+        work,
         max_epoch,
         req,
         &steps,
-        installs,
     )
 }
 
@@ -252,7 +304,29 @@ pub fn answer_command(
     attempts: &[AcceptedAttempt],
     max_epoch: CoordinatorEpoch,
     req: &crate::wire::ForecastCommandRequest,
-    installs: ToolInstalls<'_>,
+) -> Result<ForecastResponse, ApiError> {
+    answer_worker_command(
+        traffic,
+        config,
+        worker_state,
+        profile,
+        ident,
+        AcceptedWork::without_registry(attempts),
+        max_epoch,
+        req,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn answer_worker_command(
+    traffic: &Path,
+    config: Option<&Path>,
+    worker_state: &Path,
+    profile: Option<&crate::ids::Digest>,
+    ident: &Ident,
+    work: AcceptedWork<'_>,
+    max_epoch: CoordinatorEpoch,
+    req: &crate::wire::ForecastCommandRequest,
 ) -> Result<ForecastResponse, ApiError> {
     if req.version != 1
         || req.argv.is_empty()
@@ -339,7 +413,7 @@ pub fn answer_command(
         })
         .transpose()?;
     let (accepted, insp) = gather(
-        || accepted_of(attempts, &ci_steps_in(worker_state), installs),
+        || accepted_of(work.attempts, &ci_steps_in(worker_state), work.installs),
         || inspect_with(&ctx, &cfg).map_err(|e| internal("inspect", e)),
         |node| {
             if let Loaded::Ok(sc) = managed::load_sidecar(&ctx, &node.command_id) {
