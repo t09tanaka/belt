@@ -219,7 +219,10 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
   box. Every other row is dim gray, its bar filled with a lighter gray. In
   `overview`, the default outside a worktree, each worktree of a repository
   with several gets its own color (a lone worktree stays gray), again for the
-  whole row. The palette has no red or yellow; red is only for an overrun.
+  whole row. The palette is five clearly different hues (blue, pink, cyan,
+  purple, green) with no red or yellow; red is only for an overrun. With more
+  worktrees than colors a repeated color is shown with its worktree name
+  underlined.
   The bar of a waiting row is the empty track in both.
 
   `exec` records the worktree (`git rev-parse --show-toplevel`) and branch

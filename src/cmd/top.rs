@@ -54,6 +54,9 @@ pub struct Wt {
     /// Where `top` was started.
     pub mine: bool,
     pub color: Color,
+    /// The color was already given to another worktree of the repository
+    /// (more worktrees than colors): the worktree cell is underlined.
+    pub repeat: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -369,18 +372,19 @@ fn why(
 
 // ------------------------------------------------------------- worktrees
 
-/// Colors a worktree can get in the overview. No red or anything that
-/// reads as red (overruns), no yellow (idle), no gray (a repository with a
-/// single worktree), nothing too dark to read on a dark background.
-const WT_COLORS: [Color; 8] = [
-    Color::LightBlue,
-    Color::LightCyan,
-    Color::LightGreen,
-    Color::LightMagenta,
-    Color::Cyan,
-    Color::Green,
-    Color::Magenta,
-    Color::Indexed(141),
+/// Colors a worktree can get in the overview, as xterm-256 indices: blue,
+/// pink, cyan, purple, green. Each is a different hue, and the order is the
+/// order a worktree falls back through when its hash slot is taken, so
+/// neighbors are far apart (a test checks the distance). No red or anything
+/// that reads as red (overruns), no yellow (idle), no gray (a repository
+/// with a single worktree), nothing too dark to read on a dark background
+/// or too pale on a light one.
+const WT_COLORS: [Color; 5] = [
+    Color::Indexed(33),  // blue
+    Color::Indexed(213), // pink
+    Color::Indexed(44),  // cyan
+    Color::Indexed(99),  // purple
+    Color::Indexed(78),  // green
 ];
 
 /// The color of the current worktree's rows in `Focus` (#3fb950), apart from
@@ -451,17 +455,19 @@ fn fnv1a(s: &str) -> u64 {
 /// Each path starts at the palette slot its hash picks; if a worktree
 /// before it (in sorted path order, so the result does not depend on the
 /// order given) already took that color, it moves on to the next free slot.
-/// Colors repeat only when there are more worktrees than colors. Gray when
-/// there is a single worktree: there is nothing to tell apart.
-fn repo_colors(paths: &[&str]) -> Vec<Color> {
+/// Colors repeat only when there are more worktrees than colors; a repeat is
+/// flagged (`true`) so it can be drawn differently. Gray when there is a
+/// single worktree: there is nothing to tell apart.
+fn repo_colors(paths: &[&str]) -> Vec<(Color, bool)> {
     if paths.len() <= 1 {
-        return vec![Color::Gray; paths.len()];
+        return vec![(Color::Gray, false); paths.len()];
     }
     let mut sorted: Vec<&str> = paths.to_vec();
     sorted.sort_unstable();
     let n = WT_COLORS.len();
     let mut taken = vec![false; n];
-    let mut slot_of: HashMap<&str, usize> = HashMap::new();
+    let mut used = vec![false; n];
+    let mut slot_of: HashMap<&str, (usize, bool)> = HashMap::new();
     for p in sorted {
         let start = (fnv1a(p) % n as u64) as usize;
         let slot = (0..n)
@@ -469,14 +475,22 @@ fn repo_colors(paths: &[&str]) -> Vec<Color> {
             .find(|&c| !taken[c])
             .unwrap_or(start);
         taken[slot] = true;
+        let repeat = used[slot];
+        used[slot] = true;
         // Past the palette size every slot is taken: start over, so the
         // repeats are spread as evenly as the palette allows.
         if taken.iter().all(|t| *t) {
             taken.fill(false);
         }
-        slot_of.insert(p, slot);
+        slot_of.insert(p, (slot, repeat));
     }
-    paths.iter().map(|p| WT_COLORS[slot_of[p]]).collect()
+    paths
+        .iter()
+        .map(|p| {
+            let (slot, repeat) = slot_of[p];
+            (WT_COLORS[slot], repeat)
+        })
+        .collect()
 }
 
 /// The distinct worktrees of `table` (running first, then waiting), in
@@ -501,6 +515,7 @@ fn worktrees_of(table: &[&Entry], me: Option<&str>) -> Vec<Wt> {
                     branch,
                     mine: me == Some(path),
                     color: Color::Gray,
+                    repeat: false,
                 },
                 e.seq,
                 e.repo.clone(),
@@ -513,8 +528,9 @@ fn worktrees_of(table: &[&Entry], me: Option<&str>) -> Vec<Wt> {
         let idx: Vec<usize> = (0..result.len()).filter(|&i| repos[i] == *repo).collect();
         let paths: Vec<&str> = idx.iter().map(|&i| result[i].path.as_str()).collect();
         let colors = repo_colors(&paths);
-        for (&i, c) in idx.iter().zip(colors) {
+        for (&i, (c, repeat)) in idx.iter().zip(colors) {
             result[i].color = c;
+            result[i].repeat = repeat;
         }
     }
     result
@@ -1104,7 +1120,13 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
         ];
         spans.push(Span::styled(col(&r.project, cols.project), text));
         let cell = worktree_text(wt, cols.worktree);
-        spans.push(Span::styled(col(&cell, cols.worktree), text));
+        let cell_style = match wt {
+            Some(w) if w.repeat && v.mode == ColorMode::Overview => {
+                text.add_modifier(Modifier::UNDERLINED)
+            }
+            _ => text,
+        };
+        spans.push(Span::styled(col(&cell, cols.worktree), cell_style));
         let flag_text = |f: &Flag| if cols.short_flags { f.1 } else { f.0 };
         let shown = &r.flags;
         let flag_strs: Vec<&str> = shown.iter().map(flag_text).collect();
@@ -1637,13 +1659,13 @@ mod tests {
     fn worktree_colors_are_stable_and_never_the_warning_colors() {
         assert_eq!(fnv1a(""), 0xcbf2_9ce4_8422_2325);
         assert_eq!(fnv1a("a"), 0xaf63_dc4c_8601_ec8c);
-        assert_eq!(repo_colors(&["/w/a"]), [Color::Gray]);
+        assert_eq!(repo_colors(&["/w/a"]), [(Color::Gray, false)]);
         assert!(repo_colors(&[]).is_empty());
         let paths: Vec<String> = (0..6).map(|i| format!("/w/wt-{i}")).collect();
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
         let c = repo_colors(&refs);
         assert_eq!(c, repo_colors(&refs));
-        assert!(c.iter().all(|c| WT_COLORS.contains(c)));
+        assert!(c.iter().all(|(c, _)| WT_COLORS.contains(c)));
         for bad in [Color::Red, Color::Yellow, Color::Gray, Color::DarkGray] {
             assert!(!WT_COLORS.contains(&bad));
         }
@@ -1697,10 +1719,11 @@ mod tests {
             branch: "b".into(),
             mine,
             color,
+            repeat: false,
         };
         let (me, other, lone) = (
-            wt(true, Color::Cyan),
-            wt(false, Color::Green),
+            wt(true, Color::Indexed(44)),
+            wt(false, Color::Indexed(78)),
             wt(false, Color::Gray),
         );
         // Focus: mine in the fixed color, everything else none.
@@ -1709,8 +1732,14 @@ mod tests {
         assert_eq!(tint(ColorMode::Focus, Some(&lone)), None);
         assert_eq!(tint(ColorMode::Focus, None), None);
         // Overview: each worktree's own, none for a lone one.
-        assert_eq!(tint(ColorMode::Overview, Some(&me)), Some(Color::Cyan));
-        assert_eq!(tint(ColorMode::Overview, Some(&other)), Some(Color::Green));
+        assert_eq!(
+            tint(ColorMode::Overview, Some(&me)),
+            Some(Color::Indexed(44))
+        );
+        assert_eq!(
+            tint(ColorMode::Overview, Some(&other)),
+            Some(Color::Indexed(78))
+        );
         assert_eq!(tint(ColorMode::Overview, Some(&lone)), None);
         assert_eq!(tint(ColorMode::Overview, None), None);
     }
@@ -1721,7 +1750,8 @@ mod tests {
         let n = WT_COLORS.len() as u64;
         assert_eq!(fnv1a(&a) % n, fnv1a(&b) % n);
         let c = repo_colors(&[&a, &b]);
-        assert_ne!(c[0], c[1]);
+        assert_ne!(c[0].0, c[1].0);
+        assert!(!c[0].1 && !c[1].1);
         // Order of the input does not change who gets what.
         let r = repo_colors(&[&b, &a]);
         assert_eq!((r[0], r[1]), (c[1], c[0]));
@@ -1730,7 +1760,7 @@ mod tests {
         let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
         let base = repo_colors(&refs);
         let distinct: std::collections::HashSet<_> =
-            base.iter().map(|c| format!("{c:?}")).collect();
+            base.iter().map(|(c, _)| format!("{c:?}")).collect();
         assert_eq!(distinct.len(), WT_COLORS.len());
         for k in 1..refs.len() {
             let mut rot = refs.clone();
@@ -1744,7 +1774,62 @@ mod tests {
         // More worktrees than colors: repeats are allowed, nothing breaks.
         let many: Vec<String> = (0..20).map(|i| format!("/m/wt-{i}")).collect();
         let many: Vec<&str> = many.iter().map(String::as_str).collect();
-        assert_eq!(repo_colors(&many).len(), 20);
+        let got = repo_colors(&many);
+        assert_eq!(got.len(), 20);
+        // The first user of each color is plain, every later one is flagged.
+        assert_eq!(got.iter().filter(|(_, r)| !*r).count(), WT_COLORS.len());
+        for c in WT_COLORS {
+            assert!(!got.iter().filter(|(x, _)| *x == c).all(|(_, r)| *r));
+        }
+    }
+
+    #[test]
+    fn no_repo_with_at_most_a_palette_of_worktrees_repeats_a_color() {
+        for n in 2..=WT_COLORS.len() {
+            for seed in 0..200 {
+                let paths: Vec<String> = (0..n).map(|i| format!("/s{seed}/wt-{i}")).collect();
+                let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+                let got = repo_colors(&refs);
+                let distinct: std::collections::HashSet<_> =
+                    got.iter().map(|(c, _)| format!("{c:?}")).collect();
+                assert_eq!(distinct.len(), n, "{refs:?}");
+                assert!(got.iter().all(|(_, r)| !*r));
+            }
+        }
+    }
+
+    /// The xterm-256 color cube / gray ramp value of index `i` (16..=255).
+    fn xterm_rgb(i: u8) -> (i32, i32, i32) {
+        if i >= 232 {
+            let v = 8 + 10 * (i as i32 - 232);
+            return (v, v, v);
+        }
+        let lv = |k: u8| if k == 0 { 0 } else { 55 + 40 * k as i32 };
+        let j = i - 16;
+        (lv(j / 36), lv(j / 6 % 6), lv(j % 6))
+    }
+
+    #[test]
+    fn neighboring_palette_colors_are_far_apart() {
+        let rgb: Vec<_> = WT_COLORS
+            .iter()
+            .map(|c| match c {
+                Color::Indexed(i) => xterm_rgb(*i),
+                other => panic!("palette colors are 256-color indices: {other:?}"),
+            })
+            .collect();
+        let dist = |a: (i32, i32, i32), b: (i32, i32, i32)| {
+            (((a.0 - b.0).pow(2) + (a.1 - b.1).pow(2) + (a.2 - b.2).pow(2)) as f64).sqrt()
+        };
+        // Neighbors are the fallback order (wrapping), so they must differ a
+        // lot; no two colors at all may be near-duplicates.
+        for i in 0..rgb.len() {
+            let next = (i + 1) % rgb.len();
+            assert!(dist(rgb[i], rgb[next]) >= 120.0, "{i} -> {next}");
+            for j in i + 1..rgb.len() {
+                assert!(dist(rgb[i], rgb[j]) >= 85.0, "{i} vs {j}");
+            }
+        }
     }
 
     #[test]
