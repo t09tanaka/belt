@@ -41,15 +41,61 @@ pub fn keep_plan(state_dir: &Path, plan: &FrozenPlan) -> std::io::Result<(Digest
     Ok((digest, bytes))
 }
 
+/// Why a run could not be looked at, or its plan not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Fault {
+    /// Something that may pass (the store was busy, a read failed): the same
+    /// is tried again, and nothing of the run is changed.
+    Transient(String),
+    /// What the parent keeps of the run says it can never go on (its plan is
+    /// gone or is not the plan, its tasks are not the tasks of the plan):
+    /// trying again reads the same.
+    Unrunnable(String),
+}
+
+impl Fault {
+    pub fn reason(&self) -> &str {
+        match self {
+            Fault::Transient(why) | Fault::Unrunnable(why) => why,
+        }
+    }
+}
+
+fn transient(e: crate::storage::StorageError) -> Fault {
+    Fault::Transient(e.to_string())
+}
+
+fn unrunnable(why: impl std::fmt::Display) -> Fault {
+    Fault::Unrunnable(why.to_string())
+}
+
+/// A plan that cannot be read: one that is not there (or is larger than a
+/// plan may be) will not be there the next time either; any other failure
+/// of the read may pass.
+fn plan_read_fault(digest: &Digest, e: &std::io::Error) -> Fault {
+    let why = format!("the frozen plan {digest}: {e}");
+    match e.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidData => Fault::Unrunnable(why),
+        _ => Fault::Transient(why),
+    }
+}
+
 /// The bytes of a plan the parent keeps, only when they hash to `digest`.
-pub fn plan_bytes(state_dir: &Path, digest: &Digest) -> Result<Vec<u8>, String> {
+pub fn read_plan(state_dir: &Path, digest: &Digest) -> Result<Vec<u8>, Fault> {
     let path = crate::worker::ci_task::plan_path(state_dir, digest);
     let limit = crate::supervisor::ci_task::MAX_PLAN_BYTES;
-    let bytes = read_capped(&path, limit).map_err(|e| format!("the frozen plan {digest}: {e}"))?;
+    let bytes = read_capped(&path, limit).map_err(|e| plan_read_fault(digest, &e))?;
     if &Digest::of_bytes(&bytes) != digest {
-        return Err(format!("the frozen plan {digest} does not have its digest"));
+        return Err(unrunnable(format!(
+            "the frozen plan {digest} does not have its digest"
+        )));
     }
     Ok(bytes)
+}
+
+/// [`read_plan`], with only the words of the fault.
+pub fn plan_bytes(state_dir: &Path, digest: &Digest) -> Result<Vec<u8>, String> {
+    read_plan(state_dir, digest).map_err(|fault| fault.reason().to_string())
 }
 
 fn read_capped(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
@@ -60,9 +106,10 @@ fn read_capped(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
-        return Err(std::io::Error::other(format!(
-            "it is larger than {limit} bytes"
-        )));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("it is larger than {limit} bytes"),
+        ));
     }
     Ok(bytes)
 }
@@ -135,7 +182,11 @@ pub struct Pass {
     pub released: Vec<TaskId>,
     /// Tasks that cannot be run (and were cancelled), with the reason.
     pub unrunnable: Vec<(TaskId, String)>,
-    /// Runs that could not be looked at, with the reason.
+    /// Runs that can never go on, with the reason: their tasks that were
+    /// not placed yet were cancelled (and are in `unrunnable`).
+    pub failed: Vec<(RunId, String)>,
+    /// Runs that could not be looked at this time, with the reason. They
+    /// are looked at again.
     pub faults: Vec<(RunId, String)>,
     /// The plans of the runs that still have a task waiting.
     pub plans: std::collections::BTreeSet<Digest>,
@@ -143,8 +194,11 @@ pub struct Pass {
 
 /// Let every run that has a task waiting go on as far as it can.
 /// `state_dir` holds the frozen plans, `results` what was collected. A run
-/// that cannot be read is left as it is (and reported in `faults`); the
-/// others go on.
+/// that could not be read this time is left as it is (and reported in
+/// `faults`). A run that can never go on ends here: every task of it that
+/// was not placed yet is cancelled with the reason (`failed`), in one
+/// transaction, so the run does not wait for a plan that will not come.
+/// The others go on.
 pub fn advance_runs(
     store: &CoordinatorStore,
     state_dir: &Path,
@@ -153,11 +207,33 @@ pub fn advance_runs(
 ) -> crate::storage::Result<Pass> {
     let mut pass = Pass::default();
     for run in store.ci_waiting_runs(RUNS_PER_PASS)? {
-        if let Err(why) = advance_run(store, state_dir, results, &run, now_ms, &mut pass) {
-            pass.faults.push((run, why));
+        match advance_run(store, state_dir, results, &run, now_ms, &mut pass) {
+            Ok(()) => {}
+            Err(Fault::Transient(why)) => pass.faults.push((run, why)),
+            Err(Fault::Unrunnable(why)) => match fail_run(store, &run, &why, now_ms) {
+                Ok(tasks) => {
+                    let tasks = tasks.into_iter().map(|task| (task, why.clone()));
+                    pass.unrunnable.extend(tasks);
+                    pass.failed.push((run, why));
+                }
+                Err(e) => pass.faults.push((run, e.to_string())),
+            },
         }
     }
     Ok(pass)
+}
+
+/// A run of CI tasks cannot go on (`why`): cancel every task of it that was
+/// not placed yet, with the reason. A task that runs is left to end; the run
+/// settles (and is no success) when it has. Returns the tasks cancelled
+/// here, none when a pass before this one did it already.
+pub fn fail_run(
+    store: &CoordinatorStore,
+    run: &RunId,
+    why: &str,
+    now_ms: u64,
+) -> crate::storage::Result<Vec<TaskId>> {
+    store.fail_ci_tasks(run, None, why, now_ms)
 }
 
 struct Member {
@@ -172,31 +248,33 @@ fn advance_run(
     run: &RunId,
     now_ms: u64,
     pass: &mut Pass,
-) -> Result<(), String> {
-    let fault = |e: crate::storage::StorageError| e.to_string();
+) -> Result<(), Fault> {
+    let fault = transient;
     let mut members: BTreeMap<String, Member> = BTreeMap::new();
     let mut digest = None;
     for row in store.ci_run_tasks(run).map_err(fault)? {
         let spec: TaskSpec = serde_json::from_value(row.spec.clone())
-            .map_err(|e| format!("task {}: {e}", row.task_id))?;
+            .map_err(|e| unrunnable(format!("task {}: {e}", row.task_id)))?;
         let Some(ci) = &spec.ci else {
-            return Err(format!("task {} is not a CI task", row.task_id));
+            return Err(unrunnable(format!("task {} is not a CI task", row.task_id)));
         };
         if digest.get_or_insert_with(|| ci.task.plan_digest.clone()) != &ci.task.plan_digest {
-            return Err("the tasks of the run name different plans".into());
+            return Err(unrunnable("the tasks of the run name different plans"));
         }
         if members
             .insert(ci.task.task_id.clone(), Member { row, spec })
             .is_some()
         {
-            return Err("two tasks of the run are the same task of the plan".into());
+            return Err(unrunnable(
+                "two tasks of the run are the same task of the plan",
+            ));
         }
     }
-    let digest = digest.ok_or("the run has no task")?;
+    let digest = digest.ok_or_else(|| unrunnable("the run has no task"))?;
     pass.plans.insert(digest.clone());
-    let plan: FrozenPlan = serde_json::from_slice(&plan_bytes(state_dir, &digest)?)
-        .map_err(|e| format!("the frozen plan {digest}: {e}"))?;
-    let mut progress = NeedsProgression::new(&plan).map_err(|e| e.to_string())?;
+    let plan: FrozenPlan = serde_json::from_slice(&read_plan(state_dir, &digest)?)
+        .map_err(|e| unrunnable(format!("the frozen plan {digest}: {e}")))?;
+    let mut progress = NeedsProgression::new(&plan).map_err(unrunnable)?;
 
     // What ended, the tasks a task depends on before the task itself.
     loop {
@@ -206,29 +284,34 @@ fn advance_run(
                 continue;
             }
             let Some(member) = members.get(&task.id) else {
-                return Err(format!("the run has no task `{}` of its plan", task.id));
+                return Err(unrunnable(format!(
+                    "the run has no task `{}` of its plan",
+                    task.id
+                )));
             };
             let Some(input) = ended(store, results, &task.id, &member.row).map_err(fault)? else {
                 continue;
             };
-            progress.step(input).map_err(|e| e.to_string())?;
+            progress.step(input).map_err(unrunnable)?;
             settled = true;
         }
         if !settled {
             break;
         }
     }
-    progress.step(Input::Advance).map_err(|e| e.to_string())?;
+    progress.step(Input::Advance).map_err(unrunnable)?;
     for action in progress.pending_actions().to_vec() {
         if let ActionKind::Ready { task, inputs } = &action.kind {
-            let member = members.get(task).ok_or("the plan changed")?;
+            let member = members
+                .get(task)
+                .ok_or_else(|| unrunnable("the plan changed"))?;
             if member.spec.ci.as_ref().is_some_and(|ci| ci.hold) {
                 release(store, run, member, inputs, now_ms, pass).map_err(fault)?;
             }
         }
         progress
             .step(Input::Ack { action: action.id })
-            .map_err(|e| e.to_string())?;
+            .map_err(unrunnable)?;
     }
     Ok(())
 }
@@ -285,10 +368,11 @@ fn release(
         let why = format!(
             "the results of the jobs it needs are larger than {MAX_RELEASED_INPUT_BYTES} bytes"
         );
-        let payload = serde_json::json!({ "task": task_id.to_string(), "reason": why });
-        store.append_event(Some(run), None, "ci_task_unrunnable", &payload, now_ms)?;
-        store.cancel_task(task_id, now_ms)?;
-        pass.unrunnable.push((task_id.clone(), why));
+        // The reason, the cancel and the event are one transaction: a pass
+        // that sees the task again finds it cancelled and writes nothing.
+        for task in store.fail_ci_tasks(run, Some(task_id), &why, now_ms)? {
+            pass.unrunnable.push((task, why.clone()));
+        }
         return Ok(());
     }
     let mut spec = member.spec.clone();
@@ -379,6 +463,42 @@ mod tests {
             .contains("digest"));
         let absent = Digest::of_bytes(b"absent");
         assert!(plan_bytes(dir.path(), &absent).is_err());
+        // A plan that is gone, is not the plan, or is larger than a plan may
+        // be stays that way; any other failure of the read may pass.
+        assert!(matches!(
+            read_plan(dir.path(), &digest),
+            Err(Fault::Unrunnable(_))
+        ));
+        assert!(matches!(
+            read_plan(dir.path(), &absent),
+            Err(Fault::Unrunnable(_))
+        ));
+        let io = |kind| std::io::Error::new(kind, "x");
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::InvalidData,
+        ] {
+            let fault = plan_read_fault(&absent, &io(kind));
+            assert_eq!(
+                fault,
+                Fault::Unrunnable(format!("the frozen plan {absent}: x"))
+            );
+            assert_eq!(fault.reason(), format!("the frozen plan {absent}: x"));
+        }
+        for kind in [
+            std::io::ErrorKind::PermissionDenied,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::Other,
+        ] {
+            let fault = plan_read_fault(&absent, &io(kind));
+            assert_eq!(
+                fault,
+                Fault::Transient(format!("the frozen plan {absent}: x"))
+            );
+        }
+        assert_eq!(Fault::Transient("busy".into()).reason(), "busy");
+        let busy = transient(crate::storage::StorageError::Busy);
+        assert_eq!(busy, Fault::Transient("database is busy (retry)".into()));
 
         let attempt = AttemptId::generate();
         let text = serde_json::json!({
@@ -409,7 +529,8 @@ mod tests {
         // Larger than a result may be.
         let large = dir.path().join("large");
         std::fs::write(&large, vec![b'x'; 9]).unwrap();
-        assert!(read_capped(&large, 8).is_err());
+        let too_large = read_capped(&large, 8).unwrap_err();
+        assert_eq!(too_large.kind(), std::io::ErrorKind::InvalidData);
         assert_eq!(read_capped(&large, 9).unwrap().len(), 9);
     }
 }

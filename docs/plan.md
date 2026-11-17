@@ -1448,7 +1448,7 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - 使える結果を残さなかった task の Job は、下流には `failure`（attempt が cancelled、または配置前に cancel されたものは `cancelled`）として渡す。
 - inputs の上限は 1 MiB（worker の上限 4 MiB、接続の frame 2 MiB より小さく）。超えた task は event `ci_task_unrunnable` を残して cancel する（run は成功にならない）。
 - 宣言が 1024 件のとき結果を足すと 1025 件になる点: CI task が宣言できる artifact と output は合わせて 1023 件まで。`ci` は今、artifact も output も宣言しない。
-- 除外の理由は新しい `Exclusion` を足さず、`CapabilityMismatch` と `unmet` で表した。
+- 除外の理由は新しい `Exclusion` を足さず、`CapabilityMismatch` と `unmet` で表した。 plan を受け取らなかった worker だけは別で、`CapabilityMismatch` にすると全員がそうのとき `no_compatible_worker` になってしまう（一時的な理由なのに）ので、`Exclusion::InputRefused` を足した。
 - 提出で断るもの: matrix の variant・式の matrix・shard・`services:` を持つ plan、secret_files を持つ source、task が 1 つも無い plan。64 個を超える task は resident が断る（既存の上限）。
 - `ci` は toolchain の凍結（`exec` の `freeze_toolchains`）をしない。profile と requires は `exec` と同じく task に入れる。
 
@@ -1464,13 +1464,21 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - matrix の展開・permit・max-parallel・fail-fast・join・集約と A27（(2) の区切り）は Driver の公開待ち。今は提出で断る。
 - `services:` を持つ task（worker の回復で container を止める実装が先）。secret_files・prepared setup・fast-worktree の `[[clone]]` を伴う CI task（local-ci の束縛の API 待ち）。
 - `retry` で上流の task をやり直しても、すでに release された下流の inputs は変わらない。下流を作り直す経路は無い。
-- 進行の pass が失敗した run（plan の file が無い・読めない等）は、そのまま待ち続ける。理由は `Pass.faults` に入るが、event や表示には出していない。
 - 親の plan は、release 済みで未配置の task が参照していても、保持日数を過ぎれば消える（run が保持日数より長く止まっている場合だけ）。worker の plan も、届いてから保持期間（既定 7 日）を過ぎて配置された task は準備で `NOT_FOUND` になる。入力の gate が run を忘れたあとの再配送では、もう一度送られて保持期間が延びる。
 - `ci` の終了コードは最初に失敗した task のもの（`exec` と同じ計算）で、Job の失敗は attempt の exit 1 として現れる。
 - CI task の実行中の log は `logs --follow` に流れない（終了後に回収される）。
 - `ci` は、`exec` が project の設定から入れるもののうち、toolchain の凍結・`prepare_commands` と fast-worktree の setup（prepared setup は CI task で断られる）・`outputs` の宣言・`pass_env` を task に入れない。
-- worker が持てる plan は 256 件・保持 7 日で、source の状態が違えば plan も違う。上限に達した worker は plan の `blob_put` を `OVERLOADED` で断り、その worker では入力が ready にならない（run は event 無しで待つ）。
 - `estimate`（`coordinator/estimate.rs`）は workload を `commands` から作るままで、CI task の step を見ない。
 - host の loop（`ci::advance`）は `NeedsProgression` の `is_settled`・`dependencies_settled` を trait の外で呼んでいる。Driver に差し替えるときは host の loop も直す。
 - run が受理される前に記録された cancel（`run_cancel_intent` だけが有る状態）と待機中の task の release の関係は、command の task と同じ経路（配置の側の扱い）に任せていて、CI 用のテストは無い。
-- mutation のテストは手元で回していない（`advance_run`・`ended`・`release`・`job_lines`・`Collector::judged` を殺すのは `tests/it` のテスト）。
+- mutation のテストは、変更した pure module（`coordinator/policy.rs`・`coordinator/input_gate.rs`・`scheduler/decide.rs`）だけを手元で回した。`advance_run`・`ended`・`release`・`job_lines`・`Collector::judged` は mutation の対象（`scripts/pure-modules.txt`）に入っていない file に有り、`tests/it` と lib のテストで確かめている。
+
+### S16 (1) の後半の追補: 黙って待つ 2 つの場合を無くした（2026-11-17、PR #70）
+
+- 進められない run: `ci::advance` の失敗を `Fault::Unrunnable`（親の持つ状態から決まる。plan の file が無い・digest が違う・読めない、task が plan と対応しない、進行の規則が拒む）と `Fault::Transient`（store の error、plan の file のその他の読み取り失敗）に分けた。前者は `CoordinatorStore::fail_ci_tasks` で、その run のまだ配置されていない CI task を理由付きで cancel する（spec の `ci.unrunnable`、event `ci_task_unrunnable`、cancel を 1 つの transaction で）。cancel 後は `ci_waiting_runs` に出ないので、同じ run を二度扱わない。inputs が上限を超えた task の cancel も同じ関数に寄せた（以前は event と cancel が別の書き込みだった）。後者はやり直し、resident が event `ci_run_stalled` を障害ごとに 1 回残す。
+- 配送の側（`resident::delivery`）でも親が plan を読めなければ同じ `fail_ci_tasks` を呼ぶ。待機中の task を持たない run（Job が 1 つだけ等）は進行の pass に現れないため。
+- 表示: `show`・`ls` の task の `unrunnable`、`logs` の status の `reason`、`ci` の Job の行の `reason`。
+- plan を受け取らない worker: `forward::plan` の失敗を、worker の答え（`Refused`）・親が読めない（`Unrunnable`）・その他（`Retry`）に分けた。`Refused` は接続の `InputGate` に run ごとの理由として持ち（64 件まで、受け取ったら消える、worker が別の boot / epoch になったら消える）、run に event `ci_plan_refused` を 1 回残す。配置はその worker を `Exclusion::InputRefused`（理由は `unmet`）で外す。tick が見る run（どこかで ready な run）に、断られた run も加えた。そうしないと、どの worker でも ready でない run は `place_one` に届かず、`task_waiting` が残らない。
+- 自分で決めたこと: (a) は run 全体の cancel ではなく、未配置の task だけを cancel する（実行中の Job は結果を残させる。plan が無くても worker は自分の写しで実行できる）。(b) は fail にせず除外にした（worker の GC で空けば解ける一時的な状態で、ほかの worker が取れる）。全 worker が断っている間は、理由付きで待つ。待つ時間に上限は設けていない。
+- テスト: lib（`coordinator::tests` 2 件、`input_gate` 2 件、`policy` 4 件、`ci_runs` 2 件、`advance` の分類）。`tests/it/collection.rs` 2 件（plan が消えた run、plan を受け取らない代役の worker）。`tests/it/bootstrap.rs` 1 件（実 binary・resident・local worker で、worker の `ci-plans/` を 256 件で埋めると `ci` が理由を残して待ち、空けると完了する）。
+- 残り: 配送の側で親が plan を読めない場合（待機中の task を持たない run）は、分類の単体テストだけで、実 binary のテストは無い。`ci_run_stalled` は event に残すだけで、`show` には出していない（DB が使えない間は event も書けない）。すでに worker に配置された attempt が plan を待っている場合（cold placement）の扱いは変えていない。

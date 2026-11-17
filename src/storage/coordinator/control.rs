@@ -30,6 +30,66 @@ impl CoordinatorStore {
         })
     }
 
+    /// The CI tasks of `run` that were never placed (only `only`, when one
+    /// is named) cannot be run: write why into each (`ci.unrunnable` of its
+    /// spec), cancel it, and record the event `ci_task_unrunnable`, all in
+    /// one transaction. A task that has an attempt, or that a cancel was
+    /// requested for, is left as it is. Returns the tasks this cancelled:
+    /// none when there was nothing left to do, so a caller that sees the
+    /// same fault again writes nothing more.
+    pub fn fail_ci_tasks(
+        &self,
+        run: &RunId,
+        only: Option<&TaskId>,
+        reason: &str,
+        at_ms: u64,
+    ) -> Result<Vec<TaskId>> {
+        let (run, only, reason) = (
+            run.to_string(),
+            only.map(|task| task.to_string()),
+            reason.to_string(),
+        );
+        self.db.write(move |tx| {
+            let tasks: Vec<String> = {
+                let mut query = tx.prepare(
+                    "SELECT t.task_id FROM task t WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2)
+                     AND t.cancel_requested_at_ms IS NULL
+                     AND json_type(t.spec_json,'$.ci')='object'
+                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)
+                     ORDER BY t.created_at_ms,t.rowid",
+                )?;
+                let rows = query.query_map(params![run, only], |row| row.get(0))?;
+                rows.collect::<std::result::Result<_, _>>()?
+            };
+            let mut failed = Vec::new();
+            for task in tasks {
+                tx.execute(
+                    "UPDATE task SET spec_json=json_set(spec_json,'$.ci.unrunnable',?2) WHERE task_id=?1",
+                    params![task, reason],
+                )?;
+                let id = TaskId::parse(&task).map_err(|e| StorageError::Invalid(e.to_string()))?;
+                let expected = revision(tx, &run)?;
+                apply_cancel(
+                    tx,
+                    Target::Task(id.clone()),
+                    expected,
+                    RunId::generate().to_string(),
+                    at_ms,
+                )?;
+                common::append_event(
+                    tx,
+                    Some(&run),
+                    None,
+                    "ci_task_unrunnable",
+                    &serde_json::json!({ "task": task, "reason": reason }),
+                    at_ms,
+                )?;
+                failed.push(id);
+            }
+            Ok(failed)
+        })
+    }
+
     /// A transport request retains its original identity and expected revision.
     pub fn cancel_control(
         &self,

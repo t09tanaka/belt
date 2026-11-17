@@ -51,6 +51,10 @@ pub struct JobLine {
     /// Why the job did not run.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skipped: Option<String>,
+    /// Why the task could not be run at all (it was cancelled before it was
+    /// placed, with this reason).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -99,6 +103,7 @@ pub fn task_specs(
                     },
                     hold: !task.depends_on.is_empty(),
                     steps: u32::try_from(demand.nodes.len()).unwrap_or(u32::MAX),
+                    unrunnable: None,
                 }),
                 toolchains: None,
                 requirements: requirements.clone(),
@@ -298,6 +303,7 @@ pub fn job_lines(
             job,
             status: status.to_string(),
             skipped,
+            reason: ci.unrunnable.clone(),
         };
         match result {
             Some(result) => lines.extend(
@@ -317,7 +323,7 @@ pub fn render_jobs(jobs: &[JobLine]) -> String {
     jobs.iter()
         .map(|line| {
             let name = line.job.as_deref().unwrap_or(&line.plan_task);
-            match &line.skipped {
+            match line.skipped.as_ref().or(line.reason.as_ref()) {
                 Some(why) => format!("{name}: {} ({why})\n", line.status),
                 None => format!("{name}: {}\n", line.status),
             }
@@ -388,15 +394,21 @@ mod tests {
             job: job.map(str::to_string),
             status: status.into(),
             skipped: skipped.map(str::to_string),
+            reason: None,
+        };
+        let unrunnable = JobLine {
+            reason: Some("the frozen plan is gone".into()),
+            ..line(None, "no_result", None)
         };
         let text = render_jobs(&[
             line(Some("build"), "failure", None),
             line(Some("test"), "skipped", Some("needs failed")),
             line(None, "no_result", None),
+            unrunnable,
         ]);
         assert_eq!(
             text,
-            "build: failure\ntest: skipped (needs failed)\nci.yml/deploy: no_result\n"
+            "build: failure\ntest: skipped (needs failed)\nci.yml/deploy: no_result\nci.yml/deploy: no_result (the frozen plan is gone)\n"
         );
         assert_eq!(render_jobs(&[]), "");
     }

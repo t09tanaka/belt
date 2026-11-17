@@ -243,7 +243,7 @@ impl Observer {
         }
         let Some(attempt_id) = aid else {
             if changed {
-                sink.status(serde_json::json!({"kind":"status","task_id":task.task_id,"run_id":task.run_id,"attempt_id":null,"pending":task.cancel_requested_at_ms.is_none()})).await?;
+                sink.status(serde_json::json!({"kind":"status","task_id":task.task_id,"run_id":task.run_id,"attempt_id":null,"pending":task.cancel_requested_at_ms.is_none(),"reason":task.unrunnable})).await?;
             }
             if task.cancel_requested_at_ms.is_none() {
                 summary.pending_tasks += 1;

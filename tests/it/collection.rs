@@ -142,6 +142,10 @@ struct State {
     ops: Vec<(&'static str, u64)>,
     /// The connection did not negotiate `ci_task_v1`.
     no_ci: bool,
+    /// The worker did not take the frozen plan of any run, for this reason:
+    /// no input is ready there.
+    refused_plan: Option<String>,
+    refused_runs: Vec<RunId>,
 }
 
 struct Worker {
@@ -430,6 +434,25 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
 impl WorkerLink for Worker {
     fn ci_task_negotiated(&self) -> bool {
         !self.state.lock().unwrap().no_ci
+    }
+    fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
+        let refused = self.state.lock().unwrap().refused_plan.is_some();
+        refused.then(|| remote_task_runner::coordinator::PlacementInputs {
+            generation: 1,
+            ready: Vec::new(),
+            identity: None,
+        })
+    }
+    fn input_refusals(&self) -> Vec<(RunId, String)> {
+        let state = self.state.lock().unwrap();
+        let why = state.refused_plan.iter();
+        why.flat_map(|why| {
+            state
+                .refused_runs
+                .iter()
+                .map(|run| (run.clone(), why.clone()))
+        })
+        .collect()
     }
     fn cost_transport(&self) -> Option<remote_task_runner::scheduler::measured::Transport> {
         Some(remote_task_runner::scheduler::measured::Transport {
@@ -3125,4 +3148,178 @@ async fn a_cancelled_ci_run_releases_nothing_more_and_settles() {
         .store()
         .release_ci_task(&ids["test"], &serde_json::json!({}), 1)
         .unwrap());
+}
+
+/// A run whose frozen plan the parent does not have any more does not wait
+/// for it: the job that was not placed yet is cancelled with the reason,
+/// the job that runs ends, and the run settles as no success.
+#[tokio::test]
+async fn a_ci_run_whose_plan_is_gone_cancels_what_waits_and_says_why() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let plan = ci_plan(CI_CHAIN);
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    let (build, test) = (ids["build"].clone(), ids["test"].clone());
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let a = report.placed[0].clone();
+    assert!(ci_advance(&fx, &c).failed.is_empty());
+
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
+    std::fs::remove_file(remote_task_runner::worker::ci_task::plan_path(
+        fx.dir.path(),
+        &digest,
+    ))
+    .unwrap();
+    let pass = ci_advance(&fx, &c);
+    assert_eq!(pass.failed.len(), 1, "{pass:?}");
+    assert_eq!(pass.failed[0].0, run);
+    let why = pass.failed[0].1.clone();
+    assert_eq!(pass.unrunnable, vec![(test.clone(), why.clone())]);
+    assert!(pass.faults.is_empty() && pass.released.is_empty());
+    let events: Vec<_> = c
+        .store()
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "ci_task_unrunnable")
+        .collect();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].run_id.as_deref(), Some(run.as_str()));
+    assert_eq!(events[0].payload["task"], test.as_str());
+    assert_eq!(events[0].payload["reason"], why.as_str());
+    let shown = c.store().query_task(test.clone()).unwrap().unwrap();
+    assert_eq!(shown.unrunnable.as_deref(), Some(why.as_str()));
+    assert!(shown.cancel_requested_at_ms.is_some());
+
+    // The job that runs is not touched, and ends as it would have.
+    assert!(c
+        .store()
+        .query_task(build.clone())
+        .unwrap()
+        .unwrap()
+        .cancel_requested_at_ms
+        .is_none());
+    let p = fx.w.payload(&a);
+    let result = ci_result(
+        &ci_task_of(&plan, "build"),
+        "build",
+        "success",
+        serde_json::json!({"version": "1"}),
+    );
+    end(&fx, &c, &a, Outcome::Succeeded, ci_out(&a, &p, &result)).await;
+    assert_eq!(ci_collect(&c, &files, &a).await.collected, vec![a]);
+    // Nothing is looked at, released or placed any more.
+    for _ in 0..2 {
+        assert_eq!(ci_advance(&fx, &c), Default::default());
+        assert!(c.tick().await.unwrap().placed.is_empty());
+    }
+    assert!(c.store().attempts_of_task(&test).unwrap().is_empty());
+    let target = remote_task_runner::service::completion::Target::Run(run.clone());
+    let snapshot = c.store().completion(target).unwrap();
+    assert!(snapshot.settled());
+    let lines =
+        remote_task_runner::service::ci_run::job_lines(c.store(), files.root(), &run).unwrap();
+    let seen: Vec<_> = lines
+        .iter()
+        .map(|l| (l.job.as_deref(), l.status.as_str(), l.reason.as_deref()))
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            (Some("build"), "success", None),
+            (None, "no_result", Some(why.as_str()))
+        ]
+    );
+}
+
+/// A worker that did not take the frozen plan of a run is left out of the
+/// placement of its tasks by name: the wait has a reason where the task is
+/// shown, another worker takes the task, and the exclusion is over when the
+/// worker takes the plan.
+#[tokio::test]
+async fn a_worker_that_did_not_take_the_plan_is_left_out_with_the_reason_until_it_does() {
+    use remote_task_runner::scheduler::decide::Exclusion;
+    const WHY: &str = "frozen plan not taken: the worker holds 256 frozen plans (OVERLOADED)";
+    let fx = fx();
+    let (c, _files) = fx.open();
+    fx.w.set(|s| s.refused_plan = Some(WHY.into()));
+    let plan = ci_plan(CI_CHAIN);
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    // Before the worker was asked to take the plan nothing is known, and
+    // nothing is said.
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    fx.w.set(|s| s.refused_runs.push(run.clone()));
+    let build = ids["build"].clone();
+    let waits = || -> Vec<remote_task_runner::storage::Event> {
+        let events = c.store().events_after(0, 1000).unwrap();
+        events
+            .into_iter()
+            .filter(|e| e.kind == remote_task_runner::scheduler::EVENT_TASK_WAITING)
+            .collect()
+    };
+
+    // The only worker did not take the plan: nothing is placed, and the run
+    // says why, once.
+    for _ in 0..3 {
+        assert!(c.tick().await.unwrap().placed.is_empty());
+    }
+    let recorded = waits();
+    assert_eq!(recorded.len(), 1, "{recorded:?}");
+    assert_eq!(recorded[0].run_id.as_deref(), Some(run.as_str()));
+    assert_eq!(recorded[0].payload["task"], build.as_str());
+    assert!(recorded[0].payload["blocked_reason"].is_null());
+    let excluded = &recorded[0].payload["decision"]["excluded"];
+    assert_eq!(excluded.as_array().unwrap().len(), 1);
+    assert_eq!(excluded[0]["worker_id"], "w-a");
+    assert_eq!(excluded[0]["why"], "input_refused");
+    assert_eq!(excluded[0]["unmet"], serde_json::json!([WHY]));
+    let shown = c.store().query_task(build.clone()).unwrap().unwrap();
+    let placement = shown.placement.unwrap();
+    assert_eq!(placement.blocked_reason, None);
+    assert_eq!(placement.excluded.len(), 1);
+    assert_eq!(placement.excluded[0].why, Exclusion::InputRefused);
+    assert_eq!(placement.excluded[0].unmet, [WHY]);
+
+    // Another worker takes it; the placement keeps who was left out and why.
+    let other = Worker::new("w-b");
+    c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+        .unwrap();
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let a = report.placed[0].clone();
+    assert_eq!(other.count("submit"), 1);
+    assert_eq!(fx.w.count("submit"), 0);
+    let decision = remote_task_runner::scheduler::reason_of(c.store(), &a)
+        .unwrap()
+        .unwrap();
+    let left_out: Vec<_> = decision
+        .excluded
+        .iter()
+        .filter(|e| e.worker_id == fx.w.id)
+        .collect();
+    assert_eq!(left_out.len(), 1);
+    assert_eq!(left_out[0].why, Exclusion::InputRefused);
+    assert_eq!(left_out[0].unmet, [WHY]);
+
+    // The other worker is away. The next run waits again, until the first
+    // worker has taken the plan: then it is a candidate like any other.
+    other.set(|s| s.offline = true);
+    let (run_2, ids_2) = ci_run(&fx, &c, &plan).await;
+    fx.w.set(|s| s.refused_runs.push(run_2.clone()));
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    fx.w.set(|s| s.refused_plan = None);
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let b = report.placed[0].clone();
+    let attempts = c.store().attempts_of_task(&ids_2["build"]).unwrap();
+    assert_eq!(attempts[0].attempt_id, b);
+    assert_eq!(fx.w.count("submit"), 1);
+    let decision = remote_task_runner::scheduler::reason_of(c.store(), &b)
+        .unwrap()
+        .unwrap();
+    assert!(decision
+        .excluded
+        .iter()
+        .all(|e| e.why != Exclusion::InputRefused));
 }

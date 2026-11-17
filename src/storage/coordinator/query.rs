@@ -116,6 +116,10 @@ fn run_facts(c: &Connection, run: &str, cancel: bool, collections: bool) -> Resu
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
+    /// Why a CI task that was never placed cannot be run (it was cancelled
+    /// with this reason).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrunnable: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placement: Option<PlacementDiagnostics>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -176,6 +180,13 @@ pub struct CurrentAttempt {
     pub state: AttemptState,
     pub observation: Observation,
     pub termination: Option<Termination>,
+}
+fn unrunnable(c: &Connection, task: &str) -> Result<Option<String>> {
+    Ok(c.query_row(
+        "SELECT json_extract(spec_json,'$.ci.unrunnable') FROM task WHERE task_id=?1",
+        [task],
+        |r| r.get(0),
+    )?)
 }
 fn in_place(c: &Connection, task: &str) -> Result<bool> {
     Ok(c.query_row(
@@ -275,7 +286,7 @@ impl CoordinatorStore {
             let cancel=if cancel {"cancel_requested_at_ms"}else{"NULL"};
             let mut q=c.prepare(&format!("SELECT task_id,created_at_ms,{cancel} FROM task WHERE run_id=?1 AND task_id>coalesce(?2,'') ORDER BY task_id LIMIT ?3"))?;
             let raw=q.query_map(params![run.as_str(),after.map(String::from),bound],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<i64>>(2)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
-            let items=raw.into_iter().map(|(tid,created,cancel)|Ok(Task{placement: if cancel.is_none() && current(c,&tid)?.is_none() {placement(c,&tid)?} else {None},in_place:in_place(c,&tid)?,current_attempt:current(c,&tid)?,task_id:id("task",TaskId::parse(&tid))?,run_id:run.clone(),created_at_ms:to_u64(created)?,cancel_requested_at_ms:cancel.map(to_u64).transpose()?})).collect::<Result<Vec<_>>>()?;
+            let items=raw.into_iter().map(|(tid,created,cancel)|Ok(Task{unrunnable:unrunnable(c,&tid)?,placement: if cancel.is_none() && current(c,&tid)?.is_none() {placement(c,&tid)?} else {None},in_place:in_place(c,&tid)?,current_attempt:current(c,&tid)?,task_id:id("task",TaskId::parse(&tid))?,run_id:run.clone(),created_at_ms:to_u64(created)?,cancel_requested_at_ms:cancel.map(to_u64).transpose()?})).collect::<Result<Vec<_>>>()?;
             Ok(page(items,n,|t|t.task_id.to_string()))
         })
     }
@@ -302,6 +313,7 @@ impl CoordinatorStore {
                 .optional()?;
             raw.map(|(run, created, cancel)| {
                 Ok(Task {
+                    unrunnable: unrunnable(c, task.as_str())?,
                     placement: if cancel.is_none() && current(c, task.as_str())?.is_none() {
                         placement(c, task.as_str())?
                     } else {

@@ -243,6 +243,23 @@ pub fn ci_declarations_fit(artifacts: usize, outputs: usize) -> bool {
     artifacts.saturating_add(outputs) < crate::outputs::MAX_OUTPUTS
 }
 
+/// Why a worker is left out of the placement of a task of `run` although
+/// it is attached: it did not take the input of the run. A worker where the
+/// input is ready was not refused (a refusal that is still listed is stale).
+pub fn input_refusal(
+    ready: bool,
+    refusals: Vec<(crate::ids::RunId, String)>,
+    run: &crate::ids::RunId,
+) -> Option<String> {
+    if ready {
+        return None;
+    }
+    refusals
+        .into_iter()
+        .find(|(refused, _)| refused == run)
+        .map(|(_, why)| why)
+}
+
 /// The work a forecast is asked for: the commands of the task, or for a CI
 /// task the commands its plan says it starts (one node per step, in order).
 pub fn workload_of_spec(
@@ -292,6 +309,7 @@ mod tests {
                 },
                 hold: false,
                 steps: 1,
+                unrunnable: None,
             }),
             toolchains: None,
             outputs: Vec::new(),
@@ -316,6 +334,29 @@ mod tests {
         assert!(!lacks_ci_task(&task_spec(false), false));
         assert!(!lacks_ci_task(&task_spec(false), true));
         assert_eq!(CI_TASK_UNMET, "protocol feature ci_task_v1");
+    }
+
+    #[test]
+    fn a_worker_is_left_out_for_the_input_it_refused_only_while_it_is_not_ready() {
+        let (a, b) = (crate::ids::RunId::generate(), crate::ids::RunId::generate());
+        let refusals = || {
+            vec![
+                (a.clone(), "full".to_string()),
+                (b.clone(), "part-way".to_string()),
+            ]
+        };
+        assert_eq!(
+            input_refusal(false, refusals(), &a).as_deref(),
+            Some("full")
+        );
+        assert_eq!(
+            input_refusal(false, refusals(), &b).as_deref(),
+            Some("part-way")
+        );
+        assert_eq!(input_refusal(true, refusals(), &a), None);
+        assert_eq!(input_refusal(false, Vec::new(), &a), None);
+        let other = crate::ids::RunId::generate();
+        assert_eq!(input_refusal(false, refusals(), &other), None);
     }
 
     #[test]

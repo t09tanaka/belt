@@ -149,6 +149,11 @@ pub struct CiSpec {
     /// (`local_ci::plan_task_demand`): the demand a forecast is asked for.
     #[serde(default)]
     pub steps: u32,
+    /// Why the task cannot be run. Written together with the cancel of a
+    /// task that was never placed (`CoordinatorStore::fail_ci_tasks`), and
+    /// shown where the task is shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unrunnable: Option<String>,
 }
 
 /// The one place an [`AttemptPayload`] is made.
@@ -1290,6 +1295,9 @@ impl Coordinator {
                     .try_fold(BTreeSet::new(), |mut ids, link| {
                         let inputs = link.placement_inputs()?;
                         ids.extend(inputs.ready.into_iter().map(|i| i.run_id));
+                        // A run whose input a worker refused is looked at
+                        // too: its wait gets a reason.
+                        ids.extend(link.input_refusals().into_iter().map(|(run, _)| run));
                         Some(ids)
                     })
                     .map(|ids| ids.into_iter().collect::<Vec<_>>())
@@ -1470,6 +1478,11 @@ impl Coordinator {
             }
         };
         let ready = |w: &Reached| readiness(w).is_some();
+        // A worker that did not take the input of the run (the frozen plan
+        // of a CI run it has no room for) is left out by name, so the wait
+        // has a reason where the task is shown.
+        let refusal =
+            |w: &Reached| policy::input_refusal(ready(w), w.link.input_refusals(), &task.run_id);
         let measured_cold = |w: &Reached| {
             if spec.in_place || !w.link.cold_eligible(&task.task_id) {
                 return false;
@@ -1482,7 +1495,7 @@ impl Coordinator {
             let costs = self.sched.query(&w.worker_id, &query);
             costs.ms[decide::TRANSFER].is_some() && !costs.assumed[decide::TRANSFER]
         };
-        if !round.open.is_empty() && !round.open.iter().any(&ready) {
+        if !round.open.is_empty() && !round.open.iter().any(|w| ready(w) || refusal(w).is_some()) {
             return Ok(());
         }
         let mut toolchain_eligible = BTreeSet::new();
@@ -1549,10 +1562,17 @@ impl Coordinator {
                     why: *why,
                 })
                 .collect();
+            excluded.extend(round.open.iter().filter_map(|w| {
+                refusal(w).map(|why| Excluded {
+                    unmet: vec![why],
+                    worker_id: w.worker_id.clone(),
+                    why: Exclusion::InputRefused,
+                })
+            }));
             let (compatible, mismatched): (Vec<&Reached>, Vec<&Reached>) = round
                 .open
                 .iter()
-                .filter(|w| ready(w) || measured_cold(w))
+                .filter(|w| refusal(w).is_none() && (ready(w) || measured_cold(w)))
                 .partition(|w| {
                     !lacks_ci(w)
                         && (spec.toolchains.is_none() || toolchain_eligible.contains(&w.worker_id))

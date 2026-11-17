@@ -104,6 +104,19 @@ impl InputGate {
             .unwrap_or_else(|e| e.into_inner())
             .preferred(self.generation(), crate::platform::monotonic_ms())
     }
+    /// The worker refused the input of `run` (see [`State::refuse`]).
+    pub fn refuse_input(&self, generation: u64, run: &crate::ids::RunId, why: &str) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .refuse(generation, run, why)
+    }
+    pub fn input_refusals(&self) -> Vec<(crate::ids::RunId, String)> {
+        self.state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .refusals()
+    }
     pub fn fail_preference(&self, run: &crate::ids::RunId) {
         self.preferences
             .lock()
@@ -219,6 +232,12 @@ pub trait WorkerLink: Send + Sync {
     }
     fn placement_inputs(&self) -> Option<PlacementInputs> {
         None
+    }
+    /// The runs whose input this worker did not take (the frozen plan of a
+    /// CI run it has no room for), with the reason, while that holds: it is
+    /// left out of the placement of the tasks of those runs, by name.
+    fn input_refusals(&self) -> Vec<(crate::ids::RunId, String)> {
+        Vec::new()
     }
     fn inputs_evaluated(&self, _generation: u64, _run: &crate::ids::RunId) {}
     /// Inspection without observing source gates or changing placement state.
@@ -338,6 +357,12 @@ impl WorkerLink for ClientLink {
     fn placement_inputs(&self) -> Option<PlacementInputs> {
         self.gate.as_ref().map(|gate| gate.placement_inputs())
     }
+    fn input_refusals(&self) -> Vec<(crate::ids::RunId, String)> {
+        self.gate
+            .as_ref()
+            .map(|gate| gate.input_refusals())
+            .unwrap_or_default()
+    }
     fn call(&self, request: Request) -> LinkFuture<'_> {
         Box::pin(async move {
             match self.client.call(request, self.timeout).await {
@@ -408,6 +433,9 @@ impl WorkerLink for Budgeted {
     }
     fn placement_inputs(&self) -> Option<PlacementInputs> {
         self.inner.placement_inputs()
+    }
+    fn input_refusals(&self) -> Vec<(crate::ids::RunId, String)> {
+        self.inner.input_refusals()
     }
     fn call(&self, request: Request) -> LinkFuture<'_> {
         Box::pin(async move {

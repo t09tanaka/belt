@@ -194,7 +194,19 @@ pub(super) async fn sources(
                             &input.source_id,
                             &ci.task.plan_digest,
                         );
-                        tokio::select! { _=input_stop.changed()=>return Ok(()), sent=sent=>sent.is_ok() }
+                        let sent = tokio::select! { _=input_stop.changed()=>return Ok(()), sent=sent=>sent };
+                        if let Err(fault) = &sent {
+                            plan_undelivered(
+                                &coordinator,
+                                &gate,
+                                &worker_id,
+                                generation,
+                                &input.run_id,
+                                fault,
+                            )
+                            .await;
+                        }
+                        sent.is_ok()
                     }
                 };
             if !delivered {
@@ -226,6 +238,56 @@ pub(super) async fn sources(
             }
         }
     }
+}
+
+/// The frozen plan of `run` did not reach this worker. A worker that does
+/// not take it is left out of the placement of the run by name (the gate
+/// keeps why, the run gets the event `ci_plan_refused` once per connection
+/// and reason); the delivery is tried again, and the refusal is over when it
+/// arrives. A plan the parent itself does not have ends the tasks of the run
+/// that were not placed yet (`ci_task_unrunnable`). Anything else is only
+/// tried again. Best effort: what cannot be recorded now is recorded at the
+/// next try.
+async fn plan_undelivered(
+    coordinator: &Arc<Coordinator>,
+    gate: &InputGate,
+    worker_id: &WorkerId,
+    generation: u64,
+    run: &RunId,
+    fault: &super::super::forward::PlanFault,
+) {
+    use super::super::forward::PlanFault;
+    let (owner, run) = (coordinator.clone(), run.clone());
+    match fault {
+        PlanFault::Retry(_) => {}
+        PlanFault::Unrunnable(why) => {
+            let why = why.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::ci::advance::fail_run(owner.store(), &run, &why, wall_ms())
+            })
+            .await;
+        }
+        PlanFault::Refused(why) => {
+            if gate.refuse_input(generation, &run, why) {
+                let payload = plan_refused_event(worker_id, why);
+                let _ = tokio::task::spawn_blocking(move || {
+                    owner.store().append_event(
+                        Some(&run),
+                        None,
+                        "ci_plan_refused",
+                        &payload,
+                        wall_ms(),
+                    )
+                })
+                .await;
+            }
+        }
+    }
+}
+
+/// What the run is told when a worker does not take its frozen plan.
+pub(super) fn plan_refused_event(worker_id: &WorkerId, why: &str) -> serde_json::Value {
+    serde_json::json!({ "worker": worker_id.to_string(), "reason": why })
 }
 
 pub(super) async fn secrets(

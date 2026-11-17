@@ -5254,6 +5254,94 @@ async fn ci_runs_a_chain_of_needs_with_outputs_and_every_job_once() {
     shutdown(&load(&spec)).await;
 }
 
+/// A worker that holds as many frozen plans as it may does not take one
+/// more. The run does not wait without a word: it gets the event
+/// `ci_plan_refused` once, the worker is left out of the placement by name
+/// (shown with the task), and when the worker has room again the plan is
+/// delivered and the run goes on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ci_says_why_it_waits_for_a_worker_whose_plan_store_is_full_and_goes_on_after() {
+    let (root, spec, input) = control_fixture();
+    let marks = ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/build\n",
+    );
+    // As many plans as a worker keeps, none of them the plan of this run.
+    let plans = remote_task_runner::worker::ci_task::plans_dir(&spec.worker_state_dir);
+    std::fs::create_dir_all(&plans).unwrap();
+    let fillers: Vec<std::path::PathBuf> = (0..remote_task_runner::worker::ci_task::MAX_PLANS)
+        .map(|n| {
+            let digest =
+                remote_task_runner::ids::Digest::of_bytes(format!("filler {n}").as_bytes());
+            let path =
+                remote_task_runner::worker::ci_task::plan_path(&spec.worker_state_dir, &digest);
+            std::fs::write(&path, b"{}").unwrap();
+            path
+        })
+        .collect();
+
+    let mut command = ci_command(&spec, &input);
+    command.kill_on_drop(true);
+    let running = tokio::spawn(async move { command.output().await.unwrap() });
+    let events = |kind: &str| -> Vec<remote_task_runner::storage::Event> {
+        let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) else {
+            return Vec::new();
+        };
+        let all = store.events_after(0, 10_000).unwrap_or_default();
+        all.into_iter().filter(|e| e.kind == kind).collect()
+    };
+    let started = std::time::Instant::now();
+    let (refused, waiting) = loop {
+        let (refused, waiting) = (events("ci_plan_refused"), events("task_waiting"));
+        if !refused.is_empty() && !waiting.is_empty() {
+            break (refused, waiting);
+        }
+        if started.elapsed() > Duration::from_secs(120) {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("the run did not say why it waits");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(!running.is_finished());
+    let reason = refused[0].payload["reason"].as_str().unwrap().to_string();
+    assert!(reason.contains("OVERLOADED"), "{reason}");
+    assert!(refused[0].payload["worker"].is_string());
+    let excluded = &waiting[0].payload["decision"]["excluded"];
+    assert_eq!(excluded[0]["why"], "input_refused", "{excluded}");
+    assert_eq!(excluded[0]["unmet"], serde_json::json!([reason]));
+    // As `show` reads it.
+    let run = remote_task_runner::ids::RunId::parse(refused[0].run_id.as_deref().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let tasks = store.query_tasks(run, 16, None).unwrap();
+    assert_eq!(tasks.items.len(), 1);
+    let placement = tasks.items[0].placement.clone().unwrap();
+    assert_eq!(placement.excluded[0].unmet, std::slice::from_ref(&reason));
+    drop(store);
+    assert!(ci_marks(&marks, "build").is_empty());
+
+    // The worker has room again: the delivery that is tried again arrives.
+    for path in &fillers {
+        std::fs::remove_file(path).unwrap();
+    }
+    let output = match tokio::time::timeout(Duration::from_secs(240), running).await {
+        Ok(output) => output.unwrap(),
+        Err(elapsed) => {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            panic!("ci did not end: {elapsed}");
+        }
+    };
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{value}");
+    assert_eq!(ci_jobs(&value)["build"].0, "success", "{value}");
+    assert_eq!(ci_marks(&marks, "build"), ["ran"]);
+    // Told once, however often the delivery was tried.
+    assert_eq!(events("ci_plan_refused").len(), 1);
+    shutdown(&load(&spec)).await;
+}
+
 /// A job that fails: the jobs that need it are skipped without a step
 /// started (and so is what needs those), `if: always()` and `if: failure()`
 /// run, and the run is a failure.

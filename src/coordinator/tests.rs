@@ -267,6 +267,7 @@ fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
             },
             hold,
             steps,
+            unrunnable: None,
         }),
         commands: vec![],
         ..spec()
@@ -423,4 +424,194 @@ async fn a_ci_task_is_queued_without_commands_and_what_no_worker_takes_is_refuse
     let pending = crate::scheduler::pending_plans(store, &f.worker).unwrap();
     assert_eq!(pending.len(), 2);
     assert_eq!(pending[1].nodes[0].node_id.as_str(), "main");
+}
+
+/// A run of three tasks of one plan: `first` is queued, `placed` has an
+/// attempt, `held` waits for the jobs it needs.
+async fn ci_run_of_three(f: &Fx) -> (RunId, TaskId, TaskId, TaskId) {
+    let source = SourceId::generate();
+    f.c.store()
+        .put_source_ref(&source, &Digest::of_bytes(b"manifest"), 1)
+        .unwrap();
+    let named = |name: &str, hold: bool| {
+        let mut spec = ci_spec(hold, 1);
+        spec.ci.as_mut().unwrap().task.task_id = name.into();
+        spec
+    };
+    let (run, first, placed, held) = (
+        RunId::generate(),
+        TaskId::generate(),
+        TaskId::generate(),
+        TaskId::generate(),
+    );
+    let tasks = vec![
+        (first.clone(), named("ci.yml/first", false)),
+        (placed.clone(), named("ci.yml/placed", false)),
+        (held.clone(), named("ci.yml/held", true)),
+    ];
+    f.c.enqueue(run.clone(), source, tasks).await.unwrap();
+    let outcome =
+        f.c.store()
+            .place(
+                &placed,
+                &f.worker,
+                &AttemptId::generate(),
+                |_| true,
+                |input| demand_of(input, 60_000),
+                2,
+            )
+            .unwrap();
+    assert!(matches!(outcome, PlaceOutcome::Placed(_)));
+    (run, first, placed, held)
+}
+
+fn unrunnable_events(store: &CoordinatorStore) -> Vec<(String, String)> {
+    store
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "ci_task_unrunnable")
+        .map(|e| {
+            (
+                e.payload["task"].as_str().unwrap().to_string(),
+                e.payload["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_ci_run_whose_plan_is_gone_ends_with_the_reason_instead_of_waiting() {
+    let f = fx();
+    let store = f.c.store();
+    let (run, first, placed, held) = ci_run_of_three(&f).await;
+    let state = f._dir.path().join("parent");
+    let results = state.join("results");
+
+    // The parent has no file of the plan: the run can never go on.
+    let pass = crate::ci::advance::advance_runs(store, &state, &results, 7).unwrap();
+    assert!(
+        pass.faults.is_empty() && pass.released.is_empty(),
+        "{pass:?}"
+    );
+    assert_eq!(pass.failed.len(), 1);
+    assert_eq!(pass.failed[0].0, run);
+    let why = pass.failed[0].1.clone();
+    assert!(why.contains("the frozen plan"), "{why}");
+    // What was not placed yet is cancelled, in the order it was made; the
+    // task that has an attempt is left to end.
+    let cancelled: Vec<&TaskId> = pass.unrunnable.iter().map(|(task, _)| task).collect();
+    assert_eq!(cancelled, [&first, &held]);
+    assert!(pass.unrunnable.iter().all(|(_, reason)| reason == &why));
+    let rows = store.ci_run_tasks(&run).unwrap();
+    let row = |task: &TaskId| rows.iter().find(|row| &row.task_id == task).unwrap();
+    assert!(row(&first).cancelled && row(&held).cancelled);
+    assert!(!row(&placed).cancelled);
+    assert_eq!(row(&held).spec["ci"]["unrunnable"], why.as_str());
+    assert_eq!(row(&first).spec["ci"]["unrunnable"], why.as_str());
+    assert!(row(&placed).spec["ci"].get("unrunnable").is_none());
+    assert!(store.queued_tasks(16).unwrap().is_empty());
+    // The reason is an event of the run, once per task, and is shown where
+    // the task is shown.
+    assert_eq!(
+        unrunnable_events(store),
+        [
+            (first.to_string(), why.clone()),
+            (held.to_string(), why.clone())
+        ]
+    );
+    let shown = store.query_task(held.clone()).unwrap().unwrap();
+    assert_eq!(shown.unrunnable.as_deref(), Some(why.as_str()));
+    assert!(shown.cancel_requested_at_ms.is_some());
+    let shown = store.query_task(placed.clone()).unwrap().unwrap();
+    assert_eq!(shown.unrunnable, None);
+    let page = store.query_tasks(run.clone(), 16, None).unwrap();
+    let reasons = page.items.iter().filter(|t| t.unrunnable.is_some()).count();
+    assert_eq!(reasons, 2);
+    let lines = crate::service::ci_run::job_lines(store, &results, &run).unwrap();
+    let line = |task: &TaskId| lines.iter().find(|line| &line.task_id == task).unwrap();
+    assert_eq!(line(&held).reason.as_deref(), Some(why.as_str()));
+    assert_eq!(line(&placed).reason, None);
+    let text = crate::service::ci_run::render_jobs(&lines);
+    assert!(
+        text.contains(&format!("ci.yml/held: no_result ({why})")),
+        "{text}"
+    );
+
+    // Nothing waits any more: the next pass does not see the run, and
+    // nothing is written twice.
+    assert!(store.ci_waiting_runs(16).unwrap().is_empty());
+    let again = crate::ci::advance::advance_runs(store, &state, &results, 8).unwrap();
+    assert_eq!(again, crate::ci::advance::Pass::default());
+    assert!(crate::ci::advance::fail_run(store, &run, "again", 9)
+        .unwrap()
+        .is_empty());
+    assert_eq!(unrunnable_events(store).len(), 2);
+}
+
+#[tokio::test]
+async fn a_ci_run_that_only_could_not_be_read_now_is_left_as_it_is_and_tried_again() {
+    let f = fx();
+    let store = f.c.store();
+    let (run, first, _placed, held) = ci_run_of_three(&f).await;
+    let state = f._dir.path().join("parent");
+    let results = state.join("results");
+    // Something that is not a file is where the plan is kept: the read
+    // fails, but not because the plan is gone.
+    let path = crate::worker::ci_task::plan_path(&state, &Digest::of_bytes(b"plan"));
+    std::fs::create_dir_all(&path).unwrap();
+    for _ in 0..2 {
+        let pass = crate::ci::advance::advance_runs(store, &state, &results, 7).unwrap();
+        assert!(pass.failed.is_empty() && pass.unrunnable.is_empty());
+        assert_eq!(pass.faults.len(), 1);
+        assert_eq!(pass.faults[0].0, run);
+        assert!(pass.faults[0].1.contains("the frozen plan"));
+        // The plan of a run that waits is kept.
+        assert!(pass.plans.contains(&Digest::of_bytes(b"plan")));
+    }
+    let rows = store.ci_run_tasks(&run).unwrap();
+    assert!(rows.iter().all(|row| !row.cancelled));
+    assert!(unrunnable_events(store).is_empty());
+    assert_eq!(
+        store.ci_waiting_runs(16).unwrap(),
+        std::slice::from_ref(&run)
+    );
+
+    // A file that is there but is not the plan: that will not pass.
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::write(&path, b"{}").unwrap();
+    let pass = crate::ci::advance::advance_runs(store, &state, &results, 8).unwrap();
+    assert_eq!(pass.failed.len(), 1);
+    assert!(pass.failed[0].1.contains("digest"), "{}", pass.failed[0].1);
+    assert!(store.ci_waiting_runs(16).unwrap().is_empty());
+
+    // Only one task, when one is named; one that is cancelled is not
+    // cancelled again, and a task of commands is never touched.
+    let (other, first_2, _placed_2, held_2) = ci_run_of_three(&f).await;
+    let one = store
+        .fail_ci_tasks(&other, Some(&held_2), "too large", 9)
+        .unwrap();
+    assert_eq!(one, std::slice::from_ref(&held_2));
+    assert!(store
+        .fail_ci_tasks(&other, Some(&held_2), "too large", 9)
+        .unwrap()
+        .is_empty());
+    let rows = store.ci_run_tasks(&other).unwrap();
+    let cancelled: Vec<&TaskId> = rows
+        .iter()
+        .filter(|r| r.cancelled)
+        .map(|r| &r.task_id)
+        .collect();
+    assert_eq!(cancelled, [&held_2]);
+    assert_eq!(
+        store.fail_ci_tasks(&other, None, "gone", 10).unwrap(),
+        [first_2]
+    );
+    let (plain, _attempt) = f.placed().await;
+    let plain_run = store.query_task(plain.clone()).unwrap().unwrap().run_id;
+    assert!(store
+        .fail_ci_tasks(&plain_run, None, "gone", 11)
+        .unwrap()
+        .is_empty());
+    let _ = (first, held);
 }
