@@ -76,7 +76,12 @@ pub fn read_result(
     let text = digest.to_string();
     let hex = text.strip_prefix("sha256:").unwrap_or(&text);
     let path = results.join(attempt.as_str()).join("artifacts").join(hex);
-    let bytes = read_capped(&path, MAX_RESULT_BYTES).map_err(|e| e.to_string())?;
+    read_result_at(&path, digest)
+}
+
+/// [`read_result`] of the file at `path`.
+pub fn read_result_at(path: &Path, digest: &Digest) -> Result<WireTaskResult, String> {
+    let bytes = read_capped(path, MAX_RESULT_BYTES).map_err(|e| e.to_string())?;
     if &Digest::of_bytes(&bytes) != digest {
         return Err("the bytes do not have the digest of the receipt".into());
     }
