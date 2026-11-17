@@ -288,6 +288,26 @@ impl CoordinatorStore {
         })
     }
 
+    /// Whether the task is one a placement may take now: the predicate of
+    /// [`Self::queued_tasks`] for one task. A read.
+    pub(crate) fn estimate_queued(&self, task: &TaskId) -> Result<bool> {
+        let queued = if self.retry_boundaries {
+            QUEUED
+        } else if self.task_cancel {
+            QUEUED_V1_CANCEL
+        } else {
+            QUEUED_V1
+        };
+        let task = task.to_string();
+        self.db.call(move |c| {
+            Ok(c.query_row(
+                &format!("SELECT EXISTS (SELECT 1 FROM task t WHERE t.task_id = ?1 AND {queued})"),
+                [&task],
+                |r| r.get::<_, bool>(0),
+            )?)
+        })
+    }
+
     /// The tasks that may be placed, oldest first (insertion order within
     /// the same millisecond).
     pub fn queued_tasks(&self, limit: u32) -> Result<Vec<QueuedTask>> {

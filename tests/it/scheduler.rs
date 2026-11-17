@@ -8,7 +8,9 @@
 //!
 //! No process is started here.
 
-use crate::coordinator::{attempts, enqueue, fx, only, queued, FakeWorker, Fx, Lost, Op, Says};
+use crate::coordinator::{
+    attempts, enqueue, fx, gated_worker, only, queued, ready_input, FakeWorker, Fx, Lost, Op, Says,
+};
 use remote_task_runner::coordinator::{Coordinator, CoordinatorError, WorkerLink};
 use remote_task_runner::error::{ApiError, BlockedReason, ErrorCode};
 use remote_task_runner::ids::*;
@@ -267,7 +269,9 @@ async fn a02_a_worker_that_joins_during_a_tick_is_counted_in_from_the_next_decis
 
 /// A worker that runs two tasks (20 s of queue) and has everything
 /// prepared, and an idle one that must be set up first.
-async fn busy_and_cold(cold_setup_ms: u64) -> (Fx, Coordinator, Arc<FakeWorker>, Decision) {
+async fn busy_and_cold_queued(
+    cold_setup_ms: u64,
+) -> (Fx, Coordinator, Arc<FakeWorker>, Arc<FakeWorker>, TaskId) {
     let mut f = fx();
     let model = Arc::new(Fixed::default());
     model.set(
@@ -301,9 +305,67 @@ async fn busy_and_cold(cold_setup_ms: u64) -> (Fx, Coordinator, Arc<FakeWorker>,
     c.attach(cold.id.clone(), Arc::clone(&cold) as Arc<dyn WorkerLink>)
         .await;
     let task = enqueue(&c, 1).await.remove(0);
+    (f, c, busy, cold, task)
+}
+
+async fn busy_and_cold(cold_setup_ms: u64) -> (Fx, Coordinator, Arc<FakeWorker>, Decision) {
+    let (f, c, _busy, cold, task) = busy_and_cold_queued(cold_setup_ms).await;
     c.tick().await.unwrap();
     let d = reason(&c, &only(&c, &task).attempt_id);
     (f, c, cold, d)
+}
+
+/// Everything a preview could have moved: the queue, the attempts, the
+/// reason a task waits for, the events, and what each worker holds and was
+/// told to do.
+#[derive(Debug, PartialEq)]
+struct Demand {
+    queued: Vec<TaskId>,
+    attempts: usize,
+    waiting: Option<Decision>,
+    events: usize,
+    workers: Vec<(Vec<AttemptId>, [usize; 4])>,
+}
+
+fn demand(c: &Coordinator, task: &TaskId, workers: &[&Arc<FakeWorker>]) -> Demand {
+    let told = |w: &&Arc<FakeWorker>| {
+        let received = [Op::Submit, Op::Cancel, Op::Retire, Op::Renew].map(|op| w.received(op));
+        (w.holds(), received)
+    };
+    Demand {
+        queued: queued(c),
+        attempts: attempts(c, task).len(),
+        waiting: c.scheduler().waiting_reason(task),
+        events: c.store().events_after(0, 10_000).unwrap().len(),
+        workers: workers.iter().map(told).collect(),
+    }
+}
+
+/// `estimate --task` and the placement that follows are the same judgement
+/// of the same facts: the worker, the rule, the order and every compared
+/// figure. The preview itself leaves the queue, the attempts and what the
+/// workers hold as they were, however often it is asked.
+#[tokio::test]
+async fn a_preview_names_the_worker_the_placement_then_takes_and_moves_nothing() {
+    for (cold_setup_ms, winner) in [(45_000, "w-busy"), (5000, "w-cold")] {
+        let (_f, c, busy, cold, task) = busy_and_cold_queued(cold_setup_ms).await;
+        let before = demand(&c, &task, &[&busy, &cold]);
+        assert_eq!((&before.queued, before.attempts), (&vec![task.clone()], 0));
+        let mut previews = Vec::new();
+        for _ in 0..100 {
+            let preview = c.estimate_task(task.clone()).await.unwrap();
+            assert!(preview.online && preview.conditional);
+            previews.push(preview.decision.expect("an online preview decides"));
+        }
+        assert_eq!(demand(&c, &task, &[&busy, &cold]), before);
+        c.tick().await.unwrap();
+        let placed = reason(&c, &only(&c, &task).attempt_id);
+        assert_eq!(placed.winner.as_ref().unwrap().as_str(), winner);
+        assert_eq!(worker_of(&c, &task), winner);
+        for preview in previews {
+            assert_eq!(preview, placed);
+        }
+    }
 }
 
 #[tokio::test]
@@ -350,6 +412,67 @@ async fn a03_a_cold_worker_that_is_set_up_quickly_beats_the_queue() {
     assert_eq!(d.compared[0].predicted_ms, Some(21_000));
     assert_eq!(d.compared[1].predicted_ms, Some(31_000));
     assert_eq!(d.why, Why::Earliest);
+}
+
+/// With input gates, the preview of a queued task follows the input of its
+/// run as the placement does: no decision while no worker holds the source,
+/// only the workers that hold it are asked, and a worker that refused the
+/// input is left out by name.
+#[tokio::test]
+async fn a_preview_of_a_queued_task_follows_the_input_of_its_run_as_the_placement_does() {
+    for refuses in [false, true] {
+        let f = fx();
+        let (a, b) = (f.worker("w-a", (2, 1)), f.worker("w-b", (2, 1)));
+        let c = f.open(&[]);
+        let (gate_a, gate_b) = (gated_worker(&a), gated_worker(&b));
+        c.attach(a.id.clone(), gate_a.clone()).await;
+        c.attach(b.id.clone(), gate_b.clone()).await;
+        let task = enqueue(&c, 1).await.remove(0);
+        let input = c.store().queued_tasks(1).unwrap().remove(0);
+
+        // Nobody holds the source: a tick decides nothing, and so does the preview.
+        let before = demand(&c, &task, &[&a, &b]);
+        let preview = c.estimate_task(task.clone()).await.unwrap();
+        assert!(preview.online && preview.conditional);
+        assert_eq!(preview.decision, None);
+        let waits = |note: &String| note.starts_with("no decision yet");
+        assert!(preview.assumptions.iter().any(waits), "{}", preview.human());
+        assert_eq!(demand(&c, &task, &[&a, &b]), before);
+        assert!(c.tick().await.unwrap().placed.is_empty());
+        assert_eq!(c.scheduler().waiting_reason(&task), None);
+
+        // The source is ready on `w-b` only; `w-a` (the lower id, which
+        // would win a tie) does not hold it, or refused it.
+        if refuses {
+            let generation = gate_a.gate.generation();
+            assert!(gate_a
+                .gate
+                .refuse_input(generation, &input.run_id, "no room for the plan"));
+        }
+        gate_b
+            .gate
+            .publish(gate_b.gate.generation(), ready_input(&input));
+        let before = demand(&c, &task, &[&a, &b]);
+        let mut previews = Vec::new();
+        for _ in 0..10 {
+            previews.push(c.estimate_task(task.clone()).await.unwrap());
+        }
+        assert_eq!(demand(&c, &task, &[&a, &b]), before);
+        c.tick().await.unwrap();
+        let placed = reason(&c, &only(&c, &task).attempt_id);
+        assert_eq!(compared(&placed), ["w-b"]);
+        let out: &[(&str, Exclusion)] = if refuses {
+            &[("w-a", Exclusion::InputRefused)]
+        } else {
+            &[]
+        };
+        assert_eq!(excluded(&placed), out);
+        for preview in previews {
+            let not_asked = |note: &String| note.starts_with("w-a: not asked");
+            assert_eq!(preview.assumptions.iter().any(not_asked), !refuses);
+            assert_eq!(preview.decision, Some(placed.clone()));
+        }
+    }
 }
 
 // ------------------------------------------------------------------- A04

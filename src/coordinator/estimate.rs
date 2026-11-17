@@ -2,31 +2,38 @@
 use super::*;
 use crate::error::ApiError;
 use crate::ids::{Digest, NodeId};
-type PreviewFuture<'a> = Pin<
-    Box<
-        dyn Future<
-                Output = std::result::Result<
-                    (
-                        Candidate,
-                        crate::wire::ForecastResponse,
-                        Instant,
-                        WorkerBootId,
-                        AgentEpoch,
-                        scheduler::measured::CostQuery,
-                    ),
-                    Excluded,
-                >,
-            > + Send
-            + 'a,
-    >,
->;
+/// A worker a preview may compare: it was inspected, takes the task and has
+/// room. Nothing here was written anywhere.
+struct Reachable {
+    worker_id: WorkerId,
+    link: Arc<dyn WorkerLink>,
+    boot: WorkerBootId,
+    epoch: AgentEpoch,
+    load: u32,
+    cost_query: scheduler::measured::CostQuery,
+    costs: decide::Costs,
+    /// The source of the run is there (always, when the preview does not
+    /// follow the queue).
+    ready: bool,
+}
+/// What a worker said to the forecast question of a preview.
+enum Said {
+    Answer(Instant, Box<crate::wire::ForecastResponse>),
+    /// It answered with an error: compared without a number, as a placement
+    /// compares a ready worker that refused the question.
+    Refused,
+    Silent,
+}
+type LookFuture<'a> =
+    Pin<Box<dyn Future<Output = std::result::Result<Reachable, Option<Excluded>>> + Send + 'a>>;
+type SaidFuture<'a> = Pin<Box<dyn Future<Output = Said> + Send + 'a>>;
 impl Coordinator {
     pub async fn estimate(
         &self,
         query: crate::service::estimate::Query,
     ) -> Result<crate::service::estimate::Estimate, ApiError> {
         query.check()?;
-        self.preview(query, None).await
+        self.preview(query, None, false).await
     }
 
     pub async fn estimate_task(
@@ -36,6 +43,13 @@ impl Coordinator {
         let input = crate::service::estimate::frozen_input(self.store(), &task_id)?;
         let spec: TaskSpec = serde_json::from_value(input.spec.clone())
             .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+        // A task that waits in the queue is answered as its placement would
+        // decide now; any other stored task as a further run of its inputs.
+        let task = task_id.clone();
+        let queued = self
+            .db(move |s| s.estimate_queued(&task))
+            .await
+            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
         self.preview(
             crate::service::estimate::Query {
                 version: 1,
@@ -45,6 +59,7 @@ impl Coordinator {
                 requirements: spec.requirements,
             },
             Some(input),
+            queued,
         )
         .await
     }
@@ -53,6 +68,7 @@ impl Coordinator {
         &self,
         query: crate::service::estimate::Query,
         input: Option<QueuedTask>,
+        queued: bool,
     ) -> Result<crate::service::estimate::Estimate, ApiError> {
         let spec = input
             .as_ref()
@@ -85,10 +101,11 @@ impl Coordinator {
             })
             .await
             .map_err(invalid)?;
-        let mut excluded = vec![];
-        let mut candidates = vec![];
-        let mut forecasts = vec![];
-        let mut evidence_queries = BTreeMap::new();
+        // The workers this task is not placed on again; a read of the queue.
+        let refused = match &input {
+            Some(input) => self.refused_by(&input.task_id).await.map_err(invalid)?,
+            None => BTreeSet::new(),
+        };
         let plan_digest = match &spec {
             Some(spec) => spec.plan_digest.clone(),
             None => Digest::of_bytes(
@@ -98,19 +115,28 @@ impl Coordinator {
         };
         let attempt = AttemptId::generate();
         let preparation_profiles = Mutex::new(BTreeMap::new());
-        let questions = workers
+        // Of a queued task: how every worker a placement may use stands by
+        // the input of the run, and the workers it would not ask.
+        let open = Mutex::new(Vec::new());
+        let not_asked = Mutex::new(Vec::new());
+        let looks: Vec<LookFuture<'_>> = workers
             .into_iter()
             .map(|(worker_id, link)| {
                 let preparation_profiles = &preparation_profiles;
+                let open = &open;
+                let not_asked = &not_asked;
                 let query = &query;
                 let loads = &loads;
-                let pending = &pending;
-                let attempt = &attempt;
-                let plan_digest = &plan_digest;
+                let refused = &refused;
                 let input = input.as_ref();
                 let spec = spec.as_ref();
                 let parent_local = &parent_local;
-                let question = async move {
+                let look = async move {
+                    let out = |worker_id, why, unmet| Excluded {
+                        worker_id,
+                        why,
+                        unmet,
+                    };
                     let response = tokio::time::timeout(
                         self.sched.forecast_wait(),
                         link.read_only_call(Request::Inspect(crate::wire::InspectRequest {
@@ -121,33 +147,46 @@ impl Coordinator {
                     )
                     .await;
                     let Ok(Ok(Response::Inspect(inspect))) = response else {
-                        return Err(Excluded {
-                            worker_id,
-                            why: Exclusion::Unreached,
-                            unmet: vec![],
-                        });
+                        return Err(Some(out(worker_id, Exclusion::Unreached, vec![])));
                     };
                     if spec.is_some() && inspect.worker_id == worker_id {
                         if let Some(cap) = inspect.capabilities.as_ref() {
-                            let mut profiles = preparation_profiles.lock().unwrap_or_else(|e| e.into_inner());
+                            let mut profiles = preparation_profiles
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
                             if profiles.len() < 256 {
-                                profiles.insert(worker_id.clone(), (cap.profile_fingerprint.clone(), inspect.worker_boot_id.clone(), inspect.agent_epoch, Arc::clone(&link)));
+                                profiles.insert(
+                                    worker_id.clone(),
+                                    (
+                                        cap.profile_fingerprint.clone(),
+                                        inspect.worker_boot_id.clone(),
+                                        inspect.agent_epoch,
+                                        Arc::clone(&link),
+                                    ),
+                                );
                             }
                         }
                     }
                     let bundle = spec.and_then(|spec| spec.toolchains.as_ref());
                     let mut bundle_valid = bundle.is_none();
                     if let Some(bundle) = bundle {
-                        let response = tokio::time::timeout(
-                            self.sched.forecast_wait(),
-                            link.read_only_call(Request::ResolveToolchains(crate::wire::ResolveToolchainsRequest {
+                        let request =
+                            Request::ResolveToolchains(crate::wire::ResolveToolchainsRequest {
                                 schema_version: SchemaVersion::CURRENT,
                                 request_id: RequestId::generate(),
                                 bundle: bundle.clone(),
                                 requirements: query.requirements.clone(),
-                            })),
-                        ).await;
-                        bundle_valid = matches!(response, Ok(Ok(Response::ResolveToolchains(ref resolved))) if resolved.bundle == *bundle);
+                            });
+                        let response = tokio::time::timeout(
+                            self.sched.forecast_wait(),
+                            link.read_only_call(request),
+                        )
+                        .await;
+                        bundle_valid = matches!(
+                            response,
+                            Ok(Ok(Response::ResolveToolchains(ref resolved)))
+                                if resolved.bundle == *bundle
+                        );
                     }
                     let mut unmet = crate::toolchain::capability::missing_with_installable(
                         &query.requirements,
@@ -160,10 +199,20 @@ impl Coordinator {
                         inspect.capabilities.as_ref(),
                     );
                     if !bundle_valid {
-                        unmet.push("stored frozen toolchains are not proven eligible on this worker".into());
+                        unmet.push(
+                            "stored frozen toolchains are not proven eligible on this worker"
+                                .into(),
+                        );
                     }
-                    if spec.is_some_and(|spec| spec.in_place) && parent_local.as_ref() != Some(&worker_id) {
+                    if spec.is_some_and(|spec| spec.in_place)
+                        && parent_local.as_ref() != Some(&worker_id)
+                    {
                         unmet.push("in-place task requires the parent-local worker".into());
+                    }
+                    if spec
+                        .is_some_and(|spec| policy::lacks_ci_task(spec, link.ci_task_negotiated()))
+                    {
+                        unmet.push(policy::CI_TASK_UNMET.to_string());
                     }
                     let command_supported = inspect
                         .capabilities
@@ -173,148 +222,323 @@ impl Coordinator {
                         unmet.push("forecast_command_v1 unavailable".into());
                     }
                     let load = loads[&worker_id];
-                    let why = if inspect.worker_id != worker_id {
-                        Some(Exclusion::Unreached)
+                    let limits = self.cfg.limits.stricter(Limits {
+                        max_active_task: inspect.max_active_task,
+                        prefetch_per_worker: inspect.prefetch_per_worker,
+                    });
+                    if inspect.worker_id != worker_id {
+                        return Err(Some(out(worker_id, Exclusion::Unreached, unmet)));
+                    }
+                    if inspect.draining {
+                        return Err(Some(out(worker_id, Exclusion::Draining, unmet)));
+                    }
+                    // Readiness as a placement reads it; `None` is not ready,
+                    // `Some(None)` a link without an input gate.
+                    let following = input.zip(spec).filter(|_| queued);
+                    let readiness = match following {
+                        None => Some(None),
+                        Some((_, spec))
+                            if spec.in_place && parent_local.as_ref() != Some(&worker_id) =>
+                        {
+                            None
+                        }
+                        Some((input, spec)) => match link.placement_inputs() {
+                            None => Some(None),
+                            Some(snapshot) => snapshot
+                                .ready
+                                .iter()
+                                .any(|ready| {
+                                    ready.run_id == input.run_id
+                                        && Some(&ready.source_id) == input.source_id.as_ref()
+                                        && ready.manifest_digest == spec.manifest_digest
+                                })
+                                .then_some(Some(snapshot.generation)),
+                        },
+                    };
+                    let ready = readiness.is_some();
+                    if let Some((input, spec)) = following {
+                        let refusal =
+                            policy::input_refusal(ready, link.input_refusals(), &input.run_id);
+                        open.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push((ready, refusal.is_some()));
+                        if !policy::has_room(load, limits) {
+                            return Err(Some(out(worker_id, Exclusion::Full, unmet)));
+                        }
+                        let measured_cold =
+                            !ready && !spec.in_place && link.cold_eligible(&input.task_id) && {
+                                let query = scheduler::measured::CostQuery::task(
+                                    &input.spec,
+                                    input.source_id.as_ref().map(|source| source.as_str()),
+                                    link.cost_transport(),
+                                );
+                                let costs = self.sched.query(&worker_id, &query);
+                                costs.ms[decide::TRANSFER].is_some()
+                                    && !costs.assumed[decide::TRANSFER]
+                            };
+                        match scheduler::preview::source_gate(ready, refusal, measured_cold) {
+                            scheduler::preview::Gate::Asked => {}
+                            scheduler::preview::Gate::InputRefused(why) => {
+                                return Err(Some(out(
+                                    worker_id,
+                                    Exclusion::InputRefused,
+                                    vec![why],
+                                )));
+                            }
+                            scheduler::preview::Gate::NotReady => {
+                                not_asked
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                                    .push(worker_id);
+                                return Err(None);
+                            }
+                        }
+                    }
+                    let why = if !policy::has_room(load, limits) {
+                        Some(Exclusion::Full)
                     } else if !unmet.is_empty() {
                         Some(Exclusion::CapabilityMismatch)
-                    } else if inspect.draining {
-                        Some(Exclusion::Draining)
-                    } else if !policy::has_room(
-                        load,
-                        self.cfg.limits.stricter(Limits {
-                            max_active_task: inspect.max_active_task,
-                            prefetch_per_worker: inspect.prefetch_per_worker,
-                        }),
-                    ) {
-                        Some(Exclusion::Full)
+                    } else if refused.contains(&worker_id) {
+                        Some(Exclusion::RefusedTask)
                     } else {
                         None
                     };
                     if let Some(why) = why {
-                        return Err(Excluded {
-                            worker_id,
-                            why,
-                            unmet,
-                        });
+                        return Err(Some(out(worker_id, why, unmet)));
                     }
-                    let transport = link.cost_transport().filter(|transport| {
-                        transport.worker_boot == inspect.worker_boot_id && transport.agent_epoch == inspect.agent_epoch
-                    });
-                    let mut cost_query = match input {
-                        Some(input) => scheduler::measured::CostQuery::task(
-                            &input.spec, input.source_id.as_ref().map(|source| source.as_str()), transport,
+                    let mut cost_query = match (input, following) {
+                        // What a placement asks the cost model.
+                        (Some(input), Some(_)) => {
+                            let mut query = scheduler::measured::CostQuery::task(
+                                &input.spec,
+                                input.source_id.as_ref().map(|source| source.as_str()),
+                                link.cost_transport(),
+                            );
+                            query.ready = readiness.is_some_and(|generation| generation.is_some());
+                            query
+                        }
+                        (Some(input), None) => scheduler::measured::CostQuery::task(
+                            &input.spec,
+                            input.source_id.as_ref().map(|source| source.as_str()),
+                            link.cost_transport().filter(|transport| {
+                                transport.worker_boot == inspect.worker_boot_id
+                                    && transport.agent_epoch == inspect.agent_epoch
+                            }),
                         ),
-                        None => scheduler::measured::CostQuery { transport, ..Default::default() },
+                        (None, _) => scheduler::measured::CostQuery {
+                            transport: link.cost_transport().filter(|transport| {
+                                transport.worker_boot == inspect.worker_boot_id
+                                    && transport.agent_epoch == inspect.agent_epoch
+                            }),
+                            ..Default::default()
+                        },
                     };
-                    if let (Some(input), Some(spec)) = (input, spec) {
-                        cost_query.ready = cost_query.transport.is_some() && link.placement_inputs().is_some_and(|snapshot| {
-                            snapshot.identity.as_ref().is_some_and(|(boot, epoch)| boot == &inspect.worker_boot_id && *epoch == inspect.agent_epoch)
-                            && snapshot.ready.iter().any(|ready| ready.run_id == input.run_id
-                                && Some(&ready.source_id) == input.source_id.as_ref()
-                                && ready.manifest_digest == spec.manifest_digest)
-                        });
+                    if let (Some(input), Some(spec), None) = (input, spec, following) {
+                        let same = |snapshot: &PlacementInputs| {
+                            snapshot.identity.as_ref().is_some_and(|(boot, epoch)| {
+                                boot == &inspect.worker_boot_id && *epoch == inspect.agent_epoch
+                            }) && snapshot.ready.iter().any(|ready| {
+                                ready.run_id == input.run_id
+                                    && Some(&ready.source_id) == input.source_id.as_ref()
+                                    && ready.manifest_digest == spec.manifest_digest
+                            })
+                        };
+                        cost_query.ready = cost_query.transport.is_some()
+                            && link.placement_inputs().is_some_and(|s| same(&s));
                     }
-                    let costs = self.sched.query(&worker_id, &cost_query);
-                    let workload = if let Some(spec) = spec {
-                        scheduler::workload_of(attempt, plan_digest, &spec.commands, decide::ready_delay_ms(&costs))
-                    } else { scheduler::workload_of(
-                        attempt,
-                        plan_digest,
-                        &[CommandSpec {
-                            node_id: NodeId::parse("command").expect("static node"),
-                            argv: query.argv.clone(),
-                            cwd: query.cwd_relative.clone(),
-                            env: BTreeMap::new(),
-                            depends_on: vec![],
-                            timeout_ms: None,
-                            setup_step: None,
-                        }],
-                        None,
-                    ) };
+                    let measured = self.sched.query(&worker_id, &cost_query);
+                    // The same assembly a placement compares by.
+                    let costs = match input {
+                        Some(input) => scheduler::preview::merge_costs(
+                            measured,
+                            self.sched.costs(&worker_id, input),
+                        ),
+                        None => measured,
+                    };
+                    Ok(Reachable {
+                        worker_id,
+                        link,
+                        boot: inspect.worker_boot_id,
+                        epoch: inspect.agent_epoch,
+                        load: load.active.saturating_add(load.pending),
+                        cost_query,
+                        costs,
+                        ready,
+                    })
+                };
+                Box::pin(look) as LookFuture<'_>
+            })
+            .collect();
+        let mut excluded = vec![];
+        let mut reached = vec![];
+        for look in join_all(looks).await {
+            match look {
+                Ok(worker) => reached.push(worker),
+                Err(reason) => excluded.extend(reason),
+            }
+        }
+        let open = open.into_inner().unwrap_or_else(|e| e.into_inner());
+        if queued && scheduler::preview::waits_for_input(&open) {
+            // A tick decides nothing for this task now, and records nothing.
+            return Ok(crate::service::estimate::Estimate {
+                version: 1,
+                online: true,
+                source_kind: "captured".into(),
+                conditional: true,
+                decision: None,
+                forecasts: vec![],
+                components: vec![],
+                assumptions: vec![
+                    "no decision yet: no attached worker holds the source of the run or refused its input; a placement waits until one does".into(),
+                    "queued task: the answer is what a placement decides from the current state of the workers".into(),
+                ],
+            });
+        }
+        // As a placement does: what nobody measured for a worker is the worst
+        // known figure before the workers are asked, so the question carries
+        // the same time before the task is ready there.
+        let mut costs: Vec<_> = reached.iter().map(|w| w.costs).collect();
+        decide::fill_costs(&mut costs);
+        for (worker, costs) in reached.iter_mut().zip(costs) {
+            worker.costs = costs;
+        }
+        let questions: Vec<SaidFuture<'_>> = reached
+            .iter()
+            .map(|worker| {
+                let query = &query;
+                let pending = &pending;
+                let attempt = &attempt;
+                let plan_digest = &plan_digest;
+                let spec = spec.as_ref();
+                let question = async move {
+                    let workload = match spec {
+                        Some(spec) => policy::workload_of_spec(
+                            attempt,
+                            spec,
+                            decide::ready_delay_ms(&worker.costs),
+                        ),
+                        None => scheduler::workload_of(
+                            attempt,
+                            plan_digest,
+                            &[CommandSpec {
+                                node_id: NodeId::parse("command").expect("static node"),
+                                argv: query.argv.clone(),
+                                cwd: query.cwd_relative.clone(),
+                                env: BTreeMap::new(),
+                                depends_on: vec![],
+                                timeout_ms: None,
+                                setup_step: None,
+                            }],
+                            None,
+                        ),
+                    };
                     let forecast = ForecastRequest {
                         schema_version: SchemaVersion::CURRENT,
                         request_id: RequestId::generate(),
                         coordinator_epoch: self.epoch(),
                         workload,
-                        pending: pending.get(&worker_id).cloned().unwrap_or_default(),
+                        pending: pending.get(&worker.worker_id).cloned().unwrap_or_default(),
                     };
                     let request = if spec.is_some() {
                         Request::Forecast(forecast)
-                    } else { Request::ForecastCommand(crate::wire::ForecastCommandRequest {
-                        schema_version: SchemaVersion::CURRENT,
-                        request_id: RequestId::generate(),
-                        coordinator_epoch: self.epoch(),
-                        version: 1,
-                        repository_id: query.repository_id.clone(),
-                        cwd_relative: query.cwd_relative.clone(),
-                        argv: query.argv.clone(),
-                        forecast,
-                    }) };
+                    } else {
+                        Request::ForecastCommand(crate::wire::ForecastCommandRequest {
+                            schema_version: SchemaVersion::CURRENT,
+                            request_id: RequestId::generate(),
+                            coordinator_epoch: self.epoch(),
+                            version: 1,
+                            repository_id: query.repository_id.clone(),
+                            cwd_relative: query.cwd_relative.clone(),
+                            argv: query.argv.clone(),
+                            forecast,
+                        })
+                    };
+                    // The age of the answer counts from before the question left.
                     let sent = Instant::now();
                     let answer = tokio::time::timeout(
                         self.sched.forecast_wait(),
-                        link.read_only_call(request),
+                        worker.link.read_only_call(request),
                     )
                     .await;
-                    let answer = match answer {
-                        Ok(Ok(Response::Forecast(answer))) if spec.is_some() => answer,
-                        Ok(Ok(Response::ForecastCommand(answer))) if spec.is_none() => answer,
-                        _ => return Err(Excluded { worker_id, why: Exclusion::NoForecast, unmet: vec![] }),
-                    };
-                    let outlook = decide::outlook_of(
-                        &Asked {
-                            worker_id: &worker_id,
-                            plan_digest,
-                            boot_id: &inspect.worker_boot_id,
-                            agent_epoch: inspect.agent_epoch,
-                        },
-                        &answer,
-                        u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        self.sched.cfg.rules.forecast_ttl_ms,
-                    );
-                    Ok((
-                        Candidate {
-                            worker_id: worker_id.clone(),
-                            priority: self.sched.priority_of(&worker_id),
-                            load: load.active.saturating_add(load.pending),
-                            costs,
-                            outlook,
-                        },
-                        answer,
-                        sent,
-                        inspect.worker_boot_id,
-                        inspect.agent_epoch,
-                        cost_query,
-                    ))
+                    match answer {
+                        Ok(Ok(Response::Forecast(answer))) if spec.is_some() => {
+                            Said::Answer(sent, Box::new(answer))
+                        }
+                        Ok(Ok(Response::ForecastCommand(answer))) if spec.is_none() => {
+                            Said::Answer(sent, Box::new(answer))
+                        }
+                        Ok(Err(LinkError::Remote(e)))
+                            if spec.is_some() && e.code != ErrorCode::StaleEpoch =>
+                        {
+                            Said::Refused
+                        }
+                        _ => Said::Silent,
+                    }
                 };
-                Box::pin(question) as PreviewFuture<'_>
+                Box::pin(question) as SaidFuture<'_>
             })
             .collect();
-        for answer in join_all(questions).await {
-            match answer {
-                Ok((mut candidate, forecast, sent, boot, epoch, cost_query)) => {
-                    evidence_queries.insert(candidate.worker_id.clone(), cost_query);
-                    candidate.outlook = decide::outlook_of(
-                        &Asked {
-                            worker_id: &candidate.worker_id,
-                            plan_digest: &plan_digest,
-                            boot_id: &boot,
-                            agent_epoch: epoch,
-                        },
-                        &forecast,
-                        u64::try_from(sent.elapsed().as_millis()).unwrap_or(u64::MAX),
-                        self.sched.cfg.rules.forecast_ttl_ms,
-                    );
-                    candidates.push(candidate);
-                    forecasts.push(forecast);
+        let answers = join_all(questions).await;
+        let now = Instant::now();
+        let mut candidates = vec![];
+        let mut forecasts = vec![];
+        let mut evidence_queries = BTreeMap::new();
+        let mut cold = BTreeSet::new();
+        let ttl = self.sched.cfg.rules.forecast_ttl_ms;
+        for (worker, said) in reached.into_iter().zip(answers) {
+            let mut left = 0;
+            let outlook = match said {
+                Said::Silent => {
+                    excluded.push(Excluded {
+                        worker_id: worker.worker_id,
+                        why: Exclusion::NoForecast,
+                        unmet: vec![],
+                    });
+                    continue;
                 }
-                Err(reason) => excluded.push(reason),
+                Said::Refused => Outlook::unusable(decide::Unusable::Refused),
+                Said::Answer(sent, answer) => {
+                    let age = now.saturating_duration_since(sent).as_millis();
+                    let outlook = decide::outlook_of(
+                        &Asked {
+                            worker_id: &worker.worker_id,
+                            plan_digest: &plan_digest,
+                            boot_id: &worker.boot,
+                            agent_epoch: worker.epoch,
+                        },
+                        &answer,
+                        u64::try_from(age).unwrap_or(u64::MAX),
+                        ttl,
+                    );
+                    left = ttl
+                        .min(answer.ttl_ms)
+                        .saturating_sub(u64::try_from(age).unwrap_or(u64::MAX));
+                    forecasts.push(*answer);
+                    outlook
+                }
+            };
+            // As a placement: a worker without the source is compared only
+            // by a usable answer that has not expired.
+            if !scheduler::preview::forecast_counts(worker.ready, outlook.unusable.is_some(), left)
+            {
+                excluded.push(Excluded {
+                    worker_id: worker.worker_id,
+                    why: Exclusion::NoForecast,
+                    unmet: vec![],
+                });
+                continue;
             }
-        }
-        let mut costs: Vec<_> = candidates.iter().map(|c| c.costs).collect();
-        decide::fill_costs(&mut costs);
-        for (candidate, costs) in candidates.iter_mut().zip(costs) {
-            candidate.costs = costs;
+            if !worker.ready {
+                cold.insert(worker.worker_id.clone());
+            }
+            evidence_queries.insert(worker.worker_id.clone(), worker.cost_query);
+            candidates.push(Candidate {
+                priority: self.sched.priority_of(&worker.worker_id),
+                worker_id: worker.worker_id,
+                load: worker.load,
+                costs: worker.costs,
+                outlook,
+            });
         }
         let decision = decide::decide(candidates, excluded, self.sched.cfg.rules);
         let components = decision
@@ -358,10 +582,24 @@ impl Coordinator {
         };
         let assumptions = if let Some(spec) = &spec {
             let mut notes = vec![
-                "hypothetical rerun using stored commands, environment, setup, frozen toolchains and output plan; not remaining runtime".into(),
+                if queued {
+                    "queued task: the answer is what a placement decides from the current state of the workers; not remaining runtime".into()
+                } else {
+                    "hypothetical rerun using stored commands, environment, setup, frozen toolchains and output plan; not remaining runtime".into()
+                },
                 "captured source kind is unknown; native runtime history correlation is unproven; fallback values rank candidates only".into(),
                 "preview is conditional on current worker state; unobserved setup and additional inputs remain unknown".into(),
             ];
+            for worker in not_asked.into_inner().unwrap_or_else(|e| e.into_inner()) {
+                notes.push(format!(
+                    "{worker}: not asked: it does not hold the source of the run and no transfer there is measured"
+                ));
+            }
+            if let Some(worker) = decision.winner.as_ref().filter(|w| cold.contains(*w)) {
+                notes.push(format!(
+                    "{worker} does not hold the source yet: a placement sends it there first and decides again when it is ready"
+                ));
+            }
             if identity_observed {
                 notes.push("selected worker preparation identity observed; availability, activation and setup delay remain unknown".into());
             }
