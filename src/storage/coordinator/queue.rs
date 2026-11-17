@@ -10,7 +10,7 @@ use super::{
     attempt_from_row, id, load_attempt, not_found, observation_str, run_of, AttemptRecord,
     CoordinatorStore, Placement, ATTEMPT, ATTEMPT_COLS,
 };
-use crate::ids::{AttemptId, Generation, PayloadHash, RunId, SourceId, TaskId, WorkerId};
+use crate::ids::{AttemptId, Generation, PayloadHash, PermitId, RunId, SourceId, TaskId, WorkerId};
 use crate::state::{AttemptState, Observation, Outcome, Receipt, Receipts, Termination};
 use crate::storage::common::{self, from_json, json};
 use crate::storage::policy::state_path;
