@@ -165,8 +165,9 @@ pub enum Reply {
     },
 }
 
-/// The digest of this process's executable, read once. The resident reads it
-/// when it starts, so a binary replaced on disk later does not change it.
+/// The digest of this process's executable, read once. The resident begins
+/// reading it when it starts (on a thread of its own: startup does not wait
+/// for it), so a binary replaced on disk later does not change it.
 pub(crate) fn own_build() -> Option<&'static str> {
     static BUILD: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
     BUILD
@@ -668,7 +669,7 @@ impl Resident {
             !inputs.collection_interval.is_zero(),
             "zero collection interval"
         );
-        own_build();
+        std::thread::spawn(own_build);
         anyhow::ensure!(
             config.local_worker.value,
             "local resident requires local worker"
@@ -1126,7 +1127,9 @@ async fn handle(
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
     if matches!(request.operation, Operation::Build) {
-        return write_message(&mut stream, &build_reply(own_build()))
+        // The digest may still be being read; the runtime does not wait for it.
+        let build = tokio::task::spawn_blocking(own_build).await?;
+        return write_message(&mut stream, &build_reply(build))
             .await
             .map_err(Into::into);
     }
