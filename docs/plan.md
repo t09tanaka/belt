@@ -1177,6 +1177,9 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 この変更で分かった制約（local-ci 0.13.0 の公開 API による。設計の判断が要る）:
 
 - `PinnedExecution::verify_workspace` は、workspace が captured source と byte 単位で一致するときだけ束縛する（secret の配置と setup の前に呼ぶ契約）。束縛（`PinnedWorkspace`）は process 内の値で、supervisor の process でしか作れない。RTR は agent が secret bundle の配置と prepared setup の複製を済ませてから supervisor を起動するので、secret_files を持つ source・prepared setup・fast-worktree の `[[clone]]` で依存を複製する worktree では束縛できない。この変更では、secret bundle・prepared setup・in-place を伴う CI task を受理の時点で断り（理由の文言に local-ci の束縛の拡張待ちであることを入れた）、束縛できない workspace は step を起動せずに failed にする。決定（2026-11-17、親）: local-ci の側に、宣言された上書き（manifest の secret_files の path、prepared setup の出力、`[[clone]]` で複製した依存の path）を除いて照合する束縛を足す。RTR の側で順序を変える回避はしない。その API が出たら、受理の拒否を外して束縛を差し替える。
+- Git worktree の source のテストは、fast-worktree の代わりに Git だけの代役（依存を複製しない）で workspace を作っている。実物の fast-worktree が `[[clone]]` や `post_add` で workspace に何かを足した場合は束縛できず（上の拡張待ち）、テストもしていない。
+- step や job の `timeout-minutes` が切れると、その step を失敗にして `if: failure()` の step を続けるのではなく、attempt 全体が timed_out で終わる（timeout を supervisor の停止理由として扱うため）。cancel・lease・deadline は step の実行中と次の step の admission で見ており、step と step の間では見ていない。
+- テストしていないもの: 交渉していない接続からの CI task を `worker/serve.rs` が断ること、再起動した supervisor の recover が `step-N` の node を引くこと（名前の解析だけテスト済み）、profile や toolchain の binding が有るときの `base_env`、plan と inputs の大きさの上限（`store_plan` の上限だけテスト済み）。
 - step の script を pipe から読む step（GitHub token を持つ script）は、task-traffic-controller の起動経路で fd を渡せないので実行できず、その step は error になる。
 - matrix の variant ごとの workspace（`PinnedWorkspaceProvider::fork`）は `RefusePinnedForks` で断る（(2) の区切り）。portool と service container の同時実行数は local-ci の既定に任せていない（`portool: None`・`containers: 1`）。
 - step が admission を待った時間を `queue_wait_secs` として local-ci へ返していない（job の時間に待ちが含まれる）。

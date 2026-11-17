@@ -345,7 +345,7 @@ CIのExecutionTaskは、通常のattemptのpayloadの一種（`ci_task`: FrozenP
 
 workerではsupervisorがlocal-ci-coreのtask実行を呼び、coreが求める各stepを、commandと同じ経路（task-traffic-controllerの登録とadmission、launchの記録、mask済みのログ、timeout、停止と停止確認）でnodeとして実行する。coreはstepのprocessを起動せず、signalも送らない（service containerのdockerやgitなど、step以外の補助processはcoreが起動する）。停止理由（cancel・lease失効・timeout）が出た後は、`if: always()` のstepも起動しない。taskの結果（Jobごとの結果とoutput）はattemptのartifactとして親へ返し、親が後続taskのinputsに入れる。
 
-coreはworkspaceがcaptured sourceとbyte単位で一致するときだけ実行を束縛する。そのため、secret_filesを配置するsource、prepared setupを伴うattempt、in-placeのworkspaceではCI taskを受理しない（制約と解消の選択肢は docs/plan.md のS16節）。
+coreはworkspaceがcaptured sourceとbyte単位で一致するときだけ実行を束縛する。そのため、secret_filesを配置するsource、prepared setupを伴うattempt、in-placeのworkspaceではCI taskを受理しない（local-ci-core側に、宣言済みの上書きを除いて照合する束縛を足して解く。決定と制約は docs/plan.md のS16節）。
 
 ## matrix・自動テストsharding・明示shard
 
