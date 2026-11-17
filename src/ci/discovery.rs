@@ -276,11 +276,9 @@ pub fn stage(
 ) {
     let mut probes = Vec::new();
     for step in candidates(plan) {
-        let Some(task) = plan
-            .tasks
-            .iter()
-            .find(|t| t.workflow == step.workflow && t.jobs == [step.job.clone()])
-        else {
+        let Some(task) = plan.tasks.iter().find(|t| {
+            t.workflow == step.workflow && t.jobs.as_slice() == std::slice::from_ref(&step.job)
+        }) else {
             continue;
         };
         let Some((_, spec)) = specs.iter().find(|(name, _)| name == &task.id) else {

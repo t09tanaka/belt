@@ -83,6 +83,9 @@ pub struct ShardSummary {
     pub source_jobs: Vec<String>,
     pub shards: Vec<String>,
     pub split: bool,
+    /// This unpartitioned candidate has to be listed on a worker.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub discovery_candidate: bool,
     /// Core's actual reasons. Planning does not invent test discovery facts.
     pub not_split: Vec<NotSplit>,
 }
@@ -196,6 +199,10 @@ pub(crate) fn summarize(fp: &FrozenPlan) -> Result<PlanSummary, PlanError> {
             toolchain_requirements: recipe.toolchain.len(),
         });
     }
+    let candidates: std::collections::BTreeSet<_> = super::discovery::candidates(fp)
+        .into_iter()
+        .map(|step| (step.workflow, step.job))
+        .collect();
     let mut shard_groups = vec![];
     for g in &fp.shard_groups {
         validate_path(&g.workflow)?;
@@ -211,6 +218,10 @@ pub(crate) fn summarize(fp: &FrozenPlan) -> Result<PlanSummary, PlanError> {
             source_jobs: g.source_jobs.clone(),
             shards: g.shards.clone(),
             split: g.split,
+            discovery_candidate: g
+                .source_jobs
+                .first()
+                .is_some_and(|job| candidates.contains(&(g.workflow.clone(), job.clone()))),
             not_split: g.not_split.clone(),
         });
     }
@@ -279,6 +290,13 @@ pub fn render_text(s: &PlanSummary) -> String {
         }
     }
     for g in s.shard_groups.iter().filter(|g| !g.split) {
+        if g.discovery_candidate {
+            lines.push(format!(
+                "task {} can be partitioned after worker discovery",
+                g.id
+            ));
+            continue;
+        }
         let reasons: Vec<_> = g.not_split.iter().map(reason_name).collect();
         lines.push(format!(
             "task {} is not split: [{}]",
