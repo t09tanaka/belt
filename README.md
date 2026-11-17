@@ -830,6 +830,23 @@ monitor rather than inside a foreground step with a short hard timeout.
 Keep the `wait` alive for as long as you care about the result: if your
 process dies, so do its jobs.
 
+### Sharing the CLI's scope from a library
+
+A program that links the crate and must use the same ledger as the command on
+the same host asks for the CLI's scope instead of repeating the rule:
+
+```rust
+let paths = task_traffic_controller::Paths::from_process_env();
+// or, testable without touching the process environment:
+let paths = task_traffic_controller::Paths::from_env(home, xdg_state_home, xdg_config_home);
+```
+
+State is `$XDG_STATE_HOME/task-traffic-controller` (else
+`$HOME/.local/state/task-traffic-controller`), config is
+`$XDG_CONFIG_HOME/task-traffic-controller/config.toml` (else
+`$HOME/.config/...`). An empty XDG value counts as unset, a relative one is
+used as given, and without `HOME` the root is `/`.
+
 ## Platform support
 
 macOS and Linux. `flock`, `wait4`, process groups and signal forwarding
