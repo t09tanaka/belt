@@ -258,6 +258,7 @@ fn show_output_is_read_strictly() {
     assert_eq!(
         ok,
         Show {
+            system: false,
             load: "loaded".into(),
             active: "active".into(),
             fragment: FILE.into(),
