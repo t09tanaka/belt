@@ -283,30 +283,19 @@ pub async fn run(
         }
     };
     let (spec, settled) = (context.bootstrap.clone(), context.clone());
-    let end = (
-        report.state == "settled",
-        report.cancel_requested || report.snapshot.as_ref().is_some_and(|s| s.cancel_requested),
-        report.collection_pending,
-        report.cli_exit_code,
-    );
+    let end = Ended::of(&report);
     let expected = receipt.as_ref().map(|receipt| {
         let tasks = receipt.tasks.iter();
         tasks.map(|task| task.plan_task.clone()).collect::<Vec<_>>()
     });
-    // Decided only here, after the wait: on the parent, from what it collected.
+    // Decided only here, after the wait: on the parent, from the result of
+    // the run and what it collected.
     let (jobs, github_status) = tokio::task::spawn_blocking(move || {
         let jobs = jobs(&spec, &run_id).unwrap_or_default();
         let record = expected.map(|expected| {
             let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
             let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
-            let end = crate::ci::status::RunEnd {
-                settled: end.0,
-                cancel_requested: end.1,
-                collection_pending: end.2,
-                exit_code: end.3,
-                expected: &expected,
-                jobs: &lines,
-            };
+            let end = end.with(&expected, &lines);
             super::github_status::settle(&settled, &run_id, &end, &status, poster.as_ref())
         });
         (jobs, record.map(|record| (run_id, record)))
@@ -344,6 +333,55 @@ async fn keep_status(
         Reply::Error { message } => Err(message),
         Reply::ControlError { error } => Err(error.message),
         _ => Err("unexpected reply".into()),
+    }
+}
+
+/// How the run ended, as the status of the run reads it: the result of the
+/// run that its completion made (`CoordinatorStore::completion`), which the
+/// exit code of `ci` and `show` read too. Nothing is judged again here.
+#[derive(Debug, Clone, Copy)]
+pub struct Ended {
+    settled: bool,
+    cancel_requested: bool,
+    collection_pending: Option<bool>,
+    exit_code: i32,
+    failed: bool,
+}
+
+impl Ended {
+    pub fn of(report: &Report) -> Self {
+        let snapshot = report.snapshot.as_ref();
+        Self {
+            settled: report.state == "settled",
+            cancel_requested: report.cancel_requested
+                || snapshot.is_some_and(|s| s.cancel_requested),
+            collection_pending: report.collection_pending,
+            exit_code: report.cli_exit_code,
+            failed: snapshot.is_some_and(|s| s.first_compute_failure.is_some()),
+        }
+    }
+
+    fn with<'a>(
+        &self,
+        expected: &'a [&'a str],
+        jobs: &'a [crate::ci::status::Job<'a>],
+    ) -> crate::ci::status::RunEnd<'a> {
+        crate::ci::status::RunEnd {
+            settled: self.settled,
+            cancel_requested: self.cancel_requested,
+            collection_pending: self.collection_pending,
+            exit_code: self.exit_code,
+            failed: self.failed,
+            expected,
+            jobs,
+        }
+    }
+
+    /// What the run computed, with the tasks that were submitted and the
+    /// lines of the run.
+    pub fn computed(&self, expected: &[&str], jobs: &[JobLine]) -> crate::ci::status::Computed {
+        let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
+        crate::ci::status::computed(&self.with(expected, &lines))
     }
 }
 

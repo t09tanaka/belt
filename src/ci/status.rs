@@ -60,31 +60,44 @@ pub struct Job<'a> {
     pub status: &'a str,
 }
 
-/// How the run ended, as the waiting side saw it.
+/// How the run ended: the result of the run as its completion has it (the
+/// one `ci`, `wait` and `show` read), and the lines the parent collected.
 #[derive(Debug, Clone, Copy)]
 pub struct RunEnd<'a> {
     /// The run settled by itself (not an interrupted or unconfirmed wait).
     pub settled: bool,
+    /// A cancel was asked for: of the run, or of a task of it (a shard that
+    /// fail-fast stopped is one).
     pub cancel_requested: bool,
     /// `Some(false)` only when every collection is closed.
     pub collection_pending: Option<bool>,
+    /// The exit code of the run. A run that ended of a cancel has the code
+    /// of a cancel; one that failed before a cancel has that of the failure.
     pub exit_code: i32,
+    /// A task or a job of the run failed (a split job that was joined as a
+    /// failure is one, although every attempt of it succeeded).
+    pub failed: bool,
     /// The tasks of the frozen plan that were submitted.
     pub expected: &'a [&'a str],
     pub jobs: &'a [Job<'a>],
 }
 
-/// The result of the run. Success fails closed: it needs a settled run, a
-/// closed collection, exit 0, at least one expected task, a line for each of
-/// them and no line that is anything but `success` or `skipped`.
+/// The result of the run. It follows the completion of the run: a run that
+/// failed is a failure whatever its lines say, and a cancel that the run did
+/// not end of (fail-fast stopped the other shards of a failed job) does not
+/// make it cancelled. Success fails closed: it needs a settled run without
+/// any cancel, a closed collection, exit 0, at least one expected task, a
+/// line for each of them and no line that is anything but `success` or
+/// `skipped`.
 pub fn computed(end: &RunEnd<'_>) -> Computed {
-    if !end.settled || end.cancel_requested {
+    let of_cancel = matches!(end.exit_code, 0 | crate::error::exit::CANCELLED);
+    if !end.settled || (end.cancel_requested && of_cancel) {
         return Computed::Cancelled;
     }
     if end.collection_pending != Some(false) {
         return Computed::Pending;
     }
-    if end.jobs.iter().any(|job| job.status == "failure") {
+    if end.failed || end.jobs.iter().any(|job| job.status == "failure") {
         return Computed::Failure;
     }
     let covered = |task: &&str| end.jobs.iter().any(|job| job.plan_task == *task);
@@ -377,9 +390,56 @@ mod tests {
             cancel_requested: false,
             collection_pending: Some(false),
             exit_code: 0,
+            failed: false,
             expected,
             jobs,
         }
+    }
+
+    #[test]
+    fn the_result_follows_the_completion_of_the_run() {
+        let cancel = crate::error::exit::CANCELLED;
+        let lines = jobs(&[("a", "success"), ("b", "no_result")]);
+        let good = end(&["a", "b"], &lines);
+        // a job joined as a failure: no line has to say so
+        let joined = RunEnd {
+            exit_code: 1,
+            failed: true,
+            ..good
+        };
+        assert_eq!(computed(&joined), Computed::Failure);
+        // fail-fast stopped the other shards: the run failed, it was not cancelled
+        let stopped = RunEnd {
+            cancel_requested: true,
+            ..joined
+        };
+        assert_eq!(computed(&stopped), Computed::Failure);
+        // a collection that failed is no failed job
+        let lost = RunEnd {
+            cancel_requested: true,
+            exit_code: 1,
+            ..good
+        };
+        assert_eq!(computed(&lost), Computed::Error);
+        // the run ended of the cancel
+        let cancelled = RunEnd {
+            exit_code: cancel,
+            ..stopped
+        };
+        assert_eq!(computed(&cancelled), Computed::Cancelled);
+        // a command that ended with that code by itself did fail
+        let own = RunEnd {
+            cancel_requested: false,
+            ..cancelled
+        };
+        assert_eq!(computed(&own), Computed::Failure);
+        // a cancel that stopped nothing: still no success
+        let all = jobs(&[("a", "success"), ("b", "success")]);
+        let late = RunEnd {
+            cancel_requested: true,
+            ..end(&["a", "b"], &all)
+        };
+        assert_eq!(computed(&late), Computed::Cancelled);
     }
 
     #[test]
