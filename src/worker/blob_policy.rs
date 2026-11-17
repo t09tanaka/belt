@@ -597,6 +597,44 @@ mod tests {
         assert_eq!(cap_of(&l, Content), 100);
         assert_eq!(cap_of(&l, Manifest), 50);
         assert_eq!(cap_of(&l, Bundle), 70);
+        // A frozen plan has a cap of its own, whatever the source limits are.
+        assert_eq!(
+            cap_of(&l, SourceBlobKind::Plan),
+            crate::supervisor::ci_task::MAX_PLAN_BYTES
+        );
+    }
+
+    #[test]
+    fn a_plan_is_named_as_a_plan_and_is_never_staged_with_a_source() {
+        use SourceBlobKind::Plan;
+        const OTHER: &str = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            staged_name(Plan, HEX, 7, false),
+            format!("plan-{HEX}-7.part")
+        );
+        // The staging of a source does not read the name back as a blob of it.
+        assert_eq!(parse_staged_name(&staged_name(Plan, HEX, 7, true)), None);
+        let n = |kind, hex, done| StagedName {
+            kind,
+            hex,
+            size: 5,
+            done,
+        };
+        for old in [Content, Manifest, Bundle, Plan] {
+            for (root_staged, done) in [(false, false), (false, true), (true, false), (true, true)]
+            {
+                assert!(!displaces(
+                    &n(Plan, HEX, false),
+                    root_staged,
+                    &n(old, HEX, done)
+                ));
+                assert!(!displaces(
+                    &n(Plan, HEX, false),
+                    root_staged,
+                    &n(old, OTHER, done)
+                ));
+            }
+        }
     }
 
     #[test]

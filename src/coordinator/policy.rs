@@ -281,6 +281,80 @@ mod tests {
         }
     }
 
+    fn task_spec(ci: bool) -> crate::coordinator::TaskSpec {
+        let digest = crate::ids::Digest::of_bytes(b"plan");
+        crate::coordinator::TaskSpec {
+            ci: ci.then(|| crate::coordinator::CiSpec {
+                task: crate::wire::CiTask {
+                    plan_digest: digest.clone(),
+                    task_id: "ci.yml/build".into(),
+                    inputs: serde_json::json!({"needs": {}}),
+                },
+                hold: false,
+                steps: 1,
+            }),
+            toolchains: None,
+            outputs: Vec::new(),
+            requirements: Default::default(),
+            in_place: false,
+            setup: None,
+            plan_digest: digest.clone(),
+            manifest_digest: digest,
+            commands: Vec::new(),
+            command_timeout_ms: None,
+            deadline_ms: None,
+            resource_wait_timeout_ms: None,
+            has_secret_bundle: false,
+            artifacts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_a_ci_task_is_kept_from_a_worker_that_did_not_negotiate_ci_tasks() {
+        assert!(lacks_ci_task(&task_spec(true), false));
+        assert!(!lacks_ci_task(&task_spec(true), true));
+        assert!(!lacks_ci_task(&task_spec(false), false));
+        assert!(!lacks_ci_task(&task_spec(false), true));
+        assert_eq!(CI_TASK_UNMET, "protocol feature ci_task_v1");
+    }
+
+    #[test]
+    fn the_declarations_of_a_ci_task_leave_room_for_its_result() {
+        let max = crate::outputs::MAX_OUTPUTS;
+        assert_eq!(max, 1024);
+        assert!(ci_declarations_fit(0, 0));
+        // 1023 declarations and the result are 1024.
+        assert!(ci_declarations_fit(max - 2, 0));
+        assert!(ci_declarations_fit(max - 1, 0));
+        assert!(ci_declarations_fit(0, max - 1));
+        assert!(ci_declarations_fit(1000, 23));
+        assert!(!ci_declarations_fit(max, 0));
+        assert!(!ci_declarations_fit(0, max));
+        assert!(!ci_declarations_fit(1000, 24));
+        assert!(!ci_declarations_fit(max + 1, 0));
+        assert!(!ci_declarations_fit(1, max));
+        assert!(!ci_declarations_fit(usize::MAX, 1));
+        assert!(!ci_declarations_fit(usize::MAX, usize::MAX));
+    }
+
+    #[test]
+    fn a_forecast_is_asked_for_the_steps_of_a_ci_task_or_the_commands_of_another() {
+        let attempt = crate::ids::AttemptId::generate();
+        let mut ci = task_spec(true);
+        ci.ci.as_mut().unwrap().steps = 3;
+        let plan = workload_of_spec(&attempt, &ci, Some(40));
+        assert_eq!(
+            plan,
+            crate::scheduler::ci_workload_of(&attempt, &ci.plan_digest, 3, Some(40))
+        );
+        assert_eq!(plan.nodes.len(), 3);
+        let plain = task_spec(false);
+        assert_eq!(
+            workload_of_spec(&attempt, &plain, None),
+            crate::scheduler::workload_of(&attempt, &plain.plan_digest, &plain.commands, None)
+        );
+    }
+
     #[test]
     fn room_is_the_free_active_slots_plus_the_prefetch() {
         let l = limits(2, 1);
