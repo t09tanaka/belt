@@ -147,6 +147,7 @@ struct State {
     ops: Vec<(&'static str, u64)>,
     /// The connection did not negotiate `ci_task_v1`.
     no_ci: bool,
+    no_discovery: bool,
     /// The worker did not take the frozen plan of any run, for this reason:
     /// no input is ready there.
     refused_plan: Option<String>,
@@ -5507,5 +5508,64 @@ jobs:
             && replay.failed.is_empty()
             && replay.faults.is_empty(),
         "{replay:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_discovery_incompatible_worker_runs_the_original_job_after_the_probe_is_rejected() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    fx.w.set(|s| s.no_discovery = true);
+    let plan = ci_plan(
+        "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npx jest\n",
+    );
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
+    let manifest = Digest::of_bytes(b"manifest");
+    let mut specs = remote_task_runner::service::ci_run::task_specs(
+        &plan,
+        &digest,
+        &manifest,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    remote_task_runner::ci::discovery::stage(&plan, &mut specs, 2, 2, "project", &[]);
+    let run = RunId::generate();
+    let source = SourceId::generate();
+    c.store().put_source_ref(&source, &manifest, 1).unwrap();
+    c.enqueue(
+        run.clone(),
+        source,
+        specs
+            .into_iter()
+            .map(|(_, s)| (TaskId::generate(), s))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    for _ in 0..2 {
+        let pass = ci_advance(&fx, &c);
+        assert!(pass.failed.is_empty() && pass.faults.is_empty(), "{pass:?}");
+    }
+    let placed = c.tick().await.unwrap().placed;
+    assert_eq!(placed.len(), 1);
+    let task = fx.w.payload(&placed[0]).ci_task.unwrap();
+    assert_eq!(task.task_id, plan.tasks[0].id);
+    assert!(!task.verify_shard_version);
+    end_shard(
+        &c,
+        &files,
+        &(placed[0].clone(), fx.w.clone()),
+        Outcome::Succeeded,
+        &ci_result(&task.task_id, "test", "success", json!({})),
+    )
+    .await;
+    assert_eq!(
+        c.store()
+            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .unwrap()
+            .exit_code(),
+        Some(0)
     );
 }
