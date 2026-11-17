@@ -51,6 +51,12 @@ fn git(dir: &Path, args: &[&str]) -> String {
             "commit.gpgsign=false",
             "-c",
             "protocol.file.allow=always",
+            // setup git only: nothing here wants a background gc or a
+            // filesystem monitor
+            "-c",
+            "gc.auto=0",
+            "-c",
+            "core.fsmonitor=false",
         ])
         .args(args)
         .current_dir(dir)

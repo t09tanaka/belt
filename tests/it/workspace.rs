@@ -54,6 +54,7 @@ fn env(home: &Path) -> BTreeMap<String, String> {
 fn git_out(env: &BTreeMap<String, String>, dir: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(["-c", "protocol.file.allow=always"])
+        .args(["-c", "gc.auto=0", "-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(dir)
         .env_clear()

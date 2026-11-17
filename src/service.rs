@@ -15,6 +15,7 @@ pub mod outputs;
 pub mod query;
 pub mod resident;
 pub mod submit;
+pub mod systemd;
 
 pub mod init;
 
@@ -23,7 +24,7 @@ mod traffic_hold;
 /// Standalone persistent worker role, independent of SSH bridge lifetime.
 pub mod worker;
 
-/// Worker-host install and lifecycle helper (macOS).
+/// Worker-host install and lifecycle helper (macOS launchd, Linux systemd).
 pub mod worker_service;
 /// Parent-side `workers` commands.
 pub mod workers;

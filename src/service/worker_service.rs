@@ -1,4 +1,4 @@
-//! Worker-host service helper (macOS). It runs on the machine that hosts the
+//! Worker-host service helper (macOS launchd, Linux systemd user service). It runs on the machine that hosts the
 //! worker, either directly or through a fixed `ssh` command from the parent
 //! (`workers add --install`, `workers start|stop|drain|resume`).
 //!
@@ -132,6 +132,7 @@ pub struct TrafficScope {
 }
 
 pub struct Paths {
+    pub backend: policy::Backend,
     pub home: PathBuf,
     pub config: PathBuf,
     pub key: PathBuf,
@@ -141,7 +142,14 @@ pub struct Paths {
     pub services: PathBuf,
 }
 impl Paths {
+    /// The paths on a host managed by launchd. Only what is common to both
+    /// managers (the installed files) may be read through this.
     pub fn resolve(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
+        Self::resolve_for(env, policy::Backend::Launchd)
+    }
+    /// The user's home and configuration directory, validated. Neither
+    /// depends on the service manager.
+    fn home_and_config(env: &BTreeMap<String, String>) -> anyhow::Result<(PathBuf, PathBuf)> {
         let home = PathBuf::from(env.get("HOME").context("HOME is required")?);
         resident::validate_components(&home)?;
         if let Some(x) = env.get("XDG_CONFIG_HOME") {
@@ -151,12 +159,35 @@ impl Paths {
             .parent()
             .context("configuration parent")?
             .to_owned();
+        Ok((home, config))
+    }
+    /// Where a resident worker's journal lives. The same under every service
+    /// manager, so the answer is the host's whatever it uses; an unusable
+    /// home is an error, never "no journal".
+    pub fn journal_path(env: &BTreeMap<String, String>) -> anyhow::Result<PathBuf> {
+        Ok(Self::home_and_config(env)?.1.join("worker-service.json"))
+    }
+    pub fn resolve_for(
+        env: &BTreeMap<String, String>,
+        backend: policy::Backend,
+    ) -> anyhow::Result<Self> {
+        let (home, config) = Self::home_and_config(env)?;
+        // The managed file's directory follows the manager: LaunchAgents, or
+        // the user's systemd units beside the configuration directory.
+        let services = match backend {
+            policy::Backend::Launchd => home.join("Library/LaunchAgents"),
+            policy::Backend::Systemd => {
+                super::systemd::policy::user_unit_dir(config.parent().context("config home")?)
+            }
+        };
+        resident::validate_components(&services)?;
         Ok(Self {
+            backend,
             key: config.join("worker-cluster.key"),
             input: config.join("worker.json"),
             journal: config.join("worker-service.json"),
             state: home.join(".remote-task-runner"),
-            services: home.join("Library/LaunchAgents"),
+            services,
             config,
             home,
         })
@@ -495,7 +526,7 @@ pub(crate) fn service_view<L: Launcher>(
     launcher: L,
 ) -> anyhow::Result<ServiceView> {
     let env = worker_env(env);
-    let paths = Paths::resolve(&env)?;
+    let paths = Paths::resolve_for(&env, launcher.backend())?;
     let journal = require_journal(&paths)?;
     let status = status(&env, launcher)?;
     Ok((
@@ -516,7 +547,11 @@ fn plan(paths: &Paths, journal: &Journal) -> anyhow::Result<policy::Plan> {
         )[..12]
     );
     let environment = service_environment(journal);
-    policy::render(&policy::Definition {
+    let render = match paths.backend {
+        policy::Backend::Launchd => policy::render,
+        policy::Backend::Systemd => super::systemd::policy::render,
+    };
+    render(&policy::Definition {
         label,
         mode: policy::Mode::User { uid: journal.uid },
         executable: paths.executable(&journal.binary_sha256),
@@ -699,7 +734,7 @@ pub fn install<L: Launcher>(
     ready_timeout: Duration,
 ) -> anyhow::Result<Status> {
     ensure!(request.schema == 1, "unsupported install request schema");
-    let paths = Paths::resolve(env)?;
+    let paths = Paths::resolve_for(env, launcher.backend())?;
     // The worker will share the scope of the user's CLI: refuse here, at
     // install, an environment it would refuse at start. Only here: stop,
     // drain and status do not depend on the caller's scope.
@@ -854,7 +889,7 @@ pub fn start<L: Launcher>(
     mut launcher: L,
     ready_timeout: Duration,
 ) -> anyhow::Result<Status> {
-    let paths = Paths::resolve(env)?;
+    let paths = Paths::resolve_for(env, launcher.backend())?;
     let journal = require_journal(&paths)?;
     let plan = plan(&paths, &journal)?;
     let receipt = journal
@@ -879,7 +914,7 @@ pub fn stop<L: Launcher>(
     cancel_running: bool,
     wait: Duration,
 ) -> anyhow::Result<Status> {
-    let paths = Paths::resolve(env)?;
+    let paths = Paths::resolve_for(env, launcher.backend())?;
     let journal = require_journal(&paths)?;
     let plan = plan(&paths, &journal)?;
     let receipt = journal
@@ -939,7 +974,7 @@ fn lifecycle_marker<L: Launcher>(
     launcher: &mut L,
     request: WorkerRequest,
 ) -> anyhow::Result<Status> {
-    let paths = Paths::resolve(env)?;
+    let paths = Paths::resolve_for(env, launcher.backend())?;
     let _lock = exclusive_lock(&paths)?;
     let mut journal = require_journal(&paths)?;
     let plan = plan(&paths, &journal)?;
@@ -974,7 +1009,7 @@ pub fn status<L: Launcher>(
     env: &BTreeMap<String, String>,
     mut launcher: L,
 ) -> anyhow::Result<Status> {
-    let paths = Paths::resolve(env)?;
+    let paths = Paths::resolve_for(env, launcher.backend())?;
     // The journal is replaced by rename, so it reads whole even mid-switch.
     let journal = require_journal(&paths)?;
     let lock = switch_lock(&paths, false, STATUS_PATIENCE)?;
@@ -1095,8 +1130,64 @@ pub fn env_report(
     crate::toolchain::envreport::collect(&spec.state_dir, &spec.env).map_err(anyhow::Error::msg)
 }
 
+/// The service manager of this host. Both are compiled everywhere; which one
+/// is built follows the OS, so only the Linux host ever runs `systemctl`.
+pub enum HostLauncher {
+    Launchd(macos::NativeLauncher),
+    Systemd(super::systemd::SystemdLauncher),
+}
+impl HostLauncher {
+    pub fn native() -> Self {
+        if cfg!(target_os = "linux") {
+            Self::Systemd(super::systemd::SystemdLauncher::native())
+        } else {
+            Self::Launchd(macos::NativeLauncher::default())
+        }
+    }
+}
+impl Launcher for HostLauncher {
+    fn backend(&self) -> policy::Backend {
+        match self {
+            Self::Launchd(l) => l.backend(),
+            Self::Systemd(l) => l.backend(),
+        }
+    }
+    fn running_identity(
+        &mut self,
+        plan: &policy::Plan,
+        receipt: &macos::Receipt,
+    ) -> Result<macos::RunningIdentity, macos::LaunchError> {
+        match self {
+            Self::Launchd(l) => l.running_identity(plan, receipt),
+            Self::Systemd(l) => l.running_identity(plan, receipt),
+        }
+    }
+    fn loaded_state(&mut self, plan: &policy::Plan, receipt: &macos::Receipt) -> LoadedState {
+        match self {
+            Self::Launchd(l) => l.loaded_state(plan, receipt),
+            Self::Systemd(l) => l.loaded_state(plan, receipt),
+        }
+    }
+    fn launchctl(&mut self, arguments: &[String]) -> Result<(), macos::LaunchError> {
+        match self {
+            Self::Launchd(l) => l.launchctl(arguments),
+            Self::Systemd(l) => l.launchctl(arguments),
+        }
+    }
+    fn verify_loaded(
+        &mut self,
+        plan: &policy::Plan,
+        receipt: &macos::Receipt,
+    ) -> Result<(), macos::LaunchError> {
+        match self {
+            Self::Launchd(l) => l.verify_loaded(plan, receipt),
+            Self::Systemd(l) => l.verify_loaded(plan, receipt),
+        }
+    }
+}
+
 /// The hidden `worker-service` command. Drain, resume and status never touch
-/// launchctl; the others use the native launcher.
+/// the service manager; the others use the host's own.
 pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
     if action == Action::Doctor {
         return super::doctor::host_main();
@@ -1143,7 +1234,7 @@ pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
                 &env,
                 &stdin,
                 &exe,
-                macos::NativeLauncher::default(),
+                HostLauncher::native(),
                 Options {
                     cancel_running,
                     wait: Duration::from_secs(wait_secs),

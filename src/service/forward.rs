@@ -750,13 +750,29 @@ mod measured_lease_tests {
         let sources = store.clone();
         let pending =
             tokio::spawn(async move { foreground_lease(&sources, &mut stopping, ownership).await });
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while store.retention.guard(true).is_ok() {
-                tokio::task::yield_now().await;
+        // Wait until the blocked foreground task holds the source guard. Probe
+        // with a bare try-lock on its own descriptor, released at once: the
+        // real exclusive guard syncs the file and its directory, and a loop of
+        // those held the lock nearly all the time on a slow disk, so the
+        // waiter's periodic shared attempt never got in before the timeout.
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(store.root().join("mutation.lock"))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                match probe.try_lock() {
+                    Ok(()) => probe.unlock().unwrap(),
+                    Err(TryLockError::WouldBlock) => break,
+                    Err(TryLockError::Error(error)) => panic!("{error}"),
+                }
+                tokio::time::sleep(Duration::from_millis(2)).await;
             }
         })
         .await
         .unwrap();
+        drop(probe);
         stop.send(true).unwrap();
         assert!(pending.await.unwrap().is_err());
         let _next = local.lock_owned().await;

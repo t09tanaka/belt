@@ -18,6 +18,12 @@ pub fn fixture_traffic_config(state: &Path) {
     fixture_traffic_config_file(&state.join("traffic/config.toml"), 2);
 }
 
+/// The same with another budget than the usual 2: the budget is counted in
+/// weights, and a command weighs 2 by default.
+pub fn fixture_traffic_budget(state: &Path, budget: u32) {
+    fixture_traffic_config_file(&state.join("traffic/config.toml"), budget);
+}
+
 /// The same for a worker started from `env`, which reads the configuration
 /// of the task-traffic-controller CLI of that environment.
 pub fn fixture_worker_traffic_config(env: &std::collections::BTreeMap<String, String>) {

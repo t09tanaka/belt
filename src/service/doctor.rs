@@ -617,16 +617,17 @@ pub fn host_main() -> i32 {
     let env: BTreeMap<String, String> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
-    let answer = super::worker_service::service_view(&env, super::macos::NativeLauncher::default())
-        .map(|(status, state, service_env, recorded)| HostAnswer {
-            status,
-            facts: gather(
-                &state,
-                &service_env,
-                &recorded,
-                &mut SystemRunner::default(),
-            ),
-        });
+    let answer =
+        super::worker_service::service_view(&env, super::worker_service::HostLauncher::native())
+            .map(|(status, state, service_env, recorded)| HostAnswer {
+                status,
+                facts: gather(
+                    &state,
+                    &service_env,
+                    &recorded,
+                    &mut SystemRunner::default(),
+                ),
+            });
     match answer {
         Ok(answer) => {
             println!("{}", serde_json::json!({"ok": true, "doctor": answer}));
