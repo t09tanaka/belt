@@ -79,6 +79,13 @@ use std::time::Duration;
 pub trait StepExecutor: Send + Sync {
     fn run(&self, req: &StepRequest) -> Result<StepExit>;
 
+    /// A distributed host may have discovered tests on a different worker.
+    /// When enabled the installed runner must match the frozen shard before
+    /// any test is started. The check runs in the test step after its setup.
+    fn verify_shard_runner(&self) -> bool {
+        false
+    }
+
     /// Perform a resolved upload/download step. A distributed executor returns
     /// upload success only after its workflow-scoped store durably accepts the
     /// files. Errors become step errors. Implementations waiting on the store

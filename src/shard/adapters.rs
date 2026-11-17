@@ -394,6 +394,46 @@ pub fn from_info(info: &RunnerInfo, root: &str) -> Option<Box<dyn RunnerAdapter>
     })
 }
 
+/// Inspect the same local tool installation both while enumerating tests
+/// and at the start of a distributed shard. These commands never install it.
+pub fn version_command(runner: &str) -> Option<&'static str> {
+    Some(match runner {
+        "cargo-test" => "cargo --version",
+        "vitest" => r#"node -p "require('vitest/package.json').version""#,
+        "jest" => r#"node -p "require('jest/package.json').version""#,
+        "playwright" => r#"node -p "require('playwright/package.json').version""#,
+        "cypress" => r#"node -p "require('cypress/package.json').version""#,
+        _ => return None,
+    })
+}
+
+pub(crate) fn guard_version(info: &RunnerInfo, script: String) -> Result<String, String> {
+    let command = version_command(&info.runner)
+        .ok_or_else(|| format!("unknown shard runner {}", info.runner))?;
+    if info.version.is_empty()
+        || info.version.len() > 256
+        || info.version.chars().any(char::is_control)
+    {
+        return Err("invalid discovery runner version".into());
+    }
+    let expected = shlex::try_quote(&info.version)
+        .map_err(|_| "invalid discovery runner version".to_owned())?;
+    let runner = &info.runner;
+    Ok(format!(
+        r#"if ! actual=$({command}); then
+    printf '%s\n' 'shard runner version unavailable ({runner})' >&2
+    exit 86
+fi
+if [ "$actual" != {expected} ]; then
+    case "$actual" in *[![:print:]]*) actual='[non-printable]' ;; esac
+    if [ "${{#actual}}" -gt 256 ]; then actual='[oversized]'; fi
+    printf 'shard runner version mismatch ({runner}): expected %s, got %s\n' {expected} "$actual" >&2
+    exit 86
+fi
+{script}"#
+    ))
+}
+
 /// A command as the text of a shell script (the words quoted), and `None` for
 /// a word a shell cannot be given.
 pub fn script_of(inv: &Invocation) -> Option<String> {
@@ -1589,6 +1629,50 @@ impl RunnerAdapter for Cypress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn distributed_shard_version_guard_runs_tests_only_on_the_discovered_version() {
+        let info = RunnerInfo {
+            runner: "cargo-test".into(),
+            version: "cargo 1.90.0 (example build)".into(),
+            ..Default::default()
+        };
+        let guarded = guard_version(&info, "printf 'ran-tests'".into()).unwrap();
+        let run = |actual: &str, status: i32| {
+            let script = format!(
+                r#"cargo() {{ printf '%s' "$STUB_VERSION"; return {status}; }}
+{guarded}"#
+            );
+            std::process::Command::new("sh")
+                .args(["-c", &script])
+                .env("STUB_VERSION", actual)
+                .output()
+                .unwrap()
+        };
+        let matched = run(&info.version, 0);
+        assert!(matched.status.success());
+        assert_eq!(matched.stdout, b"ran-tests");
+        let different = run("cargo 1.91.0", 0);
+        assert_eq!(different.status.code(), Some(86));
+        assert!(different.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&different.stderr)
+            .contains("expected cargo 1.90.0 (example build), got cargo 1.91.0"));
+        let missing = run("", 1);
+        assert_eq!(missing.status.code(), Some(86));
+        assert!(missing.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("unavailable"));
+        let quoted = RunnerInfo {
+            version: "v1'; echo injected; #".into(),
+            ..info
+        };
+        let script = guard_version(&quoted, "printf ran".into()).unwrap();
+        let mismatch = std::process::Command::new("sh")
+            .args(["-c", &format!("cargo() {{ echo v2; }}\n{script}")])
+            .output()
+            .unwrap();
+        assert_eq!(mismatch.status.code(), Some(86));
+        assert!(mismatch.stdout.is_empty());
+    }
 
     fn out(stdout: &str, success: bool) -> CommandOutput {
         CommandOutput {

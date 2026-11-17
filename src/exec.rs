@@ -3364,7 +3364,18 @@ impl<'a> Runner<'a> {
             // the step that runs the tests of a shard runs the shard's command
             // (after the expressions of the step were read: a name is not one)
             let script = match shard.filter(|t| t.step == n) {
-                Some(ts) => match shard_script(ts, &ws.join(&wd)) {
+                Some(ts) => match shard_script(ts, &ws.join(&wd)).and_then(|script| {
+                    if self
+                        .opts
+                        .executor
+                        .as_ref()
+                        .is_some_and(|host| host.verify_shard_runner())
+                    {
+                        crate::shard::adapters::guard_version(&ts.runner, script)
+                    } else {
+                        Ok(script)
+                    }
+                }) {
                     Ok(sc) => sc,
                     Err(e) => {
                         push(&mut steps, Outcome::Error(e.clone()), None, None, None);
