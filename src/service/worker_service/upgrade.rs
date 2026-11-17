@@ -1,20 +1,25 @@
 //! Switching the installed version on the worker host (`upgrade`, `rollback`).
 //!
 //! Both are the same resumable sequence towards a target version. The order
-//! is: place the binary in its own version directory (an existing file is
-//! never overwritten), check that the target can read what is installed,
-//! stop the running service once no attempt is live, record the switch, then
-//! move the service file, the worker input and `bin/current` to the target
-//! and start it. The switch is recorded in the journal before the first
-//! change that cannot be undone by doing nothing, so a run that died anywhere
-//! is finished by running `upgrade` again or undone by `rollback`.
+//! is: drain (recording that this upgrade did it), place the binary in its
+//! own version directory (an existing file is never overwritten), check that
+//! the target can read what is installed, stop the running service once no
+//! attempt is live, save the worker database, record the switch, then move
+//! the service file, the worker input and `bin/current` to the target and
+//! start it. The switch is recorded in the journal before the first change
+//! that cannot be undone by doing nothing, so a run that died anywhere is
+//! finished by running `upgrade` again or undone by `rollback`.
 //!
-//! `rollback` restores the files this module moves. It does not restore the
-//! worker database: once a started version has migrated it, an older version
-//! refuses to open it and the rollback ends as a reported failure.
+//! The record of the switch outlives the start of the new version. Only
+//! `commit`, which the parent sends after it has checked the new version,
+//! forgets the previous one, deletes the saved database and resumes a drain
+//! this upgrade made. Until then `rollback` returns to the previous version
+//! and puts the saved database back before it starts, so a migration by the
+//! new version does not strand the old one. After `commit` there is nothing
+//! to roll back to.
 //!
-//! The drain marker is left as it is: the caller resumes the worker after it
-//! has checked the new service. Nothing here signals a process.
+//! Every action here holds the host's switch lock from before it reads the
+//! journal until it has answered. Nothing here signals a process.
 use super::*;
 
 /// What the parent sends on stdin. `binary_sha256` is the target version:
@@ -37,28 +42,38 @@ pub(super) struct Switch {
     pub from: String,
     /// The previous version's service file, until it has been removed.
     pub from_receipt: Option<macos::Receipt>,
+    /// The worker database as `from` left it is kept beside that version.
+    /// False when no database existed then.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub database_saved: bool,
 }
 
 /// The points of the sequence, in order. A test fails or stops at any of them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
+    Drain,
     Place,
     Compat,
     Stop,
+    Backup,
     Record,
     RemoveOld,
+    Restore,
     Input,
     Link,
     Publish,
     Start,
     Settle,
 }
-pub const STEPS: [Step; 10] = [
+pub const STEPS: [Step; 13] = [
+    Step::Drain,
     Step::Place,
     Step::Compat,
     Step::Stop,
+    Step::Backup,
     Step::Record,
     Step::RemoveOld,
+    Step::Restore,
     Step::Input,
     Step::Link,
     Step::Publish,
@@ -161,13 +176,16 @@ pub fn upgrade<L: Launcher>(
     hook: Hook,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve(env)?;
-    let journal = require_journal(&paths)?;
+    let _lock = exclusive_lock(&paths)?;
+    let mut journal = require_journal(&paths)?;
     check_request(&journal, request)?;
     let digest = sha256_file(current_exe)?;
     ensure!(
         digest == request.binary_sha256,
         "the upgrading binary is not the one the parent sent"
     );
+    hook(Step::Drain)?;
+    own_drain(&paths, &mut journal)?;
     hook(Step::Place)?;
     place_binary(&paths, &digest, current_exe)?;
     hook(Step::Compat)?;
@@ -175,7 +193,118 @@ pub fn upgrade<L: Launcher>(
     switch_to(&paths, journal, &digest, launcher, options, hook)
 }
 
-/// `worker-service rollback`: back to a version that is still installed.
+/// Drain for the upgrade and say so in the journal, unless the worker is
+/// draining already: that drain is the operator's and stays theirs. The
+/// journal is written first, so a drain is never left without its owner.
+fn own_drain(paths: &Paths, journal: &mut Journal) -> anyhow::Result<()> {
+    marker(paths, Duration::ZERO).verify_binding(&identity(journal))?;
+    let draining = Control::effective(&paths.state).drain;
+    if !journal.drained_by_upgrade {
+        if draining {
+            return Ok(());
+        }
+        journal.drained_by_upgrade = true;
+        save_journal(paths, journal)?;
+    }
+    if !draining {
+        control::write(&paths.state, Control::draining())?;
+    }
+    Ok(())
+}
+
+/// Where the worker database of `digest` is kept while a switch away from
+/// it is not committed.
+fn saved_database(paths: &Paths, digest: &str) -> PathBuf {
+    paths
+        .config
+        .join("bin")
+        .join(digest)
+        .join("worker.db.saved")
+}
+
+/// Move the write-ahead log into the database file. The service is stopped,
+/// so nothing else has the database open; if something does, say so rather
+/// than copy or replace a file that is in use.
+fn checkpoint(database: &Path) -> anyhow::Result<()> {
+    ensure!(
+        fs::symlink_metadata(database)?.is_file(),
+        "the worker database is not a regular file"
+    );
+    let connection = rusqlite::Connection::open_with_flags(
+        database,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let busy: i64 =
+        connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+    ensure!(
+        busy == 0,
+        "the worker database is in use by another process"
+    );
+    Ok(())
+}
+
+fn remove_if_present(path: &Path) -> anyhow::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Copy `from` to `to` through a private temporary file and a rename.
+fn copy_private(from: &Path, to: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let directory = to.parent().context("file parent")?;
+    let temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary
+        .as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
+    let mut source = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(from)?;
+    std::io::copy(&mut source, &mut temporary.as_file())?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(to).map_err(|e| e.error)?;
+    File::open(directory)?.sync_all()?;
+    Ok(())
+}
+
+/// Keep the stopped version's database beside its binary. Returns whether
+/// there was one. A copy left by an earlier, unrecorded attempt is replaced.
+fn save_database(paths: &Paths, digest: &str) -> anyhow::Result<bool> {
+    let database = paths.state.join("worker.db");
+    let saved = saved_database(paths, digest);
+    if absent(&database)? {
+        remove_if_present(&saved)?;
+        return Ok(false);
+    }
+    checkpoint(&database)?;
+    copy_private(&database, &saved)?;
+    Ok(true)
+}
+
+/// Put the database `digest` left back in place. The copy is kept until the
+/// switch is over, so running this again gives the same result.
+fn restore_database(paths: &Paths, digest: &str) -> anyhow::Result<()> {
+    let database = paths.state.join("worker.db");
+    let saved = saved_database(paths, digest);
+    ensure!(
+        !absent(&saved)?,
+        "the worker database saved for version {digest} is gone, so that version cannot be restored; run upgrade again to finish the switch"
+    );
+    if !absent(&database)? {
+        checkpoint(&database)?;
+    }
+    // A log of the replaced database must never be replayed into this one.
+    remove_if_present(&paths.state.join("worker.db-wal"))?;
+    remove_if_present(&paths.state.join("worker.db-shm"))?;
+    copy_private(&saved, &database)
+}
+
+/// `worker-service rollback`: back to the version an uncommitted switch
+/// began from. Without such a switch only the installed version itself can
+/// be named (it is started again); a committed switch cannot be undone.
 pub fn rollback<L: Launcher>(
     env: &BTreeMap<String, String>,
     request: &SwitchRequest,
@@ -184,8 +313,20 @@ pub fn rollback<L: Launcher>(
     hook: Hook,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve(env)?;
+    let _lock = exclusive_lock(&paths)?;
     let journal = require_journal(&paths)?;
     check_request(&journal, request)?;
+    let origin = journal
+        .switch
+        .as_ref()
+        .map_or(journal.binary_sha256.as_str(), |switch| {
+            switch.from.as_str()
+        });
+    ensure!(
+        origin == request.binary_sha256,
+        "no uncommitted switch from version {} is recorded; a committed upgrade cannot be rolled back",
+        request.binary_sha256
+    );
     installed_version(&paths, &request.binary_sha256)?;
     switch_to(
         &paths,
@@ -328,14 +469,22 @@ fn switch_to<L: Launcher>(
                 0o600,
                 false,
             )?;
-            hook(Step::Record)?;
-            let from = match journal.switch.take() {
-                Some(switch) => switch.from,
-                None => journal.binary_sha256.clone(),
+            // The database is saved once, as the version the switch began
+            // from left it. A recorded switch keeps that copy: what is in
+            // place now may already be the newer version's.
+            let (from, database_saved) = match journal.switch.take() {
+                Some(switch) => (switch.from, switch.database_saved),
+                None => {
+                    hook(Step::Backup)?;
+                    let saved = save_database(paths, &journal.binary_sha256)?;
+                    (journal.binary_sha256.clone(), saved)
+                }
             };
+            hook(Step::Record)?;
             journal.switch = Some(Switch {
                 from,
                 from_receipt: Some(receipt),
+                database_saved,
             });
             journal.receipt = None;
         } else {
@@ -356,6 +505,17 @@ fn switch_to<L: Launcher>(
             switch.from_receipt = None;
         }
         save_journal(paths, &journal)?;
+    }
+    // Returning to the version the switch began from: its database goes back
+    // before it starts. Without a service file nothing of either version runs.
+    if journal.receipt.is_none()
+        && journal
+            .switch
+            .as_ref()
+            .is_some_and(|switch| switch.from == to && switch.database_saved)
+    {
+        hook(Step::Restore)?;
+        restore_database(paths, to)?;
     }
     hook(Step::Input)?;
     let input = input_for(paths, to)?;
@@ -381,10 +541,53 @@ fn switch_to<L: Launcher>(
     ensure_started(&mut files, &mut launcher, &plan, &receipt)?;
     let ready = wait_ready(&paths.state, options.ready_timeout);
     hook(Step::Settle)?;
-    if journal.switch.take().is_some() {
+    // Back where the switch began, nothing is left to return to. A switch to
+    // any other version stays recorded until the parent commits it.
+    if journal.switch.as_ref().is_some_and(|s| s.from == to) {
+        remove_if_present(&saved_database(paths, to))?;
+        journal.switch = None;
         save_journal(paths, &journal)?;
     }
     status_with(paths, &journal, &plan, &receipt, &mut launcher, ready)
+}
+
+/// `worker-service commit`: the parent has checked the installed version.
+/// Forget the version the switch began from, delete its saved database and
+/// resume a drain the upgrade made. Running it again changes nothing more.
+pub fn commit<L: Launcher>(
+    env: &BTreeMap<String, String>,
+    request: &SwitchRequest,
+    mut launcher: L,
+) -> anyhow::Result<Status> {
+    let paths = Paths::resolve(env)?;
+    let _lock = exclusive_lock(&paths)?;
+    let mut journal = require_journal(&paths)?;
+    check_request(&journal, request)?;
+    ensure!(
+        journal.binary_sha256 == request.binary_sha256,
+        "the host is on version {}, not the one to commit",
+        journal.binary_sha256
+    );
+    let receipt = journal
+        .receipt
+        .clone()
+        .context("the version switch is unfinished; nothing was committed")?;
+    if let Some(switch) = journal.switch.take() {
+        // The copy goes first: a switch that is still recorded without it
+        // refuses to roll back instead of starting on a missing database.
+        remove_if_present(&saved_database(&paths, &switch.from))?;
+        save_journal(&paths, &journal)?;
+    }
+    if journal.drained_by_upgrade {
+        // The marker first: a crash in between leaves the ownership recorded
+        // and the next commit finishes, never a drain nobody owns.
+        marker(&paths, Duration::ZERO).request(&identity(&journal), WorkerRequest::Resume)?;
+        journal.drained_by_upgrade = false;
+        save_journal(&paths, &journal)?;
+    }
+    let plan = plan(&paths, &journal)?;
+    let ready = agent_reachable(&paths.state);
+    status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
 
 /// The status of a host whose switch has no service file yet: nothing of the
@@ -406,6 +609,8 @@ pub(super) fn unsettled_status(paths: &Paths, journal: &Journal) -> anyhow::Resu
         live_attempts: live_attempts(&paths.state).ok(),
         bridge_binary: None,
         switching_from: Some(switch.from.clone()),
+        drained_by_upgrade: journal.drained_by_upgrade,
+        switch_running: false,
     })
 }
 

@@ -122,8 +122,25 @@ impl Host {
             hook,
         )
     }
+    fn commit(&self, digest: &str) -> anyhow::Result<Status> {
+        commit(&self.env, &self.request(digest), self.fake.clone())
+    }
     fn status(&self) -> Status {
         status(&self.env, self.fake.clone()).unwrap()
+    }
+    fn journal(&self) -> Vec<u8> {
+        fs::read(self.paths().journal).unwrap()
+    }
+    /// A real worker database with one marker table, as the old version left it.
+    fn database(&self) -> PathBuf {
+        let paths = self.paths();
+        drop(
+            crate::storage::WorkerStore::open(&paths.state, &WorkerId::parse("mini-a").unwrap())
+                .unwrap(),
+        );
+        let path = paths.state.join("worker.db");
+        sql(&path, "CREATE TABLE left_by_old (x)");
+        path
     }
     fn launchctl(&self) -> Vec<String> {
         let world = self.fake.0.borrow();
@@ -135,11 +152,14 @@ impl Host {
     fn input(&self) -> super::super::super::worker::WorkerSpec {
         super::super::super::worker::read_input(&self.paths().input).unwrap()
     }
-    /// The host serves `digest`: journal, link, input and service agree, the
-    /// journal is at rest in its first shape, and no version binary changed.
+    /// Once the parent has committed, the host serves `digest`: journal, link,
+    /// input and service agree, the journal is at rest in its first shape,
+    /// and no version binary changed.
     fn assert_serving(&self, digest: &str) {
         let paths = self.paths();
+        self.commit(digest).unwrap();
         let status = self.status();
+        assert!(!status.drained_by_upgrade && !status.switch_running);
         assert_eq!(status.binary_sha256, digest);
         assert_eq!(status.loaded, Some(true));
         assert!(status.ready);
@@ -161,6 +181,27 @@ impl Host {
             paths.bridge_binary().to_str()
         );
     }
+}
+
+fn sql(database: &Path, statement: &str) {
+    rusqlite::Connection::open(database)
+        .unwrap()
+        .execute_batch(statement)
+        .unwrap();
+}
+fn tables(database: &Path) -> Vec<String> {
+    let connection =
+        rusqlite::Connection::open_with_flags(database, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .unwrap();
+    let mut statement = connection
+        .prepare("SELECT name FROM sqlite_master WHERE name LIKE '%_by_%' ORDER BY name")
+        .unwrap();
+    let names = statement.query_map([], |row| row.get(0)).unwrap();
+    names.map(Result::unwrap).collect()
+}
+/// The steps an upgrade of a host without a recorded switch passes.
+fn upgrade_steps() -> impl Iterator<Item = Step> {
+    STEPS.into_iter().filter(|step| *step != Step::Restore)
 }
 
 #[test]
@@ -222,7 +263,7 @@ fn rollback_returns_to_the_previous_version_with_its_own_input() {
 
 #[test]
 fn an_upgrade_that_fails_at_any_step_can_be_rolled_back() {
-    for step in STEPS {
+    for step in upgrade_steps() {
         let h = Host::new();
         let error = h.upgrade(&mut failing(step)).unwrap_err();
         assert!(format!("{error:#}").contains("injected"), "{step:?}");
@@ -238,7 +279,7 @@ fn an_upgrade_that_fails_at_any_step_can_be_rolled_back() {
 
 #[test]
 fn an_upgrade_that_stopped_at_any_step_is_finished_by_running_it_again() {
-    for step in STEPS {
+    for step in upgrade_steps() {
         let h = Host::new();
         h.upgrade(&mut failing(step)).unwrap_err();
         h.upgrade(&mut |_| Ok(())).unwrap();
@@ -368,12 +409,16 @@ fn rollback_refuses_a_version_that_is_absent_or_no_longer_its_bytes() {
             &mut |_| Ok(()),
         )
     };
+    // Nothing was switched, so there is nothing to return to.
     let error = to(&h.new).unwrap_err();
-    assert!(format!("{error:#}").contains("not installed"));
+    assert!(format!("{error:#}").contains("no uncommitted switch"));
     h.upgrade(&mut |_| Ok(())).unwrap();
     fs::write(h.paths().executable(&h.old), b"tampered").unwrap();
     let error = to(&h.old).unwrap_err();
     assert!(format!("{error:#}").contains("differs from its name"));
+    fs::remove_file(h.paths().executable(&h.old)).unwrap();
+    let error = to(&h.old).unwrap_err();
+    assert!(format!("{error:#}").contains("not installed"));
     assert_eq!(h.status().binary_sha256, h.new);
     assert_eq!(h.launchctl(), ["bootstrap", "bootout", "bootstrap"]);
 }
@@ -395,11 +440,16 @@ fn an_unreadable_database_or_a_foreign_binding_fails_before_anything_stops() {
         serde_json::to_vec(&(1, ClusterId::generate(), "mini-a", "k")).unwrap(),
     )
     .unwrap();
+    // The drain of the first attempt is the upgrade's and is said to be.
+    let status = h.status();
+    assert!(status.draining && status.drained_by_upgrade);
+    let before = h.journal();
     assert!(h.upgrade(&mut |_| Ok(())).is_err());
+    // A state that is bound to another identity is not touched at all.
+    assert_eq!(h.journal(), before);
     // Placement alone happened: the old service was never touched.
     assert_eq!(h.launchctl(), ["bootstrap"]);
     assert_eq!(h.current(), Path::new(&h.old));
-    assert!(!h.status().draining);
     assert_eq!(fs::read(paths.executable(&h.new)).unwrap(), b"new version");
 }
 
@@ -524,4 +574,475 @@ fn a_stop_that_waited_on_live_attempts_says_nothing_was_switched() {
     // Idle or unreadable: the stop failed for its own reason.
     assert_eq!(text(Some(0)), "the original reason");
     assert_eq!(text(None), "the original reason");
+}
+
+// --- the switch is kept until the parent commits (H1, M1) -------------------
+
+#[test]
+fn a_started_version_stays_revocable_until_the_parent_commits() {
+    let h = Host::new();
+    let status = h.upgrade(&mut |_| Ok(())).unwrap();
+    // The new version runs, and the host still knows where it came from.
+    assert_eq!(status.loaded, Some(true));
+    assert!(status.ready);
+    assert_eq!(status.switching_from.as_deref(), Some(h.old.as_str()));
+    assert_eq!(h.status().switching_from.as_deref(), Some(h.old.as_str()));
+    // A parent that died here and came back can still return to the old one.
+    h.rollback(&mut |_| Ok(())).unwrap();
+    let status = h.status();
+    assert_eq!(status.binary_sha256, h.old);
+    assert_eq!(status.switching_from, None);
+    assert_eq!(status.loaded, Some(true));
+    h.assert_serving(&h.old);
+}
+
+#[test]
+fn commit_forgets_the_previous_version_and_nothing_can_be_rolled_back_after_it() {
+    let h = Host::new();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    let status = h.commit(&h.new).unwrap();
+    assert_eq!(status.switching_from, None);
+    assert_eq!((status.loaded, status.ready), (Some(true), true));
+    assert!(!status.draining && !status.drained_by_upgrade);
+    let at_rest = h.journal();
+    let _: JournalV1 = serde_json::from_slice(&at_rest).unwrap();
+    // Again: nothing more changes.
+    h.commit(&h.new).unwrap();
+    assert_eq!(h.journal(), at_rest);
+    let error = h.rollback(&mut |_| Ok(())).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("a committed upgrade cannot be rolled back"),
+        "{error:#}"
+    );
+    assert_eq!(h.journal(), at_rest);
+    assert_eq!(h.launchctl(), ["bootstrap", "bootout", "bootstrap"]);
+}
+
+#[test]
+fn commit_names_the_installed_version_and_needs_a_finished_switch() {
+    let h = Host::new();
+    h.upgrade(&mut failing(Step::Publish)).unwrap_err();
+    let before = h.journal();
+    let error = h.commit(&h.new).unwrap_err();
+    assert!(format!("{error:#}").contains("unfinished"), "{error:#}");
+    let error = h.commit(&h.old).unwrap_err();
+    assert!(format!("{error:#}").contains("not the one to commit"));
+    let mut foreign = h.request(&h.new);
+    foreign.cluster = ClusterId::generate();
+    assert!(commit(&h.env, &foreign, h.fake.clone()).is_err());
+    assert_eq!(h.journal(), before);
+    assert!(h.status().draining);
+}
+
+#[test]
+fn a_drain_the_upgrade_made_is_recorded_from_its_first_step_and_resumed_by_commit() {
+    for step in upgrade_steps().filter(|step| *step != Step::Drain) {
+        let h = Host::new();
+        h.upgrade(&mut failing(step)).unwrap_err();
+        let status = h.status();
+        assert!(status.draining && status.drained_by_upgrade, "{step:?}");
+        // The next run finds its own drain and the commit ends it.
+        h.upgrade(&mut |_| Ok(())).unwrap();
+        assert!(h.status().drained_by_upgrade, "{step:?}");
+        let status = h.commit(&h.new).unwrap();
+        assert!(!status.draining && !status.drained_by_upgrade, "{step:?}");
+        assert!(!Control::effective(&h.paths().state).drain);
+    }
+    // Before the drain step nothing is drained or recorded.
+    let h = Host::new();
+    let before = h.journal();
+    h.upgrade(&mut failing(Step::Drain)).unwrap_err();
+    assert_eq!(h.journal(), before);
+    assert!(!h.status().draining);
+}
+
+#[test]
+fn a_drain_the_operator_made_stays_theirs_through_upgrade_and_commit() {
+    let h = Host::new();
+    drain(&h.env, h.fake.clone()).unwrap();
+    let status = h.upgrade(&mut |_| Ok(())).unwrap();
+    assert!(status.draining && !status.drained_by_upgrade);
+    let status = h.commit(&h.new).unwrap();
+    assert!(status.draining && !status.drained_by_upgrade);
+    assert_eq!(status.switching_from, None);
+    let _: JournalV1 = serde_json::from_slice(&h.journal()).unwrap();
+}
+
+#[test]
+fn a_recorded_drain_whose_marker_was_never_written_is_written_by_the_next_run() {
+    let h = Host::new();
+    h.upgrade(&mut failing(Step::Place)).unwrap_err();
+    // As if the first run had died between the journal and the marker.
+    control::write(&h.paths().state, Control::default()).unwrap();
+    h.upgrade(&mut failing(Step::Place)).unwrap_err();
+    let status = h.status();
+    assert!(status.draining && status.drained_by_upgrade);
+}
+
+#[test]
+fn the_operators_drain_and_resume_take_the_drain_over_from_the_upgrade() {
+    let h = Host::new();
+    h.upgrade(&mut failing(Step::Compat)).unwrap_err();
+    assert!(h.status().drained_by_upgrade);
+    let status = drain(&h.env, h.fake.clone()).unwrap();
+    assert!(status.draining && !status.drained_by_upgrade);
+    // The upgrade no longer resumes what the operator asked for.
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    assert!(h.commit(&h.new).unwrap().draining);
+
+    let h = Host::new();
+    h.upgrade(&mut failing(Step::Compat)).unwrap_err();
+    let status = resume(&h.env, h.fake.clone()).unwrap();
+    assert!(!status.draining && !status.drained_by_upgrade);
+    let _: JournalV1 = serde_json::from_slice(&h.journal()).unwrap();
+}
+
+#[test]
+fn resume_is_refused_while_a_switch_awaits_its_commit() {
+    let h = Host::new();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    let before = h.journal();
+    let error = resume(&h.env, h.fake.clone()).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("awaits its commit"),
+        "{error:#}"
+    );
+    assert_eq!(h.journal(), before);
+    assert!(h.status().draining);
+    // Draining again is harmless and makes the drain the operator's.
+    assert!(drain(&h.env, h.fake.clone()).unwrap().draining);
+    h.commit(&h.new).unwrap();
+    assert!(!resume(&h.env, h.fake.clone()).unwrap().draining);
+}
+
+// --- the worker database is saved and put back (M3) -------------------------
+
+#[test]
+fn rollback_before_commit_puts_the_saved_database_back_before_the_old_version_starts() {
+    let h = Host::new();
+    let database = h.database();
+    let saved = saved_database(&h.paths(), &h.old);
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    assert_eq!(tables(&saved), ["left_by_old"]);
+    assert_eq!(
+        fs::metadata(&saved).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    // The new version migrates; an idle connection keeps its log file alive.
+    let held = rusqlite::Connection::open(&database).unwrap();
+    held.execute_batch("CREATE TABLE made_by_new (x)").unwrap();
+    assert!(
+        fs::metadata(h.paths().state.join("worker.db-wal"))
+            .unwrap()
+            .len()
+            > 0
+    );
+    let mut seen_at_start = Vec::new();
+    h.rollback(&mut |step| {
+        if step == Step::Start {
+            seen_at_start = tables(&database);
+        }
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen_at_start, ["left_by_old"]);
+    assert_eq!(tables(&database), ["left_by_old"]);
+    // The old version reads it, and the copy is gone with the switch.
+    crate::storage::WorkerStore::open_read_only(&h.paths().state).unwrap();
+    assert!(absent(&saved).unwrap());
+    h.assert_serving(&h.old);
+}
+
+#[test]
+fn the_saved_database_holds_what_was_still_in_the_log() {
+    let h = Host::new();
+    let database = h.database();
+    // Written but not yet moved into the database file.
+    let held = rusqlite::Connection::open(&database).unwrap();
+    held.execute_batch("CREATE TABLE logged_by_old (x)")
+        .unwrap();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    assert_eq!(
+        tables(&saved_database(&h.paths(), &h.old)),
+        ["left_by_old", "logged_by_old"]
+    );
+}
+
+#[test]
+fn the_saved_database_is_never_replaced_once_the_switch_is_recorded() {
+    let h = Host::new();
+    let database = h.database();
+    h.fake.0.borrow_mut().fail_start = true;
+    h.upgrade(&mut |_| Ok(())).unwrap_err();
+    h.fake.0.borrow_mut().fail_start = false;
+    sql(&database, "CREATE TABLE made_by_new (x)");
+    // Forward again, half back, forward again: the copy stays the old one's.
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    h.rollback(&mut failing(Step::Settle)).unwrap_err();
+    sql(&database, "CREATE TABLE made_by_old_later (x)");
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    assert_eq!(tables(&saved_database(&h.paths(), &h.old)), ["left_by_old"]);
+    assert_eq!(tables(&database), ["left_by_old", "made_by_old_later"]);
+    h.rollback(&mut |_| Ok(())).unwrap();
+    assert_eq!(tables(&database), ["left_by_old"]);
+}
+
+#[test]
+fn a_rollback_that_died_after_the_old_version_started_does_not_replace_its_database() {
+    let h = Host::new();
+    let database = h.database();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    h.rollback(&mut failing(Step::Settle)).unwrap_err();
+    assert_eq!(h.status().loaded, Some(true));
+    sql(&database, "CREATE TABLE made_by_old_later (x)");
+    let mut steps = Vec::new();
+    h.rollback(&mut |step| {
+        steps.push(step);
+        Ok(())
+    })
+    .unwrap();
+    assert!(!steps.contains(&Step::Restore), "{steps:?}");
+    assert_eq!(tables(&database), ["left_by_old", "made_by_old_later"]);
+}
+
+#[test]
+fn a_restore_that_failed_is_done_again_by_the_next_rollback() {
+    let h = Host::new();
+    let database = h.database();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    sql(&database, "CREATE TABLE made_by_new (x)");
+    for step in [Step::Restore, Step::Input, Step::Publish] {
+        h.rollback(&mut failing(step)).unwrap_err();
+        // Nothing of either version runs while the database is replaced.
+        assert_eq!(h.status().loaded, None, "{step:?}");
+    }
+    h.rollback(&mut |_| Ok(())).unwrap();
+    assert_eq!(tables(&database), ["left_by_old"]);
+    h.assert_serving(&h.old);
+}
+
+#[test]
+fn commit_deletes_the_saved_database() {
+    let h = Host::new();
+    h.database();
+    let saved = saved_database(&h.paths(), &h.old);
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    assert!(!absent(&saved).unwrap());
+    h.commit(&h.new).unwrap();
+    assert!(absent(&saved).unwrap());
+}
+
+#[test]
+fn a_recorded_switch_whose_saved_database_is_gone_refuses_to_roll_back() {
+    let h = Host::new();
+    let database = h.database();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    sql(&database, "CREATE TABLE made_by_new (x)");
+    fs::remove_file(saved_database(&h.paths(), &h.old)).unwrap();
+    let error = h.rollback(&mut |_| Ok(())).unwrap_err();
+    assert!(format!("{error:#}").contains("is gone"), "{error:#}");
+    // The newer database was left as it is; going forward still works.
+    assert_eq!(tables(&database), ["left_by_old", "made_by_new"]);
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    h.assert_serving(&h.new);
+}
+
+#[test]
+fn a_host_without_a_database_saves_none_and_drops_a_stale_copy() {
+    let h = Host::new();
+    let paths = h.paths();
+    let saved = saved_database(&paths, &h.old);
+    fs::write(&saved, b"left by an attempt that was never recorded").unwrap();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    assert!(absent(&saved).unwrap());
+    let journal = read_journal(&paths).unwrap().unwrap();
+    assert!(!journal.switch.unwrap().database_saved);
+    let mut steps = Vec::new();
+    h.rollback(&mut |step| {
+        steps.push(step);
+        Ok(())
+    })
+    .unwrap();
+    assert!(!steps.contains(&Step::Restore));
+    h.assert_serving(&h.old);
+}
+
+#[test]
+fn an_attempt_that_was_never_recorded_leaves_a_copy_the_next_one_replaces() {
+    let h = Host::new();
+    let database = h.database();
+    h.upgrade(&mut failing(Step::Record)).unwrap_err();
+    // The old version was started again and wrote more.
+    h.rollback(&mut |_| Ok(())).unwrap();
+    assert_eq!(h.status().loaded, Some(true));
+    sql(&database, "CREATE TABLE more_by_old (x)");
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    assert_eq!(
+        tables(&saved_database(&h.paths(), &h.old)),
+        ["left_by_old", "more_by_old"]
+    );
+}
+
+#[test]
+fn a_database_that_is_in_use_is_neither_copied_nor_replaced() {
+    let h = Host::new();
+    let database = h.database();
+    checkpoint(&database).unwrap();
+    // A reader that pins the log while more is written to it.
+    let reader = rusqlite::Connection::open(&database).unwrap();
+    reader.execute_batch("BEGIN").unwrap();
+    let _: i64 = reader
+        .query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap();
+    let writer = rusqlite::Connection::open(&database).unwrap();
+    writer
+        .execute_batch("CREATE TABLE more_by_old (x)")
+        .unwrap();
+    let error = checkpoint(&database).unwrap_err();
+    assert!(format!("{error:#}").contains("in use"), "{error:#}");
+    let error = h.upgrade(&mut |_| Ok(())).unwrap_err();
+    assert!(format!("{error:#}").contains("in use"), "{error:#}");
+    assert_eq!(h.status().switching_from, None);
+    drop(reader);
+    // Not a file: nothing is opened through a link.
+    let elsewhere = h.paths().home.join("elsewhere.db");
+    fs::rename(&database, &elsewhere).unwrap();
+    std::os::unix::fs::symlink(&elsewhere, &database).unwrap();
+    assert!(checkpoint(&database).is_err());
+}
+
+// --- one switch at a time (M2) ----------------------------------------------
+
+#[test]
+fn every_changing_action_is_refused_while_another_helper_holds_the_switch_lock() {
+    let h = Host::new();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    let before = (h.journal(), h.launchctl());
+    let held = switch_lock(&h.paths(), true, Duration::ZERO)
+        .unwrap()
+        .expect("the lock is free");
+    let refused = [
+        h.upgrade(&mut |_| Ok(())),
+        h.rollback(&mut |_| Ok(())),
+        h.commit(&h.new),
+        drain(&h.env, h.fake.clone()),
+        resume(&h.env, h.fake.clone()),
+    ];
+    for result in refused {
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("a version switch is running"),
+            "{error:#}"
+        );
+    }
+    assert_eq!((h.journal(), h.launchctl()), before);
+    // Status still answers, and says what is going on.
+    let status = h.status();
+    assert!(status.switch_running);
+    assert_eq!(status.binary_sha256, h.new);
+    drop(held);
+    assert!(!h.status().switch_running);
+    h.rollback(&mut |_| Ok(())).unwrap();
+    h.assert_serving(&h.old);
+}
+
+#[test]
+fn a_running_switch_holds_the_lock_from_its_first_step_to_its_last() {
+    let h = Host::new();
+    let mut seen = Vec::new();
+    h.upgrade(&mut |step| {
+        let status = h.status();
+        let second = h.rollback(&mut |_| Ok(())).unwrap_err();
+        seen.push((
+            step,
+            status.switch_running,
+            format!("{second:#}").contains("a version switch is running"),
+        ));
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(seen.len(), STEPS.len() - 1);
+    assert!(seen
+        .iter()
+        .all(|(_, running, refused)| *running && *refused));
+    // And lets go of it when it returns, also by an error.
+    assert!(!h.status().switch_running);
+    h.rollback(&mut failing(Step::Stop)).unwrap_err();
+    assert!(!h.status().switch_running);
+}
+
+#[test]
+fn two_statuses_at_once_do_not_take_each_other_for_a_switch() {
+    let h = Host::new();
+    let paths = h.paths();
+    let reader = switch_lock(&paths, false, Duration::ZERO).unwrap();
+    assert!(reader.is_some());
+    assert!(!h.status().switch_running);
+    // A writer waits a little for a reader, then gives up without an error.
+    let started = Instant::now();
+    assert!(switch_lock(&paths, true, Duration::from_millis(40))
+        .unwrap()
+        .is_none());
+    assert!(started.elapsed() >= Duration::from_millis(40));
+    drop(reader);
+    assert!(switch_lock(&paths, true, Duration::ZERO).unwrap().is_some());
+    let mode = fs::metadata(paths.config.join("worker-service.lock"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o600);
+}
+
+#[test]
+fn the_helper_reads_a_commit_request_and_refuses_an_unknown_field() {
+    let h = Host::new();
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    let mut value = serde_json::to_value(h.request(&h.new)).unwrap();
+    let run = |body: &serde_json::Value| {
+        handle(
+            Action::Commit,
+            &h.env,
+            &serde_json::to_vec(body).unwrap(),
+            &h.new_exe,
+            h.fake.clone(),
+            OPTIONS,
+        )
+    };
+    value["extra"] = true.into();
+    assert!(run(&value).is_err());
+    assert!(h.status().switching_from.is_some());
+    value.as_object_mut().unwrap().remove("extra");
+    assert_eq!(run(&value).unwrap().switching_from, None);
+}
+
+#[test]
+fn a_status_at_rest_keeps_the_shape_the_first_release_reads() {
+    let h = Host::new();
+    let value = serde_json::to_value(h.status()).unwrap();
+    let mut keys: Vec<&str> = value
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "binary_sha256",
+            "bridge_binary",
+            "cancel_running",
+            "cluster",
+            "draining",
+            "live_attempts",
+            "loaded",
+            "ready",
+            "worker_id"
+        ]
+    );
+    h.upgrade(&mut |_| Ok(())).unwrap();
+    let value = serde_json::to_value(h.status()).unwrap();
+    assert_eq!(value["drained_by_upgrade"], true);
+    assert_eq!(value["switching_from"], h.old.as_str());
+    assert!(value.get("switch_running").is_none());
 }

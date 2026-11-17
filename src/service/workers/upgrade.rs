@@ -1,18 +1,27 @@
-//! Parent-side `workers upgrade`: drain, place the new version, check it can
-//! read what is installed, switch the service, check the bridge the resident
-//! uses, resume. The worker-host helper does the switch; this side decides
-//! what a failure means and never reports a state the host did not show:
+//! Parent-side `workers upgrade`: check the resident, then let the host
+//! drain, place the new version, check it can read what is installed and
+//! switch the service; check the bridge the resident uses; commit. The
+//! worker-host helper does the switch; this side decides what a failure
+//! means and never reports a state the host did not show:
 //!
 //! - a failure before anything was switched leaves the previous version
-//!   serving and says so;
+//!   serving (checked with a `hello`, not assumed) and says so;
 //! - a failure after the switch began rolls back to the previous version and
 //!   checks it the same way;
 //! - when the rollback fails too, or the host cannot be observed, the error
 //!   says what was last seen and claims neither "upgraded" nor "stopped".
 //!
-//! The health check is one `hello` from this binary through the registered
-//! bridge path. A resident that is already running reconnects on its own and
-//! negotiates again; its link is not checked here.
+//! The host keeps two records until this side commits: the version the
+//! switch began from, and whether the upgrade made the drain. A run that
+//! died anywhere is therefore continued by running `upgrade` again: it can
+//! still roll back, and it resumes exactly the drain an earlier run made.
+//! After the commit there is no rollback.
+//!
+//! The health check is one `hello` through the registered bridge path with
+//! the features the coordinator resident requires. The upgrade is refused
+//! while a resident of another build runs: its link to the new worker would
+//! go unchecked. The previous version is checked with the features it agreed
+//! to before the upgrade, not with what this build requires.
 use super::*;
 use crate::service::worker_service::upgrade::SwitchRequest;
 
@@ -30,7 +39,8 @@ pub struct UpgradeResult {
     /// The version that was serving before, and the one that serves now.
     pub from: String,
     pub to: String,
-    /// The worker is draining now (it was before the upgrade and was left so).
+    /// The worker is draining now. Only a drain that was there before the
+    /// upgrade is left; one the upgrade made has been resumed.
     pub draining: bool,
     pub status: Status,
 }
@@ -44,7 +54,7 @@ fn short(digest: &str) -> &str {
     digest.get(..12).unwrap_or(digest)
 }
 
-/// The version to return to: what an unfinished switch started from, else
+/// The version to return to: what an uncommitted switch started from, else
 /// what is installed, whichever is not the target.
 fn previous_version(before: &Status, target: &str) -> Option<String> {
     [
@@ -57,11 +67,9 @@ fn previous_version(before: &Status, target: &str) -> Option<String> {
     .map(str::to_owned)
 }
 
-/// Why `status` does not show `digest` serving, if it does not.
+/// Why `status` does not show `digest` serving, if it does not. A switch
+/// that awaits its commit is not a reason: the version runs.
 fn not_serving(status: &Status, digest: &str) -> Option<String> {
-    if status.switching_from.is_some() {
-        return Some("the version switch is unfinished".into());
-    }
     if status.binary_sha256 != digest {
         return Some(format!(
             "the host reports version {}",
@@ -71,6 +79,9 @@ fn not_serving(status: &Status, digest: &str) -> Option<String> {
     match status.loaded {
         Some(true) => {}
         Some(false) => return Some("the service is not loaded".into()),
+        None if status.switching_from.is_some() => {
+            return Some("the version switch is unfinished".into())
+        }
         None => return Some("the loaded service could not be identified".into()),
     }
     (!status.ready).then(|| "the agent does not accept connections".into())
@@ -85,18 +96,60 @@ fn observed(status: &Status) -> String {
     format!(
         "last observed: version {}{}, service {loaded}, agent {}, {}",
         short(&status.binary_sha256),
-        if status.switching_from.is_some() {
-            " (switch unfinished)"
-        } else {
-            ""
+        match &status.switching_from {
+            Some(from) => format!(" (switch from {} not committed)", short(from)),
+            None => String::new(),
         },
         if status.ready { "ready" } else { "not ready" },
-        if status.draining {
-            "draining"
-        } else {
-            "not draining"
+        match (status.draining, status.drained_by_upgrade) {
+            (true, true) => "drained by the upgrade",
+            (true, false) => "draining",
+            (false, _) => "not draining",
         },
     )
+}
+
+/// The resident decides what a worker must offer. `Ok`: the features the
+/// health check requires. `Err`: why the upgrade must not start.
+fn resident_requirement(new: &str, resident: ResidentBuild) -> Result<Vec<String>, String> {
+    let offered = crate::protocol::session::offered_features();
+    let required = crate::protocol::session::required_features();
+    match resident {
+        ResidentBuild::NotRunning => Ok(required),
+        ResidentBuild::Unknown { reason } => Err(format!(
+            "the running resident did not say which build it is ({reason})"
+        )),
+        ResidentBuild::Running {
+            binary_sha256,
+            features,
+            required_features,
+        } => {
+            if binary_sha256 != new {
+                return Err(format!(
+                    "the running resident is build {}, this binary is {}",
+                    short(&binary_sha256),
+                    short(new)
+                ));
+            }
+            if features != offered || required_features != required {
+                return Err(
+                    "the running resident negotiates other features than this binary".into(),
+                );
+            }
+            Ok(required_features)
+        }
+    }
+}
+
+/// What the previous version must agree to when it is checked: of the
+/// features the resident requires, those the version agreed to before the
+/// upgrade. A version that was not seen serving is asked for none.
+fn previous_requirement(required: &[String], agreed: Option<&[String]>) -> Vec<String> {
+    required
+        .iter()
+        .filter(|feature| agreed.is_some_and(|agreed| agreed.contains(feature)))
+        .cloned()
+        .collect()
 }
 
 struct Session<'a, R: Remote> {
@@ -137,7 +190,12 @@ impl<R: Remote> Session<'_, R> {
     fn status(&mut self) -> Result<Status, ApiError> {
         self.helper("status", &[], Duration::from_secs(120))
     }
-    fn switch(&mut self, action: &'static str, digest: &str) -> Result<Status, ApiError> {
+    fn request(
+        &mut self,
+        action: &'static str,
+        digest: &str,
+        timeout: Duration,
+    ) -> Result<Status, ApiError> {
         let request = SwitchRequest {
             schema: 1,
             cluster: self.cluster.clone(),
@@ -146,37 +204,56 @@ impl<R: Remote> Session<'_, R> {
         };
         let body = serde_json::to_vec(&request)
             .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
-        self.helper(action, &body, Duration::from_secs(STOP_WAIT_SECS + 300))
+        self.helper(action, &body, timeout)
     }
-    /// `digest` is serving: the host says so and the bridge the resident
-    /// uses answers `hello` as this worker in this cluster.
-    fn serving(&mut self, status: &Status, digest: &str) -> Result<(), String> {
-        if let Some(why) = not_serving(status, digest) {
-            return Err(why);
-        }
+    fn switch(&mut self, action: &'static str, digest: &str) -> Result<Status, ApiError> {
+        self.request(action, digest, Duration::from_secs(STOP_WAIT_SECS + 300))
+    }
+    fn hello(&mut self, status: &Status, required: &[String]) -> Result<Vec<String>, String> {
         let binary = self
             .binary
             .clone()
             .or_else(|| status.bridge_binary.clone())
             .ok_or("the host did not report its bridge binary path")?;
-        let (cluster, worker) = self
+        let hello = self
             .remote
-            .bridge_hello(&self.target, &binary, &self.cluster)
+            .bridge_hello_with(&self.target, &binary, &self.cluster, required)
             .map_err(|m| format!("the worker bridge did not complete hello: {m}"))?;
-        if worker.as_str() != self.name || cluster != self.cluster {
+        if hello.worker.as_str() != self.name || hello.cluster != self.cluster {
             return Err("the worker bridge answered for a different worker or cluster".into());
         }
-        Ok(())
+        Ok(hello.features)
     }
-    /// Resume when this run is the one that drained. The text says what is
-    /// left for the operator, if anything.
-    fn resume(&mut self, wanted: bool) -> &'static str {
-        if !wanted {
-            return "; it was draining before and still is";
+    /// `digest` is serving: the host says so and the bridge the resident
+    /// uses answers `hello` as this worker in this cluster, agreeing to
+    /// `required`.
+    fn serving(
+        &mut self,
+        status: &Status,
+        digest: &str,
+        required: &[String],
+    ) -> Result<(), String> {
+        if let Some(why) = not_serving(status, digest) {
+            return Err(why);
         }
-        match self.helper("resume", &[], Duration::from_secs(120)) {
-            Ok(status) if !status.draining => "",
-            _ => "; it could not be resumed and is draining, run workers resume",
+        self.hello(status, required).map(|_| ())
+    }
+    /// Tell the host that `digest` has been checked. It forgets the version
+    /// the switch began from and resumes a drain the upgrade made. `Ok`: the
+    /// host's state after it, and what is left to say about the drain.
+    /// `Err`: what is left for the operator.
+    fn commit(&mut self, digest: &str) -> Result<(Status, &'static str), &'static str> {
+        match self.request("commit", digest, Duration::from_secs(120)) {
+            Ok(status) if !status.draining => Ok((status, "")),
+            Ok(status) if !status.drained_by_upgrade => {
+                Ok((status, "; it was draining before the upgrade and still is"))
+            }
+            _ => Err("; the commit did not finish, so it may still be drained by the upgrade: run workers upgrade again"),
+        }
+    }
+    fn left(&mut self, digest: &str) -> &'static str {
+        match self.commit(digest) {
+            Ok((_, left)) | Err(left) => left,
         }
     }
     fn last_observed(&mut self) -> (ErrorCode, String) {
@@ -189,21 +266,26 @@ impl<R: Remote> Session<'_, R> {
         }
     }
     /// Return to `previous` after the switch began. Always an error: either
-    /// "rolled back and serving again", or what was last seen.
-    fn roll_back(&mut self, previous: Option<String>, reason: &str, resume: bool) -> ApiError {
+    /// "rolled back and serving again", or what was last seen. The drain is
+    /// released only with a version that passed its check.
+    fn roll_back(
+        &mut self,
+        previous: Option<String>,
+        reason: &str,
+        required: &[String],
+    ) -> ApiError {
         let name = self.name;
         let Some(previous) = previous else {
             let (code, seen) = self.last_observed();
-            let left = self.resume(resume);
             return ApiError::new(
                 code,
-                format!("upgrade of worker {name} failed ({reason}); no previous version is known, so nothing was rolled back; {seen}{left}"),
+                format!("upgrade of worker {name} failed ({reason}); no previous version is known, so nothing was rolled back; {seen}; run workers upgrade again"),
             );
         };
         let failure = match self.switch("rollback", &previous) {
-            Ok(status) => match self.serving(&status, &previous) {
+            Ok(status) => match self.serving(&status, &previous, required) {
                 Ok(()) => {
-                    let left = self.resume(resume);
+                    let left = self.left(&previous);
                     return ApiError::new(
                         ErrorCode::Conflict,
                         format!(
@@ -231,6 +313,7 @@ pub fn upgrade(
     spec: &Spec,
     exe: &Path,
     name: &str,
+    resident: impl FnOnce(&Spec) -> ResidentBuild,
 ) -> Result<UpgradeResult, ApiError> {
     check_name(name)?;
     let registration = registered(env, name)?
@@ -247,6 +330,13 @@ pub fn upgrade(
     let target = target_of(&registration.ssh)?;
     let new = worker_service::sha256_file(exe)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    // Before anything is sent to the host.
+    let required = resident_requirement(&new, resident(spec)).map_err(|why| {
+        ApiError::new(
+            ErrorCode::Conflict,
+            format!("worker {name} was not upgraded: {why}; restart the resident so that it runs this binary, then run workers upgrade again (nothing was changed)"),
+        )
+    })?;
     // Staging writes only the bootstrap directory; the installed worker is untouched.
     ensure_staged(remote, &target, exe, &new)?;
     let mut session = Session {
@@ -258,42 +348,55 @@ pub fn upgrade(
         binary: registration.binary.clone(),
     };
     let before = session.status()?;
-    let unfinished = before.switching_from.is_some();
-    if !unfinished && before.binary_sha256 == new && session.serving(&before, &new).is_ok() {
-        return Ok(UpgradeResult {
-            id: name.into(),
-            outcome: Outcome::AlreadyCurrent,
-            from: new.clone(),
-            to: new,
-            draining: before.draining,
-            status: before,
-        });
+    if before.switch_running {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            format!("worker {name} was not upgraded: a version switch is running on its host; nothing was changed, run workers upgrade again when it has finished"),
+        ));
+    }
+    let uncommitted = before.switching_from.is_some();
+    if !uncommitted
+        && before.binary_sha256 == new
+        && session.serving(&before, &new, &required).is_ok()
+    {
+        if !before.drained_by_upgrade {
+            return Ok(UpgradeResult {
+                id: name.into(),
+                outcome: Outcome::AlreadyCurrent,
+                from: new.clone(),
+                to: new,
+                draining: before.draining,
+                status: before,
+            });
+        }
+        // An earlier run was stopped inside its commit: finish it.
+        return match session.commit(&new) {
+            Ok((status, _)) => Ok(UpgradeResult {
+                id: name.into(),
+                outcome: Outcome::AlreadyCurrent,
+                from: new.clone(),
+                to: new,
+                draining: status.draining,
+                status,
+            }),
+            Err(left) => Err(ApiError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "worker {name} has version {} and passed its check{left}",
+                    short(&new)
+                ),
+            )),
+        };
     }
     // The version is installed but not serving: the switch below starts it
     // (it changes nothing else) and checks it like a new one.
     let previous = previous_version(&before, &new);
-    // An unfinished switch was drained by the run that began it.
-    let resume = !before.draining || unfinished;
-    if !before.draining && !unfinished {
-        match session.helper("drain", &[], Duration::from_secs(120)) {
-            Ok(status) if status.draining => {}
-            Ok(_) => {
-                return Err(ApiError::new(
-                    ErrorCode::Conflict,
-                    format!("worker {name} did not start draining; nothing was changed"),
-                ))
-            }
-            Err(error) => {
-                return Err(ApiError::new(
-                    error.code,
-                    format!(
-                        "worker {name} was not upgraded: draining failed ({}); the previous version is installed and may be draining, run workers resume",
-                        error.message
-                    ),
-                ))
-            }
-        }
-    }
+    // What the previous version agrees to, while it can still be asked.
+    let agreed = (before.binary_sha256 != new
+        && not_serving(&before, &before.binary_sha256).is_none())
+    .then(|| session.hello(&before, &[]).ok())
+    .flatten();
+    let previous_required = previous_requirement(&required, agreed.as_deref());
     let switched = match session.switch("upgrade", &new) {
         Ok(status) => status,
         Err(error) => {
@@ -310,11 +413,25 @@ pub fn upgrade(
                     ))
                 }
             };
-            if let Some(previous) = previous
-                .as_ref()
-                .filter(|previous| not_serving(&after, previous).is_none())
-            {
-                let left = session.resume(resume);
+            if after.switch_running {
+                // The helper is still at work: undoing it now would run
+                // two switches against each other.
+                return Err(ApiError::new(
+                    ErrorCode::CommunicationUnknown,
+                    format!(
+                        "upgrade of worker {name}: the host did not answer ({}) and a version switch is still running there; nothing was rolled back or resumed, run workers upgrade again when it has finished; {}",
+                        error.message,
+                        observed(&after)
+                    ),
+                ));
+            }
+            if let Some(previous) = previous.as_ref().filter(|previous| {
+                after.switching_from.is_none()
+                    && session
+                        .serving(&after, previous, &previous_required)
+                        .is_ok()
+            }) {
+                let left = session.left(previous);
                 return Err(ApiError::new(
                     error.code,
                     format!(
@@ -325,44 +442,73 @@ pub fn upgrade(
                 ));
             }
             if not_serving(&after, &new).is_some() {
-                return Err(session.roll_back(previous, &error.message, resume));
+                return Err(session.roll_back(previous, &error.message, &previous_required));
             }
             // Only the answer was lost: the host shows the new version.
             after
         }
     };
-    let reason = match session.serving(&switched, &new) {
+    let reason = match session.serving(&switched, &new, &required) {
         Ok(()) => {
-            if session.binary.is_none() {
-                if let Some(binary) = &switched.bridge_binary {
-                    set_binary(env, name, binary)?;
-                }
-            }
-            let left = session.resume(resume);
-            if resume && !left.is_empty() {
-                return Err(ApiError::new(
+            // Commit, and with it resume, before anything else can fail.
+            let (status, _) = session.commit(&new).map_err(|left| {
+                ApiError::new(
                     ErrorCode::Conflict,
                     format!(
                         "worker {name} was upgraded to version {} and passed its check{left}",
                         short(&new)
                     ),
-                ));
+                )
+            })?;
+            if session.binary.is_none() {
+                if let Some(binary) = &status.bridge_binary {
+                    set_binary(env, name, binary).map_err(|error| {
+                        ApiError::new(
+                            error.code,
+                            format!(
+                                "worker {name} was upgraded to version {} and {}, but its registration could not be updated: {}",
+                                short(&new),
+                                if status.draining {
+                                    "is still draining as it was before"
+                                } else {
+                                    "is not draining"
+                                },
+                                error.message
+                            ),
+                        )
+                    })?;
+                }
             }
             return Ok(UpgradeResult {
                 id: name.into(),
                 outcome: Outcome::Upgraded,
                 from: previous.unwrap_or_else(|| new.clone()),
                 to: new,
-                draining: !resume,
-                status: Status {
-                    draining: !resume,
-                    ..switched
-                },
+                draining: status.draining,
+                status,
             });
         }
         Err(why) => format!("the new version did not pass its check: {why}"),
     };
-    Err(session.roll_back(previous, &reason, resume))
+    Err(session.roll_back(previous, &reason, &previous_required))
+}
+
+fn describe(name: &str, result: &UpgradeResult) -> String {
+    let done = match result.outcome {
+        Outcome::AlreadyCurrent => {
+            format!("worker {name} already has version {}", short(&result.to))
+        }
+        Outcome::Upgraded => format!(
+            "worker {name} upgraded from version {} to {}",
+            short(&result.from),
+            short(&result.to)
+        ),
+    };
+    if result.draining {
+        format!("{done}; it was draining before and still is")
+    } else {
+        done
+    }
 }
 
 pub(super) fn command(
@@ -375,24 +521,12 @@ pub(super) fn command(
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))
         .and_then(|exe| {
             let spec = crate::service::context::runtime_spec(env)?;
-            upgrade(&mut SshRemote, env, &spec, &exe, name)
+            upgrade(&mut SshRemote, env, &spec, &exe, name, resident_build)
         });
-    let text = match &result {
-        Ok(r) if r.outcome == Outcome::AlreadyCurrent => {
-            format!("worker {name} already has version {}", short(&r.to))
-        }
-        Ok(r) => format!(
-            "worker {name} upgraded from version {} to {}{}",
-            short(&r.from),
-            short(&r.to),
-            if r.draining {
-                "; it was draining before and still is"
-            } else {
-                ""
-            }
-        ),
-        Err(_) => String::new(),
-    };
+    let text = result
+        .as_ref()
+        .map(|r| describe(name, r))
+        .unwrap_or_default();
     emit(
         json,
         result.map(|r| serde_json::to_value(r).expect("serializes")),
