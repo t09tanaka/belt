@@ -1795,7 +1795,7 @@ pub(crate) mod meeting {
             let mut inside = self.inside.lock().unwrap();
             *inside += 1;
             self.changed.notify_all();
-            let (_, wait) = self
+            let (_inside, wait) = self
                 .changed
                 .wait_timeout_while(inside, Duration::from_secs(10), |n| *n < self.need)
                 .unwrap();

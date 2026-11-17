@@ -412,7 +412,6 @@ mod tests {
         assert!(report.required_tools.is_empty());
         assert!(report.profile_digest.unwrap().starts_with("sha256:"));
         // Nothing to resolve the scope from: not measured.
-        // Nothing to resolve the scope from: not measured.
         assert_eq!(report.policy_digest, None);
     }
 
