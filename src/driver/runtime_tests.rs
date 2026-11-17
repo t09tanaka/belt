@@ -3773,6 +3773,28 @@ fn a_plan_with_a_task_named_like_a_dynamic_member_is_refused_before_it_runs() {
         .id = format!("{origin}#7");
     f.plan.digest = f.plan.compute_digest().unwrap();
     assert_eq!(driver_of(&f).unwrap_err().to_string(), RESERVED);
+    // a worker that derives the members again from such a plan refuses too
+    let good = Fixture::new(WORKFLOW);
+    let mut d = good.driver(2);
+    seed(&good, &mut d);
+    let inputs = &d.state.expansions[&origin].inputs;
+    let evaluation = d.evaluation.as_ref().unwrap();
+    let dynamic = good.plan.task(&origin).unwrap();
+    let derive = |plan: &FrozenPlan| {
+        dispatch::derive(plan, evaluation, dynamic, inputs, 4, MAX_WIRE_BYTES).map(|_| ())
+    };
+    derive(&good.plan).unwrap();
+    let mut colliding = good.plan.clone();
+    colliding
+        .tasks
+        .iter_mut()
+        .find(|t| t.jobs == ["consumer"])
+        .unwrap()
+        .id = format!("{origin}#1");
+    assert!(derive(&colliding)
+        .unwrap_err()
+        .to_string()
+        .contains("derived member collides with frozen task"));
     // a static matrix names its members the same way: its plan has two tasks
     // of one id, which no driver takes either
     let f = Fixture::new(
