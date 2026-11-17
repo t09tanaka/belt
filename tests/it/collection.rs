@@ -5123,7 +5123,7 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     assert!(probe.history_keys.iter().all(Option::is_some));
     let job = specs
         .iter()
-        .find(|(id, _)| id != &discovery)
+        .find(|(id, _)| id == &test)
         .and_then(|(_, spec)| spec.ci.as_ref())
         .unwrap();
     for key in &probe.history_keys {
