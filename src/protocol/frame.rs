@@ -304,7 +304,7 @@ mod tests {
         for op in Operation::ALL {
             let want = match op {
                 ReadLog => StreamKind::Log,
-                BlobPut | BlobGet | SecretBundlePut => StreamKind::Blob,
+                BlobPut | BlobGet | SecretBundlePut | WorkflowArtifact => StreamKind::Blob,
                 _ => StreamKind::Control,
             };
             assert_eq!(kind_of_operation(op), want, "{op:?}");

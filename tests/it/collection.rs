@@ -5166,3 +5166,28 @@ jobs:
         }
     );
 }
+
+#[test]
+fn a38_refuses_cross_run_artifact_options_before_any_job_can_be_placed() {
+    let plan = ci_plan(
+        r#"on: push
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: '123'
+"#,
+    );
+    let err = remote_task_runner::service::ci_run::task_specs(
+        &plan,
+        &Digest::of_bytes(b"plan"),
+        &Digest::of_bytes(b"manifest"),
+        &Default::default(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    assert!(err.message.contains("run-id"), "{}", err.message);
+}

@@ -138,6 +138,12 @@ pub fn task_specs(
             "the plan has no task: no workflow has a job to run",
         ));
     }
+    let local_plan = plan.to_plan();
+    for workflow in 0..plan.workflows.len() {
+        if let Some(reason) = local_ci::artifact_io::workflow_refusal(&local_plan, workflow) {
+            return Err(invalid(reason));
+        }
+    }
     let distributed_matrix = plan
         .tasks
         .iter()

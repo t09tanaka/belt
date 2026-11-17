@@ -209,6 +209,13 @@ impl CoordinatorStore {
                 return Ok(WorkflowArtifact { producer, receipt: serde_json::from_str(&json)
                     .map_err(|e| StorageError::Corrupt(e.to_string()))? });
             }
+            let mut names = tx.prepare("SELECT DISTINCT name FROM workflow_artifact WHERE run_id=?1 AND workflow=?2 ORDER BY name LIMIT 1025")?;
+            let existing=names.query_map(params![run,workflow], |r|r.get::<_,String>(0))?
+                .collect::<std::result::Result<Vec<_>,_>>()?;
+            if existing.len() >= crate::outputs::MAX_OUTPUTS && !existing.contains(&receipt.name) {
+                return Err(StorageError::Invalid("too many artifacts in this workflow".into()));
+            }
+            local_ci::artifact::name_collision(&existing, &receipt.name).map_err(StorageError::Invalid)?;
             let last: u32 = tx.query_row(
                 "SELECT coalesce(max(version),0) FROM workflow_artifact WHERE run_id=?1 AND workflow=?2 AND name=?3",
                 params![run,workflow,receipt.name], |r| r.get(0))?;
