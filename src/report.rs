@@ -709,6 +709,7 @@ mod tests {
             wait_slot_secs: slot,
             wait_queue_secs: queue,
             wait_parallel_secs: parallel,
+            ..JobTime::default()
         };
         assert_eq!(waits(None), "");
         assert_eq!(waits(Some(&t(0.0, 0.4, 0.0, 0.2))), "");

@@ -101,6 +101,26 @@ pub struct JobTime {
     pub wait_queue_secs: f64,
     /// For one of the `--parallel` places of this run.
     pub wait_parallel_secs: f64,
+    /// When the run began to handle the job, before any wait for it (UNIX
+    /// epoch milliseconds; 0 when unknown). For the jobs of one unit, the
+    /// moment the unit began to wait.
+    #[serde(default)]
+    pub requested_at_ms: u64,
+    /// When the job's own execution began, after the lock, slot and
+    /// `--parallel` waits (UNIX epoch milliseconds; 0 when unknown).
+    #[serde(default)]
+    pub started_at_ms: u64,
+    /// When the job ended (UNIX epoch milliseconds; 0 when unknown).
+    /// `finished_at_ms - started_at_ms` is about `work_secs + wait_queue_secs`.
+    #[serde(default)]
+    pub finished_at_ms: u64,
+}
+
+/// The wall clock as UNIX epoch milliseconds, for [`JobTime`].
+pub fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
 }
 
 /// The waits of a unit before any of its jobs started.
@@ -108,6 +128,8 @@ pub struct JobTime {
 struct UnitWait {
     lock: f64,
     parallel: f64,
+    /// When the unit began to wait (epoch ms; 0: not recorded).
+    requested_at_ms: u64,
 }
 
 impl UnitWait {
@@ -118,6 +140,15 @@ impl UnitWait {
 
 /// Charge the waits of a unit to its first job that ran (else its first).
 fn charge(jobs: &mut [JobResult], w: UnitWait) {
+    if w.requested_at_ms > 0 {
+        // every job that ran was requested when its unit began to wait
+        for t in jobs.iter_mut().filter_map(|j| j.time.as_mut()) {
+            t.requested_at_ms = match t.requested_at_ms {
+                0 => w.requested_at_ms,
+                r => r.min(w.requested_at_ms),
+            };
+        }
+    }
     if w.total() <= 0.0 {
         return;
     }
@@ -130,6 +161,9 @@ fn charge(jobs: &mut [JobResult], w: UnitWait) {
         });
         t.wait_lock_secs += w.lock;
         t.wait_parallel_secs += w.parallel;
+        if t.requested_at_ms == 0 {
+            t.requested_at_ms = w.requested_at_ms;
+        }
     }
 }
 
@@ -1771,6 +1805,7 @@ impl<'a> Runner<'a> {
                         return;
                     }
                     let t0 = Instant::now();
+                    let requested_at_ms = now_ms();
                     let lock = if self.unit_locked(u) {
                         self.lock().ok()
                     } else {
@@ -1781,6 +1816,7 @@ impl<'a> Runner<'a> {
                     let waited = UnitWait {
                         lock: locked_at,
                         parallel: t0.elapsed().as_secs_f64() - locked_at,
+                        requested_at_ms,
                     };
                     let r = if isolate && !self.ctx.cancel.is_cancelled() {
                         self.run_unit_in_copy(i, u, waited)
@@ -2773,6 +2809,7 @@ impl<'a> Runner<'a> {
         let one = |ws: &Path, cm: Map<String, Value>, display: String| {
             // Something rewriting cannot reach (a `container_name:`) still needs
             // the lock. Taken before the slot, in the order units take them.
+            let requested_at_ms = now_ms();
             let t_lock = Instant::now();
             let lock = if exclusive && !locked && self.fixed_resources(ws, w, job, &cm) {
                 self.lock().ok()
@@ -2808,6 +2845,9 @@ impl<'a> Runner<'a> {
             });
             t.wait_lock_secs += wait_lock;
             t.wait_slot_secs += wait_slot;
+            if t.started_at_ms > 0 {
+                t.requested_at_ms = requested_at_ms.min(t.started_at_ms);
+            }
             if matches!(r.0.outcome, Outcome::Fail | Outcome::Error(_)) {
                 failed.store(true, Ordering::SeqCst);
             }
@@ -2974,6 +3014,7 @@ impl<'a> Runner<'a> {
     ) -> (JobResult, Map<String, Value>) {
         let native_scope = native_step::NativeScope::default();
         let t0 = Instant::now();
+        let started_at_ms = now_ms();
         let mut stopped = false;
         let mut steps: Vec<StepResult> = Vec::new();
         let mut names = Vec::new();
@@ -3643,6 +3684,9 @@ impl<'a> Runner<'a> {
         result.time = Some(JobTime {
             work_secs: (result.secs - queue.as_secs_f64()).max(0.0),
             wait_queue_secs: queue.as_secs_f64(),
+            requested_at_ms: started_at_ms,
+            started_at_ms,
+            finished_at_ms: now_ms().max(started_at_ms),
             ..JobTime::default()
         });
         (result, outputs)
@@ -4482,6 +4526,7 @@ mod tests {
             UnitWait {
                 lock: 30.0,
                 parallel: 2.0,
+                ..UnitWait::default()
             },
         );
         assert_eq!(
@@ -4510,10 +4555,61 @@ mod tests {
             UnitWait {
                 lock: 4.0,
                 parallel: 0.0,
+                ..UnitWait::default()
             },
         );
         assert_eq!(jobs[0].time, None);
         assert_eq!(jobs[1].time.as_ref().unwrap().wait_lock_secs, 4.0);
+    }
+
+    #[test]
+    fn job_time_stamps_are_serialized_and_old_results_without_them_parse() {
+        let t = JobTime {
+            work_secs: 1.0,
+            requested_at_ms: 1_700_000_000_000,
+            started_at_ms: 1_700_000_001_000,
+            finished_at_ms: 1_700_000_002_000,
+            ..JobTime::default()
+        };
+        let v = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["requested_at_ms"], 1_700_000_000_000u64);
+        assert_eq!(v["started_at_ms"], 1_700_000_001_000u64);
+        assert_eq!(v["finished_at_ms"], 1_700_000_002_000u64);
+        assert_eq!(serde_json::from_value::<JobTime>(v).unwrap(), t);
+        let old: JobTime = serde_json::from_str(
+            r#"{"work_secs":2.0,"wait_lock_secs":0.0,"wait_slot_secs":0.0,"wait_queue_secs":0.0,"wait_parallel_secs":0.0}"#,
+        )
+        .unwrap();
+        assert_eq!(old.work_secs, 2.0);
+        assert_eq!(
+            (old.requested_at_ms, old.started_at_ms, old.finished_at_ms),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn a_unit_stamps_the_request_time_on_every_job_that_ran() {
+        let ran = |at: u64| {
+            let mut j = job_with_secs(1.0);
+            j.time = Some(JobTime {
+                work_secs: 1.0,
+                requested_at_ms: at,
+                started_at_ms: 5_000,
+                ..JobTime::default()
+            });
+            j
+        };
+        let mut jobs = vec![ran(0), ran(4_000), job_with_secs(0.0)];
+        charge(
+            &mut jobs,
+            UnitWait {
+                requested_at_ms: 1_000,
+                ..UnitWait::default()
+            },
+        );
+        assert_eq!(jobs[0].time.as_ref().unwrap().requested_at_ms, 1_000);
+        assert_eq!(jobs[1].time.as_ref().unwrap().requested_at_ms, 1_000);
+        assert_eq!(jobs[2].time, None);
     }
 
     #[test]
@@ -4883,6 +4979,9 @@ mod tests {
             wait_slot_secs: 3.0,
             wait_queue_secs: 4.0,
             wait_parallel_secs: 5.0,
+            requested_at_ms: 1_700_000_000_000,
+            started_at_ms: 1_700_000_001_000,
+            finished_at_ms: 1_700_000_009_000,
         };
         let r = crate::task::TaskResult {
             schema_version: crate::wire::wire_version(),

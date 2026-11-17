@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Add `requested_at_ms`, `started_at_ms` and `finished_at_ms` (UNIX epoch milliseconds) to a job's `time`, so that a reader can tell whether a job was slow because it waited or because it ran long, and line jobs up against other runs and the task-traffic-controller ledger. Additive: a result without them still reads (as 0); the human report is unchanged.
+
 ## [0.18.0] - 2026-11-17
 
 - Add `local_ci::driver::Driver`, a host-neutral state machine that advances a run over a frozen plan: the order of the job graph, the members of a matrix (static, or named by another job's output and derived from verified source), `max-parallel`, `fail-fast`, matrix and shard joins, and run cancellation. A host proposes each input, stores the returned `Transition`, then applies it; replaying the stored records gives the same state. The driver keeps its state within a fixed size and settles a result it cannot hold as a typed infrastructure failure, never as invented outputs. See "Driving a run from another host" in the README and `tests/driver_host.rs`.
