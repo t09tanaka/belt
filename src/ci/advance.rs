@@ -350,7 +350,15 @@ fn advance_run(
         .map_err(|e| unrunnable(format!("the frozen plan {digest}: {e}")))?;
     if matrix::applies(&plan) {
         return matrix::advance(
-            store, state_dir, results, run, &plan, &members, now_ms, pass,
+            store,
+            state_dir,
+            results,
+            run,
+            &plan,
+            &members,
+            project.as_deref(),
+            now_ms,
+            pass,
         );
     }
     let mut progress = replay(store, results, &plan, |task| {
@@ -378,14 +386,7 @@ fn advance_run(
         });
         let rerun = progress.split_job_rerun(&group.id);
         let timings = (|| {
-            let first = plan.task(group.shards.first()?)?.shard.as_ref()?;
-            let scope = super::discovery::timing_key(
-                project.as_deref()?,
-                &group.workflow,
-                group.source_jobs.first()?,
-                &first.dir,
-                group.runner.as_ref()?,
-            );
+            let scope = group_timing_scope(&plan, group, project.as_deref())?;
             let observations = progress
                 .timing_samples(group)
                 .into_iter()
@@ -429,6 +430,21 @@ fn advance_run(
             .map_err(unrunnable)?;
     }
     Ok(())
+}
+
+fn group_timing_scope(
+    plan: &FrozenPlan,
+    group: &local_ci::dag::ShardGroup,
+    project: Option<&str>,
+) -> Option<String> {
+    let first = plan.task(group.shards.first()?)?.shard.as_ref()?;
+    Some(super::discovery::timing_key(
+        project?,
+        &group.workflow,
+        group.source_jobs.first()?,
+        &first.dir,
+        group.runner.as_ref()?,
+    ))
 }
 
 /// The progression of a run of `plan` with everything that ended taken in:

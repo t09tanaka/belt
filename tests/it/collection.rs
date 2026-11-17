@@ -5383,3 +5383,128 @@ jobs:
     assert_eq!(err.code, ErrorCode::InvalidInput);
     assert!(err.message.contains("run-id"), "{}", err.message);
 }
+
+#[tokio::test]
+async fn discovery_precedes_the_matrix_journal_and_its_shard_timings_survive_replay() {
+    use remote_task_runner::ci::discovery::{candidates, stage, WorkerListing};
+    let fx = fx();
+    let (c, files) = fx.open();
+    let plan = ci_plan(
+        r#"on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx jest
+  variants:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2]
+    steps:
+      - run: echo "${{ matrix.n }}"
+"#,
+    );
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
+    let manifest = Digest::of_bytes(b"manifest");
+    let mut specs = remote_task_runner::service::ci_run::task_specs(
+        &plan,
+        &digest,
+        &manifest,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    stage(&plan, &mut specs, 2, 2, "example/project", &[]);
+    let run = RunId::generate();
+    let source = SourceId::generate();
+    c.store().put_source_ref(&source, &manifest, 1).unwrap();
+    c.enqueue(
+        run.clone(),
+        source,
+        specs
+            .into_iter()
+            .map(|(_, s)| (TaskId::generate(), s))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    let listing = WorkerListing {
+        step: candidates(&plan).pop().unwrap(),
+        runner_version: "30.2".into(),
+        setup_ms: None,
+        discovered: listed(&["a.js", "b.js"]),
+    };
+    assert!(ci_advance(&fx, &c).released.is_empty());
+    let placements = c.tick().await.unwrap().placed;
+    assert_eq!(placements.len(), 1);
+    assert_eq!(
+        fx.w.payload(&placements[0]).ci_task.unwrap().task_id,
+        listing.step.task_id()
+    );
+    end_shard(
+        &c,
+        &files,
+        &(placements[0].clone(), fx.w.clone()),
+        Outcome::Succeeded,
+        &serde_json::to_vec(&listing).unwrap(),
+    )
+    .await;
+    for _ in 0..3 {
+        let pass = ci_advance(&fx, &c);
+        assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
+    }
+    let placements = c.tick().await.unwrap().placed;
+    assert_eq!(placements.len(), 2);
+    let dag = fx.w.payload(&placements[0]).ci_task.unwrap().plan_digest;
+    let split = serde_json::from_slice(
+        &remote_task_runner::ci::advance::read_plan(fx.dir.path(), &dag).unwrap(),
+    )
+    .unwrap();
+    let group = split_group(&split);
+    for attempt in placements {
+        let id = fx.w.payload(&attempt).ci_task.unwrap().task_id;
+        let index = group.shards.iter().position(|s| s == &id).unwrap();
+        let mut report: serde_json::Value =
+            serde_json::from_slice(&shard_result(&group, index, "success", "passed", None))
+                .unwrap();
+        for test in report["shard"]["tests"].as_array_mut().unwrap() {
+            test["millis"] = json!(35);
+        }
+        end_shard(
+            &c,
+            &files,
+            &(attempt, fx.w.clone()),
+            Outcome::Succeeded,
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .await;
+    }
+    let joined = ci_advance(&fx, &c);
+    assert!(joined.joined.contains(&group.id), "{joined:?}");
+    assert_eq!(joined.released.len(), 2);
+    let timings = c
+        .store()
+        .ci_test_timings(
+            listing.history_key(&plan, "example/project").unwrap(),
+            listing.discovered.tests,
+        )
+        .unwrap();
+    assert_eq!(
+        timings
+            .values()
+            .flat_map(|h| h.millis.values())
+            .copied()
+            .collect::<Vec<_>>(),
+        [35, 35]
+    );
+    let replay = ci_advance(&fx, &c);
+    assert!(
+        replay.joined.is_empty()
+            && replay.released.is_empty()
+            && replay.failed.is_empty()
+            && replay.faults.is_empty(),
+        "{replay:?}"
+    );
+}

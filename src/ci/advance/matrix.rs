@@ -260,6 +260,7 @@ pub(super) fn advance(
     run: &RunId,
     plan: &FrozenPlan,
     members: &BTreeMap<String, Member>,
+    project: Option<&str>,
     now_ms: u64,
     pass: &mut Pass,
 ) -> Result<(), Fault> {
@@ -491,6 +492,7 @@ pub(super) fn advance(
     }
     for group in plan.shard_groups.iter().filter(|g| g.split) {
         if let Some(join) = journal.driver.shard_join(&group.id) {
+            let mut observations = Vec::new();
             let verified = group
                 .shards
                 .iter()
@@ -501,12 +503,25 @@ pub(super) fn advance(
                     };
                     let result = ended(store, results, task, &m.row).map_err(transient)?;
                     Ok(match result {
-                        Some(Input::Settle { result, .. }) => crate::ci::shards::verified(
-                            group,
-                            index,
-                            &result.outcomes,
-                            result.shard.as_ref(),
-                        ),
+                        Some(Input::Settle { result, .. }) => {
+                            let verified = crate::ci::shards::verified(
+                                group,
+                                index,
+                                &result.outcomes,
+                                result.shard.as_ref(),
+                            );
+                            if verified && join.outcome.status == JobStatus::Success {
+                                if let (Some(receipt), Some(attempt)) =
+                                    (&result.shard, &m.row.attempt)
+                                {
+                                    observations.push((
+                                        attempt.worker.clone(),
+                                        crate::ci::progress::receipt_timings(receipt),
+                                    ));
+                                }
+                            }
+                            verified
+                        }
                         _ => false,
                     })
                 })
@@ -518,7 +533,14 @@ pub(super) fn advance(
                     .unwrap_or("a shard of the job failed")
             });
             if store
-                .join_ci_shards(run, &group.id, failure, &rerun, now_ms)
+                .join_ci_shards_with_timings(
+                    run,
+                    &group.id,
+                    failure,
+                    &rerun,
+                    now_ms,
+                    group_timing_scope(plan, group, project).map(|scope| (scope, observations)),
+                )
                 .map_err(transient)?
             {
                 pass.joined.push(group.id.clone());

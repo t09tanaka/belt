@@ -76,6 +76,10 @@ impl DiscoveryStep {
 /// A job with more than one test step cannot be split by replacing just one:
 /// every other test would be run in every shard.
 pub fn candidates(plan: &FrozenPlan) -> Vec<DiscoveryStep> {
+    let matrix = plan
+        .tasks
+        .iter()
+        .any(|t| t.dynamic_matrix || t.variant.is_some());
     let mut steps = Vec::new();
     for group in &plan.shard_groups {
         let [id] = group.source_jobs.as_slice() else {
@@ -95,7 +99,14 @@ pub fn candidates(plan: &FrozenPlan) -> Vec<DiscoveryStep> {
         let Some(j) = w.jobs.iter().find(|j| &j.id == id) else {
             continue;
         };
-        if j.matrix.is_some() || j.container || j.reusable.is_some() {
+        // The SDK matrix journal owns admissions and replays against one
+        // immutable task graph. Only jobs ready before its first transition
+        // may replace a task in that graph.
+        if (matrix && !j.needs.is_empty())
+            || j.matrix.is_some()
+            || j.container
+            || j.reusable.is_some()
+        {
             continue;
         }
         let mut runners = j
@@ -309,6 +320,7 @@ pub fn stage(
         let ci = probe.ci.as_mut().expect("specs came from a CI plan");
         let id = step.task_id();
         ci.task.task_id = id.clone();
+        ci.hold = !task.depends_on.is_empty();
         // The version check and listing run different commands from the test job.
         // Forecast them from samples recorded for this probe on the worker.
         let demand = step.execution_plan(plan).ok().and_then(|probe_plan| {

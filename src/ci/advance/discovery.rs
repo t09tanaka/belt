@@ -92,6 +92,8 @@ pub(super) fn advance(
         .and_then(|m| m["per_worker"].as_u64())
         .and_then(|n| usize::try_from(n).ok())
         .unwrap_or(capacity);
+    let matrix = super::matrix::applies(&plan);
+    let mut waiting = false;
     let mut policies = BTreeMap::new();
     let mut listings = Vec::new();
     let mut ids = Vec::new();
@@ -111,6 +113,7 @@ pub(super) fn advance(
                     })
                 })
         {
+            waiting = true;
             stop(
                 store,
                 run,
@@ -130,6 +133,7 @@ pub(super) fn advance(
         let step = DiscoveryStep::from_task(&initial, id)
             .ok_or_else(|| unrunnable("unexpected discovery task"))?;
         let Some(mut listing) = read_listing(store, results, probe, step)? else {
+            waiting = true;
             continue;
         };
         listing.step.plan_digest = plan.digest.clone();
@@ -179,6 +183,9 @@ pub(super) fn advance(
         }
         ids.push(probe.task_id.clone());
         listings.push(listing);
+    }
+    if matrix && waiting {
+        return Ok(true);
     }
     if listings.is_empty() {
         return Ok(false);
