@@ -2156,3 +2156,71 @@ mod sync {
         assert!(read_project_requirements(root).is_err());
     }
 }
+
+/// The staging commands as a host's `/bin/sh` runs them, in a private HOME:
+/// what the fakes above only recognize by their first words.
+#[test]
+fn the_staging_commands_run_in_a_real_shell() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let home = crate::test_tmp::tempdir().unwrap();
+    let sh = |command: &str, stdin: &[u8]| {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    // A script stands in for the binary: it is what `--version` runs.
+    let bytes = b"#!/bin/sh\necho 'remote-task-runner 9.9.9'\n";
+    let source = home.path().join("source");
+    fs::write(&source, bytes).unwrap();
+    let digest = worker_service::sha256_file(&source).unwrap();
+    let staged = home
+        .path()
+        .join(format!(".remote-task-runner-bootstrap/rtr-{digest}"));
+    let last = |text: &str| text.lines().last().unwrap_or("").to_string();
+
+    let (code, probe) = sh(&probe_command(&digest), b"");
+    assert_eq!((code, last(&probe).as_str()), (Some(0), "absent"));
+    assert_eq!(probe.lines().count(), 3, "{probe}");
+    // Bytes of another digest are refused and leave nothing behind.
+    let (code, _) = sh(&stage_command(&digest), b"something else");
+    assert_eq!(code, Some(3));
+    assert!(!staged.exists());
+    assert_eq!(fs::read_dir(staged.parent().unwrap()).unwrap().count(), 0);
+    // The right bytes are published, executable and private.
+    let (code, _) = sh(&stage_command(&digest), bytes);
+    assert_eq!(code, Some(0));
+    assert_eq!(fs::read(&staged).unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let (code, probe) = sh(&probe_command(&digest), b"");
+    assert_eq!((code, last(&probe).as_str()), (Some(0), "staged"));
+    let parsed = target::parse_probe(&probe);
+    assert!(parsed.staged && !parsed.system.is_empty() && !parsed.machine.is_empty());
+    let (code, version) = sh(&version_command(&digest), b"");
+    assert_eq!(
+        (code, version.as_str()),
+        (Some(0), "remote-task-runner 9.9.9\n")
+    );
+    // A copy whose content changed is not the staged binary.
+    fs::write(&staged, b"tampered").unwrap();
+    assert_eq!(last(&sh(&probe_command(&digest), b"").1), "absent");
+    let (code, _) = sh(&unstage_command(&digest), b"");
+    assert_eq!(code, Some(0));
+    assert!(!staged.exists());
+}

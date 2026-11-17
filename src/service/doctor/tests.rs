@@ -1781,7 +1781,7 @@ fn an_ephemeral_worker_that_is_not_running_is_a_notice_and_its_environment_is_no
     assert_eq!(of(&report, "mini-a", "bridge").level, Level::Fail);
     assert_eq!(asked, ["mini-a"]);
 
-    // One that answers is compared like any other worker.
+    // Nor is one that answers: it has no installed helper to report with.
     let mut w = ephemeral_world();
     w.remote.hosts.insert(
         "colab-tunnel".into(),
@@ -1802,5 +1802,5 @@ fn an_ephemeral_worker_that_is_not_running_is_a_notice_and_its_environment_is_no
         Some(&mut source),
     )
     .unwrap();
-    assert_eq!(asked, ["mini-a", "colab-1"]);
+    assert_eq!(asked, ["mini-a"]);
 }

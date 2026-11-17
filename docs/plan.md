@@ -1592,6 +1592,10 @@ S24 の残り（必須。この変更でも S24 は完了しない）:
 4. トンネル越しの実 SSH で一時 worker に配置し、切断し、forget するまでの通し（A46 の残り、S26）。トンネルの提供は仕様どおり範囲外。
 5. 退役した identity の worker へ「cleanup せよ」と伝える wire の message は足していない。親が attach しないことと、worker 側の lease 切れで止まることに任せている。
 6. ephemeral が消す state は worker DB の live attempt を見て判断する。attempt の supervisor が agent の終了後も生きている場合の扱い（残す）は試験していない（worker 側の 1 本目から持ち越し）。
+8. `forget`（と新しい起動による退役）が閉じる回収は、その時点で live だった attempt のものだけ。worker が消える前に terminal になり、まだ回収していなかった attempt の回収は、既存の断念の規則（保持期間）で閉じるまで待ちのまま残る。
+9. forget で `interrupted` に確定した task が明示の retry を受け付けることは、既存の retry の規則（terminal の attempt）に任せており、forget からの通しの試験は無い。
+10. 一時 worker は `doctor` の環境の比較（`workers diff` 相当）の対象外（比較の報告は導入済みの worker の helper が出すため）。`workers diff` / `sync` を一時 worker に対して実行した場合の扱いは決めていない。
+11. binary の version は crate の version（今は `0.0.0`）で比べるので、0.1.0 より前は `--version` の確認がどの build でも通る。
 7. `workers`（一覧）は未実装のまま。一時 worker の接続状態と記録された identity を見る command は無い（`doctor` の bridge の check で分かる）。
 
 ### S16 (1) の後半: 親の側の `ci` の実行（2026-11-17、main `b673327` 起点）

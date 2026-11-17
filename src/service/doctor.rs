@@ -925,10 +925,9 @@ pub fn run(
     for worker in workers::registrations(env)? {
         let host = worker.id.as_str();
         if worker.ephemeral {
-            let answered = look_at_ephemeral(remote, &worker, &cluster, &mut checks);
-            if let (true, Some(source)) = (answered, diff.as_mut()) {
-                checks.extend(source(host));
-            }
+            // Its environment is not compared: the report comes from the
+            // helper of an installed worker, which an ephemeral host lacks.
+            look_at_ephemeral(remote, &worker, &cluster, &mut checks);
             continue;
         }
         let looked = look_at_worker(remote, &worker, &cluster);
@@ -980,19 +979,19 @@ pub fn run(
 /// An ephemeral worker has no service and no helper installed by the
 /// parent: the only thing to look at is whether its bridge answers `hello`
 /// as this worker. One that does not answer is a notice, not a failure: it
-/// exists only while its user runs it. Returns whether it answered.
+/// exists only while its user runs it.
 fn look_at_ephemeral(
     remote: &mut impl Remote,
     worker: &workers::Registered,
     cluster: &ClusterId,
     checks: &mut Vec<Check>,
-) -> bool {
+) {
     let host = worker.id.as_str();
     checks.push(Check::new(
         host,
         "service",
         Level::Notice,
-        "ephemeral worker: it has no service; it is started on its own host with worker --ephemeral and is not installed, upgraded or controlled from here",
+        "ephemeral worker: it has no service; it is started on its own host with worker --ephemeral and is not installed, upgraded or controlled from here; its environment is not compared with the parent's",
     ));
     let hello = SshTarget::parse(&worker.ssh)
         .map_err(|e| e.to_string())
@@ -1021,9 +1020,7 @@ fn look_at_ephemeral(
             format!("the worker bridge did not complete hello ({why}); an ephemeral worker answers only while it is started on its host. If it is gone for good, workers forget {host} ends what it held"),
         ),
     };
-    let answered = level == Level::Ok;
     checks.push(Check::new(host, "bridge", level, detail));
-    answered
 }
 
 /// One worker: its facts and whether its bridge completes `hello`.
