@@ -179,6 +179,87 @@ fn load_row(conn: &Connection, aid: &str) -> Result<Option<CollectionRow>> {
     }))
 }
 
+/// [`CoordinatorStore::close_collection`] inside a transaction the caller
+/// already holds, so that an attempt can be ended and its collection closed
+/// in one commit.
+pub(super) fn close_collection_in(
+    tx: &Connection,
+    a: &str,
+    digest: Option<&Digest>,
+    verdict: Verdict,
+    acked: bool,
+    at_ms: u64,
+) -> Result<bool> {
+    let mut core = common::read_core(tx, ATTEMPT, a)?;
+    let illegal = |why| StorageError::IllegalState {
+        attempt: a.to_string(),
+        state: core.state,
+        why,
+    };
+    if !core.state.is_terminal() {
+        return Err(illegal("only an ended attempt is collected"));
+    }
+    let row = ensure_row(tx, a, at_ms)?;
+    if row.closed_at_ms.is_some() {
+        return Ok(false);
+    }
+    if verdict != Verdict::GaveUp && (digest.is_none() || row.result_digest.as_ref() != digest) {
+        return Err(illegal("the collection is of another result"));
+    }
+    let at = to_i64(at_ms)?;
+    let run = run_of(tx, a)?;
+    if verdict == Verdict::Complete {
+        let (required, persisted) = artifact_counts(tx, a)?;
+        if Collection::derive(core.state, required, persisted, false) != Collection::Collected {
+            return Err(illegal("required outputs are not all collected"));
+        }
+        if core.receipts.mark(Receipt::Collected, at_ms) {
+            tx.execute(
+                "UPDATE attempt SET receipts_json = ?1 WHERE attempt_id = ?2",
+                params![common::json(&core.receipts), a],
+            )?;
+            common::append_event(
+                tx,
+                run.as_deref(),
+                Some(a),
+                "collected",
+                &Value::Null,
+                at_ms,
+            )?;
+        }
+    } else {
+        let n = tx.execute(
+            "UPDATE attempt SET collection_failed_at_ms = ?1
+             WHERE attempt_id = ?2 AND collection_failed_at_ms IS NULL",
+            params![at, a],
+        )?;
+        if n == 1 {
+            common::append_event(
+                tx,
+                run.as_deref(),
+                Some(a),
+                "collection_failed",
+                &json!({"why": verdict.as_str()}),
+                at_ms,
+            )?;
+        }
+    }
+    tx.execute(
+        "UPDATE collection SET verdict = ?1, acked_at_ms = ?2, closed_at_ms = ?3,
+            updated_at_ms = ?3 WHERE attempt_id = ?4",
+        params![verdict.as_str(), acked.then_some(at), at, a],
+    )?;
+    common::append_event(
+        tx,
+        run.as_deref(),
+        Some(a),
+        "collection_closed",
+        &json!({"verdict": verdict.as_str(), "acked": acked}),
+        at_ms,
+    )?;
+    Ok(true)
+}
+
 /// The row of an attempt that exists, made if it is not there yet.
 fn ensure_row(conn: &Connection, aid: &str, at_ms: u64) -> Result<CollectionRow> {
     common::read_core(conn, ATTEMPT, aid)?;
@@ -668,78 +749,8 @@ impl CoordinatorStore {
         at_ms: u64,
     ) -> Result<bool> {
         let (a, digest) = (attempt_id.to_string(), result_digest.cloned());
-        self.db.write(move |tx| {
-            let mut core = common::read_core(tx, ATTEMPT, &a)?;
-            let illegal = |why| StorageError::IllegalState {
-                attempt: a.clone(),
-                state: core.state,
-                why,
-            };
-            if !core.state.is_terminal() {
-                return Err(illegal("only an ended attempt is collected"));
-            }
-            let row = ensure_row(tx, &a, at_ms)?;
-            if row.closed_at_ms.is_some() {
-                return Ok(false);
-            }
-            if verdict != Verdict::GaveUp && (digest.is_none() || row.result_digest != digest) {
-                return Err(illegal("the collection is of another result"));
-            }
-            let at = to_i64(at_ms)?;
-            let run = run_of(tx, &a)?;
-            if verdict == Verdict::Complete {
-                let (required, persisted) = artifact_counts(tx, &a)?;
-                if Collection::derive(core.state, required, persisted, false)
-                    != Collection::Collected
-                {
-                    return Err(illegal("required outputs are not all collected"));
-                }
-                if core.receipts.mark(Receipt::Collected, at_ms) {
-                    tx.execute(
-                        "UPDATE attempt SET receipts_json = ?1 WHERE attempt_id = ?2",
-                        params![common::json(&core.receipts), a],
-                    )?;
-                    common::append_event(
-                        tx,
-                        run.as_deref(),
-                        Some(&a),
-                        "collected",
-                        &Value::Null,
-                        at_ms,
-                    )?;
-                }
-            } else {
-                let n = tx.execute(
-                    "UPDATE attempt SET collection_failed_at_ms = ?1
-                     WHERE attempt_id = ?2 AND collection_failed_at_ms IS NULL",
-                    params![at, a],
-                )?;
-                if n == 1 {
-                    common::append_event(
-                        tx,
-                        run.as_deref(),
-                        Some(&a),
-                        "collection_failed",
-                        &json!({"why": verdict.as_str()}),
-                        at_ms,
-                    )?;
-                }
-            }
-            tx.execute(
-                "UPDATE collection SET verdict = ?1, acked_at_ms = ?2, closed_at_ms = ?3,
-                    updated_at_ms = ?3 WHERE attempt_id = ?4",
-                params![verdict.as_str(), acked.then_some(at), at, a],
-            )?;
-            common::append_event(
-                tx,
-                run.as_deref(),
-                Some(&a),
-                "collection_closed",
-                &json!({"verdict": verdict.as_str(), "acked": acked}),
-                at_ms,
-            )?;
-            Ok(true)
-        })
+        self.db
+            .write(move |tx| close_collection_in(tx, &a, digest.as_ref(), verdict, acked, at_ms))
     }
 
     /// Where the run stands: each task by its current attempt (the one that

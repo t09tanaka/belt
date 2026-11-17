@@ -8,6 +8,7 @@
 //! No process is started here. A "crash" is the coordinator dropped where
 //! it stands and its database and result store opened again.
 
+use remote_task_runner::ci::status::Computed;
 use remote_task_runner::coordinator::policy::Limits;
 use remote_task_runner::coordinator::{
     Coordinator, CoordinatorConfig, LinkError, TaskSpec, WorkerLink,
@@ -124,6 +125,10 @@ struct Job {
 #[derive(Default)]
 struct State {
     jobs: BTreeMap<AttemptId, Job>,
+    one_slot: bool,
+    pending_artifacts: BTreeMap<AttemptId, ArtifactAction>,
+    artifact_answers: BTreeMap<Digest, ArtifactAnswer>,
+    artifact_data: BTreeMap<Digest, Vec<u8>>,
     offline: bool,
     /// Lose the n-th request (from 1) of a kind, and be gone after it.
     trip: Option<(&'static str, usize, Lost)>,
@@ -265,6 +270,34 @@ impl Worker {
             }
         };
         match request {
+            Request::WorkflowArtifact(r) => {
+                let result = match r.command {
+                    WorkflowArtifactCommand::Poll => ArtifactExchangeResult::Pending {
+                        action: s.pending_artifacts.get(&r.attempt_id).cloned(),
+                    },
+                    WorkflowArtifactCommand::Answer { key, answer } => {
+                        assert_eq!(&s.pending_artifacts[&r.attempt_id].key, &key);
+                        s.artifact_answers.insert(key, answer);
+                        ArtifactExchangeResult::Accepted
+                    }
+                    WorkflowArtifactCommand::Read {
+                        key,
+                        digest,
+                        offset,
+                    } => {
+                        assert_eq!(&s.pending_artifacts[&r.attempt_id].key, &key);
+                        let blob = &s.artifact_data[&digest];
+                        let start = offset as usize;
+                        ArtifactExchangeResult::Chunk {
+                            data: Bytes(blob[start..blob.len().min(start + 128 * 1024)].to_vec()),
+                        }
+                    }
+                };
+                Ok(Response::WorkflowArtifact(WorkflowArtifactResponse {
+                    schema_version: SchemaVersion::CURRENT,
+                    result,
+                }))
+            }
             Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
                 preparation_observations: None,
                 capabilities: None,
@@ -276,8 +309,8 @@ impl Worker {
                 policy_digest: Digest::of_bytes(b"p"),
                 active_task: 0,
                 prefetch_pending: 0,
-                max_active_task: 8,
-                prefetch_per_worker: 8,
+                max_active_task: if s.one_slot { 1 } else { 8 },
+                prefetch_per_worker: if s.one_slot { 0 } else { 8 },
                 disk_free_bytes: 1,
                 draining: false,
             })),
@@ -436,6 +469,11 @@ impl Worker {
 
 fn kind_of(request: &Request) -> (&'static str, u64) {
     match request {
+        Request::WorkflowArtifact(r) => match &r.command {
+            WorkflowArtifactCommand::Read { offset, .. } => ("workflow_read", *offset),
+            WorkflowArtifactCommand::Answer { .. } => ("workflow_ack", 0),
+            WorkflowArtifactCommand::Poll => ("workflow_poll", 0),
+        },
         Request::Inspect(_) => ("inspect", 0),
         Request::GetAttempt(_) => ("get", 0),
         Request::SubmitAttempt(_) => ("submit", 0),
@@ -451,6 +489,13 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
 }
 
 impl WorkerLink for Worker {
+    fn workflow_artifacts_negotiated(&self) -> bool {
+        self.ci_task_negotiated()
+    }
+
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.ci_task_negotiated()
+    }
     fn ci_discovery_negotiated(&self) -> bool {
         self.ci_task_negotiated()
     }
@@ -2821,6 +2866,11 @@ use remote_task_runner::supervisor::ci_task::RESULT_ARTIFACT;
 /// The frozen plan of a workflow, made from a capture of its own (in a
 /// directory of its own: the parent of these tests holds no source).
 fn ci_plan(workflow: &str) -> local_ci::FrozenPlan {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    ci_plan_at(workflow, dir.path(), &RunId::generate())
+}
+
+fn ci_plan_at(workflow: &str, state_dir: &std::path::Path, run: &RunId) -> local_ci::FrozenPlan {
     use local_ci::frozen::Filters;
     use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
     let dir = crate::test_tmp::tempdir().unwrap();
@@ -2838,11 +2888,11 @@ fn ci_plan(workflow: &str) -> local_ci::FrozenPlan {
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
-    let store = SourceStore::open(&dir.path().join("state")).unwrap();
+    let store = SourceStore::open(state_dir).unwrap();
     let captured = capture_for_run(
         &env,
         &store,
-        &RunId::generate(),
+        run,
         &SourceRequest::Directory { dir: project },
         &CaptureParams::default(),
     )
@@ -3120,6 +3170,9 @@ async fn a_ci_task_without_a_usable_result_is_no_success_and_the_next_job_sees_a
         let target = remote_task_runner::service::completion::Target::Run(run.clone());
         let exit = c.store().completion(target).unwrap().exit_code();
         assert!(exit.is_some_and(|code| code != 0), "{exit:?}");
+        // No job failed: a result that is lost is an error of the run.
+        let status = ci_computed(&fx, &c, &files, &run);
+        assert_eq!(status, Computed::Error, "{unreadable}");
         let lines = remote_task_runner::service::ci_run::job_lines(
             c.store(),
             fx.dir.path(),
@@ -3166,10 +3219,11 @@ async fn a_cancelled_ci_run_releases_nothing_more_and_settles() {
     }
     assert!(c.store().attempts_of_task(&ids["test"]).unwrap().is_empty());
     assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
-    let target = remote_task_runner::service::completion::Target::Run(run);
+    let target = remote_task_runner::service::completion::Target::Run(run.clone());
     let snapshot = c.store().completion(target).unwrap();
     assert!(snapshot.settled());
     assert!(snapshot.exit_code().is_some_and(|code| code != 0));
+    assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Cancelled);
     // A released spec that still waits is never written.
     let waiting = serde_json::json!({"ci": {"hold": true}});
     assert!(c
@@ -3442,13 +3496,22 @@ async fn ci_run_by_task(
     c: &Coordinator,
     plan: &local_ci::FrozenPlan,
 ) -> (RunId, BTreeMap<String, TaskId>) {
+    ci_run_by_id(fx, c, plan, RunId::generate()).await
+}
+
+async fn ci_run_by_id(
+    fx: &Fx,
+    c: &Coordinator,
+    plan: &local_ci::FrozenPlan,
+    run: RunId,
+) -> (RunId, BTreeMap<String, TaskId>) {
     let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
     let none = Default::default();
     let specs =
         remote_task_runner::service::ci_run::task_specs(plan, &digest, &manifest, &none, None)
             .unwrap();
-    let (run, source) = (RunId::generate(), SourceId::generate());
+    let source = SourceId::generate();
     c.store().put_source_ref(&source, &manifest, 1).unwrap();
     let mut ids = BTreeMap::new();
     let mut tasks = Vec::new();
@@ -3502,6 +3565,28 @@ fn ci_lines(
 ) -> Vec<remote_task_runner::service::ci_run::JobLine> {
     remote_task_runner::service::ci_run::job_lines(c.store(), fx.dir.path(), files.root(), run)
         .unwrap()
+}
+
+/// What the status of the run says it computed (S19): from the completion of
+/// the run, as `ci` reads it after its wait, and the lines of the run.
+fn ci_computed(
+    fx: &Fx,
+    c: &Coordinator,
+    files: &Arc<ResultStore>,
+    run: &RunId,
+) -> remote_task_runner::ci::status::Computed {
+    use remote_task_runner::service::{ci_run, completion::Target, control::Report};
+    let target = Target::Run(run.clone());
+    let snapshot = c.store().completion(target.clone()).unwrap();
+    let report = Report::settled(target, &snapshot).expect("the run settled");
+    let lines = ci_lines(fx, c, files, run);
+    let expected: Vec<String> = lines
+        .iter()
+        .filter(|l| l.part != Some(ci_run::Part::Job))
+        .map(|l| l.plan_task.clone())
+        .collect();
+    let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+    ci_run::Ended::of(&report).computed(&expected, &lines)
 }
 
 /// A39: a job of Vitest (and of Jest) files is split by file. Every listed
@@ -3993,6 +4078,20 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
             "{why}"
         );
         assert!(text.contains(&format!("test: failure ({why})\n")), "{text}");
+
+        // Once report ended too, the status of the run (S19) is its
+        // failure: the stop of the other shards makes it no cancelled run.
+        let p = fx.w.payload(&b);
+        let task = ci_task_of(&plan, "report");
+        let result = ci_result(&task, "report", "success", serde_json::json!({}));
+        fx.w.finish(&b, Outcome::Succeeded, ci_out(&b, &p, &result));
+        for _ in 0..3 {
+            c.tick().await.unwrap();
+            collect(&c, &files).await;
+        }
+        let target = remote_task_runner::service::completion::Target::Run(run.clone());
+        assert!(c.store().completion(target).unwrap().cancel_requested);
+        assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Failure);
     }
 }
 
@@ -4335,6 +4434,7 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
         assert_eq!(joined[0].payload["job"], group.id.as_str());
         if omit {
             assert_eq!(after.exit_code(), Some(1));
+            assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Failure);
             let failure = after.first_compute_failure.clone().unwrap();
             assert_eq!(failure.task_id, *ids.values().min().unwrap());
             let why = rows[0].spec["ci"]["join_failure"].as_str().unwrap();
@@ -4396,10 +4496,12 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
             assert_eq!(ci_advance(&fx, &c).joined, vec![group.id.clone()]);
             let done = c.store().completion(target.clone()).unwrap();
             assert_eq!(done.exit_code(), Some(0));
+            assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Success);
             assert!(of(1).spec["ci"].get("rerun").is_none());
             continue;
         } else {
             assert_eq!(after.exit_code(), Some(0));
+            assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Success);
             assert!(rows
                 .iter()
                 .all(|row| row.spec["ci"].get("join_failure").is_none()));
@@ -4441,6 +4543,8 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
     let after = c.store().completion(Target::Run(run.clone())).unwrap();
     assert!(after.settled());
     assert_eq!(after.exit_code(), Some(1));
+    // The plan is gone, so no line of the job says it: the run does.
+    assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Failure);
     assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
 }
 
@@ -4780,6 +4884,9 @@ async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed(
             c.cancel_run(run.clone()).await.unwrap();
             let after = c.store().completion(target).unwrap();
             assert_eq!(after.exit_code(), code, "{said}");
+            // A cancel that stopped nothing: the status is the failure.
+            let status = ci_computed(&fx, &c, &files, &run);
+            assert_eq!(status, Computed::Failure, "{said}");
             continue;
         }
         c.cancel_run(run.clone()).await.unwrap();
@@ -4794,7 +4901,188 @@ async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed(
         let lines = ci_lines(&fx, &c, &files, &run);
         let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
         assert_eq!(job.status, "failure", "{said}");
+        // Yet the run is cancelled: its status is no failure and no success.
+        let status = ci_computed(&fx, &c, &files, &run);
+        assert_eq!(status, Computed::Cancelled, "{said}");
     }
+}
+
+/// A27. Drive the durable queue, worker receipts and local-ci matrix driver,
+/// including replay between settlements. The job's outputs follow variant
+/// order even when collection completes in the opposite order.
+#[tokio::test]
+async fn a27_matrix_permits_join_and_fail_fast_across_workers() {
+    let workflow = r#"on: push
+jobs:
+  leg:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 2
+      fail-fast: true
+      matrix:
+        n: [0, 1, 2]
+    outputs:
+      value: ${{ steps.out.outputs.value }}
+    steps:
+      - id: out
+        run: echo "value=${{ matrix.n }}" >> "$GITHUB_OUTPUT"
+  report:
+    if: always()
+    needs: leg
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.leg.outputs.value }}"
+"#;
+    for fail in [false, true] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let other = Worker::new("w-b");
+        c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+            .unwrap();
+        let plan = ci_plan(workflow);
+        let variants: Vec<_> = plan.tasks.iter().filter(|t| t.variant.is_some()).collect();
+        assert_eq!(variants.len(), 3);
+        let (_, ids) = ci_run_by_task(&fx, &c, &plan).await;
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.released.len(), 2, "{pass:?}");
+        let placements = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
+        assert_eq!(placements.len(), 2);
+        let group = &variants[0].variant.as_ref().unwrap().group;
+        for (a, w) in placements.values() {
+            assert!(w.payload(a).permit_id.is_some());
+        }
+        let result = |t: &local_ci::dag::ExecutionTask, success: bool| {
+            let index = t.variant.as_ref().unwrap().index;
+            serde_json::to_vec(&json!({"schema_version":1,"task":t.id,"jobs":[{
+                "workflow":t.workflow,"job":"leg","display":"leg","result":if success{"pass"}else{"fail"},"secs":0,"steps":[]
+            }],"outcomes":[{"job":"leg","variant":index,"status":if success{"success"}else{"failure"},
+                "outputs":{"value":index.to_string()},"skipped":null,"ancestor_failed":false}],
+                "receipt_ignored":null,"artifacts":[]})).unwrap()
+        };
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        end_shard(
+            &c,
+            &files,
+            &placements[&variants[1].id],
+            if fail {
+                Outcome::Failed
+            } else {
+                Outcome::Succeeded
+            },
+            &result(variants[1], !fail),
+        )
+        .await;
+        let pass = ci_advance(&fx, &c);
+        assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
+        if fail {
+            assert!(pass.released.is_empty());
+            assert!(pass.stopped.contains(&ids[&variants[0].id]), "{pass:?}");
+            assert!(pass.stopped.contains(&ids[&variants[2].id]), "{pass:?}");
+            assert!(c
+                .store()
+                .attempts_of_task(&ids[&variants[2].id])
+                .unwrap()
+                .is_empty());
+            continue;
+        }
+        assert_eq!(pass.released, [ids[&variants[2].id].clone()]);
+        let more = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
+        end_shard(
+            &c,
+            &files,
+            &more[&variants[2].id],
+            Outcome::Succeeded,
+            &result(variants[2], true),
+        )
+        .await;
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        end_shard(
+            &c,
+            &files,
+            &placements[&variants[0].id],
+            Outcome::Succeeded,
+            &result(variants[0], true),
+        )
+        .await;
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.joined, [group.clone()]);
+        let next = ci_task_of(&plan, "report");
+        assert_eq!(pass.released, [ids[&next].clone()]);
+        let last = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
+        let (a, w) = &last[&next];
+        assert_eq!(
+            w.payload(a).ci_task.unwrap().inputs["needs"]["leg"]["outputs"]["value"],
+            "2"
+        );
+        assert!(ci_advance(&fx, &c).released.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a27_dynamic_members_are_persisted_once_and_join_after_verified_receipts() {
+    let workflow = r#"on: push
+jobs:
+  leg:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix: ${{ fromJSON('{"include":[{"n":0},{"n":1}]}') }}
+    steps:
+      - run: echo ${{ matrix.n }}
+"#;
+    let fx = fx();
+    let (c, files) = fx.open();
+    let run = RunId::generate();
+    let plan = ci_plan_at(workflow, fx.dir.path(), &run);
+    assert!(plan.tasks.iter().any(|t| t.dynamic_matrix));
+    let (_, ids) = ci_run_by_id(&fx, &c, &plan, run.clone()).await;
+    let origin = ci_task_of(&plan, "leg");
+    let pass = ci_advance(&fx, &c);
+    assert!(pass.failed.is_empty() && pass.faults.is_empty(), "{pass:?}");
+    assert_eq!(c.store().ci_run_tasks(&run).unwrap().len(), 3);
+    for index in 0..2 {
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.released.len(), 1, "{pass:?}");
+        let report = c.tick().await.unwrap();
+        assert_eq!(report.placed.len(), 1, "{report:?}");
+        let attempt = &report.placed[0];
+        let sent = fx.w.payload(attempt);
+        let ci = sent.ci_task.as_ref().unwrap();
+        let dispatch = ci.dispatch.as_ref().unwrap();
+        assert_eq!(dispatch["origin"], origin);
+        assert_eq!(dispatch["task"], ci.task_id);
+        assert_eq!(dispatch["index"], index);
+        assert!(sent.permit_id.is_some());
+        let receipt=serde_json::to_vec(&json!({"schema_version":1,"task":ci.task_id,"jobs":[{
+            "workflow":plan.tasks[0].workflow,"job":"leg","display":"leg","result":"pass","secs":0,"steps":[]
+        }],"outcomes":[{"job":"leg","variant":index,"status":"success","outputs":{},"skipped":null,"ancestor_failed":false}],
+        "receipt_ignored":null,"artifacts":[]})).unwrap();
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        end(
+            &fx,
+            &c,
+            attempt,
+            Outcome::Succeeded,
+            ci_out(attempt, &sent, &receipt),
+        )
+        .await;
+        ci_collect(&c, &files, attempt).await;
+    }
+    let pass = ci_advance(&fx, &c);
+    assert!(pass.joined.contains(&origin), "{pass:?}");
+    assert_eq!(c.store().ci_run_tasks(&run).unwrap().len(), 3);
+    assert!(c
+        .store()
+        .attempts_of_task(&ids[&origin])
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        c.store()
+            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .unwrap()
+            .exit_code(),
+        Some(0)
+    );
 }
 
 /// The parent starts from the unpartitioned job. A separate discovery
@@ -4825,6 +5113,22 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     c.store().put_source_ref(&source, &manifest, 1).unwrap();
     let steps = candidates(&whole);
     let discovery = steps[0].task_id();
+    let probe = specs
+        .iter()
+        .find(|(id, _)| id == &discovery)
+        .and_then(|(_, spec)| spec.ci.as_ref())
+        .unwrap();
+    assert_eq!(probe.steps, 2, "runner version and test listing");
+    assert_eq!(probe.history_keys.len(), 2);
+    assert!(probe.history_keys.iter().all(Option::is_some));
+    let job = specs
+        .iter()
+        .find(|(id, _)| id == &test)
+        .and_then(|(_, spec)| spec.ci.as_ref())
+        .unwrap();
+    for key in &probe.history_keys {
+        assert!(!job.history_keys.contains(key));
+    }
     let task_id = TaskId::generate();
     c.enqueue(
         run.clone(),
@@ -4907,4 +5211,175 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     let bytes = remote_task_runner::ci::advance::read_plan(fx.dir.path(), &changed).unwrap();
     let split: local_ci::FrozenPlan = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(split_group(&split).manifest, listing.discovered.tests);
+}
+
+#[tokio::test]
+async fn a38_live_artifact_transfer_resumes_before_either_worker_finishes() {
+    let fx = fx();
+    let (mut c, files) = fx.open();
+    let other = Worker::new("w-b");
+    fx.w.set(|s| s.one_slot = true);
+    other.set(|s| s.one_slot = true);
+    c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+        .unwrap();
+    let workflow = r#"on: push
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: result.dat
+          if-no-files-found: error
+      - run: echo still-running
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+"#;
+    let plan = ci_plan(workflow);
+    // Separate admission keeps each live job on a known worker without
+    // introducing a dependency on the producer's terminal result.
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    let first = &ids["produce"];
+    let second = &ids["consume"];
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 2);
+    let producer = c.store().attempts_of_task(first).unwrap()[0]
+        .attempt_id
+        .clone();
+    let consumer = c.store().attempts_of_task(second).unwrap()[0]
+        .attempt_id
+        .clone();
+    let worker_of = |id: &AttemptId| {
+        if fx.w.state.lock().unwrap().jobs.contains_key(id) {
+            fx.w.clone()
+        } else {
+            other.clone()
+        }
+    };
+    let up = worker_of(&producer);
+    let down = worker_of(&consumer);
+    assert_ne!(up.id, down.id);
+    let contents = vec![b'c'; 128 * 1024 + 17];
+    let digest = Digest::of_bytes(&contents);
+    let logical = &plan
+        .tasks
+        .iter()
+        .find(|t| t.jobs.iter().any(|j| j == "produce"))
+        .unwrap()
+        .workflow;
+    let upload = ArtifactAction {
+        key: Digest::of_bytes(b"upload"),
+        intent: ArtifactIntent::Upload {
+            overwrite: false,
+            receipt: json!({
+                "name":"package","version":1,"files":[{"path":"result.dat","size":contents.len(),"sha256":digest.as_str().strip_prefix("sha256:").unwrap()}],
+                "plan_digest":plan.digest,"attempt_id":"run","job":format!("{logical}::produce"),"display":"produce","task":null,"retention_days":null,
+            }),
+        },
+    };
+    up.set(|s| {
+        s.artifact_data.insert(digest.clone(), contents.clone());
+        s.pending_artifacts.insert(producer.clone(), upload.clone());
+    });
+    c.tick().await.unwrap();
+    assert!(c
+        .store()
+        .workflow_artifacts(&run, logical)
+        .unwrap()
+        .is_empty());
+    assert_eq!(up.offsets("workflow_read"), [0]);
+    let catalog = ArtifactAction {
+        key: Digest::of_bytes(b"catalog"),
+        intent: ArtifactIntent::Catalog {
+            name: Some("package".into()),
+            pattern: None,
+        },
+    };
+    down.set(|s| {
+        s.pending_artifacts
+            .insert(consumer.clone(), catalog.clone());
+    });
+    drop(c);
+    drop(files);
+    (c, _) = fx.open();
+    c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+        .unwrap();
+    c.tick().await.unwrap();
+    assert!(
+        !down
+            .state
+            .lock()
+            .unwrap()
+            .artifact_answers
+            .contains_key(&catalog.key),
+        "the upload's last chunk has arrived but the parent has not published the receipt"
+    );
+    c.tick().await.unwrap();
+    assert_eq!(up.offsets("workflow_read"), [0, 128 * 1024]);
+    assert_eq!(
+        up.state.lock().unwrap().artifact_answers[&upload.key],
+        ArtifactAnswer::Uploaded { version: 1 }
+    );
+    c.tick().await.unwrap();
+    assert_eq!(
+        c.store().workflow_artifacts(&run, logical).unwrap().len(),
+        1
+    );
+    up.set(|s| {
+        s.pending_artifacts.remove(&producer);
+    });
+    c.tick().await.unwrap();
+    assert!(
+        matches!(&down.state.lock().unwrap().artifact_answers[&catalog.key],ArtifactAnswer::Catalog{artifacts} if artifacts.len()==1)
+    );
+    let fetch = ArtifactAction {
+        key: Digest::of_bytes(b"download"),
+        intent: ArtifactIntent::Fetch {
+            producer: producer.clone(),
+            name: "package".into(),
+            version: 1,
+            digest,
+            offset: 128 * 1024,
+        },
+    };
+    down.set(|s| {
+        s.pending_artifacts.insert(consumer, fetch.clone());
+    });
+    c.tick().await.unwrap();
+    assert_eq!(
+        down.state.lock().unwrap().artifact_answers[&fetch.key],
+        ArtifactAnswer::Chunk {
+            data: Bytes(vec![b'c'; 17])
+        }
+    );
+}
+
+#[test]
+fn a38_refuses_cross_run_artifact_options_before_any_job_can_be_placed() {
+    let plan = ci_plan(
+        r#"on: push
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: '123'
+"#,
+    );
+    let err = remote_task_runner::service::ci_run::task_specs(
+        &plan,
+        &Digest::of_bytes(b"plan"),
+        &Digest::of_bytes(b"manifest"),
+        &Default::default(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    assert!(err.message.contains("run-id"), "{}", err.message);
 }

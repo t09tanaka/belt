@@ -16,6 +16,7 @@
 //! to fix fails; what an exec or `workers sync` installs by itself, or what
 //! neither side measures yet, is a `notice` and does not change the exit.
 use super::bootstrap::Spec;
+use super::macos::policy::Backend;
 use super::worker_service::Status;
 use super::workers::{self, Remote, RemoteOutput};
 use crate::{
@@ -37,6 +38,8 @@ use std::{
 use task_traffic_controller::{config::Config, ledger::Ledger, Paths};
 
 const TRAFFIC_CLI: &str = "task-traffic-controller";
+/// Where `loginctl` is when the service environment's PATH does not have it.
+const LOGINCTL: &str = "/usr/bin/loginctl";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const OUTPUT_LIMIT: u64 = 1 << 20;
 
@@ -117,6 +120,10 @@ pub struct HostFacts {
     pub cli: Option<TrafficCli>,
     pub docker: Docker,
     pub profile: ProfileFacts,
+    /// Lingering of the service user. Only a host whose service is a systemd
+    /// user service reports it; a helper that predates the check does not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub linger: Option<Linger>,
 }
 
 /// Runs one bounded command in a given environment. `None`: it could not be
@@ -325,7 +332,30 @@ pub fn gather(
         cli: traffic_cli(env, runner),
         docker: docker(env, runner),
         profile: profile(worker_state, env),
+        linger: None,
     }
+}
+
+/// Whether lingering is enabled for the user `uid`, asked of `loginctl` in
+/// the service environment. `None` for a service manager that has no such
+/// thing (launchd). A `loginctl` that is missing or does not answer is
+/// reported as no answer, never as enabled.
+pub fn linger_fact(
+    backend: Backend,
+    uid: u32,
+    env: &BTreeMap<String, String>,
+    runner: &mut dyn Runner,
+) -> Option<Linger> {
+    if backend != Backend::Systemd {
+        return None;
+    }
+    let program = find_on_path(env, "loginctl").unwrap_or_else(|| PathBuf::from(LOGINCTL));
+    let arguments = linger::arguments(uid);
+    let arguments: Vec<&str> = arguments.iter().map(String::as_str).collect();
+    let enabled = runner
+        .run(&program, &arguments, env)
+        .and_then(|(code, stdout)| linger::parse(code, &stdout));
+    Some(Linger { uid, enabled })
 }
 
 /// An endpoint on this host: a Unix socket or a pipe, not a network address.
@@ -515,6 +545,9 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
             ),
         ),
     });
+    if let Some(linger) = &facts.linger {
+        out.push(linger::check(host, linger));
+    }
     out
 }
 
@@ -596,7 +629,7 @@ pub fn service_checks(host: &str, status: &Status, parent_version: &str) -> Vec<
             "version",
             Level::Notice,
             format!(
-                "runs {}, the parent is {}; run workers upgrade",
+                "runs {}, the parent is {}; run workers upgrade (a worker whose OS or architecture differs from the parent's runs a build of its own and always shows another digest: upgrade it with --binary when the parent's version changes)",
                 short(&status.binary_sha256),
                 short(parent_version)
             ),
@@ -617,17 +650,23 @@ pub fn host_main() -> i32 {
     let env: BTreeMap<String, String> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
-    let answer =
-        super::worker_service::service_view(&env, super::worker_service::HostLauncher::native())
-            .map(|(status, state, service_env, recorded)| HostAnswer {
-                status,
-                facts: gather(
-                    &state,
+    let launcher = super::worker_service::HostLauncher::native();
+    let backend = super::macos::Launcher::backend(&launcher);
+    let answer = super::worker_service::service_view(&env, launcher).map(
+        |(status, state, service_env, recorded)| {
+            let mut runner = SystemRunner::default();
+            let mut facts = gather(&state, &service_env, &recorded, &mut runner);
+            if !status.system_user {
+                facts.linger = linger_fact(
+                    backend,
+                    rustix::process::geteuid().as_raw(),
                     &service_env,
-                    &recorded,
-                    &mut SystemRunner::default(),
-                ),
-            });
+                    &mut runner,
+                );
+            }
+            HostAnswer { status, facts }
+        },
+    );
     match answer {
         Ok(answer) => {
             println!("{}", serde_json::json!({"ok": true, "doctor": answer}));
@@ -740,8 +779,9 @@ pub fn project_checks(notices: Result<&[crate::config::resolve::Notice], String>
 
 /// Where the checks of `workers diff` (§22.2) join the report: asked once
 /// for every worker that answered. `None` leaves the comparison out, and the
-/// report says so per worker.
-pub type DiffSource<'a> = Option<&'a mut dyn FnMut(&str) -> Vec<Check>>;
+/// report says so per worker. It is called from the thread that looks at that
+/// worker, with the handle to ask over, so workers are looked at together.
+pub type DiffSource<'a> = Option<&'a (dyn Fn(&mut dyn Remote, &str) -> Vec<Check> + Sync)>;
 
 /// The difference `workers diff` found for one worker, as checks: one per
 /// item. `same` is ok. Only what a person has to fix fails (`differs`,
@@ -815,7 +855,7 @@ fn measure_parent(
 /// parent's own measurement, taken once for all workers; when it failed no
 /// worker is asked.
 pub fn worker_diff(
-    remote: &mut impl Remote,
+    remote: &mut (impl Remote + ?Sized),
     env: &BTreeMap<String, String>,
     exe: &Path,
     parent: Result<&EnvReport, &str>,
@@ -839,7 +879,8 @@ pub fn run(
     env: &BTreeMap<String, String>,
     spec: &Spec,
     parent_version: &str,
-    mut diff: DiffSource,
+    parent_backend: Backend,
+    diff: DiffSource,
 ) -> Result<Report, ApiError> {
     let cluster = spec.expected_cluster.clone().ok_or_else(|| {
         ApiError::new(
@@ -866,68 +907,164 @@ pub fn run(
             "no service environment is retained; checked in this shell's environment, which the service may not share",
         )
     });
-    let local = gather(
+    let mut local = gather(
         &spec.worker_state_dir,
         if retained { &spec.env } else { env },
         if retained { &spec.env } else { env },
         runner,
     );
+    // The parent's own worker runs inside the coordinator's service: only a
+    // parent that `init` registered has a service whose user can linger.
+    if spec.managed_service.is_some() {
+        local.linger = linger_fact(
+            parent_backend,
+            rustix::process::geteuid().as_raw(),
+            if retained { &spec.env } else { env },
+            runner,
+        );
+    }
     checks.extend(evaluate("parent", &local));
     engines.push(("parent".to_string(), local.docker.engine_id.clone()));
-    for worker in workers::registrations(env)? {
-        let host = worker.id.as_str();
-        let looked = look_at_worker(remote, &worker, &cluster);
-        let answered = looked.is_ok();
-        match looked {
-            Err(reason) => checks.push(Check::new(host, "reachable", Level::Fail, reason)),
-            Ok((answer, bridge)) => {
-                checks.push(Check::new(
-                    host,
-                    "reachable",
-                    Level::Ok,
-                    "answered over ssh",
-                ));
-                checks.extend(service_checks(host, &answer.status, parent_version));
-                checks.push(match bridge {
-                    Ok(()) => Check::new(
-                        host,
-                        "bridge",
-                        Level::Ok,
-                        "hello completed with every required feature",
-                    ),
-                    Err(reason) => Check::new(host, "bridge", Level::Fail, reason),
-                });
-                checks.extend(evaluate(host, &answer.facts));
-                engines.push((host.to_string(), answer.facts.docker.engine_id.clone()));
-            }
-        }
-        checks.extend(match (answered, diff.as_mut()) {
-            // Its own check already says why; a second ssh would wait again.
-            (false, _) => vec![Check::new(
-                host,
-                "environment_diff",
-                Level::NotChecked,
-                "the worker did not answer; its environment was not compared with the parent's",
-            )],
-            (true, Some(source)) => source(host),
-            (true, None) => vec![Check::new(
-                host,
-                "environment_diff",
-                Level::NotChecked,
-                "the comparison of workers diff was left out; toolchain and tool differences were not compared",
-            )],
-        });
+    // Every worker is looked at at the same time (up to a bound), each on its
+    // own ssh processes; what is printed keeps the order of the registrations.
+    let registered = workers::registrations(env)?;
+    let looked = workers::fan_out(remote, registered.iter().collect(), &|handle, worker| {
+        look_at(handle, worker, &cluster, parent_version, diff)
+    });
+    for one in looked {
+        checks.extend(one.checks);
+        engines.extend(one.engine);
     }
     checks.extend(shared_engines(&engines));
     Ok(Report::of(checks))
 }
 
-/// One worker: its facts and whether its bridge completes `hello`.
-fn look_at_worker(
-    remote: &mut impl Remote,
+/// An ephemeral worker has no service and no helper installed by the
+/// parent: the only thing to look at is whether its bridge answers `hello`
+/// as this worker. One that does not answer is a notice, not a failure: it
+/// exists only while its user runs it.
+fn look_at_ephemeral(
+    remote: &mut dyn Remote,
     worker: &workers::Registered,
     cluster: &ClusterId,
-) -> Result<(HostAnswer, Result<(), String>), String> {
+    checks: &mut Vec<Check>,
+) {
+    let host = worker.id.as_str();
+    checks.push(Check::new(
+        host,
+        "service",
+        Level::Notice,
+        "ephemeral worker: it has no service; it is started on its own host with worker --ephemeral and is not installed, upgraded or controlled from here; its environment is not compared with the parent's",
+    ));
+    let hello = SshTarget::parse(&worker.ssh)
+        .map_err(|e| e.to_string())
+        .and_then(|target| {
+            remote.bridge_hello(
+                &target,
+                worker.binary.as_deref().unwrap_or("remote-task-runner"),
+                cluster,
+            )
+        });
+    let (level, detail) = match hello {
+        Ok((answered_cluster, answered_worker))
+            if answered_worker.as_str() == worker.id && &answered_cluster == cluster =>
+        {
+            (
+                Level::Ok,
+                "hello completed with every required feature".to_string(),
+            )
+        }
+        Ok(_) => (
+            Level::Fail,
+            "the worker bridge answered for a different worker or cluster".to_string(),
+        ),
+        Err(why) => (
+            Level::Notice,
+            format!("the worker bridge did not complete hello ({why}); an ephemeral worker answers only while it is started on its host. If it is gone for good, workers forget {host} ends what it held"),
+        ),
+    };
+    checks.push(Check::new(host, "bridge", level, detail));
+}
+
+/// What one worker contributes to the report.
+struct Looked {
+    checks: Vec<Check>,
+    /// The worker's Docker engine, for the check that workers do not share one.
+    engine: Option<(String, Option<String>)>,
+}
+
+/// One worker, with every question it is asked. The doctor helper answers
+/// first; the bridge `hello` and the environment comparison then depend only
+/// on that answer, so they are asked at the same time.
+fn look_at(
+    remote: &mut dyn Remote,
+    worker: &workers::Registered,
+    cluster: &ClusterId,
+    parent_version: &str,
+    diff: DiffSource,
+) -> Looked {
+    let host = worker.id.as_str();
+    let mut checks = Vec::new();
+    let mut engine = None;
+    if worker.ephemeral {
+        look_at_ephemeral(remote, worker, cluster, &mut checks);
+        return Looked { checks, engine };
+    }
+    match ask_worker(remote, worker, cluster) {
+        // Its own check says why; a second ssh would only wait again.
+        Err(reason) => {
+            checks.push(Check::new(host, "reachable", Level::Fail, reason));
+            checks.push(Check::new(
+                host,
+                "environment_diff",
+                Level::NotChecked,
+                "the worker did not answer; its environment was not compared with the parent's",
+            ));
+        }
+        Ok(answer) => {
+            let (bridge, compared) = workers::both(
+                remote,
+                |handle| probe_bridge(handle, worker, cluster),
+                |handle| diff.map(|source| source(handle, host)),
+            );
+            checks.push(Check::new(
+                host,
+                "reachable",
+                Level::Ok,
+                "answered over ssh",
+            ));
+            checks.extend(service_checks(host, &answer.status, parent_version));
+            checks.push(match bridge {
+                Ok(()) => Check::new(
+                    host,
+                    "bridge",
+                    Level::Ok,
+                    "hello completed with every required feature",
+                ),
+                Err(reason) => Check::new(host, "bridge", Level::Fail, reason),
+            });
+            checks.extend(evaluate(host, &answer.facts));
+            engine = Some((host.to_string(), answer.facts.docker.engine_id.clone()));
+            checks.extend(compared.unwrap_or_else(|| {
+                vec![Check::new(
+                    host,
+                    "environment_diff",
+                    Level::NotChecked,
+                    "the comparison of workers diff was left out; toolchain and tool differences were not compared",
+                )]
+            }));
+        }
+    }
+    Looked { checks, engine }
+}
+
+/// The worker's own doctor helper, over ssh: its facts and status, for the
+/// worker the registration names.
+fn ask_worker(
+    remote: &mut dyn Remote,
+    worker: &workers::Registered,
+    cluster: &ClusterId,
+) -> Result<HostAnswer, String> {
     let target = SshTarget::parse(&worker.ssh).map_err(|e| e.to_string())?;
     let binary = worker
         .binary
@@ -944,7 +1081,24 @@ fn look_at_worker(
     if answer.status.worker_id.as_str() != worker.id || &answer.status.cluster != cluster {
         return Err("the host answered for a different worker identity or cluster".into());
     }
-    let bridge = remote
+    if worker.system_user != answer.status.system_user {
+        return Err("the installed service mode differs from the worker registration".into());
+    }
+    Ok(answer)
+}
+
+/// Whether the worker's bridge completes `hello`, as the resident runs it.
+fn probe_bridge(
+    remote: &mut dyn Remote,
+    worker: &workers::Registered,
+    cluster: &ClusterId,
+) -> Result<(), String> {
+    let target = SshTarget::parse(&worker.ssh).map_err(|e| e.to_string())?;
+    let binary = worker
+        .binary
+        .as_deref()
+        .ok_or("the registration has no binary path")?;
+    remote
         .bridge_hello(&target, binary, cluster)
         .map_err(|m| format!("the worker bridge did not complete hello: {m}"))
         .and_then(
@@ -955,8 +1109,7 @@ fn look_at_worker(
                     Err("the worker bridge answered for a different worker or cluster".to_string())
                 }
             },
-        );
-    Ok((answer, bridge))
+        )
 }
 
 fn text(report: &Report) -> String {
@@ -996,13 +1149,12 @@ pub fn command(json: bool) -> i32 {
             let spec = super::context::runtime_spec(&env)?;
             // Measured as `workers diff` measures it, once, and only when a
             // worker answers.
-            let mut parent: Option<Result<EnvReport, String>> = None;
-            let mut source = |host: &str| {
-                let parent = parent.get_or_insert_with(|| {
-                    measure_parent(&spec, crate::toolchain::envreport::collect)
-                });
+            let parent: std::sync::OnceLock<Result<EnvReport, String>> = std::sync::OnceLock::new();
+            let source = |remote: &mut dyn Remote, host: &str| {
+                let parent = parent
+                    .get_or_init(|| measure_parent(&spec, crate::toolchain::envreport::collect));
                 worker_diff(
-                    &mut workers::SshRemote,
+                    remote,
                     &env,
                     &exe,
                     parent.as_ref().map_err(String::as_str),
@@ -1015,7 +1167,8 @@ pub fn command(json: bool) -> i32 {
                 &env,
                 &spec,
                 &version,
-                Some(&mut source),
+                super::macos::Launcher::backend(&super::worker_service::HostLauncher::native()),
+                Some(&source),
             )?;
             let project = std::env::current_dir()
                 .map_err(|e| e.to_string())
@@ -1073,6 +1226,9 @@ pub fn command(json: bool) -> i32 {
         }
     }
 }
+
+pub mod linger;
+pub use linger::Linger;
 
 #[cfg(test)]
 mod tests;

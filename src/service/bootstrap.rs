@@ -184,7 +184,7 @@ pub(crate) async fn connect_managed<L: super::macos::Launcher>(
 
 pub async fn ensure(spec: Spec) -> anyhow::Result<Client> {
     if spec.managed_service.is_some() {
-        return connect_managed(&spec, &mut super::macos::NativeLauncher::default()).await;
+        return connect_managed(&spec, &mut super::worker_service::HostLauncher::native()).await;
     }
     let copy = spec.clone();
     let lock = tokio::task::spawn_blocking(move || -> anyhow::Result<File> {

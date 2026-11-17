@@ -71,6 +71,34 @@ pub fn freeze_plan(
     .map_err(|e| ExecuteError::Binding(format!("{e:#}")))
 }
 
+pub(crate) enum SelectedTask<'a> {
+    Plan(&'a str),
+    Derived(&'a local_ci::driver::DerivedDispatch),
+}
+
+pub(crate) fn decode_dispatch(
+    value: &serde_json::Value,
+    task: &str,
+) -> Result<local_ci::driver::DerivedDispatch, String> {
+    let dispatch = local_ci::driver::DerivedDispatch::from_json(&value.to_string())
+        .map_err(|e| format!("invalid matrix dispatch: {e:#}"))?;
+    if dispatch.task_id() != task {
+        return Err("matrix dispatch names a different task".into());
+    }
+    Ok(dispatch)
+}
+
+/// The local CI event supplies no caller-provided GitHub, vars or inputs overrides.
+/// Source-bound workflow scheduling still comes from the SDK evaluation source.
+pub(crate) fn portable_facts() -> local_ci::driver::PortableFacts {
+    local_ci::driver::PortableFacts {
+        schema_version: local_ci::driver::DISPATCH_VERSION,
+        github: Default::default(),
+        vars: Default::default(),
+        inputs: Default::default(),
+    }
+}
+
 /// Run task `task_id` of `plan` in `paths.root` with `inputs` as the results
 /// of the jobs it needs.
 /// A matrix that would need a second workspace is refused by the core
@@ -80,6 +108,26 @@ pub fn execute_task(
     manifest: &SourceManifest,
     plan: &FrozenPlan,
     task_id: &str,
+    inputs: &TaskInputs,
+    paths: TaskPaths,
+    executor: Arc<dyn StepExecutor>,
+) -> Result<TaskResult, ExecuteError> {
+    execute_selected(
+        store,
+        manifest,
+        plan,
+        SelectedTask::Plan(task_id),
+        inputs,
+        paths,
+        executor,
+    )
+}
+
+pub(crate) fn execute_selected(
+    store: &SourceStore,
+    manifest: &SourceManifest,
+    plan: &FrozenPlan,
+    task: SelectedTask<'_>,
     inputs: &TaskInputs,
     paths: TaskPaths,
     executor: Arc<dyn StepExecutor>,
@@ -119,16 +167,31 @@ pub fn execute_task(
                 trash: paths.trash.clone(),
                 all_os_legs: false,
             };
-            local_ci::source_execute::execute_pinned_task(
-                &ctx,
-                &input,
-                task_id,
-                inputs,
-                None,
-                &ws,
-                opts,
-                &RefusePinnedForks,
-            )
+            match task {
+                SelectedTask::Plan(task_id) => local_ci::source_execute::execute_pinned_task(
+                    &ctx,
+                    &input,
+                    task_id,
+                    inputs,
+                    None,
+                    &ws,
+                    opts,
+                    &RefusePinnedForks,
+                ),
+                SelectedTask::Derived(dispatch) => {
+                    local_ci::source_execute::execute_pinned_dispatch(
+                        &ctx,
+                        &input,
+                        dispatch,
+                        inputs,
+                        &portable_facts(),
+                        None,
+                        &ws,
+                        opts,
+                        &RefusePinnedForks,
+                    )
+                }
+            }
             .map_err(|e| ExecuteError::Run(format!("{e:#}")))
         };
         Ok(run())
@@ -258,6 +321,88 @@ pub(crate) mod tests {
             .find(|t| t.jobs.iter().any(|j| j == job))
             .unwrap()
             .id
+    }
+
+    #[test]
+    fn derived_dispatch_executes_only_its_source_bound_variant() {
+        use local_ci::driver::{ActionKind, Driver, DriverConfig, Input, DRIVER_VERSION};
+        let f = fixture(
+            r#"on: push
+jobs:
+  leg:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix: ${{ fromJSON('{"include":[{"n":0},{"n":1}]}') }}
+    steps:
+      - run: echo ${{ matrix.n }} > member
+"#,
+        );
+        let mut driver = f
+            .store
+            .object_store()
+            .unwrap()
+            .with_sdk(|objects| {
+                let pin = PinnedExecution::new(&f.plan, &f.manifest, objects)?;
+                Driver::with_evaluation(
+                    &f.plan,
+                    DriverConfig {
+                        schema_version: DRIVER_VERSION,
+                        max_parallel: 2,
+                    },
+                    &pin.evaluation_source()?,
+                    portable_facts(),
+                )
+            })
+            .unwrap();
+        let advance = driver.propose(Input::Advance).unwrap();
+        driver.apply(&advance).unwrap();
+        let exec = Arc::new(Plain::default());
+        let members = driver
+            .pending_actions()
+            .iter()
+            .filter_map(|a| match &a.kind {
+                ActionKind::DerivedReady { dispatch, inputs } => Some((dispatch, inputs)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(members.len(), 2);
+        for (dispatch, inputs) in members {
+            let paths = paths(&f.area, &format!("leg-{}", dispatch.index()));
+            f.store.materialize(&f.manifest, &paths.root).unwrap();
+            let produced = paths.root.join("member");
+            let json = serde_json::to_value(dispatch).unwrap();
+            assert!(decode_dispatch(&json, "another-task").is_err());
+            let decoded = decode_dispatch(&json, dispatch.task_id()).unwrap();
+            let mut wrong = inputs.clone();
+            wrong.run_cancelled = !wrong.run_cancelled;
+            assert!(execute_selected(
+                &f.store,
+                &f.manifest,
+                &f.plan,
+                SelectedTask::Derived(&decoded),
+                &wrong,
+                paths.clone(),
+                exec.clone()
+            )
+            .is_err());
+            assert!(!produced.exists());
+            let result = execute_selected(
+                &f.store,
+                &f.manifest,
+                &f.plan,
+                SelectedTask::Derived(&decoded),
+                inputs,
+                paths,
+                exec.clone(),
+            )
+            .unwrap();
+            assert_eq!(result.task, dispatch.task_id());
+            assert_eq!(result.outcomes[0].status, JobStatus::Success);
+            assert_eq!(
+                std::fs::read_to_string(produced).unwrap().trim(),
+                dispatch.index().to_string()
+            );
+        }
     }
 
     #[test]

@@ -54,6 +54,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+mod environment;
 mod warmup;
 
 /// What an agent is started with. Nothing is read from the process
@@ -65,6 +66,8 @@ pub struct AgentConfig {
     pub worker_id: WorkerId,
     /// This boot of the machine (`platform::boot_id()` in production).
     pub boot_id: WorkerBootId,
+    /// Per-start identity advertised by an ephemeral worker.
+    pub instance_id: Option<WorkerBootId>,
     /// The binary whose `supervise --spec <file>` runs an attempt.
     pub supervisor_exe: PathBuf,
     pub traffic_state_dir: PathBuf,
@@ -123,6 +126,10 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    pub(crate) fn advertised_boot(&self) -> &WorkerBootId {
+        self.instance_id.as_ref().unwrap_or(&self.boot_id)
+    }
+
     pub fn new(
         state_dir: PathBuf,
         worker_id: WorkerId,
@@ -134,6 +141,7 @@ impl AgentConfig {
             state_dir,
             worker_id,
             boot_id,
+            instance_id: None,
             supervisor_exe,
             traffic_config: None,
             capability_profile: None,
@@ -2087,6 +2095,41 @@ impl Agent {
                 self.status(&rec).map(Response::GetAttempt)
             }
             Request::ListAttempts(r) => self.list(r).map(Response::ListAttempts),
+            Request::WorkflowArtifact(r) => {
+                let rec = self.known(&r.attempt_id)?;
+                Self::generation(&rec, r.generation)?;
+                if r.coordinator_epoch != session.coordinator_epoch
+                    || r.coordinator_epoch < self.store.max_coordinator_epoch().map_err(api)?
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::StaleEpoch,
+                        "artifact exchange from a stale coordinator",
+                    ));
+                }
+                if rec.retired
+                    || rec.cancel_requested_at_ms.is_some()
+                    || rec.state == AttemptState::Terminal
+                {
+                    return Err(ApiError::new(
+                        ErrorCode::Conflict,
+                        "artifact attempt is no longer live",
+                    ));
+                }
+                let root = self
+                    .cfg
+                    .attempts_root()
+                    .join(r.attempt_id.as_str())
+                    .join("ci")
+                    .join("exchange");
+                crate::ci::artifact_exchange::respond(&root, r.command)
+                    .map(|result| {
+                        Response::WorkflowArtifact(crate::wire::WorkflowArtifactResponse {
+                            schema_version: SchemaVersion::CURRENT,
+                            result,
+                        })
+                    })
+                    .map_err(|e| invalid(e.to_string()))
+            }
             Request::RenewLease(r) => self.renew(r).map(Response::RenewLease),
             Request::CancelAttempt(r) => self.cancel(r).map(Response::CancelAttempt),
             Request::RetireAttempt(r) => self.retire(r).map(Response::RetireAttempt),
@@ -2113,11 +2156,11 @@ impl Agent {
                 let max_epoch = self.store.max_coordinator_epoch().map_err(api)?;
                 let ident = crate::forecast::plan::Ident {
                     worker_id: self.cfg.worker_id.clone(),
-                    boot_id: self.cfg.boot_id.clone(),
+                    boot_id: self.cfg.advertised_boot().clone(),
                     agent_epoch: self.epoch,
                     forecast_ttl_ms: self.cfg.forecast_ttl_ms,
                 };
-                crate::forecast::answer_command(
+                crate::forecast::answer_worker_command(
                     &self.cfg.traffic_state_dir,
                     self.cfg.traffic_config.as_deref(),
                     &self.cfg.state_dir,
@@ -2126,7 +2169,10 @@ impl Agent {
                         .as_ref()
                         .map(|_| &self.cfg.profile_fingerprint),
                     &ident,
-                    &attempts,
+                    crate::forecast::AcceptedWork {
+                        attempts: &attempts,
+                        installs: &|payload| self.pending_tool_installs(payload),
+                    },
                     max_epoch,
                     &r,
                 )
@@ -2156,7 +2202,7 @@ impl Agent {
                     crate::wire::PreparationProbeResponse {
                         schema_version: SchemaVersion::CURRENT,
                         worker_id: self.cfg.worker_id.clone(),
-                        worker_boot_id: self.cfg.boot_id.clone(),
+                        worker_boot_id: self.cfg.advertised_boot().clone(),
                         agent_epoch: self.epoch,
                         probe,
                     },
@@ -2172,10 +2218,7 @@ impl Agent {
                 ))
             }
             Request::EnvSync(r) => self.env_sync(r).map(Response::EnvSync),
-            Request::EnvReport(_) => Err(ApiError::new(
-                ErrorCode::NotImplemented,
-                "this operation is not implemented by the worker agent yet",
-            )),
+            Request::EnvReport(r) => self.env_report(r).map(Response::EnvReport),
         }
     }
 
@@ -2335,7 +2378,7 @@ impl Agent {
             run_id: rec.run_id.clone(),
             task_id: rec.task_id.clone(),
             generation: rec.generation,
-            worker_boot_id: self.cfg.boot_id.clone(),
+            worker_boot_id: self.cfg.advertised_boot().clone(),
             agent_epoch: self.epoch,
             state: rec.state,
             receipts: rec.receipts,
@@ -2718,19 +2761,45 @@ impl Agent {
         let max_epoch = self.store.max_coordinator_epoch().map_err(api)?;
         let ident = crate::forecast::plan::Ident {
             worker_id: self.cfg.worker_id.clone(),
-            boot_id: self.cfg.boot_id.clone(),
+            boot_id: self.cfg.advertised_boot().clone(),
             agent_epoch: self.epoch,
             forecast_ttl_ms: self.cfg.forecast_ttl_ms,
         };
-        crate::forecast::answer(
+        crate::forecast::answer_worker(
             &self.cfg.traffic_state_dir,
             self.cfg.traffic_config.as_deref(),
             &self.cfg.state_dir,
+            Some(&self.cfg.profile_fingerprint),
             &ident,
-            &attempts,
+            crate::forecast::AcceptedWork {
+                attempts: &attempts,
+                installs: &|payload| self.pending_tool_installs(payload),
+            },
             max_epoch,
             &r,
         )
+    }
+
+    /// How many of an accepted attempt's tools are not installed yet (read
+    /// only: the same detect admission uses). A tool whose state cannot be
+    /// read counts as waiting; an attempt that needs no tool, or a worker with
+    /// no registry, counts as none (admission blocks the latter).
+    fn pending_tool_installs(&self, payload: &AttemptPayload) -> usize {
+        let (Some(bundle), Some(registry)) = (&payload.toolchains, &self.toolchains) else {
+            return 0;
+        };
+        let Ok(requests) = self.toolchain_requests(bundle) else {
+            return 0;
+        };
+        requests
+            .iter()
+            .filter(|r| {
+                !matches!(
+                    registry.detect(r),
+                    Ok(crate::toolchain::adapters::Availability::Installed(_))
+                )
+            })
+            .count()
     }
 
     fn capabilities_with_diagnostic(
@@ -2837,7 +2906,7 @@ impl Agent {
             capabilities: self.capabilities(),
             schema_version: SchemaVersion::CURRENT,
             worker_id: self.cfg.worker_id.clone(),
-            worker_boot_id: self.cfg.boot_id.clone(),
+            worker_boot_id: self.cfg.advertised_boot().clone(),
             agent_epoch: self.epoch,
             snapshot_digest: Digest::of_bytes(
                 format!("{}/{active}/{pending}", self.epoch.0).as_bytes(),

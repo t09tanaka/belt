@@ -25,12 +25,15 @@
 mod collect;
 mod env_sync;
 mod estimate;
+mod forget;
+pub mod identity;
 mod input_gate;
 mod link;
 pub mod policy;
 mod prefetch;
 mod preparation;
 mod preparation_identity;
+mod workflow_artifact;
 
 pub use input_gate::{PlacementInputs, ReadyInput};
 pub use link::{ClientLink, InputGate, LinkError, WorkerLink};
@@ -134,9 +137,26 @@ pub struct TaskSpec {
     pub outputs: Vec<crate::wire::OutputDecl>,
 }
 
+/// The shared permit pool of a matrix job within this run. An unknown attempt keeps its permit.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MatrixAdmission {
+    pub group: String,
+    pub max_parallel: std::num::NonZeroU32,
+}
+
 /// A task of a frozen CI plan, as it is queued.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiSpec {
+    /// Planned SDK step identities, in demand order. Old tasks have no samples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_keys: Vec<Option<crate::ids::Digest>>,
+    /// A dynamic origin waits on derived variants and never executes itself.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub dynamic_origin: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub core_outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<MatrixAdmission>,
     /// A rerun could repeat external effects. A captured job policy must
     /// explicitly allow retry for a non-idempotent runner.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -207,7 +227,7 @@ pub fn build_payload(
         source_id,
         plan_digest: spec.plan_digest.clone(),
         manifest_digest: spec.manifest_digest.clone(),
-        permit_id: None,
+        permit_id: input.permit_id.clone(),
         commands: spec.commands.clone(),
         lease_ms,
         command_timeout_ms: spec.command_timeout_ms,
@@ -1040,7 +1060,14 @@ impl Coordinator {
             (Step::Settle, Some(status)) => self.mirror(&status, report).await,
             (Step::Follow, Some(status)) => {
                 self.mirror(&status, report).await?;
-                self.renew(link, a, status.state, report).await
+                self.renew(link, a, status.state, report).await?;
+                if !matches!(
+                    status.state,
+                    AttemptState::Cancelling | AttemptState::Finalizing
+                ) {
+                    self.follow_artifacts(link, &live).await?;
+                }
+                Ok(())
             }
             // A step that needs a status always comes with one; without it
             // nothing is known.
@@ -1483,13 +1510,7 @@ impl Coordinator {
             // It waits for the jobs it needs; the queue does not list it.
             return Ok(());
         }
-        let lacks_ci = |w: &Reached| {
-            policy::missing_ci_feature(
-                &spec,
-                w.link.ci_task_negotiated(),
-                w.link.ci_discovery_negotiated(),
-            )
-        };
+        let unmet_ci = |w: &Reached| policy::unmet_ci(&spec, w.link.as_ref());
         let parent_local = self
             .parent_local
             .lock()
@@ -1609,7 +1630,7 @@ impl Coordinator {
                 .iter()
                 .filter(|w| refusal(w).is_none() && (ready(w) || measured_cold(w)))
                 .partition(|w| {
-                    lacks_ci(w).is_none()
+                    unmet_ci(w).is_none()
                         && (spec.toolchains.is_none() || toolchain_eligible.contains(&w.worker_id))
                         && crate::toolchain::capability::missing_with_installable(
                             &spec.requirements,
@@ -1619,8 +1640,8 @@ impl Coordinator {
                         .is_empty()
                 });
             excluded.extend(mismatched.into_iter().map(|w| Excluded {
-                unmet: if let Some(reason) = lacks_ci(w) {
-                    vec![reason.to_string()]
+                unmet: if let Some(why) = unmet_ci(w) {
+                    vec![why.to_string()]
                 } else {
                     crate::toolchain::envdiff::with_steps(
                         crate::toolchain::capability::missing(
@@ -1888,7 +1909,7 @@ impl Coordinator {
                 // Counted again in the commit, it has no room after all:
                 // decide once more without it.
                 PlaceOutcome::WorkerFull(_) => round.close(&winner, Exclusion::Full),
-                PlaceOutcome::NotQueued => return Ok(()),
+                PlaceOutcome::NotQueued | PlaceOutcome::MatrixFull => return Ok(()),
                 PlaceOutcome::Unbuildable(why) => {
                     // This task only; the ones behind it are placed.
                     return self.note_unplaceable(task, why).await;
@@ -2009,6 +2030,7 @@ fn check_spec(
     lease_ms: u64,
 ) -> Result<()> {
     let input = PlaceInput {
+        permit_id: None,
         run_id: run_id.clone(),
         task_id: task_id.clone(),
         generation: Generation(1),

@@ -69,6 +69,17 @@ fn compute_target(
                 .into(),
         );
     }
+    if accepted
+        .iter()
+        .any(|a| !a.terminal && plan::is_install_node(&a.node_id))
+    {
+        // Not `soft` either: an install's time is not measured, and one that
+        // is already running is counted twice (later, never earlier).
+        notes.note(
+            "toolchain installs an accepted attempt waits for count as demand ahead; their time is not measured"
+                .into(),
+        );
+    }
     let overlay = plan::merge_overlay(&req.workload, &req.pending, accepted, defaults);
     let fc = ttc::forecast(ctx, insp, &target, &overlay).map_err(|e| match e {
         task_traffic_controller::error::Error::Plan(m) => ApiError::new(ErrorCode::InvalidInput, m),
@@ -93,6 +104,25 @@ fn compute_target(
 /// the worker holds tells (0 when it does not).
 pub type CiSteps<'a> = &'a dyn Fn(&crate::wire::CiTask) -> usize;
 
+/// How many toolchain installs an accepted attempt still waits for (0 when it
+/// needs none or the worker cannot tell).
+pub type ToolInstalls<'a> = &'a dyn Fn(&AttemptPayload) -> usize;
+
+/// Snapshot of accepted work, including installation demand from the worker registry.
+pub(crate) struct AcceptedWork<'a> {
+    pub attempts: &'a [AcceptedAttempt],
+    pub installs: ToolInstalls<'a>,
+}
+
+impl<'a> AcceptedWork<'a> {
+    fn without_registry(attempts: &'a [AcceptedAttempt]) -> Self {
+        Self {
+            attempts,
+            installs: &|_| 0,
+        }
+    }
+}
+
 /// The steps of the CI tasks, read from the plans kept under `worker_state`.
 fn ci_steps_in(worker_state: &Path) -> impl Fn(&crate::wire::CiTask) -> usize + '_ {
     move |task| crate::worker::ci_task::planned_steps(worker_state, task)
@@ -104,6 +134,7 @@ fn ci_steps_in(worker_state: &Path) -> impl Fn(&crate::wire::CiTask) -> usize + 
 fn accepted_of(
     attempts: &[AcceptedAttempt],
     ci_steps: CiSteps<'_>,
+    installs: ToolInstalls<'_>,
 ) -> Result<Vec<AcceptedNode>, ApiError> {
     let mut out = Vec::new();
     for rec in attempts {
@@ -113,6 +144,10 @@ fn accepted_of(
         let nodes = plan::accepted_nodes(&rec.attempt_id, &payload, steps)
             .map_err(|e| internal(&format!("attempt {}", rec.attempt_id), e))?;
         out.extend(nodes);
+        let waiting =
+            plan::install_nodes(&rec.attempt_id, &payload.plan_digest, installs(&payload))
+                .map_err(|e| internal(&format!("attempt {}", rec.attempt_id), e))?;
+        out.extend(waiting);
     }
     Ok(out)
 }
@@ -166,6 +201,26 @@ pub fn answer_with_ci(
     req: &ForecastRequest,
     ci_steps: CiSteps<'_>,
 ) -> Result<ForecastResponse, ApiError> {
+    answer_with_work(
+        ctx,
+        cfg,
+        ident,
+        AcceptedWork::without_registry(attempts),
+        max_epoch,
+        req,
+        ci_steps,
+    )
+}
+
+pub(crate) fn answer_with_work(
+    ctx: &Context,
+    cfg: &Config,
+    ident: &Ident,
+    work: AcceptedWork<'_>,
+    max_epoch: CoordinatorEpoch,
+    req: &ForecastRequest,
+    ci_steps: CiSteps<'_>,
+) -> Result<ForecastResponse, ApiError> {
     if req.coordinator_epoch < max_epoch {
         return Err(ApiError::new(
             ErrorCode::StaleEpoch,
@@ -178,7 +233,7 @@ pub fn answer_with_ci(
     // Refuse an oversized request before any file is read.
     plan::check_request(req).map_err(plan::RequestError::into_api)?;
     let (accepted, insp) = gather(
-        || accepted_of(attempts, ci_steps),
+        || accepted_of(work.attempts, ci_steps, work.installs),
         || inspect_with(ctx, cfg).map_err(|e| internal("inspect", e)),
         |node| {
             // A sidecar that cannot be read keeps the demand.
@@ -201,21 +256,96 @@ pub fn answer(
     max_epoch: CoordinatorEpoch,
     req: &ForecastRequest,
 ) -> Result<ForecastResponse, ApiError> {
+    answer_worker(
+        traffic_state_dir,
+        traffic_config,
+        worker_state,
+        None,
+        ident,
+        AcceptedWork::without_registry(attempts),
+        max_epoch,
+        req,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn answer_worker(
+    traffic_state_dir: &Path,
+    traffic_config: Option<&Path>,
+    worker_state: &Path,
+    profile: Option<&crate::ids::Digest>,
+    ident: &Ident,
+    work: AcceptedWork<'_>,
+    max_epoch: CoordinatorEpoch,
+    req: &ForecastRequest,
+) -> Result<ForecastResponse, ApiError> {
     let config_path = traffic_config
         .map(Path::to_path_buf)
         .unwrap_or_else(|| traffic_state_dir.join("config.toml"));
     let paths = Paths::new(traffic_state_dir, config_path);
     let cfg = Config::load(paths.config_file()).map_err(|e| internal("traffic config", e))?;
     let steps = ci_steps_in(worker_state);
-    answer_with_ci(
-        &Context::new(paths),
-        &cfg,
-        ident,
-        attempts,
-        max_epoch,
-        req,
-        &steps,
-    )
+    let ctx = Context::new(paths);
+    if req.coordinator_epoch < max_epoch {
+        return Err(ApiError::new(ErrorCode::StaleEpoch, "stale forecast epoch"));
+    }
+    plan::check_request(req).map_err(plan::RequestError::into_api)?;
+    let mut req = req.clone();
+    if let Some(profile) = profile {
+        apply_ci_history(&ctx, profile, &mut req)?;
+    }
+    answer_with_work(&ctx, &cfg, ident, work, max_epoch, &req, &steps)
+}
+
+/// Match samples in the worker's ledger against the requested steps once.
+fn apply_ci_history(
+    ctx: &Context,
+    profile: &crate::ids::Digest,
+    req: &mut ForecastRequest,
+) -> Result<(), ApiError> {
+    use std::collections::HashMap;
+    let mut samples = HashMap::new();
+    for plan in std::iter::once(&req.workload).chain(&req.pending) {
+        for key in plan
+            .nodes
+            .iter()
+            .filter(|node| node.predicted_runtime_ms.is_none())
+            .filter_map(|node| node.ci_history_key.as_ref())
+        {
+            samples
+                .entry(crate::ci::timing::profile_key(key, profile))
+                .or_insert_with(Vec::new);
+        }
+    }
+    if samples.is_empty() {
+        return Ok(());
+    }
+    for record in task_traffic_controller::history::read_all(ctx.paths.history_file())
+        .map_err(|e| internal("CI step history", e))?
+    {
+        if let Some(walls) = samples.get_mut(&record.key_argv) {
+            if record.exit_code == 0 && record.wall_secs.is_finite() {
+                walls.push(record.wall_secs);
+            }
+        }
+    }
+    for plan in std::iter::once(&mut req.workload).chain(&mut req.pending) {
+        for node in &mut plan.nodes {
+            if node.predicted_runtime_ms.is_some() {
+                continue;
+            }
+            let Some(step) = &node.ci_history_key else {
+                continue;
+            };
+            let key = crate::ci::timing::profile_key(step, profile);
+            node.predicted_runtime_ms = samples
+                .get(&key)
+                .and_then(|walls| task_traffic_controller::eta::expected_wall(walls))
+                .and_then(|seconds| std::time::Duration::try_from_secs_f64(seconds).ok())
+                .and_then(|time| u64::try_from(time.as_millis()).ok());
+        }
+    }
+    Ok(())
 }
 
 /// Derive command history only from an existing canonical clone, without preparing it.
@@ -227,6 +357,29 @@ pub fn answer_command(
     profile: Option<&crate::ids::Digest>,
     ident: &Ident,
     attempts: &[AcceptedAttempt],
+    max_epoch: CoordinatorEpoch,
+    req: &crate::wire::ForecastCommandRequest,
+) -> Result<ForecastResponse, ApiError> {
+    answer_worker_command(
+        traffic,
+        config,
+        worker_state,
+        profile,
+        ident,
+        AcceptedWork::without_registry(attempts),
+        max_epoch,
+        req,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn answer_worker_command(
+    traffic: &Path,
+    config: Option<&Path>,
+    worker_state: &Path,
+    profile: Option<&crate::ids::Digest>,
+    ident: &Ident,
+    work: AcceptedWork<'_>,
     max_epoch: CoordinatorEpoch,
     req: &crate::wire::ForecastCommandRequest,
 ) -> Result<ForecastResponse, ApiError> {
@@ -315,7 +468,7 @@ pub fn answer_command(
         })
         .transpose()?;
     let (accepted, insp) = gather(
-        || accepted_of(attempts, &ci_steps_in(worker_state)),
+        || accepted_of(work.attempts, &ci_steps_in(worker_state), work.installs),
         || inspect_with(&ctx, &cfg).map_err(|e| internal("inspect", e)),
         |node| {
             if let Loaded::Ok(sc) = managed::load_sidecar(&ctx, &node.command_id) {
@@ -351,6 +504,8 @@ mod tests {
         let d = Digest::of_bytes(b"x");
         let payload = AttemptPayload {
             ci_task: Some(crate::wire::CiTask {
+                artifact_workflow: None,
+                dispatch: None,
                 plan_digest: Digest::of_bytes(&bytes),
                 task_id: task_of(&f.plan, "build").to_string(),
                 inputs: serde_json::json!({}),
@@ -395,9 +550,12 @@ mod tests {
             .unwrap();
         let attempts = store.list_nonterminal().unwrap();
         // The plan has not arrived: the task has no known step yet.
-        assert_eq!(accepted_of(&attempts, &ci_steps_in(&state)).unwrap(), []);
+        assert_eq!(
+            accepted_of(&attempts, &ci_steps_in(&state), &|_| 0).unwrap(),
+            []
+        );
         crate::worker::ci_task::store_plan(&state, &bytes).unwrap();
-        let nodes = accepted_of(&attempts, &ci_steps_in(&state)).unwrap();
+        let nodes = accepted_of(&attempts, &ci_steps_in(&state), &|_| 0).unwrap();
         assert_eq!(nodes.len(), 1, "the one `run:` step of the job");
         assert_eq!(nodes[0].node_id.as_str(), "step-0");
         assert_eq!(nodes[0].attempt_id, attempt);
@@ -406,8 +564,13 @@ mod tests {
             crate::supervisor::spec::command_id(&attempt, 0)
         );
         // What says how many steps a task has is asked for CI tasks only.
-        assert_eq!(accepted_of(&attempts, &|_| 3).unwrap().len(), 3);
-        assert_eq!(accepted_of(&attempts, &|_| 0).unwrap(), []);
+        assert_eq!(accepted_of(&attempts, &|_| 3, &|_| 0).unwrap().len(), 3);
+        assert_eq!(accepted_of(&attempts, &|_| 0, &|_| 0).unwrap(), []);
+        // What an attempt still has to install is asked for every attempt.
+        let waiting = accepted_of(&attempts, &|_| 0, &|_| 2).unwrap();
+        let names: Vec<&str> = waiting.iter().map(|n| n.node_id.as_str()).collect();
+        assert_eq!(names, ["toolchain-install-0", "toolchain-install-1"]);
+        assert!(waiting.iter().all(|n| n.attempt_id == attempt));
     }
     use crate::wire::{
         ConcurrencyLimits, Correlation, ForecastField, RuntimeSource, SchemaVersion, Uncertainty,
@@ -507,6 +670,7 @@ mod tests {
 
     fn node(attempt: &AttemptId, id: &str, runtime_ms: Option<u64>) -> WorkloadNode {
         WorkloadNode {
+            ci_history_key: None,
             node_id: NodeId::parse(id).unwrap(),
             depends_on: vec![],
             priority: 0,
@@ -813,6 +977,94 @@ mod tests {
     }
 
     #[test]
+    fn a10_matrix_variants_forecast_the_final_step_after_preparation() {
+        let fixture = crate::ci::execute::tests::fixture(
+            r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [debug, release]
+    steps:
+      - run: echo configure
+      - run: echo compile
+      - run: echo verify
+"#,
+        );
+        let digest = Digest::of_bytes(&serde_json::to_vec(&fixture.plan).unwrap());
+        let specs = crate::service::ci_run::task_specs(
+            &fixture.plan,
+            &digest,
+            &Digest::of_bytes(b"manifest"),
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 2);
+        let traffic = tempfile::tempdir().unwrap();
+        let context = Context::new(Paths::new(
+            traffic.path(),
+            traffic.path().join("config.toml"),
+        ));
+        let profile = Digest::of_bytes(b"profile");
+        for (task, spec) in specs {
+            assert!(fixture
+                .plan
+                .tasks
+                .iter()
+                .any(|t| t.id == task && t.variant.is_some()));
+            let attempt = AttemptId::generate();
+            let workload =
+                crate::coordinator::policy::workload_of_spec(&attempt, &spec, Some(4_000));
+            assert_eq!(workload.nodes.len(), 3);
+            let mut req = request(workload, vec![]);
+            apply_ci_history(&context, &profile, &mut req).unwrap();
+            assert!(req
+                .workload
+                .nodes
+                .iter()
+                .all(|node| node.predicted_runtime_ms.is_none()));
+            let (cold, _) = run(&insp(4, calm(), vec![]), &req, &[]);
+            assert_eq!(cold.target.runtime_source, RuntimeSource::Fallback);
+            for (node, seconds) in req.workload.nodes.iter().zip([10.0, 20.0, 5.0]) {
+                let step = node.ci_history_key.as_ref().unwrap();
+                let record = task_traffic_controller::history::Record {
+                    key: "ttc".into(),
+                    repo: String::new(),
+                    subdir: String::new(),
+                    argv: String::new(),
+                    key_argv: crate::ci::timing::profile_key(step, &profile),
+                    started_at: t0(),
+                    wall_secs: seconds,
+                    cpu_secs: 0.0,
+                    max_rss_bytes: 0,
+                    exit_code: 0,
+                    weight_used: 1,
+                    contended: false,
+                    measurement_id: None,
+                    extra: Default::default(),
+                };
+                task_traffic_controller::history::append(context.paths.history_file(), &record)
+                    .unwrap();
+            }
+            apply_ci_history(&context, &Digest::of_bytes(b"other-profile"), &mut req).unwrap();
+            assert!(req
+                .workload
+                .nodes
+                .iter()
+                .all(|node| node.predicted_runtime_ms.is_none()));
+            apply_ci_history(&context, &profile, &mut req).unwrap();
+            let (answer, _) = run(&insp(4, calm(), vec![]), &req, &[]);
+            assert_eq!(answer.target.runtime_source, RuntimeSource::Measured);
+            assert_eq!(answer.target.ready_in_ms, Some(4_000));
+            assert_eq!(answer.target.execution_ms, Some(35_000));
+            assert_eq!(answer.target.finish_in_ms, Some(39_000));
+            assert_eq!(answer.coverage[0].node_ids.len(), 3);
+        }
+    }
+
+    #[test]
     fn a10_a_chain_reports_the_end_of_the_last_step() {
         let a = AttemptId::generate();
         let mut setup = node(&a, "setup", Some(10_000));
@@ -858,6 +1110,49 @@ mod tests {
             &[],
         );
         assert_eq!(ans.target.finish_in_ms, Some(80_000));
+    }
+
+    #[test]
+    fn a_toolchain_install_an_attempt_waits_for_is_demand_ahead_and_said() {
+        let a = AttemptId::generate();
+        let b = AttemptId::generate();
+        let req = request(plan_of(&a, vec![node(&a, "main", Some(10_000))]), vec![]);
+        // One slot: the install queues ahead of the target.
+        let one = insp(1, calm(), vec![]);
+        let alone = run(&one, &req, &[]).0;
+        let installs =
+            plan::install_nodes(&b, &Digest::of_bytes(b"p"), 2).expect("node ids are valid");
+        let with = run(&one, &req, &installs).0;
+        assert!(!alone
+            .target
+            .assumptions
+            .join("\n")
+            .contains("toolchain installs"));
+        assert!(with
+            .target
+            .assumptions
+            .join("\n")
+            .contains("toolchain installs"));
+        // An install's time is not measured: the finish is unknown, never an
+        // eta that leaves it out.
+        assert_eq!(alone.target.finish_in_ms, Some(10_000));
+        assert_eq!(with.target.finish_in_ms, None);
+        assert_reasons_match(&with);
+        // A finished one is no demand and no note.
+        let done: Vec<_> = installs
+            .into_iter()
+            .map(|n| AcceptedNode {
+                terminal: true,
+                ..n
+            })
+            .collect();
+        let after = run(&one, &req, &done).0;
+        assert_eq!(after.target.finish_in_ms, alone.target.finish_in_ms);
+        assert!(!after
+            .target
+            .assumptions
+            .join("\n")
+            .contains("toolchain installs"));
     }
 
     #[test]

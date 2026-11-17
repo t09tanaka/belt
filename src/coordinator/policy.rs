@@ -229,6 +229,33 @@ pub fn may_send(facts: Facts) -> bool {
 
 /// What a worker that cannot be given a CI task lacks, as a placement
 /// records it for the worker it left out.
+pub fn unmet_ci(spec: &super::TaskSpec, link: &dyn super::WorkerLink) -> Option<&'static str> {
+    if let Some(reason) = missing_ci_feature(
+        spec,
+        link.ci_task_negotiated(),
+        link.ci_discovery_negotiated(),
+    ) {
+        return Some(reason);
+    }
+    if spec
+        .ci
+        .as_ref()
+        .is_some_and(|ci| ci.task.dispatch.is_some())
+        && !link.matrix_dispatch_negotiated()
+    {
+        return Some("protocol feature ci_matrix_dispatch_v1");
+    }
+    if spec
+        .ci
+        .as_ref()
+        .is_some_and(|ci| ci.task.artifact_workflow.is_some())
+        && !link.workflow_artifacts_negotiated()
+    {
+        return Some("protocol feature ci_workflow_artifacts_v1");
+    }
+    None
+}
+
 pub const CI_TASK_UNMET: &str = "protocol feature ci_task_v1";
 
 /// Is a worker left out of the placement of `spec` because the task is a CI
@@ -284,12 +311,18 @@ pub fn workload_of_spec(
     ready_delay_ms: Option<u64>,
 ) -> crate::wire::WorkloadPlan {
     match &spec.ci {
-        Some(ci) => crate::scheduler::ci_workload_of(
-            attempt_id,
-            &spec.plan_digest,
-            ci.steps,
-            ready_delay_ms,
-        ),
+        Some(ci) => {
+            let mut workload = crate::scheduler::ci_workload_of(
+                attempt_id,
+                &spec.plan_digest,
+                ci.steps,
+                ready_delay_ms,
+            );
+            for (node, key) in workload.nodes.iter_mut().zip(&ci.history_keys) {
+                node.ci_history_key.clone_from(key);
+            }
+            workload
+        }
         None => crate::scheduler::workload_of(
             attempt_id,
             &spec.plan_digest,
@@ -318,9 +351,15 @@ mod tests {
         let digest = crate::ids::Digest::of_bytes(b"plan");
         crate::coordinator::TaskSpec {
             ci: ci.then(|| crate::coordinator::CiSpec {
+                history_keys: Vec::new(),
+                dynamic_origin: false,
+                core_outcome: None,
+                matrix: None,
                 shard_retry_forbidden: false,
                 shard_preferred_worker: None,
                 task: crate::wire::CiTask {
+                    artifact_workflow: None,
+                    dispatch: None,
                     plan_digest: digest.clone(),
                     task_id: "ci.yml/build".into(),
                     inputs: serde_json::json!({"needs": {}}),

@@ -18,6 +18,10 @@ pub struct Run {
     pub closed_at_ms: Option<u64>,
     pub task_count: u64,
     pub facts: RunFacts,
+    /// What became of the GitHub status of the run (`show` of one run
+    /// only): the computed result and the posting, kept apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_status: Option<serde_json::Value>,
 }
 /// Public immutable export metadata. Execution identities and declaration paths stay private.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,7 +270,7 @@ impl CoordinatorStore {
             let c=c.unchecked_transaction()?;
             let mut q=c.prepare("SELECT r.run_id,r.created_at_ms,r.closed_at_ms,(SELECT count(*) FROM task t WHERE t.run_id=r.run_id) FROM run r WHERE r.run_id > coalesce(?1,'') ORDER BY r.run_id LIMIT ?2")?;
             let raw=q.query_map(params![after.map(String::from),bound],|r|Ok((r.get::<_,String>(0)?,r.get::<_,i64>(1)?,r.get::<_,Option<i64>>(2)?,r.get::<_,i64>(3)?)))?.collect::<std::result::Result<Vec<_>,_>>()?;
-            let items=raw.into_iter().map(|(rid,created,closed,count)|Ok(Run{facts:run_facts(&c,&rid,cancel,collections)?,run_id:id("run",RunId::parse(&rid))?,created_at_ms:to_u64(created)?,closed_at_ms:closed.map(to_u64).transpose()?,task_count:to_u64(count)?})).collect::<Result<Vec<_>>>()?;
+            let items=raw.into_iter().map(|(rid,created,closed,count)|Ok(Run{github_status:None,facts:run_facts(&c,&rid,cancel,collections)?,run_id:id("run",RunId::parse(&rid))?,created_at_ms:to_u64(created)?,closed_at_ms:closed.map(to_u64).transpose()?,task_count:to_u64(count)?})).collect::<Result<Vec<_>>>()?;
             Ok(page(items,n,|r|r.run_id.to_string()))
         })
     }
@@ -275,7 +279,7 @@ impl CoordinatorStore {
         self.db.call(move |c| {
             let c=c.unchecked_transaction()?;
             let raw=c.query_row("SELECT created_at_ms,closed_at_ms,(SELECT count(*) FROM task WHERE run_id=?1) FROM run WHERE run_id=?1",[run.as_str()],|r|Ok((r.get::<_,i64>(0)?,r.get::<_,Option<i64>>(1)?,r.get::<_,i64>(2)?))).optional()?;
-            raw.map(|(created,closed,count)|Ok(Run{facts:run_facts(&c,run.as_str(),cancel,collections)?,run_id:run,created_at_ms:to_u64(created)?,closed_at_ms:closed.map(to_u64).transpose()?,task_count:to_u64(count)?})).transpose()
+            raw.map(|(created,closed,count)|Ok(Run{github_status:super::ci::github_status(&c,run.as_str())?,facts:run_facts(&c,run.as_str(),cancel,collections)?,run_id:run,created_at_ms:to_u64(created)?,closed_at_ms:closed.map(to_u64).transpose()?,task_count:to_u64(count)?})).transpose()
         })
     }
     pub fn query_tasks(&self, run: RunId, n: u32, after: Option<TaskId>) -> Result<Page<Task>> {

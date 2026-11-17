@@ -54,6 +54,9 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    EnvReport {
+        worker: WorkerId,
+    },
     ResolveToolchains {
         bundle: crate::toolchain::contract::FrozenBundle,
         requirements: crate::toolchain::capability::ExecutionRequirements,
@@ -86,6 +89,16 @@ pub enum Operation {
     /// Re-read the private worker registration and dial workers added since
     /// startup. Never disconnects or changes a worker that is already dialed.
     ReloadWorkers,
+    ListWorkers {
+        names: Vec<WorkerId>,
+    },
+    /// `workers forget`: the user declared an ephemeral worker gone. Refused
+    /// for a persistent worker and for one that is connected. A resident
+    /// older than this operation cannot read the request and closes the
+    /// connection.
+    ForgetWorker {
+        worker: WorkerId,
+    },
     /// Which binary this resident runs and what it offers and requires of a
     /// worker in `hello`. A resident older than this operation cannot read
     /// the request and closes the connection.
@@ -106,6 +119,12 @@ pub enum Operation {
     Query {
         query: super::query::Query,
     },
+    /// Keep what became of the GitHub status of a run (posted by the caller,
+    /// on the parent). The record holds no credential.
+    RecordStatus {
+        run_id: RunId,
+        record: crate::ci::status::Record,
+    },
     Shutdown,
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -119,6 +138,9 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
+    EnvReport {
+        environment: crate::toolchain::envdiff::EnvReport,
+    },
     ResolvedToolchains {
         bundle: crate::toolchain::contract::FrozenBundle,
     },
@@ -140,9 +162,18 @@ pub enum Reply {
     Ready {
         epoch: CoordinatorEpoch,
     },
+    WorkersListed {
+        observations: BTreeMap<WorkerId, (bool, Option<String>)>,
+    },
     WorkersReloaded {
         /// The workers this request started dialing.
         connecting: Vec<String>,
+    },
+    WorkerForgotten {
+        /// Whether an identity was recorded for the worker and is retired now.
+        identity_retired: bool,
+        /// The attempts that were ended, oldest first.
+        ended: Vec<AttemptId>,
     },
     Build {
         /// SHA-256 of the executable, read when the resident started.
@@ -326,6 +357,8 @@ impl Client {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "parent connect timeout"))??;
         let response_timeout = if matches!(&operation, Operation::SubmitCaptured { .. }) {
             Duration::from_secs(300)
+        } else if matches!(&operation, Operation::EnvReport { .. }) {
+            Duration::from_secs(65)
         } else {
             IO_TIMEOUT
         };
@@ -627,9 +660,6 @@ async fn connect_local(
     tokio::task::JoinHandle<()>,
     crate::protocol::Client,
     Arc<crate::coordinator::InputGate>,
-    bool,
-    bool,
-    bool,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
@@ -662,21 +692,6 @@ async fn connect_local(
             return Err(e.into());
         }
     };
-    let probe = connected
-        .negotiated
-        .features
-        .iter()
-        .any(|feature| feature == crate::wire::PREPARATION_PROBE_FEATURE);
-    let observations = connected
-        .negotiated
-        .features
-        .iter()
-        .any(|feature| feature == crate::setup::observation_transport::FEATURE);
-    let env_sync = connected
-        .negotiated
-        .features
-        .iter()
-        .any(|feature| feature == crate::wire::ENV_SYNC_FEATURE);
     let worker_client = connected.client.clone();
     let provenance = Digest::of_bytes(&serde_json::to_vec(
         &serde_json::json!({"transport":"local-private-rpc-v1","protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"timeout_ms":parts.worker_timeout.as_millis()}),
@@ -684,20 +699,6 @@ async fn connect_local(
     let input_gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(
         provenance.to_string(),
     ));
-    input_gate.set_ci_discovery(
-        connected
-            .negotiated
-            .features
-            .iter()
-            .any(|f| f == crate::wire::CI_DISCOVERY_FEATURE),
-    );
-    input_gate.set_ci_task(
-        connected
-            .negotiated
-            .features
-            .iter()
-            .any(|feature| feature == crate::wire::CI_TASK_FEATURE),
-    );
     input_gate
         .observe(
             connected.worker.worker_boot_id.clone(),
@@ -705,25 +706,18 @@ async fn connect_local(
         )
         .await;
     if let Err(e) = config
-        .attach_worker(
+        .attach_gated_worker(
             &parts.coordinator,
             WorkerTarget::Local(&parts.worker_id),
             connected,
+            input_gate.clone(),
         )
         .await
     {
         worker_connection.abort();
         anyhow::bail!(e.message);
     }
-    Ok((
-        listener,
-        worker_connection,
-        worker_client,
-        input_gate,
-        observations,
-        probe,
-        env_sync,
-    ))
+    Ok((listener, worker_connection, worker_client, input_gate))
 }
 
 impl Resident {
@@ -766,34 +760,15 @@ impl Resident {
         })
         .await??;
         let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection, worker_client, input_gate, observations, probe, env_sync) =
-            match connected {
-                Ok(value) => value,
-                Err(e) => {
-                    tokio::task::spawn_blocking(move || startup.cleanup()).await?;
-                    return Err(e);
-                }
-            };
+        let (listener, worker_connection, worker_client, input_gate) = match connected {
+            Ok(value) => value,
+            Err(e) => {
+                tokio::task::spawn_blocking(move || startup.cleanup()).await?;
+                return Err(e);
+            }
+        };
         let parts = startup.parts.take().expect("prepared startup");
 
-        parts
-            .coordinator
-            .attach(
-                parts.worker_id.clone(),
-                Arc::new(
-                    crate::coordinator::ClientLink::gated(
-                        worker_client.clone(),
-                        parts.worker_timeout,
-                        input_gate.clone(),
-                    )
-                    .with_preparation_observations(observations)
-                    .with_preparation_probe(probe)
-                    .with_env_sync(env_sync)
-                    .with_ci_task(input_gate.ci_task())
-                    .with_ci_discovery(input_gate.ci_discovery()),
-                ),
-            )
-            .await;
         Ok(Self {
             remote_config,
             remote_env: inputs_env,
@@ -845,7 +820,7 @@ impl Resident {
                 rx.clone(),
             ));
         }
-        let (reload_tx, mut reload_rx) = mpsc::channel::<oneshot::Sender<Reply>>(4);
+        let (reload_tx, mut reload_rx) = mpsc::channel::<Control>(4);
         let (base, env, local) = (
             self.remote_config.clone(),
             self.remote_env.clone(),
@@ -948,8 +923,19 @@ impl Resident {
                     match result { Some(Ok(Err(e))) => failure = Some(e), Some(Err(e)) => failure = Some(e.into()), _ => {} }
                     break;
                 },
-                Some(answer) = reload_rx.recv() => {
+                Some(control) = reload_rx.recv() => {
                     let (base, env, local) = (base.clone(), env.clone(), local.clone());
+                    let answer = match control {
+                        Control::Reload(answer) => answer,
+                        Control::Forget(worker, answer) => {
+                            // Off this loop: it waits for the coordinator's actor.
+                            let coordinator = self.coordinator.clone();
+                            requests.spawn(async move {
+                                let _ = answer.send(remote::forget(&coordinator, &base, &env, &local, &worker).await);
+                            });
+                            continue;
+                        }
+                    };
                     let fresh = tokio::task::spawn_blocking(move || remote::reload(&base, &env, &local)).await;
                     let reply = match fresh {
                         Ok(Ok(fresh)) => {
@@ -1143,6 +1129,12 @@ where
         Err(error) => error_reply(error),
     })
 }
+/// What a request asks of the resident's own loop, which holds the worker
+/// registration.
+enum Control {
+    Reload(oneshot::Sender<Reply>),
+    Forget(WorkerId, oneshot::Sender<Reply>),
+}
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: UnixStream,
@@ -1154,7 +1146,7 @@ async fn handle(
     client: Client,
     admission: Arc<Mutex<bool>>,
     stop: watch::Sender<bool>,
-    reload: mpsc::Sender<oneshot::Sender<Reply>>,
+    reload: mpsc::Sender<Control>,
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
@@ -1191,6 +1183,18 @@ async fn handle(
         .await?;
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
+    if let Operation::ListWorkers { names } = &request.operation {
+        let reply = match coordinator.worker_observations(names.clone()).await {
+            Ok(observations) => Reply::WorkersListed { observations },
+            Err(error) => Reply::ControlError {
+                error: crate::error::ApiError::new(
+                    crate::error::ErrorCode::Internal,
+                    error.to_string(),
+                ),
+            },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     if matches!(request.operation, Operation::Build) {
         // The digest may still be being read; the runtime does not wait for it.
         let build = tokio::task::spawn_blocking(own_build).await?;
@@ -1198,9 +1202,21 @@ async fn handle(
             .await
             .map_err(Into::into);
     }
-    if matches!(request.operation, Operation::ReloadWorkers) {
+    let control = match &request.operation {
+        Operation::ReloadWorkers => Some((None, "the resident did not finish the reload in time")),
+        Operation::ForgetWorker { worker } => Some((
+            Some(worker.clone()),
+            "the resident did not answer in time; whether the worker was forgotten is not known, run workers forget again",
+        )),
+        _ => None,
+    };
+    if let Some((forget, late)) = control {
         let (answer, wait) = oneshot::channel();
-        let reply = if reload.send(answer).await.is_err() {
+        let control = match forget {
+            Some(worker) => Control::Forget(worker, answer),
+            None => Control::Reload(answer),
+        };
+        let reply = if reload.send(control).await.is_err() {
             Reply::Stopping
         } else {
             match tokio::time::timeout(Duration::from_secs(4), wait).await {
@@ -1208,7 +1224,7 @@ async fn handle(
                 _ => Reply::ControlError {
                     error: crate::error::ApiError::new(
                         crate::error::ErrorCode::CommunicationUnknown,
-                        "the resident did not finish the reload in time",
+                        late,
                     ),
                 },
             }
@@ -1226,6 +1242,17 @@ async fn handle(
         let reply = match coordinator.estimate(query).await {
             Ok(estimate) => Reply::Estimate { estimate },
             Err(error) => Reply::ControlError { error },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
+    if let Operation::EnvReport { worker } = request.operation {
+        let mut stopping = stop.subscribe();
+        let reply = tokio::select! {
+            _ = stopping.changed() => Reply::Stopping,
+            result = coordinator.env_report(&worker) => match result {
+                Ok(environment) => Reply::EnvReport { environment },
+                Err(error) => Reply::ControlError { error },
+            }
         };
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
@@ -1379,7 +1406,10 @@ async fn handle(
                 },
             },
             // Answered before admission; never reaches this match.
-            Operation::ReloadWorkers | Operation::Build => Reply::Error {
+            Operation::ListWorkers { .. }
+            | Operation::ReloadWorkers
+            | Operation::ForgetWorker { .. }
+            | Operation::Build => Reply::Error {
                 message: "handled outside admission".into(),
             },
             Operation::Ping => Reply::Ready {
@@ -1589,9 +1619,29 @@ async fn handle(
                     },
                 }
             }
+            Operation::RecordStatus { run_id, record } => {
+                let (coordinator, run) = (coordinator.clone(), run_id.clone());
+                let kept = tokio::task::spawn_blocking(move || {
+                    let record = serde_json::to_value(&record)
+                        .map_err(|e| crate::storage::StorageError::Invalid(e.to_string()))?;
+                    coordinator.store().record_github_status(
+                        &run,
+                        &record,
+                        crate::platform::clock::wall_ms(),
+                    )
+                })
+                .await?;
+                match kept {
+                    Ok(()) => Reply::Accepted { run_id },
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                }
+            }
             Operation::Query { .. }
             | Operation::Estimate { .. }
             | Operation::EstimateTask { .. }
+            | Operation::EnvReport { .. }
             | Operation::EnvSync { .. }
             | Operation::ResolveToolchains { .. } => {
                 unreachable!("read handled before admission")

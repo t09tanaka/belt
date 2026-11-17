@@ -11,14 +11,11 @@
 use crate::common::{alive, read_pid};
 use crate::worker_agent;
 use remote_task_runner::coordinator::policy::Limits;
-use remote_task_runner::coordinator::ClientLink;
 use remote_task_runner::coordinator::{
     Coordinator, CoordinatorConfig, CoordinatorError, LinkError, TaskSpec, WorkerLink,
 };
 use remote_task_runner::error::{ApiError, BlockedReason, ConflictReason, ErrorCode};
 use remote_task_runner::ids::*;
-use remote_task_runner::protocol::transport::duplex_pair;
-use remote_task_runner::protocol::{connect, ClientConfig};
 use remote_task_runner::results::{CollectConfig, CollectReport, ResultStore};
 use remote_task_runner::scheduler::{CostModel, Scheduler, SchedulerConfig, UnknownCosts};
 use remote_task_runner::state::{
@@ -27,7 +24,6 @@ use remote_task_runner::state::{
 use remote_task_runner::storage::{AttemptRecord, CoordinatorStore, StorageError};
 use remote_task_runner::wire::*;
 use remote_task_runner::worker::policy::{load_counts, retire_status};
-use remote_task_runner::worker::serve::serve_connection;
 use remote_task_runner::worker::Agent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
@@ -36,7 +32,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::sync::Semaphore;
 
 // ------------------------------------------------------------ the workers
 
@@ -1822,47 +1817,13 @@ async fn a_run_without_a_command_is_refused_whole() {
 
 // ------------------------------------------------- against a real worker
 
-/// A link that carries one retire out and loses its answer.
-struct LoseRetireAnswer {
-    inner: ClientLink,
-    armed: AtomicBool,
-}
-
-impl WorkerLink for LoseRetireAnswer {
-    fn call(
-        &self,
-        request: Request,
-    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
-        Box::pin(async move {
-            let lose = matches!(request, Request::RetireAttempt(_))
-                && self.armed.swap(false, Ordering::SeqCst);
-            let answer = self.inner.call(request).await;
-            if lose {
-                Err(LinkError::Unconfirmed)
-            } else {
-                answer
-            }
-        })
-    }
-}
-
-/// A connection of this coordinator (its cluster, id and epoch) to the agent.
+/// Use the same real worker transport and lost-answer injection as the one-host scenarios.
 async fn link_to(c: &Coordinator, agent: &Arc<Agent>, lose_retire: bool) -> Arc<dyn WorkerLink> {
-    let (near, far) = duplex_pair(64 * 1024);
-    let cluster = c.store().cluster_id().clone();
-    let permits = Arc::new(Semaphore::new(64));
-    tokio::spawn(serve_connection(
-        agent.clone(),
-        far,
-        cluster.clone(),
-        permits,
-    ));
-    let cfg = ClientConfig::new(cluster, c.store().coordinator_id().clone(), c.epoch());
-    let client = connect(near, cfg).await.unwrap().client;
-    Arc::new(LoseRetireAnswer {
-        inner: ClientLink::new(client, Duration::from_secs(30)),
-        armed: AtomicBool::new(lose_retire),
-    })
+    let faults = Arc::new(crate::one_host::Faults::default());
+    if lose_retire {
+        faults.lose(Operation::RetireAttempt, Lost::Answer);
+    }
+    crate::one_host::connect_agent(c, agent.clone(), faults).await
 }
 
 fn count_lines(p: &std::path::Path) -> usize {

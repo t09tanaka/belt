@@ -244,7 +244,7 @@ impl CoordinatorStore {
 fn unjoin(c: &Connection, run: &RunId, group: &str) -> Result<()> {
     c.execute(
         "UPDATE task SET spec_json=json_remove(spec_json,'$.ci.joined','$.ci.join_failure','$.ci.rerun')
-         WHERE run_id=?1 AND json_extract(spec_json,'$.ci.shard_group')=?2",
+         WHERE run_id=?1 AND coalesce(json_extract(spec_json,'$.ci.shard_group'),json_extract(spec_json,'$.ci.matrix.group'))=?2",
         params![run.as_str(), group],
     )?;
     Ok(())
@@ -296,10 +296,10 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                 "SELECT t.task_id,t.min_generation,a.generation,a.state,a.observation,a.termination_json,a.retired,
                  EXISTS(SELECT 1 FROM attempt x LEFT JOIN retire_tombstone z USING(attempt_id) WHERE x.task_id=t.task_id AND x.retired=0 AND (x.state<>'terminal' OR (z.attempt_id IS NOT NULL AND z.confirmed_at_ms IS NULL))),
                  json_extract(t.spec_json,'$.manifest_digest'),json_extract(t.spec_json,'$.has_secret_bundle'),coalesce(json_extract(t.spec_json,'$.in_place'),0),
-                 t.cancel_requested_at_ms IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.unrunnable'),'')=?5,
-                 coalesce(json_extract(t.spec_json,'$.ci.rerun'),0),json_extract(t.spec_json,'$.ci.shard_group'),coalesce(json_extract(t.spec_json,'$.ci.shard_retry_forbidden'),0)
+                 t.cancel_requested_at_ms IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.unrunnable'),'') IN (?5,?6),
+                 coalesce(json_extract(t.spec_json,'$.ci.rerun'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')),coalesce(json_extract(t.spec_json,'$.ci.shard_retry_forbidden'),0)
                  FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id ORDER BY aa.generation DESC LIMIT 1)
-                 WHERE t.run_id=?1 AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.rtr_discovery.applied'),0)=0 AND (?2 IS NULL OR t.task_id=?2) AND t.task_id>?3 ORDER BY t.task_id LIMIT ?4",
+                 WHERE t.run_id=?1 AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.rtr_discovery.applied'),0)=0 AND coalesce(json_extract(t.spec_json,'$.ci.dynamic_origin'),0)=0 AND (?2 IS NULL OR t.task_id=?2) AND t.task_id>?3 ORDER BY t.task_id LIMIT ?4",
             )?;
             let rows = stmt.query_map(
                 params![
@@ -307,7 +307,8 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                     binding.selected,
                     after,
                     PAGE,
-                    crate::ci::shards::FAIL_FAST_REASON
+                    crate::ci::shards::FAIL_FAST_REASON,
+                    crate::ci::advance::MATRIX_FAIL_FAST_REASON
                 ],
                 |r| {
                     Ok(TaskRow {
@@ -436,6 +437,14 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
                 unjoined.extend(row.shard_group);
             }
         }
+    }
+    if let Some(revision) = authorize {
+        c.execute("UPDATE task SET spec_json=json_remove(spec_json,'$.ci.core_outcome') WHERE run_id=?1 AND json_extract(spec_json,'$.ci.dynamic_origin')=1", [binding.run.as_str()])?;
+        // A matrix run's driver binds the inputs again before each retried task is released.
+        c.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.hold',json('true'))
+            WHERE run_id=?1 AND authorization_revision=?2 AND EXISTS(
+                SELECT 1 FROM task m WHERE m.run_id=?1 AND (json_type(m.spec_json,'$.ci.matrix')='object' OR json_extract(m.spec_json,'$.ci.dynamic_origin')=1))",
+            params![binding.run.as_str(),to_i64(revision)?])?;
     }
     for group in &unjoined {
         unjoin(c, &binding.run, group)?;

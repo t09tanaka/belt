@@ -2,7 +2,7 @@
 //! No detached fallback, native stop, PID signalling or automatic upgrade.
 use super::{
     bootstrap::{self, Spec},
-    macos::{self, DirectoryFiles, Launcher, LoadedState, ManagedFiles},
+    macos::{self, policy::Backend, DirectoryFiles, Launcher, LoadedState, ManagedFiles},
     resident,
 };
 use crate::{
@@ -62,9 +62,27 @@ struct Paths {
     input: PathBuf,
     services: PathBuf,
     journal: PathBuf,
+    /// The service manager the coordinator is registered with. The managed
+    /// file's place and form follow it.
+    backend: Backend,
+}
+/// Where the service manager reads the coordinator's managed file: the
+/// user's LaunchAgents, or the user's systemd units beside the
+/// configuration directory.
+fn services_dir(backend: Backend, home: &Path, config: &Path) -> anyhow::Result<PathBuf> {
+    Ok(match backend {
+        Backend::Launchd => home.join("Library/LaunchAgents"),
+        Backend::Systemd => {
+            super::systemd::policy::user_unit_dir(config.parent().context("config home")?)
+        }
+    })
 }
 impl Paths {
+    #[cfg(test)]
     fn resolve(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
+        Self::resolve_for(env, Backend::Launchd)
+    }
+    fn resolve_for(env: &BTreeMap<String, String>, backend: Backend) -> anyhow::Result<Self> {
         let home = PathBuf::from(env.get("HOME").context("HOME is required")?);
         // A relative XDG_CONFIG_HOME is refused here, not silently ignored.
         if let Some(x) = env.get("XDG_CONFIG_HOME") {
@@ -81,7 +99,7 @@ impl Paths {
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/state"))
             .join("rtr");
-        let services = home.join("Library/LaunchAgents");
+        let services = services_dir(backend, &home, &config)?;
         // Every path that is used is checked, before anything is created. HOME
         // is judged only through the paths made from it: a state or
         // configuration directory named by XDG_* stands on its own components.
@@ -96,6 +114,7 @@ impl Paths {
             services,
             journal: config.join("init.json"),
             config,
+            backend,
         })
     }
 }
@@ -192,6 +211,21 @@ struct Journal {
     database: Option<Proof>,
     cluster: Option<ClusterId>,
     coordinator: Option<CoordinatorId>,
+    /// The service is a systemd user unit (Linux), not a LaunchAgent. Left
+    /// out for launchd, so a journal written on macOS reads as before. The
+    /// journal says it, not the machine that reads it: a process that checks
+    /// a managed service looks for the file where init put it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    systemd: bool,
+}
+impl Journal {
+    fn backend(&self) -> Backend {
+        if self.systemd {
+            Backend::Systemd
+        } else {
+            Backend::Launchd
+        }
+    }
 }
 struct JournalFile {
     path: PathBuf,
@@ -441,7 +475,11 @@ fn plan(paths: &Paths, j: &Journal) -> anyhow::Result<macos::policy::Plan> {
         .filter(|(k, _)| !matches!(k.as_str(), "XDG_CONFIG_HOME" | "XDG_STATE_HOME"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    macos::policy::render(&macos::policy::Definition {
+    let render = match paths.backend {
+        Backend::Launchd => macos::policy::render,
+        Backend::Systemd => super::systemd::policy::render,
+    };
+    render(&macos::policy::Definition {
         label,
         mode: macos::policy::Mode::User { uid: j.uid },
         executable: j.spec.executable.clone(),
@@ -455,6 +493,10 @@ fn validate_journal(j: &Journal, p: &Paths, uid: u32, digest: &str) -> anyhow::R
     ensure!(
         j.schema_version == 1 && j.uid == uid,
         "foreign init journal"
+    );
+    ensure!(
+        j.backend() == p.backend,
+        "the init journal was written for another service manager; reconciliation required"
     );
     ensure!(
         j.binary_hash == digest,
@@ -515,7 +557,7 @@ async fn initialize_with_durability<L: Launcher>(
 ) -> anyhow::Result<ResultReceipt> {
     let uid = rustix::process::geteuid().as_raw();
     ensure!(uid > 0, "init requires a non-root user");
-    let paths = Paths::resolve(&context.env)?;
+    let paths = Paths::resolve_for(&context.env, launcher.backend())?;
     // Values rendered into the service must round-trip through `launchctl print`;
     // refuse before any file or directory is created.
     service_inputs_observable(&paths, &context.env)?;
@@ -586,6 +628,7 @@ async fn initialize_with_durability<L: Launcher>(
             },
             files: vec![],
             pending: None,
+            systemd: paths.backend == Backend::Systemd,
             plist: None,
             database: None,
             cluster: Some(cluster),
@@ -826,8 +869,9 @@ fn managed_journal(spec: &Spec) -> anyhow::Result<(Journal, Paths)> {
         worker: spec.worker_state_dir.clone(),
         key: spec.cluster_key_path.clone(),
         input: config.join("coordinator.json"),
-        services: home.join("Library/LaunchAgents"),
+        services: services_dir(j.backend(), &home, &config)?,
         journal: journal.clone(),
+        backend: j.backend(),
     };
     validate_journal(
         &j,
@@ -887,6 +931,10 @@ pub(crate) async fn managed_health<L: Launcher>(
     launcher: &mut L,
 ) -> anyhow::Result<()> {
     let (j, paths) = managed_journal(spec)?;
+    ensure!(
+        launcher.backend() == paths.backend,
+        "the managed service belongs to another service manager"
+    );
     let plan = plan(&paths, &j)?;
     let receipt = j.plist.as_ref().expect("validated");
     let before = launcher.running_identity(&plan, receipt).map_err(|_| {
@@ -919,42 +967,38 @@ pub(crate) async fn managed_health<L: Launcher>(
     Ok(())
 }
 
+/// `init`. The coordinator and its local worker run as one service of the
+/// host's service manager: a LaunchAgent on macOS, a systemd user unit on
+/// Linux (`HostLauncher::native`).
 pub fn command() -> Result<ResultReceipt, ApiError> {
-    #[cfg(not(target_os = "macos"))]
-    {
-        Err(ApiError::new(
-            ErrorCode::NotImplemented,
-            "persistent init requires the Linux systemd backend; no files were changed",
+    let context = ContextInput {
+        env: std::env::vars_os()
+            .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+            .collect(),
+        executable: std::env::current_exe()
+            .map_err(|_| ApiError::new(ErrorCode::InvalidInput, "cannot locate executable"))?,
+    };
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    runtime
+        .block_on(initialize(
+            context,
+            &mut super::worker_service::HostLauncher::native(),
         ))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        let context = ContextInput {
-            env: std::env::vars_os()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-                .collect(),
-            executable: std::env::current_exe()
-                .map_err(|_| ApiError::new(ErrorCode::InvalidInput, "cannot locate executable"))?,
-        };
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
-        runtime
-            .block_on(initialize(context, &mut macos::NativeLauncher::default()))
-            .map_err(|e| {
-                ApiError::new(
-                    if e.downcast_ref::<Unconfirmed>().is_some() {
-                        ErrorCode::CommunicationUnknown
-                    } else if e.downcast_ref::<InvalidServiceInput>().is_some() {
-                        ErrorCode::InvalidInput
-                    } else {
-                        ErrorCode::Conflict
-                    },
-                    format!("init: {e}"),
-                )
-            })
-    }
+        .map_err(|e| {
+            ApiError::new(
+                if e.downcast_ref::<Unconfirmed>().is_some() {
+                    ErrorCode::CommunicationUnknown
+                } else if e.downcast_ref::<InvalidServiceInput>().is_some() {
+                    ErrorCode::InvalidInput
+                } else {
+                    ErrorCode::Conflict
+                },
+                format!("init: {e}"),
+            )
+        })
 }
 #[cfg(test)]
 mod tests;

@@ -396,9 +396,10 @@ fn a_database_without_the_page_indexes_is_upgraded_to_have_them() {
     let dir = crate::test_tmp::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
+    // The step that adds the page indexes, wherever later steps put it.
     let before = all
         .iter()
-        .position(|step| step.contains("CREATE INDEX placement_unacked"))
+        .position(|step| step.contains("placement_unacked"))
         .unwrap();
     let old = db::open_with(
         &path,

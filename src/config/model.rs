@@ -30,6 +30,9 @@ pub struct Coordinator {
     pub stale_seconds: Option<u64>,
     pub lease_seconds: Option<u64>,
     pub term_grace_seconds: Option<u64>,
+    /// How long a worker keeps an install that `workers sync` started when
+    /// nobody asks about it any more, before it lets go of the install.
+    pub warmup_idle_seconds: Option<u64>,
     pub max_active_task: Option<u32>,
     pub log_spool_limit_bytes: Option<u64>,
     pub retention_days: Option<u32>,

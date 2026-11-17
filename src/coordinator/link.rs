@@ -215,6 +215,12 @@ pub trait WorkerLink: Send + Sync {
     fn ci_task_negotiated(&self) -> bool {
         false
     }
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        false
+    }
+    fn workflow_artifacts_negotiated(&self) -> bool {
+        false
+    }
 
     fn ci_discovery_negotiated(&self) -> bool {
         false
@@ -268,7 +274,9 @@ pub struct ClientLink {
     preparation_probe: bool,
     env_sync: bool,
     ci_task: bool,
+    matrix_dispatch: bool,
     ci_discovery: bool,
+    workflow_artifacts: bool,
 }
 
 impl ClientLink {
@@ -281,7 +289,9 @@ impl ClientLink {
             preparation_probe: false,
             env_sync: false,
             ci_task: false,
+            matrix_dispatch: false,
             ci_discovery: false,
+            workflow_artifacts: false,
         }
     }
 }
@@ -296,7 +306,9 @@ impl ClientLink {
             preparation_probe: false,
             env_sync: false,
             ci_task: false,
+            matrix_dispatch: false,
             ci_discovery: false,
+            workflow_artifacts: false,
         }
     }
 }
@@ -313,8 +325,18 @@ impl ClientLink {
         self.env_sync = negotiated;
         self
     }
+    pub fn with_matrix_dispatch(mut self, negotiated: bool) -> Self {
+        self.matrix_dispatch = negotiated;
+        self
+    }
+
     pub fn with_ci_discovery(mut self, negotiated: bool) -> Self {
         self.ci_discovery = negotiated;
+        self
+    }
+
+    pub fn with_workflow_artifacts(mut self, negotiated: bool) -> Self {
+        self.workflow_artifacts = negotiated;
         self
     }
     pub fn with_ci_task(mut self, negotiated: bool) -> Self {
@@ -331,6 +353,12 @@ impl WorkerLink for ClientLink {
     }
     fn env_sync_negotiated(&self) -> bool {
         self.env_sync
+    }
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.matrix_dispatch
+    }
+    fn workflow_artifacts_negotiated(&self) -> bool {
+        self.workflow_artifacts
     }
     fn ci_task_negotiated(&self) -> bool {
         self.ci_task
@@ -359,8 +387,13 @@ impl WorkerLink for ClientLink {
 
     fn read_only_call(&self, request: Request) -> LinkFuture<'_> {
         Box::pin(async move {
+            let timeout = if matches!(request, Request::EnvReport(_)) {
+                Duration::from_secs(60)
+            } else {
+                self.timeout
+            };
             self.client
-                .call(request, self.timeout)
+                .call(request, timeout)
                 .await
                 .map_err(|e| match e {
                     CallError::Remote(e) => LinkError::Remote(e),
@@ -421,6 +454,12 @@ impl WorkerLink for Budgeted {
     }
     fn env_sync_negotiated(&self) -> bool {
         self.inner.env_sync_negotiated()
+    }
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.inner.matrix_dispatch_negotiated()
+    }
+    fn workflow_artifacts_negotiated(&self) -> bool {
+        self.inner.workflow_artifacts_negotiated()
     }
     fn ci_task_negotiated(&self) -> bool {
         self.inner.ci_task_negotiated()

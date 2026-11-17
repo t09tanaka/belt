@@ -492,6 +492,40 @@ fn creating_an_attempt_with_a_bad_permit_leaves_no_attempt() {
     );
     assert!(r.is_err());
     assert!(f.store.list_nonterminal_attempts().unwrap().is_empty());
+    let other = RunId::generate();
+    f.store
+        .create_run(&other, None, None, &json!({}), 1)
+        .unwrap();
+    f.store.create_matrix_group("other", &other, 1, 1).unwrap();
+    f.store.create_matrix_group("mine", &f.run, 1, 1).unwrap();
+    let permit = PermitId::generate();
+    f.store
+        .acquire_permit("other", &permit, 1)
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        f.store.acquire_permit("mine", &permit, 1),
+        Err(StorageError::Invalid(_))
+    ));
+    let wrong_run = f.store.create_attempt(
+        NewAttempt {
+            attempt_id: AttemptId::generate(),
+            task_id: f.task.clone(),
+            worker_id: f.worker.clone(),
+            payload_hash: hash('a'),
+            permit_id: Some(permit.clone()),
+        },
+        1,
+    );
+    assert!(matches!(wrong_run, Err(StorageError::Invalid(_))));
+    assert!(f
+        .store
+        .get_permit(&permit)
+        .unwrap()
+        .unwrap()
+        .attempt_id
+        .is_none());
+    assert!(f.store.list_nonterminal_attempts().unwrap().is_empty());
     // The failed commit did not use up the task.
     f.attempt('a').unwrap();
 }
@@ -606,6 +640,24 @@ fn an_attempt_without_required_artifacts_is_collected_at_terminal() {
         .finalize_attempt(&a.attempt_id, done(Outcome::Failed), 2)
         .unwrap();
     assert!(f.store.mark_collected(&a.attempt_id, 3).unwrap());
+}
+
+#[test]
+fn forget_closes_pending_collection_and_preserves_a_reported_outcome() {
+    let f = fx();
+    let attempt = f.attempt('a').unwrap().attempt_id;
+    f.to_finalizing(&attempt);
+    f.store
+        .finalize_attempt(&attempt, done(Outcome::Succeeded), 30)
+        .unwrap();
+    for now in [40, 50] {
+        let forgotten = f.store.forget_worker(&f.worker, now).unwrap();
+        assert!(forgotten.ended.is_empty());
+        let row = f.store.collection(&attempt).unwrap().unwrap();
+        assert_eq!(row.closed_at_ms, Some(40));
+        let saved = f.store.get_attempt(&attempt).unwrap().unwrap();
+        assert_eq!(saved.termination, Some(done(Outcome::Succeeded)));
+    }
 }
 
 fn blob(r: &str, a: &AttemptId, kind: BlobKind, loc: &str) -> NewBlobRef {
@@ -2554,6 +2606,60 @@ fn a_run_is_queued_whole_or_not_at_all_and_in_the_order_given() {
 }
 
 #[test]
+fn matrix_placement_holds_the_global_slot_until_proven_stopped() {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let run = RunId::generate();
+    let a = TaskId::generate();
+    let b = TaskId::generate();
+    let spec = json!({"ci":{"matrix":{"group":"ci.yml::test","max_parallel":1}}});
+    store
+        .enqueue(
+            &run,
+            None,
+            &json!({}),
+            &[(a.clone(), spec.clone()), (b.clone(), spec)],
+            1,
+        )
+        .unwrap();
+    let first = placed(place_on(&store, &a, "w-a", 1));
+    let permit = first.permit_id.unwrap();
+    assert_eq!(
+        store
+            .get_permit(&permit)
+            .unwrap()
+            .unwrap()
+            .attempt_id
+            .as_ref(),
+        Some(&first.attempt_id)
+    );
+    store
+        .record_seen(&first.attempt_id, false, None, Observation::Unknown, 20)
+        .unwrap();
+    drop(store);
+    let store = CoordinatorStore::open(dir.path(), 21).unwrap();
+    assert_eq!(place_on(&store, &b, "w-b", 1), PlaceOutcome::MatrixFull);
+    assert!(store.attempts_of_task(&b).unwrap().is_empty());
+    store.begin_retire(&first.attempt_id, "move", 22).unwrap();
+    assert_eq!(place_on(&store, &b, "w-b", 1), PlaceOutcome::MatrixFull);
+    store.confirm_retire(&first.attempt_id, 23).unwrap();
+    assert!(!store.get_permit(&permit).unwrap().unwrap().held);
+    let second = placed(place_on(&store, &b, "w-b", 1));
+    let second_permit = second.permit_id.unwrap();
+    assert_ne!(second_permit, permit);
+    store
+        .record_seen(
+            &second.attempt_id,
+            true,
+            seen(AttemptState::Terminal, Some(done(Outcome::Succeeded))),
+            Observation::Known,
+            24,
+        )
+        .unwrap();
+    assert!(!store.get_permit(&second_permit).unwrap().unwrap().held);
+}
+
+#[test]
 fn placing_commits_the_attempt_and_its_unacked_demand_together() {
     let (_d, store, _run, ids) = queue_fx(2);
     let a = placed(place_on(&store, &ids[0], "w-a", 1));
@@ -2991,7 +3097,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     let all = schema::steps(DbKind::Coordinator);
     assert_eq!(
         all.len(),
-        11,
+        12,
         "this test is about step 1 and the steps after it"
     );
     let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
@@ -3104,7 +3210,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opened for writing, it is migrated, and every row is still there.
     let store = CoordinatorStore::open(dir.path(), 10).unwrap();
-    assert_eq!(schema_of(&store), ("11".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("12".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(4));
     assert_eq!(store.cluster_id(), &cluster);
     check_rows(&store);
@@ -3122,7 +3228,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opening again migrates nothing and loses nothing.
     let store = CoordinatorStore::open(dir.path(), 20).unwrap();
-    assert_eq!(schema_of(&store), ("11".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("12".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(5));
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);
@@ -3313,7 +3419,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     let dir = crate::test_tmp::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(all.len(), 11);
+    assert_eq!(all.len(), 12);
     let cluster = ClusterId::generate();
     let co = CoordinatorId::generate();
     let run = RunId::generate();
@@ -3368,7 +3474,7 @@ fn bounded_query_index_migrates_only_with_owner_and_preserves_rows() {
     }
     let owner = CoordinatorStore::open(dir.path(), 2).unwrap();
     let migrated = schema_info(&owner);
-    assert_eq!(migrated.0, "11");
+    assert_eq!(migrated.0, "12");
     assert_eq!(migrated.2, 3);
     assert!(migrated.1.is_some());
     let target_run = run.to_string();
@@ -4899,7 +5005,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP TABLE ci_test_timing; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));
@@ -5576,6 +5682,166 @@ fn live_attempts_of_a_worker_are_paged_without_gaps_repeats_or_other_rows() {
     assert!(f
         .store
         .live_attempt_subset(&other, &expected[..8])
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn the_github_status_of_a_run_is_kept_in_its_journal_and_the_last_one_is_shown() {
+    let f = fx();
+    assert_eq!(f.store.github_status_of(&f.run).unwrap(), None);
+    assert!(f
+        .store
+        .query_run(f.run.clone())
+        .unwrap()
+        .unwrap()
+        .github_status
+        .is_none());
+    let other = RunId::generate();
+    f.store
+        .create_run(&other, None, None, &json!({}), 1)
+        .unwrap();
+    let first = json!({"computed": "success", "posting": "failed", "error": "e"});
+    let last = json!({"computed": "success", "posting": "posted"});
+    f.store.record_github_status(&f.run, &first, 5).unwrap();
+    f.store
+        .record_github_status(&other, &json!({"posting": "skipped"}), 6)
+        .unwrap();
+    f.store.record_github_status(&f.run, &last, 7).unwrap();
+    // An event of another kind, and one of an attempt, are not the status.
+    f.store
+        .append_event(
+            Some(&f.run),
+            None,
+            "task_waiting",
+            &json!({"posting": "no"}),
+            8,
+        )
+        .unwrap();
+    assert_eq!(
+        f.store.github_status_of(&f.run).unwrap(),
+        Some(last.clone())
+    );
+    let shown = f.store.query_run(f.run.clone()).unwrap().unwrap();
+    assert_eq!(shown.github_status, Some(last));
+    assert_eq!(
+        f.store.github_status_of(&other).unwrap(),
+        Some(json!({"posting": "skipped"}))
+    );
+    // The list of runs stays without it.
+    let listed = f.store.query_runs(8, None).unwrap();
+    assert!(listed.items.iter().all(|run| run.github_status.is_none()));
+    // A run that does not exist keeps nothing.
+    let unknown = RunId::generate();
+    let refused = f
+        .store
+        .record_github_status(&unknown, &json!({}), 9)
+        .unwrap_err();
+    assert!(
+        matches!(refused, StorageError::NotFound { .. }),
+        "{refused}"
+    );
+    assert_eq!(f.store.github_status_of(&unknown).unwrap(), None);
+    // The read seeks the events of no attempt; it does not scan the journal.
+    let plan = f
+        .store
+        .db
+        .call(|c| {
+            let mut q = c.prepare("EXPLAIN QUERY PLAN SELECT payload_json FROM event WHERE attempt_id IS NULL AND run_id=?1 AND kind=?2 ORDER BY seq DESC LIMIT 1")?;
+            let rows = q.query_map(["r", "k"], |r| r.get::<_, String>(3))?;
+            Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+        })
+        .unwrap();
+    assert!(
+        plan.iter().any(|line| line.contains("event_attempt")),
+        "{plan:?}"
+    );
+}
+
+#[test]
+fn live_workflow_artifacts_require_durable_bytes_and_replay_the_original_version() {
+    use local_ci::artifact_io::{FileEntry, Receipt as Manifest};
+    let f = fx();
+    let attempt = f.attempt('a').unwrap().attempt_id;
+    let bytes = b"compiled output";
+    let digest = Digest::of_bytes(bytes);
+    let manifest = Manifest {
+        name: "build".into(),
+        version: 1,
+        files: vec![FileEntry {
+            path: "out/app".into(),
+            size: bytes.len() as u64,
+            sha256: digest.as_str().strip_prefix("sha256:").unwrap().into(),
+        }],
+        plan_digest: "plan".into(),
+        attempt_id: "run".into(),
+        job: "ci::build".into(),
+        display: "build".into(),
+        task: None,
+        retention_days: None,
+        compression_level: None,
+        restored_from: None,
+    };
+    let publish = |store: &CoordinatorStore, workflow: &str, key: &[u8], overwrite| {
+        store.publish_workflow_artifact(
+            WorkflowUpload {
+                run: &f.run,
+                workflow,
+                producer: &attempt,
+                key: &Digest::of_bytes(key),
+                overwrite,
+                receipt: manifest.clone(),
+            },
+            30,
+        )
+    };
+    assert!(publish(&f.store, "ci", b"first", false).is_err());
+    assert!(f.store.workflow_artifacts(&f.run, "ci").unwrap().is_empty());
+    let files = crate::results::ResultStore::open(&f._dir.path().join("results")).unwrap();
+    files.append_part(&attempt, &digest, 0, bytes).unwrap();
+    files
+        .publish_artifact(&attempt, &digest, bytes.len() as u64)
+        .unwrap();
+    assert_eq!(
+        publish(&f.store, "ci", b"first", false)
+            .unwrap()
+            .receipt
+            .version,
+        1
+    );
+    assert!(publish(&f.store, "ci", b"second", false).is_err());
+    assert_eq!(
+        publish(&f.store, "ci", b"second", true)
+            .unwrap()
+            .receipt
+            .version,
+        2
+    );
+    assert!(publish(&f.store, "ci", b"first", true).is_err());
+    assert_eq!(
+        publish(&f.store, "lint", b"lint", false)
+            .unwrap()
+            .receipt
+            .version,
+        1
+    );
+    drop(f.store);
+    let store = CoordinatorStore::open(f._dir.path(), 40).unwrap();
+    assert_eq!(
+        publish(&store, "ci", b"first", false)
+            .unwrap()
+            .receipt
+            .version,
+        1
+    );
+    assert_eq!(
+        store.workflow_artifacts(&f.run, "ci").unwrap()[0]
+            .receipt
+            .version,
+        2
+    );
+    assert!(store
+        .workflow_artifacts(&RunId::generate(), "ci")
         .unwrap()
         .is_empty());
 }

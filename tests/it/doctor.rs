@@ -288,6 +288,7 @@ fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
                 fingerprint: Some("sha256:f".into()),
                 error: None,
             },
+            linger: None,
         },
     }});
     // No machine that runs this test is this platform.

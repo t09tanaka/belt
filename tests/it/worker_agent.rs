@@ -2866,6 +2866,8 @@ async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot(
     let real = remote_task_runner::platform::boot_id().expect("this machine has a boot id");
     let f = fx();
     let mut cfg = f.cfg(&real);
+    let instance = WorkerBootId::parse("ephemeral-start").unwrap();
+    cfg.instance_id = Some(instance.clone());
     cfg.retire_wait_ms = 300;
     let agent = f.start_with(cfg.clone());
     let c = f.connect(&agent).await;
@@ -2901,6 +2903,7 @@ async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot(
     let Response::GetAttempt(status) = call(&c, get()).await.unwrap() else {
         panic!()
     };
+    assert_eq!(status.worker_boot_id, instance);
     assert_eq!(
         status.observation,
         remote_task_runner::state::Observation::Unknown
@@ -3343,6 +3346,7 @@ async fn the_agent_answers_a_forecast_and_writes_nothing() {
                 plan_digest: Digest::of_bytes(b"plan"),
                 expansion_seq: 0,
                 nodes: vec![WorkloadNode {
+                    ci_history_key: None,
                     node_id: n.clone(),
                     depends_on: vec![],
                     priority: 0,
@@ -4464,6 +4468,8 @@ fn ci_payload() -> AttemptPayload {
     let mut p = payload("true");
     p.commands.clear();
     p.ci_task = Some(remote_task_runner::wire::CiTask {
+        artifact_workflow: None,
+        dispatch: None,
         plan_digest: Digest::of_bytes(b"a plan this worker was never sent"),
         task_id: "ci.yml/build".into(),
         inputs: serde_json::json!({ "needs": {} }),
@@ -4733,6 +4739,8 @@ fn ci_fx(workflow: &str) -> CiFx {
         .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
         .unwrap();
     base.ci_task = Some(CiTask {
+        artifact_workflow: None,
+        dispatch: None,
         plan_digest,
         task_id: String::new(),
         inputs: serde_json::to_value(local_ci::TaskInputs::default()).unwrap(),
@@ -5445,4 +5453,162 @@ async fn an_attempt_stored_for_another_scope_starts_in_the_scope_of_the_worker()
     assert!(has("TASK_TRAFFIC_CONTROLLER_NESTED=inherit"), "{seen}");
     assert!(!seen.contains("XDG_CONFIG_HOME="), "{seen}");
     agent.shutdown();
+}
+
+#[test]
+fn asking_about_no_tool_lets_go_of_the_warm_up_at_once() {
+    let (f, agent) = warm_fx(|_| {});
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let sync = RequestId::generate();
+    env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert!(f.host.releases().is_empty());
+    let ended = env_sync(&agent, &sync, vec![]).unwrap();
+    assert!(ended.is_empty());
+    let first = f.host.tool_polls()[0].clone();
+    assert_eq!(f.host.releases(), vec![first]);
+    // Once: asking again, and the idle tick, let go of nothing more.
+    assert!(env_sync(&agent, &sync, vec![]).unwrap().is_empty());
+    agent.tick();
+    assert_eq!(f.host.releases().len(), 1);
+    // An id nobody knows starts nothing and is not remembered.
+    assert!(env_sync(&agent, &RequestId::generate(), vec![])
+        .unwrap()
+        .is_empty());
+    assert_eq!(f.host.tool_polls().len(), 1);
+    // The same id asked about its tool again is a new warm-up.
+    let again = env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(again[0].outcome, SyncOutcome::Pending);
+    assert_eq!(f.host.tool_polls().len(), 2);
+    assert_ne!(f.host.tool_polls()[1], f.host.tool_polls()[0]);
+    // A warm-up that was decided already let go of its install; ending it
+    // lets go of nothing a second time.
+    let decided = RequestId::generate();
+    *f.host.tool_poll.lock().unwrap() = Some(Some("no".into()));
+    let failed = env_sync(&agent, &decided, vec![tool("python", "3.12.0")]).unwrap();
+    assert_eq!(failed[0].outcome, SyncOutcome::Failed);
+    let released = f.host.releases().len();
+    env_sync(&agent, &decided, vec![]).unwrap();
+    assert_eq!(f.host.releases().len(), released);
+}
+
+#[test]
+fn ending_a_warm_up_during_a_look_lets_go_when_the_look_comes_back() {
+    let (f, agent) = warm_fx(|_| {});
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    f.host.tool_poll_hold.store(true, Ordering::SeqCst);
+    let sync = RequestId::generate();
+    let first = env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(first[0].outcome, SyncOutcome::Pending);
+    // The look hangs: ending the warm-up now cannot release its consumer
+    // (the look would create the reference again), so it waits for the look.
+    env_sync(&agent, &sync, vec![]).unwrap();
+    let consumer = f.host.tool_polls()[0].clone();
+    assert!(!f.host.releases().contains(&consumer));
+    f.host.tool_poll_hold.store(false, Ordering::SeqCst);
+    wait_for("the release after the look", || {
+        f.host.releases().contains(&consumer)
+    });
+    assert_eq!(f.host.releases(), vec![consumer.clone()]);
+    // Forgotten: the same id starts a fresh warm-up.
+    let again = env_sync(&agent, &sync, vec![tool("node", "20.0.0")]).unwrap();
+    assert_eq!(again[0].outcome, SyncOutcome::Pending);
+    assert_ne!(f.host.tool_polls().last().unwrap(), &consumer);
+}
+
+/// A forecast counts the installs an accepted attempt still waits for: they
+/// are demand ahead from acceptance on, and the answer says so. An attempt
+/// that needs no tool adds none.
+#[test]
+fn a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for() {
+    use remote_task_runner::toolchain::{contract::FrozenBundle, versions::*};
+    let (f, agent) = warm_fx(|_| {});
+    *f.host.tool_poll.lock().unwrap() = Some(None);
+    let session = Session {
+        coordinator_epoch: CoordinatorEpoch(1),
+    };
+    let ask = || {
+        let a = AttemptId::generate();
+        let n = NodeId::parse("main").unwrap();
+        let Response::Forecast(r) = agent
+            .handle(
+                session,
+                Request::Forecast(ForecastRequest {
+                    schema_version: SchemaVersion::CURRENT,
+                    request_id: RequestId::generate(),
+                    coordinator_epoch: CoordinatorEpoch(1),
+                    workload: WorkloadPlan {
+                        attempt_id: a.clone(),
+                        plan_digest: Digest::of_bytes(b"plan"),
+                        expansion_seq: 0,
+                        nodes: vec![WorkloadNode {
+                            node_id: n.clone(),
+                            depends_on: vec![],
+                            priority: 0,
+                            weight: Some(1),
+                            predicted_rss_bytes: Some(1),
+                            predicted_runtime_ms: Some(5_000),
+                            ci_history_key: None,
+                            external_delay_ms: None,
+                            ready_in_ms: Some(0),
+                            concurrency: ConcurrencyLimits::default(),
+                            correlation: Correlation {
+                                attempt_id: a.clone(),
+                                node_id: n,
+                                ledger_entry: None,
+                            },
+                            shared_builder: None,
+                        }],
+                    },
+                    pending: vec![],
+                }),
+            )
+            .unwrap()
+        else {
+            panic!("a forecast answer")
+        };
+        r
+    };
+    let said = |r: &ForecastResponse| r.target.assumptions.join("\n");
+    assert!(!said(&ask()).contains("toolchain installs"));
+    // An attempt without a frozen toolchain adds no install.
+    let mut plain = payload("exit 0");
+    plain.commands[0].env.clear();
+    agent
+        .handle(session, submit_req(&AttemptId::generate(), &plain))
+        .unwrap();
+    assert!(!said(&ask()).contains("toolchain installs"));
+    // One that waits for node 20.0.0 (not installed: the manager is never run).
+    let mut p = payload("exit 0");
+    p.commands[0].env.clear();
+    let scope = Scope::project("");
+    p.toolchains = Some(Box::new(
+        FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                p.manifest_digest.clone(),
+                Digest::of_bytes(b"parent"),
+                scope.clone(),
+                &[Declaration {
+                    tool: ToolId::parse("node").unwrap(),
+                    constraint: Constraint::parse("20.0.0").unwrap(),
+                    scope,
+                    location: Location {
+                        path: ".node-version".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &BTreeMap::new(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    ));
+    agent
+        .handle(session, submit_req(&AttemptId::generate(), &p))
+        .unwrap();
+    let r = ask();
+    assert!(said(&r).contains("toolchain installs"), "{}", said(&r));
+    assert!(r.target.conditional);
 }

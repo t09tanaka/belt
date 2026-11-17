@@ -10,9 +10,9 @@
 //! the stop.
 pub mod policy;
 
-use super::macos::native::{run_bounded, CommandOutput, CommandRunner, OUTPUT_LIMIT};
 use super::macos::policy::{Backend, Plan};
 use super::macos::{LaunchError, Launcher, LoadedState, Receipt, RunningIdentity};
+use super::manager_command::{run_bounded, CommandOutput, CommandRunner, OUTPUT_LIMIT};
 use std::time::Duration;
 
 const SYSTEMCTL: &str = "/usr/bin/systemctl";
@@ -44,7 +44,13 @@ impl CommandRunner for SystemctlRunner {
         } else {
             QUICK
         };
-        run_bounded(SYSTEMCTL, arguments, &self.env, deadline)
+        let env: &[(String, String)] = if arguments.first().is_some_and(|scope| scope == "--system")
+        {
+            &[]
+        } else {
+            &self.env
+        };
+        run_bounded(SYSTEMCTL, arguments, env, deadline)
     }
 }
 
@@ -70,7 +76,12 @@ impl<R: CommandRunner> SystemdLauncher<R> {
         if !output.success || !output.stderr.is_empty() || output.stdout.len() > OUTPUT_LIMIT {
             return Err(LaunchError::NotApplied("unit query unconfirmed".into()));
         }
-        policy::parse_show(&output.stdout).map_err(|why| LaunchError::NotApplied(why.into()))
+        let username = match plan.mode() {
+            super::macos::policy::Mode::User { .. } => None,
+            super::macos::policy::Mode::SystemUser { username, .. } => Some(username.as_str()),
+        };
+        policy::parse_show_for(&output.stdout, username)
+            .map_err(|why| LaunchError::NotApplied(why.into()))
     }
 }
 impl<R: CommandRunner> Launcher for SystemdLauncher<R> {

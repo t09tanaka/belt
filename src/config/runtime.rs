@@ -73,14 +73,14 @@ impl ResolvedConfig {
             return Err(invalid("worker hello cluster does not match coordinator"));
         }
         let id = &connected.worker.worker_id;
-        let priority = match target {
+        let (priority, ephemeral) = match target {
             WorkerTarget::Local(expected) => {
                 if !self.local_worker.value || expected != id {
                     return Err(invalid(
                         "local worker identity does not match configuration",
                     ));
                 }
-                self.local_worker_priority.value
+                (self.local_worker_priority.value, false)
             }
             WorkerTarget::Remote(name) => {
                 let worker = self
@@ -93,7 +93,7 @@ impl ResolvedConfig {
                         "worker hello identity does not match configured name",
                     ));
                 }
-                worker.priority.value
+                (worker.priority.value, worker.ephemeral)
             }
         };
         coordinator.scheduler().set_priority(id, priority);
@@ -113,6 +113,16 @@ impl ResolvedConfig {
             .features
             .iter()
             .any(|feature| feature == crate::wire::ENV_SYNC_FEATURE);
+        let workflow_artifacts = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|f| f == crate::wire::WORKFLOW_ARTIFACTS_FEATURE);
+        let matrix_dispatch = connected
+            .negotiated
+            .features
+            .iter()
+            .any(|f| f == crate::wire::MATRIX_DISPATCH_FEATURE);
         let discovery = connected
             .negotiated
             .features
@@ -136,9 +146,22 @@ impl ResolvedConfig {
             .with_preparation_probe(probe)
             .with_env_sync(env_sync)
             .with_ci_task(ci_task)
-            .with_ci_discovery(discovery),
+            .with_matrix_dispatch(matrix_dispatch)
+            .with_ci_discovery(discovery)
+            .with_workflow_artifacts(workflow_artifacts),
         );
-        coordinator.attach(id.clone(), link.clone()).await;
+        if ephemeral {
+            use crate::coordinator::identity::Admission;
+            match coordinator.attach_ephemeral(id.clone(), &connected.worker.worker_boot_id, link.clone())
+                .await.map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))? {
+                Admission::First | Admission::Same => {}
+                Admission::Retired => return Err(ApiError::new(ErrorCode::Conflict, "the worker identity was retired")),
+                Admission::Conflict => return Err(ApiError::new(ErrorCode::Conflict,
+                    "another identity holds this worker name; use workers forget once the previous worker is gone")),
+            }
+        } else {
+            coordinator.attach(id.clone(), link.clone()).await;
+        }
         Ok(link)
     }
 }
@@ -193,6 +216,7 @@ impl ResolvedConfig {
         agent.prefetch_per_worker = settings.coordinator.limits.prefetch_per_worker;
         agent.forecast_ttl_ms = settings.scheduler.rules.forecast_ttl_ms;
         agent.term_grace_ms = settings.term_grace_ms;
+        agent.warmup_idle_ms = settings.warmup_idle_ms;
         agent.log_limit_bytes = settings.log_limit_bytes;
         agent.retention_ms = settings.retention_ms;
         let profile = crate::toolchain::profile::Profile::load(&inputs.state_dir, &inputs.env)
@@ -229,6 +253,11 @@ impl ResolvedConfig {
 }
 
 impl WorkerRuntime {
+    pub(crate) fn with_instance(mut self, instance: Option<WorkerBootId>) -> Self {
+        self.agent.instance_id = instance;
+        self
+    }
+
     pub fn agent_config(&self) -> &AgentConfig {
         &self.agent
     }

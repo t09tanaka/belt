@@ -40,6 +40,7 @@ fn runtime_factory_enables_setup_and_starts_agent() {
     cfg.prefetch_per_worker.value = 2;
     cfg.log_spool_limit_bytes.value = 8192;
     cfg.term_grace_seconds.value = 4;
+    cfg.warmup_idle_seconds.value = 7;
     cfg.profile.value = Some("custom".into());
     let input = inputs(root.path());
     let runtime = cfg.worker_runtime(input.clone()).unwrap();
@@ -90,6 +91,7 @@ fn runtime_factory_enables_setup_and_starts_agent() {
         )
     );
     assert_eq!(runtime.setup_config().term_grace_ms, 4000);
+    assert_eq!(runtime.agent_config().warmup_idle_ms, 7000);
     assert_eq!(runtime.setup_config().log_limit_bytes, 8192);
     assert_eq!(runtime.setup_config().lease_ms, 60_000);
     assert_eq!(

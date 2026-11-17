@@ -69,6 +69,7 @@ fn ident() -> Ident {
 
 fn node(attempt: &AttemptId, id: &str, runtime_ms: u64) -> WorkloadNode {
     WorkloadNode {
+        ci_history_key: None,
         node_id: NodeId::parse(id).unwrap(),
         depends_on: vec![],
         priority: 0,

@@ -21,6 +21,13 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Register the root-owned service definition for a non-root worker.
+    RegisterSystemWorker {
+        #[arg(long)]
+        account: String,
+        #[arg(long)]
+        config_dir: std::path::PathBuf,
+    },
     /// Run one admitted private tool installer (internal).
     #[command(hide = true)]
     ToolchainInstall {
@@ -95,6 +102,12 @@ pub struct CiArgs {
     /// Git ref to run.
     #[arg(long = "ref")]
     pub git_ref: Option<String>,
+    /// Do not post the result as a GitHub commit status.
+    #[arg(long)]
+    pub no_status: bool,
+    /// The context of the GitHub commit status.
+    #[arg(long, default_value = crate::ci::status::DEFAULT_CONTEXT)]
+    pub status_context: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -229,6 +242,14 @@ pub enum WorkersSub {
         /// Install the worker over SSH.
         #[arg(long)]
         install: bool,
+        /// With `--install`: the build to send, for a worker whose OS or
+        /// architecture differs from this machine's.
+        #[arg(long, requires = "install", value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
+        /// Register an ephemeral worker: started on its own host with
+        /// `worker --ephemeral`, reached over SSH, never installed.
+        #[arg(long, conflicts_with_all = ["install", "binary"])]
+        ephemeral: bool,
     },
     /// Start a worker.
     Start { name: String },
@@ -244,7 +265,13 @@ pub enum WorkersSub {
         cancel_running: bool,
     },
     /// Upgrade a worker.
-    Upgrade { name: String },
+    Upgrade {
+        name: String,
+        /// The build to send, for a worker whose OS or architecture differs
+        /// from this machine's.
+        #[arg(long, value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
+    },
     /// Show differences from the project requirements.
     Diff {
         /// A registered worker; every registered worker when omitted.
@@ -257,7 +284,7 @@ pub enum WorkersSub {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Forget a worker.
+    /// Declare an ephemeral worker gone: its attempts end as interrupted.
     Forget { name: String },
 }
 
@@ -275,6 +302,9 @@ pub struct WorkerServiceArgs {
 
 #[derive(Debug, Args)]
 pub struct WorkerArgs {
+    /// Start from the administrator-registered, version-independent definition.
+    #[arg(long, requires = "input")]
+    pub system_service: bool,
     /// Speak the protocol over stdin/stdout.
     #[arg(long)]
     pub stdio: bool,
@@ -392,8 +422,24 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::Daemon(args) = &cli.command {
         return crate::service::bootstrap::daemon_main(args.input.as_deref());
     }
+    if let Command::RegisterSystemWorker {
+        account,
+        config_dir,
+    } = &cli.command
+    {
+        return crate::service::worker_service::system_user::command(account, config_dir, cli.json);
+    }
     if let Command::Worker(args) = &cli.command {
         if let Some(input) = &args.input {
+            if args.system_service {
+                return match crate::service::worker_service::system_user::start(input) {
+                    Ok(()) => 0,
+                    Err(error) => {
+                        eprintln!("{error:#}");
+                        1
+                    }
+                };
+            }
             return crate::service::worker::main(input);
         }
         if let (true, Some(cluster), Some(name), Some(key_file)) =
@@ -420,6 +466,9 @@ pub fn run(cli: Cli) -> i32 {
             args.cancel_running,
             args.wait_secs,
         );
+    }
+    if matches!(&cli.command, Command::Workers(WorkersArgs { sub: None })) {
+        return crate::service::workers::list_command(cli.json);
     }
     if let Command::Workers(WorkersArgs { sub: Some(sub) }) = &cli.command {
         if let Some(code) = crate::service::workers::command(sub, cli.json) {
@@ -541,8 +590,19 @@ fn run_ci(cli: &Cli) -> i32 {
                     }
                 }
             });
-            let result =
-                crate::service::ci_run::run(context, args.git_ref.clone(), &mut receiver).await;
+            let status = crate::service::github_status::Options {
+                enabled: !args.no_status,
+                context: args.status_context.clone(),
+            };
+            let poster = std::sync::Arc::new(crate::service::github_status::Gh::new(&context));
+            let result = crate::service::ci_run::run(
+                context,
+                args.git_ref.clone(),
+                &mut receiver,
+                status,
+                poster,
+            )
+            .await;
             watcher.abort();
             let _ = watcher.await;
             result
@@ -564,6 +624,9 @@ fn run_ci(cli: &Cli) -> i32 {
                     unreachable!("ci waits for a run")
                 };
                 println!("{run} {}", ci.report.state);
+                if let Some(status) = &ci.github_status {
+                    println!("{}", crate::ci::status::render(status));
+                }
                 if ci.report.collection_pending == Some(true) {
                     eprintln!("collection is still pending");
                 }

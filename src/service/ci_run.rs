@@ -26,6 +26,9 @@ pub struct SubmittedTask {
     pub plan_task: String,
     /// It waits for the jobs it needs.
     pub waits: bool,
+    /// Discovery is listed in the submit receipt but produces no public job line.
+    #[serde(skip)]
+    discovery: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -70,6 +73,10 @@ pub struct CiReport {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plan_digest: Option<Digest>,
     pub jobs: Vec<JobLine>,
+    /// The GitHub status of the run: what was computed and what became of
+    /// the post, kept apart. A post that failed changes nothing else here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub github_status: Option<crate::ci::status::Record>,
 }
 
 fn invalid(message: impl Into<String>) -> ApiError {
@@ -84,6 +91,43 @@ pub enum Part {
     Job,
 }
 
+/// A matrix variant reserves one slot shared by every worker running this job.
+fn matrix_admission(
+    plan: &local_ci::FrozenPlan,
+    task: &local_ci::dag::ExecutionTask,
+) -> Result<Option<crate::coordinator::MatrixAdmission>, ApiError> {
+    use local_ci::dag::NodeKind;
+    let Some(variant) = &task.variant else {
+        return Ok(None);
+    };
+    let group = plan
+        .graph
+        .nodes
+        .iter()
+        .find(|node| node.id == variant.group)
+        .ok_or_else(|| invalid(format!("missing matrix group for task {}", task.id)))?;
+    let NodeKind::MatrixGroup {
+        variants,
+        max_parallel,
+        ..
+    } = &group.kind
+    else {
+        return Err(invalid(format!(
+            "invalid matrix group for task {}",
+            task.id
+        )));
+    };
+    let limit = max_parallel.unwrap_or(variants.len());
+    let max_parallel = u32::try_from(limit)
+        .ok()
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| invalid(format!("invalid matrix parallelism for task {}", task.id)))?;
+    Ok(Some(crate::coordinator::MatrixAdmission {
+        group: group.id.clone(),
+        max_parallel,
+    }))
+}
+
 /// The tasks of `plan` as they are queued: one spec per task, in plan order.
 /// A task that depends on another waits (`hold`) and has no inputs yet.
 pub fn task_specs(
@@ -93,7 +137,7 @@ pub fn task_specs(
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     command_timeout_ms: Option<u64>,
 ) -> Result<Vec<(String, TaskSpec)>, ApiError> {
-    if let Some(why) = crate::ci::progress::unsupported(plan) {
+    if let Some(why) = crate::ci::advance::unsupported(plan) {
         return Err(invalid(format!("this plan cannot be run yet: {why}")));
     }
     if plan.tasks.is_empty() {
@@ -101,6 +145,16 @@ pub fn task_specs(
             "the plan has no task: no workflow has a job to run",
         ));
     }
+    let local_plan = plan.to_plan();
+    for workflow in 0..plan.workflows.len() {
+        if let Some(reason) = local_ci::artifact_io::workflow_refusal(&local_plan, workflow) {
+            return Err(invalid(reason));
+        }
+    }
+    let distributed_matrix = plan
+        .tasks
+        .iter()
+        .any(|t| t.variant.is_some() || t.dynamic_matrix);
     let no_inputs = serde_json::to_value(local_ci::TaskInputs::default())
         .map_err(|e| invalid(e.to_string()))?;
     plan.tasks
@@ -110,14 +164,35 @@ pub fn task_specs(
                 .map_err(|e| invalid(format!("task `{}`: {e:#}", task.id)))?;
             let spec = TaskSpec {
                 ci: Some(CiSpec {
+                    history_keys: crate::ci::timing::keys(
+                        &demand,
+                        &crate::ci::timing::task_scope(plan, &task.id),
+                    ),
+                    dynamic_origin: task.dynamic_matrix,
+                    core_outcome: None,
+                    matrix: matrix_admission(plan, task)?,
                     shard_retry_forbidden: false,
                     shard_preferred_worker: None,
                     task: CiTask {
+                        artifact_workflow: plan
+                            .workflows
+                            .iter()
+                            .find(|w| w.file == task.workflow)
+                            .filter(|w| {
+                                w.jobs
+                                    .iter()
+                                    .filter(|j| task.jobs.contains(&j.id))
+                                    .flat_map(|j| &j.steps)
+                                    .filter_map(|s| s.uses.as_deref())
+                                    .any(|u| local_ci::artifact::parse_uses(u).is_some())
+                            })
+                            .map(|w| w.file.clone()),
+                        dispatch: None,
                         plan_digest: plan_digest.clone(),
                         task_id: task.id.clone(),
                         inputs: no_inputs.clone(),
                     },
-                    hold: !task.depends_on.is_empty(),
+                    hold: distributed_matrix || !task.depends_on.is_empty(),
                     steps: u32::try_from(demand.nodes.len()).unwrap_or(u32::MAX),
                     unrunnable: None,
                     shard_group: crate::ci::shards::group_of(plan, task)
@@ -233,6 +308,10 @@ pub async fn submit(
             task_id: task_id.clone(),
             plan_task,
             waits: spec.ci.as_ref().is_some_and(|ci| ci.hold),
+            discovery: spec
+                .ci
+                .as_ref()
+                .is_some_and(|ci| crate::wire::is_discovery_task(&ci.task)),
         });
         tasks.push((task_id, spec));
     }
@@ -273,12 +352,14 @@ pub async fn run(
     context: Context,
     revision: Option<String>,
     signals: &mut mpsc::UnboundedReceiver<()>,
+    status: super::github_status::Options,
+    poster: std::sync::Arc<dyn super::github_status::Poster>,
 ) -> Result<CiReport, ApiError> {
     let run_id = RunId::generate();
     let target = Target::Run(run_id.clone());
     let budget = Duration::from_secs(30);
     let submitted = submit(context.clone(), revision, run_id.clone());
-    let (report, plan_digest) = tokio::select! {biased;
+    let (report, receipt) = tokio::select! {biased;
         _ = control::interrupted(signals) => {
             (control::cancel_and_stop(&context.bootstrap, target.clone(), signals, budget).await, None)
         }
@@ -293,28 +374,147 @@ pub async fn run(
             } else {
                 observed
             };
-            (report, Some(receipt.plan_digest))
+            (report, Some(receipt))
         }
     };
-    let spec = context.bootstrap.clone();
-    let (executed_digest, jobs) = tokio::task::spawn_blocking(move || {
-        let store = super::bootstrap::read_only_store(&spec).map_err(|e| e.to_string())?;
-        job_report(
-            &store,
-            &spec.state_dir,
-            &spec.state_dir.join("results"),
-            &run_id,
-        )
+    let (spec, settled) = (context.bootstrap.clone(), context.clone());
+    let end = Ended::of(&report);
+    let expected = receipt.as_ref().map(|receipt| {
+        let tasks = receipt.tasks.iter().filter(|task| !task.discovery);
+        tasks.map(|task| task.plan_task.clone()).collect::<Vec<_>>()
+    });
+    // Decided only here, after the wait: on the parent, from the result of
+    // the run and what it collected.
+    let (executed_digest, jobs, github_status) = tokio::task::spawn_blocking(move || {
+        let (executed_digest, jobs) = super::bootstrap::read_only_store(&spec)
+            .ok()
+            .and_then(|store| {
+                job_report(
+                    &store,
+                    &spec.state_dir,
+                    &spec.state_dir.join("results"),
+                    &run_id,
+                )
+                .ok()
+            })
+            .unwrap_or_default();
+        let record = expected.map(|expected| {
+            let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+            let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
+            let end = end.with(&expected, &lines);
+            super::github_status::settle(&settled, &run_id, &end, &status, poster.as_ref())
+        });
+        (executed_digest, jobs, record.map(|record| (run_id, record)))
     })
     .await
-    .ok()
-    .and_then(Result::ok)
     .unwrap_or_default();
+    let github_status = match github_status {
+        Some((run_id, record)) => {
+            if let Err(why) = keep_status(&context, run_id, record.clone()).await {
+                eprintln!("warning: the status of the run was not recorded: {why}");
+            }
+            Some(record)
+        }
+        None => None,
+    };
     Ok(CiReport {
         report,
-        plan_digest: executed_digest.or(plan_digest),
+        plan_digest: executed_digest.or_else(|| receipt.map(|receipt| receipt.plan_digest)),
         jobs,
+        github_status,
     })
+}
+
+/// Keep the status with the run, so that `show` says it later. The resident
+/// owns the journal; an older one does not know the request and says so.
+async fn keep_status(
+    context: &Context,
+    run_id: RunId,
+    record: crate::ci::status::Record,
+) -> Result<(), String> {
+    let owner = context.owner().await.map_err(|e| e.to_string())?;
+    let request = Operation::RecordStatus { run_id, record };
+    match owner.request(request).await.map_err(|e| e.to_string())? {
+        Reply::Accepted { .. } => Ok(()),
+        Reply::Error { message } => Err(message),
+        Reply::ControlError { error } => Err(error.message),
+        _ => Err("unexpected reply".into()),
+    }
+}
+
+/// How the run ended, as the status of the run reads it: the result of the
+/// run that its completion made (`CoordinatorStore::completion`), which the
+/// exit code of `ci` and `show` read too. Nothing is judged again here.
+#[derive(Debug, Clone, Copy)]
+pub struct Ended {
+    settled: bool,
+    cancel_requested: bool,
+    collection_pending: Option<bool>,
+    exit_code: i32,
+    failed: Option<crate::ci::status::Cause>,
+}
+
+/// The failure of a run in the plain values the status decides from.
+fn fault(failure: &super::completion::Failure) -> crate::ci::status::Fault {
+    use crate::state::{Exit, Outcome};
+    let end = failure.termination;
+    crate::ci::status::Fault {
+        exit_code: failure.exit_code,
+        own_exit: end
+            .and_then(super::completion::compute_failure)
+            .map(|(_, exit)| exit),
+        exited: matches!(end.and_then(|t| t.exit()), Some(Exit::Code(code)) if code != 0),
+        cancelled: end.is_none_or(|t| t.outcome() == Outcome::Cancelled),
+    }
+}
+
+impl Ended {
+    pub fn of(report: &Report) -> Self {
+        let snapshot = report.snapshot.as_ref();
+        Self {
+            settled: report.state == "settled",
+            cancel_requested: report.cancel_requested
+                || snapshot.is_some_and(|s| s.cancel_requested),
+            collection_pending: report.collection_pending,
+            exit_code: report.cli_exit_code,
+            failed: snapshot
+                .and_then(|s| s.first_compute_failure.as_ref())
+                .map(|failure| crate::ci::status::cause(&fault(failure))),
+        }
+    }
+
+    fn with<'a>(
+        &self,
+        expected: &'a [&'a str],
+        jobs: &'a [crate::ci::status::Job<'a>],
+    ) -> crate::ci::status::RunEnd<'a> {
+        crate::ci::status::RunEnd {
+            settled: self.settled,
+            cancel_requested: self.cancel_requested,
+            collection_pending: self.collection_pending,
+            exit_code: self.exit_code,
+            failed: self.failed,
+            expected,
+            jobs,
+        }
+    }
+
+    /// What the run computed, with the tasks that were submitted and the
+    /// lines of the run.
+    pub fn computed(&self, expected: &[&str], jobs: &[JobLine]) -> crate::ci::status::Computed {
+        let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
+        crate::ci::status::computed(&self.with(expected, &lines))
+    }
+}
+
+impl JobLine {
+    /// The line as the status decision reads it.
+    fn status_line(&self) -> crate::ci::status::Job<'_> {
+        crate::ci::status::Job {
+            plan_task: &self.plan_task,
+            status: &self.status,
+        }
+    }
 }
 
 /// How the jobs of a run ended, read from what the parent collected. Reads
@@ -428,7 +628,11 @@ fn job_report(
                     .into_iter()
                     .map(|o| line(Some(o.job), o.status.as_str(), o.skipped)),
             ),
-            None => lines.push(line(None, "no_result", None)),
+            None => lines.push(line(
+                None,
+                ci.core_outcome.as_deref().unwrap_or("no_result"),
+                None,
+            )),
         }
     }
     let plan = digest

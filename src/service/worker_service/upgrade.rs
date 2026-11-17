@@ -356,10 +356,10 @@ fn retire<L: Launcher>(
     paths: &Paths,
     journal: &Journal,
     receipt: &macos::Receipt,
-    files: DirectoryFiles,
+    files: system_user::ServiceFiles,
     mut launcher: L,
     wait: Duration,
-) -> anyhow::Result<(DirectoryFiles, L)> {
+) -> anyhow::Result<(system_user::ServiceFiles, L)> {
     let plan = plan(paths, journal)?;
     match launcher.loaded_state(&plan, receipt) {
         LoadedState::Unknown => anyhow::bail!(
@@ -447,7 +447,7 @@ fn switch_to<L: Launcher>(
     options: Options,
     hook: Hook,
 ) -> anyhow::Result<Status> {
-    let mut files = services(paths)?;
+    let mut files = services(paths, &journal)?;
     // A switch that died between recording a new service file and publishing
     // it left a receipt for a file that was never there.
     if journal.switch.is_some() {
@@ -497,7 +497,7 @@ fn switch_to<L: Launcher>(
     }
     if let Some(old) = journal.switch.as_ref().and_then(|s| s.from_receipt.clone()) {
         hook(Step::RemoveOld)?;
-        if !absent(old.path())? {
+        if journal.system_user.is_none() && !absent(old.path())? {
             let _lease = files.lifecycle_lock()?;
             files.remove(&old)?;
         }
@@ -599,6 +599,7 @@ pub(super) fn unsettled_status(paths: &Paths, journal: &Journal) -> anyhow::Resu
         .context("service was never installed")?;
     let current = Control::effective(&paths.state);
     Ok(Status {
+        system_user: journal.system_user.is_some(),
         worker_id: journal.worker_id.clone(),
         cluster: journal.cluster.clone(),
         binary_sha256: journal.binary_sha256.clone(),

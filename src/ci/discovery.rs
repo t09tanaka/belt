@@ -309,12 +309,23 @@ pub fn stage(
         let ci = probe.ci.as_mut().expect("specs came from a CI plan");
         let id = step.task_id();
         ci.task.task_id = id.clone();
+        // The version check and listing run different commands from the test job.
+        // Forecast them from samples recorded for this probe on the worker.
+        let demand = step.execution_plan(plan).ok().and_then(|probe_plan| {
+            let task = probe_plan.tasks.iter().find(|t| {
+                t.workflow == step.workflow && t.jobs.as_slice() == std::slice::from_ref(&step.job)
+            })?;
+            local_ci::plan_task_demand(&probe_plan, &task.id).ok()
+        });
+        ci.history_keys = demand.as_ref().map_or_else(Vec::new, |demand| {
+            crate::ci::timing::keys(demand, &crate::ci::timing::task_scope(plan, &id))
+        });
         let policy = policies
             .iter()
             .find(|p| p.workflow == step.workflow && p.job == step.job);
         ci.task.inputs["rtr_discovery"] = serde_json::json!({"original_task":task.id,"capacity": capacity,"per_worker":per_worker, "project": project, "applied": false, "policy": policy});
-
-        ci.steps = u32::try_from(step.step + 2).unwrap_or(u32::MAX);
+        let steps = demand.map_or(step.step + 2, |demand| demand.nodes.len());
+        ci.steps = u32::try_from(steps).unwrap_or(u32::MAX);
         probes.push((id, probe));
     }
     specs.extend(probes);

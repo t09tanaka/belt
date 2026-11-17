@@ -1451,3 +1451,38 @@ fn non_node_workspace_files_and_node_toml_without_node_remain_explicit() {
     )
     .is_err());
 }
+
+#[test]
+fn a_requirement_is_made_for_the_project_and_for_each_narrower_scope() {
+    let step = |job: &str, n: usize, raw: &str| Declaration {
+        scope: Scope {
+            project: "".into(),
+            workflow: Some("w.yml".into()),
+            job: Some(job.into()),
+            step: Some(n),
+        },
+        ..decl(raw)
+    };
+    assert!(requirement_scopes(&[]).is_empty());
+    let found = [
+        decl(">=18"),
+        step("a", 0, "^20"),
+        step("a", 0, "^20.1"),
+        step("b", 1, "^22"),
+    ];
+    let scopes = requirement_scopes(&found);
+    assert_eq!(scopes.len(), 3, "{scopes:?}");
+    assert!(scopes.contains(&Scope::project("")));
+    // The step of the same scope counts once; each scope sees the project's
+    // own declarations as well.
+    let a = effective(&found, &scopes[1]).unwrap();
+    assert_eq!(a[0].constraints.len(), 3);
+    let project = effective(&found, &Scope::project("")).unwrap();
+    assert_eq!(project[0].constraints.len(), 1);
+    // Another project is its own scope.
+    let other = Declaration {
+        scope: Scope::project("web"),
+        ..decl("^16")
+    };
+    assert_eq!(requirement_scopes(&[other]).len(), 1);
+}
