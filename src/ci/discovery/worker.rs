@@ -22,7 +22,18 @@ impl DiscoveryStep {
     pub fn execution_plan(&self, plan: &FrozenPlan) -> anyhow::Result<FrozenPlan> {
         let target = self.target(plan)?;
         let runner = adapter(target.command, "", "", Isolation::None)?;
-        let listing = adapters::script_of(&runner.discover_command())
+        let mut invocation = runner.discover_command();
+        invocation.argv.splice(
+            0..0,
+            [
+                "sh".into(),
+                "-c".into(),
+                include_str!("list_output.sh").into(),
+                "rtr-discovery".into(),
+                crate::ci::advance::MAX_RESULT_BYTES.to_string(),
+            ],
+        );
+        let listing = adapters::script_of(&invocation)
             .ok_or_else(|| anyhow::anyhow!("runner listing cannot be represented as a step"))?;
         let version = adapters::version_command(&runner.info().runner)
             .ok_or_else(|| anyhow::anyhow!("unknown runner {}", runner.info().runner))?;
@@ -91,15 +102,16 @@ impl DiscoveryStep {
         let Some(version) = step_log(self.step, 4096) else {
             return Ok(self.failed());
         };
-        let Some(list) = step_log(self.step + 1, crate::ci::advance::MAX_RESULT_BYTES) else {
+        let Some(list) = step_log(self.step + 1, crate::ci::advance::MAX_RESULT_BYTES + 128) else {
             return Ok(self.failed());
         };
         let version = version.trim();
         if version.is_empty() || version.len() > 256 || version.chars().any(char::is_control) {
             return Ok(self.failed());
         }
-        // The supervisor tees both streams into the one step log. The cargo
-        // adapter counts harness summaries in stdout and target lines in stderr.
+        let Some((stdout, stderr)) = streams(&list) else {
+            return Ok(self.failed());
+        };
         let setup_ms = result.jobs.first().and_then(|job| {
             let elapsed: f64 = job
                 .steps
@@ -115,8 +127,8 @@ impl DiscoveryStep {
             workspace,
             version.to_owned(),
             CommandOutput {
-                stdout: list.clone(),
-                stderr: list,
+                stdout: stdout.into(),
+                stderr: stderr.into(),
                 success: true,
                 exit: Some(0),
             },
@@ -124,6 +136,20 @@ impl DiscoveryStep {
         listing.setup_ms = setup_ms;
         Ok(listing)
     }
+}
+
+fn streams(frame: &str) -> Option<(&str, &str)> {
+    let (header, payload) = frame.split_once('\n')?;
+    let lengths = header.strip_prefix("rtr-list-v1 ")?;
+    let (out, err) = lengths.split_once(' ')?;
+    let out: usize = out.parse().ok()?;
+    let err: usize = err.parse().ok()?;
+    if out.checked_add(err)? != payload.len()
+        || payload.len() as u64 > crate::ci::advance::MAX_RESULT_BYTES
+    {
+        return None;
+    }
+    Some((payload.get(..out)?, payload.get(out..)?))
 }
 
 // Only a job-wide admission wait is available. Subtracting all of it gives
@@ -136,7 +162,14 @@ fn preparation_ms(elapsed: f64, wait: f64) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::preparation_ms;
+    use super::{preparation_ms, streams};
+
+    #[test]
+    fn listing_frame_preserves_byte_boundaries_and_rejects_truncation() {
+        assert_eq!(streams("rtr-list-v1 3 4\n猫err\n"), Some(("猫", "err\n")));
+        assert_eq!(streams("rtr-list-v1 2 5\n猫err\n"), None);
+        assert_eq!(streams("rtr-list-v1 3 5\n猫err\n"), None);
+    }
 
     #[test]
     fn preparation_excludes_admission_wait_and_rejects_invalid_measurements() {
