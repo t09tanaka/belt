@@ -415,9 +415,11 @@ fn add_and_remove_a_commit_workspace() {
 #[test]
 fn removing_an_attempt_releases_only_its_portool_allocation() {
     let f = fixture();
+    // The attempts belong to the worker clone. The capture repository has
+    // a different portool project, but both use this fixture's private HOME.
     let allocations = || {
         let out = Command::new("portool")
-            .args(["ls", "--json"])
+            .args(["ls", "--all", "--json"])
             .env_clear()
             .envs(f.env())
             .current_dir(&f.dir)
