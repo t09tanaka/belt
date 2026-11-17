@@ -462,9 +462,7 @@ pub fn run(cli: Cli) -> i32 {
 
 /// The context `ci` and `ci plan` capture and plan in: the snapshot kind and
 /// revision of the command line over the configuration.
-fn ci_context(
-    args: &CiArgs,
-) -> Result<crate::service::context::Context, crate::error::ApiError> {
+fn ci_context(args: &CiArgs) -> Result<crate::service::context::Context, crate::error::ApiError> {
     use crate::{
         config::{model::SourceMode, Overlay},
         service::context::{runtime_spec, Context},
@@ -501,7 +499,8 @@ fn run_ci(cli: &Cli) -> i32 {
             unreachable!()
         };
         let context = ci_context(args)?;
-        let internal = |e: std::io::Error| crate::error::ApiError::new(ErrorCode::Internal, e.to_string());
+        let internal =
+            |e: std::io::Error| crate::error::ApiError::new(ErrorCode::Internal, e.to_string());
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()

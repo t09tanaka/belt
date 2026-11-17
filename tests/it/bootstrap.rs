@@ -2654,7 +2654,7 @@ async fn in_place_exec_updates_original_directory_and_retries_mutable_input_afte
     );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
     assert_eq!(value["result"]["snapshot"]["in_place"], true);
-    let run = remote_task_runner::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
     let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
     assert_eq!(
         std::fs::read_to_string(input.join("output.txt")).unwrap(),
@@ -2768,7 +2768,7 @@ async fn in_place_secret_values_are_read_only_masked_and_inventory_changes_rejec
         String::from_utf8_lossy(&out.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let run = remote_task_runner::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
     let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
     let old = CoordinatorStore::open_read_only(&spec.state_dir)
         .unwrap()
@@ -2938,7 +2938,7 @@ async fn in_place_retry_rejects_original_subdirectory_replaced_by_external_symli
         String::from_utf8_lossy(&out.stderr)
     );
     let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    let run = remote_task_runner::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
     let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
     assert!(sub.join("marker").exists());
     shutdown(&load(&spec)).await;
@@ -5194,12 +5194,17 @@ fn ci_marks(marks: &std::path::Path, job: &str) -> Vec<String> {
 
 /// How many attempts each task of the run had, by the task of the plan.
 fn ci_attempts(spec: &Spec, value: &serde_json::Value) -> BTreeMap<String, usize> {
-    let run = remote_task_runner::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let run =
+        remote_task_runner::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap())
+            .unwrap();
     let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     let rows = store.ci_run_tasks(&run).unwrap();
     rows.into_iter()
         .map(|row| {
-            let task = row.spec["ci"]["task"]["task_id"].as_str().unwrap().to_string();
+            let task = row.spec["ci"]["task"]["task_id"]
+                .as_str()
+                .unwrap()
+                .to_string();
             (task, store.attempts_of_task(&row.task_id).unwrap().len())
         })
         .collect()
@@ -5221,7 +5226,10 @@ async fn ci_runs_a_chain_of_needs_with_outputs_and_every_job_once() {
     assert_eq!(value["ok"], true);
     assert_eq!(value["result"]["state"], "settled");
     assert_eq!(value["result"]["snapshot"]["task_count"], 3);
-    assert!(value["result"]["plan_digest"].as_str().unwrap().starts_with("sha256:"));
+    assert!(value["result"]["plan_digest"]
+        .as_str()
+        .unwrap()
+        .starts_with("sha256:"));
     let jobs = ci_jobs(&value);
     for job in ["build", "test", "deploy"] {
         assert_eq!(jobs[job], ("success".to_string(), None), "{job}: {value}");
@@ -5253,7 +5261,10 @@ async fn ci_skips_what_needs_a_failed_job_and_runs_always_and_failure() {
     assert_eq!(value["result"]["snapshot"]["task_count"], 6);
     let jobs = ci_jobs(&value);
     assert_eq!(jobs["build"].0, "failure", "{value}");
-    assert_eq!(jobs["test"], ("skipped".to_string(), Some("needs failed".to_string())));
+    assert_eq!(
+        jobs["test"],
+        ("skipped".to_string(), Some("needs failed".to_string()))
+    );
     assert_eq!(jobs["deploy"].0, "skipped", "{value}");
     assert_eq!(jobs["calm"].0, "skipped", "{value}");
     assert_eq!(jobs["report"].0, "success", "{value}");
@@ -5292,7 +5303,10 @@ async fn ci_sigint_cancels_the_running_job_and_the_ones_that_wait() {
     assert!(identity.identity().is_some());
     let started = tokio::time::timeout(Duration::from_secs(120), async {
         while ci_marks(&marks, "first").is_empty() {
-            assert!(child.try_wait().unwrap().is_none(), "ci exited before its job started");
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "ci exited before its job started"
+            );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     });
@@ -5325,7 +5339,11 @@ async fn ci_sigint_cancels_the_running_job_and_the_ones_that_wait() {
     let attempts = ci_attempts(&spec, &value);
     let mut counts: Vec<usize> = attempts.values().copied().collect();
     counts.sort();
-    assert_eq!(counts, [0, 1], "the job that waited was never placed: {attempts:?}");
+    assert_eq!(
+        counts,
+        [0, 1],
+        "the job that waited was never placed: {attempts:?}"
+    );
     // Not even `always()` runs after the run was cancelled before it was placed.
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(ci_marks(&marks, "second").is_empty());

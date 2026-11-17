@@ -177,7 +177,10 @@ impl NeedsProgression {
             .filter(|t| t.depends_on.iter().all(|d| self.settled.contains_key(d)))
             .map(|t| {
                 let finished = self.settled.values().flatten();
-                (t.id.clone(), TaskInputs::new(self.needs_of(t), finished, false))
+                (
+                    t.id.clone(),
+                    TaskInputs::new(self.needs_of(t), finished, false),
+                )
             })
             .collect();
         for (task, inputs) in ready {
@@ -334,7 +337,10 @@ mod tests {
         let f = fixture(CHAIN);
         let id = |job: &str| task_of(&f.plan, job).to_string();
         let mut p = NeedsProgression::new(&f.plan).unwrap();
-        assert!(p.pending_actions().is_empty(), "nothing before the first look");
+        assert!(
+            p.pending_actions().is_empty(),
+            "nothing before the first look"
+        );
         p.step(Input::Advance).unwrap();
         let mut first = ready(&p);
         first.sort();
@@ -364,7 +370,10 @@ mod tests {
         assert_eq!(inputs.needs["build"].outputs["v"], "1");
         assert_eq!(inputs.needs["build"].status, JobStatus::Success);
         assert!(!inputs.run_cancelled);
-        assert_eq!(p.outcome(&f.plan.tasks[0].workflow, "build").unwrap().job, "build");
+        assert_eq!(
+            p.outcome(&f.plan.tasks[0].workflow, "build").unwrap().job,
+            "build"
+        );
         assert!(p.outcome("another.yml", "build").is_none());
         assert!(p.outcome(&f.plan.tasks[0].workflow, "test").is_none());
     }
@@ -481,8 +490,14 @@ mod tests {
         };
         let ok = || outcome("build", JobStatus::Success);
         let other_task = settle(&mut p, &id("build"), result(&id("test"), vec![ok()]));
-        assert!(matches!(other_task, Err(ProgressError::Result { .. })), "{other_task:?}");
-        let foreign = result(&id("build"), vec![ok(), outcome("test", JobStatus::Success)]);
+        assert!(
+            matches!(other_task, Err(ProgressError::Result { .. })),
+            "{other_task:?}"
+        );
+        let foreign = result(
+            &id("build"),
+            vec![ok(), outcome("test", JobStatus::Success)],
+        );
         assert!(matches!(
             settle(&mut p, &id("build"), foreign),
             Err(ProgressError::Result { .. })
@@ -535,7 +550,10 @@ mod tests {
                 label: "l".into(),
             })
         });
-        assert!(variant.contains("variant") && variant.contains(&id), "{variant}");
+        assert!(
+            variant.contains("variant") && variant.contains(&id),
+            "{variant}"
+        );
         let services = broken(&|t| {
             t.services = vec![local_ci::dag::TaskService {
                 job: "build".into(),

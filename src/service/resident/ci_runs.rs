@@ -31,8 +31,12 @@ pub(super) async fn run(
         // A pass that fails is tried again at the next heartbeat: a run that
         // cannot go on never stops the resident.
         let _ = tokio::task::spawn_blocking(move || {
-            let pass =
-                crate::ci::advance::advance_runs(owner.store(), &dir, &dir.join("results"), wall_ms());
+            let pass = crate::ci::advance::advance_runs(
+                owner.store(),
+                &dir,
+                &dir.join("results"),
+                wall_ms(),
+            );
             if let Ok(pass) = &pass {
                 let keep_ms = plan_retention_ms(retention_days);
                 crate::worker::ci_task::sweep_plans(&dir, &pass.plans, keep_ms);

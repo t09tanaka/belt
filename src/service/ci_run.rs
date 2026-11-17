@@ -79,7 +79,9 @@ pub fn task_specs(
         return Err(invalid(format!("this plan cannot be run yet: {why}")));
     }
     if plan.tasks.is_empty() {
-        return Err(invalid("the plan has no task: no workflow has a job to run"));
+        return Err(invalid(
+            "the plan has no task: no workflow has a job to run",
+        ));
     }
     let no_inputs = serde_json::to_value(local_ci::TaskInputs::default())
         .map_err(|e| invalid(e.to_string()))?;
@@ -172,7 +174,13 @@ pub async fn submit(
     let manifest_digest = Digest::parse(&captured.manifest.manifest_digest)
         .or_else(|_| Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest)))
         .map_err(|e| invalid(e.to_string()))?;
-    let specs = task_specs(&plan, &plan_digest, &manifest_digest, &requirements, timeout)?;
+    let specs = task_specs(
+        &plan,
+        &plan_digest,
+        &manifest_digest,
+        &requirements,
+        timeout,
+    )?;
     let mut submitted = Vec::with_capacity(specs.len());
     let mut tasks = Vec::with_capacity(specs.len());
     for (plan_task, spec) in specs {
@@ -292,9 +300,12 @@ pub fn job_lines(
             skipped,
         };
         match result {
-            Some(result) => lines.extend(result.outcomes.into_iter().map(|o| {
-                line(Some(o.job), o.status.as_str(), o.skipped)
-            })),
+            Some(result) => lines.extend(
+                result
+                    .outcomes
+                    .into_iter()
+                    .map(|o| line(Some(o.job), o.status.as_str(), o.skipped)),
+            ),
             None => lines.push(line(None, "no_result", None)),
         }
     }
@@ -330,7 +341,12 @@ mod tests {
         assert_eq!(specs.len(), 2);
         let of = |job: &str| {
             let id = task_of(&f.plan, job).to_string();
-            specs.iter().find(|(task, _)| task == &id).unwrap().1.clone()
+            specs
+                .iter()
+                .find(|(task, _)| task == &id)
+                .unwrap()
+                .1
+                .clone()
         };
         let build = of("build");
         let ci = build.ci.as_ref().unwrap();

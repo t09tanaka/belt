@@ -120,11 +120,10 @@ impl CoordinatorStore {
             if changed == 0 {
                 return Ok(false);
             }
-            let run: String = tx.query_row(
-                "SELECT run_id FROM task WHERE task_id=?1",
-                [&task],
-                |row| row.get(0),
-            )?;
+            let run: String =
+                tx.query_row("SELECT run_id FROM task WHERE task_id=?1", [&task], |row| {
+                    row.get(0)
+                })?;
             common::append_event(
                 tx,
                 Some(&run),

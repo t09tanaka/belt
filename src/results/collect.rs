@@ -194,10 +194,12 @@ fn declared_of(payload: &Option<Value>) -> std::result::Result<Declared, &'stati
 /// requires: without it the jobs that need the task's cannot be given their
 /// inputs, so the task is not a success.
 fn ci_result_of(payload: &AttemptPayload) -> Option<(String, bool)> {
-    payload
-        .ci_task
-        .as_ref()
-        .map(|_| (crate::supervisor::ci_task::RESULT_ARTIFACT.to_string(), true))
+    payload.ci_task.as_ref().map(|_| {
+        (
+            crate::supervisor::ci_task::RESULT_ARTIFACT.to_string(),
+            true,
+        )
+    })
 }
 
 impl Declared {

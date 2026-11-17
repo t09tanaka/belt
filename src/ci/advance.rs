@@ -60,7 +60,9 @@ fn read_capped(path: &Path, limit: u64) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
     file.take(limit.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > limit {
-        return Err(std::io::Error::other(format!("it is larger than {limit} bytes")));
+        return Err(std::io::Error::other(format!(
+            "it is larger than {limit} bytes"
+        )));
     }
     Ok(bytes)
 }
@@ -314,7 +316,10 @@ mod tests {
         assert_eq!(standing(false, Some((None, None))), Standing::Open);
         assert_eq!(standing(true, Some((None, None))), Standing::Open);
         assert_eq!(standing(false, Some((Some(&done), None))), Standing::Open);
-        assert_eq!(standing(false, Some((None, Some("complete")))), Standing::Open);
+        assert_eq!(
+            standing(false, Some((None, Some("complete")))),
+            Standing::Open
+        );
         assert_eq!(
             standing(true, Some((Some(&done), Some("gave_up")))),
             Standing::Ended(done.outcome())
@@ -323,7 +328,10 @@ mod tests {
 
     #[test]
     fn without_a_result_a_cancelled_attempt_counts_as_cancelled_and_any_other_as_failed() {
-        assert_eq!(status_without_result(Outcome::Cancelled), JobStatus::Cancelled);
+        assert_eq!(
+            status_without_result(Outcome::Cancelled),
+            JobStatus::Cancelled
+        );
         for outcome in [
             Outcome::Succeeded,
             Outcome::Failed,
@@ -352,7 +360,9 @@ mod tests {
         let overhead = serde_json::to_vec(&small).unwrap().len() - 16;
         assert!(inputs_fit(&small));
         assert!(inputs_fit(&inputs(MAX_RELEASED_INPUT_BYTES - overhead)));
-        assert!(!inputs_fit(&inputs(MAX_RELEASED_INPUT_BYTES - overhead + 1)));
+        assert!(!inputs_fit(&inputs(
+            MAX_RELEASED_INPUT_BYTES - overhead + 1
+        )));
     }
 
     #[test]
@@ -364,7 +374,9 @@ mod tests {
         assert_eq!(plan_bytes(dir.path(), &digest).unwrap(), bytes);
         let path = crate::worker::ci_task::plan_path(dir.path(), &digest);
         std::fs::write(&path, b"{}").unwrap();
-        assert!(plan_bytes(dir.path(), &digest).unwrap_err().contains("digest"));
+        assert!(plan_bytes(dir.path(), &digest)
+            .unwrap_err()
+            .contains("digest"));
         let absent = Digest::of_bytes(b"absent");
         assert!(plan_bytes(dir.path(), &absent).is_err());
 
@@ -379,7 +391,10 @@ mod tests {
         let kept = dir.path().join(attempt.as_str()).join("artifacts");
         std::fs::create_dir_all(&kept).unwrap();
         std::fs::write(kept.join(&hex), &text).unwrap();
-        assert_eq!(read_result(dir.path(), &attempt, &digest).unwrap().task, "t");
+        assert_eq!(
+            read_result(dir.path(), &attempt, &digest).unwrap().task,
+            "t"
+        );
         // Not JSON of a result.
         let junk = Digest::of_bytes(b"junk");
         let junk_hex = junk.to_string().replace("sha256:", "");

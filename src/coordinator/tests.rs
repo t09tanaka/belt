@@ -309,7 +309,9 @@ fn the_forecast_of_a_ci_task_is_asked_for_every_step_of_the_plan() {
     assert_eq!(delays, [Some(40), None, None]);
     assert!(plan.nodes.iter().all(|n| n.correlation.attempt_id == a));
     assert_eq!(plan.nodes[2].correlation.node_id, plan.nodes[2].node_id);
-    assert!(policy::workload_of_spec(&a, &ci_spec(false, 0), None).nodes.is_empty());
+    assert!(policy::workload_of_spec(&a, &ci_spec(false, 0), None)
+        .nodes
+        .is_empty());
     // A task of commands is asked for its commands, as before.
     let commands = policy::workload_of_spec(&a, &spec(), Some(40));
     assert_eq!(commands.nodes.len(), 1);
@@ -322,7 +324,9 @@ async fn a_ci_task_is_queued_without_commands_and_what_no_worker_takes_is_refuse
     let f = fx();
     let source = SourceId::generate();
     let store = f.c.store();
-    store.put_source_ref(&source, &Digest::of_bytes(b"manifest"), 1).unwrap();
+    store
+        .put_source_ref(&source, &Digest::of_bytes(b"manifest"), 1)
+        .unwrap();
     let enqueue = |spec: TaskSpec| {
         let (c, source) = (&f.c, source.clone());
         async move {
@@ -362,8 +366,13 @@ async fn a_ci_task_is_queued_without_commands_and_what_no_worker_takes_is_refuse
     // A task that waits is a task of its run, and is not in the queue.
     let ready = enqueue(ci_spec(false, 2)).await.unwrap();
     let held = enqueue(ci_spec(true, 2)).await.unwrap();
-    let queued: Vec<TaskId> = store.queued_tasks(16).unwrap().into_iter().map(|t| t.task_id).collect();
-    assert_eq!(queued, [ready.clone()]);
+    let queued: Vec<TaskId> = store
+        .queued_tasks(16)
+        .unwrap()
+        .into_iter()
+        .map(|t| t.task_id)
+        .collect();
+    assert_eq!(queued, std::slice::from_ref(&ready));
     let waiting = store.ci_waiting_runs(16).unwrap();
     assert_eq!(waiting.len(), 1);
     let rows = store.ci_run_tasks(&waiting[0]).unwrap();
@@ -374,7 +383,14 @@ async fn a_ci_task_is_queued_without_commands_and_what_no_worker_takes_is_refuse
     let attempt = AttemptId::generate();
     let place = |task: &TaskId, attempt: &AttemptId| {
         store
-            .place(task, &f.worker, attempt, |_| true, |input| demand_of(input, 60_000), 2)
+            .place(
+                task,
+                &f.worker,
+                attempt,
+                |_| true,
+                |input| demand_of(input, 60_000),
+                2,
+            )
             .unwrap()
     };
     assert!(!matches!(place(&held, &attempt), PlaceOutcome::Placed(_)));
@@ -394,7 +410,11 @@ async fn a_ci_task_is_queued_without_commands_and_what_no_worker_takes_is_refuse
     let pending = crate::scheduler::pending_plans(store, &f.worker).unwrap();
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].attempt_id, attempt);
-    let names: Vec<&str> = pending[0].nodes.iter().map(|n| n.node_id.as_str()).collect();
+    let names: Vec<&str> = pending[0]
+        .nodes
+        .iter()
+        .map(|n| n.node_id.as_str())
+        .collect();
     assert_eq!(names, ["step-0", "step-1"]);
     // A task of commands has no such number.
     let (_task, other) = f.placed().await;

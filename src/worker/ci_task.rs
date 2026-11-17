@@ -560,9 +560,15 @@ mod tests {
         assert_eq!((again.received, again.complete), (5, false));
         let last = put_plan(dir.path(), &chunk(bytes, &digest, 5, bytes.len() - 5)).unwrap();
         assert_eq!((last.received, last.complete), (bytes.len() as u64, true));
-        assert_eq!(std::fs::read(plan_path(dir.path(), &digest)).unwrap(), bytes);
+        assert_eq!(
+            std::fs::read(plan_path(dir.path(), &digest)).unwrap(),
+            bytes
+        );
         assert_eq!(parts_in(&plans_dir(dir.path())), 0, "nothing stays staged");
-        let mode = std::fs::metadata(plans_dir(dir.path())).unwrap().permissions().mode();
+        let mode = std::fs::metadata(plans_dir(dir.path()))
+            .unwrap()
+            .permissions()
+            .mode();
         assert_eq!(mode & 0o777, 0o700);
 
         // Held already: complete at once, whatever the chunk.

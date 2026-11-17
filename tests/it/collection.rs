@@ -2941,12 +2941,18 @@ async fn a38_a_job_that_needs_another_starts_elsewhere_once_the_result_is_here_a
 
     // build ends. Its result is on the parent only after the collection.
     let p = fx.w.payload(&a);
-    assert_eq!(p.ci_task.as_ref().unwrap().task_id, ci_task_of(&plan, "build"));
+    assert_eq!(
+        p.ci_task.as_ref().unwrap().task_id,
+        ci_task_of(&plan, "build")
+    );
     assert!(p.commands.is_empty());
     let outputs = serde_json::json!({"version": "1.2.3"});
     let result = ci_result(&ci_task_of(&plan, "build"), "build", "success", outputs);
     end(&fx, &c, &a, Outcome::Succeeded, ci_out(&a, &p, &result)).await;
-    assert!(ci_advance(&fx, &c).released.is_empty(), "not before it is collected");
+    assert!(
+        ci_advance(&fx, &c).released.is_empty(),
+        "not before it is collected"
+    );
     assert!(c.tick().await.unwrap().placed.is_empty());
     let report = ci_collect(&c, &files, &a).await;
     assert_eq!(report.collected, vec![a.clone()], "{report:?}");
@@ -2980,7 +2986,12 @@ async fn a38_a_job_that_needs_another_starts_elsewhere_once_the_result_is_here_a
     assert_eq!(attempts(&test).len(), 1);
 
     // test ends on the other worker and the run is settled as a success.
-    let result = ci_result(&ci_task_of(&plan, "test"), "test", "success", serde_json::json!({}));
+    let result = ci_result(
+        &ci_task_of(&plan, "test"),
+        "test",
+        "success",
+        serde_json::json!({}),
+    );
     other.finish(&b, Outcome::Succeeded, ci_out(&b, &sent, &result));
     assert_eq!(c.tick().await.unwrap().settled, vec![b.clone()]);
     assert_eq!(ci_collect(&c, &files, &b).await.collected, vec![b]);
@@ -2988,8 +2999,14 @@ async fn a38_a_job_that_needs_another_starts_elsewhere_once_the_result_is_here_a
     assert_eq!(c.store().completion(target).unwrap().exit_code(), Some(0));
     let lines =
         remote_task_runner::service::ci_run::job_lines(c.store(), files.root(), &run).unwrap();
-    let seen: Vec<_> = lines.iter().map(|l| (l.job.as_deref(), l.status.as_str())).collect();
-    assert_eq!(seen, [(Some("build"), "success"), (Some("test"), "success")]);
+    let seen: Vec<_> = lines
+        .iter()
+        .map(|l| (l.job.as_deref(), l.status.as_str()))
+        .collect();
+    assert_eq!(
+        seen,
+        [(Some("build"), "success"), (Some("test"), "success")]
+    );
 }
 
 /// The result of a CI task is required by the parent although no payload
@@ -3032,7 +3049,10 @@ async fn a_ci_task_without_a_usable_result_is_no_success_and_the_next_job_sees_a
         let b = c.tick().await.unwrap().placed[0].clone();
         let sent = fx.w.payload(&b);
         let inputs = &sent.ci_task.as_ref().unwrap().inputs;
-        assert_eq!(inputs["needs"]["build"]["status"], "failure", "{unreadable}");
+        assert_eq!(
+            inputs["needs"]["build"]["status"], "failure",
+            "{unreadable}"
+        );
         assert_eq!(inputs["needs"]["build"]["outputs"], serde_json::json!({}));
 
         // It comes back skipped, with nothing but its result: collected.
@@ -3052,11 +3072,16 @@ async fn a_ci_task_without_a_usable_result_is_no_success_and_the_next_job_sees_a
         assert!(exit.is_some_and(|code| code != 0), "{exit:?}");
         let lines =
             remote_task_runner::service::ci_run::job_lines(c.store(), files.root(), &run).unwrap();
-        let test = lines.iter().find(|l| l.job.as_deref() == Some("test")).unwrap();
+        let test = lines
+            .iter()
+            .find(|l| l.job.as_deref() == Some("test"))
+            .unwrap();
         assert_eq!(test.status, "skipped");
         assert_eq!(test.skipped.as_deref(), Some("needs failed"));
         if !unreadable {
-            assert!(lines.iter().any(|l| l.job.is_none() && l.status == "no_result"));
+            assert!(lines
+                .iter()
+                .any(|l| l.job.is_none() && l.status == "no_result"));
         }
     }
 }
@@ -3072,7 +3097,12 @@ async fn a_cancelled_ci_run_releases_nothing_more_and_settles() {
     let a = c.tick().await.unwrap().placed[0].clone();
     c.cancel_run(run.clone()).await.unwrap();
     let p = fx.w.payload(&a);
-    let result = ci_result(&ci_task_of(&plan, "build"), "build", "success", serde_json::json!({}));
+    let result = ci_result(
+        &ci_task_of(&plan, "build"),
+        "build",
+        "success",
+        serde_json::json!({}),
+    );
     fx.w.finish(&a, Outcome::Cancelled, ci_out(&a, &p, &result));
     for _ in 0..3 {
         c.tick().await.unwrap();
@@ -3087,6 +3117,12 @@ async fn a_cancelled_ci_run_releases_nothing_more_and_settles() {
     assert!(snapshot.exit_code().is_some_and(|code| code != 0));
     // A released spec that still waits is never written.
     let waiting = serde_json::json!({"ci": {"hold": true}});
-    assert!(c.store().release_ci_task(&ids["test"], &waiting, 1).is_err());
-    assert!(!c.store().release_ci_task(&ids["test"], &serde_json::json!({}), 1).unwrap());
+    assert!(c
+        .store()
+        .release_ci_task(&ids["test"], &waiting, 1)
+        .is_err());
+    assert!(!c
+        .store()
+        .release_ci_task(&ids["test"], &serde_json::json!({}), 1)
+        .unwrap());
 }

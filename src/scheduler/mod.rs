@@ -373,7 +373,12 @@ fn plan_of(p: &Placement) -> Option<WorkloadPlan> {
         // The steps of a CI task are in its plan; the placement kept their number.
         let steps = p.demand.get("ci_steps").and_then(|n| n.as_u64());
         let steps = u32::try_from(steps.unwrap_or(0)).unwrap_or(u32::MAX);
-        return Some(ci_workload_of(attempt_id, &payload.plan_digest, steps, None));
+        return Some(ci_workload_of(
+            attempt_id,
+            &payload.plan_digest,
+            steps,
+            None,
+        ));
     }
     Some(workload_of(
         attempt_id,

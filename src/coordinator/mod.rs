@@ -1961,10 +1961,12 @@ fn check_spec(
     };
     let invalid = |e: String| CoordinatorError::Invalid(format!("task {task_id}: {e}"));
     demand_of(&input, lease_ms).map_err(|e| invalid(e.to_string()))?;
-    let parsed: TaskSpec = serde_json::from_value(spec.clone()).map_err(|e| invalid(e.to_string()))?;
+    let parsed: TaskSpec =
+        serde_json::from_value(spec.clone()).map_err(|e| invalid(e.to_string()))?;
     if parsed.ci.is_some() {
         // What every worker would refuse is refused here, before the run exists.
-        let payload = build_payload(&input, &parsed, lease_ms).map_err(|e| invalid(e.to_string()))?;
+        let payload =
+            build_payload(&input, &parsed, lease_ms).map_err(|e| invalid(e.to_string()))?;
         crate::worker::ci_task::check_payload(&payload).map_err(|why| invalid(why.into()))?;
         if !policy::ci_declarations_fit(payload.artifacts.len(), payload.outputs.len()) {
             return Err(invalid(
