@@ -895,3 +895,31 @@ mod systemd {
         );
     }
 }
+
+#[test]
+fn the_journal_is_where_every_service_manager_keeps_it() {
+    let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    };
+    let e = env(&[("HOME", "/h")]);
+    let want = PathBuf::from("/h/.config/remote-task-runner/worker-service.json");
+    assert_eq!(Paths::journal_path(&e).unwrap(), want);
+    for backend in [policy::Backend::Launchd, policy::Backend::Systemd] {
+        assert_eq!(Paths::resolve_for(&e, backend).unwrap().journal, want);
+    }
+    let x = env(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "/x")]);
+    let want = PathBuf::from("/x/remote-task-runner/worker-service.json");
+    assert_eq!(Paths::journal_path(&x).unwrap(), want);
+    assert_eq!(
+        Paths::resolve_for(&x, policy::Backend::Systemd)
+            .unwrap()
+            .journal,
+        want
+    );
+    // An unusable home is an error, not "no journal".
+    assert!(Paths::journal_path(&env(&[])).is_err());
+    assert!(Paths::journal_path(&env(&[("HOME", "relative")])).is_err());
+}

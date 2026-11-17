@@ -65,9 +65,7 @@ fn start(args: &Args) -> anyhow::Result<()> {
     let instance = ulid::Ulid::new().to_string();
     // Only the existence of a resident's journal matters; reading it is not
     // this role's business.
-    let resident = Paths::resolve(&env)
-        .ok()
-        .is_some_and(|p| std::fs::symlink_metadata(&p.journal).is_ok());
+    let resident = std::fs::symlink_metadata(Paths::journal_path(&env)?).is_ok();
     let state_exists = env
         .get("HOME")
         .map(|h| Path::new(h).join(".remote-task-runner"))

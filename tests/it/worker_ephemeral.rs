@@ -9,9 +9,7 @@ use std::process::Stdio;
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
-/// Generous: a coverage-instrumented binary under a loaded runner starts and
-/// exits slowly, and these only bound a hang.
-const T: Duration = Duration::from_secs(60);
+const T: Duration = Duration::from_secs(20);
 
 struct Fx {
     root: tempfile::TempDir,

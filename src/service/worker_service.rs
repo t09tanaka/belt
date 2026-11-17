@@ -147,10 +147,9 @@ impl Paths {
     pub fn resolve(env: &BTreeMap<String, String>) -> anyhow::Result<Self> {
         Self::resolve_for(env, policy::Backend::Launchd)
     }
-    pub fn resolve_for(
-        env: &BTreeMap<String, String>,
-        backend: policy::Backend,
-    ) -> anyhow::Result<Self> {
+    /// The user's home and configuration directory, validated. Neither
+    /// depends on the service manager.
+    fn home_and_config(env: &BTreeMap<String, String>) -> anyhow::Result<(PathBuf, PathBuf)> {
         let home = PathBuf::from(env.get("HOME").context("HOME is required")?);
         resident::validate_components(&home)?;
         if let Some(x) = env.get("XDG_CONFIG_HOME") {
@@ -160,6 +159,19 @@ impl Paths {
             .parent()
             .context("configuration parent")?
             .to_owned();
+        Ok((home, config))
+    }
+    /// Where a resident worker's journal lives. The same under every service
+    /// manager, so the answer is the host's whatever it uses; an unusable
+    /// home is an error, never "no journal".
+    pub fn journal_path(env: &BTreeMap<String, String>) -> anyhow::Result<PathBuf> {
+        Ok(Self::home_and_config(env)?.1.join("worker-service.json"))
+    }
+    pub fn resolve_for(
+        env: &BTreeMap<String, String>,
+        backend: policy::Backend,
+    ) -> anyhow::Result<Self> {
+        let (home, config) = Self::home_and_config(env)?;
         // The managed file's directory follows the manager: LaunchAgents, or
         // the user's systemd units beside the configuration directory.
         let services = match backend {
