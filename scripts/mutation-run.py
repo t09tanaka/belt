@@ -7,6 +7,7 @@ import os
 import re
 from pathlib import Path
 import subprocess
+import tempfile
 import time
 import uuid
 
@@ -64,8 +65,12 @@ def main():
     if version != "cargo-schemata 0.4.0":
         raise ValueError(f"expected cargo-schemata 0.4.0, got {version}")
     started = time.monotonic()
-    with (output / "run.log").open("w") as log:
-        result = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    # Keep Unix socket paths short. A mutation of PID classification must
+    # never sweep another test process's live fixture. The unmodified driver
+    # owns cleanup, including leftovers from killed or timed-out mutants.
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="rtr-m-") as fixtures, (output / "run.log").open("w") as log:
+        env = dict(os.environ, RTR_MUTATION_FIXTURE_PARENT=fixtures)
+        result = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in result.stdout:
             log.write(line)
             log.flush()
