@@ -2,12 +2,13 @@
 //! `task-traffic-controller` CLI of the same OS user resolves, so both share
 //! one ledger, one lock, one set of leases and one configuration (spec §14).
 //!
-//! The library has no public function for this (it never looks at `HOME` or
-//! the XDG variables; the rule lives in the CLI binary), so the rule is
-//! written once here. The environment arrives as a map argument; this module
-//! never reads the process environment.
+//! The rule itself is the library's own (`Paths::from_env`, the function the
+//! CLI calls), so it is not written a second time here. What this module adds
+//! is a check before the call. The environment arrives as a map argument;
+//! this module never reads the process environment.
 
 use std::collections::BTreeMap;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use task_traffic_controller::ledger::Ledger;
 use task_traffic_controller::{managed, Context, Paths};
@@ -17,7 +18,8 @@ pub const DIR: &str = "task-traffic-controller";
 /// The variable that moves the CLI's state directory. A step that changed it
 /// would run its nested `task-traffic-controller` against another ledger.
 pub const STATE_HOME_ENV: &str = "XDG_STATE_HOME";
-const CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
+/// The variable that moves the CLI's configuration directory.
+pub const CONFIG_HOME_ENV: &str = "XDG_CONFIG_HOME";
 /// Where a worker kept its own ledger before it shared the CLI's.
 pub const LEGACY_DIR: &str = "traffic";
 
@@ -28,47 +30,58 @@ pub struct Scope {
     pub config_file: PathBuf,
 }
 
-/// The CLI's rule on `env`: `$XDG_STATE_HOME/task-traffic-controller`, else
-/// `$HOME/.local/state/task-traffic-controller`; the configuration is
-/// `$XDG_CONFIG_HOME/task-traffic-controller/config.toml`, else under
+/// The CLI's rule on `env` (`Paths::from_env`): `$XDG_STATE_HOME/` else
+/// `$HOME/.local/state/`, then `task-traffic-controller`; the configuration
+/// is `$XDG_CONFIG_HOME/task-traffic-controller/config.toml`, else under
 /// `$HOME/.config`. As in the CLI an empty variable counts as unset.
 ///
-/// Stricter than the CLI in two places, because a worker and the commands it
-/// starts must resolve the same directory whatever their working directory:
-/// a relative value is refused (the CLI would resolve it against its own
-/// working directory), and a missing `HOME` is refused (the CLI falls back to
-/// `/`).
+/// Stricter than the CLI in two places, checked before the call, because a
+/// worker and the commands it starts must resolve the same directory whatever
+/// their working directory: a relative value is refused (the CLI would
+/// resolve it against its own working directory), and a missing `HOME` is
+/// refused (the CLI falls back to `/`).
 pub fn resolve(env: &BTreeMap<String, String>) -> Result<Scope, String> {
-    let state = base(env, STATE_HOME_ENV, ".local/state")?;
-    let config = base(env, CONFIG_HOME_ENV, ".config")?;
+    let get = |var: &str| env.get(var).filter(|v| !v.is_empty());
+    let state = get(STATE_HOME_ENV);
+    let config = get(CONFIG_HOME_ENV);
+    let home = get("HOME");
+    // HOME decides only what an XDG variable leaves open.
+    for (var, value, needs_home) in [
+        (STATE_HOME_ENV, state, state.is_none()),
+        (CONFIG_HOME_ENV, config, config.is_none()),
+    ] {
+        if needs_home && home.is_none() {
+            return Err(format!(
+                "cannot locate the task-traffic-controller scope: set {var} or HOME"
+            ));
+        }
+        if let Some(value) = value {
+            require_absolute(var, value)?;
+        }
+    }
+    if let Some(home) = home {
+        if state.is_none() || config.is_none() {
+            require_absolute("HOME", home)?;
+        }
+    }
+    let paths = Paths::from_env(
+        home.map(OsStr::new),
+        state.map(OsStr::new),
+        config.map(OsStr::new),
+    );
     Ok(Scope {
-        state_dir: state.join(DIR),
-        config_file: config.join(DIR).join("config.toml"),
+        state_dir: paths.state_dir().to_path_buf(),
+        config_file: paths.config_file().to_path_buf(),
     })
 }
 
-fn base(env: &BTreeMap<String, String>, var: &str, under_home: &str) -> Result<PathBuf, String> {
-    let (name, value, tail) = match env.get(var).filter(|v| !v.is_empty()) {
-        Some(value) => (var, value, None),
-        None => match env.get("HOME").filter(|v| !v.is_empty()) {
-            Some(home) => ("HOME", home, Some(under_home)),
-            None => {
-                return Err(format!(
-                    "cannot locate the task-traffic-controller scope: set {var} or HOME"
-                ))
-            }
-        },
-    };
-    let path = Path::new(value);
-    if !path.is_absolute() {
-        return Err(format!(
-            "{name} must be an absolute path to share one task-traffic-controller scope, not {value:?}"
-        ));
+fn require_absolute(name: &str, value: &str) -> Result<(), String> {
+    if Path::new(value).is_absolute() {
+        return Ok(());
     }
-    Ok(match tail {
-        Some(tail) => path.join(tail),
-        None => path.to_path_buf(),
-    })
+    Err(format!(
+        "{name} must be an absolute path to share one task-traffic-controller scope, not {value:?}"
+    ))
 }
 
 /// Refuse to leave the worker's former scope (`<state>/traffic`) while it

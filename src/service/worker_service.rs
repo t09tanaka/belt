@@ -38,6 +38,9 @@ const ENV: &[&str] = &[
     "LC_ALL",
     "LC_CTYPE",
     "XDG_CONFIG_HOME",
+    // The scope of the task-traffic-controller CLI follows these two, so the
+    // worker takes the values of the user's shell at install or init.
+    "XDG_STATE_HOME",
 ];
 const BINARY: &str = "remote-task-runner";
 /// How long `install` and `start` wait for the agent socket to accept.
@@ -103,6 +106,9 @@ impl Paths {
         if let Some(x) = env.get("XDG_CONFIG_HOME") {
             resident::validate_components(Path::new(x))?;
         }
+        // The worker will share the scope of the user's CLI: refuse here, at
+        // install, an environment it would refuse at start.
+        crate::config::traffic::resolve(env).map_err(anyhow::Error::msg)?;
         let config = crate::config::paths::user_config_path(env)?
             .parent()
             .context("configuration parent")?
@@ -346,11 +352,12 @@ fn plan(paths: &Paths, journal: &Journal) -> anyhow::Result<policy::Plan> {
             Sha256::digest(paths.config.as_os_str().as_encoded_bytes())
         )[..12]
     );
-    // The service environment never carries a configuration redirect.
+    // The service environment never carries a configuration or state
+    // redirect: the worker reads both from the journal, not from its process.
     let environment = journal
         .env
         .iter()
-        .filter(|(k, _)| k.as_str() != "XDG_CONFIG_HOME")
+        .filter(|(k, _)| !matches!(k.as_str(), "XDG_CONFIG_HOME" | "XDG_STATE_HOME"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     policy::render(&policy::Definition {

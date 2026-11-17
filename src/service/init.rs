@@ -43,6 +43,9 @@ const ENV: &[&str] = &[
     "LC_ALL",
     "LC_CTYPE",
     "XDG_CONFIG_HOME",
+    // The scope of the task-traffic-controller CLI follows these two, so the
+    // worker takes the values of the user's shell at install or init.
+    "XDG_STATE_HOME",
 ];
 
 #[derive(Clone)]
@@ -67,6 +70,9 @@ impl Paths {
         if let Some(x) = env.get("XDG_CONFIG_HOME") {
             resident::validate_components(Path::new(x))?;
         }
+        // The worker will share the scope of the user's CLI: refuse here, at
+        // install, an environment it would refuse at start.
+        crate::config::traffic::resolve(env).map_err(anyhow::Error::msg)?;
         let user = crate::config::paths::user_config_path(env)?;
         let config = user.parent().context("configuration parent")?.to_owned();
         let root = env
@@ -426,7 +432,7 @@ fn plan(paths: &Paths, j: &Journal) -> anyhow::Result<macos::policy::Plan> {
         .spec
         .env
         .iter()
-        .filter(|(k, _)| k.as_str() != "XDG_CONFIG_HOME")
+        .filter(|(k, _)| !matches!(k.as_str(), "XDG_CONFIG_HOME" | "XDG_STATE_HOME"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     macos::policy::render(&macos::policy::Definition {

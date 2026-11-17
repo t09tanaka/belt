@@ -78,10 +78,14 @@ const INSTALL_GUARDS: &[(&str, &str)] = &[
     ("MISE_AUTO_INSTALL", "false"),
 ];
 // `XDG_STATE_HOME` decides (with `HOME`) which task-traffic-controller ledger
-// a nested CLI uses: a command keeps the worker's value, set or unset.
+// a nested CLI uses, and `XDG_CONFIG_HOME` which configuration: a command
+// keeps the worker's value of both, set or unset.
+fn scope_env(key: &str) -> bool {
+    key == crate::config::traffic::STATE_HOME_ENV || key == crate::config::traffic::CONFIG_HOME_ENV
+}
 fn protected_env(key: &str) -> bool {
     matches!(key, "PATH" | "SHELL" | "HOME" | "TMPDIR")
-        || key == crate::config::traffic::STATE_HOME_ENV
+        || scope_env(key)
         || INSTALL_GUARDS.iter().any(|(name, _)| *name == key)
 }
 
@@ -201,7 +205,7 @@ impl Profile {
                 .filter(|(k, _)| {
                     definition.allowed_env.contains(*k)
                         || matches!(k.as_str(), "HOME" | "TMPDIR")
-                        || k.as_str() == crate::config::traffic::STATE_HOME_ENV
+                        || scope_env(k)
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
@@ -1481,6 +1485,47 @@ mod tests {
             "allowed_env = [\"XDG_STATE_HOME\"]\n[profiles.node22.env]\nXDG_STATE_HOME = \"/mine\"",
         );
         assert!(Profile::load(dir.path(), &with_state).is_err());
+    }
+    /// The configuration of a nested task-traffic-controller follows
+    /// `XDG_CONFIG_HOME`: a command gets the worker's value, explicit profile
+    /// or not, and cannot replace it.
+    #[test]
+    fn a_command_keeps_the_config_home_of_the_worker() {
+        let set = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let mut with_config = env(dir.path());
+        with_config.insert("XDG_CONFIG_HOME".into(), "/config".into());
+        let default = Profile::load(dir.path(), &with_config).unwrap();
+        assert_eq!(default.environment()["XDG_CONFIG_HOME"], "/config");
+        assert!(default
+            .execution_environment(&set(&[("XDG_CONFIG_HOME", "/other")]))
+            .is_err());
+        write_profile(dir.path(), "node22", "allowed_env = [\"OTHER\"]");
+        let explicit = Profile::load(dir.path(), &with_config).unwrap();
+        assert_eq!(explicit.environment()["XDG_CONFIG_HOME"], "/config");
+        assert_eq!(
+            explicit
+                .execution_environment(&set(&[("XDG_CONFIG_HOME", "/config")]))
+                .unwrap()["XDG_CONFIG_HOME"],
+            "/config"
+        );
+        assert!(explicit
+            .execution_environment(&set(&[("XDG_CONFIG_HOME", "/other")]))
+            .is_err());
+        // Unset for the worker means unset for the command.
+        let unset = Profile::load(dir.path(), &env(dir.path())).unwrap();
+        assert!(!unset.environment().contains_key("XDG_CONFIG_HOME"));
+        write_profile(
+            dir.path(),
+            "node22",
+            "allowed_env = [\"XDG_CONFIG_HOME\"]\n[profiles.node22.env]\nXDG_CONFIG_HOME = \"/mine\"",
+        );
+        assert!(Profile::load(dir.path(), &with_config).is_err());
     }
     #[test]
     fn private_input_rejects_symlinks_permissions_secrets_and_required_missing() {

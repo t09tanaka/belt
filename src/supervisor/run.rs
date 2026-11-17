@@ -819,6 +819,7 @@ impl Control<'_> {
         };
         let opts = Opts {
             label: None,
+            parent: None,
             weight: node.weight,
             front: false,
             key: profile_history_key(
@@ -1119,6 +1120,7 @@ impl Control<'_> {
                         weight_used: entry.weight,
                         contended: ran.contended,
                         measurement_id: None,
+                        extra: Default::default(),
                     };
                     // The command id fences replay. A crash between durable
                     // finish and this append can lose one sample; recovery

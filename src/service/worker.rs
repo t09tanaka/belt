@@ -22,6 +22,9 @@ const ENV: &[&str] = &[
     "LC_ALL",
     "LC_CTYPE",
     "XDG_CONFIG_HOME",
+    // The scope of the task-traffic-controller CLI follows these two, so the
+    // worker takes the values of the user's shell at install or init.
+    "XDG_STATE_HOME",
 ];
 
 /// Provisioned out of band; never generated from an unverified peer hello.

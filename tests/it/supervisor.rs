@@ -2407,3 +2407,116 @@ fn generic_conditions_cover_timeout_prelaunch_cancel_and_prepared_only() {
         }
     }
 }
+
+// ---------------------------------------------- a ledger in the v3 shape
+
+/// A nested entry as `task-traffic-controller` 0.9 and later write it: it
+/// names the entry it runs under, which makes `Ledger::save` write the file in
+/// the v3 shape that a 0.8 library cannot read.
+fn nested_entry(id: &str, parent: &str) -> task_traffic_controller::ledger::Entry {
+    serde_json::from_value(serde_json::json!({
+        "id": id, "pid": std::process::id(), "state": "running", "front": false,
+        "weight": 1, "predicted_rss": 0, "repo": "", "argv": "x", "key": "k",
+        "seq": 1, "enqueued_at": "2030-01-01T00:00:00Z", "parent": parent,
+    }))
+    .unwrap()
+}
+
+/// Put a v3 ledger with one live nested entry into `scope`. The returned
+/// lease keeps the entry alive (the reaper keeps what holds one).
+fn seed_v3_ledger(scope: &Path) -> task_traffic_controller::lock::Lock {
+    let ctx = task_traffic_controller::Context::new(task_traffic_controller::Paths::new(
+        scope,
+        scope.join("config.toml"),
+    ));
+    let ledger = task_traffic_controller::ledger::Ledger {
+        entries: vec![nested_entry("cli-nested", "cli-outer")],
+        ..Default::default()
+    };
+    ledger.save(&ctx.paths.ledger_file()).unwrap();
+    assert_eq!(
+        task_traffic_controller::ledger::Ledger::file_format(&ctx.paths.ledger_file()),
+        task_traffic_controller::ledger::NESTED_SCHEMA_VERSION,
+    );
+    task_traffic_controller::lock::take_lease(&ctx, "cli-nested").unwrap()
+}
+
+#[test]
+fn a_run_goes_on_while_the_scope_holds_a_v3_ledger() {
+    let f = fx(vec![node("build", "exit 0")]);
+    let _lease = seed_v3_ledger(&f.spec.traffic_state_dir);
+    let r = run(&f.spec).unwrap();
+    assert_eq!(settled(&r).outcome(), Outcome::Succeeded, "{}", f.output());
+    // The other command's entry is still there, still in the v3 shape.
+    let path =
+        task_traffic_controller::Paths::new(&f.spec.traffic_state_dir, "unused").ledger_file();
+    assert_eq!(
+        task_traffic_controller::ledger::Ledger::file_format(&path),
+        task_traffic_controller::ledger::NESTED_SCHEMA_VERSION,
+    );
+    let ledger = task_traffic_controller::ledger::Ledger::load(&path).unwrap();
+    assert!(ledger.entries.iter().any(|e| e.id == "cli-nested"));
+}
+
+/// The real thing: while a step's own `task-traffic-controller exec` runs, the
+/// installed CLI keeps the ledger in the v3 shape, and the worker's library
+/// still inspects the scope and supervises another attempt. Needs the CLI
+/// (0.9 or later) on `PATH`, so it is run by hand:
+/// `cargo test --test it a_real_nested_cli -- --ignored`.
+#[test]
+#[ignore = "needs the task-traffic-controller CLI 0.9 or later on PATH"]
+fn a_real_nested_cli_leaves_the_worker_able_to_read_the_ledger() {
+    let cli = std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .map(|d| d.join("task-traffic-controller"))
+        .find(|p| p.is_file())
+        .expect("task-traffic-controller on PATH");
+    let home = crate::test_tmp::tempdir().unwrap();
+    let scope = home.path().join(".local/state/task-traffic-controller");
+    let started = home.path().join("started");
+    let release = home.path().join("release");
+    let inner = format!(
+        "touch {}; while [ ! -e {} ]; do sleep 0.05; done",
+        started.display(),
+        release.display()
+    );
+    let mut outer = fx(vec![]);
+    outer.spec.traffic_state_dir = scope.clone();
+    outer.spec.nodes = vec![NodeSpec {
+        env: BTreeMap::from([
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("HOME".into(), home.path().display().to_string()),
+            ("RTR_TEST_CLI".into(), cli.display().to_string()),
+            ("RTR_TEST_INNER".into(), inner),
+        ]),
+        ..node(
+            "outer",
+            "\"$RTR_TEST_CLI\" exec -- /bin/sh -c \"$RTR_TEST_INNER\"",
+        )
+    }];
+    let other = fx(vec![node("other", "exit 0")]);
+    let mut other_spec = other.spec.clone();
+    other_spec.traffic_state_dir = scope.clone();
+    let ledger_file = task_traffic_controller::Paths::new(&scope, "unused").ledger_file();
+    std::thread::scope(|s| {
+        let runner = s.spawn(|| run(&outer.spec).unwrap());
+        wait_for("the nested command to start", || started.exists());
+        // The CLI wrote the nested entry in the shape a 0.8 library refused.
+        assert_eq!(
+            task_traffic_controller::ledger::Ledger::file_format(&ledger_file),
+            task_traffic_controller::ledger::NESTED_SCHEMA_VERSION,
+        );
+        let ctx = task_traffic_controller::Context::new(task_traffic_controller::Paths::new(
+            &scope,
+            scope.join("config.toml"),
+        ));
+        let seen = task_traffic_controller::inspect::inspect(&ctx).unwrap();
+        assert!(seen.entries.iter().any(|e| e.entry.parent.is_some()));
+        let t = settled(&run(&other_spec).unwrap());
+        assert_eq!(t.outcome(), Outcome::Succeeded, "{}", other.output());
+        std::fs::write(&release, "").unwrap();
+        let t = settled(&runner.join().unwrap());
+        assert_eq!(t.outcome(), Outcome::Succeeded, "{}", outer.output());
+    });
+}

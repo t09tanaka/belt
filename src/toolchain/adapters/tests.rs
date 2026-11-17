@@ -1023,3 +1023,34 @@ fn preparation_probe_activation_cannot_mix_verification_queries() {
         Err("probe_verification_query_mismatch")
     );
 }
+/// An adapter cannot move the worker's task-traffic-controller scope for the
+/// commands that run under its activation.
+#[test]
+fn an_activation_never_replaces_the_xdg_scope_of_the_worker() {
+    let mut f = fixture(AdapterKind::Corepack, "pnpm");
+    for var in ["XDG_STATE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME"] {
+        f.plan.activation_env.insert(var.into(), "/adapter".into());
+    }
+    let mut fake = Fake::for_plan(&f.plan);
+    let receipt = install_admitted(&f.plan, &mut fake).unwrap();
+    let mut base = base_env(&f.plan);
+    base.insert("XDG_STATE_HOME".into(), "/private/worker-state".into());
+    let activation = activate(
+        &f.plan,
+        &receipt,
+        Digest::of_bytes(b"base"),
+        &base,
+        Digest::of_bytes(b"setup"),
+        &f.shell,
+    )
+    .unwrap();
+    assert_eq!(
+        activation.environment["XDG_STATE_HOME"],
+        base["XDG_STATE_HOME"]
+    );
+    assert_eq!(
+        activation.environment["XDG_CONFIG_HOME"],
+        base["XDG_CONFIG_HOME"]
+    );
+    assert!(!activation.environment.contains_key("XDG_DATA_HOME"));
+}
