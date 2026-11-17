@@ -30,6 +30,11 @@ want = {
     "src/shard/isolation.rs",
     "src/demand.rs",
     "src/result_wire.rs",
+    "src/driver.rs",
+    "src/driver/atomic.rs",
+    "src/driver/dispatch.rs",
+    "src/driver/shards.rs",
+    "src/job_evaluate.rs",
 }
 seen = set()
 bad = []

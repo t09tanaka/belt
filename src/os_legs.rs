@@ -81,7 +81,7 @@ pub fn family_of_runs_on(v: &Value) -> Option<(Family, String)> {
 pub fn family_of_leg(job: &Job, contexts: &Map<String, Value>) -> Option<(Family, String)> {
     let y = job.runs_on.as_ref()?;
     let ctx = crate::expr::Ctx::new(contexts, crate::expr::Status::Success);
-    let v = crate::exec::eval_strings(&crate::matrix::yaml_to_json(y), &ctx).ok()?;
+    let v = crate::job_evaluate::eval_strings(&crate::matrix::yaml_to_json(y), &ctx).ok()?;
     family_of_runs_on(&v)
 }
 

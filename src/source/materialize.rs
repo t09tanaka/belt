@@ -99,7 +99,7 @@ pub fn materialize_from(store: &ObjectStore, m: &SourceManifest, dest: &Path) ->
             materialize_from(store, &nested, &dir)?;
         }
     }
-    let got = scan(dest, &sub_paths)?;
+    let got = scan(dest, &sub_paths, &[])?;
     if tree_digest(&got) != m.object_manifest.tree_digest {
         return Err(SourceError::Corrupt {
             what: "the materialized tree does not hash to the manifest".into(),
@@ -114,8 +114,14 @@ fn check_digest_of(m: &SourceManifest) -> Result<()> {
 }
 
 /// What is under `dest` (not looking into `skip`), in manifest form.
-fn scan(dest: &Path, skip: &[&RelPath]) -> Result<Vec<FileEntry>> {
-    fn walk(root: &Path, rel: &RelPath, skip: &[&RelPath], out: &mut Vec<FileEntry>) -> Result<()> {
+fn scan(dest: &Path, skip: &[&RelPath], unverified: &[RelPath]) -> Result<Vec<FileEntry>> {
+    fn walk(
+        root: &Path,
+        rel: &RelPath,
+        skip: &[&RelPath],
+        unverified: &[RelPath],
+        out: &mut Vec<FileEntry>,
+    ) -> Result<()> {
         let here = if rel.is_empty() {
             root.to_path_buf()
         } else {
@@ -132,13 +138,17 @@ fn scan(dest: &Path, skip: &[&RelPath]) -> Result<Vec<FileEntry>> {
             }
             b.extend_from_slice(name.as_bytes());
             let p = RelPath(b);
+            // declared by the host: whatever is there is not looked at
+            if unverified.contains(&p) {
+                continue;
+            }
             let full = root.join(p.to_path());
             let md = std::fs::symlink_metadata(&full)?;
             if md.is_dir() {
                 if skip.iter().any(|s| **s == p) {
                     continue;
                 }
-                walk(root, &p, skip, out)?;
+                walk(root, &p, skip, unverified, out)?;
             } else if md.file_type().is_symlink() {
                 let t = std::fs::read_link(&full)?;
                 let bytes = t.as_os_str().as_bytes();
@@ -168,7 +178,7 @@ fn scan(dest: &Path, skip: &[&RelPath]) -> Result<Vec<FileEntry>> {
         Ok(())
     }
     let mut out = vec![];
-    walk(dest, &RelPath(vec![]), skip, &mut out)?;
+    walk(dest, &RelPath(vec![]), skip, unverified, &mut out)?;
     out.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(out)
 }
@@ -455,10 +465,79 @@ pub fn verify_materialized_from(
     m: &SourceManifest,
     root: &Path,
 ) -> Result<()> {
+    verify_materialized_except(store, m, root, &[])
+}
+
+/// What a host may leave out of the verification of a workspace: `paths`
+/// (files or directories it placed there) and `secret_files`, each of which the
+/// manifest must declare. Returns them sorted, without repeats.
+///
+/// A path is relative to the root and normalized: no empty, `.`, `..` or
+/// `.git` component, so not absolute. It must not be a symbolic link, lead
+/// through one or through a file, or touch a submodule.
+pub fn check_unverified_paths(
+    m: &SourceManifest,
+    root: &Path,
+    paths: &[RelPath],
+    secret_files: &[RelPath],
+) -> Result<Vec<RelPath>> {
+    let mut all = BTreeSet::new();
+    for (path, secret) in paths
+        .iter()
+        .map(|p| (p, false))
+        .chain(secret_files.iter().map(|p| (p, true)))
+    {
+        check_safe(path)?;
+        if secret && !m.secret_files.iter().any(|s| s.path == *path) {
+            bail!(
+                "{} is not a secret file of the captured source",
+                path.display()
+            );
+        }
+        if m.submodules.iter().any(|sub| {
+            sub.path == *path || path.starts_with_dir(&sub.path) || sub.path.starts_with_dir(path)
+        }) {
+            bail!("{} overlaps a submodule", path.display());
+        }
+        for ancestor in path.ancestors() {
+            let md = std::fs::symlink_metadata(root.join(ancestor.to_path()));
+            if !md.is_ok_and(|md| md.is_dir()) {
+                bail!(
+                    "{} leads through a symbolic link or a non-directory",
+                    path.display()
+                );
+            }
+        }
+        match std::fs::symlink_metadata(root.join(path.to_path())) {
+            Ok(md) if md.file_type().is_symlink() => {
+                bail!("{} is a symbolic link", path.display())
+            }
+            Ok(md) if secret && !md.is_file() => {
+                bail!("secret file {} is not a regular file", path.display())
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        all.insert(path.clone());
+    }
+    Ok(all.into_iter().collect())
+}
+
+/// [`verify_materialized_from`], leaving out `unverified` (as
+/// [`check_unverified_paths`] returned them) and everything below them.
+/// Everything else has to match the captured source byte for byte.
+pub fn verify_materialized_except(
+    store: &ObjectStore,
+    m: &SourceManifest,
+    root: &Path,
+    unverified: &[RelPath],
+) -> Result<()> {
     fn verify(
         store: &ObjectStore,
         m: &SourceManifest,
         root: &Path,
+        unverified: &[RelPath],
         ancestors: &mut BTreeSet<String>,
         remaining: &mut usize,
     ) -> Result<()> {
@@ -507,12 +586,28 @@ pub fn verify_materialized_from(
                 if nested.source_id != *id {
                     bail!("captured submodule identity mismatch");
                 }
-                verify(store, &nested, &nested_root, ancestors, remaining)?;
+                verify(store, &nested, &nested_root, &[], ancestors, remaining)?;
             } else if std::fs::read_dir(&nested_root)?.next().is_some() {
                 bail!("uncaptured submodule is not empty");
             }
         }
-        if tree_digest(&scan(root, &sub_paths)?) != m.object_manifest.tree_digest {
+        let expected = if unverified.is_empty() {
+            m.object_manifest.tree_digest.clone()
+        } else {
+            let kept: Vec<FileEntry> = m
+                .object_manifest
+                .entries
+                .iter()
+                .filter(|entry| {
+                    !unverified
+                        .iter()
+                        .any(|u| entry.path == *u || entry.path.starts_with_dir(u))
+                })
+                .cloned()
+                .collect();
+            tree_digest(&kept)
+        };
+        if tree_digest(&scan(root, &sub_paths, unverified)?) != expected {
             bail!("workspace bytes do not match captured source");
         }
         ancestors.remove(&m.source_id);
@@ -522,6 +617,7 @@ pub fn verify_materialized_from(
         store,
         m,
         root,
+        unverified,
         &mut BTreeSet::new(),
         &mut (super::MAX_DIRTY_SUBMODULES + 1),
     )

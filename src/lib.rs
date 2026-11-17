@@ -16,11 +16,14 @@ pub mod cpu;
 pub mod dag;
 pub mod demand;
 mod digest;
+pub mod driver;
 pub mod exec;
+mod execution_outcome;
 pub mod expr;
 pub mod filter;
 pub mod frozen;
 pub mod git;
+mod job_evaluate;
 pub mod matrix;
 pub mod os_legs;
 pub mod plan;
@@ -54,7 +57,8 @@ pub use run::{
 };
 pub use step_executor::{ScriptPipe, StepExecutor, StepExit, StepRequest};
 pub use task::{
-    aggregate_matrix, execute_setup, execute_task, JobOutcome, JobStatus, TaskInputs, TaskResult,
+    aggregate_matrix, execute_git_dispatch, execute_setup, execute_task, JobOutcome, JobStatus,
+    TaskInputs, TaskResult,
 };
 
 pub use source_plan::{

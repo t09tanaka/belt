@@ -18,7 +18,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 struct CancelState {
     cancelled: AtomicBool,
     pgids: Mutex<Vec<i32>>,
+    native_uncertain: Mutex<Vec<u32>>,
     containers: Mutex<Vec<String>>,
+    creation_candidates: Mutex<Vec<String>>,
+    unverified_compose: Mutex<Vec<String>>,
+    pending_ports: Mutex<Vec<PathBuf>>,
+    external_executor: AtomicBool,
     compose_projects: Mutex<Vec<String>>,
 }
 
@@ -63,6 +68,21 @@ impl CancelHandle {
         self.0.pgids.lock().unwrap().retain(|&p| p != pg);
     }
 
+    pub(crate) fn record_native_uncertain(&self, leader: u32) {
+        let mut ids = self.0.native_uncertain.lock().unwrap();
+        ids.push(leader);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_group_count(&self) -> usize {
+        self.0.pgids.lock().unwrap().len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn native_uncertain(&self) -> Vec<u32> {
+        self.0.native_uncertain.lock().unwrap().clone()
+    }
+
     pub(crate) fn track_container(&self, name: String) {
         self.0.containers.lock().unwrap().push(name);
     }
@@ -87,15 +107,108 @@ impl CancelHandle {
             .retain(|p| !projects.contains(p));
     }
 
-    /// Take down what this attempt still has up: compose projects, then
-    /// containers.
-    pub(crate) fn remove_containers(&self, ctx: &ExecContext) {
-        let projects: Vec<String> = self.0.compose_projects.lock().unwrap().drain(..).collect();
-        for diagnostic in crate::cleanup::compose_down(ctx, &projects) {
-            eprintln!("local-ci: {diagnostic}");
+    pub(crate) fn creation_started(&self, name: String) {
+        self.0.creation_candidates.lock().unwrap().push(name);
+    }
+    pub(crate) fn creation_acknowledged(&self, name: &str, id: String) {
+        self.track_container(id);
+        // A later successful operation with the same requested name cannot
+        // erase an earlier ambiguous creation operation.
+        let mut candidates = self.0.creation_candidates.lock().unwrap();
+        if let Some(index) = candidates.iter().rposition(|n| n == name) {
+            candidates.remove(index);
         }
-        let names: Vec<String> = self.0.containers.lock().unwrap().drain(..).collect();
-        for diagnostic in crate::cleanup::remove_tracked_containers(ctx, &names) {
+    }
+    pub(crate) fn track_unverified_compose(&self, name: String) {
+        let mut names = self.0.unverified_compose.lock().unwrap();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    pub(crate) fn external_execution_started(&self) {
+        self.0.external_executor.store(true, Ordering::SeqCst);
+    }
+    pub(crate) fn port_release_pending(&self, path: &std::path::Path) {
+        let mut paths = self.0.pending_ports.lock().unwrap();
+        if !paths.iter().any(|p| p == path) {
+            paths.push(path.into());
+        }
+    }
+    pub(crate) fn port_release_confirmed(&self, path: &std::path::Path) {
+        self.0.pending_ports.lock().unwrap().retain(|p| p != path);
+    }
+    pub(crate) fn pending_ownership(&self) -> crate::execution_outcome::PendingOwnership {
+        crate::execution_outcome::PendingOwnership {
+            native_groups: self.0.pgids.lock().unwrap().len(),
+            native_uncertain: self.0.native_uncertain.lock().unwrap().clone(),
+            external_executor: self.0.external_executor.load(Ordering::SeqCst),
+            containers: self.0.containers.lock().unwrap().clone(),
+            creation_candidates: self.0.creation_candidates.lock().unwrap().clone(),
+            compose: self.0.compose_projects.lock().unwrap().clone(),
+            unverified_compose: self.0.unverified_compose.lock().unwrap().clone(),
+            port_paths: self.0.pending_ports.lock().unwrap().clone(),
+        }
+    }
+    pub(crate) fn cleanup_projects(
+        &self,
+        ctx: &ExecContext,
+        projects: &[String],
+    ) -> Vec<crate::cleanup::CleanupIncomplete> {
+        #[cfg(test)]
+        crate::exec::finalization_test::inspect("resource cleanup");
+        let unverified = self.0.unverified_compose.lock().unwrap().clone();
+        let allowed: Vec<String> = projects
+            .iter()
+            .filter(|p| !unverified.contains(p))
+            .cloned()
+            .collect();
+        let mut errors = crate::cleanup::compose_down(ctx, &allowed);
+        if errors.is_empty() {
+            self.untrack_compose(&allowed);
+        }
+        if projects.iter().any(|p| unverified.contains(p)) {
+            errors.push(crate::cleanup::CleanupIncomplete(
+                "unverified Compose namespace retained".into(),
+            ));
+        }
+        errors
+    }
+    pub(crate) fn cleanup_owned(
+        &self,
+        ctx: &ExecContext,
+    ) -> crate::execution_outcome::CleanupOutcome {
+        let projects = self.0.compose_projects.lock().unwrap().clone();
+        let mut diagnostics = self.cleanup_projects(ctx, &projects);
+        let ids = self.0.containers.lock().unwrap().clone();
+        let removed = crate::cleanup::remove_tracked_containers(ctx, &ids);
+        if removed.is_empty() {
+            self.untrack_containers(&ids.iter().collect());
+        }
+        diagnostics.extend(removed);
+        let pending = self.pending_ownership();
+        if !pending.creation_candidates.is_empty() {
+            diagnostics.push(crate::cleanup::CleanupIncomplete(
+                "unconfirmed container creation retained".into(),
+            ));
+        }
+        if !pending.unverified_compose.is_empty()
+            && !diagnostics
+                .iter()
+                .any(|d| d.0 == "unverified Compose namespace retained")
+        {
+            diagnostics.push(crate::cleanup::CleanupIncomplete(
+                "unverified Compose namespace retained".into(),
+            ));
+        }
+        crate::execution_outcome::CleanupOutcome {
+            diagnostics,
+            pending,
+        }
+    }
+    /// Legacy caller projection: warnings are separate from business results.
+    /// Failed/unknown references remain available to the owned outcome API.
+    pub(crate) fn remove_containers(&self, ctx: &ExecContext) {
+        for diagnostic in self.cleanup_owned(ctx).diagnostics {
             eprintln!("local-ci: warning: {diagnostic}");
         }
     }
@@ -251,5 +364,78 @@ mod tests {
         assert_eq!(*c.0.pgids.lock().unwrap(), vec![2]);
         c.untrack_pgid(2);
         assert!(c.0.pgids.lock().unwrap().is_empty());
+    }
+    fn cleanup_fixture(body: &str) -> (tempfile::TempDir, ExecContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let docker = root.path().join("docker");
+        std::fs::write(
+            &docker,
+            format!("#!/bin/sh\necho \"$*\" >> \"$HOME/calls\"\n{body}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(docker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let ctx = ExecContext::new(
+            [
+                (
+                    "PATH".into(),
+                    format!("{}:/usr/bin:/bin", root.path().display()),
+                ),
+                ("HOME".into(), root.path().display().to_string()),
+            ]
+            .into(),
+        );
+        (root, ctx)
+    }
+    #[test]
+    fn failed_owned_id_cleanup_is_retained_until_acknowledged_retry() {
+        let id = "a".repeat(64);
+        let script = format!(
+            r#"case "$1" in
+ps) [ -f "$HOME/removed" ] || echo '{id}';;
+rm) [ -f "$HOME/allow" ] || exit 1; touch "$HOME/removed";;
+esac
+exit 0"#
+        );
+        let (root, ctx) = cleanup_fixture(&script);
+        ctx.cancel.track_container(id.clone());
+        let failed = ctx.cancel.cleanup_owned(&ctx);
+        assert!(!failed.diagnostics.is_empty());
+        assert_eq!(failed.pending.containers, vec![id.clone()]);
+        std::fs::write(root.path().join("allow"), b"now").unwrap();
+        let retried = ctx.cancel.cleanup_owned(&ctx);
+        assert!(retried.diagnostics.is_empty());
+        assert!(retried.pending.no_known_pending());
+        // A repeated acknowledged-absent ID is cleared without rm by name.
+        ctx.cancel.track_container(id.clone());
+        assert!(ctx.cancel.cleanup_owned(&ctx).pending.no_known_pending());
+        let calls = std::fs::read_to_string(root.path().join("calls")).unwrap();
+        assert_eq!(calls.lines().filter(|l| l.starts_with("rm ")).count(), 2);
+        assert!(calls.lines().all(|l| !l.contains("local-ci-")));
+    }
+    #[test]
+    fn uncertain_creation_and_external_compose_names_never_authorize_deletion() {
+        let (root, ctx) = cleanup_fixture("exit 0");
+        ctx.cancel.creation_started("candidate-name".into());
+        ctx.cancel.track_compose("shared-name".into());
+        ctx.cancel.track_unverified_compose("shared-name".into());
+        let outcome = ctx.cancel.cleanup_owned(&ctx);
+        assert_eq!(outcome.pending.creation_candidates, vec!["candidate-name"]);
+        assert_eq!(outcome.pending.unverified_compose, vec!["shared-name"]);
+        assert!(!outcome.pending.no_known_pending());
+        assert!(!root.path().join("calls").exists());
+        let debug = format!("{:?}", outcome.pending);
+        assert!(!debug.contains("candidate-name") && !debug.contains("shared-name"));
+    }
+    #[test]
+    fn an_id_filtered_query_cannot_expand_cleanup_to_another_id() {
+        let (root, ctx) = cleanup_fixture(&format!("echo '{}'\nexit 0", "b".repeat(64)));
+        ctx.cancel.track_container("a".repeat(64));
+        let outcome = ctx.cancel.cleanup_owned(&ctx);
+        assert_eq!(outcome.pending.containers, vec!["a".repeat(64)]);
+        assert!(!outcome.diagnostics.is_empty());
+        assert!(!std::fs::read_to_string(root.path().join("calls"))
+            .unwrap()
+            .contains("rm "));
     }
 }

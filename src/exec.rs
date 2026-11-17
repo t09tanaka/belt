@@ -1,5 +1,7 @@
 //! Running the plan: setup once, then every unit on its own thread.
 
+mod native_step;
+
 use crate::artifact::{self};
 use crate::artifact_io;
 use crate::context::ExecContext;
@@ -192,6 +194,10 @@ pub struct Workspace {
 }
 
 pub struct Runner<'a> {
+    selected: Option<(
+        crate::driver::dispatch::Selection,
+        crate::driver::PortableFacts,
+    )>,
     pinned: Option<(
         &'a crate::source_execute::PinnedExecution<'a>,
         &'a crate::source_execute::PinnedWorkspace,
@@ -833,6 +839,15 @@ fn rewrite_env_value(key: &str, val: &str, maps: &[PortMap]) -> String {
 }
 
 impl<'a> Runner<'a> {
+    pub(crate) fn select_derived(
+        mut self,
+        selection: crate::driver::dispatch::Selection,
+        facts: crate::driver::PortableFacts,
+    ) -> Self {
+        self.selected = Some((selection, facts));
+        self
+    }
+
     pub fn new(
         ctx: &'a ExecContext,
         fp: &'a FrozenPlan,
@@ -917,6 +932,7 @@ impl<'a> Runner<'a> {
             .filter_map(|wf| Some((wf, artifact_io::workflow_refusal(&plan, wf)?)))
             .collect();
         Ok(Runner {
+            selected: None,
             pinned,
             ctx,
             fp,
@@ -936,7 +952,14 @@ impl<'a> Runner<'a> {
             base_path,
             seq: pinned
                 .map(|(_, ws, _)| ws.sequence.clone())
-                .unwrap_or_else(|| Arc::new(AtomicUsize::new(0))),
+                .unwrap_or_else(|| {
+                    // Ordinary runners name resources by process ID. Fresh
+                    // attempts in that process must share the counter too.
+                    static SEQUENCE: OnceLock<Arc<AtomicUsize>> = OnceLock::new();
+                    SEQUENCE
+                        .get_or_init(|| Arc::new(AtomicUsize::new(0)))
+                        .clone()
+                }),
             synced: Mutex::new(HashSet::new()),
             docker_ok: OnceLock::new(),
         })
@@ -1088,6 +1111,7 @@ impl<'a> Runner<'a> {
     #[allow(clippy::too_many_arguments)]
     fn shell(
         &self,
+        native_scope: &native_step::NativeScope,
         cwd: &Path,
         script: &str,
         shell: Option<&str>,
@@ -1105,6 +1129,7 @@ impl<'a> Runner<'a> {
         loop {
             let from = fs::metadata(log).map(|m| m.len()).unwrap_or(0);
             let (r, q) = self.shell_once(
+                native_scope,
                 cwd,
                 script,
                 shell,
@@ -1134,6 +1159,7 @@ impl<'a> Runner<'a> {
     #[allow(clippy::too_many_arguments)]
     fn shell_once(
         &self,
+        native_scope: &native_step::NativeScope,
         cwd: &Path,
         script: &str,
         shell: Option<&str>,
@@ -1243,6 +1269,7 @@ impl<'a> Runner<'a> {
             return Ok((Exit::Code(1), Duration::ZERO));
         }
         if let Some(ex) = &self.opts.executor {
+            self.ctx.cancel.external_execution_started();
             return self.shell_via_executor(
                 ex.as_ref(),
                 n,
@@ -1299,11 +1326,12 @@ impl<'a> Runner<'a> {
         } else {
             None
         };
-        let mut child = cmd
+        let child = cmd
             .spawn()
             .with_context(|| format!("cannot start {}", argv[0]))?;
-        let writer_stop = Arc::new(AtomicBool::new(false));
-        let mut writer = None;
+        let wrapped = self.opts.traffic_controller.is_some() && key.is_some();
+        let mut child = native_step::NativeStep::new(child, self.ctx.cancel.clone(), wrapped);
+        let writer_stop = child.writer_stop();
         if let Some((r, w)) = pipe {
             // the child has its own copy
             drop(r);
@@ -1313,13 +1341,11 @@ impl<'a> Runner<'a> {
             // if something that outlived the step still holds the read end.
             let body = body.clone();
             let stop = writer_stop.clone();
-            writer = Some(std::thread::spawn(move || {
+            child.set_writer(std::thread::spawn(move || {
                 write_until_stopped(w, body.as_bytes(), &stop)
             }));
         }
-        let pid = child.id() as i32;
         let spawned = (Instant::now(), std::time::SystemTime::now());
-        self.ctx.cancel.track_pgid(pid);
         // With task-traffic-controller the clock starts when the command gets its turn, not while it waits.
         let mut started: Option<Instant> = if self.opts.traffic_controller.is_some() {
             None
@@ -1330,7 +1356,7 @@ impl<'a> Runner<'a> {
         let mut term_at: Option<Instant> = None;
         let mut timed_out = false;
         let status = loop {
-            if let Some(st) = child.try_wait()? {
+            if let Some(st) = child.observe()? {
                 break st;
             }
             if started.is_none() && marked && turn.exists() {
@@ -1356,24 +1382,15 @@ impl<'a> Runner<'a> {
             let over = matches!((timeout, started), (Some(t), Some(s)) if s.elapsed() > t);
             if (over || self.ctx.cancel.is_cancelled()) && term_at.is_none() {
                 timed_out = over;
-                unsafe {
-                    libc::killpg(pid, libc::SIGTERM);
-                }
+                child.signal(libc::SIGTERM);
                 term_at = Some(Instant::now());
             }
             if term_at.is_some_and(|t| t.elapsed() > Duration::from_secs(10)) {
-                unsafe {
-                    libc::killpg(pid, libc::SIGKILL);
-                }
+                child.signal(libc::SIGKILL);
             }
             std::thread::sleep(Duration::from_millis(200));
         };
-        self.ctx.cancel.untrack_pgid(pid);
-        // the step is over: nothing is owed to a reader that is still around
-        writer_stop.store(true, Ordering::SeqCst);
-        if let Some(h) = writer {
-            let _ = h.join();
-        }
+        child.finish(native_scope);
         if !piped {
             let _ = fs::remove_file(&file);
         }
@@ -1575,6 +1592,7 @@ impl<'a> Runner<'a> {
     }
 
     pub fn run_recipe(&self, recipe: &SetupRecipe, key: &str) -> Result<PreparedSetup> {
+        let native_scope = native_step::NativeScope::default();
         self.validate_source()?;
         if recipe.steps.is_empty() {
             return Ok(PreparedSetup {
@@ -1655,6 +1673,7 @@ impl<'a> Runner<'a> {
             let cwd = self.wt.join(&s.dir);
             let res = self
                 .shell(
+                    &native_scope,
                     &cwd,
                     &s.run,
                     s.shell.as_deref(),
@@ -1703,6 +1722,8 @@ impl<'a> Runner<'a> {
                 break;
             }
         }
+        // Stop script producers before observing the prepared artifact tree.
+        drop(native_scope);
         let artifacts = if out.iter().all(|r| r.outcome == Outcome::Pass) {
             setup::artifact_digests(
                 &self.wt,
@@ -2054,15 +2075,26 @@ impl<'a> Runner<'a> {
     /// Give back the port block of `ws`. The worktree of the run itself may hold
     /// one even when no job asked: portool's post-checkout hook takes it.
     pub fn release_ports(&self, ws: &Path) -> Result<()> {
+        self.release_ports_checked(ws)
+    }
+
+    pub(crate) fn release_ports_checked(&self, ws: &Path) -> Result<()> {
+        // Record before source validation: failure must not erase the lease's
+        // identity or trigger release in a replaced workspace.
+        if self.opts.portool.is_some() {
+            self.ctx.cancel.port_release_pending(ws);
+        }
         self.validate_source()?;
         let Some(bin) = &self.opts.portool else {
             return Ok(());
         };
-        if (ws == self.wt || self.synced.lock().unwrap().remove(ws))
+        if (ws == self.wt || self.synced.lock().unwrap().contains(ws))
             && ws.join(".portool.toml").is_file()
         {
-            crate::portool::release(self.ctx, bin, ws);
+            crate::portool::release_checked(self.ctx, bin, ws)?;
+            self.synced.lock().unwrap().remove(ws);
         }
+        self.ctx.cancel.port_release_confirmed(ws);
         Ok(())
     }
 
@@ -2358,6 +2390,12 @@ impl<'a> Runner<'a> {
         whole_matrix: bool,
     ) -> Result<TaskResult> {
         self.validate_source()?;
+        anyhow::ensure!(
+            self.selected
+                .as_ref()
+                .is_none_or(|(selection, _)| &selection.task == task),
+            "selected dispatch task mismatch"
+        );
         let wi = self
             .plan
             .selected
@@ -2628,7 +2666,6 @@ impl<'a> Runner<'a> {
         shard: Option<&dag::TaskShard>,
     ) -> Vec<(JobResult, Map<String, Value>)> {
         let gh = self.github_ctx(ws, w, event, &job.id);
-        let base_name = job.name.clone().unwrap_or_else(|| job.id.clone());
         let skip = |display: String, reason: String| {
             (
                 JobResult {
@@ -2670,161 +2707,63 @@ impl<'a> Runner<'a> {
             )
         };
 
-        let needs_of_job: Map<String, Value> = job
-            .needs
-            .iter()
-            .filter_map(|n| needs.get(n).map(|v| (n.clone(), v.clone())))
-            .collect();
-        // The status functions of a job, as on GitHub: `success()` when every
-        // job it needs succeeded (a skipped one does not count), `failure()`
-        // when one failed, or any job further up did, `cancelled()` when the
-        // run was cancelled.
-        let results: Vec<String> = needs_of_job
-            .values()
-            .map(|v| v["result"].as_str().unwrap_or("success").to_string())
-            .collect();
-        let any_result = |r: &str| results.iter().any(|x| x == r);
-        let needs_fns = expr::StatusFns {
-            success: results.iter().all(|r| r == "success"),
-            failure: ancestor_failed || any_result("failure"),
-            cancelled: run_cancelled,
-        };
-        // why a job that is not run by its `if:` is not run
-        let why_not = || {
-            if needs_fns.success || !expr::success_gated(job.cond.as_deref()) {
-                "if: false"
-            } else if any_result("failure") {
-                "needs failed"
-            } else if any_result("cancelled") {
-                "needs cancelled"
-            } else if any_result("skipped") {
-                "needs skipped"
-            } else {
-                "if: false"
-            }
-        };
-        let mut ctx_map = Map::new();
-        ctx_map.insert("github".into(), gh.clone());
-        ctx_map.insert("needs".into(), Value::Object(needs_of_job.clone()));
-        ctx_map.insert("runner".into(), self.runner_ctx());
-        ctx_map.insert("inputs".into(), json!({}));
-        ctx_map.insert("vars".into(), json!({}));
-        ctx_map.insert("env".into(), json!({}));
-        ctx_map.insert("matrix".into(), json!({}));
-        ctx_map.insert("strategy".into(), json!({}));
-
-        // The matrix may be an expression over `needs`.
-        let combos = match &job.matrix {
-            None => vec![Map::new()],
-            Some(m) => {
-                let ctx = Ctx::new(&ctx_map, Status::Success);
-                let value = eval_strings(&matrix::yaml_to_json(m), &ctx);
-                match value.and_then(|v| matrix::expand(&v)) {
-                    Ok(c) => c,
-                    Err(e) => return vec![error(base_name, format!("matrix: {e:#}"))],
-                }
-            }
-        };
-        if job.container {
-            return vec![skip(base_name, "container: is not supported".into())];
-        }
-        if let Some(u) = &job.reusable {
-            return vec![skip(
-                base_name,
-                format!("reusable workflow {u} is not supported"),
-            )];
-        }
-
-        // The entries of the matrix with their contexts and names.
-        let mut entries: Vec<(usize, Map<String, Value>, String)> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
-        let total = combos.len();
-        let mut matrices: Vec<Map<String, Value>> = Vec::new();
-        for (idx, combo) in combos.into_iter().enumerate() {
-            let mut cm = ctx_map.clone();
-            cm.insert("matrix".into(), Value::Object(combo.clone()));
-            cm.insert(
-                "strategy".into(),
-                json!({"job-index": idx, "job-total": total}),
-            );
-            let mut display = {
-                let ctx = Ctx::new(&cm, Status::Success);
-                match &job.name {
-                    Some(n) if n.contains("${{") => {
-                        expr::interpolate(n, &ctx).unwrap_or_else(|_| n.clone())
-                    }
-                    Some(n) if !combo.is_empty() => format!("{n} ({})", matrix::describe(&combo)),
-                    Some(n) => n.clone(),
-                    None if !combo.is_empty() => {
-                        format!("{} ({})", job.id, matrix::describe(&combo))
-                    }
-                    None => job.id.clone(),
-                }
-            };
-            // each shard of a job has a name (and so a log) of its own
-            if let Some(t) = shard {
-                display = format!("{display} (shard {}/{})", t.index + 1, t.count);
-            }
-            // a name over some of the matrix only: keep the entries (and their logs) apart
-            if !seen.insert(display.clone()) {
-                display = format!("{display} #{}", idx + 1);
-                seen.insert(display.clone());
-            }
-            matrices.push(combo);
-            entries.push((idx, cm, display));
-        }
-
         // The OS each entry's `runs-on` names. Every job runs on the host: the
         // entries of another OS that a leg of the host's OS stands in for are
-        // not run, the others run with a note.
+        // not run, the others run with a note. The shared evaluation stays
+        // free of the host; a member a driver selected was placed by its host.
         let host = os_legs::Family::host();
-        let os_of: Vec<Option<(os_legs::Family, String)>> = entries
-            .iter()
-            .map(|(_, cm, _)| os_legs::family_of_leg(job, cm))
-            .collect();
-        let twin_of: Vec<Option<usize>> = if self.opts.all_os_legs {
-            vec![None; entries.len()]
+        let legs = if self.selected.is_none() {
+            self.os_legs_of(job, &gh, needs, shard)
         } else {
-            let legs: Vec<os_legs::Leg> = os_of
-                .iter()
-                .zip(matrices)
-                .map(|(o, matrix)| os_legs::Leg {
-                    family: o.as_ref().map(|(f, _)| *f),
-                    matrix,
-                })
-                .collect();
-            os_legs::twins(host, job, &legs)
+            None
         };
-
-        // Combinations that pass `if:` run after this loop.
-        let mut out: Vec<Option<(JobResult, Map<String, Value>)>> = Vec::new();
-        let mut todo: Vec<(usize, Map<String, Value>, String)> = Vec::new();
-        let mut notes: Vec<(usize, String)> = Vec::new();
-        for (k, (idx, cm, display)) in entries.iter().enumerate() {
-            if only.is_some_and(|o| o != *idx) {
-                continue;
+        let evaluated = match &self.selected {
+            Some((selection, facts)) => {
+                selection.worker_evaluation(gh, self.runner_ctx(), needs, facts)
             }
-            let (cm, display) = (cm.clone(), display.clone());
-            let run_it = {
-                let ctx = Ctx::with_fns(&cm, needs_fns);
-                expr::condition(job.cond.as_deref(), &ctx)
-            };
-            match run_it {
-                Ok(true) => match (&os_of[k], twin_of[k]) {
-                    (Some((family, label)), Some(t)) => out.push(Some(skip(
-                        display,
-                        os_legs::not_run_reason(label, *family, host, &entries[t].2),
-                    ))),
-                    (os, _) => {
-                        if let Some((family, label)) = os.as_ref().filter(|(f, _)| *f != host) {
-                            notes.push((out.len(), os_legs::ran_on_note(label, *family, host)));
+            None => crate::job_evaluate::evaluate_job(
+                job,
+                gh,
+                self.runner_ctx(),
+                needs,
+                ancestor_failed,
+                run_cancelled,
+                only,
+                shard,
+            ),
+        };
+        let mut out = Vec::new();
+        let mut notes: Vec<(usize, String)> = Vec::new();
+        let mut todo = Vec::new();
+        for (k, entry) in evaluated.entries.into_iter().enumerate() {
+            match entry.decision {
+                crate::job_evaluate::Decision::Run(cm) => {
+                    let leg = legs.as_ref().and_then(|l| l.get(only.unwrap_or(k)));
+                    match leg {
+                        Some(OsLeg {
+                            os: Some((family, label)),
+                            twin: Some(twin),
+                        }) => out.push(Some(skip(
+                            entry.display,
+                            os_legs::not_run_reason(label, *family, host, twin),
+                        ))),
+                        _ => {
+                            if let Some((family, label)) =
+                                leg.and_then(|l| l.os.as_ref()).filter(|(f, _)| *f != host)
+                            {
+                                notes.push((out.len(), os_legs::ran_on_note(label, *family, host)));
+                            }
+                            todo.push((out.len(), cm, entry.display));
+                            out.push(None);
                         }
-                        todo.push((out.len(), cm, display));
-                        out.push(None);
                     }
-                },
-                Ok(false) => out.push(Some(skip(display, why_not().into()))),
-                Err(e) => out.push(Some(error(display, format!("if: {e:#}")))),
+                }
+                crate::job_evaluate::Decision::Skip(reason) => {
+                    out.push(Some(skip(entry.display, reason)))
+                }
+                crate::job_evaluate::Decision::Error(reason) => {
+                    out.push(Some(error(entry.display, reason)))
+                }
             }
         }
 
@@ -2928,6 +2867,76 @@ impl<'a> Runner<'a> {
         out.into_iter().flatten().collect()
     }
 
+    /// The OS of every entry of the job's matrix, and the name of the entry
+    /// of the host's OS that stands in for it. `None` when the job has no
+    /// entries to tell apart (its matrix does not expand, or it is not run).
+    fn os_legs_of(
+        &self,
+        job: &Job,
+        gh: &Value,
+        needs: &Map<String, Value>,
+        shard: Option<&dag::TaskShard>,
+    ) -> Option<Vec<OsLeg>> {
+        job.runs_on.as_ref()?;
+        // every entry with its contexts and name, whatever its `if:` and the
+        // jobs it needs say (no `if:` would mean `success()`)
+        let mut all = job.clone();
+        all.cond = Some("always()".into());
+        let entries = crate::job_evaluate::evaluate_job(
+            &all,
+            gh.clone(),
+            self.runner_ctx(),
+            needs,
+            false,
+            false,
+            None,
+            shard,
+        )
+        .entries;
+        let mut contexts = Vec::new();
+        let mut displays = Vec::new();
+        for entry in entries {
+            match entry.decision {
+                crate::job_evaluate::Decision::Run(cm) => {
+                    contexts.push(cm);
+                    displays.push(entry.display);
+                }
+                _ => return None,
+            }
+        }
+        let os_of: Vec<Option<(os_legs::Family, String)>> = contexts
+            .iter()
+            .map(|cm| os_legs::family_of_leg(job, cm))
+            .collect();
+        let twin_of: Vec<Option<usize>> = if self.opts.all_os_legs {
+            vec![None; contexts.len()]
+        } else {
+            let legs: Vec<os_legs::Leg> = os_of
+                .iter()
+                .zip(&contexts)
+                .map(|(o, cm)| os_legs::Leg {
+                    family: o.as_ref().map(|(f, _)| *f),
+                    matrix: cm
+                        .get("matrix")
+                        .and_then(Value::as_object)
+                        .cloned()
+                        .unwrap_or_default(),
+                })
+                .collect();
+            os_legs::twins(os_legs::Family::host(), job, &legs)
+        };
+        Some(
+            os_of
+                .into_iter()
+                .zip(twin_of)
+                .map(|(os, twin)| OsLeg {
+                    os,
+                    twin: twin.map(|t| displays[t].clone()),
+                })
+                .collect(),
+        )
+    }
+
     /// Evaluate `pairs` into `into`. Says whether a secret that cannot be
     /// supplied was read.
     fn eval_env(
@@ -2963,6 +2972,7 @@ impl<'a> Runner<'a> {
         // the part of a split job this runs: its step runs the shard's command
         shard: Option<&dag::TaskShard>,
     ) -> (JobResult, Map<String, Value>) {
+        let native_scope = native_step::NativeScope::default();
         let t0 = Instant::now();
         let mut stopped = false;
         let mut steps: Vec<StepResult> = Vec::new();
@@ -3367,10 +3377,22 @@ impl<'a> Runner<'a> {
                 .get("COMPOSE_PROJECT_NAME")
                 .map(expr::to_string)
                 .filter(|p| !p.is_empty());
-            for p in compose_projects(&script).into_iter().chain(from_env) {
+            for p in compose_projects(&script) {
                 if !projects.contains(&p) {
-                    self.ctx.cancel.track_compose(p.clone());
+                    if exclusive && p.ends_with(&format!("-{tag}")) {
+                        self.ctx.cancel.track_compose(p.clone());
+                    } else {
+                        self.ctx.cancel.track_unverified_compose(p.clone());
+                    }
                     projects.push(p);
+                }
+            }
+            if let Some(project) = from_env {
+                // An external override is not proof of this entry's namespace.
+                // Never down that project based only on the supplied name.
+                self.ctx.cancel.track_unverified_compose(project.clone());
+                if !projects.contains(&project) {
+                    projects.push(project);
                 }
             }
             // The job's share of the CPU, for the tools that read it. What the
@@ -3425,6 +3447,7 @@ impl<'a> Runner<'a> {
             }
             let res = self
                 .shell(
+                    &native_scope,
                     &ws.join(&wd),
                     &script,
                     step_shell,
@@ -3544,10 +3567,11 @@ impl<'a> Runner<'a> {
                 }
             }
         }
+        // A surviving script must not recreate daemon resources after cleanup.
+        drop(native_scope);
         self.stop_services(&names, &mut steps);
-        let cleanup = crate::cleanup::compose_down(self.ctx, &projects);
+        let cleanup = self.ctx.cancel.cleanup_projects(self.ctx, &projects);
         self.record_cleanup_warnings(&mut steps, cleanup);
-        self.ctx.cancel.untrack_compose(&projects);
 
         // job outputs
         let mut outputs = Map::new();
@@ -3947,15 +3971,15 @@ impl<'a> Runner<'a> {
             );
             args.push(image.clone());
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            self.docker(&refs, Duration::from_secs(120))?;
-            self.ctx.cancel.track_container(name.clone());
-            names.push(name.clone());
+            self.ctx.cancel.creation_started(name.clone());
+            let id = self.docker(&refs, Duration::from_secs(120))?;
+            ensure_container_id(&id)?;
+            self.ctx.cancel.creation_acknowledged(&name, id.clone());
+            names.push(id.clone());
             let mut ports = Map::new();
             for (d, c) in &svc.ports {
-                let line = self.docker(
-                    &["port", &name, &format!("{c}/tcp")],
-                    Duration::from_secs(30),
-                )?;
+                let line =
+                    self.docker(&["port", &id, &format!("{c}/tcp")], Duration::from_secs(30))?;
                 let actual: u16 = line
                     .lines()
                     .next()
@@ -3969,10 +3993,10 @@ impl<'a> Runner<'a> {
                     actual,
                 });
             }
-            self.wait_healthy(&name, svc, &maps)?;
+            self.wait_healthy(&id, svc, &maps)?;
             sctx.insert(
                 svc.id.clone(),
-                json!({"id": name, "ports": ports, "network": ""}),
+                json!({"id": id, "ports": ports, "network": ""}),
             );
         }
         Ok((maps, sctx))
@@ -4048,12 +4072,12 @@ impl<'a> Runner<'a> {
     }
 
     fn stop_services(&self, names: &[String], steps: &mut [StepResult]) {
-        self.record_cleanup_warnings(
-            steps,
-            crate::cleanup::remove_tracked_containers(self.ctx, names),
-        );
-        let set: HashSet<&String> = names.iter().collect();
-        self.ctx.cancel.untrack_containers(&set);
+        let diagnostics = crate::cleanup::remove_tracked_containers(self.ctx, names);
+        if diagnostics.is_empty() {
+            let set: HashSet<&String> = names.iter().collect();
+            self.ctx.cancel.untrack_containers(&set);
+        }
+        self.record_cleanup_warnings(steps, diagnostics);
     }
 }
 
@@ -4173,22 +4197,12 @@ fn write_private(path: &Path, content: &str) -> std::io::Result<()> {
     f.write_all(content.as_bytes())
 }
 
-/// Evaluate every `${{ }}` string inside a JSON value, keeping the result's type.
-pub(crate) fn eval_strings(v: &Value, ctx: &Ctx) -> Result<Value> {
-    Ok(match v {
-        Value::String(s) if s.contains("${{") => expr::interpolate_value(s, ctx)?,
-        Value::Array(a) => Value::Array(
-            a.iter()
-                .map(|x| eval_strings(x, ctx))
-                .collect::<Result<_>>()?,
-        ),
-        Value::Object(o) => Value::Object(
-            o.iter()
-                .map(|(k, x)| Ok((k.clone(), eval_strings(x, ctx)?)))
-                .collect::<Result<_>>()?,
-        ),
-        other => other.clone(),
-    })
+/// What the OS legs say of one entry of a matrix.
+struct OsLeg {
+    /// the OS its `runs-on` names, with the label
+    os: Option<(os_legs::Family, String)>,
+    /// the name of the entry of the host's OS that stands in for it
+    twin: Option<String>,
 }
 
 fn record(
@@ -4212,11 +4226,139 @@ pub fn write_json(path: &Path, v: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+fn ensure_container_id(id: &str) -> Result<()> {
+    anyhow::ensure!(
+        crate::cleanup::valid_container_id(id),
+        "Docker did not acknowledge a complete container ID"
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod finalization_test {
+    type Probe = Box<dyn FnMut(&str)>;
+    std::thread_local! {
+        static PROBE: std::cell::RefCell<Option<Probe>> = const { std::cell::RefCell::new(None) };
+    }
+    pub(crate) fn inspect(boundary: &str) {
+        PROBE.with_borrow_mut(|probe| {
+            if let Some(probe) = probe {
+                probe(boundary);
+            }
+        });
+    }
+    pub(crate) fn observe<T>(probe: impl FnMut(&str) + 'static, action: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                PROBE.with_borrow_mut(|probe| *probe = None);
+            }
+        }
+        PROBE.with_borrow_mut(|slot| {
+            assert!(slot.is_none());
+            *slot = Some(Box::new(probe));
+        });
+        let _reset = Reset;
+        action()
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests build their own commands
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn fresh_git_runners_share_process_resource_sequence() {
+        let area = tempfile::Builder::new()
+            .prefix("localci-resource-sequence-")
+            .tempdir_in(fs::canonicalize(std::env::temp_dir()).unwrap())
+            .unwrap();
+        let root = area.path();
+        fs::create_dir_all(root.join(".github/workflows")).unwrap();
+        fs::write(root.join(".github/workflows/ci.yml"),
+            "on: push\njobs:\n  check:\n    runs-on: fixture\n    steps:\n      - run: echo fixture\n").unwrap();
+        for args in [
+            vec!["init", "-q", "-b", "main"],
+            vec!["add", "."],
+            vec!["commit", "-qm", "fixture"],
+        ] {
+            let status = Command::new("/usr/bin/git")
+                .args([
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .current_dir(root)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", root)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
+        let ctx = ExecContext::new(
+            [
+                ("PATH".into(), "/usr/bin:/bin".into()),
+                ("HOME".into(), root.display().to_string()),
+            ]
+            .into(),
+        );
+        let other_ctx = ctx.fresh_attempt();
+        let fp = crate::build_frozen_plan(
+            &ctx,
+            &crate::Target {
+                dir: root.into(),
+                sha: "HEAD".into(),
+                base: Some("HEAD".into()),
+                all: true,
+                include_disabled: true,
+                workflows_dirs: vec![],
+                workflows: vec![],
+                jobs: vec![],
+            },
+            &mut crate::Quiet,
+        )
+        .unwrap();
+        let workspace = |name: &str| Workspace {
+            root: root.join(name),
+            repo_root: root.into(),
+            run_dir: root.join(format!("{name}-run")),
+            tools: root.join(format!("{name}-tools")),
+            lock_file: root.join(format!("{name}-lock")),
+        };
+        let opts = || Opts {
+            parallel: 1,
+            traffic_controller: None,
+            executor: None,
+            portool: None,
+            containers: 1,
+            job_timeout_min: 1.,
+            keep: false,
+            trash: root.join("trash"),
+            all_os_legs: false,
+        };
+        let a = Runner::new(&ctx, &fp, &workspace("one"), opts()).unwrap();
+        let b = Runner::new(&other_ctx, &fp, &workspace("two"), opts()).unwrap();
+        let names = [a.resource_name(), b.resource_name(), a.resource_name()];
+        assert_eq!(names.iter().collect::<HashSet<_>>().len(), 3, "{names:?}");
+        assert!(Arc::ptr_eq(&a.seq, &b.seq));
+        let prefix = format!("local-ci-{}-", std::process::id());
+        let values: Vec<usize> = names
+            .iter()
+            .map(|n| n.strip_prefix(&prefix).unwrap().parse().unwrap())
+            .collect();
+        assert!(values.windows(2).all(|v| v[0] < v[1]));
+        assert_ne!(a.wt, b.wt);
+        assert_ne!(a.run_dir, b.run_dir);
+    }
 
     #[test]
     fn run_label_plain() {

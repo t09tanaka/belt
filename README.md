@@ -709,6 +709,100 @@ workspace after checking each against its HMAC.
   killed during the write can leave a `.secrets.tmp-*` file (0600, the secret
   files in plain) next to the path: sweep those when you keep the directory.
 
+## Driving a run from another host (library)
+
+`local_ci::driver::Driver` advances one run over a frozen plan without doing
+any work itself: it decides what is ready, how many tasks may be held at once,
+when a matrix or a set of shards is complete, and what a cancel reaches. It
+reads no clock, file or process, so a host that distributes tasks to workers
+and a host that runs them in place share the same progression. Tasks are
+executed with the existing Runner (`execute_task`, `execute_git_dispatch`,
+`execute_pinned_task`, `execute_pinned_dispatch`), which evaluates jobs with
+the same code the driver uses to expand a matrix.
+
+```rust
+use local_ci::driver::{ActionKind, Driver, DriverConfig, Input, DRIVER_VERSION};
+
+let config = DriverConfig { schema_version: DRIVER_VERSION, max_parallel: 4 };
+// `Driver::new(&plan, config)` when no matrix depends on another job's output
+let mut driver = Driver::with_evaluation(&plan, config, &source, facts)?;
+
+// every change is proposed, stored by the host, then applied
+let record = driver.propose(Input::Advance)?;
+journal.append(serde_json::to_string(&record)?)?;
+driver.apply(&record)?;
+
+for action in driver.pending_actions() {
+    match &action.kind {
+        ActionKind::Ready { task, inputs } => { /* a task of the plan */ }
+        ActionKind::DerivedReady { dispatch, inputs } => { /* a member of a dynamic matrix */ }
+        ActionKind::Cancel { task, token } => { /* tell that worker to stop, then Ack */ }
+        ActionKind::Finished => { /* every task is decided */ }
+    }
+}
+```
+
+**Progress.** `propose(input)` computes a `Transition` and changes nothing;
+`apply(&transition)` recomputes it and refuses a record that was altered, is
+out of order, or belongs to another plan or configuration. Replaying the stored
+records into a new `Driver` gives the same state (`Transition::from_json`), so
+the journal is the only thing a host has to keep. `Input::Advance` makes the
+first tasks ready; later inputs advance the run by themselves.
+
+**Events.** `pending_actions()` is the outbox: `Ready`, `DerivedReady`,
+`Cancel` and `Finished`, each with a stable `id`. A ready action leaves the
+outbox when its task is claimed (acknowledging it changes nothing); a `Cancel`
+when the host sends `Input::Ack { action }` or the task ends; `Finished` when
+it is acknowledged. An action that is still there after a
+restart has to be delivered again, so delivery must be idempotent on `id`.
+The members of a matrix that is an expression over `needs` appear as
+`DerivedReady` once the job that names them has settled: the driver derives
+them from the verified source (`git_evaluation_source` or
+`PinnedExecution::evaluation_source`) and the host's `PortableFacts`, and the
+worker derives the same dispatch again before it runs anything.
+`requirements(task)` gives the `runs-on` of a task for placement.
+
+**Permits.** `Input::Claim { task, token }` admits one attempt and takes a
+permit; it is refused when `max_parallel` or the `max-parallel` of the job's
+matrix is used up (`admitted()` counts the claims held). The host commits
+`Input::MarkDispatched` before it sends the work. The permit is released by
+exactly one of:
+
+- `Input::Settle { task, token, result_digest, result }`, the worker's
+  `WireTaskResult`. The driver checks it against the task before it publishes
+  outcomes, joins the matrix (`fail-fast` included) or the shards
+  (`shard_join`), and makes the jobs that need them ready.
+- `Input::AbortBeforeExecution { task, token, reason }`: the host could not
+  start a claim that was never dispatched.
+- `Input::Fence { task, token }`: the host has revoked a claim that will not
+  answer (a lost worker). The job fails with no outputs, and a result that
+  arrives later under that token is refused. The driver cannot know that the
+  worker stopped; the host answers for what it still holds.
+
+**Cancel.** `Input::Cancel` cancels the run: tasks nobody claimed are decided
+as cancelled, and each claimed task gets a `Cancel` action. A claim keeps its
+permit until its result, abort or fence arrives; an acknowledged `Cancel` is
+not a stop. `fail-fast` uses the same requests for the other members of a
+matrix or a set of shards.
+
+**Results.** `outcome(workflow, job)` is the published outcome of a job (a
+matrix joined as on GitHub), `core_decision(task)` says when the driver decided
+a task without a worker (skipped, cancelled, host failure), and
+`infrastructure_failure()` must be checked before a run is reported as passed:
+a result too large for the driver's bounded state is kept as its digest and
+statuses (`unavailable_worker_receipt`) and stops the run instead of
+publishing outputs it does not have. The bounds and what a host has to do
+about them are in the module documentation (`cargo doc`, `local_ci::driver`).
+
+`tests/driver_host.rs` is a complete host in about two hundred lines: a
+dynamic matrix run through the driver and the Runner, a replay of its journal,
+and a lost worker that is fenced.
+
+Not in this version: the `local-ci` command still schedules with its own
+Runner loop, retrying a shard under a new attempt is the host's work (a fenced
+or failed shard fails its join), and artifacts move through the host's own
+storage (`artifact_io`), not through the driver.
+
 ## Files
 
 The cache directory is `~/Library/Caches/local-ci` on macOS and
@@ -787,7 +881,7 @@ cargo test --features browser-tests   # without the feature, the tests that star
 The pure decision modules (`src/matrix.rs`, `src/filter.rs`, `src/source/gate.rs`,
 `src/dag.rs`, `src/frozen.rs`, `src/artifact.rs`, `src/shard.rs`, `src/shard/adapters.rs`,
 `src/shard/coverage.rs`, `src/shard/isolation.rs`, `src/demand.rs`, `src/result_wire.rs`) are gated on 100% line coverage over the whole test suite (`src/wire.rs` and `src/digest.rs` are held to the mutation gate only: the line counts of their generic and per-crate code are not stable enough for a 100% line gate).
-All of them but `src/dag.rs` are also gated on zero surviving mutants. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
+All of them but `src/dag.rs` are also gated on zero surviving mutants. The shared driver and the job evaluation it shares with the Runner (`src/driver.rs`, `src/driver/atomic.rs`, `src/driver/dispatch.rs`, `src/driver/shards.rs`, `src/job_evaluate.rs`) are held to both gates as well. The coverage gate needs `cargo-llvm-cov` and the `llvm-tools-preview`
 component. If `cargo llvm-cov` cannot find the LLVM tools, point it at them:
 
 ```sh
@@ -853,3 +947,136 @@ names, with shared sequence allocation across its setup/task runners. Recovery
 preserves setup tools and install markers while issuing a fresh execution
 namespace. Hosts retain workspace, secret restoration and cleanup ownership via
 `PinnedWorkspaceProvider`.
+
+
+### Binding a workspace the host has added to (library)
+
+`PinnedExecution::verify_workspace` binds a workspace only when it equals the
+captured source byte for byte. A host that restores secret files, copies
+dependency directories in or keeps the output of a prepared setup before it
+binds declares those paths instead:
+
+```rust
+use local_ci::source::RelPath;
+use local_ci::source_execute::WorkspaceOverlay;
+
+let overlay = WorkspaceOverlay {
+    paths: vec![RelPath::new("node_modules"), RelPath::new("packages/app/dist")],
+    secret_files: vec![RelPath::new(".env")],
+};
+let workspace = input.verify_workspace_with_overlay(&ctx, workspace, &overlay)?;
+audit(workspace.unverified_paths()); // sorted, what was not compared
+```
+
+A declared path and everything below it is not compared; every other file must
+still match, an undeclared extra file is refused, and the Git HEAD and index
+are checked as before. A path has to be relative and normalized (no empty, `.`,
+`..` or `.git` component), must not be a symbolic link or lead through one or
+through a file, and must not touch a submodule. A secret file has to be one the
+manifest declares, and a regular file when it is there. The content of the
+declared paths is the host's word: steps run with it unchecked. A workspace
+restored from a worker receipt does not carry the list.
+
+### Verified scheduling source (library, in development)
+
+`source_execute::git_evaluation_source(ctx, repository, frozen_plan)` reads the
+ordinary Git plan's exact full commit and returns `VerifiedEvaluationSource`.
+It rereads the original `runs-on` facts from the source instead of trusting
+the frozen workflow projection. Each workflow must be a regular blob at the exact literal path,
+match the frozen projection, and pass raw-byte Git OID and SHA-256 checks.
+Working-tree edits and replacement refs cannot retarget these reads.
+
+Ordinary Git planning and this reader require Git with the `--no-lazy-fetch`
+global option; unsupported versions fail explicitly. Missing local objects fail without fetching, applying
+filters or prompting for credentials. It reads at most 4096 workflows and 4MiB
+of their combined contents, with bounded stdout/stderr and cooperative 5-second
+command / 30-second request deadlines. Owned command groups are killed before
+their leaders are reaped on every return path. The Git executable and repository
+object database remain the host's trust boundary: this does not scan or verify
+the whole commit/tree object graph against hostile database replacement.
+
+The planner shares that raw workflow-body reader and one combined byte/count
+budget, preserving trailing YAML block-scalar newlines instead of trimming
+workflow text. Ref metadata is resolved once to an immutable commit before
+listing and reading. Listing uses the same owned Git process boundary with
+literal NUL-terminated paths and strict UTF-8 decoding. A separate aggregate
+metadata allowance covers all directories: at most 4096 listed entries (including
+non-workflow files), at most 4096 bytes per path and about 16MiB of raw listing
+bytes. Those limits do not reset per directory and do not consume the separate
+4MiB workflow-body budget. Other legacy metadata calls remain outside these
+bounds; no hard filesystem syscall deadline is claimed. Git plans previously frozen with trimmed
+block-scalar text must be rebuilt from the same immutable commit before using
+the strict scheduling verifier; no trimming compatibility fallback is applied.
+
+Captured inputs still use `PinnedExecution::evaluation_source()` and a real
+manifest binding. The unpublished scheduling record is schema 2 with explicit
+`EvaluationBinding::Captured { manifest_digest }` or `Git { execution_commit }`;
+Git inputs never receive a synthetic manifest digest. Decoded records are
+untrusted: `verify_git_evaluation_source` or the captured verifier must recompute
+before accepting them. The verified capability has no deserialization or
+unchecked construction API. This is a scheduling-provenance boundary, not a
+replacement of the ordinary CLI Runner; the shared host adapter remains work
+in progress.
+
+### Verified ordinary Git dynamic execution (library, in development)
+
+`execute_git_dispatch` executes one member from a real `Driver::DerivedReady`
+action. It rereads verified Git source and rederives the complete dispatch from
+the frozen plan, original scheduling facts, host-authorized `PortableFacts` and
+`TaskInputs` before constructing a Runner. Captured execution uses the same
+shared dispatch validator. A decoded dispatch or a caller-made task is not an
+execution capability. The host still authenticates the committed claim, inputs,
+facts, worker selection and delivery; this API does not advance Driver state.
+
+This is an attempt-scoped entry with the same prepared-checkout contract as
+`execute_task`. The caller supplies its own context and workspace, tools and
+run directory. Context-wide container cleanup and workspace port release occur
+after execution, so concurrent attempts must not share those resources. Ordinary
+fresh Runners share a process resource-name counter; captured workspace counters
+and namespaces are unchanged. This uniqueness fix does not make shared-context
+cleanup safe. The internal provenance/selection helper is separate from execution
+and cleanup for a future persistent-unit host; the ordinary CLI scheduler,
+shared-unit lifecycle and host failure policies remain to be integrated.
+
+
+### Native execution ownership (in development)
+
+Native shell steps keep an owned, unreaped group leader until their matrix entry
+or preparation recipe finishes. This pins the identity used by cancellation:
+groups are untracked before the leader is reaped, including on error and unwind.
+Script-pipe writers are stopped and joined on every return path. A background
+server may continue into subsequent steps of the same entry; draining that entry
+does not signal groups owned by another entry. The entry drains its native
+scripts before service/Compose cleanup, and a preparation recipe drains them
+before computing artifact digests. This prevents a still-running script from
+recreating resources after cleanup or mutating a receipt's artifact snapshot.
+Holding completed leaders uses kernel child slots for the entry lifetime, rather than silently narrowing the
+accepted step count.
+
+This native-group boundary is not a physical stop proof for an entire execution.
+Task-traffic-controller wrappers can own grandchildren in a different group, and
+an external executor has its own lifetime contract. Their direct child returning,
+a cancellation flag or an empty PID list is insufficient. The future shared host
+must consume an explicit drain outcome and retain uncertain ownership; the pure
+Driver host-terminal policy and ordinary Runner adapter remain unfinished.
+
+The private attempt outcome keeps the actual task `Result` separate from cleanup
+errors and remaining ownership observations. Legacy task entry points preserve
+cleanup warnings and retain the original result inside a final-cleanup error.
+Failed removal and port release keep their references for recovery; failure to
+validate a replaced captured workspace never authorizes cleanup in its replacement.
+A successful detached Docker create must acknowledge a full container ID. Health,
+port and removal commands use that ID, including after renaming. A timed-out,
+failed or invalid acknowledgement leaves a creation candidate, never permission
+to remove the requested name. Retrying removal first queries that exact ID;
+absence is success, and unexpected IDs cannot expand deletion scope.
+
+Generated and rewritten literal Compose namespaces still follow the existing
+Runner naming scheme. An external `COMPOSE_PROJECT_NAME` or an unrewritten
+script literal is an unverified reference: automatic cleanup will not query or
+bring down that project. This
+conservative boundary can leave resources for explicit host reconciliation.
+The next required integration must assign and attest resources per run/unit,
+keep shared setup resources alive for the unit, and map actual engine-domain
+stop evidence into the persistent host. The private outcome does not supply a
+`ConfirmedStopped` capability, and an empty tracking registry never supplies one.

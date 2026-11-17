@@ -785,6 +785,8 @@ pub(crate) fn artifact_digests(
     before: &BTreeSet<String>,
     after: &BTreeSet<String>,
 ) -> Vec<ArtifactDigest> {
+    #[cfg(test)]
+    crate::exec::finalization_test::inspect("artifact capture");
     after
         .difference(before)
         .map(|p| ArtifactDigest {

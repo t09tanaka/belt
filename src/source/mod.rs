@@ -27,8 +27,8 @@ pub use capture::{capture_directory, capture_source, seal_manifest};
 pub use gate::{publishable, SourceInfo};
 pub(crate) use materialize::check_materialization_graph;
 pub use materialize::{
-    add_worktree, default_store, materialize_from, materialize_secrets, materialize_source,
-    verify_materialized_from,
+    add_worktree, check_unverified_paths, default_store, materialize_from, materialize_secrets,
+    materialize_source, verify_materialized_except, verify_materialized_from,
 };
 pub use secret::{hmac_sha256, secret_digest, SecretBundle};
 pub use store::{ObjectStore, RelPath};

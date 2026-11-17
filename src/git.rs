@@ -176,12 +176,29 @@ pub fn workflows_at(
             dirs.push((d, Named::Flag));
         }
     }
+    // Resolve once before listing and reading. Metadata keeps its existing
+    // trimmed representation; workflow contents use the shared exact-byte IO.
+    let commit = git(
+        ctx,
+        dir,
+        &[
+            "--no-replace-objects",
+            "--no-lazy-fetch",
+            "--literal-pathspecs",
+            "-c",
+            "protocol.allow=never",
+            "rev-parse",
+            "--verify",
+            "--end-of-options",
+            &format!("{sha}^{{commit}}"),
+        ],
+    )?;
+    let mut reader = crate::source_execute::GitWorkflowReader::new(ctx, dir, &commit)?;
     let mut out = Vec::new();
     for (d, named) in &dirs {
-        let list =
-            git(ctx, dir, &["ls-tree", "--name-only", sha, &format!("{d}/")]).unwrap_or_default();
+        let list = reader.paths(d)?;
         let files: Vec<&str> = list
-            .lines()
+            .split('\0')
             .filter(|f| f.ends_with(".yml") || f.ends_with(".yaml"))
             .collect();
         if files.is_empty() && *named != Named::Default {
@@ -197,10 +214,11 @@ pub fn workflows_at(
         for f in files {
             out.push((
                 f.to_string(),
-                git(ctx, dir, &["show", &format!("{sha}:{f}")])?,
+                String::from_utf8(reader.read(f)?).context("workflow is not UTF-8")?,
             ));
         }
     }
+    reader.finish()?;
     Ok(out)
 }
 

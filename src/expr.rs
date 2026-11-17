@@ -47,6 +47,7 @@ pub struct Ctx<'a> {
     /// Where the value of `github.token` / `secrets.GITHUB_TOKEN` comes from,
     /// when this host can supply it.
     token_from: Option<&'a crate::context::ExecContext>,
+    output_limit: Option<usize>,
 }
 
 impl<'a> Ctx<'a> {
@@ -60,6 +61,7 @@ impl<'a> Ctx<'a> {
             status,
             used_secrets: Cell::new(false),
             token_from: None,
+            output_limit: None,
         }
     }
 
@@ -74,9 +76,62 @@ impl<'a> Ctx<'a> {
         self
     }
 
+    /// Opt in to bounded intermediate/output values; ordinary evaluation is unlimited.
+    pub fn with_output_limit(mut self, bytes: usize) -> Self {
+        self.output_limit = Some(bytes);
+        self
+    }
+    pub(crate) fn check_value<T: serde::Serialize>(&self, value: &T) -> Result<()> {
+        if let Some(limit) = self.output_limit {
+            serialized_size(value, limit)?;
+        }
+        Ok(())
+    }
+    fn check_len(&self, bytes: usize) -> Result<()> {
+        if self.output_limit.is_some_and(|limit| bytes > limit) {
+            return Err(EvaluationBudgetExceeded("expression output byte budget exceeded").into());
+        }
+        Ok(())
+    }
     fn token(&self) -> Option<String> {
         self.token_from?.github_token().map(str::to_string)
     }
+}
+
+/// Distinguishes resource refusal from an ordinary expression/matrix error.
+#[derive(Debug)]
+pub(crate) struct EvaluationBudgetExceeded(pub &'static str);
+impl std::fmt::Display for EvaluationBudgetExceeded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0)
+    }
+}
+impl std::error::Error for EvaluationBudgetExceeded {}
+
+/// Count serialized bytes without allocating a second serialized value.
+pub(crate) fn serialized_size<T: serde::Serialize>(value: &T, limit: usize) -> Result<usize> {
+    struct Counter {
+        bytes: usize,
+        limit: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes = self
+                .bytes
+                .checked_add(bytes.len())
+                .filter(|n| *n <= self.limit)
+                .ok_or_else(|| std::io::Error::other("serialized byte budget exceeded"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter { bytes: 0, limit };
+    serde_json::to_writer(&mut counter, value).map_err(|_| {
+        anyhow::Error::new(EvaluationBudgetExceeded("serialized byte budget exceeded"))
+    })?;
+    Ok(counter.bytes)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -439,8 +494,11 @@ fn get_prop(base: &Value, key: &Value) -> Value {
 }
 
 fn eval(ast: &Ast, ctx: &Ctx) -> Result<Value> {
-    Ok(match ast {
-        Ast::Lit(v) => v.clone(),
+    let result = match ast {
+        Ast::Lit(v) => {
+            ctx.check_value(v)?;
+            v.clone()
+        }
         Ast::Ctx(name) => {
             let lower = name.to_ascii_lowercase();
             if lower == "secrets" {
@@ -448,7 +506,10 @@ fn eval(ast: &Ast, ctx: &Ctx) -> Result<Value> {
                 return Ok(Value::Object(Map::new()));
             }
             match ctx.contexts.get(&lower) {
-                Some(v) => v.clone(),
+                Some(v) => {
+                    ctx.check_value(v)?;
+                    v.clone()
+                }
                 None => bail!("unsupported context `{name}`"),
             }
         }
@@ -501,11 +562,28 @@ fn eval(ast: &Ast, ctx: &Ctx) -> Result<Value> {
             }
         }
         Ast::Call(name, args) => call(name, args, ctx)?,
-    })
+    };
+    ctx.check_value(&result)?;
+    Ok(result)
 }
 
 fn call(name: &str, args: &[Ast], ctx: &Ctx) -> Result<Value> {
-    let a: Vec<Value> = args.iter().map(|e| eval(e, ctx)).collect::<Result<_>>()?;
+    let mut a = Vec::new();
+    let mut argument_bytes = 0usize;
+    for argument in args {
+        let value = eval(argument, ctx)?;
+        if let Some(limit) = ctx.output_limit {
+            argument_bytes = argument_bytes
+                .checked_add(serialized_size(&value, limit)?)
+                .ok_or_else(|| {
+                    anyhow::Error::new(EvaluationBudgetExceeded(
+                        "expression argument byte budget exceeded",
+                    ))
+                })?;
+            ctx.check_len(argument_bytes)?;
+        }
+        a.push(value);
+    }
     let s = |i: usize| a.get(i).map(to_string).unwrap_or_default();
     Ok(match name {
         "success" => Value::Bool(ctx.status.success),
@@ -527,7 +605,26 @@ fn call(name: &str, args: &[Ast], ctx: &Ctx) -> Result<Value> {
         "format" => {
             let mut out = s(0);
             for i in 1..a.len() {
-                out = out.replace(&format!("{{{}}}", i - 1), &s(i));
+                let needle = format!("{{{}}}", i - 1);
+                let replacement = s(i);
+                if ctx.output_limit.is_some() {
+                    let count = out.matches(&needle).count();
+                    let bytes = count
+                        .checked_mul(needle.len())
+                        .and_then(|removed| out.len().checked_sub(removed))
+                        .and_then(|base| {
+                            count
+                                .checked_mul(replacement.len())
+                                .and_then(|added| base.checked_add(added))
+                        })
+                        .ok_or_else(|| {
+                            anyhow::Error::new(EvaluationBudgetExceeded(
+                                "expression output byte budget exceeded",
+                            ))
+                        })?;
+                    ctx.check_len(bytes)?;
+                }
+                out = out.replace(&needle, &replacement);
             }
             Value::String(out.replace("{{", "{").replace("}}", "}"))
         }
@@ -535,14 +632,68 @@ fn call(name: &str, args: &[Ast], ctx: &Ctx) -> Result<Value> {
             let sep = if a.len() > 1 { s(1) } else { ",".into() };
             match a.first() {
                 Some(Value::Array(items)) => {
-                    Value::String(items.iter().map(to_string).collect::<Vec<_>>().join(&sep))
+                    let parts: Vec<_> = items.iter().map(to_string).collect();
+                    if ctx.output_limit.is_some() {
+                        let bytes = parts
+                            .iter()
+                            .try_fold(0usize, |n, part| n.checked_add(part.len()))
+                            .and_then(|n| {
+                                sep.len()
+                                    .checked_mul(parts.len().saturating_sub(1))
+                                    .and_then(|separators| n.checked_add(separators))
+                            })
+                            .ok_or_else(|| {
+                                anyhow::Error::new(EvaluationBudgetExceeded(
+                                    "expression output byte budget exceeded",
+                                ))
+                            })?;
+                        ctx.check_len(bytes)?;
+                    }
+                    Value::String(parts.join(&sep))
                 }
                 _ => Value::String(s(0)),
             }
         }
-        "tojson" => Value::String(serde_json::to_string_pretty(
-            a.first().unwrap_or(&Value::Null),
-        )?),
+        "tojson" => {
+            let value = a.first().unwrap_or(&Value::Null);
+            if let Some(limit) = ctx.output_limit {
+                struct Limited {
+                    output: Vec<u8>,
+                    limit: usize,
+                }
+                impl std::io::Write for Limited {
+                    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                        if self
+                            .output
+                            .len()
+                            .checked_add(bytes.len())
+                            .is_none_or(|n| n > self.limit)
+                        {
+                            return Err(std::io::Error::other(
+                                "expression output byte budget exceeded",
+                            ));
+                        }
+                        self.output.extend_from_slice(bytes);
+                        Ok(bytes.len())
+                    }
+                    fn flush(&mut self) -> std::io::Result<()> {
+                        Ok(())
+                    }
+                }
+                let mut writer = Limited {
+                    output: Vec::new(),
+                    limit,
+                };
+                serde_json::to_writer_pretty(&mut writer, value).map_err(|_| {
+                    anyhow::Error::new(EvaluationBudgetExceeded(
+                        "expression output byte budget exceeded",
+                    ))
+                })?;
+                Value::String(String::from_utf8(writer.output)?)
+            } else {
+                Value::String(serde_json::to_string_pretty(value)?)
+            }
+        }
         "fromjson" => serde_json::from_str(&s(0)).map_err(|e| anyhow::anyhow!("fromJSON: {e}"))?,
         other => bail!("unsupported function `{other}()`"),
     })
@@ -558,14 +709,31 @@ pub fn interpolate(s: &str, ctx: &Ctx) -> Result<String> {
     let mut out = String::new();
     let mut rest = s;
     while let Some(start) = rest.find("${{") {
+        ctx.check_len(out.len().checked_add(start).ok_or_else(|| {
+            anyhow::Error::new(EvaluationBudgetExceeded(
+                "expression output byte budget exceeded",
+            ))
+        })?)?;
         out.push_str(&rest[..start]);
         let after = &rest[start + 3..];
         let end =
             find_close(after).ok_or_else(|| anyhow::anyhow!("unterminated `${{{{` in `{s}`"))?;
-        out.push_str(&to_string(&evaluate(&after[..end], ctx)?));
+        let value = to_string(&evaluate(&after[..end], ctx)?);
+        ctx.check_len(out.len().checked_add(value.len()).ok_or_else(|| {
+            anyhow::Error::new(EvaluationBudgetExceeded(
+                "expression output byte budget exceeded",
+            ))
+        })?)?;
+        out.push_str(&value);
         rest = &after[end + 2..];
     }
+    ctx.check_len(out.len().checked_add(rest.len()).ok_or_else(|| {
+        anyhow::Error::new(EvaluationBudgetExceeded(
+            "expression output byte budget exceeded",
+        ))
+    })?)?;
     out.push_str(rest);
+    ctx.check_value(&out)?;
     Ok(out)
 }
 
@@ -603,6 +771,166 @@ fn find_close(s: &str) -> Option<usize> {
         i += 1;
     }
     None
+}
+
+/// Portable evaluation stages used before a worker has been selected.
+/// Ordinary Runner evaluation does not opt into this stricter policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortableStage {
+    Matrix,
+    JobIf,
+    RunsOn,
+    Name,
+}
+
+/// Check availability using the same parsed AST as expression execution.
+/// `bare` matches job `if:` syntax; other fields only evaluate `${{ }}`.
+/// This checks context availability, not the authenticity of supplied facts.
+pub fn validate_portable(text: &str, bare: bool, stage: PortableStage) -> Result<()> {
+    validate_portable_context(text, bare, stage, None)
+}
+
+/// Additionally reject github properties missing from explicit portable facts.
+pub fn validate_portable_context(
+    text: &str,
+    bare: bool,
+    stage: PortableStage,
+    contexts: Option<&Map<String, Value>>,
+) -> Result<()> {
+    let mut rest = text;
+    let mut found = false;
+    while let Some(start) = rest.find("${{") {
+        found = true;
+        let after = &rest[start + 3..];
+        let end =
+            find_close(after).ok_or_else(|| anyhow::anyhow!("unterminated portable expression"))?;
+        // condition() reparses mixed interpolation output as an expression.
+        // Its runtime-generated AST cannot be approved before evaluation.
+        if bare && (!text[..start].trim().is_empty() || !after[end + 2..].trim().is_empty()) {
+            bail!("portable if requires one complete expression");
+        }
+        portable_ast(&parse(&after[..end])?, stage, contexts)?;
+        rest = &after[end + 2..];
+    }
+    if bare && !found && !text.trim().is_empty() {
+        portable_ast(&parse(text)?, stage, contexts)?;
+    }
+    Ok(())
+}
+
+fn portable_ast(
+    ast: &Ast,
+    stage: PortableStage,
+    contexts: Option<&Map<String, Value>>,
+) -> Result<()> {
+    // A github chain must select a literal portable property before the
+    // object is read. Reject computed indices and whole-object serialization,
+    // even in dead branches; no guessed worker workspace or token is supplied.
+    let mut base = ast;
+    let mut keys = Vec::new();
+    loop {
+        match base {
+            Ast::Prop(parent, key) => {
+                keys.push(Some(key.as_ref()));
+                base = parent;
+            }
+            Ast::Star(parent) => {
+                keys.push(None);
+                base = parent;
+            }
+            _ => break,
+        }
+    }
+    if matches!(base, Ast::Ctx(name) if name.eq_ignore_ascii_case("github")) {
+        let Some(Some(Ast::Lit(Value::String(first)))) = keys.last() else {
+            bail!("portable github requires a literal property");
+        };
+        if !matches!(
+            first.to_ascii_lowercase().as_str(),
+            "event_name"
+                | "event"
+                | "sha"
+                | "ref"
+                | "ref_name"
+                | "head_ref"
+                | "base_ref"
+                | "repository"
+                | "repository_owner"
+                | "workflow"
+                | "job"
+                | "run_id"
+                | "run_number"
+                | "run_attempt"
+                | "actor"
+                | "server_url"
+                | "api_url"
+        ) {
+            bail!("github property is unavailable before worker selection");
+        }
+        if !keys
+            .iter()
+            .all(|k| matches!(k, Some(Ast::Lit(Value::String(_)))))
+        {
+            bail!("computed github properties are unavailable before worker selection");
+        }
+        if let Some(contexts) = contexts {
+            let mut value = contexts
+                .get("github")
+                .ok_or_else(|| anyhow::anyhow!("github facts unavailable"))?
+                .clone();
+            for key in keys.iter().rev() {
+                let Some(Ast::Lit(Value::String(key))) = key else {
+                    unreachable!()
+                };
+                value = get_prop(&value, &Value::String(key.clone()));
+                if value.is_null() {
+                    bail!("github property unavailable in supplied facts");
+                }
+            }
+        }
+        return Ok(());
+    }
+    match ast {
+        Ast::Lit(_) => Ok(()),
+        Ast::Ctx(name) => {
+            let name = name.to_ascii_lowercase();
+            if matches!(name.as_str(), "needs" | "vars" | "inputs")
+                || (matches!(stage, PortableStage::RunsOn | PortableStage::Name)
+                    && matches!(name.as_str(), "matrix" | "strategy"))
+            {
+                Ok(())
+            } else {
+                bail!("context is unavailable at portable {stage:?} stage")
+            }
+        }
+        Ast::Prop(base, key) => {
+            portable_ast(base, stage, contexts)?;
+            portable_ast(key, stage, contexts)
+        }
+        Ast::Star(base) | Ast::Not(base) => portable_ast(base, stage, contexts),
+        Ast::Bin(_, left, right) => {
+            portable_ast(left, stage, contexts)?;
+            portable_ast(right, stage, contexts)
+        }
+        Ast::Call(name, args) => {
+            let ordinary = matches!(
+                name.as_str(),
+                "contains" | "startswith" | "endswith" | "format" | "join" | "tojson" | "fromjson"
+            );
+            let status = stage == PortableStage::JobIf
+                && matches!(
+                    name.as_str(),
+                    "success" | "failure" | "cancelled" | "always"
+                );
+            if !ordinary && !status {
+                bail!("function is unavailable at portable {stage:?} stage");
+            }
+            for arg in args {
+                portable_ast(arg, stage, contexts)?;
+            }
+            Ok(())
+        }
+    }
 }
 
 /// What an expression takes from the `needs` context.
@@ -865,5 +1193,169 @@ mod tests {
         let m = ctx_map();
         let c = Ctx::new(&m, Status::Success);
         assert_eq!(interpolate("${{ format('{{x}}') }}", &c).unwrap(), "{x}");
+    }
+}
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    #[test]
+    fn stages_validate_actual_ast_and_fail_closed_in_dead_branches() {
+        for expression in [
+            "fromJSON(needs.seed.outputs.matrix)",
+            "inputs[vars.key]",
+            "toJSON(needs)",
+            "github.event.pull_request.head.ref",
+            "github['repository']",
+        ] {
+            validate_portable(expression, true, PortableStage::Matrix).unwrap();
+        }
+        for stage in [
+            PortableStage::Matrix,
+            PortableStage::JobIf,
+            PortableStage::RunsOn,
+            PortableStage::Name,
+        ] {
+            for expression in [
+                "runner.os",
+                "env.CACHE",
+                "secrets.X",
+                "steps.out.outputs.x",
+                "github.workspace",
+                "github.token",
+                "github[inputs.key]",
+                "github.event[inputs.key]",
+                "toJSON(github)",
+                "github.*",
+                "hashFiles('**')",
+                "false && runner.os",
+                "true || secrets.X",
+                "fromJSON(toJSON(github)).workspace",
+            ] {
+                assert!(
+                    validate_portable(expression, true, stage).is_err(),
+                    "{stage:?}: {expression}"
+                );
+            }
+        }
+        assert!(validate_portable("matrix.os", true, PortableStage::Matrix).is_err());
+        assert!(validate_portable("strategy.job-total", true, PortableStage::Matrix).is_err());
+        assert!(validate_portable("matrix.os", true, PortableStage::JobIf).is_err());
+        assert!(validate_portable("strategy.job-total", true, PortableStage::JobIf).is_err());
+        for stage in [PortableStage::RunsOn, PortableStage::Name] {
+            validate_portable(
+                "format('{0}-{1}', matrix.os, strategy.job-index)",
+                true,
+                stage,
+            )
+            .unwrap();
+        }
+        validate_portable(
+            "always() && needs.seed.result == 'success'",
+            true,
+            PortableStage::JobIf,
+        )
+        .unwrap();
+        assert!(validate_portable("success()", true, PortableStage::Matrix).is_err());
+    }
+    #[test]
+    fn portable_fact_lookup_shares_case_insensitive_property_semantics() {
+        let contexts = json_context_for_portable();
+        validate_portable_context(
+            "github.ACTOR == 'known'",
+            true,
+            PortableStage::JobIf,
+            Some(&contexts),
+        )
+        .unwrap();
+        validate_portable_context(
+            "${{ github.event.COMMITS.message }}",
+            false,
+            PortableStage::Name,
+            Some(&contexts),
+        )
+        .unwrap();
+        assert!(validate_portable_context(
+            "github.base_ref",
+            true,
+            PortableStage::JobIf,
+            Some(&contexts)
+        )
+        .is_err());
+    }
+    fn json_context_for_portable() -> Map<String, Value> {
+        [("github".into(), serde_json::json!({"actor":"known", "event":{"commits":[{"message":"first"},{"message":"second"}]}}))].into_iter().collect()
+    }
+    #[test]
+    fn interpolation_does_not_reparse_unvalidated_generated_if() {
+        validate_portable("plain runner.os", false, PortableStage::RunsOn).unwrap();
+        validate_portable("worker-${{ matrix.os }}", false, PortableStage::RunsOn).unwrap();
+        validate_portable(
+            " ${{ needs.seed.result == 'success' }} ",
+            true,
+            PortableStage::JobIf,
+        )
+        .unwrap();
+        for text in [
+            "runner.${{ inputs.key }}",
+            "${{ inputs.root }}.os",
+            "${{ inputs.a }} == ${{ inputs.b }}",
+            "${{ runner.os",
+            "${{ needs[ }}",
+        ] {
+            assert!(
+                validate_portable(text, true, PortableStage::JobIf).is_err(),
+                "{text}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod output_budget_tests {
+    use super::*;
+    #[test]
+    fn opt_in_bounds_format_join_and_json_without_changing_default_results() {
+        let contexts: Map<String,Value> = [("vars".into(),serde_json::json!({"blob":"x".repeat(32), "items":["a","b","c"], "nested":{"a":{"b":{"c":{"d":"value"}}}}}))].into_iter().collect();
+        let ordinary = Ctx::new(&contexts, Status::Success);
+        let limited = Ctx::new(&contexts, Status::Success).with_output_limit(256);
+        let text = format!("format('{}', vars.blob)", "{0}".repeat(32));
+        assert_eq!(
+            evaluate(&text, &ordinary).unwrap(),
+            Value::String("x".repeat(1024))
+        );
+        assert!(evaluate(&text, &limited)
+            .unwrap_err()
+            .to_string()
+            .contains("budget"));
+        let join = format!("join(vars.items, '{}')", "x".repeat(128));
+        assert_eq!(
+            evaluate(&join, &ordinary).unwrap().as_str().unwrap().len(),
+            259
+        );
+        assert!(evaluate(&join, &limited).is_err());
+        let tiny = Ctx::new(&contexts, Status::Success).with_output_limit(256);
+        let interpolation = format!("{}${{{{ vars.blob }}}}", "a".repeat(240));
+        assert!(interpolate(&interpolation, &tiny).is_err());
+        let nested: Value = (0..12).fold(
+            Value::String("value".into()),
+            |inner, _| serde_json::json!({"a":inner}),
+        );
+        let small: Map<String, Value> = [("vars".into(), serde_json::json!({"nested":nested}))]
+            .into_iter()
+            .collect();
+        assert!(
+            evaluate("toJSON(vars.nested)", &Ctx::new(&small, Status::Success))
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .len()
+                > 128
+        );
+        assert!(evaluate(
+            "toJSON(vars.nested)",
+            &Ctx::new(&small, Status::Success).with_output_limit(128)
+        )
+        .is_err());
     }
 }

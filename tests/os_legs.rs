@@ -234,3 +234,23 @@ fn a_job_that_needs_a_matrix_gets_the_outputs_of_the_leg_that_ran() {
     assert!(out.contains(&format!("build ({other})")), "{out}");
     assert_eq!(o.status.code(), Some(3), "{out}");
 }
+
+#[test]
+fn the_legs_are_folded_when_a_needed_job_failed() {
+    let (host, host_name, other, other_name) = labels();
+    let r = repo(&format!(
+        "name: CI\non: push\njobs:\n  first:\n    runs-on: {host}\n    steps:\n      - run: exit 1\n  test:\n    needs: first\n    if: always()\n    runs-on: ${{{{ matrix.os }}}}\n    strategy:\n      matrix:\n        os: [{host}, {other}]\n    steps:\n      - run: echo hi\n"
+    ));
+    let o = run(&r, &["--json"], &[]);
+    let v = json(&o);
+    assert_eq!(job(&v, "first")["result"], "fail");
+    assert_eq!(job(&v, &format!("test ({host})"))["result"], "pass");
+    let skipped = job(&v, &format!("test ({other})"));
+    assert_eq!(skipped["result"], "skip");
+    assert_eq!(
+        skipped["reason"],
+        format!(
+            "runs-on {other}: {other_name} is not reproduced on this {host_name} host; the same steps ran as test ({host})"
+        )
+    );
+}

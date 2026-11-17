@@ -880,7 +880,7 @@ const SERVICE_JOB: &str = "name: w\non:\n  pull_request:\n    paths: ['x/**']\nj
 fn service_control_and_tracked_removal_use_the_bounded_runner() {
     let l = lab_for(SERVICE_JOB);
     std::fs::write(l.tmp.path().join("fakebin/docker"),
-        "#!/bin/sh\necho \"$*\" >> \"$HOME/docker-calls\"\ncase \"$1\" in\n  info) echo 1;;\n  inspect) echo 'running none';;\n  run) echo container;;\n  rm) echo private-daemon-error >&2; exit 1;;\nesac\nexit 0\n").unwrap();
+        "#!/bin/sh\necho \"$*\" >> \"$HOME/docker-calls\"\ncase \"$1\" in\n  info) echo 1;;\n  inspect) echo 'running none';;\n  run) printf '%064d\\n' 0;;\n  ps) case \"$*\" in *id=*) printf '%064d\\n' 0;; esac;;\n  rm) echo private-daemon-error >&2; exit 1;;\nesac\nexit 0\n").unwrap();
     let result = l.run(Some(Recorder::new(Exit::Code(0), None)));
     assert_eq!(job(&result).outcome, Outcome::Pass);
     assert_eq!(job(&result).steps.len(), 1);
@@ -892,7 +892,7 @@ fn service_control_and_tracked_removal_use_the_bounded_runner() {
     let calls = std::fs::read_to_string(l.tmp.path().join("docker-calls")).unwrap();
     assert!(calls
         .lines()
-        .any(|line| line.starts_with("rm -f -- local-ci-")));
+        .any(|line| line == format!("rm -f -- {}", "0".repeat(64))));
     assert!(!serde_json::to_string(&result)
         .unwrap()
         .contains("private-daemon-error"));
@@ -902,9 +902,73 @@ fn service_control_and_tracked_removal_use_the_bounded_runner() {
 fn exited_service_diagnostics_do_not_expose_daemon_stderr() {
     let l = lab_for(SERVICE_JOB);
     std::fs::write(l.tmp.path().join("fakebin/docker"),
-        "#!/bin/sh\ncase \"$1\" in\n  inspect) echo 'exited none';;\n  logs) echo private-daemon-error >&2; exit 1;;\nesac\nexit 0\n").unwrap();
+        "#!/bin/sh\ncase \"$1\" in\n  run) printf '%064d\\n' 0;;\n  inspect) echo 'exited none';;\n  logs) echo private-daemon-error >&2; exit 1;;\nesac\nexit 0\n").unwrap();
     let result = l.run(Some(Recorder::new(Exit::Code(0), None)));
     assert!(
         matches!(&job(&result).outcome, Outcome::Error(why) if why.contains("diagnostic logs unavailable") && !why.contains("private-daemon-error"))
     );
+}
+
+#[test]
+fn unacknowledged_service_creation_never_authorizes_name_removal() {
+    for reply in ["exit 1", "echo malformed; exit 0", "exit 0"] {
+        let l = lab_for(SERVICE_JOB);
+        let script = format!("#!/bin/sh\necho \"$*\" >> \"$HOME/docker-calls\"\ncase \"$1\" in run) {reply};; esac\nexit 0\n");
+        std::fs::write(l.tmp.path().join("fakebin/docker"), script).unwrap();
+        let result = l.run(Some(Recorder::new(Exit::Code(0), None)));
+        assert!(matches!(job(&result).outcome, Outcome::Error(_)));
+        let calls = std::fs::read_to_string(l.tmp.path().join("docker-calls")).unwrap();
+        assert!(calls.lines().any(|line| line.starts_with("run ")));
+        assert!(!calls
+            .lines()
+            .any(|line| line.starts_with("rm ") || line.starts_with("inspect ")));
+    }
+}
+
+#[test]
+fn service_inspection_and_removal_use_acknowledged_id_despite_name_changes() {
+    let workflow = SERVICE_JOB.replace(
+        "image: example-db",
+        "image: example-db\n        ports: [\"5432:5432\"]\n        options: --health-cmd true",
+    );
+    let l = lab_for(&workflow);
+    let id = "c".repeat(64);
+    let script = format!("#!/bin/sh\necho \"$*\" >> \"$HOME/docker-calls\"\ncase \"$1\" in\nrun) echo {id};;\ninspect) echo 'running healthy';;\nport) echo '127.0.0.1:15432';;\nps) case \"$*\" in *id={id}*) echo {id};; esac;;\nesac\nexit 0\n");
+    std::fs::write(l.tmp.path().join("fakebin/docker"), script).unwrap();
+    let result = l.run(Some(Recorder::new(Exit::Code(0), None)));
+    assert_eq!(job(&result).outcome, Outcome::Pass);
+    let calls = std::fs::read_to_string(l.tmp.path().join("docker-calls")).unwrap();
+    for line in calls
+        .lines()
+        .filter(|line| line.starts_with("inspect ") || line.starts_with("rm "))
+    {
+        assert!(
+            line.ends_with(&id),
+            "control command lost acknowledged identity"
+        );
+    }
+    assert!(calls
+        .lines()
+        .any(|line| line == format!("port {id} 5432/tcp")));
+    assert!(calls.lines().any(|line| line == format!("rm -f -- {id}")));
+}
+
+#[test]
+fn external_compose_namespace_never_authorizes_automatic_down() {
+    let workflow = TWO_STEPS.replace(
+        "JOB_VAR: j",
+        "JOB_VAR: j\n      COMPOSE_PROJECT_NAME: existing-shared-project",
+    );
+    let l = lab_for(&workflow);
+    std::fs::write(
+        l.tmp.path().join("fakebin/docker"),
+        "#!/bin/sh\necho \"$*\" >> \"$HOME/docker-calls\"\nexit 0\n",
+    )
+    .unwrap();
+    let result = l.run(Some(Recorder::new(Exit::Code(0), None)));
+    assert_eq!(job(&result).outcome, Outcome::Pass);
+    let calls = std::fs::read_to_string(l.tmp.path().join("docker-calls")).unwrap_or_default();
+    assert!(!calls
+        .lines()
+        .any(|line| line.contains("existing-shared-project")));
 }

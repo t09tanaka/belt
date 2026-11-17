@@ -8,6 +8,12 @@ use crate::{
     task::{TaskInputs, TaskResult},
 };
 use anyhow::{bail, Context, Result};
+mod evaluation;
+pub(crate) use evaluation::GitWorkflowReader;
+pub use evaluation::{
+    git_evaluation_source, verify_git_evaluation_source, EvaluationBinding, EvaluationSource,
+    JobScheduling, VerifiedEvaluationSource, WorkflowScheduling,
+};
 mod receipt;
 pub use receipt::{AttemptBinding, PrivateReceiptDirectory};
 use std::path::Path;
@@ -50,10 +56,30 @@ pub struct PinnedWorkspace {
     inode: u64,
     pub(crate) namespace: String,
     pub(crate) sequence: Arc<AtomicUsize>,
+    unverified: Vec<crate::source::RelPath>,
 }
+
+/// What a host placed in a workspace before binding it, and so asks
+/// [`PinnedExecution::verify_workspace_with_overlay`] not to compare with the
+/// captured source. Paths are relative to the workspace root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkspaceOverlay {
+    /// Files or directories: the output of a prepared setup, dependency
+    /// directories copied in. Everything below a directory is left out.
+    pub paths: Vec<crate::source::RelPath>,
+    /// Restored secret files. Each must be one the manifest declares.
+    pub secret_files: Vec<crate::source::RelPath>,
+}
+
 impl PinnedWorkspace {
     pub fn workspace(&self) -> &Workspace {
         &self.workspace
+    }
+    /// The paths that were left out when this workspace was verified, sorted:
+    /// what [`WorkspaceOverlay`] declared. Empty for a workspace that was
+    /// materialized, verified whole, or restored from a receipt.
+    pub fn unverified_paths(&self) -> &[crate::source::RelPath] {
+        &self.unverified
     }
     pub(crate) fn validate(&self, input: &PinnedExecution<'_>) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
@@ -129,6 +155,42 @@ impl<'a> PinnedExecution<'a> {
         crate::source::verify_materialized_from(self.store, self.manifest, &workspace.root)?;
         self.verify_git(ctx, &workspace.root, false)?;
         self.bind_verified_workspace(workspace)
+    }
+
+    /// [`Self::verify_workspace`] for a workspace the host has already put
+    /// secrets, setup output or dependencies into. Only what `overlay`
+    /// declares, and what lies below it, is left out; every other byte must
+    /// match the captured source, and the Git HEAD and index are checked as
+    /// before. The declared paths are refused when they are not normalized
+    /// relative paths, are or lead through a symbolic link, touch a submodule,
+    /// or name a secret file the manifest does not declare. The bound
+    /// workspace records them ([`PinnedWorkspace::unverified_paths`]).
+    ///
+    /// The content of the declared paths is the host's word: nothing here
+    /// checks it, and steps run with it.
+    pub fn verify_workspace_with_overlay(
+        &self,
+        ctx: &ExecContext,
+        workspace: Workspace,
+        overlay: &WorkspaceOverlay,
+    ) -> Result<PinnedWorkspace> {
+        self.validate(self.plan)?;
+        let unverified = crate::source::check_unverified_paths(
+            self.manifest,
+            &workspace.root,
+            &overlay.paths,
+            &overlay.secret_files,
+        )?;
+        crate::source::verify_materialized_except(
+            self.store,
+            self.manifest,
+            &workspace.root,
+            &unverified,
+        )?;
+        self.verify_git(ctx, &workspace.root, false)?;
+        let mut bound = self.bind_verified_workspace(workspace)?;
+        bound.unverified = unverified;
+        Ok(bound)
     }
 
     /// SDK-owned legacy Git materialization: HEAD is the execution commit and
@@ -229,6 +291,7 @@ impl<'a> PinnedExecution<'a> {
             root,
             device: metadata.dev(),
             inode: metadata.ino(),
+            unverified: vec![],
         })
     }
 
@@ -327,6 +390,31 @@ pub fn execute_pinned_task(
     )
 }
 
+/// Execute only a recomputed member of the original captured dynamic task.
+/// Host must bind dispatch/inputs/facts to its committed readiness/attempt.
+#[allow(clippy::too_many_arguments)]
+pub fn execute_pinned_dispatch(
+    ctx: &ExecContext,
+    input: &PinnedExecution<'_>,
+    dispatch: &crate::driver::DerivedDispatch,
+    inputs: &TaskInputs,
+    facts: &crate::driver::PortableFacts,
+    prepared: Option<(&PreparedReceipt, &TemplateContext)>,
+    ws: &PinnedWorkspace,
+    opts: Opts,
+    workspaces: &dyn PinnedWorkspaceProvider,
+) -> Result<TaskResult> {
+    input.validate(input.plan)?;
+    ws.validate(input)?;
+    let source = input.evaluation_source()?;
+    let selection =
+        crate::driver::dispatch::validate(input.plan, &source, facts, dispatch, inputs)?;
+    let task = selection.task.clone();
+    let runner = Runner::new_pinned(ctx, input, ws, opts, workspaces)?
+        .select_derived(selection, facts.clone());
+    crate::task::execute_resolved_with_runner(ctx, &task, inputs, prepared, ws.workspace(), runner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -416,5 +504,102 @@ mod tests {
             )
             .is_err());
         assert!(!workspace.workspace().tools.exists());
+    }
+    #[test]
+    fn replaced_workspace_at_final_cleanup_retains_actual_result_and_port_reference() {
+        struct ReplaceRoot;
+        impl crate::StepExecutor for ReplaceRoot {
+            fn run(&self, req: &crate::StepRequest) -> Result<crate::StepExit> {
+                std::fs::rename(&req.cwd, req.cwd.with_extension("original"))?;
+                std::fs::create_dir(&req.cwd)?;
+                Ok(crate::StepExit {
+                    exit: crate::exec::Exit::Code(0),
+                    run_secs: 0.,
+                    queue_wait_secs: None,
+                })
+            }
+        }
+        let area = tempfile::tempdir().unwrap();
+        let source = area.path().join("source");
+        std::fs::create_dir_all(source.join(".github/workflows")).unwrap();
+        std::fs::write(
+            source.join(".github/workflows/ci.yml"),
+            "on: push\njobs:\n  test:\n    runs-on: x\n    steps:\n      - run: echo completed\n",
+        )
+        .unwrap();
+        let store = ObjectStore::open(area.path().join("store")).unwrap();
+        let ctx = ExecContext::new(Default::default());
+        let manifest = crate::source::capture_directory(
+            &ctx,
+            &source,
+            &crate::source::CaptureOptions {
+                store: Some(store.root().into()),
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .manifest;
+        let plan = crate::build_frozen_plan_from_source(
+            &store,
+            &manifest,
+            &crate::PinnedPlanOptions {
+                filters: crate::frozen::Filters {
+                    all: false,
+                    include_disabled: true,
+                    workflows_dirs: vec![],
+                    workflows: vec![],
+                    jobs: vec![],
+                },
+                workflow_dirs_override: None,
+                disabled: vec![],
+                base_branch: None,
+                changed_files: None,
+            },
+        )
+        .unwrap();
+        let input = PinnedExecution::new(&plan, &manifest, &store).unwrap();
+        let workspace = input
+            .materialize_workspace(Workspace {
+                root: area.path().join("root"),
+                repo_root: area.path().join("no-repo"),
+                run_dir: area.path().join("run"),
+                tools: area.path().join("tools"),
+                lock_file: area.path().join("lock"),
+            })
+            .unwrap();
+        let opts = Opts {
+            parallel: 1,
+            traffic_controller: None,
+            executor: Some(Arc::new(ReplaceRoot)),
+            portool: Some(area.path().join("never-invoked-portool")),
+            containers: 1,
+            job_timeout_min: 1.,
+            keep: false,
+            trash: area.path().join("trash"),
+            all_os_legs: false,
+        };
+        let provider = RefusePinnedForks;
+        let runner = Runner::new_pinned(&ctx, &input, &workspace, opts, &provider).unwrap();
+        let outcome = crate::task::execute_resolved_outcome(
+            &ctx,
+            &plan.tasks[0],
+            &TaskInputs::default(),
+            None,
+            workspace.workspace(),
+            runner,
+        );
+        assert_eq!(
+            outcome.execution.as_ref().unwrap().outcomes[0].status,
+            crate::JobStatus::Success
+        );
+        assert!(outcome.final_error.is_some());
+        assert_eq!(
+            outcome.cleanup.pending.port_paths,
+            vec![workspace.workspace().root.clone()]
+        );
+        assert!(
+            crate::execution_outcome::retained_result(&outcome.legacy_result().unwrap_err())
+                .is_some()
+        );
     }
 }
