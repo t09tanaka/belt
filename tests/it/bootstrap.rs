@@ -4605,11 +4605,13 @@ fn sync_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
     let stubs = root.path().join("tool-stubs");
     std::fs::create_dir(&host).unwrap();
     crate::common::write_executable(&host.join("node"), "#!/bin/sh\nprintf 'v18.0.0\\n'\n");
-    let traffic = spec.worker_state_dir.join("traffic");
-    std::fs::create_dir(&traffic).unwrap();
-    std::fs::set_permissions(&traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // The worker's scope is the command's (HOME / XDG), not `<state>/traffic`.
+    let traffic_config = worker_traffic(&spec.env).config_file;
+    let traffic = traffic_config.parent().unwrap();
+    std::fs::create_dir_all(traffic).unwrap();
+    std::fs::set_permissions(traffic, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(
-        traffic.join("config.toml"),
+        &traffic_config,
         "budget = 8\ncpu_threshold_percent = 100.0\nmemory_reserve_mib = 0\n",
     )
     .unwrap();
@@ -4940,7 +4942,7 @@ async fn the_install_of_a_warm_up_waits_for_the_traffic_gate_of_the_worker() {
     use task_traffic_controller::{managed, Context};
     let (_root, spec, host) = sync_fixture();
     let client = ensure(spec.clone()).await.unwrap();
-    let traffic = spec.worker_state_dir.join("traffic");
+    let scope = worker_traffic(&spec.env);
     let cfg = Config {
         budget: 8,
         cpu_threshold_percent: 100.0,
@@ -4948,8 +4950,8 @@ async fn the_install_of_a_warm_up_waits_for_the_traffic_gate_of_the_worker() {
         ..Config::default()
     };
     let ctx = Context::new(task_traffic_controller::paths::Paths::new(
-        &traffic,
-        traffic.join("config.toml"),
+        &scope.state_dir,
+        &scope.config_file,
     ));
     // The whole budget of the worker is taken by something else.
     let id = "warm-up-admission-blocker".to_string();
