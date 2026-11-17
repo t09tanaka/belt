@@ -299,18 +299,24 @@ pub(super) mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_stopped_resident_ends_the_loop_without_a_page() {
         let f = Fixture::new();
-        let (_, attempt) = f.expired();
+        // A durable claim: any page at all would finish it and delete this.
+        let (run_id, attempt) = claimed(f.owner.store(), &f.files);
         let (stop, rx) = watch::channel(true);
-        run(
-            f.owner.clone(),
-            f.files.clone(),
-            RETENTION_DAYS,
-            Duration::from_millis(10),
-            rx,
+        tokio::time::timeout(
+            Duration::from_secs(20),
+            run(
+                f.owner.clone(),
+                f.files.clone(),
+                RETENTION_DAYS,
+                Duration::from_millis(10),
+                rx,
+            ),
         )
         .await
+        .expect("the loop went on after the stop")
         .unwrap();
         drop(stop);
         assert!(f.directory(&attempt).exists());
+        assert_eq!(f.pending(&run_id), 1);
     }
 }
