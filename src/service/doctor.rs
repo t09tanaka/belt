@@ -12,7 +12,9 @@
 //!
 //! A check is `ok`, `notice`, `fail` or `not_checked`. Something that could
 //! not be looked at is never `ok`: an unreachable worker fails, and a check
-//! that is not implemented yet is listed as `not_checked`.
+//! that is not implemented yet is listed as `not_checked`. What a person has
+//! to fix fails; what an exec or `workers sync` installs by itself, or what
+//! neither side measures yet, is a `notice` and does not change the exit.
 use super::bootstrap::Spec;
 use super::worker_service::Status;
 use super::workers::{self, Remote, RemoteOutput};
@@ -741,9 +743,11 @@ pub fn project_checks(notices: Result<&[crate::config::resolve::Notice], String>
 pub type DiffSource<'a> = Option<&'a mut dyn FnMut(&str) -> Vec<Check>>;
 
 /// The difference `workers diff` found for one worker, as checks: one per
-/// item. `same` is ok and every class a person or `workers sync` has to act
-/// on fails. What was not measured, or a difference that could not be taken
-/// at all, is a check that was not made: never a pass, never an empty list.
+/// item. `same` is ok. Only what a person has to fix fails (`differs`,
+/// `missing`, `manual_required`). `auto_installable` is a notice: an exec's
+/// warm-up and `workers sync` install it. An item neither side measured is a
+/// notice too. A difference that could not be taken at all is a check that
+/// was not made: never a pass, never an empty list.
 pub fn diff_checks(host: &str, measured: Result<&[Item], &str>) -> Vec<Check> {
     let left_out = |why: &str| {
         vec![Check::new(
@@ -763,11 +767,8 @@ pub fn diff_checks(host: &str, measured: Result<&[Item], &str>) -> Vec<Check> {
         .map(|item| {
             let level = match item.class {
                 Class::Same => Level::Ok,
-                Class::NotMeasured => Level::NotChecked,
-                Class::Differs
-                | Class::Missing
-                | Class::AutoInstallable
-                | Class::ManualRequired => Level::Fail,
+                Class::AutoInstallable | Class::NotMeasured => Level::Notice,
+                Class::Differs | Class::Missing | Class::ManualRequired => Level::Fail,
             };
             let class = serde_json::to_value(item.class)
                 .ok()
@@ -782,6 +783,13 @@ pub fn diff_checks(host: &str, measured: Result<&[Item], &str>) -> Vec<Check> {
             if let Some(steps) = &item.steps {
                 detail.push_str(&format!(" -> {steps}"));
             }
+            match item.class {
+                Class::AutoInstallable => detail.push_str(&format!(
+                    " (an exec installs it; `remote-task-runner workers sync {host}` installs it now)"
+                )),
+                Class::NotMeasured => detail.push_str(" (not measured yet)"),
+                _ => {}
+            }
             // Values come from the worker's report.
             Check::new(
                 host,
@@ -791,6 +799,15 @@ pub fn diff_checks(host: &str, measured: Result<&[Item], &str>) -> Vec<Check> {
             )
         })
         .collect()
+}
+
+/// The parent's own measurement, in the retained service environment and
+/// never in the invoking shell's: the rule `workers diff` follows.
+fn measure_parent(
+    spec: &Spec,
+    collect: impl FnOnce(&Path, &BTreeMap<String, String>) -> Result<EnvReport, String>,
+) -> Result<EnvReport, String> {
+    collect(&spec.worker_state_dir, &spec.env)
 }
 
 /// `workers diff` for one worker, as doctor's checks. `parent` is the
@@ -977,16 +994,11 @@ pub fn command(json: bool) -> i32 {
                 .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
             let spec = super::context::runtime_spec(&env)?;
             // Measured as `workers diff` measures it, once, and only when a
-            // worker answers; in the environment `run` checks the parent in
-            // (the invoking shell's when none is retained, which it notes).
+            // worker answers.
             let mut parent: Option<Result<EnvReport, String>> = None;
             let mut source = |host: &str| {
                 let parent = parent.get_or_insert_with(|| {
-                    let retained = spec.env.contains_key("HOME");
-                    crate::toolchain::envreport::collect(
-                        &spec.worker_state_dir,
-                        if retained { &spec.env } else { &env },
-                    )
+                    measure_parent(&spec, crate::toolchain::envreport::collect)
                 });
                 worker_diff(
                     &mut workers::SshRemote,

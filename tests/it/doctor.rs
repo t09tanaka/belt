@@ -238,12 +238,27 @@ fn a_check_that_was_not_made_is_not_healthy_and_exits_apart_from_a_failure() {
     assert_ne!(ErrorCode::Blocked.exit_code(), 1);
 }
 
-#[test]
-fn a_worker_that_answers_has_its_environment_compared_with_the_parent_s() {
+/// The service environment a coordinator retains: what `workers diff` measures
+/// the parent in.
+fn retained_env(fx: &Fx) -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([
+        ("HOME".to_string(), fx.path("home").display().to_string()),
+        (
+            "PATH".to_string(),
+            format!("{}:/usr/bin:/bin", fx.path("bin").display()),
+        ),
+    ])
+}
+
+fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
     use remote_task_runner::service::doctor::{Docker, HostFacts, ProfileFacts, Scope};
     use remote_task_runner::toolchain::envdiff::{self, EnvReport};
     let fx = Fx::new();
-    let cluster = fx.init();
+    let cluster = fx.init_with_env(if retained {
+        retained_env(&fx)
+    } else {
+        Default::default()
+    });
     no_engine(&fx);
     fx.config(
         "schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@mini-a.local\"\nbinary = \"/w/bin/current/remote-task-runner\"\n",
@@ -293,12 +308,13 @@ fn a_worker_that_answers_has_its_environment_compared_with_the_parent_s() {
         "case \"$*\" in\n*\"'worker-service' 'doctor'\") printf '%s\\n' '{doctor}';;\n*\"'worker-service' 'env'\") printf '%s\\n' '{env}';;\n*) exit 1;;\nesac"
     ));
     let out = fx.run(&["doctor"]);
-    let report = json(&out);
-    assert_eq!(
-        out.status.code(),
-        Some(ErrorCode::Blocked.exit_code()),
-        "{report}"
-    );
+    (out.status.code(), json(&out))
+}
+
+#[test]
+fn a_worker_that_answers_has_its_environment_compared_with_the_parent_s() {
+    let (code, report) = answering_worker(true);
+    assert_eq!(code, Some(ErrorCode::Blocked.exit_code()), "{report}");
     assert_eq!(check(&report, "mini-a", "reachable")["level"], "ok");
     let compared: Vec<_> = report["result"]["checks"]
         .as_array()
@@ -326,7 +342,32 @@ fn a_worker_that_answers_has_its_environment_compared_with_the_parent_s() {
             .all(|c| !c["detail"].as_str().unwrap().contains("left out")),
         "{report}"
     );
-    // The policy digest is not measured by either side yet: listed, not passed.
-    assert!(compared.iter().any(|c| c["level"] == "not_checked"
-        && c["detail"].as_str().unwrap().starts_with("policy_digest: ")));
+    // The policy digest is not measured by either side yet: listed as a
+    // notice, neither a pass nor a reason to exit 1.
+    assert!(compared.iter().any(|c| c["level"] == "notice"
+        && c["detail"].as_str().unwrap().starts_with("policy_digest: ")
+        && c["detail"].as_str().unwrap().contains("not measured yet")));
+    assert_eq!(report["result"]["not_checked"], 0, "{report}");
+}
+
+#[test]
+fn without_a_retained_service_environment_the_parent_is_not_measured_in_the_shell_s() {
+    let (code, report) = answering_worker(false);
+    // Not compared at all, and said so: one check that was not made.
+    let compared: Vec<_> = report["result"]["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["host"] == "mini-a" && c["id"] == "environment_diff")
+        .collect();
+    assert_eq!(compared.len(), 1, "{report}");
+    assert_eq!(compared[0]["level"], "not_checked");
+    assert!(
+        compared[0]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("the parent's environment could not be measured"),
+        "{report}"
+    );
+    assert_ne!(code, Some(0));
 }

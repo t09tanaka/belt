@@ -1118,6 +1118,11 @@ workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、co
 
 `remote-task-runner workers diff [<worker>] [--json]` は、親（local worker）と対象workerのprofile実効環境の差を示す。対象は、各toolの版（版管理ツールに導入済みの版一覧を含む）、PATH上の必要tool、portool・task-traffic-controller runtime・local-ci core・remote-task-runner自身の版、Docker実行可否、利用可能disk、profile digest、task-traffic-controller policy digestとする。項目ごとに `same / differs / missing / auto_installable / manual_required` を示す。`doctor` はこの結果を含む。
 
+`doctor` は worker ごとの差を `environment_diff` として項目ごとに1 checkで載せ、区分は次のとおりとする。利用者が手を動かさないと直らない差だけが `fail`（exit 1相当のblocked）になる。
+- `fail`: `differs`、`missing`、`manual_required`、diskの不足。
+- `notice`（exitに影響しない）: `auto_installable`（execのウォームアップと `workers sync` が自動で入れるため。`workers sync <worker>` で今すぐ入れられると案内する）、親もworkerも測らない項目（`not_measured`。policy digestなど。「まだ測っていない」と表示する）。
+- `not_checked`（healthyにならない）: 到達できなかったworker、worker・親の環境を測れなかった場合。親は `workers diff` と同じく保持したserviceの環境で測り、呼び出したshellの環境では測らない。
+
 `remote-task-runner workers sync <worker> [--project <dir>]` は、対象workerに対し、自動導入可能な差を事前に解消する（ウォームアップ）。`--project` を付けた場合は、そのプロジェクトの版指定・baselineを基準にする。手動対応が必要な差は導入せず、手順を表示する。sync中もworkerは新規配置を受けられるが、導入対象の版を要する配置はsingleflightで導入完了を待つ。
 
 導入は、動いている resident が worker の link 越しに `env_sync`（第11章）で依頼する。resident が動いていなければ、起動せずに止まる。worker が `unchanged`（既に導入済み）と答えた版は、導入したものとして表示しない。導入した版も `unchanged` の版も、導入後に worker を測り直し、見えなければ blocked にする。親の中断（Ctrl-C）では、worker の導入は最長 `warmup_idle_ms`（60秒）続いてから止まる。その間に同じ版を sync し直せば、同じ導入に合流する。

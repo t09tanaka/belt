@@ -26,6 +26,13 @@ impl Fx {
     /// An initialized coordinator: the retained input names the cluster, as
     /// `init` leaves it. Nothing is started.
     pub(super) fn init(&self) -> ClusterId {
+        self.init_with_env(Default::default())
+    }
+    /// As `init`, with the service environment the coordinator retained.
+    pub(super) fn init_with_env(
+        &self,
+        env: std::collections::BTreeMap<String, String>,
+    ) -> ClusterId {
         use remote_task_runner::service::bootstrap::{write_input, Spec};
         let dir = self.path("home/.config/remote-task-runner");
         std::fs::create_dir_all(&dir).unwrap();
@@ -50,7 +57,7 @@ impl Fx {
             worker_id: WorkerId::parse("local").unwrap(),
             cluster_key_path: self.path("cluster.key"),
             executable: self.path("rtr"),
-            env: Default::default(),
+            env,
             repo_root: None,
             expected_cluster: Some(cluster.clone()),
             managed_service: None,

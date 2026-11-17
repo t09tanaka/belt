@@ -1285,7 +1285,7 @@ mod environment_diff {
     }
 
     #[test]
-    fn every_class_becomes_one_check_and_only_same_passes() {
+    fn every_class_becomes_one_check_and_only_what_a_person_must_fix_fails() {
         let items = [
             item("platform", Class::Same),
             item("node", Class::Differs),
@@ -1305,19 +1305,87 @@ mod environment_diff {
                 Level::Ok,
                 Level::Fail,
                 Level::Fail,
+                Level::Notice,
                 Level::Fail,
-                Level::Fail,
-                Level::NotChecked
+                Level::Notice
             ]
         );
         assert_eq!(checks[0].detail, "platform: same parent=22.1.0 worker=-");
         assert_eq!(
             checks[3].detail,
-            "flutter: auto_installable parent=22.1.0 worker=- -> do this"
+            "flutter: auto_installable parent=22.1.0 worker=- -> do this (an exec installs it; `remote-task-runner workers sync mini-a` installs it now)"
         );
         assert_eq!(
             checks[5].detail,
-            "policy_digest: not_measured parent=22.1.0 worker=- -> do this"
+            "policy_digest: not_measured parent=22.1.0 worker=- -> do this (not measured yet)"
+        );
+    }
+
+    #[test]
+    fn a_registered_worker_with_nothing_to_fix_keeps_the_exit_at_zero() {
+        let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
+        // No separate task-traffic-controller on the worker: nothing else is left out.
+        let (_, facts, _) = w
+            .remote
+            .hosts
+            .get_mut("ci@mini-a.local")
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        facts.cli = None;
+        facts.cli_scope.in_use = false;
+        let mut source = |host: &str| {
+            diff_checks(
+                host,
+                Ok(&[
+                    item("platform", Class::Same),
+                    item("flutter", Class::AutoInstallable),
+                    item("policy_digest", Class::NotMeasured),
+                ]),
+            )
+        };
+        let report = run(
+            &mut w.remote,
+            &mut w.runner,
+            &w.host.env,
+            &w.spec,
+            &w.version,
+            Some(&mut source),
+        )
+        .unwrap();
+        let left: Vec<_> = report
+            .checks
+            .iter()
+            .filter(|c| c.level == Level::NotChecked)
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        assert!(report.problem().is_none(), "{:?}", report.problem());
+        // The same list with something a person must fix does fail.
+        let mut source = |host: &str| diff_checks(host, Ok(&[item("node", Class::Missing)]));
+        let report = run(
+            &mut w.remote,
+            &mut w.runner,
+            &w.host.env,
+            &w.spec,
+            &w.version,
+            Some(&mut source),
+        )
+        .unwrap();
+        assert!(report.problem().is_some());
+    }
+
+    #[test]
+    fn the_parent_is_measured_in_the_retained_environment_as_workers_diff_does() {
+        let w = World::new(&[]);
+        let mut seen = None;
+        let result = measure_parent(&w.spec, |state, env| {
+            seen = Some((state.to_path_buf(), env.clone()));
+            Err("no profile".into())
+        });
+        assert_eq!(result.unwrap_err(), "no profile");
+        assert_eq!(
+            seen,
+            Some((w.spec.worker_state_dir.clone(), w.spec.env.clone()))
         );
     }
 
