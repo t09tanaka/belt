@@ -193,6 +193,46 @@ fn admitted(ctx: &Context, spec: &SuperviseSpec, node: &NodeSpec) -> bool {
         && crate::platform::read_process(pid).ppid == Some(sidecar.owner_pid)
 }
 
+/// How long a helper waits for the records of its own admission (the
+/// ledger entry, the sidecar, the launch in the worker store). Its
+/// supervisor writes them after it started the helper, and on a busy machine
+/// that takes seconds: a short wait here failed installs that were admitted.
+/// A helper that is never admitted is stopped by its supervisor's deadline
+/// before this, or leaves here.
+const ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+#[derive(Debug, PartialEq, Eq)]
+enum AdmissionStep {
+    Go,
+    Wait,
+    GiveUp,
+}
+
+/// What a helper does next. It runs the manager only once it is admitted.
+/// When the admission of this command names another process as its child,
+/// this helper was started beside it and never will be: it leaves at once.
+fn admission_step(admitted: bool, another_is_the_child: bool, waited: Duration) -> AdmissionStep {
+    if admitted {
+        AdmissionStep::Go
+    } else if another_is_the_child || waited >= ADMISSION_WAIT {
+        AdmissionStep::GiveUp
+    } else {
+        AdmissionStep::Wait
+    }
+}
+
+/// The admission of this builder's command records a child, and it is not
+/// this process.
+fn another_is_the_child(ctx: &Context, spec: &SuperviseSpec) -> bool {
+    let id = command_id(&spec.attempt_id, 0);
+    match managed::assess(ctx, &id).sidecar {
+        managed::Loaded::Ok(sidecar) => sidecar
+            .child
+            .is_some_and(|child| child.pid != std::process::id()),
+        _ => false,
+    }
+}
+
 fn run_helper(path: &Path, binding: &str) -> Result<(), String> {
     let dir = path.parent().ok_or("missing_builder_directory")?;
     if path != dir.join(REQUEST_FILE)
@@ -244,15 +284,18 @@ fn run_helper(path: &Path, binding: &str) -> Result<(), String> {
         &spec.traffic_state_dir,
         spec.traffic_config_path(),
     ));
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let began = Instant::now();
     loop {
-        if admitted(&ctx, &spec, &node) {
-            break;
+        let admitted = admitted(&ctx, &spec, &node);
+        match admission_step(
+            admitted,
+            !admitted && another_is_the_child(&ctx, &spec),
+            began.elapsed(),
+        ) {
+            AdmissionStep::Go => break,
+            AdmissionStep::GiveUp => return Err("installer_not_admitted".into()),
+            AdmissionStep::Wait => std::thread::sleep(Duration::from_millis(10)),
         }
-        if Instant::now() >= deadline {
-            return Err("installer_not_admitted".into());
-        }
-        std::thread::sleep(Duration::from_millis(10));
     }
     adapters::install_admitted(&plan, &toolchains, &mut HelperExecutor).map_err(str::to_string)?;
     Ok(())
@@ -347,5 +390,48 @@ mod tests {
         std::fs::write(&file, vec![b' '; MAX_REQUEST as usize + 1]).unwrap();
         assert!(private_json::<serde_json::Value>(&file).is_err());
         assert!(private_json::<serde_json::Value>(temp.path()).is_err());
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::{admission_step, AdmissionStep, ADMISSION_WAIT};
+    use std::time::Duration;
+
+    #[test]
+    fn a_helper_runs_only_admitted_waits_for_its_records_and_leaves_when_another_is_the_child() {
+        let just_under = ADMISSION_WAIT - Duration::from_millis(1);
+        // Admitted: it goes, whatever else.
+        assert_eq!(
+            admission_step(true, false, Duration::ZERO),
+            AdmissionStep::Go
+        );
+        assert_eq!(
+            admission_step(true, false, ADMISSION_WAIT),
+            AdmissionStep::Go
+        );
+        // Not yet: it waits well beyond the few seconds a busy machine
+        // takes to write the records, then gives up.
+        assert_eq!(
+            admission_step(false, false, Duration::ZERO),
+            AdmissionStep::Wait
+        );
+        assert_eq!(
+            admission_step(false, false, Duration::from_secs(30)),
+            AdmissionStep::Wait
+        );
+        assert_eq!(
+            admission_step(false, false, just_under),
+            AdmissionStep::Wait
+        );
+        assert_eq!(
+            admission_step(false, false, ADMISSION_WAIT),
+            AdmissionStep::GiveUp
+        );
+        // Another process is the admitted child: never this one.
+        assert_eq!(
+            admission_step(false, true, Duration::ZERO),
+            AdmissionStep::GiveUp
+        );
     }
 }
