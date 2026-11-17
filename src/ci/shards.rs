@@ -357,6 +357,18 @@ pub(crate) mod tests {
             p.tasks[at].shard.as_mut().unwrap().count = 1;
         });
         assert!(one.contains("does not have its shards"), "{one}");
+        // A split job that names a shard the plan does not have.
+        let ghost = broken(&|p| {
+            for t in p.tasks.iter_mut() {
+                if let Some(shard) = t.shard.as_mut() {
+                    shard.count = 3;
+                }
+            }
+            for g in p.shard_groups.iter_mut().filter(|g| g.split) {
+                g.shards.push("ghost".into());
+            }
+        });
+        assert!(ghost.contains("does not have its shards"), "{ghost}");
         // A task of another group under the name of a shard is not a shard
         // of this one.
         let foreign = broken(&|p| {
@@ -432,8 +444,8 @@ pub(crate) mod tests {
         };
         assert!(to_cancel(g, &ended(&[])).is_empty());
         assert!(to_cancel(g, &ended(&[(&a, false)])).is_empty());
-        assert_eq!(to_cancel(g, &ended(&[(&a, true)])), [b.clone()]);
-        assert_eq!(to_cancel(g, &ended(&[(&b, true)])), [a.clone()]);
+        assert_eq!(to_cancel(g, &ended(&[(&a, true)])), [b.as_str()]);
+        assert_eq!(to_cancel(g, &ended(&[(&b, true)])), [a.as_str()]);
         assert!(to_cancel(g, &ended(&[(&a, true), (&b, false)])).is_empty());
         // The failure of a task that is no shard of the group stops nothing.
         let stranger = "another".to_string();

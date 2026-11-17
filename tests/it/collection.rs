@@ -3964,3 +3964,139 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
         assert!(text.contains(&format!("test: failure ({why})\n")), "{text}");
     }
 }
+
+/// A41, retry: after a shard failed and fail-fast stopped another, a retry
+/// of the run starts a new attempt of those two only, on the same frozen
+/// plan. The shard that passed is not run again and its checked result is
+/// kept: the job becomes a success from the kept result and the new ones.
+#[tokio::test]
+async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the_rest() {
+    use remote_task_runner::service::ci_run::Part;
+    use remote_task_runner::service::completion::Target;
+    use remote_task_runner::storage::RetryPreparation;
+    let discovered = listed(&["a", "b", "c", "d", "e", "f"]);
+    let adapter = CargoTest::new("1.91.0", &[], Safety::default());
+    let opts = PartitionOpts::default();
+    let fx = fx();
+    let (c, files) = fx.open();
+    let whole = ci_plan(&split_workflow("cargo test"));
+    let shards = partition_tests(&adapter, &discovered, &History::default(), 3, &opts);
+    let plan = whole
+        .with_shards(&[split_request(&whole, shards, &discovered, true)])
+        .unwrap();
+    let group = split_group(&plan);
+    let (run, ids) = ci_run_by_task(&fx, &c, &plan).await;
+    let task = |at: usize| ids[&group.shards[at]].clone();
+    let attempts = |at: usize| c.store().attempts_of_task(&task(at)).unwrap();
+    let first = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
+
+    // Shard 0 passes, shard 1 fails, shard 2 is stopped while it runs.
+    let passed = shard_result(&group, 0, "success", "passed", None);
+    end_shard(
+        &c,
+        &files,
+        &first[&group.shards[0]],
+        Outcome::Succeeded,
+        &passed,
+    )
+    .await;
+    let failed = shard_result(&group, 1, "failure", "failed", None);
+    end_shard(
+        &c,
+        &files,
+        &first[&group.shards[1]],
+        Outcome::Failed,
+        &failed,
+    )
+    .await;
+    assert_eq!(ci_advance(&fx, &c).stopped, vec![task(2)]);
+    for _ in 0..4 {
+        c.tick().await.unwrap();
+        collect(&c, &files).await;
+    }
+    assert_eq!(ci_advance(&fx, &c).released.len(), 1, "report goes on");
+    let lines = ci_lines(&fx, &c, &files, &run);
+    let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
+    assert_eq!(job.status, "failure");
+    // report runs (it is `if: always()`) and ends.
+    let b = c.tick().await.unwrap().placed[0].clone();
+    let sent = fx.w.payload(&b);
+    let done = ci_result(&ci_task_of(&plan, "report"), "report", "success", json!({}));
+    end(&fx, &c, &b, Outcome::Succeeded, ci_out(&b, &sent, &done)).await;
+    ci_collect(&c, &files, &b).await;
+
+    // Retry the run: only the two shards that did not pass.
+    let target = Target::Run(run.clone());
+    let revision = c
+        .store()
+        .completion(target.clone())
+        .unwrap()
+        .control_revision;
+    let prepared = match c.store().prepare_retry(target, revision, "again".into()) {
+        Ok(RetryPreparation::Prepared(prepared)) => prepared,
+        Ok(RetryPreparation::Replay(_)) => panic!("a first request is no replay"),
+        Err(e) => panic!("{e}"),
+    };
+    let receipt = c.store().commit_retry(prepared, false, wall_ms()).unwrap();
+    assert_eq!(receipt.task_count, 2);
+    let rows = c.store().ci_run_tasks(&run).unwrap();
+    let row = |at: usize| rows.iter().find(|r| r.task_id == task(at)).unwrap();
+    let kept = row(0).attempt.clone().unwrap();
+    assert_eq!(kept.attempt_id, first[&group.shards[0]].0);
+    assert!(kept.termination.is_some() && kept.collection.is_some());
+    for at in [1, 2] {
+        assert!(
+            row(at).attempt.is_none() && !row(at).cancelled,
+            "shard {at}"
+        );
+    }
+    // The job is open again: the run is looked at, and nothing is stopped
+    // for the failure that was retried.
+    assert_eq!(c.store().ci_waiting_runs(8).unwrap(), vec![run.clone()]);
+    let pass = ci_advance(&fx, &c);
+    assert!(
+        pass.stopped.is_empty() && pass.released.is_empty(),
+        "{pass:?}"
+    );
+    let lines = ci_lines(&fx, &c, &files, &run);
+    assert!(lines.iter().all(|l| l.part != Some(Part::Job)), "{lines:?}");
+
+    // The two get a new attempt each; the shard that passed gets none.
+    let again = placed_by_task(&[&fx.w], &c.tick().await.unwrap().placed);
+    let retried: Vec<&String> = again.keys().collect();
+    assert_eq!(retried, [&group.shards[1], &group.shards[2]]);
+    for at in [1, 2] {
+        let sent = again[&group.shards[at]]
+            .1
+            .payload(&again[&group.shards[at]].0);
+        let before = first[&group.shards[at]]
+            .1
+            .payload(&first[&group.shards[at]].0);
+        // The same task of the same frozen plan.
+        assert_eq!(sent.ci_task, before.ci_task);
+        let result = shard_result(&group, at, "success", "passed", None);
+        end_shard(
+            &c,
+            &files,
+            &again[&group.shards[at]],
+            Outcome::Succeeded,
+            &result,
+        )
+        .await;
+    }
+    assert_eq!(
+        (attempts(0).len(), attempts(1).len(), attempts(2).len()),
+        (1, 2, 2)
+    );
+    ci_advance(&fx, &c);
+    assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
+    let lines = ci_lines(&fx, &c, &files, &run);
+    let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
+    assert_eq!((job.status.as_str(), &job.reason), ("success", &None));
+    let shards: Vec<&str> = lines
+        .iter()
+        .filter(|l| l.part == Some(Part::Shard))
+        .map(|l| l.status.as_str())
+        .collect();
+    assert_eq!(shards, ["success", "success", "success"]);
+}
