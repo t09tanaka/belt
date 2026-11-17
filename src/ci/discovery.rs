@@ -1,6 +1,7 @@
 //! Bind a worker's listing to the frozen job and use the same runner adapter
 //! for listing, partitioning and execution. The listing carries no worker paths.
 
+mod reports;
 pub(crate) mod timing;
 mod worker;
 
@@ -194,10 +195,13 @@ impl DiscoveryStep {
                 .ok_or_else(|| anyhow::anyhow!("runner directory is not UTF-8"))?,
             Isolation::None,
         )?;
-        let discovered = runner.discover(&output).unwrap_or_else(|_| Discovered {
+        let mut discovered = runner.discover(&output).unwrap_or_else(|_| Discovered {
             blocked: vec![NotSplit::DiscoveryFailed],
             ..Default::default()
         });
+        if let Some(reason) = reports::reason(plan, &self, &workspace, &root, runner.info()) {
+            discovered.blocked.push(reason);
+        }
         Ok(WorkerListing {
             step: self,
             runner_version: version,

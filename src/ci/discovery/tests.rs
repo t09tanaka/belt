@@ -125,3 +125,36 @@ fn browser_shards_require_a_fixture_isolation_declaration() {
     assert_eq!(asked.plan.shards.len(), 2);
     assert!(f.plan.with_shards(&[asked]).unwrap().shard_groups[0].split);
 }
+
+#[test]
+fn configured_reporters_and_post_test_uploads_keep_the_whole_job() {
+    let fixture = fixture(WORKFLOW);
+    let step = candidates(&fixture.plan).pop().unwrap();
+    let info = adapter("npx jest", "30", "", Isolation::None).unwrap();
+    let root = fixture.area.canonicalize().unwrap();
+    std::fs::write(
+        root.join("jest.config.js"),
+        "module.exports = {reporters: ['default', 'jest-junit']}",
+    )
+    .unwrap();
+    assert_eq!(
+        reports::reason(&fixture.plan, &step, &root, &root, info.info()),
+        Some(NotSplit::InexactAggregation)
+    );
+    std::fs::write(
+        root.join("jest.config.js"),
+        "module.exports = {collectCoverage: true}",
+    )
+    .unwrap();
+    assert_eq!(
+        reports::reason(&fixture.plan, &step, &root, &root, info.info()),
+        Some(NotSplit::CoverageNotMerged)
+    );
+    let mut post = fixture.plan.clone();
+    let job = &mut post.workflows[0].jobs[0];
+    job.steps.push(job.steps[0].clone());
+    assert_eq!(
+        reports::reason(&post, &step, &root, &root, info.info()),
+        Some(NotSplit::InexactAggregation)
+    );
+}
