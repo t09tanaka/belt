@@ -975,8 +975,7 @@ mod tests {
         // One slot: the install queues ahead of the target.
         let one = insp(1, calm(), vec![]);
         let alone = run(&one, &req, &[]).0;
-        let installs =
-            plan::install_nodes(&b, &Digest::of_bytes(b"p"), 2).expect("node ids are valid");
+        let installs = plan::install_nodes(&b, &Digest::of_bytes(b"p"), 2);
         let with = run(&one, &req, &installs).0;
         assert!(!alone
             .target
