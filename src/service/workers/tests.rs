@@ -1966,7 +1966,9 @@ fn diff_of_every_worker_asks_them_at_the_same_time_and_keeps_the_order() {
         ("mini-b", "ci@host-b"),
         ("mini-c", "ci@host-c"),
     ] {
-        w.add(name, Some(host), true).unwrap();
+        // Each entry is measured by Together below. Registering it needs no
+        // service installation in the shared fixture home.
+        w.add(name, Some(host), false).unwrap();
     }
     let reply = format!(
         "{}\n",
