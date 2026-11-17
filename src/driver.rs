@@ -2345,6 +2345,37 @@ mod tests {
         assert_eq!(d.admitted(), 0);
     }
     #[test]
+    fn fences_of_fail_fast_members_commit_at_the_least_state_limit() {
+        let mut d = driver(true, 3);
+        commit(&mut d, Input::Advance);
+        let members = ready(&d, ".github/workflows/a.yml");
+        assert_eq!(members.len(), 3);
+        for member in &members[..2] {
+            claim(&mut d, member);
+            mark(&mut d, member);
+        }
+        d.state_byte_limit = crate::expr::serialized_size(&d.state, MAX_WIRE_BYTES).unwrap()
+            + d.cancel_reserve(&d.state).unwrap();
+        // the first fence skips the member nobody claimed and asks the other
+        // owner to stop; neither it nor the second is refused
+        commit(&mut d, fence(&members[0], &members[0]));
+        assert_eq!(d.admitted(), 1);
+        assert_eq!(
+            d.core_decision(&members[2]).unwrap().0,
+            CoreDecision::UnstartedSkipped
+        );
+        commit(&mut d, fence(&members[1], &members[1]));
+        assert_eq!(d.admitted(), 0);
+        assert!(d.infrastructure_failure().is_none());
+        assert_eq!(
+            d.outcome(".github/workflows/a.yml", "first")
+                .unwrap()
+                .status,
+            JobStatus::Failure
+        );
+        assert!(crate::expr::serialized_size(&d.state, d.state_byte_limit).is_ok());
+    }
+    #[test]
     fn refuses_modified_frozen_plan_and_config_binding() {
         let mut fp = plan(true, 1);
         fp.tasks[0].jobs.push("forged".into());

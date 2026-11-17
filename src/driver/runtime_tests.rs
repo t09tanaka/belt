@@ -4748,7 +4748,11 @@ fn no_release_is_refused_at_any_state_limit() {
         + roomy.cancel_reserve(&roomy.state).unwrap();
     assert!(most > least);
     let (mut halted, mut passed) = (0, 0);
-    for limit in (least..=most + 997).step_by(997) {
+    // both ends to the byte, and eight limits between them
+    let limits = [least, least + 1, most - 1, most, most + 1]
+        .into_iter()
+        .chain((least..most).step_by((most - least) / 8).skip(1));
+    for limit in limits {
         for order in &orders {
             for cancel in [false, true] {
                 let mut d = d.clone();
