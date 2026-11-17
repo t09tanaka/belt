@@ -52,6 +52,51 @@ impl Computed {
     }
 }
 
+/// What the run failed of, as local-ci tells a failure from an error: a
+/// job that failed is a failure, anything else that kept the run from a
+/// result is an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    /// A command ended with a code that is not zero, or a job is a failure
+    /// (the tests of a shard, a split job that was joined as one).
+    Job,
+    /// The task was cancelled: stopped, or never placed.
+    Cancel,
+    /// A timeout, a signal, an attempt that was lost or interrupted.
+    Other,
+}
+
+/// The failure of the run as its completion has it, in plain values.
+#[derive(Debug, Clone, Copy)]
+pub struct Fault {
+    /// The exit code the run has of it.
+    pub exit_code: i32,
+    /// The exit code the end of the task's attempt stands for by itself.
+    /// `None`: the attempt succeeded, or the task has none.
+    pub own_exit: Option<i32>,
+    /// The command ended by itself with a code that is not zero.
+    pub exited: bool,
+    /// The task was cancelled: its attempt ended so, or it has none.
+    pub cancelled: bool,
+}
+
+/// What the run failed of. A failure that is not the end of the attempt
+/// itself is one of a job, laid over an attempt that succeeded or was only
+/// stopped; a cancel comes before the way the stopped command ended.
+pub fn cause(fault: &Fault) -> Cause {
+    let of_job =
+        fault.own_exit != Some(fault.exit_code) && fault.exit_code != crate::error::exit::CANCELLED;
+    if of_job {
+        Cause::Job
+    } else if fault.cancelled {
+        Cause::Cancel
+    } else if fault.exited {
+        Cause::Job
+    } else {
+        Cause::Other
+    }
+}
+
 /// One line of what the parent collected: a job of a task, or the task
 /// itself with the status `no_result`.
 #[derive(Debug, Clone, Copy)]
@@ -71,33 +116,36 @@ pub struct RunEnd<'a> {
     pub cancel_requested: bool,
     /// `Some(false)` only when every collection is closed.
     pub collection_pending: Option<bool>,
-    /// The exit code of the run. A run that ended of a cancel has the code
-    /// of a cancel; one that failed before a cancel has that of the failure.
+    /// The exit code of the run.
     pub exit_code: i32,
-    /// A task or a job of the run failed (a split job that was joined as a
-    /// failure is one, although every attempt of it succeeded).
-    pub failed: bool,
+    /// What the run failed of, when a task or a job of it failed (a split
+    /// job that was joined as a failure is one, although every attempt of
+    /// it succeeded). A run that failed before a cancel failed of that.
+    pub failed: Option<Cause>,
     /// The tasks of the frozen plan that were submitted.
     pub expected: &'a [&'a str],
     pub jobs: &'a [Job<'a>],
 }
 
-/// The result of the run. It follows the completion of the run: a run that
-/// failed is a failure whatever its lines say, and a cancel that the run did
-/// not end of (fail-fast stopped the other shards of a failed job) does not
-/// make it cancelled. Success fails closed: it needs a settled run without
+/// The result of the run. It follows the completion of the run: a run with
+/// a failed job is a failure whatever its lines say, and a cancel that the
+/// run did not end of (fail-fast stopped the other shards of a failed job)
+/// does not make it cancelled. What else kept the run from a result (a
+/// timeout, a signal, a lost attempt, a failed collection) is an error, as
+/// local-ci has it. Success fails closed: it needs a settled run without
 /// any cancel, a closed collection, exit 0, at least one expected task, a
 /// line for each of them and no line that is anything but `success` or
 /// `skipped`.
 pub fn computed(end: &RunEnd<'_>) -> Computed {
-    let of_cancel = matches!(end.exit_code, 0 | crate::error::exit::CANCELLED);
+    let of_cancel = end.exit_code == 0 || end.failed == Some(Cause::Cancel);
     if !end.settled || (end.cancel_requested && of_cancel) {
         return Computed::Cancelled;
     }
     if end.collection_pending != Some(false) {
         return Computed::Pending;
     }
-    if end.failed || end.jobs.iter().any(|job| job.status == "failure") {
+    let job = end.failed == Some(Cause::Job);
+    if job || end.jobs.iter().any(|job| job.status == "failure") {
         return Computed::Failure;
     }
     let covered = |task: &&str| end.jobs.iter().any(|job| job.plan_task == *task);
@@ -390,7 +438,7 @@ mod tests {
             cancel_requested: false,
             collection_pending: Some(false),
             exit_code: 0,
-            failed: false,
+            failed: None,
             expected,
             jobs,
         }
@@ -404,9 +452,24 @@ mod tests {
         // a job joined as a failure: no line has to say so
         let joined = RunEnd {
             exit_code: 1,
-            failed: true,
+            failed: Some(Cause::Job),
             ..good
         };
+        // a timeout or a signal is an error, as local-ci tells it
+        for exit_code in [crate::error::exit::TIMED_OUT, 137] {
+            let other = RunEnd {
+                exit_code,
+                failed: Some(Cause::Other),
+                ..good
+            };
+            assert_eq!(computed(&other), Computed::Error);
+            // also when fail-fast or a late cancel asked something to stop
+            let asked = RunEnd {
+                cancel_requested: true,
+                ..other
+            };
+            assert_eq!(computed(&asked), Computed::Error);
+        }
         assert_eq!(computed(&joined), Computed::Failure);
         // fail-fast stopped the other shards: the run failed, it was not cancelled
         let stopped = RunEnd {
@@ -421,16 +484,25 @@ mod tests {
             ..good
         };
         assert_eq!(computed(&lost), Computed::Error);
-        // the run ended of the cancel
-        let cancelled = RunEnd {
+        // the run ended of the cancel, however the stopped command ended
+        for exit_code in [cancel, 143] {
+            let cancelled = RunEnd {
+                exit_code,
+                failed: Some(Cause::Cancel),
+                ..stopped
+            };
+            assert_eq!(computed(&cancelled), Computed::Cancelled);
+            // nobody asked for a cancel: no final state is made of it
+            let unasked = RunEnd {
+                cancel_requested: false,
+                ..cancelled
+            };
+            assert_eq!(computed(&unasked), Computed::Error);
+        }
+        // a command that ended with the code of a cancel by itself did fail
+        let own = RunEnd {
             exit_code: cancel,
             ..stopped
-        };
-        assert_eq!(computed(&cancelled), Computed::Cancelled);
-        // a command that ended with that code by itself did fail
-        let own = RunEnd {
-            cancel_requested: false,
-            ..cancelled
         };
         assert_eq!(computed(&own), Computed::Failure);
         // a cancel that stopped nothing: still no success
@@ -440,6 +512,45 @@ mod tests {
             ..end(&["a", "b"], &all)
         };
         assert_eq!(computed(&late), Computed::Cancelled);
+    }
+
+    #[test]
+    fn what_a_run_failed_of_is_a_job_a_cancel_or_something_else() {
+        let cancel = crate::error::exit::CANCELLED;
+        let fault = |exit_code, own_exit, exited, cancelled| Fault {
+            exit_code,
+            own_exit,
+            exited,
+            cancelled,
+        };
+        // a command that ended with a code, also the code of a cancel
+        assert_eq!(cause(&fault(2, Some(2), true, false)), Cause::Job);
+        assert_eq!(cause(&fault(cancel, Some(cancel), true, false)), Cause::Job);
+        // a job joined as a failure: over an attempt that succeeded, over a
+        // shard that was only stopped, over one that was never placed
+        assert_eq!(cause(&fault(1, None, false, false)), Cause::Job);
+        assert_eq!(cause(&fault(1, Some(cancel), false, true)), Cause::Job);
+        assert_eq!(cause(&fault(1, None, false, true)), Cause::Job);
+        // a timeout, a signal, an attempt that was lost
+        let timed_out = crate::error::exit::TIMED_OUT;
+        assert_eq!(
+            cause(&fault(timed_out, Some(timed_out), false, false)),
+            Cause::Other
+        );
+        assert_eq!(cause(&fault(137, Some(137), false, false)), Cause::Other);
+        assert_eq!(cause(&fault(1, Some(1), false, false)), Cause::Other);
+        // a cancel: never placed, stopped, stopped by a signal or with a
+        // code, and a run cancelled over a shard that had failed
+        assert_eq!(cause(&fault(cancel, None, false, true)), Cause::Cancel);
+        assert_eq!(
+            cause(&fault(cancel, Some(cancel), false, true)),
+            Cause::Cancel
+        );
+        assert_eq!(cause(&fault(143, Some(143), false, true)), Cause::Cancel);
+        assert_eq!(cause(&fault(143, Some(143), true, true)), Cause::Cancel);
+        assert_eq!(cause(&fault(cancel, Some(1), true, true)), Cause::Cancel);
+        // the code of a cancel over a task that was not: nothing known
+        assert_eq!(cause(&fault(cancel, None, false, false)), Cause::Other);
     }
 
     #[test]

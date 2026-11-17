@@ -3118,6 +3118,9 @@ async fn a_ci_task_without_a_usable_result_is_no_success_and_the_next_job_sees_a
         let target = remote_task_runner::service::completion::Target::Run(run.clone());
         let exit = c.store().completion(target).unwrap().exit_code();
         assert!(exit.is_some_and(|code| code != 0), "{exit:?}");
+        // No job failed: a result that is lost is an error of the run.
+        let status = ci_computed(&fx, &c, &files, &run);
+        assert_eq!(status, Computed::Error, "{unreadable}");
         let lines = remote_task_runner::service::ci_run::job_lines(
             c.store(),
             fx.dir.path(),

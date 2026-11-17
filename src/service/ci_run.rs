@@ -345,7 +345,21 @@ pub struct Ended {
     cancel_requested: bool,
     collection_pending: Option<bool>,
     exit_code: i32,
-    failed: bool,
+    failed: Option<crate::ci::status::Cause>,
+}
+
+/// The failure of a run in the plain values the status decides from.
+fn fault(failure: &super::completion::Failure) -> crate::ci::status::Fault {
+    use crate::state::{Exit, Outcome};
+    let end = failure.termination;
+    crate::ci::status::Fault {
+        exit_code: failure.exit_code,
+        own_exit: end
+            .and_then(super::completion::compute_failure)
+            .map(|(_, exit)| exit),
+        exited: matches!(end.and_then(|t| t.exit()), Some(Exit::Code(code)) if code != 0),
+        cancelled: end.is_none_or(|t| t.outcome() == Outcome::Cancelled),
+    }
 }
 
 impl Ended {
@@ -357,7 +371,9 @@ impl Ended {
                 || snapshot.is_some_and(|s| s.cancel_requested),
             collection_pending: report.collection_pending,
             exit_code: report.cli_exit_code,
-            failed: snapshot.is_some_and(|s| s.first_compute_failure.is_some()),
+            failed: snapshot
+                .and_then(|s| s.first_compute_failure.as_ref())
+                .map(|failure| crate::ci::status::cause(&fault(failure))),
         }
     }
 
