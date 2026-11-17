@@ -61,6 +61,8 @@ const RESULT_FILE: &str = "result.json";
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTaskSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_scope: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dispatch: Option<serde_json::Value>,
     /// The bytes of the frozen plan. Used only when they hash to
     /// `plan_digest`.
@@ -240,6 +242,7 @@ pub(crate) type Core<'a> = &'a (dyn Fn(
          + Sync);
 
 struct StepJob {
+    sdk_key: Option<String>,
     argv: Vec<String>,
     cwd: PathBuf,
     env: Vec<(String, String)>,
@@ -257,6 +260,7 @@ impl StepExecutor for Queue {
     fn run(&self, req: &StepRequest) -> anyhow::Result<StepExit> {
         let (reply, answer) = sync_channel(1);
         let job = StepJob {
+            sdk_key: req.key.clone(),
             argv: req.argv.clone(),
             cwd: req.cwd.clone(),
             env: req.env.clone(),
@@ -365,6 +369,7 @@ fn stopped_between(reason: StopReason) -> NodeEnd {
 fn serve(
     ctl: &mut Control<'_>,
     steps: Receiver<StepJob>,
+    ci: &CiTaskSpec,
     cancel: &CancelHandle,
 ) -> (Option<NodeEnd>, String, Option<SupervisorError>) {
     let mut over: Option<NodeEnd> = None;
@@ -419,7 +424,15 @@ fn serve(
                 .append(true)
                 .open(&job.log)
                 .ok();
-            let end = ctl.run_node(index, &node);
+            let timing = ci
+                .history_scope
+                .as_ref()
+                .zip(job.sdk_key.as_deref())
+                .and_then(|(scope, key)| {
+                    let cwd = job.cwd.strip_prefix(&ci.workspace).ok()?.to_str()?;
+                    Some(crate::ci::timing::step(scope, key, cwd))
+                });
+            let end = ctl.run_node_with_ci_history(index, &node, timing.as_ref());
             ctl.tee = None;
             end
         });
@@ -460,7 +473,7 @@ pub(super) fn drive(ctl: &mut Control<'_>, ci: &CiTaskSpec, core: Core<'_>) -> R
         // panics) the queue closes and the loop below ends.
         let handle = cancel.clone();
         let running = s.spawn(move || core(&state_dir, ci, executor, handle));
-        let served = serve(ctl, steps, &cancel);
+        let served = serve(ctl, steps, ci, &cancel);
         (served, running.join())
     });
     let (over, last_node, fatal) = served;
@@ -655,6 +668,7 @@ mod tests {
     #[test]
     fn the_spec_shows_no_value_of_its_environment_and_needs_absolute_paths() {
         let mut ci = CiTaskSpec {
+            history_scope: None,
             dispatch: None,
             plan_path: "/a/plan.json".into(),
             plan_digest: Digest::of_bytes(b"plan"),

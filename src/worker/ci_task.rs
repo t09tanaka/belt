@@ -510,6 +510,7 @@ pub fn prepare(
     let ci_source_id = ci_id_of(&payload.source_id)
         .ok_or_else(|| invalid("the source of the attempt has no captured id"))?;
     Ok(CiTaskSpec {
+        history_scope: Some(crate::ci::timing::task_scope(&plan, &task.task_id)),
         dispatch: task.dispatch.clone(),
         plan_path,
         plan_digest: task.plan_digest.clone(),

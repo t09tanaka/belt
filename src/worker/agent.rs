@@ -2722,10 +2722,11 @@ impl Agent {
             agent_epoch: self.epoch,
             forecast_ttl_ms: self.cfg.forecast_ttl_ms,
         };
-        crate::forecast::answer(
+        crate::forecast::answer_for_profile(
             &self.cfg.traffic_state_dir,
             self.cfg.traffic_config.as_deref(),
             &self.cfg.state_dir,
+            Some(&self.cfg.profile_fingerprint),
             &ident,
             &attempts,
             max_epoch,

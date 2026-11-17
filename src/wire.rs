@@ -440,6 +440,9 @@ pub struct Correlation {
 /// number is `None` when unknown; an absent value is never read as zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadNode {
+    /// Opaque SDK step identity for this source, matrix task and working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_history_key: Option<crate::ids::Digest>,
     pub node_id: NodeId,
     #[serde(default)]
     pub depends_on: Vec<NodeId>,
@@ -1878,6 +1881,7 @@ mod tests {
             plan_digest: dg("plan"),
             expansion_seq: 1,
             nodes: vec![WorkloadNode {
+                ci_history_key: None,
                 node_id: node("test"),
                 depends_on: vec![node("setup")],
                 priority: 0,

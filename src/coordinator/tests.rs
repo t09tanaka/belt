@@ -263,6 +263,7 @@ fn setup_survives_queue_serialization_and_payload_construction() {
 fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
     TaskSpec {
         ci: Some(CiSpec {
+            history_keys: Vec::new(),
             dynamic_origin: false,
             core_outcome: None,
             matrix: None,

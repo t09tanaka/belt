@@ -151,6 +151,10 @@ pub fn task_specs(
                 .map_err(|e| invalid(format!("task `{}`: {e:#}", task.id)))?;
             let spec = TaskSpec {
                 ci: Some(CiSpec {
+                    history_keys: crate::ci::timing::keys(
+                        &demand,
+                        &crate::ci::timing::task_scope(plan, &task.id),
+                    ),
                     dynamic_origin: task.dynamic_matrix,
                     core_outcome: None,
                     matrix: matrix_admission(plan, task)?,

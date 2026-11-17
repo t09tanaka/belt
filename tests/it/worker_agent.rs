@@ -3343,6 +3343,7 @@ async fn the_agent_answers_a_forecast_and_writes_nothing() {
                 plan_digest: Digest::of_bytes(b"plan"),
                 expansion_seq: 0,
                 nodes: vec![WorkloadNode {
+                    ci_history_key: None,
                     node_id: n.clone(),
                     depends_on: vec![],
                     priority: 0,

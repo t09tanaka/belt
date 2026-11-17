@@ -144,6 +144,9 @@ pub struct MatrixAdmission {
 /// A task of a frozen CI plan, as it is queued.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiSpec {
+    /// Planned SDK step identities, in demand order. Old tasks have no samples.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_keys: Vec<Option<crate::ids::Digest>>,
     /// A dynamic origin waits on derived variants and never executes itself.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dynamic_origin: bool,

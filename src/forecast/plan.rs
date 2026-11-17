@@ -644,6 +644,7 @@ mod tests {
 
     fn node(attempt: &AttemptId, id: &str) -> WorkloadNode {
         WorkloadNode {
+            ci_history_key: None,
             node_id: NodeId::parse(id).unwrap(),
             depends_on: vec![],
             priority: 0,
