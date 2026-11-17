@@ -2878,9 +2878,10 @@ impl<'a> Runner<'a> {
         shard: Option<&dag::TaskShard>,
     ) -> Option<Vec<OsLeg>> {
         job.runs_on.as_ref()?;
-        // every entry with its contexts and name, whatever its `if:` says
+        // every entry with its contexts and name, whatever its `if:` and the
+        // jobs it needs say (no `if:` would mean `success()`)
         let mut all = job.clone();
-        all.cond = None;
+        all.cond = Some("always()".into());
         let entries = crate::job_evaluate::evaluate_job(
             &all,
             gh.clone(),

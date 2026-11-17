@@ -744,8 +744,9 @@ first tasks ready; later inputs advance the run by themselves.
 
 **Events.** `pending_actions()` is the outbox: `Ready`, `DerivedReady`,
 `Cancel` and `Finished`, each with a stable `id`. A ready action leaves the
-outbox when its task is claimed; a `Cancel` when the host sends
-`Input::Ack { action }` or the task ends. An action that is still there after a
+outbox when its task is claimed (acknowledging it changes nothing); a `Cancel`
+when the host sends `Input::Ack { action }` or the task ends; `Finished` when
+it is acknowledged. An action that is still there after a
 restart has to be delivered again, so delivery must be idempotent on `id`.
 The members of a matrix that is an expression over `needs` appear as
 `DerivedReady` once the job that names them has settled: the driver derives
