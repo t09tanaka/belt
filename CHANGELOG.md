@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Post the `local-ci` commit status only when origin is on github.com, or on the host named by `GH_HOST`. Before, `owner/name` was taken from any origin URL, so a GitLab, GitHub Enterprise or local-path origin could post to an unrelated repository on github.com. Any other origin is skipped with the reason, not a failure of the run.
+- A failed status post says "not on GitHub yet" only for GitHub's "No commit found" reply. Any other HTTP 422 is reported as a `gh api` error with its first line.
+
 ## [0.18.1] - 2026-11-17
 
 - Fix the driver refusing to release a claim for want of state capacity. `Input::Fence` and `Input::AbortBeforeExecution` were refused with `DriverStorageError` when the jobs they made ready (each with a copy of the outputs it needs) did not fit the driver's bounded state, so the claim kept its permit and the host could not end it. Such a release now commits like a settlement that does not fit: the claim is released with its host failure, `infrastructure_failure()` is `DriverCapacity`, the tasks nobody claimed are `InfrastructureBlocked` and nothing more is made ready. A release that fits is decided exactly as before, so the records of a 0.18.0 journal replay unchanged and `DRIVER_VERSION` stays 8; a journal that holds such a release cannot be replayed by 0.18.0, which refuses that record.

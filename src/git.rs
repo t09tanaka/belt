@@ -235,6 +235,51 @@ pub fn repo_slug(ctx: &ExecContext, dir: &Path) -> Option<String> {
     }
 }
 
+/// The host and `owner/name` of a remote URL (`https://`, `ssh://`, scp-style
+/// `user@host:owner/name`). `None` for a local path, a `file://` URL, or
+/// anything with no host or fewer than two path segments. The host is
+/// lowercased and has no user or port.
+pub fn remote_host_and_slug(url: &str) -> Option<(String, String)> {
+    let url = url.trim();
+    let (authority, path) = if let Some((scheme, rest)) = url.split_once("://") {
+        if scheme.eq_ignore_ascii_case("file") {
+            return None;
+        }
+        rest.split_once('/')?
+    } else {
+        // scp-style has a `:` before any `/`; a lone letter is a drive (`C:`).
+        let (host, path) = url.split_once(':')?;
+        if host.contains('/') || host.contains('\\') || host.len() <= 1 {
+            return None;
+        }
+        (host, path)
+    };
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(v6),
+        None => host.split(':').next().unwrap_or(host),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    let path = path.trim_end_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let parts: Vec<&str> = path.rsplit('/').take(2).collect();
+    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        Some((
+            host.to_ascii_lowercase(),
+            format!("{}/{}", parts[1], parts[0]),
+        ))
+    } else {
+        None
+    }
+}
+
+/// The origin remote's URL, as configured.
+pub fn origin_url(ctx: &ExecContext, dir: &Path) -> Option<String> {
+    git_ok(ctx, dir, &["remote", "get-url", "origin"])
+}
+
 pub fn add_worktree(ctx: &ExecContext, repo: &Path, path: &Path, sha: &str) -> Result<()> {
     add_worktree_with(ctx, repo, path, sha, true)
 }
@@ -828,6 +873,49 @@ fn spawn_quiet(mut cmd: Command) -> std::io::Result<std::process::Child> {
 #[cfg(test)]
 #[allow(clippy::disallowed_methods)] // tests build their own commands
 mod tests {
+    #[test]
+    fn remote_host_and_slug_forms() {
+        let ok = |u: &str| remote_host_and_slug(u);
+        let want = |h: &str, s: &str| Some((h.to_string(), s.to_string()));
+        assert_eq!(ok("https://github.com/o/n.git"), want("github.com", "o/n"));
+        assert_eq!(ok("https://github.com/o/n/"), want("github.com", "o/n"));
+        assert_eq!(
+            ok("https://user:tok@GitHub.com:443/o/n"),
+            want("github.com", "o/n")
+        );
+        assert_eq!(ok("git@github.com:o/n.git"), want("github.com", "o/n"));
+        assert_eq!(ok("github.com:o/n"), want("github.com", "o/n"));
+        assert_eq!(
+            ok("ssh://git@ghe.example.com:2222/o/n.git"),
+            want("ghe.example.com", "o/n")
+        );
+        assert_eq!(
+            ok("git@gitlab.com:grp/sub/n.git"),
+            want("gitlab.com", "sub/n")
+        );
+        assert_eq!(ok("ssh://git@[::1]:22/o/n"), want("::1", "o/n"));
+    }
+
+    #[test]
+    fn remote_host_and_slug_rejects_without_host() {
+        for u in [
+            "/srv/git/o/n.git",
+            "../o/n",
+            "./n",
+            "~/o/n",
+            "file:///srv/o/n.git",
+            "C:/o/n",
+            "C:\\o\\n",
+            "https://github.com/n",
+            "https://github.com",
+            "git@github.com:n",
+            "",
+            "n",
+        ] {
+            assert_eq!(remote_host_and_slug(u), None, "{u}");
+        }
+    }
+
     use super::*;
 
     fn ctx() -> ExecContext {
