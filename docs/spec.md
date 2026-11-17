@@ -840,6 +840,15 @@ matrixのoutputは既定で元のmatrix順に集約し、完了到着順によ�
 
 汎用の成果物宣言に加え、初回版は `actions/upload-artifact@v4` と `actions/download-artifact@v4` の同一run内の同じworkflow内の基本動作を実装する。name、path、複数file、missing-file policy、download先を対応表に明記する。cross-run、GitHub側artifact IDやAPI連携等の未対応optionは事前errorにする。現行のような単純skipを完全対応として表示しない。
 
+| action / option | 分散 `ci` での動作 |
+| --- | --- |
+| upload の `name`・`path` | 名前の既定値は `artifact`。workspace 内の相対パス、ディレクトリ、複数行のパターンで複数ファイルを選択できる。 |
+| upload の `if-no-files-found` | `error` は step 失敗。`warn`（既定）と `ignore` は成果物を公開せずに step を終える。 |
+| upload の `overwrite` | 既定では同一 workflow の既存名を拒否する。`true` は新しい版を割り当てる。親は各ファイルのサイズと SHA-256 を検証・永続化してから応答する。 |
+| download の `name`・`pattern`・`path` | 同一 run・workflow 内で公開された版を選び、指定先（既定は workspace）へ展開する。複数名は各名前の下へ展開し、`merge-multiple: true` では同じ先へ展開する。衝突する展開先は拒否する。 |
+| 転送・保持 | 1 回の upload は最大 4,096 ファイル、合計 1 GiB。接続が切れた場合、親は永続化済みのオフセットから取得を再開する。 |
+| 対象外の指定 | 外部 run・repository、GitHub の artifact ID・認証 token・API に依存する指定は、run を受理する前にエラーとする。 |
+
 中間artifactはupload step時点でimmutableに固定し、親で検証・永続保存したreceiptを公開してからstepを完了する。download側はこのreceiptを待つ。最終run回収とは別の処理とし、後段がUnit terminalまでartifactを待つdeadlockを作らない。同名artifactのconflictもworkflow単位で判定し、別workflowが同名のartifactをuploadしてもconflictにならない（local-ci 0.8.0以降の実装と同じ）。別workflowのartifactはdownloadできない。同名artifactは同じworkflow内では既定でconflict、明示overwriteは新しいartifact versionとして記録する。matrixにはvariantを含む名前または明示reducerを必要とする。
 
 `outputs` は明示directoryへ展開する。元worktreeへ戻す操作を用意する場合は、実行時sourceと現在内容の差分を確認し、競合を拒否する。入力、ログ、結果の既定保持はterminal後7日とし、実行中・回収待ち・参照中cacheはGCしない。削除前に未回収必須artifactを検査する。親が回収した結果（result・log・artifact）は、回収が閉じた（`collected`、または回収の打ち切り・必須artifactの欠落を確定した）attemptについて消す。保持期間は、terminalと回収を閉じた時点の遅い方から数える（workerが長く不在で、terminalから保持期間を過ぎて回収された結果を、回収の直後に消さない）。回収の判定の記録は消さない。

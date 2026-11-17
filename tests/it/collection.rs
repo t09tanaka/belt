@@ -5293,12 +5293,32 @@ jobs:
         .unwrap()
         .is_empty());
     assert_eq!(up.offsets("workflow_read"), [0]);
+    let catalog = ArtifactAction {
+        key: Digest::of_bytes(b"catalog"),
+        intent: ArtifactIntent::Catalog {
+            name: Some("package".into()),
+            pattern: None,
+        },
+    };
+    down.set(|s| {
+        s.pending_artifacts
+            .insert(consumer.clone(), catalog.clone());
+    });
     drop(c);
     drop(files);
     (c, _) = fx.open();
     c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
         .unwrap();
     c.tick().await.unwrap();
+    assert!(
+        !down
+            .state
+            .lock()
+            .unwrap()
+            .artifact_answers
+            .contains_key(&catalog.key),
+        "the upload's last chunk has arrived but the parent has not published the receipt"
+    );
     c.tick().await.unwrap();
     assert_eq!(up.offsets("workflow_read"), [0, 128 * 1024]);
     assert_eq!(
@@ -5312,17 +5332,6 @@ jobs:
     );
     up.set(|s| {
         s.pending_artifacts.remove(&producer);
-    });
-    let catalog = ArtifactAction {
-        key: Digest::of_bytes(b"catalog"),
-        intent: ArtifactIntent::Catalog {
-            name: Some("package".into()),
-            pattern: None,
-        },
-    };
-    down.set(|s| {
-        s.pending_artifacts
-            .insert(consumer.clone(), catalog.clone());
     });
     c.tick().await.unwrap();
     assert!(
@@ -5348,4 +5357,29 @@ jobs:
             data: Bytes(vec![b'c'; 17])
         }
     );
+}
+
+#[test]
+fn a38_refuses_cross_run_artifact_options_before_any_job_can_be_placed() {
+    let plan = ci_plan(
+        r#"on: push
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: '123'
+"#,
+    );
+    let err = remote_task_runner::service::ci_run::task_specs(
+        &plan,
+        &Digest::of_bytes(b"plan"),
+        &Digest::of_bytes(b"manifest"),
+        &Default::default(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    assert!(err.message.contains("run-id"), "{}", err.message);
 }
