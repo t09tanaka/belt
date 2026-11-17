@@ -196,7 +196,8 @@ It needs a terminal (use `status` to pipe), and only reads and reaps like
 - **queue**: one row per entry, numbered `#1`, `#2`, ... down the screen:
   the running ones first, soonest to finish first (those with no learned
   time last), then the waiting ones in queue order. Columns:
-  - a `▌` in the worktree's color, and the number;
+  - a `▌` in the worktree's color on a running row (a waiting row leaves
+    it blank), and the number;
   - `project` (repo name, plus `/subdir`);
   - `worktree`: the branch (the short commit hash when detached), in the
     worktree's color, cut in the middle with `…` when it is long (never under 4 characters),

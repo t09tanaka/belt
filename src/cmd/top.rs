@@ -834,6 +834,8 @@ const FRONT: Flag = ("[front]", "f");
 /// A row, ready to lay out.
 #[derive(Debug, Clone, PartialEq)]
 struct TableRow {
+    /// Running, not waiting: only these rows get the band.
+    running: bool,
     num: usize,
     project: String,
     job: String,
@@ -849,6 +851,7 @@ struct TableRow {
 
 fn table_rows(v: &View) -> Vec<TableRow> {
     let run = v.running.iter().map(|r| TableRow {
+        running: true,
         num: r.num,
         project: r.project.clone(),
         job: r.job.clone(),
@@ -863,6 +866,7 @@ fn table_rows(v: &View) -> Vec<TableRow> {
         over: matches!(r.progress, Progress::Known { over: true, .. }),
     });
     let wait = v.waiting.iter().map(|w| TableRow {
+        running: false,
         num: w.num,
         project: w.project.clone(),
         job: w.job.clone(),
@@ -1109,13 +1113,18 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
         let tint = row_tint(v, r.wt);
         let text = tinted(v, tint, base);
         let mut spans = vec![
-            Span::styled(
-                "▌",
-                match tint {
-                    None if v.mode == ColorMode::Focus => MUTED_STYLE,
-                    _ => Style::new().fg(band_color(v, r.wt)),
-                },
-            ),
+            // Only a running row has the band; a waiting one keeps the column blank.
+            if r.running {
+                Span::styled(
+                    "▌",
+                    match tint {
+                        None if v.mode == ColorMode::Focus => MUTED_STYLE,
+                        _ => Style::new().fg(band_color(v, r.wt)),
+                    },
+                )
+            } else {
+                Span::raw(" ")
+            },
             Span::styled(format!("{:>num_w$} ", format!("#{}", r.num)), text),
         ];
         spans.push(Span::styled(col(&r.project, cols.project), text));
@@ -2242,7 +2251,9 @@ mod tests {
         // Rows are numbered #1 to #5, top to bottom.
         let order: Vec<String> = out
             .lines()
-            .filter(|l| l.contains('▌'))
+            .skip_while(|l| !l.contains("progress"))
+            .skip(1)
+            .filter(|l| l.contains('#'))
             .map(|l| {
                 let at = l.find('#').unwrap();
                 l[at..].chars().take(2).collect()
@@ -2293,7 +2304,8 @@ mod tests {
         assert_eq!(band.fg, Color::Gray);
         // The row of the worktree top runs in is bold, the others are not.
         let (band, num) = at("cargo clippy");
-        assert_eq!(band.fg, v.worktrees[2].color);
+        // It is waiting, so its band is blank.
+        assert_eq!(band.symbol(), " ");
         assert!(num.modifier.contains(Modifier::BOLD));
         // The worktree name has the worktree's color.
         let y = row_y(&buf, 120, 16, "cargo clippy");
@@ -2306,6 +2318,25 @@ mod tests {
         assert_eq!(buf[(1, by)].symbol(), "#");
         assert_eq!(buf[(2, by)].symbol(), "1");
         assert_eq!(buf[(1, by)].bg, v.worktrees[0].color);
+    }
+
+    #[test]
+    fn only_a_running_row_has_the_band_in_both_color_modes() {
+        for mode in [ColorMode::Overview, ColorMode::Focus] {
+            let mut v = sample_view(Utc::now());
+            v.mode = mode;
+            let rows = table_rows(&v);
+            assert!(rows.iter().any(|r| r.running) && rows.iter().any(|r| !r.running));
+            let t = render(&v, 120, 16);
+            let buf = t.backend().buffer().clone();
+            for r in &rows {
+                let y = row_y(&buf, 120, 16, &format!("#{} ", r.num));
+                // Column 1 is the band; the number follows it either way.
+                let want = if r.running { "▌" } else { " " };
+                assert_eq!(buf[(1, y)].symbol(), want, "{mode:?} #{}", r.num);
+                assert_eq!(buf[(2, y)].symbol(), "#", "{mode:?} #{}", r.num);
+            }
+        }
     }
 
     /// The foreground of every non-blank cell of the row with `needle`,
