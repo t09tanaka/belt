@@ -172,7 +172,11 @@ struct Journal {
 
 /// How long an action waits for the host's switch lock before it says a
 /// switch is running. Long enough to outlast a concurrent `status`.
-const LOCK_PATIENCE: Duration = Duration::from_millis(if cfg!(test) { 60 } else { 2000 });
+const LOCK_PATIENCE: Duration = Duration::from_millis(if cfg!(test) { 250 } else { 2000 });
+/// How long `status` waits before it reports a running switch. Not zero: a
+/// lock outlives its holder for a moment in any child that was forked while
+/// the descriptor was open and has not reached its `exec` yet.
+const STATUS_PATIENCE: Duration = Duration::from_millis(250);
 
 /// The host's switch lock, held for as long as this value lives.
 pub(crate) struct SwitchLock(#[allow(dead_code)] File);
@@ -867,7 +871,7 @@ pub fn status<L: Launcher>(
     let paths = Paths::resolve(env)?;
     // The journal is replaced by rename, so it reads whole even mid-switch.
     let journal = require_journal(&paths)?;
-    let lock = switch_lock(&paths, false, Duration::ZERO)?;
+    let lock = switch_lock(&paths, false, STATUS_PATIENCE)?;
     let plan = plan(&paths, &journal)?;
     let mut status = match journal.receipt.clone() {
         None => upgrade::unsettled_status(&paths, &journal)?,
