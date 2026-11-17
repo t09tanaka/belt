@@ -112,6 +112,10 @@ fn invalid_inputs_are_refused() {
     for mode in [
         Mode::User { uid: 0 },
         Mode::SystemUser {
+            uid: 501,
+            username: "000".into(),
+        },
+        Mode::SystemUser {
             uid: 0,
             username: "worker".into(),
         },
