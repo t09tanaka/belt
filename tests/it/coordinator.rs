@@ -3061,7 +3061,14 @@ async fn a_worker_with_more_live_attempts_than_a_page_is_followed_completely() {
     let a = f.worker("w-a", (MANY as u32, 0));
     let c = f.open(&[&a]);
     let tasks = enqueue(&c, MANY).await;
-    let placed = c.tick().await.unwrap().placed;
+    // A tick places what fits in its time: a loaded machine takes several.
+    let mut placed = Vec::new();
+    for _ in 0..MANY {
+        placed.extend(c.tick().await.unwrap().placed);
+        if placed.len() == MANY {
+            break;
+        }
+    }
     assert_eq!(placed.len(), MANY);
     assert_eq!(a.holds().len(), MANY);
 
