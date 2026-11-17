@@ -788,6 +788,9 @@ mod tests {
             MeasuredCosts::open(dir.path(), crate::results::CollectConfig::default()).unwrap();
         model.drain();
         let mut db = Connection::open(dir.path().join("costs-v1.sqlite")).unwrap();
+        // The cap needs thousands of one-row commits; durability is not under
+        // test here, so this test's own connection skips the per-commit fsync.
+        db.execute_batch("PRAGMA synchronous=OFF").unwrap();
         let (worker, query) = query();
         let first = sample(&worker, &query, Phase::Transfer, "one");
         assert!(record(&mut db, &first).unwrap());
