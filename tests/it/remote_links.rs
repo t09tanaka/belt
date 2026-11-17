@@ -431,3 +431,147 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
     a.stop().await;
     b.stop().await;
 }
+
+/// A38 from the public CLI through a resident, its real local worker, a
+/// separately started worker over the stdio bridge, and real supervisors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a38_public_ci_delivers_needs_outputs_and_a_verified_multifile_artifact_to_another_worker()
+{
+    use remote_task_runner::worker::control::{self, Control};
+    let (root, spec, input) = super::bootstrap::control_fixture();
+    let cluster = CoordinatorStore::open(&spec.state_dir, wall_ms())
+        .unwrap()
+        .cluster_id()
+        .clone();
+    let home = root.path().join("peer");
+    let remote = spawn_worker(&home, &cluster, &spec.cluster_key_path, "peer");
+    let remote_state = home.join(".remote-task-runner");
+    wait_for("private peer socket", || {
+        remote_state.join("agent.sock").exists()
+    })
+    .await;
+    control::write(&remote_state, Control::draining()).unwrap();
+    let config = root.path().join(".config/remote-task-runner/config.toml");
+    let text="schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\n[[workers]]\nid='peer'\nssh='peer'\n";
+    write_private(&config, text.as_bytes());
+    let quote = remote_task_runner::protocol::ssh::quote;
+    let ssh=format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n[ \"$#\" -eq 3 ] && [ \"$2\" = peer ] && [ \"$3\" = \"'remote-task-runner' 'worker' '--stdio'\" ] || exit 91\nHOME={} exec {} worker --stdio\n",quote(home.to_str().unwrap()),quote(BIN));
+    super::common::write_executable(&root.path().join("tool-stubs/ssh"), &ssh);
+    let marks = super::bootstrap::ci_project(
+        root.path(),
+        &input,
+        r#"  build:
+    runs-on: ubuntu-latest
+    outputs:
+      id: ${{ steps.make.outputs.id }}
+    steps:
+      - id: make
+        run: |
+          mkdir -p out/sub
+          echo abc > out/first
+          echo def > out/sub/second
+          echo id=release-417 >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: out/
+          if-no-files-found: error
+      - run: |
+          echo sent >> MARKS/build
+          i=0
+          while [ ! -f MARKS/resume ] && [ "$i" -lt 900 ]; do sleep 0.1; i=$((i+1)); done
+          test -f MARKS/resume
+  verify:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+          path: release
+      - run: |
+          test "${{ needs.build.outputs.id }}" = release-417
+          test "$(cat release/first)" = abc
+          test "$(cat release/sub/second)" = def
+          echo verified >> MARKS/verify
+"#,
+    );
+    let child = super::bootstrap::ci_command(&spec, &input)
+        .kill_on_drop(true)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait_for("producer passing the acknowledged upload step", || {
+        marks.join("build").exists()
+    })
+    .await;
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let run = store
+        .query_runs(8, None)
+        .unwrap()
+        .items
+        .into_iter()
+        .next()
+        .unwrap()
+        .run_id;
+    let rows = store.ci_run_tasks(&run).unwrap();
+    let workflow = rows[0].spec["ci"]["task"]["artifact_workflow"]
+        .as_str()
+        .unwrap();
+    let receipts = store.workflow_artifacts(&run, workflow).unwrap();
+    assert_eq!(receipts.len(), 1);
+    let published = &receipts[0];
+    assert_eq!(published.receipt.name, "package");
+    assert_eq!(published.receipt.files.len(), 2);
+    let latest = store.get_attempt(&published.producer).unwrap().unwrap();
+    assert_eq!(latest.worker_id, spec.worker_id);
+    assert!(latest.termination.is_none());
+    control::write(&spec.worker_state_dir, Control::draining()).unwrap();
+    control::write(&remote_state, Control::default()).unwrap();
+    std::fs::write(marks.join("resume"), "ok").unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(120), child.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["result"]["state"], "settled");
+    assert_eq!(
+        std::fs::read_to_string(marks.join("build")).unwrap(),
+        "sent\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(marks.join("verify")).unwrap(),
+        "verified\n"
+    );
+    let rows = store.ci_run_tasks(&run).unwrap();
+    assert_eq!(rows.len(), 2);
+    let mut workers = std::collections::BTreeSet::new();
+    for row in rows {
+        let attempts = store.attempts_of_task(&row.task_id).unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(
+            attempts[0].termination.unwrap().outcome(),
+            Outcome::Succeeded
+        );
+        workers.insert(attempts[0].worker_id.to_string());
+    }
+    assert_eq!(
+        workers,
+        [spec.worker_id.to_string(), "peer".into()]
+            .into_iter()
+            .collect()
+    );
+    let client = Client::load(&spec.state_dir, cluster).unwrap();
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    remote.stop().await;
+}
