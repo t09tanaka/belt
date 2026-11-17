@@ -1974,9 +1974,9 @@ dependencies = [
 
 [[package]]
 name = "task-traffic-controller"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "597ea1cc0946f6c01579d7797da38c2841891bdc7448b449eff3562461eaf878"
+checksum = "4ef58705cf8bdaddeb410a27a367e5426fb446b5420396524cd33f8a54d0bca2"
 dependencies = [
  "chrono",
  "clap",
