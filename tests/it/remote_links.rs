@@ -156,9 +156,8 @@ async fn submit(
         let release = remote_task_runner::protocol::ssh::quote(
             &root.join("release-local").display().to_string(),
         );
-        format!(
-            "i=0; while [ ! -e {release} ] && [ \"$i\" -lt 600 ]; do i=$((i+1)); sleep 0.05; done"
-        )
+        let fixture = remote_task_runner::protocol::ssh::quote(&root.display().to_string());
+        format!("while [ -d {fixture} ] && [ ! -e {release} ]; do sleep 0.05; done")
     } else {
         format!("sleep {delay}")
     };
@@ -530,10 +529,20 @@ HOME="$home" exec {} worker --stdio
         u32::MAX,
     )
     .await;
-    wait_for("ephemeral execution", || {
-        root.join("count-ephemeral").exists()
+    if tokio::time::timeout(T, async {
+        while !root.join("count-ephemeral").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     })
-    .await;
+    .await
+    .is_err()
+    {
+        let attempts = store.attempts_of_task(&task).unwrap();
+        panic!("ephemeral command did not start; placements and states: {:?}; bridge dials: {:?}; parent log: {}",
+            attempts.iter().map(|a| (&a.worker_id, a.state, a.observation, &a.termination)).collect::<Vec<_>>(),
+            std::fs::read_to_string(home.join("bridge-dials")).ok(),
+            std::fs::read_to_string(state.join("fixture-parent.stderr")).unwrap_or_default());
+    }
     let placed = attempt(&state, &task).unwrap();
     assert_eq!(placed.worker_id, worker);
     std::fs::write(home.join("offline"), "").unwrap();
