@@ -1116,7 +1116,10 @@ pub fn describe_forget(result: &ForgetResult) -> String {
             result.id
         ),
         1 => format!("forgot worker {}: {identity}; 1 attempt ended", result.id),
-        n => format!("forgot worker {}: {identity}; {n} attempts ended", result.id),
+        n => format!(
+            "forgot worker {}: {identity}; {n} attempts ended",
+            result.id
+        ),
     }
 }
 
