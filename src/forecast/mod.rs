@@ -814,6 +814,54 @@ mod tests {
     }
 
     #[test]
+    fn a10_matrix_variants_forecast_the_final_step_after_preparation() {
+        let fixture = crate::ci::execute::tests::fixture(
+            r#"on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        flavor: [debug, release]
+    steps:
+      - run: echo configure
+      - run: echo compile
+      - run: echo verify
+"#,
+        );
+        let digest = Digest::of_bytes(&serde_json::to_vec(&fixture.plan).unwrap());
+        let specs = crate::service::ci_run::task_specs(
+            &fixture.plan,
+            &digest,
+            &Digest::of_bytes(b"manifest"),
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(specs.len(), 2);
+        for (task, spec) in specs {
+            assert!(fixture
+                .plan
+                .tasks
+                .iter()
+                .any(|t| t.id == task && t.variant.is_some()));
+            let attempt = AttemptId::generate();
+            let mut workload =
+                crate::coordinator::policy::workload_of_spec(&attempt, &spec, Some(4_000));
+            assert_eq!(workload.nodes.len(), 3);
+            // Execution samples in milliseconds, with an independent preparation delay.
+            for (node, time) in workload.nodes.iter_mut().zip([10_000, 20_000, 5_000]) {
+                node.predicted_runtime_ms = Some(time);
+            }
+            let (answer, _) = run(&insp(4, calm(), vec![]), &request(workload, vec![]), &[]);
+            assert_eq!(answer.target.ready_in_ms, Some(4_000));
+            assert_eq!(answer.target.execution_ms, Some(35_000));
+            assert_eq!(answer.target.finish_in_ms, Some(39_000));
+            assert_eq!(answer.coverage[0].node_ids.len(), 3);
+        }
+    }
+
+    #[test]
     fn a10_a_chain_reports_the_end_of_the_last_step() {
         let a = AttemptId::generate();
         let mut setup = node(&a, "setup", Some(10_000));
