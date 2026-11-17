@@ -1,4 +1,3 @@
-
 use super::*;
 use crate::ci::execute::tests::fixture;
 use local_ci::shard::Basis;
@@ -80,4 +79,39 @@ fn an_exact_worker_listing_is_split_with_history_and_bound_to_its_plan() {
         |_| Isolation::None
     )
     .is_err());
+}
+
+#[test]
+fn browser_shards_require_a_fixture_isolation_declaration() {
+    let f = fixture(&WORKFLOW.replace("npx jest", "npx cypress run"));
+    let step = candidates(&f.plan).pop().unwrap();
+    let listing = WorkerListing {
+        step,
+        runner_version: "13.0.0".into(),
+        discovered: Discovered {
+            tests: vec!["cypress/e2e/a.cy.js".into(), "cypress/e2e/b.cy.js".into()],
+            complete: true,
+            blocked: vec![],
+        },
+    };
+    let request = |isolation| {
+        listing
+            .partition(
+                &f.plan,
+                &History::default(),
+                2,
+                &PartitionOpts::default(),
+                isolation,
+            )
+            .unwrap()
+    };
+    assert!(request(Isolation::None)
+        .plan
+        .not_split
+        .contains(&NotSplit::NoIsolation));
+    let asked = request(Isolation::Declared {
+        evidence: "database per portool project".into(),
+    });
+    assert_eq!(asked.plan.shards.len(), 2);
+    assert!(f.plan.with_shards(&[asked]).unwrap().shard_groups[0].split);
 }

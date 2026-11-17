@@ -137,6 +137,11 @@ pub struct TaskSpec {
 /// A task of a frozen CI plan, as it is queued.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiSpec {
+    /// A rerun could repeat external effects. A captured job policy must
+    /// explicitly allow retry for a non-idempotent runner.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub shard_retry_forbidden: bool,
+
     /// What the worker is sent: the plan by its digest, the task, and the
     /// results of the jobs it needs.
     pub task: crate::wire::CiTask,

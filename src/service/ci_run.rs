@@ -110,6 +110,7 @@ pub fn task_specs(
                 .map_err(|e| invalid(format!("task `{}`: {e:#}", task.id)))?;
             let spec = TaskSpec {
                 ci: Some(CiSpec {
+                    shard_retry_forbidden: false,
                     task: CiTask {
                         plan_digest: plan_digest.clone(),
                         task_id: task.id.clone(),
@@ -186,14 +187,14 @@ pub async fn submit(
                     invalid(error.to_string())
                 }
             })?;
-        let plan = super::planning::freeze(&store, &manifest)?;
+        let (plan, policies) = super::planning::freeze_with_policies(&store, &manifest)?;
         let (plan_digest, _) = crate::ci::advance::keep_plan(context.state_dir(), &plan)
             .map_err(|e| invalid(format!("cannot keep the frozen plan: {e}")))?;
-        Ok((captured, plan, plan_digest))
+        Ok((captured, plan, plan_digest, policies))
     })
     .await
     .map_err(|e| invalid(e.to_string()))?;
-    let (captured, plan, plan_digest) = frozen?;
+    let (captured, plan, plan_digest, policies) = frozen?;
     let source_id = captured.manifest.source_id.clone();
     let manifest_digest = Digest::parse(&captured.manifest.manifest_digest)
         .or_else(|_| Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest)))
@@ -214,7 +215,7 @@ pub async fn submit(
             .repository
             .clone()
             .unwrap_or_else(|| Digest::of_bytes(root.as_os_str().as_bytes()).to_string());
-        crate::ci::discovery::stage(&plan, &mut specs, capacity, &project);
+        crate::ci::discovery::stage(&plan, &mut specs, capacity, &project, &policies);
     }
     let mut submitted = Vec::with_capacity(specs.len());
     let mut tasks = Vec::with_capacity(specs.len());

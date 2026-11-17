@@ -4818,7 +4818,7 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
         None,
     )
     .unwrap();
-    stage(&whole, &mut specs, 2, "example/project");
+    stage(&whole, &mut specs, 2, "example/project", &[]);
     let run = RunId::generate();
     let source = SourceId::generate();
     c.store().put_source_ref(&source, &manifest, 1).unwrap();

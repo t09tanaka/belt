@@ -75,6 +75,7 @@ pub(super) fn advance(
         .and_then(|m| m["capacity"].as_u64())
         .and_then(|n| usize::try_from(n).ok())
         .ok_or_else(|| unrunnable("invalid shard capacity"))?;
+    let mut policies = BTreeMap::new();
     let mut listings = Vec::new();
     let mut ids = Vec::new();
     for probe in std::iter::once(first).chain(probes) {
@@ -88,6 +89,17 @@ pub(super) fn advance(
         let Some(listing) = read_listing(store, results, probe, step)? else {
             return Ok(true);
         };
+        let policy = metadata(probe)
+            .and_then(|m| m.get("policy"))
+            .filter(|v| !v.is_null());
+        if let Some(value) = policy {
+            let p: crate::config::model::ShardPolicy =
+                serde_json::from_value(value.clone()).map_err(unrunnable)?;
+            if p.workflow != listing.step.workflow || p.job != listing.step.job {
+                return Err(unrunnable("shard policy belongs to another job"));
+            }
+            policies.insert((p.workflow.clone(), p.job.clone()), p);
+        }
         ids.push(probe.task_id.clone());
         listings.push(listing);
     }
@@ -103,7 +115,13 @@ pub(super) fn advance(
             let key = listing.history_key(&plan, project)?;
             Ok(store.ci_test_timings(key, listing.discovered.tests.clone())?)
         },
-        |_| Isolation::None,
+        |step| {
+            policies
+                .get(&(step.workflow.clone(), step.job.clone()))
+                .and_then(|p| p.isolation.clone())
+                .map(|evidence| Isolation::Declared { evidence })
+                .unwrap_or_default()
+        },
     )
     .map_err(unrunnable)?;
     let (digest, _) = keep_plan(state_dir, &split).map_err(|e| Fault::Transient(e.to_string()))?;
@@ -151,6 +169,17 @@ pub(super) fn advance(
             } else {
                 TaskId::generate()
             };
+            let mut spec = spec.clone();
+            if let Some(shard) = split.task(name).and_then(|t| t.shard.as_ref()) {
+                let runner = shard.runner.runner.as_str();
+                let allowed = policies
+                    .get(&(original.workflow.clone(), original.jobs[0].clone()))
+                    .and_then(|p| p.allow_retry)
+                    .unwrap_or(!matches!(runner, "playwright" | "cypress"));
+                if let Some(ci) = &mut spec.ci {
+                    ci.shard_retry_forbidden = !allowed;
+                }
+            }
             parts.push((task, serde_json::to_value(spec).map_err(unrunnable)?));
         }
         replacements.push((row.task_id.clone(), parts));

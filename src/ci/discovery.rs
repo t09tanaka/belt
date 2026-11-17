@@ -273,6 +273,7 @@ pub fn stage(
     specs: &mut Vec<(String, crate::coordinator::TaskSpec)>,
     capacity: usize,
     project: &str,
+    policies: &[crate::config::model::ShardPolicy],
 ) {
     let mut probes = Vec::new();
     for step in candidates(plan) {
@@ -288,8 +289,10 @@ pub fn stage(
         let ci = probe.ci.as_mut().expect("specs came from a CI plan");
         let id = step.task_id();
         ci.task.task_id = id.clone();
-        ci.task.inputs["rtr_discovery"] =
-            serde_json::json!({"capacity": capacity, "project": project, "applied": false});
+        let policy = policies
+            .iter()
+            .find(|p| p.workflow == step.workflow && p.job == step.job);
+        ci.task.inputs["rtr_discovery"] = serde_json::json!({"capacity": capacity, "project": project, "applied": false, "policy": policy});
         ci.hold = false;
         ci.steps = u32::try_from(step.step + 2).unwrap_or(u32::MAX);
         probes.push((id, probe));

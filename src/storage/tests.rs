@@ -5579,3 +5579,30 @@ fn live_attempts_of_a_worker_are_paged_without_gaps_repeats_or_other_rows() {
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn retry_of_a_non_idempotent_shard_requires_its_captured_permission() {
+    use crate::service::completion::Target;
+    let (f, _) = retry_fixture(Outcome::Failed);
+    let id = f.task.to_string();
+    f.store.db.write(move|tx| {
+        tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.shard_retry_forbidden',json('true')) WHERE task_id=?1",[id])?;
+        Ok(())
+    }).unwrap();
+    for target in [Target::Task(f.task.clone()), Target::Run(f.run.clone())] {
+        let refused = f
+            .store
+            .retry(target, 0, "protected".into(), 40, |_, _, _| {
+                panic!("protected retry reached input validation")
+            })
+            .unwrap_err();
+        assert!(refused.to_string().contains("allow_retry"));
+    }
+    assert_eq!(
+        f.store
+            .completion(Target::Run(f.run.clone()))
+            .unwrap()
+            .control_revision,
+        0
+    );
+}

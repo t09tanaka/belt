@@ -260,6 +260,7 @@ fn setup_survives_queue_serialization_and_payload_construction() {
 fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
     TaskSpec {
         ci: Some(CiSpec {
+            shard_retry_forbidden: false,
             task: crate::wire::CiTask {
                 plan_digest: Digest::of_bytes(b"plan"),
                 task_id: "ci.yml/build".into(),
