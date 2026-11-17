@@ -1117,5 +1117,25 @@ A44 の sync 側のテスト（ネットワークに出ない）:
 2. ssh 越しの remote worker に対する `workers sync` の実機での受入（S26）。往復の試験は local worker の link で行った。remote の link を作る `config/runtime.rs` が feature の合意を渡すこと（合意した peer には送り、していない peer には送らない）は `tests/it/runtime.rs` で確かめたが、ssh の bridge を通した導入の往復は試験していない。
 3. `--project` は workflow の `setup-*` 入力を読まない（版指定ファイルのみ）。
 4. `diff` の worker 省略時の並列化、`installed_inventory` の所要時間の計測（1 本目から継続）。
-5. spec 11 章は `env_sync` の名前だけを挙げており、`pending` と `sync_id` による聞き直し、feature `env_sync_v1` は spec に書いていない（spec の追記は未実施）。
+5. （4 本目で解消）spec 11 章・18 章・22.2 に `env_sync` の意味、feature `env_sync_v1`、N/N+1 の規則を書いた。
 6. sync の途中で Ctrl-C したとき、worker 側の導入は最長 `warmup_idle_ms` 続いてから止まる（即時の取り消し要求は無い）。
+
+### S21 `workers sync` のレビュー修正（2026-11-17、4 本目: PR #59 の指摘）
+
+- **H1（S20 からの欠陥）**: 失敗した導入・途中で止められた導入が receipt の無い private root を残し、同じ版がその後ずっと失敗していた。原因は 2 か所で、`poll_tool` が導入者を起動する前に `detect` の `installation_incomplete_or_unreceipted` を `Failed` にしていたことと、`install_admitted` が中身のある root を `installation_partial_requires_cleanup` で断っていたこと。直し方: `poll_tool` は「root はあるが receipt が無い」場合に限って導入者を起動する（信用できない receipt・tree の drift・安全でないディレクトリは従来どおり `Failed`）。`install_admitted` は `install.lock` を排他で取り（他の導入者が持っていれば何も消さずに待つ）、receipt があればそれを返し、無ければ root の中身を消してから入れ直す。消す前に root の場所を確かめる（管理ディレクトリの直下、名前が plan identity の 64 桁 16 進、所有者のみの権限、symlink を経由しない）。`install.lock` は残し、symlink は辿らずに外し、receipt のある root（検証できない receipt を含む）は消さない。仕事の中の導入も warm-up も同じ `poll_tool` → helper → `install_admitted` を通るので、両方が直る。修正前に、失敗させた版をもう一度導入するテストが builder と resident 経由の両方で失敗することを確かめた（`installation_incomplete_or_unreceipted`）。
+  - 変わった既存の振る舞い: 導入が失敗した版を次の consumer が要求すると、導入をもう一度試す（以前は 1 回目の失敗を返し続けた）。失敗を見た consumer 自身には同じ失敗を返し続ける。`installation_busy` と `installation_partial_requires_cleanup` は返さなくなった。
+- **M1**: 一度 `pending` を見た後は、resident に繋がらない（接続拒否・socket なし）と `NOT_FOUND`（resident が worker をまだ掴んでいない）を答えなしとして、2 分の上限の中で聞き直す。`pending` を見た後に止める・打ち切るときは、導入が worker で続いている可能性と `workers diff` を添える。resident は起動のたびに token を作り直すので、答えを読めなかったら client を読み直してから聞き直す（これが無いと、再起動後の resident に古い token で聞き続けて打ち切りになる。再起動をまたぐ試験で見つけた）。
+- **M2**: 停止中の worker は新しい warm-up を `CONFLICT` で断り、親はその場で止めて worker の文言を出す（`OVERLOADED` は「混んでいる」だけになった）。error code は増やしていない（古い親が読めない値を返さないため）。resident の再起動の案内は、resident がこの操作に一度も答えなかったときだけ出す。
+- **M3**: 親は worker の答え（`pending` と `OVERLOADED`）で「最後に答えがあった時刻」を更新する。worker の確認は `sync_id` ごとに 1 本の別スレッドで行い、warm-up の lock の外で動く。確認を始めた要求は最長 1.5 秒待って `pending` を返し、確認中に来た同じ `sync_id` の要求は分かっている結果をその場で返す（時間切れになった要求がスレッドを積み上げない）。遅い確認の結果は残り、次の要求に答える。確認中の warm-up は idle でも手放さない（手放すと、確認が consumer を作り直し、誰も解放しなくなる）。
+- **L1**: worker が `unchanged` と答えた版は `installed` に入れない。測り直しと `verify` は、`unchanged` の版にも行う。親が `pending` を見た後の `unchanged`（worker の再起動で warm-up を忘れた場合）は、導入したものとして数える。
+- **L2**: `toolchain_poll` は warm-up の lock の外（上の別スレッド）で呼ぶ。
+- **L3**: resident の client を作れないとき、「resident が動いていない」と言うのは、token か socket が無い・接続拒否のときだけ。それ以外はそのままの理由を出す。
+- **L4（入れない）**: warm-up は `max_concurrent_prepares` に数えない。この上限は workspace の準備（`host.prepare` のスレッド）の数を縛るもので、仕事の中の toolchain の導入もこの枠を持たない。warm-up が枠を持つと、最長 15 分の導入の間、workspace の準備が待たされる。導入の同時数は、版ごとの singleflight、task-traffic-controller の gate、warm-up の上限 16 で縛っている。
+- **テスト（M4）**:
+  - 導入中の worker の再起動: `tests/it/toolchain_preparation.rs`（同じ state を開き直し、古い導入者が片付くまで次を始めず、その後に導入が成功する）。
+  - resident の再起動をまたぐ sync: `tests/it/bootstrap.rs`（local worker は resident の中にあるので、worker の再起動も兼ねる）。
+  - 中断のあとの 2 回目の sync（worker が忘れる前）: `tests/it/bootstrap.rs`（manager は 1 回だけ）。忘れた後（60 秒）は、`warmup_idle_ms` を resident の設定から変えられないため resident 経由では試験していない。同じ経路を 2 段で確かめた: agent が idle で参照を手放し、同じ `sync_id` の聞き直しが新しい warm-up になること（`tests/it/worker_agent.rs`、link の切断が `warmup_idle_ms` を超える場合も同じ）、参照が無くなって止められた導入の後に同じ版が導入できること（`tests/it/toolchain_preparation.rs`）。
+  - gate: `tests/it/bootstrap.rs`（worker の予算を別の entry で埋めると、導入が worker の ledger に並び、manager が走らない。空けると導入される）。
+  - 遅い確認: `tests/it/worker_agent.rs`（確認が戻らなくても要求は `pending` で返り、聞き直しは確認を増やさず、結果は残る）。
+
+残り（S21 は完了していない）: 上の 1〜4 と 6。加えて、`warmup_idle_ms` を超えた後の 2 回目の sync を resident 経由の 1 本の試験で確かめること（設定の口が要る）。`dry_run` の `env_sync` は receipt の無い root を `failed` と答える（導入すれば直るが、表示は直していない。CLI は `dry_run` を使っていない）。
