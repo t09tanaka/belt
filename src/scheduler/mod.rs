@@ -15,7 +15,7 @@ pub mod measured;
 
 use crate::forecast::plan::MAX_PENDING_PLANS;
 use crate::ids::{AttemptId, PlanDigest, TaskId, WorkerId};
-use crate::storage::{CoordinatorStore, Placement, QueuedTask};
+use crate::storage::{CoordinatorStore, Placement, QueuedTask, PAGE_MAX};
 use crate::wire::{
     AttemptPayload, CommandSpec, ConcurrencyLimits, Correlation, WorkloadNode, WorkloadPlan,
 };
@@ -281,23 +281,37 @@ pub fn workload_of(
 /// acknowledged: it is not in the worker's own state yet, so the forecast
 /// question carries it (spec chapter 9, step 6). The oldest first, and no
 /// more than a worker accepts in one question.
-pub fn pending_of(unacked: &[Placement], worker_id: &WorkerId) -> Vec<WorkloadPlan> {
-    unacked
-        .iter()
-        .filter(|p| &p.worker_id == worker_id)
-        .filter_map(|p| {
-            let attempt_id = p.attempt_id.as_ref()?;
-            let payload: AttemptPayload =
-                serde_json::from_value(p.demand.get("payload")?.clone()).ok()?;
-            Some(workload_of(
-                attempt_id,
-                &payload.plan_digest,
-                &payload.commands,
-                None,
-            ))
-        })
-        .take(MAX_PENDING_PLANS)
-        .collect()
+///
+/// The placements are read a page at a time and only their plans are kept,
+/// so what this holds is bounded by one page and [`MAX_PENDING_PLANS`]
+/// plans, however many placements wait.
+pub fn pending_plans(
+    store: &CoordinatorStore,
+    worker_id: &WorkerId,
+) -> crate::storage::Result<Vec<WorkloadPlan>> {
+    let mut plans = Vec::new();
+    let mut after = 0;
+    while plans.len() < MAX_PENDING_PLANS {
+        let page = store.unacked_demand_page(worker_id, after, PAGE_MAX)?;
+        let Some(last) = page.last() else { break };
+        after = last.placement_id;
+        let room = MAX_PENDING_PLANS - plans.len();
+        plans.extend(page.iter().filter_map(plan_of).take(room));
+    }
+    Ok(plans)
+}
+
+/// The plan of one placement; `None` for one without an attempt or with a
+/// payload that does not read.
+fn plan_of(p: &Placement) -> Option<WorkloadPlan> {
+    let attempt_id = p.attempt_id.as_ref()?;
+    let payload: AttemptPayload = serde_json::from_value(p.demand.get("payload")?.clone()).ok()?;
+    Some(workload_of(
+        attempt_id,
+        &payload.plan_digest,
+        &payload.commands,
+        None,
+    ))
 }
 
 /// The decision that placed an attempt, as it was committed with the
