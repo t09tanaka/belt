@@ -322,7 +322,10 @@ fn entries_list_every_value_with_its_origin() {
     assert_eq!(get("execution.timeout_seconds").value, "3600");
     assert_eq!(get("toolchain.match").value, "exact");
     assert_eq!(get("ci.unsupported").value, "error");
-    assert_eq!(e.len(), 26);
+    let warmup = get("coordinator.warmup_idle_seconds");
+    assert_eq!(warmup.value, "60");
+    assert_eq!(warmup.origin, Origin::Default);
+    assert_eq!(e.len(), 27);
     assert_eq!(get("ci.no_cache").value, "[]");
     let none = run(None, None, None, &Overlay::default())
         .unwrap()
