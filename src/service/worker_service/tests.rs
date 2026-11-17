@@ -946,6 +946,13 @@ fn a_system_service_installs_stops_restores_and_upgrades_without_replacing_the_a
             let system_plan = plan(&paths, &journal).unwrap();
             let file = system_user::publish_definition(&system_dir, &system_plan, euid()).unwrap();
             let bytes = fs::read(&file).unwrap();
+            let account = journal.system_user.as_deref().unwrap();
+            let version = fs::canonicalize(paths.executable(&host.digest)).unwrap();
+            // Automatic startup is legitimate as soon as the administrator
+            // publishes the first definition, before the parent retries.
+            system_user::check_boot(&paths, account, &version).unwrap();
+            assert!(system_user::check_boot(&paths, "another-account", &version).is_err());
+            assert!(system_user::check_boot(&paths, account, &host.exe).is_err());
             let up = host.install().unwrap();
             assert!(up.system_user && up.ready && up.loaded == Some(true));
             let first = require_journal(&paths).unwrap().receipt.unwrap();
@@ -973,9 +980,20 @@ fn a_system_service_installs_stops_restores_and_upgrades_without_replacing_the_a
                 &new_binary,
                 host.fake.clone(),
                 options,
-                &mut |_| Ok(()),
+                &mut |step| {
+                    if step == upgrade::Step::Input {
+                        assert!(system_user::check_boot(&paths, account, &version)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("switch has not published"));
+                    }
+                    Ok(())
+                },
             )
             .unwrap();
+            let new = fs::canonicalize(paths.executable(&update.binary_sha256)).unwrap();
+            system_user::check_boot(&paths, account, &new).unwrap();
+            assert!(system_user::check_boot(&paths, account, &version).is_err());
             assert!(switched.system_user && switched.ready);
             assert_eq!(switched.binary_sha256, update.binary_sha256);
             let installed = upgrade::commit(&host.env, &update, host.fake.clone()).unwrap();

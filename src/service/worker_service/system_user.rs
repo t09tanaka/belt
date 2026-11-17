@@ -279,12 +279,16 @@ pub(crate) fn check_start(input: &Path) -> anyhow::Result<()> {
     ]);
     let paths = Paths::resolve_for(&env, HostLauncher::native().backend())?;
     ensure!(paths.input == input, "unexpected system worker input path");
-    let journal = require_journal(&paths)?;
+    check_boot(&paths, &name, &std::env::current_exe()?)
+}
+
+pub(super) fn check_boot(paths: &Paths, username: &str, executable: &Path) -> anyhow::Result<()> {
+    let journal = require_journal(paths)?;
     ensure!(
-        journal.system_user.as_ref() == Some(&name),
+        journal.system_user.as_deref() == Some(username),
         "installed worker is not bound to this service account"
     );
-    let plan = plan(&paths, &journal)?;
+    let plan = plan(paths, &journal)?;
     let observed = receipt(&plan)?;
     if let Some(expected) = &journal.receipt {
         ensure!(&observed == expected, "system definition was replaced");
@@ -298,7 +302,7 @@ pub(crate) fn check_start(input: &Path) -> anyhow::Result<()> {
         );
     }
     ensure!(
-        fs::canonicalize(paths.executable(&journal.binary_sha256))? == std::env::current_exe()?,
+        fs::canonicalize(paths.executable(&journal.binary_sha256))? == executable,
         "worker binary differs from the installed version"
     );
     Ok(())
