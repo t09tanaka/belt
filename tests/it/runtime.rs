@@ -135,10 +135,16 @@ fn the_worker_scope_follows_the_state_home_and_reaches_every_command() {
     let step = profile.execution_environment(&BTreeMap::new()).unwrap();
     assert_eq!(step["XDG_STATE_HOME"], input.env["XDG_STATE_HOME"]);
     assert_eq!(step["HOME"], input.env["HOME"]);
+    assert_eq!(step["TASK_TRAFFIC_CONTROLLER_NESTED"], "inherit");
+    // A setup step gets the same, on top of the toolchain environment (which
+    // the keys of prepared work are made from, and which does not hold it).
+    let setup = runtime.setup_config();
+    assert_eq!(setup.scope_env.as_ref(), Some(profile.scope_environment()));
     assert_eq!(
-        runtime.setup_config().env["XDG_STATE_HOME"],
+        setup.scope_env.as_ref().unwrap()["XDG_STATE_HOME"],
         input.env["XDG_STATE_HOME"]
     );
+    assert!(!setup.env.contains_key("XDG_STATE_HOME"));
 
     // Without anything to resolve the scope from, there is no worker.
     input.env.remove("XDG_STATE_HOME");

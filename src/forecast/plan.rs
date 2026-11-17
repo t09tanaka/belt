@@ -333,10 +333,13 @@ pub fn snapshot_digest(
 
 /// Running ledger entries whose remaining time is unknown: past their
 /// history, without a history, without a start time, or without a lease.
+/// A nested entry (one with a `parent`) is not counted: it runs inside its
+/// parent, whose remaining time is the one that matters, and it usually has
+/// no history of its own.
 pub fn overrunning(insp: &Inspection) -> usize {
     insp.entries
         .iter()
-        .filter(|e| e.entry.state == State::Running)
+        .filter(|e| e.entry.state == State::Running && e.entry.parent.is_none())
         .filter(|e| {
             let elapsed_ms = e
                 .entry
@@ -1101,6 +1104,24 @@ mod tests {
         assert_eq!(n(entry(State::Running, Some(10.0), Some(5), true)), 1);
         // A waiting entry has no remaining time to be unknown.
         assert_eq!(n(entry(State::Waiting, None, None, false)), 0);
+        // A nested entry runs inside its parent: never counted on its own,
+        // whatever is unknown about it.
+        let nested = |mut e: InspectedEntry| {
+            e.entry.parent = Some("outer".into());
+            e
+        };
+        assert_eq!(n(nested(entry(State::Running, None, None, false))), 0);
+        assert_eq!(
+            n(nested(entry(State::Running, Some(10.0), Some(99), true))),
+            0
+        );
+        assert_eq!(
+            overrunning(&insp_of(vec![
+                entry(State::Running, None, Some(1), false),
+                nested(entry(State::Running, None, Some(1), false)),
+            ])),
+            1
+        );
         assert_eq!(
             overrunning(&insp_of(vec![
                 entry(State::Running, None, None, false),

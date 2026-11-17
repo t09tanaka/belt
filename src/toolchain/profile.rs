@@ -78,11 +78,12 @@ const INSTALL_GUARDS: &[(&str, &str)] = &[
     ("MISE_AUTO_INSTALL", "false"),
 ];
 // `XDG_STATE_HOME` decides (with `HOME`) which task-traffic-controller ledger
-// a nested CLI uses, and `XDG_CONFIG_HOME` which configuration: a command
-// keeps the worker's value of both, set or unset.
-fn scope_env(key: &str) -> bool {
-    key == crate::config::traffic::STATE_HOME_ENV || key == crate::config::traffic::CONFIG_HOME_ENV
-}
+// a nested CLI uses, `XDG_CONFIG_HOME` which configuration, and
+// `TASK_TRAFFIC_CONTROLLER_NESTED` how it nests: a command keeps the worker's
+// value of each, set or unset. They say where the scope is, not what the
+// toolchain is: they are kept apart from `env`, outside the profile digest,
+// the fingerprint and the activation of an execution binding.
+use crate::config::traffic::is_step_env as scope_env;
 fn protected_env(key: &str) -> bool {
     matches!(key, "PATH" | "SHELL" | "HOME" | "TMPDIR")
         || scope_env(key)
@@ -119,6 +120,9 @@ pub struct Profile {
     definition: Definition,
     env: BTreeMap<String, String>,
     digest: Digest,
+    /// The scope variables every command gets on top of `env`
+    /// (`config::traffic::step_env`). Not hashed.
+    scope_env: BTreeMap<String, String>,
     report_identity: Arc<Mutex<Option<ReportIdentity>>>,
     completed_report: Arc<Mutex<Option<CompletedReport>>>,
     report_sequence: Arc<AtomicU64>,
@@ -203,9 +207,9 @@ impl Profile {
             let mut env: BTreeMap<_, _> = retained
                 .iter()
                 .filter(|(k, _)| {
-                    definition.allowed_env.contains(*k)
-                        || matches!(k.as_str(), "HOME" | "TMPDIR")
-                        || scope_env(k)
+                    !scope_env(k)
+                        && (definition.allowed_env.contains(*k)
+                            || matches!(k.as_str(), "HOME" | "TMPDIR"))
                 })
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
@@ -228,23 +232,31 @@ impl Profile {
                     .map(String::as_str)
                     .unwrap_or("/bin/bash"),
             );
+            // Everything the worker kept, but the scope variables.
+            let toolchain: BTreeMap<String, String> = retained
+                .iter()
+                .filter(|(k, _)| !scope_env(k))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect();
             let definition = Definition {
                 path: std::env::split_paths(path).collect(),
                 shell,
                 env: BTreeMap::new(),
-                allowed_env: retained.keys().cloned().collect(),
+                allowed_env: toolchain.keys().cloned().collect(),
                 required_tools: BTreeSet::new(),
                 secret_refs: BTreeMap::new(),
                 cache_namespace: "default".into(),
             };
-            ("default".into(), definition, retained.clone())
+            ("default".into(), definition, toolchain)
         };
-        Self::new(name, definition, env, explicit_allowlist)
+        let scope = crate::config::traffic::step_env(retained);
+        Self::new(name, definition, env, scope, explicit_allowlist)
     }
     fn new(
         name: String,
         definition: Definition,
         mut env: BTreeMap<String, String>,
+        scope_env: BTreeMap<String, String>,
         explicit_allowlist: bool,
     ) -> Result<Self, String> {
         if !definition.secret_refs.is_empty() {
@@ -266,7 +278,7 @@ impl Profile {
             || definition.allowed_env.len() > 256
             || env.len() > 256
             || env.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>() > 65536
-            || env.iter().any(|(k, v)| {
+            || env.iter().chain(&scope_env).any(|(k, v)| {
                 k.is_empty()
                     || k.len() > 128
                     || k.contains(['=', '\0'])
@@ -311,6 +323,7 @@ impl Profile {
             name,
             definition,
             env,
+            scope_env,
             digest,
             report_identity: Arc::new(Mutex::new(None)),
             completed_report: Arc::new(Mutex::new(None)),
@@ -336,18 +349,27 @@ impl Profile {
     pub fn name(&self) -> &str {
         &self.name
     }
+    /// The toolchain environment: what the digest, the fingerprint and an
+    /// execution binding's activation are made from. A command also gets
+    /// [`Profile::scope_environment`].
     pub fn environment(&self) -> &BTreeMap<String, String> {
         &self.env
+    }
+    /// The variables that tell a command's own task-traffic-controller which
+    /// scope to use and how to nest: the worker's, on top of everything.
+    pub fn scope_environment(&self) -> &BTreeMap<String, String> {
+        &self.scope_env
     }
     pub fn execution_environment(
         &self,
         extra: &BTreeMap<String, String>,
     ) -> Result<BTreeMap<String, String>, String> {
+        let own = |key: &str| self.scope_env.get(key).or_else(|| self.env.get(key));
         if extra.iter().any(|(key, value)| {
             (self.explicit_allowlist
                 && !self.definition.allowed_env.contains(key)
                 && !protected_env(key))
-                || protected_env(key) && self.env.get(key) != Some(value)
+                || protected_env(key) && own(key) != Some(value)
         }) {
             return Err(
                 "command env is outside the active profile allowlist or changes protected environment"
@@ -355,7 +377,32 @@ impl Profile {
             );
         }
         let mut env = self.env.clone();
+        env.extend(self.scope_env.clone());
         env.extend(extra.clone());
+        Ok(env)
+    }
+    /// The environment of one command: [`Profile::execution_environment`],
+    /// or with an execution binding its activation and `extra`. Either way
+    /// the scope variables are the worker's present ones: the activation
+    /// does not hold them, and a binding accepted before they changed (or
+    /// before the worker carried them at all) stays valid.
+    pub fn command_environment(
+        &self,
+        binding: Option<&super::contract::ExecutionBinding>,
+        extra: &BTreeMap<String, String>,
+    ) -> Result<BTreeMap<String, String>, String> {
+        let unbound = self.execution_environment(extra)?;
+        let Some(binding) = binding else {
+            return Ok(unbound);
+        };
+        // Checked against the worker's values above; the activation has none.
+        let own: BTreeMap<String, String> = extra
+            .iter()
+            .filter(|(k, _)| !scope_env(k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut env = binding.environment(&own)?;
+        crate::config::traffic::apply_step_env(&mut env, &self.scope_env);
         Ok(env)
     }
     pub fn shell(&self) -> &Path {
@@ -1454,14 +1501,18 @@ mod tests {
         let mut with_state = env(dir.path());
         with_state.insert("XDG_STATE_HOME".into(), "/state".into());
         // The default profile: the worker has none, so a command has none.
+        let step = |p: &Profile| p.execution_environment(&BTreeMap::new()).unwrap();
         let unset = Profile::load(dir.path(), &env(dir.path())).unwrap();
-        assert!(!unset.environment().contains_key("XDG_STATE_HOME"));
+        assert!(!step(&unset).contains_key("XDG_STATE_HOME"));
         assert!(unset
             .execution_environment(&set(&[("XDG_STATE_HOME", "/other")]))
             .is_err());
         // The worker has one: passed on, and only as it is.
         let given = Profile::load(dir.path(), &with_state).unwrap();
-        assert_eq!(given.environment()["XDG_STATE_HOME"], "/state");
+        assert_eq!(step(&given)["XDG_STATE_HOME"], "/state");
+        // It is the scope's, not the toolchain's.
+        assert!(!given.environment().contains_key("XDG_STATE_HOME"));
+        assert_eq!(given.scope_environment()["XDG_STATE_HOME"], "/state");
         assert!(given
             .execution_environment(&set(&[("XDG_STATE_HOME", "/other")]))
             .is_err());
@@ -1475,7 +1526,7 @@ mod tests {
         // one that lists it cannot give it a value of its own.
         write_profile(dir.path(), "node22", "allowed_env = [\"OTHER\"]");
         let explicit = Profile::load(dir.path(), &with_state).unwrap();
-        assert_eq!(explicit.environment()["XDG_STATE_HOME"], "/state");
+        assert_eq!(step(&explicit)["XDG_STATE_HOME"], "/state");
         assert!(explicit
             .execution_environment(&set(&[("XDG_STATE_HOME", "/other")]))
             .is_err());
@@ -1500,14 +1551,16 @@ mod tests {
         let dir = crate::test_tmp::tempdir().unwrap();
         let mut with_config = env(dir.path());
         with_config.insert("XDG_CONFIG_HOME".into(), "/config".into());
+        let step = |p: &Profile| p.execution_environment(&BTreeMap::new()).unwrap();
         let default = Profile::load(dir.path(), &with_config).unwrap();
-        assert_eq!(default.environment()["XDG_CONFIG_HOME"], "/config");
+        assert_eq!(step(&default)["XDG_CONFIG_HOME"], "/config");
+        assert!(!default.environment().contains_key("XDG_CONFIG_HOME"));
         assert!(default
             .execution_environment(&set(&[("XDG_CONFIG_HOME", "/other")]))
             .is_err());
         write_profile(dir.path(), "node22", "allowed_env = [\"OTHER\"]");
         let explicit = Profile::load(dir.path(), &with_config).unwrap();
-        assert_eq!(explicit.environment()["XDG_CONFIG_HOME"], "/config");
+        assert_eq!(step(&explicit)["XDG_CONFIG_HOME"], "/config");
         assert_eq!(
             explicit
                 .execution_environment(&set(&[("XDG_CONFIG_HOME", "/config")]))
@@ -1519,13 +1572,166 @@ mod tests {
             .is_err());
         // Unset for the worker means unset for the command.
         let unset = Profile::load(dir.path(), &env(dir.path())).unwrap();
-        assert!(!unset.environment().contains_key("XDG_CONFIG_HOME"));
+        assert!(!step(&unset).contains_key("XDG_CONFIG_HOME"));
         write_profile(
             dir.path(),
             "node22",
             "allowed_env = [\"XDG_CONFIG_HOME\"]\n[profiles.node22.env]\nXDG_CONFIG_HOME = \"/mine\"",
         );
         assert!(Profile::load(dir.path(), &with_config).is_err());
+    }
+    /// A nested `task-traffic-controller exec` runs under its step's entry
+    /// (spec chapter 14): every command is told so, and cannot say otherwise.
+    #[test]
+    fn a_command_is_told_to_inherit_and_cannot_change_it() {
+        let set = |k: &str, v: &str| BTreeMap::from([(k.to_string(), v.to_string())]);
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let mut worker = env(dir.path());
+        // What the worker's own shell said does not reach a command.
+        worker.insert("TASK_TRAFFIC_CONTROLLER_NESTED".into(), "admit".into());
+        let check = |profile: &Profile| {
+            let step = profile.execution_environment(&BTreeMap::new()).unwrap();
+            assert_eq!(step["TASK_TRAFFIC_CONTROLLER_NESTED"], "inherit");
+            assert!(!profile
+                .environment()
+                .contains_key("TASK_TRAFFIC_CONTROLLER_NESTED"));
+            assert!(profile
+                .execution_environment(&set("TASK_TRAFFIC_CONTROLLER_NESTED", "admit"))
+                .is_err());
+            assert!(profile
+                .execution_environment(&set("TASK_TRAFFIC_CONTROLLER_NESTED", "inherit"))
+                .is_ok());
+        };
+        check(&Profile::load(dir.path(), &worker).unwrap());
+        write_profile(
+            dir.path(),
+            "node22",
+            "allowed_env = [\"TASK_TRAFFIC_CONTROLLER_NESTED\"]",
+        );
+        check(&Profile::load(dir.path(), &worker).unwrap());
+        write_profile(
+            dir.path(),
+            "node22",
+            "allowed_env = [\"TASK_TRAFFIC_CONTROLLER_NESTED\"]\n[profiles.node22.env]\nTASK_TRAFFIC_CONTROLLER_NESTED = \"admit\"",
+        );
+        assert!(Profile::load(dir.path(), &worker).is_err());
+    }
+    /// The scope variables are no part of what a worker is: a worker that
+    /// gains, loses or moves `XDG_STATE_HOME` / `XDG_CONFIG_HOME` keeps its
+    /// digest and its fingerprint, so what it accepted before stays valid.
+    #[test]
+    fn the_scope_variables_do_not_change_the_identity_of_a_profile() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let plain = env(dir.path());
+        let mut moved = plain.clone();
+        moved.insert("XDG_STATE_HOME".into(), "/state".into());
+        moved.insert("XDG_CONFIG_HOME".into(), "/config".into());
+        moved.insert("TASK_TRAFFIC_CONTROLLER_NESTED".into(), "admit".into());
+        let mut other = plain.clone();
+        other.insert("ORDINARY".into(), "x".into());
+        let identity = |retained: &BTreeMap<String, String>| {
+            let profile = Profile::load(dir.path(), retained).unwrap();
+            (
+                profile.definition_digest().clone(),
+                profile.startup_report().profile_fingerprint,
+                profile.environment().clone(),
+            )
+        };
+        // The default profile, then an explicit one that lists them, then
+        // one that does not.
+        for extra in [
+            None,
+            Some("allowed_env = [\"XDG_STATE_HOME\", \"XDG_CONFIG_HOME\", \"ORDINARY\"]"),
+            Some("allowed_env = [\"ORDINARY\"]"),
+        ] {
+            match extra {
+                Some(extra) => write_profile(dir.path(), "node22", extra),
+                None => assert!(!dir.path().join("profiles.toml").exists()),
+            }
+            assert_eq!(identity(&plain), identity(&moved), "{extra:?}");
+            // An ordinary variable still is part of it.
+            assert_ne!(identity(&plain).0, identity(&other).0, "{extra:?}");
+        }
+    }
+    /// With an execution binding the command starts from the activation,
+    /// which holds no scope variable; they are the worker's present ones,
+    /// whatever the worker carried when the binding was accepted.
+    #[test]
+    fn a_bound_command_gets_the_scope_of_the_worker_not_of_the_binding() {
+        use crate::toolchain::adapters::{ActivationReceipt, FileIdentity};
+        use crate::toolchain::contract::ExecutionBinding;
+        let set = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+            pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect()
+        };
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let mut worker = env(dir.path());
+        worker.insert("XDG_STATE_HOME".into(), "/state".into());
+        let profile = Profile::load(dir.path(), &worker).unwrap();
+        let binding = |environment: BTreeMap<String, String>| ExecutionBinding {
+            activation: ActivationReceipt {
+                base_profile: Digest::of_bytes(b"fixture"),
+                frozen: Digest::of_bytes(b"fixture"),
+                setup_policy: Digest::of_bytes(b"fixture"),
+                installation: Digest::of_bytes(b"fixture"),
+                environment,
+                shell: FileIdentity {
+                    path: "/bin/sh".into(),
+                    digest: Digest::of_bytes(b"fixture"),
+                    size: 0,
+                    executable: true,
+                },
+                binding_digest: Digest::of_bytes(b"fixture"),
+                execution_fingerprint: Digest::of_bytes(b"fixture"),
+            },
+        };
+        let bound = binding(set(&[("PATH", "/tools:/bin"), ("HOME", "/h")]));
+        let env = profile
+            .command_environment(Some(&bound), &set(&[("FLAG", "1")]))
+            .unwrap();
+        assert_eq!(
+            env,
+            set(&[
+                ("PATH", "/tools:/bin"),
+                ("HOME", "/h"),
+                ("FLAG", "1"),
+                ("XDG_STATE_HOME", "/state"),
+                ("TASK_TRAFFIC_CONTROLLER_NESTED", "inherit"),
+            ])
+        );
+        // A step that repeats the worker's own value is as before; one that
+        // changes it is refused, as is one that changes the activation.
+        assert_eq!(
+            profile
+                .command_environment(Some(&bound), &set(&[("XDG_STATE_HOME", "/state")]))
+                .unwrap()["XDG_STATE_HOME"],
+            "/state"
+        );
+        assert!(profile
+            .command_environment(Some(&bound), &set(&[("XDG_STATE_HOME", "/other")]))
+            .is_err());
+        assert!(profile
+            .command_environment(Some(&bound), &set(&[("XDG_CACHE_HOME", "/cache")]))
+            .is_err());
+        // An activation written by a worker that still carried them (or of
+        // another scope) does not bring its values back.
+        let stale = binding(set(&[
+            ("PATH", "/tools:/bin"),
+            ("XDG_STATE_HOME", "/old"),
+            ("XDG_CONFIG_HOME", "/old-config"),
+        ]));
+        let env = profile
+            .command_environment(Some(&stale), &BTreeMap::new())
+            .unwrap();
+        assert_eq!(env["XDG_STATE_HOME"], "/state");
+        assert!(!env.contains_key("XDG_CONFIG_HOME"));
+        // Without a binding it is the profile's own environment.
+        assert_eq!(
+            profile.command_environment(None, &set(&[("FLAG", "1")])),
+            profile.execution_environment(&set(&[("FLAG", "1")]))
+        );
     }
     #[test]
     fn private_input_rejects_symlinks_permissions_secrets_and_required_missing() {

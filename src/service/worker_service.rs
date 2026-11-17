@@ -88,6 +88,23 @@ pub struct Status {
     /// non-login ssh PATH.
     #[serde(default)]
     pub bridge_binary: Option<String>,
+    /// The task-traffic-controller scope the worker uses: resolved from the
+    /// environment recorded at install, which is what the worker starts
+    /// with. `None` when that environment does not resolve to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_scope: Option<TrafficScope>,
+    /// Set while the worker is up but not serving, because commands it
+    /// started in another scope have not ended (`reason`:
+    /// `waiting_for_previous_scope`), or because that scope cannot be read
+    /// (`previous_scope_unreadable`; `message` says what to do).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_hold: Option<crate::config::traffic::HoldRecord>,
+}
+
+#[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TrafficScope {
+    pub state_dir: PathBuf,
+    pub config_file: PathBuf,
 }
 
 pub struct Paths {
@@ -106,9 +123,6 @@ impl Paths {
         if let Some(x) = env.get("XDG_CONFIG_HOME") {
             resident::validate_components(Path::new(x))?;
         }
-        // The worker will share the scope of the user's CLI: refuse here, at
-        // install, an environment it would refuse at start.
-        crate::config::traffic::resolve(env).map_err(anyhow::Error::msg)?;
         let config = crate::config::paths::user_config_path(env)?
             .parent()
             .context("configuration parent")?
@@ -343,6 +357,27 @@ fn worker_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
         .collect()
 }
 
+/// The recorded environment of an installed worker, with the two variables
+/// that place the task-traffic-controller scope taken from `caller` (set or
+/// unset) when `idle`; unchanged otherwise.
+fn scope_refreshed(
+    recorded: &BTreeMap<String, String>,
+    caller: &BTreeMap<String, String>,
+    idle: bool,
+) -> BTreeMap<String, String> {
+    use crate::config::traffic::{CONFIG_HOME_ENV, STATE_HOME_ENV};
+    let mut env = recorded.clone();
+    if idle {
+        for key in [STATE_HOME_ENV, CONFIG_HOME_ENV] {
+            match caller.get(key) {
+                Some(value) => env.insert(key.into(), value.clone()),
+                None => env.remove(key),
+            };
+        }
+    }
+    env
+}
+
 fn plan(paths: &Paths, journal: &Journal) -> anyhow::Result<policy::Plan> {
     let label = format!(
         "io.github.t09tanaka.rtr.worker.{}.{}",
@@ -544,6 +579,10 @@ pub fn install<L: Launcher>(
 ) -> anyhow::Result<Status> {
     ensure!(request.schema == 1, "unsupported install request schema");
     let paths = Paths::resolve(env)?;
+    // The worker will share the scope of the user's CLI: refuse here, at
+    // install, an environment it would refuse at start. Only here: stop,
+    // drain and status do not depend on the caller's scope.
+    crate::config::traffic::resolve(env).map_err(anyhow::Error::msg)?;
     let digest = sha256_file(current_exe)?;
     ensure!(
         digest == request.binary_sha256,
@@ -569,9 +608,24 @@ pub fn install<L: Launcher>(
     // trip the comparison). Before that nothing runs yet and a re-run replaces.
     let registered = existing.as_ref().is_some_and(|j| j.receipt.is_some());
     let env = match &existing {
-        Some(journal) if registered => journal.env.clone(),
+        Some(journal) if registered => {
+            // The one exception is the scope of task-traffic-controller,
+            // which is no part of the service file: a stopped worker without
+            // an unfinished attempt takes the caller's, so that `stop` and
+            // `install` again is how a worker follows a changed
+            // XDG_STATE_HOME. A running one keeps what it started with.
+            let stopped = match &journal.receipt {
+                Some(receipt) => {
+                    launcher.loaded_state(&plan(&paths, journal)?, receipt) == LoadedState::Absent
+                }
+                None => false,
+            };
+            let idle = stopped && live_attempts(&paths.state).is_ok_and(|n| n == 0);
+            scope_refreshed(&journal.env, env, idle)
+        }
         _ => worker_env(env),
     };
+    let moved = existing.as_ref().is_some_and(|j| j.env != env);
     let executable = place_binary(&paths, &digest, current_exe)?;
     link_current(&paths, &digest)?;
     publish_exact(
@@ -595,7 +649,7 @@ pub fn install<L: Launcher>(
         &paths.input,
         &serde_json::to_vec(&spec)?,
         0o600,
-        !registered,
+        !registered || moved,
     )?;
     let mut journal = match existing {
         Some(mut journal) => {
@@ -809,6 +863,19 @@ fn status_with<L: Launcher>(
         bridge_binary: fs::symlink_metadata(paths.current_link())
             .ok()
             .and_then(|_| paths.bridge_binary().to_str().map(str::to_owned)),
+        traffic_scope: crate::config::traffic::resolve(&journal.env)
+            .ok()
+            .map(|scope| TrafficScope {
+                state_dir: scope.state_dir,
+                config_file: scope.config_file,
+            }),
+        // Only a worker that may be running waits; what a stopped one left
+        // behind is not its state now.
+        traffic_hold: crate::config::traffic::recorded_hold(
+            &paths.state,
+            crate::platform::wall_ms(),
+        )
+        .filter(|_| loaded != Some(false)),
     })
 }
 
