@@ -358,7 +358,13 @@ mod tests {
         let group = &mut fp.shard_groups[0];
         group.split = true;
         group.shards = vec!["first".into(), "second".into()];
-        group.assignments = vec![vec!["one".into(), "two".into()], vec![]];
+        // Shards may already be named while no test has been assigned yet.
+        group.assignments = vec![vec![], vec![]];
+        let empty = summarize(&fp).unwrap();
+        assert!(empty.shard_groups[0].assigned_test_counts.is_empty());
+        assert!(!render_text(&empty).contains("assigned tests"));
+
+        fp.shard_groups[0].assignments = vec![vec!["one".into(), "two".into()], vec![]];
         let summary = summarize(&fp).unwrap();
         assert_eq!(summary.shard_groups[0].assigned_test_counts, [2, 0]);
         assert!(render_text(&summary)

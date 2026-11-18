@@ -3386,6 +3386,26 @@ mod tests {
     }
 
     #[test]
+    fn discovery_task_ids_require_the_discovery_feature_without_a_version_check() {
+        let digest = dg("shard discovery");
+        let mut task = CiTask {
+            task_id: format!("rtr-discover-{digest}"),
+            plan_digest: dg("plan"),
+            inputs: json!({}),
+            dispatch: None,
+            artifact_workflow: None,
+            verify_shard_version: false,
+        };
+        assert!(is_discovery_task(&task));
+        assert!(requires_discovery_feature(&task));
+        for id in ["ci.yml/test", "rtr-discover-invalid"] {
+            task.task_id = id.into();
+            assert!(!is_discovery_task(&task));
+            assert!(!requires_discovery_feature(&task));
+        }
+    }
+
+    #[test]
     fn a_ci_task_is_part_of_the_payload_hash_and_not_written_when_absent() {
         let base = payload();
         assert!(serde_json::to_value(&base)

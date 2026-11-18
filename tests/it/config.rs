@@ -1299,6 +1299,7 @@ fn captured_shard_policy_names_one_job_and_its_fixture_boundary() {
     assert_eq!(policy_row.allow_retry, Some(true));
     for denied in [
         format!("{header}{policy}{policy}"),
+        format!("{header}{}", policy.replace("'browser'", r#""web\ttests""#)),
         format!("{header}{}", policy.replace("database per attempt", " ")),
         format!(
             "{header}{}",
