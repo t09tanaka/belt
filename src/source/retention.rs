@@ -135,8 +135,23 @@ impl Index {
         }
         .context("initial source guard")?;
         this.prepare_index_file()?;
-        this.connect().context("connect source index")?.execute_batch("PRAGMA synchronous=FULL;
-          CREATE TABLE IF NOT EXISTS root(id TEXT PRIMARY KEY,kind TEXT NOT NULL,source TEXT);
+        this.initialize_schema()
+            .context("initialize source index")?;
+        Ok((this, guard))
+    }
+
+    fn initialize_schema(&self) -> Result<()> {
+        let mut db = self.connect().context("connect source index")?;
+        let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 1 {
+            return Ok(());
+        }
+        ensure!(version == 0, "unknown source index version {version}");
+        // A new index and an unversioned legacy index use the same idempotent
+        // migration. Publish the marker atomically with the tables and rows.
+        db.pragma_update(None, "synchronous", "FULL")?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS root(id TEXT PRIMARY KEY,kind TEXT NOT NULL,source TEXT);
           CREATE INDEX IF NOT EXISTS root_kind ON root(kind,id);
           CREATE INDEX IF NOT EXISTS root_unknown ON root(source,kind,id);
           CREATE TABLE IF NOT EXISTS object(id TEXT PRIMARY KEY,path TEXT NOT NULL);
@@ -154,8 +169,10 @@ impl Index {
           CREATE INDEX IF NOT EXISTS vault_delete_pending ON vault_delete_claim(done,run_id);
           CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-          INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');").context("initialize source index")?;
-        Ok((this, guard))
+          INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');")?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+        Ok(())
     }
     fn prepare_index_file(&self) -> Result<()> {
         use rustix::fs::{statat, AtFlags, FileType, Mode, OFlags, RenameFlags};
@@ -1775,17 +1792,10 @@ mod tests {
         let first = f.store.retention.connect().unwrap();
         first.execute_batch("BEGIN IMMEDIATE").unwrap();
         assert!(probe(&f.store.retention.database).contains("RTR_INDEX_PROBE=BUSY"));
-        // Initializing another connection needs a write too. It may report
-        // BUSY, but its cleanup must not release this process's existing lock.
-        let reopened = Index::open(f.store.root()).unwrap_err();
-        assert!(
-            matches!(
-                reopened.downcast_ref::<rusqlite::Error>(),
-                Some(rusqlite::Error::SqliteFailure(error, _))
-                    if error.code == rusqlite::ErrorCode::DatabaseBusy
-            ),
-            "{reopened:#}"
-        );
+        // The schema is already initialized. Opening it succeeds while the
+        // writer is active and never releases that writer's exclusion.
+        let reopened = Index::open(f.store.root()).unwrap();
+        drop(reopened);
         assert!(!first.is_autocommit());
         let after = probe(&f.store.retention.database);
         assert!(after.contains("RTR_INDEX_PROBE=BUSY"), "{after}");
