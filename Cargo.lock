@@ -1568,6 +1568,7 @@ dependencies = [
  "local-ci",
  "memchr",
  "node-semver",
+ "ratatui",
  "rusqlite",
  "rustix",
  "serde",

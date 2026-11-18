@@ -1833,6 +1833,20 @@ pub(super) fn emit(
     }
 }
 
+type WorkerConnections = BTreeMap<WorkerId, (bool, Option<String>)>;
+
+/// A missing resident leaves the live connection status unknown.
+pub(super) fn observed_connections(
+    spec: &Spec,
+    names: Vec<WorkerId>,
+) -> Result<Option<WorkerConnections>, ApiError> {
+    match resident_request(spec, super::resident::Operation::ListWorkers { names }) {
+        Ok(super::resident::Reply::WorkersListed { observations }) => Ok(Some(observations)),
+        Ok(super::resident::Reply::ControlError { error }) => Err(error),
+        _ => Ok(None),
+    }
+}
+
 /// List registrations even when no resident is running. Only a resident
 /// observation can establish that a worker is connected or disconnected.
 pub fn list_command(json: bool) -> i32 {
@@ -1848,16 +1862,7 @@ pub fn list_command(json: bool) -> i32 {
             None
         } else {
             match super::context::runtime_spec(&env) {
-                Ok(spec) => match resident_request(
-                    &spec,
-                    super::resident::Operation::ListWorkers { names: ids },
-                ) {
-                    Ok(super::resident::Reply::WorkersListed { observations }) => {
-                        Some(observations)
-                    }
-                    Ok(super::resident::Reply::ControlError { error }) => return Err(error),
-                    _ => None,
-                },
+                Ok(spec) => observed_connections(&spec, ids)?,
                 Err(e) if e.code == ErrorCode::NotFound => None,
                 Err(e) => return Err(e),
             }

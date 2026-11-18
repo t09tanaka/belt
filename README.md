@@ -6,6 +6,10 @@ Status: in development. The specification (Japanese) is in [docs/spec.md](docs/s
 
 Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) for per-host resource admission.
 
+## Watch workers and tasks
+
+Run `remote-task-runner top` in a terminal to see worker connections, active attempts, waiting tasks, and attempts whose state is uncertain. The view refreshes every second. Set the period with `--interval 2`, scroll with the arrow keys, and quit with `q`, Esc, or Ctrl-C. Use `remote-task-runner --json top` for one snapshot in a pipeline.
+
 ## Development
 
 The CLI surface is defined, but public orchestration commands remain under development. Unimplemented commands return `NOT_IMPLEMENTED` (exit code 70; with `--json`, an envelope with `schema_version` on stdout).

@@ -232,6 +232,43 @@ fn page<T>(mut items: Vec<T>, n: u32, key: impl Fn(&T) -> String) -> Page<T> {
     };
     Page { items, next_cursor }
 }
+/// Metadata shown by the live queue monitor. No command arguments or environment.
+#[derive(Debug, Serialize)]
+pub(crate) struct MonitorTask {
+    pub task_id: String,
+    pub run_id: String,
+    pub label: Option<String>,
+    pub worker_id: Option<String>,
+    pub state: String,
+    pub observation: Option<String>,
+    pub created_at_ms: u64,
+}
+
+impl CoordinatorStore {
+    pub(crate) fn monitor_tasks(&self) -> Result<Vec<MonitorTask>> {
+        let cancel = self.task_cancel;
+        self.db.call(move |c| {
+            let boundary = current_boundary(c)?;
+            let uncancelled = if cancel { "t.cancel_requested_at_ms IS NULL" } else { "1" };
+            let sql = format!("SELECT t.task_id, t.run_id,
+                coalesce(json_extract(t.spec_json,'$.ci.task.task_id'), json_extract(t.spec_json,'$.commands[0].node_id')),
+                a.worker_id, coalesce(a.state, CASE WHEN json_extract(t.spec_json,'$.ci.hold') THEN 'held' ELSE 'queued' END),
+                a.observation, t.created_at_ms
+                FROM task t JOIN run r ON r.run_id=t.run_id
+                LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa
+                    WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1)
+                WHERE a.state <> 'terminal' OR (a.attempt_id IS NULL AND r.closed_at_ms IS NULL AND {uncancelled})
+                ORDER BY t.created_at_ms, t.task_id");
+            let mut query = c.prepare(&sql)?;
+            let rows = query.query_map([], |r| Ok(MonitorTask {
+                task_id: r.get(0)?, run_id: r.get(1)?, label: r.get(2)?, worker_id: r.get(3)?,
+                state: r.get(4)?, observation: r.get(5)?, created_at_ms: r.get(6)?,
+            }))?;
+            Ok(rows.collect::<rusqlite::Result<_>>()?)
+        })
+    }
+}
+
 impl CoordinatorStore {
     /// Read only bounded collection status, never result_json or logs_json.
     pub fn query_collection_metadata(
