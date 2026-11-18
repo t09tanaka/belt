@@ -481,19 +481,18 @@ fn is_controller_line(line: &str) -> bool {
     line.starts_with(CONTROLLER_PREFIX)
 }
 
-/// Whether the finished lines of `b`, a step's log read from the start of a
-/// line, hold one that is the command's own: a line that is not blank and not
-/// task-traffic-controller's. A line without its newline yet is left out, as
-/// task-traffic-controller may write a line and its newline apart: the start
-/// of the next read would be a bare newline, and the rest of a line is not
-/// its prefix.
+/// Whether `b`, a step's log read from the start of a line, holds output of the
+/// command's own: a line that is not task-traffic-controller's. The line not
+/// finished yet counts too, unless it is, or may still become, one of
+/// task-traffic-controller's: it writes a line and its newline apart, so a
+/// read may end between them. The caller reads that line again from its
+/// start, so the next read never begins with the bare newline.
 fn command_spoke(b: &[u8]) -> bool {
-    let Some(end) = b.iter().rposition(|&c| c == b'\n') else {
-        return false;
-    };
-    String::from_utf8_lossy(&b[..end])
-        .lines()
-        .any(|l| !l.trim().is_empty() && !is_controller_line(l))
+    let text = String::from_utf8_lossy(b);
+    let mut lines = text.split('\n');
+    let rest = lines.next_back().unwrap_or_default();
+    lines.any(|l| !is_controller_line(l))
+        || !rest.is_empty() && !is_controller_line(rest) && !CONTROLLER_PREFIX.starts_with(rest)
 }
 
 /// Its ledger lock timing out, so the command never ran.
@@ -4804,17 +4803,21 @@ mod tests {
     }
 
     #[test]
-    fn only_a_finished_line_of_the_commands_own_starts_its_clock() {
+    fn only_the_commands_own_output_starts_its_clock() {
         let p = "task-traffic-controller: waiting 0:08 (queue)";
-        // the newline written apart from its line, a blank line
-        assert!(!command_spoke(b"\n"));
-        assert!(!command_spoke(format!("\n{p}\n").as_bytes()));
-        assert!(!command_spoke(b"  \n\n"));
-        // a line not finished yet waits for its end
-        assert!(!command_spoke(b"hello"));
-        assert!(!command_spoke(format!("{p}\nhel").as_bytes()));
+        assert!(!command_spoke(b""));
+        assert!(!command_spoke(format!("{p}\n{p}\n").as_bytes()));
+        // a line of the controller's not finished yet, or its prefix so far
+        assert!(!command_spoke(p.as_bytes()));
+        assert!(!command_spoke(format!("{p}\ntask-traffic").as_bytes()));
+        assert!(!command_spoke(format!("{p}\n{p}").as_bytes()));
+        // the command's own, finished or not: a progress line with no newline
+        // counts, and so does a blank line
         assert!(command_spoke(format!("{p}\nhello\n").as_bytes()));
-        assert!(command_spoke(b"hello\nwor"));
+        assert!(command_spoke(b"building..."));
+        assert!(command_spoke(format!("{p}\n50%\r").as_bytes()));
+        assert!(command_spoke(b"\n"));
+        assert!(command_spoke(format!("{p}\n\n{p}\n").as_bytes()));
     }
 
     #[test]

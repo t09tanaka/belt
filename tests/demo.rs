@@ -587,15 +587,14 @@ jobs:
 "#,
     );
     // A task-traffic-controller that waits 8 seconds, writing each "waiting" line
-    // and its newline apart (as `eprintln!` may), and a blank line: neither
-    // the newline nor the blank line is the command's output.
+    // and its newline apart (as `eprintln!` may): the newline that comes later
+    // is not the command's output.
     let bin = d.home.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let fake = bin.join("task-traffic-controller");
     std::fs::write(
         &fake,
         "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\n\
-         echo >&2\n\
          for i in 1 2 3 4 5 6 7 8; do\n\
          printf 'task-traffic-controller: waiting 0:0%s (queue)' \"$i\" >&2\n\
          sleep 0.5\n\
