@@ -5065,7 +5065,7 @@ jobs:
         )
         .await;
         let pass = ci_advance(&fx, &c);
-        assert_eq!(pass.joined, [group.clone()]);
+        assert_eq!(pass.joined.as_slice(), std::slice::from_ref(&group));
         let next = ci_task_of(&plan, "report");
         assert_eq!(pass.released, [ids[&next].clone()]);
         let last = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
