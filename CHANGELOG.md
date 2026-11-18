@@ -2,7 +2,10 @@
 
 ## [Unreleased]
 
+## [0.18.3] - 2026-11-18
+
 - Fix a step's clock starting while it still waited for task-traffic-controller, so that a step that runs for seconds timed out with only the controller's "waiting" lines in its log (`timed out after 599s (what was left of the job's 10 min)`). The log was read up to its end, and task-traffic-controller writes a line and its newline apart: a read that came between them left a bare newline for the next one, and that blank line was taken for the command's output. A line is now read again from its start until it is finished, and a line not finished yet is the command's output unless it is, or may still become, one of task-traffic-controller's (so a progress line with no newline still starts the clock). A job's `timeout-minutes` still counts only the running of its setup and steps, as since 0.17.2.
+- For distributed step executors (library API, additive): an optional synchronous artifact action hook, whose default still uses the local artifact store; per-test shard timings kept in receipts; and a check of the runner's version at the shard step before dispatch. `local-ci run` is unchanged.
 
 ## [0.18.2] - 2026-11-17
 
