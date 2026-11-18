@@ -391,6 +391,63 @@ mod tests {
     }
 
     #[test]
+    fn placement_reports_the_first_required_ci_feature_the_worker_lacks() {
+        use crate::coordinator::tests::Silent;
+        use crate::wire::{
+            CI_DISCOVERY_FEATURE, CI_TASK_FEATURE, MATRIX_DISPATCH_FEATURE,
+            WORKFLOW_ARTIFACTS_FEATURE,
+        };
+
+        // Base CI support precedes discovery, matrix dispatch, and artifacts
+        // when more than one required feature is absent from the worker.
+        let features = [
+            CI_TASK_FEATURE,
+            CI_DISCOVERY_FEATURE,
+            MATRIX_DISPATCH_FEATURE,
+            WORKFLOW_ARTIFACTS_FEATURE,
+        ];
+        let subsets = |features: &[&'static str]| -> Vec<Vec<&'static str>> {
+            (0..1usize << features.len())
+                .map(|mask| {
+                    features
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, feature)| {
+                            (mask & (1 << index) != 0).then_some(*feature)
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let optional_requirements = subsets(&features[1..]);
+        for negotiated in subsets(&features) {
+            let link = Silent::with_features(negotiated);
+            assert_eq!(unmet_ci(&task_spec(false), &link), None);
+            for optional in &optional_requirements {
+                let mut spec = task_spec(true);
+                let task = &mut spec.ci.as_mut().unwrap().task;
+                task.verify_shard_version = optional.contains(&CI_DISCOVERY_FEATURE);
+                task.dispatch = optional
+                    .contains(&MATRIX_DISPATCH_FEATURE)
+                    .then(|| serde_json::json!({}));
+                task.artifact_workflow = optional
+                    .contains(&WORKFLOW_ARTIFACTS_FEATURE)
+                    .then(|| "ci.yml".into());
+                let expected = std::iter::once(&CI_TASK_FEATURE)
+                    .chain(optional)
+                    .find(|feature| !link.features.contains(feature))
+                    .map(|feature| format!("protocol feature {feature}"));
+                assert_eq!(
+                    unmet_ci(&spec, &link),
+                    expected.as_deref(),
+                    "optional {optional:?}, negotiated {:?}",
+                    link.features
+                );
+            }
+        }
+    }
+
+    #[test]
     fn a_version_bound_shard_requires_the_discovery_protocol_on_its_execution_worker() {
         let mut spec = task_spec(true);
         assert_eq!(missing_ci_feature(&spec, true, false), None);

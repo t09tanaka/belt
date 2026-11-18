@@ -8,11 +8,39 @@ use std::sync::atomic::AtomicUsize;
 
 /// A worker that counts what it is sent and answers nothing.
 #[derive(Default)]
-struct Silent {
+pub(super) struct Silent {
     calls: AtomicUsize,
+    pub(super) features: Vec<&'static str>,
+}
+
+impl Silent {
+    pub(super) fn with_features(features: Vec<&'static str>) -> Self {
+        Self {
+            features,
+            ..Self::default()
+        }
+    }
 }
 
 impl WorkerLink for Silent {
+    fn ci_task_negotiated(&self) -> bool {
+        self.features.contains(&crate::wire::CI_TASK_FEATURE)
+    }
+
+    fn ci_discovery_negotiated(&self) -> bool {
+        self.features.contains(&crate::wire::CI_DISCOVERY_FEATURE)
+    }
+
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.features
+            .contains(&crate::wire::MATRIX_DISPATCH_FEATURE)
+    }
+
+    fn workflow_artifacts_negotiated(&self) -> bool {
+        self.features
+            .contains(&crate::wire::WORKFLOW_ARTIFACTS_FEATURE)
+    }
+
     fn call(&self, _request: Request) -> LinkFuture<'_> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Err(LinkError::Unconfirmed) })
