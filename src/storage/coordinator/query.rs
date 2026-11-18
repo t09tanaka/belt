@@ -258,7 +258,13 @@ fn executable(argv: &[String]) -> Option<String> {
         let mut args = argv[2..].iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--" => return args.next().and_then(|name| basename(name)).or(Some(outer)),
+                "--" => {
+                    return args
+                        .next()
+                        .and_then(|name| basename(name))
+                        .map(|name| format!("{name} [portool]"))
+                        .or(Some(outer))
+                }
                 "-e" | "--env-file" => {
                     args.next();
                 }
@@ -272,6 +278,41 @@ fn executable(argv: &[String]) -> Option<String> {
         }
     }
     Some(outer)
+}
+
+#[cfg(test)]
+mod monitor_command_tests {
+    use super::executable;
+
+    #[test]
+    fn recognizes_only_a_leading_portool_exec_with_a_command() {
+        for (args, expected) in [
+            (
+                vec!["/usr/bin/echo", "portool", "exec", "--", "secret"],
+                "echo",
+            ),
+            (vec!["portool", "check"], "portool"),
+            (vec!["portool", "exec", "--strict", "--"], "portool"),
+            (
+                vec![
+                    "portool",
+                    "exec",
+                    "--env-file=a",
+                    "-eb",
+                    "--env-file-overrides",
+                    "--",
+                    "/bin/cat",
+                    "secret",
+                ],
+                "cat [portool]",
+            ),
+        ] {
+            assert_eq!(
+                executable(&args.into_iter().map(String::from).collect::<Vec<_>>()).as_deref(),
+                Some(expected)
+            );
+        }
+    }
 }
 
 impl CoordinatorStore {

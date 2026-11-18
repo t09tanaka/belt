@@ -8,7 +8,7 @@ Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and 
 
 ## Watch workers and tasks
 
-Run `remote-task-runner top` in a terminal to see worker connections, active attempts, waiting tasks, and attempts whose state is uncertain. The view refreshes every second. Set the period with `--interval 2`, scroll with the arrow keys, and quit with `q`, Esc, or Ctrl-C. Use `remote-task-runner --json top` for one snapshot in a pipeline.
+Run `remote-task-runner top` in a terminal to see worker connections, active attempts, waiting tasks, and attempts whose state is uncertain. Task details show the executable name. Commands wrapped in `portool exec` show the inner executable followed by `[portool]`. The view refreshes every second. Set the period with `--interval 2`, scroll with the arrow keys, and quit with `q`, Esc, or Ctrl-C. Use `remote-task-runner --json top` for one snapshot in a pipeline.
 
 ## Development
 

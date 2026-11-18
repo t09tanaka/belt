@@ -138,9 +138,9 @@ fn lines(s: &Snapshot) -> Vec<Line<'static>> {
             )));
             out.push(Line::from(format!(
                 "    {}  {}  {}",
+                plain(row.command.as_deref().unwrap_or("")),
                 plain(&row.run_id),
-                plain(row.label.as_deref().unwrap_or("")),
-                plain(row.command.as_deref().unwrap_or(""))
+                plain(row.label.as_deref().unwrap_or(""))
             )));
         }
     }
@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(tasks[0].task_id, queued.as_str());
         assert_eq!(tasks[0].label.as_deref(), Some("main"));
         assert_eq!(tasks[0].state, "queued");
-        assert_eq!(tasks[0].command.as_deref(), Some("echo"));
+        assert_eq!(tasks[0].command.as_deref(), Some("echo [portool]"));
         assert_eq!(tasks[1].state, "held");
         assert_eq!(tasks[1].label.as_deref(), Some("ci.yml/test"));
         assert!(!serde_json::to_string(&tasks)
