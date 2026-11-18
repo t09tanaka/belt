@@ -1677,13 +1677,14 @@ mod tests {
             version: "cargo 1.90.0 (example build)".into(),
             ..Default::default()
         };
+        let ctx = ExecContext::new(Default::default());
         let guarded = guard_version(&info, "printf 'ran-tests'".into()).unwrap();
         let run = |actual: &str, status: i32| {
             let script = format!(
                 r#"cargo() {{ printf '%s' "$STUB_VERSION"; return {status}; }}
 {guarded}"#
             );
-            std::process::Command::new("sh")
+            ctx.command("/bin/sh")
                 .args(["-c", &script])
                 .env("STUB_VERSION", actual)
                 .output()
@@ -1706,7 +1707,8 @@ mod tests {
             ..info
         };
         let script = guard_version(&quoted, "printf ran".into()).unwrap();
-        let mismatch = std::process::Command::new("sh")
+        let mismatch = ctx
+            .command("/bin/sh")
             .args(["-c", &format!("cargo() {{ echo v2; }}\n{script}")])
             .output()
             .unwrap();
