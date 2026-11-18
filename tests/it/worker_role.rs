@@ -359,7 +359,8 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     std::fs::write(&release, "finish").unwrap();
 
     tokio::time::timeout(T, async {
-        while !side_effect.exists() {
+        // The shell creates the file before printf appends the effect.
+        while !std::fs::metadata(&side_effect).is_ok_and(|file| file.len() > 0) {
             tokio::time::sleep(Duration::from_millis(30)).await;
         }
     })
