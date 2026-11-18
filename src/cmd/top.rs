@@ -21,10 +21,12 @@ use ratatui::widgets::{Block, Paragraph};
 use ratatui::Frame;
 use task_traffic_controller::admit::{self, Decision, Limits, LiveSnapshot, Reason, State};
 use task_traffic_controller::config::Config;
-use task_traffic_controller::display::{fmt_bytes, fmt_duration, is_idle, running_for, truncate};
+use task_traffic_controller::display::{fmt_bytes, fmt_duration, is_idle, running_for};
 use task_traffic_controller::error::{Error, Result};
 use task_traffic_controller::ledger::{Entry, Ledger};
 use task_traffic_controller::{eta, exec, gitctx, key, lock, managed, Context};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 /// One running entry's share of the cores bar.
 #[derive(Debug, Clone, PartialEq)]
@@ -554,21 +556,42 @@ fn worktrees_of(table: &[&Entry], me: Option<&str>) -> Vec<Wt> {
     result
 }
 
-/// `s` cut to `max` characters with the middle replaced by `…`.
-fn ellipsize_middle(s: &str, max: usize) -> String {
-    let n = s.chars().count();
-    if n <= max {
-        return s.to_string();
+/// Number of UTF-8 bytes occupied by whole graphemes fitting in the cell budget.
+fn fitting_bytes<'a>(clusters: impl Iterator<Item = &'a str>, mut cells: usize) -> usize {
+    let mut bytes = 0;
+    for cluster in clusters {
+        let width = cluster.width();
+        if width > cells {
+            break;
+        }
+        cells -= width;
+        bytes += cluster.len();
     }
-    if max <= 1 {
-        return "…".repeat(max);
+    bytes
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_owned();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let end = fitting_bytes(s.graphemes(true), max - 1);
+    format!("{}…", &s[..end])
+}
+
+fn ellipsize_middle(s: &str, max: usize) -> String {
+    if s.width() <= max {
+        return s.to_owned();
+    }
+    if max == 0 {
+        return String::new();
     }
     let keep = max - 1;
-    let head = keep.div_ceil(2);
-    let tail = keep - head;
-    let h: String = s.chars().take(head).collect();
-    let t: String = s.chars().skip(n - tail).collect();
-    format!("{h}…{t}")
+    let head = fitting_bytes(s.graphemes(true), keep.div_ceil(2));
+    let tail = fitting_bytes(s.graphemes(true).rev(), keep - s[..head].width());
+    format!("{}…{}", &s[..head], &s[s.len() - tail..])
 }
 
 // ------------------------------------------------------------ the bar
@@ -798,14 +821,14 @@ fn worktree_text(w: Option<&Wt>, max: usize) -> String {
         w.branch.clone()
     };
     let suffix = if w.mine { " (current)" } else { "" };
-    let room = max.saturating_sub(suffix.chars().count()).max(4);
+    let room = max.saturating_sub(suffix.width()).max(4);
     format!("{}{suffix}", ellipsize_middle(&branch, room))
 }
 
 /// The job name cut so that its flags fit in `width`: (name, flags).
 fn job_parts(job: &str, flags: &[&str], width: usize) -> (String, String) {
     let tail: String = flags.iter().map(|f| format!(" {f}")).collect();
-    let tail_w = tail.chars().count();
+    let tail_w = tail.width();
     if tail_w + 4 > width {
         return (truncate(job, width), String::new());
     }
@@ -1036,7 +1059,7 @@ fn bar_line(v: &View, width: u16) -> Line<'static> {
         let c = band_color(v, s.wt);
         let cells = s.slots as usize * w;
         let num: String = format!("#{}", s.num).chars().take(cells).collect();
-        let n = num.chars().count();
+        let n = num.width();
         spans.push(Span::styled(
             num,
             Style::new()
@@ -1059,10 +1082,10 @@ fn col(s: &str, w: usize) -> String {
     format!("{} ", fit(s, w))
 }
 
-/// Pad or cut `s` to exactly `w` characters.
+/// Pad or cut `s` to exactly `w` terminal cells.
 fn fit(s: &str, w: usize) -> String {
     let t = truncate(s, w);
-    let n = t.chars().count();
+    let n = t.width();
     format!("{t}{}", " ".repeat(w - n))
 }
 
@@ -1071,18 +1094,18 @@ fn table_wants(v: &View, rows: &[TableRow], prefix: usize) -> Wants {
     let widest = |len: &dyn Fn(&TableRow) -> usize| rows.iter().map(len).max().unwrap_or(0);
     let wt_text = |r: &TableRow| {
         let wt = r.wt.and_then(|i| v.worktrees.get(i));
-        worktree_text(wt, usize::MAX).chars().count()
+        worktree_text(wt, usize::MAX).width()
     };
     let job = |r: &TableRow, short: bool| {
-        r.job.chars().count()
+        r.job.width()
             + r.flags
                 .iter()
-                .map(|f| 1 + if short { f.1 } else { f.0 }.len())
+                .map(|f| 1 + if short { f.1 } else { f.0 }.width())
                 .sum::<usize>()
     };
     Wants {
         prefix,
-        project: widest(&|r| r.project.chars().count()),
+        project: widest(&|r| r.project.width()),
         worktree: widest(&wt_text).max("worktree".len()),
         job: widest(&|r| job(r, false)),
         job_short_flags: widest(&|r| job(r, true)),
@@ -1091,8 +1114,8 @@ fn table_wants(v: &View, rows: &[TableRow], prefix: usize) -> Wants {
         } else {
             0
         },
-        right: widest(&|r| r.right.chars().count()),
-        right_short: widest(&|r| r.right_short.chars().count()),
+        right: widest(&|r| r.right.width()),
+        right_short: widest(&|r| r.right_short.width()),
     }
 }
 
@@ -1158,7 +1181,7 @@ fn draw_queue(f: &mut Frame, area: Rect, v: &View) {
         let shown = &r.flags;
         let flag_strs: Vec<&str> = shown.iter().map(flag_text).collect();
         let (name, flags) = job_parts(&r.job, &flag_strs, cols.job);
-        let used = name.chars().count() + flags.chars().count();
+        let used = name.width() + flags.width();
         spans.push(Span::styled(name, text));
         for flag in shown {
             if flags.contains(flag_text(flag)) {
@@ -1920,7 +1943,7 @@ mod tests {
         assert_eq!(ellipsize_middle("abcdef", 2), "a…");
         assert_eq!(ellipsize_middle("abcdef", 1), "…");
         assert_eq!(ellipsize_middle("abcdef", 0), "");
-        assert_eq!(ellipsize_middle("日本語のブランチ名", 5), "日本…チ名");
+        assert_eq!(ellipsize_middle("日本語のブランチ名", 5), "日…名");
     }
 
     #[test]
@@ -2193,6 +2216,22 @@ mod tests {
     }
 
     #[test]
+    fn japanese_project_and_job_keep_the_bar_aligned() {
+        let mut v = sample_view(Utc::now());
+        v.plain = true;
+        v.running[0].project = "試験プロジェクト".into();
+        v.running[0].job = "日本語ビルドとテスト [portool]".into();
+        for w in [80, 120, 170] {
+            let cells = bar_row(&v, w, 0);
+            assert_eq!(cells[0].symbol(), "█", "bar start at width {w}");
+        }
+        assert_eq!(fit("日a", 4), "日a ");
+        assert_eq!(fit("あいう", 4), "あ… ");
+        assert_eq!(truncate("e\u{301}日本語", 4), "e\u{301}日…");
+        assert_eq!(truncate("日本", 0), "");
+    }
+
+    #[test]
     fn without_color_the_bar_uses_block_characters() {
         let mut v = sample_view(Utc::now());
         assert!(!v.plain);
@@ -2217,7 +2256,7 @@ mod tests {
         let (mut full_project, mut full_wt, mut full_job) = (false, false, false);
         for w in 60u16..180 {
             let c = layout(w as usize - 2, table_wants(&v, &rows, 4));
-            full_project |= c.project == longest(&|r| r.project.chars().count());
+            full_project |= c.project == longest(&|r| r.project.width());
             full_wt |= c.worktree == "main (current)".len();
             full_job |= c.job == table_wants(&v, &rows, 4).job.min(JOB_SQUEEZED);
             let t = render(&v, w, 16);
