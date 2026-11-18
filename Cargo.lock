@@ -1622,6 +1622,8 @@ dependencies = [
  "sysinfo",
  "tempfile",
  "toml",
+ "unicode-segmentation",
+ "unicode-width",
  "uuid",
 ]
 
