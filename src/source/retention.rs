@@ -1773,6 +1773,31 @@ mod tests {
         }
     }
     #[test]
+    fn unversioned_source_indexes_keep_existing_registration_data_on_upgrade() {
+        let f = Fixture::new();
+        let db = f.store.retention.connect().unwrap();
+        db.execute(
+            "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 0).unwrap();
+        Index::open(f.store.root()).unwrap();
+        let version: u32 = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let registration: String = db
+            .query_row(
+                "SELECT value FROM meta WHERE key='legacy_registration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registration, "done");
+    }
+
+    #[test]
     fn opening_another_index_preserves_live_sqlite_writer_exclusion() {
         fn probe(path: &Path) -> String {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
