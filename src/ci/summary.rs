@@ -343,6 +343,28 @@ mod tests {
         summary.shard_groups[0].split = true;
         assert_eq!(render_text(&summary), format!("{head}{list}{rest}"));
     }
+    #[test]
+    fn discovery_summary_changes_after_the_worker_partitions_tests() {
+        let path = ".github/workflows/test.yml";
+        let yaml = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+        let mut fp = plan(&[(path, yaml)]);
+        let summary = summarize(&fp).unwrap();
+        let group = &summary.shard_groups[0];
+        assert!(group.discovery_candidate);
+        assert!(render_text(&summary).contains(&format!(
+            "task {} can be partitioned after worker discovery",
+            group.id
+        )));
+        let group = &mut fp.shard_groups[0];
+        group.split = true;
+        group.shards = vec!["first".into(), "second".into()];
+        group.assignments = vec![vec!["one".into(), "two".into()], vec![]];
+        let summary = summarize(&fp).unwrap();
+        assert_eq!(summary.shard_groups[0].assigned_test_counts, [2, 0]);
+        assert!(render_text(&summary)
+            .contains("shard first has 2 assigned tests\nshard second has 0 assigned tests"));
+    }
+
     use local_ci::frozen::{DisabledRecord, Filters, FrozenConfig, PlanParts, SourceRef};
 
     fn plan(workflows: &[(&str, &str)]) -> FrozenPlan {

@@ -391,6 +391,47 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_and_artifact_tasks_require_their_negotiated_features() {
+        struct Features {
+            matrix: bool,
+            artifacts: bool,
+        }
+        impl crate::coordinator::WorkerLink for Features {
+            fn ci_task_negotiated(&self) -> bool {
+                true
+            }
+            fn matrix_dispatch_negotiated(&self) -> bool {
+                self.matrix
+            }
+            fn workflow_artifacts_negotiated(&self) -> bool {
+                self.artifacts
+            }
+            fn call(&self, _: crate::wire::Request) -> crate::coordinator::link::LinkFuture<'_> {
+                unreachable!("placement checks only negotiated features")
+            }
+        }
+        let mut spec = task_spec(true);
+        let task = &mut spec.ci.as_mut().unwrap().task;
+        task.dispatch = Some(serde_json::json!({}));
+        task.artifact_workflow = Some("test.yml".into());
+        let mut link = Features {
+            matrix: false,
+            artifacts: false,
+        };
+        assert_eq!(
+            unmet_ci(&spec, &link),
+            Some("protocol feature ci_matrix_dispatch_v1")
+        );
+        link.matrix = true;
+        assert_eq!(
+            unmet_ci(&spec, &link),
+            Some("protocol feature ci_workflow_artifacts_v1")
+        );
+        link.artifacts = true;
+        assert_eq!(unmet_ci(&spec, &link), None);
+    }
+
+    #[test]
     fn a_version_bound_shard_requires_the_discovery_protocol_on_its_execution_worker() {
         let mut spec = task_spec(true);
         assert_eq!(missing_ci_feature(&spec, true, false), None);
