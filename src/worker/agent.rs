@@ -2124,7 +2124,7 @@ impl Agent {
                     agent_epoch: self.epoch,
                     forecast_ttl_ms: self.cfg.forecast_ttl_ms,
                 };
-                crate::forecast::answer_command(
+                crate::forecast::answer_worker_command(
                     &self.cfg.traffic_state_dir,
                     self.cfg.traffic_config.as_deref(),
                     &self.cfg.state_dir,
@@ -2133,7 +2133,10 @@ impl Agent {
                         .as_ref()
                         .map(|_| &self.cfg.profile_fingerprint),
                     &ident,
-                    &attempts,
+                    crate::forecast::AcceptedWork {
+                        attempts: &attempts,
+                        installs: &|payload| self.pending_tool_installs(payload),
+                    },
                     max_epoch,
                     &r,
                 )
@@ -2729,15 +2732,40 @@ impl Agent {
             agent_epoch: self.epoch,
             forecast_ttl_ms: self.cfg.forecast_ttl_ms,
         };
-        crate::forecast::answer(
+        crate::forecast::answer_worker(
             &self.cfg.traffic_state_dir,
             self.cfg.traffic_config.as_deref(),
             &self.cfg.state_dir,
             &ident,
-            &attempts,
+            crate::forecast::AcceptedWork {
+                attempts: &attempts,
+                installs: &|payload| self.pending_tool_installs(payload),
+            },
             max_epoch,
             &r,
         )
+    }
+
+    /// How many of an accepted attempt's tools are not installed yet (read
+    /// only: the same detect admission uses). A tool whose state cannot be
+    /// read counts as waiting; an attempt that needs no tool, or a worker with
+    /// no registry, counts as none (admission blocks the latter).
+    fn pending_tool_installs(&self, payload: &AttemptPayload) -> usize {
+        let (Some(bundle), Some(registry)) = (&payload.toolchains, &self.toolchains) else {
+            return 0;
+        };
+        let Ok(requests) = self.toolchain_requests(bundle) else {
+            return 0;
+        };
+        requests
+            .iter()
+            .filter(|r| {
+                !matches!(
+                    registry.detect(r),
+                    Ok(crate::toolchain::adapters::Availability::Installed(_))
+                )
+            })
+            .count()
     }
 
     fn capabilities_with_diagnostic(
