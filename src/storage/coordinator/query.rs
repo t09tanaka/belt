@@ -238,10 +238,40 @@ pub(crate) struct MonitorTask {
     pub task_id: String,
     pub run_id: String,
     pub label: Option<String>,
+    pub command: Option<String>,
     pub worker_id: Option<String>,
     pub state: String,
     pub observation: Option<String>,
     pub created_at_ms: u64,
+}
+
+// Keep argument values and local directory names out of monitor output.
+fn executable(argv: &[String]) -> Option<String> {
+    fn basename(value: &str) -> Option<String> {
+        std::path::Path::new(value)
+            .file_name()?
+            .to_str()
+            .map(str::to_owned)
+    }
+    let outer = basename(argv.first()?)?;
+    if outer == "portool" && argv.get(1).is_some_and(|arg| arg == "exec") {
+        let mut args = argv[2..].iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--" => return args.next().and_then(|name| basename(name)).or(Some(outer)),
+                "-e" | "--env-file" => {
+                    args.next();
+                }
+                "--check-ports"
+                | "--strict"
+                | "--reallocate-on-conflict"
+                | "--env-file-overrides" => {}
+                value if value.starts_with("--env-file=") || value.starts_with("-e") => {}
+                _ => break,
+            }
+        }
+    }
+    Some(outer)
 }
 
 impl CoordinatorStore {
@@ -253,22 +283,24 @@ impl CoordinatorStore {
             let sql = format!("SELECT t.task_id, t.run_id,
                 coalesce(json_extract(t.spec_json,'$.ci.task.task_id'), json_extract(t.spec_json,'$.commands[0].node_id')),
                 a.worker_id, coalesce(a.state, CASE WHEN json_extract(t.spec_json,'$.ci.hold') THEN 'held' ELSE 'queued' END),
-                a.observation, t.created_at_ms
+                a.observation, t.created_at_ms, json_extract(t.spec_json,'$.commands[0].argv')
                 FROM task t JOIN run r ON r.run_id=t.run_id
                 LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa
                     WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1)
                 WHERE a.state <> 'terminal' OR (a.attempt_id IS NULL AND r.closed_at_ms IS NULL AND {uncancelled})
                 ORDER BY t.created_at_ms, t.task_id");
             let mut query = c.prepare(&sql)?;
-            let rows = query.query_map([], |r| Ok((MonitorTask {
-                task_id: r.get(0)?, run_id: r.get(1)?, label: r.get(2)?, worker_id: r.get(3)?,
-                state: r.get(4)?, observation: r.get(5)?, created_at_ms: 0,
-            }, r.get::<_, i64>(6)?)))?;
-            rows.map(|row| {
-                let (mut task, created) = row?;
-                task.created_at_ms = to_u64(created)?;
-                Ok(task)
-            }).collect()
+            let mut rows = query.query([])?;
+            let mut tasks = Vec::new();
+            while let Some(row) = rows.next()? {
+                let argv: Option<String> = row.get(7)?;
+                let command = argv.as_deref().and_then(|json| serde_json::from_str::<Vec<String>>(json).ok()).and_then(|argv| executable(&argv));
+                tasks.push(MonitorTask {
+                    task_id: row.get(0)?, run_id: row.get(1)?, label: row.get(2)?, worker_id: row.get(3)?,
+                    state: row.get(4)?, observation: row.get(5)?, created_at_ms: to_u64(row.get(6)?)?, command,
+                });
+            }
+            Ok(tasks)
         })
     }
 }

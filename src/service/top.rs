@@ -137,9 +137,10 @@ fn lines(s: &Snapshot) -> Vec<Line<'static>> {
                 plain(row.worker_id.as_deref().unwrap_or("unplaced"))
             )));
             out.push(Line::from(format!(
-                "    {}  {}",
+                "    {}  {}  {}",
                 plain(&row.run_id),
-                plain(row.label.as_deref().unwrap_or(""))
+                plain(row.label.as_deref().unwrap_or("")),
+                plain(row.command.as_deref().unwrap_or(""))
             )));
         }
     }
@@ -315,7 +316,7 @@ mod tests {
             .create_task(
                 &queued,
                 &run,
-                &json!({"commands":[{"node_id":"main","argv":["never-show-this"]}]}),
+                &json!({"commands":[{"node_id":"main","argv":["/usr/bin/portool","exec","-e","never-show-this","--strict","--","/bin/echo","never-show-this"]}]}),
                 2,
             )
             .unwrap();
@@ -333,6 +334,7 @@ mod tests {
         assert_eq!(tasks[0].task_id, queued.as_str());
         assert_eq!(tasks[0].label.as_deref(), Some("main"));
         assert_eq!(tasks[0].state, "queued");
+        assert_eq!(tasks[0].command.as_deref(), Some("echo"));
         assert_eq!(tasks[1].state, "held");
         assert_eq!(tasks[1].label.as_deref(), Some("ci.yml/test"));
         assert!(!serde_json::to_string(&tasks)
@@ -347,6 +349,7 @@ mod tests {
         let mut task = MonitorTask {
             task_id: "task".into(),
             run_id: "run".into(),
+            command: None,
             label: Some("label\n\x1b[2J".into()),
             worker_id: Some("local".into()),
             state: "active".into(),
