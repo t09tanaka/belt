@@ -451,10 +451,11 @@ fn removing_an_attempt_releases_only_its_portool_allocation() {
         return;
     }
     f.commit(".portool.toml", "[ports]\nweb = 0\n");
-    f.commit(".fast-worktree.toml", "[[post_add]]\nrun = \"portool sync --quiet && portool check\"\n[[pre_remove]]\nrun = \"portool release\"\n");
+    // The release hook is part of the uncommitted snapshot used at admission.
+    std::fs::write(f.dir.join(".fast-worktree.toml"), "[[post_add]]\nrun = \"portool sync --quiet && portool check\"\n[[pre_remove]]\nrun = \"portool release\"\n").unwrap();
     assert!(allocations().is_empty());
     let store = f.store();
-    let manifest = f.capture_commit(&store, "HEAD");
+    let manifest = dirty_capture(&f, &store);
     let fw: Arc<dyn FastWorktree> = Arc::new(CliFastWorktree::new(f.env()));
     let ws = f.workspaces(&fw);
     let repo = f.clone_of(&ws);

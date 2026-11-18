@@ -43,6 +43,10 @@ use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+// Git removes this private per-worktree ref with the worktree registration.
+// It keeps the admission snapshot reachable even after reproducing the original HEAD.
+const CLEANUP_COMMIT: &str = "refs/worktree/rtr-cleanup";
+
 /// What kind of workspace this is, and so how it goes away.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -471,6 +475,13 @@ impl Workspaces {
         m: &CiManifest,
         commit: &str,
     ) -> Result<(bool, Vec<String>), ApiError> {
+        git::run_in_worktree(
+            &self.env,
+            dest,
+            &self.workspaces_root(),
+            &["update-ref", CLEANUP_COMMIT, commit],
+        )
+        .map_err(internal)?;
         let Some(head) = m.original_head.as_deref() else {
             return Ok((
                 false,
@@ -592,12 +603,7 @@ impl Workspaces {
     /// workspaces root and, for a worktree, the clone and branch the ones
     /// `create` makes.
     ///
-    /// The clone's `pre_remove` hook is read by `fast-worktree` from the
-    /// clone's main checkout, which is at whichever commit the last add moved
-    /// it to, not necessarily this attempt's. Aligning it would make every
-    /// removal exclusive (serialized with all adds and removals of the
-    /// repository, and flipping the checkout under adds in flight), so it is
-    /// not done: a project's `pre_remove` hooks must not depend on the commit.
+    /// fast-worktree reads the removal hooks from the attempt checkout.
     pub fn remove(&self, ws: &Workspace) -> Result<(), ApiError> {
         if ws.kind == WorkspaceKind::InPlace {
             return Ok(());
@@ -679,14 +685,17 @@ impl Workspaces {
     /// the clone), checking that Git succeeded.
     fn clean_worktree(&self, dir: &Path) -> bool {
         let ceiling = self.workspaces_root();
-        ["reset", "clean"].iter().all(|c| {
-            let args: &[&str] = if *c == "reset" {
-                &["reset", "-q", "--hard"]
-            } else {
-                &["clean", "-q", "-fd"]
-            };
-            git::run_in_worktree(&self.env, dir, &ceiling, args).is_ok()
-        })
+        let git = |args: &[&str]| git::run_in_worktree(&self.env, dir, &ceiling, args);
+        if let Ok(commit) = git(&["rev-parse", "--verify", "--quiet", CLEANUP_COMMIT]) {
+            // The running command may have switched branches. Detach before
+            // the reset so cleanup cannot move another branch to this commit.
+            if git(&["update-ref", "--no-deref", "HEAD", &commit]).is_err() {
+                return false;
+            }
+        }
+        // For older workspaces without a saved commit, retain the previous
+        // cleanup at HEAD. Ignored dependencies belong to fast-worktree.
+        git(&["reset", "-q", "--hard"]).is_ok() && git(&["clean", "-q", "-fd"]).is_ok()
     }
 
     /// Drop the attempt's branch and registration. A branch whose worktree is
