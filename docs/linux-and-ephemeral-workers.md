@@ -22,8 +22,75 @@ upgrade order are the same.
   (`XDG_RUNTIME_DIR` set, or `/run/user/<uid>` present).
 - To keep the worker running after the last login session ends, enable
   lingering for the user once: `loginctl enable-linger <user>`.
+  `doctor` asks each systemd host (`loginctl show-user <uid>
+  --property=Linger`) and warns, with that command, when lingering is off.
 - A host without systemd (a container) is not a resident worker host; use an
   ephemeral worker there.
+
+### Installing a Linux worker from the parent
+
+`workers add <name> --ssh <dest> --install` and `workers upgrade <name>` send
+the parent's own binary only to a host of the parent's own operating system
+and architecture. For any other host, build `remote-task-runner` of the same
+version for that host and name the build:
+
+```
+remote-task-runner workers add mini-l --ssh ci@mini-l.local --install \
+    --binary target/x86_64-unknown-linux-gnu/release/remote-task-runner
+remote-task-runner workers upgrade mini-l \
+    --binary target/x86_64-unknown-linux-gnu/release/remote-task-runner
+```
+
+- Without `--binary`, a host of another platform is refused before anything is
+  sent; the message names the target triple that is needed. Nothing is
+  downloaded for you.
+- After the copy and before anything is installed or switched, the parent runs
+  the copy's `--version` on the host. It must print exactly what the parent
+  prints. A copy that does not is removed again, and the installed version is
+  left as it was.
+- `doctor` compares binaries by digest, so a worker of another platform always
+  shows "another build"; upgrade it with `--binary` when the parent's version
+  changes.
+
+### Dedicated worker available before login
+
+In the parent's `[[workers]]` entry, set `service_mode = "system-user"` and use
+the non-root build account for SSH. Running `workers add NAME --ssh DEST --install`
+stages the worker under that account and reports the configuration directory
+and the expected system service file. Supply `--binary` as above for another
+platform.
+
+On the worker host, an administrator registers the system definition with an
+administrator-controlled copy of the same CLI. For a Linux account named
+`build`, an example is
+
+```sh
+sudo /usr/local/sbin/remote-task-runner register-system-worker \
+    --account build --config-dir /home/build/.config/remote-task-runner
+```
+
+Use the configuration directory reported by the SSH helper. The command prints
+the installed definition's full path. On Linux, run `systemctl daemon-reload`
+and `systemctl enable --now <printed-unit-filename>` with administrator rights.
+On macOS, run `launchctl bootstrap system <printed-plist-path>` with
+administrator rights. Repeat the parent's install command to verify the
+running worker and finish enrollment.
+
+The system definition starts the non-root account at boot and follows the
+worker's installed version across upgrades. On Linux the unit must be enabled
+for boot. The helper checks the unit's effective user, activation and drop-ins.
+Start and stop use the system manager. The SSH account needs host authorization
+for those operations on its own unit, including the stop and start performed
+by upgrades. Keep the administrator's registration binary and system definition
+under administrator ownership. `doctor` checks the configured service mode and
+the worker's service environment. Linux system services run independently of
+user-session lingering.
+
+### The coordinator on Linux
+
+`init` registers the coordinator (with its local worker) as a systemd user
+unit on Linux, in the same directory as a worker's unit. The same note about
+lingering applies, and `doctor` checks it for the parent too.
 
 ## Ephemeral worker (notebook)
 
@@ -55,6 +122,41 @@ worker from a cell:
   directory, unless work is still recorded in it (then the state is kept and
   the next start refuses until you deal with it).
 
-What is not covered here: the tunnel itself, the parent attaching an
-`ephemeral = true` worker, and declaring a vanished worker gone
-(`workers forget`). Those are later parts of the same plan row.
+### On the parent
+
+Register the worker with its tunnel's SSH destination and mark it ephemeral:
+
+```
+remote-task-runner workers add colab-1 --ssh colab-1 --ephemeral
+```
+
+(or write `ephemeral = true` on its `[[workers]]` entry). The parent then
+dials it like any other worker. If the binary is not on the SSH login `PATH`
+of the notebook host, add `binary = "/absolute/path/remote-task-runner"` to
+the entry.
+
+- The parent never installs, upgrades, starts, stops, drains or resumes an
+  ephemeral worker; those commands are refused without contacting it.
+  `doctor` only checks that it answers.
+- While the worker cannot be reached, the tasks it held stay `unknown`. They
+  are not given to another worker and not failed, however long it takes.
+- When the same worker is started again, it comes back with a new identity.
+  The parent refuses the new identity until you forget the previous one.
+  The previous identity can reconnect and report its attempts in the meantime.
+  Run `remote-task-runner workers` to see the registered SSH destination,
+  connection state and recorded identity. If the resident cannot answer, the
+  connection state is `unknown`. Add `--json` for the same fields as JSON.
+- When the previous worker is gone, say so:
+
+  ```
+  remote-task-runner workers forget colab-1
+  ```
+
+  Its identity is retired and the tasks it held end as `interrupted`
+  (`cancelled` if you had already cancelled them). They are not run again by
+  themselves: retry them. A worker that comes back with a retired identity is
+  refused. `forget` is refused for a worker that is connected and for a worker
+  that is not ephemeral, and it needs the coordinator resident to be running.
+
+What is not covered here: the tunnel itself. Acceptance on real Linux hosts
+and through a real tunnel is still to be done.

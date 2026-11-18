@@ -1,35 +1,30 @@
 use assert_cmd::Command;
 
-const CASES: &[&[&str]] = &[&["workers"], &["workers", "forget", "w"]];
-
 #[test]
-fn every_command_reports_not_implemented_as_json() {
-    for args in CASES {
-        let out = Command::cargo_bin("remote-task-runner")
-            .unwrap()
-            .arg("--json")
-            .args(*args)
-            .output()
-            .unwrap();
-        assert_eq!(out.status.code(), Some(70), "{args:?}");
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("stdout is JSON");
-        assert_eq!(v["schema_version"], 1, "{args:?}");
-        assert_eq!(v["ok"], false, "{args:?}");
-        assert_eq!(v["error"]["code"], "NOT_IMPLEMENTED", "{args:?}");
-        assert!(v["error"]["message"].is_string(), "{args:?}");
-    }
-}
-
-#[test]
-fn without_json_stdout_is_empty_and_error_goes_to_stderr() {
+fn workers_lists_registrations_without_starting_a_resident() {
+    let root = crate::test_tmp::tempdir().unwrap();
+    let config = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        "schema_version = 1\n[[workers]]\nid = 'mini-a'\nssh = 'user@mini-a'\nephemeral = true\n",
+    )
+    .unwrap();
     let out = Command::cargo_bin("remote-task-runner")
         .unwrap()
-        .args(["workers", "forget", "w"])
+        .env_clear()
+        .env("HOME", root.path())
+        .args(["workers", "--json"])
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(70));
-    assert!(out.stdout.is_empty());
-    assert!(!out.stderr.is_empty());
+    assert!(out.status.success(), "{:?}", out);
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(
+        value["result"]["workers"],
+        serde_json::json!([{
+            "id":"mini-a","ssh":"user@mini-a","ephemeral":true,"connection":"unknown","identity":null
+        }])
+    );
 }
 
 #[test]

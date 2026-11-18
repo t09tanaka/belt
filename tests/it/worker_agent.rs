@@ -2866,6 +2866,8 @@ async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot(
     let real = remote_task_runner::platform::boot_id().expect("this machine has a boot id");
     let f = fx();
     let mut cfg = f.cfg(&real);
+    let instance = WorkerBootId::parse("ephemeral-start").unwrap();
+    cfg.instance_id = Some(instance.clone());
     cfg.retire_wait_ms = 300;
     let agent = f.start_with(cfg.clone());
     let c = f.connect(&agent).await;
@@ -2901,6 +2903,7 @@ async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot(
     let Response::GetAttempt(status) = call(&c, get()).await.unwrap() else {
         panic!()
     };
+    assert_eq!(status.worker_boot_id, instance);
     assert_eq!(
         status.observation,
         remote_task_runner::state::Observation::Unknown

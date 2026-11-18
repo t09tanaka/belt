@@ -6,7 +6,7 @@
 //! A value that would need escaping beyond systemd's own quoting is refused
 //! instead (control characters, NUL). `%` and `$` are live in unit files, so
 //! they are escaped where systemd reads them.
-use crate::service::macos::policy::{Definition, Mode, Plan};
+use crate::service::macos::policy::{valid_system_account, Definition, Mode, Plan};
 use crate::service::macos::LoadedState;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
@@ -89,14 +89,7 @@ pub fn render(def: &Definition) -> Result<Plan, String> {
     }
     let (user, target) = match &def.mode {
         Mode::User { uid } if *uid > 0 => (String::new(), "default.target"),
-        Mode::SystemUser { uid, username }
-            if *uid > 0
-                && !username.is_empty()
-                && username != "root"
-                && username
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)) =>
-        {
+        Mode::SystemUser { uid, username } if valid_system_account(*uid, username) => {
             (format!("User={username}\n"), "multi-user.target")
         }
         _ => return Err("service requires a non-root user identity".into()),
@@ -159,6 +152,7 @@ pub fn steps(arguments: &[String]) -> Result<Vec<Vec<String>>, String> {
         words
     };
     match verb.as_str() {
+        "start" if scope == SYSTEM => Ok(vec![with("start", Some(unit))]),
         "start" => Ok(vec![
             with("daemon-reload", None),
             with("enable", Some(unit)),
@@ -171,11 +165,12 @@ pub fn steps(arguments: &[String]) -> Result<Vec<Vec<String>>, String> {
 
 /// `systemctl` words that read one unit's state.
 pub fn show_arguments(scope: &str, unit: &str) -> Vec<String> {
+    let properties = properties(scope == SYSTEM);
     vec![
         scope.into(),
         "show".into(),
         unit.into(),
-        format!("--property={PROPERTIES}"),
+        format!("--property={properties}"),
     ]
 }
 
@@ -204,6 +199,7 @@ pub fn systemctl_env(
 /// One reading of `systemctl show`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Show {
+    system: bool,
     load: String,
     active: String,
     fragment: String,
@@ -214,11 +210,26 @@ pub struct Show {
 /// Strict: exactly the requested properties, once each. Anything else is
 /// refused, never guessed at.
 pub fn parse_show(bytes: &[u8]) -> Result<Show, &'static str> {
+    parse_show_for(bytes, None)
+}
+
+fn properties(system: bool) -> String {
+    if system {
+        format!("{PROPERTIES},User,DropInPaths,UnitFileState")
+    } else {
+        PROPERTIES.to_owned()
+    }
+}
+
+/// Confirm the account and persistent activation of a system service in
+/// systemd's effective configuration, including any manager-side overrides.
+pub fn parse_show_for(bytes: &[u8], username: Option<&str>) -> Result<Show, &'static str> {
     let text = std::str::from_utf8(bytes).map_err(|_| "show output is not UTF-8")?;
+    let properties = properties(username.is_some());
     let mut fields: BTreeMap<&str, &str> = BTreeMap::new();
     for line in text.lines() {
         let (key, value) = line.split_once('=').ok_or("unparsable show line")?;
-        if !PROPERTIES.split(',').any(|p| p == key) {
+        if !properties.split(',').any(|p| p == key) {
             return Err("unexpected show property");
         }
         if fields.insert(key, value).is_some() {
@@ -226,8 +237,19 @@ pub fn parse_show(bytes: &[u8]) -> Result<Show, &'static str> {
         }
     }
     let get = |key: &str| fields.get(key).copied().ok_or("missing show property");
+    let load = get("LoadState")?;
+    if let Some(username) = username {
+        let user = get("User")?;
+        let drop_ins = get("DropInPaths")?;
+        let enabled = get("UnitFileState")?;
+        if load != "not-found" && (user != username || !drop_ins.is_empty() || enabled != "enabled")
+        {
+            return Err("system service account, definition or boot activation differs");
+        }
+    }
     Ok(Show {
-        load: get("LoadState")?.to_owned(),
+        system: username.is_some(),
+        load: load.to_owned(),
         active: get("ActiveState")?.to_owned(),
         fragment: get("FragmentPath")?.to_owned(),
         main_pid: get("MainPID")?.parse().map_err(|_| "bad MainPID")?,
@@ -243,6 +265,12 @@ impl Show {
     /// A stopped unit, or one systemd has not read yet, is `Absent`. A running
     /// one is `Match` only from this exact file and without a pending reload.
     pub fn classify(&self, file: &Path) -> LoadedState {
+        if self.system
+            && self.load == "loaded"
+            && (Path::new(&self.fragment) != file || self.need_reload)
+        {
+            return LoadedState::Unknown;
+        }
         match (self.load.as_str(), self.active.as_str()) {
             ("not-found", "inactive") => LoadedState::Absent,
             ("loaded", "inactive" | "failed") => LoadedState::Absent,

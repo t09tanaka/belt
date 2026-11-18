@@ -14,6 +14,13 @@ struct FakeRemote {
     fake: Fake,
     reachable: bool,
     os: &'static str,
+    /// What `uname -m` prints; the machine the test runs on when `None`.
+    machine: Option<&'static str>,
+    /// The parent's OS, as Rust names it.
+    parent: &'static str,
+    /// What the staged binary prints for `--version`, and its exit status;
+    /// this build's own version when `None`.
+    version: Option<(i32, String)>,
     log: Vec<String>,
     stdins: Vec<Vec<u8>>,
     /// Every `(binary, cluster)` the bridge check was asked about.
@@ -52,8 +59,9 @@ impl FakeRemote {
 }
 impl Remote for FakeRemote {
     fn parent_os(&self) -> &str {
-        // The parent is a Mac whatever machine the test runs on.
-        "macos"
+        // The parent is a Mac whatever machine the test runs on, unless a
+        // test says otherwise.
+        self.parent
     }
     fn bridge_hello(
         &mut self,
@@ -110,7 +118,21 @@ impl Remote for FakeRemote {
             } else {
                 "absent"
             };
-            return Ok(ok(format!("{}\n{}\n{staged}\n", self.os, local_arch())));
+            let machine = self.machine.unwrap_or(local_arch());
+            return Ok(ok(format!("{}\n{machine}\n{staged}\n", self.os)));
+        }
+        if shell.ends_with(" --version") {
+            assert!(self.staged().exists(), "asked before anything was staged");
+            let (code, stdout) = self.version.clone().unwrap_or((0, own_version()));
+            return Ok(RemoteOutput {
+                code: Some(code),
+                stdout: stdout.into_bytes(),
+                stderr: vec![],
+            });
+        }
+        if shell.starts_with("rm -f ") {
+            let _ = fs::remove_file(self.staged());
+            return Ok(ok(String::new()));
         }
         if shell.starts_with("set -eu") {
             fs::write(self.staged(), stdin).unwrap();
@@ -229,6 +251,9 @@ impl World {
                 fake,
                 reachable: true,
                 os: "Darwin",
+                machine: None,
+                parent: "macos",
+                version: None,
                 log: vec![],
                 stdins: vec![],
                 bridges: vec![],
@@ -253,11 +278,26 @@ impl World {
             &self.exe,
             name,
             ssh,
-            install,
+            AddOptions {
+                install,
+                ..AddOptions::default()
+            },
             |_| {
                 reloads.borrow_mut().push(());
                 ResidentReload::NotRunning
             },
+        )
+    }
+    fn add_with(&mut self, name: &str, options: AddOptions<'_>) -> Result<AddResult, ApiError> {
+        add(
+            &mut self.remote,
+            &self.env,
+            &self.spec,
+            &self.exe,
+            name,
+            Some("ci@h"),
+            options,
+            |_| ResidentReload::NotRunning,
         )
     }
     fn lifecycle(&mut self, name: &str, action: Lifecycle) -> Result<Status, ApiError> {
@@ -376,13 +416,331 @@ fn an_unreachable_host_is_an_unknown_outcome_and_registers_nothing() {
     }
 }
 
+/// The other machine of a pair: never the one the test runs on.
+fn other_machine() -> &'static str {
+    if local_arch() == "arm64" {
+        "x86_64"
+    } else {
+        "arm64"
+    }
+}
+
 #[test]
-fn a_host_that_is_not_a_matching_macos_is_refused_before_staging() {
+fn the_own_binary_is_not_sent_to_a_host_of_another_platform() {
+    for (os, machine, triple) in [
+        ("Linux", None, "-unknown-linux-gnu"),
+        ("Darwin", Some(other_machine()), "-apple-darwin"),
+    ] {
+        let mut w = World::new();
+        w.remote.os = os;
+        w.remote.machine = machine;
+        let error = w.add("mini-a", Some("ci@h"), true).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains(triple), "{}", error.message);
+        assert!(
+            error.message.contains("--binary <path>"),
+            "{}",
+            error.message
+        );
+        // Only the read-only probe ran, and nothing was registered.
+        assert_eq!(w.remote.log.len(), 1);
+        assert!(!w.remote.staged().exists());
+        assert!(!w.config_text().contains("mini-a"));
+    }
+    // A platform no worker runs on is refused even with a named build.
     let mut w = World::new();
-    w.remote.os = "Linux";
-    let error = w.add("mini-a", Some("ci@h"), true).unwrap_err();
+    w.remote.os = "FreeBSD";
+    let exe = w.exe.clone();
+    let error = w
+        .add_with(
+            "mini-a",
+            AddOptions {
+                install: true,
+                binary: Some(&exe),
+                ..AddOptions::default()
+            },
+        )
+        .unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidInput);
     assert!(!w.remote.staged().exists());
+}
+
+#[test]
+fn a_named_build_is_what_is_sent_to_a_host_of_another_platform() {
+    let mut w = World::new();
+    w.remote.os = "Linux";
+    w.remote.machine = Some("x86_64");
+    // The build for the worker: other bytes than the parent's own binary.
+    let build = w.exe.with_file_name("rtr-linux");
+    fs::write(&build, b"a build for the worker").unwrap();
+    let result = w
+        .add_with(
+            "mini-a",
+            AddOptions {
+                install: true,
+                binary: Some(&build),
+                ..AddOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(result.registered && result.installed);
+    assert_eq!(
+        fs::read(w.remote.staged()).unwrap(),
+        b"a build for the worker"
+    );
+    let digest = worker_service::sha256_file(&build).unwrap();
+    assert_ne!(digest, worker_service::sha256_file(&w.exe).unwrap());
+    // Every remote step names the build that was sent, and the version was
+    // asked for after staging and before the install.
+    let steps: Vec<&str> = w.remote.log.iter().map(String::as_str).collect();
+    assert!(steps.iter().all(|step| step.contains(&digest)), "{steps:?}");
+    assert!(steps[0].starts_with("uname -s; uname -m;"));
+    assert!(steps[1].starts_with("set -eu"));
+    assert!(steps[2].ends_with(" --version"));
+    assert!(steps[3].ends_with("worker-service install"));
+    assert_eq!(result.status.unwrap().binary_sha256, digest);
+}
+
+#[test]
+fn a_linux_parent_sends_its_own_binary_to_a_linux_host_of_its_architecture() {
+    let mut w = World::new();
+    w.remote.parent = "linux";
+    w.remote.os = "Linux";
+    let result = w.add("mini-a", Some("ci@h"), true).unwrap();
+    assert!(result.installed);
+    // To a Mac it does not.
+    let mut w = World::new();
+    w.remote.parent = "linux";
+    let error = w.add("mini-a", Some("ci@h"), true).unwrap_err();
+    assert!(error.message.contains("-apple-darwin"), "{}", error.message);
+}
+
+#[test]
+fn a_build_that_does_not_report_the_parents_version_is_removed_before_any_install() {
+    for (code, said) in [
+        (0, "remote-task-runner 0.0.0-other\n"),
+        // It reports the right words and fails, or cannot run at all.
+        (1, ""),
+        (126, "cannot execute binary file\n"),
+    ] {
+        let mut w = World::new();
+        w.remote.version = Some((code, said.to_string()));
+        let error = w.add("mini-a", Some("ci@h"), true).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput, "{code}");
+        assert!(
+            error.message.contains("nothing was installed or switched"),
+            "{}",
+            error.message
+        );
+        assert!(
+            error.message.contains("the staged copy was removed"),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains(own_version().trim()));
+        assert!(!w.remote.staged().exists());
+        assert!(!w
+            .remote
+            .log
+            .iter()
+            .any(|step| step.contains("worker-service")));
+        assert!(w.calls().is_empty());
+        assert!(!w.config_text().contains("mini-a"));
+    }
+    // The parent's own version with a failing exit status is not a match.
+    let mut w = World::new();
+    w.remote.version = Some((3, own_version()));
+    assert!(w.add("mini-a", Some("ci@h"), true).is_err());
+    assert!(!w.remote.staged().exists());
+    // ssh itself failing says nothing about the copy: it is kept.
+    let mut w = World::new();
+    w.remote.version = Some((255, String::new()));
+    let error = w.add("mini-a", Some("ci@h"), true).unwrap_err();
+    assert_eq!(error.code, ErrorCode::CommunicationUnknown);
+    assert!(w.remote.staged().exists());
+}
+
+#[test]
+fn the_staging_commands_use_whichever_digest_tool_the_host_has() {
+    let digest = "ab".repeat(32);
+    for command in [stage_command(&digest), probe_command(&digest)] {
+        assert!(command.contains("command -v sha256sum"), "{command}");
+        assert!(command.contains("shasum -a 256"), "{command}");
+        assert!(command.contains(&digest));
+    }
+    assert!(probe_command(&digest).starts_with("uname -s; uname -m;"));
+    assert!(stage_command(&digest).starts_with("set -eu;"));
+    assert_eq!(
+        version_command(&digest),
+        format!("exec \"$HOME/.remote-task-runner-bootstrap/rtr-{digest}\" --version")
+    );
+    assert_eq!(
+        unstage_command(&digest),
+        format!("rm -f \"$HOME/.remote-task-runner-bootstrap/rtr-{digest}\"")
+    );
+    assert!(own_version().starts_with("remote-task-runner "));
+    assert!(own_version().contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn an_ephemeral_worker_is_registered_and_never_installed_or_controlled() {
+    let mut w = World::new();
+    let ephemeral = AddOptions {
+        ephemeral: true,
+        ..AddOptions::default()
+    };
+    let result = w.add_with("colab-1", ephemeral).unwrap();
+    assert!(result.registered && result.ephemeral && !result.installed);
+    assert_eq!(serde_json::to_value(&result).unwrap()["ephemeral"], true);
+    assert!(w.config_text().contains("ephemeral = true"));
+    let registration = registered(&w.env, "colab-1").unwrap().unwrap();
+    assert!(registration.ephemeral);
+    assert!(registrations(&w.env).unwrap()[0].ephemeral);
+    // Adding it again changes nothing, with or without the flag.
+    assert!(!w.add_with("colab-1", ephemeral).unwrap().registered);
+    let again = w.add("colab-1", Some("ci@h"), false).unwrap();
+    assert!(!again.registered && again.ephemeral);
+    assert_eq!(w.config_text().matches("ephemeral = true").count(), 1);
+    // No install, in either spelling, and no build to send.
+    let exe = w.exe.clone();
+    for options in [
+        AddOptions {
+            install: true,
+            ..AddOptions::default()
+        },
+        AddOptions {
+            install: true,
+            ephemeral: true,
+            ..AddOptions::default()
+        },
+        AddOptions {
+            ephemeral: true,
+            binary: Some(&exe),
+            ..AddOptions::default()
+        },
+    ] {
+        let error = w.add_with("colab-1", options).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+        assert!(error.message.contains("no service"), "{}", error.message);
+    }
+    for action in [
+        Lifecycle::Start,
+        Lifecycle::Drain,
+        Lifecycle::Resume,
+        Lifecycle::Stop {
+            cancel_running: false,
+        },
+        Lifecycle::Stop {
+            cancel_running: true,
+        },
+    ] {
+        let error = w.lifecycle("colab-1", action).unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput, "{action:?}");
+        assert!(error.message.contains("no service"), "{}", error.message);
+    }
+    // Not one remote command was run for it.
+    assert!(w.remote.log.is_empty() && w.remote.bridges.is_empty());
+    // A persistent worker stays one; a plain registration is not ephemeral.
+    w.add("mini-a", Some("ci@h"), false).unwrap();
+    assert!(!registered(&w.env, "mini-a").unwrap().unwrap().ephemeral);
+    assert!(
+        !serde_json::to_value(w.add("mini-a", Some("ci@h"), false).unwrap())
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("ephemeral")
+    );
+    assert_eq!(
+        w.add_with("mini-a", ephemeral).unwrap_err().code,
+        ErrorCode::Conflict
+    );
+    // `--binary` is what `--install` sends, and nothing without it.
+    let error = w
+        .add_with(
+            "mini-b",
+            AddOptions {
+                binary: Some(&exe),
+                ..AddOptions::default()
+            },
+        )
+        .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert!(error.message.contains("--install"), "{}", error.message);
+}
+
+#[test]
+fn forget_reports_only_what_the_resident_confirmed() {
+    use crate::service::resident::Reply;
+    let attempt = crate::ids::AttemptId::generate();
+    let asked = std::cell::RefCell::new(Vec::new());
+    let result = forget("colab-1", |worker| {
+        asked.borrow_mut().push(worker.to_string());
+        Ok(Reply::WorkerForgotten {
+            identity_retired: true,
+            ended: vec![attempt.clone()],
+        })
+    })
+    .unwrap();
+    assert_eq!(*asked.borrow(), ["colab-1"]);
+    assert_eq!(
+        result,
+        ForgetResult {
+            id: "colab-1".into(),
+            identity_retired: true,
+            ended: vec![attempt],
+        }
+    );
+    let text = describe_forget(&result);
+    assert!(
+        text.contains("colab-1") && text.contains("is retired"),
+        "{text}"
+    );
+    assert!(text.ends_with("1 attempt ended"), "{text}");
+    let nothing = describe_forget(&ForgetResult {
+        id: "colab-1".into(),
+        identity_retired: false,
+        ended: vec![],
+    });
+    assert!(nothing.contains("no identity was recorded"), "{nothing}");
+    assert!(nothing.contains("held no attempt"), "{nothing}");
+    // The resident's refusal is passed on as it is.
+    let refused = forget("mini-a", |_| {
+        Ok(Reply::ControlError {
+            error: ApiError::new(ErrorCode::Conflict, "the worker is connected"),
+        })
+    })
+    .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Conflict);
+    assert_eq!(refused.message, "the worker is connected");
+    // Anything else is not a forget.
+    let stopping = forget("colab-1", |_| Ok(Reply::Stopping)).unwrap_err();
+    assert_eq!(stopping.code, ErrorCode::CommunicationUnknown);
+    assert!(stopping.message.contains("nothing was forgotten"));
+    let other = forget("colab-1", |_| {
+        Ok(Reply::WorkersReloaded { connecting: vec![] })
+    });
+    let other = other.unwrap_err();
+    assert_eq!(other.code, ErrorCode::Conflict);
+    assert!(other.message.contains("restart it"), "{}", other.message);
+    let silent = forget("colab-1", |_| Err("it is not running".into())).unwrap_err();
+    assert_eq!(silent.code, ErrorCode::CommunicationUnknown);
+    assert!(
+        silent.message.contains("it is not running"),
+        "{}",
+        silent.message
+    );
+    // A name that cannot be a worker is refused before anything is asked.
+    let bad = forget("bad name", |_| panic!("asked")).unwrap_err();
+    assert_eq!(bad.code, ErrorCode::InvalidInput);
+    // Without a cluster there is no resident to ask.
+    let mut w = World::new();
+    w.spec.expected_cluster = None;
+    let why = ask_resident_to_forget(&w.spec, WorkerId::parse("colab-1").unwrap()).unwrap_err();
+    assert!(why.contains("run init"), "{why}");
+    // With one, but no resident: nothing is started for it.
+    let w = World::new();
+    let why = ask_resident_to_forget(&w.spec, WorkerId::parse("colab-1").unwrap()).unwrap_err();
+    assert_eq!(why, "it is not running");
 }
 
 #[test]
@@ -428,7 +786,7 @@ fn registration_keeps_existing_configuration_bytes() {
     fs::create_dir_all(w.config.parent().unwrap()).unwrap();
     let original = "schema_version = 1\n# keep me\n[coordinator]\nlocal_worker_priority = 3";
     fs::write(&w.config, original).unwrap();
-    register(&w.env, "mini-a", "ci@h", None).unwrap();
+    register(&w.env, "mini-a", "ci@h", None, false).unwrap();
     let text = w.config_text();
     assert!(text.starts_with(original));
     assert!(text.contains("id = \"mini-a\""));
@@ -543,6 +901,7 @@ fn helper_commands_are_fixed_strings_without_names_or_paths() {
 
 fn status_with(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
     Status {
+        system_user: false,
         worker_id: WorkerId::parse("mini-a").unwrap(),
         cluster: ClusterId::generate(),
         binary_sha256: "0".repeat(64),
@@ -759,7 +1118,7 @@ fn add_reports_what_the_running_resident_did() {
             &w2.exe,
             "mini-a",
             Some("ci@h"),
-            false,
+            AddOptions::default(),
             |_| once.take().unwrap(),
         )
         .unwrap();
@@ -1797,4 +2156,92 @@ mod sync {
         fs::write(root.join(".node-version"), "20\n").unwrap();
         assert!(read_project_requirements(root).is_err());
     }
+}
+
+/// The staging commands as a host's `/bin/sh` runs them, in a private HOME:
+/// what the fakes above only recognize by their first words.
+#[test]
+fn the_staging_commands_run_in_a_real_shell() {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    let home = crate::test_tmp::tempdir().unwrap();
+    let sh = |command: &str, stdin: &[u8]| {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", command])
+            .env_clear()
+            .env("HOME", home.path())
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        let out = child.wait_with_output().unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+        )
+    };
+    // A script stands in for the binary: it is what `--version` runs.
+    let bytes = b"#!/bin/sh\necho 'remote-task-runner 9.9.9'\n";
+    let source = home.path().join("source");
+    fs::write(&source, bytes).unwrap();
+    let digest = worker_service::sha256_file(&source).unwrap();
+    let staged = home
+        .path()
+        .join(format!(".remote-task-runner-bootstrap/rtr-{digest}"));
+    let last = |text: &str| text.lines().last().unwrap_or("").to_string();
+
+    let (code, probe) = sh(&probe_command(&digest), b"");
+    assert_eq!((code, last(&probe).as_str()), (Some(0), "absent"));
+    assert_eq!(probe.lines().count(), 3, "{probe}");
+    // Bytes of another digest are refused and leave nothing behind.
+    let (code, _) = sh(&stage_command(&digest), b"something else");
+    assert_eq!(code, Some(3));
+    assert!(!staged.exists());
+    assert_eq!(fs::read_dir(staged.parent().unwrap()).unwrap().count(), 0);
+    // The right bytes are published, executable and private.
+    let (code, _) = sh(&stage_command(&digest), bytes);
+    assert_eq!(code, Some(0));
+    assert_eq!(fs::read(&staged).unwrap(), bytes);
+    assert_eq!(
+        fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let (code, probe) = sh(&probe_command(&digest), b"");
+    assert_eq!((code, last(&probe).as_str()), (Some(0), "staged"));
+    let parsed = target::parse_probe(&probe);
+    assert!(parsed.staged && !parsed.system.is_empty() && !parsed.machine.is_empty());
+    let (code, version) = sh(&version_command(&digest), b"");
+    assert_eq!(
+        (code, version.as_str()),
+        (Some(0), "remote-task-runner 9.9.9\n")
+    );
+    // A copy whose content changed is not the staged binary.
+    fs::write(&staged, b"tampered").unwrap();
+    assert_eq!(last(&sh(&probe_command(&digest), b"").1), "absent");
+    let (code, _) = sh(&unstage_command(&digest), b"");
+    assert_eq!(code, Some(0));
+    assert!(!staged.exists());
+}
+
+#[test]
+fn a_preconfigured_system_worker_asks_for_the_system_manager_and_never_installs_a_user_service() {
+    let mut w = World::new();
+    w.add("mini-a", Some("ci@h"), false).unwrap();
+    let config = w.config_text() + "service_mode = \"system-user\"\n";
+    fs::write(&w.config, &config).unwrap();
+    // The host is an ordinary temp HOME with no administrator registration.
+    assert!(w.add("mini-a", Some("ci@h"), true).is_err());
+    assert!(w
+        .remote
+        .stdins
+        .iter()
+        .filter_map(|bytes| serde_json::from_slice::<InstallRequest>(bytes).ok())
+        .any(|request| request.system_user));
+    assert!(w.calls().is_empty());
+    assert_eq!(w.config_text(), config);
+    let paths = WorkerPaths::resolve(&w.remote.env).unwrap();
+    assert!(!paths.services.exists());
 }

@@ -36,6 +36,14 @@ struct FakeRemote {
     env: BTreeMap<String, String>,
     fake: Fake,
     os: &'static str,
+    /// What the host prints for `uname -s` and `uname -m` (the machine the
+    /// test runs on when `None`).
+    uname: (&'static str, Option<&'static str>),
+    /// What the staged binary prints for `--version`; this build's own
+    /// version when `None`.
+    version: Option<String>,
+    /// The shell commands that were run, in order.
+    log: Vec<String>,
     /// The helper actions that were asked for, in order.
     actions: Vec<String>,
     /// How long the parent was willing to wait for each of them.
@@ -134,13 +142,25 @@ impl Remote for FakeRemote {
         stdin: &[u8],
         timeout: Duration,
     ) -> Result<RemoteOutput, String> {
+        self.log.push(shell.to_string());
         let staged = self.staging.join(format!("rtr-{}", Self::digest_in(shell)));
         if shell.starts_with("uname -s") {
             let state = if staged.exists() { "staged" } else { "absent" };
+            let machine = self.uname.1.unwrap_or(super::super::local_arch());
+            return Ok(output(0, format!("{}\n{machine}\n{state}\n", self.uname.0)));
+        }
+        if shell.ends_with(" --version") {
+            assert!(staged.exists(), "asked before anything was staged");
             return Ok(output(
                 0,
-                format!("Darwin\n{}\n{state}\n", super::super::local_arch()),
+                self.version
+                    .clone()
+                    .unwrap_or_else(super::super::own_version),
             ));
+        }
+        if shell.starts_with("rm -f ") {
+            let _ = fs::remove_file(&staged);
+            return Ok(output(0, String::new()));
         }
         if shell.starts_with("set -eu") {
             self.transfers += 1;
@@ -256,6 +276,7 @@ impl World {
         fake.0.borrow_mut().state = paths.state.clone();
         let old = sha256_file(&old_exe).unwrap();
         let request = InstallRequest {
+            system_user: false,
             schema: 1,
             cluster: cluster.clone(),
             worker_id: WorkerId::parse("mini-a").unwrap(),
@@ -283,6 +304,7 @@ impl World {
             "mini-a",
             "ci@mini-a.local",
             with_binary.then_some(binary.as_str()),
+            false,
         )
         .unwrap();
         let staging = root.join("staging");
@@ -305,6 +327,9 @@ impl World {
                 env: worker_env,
                 fake,
                 os: "macos",
+                uname: ("Darwin", None),
+                version: None,
+                log: vec![],
                 actions: vec![],
                 timeouts: vec![],
                 transfers: 0,
@@ -330,6 +355,7 @@ impl World {
             &self.env,
             &self.spec,
             &self.exe,
+            None,
             "mini-a",
             |_| resident,
         )
@@ -1131,7 +1157,7 @@ fn a_damaged_transfer_is_never_run() {
 }
 
 #[test]
-fn upgrade_needs_a_registered_worker_a_cluster_and_a_mac_parent() {
+fn upgrade_needs_a_registered_worker_a_cluster_and_a_host_its_binary_runs_on() {
     let mut w = World::new();
     let not_running = |_: &Spec| ResidentBuild::NotRunning;
     let error = upgrade(
@@ -1139,6 +1165,7 @@ fn upgrade_needs_a_registered_worker_a_cluster_and_a_mac_parent() {
         &w.env,
         &w.spec,
         &w.exe,
+        None,
         "mini-b",
         not_running,
     )
@@ -1149,17 +1176,147 @@ fn upgrade_needs_a_registered_worker_a_cluster_and_a_mac_parent() {
         &w.env,
         &w.spec,
         &w.exe,
+        None,
         "bad name",
         not_running,
     )
     .unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidInput);
+    // A Linux parent has no binary for a Mac, and a Mac parent none for Linux.
     w.remote.os = "linux";
-    assert_eq!(w.upgrade().unwrap_err().code, ErrorCode::InvalidInput);
+    let error = w.upgrade().unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert!(error.message.contains("-apple-darwin"), "{}", error.message);
     w.remote.os = "macos";
+    w.remote.uname = ("Linux", Some("aarch64"));
+    let error = w.upgrade().unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("aarch64-unknown-linux-gnu")
+            && error.message.contains("--binary <path>"),
+        "{}",
+        error.message
+    );
+    // Only the read-only probe ran for those two.
+    assert_eq!(w.remote.log.len(), 2);
+    assert!(w.remote.log.iter().all(|step| step.starts_with("uname -s")));
+    w.remote.uname = ("Darwin", None);
     w.spec.expected_cluster = None;
     assert_eq!(w.upgrade().unwrap_err().code, ErrorCode::InvalidInput);
     assert!(w.actions().is_empty() && w.remote.transfers == 0);
+    assert_eq!(w.remote.log.len(), 2);
+}
+
+impl World {
+    /// The build made for the worker's platform: other bytes than `exe`.
+    fn build(&self) -> PathBuf {
+        let build = self.exe.with_file_name("rtr-for-the-worker");
+        fs::write(&build, b"new version, built for the worker").unwrap();
+        build
+    }
+    fn upgrade_with(&mut self, build: &Path) -> Result<UpgradeResult, ApiError> {
+        let resident = self.resident.clone();
+        upgrade(
+            &mut self.remote,
+            &self.env,
+            &self.spec,
+            &self.exe,
+            Some(build),
+            "mini-a",
+            |_| resident,
+        )
+    }
+}
+
+#[test]
+fn a_worker_of_another_platform_is_upgraded_with_the_named_build() {
+    let mut w = World::new();
+    w.remote.uname = ("Linux", Some("x86_64"));
+    let build = w.build();
+    let digest = sha256_file(&build).unwrap();
+    assert_ne!(digest, w.new);
+    // The resident runs this parent's binary, not the build for the worker:
+    // that is what it is compared with.
+    w.resident = ResidentBuild::Running {
+        binary_sha256: w.new.clone(),
+        features: crate::protocol::session::offered_features(),
+        required_features: required(),
+    };
+    let result = w.upgrade_with(&build).unwrap();
+    assert_eq!(result.outcome, Outcome::Upgraded);
+    assert_eq!(
+        (result.from.as_str(), result.to.as_str()),
+        (w.old.as_str(), digest.as_str())
+    );
+    w.assert_serving(&digest);
+    assert_eq!(w.remote.transfers, 1);
+    // The version was asked for after staging and before the first helper action.
+    let steps: Vec<&str> = w.remote.log.iter().map(String::as_str).collect();
+    assert!(steps[0].starts_with("uname -s"));
+    assert!(steps[1].starts_with("set -eu"));
+    assert!(steps[2].ends_with(" --version"));
+    assert!(steps[3].contains("worker-service status"), "{steps:?}");
+    assert!(steps.iter().all(|step| step.contains(&digest)), "{steps:?}");
+    // A resident of the worker's build is another build than this parent.
+    let mut w = World::new();
+    w.remote.uname = ("Linux", Some("x86_64"));
+    let build = w.build();
+    w.resident = ResidentBuild::Running {
+        binary_sha256: sha256_file(&build).unwrap(),
+        features: crate::protocol::session::offered_features(),
+        required_features: required(),
+    };
+    let error = w.upgrade_with(&build).unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert!(w.remote.log.is_empty());
+}
+
+#[test]
+fn a_build_of_another_version_is_removed_and_the_worker_is_not_switched() {
+    let mut w = World::new();
+    w.remote.version = Some("remote-task-runner 0.0.0-other\n".into());
+    let build = w.build();
+    let digest = sha256_file(&build).unwrap();
+    let error = w.upgrade_with(&build).unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert!(
+        error.message.contains("remote-task-runner 0.0.0-other")
+            && error.message.contains("nothing was installed or switched")
+            && error.message.contains("the staged copy was removed"),
+        "{}",
+        error.message
+    );
+    // No helper action ran: the old version serves, undrained, and the
+    // staged copy is gone.
+    assert!(w.actions().is_empty());
+    assert!(!w.remote.staging.join(format!("rtr-{digest}")).exists());
+    w.assert_serving(&w.old.clone());
+    // The same build is fine once it reports this parent's version.
+    w.remote.version = None;
+    assert_eq!(w.upgrade_with(&build).unwrap().outcome, Outcome::Upgraded);
+    assert_eq!(w.remote.transfers, 2);
+}
+
+#[test]
+fn an_ephemeral_worker_is_never_upgraded() {
+    let mut w = World::new();
+    let config = crate::config::paths::user_config_path(&w.env).unwrap();
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str("\n[[workers]]\nid = \"colab-1\"\nssh = \"colab\"\nephemeral = true\n");
+    fs::write(&config, text).unwrap();
+    let error = upgrade(
+        &mut w.remote,
+        &w.env,
+        &w.spec,
+        &w.exe,
+        None,
+        "colab-1",
+        |_| panic!("the resident is not asked"),
+    )
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::InvalidInput);
+    assert!(error.message.contains("no service"), "{}", error.message);
+    assert!(w.remote.log.is_empty());
 }
 
 #[test]
@@ -1183,6 +1340,7 @@ fn a_registration_without_a_binary_path_gains_it_after_the_check() {
 
 fn status(version: &str, from: Option<&str>) -> Status {
     Status {
+        system_user: false,
         worker_id: WorkerId::parse("mini-a").unwrap(),
         cluster: ClusterId::generate(),
         binary_sha256: version.into(),

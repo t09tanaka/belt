@@ -154,6 +154,17 @@ fn string(s: &str) -> Result<String, String> {
     Ok(format!("<string>{}</string>", xml(s)?))
 }
 
+/// A numeric User= is a UID for systemd. Both managers must be given the
+/// validated account name, independent of the numeric identity in the plan.
+pub(crate) fn valid_system_account(uid: u32, username: &str) -> bool {
+    uid > 0
+        && username != "root"
+        && username.bytes().any(|b| !b.is_ascii_digit())
+        && username
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+}
+
 pub fn render(def: &Definition) -> Result<Plan, String> {
     if def.label.is_empty()
         || def.label.len() > 128
@@ -167,19 +178,10 @@ pub fn render(def: &Definition) -> Result<Plan, String> {
     }
     let (domain, user) = match &def.mode {
         Mode::User { uid } if *uid > 0 => (format!("gui/{uid}"), String::new()),
-        Mode::SystemUser { uid, username }
-            if *uid > 0
-                && !username.is_empty()
-                && username != "root"
-                && username
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b)) =>
-        {
-            (
-                "system".into(),
-                format!("<key>UserName</key>{}", string(username)?),
-            )
-        }
+        Mode::SystemUser { uid, username } if valid_system_account(*uid, username) => (
+            "system".into(),
+            format!("<key>UserName</key>{}", string(username)?),
+        ),
         _ => return Err("service requires a non-root user identity".into()),
     };
     let mut argv = string(absolute(&def.executable)?)?;
@@ -292,6 +294,10 @@ mod tests {
         }
         for mode in [
             Mode::User { uid: 0 },
+            Mode::SystemUser {
+                uid: 501,
+                username: "0".into(),
+            },
             Mode::SystemUser {
                 uid: 0,
                 username: "worker".into(),

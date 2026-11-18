@@ -648,3 +648,94 @@ fn concurrent_directory_winner_is_revalidated_and_synced() {
         assert!(durability.0.is_empty());
     }
 }
+
+/// A systemd user manager that takes the unit and never says whether it
+/// started: the files of the Linux form are in place and retained.
+struct SilentSystemd(Vec<Vec<String>>);
+impl Launcher for SilentSystemd {
+    fn backend(&self) -> Backend {
+        Backend::Systemd
+    }
+    fn loaded_state(&mut self, _: &Plan, _: &Receipt) -> LoadedState {
+        LoadedState::Absent
+    }
+    fn verify_loaded(&mut self, _: &Plan, _: &Receipt) -> Result<(), LaunchError> {
+        panic!("no stop verification")
+    }
+    fn launchctl(&mut self, args: &[String]) -> Result<(), LaunchError> {
+        self.0.push(args.to_vec());
+        Err(LaunchError::OutcomeUnknown("owned test uncertainty".into()))
+    }
+}
+
+#[tokio::test]
+async fn init_with_a_systemd_manager_writes_a_user_unit_and_no_launch_agent() {
+    let (t, c) = fixture();
+    let p = Paths::resolve_for(&c.env, Backend::Systemd).unwrap();
+    assert_eq!(p.services, t.path().join("config/systemd/user"));
+    assert_eq!(
+        Paths::resolve(&c.env).unwrap().services,
+        t.path().join("Library/LaunchAgents")
+    );
+    let mut manager = SilentSystemd(Vec::new());
+    let err = initialize(c.clone(), &mut manager).await.unwrap_err();
+    assert!(err.downcast_ref::<Unconfirmed>().is_some());
+    let j: Journal = serde_json::from_slice(&fs::read(&p.journal).unwrap()).unwrap();
+    assert!(j.systemd && j.backend() == Backend::Systemd);
+    let receipt = j.plist.as_ref().unwrap();
+    let unit = receipt.path();
+    assert_eq!(unit.parent().unwrap(), p.services);
+    assert_eq!(unit.extension().unwrap(), "service");
+    let text = fs::read_to_string(unit).unwrap();
+    assert!(text.contains("[Service]") && text.contains("Restart=always"));
+    assert!(text.contains("WantedBy=default.target"));
+    assert!(text.contains(j.spec.executable.to_str().unwrap()));
+    assert!(text.contains(p.input.to_str().unwrap()));
+    assert!(!text.contains("SECRET_TOKEN") && !text.contains("never persist"));
+    // The manager was asked once, in its own words, for this unit.
+    let name = unit.file_name().unwrap().to_str().unwrap().to_string();
+    assert_eq!(
+        manager.0,
+        [vec!["--user".to_string(), "start".into(), name]]
+    );
+    assert!(!t.path().join("Library").exists());
+    // The journal says which manager it was written for: launchd does not
+    // take it over, and nothing is written for it.
+    let error = initialize(c.clone(), &mut Unknown).await.unwrap_err();
+    assert!(
+        error.to_string().contains("another service manager"),
+        "{error}"
+    );
+    assert!(!t.path().join("Library").exists());
+    // A process that checks the managed service finds it where init put it,
+    // whatever machine it runs on.
+    let (journal, paths) = managed_journal(&j.spec).unwrap();
+    assert_eq!(paths.backend, Backend::Systemd);
+    assert_eq!(paths.services, p.services);
+    assert!(journal.systemd);
+    let health = managed_health(&j.spec, &mut Unknown).await.unwrap_err();
+    assert!(
+        health.to_string().contains("another service manager"),
+        "{health}"
+    );
+}
+
+#[tokio::test]
+async fn a_launchd_journal_does_not_say_systemd_and_reads_as_before() {
+    let (_t, c) = fixture();
+    let p = Paths::resolve(&c.env).unwrap();
+    assert!(initialize(c.clone(), &mut Unknown).await.is_err());
+    let bytes = fs::read(&p.journal).unwrap();
+    assert!(!String::from_utf8_lossy(&bytes).contains("systemd"));
+    let j: Journal = serde_json::from_slice(&bytes).unwrap();
+    assert!(!j.systemd && j.backend() == Backend::Launchd);
+    // A systemd manager does not take over a journal written for launchd.
+    let error = initialize(c, &mut SilentSystemd(Vec::new()))
+        .await
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("another service manager"),
+        "{error}"
+    );
+    assert!(!p.config.parent().unwrap().join("systemd").exists());
+}

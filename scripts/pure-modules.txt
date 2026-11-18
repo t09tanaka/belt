@@ -53,4 +53,7 @@ src/toolchain/declarations.rs
 src/ci/shards.rs
 src/service/systemd/policy.rs
 src/service/worker/ephemeral/plan.rs
+src/coordinator/identity.rs
+src/service/workers/target.rs
+src/service/doctor/linger.rs
 src/ci/status.rs

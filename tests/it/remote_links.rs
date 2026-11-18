@@ -154,11 +154,10 @@ async fn submit(
     );
     let wait = if delay == u32::MAX {
         let release = remote_task_runner::protocol::ssh::quote(
-            &root.join("release-local").display().to_string(),
+            &root.join(format!("release-{name}")).display().to_string(),
         );
-        format!(
-            "i=0; while [ ! -e {release} ] && [ \"$i\" -lt 600 ]; do i=$((i+1)); sleep 0.05; done"
-        )
+        let fixture = remote_task_runner::protocol::ssh::quote(&root.display().to_string());
+        format!("while [ -d {fixture} ] && [ ! -e {release} ]; do sleep 0.05; done")
     } else {
         format!("sleep {delay}")
     };
@@ -170,7 +169,7 @@ async fn submit(
         manifest_digest: Digest::parse(manifest).or_else(|_| Digest::parse(&format!("sha256:{manifest}"))).unwrap(),
         commands: vec![CommandSpec { node_id: NodeId::parse("main").unwrap(),
             argv: vec!["/bin/sh".into(), "-c".into(), format!("test \"$(cat .env)\" = \"TOKEN=$(cat ordinary)-private\" && echo once >> {count} && {wait}")],
-            cwd: String::new(), env: BTreeMap::from([("PATH".into(), "/usr/bin:/bin".into())]),
+            cwd: String::new(), env: BTreeMap::new(),
             depends_on: vec![], timeout_ms: None, setup_step: None }],
         command_timeout_ms: None, deadline_ms: None, resource_wait_timeout_ms: None,
         has_secret_bundle: true, artifacts: vec![],
@@ -191,6 +190,70 @@ fn attempt(state: &Path, task: &TaskId) -> Option<remote_task_runner::storage::A
         .unwrap()
         .latest_attempt_of_task(task)
         .unwrap()
+}
+
+async fn start_parent(
+    root: &Path,
+    state: &Path,
+    key: &Path,
+    cluster: &ClusterId,
+) -> (Owned, Client, Spec) {
+    let spec = Spec {
+        state_dir: state.to_owned(),
+        worker_state_dir: root.join("local"),
+        worker_id: WorkerId::parse("local").unwrap(),
+        cluster_key_path: key.to_owned(),
+        executable: BIN.into(),
+        repo_root: None,
+        expected_cluster: Some(cluster.clone()),
+        managed_service: None,
+        env: BTreeMap::from([
+            ("HOME".into(), root.display().to_string()),
+            (
+                "XDG_CONFIG_HOME".into(),
+                root.join("config").display().to_string(),
+            ),
+            ("PATH".into(), "/usr/bin:/bin".into()),
+            ("TOKIO_WORKER_THREADS".into(), "2".into()),
+            ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
+            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
+        ]),
+    };
+    let input = root.join("parent.json");
+    write_private(&input, &serde_json::to_vec(&spec).unwrap());
+    let parent_log = state.join("fixture-parent.stderr");
+    let mut owner = Owned::new(
+        tokio::process::Command::new(BIN)
+            .args(["daemon", "--input"])
+            .arg(&input)
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .env("TOKIO_WORKER_THREADS", "2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(std::fs::File::create(&parent_log).unwrap()))
+            .spawn()
+            .unwrap(),
+    );
+    // The socket file appears at bind and becomes private (and the token
+    // complete) a moment later, so wait for a client that loads, as the
+    // product bootstrap does, not for the bare path.
+    let mut loaded = None;
+    wait_for("parent IPC socket", || {
+        let exited = owner.child.as_mut().unwrap().try_wait().unwrap();
+        assert!(
+            exited.is_none(),
+            "parent exited {exited:?}: {}",
+            std::fs::read_to_string(&parent_log).unwrap()
+        );
+        loaded = Client::load(state, cluster.clone()).ok();
+        loaded.is_some()
+    })
+    .await;
+    let client = loaded.unwrap();
+    (owner, client, spec)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -250,55 +313,7 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = format!("schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\nlocal_worker_priority=-100\nmax_active_task=1\n[scheduler]\nprefetch_per_worker=0\n[[workers]]\nid='remote-a'\nssh='{}'\npriority=100\n[[workers]]\nid='remote-b'\nssh='{}'\npriority=100\n[[workers]]\nid='offline'\nssh='{}'\npriority=100\n[[workers]]\nid='wrong-identity'\nssh='{}'\npriority=100\n", homes[0].display(), homes[1].display(), root.join("missing").display(), wrong_home.display());
     write_private(&config_dir.join("config.toml"), config.as_bytes());
-    let spec = Spec {
-        state_dir: state.clone(),
-        worker_state_dir: local,
-        worker_id: WorkerId::parse("local").unwrap(),
-        cluster_key_path: key.clone(),
-        executable: BIN.into(),
-        repo_root: None,
-        expected_cluster: Some(cluster.clone()),
-        managed_service: None,
-        env: BTreeMap::from([
-            ("HOME".into(), root.display().to_string()),
-            ("XDG_CONFIG_HOME".into(), xdg.display().to_string()),
-            ("PATH".into(), "/usr/bin:/bin".into()),
-            ("TOKIO_WORKER_THREADS".into(), "2".into()),
-            ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
-            ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
-        ]),
-    };
-    let input = root.join("parent.json");
-    write_private(&input, &serde_json::to_vec(&spec).unwrap());
-    let parent_log = state.join("fixture-parent.stderr");
-    let mut owner = Owned::new(
-        tokio::process::Command::new(BIN)
-            .args(["daemon", "--input"])
-            .arg(&input)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
-            .env("TOKIO_WORKER_THREADS", "2")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::from(std::fs::File::create(&parent_log).unwrap()))
-            .spawn()
-            .unwrap(),
-    );
-    // The socket file appears at bind and becomes private (and the token
-    // complete) a moment later, so wait for a client that loads, as the
-    // product bootstrap does, not for the bare path.
-    let mut loaded = None;
-    wait_for("parent IPC socket", || {
-        let exited = owner.child.as_mut().unwrap().try_wait().unwrap();
-        assert!(
-            exited.is_none(),
-            "parent exited {exited:?}: {}",
-            std::fs::read_to_string(&parent_log).unwrap()
-        );
-        loaded = Client::load(&state, cluster.clone()).ok();
-        loaded.is_some()
-    })
-    .await;
-    let client = loaded.unwrap();
+    let (owner, client, spec) = start_parent(root, &state, &key, &cluster).await;
     // Occupy the local slot first while both remotes are deliberately offline.
     let blocker = submit(&client, &state, &spec.env, &key, root, "blocker", u32::MAX).await;
     if tokio::time::timeout(T, async {
@@ -369,7 +384,7 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
         attempt(&state, &first).is_some_and(|a| a.observation == Observation::Unknown)
     })
     .await;
-    std::fs::write(root.join("release-local"), "release fixture task").unwrap();
+    std::fs::write(root.join("release-blocker"), "release fixture task").unwrap();
     wait_for("local blocker collection", || {
         attempt(&state, &blocker).is_some_and(|a| a.receipts.collected_at_ms.is_some())
     })
@@ -430,4 +445,187 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
     );
     a.stop().await;
     b.stop().await;
+}
+
+/// A46 across the real daemon, worker executable and stdio bridge. The SSH
+/// executable stands in for the user's tunnel and can disconnect it without
+/// stopping the worker it leads to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a46_a_tunnel_disconnect_keeps_the_ephemeral_attempt_until_explicit_forget() {
+    let fixture = crate::test_tmp::tempdir().unwrap();
+    let root = fixture.path();
+    let state = root.join("parent");
+    let home = root.join("ephemeral");
+    let bin = root.join("bin");
+    let config = root.join("config/remote-task-runner");
+    for dir in [root, &state, &root.join("local"), &home, &bin, &config] {
+        private(dir);
+    }
+    let key = root.join("key");
+    remote_task_runner::secrets::key::init(&key).unwrap();
+    let cluster = CoordinatorStore::open(&state, wall_ms())
+        .unwrap()
+        .cluster_id()
+        .clone();
+    let worker = WorkerId::parse("colab").unwrap();
+    write_private(&config.join("config.toml"), format!(
+        "schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\nmax_active_task=1\n[scheduler]\nprefetch_per_worker=0\n[[workers]]\nid='colab'\nssh='{}'\nephemeral=true\n",
+        home.display()
+    ).as_bytes());
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+[ "$#" = 3 ] || exit 91
+home=$2
+[ "$3" = "'remote-task-runner' 'worker' '--stdio'" ] || exit 91
+[ ! -e "$home/offline" ] || exit 92
+echo $$ > "$home/bridge.pid"
+echo $$ >> "$home/bridge-dials"
+HOME="$home" exec {} worker --stdio
+"#,
+            remote_task_runner::protocol::ssh::quote(BIN)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(home.join("offline"), "").unwrap();
+    let agent = Owned::new(
+        tokio::process::Command::new(BIN)
+            .args(["worker", "--ephemeral", "--cluster"])
+            .arg(cluster.to_string())
+            .args(["--name", worker.as_str(), "--key-file"])
+            .arg(&key)
+            .env("HOME", &home)
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .env("PATH", "/bin:/usr/bin")
+            .env("TOKIO_WORKER_THREADS", "2")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let (owner, client, spec) = start_parent(root, &state, &key, &cluster).await;
+    let blocker = submit(&client, &state, &spec.env, &key, root, "blocker", u32::MAX).await;
+    wait_for("local slot occupied", || {
+        root.join("count-blocker").exists()
+    })
+    .await;
+    std::fs::remove_file(home.join("offline")).unwrap();
+    let store = CoordinatorStore::open_read_only(&state).unwrap();
+    wait_for("ephemeral identity admitted", || {
+        store.worker_identity(&worker).unwrap().is_some()
+    })
+    .await;
+    let identity = WorkerBootId::parse(&store.worker_identity(&worker).unwrap().unwrap()).unwrap();
+    let task = submit(
+        &client,
+        &state,
+        &spec.env,
+        &key,
+        root,
+        "ephemeral",
+        u32::MAX,
+    )
+    .await;
+    if tokio::time::timeout(T, async {
+        while !root.join("count-ephemeral").exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        let attempts = store.attempts_of_task(&task).unwrap();
+        let worker_events = remote_task_runner::storage::WorkerStore::open_read_only(
+            &home.join(".remote-task-runner"),
+        )
+        .and_then(|worker| worker.events_after(0, 200))
+        .map(|events| events.into_iter().map(|e| e.kind).collect::<Vec<_>>());
+        let refused: Vec<_> = attempts
+            .iter()
+            .flat_map(|attempt| {
+                store
+                    .events_of(&attempt.attempt_id, "submit_refused")
+                    .unwrap()
+            })
+            .map(|event| event.payload)
+            .collect();
+        panic!("ephemeral command did not start; placements and states: {:?}; worker events: {worker_events:?}; submit refusals: {refused:?}; bridge dials: {:?}; parent log: {}",
+            attempts.iter().map(|a| (&a.worker_id, a.state, a.observation, &a.termination)).collect::<Vec<_>>(),
+            std::fs::read_to_string(home.join("bridge-dials")).ok(),
+            std::fs::read_to_string(state.join("fixture-parent.stderr")).unwrap_or_default());
+    }
+    let placed = attempt(&state, &task).unwrap();
+    assert_eq!(placed.worker_id, worker);
+    std::fs::write(home.join("offline"), "").unwrap();
+    let (pid, start) = bridge(&home, owner.pid).unwrap();
+    super::common::kill_recorded(pid, &start);
+    wait_for("unknown attempt", || {
+        attempt(&state, &task).is_some_and(|a| a.observation == Observation::Unknown)
+    })
+    .await;
+    std::fs::write(root.join("release-blocker"), "").unwrap();
+    wait_for("available local slot", || {
+        attempt(&state, &blocker).is_some_and(|a| a.receipts.collected_at_ms.is_some())
+    })
+    .await;
+    let attempts = store.attempts_of_task(&task).unwrap();
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(attempts[0].observation, Observation::Unknown);
+    assert!(attempts[0].termination.is_none());
+    let reply = client
+        .request(Operation::ForgetWorker {
+            worker: worker.clone(),
+        })
+        .await
+        .unwrap();
+    assert!(
+        matches!(reply, Reply::WorkerForgotten { identity_retired: true, ended } if ended == vec![placed.attempt_id])
+    );
+    assert!(store.worker_identity_retired(&worker, &identity).unwrap());
+    assert_eq!(
+        attempt(&state, &task)
+            .unwrap()
+            .termination
+            .unwrap()
+            .outcome(),
+        Outcome::Interrupted
+    );
+    // The dial loop starts the next bridge only after it has reaped the
+    // previous one. Two new dials prove the returning worker's first
+    // connection was actually closed while its process was still alive.
+    let previous_dials = std::fs::read_to_string(home.join("bridge-dials"))
+        .unwrap()
+        .lines()
+        .count();
+    std::fs::remove_file(home.join("offline")).unwrap();
+    wait_for("returning worker connection closed and redialed", || {
+        std::fs::read_to_string(home.join("bridge-dials"))
+            .unwrap()
+            .lines()
+            .count()
+            >= previous_dials + 2
+    })
+    .await;
+    assert_eq!(
+        super::common::identity_of(agent.pid).as_deref(),
+        Some(agent.start.as_str())
+    );
+    assert_eq!(store.worker_identity(&worker).unwrap(), None);
+    assert_eq!(store.attempts_of_task(&task).unwrap().len(), 1);
+    assert_eq!(
+        std::fs::read_to_string(root.join("count-ephemeral")).unwrap(),
+        "once\n"
+    );
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    std::fs::write(root.join("release-ephemeral"), "").unwrap();
+    owner.wait().await;
+    agent.stop().await;
 }

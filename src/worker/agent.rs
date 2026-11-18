@@ -65,6 +65,8 @@ pub struct AgentConfig {
     pub worker_id: WorkerId,
     /// This boot of the machine (`platform::boot_id()` in production).
     pub boot_id: WorkerBootId,
+    /// Per-start identity advertised by an ephemeral worker.
+    pub instance_id: Option<WorkerBootId>,
     /// The binary whose `supervise --spec <file>` runs an attempt.
     pub supervisor_exe: PathBuf,
     pub traffic_state_dir: PathBuf,
@@ -123,6 +125,10 @@ pub struct AgentConfig {
 }
 
 impl AgentConfig {
+    pub(crate) fn advertised_boot(&self) -> &WorkerBootId {
+        self.instance_id.as_ref().unwrap_or(&self.boot_id)
+    }
+
     pub fn new(
         state_dir: PathBuf,
         worker_id: WorkerId,
@@ -134,6 +140,7 @@ impl AgentConfig {
             state_dir,
             worker_id,
             boot_id,
+            instance_id: None,
             supervisor_exe,
             traffic_config: None,
             capability_profile: None,
@@ -2113,7 +2120,7 @@ impl Agent {
                 let max_epoch = self.store.max_coordinator_epoch().map_err(api)?;
                 let ident = crate::forecast::plan::Ident {
                     worker_id: self.cfg.worker_id.clone(),
-                    boot_id: self.cfg.boot_id.clone(),
+                    boot_id: self.cfg.advertised_boot().clone(),
                     agent_epoch: self.epoch,
                     forecast_ttl_ms: self.cfg.forecast_ttl_ms,
                 };
@@ -2156,7 +2163,7 @@ impl Agent {
                     crate::wire::PreparationProbeResponse {
                         schema_version: SchemaVersion::CURRENT,
                         worker_id: self.cfg.worker_id.clone(),
-                        worker_boot_id: self.cfg.boot_id.clone(),
+                        worker_boot_id: self.cfg.advertised_boot().clone(),
                         agent_epoch: self.epoch,
                         probe,
                     },
@@ -2335,7 +2342,7 @@ impl Agent {
             run_id: rec.run_id.clone(),
             task_id: rec.task_id.clone(),
             generation: rec.generation,
-            worker_boot_id: self.cfg.boot_id.clone(),
+            worker_boot_id: self.cfg.advertised_boot().clone(),
             agent_epoch: self.epoch,
             state: rec.state,
             receipts: rec.receipts,
@@ -2718,7 +2725,7 @@ impl Agent {
         let max_epoch = self.store.max_coordinator_epoch().map_err(api)?;
         let ident = crate::forecast::plan::Ident {
             worker_id: self.cfg.worker_id.clone(),
-            boot_id: self.cfg.boot_id.clone(),
+            boot_id: self.cfg.advertised_boot().clone(),
             agent_epoch: self.epoch,
             forecast_ttl_ms: self.cfg.forecast_ttl_ms,
         };
@@ -2837,7 +2844,7 @@ impl Agent {
             capabilities: self.capabilities(),
             schema_version: SchemaVersion::CURRENT,
             worker_id: self.cfg.worker_id.clone(),
-            worker_boot_id: self.cfg.boot_id.clone(),
+            worker_boot_id: self.cfg.advertised_boot().clone(),
             agent_epoch: self.epoch,
             snapshot_digest: Digest::of_bytes(
                 format!("{}/{active}/{pending}", self.epoch.0).as_bytes(),

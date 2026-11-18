@@ -27,6 +27,8 @@ pub use live_log::{LiveLogTarget, LogProgress};
 mod ci;
 pub use ci::{CiAttempt, CiTaskRow};
 mod control;
+mod identity;
+pub use identity::Forgotten;
 mod retry;
 pub use retry::{PreparedRetry, RetryPreparation};
 pub mod query;

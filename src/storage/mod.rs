@@ -27,10 +27,10 @@ mod worker;
 
 pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
 pub use coordinator::{
-    ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, InputCursor,
-    InputPage, LiveAttempt, LiveAttemptPage, NewAttempt, Permit, PlaceInput, PlaceOutcome,
-    Placement, PreparedRetry, QueuedTask, ResultRef, RetireEnd, RetryPreparation, RunStanding,
-    Seen, WorkerLoad, PAGE_MAX,
+    ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, Forgotten,
+    InputCursor, InputPage, LiveAttempt, LiveAttemptPage, NewAttempt, Permit, PlaceInput,
+    PlaceOutcome, Placement, PreparedRetry, QueuedTask, ResultRef, RetireEnd, RetryPreparation,
+    RunStanding, Seen, WorkerLoad, PAGE_MAX,
 };
 pub use coordinator::{CiAttempt, CiTaskRow};
 pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
