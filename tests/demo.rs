@@ -568,6 +568,70 @@ jobs:
 }
 
 #[test]
+fn a_waiting_line_written_in_two_parts_does_not_start_the_steps_clock() {
+    let d = demo("app/lib.sh");
+    // 6 seconds for the job; its steps run for about one
+    add_workflow(
+        &d,
+        "queue.yml",
+        r#"name: Queue
+on: pull_request
+jobs:
+  waiter:
+    runs-on: ubuntu-latest
+    timeout-minutes: 0.1
+    steps:
+      - run: echo one
+      - shell: python3 {0}
+        run: print("two")
+"#,
+    );
+    // A task-traffic-controller that waits 8 seconds, writing each "waiting" line
+    // and its newline apart (as `eprintln!` may), and a blank line: neither
+    // the newline nor the blank line is the command's output.
+    let bin = d.home.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("task-traffic-controller");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\n\
+         echo >&2\n\
+         for i in 1 2 3 4 5 6 7 8; do\n\
+         printf 'task-traffic-controller: waiting 0:0%s (queue)' \"$i\" >&2\n\
+         sleep 0.5\n\
+         printf '\\n' >&2\n\
+         sleep 0.5\n\
+         done\n\
+         exec \"$@\"\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+    let o = local_ci_path(
+        &d,
+        &path,
+        &[
+            "run",
+            "--no-status",
+            "--no-cache",
+            "--json",
+            "-w",
+            "queue.yml",
+        ],
+    );
+    let steps = job_steps(&o);
+    // the bash step and the python one (whose turn is read from the log alone)
+    assert_eq!(steps.len(), 2, "{steps:?}");
+    for s in &steps {
+        assert_eq!(s["result"], "pass", "{steps:?}");
+    }
+    let t = &job_times(&o)["waiter"];
+    assert!(t["wait_queue_secs"].as_f64().unwrap() > 14.0, "{t}");
+    assert!(t["work_secs"].as_f64().unwrap() < 6.0, "{t}");
+}
+
+#[test]
 fn the_running_of_the_steps_still_uses_up_the_jobs_timeout() {
     let d = demo("app/lib.sh");
     // 6 seconds for the job: the second step is stopped when they are over,

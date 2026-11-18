@@ -514,7 +514,9 @@ into a prefix of the run, so neither changes your machine.
 
 - **[task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller)**: when it is installed,
   every `run:` step, setup included, is wrapped in `task-traffic-controller exec`, so heavy steps
-  wait for CPU instead of piling up. Timeouts start when the step gets its turn,
+  wait for CPU instead of piling up. Timeouts start when the step gets its turn
+  (a bash or sh step marks it as its first act; for other shells, at the first
+  finished line of the log that is not blank and not task-traffic-controller's),
   and the wait does not count against the job's `timeout-minutes` (or
   `--job-timeout`) either: a job is over its time when its setup and the
   running of its steps add up to more than that. A step that is stopped at the

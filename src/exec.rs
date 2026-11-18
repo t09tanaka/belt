@@ -481,6 +481,21 @@ fn is_controller_line(line: &str) -> bool {
     line.starts_with(CONTROLLER_PREFIX)
 }
 
+/// Whether the finished lines of `b`, a step's log read from the start of a
+/// line, hold one that is the command's own: a line that is not blank and not
+/// task-traffic-controller's. A line without its newline yet is left out, as
+/// task-traffic-controller may write a line and its newline apart: the start
+/// of the next read would be a bare newline, and the rest of a line is not
+/// its prefix.
+fn command_spoke(b: &[u8]) -> bool {
+    let Some(end) = b.iter().rposition(|&c| c == b'\n') else {
+        return false;
+    };
+    String::from_utf8_lossy(&b[..end])
+        .lines()
+        .any(|l| !l.trim().is_empty() && !is_controller_line(l))
+}
+
 /// Its ledger lock timing out, so the command never ran.
 fn is_ledger_timeout_line(line: &str) -> bool {
     line.strip_prefix(CONTROLLER_PREFIX)
@@ -1403,13 +1418,14 @@ impl<'a> Runner<'a> {
                         let _ = lf.seek(SeekFrom::Start(seen));
                         let mut b = Vec::new();
                         let _ = lf.read_to_end(&mut b);
-                        seen = len;
-                        if String::from_utf8_lossy(&b)
-                            .lines()
-                            .any(|l| !is_controller_line(l))
-                        {
+                        if command_spoke(&b) {
                             started = Some(Instant::now());
                         }
+                        // a line not finished yet is read again with its end
+                        seen += b
+                            .iter()
+                            .rposition(|&c| c == b'\n')
+                            .map_or(0, |i| i as u64 + 1);
                     }
                 }
             }
@@ -4785,6 +4801,20 @@ mod tests {
         writeln!(f, "npm ERR! something").unwrap();
         assert!(!ledger_timed_out(&log, from));
         assert!(!ledger_timed_out(&log, 0));
+    }
+
+    #[test]
+    fn only_a_finished_line_of_the_commands_own_starts_its_clock() {
+        let p = "task-traffic-controller: waiting 0:08 (queue)";
+        // the newline written apart from its line, a blank line
+        assert!(!command_spoke(b"\n"));
+        assert!(!command_spoke(format!("\n{p}\n").as_bytes()));
+        assert!(!command_spoke(b"  \n\n"));
+        // a line not finished yet waits for its end
+        assert!(!command_spoke(b"hello"));
+        assert!(!command_spoke(format!("{p}\nhel").as_bytes()));
+        assert!(command_spoke(format!("{p}\nhello\n").as_bytes()));
+        assert!(command_spoke(b"hello\nwor"));
     }
 
     #[test]

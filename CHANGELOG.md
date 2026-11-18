@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Fix a step's clock starting while it still waited for task-traffic-controller, so that a step that runs for seconds timed out with only the controller's "waiting" lines in its log (`timed out after 599s (what was left of the job's 10 min)`). The log was read up to its end, and task-traffic-controller writes a line and its newline apart: a read that came between them left a bare newline for the next one, and that blank line was taken for the command's output. Only finished lines are read now, and blank lines are not the command's output. A job's `timeout-minutes` still counts only the running of its setup and steps, as since 0.17.2.
+
 ## [0.18.2] - 2026-11-17
 
 - Post the `local-ci` commit status only when origin is on github.com, or on the host named by `GH_HOST`. Before, `owner/name` was taken from any origin URL, so a GitLab, GitHub Enterprise or local-path origin could post to an unrelated repository on github.com. Any other origin is skipped with the reason, not a failure of the run.
