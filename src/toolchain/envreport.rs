@@ -379,7 +379,11 @@ mod tests {
         assert_eq!(digest("b", None), default);
         let four = digest("d", Some("budget = 4\n"));
         assert_eq!(digest("e", Some("budget = 4\n")), four);
-        assert_ne!(four, default);
+        let default_budget = task_traffic_controller::config::Config::default().budget;
+        assert_eq!(
+            digest("i", Some(&format!("budget = {default_budget}\n"))),
+            default
+        );
         assert_ne!(digest("f", Some("budget = 5\n")), four);
         // A configuration that cannot be read is not measured.
         assert_eq!(digest("g", Some("budget = 0\n")), None);
