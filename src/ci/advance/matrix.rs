@@ -67,7 +67,7 @@ struct Claim {
     dispatched: bool,
 }
 
-struct Journal<'a> {
+pub(super) struct Journal<'a> {
     driver: Driver,
     claims: BTreeMap<String, Claim>,
     store: &'a CoordinatorStore,
@@ -115,7 +115,7 @@ impl Event {
 }
 
 impl<'a> Journal<'a> {
-    fn open(
+    pub(super) fn open(
         store: &'a CoordinatorStore,
         results: &'a Path,
         run: &'a RunId,
@@ -254,17 +254,14 @@ impl<'a> Journal<'a> {
 }
 
 pub(super) fn advance(
-    store: &CoordinatorStore,
-    state_dir: &Path,
-    results: &Path,
-    run: &RunId,
+    mut journal: Journal<'_>,
     plan: &FrozenPlan,
     members: &BTreeMap<String, Member>,
     project: Option<&str>,
     now_ms: u64,
     pass: &mut Pass,
 ) -> Result<(), Fault> {
-    let mut journal = Journal::open(store, results, run, plan, state_dir)?;
+    let (store, results, run) = (journal.store, journal.results, journal.run);
     if !journal.driver.cancelled()
         && store
             .ci_run_cancelled(run, journal.authorization)

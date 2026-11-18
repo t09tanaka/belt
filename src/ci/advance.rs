@@ -349,17 +349,8 @@ fn advance_run(
     let plan: FrozenPlan = serde_json::from_slice(&read_plan(state_dir, &digest)?)
         .map_err(|e| unrunnable(format!("the frozen plan {digest}: {e}")))?;
     if matrix::applies(&plan) {
-        return matrix::advance(
-            store,
-            state_dir,
-            results,
-            run,
-            &plan,
-            &members,
-            project.as_deref(),
-            now_ms,
-            pass,
-        );
+        let journal = matrix::Journal::open(store, results, run, &plan, state_dir)?;
+        return matrix::advance(journal, &plan, &members, project.as_deref(), now_ms, pass);
     }
     let mut progress = replay(store, results, &plan, |task| {
         members.get(task).map(|member| &member.row)

@@ -1917,6 +1917,8 @@ pub struct ErrorResponse {
 /// are the protocol layer's concern).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Keep the public frame constructors consistent with Request. Each frame is processed individually.
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     Request(Request),
     Response {
