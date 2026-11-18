@@ -260,11 +260,15 @@ impl CoordinatorStore {
                 WHERE a.state <> 'terminal' OR (a.attempt_id IS NULL AND r.closed_at_ms IS NULL AND {uncancelled})
                 ORDER BY t.created_at_ms, t.task_id");
             let mut query = c.prepare(&sql)?;
-            let rows = query.query_map([], |r| Ok(MonitorTask {
+            let rows = query.query_map([], |r| Ok((MonitorTask {
                 task_id: r.get(0)?, run_id: r.get(1)?, label: r.get(2)?, worker_id: r.get(3)?,
-                state: r.get(4)?, observation: r.get(5)?, created_at_ms: r.get(6)?,
-            }))?;
-            Ok(rows.collect::<rusqlite::Result<_>>()?)
+                state: r.get(4)?, observation: r.get(5)?, created_at_ms: 0,
+            }, r.get::<_, i64>(6)?)))?;
+            rows.map(|row| {
+                let (mut task, created) = row?;
+                task.created_at_ms = to_u64(created)?;
+                Ok(task)
+            }).collect()
         })
     }
 }
