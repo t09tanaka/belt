@@ -184,6 +184,10 @@ pub struct TestResult {
     /// The name the runner lists the test by.
     pub identity: String,
     pub status: TestStatus,
+    /// Elapsed milliseconds for this runner's own unit (e.g. one Jest file).
+    /// Older receipts and reporters without a measurement leave it absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub millis: Option<u64>,
 }
 
 /// What one shard reported.
@@ -1222,6 +1226,7 @@ mod tests {
             tests: tests
                 .iter()
                 .map(|(i, s)| TestResult {
+                    millis: None,
                     identity: i.to_string(),
                     status: *s,
                 })

@@ -3204,7 +3204,7 @@ impl<'a> Runner<'a> {
 
             if let Some(uses) = &s.uses {
                 let (outcome, note) = match artifact::parse_uses(uses) {
-                    Some(Ok(kind)) => self.artifact_step(ws, w, job, &display, s, &scm, kind),
+                    Some(Ok(kind)) => self.artifact_step(ws, w, job, &display, n, s, &scm, kind),
                     Some(Err(e)) => (Outcome::Error(e), None),
                     None => self.check_action(uses, s, &scm),
                 };
@@ -3364,7 +3364,18 @@ impl<'a> Runner<'a> {
             // the step that runs the tests of a shard runs the shard's command
             // (after the expressions of the step were read: a name is not one)
             let script = match shard.filter(|t| t.step == n) {
-                Some(ts) => match shard_script(ts, &ws.join(&wd)) {
+                Some(ts) => match shard_script(ts, &ws.join(&wd)).and_then(|script| {
+                    if self
+                        .opts
+                        .executor
+                        .as_ref()
+                        .is_some_and(|host| host.verify_shard_runner())
+                    {
+                        crate::shard::adapters::guard_version(&ts.runner, script)
+                    } else {
+                        Ok(script)
+                    }
+                }) {
                     Ok(sc) => sc,
                     Err(e) => {
                         push(&mut steps, Outcome::Error(e.clone()), None, None, None);
@@ -3904,6 +3915,7 @@ impl<'a> Runner<'a> {
         w: &Workflow,
         job: &Job,
         display: &str,
+        step_index: usize,
         s: &Step,
         cm: &Map<String, Value>,
         kind: artifact::Kind,
@@ -3932,9 +3944,27 @@ impl<'a> Runner<'a> {
             display: display.to_string(),
             task,
         };
-        let done = match kind {
-            artifact::Kind::Upload => artifact_io::upload(&area, &who, ws, &with),
-            artifact::Kind::Download => artifact_io::download(&area, ws, &with),
+        let request = crate::ArtifactRequest {
+            kind,
+            area: &area,
+            who: &who,
+            workflow: &w.file,
+            workspace: ws,
+            with: &with,
+            step_index,
+            variant: job
+                .matrix
+                .as_ref()
+                .and_then(|_| cm.get("strategy"))
+                .and_then(|s| s.get("job-index"))
+                .and_then(Value::as_u64),
+            cancel: &self.ctx.cancel,
+        };
+        let done = match self.opts.executor.as_deref() {
+            Some(host) => {
+                artifact::validate_run(kind, &with).and_then(|()| host.artifact(&request))
+            }
+            None => request.run_local(),
         };
         match done {
             Ok(note) => {

@@ -13,7 +13,7 @@ use crate::context::CancelHandle;
 use crate::exec::Exit;
 use anyhow::Result;
 use std::os::fd::RawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Runs the shell command of one step.
@@ -78,6 +78,50 @@ use std::time::Duration;
 ///   information and is not used.
 pub trait StepExecutor: Send + Sync {
     fn run(&self, req: &StepRequest) -> Result<StepExit>;
+
+    /// A distributed host may have discovered tests on a different worker.
+    /// When enabled the installed runner must match the frozen shard before
+    /// any test is started. The check runs in the test step after its setup.
+    fn verify_shard_runner(&self) -> bool {
+        false
+    }
+
+    /// Perform a resolved upload/download step. A distributed executor returns
+    /// upload success only after its workflow-scoped store durably accepts the
+    /// files. Errors become step errors. Implementations waiting on the store
+    /// must observe the attempt's cancellation. The default uses the run's
+    /// local artifact area, as does a runner without an external executor.
+    fn artifact(&self, request: &ArtifactRequest<'_>) -> Result<String, String> {
+        request.run_local()
+    }
+}
+
+/// One invocation of an artifact action after expression evaluation. A host
+/// can key retries by its own attempt identity, job, variant, and step index.
+pub struct ArtifactRequest<'a> {
+    pub kind: crate::artifact::Kind,
+    pub workflow: &'a str,
+    pub area: &'a crate::artifact_io::Area,
+    pub who: &'a crate::artifact_io::Who,
+    pub workspace: &'a Path,
+    pub with: &'a [(String, String)],
+    pub step_index: usize,
+    pub variant: Option<u64>,
+    pub cancel: &'a CancelHandle,
+}
+
+impl ArtifactRequest<'_> {
+    /// Apply the standard path, file selection, digest, and conflict checks to the local area.
+    pub fn run_local(&self) -> Result<String, String> {
+        match self.kind {
+            crate::artifact::Kind::Upload => {
+                crate::artifact_io::upload(self.area, self.who, self.workspace, self.with)
+            }
+            crate::artifact::Kind::Download => {
+                crate::artifact_io::download(self.area, self.workspace, self.with)
+            }
+        }
+    }
 }
 
 /// One step to run; see [`StepExecutor`] for what the implementation owes.

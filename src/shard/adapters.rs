@@ -394,6 +394,46 @@ pub fn from_info(info: &RunnerInfo, root: &str) -> Option<Box<dyn RunnerAdapter>
     })
 }
 
+/// Inspect the same local tool installation both while enumerating tests
+/// and at the start of a distributed shard. These commands never install it.
+pub fn version_command(runner: &str) -> Option<&'static str> {
+    Some(match runner {
+        "cargo-test" => "cargo --version",
+        "vitest" => r#"node -p "require('vitest/package.json').version""#,
+        "jest" => r#"node -p "require('jest/package.json').version""#,
+        "playwright" => r#"node -p "require('playwright/package.json').version""#,
+        "cypress" => r#"node -p "require('cypress/package.json').version""#,
+        _ => return None,
+    })
+}
+
+pub(crate) fn guard_version(info: &RunnerInfo, script: String) -> Result<String, String> {
+    let command = version_command(&info.runner)
+        .ok_or_else(|| format!("unknown shard runner {}", info.runner))?;
+    let expected = shlex::try_quote(&info.version)
+        .map_err(|_| "invalid discovery runner version".to_owned())?;
+    if info.version.is_empty()
+        || info.version.len() > 256
+        || info.version.chars().any(char::is_control)
+    {
+        return Err("invalid discovery runner version".into());
+    }
+    let runner = &info.runner;
+    Ok(format!(
+        r#"if ! actual=$({command}); then
+    printf '%s\n' 'shard runner version unavailable ({runner})' >&2
+    exit 86
+fi
+if [ "$actual" != {expected} ]; then
+    case "$actual" in *[![:print:]]*) actual='[non-printable]' ;; esac
+    if [ "${{#actual}}" -gt 256 ]; then actual='[oversized]'; fi
+    printf 'shard runner version mismatch ({runner}): expected %s, got %s\n' {expected} "$actual" >&2
+    exit 86
+fi
+{script}"#
+    ))
+}
+
 /// A command as the text of a shell script (the words quoted), and `None` for
 /// a word a shell cannot be given.
 pub fn script_of(inv: &Invocation) -> Option<String> {
@@ -634,6 +674,7 @@ impl RunnerAdapter for CargoTest {
                     _ => return None,
                 };
                 Some(TestResult {
+                    millis: None,
                     identity: name.strip_suffix(" - should panic").unwrap_or(name).into(),
                     status,
                 })
@@ -718,6 +759,16 @@ fn file_status(file: &str, tests: &[&str]) -> TestStatus {
     }
 }
 
+/// Jest and Vitest report suite start/end as epoch milliseconds. Round
+/// their difference once to preserve sub-millisecond timestamps. Reports
+/// without a completed interval contribute no timing sample.
+fn js_file_millis(file: &Value) -> Option<u64> {
+    let start = file.get("startTime")?.as_f64()?;
+    let end = file.get("endTime")?.as_f64()?;
+    let millis = (end - start).round();
+    (start > 0.0 && end >= start && millis < u64::MAX as f64).then_some(millis as u64)
+}
+
 /// The files of a Vitest or Jest JSON report, by the name they are listed by.
 fn collect_js(root: &str, job_id: &str, shard_id: &str, out: &CommandOutput) -> ShardOutcome {
     let report = json_of(&out.stdout);
@@ -740,6 +791,7 @@ fn collect_js(root: &str, job_id: &str, shard_id: &str, out: &CommandOutput) -> 
                 .filter_map(|t| t.get("status").and_then(Value::as_str))
                 .collect();
             Some(TestResult {
+                millis: js_file_millis(r),
                 identity: relative(root, name),
                 status: file_status(own, &tests),
             })
@@ -1002,6 +1054,7 @@ impl PwTest {
             _ => TestStatus::Failed,
         };
         TestResult {
+            millis: None,
             identity: self.identity(),
             status,
         }
@@ -1219,7 +1272,11 @@ fn pw_fold(results: Vec<TestResult>, given: &[String]) -> Vec<TestResult> {
             } else {
                 TestStatus::Passed
             };
-            TestResult { identity, status }
+            TestResult {
+                identity,
+                status,
+                millis: None,
+            }
         })
         .collect()
 }
@@ -1446,6 +1503,7 @@ fn cypress_report(stdout: &str) -> Option<Vec<TestResult>> {
                 TestStatus::Skipped
             };
             Some(TestResult {
+                millis: None,
                 identity: r.get("spec")?.as_str()?.to_string(),
                 status,
             })
@@ -1571,6 +1629,92 @@ impl RunnerAdapter for Cypress {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_guard_checks_each_local_runner_and_rejects_invalid_receipts() {
+        for (runner, command) in [
+            ("cargo-test", "cargo --version"),
+            ("jest", r#"node -p "require('jest/package.json').version""#),
+            (
+                "vitest",
+                r#"node -p "require('vitest/package.json').version""#,
+            ),
+            (
+                "playwright",
+                r#"node -p "require('playwright/package.json').version""#,
+            ),
+            (
+                "cypress",
+                r#"node -p "require('cypress/package.json').version""#,
+            ),
+        ] {
+            assert_eq!(version_command(runner), Some(command));
+        }
+        let mut info = RunnerInfo {
+            runner: "unknown".into(),
+            version: "v1".into(),
+            ..Default::default()
+        };
+        assert!(guard_version(&info, String::new())
+            .unwrap_err()
+            .contains("unknown shard runner"));
+        info.runner = "cargo-test".into();
+        for invalid in [String::new(), "x".repeat(257), "v1\n".into(), "v1\0".into()] {
+            info.version = invalid;
+            assert_eq!(
+                guard_version(&info, String::new()).unwrap_err(),
+                "invalid discovery runner version"
+            );
+        }
+        info.version = "x".repeat(256);
+        assert!(guard_version(&info, String::new()).is_ok());
+    }
+
+    #[test]
+    fn distributed_shard_version_guard_runs_tests_only_on_the_discovered_version() {
+        let info = RunnerInfo {
+            runner: "cargo-test".into(),
+            version: "cargo 1.90.0 (example build)".into(),
+            ..Default::default()
+        };
+        let ctx = ExecContext::new(Default::default());
+        let guarded = guard_version(&info, "printf 'ran-tests'".into()).unwrap();
+        let run = |actual: &str, status: i32| {
+            let script = format!(
+                r#"cargo() {{ printf '%s' "$STUB_VERSION"; return {status}; }}
+{guarded}"#
+            );
+            ctx.command("/bin/sh")
+                .args(["-c", &script])
+                .env("STUB_VERSION", actual)
+                .output()
+                .unwrap()
+        };
+        let matched = run(&info.version, 0);
+        assert!(matched.status.success());
+        assert_eq!(matched.stdout, b"ran-tests");
+        let different = run("cargo 1.91.0", 0);
+        assert_eq!(different.status.code(), Some(86));
+        assert!(different.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&different.stderr)
+            .contains("expected cargo 1.90.0 (example build), got cargo 1.91.0"));
+        let missing = run("", 1);
+        assert_eq!(missing.status.code(), Some(86));
+        assert!(missing.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("unavailable"));
+        let quoted = RunnerInfo {
+            version: "v1'; echo injected; #".into(),
+            ..info
+        };
+        let script = guard_version(&quoted, "printf ran".into()).unwrap();
+        let mismatch = ctx
+            .command("/bin/sh")
+            .args(["-c", &format!("cargo() {{ echo v2; }}\n{script}")])
+            .output()
+            .unwrap();
+        assert_eq!(mismatch.status.code(), Some(86));
+        assert!(mismatch.stdout.is_empty());
+    }
 
     fn out(stdout: &str, success: bool) -> CommandOutput {
         CommandOutput {
@@ -1740,6 +1884,37 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
             ["npx", "vitest", "run", "--reporter=json", "--config=v.js"]
         );
         assert!(v.capabilities().native_shard);
+    }
+
+    #[test]
+    fn js_file_timings_survive_receipts_and_bad_intervals_remain_missing() {
+        let report = r#"{"testResults":[
+          {"name":"/p/a","startTime":100.5,"endTime":119.1},
+          {"name":"/p/b","startTime":75,"endTime":75},
+          {"name":"/p/c","startTime":100,"endTime":99},
+          {"name":"/p/d","endTime":110},
+          {"name":"/p/e","startTime":0,"endTime":110},
+          {"name":"/p/f","startTime":1,"endTime":1e30}]}"#;
+        for result in [
+            Jest::new("1", "/p", &[], Safety::default()).collect("j", "s", &out(report, true)),
+            Vitest::new("1", "/p", &[], Safety::default()).collect("j", "s", &out(report, true)),
+        ] {
+            assert_eq!(
+                result.tests.iter().map(|r| r.millis).collect::<Vec<_>>(),
+                [Some(19), Some(0), None, None, None, None]
+            );
+            assert_eq!(result.tests[0].identity, "a");
+            let encoded = serde_json::to_value(&result).unwrap();
+            assert_eq!(encoded["tests"][0]["millis"], 19);
+            assert!(encoded["tests"][2].get("millis").is_none());
+            assert_eq!(
+                serde_json::from_value::<ShardOutcome>(encoded).unwrap(),
+                result
+            );
+        }
+        let old: TestResult =
+            serde_json::from_str(r#"{"identity":"old","status":"passed"}"#).unwrap();
+        assert_eq!(old.millis, None);
     }
 
     #[test]
@@ -2913,6 +3088,7 @@ test d - should panic ... ok\ntest e ... bench\nnot a test line\ntest f without 
         // a file whose name starts like a given file is not part of it
         let r = pw_fold(
             vec![TestResult {
+                millis: None,
                 identity: "[d] › a.spec.jsx › t".into(),
                 status: Passed,
             }],
