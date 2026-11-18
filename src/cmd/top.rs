@@ -315,14 +315,32 @@ fn project(e: &Entry) -> String {
 /// The `--label`; otherwise the script's file name for `bash ... step.sh`
 /// style commands; otherwise the whole command line.
 fn job_name(e: &Entry) -> String {
-    if let Some(l) = e.label.as_deref().filter(|l| !l.is_empty()) {
-        return l.to_string();
+    let inner = portool_command(&e.argv);
+    let argv = inner.unwrap_or(&e.argv);
+    let name = e
+        .label
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| script_name(argv))
+        .unwrap_or_else(|| argv.to_owned());
+    if inner.is_some() {
+        format!("{name} [portool]")
+    } else {
+        name
     }
-    job_of_argv(&e.argv)
 }
 
-fn job_of_argv(argv: &str) -> String {
-    script_name(argv).unwrap_or_else(|| argv.to_string())
+/// Ledger entries store a space-joined display string. Only unwrap a leading
+/// portool exec with its required command separator; leave inner flags intact.
+fn portool_command(argv: &str) -> Option<&str> {
+    let (wrapper, inner) = argv.split_once(" -- ")?;
+    let mut words = wrapper.split_whitespace();
+    if Path::new(words.next()?).file_name()? != "portool" || words.next()? != "exec" {
+        return None;
+    }
+    let inner = inner.trim_start();
+    (!inner.is_empty()).then_some(inner)
 }
 
 fn script_name(argv: &str) -> Option<String> {
@@ -1525,6 +1543,36 @@ mod tests {
         assert_eq!(project(&e), "web");
         e.repo.clear();
         assert_eq!(project(&e), "-");
+    }
+
+    #[test]
+    fn top_names_the_job_inside_portool_and_marks_the_wrapper() {
+        let mut e = entry(
+            "a",
+            State::Running,
+            1,
+            1,
+            "/r/web",
+            "api",
+            "x",
+            Utc::now(),
+            1,
+        );
+        e.argv =
+            "/opt/tools/portool exec -e ./local.env --strict -- cargo test -- --exact suite".into();
+        assert_eq!(job_name(&e), "cargo test -- --exact suite [portool]");
+        e.argv = "portool exec -- /bin/bash ./steps/check.sh".into();
+        assert_eq!(job_name(&e), "check.sh [portool]");
+        e.label = Some("CI checks".into());
+        assert_eq!(job_name(&e), "CI checks [portool]");
+        for ordinary in [
+            "echo portool exec -- hello",
+            "portool check -- all",
+            "portool exec --help",
+            "portool exec -- ",
+        ] {
+            assert_eq!(portool_command(ordinary), None);
+        }
     }
 
     #[test]
