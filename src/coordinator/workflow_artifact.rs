@@ -54,19 +54,6 @@ impl Coordinator {
         if !raw["ci_task"]["artifact_workflow"].is_string() {
             return Ok(());
         }
-        let payload: AttemptPayload = serde_json::from_value(raw.clone())
-            .map_err(|e| CoordinatorError::Invalid(e.to_string()))?;
-        if payload_hash(&payload).ok().as_ref() != Some(&live.record.payload_hash) {
-            return Err(CoordinatorError::Invalid(
-                "artifact placement payload mismatch".into(),
-            ));
-        }
-        let Some(ci) = payload.ci_task else {
-            return Ok(());
-        };
-        let Some(workflow) = ci.artifact_workflow.clone() else {
-            return Ok(());
-        };
         let Some(ArtifactExchangeResult::Pending {
             action: Some(action),
         }) = self
@@ -76,17 +63,19 @@ impl Coordinator {
             return Ok(());
         };
         let key = action.key.clone();
-        let result = self
-            .process_artifact(link, &live.record, payload.run_id, workflow, ci, action)
-            .await;
-        let answer = match result {
+        let answer = match self.placed_artifact(link, live, raw, action).await {
             Ok(Some(ok)) => ok,
             Ok(None) => return Ok(()),
-            Err(
-                CoordinatorError::Invalid(reason)
-                | CoordinatorError::Storage(StorageError::Invalid(reason)),
-            ) => ArtifactAnswer::Failed { reason },
-            Err(e) => return Err(e),
+            // What went wrong with this one action is the answer to it: the
+            // step that asked fails, and the walk goes on to the next attempt.
+            Err(e) => {
+                let reason = action_failure(e)?;
+                eprintln!(
+                    "workflow artifact action of attempt {} failed: {reason}",
+                    live.record.attempt_id
+                );
+                ArtifactAnswer::Failed { reason }
+            }
         };
         self.artifact_call(
             link,
@@ -95,6 +84,30 @@ impl Coordinator {
         )
         .await?;
         Ok(())
+    }
+    /// The action of a step, in the run and workflow its placement fixed.
+    async fn placed_artifact(
+        &self,
+        link: &dyn WorkerLink,
+        live: &LiveAttempt,
+        raw: &serde_json::Value,
+        action: ArtifactAction,
+    ) -> Result<Option<ArtifactAnswer>> {
+        let invalid = |s: &str| CoordinatorError::Invalid(s.into());
+        let payload: AttemptPayload = serde_json::from_value(raw.clone())
+            .map_err(|e| CoordinatorError::Invalid(e.to_string()))?;
+        if payload_hash(&payload).ok().as_ref() != Some(&live.record.payload_hash) {
+            return Err(invalid("artifact placement payload mismatch"));
+        }
+        let ci = payload
+            .ci_task
+            .ok_or_else(|| invalid("artifact placement is not a CI task"))?;
+        let workflow = ci
+            .artifact_workflow
+            .clone()
+            .ok_or_else(|| invalid("artifact placement has no workflow"))?;
+        self.process_artifact(link, &live.record, payload.run_id, workflow, ci, action)
+            .await
     }
     async fn process_artifact(
         &self,
@@ -157,10 +170,12 @@ impl Coordinator {
                 let state = self.store.state_dir().to_owned();
                 let verified = receipt.clone();
                 let wf = workflow.clone();
+                let declaring = attempt.clone();
                 let files = tokio::task::spawn_blocking(move || {
-                    verify_manifest(&state, &ci, &wf, &verified)?;
-                    ResultStore::open(&state.join("results"))
-                        .map_err(|e| CoordinatorError::Results(e.to_string()))
+                    let files = ResultStore::open(&state.join("results"))
+                        .map_err(|e| CoordinatorError::Results(e.to_string()))?;
+                    verify_manifest(&state, &files, &declaring, &ci, &wf, &verified)?;
+                    Ok::<_, CoordinatorError>(files)
                 })
                 .await
                 .map_err(|_| CoordinatorError::Aborted)??;
@@ -271,8 +286,58 @@ fn store_error(e: impl std::fmt::Display) -> StorageError {
     StorageError::Corrupt(e.to_string())
 }
 
+/// What one failed action answers its step, or the error that stops the
+/// walk: this process is not the coordinator any more, or its database (not
+/// one row or one file of it) cannot be used now. Such an error says nothing
+/// about the action, which is asked again by the next poll.
+fn action_failure(e: CoordinatorError) -> Result<String> {
+    match e {
+        CoordinatorError::Fenced(_)
+        | CoordinatorError::Aborted
+        | CoordinatorError::Storage(
+            StorageError::Sqlite(_)
+            | StorageError::Busy
+            | StorageError::Incompatible(_)
+            | StorageError::KindMismatch { .. }
+            | StorageError::Locked(_)
+            | StorageError::StaleEpoch { .. }
+            | StorageError::Closed
+            | StorageError::Panicked,
+        ) => Err(e),
+        CoordinatorError::Invalid(reason)
+        | CoordinatorError::Storage(StorageError::Invalid(reason)) => Ok(reason),
+        e => Ok(e.to_string()),
+    }
+}
+
+/// A digest names bytes of one length. A declaration that gives it another
+/// length than the file this producer already published under it, or two
+/// lengths at once, is refused here: the published file is left as it is.
+fn declared_sizes(files: &ResultStore, producer: &AttemptId, receipt: &Receipt) -> Result<()> {
+    let invalid = |s: &str| CoordinatorError::Invalid(s.into());
+    let mut sizes = BTreeMap::new();
+    for f in &receipt.files {
+        let digest = Digest::parse(&format!("sha256:{}", f.sha256))
+            .map_err(|_| invalid("invalid file digest"))?;
+        if *sizes.entry(f.sha256.as_str()).or_insert(f.size) != f.size {
+            return Err(invalid("artifact declares one digest with two sizes"));
+        }
+        let published = files
+            .published_len(producer, &digest)
+            .map_err(|e| CoordinatorError::Results(e.to_string()))?;
+        if published.is_some_and(|len| len != f.size) {
+            return Err(invalid(
+                "artifact size conflicts with the published file of its digest",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_manifest(
     state: &std::path::Path,
+    files: &ResultStore,
+    producer: &AttemptId,
     ci: &CiTask,
     workflow: &str,
     receipt: &Receipt,
@@ -295,6 +360,7 @@ fn verify_manifest(
             .filter(|v| *v <= crate::outputs::MAX_BUNDLE_BYTES)
             .ok_or_else(|| invalid("artifact exceeds size limit"))?;
     }
+    declared_sizes(files, producer, receipt)?;
     let bytes = crate::ci::advance::plan_bytes(state, &ci.plan_digest)
         .map_err(CoordinatorError::Results)?;
     let plan: local_ci::FrozenPlan =

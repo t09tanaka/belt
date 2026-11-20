@@ -722,6 +722,16 @@ impl ResultStore {
         Ok(remove_if_there(&self.log_path(attempt, stream))?)
     }
 
+    /// The length of the published file with `digest`, when one is there.
+    /// Nothing is hashed and nothing is changed.
+    pub fn published_len(&self, attempt: &AttemptId, digest: &Digest) -> Result<Option<u64>> {
+        match fs::symlink_metadata(self.artifact_path(attempt, digest)) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// How far the artifact with `digest` (of `size` bytes) is. A published
     /// file is hashed again: it counts only if it is the recorded one, and
     /// one that is not (it was damaged where it lay) is removed. Arrived

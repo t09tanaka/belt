@@ -185,14 +185,24 @@ impl CoordinatorStore {
                 rows.collect::<std::result::Result<_,_>>()?
             };
             let mut report=ResultGcPage{examined:refs.len() as u32,next:if refs.len()==limit as usize {refs.last().map(|r|r.0.clone())}else{None},..Default::default()};
+            // Every reference of a page is of this one run: its end is read once.
+            let mut run_end:Option<Option<u64>>=None;
             for (reference,attempt,locator,pins) in refs {
                 if !ResultStore::owns(&locator) {report.foreign+=1;continue;}
+                // A later job of the run may still download what an attempt
+                // that ended long ago uploaded: such a file stays while the
+                // run is open, and for the whole retention after its end.
+                let later=if reference.starts_with(workflow_artifact::REF_PREFIX) {
+                    let end=match run_end {Some(end)=>end,None=>*run_end.insert(workflow_run_end(tx,&run)?)};
+                    let Some(end)=end else {continue};
+                    end
+                } else {0};
                 let rec=load_attempt(tx,&attempt)?.ok_or_else(||not_found("GC attempt"))?;
                 let blocked:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM attempt a LEFT JOIN collection c USING(attempt_id) WHERE a.attempt_id=?1 AND (a.observation<>'known' OR (a.state<>'terminal' AND a.retired=0) OR (a.retired=0 AND (c.closed_at_ms IS NULL OR (c.acked_at_ms IS NULL AND a.collection_failed_at_ms IS NULL)))))",[&attempt],|r|r.get(0))?;
                 if blocked {continue;}
                 let (required,persisted)=artifact_counts(tx,&attempt)?;
                 let closed=collect::closed_at(tx,&attempt)?;
-                let facts=GcCandidate{terminal_at_ms:rec.terminal_at_ms.map(|t|t.max(closed.unwrap_or(0))),retired_at_ms:rec.retired_at_ms,collected:rec.receipts.reached(Receipt::Collected),collection_failed_at_ms:rec.collection_failed_at_ms,missing_required_artifacts:required-persisted,pins};
+                let facts=GcCandidate{terminal_at_ms:rec.terminal_at_ms.map(|t|t.max(closed.unwrap_or(0)).max(later)),retired_at_ms:rec.retired_at_ms.map(|t|t.max(later)),collected:rec.receipts.reached(Receipt::Collected),collection_failed_at_ms:rec.collection_failed_at_ms,missing_required_artifacts:required-persisted,pins};
                 if facts.ended_at_ms().is_some_and(|ended|ended>now) {continue;}
                 if decide_gc(&facts,now,retention,None)!=GcVerdict::Collect {continue;}
                 // A foreign run sharing a locator is retained rather than assigning
@@ -254,6 +264,30 @@ impl CoordinatorStore {
             Ok(())
         })
     }
+}
+
+/// When the run ended, for the files its jobs hand to each other; `None`
+/// while a job may still ask for one. A run has ended when every task is
+/// computed as the listing of runs counts it (`compute_complete`: its current
+/// attempt has its termination, or it was cancelled before it was placed) and
+/// no attempt of the run is still live. The end is the latest moment an
+/// attempt ended, a task was cancelled or the run was closed.
+fn workflow_run_end(c: &Connection, run: &str) -> Result<Option<u64>> {
+    if !query::run_facts(c, run, true, true)?.compute_complete {
+        return Ok(None);
+    }
+    let (live, ended): (bool, i64) = c.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1 AND a.retired=0 AND a.state<>'terminal'),
+            max((SELECT coalesce(max(coalesce(a.terminal_at_ms,a.retired_at_ms,0)),0) FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1),
+                (SELECT coalesce(max(t.cancel_requested_at_ms),0) FROM task t WHERE t.run_id=?1),
+                (SELECT coalesce(max(closed_at_ms),0) FROM run WHERE run_id=?1))",
+        [run],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    if live {
+        return Ok(None);
+    }
+    to_u64(ended).map(Some)
 }
 
 /// Caller holds source EX; history scan is deliberate and not a bounded-ref claim.

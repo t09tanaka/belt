@@ -71,7 +71,12 @@ pub struct RunFacts {
     pub compute_complete: bool,
     pub collection_complete: bool,
 }
-fn run_facts(c: &Connection, run: &str, cancel: bool, collections: bool) -> Result<RunFacts> {
+pub(super) fn run_facts(
+    c: &Connection,
+    run: &str,
+    cancel: bool,
+    collections: bool,
+) -> Result<RunFacts> {
     // Same current-attempt selection and cancelled-unplaced exception as
     // run_standing. The engine aggregates without materializing task rows.
     let cancelled = if cancel {

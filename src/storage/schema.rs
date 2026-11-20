@@ -405,6 +405,12 @@ UPDATE matrix_permit SET held=0,released_at_ms=(
     fingerprint TEXT NOT NULL,
     PRIMARY KEY(producer,action_key)
 ) WITHOUT ROWID;"#.into(),
+            // Step 13 released only the held permits of an ended attempt. A
+            // permit that an earlier binary reserved and never bound to an
+            // attempt belongs to nothing that can end: a reservation and its
+            // binding are one commit now, so no such permit is in use while
+            // this runs, and its slot is given back.
+            "UPDATE matrix_permit SET held=0,released_at_ms=coalesce(released_at_ms,created_at_ms) WHERE held=1 AND attempt_id IS NULL;".into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

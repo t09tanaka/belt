@@ -5420,6 +5420,161 @@ jobs:
     );
 }
 
+#[tokio::test]
+async fn a38_a_failed_artifact_action_fails_its_step_and_the_others_are_still_driven() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let workflow = r#"on: push
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: result.dat
+      - run: echo still-running
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+"#;
+    let plan = ci_plan(workflow);
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    // Both jobs are live on the one worker: one walk drives them in turn.
+    assert_eq!(c.tick().await.unwrap().placed.len(), 2);
+    let attempt_of = |job: &str| {
+        c.store().attempts_of_task(&ids[job]).unwrap()[0]
+            .attempt_id
+            .clone()
+    };
+    let (producer, consumer) = (attempt_of("produce"), attempt_of("consume"));
+    let contents = b"seventeen bytes!!".to_vec();
+    let digest = Digest::of_bytes(&contents);
+    let logical = &plan
+        .tasks
+        .iter()
+        .find(|t| t.jobs.iter().any(|j| j == "produce"))
+        .unwrap()
+        .workflow;
+    let upload_of = |key: &[u8], size: usize, overwrite: bool| ArtifactAction {
+        key: Digest::of_bytes(key),
+        intent: ArtifactIntent::Upload {
+            overwrite,
+            receipt: json!({
+                "name":"package","version":1,"files":[{"path":"result.dat","size":size,"sha256":digest.as_str().strip_prefix("sha256:").unwrap()}],
+                "plan_digest":plan.digest,"attempt_id":"run","job":format!("{logical}::produce"),"display":"produce","task":null,"retention_days":null,
+            }),
+        },
+    };
+    let answer_of = |key: &Digest| {
+        fx.w.state
+            .lock()
+            .unwrap()
+            .artifact_answers
+            .get(key)
+            .cloned()
+    };
+    let upload = upload_of(b"upload", contents.len(), false);
+    fx.w.set(|s| {
+        s.artifact_data.insert(digest.clone(), contents.clone());
+        s.pending_artifacts.insert(producer.clone(), upload.clone());
+    });
+    for _ in 0..4 {
+        c.tick().await.unwrap();
+    }
+    assert_eq!(
+        answer_of(&upload.key),
+        Some(ArtifactAnswer::Uploaded { version: 1 })
+    );
+    assert_eq!(
+        c.store().workflow_artifacts(&run, logical).unwrap().len(),
+        1
+    );
+    let published = files.artifact_path(&producer, &digest);
+    assert_eq!(std::fs::read(&published).unwrap(), contents);
+
+    // A later declaration of the published digest with another size is
+    // refused, and the published file stays as it is.
+    let resized = upload_of(b"resized", contents.len() + 1, true);
+    fx.w.set(|s| {
+        s.pending_artifacts
+            .insert(producer.clone(), resized.clone());
+    });
+    c.tick().await.unwrap();
+    assert!(
+        matches!(answer_of(&resized.key), Some(ArtifactAnswer::Failed { reason }) if reason.contains("size conflicts")),
+        "{:?}",
+        answer_of(&resized.key)
+    );
+    assert_eq!(std::fs::read(&published).unwrap(), contents);
+    // So is one declaration that gives a digest two sizes at once.
+    let mut twice = upload_of(b"twice", contents.len(), true);
+    let ArtifactIntent::Upload { receipt, .. } = &mut twice.intent else {
+        unreachable!()
+    };
+    let mut second = receipt["files"][0].clone();
+    second["path"] = json!("copy.dat");
+    second["size"] = json!(contents.len() + 1);
+    receipt["files"].as_array_mut().unwrap().push(second);
+    fx.w.set(|s| {
+        s.pending_artifacts.insert(producer.clone(), twice.clone());
+    });
+    c.tick().await.unwrap();
+    assert!(
+        matches!(answer_of(&twice.key), Some(ArtifactAnswer::Failed { reason }) if reason.contains("two sizes")),
+        "{:?}",
+        answer_of(&twice.key)
+    );
+    assert_eq!(std::fs::read(&published).unwrap(), contents);
+    assert_eq!(fx.w.offsets("workflow_read"), [0]);
+
+    // The file is gone from the result store. Whichever of the two attempts
+    // the walk reaches first, the fetch of one fails its own step only and
+    // the action of the other is answered in the same walk.
+    std::fs::remove_file(&published).unwrap();
+    for (n, (broken, other)) in [(&producer, &consumer), (&consumer, &producer)]
+        .into_iter()
+        .enumerate()
+    {
+        let fetch = ArtifactAction {
+            key: Digest::of_bytes(format!("fetch-{n}").as_bytes()),
+            intent: ArtifactIntent::Fetch {
+                producer: producer.clone(),
+                name: "package".into(),
+                version: 1,
+                digest: digest.clone(),
+                offset: 0,
+            },
+        };
+        let catalog = ArtifactAction {
+            key: Digest::of_bytes(format!("catalog-{n}").as_bytes()),
+            intent: ArtifactIntent::Catalog {
+                name: Some("package".into()),
+                pattern: None,
+            },
+        };
+        fx.w.set(|s| {
+            s.pending_artifacts.insert(broken.clone(), fetch.clone());
+            s.pending_artifacts.insert(other.clone(), catalog.clone());
+        });
+        let report = c.tick().await.unwrap();
+        assert!(report.unknown.is_empty(), "{report:?}");
+        assert!(
+            matches!(answer_of(&fetch.key), Some(ArtifactAnswer::Failed { .. })),
+            "{:?}",
+            answer_of(&fetch.key)
+        );
+        assert!(
+            matches!(answer_of(&catalog.key), Some(ArtifactAnswer::Catalog { artifacts }) if artifacts.len() == 1),
+            "{:?}",
+            answer_of(&catalog.key)
+        );
+    }
+}
+
 #[test]
 fn a38_refuses_cross_run_artifact_options_before_any_job_can_be_placed() {
     let plan = ci_plan(
