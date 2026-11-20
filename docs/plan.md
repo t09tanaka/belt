@@ -1,6 +1,6 @@
 # belt 実装計画
 
-`docs/spec.md`（仕様版 1.3）の実装を、PR 単位に分けた計画である。仕様の受入条件 A01〜A49 は、この表のいずれかの行が担当する。
+`docs/spec.md`（仕様版 1.4）の実装を、PR 単位に分けた計画である。仕様の受入条件 A01〜A49、A51〜A54、A56〜A58 は、この表のいずれかの行が担当する（A50 と A55 は別の作業のために番号を空けてある）。
 
 ## 前提
 
@@ -47,7 +47,14 @@
 | S23 | belt | upgrade・rollback・doctor | drain → 配置 → 互換検査 → 切替 → health → resume、失敗時の rollback、doctor（task-traffic-controller runtime の互換・policy digest・state path・Docker の resource domain・service 環境での profile 検査） | A05・A34・A36 のテスト | Mac 以外 | S22 |
 | S24 | belt | Linux の常駐と Colab の一時 worker | Linux の systemd user service（install / start / stop / upgrade）、Colab の一時 worker（`worker --ephemeral` をノートブックから起動、利用者が用意したトンネル経由で親が SSH、起動ごとに新しい identity、`workers forget` で消滅を宣言したときだけ interrupted に確定） | Linux（CI の ubuntu）での install → start → stop の統合テスト、ephemeral の identity と forget のテスト | macOS の常駐（S22）、トンネルの提供 | S22・S23 |
 | S25 | belt | 1 台上の試験ハーネスと障害注入 | 複数 worker（別 state dir）を 1 台で立てる、kill 点・ACK 消失・時計のずれの注入口、A 対応表のうち実機不要のものを自動試験にまとめる | 実機不要の A がすべて自動で緑 | 実機の試験（S26） | S15・S16・S18・S23 |
-| S26 | belt | Docker での受入と初回リリース | 手元の Mac と Docker の複数 Linux worker で A01・A02・A24・A26・A34・A35・A37・A45・A46 の適用可能な範囲を検証、結果の報告、0.1.0 の `cargo publish` とタグ・Release | 適用可能な A が緑、§20 の完了報告。独立 Mac 固有の未検証項目は明記する | 追加 Mac の調達 | 全行、Docker。受入環境は下記に従う |
+| S26 | belt | Docker での受入と初回リリース | 手元の Mac と Docker の複数 Linux worker で A01・A02・A24・A26・A34・A35・A37・A45・A46 と、A51・A53・A54 の実機間でしか確かめられない部分（別マシンからの投入、実 SSH での鍵の配布、別マシンの停止）の適用可能な範囲を検証、結果の報告、0.1.0 の `cargo publish` とタグ・Release | 適用可能な A が緑、§20 の完了報告。独立 Mac 固有の未検証項目は明記する | 追加 Mac の調達 | 全行、Docker。受入環境は下記に従う |
+| WP24a | belt | 仕様: グループと、run を投げたメンバー | `docs/spec.md`（仕様版 1.4、第24章と関連章）、`docs/plan.md`（この行と WP24b〜WP24e・R68・R96、A51〜A54・A56〜A58 の対応） | 節番号と A 番号の参照が合っている。公開禁止語の grep が 0 件 | コード | なし |
+| WP24b | belt | グループのメンバーであることの確認と、投げたメンバーごとの所有 | hello の後の相互の `group_proof`（feature `group_membership_v1`、必須。hello の答えの nonce、proof の前に identity・epoch・能力を返さないこと、接続した側が worker の proof を確かめるまで仕事も secret も送らないこと）と断る理由（`group_mismatch`・`group_key_mismatch`・`member_identity_mismatch`・`identity_retired`）、メンバーの名前と `coordinator_id` の組の固定、グループ鍵の世代（番号と指紋、今の鍵と次の鍵）を持つ置き場（今の単一の `cluster_key_path` を世代 1 として引き継ぐ）、鍵の切替で接続を閉じること、次の鍵を持つ worker が断られた時点で自分で切り替えること、worker DB を `(coordinator_id, attempt_id)`・`(coordinator_id, task_id)` の鍵へ作り直すこと（drain 済みのときだけ。live な attempt があれば断る。古い行は捨てる）、`coordinator_id` ごとの `coordinator_epoch`・lease key・attempt の所有（他のメンバーの attempt は `NOT_FOUND`、同じ ID でも互いに `RETIRED`・`CONFLICT` を起こさない）、届かなかった attempt の tombstone の上限と消去、退役の通知 `identity_retired`（feature `identity_retired_v1`、必須。WP21 の残り）。worker DB の step 4、coordinator DB の step 20 | 仕様 §24.2 の認証・§24.3・§24.4 の所有と epoch のテスト。A53 のうち鍵の確認（相互の proof、名前の固定）と退役の通知、A58（live な attempt があるときの拒否と、drain 済みの移行）。A18・A19 が変わらず通る | 鍵の配布と更新の command（WP24d）、調停（WP24c） | WP24a |
+| WP24c | belt | 投げたメンバーをまたぐ調停と、断られた後の置き直し | worker が自分の設定の受付窓を全メンバーの合計で数えて断る（`overloaded_reason.reason = "capacity"`、feature `shared_admission_v1`、必須。断った worker は tombstone を含めて何も保存しない）、`inspect` の受付窓（上限・使用数・共有の有無）、投げた側が自分の値と worker の値の小さい方で数えること、forecast の `foreign_demand` と coverage の絞り込み、1 回だけ送って断られた attempt は retire なしで閉じて次の generation へ（理由 `capacity_refused` は自分の DB にだけ記録）、送信の結果が不確かな attempt は retire →未開始の確認→次の generation、一時的な除外と `task_waiting`（`capacity`）、配置理由と `estimate` の表示。coordinator DB の step 21（必要な場合） | 仕様 §24.4・§24.5 と A52 のテスト（2 つのメンバーの同時配置、断った worker に何も残らないこと、不確かな送信の後の遅れた submit が `RETIRED`、最大 1 回の開始、置き直す先が無いときの `task_waiting`、local worker が他のメンバーの仕事で埋まっているときの自分の run）。A06・A08・A19 が変わらず通る | メンバーごとの予約・比例配分（初回リリースに含めない） | WP24b |
+| WP24d | belt | メンバーの設定と CLI、鍵の配布と更新、1 台が両方の役割を持つこと | `[[workers]]` をメンバーの一覧として読む（自動発見なし、`id` はメンバーの名前）、`workers add` の SSH helper がグループの ID・鍵・名前を渡すこと（同じグループならそのまま、別のグループなら断り、`--move` と live な仕事が無いことの両方があるときだけ移す）、`group`・`group rotate-key`（各メンバーの一覧を集めて和集合を確かめる→配る→切り替えるの順、`--remove`・`--skip`、途中からの再開、別の指紋の次の鍵があるときの拒否、`--remove` が SSH 鍵を消す手順を表示すること）・`group send-key`（forget したメンバーを戻すときは worker identity を作り直す）、外したメンバーへ SSH で到達できる間の `group`・`doctor` の警告、鍵の更新で外したメンバーへの `workers forget`（lease と停止猶予が過ぎるまで断る）、既に belt を持つ host への `workers add` が 2 つ目の worker を作らないこと、導入済みの host での `init` が同じ resident に coordinator の役割を足すこと、local worker と他のメンバーが使う worker が同じ agent・同じ worker DB であること、`workers stop` の拒否（`--all-submitters`）、`doctor` と `group` の `group_key_mismatch` 表示 | 仕様 §4「グループの管理」・§5・§15・§24.1・§24.2 のテスト。A51 と A53（鍵の更新・削除・取り残されたメンバー・途中で落とした後の再開）と A54 の `stop` の拒否のうち、1 host で確かめられる部分。鍵が引数・ログ・journal に出ないことのテスト | メンバーの更新（R68）、遅い peer の切り離し（R96）、メンバーの一覧の自動同期 | WP24b |
+| WP24e | belt | 1 host 上の 2〜3 メンバーの受入 | S25 のハーネスで、別の state directory を持つ 2〜3 個のメンバーを 1 台に立てる。A51〜A54・A56〜A58 を自動試験にし、A 対応表と S25 の表へ試験名を書く。投げたメンバーの停止・答えないメンバー・鍵の更新の途中での停止の注入口 | A51〜A54・A56〜A58 が 1 host の自動試験で通る。実機間でしか確かめられない部分（別マシンの電源断、実 SSH での鍵の配布）は S26 の確認待ちとして区別して書く | 実機の受入（S26） | WP24c・WP24d・R68・R96 |
+| R68 | belt | resident が自分を更新する（メンバーの更新） | `belt upgrade [--binary <path>]`: 更新のための保留（drain とは別の永続状態で、`resume` では解けない）→受理済みの仕事の完了待ち→親 DB と worker DB を同じ時点で退避 → 版別 directory へ配置 → 互換検査 → service 切替 → 実行した CLI が health を確かめて commit → 保留を解く。commit までは coordinator の役割を adopt と lease 更新だけに制限し（配置・generation の作成・投入の受理・retire と cancel の送信・回収の確定をしない）、worker は他のメンバーからの状態を変える要求のすべてに、何も保存せず理由なしの `OVERLOADED` を返す。commit の期限は service の入口（更新されない側）が見張り、過ぎたら新しい版が応答していなくても元へ戻す。rollback は 2 つの DB を一緒に戻す。`workers upgrade` が相手のマシンで同じ手順を起こす。process lock で同時に 1 つ | 仕様 §24.8 と A57 のテスト（run を抱えたメンバーの更新で attempt を失わない、失敗時に 2 つの DB が一緒に元の版へ戻る、rollback の後に user command を再び開始しない＝二重実行が無い、試用中に別のメンバーが出した retire が rollback の後に届いて二重実行にならない、新しい版が応答しないときに入口が期限で戻す、N と N+1 のメンバーが両方向で動く） | release の成果物の自動取得 | WP24b・WP24d |
+| R96 | belt | 遅い・応答しないメンバーが CLI と他のメンバーを止めない | coordinator の tick が worker との通信を待つ間 actor を持ち続けない構造へ直す（worker ごとの独立した処理、actor へは結果だけ）。自分の DB だけで答えられる CLI 要求を他のメンバーの状態から切り離す。照会が要る CLI は答えた分だけ返す。受ける側で、あるメンバーの接続が他のメンバーへの応答を塞がないこと | 仕様 §24.7 と A56 のテスト。worker への呼び出しが永久に答えないままの状態で CLI 要求が完了することを構造として確かめ、加えて仮想の時計で 2 秒以内に返ることを測る、決定的なテスト（sleep に頼らない） | `worker_budget_ms` の既定値の変更 | なし（WP24b と並行可） |
 
 正式名は決定済みである（2026-11-20）。名前は belt、crate は `belt-cli`、バイナリは `belt`、lib は `belt` とする。旧名 remote-task-runner（略称 rtr）からの改名は WP22 で実施した。以降の記述は新名に揃えてある。
 
@@ -176,7 +183,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 - Docker 上の Linux worker と macOS ホストの結果は区別する。Docker を別の Mac 実機と記載せず、独立した Mac の sleep・boot・launchd・実機間転送など、代替できない項目は実機確認待ちとして A 対応表と最終報告へ残す。
 - 公開する版には Docker で確認した範囲と未検証範囲を明記する。実機未確認の項目を、A01〜A49 全件確認済みと報告しない。
 
-## A01〜A49 の対応
+## A01〜A49・A51〜A54・A56〜A58 の対応
 
 | A | 担当行 | 実機要 |
 |---|---|---|
@@ -207,6 +214,13 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A47 | S8 | |
 | A48 | S7 | |
 | A49 | S13（配置）・S3（設定）・S15a（設定から scheduler への接続） | |
+| A51 | WP24d・WP24e | ○（別マシン間は S26） |
+| A52 | WP24c・WP24b（所有と epoch）・WP24e | |
+| A53 | WP24b（鍵の確認・退役の通知）・WP24d（鍵の更新・削除）・WP24e | ○（実 SSH での鍵の配布は S26） |
+| A54 | WP24b（投げたメンバーごとの lease）・WP24d（`stop` の拒否）・WP24e | ○（別マシンの停止は S26） |
+| A56 | R96・WP24e | |
+| A57 | R68・WP24e | |
+| A58 | WP24b | |
 
 ### S25: 1 台上の試験ハーネスと A01〜A49 の自動試験の対応（2026-11-17）
 
@@ -1734,3 +1748,30 @@ FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard �
 - `gh` の時間切れで止めるのは直接の子 process だけ。`gh` が起こした孫 process（credential helper など）は残り得る。孫が pipe を持ったまま `gh` が失敗で終わると、出力の読み取りが孫の終了まで待つ。
 - `local-ci status` 側に同じ検証を適用する件（仕様の一文）は local-ci の側に既に有り（`publishable`）、この行では local-ci を変えていない。
 - tracked file の exclude や追加 input の扱いは `worktree_tree` の一致に任せている（ignored の secret_files は仕様どおり一致判定に入れない）。CI task は secret_files を伴う source をまだ断るので、その組み合わせの実 binary のテストは無い。
+
+### WP24: グループと、run を投げたメンバー（2026-11-20）
+
+仕様 第24章（仕様版 1.4）の実装行は、分割表の WP24a〜WP24e・R68・R96 である。採用しなかった案（Raft などの合意による構成と、メンバーごとの信頼の登録・取消）は仕様 §24.9 に理由を書いた。ここには、各行が足す DB の migration と wire の feature をまとめる。
+
+DB の migration（既存は coordinator DB が step 1〜19、worker DB が step 1〜3。step は追記だけで、既存の step は書き換えない）:
+
+| DB | step | 行 | 内容 |
+|---|---|---|---|
+| worker | 4 | WP24b | `worker_attempt`・`tombstone`・`lease`・`command_launch`・`log_spool`・`blob_ref` を作り直し、鍵を `(coordinator_id, attempt_id)` にする。task ごとの live な attempt の一意 index（今の `worker_attempt_one_live` は `task_id` だけ）を `(coordinator_id, task_id)` にする。今は主キーが `attempt_id` だけなので、作り直さないと、あるメンバーが別のメンバーの仕事を `RETIRED`・`CONFLICT` にできてしまう。trigger `tombstone_no_delete` を、届かなかった attempt の tombstone だけは消せる形に置き換える（仕様 §24.4）。`worker_state.max_coordinator_epoch`（全体で 1 つ）を `coordinator_id` ごとの表にする。グループ鍵の世代（番号と指紋、今・次）、メンバーの名前と `coordinator_id` の組、worker identity の後半（`send-key` で作り直す）、退役を告げられた identity、更新のための保留を持つ表。この step は drain 済みで live な attempt が無いときだけ進む。migration は SQL 文字列の一覧なので、この前提は SQL の実行前に code で検査する。live な attempt がある DB で新しい binary の resident を起動したときは、件数と対処手順を示して起動を断る（A58）。古い attempt・tombstone・lease・epoch の行は引き継がずに捨てる（最初の公開版より前の DB なので、所有者を推測しない） |
+| coordinator | 20 | WP24b | 新しい表を 2 つ足す: 退役した worker identity へ通知を送った記録と、「削除済みメンバー」の小さな記録（名前と削除時刻。SSH 到達の警告が消えるまで残す。仕様 §24.2）。既存の `worker_identity_tombstone` は trigger（`worker_identity_tombstone_fixed`）が UPDATE を拒むので、列を足しても書けない。そのため別の表にする |
+| coordinator | 21 | WP24c | 容量で断られた attempt を探す部分 index（`placement_unacked` と同じ形）。retire せずに閉じる理由 `capacity_refused` と event `submit_refused_capacity` は、既存の理由（`worker_cannot_run`）と同じく文字列で持ち、schema の制約は無いので、それ自体は step を要らない。index が不要と分かれば、この step は足さない |
+
+- WP24d・WP24e・R68・R96 は、今の見込みでは DB の step を足さない。drain の状態は worker 全体のもので、メンバーごとには持たない。必要と分かった行は、この表に step を足してから実装する。
+- step の番号は main へ入る順に確定する。上の番号は WP24b → WP24c の順で入る前提で、順が変わったら表を直す。古い binary は知らない step を持つ DB を拒否する（既存の互換表の規則）。R68 の rollback が親 DB と worker DB を一緒に戻すのは、このためである。
+
+hello の feature と wire の追加（3 つとも最初の公開版から必須にする。これより古い公開版は無いので、持たない相手との互換の枝は作らない。schema version は上げない）:
+
+| feature | 行 | 足すもの |
+|---|---|---|
+| `group_membership_v1` | WP24b | 相互の操作 `group_proof`（要求: メンバーの名前・鍵の指紋・自分の nonce・`cluster_id`／`coordinator_id`／名前／相手の nonce に対する HMAC。答え: 相手の HMAC と、worker identity・boot・epoch・profile・能力）。hello の答えに nonce を足し、identity などを `group_proof` の答えへ移す。断る答えの理由（`group_mismatch`・`group_key_mismatch`・`member_identity_mismatch`・`identity_retired`） |
+| `identity_retired_v1` | WP24b | 操作 `identity_retired`（要求: `coordinator_id`・`worker_id`・`worker_boot_id`。`worker_id` が自分の名前のときだけ受ける。同じ内容の再送に同じ答え） |
+| `shared_admission_v1` | WP24c | `submit_attempt` の `OVERLOADED` に付ける `overloaded_reason.reason = "capacity"`、`inspect` の受付窓（上限・使用数・聞いたメンバーの分・他のメンバーの分・自分で投げた非 terminal の run の有無）、forecast の `foreign_demand`（件数） |
+
+鍵の配布・切替・送り直しは SSH 越しの固定 helper で行い、worker protocol の操作にはしない（WP24d）。仕様 §22.3 が定めているのは secret bundle の HMAC であり、hello の認証は §24.2 が新しく定める。鍵そのものは同じ file を使う。
+
+R68 と R96 は backlog の番号をそのまま行の名前にした。R68（resident が自分を更新する）は、どのメンバーも投入する側になることで全員に要るようになったため、初回リリースの範囲に含める（仕様 §24.8）。R96 は、2026-11-20 時点で coordinator の tick が応答しない worker 1 台につき `worker_budget_ms`（既定 15 秒）のあいだ actor を持ち続け、CLI の要求が時間切れになる問題で、仕様 §24.7 を完了条件とする。WP21 の残り（退役した identity の worker へ伝える wire の message。S24 の残り 5）は WP24b が担当する。

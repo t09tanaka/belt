@@ -1,6 +1,6 @@
 # belt 仕様
 
-仕様版 1.3 / 2026-11-10（1.2: 2026-11-10、1.1: 2026-11-09、1.0: 2026-11-06）/ 実装に向けた提案仕様
+仕様版 1.4 / 2026-11-20（1.3: 2026-11-10、1.2: 2026-11-10、1.1: 2026-11-09、1.0: 2026-11-06）/ 実装に向けた提案仕様
 
 この文書は、`belt` を日常の開発で使える状態まで一度に実装するための仕様である。未コミット変更、複数Macへの配置、導入・起動、ログ・成果物、キャンセル、切断・再起動からの復旧を、初回リリースの必須条件とする。実装工程は分けるが、これらが揃う前を実用版の完成とは扱わない。
 
@@ -12,6 +12,8 @@
 
 1.3 での変更: 仕事の呼び名を旧名から `task` に改めた（ID prefix は `task`、旧名の別名は置かない）。local-ciの Task は混同を避けるため `ExecutionTask` と書き分けた。
 
+1.4 での変更: 親をclusterに1つ置く構成をやめ、マシンを対等なメンバーからなる1つのグループとして扱う構成に改めた。どのメンバーも投入でき、runの正本は投げたメンバーだけが持つ。第24章を追加し、第1〜5章、第9〜12章、第15・16章、第18〜20章、第22章の該当箇所を合わせた。グループ鍵による認証とメンバーの追加・削除・鍵の更新（`group`）、投げたメンバーをまたぐ調停と容量による断り、退役の通知、遅いpeerが他を止めない要求（R96）、メンバーの更新（R68）を定め、受入条件 A51〜A54 と A56〜A58 を足した（A50 は `belt exec`、A55 は fast-worktree・portool の組み込みのために空けてある）。
+
 # 1. 製品の目的と確定事項
 
 `belt` は、手元のMacとLAN内の複数Macを使ってCIと開発用コマンドを実行する、単一コマンドの実行基盤とする。利用者は仕事を投入し、配置・待機・実行・回収をツールに任せる。
@@ -20,7 +22,8 @@
 | - | - |
 | 公開コマンド | `belt` に統合する |
 | 仕事の呼び名 | `task`（beltが配置する仕事単位。local-ciのJob DAGの `ExecutionTask`（配置可能な実行セッション）とは別概念で、`ci` はCI runを作りその中のJob／ExecutionTask／Shardを `task` にする） |
-| 構成 | 親となるcoordinatorが1つ、workerが複数 |
+| 構成 | マシンは対等なメンバーからなる1つのグループを作る。どのメンバーも同じ `belt` で、投入もでき、他のメンバーが投げた仕事も受ける。以下の「親」は、そのrunを投げたメンバー（のcoordinator）を指す（第24章） |
+| runの正本 | runごとに1つ。投げたメンバーのSQLiteに置く。合意の仕組みや分散DBは使わない |
 | 親の計算資源 | 親自身もworkerとして参加する |
 | 実行場所 | 通常、発注側は指定しない。能力・待ち時間・準備時間から親が選ぶ |
 | 対象 | `local-ci` によるCIと、一般の非対話コマンド |
@@ -49,8 +52,12 @@
 13. worker間のツール版・入力ファイルの差を検出し、自動で揃えられるものは揃え、揃えられないものは理由と手順を示す（第22章）。
 14. Linux（x86_64・arm64）のworkerを、macOSと同じ契約で常駐・導入・更新できる。常駐しない一時worker（Google Colab等）を、親からSSH経由で使い、消滅を利用者が宣言できる（第15章）。
 15. workerのattempt workspaceを、プロジェクトの `.fast-worktree.toml` と `.worktreeinclude` をそのまま使ってfast-worktreeで作り、消す（22.5）。
+16. `init` 済みのどのメンバーからでも投入でき、投げたメンバーがそのrunの正本を持つ。1つのworkerがグループの全員の仕事を受け、取り合いを受ける側で調停する。投げたメンバーが1つ落ちても、他のメンバーのrunは残りのworkerの上で続く（第24章）。
+17. メンバーであることをグループ鍵で確かめ、メンバーの追加・削除と鍵の更新を2〜5台で無理なく行える（24.2）。
+18. 遅い・応答しないメンバーが1台あっても、CLIの応答と他のメンバーとのやり取りを止めない（24.7）。
+19. メンバーが自分のresidentを更新でき、失敗したら二重実行を起こさずに元の版へ戻せる（24.8）。
 
-対象外は、複数親による自動フェイルオーバー、任意プロセスの途中状態の移送、電源OFFのMacの確実な遠隔起動、任意のGitHub Actions actionへの完全互換、共有メモリ型の分散処理とする。これらは今回の開発目的を定義する境界であり、上記の実用機能を後回しにする理由にはしない。
+対象外は、投げたメンバーが落ちたrunを別のメンバーが引き継ぐ自動フェイルオーバー、メンバーの自動発見、任意プロセスの途中状態の移送、電源OFFのMacの確実な遠隔起動、任意のGitHub Actions actionへの完全互換、共有メモリ型の分散処理とする。これらは今回の開発目的を定義する境界であり、上記の実用機能を後回しにする理由にはしない。
 
 # 3. 責務と内部構成
 
@@ -64,11 +71,13 @@
 | local-ci-core | workflow解析、Job DAG、実行可能ExecutionTask／Shardへの分割、CI実行・結果 | ネットワーク配置を所有しない |
 | task-traffic-controller-core | 1ホスト内の資源計画、キュー、開始判定、見積もり、計測 | ネットワークや分散リーダーを管理しない |
 
+coordinatorとworker agentは、1つのメンバーの1つのresidentの中で両方動く（第24章）。coordinatorは自分が投げたrunだけを所有し、worker agentはグループのすべてのメンバー（自分のcoordinatorを含む）から仕事を受ける。表の「親」は、そのrunを投げたメンバーのcoordinatorを指す。
+
 `task-traffic-controller` に分散システム全体を入れない。ホスト内の資源制御を再利用可能にし、その情報を `belt` が配置判断に使う。
 
 配布物は原則として1つの `belt` バイナリとする。通常利用で `local-ci` や `task-traffic-controller` の別インストールを要求しない。既存リポジトリから `local-ci-core` と `task-traffic-controller-core` を抽出し、既存CLIもそのcoreを使う薄いadapterとして維持する。依存version・protocol・cache schemaは固定し、配布物に元のライセンス表記を含める。
 
-workerには待受プロセスを置く。ただしLANへ独自の未認証TCPポートを開ける構成を既定にはしない。親がSSH接続を張り、`belt worker --stdio` をUnix socketへのbridgeとして起動する。agentとsupervisorはSSHから独立して動く。親のlocal workerも同じ実行経路を使い、通信部分だけUnix socket直結とする。
+workerには待受プロセスを置く。ただしLANへ独自の未認証TCPポートを開ける構成を既定にはしない。親がSSH接続を張り、`belt worker --stdio` をUnix socketへのbridgeとして起動する。agentとsupervisorはSSHから独立して動く。親のlocal workerも同じ実行経路を使い、通信部分だけUnix socket直結とする。他のメンバーがSSH越しに使うworkerと、そのマシンのlocal workerは同じ1つのworker agentである（24.1）。
 
 attempt supervisorは、attemptごとに同じ `belt` バイナリを別プロセスとして起動したものとする（第23章）。
 
@@ -83,7 +92,7 @@ belt workers add mini-b --ssh ci@mini-b.local --install
 belt doctor
 ```
 
-`init` は親のcoordinatorとlocal workerを構成する（macOSはLaunchAgent、Linuxはsystemdのuser service）。`workers add --install` はSSH接続、互換バイナリ転送、service登録、起動、能力検査を実施する。親が送るのは、workerのOSとarchが親と同じときは親自身のバイナリ、違うときは `--binary <path>` で指定した、そのworker向けのbuildである（指定が無ければ、必要なtarget tripleを示して断る。第15章）。再実行は冪等とし、途中失敗を再開できる。SSHのRemote Loginと認証が利用可能であることは前提とする。OSの権限やライセンス同意が必要な環境導入は、必要な操作と検出した不足を明示する。
+`init` はそのマシンを、coordinatorと自分のlocal workerを持つメンバーとして構成する（macOSはLaunchAgent、Linuxはsystemdのuser service）。グループにまだ属していなければ、そのマシンだけのグループ（IDと鍵）を作る。1台だけならこれで使える。`workers add --install` はSSH接続、互換バイナリ転送、service登録、起動、能力検査を実施する。親が送るのは、workerのOSとarchが親と同じときは親自身のバイナリ、違うときは `--binary <path>` で指定した、そのworker向けのbuildである（指定が無ければ、必要なtarget tripleを示して断る。第15章）。`workers add` は相手を自分のグループのメンバーにし、グループのIDと鍵を渡す（24.2）。相手が別のグループに属するときは断り、`--move` を明示したときだけ移す。相手が既にbeltを持つマシンなら、2つ目のworkerを導入しない（`--install` を付けても同じ。版が合わないときは `workers upgrade` を案内して止まる。第15章）。再実行は冪等とし、途中失敗を再開できる。SSHのRemote Loginと認証が利用可能であることは前提とする。OSの権限やライセンス同意が必要な環境導入は、必要な操作と検出した不足を明示する。
 
 ## 日常の利用
 
@@ -103,6 +112,8 @@ belt cancel <id>
 belt retry <id>
 belt outputs <id> --dir ./belt-results
 ```
+
+どのメンバーからでも投入できる。ふだん使わない方のPCで `belt ci` を実行すれば、そのPCがそのrunを投げたメンバーになり、自分と、設定に書いた他のメンバー（ふだんのmain PCを含む）へjobを配る（24.1）。これらのcommandが扱うのは、自分が投げたrunだけである。
 
 `ci` はCI runを作り、その中のJob／ExecutionTask／Shardをtaskにする。`exec` は原則1つのtaskを作り、結果まで待つ。`submit` は非同期投入で、親が入力snapshotと実行仕様を永続受理した後にIDを返す。workerでの受理や実行開始までを保証する応答ではない。
 
@@ -125,7 +136,24 @@ belt workers forget colab-1
 belt estimate --json -- pnpm test
 ```
 
+相手のマシンは他のメンバーの仕事も受け、自分でも投入する（第24章）。`drain`・`resume` はそのworker全体に働く。`stop` はそのマシンのresident（両方の役割）を止める操作なので、相手が他のメンバーの仕事か、自分で投げた非terminalのrunを持つときは、理由を示して断る。`stop --all-submitters` を明示したときだけ、drainの後に止める（そのマシンが投げたrunは、process停止と同じ扱いになる。24.6）。`stop --cancel-running` も同じ条件で `--all-submitters` を要する。`start` はresidentを起動し、両方の役割が戻る。`forget` は、一時workerのほか、鍵の更新で外したメンバーにも使える（24.2）。
+
 `drain` は新規配置を止め、受理済みの仕事は完了させる。通常の `stop` はdrainして終了を待ってから停止する。即時停止は `stop --cancel-running` で明示し、停止確認まで追跡する。到達不能なら停止済みにはしない。`upgrade` は `workers upgrade <worker> --binary <path>` で、親とOS・archの違うworker向けのbuildを指定できる。`diff`／`sync` は第22章で定める。`forget` は、到達できなくなった一時workerの消滅を利用者が宣言する操作で、第15章で定める。一時workerは `workers add <worker> --ssh <dest> --ephemeral` で登録する。
+
+## グループの管理
+
+```sh
+belt group
+belt group rotate-key [--remove <member>] [--skip <member>]
+belt group send-key <member>
+belt upgrade
+```
+
+- `group` は、グループのID、鍵の世代、自分の名前と、メンバーごとの状態（接続、鍵が合っているか、自分が置いている仕事と受けている仕事の件数）を示す。
+- メンバーの追加は `workers add` で行う。削除は `group rotate-key --remove <member>` で、一覧から消して鍵を更新する。メンバーごとの信頼の登録・取消の操作は無い。鍵の更新はSSHのアクセスを取り消さないので、外したマシンのSSH鍵を消す手順を表示する（24.2）。
+- `group rotate-key` は、既に次の鍵を持っていれば、同じ指紋の鍵で途中から更新を再開する。相手が別の指紋の次の鍵を持つ場合は断る（24.2）。
+- `group send-key` は、鍵の更新に取り残されたメンバーへ今の鍵を送り直す。
+- `upgrade` は自分のマシンを更新する（24.8）。
 
 表示は最低限、worker、能力、接続状態、running／waiting、資源予算、予測の品質を含む。taskには担当worker、実行段階、ローカル待ち時間、見込み完了時間、source ID、attempt IDを表示する。未知の時間を0秒と表示しない。
 
@@ -154,6 +182,7 @@ priority_step_seconds = 60   # priority 1段 = 60秒分の補正（既定60、0�
 timeout_seconds = 3600
 toolchain_match = "exact"
 
+# メンバーの一覧。このマシンが仕事を配る相手を書く。自動発見はしない（第24章）
 [[workers]]
 id = "mini-a"
 ssh = "ci@mini-a.local"
@@ -208,6 +237,8 @@ paths = ["test-results/**", "coverage/**"]
 required = false
 when = "always"
 ```
+
+`[[workers]]` がメンバーの一覧である。beltはここに書かれたマシンだけへ仕事を配り、LAN内のマシンを自動で探さない。`id` は相手のメンバーの名前と一致させる。一覧はメンバーごとのもので、他のメンバーの一覧と一致している必要は無い。グループのIDと鍵は設定fileには書かず、`init`・`workers add` が置くstateに持つ。`[coordinator] max_active_task` と `[scheduler] prefetch_per_worker` は、自分が配るときの上限であると同時に、このマシンのworkerが他のメンバーへ答える受付窓でもある（24.4）。
 
 設定の優先順位は、明示CLI引数、プロジェクト設定、ユーザー設定、既定値とする。旧 `.local-ci.toml` は対応する項目のfallbackとして読む。両方で矛盾する設定は出所を表示し、黙って片方を無視しない。未知の設定名はerrorにする（`secret_files = [{ glob = ".env", requird = true }]` のように表の内側の綴り誤りも、キー名と位置を示してerrorにする）。
 
@@ -463,6 +494,8 @@ coordinator内の1つのscheduler actorが、配置のcommitを直列化する�
 
 workerはactive task数と未開始prefetch数の両方を制限する。既定は `max_active_task = 2`、`prefetch_per_worker = 1` とし、設定で調整できる。resource待ちのactive taskもactive枠を使う。親は、あるworkerに置いたtask（開始済み・未開始・未ACK・unknown・retire確認待ちを含む）の合計が `max_active_task + prefetch_per_worker` に達したら、そのworkerへ新しく配置しない。上限は親の設定とworkerが `inspect` で答えた値の、項目ごとに小さい方を使う。件数は配置を記録するtransactionの中で数え直す。セッションだけを大量に開始して親のbacklogを消費する実装を避ける。step単位のCPU・メモリ制御は別途task-traffic-controllerが行う。
 
+この受付窓は、そのworkerへ仕事を投げるすべてのメンバーに共通の1つの予算で、値は受ける側のマシン自身の設定が決める（`inspect` で答える）。投げた側が数えられるのは自分が置いたtaskだけなので、上限を守る責任はworkerにあり、workerは窓を超える新規submitを断る。断られた側は、retireを確認してから別のworkerへ置き直す（24.4）。投げた側の件数の確認は、断られるsubmitを減らすために残す。
+
 ## 読み取り専用の見積（`estimate`）
 
 `estimate -- <command>` は未投入のcommandを、`estimate --task <ID>` は保存済みtaskの入力（commands・env・requirements・toolchains・出力計画・source）を使って見積もる（queueで配置を待っているtaskならその配置、それ以外なら仮の追加実行）。どちらも、既に起動している認証済みownerにだけ照会する。ownerを起動せず、停止中は `online: false` とし、実行・待ち・転送・setup・回収をすべてunknownと答える。
@@ -505,6 +538,7 @@ setupの見積は、実測の観測を数値へ変換するモデルが無いた
 - 比べたworkerごとに、予測の種別（`measured` は時間、`fallback` は順位、数値が無ければ `unknown`）、使わなかったforecastの理由、priorityと補正量、親が置いているtask数、待ち時間、実行時間、条件付きかどうか。
 - 転送・setup・回収のそれぞれについて、実測（標本数と残りの有効時間）、確認済みready、cost modelの値、仮の値（順位付け専用）、unknownとその理由のどれであるか。仮の値と `fallback` の順位は、時間として表示しない。
 - 外したworkerと理由、満たしていない条件。
+- workerごとに、他のメンバーの需要を含むかどうかとその件数（24.5）。
 - この見積が前提にしていること（仮の追加実行であること、in-placeの内容は固定されないこと、など）。
 
 ## 必要なのは仕事ごとの予測
@@ -546,6 +580,8 @@ workerはcoverageとsnapshot digestを返す。coverageは `attempt_id / plan_di
 
 登録ACKだけで仮需要を消さず、今回のforecastに使う実ledger snapshotに同じnodeが存在するときだけ実需要へ置き換える。terminal確認済みnodeは除去する。別storeの読取り順序によって、実ledgerにもoverlayにも需要がないsnapshotを作らない。
 
+workerは複数のメンバーから仕事を受ける。forecastは、他のメンバーが投げた仕事も、実ledgerにあるものとworkerが受理済みのものを需要に含める。coverageは聞いたメンバーの分だけを返し、他の分は件数だけを返す。他のメンバーが送信中でまだ届いていない仕事は見えないので、その分はsubmitの時点の断りで吸収する（24.5）。
+
 forecastは読み取り専用とし、全workerへ100回照会してもqueue entry・lease・jobが増えない。snapshotは予約券ではなく、実行時は最新状態をlock下で再確認する。
 
 ## 不確実な予測
@@ -564,17 +600,17 @@ APIは `measured / fallback / unknown` の出所、履歴件数、条件付き�
 
 | ID | 用途 |
 | - | - |
-| cluster_id / coordinator_id | 1つの親と配下のworkerの関係 |
-| coordinator_epoch | 親の再起動後に古い制御を拒否する世代 |
-| worker_id / worker_boot_id | workerのidentityとOS bootの区別 |
+| cluster_id / coordinator_id | `cluster_id` はグループのIDで、グループ鍵と組で信頼の境界を決める。`coordinator_id` はメンバーのcoordinatorの導入で、グループの中でrunを投げたメンバーを区別する。1つのメンバーは1つのグループに属する（第24章） |
+| coordinator_epoch | 親の再起動後に古い制御を拒否する世代。投げたメンバー（`coordinator_id`）ごとに数え、workerはメンバーごとに最大値を持つ |
+| worker_id / worker_boot_id | workerのidentityとOS bootの区別。`worker_id` はメンバーの名前で、グループの中で1つ |
 | agent_epoch | agent再起動を区別し、古いforecastを失効 |
-| run_id | 1回のCIまたはcommand投入 |
+| run_id | 1回のCIまたはcommand投入。投げたメンバーのDBだけが正本 |
 | task_id | 配置可能な論理的な仕事 |
-| attempt_id / generation | 1回の実行試行と世代 |
+| attempt_id / generation | 1回の実行試行と世代。workerは `(coordinator_id, attempt_id)` で持ち、投げたメンバーが違えば別のものとして扱う |
 | node_id | setup・step等の実行node |
 | request_id / payload_hash | 冪等な要求と同一内容の確認 |
 
-親と各workerは、それぞれローカルdiskのSQLiteを正本とする。WALを使用し、受理・配置・terminal確定等の重要transactionは永続commit後に応答する。LAN共有directory上のSQLiteや、task-traffic-controller ledgerを分散DBとして使用しない。
+親と各workerは、それぞれローカルdiskのSQLiteを正本とする。WALを使用し、受理・配置・terminal確定等の重要transactionは永続commit後に応答する。LAN共有directory上のSQLiteや、task-traffic-controller ledgerを分散DBとして使用しない。メンバーは親DB（自分が投げたrun）とworker DB（グループのメンバーから受けたattempt）の両方を持ち、runの記録を他のメンバーへ複製しない。
 
 同じtaskに非terminalの実行attemptを複数持たない。新attemptは旧attemptのterminal／retiredが確認されてから作る。coordinator epochで古い制御要求を拒否するが、世代を増やしただけで古いプロセスが停止したとは扱わない。結果はattempt ID、generation、payload hashで採否を決める。再起動後にadoptした同じattemptの永続結果は、生成時のcoordinator epochが古くても回収する。
 
@@ -621,7 +657,7 @@ workerは `command registered` と `running` に初めて到達したとき、re
 
 SSH上でversion付きの長さprefix JSON frameを使う。stdoutはprotocol専用、診断はstderrへ出す。大きなsource・artifactはchunk転送し、digestとoffsetで中断再開する。ログ転送がcontrol・heartbeatを塞がないよう、別streamまたは優先制御を実装する。
 
-必要な操作は `hello`、`inspect`、`forecast`、`submit_attempt`、`get_attempt`、`list_attempts`、`renew_lease`、`cancel_attempt`、`retire_attempt`、`watch_events`、`read_log`、`get_result`、`ack_collected`、blobの転送・検証、secret bundleの転送（第22章）、環境差分の取得と導入（`env_report`・`env_sync`）とする。
+必要な操作は `hello`、`inspect`、`forecast`、`submit_attempt`、`get_attempt`、`list_attempts`、`renew_lease`、`cancel_attempt`、`retire_attempt`、`watch_events`、`read_log`、`get_result`、`ack_collected`、blobの転送・検証、secret bundleの転送（第22章）、環境差分の取得と導入（`env_report`・`env_sync`）、グループ鍵の確認（`group_proof`。24.2）、退役の通知（`identity_retired`。24.3）とする。
 
 `env_sync` は、親が名指しした tool と厳密な版だけを worker 自身の registry（`toolchains.toml`）の inventory に照らして導入する。導入は待たずに `pending` を返し、親は同じ `sync_id`（導入1回ごとに親が決め、要求ごとの `request_id` とは別）で聞き直す。worker は `sync_id` ごとに導入への参照を1つ持ち、決着した結果は聞き直しに同じ答えで返す。同じ `sync_id` で別の tool を要求したら `CONFLICT`。1要求の tool は32個まで、同時に覚える `sync_id` は16個まで（超える要求は `OVERLOADED`）。古い epoch は `STALE_EPOCH`。停止中の worker は新しい `sync_id` を `CONFLICT`（停止中であることを述べる）で断り、既に覚えている `sync_id` には答え続ける。
 
@@ -629,13 +665,13 @@ worker 側の確認（registry・receipt・setup の照会）は、`sync_id` ご
 
 親は `COMMUNICATION_UNKNOWN` を答えなしとして、`OVERLOADED` を「worker は居るが混んでいる」という答えとして、どちらも同じ `sync_id` で聞き直す。worker の答え（`pending`・`OVERLOADED`）の無い状態が2分続いたら打ち切る。一度 `pending` を見た後は、resident に繋がらないこと、resident が停止中と答えること、resident が worker をまだ掴んでいないこと（`NOT_FOUND`）も答えなしとして同じ2分の中で聞き直す（resident の再起動をまたぐ）。`pending` を見る前のそれらは、その場で止める。`pending` が続く間は最長1時間待つ（worker は準備の timeout 15分で `failed` にする）。`pending` を見た後に打ち切る・止めるときは、worker で導入が続いている可能性と、`workers diff` で確かめられることを伝える。
 
-`hello` でprotocol version、feature、worker identity、profile、epochを確認する。互換性のないworkerにはdispatchしない。要求は固定バイナリへ構造化データで渡し、利用者のargvやpathをSSHのshell文字列へ直接連結しない。
+`hello` でprotocol versionとfeatureを決め、続く `group_proof` で、グループ（`cluster_id`）とグループ鍵を双方が確かめ合う。worker identity、profile、epoch、能力は、proofが合った後に `group_proof` の答えで返す（proofの前には返さない）。互換性のないworkerにはdispatchしない。proofが合うまで、workerは他の操作を受けず、接続した側は仕事もsecretも送らない。グループが違う接続、鍵が合わない接続、名前と `coordinator_id` の組が記録と違う接続、退役を告げられたidentityのままの接続は、理由を付けて断る（24.2・24.3・24.10）。鍵が更新されたら、workerは古い鍵で確かめた接続を閉じ、以後は新しい鍵のproofだけを受ける。断る理由は `PROTOCOL_INCOMPATIBLE` に付ける項目で、新しいerror codeは足さない。断られた側は、送り直しを繰り返さず、設定の不一致として `workers`・`group`・`doctor` に表示する。1つのworkerは複数のメンバーと同時に接続を持ち、attemptへの操作は、そのattemptをsubmitしたメンバーの分だけを対象にする（24.4）。
 
 optional な feature `env_sync_v1` は、`env_sync` に答えられることを表す。双方が提供し、どちらも必須にしない（接続・通常の配置は片方が古くても動く）。合意していない接続へは親は `env_sync` を送らず `PROTOCOL_INCOMPATIBLE`（`workers upgrade` を案内）とし、worker も合意していない接続からの `env_sync` を断る。`env_sync` の `sync_id` と `pending` は、この feature を合意した peer にだけ送るので、schema version は上げない。
 
-workerは受け取る量に上限を持ち、超える要求は一部だけ処理せずerrorで断る。
+workerは受け取る量に上限を持ち、超える要求は一部だけ処理せずerrorで断る。以下の上限は、どれもそのworkerへ仕事を投げるすべてのメンバーの合計に対するものである（24.4）。
 
-- `submit_attempt`: terminalでないattemptはworkerあたり32個まで（worker agentの設定 `max_live_attempts`）。超える新規submitは何も保存せず `OVERLOADED` で断り、親は後で同じattemptを送り直す。受理済みattemptの再送は上限に数えず、既存状態を返す。`lease_ms` は24時間以下でworkerの監視間隔より長いこと、`deadline_ms`・各timeoutは7日以下であること。argv・env・cwdのNUL、空またはenv名に `=` を含むものは `INVALID_INPUT` とする。artifactの宣言（`artifacts`）は1024件まで、nameは255 byteまで、pathは1024 byteまでとし、超えるものと第13章の規則に反する宣言は `INVALID_INPUT` として何も保存しない。
+- `submit_attempt`: terminalでないattemptはworkerあたり32個まで（worker agentの設定 `max_live_attempts`）。超える新規submitは何も保存せず `OVERLOADED` で断り、親は後で同じattemptを送り直す。受理済みattemptの再送は上限に数えず、既存状態を返す。これとは別に、受付窓（worker自身の設定の `max_active_task + prefetch_per_worker`。第9章）を超える新規submitも、tombstoneを含めて何も保存せずに断り、`overloaded_reason.reason = "capacity"` を付ける（24.4）。`lease_ms` は24時間以下でworkerの監視間隔より長いこと、`deadline_ms`・各timeoutは7日以下であること。argv・env・cwdのNUL、空またはenv名に `=` を含むものは `INVALID_INPUT` とする。artifactの宣言（`artifacts`）は1024件まで、nameは255 byteまで、pathは1024 byteまでとし、超えるものと第13章の規則に反する宣言は `INVALID_INPUT` として何も保存しない。
 - workspaceの準備は同時に4個まで（`max_concurrent_prepares`）。1つの準備は15分（fast-worktreeの既定timeoutと同じ）を超えたらattemptをfailedにする。
 - `list_attempts`: `states` の絞り込みはDB側で行う。該当が500件を超えるときは先頭だけを返さず `INVALID_INPUT` とし、呼び出し側が `states` を絞る。
 - `blob_put`（sourceの受け取り）: sourceは、manifest（そのsource自身のものが最初、続いてそれが名指しするsubmodule captureのもの）、content（manifestが名指しするファイル）、Git bundle（Git sourceに1つ）の3種類のblobで届く。必要なものが全部そろうまで、workerのobject storeにもcloneにも何も入れない。そろったあとも、sourceを断り得る検査（storeに既にあるファイルのサイズ、submodule captureの有無、bundleが展開できてmanifestの名指すcommitを運ぶこと）を全部先に済ませ、bundleはcloneの隣の作業用repository（cloneのrefを持ち、objectsは借りるだけ）で試す。断ったsource・途中で捨てたsourceは、storeにもcloneにも何も残さない。上限は次のとおりで、どれも書き込む前に、相手が申告したサイズで判定する。
@@ -675,16 +711,17 @@ workerは受け取る量に上限を持ち、超える要求は一部だけ処�
 - retireが確認済みになったときの扱いは、確認を記録するtransactionの中で、その時点の記録から決める。taskにcancelが記録されていれば、taskを空けずに親がそのattemptを `cancelled` に確定する。workerがsubmitを確定的に断ったことによるretireなら `failed` に確定する。どちらでもなければattemptをretire済みにしてtaskを空ける。terminalのattemptをretire済みにはしない（結果が確定したtaskを再び配置しないため）。
 - 届く前にcancelしたattemptは、workerにtombstoneが書かれたことを確かめてから、親が `cancelled` を確定する。
 - workerがsubmitをerrorで断ったとき、確定的な拒否として扱うのは、attempt自体についての答えだけとする。`INVALID_INPUT` と、同じattemptを別のpayloadで受理済みであることを示す `CONFLICT`（`conflict_reason.reason = "payload_mismatch"`）である。このときは、そのworkerへretireを送ってtombstoneを残し、確認できたら親がそのattemptを `failed` に確定する。別workerへは自動で配置しない。
-- それ以外のerror（`OVERLOADED`、`INTERNAL`、`COMMUNICATION_UNKNOWN`、`NOT_IMPLEMENTED`、`NOT_FOUND`、理由が `payload_mismatch` でない `CONFLICT`、`blocked_reason` が `secret_unavailable` か無い `BLOCKED`、親の知らないcode）は、workerの一時的な不調か、そのattemptについての答えではないものとして扱う。taskを失敗にせず、同じattemptを同じworkerへ後で送り直す（何回でも）。断られた理由は、attemptのevent `submit_deferred` に、答え（error codeと、`BLOCKED` ではその `blocked_reason` の組）ごとに1回記録する（待っている理由を表示できるようにするため）。
+- 容量による断り（`OVERLOADED` で `overloaded_reason.reason = "capacity"`）は、そのworkerが他のメンバーの仕事を含めて満杯で、何も保存しなかったことを表す。そのattemptを1回だけ送ってこの答えを得たときは、retireを送らずにattemptを閉じ（理由 `capacity_refused` は親DBにだけ記録する）、同じtransactionでattemptのevent `submit_refused_capacity` を残して、次のgenerationで別のworkerへ配置する。2回以上送っていた、または答えの無い送信があったときは、遅れて届くcopyが残り得るので、retireを依頼し、workerが未開始を確認してからtaskを空ける。どちらの場合もtaskは失敗にしない。除外は一時的で、そのworkerが `inspect` で空きを答えれば候補に戻る（24.4）。
+- それ以外のerror（理由の無い `OVERLOADED`、`INTERNAL`、`COMMUNICATION_UNKNOWN`、`NOT_IMPLEMENTED`、`NOT_FOUND`、理由が `payload_mismatch` でない `CONFLICT`、`blocked_reason` が `secret_unavailable` か無い `BLOCKED`、親の知らないcode）は、workerの一時的な不調か、そのattemptについての答えではないものとして扱う。taskを失敗にせず、同じattemptを同じworkerへ後で送り直す（何回でも）。断られた理由は、attemptのevent `submit_deferred` に、答え（error codeと、`BLOCKED` ではその `blocked_reason` の組）ごとに1回記録する（待っている理由を表示できるようにするため）。
 - workerが自分の側の理由だと明示した答え、つまり `PROTOCOL_INCOMPATIBLE` と、`blocked_reason` が `environment_mismatch` か `no_compatible_worker` の `BLOCKED` は、そのworkerでは解消しない理由として扱う。同じattemptに同じ答え（codeと `blocked_reason` の組）が2回返ったら（1回目は `submit_deferred` に記録済み）、schedulerがそのattemptのretireを依頼し（理由 `worker_cannot_run`）、同じtransactionでattemptのevent `worker_excluded` にworker・code・`blocked_reason` を残す。別の理由の `BLOCKED` が先に返っていても、それは2回目に数えない。workerが未開始を確認した時点でtaskが空き、次のgenerationで配置される。そのtaskは、理由 `worker_cannot_run` のretireが確認済みのattemptのworkerへは配置しない（retireの理由だけで判断する。親DBの記録から判断するので、親の再起動後も同じ）。taskは失敗にしない。全workerが外れたtaskは未配置のまま待ち、理由は `task_waiting` に残る。`secret_unavailable` はどのworkerでも同じなので、移さずに同じworkerへ送り直す。
 - 答えが届いたが読めなかったとき（schema versionが違う、別の操作への答えだった）は、workerのerrorではなく「答えが無い」として扱う。workerは依頼を実行したかもしれないので、拒否には数えず、unknownのまま保持する。
 - 配置を記録した直後でも、そのattemptにcancelかretireの依頼が記録されていれば、submitを送らない（次の確認でcancel・retireを先に届ける）。
-- 親は1回のtickで全workerを並行して確認する。1つのworkerに使う時間には上限（`worker_budget_ms`、既定15秒）を置き、上限までに答えの無かったattemptはunknownにして次のtickで確認し直す。そのworkerにはそのtickで新しい配置を送らない。応答の遅いworkerが1台あっても、他のworkerのleaseの更新は遅れない。tickの終わりに行う配置のsubmitにも同じ長さの上限を置くので、1回のtickは上限の約2倍以内に終わる。この2倍が `lease_ms` より十分短くなるように設定する。配置の決定（transaction）は並行させず、1つずつ行う。
+- 親は1回のtickで全workerを並行して確認する。1つのworkerに使う時間には上限（`worker_budget_ms`、既定15秒）を置き、上限までに答えの無かったattemptはunknownにして次のtickで確認し直す。そのworkerにはそのtickで新しい配置を送らない。応答の遅いworkerが1台あっても、他のworkerのleaseの更新は遅れない。tickの終わりに行う配置のsubmitにも同じ長さの上限を置くので、1回のtickは上限の約2倍以内に終わる。この2倍が `lease_ms` より十分短くなるように設定する。配置の決定（transaction）は並行させず、1つずつ行う。workerとの通信を待つ間、coordinatorのactorを占有しない。応答しないworkerが何台あっても、CLIの要求と他のworkerとのやり取りは待たされない（24.7）。
 - payloadを組み立てられないtaskは、受付（enqueue）の時点で断る。受付を通らずに親DBにある組み立てられないtaskは、配置のたびに飛ばして他のtaskの配置を続け、理由をrunのevent `task_unplaceable` に記録する（1回の親processにつき1回）。
 - `STALE_EPOCH` を受け取った親は、新しい親に交代したものとして、以後は配置も制御も行わない。
 - 配置を記録した未ACKの需要は、workerの受理を記録したときのほか、attemptがterminalになったとき、retireが確認されたときにも解消する。
 
-retire・重複排除の最小記録はclusterの寿命中保持する。大量のログ・成果物をGCしても、古いsubmitを新規実行する状態に戻さない。完全消去・再登録は新しいworker identityとして扱い、旧identityのunknown attemptを自動的に再投入しない。
+retire・重複排除の最小記録はclusterの寿命中保持する（attemptが届かなかったtombstoneだけは、24.4の規則で消してよい）。大量のログ・成果物をGCしても、古いsubmitを新規実行する状態に戻さない。完全消去・再登録は新しいworker identityとして扱い、旧identityのunknown attemptを自動的に再投入しない。
 
 # 12. lease、停止、再接続、再起動
 
@@ -741,6 +778,13 @@ command実行timeoutは、attemptの既定値（`command_timeout_ms`）と、com
 | CLI終了 | durable jobは継続。IDで再接続 |
 | SSH切断 | worker spoolへ出力。lease範囲で継続し、再接続で追跡 |
 | 親process再起動 | process lock取得、epoch更新、非terminalをreconcileして同じattemptをadopt |
+| 投げたメンバーの停止 | 止まるのはそのメンバーが投げたrunだけ。そのattemptはworkerでleaseの範囲だけ続き、切れたら止まる。他のメンバーのrunは同じworkerの上で続く。別のメンバーは引き継がない（24.6） |
+| メンバーのマシンの停止（両方の役割） | そのメンバーが投げたrunは上の行、そのマシンをworkerとして使っていた他のメンバーのattemptは「worker OS再起動」等の行で扱う（24.6） |
+| グループ鍵の更新 | メンバー間の接続を閉じ、新しい鍵でつなぎ直す。attemptはleaseの範囲で続く。次の鍵を持つメンバーは断られた時点で自分で切り替え、持たないメンバーは `group send-key` で戻る（24.2） |
+| メンバーの削除 | 外したメンバーが投げたattemptは、残るworkerがleaseの失効で止める。外したメンバーの上のattemptはunknownのまま保持し、leaseと停止猶予が過ぎた後の `workers forget` で確定する。未回収の結果は失われる。SSHのアクセスは鍵の更新では消えない（24.2） |
+| 退役済みidentityのworkerが戻った | 親はattachせず、退役を通知する。workerはそのメンバーのattemptだけを止める（24.3） |
+| workerが容量を理由にsubmitを断った | workerは何も保存しない。1回だけ送って断られたattemptはそのまま閉じ、送信の結果が不確かなattemptはretireを確認してから、別のworkerへ置き直す。taskは失敗にしない（24.4） |
+| 更新（`belt upgrade`）の失敗 | 期限までにcommitされなければ、serviceの入口が親DBとworker DBを一緒に退避へ戻して元の版で続ける。試用中は配置も確定も行わず、他のメンバーの要求にも「後で送り直せ」とだけ答えているので、二重実行は起きない（24.8） |
 | worker agent再起動 | 生存supervisorへ再接続。DBのactive表示だけでcommandを再起動しない |
 | supervisor異常終了 | 子孫・serviceを調査、停止・確定。起動済み不明なら自動再実行しない。identityを読めないprocessと、leaderが消えたあと自分のものと確認できないgroupにはsignalを送らず、未解決のまま残して、確定できるまで間隔を延ばしながらrecoveryで再確認する |
 | worker OS再起動 | boot ID変更を検出し、旧所有資源を確認・cleanupしてinterruptedへ |
@@ -751,7 +795,7 @@ command実行timeoutは、attemptの既定値（`command_timeout_ms`）と、com
 
 任意commandの命令途中から再開する機能ではない。OS rebootで失われた計算は、interrupted確定後に明示retryする。安全に再実行できる仕事はプロジェクトの明示設定によるretry policyを使えるが、実行状態unknownのattemptには適用しない。
 
-分散matrix groupは、coordinatorがsubmit前にglobal permitを永続確保し、permit IDをattemptへ結び付ける。terminal、またはretireと停止確認が揃うまで解放せず、unknownも枠を保持する。parent不在時は新しいpermitを発行しない。発行済みpermitのattemptはlease規則に従う。global semaphore、fail-fast、joinをdurable coordinatorが管理し、再起動時に復元する。
+分散matrix groupは、coordinatorがsubmit前にglobal permitを永続確保し、permit IDをattemptへ結び付ける。terminal、またはretireと停止確認が揃うまで解放せず、unknownも枠を保持する。parent不在時は新しいpermitを発行しない。permitはrunを投げたメンバーが管理し、他のメンバーのrunとは共有しない。発行済みpermitのattemptはlease規則に従う。global semaphore、fail-fast、joinをdurable coordinatorが管理し、再起動時に復元する。
 
 # 13. ログ、結果、成果物
 
@@ -873,9 +917,11 @@ repo lock、port、container slotは実行host内の資源として扱う。pare
 
 同一OS userの互換task-traffic-controller CLIとbeltは同じledger・lock・leaseの資源scopeを使う。共存保証の対象は、本仕様のreaper修正を含む更新後のtask-traffic-controller runtimeとする。未修正v0.4.2 binaryの同時使用まで無条件には保証しない。複数OS userでそれぞれ全CPU budgetを持つ構成にはしない。複数userを運用する場合は管理者が合計予算を分割するか、単一実行userへ集約する。
 
-同じledgerに加え、scopeのeffective policyも一致させる。budgetやguardをworkerだけの別configで上書きしない。共通configを正本とし、必要なpolicy変更はdrainまたは協調更新で行う。doctorは旧CLIとworkerのstate path・policy digestを確認する。nested task-traffic-controllerにも同じscopeを明示し、HOME／XDG系の偶然の違いで別budgetを作らない。
+同じledgerに加え、scopeのeffective policyも一致させる。budgetやguardをworkerだけの別configで上書きしない。共通configを正本とし、必要なpolicy変更はdrainまたは協調更新で行う。ここでいう共通configは、そのhostのメンバー自身の設定である。他のメンバーは、仕事を投げるときに相手のhostのpolicyを上書きしない（メンバーごとに設定が違ってよく、違いは `inspect` とforecastの答えに現れる。24.4）。doctorは旧CLIとworkerのstate path・policy digestを確認する。nested task-traffic-controllerにも同じscopeを明示し、HOME／XDG系の偶然の違いで別budgetを作らない。
 
 # 15. 親からの導入と常駐方式（macOS・Linux・一時worker）
+
+1つのhostには1つのresidentを置き、そのresidentがcoordinatorとworker agentの両方の役割を持つ（第24章）。`init` が登録するserviceも、`workers add --install` が相手に登録するserviceも、この1つのresidentである。既にbeltを持つhostへ `workers add` したときは、serviceもbinaryも足さず、グループのIDと鍵を渡すだけにする（24.2）。`workers add --install` で導入されただけのhostは、仕事を受ける役割だけを持つ。そのhostで `belt init` を実行すると、同じresidentにcoordinatorの役割が加わり（グループは今のものを使い、自分の `coordinator_id` を発行する）、そのhostから投入できるようになる。このときも2つ目のworkerは作らない。1つのhostに、別のstate directoryを持つ2つ目のworkerを常駐させない（試験ハーネスを除く）。
 
 SSHで到達できる、起動中のMacへworkerを導入・起動できる。Remote Loginの有効化、正しいSSH認証、known_hostsの確認を利用する。SSH agent forwardingや親のprivate key複製は既定にしない。これはworker processの起動であり、電源OFFのMacをSSHだけで起動する機能ではない。
 
@@ -906,13 +952,14 @@ Google Colabのように、常駐できず、利用者が起動した間だけ�
 
 - **起動**: 利用者がノートブックから `belt worker --ephemeral` を起動する。LaunchAgentやsystemdへ登録せず、親からの導入・更新（`workers add --install`、`upgrade`）の対象にもしない。バイナリの配置は利用者が行う。
 - **接続**: 親は、利用者が用意したトンネルを指すSSH接続（ユーザー設定の `ephemeral = true` のworker）でつなぐ。独自の未認証ポートを開けない原則（第3章）は一時workerでも変えない。
+- **グループ**: 起動時にグループのIDと鍵を受け取るので、鍵を持つどのメンバーも使える。identityの退役と `workers forget` は、それを行ったメンバーの記録の中だけで働く（24.3）。鍵が更新されたら、新しい鍵で起動し直す。
 - **identity**: 起動ごとに新しいworker identityを発行する。以前のidentityの再接続として扱わない。親は最後に見たidentityを記録する。同じ名前で別のidentityが接続を試みた場合、利用者が旧identityを `workers forget` するまで新しい接続を拒否する。以前の起動のattemptを新しい起動へ送らない。
 - **到達不能**: 一時workerへ配置したattemptは、接続が切れてもunknownのまま保持する。時間の経過や推測で別workerへ再投入しない（第11章・第12章）。
-- **`workers forget`**: 利用者が `belt workers forget <worker>` で消滅を宣言したときだけ、そのworkerのunknownのattemptをinterruptedに確定し、そのidentityを退役させる。退役したidentityはtombstoneを永続保持し、遅れて戻った同じidentityは接続させない（親はsubmitもrenewも送らず、worker側のattemptはleaseが切れて止まる）。確定したattemptの回収は断念として閉じる（消えたworkerからは回収できない）。確定後の再実行は、プロジェクトの明示retry policyまたは利用者の明示retryによる。forgetは、接続中のworkerや通常のworkerには使えない（拒否する）。
+- **`workers forget`**: 利用者が `belt workers forget <worker>` で消滅を宣言したときだけ、そのworkerのunknownのattemptをinterruptedに確定し、そのidentityを退役させる。退役したidentityはtombstoneを永続保持し、遅れて戻った同じidentityは接続させない（親はsubmitもrenewも送らず、退役を通知する。workerはそのメンバーのattemptをすぐに止める。通知が届かなければ、worker側のattemptはleaseが切れて止まる。24.3）。確定したattemptの回収は断念として閉じる（消えたworkerからは回収できない）。確定後の再実行は、プロジェクトの明示retry policyまたは利用者の明示retryによる。forgetは、接続中のworkerや通常のworkerには使えない（拒否する）。
 
 親が送るバイナリは、workerのOSとarchが親と同じときだけ親自身のものとする。違うときは `--binary <path>` で指定されたbuildを送り、指定が無ければ必要なtarget triple（例: `x86_64-unknown-linux-gnu`）を示して何も送らずに断る。releaseの成果物を自動で取得することはしない。送ったバイナリは、導入・切替の前にworker上で `--version` を実行させ、親と同じversionであることを確かめる。違う場合は送ったcopyを消して断り、導入済みのversionには触れない。
 
-バイナリはversion別directoryへ配置し、実行中supervisorのファイルを上書きしない。更新はdrain、配置、互換検査、service切替、health check、resumeの順に行う。失敗時は元versionへ戻せる。古いattemptの結果とspoolを読み取れるmigrationを含める。
+バイナリはversion別directoryへ配置し、実行中supervisorのファイルを上書きしない。更新はdrain、配置、互換検査、service切替、health check、resumeの順に行う。失敗時は元versionへ戻せる。古いattemptの結果とspoolを読み取れるmigrationを含める。更新の単位はマシン（1つのbinary、両方の役割）で、drainはworker全体に対して行う。自分のマシンは `belt upgrade` で更新し、commitまでの制限と、親DB・worker DBを一緒に戻すrollbackは24.8に従う。
 
 # 16. task-traffic-controllerに必要な仕様変更
 
@@ -1083,16 +1130,17 @@ runの結果にはsource digestと元HEADを併記する。入力が一致する
 | results | 完全性検査、artifact、spool、retention |
 | service | launchd、SSH bootstrap、更新・rollback、doctor |
 | storage | schema migration、transaction、tombstone、event journal |
+| group | グループ鍵の確認・配布・更新、投げたメンバーごとのepochとattemptの所有、容量による断り、退役の通知（第24章） |
 
 既存のtask-traffic-controllerを利用中なら、そのstate scopeを検出し、旧jobをdrainして必要なruntime更新を行ったうえで同じbudgetを使う。別scopeへ移す必要がある場合も移行を明示する。履歴が取り込めなくてもcold startとして動作させ、履歴欠落を資源不足や0秒予測に変換しない。
 
-既存 `.local-ci.toml` とworkflowは読み込み、`belt ci plan` で互換性・分散単位・必要profileを表示する。1台だけでも全く同じcoordinator／worker経路を通し、子が増えたときだけ別実装へ切り替わる構造にしない。
+既存 `.local-ci.toml` とworkflowは読み込み、`belt ci plan` で互換性・分散単位・必要profileを表示する。1台だけでも全く同じcoordinator／worker経路を通し、子が増えたときだけ別実装へ切り替わる構造にしない。1台だけのグループと、複数のメンバーがそれぞれ投入するグループも、同じ経路である。
 
 新しい operation・enum 値・必須フィールドは、hello の optional feature に紐づけ、合意した peer にだけ送る（N と N+1 が同じ cluster に居ても、接続と配置が動くこと）。error code を増やすときも同じ扱いとし、合意していない peer には読めない値を返さない。
 
 protocol／storage migrationは互換表を持ち、未知versionをその場で書き換えない。更新前にjob状態を保護し、稼働中attemptを旧versionのまま追跡できる。親DBのcopyを別Macで同時起動してactive-activeにする操作はサポートしない。
 
-版の間の互換はN／N+1とする。新しいfeatureは、まず「提供するが要求しない」版をすべてのpeer（親のresidentとworker）へ配り、要求（required）へ変えるのはその次の版からにする。`workers upgrade` は、動いているresidentが親のbinaryと同じbuildのときだけ進め、healthの `hello` はresidentが要求するfeatureで行う。rollbackで戻した版は、その版がupgrade前に合意していたfeatureだけで検査する。
+版の間の互換はN／N+1とする。新しいfeatureは、まず「提供するが要求しない」版をすべてのpeer（親のresidentとworker）へ配り、要求（required）へ変えるのはその次の版からにする。第24章のfeatureは最初の公開版から必須とする（24.10）。`workers upgrade` は、動いているresidentが親のbinaryと同じbuildのときだけ進め、healthの `hello` はresidentが要求するfeatureで行う。rollbackで戻した版は、その版がupgrade前に合意していたfeatureだけで検査する。
 
 workerの `upgrade` をrollbackできるのは、親が新しい版のhealthを確かめてcommitするまでである。その間workerはdrainのままで、切替前に退避したworker DBをrollbackで戻す。したがって試用中の版が書いた記録（ackやGCの進み）はrollbackで切替前へ巻き戻る。commitの後は戻せない。
 
@@ -1151,6 +1199,15 @@ workerの `upgrade` をrollbackできるのは、親が新しい版のhealthを�
 | A47 | `.worktreeinclude` に一致するignoredファイル | secret_filesの宣言なしで、22.3と同じ経路（HMAC digest・0600・terminal時の削除）でworkerへ送られ、object store・cache・template・log・artifactに残らない。`[source] secret_files` には追加分だけを書けば足りる |
 | A48 | fast-worktreeによるworkspace | attempt workspaceがfast-worktreeで作られ、プロジェクトの `.fast-worktree.toml` と `.worktreeinclude` がそのまま使われる。terminal後にworkspaceとportoolの割当が消える。macOSとLinuxで通る（Linuxでは依存の複製が効かず `npm ci` になってよい） |
 | A49 | priorityの異なるworker | 予測完了時間の差が補正量未満なら高いpriorityのworkerに配置し、補正量を超えて速いworkerがあればそちらに配置する。全員同じpriorityなら従来と同じ配置。配置理由に補正量が出る |
+| A51 | どのメンバーからでも投入できる | 2〜3台のメンバーが同じグループに属し、互いを `[[workers]]` に持つ。あるメンバーで `belt ci` を実行すると、そのメンバーの自分のworkerと他のメンバーの両方で実行される。runの記録は投げたメンバーのDBだけにあり、他のメンバーの `ls` には出ない。別のメンバーから同時に投入したrunも完了する。既にbeltを持つhostへの `workers add` は2つ目のworkerを作らない。`workers add --install` で導入されただけのhostは、`init` するまで仕事を受けるだけで、投入はできない。1台だけの `init` は従来どおり動く |
+| A52 | 複数のメンバーが1つのworkerを取り合う | 2つのメンバーが同じworkerへ同時に配置しても、そのworkerのterminalでないattemptの合計が、worker自身の設定の受付窓を超えず、task-traffic-controllerの予算も1つである。窓を超えたsubmitは容量を理由に断られ、workerにはtombstoneを含めて何も残らない。1回だけ送って断られたattemptはretireなしで閉じ、送信の結果が不確かなattemptはretireの確認の後に、別のworkerへ置き直す。user commandは最大1回だけ開始され、遅れて届いた元のsubmitは `RETIRED` で断られる。置き直す先が無いときは、taskは失敗せず `task_waiting`（`capacity`）で待つ。自分のlocal workerの窓が他のメンバーの仕事で埋まっているときも、自分のrunは失敗せず、他のworkerへ置くか待つ（自分の仕事の優先枠は無い）。forecastと `estimate` は他のメンバーの需要を含み、その件数を示す。あるメンバーのepochが進んでも、他のメンバーの要求は `STALE_EPOCH` にならない。別のメンバーが同じ `attempt_id`・`task_id` を使っても、互いの仕事を `RETIRED`・`CONFLICT` にせず、状態も読めない（正直なメンバーの前提で、取り違えを防ぐ） |
+| A53 | グループ鍵、メンバーの削除、退役の通知 | グループが違う接続と、鍵が合わない接続は断られ、attemptを受け付けない。proofの前に、workerはidentity・epoch・能力を返さない。接続した側は、workerのproofが合わなければ仕事もsecretも送らない。名前と `coordinator_id` の組が記録と違う接続は断られる。`workers add` は、別のグループのマシンを `--move` なしでは移さない。`group rotate-key` は、他のメンバーの一覧に自分の知らないメンバーが居れば配る前に断り、配る段では動いている仕事に何も起こさず、切り替えた後は古い鍵の接続を閉じて断る。残るメンバーのattemptはleaseの範囲で続く。配る段・切り替える段のどこで落としても、再実行が続きを行う。次の鍵を持つメンバーは断られた時点で自分で切り替わり、持たないメンバーは `group send-key` で戻る。別の指紋の次の鍵がある間、2つ目の更新は断られる。`--remove` はSSH鍵を消す手順を表示し、外したメンバーへSSHで到達できる間は `group`・`doctor` が警告する。外したメンバーが投げたattemptは、残るworkerがleaseの失効で止める。外したメンバーの上のattemptはunknownのまま保持され、leaseと停止猶予が過ぎる前の `workers forget` は断られ、過ぎた後は `interrupted` に確定する。forgetしたメンバーを `send-key` で戻すと新しいworker identityで接続し、古いidentityのattemptは送られない。退役済みidentityのworkerが戻ると、投げた側はattachせずに退役を通知し、workerはそのメンバーのattemptだけをleaseの失効を待たずに止める |
+| A54 | 投げたメンバーの停止 | あるメンバーのresidentを止めると、そのメンバーが投げたrunだけが進まなくなり、そのattemptはleaseの範囲で続いた後に止まる。他のメンバーが投げたrunは同じworkerの上で完了する。止めたメンバーを起動し直すと、同じattemptをadoptし、再spawnしない。他のメンバーの仕事を持つマシンへの `workers stop` は、`--all-submitters` が無ければ断られる |
+| A56 | 遅い・応答しないメンバー | workerへの呼び出しが1つ、永久に答えないままになっている状態で、自分のDBだけで答えられるCLIの要求が完了し、他のworkerのlease更新と配置が進む（答えない呼び出しの完了を待たないことを、構造として確かめる）。加えて、その要求が仮想の時計で2秒以内に返る。受ける側でも、答えないメンバーの接続を持ったまま、他のメンバーの要求が完了する。sleepに頼らない決定的な試験で確かめる |
+| A57 | メンバーの更新とrollback | `belt upgrade` でマシンを更新しても、そのメンバーが投げたrunと、他のメンバーから受けたattemptを失わない。commitの前は、新しい版が配置・generationの作成・回収の確定を行わず、他のメンバーからの状態を変える要求には、何も保存せずに「後で送り直せ」と答える。更新のための保留は `workers resume` では解けない。期限までにcommitされなければ、新しい版が応答していなくても、serviceの入口が親DBとworker DBを一緒に元へ戻し、元の版が同じattemptをadoptして、user commandを再び開始しない。試用中に別のメンバーが、更新中のマシンの上のattemptをretireしようとした場合：retireは相手の側で未確認のまま残り、rollbackの後に届いてtombstoneになり、そのattemptも置き直した先も二重に走らない。NとN+1のメンバーが、投げる側・受ける側のどちらの向きでも動く |
+| A58 | 既存のworker DBの移行 | liveなattemptを持つworker DBの移行（step 4）は、件数と手順を示して断られ、DBは変わらない。drain済みでliveなattemptが無いworker DBは移行でき、古いattempt・tombstone・lease・epochの行は捨てられ、グループのIDと鍵は世代1として引き継がれる。移行後、古い版の接続は `group_proof` を通れず、submitできない |
+
+A50（`belt exec`）とA55（fast-worktree・portoolの組み込み）は、それぞれの作業のために番号を空けてあり、この版では定めない。A51〜A54とA56〜A58は第24章の受入で、1台のhost上に2〜3個のメンバー（別のstate directory）を立てた試験で確かめ、実機間の確認（別マシンの停止、実SSHでの鍵の配布）は工程6に含める。
 
 A37では、実行時間を準備・転送・資源待ち・計算・回収に分けて記録する。小さいjobは転送で遅くなる場合もあるため、全jobの一律speedupを保証値にしない。対象CIの分散可能な並列幅、cold／warm、親単独との差を報告し、目標の負荷が1台へ集中したままなら完成としない。
 
@@ -1167,7 +1224,8 @@ CI自体のpassには、必要なtaskが仕様どおり成功または許容さ�
 | 3 | durable runtimeとprotocol | receipt、supervisor、lease、cancel、idempotency、spool、OS依存部分（macOSとLinux） |
 | 4 | forecastと動的配置 | WorkloadPlan、overlay、bounded dispatch、途中worker参加 |
 | 5 | CI統合と運用 | 自動テストsharding、runner adapter、結果完全性、status、service導入・更新（macOS・Linux・一時worker）、toolchain整合、fast-worktreeによるworkspace、doctor |
-| 6 | 受入検証と修正 | A01〜A49、実Mac、Linux、実プロジェクト、障害注入 |
+| 5b | グループと投げたメンバー | グループ鍵の確認・配布・更新、投げたメンバーごとのepochと所有、調停と置き直し、退役の通知、メンバーの設定とCLI、メンバーの更新、遅いpeerの切り離し（第24章） |
+| 6 | 受入検証と修正 | A01〜A49、A51〜A54、A56〜A58、実Mac、Linux、実プロジェクト、障害注入 |
 
 完了報告には、実装commit、対応version、検証したMac・Linux・OS・profile、受入結果、既知の互換制限、運用手順を添える。未実装の必須項目を「将来対応」と記載して実用版完成とはしない。
 
@@ -1220,7 +1278,7 @@ workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、co
 
 ## 22.2 `workers diff` と `workers sync`
 
-`belt workers diff [<worker>] [--json]`（workerを省略すると、登録した全workerへ同時に尋ね、結果は登録順に出す。同時に尋ねるのは最大8台）は、親（local worker）と対象workerのprofile実効環境の差を示す。対象は、各toolの版（版管理ツールに導入済みの版一覧を含む）、PATH上の必要tool、portool・task-traffic-controller runtime・local-ci core・belt自身の版、Docker実行可否、利用可能disk、profile digest、task-traffic-controller policy digestとする。項目ごとに `same / differs / missing / auto_installable / manual_required` を示す。`doctor` はこの結果を含む。
+`belt workers diff [<worker>] [--json]`（workerを省略すると、登録した全workerへ同時に尋ね、結果は登録順に出す。同時に尋ねるのは最大8台）は、親（local worker。commandを実行したメンバー自身のworker）と対象workerのprofile実効環境の差を示す。比べる基準は実行したメンバーなので、別のメンバーから実行すれば差の出方は変わり得る。対象は、各toolの版（版管理ツールに導入済みの版一覧を含む）、PATH上の必要tool、portool・task-traffic-controller runtime・local-ci core・belt自身の版、Docker実行可否、利用可能disk、profile digest、task-traffic-controller policy digestとする。項目ごとに `same / differs / missing / auto_installable / manual_required` を示す。`doctor` はこの結果を含む。
 
 `doctor` は worker ごとの差を `environment_diff` として項目ごとに1 checkで載せ、区分は次のとおりとする。利用者が手を動かさないと直らない差だけが `fail`（exit 1相当のblocked）になる。
 - `fail`: `differs`、`missing`、`manual_required`、diskの不足。
@@ -1570,3 +1628,196 @@ Physical deletion remains limited to the approved indexed private parent Source 
 private parent Vault run files. Original paths, keys, Git refs/objects, caches, unknown extra files, unproven/pending
 roots, run binding records, lock/index identities and worker Vault erase/reupload behavior are outside this driver.
 Runtime tests invoke only private owned TempDir state; no production user-state invocation is part of validation.
+
+# 24. グループと、runを投げたメンバー（2026-11-20）
+
+2026-11-20の決定。親をclusterに1つ置く構成をやめ、ネットワーク上のマシンを、対等なメンバーからなる1つのグループとして扱う。親・子というマシンの種類は無い。この章が正本である。他の章の「親」「coordinator」は「そのrunを投げたメンバー（のcoordinator）」、「cluster」は「グループ」と読む。
+
+## 24.1 モデル
+
+| 用語 | 意味 |
+| - | - |
+| グループ | 互いを信頼するメンバーの集まり。`cluster_id`（グループのID）と、グループ全体で共有する1つの鍵（グループ鍵）で決まる。信頼の境界はグループである |
+| メンバー | グループに属する1台のマシン（1つのOS user）。1つの `belt` バイナリと1つのresidentを持ち、residentがcoordinatorとworker agentを兼ねる。メンバーの名前はグループの中で1つで、`[[workers]]` の `id` と `worker_id` に使う |
+| 投げたメンバー | あるrunを投入したメンバー。そのrunの間、変わらない。グループの中では `coordinator_id` で区別する |
+
+- すべてのメンバーで同じ `belt` バイナリが動く。投入専用・実行専用のバイナリや導入形態は無い。
+- どのメンバーも投入できる（`ci`・`exec`・`submit`）。仕事は、投げたメンバー自身を含む、空きのあるメンバーへ配る。
+- runごとに正本は1つである。run・task・attempt・配置・結果は、投げたメンバーのSQLiteだけに置く。他のメンバーはそのrunの記録を持たない。合意の仕組みも分散DBも使わない（第10章）。
+- 1つのメンバーにworkerは1つである。自分のcoordinatorが使うlocal workerと、他のメンバーが `worker --stdio` のbridge越しに使うworkerは、同じworker agent・同じworker DB・同じtask-traffic-controllerのscopeである。別のworkerを並べて同じhostの予算を二重に作らない。
+- メンバーの一覧はユーザー設定のfile（`[[workers]]`）から読む。自動発見はしない。一覧はメンバーごとに持ち、そのメンバーが仕事を配る相手を表す。全員の一覧が一致している必要は無い。
+- メンバーであることは、グループ鍵を持っていることで決まる（24.2）。一覧は「誰に配るか」、鍵は「誰の仕事を受けるか」を決める。
+- 1台だけの構成は従来と同じである。`init` が、そのマシンだけのグループを作り、同じ経路を通る（第18章）。
+- runは投げたメンバーで見る。`ls`・`show`・`logs`・`cancel`・`retry`・`outputs` は自分が投げたrunだけを扱い、他のメンバーのrunを一覧・操作する機能は置かない。
+- coordinatorの役割は `init` を実行したメンバーが持つ。`workers add --install` で導入されただけのメンバーは、そこで `init` を実行するまで、仕事を受けるだけである（第15章）。
+
+例：ふだん使うmain PC（`main`）と、もう1台のPC（`sub`）がある。`main` で `belt init` と `belt workers add sub --ssh me@sub.local --install` を実行し、`sub` で `belt init` と `belt workers add main --ssh me@main.local` を実行する。`sub` で `belt ci` を実行すると、`sub` がそのrunを投げたメンバーになり、jobを自分と `main` へ配る。同じ時刻に `main` で `belt ci` を実行すれば、そのrunを投げたメンバーは `main` で、2つのrunは受ける側の調停（24.4）で同じ予算を分け合う。
+
+## 24.2 メンバーの認証、追加、削除、鍵の更新
+
+グループ鍵は、既存のcluster鍵（`cluster_key_path` の指すfile。22.3でsecret bundleのHMACに使っているもの）をそのまま使う。メンバーごと・相手ごとの鍵は持たない。鍵には世代番号（1から）を付ける。
+
+**認証**。メンバーであることは、双方が `group_proof` で確かめ合う。feature `group_membership_v1` は最初の公開版から必須とする（それより古い公開版は無い）。相手のSSHのOS userへ入れることと、グループ鍵を持っていることの両方が要る。
+
+1. `hello` では、protocol versionとfeatureだけを決める。受ける側は、helloの答えに一度限りの乱数（nonce）を入れ、worker identity・boot・epoch・profile・能力はまだ返さない。
+2. 接続した側は `group_proof` を送る。内容は、自分のメンバーの名前、鍵の指紋（24.2の「世代」）、自分のnonce、そして `cluster_id`・`coordinator_id`・メンバーの名前・受ける側のnonceに対するグループ鍵のHMACである。
+3. 受ける側は自分の鍵で確かめる。合えば、接続した側のnonceと自分のメンバーの名前に対するHMACを答え、ここで初めてworker identity・boot・epoch・profile・能力を返す。
+4. 接続した側は、その答えを自分の鍵で確かめる。合わない相手へは、仕事もsecretもsourceも送らない。
+
+- 受ける側は、proofを確かめるまで、その接続から他の操作を受けない。`cluster_id` が違う接続、HMACが合わない接続は、理由（`group_mismatch`・`group_key_mismatch`）を付けて断る。
+- **名前と `coordinator_id` の固定**: 受ける側は、proofで名乗られたメンバーの名前と `coordinator_id` の組を記録する。記録済みの名前が別の `coordinator_id` で来たとき、記録済みの `coordinator_id` が別の名前で来たときは、理由 `member_identity_mismatch` で断る。state directoryを複製・復元したマシンが別の名前で加わること、作り直したマシンが黙って同じ名前を引き継ぐことを、これで止める。組を取り替えるのは、`workers add` と `group send-key` がそのメンバーへ明示的に行ったときだけである。
+
+**前提（正直なメンバー）**。グループ鍵を持つメンバーは、相手のOS userとして任意のcommandを実行できる。したがってグループは「誰の仕事を受けるか」の境界であり、メンバーどうしを互いから隔離する仕組みではない。鍵を持つメンバーが、悪意を持って別のメンバーの名前と `coordinator_id` の組を名乗ることは防がない。上の固定と24.4の「見える範囲」は、誤り（複製・復元・設定の取り違え）を防ぐためのもので、悪意のあるメンバーへの防御ではない。信頼できるマシンだけをグループに入れる。
+
+**追加**。メンバーが `workers add <name> --ssh <dest>` を実行すると、SSH越しの固定helperが、相手へグループのID・鍵・メンバーの名前を渡す（`--install` のときはbinaryの導入に続けて行う）。鍵はSSHの接続の中だけを通し、引数やログに出さない。
+
+- 相手が同じグループのメンバーなら、何も変えず、自分の一覧に足すだけである（名前が相手の名前と違えば断る）。
+- 相手が別のグループに属するときは、何も変えずに断る。黙って移すことはしない。`--move` を明示し、かつ相手がliveなattemptも非terminalのrunも持たないときだけ、自分のグループへ移す（グループのIDと鍵を置き換える。相手の `coordinator_id` と過去のrunの記録は残る）。1つのメンバーが2つのグループに属することは無い。
+- 相手が仕事を配る側にもなるには、相手の側でも `init` と `workers add` を行う（一覧はメンバーごと）。
+
+**削除と鍵の更新**。メンバーを外すには、残るメンバーの一覧からそのメンバーを消し、鍵を更新する。beltの中の信頼を取り消すのは鍵の更新であり、一覧から消すだけでは、外したメンバーからの仕事を断れない。メンバーごとの登録・取消の操作は置かない。
+
+鍵の更新は、SSHのアクセスを取り消さない。外したマシンのSSH鍵が残るメンバーの `authorized_keys` に残っていれば、そのマシンはbeltを通さずに、同じOS userとしてcommandを実行できる。beltは `authorized_keys` を編集しない。`group rotate-key --remove` は、残る各メンバーのbelt用accountから外したマシンのSSH鍵を消す手順を表示する。`group` と `doctor` は、外したメンバーへSSHでまだ到達できる間、警告を出し続ける（到達できなくなったら消える）。一覧の行を消した後も、警告が消えるまで、名前と削除時刻を小さな「削除済みメンバー」の記録に残す。
+
+鍵の「世代」は、番号と鍵の指紋（鍵から導く短いdigest。鍵そのものは復元できない）の組で表す。どの鍵を持っているかは指紋で比べ、番号だけで判断しない。
+
+```sh
+belt group rotate-key --remove old-mini   # 一覧から消し、残る全員へ新しい鍵を配って切り替える
+belt group send-key mini-b                # 取り残されたメンバーへ、今の鍵を送り直す
+belt group                                # グループのID、鍵の世代、メンバーごとの状態
+```
+
+`group rotate-key` は、残るメンバーのどれか1台で実行する。そのメンバーの一覧（`[[workers]]`）に、残る全員が載っていること。手順は2段で、どこで止まっても同じcommandの再実行が続きを行う。
+
+1. **配る**: まず、一覧の各メンバーから、そのメンバーの一覧（`[[workers]]`）を固定helperで集める。集めた一覧の和集合に、自分の一覧にも `--remove` にも無いメンバーが居れば、何も配らずに断り、そのメンバーを示す（知らないメンバーを黙って取り残さないため）。次に、既に次の鍵を持っていればその鍵を使い、無ければ新しい世代の鍵を作り、一覧の各メンバーへ渡す。受け取ったメンバーは、それを「次の鍵」として保存する。この段では、全員が今の鍵で署名し、今の鍵と次の鍵の両方を受け入れる。動いている仕事には何も起きない。1台でも渡せなければ、ここで止まり、渡せなかったメンバーを示す（`--skip <member>` を付けたメンバーは後回しにできる）。
+2. **切り替える**: 全員（skipを除く）へ渡せたら、各メンバーへ切替を指示する。切り替えたメンバーは、次の鍵を今の鍵にし、古い鍵を捨て、メンバー間の接続をすべて閉じる。以後は新しい鍵のproofだけを受け入れる。残るメンバーどうしはすぐにつなぎ直し、attemptはleaseの範囲で続く（短い切断と同じ。第12章）。
+
+- **自分で切り替える**: 次の鍵を持つメンバーが、今の鍵のproofを `group_key_mismatch` で断られ、相手の示した指紋が自分の次の鍵のものだったときは、切替の指示を待たずに自分で次の鍵へ切り替える。切替の指示が届かなかったメンバーは、これで追い付く。相手が認証前に名乗った指紋で切り替えることは、上の正直なメンバーの前提で許容する。
+- **同時の更新**: `group rotate-key` を実行したメンバーが既に「次の鍵」を持っていれば、その鍵（同じ指紋）を使い、止まったところから更新を続ける。配る段で、相手が自分の知らない別の指紋の「次の鍵」を持っていたら、何も上書きせずに断り、先の更新を続けるよう示す。
+- `--remove <name>` は、実行したメンバーの一覧からそのメンバーを消し、鍵を渡さない。他のメンバーの一覧に残っている行は、そのメンバーの `doctor` と `group` が `group_key_mismatch` として示すので、それぞれで消す。
+- 次の鍵を受け取っていないまま取り残されたメンバー（skipしたもの）は、古い鍵のままなので断られる。残るメンバーの1台から `group send-key <member>` で今の鍵を渡すと戻る。止まっていた間にleaseが切れたattemptは、通常の規則どおりworkerが止めて `interrupted` と答える。
+- 2〜5台を想定し、渡す順は一覧の順、同時には行わない。鍵の更新の間、新しい投入と配置は止めない。
+
+**外したメンバーに関わる仕事**。
+
+| 仕事 | 扱い |
+| - | - |
+| 外したメンバーが投げたrunのattemptで、残るメンバーの上にあるもの | 切替で接続が閉じ、外したメンバーはつなぎ直せないので、renewが来ない。残るメンバーのworkerは、leaseの失効で止めて `interrupted` に確定する（既存の規則）。未回収の結果は回収されないまま、保持期間で消える |
+| 残るメンバーが投げたrunのattemptで、外したメンバーの上にあるもの | 投げたメンバーからは到達不能と同じに見え、unknownのまま保持する。時間の経過では置き直さない。利用者が `workers forget <name>` を実行すると、`interrupted`（cancel済みは `cancelled`）に確定し、回収を断念として閉じる（第15章と同じ確定の規則）。再実行は明示retryかretry policyによる。未回収の結果は失われる |
+
+- `workers forget` は、一時workerのほかに、「最後に接続した後でグループ鍵が更新され、今接続していない」メンバーにも使えるものとする。ただしこの場合は、そのメンバーと最後に連絡が取れた時点から、leaseの1期間と停止猶予（`lease_seconds` とTERM後の猶予。第12章）が過ぎるまでは確定しない。過ぎる前の `forget` は、残り時間を示して断る。相手のworkerがleaseの失効で止め終える時間を待つことで、確定の後のretryが、止まっていないcommandと重ならないようにする（正直なメンバーの前提）。`group rotate-key --remove <name>` は、実行したメンバーについて、この時間が過ぎた後に `workers forget` を実行するよう案内する。他のメンバーも、そのメンバーにattemptを置いていた場合に、自分で実行する。
+- **forgetしたメンバーを戻すとき**: `group send-key` で常駐のメンバーを戻すと、そのメンバーのworkerは新しいworker identityで接続する。仕組みは一時worker（第15章）と同じで、workerは `<OSのboot id>.<ULID>` の後半を保存しておき、`send-key` を受け取ったときに作り直す。作り直す前に、古いidentityで受けていたliveなattemptを止めて `interrupted` に確定する。`send-key` はforgetの有無によらず毎回identityを作り直すので、forgetしていなくてもliveなattemptが止まるのは意図した動作である。forgetした側には古いidentityのtombstoneが残るので、戻ったworkerは「新しいidentity」として通り、古いidentityのattemptが新しい接続へ送られることは無い。
+- 外したメンバーの側では、自分のrunのattemptはunknownのまま残る（残るメンバーが `group_key_mismatch` で断るため）。グループへ戻す（`send-key`）か、そのメンバーのstateを作り直すまで解消しない。初回リリースではこの扱いとする。
+- 外したメンバーのworkerは、renewが来ないので、受けていたattemptを自分のleaseの規則で止める（正直なメンバーの前提）。
+
+親DBやstate directoryのcopyを別のマシンで起動する構成は、第18章のとおりサポートしない。copyが別の名前で加わろうとした場合と、同じ名前で別の `coordinator_id` が来た場合は、上の「名前と `coordinator_id` の固定」で断る。同じ名前と同じ `coordinator_id` のcopyが同時に動く場合だけは区別できない。
+
+## 24.3 workerのidentityと、退役の通知
+
+- workerのidentityとそのtombstone（第15章）は、それを記録したメンバーのDBの中だけのものである。あるメンバーがworkerのidentityを退役させても、他のメンバーの記録は変わらない。`workers forget` と「同じ名前で新しいidentityが接続した」ことによる退役が確定するのも、そのメンバーが投げたattemptだけである。
+- 一時workerの起動ごとのidentityは、グループの全員に共通の1つである。起動時にグループのIDと鍵を受け取る（`--cluster`・`--name`・`--key-file`。従来どおり）ので、鍵を持つどのメンバーも使える。
+
+**退役の通知**（wire）。退役済みのidentityがhelloに答えたとき、投げたメンバーはattachしない（従来どおり）。投げたメンバーは、接続を閉じる前に `identity_retired`（`coordinator_id`、`worker_id`、退役させた `worker_boot_id`）を1回送る（feature `identity_retired_v1`。最初の公開版から必須）。
+
+- workerは、`worker_id` が自分の名前で、`worker_boot_id` が自分の今のidentityのときだけ受け付ける。それ以外は何もせずに断る。
+- 受け付けたworkerは、そのメンバーが投げたliveなattemptを、leaseの失効を待たずにcancelと同じ手順で止めて `interrupted` に確定し、「このメンバーからこのidentityの退役を告げられた」ことを永続化する。以後、同じidentityである間は、そのメンバーの接続を理由 `identity_retired` で断る。
+- 他のメンバーが投げたattempt・接続・leaseには触れない。
+- 一時workerは、退役を告げられ、liveなattemptが無くなったら、stateを消して終了してよい。
+- 通知は同じ内容の再送に同じ答えを返す。届かなくても安全性は変わらない（submitもrenewも送られないので、attemptはleaseの失効で止まる）。通知の目的は、失効を待たずに止めて資源を空けることである。送った側は送ったことを記録するが、届いたことを前提にしない。
+
+## 24.4 投げたメンバーをまたぐ調停
+
+取り合いは、受ける側（worker）で調停する。投げたメンバーは、他に投げているメンバーがいることを前提にしない。
+
+- **予算は1つ**: workerの受付窓（`max_active_task + prefetch_per_worker`。第9章）と、task-traffic-controllerのadmission（第16章）は、すべてのメンバーが投げた仕事を合わせた1つの予算である。メンバーごとの枠は持たない。
+- **窓の出所**: 受付窓は、受ける側のメンバー自身のユーザー設定（そのマシンの `[coordinator] max_active_task` と `[scheduler] prefetch_per_worker`）で決まる。workerは `inspect` でこの値を答える。投げたメンバーは、自分の設定の値とworkerが答えた値の、項目ごとに小さい方で数える（第9章）。投げたメンバーの設定が、他のマシンの窓を広げることは無い。
+- **workerが正**: workerは、terminalでないattemptをすべてのメンバーの分について数え、受付窓を超える新規submitを、何も保存せずに断る。投げた側が自分の配置を数えて上限で止める規則は残すが、断られるsubmitを減らすための最適化である。受理済みattemptの再送は数えず、断らない（第11章の冪等性）。
+- **断り方**: `OVERLOADED` に `overloaded_reason.reason = "capacity"` を付けて答える（feature `shared_admission_v1`。最初の公開版から必須）。知らない `reason` は理由なしとして読む。断ったworkerは何も保存しない。tombstoneも残さない。
+- **断られた側**: `capacity` の答えは「workerは何も保存していない」という確定した答えである。そのattemptを1回だけ送り、その1回に `capacity` が返ったときは、届いていないcopyはどこにも無いので、retireを送らずにそのattemptを閉じ（理由 `capacity_refused` を自分のDBに記録する。wireには載せない）、次のgenerationで別のworkerへ配置する。
+- **結果が不確かなとき**: そのattemptを2回以上送っていた、または答えの無い送信が1回でもあった場合は、遅れて届くcopyが残り得る。coordinatorの再起動後、送信回数が永続記録から分からないattemptも、結果が不確かなものとしてretireを通す。このときは従来どおりretireを依頼し、workerのtombstoneと未開始の確認を得てからtaskを空ける（第11章の「retireしてから置き直す」規則）。遅れて届いた元のsubmitは `RETIRED` で断られ、同じ仕事が2か所で走らない（A19）。確認が取れない間はunknownのまま保持し、置き直さない。
+- **除外は一時的**: `capacity_refused` のworkerは、`worker_cannot_run`（第11章）と違い、そのtaskから恒久的には外さない。そのworkerが次の `inspect` で受付窓の空きを答えるまで、どのtaskもそこへ新しく配置しない。空きを答えたら候補に戻す。この状態はprocessの中だけに持ち、再起動後は `inspect` の答えから決め直す。
+- **置き直す先が無いとき**: taskは未配置のまま待ち、理由（`capacity`）を `task_waiting` に残す。taskを失敗にしない。
+- **`inspect`**: 受付窓の上限と使用数、そのうち聞いたメンバーの分と他のメンバーの分（件数だけ）、そのマシンが自分で投げた非terminalのrunを持つかどうかを答える。
+- **公平さ**: 受付は到着順である。メンバーごとの予約や比例配分は初回リリースに含めない。1つのメンバーが窓を埋めている間、他のメンバーはそのworkerを使えないが、失敗にはならず、他のworkerへ置くか待つ。自分のlocal workerにも優先枠は無い。自分のマシンの窓が他のメンバーの仕事で埋まっていれば、自分のrunも、他のworkerへ置くか待つことになる。
+- **その他の共有上限**: `max_live_attempts`、同時に行うworkspaceの準備、blobの受け取りの量と個数、覚える `sync_id` の数（第11章）も、すべてのメンバーの合計に対する上限である。超えた要求は従来どおり理由なしの `OVERLOADED`（何も行っていないので送り直せる）で断る。
+- **runの中の制約**: matrixのglobal permit、ShardGroup、fail-fast、joinは、runの中の制約なので、投げたメンバーが管理する（第12章）。
+- **epoch**: `coordinator_epoch` は投げたメンバーごとの世代である。workerは `coordinator_id` ごとに最大のepochを持ち、`STALE_EPOCH` の判定、lease key（`coordinator_epoch`・`lease_seq`）、helloの答えの `coordinator_epoch` には、そのメンバーのものだけを使う。あるメンバーのepochが進んでも、他のメンバーの要求は古くならない。
+- **所有と見える範囲**: attemptは、それをsubmitしたメンバー（`coordinator_id`）のものである。workerは、attempt・retireのtombstone・leaseを `(coordinator_id, attempt_id)` で、taskごとのliveなattemptの一意性を `(coordinator_id, task_id)` で持つ。したがって、別のメンバーが同じ `attempt_id` や `task_id` を使っても別の行になり、互いに `RETIRED` や `CONFLICT` を起こさず、相手の状態も返らない。`get_attempt`・`list_attempts`・`renew_lease`・`cancel_attempt`・`retire_attempt`・`watch_events`・`read_log`・`get_result`・`ack_collected`・`blob_get`・`secret_bundle_put` は、接続したメンバーの分だけを対象にする（他のメンバーのattemptは `NOT_FOUND`）。
+- **届かなかったattemptのtombstone**: retireやcancelが先に届き、attemptが届かなかったtombstoneは、そのメンバーの `coordinator_epoch` が記録時より進んだら消してよい（古いepochの遅れたsubmitは `STALE_EPOCH` で断られる）。メンバーごとに1万件を上限とし、超える依頼は `OVERLOADED` で断る。受理したattemptのtombstoneは従来どおり消さない。
+- **drainとstop**: `workers drain`・`resume` はメンバー全体に働く（どのメンバーからの新しいsubmitも止める）。状態はworkerの側に永続化し、どのメンバーからでも `resume` できる。更新のための保留（24.8）はdrainとは別の状態で、`resume` では解けない。`workers stop` はそのマシンのresident（両方の役割）を止めるので、相手が他のメンバーの仕事を持つか、自分で投げた非terminalのrunを持つとき（`inspect` の答えで分かる）は、理由を示して断る。`--all-submitters` を明示したときだけ進める。`stop --cancel-running` も同じ条件で `--all-submitters` を要する。
+
+## 24.5 投げたメンバーをまたぐ予測と見積
+
+- workerのforecastは、実ledger（誰が投げたかを問わず全部）、workerが受理した未登録のworkload（すべてのメンバーの分）、聞いたメンバーが送信中の未ACKの仕事（そのメンバーが渡す）を含める。
+- 他のメンバーが送信中でまだworkerに届いていない仕事は、どこからも見えない。forecastは予約券ではない（第9章）ので、その分は実際のsubmitの時点の断り（24.4）で吸収する。
+- coverageとnodeの識別子（第9章）は、聞いたメンバーの分だけを返す。他のメンバーの需要は合成済みの結果に効かせ、件数だけを `foreign_demand` として返す。識別子・command・sourceは返さない。聞いた側は、合成済みの需要をoverlayへ足し直さない。
+- 配置理由と `estimate` の表示には、他のメンバーの需要を含むことと、その件数を出す。`estimate` は読み取り専用のままで、他のメンバーの仕事があっても何も増やさない（A06）。
+- 自分のlocal workerも同じ扱いである。他のメンバーの仕事が入っていれば、自分のrunのforecastにその分が現れる。
+
+## 24.6 障害の範囲
+
+| 障害 | 止まるもの | 続くもの |
+| - | - | - |
+| あるメンバーのresidentが落ちる | そのメンバーが投げたrunの進行（配置・lease更新・回収）。そのメンバーのworker agent | そのrunのattemptは、置かれたworkerでleaseの範囲だけ続き、切れたら止まる（第12章）。supervisorは別processなので、そのマシン上のattemptもleaseの範囲で続く。他のメンバーが投げたrunは、残りのworkerの上で続く |
+| あるメンバーのマシンが落ちる（電源・OS） | 上に加えて、そのマシン上で動いていたすべてのattempt | 他のメンバーから見ると「workerの到達不能」「worker OS再起動」（第12章）で、それぞれが自分のattemptをその規則で扱う |
+| residentが戻る | — | coordinatorは自分のrunの非terminalをreconcileして同じattemptをadoptし、worker agentは生きているsupervisorへ再接続する（第12章の2つの行が、1つのprocessで両方起こる） |
+
+- workerは投げたメンバーごとにleaseを見る。あるメンバーが落ちてleaseが切れても、止めるのはそのメンバーのattemptだけである。
+- 投げたメンバーが落ちたrunを、別のメンバーが引き継ぐことはしない（第2章の対象外）。そのresidentが戻るまで、そのrunは進まない。
+- 投入は、自分のresidentが動いているときだけできる。他のメンバーに投げさせる機能は置かない。
+
+## 24.7 遅いpeerが他を止めない（R96）
+
+2026-11-20時点の実装では、coordinatorのtickが応答しないworkerと話している間、1台あたりの上限 `worker_budget_ms`（既定15秒）のあいだcoordinatorのactorを持ち続け、その間のCLIの要求が時間切れになる。メンバーが増えるとこの時間は重なって増えるので、次を必須とする。
+
+1. **actor**: 配置のcommitとDBの書き込みを直列化するactorは、他のメンバーとの通信を待つ間、占有されない。通信はworkerごとの独立した処理で行い、actorへは結果だけを渡す。
+2. **CLI**: 自分のDBだけで答えられる要求（投入の受理、cancel・retryの受理、`ls`、`show`、回収済みの `logs`・`outputs`、`workers`・`group` の一覧、`workers forget`）の応答時間は、メンバーの台数と状態に依存しない。到達不能・無応答のメンバーが何台あっても同じである。
+3. **照会が要るCLI**: `estimate`、`workers diff`、`doctor`、未回収分の `logs --follow` などは、答えたメンバーの分を、答えないメンバーを待たずに（メンバーごとの上限で）返し、答えなかったメンバーを明示する。
+4. **worker どうし**: 1台の遅いworkerが、他のworkerのlease更新・確認を遅らせないという規則（第11章）を、配置のsubmit、回収、`env_sync`、blobの転送にも広げる。
+5. **受ける側**: あるメンバーの接続が遅い・止まっている・大きな転送の途中であっても、他のメンバーのhello・`inspect`・`forecast`・submit・renew・cancelを塞がない。メンバーをまたいで共有するlockを、通信を待つ間持ち続けない。
+6. **同じprocessの中**: 1つのresidentが両方の役割を持つので、自分のcoordinatorが遅いメンバーを待っていても、同じマシンのworker agentが他のメンバーへ答える時間は変わらない。逆も同じである。
+
+受入（A56）では、接続は保ったまま答えないメンバーを置いた状態で、2の要求が2秒以内に返ることを確かめる。この2秒は実装の定数とし、`worker_budget_ms` より十分短くする。試験は仮想の時計で測る決定的なものとし、sleepに頼らない。
+
+## 24.8 メンバーの更新（R68: residentが自分を更新する）
+
+residentが自分自身を更新する機能（R68）は、初回リリースの範囲に含める。どのメンバーも投げる側なので、すべてのメンバーのresidentを更新する手段が要る。`workers upgrade` は、動いているresidentが自分のbinaryと同じbuildのときだけ進む（第18章）ので、まず自分を更新できなければ、他のメンバーも更新できない。
+
+- `belt upgrade [--binary <path>]` は、自分のマシン（1つのresident、両方の役割）を更新する。更新のための保留を置き、受理済みの仕事の完了を待ち、親DBとworker DBを退避し、新しいbinaryを版別directoryへ置き、互換を検査し、serviceを切り替え、healthを確かめ、commitして保留を解く。実行中のbinaryを上書きしない。
+- **更新のための保留**: 更新の開始時にworkerへ置く、drainとは別の永続状態である。新しいsubmitを受けない点はdrainと同じだが、`workers resume` では解けず、解くのはcommitかrollbackだけである。利用者が先にdrainしていた場合、commitの後もそのdrainは残る。
+- **試用中は誰にも約束しない**: 切り替えた新しい版は、commitされるまで試用中である。試用中のworkerは、他のメンバーからの状態を変える要求（submit・renew・retire・cancel・`ack_collected`・blobやsecretの受け取り・`env_sync`・`identity_retired`）のすべてに、何も行わず、何も保存せずに、後で送り直せる答え（理由なしの `OVERLOADED`）を返す。読み取り（`inspect`・`get_attempt`・`forecast`）には答える。したがって、他のメンバーのretireやcancelは、相手の側で未確認のまま残り、commitかrollbackの後に届け直される。試用中に受け取ったtombstoneや確認が、rollbackで消えるということが起こらない。保留で受理済みの仕事の完了を待ってから切り替えるので、試用中にrenewを断られて止まるattemptは無い。
+- **試用中のcoordinator**: coordinatorの役割は、既存のattemptのadoptとlease更新だけを行う。新しい配置、新しいgenerationの作成、投入の受理、retire・cancelの送信、回収の確定（`ack_collected` と結果の採用）は行わない。
+- **退避とrollback**: 切替の前に、親DB（自分が投げたrun）とworker DBの両方を、同じ時点で退避する。新しい版のmigration（coordinatorとworkerのstep）は古い版から読めないので、rollbackは2つのDBを一緒に退避へ戻す。片方だけを戻さない。commitの後は戻せない（第18章のworkerの規則と同じ）。
+- **誰が決めるか**: 外側から見ている別のメンバーは居ないので、`belt upgrade` を実行したCLIが、新しい版のhealth（`hello` とfeature、両方のDBが開けること、adoptしたattemptのleaseを更新できたこと）を確かめてcommitを指示する。
+- **期限**: commitには期限（実装の定数。leaseの1期間より短くする）を置く。期限を見張るのは、serviceが起動する入口（版を選んでresidentを起動する部分。切替の前から動いている、更新されない側）である。期限までにcommitされなければ、新しい版が応答していなくても、入口が新しい版を止め、2つのDBを戻し、元の版を起動する。新しい版の起動時の確認だけに頼らない。CLIが途中で落ちた場合も同じ期限で戻る。
+- **rollback後に二重実行しない**: 試用中は、自分では新しい配置もgenerationも作らず、他のメンバーへは何も約束していない。lease更新は同じlease keyの続きとして行う。したがって、戻した後の古い版は、退避した時点の記録から同じattemptをadoptするだけになり、他のメンバーが試用中に出したretireは、戻した後に届いてtombstoneになる。試用中に進んだ `lease_seq` は、戻した版がworkerの答えから読み直す。
+- 自分が投げたrunは、切替の間、process再起動と同じ扱いになる（第12章）。他のworker上のattemptはleaseの範囲で続く。切替がleaseより長引いた場合は、worker側の既存の規則で止まる。
+- `workers upgrade <worker>` は、SSH先のマシンで同じ手順を起こす。更新されるのはそのマシンの1つのbinaryで、相手が投げたrunも上の規則で保たれる。このときは、実行した側のCLIがhealthを確かめてcommitする。期限を見張るのは、相手のマシンのserviceの入口である。
+- 同じマシンに対する更新は、process lockで同時に1つだけにする。
+- 版の間の互換は第18章のN／N+1のままである。メンバーはどの順に更新してもよく、NのメンバーとN+1のメンバーは、投げる側・受ける側のどちらの向きでも互いを使える。
+
+## 24.9 採用しなかった案
+
+案A（Raftなどの合意で、すべてのメンバーが同じ状態を持つ構成）は採用しない。
+
+- 2台では過半数が成り立たない。最も多い構成が2台で、1台が落ちると全体が止まる。
+- coordinator・storage・復旧の規則を大きく書き直すことになる。
+- secret（GitHub status用のcredential、secret bundle）を全メンバーへ複製する必要がある。
+- 古いleaderの書き込みを止めるfencingが要る。「世代を増やしただけで古いプロセスが停止したとは扱わない」（第10章）という原則と両立させる仕組みを別に作ることになる。
+
+この章の構成は、投げたメンバーが落ちたrunが止まることを受け入れる代わりに、これらを要らなくする。対等なのは「誰でも投げられ、誰でも受ける」ことであり、runの記録を全員で持つことではない。
+
+投げるメンバーごとにworkerが信頼を登録・取消する構成（メンバーごとの鍵と取消の記録）も採用しない。2〜5台では、グループ鍵1つと鍵の更新で足り、登録・取消・相手ごとのdrainの操作と記録を持たずに済む。
+
+## 24.10 wireと移行のまとめ
+
+| feature（hello。どれも最初の公開版から必須） | 内容 |
+| - | - |
+| `group_membership_v1` | 操作 `group_proof`（相互）、helloの答えのnonce、断る理由（`group_mismatch`・`group_key_mismatch`・`member_identity_mismatch`・`identity_retired`） |
+| `identity_retired_v1` | 操作 `identity_retired`（24.3） |
+| `shared_admission_v1` | submitの `overloaded_reason.reason = "capacity"`、`inspect` の受付窓の使用数と共有の有無、forecastの `foreign_demand` |
+
+- 3つとも必須にする。これより古い公開版は無いので、持たない相手との互換の枝は置かない。持たない相手とは接続しない。schema versionは上げない。
+- helloの要求は従来から `cluster_id`・`coordinator_id`・`coordinator_epoch` を運ぶので、項目は増やさない。helloの答えは、nonceを加え、worker identity・boot・epoch・profile・能力を `group_proof` の答えへ移す。
+- 鍵の配布・切替・送り直し（`workers add`、`group rotate-key`、`group send-key`）は、SSH越しの固定helperで行い、worker protocolの操作にはしない。
+- 既存のworker DBの移行（step 4）: 最初の公開版より前のDBなので、誰のattemptだったかを推測して引き継ぐことはしない。移行は、workerがdrain済みでliveなattemptが無いときだけ行い、liveなattemptがあれば、その件数と、drainして完了を待つ手順を示して断る（DBには触れない）。移行では、古いattempt・tombstone・lease・epochの行を捨てる。古いcoordinatorも同じ更新で新しい版になり、新しい鍵の形（`(coordinator_id, …)`）の下でepochを数え直す。古い版の遅れたsubmitは、`group_proof` を通れないので届かない。今の `cluster_id` と鍵は、そのままグループのIDと世代1の鍵にする。
