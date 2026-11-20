@@ -267,7 +267,10 @@ impl LogPrefixReader {
         .into();
         let meta = file.metadata()?;
         if !meta.is_file() || meta.len() != size {
-            return Err(io::Error::other("artifact size/type mismatch").into());
+            // Not a fault of the read: the file is not the receipted one.
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "artifact size/type mismatch").into(),
+            );
         }
         Ok(file)
     }
@@ -720,6 +723,16 @@ impl ResultStore {
     /// Drop what is here of a stream: it is read again from its start.
     pub fn discard_log(&self, attempt: &AttemptId, stream: LogStream) -> Result<()> {
         Ok(remove_if_there(&self.log_path(attempt, stream))?)
+    }
+
+    /// The length of the published file with `digest`, when one is there.
+    /// Nothing is hashed and nothing is changed.
+    pub fn published_len(&self, attempt: &AttemptId, digest: &Digest) -> Result<Option<u64>> {
+        match fs::symlink_metadata(self.artifact_path(attempt, digest)) {
+            Ok(m) => Ok(Some(m.len())),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
     /// How far the artifact with `digest` (of `size` bytes) is. A published

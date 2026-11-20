@@ -510,6 +510,85 @@ fn matrix_permits_hold_until_terminal_or_confirmed_retire() {
 }
 
 #[test]
+fn an_unbound_permit_of_a_step_12_file_gives_its_slot_back_when_migrated() {
+    let f = fx();
+    let all = schema::steps(DbKind::Coordinator);
+    assert_eq!(
+        all.iter().position(|s| s.contains("matrix_permit_held")),
+        Some(12),
+        "the step that released the permits of ended attempts"
+    );
+    f.store.create_matrix_group("g", &f.run, 2, 1).unwrap();
+    let (unbound, bound, next) = (
+        PermitId::generate(),
+        PermitId::generate(),
+        PermitId::generate(),
+    );
+    assert!(f.store.acquire_permit("g", &unbound, 5).unwrap().is_some());
+    assert!(f.store.acquire_permit("g", &bound, 6).unwrap().is_some());
+    // A permit of an attempt that still runs keeps its slot.
+    f.store
+        .create_attempt(
+            NewAttempt {
+                attempt_id: AttemptId::generate(),
+                task_id: f.task.clone(),
+                worker_id: f.worker.clone(),
+                payload_hash: hash('a'),
+                permit_id: Some(bound.clone()),
+            },
+            7,
+        )
+        .unwrap();
+    assert!(f.store.acquire_permit("g", &next, 8).unwrap().is_none());
+    // Exactly the step-12 schema: what steps 13 and later made is gone.
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute_batch(
+                "DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download;
+                 DROP TABLE ci_test_timing; DROP TABLE workflow_artifact;
+                 DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended;
+                 DROP INDEX matrix_permit_held;
+                 UPDATE schema_meta SET value='12' WHERE key='schema_version';",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    drop(f.store);
+    let owner = CoordinatorStore::open(f._dir.path(), 20).unwrap();
+    let version: String = owner
+        .db
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT value FROM schema_meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(version, all.len().to_string());
+    assert!(!owner.get_permit(&unbound).unwrap().unwrap().held);
+    assert!(owner.get_permit(&bound).unwrap().unwrap().held);
+    assert_eq!(owner.held_permits("g").unwrap(), 1);
+    let released: Option<i64> = owner
+        .db
+        .call(move |c| {
+            Ok(c.query_row(
+                "SELECT released_at_ms FROM matrix_permit WHERE permit_id=?1",
+                [unbound.as_str()],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(released, Some(5));
+    assert!(owner.acquire_permit("g", &next, 21).unwrap().is_some());
+    assert!(owner
+        .acquire_permit("g", &PermitId::generate(), 22)
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn creating_an_attempt_with_a_bad_permit_leaves_no_attempt() {
     let f = fx();
     let r = f.store.create_attempt(
@@ -5324,6 +5403,144 @@ fn result_retention_keeps_unknown_unacked_open_and_pinned_references() {
         .unwrap();
     assert!(p.clock_held);
     assert_eq!(p.removed, 0);
+}
+
+#[test]
+fn workflow_artifact_files_outlive_their_producer_until_the_run_has_ended() {
+    use crate::results::store::ResultStore;
+    use local_ci::artifact_io::{FileEntry, Receipt as Manifest};
+    let f = fx();
+    // The producer ended at 100 and its collection is closed.
+    let producer = retention_ready(&f);
+    // A later job of the same run that is not placed yet.
+    let later = TaskId::generate();
+    f.store.create_task(&later, &f.run, &json!({}), 1).unwrap();
+    // The origin of a matrix is never placed itself. It holds the run open
+    // until its members are joined, and not after.
+    let origin = TaskId::generate();
+    f.store
+        .create_task(
+            &origin,
+            &f.run,
+            &json!({"ci":{"hold":true,"dynamic_origin":true}}),
+            1,
+        )
+        .unwrap();
+    let digest = Digest::of_bytes(b"built");
+    f.store
+        .reserve_workflow_files(
+            WorkflowUpload {
+                run: &f.run,
+                workflow: "ci",
+                producer: &producer,
+                key: &Digest::of_bytes(b"upload"),
+                overwrite: false,
+                receipt: Manifest {
+                    name: "build".into(),
+                    version: 1,
+                    files: vec![FileEntry {
+                        path: "out/app".into(),
+                        size: 5,
+                        sha256: digest.as_str().strip_prefix("sha256:").unwrap().into(),
+                    }],
+                    plan_digest: "plan".into(),
+                    attempt_id: "run".into(),
+                    job: "ci::build".into(),
+                    display: "build".into(),
+                    task: None,
+                    retention_days: None,
+                    compression_level: None,
+                    restored_from: None,
+                },
+            },
+            50,
+        )
+        .unwrap();
+    // What only the producer's own end keeps, for comparison.
+    f.store
+        .add_blob_ref(
+            &blob(
+                "plain",
+                &producer,
+                BlobKind::Result,
+                &ResultStore::result_locator(&producer),
+            ),
+            102,
+        )
+        .unwrap();
+    let artifact_refs = || {
+        f.store
+            .db
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT count(*) FROM blob_ref WHERE ref_id LIKE 'ci-artifact/%'",
+                    [],
+                    |r| r.get::<_, u32>(0),
+                )?)
+            })
+            .unwrap()
+    };
+    let guard = crate::test_tmp::gc_guard(&f.store, &f.run);
+    let claim = |wall, mono| {
+        f.store
+            .claim_result_page(&guard, &f.run, "", 32, wall, mono, Some("boot".into()), 10)
+            .unwrap()
+    };
+    assert!(claim(200, 10).clock_held);
+    // The producer ended longer ago than the retention, but the run is open.
+    let open = claim(210, 20);
+    assert_eq!((open.examined, open.removed, open.queued), (2, 1, 1));
+    assert_eq!(artifact_refs(), 1);
+    // The later job runs and ends at 205: the retention starts there.
+    let consumer = f
+        .store
+        .create_attempt(
+            NewAttempt {
+                attempt_id: AttemptId::generate(),
+                task_id: later,
+                worker_id: f.worker.clone(),
+                payload_hash: hash('b'),
+                permit_id: None,
+            },
+            203,
+        )
+        .unwrap()
+        .attempt_id;
+    f.to_finalizing(&consumer);
+    assert_eq!(claim(211, 21).removed, 0, "a job of the run is still live");
+    f.store
+        .finalize_attempt(&consumer, done(Outcome::Succeeded), 205)
+        .unwrap();
+    assert_eq!(claim(216, 26).removed, 0, "the matrix is not joined");
+    let authorization = f.store.ci_driver_authorization(&f.run).unwrap();
+    assert!(f
+        .store
+        .complete_ci_origin(&f.run, &origin, authorization, "success", 206)
+        .unwrap());
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute(
+                "UPDATE attempt SET terminal_at_ms=209 WHERE terminal_at_ms=205",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(claim(218, 28).removed, 0, "within retention of the run");
+    assert_eq!(artifact_refs(), 1);
+    let ended = claim(219, 29);
+    assert_eq!((ended.removed, ended.queued), (1, 1));
+    assert_eq!(artifact_refs(), 0);
+    assert_eq!(
+        f.store
+            .pending_result_page(&guard, &f.run, 8)
+            .unwrap()
+            .iter()
+            .filter(|claim| claim.locator == ResultStore::artifact_locator(&producer, &digest))
+            .count(),
+        1
+    );
 }
 
 #[test]

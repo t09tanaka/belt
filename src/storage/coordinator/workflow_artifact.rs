@@ -30,6 +30,16 @@ impl WorkflowUpload<'_> {
     }
 }
 
+/// The references of the files of workflow artifacts start with this, and
+/// no other reference does. They are kept by their producer attempt, but a
+/// later job of the run reads them: retention measures them from the end of
+/// the run ([`super::retention`]).
+pub(super) const REF_PREFIX: &str = "ci-artifact/";
+
+pub(crate) fn ref_id(producer: &AttemptId, digest: &Digest) -> String {
+    format!("{REF_PREFIX}{producer}/{digest}")
+}
+
 impl CoordinatorStore {
     pub(crate) fn reserve_workflow_files(
         &self,
@@ -59,7 +69,7 @@ impl CoordinatorStore {
                     tx,
                     producer.as_str(),
                     &ResultRef {
-                        ref_id: format!("ci-artifact/{producer}/{digest}"),
+                        ref_id: ref_id(&producer, &digest),
                         kind: BlobKind::Result,
                         locator,
                     },
@@ -259,7 +269,7 @@ impl CoordinatorStore {
                     .map_err(|e| StorageError::Invalid(e.to_string()))?;
                 let locator = ResultStore::artifact_locator(&producer, &digest);
                 add_ref(tx,producer.as_str(),&ResultRef {
-                    ref_id: format!("ci-artifact/{producer}/{digest}"), kind: BlobKind::Result, locator,
+                    ref_id: ref_id(&producer, &digest), kind: BlobKind::Result, locator,
                 },at_ms)?;
             }
             let json = serde_json::to_string(&receipt).map_err(|e| StorageError::Invalid(e.to_string()))?;
