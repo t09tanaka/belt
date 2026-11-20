@@ -4,19 +4,17 @@
 //! one repository, directory snapshots, `--in-place`, and a missing tool.
 //!
 //! The real `fast-worktree` is used when it is on the PATH; set
-//! `RTR_REQUIRE_FAST_WORKTREE=1` (CI does) to make its absence a failure.
+//! `BELT_REQUIRE_FAST_WORKTREE=1` (CI does) to make its absence a failure.
 
 use crate::common;
 
+use belt::error::{BlockedReason, ErrorCode};
+use belt::ids::AttemptId;
+use belt::source::{capture, CaptureParams, ObjectsRepo, SourceRequest, SourceStore};
+use belt::workspace::plan::FwFailure;
+use belt::workspace::{CliFastWorktree, FastWorktree, Workspace, WorkspaceKind, Workspaces};
 use local_ci::source::SourceManifest as CiManifest;
 use local_ci::ExecContext;
-use remote_task_runner::error::{BlockedReason, ErrorCode};
-use remote_task_runner::ids::AttemptId;
-use remote_task_runner::source::{capture, CaptureParams, ObjectsRepo, SourceRequest, SourceStore};
-use remote_task_runner::workspace::plan::FwFailure;
-use remote_task_runner::workspace::{
-    CliFastWorktree, FastWorktree, Workspace, WorkspaceKind, Workspaces,
-};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -185,7 +183,7 @@ fn backends(home: &Path) -> Vec<Backend> {
             real: true,
             make: |env| Arc::new(CliFastWorktree::new(env)),
         });
-    } else if std::env::var("RTR_REQUIRE_FAST_WORKTREE").is_ok() {
+    } else if std::env::var("BELT_REQUIRE_FAST_WORKTREE").is_ok() {
         panic!("fast-worktree is required here and is not installed");
     } else {
         eprintln!("fast-worktree is not installed: only the stand-in is tested");
@@ -359,7 +357,7 @@ fn worktrees(f: &Fixture, clone: &Path) -> Vec<String> {
 fn branches(f: &Fixture, clone: &Path) -> Vec<String> {
     f.git(
         clone,
-        &["branch", "--list", "rtr/*", "--format=%(refname:short)"],
+        &["branch", "--list", "belt/*", "--format=%(refname:short)"],
     )
     .lines()
     .map(str::to_string)
@@ -445,7 +443,7 @@ fn removing_an_attempt_releases_only_its_portool_allocation() {
         .output();
     if !real_available(&f.root.join("home")) || !portool.is_ok_and(|out| out.status.success()) {
         assert!(
-            std::env::var_os("RTR_REQUIRE_FAST_WORKTREE").is_none(),
+            std::env::var_os("BELT_REQUIRE_FAST_WORKTREE").is_none(),
             "A48 needs fast-worktree and portool"
         );
         return;
@@ -843,7 +841,7 @@ fn a_create_after_a_crash_clears_the_stale_branch_and_registration() {
                 "add",
                 "-q",
                 "-b",
-                &format!("rtr/{att}"),
+                &format!("belt/{att}"),
                 dir.to_str().unwrap(),
                 &commit,
             ],
@@ -1050,7 +1048,7 @@ fn a_symlink_at_the_workspaces_place_is_not_followed() {
         cwd: place.clone(),
         kind: WorkspaceKind::Worktree {
             clone: repo.dir().to_path_buf(),
-            branch: format!("rtr/{att}"),
+            branch: format!("belt/{att}"),
         },
         index_reproduced: true,
         warnings: vec![],
@@ -1083,7 +1081,7 @@ fn a_create_over_a_dead_creates_directory_starts_over() {
                 "add",
                 "-q",
                 "-b",
-                &format!("rtr/{att}"),
+                &format!("belt/{att}"),
                 dir.to_str().unwrap(),
                 m.execution_commit.as_deref().unwrap(),
             ],

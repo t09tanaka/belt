@@ -10,21 +10,19 @@
 
 use crate::common::{alive, read_pid};
 use crate::worker_agent;
-use remote_task_runner::coordinator::policy::Limits;
-use remote_task_runner::coordinator::{
+use belt::coordinator::policy::Limits;
+use belt::coordinator::{
     Coordinator, CoordinatorConfig, CoordinatorError, LinkError, TaskSpec, WorkerLink,
 };
-use remote_task_runner::error::{ApiError, BlockedReason, ConflictReason, ErrorCode};
-use remote_task_runner::ids::*;
-use remote_task_runner::results::{CollectConfig, CollectReport, ResultStore};
-use remote_task_runner::scheduler::{CostModel, Scheduler, SchedulerConfig, UnknownCosts};
-use remote_task_runner::state::{
-    AttemptState, Observation, Outcome, Receipt, Receipts, Termination,
-};
-use remote_task_runner::storage::{AttemptRecord, CoordinatorStore, StorageError};
-use remote_task_runner::wire::*;
-use remote_task_runner::worker::policy::{load_counts, retire_status};
-use remote_task_runner::worker::Agent;
+use belt::error::{ApiError, BlockedReason, ConflictReason, ErrorCode};
+use belt::ids::*;
+use belt::results::{CollectConfig, CollectReport, ResultStore};
+use belt::scheduler::{CostModel, Scheduler, SchedulerConfig, UnknownCosts};
+use belt::state::{AttemptState, Observation, Outcome, Receipt, Receipts, Termination};
+use belt::storage::{AttemptRecord, CoordinatorStore, StorageError};
+use belt::wire::*;
+use belt::worker::policy::{load_counts, retire_status};
+use belt::worker::Agent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -116,7 +114,7 @@ impl Cluster {
 }
 
 pub(crate) struct State {
-    capabilities: Option<remote_task_runner::toolchain::capability::WorkerCapabilities>,
+    capabilities: Option<belt::toolchain::capability::WorkerCapabilities>,
     pub(crate) max_epoch: u64,
     pub(crate) held: BTreeMap<AttemptId, Held>,
     pub(crate) tombstones: BTreeSet<AttemptId>,
@@ -1884,7 +1882,7 @@ async fn a19_a_real_worker_stops_the_retired_run_and_the_resent_retire_frees_the
     let first = only(&c, &task);
     // The real worker answered the scheduler's forecast question with a
     // number to compare by (a ranking: nothing has run here before).
-    let decision = remote_task_runner::scheduler::reason_of(c.store(), &first.attempt_id)
+    let decision = belt::scheduler::reason_of(c.store(), &first.attempt_id)
         .unwrap()
         .unwrap();
     let outlook = decision.compared[0].outlook;
@@ -2045,7 +2043,7 @@ async fn a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_w
 // Readiness constrains only new placements; control traffic still reaches the peer.
 pub(crate) struct InputGatedWorker {
     worker: Arc<FakeWorker>,
-    pub(crate) gate: Arc<remote_task_runner::coordinator::InputGate>,
+    pub(crate) gate: Arc<belt::coordinator::InputGate>,
     invalidate_forecast: AtomicBool,
     attestor: Option<Arc<ToolchainAttestor>>,
 }
@@ -2060,18 +2058,13 @@ impl WorkerLink for InputGatedWorker {
         }
     }
 
-    fn cost_transport(&self) -> Option<remote_task_runner::scheduler::measured::Transport> {
+    fn cost_transport(&self) -> Option<belt::scheduler::measured::Transport> {
         self.gate.cost_transport()
     }
     fn cold_eligible(&self, task: &TaskId) -> bool {
         self.gate.cold_eligible(task)
     }
-    fn prefer(
-        &self,
-        task: &remote_task_runner::storage::QueuedTask,
-        expected: u64,
-        ttl: u64,
-    ) -> bool {
+    fn prefer(&self, task: &belt::storage::QueuedTask, expected: u64, ttl: u64) -> bool {
         self.gate.prefer(task, expected, ttl)
     }
     fn clear_preference(&self, task: Option<&TaskId>, run: Option<&RunId>) {
@@ -2084,7 +2077,7 @@ impl WorkerLink for InputGatedWorker {
     fn inputs_evaluated(&self, generation: u64, run: &RunId) {
         self.gate.evaluated(generation, run);
     }
-    fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
+    fn placement_inputs(&self) -> Option<belt::coordinator::PlacementInputs> {
         Some(self.gate.placement_inputs())
     }
     fn input_refusals(&self) -> Vec<(RunId, String)> {
@@ -2118,10 +2111,8 @@ pub(crate) fn gated_worker(worker: &Arc<FakeWorker>) -> Arc<InputGatedWorker> {
         attestor: None,
     })
 }
-pub(crate) fn ready_input(
-    task: &remote_task_runner::storage::QueuedTask,
-) -> remote_task_runner::coordinator::ReadyInput {
-    remote_task_runner::coordinator::ReadyInput {
+pub(crate) fn ready_input(task: &belt::storage::QueuedTask) -> belt::coordinator::ReadyInput {
+    belt::coordinator::ReadyInput {
         run_id: task.run_id.clone(),
         source_id: task.source_id.clone().unwrap(),
         manifest_digest: spec().manifest_digest,
@@ -2238,16 +2229,9 @@ fn source_gate_exclude_task(c: &Coordinator, task: &TaskId, worker: &WorkerId) {
             1,
         )
         .unwrap();
-    assert!(matches!(
-        placed,
-        remote_task_runner::storage::PlaceOutcome::Placed(_)
-    ));
+    assert!(matches!(placed, belt::storage::PlaceOutcome::Placed(_)));
     c.store()
-        .begin_retire(
-            &attempt,
-            remote_task_runner::scheduler::REASON_WORKER_CANNOT_RUN,
-            2,
-        )
+        .begin_retire(&attempt, belt::scheduler::REASON_WORKER_CANNOT_RUN, 2)
         .unwrap();
     c.store().confirm_retire(&attempt, 3).unwrap();
 }
@@ -2283,7 +2267,7 @@ async fn source_gate_full_cache_evicts_only_evaluated_inputs_for_later_compatibl
     .unwrap();
     assert!(c.tick().await.unwrap().placed.is_empty());
     assert!(gated.gate.evict_evaluated());
-    let input = remote_task_runner::coordinator::ReadyInput {
+    let input = belt::coordinator::ReadyInput {
         run_id: run,
         source_id,
         manifest_digest: spec().manifest_digest,
@@ -2312,7 +2296,7 @@ async fn source_gate_advances_within_one_ready_run_beyond_dispatch_scan() {
     }
     gated.gate.publish(
         gated.gate.generation(),
-        remote_task_runner::coordinator::ReadyInput {
+        belt::coordinator::ReadyInput {
             run_id: run,
             source_id: source,
             manifest_digest: spec().manifest_digest,
@@ -2351,7 +2335,7 @@ struct DbCommitWorker {
     commit_entered: tokio::sync::Notify,
 }
 impl WorkerLink for DbCommitWorker {
-    fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
+    fn placement_inputs(&self) -> Option<belt::coordinator::PlacementInputs> {
         self.inner.placement_inputs()
     }
     fn placement_fence(&self) -> Option<Arc<tokio::sync::Mutex<()>>> {
@@ -2505,7 +2489,7 @@ struct ReplacesDuringForecast {
     unrestricted: bool,
 }
 impl WorkerLink for ReplacesDuringForecast {
-    fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
+    fn placement_inputs(&self) -> Option<belt::coordinator::PlacementInputs> {
         if self.unrestricted {
             None
         } else {
@@ -2626,7 +2610,7 @@ async fn in_place_scheduler_uses_only_explicit_parent_local_and_never_automatic_
 
 #[tokio::test]
 async fn capability_filter_runs_before_forecast_and_records_unmet_requirements() {
-    use remote_task_runner::toolchain::capability::*;
+    use belt::toolchain::capability::*;
     let f = fx();
     let old = f.worker("old", (1, 1));
     let capable = f.worker("capable", (1, 1));
@@ -2698,7 +2682,7 @@ async fn capability_filter_runs_before_forecast_and_records_unmet_requirements()
         .unwrap()
         .into_iter()
         .find(|e| {
-            e.kind == remote_task_runner::scheduler::EVENT_TASK_WAITING
+            e.kind == belt::scheduler::EVENT_TASK_WAITING
                 && e.payload["task"] == mismatch_task.to_string()
         })
         .unwrap();
@@ -2755,7 +2739,7 @@ impl WorkerLink for ToolchainAttestor {
 }
 #[tokio::test]
 async fn slow_toolchain_attestation_respects_round_budget_and_other_lease_progress() {
-    use remote_task_runner::toolchain::{contract::FrozenBundle, versions::*};
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
     let mut f = fx();
     f.cfg.worker_budget_ms = 1500;
     f.sched.forecast_wait_ms = 50;
@@ -2854,7 +2838,7 @@ async fn measured_cold_frozen_attested_candidate_prefetches_before_attempt() {
     measured_cold_fixture(true, true, true).await;
 }
 async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
-    use remote_task_runner::scheduler::measured::{CostQuery, MeasuredCosts, Phase, Sample};
+    use belt::scheduler::measured::{CostQuery, MeasuredCosts, Phase, Sample};
     let mut f = fx();
     let stats = crate::test_tmp::tempdir().unwrap();
     {
@@ -2876,11 +2860,9 @@ async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
     let c = f.open(&[]);
     let warm_link = Arc::new(InputGatedWorker {
         worker: warm.clone(),
-        gate: Arc::new(
-            remote_task_runner::coordinator::InputGate::with_transport_policy(
-                "fixture-rpc-v1".into(),
-            ),
-        ),
+        gate: Arc::new(belt::coordinator::InputGate::with_transport_policy(
+            "fixture-rpc-v1".into(),
+        )),
         invalidate_forecast: AtomicBool::new(false),
         attestor: frozen.then(|| {
             Arc::new(ToolchainAttestor {
@@ -2891,11 +2873,9 @@ async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
     });
     let cold_link = Arc::new(InputGatedWorker {
         worker: cold.clone(),
-        gate: Arc::new(
-            remote_task_runner::coordinator::InputGate::with_transport_policy(
-                "fixture-rpc-v1".into(),
-            ),
-        ),
+        gate: Arc::new(belt::coordinator::InputGate::with_transport_policy(
+            "fixture-rpc-v1".into(),
+        )),
         invalidate_forecast: AtomicBool::new(false),
         attestor: frozen.then(|| {
             Arc::new(ToolchainAttestor {
@@ -2912,7 +2892,7 @@ async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
     c.attach(warm.id.clone(), warm_link.clone()).await;
     c.attach(cold.id.clone(), cold_link.clone()).await;
     let tasks = if frozen {
-        use remote_task_runner::toolchain::{contract::FrozenBundle, versions::*};
+        use belt::toolchain::{contract::FrozenBundle, versions::*};
         let mut task_spec = spec();
         let scope = Scope::project("");
         task_spec.toolchains = Some(
@@ -2957,7 +2937,7 @@ async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
             task.source_id.as_ref().map(|s| s.as_str()),
             cold_link.cost_transport(),
         );
-        let now = remote_task_runner::platform::monotonic_ms();
+        let now = belt::platform::monotonic_ms();
         model.record(
             Sample::verified(
                 &cold.id,
@@ -2986,10 +2966,9 @@ async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
         assert_eq!(cold.count(Op::Forecast), 0);
     }
     assert_eq!(only(&c, &tasks[0]).worker_id, warm.id);
-    let evidence =
-        remote_task_runner::scheduler::cost_evidence_of(c.store(), &only(&c, &tasks[0]).attempt_id)
-            .unwrap()
-            .unwrap();
+    let evidence = belt::scheduler::cost_evidence_of(c.store(), &only(&c, &tasks[0]).attempt_id)
+        .unwrap()
+        .unwrap();
     let warm_evidence = &evidence
         .iter()
         .find(|e| e.worker_id == warm.id)
@@ -2997,7 +2976,7 @@ async fn measured_cold_fixture(known: bool, frozen: bool, cold_attests: bool) {
         .costs;
     assert_eq!(
         warm_evidence.transfer.kind,
-        remote_task_runner::scheduler::measured::EvidenceKind::VerifiedReady
+        belt::scheduler::measured::EvidenceKind::VerifiedReady
     );
     assert_eq!(warm_evidence.transfer.sample_count, Some(0));
     assert_eq!(warm_evidence.setup.ms, None);

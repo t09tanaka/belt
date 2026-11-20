@@ -150,7 +150,7 @@ impl Db {
 fn spawn(conn: Connection, path: &Path) -> Db {
     let (tx, rx) = mpsc::channel::<Job>();
     let join = std::thread::Builder::new()
-        .name("rtr-storage".into())
+        .name("belt-storage".into())
         .spawn(move || {
             let mut conn = conn;
             while let Ok(job) = rx.recv() {

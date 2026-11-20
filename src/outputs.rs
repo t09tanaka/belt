@@ -11,7 +11,7 @@ pub const MAX_ATTEMPT_FILES: usize = 16384;
 pub const MAX_VISITED: usize = 100_000;
 pub const MAX_BUNDLE_BYTES: u64 = 1 << 30;
 /// Components excluded from producer traversal and retained bundle export.
-pub const RESERVED_COMPONENTS: [&[u8]; 2] = [b".git", b".remote-task-runner"];
+pub const RESERVED_COMPONENTS: [&[u8]; 2] = [b".git", b".belt"];
 pub const FEATURE: &str = "output_bundles_v1";
 
 pub fn eligible(when: OutputWhen, outcome: Outcome, collection_allowed: bool) -> bool {

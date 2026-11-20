@@ -23,7 +23,7 @@ fn a_user_unit_is_rendered_exactly() {
     let plan = render(&definition()).unwrap();
     assert_eq!(
         plan.plist(),
-        "[Unit]\nDescription=remote-task-runner worker\n\n[Service]\nType=simple\n\
+        "[Unit]\nDescription=belt worker\n\n[Service]\nType=simple\n\
 ExecStart=\"/opt/example/bin/runner\" \"worker\" \"--input\" \"/cfg/in.json\"\n\
 WorkingDirectory=/cfg\nEnvironment=\"HOME=/home/u\"\nEnvironment=\"PATH=/usr/bin\"\n\
 Restart=always\nRestartSec=5\nTimeoutStopSec=60\n\n[Install]\nWantedBy=default.target\n"
@@ -171,7 +171,7 @@ fn units_live_below_the_config_home() {
 
 #[test]
 fn a_start_reloads_enables_then_starts_and_a_stop_only_stops() {
-    let unit = "rtr.worker.service";
+    let unit = "belt.worker.service";
     assert_eq!(
         steps(&words(&["--user", "start", unit])).unwrap(),
         [

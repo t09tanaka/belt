@@ -411,7 +411,7 @@ pub fn stage(
         let policy = policies
             .iter()
             .find(|p| p.workflow == step.workflow && p.job == step.job);
-        ci.task.inputs["rtr_discovery"] = serde_json::json!({"original_task":task.id,"capacity": capacity,"per_worker":per_worker, "project": project, "applied": false, "policy": policy});
+        ci.task.inputs["belt_discovery"] = serde_json::json!({"original_task":task.id,"capacity": capacity,"per_worker":per_worker, "project": project, "applied": false, "policy": policy});
         let steps = demand.map_or(step.step + 2, |demand| demand.nodes.len());
         ci.steps = u32::try_from(steps).unwrap_or(u32::MAX);
         probes.push((id, probe));
@@ -423,7 +423,7 @@ pub fn stage(
 pub fn active_plan(rows: &[crate::storage::CiTaskRow]) -> Option<&str> {
     rows.iter().find_map(|r| {
         r.spec
-            .pointer("/ci/task/inputs/rtr_discovery/active_plan")
+            .pointer("/ci/task/inputs/belt_discovery/active_plan")
             .and_then(|v| v.as_str())
     })
 }

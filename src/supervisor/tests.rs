@@ -410,14 +410,14 @@ fn two_threads_share_the_limit_exactly() {
 // ------------------------------------------------- separate processes
 
 /// The body of the child process of the tests below: append numbered chunks
-/// forever (until killed) to the spool named by `RTR_SPOOL_ROOT` /
-/// `RTR_SPOOL_ATTEMPT`. Does nothing in a normal run.
+/// forever (until killed) to the spool named by `BELT_SPOOL_ROOT` /
+/// `BELT_SPOOL_ATTEMPT`. Does nothing in a normal run.
 #[test]
 #[ignore = "owned subprocess helper"]
 fn child_writer_main() {
     let (Ok(root), Ok(attempt)) = (
-        std::env::var("RTR_SPOOL_ROOT"),
-        std::env::var("RTR_SPOOL_ATTEMPT"),
+        std::env::var("BELT_SPOOL_ROOT"),
+        std::env::var("BELT_SPOOL_ATTEMPT"),
     ) else {
         return;
     };
@@ -441,8 +441,8 @@ fn spawn_child(root: &Path, a: &AttemptId) -> crate::test_child::OwnedChild {
             "--ignored",
             "--nocapture",
         ])
-        .env("RTR_SPOOL_ROOT", root)
-        .env("RTR_SPOOL_ATTEMPT", a.as_str())
+        .env("BELT_SPOOL_ROOT", root)
+        .env("BELT_SPOOL_ATTEMPT", a.as_str())
         .stdin(Stdio::null());
     crate::test_child::OwnedChild::spawn(command).unwrap()
 }

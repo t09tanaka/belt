@@ -2,7 +2,7 @@
 //! `task-traffic-controller` and a fake `ssh` stand in for the real ones; no
 //! service, no ssh and no state outside the temporary directory is touched.
 use super::workers_lifecycle::{json, Fx};
-use remote_task_runner::error::ErrorCode;
+use belt::error::ErrorCode;
 use std::os::unix::fs::PermissionsExt;
 
 fn tool(fx: &Fx, name: &str, body: &str) {
@@ -106,7 +106,7 @@ fn an_unreachable_worker_fails_and_the_diff_slot_is_listed_as_not_checked() {
     let fx = Fx::new();
     fx.init();
     fx.config(
-        "schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@mini-a.local\"\nbinary = \"/w/bin/current/remote-task-runner\"\n",
+        "schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@mini-a.local\"\nbinary = \"/w/bin/current/belt\"\n",
     );
     fx.ssh("exit 255");
     let out = fx.run(&["doctor"]);
@@ -121,7 +121,7 @@ fn an_unreachable_worker_fails_and_the_diff_slot_is_listed_as_not_checked() {
     // One fixed command through the registered binary.
     assert_eq!(
         fx.argv().last().unwrap(),
-        "exec '/w/bin/current/remote-task-runner' 'worker-service' 'doctor'"
+        "exec '/w/bin/current/belt' 'worker-service' 'doctor'"
     );
 }
 
@@ -131,7 +131,7 @@ fn text_mode_lists_every_check_and_exits_by_the_result() {
     fx.init();
     no_engine(&fx);
     let run = || {
-        std::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+        std::process::Command::new(env!("CARGO_BIN_EXE_belt"))
             .arg("doctor")
             // Outside any project: nothing about a project is reported.
             .current_dir(fx.path("home"))
@@ -177,7 +177,7 @@ fn a_legacy_key_of_the_project_is_noticed() {
     let project = fx.path("project");
     std::fs::create_dir(&project).unwrap();
     let run = || {
-        let out = std::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_belt"))
             .args(["--json", "doctor"])
             .current_dir(&project)
             .env_clear()
@@ -251,8 +251,8 @@ fn retained_env(fx: &Fx) -> std::collections::BTreeMap<String, String> {
 }
 
 fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
-    use remote_task_runner::service::doctor::{Docker, HostFacts, ProfileFacts, Scope};
-    use remote_task_runner::toolchain::envdiff::{self, EnvReport};
+    use belt::service::doctor::{Docker, HostFacts, ProfileFacts, Scope};
+    use belt::toolchain::envdiff::{self, EnvReport};
     let fx = Fx::new();
     let cluster = fx.init_with_env(if retained {
         retained_env(&fx)
@@ -261,7 +261,7 @@ fn answering_worker(retained: bool) -> (Option<i32>, serde_json::Value) {
     });
     no_engine(&fx);
     fx.config(
-        "schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@mini-a.local\"\nbinary = \"/w/bin/current/remote-task-runner\"\n",
+        "schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@mini-a.local\"\nbinary = \"/w/bin/current/belt\"\n",
     );
     let scope = Scope {
         state_dir: "/s".into(),

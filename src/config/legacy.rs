@@ -1,6 +1,6 @@
 //! `.local-ci.toml` (local-ci 0.9) as a fallback for the keys both tools share.
 //!
-//! | `.local-ci.toml`          | `.remote-task-runner.toml`  |
+//! | `.local-ci.toml`          | `.belt.toml`  |
 //! | ------------------------- | --------------------------- |
 //! | `workflows-dirs`          | `[ci] workflows_dirs`       |
 //! | `[source] include`        | `[source] include`          |
@@ -21,29 +21,29 @@ use super::model::{SecretFile, SecretSpec};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Mapping {
     pub local_ci: &'static str,
-    pub rtr: &'static str,
+    pub belt: &'static str,
 }
 
 pub const MAPPING: &[Mapping] = &[
     Mapping {
         local_ci: "workflows-dirs",
-        rtr: "[ci] workflows_dirs",
+        belt: "[ci] workflows_dirs",
     },
     Mapping {
         local_ci: "[source] include",
-        rtr: "[source] include",
+        belt: "[source] include",
     },
     Mapping {
         local_ci: "[source] exclude",
-        rtr: "[source] exclude",
+        belt: "[source] exclude",
     },
     Mapping {
         local_ci: "[source] secret_files",
-        rtr: "[source] secret_files",
+        belt: "[source] secret_files",
     },
     Mapping {
         local_ci: "no-cache",
-        rtr: "[ci] no_cache",
+        belt: "[ci] no_cache",
     },
 ];
 

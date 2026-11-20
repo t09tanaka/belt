@@ -1,4 +1,4 @@
-//! The supervisor as its own process: `remote-task-runner supervise --spec F`.
+//! The supervisor as its own process: `belt supervise --spec F`.
 //!
 //! The agent starts it with [`spawn_detached`] and may then die, restart or
 //! lose its SSH session: the supervisor is in its own session, ignores

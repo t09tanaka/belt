@@ -44,7 +44,7 @@ impl Host {
         let dir = crate::test_tmp::tempdir().unwrap();
         let home = dir.path().join("home");
         let bin = dir.path().join("bin");
-        let state = home.join(".remote-task-runner");
+        let state = home.join(".belt");
         for path in [&home, &bin, &state] {
             fs::create_dir(path).unwrap();
         }
@@ -168,7 +168,7 @@ fn the_worker_scope_is_the_one_the_agent_gives_its_supervisors() {
                 state_dir: host.state.clone(),
                 worker_id: WorkerId::parse("mini-a").unwrap(),
                 boot_id: crate::ids::WorkerBootId::parse("boot").unwrap(),
-                supervisor_exe: PathBuf::from("/bin/rtr"),
+                supervisor_exe: PathBuf::from("/bin/belt"),
                 cluster_key_path: host.home.join("cluster.key"),
                 env: recorded.clone(),
             })
@@ -600,7 +600,7 @@ fn status(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
         draining,
         cancel_running: false,
         live_attempts: Some(0),
-        bridge_binary: Some("/w/bin/current/remote-task-runner".into()),
+        bridge_binary: Some("/w/bin/current/belt".into()),
         switching_from: None,
         drained_by_upgrade: false,
         switch_running: false,
@@ -763,7 +763,7 @@ impl World {
         for (name, ssh, with_binary) in workers {
             config.push_str(&format!("[[workers]]\nid = \"{name}\"\nssh = \"{ssh}\"\n"));
             if *with_binary {
-                config.push_str("binary = \"/w/bin/current/remote-task-runner\"\n");
+                config.push_str("binary = \"/w/bin/current/belt\"\n");
             }
             let mut answer = status(Some(true), true, false);
             answer.worker_id = WorkerId::parse(name).unwrap();
@@ -772,7 +772,7 @@ impl World {
             facts.docker.engine_id = Some(format!("engine-of-{name}"));
             hosts.insert(ssh.to_string(), Some((name.to_string(), facts, answer)));
         }
-        let directory = host.home.join(".config/remote-task-runner");
+        let directory = host.home.join(".config/belt");
         fs::create_dir_all(&directory).unwrap();
         fs::write(directory.join("config.toml"), config).unwrap();
         let local_state = host.home.join("local-worker");
@@ -784,7 +784,7 @@ impl World {
                 worker_state_dir: local_state,
                 worker_id: WorkerId::parse("local").unwrap(),
                 cluster_key_path: host.home.join("cluster.key"),
-                executable: host.home.join("rtr"),
+                executable: host.home.join("belt"),
                 env: BTreeMap::new(),
                 repo_root: None,
                 expected_cluster: Some(cluster.clone()),
@@ -899,7 +899,7 @@ fn every_registered_worker_is_asked_through_its_registered_binary() {
     let report = w.run();
     assert_eq!(
         w.remote.shells,
-        ["exec '/w/bin/current/remote-task-runner' 'worker-service' 'doctor'"; 2]
+        ["exec '/w/bin/current/belt' 'worker-service' 'doctor'"; 2]
     );
     for host in ["mini-a", "mini-b"] {
         for id in [
@@ -1110,7 +1110,7 @@ fn the_system_runner_returns_the_exit_code_and_output_in_the_given_environment()
 fn a_worker_host_is_viewed_through_its_recorded_service_environment() {
     use crate::service::worker_service::{install, service_view, tests::Fake, InstallRequest};
     let h = Host::new();
-    let exe = h.bin.join("rtr");
+    let exe = h.bin.join("belt");
     fs::write(&exe, b"pretend binary").unwrap();
     let fake = Fake::default();
     fake.0.borrow_mut().state = h.state.clone();
@@ -1319,7 +1319,7 @@ mod environment_diff {
         assert_eq!(checks[0].detail, "platform: same parent=22.1.0 worker=-");
         assert_eq!(
             checks[3].detail,
-            "flutter: auto_installable parent=22.1.0 worker=- -> do this (an exec installs it; `remote-task-runner workers sync mini-a` installs it now)"
+            "flutter: auto_installable parent=22.1.0 worker=- -> do this (an exec installs it; `belt workers sync mini-a` installs it now)"
         );
         assert_eq!(
             checks[5].detail,
@@ -1438,14 +1438,14 @@ mod environment_diff {
     #[test]
     fn the_worker_is_asked_for_its_environment_and_the_difference_is_listed() {
         let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
-        let exe = w.host.home.join("rtr");
+        let exe = w.host.home.join("belt");
         fs::write(&exe, "binary").unwrap();
         let parent = environment("22.1.0");
         w.remote.env_answer = answer(&environment("20.0.0"));
         let checks = worker_diff(&mut w.remote, &w.host.env, &exe, Ok(&parent), "mini-a");
         assert_eq!(
             w.remote.shells,
-            ["exec '/w/bin/current/remote-task-runner' 'worker-service' 'env'"]
+            ["exec '/w/bin/current/belt' 'worker-service' 'env'"]
         );
         let subject = |name: &str| {
             let found: Vec<_> = checks
@@ -1474,7 +1474,7 @@ mod environment_diff {
     #[test]
     fn a_worker_that_gives_no_report_is_listed_as_not_compared() {
         let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
-        let exe = w.host.home.join("rtr");
+        let exe = w.host.home.join("belt");
         fs::write(&exe, "binary").unwrap();
         let parent = environment("22.1.0");
         // A binary that predates the action prints nothing.
@@ -1493,7 +1493,7 @@ mod environment_diff {
     #[test]
     fn without_the_parent_s_measurement_no_worker_is_asked() {
         let mut w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
-        let exe = w.host.home.join("rtr");
+        let exe = w.host.home.join("belt");
         let checks = worker_diff(
             &mut w.remote,
             &w.host.env,
@@ -1705,7 +1705,7 @@ fn a_linux_worker_whose_lingering_is_off_is_warned_about_with_the_fix() {
 
 fn ephemeral_world() -> World {
     let w = World::new(&[("mini-a", "ci@mini-a.local", true)]);
-    let config = w.host.home.join(".config/remote-task-runner/config.toml");
+    let config = w.host.home.join(".config/belt/config.toml");
     let mut text = fs::read_to_string(&config).unwrap();
     text.push_str("[[workers]]\nid = \"colab-1\"\nssh = \"colab-tunnel\"\nephemeral = true\n");
     fs::write(&config, text).unwrap();

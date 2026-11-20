@@ -31,14 +31,14 @@ upgrade order are the same.
 
 `workers add <name> --ssh <dest> --install` and `workers upgrade <name>` send
 the parent's own binary only to a host of the parent's own operating system
-and architecture. For any other host, build `remote-task-runner` of the same
+and architecture. For any other host, build `belt` of the same
 version for that host and name the build:
 
 ```
-remote-task-runner workers add mini-l --ssh ci@mini-l.local --install \
-    --binary target/x86_64-unknown-linux-gnu/release/remote-task-runner
-remote-task-runner workers upgrade mini-l \
-    --binary target/x86_64-unknown-linux-gnu/release/remote-task-runner
+belt workers add mini-l --ssh ci@mini-l.local --install \
+    --binary target/x86_64-unknown-linux-gnu/release/belt
+belt workers upgrade mini-l \
+    --binary target/x86_64-unknown-linux-gnu/release/belt
 ```
 
 - Without `--binary`, a host of another platform is refused before anything is
@@ -65,8 +65,8 @@ administrator-controlled copy of the same CLI. For a Linux account named
 `build`, an example is
 
 ```sh
-sudo /usr/local/sbin/remote-task-runner register-system-worker \
-    --account build --config-dir /home/build/.config/remote-task-runner
+sudo /usr/local/sbin/belt register-system-worker \
+    --account build --config-dir /home/build/.config/belt
 ```
 
 Use the configuration directory reported by the SSH helper. The command prints
@@ -99,14 +99,14 @@ the parent never installs or upgrades it, and it opens no port: the parent
 connects over SSH through a tunnel you provide, with `ephemeral = true` on the
 worker's `[[workers]]` entry.
 
-Place the `remote-task-runner` binary and the cluster key on the notebook host
+Place the `belt` binary and the cluster key on the notebook host
 yourself (keep the key out of cell output and version control), then start the
 worker from a cell:
 
 ```
-!chmod 700 ./remote-task-runner
+!chmod 700 ./belt
 !chmod 600 ./cluster.key
-!nohup ./remote-task-runner worker --ephemeral \
+!nohup ./belt worker --ephemeral \
     --cluster <CLUSTER_ID> --name <WORKER_NAME> \
     --key-file "$PWD/cluster.key" > worker.log 2>&1 &
 ```
@@ -117,7 +117,7 @@ worker from a cell:
   reports changes with every start, so a restarted worker is never taken for
   the one before it.
 - It starts clean. It refuses to run if worker state already exists in
-  `~/.remote-task-runner`, or if a persistent worker is installed on the host.
+  `~/.belt`, or if a persistent worker is installed on the host.
 - Stop it with SIGTERM or by interrupting the cell. It removes its own state
   directory, unless work is still recorded in it (then the state is kept and
   the next start refuses until you deal with it).
@@ -127,20 +127,20 @@ worker from a cell:
 Register the worker with its tunnel's SSH destination and mark it ephemeral:
 
 ```
-remote-task-runner workers add colab-1 --ssh colab-1 --ephemeral
+belt workers add colab-1 --ssh colab-1 --ephemeral
 ```
 
 (or write `ephemeral = true` on its `[[workers]]` entry). The parent then
 dials it like any other worker. If the binary is not on the SSH login `PATH`
-of the notebook host, add `binary = "/absolute/path/remote-task-runner"` to
+of the notebook host, add `binary = "/absolute/path/belt"` to
 the entry.
 
 - The parent never installs, upgrades, starts, stops, drains or resumes an
   ephemeral worker; those commands are refused without contacting it.
   `doctor` checks whether it answers.
-- While the parent has a connection, `remote-task-runner workers diff colab-1`
+- While the parent has a connection, `belt workers diff colab-1`
   compares the active worker profile with the parent. Use
-  `remote-task-runner workers sync colab-1` to install eligible tool versions
+  `belt workers sync colab-1` to install eligible tool versions
   and measure the result. Both commands need the coordinator resident and the
   notebook worker to be running. A disconnected worker produces a measurement
   error.
@@ -149,13 +149,13 @@ the entry.
 - When the same worker is started again, it comes back with a new identity.
   The parent refuses the new identity until you forget the previous one.
   The previous identity can reconnect and report its attempts in the meantime.
-  Run `remote-task-runner workers` to see the registered SSH destination,
+  Run `belt workers` to see the registered SSH destination,
   connection state and recorded identity. If the resident cannot answer, the
   connection state is `unknown`. Add `--json` for the same fields as JSON.
 - When the previous worker is gone, say so:
 
   ```
-  remote-task-runner workers forget colab-1
+  belt workers forget colab-1
   ```
 
   Its identity is retired and the tasks it held end as `interrupted`

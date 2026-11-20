@@ -7,20 +7,20 @@
 use crate::common::{alive, read_pid};
 use crate::proto_common;
 
+use belt::error::{ApiError, ConflictReason, ErrorCode};
+use belt::ids::*;
+use belt::protocol::transport::duplex_pair;
+use belt::protocol::{connect, CallError, Client};
+use belt::secrets::envfile::secret_values;
+use belt::secrets::place::{FileIdentity, Placed};
+use belt::state::{AttemptState, Outcome, Receipt};
+use belt::storage::{AcceptedAttempt, BlobKind, NewBlobRef, WorkerStore};
+use belt::wire::*;
+use belt::worker::policy::{Step, STARTUP_ORDER};
+use belt::worker::serve::serve_connection;
+use belt::worker::{Agent, AgentConfig, Host, ProbePoint, Session};
+use belt::workspace::{Workspace, WorkspaceKind};
 use proto_common::client_cfg;
-use remote_task_runner::error::{ApiError, ConflictReason, ErrorCode};
-use remote_task_runner::ids::*;
-use remote_task_runner::protocol::transport::duplex_pair;
-use remote_task_runner::protocol::{connect, CallError, Client};
-use remote_task_runner::secrets::envfile::secret_values;
-use remote_task_runner::secrets::place::{FileIdentity, Placed};
-use remote_task_runner::state::{AttemptState, Outcome, Receipt};
-use remote_task_runner::storage::{AcceptedAttempt, BlobKind, NewBlobRef, WorkerStore};
-use remote_task_runner::wire::*;
-use remote_task_runner::worker::policy::{Step, STARTUP_ORDER};
-use remote_task_runner::worker::serve::serve_connection;
-use remote_task_runner::worker::{Agent, AgentConfig, Host, ProbePoint, Session};
-use remote_task_runner::workspace::{Workspace, WorkspaceKind};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -88,9 +88,9 @@ impl DirHost {
 impl Host for DirHost {
     fn preparation_observation_page(
         &self,
-        _request: &remote_task_runner::setup::observation_transport::ObservationPageRequest,
-    ) -> Option<remote_task_runner::setup::observation_transport::ObservationPage> {
-        use remote_task_runner::setup::observation_transport::*;
+        _request: &belt::setup::observation_transport::ObservationPageRequest,
+    ) -> Option<belt::setup::observation_transport::ObservationPage> {
+        use belt::setup::observation_transport::*;
         self.log("observation_page");
         Some(ObservationPage::Unavailable {
             reason: UnavailableReason::OwnerChanged,
@@ -145,8 +145,8 @@ impl Host for DirHost {
         a: &AcceptedAttempt,
         _: &AttemptPayload,
         _: &Workspace,
-    ) -> Result<remote_task_runner::setup::builder::SetupPoll, ApiError> {
-        use remote_task_runner::setup::builder::SetupPoll;
+    ) -> Result<belt::setup::builder::SetupPoll, ApiError> {
+        use belt::setup::builder::SetupPoll;
         self.log(format!("setup_poll {}", a.attempt_id));
         if self.setup_pending.load(Ordering::SeqCst) {
             return Ok(SetupPoll::Pending);
@@ -161,29 +161,26 @@ impl Host for DirHost {
     }
     fn toolchain_registry(
         &self,
-        profile: &remote_task_runner::toolchain::profile::Profile,
+        profile: &belt::toolchain::profile::Profile,
         base: Digest,
-    ) -> Result<Option<remote_task_runner::toolchain::registry::Registry>, ApiError> {
+    ) -> Result<Option<belt::toolchain::registry::Registry>, ApiError> {
         let state = self.base.join("state");
         if !state.join("toolchains.toml").exists() {
             return Ok(None);
         }
-        remote_task_runner::toolchain::registry::Registry::load(&state, profile, base)
+        belt::toolchain::registry::Registry::load(&state, profile, base)
             .map(Some)
             .map_err(|e| ApiError::new(ErrorCode::Internal, e))
     }
-    fn toolchain_retry(
-        &self,
-        request: &remote_task_runner::toolchain::preparation::PreparationRequest,
-    ) {
+    fn toolchain_retry(&self, request: &belt::toolchain::preparation::PreparationRequest) {
         self.log(format!("tool_retry {}", request.tool.as_str()));
     }
     fn toolchain_poll(
         &self,
         a: &AttemptId,
-        request: &remote_task_runner::toolchain::preparation::PreparationRequest,
-    ) -> Result<remote_task_runner::toolchain::preparation::ToolPreparationPoll, ApiError> {
-        use remote_task_runner::toolchain::preparation::{PreparationFailure, ToolPreparationPoll};
+        request: &belt::toolchain::preparation::PreparationRequest,
+    ) -> Result<belt::toolchain::preparation::ToolPreparationPoll, ApiError> {
+        use belt::toolchain::preparation::{PreparationFailure, ToolPreparationPoll};
         self.log(format!("tool_poll {a} {}", request.tool.as_str()));
         while self.tool_poll_hold.load(Ordering::SeqCst) {
             std::thread::sleep(Duration::from_millis(10));
@@ -281,7 +278,7 @@ pub(crate) fn fx_named(worker: &str) -> Fx {
     // Not under the system temp directory: a supervisor a failed test leaves
     // behind must not write into a directory a test runner clears.
     let dir = tempfile::Builder::new()
-        .prefix("rtr-agent-")
+        .prefix("belt-agent-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
     let host = Arc::new(DirHost {
@@ -342,7 +339,7 @@ impl Drop for Fx {
         }
         // Prepared templates are read-only by design, and the removal of the
         // directory stops at the first one it cannot empty.
-        remote_task_runner::platform::owned_temp::make_writable(self.dir.path());
+        belt::platform::owned_temp::make_writable(self.dir.path());
     }
 }
 
@@ -397,7 +394,7 @@ impl Fx {
             self.state(),
             self.worker.clone(),
             WorkerBootId::parse(boot).unwrap(),
-            PathBuf::from(env!("CARGO_BIN_EXE_remote-task-runner")),
+            PathBuf::from(env!("CARGO_BIN_EXE_belt")),
         );
         cfg.poll_ms = 25;
         cfg.inhibit_sleep = false;
@@ -439,7 +436,7 @@ impl Fx {
     /// [`Fx::connect`] with `ci_task_v1` offered by both sides explicitly
     /// (every build that delivers the frozen plan offers it anyway).
     async fn connect_ci(&self, agent: &Arc<Agent>) -> Client {
-        use remote_task_runner::worker::serve::serve_connection_offering;
+        use belt::worker::serve::serve_connection_offering;
         let (a, b) = duplex_pair(64 * 1024);
         let permits = Arc::new(Semaphore::new(64));
         let (agent, cluster) = (agent.clone(), self.cluster.clone());
@@ -1489,10 +1486,7 @@ async fn a_command_s_own_timeout_overrides_the_default_of_the_attempt() {
         assert_eq!(f.wait_terminal(&b), Outcome::TimedOut);
         assert!(started.elapsed() < Duration::from_secs(15));
         let t = f.rec(&b).termination.unwrap();
-        assert_eq!(
-            t.timeout().unwrap().kind,
-            remote_task_runner::state::TimeoutKind::Command
-        );
+        assert_eq!(t.timeout().unwrap().kind, belt::state::TimeoutKind::Command);
     }
 }
 
@@ -1676,7 +1670,7 @@ async fn status_events_logs_lease_and_inspect_answer_from_the_store() {
     assert_eq!(w.next_seq, seqs.len() as u64);
     assert_eq!(w.events[0].kind, EventKind::ReceiptReached);
     assert_eq!(w.events.last().unwrap().state, Some(AttemptState::Terminal));
-    let mut cursor = remote_task_runner::protocol::chunk::EventCursor::new(a.clone(), 0);
+    let mut cursor = belt::protocol::chunk::EventCursor::new(a.clone(), 0);
     assert_eq!(
         cursor.fresh(&w.events, w.next_seq).unwrap().len(),
         seqs.len()
@@ -2201,7 +2195,7 @@ async fn declared_artifacts_reach_the_supervisor_and_the_result_tells_required_f
     };
     // Everything chapter 13 lists, per artifact.
     let record = |name: &str, content: &[u8]| ArtifactRecord {
-        encoding: remote_task_runner::wire::ArtifactEncoding::Raw,
+        encoding: belt::wire::ArtifactEncoding::Raw,
         name: name.to_string(),
         path: name.to_string(),
         size: content.len() as u64,
@@ -2257,7 +2251,7 @@ async fn declared_artifacts_reach_the_supervisor_and_the_result_tells_required_f
     assert_eq!(stored["artifacts_not_stored"].as_array().unwrap().len(), 3);
     assert_eq!(
         result.result_digest,
-        remote_task_runner::wire::payload_hash(&stored).unwrap()
+        belt::wire::payload_hash(&stored).unwrap()
     );
 }
 
@@ -2449,26 +2443,26 @@ async fn a_renewal_before_the_start_seeds_the_supervisor_with_what_is_left_of_it
     let p = payload(&script);
     let a = AttemptId::generate();
     submit(&c, &a, &p).await;
-    let accepted = remote_task_runner::platform::monotonic_ms();
+    let accepted = belt::platform::monotonic_ms();
     wait_for("preparation to begin", || {
         f.host.count(&format!("prepare {a}")) == 1
     });
     // Distinct clock ticks make the wrong acceptance/start origin fail
     // without requiring any operation to finish within a small budget.
     wait_for("a tick after acceptance", || {
-        remote_task_runner::platform::monotonic_ms() > accepted
+        belt::platform::monotonic_ms() > accepted
     });
-    let before = remote_task_runner::platform::monotonic_ms();
+    let before = belt::platform::monotonic_ms();
     let Response::RenewLease(r) = call(&c, renew_req(&a, 1, p.lease_ms)).await.unwrap() else {
         panic!()
     };
-    let after = remote_task_runner::platform::monotonic_ms();
+    let after = belt::platform::monotonic_ms();
     assert!(r.extended);
     assert_eq!(f.store().lease(&a).unwrap().unwrap().0.lease_seq, 1);
     assert!(f.store().lease_renewed_at(&a).unwrap().is_some());
     assert_eq!(lines(&marker), 0, "preparation still owns the start gate");
     wait_for("a tick after renewal", || {
-        remote_task_runner::platform::monotonic_ms() > after
+        belt::platform::monotonic_ms() > after
     });
     f.host.block_prepare.store(false, Ordering::SeqCst);
     wait_for("the command to start", || lines(&marker) == 1);
@@ -2686,7 +2680,7 @@ async fn a_supervisor_that_cannot_be_started_is_tried_five_times_then_the_attemp
             result_digest: result.result_digest.clone(),
         })
     };
-    let held = remote_task_runner::supervisor::lock::SupervisorLock::try_acquire(&f.state(), &a)
+    let held = belt::supervisor::lock::SupervisorLock::try_acquire(&f.state(), &a)
         .unwrap()
         .expect("no supervisor lives");
     let e = call(&c, ack()).await.unwrap_err();
@@ -2700,7 +2694,7 @@ async fn a_supervisor_that_cannot_be_started_is_tried_five_times_then_the_attemp
     assert!(f.rec(&a).acked_at_ms.is_some());
     // And the lock is free again for whoever comes next.
     assert!(
-        remote_task_runner::supervisor::lock::SupervisorLock::try_acquire(&f.state(), &a)
+        belt::supervisor::lock::SupervisorLock::try_acquire(&f.state(), &a)
             .unwrap()
             .is_some()
     );
@@ -2867,7 +2861,7 @@ async fn a_secret_bundle_for_a_workspace_that_is_not_there_yet_is_sent_again() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot() {
-    let real = remote_task_runner::platform::boot_id().expect("this machine has a boot id");
+    let real = belt::platform::boot_id().expect("this machine has a boot id");
     let f = fx();
     let mut cfg = f.cfg(&real);
     let instance = WorkerBootId::parse("ephemeral-start").unwrap();
@@ -2908,10 +2902,7 @@ async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot(
         panic!()
     };
     assert_eq!(status.worker_boot_id, instance);
-    assert_eq!(
-        status.observation,
-        remote_task_runner::state::Observation::Unknown
-    );
+    assert_eq!(status.observation, belt::state::Observation::Unknown);
     let Response::RetireAttempt(r) = call(&c, retire_req(&a)).await.unwrap() else {
         panic!()
     };
@@ -2934,10 +2925,7 @@ async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot(
     let Response::GetAttempt(status) = call(&c, get()).await.unwrap() else {
         panic!()
     };
-    assert_eq!(
-        status.observation,
-        remote_task_runner::state::Observation::Known
-    );
+    assert_eq!(status.observation, belt::state::Observation::Known);
     assert_eq!(lines(&marker), 1);
 }
 
@@ -3086,7 +3074,7 @@ fn startup_runs_every_sweep_in_order_before_any_attempt_is_prepared() {
         .unwrap();
         store
             .submit(
-                remote_task_runner::storage::NewAcceptance {
+                belt::storage::NewAcceptance {
                     attempt_id: a.clone(),
                     run_id: p.run_id.clone(),
                     task_id: p.task_id.clone(),
@@ -3095,7 +3083,7 @@ fn startup_runs_every_sweep_in_order_before_any_attempt_is_prepared() {
                     coordinator_epoch: CoordinatorEpoch(1),
                     spec: serde_json::to_value(&p).unwrap(),
                 },
-                remote_task_runner::platform::wall_ms(),
+                belt::platform::wall_ms(),
             )
             .unwrap();
     }
@@ -3151,7 +3139,7 @@ fn a_failing_startup_step_refuses_the_start_and_runs_nothing_after_it() {
 
 /// The real host, except for the process-wide core dump limit (this test
 /// shares its process with the others).
-struct RealButCore(remote_task_runner::worker::machine::Machine);
+struct RealButCore(belt::worker::machine::Machine);
 
 impl Host for RealButCore {
     fn disable_core_dumps(&self) -> Result<(), ApiError> {
@@ -3177,7 +3165,7 @@ impl Host for RealButCore {
         a: &AcceptedAttempt,
         p: &AttemptPayload,
         w: &Workspace,
-    ) -> Result<remote_task_runner::setup::builder::SetupPoll, ApiError> {
+    ) -> Result<belt::setup::builder::SetupPoll, ApiError> {
         self.0.setup_poll(a, p, w)
     }
     fn setup_release(&self, a: &AttemptId) {
@@ -3207,7 +3195,7 @@ impl Host for RealButCore {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_it() {
-    use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    use belt::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
     let f = fx();
     let state = f.state();
     let env: BTreeMap<String, String> = [
@@ -3242,8 +3230,7 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
     std::fs::create_dir_all(&orphan).unwrap();
 
     let machine =
-        remote_task_runner::worker::machine::Machine::open(&state, env, state.join("cluster.key"))
-            .unwrap();
+        belt::worker::machine::Machine::open(&state, env, state.join("cluster.key")).unwrap();
     let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
     f.agents.lock().unwrap().push(agent.clone());
     assert!(!orphan.exists());
@@ -3286,15 +3273,15 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
 
     // A run whose source has a secret file: the worker knows its path from
     // the manifest in its store, and refuses to keep it as an artifact.
+    use belt::secrets::capture::{capture_run, SecretInputs};
     use local_ci::source::SecretSpec;
-    use remote_task_runner::secrets::capture::{capture_run, SecretInputs};
     std::fs::write(plain.join("sub/.env"), "TOKEN=0123456789abcdef\n").unwrap();
     let run = RunId::generate();
-    let key = remote_task_runner::secrets::key::ClusterKey::from_bytes(vec![5; 32]).unwrap();
+    let key = belt::secrets::key::ClusterKey::from_bytes(vec![5; 32]).unwrap();
     let with_secret = capture_run(
         &BTreeMap::new(),
         &store,
-        &remote_task_runner::secrets::vault::Vault::open(&state).unwrap(),
+        &belt::secrets::vault::Vault::open(&state).unwrap(),
         &SecretInputs {
             key: &key,
             declared: &[SecretSpec {
@@ -3407,15 +3394,15 @@ fn digest_of(manifest_digest: &str) -> Digest {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_any_name() {
-    use remote_task_runner::secrets::capture::{capture_run, SecretInputs};
-    use remote_task_runner::secrets::send::batch_requests;
-    use remote_task_runner::secrets::vault::Vault;
-    use remote_task_runner::source::{CaptureParams, SourceRequest, SourceStore};
+    use belt::secrets::capture::{capture_run, SecretInputs};
+    use belt::secrets::send::batch_requests;
+    use belt::secrets::vault::Vault;
+    use belt::source::{CaptureParams, SourceRequest, SourceStore};
     const SECRET: &str = "s3cr3t-Value-0123456789";
     let f = fx();
     let state = f.state();
     let env = real_env(&f);
-    let key = remote_task_runner::secrets::key::init(&state.join("cluster.key")).unwrap();
+    let key = belt::secrets::key::init(&state.join("cluster.key")).unwrap();
     let store = SourceStore::open(&state).unwrap();
     let vault = Vault::open(&state).unwrap();
 
@@ -3465,12 +3452,9 @@ async fn the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_an
         .collect();
     assert_eq!(secret_files, ["local.env"]);
 
-    let machine = remote_task_runner::worker::machine::Machine::open(
-        &state,
-        env.clone(),
-        state.join("cluster.key"),
-    )
-    .unwrap();
+    let machine =
+        belt::worker::machine::Machine::open(&state, env.clone(), state.join("cluster.key"))
+            .unwrap();
     let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
     f.agents.lock().unwrap().push(agent.clone());
     let c = f.connect(&agent).await;
@@ -3601,7 +3585,7 @@ async fn the_commands_of_a_prepared_setup_are_left_out_and_the_others_run() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_submit_with_a_setup_that_is_not_valid_is_refused_before_it_is_stored() {
-    use remote_task_runner::wire::{ReuseScope, SetupSpec, SetupStep};
+    use belt::wire::{ReuseScope, SetupSpec, SetupStep};
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
@@ -3772,8 +3756,8 @@ async fn an_attempt_that_waited_too_long_for_its_setup_runs_every_command_itself
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_real_host_prepares_a_setup_once_and_two_attempts_use_it() {
-    use remote_task_runner::setup::builder::SetupConfig;
-    use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    use belt::setup::builder::SetupConfig;
+    use belt::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
     let f = fx();
     let state = f.state();
     let env: BTreeMap<String, String> = [
@@ -3799,16 +3783,13 @@ async fn the_real_host_prepares_a_setup_once_and_two_attempts_use_it() {
         &CaptureParams::default(),
     )
     .unwrap();
-    let machine = remote_task_runner::worker::machine::Machine::open(
-        &state,
-        env.clone(),
-        state.join("cluster.key"),
-    )
-    .unwrap();
+    let machine =
+        belt::worker::machine::Machine::open(&state, env.clone(), state.join("cluster.key"))
+            .unwrap();
     let mut setup = SetupConfig::new(
         state.clone(),
         WorkerId::parse("w-test").unwrap(),
-        PathBuf::from(env!("CARGO_BIN_EXE_remote-task-runner")),
+        PathBuf::from(env!("CARGO_BIN_EXE_belt")),
     );
     setup.poll_ms = 25;
     setup.lease_ms = 3_000;
@@ -3992,7 +3973,7 @@ async fn in_place_is_refused_by_default_worker_admission_before_acceptance() {
 
 #[tokio::test]
 async fn capabilities_reject_bypassed_placement_before_acceptance_or_workspace() {
-    use remote_task_runner::toolchain::capability::ExecutionRequirements;
+    use belt::toolchain::capability::ExecutionRequirements;
     let f = fx();
     let agent = f.start("boot-1");
     let client = f.connect(&agent).await;
@@ -4002,7 +3983,7 @@ async fn capabilities_reject_bypassed_placement_before_acceptance_or_workspace()
     let error = call(&client, submit_req(&a, &p)).await.unwrap_err();
     assert_eq!(
         error.blocked_reason,
-        Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+        Some(belt::error::BlockedReason::EnvironmentMismatch)
     );
     assert!(f.store().get(&a).unwrap().is_none());
     assert_eq!(f.host.count("prepare"), 0);
@@ -4010,7 +3991,7 @@ async fn capabilities_reject_bypassed_placement_before_acceptance_or_workspace()
 
 #[tokio::test]
 async fn capabilities_detect_tool_drift_but_keep_accepted_replays_idempotent() {
-    use remote_task_runner::toolchain::{capability::ExecutionRequirements, profile::Profile};
+    use belt::toolchain::{capability::ExecutionRequirements, profile::Profile};
     let f = fx();
     let bin = f.path("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -4048,14 +4029,14 @@ async fn capabilities_detect_tool_drift_but_keep_accepted_replays_idempotent() {
     let error = call(&client, submit_req(&b, &p)).await.unwrap_err();
     assert_eq!(
         error.blocked_reason,
-        Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+        Some(belt::error::BlockedReason::EnvironmentMismatch)
     );
     assert!(f.store().get(&b).unwrap().is_none());
 }
 
 #[tokio::test]
 async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed() {
-    use remote_task_runner::toolchain::{capability::ExecutionRequirements, profile::Profile};
+    use belt::toolchain::{capability::ExecutionRequirements, profile::Profile};
     for required_profile_tool in [false, true] {
         let f = fx();
         let bin = f.path("bin");
@@ -4093,7 +4074,7 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
             let error = call(&client, submit_req(&a, &p)).await.unwrap_err();
             assert_eq!(
                 error.blocked_reason,
-                Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+                Some(belt::error::BlockedReason::EnvironmentMismatch)
             );
             assert!(f.store().get(&a).unwrap().is_none());
         } else {
@@ -4104,7 +4085,7 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
             let error = call(&client, submit_req(&b, &p)).await.unwrap_err();
             assert_eq!(
                 error.blocked_reason,
-                Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+                Some(belt::error::BlockedReason::EnvironmentMismatch)
             );
             assert!(f.store().get(&b).unwrap().is_none());
         }
@@ -4113,7 +4094,7 @@ async fn capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed
 
 #[tokio::test]
 async fn capability_negotiation_is_required_even_if_worker_has_the_profile() {
-    use remote_task_runner::toolchain::{
+    use belt::toolchain::{
         capability::{ExecutionRequirements, FEATURE},
         profile::Profile,
     };
@@ -4167,7 +4148,7 @@ async fn capability_negotiation_is_required_even_if_worker_has_the_profile() {
 
 #[tokio::test]
 async fn frozen_toolchain_submit_and_readonly_proposal_require_negotiated_feature() {
-    use remote_task_runner::toolchain::{
+    use belt::toolchain::{
         contract::{FrozenBundle, FEATURE},
         versions::*,
     };
@@ -4232,7 +4213,7 @@ async fn frozen_toolchain_submit_and_readonly_proposal_require_negotiated_featur
 
 #[tokio::test]
 async fn preparation_observations_are_optional_negotiated_and_never_break_inspect() {
-    use remote_task_runner::setup::observation_transport::*;
+    use belt::setup::observation_transport::*;
     let f = fx();
     let agent = f.start("boot-1");
     for negotiated in [false, true] {
@@ -4292,7 +4273,7 @@ async fn preparation_observations_are_optional_negotiated_and_never_break_inspec
 
 #[tokio::test]
 async fn preparation_probe_is_negotiated_readonly_and_profile_bound() {
-    use remote_task_runner::setup::preparation_probe::{PreparationProbe, ProbeUnknown};
+    use belt::setup::preparation_probe::{PreparationProbe, ProbeUnknown};
     let f = fx();
     let cfg = f.cfg("boot-probe");
     let fingerprint = cfg.profile_fingerprint.clone();
@@ -4399,7 +4380,7 @@ async fn inspect_draining(c: &Client) -> bool {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_operator_drain_is_reported_and_a_cancel_request_stops_the_live_attempt() {
-    use remote_task_runner::worker::control::{self, Control};
+    use belt::worker::control::{self, Control};
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
@@ -4440,7 +4421,7 @@ async fn an_operator_drain_is_reported_and_a_cancel_request_stops_the_live_attem
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_draining_worker_refuses_a_new_attempt_but_answers_a_resend() {
-    use remote_task_runner::worker::control::{self, Control};
+    use belt::worker::control::{self, Control};
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
@@ -4471,7 +4452,7 @@ async fn a_draining_worker_refuses_a_new_attempt_but_answers_a_resend() {
 fn ci_payload() -> AttemptPayload {
     let mut p = payload("true");
     p.commands.clear();
-    p.ci_task = Some(remote_task_runner::wire::CiTask {
+    p.ci_task = Some(belt::wire::CiTask {
         verify_shard_version: false,
         artifact_workflow: None,
         dispatch: None,
@@ -4520,14 +4501,14 @@ async fn a_ci_task_that_cannot_be_run_yet_is_refused_before_it_is_stored() {
         // the name the result of the task is kept under
         refused(|p| {
             p.artifacts = vec![decl(
-                "rtr-ci-task-result.json",
+                "belt-ci-task-result.json",
                 "out.txt",
                 MissingPolicy::Optional,
             )]
         }),
         refused(|p| {
             p.artifacts = vec![decl(
-                "rtr-ci-task-result.json/part",
+                "belt-ci-task-result.json/part",
                 "out.txt",
                 MissingPolicy::Optional,
             )]
@@ -4560,7 +4541,7 @@ async fn a_ci_task_that_was_not_negotiated_is_refused_and_this_build_offers_it()
     assert_eq!(e.code, ErrorCode::ProtocolIncompatible, "{}", e.message);
     assert!(e.message.contains("not negotiated"), "{}", e.message);
     assert!(f.store().get(&a).unwrap().is_none());
-    assert!(remote_task_runner::protocol::hello::SUPPORTED_FEATURES.contains(&CI_TASK_FEATURE));
+    assert!(belt::protocol::hello::SUPPORTED_FEATURES.contains(&CI_TASK_FEATURE));
     // An attempt of commands is taken on the same connection.
     submit(&c, &a, &payload("exit 0")).await;
     assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
@@ -4572,8 +4553,8 @@ async fn a_ci_task_that_was_not_negotiated_is_refused_and_this_build_offers_it()
 /// the digest are not kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_frozen_plan_is_delivered_as_a_blob_and_the_task_runs_from_it() {
-    use remote_task_runner::protocol::transfer::put_blob_reader_as;
-    use remote_task_runner::worker::ci_task::{plan_path, plans_dir};
+    use belt::protocol::transfer::put_blob_reader_as;
+    use belt::worker::ci_task::{plan_path, plans_dir};
     let ci = ci_fx(CI_WORKFLOW);
     let state = ci.f.state();
     let task = ci.base.ci_task.clone().unwrap();
@@ -4650,7 +4631,7 @@ impl CiFx {
             .join("attempts")
             .join(a.as_str())
             .join("artifacts")
-            .join(remote_task_runner::supervisor::ci_task::RESULT_ARTIFACT);
+            .join(belt::supervisor::ci_task::RESULT_ARTIFACT);
         let text = std::fs::read_to_string(kept).ok()?;
         Some(local_ci::WireTaskResult::from_json(&text).unwrap())
     }
@@ -4664,8 +4645,8 @@ impl CiFx {
 }
 
 fn ci_fx(workflow: &str) -> CiFx {
+    use belt::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
     use local_ci::frozen::Filters;
-    use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
     let f = fx();
     let state = f.state();
     std::fs::create_dir_all(f.path("home")).unwrap();
@@ -4709,17 +4690,16 @@ fn ci_fx(workflow: &str) -> CiFx {
         base_branch: None,
         changed_files: None,
     };
-    let plan = remote_task_runner::ci::execute::freeze_plan(&store, &manifest, &options).unwrap();
+    let plan = belt::ci::execute::freeze_plan(&store, &manifest, &options).unwrap();
     // Where the delivery of the plan (the next step of S16) will put it.
     let bytes = serde_json::to_vec(&plan).unwrap();
-    let plan_digest = remote_task_runner::worker::ci_task::store_plan(&state, &bytes).unwrap();
+    let plan_digest = belt::worker::ci_task::store_plan(&state, &bytes).unwrap();
 
     let machine =
-        remote_task_runner::worker::machine::Machine::open(&state, env, state.join("cluster.key"))
-            .unwrap();
+        belt::worker::machine::Machine::open(&state, env, state.join("cluster.key")).unwrap();
     // A measured environment of the fixture's own: the core and the steps
     // get its HOME, never the HOME of whoever runs the tests.
-    let profile = remote_task_runner::toolchain::profile::Profile::load(
+    let profile = belt::toolchain::profile::Profile::load(
         &state,
         &[
             ("PATH".into(), "/usr/bin:/bin".into()),
@@ -4879,7 +4859,7 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_gc_of_the_agent_removes_the_plans_no_unfinished_attempt_names() {
-    use remote_task_runner::worker::ci_task::{plan_path, store_plan};
+    use belt::worker::ci_task::{plan_path, store_plan};
     let f = fx();
     let state = f.state();
     let mut cfg = f.cfg("boot-a");
@@ -4899,7 +4879,7 @@ async fn the_gc_of_the_agent_removes_the_plans_no_unfinished_attempt_names() {
 /// A fixture whose worker has a registry: node 20.0.0 and 22.0.0 may be
 /// installed. The managers are never run here (the host's poll is scripted).
 fn warm_fx(configure: impl FnOnce(&mut AgentConfig)) -> (Fx, Arc<Agent>) {
-    use remote_task_runner::toolchain::profile::Profile;
+    use belt::toolchain::profile::Profile;
     let f = fx();
     let state = f.state();
     let private = |path: &Path, mode| {
@@ -5394,7 +5374,7 @@ fn a_slow_look_is_answered_pending_and_asking_meanwhile_starts_no_second_look() 
 /// ledger and what the command's own task-traffic-controller would resolve.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attempt_stored_for_another_scope_starts_in_the_scope_of_the_worker() {
-    use remote_task_runner::toolchain::profile::Profile;
+    use belt::toolchain::profile::Profile;
     let f = fx();
     let home = f.path("home");
     std::fs::create_dir(&home).unwrap();
@@ -5406,7 +5386,7 @@ async fn an_attempt_stored_for_another_scope_starts_in_the_scope_of_the_worker()
     ]
     .into();
     crate::common::fixture_worker_traffic_config(&env);
-    let scope = remote_task_runner::config::traffic::resolve(&env).unwrap();
+    let scope = belt::config::traffic::resolve(&env).unwrap();
     let profile = Profile::load(&f.state(), &env).unwrap();
     let mut cfg = f.cfg("boot-1");
     cfg.profile = profile.name().into();
@@ -5536,7 +5516,7 @@ fn ending_a_warm_up_during_a_look_lets_go_when_the_look_comes_back() {
 /// that needs no tool adds none.
 #[test]
 fn a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for() {
-    use remote_task_runner::toolchain::{contract::FrozenBundle, versions::*};
+    use belt::toolchain::{contract::FrozenBundle, versions::*};
     let (f, agent) = warm_fx(|_| {});
     *f.host.tool_poll.lock().unwrap() = Some(None);
     let session = Session {

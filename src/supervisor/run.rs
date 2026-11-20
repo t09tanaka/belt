@@ -1265,7 +1265,7 @@ impl Control<'_> {
                         key_argv: opts
                             .key
                             .as_deref()
-                            .filter(|key| key.starts_with("rtr-ci-step:"))
+                            .filter(|key| key.starts_with("belt-ci-step:"))
                             .unwrap_or_default()
                             .to_owned(),
                         started_at: ran.started_at,
@@ -1560,7 +1560,7 @@ pub(crate) fn run_using(spec: &SuperviseSpec, core: super::ci_task::Core<'_>) ->
     }
 
     let (_guard, sleep_inhibit) = if spec.inhibit_sleep {
-        match platform::inhibit::acquire("remote-task-runner", "running a command") {
+        match platform::inhibit::acquire("belt", "running a command") {
             Inhibit::Held(g) => {
                 let how = format!("held via {}", g.via());
                 (Some(g), how)
@@ -1801,7 +1801,7 @@ pub(crate) fn profile_history_key(
     let command = task_traffic_controller::exec::command_key(ctx, cwd, None, argv)
         .map_err(SupervisorError::traffic)?;
     Ok(Some(format!(
-        "rtr-profile:{profile}:command:{}",
+        "belt-profile:{profile}:command:{}",
         command.hash
     )))
 }

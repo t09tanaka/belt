@@ -1,16 +1,12 @@
-use remote_task_runner::config::legacy::{self, MAPPING, UNMAPPED};
-use remote_task_runner::config::load::load;
-use remote_task_runner::config::model::{
+use belt::config::legacy::{self, MAPPING, UNMAPPED};
+use belt::config::load::load;
+use belt::config::model::{
     OutputWhen, SecretSpec, ServiceMode, SourceMode, Strategy, ToolchainMatch, Unsupported,
 };
-use remote_task_runner::config::parse::{parse_project, parse_user};
-use remote_task_runner::config::paths::{
-    legacy_config_path, project_config_path, user_config_path,
-};
-use remote_task_runner::config::resolve::{
-    resolve, Inputs, Loaded, Origin, Overlay, ResolvedConfig, Value,
-};
-use remote_task_runner::config::ConfigError;
+use belt::config::parse::{parse_project, parse_user};
+use belt::config::paths::{legacy_config_path, project_config_path, user_config_path};
+use belt::config::resolve::{resolve, Inputs, Loaded, Origin, Overlay, ResolvedConfig, Value};
+use belt::config::ConfigError;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -55,7 +51,7 @@ schema_version = 1
 [source]
 mode = "worktree"
 include = []
-exclude = ["remote-task-runner-results/**"]
+exclude = ["belt-results/**"]
 secret_files = [".env.test", "packages/*/.env.test"]
 
 [execution]
@@ -79,17 +75,17 @@ required = false
 when = "always"
 "#;
 
-fn user(text: &str) -> Loaded<remote_task_runner::config::model::UserConfig> {
+fn user(text: &str) -> Loaded<belt::config::model::UserConfig> {
     Loaded {
         path: "/u/config.toml".into(),
         value: parse_user("/u/config.toml", text).unwrap(),
     }
 }
 
-fn project(text: &str) -> Loaded<remote_task_runner::config::model::ProjectConfig> {
+fn project(text: &str) -> Loaded<belt::config::model::ProjectConfig> {
     Loaded {
-        path: "/r/.remote-task-runner.toml".into(),
-        value: parse_project("/r/.remote-task-runner.toml", text).unwrap(),
+        path: "/r/.belt.toml".into(),
+        value: parse_project("/r/.belt.toml", text).unwrap(),
     }
 }
 
@@ -154,7 +150,7 @@ fn spec_examples_resolve() {
     assert_eq!(r.workers[1].ssh, "ci@mini-b.local");
     assert_eq!(r.strategy.value, Strategy::EarliestFinish);
     assert_eq!(r.source_mode.value, SourceMode::Worktree);
-    assert_eq!(r.exclude.value, s(&["remote-task-runner-results/**"]));
+    assert_eq!(r.exclude.value, s(&["belt-results/**"]));
     assert_eq!(
         r.secret_files.value,
         vec![
@@ -187,7 +183,7 @@ fn spec_examples_resolve() {
     );
     assert_eq!(
         r.timeout_seconds.origin,
-        Origin::Project("/r/.remote-task-runner.toml".into())
+        Origin::Project("/r/.belt.toml".into())
     );
 }
 
@@ -310,10 +306,7 @@ fn entries_list_every_value_with_its_origin() {
     assert_eq!(get("coordinator.stale_seconds").origin, Origin::Default);
     assert_eq!(get("scheduler.strategy").value, "earliest_finish");
     assert_eq!(get("source.mode").value, "worktree");
-    assert_eq!(
-        get("source.exclude").value,
-        "[remote-task-runner-results/**]"
-    );
+    assert_eq!(get("source.exclude").value, "[belt-results/**]");
     assert_eq!(
         get("source.secret_files").value,
         "[.env.test, packages/*/.env.test]"
@@ -754,8 +747,8 @@ fn legacy_mapping_table_covers_the_shared_keys() {
             "no-cache"
         ]
     );
-    assert_eq!(MAPPING[4].rtr, "[ci] no_cache");
-    assert_eq!(MAPPING[0].rtr, "[ci] workflows_dirs");
+    assert_eq!(MAPPING[4].belt, "[ci] no_cache");
+    assert_eq!(MAPPING[0].belt, "[ci] workflows_dirs");
     assert_eq!(UNMAPPED, ["link-node-modules", "[setup] ignore-env"]);
 }
 
@@ -830,7 +823,7 @@ secret_files = [".env"]
     ));
     assert_eq!(p.len(), 4, "{p:?}");
     let has = |needle: &str| p.iter().any(|m| m.contains(needle));
-    assert!(has("/r/.remote-task-runner.toml [ci] workflows_dirs = [\"other\"] conflicts with /r/.local-ci.toml workflows-dirs = [\"ci/workflows\"]"), "{p:?}");
+    assert!(has("/r/.belt.toml [ci] workflows_dirs = [\"other\"] conflicts with /r/.local-ci.toml workflows-dirs = [\"ci/workflows\"]"), "{p:?}");
     assert!(has("[source] include = [\"a\"] conflicts with /r/.local-ci.toml [source] include = [\"gen/**\"]"));
     assert!(has("[source] exclude = [\"b\"]"));
     assert!(has("[source] secret_files = [\".env\"] conflicts with /r/.local-ci.toml [source] secret_files = [\".env\", \"x/.env (required)\"]"));
@@ -872,13 +865,13 @@ fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 #[test]
 fn user_config_path_follows_xdg() {
     let p = user_config_path(&env(&[("XDG_CONFIG_HOME", "/x/cfg"), ("HOME", "/h")])).unwrap();
-    assert_eq!(p, Path::new("/x/cfg/remote-task-runner/config.toml"));
+    assert_eq!(p, Path::new("/x/cfg/belt/config.toml"));
     let p = user_config_path(&env(&[("HOME", "/h")])).unwrap();
-    assert_eq!(p, Path::new("/h/.config/remote-task-runner/config.toml"));
+    assert_eq!(p, Path::new("/h/.config/belt/config.toml"));
     // relative or empty XDG_CONFIG_HOME is ignored
     for bad in ["", "rel/dir"] {
         let p = user_config_path(&env(&[("XDG_CONFIG_HOME", bad), ("HOME", "/h")])).unwrap();
-        assert_eq!(p, Path::new("/h/.config/remote-task-runner/config.toml"));
+        assert_eq!(p, Path::new("/h/.config/belt/config.toml"));
     }
     assert_eq!(
         user_config_path(&env(&[])).unwrap_err(),
@@ -893,10 +886,7 @@ fn user_config_path_follows_xdg() {
 #[test]
 fn project_and_legacy_paths_sit_at_the_repo_root() {
     let root = Path::new("/repo");
-    assert_eq!(
-        project_config_path(root),
-        Path::new("/repo/.remote-task-runner.toml")
-    );
+    assert_eq!(project_config_path(root), Path::new("/repo/.belt.toml"));
     assert_eq!(legacy_config_path(root), Path::new("/repo/.local-ci.toml"));
 }
 
@@ -907,13 +897,9 @@ fn load_reads_the_three_files() {
     let home = crate::test_tmp::tempdir().unwrap();
     let repo = crate::test_tmp::tempdir().unwrap();
     let xdg = home.path().join("xdg");
-    std::fs::create_dir_all(xdg.join("remote-task-runner")).unwrap();
-    std::fs::write(xdg.join("remote-task-runner/config.toml"), USER_EXAMPLE).unwrap();
-    std::fs::write(
-        repo.path().join(".remote-task-runner.toml"),
-        PROJECT_EXAMPLE,
-    )
-    .unwrap();
+    std::fs::create_dir_all(xdg.join("belt")).unwrap();
+    std::fs::write(xdg.join("belt/config.toml"), USER_EXAMPLE).unwrap();
+    std::fs::write(repo.path().join(".belt.toml"), PROJECT_EXAMPLE).unwrap();
     std::fs::write(
         repo.path().join(".local-ci.toml"),
         "no-cache = [\"ci.yml\"]\n",
@@ -924,7 +910,7 @@ fn load_reads_the_three_files() {
     assert_eq!(r.workers.len(), 3);
     assert_eq!(r.profile.value.as_deref(), Some("web-dev"));
     assert!(
-        matches!(&r.heartbeat_seconds.origin, Origin::User(p) if p.ends_with("remote-task-runner/config.toml"))
+        matches!(&r.heartbeat_seconds.origin, Origin::User(p) if p.ends_with("belt/config.toml"))
     );
 
     // outside a repo only the user file is read; missing files are fine
@@ -946,20 +932,14 @@ fn load_reports_parse_io_and_missing_home_errors() {
         ConfigError::NoConfigHome
     );
     std::fs::write(
-        repo.path().join(".remote-task-runner.toml"),
+        repo.path().join(".belt.toml"),
         "schema_version = 1\nzzz = 1\n",
     )
     .unwrap();
     let err = load(&e, Some(repo.path()), &Overlay::default()).unwrap_err();
-    assert!(
-        err.to_string().contains("zzz") && err.to_string().contains(".remote-task-runner.toml")
-    );
+    assert!(err.to_string().contains("zzz") && err.to_string().contains(".belt.toml"));
 
-    std::fs::write(
-        repo.path().join(".remote-task-runner.toml"),
-        "schema_version = 1\n",
-    )
-    .unwrap();
+    std::fs::write(repo.path().join(".belt.toml"), "schema_version = 1\n").unwrap();
     std::fs::write(repo.path().join(".local-ci.toml"), "bogus = 1\n").unwrap();
     let err = load(&e, Some(repo.path()), &Overlay::default()).unwrap_err();
     assert!(err.to_string().contains(".local-ci.toml"));
@@ -971,7 +951,7 @@ fn load_reports_parse_io_and_missing_home_errors() {
     assert!(matches!(err, ConfigError::Io { .. }), "{err}");
 
     // a bad user file
-    let cfg = home.path().join(".config/remote-task-runner");
+    let cfg = home.path().join(".config/belt");
     std::fs::create_dir_all(&cfg).unwrap();
     std::fs::write(cfg.join("config.toml"), "schema_version = 1\nnope = 1\n").unwrap();
     let err = load(&e, None, &Overlay::default()).unwrap_err();
@@ -1017,7 +997,7 @@ fn no_cache_in_the_project_file_and_its_origin() {
         r.no_cache,
         v(
             s(&["ci.yml", "e2e.yml:browser"]),
-            Origin::Project("/r/.remote-task-runner.toml".into())
+            Origin::Project("/r/.belt.toml".into())
         )
     );
     let e = r.entries();

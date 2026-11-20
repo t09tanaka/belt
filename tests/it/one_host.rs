@@ -21,17 +21,17 @@
 use crate::common::{alive, identity_of, kill_recorded_group, read_pid};
 use crate::coordinator::{attempts, only, queued, source, spec, Lost};
 use crate::worker_agent;
-use remote_task_runner::coordinator::{
+use belt::coordinator::{
     ClientLink, Coordinator, CoordinatorConfig, LinkError, TaskSpec, WorkerLink,
 };
-use remote_task_runner::ids::*;
-use remote_task_runner::protocol::transport::duplex_pair;
-use remote_task_runner::protocol::{connect, ClientConfig};
-use remote_task_runner::state::{AttemptState, Outcome, Receipt, Receipts};
-use remote_task_runner::storage::{AttemptRecord, CoordinatorStore, StorageError};
-use remote_task_runner::wire::*;
-use remote_task_runner::worker::serve::serve_connection;
-use remote_task_runner::worker::Agent;
+use belt::ids::*;
+use belt::protocol::transport::duplex_pair;
+use belt::protocol::{connect, ClientConfig};
+use belt::state::{AttemptState, Outcome, Receipt, Receipts};
+use belt::storage::{AttemptRecord, CoordinatorStore, StorageError};
+use belt::wire::*;
+use belt::worker::serve::serve_connection;
+use belt::worker::Agent;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -819,7 +819,7 @@ async fn a26_workers_whose_wall_clocks_are_off_keep_their_leases_and_end_normall
     let c = h.parent().await;
     h.worker("w-a").faults.skew_wall(-DAY);
     h.worker("w-b").faults.skew_wall(365 * DAY);
-    let before = remote_task_runner::platform::wall_ms();
+    let before = belt::platform::wall_ms();
     let probes = h.enqueue(&c, 2, "sleep 6").await;
     h.settle(&c, &probes).await;
     let picture = h.picture(&c, &probes);

@@ -42,7 +42,7 @@ const ENV: &[&str] = &[
     // worker takes the values of the user's shell at install or init.
     "XDG_STATE_HOME",
 ];
-const BINARY: &str = "remote-task-runner";
+const BINARY: &str = "belt";
 /// How long `install` and `start` wait for the agent socket to accept.
 pub const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -190,7 +190,7 @@ impl Paths {
             key: config.join("worker-cluster.key"),
             input: config.join("worker.json"),
             journal: config.join("worker-service.json"),
-            state: home.join(".remote-task-runner"),
+            state: home.join(".belt"),
             services,
             config,
             home,
@@ -561,7 +561,7 @@ fn service_plan(
     environment: Environment,
 ) -> anyhow::Result<policy::Plan> {
     let label = format!(
-        "io.github.t09tanaka.rtr.worker.{}.{}",
+        "io.github.t09tanaka.belt.worker.{}.{}",
         match &mode {
             policy::Mode::User { uid } | policy::Mode::SystemUser { uid, .. } => uid,
         },

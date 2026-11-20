@@ -31,7 +31,7 @@ struct Cursors {
 impl Cursors {
     fn new() -> Result<Self, ApiError> {
         let directory = tempfile::Builder::new()
-            .prefix("rtr-log-reader-")
+            .prefix("belt-log-reader-")
             .tempdir()
             .map_err(internal)?;
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))
@@ -1191,10 +1191,10 @@ mod tests {
     fn parser_keeps_existing_logs_grammar_and_attempt_validation_precedes_state() {
         use clap::Parser;
         assert!(
-            crate::cli::Cli::try_parse_from(["rtr", "logs", "task_invalid", "--follow"]).is_ok()
+            crate::cli::Cli::try_parse_from(["belt", "logs", "task_invalid", "--follow"]).is_ok()
         );
         assert!(crate::cli::Cli::try_parse_from([
-            "rtr",
+            "belt",
             "logs",
             "task_invalid",
             "--attempt",
@@ -1202,7 +1202,7 @@ mod tests {
         ])
         .is_ok());
         assert!(crate::cli::Cli::try_parse_from([
-            "rtr",
+            "belt",
             "logs",
             "task_invalid",
             "--stream",

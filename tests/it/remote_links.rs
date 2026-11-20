@@ -1,21 +1,21 @@
 //! Real private worker roles, through a fixture-owned fake ssh executable.
 //! No host SSH server, service manager, or user configuration is touched.
-use remote_task_runner::coordinator::TaskSpec;
-use remote_task_runner::ids::*;
-use remote_task_runner::platform::wall_ms;
-use remote_task_runner::service::bootstrap::Spec;
-use remote_task_runner::service::resident::{Client, Operation, Reply};
-use remote_task_runner::service::worker::WorkerSpec;
-use remote_task_runner::state::{Observation, Outcome};
-use remote_task_runner::storage::CoordinatorStore;
-use remote_task_runner::wire::CommandSpec;
+use belt::coordinator::TaskSpec;
+use belt::ids::*;
+use belt::platform::wall_ms;
+use belt::service::bootstrap::Spec;
+use belt::service::resident::{Client, Operation, Reply};
+use belt::service::worker::WorkerSpec;
+use belt::state::{Observation, Outcome};
+use belt::storage::CoordinatorStore;
+use belt::wire::CommandSpec;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
-const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
+const BIN: &str = env!("CARGO_BIN_EXE_belt");
 const T: Duration = Duration::from_secs(40);
 
 struct Owned {
@@ -43,7 +43,7 @@ impl Owned {
     }
     async fn stop(self) {
         if super::common::identity_of(self.pid).as_deref() == Some(&self.start) {
-            remote_task_runner::platform::signal_pid(self.pid, libc::SIGTERM);
+            belt::platform::signal_pid(self.pid, libc::SIGTERM);
         }
         self.wait().await;
     }
@@ -68,7 +68,7 @@ fn write_private(path: &Path, bytes: &[u8]) {
 }
 fn spawn_worker(home: &Path, cluster: &ClusterId, key: &Path, id: &str) -> Owned {
     private(home);
-    let state = home.join(".remote-task-runner");
+    let state = home.join(".belt");
     private(&state);
     let input = home.join("worker.json");
     let spec = WorkerSpec {
@@ -108,7 +108,7 @@ fn bridge(home: &Path, parent: u32) -> Option<(u32, String)> {
         .trim()
         .parse()
         .ok()?;
-    let process = remote_task_runner::platform::read_process(pid);
+    let process = belt::platform::read_process(pid);
     if process.ppid != Some(parent) {
         return None;
     }
@@ -128,14 +128,14 @@ async fn submit(
     std::fs::write(dir.join("ordinary"), name).unwrap();
     std::fs::write(dir.join(".env"), format!("TOKEN={name}-private\n")).unwrap();
     let run = RunId::generate();
-    let source_store = remote_task_runner::source::SourceStore::open(state).unwrap();
-    let vault = remote_task_runner::secrets::vault::Vault::open(state).unwrap();
-    let key = remote_task_runner::secrets::key::load(key).unwrap();
-    let capture = remote_task_runner::secrets::capture::capture_run(
+    let source_store = belt::source::SourceStore::open(state).unwrap();
+    let vault = belt::secrets::vault::Vault::open(state).unwrap();
+    let key = belt::secrets::key::load(key).unwrap();
+    let capture = belt::secrets::capture::capture_run(
         env,
         &source_store,
         &vault,
-        &remote_task_runner::secrets::capture::SecretInputs {
+        &belt::secrets::capture::SecretInputs {
             key: &key,
             declared: &[local_ci::source::SecretSpec {
                 glob: ".env".into(),
@@ -143,20 +143,18 @@ async fn submit(
             }],
         },
         &run,
-        &remote_task_runner::source::SourceRequest::Directory { dir },
+        &belt::source::SourceRequest::Directory { dir },
         &Default::default(),
     )
     .unwrap();
     let manifest = &capture.manifest.manifest_digest;
     let task = TaskId::generate();
-    let count = remote_task_runner::protocol::ssh::quote(
-        &root.join(format!("count-{name}")).display().to_string(),
-    );
+    let count =
+        belt::protocol::ssh::quote(&root.join(format!("count-{name}")).display().to_string());
     let wait = if delay == u32::MAX {
-        let release = remote_task_runner::protocol::ssh::quote(
-            &root.join(format!("release-{name}")).display().to_string(),
-        );
-        let fixture = remote_task_runner::protocol::ssh::quote(&root.display().to_string());
+        let release =
+            belt::protocol::ssh::quote(&root.join(format!("release-{name}")).display().to_string());
+        let fixture = belt::protocol::ssh::quote(&root.display().to_string());
         format!("while [ -d {fixture} ] && [ ! -e {release} ]; do sleep 0.05; done")
     } else {
         format!("sleep {delay}")
@@ -185,7 +183,7 @@ async fn submit(
     assert!(matches!(reply, Reply::Accepted { .. }), "{reply:?}");
     task
 }
-fn attempt(state: &Path, task: &TaskId) -> Option<remote_task_runner::storage::AttemptRecord> {
+fn attempt(state: &Path, task: &TaskId) -> Option<belt::storage::AttemptRecord> {
     CoordinatorStore::open_read_only(state)
         .unwrap()
         .latest_attempt_of_task(task)
@@ -265,13 +263,13 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
     let state = root.join("parent");
     let local = root.join("local");
     let xdg = root.join("config");
-    let config_dir = xdg.join("remote-task-runner");
+    let config_dir = xdg.join("belt");
     let bin = root.join("bin");
     for dir in [&state, &local, &config_dir, &bin] {
         private(dir);
     }
     let key = root.join("key");
-    remote_task_runner::secrets::key::init(&key).unwrap();
+    belt::secrets::key::init(&key).unwrap();
     let cluster = {
         let store = CoordinatorStore::open(&state, wall_ms()).unwrap();
         store.cluster_id().clone()
@@ -285,7 +283,7 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
                 if let Some(status) = worker.child.as_mut().unwrap().try_wait().unwrap() {
                     return Err(status);
                 }
-                if home.join(".remote-task-runner/agent.sock").exists() {
+                if home.join(".belt/agent.sock").exists() {
                     return Ok(());
                 }
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -308,7 +306,7 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
         std::fs::write(home.join("offline"), "initial offline peer").unwrap();
     }
     let fake = bin.join("ssh");
-    let script = format!("#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nhome=$1\nshift\n[ \"$1\" = \"'remote-task-runner' 'worker' '--stdio'\" ] || exit 91\n[ ! -e \"$home/offline\" ] || exit 92\ndd if=/dev/zero bs=4096 count=32 1>&2 2>/dev/null\nprintf '%s\\n' $$ > \"$home/bridge.pid\"\ncase \"$home\" in */wrong-home) home={} ;; esac\nHOME=\"$home\" exec {} worker --stdio\n", remote_task_runner::protocol::ssh::quote(&homes[1].display().to_string()), remote_task_runner::protocol::ssh::quote(BIN));
+    let script = format!("#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nhome=$1\nshift\n[ \"$1\" = \"'belt' 'worker' '--stdio'\" ] || exit 91\n[ ! -e \"$home/offline\" ] || exit 92\ndd if=/dev/zero bs=4096 count=32 1>&2 2>/dev/null\nprintf '%s\\n' $$ > \"$home/bridge.pid\"\ncase \"$home\" in */wrong-home) home={} ;; esac\nHOME=\"$home\" exec {} worker --stdio\n", belt::protocol::ssh::quote(&homes[1].display().to_string()), belt::protocol::ssh::quote(BIN));
     std::fs::write(&fake, script).unwrap();
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o700)).unwrap();
     let config = format!("schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\nlocal_worker_priority=-100\nmax_active_task=1\n[scheduler]\nprefetch_per_worker=0\n[[workers]]\nid='remote-a'\nssh='{}'\npriority=100\n[[workers]]\nid='remote-b'\nssh='{}'\npriority=100\n[[workers]]\nid='offline'\nssh='{}'\npriority=100\n[[workers]]\nid='wrong-identity'\nssh='{}'\npriority=100\n", homes[0].display(), homes[1].display(), root.join("missing").display(), wrong_home.display());
@@ -331,8 +329,7 @@ async fn two_remote_roles_deliver_inputs_and_reconnect_same_attempt_while_offlin
             );
             super::bootstrap::diagnose_attempt(&spec, &attempt.attempt_id);
             let worker =
-                remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
-                    .unwrap();
+                belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
             for event in worker.events_of_attempt(&attempt.attempt_id, 40).unwrap() {
                 eprintln!("initial local event={}", event.kind);
             }
@@ -457,12 +454,12 @@ async fn a46_a_tunnel_disconnect_keeps_the_ephemeral_attempt_until_explicit_forg
     let state = root.join("parent");
     let home = root.join("ephemeral");
     let bin = root.join("bin");
-    let config = root.join("config/remote-task-runner");
+    let config = root.join("config/belt");
     for dir in [root, &state, &root.join("local"), &home, &bin, &config] {
         private(dir);
     }
     let key = root.join("key");
-    remote_task_runner::secrets::key::init(&key).unwrap();
+    belt::secrets::key::init(&key).unwrap();
     let cluster = CoordinatorStore::open(&state, wall_ms())
         .unwrap()
         .cluster_id()
@@ -480,13 +477,13 @@ async fn a46_a_tunnel_disconnect_keeps_the_ephemeral_attempt_until_explicit_forg
 while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
 [ "$#" = 3 ] || exit 91
 home=$2
-[ "$3" = "'remote-task-runner' 'worker' '--stdio'" ] || exit 91
+[ "$3" = "'belt' 'worker' '--stdio'" ] || exit 91
 [ ! -e "$home/offline" ] || exit 92
 echo $$ > "$home/bridge.pid"
 echo $$ >> "$home/bridge-dials"
 HOME="$home" exec {} worker --stdio
 "#,
-            remote_task_runner::protocol::ssh::quote(BIN)
+            belt::protocol::ssh::quote(BIN)
         ),
     )
     .unwrap();
@@ -540,11 +537,9 @@ HOME="$home" exec {} worker --stdio
     .is_err()
     {
         let attempts = store.attempts_of_task(&task).unwrap();
-        let worker_events = remote_task_runner::storage::WorkerStore::open_read_only(
-            &home.join(".remote-task-runner"),
-        )
-        .and_then(|worker| worker.events_after(0, 200))
-        .map(|events| events.into_iter().map(|e| e.kind).collect::<Vec<_>>());
+        let worker_events = belt::storage::WorkerStore::open_read_only(&home.join(".belt"))
+            .and_then(|worker| worker.events_after(0, 200))
+            .map(|events| events.into_iter().map(|e| e.kind).collect::<Vec<_>>());
         let refused: Vec<_> = attempts
             .iter()
             .flat_map(|attempt| {
@@ -635,7 +630,7 @@ HOME="$home" exec {} worker --stdio
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a38_public_ci_delivers_needs_outputs_and_a_verified_multifile_artifact_to_another_worker()
 {
-    use remote_task_runner::worker::control::{self, Control};
+    use belt::worker::control::{self, Control};
     let (root, spec, input) = super::bootstrap::control_fixture();
     let cluster = CoordinatorStore::open(&spec.state_dir, wall_ms())
         .unwrap()
@@ -643,17 +638,17 @@ async fn a38_public_ci_delivers_needs_outputs_and_a_verified_multifile_artifact_
         .clone();
     let home = root.path().join("peer");
     let remote = spawn_worker(&home, &cluster, &spec.cluster_key_path, "peer");
-    let remote_state = home.join(".remote-task-runner");
+    let remote_state = home.join(".belt");
     wait_for("private peer socket", || {
         remote_state.join("agent.sock").exists()
     })
     .await;
     control::write(&remote_state, Control::draining()).unwrap();
-    let config = root.path().join(".config/remote-task-runner/config.toml");
+    let config = root.path().join(".config/belt/config.toml");
     let text="schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\n[[workers]]\nid='peer'\nssh='peer'\n";
     write_private(&config, text.as_bytes());
-    let quote = remote_task_runner::protocol::ssh::quote;
-    let ssh=format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n[ \"$#\" -eq 3 ] && [ \"$2\" = peer ] && [ \"$3\" = \"'remote-task-runner' 'worker' '--stdio'\" ] || exit 91\nHOME={} exec {} worker --stdio\n",quote(home.to_str().unwrap()),quote(BIN));
+    let quote = belt::protocol::ssh::quote;
+    let ssh=format!("#!/bin/sh\nwhile [ \"$#\" -gt 0 ] && [ \"$1\" != -- ]; do shift; done\n[ \"$#\" -eq 3 ] && [ \"$2\" = peer ] && [ \"$3\" = \"'belt' 'worker' '--stdio'\" ] || exit 91\nHOME={} exec {} worker --stdio\n",quote(home.to_str().unwrap()),quote(BIN));
     super::common::write_executable(&root.path().join("tool-stubs/ssh"), &ssh);
     let marks = super::bootstrap::ci_project(
         root.path(),

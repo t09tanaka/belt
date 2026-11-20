@@ -1,4 +1,4 @@
-//! remote-task-runner: distribute CI and heavy commands across your own machines.
+//! belt: distribute CI and heavy commands across your own machines.
 
 pub mod cli;
 pub mod config;
@@ -27,7 +27,7 @@ pub mod ci;
 
 // The test-only helpers name this crate the way the integration tests do.
 #[cfg(test)]
-extern crate self as remote_task_runner;
+extern crate self as belt;
 
 #[cfg(test)]
 mod test_child;

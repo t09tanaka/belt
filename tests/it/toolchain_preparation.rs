@@ -1,22 +1,20 @@
 //! Real private fixture managers, through the setup supervisor and TTC.
-use remote_task_runner::error::ApiError;
-use remote_task_runner::ids::{AttemptId, Digest, WorkerId};
-use remote_task_runner::setup::builder::{BuilderWorkspaces, SetupConfig, Setups};
-use remote_task_runner::toolchain::adapters::{
-    self, AdapterKind, FileIdentity, HostTools, ResolutionEvidence,
-};
-use remote_task_runner::toolchain::preparation::{PreparationRequest, ToolPreparationPoll};
-use remote_task_runner::toolchain::versions::{
+use belt::error::ApiError;
+use belt::ids::{AttemptId, Digest, WorkerId};
+use belt::setup::builder::{BuilderWorkspaces, SetupConfig, Setups};
+use belt::toolchain::adapters::{self, AdapterKind, FileIdentity, HostTools, ResolutionEvidence};
+use belt::toolchain::preparation::{PreparationRequest, ToolPreparationPoll};
+use belt::toolchain::versions::{
     Constraint, Declaration, FrozenToolchains, Location, MatchPolicy, Scope, ToolId,
 };
-use remote_task_runner::wire::AttemptPayload;
-use remote_task_runner::workspace::Workspace;
+use belt::wire::AttemptPayload;
+use belt::workspace::Workspace;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
+const BIN: &str = env!("CARGO_BIN_EXE_belt");
 struct NoWorkspace;
 impl BuilderWorkspaces for NoWorkspace {
     fn create(&self, _: &AttemptId, _: &AttemptPayload) -> Result<Workspace, ApiError> {
@@ -40,7 +38,7 @@ struct Fx {
 impl Fx {
     fn new(kind: AdapterKind, tool: &str, mode: &str) -> Self {
         let dir = tempfile::Builder::new()
-            .prefix("rtr-tool-preparation-")
+            .prefix("belt-tool-preparation-")
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
             .unwrap();
         let base = std::fs::canonicalize(dir.path()).unwrap();
@@ -314,10 +312,7 @@ fn all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipt
         );
         assert_eq!(original[0].policy, "sum-ttc-admitted-run-wall-v1");
         assert_eq!(original[0].node_count, 1);
-        assert_eq!(
-            original[0].boot,
-            remote_task_runner::platform::boot_id().unwrap()
-        );
+        assert_eq!(original[0].boot, belt::platform::boot_id().unwrap());
         for _ in 0..100 {
             assert_eq!(f.setups.preparation_observations(usize::MAX), original);
         }
@@ -669,8 +664,8 @@ fn fixture_child(f: &Fx) -> (u32, u64) {
 }
 fn same_live(pid: u32, start: u64) -> bool {
     matches!(
-        remote_task_runner::platform::read_process(pid).start,
-        remote_task_runner::platform::process_read::StartIdentity::Identity(_)
+        belt::platform::read_process(pid).start,
+        belt::platform::process_read::StartIdentity::Identity(_)
     ) && task_traffic_controller::process::start_time(pid) == Some(start)
 }
 
@@ -928,8 +923,8 @@ fn parent_capture_definition_and_local_worker_definition_remain_separate() {
 
 #[test]
 fn worker_private_registry_builds_request_for_real_setup_preparation() {
-    use remote_task_runner::toolchain::profile::Profile;
-    use remote_task_runner::toolchain::registry::Registry;
+    use belt::toolchain::profile::Profile;
+    use belt::toolchain::registry::Registry;
     for (kind, tool) in [
         (AdapterKind::Nodenv, "node"),
         (AdapterKind::Rustup, "rust"),

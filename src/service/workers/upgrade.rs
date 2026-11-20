@@ -47,7 +47,7 @@ pub struct UpgradeResult {
 
 /// A helper action run by the staged binary of this exact build.
 fn staged_command(digest: &str, action: &'static str) -> String {
-    format!("exec \"{STAGING}/rtr-{digest}\" worker-service {action} --wait-secs {STOP_WAIT_SECS}")
+    format!("exec \"{STAGING}/belt-{digest}\" worker-service {action} --wait-secs {STOP_WAIT_SECS}")
 }
 
 fn short(digest: &str) -> &str {

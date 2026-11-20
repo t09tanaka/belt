@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
-const READY_ENV: &str = "RTR_TEST_CHILD_READY";
+const READY_ENV: &str = "BELT_TEST_CHILD_READY";
 const READY: &[u8] = b"ready\n";
 const TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -35,7 +35,7 @@ pub(crate) struct OwnedChild {
 
 impl OwnedChild {
     fn start(mut command: Command) -> io::Result<Self> {
-        let directory = crate::test_tmp::prefixed("rtr-test-child-")?;
+        let directory = crate::test_tmp::prefixed("belt-test-child-")?;
         let ready = directory.path().join("ready");
         let child = command
             .env(READY_ENV, &ready)
@@ -155,7 +155,7 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("RTR_TEST_CHILD_MODE", mode)
+            .env("BELT_TEST_CHILD_MODE", mode)
             .stdin(Stdio::piped());
         command
     }
@@ -176,7 +176,7 @@ mod tests {
     #[test]
     #[ignore = "owned subprocess helper"]
     fn fixture_child() {
-        let mode = std::env::var("RTR_TEST_CHILD_MODE").unwrap();
+        let mode = std::env::var("BELT_TEST_CHILD_MODE").unwrap();
         if mode == "exit" {
             return;
         }

@@ -1,4 +1,4 @@
-# remote-task-runner
+# belt
 
 Run CI and development commands across your own Macs on the LAN: one coordinator, many workers, with uncommitted changes, durable queues, cancellation and crash recovery.
 
@@ -6,9 +6,17 @@ Status: in development. The specification (Japanese) is in [docs/spec.md](docs/s
 
 Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and [task-traffic-controller](https://github.com/t09tanaka/task-traffic-controller) for per-host resource admission.
 
+## Install
+
+The crates.io package is `belt-cli` (the name `belt` is taken by an unrelated crate); it installs the `belt` command. Not yet published.
+
+```sh
+cargo install belt-cli
+```
+
 ## Watch workers and tasks
 
-Run `remote-task-runner top` in a terminal to see worker connections, active attempts, waiting tasks, and attempts whose state is uncertain. Task details show the executable name. Commands wrapped in `portool exec` show the inner executable followed by `[portool]`. The view refreshes every second. Set the period with `--interval 2`, scroll with the arrow keys, and quit with `q`, Esc, or Ctrl-C. Use `remote-task-runner --json top` for one snapshot in a pipeline.
+Run `belt top` in a terminal to see worker connections, active attempts, waiting tasks, and attempts whose state is uncertain. Task details show the executable name. Commands wrapped in `portool exec` show the inner executable followed by `[portool]`. The view refreshes every second. Set the period with `--interval 2`, scroll with the arrow keys, and quit with `q`, Esc, or Ctrl-C. Use `belt --json top` for one snapshot in a pipeline.
 
 ## Development
 
@@ -40,14 +48,14 @@ repository's resource admission and portool entry when running locally.
 
 ## Distributed test jobs
 
-`remote-task-runner ci plan` identifies jobs that a worker can enumerate.
-`remote-task-runner ci plan --run <run-id>` reads the stored plan, including
+`belt ci plan` identifies jobs that a worker can enumerate.
+`belt ci plan --run <run-id>` reads the stored plan, including
 the shard task IDs, test counts and reasons a job stayed whole. Discovery runs against the
 captured source with the job's setup. After the parent receives the listing,
 it releases the tests to run and keeps each shard's identity for retries.
 
 Playwright and Cypress projects can declare their independent fixtures for
-a specific job in the captured `.remote-task-runner.toml`. Set `allow_retry`
+a specific job in the captured `.belt.toml`. Set `allow_retry`
 when running a failed shard again is safe for the external resources it uses.
 
 ```toml
@@ -63,7 +71,7 @@ allow_retry = true
 MIT
 
 A separately provisioned persistent worker can run in the foreground with
-`remote-task-runner worker --input "$WORKER_INPUT"`. The retained input is private
+`belt worker --input "$WORKER_INPUT"`. The retained input is private
 and binds the cluster, worker identity, executable, key and captured configuration.
 Its HOME and canonical worker state must match the `worker --stdio` bridge. The
 bridge may disconnect while accepted work and its independent supervisor continue.
@@ -72,7 +80,7 @@ The parent snapshots explicitly registered workers from its private user
 identity; `ssh` is its SSH destination. The parent verifies cluster, identity and
 protocol before attachment, forwards captured source and secrets on that link,
 and reconnects without creating a replacement attempt. The remote executable is
-`remote-task-runner` on the remote PATH, through the fixed `worker --stdio` bridge.
+`belt` on the remote PATH, through the fixed `worker --stdio` bridge.
 SSH connection failures stay isolated from local work and other peers.
 
 Registration changes require a parent restart. Automatic enrollment, worker

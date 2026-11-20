@@ -1,11 +1,11 @@
-use remote_task_runner::config::resolve::WorkerSpec;
-use remote_task_runner::config::runtime::{WorkerInputs, WorkerTarget};
-use remote_task_runner::config::{resolve, Inputs, Overlay, ResolvedConfig};
-use remote_task_runner::ids::*;
-use remote_task_runner::protocol::transport::duplex_pair;
-use remote_task_runner::protocol::{accept, connect, ClientConfig, Connected, ServerConfig};
-use remote_task_runner::scheduler::UnknownCosts;
-use remote_task_runner::storage::CoordinatorStore;
+use belt::config::resolve::WorkerSpec;
+use belt::config::runtime::{WorkerInputs, WorkerTarget};
+use belt::config::{resolve, Inputs, Overlay, ResolvedConfig};
+use belt::ids::*;
+use belt::protocol::transport::duplex_pair;
+use belt::protocol::{accept, connect, ClientConfig, Connected, ServerConfig};
+use belt::scheduler::UnknownCosts;
+use belt::storage::CoordinatorStore;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -23,7 +23,7 @@ fn inputs(root: &std::path::Path) -> WorkerInputs {
         state_dir: root.join("worker"),
         worker_id: WorkerId::parse("local").unwrap(),
         boot_id: WorkerBootId::parse("boot-1").unwrap(),
-        supervisor_exe: env!("CARGO_BIN_EXE_remote-task-runner").into(),
+        supervisor_exe: env!("CARGO_BIN_EXE_belt").into(),
         cluster_key_path: root.join("cluster.key"),
         env: BTreeMap::from([
             ("PATH".into(), "/usr/bin:/bin".into()),
@@ -209,16 +209,16 @@ fn runtime_factory_preserves_git_preflight_error() {
         .open_host()
         .err()
         .unwrap();
-    assert_eq!(err.code, remote_task_runner::error::ErrorCode::Blocked);
+    assert_eq!(err.code, belt::error::ErrorCode::Blocked);
     assert!(err.message.contains("Git") || err.message.contains("git"));
 }
 
-async fn connected(c: &remote_task_runner::coordinator::Coordinator, name: &str) -> Connected {
+async fn connected(c: &belt::coordinator::Coordinator, name: &str) -> Connected {
     connected_without(c, name, &[]).await
 }
 
 async fn connected_without(
-    c: &remote_task_runner::coordinator::Coordinator,
+    c: &belt::coordinator::Coordinator,
     name: &str,
     missing: &[&str],
 ) -> Connected {
@@ -326,8 +326,8 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
 
 #[tokio::test]
 async fn dispatch_and_artifact_tasks_require_their_negotiated_features() {
-    use remote_task_runner::coordinator::policy::unmet_ci;
-    use remote_task_runner::wire::{MATRIX_DISPATCH_FEATURE, WORKFLOW_ARTIFACTS_FEATURE};
+    use belt::coordinator::policy::unmet_ci;
+    use belt::wire::{MATRIX_DISPATCH_FEATURE, WORKFLOW_ARTIFACTS_FEATURE};
 
     let fx = super::coordinator::fx();
     let coordinator = fx.open(&[]);
@@ -378,9 +378,9 @@ async fn dispatch_and_artifact_tasks_require_their_negotiated_features() {
 /// one that did not offer it.
 #[tokio::test]
 async fn runtime_attach_carries_whether_the_worker_answers_env_sync() {
-    use remote_task_runner::error::ErrorCode;
-    use remote_task_runner::ids::RequestId;
-    use remote_task_runner::wire::{ToolRequirement, ENV_SYNC_FEATURE};
+    use belt::error::ErrorCode;
+    use belt::ids::RequestId;
+    use belt::wire::{ToolRequirement, ENV_SYNC_FEATURE};
     let root = crate::test_tmp::tempdir().unwrap();
     let mut cfg = config();
     for id in ["new", "old"] {

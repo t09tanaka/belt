@@ -26,7 +26,7 @@ use std::{
 const OUTPUT_LIMIT: usize = 1 << 20;
 /// How long `stop` waits for accepted work before giving up (the worker stays drained).
 pub const STOP_WAIT_SECS: u64 = 600;
-const STAGING: &str = "$HOME/.remote-task-runner-bootstrap";
+const STAGING: &str = "$HOME/.belt-bootstrap";
 
 #[derive(Debug)]
 pub struct RemoteOutput {
@@ -402,7 +402,7 @@ fn invalid(message: impl Into<String>) -> ApiError {
 /// (the worker's own installed copy, independent of ssh's PATH and of this
 /// parent's version) it is that binary. A registration without one keeps the
 /// older lookup: the staged binary of this exact build, else whatever
-/// `remote-task-runner` the login PATH provides. Only constants, a hex digest
+/// `belt` the login PATH provides. Only constants, a hex digest
 /// and quoted words appear.
 pub fn helper_command(
     binary: Option<&str>,
@@ -433,8 +433,8 @@ fn launch(binary: Option<&str>, digest: &str, words: &str) -> String {
         return format!("exec {} {words}", quote(binary));
     }
     format!(
-        "b=\"{STAGING}/rtr-{digest}\"; if [ -x \"$b\" ]; then exec \"$b\" {words}; else exec {} {words}; fi",
-        quote("remote-task-runner")
+        "b=\"{STAGING}/belt-{digest}\"; if [ -x \"$b\" ]; then exec \"$b\" {words}; else exec {} {words}; fi",
+        quote("belt")
     )
 }
 
@@ -451,7 +451,7 @@ pub fn env_command(binary: Option<&str>, digest: &str) -> String {
 /// SHA-256 is the expected digest; a short or damaged transfer is removed.
 fn stage_command(digest: &str) -> String {
     format!(
-        "set -eu; umask 077; {SHA256}; d=\"{STAGING}\"; mkdir -p \"$d\"; p=\"$d/rtr-{digest}.part\"; cat > \"$p\"; chmod 700 \"$p\"; got=$(sha \"$p\"); if [ \"$got\" != \"{digest}\" ]; then rm -f \"$p\"; echo 'staged binary digest mismatch' >&2; exit 3; fi; mv \"$p\" \"$d/rtr-{digest}\""
+        "set -eu; umask 077; {SHA256}; d=\"{STAGING}\"; mkdir -p \"$d\"; p=\"$d/belt-{digest}.part\"; cat > \"$p\"; chmod 700 \"$p\"; got=$(sha \"$p\"); if [ \"$got\" != \"{digest}\" ]; then rm -f \"$p\"; echo 'staged binary digest mismatch' >&2; exit 3; fi; mv \"$p\" \"$d/belt-{digest}\""
     )
 }
 
@@ -461,12 +461,12 @@ const SHA256: &str = "sha() { if command -v sha256sum >/dev/null 2>&1; then sha2
 
 /// What the staged binary says its version is. Nothing on the host changes.
 fn version_command(digest: &str) -> String {
-    format!("exec \"{STAGING}/rtr-{digest}\" --version")
+    format!("exec \"{STAGING}/belt-{digest}\" --version")
 }
 
 /// Remove a staged binary that must not be used.
 fn unstage_command(digest: &str) -> String {
-    format!("rm -f \"{STAGING}/rtr-{digest}\"")
+    format!("rm -f \"{STAGING}/belt-{digest}\"")
 }
 
 /// What this parent prints for `--version`: what a binary sent to a worker
@@ -480,12 +480,12 @@ const EPHEMERAL_NO_SERVICE: &str = "an ephemeral worker has no service: it is st
 /// `staged` only for an executable whose content is the expected digest.
 fn probe_command(digest: &str) -> String {
     format!(
-        "uname -s; uname -m; {SHA256}; f=\"{STAGING}/rtr-{digest}\"; if [ -x \"$f\" ] && [ \"$(sha \"$f\")\" = \"{digest}\" ]; then echo staged; else echo absent; fi"
+        "uname -s; uname -m; {SHA256}; f=\"{STAGING}/belt-{digest}\"; if [ -x \"$f\" ] && [ \"$(sha \"$f\")\" = \"{digest}\" ]; then echo staged; else echo absent; fi"
     )
 }
 
 fn install_command(digest: &str) -> String {
-    format!("exec \"{STAGING}/rtr-{digest}\" worker-service install")
+    format!("exec \"{STAGING}/belt-{digest}\" worker-service install")
 }
 
 #[cfg(test)]
@@ -1274,7 +1274,7 @@ fn parse_env_reply(out: &RemoteOutput, name: &str) -> Result<EnvReport, ApiError
         let version = value["env"]["schema_version"].as_u64();
         return match version {
             Some(v) if v > u64::from(envdiff::SCHEMA) => Err(conflict(format!(
-                "the worker reports environment schema {v}, newer than this machine understands ({}); upgrade remote-task-runner here",
+                "the worker reports environment schema {v}, newer than this machine understands ({}); upgrade belt here",
                 envdiff::SCHEMA
             ))),
             Some(v) if v < u64::from(envdiff::SCHEMA) => Err(conflict(format!(

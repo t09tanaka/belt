@@ -166,22 +166,18 @@ mod tests {
 
     #[test]
     fn binaries_are_absolute_or_bare() {
-        for good in [
-            "/opt/rtr/bin/remote-task-runner",
-            "remote-task-runner",
-            "/a b/c",
-        ] {
+        for good in ["/opt/belt/bin/belt", "belt", "/a b/c"] {
             assert!(RemoteCommand::worker_stdio(good).is_ok(), "{good}");
         }
         for bad in [
             "",
-            "~/bin/rtr",
-            "bin/rtr",
-            "./rtr",
+            "~/bin/belt",
+            "bin/belt",
+            "./belt",
             "-x",
             "/a\nb",
             "/a\tb",
-            "rtr\0",
+            "belt\0",
         ] {
             assert!(RemoteCommand::worker_stdio(bad).is_err(), "{bad:?}");
         }
@@ -202,16 +198,16 @@ mod tests {
 
     #[test]
     fn the_remote_command_is_fixed_and_quoted() {
-        let c = RemoteCommand::worker_stdio("/opt/my tools/rtr").unwrap();
-        assert_eq!(c.shell_string(), "'/opt/my tools/rtr' 'worker' '--stdio'");
-        let c = RemoteCommand::worker_stdio("remote-task-runner").unwrap();
-        assert_eq!(c.shell_string(), "'remote-task-runner' 'worker' '--stdio'");
+        let c = RemoteCommand::worker_stdio("/opt/my tools/belt").unwrap();
+        assert_eq!(c.shell_string(), "'/opt/my tools/belt' 'worker' '--stdio'");
+        let c = RemoteCommand::worker_stdio("belt").unwrap();
+        assert_eq!(c.shell_string(), "'belt' 'worker' '--stdio'");
     }
 
     #[test]
     fn argv_has_the_destination_once_after_the_option_terminator() {
         let t = SshTarget::parse("user@host").unwrap();
-        let c = RemoteCommand::worker_stdio("/usr/local/bin/remote-task-runner").unwrap();
+        let c = RemoteCommand::worker_stdio("/usr/local/bin/belt").unwrap();
         let argv = ssh_argv(&t, &c);
         assert_eq!(
             argv,
@@ -230,7 +226,7 @@ mod tests {
                 "ServerAliveCountMax=3",
                 "--",
                 "user@host",
-                "'/usr/local/bin/remote-task-runner' 'worker' '--stdio'",
+                "'/usr/local/bin/belt' 'worker' '--stdio'",
             ]
         );
         // Everything before `--` is fixed, whatever the destination.

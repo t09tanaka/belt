@@ -112,7 +112,7 @@ pub fn decide(
         return Ok(worker);
     }
     Err(format!(
-        "the worker is {system}/{machine} and this parent's own binary does not run there; build remote-task-runner of this version for {} and name it with --binary <path>; nothing was sent",
+        "the worker is {system}/{machine} and this parent's own binary does not run there; build belt of this version for {} and name it with --binary <path>; nothing was sent",
         worker.triple()
     ))
 }
@@ -261,11 +261,11 @@ mod tests {
 
     #[test]
     fn a_version_matches_only_when_it_is_the_same_text() {
-        let own = "remote-task-runner 1.2.3\n";
-        assert!(version_matches(own, b"remote-task-runner 1.2.3\n"));
-        assert!(version_matches(own, b"  remote-task-runner 1.2.3\r\n"));
-        assert!(!version_matches(own, b"remote-task-runner 1.2.4\n"));
-        assert!(!version_matches(own, b"remote-task-runner 1.2.3 extra"));
+        let own = "belt 1.2.3\n";
+        assert!(version_matches(own, b"belt 1.2.3\n"));
+        assert!(version_matches(own, b"  belt 1.2.3\r\n"));
+        assert!(!version_matches(own, b"belt 1.2.4\n"));
+        assert!(!version_matches(own, b"belt 1.2.3 extra"));
         assert!(!version_matches(own, b""));
         assert!(!version_matches(own, &[0xff, 0xfe]));
         // Nothing matches a parent that knows no version of its own.
@@ -275,10 +275,7 @@ mod tests {
 
     #[test]
     fn a_reported_version_is_shown_as_one_bounded_plain_line() {
-        assert_eq!(
-            shown_version(b"remote-task-runner 0.1.0\nmore\n"),
-            "remote-task-runner 0.1.0"
-        );
+        assert_eq!(shown_version(b"belt 0.1.0\nmore\n"), "belt 0.1.0");
         assert_eq!(shown_version(b""), "nothing");
         assert_eq!(shown_version(b"  \n"), "nothing");
         assert_eq!(shown_version(b" a\x1b[31mb \n"), "a[31mb");

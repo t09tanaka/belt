@@ -5,20 +5,18 @@
 //! process behind (the fixture kills what still runs under its directory).
 
 use crate::common::kill_if_command;
-use remote_task_runner::error::ApiError;
-use remote_task_runner::ids::{
-    AttemptId, Digest, Generation, PlanDigest, RunId, SourceId, TaskId, WorkerId,
-};
-use remote_task_runner::setup::builder::{BuilderWorkspaces, SetupConfig, SetupPoll, Setups};
-use remote_task_runner::setup::store::remove_tree;
-use remote_task_runner::wire::{AttemptPayload, ReuseScope, SetupSpec, SetupStep};
-use remote_task_runner::workspace::{Workspace, WorkspaceKind};
+use belt::error::ApiError;
+use belt::ids::{AttemptId, Digest, Generation, PlanDigest, RunId, SourceId, TaskId, WorkerId};
+use belt::setup::builder::{BuilderWorkspaces, SetupConfig, SetupPoll, Setups};
+use belt::setup::store::remove_tree;
+use belt::wire::{AttemptPayload, ReuseScope, SetupSpec, SetupStep};
+use belt::workspace::{Workspace, WorkspaceKind};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
+const BIN: &str = env!("CARGO_BIN_EXE_belt");
 const LIMIT: Duration = Duration::from_secs(90);
 
 /// Workspaces as plain directories with a file in them, and the files of
@@ -97,7 +95,7 @@ fn fx_with(change: impl FnOnce(&mut SetupConfig, &Path)) -> Fx {
     // Not under the system temp directory: a process a failed test leaves
     // behind must not write into a directory a test runner clears.
     let dir = tempfile::Builder::new()
-        .prefix("rtr-setup-")
+        .prefix("belt-setup-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
     let ws = Arc::new(DirWs {
@@ -286,7 +284,7 @@ impl Fx {
     /// The supervisor has recorded the process of the builder's step (it
     /// can be told from any other process after that).
     fn launch_recorded(&self) -> bool {
-        use remote_task_runner::storage::WorkerStore;
+        use belt::storage::WorkerStore;
         let Some(dir) = std::fs::read_dir(self.builders())
             .ok()
             .and_then(|mut rd| rd.next())
@@ -824,7 +822,7 @@ fn steps_that_cannot_be_prepared_in_advance_stay_with_their_consumer() {
         .setups
         .poll(&AttemptId::generate(), &f.payload(&bad), &wa)
         .unwrap_err();
-    assert_eq!(e.code, remote_task_runner::error::ErrorCode::InvalidInput);
+    assert_eq!(e.code, belt::error::ErrorCode::InvalidInput);
 }
 
 #[test]
@@ -845,15 +843,13 @@ fn what_a_crash_left_is_cleaned_at_the_start() {
     std::fs::create_dir_all(half.join("tree")).unwrap();
     let dead = AttemptId::generate();
     let dead_ws = f.ws.make(&dead);
-    let bdir = f
-        .builders()
-        .join(remote_task_runner::ids::BuilderId::generate().as_str());
+    let bdir = f.builders().join(belt::ids::BuilderId::generate().as_str());
     std::fs::create_dir_all(&bdir).unwrap();
     std::fs::write(
         bdir.join("meta.json"),
         format!(
             r#"{{"builder_id":"{}","attempt_id":"{dead}","key":"sha256:k"}}"#,
-            remote_task_runner::ids::BuilderId::generate()
+            belt::ids::BuilderId::generate()
         ),
     )
     .unwrap();
@@ -1113,7 +1109,7 @@ fn a_link_into_the_builders_workspace_is_made_relative() {
 fn a_spec_that_names_secrets_is_not_prepared() {
     let f = fx();
     let mut s = spec(vec![install(&f, "count", "")]);
-    s.secrets = vec![remote_task_runner::wire::SecretVersion {
+    s.secrets = vec![belt::wire::SecretVersion {
         name: "NPM_TOKEN".into(),
         digest: "v1".into(),
     }];
@@ -1184,10 +1180,10 @@ fn a_copy_that_fails_halfway_is_taken_back() {
 
 mod store {
     use super::*;
-    use remote_task_runner::ids::BuilderId;
-    use remote_task_runner::setup::policy::{seal_receipt, Limits};
-    use remote_task_runner::setup::store::{digest_of, TemplateStore};
-    use remote_task_runner::wire::PreparedArtifact;
+    use belt::ids::BuilderId;
+    use belt::setup::policy::{seal_receipt, Limits};
+    use belt::setup::store::{digest_of, TemplateStore};
+    use belt::wire::PreparedArtifact;
 
     struct S {
         dir: tempfile::TempDir,

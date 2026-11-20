@@ -293,7 +293,7 @@ fn advance_run(
         .iter()
         .find_map(|r| {
             r.spec
-                .pointer("/ci/task/inputs/rtr_discovery/project")
+                .pointer("/ci/task/inputs/belt_discovery/project")
                 .and_then(|v| v.as_str())
         })
         .map(str::to_owned);

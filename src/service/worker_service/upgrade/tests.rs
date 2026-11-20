@@ -49,7 +49,7 @@ impl Host {
         let root = dir.path().to_owned();
         let home = root.join("h");
         fs::create_dir(&home).unwrap();
-        let (old_exe, new_exe) = (root.join("rtr-old"), root.join("rtr-new"));
+        let (old_exe, new_exe) = (root.join("belt-old"), root.join("belt-new"));
         fs::write(&old_exe, b"old version").unwrap();
         fs::write(&new_exe, b"new version").unwrap();
         let env = BTreeMap::from([
@@ -57,7 +57,7 @@ impl Host {
             ("PATH".to_string(), "/usr/bin:/bin".to_string()),
         ]);
         let fake = Fake::default();
-        fake.0.borrow_mut().state = home.join(".remote-task-runner");
+        fake.0.borrow_mut().state = home.join(".belt");
         fake.0.borrow_mut().backend = backend;
         let cluster = ClusterId::generate();
         let old = sha256_file(&old_exe).unwrap();

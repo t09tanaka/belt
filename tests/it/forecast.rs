@@ -3,12 +3,12 @@
 //! the stale coordinator. No process is started: a command is registered in
 //! the task-traffic-controller ledger without running.
 
-use remote_task_runner::error::ErrorCode;
-use remote_task_runner::forecast::answer_with;
-use remote_task_runner::forecast::plan::Ident;
-use remote_task_runner::ids::*;
-use remote_task_runner::storage::{AcceptedAttempt, NewAcceptance, WorkerStore};
-use remote_task_runner::wire::*;
+use belt::error::ErrorCode;
+use belt::forecast::answer_with;
+use belt::forecast::plan::Ident;
+use belt::ids::*;
+use belt::storage::{AcceptedAttempt, NewAcceptance, WorkerStore};
+use belt::wire::*;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -28,7 +28,7 @@ struct Fx {
 fn fx() -> Fx {
     Fx {
         dir: tempfile::Builder::new()
-            .prefix("rtr-forecast-")
+            .prefix("belt-forecast-")
             .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
             .unwrap(),
     }
@@ -123,7 +123,7 @@ fn accept(store: &WorkerStore, attempt: &AttemptId, node: &str) -> AcceptedAttem
         plan_digest: d.clone(),
         manifest_digest: d,
         permit_id: None,
-        commands: vec![remote_task_runner::wire::CommandSpec {
+        commands: vec![belt::wire::CommandSpec {
             setup_step: None,
             node_id: NodeId::parse(node).unwrap(),
             argv: vec!["true".into()],
@@ -158,7 +158,7 @@ fn accept(store: &WorkerStore, attempt: &AttemptId, node: &str) -> AcceptedAttem
 
 /// Register the attempt's only node in the ledger, as its supervisor would.
 fn register(ctx: &Context, attempt: &AttemptId, work: &Path) -> managed::OwnerGuard {
-    let id = remote_task_runner::supervisor::spec::command_id(attempt, 0);
+    let id = belt::supervisor::spec::command_id(attempt, 0);
     let spec = TtcSpec {
         command_id: id,
         spec_digest: "digest".into(),
@@ -376,14 +376,13 @@ fn a08_a_node_is_one_demand_before_it_registers_after_and_once_finished() {
     // The simulation's own report: the node is replaced by its ledger entry
     // and nothing of it is applied as overlay demand.
     let insp = inspect_with(&ctx, &cfg()).unwrap();
-    let nodes = remote_task_runner::forecast::plan::accepted_nodes(
+    let nodes = belt::forecast::plan::accepted_nodes(
         &b,
         &serde_json::from_value(attempts[0].spec.clone()).unwrap(),
         0,
     )
     .unwrap();
-    let (_, report) =
-        remote_task_runner::forecast::compute(&ctx, &insp, 1, &ident(), &req, &nodes).unwrap();
+    let (_, report) = belt::forecast::compute(&ctx, &insp, 1, &ident(), &req, &nodes).unwrap();
     assert_eq!(report.replaced_by_ledger, [format!("{b}/work")]);
     assert!(report.applied.is_empty());
 
@@ -448,9 +447,7 @@ fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
     let repository = "root:0123456789012345678901234567890123456789";
     let clone = state
         .join("clones")
-        .join(remote_task_runner::workspace::plan::clone_dir_name(
-            repository,
-        ));
+        .join(belt::workspace::plan::clone_dir_name(repository));
     std::fs::create_dir_all(&clone).unwrap();
     assert!(std::process::Command::new("git")
         .args(["init", "-q"])
@@ -523,7 +520,7 @@ fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
     }
     let before = snapshot(f.dir.path());
     for _ in 0..100 {
-        let result = remote_task_runner::forecast::answer_command(
+        let result = belt::forecast::answer_command(
             &f.traffic(),
             None,
             &state,
@@ -542,7 +539,7 @@ fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
     assert_eq!(before, snapshot(f.dir.path()));
     let mut missing = req.clone();
     missing.repository_id = Some("root:other".into());
-    let result = remote_task_runner::forecast::answer_command(
+    let result = belt::forecast::answer_command(
         &f.traffic(),
         None,
         &state,
@@ -557,7 +554,7 @@ fn command_forecast_100_reads_preserve_history_ledger_and_source_tree() {
     assert_eq!(result.target.execution_ms, None);
     assert_eq!(before, snapshot(f.dir.path()));
     missing.cwd_relative = "../outside".into();
-    assert!(remote_task_runner::forecast::answer_command(
+    assert!(belt::forecast::answer_command(
         &f.traffic(),
         None,
         &state,

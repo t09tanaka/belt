@@ -1,14 +1,12 @@
 //! Shared helpers for the protocol tests: a fake worker built on the public API.
 #![allow(dead_code)]
 
-use remote_task_runner::error::ApiError;
-use remote_task_runner::ids::*;
-use remote_task_runner::protocol::hello::WorkerIdentity;
-use remote_task_runner::protocol::transport::duplex_pair;
-use remote_task_runner::protocol::{
-    accept, connect, Accepted, ClientConfig, Connected, Incoming, ServerConfig,
-};
-use remote_task_runner::wire::*;
+use belt::error::ApiError;
+use belt::ids::*;
+use belt::protocol::hello::WorkerIdentity;
+use belt::protocol::transport::duplex_pair;
+use belt::protocol::{accept, connect, Accepted, ClientConfig, Connected, Incoming, ServerConfig};
+use belt::wire::*;
 use std::sync::Arc;
 use std::time::Duration;
 

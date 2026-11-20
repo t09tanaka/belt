@@ -2,9 +2,9 @@
 //! unit tests: forking from there races with other tests' lock files.
 
 use crate::common::RecordedMembers;
-use remote_task_runner::platform::{self, StartIdentity};
-use remote_task_runner::supervisor::identity::Leader;
-use remote_task_runner::supervisor::stop::*;
+use belt::platform::{self, StartIdentity};
+use belt::supervisor::identity::Leader;
+use belt::supervisor::stop::*;
 
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};

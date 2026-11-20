@@ -145,8 +145,8 @@ mod tests {
 
     #[test]
     fn a_missing_helper_is_unavailable_not_an_error() {
-        match acquire_with(&argv(&["rtr-no-such-helper-binary"])) {
-            Inhibit::Unavailable(why) => assert!(why.contains("rtr-no-such-helper-binary")),
+        match acquire_with(&argv(&["belt-no-such-helper-binary"])) {
+            Inhibit::Unavailable(why) => assert!(why.contains("belt-no-such-helper-binary")),
             Inhibit::Held(_) => panic!("must not hold"),
         }
         assert!(matches!(acquire_with(&[]), Inhibit::Unavailable(_)));
@@ -177,7 +177,7 @@ mod tests {
 
     #[test]
     fn acquire_on_this_os_is_held_or_explains_itself() {
-        match acquire("remote-task-runner", "test") {
+        match acquire("belt", "test") {
             Inhibit::Held(g) => assert!(!g.via().is_empty()),
             Inhibit::Unavailable(why) => assert!(!why.is_empty()),
         }

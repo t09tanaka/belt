@@ -52,7 +52,7 @@ fn unit() -> Unit {
     let plan = policy::render(&Definition {
         label: "org.example.worker".into(),
         mode: Mode::User { uid: 1000 },
-        executable: "/opt/rtr".into(),
+        executable: "/opt/belt".into(),
         arguments: vec!["worker".into()],
         environment: BTreeMap::new(),
         working_directory: "/cfg".into(),

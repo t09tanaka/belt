@@ -95,7 +95,7 @@ impl Host {
         let root = dir.path().to_owned();
         let home = root.join("h");
         fs::create_dir(&home).unwrap();
-        let exe = root.join("rtr");
+        let exe = root.join("belt");
         fs::write(&exe, b"pretend binary").unwrap();
         let digest = sha256_file(&exe).unwrap();
         let env = BTreeMap::from([
@@ -103,7 +103,7 @@ impl Host {
             ("PATH".to_string(), "/usr/bin:/bin".to_string()),
         ]);
         let fake = Fake::default();
-        fake.0.borrow_mut().state = home.join(".remote-task-runner");
+        fake.0.borrow_mut().state = home.join(".belt");
         fake.0.borrow_mut().backend = backend;
         Host {
             request: InstallRequest {
@@ -842,7 +842,7 @@ mod systemd {
             .collect();
         assert_eq!(units.len(), 1);
         let name = units[0].file_name().unwrap().to_str().unwrap().to_owned();
-        assert!(name.starts_with("io.github.t09tanaka.rtr.worker.") && name.ends_with(".service"));
+        assert!(name.starts_with("io.github.t09tanaka.belt.worker.") && name.ends_with(".service"));
         let unit = fs::read_to_string(&units[0]).unwrap();
         assert!(unit.contains(&format!(
             "ExecStart=\"{}\" \"worker\" \"--input\" \"{}\"\n",
@@ -908,13 +908,13 @@ fn the_journal_is_where_every_service_manager_keeps_it() {
             .collect()
     };
     let e = env(&[("HOME", "/h")]);
-    let want = PathBuf::from("/h/.config/remote-task-runner/worker-service.json");
+    let want = PathBuf::from("/h/.config/belt/worker-service.json");
     assert_eq!(Paths::journal_path(&e).unwrap(), want);
     for backend in [policy::Backend::Launchd, policy::Backend::Systemd] {
         assert_eq!(Paths::resolve_for(&e, backend).unwrap().journal, want);
     }
     let x = env(&[("HOME", "/h"), ("XDG_CONFIG_HOME", "/x")]);
-    let want = PathBuf::from("/x/remote-task-runner/worker-service.json");
+    let want = PathBuf::from("/x/belt/worker-service.json");
     assert_eq!(Paths::journal_path(&x).unwrap(), want);
     assert_eq!(
         Paths::resolve_for(&x, policy::Backend::Systemd)

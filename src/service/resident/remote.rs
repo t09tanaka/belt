@@ -132,7 +132,7 @@ pub(super) async fn forget(
 /// bare name for a registration made before the path was recorded.
 fn bridge_command(worker: &WorkerSpec) -> anyhow::Result<RemoteCommand> {
     Ok(RemoteCommand::worker_stdio(
-        worker.binary.as_deref().unwrap_or("remote-task-runner"),
+        worker.binary.as_deref().unwrap_or("belt"),
     )?)
 }
 

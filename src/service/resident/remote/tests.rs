@@ -21,7 +21,7 @@ fn config(text: &str) -> ResolvedConfig {
 fn local_only_startup_does_not_require_private_ssh_registration_config() {
     let root = crate::test_tmp::tempdir().unwrap();
     let env = BTreeMap::from([("XDG_CONFIG_HOME".into(), root.path().display().to_string())]);
-    let dir = root.path().join("remote-task-runner");
+    let dir = root.path().join("belt");
     private_dir(&dir).unwrap();
     let path = dir.join("config.toml");
     let text = "schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\n";
@@ -43,7 +43,7 @@ fn local_only_startup_does_not_require_private_ssh_registration_config() {
 fn registration_is_private_bounded_and_snapshotted_from_user_only() {
     let root = crate::test_tmp::tempdir().unwrap();
     let env = BTreeMap::from([("XDG_CONFIG_HOME".into(), root.path().display().to_string())]);
-    let dir = root.path().join("remote-task-runner");
+    let dir = root.path().join("belt");
     private_dir(&dir).unwrap();
     let path = dir.join("config.toml");
     let stale = config("schema_version=1\n[[workers]]\nid='stale'\nssh='stale-host'\n");
@@ -242,7 +242,7 @@ async fn stopped_handshake_reaps_only_its_owned_ssh_child() {
 async fn local_identity_conflict_is_rejected_before_resident_state_changes() {
     let root = crate::test_tmp::tempdir().unwrap();
     let env = BTreeMap::from([("XDG_CONFIG_HOME".into(), root.path().display().to_string())]);
-    let dir = root.path().join("remote-task-runner");
+    let dir = root.path().join("belt");
     private_dir(&dir).unwrap();
     let text = "schema_version=1\n[[workers]]\nid='local'\nssh='remote-alias'\n";
     let path = dir.join("config.toml");
@@ -383,7 +383,7 @@ async fn stopping_before_invalidation_rejects_late_ready_and_finishes_nested_ver
 }
 
 fn write_registration(root: &Path, text: &str) {
-    let dir = root.join(".config/remote-task-runner");
+    let dir = root.join(".config/belt");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("config.toml");
     std::fs::write(&path, text).unwrap();
@@ -401,13 +401,13 @@ fn a_reload_reads_the_registration_even_when_startup_had_no_remote_worker() {
     assert!(reload(&started, &env, &local).unwrap().workers.is_empty());
     write_registration(
         root.path(),
-        "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\nbinary='/w/bin/current/remote-task-runner'\n",
+        "schema_version=1\n[[workers]]\nid='remote-a'\nssh='peer-a'\nbinary='/w/bin/current/belt'\n",
     );
     let fresh = reload(&started, &env, &local).unwrap();
     assert_eq!(fresh.workers.len(), 1);
     assert_eq!(
         fresh.workers[0].binary.as_deref(),
-        Some("/w/bin/current/remote-task-runner")
+        Some("/w/bin/current/belt")
     );
     // The same refusals as startup.
     write_registration(
@@ -420,14 +420,11 @@ fn a_reload_reads_the_registration_even_when_startup_had_no_remote_worker() {
 #[test]
 fn the_bridge_runs_the_registered_absolute_binary_or_the_bare_name() {
     let c = config(
-        "schema_version=1\n[[workers]]\nid='a'\nssh='h'\nbinary='/w/my dir/rtr'\n[[workers]]\nid='b'\nssh='h'\n",
+        "schema_version=1\n[[workers]]\nid='a'\nssh='h'\nbinary='/w/my dir/belt'\n[[workers]]\nid='b'\nssh='h'\n",
     );
     let words = |w: &WorkerSpec| bridge_command(w).unwrap().shell_string();
-    assert_eq!(words(&c.workers[0]), "'/w/my dir/rtr' 'worker' '--stdio'");
-    assert_eq!(
-        words(&c.workers[1]),
-        "'remote-task-runner' 'worker' '--stdio'"
-    );
+    assert_eq!(words(&c.workers[0]), "'/w/my dir/belt' 'worker' '--stdio'");
+    assert_eq!(words(&c.workers[1]), "'belt' 'worker' '--stdio'");
 }
 
 #[tokio::test]

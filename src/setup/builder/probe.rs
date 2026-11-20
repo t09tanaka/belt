@@ -860,7 +860,7 @@ mod preparation_probe_tests {
     #[ignore = "explicit read-only manager calibration; requires owned fixture and manager path"]
     fn preparation_probe_calibration_real_manager_six_samples() {
         let manager = std::fs::canonicalize(
-            std::env::var_os("RTR_PROBE_CALIBRATION_MANAGER").expect("explicit manager required"),
+            std::env::var_os("BELT_PROBE_CALIBRATION_MANAGER").expect("explicit manager required"),
         )
         .unwrap();
         let mut f = Fixture::new();

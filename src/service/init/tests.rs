@@ -238,8 +238,8 @@ fn home_is_checked_only_through_the_paths_made_from_it() {
         ("XDG_CONFIG_HOME", &config),
     ]))
     .unwrap();
-    assert_eq!(paths.state, state.join("rtr/coordinator"));
-    assert_eq!(paths.worker, state.join("rtr/local-worker"));
+    assert_eq!(paths.state, state.join("belt/coordinator"));
+    assert_eq!(paths.worker, state.join("belt/local-worker"));
     assert!(paths.config.starts_with(&config));
     assert_eq!(paths.services, home.join("Library/LaunchAgents"));
     // XDG_* paths are held to the same rule on their own components.

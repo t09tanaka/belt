@@ -1,20 +1,20 @@
 use crate::proto_common as common;
 
-use common::*;
-use remote_task_runner::error::ErrorCode;
-use remote_task_runner::ids::*;
-use remote_task_runner::protocol::chunk::{ChunkReceiver, LogCursor};
-use remote_task_runner::protocol::frame::{encode, Body, Frame, MAX_FRAME_LEN};
-use remote_task_runner::protocol::io::{read_frame, write_frame};
-use remote_task_runner::protocol::mux::{run_writer, Outbox, Shared};
-use remote_task_runner::protocol::mux::{
+use belt::error::ErrorCode;
+use belt::ids::*;
+use belt::protocol::chunk::{ChunkReceiver, LogCursor};
+use belt::protocol::frame::{encode, Body, Frame, MAX_FRAME_LEN};
+use belt::protocol::io::{read_frame, write_frame};
+use belt::protocol::mux::{run_writer, Outbox, Shared};
+use belt::protocol::mux::{
     INBOUND_BULK_MAX_REQUESTS, INBOUND_CONTROL_MAX_REQUESTS, OUTBOX_CONTROL_MAX_FRAMES,
 };
-use remote_task_runner::protocol::sched::Outgoing;
-use remote_task_runner::protocol::transfer::{get_blob, put_blob, read_log, TransferError};
-use remote_task_runner::protocol::transport::duplex_pair;
-use remote_task_runner::protocol::{accept, connect, CallError, ConnectError, Unconfirmed};
-use remote_task_runner::wire::*;
+use belt::protocol::sched::Outgoing;
+use belt::protocol::transfer::{get_blob, put_blob, read_log, TransferError};
+use belt::protocol::transport::duplex_pair;
+use belt::protocol::{accept, connect, CallError, ConnectError, Unconfirmed};
+use belt::wire::*;
+use common::*;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -156,7 +156,7 @@ async fn a_lying_worker_answer_is_refused_by_the_coordinator() {
     };
     let mut resp = identity("w1").response(
         &cluster,
-        &remote_task_runner::protocol::hello::Negotiated {
+        &belt::protocol::hello::Negotiated {
             version: 77,
             features: vec![],
         },
@@ -259,7 +259,7 @@ async fn a_worker_error_comes_back_as_a_remote_error_not_unconfirmed() {
     serve(
         srv.incoming,
         Arc::new(|_| {
-            Some(Err(remote_task_runner::error::ApiError::new(
+            Some(Err(belt::error::ApiError::new(
                 ErrorCode::StaleEpoch,
                 "old",
             )))
@@ -412,7 +412,7 @@ fn blob_worker(state: Arc<Mutex<Option<ChunkReceiver>>>) -> Handler {
                     received: a.received,
                     complete: a.complete,
                 })),
-                Err(remote_task_runner::protocol::chunk::ChunkError::Gap { received }) => {
+                Err(belt::protocol::chunk::ChunkError::Gap { received }) => {
                     Ok(Response::BlobPut(BlobPutResponse {
                         schema_version: SchemaVersion::CURRENT,
                         digest: r.digest,
@@ -420,7 +420,7 @@ fn blob_worker(state: Arc<Mutex<Option<ChunkReceiver>>>) -> Handler {
                         complete: false,
                     }))
                 }
-                Err(e) => Err(remote_task_runner::error::ApiError::new(
+                Err(e) => Err(belt::error::ApiError::new(
                     ErrorCode::Conflict,
                     e.to_string(),
                 )),
@@ -701,7 +701,7 @@ const FLOOD_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
 const FLOOD_CALL_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Call `requests` at once on a worker that is not taking anything off its queues.
-fn start_flood(client: &remote_task_runner::protocol::Client, requests: Vec<Request>) -> Calls {
+fn start_flood(client: &belt::protocol::Client, requests: Vec<Request>) -> Calls {
     requests
         .into_iter()
         .map(|r| {
@@ -726,10 +726,7 @@ async fn wait_for_refusals(calls: &Calls, n: usize) {
 /// Drain until every caller has a result, rather than treating a quiet interval
 /// as proof that all requests arrived. Dropping each accepted request answers
 /// it INTERNAL; refused requests answer OVERLOADED.
-async fn finish_flood(
-    incoming: &mut remote_task_runner::protocol::Incoming,
-    calls: Calls,
-) -> (usize, usize) {
+async fn finish_flood(incoming: &mut belt::protocol::Incoming, calls: Calls) -> (usize, usize) {
     let total = calls.len();
     let mut pending = tokio::task::JoinSet::new();
     for call in calls {
@@ -1166,7 +1163,7 @@ impl std::io::Seek for BoundedUploadReader {
 }
 #[tokio::test]
 async fn streamed_upload_is_bounded_off_executor_and_follows_receiver_offsets() {
-    use remote_task_runner::protocol::transfer::put_blob_reader_as;
+    use belt::protocol::transfer::put_blob_reader_as;
     let data = pseudo_random(3 * 64 * 1024 + 17);
     let digest = Digest::of_bytes(&data);
     let source = SourceId::generate();
@@ -1224,7 +1221,7 @@ async fn streamed_upload_is_bounded_off_executor_and_follows_receiver_offsets() 
 }
 #[tokio::test]
 async fn streamed_upload_empty_stall_regression_and_changed_bytes_are_checked() {
-    use remote_task_runner::protocol::transfer::put_blob_reader_as;
+    use belt::protocol::transfer::put_blob_reader_as;
     let cluster = ClusterId::generate();
     let source = SourceId::generate();
     let (conn, srv) = pair(&cluster).await;
@@ -1314,7 +1311,7 @@ async fn streamed_upload_empty_stall_regression_and_changed_bytes_are_checked() 
 
 #[tokio::test]
 async fn streamed_upload_detects_file_mutation_between_chunks() {
-    use remote_task_runner::protocol::transfer::put_blob_reader_as;
+    use belt::protocol::transfer::put_blob_reader_as;
     use std::io::{Seek, SeekFrom, Write};
     use std::os::unix::fs::FileExt;
     for grows in [false, true] {
@@ -1413,7 +1410,7 @@ async fn output_bundle_feature_is_required_even_when_configs_clear_requirements(
     assert!(h.features.iter().any(|f| f == "output_bundles_v1"));
     let response = identity("w1").response(
         &cluster,
-        &remote_task_runner::protocol::hello::Negotiated {
+        &belt::protocol::hello::Negotiated {
             version: 1,
             features: vec![],
         },

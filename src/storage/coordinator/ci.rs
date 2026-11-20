@@ -412,7 +412,7 @@ impl CoordinatorStore {
             for id in &probe_ids {
                 let pending: bool = tx.query_row(
                     "SELECT EXISTS(SELECT 1 FROM task WHERE run_id=?1 AND task_id=?2
-                     AND json_extract(spec_json,'$.ci.task.inputs.rtr_discovery.applied')=0 AND coalesce(json_extract(spec_json,'$.ci.task.inputs.rtr_discovery.active_plan'),json_extract(spec_json,'$.plan_digest'))=?3)",
+                     AND json_extract(spec_json,'$.ci.task.inputs.belt_discovery.applied')=0 AND coalesce(json_extract(spec_json,'$.ci.task.inputs.belt_discovery.active_plan'),json_extract(spec_json,'$.plan_digest'))=?3)",
                     params![run, id.as_str(),previous], |r| r.get(0))?;
                 if !pending { return Ok(false); }
             }
@@ -433,10 +433,10 @@ impl CoordinatorStore {
                 }
             }
             for id in probe_ids {
-                tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.rtr_discovery.applied',json('true'),'$.ci.task.inputs.rtr_discovery.applied_plan',?3) WHERE run_id=?1 AND task_id=?2",
+                tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.belt_discovery.applied',json('true'),'$.ci.task.inputs.belt_discovery.applied_plan',?3) WHERE run_id=?1 AND task_id=?2",
                     params![run, id.as_str(),next])?;
             }
-            tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.rtr_discovery.active_plan',?2) WHERE run_id=?1 AND json_type(spec_json,'$.ci.task.inputs.rtr_discovery')='object'",params![run,next])?;
+            tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.belt_discovery.active_plan',?2) WHERE run_id=?1 AND json_type(spec_json,'$.ci.task.inputs.belt_discovery')='object'",params![run,next])?;
             common::append_event(tx,Some(&run),None,"ci_discovery_applied",&serde_json::json!({}),at_ms)?;
             Ok(true)
         })
@@ -458,8 +458,8 @@ impl CoordinatorStore {
         self.db.write(move |tx| {
             let changed = tx.execute(
                 &format!(
-                    "UPDATE task AS t SET spec_json=CASE WHEN json_type(t.spec_json,'$.ci.task.inputs.rtr_discovery')='object'
-                        THEN json_set(?2,'$.ci.task.inputs.rtr_discovery',json_extract(t.spec_json,'$.ci.task.inputs.rtr_discovery'))
+                    "UPDATE task AS t SET spec_json=CASE WHEN json_type(t.spec_json,'$.ci.task.inputs.belt_discovery')='object'
+                        THEN json_set(?2,'$.ci.task.inputs.belt_discovery',json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery'))
                         ELSE ?2 END WHERE t.task_id=?1 AND {HELD}
                      AND t.cancel_requested_at_ms IS NULL
                      AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))"

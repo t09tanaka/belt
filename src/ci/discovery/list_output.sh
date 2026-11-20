@@ -2,7 +2,7 @@ set -eu
 umask 077
 limit=$1
 shift
-dir=$(mktemp -d "${TMPDIR:-/tmp}/rtr-discovery.XXXXXXXX")
+dir=$(mktemp -d "${TMPDIR:-/tmp}/belt-discovery.XXXXXXXX")
 trap 'rm -f "$dir/out.pipe" "$dir/err.pipe" "$dir/out" "$dir/err"; rmdir "$dir"' EXIT
 trap 'exit 1' HUP INT TERM
 mkfifo "$dir/out.pipe" "$dir/err.pipe"
@@ -18,5 +18,5 @@ wait "$err_pid"
 out=$(wc -c <"$dir/out")
 err=$(wc -c <"$dir/err")
 [ "$((out + err))" -le "$limit" ] || exit 1
-printf 'rtr-list-v1 %d %d\n' "$out" "$err"
+printf 'belt-list-v1 %d %d\n' "$out" "$err"
 cat "$dir/out" "$dir/err"

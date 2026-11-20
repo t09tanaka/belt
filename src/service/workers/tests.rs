@@ -160,7 +160,7 @@ impl Remote for FakeRemote {
                 },
             );
         }
-        let (action, cancel) = if shell.starts_with("exec \"$HOME/.remote-task-runner-bootstrap/") {
+        let (action, cancel) = if shell.starts_with("exec \"$HOME/.belt-bootstrap/") {
             assert!(shell.ends_with("worker-service install"));
             (Action::Install, false)
         } else {
@@ -226,9 +226,9 @@ impl World {
         };
         let env = make_home("parent");
         let worker_env = make_home("worker");
-        let key_path = root.join("parent/.config/remote-task-runner/cluster.key");
+        let key_path = root.join("parent/.config/belt/cluster.key");
         crate::secrets::key::init(&key_path).unwrap();
-        let exe = root.join("rtr");
+        let exe = root.join("belt");
         fs::write(&exe, b"pretend binary").unwrap();
         let fake = Fake::default();
         fake.0.borrow_mut().state = WorkerPaths::resolve(&worker_env).unwrap().state;
@@ -471,7 +471,7 @@ fn a_named_build_is_what_is_sent_to_a_host_of_another_platform() {
     w.remote.os = "Linux";
     w.remote.machine = Some("x86_64");
     // The build for the worker: other bytes than the parent's own binary.
-    let build = w.exe.with_file_name("rtr-linux");
+    let build = w.exe.with_file_name("belt-linux");
     fs::write(&build, b"a build for the worker").unwrap();
     let result = w
         .add_with(
@@ -518,7 +518,7 @@ fn a_linux_parent_sends_its_own_binary_to_a_linux_host_of_its_architecture() {
 #[test]
 fn a_build_that_does_not_report_the_parents_version_is_removed_before_any_install() {
     for (code, said) in [
-        (0, "remote-task-runner 0.0.0-other\n"),
+        (0, "belt 0.0.0-other\n"),
         // It reports the right words and fails, or cannot run at all.
         (1, ""),
         (126, "cannot execute binary file\n"),
@@ -572,13 +572,13 @@ fn the_staging_commands_use_whichever_digest_tool_the_host_has() {
     assert!(stage_command(&digest).starts_with("set -eu;"));
     assert_eq!(
         version_command(&digest),
-        format!("exec \"$HOME/.remote-task-runner-bootstrap/rtr-{digest}\" --version")
+        format!("exec \"$HOME/.belt-bootstrap/belt-{digest}\" --version")
     );
     assert_eq!(
         unstage_command(&digest),
-        format!("rm -f \"$HOME/.remote-task-runner-bootstrap/rtr-{digest}\"")
+        format!("rm -f \"$HOME/.belt-bootstrap/belt-{digest}\"")
     );
-    assert!(own_version().starts_with("remote-task-runner "));
+    assert!(own_version().starts_with("belt "));
     assert!(own_version().contains(env!("CARGO_PKG_VERSION")));
 }
 
@@ -891,11 +891,11 @@ fn helper_commands_are_fixed_strings_without_names_or_paths() {
         600,
     );
     assert!(stop.contains("'worker-service' 'stop' '--wait-secs' '600' '--cancel-running'"));
-    assert!(stop.contains(&format!("rtr-{digest}")));
-    assert!(stop.contains("exec 'remote-task-runner'"));
+    assert!(stop.contains(&format!("belt-{digest}")));
+    assert!(stop.contains("exec 'belt'"));
     let plain = helper_command(None, &digest, Lifecycle::Drain, 600);
     assert!(!plain.contains("--cancel-running"));
-    assert!(stage_command(&digest).contains(&format!("rtr-{digest}.part")));
+    assert!(stage_command(&digest).contains(&format!("belt-{digest}.part")));
     assert!(install_command(&digest).ends_with("worker-service install"));
 }
 
@@ -998,7 +998,7 @@ fn add_install_records_the_absolute_binary_and_the_bridge_is_checked_with_it() {
     w.lifecycle("mini-a", Lifecycle::Drain).unwrap();
     let last = w.remote.log.last().unwrap();
     assert!(last.starts_with(&format!("exec '{binary}' 'worker-service' 'drain'")));
-    assert!(!last.contains("exec 'remote-task-runner'"));
+    assert!(!last.contains("exec 'belt'"));
 }
 
 #[test]
@@ -1075,12 +1075,12 @@ fn a_binary_that_cannot_be_recorded_is_reported() {
         "schema_version = 1\n[[workers]]\nid='mini-a'\nssh='h'\n",
     )
     .unwrap();
-    assert!(set_binary(&w.env, "mini-a", "/b/rtr").is_ok());
-    assert!(w.config_text().contains("binary = \"/b/rtr\""));
-    let error = set_binary(&w.env, "ghost", "/b/rtr").unwrap_err();
-    assert!(error.message.contains("binary = \"/b/rtr\""));
+    assert!(set_binary(&w.env, "mini-a", "/b/belt").is_ok());
+    assert!(w.config_text().contains("binary = \"/b/belt\""));
+    let error = set_binary(&w.env, "ghost", "/b/belt").unwrap_err();
+    assert!(error.message.contains("binary = \"/b/belt\""));
     // A relative path never reaches the file.
-    assert!(set_binary(&w.env, "mini-a", "rtr").is_err());
+    assert!(set_binary(&w.env, "mini-a", "belt").is_err());
 }
 
 #[test]
@@ -1089,7 +1089,7 @@ fn a_different_recorded_binary_is_a_conflict() {
     fs::create_dir_all(w.config.parent().unwrap()).unwrap();
     fs::write(
         &w.config,
-        "schema_version = 1\n[[workers]]\nid='mini-a'\nssh='ci@h'\nbinary='/elsewhere/rtr'\n",
+        "schema_version = 1\n[[workers]]\nid='mini-a'\nssh='ci@h'\nbinary='/elsewhere/belt'\n",
     )
     .unwrap();
     assert_eq!(
@@ -1147,10 +1147,10 @@ fn a_lifecycle_answer_from_another_cluster_is_refused() {
 #[test]
 fn helper_command_runs_a_registered_path_with_its_quoting() {
     let digest = "a".repeat(64);
-    let command = helper_command(Some("/w/my dir/rtr"), &digest, Lifecycle::Resume, 5);
+    let command = helper_command(Some("/w/my dir/belt"), &digest, Lifecycle::Resume, 5);
     assert_eq!(
         command,
-        "exec '/w/my dir/rtr' 'worker-service' 'resume' '--wait-secs' '5'"
+        "exec '/w/my dir/belt' 'worker-service' 'resume' '--wait-secs' '5'"
     );
 }
 
@@ -1190,19 +1190,19 @@ fn staging_publishes_only_a_binary_with_the_expected_digest() {
     // A cut-off transfer is removed and nothing is published.
     let cut = sh(&stage_command(&digest), home, &bytes[..5]);
     assert_eq!(cut.status.code(), Some(3));
-    let staging = home.join(".remote-task-runner-bootstrap");
-    assert!(!staging.join(format!("rtr-{digest}")).exists());
-    assert!(!staging.join(format!("rtr-{digest}.part")).exists());
+    let staging = home.join(".belt-bootstrap");
+    assert!(!staging.join(format!("belt-{digest}")).exists());
+    assert!(!staging.join(format!("belt-{digest}.part")).exists());
     // The whole transfer is published and probed as staged.
     let full = sh(&stage_command(&digest), home, &bytes);
     assert_eq!(full.status.code(), Some(0), "{:?}", full.stderr);
     assert_eq!(
-        fs::read(staging.join(format!("rtr-{digest}"))).unwrap(),
+        fs::read(staging.join(format!("belt-{digest}"))).unwrap(),
         bytes
     );
     assert!(probe(home).ends_with("staged\n"));
     // An executable with other content is not "staged".
-    fs::write(staging.join(format!("rtr-{digest}")), b"damaged").unwrap();
+    fs::write(staging.join(format!("belt-{digest}")), b"damaged").unwrap();
     assert!(probe(home).ends_with("absent\n"));
 }
 
@@ -1390,7 +1390,7 @@ fn parent_report() -> EnvReport {
             },
         )]),
         helpers: BTreeMap::from([(
-            "remote-task-runner".to_string(),
+            "belt".to_string(),
             Some(env!("CARGO_PKG_VERSION").to_string()),
         )]),
         docker: Docker::NotRunnable,
@@ -1416,7 +1416,7 @@ fn diff_asks_the_installed_worker_binary_and_compares_with_the_parent() {
     assert_eq!(diffs[0].worker, "mini-a");
     let get = |name: &str| diffs[0].items.iter().find(|i| i.subject == name).unwrap();
     // The helper measured the worker itself: its own version and a real disk.
-    assert_eq!(get("remote-task-runner").class, envdiff::Class::Same);
+    assert_eq!(get("belt").class, envdiff::Class::Same);
     assert_ne!(get("git").class, envdiff::Class::Same);
     assert!(get("disk").worker.is_some());
     assert!(!diffs[0].all_same);
@@ -1426,7 +1426,7 @@ fn diff_asks_the_installed_worker_binary_and_compares_with_the_parent() {
     assert!(!w.remote.log[0].contains("mini-a"));
     let text = render_diff(&diffs);
     assert!(text.starts_with("worker mini-a\n"));
-    assert!(text.contains("remote-task-runner"));
+    assert!(text.contains("belt"));
     assert!(text.contains("same"));
 }
 
@@ -1543,11 +1543,11 @@ fn diff_never_turns_a_bad_answer_into_a_difference() {
 #[test]
 fn the_env_command_is_fixed_with_or_without_a_registered_binary() {
     assert_eq!(
-        env_command(Some("/opt/rtr/bin"), "abc"),
-        "exec '/opt/rtr/bin' 'worker-service' 'env'"
+        env_command(Some("/opt/belt/bin"), "abc"),
+        "exec '/opt/belt/bin' 'worker-service' 'env'"
     );
     let staged = env_command(None, "abc");
-    assert!(staged.contains("rtr-abc"));
+    assert!(staged.contains("belt-abc"));
     assert!(staged.contains("'worker-service' 'env'"));
 }
 
@@ -2490,13 +2490,11 @@ fn the_staging_commands_run_in_a_real_shell() {
         )
     };
     // A script stands in for the binary: it is what `--version` runs.
-    let bytes = b"#!/bin/sh\necho 'remote-task-runner 9.9.9'\n";
+    let bytes = b"#!/bin/sh\necho 'belt 9.9.9'\n";
     let source = home.path().join("source");
     fs::write(&source, bytes).unwrap();
     let digest = worker_service::sha256_file(&source).unwrap();
-    let staged = home
-        .path()
-        .join(format!(".remote-task-runner-bootstrap/rtr-{digest}"));
+    let staged = home.path().join(format!(".belt-bootstrap/belt-{digest}"));
     let last = |text: &str| text.lines().last().unwrap_or("").to_string();
 
     let (code, probe) = sh(&probe_command(&digest), b"");
@@ -2520,10 +2518,7 @@ fn the_staging_commands_run_in_a_real_shell() {
     let parsed = target::parse_probe(&probe);
     assert!(parsed.staged && !parsed.system.is_empty() && !parsed.machine.is_empty());
     let (code, version) = sh(&version_command(&digest), b"");
-    assert_eq!(
-        (code, version.as_str()),
-        (Some(0), "remote-task-runner 9.9.9\n")
-    );
+    assert_eq!((code, version.as_str()), (Some(0), "belt 9.9.9\n"));
     // A copy whose content changed is not the staged binary.
     fs::write(&staged, b"tampered").unwrap();
     assert_eq!(last(&sh(&probe_command(&digest), b"").1), "absent");

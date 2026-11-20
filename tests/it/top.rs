@@ -3,11 +3,9 @@
 fn top_refreshes_the_live_task_and_restores_the_terminal_on_each_quit_key() {
     let (_root, spec, input) = super::bootstrap::control_fixture_with(|spec| {
         // An initialized client pins its cluster before observing its resident.
-        let store = remote_task_runner::storage::CoordinatorStore::open(
-            &spec.state_dir,
-            remote_task_runner::platform::wall_ms(),
-        )
-        .unwrap();
+        let store =
+            belt::storage::CoordinatorStore::open(&spec.state_dir, belt::platform::wall_ms())
+                .unwrap();
         spec.expected_cluster = Some(store.cluster_id().clone());
     });
     let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/it/top_pty.py");

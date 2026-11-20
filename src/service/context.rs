@@ -146,7 +146,7 @@ pub fn runtime_spec(env: &BTreeMap<String, String>) -> Result<Spec, ApiError> {
     {
         return Err(ApiError::new(
             ErrorCode::NotFound,
-            "coordinator is not initialized; run remote-task-runner init",
+            "coordinator is not initialized; run belt init",
         ));
     }
     let spec = super::bootstrap::read_input(&input).map_err(|e| {

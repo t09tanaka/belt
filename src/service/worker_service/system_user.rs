@@ -146,7 +146,10 @@ fn receipt(plan: &policy::Plan) -> anyhow::Result<Receipt> {
 /// operation. It renders the unit from explicit inputs and the OS account
 /// database. It never reads a service definition from the worker account.
 fn register(username: &str, config: &Path) -> anyhow::Result<PathBuf> {
-    ensure!(euid() == 0, "system registration requires an administrator running a trusted copy of remote-task-runner");
+    ensure!(
+        euid() == 0,
+        "system registration requires an administrator running a trusted copy of belt"
+    );
     let account = macos::NativeAccounts
         .lookup(username)
         .map_err(anyhow::Error::msg)?
@@ -342,7 +345,7 @@ mod tests {
 
     #[test]
     fn a_system_definition_preserves_a_literal_specifier_and_refuses_an_injected_line() {
-        let dir = Path::new("/home/build/100%/remote-task-runner");
+        let dir = Path::new("/home/build/100%/belt");
         for backend in [policy::Backend::Launchd, policy::Backend::Systemd] {
             let plan = fixture_plan(backend, dir);
             let cli = <crate::cli::Cli as clap::Parser>::try_parse_from(plan.arguments()).unwrap();
@@ -357,8 +360,8 @@ mod tests {
             };
             assert!(plan
                 .plist()
-                .contains(&format!("/{represented}/remote-task-runner/worker.json")));
-            let injected = Path::new("/home/build/injected\nUser=root/remote-task-runner");
+                .contains(&format!("/{represented}/belt/worker.json")));
+            let injected = Path::new("/home/build/injected\nUser=root/belt");
             assert!(service_plan(
                 backend,
                 injected,
@@ -377,7 +380,7 @@ mod tests {
     fn system_registration_is_stable_across_worker_versions_and_checks_the_owned_definition() {
         for backend in [policy::Backend::Launchd, policy::Backend::Systemd] {
             let directory = crate::test_tmp::tempdir().unwrap();
-            let config = Path::new("/home/build/.config/remote-task-runner");
+            let config = Path::new("/home/build/.config/belt");
             let plan = fixture_plan(backend, config);
             let path = publish_definition(directory.path(), &plan, euid()).unwrap();
             assert_eq!(path.file_name().unwrap().to_str().unwrap(), plan.filename());

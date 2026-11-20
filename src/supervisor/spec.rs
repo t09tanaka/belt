@@ -385,7 +385,7 @@ fn private_to(owner: u32, mode: u32, user: u32) -> bool {
 /// used; the same attempt and node always give the same id (registration is
 /// idempotent on it).
 pub fn command_id(attempt: &AttemptId, index: usize) -> String {
-    format!("rtr-{attempt}-{index}")
+    format!("belt-{attempt}-{index}")
 }
 
 /// A digest of what the node runs, so a registration of the same id with a

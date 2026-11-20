@@ -3,25 +3,25 @@
 
 use crate::proto_common as common;
 
+use belt::ids::*;
+use belt::protocol::ssh::{ssh_argv, RemoteCommand, SshTarget};
+use belt::protocol::transport::{listen_unix, spawn_child, Io};
+use belt::protocol::{accept, connect};
 use common::*;
-use remote_task_runner::ids::*;
-use remote_task_runner::protocol::ssh::{ssh_argv, RemoteCommand, SshTarget};
-use remote_task_runner::protocol::transport::{listen_unix, spawn_child, Io};
-use remote_task_runner::protocol::{accept, connect};
 use std::process::Stdio;
 use std::sync::Arc;
 
 /// Unix socket paths are limited to about 100 bytes; the default temp
 /// directory can exceed that on macOS.
 fn short_tempdir() -> tempfile::TempDir {
-    crate::test_tmp::prefixed("rtr").unwrap()
+    crate::test_tmp::prefixed("belt").unwrap()
 }
 
-const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
+const BIN: &str = env!("CARGO_BIN_EXE_belt");
 
-/// An agent on `<home>/.remote-task-runner/agent.sock` that answers ack requests.
+/// An agent on `<home>/.belt/agent.sock` that answers ack requests.
 fn start_agent(home: &std::path::Path, cluster: &ClusterId) {
-    let sock = home.join(".remote-task-runner").join("agent.sock");
+    let sock = home.join(".belt").join("agent.sock");
     let listener = listen_unix(&sock).unwrap();
     let cluster = cluster.clone();
     tokio::spawn(async move {
@@ -103,7 +103,7 @@ async fn the_ssh_command_line_reaches_the_bridge_through_a_remote_shell() {
     let tools = short_tempdir();
     let dir = tools.path().join("it's a dir");
     std::fs::create_dir_all(&dir).unwrap();
-    let wrapper = dir.join("rtr wrapper.sh");
+    let wrapper = dir.join("belt wrapper.sh");
     crate::common::write_executable(
         &wrapper,
         &format!(
@@ -156,7 +156,7 @@ fn a_non_utf8_environment_does_not_crash_the_bridge() {
     let out = assert_cmd::Command::new(BIN)
         .args(["worker", "--stdio"])
         .env("HOME", home.path())
-        .env("RTR_TEST_JUNK", &junk)
+        .env("BELT_TEST_JUNK", &junk)
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(73), "{:?}", out.status);
@@ -177,7 +177,7 @@ fn a_non_utf8_environment_does_not_crash_the_bridge() {
 #[tokio::test]
 async fn the_bridge_exits_when_the_agent_closes_even_if_stdin_stays_open() {
     let home = short_tempdir();
-    let sock = home.path().join(".remote-task-runner").join("agent.sock");
+    let sock = home.path().join(".belt").join("agent.sock");
     let listener = listen_unix(&sock).unwrap();
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();

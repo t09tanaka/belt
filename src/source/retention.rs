@@ -1774,7 +1774,7 @@ mod tests {
     #[test]
     #[ignore = "owned SQLite lock probe subprocess"]
     fn source_index_writer_probe_child() {
-        let path = std::env::var_os("RTR_SOURCE_INDEX_PROBE").expect("private probe database");
+        let path = std::env::var_os("BELT_SOURCE_INDEX_PROBE").expect("private probe database");
         let db = Connection::open_with_flags(
             Path::new(&path),
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
@@ -1784,12 +1784,12 @@ mod tests {
         match db.execute_batch("BEGIN IMMEDIATE") {
             Ok(()) => {
                 db.execute_batch("ROLLBACK").unwrap();
-                println!("RTR_INDEX_PROBE=ACQUIRED");
+                println!("BELT_INDEX_PROBE=ACQUIRED");
             }
             Err(rusqlite::Error::SqliteFailure(error, _))
                 if error.code == rusqlite::ErrorCode::DatabaseBusy =>
             {
-                println!("RTR_INDEX_PROBE=BUSY");
+                println!("BELT_INDEX_PROBE=BUSY");
             }
             other => panic!("unexpected SQLite lock probe: {other:?}"),
         }
@@ -1829,7 +1829,7 @@ mod tests {
                     "--ignored",
                     "--nocapture",
                 ])
-                .env("RTR_SOURCE_INDEX_PROBE", path)
+                .env("BELT_SOURCE_INDEX_PROBE", path)
                 .output()
                 .unwrap();
             assert!(output.status.success(), "{output:?}");
@@ -1838,22 +1838,22 @@ mod tests {
         let f = Fixture::new();
         let first = f.store.retention.connect().unwrap();
         first.execute_batch("BEGIN IMMEDIATE").unwrap();
-        assert!(probe(&f.store.retention.database).contains("RTR_INDEX_PROBE=BUSY"));
+        assert!(probe(&f.store.retention.database).contains("BELT_INDEX_PROBE=BUSY"));
         // The schema is already initialized. Opening it succeeds while the
         // writer is active and never releases that writer's exclusion.
         let reopened = Index::open(f.store.root()).unwrap();
         drop(reopened);
         assert!(!first.is_autocommit());
         let after = probe(&f.store.retention.database);
-        assert!(after.contains("RTR_INDEX_PROBE=BUSY"), "{after}");
+        assert!(after.contains("BELT_INDEX_PROBE=BUSY"), "{after}");
         first.execute_batch("ROLLBACK").unwrap();
-        assert!(probe(&f.store.retention.database).contains("RTR_INDEX_PROBE=ACQUIRED"));
+        assert!(probe(&f.store.retention.database).contains("BELT_INDEX_PROBE=ACQUIRED"));
     }
     #[test]
     #[ignore = "owned helper subprocess"]
     fn source_lock_child() {
         use std::io::{Read, Write};
-        let state = std::env::var_os("RTR_SOURCE_LOCK_HELPER").expect("helper path");
+        let state = std::env::var_os("BELT_SOURCE_LOCK_HELPER").expect("helper path");
         let store = SourceStore::open(Path::new(&state)).unwrap();
         let _guard = store.mutation_guard().unwrap();
         println!("READY");
@@ -1872,7 +1872,7 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("RTR_SOURCE_LOCK_HELPER", &f.state)
+            .env("BELT_SOURCE_LOCK_HELPER", &f.state)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -3202,13 +3202,13 @@ mod tests {
                 "--ignored",
                 "--nocapture",
             ])
-            .env("RTR_SOURCE_INDEX_PROBE", &path)
+            .env("BELT_SOURCE_INDEX_PROBE", &path)
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");
         assert!(String::from_utf8(output.stdout)
             .unwrap()
-            .contains("RTR_INDEX_PROBE=BUSY"));
+            .contains("BELT_INDEX_PROBE=BUSY"));
         writer.execute_batch("ROLLBACK").unwrap();
     }
     #[test]

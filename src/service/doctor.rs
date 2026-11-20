@@ -387,7 +387,7 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
             "traffic_runtime",
             Level::Fail,
             format!(
-                "{} does not know managed entries (no `ledger_format` in `status --json`); drain its jobs ({}) and update it before it shares a scope with remote-task-runner",
+                "{} does not know managed entries (no `ledger_format` in `status --json`); drain its jobs ({}) and update it before it shares a scope with belt",
                 cli.path,
                 match facts.cli_scope.ledger_entries {
                     Some(n) => format!("{n} in its ledger"),
@@ -826,7 +826,7 @@ pub fn diff_checks(host: &str, measured: Result<&[Item], &str>) -> Vec<Check> {
             }
             match item.class {
                 Class::AutoInstallable => detail.push_str(&format!(
-                    " (an exec installs it; `remote-task-runner workers sync {host}` installs it now)"
+                    " (an exec installs it; `belt workers sync {host}` installs it now)"
                 )),
                 Class::NotMeasured => detail.push_str(" (not measured yet)"),
                 _ => {}
@@ -959,11 +959,7 @@ fn look_at_ephemeral(
     let hello = SshTarget::parse(&worker.ssh)
         .map_err(|e| e.to_string())
         .and_then(|target| {
-            remote.bridge_hello(
-                &target,
-                worker.binary.as_deref().unwrap_or("remote-task-runner"),
-                cluster,
-            )
+            remote.bridge_hello(&target, worker.binary.as_deref().unwrap_or("belt"), cluster)
         });
     let (level, detail) = match hello {
         Ok((answered_cluster, answered_worker))

@@ -68,7 +68,7 @@ fn start(args: &Args) -> anyhow::Result<()> {
     let resident = std::fs::symlink_metadata(Paths::journal_path(&env)?).is_ok();
     let state_exists = env
         .get("HOME")
-        .map(|h| Path::new(h).join(".remote-task-runner"))
+        .map(|h| Path::new(h).join(".belt"))
         .is_some_and(|p| std::fs::symlink_metadata(p).is_ok());
     let planned = plan::plan(
         &plan::Request {

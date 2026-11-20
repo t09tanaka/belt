@@ -10,7 +10,7 @@ use crate::error::ErrorCode;
 pub const SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Parser)]
-#[command(name = "remote-task-runner", version, about)]
+#[command(name = "belt", version, about)]
 pub struct Cli {
     /// Print a structured result on stdout (progress and diagnostics go to stderr).
     #[arg(long, global = true)]
@@ -1011,16 +1011,16 @@ mod estimate_args_tests {
     #[test]
     fn frozen_task_conflicts_with_execution_overrides_and_raw_command_stays_required() {
         assert!(
-            Cli::try_parse_from(["rtr", "estimate", "--task", "task_example", "--json"]).is_ok()
+            Cli::try_parse_from(["belt", "estimate", "--task", "task_example", "--json"]).is_ok()
         );
-        assert!(Cli::try_parse_from(["rtr", "estimate", "--", "echo", "hello"]).is_ok());
-        assert!(Cli::try_parse_from(["rtr", "estimate"]).is_err());
+        assert!(Cli::try_parse_from(["belt", "estimate", "--", "echo", "hello"]).is_ok());
+        assert!(Cli::try_parse_from(["belt", "estimate"]).is_err());
         for extra in [
             vec!["--profile", "p"],
             vec!["--requires", "node"],
             vec!["--", "echo"],
         ] {
-            let mut args = vec!["rtr", "estimate", "--task", "task_example"];
+            let mut args = vec!["belt", "estimate", "--task", "task_example"];
             args.extend(extra);
             assert!(Cli::try_parse_from(args).is_err());
         }

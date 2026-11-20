@@ -230,7 +230,7 @@ impl Bundle {
                     .rsplit_once('/')
                     .ok_or_else(|| invalid("missing parent"))?;
                 let directory = walk(root, parent)?;
-                let temp = format!(".rtr-export-{}", crate::ids::AttemptId::generate());
+                let temp = format!(".belt-export-{}", crate::ids::AttemptId::generate());
                 let mut output: File = openat(
                     &directory,
                     &temp,
@@ -528,12 +528,12 @@ mod tests {
         for path in [
             ".git/config",
             "a/.git/config",
-            ".remote-task-runner/token",
-            "a/.remote-task-runner/token",
+            ".belt/token",
+            "a/.belt/token",
             "a/.GiT/config",
             "a/.g\u{200d}it/config",
-            "a/.remote-task-runner\u{feff}/token",
-            "a/.REMOTE-TASK-RUNNER/token",
+            "a/.belt\u{feff}/token",
+            "a/.BELT/token",
         ] {
             // A valid member preceding the malicious member must not become visible.
             let bytes = tar(&[("ordinary", b"ok", b'0'), (path, b"private", b'0')]);

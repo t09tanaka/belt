@@ -657,14 +657,14 @@ mod tests {
                 &step(),
                 control(
                     ErrorCode::ProtocolIncompatible,
-                    "run remote-task-runner workers upgrade w\n",
+                    "run belt workers upgrade w\n",
                 ),
                 begun,
             ) else {
                 panic!()
             };
             assert_eq!(e.code, ErrorCode::ProtocolIncompatible);
-            assert_eq!(e.message, "run remote-task-runner workers upgrade w");
+            assert_eq!(e.message, "run belt workers upgrade w");
             assert!(matches!(
                 look(&step(), control(ErrorCode::StaleEpoch, "x"), begun),
                 Look::Stop(_)

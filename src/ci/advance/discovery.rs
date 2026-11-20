@@ -4,7 +4,7 @@ use crate::ci::discovery::{apply, DiscoveryStep, WorkerListing};
 use local_ci::shard::adapters::Isolation;
 
 pub(super) fn metadata(row: &CiTaskRow) -> Option<&serde_json::Value> {
-    row.spec.pointer("/ci/task/inputs/rtr_discovery")
+    row.spec.pointer("/ci/task/inputs/belt_discovery")
 }
 
 pub(super) fn is_probe(row: &CiTaskRow) -> bool {

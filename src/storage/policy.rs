@@ -56,7 +56,7 @@ pub enum SchemaPlan {
 /// Why the file cannot be used. None of these modify the file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Incompat {
-    /// Not a remote-task-runner database.
+    /// Not a belt database.
     Foreign,
     /// Read-only access to a database that has no schema yet.
     Empty,

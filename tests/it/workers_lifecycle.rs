@@ -2,13 +2,13 @@
 //! PATH. The fake never starts a remote helper, so no launchctl, LaunchAgent,
 //! ~/.ssh or sudo is involved. Remote install/start/stop with a fake launcher
 //! is covered in the library tests of the service modules.
-use remote_task_runner::error::ErrorCode;
-use remote_task_runner::ids::{ClusterId, WorkerId};
+use belt::error::ErrorCode;
+use belt::ids::{ClusterId, WorkerId};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::Output;
 
-const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
+const BIN: &str = env!("CARGO_BIN_EXE_belt");
 
 pub(super) struct Fx {
     dir: super::common::Tmp,
@@ -33,8 +33,8 @@ impl Fx {
         &self,
         env: std::collections::BTreeMap<String, String>,
     ) -> ClusterId {
-        use remote_task_runner::service::bootstrap::{write_input, Spec};
-        let dir = self.path("home/.config/remote-task-runner");
+        use belt::service::bootstrap::{write_input, Spec};
+        let dir = self.path("home/.config/belt");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         let private = |name: &str| {
@@ -43,11 +43,12 @@ impl Fx {
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
             path
         };
-        remote_task_runner::secrets::key::init(&self.path("cluster.key")).unwrap();
-        std::fs::write(self.path("rtr"), b"x").unwrap();
-        std::fs::set_permissions(self.path("rtr"), std::fs::Permissions::from_mode(0o700)).unwrap();
+        belt::secrets::key::init(&self.path("cluster.key")).unwrap();
+        std::fs::write(self.path("belt"), b"x").unwrap();
+        std::fs::set_permissions(self.path("belt"), std::fs::Permissions::from_mode(0o700))
+            .unwrap();
         let state_dir = private("coordinator");
-        let cluster = remote_task_runner::storage::CoordinatorStore::open(&state_dir, 1)
+        let cluster = belt::storage::CoordinatorStore::open(&state_dir, 1)
             .unwrap()
             .cluster_id()
             .clone();
@@ -56,7 +57,7 @@ impl Fx {
             worker_state_dir: private("local-worker"),
             worker_id: WorkerId::parse("local").unwrap(),
             cluster_key_path: self.path("cluster.key"),
-            executable: self.path("rtr"),
+            executable: self.path("belt"),
             env,
             repo_root: None,
             expected_cluster: Some(cluster.clone()),
@@ -66,7 +67,7 @@ impl Fx {
         cluster
     }
     pub(super) fn config(&self, text: &str) {
-        let dir = self.path("home/.config/remote-task-runner");
+        let dir = self.path("home/.config/belt");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("config.toml"), text).unwrap();
     }
@@ -233,7 +234,7 @@ fn add_needs_an_initialized_coordinator_and_changes_nothing_without_it() {
     let out = fx.run(&["workers", "add", "mini-a", "--ssh", "ci@h", "--install"]);
     assert_eq!(out.status.code(), Some(ErrorCode::NotFound.exit_code()));
     assert!(!fx.path("argv").exists());
-    assert!(!Path::new(&fx.path("home/.config/remote-task-runner/config.toml")).exists());
+    assert!(!Path::new(&fx.path("home/.config/belt/config.toml")).exists());
 }
 
 #[test]
@@ -290,7 +291,7 @@ fn an_answer_that_does_not_show_the_requested_state_is_not_reported_as_success()
 
 mod a44 {
     use super::*;
-    use remote_task_runner::toolchain::envdiff::{Docker, EnvReport, Managed, Observed, ToolFact};
+    use belt::toolchain::envdiff::{Docker, EnvReport, Managed, Observed, ToolFact};
     use std::collections::BTreeMap;
 
     fn shim(dir: &Path, name: &str, body: &str) {
@@ -351,7 +352,7 @@ mod a44 {
                 ("xcode".to_string(), tool(Observed::Unavailable, None, None)),
             ]),
             helpers: BTreeMap::from([(
-                "remote-task-runner".to_string(),
+                "belt".to_string(),
                 Some(env!("CARGO_PKG_VERSION").to_string()),
             )]),
             docker: Docker::NotRunnable,
@@ -416,7 +417,7 @@ mod a44 {
         assert!(docker["steps"].as_str().unwrap().contains("Colima"));
         // The built-in tools are compared by this binary's build, not by an
         // external `--version`.
-        assert_eq!(item(&value, "remote-task-runner")["class"], "same");
+        assert_eq!(item(&value, "belt")["class"], "same");
         assert!(!has_item(&value, "local-ci"));
         assert!(!has_item(&value, "task-traffic-controller"));
         assert_eq!(item(&value, "platform")["class"], "same");

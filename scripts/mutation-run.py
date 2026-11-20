@@ -68,8 +68,8 @@ def main():
     # Keep Unix socket paths short. A mutation of PID classification must
     # never sweep another test process's live fixture. The unmodified driver
     # owns cleanup, including leftovers from killed or timed-out mutants.
-    with tempfile.TemporaryDirectory(dir="/tmp", prefix="rtr-m-") as fixtures, (output / "run.log").open("w") as log:
-        env = dict(os.environ, RTR_MUTATION_FIXTURE_PARENT=fixtures)
+    with tempfile.TemporaryDirectory(dir="/tmp", prefix="belt-m-") as fixtures, (output / "run.log").open("w") as log:
+        env = dict(os.environ, BELT_MUTATION_FIXTURE_PARENT=fixtures)
         result = subprocess.Popen(command, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
         for line in result.stdout:
             log.write(line)

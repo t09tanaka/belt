@@ -24,7 +24,7 @@ pub fn workspace_dir(workspaces_root: &Path, attempt: &AttemptId) -> PathBuf {
 
 /// The branch of an attempt's worktree in the canonical clone.
 pub fn branch_name(attempt: &AttemptId) -> String {
-    format!("rtr/{}", attempt.as_str())
+    format!("belt/{}", attempt.as_str())
 }
 
 /// The directory name of the canonical clone of a repository: derived from the
@@ -335,7 +335,7 @@ mod tests {
             workspace_dir(Path::new("/s/workspaces"), &att()),
             PathBuf::from("/s/workspaces/att_01J0000000000000000000000A")
         );
-        assert_eq!(branch_name(&att()), "rtr/att_01J0000000000000000000000A");
+        assert_eq!(branch_name(&att()), "belt/att_01J0000000000000000000000A");
     }
 
     #[test]
@@ -541,7 +541,7 @@ mod tests {
             (cl.join("r-ab"), "main".to_string()),
             (
                 cl.join("r-ab"),
-                "rtr/att_01J0000000000000000000000B".to_string(),
+                "belt/att_01J0000000000000000000000B".to_string(),
             ),
         ] {
             let e = check_worktree_record(cl, &clone, &branch, &a).unwrap_err();

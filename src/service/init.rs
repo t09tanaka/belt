@@ -98,7 +98,7 @@ impl Paths {
             .filter(|x| Path::new(x).is_absolute())
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join(".local/state"))
-            .join("rtr");
+            .join("belt");
         let services = services_dir(backend, &home, &config)?;
         // Every path that is used is checked, before anything is created. HOME
         // is judged only through the paths made from it: a state or
@@ -461,7 +461,7 @@ fn service_inputs_observable(paths: &Paths, env: &BTreeMap<String, String>) -> a
 }
 fn plan(paths: &Paths, j: &Journal) -> anyhow::Result<macos::policy::Plan> {
     let label = format!(
-        "io.github.t09tanaka.rtr.local.{}.{}",
+        "io.github.t09tanaka.belt.local.{}.{}",
         j.uid,
         &format!(
             "{:x}",
@@ -503,7 +503,7 @@ fn validate_journal(j: &Journal, p: &Paths, uid: u32, digest: &str) -> anyhow::R
         "installed binary differs; upgrade required (installed version retained)"
     );
     ensure!(
-        j.spec.executable == p.config.join("bin").join(digest).join("remote-task-runner")
+        j.spec.executable == p.config.join("bin").join(digest).join("belt")
             && j.spec.state_dir == p.state
             && j.spec.worker_state_dir == p.worker
             && j.spec.cluster_key_path == p.key
@@ -616,11 +616,7 @@ async fn initialize_with_durability<L: Launcher>(
                 worker_state_dir: paths.worker.clone(),
                 worker_id: WorkerId::parse(&format!("local-{}", ulid::Ulid::new()))?,
                 cluster_key_path: paths.key.clone(),
-                executable: paths
-                    .config
-                    .join("bin")
-                    .join(&digest)
-                    .join("remote-task-runner"),
+                executable: paths.config.join("bin").join(&digest).join("belt"),
                 env,
                 repo_root: Some(paths.config.clone()),
                 expected_cluster: Some(cluster.clone()),

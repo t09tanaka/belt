@@ -1,17 +1,15 @@
 //! Private IPC and real local-worker composition; no process bootstrap claim.
-use remote_task_runner::config::runtime::WorkerInputs;
-use remote_task_runner::config::{resolve, Inputs as ConfigInputs, Overlay, ResolvedConfig};
-use remote_task_runner::coordinator::TaskSpec;
-use remote_task_runner::ids::*;
-use remote_task_runner::platform::wall_ms;
-use remote_task_runner::results::CollectConfig;
-use remote_task_runner::service::resident::{
-    Inputs, Operation, Reply, Request, Resident, MAX_REQUEST_BYTES,
-};
-use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
-use remote_task_runner::state::Outcome;
-use remote_task_runner::storage::CoordinatorStore;
-use remote_task_runner::wire::{CommandSpec, LogStream};
+use belt::config::runtime::WorkerInputs;
+use belt::config::{resolve, Inputs as ConfigInputs, Overlay, ResolvedConfig};
+use belt::coordinator::TaskSpec;
+use belt::ids::*;
+use belt::platform::wall_ms;
+use belt::results::CollectConfig;
+use belt::service::resident::{Inputs, Operation, Reply, Request, Resident, MAX_REQUEST_BYTES};
+use belt::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+use belt::state::Outcome;
+use belt::storage::CoordinatorStore;
+use belt::wire::{CommandSpec, LogStream};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -20,7 +18,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 
 fn root() -> tempfile::TempDir {
-    crate::test_tmp::prefixed("rtr-res-").unwrap()
+    crate::test_tmp::prefixed("belt-res-").unwrap()
 }
 fn config() -> ResolvedConfig {
     let mut c = resolve(&ConfigInputs {
@@ -35,14 +33,14 @@ fn config() -> ResolvedConfig {
     c
 }
 fn inputs(root: &Path) -> Inputs {
-    remote_task_runner::secrets::key::init(&root.join("key")).unwrap();
+    belt::secrets::key::init(&root.join("key")).unwrap();
     Inputs {
         state_dir: root.join("parent-state"),
         worker: WorkerInputs {
             state_dir: root.join("worker"),
             worker_id: WorkerId::parse("local").unwrap(),
             boot_id: WorkerBootId::parse("boot-test").unwrap(),
-            supervisor_exe: env!("CARGO_BIN_EXE_remote-task-runner").into(),
+            supervisor_exe: env!("CARGO_BIN_EXE_belt").into(),
             cluster_key_path: root.join("key"),
             env: BTreeMap::from([
                 ("PATH".into(), "/usr/bin:/bin".into()),
@@ -56,7 +54,7 @@ fn inputs(root: &Path) -> Inputs {
     }
 }
 async fn stop(
-    client: &remote_task_runner::service::resident::Client,
+    client: &belt::service::resident::Client,
     task: tokio::task::JoinHandle<anyhow::Result<()>>,
 ) {
     assert!(matches!(
@@ -111,17 +109,17 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
         ci: None,
         toolchains: None,
         outputs: vec![
-            remote_task_runner::wire::OutputDecl {
+            belt::wire::OutputDecl {
                 name: "bundle".into(),
                 paths: vec!["reports/**".into(), "coverage/**".into(), "reports".into()],
-                if_missing: remote_task_runner::wire::MissingPolicy::Required,
-                when: remote_task_runner::wire::OutputWhen::Success,
+                if_missing: belt::wire::MissingPolicy::Required,
+                when: belt::wire::OutputWhen::Success,
             },
-            remote_task_runner::wire::OutputDecl {
+            belt::wire::OutputDecl {
                 name: "unsafe".into(),
                 paths: vec!["forbidden".into()],
-                if_missing: remote_task_runner::wire::MissingPolicy::Optional,
-                when: remote_task_runner::wire::OutputWhen::Always,
+                if_missing: belt::wire::MissingPolicy::Optional,
+                when: belt::wire::OutputWhen::Always,
             },
         ],
         requirements: Default::default(),
@@ -148,7 +146,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: false,
-        artifacts: vec![remote_task_runner::wire::ArtifactDecl { name:"raw".into(), path:"input.txt".into(), if_missing:remote_task_runner::wire::MissingPolicy::Required }],
+        artifacts: vec![belt::wire::ArtifactDecl { name:"raw".into(), path:"input.txt".into(), if_missing:belt::wire::MissingPolicy::Required }],
     };
     let submitter = client.clone();
     let reply = submitter
@@ -192,15 +190,14 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
     assert_eq!(attempt.termination.unwrap().outcome(), Outcome::Succeeded);
     stop(&client, runner).await;
     let files =
-        remote_task_runner::results::ResultStore::open(&root.path().join("parent-state/results"))
-            .unwrap();
+        belt::results::ResultStore::open(&root.path().join("parent-state/results")).unwrap();
     assert_eq!(
         files
             .read_log(&attempt.attempt_id, LogStream::Stdout)
             .unwrap(),
         b"snapshot\n"
     );
-    let result: remote_task_runner::wire::GetResultResponse =
+    let result: belt::wire::GetResultResponse =
         serde_json::from_slice(&files.read_result(&attempt.attempt_id).unwrap().unwrap()).unwrap();
     assert!(result.outputs_evaluated);
     assert_eq!(result.artifacts.len(), 2);
@@ -208,7 +205,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
     assert_eq!(result.artifacts_not_stored[0].name, "unsafe");
     assert_eq!(
         result.artifacts_not_stored[0].reason,
-        remote_task_runner::wire::NotStoredReason::Refused
+        belt::wire::NotStoredReason::Refused
     );
     let bundle = result
         .artifacts
@@ -216,10 +213,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
         .find(|a| a.name == "bundle")
         .unwrap();
     assert_eq!(bundle.name, "bundle");
-    assert_eq!(
-        bundle.encoding,
-        remote_task_runner::wire::ArtifactEncoding::TarV1
-    );
+    assert_eq!(bundle.encoding, belt::wire::ArtifactEncoding::TarV1);
     let bytes = std::fs::read(files.artifact_path(&attempt.attempt_id, &bundle.digest)).unwrap();
     assert_eq!(Digest::of_bytes(&bytes), bundle.digest);
     assert_eq!(bytes.len() as u64, bundle.size);
@@ -230,9 +224,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
         .map(|e| e.unwrap().path().unwrap().to_str().unwrap().to_owned())
         .collect();
     assert_eq!(paths, ["coverage/b", "reports/a"]);
-    let worker =
-        remote_task_runner::storage::WorkerStore::open_read_only(&root.path().join("worker"))
-            .unwrap();
+    let worker = belt::storage::WorkerStore::open_read_only(&root.path().join("worker")).unwrap();
     let journal = worker
         .events_of(&attempt.attempt_id, "artifacts_stored")
         .unwrap();
@@ -241,37 +233,33 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
     assert_eq!(journal[0].payload["artifacts"][0]["encoding"], "tar_v1");
     let immutable = worker.get_result(&attempt.attempt_id).unwrap().unwrap();
     assert_eq!(
-        remote_task_runner::wire::payload_hash(&immutable).unwrap(),
+        belt::wire::payload_hash(&immutable).unwrap(),
         result.result_digest
     );
     // Public CLI works offline without Git, project configuration or an owner.
     let config_root = root.path().join("config");
-    let config_dir = config_root.join("remote-task-runner");
+    let config_dir = config_root.join("belt");
     std::fs::create_dir_all(&config_dir).unwrap();
     std::fs::set_permissions(&config_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let spec = remote_task_runner::service::bootstrap::Spec {
+    let spec = belt::service::bootstrap::Spec {
         state_dir: root.path().join("parent-state"),
         worker_state_dir: root.path().join("worker"),
         worker_id: WorkerId::parse("local").unwrap(),
         cluster_key_path: root.path().join("key"),
-        executable: env!("CARGO_BIN_EXE_remote-task-runner").into(),
+        executable: env!("CARGO_BIN_EXE_belt").into(),
         env: BTreeMap::new(),
         repo_root: None,
         expected_cluster: None,
         managed_service: None,
     };
-    remote_task_runner::service::bootstrap::write_input(
-        &config_dir.join("coordinator.json"),
-        &spec,
-    )
-    .unwrap();
+    belt::service::bootstrap::write_input(&config_dir.join("coordinator.json"), &spec).unwrap();
     let before = CoordinatorStore::open_read_only(&spec.state_dir)
         .unwrap()
         .epoch();
     let no_git = root.path().join("no-git");
     std::fs::create_dir(&no_git).unwrap();
     let exported = root.path().join("exported");
-    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_belt"))
         .env_clear()
         .envs(super::common::profile_env())
         .env("XDG_CONFIG_HOME", &config_root)
@@ -320,7 +308,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
             .epoch(),
         before
     );
-    let conflict = tokio::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+    let conflict = tokio::process::Command::new(env!("CARGO_BIN_EXE_belt"))
         .env_clear()
         .envs(super::common::profile_env())
         .env("XDG_CONFIG_HOME", &config_root)
@@ -411,7 +399,7 @@ async fn resident_rejects_foreign_credentials_oversized_frames_and_schema() {
             Operation::Cancel {
                 request_id: RunId::generate().to_string(),
                 expected_control_revision: 0,
-                target: remote_task_runner::service::completion::Target::Run(rejected.clone()),
+                target: belt::service::completion::Target::Run(rejected.clone()),
             },
         ] {
             let mut stream = raw(
@@ -447,14 +435,14 @@ async fn resident_rejects_foreign_credentials_oversized_frames_and_schema() {
     assert!(matches!(
         client
             .request(Operation::Query {
-                query: remote_task_runner::service::query::Query::Completion {
-                    target: remote_task_runner::service::completion::Target::Run(rejected)
+                query: belt::service::query::Query::Completion {
+                    target: belt::service::completion::Target::Run(rejected)
                 }
             })
             .await
             .unwrap(),
         Reply::QueryError {
-            code: remote_task_runner::error::ErrorCode::NotFound,
+            code: belt::error::ErrorCode::NotFound,
             ..
         }
     ));
@@ -664,13 +652,13 @@ async fn resident_measured_fixture(metrics_fail: bool) {
     std::fs::write(source.join("payload"), vec![b'x'; 128 * 1024]).unwrap();
     let run = RunId::generate();
     let sources = SourceStore::open(&state).unwrap();
-    let vault = remote_task_runner::secrets::vault::Vault::open(&state).unwrap();
-    let key = remote_task_runner::secrets::key::load(&root.path().join("key")).unwrap();
-    let captured = remote_task_runner::secrets::capture::capture_run(
+    let vault = belt::secrets::vault::Vault::open(&state).unwrap();
+    let key = belt::secrets::key::load(&root.path().join("key")).unwrap();
+    let captured = belt::secrets::capture::capture_run(
         &env,
         &sources,
         &vault,
-        &remote_task_runner::secrets::capture::SecretInputs {
+        &belt::secrets::capture::SecretInputs {
             key: &key,
             declared: &[],
         },
@@ -750,7 +738,7 @@ async fn resident_measured_fixture(metrics_fail: bool) {
     for _ in 0..(if metrics_fail { 0 } else { 100 }) {
         let reply = client
             .request(Operation::Estimate {
-                query: remote_task_runner::service::estimate::Query {
+                query: belt::service::estimate::Query {
                     version: 1,
                     argv: vec!["/bin/true".into()],
                     repository_id: None,
