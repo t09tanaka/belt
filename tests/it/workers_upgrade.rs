@@ -3,7 +3,7 @@
 //! fake launcher and failures at every step, is covered in the library tests
 //! (`service::workers::upgrade`, `service::worker_service::upgrade`).
 use super::workers_lifecycle::{json, Fx};
-use remote_task_runner::error::ErrorCode;
+use belt::error::ErrorCode;
 
 const REGISTERED: &str =
     "schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@mini-a.local\"\n";
@@ -54,7 +54,7 @@ fn a_host_that_answers_garbage_to_the_first_question_changes_nothing() {
         "Linux"
     };
     let arch = std::env::consts::ARCH;
-    let version = std::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+    let version = std::process::Command::new(env!("CARGO_BIN_EXE_belt"))
         .arg("--version")
         .output()
         .unwrap();
@@ -76,7 +76,7 @@ fn a_host_that_answers_garbage_to_the_first_question_changes_nothing() {
     assert_eq!(commands.len(), 3, "{commands:?}");
     assert!(commands[1].ends_with(" --version"));
     assert!(commands[2].ends_with(" worker-service status --wait-secs 600"));
-    assert!(commands[2].starts_with("exec \"$HOME/.remote-task-runner-bootstrap/rtr-"));
+    assert!(commands[2].starts_with("exec \"$HOME/.belt-bootstrap/belt-"));
 }
 
 #[test]
@@ -84,7 +84,7 @@ fn text_mode_prints_the_error_on_stderr_only() {
     let fx = Fx::new();
     fx.init();
     fx.ssh("exit 0");
-    let out = std::process::Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_belt"))
         .args(["workers", "upgrade", "ghost"])
         .env_clear()
         .env("HOME", fx.path("home"))

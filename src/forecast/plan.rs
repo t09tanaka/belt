@@ -274,7 +274,7 @@ pub fn install_nodes(
             plan_digest: plan_digest.clone(),
             node_id: NodeId::parse(&install_node_name(index))
                 .expect("a fixed prefix and a decimal index form a valid node ID"),
-            command_id: format!("rtr-{attempt}-install-{index}"),
+            command_id: format!("belt-{attempt}-install-{index}"),
             terminal: false,
         })
         .collect()
@@ -954,7 +954,7 @@ mod tests {
                 crate::supervisor::spec::command_id(&a, index)
             );
         }
-        assert_eq!(nodes[0].command_id, format!("rtr-{a}-install-0"));
+        assert_eq!(nodes[0].command_id, format!("belt-{a}-install-0"));
         assert_ne!(nodes[0].command_id, nodes[1].command_id);
     }
 

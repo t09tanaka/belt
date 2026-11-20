@@ -171,12 +171,12 @@ mod tests {
     #[test]
     #[ignore = "owned subprocess helper"]
     fn pin_subprocess_holder() {
-        let Ok(state) = std::env::var("RTR_PIN_CHILD_STATE") else {
+        let Ok(state) = std::env::var("BELT_PIN_CHILD_STATE") else {
             return;
         };
         use std::io::Read;
-        let run = RunId::parse(&std::env::var("RTR_PIN_CHILD_RUN").unwrap()).unwrap();
-        let _pin = if std::env::var_os("RTR_PIN_CHILD_EXCLUSIVE").is_some() {
+        let run = RunId::parse(&std::env::var("BELT_PIN_CHILD_RUN").unwrap()).unwrap();
+        let _pin = if std::env::var_os("BELT_PIN_CHILD_EXCLUSIVE").is_some() {
             RunPin::exclusive(Path::new(&state), &run)
         } else {
             RunPin::shared(Path::new(&state), &run)
@@ -201,11 +201,11 @@ mod tests {
                     "--ignored",
                     "--nocapture",
                 ])
-                .env("RTR_PIN_CHILD_STATE", dir.path())
-                .env("RTR_PIN_CHILD_RUN", run.as_str())
+                .env("BELT_PIN_CHILD_STATE", dir.path())
+                .env("BELT_PIN_CHILD_RUN", run.as_str())
                 .stdin(Stdio::piped());
             if exclusive {
-                command.env("RTR_PIN_CHILD_EXCLUSIVE", "1");
+                command.env("BELT_PIN_CHILD_EXCLUSIVE", "1");
             }
             let mut child = crate::test_child::OwnedChild::spawn(command).unwrap();
             assert_eq!(

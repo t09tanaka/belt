@@ -57,7 +57,7 @@ pub struct EnvReport {
     pub tools: BTreeMap<String, ToolFact>,
     /// Build identity of what is built into this binary. The
     /// task-traffic-controller runtime and local-ci core are part of the
-    /// remote-task-runner binary (spec 22.4), so the version of that binary
+    /// belt binary (spec 22.4), so the version of that binary
     /// stands for all three and no external `--version` is asked. Separately
     /// distributed helpers (portool, fast-worktree) are in `tools`.
     pub helpers: BTreeMap<String, Option<String>>,
@@ -227,7 +227,7 @@ fn value_item(subject: &str, want: Option<&str>, have: Option<&str>) -> Option<I
             Some(want),
             Some(h),
             Some(format!(
-                "install {subject} {want} on the worker, or run workers upgrade for remote-task-runner"
+                "install {subject} {want} on the worker, or run workers upgrade for belt"
             )),
         ),
     })
@@ -728,33 +728,27 @@ mod tests {
     #[test]
     fn the_built_in_build_identity_compares_by_version() {
         let mut parent = report();
-        parent
-            .helpers
-            .insert("remote-task-runner".into(), Some("0.13.0".into()));
+        parent.helpers.insert("belt".into(), Some("0.13.0".into()));
         parent.helpers.insert("absent-here".into(), None);
         let mut worker = report();
         let find = |parent: &EnvReport, worker: &EnvReport| {
             diff(parent, worker)
                 .into_iter()
-                .find(|i| i.subject == "remote-task-runner")
+                .find(|i| i.subject == "belt")
                 .unwrap()
         };
         assert_eq!(find(&parent, &worker).class, Class::Missing);
-        worker
-            .helpers
-            .insert("remote-task-runner".into(), Some("0.12.0".into()));
+        worker.helpers.insert("belt".into(), Some("0.12.0".into()));
         let item = find(&parent, &worker);
         assert_eq!(item.class, Class::Differs);
         assert!(item
             .steps
             .unwrap()
-            .contains("install remote-task-runner 0.13.0 on the worker"));
+            .contains("install belt 0.13.0 on the worker"));
         assert!(diff(&parent, &worker)
             .iter()
             .all(|i| i.subject != "absent-here"));
-        worker
-            .helpers
-            .insert("remote-task-runner".into(), Some("0.13.0".into()));
+        worker.helpers.insert("belt".into(), Some("0.13.0".into()));
         assert_eq!(find(&parent, &worker).class, Class::Same);
     }
 

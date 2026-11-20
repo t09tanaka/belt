@@ -1,14 +1,14 @@
 //! Public foreground worker and bridge are separate owned child processes.
-use remote_task_runner::ids::*;
-use remote_task_runner::protocol::{connect, transport::Io, Connected};
-use remote_task_runner::service::worker::WorkerSpec;
-use remote_task_runner::wire::*;
+use belt::ids::*;
+use belt::protocol::{connect, transport::Io, Connected};
+use belt::service::worker::WorkerSpec;
+use belt::wire::*;
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
-const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
+const BIN: &str = env!("CARGO_BIN_EXE_belt");
 const T: Duration = Duration::from_secs(15);
 // Start identities are recorded once, when this test spawns the child. A later
 // signal compares against that record, never against a fresh read of the pid.
@@ -52,13 +52,13 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
-        let root = crate::test_tmp::prefixed("rtr-wr-").unwrap();
+        let root = crate::test_tmp::prefixed("belt-wr-").unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let state = root.path().join(".remote-task-runner");
+        let state = root.path().join(".belt");
         std::fs::create_dir(&state).unwrap();
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
         let key = root.path().join("key");
-        remote_task_runner::secrets::key::init(&key).unwrap();
+        belt::secrets::key::init(&key).unwrap();
         let spec = WorkerSpec {
             schema: 1,
             expected_cluster: ClusterId::generate(),
@@ -153,10 +153,10 @@ impl Fixture {
         let (pid, start) = recorded(child);
         let start = start.expect("child was live when spawned");
         assert_eq!(
-            remote_task_runner::platform::process_start_identity(pid),
-            remote_task_runner::platform::StartIdentity::Identity(start)
+            belt::platform::process_start_identity(pid),
+            belt::platform::StartIdentity::Identity(start)
         );
-        assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGTERM));
+        assert!(belt::platform::signal_pid(pid, libc::SIGTERM));
         assert!(tokio::time::timeout(T, child.wait())
             .await
             .unwrap()
@@ -175,7 +175,7 @@ impl Fixture {
 
 #[tokio::test]
 async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
-    use remote_task_runner::source::{capture, CaptureParams, SourceRequest, SourceStore};
+    use belt::source::{capture, CaptureParams, SourceRequest, SourceStore};
     let f = Fixture::new();
     let source = f.root.path().join("source");
     std::fs::create_dir(&source).unwrap();
@@ -195,7 +195,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     assert_eq!(initial.worker_id, f.spec.worker_id);
     assert_eq!(
         initial.worker_boot_id.as_str(),
-        remote_task_runner::platform::boot_id().unwrap()
+        belt::platform::boot_id().unwrap()
     );
     let side_effect = f.root.path().join("effect");
     let started = f.root.path().join("started");
@@ -285,8 +285,8 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     let (mut adoption_bridge, adopted) = f.bridge().await;
     assert!(adopted.worker.agent_epoch > initial.agent_epoch);
     assert_eq!(
-        remote_task_runner::platform::process_start_identity(command_pid as u32),
-        remote_task_runner::platform::StartIdentity::Identity(command_start.clone())
+        belt::platform::process_start_identity(command_pid as u32),
+        belt::platform::StartIdentity::Identity(command_start.clone())
     );
     // Command exec/PID-file creation precedes the supervisor's durable process
     // identity and Running receipt. A hello is not an adoption-ready barrier.
@@ -298,8 +298,8 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
                 "command gate must remain closed during adoption"
             );
             assert_eq!(
-                remote_task_runner::platform::process_start_identity(command_pid as u32),
-                remote_task_runner::platform::StartIdentity::Identity(command_start.clone())
+                belt::platform::process_start_identity(command_pid as u32),
+                belt::platform::StartIdentity::Identity(command_start.clone())
             );
             let response = adopted
                 .client
@@ -321,15 +321,12 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
             assert!(
                 matches!(
                     status.state,
-                    remote_task_runner::state::AttemptState::Starting
-                        | remote_task_runner::state::AttemptState::Active
+                    belt::state::AttemptState::Starting | belt::state::AttemptState::Active
                 ),
                 "unexpected adoption state: {status:?}"
             );
-            let ready = status.state == remote_task_runner::state::AttemptState::Active
-                && status
-                    .receipts
-                    .reached(remote_task_runner::state::Receipt::Running);
+            let ready = status.state == belt::state::AttemptState::Active
+                && status.receipts.reached(belt::state::Receipt::Running);
             last_status = Some(status);
             if ready {
                 break;
@@ -342,8 +339,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
         active.is_ok(),
         "adoption did not become active: {last_status:?}"
     );
-    let store =
-        remote_task_runner::storage::WorkerStore::open_read_only(&f.spec.state_dir).unwrap();
+    let store = belt::storage::WorkerStore::open_read_only(&f.spec.state_dir).unwrap();
     let launches = store.launches(&attempt).unwrap();
     assert_eq!(store.count_launches().unwrap(), 1);
     assert_eq!(launches.len(), 1);
@@ -378,7 +374,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
                 schema_version: SchemaVersion::CURRENT,
                 request_id: RequestId::generate(), attempt_id: attempt.clone(),
             }), T).await.unwrap();
-            if matches!(status, Response::GetAttempt(s) if s.state == remote_task_runner::state::AttemptState::Terminal) { break; }
+            if matches!(status, Response::GetAttempt(s) if s.state == belt::state::AttemptState::Terminal) { break; }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }).await.unwrap();
@@ -401,7 +397,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     assert_eq!(result.attempt_id, attempt);
     assert_eq!(
         result.termination.outcome(),
-        remote_task_runner::state::Outcome::Succeeded
+        belt::state::Outcome::Succeeded
     );
     kill_owned(&mut bridge).await;
     drop(connected);
@@ -433,8 +429,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     kill_owned(&mut bridge).await;
     drop(connected);
     f.stop(&mut worker).await;
-    let store =
-        remote_task_runner::storage::WorkerStore::open_read_only(&f.spec.state_dir).unwrap();
+    let store = belt::storage::WorkerStore::open_read_only(&f.spec.state_dir).unwrap();
     assert_eq!(store.count_launches().unwrap(), 1);
     assert_eq!(std::fs::read_to_string(side_effect).unwrap(), "done");
 }
@@ -536,12 +531,12 @@ async fn worker_never_reclaims_unknown_or_uncertain_socket() {
 #[tokio::test]
 async fn worker_staged_socket_fits_near_unix_path_limit() {
     let mut f = Fixture::new();
-    let tail = "/.remote-task-runner/agent.sock";
+    let tail = "/.belt/agent.sock";
     let component = 100 - f.root.path().as_os_str().len() - 1 - tail.len();
     let home = f.root.path().join("h".repeat(component));
     std::fs::create_dir(&home).unwrap();
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
-    let state = home.join(".remote-task-runner");
+    let state = home.join(".belt");
     std::fs::rename(&f.spec.state_dir, &state).unwrap();
     f.spec.state_dir = state;
     f.spec.env.insert("HOME".into(), home.display().to_string());
@@ -596,7 +591,7 @@ async fn worker_missing_binding_never_reenrolls_existing_database() {
     let original_cluster = f.spec.expected_cluster.clone();
     let original_key = f.spec.cluster_key_path.clone();
     let different_key = f.root.path().join("different-key");
-    remote_task_runner::secrets::key::init(&different_key).unwrap();
+    belt::secrets::key::init(&different_key).unwrap();
     // Even the same cluster/key cannot establish missing enrollment provenance.
     for variant in 0..3 {
         f.spec.expected_cluster = if variant == 1 {
@@ -620,7 +615,7 @@ async fn worker_missing_binding_never_reenrolls_existing_database() {
 
 #[tokio::test]
 async fn worker_enrollment_lock_stays_held_through_agent_start() {
-    use remote_task_runner::config::runtime::WorkerInputs;
+    use belt::config::runtime::WorkerInputs;
     let mut f = Fixture::new();
     let bin = f.root.path().join("bin");
     std::fs::create_dir(&bin).unwrap();
@@ -647,7 +642,7 @@ async fn worker_enrollment_lock_stays_held_through_agent_start() {
     assert!(!f.spec.state_dir.join("worker.db").exists());
     // A legacy public Agent entry (which knows only worker ID, no cluster)
     // attempts to intervene after binding while role host preflight is paused.
-    let config = remote_task_runner::config::resolve(&remote_task_runner::config::Inputs {
+    let config = belt::config::resolve(&belt::config::Inputs {
         overlay: &Default::default(),
         project: None,
         legacy: None,
@@ -658,8 +653,7 @@ async fn worker_enrollment_lock_stays_held_through_agent_start() {
         .worker_runtime(WorkerInputs {
             state_dir: f.spec.state_dir.clone(),
             worker_id: f.spec.worker_id.clone(),
-            boot_id: WorkerBootId::parse(&remote_task_runner::platform::boot_id().unwrap())
-                .unwrap(),
+            boot_id: WorkerBootId::parse(&belt::platform::boot_id().unwrap()).unwrap(),
             supervisor_exe: BIN.into(),
             cluster_key_path: f.spec.cluster_key_path.clone(),
             env: BTreeMap::from([
@@ -673,7 +667,7 @@ async fn worker_enrollment_lock_stays_held_through_agent_start() {
         .unwrap()
         .err()
         .expect("legacy agent must not acquire the role gate");
-    assert_eq!(error.code, remote_task_runner::error::ErrorCode::Conflict);
+    assert_eq!(error.code, belt::error::ErrorCode::Conflict);
     assert!(!f.spec.state_dir.join("worker.db").exists());
     assert_eq!(std::fs::read(&binding).unwrap(), enrolled);
     std::fs::write(&release, "continue").unwrap();

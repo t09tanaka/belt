@@ -5,14 +5,14 @@
 
 use crate::common;
 
-use local_ci::source::{seal_manifest, SourceKind, Stage};
-use local_ci::ExecContext;
-use remote_task_runner::error::ErrorCode;
-use remote_task_runner::ids::RunId;
-use remote_task_runner::source::diff::BlobWant;
-use remote_task_runner::source::{
+use belt::error::ErrorCode;
+use belt::ids::RunId;
+use belt::source::diff::BlobWant;
+use belt::source::{
     capture, capture_for_run, CaptureParams, ObjectsRepo, Peer, SourceRequest, SourceStore,
 };
+use local_ci::source::{seal_manifest, SourceKind, Stage};
+use local_ci::ExecContext;
 use std::collections::BTreeMap;
 use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -1651,10 +1651,7 @@ fn source_upload_opens_verified_descriptors_without_links_or_whole_reads() {
     let (hash, size) = store.object_store().unwrap().put_bytes(&bytes).unwrap();
     let mut upload = store.open_blob_verified(&hash).unwrap();
     assert_eq!(upload.size, size);
-    assert_eq!(
-        upload.digest,
-        remote_task_runner::ids::Digest::of_bytes(&bytes)
-    );
+    assert_eq!(upload.digest, belt::ids::Digest::of_bytes(&bytes));
     assert_eq!(upload.file.stream_position().unwrap(), 0);
     let mut prefix = [0; 7];
     upload.file.read_exact(&mut prefix).unwrap();

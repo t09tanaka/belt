@@ -393,7 +393,7 @@ async fn a_ci_task_is_queued_without_commands_and_what_no_worker_takes_is_refuse
     assert!(enqueue(secrets).await.unwrap_err().contains("secret files"));
     let mut reserved = ci_spec(false, 1);
     reserved.artifacts = vec![ArtifactDecl {
-        name: "rtr-ci-task-result.json".into(),
+        name: "belt-ci-task-result.json".into(),
         path: "x".into(),
         if_missing: crate::wire::MissingPolicy::Optional,
     }];

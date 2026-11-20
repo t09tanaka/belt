@@ -1,4 +1,4 @@
-# remote-task-runner 実装計画
+# belt 実装計画
 
 `docs/spec.md`（仕様版 1.3）の実装を、PR 単位に分けた計画である。仕様の受入条件 A01〜A49 は、この表のいずれかの行が担当する。
 
@@ -7,49 +7,49 @@
 - lease 更新の実プロセス試験は、準備開始・更新の durable commit・seed の更新キーと単一 monotonic 測定期限・コマンド開始・supervisor の更新キー観測を順に確認する。短い実時間枠内での起動速度や旧 watcher を期待せず、期限境界は純粋な LeaseClock 試験で検証する。観測 journal は best-effort 診断であり、lease の判定やコマンドの継続条件にしない。
 
 - 全 PR を `main` 宛てにし、単体で CI が通る形で都度マージする。依存列の「#N」は「#N が main にマージされた後、main から起点を切る」。
-- 共通の検証コマンド（RTR = remote-task-runner）: `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、GitHub Actions の緑。純粋モジュールは local-ci と同じく行カバレッジ 100% のゲートと cargo-schemata の変異テストに登録する。
-- 略称: RTR = remote-task-runner、LC = local-ci、TTC = task-traffic-controller。
+- 共通の検証コマンド（belt = belt）: `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、GitHub Actions の緑。純粋モジュールは local-ci と同じく行カバレッジ 100% のゲートと cargo-schemata の変異テストに登録する。
+- 略称: belt = belt、LC = local-ci、TTC = task-traffic-controller。
 
 ## 分割表
 
 | # | repo | タスク | スコープ | 完了条件 | 非スコープ | 依存 |
 |---|---|---|---|---|---|---|
-| S0 | RTR | 仕様 v1.2 | `docs/spec.md`、`docs/plan.md`（この表と A 対応表） | 仕様 v1.2 を反映（workspace は fast-worktree、基準版を local-ci 0.9.0 / task-traffic-controller 0.5.0 へ、Linux と一時 worker、`.worktreeinclude`、A45〜A48）。公開禁止語の grep が 0 件 | コード | なし |
-| S1 | RTR | crate の骨組みと CI | `Cargo.toml`（local-ci 0.9・task-traffic-controller 0.5 を crates.io から）、§18 の module を空で全部作る、clap で §4 の全サブコマンド（未実装は `NOT_IMPLEMENTED` の構造化 error）、`--json` の外枠（schema_version・error code）、`.github/workflows/ci.yml`（fmt・clippy・test を macOS と Linux）、coverage gate と cargo-schemata の枠 | 共通の検証コマンドが緑。`remote-task-runner <各サブコマンド> --json` が schema_version 付きの error を返すテスト | 各機能の中身 | なし |
+| S0 | belt | 仕様 v1.2 | `docs/spec.md`、`docs/plan.md`（この表と A 対応表） | 仕様 v1.2 を反映（workspace は fast-worktree、基準版を local-ci 0.9.0 / task-traffic-controller 0.5.0 へ、Linux と一時 worker、`.worktreeinclude`、A45〜A48）。公開禁止語の grep が 0 件 | コード | なし |
+| S1 | belt | crate の骨組みと CI | `Cargo.toml`（local-ci 0.9・task-traffic-controller 0.5 を crates.io から）、§18 の module を空で全部作る、clap で §4 の全サブコマンド（未実装は `NOT_IMPLEMENTED` の構造化 error）、`--json` の外枠（schema_version・error code）、`.github/workflows/ci.yml`（fmt・clippy・test を macOS と Linux）、coverage gate と cargo-schemata の枠 | 共通の検証コマンドが緑。`belt <各サブコマンド> --json` が schema_version 付きの error を返すテスト | 各機能の中身 | なし |
 | X1 | LC・TTC | core の不足調査（読むだけ・完了） | §16 の core API・§17 の公開 API と local-ci 0.9.0 / task-traffic-controller 0.5.0 の差分。結果は仕様 §16・§17 の「0.5.0 / 0.9.0 での状態」列に反映済み | 各 API が有る／名前違いで有る／無いと、必要な変更の一覧。T1・L1a・L1b・L2・L3 のスコープがこれで確定した | 実装 | なし |
-| S2 | RTR | 契約（ID・状態・wire） | §10 の ID 型、状態機械と terminal outcome・観測状態・receipt、error code、§11 の全操作の request/response DTO（schema_version・digest） | 純粋モジュールとしてカバレッジ 100%・変異テスト。状態遷移表のテスト | 通信・保存の実装 | S1 |
-| S3 | RTR | 設定 | §5 のユーザー設定・プロジェクト設定、優先順位、未知キーの error、`.local-ci.toml` の fallback と矛盾の出所表示、`[toolchain]`・`[source] secret_files`・`[[outputs]]` の型 | 設定例 2 つが通る、未知キー・矛盾のテスト | 設定の利用側 | S1 |
-| S4 | RTR | storage | SQLite（WAL）、migration と互換表、親 DB・worker DB の schema、条件付き terminal 確定、event journal、retire tombstone の永続保持 | 未知 version を書き換えないテスト、terminal が 1 回だけ確定する競合テスト | 配置・通信 | S2 |
-| S5 | RTR | protocol 転送層 | 長さ prefix JSON frame、`hello` の version・feature 照合、control を log が塞がない多重化、chunk 転送の offset・digest 再開、`worker --stdio` の Unix socket bridge、SSH 起動（argv をシェル文字列にしない） | 切断・再開・非互換 version のテスト | 各操作の業務処理 | S2 |
-| S6 | RTR | source capture と object store | `local_ci::capture_source` を使った worktree / commit / directory、private object store、§6 の SourceManifest、SOURCE_BUSY、未 push objects の bundle、submodule・LFS、展開時の path 安全性 | A11〜A14 相当のテスト（一時 Git repo の自作 fixture） | worker での展開 | S2（X1 で capture に不足があれば L 行も） |
-| S7 | RTR | worker の workspace | repo ごとの canonical clone、attempt workspace を fast-worktree で作る・消す（プロジェクトの `.fast-worktree.toml` と `.worktreeinclude` をそのまま使う）、directory snapshot、`exec --in-place`（親 local worker 限定） | macOS と Linux で add / remove が通るテスト、元 worktree を書き換えないテスト（A48） | setup template（S17） | S6 |
-| S8 | RTR | secret_files | §22.3 の SecretBundle（cluster 鍵の HMAC）、親での 0600 保持と削除、転送操作、0600 配置、terminal 時と reconcile 時の消去、ログの mask | A43・A47 のテスト | toolchain | S5・S6 |
-| S9a | RTR | supervisor（寿命・lease・停止） | attempt ごとの別プロセス、task-traffic-controller の managed `register` / `try_admit` / `run_command`、launch intent、process identity（boot ID・開始時刻）、suspend を含む単調時計の lease、renew の冪等性、cancel の TERM→KILL と停止確認、3 種の timeout、実行中の sleep 抑止 | A20・A21・A22・A25・A26（時計）のテスト。OS 依存部分（単調時計・boot ID・process identity・sleep 抑止）の macOS 版と Linux 版（A45） | log spool（S9b） | S4 |
-| S9b | RTR | log spool と結果記録 | stdout / stderr の disk spool、stream ID・offset・sequence、非 UTF-8、上限 1 GiB と `log_truncated`、結果と artifact の attempt 別保存 | A29 のテスト | 回収（S14） | S4 |
-| S10 | RTR | worker agent | §11 の worker 側操作すべて、`attempt_id + payload_hash` の冪等受理、retire tombstone、再起動時の supervisor adopt、boot ID 変化で interrupted、`ack_collected` までの GC 保護 | A18・A19・A23・A24（擬似）のテスト | forecast（S11）・導入（S22） | S4・S5・S9a・S9b |
-| S11 | RTR | worker forecast | task-traffic-controller の forecast に受理済み未登録の overlay を重ねる、coverage（attempt・plan_digest・expansion_seq・node）、読み取り専用、TTL と epoch 失効、measured / fallback / unknown | A06〜A10 のテスト | 配置の判断（S13） | S10・X1 |
-| S12 | RTR | coordinator の中核 | durable queue（run・task・attempt）、prefetch / max_active を守る dispatch、未 ACK 需要を同じ transaction に記録、retire してから再配置、unknown の保持、epoch と再起動時の reconcile・adopt、cancel の伝達 | A19・A21・A22・A23 のテスト（親側） | 予測による選択（S13）・回収（S14） | S4・S5・S10 |
-| S13 | RTR | scheduler | 1 actor で配置を直列化、転送＋setup＋実行＋回収の予測完了時間で比較、同点規則、途中参加 worker の取り込み、配置理由の表示 | A01〜A04 のテスト（1 台上の複数 worker） | CI 固有の処理 | S11・S12 |
-| S14 | RTR | 結果の回収 | collecting 状態、artifact の digest 検証と atomic 公開、`ack_collected`、回収だけの再開、完全性検査と `no_work`、保持 7 日の GC | A30・A31 のテスト | GitHub status（S19） | S9b・S12 |
-| S15 | RTR | 利用者コマンド | `init`・`exec`・`submit`・`ls`・`show`・`logs --follow`・`wait`・`cancel`（Ctrl-C）・`retry`・`outputs`・`estimate`、JSON と exit code | 各コマンドの統合テスト、`exec` の exit code 透過 | `ci`（S16）・`workers`（S21〜S23） | S12・S14 |
-| S16 | RTR | CI 統合 | `ci` / `ci plan`、FrozenPlan を 1 回だけ作る、Job DAG の配置と needs output、dynamic matrix の展開 event、host をまたぐ中間 artifact の receipt（workflow 単位）、matrix の global permit・max-parallel・fail-fast・join・決定的な集約、分割できない理由の表示 | A10・A27・A28・A38 のテスト | test sharding（S18） | S13・S14・L1a・L1b |
-| S17 | RTR | setup と template | SetupRecipe / PreparedTemplate receipt、worker 内 singleflight の builder（builder_id・consumer 参照・独自 lease）、immutable template と書き込み分離の複製、`--no-cache`、`[prepare]`。fast-worktree の `[[clone]]` との境界は仕様 v1.2 に従う | A15〜A17 のテスト | toolchain の導入（S20） | S7・S9a・S10 |
+| S2 | belt | 契約（ID・状態・wire） | §10 の ID 型、状態機械と terminal outcome・観測状態・receipt、error code、§11 の全操作の request/response DTO（schema_version・digest） | 純粋モジュールとしてカバレッジ 100%・変異テスト。状態遷移表のテスト | 通信・保存の実装 | S1 |
+| S3 | belt | 設定 | §5 のユーザー設定・プロジェクト設定、優先順位、未知キーの error、`.local-ci.toml` の fallback と矛盾の出所表示、`[toolchain]`・`[source] secret_files`・`[[outputs]]` の型 | 設定例 2 つが通る、未知キー・矛盾のテスト | 設定の利用側 | S1 |
+| S4 | belt | storage | SQLite（WAL）、migration と互換表、親 DB・worker DB の schema、条件付き terminal 確定、event journal、retire tombstone の永続保持 | 未知 version を書き換えないテスト、terminal が 1 回だけ確定する競合テスト | 配置・通信 | S2 |
+| S5 | belt | protocol 転送層 | 長さ prefix JSON frame、`hello` の version・feature 照合、control を log が塞がない多重化、chunk 転送の offset・digest 再開、`worker --stdio` の Unix socket bridge、SSH 起動（argv をシェル文字列にしない） | 切断・再開・非互換 version のテスト | 各操作の業務処理 | S2 |
+| S6 | belt | source capture と object store | `local_ci::capture_source` を使った worktree / commit / directory、private object store、§6 の SourceManifest、SOURCE_BUSY、未 push objects の bundle、submodule・LFS、展開時の path 安全性 | A11〜A14 相当のテスト（一時 Git repo の自作 fixture） | worker での展開 | S2（X1 で capture に不足があれば L 行も） |
+| S7 | belt | worker の workspace | repo ごとの canonical clone、attempt workspace を fast-worktree で作る・消す（プロジェクトの `.fast-worktree.toml` と `.worktreeinclude` をそのまま使う）、directory snapshot、`exec --in-place`（親 local worker 限定） | macOS と Linux で add / remove が通るテスト、元 worktree を書き換えないテスト（A48） | setup template（S17） | S6 |
+| S8 | belt | secret_files | §22.3 の SecretBundle（cluster 鍵の HMAC）、親での 0600 保持と削除、転送操作、0600 配置、terminal 時と reconcile 時の消去、ログの mask | A43・A47 のテスト | toolchain | S5・S6 |
+| S9a | belt | supervisor（寿命・lease・停止） | attempt ごとの別プロセス、task-traffic-controller の managed `register` / `try_admit` / `run_command`、launch intent、process identity（boot ID・開始時刻）、suspend を含む単調時計の lease、renew の冪等性、cancel の TERM→KILL と停止確認、3 種の timeout、実行中の sleep 抑止 | A20・A21・A22・A25・A26（時計）のテスト。OS 依存部分（単調時計・boot ID・process identity・sleep 抑止）の macOS 版と Linux 版（A45） | log spool（S9b） | S4 |
+| S9b | belt | log spool と結果記録 | stdout / stderr の disk spool、stream ID・offset・sequence、非 UTF-8、上限 1 GiB と `log_truncated`、結果と artifact の attempt 別保存 | A29 のテスト | 回収（S14） | S4 |
+| S10 | belt | worker agent | §11 の worker 側操作すべて、`attempt_id + payload_hash` の冪等受理、retire tombstone、再起動時の supervisor adopt、boot ID 変化で interrupted、`ack_collected` までの GC 保護 | A18・A19・A23・A24（擬似）のテスト | forecast（S11）・導入（S22） | S4・S5・S9a・S9b |
+| S11 | belt | worker forecast | task-traffic-controller の forecast に受理済み未登録の overlay を重ねる、coverage（attempt・plan_digest・expansion_seq・node）、読み取り専用、TTL と epoch 失効、measured / fallback / unknown | A06〜A10 のテスト | 配置の判断（S13） | S10・X1 |
+| S12 | belt | coordinator の中核 | durable queue（run・task・attempt）、prefetch / max_active を守る dispatch、未 ACK 需要を同じ transaction に記録、retire してから再配置、unknown の保持、epoch と再起動時の reconcile・adopt、cancel の伝達 | A19・A21・A22・A23 のテスト（親側） | 予測による選択（S13）・回収（S14） | S4・S5・S10 |
+| S13 | belt | scheduler | 1 actor で配置を直列化、転送＋setup＋実行＋回収の予測完了時間で比較、同点規則、途中参加 worker の取り込み、配置理由の表示 | A01〜A04 のテスト（1 台上の複数 worker） | CI 固有の処理 | S11・S12 |
+| S14 | belt | 結果の回収 | collecting 状態、artifact の digest 検証と atomic 公開、`ack_collected`、回収だけの再開、完全性検査と `no_work`、保持 7 日の GC | A30・A31 のテスト | GitHub status（S19） | S9b・S12 |
+| S15 | belt | 利用者コマンド | `init`・`exec`・`submit`・`ls`・`show`・`logs --follow`・`wait`・`cancel`（Ctrl-C）・`retry`・`outputs`・`estimate`、JSON と exit code | 各コマンドの統合テスト、`exec` の exit code 透過 | `ci`（S16）・`workers`（S21〜S23） | S12・S14 |
+| S16 | belt | CI 統合 | `ci` / `ci plan`、FrozenPlan を 1 回だけ作る、Job DAG の配置と needs output、dynamic matrix の展開 event、host をまたぐ中間 artifact の receipt（workflow 単位）、matrix の global permit・max-parallel・fail-fast・join・決定的な集約、分割できない理由の表示 | A10・A27・A28・A38 のテスト | test sharding（S18） | S13・S14・L1a・L1b |
+| S17 | belt | setup と template | SetupRecipe / PreparedTemplate receipt、worker 内 singleflight の builder（builder_id・consumer 参照・独自 lease）、immutable template と書き込み分離の複製、`--no-cache`、`[prepare]`。fast-worktree の `[[clone]]` との境界は仕様 v1.2 に従う | A15〜A17 のテスト | toolchain の導入（S20） | S7・S9a・S10 |
 | L1a | LC | step 実行の差し込み口 | `exec::Opts` に `CommandExecutor` 相当の trait（`StepRequest` を受けて `StepExit` を返す）を足す。executor が無いときは従来どおりバイナリを子プロセスで起動する。pipe fd（token の受け渡し）と process group の扱いを trait の契約に明記する。local-ci は task-traffic-controller の crate に依存しない | local-ci の CI（coverage・変異）緑、executor 未設定の挙動がバイト単位で不変（A36）、`cargo publish` まで | L1b・L2・L3 | なし |
 | L1b | LC | task demand 列挙と wire DTO | `plan_task_demand`（task-traffic-controller の型に依存しない DTO。条件式・動的 matrix は `conditional`）、`SetupRecipe`・`PreparedReceipt`・`TaskResult`・`TaskInputs`・`ExecutionTask`・`JobGraph` の schema_version と digest、wire から host path を除く（`StepResult.log`・`RunResult.run_dir`）、`RunResult` の `Deserialize` | local-ci の CI 緑、既存 CLI の JSON 出力は不変（A36）、`cargo publish` まで | test sharding（L2・L3） | L1a・L2 |
 | L2 | LC | test sharding（土台＋cargo test・Vitest・Jest） | `partition_tests`、adapter の discover / partition / invoke / collect / merge、履歴による長い順の割り当てと決定的な fallback、全件 1 回の集合検証 | A39・A40 のテスト（同梱 example） | Playwright・Cypress・coverage merge | X1 |
-| L3 | LC | test sharding（Playwright・Cypress・coverage merge・分割禁止条件） | 2 adapter、runner 対応の coverage merge、DB / port / container を隔離できない E2E の分割禁止 | A41 のテスト、`cargo publish` まで | RTR 側の配置 | L2 |
-| T1 | TTC | 分散用 API の不足分 | `exec::Opts` にenv map（`env_clear` 後に設定）とstdio（stdout・stderrの追記先log path、stdinはnull）を足し、`managed::run_command` まで通す。`None` 既定で既存CLIの挙動を変えず、履歴keyにenvを混ぜない。任意: `legacy_clock`、inspect の history quality | task-traffic-controller の CI 緑、env 隔離・log 追記・lease と marker が残るテスト、既存 CLI の挙動不変、`cargo publish` まで | RTR 側 | なし |
-| S18 | RTR | sharding の配置 | ShardGroup の配置と集約、fail-fast、失敗 Shard の retry、通過済み結果の保持 | A39〜A41 の統合テスト | adapter 本体 | S16・L3 |
-| S19 | RTR | GitHub status | 親だけが投稿、公開 commit と検査入力の一致検証、dirty / synthetic は success にしない、計算結果と投稿失敗を分けて報告 | A32 のテスト | local-ci 単体の status の変更（必要なら L 行を追加） | S16 |
-| S20 | RTR | toolchain | §22.1 の版指定の読み取り、baseline、match 規則、adapter（nodenv・rustup・mise・fvm・corepack）の detect / resolve / install / activate、setup と同じ経路の導入、`blocked: environment_mismatch` | A33・A42 のテスト | diff / sync（S21） | S10・S17 |
-| S21 | RTR | `workers diff` / `sync` | §22.2 の差分項目と 5 分類、sync は自動導入できる差だけ、`doctor` へ含める | A44 のテスト | 導入・常駐（S22） | S20・S22 |
-| S22 | RTR | 導入と常駐（macOS） | `workers add --install`（SSH bootstrap、版別ディレクトリ）、LaunchAgent / LaunchDaemon（`UserName`）、start / stop / drain / resume / `stop --cancel-running` | 1 台上での install → start → stop の統合テスト | upgrade・doctor（S23）・Mac 以外（S24） | S10 |
-| S23 | RTR | upgrade・rollback・doctor | drain → 配置 → 互換検査 → 切替 → health → resume、失敗時の rollback、doctor（task-traffic-controller runtime の互換・policy digest・state path・Docker の resource domain・service 環境での profile 検査） | A05・A34・A36 のテスト | Mac 以外 | S22 |
-| S24 | RTR | Linux の常駐と Colab の一時 worker | Linux の systemd user service（install / start / stop / upgrade）、Colab の一時 worker（`worker --ephemeral` をノートブックから起動、利用者が用意したトンネル経由で親が SSH、起動ごとに新しい identity、`workers forget` で消滅を宣言したときだけ interrupted に確定） | Linux（CI の ubuntu）での install → start → stop の統合テスト、ephemeral の identity と forget のテスト | macOS の常駐（S22）、トンネルの提供 | S22・S23 |
-| S25 | RTR | 1 台上の試験ハーネスと障害注入 | 複数 worker（別 state dir）を 1 台で立てる、kill 点・ACK 消失・時計のずれの注入口、A 対応表のうち実機不要のものを自動試験にまとめる | 実機不要の A がすべて自動で緑 | 実機の試験（S26） | S15・S16・S18・S23 |
-| S26 | RTR | Docker での受入と初回リリース | 手元の Mac と Docker の複数 Linux worker で A01・A02・A24・A26・A34・A35・A37・A45・A46 の適用可能な範囲を検証、結果の報告、0.1.0 の `cargo publish` とタグ・Release | 適用可能な A が緑、§20 の完了報告。独立 Mac 固有の未検証項目は明記する | 追加 Mac の調達 | 全行、Docker。受入環境は下記に従う |
+| L3 | LC | test sharding（Playwright・Cypress・coverage merge・分割禁止条件） | 2 adapter、runner 対応の coverage merge、DB / port / container を隔離できない E2E の分割禁止 | A41 のテスト、`cargo publish` まで | belt 側の配置 | L2 |
+| T1 | TTC | 分散用 API の不足分 | `exec::Opts` にenv map（`env_clear` 後に設定）とstdio（stdout・stderrの追記先log path、stdinはnull）を足し、`managed::run_command` まで通す。`None` 既定で既存CLIの挙動を変えず、履歴keyにenvを混ぜない。任意: `legacy_clock`、inspect の history quality | task-traffic-controller の CI 緑、env 隔離・log 追記・lease と marker が残るテスト、既存 CLI の挙動不変、`cargo publish` まで | belt 側 | なし |
+| S18 | belt | sharding の配置 | ShardGroup の配置と集約、fail-fast、失敗 Shard の retry、通過済み結果の保持 | A39〜A41 の統合テスト | adapter 本体 | S16・L3 |
+| S19 | belt | GitHub status | 親だけが投稿、公開 commit と検査入力の一致検証、dirty / synthetic は success にしない、計算結果と投稿失敗を分けて報告 | A32 のテスト | local-ci 単体の status の変更（必要なら L 行を追加） | S16 |
+| S20 | belt | toolchain | §22.1 の版指定の読み取り、baseline、match 規則、adapter（nodenv・rustup・mise・fvm・corepack）の detect / resolve / install / activate、setup と同じ経路の導入、`blocked: environment_mismatch` | A33・A42 のテスト | diff / sync（S21） | S10・S17 |
+| S21 | belt | `workers diff` / `sync` | §22.2 の差分項目と 5 分類、sync は自動導入できる差だけ、`doctor` へ含める | A44 のテスト | 導入・常駐（S22） | S20・S22 |
+| S22 | belt | 導入と常駐（macOS） | `workers add --install`（SSH bootstrap、版別ディレクトリ）、LaunchAgent / LaunchDaemon（`UserName`）、start / stop / drain / resume / `stop --cancel-running` | 1 台上での install → start → stop の統合テスト | upgrade・doctor（S23）・Mac 以外（S24） | S10 |
+| S23 | belt | upgrade・rollback・doctor | drain → 配置 → 互換検査 → 切替 → health → resume、失敗時の rollback、doctor（task-traffic-controller runtime の互換・policy digest・state path・Docker の resource domain・service 環境での profile 検査） | A05・A34・A36 のテスト | Mac 以外 | S22 |
+| S24 | belt | Linux の常駐と Colab の一時 worker | Linux の systemd user service（install / start / stop / upgrade）、Colab の一時 worker（`worker --ephemeral` をノートブックから起動、利用者が用意したトンネル経由で親が SSH、起動ごとに新しい identity、`workers forget` で消滅を宣言したときだけ interrupted に確定） | Linux（CI の ubuntu）での install → start → stop の統合テスト、ephemeral の identity と forget のテスト | macOS の常駐（S22）、トンネルの提供 | S22・S23 |
+| S25 | belt | 1 台上の試験ハーネスと障害注入 | 複数 worker（別 state dir）を 1 台で立てる、kill 点・ACK 消失・時計のずれの注入口、A 対応表のうち実機不要のものを自動試験にまとめる | 実機不要の A がすべて自動で緑 | 実機の試験（S26） | S15・S16・S18・S23 |
+| S26 | belt | Docker での受入と初回リリース | 手元の Mac と Docker の複数 Linux worker で A01・A02・A24・A26・A34・A35・A37・A45・A46 の適用可能な範囲を検証、結果の報告、0.1.0 の `cargo publish` とタグ・Release | 適用可能な A が緑、§20 の完了報告。独立 Mac 固有の未検証項目は明記する | 追加 Mac の調達 | 全行、Docker。受入環境は下記に従う |
 
-正式名は決定済みである（2026-11-20）。名前は belt、crate は `belt-cli`、バイナリは `belt`、lib は `belt` とする。「remote-task-runner」は現時点の作業名で、改名そのものは WP22 として未実施（0.1.0 の公開前に行う）。
+正式名は決定済みである（2026-11-20）。名前は belt、crate は `belt-cli`、バイナリは `belt`、lib は `belt` とする。旧名 remote-task-runner（略称 rtr）からの改名は WP22 で実施した。以降の記述は新名に揃えてある。
 
 ## 現在の進捗と追加作業（2026-11-14）
 
@@ -57,20 +57,20 @@
 
 - S0〜S14 と S17（PR #38、merge `9a9abc8`）は main に統合済み。S17 の検証対象 `279449b` はローカル実行 9 ジョブとリモート 9 ジョブが成功。S15 以降の接続と、追加検証で見つかった回復・テストの問題を別変更で進める。
 - S15 は以下の小さい PR に分ける。S15a は S17 の統合結果へ載せ直し、PR #40 で本流へ統合済み。S15b の library 常駐基盤も実装・独立レビュー済みであり、別 process の bootstrap と CLI 接続は S15c で検証する。独立した修正・調査は担当を分け、設計と統合は親担当が行う。
-- 検証はコミット済み HEAD に対する `local-ci run --include-disabled` を基準とし、対象 SHA、コードの失敗、環境エラー、未再現の範囲、リモート CI の結果を分ける。共有ツールが原因なら、そのツールで修正・検証・公開した後、RTR の利用版を別変更で追従する。
+- 検証はコミット済み HEAD に対する `local-ci run --include-disabled` を基準とし、対象 SHA、コードの失敗、環境エラー、未再現の範囲、リモート CI の結果を分ける。共有ツールが原因なら、そのツールで修正・検証・公開した後、belt の利用版を別変更で追従する。
 
 | 追加行 | 担当 | 必要になった理由・スコープ | 完了条件 | 依存・状態 |
 |---|---|---|---|---|
 | F1 | TTC | 同じ秒に開始した無関係な session leader が、孤児の候補から外れない。同 boot の単調時刻で子より古いと証明できる場合だけ除外する | 修正前に失敗する決定的な回帰テスト。unknown・equal・newer・別 boot・矛盾する証拠は保持。関連統合テストと CI、修正版の公開 | PR #29 統合、0.8.1 公開済み。ローカル実行ジョブ 5 件・リモート 5 件成功。ローカルの installer action 未再現は別記 |
 | F2 | fast-worktree | 並行する Git worktree 登録が、別の登録途中の空 `commondir` を読む競合 | Git ネイティブの登録操作と関連する読取・削除を repository 共通の排他で保護。hook は抑止せず、同 repo への同期再入は lock を迂回せず即時エラーにして deadlock を防ぐ。並行登録・hook の実行と拒否・再入・失敗時の状態の回帰テストと CI、制限を明記した修正版の公開 | PR #11 統合、0.4.0 公開済み。ローカル 3 件・リモート 3 件成功。native Git hook 中は同 repo の操作が直列化される。依存準備と fast-worktree の設定 hook は排他外。独自の排他を使わない raw Git は保護範囲外 |
-| F3 | RTR | 修正済み共有ツールと実行環境への追従 | TTC・fast-worktree の修正版を利用し、必要版・表示・テスト・文書を一致させる。local-ci の実行失敗を解消し、PR #38 をマージ | F1・F2 完了、PR #38 統合済み。追加の型付き回復 API は F8 で扱う |
+| F3 | belt | 修正済み共有ツールと実行環境への追従 | TTC・fast-worktree の修正版を利用し、必要版・表示・テスト・文書を一致させる。local-ci の実行失敗を解消し、PR #38 をマージ | F1・F2 完了、PR #38 統合済み。追加の型付き回復 API は F8 で扱う |
 | F4 | 検証環境 | CI の Rust 1.100 と古いローカル formatter・coverage ツールの差 | 同じ Rust 版と対応する coverage ツールで検証。新しい compiler で判明した未カバー分岐をテストし、ゲートを維持 | formatter と forecast の不足テストは PR #38 に反映。coverage ツールを CI と同版へ更新済み |
-| F5 | RTR | protocol flood のテストが無受信 1 秒を全 request 到着とみなし、遅い RPC を取り残す | 全 caller の応答と受理数を照合して終了。RPC が同期の各 phase より先に timeout しない階層予算を持ち、遅延到着を sleep なしで再現する回帰テストを追加 | 関連 3 テストを各 20 回、計 60 回成功。HEAD `279449b` の全体ローカル実行ジョブ成功。Overloaded/Internal の分類と件数の検査は維持 |
-| F6 | RTR CI | 同一ホストの mutation 4 shard がそれぞれ多数の Rust/Tokio integration test を並列起動し、基準実行の lease・deadline 検証を過負荷にする | mutation job に `RUST_TEST_THREADS=2` を設定し、4 shard・全テスト・全 mutant・判定基準は維持。cargo-schemata の基準実行と mutant 実行への継承を確認 | 既知失敗 5 件×4 プロセスと、関連 module 114 件×4 プロセス、計 456 件の module 検証が成功。HEAD `279449b` の全体ローカル実行 9 ジョブ成功。導入 action 未対応による incomplete は保持。リモート 9 ジョブも成功 |
+| F5 | belt | protocol flood のテストが無受信 1 秒を全 request 到着とみなし、遅い RPC を取り残す | 全 caller の応答と受理数を照合して終了。RPC が同期の各 phase より先に timeout しない階層予算を持ち、遅延到着を sleep なしで再現する回帰テストを追加 | 関連 3 テストを各 20 回、計 60 回成功。HEAD `279449b` の全体ローカル実行ジョブ成功。Overloaded/Internal の分類と件数の検査は維持 |
+| F6 | belt CI | 同一ホストの mutation 4 shard がそれぞれ多数の Rust/Tokio integration test を並列起動し、基準実行の lease・deadline 検証を過負荷にする | mutation job に `RUST_TEST_THREADS=2` を設定し、4 shard・全テスト・全 mutant・判定基準は維持。cargo-schemata の基準実行と mutant 実行への継承を確認 | 既知失敗 5 件×4 プロセスと、関連 module 114 件×4 プロセス、計 456 件の module 検証が成功。HEAD `279449b` の全体ローカル実行 9 ジョブ成功。導入 action 未対応による incomplete は保持。リモート 9 ジョブも成功 |
 
-| F7 | RTR test | 稼働中 SQLite DB と SHM を同一 process で raw open/close すると POSIX lock が解除され、別 writer 終了時の WAL 消失と readonly エラー 522 を起こす | 独立 process で DB/WAL/SHM の物理バイトを検査し、論理削除済みデータの漏洩検査も維持する。readonly 接続を弱めず、最小再現と WAL 回帰で検証 | 通常 cleanup の関連 3 件と追加回帰 4 件が成功。独立 process の raw scan で論理削除済み WAL の物理残存も検査し、PR #38 は統合済み。VACUUM による圧縮 snapshot は検査範囲が狭くなるため採用しない |
+| F7 | belt test | 稼働中 SQLite DB と SHM を同一 process で raw open/close すると POSIX lock が解除され、別 writer 終了時の WAL 消失と readonly エラー 522 を起こす | 独立 process で DB/WAL/SHM の物理バイトを検査し、論理削除済みデータの漏洩検査も維持する。readonly 接続を弱めず、最小再現と WAL 回帰で検証 | 通常 cleanup の関連 3 件と追加回帰 4 件が成功。独立 process の raw scan で論理削除済み WAL の物理残存も検査し、PR #38 は統合済み。VACUUM による圧縮 snapshot は検査範囲が狭くなるため採用しない |
 
-| F8 | TTC・RTR | 回復時の TTC `ProbeUnknown` を通常の失敗に数え、identity の不確定と他の失敗が混在した場合も分類できていなかった | 同じ ledger lock 内の解決判定を型付き API で返し、文字列解析・再 scan を避ける。ProbeUnknown だけの不確定は再確認し、混在原因は区別する。新 launch や偽 terminal を作らず回復する決定的テストと全 CI | TTC PR #30 の観測同期修正と PR #31 の API を統合し 0.8.2 公開済み。ローカル・リモート各 5 ジョブ成功、配布 8 asset の checksum 一致。RTR の関連 unit 31 件・実回復 1 件・pure mutation 2 caught 成功、RTR `623cfd5` のローカル実行 9 ジョブとリモート 9 ジョブ成功、PR #39 を merge `3270420` で統合済み。負荷下の既存時間依存テストは別件として残し、未証明の CPU guard 設定案は採用しない |
+| F8 | TTC・belt | 回復時の TTC `ProbeUnknown` を通常の失敗に数え、identity の不確定と他の失敗が混在した場合も分類できていなかった | 同じ ledger lock 内の解決判定を型付き API で返し、文字列解析・再 scan を避ける。ProbeUnknown だけの不確定は再確認し、混在原因は区別する。新 launch や偽 terminal を作らず回復する決定的テストと全 CI | TTC PR #30 の観測同期修正と PR #31 の API を統合し 0.8.2 公開済み。ローカル・リモート各 5 ジョブ成功、配布 8 asset の checksum 一致。belt の関連 unit 31 件・実回復 1 件・pure mutation 2 caught 成功、belt `623cfd5` のローカル実行 9 ジョブとリモート 9 ジョブ成功、PR #39 を merge `3270420` で統合済み。負荷下の既存時間依存テストは別件として残し、未証明の CPU guard 設定案は採用しない |
 
 F2 は登録と hook を分離する案も調査したが、`core.hooksPath` の抑止は reference-transaction hook まで消し、`--no-checkout` でも同 hook が登録中に発火する。hook の契約を削らず単純な排他を採用するため、長い native hook の並行性と同期再入の制限を明示する方針へ変更した。Git の最低版を上げる案は採用しない。
 
@@ -230,7 +230,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 - **未実装**: 担当行が未了で、期待結果を確かめる試験が無い。
 - **S26**: 実際のプロジェクトと複数 host が要り、ここでは試験しない。
 
-2026-11-18 に統合候補 `d4d5f47` の A01〜A49 全行をテスト名と照合した。その後、最終の main `8f32159`（2026-11-20）で GitHub Actions が緑になり、実 CLI を必須にした全試験（`RTR_REQUIRE_FAST_WORKTREE=1 RTR_REQUIRE_TTC_CLI=1 cargo nextest run --no-fail-fast`）も 2513 件中 2513 件成功、失敗 0、skip 11 件（すべて `#[ignore]`）だった。「統合検証済み」は、この main で上記の結果を確認した項目。各行の個別検証と S26 の実環境検証は別に示す。
+2026-11-18 に統合候補 `d4d5f47` の A01〜A49 全行をテスト名と照合した。その後、最終の main `8f32159`（2026-11-20）で GitHub Actions が緑になり、実 CLI を必須にした全試験（`BELT_REQUIRE_FAST_WORKTREE=1 BELT_REQUIRE_TTC_CLI=1 cargo nextest run --no-fail-fast`）も 2513 件中 2513 件成功、失敗 0、skip 11 件（すべて `#[ignore]`）だった。「統合検証済み」は、この main で上記の結果を確認した項目。各行の個別検証と S26 の実環境検証は別に示す。
 
 | A | 区分 | 自動試験（代表） | 残り・検証範囲 |
 |---|---|---|---|
@@ -646,7 +646,7 @@ base profile と attempt の effective fingerprint を分離し、受入後の�
 検証基盤は local-ci 0.12.1 のローカル10項目とリモート10項目が成功し、PR45をマージ、
 crate とリリースタグを公開し、4環境の配布物とchecksum計8件を照合した。
 公開crateも検証済みソースと一致し、手元のCLIを0.12.1へ更新した。
-RTR PR44 の timing fixture 補正はローカル9項目・リモート9項目成功後にマージした。
+belt PR44 の timing fixture 補正はローカル9項目・リモート9項目成功後にマージした。
 PR42 はその補正と CI 依存準備を取り込んだ committed HEAD の全体検証を実行中。
 ローカル未対応 installer・Docker 環境は未検証として区別する。
 
@@ -1265,7 +1265,7 @@ focused成功へ読み替えない。実user stateのGCやnative serviceへの�
 
 レビュー指摘（PR #50）への対応（2026-11-17）:
 
-- bridge の起動: install は worker の設定 dir に版に依らない `bin/current` symlink を作り、その絶対パス（`<config>/bin/current/remote-task-runner`）を応答で返す。親は `[[workers]]` の `binary` に保存し、resident の bridge と lifecycle の helper はそれを使う（`binary` が無い旧登録は従来どおり PATH の名前）。`workers add --install` の再実行で旧登録にも追記する。install の最後に、resident と同じ経路（絶対パスの `worker --stdio` を ssh で起動し hello）を通し、worker_id と cluster の一致を確かめてから登録する。
+- bridge の起動: install は worker の設定 dir に版に依らない `bin/current` symlink を作り、その絶対パス（`<config>/bin/current/belt`）を応答で返す。親は `[[workers]]` の `binary` に保存し、resident の bridge と lifecycle の helper はそれを使う（`binary` が無い旧登録は従来どおり PATH の名前）。`workers add --install` の再実行で旧登録にも追記する。install の最後に、resident と同じ経路（絶対パスの `worker --stdio` を ssh で起動し hello）を通し、worker_id と cluster の一致を確かめてから登録する。
 - 動いている resident への反映: resident の認証済み control に `ReloadWorkers` を足し、`workers add` の最後に要求する。resident が無ければ何もせず、失敗は結果の `resident` に「再起動まで未接続」として出す。
 - staging と probe は SHA-256 を照合し、部分転送を公開しない。再実行は worker.json の揮発する env を比較から外し、receipt の無い未完了 install は置き換えを許す。local worker 名の衝突は install 前に拒否する。lifecycle は応答の cluster を照合し、start・stop・drain・resume は実状態に合わせて報告する（loaded でなければ start は失敗、停止を確認できなければ stop は失敗）。start は cancel 指示を起動前に消す。状態 dir を読めない場合は 0 件と見なさずエラーにする。
 - agent は drain 中の新規受理を `Overloaded` で拒否する（再送への応答は維持）。stop は 0 件を 2 回続けて確認してから bootout する。
@@ -1279,9 +1279,9 @@ S22 の残り（必須。この変更で S22 は完了しない）:
 
 ### S21 `workers diff`（2026-11-17、1 本目: diff と待機理由の手順）
 
-`workers diff [<worker>]` を実装した。親と worker は同じ測定関数（`toolchain::envreport::collect`）で測り、worker 側は登録済みの binary の隠し action `worker-service env` が ssh 越しに JSON の環境 report を返す。測定は resident と同じ永続入力（worker.json の env と profile の PATH）を使い、ssh セッションの PATH は使わない。report は tool ごとの観測（available / unavailable / unknown）と版、版管理 adapter（registry）の導入候補と導入済みの版、remote-task-runner の build 版、`docker info` による実行可否、空き disk、profile の名前・required_tools・digest、policy digest を持つ。
+`workers diff [<worker>]` を実装した。親と worker は同じ測定関数（`toolchain::envreport::collect`）で測り、worker 側は登録済みの binary の隠し action `worker-service env` が ssh 越しに JSON の環境 report を返す。測定は resident と同じ永続入力（worker.json の env と profile の PATH）を使い、ssh セッションの PATH は使わない。report は tool ごとの観測（available / unavailable / unknown）と版、版管理 adapter（registry）の導入候補と導入済みの版、belt の build 版、`docker info` による実行可否、空き disk、profile の名前・required_tools・digest、policy digest を持つ。
 
-task-traffic-controller と local-ci は RTR の binary に組み込まれている（spec 22.4）ので、外部の `--version` は叩かず、双方の binary の build 版（`remote-task-runner` の版）で比べる。portool・fast-worktree は他の tool と同じ 3 状態（ある・無い・測れない）で測り、測れないものを same にも missing にもしない。`docker info` は profile の HOME と worker env の `DOCKER_HOST`・`DOCKER_CONTEXT` を付けて呼び、エラーは Unknown とする（docker の実体が無いときだけ not runnable）。子は自分の process group に置き、出力は上限（8 KiB）を超えた分を読み捨てて pipe を詰まらせず、時間切れでは group ごと止める（`platform::signal_process_group`）。
+task-traffic-controller と local-ci は belt の binary に組み込まれている（spec 22.4）ので、外部の `--version` は叩かず、双方の binary の build 版（`belt` の版）で比べる。portool・fast-worktree は他の tool と同じ 3 状態（ある・無い・測れない）で測り、測れないものを same にも missing にもしない。`docker info` は profile の HOME と worker env の `DOCKER_HOST`・`DOCKER_CONTEXT` を付けて呼び、エラーは Unknown とする（docker の実体が無いときだけ not runnable）。子は自分の process group に置き、出力は上限（8 KiB）を超えた分を読み捨てて pipe を詰まらせず、時間切れでは group ごと止める（`platform::signal_process_group`）。
 
 差の判定は純粋関数 `toolchain::envdiff::diff(parent, worker) -> Vec<Item>`（`doctor` から呼べるよう公開、PURE 対象）。分類は `same / differs / missing / auto_installable / manual_required / not_measured` で、優先順位は次のとおり。unknown は同じと見なさず（`differs`）、手順は「測れなかった（could not be measured）」と言い、install は案内しない。manual の tool（xcode・docker）は版 manager が候補を持っていても常に `manual_required`。portool・fast-worktree は配布経路（版 manager の導入候補）が無ければ `manual_required`。worker の版 manager に導入済みの版は、既定の版が違っても、PATH に tool が無くても `same`（H1）。導入候補にある版が未導入なら `auto_installable`、候補外なら `missing` か `differs`。profile は名前と required_tools で比べ、digest は host ごとの絶対 path を含むため表示だけにする。policy digest は本物の digest ができるまで `not_measured`（same にしない。`all_same` の判定には入れない）。手順（steps）は項目ごとに付ける。古い binary・新しい schema・壊れた応答・ログインの banner・worker 側の拒否は、それぞれ別の文言の `CONFLICT` で、空の差にはしない。worker から来た文字列は制御文字を除いて出す。
 
@@ -1291,7 +1291,7 @@ task-traffic-controller と local-ci は RTR の binary に組み込まれてい
 
 A44 の diff 側: `src/toolchain/envdiff.rs` の単体試験、偽の ssh と一時 HOME の `src/service/workers/tests.rs`、実 binary・偽 ssh・偽の tool shim の `tests/it/workers_lifecycle.rs`（`a44`）。ネットワークには出ない。
 
-残り（S21 は完了していない）: `workers sync` の実際の導入は 3 本目で入れた（下の節）。`doctor` への組み込みは 7 本目で入れた（下の「S21 `doctor` への接続」）。`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は RTR の版だけで、組み込んだ crate 個別の build 情報は持たない。
+残り（S21 は完了していない）: `workers sync` の実際の導入は 3 本目で入れた（下の節）。`doctor` への組み込みは 7 本目で入れた（下の「S21 `doctor` への接続」）。`diff` の worker 省略時の並列化、実機での受入（S26）。`installed_inventory` の所要時間（1 版ごとに detect）は未計測（L7）。task-traffic-controller と local-ci の比較は belt の版だけで、組み込んだ crate 個別の build 情報は持たない。
 
 ### S21 `workers sync`（2026-11-17、2 本目: 計画と blocked、導入の差し込み口）
 
@@ -1377,7 +1377,7 @@ PR #59 の H1 修正（4 本目）へのレビューを受けて、toolchain の
 main（S23 の doctor・upgrade、scope の統一、schema v11 など）を merge commit で取り込み、`doctor::command` が `doctor::run` の `diff` に渡す値を `None` から `workers diff` の比較に置き換えた（spec §22.2「`doctor` はこの結果を含む」）。
 
 - 答えた worker ごとに、`workers diff` と同じ経路（`workers::fetch_env` が登録済みの binary の `worker-service env` を ssh で尋ねる）で環境 report を取り、`envdiff::diff` の結果を check にする（`doctor::worker_diff`）。親の測定は 1 回だけで、worker が 1 台も答えなければ測らない。親を測る環境は `workers diff` と同じにした（常に保持した service の env。呼び出した shell の env では測らない。`doctor::measure_parent`）。
-- 項目から check への変換は純粋関数 `doctor::diff_checks`。id はどれも `environment_diff` で、項目ごとに 1 check（detail は `<項目>: <分類> parent=… worker=… -> <手順>`）。`same` は ok、`differs`・`missing`・`manual_required` は fail（利用者が手を動かさないと直らない差）、`auto_installable` は notice（exec の warm-up と `workers sync` が入れる。detail で `remote-task-runner workers sync <worker>` を案内）、`not_measured` も notice（「まだ測っていない」。`not_checked` にしない）。report を取れなかった worker（古い binary、壊れた応答、拒否）と親を測れなかった場合は、理由を添えた `not_checked` 1 つで、空の結果にも ok にもしない。worker から来た文字列は制御文字を除く。
+- 項目から check への変換は純粋関数 `doctor::diff_checks`。id はどれも `environment_diff` で、項目ごとに 1 check（detail は `<項目>: <分類> parent=… worker=… -> <手順>`）。`same` は ok、`differs`・`missing`・`manual_required` は fail（利用者が手を動かさないと直らない差）、`auto_installable` は notice（exec の warm-up と `workers sync` が入れる。detail で `belt workers sync <worker>` を案内）、`not_measured` も notice（「まだ測っていない」。`not_checked` にしない）。report を取れなかった worker（古い binary、壊れた応答、拒否）と親を測れなかった場合は、理由を添えた `not_checked` 1 つで、空の結果にも ok にもしない。worker から来た文字列は制御文字を除く。
 - ssh で答えなかった worker には環境を尋ね直さない（`reachable` が既に fail を出している。2 回目の待ちを作らない）。`environment_diff` は `not_checked` として列挙する。
 - 試験: `src/service/doctor/tests.rs` の `environment_diff`（全分類、制御文字、取れなかった場合、偽の ssh 越しの差と一致、親を測れない場合、答えない worker）と、実 binary・偽 ssh の `tests/it/doctor.rs`（worker の platform が違う report を返すと `environment_diff` が fail になり、policy digest は notice で `not_checked` は 0）。差の無い親・worker の doctor が exit 0 になること（`a_registered_worker_with_nothing_to_fix_keeps_the_exit_at_zero`）と、親を保持した env で測ること（`the_parent_is_measured_in_the_retained_environment_as_workers_diff_does`）も固定した。
 
@@ -1404,7 +1404,7 @@ worker は自分専用の scope（`<state>/traffic`）を使っていて、同�
 - 実際の CLI を step から呼ぶ試験は `a_real_nested_cli_runs_under_its_step_and_shares_the_ledger`（下の「レビュー指摘の修正」の 6・8）。
 
 依存更新（task-traffic-controller 0.8.2 から 0.10.1、2026-11-17）で直したこと:
-- 0.10.1 の library は `Paths::from_env(home, xdg_state_home, xdg_config_home)` を公開した（CLI が呼ぶのと同じ関数）。`src/config/traffic.rs` の `resolve` はこれを呼ぶだけにして、規則を二重に持たない。RTR 側の制約（相対パスと `HOME` 無しの拒否）だけを呼ぶ前の検査として残した。
+- 0.10.1 の library は `Paths::from_env(home, xdg_state_home, xdg_config_home)` を公開した（CLI が呼ぶのと同じ関数）。`src/config/traffic.rs` の `resolve` はこれを呼ぶだけにして、規則を二重に持たない。belt 側の制約（相対パスと `HOME` 無しの拒否）だけを呼ぶ前の検査として残した。
 - 0.9 以降の CLI は nested exec の間 ledger を v3 形（`entries_v3` のみ）で書く。0.10.1 の `Ledger::load` はこれを読めるので、supervisor の `run` と forecast の inspect が `Traffic("ledger: ...")` で失敗する問題は解消した。試験: v3 形の ledger を scope に置いて run が成功し v3 形のまま残ること（`tests/it/supervisor.rs`）、forecast が読んで何も変えないこと（`tests/it/forecast.rs`）。導入済みの CLI を step から実際に呼ぶ試験は、下の「レビュー指摘の修正」の 8 で CI に入れた。
 - service 環境の allowlist（worker・worker-service・init）に `XDG_STATE_HOME` を足した。install と init の時点で利用者の shell の値を journal の env に取り込み、常駐 worker が同じ scope を使う。launchd の plist は `PATH`・`HOME` などの固定の鍵しか受けないので、`XDG_CONFIG_HOME` と同じく plist には渡さない（worker は journal の env から読む）。install と init は、worker が起動時に拒む env（相対パスの XDG と `HOME`）をその場で拒む。
 - step への環境: `XDG_CONFIG_HOME` も `XDG_STATE_HOME` と同じく profile の保護対象にした（worker の値を明示 profile の allowlist に無くても渡し、step・profile からは変更できない）。toolchain adapter の `activation_env` は `XDG_*` をすべて無視する。
@@ -1416,11 +1416,11 @@ worker は自分専用の scope（`<state>/traffic`）を使っていて、同�
 2. env が最初の install で固定される（medium）。service file を登録したあとの `install` は journal の env を使い回すので、「install し直せば直る」は誤りだった。直し方: `worker-service stop` のあと同じ binary で `install` し直すと、未終了の attempt が無い場合に限り、journal と `worker.json` の `XDG_STATE_HOME` / `XDG_CONFIG_HOME` だけを呼び出し側の値（未設定を含む）に置き換える。`PATH` などほかの値と service file は変えない。動作中の worker、未終了の attempt がある worker は元の値のまま。`worker-service status` は journal の env から解決した scope を `traffic_scope`（`state_dir`・`config_file`）で返す（呼び出し側の shell の値ではない）。
 3. 拒否で worker が終了し launchd が再起動を繰り返す（medium）。終了しない。worker 役と resident は `worker_runtime` の前で待ち（`src/service/traffic_hold.rs`）、1 秒から倍にして 30 秒までの間隔で見直し、解けたら起動を続ける。記録は状態が変わったときだけ出す。SIGTERM / SIGINT では待ちをやめて終了する。待つあいだ `<state>/traffic-hold.json` を毎回書き直し、`worker-service status` が `traffic_hold`（`reason`: `waiting_for_previous_scope`）で返す。90 秒更新されていない記録と、service が load されていないときの記録は、いなくなった worker のものとして返さない。ledger が読めない場合は待っても直らないので別の `reason`（`previous_scope_unreadable`）と別の文面にし、手順（worker が起動した command が残っていないことを確かめ、`<state>/traffic` を別名へ動かす）を示す。動かせば次の見直しで起動する。`worker_runtime` 自身の検査は、待たない呼び出し側のための最後の確認として残した。
    - 待っているあいだは agent が動かないので lease を更新する相手がいない。旧 scope で動いている attempt は、自分で終わるか、lease が切れた時点で supervisor に止められる。supervisor が生きているかぎり、待ちが lease より長く続くことは無い。supervisor が死んで command だけが旧 ledger に残っている場合は、その process が終わるまで待つ（回復する agent が動いていないため。以前の拒否でも同じだった）。
-4. scope の変数と toolchain の環境（medium）。`XDG_STATE_HOME`・`XDG_CONFIG_HOME`・`TASK_TRAFFIC_CONTROLLER_NESTED` は profile の digest と fingerprint、execution binding の activation から常に外す。scope の場所を伝える値で toolchain の環境ではなく、入れると scope を動かしただけで受理済みの binding と計測履歴が無効になるため。profile は toolchain の環境（`environment()`）と scope の変数（`scope_environment()`）を別に持ち、command の環境は `command_environment` が両方から作る（binding があれば activation の上に worker の今の scope を載せる）。worker 自身が使う補助（tool の probe・git・workspace の道具）には、step と同じく両方を渡す（`host_environment()`。`XDG_CONFIG_HOME` を読む tool が probe と step で違う答えを返さないため）。setup の key を作る `SetupConfig.env` には入れず、`scope_env` として setup step へ載せる（tool の installer は plan が決めた専用の `XDG_*` を持つので載せない）。RTR は未公開で配備済みの worker がいないので、`XDG_CONFIG_HOME` を持っていた worker の fingerprint が 1 回変わることは受け入れた。試験: profile の digest・fingerprint・環境が scope の変数の有無で変わらないこと（`src/toolchain/profile.rs`）、受理時の activation と、worker が scope の変数を持つようになったあとに作り直した activation が等しいこと（launch と回復が行う比較。`src/toolchain/adapters/tests.rs` の `an_accepted_binding_stays_valid_when_the_worker_gains_scope_variables`）。
+4. scope の変数と toolchain の環境（medium）。`XDG_STATE_HOME`・`XDG_CONFIG_HOME`・`TASK_TRAFFIC_CONTROLLER_NESTED` は profile の digest と fingerprint、execution binding の activation から常に外す。scope の場所を伝える値で toolchain の環境ではなく、入れると scope を動かしただけで受理済みの binding と計測履歴が無効になるため。profile は toolchain の環境（`environment()`）と scope の変数（`scope_environment()`）を別に持ち、command の環境は `command_environment` が両方から作る（binding があれば activation の上に worker の今の scope を載せる）。worker 自身が使う補助（tool の probe・git・workspace の道具）には、step と同じく両方を渡す（`host_environment()`。`XDG_CONFIG_HOME` を読む tool が probe と step で違う答えを返さないため）。setup の key を作る `SetupConfig.env` には入れず、`scope_env` として setup step へ載せる（tool の installer は plan が決めた専用の `XDG_*` を持つので載せない）。belt は未公開で配備済みの worker がいないので、`XDG_CONFIG_HOME` を持っていた worker の fingerprint が 1 回変わることは受け入れた。試験: profile の digest・fingerprint・環境が scope の変数の有無で変わらないこと（`src/toolchain/profile.rs`）、受理時の activation と、worker が scope の変数を持つようになったあとに作り直した activation が等しいこと（launch と回復が行う比較。`src/toolchain/adapters/tests.rs` の `an_accepted_binding_stays_valid_when_the_worker_gains_scope_variables`）。
 5. #56 と #58 は一緒に main へ入れる（#56 だけでは CLI 0.9 以降の v3 ledger を 0.8 の library が読めない）。
 6. nested exec（low）。仕様 §14（763 行）は「同じ scope の lease を検証して継承し、二重課金を避ける」で、inherit である（773・775 行は scope と policy の一致を述べるだけで、どちらとも決めていない）。CLI は 0.9 から既定が admit（step の entry の子として budget に並ぶ）なので、worker は全 step に `TASK_TRAFFIC_CONTROLLER_NESTED=inherit` を渡し、profile・step からは変えられないようにした。nested の command は step の entry の下ですぐ動き、自分の entry を持たない。試験: probe が inherit と判定すること、worker の変数を外すと child（admit）になること（対照）、実 CLI で nested 実行中の ledger に step の entry しか無いこと。
 7. `src/forecast/plan.rs` の `overrunning()` は `parent` を持つ entry を数えない（親の中で動く。利用者の CLI が admit で作る子 entry は履歴を持たないことが多く、数えると overrun の理由が誤って出る）。
-8. 実 CLI の試験（low）。`#[ignore]` をやめ、`RTR_REQUIRE_FAST_WORKTREE` と同じ規約にした（CLI が PATH に無ければ理由を出して skip、`RTR_REQUIRE_TTC_CLI=1` なら失敗）。設定は CLI が読む `HOME/.config/task-traffic-controller/config.toml` に書き（budget 2、CPU・memory の guard 無し。admit の回だけ budget 3: admit では nested の command が step とは別に budget を 1 つ使うので、2 のままだと並行する別の attempt が admit されない。inherit が避けているのはこの二重計上である）、同じ file を worker の `traffic_config` に渡す。worker が step に渡す環境（inherit）と、`--nested admit`（v3 形の ledger を worker の library が読み、別の attempt を並行して supervise できること）の 2 通りを回す。別の attempt は期限付きで待ち、nested の command は試験が失敗しても必ず解放する（解放前に `run` を呼んで止まる順序を無くした）。CI は test job（ubuntu・macos）に CLI 0.10.1 を入れ、`RTR_REQUIRE_TTC_CLI=1` を設定する。coverage job と mutation job には入れない: coverage の gate は `scripts/pure-modules.txt` の module の行だけを見ていて、この試験が通る supervisor の経路は対象外であり、mutation は `--lib` と `config::` の統合試験だけを選ぶ。どちらでも CLI が無ければ skip され、gate の値は変わらない。
+8. 実 CLI の試験（low）。`#[ignore]` をやめ、`BELT_REQUIRE_FAST_WORKTREE` と同じ規約にした（CLI が PATH に無ければ理由を出して skip、`BELT_REQUIRE_TTC_CLI=1` なら失敗）。設定は CLI が読む `HOME/.config/task-traffic-controller/config.toml` に書き（budget 2、CPU・memory の guard 無し。admit の回だけ budget 3: admit では nested の command が step とは別に budget を 1 つ使うので、2 のままだと並行する別の attempt が admit されない。inherit が避けているのはこの二重計上である）、同じ file を worker の `traffic_config` に渡す。worker が step に渡す環境（inherit）と、`--nested admit`（v3 形の ledger を worker の library が読み、別の attempt を並行して supervise できること）の 2 通りを回す。別の attempt は期限付きで待ち、nested の command は試験が失敗しても必ず解放する（解放前に `run` を呼んで止まる順序を無くした）。CI は test job（ubuntu・macos）に CLI 0.10.1 を入れ、`BELT_REQUIRE_TTC_CLI=1` を設定する。coverage job と mutation job には入れない: coverage の gate は `scripts/pure-modules.txt` の module の行だけを見ていて、この試験が通る supervisor の経路は対象外であり、mutation は `--lib` と `config::` の統合試験だけを選ぶ。どちらでも CLI が無ければ skip され、gate の値は変わらない。
 9. `traffic::resolve` の検査は `worker-service install` と `init` だけに掛ける。stop・drain・resume・status・start は、呼び出し側の shell の `XDG_STATE_HOME` が相対でも動く。
 10. `Cargo.toml` は `~0.10.1`、README は「0.10.x」。ledger を同じ user の CLI と共有するので、ledger の形式が変わりうる次の minor へ library だけ、または CLI だけが進まないようにする。
 11. 既知の制約: worker は利用者の CLI の設定 file を読む。0.10 の library の検査が拒む key や値があると、直すまで worker が起動する command はすべて失敗する（README に記載）。
@@ -1505,10 +1505,10 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 
 未実装の分は、止まっている理由で 2 つに分かれる。
 
-- local-ci の shared Driver 待ち: run の進行、動的 matrix の展開と event、permit の利用、max-parallel・fail-fast・join、cancel。上の 2026-11-15 の記録のとおり Driver が host に依存しない形で持つ。Driver は 2026-11-17 の時点で未公開で、crates.io の最新 0.17.1 にも `driver`・`job_evaluate` の module は無い。RTR の依存は 0.13.0 のままである。公開済みの API だけで RTR 側に進行を書くと、同じものを二重に持つことになる。
+- local-ci の shared Driver 待ち: run の進行、動的 matrix の展開と event、permit の利用、max-parallel・fail-fast・join、cancel。上の 2026-11-15 の記録のとおり Driver が host に依存しない形で持つ。Driver は 2026-11-17 の時点で未公開で、crates.io の最新 0.17.1 にも `driver`・`job_evaluate` の module は無い。belt の依存は 0.13.0 のままである。公開済みの API だけで belt 側に進行を書くと、同じものを二重に持つことになる。
 - Driver に依らず公開済みの API（`execute_pinned_task`・`TaskInputs`・`StepExecutor`・`plan_task_demand`）で作れるが、設計が未決定: (a) worker 側の CI task 実行。FrozenPlan・task id・`TaskInputs` を worker へどう渡すか（wire の新しい payload か別の形か）、step を task-traffic-controller に載せる `StepExecutor` を supervisor のどこに置くか。worker の admission と supervisor の spec に及ぶ。(b) FrozenPlan の task を `WorkloadPlan` にして配置時の forecast へ渡す接続（A10 の S16 分）。(c) 実行中の中間 artifact を親へ送り、receipt を別 host の download へ返す経路。
 
-この変更では、どちらも実装していない。再開の順序の案は、(a)〜(c) の設計を決める、local-ci の Driver を現在の main へ載せ直して公開し RTR の依存を別の変更で上げる、その上で (1) `ci` の実行 driver と worker 側の CI task 実行・needs output・A10 の接続・A38 のうち結果と output の分、(2) matrix の permit・max-parallel・fail-fast・join・集約と展開 event・A27、(3) 中間 artifact の receipt と A38 の artifact の分、である。(a) は Driver の公開を待たずに始められる。S16 の必須範囲は変えない。
+この変更では、どちらも実装していない。再開の順序の案は、(a)〜(c) の設計を決める、local-ci の Driver を現在の main へ載せ直して公開し belt の依存を別の変更で上げる、その上で (1) `ci` の実行 driver と worker 側の CI task 実行・needs output・A10 の接続・A38 のうち結果と output の分、(2) matrix の permit・max-parallel・fail-fast・join・集約と展開 event・A27、(3) 中間 artifact の receipt と A38 の artifact の分、である。(a) は Driver の公開を待たずに始められる。S16 の必須範囲は変えない。
 
 ### S16 (1) の前半: worker 側の CI task の実行（2026-11-17、main `cc4cc9c` 起点。同日、PR #64 のレビュー指摘を反映）
 
@@ -1518,13 +1518,13 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 
 - wire: `AttemptPayload.ci_task`（`CiTask { plan_digest, task_id, inputs }`）。無いときは書き出さないので、既存の payload の canonical JSON と hash は変わらない。交渉していない接続からの CI task は `PROTOCOL_INCOMPATIBLE` で断る。
 - feature `ci_task_v1` は、この変更では `SUPPORTED_FEATURES` に入れない。FrozenPlan の配送と一緒に次の変更で提供する（plan を受け取れない worker が CI task を引き受けないようにするため）。worker 側の実装とテストは残し、テストは `worker::serve::serve_connection_offering` で feature を有効にした接続を組み立てて行う。
-- worker の受理: CI task は `commands` を持たない。次のものは受理の時点で理由を付けて断る（`INVALID_INPUT`）。`in_place`・secret bundle・prepared setup（下の制約）。4 MiB を超える inputs。結果の artifact の名前 `rtr-ci-task-result.json`（とその配下）を名前に持つ artifact・output の宣言。plan が届いていれば、`services:` を持つ task（下の残件）と、digest に合わない plan。
+- worker の受理: CI task は `commands` を持たない。次のものは受理の時点で理由を付けて断る（`INVALID_INPUT`）。`in_place`・secret bundle・prepared setup（下の制約）。4 MiB を超える inputs。結果の artifact の名前 `belt-ci-task-result.json`（とその配下）を名前に持つ artifact・output の宣言。plan が届いていれば、`services:` を持つ task（下の残件）と、digest に合わない plan。
 - agent（`src/worker/agent.rs` は振り分けの分岐 3 か所と、受理の `check_accepted`・GC の `gc_plans`・forecast の `answer` に state dir を渡す各 1 行。本体は `src/worker/ci_task.rs`）: 届いている FrozenPlan の bytes を digest で照合し、task がその plan に有ること・inputs が読めることを確かめてから、supervisor の spec に `ci` を入れる。`commands` が空でも `prepared_only`（command 無しの成功）にはしない。
 - supervisor（`src/supervisor/ci_task.rs`、local-ci との接続は `src/ci/execute.rs`）: `execute_pinned_task` を別 thread で呼び、`StepExecutor` として受けた各 step を、exec の command と同じ `run_node`（task-traffic-controller の登録と admission、launch の claim、spool への mask 済みの出力、timeout、停止と停止確認）で 1 つずつ node として実行する。local-ci は step の process を起動も signal もしない（cancel handle には process group を渡さない）。service container の docker や git など、step 以外の補助 process は local-ci が自分で起動する。
 - step の外の監視: core が step を求めていない間も、`poll_ms` ごとに取消要求・lease・attempt の deadline を見る（`Control::look_between_nodes`）。lease の更新は step の外でも反映するので、step の外の作業が lease より長くても、更新されている attempt は失効しない。止める理由が出たら、`ExecContext` に入れた `CancelHandle` で core を止める。
 - attempt を終わらせるもの: cancel・lease 失効・attempt の deadline・資源待ちの timeout・spool の失敗・停止未確認。これらの後は `if: always()` の step も起動しない。step や job の `timeout-minutes`（と、上限としての親の `command_timeout_ms`。小さい方）が切れた step は、止めて停止を確認したうえで `StepEnd::Timeout` として core に返し、続けるかどうかは core が決める。
 - 時間: `NodeEnd` が待ちの時間と実行の時間を分けて持つ。core へは `run_secs`（実行だけ）と `queue_wait_secs` を返す。
-- 結果: task の結果（`WireTaskResult`。job ごとの結果と `outputs`）を、attempt の artifact `rtr-ci-task-result.json` として既存の artifact と collection の経路で親へ返す。secret の値を含む結果は artifact として残さない。outcomes が下流の inputs の上限（`MAX_INPUT_BYTES`、4 MiB）を超える task は、実行した worker で失敗にする。step を 1 つも開始しなかった task は結果だけを残し、宣言済みの artifact と output は探さない（spec 13 章に例外として記載）。attempt の終了は、止める理由が有ればそれ、無ければ job の結果（failure か cancelled が 1 つでも有れば exit 1 の failed、skipped は失敗にしない）、task を実行できなかったときは exit 無しの failed と event `ci_task_failed`。
+- 結果: task の結果（`WireTaskResult`。job ごとの結果と `outputs`）を、attempt の artifact `belt-ci-task-result.json` として既存の artifact と collection の経路で親へ返す。secret の値を含む結果は artifact として残さない。outcomes が下流の inputs の上限（`MAX_INPUT_BYTES`、4 MiB）を超える task は、実行した worker で失敗にする。step を 1 つも開始しなかった task は結果だけを残し、宣言済みの artifact と output は探さない（spec 13 章に例外として記載）。attempt の終了は、止める理由が有ればそれ、無ければ job の結果（failure か cancelled が 1 つでも有れば exit 1 の failed、skipped は失敗にしない）、task を実行できなかったときは exit 無しの failed と event `ci_task_failed`。
 - plan の置き場 `<state_dir>/ci-plans/`: mode 0700（既に有るディレクトリも揃える）、256 件・合計 1 GiB まで。未完了の attempt が参照せず、置かれてから保持期間（`retention_ms`）を過ぎた plan は、attempt の GC（`Agent::gc`）と一緒に消す。
 - 回復: lost した supervisor の step の FIFO は、`launches` の step の番号から引いて消す。step の command id は `step-N` の番号から引く（`recover::launched_index`）。
 - forecast: 受理済みで未開始の CI task は、plan の `plan_task_demand` が挙げる command の数だけ `step-N` の future demand を出す（worker 側）。
@@ -1533,10 +1533,10 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 
 この変更で分かった制約（local-ci 0.13.0 の公開 API による）:
 
-- `PinnedExecution::verify_workspace` は、workspace が captured source と byte 単位で一致するときだけ束縛する（secret の配置と setup の前に呼ぶ契約）。束縛（`PinnedWorkspace`）は process 内の値で、supervisor の process でしか作れない。RTR は agent が secret bundle の配置と prepared setup の複製を済ませてから supervisor を起動するので、secret_files を持つ source・prepared setup・fast-worktree の `[[clone]]` で依存を複製する worktree では束縛できない。この変更では、secret bundle・prepared setup・in-place を伴う CI task を受理の時点で断り、束縛できない workspace は step を起動せずに failed にする。決定（2026-11-17、親）: local-ci の側に、宣言された上書きを除いて照合する束縛を足す。RTR の側で順序を変える回避はしない。その API が出たら、受理の拒否を外して束縛を差し替える。
+- `PinnedExecution::verify_workspace` は、workspace が captured source と byte 単位で一致するときだけ束縛する（secret の配置と setup の前に呼ぶ契約）。束縛（`PinnedWorkspace`）は process 内の値で、supervisor の process でしか作れない。belt は agent が secret bundle の配置と prepared setup の複製を済ませてから supervisor を起動するので、secret_files を持つ source・prepared setup・fast-worktree の `[[clone]]` で依存を複製する worktree では束縛できない。この変更では、secret bundle・prepared setup・in-place を伴う CI task を受理の時点で断り、束縛できない workspace は step を起動せずに failed にする。決定（2026-11-17、親）: local-ci の側に、宣言された上書きを除いて照合する束縛を足す。belt の側で順序を変える回避はしない。その API が出たら、受理の拒否を外して束縛を差し替える。
 - Git worktree の source のテストは、fast-worktree の代わりに Git だけの代役（依存を複製しない）で workspace を作っている。実物の fast-worktree が `[[clone]]` や `post_add` で workspace に何かを足した場合は束縛できず、テストもしていない。
 - core を止められるのは、core が cancel handle を見る箇所だけである。`verify_workspace` の途中など handle を見ない区間は止まらず、supervisor は core の thread が戻るのを待つ。取消要求の永続化から handle の cancel までは最大 `poll_ms` かかり、その間に core が補助 process（git など）を起動しうる（step は database の claim が断るので起動しない）。
-- `timeout-minutes` が切れた step に `continue-on-error: true` が付いていても、local-ci 0.13.0 の core は job を失敗として扱う（GitHub Actions とは違う）。RTR は step の結果を返すだけで、この扱いは変えていない。
+- `timeout-minutes` が切れた step に `continue-on-error: true` が付いていても、local-ci 0.13.0 の core は job を失敗として扱う（GitHub Actions とは違う）。belt は step の結果を返すだけで、この扱いは変えていない。
 - step を node として登録する間（履歴の key の計算と task-traffic-controller への登録。admission の最初の look の前）は、exec の command と同じく lease を見ない。負荷の高い機械では、この区間が 1 秒を超えることがあった（lease 1.5 秒のテストで観測）。既定の lease（60 秒）では問題にならないが、step ごとに起きる。
 - 資源待ちの timeout（`resource_wait_timeout_ms`）は plan の `timeout-minutes` ではなく attempt の予算なので、attempt を終わらせる扱いにしている。
 - step の script を pipe から読む step（GitHub token を持つ script）は、task-traffic-controller の起動経路で fd を渡せないので実行できず、その step は error になる。
@@ -1550,7 +1550,7 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 
 - FrozenPlan の bytes の配送と、feature `ci_task_v1` の提供。worker は `<state_dir>/ci-plans/<sha256>.json` に置かれた bytes を使う（`worker::ci_task::store_plan`）。`blob_put` の経路に plan 用の種類を足して親から届けるところは未実装で、届いていない plan の attempt は準備で失敗する（`NOT_FOUND`）。配送を入れる変更で `ci_task_v1` を `SUPPORTED_FEATURES` に入れる。
 - `services:` を持つ task の実行。今は受理で断る。supervisor が失われたとき、core が起動した container と compose project を recover で止める実装（core の `CancelHandle` が持つ名前を attempt に記録し、recover で止める）を入れてから、拒否を外す。
-- 親の側の回収: `ci_task` を持つ payload では、結果の artifact `rtr-ci-task-result.json` を必須（required）として扱う（`results/collect.rs` の `declared_of` は今 `payload.artifacts` だけを見る。worker は `ArtifactDecl` でこの名前を宣言できない）。宣言が 1024 件のとき、結果を足すと 1025 件になる点も合わせて決める。偽の worker がこの artifact だけを返すテストを付ける。
+- 親の側の回収: `ci_task` を持つ payload では、結果の artifact `belt-ci-task-result.json` を必須（required）として扱う（`results/collect.rs` の `declared_of` は今 `payload.artifacts` だけを見る。worker は `ArtifactDecl` でこの名前を宣言できない）。宣言が 1024 件のとき、結果を足すと 1025 件になる点も合わせて決める。偽の worker がこの artifact だけを返すテストを付ける。
 - 親の側: `ci` の実行（`src/cli.rs` と `tests/it/not_implemented.rs` の 2 行）、`TaskSpec` への `ci_task` の追加と `build_payload`、`ci_task_v1` の無い worker の除外と placement への理由の記録、Driver と同じ形の trait の後ろに置く run の進行（needs の DAG、上流の成功後だけ下流を配置、失敗時の skipped、cancel）、needs output を下流の `inputs` へ入れること（複数の上流の合計が上限を超える場合の扱いを含む）、`plan_task_demand` から `WorkloadPlan` を作って配置時の forecast に渡すこと（A10 の S16 分）、A38 のうち結果と output の分のテスト。
 
 ### S24 Linux の systemd user service と ephemeral worker（2026-11-17、worker 側の 1 本目）
@@ -1559,7 +1559,7 @@ S16 行の各項目を、main のコードとテストに照らして分けた�
 - `src/service/systemd/`: Linux の service backend。`policy.rs`（純粋: unit の描画、`systemctl` の引数列をデータで返す `steps`、`systemctl show` の厳密な読み取り、`systemctl --user` に渡す環境）と `SystemdLauncher`（command runner を差し込める。実 `systemctl` は `SystemctlRunner` だけ）。`policy.rs` は `scripts/pure-modules.txt` に載せた（mutation・100% 行 coverage の対象）。
 - 既存の worker-host helper（`worker_service`、upgrade・rollback・commit を含む）は分けずに、`Launcher::backend()`（既定は launchd）と `Paths::resolve_for(env, backend)` で manager を選ぶ。managed file の置き場は launchd が `~/Library/LaunchAgents`、systemd が `$XDG_CONFIG_HOME/systemd/user`。journal・receipt の形、version 別 directory、upgrade の順序は変えていない。`HostLauncher::native()` が OS（`cfg!(target_os = "linux")`。両方の枝が全 OS で型検査される）で manager を選び、`worker-service` と doctor の host 側が使う。
 - 起動は `daemon-reload`、`enable`、`start` の順、停止は worker の ack の後の `stop` だけ（unit は enable のまま。launchd の bootout 後に次回 login で読み直されるのと同じ）。`daemon-reload` と `enable` の失敗は NotApplied、最後の `start`・`stop` の失敗と runner の無応答は OutcomeUnknown。`show` の読み取りは `LoadState`・`ActiveState`・`FragmentPath`・`MainPID`・`NeedDaemonReload` だけを受け、他は Unknown にする。
-- `worker --ephemeral --cluster <id> --name <worker> --key-file <abs path>`（`src/service/worker/ephemeral.rs`、純粋な判断は `ephemeral/plan.rs`）。service を登録せず、前景で動く。正準の worker state（`$HOME/.remote-task-runner`、`worker --stdio` の橋が探す場所）が既にあるか、常駐 worker の journal があるときは、何も作らずに拒否する（常駐にならない）。起動ごとに新しい identity: worker 名は親が登録した名前のまま、報告する boot identity が `<OS の boot id>.<起動ごとの ULID>` になる。終了（SIGTERM・interrupt）時は自分が作った state directory（dev・ino を確かめる）を、worker DB に live な attempt が無いときだけ消す。使い方は `docs/linux-and-ephemeral-workers.md`。
+- `worker --ephemeral --cluster <id> --name <worker> --key-file <abs path>`（`src/service/worker/ephemeral.rs`、純粋な判断は `ephemeral/plan.rs`）。service を登録せず、前景で動く。正準の worker state（`$HOME/.belt`、`worker --stdio` の橋が探す場所）が既にあるか、常駐 worker の journal があるときは、何も作らずに拒否する（常駐にならない）。起動ごとに新しい identity: worker 名は親が登録した名前のまま、報告する boot identity が `<OS の boot id>.<起動ごとの ULID>` になる。終了（SIGTERM・interrupt）時は自分が作った state directory（dev・ino を確かめる）を、worker DB に live な attempt が無いときだけ消す。使い方は `docs/linux-and-ephemeral-workers.md`。
 
 試験。systemd 用の偽 Launcher で install・start・stop・start と upgrade の順序（`start`、`stop`、`start`）、unit の描画、`XDG_CONFIG_HOME` の置き場を macOS 上でも確かめる。実バイナリの統合試験（`tests/it/worker_ephemeral.rs`）で、ephemeral が何も導入せず、起動ごとに identity が違い、停止後に state が消え、既存 state と常駐 journal を拒否し、引数が足りなければ exit 2 になることを確かめる。`tests/it/not_implemented.rs` から `worker --ephemeral` を外した（`workers forget` は未実装のまま）。
 
@@ -1693,8 +1693,8 @@ FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard �
 初回実装時点の残件は次のとおり。
 
 - 本番の `ci` は分割の要求（`ShardRequest`）を作らない。`service::planning::freeze` は test の列挙（adapter の discover）を走らせないので、実際の `ci` の plan は今も Shard を持たない。上のテストは `FrozenPlan::with_shards` で作った plan を使う。列挙をどこで走らせるか（親か worker か、どの workspace か）は未決定で、adapter 本体の側の作業である。
-- 履歴の入力元が無い（A40）。worker が返す `TestResult` は所要時間を持たず、`History` と `PartitionOpts.speed_permille`（worker の性能補正）に入れる値を RTR は記録していない。Shard 数を worker の実効容量と残りの DAG から決める処理も無い。
-- worker が Shard を実際に実行する経路（`execute_pinned_task` が Shard の command を作り `ShardOutcome` を返す）は local-ci の側のテストに任せていて、RTR では実 runner を動かしていない。テストの worker は receipt を手で作る。
+- 履歴の入力元が無い（A40）。worker が返す `TestResult` は所要時間を持たず、`History` と `PartitionOpts.speed_permille`（worker の性能補正）に入れる値を belt は記録していない。Shard 数を worker の実効容量と残りの DAG から決める処理も無い。
+- worker が Shard を実際に実行する経路（`execute_pinned_task` が Shard の command を作り `ShardOutcome` を返す）は local-ci の側のテストに任せていて、belt では実 runner を動かしていない。テストの worker は receipt を手で作る。
 - retry しても、すでに failure の inputs で release された後続の task はやり直さない（S16 の plain な Job と同じ）。
 - 非冪等な runner の明示的な retry 許可（`ExecutionTask.retry`）は見ていない。
 - coverage の merge、JUnit などの artifact の重複・欠落の検査、assertion 数の集約は無い（local-ci は coverage を集める Job を分割しない）。

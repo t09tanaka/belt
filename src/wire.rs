@@ -916,7 +916,7 @@ pub const CI_DISCOVERY_FEATURE: &str = "ci_discovery_v1";
 
 pub fn is_discovery_task(task: &CiTask) -> bool {
     task.task_id
-        .strip_prefix("rtr-discover-")
+        .strip_prefix("belt-discover-")
         .is_some_and(|id| Digest::parse(id).is_ok())
 }
 
@@ -3389,7 +3389,7 @@ mod tests {
     fn discovery_task_ids_require_the_discovery_feature_without_a_version_check() {
         let digest = dg("shard discovery");
         let mut task = CiTask {
-            task_id: format!("rtr-discover-{digest}"),
+            task_id: format!("belt-discover-{digest}"),
             plan_digest: dg("plan"),
             inputs: json!({}),
             dispatch: None,
@@ -3398,7 +3398,7 @@ mod tests {
         };
         assert!(is_discovery_task(&task));
         assert!(requires_discovery_feature(&task));
-        for id in ["ci.yml/test", "rtr-discover-invalid"] {
+        for id in ["ci.yml/test", "belt-discover-invalid"] {
             task.task_id = id.into();
             assert!(!is_discovery_task(&task));
             assert!(!requires_discovery_feature(&task));

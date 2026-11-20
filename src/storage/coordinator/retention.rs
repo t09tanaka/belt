@@ -280,7 +280,7 @@ fn workflow_run_end(c: &Connection, run: &str) -> Result<Option<u64>> {
         "SELECT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1 AND a.retired=0 AND a.state<>'terminal')
               OR EXISTS(SELECT 1 FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 AND aa.generation>=t.min_generation ORDER BY aa.generation DESC LIMIT 1)
                  WHERE t.run_id=?1 AND a.termination_json IS NULL AND (t.cancel_requested_at_ms IS NULL OR a.attempt_id IS NOT NULL)
-                 AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.rtr_discovery.applied'),0)=0
+                 AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery.applied'),0)=0
                  AND NOT (coalesce(json_extract(t.spec_json,'$.ci.dynamic_origin'),0)=1 AND json_extract(t.spec_json,'$.ci.core_outcome') IS NOT NULL)),
             max((SELECT coalesce(max(coalesce(a.terminal_at_ms,a.retired_at_ms,0)),0) FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1),
                 (SELECT coalesce(max(t.cancel_requested_at_ms),0) FROM task t WHERE t.run_id=?1),

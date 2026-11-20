@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 // Git removes this private per-worktree ref with the worktree registration.
 // It keeps the admission snapshot reachable even after reproducing the original HEAD.
-const CLEANUP_COMMIT: &str = "refs/worktree/rtr-cleanup";
+const CLEANUP_COMMIT: &str = "refs/worktree/belt-cleanup";
 
 /// What kind of workspace this is, and so how it goes away.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -850,8 +850,8 @@ fn lock_exclusive(clone: &Path) -> Result<File, ApiError> {
 
 fn lock_main(clone: &Path, take: fn(&File) -> std::io::Result<()>) -> Result<File, ApiError> {
     let git = clone.join(".git");
-    let intent = open_lock(&git.join("rtr-workspace.intent"))?;
-    let main = open_lock(&git.join("rtr-workspace.lock"))?;
+    let intent = open_lock(&git.join("belt-workspace.intent"))?;
+    let main = open_lock(&git.join("belt-workspace.lock"))?;
     let err = |e| io_err("cannot lock the clone", e);
     intent.lock().map_err(err)?;
     // the intent lock is released when `intent` is dropped, on any return

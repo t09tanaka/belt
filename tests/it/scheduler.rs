@@ -11,19 +11,19 @@
 use crate::coordinator::{
     attempts, enqueue, fx, gated_worker, only, queued, ready_input, FakeWorker, Fx, Lost, Op, Says,
 };
-use remote_task_runner::coordinator::{Coordinator, CoordinatorError, WorkerLink};
-use remote_task_runner::error::{ApiError, BlockedReason, ErrorCode};
-use remote_task_runner::ids::*;
-use remote_task_runner::scheduler::decide::{
+use belt::coordinator::{Coordinator, CoordinatorError, WorkerLink};
+use belt::error::{ApiError, BlockedReason, ErrorCode};
+use belt::ids::*;
+use belt::scheduler::decide::{
     Costs, Decision, Exclusion, Label, Rule, Unusable, Why, COLLECTION, SETUP, TRANSFER,
 };
-use remote_task_runner::scheduler::{
+use belt::scheduler::{
     decision_seq_of, reason_of, CostModel, Scheduler, SchedulerConfig, UnknownCosts,
     EVENT_TASK_WAITING, EVENT_WORKER_EXCLUDED, REASON_WORKER_CANNOT_RUN,
 };
-use remote_task_runner::state::Outcome;
-use remote_task_runner::storage::QueuedTask;
-use remote_task_runner::wire::{RuntimeSource, Uncertainty};
+use belt::state::Outcome;
+use belt::storage::QueuedTask;
+use belt::wire::{RuntimeSource, Uncertainty};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -48,7 +48,7 @@ fn worker_of(c: &Coordinator, task: &TaskId) -> String {
 }
 
 /// The last attempt of a task.
-fn last(c: &Coordinator, task: &TaskId) -> remote_task_runner::storage::AttemptRecord {
+fn last(c: &Coordinator, task: &TaskId) -> belt::storage::AttemptRecord {
     attempts(c, task).pop().unwrap()
 }
 
@@ -1080,10 +1080,7 @@ async fn tasks_every_worker_is_excluded_for_do_not_keep_newer_ones_from_being_pl
                 1,
             )
             .unwrap();
-        assert!(matches!(
-            placed,
-            remote_task_runner::storage::PlaceOutcome::Placed(_)
-        ));
+        assert!(matches!(placed, belt::storage::PlaceOutcome::Placed(_)));
         c.store()
             .begin_retire(&id, REASON_WORKER_CANNOT_RUN, 2)
             .unwrap();

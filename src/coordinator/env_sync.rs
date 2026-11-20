@@ -75,7 +75,7 @@ impl Coordinator {
             return Err(ApiError::new(
                 ErrorCode::ProtocolIncompatible,
                 format!(
-                    "worker {worker} runs a remote-task-runner that cannot install ahead of a task; run remote-task-runner workers upgrade {worker}, then workers sync again"
+                    "worker {worker} runs a belt that cannot install ahead of a task; run belt workers upgrade {worker}, then workers sync again"
                 ),
             ));
         }

@@ -2,23 +2,21 @@
 //! recovery, and survival of the agent's death.
 
 use crate::common::{alive, identity_of, kill_recorded, kill_recorded_group, read_pid};
-use remote_task_runner::ids::*;
-use remote_task_runner::platform;
-use remote_task_runner::platform::{signal_pid, signal_process_group};
-use remote_task_runner::state::{AttemptState, Exit, Outcome, Receipt, TimeoutKind, TimeoutPhase};
-use remote_task_runner::storage::{LeaseOutcome, NewAcceptance, StorageError, WorkerStore};
-use remote_task_runner::supervisor::lease::LeaseSeed;
-use remote_task_runner::supervisor::outcome::drain_pending_deletes;
-use remote_task_runner::supervisor::process::{code, spawn_detached, supervise};
-use remote_task_runner::supervisor::recover::recover;
-use remote_task_runner::supervisor::run::{run, Report};
-use remote_task_runner::supervisor::spec::{
-    ArtifactFile, ArtifactsSpec, MaskValues, NodeSpec, SuperviseSpec,
-};
-use remote_task_runner::supervisor::spool::{AttemptSpool, SpoolReader};
-use remote_task_runner::wire::LeaseKey;
-use remote_task_runner::wire::LogStream;
-use remote_task_runner::wire::MissingPolicy;
+use belt::ids::*;
+use belt::platform;
+use belt::platform::{signal_pid, signal_process_group};
+use belt::state::{AttemptState, Exit, Outcome, Receipt, TimeoutKind, TimeoutPhase};
+use belt::storage::{LeaseOutcome, NewAcceptance, StorageError, WorkerStore};
+use belt::supervisor::lease::LeaseSeed;
+use belt::supervisor::outcome::drain_pending_deletes;
+use belt::supervisor::process::{code, spawn_detached, supervise};
+use belt::supervisor::recover::recover;
+use belt::supervisor::run::{run, Report};
+use belt::supervisor::spec::{ArtifactFile, ArtifactsSpec, MaskValues, NodeSpec, SuperviseSpec};
+use belt::supervisor::spool::{AttemptSpool, SpoolReader};
+use belt::wire::LeaseKey;
+use belt::wire::LogStream;
+use belt::wire::MissingPolicy;
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -54,7 +52,7 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
     // killed test (setsid keeps it alive) must not write into a directory that
     // a test runner clears between runs.
     let dir = tempfile::Builder::new()
-        .prefix("rtr-")
+        .prefix("belt-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
     let state = dir.path().join("state");
@@ -167,10 +165,7 @@ impl Fx {
         self.store.get(self.attempt()).unwrap().unwrap().state
     }
     /// What a reader in another process sees of the attempt's output.
-    fn output_of(
-        &self,
-        attempt: &AttemptId,
-    ) -> (Vec<u8>, remote_task_runner::supervisor::spool::ReadChunk) {
+    fn output_of(&self, attempt: &AttemptId) -> (Vec<u8>, belt::supervisor::spool::ReadChunk) {
         let r = SpoolReader::open(&self.spec.spool_dir(), attempt).unwrap();
         let (mut out, mut off) = (Vec::new(), 0);
         loop {
@@ -221,7 +216,7 @@ impl Fx {
         spec.attempt_id = attempt;
         spec
     }
-    fn term(&self) -> remote_task_runner::state::Termination {
+    fn term(&self) -> belt::state::Termination {
         self.store
             .get(self.attempt())
             .unwrap()
@@ -246,12 +241,12 @@ fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
     }
 }
 
-fn settled(r: &Report) -> remote_task_runner::state::Termination {
+fn settled(r: &Report) -> belt::state::Termination {
     assert_eq!(r.unresolved, None);
     r.termination.expect("settled")
 }
 
-fn assert_recorded_command_stopped(identity: &remote_task_runner::storage::ProcessIdentity) {
+fn assert_recorded_command_stopped(identity: &belt::storage::ProcessIdentity) {
     assert!(identity.pid > 1);
     match platform::process_start_identity(identity.pid) {
         platform::StartIdentity::NoProcess => {}
@@ -282,7 +277,7 @@ fn assert_recorded_traffic_child_stopped(child: &task_traffic_controller::proces
 
 // Measure the stop from a command's durable start marker. Registration,
 // admission and earlier nodes are not part of the running-command budget.
-fn run_from_command_start(f: &Fx, marker: &Path) -> remote_task_runner::state::Termination {
+fn run_from_command_start(f: &Fx, marker: &Path) -> belt::state::Termination {
     std::thread::scope(|scope| {
         let runner = scope.spawn(|| run(&f.spec).unwrap());
         wait_for("the timed command to start", || marker.exists());
@@ -355,12 +350,12 @@ fn cli_paths() -> task_traffic_controller::Paths {
 #[ignore = "helper process of the nested scope tests"]
 fn nested_cli_probe() {
     use task_traffic_controller::exec::{nesting, NestedMode, Nesting};
-    let Some(out) = std::env::var_os("RTR_NESTED_PROBE_OUT") else {
+    let Some(out) = std::env::var_os("BELT_NESTED_PROBE_OUT") else {
         return;
     };
     let ctx = task_traffic_controller::Context::new(cli_paths());
     let var = |name: &str| std::env::var(name).ok();
-    let mode = var(remote_task_runner::config::traffic::NESTED_ENV);
+    let mode = var(belt::config::traffic::NESTED_ENV);
     let decided = nesting(
         &ctx,
         mode.as_deref().map_or(NestedMode::default(), |text| {
@@ -400,7 +395,7 @@ fn worker_fx(
     env: BTreeMap<String, String>,
     extra: &BTreeMap<String, String>,
 ) -> (Fx, BTreeMap<String, String>) {
-    use remote_task_runner::config::{self, runtime::WorkerInputs};
+    use belt::config::{self, runtime::WorkerInputs};
     let mut f = fx(vec![]);
     let runtime = config::resolve(&config::Inputs {
         overlay: &Default::default(),
@@ -413,7 +408,7 @@ fn worker_fx(
         state_dir: f.spec.state_dir.clone(),
         worker_id: f.spec.worker_id.clone(),
         boot_id: WorkerBootId::parse("boot-1").unwrap(),
-        supervisor_exe: env!("CARGO_BIN_EXE_remote-task-runner").into(),
+        supervisor_exe: env!("CARGO_BIN_EXE_belt").into(),
         cluster_key_path: f.path("cluster.key"),
         env,
     })
@@ -439,7 +434,7 @@ fn probe_nested(
 ) -> (Fx, serde_json::Value) {
     let home = PathBuf::from(&env["HOME"]);
     let out = home.join("probe.json");
-    let extra = BTreeMap::from([("RTR_NESTED_PROBE_OUT".into(), out.display().to_string())]);
+    let extra = BTreeMap::from([("BELT_NESTED_PROBE_OUT".into(), out.display().to_string())]);
     let (f, step) = worker_fx(env, &extra);
     let mut spec = f.spec.clone();
     spec.nodes = vec![NodeSpec {
@@ -483,7 +478,7 @@ fn a_nested_cli_shares_the_ledger_of_the_worker_and_inherits_the_run() {
             home.path().join(".local/state")
         };
         let (f, report) = probe_nested(env, |_| {});
-        let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), 0);
+        let id = belt::supervisor::spec::command_id(f.attempt(), 0);
         // The CLI resolves the directory the worker admitted the command in,
         assert_eq!(
             report["state_dir"],
@@ -514,10 +509,10 @@ fn without_the_workers_mode_a_nested_cli_would_queue_as_a_child() {
     let (f, report) = probe_nested(worker_env(home.path()), |spec| {
         spec.nodes[0]
             .env
-            .remove(remote_task_runner::config::traffic::NESTED_ENV)
+            .remove(belt::config::traffic::NESTED_ENV)
             .expect("the worker sets the mode");
     });
-    let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), 0);
+    let id = belt::supervisor::spec::command_id(f.attempt(), 0);
     assert_eq!(report["mode"], serde_json::Value::Null);
     assert_eq!(report["nesting"], "child");
     assert_eq!(report["under"], serde_json::json!(id));
@@ -558,8 +553,8 @@ fn a_failing_node_stops_the_attempt_and_later_nodes_never_start() {
 fn nodes_run_in_order_with_an_isolated_environment_and_their_output_in_the_spool() {
     let f = fx(vec![]);
     let mut spec = f.spec.clone();
-    let mut n1 = node("one", "echo first:$RTR_VAR:${HOME:-nohome}; echo err >&2");
-    n1.env.insert("RTR_VAR".into(), "x".into());
+    let mut n1 = node("one", "echo first:$BELT_VAR:${HOME:-nohome}; echo err >&2");
+    n1.env.insert("BELT_VAR".into(), "x".into());
     let n2 = node("two", "echo second");
     spec.nodes = vec![n1, n2];
     let t = settled(&run(&spec).unwrap());
@@ -1314,7 +1309,7 @@ fn artifacts_are_stored_before_the_attempt_is_settled_and_the_result_names_them(
 
 #[test]
 fn a_secret_file_and_a_copy_of_a_secret_value_are_not_kept_whatever_they_are_called() {
-    use remote_task_runner::secrets::place::FileIdentity;
+    use belt::secrets::place::FileIdentity;
     const VALUE: &str = "hunter2-hunter2-hunter2";
     let mut f = fx(vec![]);
     // `ſecrets.env` is the secret file itself where the file system folds
@@ -1334,7 +1329,7 @@ fn a_secret_file_and_a_copy_of_a_secret_value_are_not_kept_whatever_they_are_cal
     plan.secret_files = vec![FileIdentity::of(
         &std::fs::symlink_metadata(&secret).unwrap(),
     )];
-    f.spec.mask = remote_task_runner::supervisor::spec::MaskValues(vec![VALUE.to_string()]);
+    f.spec.mask = belt::supervisor::spec::MaskValues(vec![VALUE.to_string()]);
     f.spec.nodes = vec![in_ws(
         &f,
         "mkdir out && ln secrets.env out/link.txt && cp secrets.env out/copy.txt && \
@@ -1604,7 +1599,7 @@ fn the_deadline_counts_the_whole_attempt() {
             &f.spec.traffic_state_dir,
             f.spec.traffic_config_path(),
         ));
-        let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), 0);
+        let id = belt::supervisor::spec::command_id(f.attempt(), 0);
         let managed::Loaded::Ok(sidecar) = managed::load_sidecar(&ctx, &id) else {
             panic!("the claimed launch must have a durable terminal sidecar");
         };
@@ -1655,7 +1650,7 @@ fn claim(f: &Fx, node: &str, ident: Option<(&str, &ProcessIdentityParts)>) {
             .record_process_identity(
                 f.attempt(),
                 &n,
-                &remote_task_runner::storage::ProcessIdentity {
+                &belt::storage::ProcessIdentity {
                     boot_id: WorkerBootId::parse(boot).unwrap(),
                     pid: p.pid,
                     start_identity: p.start.clone(),
@@ -1778,7 +1773,7 @@ fn a_dead_leader_with_a_surviving_descendant_is_stopped_by_recovery() {
 /// node `index`: its PID and start time, read here from the live process.
 fn record_descendant(f: &Fx, index: usize, pid: u32) {
     use task_traffic_controller::{managed, process, Context, Paths};
-    let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), index);
+    let id = belt::supervisor::spec::command_id(f.attempt(), index);
     let start = process::start_time(pid).expect("the descendant is running");
     let sidecar: managed::Sidecar = serde_json::from_value(serde_json::json!({
         "version": 1,
@@ -1824,11 +1819,11 @@ fn closed_spool(f: &Fx, bytes: &[u8]) {
     s.finish().unwrap();
 }
 
-fn log_ref(f: &Fx) -> remote_task_runner::storage::NewBlobRef {
-    remote_task_runner::storage::NewBlobRef {
+fn log_ref(f: &Fx) -> belt::storage::NewBlobRef {
+    belt::storage::NewBlobRef {
         ref_id: format!("{}:logs", f.attempt()),
         attempt_id: f.attempt().to_string(),
-        kind: remote_task_runner::storage::BlobKind::Log,
+        kind: belt::storage::BlobKind::Log,
         locator: format!("{}/logs", f.attempt()),
     }
 }
@@ -1893,7 +1888,7 @@ fn a_crash_right_after_closing_the_spool_is_settled_from_the_closed_spool() {
 fn a_crash_after_the_log_reference_is_settled_with_that_one_reference() {
     let f = fx(vec![node("n", "true")]);
     closed_spool(&f, b"12345");
-    let pos = remote_task_runner::storage::LogPosition {
+    let pos = belt::storage::LogPosition {
         written_bytes: 5,
         dropped_bytes: 0,
         last_seq: 1,
@@ -1935,9 +1930,7 @@ fn a_crash_between_the_termination_and_the_result_is_completed_by_the_next_start
     f.store
         .transition(f.attempt(), AttemptState::Finalizing, 51)
         .unwrap();
-    let ok =
-        remote_task_runner::state::Termination::new(Outcome::Succeeded, Some(Exit::Code(0)), None)
-            .unwrap();
+    let ok = belt::state::Termination::new(Outcome::Succeeded, Some(Exit::Code(0)), None).unwrap();
     f.store.finalize(f.attempt(), ok, 52).unwrap();
     assert!(f.store.get_result(f.attempt()).unwrap().is_none());
     // The termination that was fixed holds, and gets its result.
@@ -1965,8 +1958,7 @@ fn a_crash_before_the_spool_was_closed_is_completed_too() {
     f.store
         .transition(f.attempt(), AttemptState::Finalizing, 5)
         .unwrap();
-    let cancelled =
-        remote_task_runner::state::Termination::new(Outcome::Cancelled, None, None).unwrap();
+    let cancelled = belt::state::Termination::new(Outcome::Cancelled, None, None).unwrap();
     f.store.finalize(f.attempt(), cancelled, 6).unwrap();
     let r = recover(&f.spec, &f.store).unwrap();
     assert_eq!((r.termination, r.finalized_here), (Some(cancelled), false));
@@ -1994,12 +1986,8 @@ fn a_crash_while_settling_after_a_write_failure_is_completed_too() {
     f.store
         .transition(f.attempt(), AttemptState::Finalizing, 51)
         .unwrap();
-    let interrupted = remote_task_runner::state::Termination::new(
-        Outcome::Interrupted,
-        Some(Exit::Code(0)),
-        None,
-    )
-    .unwrap();
+    let interrupted =
+        belt::state::Termination::new(Outcome::Interrupted, Some(Exit::Code(0)), None).unwrap();
     f.store.finalize(f.attempt(), interrupted, 52).unwrap();
     assert!(f.store.get_result(f.attempt()).unwrap().is_none());
     // That event does not say "settled without its spool": the result is
@@ -2136,7 +2124,7 @@ fn an_attempt_settled_without_its_spool_keeps_its_files_accounted_for() {
 // ------------------------------------------- A21 the agent dies, the supervisor does not
 
 fn exe() -> PathBuf {
-    assert_cmd::cargo::cargo_bin("remote-task-runner")
+    assert_cmd::cargo::cargo_bin("belt")
 }
 
 /// The spec file as the agent must write it: its user's alone.
@@ -2350,7 +2338,7 @@ fn a_bad_spec_is_refused_with_its_own_exit_code() {
 
 #[test]
 fn generic_output_bundles_follow_execution_conditions_and_survive_restart() {
-    use remote_task_runner::wire::{OutputDecl, OutputWhen};
+    use belt::wire::{OutputDecl, OutputWhen};
     for (script, success) in [("exit 0", true), ("exit 7", false)] {
         let mut f = fx(vec![]);
         let mut p = artifacts(&f, &[]);
@@ -2419,7 +2407,7 @@ fn generic_output_bundles_follow_execution_conditions_and_survive_restart() {
 
 #[test]
 fn generic_conditions_cover_timeout_prelaunch_cancel_and_prepared_only() {
-    use remote_task_runner::wire::{OutputDecl, OutputWhen};
+    use belt::wire::{OutputDecl, OutputWhen};
     for mode in ["timeout", "cancel", "prepared", "zero"] {
         let mut f = fx(vec![]);
         let mut p = artifacts(&f, &[]);
@@ -2541,7 +2529,7 @@ fn a_run_goes_on_while_the_scope_holds_a_v3_ledger() {
 }
 
 /// The installed `task-traffic-controller`. Without one the real-CLI test
-/// cannot run: that is a failure where it is required (`RTR_REQUIRE_TTC_CLI`,
+/// cannot run: that is a failure where it is required (`BELT_REQUIRE_TTC_CLI`,
 /// set in CI), and said aloud elsewhere.
 fn ttc_cli() -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
@@ -2550,7 +2538,7 @@ fn ttc_cli() -> Option<PathBuf> {
         .find(|p| p.is_file());
     if found.is_none() {
         assert!(
-            std::env::var_os("RTR_REQUIRE_TTC_CLI").is_none(),
+            std::env::var_os("BELT_REQUIRE_TTC_CLI").is_none(),
             "task-traffic-controller is required here and is not installed"
         );
         eprintln!("task-traffic-controller is not installed: the real CLI is not run from a step");
@@ -2602,8 +2590,8 @@ fn a_real_nested_cli_runs_under_its_step_and_shares_the_ledger() {
             release.display()
         );
         let extra = BTreeMap::from([
-            ("RTR_TEST_CLI".to_string(), cli.display().to_string()),
-            ("RTR_TEST_INNER".to_string(), inner),
+            ("BELT_TEST_CLI".to_string(), cli.display().to_string()),
+            ("BELT_TEST_INNER".to_string(), inner),
         ]);
         let (mut outer, step) = worker_fx(env.clone(), &extra);
         assert_eq!(step["TASK_TRAFFIC_CONTROLLER_NESTED"], "inherit");
@@ -2617,14 +2605,14 @@ fn a_real_nested_cli_runs_under_its_step_and_shares_the_ledger() {
         assert!(config.is_file());
         // The flag wins over the variable the worker sets.
         let script = match mode {
-            "inherit" => "\"$RTR_TEST_CLI\" exec -- /bin/sh -c \"$RTR_TEST_INNER\"",
-            _ => "\"$RTR_TEST_CLI\" exec --nested admit -- /bin/sh -c \"$RTR_TEST_INNER\"",
+            "inherit" => "\"$BELT_TEST_CLI\" exec -- /bin/sh -c \"$BELT_TEST_INNER\"",
+            _ => "\"$BELT_TEST_CLI\" exec --nested admit -- /bin/sh -c \"$BELT_TEST_INNER\"",
         };
         outer.spec.nodes = vec![NodeSpec {
             env: step,
             ..node("outer", script)
         }];
-        let outer_id = remote_task_runner::supervisor::spec::command_id(outer.attempt(), 0);
+        let outer_id = belt::supervisor::spec::command_id(outer.attempt(), 0);
         let (mut other, _) = worker_fx(env, &BTreeMap::new());
         other.spec.nodes = vec![node("other", "exit 0")];
         assert_eq!(other.spec.traffic_state_dir, scope);

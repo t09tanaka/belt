@@ -97,10 +97,10 @@ fn captured_ci_config(
     manifest: &SourceManifest,
 ) -> Result<(Vec<String>, Vec<crate::config::model::ShardPolicy>), ApiError> {
     use crate::config::{self, resolve::Loaded, Inputs, Overlay};
-    let project = captured_text(store, manifest, ".remote-task-runner.toml")?
+    let project = captured_text(store, manifest, ".belt.toml")?
         .map(|text| {
-            config::parse::parse_project(".remote-task-runner.toml", &text).map(|value| Loaded {
-                path: ".remote-task-runner.toml".into(),
+            config::parse::parse_project(".belt.toml", &text).map(|value| Loaded {
+                path: ".belt.toml".into(),
                 value,
             })
         })
@@ -139,7 +139,7 @@ pub fn stored(
     let digest = crate::ci::discovery::active_plan(&rows)
         .or_else(|| {
             rows.iter()
-                .filter(|r| r.spec.pointer("/ci/task/inputs/rtr_discovery").is_none())
+                .filter(|r| r.spec.pointer("/ci/task/inputs/belt_discovery").is_none())
                 .find_map(|r| {
                     r.spec
                         .pointer("/ci/task/plan_digest")

@@ -6,11 +6,11 @@ impl DiscoveryStep {
     /// workflow/job separator. An older worker refuses an unknown id.
     pub fn task_id(&self) -> String {
         let bytes = serde_json::to_vec(self).expect("discovery coordinates serialize");
-        format!("rtr-discover-{}", crate::ids::Digest::of_bytes(&bytes))
+        format!("belt-discover-{}", crate::ids::Digest::of_bytes(&bytes))
     }
 
     pub fn from_task(plan: &FrozenPlan, id: &str) -> Option<Self> {
-        if !id.starts_with("rtr-discover-") {
+        if !id.starts_with("belt-discover-") {
             return None;
         }
         candidates(plan).into_iter().find(|c| c.task_id() == id)
@@ -29,7 +29,7 @@ impl DiscoveryStep {
                 "sh".into(),
                 "-c".into(),
                 include_str!("list_output.sh").into(),
-                "rtr-discovery".into(),
+                "belt-discovery".into(),
                 crate::ci::advance::MAX_RESULT_BYTES.to_string(),
             ],
         );
@@ -140,7 +140,7 @@ impl DiscoveryStep {
 
 fn streams(frame: &str) -> Option<(&str, &str)> {
     let (header, payload) = frame.split_once('\n')?;
-    let lengths = header.strip_prefix("rtr-list-v1 ")?;
+    let lengths = header.strip_prefix("belt-list-v1 ")?;
     let (out, err) = lengths.split_once(' ')?;
     let out: usize = out.parse().ok()?;
     let err: usize = err.parse().ok()?;
@@ -166,9 +166,9 @@ mod tests {
 
     #[test]
     fn listing_frame_preserves_byte_boundaries_and_rejects_truncation() {
-        assert_eq!(streams("rtr-list-v1 3 4\n猫err\n"), Some(("猫", "err\n")));
-        assert_eq!(streams("rtr-list-v1 2 5\n猫err\n"), None);
-        assert_eq!(streams("rtr-list-v1 3 5\n猫err\n"), None);
+        assert_eq!(streams("belt-list-v1 3 4\n猫err\n"), Some(("猫", "err\n")));
+        assert_eq!(streams("belt-list-v1 2 5\n猫err\n"), None);
+        assert_eq!(streams("belt-list-v1 3 5\n猫err\n"), None);
     }
 
     #[test]

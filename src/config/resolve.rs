@@ -394,7 +394,7 @@ fn conflict<T>(
             problems.push(format!(
                 "{} {} = {} conflicts with {} {} = {}; make them agree or remove one",
                 paths.0,
-                m.rtr,
+                m.belt,
                 show(p),
                 paths.1,
                 m.local_ci,
@@ -637,7 +637,7 @@ fn check_prepare(project: &ProjectConfig, problems: &mut Vec<String>) -> Vec<Vec
 }
 
 const NOTICE_REASON: &str =
-    "not supported by remote-task-runner; dependencies are prepared by fast-worktree's [[clone]]";
+    "not supported by belt; dependencies are prepared by fast-worktree's [[clone]]";
 
 /// Unsupported `.local-ci.toml` keys that actually carry a value.
 fn legacy_notices(legacy: &Fallback) -> Vec<Notice> {
@@ -1036,11 +1036,11 @@ mod tests {
             w.binary = Some(binary.into());
             worker_problems(vec![w])
         };
-        assert!(with_binary("/usr/local/bin/remote-task-runner").is_empty());
-        assert_eq!(with_binary("remote-task-runner").len(), 1);
-        assert_eq!(with_binary("bin/rtr").len(), 1);
-        assert_eq!(with_binary("/opt/rtr\n").len(), 1);
-        assert_eq!(with_binary("/opt/\u{7}rtr").len(), 1);
+        assert!(with_binary("/usr/local/bin/belt").is_empty());
+        assert_eq!(with_binary("belt").len(), 1);
+        assert_eq!(with_binary("bin/belt").len(), 1);
+        assert_eq!(with_binary("/opt/belt\n").len(), 1);
+        assert_eq!(with_binary("/opt/\u{7}belt").len(), 1);
         // Both conditions failing is still one problem for the worker.
         assert_eq!(with_binary("rel\npath").len(), 1);
         assert!(with_binary("rel")[0].contains("binary"));

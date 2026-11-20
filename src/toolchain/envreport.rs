@@ -249,7 +249,7 @@ fn measure(
     // 22.4): its build identity stands for them, and no external `--version`
     // is run.
     let helpers = BTreeMap::from([(
-        "remote-task-runner".to_string(),
+        "belt".to_string(),
         Some(env!("CARGO_PKG_VERSION").to_string()),
     )]);
     let docker = docker_state(profile.path_dirs(), profile, env, docker_timeout);
@@ -419,12 +419,9 @@ mod tests {
         assert_eq!(report.tools["node"].version.as_deref(), Some("20.1.0"));
         assert_eq!(report.tools["cargo"].observed, Observed::Unavailable);
         assert_eq!(report.tools["node"].managed, None);
+        assert_eq!(report.helpers.keys().collect::<Vec<_>>(), ["belt"]);
         assert_eq!(
-            report.helpers.keys().collect::<Vec<_>>(),
-            ["remote-task-runner"]
-        );
-        assert_eq!(
-            report.helpers["remote-task-runner"].as_deref(),
+            report.helpers["belt"].as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
         assert_eq!(report.docker, Docker::Runnable);

@@ -1,5 +1,5 @@
 [package]
-name = "remote-task-runner"
+name = "belt-cli"
 version = "0.0.0"
 edition = "2021"
 rust-version = "1.89"
@@ -9,11 +9,11 @@ repository = "https://github.com/t09tanaka/remote-task-runner"
 readme = "README.md"
 
 [lib]
-name = "remote_task_runner"
+name = "belt"
 path = "src/lib.rs"
 
 [[bin]]
-name = "remote-task-runner"
+name = "belt"
 path = "src/main.rs"
 
 [dependencies]

@@ -2,13 +2,9 @@
 
 #![allow(dead_code)]
 
-use remote_task_runner::platform::{
-    process_group_of, process_start_identity, signal_pid, StartIdentity,
-};
-use remote_task_runner::supervisor::identity::Leader;
-use remote_task_runner::supervisor::stop::{
-    stop_group, Members, NoEvidence, StopTarget, StopTimes,
-};
+use belt::platform::{process_group_of, process_start_identity, signal_pid, StartIdentity};
+use belt::supervisor::identity::Leader;
+use belt::supervisor::stop::{stop_group, Members, NoEvidence, StopTarget, StopTimes};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -36,9 +32,7 @@ pub fn fixture_worker_traffic_budget(
     budget: u32,
 ) {
     fixture_traffic_config_file(
-        &remote_task_runner::config::traffic::resolve(env)
-            .unwrap()
-            .config_file,
+        &belt::config::traffic::resolve(env).unwrap().config_file,
         budget,
     );
 }
@@ -74,7 +68,7 @@ impl Tmp {
 
 impl Drop for Tmp {
     fn drop(&mut self) {
-        remote_task_runner::platform::owned_temp::make_writable(self.0.path());
+        belt::platform::owned_temp::make_writable(self.0.path());
     }
 }
 
@@ -197,7 +191,7 @@ impl Drop for DaemonRoot {
         stop_daemon(&self.state);
         // Prepared templates under the worker state are read-only by design,
         // and removal stops at the first directory it cannot empty.
-        remote_task_runner::platform::owned_temp::make_writable(self.dir.path());
+        belt::platform::owned_temp::make_writable(self.dir.path());
     }
 }
 
@@ -241,19 +235,15 @@ pub fn stop_daemon(state: &Path) {
             let Some(start) = identity_of(pid) else {
                 return;
             };
-            let client = remote_task_runner::storage::CoordinatorStore::open_read_only(&state)
+            let client = belt::storage::CoordinatorStore::open_read_only(&state)
                 .ok()
                 .and_then(|store| {
-                    remote_task_runner::service::resident::Client::load(
-                        &state,
-                        store.cluster_id().clone(),
-                    )
-                    .ok()
+                    belt::service::resident::Client::load(&state, store.cluster_id().clone()).ok()
                 });
             if let Some(client) = client {
                 let _ = tokio::time::timeout(
                     Duration::from_secs(5),
-                    client.request(remote_task_runner::service::resident::Operation::Shutdown),
+                    client.request(belt::service::resident::Operation::Shutdown),
                 )
                 .await;
             }

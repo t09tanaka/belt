@@ -47,7 +47,7 @@ use std::time::Duration;
 
 /// The name the task's result is kept under, as an artifact of the attempt:
 /// the parent reads the outcomes and outputs of the task's jobs from it.
-pub const RESULT_ARTIFACT: &str = "rtr-ci-task-result.json";
+pub const RESULT_ARTIFACT: &str = "belt-ci-task-result.json";
 /// The frozen plan is JSON of at most this many bytes.
 pub const MAX_PLAN_BYTES: u64 = 64 << 20;
 /// The inputs of a task (the outcomes of the jobs it needs) are JSON of at

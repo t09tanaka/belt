@@ -66,7 +66,7 @@ enum ProbeMiss {
     TimedOut,
     Failed,
 }
-const PROBE_DIR_PREFIX: &str = "rtr-tool-probe-";
+const PROBE_DIR_PREFIX: &str = "belt-tool-probe-";
 const PREPARATION_SNAPSHOT_TTL_MS: u64 = 5_000;
 // Tool discovery must not bootstrap a manager-selected tool behind admission.
 const INSTALL_GUARDS: &[(&str, &str)] = &[

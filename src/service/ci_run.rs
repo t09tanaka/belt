@@ -607,7 +607,7 @@ fn job_report(
         else {
             continue;
         };
-        if ci.task.inputs.get("rtr_discovery").is_some() {
+        if ci.task.inputs.get("belt_discovery").is_some() {
             continue;
         }
         by_plan_task.insert(ci.task.task_id.clone(), row);

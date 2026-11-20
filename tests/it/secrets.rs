@@ -5,19 +5,19 @@
 use crate::common;
 use crate::proto_common as proto;
 
+use belt::error::{BlockedReason, ErrorCode};
+use belt::ids::*;
+use belt::secrets::capture::{capture_run, run_bundle_path, SecretInputs};
+use belt::secrets::key::ClusterKey;
+use belt::secrets::place::WorkerSecrets;
+use belt::secrets::plan::hex_encode;
+use belt::secrets::send::send_bundle;
+use belt::secrets::vault::Vault;
+use belt::secrets::SecretError;
+use belt::source::{CaptureParams, SourceRequest, SourceStore};
+use belt::wire::*;
 use local_ci::source::SecretSpec;
 use proto::*;
-use remote_task_runner::error::{BlockedReason, ErrorCode};
-use remote_task_runner::ids::*;
-use remote_task_runner::secrets::capture::{capture_run, run_bundle_path, SecretInputs};
-use remote_task_runner::secrets::key::ClusterKey;
-use remote_task_runner::secrets::place::WorkerSecrets;
-use remote_task_runner::secrets::plan::hex_encode;
-use remote_task_runner::secrets::send::send_bundle;
-use remote_task_runner::secrets::vault::Vault;
-use remote_task_runner::secrets::SecretError;
-use remote_task_runner::source::{CaptureParams, SourceRequest, SourceStore};
-use remote_task_runner::wire::*;
 use std::collections::BTreeMap;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -102,7 +102,7 @@ fn do_capture(
     fx: &Fx,
     run: &RunId,
     declared: &[SecretSpec],
-) -> Result<remote_task_runner::source::Captured, remote_task_runner::error::ApiError> {
+) -> Result<belt::source::Captured, belt::error::ApiError> {
     let store = SourceStore::open(&fx.state).unwrap();
     let vault = Vault::open(&fx.state).unwrap();
     capture_run(
@@ -119,7 +119,7 @@ fn do_capture(
     )
 }
 
-fn paths(c: &remote_task_runner::source::Captured) -> Vec<String> {
+fn paths(c: &belt::source::Captured) -> Vec<String> {
     c.manifest
         .secret_files
         .iter()
@@ -453,7 +453,7 @@ fn capture_with(
     run: &RunId,
     declared: &[SecretSpec],
     request: &SourceRequest,
-) -> Result<remote_task_runner::source::Captured, remote_task_runner::error::ApiError> {
+) -> Result<belt::source::Captured, belt::error::ApiError> {
     let store = SourceStore::open(&fx.state).unwrap();
     let vault = Vault::open(&fx.state).unwrap();
     capture_run(
@@ -700,10 +700,8 @@ fn two_runs_of_one_commit_each_get_their_own_bundle_and_a_leftover_at_the_path_i
         secret_bundle: Some(run_bundle_path(&store, run)),
         ..CaptureParams::default()
     };
-    let a = remote_task_runner::source::capture_for_run(&fx.env(), &store, &r1, &commit, &mk(&r1))
-        .unwrap();
-    let b = remote_task_runner::source::capture_for_run(&fx.env(), &store, &r2, &commit, &mk(&r2))
-        .unwrap();
+    let a = belt::source::capture_for_run(&fx.env(), &store, &r1, &commit, &mk(&r1)).unwrap();
+    let b = belt::source::capture_for_run(&fx.env(), &store, &r2, &commit, &mk(&r2)).unwrap();
     assert_eq!(a.manifest.ci_source_id, b.manifest.ci_source_id);
     let (pa, pb) = (a.secrets.unwrap(), b.secrets.unwrap());
     assert_eq!(pa, run_bundle_path(&store, &r1));
@@ -725,7 +723,7 @@ fn the_sweep_also_removes_the_temporary_files_of_a_killed_bundle_write() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(".secrets.tmp-4242-1"), "plain secret").unwrap();
     std::fs::write(dir.join("unrelated.txt"), "x").unwrap();
-    let n = remote_task_runner::secrets::capture::sweep_store_copies(&store, |_| true).unwrap();
+    let n = belt::secrets::capture::sweep_store_copies(&store, |_| true).unwrap();
     assert_eq!(n, 1);
     assert!(!dir.join(".secrets.tmp-4242-1").exists());
     assert!(dir.join("unrelated.txt").exists());
@@ -744,14 +742,8 @@ fn a_bundle_the_run_could_not_adopt_is_adopted_by_the_next_call_after_its_hmac_i
         ..CaptureParams::default()
     };
     // a capture that was bound to its run and then lost the process before the adoption
-    let left = remote_task_runner::source::capture_for_run(
-        &fx.env(),
-        &store,
-        &run,
-        &fx.request(),
-        &params,
-    )
-    .unwrap();
+    let left =
+        belt::source::capture_for_run(&fx.env(), &store, &run, &fx.request(), &params).unwrap();
     let copy = left.secrets.clone().unwrap();
     assert!(copy.exists());
     let got = do_capture(&fx, &run, &[]).unwrap();
@@ -774,14 +766,8 @@ fn a_bundle_the_run_could_not_adopt_is_adopted_by_the_next_call_after_its_hmac_i
         secret_bundle: Some(run_bundle_path(&store, &run2)),
         ..params
     };
-    let left = remote_task_runner::source::capture_for_run(
-        &fx.env(),
-        &store,
-        &run2,
-        &fx.request(),
-        &params,
-    )
-    .unwrap();
+    let left =
+        belt::source::capture_for_run(&fx.env(), &store, &run2, &fx.request(), &params).unwrap();
     let copy = left.secrets.unwrap();
     let text = std::fs::read_to_string(&copy).unwrap();
     let orig = hex_encode(ENV_TEXT.as_bytes());
@@ -830,7 +816,7 @@ fn the_sweep_removes_the_leftover_bundles_nobody_will_adopt() {
         secret_key: fx.key.as_bytes().to_vec(),
         ..CaptureParams::default()
     };
-    let left = remote_task_runner::source::capture_for_run(
+    let left = belt::source::capture_for_run(
         &fx.env(),
         &store,
         &RunId::generate(),
@@ -842,18 +828,18 @@ fn the_sweep_removes_the_leftover_bundles_nobody_will_adopt() {
     let id = left.manifest.ci_source_id.clone();
     // a run still waits for it: kept
     assert_eq!(
-        remote_task_runner::secrets::capture::sweep_store_copies(&store, |s| s == id).unwrap(),
+        belt::secrets::capture::sweep_store_copies(&store, |s| s == id).unwrap(),
         0
     );
     assert!(copy.exists());
     // nobody does: removed, and a second sweep has nothing to do
     assert_eq!(
-        remote_task_runner::secrets::capture::sweep_store_copies(&store, |_| false).unwrap(),
+        belt::secrets::capture::sweep_store_copies(&store, |_| false).unwrap(),
         1
     );
     assert!(!copy.exists());
     assert_eq!(
-        remote_task_runner::secrets::capture::sweep_store_copies(&store, |_| false).unwrap(),
+        belt::secrets::capture::sweep_store_copies(&store, |_| false).unwrap(),
         0
     );
     assert_no_plaintext(&fx.state.join("sources"));
@@ -1036,8 +1022,8 @@ fn a_bundle_of_another_run_is_not_placed_for_this_attempt() {
 
 #[test]
 fn no_secret_type_shows_a_value_or_the_key_in_debug() {
-    use remote_task_runner::secrets::envfile::secret_values;
-    use remote_task_runner::secrets::mask::Masker;
+    use belt::secrets::envfile::secret_values;
+    use belt::secrets::mask::Masker;
     let fx = fixture(Some(".env\n"));
     let run = RunId::generate();
     let got = do_capture(&fx, &run, &[]).unwrap();

@@ -74,7 +74,7 @@ impl FakeRemote {
         Some(fault)
     }
     fn digest_in(shell: &str) -> String {
-        let at = shell.find("/rtr-").expect("a staged path") + 5;
+        let at = shell.find("/belt-").expect("a staged path") + "/belt-".len();
         shell[at..at + 64].to_string()
     }
 }
@@ -143,7 +143,9 @@ impl Remote for FakeRemote {
         timeout: Duration,
     ) -> Result<RemoteOutput, String> {
         self.log.push(shell.to_string());
-        let staged = self.staging.join(format!("rtr-{}", Self::digest_in(shell)));
+        let staged = self
+            .staging
+            .join(format!("belt-{}", Self::digest_in(shell)));
         if shell.starts_with("uname -s") {
             let state = if staged.exists() { "staged" } else { "absent" };
             let machine = self.uname.1.unwrap_or(super::super::local_arch());
@@ -183,7 +185,7 @@ impl Remote for FakeRemote {
             .into_iter()
             .find(|a| shell.contains(&format!(" worker-service {a} --wait-secs 600")))
             .expect("a helper action");
-        assert!(shell.starts_with("exec \"$HOME/.remote-task-runner-bootstrap/rtr-"));
+        assert!(shell.starts_with("exec \"$HOME/.belt-bootstrap/belt-"));
         self.actions.push(action.to_string());
         self.timeouts.push(timeout);
         let fault = self.fault(action);
@@ -265,9 +267,9 @@ impl World {
             ])
         };
         let (env, worker_env) = (home("parent"), home("worker"));
-        let key_path = root.join("parent/.config/remote-task-runner/cluster.key");
+        let key_path = root.join("parent/.config/belt/cluster.key");
         crate::secrets::key::init(&key_path).unwrap();
-        let (old_exe, exe) = (root.join("rtr-old"), root.join("rtr"));
+        let (old_exe, exe) = (root.join("belt-old"), root.join("belt"));
         fs::write(&old_exe, b"old version").unwrap();
         fs::write(&exe, b"new version").unwrap();
         let cluster = ClusterId::generate();
@@ -879,7 +881,7 @@ fn a_failed_commit_is_said_without_undoing_the_upgrade() {
 #[test]
 fn a_registration_that_cannot_be_updated_is_said_after_the_worker_was_resumed() {
     let mut w = World::registered(false);
-    let config = w.env["HOME"].clone() + "/.config/remote-task-runner";
+    let config = w.env["HOME"].clone() + "/.config/belt";
     let lock = |mode| fs::set_permissions(&config, fs::Permissions::from_mode(mode)).unwrap();
     lock(0o500);
     let error = w.upgrade();
@@ -906,7 +908,7 @@ fn a_registration_that_cannot_be_updated_is_said_after_the_worker_was_resumed() 
         OPTIONS,
     )
     .unwrap();
-    let config = w.env["HOME"].clone() + "/.config/remote-task-runner";
+    let config = w.env["HOME"].clone() + "/.config/belt";
     fs::set_permissions(&config, fs::Permissions::from_mode(0o500)).unwrap();
     let error = w.upgrade();
     fs::set_permissions(&config, fs::Permissions::from_mode(0o700)).unwrap();
@@ -1129,7 +1131,7 @@ fn a_double_that_models_no_features_answers_the_requiring_probe_as_the_plain_one
     let target = target_of("ci@mini-a.local").unwrap();
     let cluster = ClusterId::generate();
     let hello = Plain
-        .bridge_hello_with(&target, "rtr", &cluster, &required())
+        .bridge_hello_with(&target, "belt", &cluster, &required())
         .unwrap();
     assert_eq!(
         hello,
@@ -1210,7 +1212,7 @@ fn upgrade_needs_a_registered_worker_a_cluster_and_a_host_its_binary_runs_on() {
 impl World {
     /// The build made for the worker's platform: other bytes than `exe`.
     fn build(&self) -> PathBuf {
-        let build = self.exe.with_file_name("rtr-for-the-worker");
+        let build = self.exe.with_file_name("belt-for-the-worker");
         fs::write(&build, b"new version, built for the worker").unwrap();
         build
     }
@@ -1274,13 +1276,13 @@ fn a_worker_of_another_platform_is_upgraded_with_the_named_build() {
 #[test]
 fn a_build_of_another_version_is_removed_and_the_worker_is_not_switched() {
     let mut w = World::new();
-    w.remote.version = Some("remote-task-runner 0.0.0-other\n".into());
+    w.remote.version = Some("belt 0.0.0-other\n".into());
     let build = w.build();
     let digest = sha256_file(&build).unwrap();
     let error = w.upgrade_with(&build).unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidInput);
     assert!(
-        error.message.contains("remote-task-runner 0.0.0-other")
+        error.message.contains("belt 0.0.0-other")
             && error.message.contains("nothing was installed or switched")
             && error.message.contains("the staged copy was removed"),
         "{}",
@@ -1289,7 +1291,7 @@ fn a_build_of_another_version_is_removed_and_the_worker_is_not_switched() {
     // No helper action ran: the old version serves, undrained, and the
     // staged copy is gone.
     assert!(w.actions().is_empty());
-    assert!(!w.remote.staging.join(format!("rtr-{digest}")).exists());
+    assert!(!w.remote.staging.join(format!("belt-{digest}")).exists());
     w.assert_serving(&w.old.clone());
     // The same build is fine once it reports this parent's version.
     w.remote.version = None;
@@ -1419,7 +1421,7 @@ fn the_staged_command_is_a_fixed_string_around_the_digest() {
     assert_eq!(
         staged_command(&"a".repeat(64), "status"),
         format!(
-            "exec \"$HOME/.remote-task-runner-bootstrap/rtr-{}\" worker-service status --wait-secs 600",
+            "exec \"$HOME/.belt-bootstrap/belt-{}\" worker-service status --wait-secs 600",
             "a".repeat(64)
         )
     );

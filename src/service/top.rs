@@ -208,11 +208,8 @@ fn interactive(refresh: Duration) -> io::Result<()> {
                 ])
                 .areas(f.area());
                 f.render_widget(
-                    Paragraph::new(format!(
-                        "remote-task-runner top   every {}s",
-                        refresh.as_secs_f64()
-                    ))
-                    .style(Style::default().bold()),
+                    Paragraph::new(format!("belt top   every {}s", refresh.as_secs_f64()))
+                        .style(Style::default().bold()),
                     head,
                 );
                 offset = offset.min(view.len().saturating_sub(usize::from(body.height)));
@@ -277,7 +274,7 @@ pub(crate) fn command(refresh: Duration, json: bool) -> i32 {
         );
     }
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        eprintln!("error: top requires a terminal for stdin and stdout; use remote-task-runner --json top for one snapshot");
+        eprintln!("error: top requires a terminal for stdin and stdout; use belt --json top for one snapshot");
         return ErrorCode::InvalidInput.exit_code();
     }
     match interactive(refresh) {

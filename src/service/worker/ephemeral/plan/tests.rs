@@ -16,7 +16,7 @@ fn plan_with(
 ) -> Result<Plan, String> {
     let cluster = ClusterId::generate().to_string();
     let key = PathBuf::from("/secrets/cluster.key");
-    let exe = PathBuf::from("/opt/rtr");
+    let exe = PathBuf::from("/opt/belt");
     let mut request = Request {
         cluster: &cluster,
         name: "colab",
@@ -40,15 +40,12 @@ fn a_clean_host_gets_a_worker_with_a_fresh_identity() {
     let p = plan_with(&env, |_, _| {}).unwrap();
     assert_eq!(p.spec.worker_id.as_str(), "colab");
     assert_eq!(p.spec.schema, 1);
-    assert_eq!(
-        p.spec.state_dir,
-        PathBuf::from("/home/u/.remote-task-runner")
-    );
+    assert_eq!(p.spec.state_dir, PathBuf::from("/home/u/.belt"));
     assert_eq!(
         p.spec.cluster_key_path,
         PathBuf::from("/secrets/cluster.key")
     );
-    assert_eq!(p.spec.executable, PathBuf::from("/opt/rtr"));
+    assert_eq!(p.spec.executable, PathBuf::from("/opt/belt"));
     assert_eq!(p.spec.config, "schema_version = 1\n");
     assert_eq!(
         p.boot_id.as_str(),

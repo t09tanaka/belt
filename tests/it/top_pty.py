@@ -1,4 +1,4 @@
-"""Black-box terminal acceptance for remote-task-runner top (Linux and macOS)."""
+"""Black-box terminal acceptance for belt top (Linux and macOS)."""
 import contextlib
 import fcntl
 import json
@@ -12,7 +12,7 @@ import sys
 import termios
 import time
 
-RTR = sys.argv[1]
+belt = sys.argv[1]
 ENTER = b"\x1b[?1049h"
 LEAVE = b"\x1b[?1049l"
 CSI = re.compile(rb"\x1b\[[0-?]*[ -/]*[@-~]")
@@ -63,7 +63,7 @@ def visible(transcript):
 
 
 def cli(*args):
-    result = subprocess.run([RTR, *args], capture_output=True, timeout=45)
+    result = subprocess.run([belt, *args], capture_output=True, timeout=45)
     assert result.returncode == 0, (args, result.stdout, result.stderr)
     return json.loads(result.stdout)
 
@@ -111,7 +111,7 @@ def terminal():
                        'after=$(stty -g) || exit 92; '
                        '[ "$after" = "$before" ] || exit 93; exit "$status"')
         process = subprocess.Popen(["/bin/sh", "-c", check_modes, "caller",
-                                    RTR, "top", "--interval", "0.2"],
+                                    belt, "top", "--interval", "0.2"],
                                    stdin=slave, stdout=slave, stderr=slave,
                                    preexec_fn=take_terminal)
         screen = Screen(master, slave, process)
@@ -135,7 +135,7 @@ def quit_top(screen, key):
 
 
 def main():
-    bad = subprocess.run([RTR, "top"], stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
+    bad = subprocess.run([belt, "top"], stdin=subprocess.DEVNULL, capture_output=True, timeout=10)
     assert bad.returncode != 0 and ENTER not in bad.stdout and b"terminal" in bad.stderr.lower()
     root = Path(os.environ["HOME"])
     marker, release = root / "command-started", root / "release-command"
@@ -174,7 +174,7 @@ def main():
             # No key, resize or restart triggers this update.
             screen.expect(lambda _: completed(), "active task disappears after completion")
             screen.resize(200)
-            screen.expect(lambda data: b"remote-task-runner" in CSI.sub(b"", data)
+            screen.expect(lambda data: b"belt" in CSI.sub(b"", data)
                           and completed(), "redraw the empty table after resize")
             quit_top(screen, b"q")
         for key in (b"\x1b", b"\x03"):

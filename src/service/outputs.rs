@@ -547,7 +547,7 @@ mod tests {
     #[test]
     fn parser_outputs_attempt_and_required_dir_validation() {
         assert!(crate::cli::Cli::try_parse_from([
-            "rtr",
+            "belt",
             "outputs",
             "task",
             "--dir",
@@ -556,7 +556,7 @@ mod tests {
             "a"
         ])
         .is_ok());
-        let cli = crate::cli::Cli::try_parse_from(["rtr", "--json", "outputs", "bad"]).unwrap();
+        let cli = crate::cli::Cli::try_parse_from(["belt", "--json", "outputs", "bad"]).unwrap();
         assert_eq!(crate::cli::run(cli), 2);
     }
     #[tokio::test]

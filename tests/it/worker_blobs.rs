@@ -5,26 +5,26 @@
 //! serves the artifacts of an attempt and nothing else.
 
 use crate::proto_common::client_cfg;
-use local_ci::source::SourceManifest as CiManifest;
-use local_ci::ExecContext;
-use remote_task_runner::error::{ApiError, BlockedReason, ConflictReason, ErrorCode};
-use remote_task_runner::ids::*;
-use remote_task_runner::protocol::transfer::put_blob_as;
-use remote_task_runner::protocol::transport::duplex_pair;
-use remote_task_runner::protocol::{connect, CallError, Client};
-use remote_task_runner::source::{capture, CaptureParams, SourceRequest, SourceStore};
-use remote_task_runner::state::{AttemptState, Outcome, Termination};
-use remote_task_runner::storage::{AcceptedAttempt, NewAcceptance, WorkerStore};
-use remote_task_runner::supervisor::outcome::{store_artifact, ArtifactInput, Forbidden};
-use remote_task_runner::wire::*;
-use remote_task_runner::worker::blob_policy::{
+use belt::error::{ApiError, BlockedReason, ConflictReason, ErrorCode};
+use belt::ids::*;
+use belt::protocol::transfer::put_blob_as;
+use belt::protocol::transport::duplex_pair;
+use belt::protocol::{connect, CallError, Client};
+use belt::source::{capture, CaptureParams, SourceRequest, SourceStore};
+use belt::state::{AttemptState, Outcome, Termination};
+use belt::storage::{AcceptedAttempt, NewAcceptance, WorkerStore};
+use belt::supervisor::outcome::{store_artifact, ArtifactInput, Forbidden};
+use belt::wire::*;
+use belt::worker::blob_policy::{
     bundle_prerequisites, lock_shard, parse_reservation, staged_name, BlobLimits, Reservation,
 };
-use remote_task_runner::worker::blobs::{self, BlobSink, Incoming};
-use remote_task_runner::worker::machine::Machine;
-use remote_task_runner::worker::serve::serve_connection;
-use remote_task_runner::worker::{Agent, AgentConfig, Host};
-use remote_task_runner::workspace::{CliFastWorktree, Workspace, Workspaces};
+use belt::worker::blobs::{self, BlobSink, Incoming};
+use belt::worker::machine::Machine;
+use belt::worker::serve::serve_connection;
+use belt::worker::{Agent, AgentConfig, Host};
+use belt::workspace::{CliFastWorktree, Workspace, Workspaces};
+use local_ci::source::SourceManifest as CiManifest;
+use local_ci::ExecContext;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -101,14 +101,14 @@ struct Fx {
 
 /// The directory of the installed `fast-worktree` (a Git source is prepared
 /// with it). Without one the test cannot run an attempt: that is a failure
-/// where it is required (`RTR_REQUIRE_FAST_WORKTREE`, set in CI), and said
+/// where it is required (`BELT_REQUIRE_FAST_WORKTREE`, set in CI), and said
 /// aloud elsewhere.
 fn fast_worktree_dir() -> Option<PathBuf> {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let found = std::env::split_paths(&path).find(|d| d.join("fast-worktree").is_file());
     if found.is_none() {
         assert!(
-            std::env::var_os("RTR_REQUIRE_FAST_WORKTREE").is_none(),
+            std::env::var_os("BELT_REQUIRE_FAST_WORKTREE").is_none(),
             "fast-worktree is required here and is not installed"
         );
         eprintln!("fast-worktree is not installed: no attempt is run from the Git source");
@@ -118,7 +118,7 @@ fn fast_worktree_dir() -> Option<PathBuf> {
 
 fn fx() -> Fx {
     let dir = tempfile::Builder::new()
-        .prefix("rtr-blobs-")
+        .prefix("belt-blobs-")
         .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .unwrap();
     std::fs::create_dir_all(dir.path().join("home")).unwrap();
@@ -338,7 +338,7 @@ exec "{real}" "$@"
             self.state(),
             WorkerId::parse("w-test").unwrap(),
             WorkerBootId::parse("boot-a").unwrap(),
-            PathBuf::from(env!("CARGO_BIN_EXE_remote-task-runner")),
+            PathBuf::from(env!("CARGO_BIN_EXE_belt")),
         );
         cfg.poll_ms = 25;
         cfg.inhibit_sleep = false;
@@ -418,7 +418,7 @@ impl Host for RealButCore {
     fn placed_secrets(
         &self,
         a: &AcceptedAttempt,
-    ) -> Result<remote_task_runner::secrets::place::Placed, ApiError> {
+    ) -> Result<belt::secrets::place::Placed, ApiError> {
         self.0.placed_secrets(a)
     }
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
@@ -1536,7 +1536,7 @@ fn a_source_whose_last_step_was_lost_is_published_by_sending_anything_again() {
     // (here: they are put there behind its back).
     let store = f.worker_store();
     for (hash, bytes) in &p.blobs {
-        let want = remote_task_runner::source::diff::BlobWant {
+        let want = belt::source::diff::BlobWant {
             hash: hash.clone(),
             size: bytes.len() as u64,
         };
@@ -2001,8 +2001,8 @@ fn a_source_holds_one_bundle_and_its_size_counts() {
 
 #[test]
 fn a_hash_keeps_the_size_the_first_manifest_gave_it() {
+    use belt::source::classify::source_id_of_ci;
     use local_ci::source::{seal_manifest, RelPath, SubmoduleRef};
-    use remote_task_runner::source::classify::source_id_of_ci;
     let f = fx();
     let (top, sub) = (f.directory("top", 60), f.directory("sub", 61));
     let (hash, big) = top.blob_of_len(5000);
@@ -2132,8 +2132,8 @@ fn clone_scratch(f: &Fx) -> Vec<PathBuf> {
 /// `b`'s manifest, sealed again, with its first file given as the file
 /// `hash` with `size` bytes; and the files it still names of `b`.
 fn lying_about(b: &Parcel, hash: &str, size: u64) -> (SourceId, Vec<u8>, Vec<Vec<u8>>) {
+    use belt::source::classify::source_id_of_ci;
     use local_ci::source::seal_manifest;
-    use remote_task_runner::source::classify::source_id_of_ci;
     let mut m = b.root.clone();
     m.object_manifest.entries[0].hash = hash.to_string();
     m.object_manifest.entries[0].size = size;
@@ -2511,8 +2511,8 @@ fn a_bundle_is_asked_of_the_disk_with_what_its_manifest_reserved() {
 
 #[test]
 fn a_commit_with_no_repository_to_hold_it_is_refused_before_the_store_is_written() {
+    use belt::source::classify::source_id_of_ci;
     use local_ci::source::{seal_manifest, RelPath, SubmoduleRef};
-    use remote_task_runner::source::classify::source_id_of_ci;
     let f = fx();
     let repo = f.path("repo");
     std::fs::create_dir_all(&repo).unwrap();
@@ -2825,7 +2825,7 @@ fn a_bundle_waits_for_another_import_into_the_same_clone() {
 
 #[test]
 fn a_source_keeps_a_few_bundle_files_in_the_parent_store_and_they_can_be_removed() {
-    use remote_task_runner::source::store::MAX_BUNDLES_PER_SOURCE;
+    use belt::source::store::MAX_BUNDLES_PER_SOURCE;
     let f = fx();
     let repo = project(&f);
     let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
@@ -3200,8 +3200,8 @@ fn a_bundle_with_the_snapshot_of_a_submodule_at_another_commit_sets_no_ref() {
 
 #[test]
 fn a_manifest_that_names_a_commit_or_a_tree_by_something_else_is_refused() {
+    use belt::source::classify::source_id_of_ci;
     use local_ci::source::seal_manifest;
-    use remote_task_runner::source::classify::source_id_of_ci;
     let f = fx();
     let (_, p) = small_project(&f);
     let m = f.machine();
@@ -3228,7 +3228,7 @@ fn a_manifest_that_names_a_commit_or_a_tree_by_something_else_is_refused() {
 
 #[test]
 fn an_old_bundle_file_that_cannot_be_removed_does_not_fail_the_export() {
-    use remote_task_runner::source::store::MAX_BUNDLES_PER_SOURCE;
+    use belt::source::store::MAX_BUNDLES_PER_SOURCE;
     let f = fx();
     let (_, p) = small_project(&f);
     let store = f.parent();

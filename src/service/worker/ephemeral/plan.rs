@@ -70,7 +70,7 @@ pub fn plan(request: &Request<'_>, host: &Host<'_>) -> Result<Plan, String> {
         .iter()
         .filter_map(|k| Some((k.to_string(), host.env.get(*k)?.clone())))
         .collect();
-    let state_dir: PathBuf = Path::new(home).join(".remote-task-runner");
+    let state_dir: PathBuf = Path::new(home).join(".belt");
     Ok(Plan {
         boot_id: boot_id(host.os_boot, host.instance)?,
         spec: WorkerSpec {

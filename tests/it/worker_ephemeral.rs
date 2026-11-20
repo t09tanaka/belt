@@ -1,14 +1,14 @@
 //! `worker --ephemeral` as the real binary, in a private HOME: it installs
 //! nothing, starts with a fresh identity each time, refuses to take over a
 //! resident worker's place and removes its state when it is stopped.
-use remote_task_runner::ids::ClusterId;
-use remote_task_runner::protocol::{connect, transport::Io};
+use belt::ids::ClusterId;
+use belt::protocol::{connect, transport::Io};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
-const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
+const BIN: &str = env!("CARGO_BIN_EXE_belt");
 const T: Duration = Duration::from_secs(20);
 
 struct Fx {
@@ -17,9 +17,9 @@ struct Fx {
 }
 impl Fx {
     fn new() -> Self {
-        let root = crate::test_tmp::prefixed("rtr-eph-").unwrap();
+        let root = crate::test_tmp::prefixed("belt-eph-").unwrap();
         std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        remote_task_runner::secrets::key::init(&root.path().join("key")).unwrap();
+        belt::secrets::key::init(&root.path().join("key")).unwrap();
         Fx {
             root,
             cluster: ClusterId::generate(),
@@ -29,7 +29,7 @@ impl Fx {
         self.root.path()
     }
     fn state(&self) -> PathBuf {
-        self.home().join(".remote-task-runner")
+        self.home().join(".belt")
     }
     fn command(&self, extra: &[&str]) -> tokio::process::Command {
         let mut c = tokio::process::Command::new(BIN);
@@ -103,13 +103,13 @@ impl Fx {
         );
         // The ephemeral process has no installed service journal. The report
         // must come from the profile of the process serving this bridge.
-        use remote_task_runner::wire::{EnvReportRequest, Request, Response, SchemaVersion};
+        use belt::wire::{EnvReportRequest, Request, Response, SchemaVersion};
         let response = connected
             .client
             .call(
                 Request::EnvReport(EnvReportRequest {
                     schema_version: SchemaVersion::CURRENT,
-                    request_id: remote_task_runner::ids::RequestId::generate(),
+                    request_id: belt::ids::RequestId::generate(),
                     required: vec![],
                 }),
                 Duration::from_secs(60),
@@ -120,10 +120,7 @@ impl Fx {
             panic!("unexpected environment reply")
         };
         let environment = answer.environment.expect("active worker's full report");
-        assert_eq!(
-            environment.schema_version,
-            remote_task_runner::toolchain::envdiff::SCHEMA
-        );
+        assert_eq!(environment.schema_version, belt::toolchain::envdiff::SCHEMA);
         assert_eq!(environment.os, answer.os);
         assert_eq!(environment.arch, answer.arch);
         assert!(!environment.profile.is_empty());
@@ -138,10 +135,10 @@ impl Fx {
     }
     async fn stop(&self, mut child: tokio::process::Child, pid: u32, start: String) {
         assert_eq!(
-            remote_task_runner::platform::process_start_identity(pid),
-            remote_task_runner::platform::StartIdentity::Identity(start)
+            belt::platform::process_start_identity(pid),
+            belt::platform::StartIdentity::Identity(start)
         );
-        assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGTERM));
+        assert!(belt::platform::signal_pid(pid, libc::SIGTERM));
         let status = tokio::time::timeout(T, child.wait())
             .await
             .unwrap()
@@ -152,7 +149,7 @@ impl Fx {
     fn assert_nothing_installed(&self) {
         assert!(!self.home().join("Library").exists());
         assert!(!self.home().join(".config/systemd").exists());
-        assert!(!self.home().join(".config/remote-task-runner").exists());
+        assert!(!self.home().join(".config/belt").exists());
     }
 }
 
@@ -166,7 +163,7 @@ async fn it_runs_under_a_fresh_identity_installs_nothing_and_cleans_up() {
         assert!(fx.state().join("agent.sock").exists());
         let (worker, boot) = fx.hello().await;
         assert_eq!(worker, "colab");
-        let os_boot = remote_task_runner::platform::boot_id().unwrap();
+        let os_boot = belt::platform::boot_id().unwrap();
         assert!(boot.starts_with(&format!("{os_boot}.")), "{boot}");
         fx.assert_nothing_installed();
         fx.stop(child, pid, start).await;
@@ -198,7 +195,7 @@ async fn it_refuses_existing_state_and_a_resident_worker_and_changes_nothing() {
     );
     std::fs::remove_dir_all(fx.state()).unwrap();
     // A resident worker's journal: the role must not exist beside it.
-    let config = fx.home().join(".config/remote-task-runner");
+    let config = fx.home().join(".config/belt");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::write(config.join("worker-service.json"), "{}").unwrap();
     let out = tokio::time::timeout(T, fx.command(&[]).spawn().unwrap().wait_with_output())
@@ -241,7 +238,7 @@ fn the_command_line_needs_all_of_cluster_name_and_key_and_never_mixes_roles() {
         Some(2)
     );
     // A bad value is reported by the worker itself, before anything exists.
-    let home = crate::test_tmp::prefixed("rtr-eph-").unwrap();
+    let home = crate::test_tmp::prefixed("belt-eph-").unwrap();
     let out = std::process::Command::new(BIN)
         .args([
             "worker",
@@ -257,5 +254,5 @@ fn the_command_line_needs_all_of_cluster_name_and_key_and_never_mixes_roles() {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
-    assert!(!home.path().join(".remote-task-runner").exists());
+    assert!(!home.path().join(".belt").exists());
 }

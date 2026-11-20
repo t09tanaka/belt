@@ -8,15 +8,13 @@
 //! No process is started here. A "crash" is the coordinator dropped where
 //! it stands and its database and result store opened again.
 
-use remote_task_runner::ci::status::Computed;
-use remote_task_runner::coordinator::policy::Limits;
-use remote_task_runner::coordinator::{
-    Coordinator, CoordinatorConfig, LinkError, TaskSpec, WorkerLink,
-};
-use remote_task_runner::error::{ApiError, ErrorCode};
-use remote_task_runner::ids::*;
-use remote_task_runner::platform::wall_ms;
-use remote_task_runner::results::plan::{RunVerdict, TaskStanding, Verdict};
+use belt::ci::status::Computed;
+use belt::coordinator::policy::Limits;
+use belt::coordinator::{Coordinator, CoordinatorConfig, LinkError, TaskSpec, WorkerLink};
+use belt::error::{ApiError, ErrorCode};
+use belt::ids::*;
+use belt::platform::wall_ms;
+use belt::results::plan::{RunVerdict, TaskStanding, Verdict};
 // Deterministic clock samples for retention integration; production uses
 // suspend-aware platform samples and a persisted quarantine baseline.
 #[derive(Default)]
@@ -24,12 +22,12 @@ struct Sweep {
     deleted: Vec<String>,
 }
 fn sweep(
-    store: &remote_task_runner::storage::CoordinatorStore,
+    store: &belt::storage::CoordinatorStore,
     files: &ResultStore,
     now: u64,
     days: u32,
-) -> Result<Sweep, remote_task_runner::results::CollectError> {
-    let retention = remote_task_runner::results::plan::retention_ms(days);
+) -> Result<Sweep, belt::results::CollectError> {
+    let retention = belt::results::plan::retention_ms(days);
     let mut report = Sweep::default();
     for run in store.query_runs(64, None)?.items {
         let guard = crate::test_tmp::gc_guard(store, &run.run_id);
@@ -69,12 +67,12 @@ fn sweep(
     }
     Ok(report)
 }
-use remote_task_runner::results::{CollectConfig, CollectReport, ResultStore};
-use remote_task_runner::state::{
+use belt::results::{CollectConfig, CollectReport, ResultStore};
+use belt::state::{
     AttemptState, Collection, Observation, Outcome, Receipt, Receipts, RunDisplay, Termination,
 };
-use remote_task_runner::storage::{CoordinatorStore, Seen, StorageError};
-use remote_task_runner::wire::*;
+use belt::storage::{CoordinatorStore, Seen, StorageError};
+use belt::wire::*;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::future::Future;
@@ -167,9 +165,9 @@ fn ended(outcome: Outcome) -> Termination {
     Termination::new(
         outcome,
         None,
-        (outcome == Outcome::TimedOut).then_some(remote_task_runner::state::TimeoutInfo {
-            kind: remote_task_runner::state::TimeoutKind::ResourceWait,
-            phase: remote_task_runner::state::TimeoutPhase::Waiting,
+        (outcome == Outcome::TimedOut).then_some(belt::state::TimeoutInfo {
+            kind: belt::state::TimeoutKind::ResourceWait,
+            phase: belt::state::TimeoutPhase::Waiting,
         }),
     )
     .unwrap()
@@ -504,9 +502,9 @@ impl WorkerLink for Worker {
     fn ci_task_negotiated(&self) -> bool {
         !self.state.lock().unwrap().no_ci
     }
-    fn placement_inputs(&self) -> Option<remote_task_runner::coordinator::PlacementInputs> {
+    fn placement_inputs(&self) -> Option<belt::coordinator::PlacementInputs> {
         let refused = self.state.lock().unwrap().refused_plan.is_some();
-        refused.then(|| remote_task_runner::coordinator::PlacementInputs {
+        refused.then(|| belt::coordinator::PlacementInputs {
             generation: 1,
             ready: Vec::new(),
             identity: None,
@@ -523,8 +521,8 @@ impl WorkerLink for Worker {
         })
         .collect()
     }
-    fn cost_transport(&self) -> Option<remote_task_runner::scheduler::measured::Transport> {
-        Some(remote_task_runner::scheduler::measured::Transport {
+    fn cost_transport(&self) -> Option<belt::scheduler::measured::Transport> {
+        Some(belt::scheduler::measured::Transport {
             worker_boot: WorkerBootId::parse("boot-1").unwrap(),
             agent_epoch: AgentEpoch(1),
             policy: "verified-memory-fixture-v1".into(),
@@ -610,11 +608,11 @@ impl Fx {
     /// Start a coordinator and open the result store on the state directory:
     /// the first, or the next after the one before was dropped.
     fn open(&self) -> (Coordinator, Arc<ResultStore>) {
-        self.open_with(Arc::new(remote_task_runner::scheduler::UnknownCosts))
+        self.open_with(Arc::new(belt::scheduler::UnknownCosts))
     }
     fn open_with(
         &self,
-        costs: Arc<dyn remote_task_runner::scheduler::CostModel>,
+        costs: Arc<dyn belt::scheduler::CostModel>,
     ) -> (Coordinator, Arc<ResultStore>) {
         let started = std::time::Instant::now();
         let store = loop {
@@ -633,8 +631,7 @@ impl Fx {
             lease_ms: 60_000,
             worker_budget_ms: 10_000,
         };
-        let scheduler =
-            remote_task_runner::scheduler::Scheduler::new(Default::default(), costs).unwrap();
+        let scheduler = belt::scheduler::Scheduler::new(Default::default(), costs).unwrap();
         let c = Coordinator::start_with(store, cfg, scheduler).unwrap();
         c.try_attach(
             self.w.id.clone(),
@@ -689,7 +686,7 @@ fn stored(
     bytes: &[u8],
 ) -> (ArtifactRecord, Vec<u8>) {
     let record = ArtifactRecord {
-        encoding: remote_task_runner::wire::ArtifactEncoding::Raw,
+        encoding: belt::wire::ArtifactEncoding::Raw,
         name: name.into(),
         path: name.into(),
         size: bytes.len() as u64,
@@ -1496,7 +1493,7 @@ async fn collected_results_are_kept_for_the_retention_and_then_deleted() {
 
 #[tokio::test]
 async fn a_parent_that_dies_between_a_file_operation_and_its_record_continues_from_the_files() {
-    use remote_task_runner::results::store::Crash;
+    use belt::results::store::Crash;
     for point in [
         Crash::ResultWritten,
         Crash::LogAppended,
@@ -1740,7 +1737,7 @@ async fn strikes_start_over_with_verified_progress_and_a_worker_that_forgot_clos
 
 #[tokio::test]
 async fn a_part_a_dead_parent_left_torn_is_fetched_again_and_is_no_strike() {
-    use remote_task_runner::results::store::Crash;
+    use belt::results::store::Crash;
     let fx = fx();
     let (c, files) = fx.open();
     let (_, _, a) = placed(&fx, &c, two()).await;
@@ -2046,12 +2043,12 @@ async fn active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_
     // The same public observer used by CLI follow sees active committed bytes
     // before termination, and keeps waiting rather than treating file EOF as done.
     let task = c.store().get_attempt(&a).unwrap().unwrap().task_id;
-    let mut observer = remote_task_runner::service::logs::Observer::new(
-        remote_task_runner::service::query::Reader::Offline(Arc::new(
+    let mut observer = belt::service::logs::Observer::new(
+        belt::service::query::Reader::Offline(Arc::new(
             CoordinatorStore::open_read_only(fx.dir.path()).unwrap(),
         )),
         fx.dir.path().join("results"),
-        remote_task_runner::service::completion::Target::Task(task),
+        belt::service::completion::Target::Task(task),
         None,
     )
     .unwrap();
@@ -2227,7 +2224,7 @@ async fn active_pages_above_64_and_hot_logs_do_not_starve_terminal_artifacts() {
         let db = c.store();
         db.create_task(&task, &run, &json!({}), 1).unwrap();
         db.create_attempt(
-            remote_task_runner::storage::NewAttempt {
+            belt::storage::NewAttempt {
                 attempt_id: a.clone(),
                 task_id: task.clone(),
                 worker_id: fx.w.id.clone(),
@@ -2472,7 +2469,7 @@ async fn retirement_and_replacement_during_log_rpc_never_mix_attempt_bytes() {
     let new = AttemptId::generate();
     let record = db
         .create_attempt(
-            remote_task_runner::storage::NewAttempt {
+            belt::storage::NewAttempt {
                 attempt_id: new.clone(),
                 task_id: task.clone(),
                 worker_id: fx.w.id.clone(),
@@ -2532,9 +2529,9 @@ async fn retirement_and_replacement_during_log_rpc_never_mix_attempt_bytes() {
 
 #[tokio::test]
 async fn generic_bundle_encoding_conditions_and_exact_receipt_are_enforced() {
-    use remote_task_runner::supervisor::bundles::store_bundle;
-    use remote_task_runner::supervisor::outcome::Forbidden;
-    use remote_task_runner::supervisor::spec::ArtifactsSpec;
+    use belt::supervisor::bundles::store_bundle;
+    use belt::supervisor::outcome::Forbidden;
+    use belt::supervisor::spec::ArtifactsSpec;
     for (when, outcome, required, include, wrong_encoding, drop_marker) in [
         (
             OutputWhen::Success,
@@ -2696,10 +2693,7 @@ async fn generic_bundle_encoding_conditions_and_exact_receipt_are_enforced() {
             assert!(fx.w.acks(&a).is_empty());
             continue;
         }
-        if !include
-            && required
-            && remote_task_runner::outputs::eligible(when, outcome, !drop_marker)
-        {
+        if !include && required && belt::outputs::eligible(when, outcome, !drop_marker) {
             assert_eq!(report.required_missing, vec![a.clone()]);
         } else {
             assert_eq!(report.collected, vec![a.clone()]);
@@ -2711,7 +2705,7 @@ async fn generic_bundle_encoding_conditions_and_exact_receipt_are_enforced() {
             let result: serde_json::Value =
                 serde_json::from_slice(&files.read_result(&a).unwrap().unwrap()).unwrap();
             assert_eq!(result["artifacts"][0]["encoding"], "tar_v1");
-        } else if required && remote_task_runner::outputs::eligible(when, outcome, !drop_marker) {
+        } else if required && belt::outputs::eligible(when, outcome, !drop_marker) {
             assert_eq!(collection.verdict, Some(Verdict::RequiredMissing));
         }
         if drop_marker {
@@ -2729,7 +2723,7 @@ async fn generic_bundle_encoding_conditions_and_exact_receipt_are_enforced() {
 
 #[tokio::test]
 async fn measured_terminal_tail_records_real_chunked_complete_collection_after_live_progress() {
-    use remote_task_runner::scheduler::{
+    use belt::scheduler::{
         measured::{collection_policy, CostQuery, MeasuredCosts},
         CostModel,
     };
@@ -2799,7 +2793,7 @@ const COLLECTION_PART: usize = 2;
 
 #[tokio::test]
 async fn measured_terminal_tail_fault_then_recovery_does_not_publish_partial_duration() {
-    use remote_task_runner::scheduler::measured::MeasuredCosts;
+    use belt::scheduler::measured::MeasuredCosts;
     let f = fx();
     let model = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
     let (c, files) = f.open_with(model.clone());
@@ -2831,7 +2825,7 @@ async fn measured_terminal_tail_fault_then_recovery_does_not_publish_partial_dur
 
 #[tokio::test]
 async fn measured_terminal_tail_durable_close_failure_keeps_sample_unknown_after_recovery() {
-    use remote_task_runner::scheduler::measured::MeasuredCosts;
+    use belt::scheduler::measured::MeasuredCosts;
     let f = fx();
     let model = Arc::new(MeasuredCosts::open(&f.dir.path().join("stats"), cfg()).unwrap());
     let (c, files) = f.open_with(model.clone());
@@ -2863,7 +2857,7 @@ async fn measured_terminal_tail_durable_close_failure_keeps_sample_unknown_after
 
 // ------------------------------------------------------------- CI tasks
 
-use remote_task_runner::supervisor::ci_task::RESULT_ARTIFACT;
+use belt::supervisor::ci_task::RESULT_ARTIFACT;
 
 /// The frozen plan of a workflow, made from a capture of its own (in a
 /// directory of its own: the parent of these tests holds no source).
@@ -2873,8 +2867,8 @@ fn ci_plan(workflow: &str) -> local_ci::FrozenPlan {
 }
 
 fn ci_plan_at(workflow: &str, state_dir: &std::path::Path, run: &RunId) -> local_ci::FrozenPlan {
+    use belt::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
     use local_ci::frozen::Filters;
-    use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
     let dir = crate::test_tmp::tempdir().unwrap();
     let home = dir.path().join("home");
     let project = dir.path().join("project");
@@ -2916,7 +2910,7 @@ fn ci_plan_at(workflow: &str, state_dir: &std::path::Path, run: &RunId) -> local
         base_branch: None,
         changed_files: None,
     };
-    remote_task_runner::ci::execute::freeze_plan(&store, &manifest, &options).unwrap()
+    belt::ci::execute::freeze_plan(&store, &manifest, &options).unwrap()
 }
 
 const CI_CHAIN: &str = "on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    outputs:\n      version: ${{ steps.v.outputs.version }}\n    steps:\n      - id: v\n        run: echo \"version=1.2.3\" >> \"$GITHUB_OUTPUT\"\n  test:\n    needs: build\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo one\n      - run: echo two\n";
@@ -2946,12 +2940,10 @@ async fn ci_run(
     c: &Coordinator,
     plan: &local_ci::FrozenPlan,
 ) -> (RunId, BTreeMap<String, TaskId>) {
-    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
+    let (digest, _) = belt::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
     let none = Default::default();
-    let specs =
-        remote_task_runner::service::ci_run::task_specs(plan, &digest, &manifest, &none, None)
-            .unwrap();
+    let specs = belt::service::ci_run::task_specs(plan, &digest, &manifest, &none, None).unwrap();
     let (run, source) = (RunId::generate(), SourceId::generate());
     c.store().put_source_ref(&source, &manifest, 1).unwrap();
     let mut ids = BTreeMap::new();
@@ -2966,10 +2958,9 @@ async fn ci_run(
     (run, ids)
 }
 
-fn ci_advance(fx: &Fx, c: &Coordinator) -> remote_task_runner::ci::advance::Pass {
+fn ci_advance(fx: &Fx, c: &Coordinator) -> belt::ci::advance::Pass {
     let results = fx.dir.path().join("results");
-    remote_task_runner::ci::advance::advance_runs(c.store(), fx.dir.path(), &results, wall_ms())
-        .unwrap()
+    belt::ci::advance::advance_runs(c.store(), fx.dir.path(), &results, wall_ms()).unwrap()
 }
 
 /// Collect until the collection of `a` is closed (a pass has a budget, and
@@ -3024,9 +3015,7 @@ async fn a38_a_job_that_needs_another_starts_elsewhere_once_the_result_is_here_a
     let a = report.placed[0].clone();
     assert_eq!(attempts(&build)[0].attempt_id, a);
     assert_eq!(other.count("submit"), 0);
-    let decision = remote_task_runner::scheduler::reason_of(c.store(), &a)
-        .unwrap()
-        .unwrap();
+    let decision = belt::scheduler::reason_of(c.store(), &a).unwrap().unwrap();
     let left_out = decision.excluded.iter().find(|e| e.worker_id == other.id);
     assert_eq!(left_out.unwrap().unmet, ["protocol feature ci_task_v1"]);
     let demand = c.store().placement_demand(&a).unwrap().unwrap();
@@ -3092,15 +3081,10 @@ async fn a38_a_job_that_needs_another_starts_elsewhere_once_the_result_is_here_a
     other.finish(&b, Outcome::Succeeded, ci_out(&b, &sent, &result));
     assert_eq!(c.tick().await.unwrap().settled, vec![b.clone()]);
     assert_eq!(ci_collect(&c, &files, &b).await.collected, vec![b]);
-    let target = remote_task_runner::service::completion::Target::Run(run.clone());
+    let target = belt::service::completion::Target::Run(run.clone());
     assert_eq!(c.store().completion(target).unwrap().exit_code(), Some(0));
-    let lines = remote_task_runner::service::ci_run::job_lines(
-        c.store(),
-        fx.dir.path(),
-        files.root(),
-        &run,
-    )
-    .unwrap();
+    let lines =
+        belt::service::ci_run::job_lines(c.store(), fx.dir.path(), files.root(), &run).unwrap();
     let seen: Vec<_> = lines
         .iter()
         .map(|l| (l.job.as_deref(), l.status.as_str()))
@@ -3169,19 +3153,14 @@ async fn a_ci_task_without_a_usable_result_is_no_success_and_the_next_job_sees_a
         let result = serde_json::to_vec(&skipped).unwrap();
         end(&fx, &c, &b, Outcome::Succeeded, ci_out(&b, &sent, &result)).await;
         assert_eq!(ci_collect(&c, &files, &b).await.collected, vec![b]);
-        let target = remote_task_runner::service::completion::Target::Run(run.clone());
+        let target = belt::service::completion::Target::Run(run.clone());
         let exit = c.store().completion(target).unwrap().exit_code();
         assert!(exit.is_some_and(|code| code != 0), "{exit:?}");
         // No job failed: a result that is lost is an error of the run.
         let status = ci_computed(&fx, &c, &files, &run);
         assert_eq!(status, Computed::Error, "{unreadable}");
-        let lines = remote_task_runner::service::ci_run::job_lines(
-            c.store(),
-            fx.dir.path(),
-            files.root(),
-            &run,
-        )
-        .unwrap();
+        let lines =
+            belt::service::ci_run::job_lines(c.store(), fx.dir.path(), files.root(), &run).unwrap();
         let test = lines
             .iter()
             .find(|l| l.job.as_deref() == Some("test"))
@@ -3221,7 +3200,7 @@ async fn a_cancelled_ci_run_releases_nothing_more_and_settles() {
     }
     assert!(c.store().attempts_of_task(&ids["test"]).unwrap().is_empty());
     assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
-    let target = remote_task_runner::service::completion::Target::Run(run.clone());
+    let target = belt::service::completion::Target::Run(run.clone());
     let snapshot = c.store().completion(target).unwrap();
     assert!(snapshot.settled());
     assert!(snapshot.exit_code().is_some_and(|code| code != 0));
@@ -3253,12 +3232,8 @@ async fn a_ci_run_whose_plan_is_gone_cancels_what_waits_and_says_why() {
     let a = report.placed[0].clone();
     assert!(ci_advance(&fx, &c).failed.is_empty());
 
-    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
-    std::fs::remove_file(remote_task_runner::worker::ci_task::plan_path(
-        fx.dir.path(),
-        &digest,
-    ))
-    .unwrap();
+    let (digest, _) = belt::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
+    std::fs::remove_file(belt::worker::ci_task::plan_path(fx.dir.path(), &digest)).unwrap();
     let pass = ci_advance(&fx, &c);
     assert_eq!(pass.failed.len(), 1, "{pass:?}");
     assert_eq!(pass.failed[0].0, run);
@@ -3303,16 +3278,11 @@ async fn a_ci_run_whose_plan_is_gone_cancels_what_waits_and_says_why() {
         assert!(c.tick().await.unwrap().placed.is_empty());
     }
     assert!(c.store().attempts_of_task(&test).unwrap().is_empty());
-    let target = remote_task_runner::service::completion::Target::Run(run.clone());
+    let target = belt::service::completion::Target::Run(run.clone());
     let snapshot = c.store().completion(target).unwrap();
     assert!(snapshot.settled());
-    let lines = remote_task_runner::service::ci_run::job_lines(
-        c.store(),
-        fx.dir.path(),
-        files.root(),
-        &run,
-    )
-    .unwrap();
+    let lines =
+        belt::service::ci_run::job_lines(c.store(), fx.dir.path(), files.root(), &run).unwrap();
     let seen: Vec<_> = lines
         .iter()
         .map(|l| (l.job.as_deref(), l.status.as_str(), l.reason.as_deref()))
@@ -3332,7 +3302,7 @@ async fn a_ci_run_whose_plan_is_gone_cancels_what_waits_and_says_why() {
 /// worker takes the plan.
 #[tokio::test]
 async fn a_worker_that_did_not_take_the_plan_is_left_out_with_the_reason_until_it_does() {
-    use remote_task_runner::scheduler::decide::Exclusion;
+    use belt::scheduler::decide::Exclusion;
     const WHY: &str = "frozen plan not taken: the worker holds 256 frozen plans (OVERLOADED)";
     let fx = fx();
     let (c, _files) = fx.open();
@@ -3344,11 +3314,11 @@ async fn a_worker_that_did_not_take_the_plan_is_left_out_with_the_reason_until_i
     assert!(c.tick().await.unwrap().placed.is_empty());
     fx.w.set(|s| s.refused_runs.push(run.clone()));
     let build = ids["build"].clone();
-    let waits = || -> Vec<remote_task_runner::storage::Event> {
+    let waits = || -> Vec<belt::storage::Event> {
         let events = c.store().events_after(0, 1000).unwrap();
         events
             .into_iter()
-            .filter(|e| e.kind == remote_task_runner::scheduler::EVENT_TASK_WAITING)
+            .filter(|e| e.kind == belt::scheduler::EVENT_TASK_WAITING)
             .collect()
     };
 
@@ -3383,9 +3353,7 @@ async fn a_worker_that_did_not_take_the_plan_is_left_out_with_the_reason_until_i
     let a = report.placed[0].clone();
     assert_eq!(other.count("submit"), 1);
     assert_eq!(fx.w.count("submit"), 0);
-    let decision = remote_task_runner::scheduler::reason_of(c.store(), &a)
-        .unwrap()
-        .unwrap();
+    let decision = belt::scheduler::reason_of(c.store(), &a).unwrap().unwrap();
     let left_out: Vec<_> = decision
         .excluded
         .iter()
@@ -3408,9 +3376,7 @@ async fn a_worker_that_did_not_take_the_plan_is_left_out_with_the_reason_until_i
     let attempts = c.store().attempts_of_task(&ids_2["build"]).unwrap();
     assert_eq!(attempts[0].attempt_id, b);
     assert_eq!(fx.w.count("submit"), 1);
-    let decision = remote_task_runner::scheduler::reason_of(c.store(), &b)
-        .unwrap()
-        .unwrap();
+    let decision = belt::scheduler::reason_of(c.store(), &b).unwrap().unwrap();
     assert!(decision
         .excluded
         .iter()
@@ -3507,12 +3473,10 @@ async fn ci_run_by_id(
     plan: &local_ci::FrozenPlan,
     run: RunId,
 ) -> (RunId, BTreeMap<String, TaskId>) {
-    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
+    let (digest, _) = belt::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
     let none = Default::default();
-    let specs =
-        remote_task_runner::service::ci_run::task_specs(plan, &digest, &manifest, &none, None)
-            .unwrap();
+    let specs = belt::service::ci_run::task_specs(plan, &digest, &manifest, &none, None).unwrap();
     let source = SourceId::generate();
     c.store().put_source_ref(&source, &manifest, 1).unwrap();
     let mut ids = BTreeMap::new();
@@ -3564,9 +3528,8 @@ fn ci_lines(
     c: &Coordinator,
     files: &Arc<ResultStore>,
     run: &RunId,
-) -> Vec<remote_task_runner::service::ci_run::JobLine> {
-    remote_task_runner::service::ci_run::job_lines(c.store(), fx.dir.path(), files.root(), run)
-        .unwrap()
+) -> Vec<belt::service::ci_run::JobLine> {
+    belt::service::ci_run::job_lines(c.store(), fx.dir.path(), files.root(), run).unwrap()
 }
 
 /// What the status of the run says it computed (S19): from the completion of
@@ -3576,8 +3539,8 @@ fn ci_computed(
     c: &Coordinator,
     files: &Arc<ResultStore>,
     run: &RunId,
-) -> remote_task_runner::ci::status::Computed {
-    use remote_task_runner::service::{ci_run, completion::Target, control::Report};
+) -> belt::ci::status::Computed {
+    use belt::service::{ci_run, completion::Target, control::Report};
     let target = Target::Run(run.clone());
     let snapshot = c.store().completion(target.clone()).unwrap();
     let report = Report::settled(target, &snapshot).expect("the run settled");
@@ -3599,7 +3562,7 @@ fn ci_computed(
 /// makes the job a failure although every shard passed.
 #[tokio::test]
 async fn a39_file_shards_cover_every_test_once_and_add_up_to_one_job() {
-    use remote_task_runner::service::ci_run::Part;
+    use belt::service::ci_run::Part;
     let files_listed = [
         "src/a.test.ts",
         "src/b.test.ts",
@@ -3745,7 +3708,7 @@ async fn a39_file_shards_cover_every_test_once_and_add_up_to_one_job() {
         worker.finish(b, Outcome::Succeeded, ci_out(b, &sent, &done));
         assert_eq!(c.tick().await.unwrap().settled, vec![b.clone()]);
         ci_collect(&c, &files, b).await;
-        let target = remote_task_runner::service::completion::Target::Run(run.clone());
+        let target = belt::service::completion::Target::Run(run.clone());
         let snapshot = c.store().completion(target).unwrap();
         assert!(snapshot.settled());
         let code = snapshot.exit_code().unwrap();
@@ -3909,8 +3872,8 @@ async fn a41_a_job_that_cannot_be_split_says_why_and_runs_as_one_job() {
             assert!(group.not_split.contains(reason), "{:?}", group.not_split);
         }
         let digest = plan.digest.clone();
-        let ci = remote_task_runner::ci::CiPlan::from_frozen(plan).unwrap();
-        let text = remote_task_runner::ci::summary::render_text(ci.summary());
+        let ci = belt::ci::CiPlan::from_frozen(plan).unwrap();
+        let text = belt::ci::summary::render_text(ci.summary());
         assert!(
             text.contains("is not split") && text.contains(shown),
             "{text}"
@@ -3940,7 +3903,7 @@ async fn a41_a_job_that_cannot_be_split_says_why_and_runs_as_one_job() {
         assert_eq!(lines.len(), 1);
         assert_eq!((lines[0].status.as_str(), lines[0].part), ("success", None));
         assert_eq!(lines[0].task_id, ids["test"]);
-        let target = remote_task_runner::service::completion::Target::Run(run);
+        let target = belt::service::completion::Target::Run(run);
         assert_eq!(c.store().completion(target).unwrap().exit_code(), Some(0));
     }
 }
@@ -3952,7 +3915,7 @@ async fn a41_a_job_that_cannot_be_split_says_why_and_runs_as_one_job() {
 /// fail-fast the other shards go on to their end.
 #[tokio::test]
 async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_report() {
-    use remote_task_runner::service::ci_run::Part;
+    use belt::service::ci_run::Part;
     let names = ["a", "b", "c", "d", "e", "f"];
     let discovered = listed(&names);
     let adapter = CargoTest::new("1.91.0", &[], Safety::default());
@@ -4032,10 +3995,7 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
                 .find(|e| e.attempt_id.as_deref() == Some(placed[id].0.as_str()))
                 .unwrap();
             assert_eq!(event.payload["task"], ids[id].as_str());
-            assert_eq!(
-                event.payload["reason"],
-                remote_task_runner::ci::shards::FAIL_FAST_REASON
-            );
+            assert_eq!(event.payload["reason"], belt::ci::shards::FAIL_FAST_REASON);
         }
         // The coordinator delivers the cancels; the stop is confirmed.
         for _ in 0..4 {
@@ -4085,7 +4045,7 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
             ]
         );
         assert_eq!(of(Part::Job), [(group.id.as_str(), "failure")]);
-        let text = remote_task_runner::service::ci_run::render_jobs(&lines);
+        let text = belt::service::ci_run::render_jobs(&lines);
         assert!(
             text.contains(&format!("{}: failure\n", group.shards[0])),
             "{text}"
@@ -4110,7 +4070,7 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
             c.tick().await.unwrap();
             collect(&c, &files).await;
         }
-        let target = remote_task_runner::service::completion::Target::Run(run.clone());
+        let target = belt::service::completion::Target::Run(run.clone());
         assert!(c.store().completion(target).unwrap().cancel_requested);
         assert_eq!(ci_computed(&fx, &c, &files, &run), Computed::Failure);
     }
@@ -4131,9 +4091,9 @@ async fn a41_retry_rebinds_failed_downstream_needs_after_the_shards_rejoin() {
 }
 
 async fn retry_shards_with_report(report_passes: bool) {
-    use remote_task_runner::service::ci_run::Part;
-    use remote_task_runner::service::completion::Target;
-    use remote_task_runner::storage::RetryPreparation;
+    use belt::service::ci_run::Part;
+    use belt::service::completion::Target;
+    use belt::storage::RetryPreparation;
     let discovered = listed(&["a", "b", "c", "d", "e", "f"]);
     let adapter = CargoTest::new("1.91.0", &[], Safety::default());
     let opts = PartitionOpts::default();
@@ -4298,8 +4258,8 @@ async fn retry_shards_with_report(report_passes: bool) {
 /// so the existing rule refuses a retry of the run.
 #[tokio::test]
 async fn a41_fail_fast_reaches_a_shard_that_was_never_placed_in_a_job_nothing_waits_for() {
-    use remote_task_runner::service::ci_run::Part;
-    use remote_task_runner::service::completion::Target;
+    use belt::service::ci_run::Part;
+    use belt::service::completion::Target;
     let names: Vec<String> = (0..36).map(|i| format!("t{i:02}")).collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let discovered = listed(&names);
@@ -4348,7 +4308,7 @@ async fn a41_fail_fast_reaches_a_shard_that_was_never_placed_in_a_job_nothing_wa
     assert!(row.cancelled && row.attempt.is_none());
     assert_eq!(
         row.spec["ci"]["unrunnable"],
-        remote_task_runner::ci::shards::FAIL_FAST_REASON
+        belt::ci::shards::FAIL_FAST_REASON
     );
     for _ in 0..4 {
         c.tick().await.unwrap();
@@ -4366,7 +4326,7 @@ async fn a41_fail_fast_reaches_a_shard_that_was_never_placed_in_a_job_nothing_wa
     assert_eq!(never.status, "no_result");
     assert_eq!(
         never.reason.as_deref(),
-        Some(remote_task_runner::ci::shards::FAIL_FAST_REASON)
+        Some(belt::ci::shards::FAIL_FAST_REASON)
     );
     let target = Target::Run(run.clone());
     let snapshot = c.store().completion(target.clone()).unwrap();
@@ -4380,7 +4340,7 @@ async fn a41_fail_fast_reaches_a_shard_that_was_never_placed_in_a_job_nothing_wa
         .store()
         .prepare_retry(alone, snapshot.control_revision, "alone".into())
     {
-        Ok(remote_task_runner::storage::RetryPreparation::Prepared(prepared)) => prepared,
+        Ok(belt::storage::RetryPreparation::Prepared(prepared)) => prepared,
         Ok(_) => panic!("a first request is no replay"),
         Err(e) => panic!("{e}"),
     };
@@ -4405,7 +4365,7 @@ async fn a41_fail_fast_reaches_a_shard_that_was_never_placed_in_a_job_nothing_wa
             .store()
             .prepare_retry(target.clone(), snapshot.control_revision, "again".into())
         {
-            Ok(remote_task_runner::storage::RetryPreparation::Prepared(prepared)) => prepared,
+            Ok(belt::storage::RetryPreparation::Prepared(prepared)) => prepared,
             Ok(_) => panic!("a first request is no replay"),
             Err(e) => panic!("{e}"),
         };
@@ -4433,7 +4393,7 @@ async fn a41_fail_fast_reaches_a_shard_that_was_never_placed_in_a_job_nothing_wa
 /// success first. A run that can never go on does not wait for the job.
 #[tokio::test]
 async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_it() {
-    use remote_task_runner::service::completion::Target;
+    use belt::service::completion::Target;
     let discovered = listed(&["a", "b", "c", "d"]);
     let adapter = CargoTest::new("1.91.0", &[], Safety::default());
     let opts = PartitionOpts::default();
@@ -4520,7 +4480,7 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
                 after.control_revision,
                 "again".into(),
             ) {
-                Ok(remote_task_runner::storage::RetryPreparation::Prepared(p)) => p,
+                Ok(belt::storage::RetryPreparation::Prepared(p)) => p,
                 Ok(_) => panic!("a first request is no replay"),
                 Err(e) => panic!("{e}"),
             };
@@ -4593,11 +4553,7 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
     }
     let rows = c.store().ci_run_tasks(&run).unwrap();
     let digest = Digest::parse(rows[0].spec["plan_digest"].as_str().unwrap()).unwrap();
-    std::fs::remove_file(remote_task_runner::worker::ci_task::plan_path(
-        fx.dir.path(),
-        &digest,
-    ))
-    .unwrap();
+    std::fs::remove_file(belt::worker::ci_task::plan_path(fx.dir.path(), &digest)).unwrap();
     let pass = ci_advance(&fx, &c);
     assert_eq!(pass.failed.len(), 1, "{pass:?}");
     let after = c.store().completion(Target::Run(run.clone())).unwrap();
@@ -4615,7 +4571,7 @@ async fn a41_a_run_is_settled_only_when_its_split_job_is_joined_and_fails_with_i
 /// (it would otherwise stop them again for ever).
 #[tokio::test]
 async fn a41_a_run_fails_of_the_failed_shard_and_a_retry_runs_a_shard_whose_tests_failed_again() {
-    use remote_task_runner::service::completion::Target;
+    use belt::service::completion::Target;
     let discovered = listed(&["a", "b", "c", "d", "e", "f"]);
     let adapter = CargoTest::new("1.91.0", &[], Safety::default());
     let opts = PartitionOpts::default();
@@ -4672,7 +4628,7 @@ async fn a41_a_run_fails_of_the_failed_shard_and_a_retry_runs_a_shard_whose_test
                 .store()
                 .prepare_retry(target.clone(), snapshot.control_revision, "again".into())
             {
-                Ok(remote_task_runner::storage::RetryPreparation::Prepared(p)) => p,
+                Ok(belt::storage::RetryPreparation::Prepared(p)) => p,
                 Ok(_) => panic!("a first request is no replay"),
                 Err(e) => panic!("{e}"),
             };
@@ -4706,12 +4662,10 @@ async fn ci_run_ranked(
     plan: &local_ci::FrozenPlan,
     rank: impl Fn(&str) -> usize,
 ) -> (RunId, BTreeMap<String, TaskId>) {
-    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
+    let (digest, _) = belt::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
     let none = Default::default();
-    let specs =
-        remote_task_runner::service::ci_run::task_specs(plan, &digest, &manifest, &none, None)
-            .unwrap();
+    let specs = belt::service::ci_run::task_specs(plan, &digest, &manifest, &none, None).unwrap();
     let (run, source) = (RunId::generate(), SourceId::generate());
     c.store().put_source_ref(&source, &manifest, 1).unwrap();
     let mut sorted: Vec<TaskId> = specs.iter().map(|_| TaskId::generate()).collect();
@@ -4750,7 +4704,7 @@ async fn until_joined(fx: &Fx, c: &Coordinator, files: &Arc<ResultStore>) {
 /// shards that are retried before it is read. It runs again with them.
 #[tokio::test]
 async fn a41_a_retry_runs_a_shard_that_did_not_pass_again_behind_a_page_of_other_shards() {
-    use remote_task_runner::service::completion::Target;
+    use belt::service::completion::Target;
     let names: Vec<String> = (0..70).map(|n| format!("t{n:02}")).collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let discovered = listed(&names);
@@ -4790,7 +4744,7 @@ async fn a41_a_retry_runs_a_shard_that_did_not_pass_again_behind_a_page_of_other
             .store()
             .prepare_retry(target.clone(), snapshot.control_revision, "again".into())
         {
-            Ok(remote_task_runner::storage::RetryPreparation::Prepared(p)) => p,
+            Ok(belt::storage::RetryPreparation::Prepared(p)) => p,
             Ok(_) => panic!("a first request is no replay"),
             Err(e) => panic!("{e}"),
         };
@@ -4808,7 +4762,7 @@ async fn a41_a_retry_runs_a_shard_that_did_not_pass_again_behind_a_page_of_other
 /// was cancelled on its own both have smaller task ids, in either order.
 #[tokio::test]
 async fn a41_a_run_fails_of_the_failed_shard_and_not_of_a_cancelled_task_of_another_job() {
-    use remote_task_runner::service::completion::Target;
+    use belt::service::completion::Target;
     let discovered = listed(&["a", "b", "c", "d", "e", "f"]);
     let adapter = CargoTest::new("1.91.0", &[], Safety::default());
     let opts = PartitionOpts::default();
@@ -4865,10 +4819,7 @@ async fn a41_a_run_fails_of_the_failed_shard_and_not_of_a_cancelled_task_of_anot
         let failure = snapshot.first_compute_failure.clone().unwrap();
         assert_eq!(failure.task_id, failing, "other first: {other_first}");
         assert!(own.exit_code().is_some_and(|code| code != 0));
-        assert_ne!(
-            own.exit_code(),
-            Some(remote_task_runner::error::exit::CANCELLED)
-        );
+        assert_ne!(own.exit_code(), Some(belt::error::exit::CANCELLED));
         assert_eq!(snapshot.exit_code(), own.exit_code());
     }
 }
@@ -4881,9 +4832,9 @@ async fn a41_a_run_fails_of_the_failed_shard_and_not_of_a_cancelled_task_of_anot
 /// fail-fast had stopped the rest and the run had failed changes nothing.
 #[tokio::test]
 async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed() {
-    use remote_task_runner::service::ci_run::Part;
-    use remote_task_runner::service::completion::Target;
-    let cancelled = remote_task_runner::error::exit::CANCELLED;
+    use belt::service::ci_run::Part;
+    use belt::service::completion::Target;
+    let cancelled = belt::error::exit::CANCELLED;
     let discovered = listed(&["a", "b", "c", "d", "e", "f"]);
     let adapter = CargoTest::new("1.91.0", &[], Safety::default());
     let opts = PartitionOpts::default();
@@ -5138,7 +5089,7 @@ jobs:
         .is_empty());
     assert_eq!(
         c.store()
-            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .completion(belt::service::completion::Target::Run(run))
             .unwrap()
             .exit_code(),
         Some(0)
@@ -5150,23 +5101,18 @@ jobs:
 /// become eligible. Repeated progression cannot create a second copy.
 #[tokio::test]
 async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed() {
-    use remote_task_runner::ci::discovery::{candidates, stage, WorkerListing};
+    use belt::ci::discovery::{candidates, stage, WorkerListing};
     let fx = fx();
     let (c, files) = fx.open();
     let whole =
         ci_plan(&CI_CHAIN.replace("- run: echo one\n      - run: echo two", "- run: npx jest"));
     let build = ci_task_of(&whole, "build");
     let test = ci_task_of(&whole, "test");
-    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &whole).unwrap();
+    let (digest, _) = belt::ci::advance::keep_plan(fx.dir.path(), &whole).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
-    let mut specs = remote_task_runner::service::ci_run::task_specs(
-        &whole,
-        &digest,
-        &manifest,
-        &Default::default(),
-        None,
-    )
-    .unwrap();
+    let mut specs =
+        belt::service::ci_run::task_specs(&whole, &digest, &manifest, &Default::default(), None)
+            .unwrap();
     stage(&whole, &mut specs, 2, 2, "example/project", &[]);
     let run = RunId::generate();
     let source = SourceId::generate();
@@ -5269,7 +5215,7 @@ async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed
     }
     let changed = fx.w.payload(&placed[0]).ci_task.unwrap().plan_digest;
     assert_ne!(changed, digest);
-    let bytes = remote_task_runner::ci::advance::read_plan(fx.dir.path(), &changed).unwrap();
+    let bytes = belt::ci::advance::read_plan(fx.dir.path(), &changed).unwrap();
     let split: local_ci::FrozenPlan = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(split_group(&split).manifest, listing.discovered.tests);
 }
@@ -5816,7 +5762,7 @@ jobs:
           run-id: '123'
 "#,
     );
-    let err = remote_task_runner::service::ci_run::task_specs(
+    let err = belt::service::ci_run::task_specs(
         &plan,
         &Digest::of_bytes(b"plan"),
         &Digest::of_bytes(b"manifest"),
@@ -5830,7 +5776,7 @@ jobs:
 
 #[tokio::test]
 async fn discovery_precedes_the_matrix_journal_and_its_shard_timings_survive_replay() {
-    use remote_task_runner::ci::discovery::{candidates, stage, WorkerListing};
+    use belt::ci::discovery::{candidates, stage, WorkerListing};
     let fx = fx();
     let (c, files) = fx.open();
     let plan = ci_plan(
@@ -5850,16 +5796,11 @@ jobs:
       - run: echo "${{ matrix.n }}"
 "#,
     );
-    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
+    let (digest, _) = belt::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
-    let mut specs = remote_task_runner::service::ci_run::task_specs(
-        &plan,
-        &digest,
-        &manifest,
-        &Default::default(),
-        None,
-    )
-    .unwrap();
+    let mut specs =
+        belt::service::ci_run::task_specs(&plan, &digest, &manifest, &Default::default(), None)
+            .unwrap();
     stage(&plan, &mut specs, 2, 2, "example/project", &[]);
     let run = RunId::generate();
     let source = SourceId::generate();
@@ -5902,10 +5843,8 @@ jobs:
     let placements = c.tick().await.unwrap().placed;
     assert_eq!(placements.len(), 2);
     let dag = fx.w.payload(&placements[0]).ci_task.unwrap().plan_digest;
-    let split = serde_json::from_slice(
-        &remote_task_runner::ci::advance::read_plan(fx.dir.path(), &dag).unwrap(),
-    )
-    .unwrap();
+    let split = serde_json::from_slice(&belt::ci::advance::read_plan(fx.dir.path(), &dag).unwrap())
+        .unwrap();
     let group = split_group(&split);
     for attempt in placements {
         let id = fx.w.payload(&attempt).ci_task.unwrap().task_id;
@@ -5965,17 +5904,12 @@ async fn a_discovery_incompatible_worker_runs_the_original_job_after_the_probe_i
     let plan = ci_plan(
         "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npx jest\n",
     );
-    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
+    let (digest, _) = belt::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
-    let mut specs = remote_task_runner::service::ci_run::task_specs(
-        &plan,
-        &digest,
-        &manifest,
-        &Default::default(),
-        None,
-    )
-    .unwrap();
-    remote_task_runner::ci::discovery::stage(&plan, &mut specs, 2, 2, "project", &[]);
+    let mut specs =
+        belt::service::ci_run::task_specs(&plan, &digest, &manifest, &Default::default(), None)
+            .unwrap();
+    belt::ci::discovery::stage(&plan, &mut specs, 2, 2, "project", &[]);
     let run = RunId::generate();
     let source = SourceId::generate();
     c.store().put_source_ref(&source, &manifest, 1).unwrap();
@@ -6009,7 +5943,7 @@ async fn a_discovery_incompatible_worker_runs_the_original_job_after_the_probe_i
     .await;
     assert_eq!(
         c.store()
-            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .completion(belt::service::completion::Target::Run(run))
             .unwrap()
             .exit_code(),
         Some(0)

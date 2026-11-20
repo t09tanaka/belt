@@ -1,5 +1,5 @@
 //! Where tests put their temporary directories: all under one root that this
-//! test process owns (`/tmp/rtr-t-XXXXXX/d`).
+//! test process owns (`/tmp/belt-t-XXXXXX/d`).
 //!
 //! Each directory is still an RAII guard. The root is removed when the
 //! process exits, which also takes what a guard could not remove. A test
@@ -9,11 +9,11 @@
 //!
 //! Shared by the unit tests and, through `#[path]`, the integration tests.
 
-use remote_task_runner::platform::owned_temp::{sweep, OwnedTemp};
+use belt::platform::owned_temp::{sweep, OwnedTemp};
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 
-const PREFIX: &str = "rtr-t-";
+const PREFIX: &str = "belt-t-";
 
 struct Root {
     owner: u32,
@@ -41,7 +41,7 @@ extern "C" fn remove_root() {
 pub fn root() -> &'static Path {
     &ROOT
         .get_or_init(|| {
-            let parent = match std::env::var_os("RTR_MUTATION_FIXTURE_PARENT") {
+            let parent = match std::env::var_os("BELT_MUTATION_FIXTURE_PARENT") {
                 // The mutation driver removes its private parent after the shard.
                 // PID classification itself can be under mutation here.
                 Some(private) => std::fs::canonicalize(private).expect("mutation fixture parent"),
@@ -88,9 +88,9 @@ const GC_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 /// only a test that never meant to contend waits here. Other errors and a
 /// lock that stays held for [`GC_LOCK_WAIT`] still fail the test.
 fn until_free<T>(
-    mut try_once: impl FnMut() -> Result<T, remote_task_runner::storage::StorageError>,
-) -> Result<T, remote_task_runner::storage::StorageError> {
-    use remote_task_runner::storage::StorageError;
+    mut try_once: impl FnMut() -> Result<T, belt::storage::StorageError>,
+) -> Result<T, belt::storage::StorageError> {
+    use belt::storage::StorageError;
     let start = std::time::Instant::now();
     loop {
         match try_once() {
@@ -107,9 +107,9 @@ fn until_free<T>(
 /// `result_gc_guard` for a test that does not itself hold the lock: waits
 /// out a copy of it that a forked child of another test still holds.
 pub fn gc_guard(
-    store: &remote_task_runner::storage::CoordinatorStore,
-    run: &remote_task_runner::ids::RunId,
-) -> remote_task_runner::results::pin::RunPin {
+    store: &belt::storage::CoordinatorStore,
+    run: &belt::ids::RunId,
+) -> belt::results::pin::RunPin {
     until_free(|| store.result_gc_guard(run)).unwrap()
 }
 
@@ -118,16 +118,15 @@ pub fn gc_guard(
 /// One retention page with a fresh cursor, retried while its run's lock is
 /// held by such a copy (the page reports `skipped` then, and did nothing).
 pub fn settled_page(
-    store: &remote_task_runner::storage::CoordinatorStore,
-    files: &remote_task_runner::results::ResultStore,
+    store: &belt::storage::CoordinatorStore,
+    files: &belt::results::ResultStore,
     retention_days: u32,
-) -> remote_task_runner::results::retention::PageReport {
+) -> belt::results::retention::PageReport {
     let start = std::time::Instant::now();
     loop {
-        let mut cursor = remote_task_runner::results::retention::Cursor::default();
+        let mut cursor = belt::results::retention::Cursor::default();
         let report =
-            remote_task_runner::results::retention::page(store, files, &mut cursor, retention_days)
-                .unwrap();
+            belt::results::retention::page(store, files, &mut cursor, retention_days).unwrap();
         if !report.skipped || start.elapsed() >= GC_LOCK_WAIT {
             return report;
         }

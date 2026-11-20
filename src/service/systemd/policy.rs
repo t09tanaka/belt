@@ -110,7 +110,7 @@ pub fn render(def: &Definition) -> Result<Plan, String> {
         env.push_str(&format!("Environment={}\n", env_assignment(key, value)?));
     }
     let unit = format!(
-        "[Unit]\nDescription=remote-task-runner worker\n\n[Service]\nType=simple\nExecStart={exec}\nWorkingDirectory={}\n{env}{user}Restart=always\nRestartSec=5\nTimeoutStopSec={STOP_TIMEOUT_SECS}\n\n[Install]\nWantedBy={target}\n",
+        "[Unit]\nDescription=belt worker\n\n[Service]\nType=simple\nExecStart={exec}\nWorkingDirectory={}\n{env}{user}Restart=always\nRestartSec=5\nTimeoutStopSec={STOP_TIMEOUT_SECS}\n\n[Install]\nWantedBy={target}\n",
         directive_path(&def.working_directory)?
     );
     Ok(Plan::systemd(def, scope(&def.mode), unit))

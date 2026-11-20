@@ -56,7 +56,7 @@ impl WorkerSpec {
             "worker HOME differs from bridge HOME"
         );
         anyhow::ensure!(
-            self.state_dir == home.join(".remote-task-runner"),
+            self.state_dir == home.join(".belt"),
             "worker state must match default bridge socket directory"
         );
         resident::check_private_dir(&self.state_dir)?;

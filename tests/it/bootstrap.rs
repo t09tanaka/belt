@@ -1,8 +1,8 @@
 //! Real owner processes, all under private temporary state and environment.
-use remote_task_runner::ids::{ClusterId, WorkerId};
-use remote_task_runner::service::bootstrap::{ensure, Spec};
-use remote_task_runner::service::resident::{Client, Operation, Reply};
-use remote_task_runner::storage::CoordinatorStore;
+use belt::ids::{ClusterId, WorkerId};
+use belt::service::bootstrap::{ensure, Spec};
+use belt::service::resident::{Client, Operation, Reply};
+use belt::storage::CoordinatorStore;
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 fn fixture() -> (super::common::DaemonRoot, Spec) {
-    let root = crate::test_tmp::prefixed("rtr-boot-").unwrap();
+    let root = crate::test_tmp::prefixed("belt-boot-").unwrap();
     std::fs::set_permissions(root.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let state = root.path().join("parent");
     let worker = root.path().join("worker");
@@ -19,13 +19,13 @@ fn fixture() -> (super::common::DaemonRoot, Spec) {
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     }
     let key = root.path().join("key");
-    remote_task_runner::secrets::key::init(&key).unwrap();
+    belt::secrets::key::init(&key).unwrap();
     let mut spec = Spec {
         state_dir: state,
         worker_state_dir: worker,
         worker_id: WorkerId::parse("persistent-local").unwrap(),
         cluster_key_path: key,
-        executable: env!("CARGO_BIN_EXE_remote-task-runner").into(),
+        executable: env!("CARGO_BIN_EXE_belt").into(),
         env: BTreeMap::from([
             ("HOME".into(), root.path().display().to_string()),
             (
@@ -81,11 +81,11 @@ fn private_tool_path(root: &std::path::Path, names: &[&str]) -> String {
 }
 
 fn coordinator_event_summary(
-    event: &remote_task_runner::storage::Event,
+    event: &belt::storage::Event,
 ) -> (
     &str,
-    Option<remote_task_runner::error::ErrorCode>,
-    Option<remote_task_runner::error::BlockedReason>,
+    Option<belt::error::ErrorCode>,
+    Option<belt::error::BlockedReason>,
 ) {
     let code = event
         .payload
@@ -102,7 +102,7 @@ fn coordinator_event_summary(
 }
 
 // Classify fixed server diagnostics without ever printing their arbitrary text.
-fn coordinator_refusal_class(event: &remote_task_runner::storage::Event) -> Option<&'static str> {
+fn coordinator_refusal_class(event: &belt::storage::Event) -> Option<&'static str> {
     let message = event.payload.get("message")?.as_str()?;
     match message {
         "toolchain_baseline_mismatch" => Some("native_baseline_mismatch"),
@@ -131,9 +131,7 @@ fn coordinator_refusal_class(event: &remote_task_runner::storage::Event) -> Opti
 /// the event kinds and the typed code and message of the agent's own refusals
 /// are printed, never other payloads.
 fn diagnose_worker(spec: &Spec) {
-    let Ok(store) =
-        remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
-    else {
+    let Ok(store) = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir) else {
         eprintln!("worker journal readable=false");
         return;
     };
@@ -207,7 +205,7 @@ fn diagnose_coordinator(spec: &Spec) {
 
 #[test]
 fn coordinator_timeout_diagnostic_keeps_only_kind_and_typed_codes() {
-    let mut event = remote_task_runner::storage::Event {
+    let mut event = belt::storage::Event {
         seq: 1,
         run_id: None,
         attempt_id: None,
@@ -221,8 +219,8 @@ fn coordinator_timeout_diagnostic_keeps_only_kind_and_typed_codes() {
         coordinator_event_summary(&event),
         (
             "submit_deferred",
-            Some(remote_task_runner::error::ErrorCode::Blocked),
-            Some(remote_task_runner::error::BlockedReason::SecretUnavailable)
+            Some(belt::error::ErrorCode::Blocked),
+            Some(belt::error::BlockedReason::SecretUnavailable)
         )
     );
     assert!(
@@ -254,8 +252,8 @@ fn coordinator_timeout_diagnostic_keeps_only_kind_and_typed_codes() {
 
 // Private fixture metadata only: never dump argv, env, paths, journal payloads,
 // or arbitrary parse errors. Cap reads even when a child leaves malformed files.
-pub(super) fn diagnose_attempt(spec: &Spec, attempt: &remote_task_runner::ids::AttemptId) {
-    use remote_task_runner::supervisor::spec::{command_id, SuperviseSpec};
+pub(super) fn diagnose_attempt(spec: &Spec, attempt: &belt::ids::AttemptId) {
+    use belt::supervisor::spec::{command_id, SuperviseSpec};
     use task_traffic_controller::managed::Sidecar;
     fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
         let file = std::fs::File::open(path).ok()?;
@@ -292,7 +290,7 @@ pub(super) fn diagnose_attempt(spec: &Spec, attempt: &remote_task_runner::ids::A
         let sidecar = read_json::<Sidecar>(&sidecar_path);
         eprintln!(
             "private TTC node={index} pipe_exists={} lease_exists={} sidecar_exists={} readable={}",
-            remote_task_runner::supervisor::spool::logs_dir(&supervise.spool_dir(), attempt)
+            belt::supervisor::spool::logs_dir(&supervise.spool_dir(), attempt)
                 .join(format!("node-{index}.pipe"))
                 .exists(),
             traffic.join("leases").join(format!("{id}.lock")).exists(),
@@ -360,8 +358,8 @@ fn panicking_fixture_process() {
 }
 
 /// The task-traffic-controller scope of a worker started from `env`.
-fn worker_traffic(env: &BTreeMap<String, String>) -> remote_task_runner::config::traffic::Scope {
-    remote_task_runner::config::traffic::resolve(env).unwrap()
+fn worker_traffic(env: &BTreeMap<String, String>) -> belt::config::traffic::Scope {
+    belt::config::traffic::resolve(env).unwrap()
 }
 
 #[tokio::test]
@@ -401,8 +399,8 @@ async fn panicking_fixture_test_leaves_no_owner_process() {
     assert!(pid > 1);
     // The fixture root stopped the owner before the helper process ended.
     assert_ne!(
-        remote_task_runner::platform::process_start_identity(pid),
-        remote_task_runner::platform::StartIdentity::Identity(start.to_string())
+        belt::platform::process_start_identity(pid),
+        belt::platform::StartIdentity::Identity(start.to_string())
     );
 }
 
@@ -538,7 +536,7 @@ async fn unsafe_keys_and_tokens_are_rejected_without_changing_files() {
 
 #[tokio::test]
 async fn retained_input_is_private_idempotent_and_restarts_through_shared_argv() {
-    use remote_task_runner::service::bootstrap::{daemon_argv, write_input};
+    use belt::service::bootstrap::{daemon_argv, write_input};
     let (root, spec) = fixture();
     let input = root.path().join("resident.json");
     let managed = write_input(&input, &spec).unwrap();
@@ -584,11 +582,9 @@ async fn retained_input_is_private_idempotent_and_restarts_through_shared_argv()
         .unwrap();
         assert_eq!(
             std::fs::read_to_string(spec.worker_state_dir.join("boot_id")).unwrap(),
-            remote_task_runner::platform::boot_id().unwrap()
+            belt::platform::boot_id().unwrap()
         );
-        let worker =
-            remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
-                .unwrap();
+        let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
         assert_eq!(worker.worker_id(), &spec.worker_id);
         let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
         if let Some(epoch) = previous {
@@ -690,7 +686,7 @@ async fn stopped_owner_with_sealed_templates_leaves_no_fixture_directory() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
-    use remote_task_runner::ids::{RunId, TaskId};
+    use belt::ids::{RunId, TaskId};
     use serde_json::json;
     let (root, spec) = fixture();
     let run = RunId::generate();
@@ -705,11 +701,10 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
             .unwrap();
         owner.close_run(&run, 2).unwrap();
     }
-    let dir = root.path().join(".config/remote-task-runner");
+    let dir = root.path().join(".config/belt");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
-    remote_task_runner::service::bootstrap::write_input(&dir.join("coordinator.json"), &spec)
-        .unwrap();
+    belt::service::bootstrap::write_input(&dir.join("coordinator.json"), &spec).unwrap();
     // Simulate v3 with durable rows and no owner, removing later indexes and
     // feature markers as well as tables so every migration can run again.
     let db = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
@@ -845,22 +840,18 @@ async fn readonly_queries_refuse_foreign_cluster_and_unsafe_key_without_owner() 
         owner.epoch()
     };
     spec.expected_cluster = Some(ClusterId::generate());
-    assert!(
-        remote_task_runner::service::query::Reader::open(spec.clone())
-            .await
-            .is_err()
-    );
+    assert!(belt::service::query::Reader::open(spec.clone())
+        .await
+        .is_err());
     spec.expected_cluster = None;
     std::fs::set_permissions(
         &spec.cluster_key_path,
         std::fs::Permissions::from_mode(0o644),
     )
     .unwrap();
-    assert!(
-        remote_task_runner::service::query::Reader::open(spec.clone())
-            .await
-            .is_err()
-    );
+    assert!(belt::service::query::Reader::open(spec.clone())
+        .await
+        .is_err());
     assert_eq!(
         CoordinatorStore::open_read_only(&spec.state_dir)
             .unwrap()
@@ -873,8 +864,8 @@ async fn readonly_queries_refuse_foreign_cluster_and_unsafe_key_without_owner() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_caller() {
-    use remote_task_runner::ids::TaskId;
-    use remote_task_runner::service::bootstrap::write_input;
+    use belt::ids::TaskId;
+    use belt::service::bootstrap::write_input;
     let (root, mut spec) = fixture();
     let repo = root.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
@@ -901,7 +892,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     std::fs::write(repo.join("input.txt"), "committed").unwrap();
     std::fs::write(repo.join(".gitignore"), "private.env\n").unwrap();
     std::fs::write(
-        repo.join(".remote-task-runner.toml"),
+        repo.join(".belt.toml"),
         "schema_version = 1\n[source]\nsecret_files = [{ glob = 'private.env', required = true }]\n",
     )
     .unwrap();
@@ -914,7 +905,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
         "PATH".into(),
         private_tool_path(root.path(), &["git", "fast-worktree", "wc"]),
     );
-    let configdir = root.path().join(".config/remote-task-runner");
+    let configdir = root.path().join(".config/belt");
     std::fs::create_dir_all(&configdir).unwrap();
     std::fs::set_permissions(&configdir, std::fs::Permissions::from_mode(0o700)).unwrap();
     write_input(&configdir.join("coordinator.json"), &spec).unwrap();
@@ -964,7 +955,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
             {
                 if attempts
                     .iter()
-                    .any(|a| a.state == remote_task_runner::state::AttemptState::Terminal)
+                    .any(|a| a.state == belt::state::AttemptState::Terminal)
                 {
                     break attempts;
                 }
@@ -984,10 +975,8 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
             eprintln!("timed out task snapshot: {snapshot:?}");
             diagnose_coordinator(&spec);
             if let Ok(Reply::Task { attempts }) = &snapshot {
-                let worker = remote_task_runner::storage::WorkerStore::open_read_only(
-                    &spec.worker_state_dir,
-                )
-                .unwrap();
+                let worker =
+                    belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
                 for a in attempts.iter().take(8) {
                     diagnose_attempt(&spec, &a.attempt_id);
                     eprintln!(
@@ -1008,10 +997,9 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     };
     if attempts.len() != 1
         || attempts[0].termination.as_ref().map(|end| end.outcome())
-            != Some(remote_task_runner::state::Outcome::Succeeded)
+            != Some(belt::state::Outcome::Succeeded)
     {
-        let worker =
-            remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir);
+        let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir);
         for attempt in attempts.iter().take(8) {
             diagnose_attempt(&spec, &attempt.attempt_id);
             if let Ok(worker) = &worker {
@@ -1046,8 +1034,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     })
     .await
     .unwrap();
-    let results =
-        remote_task_runner::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
+    let results = belt::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if results
@@ -1055,10 +1042,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
                 .unwrap()
                 .is_some()
                 && results
-                    .log_len(
-                        &attempts[0].attempt_id,
-                        remote_task_runner::wire::LogStream::Stdout,
-                    )
+                    .log_len(&attempts[0].attempt_id, belt::wire::LogStream::Stdout)
                     .unwrap()
                     > 0
             {
@@ -1070,10 +1054,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     .await
     .unwrap();
     let log = results
-        .read_log(
-            &attempts[0].attempt_id,
-            remote_task_runner::wire::LogStream::Stdout,
-        )
+        .read_log(&attempts[0].attempt_id, belt::wire::LogStream::Stdout)
         .unwrap();
     assert!(!String::from_utf8_lossy(&log).contains(secret));
     assert!(
@@ -1081,8 +1062,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
         "collected masked stdout must survive workspace cleanup"
     );
     let sources = open_sources(&spec.state_dir);
-    let id =
-        remote_task_runner::ids::RunId::parse(value["result"]["run_id"].as_str().unwrap()).unwrap();
+    let id = belt::ids::RunId::parse(value["result"]["run_id"].as_str().unwrap()).unwrap();
     let ci = sources.source_of_run(&id).unwrap().unwrap();
     let manifest = sources.manifest(&ci).unwrap().unwrap();
     assert!(!manifest
@@ -1091,8 +1071,8 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
         .iter()
         .any(|e| e.path.0 == b"private.env"));
     assert_eq!(manifest.secret_files.len(), 1);
-    let vault = remote_task_runner::secrets::vault::Vault::open(&spec.state_dir).unwrap();
-    let key = remote_task_runner::secrets::key::load(&spec.cluster_key_path).unwrap();
+    let vault = belt::secrets::vault::Vault::open(&spec.state_dir).unwrap();
+    let key = belt::secrets::key::load(&spec.cluster_key_path).unwrap();
     assert!(vault.has(&id));
     assert_eq!(
         vault.load(&id, &manifest.secret_files, &key).unwrap().files[0]
@@ -1111,16 +1091,14 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
             {
                 if let Some(a) = attempts
                     .iter()
-                    .find(|a| a.state == remote_task_runner::state::AttemptState::Terminal)
+                    .find(|a| a.state == belt::state::AttemptState::Terminal)
                 {
-                    if a.termination.as_ref().unwrap().outcome()
-                        != remote_task_runner::state::Outcome::Succeeded
+                    if a.termination.as_ref().unwrap().outcome() != belt::state::Outcome::Succeeded
                     {
                         eprintln!("second attempt: {a:?}");
-                        let worker = remote_task_runner::storage::WorkerStore::open_read_only(
-                            &spec.worker_state_dir,
-                        )
-                        .unwrap();
+                        let worker =
+                            belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
+                                .unwrap();
                         for event in worker.events_of_attempt(&a.attempt_id, 40).unwrap() {
                             eprintln!(
                                 "second event {}: code={:?} message={:?}",
@@ -1145,7 +1123,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     .await
     .unwrap();
     // Same-run retry must use the retained run bundle after the file changes.
-    let target = remote_task_runner::service::completion::Target::Task(task.clone());
+    let target = belt::service::completion::Target::Task(task.clone());
     let accepted = client
         .request(Operation::Retry {
             target: target.clone(),
@@ -1161,7 +1139,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let report = tokio::time::timeout(
         Duration::from_secs(30),
-        remote_task_runner::service::control::wait(&spec, target.clone(), &mut signals),
+        belt::service::control::wait(&spec, target.clone(), &mut signals),
     )
     .await
     .unwrap()
@@ -1175,8 +1153,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
             .await
         {
             let worker =
-                remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
-                    .unwrap();
+                belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
             for attempt in attempts.iter().take(8) {
                 diagnose_attempt(&spec, &attempt.attempt_id);
                 for event in worker.events_of_attempt(&attempt.attempt_id, 30).unwrap() {
@@ -1205,15 +1182,13 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     };
     assert_eq!(
         error.blocked_reason,
-        Some(remote_task_runner::error::BlockedReason::SecretUnavailable)
+        Some(belt::error::BlockedReason::SecretUnavailable)
     );
     let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     assert_eq!(owner.attempts_of_task(&task).unwrap().len(), 2);
     assert_eq!(
         owner
-            .completion(remote_task_runner::service::completion::Target::Run(
-                id.clone()
-            ))
+            .completion(belt::service::completion::Target::Run(id.clone()))
             .unwrap()
             .control_revision,
         1
@@ -1248,20 +1223,20 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
 
 #[test]
 fn command_capture_directory_is_bound_once_and_source_view_reuses_it() {
-    use remote_task_runner::service::{context::Context, input};
+    use belt::service::{context::Context, input};
     let (root, spec) = fixture();
     let dir = root.path().join("directory");
     std::fs::create_dir(&dir).unwrap();
     std::fs::write(dir.join("input"), "first immutable input").unwrap();
     std::fs::write(dir.join("ignored.txt"), "excluded by directory policy").unwrap();
     std::fs::write(
-        dir.join(".remote-task-runner.toml"),
+        dir.join(".belt.toml"),
         "schema_version=1\n[[outputs]]\nname='report'\npaths=['report.txt']\n[source]\nexclude=['ignored.txt']\n",
     ).unwrap();
     let mut context = Context::load(spec.env.clone(), dir.clone(), spec).unwrap();
     assert!(context.repo_root.is_none());
     assert_eq!(context.config.outputs.len(), 1);
-    let run = remote_task_runner::ids::RunId::generate();
+    let run = belt::ids::RunId::generate();
     let first = input::capture(&context, &run, None).unwrap();
     assert!(!first
         .manifest
@@ -1286,14 +1261,9 @@ fn command_capture_directory_is_bound_once_and_source_view_reuses_it() {
         !context.state_dir().join("coordinator.db").exists(),
         "capture took writable owner state"
     );
-    assert!(input::capture(
-        &context,
-        &remote_task_runner::ids::RunId::generate(),
-        Some("HEAD")
-    )
-    .is_err());
-    context.config.source_mode.value = remote_task_runner::config::model::SourceMode::Commit;
-    assert!(input::capture(&context, &remote_task_runner::ids::RunId::generate(), None).is_err());
+    assert!(input::capture(&context, &belt::ids::RunId::generate(), Some("HEAD")).is_err());
+    context.config.source_mode.value = belt::config::model::SourceMode::Commit;
+    assert!(input::capture(&context, &belt::ids::RunId::generate(), None).is_err());
     let mut invalid_env = context.env.clone();
     invalid_env.insert(
         "GIT_DIR".into(),
@@ -1308,7 +1278,7 @@ fn command_capture_directory_is_bound_once_and_source_view_reuses_it() {
 #[test]
 fn uninitialized_submit_is_typed_without_creating_config_or_state() {
     let root = crate::test_tmp::tempdir().unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+    let output = Command::new(env!("CARGO_BIN_EXE_belt"))
         .args(["--json", "submit", "--", "true"])
         .env_clear()
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
@@ -1327,7 +1297,7 @@ fn uninitialized_submit_is_typed_without_creating_config_or_state() {
 
 #[test]
 fn command_commit_capture_requires_and_preserves_explicit_revision() {
-    use remote_task_runner::service::{context::Context, input};
+    use belt::service::{context::Context, input};
     let (root, spec) = fixture();
     let repo = root.path().join("commit-repo");
     std::fs::create_dir(&repo).unwrap();
@@ -1360,9 +1330,9 @@ fn command_commit_capture_requires_and_preserves_explicit_revision() {
     git(&["commit", "-qam", "second"]);
     std::fs::write(repo.join("input"), "dirty worktree").unwrap();
     let mut context = Context::load(spec.env.clone(), repo.clone(), spec).unwrap();
-    context.config.source_mode.value = remote_task_runner::config::model::SourceMode::Commit;
-    assert!(input::capture(&context, &remote_task_runner::ids::RunId::generate(), None).is_err());
-    let run = remote_task_runner::ids::RunId::generate();
+    context.config.source_mode.value = belt::config::model::SourceMode::Commit;
+    assert!(input::capture(&context, &belt::ids::RunId::generate(), None).is_err());
+    let run = belt::ids::RunId::generate();
     let captured = input::capture(&context, &run, Some(&old)).unwrap();
     assert_eq!(
         captured.manifest.original_head.as_deref(),
@@ -1384,10 +1354,10 @@ fn command_commit_capture_requires_and_preserves_explicit_revision() {
 /// is nonblocking by design and the daemon takes the exclusive source guard for
 /// its retention passes, so a test that looks at the store while the daemon is
 /// up sees a transient `WouldBlock`; only a guard that stays held fails it.
-fn open_sources(state: &std::path::Path) -> remote_task_runner::source::SourceStore {
+fn open_sources(state: &std::path::Path) -> belt::source::SourceStore {
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
-        match remote_task_runner::source::SourceStore::open(state) {
+        match belt::source::SourceStore::open(state) {
             Err(error)
                 if std::time::Instant::now() < deadline
                     && error.chain().any(|cause| {
@@ -1411,7 +1381,7 @@ pub(super) fn control_fixture_with(
 ) -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
     let (root, mut spec) = fixture();
     configure(&mut spec);
-    let config = root.path().join(".config/remote-task-runner");
+    let config = root.path().join(".config/belt");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(
@@ -1419,8 +1389,7 @@ pub(super) fn control_fixture_with(
         "schema_version = 1\n[coordinator]\nheartbeat_seconds = 1\nstale_seconds = 3\n",
     )
     .unwrap();
-    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
-        .unwrap();
+    belt::service::bootstrap::write_input(&config.join("coordinator.json"), &spec).unwrap();
     let input = root.path().join("input");
     std::fs::create_dir(&input).unwrap();
     std::fs::write(input.join("input.txt"), "snapshot").unwrap();
@@ -1471,11 +1440,7 @@ async fn configured_control_exec_exit_and_offline_wait_ignore_current_project_an
         .unwrap()
         .epoch();
     shutdown(&client).await;
-    std::fs::write(
-        input.join(".remote-task-runner.toml"),
-        "invalid project config [",
-    )
-    .unwrap();
+    std::fs::write(input.join(".belt.toml"), "invalid project config [").unwrap();
     for args in [
         vec!["ls"],
         vec!["show", run.as_deref().unwrap()],
@@ -1511,7 +1476,7 @@ async fn configured_control_exec_exit_and_offline_wait_ignore_current_project_an
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_starts() {
-    use remote_task_runner::service::{
+    use belt::service::{
         completion::Target,
         context::Context,
         control,
@@ -1536,7 +1501,7 @@ async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_st
         panic!("exec must bind a run")
     };
     let task = report.task_id.unwrap();
-    remote_task_runner::service::submit::command_with_ids(
+    belt::service::submit::command_with_ids(
         context.clone(),
         vec!["/bin/sh".into(), "-c".into(), "exit 99".into()],
         None,
@@ -1563,7 +1528,7 @@ async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_st
         .list_nonterminal_attempts()
         .unwrap()
         .is_empty());
-    let missing = remote_task_runner::ids::TaskId::generate().to_string();
+    let missing = belt::ids::TaskId::generate().to_string();
     let error = tokio::process::Command::new(&spec.executable)
         .args(["--json", "cancel", &missing])
         .env_clear()
@@ -1580,7 +1545,7 @@ async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_st
         "{}",
         String::from_utf8_lossy(&error.stdout)
     );
-    let absent = remote_task_runner::ids::RunId::generate().to_string();
+    let absent = belt::ids::RunId::generate().to_string();
     let receipt = tokio::process::Command::new(&spec.executable)
         .args(["--json", "cancel", &absent])
         .env_clear()
@@ -1599,10 +1564,10 @@ async fn control_interrupt_before_acceptance_is_durable_and_late_submit_never_st
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_wait_interrupt_detaches_without_cancelling_work() {
-    use remote_task_runner::service::{completion::Target, context::Context, control};
+    use belt::service::{completion::Target, context::Context, control};
     let (_root, spec, input) = control_fixture();
     let context = Context::load(spec.env.clone(), input, spec.clone()).unwrap();
-    let receipt = remote_task_runner::service::submit::command(
+    let receipt = belt::service::submit::command(
         context.clone(),
         vec!["/bin/sh".into(), "-c".into(), "sleep 1; exit 0".into()],
         None,
@@ -1667,7 +1632,7 @@ async fn control_exec_sigint(in_place: bool) {
         .unwrap();
     let pid = child.id().unwrap();
     assert!(pid > 1);
-    let identity = remote_task_runner::platform::process_start_identity(pid);
+    let identity = belt::platform::process_start_identity(pid);
     assert!(identity.identity().is_some());
     tokio::time::timeout(Duration::from_secs(20), async {
         loop {
@@ -1694,11 +1659,8 @@ async fn control_exec_sigint(in_place: bool) {
         diagnose_worker(&spec);
         panic!("no attempt reached running: {elapsed}");
     });
-    assert_eq!(
-        remote_task_runner::platform::process_start_identity(pid),
-        identity
-    );
-    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
+    assert_eq!(belt::platform::process_start_identity(pid), identity);
+    assert!(belt::platform::signal_pid(pid, libc::SIGINT));
     let output = tokio::time::timeout(Duration::from_secs(35), child.wait_with_output())
         .await
         .unwrap()
@@ -1730,10 +1692,10 @@ async fn control_exec_sigint(in_place: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_wait_reopens_after_owner_restart_without_new_attempt() {
-    use remote_task_runner::service::{completion::Target, context::Context, control};
+    use belt::service::{completion::Target, context::Context, control};
     let (_root, spec, input) = control_fixture();
     let context = Context::load(spec.env.clone(), input, spec.clone()).unwrap();
-    let receipt = remote_task_runner::service::submit::command(
+    let receipt = belt::service::submit::command(
         context,
         vec!["/bin/sh".into(), "-c".into(), "sleep 3; exit 0".into()],
         None,
@@ -1756,15 +1718,14 @@ async fn control_wait_reopens_after_owner_restart_without_new_attempt() {
             eprintln!(
                 "restart completion: {:?}",
                 store
-                    .completion(remote_task_runner::service::completion::Target::Task(
+                    .completion(belt::service::completion::Target::Task(
                         receipt.task_id.clone()
                     ))
                     .unwrap()
             );
             let attempts = store.attempts_of_task(&receipt.task_id).unwrap();
             let worker =
-                remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
-                    .unwrap();
+                belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
             for attempt in attempts {
                 eprintln!(
                     "parent attempt: state={:?} observation={:?} termination={:?}",
@@ -1797,17 +1758,17 @@ async fn control_wait_reopens_after_owner_restart_without_new_attempt() {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn control_exec_succeeded_compute_but_missing_collection_exits_78() {
-    use remote_task_runner::service::{context::Context, control};
+    use belt::service::{context::Context, control};
     let (_root, spec, input) = control_fixture();
     let mut context = Context::load(spec.env.clone(), input, spec.clone()).unwrap();
     context
         .config
         .outputs
-        .push(remote_task_runner::config::resolve::OutputSpec {
+        .push(belt::config::resolve::OutputSpec {
             name: "required.txt".into(),
             paths: vec!["not-created.txt".into()],
             required: true,
-            when: remote_task_runner::config::model::OutputWhen::Always,
+            when: belt::config::model::OutputWhen::Always,
         });
     let (_sender, mut signals) = tokio::sync::mpsc::unbounded_channel();
     // The outer bound must exceed the 20s the exec itself allows for the
@@ -1830,7 +1791,7 @@ async fn control_exec_succeeded_compute_but_missing_collection_exits_78() {
     let snapshot = report.snapshot.unwrap();
     assert_eq!(
         snapshot.first_termination.unwrap().outcome(),
-        remote_task_runner::state::Outcome::Succeeded
+        belt::state::Outcome::Succeeded
     );
     assert_eq!(snapshot.collection_failed_tasks, 1);
     assert_eq!(snapshot.collection_pending_tasks, 0);
@@ -1839,8 +1800,8 @@ async fn control_exec_succeeded_compute_but_missing_collection_exits_78() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
-    use remote_task_runner::ids::{RunId, TaskId};
-    use remote_task_runner::service::{completion::Target, control};
+    use belt::ids::{RunId, TaskId};
+    use belt::service::{completion::Target, control};
     let (_root, spec, input) = control_fixture();
     let output = tokio::process::Command::new(&spec.executable)
         .args([
@@ -1873,7 +1834,7 @@ async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
     drop(owner);
     std::fs::write(input.join("input.txt"), "changed after initial capture").unwrap();
     // Retry ignores current project configuration and does not need git.
-    std::fs::write(input.join(".remote-task-runner.toml"), "invalid [ config").unwrap();
+    std::fs::write(input.join(".belt.toml"), "invalid [ config").unwrap();
     let client = load(&spec);
     // Treat this accepted cancellation response as lost by the transport.
     let cancelled = client
@@ -1936,13 +1897,9 @@ async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
     assert_eq!(attempts[0], old);
     assert_eq!(attempts[1].generation.0, 2);
     drop(owner);
-    let results =
-        remote_task_runner::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
+    let results = belt::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
     let log = results
-        .read_log(
-            &attempts[1].attempt_id,
-            remote_task_runner::wire::LogStream::Stdout,
-        )
+        .read_log(&attempts[1].attempt_id, belt::wire::LogStream::Stdout)
         .unwrap();
     assert!(String::from_utf8_lossy(&log).contains("snapshot"));
     let client = load(&spec);
@@ -2032,10 +1989,10 @@ async fn retry_same_run_cli_uses_original_inputs_and_restart_receipt() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git() {
-    use remote_task_runner::ids::{AttemptId, Digest, RunId, TaskId};
-    use remote_task_runner::state::AttemptState;
-    use remote_task_runner::storage::NewAttempt;
-    use remote_task_runner::wire::LogStream;
+    use belt::ids::{AttemptId, Digest, RunId, TaskId};
+    use belt::state::AttemptState;
+    use belt::storage::NewAttempt;
+    use belt::wire::LogStream;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
     let (root, spec, _) = control_fixture();
     let run = RunId::generate();
@@ -2074,9 +2031,7 @@ async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git()
     ] {
         owner.transition_attempt(&attempt, state, 3).unwrap();
     }
-    let files =
-        remote_task_runner::results::store::ResultStore::open(&spec.state_dir.join("results"))
-            .unwrap();
+    let files = belt::results::store::ResultStore::open(&spec.state_dir.join("results")).unwrap();
     owner
         .prepare_log_progress(&attempt, LogStream::Stdout, 3)
         .unwrap();
@@ -2119,7 +2074,7 @@ async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git()
         .unwrap();
     let pid = child.id().unwrap();
     assert!(pid > 1);
-    let identity = remote_task_runner::platform::process_start_identity(pid);
+    let identity = belt::platform::process_start_identity(pid);
     assert!(identity.identity().is_some());
     let mut stdout = tokio::io::BufReader::new(child.stdout.take().unwrap());
     let mut first = String::new();
@@ -2128,11 +2083,8 @@ async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git()
         .unwrap()
         .unwrap();
     assert!(!first.is_empty());
-    assert_eq!(
-        remote_task_runner::platform::process_start_identity(pid),
-        identity
-    );
-    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
+    assert_eq!(belt::platform::process_start_identity(pid), identity);
+    assert!(belt::platform::signal_pid(pid, libc::SIGINT));
     let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
         .await
         .unwrap()
@@ -2197,7 +2149,7 @@ async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git()
         .unwrap();
     let pid = blocked.id().unwrap();
     assert!(pid > 1);
-    let identity = remote_task_runner::platform::process_start_identity(pid);
+    let identity = belt::platform::process_start_identity(pid);
     assert!(identity.identity().is_some());
     let mut unconsumed = tokio::io::BufReader::new(blocked.stdout.take().unwrap());
     let mut first = String::new();
@@ -2209,11 +2161,8 @@ async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git()
     // Deliberately stop reading while an encoded 64-KiB chunk fills the pipe.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(blocked.try_wait().unwrap().is_none());
-    assert_eq!(
-        remote_task_runner::platform::process_start_identity(pid),
-        identity
-    );
-    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
+    assert_eq!(belt::platform::process_start_identity(pid), identity);
+    assert!(belt::platform::signal_pid(pid, libc::SIGINT));
     // wait() does NOT drain stdout. Detach must finish even with no consumer.
     let status = tokio::time::timeout(Duration::from_secs(3), blocked.wait())
         .await
@@ -2229,7 +2178,7 @@ async fn public_logs_offline_raw_ndjson_and_sigint_detach_without_owner_or_git()
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_logs_closed_run_final_blocked_stdout_still_detaches() {
-    use remote_task_runner::ids::RunId;
+    use belt::ids::RunId;
     use std::os::fd::OwnedFd;
     let (root, spec, _) = control_fixture();
     let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
@@ -2277,7 +2226,7 @@ async fn public_logs_closed_run_final_blocked_stdout_still_detaches() {
         .unwrap();
     let pid = child.id().unwrap();
     assert!(pid > 1);
-    let identity = remote_task_runner::platform::process_start_identity(pid);
+    let identity = belt::platform::process_start_identity(pid);
     assert!(identity.identity().is_some());
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -2293,11 +2242,8 @@ async fn public_logs_closed_run_final_blocked_stdout_still_detaches() {
     // Allow the empty, read-only sweep to reach its sole final write.
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(child.try_wait().unwrap().is_none());
-    assert_eq!(
-        remote_task_runner::platform::process_start_identity(pid),
-        identity
-    );
-    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
+    assert_eq!(belt::platform::process_start_identity(pid), identity);
+    assert!(belt::platform::signal_pid(pid, libc::SIGINT));
     let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
         .await
         .unwrap()
@@ -2318,7 +2264,7 @@ async fn public_logs_closed_run_final_blocked_stdout_still_detaches() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
-    use remote_task_runner::ids::RunId;
+    use belt::ids::RunId;
     use std::os::fd::OwnedFd;
     let (root, spec, _) = control_fixture();
     let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
@@ -2365,7 +2311,7 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
         .unwrap();
     let pid = child.id().unwrap();
     assert!(pid > 1);
-    let identity = remote_task_runner::platform::process_start_identity(pid);
+    let identity = belt::platform::process_start_identity(pid);
     assert!(identity.identity().is_some());
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -2383,15 +2329,12 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
     assert!(child.try_wait().unwrap().is_none());
     let gc_owner = CoordinatorStore::open(&spec.state_dir, 10).unwrap();
     assert!(
-        matches!(gc_owner.result_gc_guard(&run), Err(remote_task_runner::storage::StorageError::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
+        matches!(gc_owner.result_gc_guard(&run), Err(belt::storage::StorageError::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
     );
     let epoch = gc_owner.epoch();
     drop(gc_owner);
-    assert_eq!(
-        remote_task_runner::platform::process_start_identity(pid),
-        identity
-    );
-    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
+    assert_eq!(belt::platform::process_start_identity(pid), identity);
+    assert!(belt::platform::signal_pid(pid, libc::SIGINT));
     let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
         .await
         .unwrap()
@@ -2410,7 +2353,7 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
     assert!(
         !CoordinatorStore::open_read_only(&spec.state_dir)
             .unwrap()
-            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .completion(belt::service::completion::Target::Run(run))
             .unwrap()
             .cancel_requested
     );
@@ -2424,18 +2367,18 @@ async fn public_outputs_blocked_stdout_detaches_without_cancel_or_owner() {
 fn seed_public_output(
     spec: &Spec,
     bytes: &[u8],
-    encoding: remote_task_runner::wire::ArtifactEncoding,
+    encoding: belt::wire::ArtifactEncoding,
 ) -> (
-    remote_task_runner::ids::RunId,
-    remote_task_runner::ids::TaskId,
-    remote_task_runner::ids::AttemptId,
-    remote_task_runner::wire::ArtifactRecord,
+    belt::ids::RunId,
+    belt::ids::TaskId,
+    belt::ids::AttemptId,
+    belt::wire::ArtifactRecord,
 ) {
-    use remote_task_runner::ids::{AttemptId, Digest, RunId, SourceId, TaskId};
-    use remote_task_runner::results::ResultStore;
-    use remote_task_runner::state::{AttemptState, Outcome, Termination};
-    use remote_task_runner::storage::{ArtifactReceipt, NewAttempt};
-    use remote_task_runner::wire::ArtifactRecord;
+    use belt::ids::{AttemptId, Digest, RunId, SourceId, TaskId};
+    use belt::results::ResultStore;
+    use belt::state::{AttemptState, Outcome, Termination};
+    use belt::storage::{ArtifactReceipt, NewAttempt};
+    use belt::wire::ArtifactRecord;
     let db = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
     let run = RunId::generate();
     let task = TaskId::generate();
@@ -2486,9 +2429,9 @@ fn seed_public_output(
         &Digest::of_bytes(b"result"),
         &serde_json::json!({"artifacts":[artifact.clone()]}),
         &[(artifact.name.clone(), true)],
-        &[remote_task_runner::storage::ResultRef {
+        &[belt::storage::ResultRef {
             ref_id: format!("{attempt}:result"),
-            kind: remote_task_runner::storage::BlobKind::Result,
+            kind: belt::storage::BlobKind::Result,
             locator: ResultStore::result_locator(&attempt),
         }],
         5,
@@ -2505,9 +2448,9 @@ fn seed_public_output(
             plan_digest: artifact.plan_digest.clone(),
             profile_fingerprint: artifact.profile_fingerprint.to_string(),
         },
-        &remote_task_runner::storage::ResultRef {
+        &belt::storage::ResultRef {
             ref_id: format!("{attempt}:artifact:{}", artifact.name),
-            kind: remote_task_runner::storage::BlobKind::Result,
+            kind: belt::storage::BlobKind::Result,
             locator: ResultStore::artifact_locator(&attempt, &artifact.digest),
         },
         6,
@@ -2527,9 +2470,9 @@ fn seed_public_output(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_outputs_retained_corruption_is_internal_before_publication() {
-    use remote_task_runner::ids::Digest;
-    use remote_task_runner::results::ResultStore;
-    use remote_task_runner::wire::ArtifactEncoding;
+    use belt::ids::Digest;
+    use belt::results::ResultStore;
+    use belt::wire::ArtifactEncoding;
     let mut builder = tar::Builder::new(Vec::new());
     for path in ["ordinary", "nested/.GiT/config"] {
         let mut header = tar::Header::new_gnu();
@@ -2599,7 +2542,7 @@ async fn public_outputs_retained_corruption_is_internal_before_publication() {
         db.close_collection(
             &attempt,
             Some(&Digest::of_bytes(b"result")),
-            remote_task_runner::results::plan::Verdict::Complete,
+            belt::results::plan::Verdict::Complete,
             true,
             8,
         )
@@ -2652,7 +2595,7 @@ async fn public_outputs_retained_corruption_is_internal_before_publication() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_place_exec_updates_original_directory_and_retries_mutable_input_after_restart() {
-    use remote_task_runner::{
+    use belt::{
         ids::{RunId, TaskId},
         service::{completion::Target, control},
     };
@@ -2695,7 +2638,7 @@ async fn in_place_exec_updates_original_directory_and_retries_mutable_input_afte
     );
     shutdown(&load(&spec)).await;
     std::fs::write(input.join("input.txt"), "mutable retry").unwrap();
-    std::fs::write(input.join(".remote-task-runner.toml"), "invalid [ config").unwrap();
+    std::fs::write(input.join(".belt.toml"), "invalid [ config").unwrap();
     let report = control::retry(&spec, Target::Run(run.clone()))
         .await
         .unwrap();
@@ -2730,7 +2673,7 @@ async fn in_place_exec_updates_original_directory_and_retries_mutable_input_afte
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_place_secret_values_are_read_only_masked_and_inventory_changes_reject_retry() {
-    use remote_task_runner::{
+    use belt::{
         ids::{RunId, TaskId},
         service::{completion::Target, control},
         wire::LogStream,
@@ -2751,7 +2694,7 @@ async fn in_place_secret_values_are_read_only_masked_and_inventory_changes_rejec
     }
     std::fs::write(input.join(".gitignore"), ".env*\n").unwrap();
     std::fs::write(
-        input.join(".remote-task-runner.toml"),
+        input.join(".belt.toml"),
         "schema_version = 1\n[source]\nsecret_files = [\".env*\"]\n",
     )
     .unwrap();
@@ -2808,8 +2751,7 @@ async fn in_place_secret_values_are_read_only_masked_and_inventory_changes_rejec
         .attempts_of_task(&task)
         .unwrap()
         .remove(0);
-    let files =
-        remote_task_runner::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
+    let files = belt::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
     let log = files.read_log(&old.attempt_id, LogStream::Stdout).unwrap();
     assert!(!String::from_utf8_lossy(&log).contains("initial-private-secret"));
     assert_eq!(
@@ -2820,7 +2762,7 @@ async fn in_place_secret_values_are_read_only_masked_and_inventory_changes_rejec
         std::fs::metadata(&secret).unwrap().permissions().mode(),
         original_mode
     );
-    remote_task_runner::secrets::vault::Vault::open(&spec.state_dir)
+    belt::secrets::vault::Vault::open(&spec.state_dir)
         .unwrap()
         .erase(&run)
         .unwrap();
@@ -2855,7 +2797,7 @@ async fn in_place_secret_values_are_read_only_masked_and_inventory_changes_rejec
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_place_preparation_runs_in_original_and_artifacts_use_normal_collection() {
-    use remote_task_runner::service::{context::Context, control};
+    use belt::service::{context::Context, control};
     let (_root, spec, input) = control_fixture();
     let mut context = Context::load(spec.env.clone(), input.clone(), spec.clone()).unwrap();
     context.config.prepare_commands = vec![vec![
@@ -2866,11 +2808,11 @@ async fn in_place_preparation_runs_in_original_and_artifacts_use_normal_collecti
     context
         .config
         .outputs
-        .push(remote_task_runner::config::resolve::OutputSpec {
+        .push(belt::config::resolve::OutputSpec {
             name: "kept".into(),
             paths: vec!["output.txt".into()],
             required: true,
-            when: remote_task_runner::config::model::OutputWhen::Always,
+            when: belt::config::model::OutputWhen::Always,
         });
     let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
     let done = control::exec_mode(
@@ -2899,7 +2841,7 @@ async fn in_place_preparation_runs_in_original_and_artifacts_use_normal_collecti
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn in_place_retry_rejects_original_subdirectory_replaced_by_external_symlink() {
-    use remote_task_runner::{
+    use belt::{
         ids::{RunId, TaskId},
         service::{completion::Target, control},
     };
@@ -2922,7 +2864,7 @@ async fn in_place_retry_rejects_original_subdirectory_replaced_by_external_symli
     std::fs::write(sub.join("input.txt"), "original subdirectory").unwrap();
     std::fs::write(input.join(".gitignore"), ".env.test\n").unwrap();
     std::fs::write(
-        input.join(".remote-task-runner.toml"),
+        input.join(".belt.toml"),
         "schema_version = 1\n[source]\nsecret_files = [\".env.test\"]\n",
     )
     .unwrap();
@@ -3028,11 +2970,8 @@ async fn public_outputs_sigint_drains_blocked_tar_worker_before_releasing_pin() 
             .unwrap();
     }
     let bytes = builder.into_inner().unwrap();
-    let (run, task, attempt, _) = seed_public_output(
-        &spec,
-        &bytes,
-        remote_task_runner::wire::ArtifactEncoding::TarV1,
-    );
+    let (run, task, attempt, _) =
+        seed_public_output(&spec, &bytes, belt::wire::ArtifactEncoding::TarV1);
     let (_unconsumed, writer) = std::os::unix::net::UnixStream::pair().unwrap();
     let stdout: OwnedFd = writer.into();
     let temporary = root.path().join("reader-tmp");
@@ -3054,7 +2993,7 @@ async fn public_outputs_sigint_drains_blocked_tar_worker_before_releasing_pin() 
         .unwrap();
     let pid = child.id().unwrap();
     assert!(pid > 1);
-    let identity = remote_task_runner::platform::process_start_identity(pid);
+    let identity = belt::platform::process_start_identity(pid);
     assert!(identity.identity().is_some());
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {
@@ -3079,15 +3018,12 @@ async fn public_outputs_sigint_drains_blocked_tar_worker_before_releasing_pin() 
     assert!(child.try_wait().unwrap().is_none());
     let gc_owner = CoordinatorStore::open(&spec.state_dir, 10).unwrap();
     assert!(
-        matches!(gc_owner.result_gc_guard(&run), Err(remote_task_runner::storage::StorageError::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
+        matches!(gc_owner.result_gc_guard(&run), Err(belt::storage::StorageError::Io(e)) if e.kind()==std::io::ErrorKind::WouldBlock)
     );
     let epoch = gc_owner.epoch();
     drop(gc_owner);
-    assert_eq!(
-        remote_task_runner::platform::process_start_identity(pid),
-        identity
-    );
-    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
+    assert_eq!(belt::platform::process_start_identity(pid), identity);
+    assert!(belt::platform::signal_pid(pid, libc::SIGINT));
     let status = tokio::time::timeout(Duration::from_secs(3), child.wait())
         .await
         .unwrap()
@@ -3106,7 +3042,7 @@ async fn public_outputs_sigint_drains_blocked_tar_worker_before_releasing_pin() 
     assert!(
         !CoordinatorStore::open_read_only(&spec.state_dir)
             .unwrap()
-            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .completion(belt::service::completion::Target::Run(run))
             .unwrap()
             .cancel_requested
     );
@@ -3136,8 +3072,8 @@ async fn public_outputs_sigint_drains_blocked_tar_worker_before_releasing_pin() 
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_retry() {
-    use remote_task_runner::service::{completion::Target, control};
-    use remote_task_runner::toolchain::capability::ExecutionRequirements;
+    use belt::service::{completion::Target, control};
+    use belt::toolchain::capability::ExecutionRequirements;
     let (root, spec, input) = control_fixture();
     let bin = root.path().join("profile-bin");
     // The host tools this test does not use are answered by the fixture.
@@ -3156,7 +3092,7 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     )
     .unwrap();
     std::fs::write(
-        input.join(".remote-task-runner.toml"),
+        input.join(".belt.toml"),
         "schema_version=1\n[[outputs]]\nname='report'\npaths=['report.txt']\nrequired=true\nwhen='always'\n",
     ).unwrap();
     let output=tokio::time::timeout(Duration::from_secs(30),tokio::process::Command::new(&spec.executable).args(["--json","exec","--profile","node22","--requires","node","--","/bin/sh","-c","test \"$(node --version)\" = v22.0.0 && test \"$MARKER\" = profile-constant || exit 99; echo report > report.txt; exit 23"]).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|v|("LLVM_PROFILE_FILE",v))).envs(&spec.env).current_dir(&input).output()).await.unwrap_or_else(|elapsed| {
@@ -3175,14 +3111,10 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
         String::from_utf8_lossy(&output.stderr)
     );
     let initial: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let run =
-        remote_task_runner::ids::RunId::parse(initial["result"]["target"]["id"].as_str().unwrap())
-            .unwrap();
-    let task =
-        remote_task_runner::ids::TaskId::parse(initial["result"]["task_id"].as_str().unwrap())
-            .unwrap();
+    let run = belt::ids::RunId::parse(initial["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let task = belt::ids::TaskId::parse(initial["result"]["task_id"].as_str().unwrap()).unwrap();
     let expected = ExecutionRequirements::parse(Some("node22".into()), &["node".into()]).unwrap();
-    std::fs::write(input.join(".remote-task-runner.toml"), "invalid [ config").unwrap();
+    std::fs::write(input.join(".belt.toml"), "invalid [ config").unwrap();
     let retry = tokio::process::Command::new(&spec.executable)
         .args(["--json", "retry", run.as_str()])
         .env_clear()
@@ -3209,11 +3141,10 @@ async fn capability_cli_named_profile_and_requires_use_actual_path_and_freeze_re
     let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     let attempts = owner.attempts_of_task(&task).unwrap();
     assert_eq!(attempts.len(), 2);
-    let worker =
-        remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
+    let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
     for attempt in attempts {
         let accepted = worker.get(&attempt.attempt_id).unwrap().unwrap();
-        let payload: remote_task_runner::wire::AttemptPayload =
+        let payload: belt::wire::AttemptPayload =
             serde_json::from_value(accepted.spec.clone()).unwrap();
         assert_eq!(payload.requirements, expected);
         assert_eq!(payload.outputs.len(), 1);
@@ -3259,7 +3190,7 @@ async fn public_exec_nested_git_cwd_uses_snapshot_root_and_preserves_in_place() 
         );
     }
     std::fs::write(sub.join("input.txt"), "dirty nested input").unwrap();
-    let config = root.path().join(".config/remote-task-runner");
+    let config = root.path().join(".config/belt");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(
@@ -3268,9 +3199,9 @@ async fn public_exec_nested_git_cwd_uses_snapshot_root_and_preserves_in_place() 
     )
     .unwrap();
     let retained = config.join("coordinator.json");
-    remote_task_runner::service::bootstrap::write_input(&retained, &spec).unwrap();
+    belt::service::bootstrap::write_input(&retained, &spec).unwrap();
     let mut child = tokio::process::Command::new(&spec.executable)
-        .args(remote_task_runner::service::bootstrap::daemon_argv(&retained).unwrap())
+        .args(belt::service::bootstrap::daemon_argv(&retained).unwrap())
         .env_clear()
         .envs(&spec.env)
         .kill_on_drop(true)
@@ -3342,17 +3273,12 @@ async fn estimate_offline_100_calls_without_git_leave_db_epoch_and_source_roots_
     let db = std::fs::read(spec.state_dir.join("coordinator.db")).unwrap();
     spec.env.insert("PATH".into(), "/nonexistent".into());
     for _ in 0..100 {
-        let context = remote_task_runner::service::context::Context::discover_estimate(
-            spec.env.clone(),
-            input.clone(),
-        )
-        .unwrap();
-        let answer = remote_task_runner::service::estimate::command(
-            context,
-            vec!["echo".into(), "hello".into()],
-        )
-        .await
-        .unwrap();
+        let context =
+            belt::service::context::Context::discover_estimate(spec.env.clone(), input.clone())
+                .unwrap();
+        let answer = belt::service::estimate::command(context, vec!["echo".into(), "hello".into()])
+            .await
+            .unwrap();
         assert!(!answer.online);
         assert!(answer.conditional && answer.decision.is_none() && answer.forecasts.is_empty());
     }
@@ -3377,14 +3303,11 @@ async fn estimate_offline_100_calls_without_git_leave_db_epoch_and_source_roots_
 #[tokio::test]
 async fn estimate_known_task_without_database_does_not_initialize_state() {
     let (_root, spec, input) = control_fixture();
-    let missing = remote_task_runner::ids::TaskId::generate();
-    let error = remote_task_runner::service::estimate::task(spec.clone(), missing.clone())
+    let missing = belt::ids::TaskId::generate();
+    let error = belt::service::estimate::task(spec.clone(), missing.clone())
         .await
         .unwrap_err();
-    assert_eq!(
-        error.code,
-        remote_task_runner::error::ErrorCode::InvalidInput
-    );
+    assert_eq!(error.code, belt::error::ErrorCode::InvalidInput);
     let output = tokio::process::Command::new(&spec.executable)
         .args(["estimate", "--task", missing.as_str(), "--json"])
         .env_clear()
@@ -3442,9 +3365,9 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     // The retained fixture input has a deliberately minimal PATH; keep its
     // existing content and start the explicit owned child with the intended env.
     let resident_input = repo.parent().unwrap().join("history-resident.json");
-    remote_task_runner::service::bootstrap::write_input(&resident_input, &spec).unwrap();
+    belt::service::bootstrap::write_input(&resident_input, &spec).unwrap();
     let mut child = tokio::process::Command::new(&spec.executable)
-        .args(remote_task_runner::service::bootstrap::daemon_argv(&resident_input).unwrap())
+        .args(belt::service::bootstrap::daemon_argv(&resident_input).unwrap())
         .env_clear()
         .envs(&spec.env)
         .kill_on_drop(true)
@@ -3492,28 +3415,25 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
             String::from_utf8_lossy(&output.stderr)
         );
         let result: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        successful_task = Some(
-            remote_task_runner::ids::TaskId::parse(result["result"]["task_id"].as_str().unwrap())
-                .unwrap(),
-        );
+        successful_task =
+            Some(belt::ids::TaskId::parse(result["result"]["task_id"].as_str().unwrap()).unwrap());
     }
     let successful_task = successful_task.unwrap();
-    let first_known =
-        remote_task_runner::service::estimate::task(spec.clone(), successful_task.clone())
-            .await
-            .unwrap();
+    let first_known = belt::service::estimate::task(spec.clone(), successful_task.clone())
+        .await
+        .unwrap();
     assert!(first_known.online);
     assert_eq!(first_known.forecasts.len(), 1, "{}", first_known.human());
     assert_ne!(
         first_known.forecasts[0].target.runtime_source,
-        remote_task_runner::wire::RuntimeSource::Measured
+        belt::wire::RuntimeSource::Measured
     );
     assert!(!first_known.components.is_empty());
     // This uses the successful transfer/collection producers, not hand-inserted stats.
     assert!(
         first_known.components.iter().any(|entry| matches!(
             entry.costs.collection.kind,
-            remote_task_runner::scheduler::measured::EvidenceKind::Measured
+            belt::scheduler::measured::EvidenceKind::Measured
         )),
         "{:?}",
         first_known.components
@@ -3524,14 +3444,13 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     )
     .unwrap();
     std::fs::write(
-        repo.join(".remote-task-runner.toml"),
+        repo.join(".belt.toml"),
         "deliberately invalid current project config",
     )
     .unwrap();
-    let changed =
-        remote_task_runner::service::estimate::task(spec.clone(), successful_task.clone())
-            .await
-            .unwrap();
+    let changed = belt::service::estimate::task(spec.clone(), successful_task.clone())
+        .await
+        .unwrap();
     assert_eq!(
         changed.forecasts[0].target.plan_digest,
         first_known.forecasts[0].target.plan_digest
@@ -3545,7 +3464,7 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
         first_known.components[0].costs.collection.ms
     );
     // Remove intentionally invalid config before exercising the original raw-command path.
-    std::fs::remove_file(repo.join(".remote-task-runner.toml")).unwrap();
+    std::fs::remove_file(repo.join(".belt.toml")).unwrap();
     let history = task_traffic_controller::history::read_all(
         &worker_traffic(&spec.env).state_dir.join("history.jsonl"),
     )
@@ -3554,12 +3473,9 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     assert!(history.iter().all(|record| record.wall_secs >= 1.0
         && record.exit_code == 0
         && record.measurement_id.is_some()));
-    let context = remote_task_runner::service::context::Context::discover_estimate(
-        spec.env.clone(),
-        repo.clone(),
-    )
-    .unwrap();
-    let answer = remote_task_runner::service::estimate::command(
+    let context =
+        belt::service::context::Context::discover_estimate(spec.env.clone(), repo.clone()).unwrap();
+    let answer = belt::service::estimate::command(
         context,
         vec!["/bin/sh".into(), "-c".into(), "sleep 1".into()],
     )
@@ -3575,16 +3491,11 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     // Public CLI task mode must work from a changed checkout with no Git in PATH.
     let mut offline_env = spec.env.clone();
     offline_env.insert("PATH".into(), "/nonexistent".into());
-    std::fs::write(
-        repo.join(".remote-task-runner.toml"),
-        "invalid project config",
-    )
-    .unwrap();
+    std::fs::write(repo.join(".belt.toml"), "invalid project config").unwrap();
     for _ in 0..100 {
-        let offline =
-            remote_task_runner::service::estimate::task(spec.clone(), successful_task.clone())
-                .await
-                .unwrap();
+        let offline = belt::service::estimate::task(spec.clone(), successful_task.clone())
+            .await
+            .unwrap();
         assert!(!offline.online && offline.decision.is_none());
         assert_eq!(offline.source_kind, "captured");
     }
@@ -3605,13 +3516,10 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["result"]["online"], false);
     assert_eq!(value["result"]["source_kind"], "captured");
-    let unknown = remote_task_runner::service::estimate::task(
-        spec.clone(),
-        remote_task_runner::ids::TaskId::generate(),
-    )
-    .await
-    .unwrap_err();
-    assert_eq!(unknown.code, remote_task_runner::error::ErrorCode::NotFound);
+    let unknown = belt::service::estimate::task(spec.clone(), belt::ids::TaskId::generate())
+        .await
+        .unwrap_err();
+    assert_eq!(unknown.code, belt::error::ErrorCode::NotFound);
     let invalid = tokio::process::Command::new(&spec.executable)
         .args(["estimate", "--task", "not-a-task", "--json"])
         .env_clear()
@@ -3641,7 +3549,7 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
     let forecast = &answer.forecasts[0];
     assert_eq!(
         forecast.target.runtime_source,
-        remote_task_runner::wire::RuntimeSource::Measured,
+        belt::wire::RuntimeSource::Measured,
         "{}",
         answer.human()
     );
@@ -3655,11 +3563,11 @@ async fn estimate_reads_real_worker_execution_history_through_authenticated_owne
 // both the receipt validator and registry detection must accept the replacement.
 fn replace_private_node_receipt(
     state: &std::path::Path,
-    profile: &remote_task_runner::toolchain::profile::Profile,
-    bundle: &remote_task_runner::toolchain::contract::FrozenBundle,
+    profile: &belt::toolchain::profile::Profile,
+    bundle: &belt::toolchain::contract::FrozenBundle,
     node: &std::path::Path,
 ) {
-    use remote_task_runner::toolchain::{
+    use belt::toolchain::{
         adapters::{Availability, FileIdentity, InstallationReceipt},
         registry::Registry,
         versions::ToolId,
@@ -3670,7 +3578,7 @@ fn replace_private_node_receipt(
     let request = registry
         .request(&bundle.frozen, &tool, Some(evidence))
         .unwrap();
-    let plan = remote_task_runner::toolchain::adapters::plan(
+    let plan = belt::toolchain::adapters::plan(
         request.kind,
         &request.frozen,
         &request.tool,
@@ -3721,7 +3629,7 @@ fn replace_private_node_receipt(
 /// profile stays as it is.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running() {
-    use remote_task_runner::toolchain::profile::Profile;
+    use belt::toolchain::profile::Profile;
     let (root, spec, input) = control_fixture();
     let host = root.path().join("private-managers");
     let stubs = root.path().join("tool-stubs");
@@ -3746,19 +3654,13 @@ async fn frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_run
     let script = format!("echo unsafe > '{}'", escaped.display());
     // The pinned Node version is not in the operator inventory.
     std::fs::write(input.join(".node-version"), "21.0.0\n").unwrap();
-    let context = remote_task_runner::service::context::Context::load(
-        spec.env.clone(),
-        input.clone(),
-        spec.clone(),
-    )
-    .unwrap();
-    let accepted = remote_task_runner::service::submit::command(
-        context,
-        vec!["/bin/sh".into(), "-c".into(), script],
-        None,
-    )
-    .await
-    .unwrap();
+    let context =
+        belt::service::context::Context::load(spec.env.clone(), input.clone(), spec.clone())
+            .unwrap();
+    let accepted =
+        belt::service::submit::command(context, vec!["/bin/sh".into(), "-c".into(), script], None)
+            .await
+            .unwrap();
     let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     let mut waiting = None;
     for _ in 0..600 {
@@ -3788,8 +3690,8 @@ async fn frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_run
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries() {
-    use remote_task_runner::service::{completion::Target, context::Context, control};
-    use remote_task_runner::toolchain::profile::Profile;
+    use belt::service::{completion::Target, context::Context, control};
+    use belt::toolchain::profile::Profile;
     let (root, spec, input) = control_fixture();
     let host = root.path().join("private-managers");
     // The host tools this test does not use are answered by the fixture.
@@ -3845,7 +3747,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
     let ready = host.join("node20-ready");
     let release = host.join("node20-release");
     let first_script = format!("test \"$(node --version)\" = v20.0.0 && test \"$(cat prepared-node.txt)\" = v20.0.0 || exit 91; : > '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 400 ]; do /bin/sleep 0.05; i=$((i+1)); done; test -f '{}' || exit 92; test \"$(node --version)\" = v20.0.0 || exit 93; exit 23", ready.display(), release.display(), release.display());
-    let first = remote_task_runner::service::submit::command(
+    let first = belt::service::submit::command(
         context,
         vec!["/bin/sh".into(), "-c".into(), first_script],
         None,
@@ -3884,9 +3786,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
     if done.cli_exit_code != 23 {
         eprintln!("public activation completion: {done:?}");
         let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
-        let worker =
-            remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir)
-                .unwrap();
+        let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
         for attempt in owner.attempts_of_task(&first.task_id).unwrap() {
             eprintln!(
                 "private preparation diagnostics: {:?}",
@@ -3941,26 +3841,23 @@ bin="$NODENV_ROOT/versions/$version/bin"
     let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     let attempts = owner.attempts_of_task(&first.task_id).unwrap();
     assert_eq!(attempts.len(), 2);
-    let worker =
-        remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
+    let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
     let mut bundles = Vec::new();
     let mut node20 = None;
     for attempt in attempts {
         let accepted = worker.get(&attempt.attempt_id).unwrap().unwrap();
-        let payload: remote_task_runner::wire::AttemptPayload =
-            serde_json::from_value(accepted.spec).unwrap();
+        let payload: belt::wire::AttemptPayload = serde_json::from_value(accepted.spec).unwrap();
         bundles.push(payload.toolchains.unwrap());
-        let binding: remote_task_runner::toolchain::contract::ExecutionBinding =
-            serde_json::from_slice(
-                &std::fs::read(
-                    spec.worker_state_dir
-                        .join("attempts")
-                        .join(attempt.attempt_id.as_str())
-                        .join("execution-binding.json"),
-                )
-                .unwrap(),
+        let binding: belt::toolchain::contract::ExecutionBinding = serde_json::from_slice(
+            &std::fs::read(
+                spec.worker_state_dir
+                    .join("attempts")
+                    .join(attempt.attempt_id.as_str())
+                    .join("execution-binding.json"),
             )
-            .unwrap();
+            .unwrap(),
+        )
+        .unwrap();
         node20 = std::env::split_paths(&binding.activation.environment["PATH"])
             .next()
             .map(|bin| bin.join("node"));
@@ -3991,7 +3888,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
         let mut context = Context::load(spec.env.clone(), input.clone(), spec.clone()).unwrap();
         context.config.prepare_commands = vec![vec!["/bin/sh".into(), "-c".into(), setup_script]];
         let consumer_script = format!("echo unsafe > '{}'", escaped.display());
-        let waiting = remote_task_runner::service::submit::command(
+        let waiting = belt::service::submit::command(
             context,
             vec!["/bin/sh".into(), "-c".into(), consumer_script],
             None,
@@ -4017,7 +3914,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
             .join("execution-binding.json");
         let original_binding = std::fs::read(&binding_path).unwrap();
         assert!(worker.launches(&accepted.attempt_id).unwrap().is_empty());
-        let payload: remote_task_runner::wire::AttemptPayload =
+        let payload: belt::wire::AttemptPayload =
             serde_json::from_value(worker.get(&accepted.attempt_id).unwrap().unwrap().spec)
                 .unwrap();
         if recover {
@@ -4055,7 +3952,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
     let adoption_release = host.join("adoption-release");
     let adoption_script = format!("test \"$(node --version)\" = v20.0.0 || exit 96; : > '{}'; i=0; while [ ! -f '{}' ] && [ $i -lt 800 ]; do /bin/sleep 0.05; i=$((i+1)); done; test -f '{}' || exit 97; exit 23", adoption_ready.display(), adoption_release.display(), adoption_release.display());
     let context = Context::load(spec.env.clone(), input.clone(), spec.clone()).unwrap();
-    let adopting = remote_task_runner::service::submit::command(
+    let adopting = belt::service::submit::command(
         context,
         vec!["/bin/sh".into(), "-c".into(), adoption_script],
         None,
@@ -4081,7 +3978,7 @@ bin="$NODENV_ROOT/versions/$version/bin"
         .join("execution-binding.json");
     let accepted_binding = std::fs::read(&binding_path).unwrap();
     assert_eq!(worker.launches(&active.attempt_id).unwrap().len(), 1);
-    let active_payload: remote_task_runner::wire::AttemptPayload =
+    let active_payload: belt::wire::AttemptPayload =
         serde_json::from_value(worker.get(&active.attempt_id).unwrap().unwrap().spec).unwrap();
     shutdown(&load(&spec)).await;
     replace_private_node_receipt(
@@ -4131,13 +4028,12 @@ bin="$NODENV_ROOT/versions/$version/bin"
 
 #[test]
 fn ci_plan_public_cli_frozen_worktree_commit_directory_and_private_failures() {
-    use remote_task_runner::service::{context::Context, planning};
+    use belt::service::{context::Context, planning};
     let (root, spec) = fixture();
-    let config = root.path().join(".config/remote-task-runner");
+    let config = root.path().join(".config/belt");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
-    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
-        .unwrap();
+    belt::service::bootstrap::write_input(&config.join("coordinator.json"), &spec).unwrap();
     let repo = root.path().join("repo");
     std::fs::create_dir_all(repo.join(".github/workflows")).unwrap();
     let workflow = repo.join(".github/workflows/ci.yml");
@@ -4146,7 +4042,7 @@ fn ci_plan_public_cli_frozen_worktree_commit_directory_and_private_failures() {
     std::fs::write(&workflow, old).unwrap();
     std::fs::write(repo.join(".gitignore"), "private.env\n").unwrap();
     std::fs::write(
-        repo.join(".remote-task-runner.toml"),
+        repo.join(".belt.toml"),
         "schema_version=1\n[source]\nsecret_files=[{glob='private.env',required=true}]\n",
     )
     .unwrap();
@@ -4329,11 +4225,10 @@ fn ci_plan_public_cli_frozen_worktree_commit_directory_and_private_failures() {
 #[test]
 fn ci_plan_shows_why_a_shared_workspace_task_is_not_split() {
     let (root, spec) = fixture();
-    let config = root.path().join(".config/remote-task-runner");
+    let config = root.path().join(".config/belt");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
-    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
-        .unwrap();
+    belt::service::bootstrap::write_input(&config.join("coordinator.json"), &spec).unwrap();
     let project = root.path().join("project");
     std::fs::create_dir_all(project.join(".github/workflows")).unwrap();
     std::fs::write(
@@ -4409,8 +4304,8 @@ fn ci_plan_shows_why_a_shared_workspace_task_is_not_split() {
 }
 
 #[test]
-fn ci_plan_captured_rtr_workflow_directories_never_use_live_config() {
-    use remote_task_runner::{
+fn ci_plan_captured_belt_workflow_directories_never_use_live_config() {
+    use belt::{
         config::{model::SourceMode, Origin, Overlay},
         service::{context::Context, planning},
     };
@@ -4419,7 +4314,7 @@ fn ci_plan_captured_rtr_workflow_directories_never_use_live_config() {
     std::fs::create_dir_all(repo.join("old-ci")).unwrap();
     let yaml = "on: push\njobs:\n  old_job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo safe\n";
     std::fs::write(repo.join("old-ci/ci.yml"), yaml).unwrap();
-    let config = repo.join(".remote-task-runner.toml");
+    let config = repo.join(".belt.toml");
     std::fs::write(
         &config,
         "schema_version=1\n[ci]\nworkflows_dirs=['old-ci']\n",
@@ -4497,7 +4392,7 @@ fn ci_plan_captured_rtr_workflow_directories_never_use_live_config() {
     )
     .unwrap();
     std::fs::write(
-        directory.join(".remote-task-runner.toml"),
+        directory.join(".belt.toml"),
         "schema_version=1\n[ci]\nworkflows_dirs=['custom-ci']\n",
     )
     .unwrap();
@@ -4537,7 +4432,7 @@ fn ci_plan_captured_rtr_workflow_directories_never_use_live_config() {
 
 #[test]
 fn ci_plan_submodules_and_distinct_capture_bindings_keep_exact_identity() {
-    use remote_task_runner::service::{context::Context, planning};
+    use belt::service::{context::Context, planning};
     let (root, spec) = fixture();
     let git = |dir: &std::path::Path, args: &[&str]| {
         let output = Command::new("git")
@@ -4632,7 +4527,7 @@ fn ci_plan_submodules_and_distinct_capture_bindings_keep_exact_identity() {
 /// `calls`, fails while `fail` exists and waits while `hold` exists. Nothing
 /// leaves the fixture's directory.
 fn sync_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
-    use remote_task_runner::toolchain::profile::Profile;
+    use belt::toolchain::profile::Profile;
     let (root, spec, _input) = control_fixture();
     let host = root.path().join("private-managers");
     let stubs = root.path().join("tool-stubs");
@@ -4676,10 +4571,8 @@ bin="$NODENV_ROOT/versions/$version/bin"
     (root, spec, host)
 }
 
-fn node_requirement(
-    version: &str,
-) -> Vec<remote_task_runner::toolchain::versions::EffectiveRequirement> {
-    use remote_task_runner::toolchain::versions::{Constraint, EffectiveRequirement, ToolId};
+fn node_requirement(version: &str) -> Vec<belt::toolchain::versions::EffectiveRequirement> {
+    use belt::toolchain::versions::{Constraint, EffectiveRequirement, ToolId};
     vec![EffectiveRequirement {
         tool: ToolId::parse("node").unwrap(),
         constraints: vec![Constraint::parse(version).unwrap()],
@@ -4690,10 +4583,9 @@ fn node_requirement(
 /// The real measurement of the local worker, reduced to node: the other
 /// tools are stubs that answer nothing here, so they cannot be measured, and
 /// what cannot be measured is (rightly) never called in sync.
-fn measure(spec: &Spec) -> remote_task_runner::toolchain::envdiff::EnvReport {
+fn measure(spec: &Spec) -> belt::toolchain::envdiff::EnvReport {
     let mut report =
-        remote_task_runner::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env)
-            .unwrap();
+        belt::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env).unwrap();
     report.tools.retain(|name, _| name == "node");
     report
 }
@@ -4703,8 +4595,8 @@ fn measure(spec: &Spec) -> remote_task_runner::toolchain::envdiff::EnvReport {
 async fn sync_node(
     spec: &Spec,
     version: &str,
-) -> Result<remote_task_runner::service::workers::SyncResult, remote_task_runner::error::ApiError> {
-    use remote_task_runner::service::workers::{sync_measured, warmup::ResidentWarmup};
+) -> Result<belt::service::workers::SyncResult, belt::error::ApiError> {
+    use belt::service::workers::{sync_measured, warmup::ResidentWarmup};
     let (spec, version) = (spec.clone(), version.to_string());
     tokio::task::spawn_blocking(move || {
         let parent = measure(&spec);
@@ -4753,7 +4645,7 @@ async fn workers_sync_installs_through_the_resident_then_measures_again_and_need
     assert_eq!(installed_node(&spec), ["20.0.0"]);
     assert_eq!(calls_of(&host, "20.0.0"), 1);
     assert!(done.in_sync);
-    let line = remote_task_runner::service::workers::render_sync(&done, true);
+    let line = belt::service::workers::render_sync(&done, true);
     assert_eq!(
         line,
         format!(
@@ -4769,8 +4661,8 @@ async fn workers_sync_installs_through_the_resident_then_measures_again_and_need
     let Reply::EnvSync { results } = client
         .request(Operation::EnvSync {
             worker: spec.worker_id.clone(),
-            sync_id: remote_task_runner::ids::RequestId::generate(),
-            tools: vec![remote_task_runner::wire::ToolRequirement {
+            sync_id: belt::ids::RequestId::generate(),
+            tools: vec![belt::wire::ToolRequirement {
                 name: "node".into(),
                 version: "20.0.0".into(),
             }],
@@ -4780,16 +4672,13 @@ async fn workers_sync_installs_through_the_resident_then_measures_again_and_need
     else {
         panic!("the resident must answer the warm-up")
     };
-    assert_eq!(
-        results[0].outcome,
-        remote_task_runner::wire::SyncOutcome::Unchanged
-    );
+    assert_eq!(results[0].outcome, belt::wire::SyncOutcome::Unchanged);
     assert_eq!(calls_of(&host, "20.0.0"), 1);
     // A worker the resident does not hold is said.
     let Reply::ControlError { error } = client
         .request(Operation::EnvSync {
             worker: WorkerId::parse("nobody").unwrap(),
-            sync_id: remote_task_runner::ids::RequestId::generate(),
+            sync_id: belt::ids::RequestId::generate(),
             tools: vec![],
         })
         .await
@@ -4797,7 +4686,7 @@ async fn workers_sync_installs_through_the_resident_then_measures_again_and_need
     else {
         panic!("an unknown worker is an error")
     };
-    assert_eq!(error.code, remote_task_runner::error::ErrorCode::NotFound);
+    assert_eq!(error.code, belt::error::ErrorCode::NotFound);
     // Without a resident nothing is installed, none is started, and it is said.
     shutdown(&client).await;
     let error = sync_node(&spec, "22.0.0").await.unwrap_err();
@@ -4818,10 +4707,10 @@ async fn a_failed_warm_up_is_blocked_and_two_syncs_at_once_share_one_install() {
     // The manager fails: blocked with what was not installed, never success.
     std::fs::write(host.join("fail"), "").unwrap();
     let error = sync_node(&spec, "20.0.0").await.unwrap_err();
-    assert_eq!(error.code, remote_task_runner::error::ErrorCode::Blocked);
+    assert_eq!(error.code, belt::error::ErrorCode::Blocked);
     assert_eq!(
         error.blocked_reason,
-        Some(remote_task_runner::error::BlockedReason::EnvironmentMismatch)
+        Some(belt::error::BlockedReason::EnvironmentMismatch)
     );
     assert!(
         error.message.contains("node 20.0.0 was not installed"),
@@ -4930,8 +4819,8 @@ async fn a_second_sync_after_an_interrupted_one_finds_or_joins_the_same_install(
     let Reply::EnvSync { results } = client
         .request(Operation::EnvSync {
             worker: spec.worker_id.clone(),
-            sync_id: remote_task_runner::ids::RequestId::generate(),
-            tools: vec![remote_task_runner::wire::ToolRequirement {
+            sync_id: belt::ids::RequestId::generate(),
+            tools: vec![belt::wire::ToolRequirement {
                 name: "node".into(),
                 version: "20.0.0".into(),
             }],
@@ -4941,10 +4830,7 @@ async fn a_second_sync_after_an_interrupted_one_finds_or_joins_the_same_install(
     else {
         panic!("the resident must answer the warm-up")
     };
-    assert_eq!(
-        results[0].outcome,
-        remote_task_runner::wire::SyncOutcome::Pending
-    );
+    assert_eq!(results[0].outcome, belt::wire::SyncOutcome::Pending);
     wait_calls(&host, "20.0.0", 1).await;
     let second = tokio::spawn({
         let spec = spec.clone();
@@ -5059,7 +4945,7 @@ async fn the_install_of_a_warm_up_waits_for_the_traffic_gate_of_the_worker() {
 async fn public_exec_output_conditions_globs_and_multiple_paths_follow_the_outcome() {
     let (root, spec, input) = control_fixture();
     std::fs::write(
-        input.join(".remote-task-runner.toml"),
+        input.join(".belt.toml"),
         "schema_version=1\n\
          [[outputs]]\nname='passed'\npaths=['ok/**']\nrequired=true\nwhen='success'\n\
          [[outputs]]\nname='failed'\npaths=['fail/*.log','extra/note.txt']\nrequired=true\nwhen='failure'\n\
@@ -5108,9 +4994,7 @@ async fn public_exec_output_conditions_globs_and_multiple_paths_follow_the_outco
         );
         let done: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let run = done["result"]["target"]["id"].as_str().unwrap().to_string();
-        let task =
-            remote_task_runner::ids::TaskId::parse(done["result"]["task_id"].as_str().unwrap())
-                .unwrap();
+        let task = belt::ids::TaskId::parse(done["result"]["task_id"].as_str().unwrap()).unwrap();
         let attempt = {
             let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
             let attempts = owner.attempts_of_task(&task).unwrap();
@@ -5242,9 +5126,7 @@ fn ci_marks(marks: &std::path::Path, job: &str) -> Vec<String> {
 
 /// How many attempts each task of the run had, by the task of the plan.
 fn ci_attempts(spec: &Spec, value: &serde_json::Value) -> BTreeMap<String, usize> {
-    let run =
-        remote_task_runner::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap())
-            .unwrap();
+    let run = belt::ids::RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
     let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     let rows = store.ci_run_tasks(&run).unwrap();
     rows.into_iter()
@@ -5305,14 +5187,12 @@ async fn ci_says_why_it_waits_for_a_worker_whose_plan_store_is_full_and_goes_on_
         "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/build\n",
     );
     // As many plans as a worker keeps, none of them the plan of this run.
-    let plans = remote_task_runner::worker::ci_task::plans_dir(&spec.worker_state_dir);
+    let plans = belt::worker::ci_task::plans_dir(&spec.worker_state_dir);
     std::fs::create_dir_all(&plans).unwrap();
-    let fillers: Vec<std::path::PathBuf> = (0..remote_task_runner::worker::ci_task::MAX_PLANS)
+    let fillers: Vec<std::path::PathBuf> = (0..belt::worker::ci_task::MAX_PLANS)
         .map(|n| {
-            let digest =
-                remote_task_runner::ids::Digest::of_bytes(format!("filler {n}").as_bytes());
-            let path =
-                remote_task_runner::worker::ci_task::plan_path(&spec.worker_state_dir, &digest);
+            let digest = belt::ids::Digest::of_bytes(format!("filler {n}").as_bytes());
+            let path = belt::worker::ci_task::plan_path(&spec.worker_state_dir, &digest);
             std::fs::write(&path, b"{}").unwrap();
             path
         })
@@ -5321,7 +5201,7 @@ async fn ci_says_why_it_waits_for_a_worker_whose_plan_store_is_full_and_goes_on_
     let mut command = ci_command(&spec, &input);
     command.kill_on_drop(true);
     let running = tokio::spawn(async move { command.output().await.unwrap() });
-    let events = |kind: &str| -> Vec<remote_task_runner::storage::Event> {
+    let events = |kind: &str| -> Vec<belt::storage::Event> {
         let Ok(store) = CoordinatorStore::open_read_only(&spec.state_dir) else {
             return Vec::new();
         };
@@ -5349,7 +5229,7 @@ async fn ci_says_why_it_waits_for_a_worker_whose_plan_store_is_full_and_goes_on_
     assert_eq!(excluded[0]["why"], "input_refused", "{excluded}");
     assert_eq!(excluded[0]["unmet"], serde_json::json!([reason]));
     // As `show` reads it.
-    let run = remote_task_runner::ids::RunId::parse(refused[0].run_id.as_deref().unwrap()).unwrap();
+    let run = belt::ids::RunId::parse(refused[0].run_id.as_deref().unwrap()).unwrap();
     let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     let tasks = store.query_tasks(run, 16, None).unwrap();
     assert_eq!(tasks.items.len(), 1);
@@ -5435,7 +5315,7 @@ async fn ci_sigint_cancels_the_running_job_and_the_ones_that_wait() {
         .unwrap();
     let pid = child.id().unwrap();
     assert!(pid > 1);
-    let identity = remote_task_runner::platform::process_start_identity(pid);
+    let identity = belt::platform::process_start_identity(pid);
     assert!(identity.identity().is_some());
     let started = tokio::time::timeout(Duration::from_secs(120), async {
         while ci_marks(&marks, "first").is_empty() {
@@ -5451,11 +5331,8 @@ async fn ci_sigint_cancels_the_running_job_and_the_ones_that_wait() {
         diagnose_worker(&spec);
         panic!("the first job did not start: {elapsed}");
     });
-    assert_eq!(
-        remote_task_runner::platform::process_start_identity(pid),
-        identity
-    );
-    assert!(remote_task_runner::platform::signal_pid(pid, libc::SIGINT));
+    assert_eq!(belt::platform::process_start_identity(pid), identity);
+    assert!(belt::platform::signal_pid(pid, libc::SIGINT));
     let output = tokio::time::timeout(Duration::from_secs(60), child.wait_with_output())
         .await
         .unwrap()
@@ -5497,7 +5374,7 @@ async fn ci_runs_the_worktree_of_a_git_repository_and_a_named_commit() {
         "PATH".into(),
         private_tool_path(root.path(), &["git", "fast-worktree"]),
     );
-    let config = root.path().join(".config/remote-task-runner");
+    let config = root.path().join(".config/belt");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(
@@ -5505,8 +5382,7 @@ async fn ci_runs_the_worktree_of_a_git_repository_and_a_named_commit() {
         "schema_version = 1\n[coordinator]\nheartbeat_seconds = 1\nstale_seconds = 3\n",
     )
     .unwrap();
-    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
-        .unwrap();
+    belt::service::bootstrap::write_input(&config.join("coordinator.json"), &spec).unwrap();
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     let jobs = |word: &str| {
@@ -5573,7 +5449,7 @@ async fn a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_
     )
     .unwrap();
     std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let config = root.path().join(".config/remote-task-runner");
+    let config = root.path().join(".config/belt");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
     std::fs::write(
@@ -5581,8 +5457,7 @@ async fn a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_
         "schema_version = 1\n[coordinator]\nheartbeat_seconds = 1\nstale_seconds = 3\n",
     )
     .unwrap();
-    remote_task_runner::service::bootstrap::write_input(&config.join("coordinator.json"), &spec)
-        .unwrap();
+    belt::service::bootstrap::write_input(&config.join("coordinator.json"), &spec).unwrap();
     let repo = root.path().join("repo");
     std::fs::create_dir_all(&repo).unwrap();
     let jobs = |word: &str| {
@@ -5692,7 +5567,7 @@ async fn a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_
 
     // No task a worker was given carries anything of the status.
     let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
-    let run = remote_task_runner::ids::RunId::parse(run).unwrap();
+    let run = belt::ids::RunId::parse(run).unwrap();
     for row in store.ci_run_tasks(&run).unwrap() {
         let text = row.spec.to_string();
         assert!(

@@ -6,8 +6,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-const RECORD: &str = "RTR_TEST_TMP_RECORD";
-const HANG: &str = "RTR_TEST_TMP_HANG";
+const RECORD: &str = "BELT_TEST_TMP_RECORD";
+const HANG: &str = "BELT_TEST_TMP_HANG";
 
 #[test]
 #[ignore = "invoked as a dedicated subprocess by the root regressions"]
@@ -65,7 +65,7 @@ fn exiting_test_process_removes_its_root_and_what_guards_left() {
     assert_ne!(root, crate::test_tmp::root());
     let outer = root.parent().unwrap();
     let name = outer.file_name().unwrap().to_str().unwrap();
-    assert!(name.starts_with("rtr-t-"), "{name}");
+    assert!(name.starts_with("belt-t-"), "{name}");
     assert!(!outer.exists(), "{outer:?} outlived its process");
 }
 
@@ -81,10 +81,7 @@ fn killed_test_process_root_is_removed_by_the_next_test_process() {
     assert!(helper(&bystander, false).wait().unwrap().success());
     assert!(root.is_dir() && outer.join("owner").is_file());
     // The child is ours and not reaped yet, so the PID is still its.
-    assert!(remote_task_runner::platform::signal_pid(
-        killed.id(),
-        libc::SIGKILL
-    ));
+    assert!(belt::platform::signal_pid(killed.id(), libc::SIGKILL));
     assert!(!killed.wait().unwrap().success());
     // Any test process that starts from here on may remove the root: no
     // assertion that it still exists.

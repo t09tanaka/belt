@@ -1,4 +1,4 @@
-//! The `SourceManifest` of spec chapter 6, as remote-task-runner sees it.
+//! The `SourceManifest` of spec chapter 6, as belt sees it.
 //!
 //! The content, and with it the identity, belong to local-ci's sealed
 //! [`CiManifest`] (schema version 2): its `manifest_digest` covers every

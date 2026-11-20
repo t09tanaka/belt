@@ -276,15 +276,11 @@ where
     Ok(())
 }
 
-/// Where a worker agent listens: `<HOME>/.remote-task-runner/agent.sock`. The
+/// Where a worker agent listens: `<HOME>/.belt/agent.sock`. The
 /// environment arrives as a map; this never reads the process environment.
 pub fn default_agent_socket(env: &BTreeMap<String, String>) -> Option<PathBuf> {
     let home = env.get("HOME").filter(|h| !h.is_empty())?;
-    Some(
-        Path::new(home)
-            .join(".remote-task-runner")
-            .join("agent.sock"),
-    )
+    Some(Path::new(home).join(".belt").join("agent.sock"))
 }
 
 #[cfg(test)]
@@ -295,7 +291,7 @@ mod tests {
     /// Unix socket paths are limited to about 100 bytes, which the default
     /// temp directory (a long per-user path on macOS) can exceed.
     fn short_tempdir() -> tempfile::TempDir {
-        crate::test_tmp::prefixed("rtr").unwrap()
+        crate::test_tmp::prefixed("belt").unwrap()
     }
 
     fn env(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
@@ -309,7 +305,7 @@ mod tests {
     fn the_agent_socket_lives_under_home() {
         assert_eq!(
             default_agent_socket(&env(&[("HOME", "/home/u")])).unwrap(),
-            PathBuf::from("/home/u/.remote-task-runner/agent.sock")
+            PathBuf::from("/home/u/.belt/agent.sock")
         );
         assert!(default_agent_socket(&env(&[])).is_none());
         assert!(default_agent_socket(&env(&[("HOME", "")])).is_none());

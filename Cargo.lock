@@ -137,6 +137,38 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
+name = "belt-cli"
+version = "0.0.0"
+dependencies = [
+ "anyhow",
+ "assert_cmd",
+ "base64",
+ "chrono",
+ "clap",
+ "getrandom 0.3.4",
+ "globset",
+ "libc",
+ "local-ci",
+ "memchr",
+ "node-semver",
+ "ratatui",
+ "rusqlite",
+ "rustix",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2",
+ "tar",
+ "task-traffic-controller",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml 0.8.23",
+ "ulid",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1553,38 +1585,6 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
-
-[[package]]
-name = "remote-task-runner"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "assert_cmd",
- "base64",
- "chrono",
- "clap",
- "getrandom 0.3.4",
- "globset",
- "libc",
- "local-ci",
- "memchr",
- "node-semver",
- "ratatui",
- "rusqlite",
- "rustix",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tar",
- "task-traffic-controller",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "toml 0.8.23",
- "ulid",
- "unicode-normalization",
-]
 
 [[package]]
 name = "rsqlite-vfs"

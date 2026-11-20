@@ -1,5 +1,5 @@
 //! Process composition only: no launchctl invocation or real LaunchAgents path.
-use remote_task_runner::{
+use belt::{
     service::{
         bootstrap,
         init::{initialize, ContextInput},
@@ -78,14 +78,14 @@ impl Launcher for OwnedLauncher {
         &mut self,
         _: &Plan,
         _: &Receipt,
-    ) -> Result<remote_task_runner::service::macos::RunningIdentity, LaunchError> {
+    ) -> Result<belt::service::macos::RunningIdentity, LaunchError> {
         let state = self.0.lock().unwrap();
         let pid = state
             .child
             .as_ref()
             .ok_or_else(|| LaunchError::NotApplied("no owned child".into()))?
             .id();
-        remote_task_runner::service::macos::RunningIdentity::observe(pid)
+        belt::service::macos::RunningIdentity::observe(pid)
             .map_err(|_| LaunchError::NotApplied("owned child identity unknown".into()))
     }
 
@@ -128,14 +128,14 @@ fn start_owned(state: &Mutex<State>, input: &std::path::Path) {
 /// A systemd user manager that owns one child: no `systemctl` runs.
 struct OwnedSystemd(Arc<Mutex<State>>, std::path::PathBuf);
 impl Launcher for OwnedSystemd {
-    fn backend(&self) -> remote_task_runner::service::macos::policy::Backend {
-        remote_task_runner::service::macos::policy::Backend::Systemd
+    fn backend(&self) -> belt::service::macos::policy::Backend {
+        belt::service::macos::policy::Backend::Systemd
     }
     fn running_identity(
         &mut self,
         plan: &Plan,
         receipt: &Receipt,
-    ) -> Result<remote_task_runner::service::macos::RunningIdentity, LaunchError> {
+    ) -> Result<belt::service::macos::RunningIdentity, LaunchError> {
         OwnedLauncher(self.0.clone()).running_identity(plan, receipt)
     }
     fn loaded_state(&mut self, plan: &Plan, receipt: &Receipt) -> LoadedState {
@@ -151,10 +151,7 @@ impl Launcher for OwnedSystemd {
             std::fs::read_to_string(self.1.join("config/systemd/user").join(&args[2])).unwrap();
         assert!(unit.contains("Restart=always") && unit.contains("WantedBy=default.target"));
         assert!(!unit.contains("SECRET_TOKEN"));
-        start_owned(
-            &self.0,
-            &self.1.join("config/remote-task-runner/coordinator.json"),
-        );
+        start_owned(&self.0, &self.1.join("config/belt/coordinator.json"));
         Ok(())
     }
 }
@@ -169,12 +166,12 @@ fn test_command(program: impl AsRef<std::ffi::OsStr>) -> Command {
     command
 }
 fn self_input(plist: &str) -> std::path::PathBuf {
-    // HOME/Library/LaunchAgents/<label>.plist -> HOME/config/remote-task-runner/coordinator.json
+    // HOME/Library/LaunchAgents/<label>.plist -> HOME/config/belt/coordinator.json
     std::path::Path::new(plist)
         .ancestors()
         .nth(3)
         .unwrap()
-        .join("config/remote-task-runner/coordinator.json")
+        .join("config/belt/coordinator.json")
 }
 fn context(root: &std::path::Path) -> ContextInput {
     ContextInput {
@@ -187,7 +184,7 @@ fn context(root: &std::path::Path) -> ContextInput {
             ("PATH".into(), "/usr/bin:/bin".into()),
             ("SECRET_TOKEN".into(), "never persist".into()),
         ]),
-        executable: env!("CARGO_BIN_EXE_remote-task-runner").into(),
+        executable: env!("CARGO_BIN_EXE_belt").into(),
     }
 }
 #[test]
@@ -218,9 +215,7 @@ fn concurrent_init_reuses_one_real_combined_resident_and_epoch() {
     assert_eq!(a.worker_id, b.worker_id);
     assert_eq!(a.cluster_id, b.cluster_id);
     assert_eq!(state.lock().unwrap().starts, 1);
-    let input = root
-        .path()
-        .join("config/remote-task-runner/coordinator.json");
+    let input = root.path().join("config/belt/coordinator.json");
     let spec = bootstrap::read_input(&input).unwrap();
     let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     assert_eq!(store.epoch(), a.epoch);
@@ -232,11 +227,10 @@ fn concurrent_init_reuses_one_real_combined_resident_and_epoch() {
             Reply::Health { ready: true, .. }
         ));
         let mut wrong_worker = spec.clone();
-        wrong_worker.worker_id =
-            remote_task_runner::ids::WorkerId::parse("foreign-worker").unwrap();
+        wrong_worker.worker_id = belt::ids::WorkerId::parse("foreign-worker").unwrap();
         assert!(bootstrap::health(&wrong_worker).await.is_err());
         let mut wrong_cluster = spec.clone();
-        wrong_cluster.expected_cluster = Some(remote_task_runner::ids::ClusterId::generate());
+        wrong_cluster.expected_cluster = Some(belt::ids::ClusterId::generate());
         assert!(bootstrap::health(&wrong_cluster).await.is_err());
         let client = Client::load(&spec.state_dir, a.cluster_id).unwrap();
         assert!(matches!(
@@ -284,7 +278,7 @@ fn linux_public_init_reaches_the_systemd_backend_and_claims_nothing_without_a_ma
     let root = crate::test_tmp::tempdir().unwrap();
     let runtime = root.path().join("run");
     std::fs::create_dir(&runtime).unwrap();
-    let out = test_command(env!("CARGO_BIN_EXE_remote-task-runner"))
+    let out = test_command(env!("CARGO_BIN_EXE_belt"))
         .args(["--json", "init"])
         .env("HOME", root.path())
         .env("PATH", "/usr/bin:/bin")
@@ -347,9 +341,7 @@ fn init_with_a_systemd_manager_registers_one_real_combined_resident() {
     assert!(!root.path().join("Library").exists());
     // The daemon checked its own managed registration from the journal, and
     // answers as the registered resident.
-    let input = root
-        .path()
-        .join("config/remote-task-runner/coordinator.json");
+    let input = root.path().join("config/belt/coordinator.json");
     let spec = bootstrap::read_input(&input).unwrap();
     runtime.block_on(async {
         assert!(matches!(
@@ -377,7 +369,7 @@ fn manual_resident_and_failed_registered_daemon_are_not_initialized() {
             &mut self,
             p: &Plan,
             r: &Receipt,
-        ) -> Result<remote_task_runner::service::macos::RunningIdentity, LaunchError> {
+        ) -> Result<belt::service::macos::RunningIdentity, LaunchError> {
             OwnedLauncher(self.0.clone()).running_identity(p, r)
         }
         fn launchctl(&mut self, args: &[String]) -> Result<(), LaunchError> {
@@ -426,12 +418,7 @@ fn manual_resident_and_failed_registered_daemon_are_not_initialized() {
     assert!(error
         .to_string()
         .contains("service identity changed after health"));
-    let spec = bootstrap::read_input(
-        &root
-            .path()
-            .join("config/remote-task-runner/coordinator.json"),
-    )
-    .unwrap();
+    let spec = bootstrap::read_input(&root.path().join("config/belt/coordinator.json")).unwrap();
     runtime.block_on(async {
         let health = bootstrap::health(&spec).await.unwrap();
         let Reply::Health {

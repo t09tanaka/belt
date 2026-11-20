@@ -109,7 +109,7 @@ async fn collection_shutdown_fixture(
     input_pause: bool,
     gc_stuck: bool,
 ) {
-    let root = crate::test_tmp::prefixed("rtr-clocks-").unwrap();
+    let root = crate::test_tmp::prefixed("belt-clocks-").unwrap();
     let mut config = crate::config::resolve(&crate::config::Inputs {
         overlay: &crate::config::Overlay::default(),
         project: None,
@@ -501,7 +501,7 @@ async fn collection_shutdown_fixture(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn durable_acceptance_survives_stalled_source_and_shutdown() {
-    let root = crate::test_tmp::prefixed("rtr-stop-source-").unwrap();
+    let root = crate::test_tmp::prefixed("belt-stop-source-").unwrap();
     crate::secrets::key::init(&root.path().join("key")).unwrap();
     let config = crate::config::resolve(&crate::config::Inputs {
         overlay: &crate::config::Overlay::default(),
@@ -1417,7 +1417,7 @@ async fn retry_preflight_keeps_admission_and_db_available_and_rechecks_stopping(
 fn retry_owner() -> (tempfile::TempDir, Arc<Coordinator>, RunId) {
     use crate::coordinator::CoordinatorConfig;
     use crate::state::Exit;
-    let root = crate::test_tmp::prefixed("rtr-retry-").unwrap();
+    let root = crate::test_tmp::prefixed("belt-retry-").unwrap();
     let store = CoordinatorStore::open(root.path(), 1).unwrap();
     let run = RunId::generate();
     let source = SourceId::generate();
@@ -1673,7 +1673,7 @@ async fn capability_private_ipc_prevents_old_owner_from_discarding_requirements(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
-    let root = crate::test_tmp::prefixed("rtr-estimate-").unwrap();
+    let root = crate::test_tmp::prefixed("belt-estimate-").unwrap();
     // Each of the 200 reads inspects the worker, and an inspection measures
     // every native tool on the profile path with one subprocess each. On
     // macOS /usr/bin holds launchers for git, xcodebuild, java, python3 and

@@ -29,5 +29,5 @@ pub(crate) fn keys(demand: &local_ci::TaskDemand, scope: &Digest) -> Vec<Option<
 }
 
 pub(crate) fn profile_key(step: &Digest, profile: &Digest) -> String {
-    format!("rtr-ci-step:{profile}:{step}")
+    format!("belt-ci-step:{profile}:{step}")
 }

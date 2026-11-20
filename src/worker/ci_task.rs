@@ -364,7 +364,7 @@ pub fn check_payload(p: &AttemptPayload) -> Result<(), &'static str> {
     {
         return Err(
             "an artifact or output of a CI task is named like its result \
-             (rtr-ci-task-result.json is reserved)",
+             (belt-ci-task-result.json is reserved)",
         );
     }
     if p.in_place {
@@ -937,13 +937,13 @@ mod tests {
 
     #[test]
     fn the_name_of_the_result_is_reserved_in_a_ci_payload_only() {
-        assert!(is_reserved_name("rtr-ci-task-result.json"));
-        assert!(is_reserved_name("rtr-ci-task-result.json/part"));
-        assert!(!is_reserved_name("rtr-ci-task-result.json.bak"));
-        assert!(!is_reserved_name("rtr-ci-task-result"));
-        assert!(!is_reserved_name("dir/rtr-ci-task-result.json"));
+        assert!(is_reserved_name("belt-ci-task-result.json"));
+        assert!(is_reserved_name("belt-ci-task-result.json/part"));
+        assert!(!is_reserved_name("belt-ci-task-result.json.bak"));
+        assert!(!is_reserved_name("belt-ci-task-result"));
+        assert!(!is_reserved_name("dir/belt-ci-task-result.json"));
         assert!(!is_reserved_name(""));
-        assert_eq!(RESULT_ARTIFACT, "rtr-ci-task-result.json");
+        assert_eq!(RESULT_ARTIFACT, "belt-ci-task-result.json");
 
         let f = fixture(WORKFLOW);
         let digest = Digest::of_bytes(b"plan");
@@ -960,7 +960,7 @@ mod tests {
             when: crate::wire::OutputWhen::Always,
         };
         let mut p = base.clone();
-        p.artifacts = vec![artifact("report"), artifact("rtr-ci-task-result.json.bak")];
+        p.artifacts = vec![artifact("report"), artifact("belt-ci-task-result.json.bak")];
         p.outputs = vec![output("dist")];
         assert_eq!(check_payload(&p), Ok(()));
         for change in [
@@ -968,7 +968,7 @@ mod tests {
                 as fn(&mut AttemptPayload, crate::wire::ArtifactDecl, crate::wire::OutputDecl),
             |p, _, o| p.outputs.push(o),
         ] {
-            for name in ["rtr-ci-task-result.json", "rtr-ci-task-result.json/x"] {
+            for name in ["belt-ci-task-result.json", "belt-ci-task-result.json/x"] {
                 let mut clash = p.clone();
                 change(&mut clash, artifact(name), output(name));
                 let why = check_payload(&clash).unwrap_err();
