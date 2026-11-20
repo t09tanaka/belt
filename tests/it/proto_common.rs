@@ -2,10 +2,14 @@
 #![allow(dead_code)]
 
 use belt::error::ApiError;
+use belt::group::Keys;
 use belt::ids::*;
 use belt::protocol::hello::WorkerIdentity;
 use belt::protocol::transport::duplex_pair;
-use belt::protocol::{accept, connect, Accepted, ClientConfig, Connected, Incoming, ServerConfig};
+use belt::protocol::{
+    accept, connect, Accepted, ClientConfig, Connected, Incoming, Membership, ServerConfig,
+};
+use belt::secrets::key::ClusterKey;
 use belt::wire::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,16 +28,47 @@ pub fn identity(name: &str) -> WorkerIdentity {
     }
 }
 
+/// The group key of these tests.
+pub fn group_key() -> ClusterKey {
+    ClusterKey::from_bytes(vec![7; 32]).unwrap()
+}
+
+/// The member a test's coordinator connects as, holding [`group_key`].
+pub fn membership(name: &str) -> Membership {
+    Membership {
+        member: WorkerId::parse(name).unwrap(),
+        key: group_key(),
+    }
+}
+
+/// Put [`group_key`] where an agent reads its key, as a key file is kept:
+/// lower-case hex, readable by its owner only.
+pub fn place_group_key(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let text: String = group_key()
+        .as_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    std::fs::write(path, format!("{text}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// A coordinator of its own: each call is another member of the group.
 pub fn client_cfg(cluster: &ClusterId) -> ClientConfig {
+    let coordinator = CoordinatorId::generate();
+    let name = format!("m-{}", &coordinator.as_str()[3..].to_lowercase());
     ClientConfig::new(
         cluster.clone(),
-        CoordinatorId::generate(),
+        coordinator,
         CoordinatorEpoch(1),
+        membership(&name),
     )
 }
 
 pub fn server_cfg(cluster: &ClusterId) -> ServerConfig {
-    ServerConfig::new(cluster.clone(), identity("w1"))
+    ServerConfig::new(cluster.clone(), identity("w1"), Keys::only(group_key()))
 }
 
 pub async fn pair(cluster: &ClusterId) -> (Connected, Accepted) {

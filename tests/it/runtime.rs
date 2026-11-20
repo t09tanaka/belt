@@ -228,8 +228,13 @@ async fn connected_without(
         cluster.clone(),
         c.store().coordinator_id().clone(),
         c.epoch(),
+        super::proto_common::membership("parent"),
     );
-    let mut server = ServerConfig::new(cluster, super::proto_common::identity(name));
+    let mut server = ServerConfig::new(
+        cluster,
+        super::proto_common::identity(name),
+        belt::group::Keys::only(super::proto_common::group_key()),
+    );
     server
         .local
         .features
@@ -411,8 +416,13 @@ async fn runtime_attach_carries_whether_the_worker_answers_env_sync() {
         cluster.clone(),
         c.store().coordinator_id().clone(),
         c.epoch(),
+        super::proto_common::membership("parent"),
     );
-    let mut server = ServerConfig::new(cluster, super::proto_common::identity("old"));
+    let mut server = ServerConfig::new(
+        cluster,
+        super::proto_common::identity("old"),
+        belt::group::Keys::only(super::proto_common::group_key()),
+    );
     server.local.features.retain(|f| f != ENV_SYNC_FEATURE);
     let (connection, accepted) = tokio::join!(connect(near, client), accept(far, server));
     let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));

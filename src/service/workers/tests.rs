@@ -1217,17 +1217,25 @@ async fn hello_names_who_answered_and_fails_when_nothing_does() {
         agent_epoch: crate::ids::AgentEpoch(1),
         profile: "p".into(),
         profile_fingerprint: crate::ids::Digest::of_bytes(b"p"),
-        coordinator_epoch: CoordinatorEpoch(0),
+        coordinator_epoch: crate::ids::CoordinatorEpoch(0),
     };
     let served = cluster.clone();
     let server = tokio::spawn(async move {
-        let _accepted =
-            crate::protocol::accept(peer, crate::protocol::ServerConfig::new(served, identity))
-                .await
-                .unwrap();
+        let _accepted = crate::protocol::accept(
+            peer,
+            crate::protocol::ServerConfig::new(
+                served,
+                identity,
+                crate::group::Keys::only(crate::group::test_key()),
+            ),
+        )
+        .await
+        .unwrap();
         std::future::pending::<()>().await;
     });
-    let hello = hello_on(parent, &cluster, None).await.unwrap();
+    let hello = hello_on(parent, &cluster, crate::group::test_key(), None)
+        .await
+        .unwrap();
     assert_eq!(
         (hello.cluster, hello.worker.as_str()),
         (cluster.clone(), "mini-a")
@@ -1238,12 +1246,19 @@ async fn hello_names_who_answered_and_fails_when_nothing_does() {
     server.abort();
     // A child that exits at once (ssh could not run the binary) is an error.
     let argv: Vec<String> = ["/bin/sh", "-c", "exit 127"].map(String::from).into();
-    assert!(hello_through(&argv, &cluster, None).await.is_err());
     assert!(
-        hello_through(&["/nonexistent/ssh".to_string()], &cluster, None)
+        hello_through(&argv, &cluster, crate::group::test_key(), None)
             .await
             .is_err()
     );
+    assert!(hello_through(
+        &["/nonexistent/ssh".to_string()],
+        &cluster,
+        crate::group::test_key(),
+        None
+    )
+    .await
+    .is_err());
 }
 
 /// A worker of another version: it speaks the protocol and offers `features`.
@@ -1259,9 +1274,13 @@ fn worker_offering(
         agent_epoch: crate::ids::AgentEpoch(1),
         profile: "p".into(),
         profile_fingerprint: crate::ids::Digest::of_bytes(b"p"),
-        coordinator_epoch: CoordinatorEpoch(0),
+        coordinator_epoch: crate::ids::CoordinatorEpoch(0),
     };
-    let mut config = crate::protocol::ServerConfig::new(cluster.clone(), identity);
+    let mut config = crate::protocol::ServerConfig::new(
+        cluster.clone(),
+        identity,
+        crate::group::Keys::only(crate::group::test_key()),
+    );
     config.local.features = features.iter().map(|f| f.to_string()).collect();
     let server = tokio::spawn(async move {
         if let Ok(_accepted) = crate::protocol::accept(peer, config).await {
@@ -1278,7 +1297,9 @@ async fn a_probe_requires_exactly_what_the_caller_lists() {
     let older = ["log_resume", "blob_resume"];
     let lacking = crate::forecast::COMMAND_FEATURE.to_string();
     let (io, server) = worker_offering(&cluster, &older);
-    let hello = hello_on(io, &cluster, None).await.unwrap();
+    let hello = hello_on(io, &cluster, crate::group::test_key(), None)
+        .await
+        .unwrap();
     assert_eq!(hello.worker.as_str(), "mini-a");
     // It says what it agreed to: nothing it lacks.
     assert!(hello.features.contains(&"log_resume".to_string()));
@@ -1286,15 +1307,21 @@ async fn a_probe_requires_exactly_what_the_caller_lists() {
     server.abort();
     // Asked for nothing, or for what it has, it passes.
     let (io, server) = worker_offering(&cluster, &older);
-    assert!(hello_on(io, &cluster, Some(&[])).await.is_ok());
+    assert!(hello_on(io, &cluster, crate::group::test_key(), Some(&[]))
+        .await
+        .is_ok());
     server.abort();
     let (io, server) = worker_offering(&cluster, &older);
     let has = ["log_resume".to_string()];
-    assert!(hello_on(io, &cluster, Some(&has)).await.is_ok());
+    assert!(hello_on(io, &cluster, crate::group::test_key(), Some(&has))
+        .await
+        .is_ok());
     server.abort();
     // Asked for what it lacks, it is refused.
     let (io, server) = worker_offering(&cluster, &older);
-    let error = hello_on(io, &cluster, Some(&[lacking])).await.unwrap_err();
+    let error = hello_on(io, &cluster, crate::group::test_key(), Some(&[lacking]))
+        .await
+        .unwrap_err();
     assert!(error.contains("required features missing"), "{error}");
     server.abort();
 }
@@ -1303,7 +1330,14 @@ async fn a_probe_requires_exactly_what_the_caller_lists() {
 fn what_this_build_offers_and_requires_is_one_list() {
     let offered = crate::protocol::session::offered_features();
     let required = crate::protocol::session::required_features();
-    assert_eq!(required, [crate::outputs::FEATURE]);
+    assert_eq!(
+        required,
+        [
+            crate::outputs::FEATURE,
+            crate::group::MEMBERSHIP_FEATURE,
+            crate::group::IDENTITY_RETIRED_FEATURE
+        ]
+    );
     assert!(required.iter().all(|f| offered.contains(f)));
     for feature in crate::protocol::hello::SUPPORTED_FEATURES {
         assert!(offered.iter().any(|f| f == feature));

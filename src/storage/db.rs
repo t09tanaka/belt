@@ -357,6 +357,7 @@ fn apply_step(conn: &mut Connection, kind: &str, to: u32, sql: &str) -> Result<(
         tx.execute("INSERT INTO schema_meta VALUES ('kind', ?1)", [kind])?;
         tx.execute("INSERT INTO schema_meta VALUES ('schema_version', '0')", [])?;
     }
+    schema::precheck(kind, to, &tx)?;
     tx.execute_batch(sql)?;
     tx.execute(
         "UPDATE schema_meta SET value = ?1 WHERE key = 'schema_version'",

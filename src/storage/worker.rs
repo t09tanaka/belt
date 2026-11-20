@@ -2,6 +2,14 @@
 //! payload hash), tombstones, launch intents and process identity, leases,
 //! log spool positions, results and `ack_collected`.
 //!
+//! An attempt belongs to the member that submitted it (spec 24.4): every
+//! attempt-keyed row is keyed by `(coordinator_id, attempt_id)`, and a
+//! [`WorkerStore`] handle is scoped to one member ([`WorkerStore::for_member`]).
+//! What it reads and writes by attempt id is that member's only; another
+//! member's attempt with the same id is a different row and is not found.
+//! The operations that are about the whole worker (the live attempts of
+//! every member, GC, the journal) say so.
+//!
 //! The agent and the attempt supervisors are different processes and each
 //! opens this file itself: WAL plus the busy timeout serialize their writes,
 //! and every state change is a conditional update.
@@ -16,8 +24,8 @@ use super::{
     StorageError, DEFAULT_GC_BATCH,
 };
 use crate::ids::{
-    AgentEpoch, AttemptId, CoordinatorEpoch, Generation, IdError, NodeId, PayloadHash, RunId,
-    TaskId, WorkerBootId, WorkerId,
+    AgentEpoch, AttemptId, CoordinatorEpoch, CoordinatorId, Generation, IdError, NodeId,
+    PayloadHash, RunId, TaskId, WorkerBootId, WorkerId,
 };
 use crate::state::{AttemptState, Receipt, Receipts, Termination};
 use crate::wire::{canonical_json, LeaseKey};
@@ -31,6 +39,30 @@ const ATTEMPT: &str = "worker_attempt";
 /// it stops protecting the attempt's files from GC (spec chapter 13: seven
 /// days after terminal).
 pub const DEFAULT_ACK_WAIT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Tombstones of attempts that never arrived, per member (spec 24.4). A
+/// cancel or retire that would add one more is refused; the ones of an older
+/// epoch go when the member's epoch moves on.
+pub const MAX_UNDELIVERED_TOMBSTONES: u64 = 10_000;
+
+/// One generation of the group key: its number and the fingerprint of the
+/// key (never the key).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyGeneration {
+    pub generation: u64,
+    pub fingerprint: String,
+}
+
+/// What recording a member's name and coordinator id found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberPin {
+    /// The pair is recorded (now, or it already was).
+    Pinned,
+    /// The name is recorded with another coordinator id.
+    NameTaken { coordinator_id: String },
+    /// The coordinator id is recorded under another name.
+    IdTaken { name: String },
+}
 
 fn id<T>(what: &str, r: std::result::Result<T, IdError>) -> Result<T> {
     r.map_err(|e| StorageError::Corrupt(format!("{what}: {e}")))
@@ -50,6 +82,8 @@ pub struct NewAcceptance {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AcceptedAttempt {
+    /// The member that submitted it.
+    pub coordinator_id: CoordinatorId,
     pub attempt_id: AttemptId,
     pub run_id: RunId,
     pub task_id: TaskId,
@@ -126,7 +160,7 @@ impl LogPosition {
 
 const COLS: &str = "attempt_id, run_id, task_id, generation, payload_hash, coordinator_epoch,
     spec_json, state, termination_json, receipts_json, cancel_requested_at_ms, retired,
-    accepted_at_ms, terminal_at_ms, acked_at_ms";
+    accepted_at_ms, terminal_at_ms, acked_at_ms, coordinator_id";
 
 fn from_row(r: &Row<'_>) -> Result<AcceptedAttempt> {
     let state = parse_state(&r.get::<_, String>(7)?)?;
@@ -138,6 +172,10 @@ fn from_row(r: &Row<'_>) -> Result<AcceptedAttempt> {
     crate::state::check_termination(state, termination.as_ref())
         .map_err(|e| StorageError::Corrupt(e.to_string()))?;
     Ok(AcceptedAttempt {
+        coordinator_id: id(
+            "coordinator_id",
+            CoordinatorId::parse(&r.get::<_, String>(15)?),
+        )?,
         attempt_id: id("attempt_id", AttemptId::parse(&r.get::<_, String>(0)?))?,
         run_id: id("run_id", RunId::parse(&r.get::<_, String>(1)?))?,
         task_id: id("task_id", TaskId::parse(&r.get::<_, String>(2)?))?,
@@ -156,18 +194,18 @@ fn from_row(r: &Row<'_>) -> Result<AcceptedAttempt> {
     })
 }
 
-fn load(conn: &Connection, attempt_id: &str) -> Result<Option<AcceptedAttempt>> {
+fn load(conn: &Connection, owner: &str, attempt_id: &str) -> Result<Option<AcceptedAttempt>> {
     conn.query_row(
-        &format!("SELECT {COLS} FROM worker_attempt WHERE attempt_id = ?1"),
-        [attempt_id],
+        &format!("SELECT {COLS} FROM worker_attempt WHERE coordinator_id = ?1 AND attempt_id = ?2"),
+        [owner, attempt_id],
         |r| Ok(from_row(r)),
     )
     .optional()?
     .transpose()
 }
 
-fn require(conn: &Connection, attempt_id: &str) -> Result<AcceptedAttempt> {
-    load(conn, attempt_id)?.ok_or_else(|| StorageError::NotFound {
+fn require(conn: &Connection, owner: &str, attempt_id: &str) -> Result<AcceptedAttempt> {
+    load(conn, owner, attempt_id)?.ok_or_else(|| StorageError::NotFound {
         what: format!("attempt {attempt_id}"),
     })
 }
@@ -179,15 +217,23 @@ fn require(conn: &Connection, attempt_id: &str) -> Result<AcceptedAttempt> {
 /// renewable, ...): the worker has seen the newer coordinator and must refuse
 /// the older one from then on. `body`'s own writes are rolled back on failure
 /// (a savepoint), so a failed request leaves nothing but the epoch.
-fn under_epoch<T, F>(db: &Db, epoch: CoordinatorEpoch, body: F) -> Result<T>
+fn under_epoch<T, F>(
+    db: &Db,
+    scope: &Option<String>,
+    attempt_id: &AttemptId,
+    epoch: CoordinatorEpoch,
+    body: F,
+) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
+    F: FnOnce(&Transaction<'_>, &str) -> Result<T> + Send + 'static,
 {
+    let (scope, attempt_id) = (scope.clone(), attempt_id.to_string());
     db.write_then(move |tx| {
-        observe_epoch(tx, epoch)?;
+        let owner = owner_in(tx, &scope, Some(&attempt_id))?;
+        observe_epoch(tx, &owner, epoch)?;
         tx.execute_batch("SAVEPOINT body")?;
-        match body(tx) {
+        match body(tx, &owner) {
             Ok(v) => {
                 tx.execute_batch("RELEASE body")?;
                 Ok(Ok(v))
@@ -200,13 +246,25 @@ where
     })
 }
 
-/// Reject a request from an older coordinator epoch; remember the newest.
-fn observe_epoch(conn: &Connection, epoch: CoordinatorEpoch) -> Result<()> {
-    let current: i64 =
-        conn.query_row("SELECT max_coordinator_epoch FROM worker_state", [], |r| {
-            r.get(0)
-        })?;
-    let current = CoordinatorEpoch(to_u64(current)?);
+/// The highest epoch `owner` has shown; 0 for a member never seen.
+fn member_epoch(conn: &Connection, owner: &str) -> Result<CoordinatorEpoch> {
+    let e: Option<i64> = conn
+        .query_row(
+            "SELECT max_epoch FROM member_epoch WHERE coordinator_id = ?1",
+            [owner],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(CoordinatorEpoch(to_u64(e.unwrap_or(0))?))
+}
+
+/// Reject a request from an older epoch of the same member; remember the
+/// newest. The epoch is the member's own: another member's never makes this
+/// one stale. When it moves on, the tombstones of this member's attempts
+/// that never arrived under an older epoch go: a late submit of one is
+/// refused as stale from here on.
+fn observe_epoch(conn: &Connection, owner: &str, epoch: CoordinatorEpoch) -> Result<()> {
+    let current = member_epoch(conn, owner)?;
     if epoch < current {
         return Err(StorageError::StaleEpoch {
             got: epoch,
@@ -215,9 +273,31 @@ fn observe_epoch(conn: &Connection, epoch: CoordinatorEpoch) -> Result<()> {
     }
     if epoch > current {
         conn.execute(
-            "UPDATE worker_state SET max_coordinator_epoch = ?1",
-            [to_i64(epoch.0)?],
+            "INSERT INTO member_epoch (coordinator_id, max_epoch) VALUES (?1, ?2)
+             ON CONFLICT (coordinator_id) DO UPDATE SET max_epoch = ?2",
+            params![owner, to_i64(epoch.0)?],
         )?;
+        conn.execute(
+            "DELETE FROM tombstone
+             WHERE coordinator_id = ?1 AND delivered = 0 AND coordinator_epoch < ?2",
+            params![owner, to_i64(epoch.0)?],
+        )?;
+    }
+    Ok(())
+}
+
+/// Refuse one more tombstone of an attempt that never arrived once the
+/// member holds [`MAX_UNDELIVERED_TOMBSTONES`] of them.
+fn undelivered_room(conn: &Connection, owner: &str) -> Result<()> {
+    let n: i64 = conn.query_row(
+        "SELECT count(*) FROM tombstone WHERE coordinator_id = ?1 AND delivered = 0",
+        [owner],
+        |r| r.get(0),
+    )?;
+    if to_u64(n)? >= MAX_UNDELIVERED_TOMBSTONES {
+        return Err(StorageError::Overloaded(format!(
+            "this worker holds {n} tombstones of attempts of this member that never arrived"
+        )));
     }
     Ok(())
 }
@@ -241,6 +321,37 @@ fn identity_of(
 pub struct WorkerStore {
     pub(crate) db: Db,
     worker_id: WorkerId,
+    /// The member whose attempts this handle addresses; `None` for the
+    /// worker's own handle, which addresses an attempt by its id alone.
+    scope: Option<String>,
+}
+
+/// The member of a row written through the worker's own handle for an
+/// attempt no member submitted. No connection can be this member: the group
+/// proof refuses it.
+fn unowned() -> String {
+    CoordinatorId::nil().to_string()
+}
+
+/// The member an operation on `attempt_id` addresses: the handle's member,
+/// or for the worker's own handle the member that submitted the attempt. An
+/// accepted attempt id is held by one member at a time on a worker
+/// ([`WorkerStore::submit`]), so that is one row at most.
+fn owner_in(conn: &Connection, scope: &Option<String>, attempt_id: Option<&str>) -> Result<String> {
+    if let Some(member) = scope {
+        return Ok(member.clone());
+    }
+    let Some(attempt_id) = attempt_id else {
+        return Ok(unowned());
+    };
+    let found: Option<String> = conn
+        .query_row(
+            "SELECT coordinator_id FROM worker_attempt WHERE attempt_id = ?1",
+            [attempt_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(found.unwrap_or_else(unowned))
 }
 
 impl WorkerStore {
@@ -275,6 +386,7 @@ impl WorkerStore {
         Ok(Self {
             db,
             worker_id: worker_id.clone(),
+            scope: None,
         })
     }
 
@@ -290,6 +402,7 @@ impl WorkerStore {
         Ok(Self {
             db,
             worker_id: id("worker_id", WorkerId::parse(&w))?,
+            scope: None,
         })
     }
 
@@ -297,14 +410,262 @@ impl WorkerStore {
         &self.worker_id
     }
 
-    /// The highest coordinator epoch a request carried so far.
+    /// The same database, scoped to the attempts `member` submitted: the
+    /// handle a connection of that member is served with. What
+    /// [`Self::open`] returns is the worker's own handle, which finds an
+    /// attempt of any member by its id (the agent's housekeeping and the
+    /// attempt's supervisor use it).
+    pub fn for_member(&self, member: &CoordinatorId) -> WorkerStore {
+        WorkerStore {
+            db: self.db.clone(),
+            worker_id: self.worker_id.clone(),
+            scope: Some(member.to_string()),
+        }
+    }
+
+    fn member_scope(&self) -> String {
+        self.scope.clone().unwrap_or_else(unowned)
+    }
+
+    /// The scope of [`Self::for_member`] for an attempt read from the
+    /// database.
+    pub fn for_attempt(&self, attempt: &AcceptedAttempt) -> WorkerStore {
+        self.for_member(&attempt.coordinator_id)
+    }
+
+    /// The member this handle is scoped to, if it is scoped.
+    pub fn member(&self) -> Option<CoordinatorId> {
+        self.scope
+            .as_deref()
+            .map(|m| CoordinatorId::parse(m).expect("a scope is a coordinator id"))
+    }
+
+    /// The highest epoch a request of this member carried so far. It is this
+    /// member's own: another member's epoch does not move it.
     pub fn max_coordinator_epoch(&self) -> Result<CoordinatorEpoch> {
+        let o = self.member_scope();
+        self.db.call(move |c| member_epoch(c, &o))
+    }
+
+    // ------------------------------------------------------------- group
+
+    /// The key generations recorded: the current one and, during a rotation,
+    /// the next.
+    pub fn group_keys(&self) -> Result<(Option<KeyGeneration>, Option<KeyGeneration>)> {
         self.db.call(|c| {
-            let e: i64 =
-                c.query_row("SELECT max_coordinator_epoch FROM worker_state", [], |r| {
-                    r.get(0)
-                })?;
-            Ok(CoordinatorEpoch(to_u64(e)?))
+            let read = |slot: &str| -> Result<Option<KeyGeneration>> {
+                c.query_row(
+                    "SELECT generation, fingerprint FROM group_key WHERE slot = ?1",
+                    [slot],
+                    |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+                )
+                .optional()?
+                .map(|(g, f)| {
+                    Ok(KeyGeneration {
+                        generation: to_u64(g)?,
+                        fingerprint: f,
+                    })
+                })
+                .transpose()
+            };
+            Ok((read("current")?, read("next")?))
+        })
+    }
+
+    /// Record the key this worker holds as its current one. With nothing
+    /// recorded it becomes generation 1 (the single key of before the
+    /// group); the recorded current generation with the same fingerprint is
+    /// left as it is. A different fingerprint is the key file having been
+    /// replaced outside a rotation (a key sent again): it is recorded as the
+    /// following generation, and a pending next key is dropped.
+    pub fn observe_group_key(&self, fingerprint: &str) -> Result<KeyGeneration> {
+        let f = fingerprint.to_string();
+        self.db.write(move |tx| {
+            let current: Option<(i64, String)> = tx
+                .query_row(
+                    "SELECT generation, fingerprint FROM group_key WHERE slot = 'current'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let generation = match current {
+                Some((g, have)) if have == f => {
+                    return Ok(KeyGeneration {
+                        generation: to_u64(g)?,
+                        fingerprint: f,
+                    })
+                }
+                Some((g, _)) => {
+                    let next: Option<(i64, String)> = tx
+                        .query_row(
+                            "SELECT generation, fingerprint FROM group_key WHERE slot = 'next'",
+                            [],
+                            |r| Ok((r.get(0)?, r.get(1)?)),
+                        )
+                        .optional()?;
+                    tx.execute("DELETE FROM group_key WHERE slot = 'next'", [])?;
+                    match next {
+                        Some((n, nf)) if nf == f => n,
+                        _ => g + 1,
+                    }
+                }
+                None => 1,
+            };
+            tx.execute(
+                "INSERT INTO group_key (slot, generation, fingerprint) VALUES ('current', ?1, ?2)
+                 ON CONFLICT (slot) DO UPDATE SET generation = ?1, fingerprint = ?2",
+                params![generation, f],
+            )?;
+            Ok(KeyGeneration {
+                generation: to_u64(generation)?,
+                fingerprint: f,
+            })
+        })
+    }
+
+    /// Record the next key of a rotation. The same fingerprint again changes
+    /// nothing; another one while a next key is recorded is refused (the
+    /// earlier rotation is continued, not overwritten).
+    pub fn set_next_group_key(&self, key: &KeyGeneration) -> Result<()> {
+        let k = key.clone();
+        self.db.write(move |tx| {
+            let have: Option<String> = tx
+                .query_row(
+                    "SELECT fingerprint FROM group_key WHERE slot = 'next'",
+                    [],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            match have {
+                Some(f) if f == k.fingerprint => Ok(()),
+                Some(f) => Err(StorageError::Immutable(format!(
+                    "a next group key is already recorded ({f})"
+                ))),
+                None => {
+                    tx.execute(
+                        "INSERT INTO group_key (slot, generation, fingerprint) VALUES ('next', ?1, ?2)",
+                        params![to_i64(k.generation)?, k.fingerprint],
+                    )?;
+                    Ok(())
+                }
+            }
+        })
+    }
+
+    /// The members whose name and coordinator id are recorded.
+    pub fn members(&self) -> Result<Vec<(String, String)>> {
+        self.db.call(|c| {
+            let mut s = c.prepare("SELECT name, coordinator_id FROM group_member ORDER BY name")?;
+            let rows = s.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok(rows.collect::<std::result::Result<_, _>>()?)
+        })
+    }
+
+    /// Record that the member `name` is this handle's member, unless either
+    /// is already recorded with another partner. Nothing is written then.
+    pub fn pin_member(&self, name: &str, at_ms: u64) -> Result<MemberPin> {
+        let (n, o) = (name.to_string(), self.member_scope());
+        self.db.write(move |tx| {
+            let by_name: Option<String> = tx
+                .query_row(
+                    "SELECT coordinator_id FROM group_member WHERE name = ?1",
+                    [&n],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(coordinator_id) = by_name {
+                return Ok(if coordinator_id == o {
+                    MemberPin::Pinned
+                } else {
+                    MemberPin::NameTaken { coordinator_id }
+                });
+            }
+            let by_id: Option<String> = tx
+                .query_row(
+                    "SELECT name FROM group_member WHERE coordinator_id = ?1",
+                    [&o],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if let Some(name) = by_id {
+                return Ok(MemberPin::IdTaken { name });
+            }
+            tx.execute(
+                "INSERT INTO group_member (name, coordinator_id, pinned_at_ms) VALUES (?1, ?2, ?3)",
+                params![n, o, to_i64(at_ms)?],
+            )?;
+            Ok(MemberPin::Pinned)
+        })
+    }
+
+    /// Replace what is recorded for `name` and for this handle's member with
+    /// this pair. Only an explicit `workers add` or `group send-key` towards
+    /// that member does this (spec 24.2).
+    pub fn replace_member_pin(&self, name: &str, at_ms: u64) -> Result<()> {
+        let (n, o) = (name.to_string(), self.member_scope());
+        self.db.write(move |tx| {
+            tx.execute(
+                "DELETE FROM group_member WHERE name = ?1 OR coordinator_id = ?2",
+                params![n, o],
+            )?;
+            tx.execute(
+                "INSERT INTO group_member (name, coordinator_id, pinned_at_ms) VALUES (?1, ?2, ?3)",
+                params![n, o, to_i64(at_ms)?],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// This handle's member told the worker that it retired the identity
+    /// `boot`. Returns whether this call recorded it (`false` for a repeat).
+    pub fn record_identity_retired(&self, boot: &WorkerBootId, at_ms: u64) -> Result<bool> {
+        let (o, b) = (self.member_scope(), boot.to_string());
+        self.db.write(move |tx| {
+            Ok(tx.execute(
+                "INSERT OR IGNORE INTO retired_identity (coordinator_id, worker_boot_id, recorded_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![o, b, to_i64(at_ms)?],
+            )? == 1)
+        })
+    }
+
+    /// Whether this handle's member retired the identity `boot`.
+    pub fn identity_retired(&self, boot: &WorkerBootId) -> Result<bool> {
+        let (o, b) = (self.member_scope(), boot.to_string());
+        self.db.call(move |c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM retired_identity WHERE coordinator_id = ?1 AND worker_boot_id = ?2",
+                params![o, b],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
+    }
+
+    /// This member's attempts that are not terminal, oldest first.
+    pub fn list_nonterminal_of_member(&self) -> Result<Vec<AcceptedAttempt>> {
+        let o = self.member_scope();
+        self.db.call(move |c| {
+            let mut s = c.prepare(&format!(
+                "SELECT {COLS} FROM worker_attempt WHERE coordinator_id = ?1 AND state <> 'terminal'
+                 ORDER BY accepted_at_ms, attempt_id"
+            ))?;
+            let rows = s.query_map([&o], |r| Ok(from_row(r)))?;
+            rows.map(|r| r?).collect()
+        })
+    }
+
+    /// How many tombstones this member has of attempts that never arrived.
+    pub fn count_undelivered_tombstones(&self) -> Result<u64> {
+        let o = self.member_scope();
+        self.db.call(move |c| {
+            let n: i64 = c.query_row(
+                "SELECT count(*) FROM tombstone WHERE coordinator_id = ?1 AND delivered = 0",
+                [&o],
+                |r| r.get(0),
+            )?;
+            to_u64(n)
         })
     }
 
@@ -336,90 +697,120 @@ impl WorkerStore {
     /// included: it counts until it is confirmed stopped (terminal). Nothing
     /// here starts a command.
     pub fn submit(&self, new: NewAcceptance, at_ms: u64) -> Result<SubmitOutcome> {
-        under_epoch(&self.db, new.coordinator_epoch, move |tx| {
-            let aid = new.attempt_id.to_string();
-            let existing = load(tx, &aid)?;
-            let tombstoned = tx
-                .query_row(
-                    "SELECT 1 FROM tombstone WHERE attempt_id = ?1",
-                    [&aid],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            let verdict = decide_submit(
-                existing.as_ref().map(|e| ExistingAttempt {
-                    key: SubmitKey {
-                        run_id: &e.run_id,
-                        task_id: &e.task_id,
-                        generation: e.generation,
-                        payload_hash: &e.payload_hash,
+        let attempt = new.attempt_id.clone();
+        under_epoch(
+            &self.db,
+            &self.scope,
+            &attempt,
+            new.coordinator_epoch,
+            move |tx, o| {
+                let aid = new.attempt_id.to_string();
+                let existing = load(tx, o, &aid)?;
+                let tombstoned = tx
+                    .query_row(
+                        "SELECT 1 FROM tombstone WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                        [o, aid.as_str()],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                let verdict = decide_submit(
+                    existing.as_ref().map(|e| ExistingAttempt {
+                        key: SubmitKey {
+                            run_id: &e.run_id,
+                            task_id: &e.task_id,
+                            generation: e.generation,
+                            payload_hash: &e.payload_hash,
+                        },
+                        retired: e.retired,
+                    }),
+                    tombstoned,
+                    SubmitKey {
+                        run_id: &new.run_id,
+                        task_id: &new.task_id,
+                        generation: new.generation,
+                        payload_hash: &new.payload_hash,
                     },
-                    retired: e.retired,
-                }),
-                tombstoned,
-                SubmitKey {
-                    run_id: &new.run_id,
-                    task_id: &new.task_id,
-                    generation: new.generation,
-                    payload_hash: &new.payload_hash,
-                },
-            );
-            match (verdict, existing) {
-                (SubmitDecision::Existing, Some(e)) => Ok(SubmitOutcome::Existing(e)),
-                (SubmitDecision::Conflict, _) => Err(StorageError::PayloadConflict(new.attempt_id)),
-                (SubmitDecision::Retired, _) => Err(StorageError::Retired(new.attempt_id)),
-                (SubmitDecision::Insert, _) | (SubmitDecision::Existing, None) => {
-                    let task = new.task_id.to_string();
-                    let live: Option<String> = tx
+                );
+                match (verdict, existing) {
+                    (SubmitDecision::Existing, Some(e)) => Ok(SubmitOutcome::Existing(e)),
+                    (SubmitDecision::Conflict, _) => {
+                        Err(StorageError::PayloadConflict(new.attempt_id))
+                    }
+                    (SubmitDecision::Retired, _) => Err(StorageError::Retired(new.attempt_id)),
+                    (SubmitDecision::Insert, _) | (SubmitDecision::Existing, None) => {
+                        // The attempt's files, its supervisor and its commands
+                        // are named by the attempt id alone, so an id another
+                        // member's attempt holds here is not accepted a second
+                        // time. Nothing of that attempt is shown: the answer is
+                        // the same whatever its state.
+                        let held: Option<i64> = tx
                         .query_row(
-                            "SELECT attempt_id FROM worker_attempt
-                             WHERE task_id = ?1 AND state <> 'terminal'",
-                            [&task],
+                            "SELECT 1 FROM worker_attempt WHERE attempt_id = ?1 AND coordinator_id <> ?2",
+                            [aid.as_str(), o],
                             |r| r.get(0),
                         )
                         .optional()?;
-                    if let Some(live) = live {
-                        return Err(StorageError::LiveAttemptExists(live));
-                    }
-                    let mut receipts = Receipts::default();
-                    receipts.mark(Receipt::WorkerAccepted, at_ms);
-                    tx.execute(
-                        "INSERT INTO worker_attempt (attempt_id, run_id, task_id, generation,
+                        if held.is_some() {
+                            return Err(StorageError::Invalid(format!(
+                                "attempt id {aid} cannot be used on this worker"
+                            )));
+                        }
+                        let task = new.task_id.to_string();
+                        let live: Option<String> = tx
+                            .query_row(
+                                "SELECT attempt_id FROM worker_attempt
+                             WHERE coordinator_id = ?1 AND task_id = ?2 AND state <> 'terminal'",
+                                [o, task.as_str()],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                        if let Some(live) = live {
+                            return Err(StorageError::LiveAttemptExists(live));
+                        }
+                        let mut receipts = Receipts::default();
+                        receipts.mark(Receipt::WorkerAccepted, at_ms);
+                        tx.execute(
+                            "INSERT INTO worker_attempt (attempt_id, run_id, task_id, generation,
                             payload_hash, coordinator_epoch, spec_json, state, receipts_json,
-                            accepted_at_ms)
-                         VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?9)",
-                        params![
-                            aid,
-                            new.run_id.as_str(),
-                            task,
-                            to_i64(new.generation.0)?,
-                            new.payload_hash.as_str(),
-                            to_i64(new.coordinator_epoch.0)?,
-                            new.spec.to_string(),
-                            json(&receipts),
-                            to_i64(at_ms)?
-                        ],
-                    )?;
-                    common::append_event(
-                        tx,
-                        Some(new.run_id.as_str()),
-                        Some(&aid),
-                        "attempt_accepted",
-                        &Value::Null,
-                        at_ms,
-                    )?;
-                    Ok(SubmitOutcome::Accepted(require(tx, &aid)?))
+                            accepted_at_ms, coordinator_id)
+                         VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?9,?10)",
+                            params![
+                                aid,
+                                new.run_id.as_str(),
+                                task,
+                                to_i64(new.generation.0)?,
+                                new.payload_hash.as_str(),
+                                to_i64(new.coordinator_epoch.0)?,
+                                new.spec.to_string(),
+                                json(&receipts),
+                                to_i64(at_ms)?,
+                                o
+                            ],
+                        )?;
+                        common::append_event_owned(
+                            tx,
+                            Some(o),
+                            Some(new.run_id.as_str()),
+                            Some(&aid),
+                            "attempt_accepted",
+                            &Value::Null,
+                            at_ms,
+                        )?;
+                        Ok(SubmitOutcome::Accepted(require(tx, o, &aid)?))
+                    }
                 }
-            }
-        })
+            },
+        )
     }
 
     pub fn get(&self, attempt_id: &AttemptId) -> Result<Option<AcceptedAttempt>> {
-        let a = attempt_id.to_string();
-        self.db.call(move |c| load(c, &a))
+        let (scope, a) = (self.scope.clone(), attempt_id.to_string());
+        self.db
+            .call(move |c| load(c, &owner_in(c, &scope, Some(&a))?, &a))
     }
 
+    /// Every member's attempts that are not terminal, oldest first.
     pub fn list_nonterminal(&self) -> Result<Vec<AcceptedAttempt>> {
         self.db.call(|c| {
             let mut s = c.prepare(&format!(
@@ -431,7 +822,7 @@ impl WorkerStore {
         })
     }
 
-    /// The attempts this worker knows, newest first, at most `limit`: those
+    /// The attempts of this member, newest first, at most `limit`: those
     /// in one of `states` when given, terminal ones only when
     /// `include_terminal`. The filter runs in the database, so `limit` counts
     /// matching attempts; a caller that must not answer with a part asks for
@@ -453,18 +844,19 @@ impl WorkerStore {
                 format!("state IN ({})", names.join(","))
             }
         };
+        let o = self.member_scope();
         self.db.call(move |c| {
             let mut s = c.prepare(&format!(
                 "SELECT {COLS} FROM worker_attempt
-                 WHERE {wanted} AND (?1 OR state <> 'terminal')
+                 WHERE coordinator_id = ?3 AND {wanted} AND (?1 OR state <> 'terminal')
                  ORDER BY accepted_at_ms DESC, attempt_id DESC LIMIT ?2"
             ))?;
-            let rows = s.query_map(params![include_terminal, limit], |r| Ok(from_row(r)))?;
+            let rows = s.query_map(params![include_terminal, limit, o], |r| Ok(from_row(r)))?;
             rows.map(|r| r?).collect()
         })
     }
 
-    /// How many attempts are not terminal.
+    /// How many attempts are not terminal, over every member.
     pub fn count_nonterminal(&self) -> Result<u64> {
         self.db.call(|c| {
             let n: i64 = c.query_row(
@@ -486,11 +878,12 @@ impl WorkerStore {
 
     /// When the last renewal was applied (this worker's wall clock), if any.
     pub fn lease_renewed_at(&self, attempt_id: &AttemptId) -> Result<Option<u64>> {
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.call(move |c| {
+            let o = owner_in(c, &o, Some(&a))?;
             c.query_row(
-                "SELECT renewed_at_ms FROM lease WHERE attempt_id = ?1",
-                [&a],
+                "SELECT renewed_at_ms FROM lease WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                [&o, &a],
                 |r| r.get::<_, i64>(0),
             )
             .optional()?
@@ -510,31 +903,44 @@ impl WorkerStore {
         at_ms: u64,
     ) -> Result<CancelOutcome> {
         let a = attempt_id.to_string();
-        under_epoch(&self.db, epoch, move |tx| {
-            let Some(existing) = load(tx, &a)? else {
-                tx.execute(
-                    "INSERT OR IGNORE INTO tombstone (attempt_id, kind, coordinator_epoch, recorded_at_ms)
-                     VALUES (?1,'cancel',?2,?3)",
-                    params![a, to_i64(epoch.0)?, to_i64(at_ms)?],
-                )?;
+        under_epoch(&self.db, &self.scope, attempt_id, epoch, move |tx, o| {
+            let Some(existing) = load(tx, o, &a)? else {
+                let known = tx
+                    .query_row(
+                        "SELECT 1 FROM tombstone WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                        [o, a.as_str()],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some();
+                if !known {
+                    undelivered_room(tx, o)?;
+                    tx.execute(
+                        "INSERT INTO tombstone (coordinator_id, attempt_id, kind, coordinator_epoch, recorded_at_ms)
+                         VALUES (?1,?2,'cancel',?3,?4)",
+                        params![o, a, to_i64(epoch.0)?, to_i64(at_ms)?],
+                    )?;
+                }
                 return Ok(CancelOutcome::Tombstoned);
             };
             if existing.cancel_requested_at_ms.is_some() {
                 return Ok(CancelOutcome::AlreadyRequested(existing));
             }
             tx.execute(
-                "UPDATE worker_attempt SET cancel_requested_at_ms = ?1 WHERE attempt_id = ?2",
-                params![to_i64(at_ms)?, a],
+                "UPDATE worker_attempt SET cancel_requested_at_ms = ?1
+                 WHERE attempt_id = ?2 AND coordinator_id = ?3",
+                params![to_i64(at_ms)?, a, o],
             )?;
-            common::append_event(
+            common::append_event_owned(
                 tx,
+                Some(o),
                 Some(existing.run_id.as_str()),
                 Some(&a),
                 "cancel_requested",
                 &Value::Null,
                 at_ms,
             )?;
-            Ok(CancelOutcome::Requested(require(tx, &a)?))
+            Ok(CancelOutcome::Requested(require(tx, o, &a)?))
         })
     }
 
@@ -548,25 +954,36 @@ impl WorkerStore {
         at_ms: u64,
     ) -> Result<Option<AcceptedAttempt>> {
         let a = attempt_id.to_string();
-        under_epoch(&self.db, epoch, move |tx| {
-            tx.execute(
-                "INSERT INTO tombstone (attempt_id, kind, coordinator_epoch, recorded_at_ms)
-                 VALUES (?1,'retire',?2,?3)
-                 ON CONFLICT (attempt_id) DO UPDATE SET kind = 'retire'",
-                params![a, to_i64(epoch.0)?, to_i64(at_ms)?],
+        under_epoch(&self.db, &self.scope, attempt_id, epoch, move |tx, o| {
+            let existing = load(tx, o, &a)?;
+            let updated = tx.execute(
+                "UPDATE tombstone SET kind = 'retire' WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                [o, a.as_str()],
             )?;
-            let Some(existing) = load(tx, &a)? else {
+            if updated == 0 {
+                if existing.is_none() {
+                    undelivered_room(tx, o)?;
+                }
+                tx.execute(
+                    "INSERT INTO tombstone (coordinator_id, attempt_id, kind, coordinator_epoch,
+                        recorded_at_ms, delivered)
+                     VALUES (?1,?2,'retire',?3,?4,?5)",
+                    params![o, a, to_i64(epoch.0)?, to_i64(at_ms)?, existing.is_some()],
+                )?;
+            }
+            let Some(existing) = existing else {
                 return Ok(None);
             };
             if !existing.retired {
                 tx.execute(
                     "UPDATE worker_attempt SET retired = 1,
                         cancel_requested_at_ms = COALESCE(cancel_requested_at_ms, ?1)
-                     WHERE attempt_id = ?2",
-                    params![to_i64(at_ms)?, a],
+                     WHERE attempt_id = ?2 AND coordinator_id = ?3",
+                    params![to_i64(at_ms)?, a, o],
                 )?;
-                common::append_event(
+                common::append_event_owned(
                     tx,
+                    Some(o),
                     Some(existing.run_id.as_str()),
                     Some(&a),
                     "retired",
@@ -574,17 +991,18 @@ impl WorkerStore {
                     at_ms,
                 )?;
             }
-            Ok(Some(require(tx, &a)?))
+            Ok(Some(require(tx, o, &a)?))
         })
     }
 
     /// `Some("cancel" | "retire")` when a tombstone exists for the id.
     pub fn tombstone(&self, attempt_id: &AttemptId) -> Result<Option<String>> {
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.call(move |c| {
+            let o = owner_in(c, &o, Some(&a))?;
             Ok(c.query_row(
-                "SELECT kind FROM tombstone WHERE attempt_id = ?1",
-                [&a],
+                "SELECT kind FROM tombstone WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                [&o, &a],
                 |r| r.get(0),
             )
             .optional()?)
@@ -599,10 +1017,11 @@ impl WorkerStore {
         to: AttemptState,
         at_ms: u64,
     ) -> Result<AttemptState> {
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.write(move |tx| {
-            let run = require(tx, &a)?.run_id;
-            common::transition(tx, ATTEMPT, &a, to, at_ms, Some(run.as_str()))
+            let o = owner_in(tx, &o, Some(&a))?;
+            let run = require(tx, &o, &a)?.run_id;
+            common::transition_owned(tx, ATTEMPT, Some(&o), &a, to, at_ms, Some(run.as_str()))
         })
     }
 
@@ -613,10 +1032,19 @@ impl WorkerStore {
         termination: Termination,
         at_ms: u64,
     ) -> Result<Finalized> {
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.write(move |tx| {
-            let run = require(tx, &a)?.run_id;
-            common::finalize(tx, ATTEMPT, &a, termination, at_ms, Some(run.as_str()))
+            let o = owner_in(tx, &o, Some(&a))?;
+            let run = require(tx, &o, &a)?.run_id;
+            common::finalize_owned(
+                tx,
+                ATTEMPT,
+                Some(&o),
+                &a,
+                termination,
+                at_ms,
+                Some(run.as_str()),
+            )
         })
     }
 
@@ -632,14 +1060,16 @@ impl WorkerStore {
                 "a worker does not set {receipt:?} directly"
             )));
         }
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.write(move |tx| {
-            let run = require(tx, &a)?.run_id;
-            let fresh = common::mark_receipt(tx, ATTEMPT, &a, receipt, at_ms)?;
+            let o = owner_in(tx, &o, Some(&a))?;
+            let run = require(tx, &o, &a)?.run_id;
+            let fresh = common::mark_receipt_owned(tx, ATTEMPT, Some(&o), &a, receipt, at_ms)?;
             if fresh {
                 // In the same commit, so the journal shows it exactly once.
-                common::append_event(
+                common::append_event_owned(
                     tx,
+                    Some(&o),
                     Some(run.as_str()),
                     Some(&a),
                     "attempt_receipt",
@@ -665,21 +1095,22 @@ impl WorkerStore {
         node: &NodeId,
         at_ms: u64,
     ) -> Result<LaunchClaim> {
-        let (a, n) = (attempt_id.to_string(), node.to_string());
+        let (o, a, n) = (self.scope.clone(), attempt_id.to_string(), node.to_string());
         self.db.write(move |tx| {
-            let rec = require(tx, &a)?;
+            let o = owner_in(tx, &o, Some(&a))?;
+            let rec = require(tx, &o, &a)?;
             let launch: Option<(Option<String>, Option<i64>, Option<String>)> = tx
                 .query_row(
                     "SELECT boot_id, pid, start_identity FROM command_launch
-                     WHERE attempt_id = ?1 AND node_id = ?2",
-                    params![a, n],
+                     WHERE attempt_id = ?1 AND node_id = ?2 AND coordinator_id = ?3",
+                    params![a, n, o],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
             let lease_expired: Option<Option<i64>> = tx
                 .query_row(
-                    "SELECT expired_at_ms FROM lease WHERE attempt_id = ?1",
-                    [&a],
+                    "SELECT expired_at_ms FROM lease WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                    [&o, &a],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -710,9 +1141,10 @@ impl WorkerStore {
                 }),
                 ClaimDecision::StartAndGrant | ClaimDecision::Grant => {
                     if decision == ClaimDecision::StartAndGrant {
-                        common::transition(
+                        common::transition_owned(
                             tx,
                             ATTEMPT,
+                            Some(&o),
                             &a,
                             AttemptState::Starting,
                             at_ms,
@@ -720,8 +1152,9 @@ impl WorkerStore {
                         )?;
                     }
                     tx.execute(
-                        "INSERT INTO command_launch (attempt_id, node_id, intent_at_ms) VALUES (?1,?2,?3)",
-                        params![a, n, to_i64(at_ms)?],
+                        "INSERT INTO command_launch (attempt_id, node_id, intent_at_ms, coordinator_id)
+                         VALUES (?1,?2,?3,?4)",
+                        params![a, n, to_i64(at_ms)?, o],
                     )?;
                     Ok(LaunchClaim::Granted)
                 }
@@ -739,12 +1172,14 @@ impl WorkerStore {
         at_ms: u64,
     ) -> Result<()> {
         let (a, n, i) = (attempt_id.to_string(), node.to_string(), identity.clone());
+        let o = self.scope.clone();
         self.db.write(move |tx| {
+            let o = owner_in(tx, &o, Some(&a))?;
             let row: Option<(Option<String>, Option<i64>, Option<String>)> = tx
                 .query_row(
                     "SELECT boot_id, pid, start_identity FROM command_launch
-                     WHERE attempt_id = ?1 AND node_id = ?2",
-                    params![a, n],
+                     WHERE attempt_id = ?1 AND node_id = ?2 AND coordinator_id = ?3",
+                    params![a, n, o],
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
@@ -763,14 +1198,15 @@ impl WorkerStore {
             tx.execute(
                 "UPDATE command_launch SET boot_id = ?3, pid = ?4, start_identity = ?5,
                         identity_at_ms = ?6
-                 WHERE attempt_id = ?1 AND node_id = ?2",
+                 WHERE attempt_id = ?1 AND node_id = ?2 AND coordinator_id = ?7",
                 params![
                     a,
                     n,
                     i.boot_id.as_str(),
                     i.pid,
                     i.start_identity,
-                    to_i64(at_ms)?
+                    to_i64(at_ms)?,
+                    o
                 ],
             )?;
             Ok(())
@@ -782,13 +1218,14 @@ impl WorkerStore {
         &self,
         attempt_id: &AttemptId,
     ) -> Result<Vec<(NodeId, u64, Option<ProcessIdentity>)>> {
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.call(move |c| {
+            let o = owner_in(c, &o, Some(&a))?;
             let mut s = c.prepare(
                 "SELECT node_id, intent_at_ms, boot_id, pid, start_identity FROM command_launch
-                 WHERE attempt_id = ?1 ORDER BY intent_at_ms, node_id",
+                 WHERE coordinator_id = ?1 AND attempt_id = ?2 ORDER BY intent_at_ms, node_id",
             )?;
-            let rows = s.query_map([&a], |r| {
+            let rows = s.query_map([&o, &a], |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, i64>(1)?,
@@ -823,47 +1260,54 @@ impl WorkerStore {
         at_ms: u64,
     ) -> Result<LeaseOutcome> {
         let a = attempt_id.clone();
-        under_epoch(&self.db, key.coordinator_epoch, move |tx| {
-            let aid = a.to_string();
-            let rec = require(tx, &aid)?;
-            let row: Option<(i64, i64, Option<i64>)> = tx
-                .query_row(
-                    "SELECT coordinator_epoch, lease_seq, expired_at_ms FROM lease WHERE attempt_id = ?1",
-                    [&aid],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                )
-                .optional()?;
-            let applied = row
-                .map(|(e, s, _)| -> Result<LeaseKey> {
-                    Ok(LeaseKey {
-                        coordinator_epoch: CoordinatorEpoch(to_u64(e)?),
-                        lease_seq: to_u64(s)?,
+        under_epoch(
+            &self.db,
+            &self.scope,
+            attempt_id,
+            key.coordinator_epoch,
+            move |tx, o| {
+                let aid = a.to_string();
+                let rec = require(tx, o, &aid)?;
+                let row: Option<(i64, i64, Option<i64>)> = tx
+                    .query_row(
+                        "SELECT coordinator_epoch, lease_seq, expired_at_ms FROM lease
+                     WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                        [o, aid.as_str()],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .optional()?;
+                let applied = row
+                    .map(|(e, s, _)| -> Result<LeaseKey> {
+                        Ok(LeaseKey {
+                            coordinator_epoch: CoordinatorEpoch(to_u64(e)?),
+                            lease_seq: to_u64(s)?,
+                        })
                     })
-                })
-                .transpose()?;
-            let expired = row.is_some_and(|(_, _, x)| x.is_some());
-            match decide_lease(
-                rec.state,
-                rec.retired,
-                expired,
-                rec.cancel_requested_at_ms.is_some(),
-                applied,
-                key,
-            ) {
-                LeaseDecision::Refuse => Err(StorageError::LeaseNotRenewable(a)),
-                LeaseDecision::Stale => Ok(LeaseOutcome::Stale),
-                LeaseDecision::Extend => {
-                    tx.execute(
-                        "INSERT INTO lease (attempt_id, coordinator_epoch, lease_seq, renewed_at_ms)
-                         VALUES (?1,?2,?3,?4)
-                         ON CONFLICT (attempt_id) DO UPDATE SET coordinator_epoch = ?2,
+                    .transpose()?;
+                let expired = row.is_some_and(|(_, _, x)| x.is_some());
+                match decide_lease(
+                    rec.state,
+                    rec.retired,
+                    expired,
+                    rec.cancel_requested_at_ms.is_some(),
+                    applied,
+                    key,
+                ) {
+                    LeaseDecision::Refuse => Err(StorageError::LeaseNotRenewable(a)),
+                    LeaseDecision::Stale => Ok(LeaseOutcome::Stale),
+                    LeaseDecision::Extend => {
+                        tx.execute(
+                        "INSERT INTO lease (attempt_id, coordinator_epoch, lease_seq, renewed_at_ms, coordinator_id)
+                         VALUES (?1,?2,?3,?4,?5)
+                         ON CONFLICT (coordinator_id, attempt_id) DO UPDATE SET coordinator_epoch = ?2,
                             lease_seq = ?3, renewed_at_ms = ?4",
-                        params![aid, to_i64(key.coordinator_epoch.0)?, to_i64(key.lease_seq)?, to_i64(at_ms)?],
+                        params![aid, to_i64(key.coordinator_epoch.0)?, to_i64(key.lease_seq)?, to_i64(at_ms)?, o],
                     )?;
-                    Ok(LeaseOutcome::Extended)
+                        Ok(LeaseOutcome::Extended)
+                    }
                 }
-            }
-        })
+            },
+        )
     }
 
     /// The lease ran out (the supervisor saw it by its monotonic clock, or
@@ -872,13 +1316,14 @@ impl WorkerStore {
     /// commit; whoever comes second changes nothing. Returns whether this
     /// call was the first.
     pub fn expire_lease(&self, attempt_id: &AttemptId, at_ms: u64) -> Result<bool> {
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.write(move |tx| {
-            let run = require(tx, &a)?.run_id;
+            let o = owner_in(tx, &o, Some(&a))?;
+            let run = require(tx, &o, &a)?.run_id;
             let already: Option<Option<i64>> = tx
                 .query_row(
-                    "SELECT expired_at_ms FROM lease WHERE attempt_id = ?1",
-                    [&a],
+                    "SELECT expired_at_ms FROM lease WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                    [&o, &a],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -886,13 +1331,14 @@ impl WorkerStore {
                 return Ok(false);
             }
             tx.execute(
-                "INSERT INTO lease (attempt_id, coordinator_epoch, lease_seq, renewed_at_ms, expired_at_ms)
-                 VALUES (?1, 0, 0, ?2, ?2)
-                 ON CONFLICT (attempt_id) DO UPDATE SET expired_at_ms = ?2",
-                params![a, to_i64(at_ms)?],
+                "INSERT INTO lease (attempt_id, coordinator_epoch, lease_seq, renewed_at_ms, expired_at_ms, coordinator_id)
+                 VALUES (?1, 0, 0, ?2, ?2, ?3)
+                 ON CONFLICT (coordinator_id, attempt_id) DO UPDATE SET expired_at_ms = ?2",
+                params![a, to_i64(at_ms)?, o],
             )?;
-            common::append_event(
+            common::append_event_owned(
                 tx,
+                Some(&o),
                 Some(run.as_str()),
                 Some(&a),
                 "lease_expired",
@@ -905,12 +1351,20 @@ impl WorkerStore {
 
     /// The highest applied key and whether the lease expired.
     pub fn lease(&self, attempt_id: &AttemptId) -> Result<Option<(LeaseKey, bool)>> {
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.call(move |c| {
+            let o = owner_in(c, &o, Some(&a))?;
             c.query_row(
-                "SELECT coordinator_epoch, lease_seq, expired_at_ms FROM lease WHERE attempt_id = ?1",
-                [&a],
-                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?)),
+                "SELECT coordinator_epoch, lease_seq, expired_at_ms FROM lease
+                 WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                [&o, &a],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, Option<i64>>(2)?,
+                    ))
+                },
             )
             .optional()?
             .map(|(e, s, x)| {
@@ -936,12 +1390,14 @@ impl WorkerStore {
         pos: LogPosition,
     ) -> Result<LogPosition> {
         let (a, s) = (attempt_id.to_string(), stream.to_string());
+        let o = self.scope.clone();
         self.db.write(move |tx| {
-            require(tx, &a)?;
+            let o = owner_in(tx, &o, Some(&a))?;
+            require(tx, &o, &a)?;
             tx.execute(
-                "INSERT INTO log_spool (attempt_id, stream, written_bytes, dropped_bytes, last_seq)
-                 VALUES (?1,?2,?3,?4,?5)
-                 ON CONFLICT (attempt_id, stream) DO UPDATE SET
+                "INSERT INTO log_spool (attempt_id, stream, written_bytes, dropped_bytes, last_seq, coordinator_id)
+                 VALUES (?1,?2,?3,?4,?5,?6)
+                 ON CONFLICT (coordinator_id, attempt_id, stream) DO UPDATE SET
                     written_bytes = MAX(written_bytes, ?3),
                     dropped_bytes = MAX(dropped_bytes, ?4),
                     last_seq = MAX(last_seq, ?5)",
@@ -950,16 +1406,19 @@ impl WorkerStore {
                     s,
                     to_i64(pos.written_bytes)?,
                     to_i64(pos.dropped_bytes)?,
-                    to_i64(pos.last_seq)?
+                    to_i64(pos.last_seq)?,
+                    o
                 ],
             )?;
-            read_log(tx, &a, &s)
+            read_log(tx, &o, &a, &s)
         })
     }
 
     pub fn log_position(&self, attempt_id: &AttemptId, stream: &str) -> Result<LogPosition> {
         let (a, s) = (attempt_id.to_string(), stream.to_string());
-        self.db.call(move |c| read_log(c, &a, &s))
+        let scope = self.scope.clone();
+        self.db
+            .call(move |c| read_log(c, &owner_in(c, &scope, Some(&a))?, &a, &s))
     }
 
     /// The log bytes stored by the other attempts of `attempt_id`'s task, as
@@ -970,18 +1429,22 @@ impl WorkerStore {
     /// that reference the files are deleted (or queued for it) and their
     /// bytes are free again; the `log_spool` rows stay as a record.
     pub fn log_bytes_of_other_attempts(&self, attempt_id: &AttemptId) -> Result<u64> {
-        let a = attempt_id.to_string();
+        let (scope, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.call(move |c| {
-            require(c, &a)?;
+            let owner = owner_in(c, &scope, Some(&a))?;
+            require(c, &owner, &a)?;
             let n: i64 = c.query_row(
                 "SELECT COALESCE(SUM(l.written_bytes), 0)
-                 FROM log_spool l JOIN worker_attempt o ON o.attempt_id = l.attempt_id
-                 WHERE o.attempt_id <> ?1 AND o.task_id =
-                    (SELECT task_id FROM worker_attempt WHERE attempt_id = ?1)
+                 FROM log_spool l JOIN worker_attempt o
+                   ON o.attempt_id = l.attempt_id AND o.coordinator_id = l.coordinator_id
+                 WHERE o.coordinator_id = ?2 AND o.attempt_id <> ?1 AND o.task_id =
+                    (SELECT task_id FROM worker_attempt
+                     WHERE attempt_id = ?1 AND coordinator_id = ?2)
                    AND (o.state <> 'terminal' OR EXISTS
                     (SELECT 1 FROM blob_ref b
-                     WHERE b.attempt_id = o.attempt_id AND b.kind = 'log'))",
-                params![a],
+                     WHERE b.attempt_id = o.attempt_id AND b.coordinator_id = o.coordinator_id
+                       AND b.kind = 'log'))",
+                params![a, owner],
                 |r| r.get(0),
             )?;
             to_u64(n)
@@ -995,8 +1458,9 @@ impl WorkerStore {
     /// (`false` for the replay of an equal result).
     pub fn record_result(&self, attempt_id: &AttemptId, result: &Value) -> Result<bool> {
         let text = canonical_result(result)?;
-        let a = attempt_id.to_string();
-        self.db.write(move |tx| store_result(tx, a, text))
+        let (scope, a) = (self.scope.clone(), attempt_id.to_string());
+        self.db
+            .write(move |tx| store_result(tx, &owner_in(tx, &scope, Some(&a))?, a, text))
     }
 
     /// Fix the termination ([`Self::finalize`]) and store the result
@@ -1015,23 +1479,34 @@ impl WorkerStore {
     where
         F: FnOnce(&Termination) -> Value + Send + 'static,
     {
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.write(move |tx| {
-            let run = require(tx, &a)?.run_id;
-            let fin = common::finalize(tx, ATTEMPT, &a, termination, at_ms, Some(run.as_str()))?;
+            let o = owner_in(tx, &o, Some(&a))?;
+            let run = require(tx, &o, &a)?.run_id;
+            let fin = common::finalize_owned(
+                tx,
+                ATTEMPT,
+                Some(&o),
+                &a,
+                termination,
+                at_ms,
+                Some(run.as_str()),
+            )?;
             let value = result(&fin.termination());
-            let fresh = store_result(tx, a, canonical_result(&value)?)?;
+            let fresh = store_result(tx, &o, a, canonical_result(&value)?)?;
             Ok((fin, value, fresh))
         })
     }
 
     pub fn get_result(&self, attempt_id: &AttemptId) -> Result<Option<Value>> {
-        let a = attempt_id.to_string();
+        let (o, a) = (self.scope.clone(), attempt_id.to_string());
         self.db.call(move |c| {
+            let o = owner_in(c, &o, Some(&a))?;
             let text: Option<Option<String>> = c
                 .query_row(
-                    "SELECT result_json FROM worker_attempt WHERE attempt_id = ?1",
-                    [&a],
+                    "SELECT result_json FROM worker_attempt
+                     WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                    [&o, &a],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -1074,8 +1549,8 @@ impl WorkerStore {
         had_result: Option<bool>,
     ) -> Result<bool> {
         let a = attempt_id.to_string();
-        under_epoch(&self.db, epoch, move |tx| {
-            let rec = require(tx, &a)?;
+        under_epoch(&self.db, &self.scope, attempt_id, epoch, move |tx, o| {
+            let rec = require(tx, o, &a)?;
             if !rec.state.is_terminal() {
                 return Err(StorageError::IllegalState {
                     attempt: a,
@@ -1085,8 +1560,9 @@ impl WorkerStore {
             }
             if let Some(had) = had_result {
                 let has: bool = tx.query_row(
-                    "SELECT result_json IS NOT NULL FROM worker_attempt WHERE attempt_id = ?1",
-                    [&a],
+                    "SELECT result_json IS NOT NULL FROM worker_attempt
+                     WHERE coordinator_id = ?1 AND attempt_id = ?2",
+                    [o, a.as_str()],
                     |r| r.get(0),
                 )?;
                 if has != had {
@@ -1098,12 +1574,14 @@ impl WorkerStore {
                 }
             }
             let n = tx.execute(
-                "UPDATE worker_attempt SET acked_at_ms = ?1 WHERE attempt_id = ?2 AND acked_at_ms IS NULL",
-                params![to_i64(at_ms)?, a],
+                "UPDATE worker_attempt SET acked_at_ms = ?1
+                 WHERE attempt_id = ?2 AND coordinator_id = ?3 AND acked_at_ms IS NULL",
+                params![to_i64(at_ms)?, a, o],
             )?;
             if n == 1 {
-                common::append_event(
+                common::append_event_owned(
                     tx,
+                    Some(o),
                     Some(rec.run_id.as_str()),
                     Some(&a),
                     "ack_collected",
@@ -1130,8 +1608,18 @@ impl WorkerStore {
             attempt_id.map(ToString::to_string),
         );
         let (kind, payload) = (kind.to_string(), payload.clone());
+        let scope = self.scope.clone();
         self.db.write(move |tx| {
-            common::append_event(tx, r.as_deref(), a.as_deref(), &kind, &payload, at_ms)
+            let o = owner_in(tx, &scope, a.as_deref())?;
+            common::append_event_owned(
+                tx,
+                Some(&o),
+                r.as_deref(),
+                a.as_deref(),
+                &kind,
+                &payload,
+                at_ms,
+            )
         })
     }
 
@@ -1142,15 +1630,21 @@ impl WorkerStore {
 
     /// Every event of one attempt, oldest first, at most `limit`.
     pub fn events_of_attempt(&self, attempt_id: &AttemptId, limit: u32) -> Result<Vec<Event>> {
-        let a = attempt_id.to_string();
-        self.db
-            .call(move |c| common::events_of_attempt(c, &a, limit))
+        let (scope, a) = (self.scope.clone(), attempt_id.to_string());
+        self.db.call(move |c| {
+            let o = owner_in(c, &scope, Some(&a))?;
+            common::events_of_attempt_owned(c, Some(&o), &a, limit)
+        })
     }
 
     /// The events of one attempt with one `kind`, oldest first.
     pub fn events_of(&self, attempt_id: &AttemptId, kind: &str) -> Result<Vec<Event>> {
         let (a, k) = (attempt_id.to_string(), kind.to_string());
-        self.db.call(move |c| common::events_of(c, &a, &k))
+        let scope = self.scope.clone();
+        self.db.call(move |c| {
+            let o = owner_in(c, &scope, Some(&a))?;
+            common::events_of_owned(c, Some(&o), &a, &k)
+        })
     }
 
     /// For each `(key, payload)` of `wanted`, append an event of `kind` to the
@@ -1173,16 +1667,30 @@ impl WorkerStore {
             key_field.to_string(),
         );
         let wanted = wanted.to_vec();
+        let o = self.scope.clone();
         self.db.write(move |tx| {
-            common::append_events_unseen(tx, r.as_deref(), &a, &k, &f, &wanted, at_ms)
+            let o = owner_in(tx, &o, Some(&a))?;
+            common::append_events_unseen_owned(
+                tx,
+                Some(&o),
+                r.as_deref(),
+                &a,
+                &k,
+                &f,
+                &wanted,
+                at_ms,
+            )
         })
     }
 
     // ------------------------------------------------------- references, GC
 
     pub fn add_blob_ref(&self, r: &NewBlobRef, at_ms: u64) -> Result<()> {
-        let r = r.clone();
-        self.db.write(move |tx| common::add_blob_ref(tx, &r, at_ms))
+        let (scope, r) = (self.scope.clone(), r.clone());
+        self.db.write(move |tx| {
+            let o = owner_in(tx, &scope, Some(&r.attempt_id))?;
+            common::add_blob_ref_owned(tx, Some(&o), &r, at_ms)
+        })
     }
 
     pub fn pin_blob(&self, ref_id: &str) -> Result<u32> {
@@ -1236,7 +1744,12 @@ impl WorkerStore {
             Some(ack_wait_ms),
             batch,
             |conn, r: &BlobRef| {
-                let rec = require(conn, &r.attempt_id)?;
+                let owner: String = conn.query_row(
+                    "SELECT coordinator_id FROM blob_ref WHERE ref_id = ?1",
+                    [&r.ref_id],
+                    |row| row.get(0),
+                )?;
+                let rec = require(conn, &owner, &r.attempt_id)?;
                 Ok(GcCandidate {
                     terminal_at_ms: rec.terminal_at_ms,
                     retired_at_ms: None,
@@ -1250,12 +1763,12 @@ impl WorkerStore {
     }
 }
 
-fn read_log(conn: &Connection, attempt_id: &str, stream: &str) -> Result<LogPosition> {
+fn read_log(conn: &Connection, owner: &str, attempt_id: &str, stream: &str) -> Result<LogPosition> {
     let row: Option<(i64, i64, i64)> = conn
         .query_row(
             "SELECT written_bytes, dropped_bytes, last_seq FROM log_spool
-             WHERE attempt_id = ?1 AND stream = ?2",
-            params![attempt_id, stream],
+             WHERE attempt_id = ?1 AND stream = ?2 AND coordinator_id = ?3",
+            params![attempt_id, stream, owner],
             |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
         )
         .optional()?;
@@ -1277,8 +1790,13 @@ fn canonical_result(result: &Value) -> Result<String> {
 /// Store `text` as the result of the terminal attempt `a`, unless it has an
 /// equal one already (`false`); another one is refused, and so is a first
 /// one after the attempt was acknowledged without a result.
-fn store_result(tx: &rusqlite::Transaction<'_>, a: String, text: String) -> Result<bool> {
-    let rec = require(tx, &a)?;
+fn store_result(
+    tx: &rusqlite::Transaction<'_>,
+    owner: &str,
+    a: String,
+    text: String,
+) -> Result<bool> {
+    let rec = require(tx, owner, &a)?;
     if !rec.state.is_terminal() {
         return Err(StorageError::IllegalState {
             attempt: a,
@@ -1287,8 +1805,8 @@ fn store_result(tx: &rusqlite::Transaction<'_>, a: String, text: String) -> Resu
         });
     }
     let existing: Option<String> = tx.query_row(
-        "SELECT result_json FROM worker_attempt WHERE attempt_id = ?1",
-        [&a],
+        "SELECT result_json FROM worker_attempt WHERE coordinator_id = ?1 AND attempt_id = ?2",
+        [owner, a.as_str()],
         |r| r.get(0),
     )?;
     match existing {
@@ -1302,8 +1820,9 @@ fn store_result(tx: &rusqlite::Transaction<'_>, a: String, text: String) -> Resu
         }),
         None => {
             tx.execute(
-                "UPDATE worker_attempt SET result_json = ?1 WHERE attempt_id = ?2",
-                params![text, a],
+                "UPDATE worker_attempt SET result_json = ?1
+                 WHERE attempt_id = ?2 AND coordinator_id = ?3",
+                params![text, a, owner],
             )?;
             Ok(true)
         }

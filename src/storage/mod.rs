@@ -16,6 +16,8 @@ mod common;
 mod coordinator;
 pub use coordinator::query;
 mod db;
+#[cfg(test)]
+mod group_tests;
 mod lock;
 #[cfg(test)]
 mod paging_tests;
@@ -38,8 +40,9 @@ pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPag
 pub use db::Db;
 pub use lock::ProcessLock;
 pub use worker::{
-    AcceptedAttempt, CancelOutcome, LaunchClaim, LeaseOutcome, LogPosition, NewAcceptance,
-    ProcessIdentity, SubmitOutcome, WorkerStore, DEFAULT_ACK_WAIT_MS,
+    AcceptedAttempt, CancelOutcome, KeyGeneration, LaunchClaim, LeaseOutcome, LogPosition,
+    MemberPin, NewAcceptance, ProcessIdentity, SubmitOutcome, WorkerStore, DEFAULT_ACK_WAIT_MS,
+    MAX_UNDELIVERED_TOMBSTONES,
 };
 
 use crate::error::ErrorCode;
@@ -81,6 +84,13 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("database is not usable by this binary: {0:?}")]
     Incompatible(Incompat),
+    /// A migration step whose precondition does not hold. Nothing was
+    /// changed; the message says what to do.
+    #[error("the database cannot be migrated yet: {0}")]
+    MigrationRefused(String),
+    /// A per-member limit is reached. Nothing of the call was committed.
+    #[error("{0}")]
+    Overloaded(String),
     #[error("database holds a {found} schema, expected {expected}")]
     KindMismatch { expected: String, found: String },
     #[error("another process holds {}", .0.display())]
@@ -146,9 +156,10 @@ impl StorageError {
     /// The wire error code this maps to.
     pub fn code(&self) -> ErrorCode {
         match self {
-            StorageError::Incompatible(_) | StorageError::KindMismatch { .. } => {
-                ErrorCode::ProtocolIncompatible
-            }
+            StorageError::Incompatible(_)
+            | StorageError::KindMismatch { .. }
+            | StorageError::MigrationRefused(_) => ErrorCode::ProtocolIncompatible,
+            StorageError::Overloaded(_) => ErrorCode::Overloaded,
             StorageError::Locked(_)
             | StorageError::PayloadConflict(_)
             | StorageError::Immutable(_)

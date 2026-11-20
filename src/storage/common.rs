@@ -24,6 +24,51 @@ pub struct Event {
     pub at_ms: u64,
 }
 
+/// The key clause of a table whose attempts belong to a member (the worker
+/// database): `owner` is bound as parameter `n`. The coordinator database has
+/// no such column and passes `None`; the parameter is bound all the same.
+fn owned(owner: Option<&str>, n: usize) -> String {
+    match owner {
+        Some(_) => format!(" AND coordinator_id = ?{n}"),
+        None => format!(" AND ?{n} IS NULL"),
+    }
+}
+
+/// [`append_event`] in the worker database: the event of an attempt names
+/// the member the attempt belongs to, and is numbered among that member's
+/// events of the attempt.
+pub(crate) fn append_event_owned(
+    conn: &Connection,
+    owner: Option<&str>,
+    run_id: Option<&str>,
+    attempt_id: Option<&str>,
+    kind: &str,
+    payload: &Value,
+    at_ms: u64,
+) -> Result<u64> {
+    let Some(owner) = owner else {
+        return append_event(conn, run_id, attempt_id, kind, payload, at_ms);
+    };
+    conn.execute(
+        "INSERT INTO event (run_id, attempt_id, attempt_seq, kind, payload_json, at_ms, coordinator_id)
+         VALUES (?1, ?2,
+            CASE WHEN ?2 IS NULL THEN NULL
+                 ELSE (SELECT COALESCE(MAX(attempt_seq), 0) + 1 FROM event
+                       WHERE coordinator_id = ?6 AND attempt_id = ?2)
+            END,
+            ?3, ?4, ?5, CASE WHEN ?2 IS NULL THEN NULL ELSE ?6 END)",
+        params![
+            run_id,
+            attempt_id,
+            kind,
+            payload.to_string(),
+            to_i64(at_ms)?,
+            owner
+        ],
+    )?;
+    to_u64(conn.last_insert_rowid())
+}
+
 pub(crate) fn append_event(
     conn: &Connection,
     run_id: Option<&str>,
@@ -60,15 +105,17 @@ pub(crate) fn events_after(conn: &Connection, after_seq: u64, limit: u32) -> Res
 
 /// Every event of one attempt, oldest first (its `attempt_seq` order), at
 /// most `limit`.
-pub(crate) fn events_of_attempt(
+pub(crate) fn events_of_attempt_owned(
     conn: &Connection,
+    owner: Option<&str>,
     attempt_id: &str,
     limit: u32,
 ) -> Result<Vec<Event>> {
+    let own = owned(owner, 3);
     let mut s = conn.prepare(&format!(
-        "SELECT {EVENT_COLS} FROM event WHERE attempt_id = ?1 ORDER BY seq LIMIT ?2"
+        "SELECT {EVENT_COLS} FROM event WHERE attempt_id = ?1{own} ORDER BY seq LIMIT ?2"
     ))?;
-    let rows = s.query_map(params![attempt_id, limit], event_row)?;
+    let rows = s.query_map(params![attempt_id, limit, owner], event_row)?;
     rows.map(|r| event_of(r?)).collect()
 }
 
@@ -112,10 +159,20 @@ fn event_of(row: EventRow) -> Result<Event> {
 
 /// The events of one attempt with one `kind`, oldest first.
 pub(crate) fn events_of(conn: &Connection, attempt_id: &str, kind: &str) -> Result<Vec<Event>> {
+    events_of_owned(conn, None, attempt_id, kind)
+}
+
+pub(crate) fn events_of_owned(
+    conn: &Connection,
+    owner: Option<&str>,
+    attempt_id: &str,
+    kind: &str,
+) -> Result<Vec<Event>> {
+    let own = owned(owner, 3);
     let mut s = conn.prepare(&format!(
-        "SELECT {EVENT_COLS} FROM event WHERE attempt_id = ?1 AND kind = ?2 ORDER BY attempt_seq"
+        "SELECT {EVENT_COLS} FROM event WHERE attempt_id = ?1 AND kind = ?2{own} ORDER BY attempt_seq"
     ))?;
-    let rows = s.query_map(params![attempt_id, kind], event_row)?;
+    let rows = s.query_map(params![attempt_id, kind, owner], event_row)?;
     rows.map(|r| event_of(r?)).collect()
 }
 
@@ -132,14 +189,30 @@ pub(crate) fn append_events_unseen(
     wanted: &[(String, Value)],
     at_ms: u64,
 ) -> Result<u32> {
-    let seen: Vec<Event> = events_of(conn, attempt_id, kind)?;
+    append_events_unseen_owned(
+        conn, None, run_id, attempt_id, kind, key_field, wanted, at_ms,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn append_events_unseen_owned(
+    conn: &Connection,
+    owner: Option<&str>,
+    run_id: Option<&str>,
+    attempt_id: &str,
+    kind: &str,
+    key_field: &str,
+    wanted: &[(String, Value)],
+    at_ms: u64,
+) -> Result<u32> {
+    let seen: Vec<Event> = events_of_owned(conn, owner, attempt_id, kind)?;
     let mut n = 0;
     for (key, payload) in wanted {
         let have = seen
             .iter()
             .any(|e| e.payload[key_field].as_str() == Some(key.as_str()));
         if !have {
-            append_event(conn, run_id, Some(attempt_id), kind, payload, at_ms)?;
+            append_event_owned(conn, owner, run_id, Some(attempt_id), kind, payload, at_ms)?;
             n += 1;
         }
     }
@@ -183,13 +256,23 @@ pub(crate) struct Core {
 }
 
 pub(crate) fn read_core(conn: &Connection, table: &str, attempt_id: &str) -> Result<Core> {
+    read_core_owned(conn, table, None, attempt_id)
+}
+
+pub(crate) fn read_core_owned(
+    conn: &Connection,
+    table: &str,
+    owner: Option<&str>,
+    attempt_id: &str,
+) -> Result<Core> {
+    let own = owned(owner, 2);
     let row = conn
         .query_row(
             &format!(
                 "SELECT state, termination_json, receipts_json
-                 FROM {table} WHERE attempt_id = ?1"
+                 FROM {table} WHERE attempt_id = ?1{own}"
             ),
-            [attempt_id],
+            params![attempt_id, owner],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
@@ -227,11 +310,24 @@ pub(crate) fn transition(
     at_ms: u64,
     run_id: Option<&str>,
 ) -> Result<AttemptState> {
-    let core = read_core(conn, table, attempt_id)?;
+    transition_owned(conn, table, None, attempt_id, to, at_ms, run_id)
+}
+
+pub(crate) fn transition_owned(
+    conn: &Connection,
+    table: &str,
+    owner: Option<&str>,
+    attempt_id: &str,
+    to: AttemptState,
+    at_ms: u64,
+    run_id: Option<&str>,
+) -> Result<AttemptState> {
+    let core = read_core_owned(conn, table, owner, attempt_id)?;
     core.state.transition(to)?;
+    let own = owned(owner, 4);
     let n = conn.execute(
-        &format!("UPDATE {table} SET state = ?1 WHERE attempt_id = ?2 AND state = ?3"),
-        params![state_str(to), attempt_id, state_str(core.state)],
+        &format!("UPDATE {table} SET state = ?1 WHERE attempt_id = ?2 AND state = ?3{own}"),
+        params![state_str(to), attempt_id, state_str(core.state), owner],
     )?;
     if n != 1 {
         return Err(StorageError::IllegalState {
@@ -240,8 +336,9 @@ pub(crate) fn transition(
             why: "changed concurrently",
         });
     }
-    append_event(
+    append_event_owned(
         conn,
+        owner,
         run_id,
         Some(attempt_id),
         "attempt_state",
@@ -262,7 +359,20 @@ pub(crate) fn finalize(
     at_ms: u64,
     run_id: Option<&str>,
 ) -> Result<Finalized> {
-    let core = read_core(conn, table, attempt_id)?;
+    finalize_owned(conn, table, None, attempt_id, termination, at_ms, run_id)
+}
+
+pub(crate) fn finalize_owned(
+    conn: &Connection,
+    table: &str,
+    owner: Option<&str>,
+    attempt_id: &str,
+    termination: Termination,
+    at_ms: u64,
+    run_id: Option<&str>,
+) -> Result<Finalized> {
+    let core = read_core_owned(conn, table, owner, attempt_id)?;
+    let own = owned(owner, 5);
     if let Some(existing) = core.termination {
         return Ok(Finalized::AlreadyTerminal(existing));
     }
@@ -273,9 +383,15 @@ pub(crate) fn finalize(
         &format!(
             "UPDATE {table} SET state = 'terminal', termination_json = ?1, terminal_at_ms = ?2,
                     receipts_json = ?3
-             WHERE attempt_id = ?4 AND state = 'finalizing' AND termination_json IS NULL"
+             WHERE attempt_id = ?4 AND state = 'finalizing' AND termination_json IS NULL{own}"
         ),
-        params![json(&term), to_i64(at_ms)?, json(&receipts), attempt_id],
+        params![
+            json(&term),
+            to_i64(at_ms)?,
+            json(&receipts),
+            attempt_id,
+            owner
+        ],
     )?;
     if n != 1 {
         return Err(StorageError::IllegalState {
@@ -284,8 +400,9 @@ pub(crate) fn finalize(
             why: "changed concurrently",
         });
     }
-    append_event(
+    append_event_owned(
         conn,
+        owner,
         run_id,
         Some(attempt_id),
         "attempt_terminal",
@@ -304,17 +421,29 @@ pub(crate) fn mark_receipt(
     receipt: Receipt,
     at_ms: u64,
 ) -> Result<bool> {
+    mark_receipt_owned(conn, table, None, attempt_id, receipt, at_ms)
+}
+
+pub(crate) fn mark_receipt_owned(
+    conn: &Connection,
+    table: &str,
+    owner: Option<&str>,
+    attempt_id: &str,
+    receipt: Receipt,
+    at_ms: u64,
+) -> Result<bool> {
     if matches!(receipt, Receipt::Terminal | Receipt::Collected) {
         return Err(StorageError::Invalid(format!(
             "{receipt:?} is set by finalize or collection, not directly"
         )));
     }
-    let mut core = read_core(conn, table, attempt_id)?;
+    let mut core = read_core_owned(conn, table, owner, attempt_id)?;
     let fresh = core.receipts.mark(receipt, at_ms);
     if fresh {
+        let own = owned(owner, 3);
         conn.execute(
-            &format!("UPDATE {table} SET receipts_json = ?1 WHERE attempt_id = ?2"),
-            params![json(&core.receipts), attempt_id],
+            &format!("UPDATE {table} SET receipts_json = ?1 WHERE attempt_id = ?2{own}"),
+            params![json(&core.receipts), attempt_id, owner],
         )?;
     }
     Ok(fresh)
@@ -384,6 +513,15 @@ pub struct GcReport {
 pub const DEFAULT_GC_BATCH: u32 = 200;
 
 pub(crate) fn add_blob_ref(conn: &Connection, r: &NewBlobRef, at_ms: u64) -> Result<()> {
+    add_blob_ref_owned(conn, None, r, at_ms)
+}
+
+pub(crate) fn add_blob_ref_owned(
+    conn: &Connection,
+    owner: Option<&str>,
+    r: &NewBlobRef,
+    at_ms: u64,
+) -> Result<()> {
     let queued: i64 = conn.query_row(
         "SELECT count(*) FROM pending_delete WHERE locator = ?1",
         [&r.locator],
@@ -392,17 +530,31 @@ pub(crate) fn add_blob_ref(conn: &Connection, r: &NewBlobRef, at_ms: u64) -> Res
     if queued > 0 {
         return Err(StorageError::LocatorPendingDelete(r.locator.clone()));
     }
-    conn.execute(
-        "INSERT INTO blob_ref (ref_id, attempt_id, kind, locator, created_at_ms)
-         VALUES (?1,?2,?3,?4,?5)",
-        params![
-            r.ref_id,
-            r.attempt_id,
-            r.kind.as_str(),
-            r.locator,
-            to_i64(at_ms)?
-        ],
-    )?;
+    match owner {
+        None => conn.execute(
+            "INSERT INTO blob_ref (ref_id, attempt_id, kind, locator, created_at_ms)
+             VALUES (?1,?2,?3,?4,?5)",
+            params![
+                r.ref_id,
+                r.attempt_id,
+                r.kind.as_str(),
+                r.locator,
+                to_i64(at_ms)?
+            ],
+        )?,
+        Some(owner) => conn.execute(
+            "INSERT INTO blob_ref (ref_id, attempt_id, kind, locator, created_at_ms, coordinator_id)
+             VALUES (?1,?2,?3,?4,?5,?6)",
+            params![
+                r.ref_id,
+                r.attempt_id,
+                r.kind.as_str(),
+                r.locator,
+                to_i64(at_ms)?,
+                owner
+            ],
+        )?,
+    };
     Ok(())
 }
 

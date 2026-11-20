@@ -1158,7 +1158,7 @@ pub fn command(json: bool) -> i32 {
                 )
             };
             let report = run(
-                &mut workers::SshRemote,
+                &mut workers::SshRemote::new(&spec.cluster_key_path),
                 &mut SystemRunner::default(),
                 &env,
                 &spec,

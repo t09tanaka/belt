@@ -83,6 +83,8 @@ pub fn kind_of_operation(op: Operation) -> StreamKind {
         | Operation::BlobGet
         | Operation::SecretBundlePut => StreamKind::Blob,
         Operation::Hello
+        | Operation::GroupProof
+        | Operation::IdentityRetired
         | Operation::Inspect
         | Operation::Forecast
         | Operation::ForecastCommand

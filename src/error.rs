@@ -219,6 +219,27 @@ pub struct ApiError {
     /// May be set when `code` is `CONFLICT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_reason: Option<ConflictReason>,
+    /// Set when the group proof of a connection was refused (spec 24.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_refusal: Option<GroupRefusal>,
+}
+
+/// Why a member refused another member's group proof. The connection is
+/// closed; nothing was accepted on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum GroupRefusal {
+    /// The peer belongs to another group.
+    GroupMismatch,
+    /// The peer holds another group key. `fingerprint` is that of the key
+    /// the refusing member signs with: a member that holds it as its next
+    /// key has missed the switch and makes it now.
+    GroupKeyMismatch { fingerprint: String },
+    /// The name is recorded with another coordinator id, or the coordinator
+    /// id under another name.
+    MemberIdentityMismatch,
+    /// The peer told this worker that it retired the identity it still has.
+    IdentityRetired,
 }
 
 impl ApiError {
@@ -228,6 +249,15 @@ impl ApiError {
             message: message.into(),
             blocked_reason: None,
             conflict_reason: None,
+            group_refusal: None,
+        }
+    }
+
+    /// The refusal of a group proof.
+    pub fn group_refused(reason: GroupRefusal, message: impl Into<String>) -> Self {
+        ApiError {
+            group_refusal: Some(reason),
+            ..ApiError::new(ErrorCode::ProtocolIncompatible, message)
         }
     }
 
@@ -236,6 +266,7 @@ impl ApiError {
             code: ErrorCode::Conflict,
             message: message.into(),
             blocked_reason: None,
+            group_refusal: None,
             conflict_reason: Some(reason),
         }
     }
@@ -245,6 +276,7 @@ impl ApiError {
             code: ErrorCode::Blocked,
             message: message.into(),
             blocked_reason: Some(reason),
+            group_refusal: None,
             conflict_reason: None,
         }
     }

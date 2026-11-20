@@ -1,13 +1,23 @@
 //! `hello` negotiation (spec chapter 11). Pure: both sides' decisions, no I/O.
 //!
+//! `hello` settles the protocol version and the features and nothing else
+//! (spec 24.2): which group the two sides belong to, and who the worker is,
+//! are settled by the group proof that follows ([`check_proof`],
+//! [`check_answer`]).
+//!
 //! A worker that does not fit gets `PROTOCOL_INCOMPATIBLE` and the connection
 //! is closed; the coordinator never dispatches to it. The coordinator checks the
 //! worker's answer as well, since the peer is not trusted to have chosen
 //! something it offered.
 
+use crate::error::GroupRefusal;
 use crate::error::{ApiError, ErrorCode};
+use crate::group::{self, Keys};
 use crate::ids::{AgentEpoch, ClusterId, CoordinatorEpoch, Digest, WorkerBootId, WorkerId};
-use crate::wire::{HelloRequest, HelloResponse, SchemaVersion};
+use crate::secrets::key::ClusterKey;
+use crate::wire::{
+    GroupProofRequest, GroupProofResponse, HelloRequest, HelloResponse, SchemaVersion,
+};
 
 /// Protocol versions this build speaks.
 pub const PROTOCOL_VERSIONS: &[u32] = &[1];
@@ -28,7 +38,13 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     crate::wire::MATRIX_DISPATCH_FEATURE,
     crate::wire::CI_DISCOVERY_FEATURE,
     crate::wire::WORKFLOW_ARTIFACTS_FEATURE,
+    group::MEMBERSHIP_FEATURE,
+    group::IDENTITY_RETIRED_FEATURE,
 ];
+
+/// The features no connection of this build goes without, on either side
+/// (spec 24.10): there is no branch for a peer that lacks them.
+pub const GROUP_FEATURES: &[&str] = &[group::MEMBERSHIP_FEATURE, group::IDENTITY_RETIRED_FEATURE];
 
 /// What one side offers and requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,9 +97,6 @@ pub fn negotiate(local: &LocalHello, req: &HelloRequest) -> Result<Negotiated, A
     if let Err(e) = req.schema_version.ensure_current() {
         return Err(incompatible(e.to_string()));
     }
-    if req.cluster_id != local.cluster_id {
-        return Err(incompatible("cluster_id mismatch"));
-    }
     let version = local
         .versions
         .iter()
@@ -114,8 +127,8 @@ pub fn verify_response(
     if let Err(e) = resp.schema_version.ensure_current() {
         return Err(incompatible(e.to_string()));
     }
-    if resp.cluster_id != offered.cluster_id {
-        return Err(incompatible("cluster_id mismatch"));
+    if !group::is_nonce(&resp.nonce) {
+        return Err(incompatible("the hello answer carries no usable nonce"));
     }
     if !offered.protocol_versions.contains(&resp.protocol_version) {
         return Err(incompatible(format!(
@@ -139,7 +152,87 @@ pub fn verify_response(
     })
 }
 
-/// What a worker reports about itself in `hello`.
+/// The worker's answer to `hello`: what was negotiated and a nonce.
+pub fn hello_response(negotiated: &Negotiated, nonce: String) -> HelloResponse {
+    HelloResponse {
+        schema_version: SchemaVersion::CURRENT,
+        protocol_version: negotiated.version,
+        features: negotiated.features.clone(),
+        nonce,
+    }
+}
+
+/// The receiving member's decision on a group proof: the key the peer
+/// proved to hold. A peer of another group and a peer whose proof does not
+/// hold under a key this member has (its current one or, during a rotation,
+/// its next one) are refused with the reason. The key is looked up by the
+/// fingerprint the peer names, and the proof decides.
+pub fn check_proof<'k>(
+    cluster_id: &ClusterId,
+    keys: &'k Keys,
+    receiver_nonce: &str,
+    hello: &HelloRequest,
+    proof: &GroupProofRequest,
+) -> Result<&'k ClusterKey, ApiError> {
+    if let Err(e) = proof.schema_version.ensure_current() {
+        return Err(incompatible(e.to_string()));
+    }
+    if hello.cluster_id != *cluster_id {
+        return Err(ApiError::group_refused(
+            GroupRefusal::GroupMismatch,
+            "cluster_id mismatch: this member belongs to another group",
+        ));
+    }
+    let wrong_key = || {
+        ApiError::group_refused(
+            GroupRefusal::GroupKeyMismatch {
+                fingerprint: group::fingerprint(&keys.current),
+            },
+            "the group key does not match the one this member holds",
+        )
+    };
+    if !group::is_nonce(&proof.nonce) {
+        return Err(incompatible("the group proof carries no usable nonce"));
+    }
+    let key = keys
+        .by_fingerprint(&proof.key_fingerprint)
+        .ok_or_else(wrong_key)?;
+    let expected = group::connector_proof(
+        key,
+        cluster_id,
+        &hello.coordinator_id,
+        &proof.member,
+        receiver_nonce,
+    );
+    if !group::proof_matches(&expected, &proof.proof) {
+        return Err(wrong_key());
+    }
+    Ok(key)
+}
+
+/// The connecting member's decision on the answer to its proof. Until this
+/// holds, nothing but `hello` and the proof has been sent to the peer.
+pub fn check_answer(
+    key: &ClusterKey,
+    connector_nonce: &str,
+    answer: &GroupProofResponse,
+) -> Result<(), ApiError> {
+    if let Err(e) = answer.schema_version.ensure_current() {
+        return Err(incompatible(e.to_string()));
+    }
+    let expected = group::receiver_proof(key, &answer.worker_id, connector_nonce);
+    if !group::proof_matches(&expected, &answer.proof) {
+        return Err(ApiError::group_refused(
+            GroupRefusal::GroupKeyMismatch {
+                fingerprint: group::fingerprint(key),
+            },
+            "the worker did not prove that it holds the group key",
+        ));
+    }
+    Ok(())
+}
+
+/// What a worker reports about itself once the peer proved its membership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerIdentity {
     pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
@@ -148,13 +241,15 @@ pub struct WorkerIdentity {
     pub agent_epoch: AgentEpoch,
     pub profile: String,
     pub profile_fingerprint: Digest,
-    /// The highest coordinator epoch this worker has seen.
+    /// The highest epoch this worker has seen of the connecting member.
     pub coordinator_epoch: CoordinatorEpoch,
 }
 
 impl WorkerIdentity {
-    pub fn response(&self, cluster_id: &ClusterId, negotiated: &Negotiated) -> HelloResponse {
-        HelloResponse {
+    /// The answer to a proof that held: this worker's own proof and who it is.
+    pub fn response(&self, negotiated: &Negotiated, proof: String) -> GroupProofResponse {
+        GroupProofResponse {
+            proof,
             capabilities: negotiated
                 .features
                 .iter()
@@ -166,9 +261,6 @@ impl WorkerIdentity {
                     report
                 }),
             schema_version: SchemaVersion::CURRENT,
-            cluster_id: cluster_id.clone(),
-            protocol_version: negotiated.version,
-            features: negotiated.features.clone(),
             worker_id: self.worker_id.clone(),
             worker_boot_id: self.worker_boot_id.clone(),
             agent_epoch: self.agent_epoch,
@@ -239,12 +331,11 @@ mod tests {
             tools: Default::default(),
             features: [FEATURE.into(), "private-feature".into()].into(),
         });
-        let c = ClusterId::generate();
         let mut n = Negotiated {
             version: 1,
             features: vec![FEATURE.into()],
         };
-        let response = id.response(&c, &n);
+        let response = id.response(&n, String::new());
         assert_eq!(
             response.capabilities.unwrap().features,
             [FEATURE.into()].into()
@@ -256,14 +347,167 @@ mod tests {
             .features
             .contains("private-feature"));
         n.features.clear();
-        assert!(id.response(&c, &n).capabilities.is_none());
+        assert!(id.response(&n, String::new()).capabilities.is_none());
         id.capabilities = None;
         n.features.push(FEATURE.into());
-        assert!(id.response(&c, &n).capabilities.is_none());
+        assert!(id.response(&n, String::new()).capabilities.is_none());
     }
 
     fn code(e: ApiError) -> (ErrorCode, String) {
         (e.code, e.message)
+    }
+
+    /// The proof a member named `member` gives for `hello` under the test key.
+    fn proof_of(hello: &HelloRequest, member: &str, receiver_nonce: &str) -> GroupProofRequest {
+        proof_with(&group::test_key(), hello, member, receiver_nonce)
+    }
+
+    fn proof_with(
+        key: &ClusterKey,
+        hello: &HelloRequest,
+        member: &str,
+        receiver_nonce: &str,
+    ) -> GroupProofRequest {
+        let member = WorkerId::parse(member).unwrap();
+        GroupProofRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            key_fingerprint: group::fingerprint(key),
+            nonce: group::nonce().unwrap(),
+            proof: group::connector_proof(
+                key,
+                &hello.cluster_id,
+                &hello.coordinator_id,
+                &member,
+                receiver_nonce,
+            ),
+            member,
+        }
+    }
+
+    fn other_key() -> ClusterKey {
+        ClusterKey::from_bytes(vec![9; 32]).unwrap()
+    }
+
+    #[test]
+    fn a_proof_holds_under_the_current_or_the_next_key_and_names_which() {
+        let c = ClusterId::generate();
+        let hello = request(&c);
+        let nonce = group::nonce().unwrap();
+        let keys = Keys {
+            current: group::test_key(),
+            next: Some(other_key()),
+        };
+        let current = check_proof(&c, &keys, &nonce, &hello, &proof_of(&hello, "main", &nonce));
+        assert_eq!(current.unwrap(), &keys.current);
+        let next = proof_with(&other_key(), &hello, "main", &nonce);
+        assert_eq!(
+            check_proof(&c, &keys, &nonce, &hello, &next).unwrap(),
+            keys.next.as_ref().unwrap()
+        );
+        // Without a rotation the other key is not accepted.
+        let only = Keys::only(group::test_key());
+        let e = check_proof(&c, &only, &nonce, &hello, &next).unwrap_err();
+        assert_eq!(
+            e.group_refusal,
+            Some(GroupRefusal::GroupKeyMismatch {
+                fingerprint: group::fingerprint(&group::test_key())
+            }),
+            "the refusal shows the key this member signs with"
+        );
+        assert_eq!(e.code, ErrorCode::ProtocolIncompatible);
+    }
+
+    #[test]
+    fn a_proof_is_refused_when_anything_it_covers_differs() {
+        let c = ClusterId::generate();
+        let hello = request(&c);
+        let nonce = group::nonce().unwrap();
+        let keys = Keys::only(group::test_key());
+        let good = proof_of(&hello, "main", &nonce);
+        assert!(check_proof(&c, &keys, &nonce, &hello, &good).is_ok());
+        let wrong_key =
+            |e: ApiError| matches!(e.group_refusal, Some(GroupRefusal::GroupKeyMismatch { .. }));
+        // Another nonce of the receiver: a proof is not replayed.
+        let replay = check_proof(&c, &keys, &group::nonce().unwrap(), &hello, &good);
+        assert!(wrong_key(replay.unwrap_err()));
+        // Another name than the one proven.
+        let mut renamed = good.clone();
+        renamed.member = WorkerId::parse("sub").unwrap();
+        assert!(wrong_key(
+            check_proof(&c, &keys, &nonce, &hello, &renamed).unwrap_err()
+        ));
+        // Another coordinator id than the one proven.
+        let mut stolen = hello.clone();
+        stolen.coordinator_id = CoordinatorId::generate();
+        assert!(wrong_key(
+            check_proof(&c, &keys, &nonce, &stolen, &good).unwrap_err()
+        ));
+        // The right fingerprint with a proof made under another key, a cut
+        // proof, an empty one.
+        let mut forged = proof_with(&other_key(), &hello, "main", &nonce);
+        forged.key_fingerprint = good.key_fingerprint.clone();
+        assert!(wrong_key(
+            check_proof(&c, &keys, &nonce, &hello, &forged).unwrap_err()
+        ));
+        for bad in [&good.proof[..63], ""] {
+            let mut cut = good.clone();
+            cut.proof = bad.into();
+            assert!(wrong_key(
+                check_proof(&c, &keys, &nonce, &hello, &cut).unwrap_err()
+            ));
+        }
+        // A proof without a nonce of its own cannot be answered.
+        let mut blind = good.clone();
+        blind.nonce = "x".into();
+        let e = check_proof(&c, &keys, &nonce, &hello, &blind).unwrap_err();
+        assert!(e.message.contains("nonce") && e.group_refusal.is_none());
+        let mut future = good.clone();
+        future.schema_version = SchemaVersion(99);
+        assert!(check_proof(&c, &keys, &nonce, &hello, &future).is_err());
+    }
+
+    #[test]
+    fn the_connecting_side_refuses_a_worker_that_does_not_prove_the_key() {
+        let n = Negotiated {
+            version: 1,
+            features: vec![],
+        };
+        let key = group::test_key();
+        let nonce = group::nonce().unwrap();
+        let me = identity();
+        let good = me.response(&n, group::receiver_proof(&key, &me.worker_id, &nonce));
+        assert!(check_answer(&key, &nonce, &good).is_ok());
+        let refused = |answer: &GroupProofResponse, nonce: &str| {
+            let e = check_answer(&key, nonce, answer).unwrap_err();
+            assert_eq!(e.code, ErrorCode::ProtocolIncompatible);
+            assert!(matches!(
+                e.group_refusal,
+                Some(GroupRefusal::GroupKeyMismatch { .. })
+            ));
+        };
+        // Another key, another nonce than this connection's, a name other
+        // than the one the proof was made over, and the connecting side's
+        // own proof sent back.
+        refused(
+            &me.response(
+                &n,
+                group::receiver_proof(&other_key(), &me.worker_id, &nonce),
+            ),
+            &nonce,
+        );
+        refused(&good, &group::nonce().unwrap());
+        let mut renamed = good.clone();
+        renamed.worker_id = WorkerId::parse("w2").unwrap();
+        refused(&renamed, &nonce);
+        let c = ClusterId::generate();
+        let hello = request(&c);
+        let mut echo = good.clone();
+        echo.proof = proof_of(&hello, me.worker_id.as_str(), &nonce).proof;
+        refused(&echo, &nonce);
+        let mut empty = good.clone();
+        empty.proof.clear();
+        refused(&empty, &nonce);
     }
 
     #[test]
@@ -285,7 +529,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_other_schema_versions_clusters_and_disjoint_versions() {
+    fn refuses_other_schema_versions_and_disjoint_versions_and_leaves_the_group_to_the_proof() {
         let c = ClusterId::generate();
         let mut req = request(&c);
         req.schema_version = SchemaVersion(99);
@@ -293,10 +537,17 @@ mod tests {
         assert_eq!(code_, ErrorCode::ProtocolIncompatible);
         assert!(msg.contains("99"));
 
-        let req = request(&ClusterId::generate());
-        let (code_, msg) = code(negotiate(&local(&c), &req).unwrap_err());
-        assert_eq!(code_, ErrorCode::ProtocolIncompatible);
-        assert!(msg.contains("cluster_id"));
+        // `hello` settles the version and the features only: a peer of
+        // another group is refused by its proof, with the reason.
+        let other = request(&ClusterId::generate());
+        assert!(negotiate(&local(&c), &other).is_ok());
+        let keys = Keys::only(group::test_key());
+        let nonce = group::nonce().unwrap();
+        let e =
+            check_proof(&c, &keys, &nonce, &other, &proof_of(&other, "main", &nonce)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::ProtocolIncompatible);
+        assert_eq!(e.group_refusal, Some(GroupRefusal::GroupMismatch));
+        assert!(e.message.contains("cluster_id"));
 
         let mut req = request(&c);
         req.protocol_versions = vec![5];
@@ -333,14 +584,31 @@ mod tests {
         let c = ClusterId::generate();
         let req = request(&c);
         let n = negotiate(&local(&c), &req).unwrap();
-        let resp = identity().response(&c, &n);
+        let resp = hello_response(&n, group::nonce().unwrap());
         assert_eq!(resp.protocol_version, 2);
-        assert_eq!(resp.worker_id, identity().worker_id);
-        assert_eq!(resp.agent_epoch, AgentEpoch(4));
-        assert_eq!(resp.coordinator_epoch, CoordinatorEpoch(9));
-        assert_eq!(resp.profile, "p");
-        assert_eq!(resp.worker_boot_id, identity().worker_boot_id);
-        assert_eq!(resp.profile_fingerprint, identity().profile_fingerprint);
+        // The answer to `hello` is the version, the features and a nonce:
+        // nothing in it says who answers.
+        let said = serde_json::to_value(&resp).unwrap();
+        let mut fields: Vec<&str> = said
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        fields.sort_unstable();
+        assert_eq!(
+            fields,
+            ["features", "nonce", "protocol_version", "schema_version"]
+        );
+        // Who answers comes with the worker's own proof.
+        let who = identity().response(&n, "proof".into());
+        assert_eq!(who.proof, "proof");
+        assert_eq!(who.worker_id, identity().worker_id);
+        assert_eq!(who.agent_epoch, AgentEpoch(4));
+        assert_eq!(who.coordinator_epoch, CoordinatorEpoch(9));
+        assert_eq!(who.profile, "p");
+        assert_eq!(who.worker_boot_id, identity().worker_boot_id);
+        assert_eq!(who.profile_fingerprint, identity().profile_fingerprint);
         assert_eq!(verify_response(&req, &[], &resp).unwrap(), n);
         assert_eq!(verify_response(&req, &s(&["b"]), &resp).unwrap(), n);
     }
@@ -350,7 +618,7 @@ mod tests {
         let c = ClusterId::generate();
         let req = request(&c);
         let n = negotiate(&local(&c), &req).unwrap();
-        let good = identity().response(&c, &n);
+        let good = hello_response(&n, group::nonce().unwrap());
 
         let mut r = good.clone();
         r.schema_version = SchemaVersion(7);
@@ -358,11 +626,13 @@ mod tests {
         assert_eq!(code_, ErrorCode::ProtocolIncompatible);
         assert!(msg.contains('7'));
 
-        let mut r = good.clone();
-        r.cluster_id = ClusterId::generate();
-        assert!(code(verify_response(&req, &[], &r).unwrap_err())
-            .1
-            .contains("cluster_id"));
+        for nonce in ["", "not-a-nonce"] {
+            let mut r = good.clone();
+            r.nonce = nonce.into();
+            assert!(code(verify_response(&req, &[], &r).unwrap_err())
+                .1
+                .contains("nonce"));
+        }
 
         let mut r = good.clone();
         r.protocol_version = 1;
@@ -385,6 +655,15 @@ mod tests {
     fn the_shipped_constants_are_consistent() {
         assert!(!PROTOCOL_VERSIONS.is_empty());
         assert!(SUPPORTED_FEATURES.contains(&"blob_resume"));
+        // The group features are offered and required by both sides.
+        assert_eq!(group::MEMBERSHIP_FEATURE, "group_membership_v1");
+        assert_eq!(group::IDENTITY_RETIRED_FEATURE, "identity_retired_v1");
+        for feature in GROUP_FEATURES {
+            assert!(SUPPORTED_FEATURES.contains(feature));
+            assert!(crate::protocol::session::required_features()
+                .iter()
+                .any(|f| f == feature));
+        }
         // Offered, never required: a worker of this build takes the frozen
         // plan as a blob, and one that does not is simply given no CI task.
         assert!(SUPPORTED_FEATURES.contains(&"ci_task_v1"));

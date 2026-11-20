@@ -529,7 +529,7 @@ pub(super) fn command(
         .and_then(|exe| {
             let spec = crate::service::context::runtime_spec(env)?;
             upgrade(
-                &mut SshRemote,
+                &mut SshRemote::new(&spec.cluster_key_path),
                 env,
                 &spec,
                 &exe,

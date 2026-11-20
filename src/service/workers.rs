@@ -11,7 +11,7 @@ use crate::{
     cli::WorkersSub,
     config::paths::user_config_path,
     error::{ApiError, ErrorCode},
-    ids::{ClusterId, CoordinatorEpoch, CoordinatorId, WorkerId},
+    ids::{ClusterId, WorkerId},
     protocol::ssh::{quote, ssh_argv, ssh_exec_argv, RemoteCommand, SshTarget},
 };
 use serde::Serialize;
@@ -126,13 +126,12 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 async fn hello_on(
     io: crate::protocol::Io,
     cluster: &ClusterId,
+    key: crate::secrets::key::ClusterKey,
     required: Option<&[String]>,
 ) -> Result<BridgeHello, String> {
-    let mut config = crate::protocol::ClientConfig::new(
-        cluster.clone(),
-        CoordinatorId::generate(),
-        CoordinatorEpoch(1),
-    );
+    // A probe proves the group key like any connection, names no
+    // coordinator, and is told who answers; the worker records nothing.
+    let mut config = crate::protocol::ClientConfig::probe(cluster.clone(), key);
     let connected = tokio::time::timeout(HELLO_TIMEOUT, async {
         match required {
             None => crate::protocol::connect(io, config).await,
@@ -146,7 +145,7 @@ async fn hello_on(
     .map_err(|_| "the worker bridge did not answer hello in time".to_string())?
     .map_err(|e| format!("the worker bridge refused hello: {e}"))?;
     Ok(BridgeHello {
-        cluster: connected.worker.cluster_id,
+        cluster: connected.cluster_id,
         worker: connected.worker.worker_id,
         features: connected.negotiated.features,
     })
@@ -157,22 +156,35 @@ async fn hello_on(
 async fn hello_through(
     argv: &[String],
     cluster: &ClusterId,
+    key: crate::secrets::key::ClusterKey,
     required: Option<&[String]>,
 ) -> Result<BridgeHello, String> {
     let transport = crate::protocol::transport::spawn_child_piped_stderr(argv)
         .map_err(|_| "ssh could not be started".to_string())?;
     let mut child = transport.child;
     drop(child.stderr.take());
-    let answer = hello_on(transport.io, cluster, required).await;
+    let answer = hello_on(transport.io, cluster, key, required).await;
     let _ = child.start_kill();
     let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
     answer
 }
 
-pub struct SshRemote;
+/// The real remote. `key_path` is this member's group key: a probe of a
+/// worker bridge proves it.
+pub struct SshRemote {
+    pub key_path: std::path::PathBuf,
+}
+
+impl SshRemote {
+    pub fn new(key_path: &Path) -> Self {
+        SshRemote {
+            key_path: key_path.to_path_buf(),
+        }
+    }
+}
 impl Remote for SshRemote {
     fn split(&self) -> Option<Box<dyn Remote + Send>> {
-        Some(Box::new(SshRemote))
+        Some(Box::new(SshRemote::new(&self.key_path)))
     }
 
     fn run(
@@ -246,7 +258,8 @@ impl Remote for SshRemote {
         binary: &str,
         cluster: &ClusterId,
     ) -> Result<(ClusterId, WorkerId), String> {
-        ssh_hello(target, binary, cluster, None).map(|hello| (hello.cluster, hello.worker))
+        ssh_hello(&self.key_path, target, binary, cluster, None)
+            .map(|hello| (hello.cluster, hello.worker))
     }
 
     fn bridge_hello_with(
@@ -256,23 +269,26 @@ impl Remote for SshRemote {
         cluster: &ClusterId,
         required: &[String],
     ) -> Result<BridgeHello, String> {
-        ssh_hello(target, binary, cluster, Some(required))
+        ssh_hello(&self.key_path, target, binary, cluster, Some(required))
     }
 }
 
 fn ssh_hello(
+    key_path: &Path,
     target: &SshTarget,
     binary: &str,
     cluster: &ClusterId,
     required: Option<&[String]>,
 ) -> Result<BridgeHello, String> {
+    let key = crate::secrets::key::load(key_path)
+        .map_err(|e| format!("the group key cannot be read: {e}"))?;
     let command = RemoteCommand::worker_stdio(binary).map_err(|e| e.to_string())?;
     let argv = ssh_argv(target, &command);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|e| e.to_string())?
-        .block_on(hello_through(&argv, cluster, required))
+        .block_on(hello_through(&argv, cluster, key, required))
 }
 
 impl Remote for Box<dyn Remote + Send> {
@@ -1918,7 +1934,14 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
             .as_ref()
             .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
         let spec = super::context::runtime_spec(&env)?;
-        lifecycle(&mut SshRemote, &env, &spec, exe, name, action)
+        lifecycle(
+            &mut SshRemote::new(&spec.cluster_key_path),
+            &env,
+            &spec,
+            exe,
+            name,
+            action,
+        )
     };
     let (name, action, result): (&str, Lifecycle, Result<Status, ApiError>) = match sub {
         WorkersSub::Forget { name } => {
@@ -1944,7 +1967,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                 .and_then(|exe| {
                     let spec = super::context::runtime_spec(&env)?;
                     add(
-                        &mut SshRemote,
+                        &mut SshRemote::new(&spec.cluster_key_path),
                         &env,
                         &spec,
                         exe,
@@ -2010,9 +2033,13 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                     .as_ref()
                     .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
                 let spec = super::context::runtime_spec(&env)?;
-                diff_workers(&mut SshRemote, &env, exe, name.as_deref(), || {
-                    crate::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env)
-                })
+                diff_workers(
+                    &mut SshRemote::new(&spec.cluster_key_path),
+                    &env,
+                    exe,
+                    name.as_deref(),
+                    || crate::toolchain::envreport::collect(&spec.worker_state_dir, &spec.env),
+                )
             })()
             .map(|diffs| {
                 let text = render_diff(&diffs);
@@ -2045,7 +2072,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                     .map(|dir| read_project_requirements(Path::new(dir)))
                     .transpose()?;
                 sync_worker(
-                    &mut SshRemote,
+                    &mut SshRemote::new(&spec.cluster_key_path),
                     &env,
                     exe,
                     name,

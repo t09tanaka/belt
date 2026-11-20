@@ -279,12 +279,29 @@ async fn session(
             }
         }
     });
+    let membership = match coordinator.membership() {
+        Ok(membership) => membership,
+        Err(e) => {
+            child.reap().await;
+            drain.abort();
+            return Err(anyhow::anyhow!(e.message));
+        }
+    };
     let connected = tokio::select! {
         _=stop.changed()=>None,
         connected=connect(transport.io, ClientConfig::new(
-            coordinator.store().cluster_id().clone(), coordinator.store().coordinator_id().clone(), coordinator.epoch()
+            coordinator.store().cluster_id().clone(), coordinator.store().coordinator_id().clone(), coordinator.epoch(), membership
         ))=>Some(connected),
     };
+    // A peer that refused this member's key and showed the fingerprint of
+    // the key this member holds as its next one has switched already: the
+    // instruction to switch did not arrive here. Switch now (spec 24.2);
+    // the next connection proves with the new key.
+    if let (Some(Err(refused)), Some(key_path)) = (&connected, coordinator.group_key_path()) {
+        if let Some(fingerprint) = refused.peer_key_fingerprint() {
+            let _ = crate::group::switch_if_peer_is_on_next(key_path, fingerprint);
+        }
+    }
     let outcome = async {
         let Some(connected) = connected else { return Ok(()); };
         let connected = connected?;

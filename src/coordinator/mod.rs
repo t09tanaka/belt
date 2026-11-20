@@ -381,6 +381,9 @@ async fn join_all<'a, T>(mut all: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a
 }
 
 pub struct Coordinator {
+    /// Who this coordinator is in the group: the name of its member and
+    /// where the member's group key is. Set once at startup.
+    group: std::sync::OnceLock<(WorkerId, std::path::PathBuf)>,
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
@@ -435,6 +438,7 @@ impl Coordinator {
     ) -> Result<Coordinator> {
         store.mark_reconciling()?;
         Ok(Coordinator {
+            group: std::sync::OnceLock::new(),
             store: Arc::new(store),
             cfg,
             workers: Mutex::default(),
@@ -465,6 +469,32 @@ impl Coordinator {
 
     pub fn store(&self) -> &CoordinatorStore {
         &self.store
+    }
+
+    /// Say who this coordinator is in the group: the name of the member it
+    /// runs on and the file of that member's group key. The first call
+    /// holds.
+    pub fn set_group_identity(&self, member: WorkerId, key_path: std::path::PathBuf) {
+        let _ = self.group.set((member, key_path));
+    }
+
+    /// The file of this member's group key, once the identity is set.
+    pub fn group_key_path(&self) -> Option<&std::path::Path> {
+        self.group.get().map(|(_, path)| path.as_path())
+    }
+
+    /// What this coordinator proves to a worker (spec 24.2): its member's
+    /// name and the group key, read now, so a key that was switched since
+    /// the last connection is the one used.
+    pub fn membership(&self) -> std::result::Result<crate::protocol::Membership, ApiError> {
+        let (member, key_path) = self.group.get().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Internal,
+                "this coordinator was not told which member of the group it is",
+            )
+        })?;
+        crate::protocol::Membership::load(member.clone(), key_path)
+            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("the group key: {e}")))
     }
 
     pub fn epoch(&self) -> CoordinatorEpoch {

@@ -2,11 +2,12 @@
 //! request, and the periodic housekeeping.
 
 use super::agent::{Agent, Session};
-use crate::error::{ApiError, ErrorCode};
-use crate::ids::ClusterId;
+use crate::error::{ApiError, ErrorCode, GroupRefusal};
+use crate::ids::{ClusterId, CoordinatorEpoch, CoordinatorId};
 use crate::protocol::hello::WorkerIdentity;
 use crate::protocol::transport::listen_unix;
-use crate::protocol::{accept, ConnectError, InboundRequest, Io, ServerConfig};
+use crate::protocol::{accept, ConnectError, InboundRequest, Io, ProvenMember, ServerConfig};
+use crate::storage::MemberPin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
@@ -19,30 +20,90 @@ pub const MAX_CONCURRENT_REQUESTS: usize = 64;
 /// Why a connection ended.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
-    /// The agent could not say who it is (the database did not answer). No
-    /// `hello` was answered: an epoch made up here would be believed.
+    /// The agent could not read its group key. No `hello` was answered.
     #[error("worker identity: {}", .0.message)]
     Identity(ApiError),
     #[error(transparent)]
     Connect(#[from] ConnectError),
 }
 
-/// What the agent says about itself in `hello`.
-pub fn identity(agent: &Agent) -> Result<WorkerIdentity, ApiError> {
+/// What the agent tells a member whose group proof held, or why it refuses
+/// it (spec 24.2, 24.3). The member's name and coordinator id are recorded
+/// together at its first proof; a name that comes with another coordinator
+/// id, or a coordinator id under another name, is refused and nothing is
+/// recorded. So is a member that told this worker it retired the identity
+/// the worker still has. The epoch in the answer is that member's own.
+///
+/// A probe ([`crate::protocol::ClientConfig::probe`]) names no coordinator:
+/// it is told who answers, nothing is recorded, and no request is served.
+pub fn admit(agent: &Agent, peer: &ProvenMember) -> Result<WorkerIdentity, ApiError> {
     let cfg = agent.config();
-    let coordinator_epoch = agent
-        .store()
-        .max_coordinator_epoch()
-        .map_err(|e| ApiError::new(e.code(), format!("the highest coordinator epoch: {e}")))?;
-    Ok(WorkerIdentity {
+    let mut me = WorkerIdentity {
         capabilities: agent.capabilities(),
         worker_id: cfg.worker_id.clone(),
         worker_boot_id: cfg.advertised_boot().clone(),
         agent_epoch: agent.agent_epoch(),
         profile: cfg.profile.clone(),
         profile_fingerprint: cfg.profile_fingerprint.clone(),
-        coordinator_epoch,
-    })
+        coordinator_epoch: CoordinatorEpoch(0),
+    };
+    if peer.coordinator_id == CoordinatorId::nil() {
+        return Ok(me);
+    }
+    let store = agent.store().for_member(&peer.coordinator_id);
+    let failed = |what: &str, e: crate::storage::StorageError| {
+        ApiError::new(e.code(), format!("{what}: {e}"))
+    };
+    let pin = store
+        .pin_member(peer.member.as_str(), crate::platform::wall_ms())
+        .map_err(|e| failed("the member record", e))?;
+    let mismatch = |message: String| {
+        Err(ApiError::group_refused(
+            GroupRefusal::MemberIdentityMismatch,
+            message,
+        ))
+    };
+    match pin {
+        MemberPin::Pinned => {}
+        MemberPin::NameTaken { .. } => {
+            return mismatch(format!(
+                "the member name {} is recorded here with another coordinator id; a machine that was rebuilt or copied does not take over a name (add it again from this member to replace the record)",
+                peer.member
+            ))
+        }
+        MemberPin::IdTaken { name } => {
+            return mismatch(format!(
+                "this coordinator id is recorded here as member {name}, not {}",
+                peer.member
+            ))
+        }
+    }
+    if store
+        .identity_retired(cfg.advertised_boot())
+        .map_err(|e| failed("the retired identities", e))?
+    {
+        return Err(ApiError::group_refused(
+            GroupRefusal::IdentityRetired,
+            "this member retired the identity this worker still has",
+        ));
+    }
+    me.coordinator_epoch = store
+        .max_coordinator_epoch()
+        .map_err(|e| failed("the highest coordinator epoch", e))?;
+    Ok(me)
+}
+
+/// Who the agent says it is, as a probe is told (no member, epoch 0).
+pub fn identity(agent: &Agent) -> Result<WorkerIdentity, ApiError> {
+    admit(
+        agent,
+        &ProvenMember {
+            coordinator_id: CoordinatorId::nil(),
+            coordinator_epoch: CoordinatorEpoch(0),
+            member: agent.config().worker_id.clone(),
+            key_fingerprint: String::new(),
+        },
+    )
 }
 
 /// Serve one connection until the peer closes it.
@@ -66,23 +127,45 @@ pub async fn serve_connection_offering(
     permits: Arc<Semaphore>,
     more_features: &[&str],
 ) -> Result<(), ServeError> {
-    let identity_agent = agent.clone();
-    let me = tokio::task::spawn_blocking(move || identity(&identity_agent))
+    // The keys are read for each connection: after a switch the new key is
+    // the one a peer must prove with. Without a readable key nothing is
+    // answered, not even `hello`.
+    let key_path = agent.config().group_key_path.clone();
+    let keys = tokio::task::spawn_blocking(move || crate::group::load_keys(&key_path))
         .await
         .map_err(|e| {
             ServeError::Identity(ApiError::new(
                 ErrorCode::Internal,
-                format!("worker identity task: {e}"),
+                format!("group key task: {e}"),
             ))
         })?
-        .map_err(ServeError::Identity)?;
-    let mut config = ServerConfig::new(cluster_id, me);
+        .map_err(|e| {
+            ServeError::Identity(ApiError::new(
+                ErrorCode::Internal,
+                format!("the group key cannot be read: {e}"),
+            ))
+        })?;
+    let mut key_changes = agent.group_key_changes();
+    key_changes.mark_unchanged();
+    let admitting = agent.clone();
+    let mut config = ServerConfig::admitting(
+        cluster_id,
+        agent.config().worker_id.clone(),
+        keys,
+        Arc::new(move |peer| admit(&admitting, peer)),
+    );
     let offered = &mut config.local.features;
     offered.extend(more_features.iter().map(|f| f.to_string()));
     let accepted = accept(io, config).await?;
+    if accepted.coordinator_id == CoordinatorId::nil() {
+        // A probe: it was told who answers. Nothing is served on it.
+        return Ok(());
+    }
     let session = Session {
+        coordinator_id: accepted.coordinator_id.clone(),
         coordinator_epoch: accepted.coordinator_epoch,
     };
+    let proven_with = accepted.key_fingerprint.clone();
     let capabilities_negotiated = accepted
         .negotiated
         .features
@@ -91,10 +174,31 @@ pub async fn serve_connection_offering(
     let negotiated_features = accepted.negotiated.features;
     let mut incoming = accepted.incoming;
     loop {
+        let next = tokio::select! {
+            next = incoming.next() => next,
+            changed = key_changes.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                // The key was switched. A connection proven with a key this
+                // worker still accepts (the one that is current now) stays;
+                // any other is closed and the peer proves again.
+                let path = agent.config().group_key_path.clone();
+                let still = tokio::task::spawn_blocking(move || crate::group::load_keys(&path))
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .is_some_and(|keys| keys.by_fingerprint(&proven_with).is_some());
+                if still {
+                    continue;
+                }
+                return Ok(());
+            }
+        };
         let Some(InboundRequest {
             mut request,
             responder,
-        }) = incoming.next().await
+        }) = next
         else {
             return Ok(());
         };
@@ -106,6 +210,7 @@ pub async fn serve_connection_offering(
         };
         let agent = agent.clone();
         let negotiated_features = negotiated_features.clone();
+        let session = session.clone();
         tokio::spawn(async move {
             let uses_workflow_artifacts = matches!(
                 &request,

@@ -586,13 +586,14 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
     // Stall only source delivery; real coordinator control keeps its original link.
     let (parent, worker) = UnixStream::pair().unwrap();
     let identity = crate::worker::serve::identity(&resident.agent).unwrap();
+    let group_keys = crate::group::load_keys(&resident.agent.config().group_key_path).unwrap();
     let cluster = client.cluster_id().clone();
     let server_cluster = cluster.clone();
     let (seen, received) = tokio::sync::oneshot::channel();
     let peer = tokio::spawn(async move {
         let mut accepted = crate::protocol::session::accept(
             Io::from_stream(worker),
-            crate::protocol::session::ServerConfig::new(server_cluster, identity),
+            crate::protocol::session::ServerConfig::new(server_cluster, identity, group_keys),
         )
         .await
         .unwrap();
@@ -627,6 +628,7 @@ async fn durable_acceptance_survives_stalled_source_and_shutdown() {
             cluster,
             resident.coordinator.store().coordinator_id().clone(),
             resident.coordinator.epoch(),
+            resident.coordinator.membership().unwrap(),
         ),
     )
     .await
@@ -925,6 +927,7 @@ async fn secret_peer(
 ) {
     let (parent, worker) = UnixStream::pair().unwrap();
     let mut identity = crate::worker::serve::identity(&resident.agent).unwrap();
+    let group_keys = crate::group::load_keys(&resident.agent.config().group_key_path).unwrap();
     identity.worker_id = id;
     let cluster = resident.client.cluster_id.clone();
     let server_cluster = cluster.clone();
@@ -932,7 +935,7 @@ async fn secret_peer(
     let peer = tokio::spawn(async move {
         let mut accepted = crate::protocol::session::accept(
             Io::from_stream(worker),
-            crate::protocol::session::ServerConfig::new(server_cluster, identity),
+            crate::protocol::session::ServerConfig::new(server_cluster, identity, group_keys),
         )
         .await
         .unwrap();
@@ -964,6 +967,7 @@ async fn secret_peer(
             cluster,
             resident.coordinator.store().coordinator_id().clone(),
             resident.coordinator.epoch(),
+            resident.coordinator.membership().unwrap(),
         ),
     )
     .await
@@ -1207,6 +1211,7 @@ async fn source_prefetch_verifies_legacy_inputs_and_advances_after_full_cache_ev
     }
     let (parent, worker) = UnixStream::pair().unwrap();
     let identity = crate::worker::serve::identity(&resident.agent).unwrap();
+    let group_keys = crate::group::load_keys(&resident.agent.config().group_key_path).unwrap();
     let cluster = resident.client.cluster_id.clone();
     let server_cluster = cluster.clone();
     let ready = Arc::new(AtomicBool::new(false));
@@ -1215,7 +1220,7 @@ async fn source_prefetch_verifies_legacy_inputs_and_advances_after_full_cache_ev
     let peer = tokio::spawn(async move {
         let mut accepted = crate::protocol::session::accept(
             Io::from_stream(worker),
-            crate::protocol::session::ServerConfig::new(server_cluster, identity),
+            crate::protocol::session::ServerConfig::new(server_cluster, identity, group_keys),
         )
         .await
         .unwrap();
@@ -1246,6 +1251,7 @@ async fn source_prefetch_verifies_legacy_inputs_and_advances_after_full_cache_ev
             cluster,
             resident.coordinator.store().coordinator_id().clone(),
             resident.coordinator.epoch(),
+            resident.coordinator.membership().unwrap(),
         ),
     )
     .await

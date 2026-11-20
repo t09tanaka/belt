@@ -69,7 +69,7 @@ impl ResolvedConfig {
         let settings = self
             .runtime_settings()
             .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
-        if &connected.worker.cluster_id != coordinator.store().cluster_id() {
+        if &connected.cluster_id != coordinator.store().cluster_id() {
             return Err(invalid("worker hello cluster does not match coordinator"));
         }
         let id = &connected.worker.worker_id;
@@ -137,6 +137,7 @@ impl ResolvedConfig {
             gate.set_ci_task(ci_task);
             gate.set_ci_discovery(discovery);
         }
+        let notice_client = connected.client.clone();
         let link: Arc<dyn crate::coordinator::WorkerLink> = Arc::new(
             (match gate {
                 Some(gate) => ClientLink::gated(connected.client, timeout, gate),
@@ -155,7 +156,21 @@ impl ResolvedConfig {
             match coordinator.attach_ephemeral(id.clone(), &connected.worker.worker_boot_id, link.clone())
                 .await.map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))? {
                 Admission::First | Admission::Same => {}
-                Admission::Retired => return Err(ApiError::new(ErrorCode::Conflict, "the worker identity was retired")),
+                Admission::Retired => {
+                    // Not attached. The worker is told once more before the
+                    // connection goes, so that it stops this member's
+                    // attempts now instead of at the end of their lease
+                    // (spec 24.3). That it was sent is recorded; that it
+                    // arrived is not assumed.
+                    crate::coordinator::identity::notify_retired(
+                        coordinator,
+                        &notice_client,
+                        id,
+                        &connected.worker.worker_boot_id,
+                    )
+                    .await;
+                    return Err(ApiError::new(ErrorCode::Conflict, "the worker identity was retired"));
+                }
                 Admission::Conflict => return Err(ApiError::new(ErrorCode::Conflict,
                     "another identity holds this worker name; use workers forget once the previous worker is gone")),
             }
@@ -210,6 +225,7 @@ impl ResolvedConfig {
             inputs.boot_id,
             inputs.supervisor_exe.clone(),
         );
+        agent.group_key_path = inputs.cluster_key_path.clone();
         agent.traffic_state_dir = traffic.state_dir;
         agent.traffic_config = Some(traffic.config_file);
         agent.max_active_task = settings.coordinator.limits.max_active_task;

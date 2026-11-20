@@ -5,6 +5,7 @@ pub mod config;
 pub mod coordinator;
 pub mod error;
 pub mod forecast;
+pub mod group;
 pub mod ids;
 pub mod outputs;
 pub mod platform;

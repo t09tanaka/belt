@@ -406,7 +406,7 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     f.ready(&mut worker).await;
     let (mut bridge, connected) = f.bridge().await;
     assert_eq!(connected.worker.worker_id, initial.worker_id);
-    assert_eq!(connected.worker.cluster_id, initial.cluster_id);
+
     assert_eq!(connected.worker.worker_boot_id, initial.worker_boot_id);
     assert!(connected.worker.agent_epoch > initial.agent_epoch);
     let response = connected
