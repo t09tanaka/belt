@@ -1281,3 +1281,20 @@ fn an_unreadable_worker_database_refuses_a_stop_and_no_database_does_not() {
         "{error:#}"
     );
 }
+
+#[test]
+fn an_unfinished_init_is_not_given_a_second_worker_service() {
+    let mut h = Host::new();
+    fs::create_dir_all(h.paths().config).unwrap();
+    // `init` journaled its plan but never published the coordinator input.
+    fs::write(h.paths().config.join("init.json"), b"{}").unwrap();
+    h.request.membership = Some(Membership {
+        caller_name: WorkerId::parse("caller").unwrap(),
+        caller_id: CoordinatorId::generate(),
+        move_group: false,
+        install: true,
+    });
+    assert!(h.install().is_err());
+    assert!(!h.paths().journal.exists());
+    assert!(h.launchctl_calls().is_empty());
+}

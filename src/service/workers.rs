@@ -1043,6 +1043,15 @@ fn install_remote(
         .run(target, &command, &body, Duration::from_secs(300))
         .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
     let status = parse_reply(&out)?;
+    // The host already had belt: the staged copy was only for a first install.
+    if options.install && status.membership_only {
+        let _ = remote.run(
+            target,
+            &unstage_command(&digest),
+            &[],
+            Duration::from_secs(60),
+        );
+    }
     if status.system_user != system_user {
         return Err(ApiError::new(
             ErrorCode::Conflict,

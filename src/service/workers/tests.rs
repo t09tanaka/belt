@@ -815,6 +815,15 @@ fn add_without_install_hands_over_membership_and_refuses_a_changed_destination()
 }
 
 #[test]
+fn install_on_a_host_that_already_has_belt_does_not_leave_a_staged_binary() {
+    let mut w = World::new();
+    w.add("mini-a", Some("ci@h"), true).unwrap();
+    let again = w.add("mini-a", Some("ci@h"), true).unwrap();
+    assert!(again.status.unwrap().membership_only);
+    assert!(!w.remote.staged().exists());
+}
+
+#[test]
 fn registration_keeps_existing_configuration_bytes() {
     let w = World::new();
     fs::create_dir_all(w.config.parent().unwrap()).unwrap();

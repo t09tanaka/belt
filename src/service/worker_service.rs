@@ -815,7 +815,12 @@ pub fn install<L: Launcher>(
     let key_bytes = hex_decode(request.key_file_text.trim_end_matches('\n'))
         .context("cluster key is not lower-case hex")?;
     crate::secrets::key::ClusterKey::from_bytes(key_bytes).context("cluster key rejected")?;
-    if request.membership.is_some() && paths.config.join("coordinator.json").try_exists()? {
+    // An unfinished `init` (journal without the published input) also takes
+    // this path and is refused there: no second service goes beside it.
+    if request.membership.is_some()
+        && (paths.config.join("coordinator.json").try_exists()?
+            || paths.config.join("init.json").try_exists()?)
+    {
         return super::init::handover(env, request, launcher);
     }
     let account = request
