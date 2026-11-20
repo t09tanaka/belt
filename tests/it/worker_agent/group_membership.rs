@@ -914,3 +914,174 @@ async fn a_probe_proves_the_key_is_told_who_answers_and_leaves_nothing() {
         GroupRefusal::GroupKeyMismatch { .. }
     ));
 }
+
+fn inspect_req() -> Request {
+    Request::Inspect(InspectRequest {
+        preparation_observations: None,
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+    })
+}
+
+async fn window_of(c: &Client) -> AdmissionWindow {
+    match call(c, inspect_req()).await.unwrap() {
+        Response::Inspect(i) => i
+            .admission
+            .expect("a worker of this build answers its window"),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn forecast_req(m: &Member) -> Request {
+    let (a, n) = (AttemptId::generate(), NodeId::parse("main").unwrap());
+    Request::Forecast(ForecastRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        coordinator_epoch: CoordinatorEpoch(m.epoch),
+        workload: WorkloadPlan {
+            attempt_id: a.clone(),
+            plan_digest: Digest::of_bytes(b"plan"),
+            expansion_seq: 0,
+            nodes: vec![WorkloadNode {
+                ci_history_key: None,
+                node_id: n.clone(),
+                depends_on: vec![],
+                priority: 0,
+                weight: Some(1),
+                predicted_rss_bytes: Some(1),
+                predicted_runtime_ms: Some(5_000),
+                external_delay_ms: None,
+                ready_in_ms: Some(0),
+                concurrency: ConcurrencyLimits::default(),
+                correlation: Correlation {
+                    attempt_id: a,
+                    node_id: n,
+                    ledger_entry: None,
+                },
+                shared_builder: None,
+            }],
+        },
+        pending: vec![],
+    })
+}
+
+/// A52 on a real agent (spec 24.4 and 24.5): the admission window is the
+/// worker's own and one budget over every member. A submit beyond it is
+/// refused for capacity and leaves nothing, no tombstone and no epoch;
+/// `inspect` and a forecast tell a member how much of the window is the
+/// others', and nothing else about their attempts.
+#[tokio::test(flavor = "multi_thread")]
+async fn a52_the_window_is_one_budget_over_every_member_and_a_refused_submit_leaves_nothing() {
+    let f = fx();
+    // At the end two commands of one member run at once.
+    f.admit_commands(2);
+    // The window of this worker: one active task and one waiting behind it.
+    let agent = f.start("boot-1");
+    let (main, sub) = (member("main"), member("sub"));
+    let a = dial(&f, &agent, &main).await.unwrap().client;
+    let b = dial(&f, &agent, &sub).await.unwrap().client;
+    let empty = window_of(&a).await;
+    assert_eq!(
+        (empty.limit, empty.used, empty.own, empty.foreign),
+        (2, 0, 0, 0)
+    );
+    assert!(empty.has_room() && !empty.shared());
+    // One attempt of each member, held before its start: no command runs,
+    // so the test does not turn on how many the machine admits at once.
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (x, y) = (AttemptId::generate(), AttemptId::generate());
+    let (script, started, release) = until_released(&f, "sub");
+    let (first, second) = (payload("exit 0"), payload(&script));
+    call(&a, request_of(&main, &x, &first)).await.unwrap();
+    call(&b, request_of(&sub, &y, &second)).await.unwrap();
+    for c in [&a, &b] {
+        let w = window_of(c).await;
+        assert_eq!((w.limit, w.used, w.own, w.foreign), (2, 2, 1, 1));
+        assert!(!w.has_room() && w.shared());
+    }
+
+    // A third, from either member and also under a newer epoch of its own.
+    let z = AttemptId::generate();
+    let third = payload("exit 0");
+    let mut newer = sub.clone();
+    newer.epoch = sub.epoch + 5;
+    for (c, m) in [(&a, &main), (&b, &newer), (&b, &newer)] {
+        let e = call(c, request_of(m, &z, &third)).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::Overloaded);
+        assert_eq!(
+            e.overloaded_reason,
+            Some(belt::error::OverloadedReason::Capacity)
+        );
+        for other in [&first, &second] {
+            assert!(
+                !e.message.contains(other.run_id.as_str())
+                    && !e.message.contains(other.task_id.as_str()),
+                "nothing of an attempt is shown"
+            );
+        }
+    }
+    // Nothing was stored: no attempt, no tombstone, no event of it, and
+    // not the epoch the refused submit carried.
+    let store = f.store();
+    assert_eq!(store.count_nonterminal().unwrap(), 2);
+    for (c, m) in [(&a, &main), (&b, &sub)] {
+        assert_eq!(code_of(c, get_req(&z)).await, ErrorCode::NotFound);
+        let own = store.for_member(&m.coordinator);
+        assert!(own.get(&z).unwrap().is_none());
+        assert!(own.tombstone(&z).unwrap().is_none());
+        assert_eq!(own.count_undelivered_tombstones().unwrap(), 0);
+        assert!(own.events_of_attempt(&z, 10).unwrap().is_empty());
+        assert_eq!(listed(c, None, true).await.len(), 1);
+    }
+    let again = dial(&f, &agent, &sub).await.unwrap();
+    assert_eq!(
+        again.worker.coordinator_epoch,
+        CoordinatorEpoch(sub.epoch),
+        "the refused submit left its epoch"
+    );
+    // A resend of an accepted attempt adds nothing and is answered.
+    let Response::SubmitAttempt(resent) = call(&a, request_of(&main, &x, &first)).await.unwrap()
+    else {
+        panic!()
+    };
+    assert!(resent.duplicate);
+
+    // A forecast counts the other member's attempt as demand, says how
+    // many there are, and names none of them.
+    for (c, m, own, other, theirs) in [(&b, &sub, &y, &x, &first), (&a, &main, &x, &y, &second)] {
+        let Response::Forecast(r) = call(c, forecast_req(m)).await.unwrap() else {
+            panic!("a forecast answer")
+        };
+        assert_eq!(r.foreign_demand, 1);
+        assert!(r.coverage.iter().any(|c| &c.attempt_id == own));
+        assert!(r.coverage.iter().all(|c| &c.attempt_id != other));
+        let text = serde_json::to_string(&r).unwrap();
+        for hidden in [
+            other.as_str(),
+            theirs.run_id.as_str(),
+            theirs.task_id.as_str(),
+        ] {
+            assert!(!text.contains(hidden), "{text}");
+        }
+    }
+
+    // An attempt that ended gives its place back, to whoever comes first:
+    // the first member's is cancelled, the other member's goes on running.
+    call(&a, cancel_req(&x)).await.unwrap();
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&x), Outcome::Cancelled);
+    wait_for("the other member's command to start", || started.exists());
+    let w = window_of(&b).await;
+    assert_eq!((w.limit, w.used, w.own, w.foreign), (2, 1, 1, 0));
+    assert!(w.has_room() && !w.shared());
+    let w = window_of(&a).await;
+    assert_eq!((w.used, w.own, w.foreign), (1, 0, 1));
+    assert!(w.has_room() && w.shared());
+    // The attempt that was refused is taken now, as it was sent before.
+    call(&b, request_of(&sub, &z, &third)).await.unwrap();
+    assert_eq!(f.wait_terminal(&z), Outcome::Succeeded);
+    std::fs::write(&release, "").unwrap();
+    assert_eq!(f.wait_terminal(&y), Outcome::Succeeded);
+    let w = window_of(&a).await;
+    assert_eq!((w.limit, w.used, w.own, w.foreign), (2, 0, 0, 0));
+}

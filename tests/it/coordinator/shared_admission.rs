@@ -443,3 +443,179 @@ async fn a_cancel_recorded_before_the_refusal_settles_the_attempt_cancelled() {
     assert!(noted(&c, &first.attempt_id, EVENT_SUBMIT_REFUSED_CAPACITY).is_empty());
     assert_eq!(attempts(&c, &task).len(), 1);
 }
+
+// ------------------------------------------- two members, one real worker
+
+/// A member's own connection to a real agent, under its own name.
+async fn member_link(
+    cluster: &ClusterId,
+    c: &Coordinator,
+    name: &str,
+    agent: &Arc<Agent>,
+) -> Arc<dyn WorkerLink> {
+    let (near, far) = belt::protocol::transport::duplex_pair(64 * 1024);
+    tokio::spawn(belt::worker::serve::serve_connection(
+        agent.clone(),
+        far,
+        cluster.clone(),
+        Arc::new(tokio::sync::Semaphore::new(64)),
+    ));
+    let membership = belt::protocol::Membership::load(
+        WorkerId::parse(name).unwrap(),
+        &agent.config().group_key_path,
+    )
+    .unwrap();
+    let cfg = belt::protocol::ClientConfig::new(
+        cluster.clone(),
+        c.store().coordinator_id().clone(),
+        c.epoch(),
+        membership,
+    );
+    let client = belt::protocol::connect(near, cfg).await.unwrap().client;
+    Arc::new(belt::coordinator::ClientLink::new(
+        client,
+        Duration::from_secs(30),
+    ))
+}
+
+/// A task whose command writes a line to `marker` when it starts, and stays.
+async fn staying_task(c: &Coordinator, marker: &std::path::Path) -> TaskId {
+    let mut task_spec = spec();
+    let script = format!("echo start >> {}; exec sleep 300", marker.display());
+    task_spec.commands[0].argv = vec!["/bin/sh".into(), "-c".into(), script];
+    task_spec.commands[0]
+        .env
+        .insert("PATH".into(), "/usr/bin:/bin".into());
+    let task = TaskId::generate();
+    c.enqueue(
+        RunId::generate(),
+        source(c),
+        vec![(task.clone(), task_spec)],
+    )
+    .await
+    .unwrap();
+    task
+}
+
+/// Tick both members until `done`, for at most 30 seconds.
+async fn tick_until(members: [&Coordinator; 2], what: &str, done: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while !done() {
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for {what}"
+        );
+        for c in members {
+            c.tick().await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// A52 with two real coordinators and one real worker whose window holds
+/// one attempt: both place at once, the worker holds one attempt and no
+/// trace of the other, the member that lost waits with the reason and does
+/// not fail, and each command starts once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a52_two_members_place_on_one_real_worker_at_once_and_its_window_holds() {
+    let mut w = worker_agent::fx();
+    w.admit_commands(2);
+    let dirs = [
+        crate::test_tmp::tempdir().unwrap(),
+        crate::test_tmp::tempdir().unwrap(),
+    ];
+    let open = |dir: &TempDir| {
+        let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+        Coordinator::start(store, CoordinatorConfig::default()).unwrap()
+    };
+    let (m, n) = (open(&dirs[0]), open(&dirs[1]));
+    w.cluster = m.store().cluster_id().clone();
+    let agent = w.start_holding("boot-a", 1);
+    let id = agent.config().worker_id.clone();
+    m.attach(
+        id.clone(),
+        member_link(&w.cluster, &m, "main", &agent).await,
+    )
+    .await;
+    n.attach(id.clone(), member_link(&w.cluster, &n, "sub", &agent).await)
+        .await;
+    let markers = [w.path("main-starts"), w.path("sub-starts")];
+    let tasks = [
+        staying_task(&m, &markers[0]).await,
+        staying_task(&n, &markers[1]).await,
+    ];
+    let (first, second) = tokio::join!(m.tick(), n.tick());
+    first.unwrap();
+    second.unwrap();
+
+    // The worker holds one attempt, of whoever came first.
+    let store = w.store();
+    let held = store.list_nonterminal().unwrap();
+    assert_eq!(held.len(), 1, "{held:?}");
+    let won = usize::from(held[0].coordinator_id != *m.store().coordinator_id());
+    let members = [&m, &n];
+    let (winner, loser) = (members[won], members[1 - won]);
+    let (kept, waiting) = (&tasks[won], &tasks[1 - won]);
+    assert_eq!(only(winner, kept).attempt_id, held[0].attempt_id);
+    tick_until([winner, loser], "the first command", || {
+        count_lines(&markers[won]) == 1
+    })
+    .await;
+    for _ in 0..3 {
+        loser.tick().await.unwrap();
+    }
+    // The other member's task did not fail and is still queued. It was
+    // either never placed (the `inspect` already said the window is full)
+    // or placed once, sent once, refused and closed without a retire.
+    assert_eq!(queued(loser), vec![waiting.clone()]);
+    let lost = attempts(loser, waiting);
+    assert!(lost.len() <= 1, "{lost:?}");
+    let own = store.for_member(loser.store().coordinator_id());
+    for a in &lost {
+        assert!(a.retired && a.termination.is_none(), "{a:?}");
+        let (asked, confirmed) = loser
+            .store()
+            .retire_tombstone(&a.attempt_id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(confirmed, Some(asked));
+        let why = noted(loser, &a.attempt_id, EVENT_SUBMIT_REFUSED_CAPACITY);
+        assert_eq!(why.len(), 1);
+        assert_eq!(why[0]["retire"], false);
+        // Nothing of it is on the worker, no tombstone either.
+        assert!(own.get(&a.attempt_id).unwrap().is_none());
+        assert!(own.tombstone(&a.attempt_id).unwrap().is_none());
+    }
+    assert_eq!(own.count_undelivered_tombstones().unwrap(), 0);
+    assert_eq!(store.list_nonterminal().unwrap().len(), 1);
+    let waits = events(loser, EVENT_TASK_WAITING);
+    let last = waits.last().expect("why the task waits is recorded");
+    assert_eq!(last["task"], waiting.to_string());
+    assert_eq!(last["blocked_reason"], "capacity");
+    assert_eq!(count_lines(&markers[1 - won]), 0);
+    assert!(events(winner, EVENT_TASK_WAITING).is_empty());
+
+    // The first member's attempt ends: the window has room, and the task
+    // that waited is placed and started, once.
+    winner.cancel_task(kept).await.unwrap();
+    tick_until([winner, loser], "the second command", || {
+        count_lines(&markers[1 - won]) == 1
+    })
+    .await;
+    let placed = attempts(loser, waiting).pop().unwrap();
+    assert!(!placed.retired);
+    assert_eq!(placed.worker_id, id);
+    assert_eq!(
+        only(winner, kept).termination.map(|t| t.outcome()),
+        Some(Outcome::Cancelled)
+    );
+    assert_eq!(count_lines(&markers[won]), 1);
+    assert_eq!(count_lines(&markers[1 - won]), 1);
+    loser.cancel_task(waiting).await.unwrap();
+    tick_until([winner, loser], "the second command to stop", || {
+        attempts(loser, waiting)
+            .pop()
+            .is_some_and(|a| a.state == AttemptState::Terminal)
+    })
+    .await;
+}
