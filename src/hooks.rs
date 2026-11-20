@@ -26,12 +26,12 @@
 //! reason = "built in CI only"
 //! ```
 //!
-//! `[[clone]]` is described in [`crate::ecosystem::target`].
+//! `[[clone]]` is described in `crate::ecosystem::target`.
 //!
 //! fast-worktree itself knows nothing about the tools a repository uses;
 //! anything repository-specific goes here.
 
-use crate::error::{Error, Result};
+use crate::error::{Error, Kind, Result};
 use crate::util::{self, errln, outln};
 use serde::Deserialize;
 use std::env;
@@ -40,18 +40,24 @@ use std::process::{Command, Stdio};
 
 pub const FILE: &str = ".fast-worktree.toml";
 
+/// The settings of one `.fast-worktree.toml`, as written.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub struct Config {
+    /// `[[post_add]]`: run in the worktree root after the dependencies.
     #[serde(default)]
     pub post_add: Vec<Hook>,
+    /// `[[pre_remove]]`: run before the worktree is moved away.
     #[serde(default)]
     pub pre_remove: Vec<Hook>,
+    /// `[[skip_lifecycle]]`: project scripts to skip after a clone.
     #[serde(default)]
     pub skip_lifecycle: Vec<SkipLifecycle>,
+    /// `[pool]`: only meaningful in the main checkout's file.
     #[serde(default)]
     pub pool: Option<PoolConfig>,
     /// `[[clone]]`: what each worktree gets, when listed (see
-    /// [`crate::ecosystem::target`]). Empty: the projects are detected from
+    /// `crate::ecosystem::target`). Empty: the projects are detected from
     /// the tracked lockfiles.
     #[serde(default)]
     pub clone: Vec<CloneEntry>,
@@ -63,6 +69,7 @@ pub struct Config {
 /// A project left out on purpose: auto-detection skips it, and `config
 /// check` does not report its lockfile as unlisted. `reason` is required.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub struct Ignore {
     /// The project directory, relative to the worktree root.
     #[serde(default)]
@@ -84,17 +91,27 @@ impl Ignore {
 
 /// One `[[clone]]` as written. Every field is optional here; what a preset
 /// fills in and what must be given is decided when it is resolved
-/// ([`crate::ecosystem::target::resolve`]).
+/// (`crate::ecosystem::target::resolve`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub struct CloneEntry {
+    /// Built-in rules to start from, such as `npm` or `dart`.
     pub preset: Option<String>,
+    /// The project directory, relative to the worktree root.
     pub dir: Option<String>,
+    /// The directory to clone, relative to `dir`, when the preset names none.
     pub path: Option<String>,
+    /// Files whose contents decide whether a cache entry fits.
     pub key: Option<Vec<String>>,
+    /// Commands whose output is added to the cache key.
     pub key_commands: Option<Vec<String>>,
+    /// The command that installs the directory when no entry fits.
     pub install: Option<String>,
+    /// A command that must succeed for a cloned directory to be used.
     pub verify: Option<String>,
+    /// Rewrite absolute paths in the clone to the new worktree.
     pub rewrite_paths: Option<bool>,
+    /// Entries (by `dir`) that this one is made after.
     pub after: Option<Vec<String>>,
 }
 
@@ -113,13 +130,19 @@ pub const CLONE_KEYS: [&str; 9] = [
 
 /// `[pool]`: how many ready worktrees to keep.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub struct PoolConfig {
+    /// The number of ready worktrees to keep.
     pub size: Option<u32>,
 }
 
+/// A `[[post_add]]` or `[[pre_remove]]` entry.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub struct Hook {
+    /// The shell command, run with `sh -c`.
     pub run: String,
+    /// A tool that must be installed, or the hook is skipped silently.
     pub requires: Option<String>,
 }
 
@@ -127,10 +150,14 @@ pub struct Hook {
 /// pair of files (relative to the project directory) is byte-identical. A
 /// missing file never counts as identical, so the script runs.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[non_exhaustive]
 pub struct SkipLifecycle {
+    /// The project directory, relative to the worktree root.
     #[serde(default = "root_dir")]
     pub dir: String,
+    /// The lifecycle script to skip, such as `postinstall`.
     pub script: String,
+    /// Pairs of files that must be byte-identical for the skip to apply.
     pub if_equal: Vec<[String; 2]>,
 }
 
@@ -187,21 +214,22 @@ impl Stage {
 impl Config {
     /// Read `<root>/.fast-worktree.toml`. A missing file is an empty
     /// config; unknown keys are reported on stderr and ignored.
-    pub fn load(root: &Path) -> Result<Config> {
+    pub(crate) fn load(root: &Path) -> Result<Config> {
         let path = root.join(FILE);
         let text = match std::fs::read_to_string(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
-            Err(e) => return Err(Error(format!("{}: {e}", path.display()))),
+            Err(e) => return Err(Error::of(Kind::Config, format!("{}: {e}", path.display()))),
         };
-        let (cfg, warnings) = parse(&text).map_err(|e| Error(format!("{FILE}: {e}")))?;
+        let (cfg, warnings) =
+            parse(&text).map_err(|e| Error::of(Kind::Config, format!("{FILE}: {e}")))?;
         for w in warnings {
             errln!("fast-worktree: {FILE}: {w}");
         }
         Ok(cfg)
     }
 
-    pub fn hooks(&self, stage: Stage) -> &[Hook] {
+    pub(crate) fn hooks(&self, stage: Stage) -> &[Hook] {
         match stage {
             Stage::PostAdd => &self.post_add,
             Stage::PreRemove => &self.pre_remove,
@@ -343,10 +371,10 @@ pub fn user_pool_size() -> Result<Option<u32>> {
     let text = match std::fs::read_to_string(&path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(Error(format!("{}: {e}", path.display()))),
+        Err(e) => return Err(Error::msg(format!("{}: {e}", path.display()))),
     };
     let (size, warnings) =
-        parse_user(&text).map_err(|e| Error(format!("{}: {e}", path.display())))?;
+        parse_user(&text).map_err(|e| Error::msg(format!("{}: {e}", path.display())))?;
     for w in warnings {
         errln!("fast-worktree: {}: {w}", path.display());
     }
@@ -392,7 +420,7 @@ pub fn run(cfg: &Config, stage: Stage, worktree: &Path, main_checkout: &Path) ->
         if let Some(p) = path_with(extra_path) {
             c.env("PATH", p);
         }
-        let ok = match c.status() {
+        let ok = match util::run_status(&mut c) {
             Ok(s) if s.success() => true,
             Ok(s) => {
                 errln!("FAILED hook {}: {} ({s})", stage.name(), hook.run);

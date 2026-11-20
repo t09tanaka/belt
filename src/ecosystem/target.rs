@@ -487,7 +487,7 @@ pub fn targets(root: &Path, cfg: &Config) -> Result<Vec<Target>> {
         let names: Vec<String> = found.iter().map(Target::label).collect();
         let problems = check_each(root, &found, &names);
         if let Some((_, e)) = problems.iter().find(|(i, _)| i.is_none()) {
-            return Err(Error(e.clone()));
+            return Err(Error::msg(e.clone()));
         }
         for (_, e) in &problems {
             warn_once(format!(
@@ -502,11 +502,11 @@ pub fn targets(root: &Path, cfg: &Config) -> Result<Vec<Target>> {
             .map(|(_, t)| t)
             .collect());
     }
-    let found = resolve(&cfg.clone).map_err(|e| Error(format!("{file}: {}", e.join("; "))))?;
+    let found = resolve(&cfg.clone).map_err(|e| Error::msg(format!("{file}: {}", e.join("; "))))?;
     let names: Vec<String> = (0..found.len()).map(|i| format!("clone[{i}]")).collect();
     let errors = check_fs(root, &found, &names);
     if !errors.is_empty() {
-        return Err(Error(format!("{file}: {}", errors.join("; "))));
+        return Err(Error::msg(format!("{file}: {}", errors.join("; "))));
     }
     Ok(found)
 }
@@ -706,7 +706,7 @@ install = "pod install""#)
         let bad = crate::hooks::parse("[[clone]]\npreset = \"none\"\n")
             .unwrap()
             .0;
-        let e = targets(root, &bad).unwrap_err().0;
+        let e = targets(root, &bad).unwrap_err().msg;
         assert!(
             e.starts_with(".fast-worktree.toml: clone[0]: unknown preset"),
             "{e}"
@@ -752,7 +752,7 @@ install = "pod install""#)
         )
         .unwrap()
         .0;
-        let e = targets(root, &cfg).unwrap_err().0;
+        let e = targets(root, &cfg).unwrap_err().msg;
         assert!(
             e.starts_with(
                 ".fast-worktree.toml: clone[0]: path `api/node_modules` holds tracked files"

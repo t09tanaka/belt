@@ -1,6 +1,6 @@
 //! Thin wrappers around the `git` CLI.
 
-use crate::error::{bail, Error, Result};
+use crate::error::{bail, Error, Kind, Result};
 use std::fs::{self, File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
@@ -36,10 +36,13 @@ pub fn output_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Resul
         .args(args)
         .envs(env.iter().copied())
         .output()
-        .map_err(|e| Error(format!("cannot run git: {e}")))?;
+        .map_err(|e| Error::of(Kind::Git, format!("cannot run git: {e}")))?;
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        bail!("git {}: {}", args.join(" "), err.trim());
+        return Err(Error::of(
+            Kind::Git,
+            format!("git {}: {}", args.join(" "), err.trim()),
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -49,14 +52,17 @@ pub fn output_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Resul
 /// environment variables for git and its hooks.
 pub fn run_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<()> {
     let registration = registration_lock(dir)?;
-    let status = command(dir)
-        .env(REGISTRATION_OWNER, &registration.key)
+    let mut c = command(dir);
+    c.env(REGISTRATION_OWNER, &registration.key)
         .args(args)
-        .envs(env.iter().copied())
-        .status()
-        .map_err(|e| Error(format!("cannot run git: {e}")))?;
+        .envs(env.iter().copied());
+    let status = crate::util::run_status(&mut c)
+        .map_err(|e| Error::of(Kind::Git, format!("cannot run git: {e}")))?;
     if !status.success() {
-        bail!("git {} failed ({status})", args.join(" "));
+        return Err(Error::of(
+            Kind::Git,
+            format!("git {} failed ({status})", args.join(" ")),
+        ));
     }
     Ok(())
 }
@@ -210,7 +216,7 @@ pub fn unregister(admin: &Path) -> Result<()> {
     let common = admin
         .parent()
         .and_then(Path::parent)
-        .ok_or_else(|| Error("not a worktree administrative directory".into()))?;
+        .ok_or_else(|| Error::msg("not a worktree administrative directory"))?;
     let _registration = lock_common(common)?;
     let is_entry = admin
         .parent()
@@ -219,7 +225,7 @@ pub fn unregister(admin: &Path) -> Result<()> {
     if !is_entry {
         bail!("{}: not a worktree entry; left alone", admin.display());
     }
-    fs::remove_dir_all(admin).map_err(|e| Error(format!("{}: {e}", admin.display())))
+    fs::remove_dir_all(admin).map_err(|e| Error::msg(format!("{}: {e}", admin.display())))
 }
 
 /// Tracked files under `root` matching the pathspecs, relative to `root`.
@@ -434,7 +440,7 @@ pub fn fetch_quietly(dir: &Path, branch: &str, limit: Option<Duration>) -> Resul
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| Error(format!("cannot run git: {e}")))?;
+        .map_err(|e| Error::of(Kind::Git, format!("cannot run git: {e}")))?;
     let start = Instant::now();
     loop {
         match child.try_wait()? {
@@ -462,8 +468,8 @@ pub fn origin_default_branch(dir: &Path) -> Result<String> {
         return Ok(b);
     }
     output(dir, &["remote", "set-head", "origin", "-a"])
-        .map_err(|e| Error(format!("cannot resolve origin's default branch: {e}")))?;
-    origin_head(dir).ok_or_else(|| Error("cannot resolve origin's default branch".into()))
+        .map_err(|e| Error::msg(format!("cannot resolve origin's default branch: {e}")))?;
+    origin_head(dir).ok_or_else(|| Error::msg("cannot resolve origin's default branch"))
 }
 
 /// Origin's default branch as `refs/remotes/origin/HEAD` records it, without

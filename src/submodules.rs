@@ -122,7 +122,7 @@ pub fn embed(plan: &[Embed]) -> Result<()> {
         match embed_one(e) {
             Ok(undo) => done.push((e, undo)),
             Err(err) => {
-                let mut msg = err.0;
+                let mut msg = err.msg;
                 for (e, undo) in done.iter().rev() {
                     if let Err(why) = unembed(e, undo) {
                         msg.push_str(&format!(
@@ -132,7 +132,7 @@ pub fn embed(plan: &[Embed]) -> Result<()> {
                         ));
                     }
                 }
-                return Err(Error(msg));
+                return Err(Error::msg(msg));
             }
         }
     }
@@ -161,7 +161,7 @@ fn config_args<'a>(config: &'a str, rest: &[&'a str]) -> Vec<&'a str> {
 /// it fails.
 fn embed_one(e: &Embed) -> Result<Undo> {
     let dot = e.work.join(".git");
-    let link = fs::read(&dot).map_err(|err| Error(format!("{}: {err}", dot.display())))?;
+    let link = fs::read(&dot).map_err(|err| Error::msg(format!("{}: {err}", dot.display())))?;
     let config = e.git_dir.join("config").to_string_lossy().into_owned();
     let worktree = git::output(
         Path::new(NEUTRAL),
@@ -169,10 +169,10 @@ fn embed_one(e: &Embed) -> Result<Undo> {
     )
     .ok()
     .map(|s| s.trim_end_matches('\n').to_string());
-    fs::remove_file(&dot).map_err(|err| Error(format!("{}: {err}", dot.display())))?;
+    fs::remove_file(&dot).map_err(|err| Error::msg(format!("{}: {err}", dot.display())))?;
     if let Err(err) = fs::rename(&e.git_dir, &dot) {
         let _ = fs::write(&dot, &link);
-        return Err(Error(format!(
+        return Err(Error::msg(format!(
             "cannot move {} to {}: {err}",
             e.git_dir.display(),
             dot.display()

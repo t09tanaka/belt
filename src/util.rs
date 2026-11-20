@@ -1,5 +1,6 @@
 //! Small helpers shared by the commands.
 
+use std::cell::RefCell;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -11,11 +12,92 @@ pub fn home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Which stream a line of output belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stream {
+    Stdout,
+    Stderr,
+}
+
+pub type Sink = Box<dyn FnMut(Stream, &str)>;
+
+/// What the library sets for the duration of one call: where the output
+/// goes instead of the terminal, and which executable runs the detached
+/// helper commands (`pool fill`, `install --changed`). The CLI sets nothing:
+/// output goes to stdout and stderr, and the helper is the running binary.
+struct Context {
+    /// `None`: stdout and stderr, and what a child writes goes there
+    /// directly.
+    sink: Option<Sink>,
+    exe: Option<PathBuf>,
+}
+
+thread_local! {
+    static CONTEXT: RefCell<Option<Context>> = const { RefCell::new(None) };
+}
+
+/// Run `f` with the output of this thread sent to `sink`, and `exe` as the
+/// helper executable. Nests; the previous context is restored.
+pub fn with_context<T>(sink: Option<Sink>, exe: Option<PathBuf>, f: impl FnOnce() -> T) -> T {
+    let prev = CONTEXT.with(|c| c.borrow_mut().replace(Context { sink, exe }));
+    struct Restore(Option<Context>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prev = self.0.take();
+            CONTEXT.with(|c| *c.borrow_mut() = prev);
+        }
+    }
+    let _restore = Restore(prev);
+    f()
+}
+
+fn to_sink(stream: Stream, s: &str) -> bool {
+    CONTEXT.with(|c| match c.borrow_mut().as_mut() {
+        Some(Context {
+            sink: Some(sink), ..
+        }) => {
+            sink(stream, s);
+            true
+        }
+        _ => false,
+    })
+}
+
+/// The executable that runs `pool fill` and `install --changed` detached:
+/// the running binary, or the one the embedding program configured.
+pub fn helper_exe() -> std::io::Result<PathBuf> {
+    let configured = CONTEXT.with(|c| c.borrow().as_ref().map(|ctx| ctx.exe.clone()));
+    match configured {
+        None => env::current_exe(),
+        Some(Some(exe)) => Ok(exe),
+        Some(None) => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "no `fast-worktree` executable is configured for background work",
+        )),
+    }
+}
+
+/// `Command::status`, except that while the library captures output, what
+/// the command writes goes to the sink too and not to this process's own
+/// stdout and stderr.
+pub fn run_status(c: &mut std::process::Command) -> std::io::Result<std::process::ExitStatus> {
+    if !CONTEXT.with(|ctx| ctx.borrow().as_ref().is_some_and(|c| c.sink.is_some())) {
+        return c.status();
+    }
+    let out = c.output()?;
+    to_sink(Stream::Stdout, &String::from_utf8_lossy(&out.stdout));
+    to_sink(Stream::Stderr, &String::from_utf8_lossy(&out.stderr));
+    Ok(out.status)
+}
+
 /// Write to stdout, ignoring errors. `print!` panics when stdout is a pipe
 /// whose reader has gone (EPIPE); `check` promises to exit 0 whatever
 /// happens to its output.
 pub fn say(s: &str) {
     use std::io::Write;
+    if to_sink(Stream::Stdout, s) {
+        return;
+    }
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(s.as_bytes()).and_then(|()| out.flush());
 }
@@ -23,6 +105,9 @@ pub fn say(s: &str) {
 /// [`say`] for stderr.
 pub fn warn(s: &str) {
     use std::io::Write;
+    if to_sink(Stream::Stderr, s) {
+        return;
+    }
     let _ = std::io::stderr().lock().write_all(s.as_bytes());
 }
 

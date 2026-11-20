@@ -1,6 +1,6 @@
 [package]
 name = "fast-worktree"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 rust-version = "1.89"
 description = "Create a git worktree with its dependencies in seconds, and remove it in one"
@@ -11,8 +11,23 @@ keywords = ["git", "worktree", "npm", "flutter", "dev-tools"]
 categories = ["command-line-utilities", "development-tools"]
 include = ["src/**/*", "tests/**/*", "examples/**/*", "README.md", "CHANGELOG.md", "LICENSE"]
 
+[lib]
+name = "fast_worktree"
+path = "src/lib.rs"
+
+[[bin]]
+name = "fast-worktree"
+path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+# The command-line parser. Programs that only use the library can build with
+# `default-features = false` and leave clap out.
+cli = ["dep:clap"]
+
 [dependencies]
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"

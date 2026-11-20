@@ -1229,6 +1229,59 @@ The time a step waited for the lock is shown apart from the time it took:
 fails with `could not lock config file` (something else had it) is tried
 again, at most twice.
 
+## Library usage
+
+The crate is also a library, for programs that create and remove worktrees
+themselves, such as a task runner that gives every attempt its own checkout.
+It does what the command does, with the same pool, cache, hooks, trash and
+kept refs in the same places, so an embedding program and the command can work
+on the same repository and state directories at the same time.
+
+```toml
+[dependencies]
+# `default-features = false` leaves the command-line parser (clap) out.
+fast-worktree = { version = "0.5", default-features = false }
+```
+
+```rust
+use fast_worktree::{Checkout, CreateOptions, Output, RemoveMode, RemoveOptions, Repository, Start};
+
+let repo = Repository::open("/work/app")?.with_output(Output::Capture);
+
+// A detached worktree at a commit, with its dependencies; a spare from the
+// pool when one is ready.
+let made = repo.create_worktree(&CreateOptions::new(
+    "/work/attempts/42",
+    Checkout::Detached(Start::Rev("3f2c1ab".into())),
+))?;
+assert!(made.setup_ok);
+
+// Removed at once; the files are deleted in the background.
+repo.remove_worktree(&made.path, &RemoveOptions::new(RemoveMode::Discard))?;
+
+// What applies to the repository: `.fast-worktree.toml`, the pool size and
+// `.worktreeinclude`.
+let cfg = repo.config()?;
+```
+
+- `Repository::create_worktree` is `add`: a new branch, an existing branch or
+  a detached `HEAD`, starting at a revision or at origin's default branch.
+- `Repository::remove_worktree` is `remove` (`RemoveMode::Strict`, which
+  refuses a dirty worktree) or `hook remove` (`RemoveMode::Discard`, which
+  keeps what has changes in the trash for a day and its `HEAD` in
+  `refs/fast-worktree/kept/`). `kept_refs`, `prune_kept_refs` and
+  `sweep_trash` manage what removals leave.
+- `Repository::fill_pool` fills the pool in the calling thread. After a
+  worktree is created, the command refills the pool in the background with
+  `fast-worktree pool fill`; the library does so with the `fast-worktree`
+  executable it finds on `PATH` or in `~/.cargo/bin` (or `with_helper`),
+  and does not refill without one.
+- Errors are one `Error` enum (`Refused`, `BranchNotMerged`, `Config`, `Git`,
+  `Io`, `Failed`). Progress lines go where `Output` says: the terminal (as the
+  command), nowhere, or the `log` of the result.
+
+The API is documented on [docs.rs](https://docs.rs/fast-worktree).
+
 ## Platforms
 
 Cloning needs macOS `clonefile(2)`. On other platforms the clone and delta
