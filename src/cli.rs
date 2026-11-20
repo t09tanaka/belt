@@ -49,6 +49,12 @@ pub enum Command {
     Submit(SubmitArgs),
     /// List runs and tasks.
     Ls(ListArgs),
+    /// Watch workers and outstanding tasks (q, Esc or Ctrl-C to quit).
+    Top {
+        /// Refresh interval in seconds (0.2 to 3600).
+        #[arg(long, default_value = "1", value_parser = crate::service::top::interval)]
+        interval: std::time::Duration,
+    },
     /// Show one run or task.
     Show(ShowArgs),
     /// Show logs.
@@ -356,6 +362,9 @@ impl Envelope {
 
 /// Run a parsed command and return the process exit code.
 pub fn run(cli: Cli) -> i32 {
+    if let Command::Top { interval } = &cli.command {
+        return crate::service::top::command(*interval, cli.json);
+    }
     if let Command::ToolchainInstall { request, binding } = &cli.command {
         return crate::toolchain::preparation::helper_main(request, binding);
     }

@@ -1403,7 +1403,14 @@ fn open_sources(state: &std::path::Path) -> remote_task_runner::source::SourceSt
     }
 }
 pub(super) fn control_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
-    let (root, spec) = fixture();
+    control_fixture_with(|_| {})
+}
+
+pub(super) fn control_fixture_with(
+    configure: impl FnOnce(&mut Spec),
+) -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
+    let (root, mut spec) = fixture();
+    configure(&mut spec);
     let config = root.path().join(".config/remote-task-runner");
     std::fs::create_dir_all(&config).unwrap();
     std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();

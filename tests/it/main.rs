@@ -44,3 +44,5 @@ mod test_tmp_root;
 
 mod workers_lifecycle;
 mod workers_upgrade;
+
+mod top;
