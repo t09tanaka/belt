@@ -52,7 +52,7 @@
 13. worker間のツール版・入力ファイルの差を検出し、自動で揃えられるものは揃え、揃えられないものは理由と手順を示す（第22章）。
 14. Linux（x86_64・arm64）のworkerを、macOSと同じ契約で常駐・導入・更新できる。常駐しない一時worker（Google Colab等）を、親からSSH経由で使い、消滅を利用者が宣言できる（第15章）。
 15. workerのattempt workspaceを、プロジェクトの `.fast-worktree.toml` と `.worktreeinclude` をそのまま使ってfast-worktreeで作り、消す（22.5）。
-16. どのnodeからでも投入でき、投入したnodeがそのrunの親になる。1つのworkerが複数の親の仕事を受け、取り合いをworkerの側で調停する。親が1つ落ちても、他の親のrunは共有workerの上で続く（第24章）。
+16. `init` 済みのどのnodeからでも投入でき、投入したnodeがそのrunの親になる。1つのworkerが複数の親の仕事を受け、取り合いをworkerの側で調停する。親が1つ落ちても、他の親のrunは共有workerの上で続く（第24章）。
 17. 遅い・応答しないpeerが1台あっても、CLIの応答と他のpeerとのやり取りを止めない（24.7）。
 18. nodeが自分のresidentを更新できる（24.8）。
 
@@ -135,13 +135,15 @@ belt workers forget colab-1
 belt estimate --json -- pnpm test
 ```
 
+相手のnodeはほかの親にも使われ、自分でも親になり得る（第24章）。`drain`・`resume` は実行した親との関係だけに働き、workerはその親からの新しいsubmitだけを止める（ほかの親の仕事は受け続ける）。`stop` はnodeのresident（親とworkerの両方の役割）を止める操作なので、相手がほかの親を信頼しているか、自分でも親の役割を持つときは、理由を示して断る。`stop --all-parents` を明示したときだけ、すべての親に対するdrainの後に止める（そのnodeが親のrunは、親processの停止と同じ扱いになる。24.6）。`start` はresidentを起動し、両方の役割が戻る。
+
 `drain` は新規配置を止め、受理済みの仕事は完了させる。通常の `stop` はdrainして終了を待ってから停止する。即時停止は `stop --cancel-running` で明示し、停止確認まで追跡する。到達不能なら停止済みにはしない。`upgrade` は `workers upgrade <worker> --binary <path>` で、親とOS・archの違うworker向けのbuildを指定できる。`diff`／`sync` は第22章で定める。`forget` は、到達できなくなった一時workerの消滅を利用者が宣言する操作で、第15章で定める。一時workerは `workers add <worker> --ssh <dest> --ephemeral` で登録する。
 
 ## peerの管理
 
 ```sh
 belt peers
-belt peers trust <name> --cluster <cluster-id> --coordinator <coordinator-id> --key-file <path>
+belt peers trust <name> --cluster <cluster-id> [--coordinator <coordinator-id>] --key-file <path>
 belt peers revoke <name>
 belt upgrade
 ```
@@ -1651,6 +1653,7 @@ Runtime tests invoke only private owned TempDir state; no production user-state 
 workerは「信頼する親」の一覧をworker DBに持つ。1行は、`cluster_id`、`coordinator_id`、表示名、その親が付けた `worker_id`、その親のcluster鍵（22.3）の参照、状態（`trusted`・`revoking`・`revoked`）、その親について見た最大の `coordinator_epoch` を持つ。
 
 - **登録**: 経路は2つある。(a) 親が `workers add <worker> --ssh <dest>`（`--install` の有無を問わない）を実行すると、SSH越しの固定helperが、その親をworkerの一覧へ登録する。そのOS userへSSHで入れることを信頼の根拠とする（従来の導入と同じ根拠）。(b) workerの利用者が、そのnodeで `belt peers trust` を実行する（一時workerや、親に書かせたくない場合）。どちらも冪等で、同じ内容の再登録は何も変えない。
+- **`coordinator_id` の決まり方**: 登録のときに与えられなかった行（既存のworkerから移行した最初の行、`worker --ephemeral` の起動時の指定、`--coordinator` を省いた `peers trust`）は、その `cluster_id` で最初に受け付けたhelloの `coordinator_id` を記録し、以後はその値に固定する。
 - **local worker**: `init` が自分のnodeの親を登録する。この行は取り消せない（`peers revoke` は拒否する）。
 - **1つのclusterに親は1つ**: 登録済みの `cluster_id` に別の `coordinator_id` でhelloが来たら断る（親DBのcopyを別のマシンで起動した場合に当たる。第18章）。取り消した `cluster_id` は登録し直せない。親を作り直したときは、新しい `cluster_id` で登録する。
 - **helloの判定**: workerは、helloの `cluster_id`・`coordinator_id` を一覧と照らす。一覧に無い親、`revoking`・`revoked` の親、退役を告げられたidentity（24.3）のままの接続は、attachさせずに断る。feature `parent_identity_v1` を示した親には、断る理由（`parent_not_trusted`・`parent_revoked`・`identity_retired`）を答えに付ける。示していない親には従来どおり理由なしの `PROTOCOL_INCOMPATIBLE` を返す。
