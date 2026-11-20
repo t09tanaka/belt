@@ -499,6 +499,21 @@ async fn a52_a_worker_that_refused_for_capacity_gets_nothing_until_it_answers_ro
     let waiting = events(&c, EVENT_TASK_WAITING);
     assert_eq!(waiting.len(), 1);
     assert_eq!(waiting[0]["blocked_reason"], "capacity");
+    let before_events = c.store().events_after(0, 10_000).unwrap();
+    let before_attempts = attempts(&c, &task);
+    for _ in 0..100 {
+        let preview = c.estimate_task(task.clone()).await.unwrap();
+        assert_eq!(
+            excluded(&preview.decision.unwrap()),
+            [("w-a", Exclusion::Capacity)]
+        );
+    }
+    assert_eq!(before_events, c.store().events_after(0, 10_000).unwrap());
+    assert_eq!(before_attempts, attempts(&c, &task));
+    assert_eq!(queued(&c), vec![task.clone()]);
+    let report = c.tick().await.unwrap();
+    assert!(report.placed.is_empty());
+    assert_eq!(a.received(Op::Submit), 2);
     // The worker answers room: it is a candidate again, and the task goes
     // there as its next generation.
     a.set(|s| {

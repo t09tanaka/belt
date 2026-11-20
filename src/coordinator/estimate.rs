@@ -225,6 +225,7 @@ impl Coordinator {
                     // As the next placement would see it: a worker that
                     // refused for capacity is out until it answers room,
                     // and this answer is what the placement would read.
+                    // Do not clear the shared set: only placement does that.
                     let window_refused = capacity_refused.contains(&worker_id)
                         && !policy::answers_room(inspect.admission.as_ref());
                     let limits = self.cfg.limits.stricter(Limits {
@@ -671,6 +672,86 @@ mod tests {
             })
         }
     }
+    struct AdmissionReader {
+        room: std::sync::atomic::AtomicBool,
+    }
+    impl WorkerLink for AdmissionReader {
+        fn call(&self, _: Request) -> super::super::link::LinkFuture<'_> {
+            panic!("estimate entered mutation-aware link")
+        }
+        fn read_only_call(&self, request: Request) -> super::super::link::LinkFuture<'_> {
+            Box::pin(async move {
+                if !matches!(request, Request::Inspect(_)) {
+                    return Err(LinkError::Unconfirmed);
+                }
+                let used = u64::from(!self.room.load(Ordering::SeqCst));
+                Ok(Response::Inspect(crate::wire::InspectResponse {
+                    admission: Some(crate::wire::AdmissionWindow {
+                        limit: 1,
+                        used,
+                        own: used,
+                        foreign: 0,
+                    }),
+                    preparation_observations: None,
+                    capabilities: None,
+                    schema_version: SchemaVersion::CURRENT,
+                    worker_id: WorkerId::parse("readonly").unwrap(),
+                    worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
+                    agent_epoch: AgentEpoch(1),
+                    snapshot_digest: Digest::of_bytes(b"s"),
+                    policy_digest: Digest::of_bytes(b"p"),
+                    active_task: 0,
+                    prefetch_pending: 0,
+                    max_active_task: 1,
+                    prefetch_per_worker: 0,
+                    disk_free_bytes: 1,
+                    draining: false,
+                }))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn capacity_estimates_preserve_the_refusal_set_and_every_durable_row() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+        let c = Coordinator::start(store, CoordinatorConfig::default()).unwrap();
+        let worker = WorkerId::parse("readonly").unwrap();
+        let link = Arc::new(AdmissionReader {
+            room: std::sync::atomic::AtomicBool::new(false),
+        });
+        c.attach(worker.clone(), link.clone()).await;
+        c.capacity_refused.lock().unwrap().insert(worker.clone());
+        let refused = c.refused_for_capacity();
+        // Includes events and every other table, not just queued tasks.
+        let before = c.store().snapshot_rows_for_test();
+        for room in [false, true] {
+            link.room.store(room, Ordering::SeqCst);
+            for _ in 0..100 {
+                let answer = c
+                    .estimate(crate::service::estimate::Query {
+                        version: 1,
+                        argv: vec!["echo".into()],
+                        repository_id: None,
+                        cwd_relative: String::new(),
+                        requirements: Default::default(),
+                    })
+                    .await
+                    .unwrap();
+                let decision = answer.decision.unwrap();
+                assert_eq!(
+                    decision
+                        .excluded
+                        .iter()
+                        .any(|e| { e.worker_id == worker && e.why == Exclusion::Capacity }),
+                    !room
+                );
+                assert_eq!(refused, c.refused_for_capacity());
+                assert_eq!(before, c.store().snapshot_rows_for_test());
+            }
+        }
+    }
+
     #[tokio::test]
     async fn estimate_100_calls_preserve_every_durable_row_epoch_and_actor_state() {
         let dir = crate::test_tmp::tempdir().unwrap();
