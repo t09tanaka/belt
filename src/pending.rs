@@ -171,7 +171,10 @@ pub fn spawn(root: &Path, dirs: &[String]) -> io::Result<()> {
         c.env_remove(v);
     }
     match c.spawn() {
-        Ok(_) => Ok(()),
+        Ok(child) => {
+            crate::util::release(child);
+            Ok(())
+        }
         Err(e) => {
             let _ = fs::remove_file(dir.join(MARKER));
             Err(e)

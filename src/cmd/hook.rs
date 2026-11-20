@@ -223,6 +223,8 @@ pub struct Discarded {
     /// its files stay in the trash for [`KEEP_SECS`] instead of being
     /// deleted at once.
     pub kept: bool,
+    /// Git no longer lists the worktree.
+    pub complete: bool,
 }
 
 /// What `hook remove` does for `given` (see the module description).
@@ -240,6 +242,7 @@ pub fn discard(given: &Path, cwd: Option<&Path>) -> Result<Discarded> {
         return Ok(Discarded {
             trash: None,
             kept: false,
+            complete: true,
         });
     }
     let path = given
@@ -406,6 +409,7 @@ pub fn discard(given: &Path, cwd: Option<&Path>) -> Result<Discarded> {
         util::tilde(&path),
         util::tilde(&dest)
     );
+    let unregistered_ok = unregistered.is_ok();
     if let Err(e) = unregistered {
         errln!("fast-worktree: git still lists it ({e})");
     }
@@ -514,6 +518,7 @@ pub fn discard(given: &Path, cwd: Option<&Path>) -> Result<Discarded> {
     Ok(Discarded {
         trash: Some(dest),
         kept: keep,
+        complete: unregistered_ok,
     })
 }
 

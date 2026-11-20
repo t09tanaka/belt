@@ -322,7 +322,7 @@ fn try_spawn_fill(main: &Path, pool: &Path, after: Option<&Path>) -> io::Result<
     for v in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX"] {
         c.env_remove(v);
     }
-    c.spawn().map(|_| ())
+    c.spawn().map(util::release)
 }
 
 /// An exclusive `flock` on `pool/fill.lock`, held while the value lives.

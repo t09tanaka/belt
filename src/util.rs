@@ -3,6 +3,7 @@
 use std::cell::RefCell;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 pub fn home() -> PathBuf {
@@ -10,6 +11,27 @@ pub fn home() -> PathBuf {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+static EMBEDDED: AtomicBool = AtomicBool::new(false);
+
+/// Mark this process as one that embeds the library: it lives on after a
+/// command would have exited, so the detached children it starts must be
+/// reaped (see [`release`]).
+pub fn set_embedded() {
+    EMBEDDED.store(true, Ordering::Relaxed);
+}
+
+/// Let go of a detached child that is not waited for. The command exits
+/// soon after, and init reaps the child; a long-lived embedding process
+/// would keep a zombie for every one, so a thread waits for it there.
+pub fn release(child: std::process::Child) {
+    if EMBEDDED.load(Ordering::Relaxed) {
+        std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+    }
 }
 
 /// Which stream a line of output belongs to.

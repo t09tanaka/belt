@@ -400,6 +400,7 @@ impl Repository {
     /// worktree of it. The helper executable is looked up here (see the
     /// crate docs).
     pub fn open(dir: impl AsRef<Path>) -> Result<Repository> {
+        util::set_embedded();
         let top = git::toplevel(dir.as_ref())?;
         let main = cmd::install::main_checkout(&top)?;
         Ok(Repository {
@@ -531,7 +532,7 @@ impl Repository {
                         trash: d.trash,
                         kept: d.kept,
                         branch_deleted: false,
-                        complete: true,
+                        complete: d.complete,
                         log: Vec::new(),
                     }
                 }
@@ -637,5 +638,6 @@ impl Repository {
 /// was kept for a day and is due, as every removal does before it moves its
 /// own worktree. Cheap when the trash is empty.
 pub fn sweep_trash() {
+    util::set_embedded();
     trash::sweep();
 }

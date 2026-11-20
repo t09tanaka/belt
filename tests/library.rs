@@ -79,6 +79,14 @@ fn entries(dir: &Path) -> usize {
     })
 }
 
+/// Wait until no background refill of the pool is running: a `pool fill`
+/// that finds the lock free runs to its end, and says nothing of another.
+fn settle(main: &Path) {
+    eventually(60, "the background refills to finish", || {
+        !cli_ok(main, &["pool", "fill"]).contains("another fill is running")
+    });
+}
+
 #[track_caller]
 fn assert_prepared(wt: &Path) {
     assert!(wt.join("gen/installed").is_file(), "no deps in {wt:?}");
@@ -139,14 +147,13 @@ fn the_library_and_the_cli_share_one_repository_and_one_state_directory() {
     let child = Command::new(BIN)
         .args(["pool", "fill"])
         .current_dir(&main)
-        .output();
-    let lib_fill = std::thread::scope(|s| {
-        let h = s.spawn(|| repo.fill_pool());
-        let c = child.unwrap();
-        assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
-        h.join().unwrap()
-    });
-    lib_fill.unwrap();
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    repo.fill_pool().unwrap();
+    let c = child.wait_with_output().unwrap();
+    assert!(c.status.success(), "{}", String::from_utf8_lossy(&c.stderr));
     // Whoever lost the race returned at once; wait for the winner.
     eventually(60, "two spares", || {
         cli_ok(&main, &["pool", "status"]).contains("2 of 2 ready")
@@ -215,6 +222,8 @@ fn the_library_and_the_cli_share_one_repository_and_one_state_directory() {
     }
     assert!(from_pool <= N);
     // Git's own bookkeeping is whole: nothing prunable, nothing half-made.
+    // First let the background refills that the creations started finish.
+    settle(&main);
     let listing = git(&main, &["worktree", "list", "--porcelain"]);
     assert!(!listing.contains("prunable"), "{listing}");
     for i in 0..N {
