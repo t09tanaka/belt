@@ -184,6 +184,15 @@ pub fn switch_to_next(key_path: &Path) -> std::io::Result<bool> {
     }
 }
 
+/// Whether the key with `fingerprint` is one this member still holds (its
+/// current key or, during a rotation, its next one). A connection that was
+/// proven with any other key is closed and proven again (spec 24.2), on the
+/// side that accepted it and on the side that made it. A key file that
+/// cannot be read holds nothing.
+pub fn still_holds(key_path: &Path, fingerprint: &str) -> bool {
+    load_keys(key_path).is_ok_and(|keys| keys.by_fingerprint(fingerprint).is_some())
+}
+
 /// A member that holds a next key was refused with `group_key_mismatch` by a
 /// peer that showed `peer_fingerprint`. When that is the fingerprint of the
 /// next key, the peer has already switched and the instruction to switch did
@@ -327,6 +336,12 @@ mod tests {
         assert_eq!(keys.current, first);
         assert!(keys.next.is_none());
         assert!(!switch_to_next(&path).unwrap(), "nothing to switch to");
+        assert!(still_holds(&path, &fingerprint(&first)));
+        assert!(!still_holds(&path, &fingerprint(&key(9))));
+        assert!(!still_holds(
+            &dir.path().join("absent"),
+            &fingerprint(&first)
+        ));
         assert!(!switch_if_peer_is_on_next(&path, &fingerprint(&first)).unwrap());
         // The first stage of a rotation hands over the next key.
         let second = key::init(&next_key_path(&path)).unwrap();

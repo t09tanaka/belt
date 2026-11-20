@@ -2072,6 +2072,17 @@ impl Agent {
         Some(current)
     }
 
+    /// Whether a member told this worker that the identity it answers with
+    /// is retired, and how many attempts (of any member) are still live
+    /// (`None`: not readable now). An ephemeral worker ends itself on these.
+    pub fn retirement(&self) -> (bool, Option<u64>) {
+        let told = self
+            .store
+            .identity_retired_by_any(self.cfg.advertised_boot())
+            .unwrap_or(false);
+        (told, self.store.count_nonterminal().ok())
+    }
+
     /// The fingerprint of the current group key, for a connection to watch.
     pub fn group_key_changes(&self) -> tokio::sync::watch::Receiver<String> {
         self.group_key.subscribe()

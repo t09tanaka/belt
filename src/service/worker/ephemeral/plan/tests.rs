@@ -112,3 +112,13 @@ fn state_is_removed_only_when_nothing_is_live() {
     assert!(!removable(Some(1)));
     assert!(!removable(None));
 }
+
+#[test]
+fn the_worker_ends_itself_only_after_the_notice_and_with_nothing_live() {
+    assert!(finished(true, Some(0)));
+    assert!(!finished(true, Some(1)), "an attempt of any member is live");
+    assert!(!finished(true, None), "the count could not be read");
+    assert!(!finished(false, Some(0)), "nobody retired this identity");
+    assert!(!finished(false, Some(2)));
+    assert!(!finished(false, None));
+}

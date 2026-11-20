@@ -311,6 +311,7 @@ async fn run(
     config: config::ResolvedConfig,
     boot_id: Option<WorkerBootId>,
 ) -> anyhow::Result<()> {
+    let ephemeral = boot_id.is_some();
     let owner = private_lock(&spec.state_dir, "worker-owner.lock")?;
     // Serialize enrollment against every Agent, including the combined resident.
     // Transfer the same descriptor into Agent; enrollment through DB open has no unlock gap.
@@ -377,10 +378,25 @@ async fn run(
             _ = terminate.recv() => break Ok(()),
             _ = ticker.tick(), if housekeeping.is_empty() => {
                 let agent = worker.agent.clone();
-                housekeeping.spawn_blocking(move || agent.tick());
+                housekeeping.spawn_blocking(move || {
+                    agent.tick();
+                    // An ephemeral worker whose identity a member retired
+                    // ends itself once nothing runs on it (spec 24.3).
+                    ephemeral && {
+                        let (told, live) = agent.retirement();
+                        ephemeral::plan::finished(told, live)
+                    }
+                });
             }
             Some(done) = housekeeping.join_next(), if !housekeeping.is_empty() => {
-                if let Err(e) = done { break Err(e.into()); }
+                match done {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        eprintln!("this worker's identity was retired and nothing runs on it: ending");
+                        break Ok(());
+                    }
+                    Err(e) => break Err(e.into()),
+                }
             },
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
             incoming = listener.accept() => match incoming {

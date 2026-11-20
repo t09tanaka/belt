@@ -257,6 +257,19 @@ async fn run_with_argv(
     }
 }
 
+/// Whether a link that was proven with the key of `proven_with` must be
+/// closed: this member holds that key no more. A coordinator without a group
+/// identity (none is set) has no key that could change.
+async fn outdated(key_path: Option<&Path>, proven_with: &str) -> bool {
+    let Some(path) = key_path.map(Path::to_path_buf) else {
+        return false;
+    };
+    let proven = proven_with.to_string();
+    !tokio::task::spawn_blocking(move || crate::group::still_holds(&path, &proven))
+        .await
+        .unwrap_or(false)
+}
+
 async fn session(
     config: &ResolvedConfig,
     worker: &WorkerSpec,
@@ -287,6 +300,10 @@ async fn session(
             return Err(anyhow::anyhow!(e.message));
         }
     };
+    // The key this link is proven with. Once this member holds it no more
+    // (it switched to the next key, by itself or told to), the link is
+    // closed and the next one proves with the new key (spec 24.2).
+    let proven_with = crate::group::fingerprint(&membership.key);
     let connected = tokio::select! {
         _=stop.changed()=>None,
         connected=connect(transport.io, ClientConfig::new(
@@ -322,6 +339,7 @@ async fn session(
                 _=child.child.as_mut().expect("owned child").wait()=>break,
                 _=jobs.join_next()=>break,
                 _=probe.tick()=> {
+                    if outdated(coordinator.group_key_path(), &proven_with).await { break; }
                     let alive = tokio::select! { _=stop.changed()=>false, result=client.ping(IO_TIMEOUT)=>result.is_ok() };
                     if !alive { break; }
                 }
@@ -343,3 +361,36 @@ async fn session(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod key_tests {
+    use super::outdated;
+    use crate::group;
+
+    /// A link of this member stays while the member holds the key it was
+    /// proven with, through the first stage of a rotation as well, and is
+    /// outdated as soon as the member has switched.
+    #[tokio::test]
+    async fn a_link_is_outdated_once_its_member_switched_the_key() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let path = dir.path().join("cluster.key");
+        crate::secrets::key::init(&path).unwrap();
+        let old = group::fingerprint(&group::load_keys(&path).unwrap().current);
+        assert!(!outdated(Some(&path), &old).await);
+        assert!(!outdated(None, &old).await, "no group identity, no key");
+        // The next key arrives: the link proven with the current one stays.
+        let next = dir.path().join("other.key");
+        crate::secrets::key::init(&next).unwrap();
+        std::fs::rename(&next, group::next_key_path(&path)).unwrap();
+        let new = group::fingerprint(group::load_keys(&path).unwrap().next.as_ref().unwrap());
+        assert_ne!(old, new);
+        assert!(!outdated(Some(&path), &old).await);
+        // The member switches by itself (a peer showed the next key).
+        assert!(group::switch_if_peer_is_on_next(&path, &new).unwrap());
+        assert!(outdated(Some(&path), &old).await);
+        assert!(!outdated(Some(&path), &new).await);
+        // A key that cannot be read proves nothing: the link goes.
+        std::fs::remove_file(&path).unwrap();
+        assert!(outdated(Some(&path), &new).await);
+    }
+}

@@ -638,6 +638,21 @@ impl WorkerStore {
         })
     }
 
+    /// Whether any member told this worker that it retired the identity
+    /// `boot`.
+    pub fn identity_retired_by_any(&self, boot: &WorkerBootId) -> Result<bool> {
+        let b = boot.to_string();
+        self.db.call(move |c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM retired_identity WHERE worker_boot_id = ?1 LIMIT 1",
+                [&b],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
+    }
+
     /// Whether this handle's member retired the identity `boot`.
     pub fn identity_retired(&self, boot: &WorkerBootId) -> Result<bool> {
         let (o, b) = (self.member_scope(), boot.to_string());

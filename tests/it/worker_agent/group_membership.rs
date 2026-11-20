@@ -664,6 +664,85 @@ async fn a_retired_identity_stops_that_members_attempts_now_and_refuses_it_from_
     dial(&f, &next, &main).await.unwrap();
 }
 
+/// The start of a prepared attempt looks at its lease first. A lease that
+/// was ended by the retirement notice (flagged, long before its time is up)
+/// ends the attempt there, `interrupted`, and its command never starts.
+/// That is for the retiring member's attempt that had not started: one of
+/// its attempts that already runs is stopped by its supervisor, and another
+/// member's attempt in the same place starts as if nothing had happened.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_ends_an_unstarted_attempt_whose_lease_was_ended_and_no_other() {
+    let f = fx();
+    f.admit_commands(3);
+    let agent = f.start("boot-1");
+    let (main, sub) = (member("main"), member("sub"));
+    let a = dial(&f, &agent, &main).await.unwrap().client;
+    let b = dial(&f, &agent, &sub).await.unwrap().client;
+    // Leases far longer than the test: no lease runs out by time here.
+    let long = |script: &str| {
+        let mut p = payload(script);
+        p.lease_ms = 600_000;
+        p
+    };
+    let marked = |tag: &str| {
+        let marker = f.path(&format!("{tag}-started"));
+        (format!("touch {}; sleep 600", marker.display()), marker)
+    };
+    // One attempt of the retiring member runs already.
+    let (running_script, running_marker) = marked("running");
+    let running = AttemptId::generate();
+    call(&a, request_of(&main, &running, &long(&running_script)))
+        .await
+        .unwrap();
+    wait_for("the first command to start", || running_marker.exists());
+    // Two more are accepted and held before their start: one of the
+    // retiring member, one of the other member.
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (unstarted_script, unstarted_marker) = marked("unstarted");
+    let other_marker = f.path("other-started");
+    let other_script = format!("touch {}", other_marker.display());
+    let (unstarted, other) = (AttemptId::generate(), AttemptId::generate());
+    call(&a, request_of(&main, &unstarted, &long(&unstarted_script)))
+        .await
+        .unwrap();
+    call(&b, request_of(&sub, &other, &long(&other_script)))
+        .await
+        .unwrap();
+    call(&a, retired_req(&main, &f.worker, "boot-1"))
+        .await
+        .unwrap();
+    // The notice flags the lease of both attempts of that member, and of
+    // no other.
+    let flagged = |x: &AttemptId| f.store().lease(x).unwrap().is_some_and(|(_, ended)| ended);
+    assert!(flagged(&unstarted) && flagged(&running));
+    assert!(!flagged(&other));
+    assert_ne!(
+        f.store().get(&unstarted).unwrap().unwrap().state,
+        AttemptState::Terminal,
+        "held before its start"
+    );
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+
+    // The unstarted one ends at its start, without a command.
+    assert_eq!(f.wait_terminal(&unstarted), Outcome::Interrupted);
+    assert!(!unstarted_marker.exists(), "its command started");
+    assert!(f.store().launches(&unstarted).unwrap().is_empty());
+    assert_eq!(events(&f, &unstarted, "lease_expired"), 1);
+    let ended = f.store().get(&unstarted).unwrap().unwrap();
+    assert_eq!(ended.cancel_requested_at_ms, None);
+    assert!(!ended.retired);
+    // The one that ran was stopped by its supervisor: it had a command.
+    assert_eq!(f.wait_terminal(&running), Outcome::Interrupted);
+    assert_eq!(f.store().launches(&running).unwrap().len(), 1);
+    // The other member's attempt starts and runs to its own end.
+    assert_eq!(f.wait_terminal(&other), Outcome::Succeeded);
+    assert!(other_marker.exists());
+    assert_eq!(events(&f, &other, "lease_expired"), 0);
+    assert_eq!(f.store().launches(&other).unwrap().len(), 1);
+    drop((a, b));
+    agent.shutdown();
+}
+
 async fn alive_on(c: &Client) -> bool {
     let inspect = Request::Inspect(InspectRequest {
         preparation_observations: None,

@@ -184,11 +184,11 @@ pub async fn serve_connection_offering(
                 // worker still accepts (the one that is current now) stays;
                 // any other is closed and the peer proves again.
                 let path = agent.config().group_key_path.clone();
-                let still = tokio::task::spawn_blocking(move || crate::group::load_keys(&path))
-                    .await
-                    .ok()
-                    .and_then(Result::ok)
-                    .is_some_and(|keys| keys.by_fingerprint(&proven_with).is_some());
+                let proven = proven_with.clone();
+                let still =
+                    tokio::task::spawn_blocking(move || crate::group::still_holds(&path, &proven))
+                        .await
+                        .unwrap_or(false);
                 if still {
                     continue;
                 }

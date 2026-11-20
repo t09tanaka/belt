@@ -14,7 +14,7 @@ use crate::service::worker_service::{live_attempts, Paths};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
-mod plan;
+pub(super) mod plan;
 
 /// The state directory this process created, and how to know it is still that one.
 struct Created {
