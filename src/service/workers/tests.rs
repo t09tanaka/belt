@@ -2837,3 +2837,5 @@ fn membership_move_refuses_foreign_live_attempts_and_uncollected_results() {
         assert_eq!(w.calls(), ["bootstrap"]);
     }
 }
+
+mod rotate;

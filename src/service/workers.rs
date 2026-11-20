@@ -622,6 +622,60 @@ pub fn registrations(env: &BTreeMap<String, String>) -> Result<Vec<Registered>, 
         .collect())
 }
 
+/// Remove only the named `[[workers]]` tables, atomically, keeping every other
+/// byte (comments and formatting included), like `register`.
+pub(super) fn remove_registrations(
+    env: &BTreeMap<String, String>,
+    names: &[String],
+) -> Result<(), ApiError> {
+    let (path, text) = read_user_config(env)?;
+    let before = registrations(env)?;
+    let kept = drop_worker_tables(&text, names)?;
+    let user = crate::config::parse::parse_user(&path.to_string_lossy(), &kept)
+        .map_err(|e| invalid(e.to_string()))?;
+    let expected: Vec<&str> = before
+        .iter()
+        .map(|w| w.id.as_str())
+        .filter(|id| !names.iter().any(|n| n == id))
+        .collect();
+    let left: Vec<&str> = user.workers.iter().map(|w| w.id.as_str()).collect();
+    if left != expected {
+        return Err(invalid(
+            "workers list could not be edited in place; remove the entries by hand",
+        ));
+    }
+    write_config(&path, &kept)
+}
+
+/// Split the text at table headers and drop each `[[workers]]` block whose
+/// `id` is named. A block runs from its header to the next header.
+fn drop_worker_tables(text: &str, names: &[String]) -> Result<String, ApiError> {
+    let mut blocks: Vec<String> = vec![String::new()];
+    for line in text.split_inclusive('\n') {
+        if line.trim_start().starts_with('[') {
+            blocks.push(String::new());
+        }
+        blocks.last_mut().expect("one block").push_str(line);
+    }
+    let mut out = String::new();
+    for block in blocks {
+        let header = block.lines().next().unwrap_or_default().trim();
+        if header.split('#').next().unwrap_or_default().trim() == "[[workers]]" {
+            let body: String = block.split_inclusive('\n').skip(1).collect();
+            let table: toml::Table = body.parse().map_err(|e| invalid(format!("{e}")))?;
+            if table
+                .get("id")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|id| names.iter().any(|n| n == id))
+            {
+                continue;
+            }
+        }
+        out.push_str(&block);
+    }
+    Ok(out)
+}
+
 /// Append one `[[workers]]` table, atomically, keeping every other byte.
 fn register(
     env: &BTreeMap<String, String>,

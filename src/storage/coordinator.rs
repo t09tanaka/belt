@@ -601,6 +601,18 @@ impl CoordinatorStore {
         )?))
     }
 
+    /// Record membership maintenance alongside a running coordinator without
+    /// taking its process lock or advancing its epoch.
+    pub(crate) fn membership_writer(state: &Path) -> Result<Self> {
+        let mut store = Self::open_read_only(state)?;
+        store.db = Db::open(
+            &state.join("coordinator.db"),
+            DbKind::Coordinator,
+            Access::ReadWrite,
+        )?;
+        Ok(store)
+    }
+
     /// Explicit, idle enrollment; keeps the member's coordinator identity.
     pub(crate) fn move_group(state: &Path, cluster: &ClusterId) -> Result<()> {
         let db = Db::open(

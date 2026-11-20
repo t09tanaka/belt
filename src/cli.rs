@@ -83,6 +83,8 @@ pub enum Command {
     /// Enroll a joining member using a bounded stdin request (internal).
     #[command(hide = true)]
     GroupJoinHelper,
+    #[command(hide = true)]
+    GroupRotateHelper,
     /// Manage workers.
     Workers(WorkersArgs),
     /// Run as a worker (internal).
@@ -98,6 +100,13 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum GroupSub {
+    /// Distribute and switch to a new group key, or resume an interrupted rotation.
+    RotateKey {
+        #[arg(long)]
+        remove: Vec<String>,
+        #[arg(long)]
+        skip: Vec<String>,
+    },
     /// Join through an existing member, registering both directions.
     Join {
         existing_member_ssh: String,
@@ -453,6 +462,9 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::Group { command } = &cli.command {
         return match command {
             None => crate::service::group::command(cli.json),
+            Some(GroupSub::RotateKey { remove, skip }) => {
+                crate::service::group::rotate::command(remove, skip, cli.json)
+            }
             Some(GroupSub::Join {
                 existing_member_ssh,
                 ssh,
@@ -464,6 +476,9 @@ pub fn run(cli: Cli) -> i32 {
                 cli.json,
             ),
         };
+    }
+    if matches!(cli.command, Command::GroupRotateHelper) {
+        return crate::service::group::rotate::helper_command();
     }
     if matches!(cli.command, Command::GroupJoinHelper) {
         return crate::service::group::join::helper_command();

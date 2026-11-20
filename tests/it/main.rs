@@ -48,3 +48,5 @@ mod workers_upgrade;
 mod top;
 
 mod group_join;
+
+mod group_rotate;
