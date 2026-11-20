@@ -267,7 +267,10 @@ impl LogPrefixReader {
         .into();
         let meta = file.metadata()?;
         if !meta.is_file() || meta.len() != size {
-            return Err(io::Error::other("artifact size/type mismatch").into());
+            // Not a fault of the read: the file is not the receipted one.
+            return Err(
+                io::Error::new(io::ErrorKind::InvalidData, "artifact size/type mismatch").into(),
+            );
         }
         Ok(file)
     }

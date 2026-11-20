@@ -4,7 +4,7 @@ use super::*;
 use crate::ci::artifact_exchange::CHUNK;
 use crate::ids::Digest;
 use crate::results::{
-    store::{ArtifactState, Publish},
+    store::{ArtifactState, Publish, StoreError},
     ResultStore,
 };
 use crate::storage::WorkflowUpload;
@@ -68,14 +68,23 @@ impl Coordinator {
             Ok(None) => return Ok(()),
             // What went wrong with this one action is the answer to it: the
             // step that asked fails, and the walk goes on to the next attempt.
-            Err(e) => {
-                let reason = action_failure(e)?;
-                eprintln!(
-                    "workflow artifact action of attempt {} failed: {reason}",
-                    live.record.attempt_id
-                );
-                ArtifactAnswer::Failed { reason }
-            }
+            Err(e) => match action_failure(e)? {
+                Failure::Answer(reason) => {
+                    eprintln!(
+                        "workflow artifact action of attempt {} failed: {reason}",
+                        live.record.attempt_id
+                    );
+                    ArtifactAnswer::Failed { reason }
+                }
+                // Nothing is answered: the next poll finds the same action.
+                Failure::Retry(why) => {
+                    eprintln!(
+                        "workflow artifact action of attempt {} is tried again: {why}",
+                        live.record.attempt_id
+                    );
+                    return Ok(());
+                }
+            },
         };
         self.artifact_call(
             link,
@@ -152,10 +161,10 @@ impl Coordinator {
                             ));
                         }
                         let files = ResultStore::open_read_only(&s.state_dir().join("results"))
-                            .map_err(store_error)?;
+                            .map_err(published_error)?;
                         let mut src = files
                             .open_artifact(&producer, &digest, f.size)
-                            .map_err(store_error)?;
+                            .map_err(published_error)?;
                         src.seek(SeekFrom::Start(offset))?;
                         let mut data = vec![0; (f.size - offset).min(CHUNK as u64) as usize];
                         src.read_exact(&mut data)?;
@@ -282,15 +291,48 @@ impl Coordinator {
     }
 }
 
-fn store_error(e: impl std::fmt::Display) -> StorageError {
-    StorageError::Corrupt(e.to_string())
+/// A failure of the result store is a fault of this machine, not a verdict
+/// on the bytes: the same call may succeed at the next poll. A length the
+/// store did not expect is one too, as the next poll reads it again.
+fn store_error(e: StoreError) -> StorageError {
+    match e {
+        StoreError::Io(e) => StorageError::Io(e),
+        StoreError::BadName(_) => StorageError::Invalid(e.to_string()),
+        StoreError::Offset { .. } | StoreError::Crash(_) => {
+            StorageError::Io(std::io::Error::other(e.to_string()))
+        }
+    }
+}
+
+/// Opening a published file for a reader also gives two verdicts: the file
+/// is not there, or it is not the one its receipt names.
+fn published_error(e: StoreError) -> StorageError {
+    match e {
+        StoreError::Io(e) if e.kind() == std::io::ErrorKind::NotFound => StorageError::NotFound {
+            what: "published artifact file".into(),
+        },
+        StoreError::Io(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            StorageError::Corrupt(e.to_string())
+        }
+        e => store_error(e),
+    }
+}
+
+/// What one failed action comes to when the walk goes on.
+#[derive(Debug, PartialEq, Eq)]
+enum Failure {
+    /// The verdict on the action: its step fails with this reason.
+    Answer(String),
+    /// A fault that may be gone at the next poll. Nothing is answered.
+    Retry(String),
 }
 
 /// What one failed action answers its step, or the error that stops the
 /// walk: this process is not the coordinator any more, or its database (not
 /// one row or one file of it) cannot be used now. Such an error says nothing
-/// about the action, which is asked again by the next poll.
-fn action_failure(e: CoordinatorError) -> Result<String> {
+/// about the action, which is asked again by the next poll. So is one that
+/// came from reading or writing a file, which is only not answered.
+fn action_failure(e: CoordinatorError) -> Result<Failure> {
     match e {
         CoordinatorError::Fenced(_)
         | CoordinatorError::Aborted
@@ -304,15 +346,33 @@ fn action_failure(e: CoordinatorError) -> Result<String> {
             | StorageError::Closed
             | StorageError::Panicked,
         ) => Err(e),
+        CoordinatorError::Results(_)
+        | CoordinatorError::Storage(StorageError::Io(_) | StorageError::SourceBusy) => {
+            Ok(Failure::Retry(e.to_string()))
+        }
         CoordinatorError::Invalid(reason)
-        | CoordinatorError::Storage(StorageError::Invalid(reason)) => Ok(reason),
-        e => Ok(e.to_string()),
+        | CoordinatorError::Storage(StorageError::Invalid(reason)) => Ok(Failure::Answer(reason)),
+        CoordinatorError::Storage(
+            StorageError::Corrupt(_)
+            | StorageError::NotFound { .. }
+            | StorageError::Immutable(_)
+            | StorageError::PayloadConflict(_)
+            | StorageError::LocatorPendingDelete(_)
+            | StorageError::Retired(_)
+            | StorageError::LiveAttemptExists(_)
+            | StorageError::LeaseNotRenewable(_)
+            | StorageError::Transition(_)
+            | StorageError::IllegalState { .. }
+            | StorageError::SecretUnavailable,
+        ) => Ok(Failure::Answer(e.to_string())),
     }
 }
 
 /// A digest names bytes of one length. A declaration that gives it another
 /// length than the file this producer already published under it, or two
 /// lengths at once, is refused here: the published file is left as it is.
+/// A published file of another length that does not hash to its digest was
+/// damaged where it lay and refuses nothing: the upload replaces it.
 fn declared_sizes(files: &ResultStore, producer: &AttemptId, receipt: &Receipt) -> Result<()> {
     let invalid = |s: &str| CoordinatorError::Invalid(s.into());
     let mut sizes = BTreeMap::new();
@@ -322,10 +382,15 @@ fn declared_sizes(files: &ResultStore, producer: &AttemptId, receipt: &Receipt) 
         if *sizes.entry(f.sha256.as_str()).or_insert(f.size) != f.size {
             return Err(invalid("artifact declares one digest with two sizes"));
         }
-        let published = files
-            .published_len(producer, &digest)
-            .map_err(|e| CoordinatorError::Results(e.to_string()))?;
-        if published.is_some_and(|len| len != f.size) {
+        let results = |e: StoreError| CoordinatorError::Results(e.to_string());
+        let Some(len) = files.published_len(producer, &digest).map_err(results)? else {
+            continue;
+        };
+        if len != f.size
+            && files
+                .verify_artifact(producer, &digest, len)
+                .map_err(results)?
+        {
             return Err(invalid(
                 "artifact size conflicts with the published file of its digest",
             ));
@@ -388,4 +453,61 @@ fn verify_manifest(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{Error, ErrorKind};
+
+    fn storage(e: StorageError) -> Result<Failure> {
+        action_failure(CoordinatorError::Storage(e))
+    }
+
+    #[test]
+    fn a_fault_of_the_store_is_tried_again_and_a_verdict_is_answered() {
+        let retried = |r: Result<Failure>| matches!(r, Ok(Failure::Retry(_)));
+        let answered = |r: Result<Failure>| matches!(r, Ok(Failure::Answer(_)));
+        let io = |kind: ErrorKind| StoreError::Io(Error::new(kind, "file"));
+        // The walk stops.
+        assert!(action_failure(CoordinatorError::Aborted).is_err());
+        assert!(action_failure(CoordinatorError::Fenced(CoordinatorEpoch(1))).is_err());
+        assert!(storage(StorageError::Busy).is_err());
+        assert!(storage(StorageError::Closed).is_err());
+        // The action is left for the next poll.
+        assert!(retried(storage(StorageError::SourceBusy)));
+        assert!(retried(storage(StorageError::Io(Error::other("disk")))));
+        assert!(retried(action_failure(CoordinatorError::Results(
+            "disk".into()
+        ))));
+        assert!(retried(storage(store_error(io(ErrorKind::NotFound)))));
+        assert!(retried(storage(store_error(StoreError::Offset {
+            want: 1,
+            have: 2
+        }))));
+        assert!(retried(storage(published_error(io(
+            ErrorKind::PermissionDenied
+        )))));
+        // The step fails.
+        assert_eq!(
+            action_failure(CoordinatorError::Invalid("bad".into())).unwrap(),
+            Failure::Answer("bad".into())
+        );
+        assert_eq!(
+            storage(StorageError::Invalid("bad".into())).unwrap(),
+            Failure::Answer("bad".into())
+        );
+        assert!(answered(storage(StorageError::Corrupt("digest".into()))));
+        assert!(answered(storage(StorageError::Immutable("v1".into()))));
+        assert!(answered(storage(StorageError::NotFound {
+            what: "blob".into()
+        })));
+        assert!(answered(storage(store_error(StoreError::BadName(
+            "..".into()
+        )))));
+        assert!(answered(storage(published_error(io(ErrorKind::NotFound)))));
+        assert!(answered(storage(published_error(io(
+            ErrorKind::InvalidData
+        )))));
+    }
 }
