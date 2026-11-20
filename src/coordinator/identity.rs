@@ -128,7 +128,9 @@ mod tests {
         use crate::ids::{AgentEpoch, CoordinatorEpoch, Digest, WorkerBootId, WorkerId};
         use crate::protocol::hello::WorkerIdentity;
         use crate::protocol::{accept, connect, ClientConfig, Membership, ServerConfig};
-        use crate::wire::{IdentityRetiredResponse, Request, Response, SchemaVersion};
+        use crate::wire::{
+            IdentityRetiredRequest, IdentityRetiredResponse, Request, Response, SchemaVersion,
+        };
 
         let dir = crate::test_tmp::tempdir().unwrap();
         let store = crate::storage::CoordinatorStore::open(dir.path(), 1).unwrap();
@@ -152,23 +154,21 @@ mod tests {
             },
             Keys::only(group::test_key()),
         );
+        let answering = (worker.clone(), boot.clone());
         let peer = tokio::spawn(async move {
             let mut accepted = accept(theirs, server).await.unwrap();
             let inbound = accepted.incoming.next().await.expect("one request");
-            let Request::IdentityRetired(notice) = inbound.request else {
-                panic!("not the notice");
-            };
             let answer = IdentityRetiredResponse {
                 schema_version: SchemaVersion::CURRENT,
-                worker_id: notice.worker_id.clone(),
-                worker_boot_id: notice.worker_boot_id.clone(),
+                worker_id: answering.0,
+                worker_boot_id: answering.1,
             };
             inbound
                 .responder
                 .respond(Response::IdentityRetired(answer))
                 .await
                 .unwrap();
-            notice
+            inbound.request
         });
         let connected = connect(
             ours,
@@ -197,13 +197,19 @@ mod tests {
             .identity_retired_notice(&worker, &boot)
             .unwrap()
             .is_some());
-        let notice = tokio::time::timeout(std::time::Duration::from_secs(10), peer)
+        let told = tokio::time::timeout(std::time::Duration::from_secs(10), peer)
             .await
             .expect("the worker was told")
             .unwrap();
-        assert_eq!(notice.coordinator_id, me);
-        assert_eq!(notice.worker_id, worker);
-        assert_eq!(notice.worker_boot_id, boot);
+        // The notice and nothing else, with this member and that identity.
+        let notice = Request::IdentityRetired(IdentityRetiredRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: told.request_id().clone(),
+            coordinator_id: me,
+            worker_id: worker,
+            worker_boot_id: boot,
+        });
+        assert_eq!(told, notice);
     }
 
     #[test]
