@@ -1,6 +1,6 @@
 # belt 実装計画
 
-`docs/spec.md`（仕様版 1.3）の実装を、PR 単位に分けた計画である。仕様の受入条件 A01〜A49 は、この表のいずれかの行が担当する。
+`docs/spec.md`（仕様版 1.4）の実装を、PR 単位に分けた計画である。仕様の受入条件 A01〜A49 と A51〜A54 は、この表のいずれかの行が担当する（A50 と A55 は別の作業のために番号を空けてある）。
 
 ## 前提
 
@@ -48,6 +48,13 @@
 | S24 | belt | Linux の常駐と Colab の一時 worker | Linux の systemd user service（install / start / stop / upgrade）、Colab の一時 worker（`worker --ephemeral` をノートブックから起動、利用者が用意したトンネル経由で親が SSH、起動ごとに新しい identity、`workers forget` で消滅を宣言したときだけ interrupted に確定） | Linux（CI の ubuntu）での install → start → stop の統合テスト、ephemeral の identity と forget のテスト | macOS の常駐（S22）、トンネルの提供 | S22・S23 |
 | S25 | belt | 1 台上の試験ハーネスと障害注入 | 複数 worker（別 state dir）を 1 台で立てる、kill 点・ACK 消失・時計のずれの注入口、A 対応表のうち実機不要のものを自動試験にまとめる | 実機不要の A がすべて自動で緑 | 実機の試験（S26） | S15・S16・S18・S23 |
 | S26 | belt | Docker での受入と初回リリース | 手元の Mac と Docker の複数 Linux worker で A01・A02・A24・A26・A34・A35・A37・A45・A46 の適用可能な範囲を検証、結果の報告、0.1.0 の `cargo publish` とタグ・Release | 適用可能な A が緑、§20 の完了報告。独立 Mac 固有の未検証項目は明記する | 追加 Mac の調達 | 全行、Docker。受入環境は下記に従う |
+| WP24a | belt | 仕様: runごとの親 | `docs/spec.md`（仕様版 1.4、第24章と関連章）、`docs/plan.md`（この行と WP24b〜WP24e・R68・R96、A51〜A54 の対応） | 節番号と A 番号の参照が合っている。公開禁止語の grep が 0 件 | コード | なし |
+| WP24b | belt | 親ごとの identity（登録・取消・退役の通知） | worker DB の「信頼する親」の一覧（登録・取消・tombstone）、hello を一覧と照らす判定と断る理由（feature `parent_identity_v1`）、親ごとの `coordinator_epoch`・lease key・attempt の所有（他の親の attempt は `NOT_FOUND`）、同じ `cluster_id` の別 `coordinator_id` の拒否、`peers revoke` の停止→確定→取消、取り消された親の側の確定、退役の通知 `identity_retired`（feature `identity_retired_v1`。WP21 の残り）。worker DB の step 4、coordinator DB の step 20 | 仕様 §24.2・§24.3 と A53 のテスト。1 つの親だけを信頼する worker が、feature を持たない親に従来と同じ答えを返す（N／N+1）。既存 worker DB の移行（今の cluster が最初の行になる）のテスト | 調停（WP24c）、CLI と設定（WP24d） | WP24a |
+| WP24c | belt | 親をまたぐ調停と、断られた後の置き直し | worker が全親の合計で受付窓を数えて断る（`overloaded_reason.reason = "capacity"`、feature `shared_admission_v1`）、`inspect` の受付窓の使用数、forecast の `foreign_demand` と coverage の絞り込み、親の側の retire（理由 `capacity_refused`）→未開始の確認→次の generation、一時的な除外と `task_waiting`（`capacity`）、配置理由と `estimate` の表示。coordinator DB の step 21 | 仕様 §24.4・§24.5 と A52 のテスト（2 つの親の同時配置、遅れた submit が `RETIRED`、最大 1 回の開始、epoch の独立）。A06・A08・A19 が変わらず通る | 親ごとの予約・比例配分（初回リリースに含めない） | WP24b |
+| WP24d | belt | peer の設定と CLI、node が親と worker を兼ねる | `[[workers]]` を peer の一覧として読む（自動発見なし）、`peers`・`peers trust`・`peers revoke`（resident への要求）、`workers add` が相手の worker へ自分を登録する SSH helper、`init` 済みの host への `workers add` が 2 つ目の worker を作らないこと、導入済みの host での `init` が同じ resident に親の役割を足すこと、local worker と他の親が使う worker が同じ agent・同じ worker DB であること、`doctor` の `parent_not_trusted` 表示 | 仕様 §4「peer の管理」・§5・§15・§24.1 のテスト。A51 のうち 1 host で確かめられる部分 | node の更新（R68）、遅い peer の切り離し（R96） | WP24b |
+| WP24e | belt | 1 host 上の 2〜3 node の受入 | S25 のハーネスで、別の state directory を持つ 2〜3 個の node（それぞれ親と worker）を 1 台に立てる。A51〜A54 を自動試験にし、A 対応表と S25 の表へ試験名を書く。親の停止・答えない peer・答えない親の注入口 | A51〜A54 が 1 host の自動試験で通る。実機間でしか確かめられない部分（別マシンの電源断、実 SSH）は S26 の確認待ちとして区別して書く | 実機の受入（S26） | WP24c・WP24d・R68・R96 |
+| R68 | belt | resident が自分を更新する（node の更新） | `belt upgrade [--binary <path>]`: 自分の worker の役割を全親に対して drain → 版別 directory へ配置 → 互換検査 → service 切替 → health → resume、失敗時の rollback。`workers upgrade` が相手の node で同じ手順を起こす。node の process lock で同時に 1 つ。自分が親の run は親 process の再起動と同じ規則で adopt | 仕様 §24.8 のテスト（run を抱えた node の更新で attempt を失わない、失敗時に元の版へ戻る、N と N+1 の node が両方向で動く）。A54 の更新の部分 | release の成果物の自動取得 | WP24b |
+| R96 | belt | 遅い・応答しない peer が CLI と他の peer を止めない | coordinator の tick が worker との通信を待つ間 actor を持ち続けない構造へ直す（worker ごとの独立した処理、actor へは結果だけ）。親 DB だけで答えられる CLI 要求を peer の状態から切り離す。peer への照会が要る CLI は答えた分だけ返す。worker の側で、ある親の接続が他の親への応答を塞がないこと | 仕様 §24.7 のテスト。答えない peer を置いた状態で CLI 要求が 2 秒以内に返る決定的なテスト（sleep に頼らない）。A54 の遅い peer の部分 | `worker_budget_ms` の既定値の変更 | なし（WP24b と並行可） |
 
 正式名は決定済みである（2026-11-20）。名前は belt、crate は `belt-cli`、バイナリは `belt`、lib は `belt` とする。旧名 remote-task-runner（略称 rtr）からの改名は WP22 で実施した。以降の記述は新名に揃えてある。
 
@@ -176,7 +183,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 - Docker 上の Linux worker と macOS ホストの結果は区別する。Docker を別の Mac 実機と記載せず、独立した Mac の sleep・boot・launchd・実機間転送など、代替できない項目は実機確認待ちとして A 対応表と最終報告へ残す。
 - 公開する版には Docker で確認した範囲と未検証範囲を明記する。実機未確認の項目を、A01〜A49 全件確認済みと報告しない。
 
-## A01〜A49 の対応
+## A01〜A49・A51〜A54 の対応
 
 | A | 担当行 | 実機要 |
 |---|---|---|
@@ -207,6 +214,10 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A47 | S8 | |
 | A48 | S7 | |
 | A49 | S13（配置）・S3（設定）・S15a（設定から scheduler への接続） | |
+| A51 | WP24d・WP24e | ○（別マシン間は S26） |
+| A52 | WP24c・WP24e | |
+| A53 | WP24b・WP24e | |
+| A54 | R96・R68・WP24b（親ごとの lease）・WP24e | ○（別マシンの停止は S26） |
 
 ### S25: 1 台上の試験ハーネスと A01〜A49 の自動試験の対応（2026-11-17）
 
@@ -1734,3 +1745,28 @@ FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard �
 - `gh` の時間切れで止めるのは直接の子 process だけ。`gh` が起こした孫 process（credential helper など）は残り得る。孫が pipe を持ったまま `gh` が失敗で終わると、出力の読み取りが孫の終了まで待つ。
 - `local-ci status` 側に同じ検証を適用する件（仕様の一文）は local-ci の側に既に有り（`publishable`）、この行では local-ci を変えていない。
 - tracked file の exclude や追加 input の扱いは `worktree_tree` の一致に任せている（ignored の secret_files は仕様どおり一致判定に入れない）。CI task は secret_files を伴う source をまだ断るので、その組み合わせの実 binary のテストは無い。
+
+### WP24: runごとの親（2026-11-20）
+
+仕様 第24章（仕様版 1.4）の実装行は、分割表の WP24a〜WP24e・R68・R96 である。採用しなかった案（Raft などの合意による構成）は仕様 §24.9 に理由を書いた。ここには、各行が足す DB の migration と wire の feature をまとめる。
+
+DB の migration（既存は coordinator DB が step 1〜19、worker DB が step 1〜3。step は追記だけで、既存の step は書き換えない）:
+
+| DB | step | 行 | 内容 |
+|---|---|---|---|
+| worker | 4 | WP24b | 「信頼する親」の表（`cluster_id`・`coordinator_id`・表示名・その親が付けた `worker_id`・鍵の参照・状態 `trusted`／`revoking`／`revoked`・親ごとの最大 `coordinator_epoch`・退役を告げられた identity）。取消の行を消せない trigger。今の 1 つの `cluster_id` と `worker_state.max_coordinator_epoch` を最初の行へ移す。attempt・tombstone・lease に親（`cluster_id`）の列を足し、既存の行を最初の親のものとして埋める |
+| coordinator | 20 | WP24b | worker ごとの「自分が取り消された」記録（理由と `attempts_stopped` を受け取った時刻）と、退役した identity へ通知を送った記録（`worker_identity_tombstone` に対応する列または表） |
+| coordinator | 21 | WP24c | 容量で断られた attempt を探す部分 index（`placement_unacked` と同じ形）。retire の理由 `capacity_refused` と event `submit_refused_capacity` は、既存の理由（`worker_cannot_run`）と同じく文字列で持ち、schema の制約は無いので、それ自体は step を要らない。index が不要と分かれば、この step は足さない |
+
+- WP24d・WP24e・R68・R96 は、今の見込みでは DB の step を足さない。必要と分かった行は、この表に step を足してから実装する。
+- step の番号は main へ入る順に確定する。上の番号は WP24b → WP24c の順で入る前提で、順が変わったら表を直す。古い binary は知らない step を持つ DB を拒否する（既存の互換表の規則）。
+
+hello の feature と wire の追加（どれも「提供するが要求しない」optional。schema version は上げない）:
+
+| feature | 行 | 足すもの |
+|---|---|---|
+| `parent_identity_v1` | WP24b | hello を断る答えの理由（`parent_not_trusted`・`parent_revoked`＋`attempts_stopped`・`identity_retired`）。hello の要求の項目は増やさない（`cluster_id`・`coordinator_id`・`coordinator_epoch` は既にある） |
+| `identity_retired_v1` | WP24b | 操作 `identity_retired`（要求: `cluster_id`・`worker_id`・`worker_boot_id`。同じ内容の再送に同じ答え） |
+| `shared_admission_v1` | WP24c | `submit_attempt` の `OVERLOADED` に付ける `overloaded_reason.reason = "capacity"`、`inspect` の受付窓（上限・使用数・聞いた親の分・他の親の分）、forecast の `foreign_demand`（件数） |
+
+R68 と R96 は backlog の番号をそのまま行の名前にした。R68（resident が自分を更新する）は、どの node も親になることで全 node に要るようになったため、初回リリースの範囲に含める（仕様 §24.8）。R96 は、2026-11-20 時点で coordinator の tick が応答しない worker 1 台につき `worker_budget_ms`（既定 15 秒）のあいだ actor を持ち続け、CLI の要求が時間切れになる問題で、仕様 §24.7 を完了条件とする。WP21 の残り（退役した identity の worker へ伝える wire の message。S24 の残り 5）は WP24b が担当する。
