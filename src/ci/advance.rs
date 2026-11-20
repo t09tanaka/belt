@@ -22,11 +22,18 @@ mod matrix;
 /// An unstarted variant stopped by matrix fail-fast can participate in a run retry.
 pub const MATRIX_FAIL_FAST_REASON: &str = "another variant of its matrix job failed (fail-fast)";
 mod discovery;
+mod pure;
+
+use pure::{
+    ended_input, join_failure, never_ran, oversize_reason, released_spec, stop_step, timing_scope,
+    Stop,
+};
+pub use pure::{inputs_fit, standing, status_without_result, Standing, MAX_RELEASED_INPUT_BYTES};
 
 use super::progress::{ActionKind, Input, NeedsProgression, Progression};
 use crate::coordinator::TaskSpec;
 use crate::ids::{AttemptId, Digest, RunId, TaskId};
-use crate::state::{Outcome, Termination};
+use crate::state::Outcome;
 use crate::storage::{CiTaskRow, CoordinatorStore};
 use crate::supervisor::ci_task::RESULT_ARTIFACT;
 use local_ci::task::{JobStatus, TaskInputs};
@@ -36,10 +43,6 @@ use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::Path;
 
-/// The inputs of a task (the outcomes of the jobs it needs) are sent in the
-/// payload of its attempt, and a payload has to fit one frame of a connection
-/// (2 MiB). Inputs larger than this are not sent: the task cannot be run.
-pub const MAX_RELEASED_INPUT_BYTES: usize = 1 << 20;
 /// The result of a task is read only up to this size.
 pub const MAX_RESULT_BYTES: u64 = 16 << 20;
 /// How many runs one pass looks at.
@@ -148,43 +151,6 @@ pub fn read_result_at(path: &Path, digest: &Digest) -> Result<WireTaskResult, St
     }
     let text = String::from_utf8(bytes).map_err(|e| e.to_string())?;
     WireTaskResult::from_json(&text).map_err(|e| format!("{e:#}"))
-}
-
-/// Where a task of a run stands, from its row alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Standing {
-    /// It waits, is queued, runs, or its result is still being collected.
-    Open,
-    /// It was cancelled before it was placed: it will never run.
-    NeverRan,
-    /// Its attempt ended this way and the collection of its result is closed.
-    Ended(Outcome),
-}
-
-pub fn standing(
-    cancelled: bool,
-    attempt: Option<(Option<&Termination>, Option<&str>)>,
-) -> Standing {
-    match attempt {
-        None if cancelled => Standing::NeverRan,
-        None => Standing::Open,
-        Some((Some(termination), Some(_))) => Standing::Ended(termination.outcome()),
-        Some(_) => Standing::Open,
-    }
-}
-
-/// What the jobs of a task count as when its attempt ended without a result
-/// the run can use.
-pub fn status_without_result(outcome: Outcome) -> JobStatus {
-    match outcome {
-        Outcome::Cancelled => JobStatus::Cancelled,
-        _ => JobStatus::Failure,
-    }
-}
-
-/// Do the inputs fit the payload of an attempt?
-pub fn inputs_fit(inputs: &TaskInputs) -> bool {
-    serde_json::to_vec(inputs).is_ok_and(|json| json.len() <= MAX_RELEASED_INPUT_BYTES)
 }
 
 /// Check the executor and the progression actually selected for this plan.
@@ -371,10 +337,7 @@ fn advance_run(
         {
             continue;
         }
-        let failure = (outcome.status == JobStatus::Failure).then(|| {
-            let problems = progress.split_job_problems(&group.id);
-            problems.unwrap_or("a shard of the job failed").to_string()
-        });
+        let failure = join_failure(outcome.status, progress.split_job_problems(&group.id));
         let rerun = progress.split_job_rerun(&group.id);
         let timings = (|| {
             let scope = group_timing_scope(&plan, group, project.as_deref())?;
@@ -429,13 +392,7 @@ fn group_timing_scope(
     project: Option<&str>,
 ) -> Option<String> {
     let first = plan.task(group.shards.first()?)?.shard.as_ref()?;
-    Some(super::discovery::timing_key(
-        project?,
-        &group.workflow,
-        group.source_jobs.first()?,
-        &first.dir,
-        group.runner.as_ref()?,
-    ))
+    timing_scope(project, group, &first.dir)
 }
 
 /// The progression of a run of `plan` with everything that ended taken in:
@@ -487,27 +444,15 @@ fn ended(
         .attempt
         .as_ref()
         .map(|a| (a.termination.as_ref(), a.collection.as_deref()));
-    let fence = |status, reason: String| Input::Fence {
-        task: task.to_string(),
-        status,
-        reason,
-    };
     Ok(match (standing(row.cancelled, attempt), &row.attempt) {
-        (Standing::NeverRan, _) => Some(fence(JobStatus::Cancelled, "cancelled".into())),
+        (Standing::NeverRan, _) => Some(never_ran(task)),
         (Standing::Ended(outcome), Some(attempt)) => {
             let kept = store.persisted_artifacts(&attempt.attempt_id)?;
             let read = match kept.iter().find(|(name, _)| name == RESULT_ARTIFACT) {
                 None => Err("its result was not collected".to_string()),
                 Some((_, digest)) => read_result(results, &attempt.attempt_id, digest),
             };
-            Some(match read {
-                Ok(result) if result.task == task => Input::Settle {
-                    task: task.to_string(),
-                    result: Box::new(result),
-                },
-                Ok(_) => fence(JobStatus::Failure, "its result is of another task".into()),
-                Err(why) => fence(status_without_result(outcome), why),
-            })
+            Some(ended_input(task, outcome, read))
         }
         _ => None,
     })
@@ -525,16 +470,17 @@ fn stop(
     now_ms: u64,
     pass: &mut Pass,
 ) -> crate::storage::Result<()> {
-    if row.cancelled {
-        return Ok(());
-    }
-    if let Some(attempt) = &row.attempt {
-        if store.stop_ci_attempt(run, &row.task_id, &attempt.attempt_id, reason, now_ms)? {
-            pass.stopped.push(row.task_id.clone());
+    match stop_step(row.cancelled, row.attempt.as_ref().map(|a| &a.attempt_id)) {
+        Stop::Leave => {}
+        Stop::Attempt(attempt) => {
+            if store.stop_ci_attempt(run, &row.task_id, attempt, reason, now_ms)? {
+                pass.stopped.push(row.task_id.clone());
+            }
         }
-    } else {
-        let stopped = store.fail_ci_tasks(run, Some(&row.task_id), reason, now_ms)?;
-        pass.stopped.extend(stopped);
+        Stop::Unplaced => {
+            let stopped = store.fail_ci_tasks(run, Some(&row.task_id), reason, now_ms)?;
+            pass.stopped.extend(stopped);
+        }
     }
     Ok(())
 }
@@ -550,9 +496,7 @@ fn release(
     let task_id = &member.row.task_id;
     let invalid = |e: serde_json::Error| crate::storage::StorageError::Invalid(e.to_string());
     if !inputs_fit(inputs) {
-        let why = format!(
-            "the results of the jobs it needs are larger than {MAX_RELEASED_INPUT_BYTES} bytes"
-        );
+        let why = oversize_reason();
         // The reason, the cancel and the event are one transaction: a pass
         // that sees the task again finds it cancelled and writes nothing.
         for task in store.fail_ci_tasks(run, Some(task_id), &why, now_ms)? {
@@ -560,12 +504,8 @@ fn release(
         }
         return Ok(());
     }
-    let mut spec = member.spec.clone();
-    if let Some(ci) = spec.ci.as_mut() {
-        ci.hold = false;
-        ci.task.inputs = serde_json::to_value(inputs).map_err(invalid)?;
-    }
-    let spec = serde_json::to_value(&spec).map_err(invalid)?;
+    let inputs = serde_json::to_value(inputs).map_err(invalid)?;
+    let spec = serde_json::to_value(released_spec(&member.spec, inputs)).map_err(invalid)?;
     if store.release_ci_task(task_id, &spec, now_ms)? {
         pass.released.push(task_id.clone());
     }
@@ -575,64 +515,6 @@ fn release(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Exit;
-
-    #[test]
-    fn a_task_stands_open_until_its_attempt_ended_and_its_collection_closed() {
-        let done = Termination::new(Outcome::Succeeded, Some(Exit::Code(0)), None).unwrap();
-        assert_eq!(standing(false, None), Standing::Open);
-        assert_eq!(standing(true, None), Standing::NeverRan);
-        assert_eq!(standing(false, Some((None, None))), Standing::Open);
-        assert_eq!(standing(true, Some((None, None))), Standing::Open);
-        assert_eq!(standing(false, Some((Some(&done), None))), Standing::Open);
-        assert_eq!(
-            standing(false, Some((None, Some("complete")))),
-            Standing::Open
-        );
-        assert_eq!(
-            standing(true, Some((Some(&done), Some("gave_up")))),
-            Standing::Ended(done.outcome())
-        );
-    }
-
-    #[test]
-    fn without_a_result_a_cancelled_attempt_counts_as_cancelled_and_any_other_as_failed() {
-        assert_eq!(
-            status_without_result(Outcome::Cancelled),
-            JobStatus::Cancelled
-        );
-        for outcome in [
-            Outcome::Succeeded,
-            Outcome::Failed,
-            Outcome::TimedOut,
-            Outcome::Interrupted,
-        ] {
-            assert_eq!(status_without_result(outcome), JobStatus::Failure);
-        }
-    }
-
-    #[test]
-    fn inputs_are_released_only_when_they_fit_a_payload() {
-        let outcome = |bytes: usize| local_ci::task::JobOutcome {
-            job: "a".into(),
-            variant: None,
-            status: JobStatus::Success,
-            outputs: [("o".to_string(), "x".repeat(bytes))].into(),
-            skipped: None,
-            ancestor_failed: false,
-        };
-        let inputs = |bytes| {
-            let o = outcome(bytes);
-            TaskInputs::new([&o], [&o], false)
-        };
-        let small = inputs(16);
-        let overhead = serde_json::to_vec(&small).unwrap().len() - 16;
-        assert!(inputs_fit(&small));
-        assert!(inputs_fit(&inputs(MAX_RELEASED_INPUT_BYTES - overhead)));
-        assert!(!inputs_fit(&inputs(
-            MAX_RELEASED_INPUT_BYTES - overhead + 1
-        )));
-    }
 
     #[test]
     fn a_plan_and_a_result_are_read_only_when_they_hash_to_their_digest() {
