@@ -134,6 +134,43 @@ fn the_library_and_the_cli_share_one_repository_and_one_state_directory() {
         .with_helper(Some(PathBuf::from(BIN)));
     assert_eq!(repo.main_checkout(), main);
 
+    // Before starting concurrent work, check both removal paths from a
+    // nested cwd. Restore cwd before asserting so failures cannot leave it
+    // pointing into the temporary repository.
+    let inside = base.join("cwd-refusal");
+    git(
+        &main,
+        &["worktree", "add", "--detach", inside.to_str().unwrap()],
+    );
+    let nested = inside.join("nested");
+    fs::create_dir(&nested).unwrap();
+    for mode in [
+        RemoveMode::Strict {
+            delete_branch: false,
+        },
+        RemoveMode::Discard,
+    ] {
+        let previous = std::env::current_dir().unwrap();
+        std::env::set_current_dir(&nested).unwrap();
+        let result = repo.remove_worktree(&inside, &RemoveOptions::new(mode));
+        let cwd = std::env::current_dir();
+        std::env::set_current_dir(previous).unwrap();
+        assert_eq!(cwd.unwrap(), nested);
+        match result {
+            Err(Error::Refused { reason, message }) => {
+                assert_eq!(reason, fast_worktree::Refusal::ProcessCwdInside);
+                assert!(message.contains("process cwd is inside the worktree"));
+            }
+            other => panic!("expected cwd refusal, got {other:?}"),
+        }
+        assert!(inside.join(".git").is_file());
+        assert!(git(&main, &["worktree", "list", "--porcelain"]).contains(inside.to_str().unwrap()));
+    }
+    git(
+        &main,
+        &["worktree", "remove", "--force", inside.to_str().unwrap()],
+    );
+
     // The effective config.
     let cfg = repo.config().unwrap();
     assert_eq!(cfg.pool_size, 2);

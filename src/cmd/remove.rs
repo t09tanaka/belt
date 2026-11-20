@@ -47,6 +47,8 @@ pub struct Facts {
 pub enum Refusal {
     /// The path is inside a worktree, not its root.
     NotWorktreeRoot,
+    /// The embedding process has its current directory inside the worktree.
+    ProcessCwdInside,
     /// The path is the repository's main checkout.
     MainCheckout,
     /// The worktree is locked.
@@ -62,6 +64,9 @@ pub enum Refusal {
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Refusal::ProcessCwdInside => {
+                "process cwd is inside the worktree; refusing to remove it"
+            }
             Refusal::NotWorktreeRoot => "not a worktree root",
             Refusal::MainCheckout => "refusing to remove the main checkout",
             Refusal::Locked => "worktree is locked",
@@ -122,11 +127,24 @@ pub fn run(opts: Opts) -> Result<i32> {
     execute(opts).map(|d| d.code)
 }
 
+/// Refuse before hooks or other removal side effects in an embedding process.
+pub(crate) fn refuse_embedded_cwd(path: &Path) -> Result<()> {
+    if crate::util::is_embedded() && std::env::current_dir().is_ok_and(|d| d.starts_with(path)) {
+        let reason = Refusal::ProcessCwdInside;
+        return Err(Error::of(
+            Kind::Refused(reason),
+            format!("{}: {reason}; nothing was removed", path.display()),
+        ));
+    }
+    Ok(())
+}
+
 pub fn execute(opts: Opts) -> Result<Done> {
     let path = opts
         .path
         .canonicalize()
         .map_err(|e| Error::msg(format!("{}: {e}", opts.path.display())))?;
+    refuse_embedded_cwd(&path)?;
     let toplevel = git::toplevel(&path)?;
     let toplevel = toplevel.canonicalize().unwrap_or(toplevel);
     let worktrees = git::worktrees(&path)?;
@@ -210,7 +228,7 @@ pub fn execute(opts: Opts) -> Result<Done> {
         }
     }
 
-    if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
+    if !crate::util::is_embedded() && std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
     }
     trash::sweep();

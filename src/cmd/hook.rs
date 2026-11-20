@@ -248,6 +248,7 @@ pub fn discard(given: &Path, cwd: Option<&Path>) -> Result<Discarded> {
     let path = given
         .canonicalize()
         .map_err(|e| Error::msg(format!("{}: {e}", given.display())))?;
+    remove::refuse_embedded_cwd(&path)?;
     let top = git::toplevel(&path).map_err(|_| {
         Error::msg(format!(
             "{}: not a git worktree; not removing it",
@@ -346,7 +347,7 @@ pub fn discard(given: &Path, cwd: Option<&Path>) -> Result<Discarded> {
             errln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
         }
     }
-    if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
+    if !crate::util::is_embedded() && std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
     }
     let name = path

@@ -22,11 +22,15 @@ pub fn set_embedded() {
     EMBEDDED.store(true, Ordering::Relaxed);
 }
 
+pub(crate) fn is_embedded() -> bool {
+    EMBEDDED.load(Ordering::Relaxed)
+}
+
 /// Let go of a detached child that is not waited for. The command exits
 /// soon after, and init reaps the child; a long-lived embedding process
 /// would keep a zombie for every one, so a thread waits for it there.
 pub fn release(child: std::process::Child) {
-    if EMBEDDED.load(Ordering::Relaxed) {
+    if is_embedded() {
         std::thread::spawn(move || {
             let mut child = child;
             let _ = child.wait();

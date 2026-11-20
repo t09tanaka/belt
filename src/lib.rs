@@ -56,17 +56,23 @@
 //! fill` in the background to replace the spare it took. A library cannot
 //! re-run its host program for that, so it runs the `fast-worktree`
 //! executable: found on `PATH` or in `~/.cargo/bin` by [`Repository::open`],
-//! or set with [`Repository::with_helper`]. Without one, spares are not
+//! or set with [`Repository::with_helper`]. This separate binary may be a
+//! different version. Embedders should pin it with `with_helper(Some(path))`
+//! or disable it with `with_helper(None)` and call [`Repository::fill_pool`]
+//! themselves. Without a helper, spares are not
 //! refilled automatically; [`Repository::fill_pool`] fills them in the
 //! calling thread.
 //!
 //! # Process-wide effects
 //!
-//! A removal run from inside the worktree being removed first moves the
-//! process's current directory to the main checkout, as the command does;
-//! relative paths given to the library are relative to the current
-//! directory. Output is directed per calling thread, so concurrent calls
-//! from different threads do not mix their logs.
+//! Removal is refused when the process cwd is inside the worktree; the
+//! library does not change cwd. Relative paths passed to
+//! [`Repository::create_worktree`] and [`Repository::remove_worktree`] resolve
+//! against the process cwd; pass absolute paths.
+//! [`Repository::open`] and [`sweep_trash`] set a process-global embedded flag
+//! that is never reset, even if opening fails or all repositories are dropped.
+//! Output is directed per calling thread, so concurrent calls from different
+//! threads do not mix their logs.
 //!
 //! # Features
 //!
@@ -398,7 +404,8 @@ pub struct KeptRef {
 impl Repository {
     /// The repository that contains `dir`: a main checkout or any linked
     /// worktree of it. The helper executable is looked up here (see the
-    /// crate docs).
+    /// crate docs). Sets a process-global embedded flag that is never reset,
+    /// even if opening fails or this repository is dropped.
     pub fn open(dir: impl AsRef<Path>) -> Result<Repository> {
         util::set_embedded();
         let top = git::toplevel(dir.as_ref())?;
@@ -417,7 +424,10 @@ impl Repository {
     }
 
     /// The `fast-worktree` executable that runs background work (`pool
-    /// fill`); `None` for no background work.
+    /// fill`); `None` for no background work. By default, a separate binary
+    /// is found on PATH or in `~/.cargo/bin`, and may be a different version.
+    /// Embedders should pin it with `with_helper(Some(path))`, or disable it
+    /// with `with_helper(None)` and call [`Self::fill_pool`] themselves.
     pub fn with_helper(mut self, exe: Option<PathBuf>) -> Self {
         self.helper = exe;
         self
@@ -459,6 +469,8 @@ impl Repository {
     /// cache where an entry fits and installed where not; then the
     /// `post_add` hooks. Fails only when the worktree itself cannot be
     /// created; see [`Created::setup_ok`] for the rest.
+    ///
+    /// Relative paths resolve against the process cwd; pass absolute paths.
     pub fn create_worktree(&self, opts: &CreateOptions) -> Result<Created> {
         let (made, log) = self.call(|| -> error::Result<cmd::add::Created> {
             let branch = match &opts.checkout {
@@ -496,6 +508,11 @@ impl Repository {
     /// background, after the `pre_remove` hooks ran and the cacheable
     /// directories were given to the cache. See [`RemoveMode`] for what is
     /// refused and what is kept.
+    ///
+    /// Relative paths resolve against the process cwd; pass absolute paths.
+    /// Returns [`Error::Refused`] if the process cwd is inside the worktree,
+    /// before running removal hooks or changing the worktree. The library
+    /// does not change the process cwd.
     pub fn remove_worktree(&self, path: impl AsRef<Path>, opts: &RemoveOptions) -> Result<Removed> {
         let path = path.as_ref();
         let (done, log) = self.call(|| -> error::Result<Removed> {
@@ -595,7 +612,9 @@ impl Repository {
     /// Make spares until the pool has its configured size, as `fast-worktree
     /// pool fill` does, in the calling thread; returns at once when another
     /// fill is running or the pool is off. Spares take a while to make:
-    /// call this from a background thread or a maintenance job.
+    /// call this from a background thread or a maintenance job. This runs
+    /// synchronously. With [`Output::Capture`] or [`Output::Discard`], child
+    /// output is buffered.
     pub fn fill_pool(&self) -> Result<()> {
         let (code, _log) = self.call(|| pool::fill_for(&self.main, None));
         match code? {
@@ -637,6 +656,7 @@ impl Repository {
 /// Finish deleting what earlier removals left in the trash, and expire what
 /// was kept for a day and is due, as every removal does before it moves its
 /// own worktree. Cheap when the trash is empty.
+/// Sets a process-global embedded flag that is never reset.
 pub fn sweep_trash() {
     util::set_embedded();
     trash::sweep();

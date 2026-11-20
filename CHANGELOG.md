@@ -26,6 +26,8 @@ change bumps the minor version).
 
 ### Changed
 
+- Library removal refuses worktrees containing the process cwd instead of changing cwd.
+
 - The command is a thin adapter over the library crate. Its behavior,
   output, exit codes, defaults, file locations and state formats are
   unchanged.
