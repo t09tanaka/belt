@@ -610,8 +610,11 @@ pub fn live_attempts(state: &Path) -> anyhow::Result<u32> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(e) => return Err(e.into()),
     }
+    // Counted, not listed: the count reads a database of the version before
+    // the attempts were keyed by member too, which this version may be asked
+    // about before it has migrated it.
     let store = crate::storage::WorkerStore::open_read_only(state)?;
-    Ok(u32::try_from(store.list_nonterminal()?.len()).unwrap_or(u32::MAX))
+    Ok(u32::try_from(store.count_nonterminal()?).unwrap_or(u32::MAX))
 }
 
 /// Poll `count` until it reports zero. A failed read is an error, never idle.

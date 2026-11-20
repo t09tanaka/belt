@@ -84,9 +84,133 @@ pub fn outcome_of_lost(cancel_requested: bool) -> Outcome {
     }
 }
 
+/// How long the notice of a retired identity may take. The connection is
+/// closed after it either way.
+const NOTICE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Tell the worker behind `client` that this member retired the identity it
+/// answered with (`identity_retired`, spec 24.3), once on this connection.
+/// The worker stops this member's attempts without waiting for their lease
+/// and refuses this member from then on. Nothing depends on the answer:
+/// neither submit nor renew is sent to a retired identity, so its attempts
+/// end with their lease in any case.
+pub async fn notify_retired(
+    coordinator: &super::Coordinator,
+    client: &crate::protocol::Client,
+    worker: &crate::ids::WorkerId,
+    boot: &crate::ids::WorkerBootId,
+) {
+    let request = crate::wire::Request::IdentityRetired(crate::wire::IdentityRetiredRequest {
+        schema_version: crate::wire::SchemaVersion::CURRENT,
+        request_id: crate::ids::RequestId::generate(),
+        coordinator_id: coordinator.store().coordinator_id().clone(),
+        worker_id: worker.clone(),
+        worker_boot_id: boot.clone(),
+    });
+    let _ = client.call(request, NOTICE_TIMEOUT).await;
+    let (store, worker, boot) = (coordinator.store.clone(), worker.clone(), boot.clone());
+    let _ = tokio::task::spawn_blocking(move || {
+        store.record_identity_retired_notice(&worker, &boot, crate::platform::wall_ms())
+    })
+    .await;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The notice goes to the worker with this member's coordinator id and
+    /// the retired identity, and that it was sent is recorded, whatever the
+    /// worker answers.
+    #[tokio::test]
+    async fn the_notice_names_the_retired_identity_and_is_recorded_as_sent() {
+        use crate::group::{self, Keys};
+        use crate::ids::{AgentEpoch, CoordinatorEpoch, Digest, WorkerBootId, WorkerId};
+        use crate::protocol::hello::WorkerIdentity;
+        use crate::protocol::{accept, connect, ClientConfig, Membership, ServerConfig};
+        use crate::wire::{
+            IdentityRetiredRequest, IdentityRetiredResponse, Request, Response, SchemaVersion,
+        };
+
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = crate::storage::CoordinatorStore::open(dir.path(), 1).unwrap();
+        let coordinator =
+            crate::coordinator::Coordinator::start(store, Default::default()).unwrap();
+        let cluster = coordinator.store().cluster_id().clone();
+        let me = coordinator.store().coordinator_id().clone();
+        let worker = WorkerId::parse("colab").unwrap();
+        let boot = WorkerBootId::parse("boot.retired").unwrap();
+        let (ours, theirs) = crate::protocol::transport::duplex_pair(64 * 1024);
+        let server = ServerConfig::new(
+            cluster.clone(),
+            WorkerIdentity {
+                capabilities: None,
+                worker_id: worker.clone(),
+                worker_boot_id: boot.clone(),
+                agent_epoch: AgentEpoch(1),
+                profile: "p".into(),
+                profile_fingerprint: Digest::of_bytes(b"p"),
+                coordinator_epoch: CoordinatorEpoch(0),
+            },
+            Keys::only(group::test_key()),
+        );
+        let answering = (worker.clone(), boot.clone());
+        let peer = tokio::spawn(async move {
+            let mut accepted = accept(theirs, server).await.unwrap();
+            let inbound = accepted.incoming.next().await.expect("one request");
+            let answer = IdentityRetiredResponse {
+                schema_version: SchemaVersion::CURRENT,
+                worker_id: answering.0,
+                worker_boot_id: answering.1,
+            };
+            inbound
+                .responder
+                .respond(Response::IdentityRetired(answer))
+                .await
+                .unwrap();
+            inbound.request
+        });
+        let connected = connect(
+            ours,
+            ClientConfig::new(
+                cluster,
+                me.clone(),
+                coordinator.epoch(),
+                Membership {
+                    member: WorkerId::parse("laptop").unwrap(),
+                    key: group::test_key(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            coordinator
+                .store()
+                .identity_retired_notice(&worker, &boot)
+                .unwrap(),
+            None
+        );
+        notify_retired(&coordinator, &connected.client, &worker, &boot).await;
+        assert!(coordinator
+            .store()
+            .identity_retired_notice(&worker, &boot)
+            .unwrap()
+            .is_some());
+        let told = tokio::time::timeout(std::time::Duration::from_secs(10), peer)
+            .await
+            .expect("the worker was told")
+            .unwrap();
+        // The notice and nothing else, with this member and that identity.
+        let notice = Request::IdentityRetired(IdentityRetiredRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: told.request_id().clone(),
+            coordinator_id: me,
+            worker_id: worker,
+            worker_boot_id: boot,
+        });
+        assert_eq!(told, notice);
+    }
 
     #[test]
     fn a_retired_identity_is_refused_whatever_is_recorded() {

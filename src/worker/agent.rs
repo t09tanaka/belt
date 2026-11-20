@@ -16,7 +16,7 @@ use super::blob_policy::BlobLimits;
 use super::blobs;
 use super::host::Host;
 use super::policy::{self, AttemptFacts, Recovery, Settle, Step, SupervisorExit};
-use crate::error::{ApiError, ConflictReason, ErrorCode};
+use crate::error::{ApiError, ConflictReason, ErrorCode, OverloadedReason};
 use crate::ids::*;
 use crate::platform;
 use crate::setup::builder::SetupPoll;
@@ -123,6 +123,9 @@ pub struct AgentConfig {
     pub max_event_scan: u32,
     /// What a coordinator may send with `blob_put`.
     pub blobs: BlobLimits,
+    /// The group key: the file of the current key. The next key of a
+    /// rotation lies beside it ([`crate::group::next_key_path`]).
+    pub group_key_path: PathBuf,
 }
 
 impl AgentConfig {
@@ -137,6 +140,7 @@ impl AgentConfig {
         supervisor_exe: PathBuf,
     ) -> Self {
         AgentConfig {
+            group_key_path: state_dir.join("cluster.key"),
             traffic_state_dir: state_dir.join("traffic"),
             state_dir,
             worker_id,
@@ -184,9 +188,12 @@ impl AgentConfig {
     }
 }
 
-/// What the connection's `hello` established.
-#[derive(Debug, Clone, Copy)]
+/// What the connection's `hello` and group proof established: the member
+/// at the other end. Every request of the connection is that member's, and
+/// reaches that member's attempts only (spec 24.4).
+#[derive(Debug, Clone)]
 pub struct Session {
+    pub coordinator_id: CoordinatorId,
     pub coordinator_epoch: CoordinatorEpoch,
 }
 
@@ -204,6 +211,10 @@ pub struct StartupReport {
 }
 
 pub struct Agent {
+    /// The fingerprint of the group key this worker signs with, as last
+    /// read from its file. A connection watches it: one whose peer proved
+    /// with a key this worker no longer accepts is closed.
+    group_key: tokio::sync::watch::Sender<String>,
     toolchains: Option<crate::toolchain::registry::Registry>,
     cfg: AgentConfig,
     store: WorkerStore,
@@ -347,6 +358,11 @@ fn api(e: StorageError) -> ApiError {
     // The one conflict a sender must not answer by sending again.
     if matches!(e, StorageError::PayloadConflict(_)) {
         return ApiError::conflict(ConflictReason::PayloadMismatch, e.to_string());
+    }
+    // Nothing was stored, and sending the same attempt again does not help:
+    // the reason tells the member to use a new attempt id.
+    if matches!(e, StorageError::AttemptIdInUse(_)) {
+        return ApiError::overloaded(OverloadedReason::AttemptIdInUse, e.to_string());
     }
     // A busy database committed nothing: the same request may be sent again.
     let code = if e.is_retryable() {
@@ -507,7 +523,20 @@ impl Agent {
                     host.sweep_workspaces(&|a| {
                         !matches!(s.get(a), Ok(None))
                             && !matches!(s.get(a), Ok(Some(r)) if r.state == AttemptState::Terminal)
-                    })?
+                    })?;
+                    // After the workspaces: what the rebuild of the database
+                    // dropped has no row that would clean its directory up.
+                    let dropped = remove_dropped_attempts(&cfg.attempts_root(), s).map_err(api)?;
+                    for (attempt, error) in &dropped.failed {
+                        let payload = json!({ "attempt": attempt, "error": error });
+                        let _ = s.append_event(
+                            None,
+                            None,
+                            "agent_dropped_attempt_kept",
+                            &payload,
+                            now(),
+                        );
+                    }
                 }
                 Step::Attempts => {
                     let s = store.expect("the store is open");
@@ -550,6 +579,7 @@ impl Agent {
             .transpose()?
             .flatten();
         let agent = Arc::new(Agent {
+            group_key: tokio::sync::watch::channel(String::new()).0,
             toolchains,
             cfg,
             store,
@@ -576,6 +606,9 @@ impl Agent {
             warmups: Mutex::default(),
             cleanup_scan: Mutex::new(None),
         });
+        // The key this worker holds is recorded as a generation (the single
+        // key of before the group is generation 1).
+        agent.refresh_group_key();
         for a in todo {
             agent.kick(&a);
         }
@@ -971,8 +1004,8 @@ impl Agent {
         let measured = self
             .store
             .lease(a)
-            .and_then(|lease| Ok((lease.map(|(k, _)| k), self.elapsed(rec, measured_at)?)));
-        let (key, (since_accept, since_grant)) = match measured {
+            .and_then(|lease| Ok((lease, self.elapsed(rec, measured_at)?)));
+        let (lease, (since_accept, since_grant)) = match measured {
             Ok(m) => m,
             Err(e) => {
                 // Without the key the supervisor would take the seed for
@@ -989,7 +1022,12 @@ impl Agent {
                 return Ok(None);
             }
         };
-        let Some(lease_left) = policy::remaining_ms(payload.lease_ms, since_grant) else {
+        // A lease that was ended before its time ran out (the member said
+        // it retired this identity) is over as well.
+        let ended = lease.as_ref().is_some_and(|(_, expired)| *expired);
+        let key = lease.map(|(k, _)| k);
+        let left = policy::remaining_ms(payload.lease_ms, since_grant).filter(|_| !ended);
+        let Some(lease_left) = left else {
             // The journal gets `lease_expired` with it. Still under the
             // lock: a renewal either came before the measuring or is refused.
             let _ = self.store.expire_lease(a, now());
@@ -1945,16 +1983,19 @@ impl Agent {
         if !super::control::read(&self.cfg.state_dir).is_ok_and(|c| c.cancel_running) {
             return;
         }
-        let Ok(epoch) = self.store.max_coordinator_epoch() else {
-            return;
-        };
         let Ok(list) = self.store.list_nonterminal() else {
             return;
         };
         for rec in list {
+            // Under the epoch of the member the attempt belongs to: one
+            // member's epoch says nothing about another's.
+            let store = self.store.for_member(&rec.coordinator_id);
+            let Ok(epoch) = store.max_coordinator_epoch() else {
+                continue;
+            };
             if rec.state != AttemptState::Terminal
                 && matches!(
-                    self.store.cancel(&rec.attempt_id, epoch, now()),
+                    store.cancel(&rec.attempt_id, epoch, now()),
                     Ok(CancelOutcome::Requested(_) | CancelOutcome::AlreadyRequested(_))
                 )
             {
@@ -1979,6 +2020,7 @@ impl Agent {
             return;
         }
         let _pass = Ticking(&self.ticking);
+        self.refresh_group_key();
         self.apply_control();
         self.reap_warmups();
         self.supervise_attempts();
@@ -1990,6 +2032,105 @@ impl Agent {
                 json!({ "code": e.code, "message": e.message }),
             );
         }
+    }
+
+    /// Read the group key again. The database records which generation it
+    /// is (the single key of before the group is generation 1), and a key
+    /// that differs from the one read last closes the connections that were
+    /// proven with a key this worker no longer accepts: after a switch only
+    /// the new key's proof is taken (spec 24.2). Called at the start and on
+    /// every tick, so a switch made by any process of this member is seen.
+    /// Returns the current fingerprint, or `None` while the key cannot be
+    /// read (no connection is accepted then either).
+    pub fn refresh_group_key(&self) -> Option<String> {
+        let keys = crate::group::load_keys(&self.cfg.group_key_path).ok()?;
+        let current = crate::group::fingerprint(&keys.current);
+        if *self.group_key.borrow() != current {
+            if let Err(e) = self.store.observe_group_key(&current) {
+                self.note_global(
+                    "agent_group_key_unrecorded",
+                    "",
+                    json!({ "error": e.to_string() }),
+                );
+                return None;
+            }
+            self.group_key.send_replace(current.clone());
+        }
+        if let Some(next) = &keys.next {
+            // The number of a next key that arrived without one (the
+            // distribution of a rotation records its own) follows the
+            // current one. Looked at only while a next key lies there.
+            if let Ok((Some(have), None)) = self.store.group_keys() {
+                let _ = self
+                    .store
+                    .set_next_group_key(&crate::storage::KeyGeneration {
+                        generation: have.generation + 1,
+                        fingerprint: crate::group::fingerprint(next),
+                    });
+            }
+        }
+        Some(current)
+    }
+
+    /// Whether a member told this worker that the identity it answers with
+    /// is retired, how many attempts (of any member) are still live, and how
+    /// many results the members that still use the identity have not
+    /// collected (`None`: not readable now). An ephemeral worker ends itself
+    /// on these.
+    pub fn retirement(&self) -> (bool, Option<u64>, Option<u64>) {
+        let boot = self.cfg.advertised_boot();
+        let told = self.store.identity_retired_by_any(boot).unwrap_or(false);
+        (
+            told,
+            self.store.count_nonterminal().ok(),
+            self.store.count_uncollected_of_serving_members(boot).ok(),
+        )
+    }
+
+    /// The fingerprint of the current group key, for a connection to watch.
+    pub fn group_key_changes(&self) -> tokio::sync::watch::Receiver<String> {
+        self.group_key.subscribe()
+    }
+
+    /// A member tells this worker that it retired the identity this worker
+    /// still answers with (spec 24.3). Only for this worker's own name and
+    /// its present identity; anything else is refused and changes nothing.
+    /// The member's live attempts are stopped now instead of when their
+    /// lease runs out, by the same path (the lease is marked expired, the
+    /// supervisor stops the command, the attempt ends `interrupted`), and
+    /// the retirement is recorded: this member's connections are refused
+    /// for as long as the identity lasts. Other members' attempts,
+    /// connections and leases are not touched. The same notice again gives
+    /// the same answer.
+    fn identity_retired(
+        self: &Arc<Self>,
+        store: &WorkerStore,
+        r: crate::wire::IdentityRetiredRequest,
+    ) -> Result<crate::wire::IdentityRetiredResponse, ApiError> {
+        if r.worker_id != self.cfg.worker_id
+            || &r.worker_boot_id != self.cfg.advertised_boot()
+            || Some(&r.coordinator_id) != store.member().as_ref()
+        {
+            return Err(ApiError::new(
+                ErrorCode::NotFound,
+                "the notice does not name this worker's present identity and the member that sends it",
+            ));
+        }
+        let at = now();
+        store
+            .record_identity_retired(&r.worker_boot_id, at)
+            .map_err(api)?;
+        for rec in &store.list_nonterminal_of_member().map_err(api)? {
+            // Idempotent: the first call writes `lease_expired`, a repeat
+            // changes nothing. A renewal is refused from here on.
+            store.expire_lease(&rec.attempt_id, at).map_err(api)?;
+            self.kick(&rec.attempt_id);
+        }
+        Ok(crate::wire::IdentityRetiredResponse {
+            schema_version: SchemaVersion::CURRENT,
+            worker_id: r.worker_id,
+            worker_boot_id: r.worker_boot_id,
+        })
     }
 
     /// Whether a diagnostic about `subject` is new (not the one written last).
@@ -2086,20 +2227,29 @@ impl Agent {
         request
             .ensure_current_schema()
             .map_err(|e| ApiError::new(ErrorCode::ProtocolIncompatible, e.to_string()))?;
+        // The member of this connection: what it names by attempt id is its
+        // own attempt, and another member's is not found.
+        let store = &self.store.for_member(&session.coordinator_id);
         match request {
             Request::Hello(_) => Err(invalid("hello is the first request of a connection")),
+            Request::GroupProof(_) => Err(invalid(
+                "the group proof follows hello, once per connection",
+            )),
+            Request::IdentityRetired(r) => self
+                .identity_retired(store, r)
+                .map(Response::IdentityRetired),
             Request::Inspect(r) => self.inspect(r).map(Response::Inspect),
-            Request::SubmitAttempt(r) => self.submit(r).map(Response::SubmitAttempt),
+            Request::SubmitAttempt(r) => self.submit(store, r).map(Response::SubmitAttempt),
             Request::GetAttempt(r) => {
-                let rec = self.known(&r.attempt_id)?;
+                let rec = self.known(store, &r.attempt_id)?;
                 self.status(&rec).map(Response::GetAttempt)
             }
-            Request::ListAttempts(r) => self.list(r).map(Response::ListAttempts),
+            Request::ListAttempts(r) => self.list(store, r).map(Response::ListAttempts),
             Request::WorkflowArtifact(r) => {
-                let rec = self.known(&r.attempt_id)?;
+                let rec = self.known(store, &r.attempt_id)?;
                 Self::generation(&rec, r.generation)?;
                 if r.coordinator_epoch != session.coordinator_epoch
-                    || r.coordinator_epoch < self.store.max_coordinator_epoch().map_err(api)?
+                    || r.coordinator_epoch < store.max_coordinator_epoch().map_err(api)?
                 {
                     return Err(ApiError::new(
                         ErrorCode::StaleEpoch,
@@ -2130,30 +2280,29 @@ impl Agent {
                     })
                     .map_err(|e| invalid(e.to_string()))
             }
-            Request::RenewLease(r) => self.renew(r).map(Response::RenewLease),
-            Request::CancelAttempt(r) => self.cancel(r).map(Response::CancelAttempt),
-            Request::RetireAttempt(r) => self.retire(r).map(Response::RetireAttempt),
-            Request::WatchEvents(r) => self.watch(r).map(Response::WatchEvents),
-            Request::ReadLog(r) => self.read_log(r).map(Response::ReadLog),
-            Request::GetResult(r) => self.result(r).map(Response::GetResult),
-            Request::AckCollected(r) => self.ack(session, r).map(Response::AckCollected),
-            Request::SecretBundlePut(r) => self.secrets(r).map(Response::SecretBundlePut),
+            Request::RenewLease(r) => self.renew(store, r).map(Response::RenewLease),
+            Request::CancelAttempt(r) => self.cancel(store, r).map(Response::CancelAttempt),
+            Request::RetireAttempt(r) => self.retire(store, r).map(Response::RetireAttempt),
+            Request::WatchEvents(r) => self.watch(store, r).map(Response::WatchEvents),
+            Request::ReadLog(r) => self.read_log(store, r).map(Response::ReadLog),
+            Request::GetResult(r) => self.result(store, r).map(Response::GetResult),
+            Request::AckCollected(r) => self.ack(store, &session, r).map(Response::AckCollected),
+            Request::SecretBundlePut(r) => self.secrets(store, r).map(Response::SecretBundlePut),
             Request::BlobPut(r) => {
                 let (host, limits) = (self.host.as_ref(), &self.cfg.blobs);
-                blobs::put(&self.store, host, limits, &self.cfg.state_dir, &r)
-                    .map(Response::BlobPut)
+                blobs::put(store, host, limits, &self.cfg.state_dir, &r).map(Response::BlobPut)
             }
             Request::BlobVerify(r) => {
                 blobs::verify(self.host.as_ref(), &self.cfg.blobs, &r).map(Response::BlobVerify)
             }
             Request::BlobGet(r) => {
-                self.known(&r.attempt_id)?;
-                blobs::get(&self.store, &self.cfg.attempts_root(), &r).map(Response::BlobGet)
+                self.known(store, &r.attempt_id)?;
+                blobs::get(store, &self.cfg.attempts_root(), &r).map(Response::BlobGet)
             }
-            Request::Forecast(r) => self.forecast(r).map(Response::Forecast),
+            Request::Forecast(r) => self.forecast(store, r).map(Response::Forecast),
             Request::ForecastCommand(r) => {
                 let attempts = self.store.list_nonterminal().map_err(api)?;
-                let max_epoch = self.store.max_coordinator_epoch().map_err(api)?;
+                let max_epoch = store.max_coordinator_epoch().map_err(api)?;
                 let ident = crate::forecast::plan::Ident {
                     worker_id: self.cfg.worker_id.clone(),
                     boot_id: self.cfg.advertised_boot().clone(),
@@ -2217,18 +2366,18 @@ impl Agent {
                     },
                 ))
             }
-            Request::EnvSync(r) => self.env_sync(r).map(Response::EnvSync),
+            Request::EnvSync(r) => self.env_sync(store, r).map(Response::EnvSync),
             Request::EnvReport(r) => self.env_report(r).map(Response::EnvReport),
         }
     }
 
     /// The record, or why there is none: `RETIRED` for a tombstone without an
     /// attempt, else `NOT_FOUND`.
-    fn known(&self, attempt: &AttemptId) -> Result<AcceptedAttempt, ApiError> {
-        if let Some(rec) = self.store.get(attempt).map_err(api)? {
+    fn known(&self, store: &WorkerStore, attempt: &AttemptId) -> Result<AcceptedAttempt, ApiError> {
+        if let Some(rec) = store.get(attempt).map_err(api)? {
             return Ok(rec);
         }
-        if self.store.tombstone(attempt).map_err(api)?.is_some() {
+        if store.tombstone(attempt).map_err(api)?.is_some() {
             return Err(ApiError::new(
                 ErrorCode::Retired,
                 format!("attempt {attempt} has a tombstone and was never accepted"),
@@ -2256,6 +2405,7 @@ impl Agent {
 
     fn submit(
         self: &Arc<Self>,
+        store: &WorkerStore,
         r: SubmitAttemptRequest,
     ) -> Result<SubmitAttemptResponse, ApiError> {
         // The claimed hash is the sender's word: recompute it.
@@ -2267,8 +2417,8 @@ impl Agent {
         // A resend of an accepted attempt is answered with what is there
         // (spec 11, idempotency): its payload was checked when it was
         // accepted, and it adds no load. The store still compares the hash.
-        let fresh = self.store.get(&r.attempt_id).map_err(api)?.is_none()
-            && self.store.tombstone(&r.attempt_id).map_err(api)?.is_none();
+        let fresh = store.get(&r.attempt_id).map_err(api)?.is_none()
+            && store.tombstone(&r.attempt_id).map_err(api)?.is_none();
         if fresh {
             policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
             super::ci_task::check_accepted(&self.cfg.state_dir, &r.payload)?;
@@ -2295,7 +2445,7 @@ impl Agent {
                     check_artifacts_not_secret(&r.payload, &secrets)?;
                 }
             }
-            let live = self.store.count_nonterminal().map_err(api)?;
+            let live = store.count_nonterminal().map_err(api)?;
             if policy::at_live_cap(live, self.cfg.max_live_attempts) {
                 return Err(ApiError::new(
                     ErrorCode::Overloaded,
@@ -2321,8 +2471,7 @@ impl Agent {
                     .map_err(|e| internal("profile identity", e))?,
             );
         }
-        let outcome = self
-            .store
+        let outcome = store
             .submit(
                 NewAcceptance {
                     attempt_id: r.attempt_id.clone(),
@@ -2393,12 +2542,15 @@ impl Agent {
         })
     }
 
-    fn list(&self, r: ListAttemptsRequest) -> Result<ListAttemptsResponse, ApiError> {
+    fn list(
+        &self,
+        store: &WorkerStore,
+        r: ListAttemptsRequest,
+    ) -> Result<ListAttemptsResponse, ApiError> {
         // One more than fits: an answer that would be cut is an error, the
         // caller narrows `states` instead of trusting a part of the list.
         let cap = self.cfg.max_list_attempts;
-        let recs = self
-            .store
+        let recs = store
             .list_attempts(
                 r.states.as_deref(),
                 r.include_terminal,
@@ -2420,14 +2572,17 @@ impl Agent {
         })
     }
 
-    fn renew(&self, r: RenewLeaseRequest) -> Result<RenewLeaseResponse, ApiError> {
-        let rec = self.known(&r.attempt_id)?;
+    fn renew(
+        &self,
+        store: &WorkerStore,
+        r: RenewLeaseRequest,
+    ) -> Result<RenewLeaseResponse, ApiError> {
+        let rec = self.known(store, &r.attempt_id)?;
         Self::generation(&rec, r.generation)?;
         // The new key and the time of its grant change as one step for a
         // start that measures the lease (`lease_step`).
         let renewing = lock(&self.lease_step);
-        let outcome = self
-            .store
+        let outcome = store
             .renew_lease(&r.attempt_id, r.key(), now())
             .map_err(api)?;
         let extended = outcome == LeaseOutcome::Extended;
@@ -2455,15 +2610,15 @@ impl Agent {
 
     fn cancel(
         self: &Arc<Self>,
+        store: &WorkerStore,
         r: CancelAttemptRequest,
     ) -> Result<CancelAttemptResponse, ApiError> {
-        if let Some(rec) = self.store.get(&r.attempt_id).map_err(api)? {
+        if let Some(rec) = store.get(&r.attempt_id).map_err(api)? {
             Self::generation(&rec, r.generation)?;
         }
         // Persisted first; the supervisor (or the watcher, before a
         // supervisor exists) acts on it.
-        let outcome = self
-            .store
+        let outcome = store
             .cancel(&r.attempt_id, r.coordinator_epoch, now())
             .map_err(api)?;
         let (state, tombstone) = match outcome {
@@ -2486,10 +2641,11 @@ impl Agent {
 
     fn retire(
         self: &Arc<Self>,
+        store: &WorkerStore,
         r: RetireAttemptRequest,
     ) -> Result<RetireAttemptResponse, ApiError> {
         let a = &r.attempt_id;
-        let before = self.store.get(a).map_err(api)?;
+        let before = store.get(a).map_err(api)?;
         if let Some(rec) = &before {
             Self::generation(rec, r.generation)?;
         }
@@ -2498,8 +2654,7 @@ impl Agent {
             .is_some_and(|b| b.state == AttemptState::Terminal);
         // The tombstone is durable before anything else: a submit that
         // arrives late is refused from here on.
-        let known = self
-            .store
+        let known = store
             .retire(a, r.coordinator_epoch, now())
             .map_err(api)?
             .is_some();
@@ -2512,7 +2667,7 @@ impl Agent {
             let mut waited = 0;
             loop {
                 now_terminal = matches!(
-                    self.store.get(a).map_err(api)?,
+                    store.get(a).map_err(api)?,
                     Some(rec) if rec.state == AttemptState::Terminal
                 );
                 if now_terminal || waited >= self.cfg.retire_wait_ms || self.stopping() {
@@ -2523,7 +2678,7 @@ impl Agent {
                 waited += step;
             }
         }
-        let had_launches = known && !self.store.launches(a).map_err(api)?.is_empty();
+        let had_launches = known && !store.launches(a).map_err(api)?.is_empty();
         Ok(RetireAttemptResponse {
             schema_version: SchemaVersion::CURRENT,
             attempt_id: r.attempt_id,
@@ -2532,15 +2687,18 @@ impl Agent {
         })
     }
 
-    fn watch(&self, r: WatchEventsRequest) -> Result<WatchEventsResponse, ApiError> {
+    fn watch(
+        &self,
+        store: &WorkerStore,
+        r: WatchEventsRequest,
+    ) -> Result<WatchEventsResponse, ApiError> {
         // The wire `seq` is per attempt, so one cursor follows one attempt.
         let Some(a) = r.attempt_id else {
             return Err(invalid("watch_events needs an attempt_id"));
         };
-        self.known(&a)?;
+        self.known(store, &a)?;
         let scan = self.cfg.max_event_scan;
-        let journal = self
-            .store
+        let journal = store
             .events_of_attempt(&a, scan.saturating_add(1))
             .map_err(api)?;
         if !policy::fits(journal.len(), scan) {
@@ -2577,8 +2735,12 @@ impl Agent {
         })
     }
 
-    fn read_log(&self, r: ReadLogRequest) -> Result<ReadLogResponse, ApiError> {
-        let rec = self.known(&r.attempt_id)?;
+    fn read_log(
+        &self,
+        store: &WorkerStore,
+        r: ReadLogRequest,
+    ) -> Result<ReadLogResponse, ApiError> {
+        let rec = self.known(store, &r.attempt_id)?;
         let reader = match SpoolReader::open(&self.cfg.attempts_root(), &r.attempt_id) {
             Ok(reader) => reader,
             // Nothing was written yet. Only an ended attempt has no more to
@@ -2615,8 +2777,13 @@ impl Agent {
     /// by the supervisor) is the truth when there is one; an attempt that
     /// ended without one (settled by the agent or by recovery) has its
     /// termination and nothing else.
-    fn ended(&self, attempt: &AttemptId, generation: Generation) -> Result<Ended, ApiError> {
-        let rec = self.known(attempt)?;
+    fn ended(
+        &self,
+        store: &WorkerStore,
+        attempt: &AttemptId,
+        generation: Generation,
+    ) -> Result<Ended, ApiError> {
+        let rec = self.known(store, attempt)?;
         Self::generation(&rec, generation)?;
         let Some(t) = rec.termination else {
             return Err(ApiError::new(
@@ -2624,7 +2791,7 @@ impl Agent {
                 format!("attempt {attempt} has not ended"),
             ));
         };
-        let stored = self.store.get_result(attempt).map_err(api)?;
+        let stored = store.get_result(attempt).map_err(api)?;
         let artifacts: Vec<ArtifactRecord> = match &stored {
             Some(v) => serde_json::from_value(v["artifacts"].clone())
                 .map_err(|e| internal("stored artifacts", e))?,
@@ -2643,12 +2810,15 @@ impl Agent {
         Ok((t, artifacts, not_stored, digest, has_result))
     }
 
-    fn result(&self, r: GetResultRequest) -> Result<GetResultResponse, ApiError> {
+    fn result(
+        &self,
+        store: &WorkerStore,
+        r: GetResultRequest,
+    ) -> Result<GetResultResponse, ApiError> {
         let (termination, artifacts, artifacts_not_stored, result_digest, _) =
-            self.ended(&r.attempt_id, r.generation)?;
+            self.ended(store, &r.attempt_id, r.generation)?;
         Ok(GetResultResponse {
-            outputs_evaluated: self
-                .store
+            outputs_evaluated: store
                 .get_result(&r.attempt_id)
                 .map_err(api)?
                 .is_some_and(|v| v["outputs_evaluated"] == true),
@@ -2665,10 +2835,11 @@ impl Agent {
 
     fn ack(
         &self,
-        session: Session,
+        store: &WorkerStore,
+        session: &Session,
         r: AckCollectedRequest,
     ) -> Result<AckCollectedResponse, ApiError> {
-        let (_, _, _, digest, has_result) = self.ended(&r.attempt_id, r.generation)?;
+        let (_, _, _, digest, has_result) = self.ended(store, &r.attempt_id, r.generation)?;
         if digest != r.result_digest {
             // The parent stored something else than what is here: the
             // protection stays.
@@ -2699,7 +2870,7 @@ impl Agent {
         // A result that is stored between that read and this write is
         // another result than the acknowledged one: refused like a digest
         // that does not match.
-        self.store
+        store
             .ack_collected_as_read(&r.attempt_id, session.coordinator_epoch, now(), has_result)
             .map_err(api)?;
         Ok(AckCollectedResponse {
@@ -2709,13 +2880,17 @@ impl Agent {
         })
     }
 
-    fn secrets(&self, r: SecretBundlePutRequest) -> Result<SecretBundlePutResponse, ApiError> {
+    fn secrets(
+        &self,
+        store: &WorkerStore,
+        r: SecretBundlePutRequest,
+    ) -> Result<SecretBundlePutResponse, ApiError> {
         // The cleanup of an ended attempt takes the same lock and runs only
         // after the end is in the database: read under the lock, the state
         // either still allows the placement (the cleanup then erases what is
         // placed) or it shows the end and nothing is placed.
         let _one = lock(shard(&self.shards, &r.attempt_id));
-        let rec = self.known(&r.attempt_id)?;
+        let rec = self.known(store, &r.attempt_id)?;
         Self::generation(&rec, r.generation)?;
         let ws = self.workspace_of(&r.attempt_id);
         let stop = rec.retired || rec.cancel_requested_at_ms.is_some();
@@ -2756,9 +2931,13 @@ impl Agent {
     }
 
     /// Read-only: nothing is written, whatever the request.
-    fn forecast(&self, r: ForecastRequest) -> Result<ForecastResponse, ApiError> {
-        let attempts = self.store.list_nonterminal().map_err(api)?;
-        let max_epoch = self.store.max_coordinator_epoch().map_err(api)?;
+    fn forecast(
+        &self,
+        store: &WorkerStore,
+        r: ForecastRequest,
+    ) -> Result<ForecastResponse, ApiError> {
+        let attempts = store.list_nonterminal().map_err(api)?;
+        let max_epoch = store.max_coordinator_epoch().map_err(api)?;
         let ident = crate::forecast::plan::Ident {
             worker_id: self.cfg.worker_id.clone(),
             boot_id: self.cfg.advertised_boot().clone(),
@@ -2920,6 +3099,63 @@ impl Agent {
             draining: super::control::Control::effective(&self.cfg.state_dir).drain,
         })
     }
+}
+
+/// The most dropped attempts one start clears; more wait for the next start.
+const DROPPED_PER_START: u32 = 10_000;
+
+/// What [`remove_dropped_attempts`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DroppedReport {
+    /// Directories (or a link standing in their place) that were removed.
+    pub removed: u32,
+    /// Entries that were let go without touching anything: no directory, a
+    /// name that is not an attempt id, or an id a member holds again.
+    pub skipped: u32,
+    /// What could not be removed (`attempt`, the I/O error): still listed,
+    /// tried again at the next start.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Remove the directories of the attempts the rebuild of the worker database
+/// dropped (migration step 4): their spec, supervisor state and workspace
+/// record have no row that would clean them up. Only an entry directly below
+/// `attempts_root` whose name is one of the dropped ids is touched. A
+/// symbolic link in its place is unlinked, never followed, and links inside
+/// the directory are removed as links. An id that a member holds again is
+/// left alone. Each entry is forgotten once its directory is gone, so a pass
+/// that was cut short goes on at the next start.
+pub fn remove_dropped_attempts(
+    attempts_root: &Path,
+    store: &WorkerStore,
+) -> Result<DroppedReport, StorageError> {
+    let mut report = DroppedReport::default();
+    for id in store.dropped_attempts(DROPPED_PER_START)? {
+        // `parse` re-encodes the id, so only the canonical spelling passes:
+        // nothing that could name another place.
+        let canonical = AttemptId::parse(&id).is_ok_and(|a| a.as_str() == id);
+        if !canonical || store.attempt_id_held(&id)? {
+            store.forget_dropped_attempt(&id)?;
+            report.skipped += 1;
+            continue;
+        }
+        let path = attempts_root.join(&id);
+        let removed = match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+            Err(e) => Err(e),
+        };
+        match removed {
+            Ok(()) => report.removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.skipped += 1,
+            Err(e) => {
+                report.failed.push((id, e.to_string()));
+                continue;
+            }
+        }
+        store.forget_dropped_attempt(&id)?;
+    }
+    Ok(report)
 }
 
 fn acquire_lock(cfg: &AgentConfig) -> Result<ProcessLock, ApiError> {

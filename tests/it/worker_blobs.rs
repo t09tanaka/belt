@@ -345,6 +345,7 @@ exec "{real}" "$@"
         cfg.retry_ms = 200;
         cfg.term_grace_ms = 2_000;
         cfg.kill_wait_ms = 2_000;
+        crate::proto_common::place_group_key(&cfg.group_key_path);
         cfg
     }
     fn start(&self) -> Arc<Agent> {

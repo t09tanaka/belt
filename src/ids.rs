@@ -46,6 +46,12 @@ macro_rules! prefixed_id {
                 Self(format!("{}_{}", $prefix, Ulid::new()))
             }
 
+            /// The identifier with an all-zero ULID. Nothing generates it;
+            /// it stands for "no such thing" where a value is required.
+            pub fn nil() -> Self {
+                Self(format!("{}_{}", $prefix, Ulid::nil()))
+            }
+
             /// Parse and validate `<prefix>_<ULID>`. The ULID part is re-encoded
             /// in its canonical upper-case form, so equal identifiers compare
             /// and hash equal whatever case they arrived in.

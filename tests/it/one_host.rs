@@ -130,8 +130,23 @@ pub(crate) async fn connect_agent(
     let (near, far) = duplex_pair(64 * 1024);
     let cluster = c.store().cluster_id().clone();
     let permits = Arc::new(Semaphore::new(64));
-    tokio::spawn(serve_connection(agent, far, cluster.clone(), permits));
-    let cfg = ClientConfig::new(cluster, c.store().coordinator_id().clone(), c.epoch());
+    tokio::spawn(serve_connection(
+        agent.clone(),
+        far,
+        cluster.clone(),
+        permits,
+    ));
+    let membership = belt::protocol::Membership::load(
+        agent.config().worker_id.clone(),
+        &agent.config().group_key_path,
+    )
+    .unwrap();
+    let cfg = ClientConfig::new(
+        cluster,
+        c.store().coordinator_id().clone(),
+        c.epoch(),
+        membership,
+    );
     let client = connect(near, cfg).await.unwrap().client;
     Arc::new(FaultLink {
         inner: ClientLink::new(client, Duration::from_secs(30)),

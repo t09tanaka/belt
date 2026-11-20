@@ -228,8 +228,13 @@ async fn connected_without(
         cluster.clone(),
         c.store().coordinator_id().clone(),
         c.epoch(),
+        super::proto_common::membership("parent"),
     );
-    let mut server = ServerConfig::new(cluster, super::proto_common::identity(name));
+    let mut server = ServerConfig::new(
+        cluster,
+        super::proto_common::identity(name),
+        belt::group::Keys::only(super::proto_common::group_key()),
+    );
     server
         .local
         .features
@@ -411,8 +416,13 @@ async fn runtime_attach_carries_whether_the_worker_answers_env_sync() {
         cluster.clone(),
         c.store().coordinator_id().clone(),
         c.epoch(),
+        super::proto_common::membership("parent"),
     );
-    let mut server = ServerConfig::new(cluster, super::proto_common::identity("old"));
+    let mut server = ServerConfig::new(
+        cluster,
+        super::proto_common::identity("old"),
+        belt::group::Keys::only(super::proto_common::group_key()),
+    );
     server.local.features.retain(|f| f != ENV_SYNC_FEATURE);
     let (connection, accepted) = tokio::join!(connect(near, client), accept(far, server));
     let seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -457,4 +467,103 @@ async fn runtime_attach_carries_whether_the_worker_answers_env_sync() {
         "{}",
         sent.message
     );
+}
+
+/// Spec 24.3: a retired identity that answers again is not attached, and is
+/// told that it was retired before the connection goes. The notice is the
+/// only thing sent to it, it is sent on each such connection (it may not
+/// have arrived), and the first sending is recorded.
+#[tokio::test]
+async fn a_retired_identity_that_answers_is_told_so_and_is_not_attached() {
+    use belt::wire::{IdentityRetiredResponse, Request, Response, SchemaVersion};
+    let root = crate::test_tmp::tempdir().unwrap();
+    let mut cfg = config();
+    let priority = cfg.local_worker_priority.clone();
+    cfg.workers.push(WorkerSpec {
+        id: "remote".into(),
+        ssh: "host".into(),
+        binary: None,
+        service_mode: None,
+        labels: vec![],
+        ephemeral: true,
+        priority,
+    });
+    let settings = cfg.runtime_settings().unwrap();
+    let c = settings
+        .start_coordinator(
+            CoordinatorStore::open(root.path(), 1).unwrap(),
+            Arc::new(UnknownCosts),
+        )
+        .unwrap();
+    let remote = WorkerId::parse("remote").unwrap();
+    let boot = super::proto_common::identity("remote").worker_boot_id;
+    cfg.attach_worker(
+        &c,
+        WorkerTarget::Remote("remote"),
+        connected(&c, "remote").await,
+    )
+    .await
+    .unwrap();
+    c.detach(&remote).await.unwrap();
+    let forgotten = c.forget_worker(&remote, Some(true)).await.unwrap();
+    assert!(forgotten.is_ok_and(|f| f.identity.as_deref() == Some(boot.as_str())));
+    assert_eq!(
+        c.store().identity_retired_notice(&remote, &boot).unwrap(),
+        None
+    );
+
+    let mut first_sent = None;
+    for _ in 0..2 {
+        let (near, far) = duplex_pair(65536);
+        let cluster = c.store().cluster_id().clone();
+        let client = ClientConfig::new(
+            cluster.clone(),
+            c.store().coordinator_id().clone(),
+            c.epoch(),
+            super::proto_common::membership("parent"),
+        );
+        let server = ServerConfig::new(
+            cluster,
+            super::proto_common::identity("remote"),
+            belt::group::Keys::only(super::proto_common::group_key()),
+        );
+        let (connection, accepted) = tokio::join!(connect(near, client), accept(far, server));
+        let (seen, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut incoming = accepted.unwrap().incoming;
+            while let Some(inbound) = incoming.next().await {
+                let _ = seen.send(inbound.request.clone());
+                if let Request::IdentityRetired(r) = &inbound.request {
+                    let answer = Response::IdentityRetired(IdentityRetiredResponse {
+                        schema_version: SchemaVersion::CURRENT,
+                        worker_id: r.worker_id.clone(),
+                        worker_boot_id: r.worker_boot_id.clone(),
+                    });
+                    let _ = inbound.responder.respond(answer).await;
+                }
+            }
+        });
+        let refused = cfg
+            .attach_worker(&c, WorkerTarget::Remote("remote"), connection.unwrap())
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(refused.code, belt::error::ErrorCode::Conflict);
+        assert!(refused.message.contains("retired"), "{}", refused.message);
+        let Some(Request::IdentityRetired(notice)) = requests.recv().await else {
+            panic!("the first request to a retired identity is the notice")
+        };
+        assert_eq!(&notice.coordinator_id, c.store().coordinator_id());
+        assert_eq!(notice.worker_id, remote);
+        assert_eq!(notice.worker_boot_id, boot);
+        // Nothing else was sent to it: no submit, no renew, no source.
+        assert!(requests.try_recv().is_err());
+        let sent = c.store().identity_retired_notice(&remote, &boot).unwrap();
+        assert!(sent.is_some());
+        assert_eq!(
+            *first_sent.get_or_insert(sent),
+            sent,
+            "the first one is kept"
+        );
+    }
 }

@@ -94,12 +94,13 @@ async fn connected(
     let (parent, peer) = crate::protocol::transport::duplex_pair(4096);
     let mut identity = crate::worker::serve::identity(&resident.agent).unwrap();
     identity.worker_id = WorkerId::parse(name).unwrap();
+    let group_keys = crate::group::load_keys(&resident.agent.config().group_key_path).unwrap();
     let cluster = resident.client.cluster_id.clone();
     let server_cluster = cluster.clone();
     let task = tokio::spawn(async move {
         let _accepted = crate::protocol::session::accept(
             peer,
-            crate::protocol::session::ServerConfig::new(server_cluster, identity),
+            crate::protocol::session::ServerConfig::new(server_cluster, identity, group_keys),
         )
         .await
         .unwrap();
@@ -111,6 +112,7 @@ async fn connected(
             cluster,
             resident.coordinator.store().coordinator_id().clone(),
             resident.coordinator.epoch(),
+            resident.coordinator.membership().unwrap(),
         ),
     )
     .await
@@ -302,6 +304,7 @@ async fn stopping_before_invalidation_rejects_late_ready_and_finishes_nested_ver
         .unwrap();
     let (parent, peer) = crate::protocol::transport::duplex_pair(4096);
     let identity = crate::worker::serve::identity(&resident.agent).unwrap();
+    let group_keys = crate::group::load_keys(&resident.agent.config().group_key_path).unwrap();
     let cluster = resident.client.cluster_id.clone();
     let server_cluster = cluster.clone();
     let (seen, received) = tokio::sync::oneshot::channel();
@@ -309,7 +312,7 @@ async fn stopping_before_invalidation_rejects_late_ready_and_finishes_nested_ver
     let server = tokio::spawn(async move {
         let mut accepted = crate::protocol::session::accept(
             peer,
-            crate::protocol::session::ServerConfig::new(server_cluster, identity),
+            crate::protocol::session::ServerConfig::new(server_cluster, identity, group_keys),
         )
         .await
         .unwrap();
@@ -339,6 +342,7 @@ async fn stopping_before_invalidation_rejects_late_ready_and_finishes_nested_ver
             cluster,
             resident.coordinator.store().coordinator_id().clone(),
             resident.coordinator.epoch(),
+            resident.coordinator.membership().unwrap(),
         ),
     )
     .await

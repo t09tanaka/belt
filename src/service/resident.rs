@@ -676,12 +676,23 @@ async fn connect_local(
         )
         .await;
     });
+    // This member's coordinator proves to its own worker like to any other.
+    let agent_config = parts.agent.config();
+    parts.coordinator.set_group_identity(
+        agent_config.worker_id.clone(),
+        agent_config.group_key_path.clone(),
+    );
+    let membership = parts
+        .coordinator
+        .membership()
+        .map_err(|e| anyhow::anyhow!(e.message))?;
     let connected = match connect(
         Io::from_stream(parent),
         ClientConfig::new(
             cluster.clone(),
             parts.coordinator.store().coordinator_id().clone(),
             parts.coordinator.epoch(),
+            membership,
         ),
     )
     .await

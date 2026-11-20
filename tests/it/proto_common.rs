@@ -2,10 +2,14 @@
 #![allow(dead_code)]
 
 use belt::error::ApiError;
+use belt::group::Keys;
 use belt::ids::*;
 use belt::protocol::hello::WorkerIdentity;
 use belt::protocol::transport::duplex_pair;
-use belt::protocol::{accept, connect, Accepted, ClientConfig, Connected, Incoming, ServerConfig};
+use belt::protocol::{
+    accept, connect, Accepted, ClientConfig, Connected, Incoming, Membership, ServerConfig,
+};
+use belt::secrets::key::ClusterKey;
 use belt::wire::*;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,16 +28,68 @@ pub fn identity(name: &str) -> WorkerIdentity {
     }
 }
 
+/// The group key of these tests.
+pub fn group_key() -> ClusterKey {
+    ClusterKey::from_bytes(vec![7; 32]).unwrap()
+}
+
+/// The member a test's coordinator connects as, holding [`group_key`].
+pub fn membership(name: &str) -> Membership {
+    Membership {
+        member: WorkerId::parse(name).unwrap(),
+        key: group_key(),
+    }
+}
+
+/// Put [`group_key`] where an agent reads its key, as a key file is kept:
+/// lower-case hex, readable by its owner only.
+pub fn place_group_key(path: &std::path::Path) {
+    place_key(path, &group_key());
+}
+
+/// Put `key` at `path` as a key file is kept.
+pub fn place_key(path: &std::path::Path, key: &ClusterKey) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let text: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
+    std::fs::write(path, format!("{text}\n")).unwrap();
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+
+/// The one member a test's group has unless the test makes more: every
+/// connection of a fixture is the same coordinator, as a reconnecting one is.
+pub fn coordinator_of(cluster: &ClusterId) -> CoordinatorId {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MEMBERS: OnceLock<Mutex<HashMap<String, CoordinatorId>>> = OnceLock::new();
+    MEMBERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(cluster.to_string())
+        .or_insert_with(CoordinatorId::generate)
+        .clone()
+}
+
 pub fn client_cfg(cluster: &ClusterId) -> ClientConfig {
     ClientConfig::new(
         cluster.clone(),
-        CoordinatorId::generate(),
+        coordinator_of(cluster),
         CoordinatorEpoch(1),
+        membership("parent"),
     )
 }
 
+/// [`client_cfg`] holding the key a started worker process keeps at
+/// `key_path`.
+pub fn client_cfg_keyed(cluster: &ClusterId, key_path: &std::path::Path) -> ClientConfig {
+    let mut cfg = client_cfg(cluster);
+    cfg.membership = Membership::load(cfg.membership.member.clone(), key_path).unwrap();
+    cfg
+}
+
 pub fn server_cfg(cluster: &ClusterId) -> ServerConfig {
-    ServerConfig::new(cluster.clone(), identity("w1"))
+    ServerConfig::new(cluster.clone(), identity("w1"), Keys::only(group_key()))
 }
 
 pub async fn pair(cluster: &ClusterId) -> (Connected, Accepted) {

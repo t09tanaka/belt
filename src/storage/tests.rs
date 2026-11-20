@@ -549,6 +549,7 @@ fn an_unbound_permit_of_a_step_12_file_gives_its_slot_back_when_migrated() {
                  DROP TABLE ci_test_timing; DROP TABLE workflow_artifact;
                  DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended;
                  DROP INDEX matrix_permit_held;
+                 DROP TABLE identity_retired_notice; DROP TABLE removed_member;
                  UPDATE schema_meta SET value='12' WHERE key='schema_version';",
             )?;
             Ok(())
@@ -1132,15 +1133,13 @@ fn a_cancel_that_arrives_first_leaves_a_tombstone_and_the_late_submit_is_retired
     assert!(matches!(e, StorageError::Retired(_)), "{e:?}");
     assert_eq!(e.code(), ErrorCode::Retired);
     assert!(w.store.get(&a).unwrap().is_none(), "nothing was accepted");
-    // The tombstone survives a restart and cannot be deleted.
+    // The tombstone survives a restart. (It goes only when the member's
+    // epoch moves on; `group_tests` has that, and that the tombstone of an
+    // accepted attempt cannot be deleted at all.)
     let Wx { dir, store, id } = w;
     drop(store);
     let store = WorkerStore::open(dir.path(), &id).unwrap();
     assert!(store.submit(acceptance(&a, &task, 'a', 1), 7).is_err());
-    assert!(store
-        .db
-        .call(|c| Ok(c.execute("DELETE FROM tombstone", [])?))
-        .is_err());
     // Retire upgrades the same tombstone.
     assert_eq!(store.retire(&a, CoordinatorEpoch(1), 8).unwrap(), None);
     assert_eq!(store.tombstone(&a).unwrap().as_deref(), Some("retire"));
@@ -1834,7 +1833,7 @@ fn many_connections_opening_a_fresh_worker_database_at_once_all_succeed() {
                 )?)
             })
             .unwrap();
-        assert_eq!(version, "3");
+        assert_eq!(version, "4");
     }
 }
 
@@ -2036,15 +2035,22 @@ fn a_failed_request_still_remembers_the_newer_coordinator_epoch() {
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
-    // A live-attempt refusal rolls back its own writes and keeps the epoch.
+    // A live-attempt refusal says "nothing was done": it rolls back its own
+    // writes and the epoch it carried as well (spec 24.4). The epoch a
+    // verdict left before it stands.
     let e = w
         .store
         .submit(acceptance(&AttemptId::generate(), &task, 'a', 7), 4)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::LiveAttemptExists(_)));
+    assert!(e.leaves_nothing());
     assert_eq!(w.store.list_nonterminal().unwrap().len(), 1);
-    let e = w.store.cancel(&a, CoordinatorEpoch(6), 5).err().unwrap();
+    assert_eq!(
+        w.store.max_coordinator_epoch().unwrap(),
+        CoordinatorEpoch(5)
+    );
+    let e = w.store.cancel(&a, CoordinatorEpoch(4), 5).err().unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
     // renew_lease on a retired attempt fails at epoch 9 and still raises it.
     w.store.retire(&a, CoordinatorEpoch(7), 6).unwrap();
@@ -2157,7 +2163,7 @@ fn tombstones_keep_their_identity_even_against_sql() {
     assert!(exec("UPDATE tombstone SET attempt_id = 'att_other' WHERE attempt_id = ?1").is_err());
     assert!(exec("UPDATE tombstone SET coordinator_epoch = 9 WHERE attempt_id = ?1").is_err());
     assert!(exec("UPDATE tombstone SET recorded_at_ms = 1 WHERE attempt_id = ?1").is_err());
-    assert!(exec("DELETE FROM tombstone WHERE attempt_id = ?1").is_err());
+    assert!(exec("UPDATE tombstone SET delivered = 1 WHERE attempt_id = ?1").is_err());
     // A cancel may grow into a retire (what `retire` does), and no further back.
     assert_eq!(
         exec("UPDATE tombstone SET kind = 'retire' WHERE attempt_id = ?1").unwrap(),
@@ -5111,7 +5117,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));

@@ -176,3 +176,80 @@ impl CoordinatorStore {
         self.db.write(move |tx| retire(tx, &worker, at_ms))
     }
 }
+
+impl CoordinatorStore {
+    /// The notice `identity_retired` was sent to the retired identity `boot`
+    /// of `worker`. Kept beside the identity tombstone, which never changes.
+    /// Returns whether this was the first one.
+    pub fn record_identity_retired_notice(
+        &self,
+        worker: &WorkerId,
+        boot: &WorkerBootId,
+        at_ms: u64,
+    ) -> Result<bool> {
+        let (w, b) = (worker.to_string(), boot.to_string());
+        self.db.write(move |tx| {
+            Ok(tx.execute(
+                "INSERT OR IGNORE INTO identity_retired_notice (worker_id, boot_id, sent_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![w, b, to_i64(at_ms)?],
+            )? == 1)
+        })
+    }
+
+    /// When the notice was first sent to that identity, if it was.
+    pub fn identity_retired_notice(
+        &self,
+        worker: &WorkerId,
+        boot: &WorkerBootId,
+    ) -> Result<Option<u64>> {
+        let (w, b) = (worker.to_string(), boot.to_string());
+        self.db.call(move |c| {
+            c.query_row(
+                "SELECT sent_at_ms FROM identity_retired_notice WHERE worker_id = ?1 AND boot_id = ?2",
+                params![w, b],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(crate::storage::to_u64)
+            .transpose()
+        })
+    }
+
+    /// A member was taken off the list: remember its name and when, for as
+    /// long as its machine may still be reachable over SSH (spec 24.2).
+    pub fn record_removed_member(&self, name: &WorkerId, at_ms: u64) -> Result<()> {
+        let n = name.to_string();
+        self.db.write(move |tx| {
+            tx.execute(
+                "INSERT OR IGNORE INTO removed_member (name, removed_at_ms) VALUES (?1, ?2)",
+                params![n, to_i64(at_ms)?],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// The removed members still remembered, by name.
+    pub fn removed_members(&self) -> Result<Vec<(String, u64)>> {
+        self.db.call(|c| {
+            let mut s =
+                c.prepare("SELECT name, removed_at_ms FROM removed_member ORDER BY name")?;
+            let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            let mut out = Vec::new();
+            for row in rows {
+                let (name, at) = row?;
+                out.push((name, crate::storage::to_u64(at)?));
+            }
+            Ok(out)
+        })
+    }
+
+    /// The removed member is not reachable any more (or is a member again):
+    /// drop the record. Returns whether there was one.
+    pub fn clear_removed_member(&self, name: &WorkerId) -> Result<bool> {
+        let n = name.to_string();
+        self.db.write(move |tx| {
+            Ok(tx.execute("DELETE FROM removed_member WHERE name = ?1", [&n])? == 1)
+        })
+    }
+}

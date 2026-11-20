@@ -16,6 +16,8 @@ mod common;
 mod coordinator;
 pub use coordinator::query;
 mod db;
+#[cfg(test)]
+mod group_tests;
 mod lock;
 #[cfg(test)]
 mod paging_tests;
@@ -38,8 +40,9 @@ pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPag
 pub use db::Db;
 pub use lock::ProcessLock;
 pub use worker::{
-    AcceptedAttempt, CancelOutcome, LaunchClaim, LeaseOutcome, LogPosition, NewAcceptance,
-    ProcessIdentity, SubmitOutcome, WorkerStore, DEFAULT_ACK_WAIT_MS,
+    AcceptedAttempt, CancelOutcome, KeyGeneration, LaunchClaim, LeaseOutcome, LogPosition,
+    MemberPin, NewAcceptance, ProcessIdentity, SubmitOutcome, WorkerStore, DEFAULT_ACK_WAIT_MS,
+    MAX_UNDELIVERED_TOMBSTONES,
 };
 
 use crate::error::ErrorCode;
@@ -81,6 +84,13 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
     #[error("database is not usable by this binary: {0:?}")]
     Incompatible(Incompat),
+    /// A migration step whose precondition does not hold. Nothing was
+    /// changed; the message says what to do.
+    #[error("the database cannot be migrated yet: {0}")]
+    MigrationRefused(String),
+    /// A per-member limit is reached. Nothing of the call was committed.
+    #[error("{0}")]
+    Overloaded(String),
     #[error("database holds a {found} schema, expected {expected}")]
     KindMismatch { expected: String, found: String },
     #[error("another process holds {}", .0.display())]
@@ -98,6 +108,13 @@ pub enum StorageError {
     },
     #[error("task already has a live attempt ({0})")]
     LiveAttemptExists(String),
+    /// The attempt id is held by an attempt of another member on this
+    /// worker (the attempt's files, its supervisor and its commands are
+    /// named by the attempt id alone). Nothing of the call was committed.
+    #[error(
+        "attempt id {0} is in use on this worker; place the task again under a new attempt id"
+    )]
+    AttemptIdInUse(AttemptId),
     #[error("lease for {0} cannot be renewed")]
     LeaseNotRenewable(AttemptId),
     #[error(transparent)]
@@ -143,12 +160,28 @@ impl StorageError {
         matches!(self, StorageError::Busy | StorageError::SourceBusy)
     }
 
+    /// True for a refusal that says "nothing was done": the request left no
+    /// trace at all, not even the newer coordinator epoch it carried, and
+    /// nothing it would have purged is gone. A verdict about the attempt
+    /// itself (retired, another payload, not renewable, ...) is not one of
+    /// these: the worker has seen the newer coordinator and says so.
+    pub fn leaves_nothing(&self) -> bool {
+        matches!(
+            self,
+            StorageError::Overloaded(_)
+                | StorageError::AttemptIdInUse(_)
+                | StorageError::LiveAttemptExists(_)
+                | StorageError::Invalid(_)
+        )
+    }
+
     /// The wire error code this maps to.
     pub fn code(&self) -> ErrorCode {
         match self {
-            StorageError::Incompatible(_) | StorageError::KindMismatch { .. } => {
-                ErrorCode::ProtocolIncompatible
-            }
+            StorageError::Incompatible(_)
+            | StorageError::KindMismatch { .. }
+            | StorageError::MigrationRefused(_) => ErrorCode::ProtocolIncompatible,
+            StorageError::Overloaded(_) | StorageError::AttemptIdInUse(_) => ErrorCode::Overloaded,
             StorageError::Locked(_)
             | StorageError::PayloadConflict(_)
             | StorageError::Immutable(_)

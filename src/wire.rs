@@ -247,10 +247,14 @@ pub enum Operation {
     ResolveToolchains,
     PreparationProbe,
     WorkflowArtifact,
+    /// The mutual proof of group membership that follows `hello`.
+    GroupProof,
+    /// The notice that a worker identity was retired.
+    IdentityRetired,
 }
 
 impl Operation {
-    pub const ALL: [Operation; 23] = [
+    pub const ALL: [Operation; 25] = [
         Operation::Hello,
         Operation::Inspect,
         Operation::Forecast,
@@ -274,6 +278,8 @@ impl Operation {
         Operation::ResolveToolchains,
         Operation::PreparationProbe,
         Operation::WorkflowArtifact,
+        Operation::GroupProof,
+        Operation::IdentityRetired,
     ];
 
     pub fn idempotency(self) -> Idempotency {
@@ -286,8 +292,10 @@ impl Operation {
             | Operation::AckCollected
             | Operation::BlobPut
             | Operation::SecretBundlePut
+            | Operation::IdentityRetired
             | Operation::EnvSync => Idempotency::RequestId,
             Operation::Hello
+            | Operation::GroupProof
             | Operation::Inspect
             | Operation::Forecast
             | Operation::ForecastCommand
@@ -358,23 +366,75 @@ pub struct HelloRequest {
     pub features: Vec<String>,
 }
 
+/// The answer to `hello`: the protocol version and the features, and a nonce
+/// for the group proof that follows. It says nothing about who answers: the
+/// worker's identity, epoch, profile and capabilities are in
+/// [`GroupProofResponse`], after the peer proved it is a member (spec 24.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloResponse {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
     pub schema_version: SchemaVersion,
-    /// The cluster this worker belongs to.
-    pub cluster_id: ClusterId,
     /// The version chosen from the coordinator's list.
     pub protocol_version: u32,
     pub features: Vec<String>,
+    /// Used once: the connecting member's proof answers it.
+    pub nonce: String,
+}
+
+/// The connecting member's proof that it holds the group key, sent once,
+/// right after `hello`. The group and the coordinator id are the ones the
+/// `hello` of this connection carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GroupProofRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    /// The name of the connecting member.
+    pub member: WorkerId,
+    /// The fingerprint of the key the proof was made with.
+    pub key_fingerprint: String,
+    /// Used once: the receiving member's proof answers it.
+    pub nonce: String,
+    /// HMAC over the group, the coordinator id, `member` and the receiving
+    /// side's nonce.
+    pub proof: String,
+}
+
+/// The receiving member's proof and, only now, who it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupProofResponse {
+    pub schema_version: SchemaVersion,
+    /// HMAC over the receiving member's name and the connecting side's nonce.
+    pub proof: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<crate::toolchain::capability::WorkerCapabilities>,
+    /// The receiving member's name.
     pub worker_id: WorkerId,
     pub worker_boot_id: WorkerBootId,
     pub agent_epoch: AgentEpoch,
     pub profile: String,
     pub profile_fingerprint: Digest,
-    /// The highest coordinator epoch the worker has seen.
+    /// The highest epoch the worker has seen of the connecting member.
     pub coordinator_epoch: CoordinatorEpoch,
+}
+
+/// A member tells a worker that it retired the identity the worker still
+/// answers with (spec 24.3). Sent once, before the connection is closed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct IdentityRetiredRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub coordinator_id: CoordinatorId,
+    pub worker_id: WorkerId,
+    /// The identity that was retired.
+    pub worker_boot_id: WorkerBootId,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IdentityRetiredResponse {
+    pub schema_version: SchemaVersion,
+    pub worker_id: WorkerId,
+    pub worker_boot_id: WorkerBootId,
 }
 
 // ---------------------------------------------------------------------------
@@ -1901,6 +1961,8 @@ operations! {
     ResolveToolchains(ResolveToolchainsRequest, ResolveToolchainsResponse),
     PreparationProbe(PreparationProbeRequest, PreparationProbeResponse),
     WorkflowArtifact(WorkflowArtifactRequest, WorkflowArtifactResponse),
+    GroupProof(GroupProofRequest, GroupProofResponse),
+    IdentityRetired(IdentityRetiredRequest, IdentityRetiredResponse),
 }
 
 /// An error reply.
@@ -2355,6 +2417,21 @@ mod tests {
             generation: Generation(1),
             command: WorkflowArtifactCommand::Poll,
         }));
+        out.push(Request::GroupProof(GroupProofRequest {
+            schema_version: SV,
+            request_id: rid(),
+            member: worker(),
+            key_fingerprint: "ab".repeat(16),
+            nonce: "cd".repeat(32),
+            proof: "ef".repeat(32),
+        }));
+        out.push(Request::IdentityRetired(IdentityRetiredRequest {
+            schema_version: SV,
+            request_id: rid(),
+            coordinator_id: CoordinatorId::generate(),
+            worker_id: worker(),
+            worker_boot_id: boot(),
+        }));
         out
     }
 
@@ -2391,17 +2468,10 @@ mod tests {
         };
         let mut out = vec![
             Response::Hello(HelloResponse {
-                capabilities: None,
                 schema_version: SV,
-                cluster_id: ClusterId::generate(),
                 protocol_version: 1,
                 features: vec![],
-                worker_id: worker(),
-                worker_boot_id: boot(),
-                agent_epoch: AgentEpoch(2),
-                profile: "default".into(),
-                profile_fingerprint: dg("p"),
-                coordinator_epoch: CoordinatorEpoch(3),
+                nonce: "cd".repeat(32),
             }),
             Response::Inspect(InspectResponse {
                 preparation_observations: None,
@@ -2570,6 +2640,22 @@ mod tests {
         out.push(Response::WorkflowArtifact(WorkflowArtifactResponse {
             schema_version: SV,
             result: ArtifactExchangeResult::Pending { action: None },
+        }));
+        out.push(Response::GroupProof(GroupProofResponse {
+            capabilities: None,
+            schema_version: SV,
+            proof: "ef".repeat(32),
+            worker_id: worker(),
+            worker_boot_id: boot(),
+            agent_epoch: AgentEpoch(2),
+            profile: "default".into(),
+            profile_fingerprint: dg("p"),
+            coordinator_epoch: CoordinatorEpoch(3),
+        }));
+        out.push(Response::IdentityRetired(IdentityRetiredResponse {
+            schema_version: SV,
+            worker_id: worker(),
+            worker_boot_id: boot(),
         }));
         out
     }
@@ -2821,6 +2907,8 @@ mod tests {
         use Operation::*;
         let expect = [
             (Hello, ReadOnly),
+            (GroupProof, ReadOnly),
+            (IdentityRetired, RequestId),
             (Inspect, ReadOnly),
             (Forecast, ReadOnly),
             (ForecastCommand, ReadOnly),
@@ -3797,9 +3885,32 @@ mod tests {
     }
 
     #[test]
-    fn hello_response_names_its_cluster() {
+    fn hello_response_carries_a_nonce_and_names_nobody() {
         let v = serde_json::to_value(&responses()[0]).unwrap();
-        assert!(v["cluster_id"].as_str().unwrap().starts_with("cl_"));
+        assert_eq!(v["nonce"].as_str().unwrap().len(), 64);
+        // Who answers (and in which group) is said after the proof only.
+        for field in [
+            "cluster_id",
+            "worker_id",
+            "worker_boot_id",
+            "agent_epoch",
+            "profile",
+            "profile_fingerprint",
+            "coordinator_epoch",
+            "capabilities",
+        ] {
+            assert!(v.get(field).is_none(), "{field}");
+        }
+        let proven = serde_json::to_value(responses().last().map(|_| {
+            responses()
+                .into_iter()
+                .find(|r| matches!(r, Response::GroupProof(_)))
+                .unwrap()
+        }))
+        .unwrap();
+        assert_eq!(proven["op"], "group_proof");
+        assert_eq!(proven["worker_id"], "mini-a");
+        assert_eq!(proven["coordinator_epoch"], 3);
         let s = serde_json::to_value(status()).unwrap();
         assert_eq!(s["worker_boot_id"], "boot-1");
         assert_eq!(s["agent_epoch"], 2);

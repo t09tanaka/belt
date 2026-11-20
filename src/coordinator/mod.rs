@@ -38,7 +38,7 @@ mod workflow_artifact;
 pub use input_gate::{PlacementInputs, ReadyInput};
 pub use link::{ClientLink, InputGate, LinkError, WorkerLink};
 
-use crate::error::{ApiError, ConflictReason, ErrorCode};
+use crate::error::{ApiError, ConflictReason, ErrorCode, OverloadedReason};
 use crate::ids::{
     AgentEpoch, AttemptId, CoordinatorEpoch, Generation, ManifestDigest, PlanDigest, RequestId,
     RunId, SourceId, TaskId, WorkerBootId, WorkerId,
@@ -75,6 +75,18 @@ use tokio::time::Instant;
 /// worker refused the attempt for good. Such an attempt is failed, not
 /// placed again, once the retire is confirmed.
 pub const REASON_SUBMIT_REFUSED: &str = "submit_refused";
+
+/// The reason recorded for a retire the coordinator starts because the
+/// worker answered that the attempt id is held there by an attempt of
+/// another member (spec 24.4). Once the retire is confirmed the task is free
+/// again and is placed under a new attempt id; no worker is left out for it
+/// and the task does not fail.
+pub const REASON_ATTEMPT_ID_IN_USE: &str = "attempt_id_in_use";
+
+/// The event on an attempt whose id its worker could not take. Payload:
+/// `{"worker", "code", "reason"}`; written with the tombstone, in one
+/// transaction.
+pub const EVENT_SUBMIT_REFUSED_ATTEMPT_ID: &str = "submit_refused_attempt_id";
 
 /// The most queued tasks one tick looks at.
 pub const DISPATCH_SCAN: u32 = 256;
@@ -381,6 +393,9 @@ async fn join_all<'a, T>(mut all: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a
 }
 
 pub struct Coordinator {
+    /// Who this coordinator is in the group: the name of its member and
+    /// where the member's group key is. Set once at startup.
+    group: std::sync::OnceLock<(WorkerId, std::path::PathBuf)>,
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
@@ -435,6 +450,7 @@ impl Coordinator {
     ) -> Result<Coordinator> {
         store.mark_reconciling()?;
         Ok(Coordinator {
+            group: std::sync::OnceLock::new(),
             store: Arc::new(store),
             cfg,
             workers: Mutex::default(),
@@ -465,6 +481,32 @@ impl Coordinator {
 
     pub fn store(&self) -> &CoordinatorStore {
         &self.store
+    }
+
+    /// Say who this coordinator is in the group: the name of the member it
+    /// runs on and the file of that member's group key. The first call
+    /// holds.
+    pub fn set_group_identity(&self, member: WorkerId, key_path: std::path::PathBuf) {
+        let _ = self.group.set((member, key_path));
+    }
+
+    /// The file of this member's group key, once the identity is set.
+    pub fn group_key_path(&self) -> Option<&std::path::Path> {
+        self.group.get().map(|(_, path)| path.as_path())
+    }
+
+    /// What this coordinator proves to a worker (spec 24.2): its member's
+    /// name and the group key, read now, so a key that was switched since
+    /// the last connection is the one used.
+    pub fn membership(&self) -> std::result::Result<crate::protocol::Membership, ApiError> {
+        let (member, key_path) = self.group.get().ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Internal,
+                "this coordinator was not told which member of the group it is",
+            )
+        })?;
+        crate::protocol::Membership::load(member.clone(), key_path)
+            .map_err(|e| ApiError::new(ErrorCode::Internal, format!("the group key: {e}")))
     }
 
     pub fn epoch(&self) -> CoordinatorEpoch {
@@ -1100,6 +1142,10 @@ impl Coordinator {
             self.unknown(&a.attempt_id, report).await?;
             return Ok(false);
         };
+        // An in-place task is never placed again by itself (it works on the
+        // user's own directory), so for it an attempt id in use is waited
+        // out like any other `OVERLOADED`: the same attempt is sent again.
+        let replaceable = !request.payload.in_place;
         match link.call(Request::SubmitAttempt(request)).await {
             Ok(Response::SubmitAttempt(r))
                 if r.attempt_id == a.attempt_id && r.generation == a.generation =>
@@ -1118,8 +1164,36 @@ impl Coordinator {
             }
             Err(LinkError::Remote(e)) => {
                 let mismatch = e.conflict_reason == Some(ConflictReason::PayloadMismatch);
-                match policy::submit_refusal(e.code, mismatch) {
+                let in_use =
+                    replaceable && e.overloaded_reason == Some(OverloadedReason::AttemptIdInUse);
+                match policy::submit_refusal(e.code, mismatch, in_use) {
                     Refusal::Fenced => Err(self.fence()),
+                    Refusal::Replace => {
+                        // The worker stored nothing of this attempt. A copy
+                        // of the submit that is still on its way could be
+                        // taken later, once the other member's attempt is
+                        // gone, so the attempt is retired there first (the
+                        // tombstone is this member's own and refuses that
+                        // copy); the task is free once the worker confirmed
+                        // and is then placed under a new attempt id.
+                        let refused = json!({
+                            "worker": a.worker_id.to_string(),
+                            "code": e.code.to_string(),
+                            "reason": REASON_ATTEMPT_ID_IN_USE,
+                        });
+                        let id = a.attempt_id.clone();
+                        self.db(move |s| {
+                            s.begin_retire_noting(
+                                &id,
+                                REASON_ATTEMPT_ID_IN_USE,
+                                Some((EVENT_SUBMIT_REFUSED_ATTEMPT_ID, &refused)),
+                                wall_ms(),
+                            )
+                        })
+                        .await?;
+                        self.observe(&a.attempt_id, Observation::Known).await?;
+                        Ok(false)
+                    }
                     Refusal::Tombstoned => {
                         self.observe(&a.attempt_id, Observation::Known).await?;
                         Ok(false)

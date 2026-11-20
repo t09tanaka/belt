@@ -590,9 +590,16 @@ HOME="$home" exec {} worker --stdio
             .outcome(),
         Outcome::Interrupted
     );
-    // The dial loop starts the next bridge only after it has reaped the
-    // previous one. Two new dials prove the returning worker's first
-    // connection was actually closed while its process was still alive.
+    // The worker is alive and still runs the command when it returns: the
+    // parent does not attach it, tells it that the identity is retired and
+    // closes the connection. The dial loop starts the next bridge only after
+    // it has reaped the previous one, so two new dials prove that the
+    // returning worker's first connection was closed.
+    assert_eq!(
+        super::common::identity_of(agent.pid).as_deref(),
+        Some(agent.start.as_str())
+    );
+    assert!(home.join(".belt").exists());
     let previous_dials = std::fs::read_to_string(home.join("bridge-dials"))
         .unwrap()
         .lines()
@@ -606,11 +613,20 @@ HOME="$home" exec {} worker --stdio
             >= previous_dials + 2
     })
     .await;
-    assert_eq!(
-        super::common::identity_of(agent.pid).as_deref(),
-        Some(agent.start.as_str())
-    );
     assert_eq!(store.worker_identity(&worker).unwrap(), None);
+    assert!(store
+        .identity_retired_notice(&worker, &identity)
+        .unwrap()
+        .is_some());
+    // Told so, the worker stops the command without waiting for its lease
+    // (nobody releases it here), and with nothing left running it ends by
+    // itself and takes its state with it (spec 24.3).
+    agent.wait().await;
+    assert!(
+        !home.join(".belt").exists(),
+        "the ephemeral worker left its state behind"
+    );
+    assert!(!root.join("release-ephemeral").exists());
     assert_eq!(store.attempts_of_task(&task).unwrap().len(), 1);
     assert_eq!(
         std::fs::read_to_string(root.join("count-ephemeral")).unwrap(),
@@ -620,9 +636,7 @@ HOME="$home" exec {} worker --stdio
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping
     ));
-    std::fs::write(root.join("release-ephemeral"), "").unwrap();
     owner.wait().await;
-    agent.stop().await;
 }
 
 /// A38 from the public CLI through a resident, its real local worker, a
@@ -767,4 +781,121 @@ async fn a38_public_ci_delivers_needs_outputs_and_a_verified_multifile_artifact_
         Reply::Stopping
     ));
     remote.stop().await;
+}
+
+/// A member that switches to the next group key closes the links it made
+/// itself: they were proven with the old key and are proven again with the
+/// new one (spec 24.2). The peer here has not switched (it holds both keys
+/// and would keep the old connection), so it is the connecting side that
+/// closes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_that_switches_the_key_closes_its_own_links_and_proves_again() {
+    let fixture = crate::test_tmp::tempdir().unwrap();
+    let root = fixture.path();
+    let state = root.join("parent");
+    let home = root.join("peer");
+    let bin = root.join("bin");
+    let config = root.join("config/belt");
+    for dir in [root, &state, &root.join("local"), &home, &bin, &config] {
+        private(dir);
+    }
+    // Each member has its own copy of the group key.
+    let key = root.join("key");
+    belt::secrets::key::init(&key).unwrap();
+    let peer_key = home.join("key");
+    let first_key = std::fs::read(&key).unwrap();
+    write_private(&peer_key, &first_key);
+    let cluster = CoordinatorStore::open(&state, wall_ms())
+        .unwrap()
+        .cluster_id()
+        .clone();
+    let mut peer = spawn_worker(&home, &cluster, &peer_key, "remote-a");
+    wait_for("the peer's socket", || {
+        assert!(peer.child.as_mut().unwrap().try_wait().unwrap().is_none());
+        home.join(".belt/agent.sock").exists()
+    })
+    .await;
+    write_private(
+        &config.join("config.toml"),
+        format!(
+            "schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\n[[workers]]\nid='remote-a'\nssh='{}'\n",
+            home.display()
+        )
+        .as_bytes(),
+    );
+    let ssh = bin.join("ssh");
+    std::fs::write(
+        &ssh,
+        format!(
+            r#"#!/bin/sh
+while [ "$#" -gt 0 ] && [ "$1" != -- ]; do shift; done
+[ "$#" = 3 ] || exit 91
+home=$2
+[ "$3" = "'belt' 'worker' '--stdio'" ] || exit 91
+echo $$ > "$home/bridge.pid"
+echo $$ >> "$home/bridge-dials"
+HOME="$home" exec {} worker --stdio
+"#,
+            belt::protocol::ssh::quote(BIN)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&ssh, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (owner, client, _spec) = start_parent(root, &state, &key, &cluster).await;
+    let dials = || {
+        std::fs::read_to_string(home.join("bridge-dials"))
+            .map(|t| t.lines().count())
+            .unwrap_or(0)
+    };
+    // The peer records a member once its proof held.
+    let proven = || {
+        belt::storage::WorkerStore::open_read_only(&home.join(".belt"))
+            .and_then(|s| s.members())
+            .is_ok_and(|m| !m.is_empty())
+    };
+    wait_for("the link to the peer to be proven", || {
+        proven() && bridge(&home, owner.pid).is_some()
+    })
+    .await;
+    let (first, _) = bridge(&home, owner.pid).unwrap();
+    let before = dials();
+
+    // The first stage of a rotation reaches both members.
+    let second = root.join("second-key");
+    belt::secrets::key::init(&second).unwrap();
+    let next_key = std::fs::read(&second).unwrap();
+    assert_ne!(next_key, first_key);
+    write_private(&belt::group::next_key_path(&peer_key), &next_key);
+    write_private(&belt::group::next_key_path(&key), &next_key);
+    // The second stage reaches only this member.
+    assert!(belt::group::switch_to_next(&key).unwrap());
+    wait_for("the link to be closed and made again", || {
+        dials() > before && bridge(&home, owner.pid).is_some_and(|(pid, _)| pid != first)
+    })
+    .await;
+    // The peer did not switch and did not restart: it was this member that
+    // closed its link. The peer takes the new proof under its next key.
+    assert_eq!(std::fs::read(&peer_key).unwrap(), first_key);
+    assert_eq!(
+        std::fs::read(belt::group::next_key_path(&peer_key)).unwrap(),
+        next_key
+    );
+    assert_eq!(std::fs::read(&key).unwrap(), next_key);
+    assert_eq!(
+        super::common::identity_of(peer.pid).as_deref(),
+        Some(peer.start.as_str())
+    );
+    // The new link holds: the same bridge is still there after the checks
+    // of the following seconds, and nothing was dialed in between.
+    let (again, start) = bridge(&home, owner.pid).unwrap();
+    let settled = dials();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(bridge(&home, owner.pid), Some((again, start)));
+    assert_eq!(dials(), settled);
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    owner.wait().await;
+    peer.stop().await;
 }

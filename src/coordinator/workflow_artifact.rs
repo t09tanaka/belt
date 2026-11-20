@@ -340,6 +340,7 @@ fn action_failure(e: CoordinatorError) -> Result<Failure> {
             StorageError::Sqlite(_)
             | StorageError::Busy
             | StorageError::Incompatible(_)
+            | StorageError::MigrationRefused(_)
             | StorageError::KindMismatch { .. }
             | StorageError::Locked(_)
             | StorageError::StaleEpoch { .. }
@@ -347,9 +348,12 @@ fn action_failure(e: CoordinatorError) -> Result<Failure> {
             | StorageError::Panicked,
         ) => Err(e),
         CoordinatorError::Results(_)
-        | CoordinatorError::Storage(StorageError::Io(_) | StorageError::SourceBusy) => {
-            Ok(Failure::Retry(e.to_string()))
-        }
+        | CoordinatorError::Storage(
+            StorageError::Io(_)
+            | StorageError::SourceBusy
+            | StorageError::Overloaded(_)
+            | StorageError::AttemptIdInUse(_),
+        ) => Ok(Failure::Retry(e.to_string())),
         CoordinatorError::Invalid(reason)
         | CoordinatorError::Storage(StorageError::Invalid(reason)) => Ok(Failure::Answer(reason)),
         CoordinatorError::Storage(

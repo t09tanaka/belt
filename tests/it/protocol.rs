@@ -26,7 +26,7 @@ async fn a_matching_peer_connects_and_requests_round_trip() {
     let (conn, srv) = pair(&cluster).await;
     assert_eq!(conn.negotiated.version, 1);
     assert_eq!(conn.worker.worker_id.as_str(), "w1");
-    assert_eq!(conn.worker.cluster_id, cluster);
+    assert_eq!(conn.cluster_id, cluster);
     assert_eq!(srv.negotiated, conn.negotiated);
     serve(srv.incoming, Arc::new(|r| Some(Ok(ack_response(&r)))));
     let req = ack_request();
@@ -154,14 +154,13 @@ async fn a_lying_worker_answer_is_refused_by_the_coordinator() {
     let Body::Message(Message::Request(Request::Hello(h))) = req.body else {
         panic!("expected hello")
     };
-    let mut resp = identity("w1").response(
-        &cluster,
+    let resp = belt::protocol::hello::hello_response(
         &belt::protocol::hello::Negotiated {
             version: 77,
             features: vec![],
         },
+        belt::group::nonce().unwrap(),
     );
-    resp.protocol_version = 77;
     let reply = Frame::message(
         req.stream,
         Message::Response {
@@ -1408,12 +1407,12 @@ async fn output_bundle_feature_is_required_even_when_configs_clear_requirements(
         panic!("hello")
     };
     assert!(h.features.iter().any(|f| f == "output_bundles_v1"));
-    let response = identity("w1").response(
-        &cluster,
+    let response = belt::protocol::hello::hello_response(
         &belt::protocol::hello::Negotiated {
             version: 1,
             features: vec![],
         },
+        belt::group::nonce().unwrap(),
     );
     write_frame(
         &mut raw.writer,

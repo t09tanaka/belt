@@ -722,6 +722,78 @@ async fn a_task_its_worker_keeps_refusing_is_retired_there_and_placed_elsewhere(
     }
 }
 
+/// A worker that holds the attempt id for another member stored nothing
+/// (spec 24.4). The attempt is taken off it at the first such answer, the
+/// task does not fail and no worker is left out: it is placed again under a
+/// new attempt id, on the same worker if that one is still the best.
+#[tokio::test]
+async fn a_task_whose_attempt_id_is_in_use_on_its_worker_is_placed_again_under_a_new_id() {
+    use belt::coordinator::{EVENT_SUBMIT_REFUSED_ATTEMPT_ID, REASON_ATTEMPT_ID_IN_USE};
+    use belt::error::OverloadedReason;
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let c = f.open(&[&a]);
+    a.set(|s| {
+        s.fault = Some(ApiError::overloaded(
+            OverloadedReason::AttemptIdInUse,
+            "in use",
+        ))
+    });
+    let task = enqueue(&c, 1).await.remove(0);
+    // Placed and refused: the retire is asked for at once, with the reason.
+    let report = c.tick().await.unwrap();
+    assert!(report.retired.is_empty() && report.settled.is_empty());
+    let first = only(&c, &task);
+    assert_eq!(a.received(Op::Submit), 1);
+    assert!(tombstone(&c, &task).is_some());
+    let noted = c
+        .store()
+        .events_of(&first.attempt_id, EVENT_SUBMIT_REFUSED_ATTEMPT_ID)
+        .unwrap();
+    assert_eq!(noted.len(), 1);
+    assert_eq!(noted[0].payload["worker"], "w-a");
+    assert_eq!(noted[0].payload["code"], "OVERLOADED");
+    assert_eq!(noted[0].payload["reason"], REASON_ATTEMPT_ID_IN_USE);
+    assert_eq!(REASON_ATTEMPT_ID_IN_USE, "attempt_id_in_use");
+    assert!(events(&c, EVENT_WORKER_EXCLUDED).is_empty());
+    // The worker confirms that nothing started: the task is free, did not
+    // fail, and goes to the same worker under another attempt id.
+    a.set(|s| s.fault = None);
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.retired, vec![first.attempt_id.clone()]);
+    assert_eq!(a.count(Op::Retire), 1);
+    c.tick().await.unwrap();
+    let all = attempts(&c, &task);
+    assert_eq!(all.len(), 2);
+    assert!(
+        all[0].retired && all[0].termination.is_none(),
+        "it did not fail"
+    );
+    assert_ne!(all[1].attempt_id, first.attempt_id);
+    assert_eq!(all[1].worker_id, a.id);
+    assert_eq!(a.holds(), vec![all[1].attempt_id.clone()]);
+    assert_eq!(
+        a.received(Op::Submit),
+        2,
+        "the refused attempt is not sent again"
+    );
+    // A plain OVERLOADED is sent again as before, however often.
+    let g = fx();
+    let w = g.worker("w-a", (1, 0));
+    let d = g.open(&[&w]);
+    w.set(|s| s.fault = Some(ApiError::new(ErrorCode::Overloaded, "busy")));
+    let waiting = enqueue(&d, 1).await.remove(0);
+    for _ in 0..3 {
+        d.tick().await.unwrap();
+    }
+    assert_eq!(
+        d.store()
+            .retire_tombstone(&only(&d, &waiting).attempt_id)
+            .unwrap(),
+        None
+    );
+}
+
 #[tokio::test]
 async fn the_workers_that_refused_a_task_stay_excluded_across_a_restart() {
     let f = fx();

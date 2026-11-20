@@ -32,6 +32,8 @@ use tokio::sync::Semaphore;
 
 const T: Duration = Duration::from_secs(20);
 
+mod group_membership;
+
 /// The machine, reduced to plain directories, with a record of every call.
 struct DirHost {
     base: PathBuf,
@@ -403,6 +405,7 @@ impl Fx {
         cfg.secret_wait_ms = 15_000;
         cfg.term_grace_ms = 2_000;
         cfg.kill_wait_ms = 2_000;
+        crate::proto_common::place_group_key(&cfg.group_key_path);
         cfg
     }
     fn start_with(&self, cfg: AgentConfig) -> Arc<Agent> {
@@ -1361,14 +1364,16 @@ async fn a_secret_file_sent_while_the_mask_is_made_is_refused_and_never_placed()
     let (seen_tx, seen_rx) = mpsc::channel::<(Option<Answer>, mpsc::Receiver<Answer>)>();
     {
         let agent = agent.clone();
+        let member = super::proto_common::coordinator_of(&f.cluster);
         *f.host.on_mask.lock().unwrap() = Some(Box::new(move |_| {
             let (tx, rx) = mpsc::channel();
-            let (agent, late) = (agent.clone(), late.clone());
+            let (agent, late, member) = (agent.clone(), late.clone(), member.clone());
             std::thread::spawn(move || {
                 let session = Session {
+                    coordinator_id: member,
                     coordinator_epoch: CoordinatorEpoch(1),
                 };
-                let _ = tx.send(agent.handle(session, late));
+                let _ = tx.send(agent.handle(session.clone(), late));
             });
             // Long enough for a put that is not kept out to be answered; a
             // put that is kept out is never answered in here.
@@ -3402,6 +3407,9 @@ async fn the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_an
     let f = fx();
     let state = f.state();
     let env = real_env(&f);
+    // The key the agent of this fixture proves the group with is the key
+    // the secrets are sealed with.
+    crate::proto_common::place_group_key(&state.join("cluster.key"));
     let key = belt::secrets::key::init(&state.join("cluster.key")).unwrap();
     let store = SourceStore::open(&state).unwrap();
     let vault = Vault::open(&state).unwrap();
@@ -4944,9 +4952,10 @@ fn env_sync(
     tools: Vec<ToolRequirement>,
 ) -> Result<Vec<ToolSyncResult>, ApiError> {
     let session = Session {
+        coordinator_id: CoordinatorId::nil(),
         coordinator_epoch: CoordinatorEpoch(1),
     };
-    match agent.handle(session, env_sync_req(sync, tools, false))? {
+    match agent.handle(session.clone(), env_sync_req(sync, tools, false))? {
         Response::EnvSync(r) => Ok(r.results),
         other => panic!("{other:?}"),
     }
@@ -5085,6 +5094,7 @@ fn env_sync_installs_only_what_the_workers_own_registry_names() {
     let Response::EnvSync(dry) = agent
         .handle(
             Session {
+                coordinator_id: CoordinatorId::nil(),
                 coordinator_epoch: CoordinatorEpoch(1),
             },
             env_sync_req(
@@ -5103,13 +5113,14 @@ fn env_sync_installs_only_what_the_workers_own_registry_names() {
     assert!(f.host.tool_retries().is_empty(), "a dry run lifts nothing");
     // A coordinator older than one this worker has heard from is refused.
     let session = Session {
+        coordinator_id: CoordinatorId::nil(),
         coordinator_epoch: CoordinatorEpoch(5),
     };
     let mut newer = payload("exit 0");
     newer.commands[0].env.clear();
     agent
         .handle(
-            session,
+            session.clone(),
             Request::SubmitAttempt(
                 SubmitAttemptRequest::new(
                     RequestId::generate(),
@@ -5132,11 +5143,11 @@ fn env_sync_installs_only_what_the_workers_own_registry_names() {
         })
     };
     assert_eq!(
-        agent.handle(session, at(4)).unwrap_err().code,
+        agent.handle(session.clone(), at(4)).unwrap_err().code,
         ErrorCode::StaleEpoch
     );
     assert!(f.host.tool_polls().is_empty());
-    agent.handle(session, at(5)).unwrap();
+    agent.handle(session.clone(), at(5)).unwrap();
     assert_eq!(f.host.tool_polls().len(), 1);
 }
 
@@ -5520,6 +5531,7 @@ fn a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for() {
     let (f, agent) = warm_fx(|_| {});
     *f.host.tool_poll.lock().unwrap() = Some(None);
     let session = Session {
+        coordinator_id: CoordinatorId::nil(),
         coordinator_epoch: CoordinatorEpoch(1),
     };
     let ask = || {
@@ -5527,7 +5539,7 @@ fn a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for() {
         let n = NodeId::parse("main").unwrap();
         let Response::Forecast(r) = agent
             .handle(
-                session,
+                session.clone(),
                 Request::Forecast(ForecastRequest {
                     schema_version: SchemaVersion::CURRENT,
                     request_id: RequestId::generate(),
@@ -5570,7 +5582,7 @@ fn a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for() {
     let mut plain = payload("exit 0");
     plain.commands[0].env.clear();
     agent
-        .handle(session, submit_req(&AttemptId::generate(), &plain))
+        .handle(session.clone(), submit_req(&AttemptId::generate(), &plain))
         .unwrap();
     assert!(!said(&ask()).contains("toolchain installs"));
     // One that waits for node 20.0.0 (not installed: the manager is never run).
@@ -5602,9 +5614,53 @@ fn a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for() {
         .unwrap(),
     ));
     agent
-        .handle(session, submit_req(&AttemptId::generate(), &p))
+        .handle(session.clone(), submit_req(&AttemptId::generate(), &p))
         .unwrap();
     let r = ask();
     assert!(said(&r).contains("toolchain installs"), "{}", said(&r));
     assert!(r.target.conditional);
+}
+
+/// The start of the agent removes the directories of the attempts the
+/// rebuild of the worker database dropped (migration step 4), and only
+/// those: a directory that is not listed stays, and a link in the place of
+/// a listed one is unlinked, not followed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_removes_the_directories_of_attempts_the_database_rebuild_dropped() {
+    let f = fx();
+    f.start("boot-a").shutdown();
+    let attempts = f.state().join("attempts");
+    let (dropped, linked, kept) = (
+        AttemptId::generate(),
+        AttemptId::generate(),
+        AttemptId::generate(),
+    );
+    let outside = f.path("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"x").unwrap();
+    for a in [&dropped, &kept] {
+        let dir = attempts.join(a.as_str());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("supervise.json"), b"{}").unwrap();
+        std::fs::write(dir.join("workspace.json"), b"{}").unwrap();
+    }
+    std::os::unix::fs::symlink(&outside, attempts.join(linked.as_str())).unwrap();
+    {
+        let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+        for a in [&dropped, &linked] {
+            db.execute(
+                "INSERT INTO dropped_attempt (attempt_id) VALUES (?1)",
+                [a.as_str()],
+            )
+            .unwrap();
+        }
+    }
+    assert_eq!(f.store().dropped_attempts(10).unwrap().len(), 2);
+    let agent = f.start("boot-a");
+    assert!(!attempts.join(dropped.as_str()).exists());
+    assert!(std::fs::symlink_metadata(attempts.join(linked.as_str())).is_err());
+    assert!(outside.join("keep").exists());
+    assert!(attempts.join(kept.as_str()).join("supervise.json").exists());
+    assert!(f.store().dropped_attempts(10).unwrap().is_empty());
+    agent.shutdown();
 }

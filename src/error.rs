@@ -113,6 +113,23 @@ pub enum ConflictReason {
     Unknown,
 }
 
+/// Why a request was refused with `OVERLOADED`, when the caller can act on
+/// the reason (accompanies `ErrorCode::Overloaded`). With a reason or
+/// without one, nothing of the request was stored.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum OverloadedReason {
+    /// A `submit_attempt` names an attempt id that an attempt of another
+    /// member holds on this worker (spec 24.4). Sending the same attempt
+    /// again does not help while that one is kept: the task is placed again
+    /// under a new attempt id.
+    AttemptIdInUse,
+    /// A reason this version does not know (a newer peer sent it): the
+    /// caller treats the error as a plain `OVERLOADED`.
+    #[serde(other)]
+    Unknown,
+}
+
 impl ErrorCode {
     /// Every code.
     pub const ALL: [ErrorCode; 16] = [
@@ -219,6 +236,30 @@ pub struct ApiError {
     /// May be set when `code` is `CONFLICT`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conflict_reason: Option<ConflictReason>,
+    /// Set when the group proof of a connection was refused (spec 24.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_refusal: Option<GroupRefusal>,
+    /// May be set when `code` is `OVERLOADED`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overloaded_reason: Option<OverloadedReason>,
+}
+
+/// Why a member refused another member's group proof. The connection is
+/// closed; nothing was accepted on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum GroupRefusal {
+    /// The peer belongs to another group.
+    GroupMismatch,
+    /// The peer holds another group key. `fingerprint` is that of the key
+    /// the refusing member signs with: a member that holds it as its next
+    /// key has missed the switch and makes it now.
+    GroupKeyMismatch { fingerprint: String },
+    /// The name is recorded with another coordinator id, or the coordinator
+    /// id under another name.
+    MemberIdentityMismatch,
+    /// The peer told this worker that it retired the identity it still has.
+    IdentityRetired,
 }
 
 impl ApiError {
@@ -228,6 +269,24 @@ impl ApiError {
             message: message.into(),
             blocked_reason: None,
             conflict_reason: None,
+            group_refusal: None,
+            overloaded_reason: None,
+        }
+    }
+
+    /// `OVERLOADED` with a reason the caller acts on.
+    pub fn overloaded(reason: OverloadedReason, message: impl Into<String>) -> Self {
+        ApiError {
+            overloaded_reason: Some(reason),
+            ..ApiError::new(ErrorCode::Overloaded, message)
+        }
+    }
+
+    /// The refusal of a group proof.
+    pub fn group_refused(reason: GroupRefusal, message: impl Into<String>) -> Self {
+        ApiError {
+            group_refusal: Some(reason),
+            ..ApiError::new(ErrorCode::ProtocolIncompatible, message)
         }
     }
 
@@ -236,6 +295,8 @@ impl ApiError {
             code: ErrorCode::Conflict,
             message: message.into(),
             blocked_reason: None,
+            group_refusal: None,
+            overloaded_reason: None,
             conflict_reason: Some(reason),
         }
     }
@@ -245,6 +306,8 @@ impl ApiError {
             code: ErrorCode::Blocked,
             message: message.into(),
             blocked_reason: Some(reason),
+            group_refusal: None,
+            overloaded_reason: None,
             conflict_reason: None,
         }
     }
@@ -343,6 +406,46 @@ mod tests {
         let codes: HashSet<_> = four.iter().map(|c| c.exit_code()).collect();
         assert_eq!(strings.len(), 4);
         assert_eq!(codes.len(), 4);
+    }
+
+    #[test]
+    fn an_overload_can_say_why_and_an_unknown_reason_is_a_plain_overload() {
+        let e = ApiError::overloaded(OverloadedReason::AttemptIdInUse, "held");
+        assert_eq!(e.code, ErrorCode::Overloaded);
+        assert_eq!(e.message, "held");
+        assert_eq!((e.blocked_reason, &e.conflict_reason), (None, &None));
+        assert_eq!(e.group_refusal, None);
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["code"], "OVERLOADED");
+        assert_eq!(
+            v["overloaded_reason"],
+            json!({"reason": "attempt_id_in_use"})
+        );
+        assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), e);
+        // A reason of a newer peer, with whatever it carries.
+        for reason in [
+            json!({"reason": "capacity"}),
+            json!({"reason": "later", "n": 3}),
+        ] {
+            let v = json!({"code": "OVERLOADED", "message": "m", "overloaded_reason": reason});
+            let e: ApiError = serde_json::from_value(v).unwrap();
+            assert_eq!(e.code, ErrorCode::Overloaded);
+            assert_eq!(e.overloaded_reason, Some(OverloadedReason::Unknown));
+        }
+        // No reason: the field is not there, in either direction.
+        let plain = ApiError::new(ErrorCode::Overloaded, "busy");
+        assert_eq!(plain.overloaded_reason, None);
+        assert!(serde_json::to_value(&plain)
+            .unwrap()
+            .get("overloaded_reason")
+            .is_none());
+        for other in [
+            ApiError::conflict(ConflictReason::PayloadMismatch, "c"),
+            ApiError::blocked(BlockedReason::SecretUnavailable, "b"),
+            ApiError::group_refused(GroupRefusal::GroupMismatch, "g"),
+        ] {
+            assert_eq!(other.overloaded_reason, None);
+        }
     }
 
     #[test]

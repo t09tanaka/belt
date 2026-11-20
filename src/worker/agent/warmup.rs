@@ -168,6 +168,7 @@ fn result(name: &str, (outcome, message): (SyncOutcome, Option<String>)) -> Tool
 impl Agent {
     pub(super) fn env_sync(
         self: &Arc<Self>,
+        store: &WorkerStore,
         r: EnvSyncRequest,
     ) -> Result<EnvSyncResponse, ApiError> {
         if r.tools.len() > MAX_ENV_SYNC_TOOLS {
@@ -177,7 +178,7 @@ impl Agent {
         if names.len() != r.tools.len() {
             return Err(invalid("env_sync names a tool twice"));
         }
-        let seen = self.store.max_coordinator_epoch().map_err(api)?;
+        let seen = store.max_coordinator_epoch().map_err(api)?;
         if r.coordinator_epoch < seen {
             return Err(ApiError::new(
                 ErrorCode::StaleEpoch,
