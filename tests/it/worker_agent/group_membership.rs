@@ -363,6 +363,9 @@ async fn a_members_name_and_coordinator_id_are_fixed_together() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_reaches_its_own_attempts_and_another_members_are_not_found() {
     let f = fx();
+    // Two members run a command each at once; the default budget of a small
+    // machine admits one, and the second would wait for the first.
+    f.admit_commands(2);
     let agent = f.start("boot-1");
     let (main, mut sub) = (member("main"), member("sub"));
     // The other member is on a much older epoch than the first: an epoch is
@@ -463,6 +466,9 @@ async fn a_member_reaches_its_own_attempts_and_another_members_are_not_found() {
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attempt_id_another_member_holds_is_refused_without_touching_that_attempt() {
     let f = fx();
+    // Two members run a command each at once; the default budget of a small
+    // machine admits one, and the second would wait for the first.
+    f.admit_commands(2);
     let agent = f.start("boot-1");
     let (main, sub) = (member("main"), member("sub"));
     let a = dial(&f, &agent, &main).await.unwrap().client;
