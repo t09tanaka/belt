@@ -274,6 +274,9 @@ pub enum WorkersSub {
         /// Stop immediately and cancel running work.
         #[arg(long)]
         cancel_running: bool,
+        /// Stop even while other members have live work on it.
+        #[arg(long)]
+        all_submitters: bool,
     },
     /// Upgrade a worker.
     Upgrade {
@@ -309,6 +312,12 @@ pub struct WorkerServiceArgs {
     /// With `stop`: seconds to wait for accepted work to finish.
     #[arg(long, default_value_t = 600)]
     pub wait_secs: u64,
+    /// With `stop`: end other members' live work too.
+    #[arg(long)]
+    pub all_submitters: bool,
+    /// With `stop`: the coordinator id of the member that asked.
+    #[arg(long, value_parser = crate::ids::CoordinatorId::parse)]
+    pub submitter: Option<crate::ids::CoordinatorId>,
 }
 
 #[derive(Debug, Args)]
@@ -482,6 +491,8 @@ pub fn run(cli: Cli) -> i32 {
             args.action,
             args.cancel_running,
             args.wait_secs,
+            args.all_submitters,
+            args.submitter.clone(),
         );
     }
     if matches!(&cli.command, Command::Workers(WorkersArgs { sub: None })) {

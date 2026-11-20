@@ -1007,9 +1007,85 @@ pub fn start<L: Launcher>(
 /// launchctl change; an unreadable or uncertain state is an error.
 pub fn stop<L: Launcher>(
     env: &BTreeMap<String, String>,
+    launcher: L,
+    cancel_running: bool,
+    wait: Duration,
+) -> anyhow::Result<Status> {
+    stop_for(env, launcher, cancel_running, wait, &Submitters::all())
+}
+
+/// Whose live work a stop may end. A stop asked for by one member refuses
+/// while another member has non-terminal attempts here, unless every
+/// submitter was named (`--all-submitters`).
+#[derive(Clone, Debug)]
+pub struct Submitters {
+    pub all: bool,
+    /// The member that asked; its own attempts do not block the stop.
+    pub caller: Option<CoordinatorId>,
+}
+impl Submitters {
+    pub fn all() -> Self {
+        Self {
+            all: true,
+            caller: None,
+        }
+    }
+}
+
+/// The members other than `caller` with non-terminal attempts in the worker
+/// database, as (name or coordinator id, count). A database that cannot be
+/// read is an error: an unreadable state is never "no other work".
+fn other_submitters(
+    state: &Path,
+    caller: Option<&CoordinatorId>,
+) -> anyhow::Result<Vec<(String, u64)>> {
+    match fs::symlink_metadata(state.join("worker.db")) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    }
+    let store = crate::storage::WorkerStore::open_read_only(state)?;
+    let names: BTreeMap<String, String> = store
+        .members()?
+        .into_iter()
+        .map(|(name, id)| (id, name))
+        .collect();
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for attempt in store.list_nonterminal()? {
+        if caller == Some(&attempt.coordinator_id) {
+            continue;
+        }
+        let id = attempt.coordinator_id.to_string();
+        *counts
+            .entry(names.get(&id).cloned().unwrap_or(id))
+            .or_default() += 1;
+    }
+    Ok(counts.into_iter().collect())
+}
+
+fn refuse_other_submitters(state: &Path, submitters: &Submitters) -> anyhow::Result<()> {
+    if submitters.all {
+        return Ok(());
+    }
+    let others = other_submitters(state, submitters.caller.as_ref())
+        .context("could not read which members have live work; nothing was stopped")?;
+    if others.is_empty() {
+        return Ok(());
+    }
+    let total: u64 = others.iter().map(|(_, n)| n).sum();
+    let who: Vec<String> = others.iter().map(|(m, n)| format!("{m} ({n})")).collect();
+    anyhow::bail!(
+        "{total} live attempt(s) of other members run here: {}; nothing was stopped (wait for them, or use --all-submitters)",
+        who.join(", ")
+    )
+}
+
+pub fn stop_for<L: Launcher>(
+    env: &BTreeMap<String, String>,
     mut launcher: L,
     cancel_running: bool,
     wait: Duration,
+    submitters: &Submitters,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve_for(env, launcher.backend())?;
     let _lock = exclusive_lock(&paths)?;
@@ -1026,6 +1102,7 @@ pub fn stop<L: Launcher>(
             "loaded service identity unknown; reconciliation required (nothing stopped)"
         ),
         LoadedState::Match => {
+            refuse_other_submitters(&paths.state, submitters)?;
             let mut manager = Manager {
                 identity: identity(&journal),
                 files,
@@ -1177,9 +1254,13 @@ fn status_with<L: Launcher>(
     })
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Options {
     pub cancel_running: bool,
+    /// With `stop`: end other members' live work too.
+    pub all_submitters: bool,
+    /// With `stop`: the member that asked.
+    pub submitter: Option<CoordinatorId>,
     /// How long stop waits for accepted work to finish.
     pub wait: Duration,
     pub ready_timeout: Duration,
@@ -1201,7 +1282,19 @@ pub fn handle<L: Launcher>(
             install(env, &request, current_exe, launcher, options.ready_timeout)
         }
         Action::Start => start(env, launcher, options.ready_timeout),
-        Action::Stop => stop(env, launcher, options.cancel_running, options.wait),
+        Action::Stop => {
+            let submitters = Submitters {
+                all: options.all_submitters,
+                caller: options.submitter.clone(),
+            };
+            stop_for(
+                env,
+                launcher,
+                options.cancel_running,
+                options.wait,
+                &submitters,
+            )
+        }
         Action::Drain => drain(env, launcher),
         Action::Resume => resume(env, launcher),
         Action::Status => status(env, launcher),
@@ -1295,7 +1388,13 @@ impl Launcher for HostLauncher {
 
 /// The hidden `worker-service` command. Drain, resume and status never touch
 /// the service manager; the others use the host's own.
-pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
+pub fn main(
+    action: Action,
+    cancel_running: bool,
+    wait_secs: u64,
+    all_submitters: bool,
+    submitter: Option<CoordinatorId>,
+) -> i32 {
     if action == Action::Doctor {
         return super::doctor::host_main();
     }
@@ -1344,6 +1443,8 @@ pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
                 HostLauncher::native(),
                 Options {
                     cancel_running,
+                    all_submitters,
+                    submitter,
                     wait: Duration::from_secs(wait_secs),
                     ready_timeout: READY_TIMEOUT,
                 },

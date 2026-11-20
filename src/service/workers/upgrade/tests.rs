@@ -13,6 +13,8 @@ use std::path::PathBuf;
 
 const OPTIONS: Options = Options {
     cancel_running: false,
+    all_submitters: false,
+    submitter: None,
     wait: Duration::ZERO,
     ready_timeout: Duration::from_secs(2),
 };

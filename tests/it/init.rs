@@ -491,6 +491,8 @@ fn workers_add_replaces_both_member_pins_without_a_second_resident() {
                 OwnedLauncher(self.state.clone()),
                 worker_service::Options {
                     cancel_running: false,
+                    all_submitters: false,
+                    submitter: None,
                     wait: Duration::ZERO,
                     ready_timeout: Duration::ZERO,
                 },

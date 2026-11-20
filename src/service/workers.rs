@@ -401,7 +401,10 @@ pub fn both<A: Send, B: Send>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifecycle {
     Start,
-    Stop { cancel_running: bool },
+    Stop {
+        cancel_running: bool,
+        all_submitters: bool,
+    },
     Drain,
     Resume,
 }
@@ -431,6 +434,7 @@ pub fn helper_command(
     digest: &str,
     lifecycle: Lifecycle,
     wait_secs: u64,
+    submitter: Option<&crate::ids::CoordinatorId>,
 ) -> String {
     let mut words = vec![
         quote("worker-service"),
@@ -438,13 +442,21 @@ pub fn helper_command(
         quote("--wait-secs"),
         quote(&wait_secs.to_string()),
     ];
-    if matches!(
-        lifecycle,
-        Lifecycle::Stop {
-            cancel_running: true
+    if let Lifecycle::Stop {
+        cancel_running,
+        all_submitters,
+    } = lifecycle
+    {
+        if cancel_running {
+            words.push(quote("--cancel-running"));
         }
-    ) {
-        words.push(quote("--cancel-running"));
+        if all_submitters {
+            words.push(quote("--all-submitters"));
+        }
+        if let Some(id) = submitter {
+            words.push(quote("--submitter"));
+            words.push(quote(id.as_str()));
+        }
     }
     launch(binary, digest, &words.join(" "))
 }
@@ -1149,6 +1161,11 @@ pub fn lifecycle(
     let digest = worker_service::sha256_file(exe)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     let wait = STOP_WAIT_SECS;
+    // Which member asks decides whose live work blocks a stop. Unreadable:
+    // none is named and every member's work blocks it.
+    let caller = crate::storage::CoordinatorStore::open_read_only(&spec.state_dir)
+        .ok()
+        .map(|store| store.coordinator_id().clone());
     let timeout = match action {
         Lifecycle::Stop { .. } => Duration::from_secs(wait + 120),
         _ => Duration::from_secs(120),
@@ -1156,7 +1173,13 @@ pub fn lifecycle(
     let out = remote
         .run(
             &target,
-            &helper_command(registration.binary.as_deref(), &digest, action, wait),
+            &helper_command(
+                registration.binary.as_deref(),
+                &digest,
+                action,
+                wait,
+                caller.as_ref(),
+            ),
             &[],
             timeout,
         )
@@ -2067,9 +2090,11 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
         WorkersSub::Stop {
             name,
             cancel_running,
+            all_submitters,
         } => {
             let action = Lifecycle::Stop {
                 cancel_running: *cancel_running,
+                all_submitters: *all_submitters,
             };
             (name, action, lifecycle_of(name, action))
         }

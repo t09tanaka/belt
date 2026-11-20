@@ -997,6 +997,8 @@ fn a_system_service_installs_stops_restores_and_upgrades_without_replacing_the_a
             };
             let options = Options {
                 cancel_running: false,
+                all_submitters: false,
+                submitter: None,
                 wait: Duration::ZERO,
                 ready_timeout: Duration::ZERO,
             };
@@ -1134,5 +1136,148 @@ fn membership_moves_an_initialized_idle_member_without_adding_a_worker() {
     assert_eq!(
         fs::read_to_string(&spec.cluster_key_path).unwrap(),
         request.key_file_text
+    );
+}
+
+fn put_attempt(db: &rusqlite::Connection, member: &CoordinatorId, _n: u32, state: &str) {
+    db.execute(
+        "INSERT INTO worker_attempt (coordinator_id, attempt_id, run_id, task_id, generation, payload_hash, coordinator_epoch, spec_json, state, termination_json, receipts_json, accepted_at_ms, terminal_at_ms)
+         VALUES (?1, ?2, ?6, ?7, 1, 'sha256:0000000000000000000000000000000000000000000000000000000000000000', 1, '{}', ?3, ?4, '{}', 1, ?5)",
+        rusqlite::params![
+            member.as_str(),
+            crate::ids::AttemptId::generate().to_string(),
+            state,
+            (state == "terminal").then_some("{}"),
+            (state == "terminal").then_some(2),
+            crate::ids::RunId::generate().to_string(),
+            crate::ids::TaskId::generate().to_string()
+        ],
+    )
+    .unwrap();
+}
+
+#[test]
+fn stop_refuses_other_members_live_work_unless_all_submitters() {
+    let h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    let state = h.paths().state;
+    let store = crate::storage::WorkerStore::open(&state, &h.request.worker_id).unwrap();
+    let (alice, bob, me) = (
+        CoordinatorId::generate(),
+        CoordinatorId::generate(),
+        CoordinatorId::generate(),
+    );
+    store.for_member(&alice).pin_member("alice", 1).unwrap();
+    let db = rusqlite::Connection::open(state.join("worker.db")).unwrap();
+    put_attempt(&db, &alice, 1, "active");
+    put_attempt(&db, &alice, 2, "active");
+    put_attempt(&db, &alice, 3, "terminal");
+    put_attempt(&db, &bob, 4, "active");
+    put_attempt(&db, &me, 5, "active");
+    let calls = h.launchctl_calls();
+    let mut options = Options {
+        cancel_running: false,
+        all_submitters: false,
+        submitter: Some(me.clone()),
+        wait: Duration::ZERO,
+        ready_timeout: Duration::ZERO,
+    };
+    for cancel_running in [false, true] {
+        options.cancel_running = cancel_running;
+        let error = handle(
+            Action::Stop,
+            &h.env,
+            &[],
+            &h.exe,
+            h.fake.clone(),
+            options.clone(),
+        )
+        .unwrap_err();
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("3 live attempt(s) of other members"),
+            "{error}"
+        );
+        assert!(error.contains("alice (2)"), "{error}");
+        assert!(error.contains(&format!("{} (1)", bob.as_str())), "{error}");
+        assert!(error.contains("--all-submitters"), "{error}");
+        assert!(!error.contains(me.as_str()));
+        // Nothing changed: no drain marker, no service change.
+        assert_eq!(control::read(&state).unwrap(), Control::default());
+        assert_eq!(h.launchctl_calls(), calls);
+    }
+    // Only the caller's own work: not refused by the guard.
+    db.execute(
+        "UPDATE worker_attempt SET state = 'terminal', termination_json = '{}', terminal_at_ms = 2 WHERE coordinator_id <> ?1",
+        [me.as_str()],
+    )
+    .unwrap();
+    refuse_other_submitters(
+        &state,
+        &Submitters {
+            all: false,
+            caller: Some(me.clone()),
+        },
+    )
+    .unwrap();
+    // Without a named caller, the caller's attempt is another member's too.
+    assert!(refuse_other_submitters(
+        &state,
+        &Submitters {
+            all: false,
+            caller: None
+        }
+    )
+    .is_err());
+}
+
+#[test]
+fn stop_with_all_submitters_goes_ahead_and_waits_for_everyone() {
+    let h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    let state = h.paths().state;
+    crate::storage::WorkerStore::open(&state, &h.request.worker_id).unwrap();
+    let other = CoordinatorId::generate();
+    let db = rusqlite::Connection::open(state.join("worker.db")).unwrap();
+    put_attempt(&db, &other, 1, "active");
+    let finisher = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(100));
+        db.execute(
+            "UPDATE worker_attempt SET state = 'terminal', termination_json = '{}', terminal_at_ms = 2",
+            [],
+        )
+        .unwrap();
+    });
+    let options = Options {
+        cancel_running: false,
+        all_submitters: true,
+        submitter: None,
+        wait: Duration::from_secs(10),
+        ready_timeout: Duration::ZERO,
+    };
+    let status = handle(Action::Stop, &h.env, &[], &h.exe, h.fake.clone(), options).unwrap();
+    finisher.join().unwrap();
+    assert_eq!(status.loaded, Some(false));
+    assert_eq!(h.launchctl_calls(), ["bootstrap", "bootout"]);
+}
+
+#[test]
+fn an_unreadable_worker_database_refuses_a_stop_and_no_database_does_not() {
+    let h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    let state = h.paths().state;
+    let guard = Submitters {
+        all: false,
+        caller: None,
+    };
+    refuse_other_submitters(&state, &guard).unwrap();
+    fs::write(state.join("worker.db"), b"not a database").unwrap();
+    let error = refuse_other_submitters(&state, &guard).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("could not read which members"),
+        "{error:#}"
     );
 }

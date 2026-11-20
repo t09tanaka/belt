@@ -110,6 +110,8 @@ impl Remote for FakeRemote {
         };
         let options = |cancel_running| Options {
             cancel_running,
+            all_submitters: false,
+            submitter: None,
             wait: Duration::ZERO,
             ready_timeout: Duration::from_secs(2),
         };
@@ -431,6 +433,7 @@ fn an_unreachable_host_is_an_unknown_outcome_and_registers_nothing() {
         Lifecycle::Resume,
         Lifecycle::Stop {
             cancel_running: true,
+            all_submitters: false,
         },
     ] {
         w.remote.reachable = false;
@@ -655,9 +658,11 @@ fn an_ephemeral_worker_is_registered_and_never_installed_or_controlled() {
         Lifecycle::Resume,
         Lifecycle::Stop {
             cancel_running: false,
+            all_submitters: false,
         },
         Lifecycle::Stop {
             cancel_running: true,
+            all_submitters: false,
         },
     ] {
         let error = w.lifecycle("colab-1", action).unwrap_err();
@@ -830,6 +835,7 @@ fn install_then_stop_then_start_on_one_host() {
             "mini-a",
             Lifecycle::Stop {
                 cancel_running: false,
+                all_submitters: false,
             },
         )
         .unwrap();
@@ -852,6 +858,7 @@ fn drain_and_resume_toggle_placement_and_cancel_running_stops_the_service() {
             "mini-a",
             Lifecycle::Stop {
                 cancel_running: true,
+                all_submitters: false,
             },
         )
         .unwrap();
@@ -916,13 +923,30 @@ fn helper_commands_are_fixed_strings_without_names_or_paths() {
         &digest,
         Lifecycle::Stop {
             cancel_running: true,
+            all_submitters: false,
         },
         600,
+        None,
     );
     assert!(stop.contains("'worker-service' 'stop' '--wait-secs' '600' '--cancel-running'"));
     assert!(stop.contains(&format!("belt-{digest}")));
     assert!(stop.contains("exec 'belt'"));
-    let plain = helper_command(None, &digest, Lifecycle::Drain, 600);
+    let id = crate::ids::CoordinatorId::generate();
+    let all = helper_command(
+        None,
+        &digest,
+        Lifecycle::Stop {
+            cancel_running: false,
+            all_submitters: true,
+        },
+        600,
+        Some(&id),
+    );
+    assert!(all.contains(&format!(
+        "'--wait-secs' '600' '--all-submitters' '--submitter' '{id}'"
+    )));
+    let plain = helper_command(None, &digest, Lifecycle::Drain, 600, Some(&id));
+    assert!(!plain.contains("--submitter"));
     assert!(!plain.contains("--cancel-running"));
     assert!(stage_command(&digest).contains(&format!("belt-{digest}.part")));
     assert!(install_command(&digest).ends_with("worker-service install"));
@@ -954,6 +978,7 @@ fn status_with(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
 fn a_command_reports_only_the_state_the_host_showed() {
     let stop = Lifecycle::Stop {
         cancel_running: false,
+        all_submitters: false,
     };
     let code = |a, s: &Status| check_outcome(a, s).map_err(|e| e.code);
     assert_eq!(
@@ -1005,7 +1030,8 @@ fn the_sentence_matches_what_happened() {
         describe(
             "w",
             Lifecycle::Stop {
-                cancel_running: true
+                cancel_running: true,
+                all_submitters: false
             },
             &up
         ),
@@ -1179,7 +1205,7 @@ fn a_lifecycle_answer_from_another_cluster_is_refused() {
 #[test]
 fn helper_command_runs_a_registered_path_with_its_quoting() {
     let digest = "a".repeat(64);
-    let command = helper_command(Some("/w/my dir/belt"), &digest, Lifecycle::Resume, 5);
+    let command = helper_command(Some("/w/my dir/belt"), &digest, Lifecycle::Resume, 5, None);
     assert_eq!(
         command,
         "exec '/w/my dir/belt' 'worker-service' 'resume' '--wait-secs' '5'"
