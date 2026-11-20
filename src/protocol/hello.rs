@@ -508,6 +508,13 @@ mod tests {
         let mut empty = good.clone();
         empty.proof.clear();
         refused(&empty, &nonce);
+        // An answer of another schema is not read at all: the versions do
+        // not fit, which says nothing about the key.
+        let mut other_schema = good.clone();
+        other_schema.schema_version = SchemaVersion(SchemaVersion::CURRENT.0 + 1);
+        let e = check_answer(&key, &nonce, &other_schema).unwrap_err();
+        assert_eq!(e.code, ErrorCode::ProtocolIncompatible);
+        assert_eq!(e.group_refusal, None);
     }
 
     #[test]

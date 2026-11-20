@@ -119,6 +119,93 @@ pub async fn notify_retired(
 mod tests {
     use super::*;
 
+    /// The notice goes to the worker with this member's coordinator id and
+    /// the retired identity, and that it was sent is recorded, whatever the
+    /// worker answers.
+    #[tokio::test]
+    async fn the_notice_names_the_retired_identity_and_is_recorded_as_sent() {
+        use crate::group::{self, Keys};
+        use crate::ids::{AgentEpoch, CoordinatorEpoch, Digest, WorkerBootId, WorkerId};
+        use crate::protocol::hello::WorkerIdentity;
+        use crate::protocol::{accept, connect, ClientConfig, Membership, ServerConfig};
+        use crate::wire::{IdentityRetiredResponse, Request, Response, SchemaVersion};
+
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let store = crate::storage::CoordinatorStore::open(dir.path(), 1).unwrap();
+        let coordinator =
+            crate::coordinator::Coordinator::start(store, Default::default()).unwrap();
+        let cluster = coordinator.store().cluster_id().clone();
+        let me = coordinator.store().coordinator_id().clone();
+        let worker = WorkerId::parse("colab").unwrap();
+        let boot = WorkerBootId::parse("boot.retired").unwrap();
+        let (ours, theirs) = crate::protocol::transport::duplex_pair(64 * 1024);
+        let server = ServerConfig::new(
+            cluster.clone(),
+            WorkerIdentity {
+                capabilities: None,
+                worker_id: worker.clone(),
+                worker_boot_id: boot.clone(),
+                agent_epoch: AgentEpoch(1),
+                profile: "p".into(),
+                profile_fingerprint: Digest::of_bytes(b"p"),
+                coordinator_epoch: CoordinatorEpoch(0),
+            },
+            Keys::only(group::test_key()),
+        );
+        let peer = tokio::spawn(async move {
+            let mut accepted = accept(theirs, server).await.unwrap();
+            let inbound = accepted.incoming.next().await.expect("one request");
+            let Request::IdentityRetired(notice) = inbound.request else {
+                panic!("not the notice");
+            };
+            let answer = IdentityRetiredResponse {
+                schema_version: SchemaVersion::CURRENT,
+                worker_id: notice.worker_id.clone(),
+                worker_boot_id: notice.worker_boot_id.clone(),
+            };
+            inbound
+                .responder
+                .respond(Response::IdentityRetired(answer))
+                .await
+                .unwrap();
+            notice
+        });
+        let connected = connect(
+            ours,
+            ClientConfig::new(
+                cluster,
+                me.clone(),
+                coordinator.epoch(),
+                Membership {
+                    member: WorkerId::parse("laptop").unwrap(),
+                    key: group::test_key(),
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            coordinator
+                .store()
+                .identity_retired_notice(&worker, &boot)
+                .unwrap(),
+            None
+        );
+        notify_retired(&coordinator, &connected.client, &worker, &boot).await;
+        assert!(coordinator
+            .store()
+            .identity_retired_notice(&worker, &boot)
+            .unwrap()
+            .is_some());
+        let notice = tokio::time::timeout(std::time::Duration::from_secs(10), peer)
+            .await
+            .expect("the worker was told")
+            .unwrap();
+        assert_eq!(notice.coordinator_id, me);
+        assert_eq!(notice.worker_id, worker);
+        assert_eq!(notice.worker_boot_id, boot);
+    }
+
     #[test]
     fn a_retired_identity_is_refused_whatever_is_recorded() {
         for recorded in [None, Some("a"), Some("b")] {
