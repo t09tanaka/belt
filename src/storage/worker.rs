@@ -653,6 +653,25 @@ impl WorkerStore {
         })
     }
 
+    /// How many ended attempts have a result that was not collected yet, of
+    /// the members that still use the identity `boot`. A member that retired
+    /// it is refused from then on and collects nothing more: its results do
+    /// not count.
+    pub fn count_uncollected_of_serving_members(&self, boot: &WorkerBootId) -> Result<u64> {
+        let b = boot.to_string();
+        self.db.call(move |c| {
+            let n: i64 = c.query_row(
+                "SELECT count(*) FROM worker_attempt
+                 WHERE state = 'terminal' AND acked_at_ms IS NULL
+                   AND coordinator_id NOT IN
+                       (SELECT coordinator_id FROM retired_identity WHERE worker_boot_id = ?1)",
+                [&b],
+                |r| r.get(0),
+            )?;
+            to_u64(n)
+        })
+    }
+
     /// Whether this handle's member retired the identity `boot`.
     pub fn identity_retired(&self, boot: &WorkerBootId) -> Result<bool> {
         let (o, b) = (self.member_scope(), boot.to_string());

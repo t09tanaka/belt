@@ -743,6 +743,72 @@ async fn a_start_ends_an_unstarted_attempt_whose_lease_was_ended_and_no_other() 
     agent.shutdown();
 }
 
+/// What an ephemeral worker ends itself on (spec 24.3): the notice, no
+/// live attempt of any member, and no result that a member which still uses
+/// the worker has not collected. The other member's uncollected result
+/// holds it until that member collects; the result of the member that
+/// retired the identity is never collected and does not hold it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_members_uncollected_result_holds_a_retired_worker_until_it_is_collected() {
+    let f = fx();
+    f.admit_commands(2);
+    let agent = f.start("boot-1");
+    let (main, sub) = (member("main"), member("sub"));
+    let a = dial(&f, &agent, &main).await.unwrap().client;
+    let b = dial(&f, &agent, &sub).await.unwrap().client;
+    assert_eq!(agent.retirement(), (false, Some(0), Some(0)));
+    let mut long = payload("sleep 600");
+    long.lease_ms = 600_000;
+    let (mine, theirs) = (AttemptId::generate(), AttemptId::generate());
+    call(&a, request_of(&main, &mine, &long)).await.unwrap();
+    call(&b, request_of(&sub, &theirs, &payload("exit 0")))
+        .await
+        .unwrap();
+    assert_eq!(f.wait_terminal(&theirs), Outcome::Succeeded);
+    // Nobody retired the identity yet: nothing ends the worker.
+    let (told, live, uncollected) = agent.retirement();
+    assert_eq!((told, live, uncollected), (false, Some(1), Some(1)));
+
+    call(&a, retired_req(&main, &f.worker, "boot-1"))
+        .await
+        .unwrap();
+    assert_eq!(f.wait_terminal(&mine), Outcome::Interrupted);
+    // Told and idle, but the other member has not collected its result.
+    // The retiring member's own result (never collected) is not counted.
+    assert!(f.store().get(&mine).unwrap().unwrap().acked_at_ms.is_none());
+    assert_eq!(agent.retirement(), (true, Some(0), Some(1)));
+    // The other member is still served: it reads its result and collects.
+    let Response::GetResult(result) = call(
+        &b,
+        Request::GetResult(GetResultRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: theirs.clone(),
+            generation: Generation(1),
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(agent.retirement(), (true, Some(0), Some(1)));
+    call(
+        &b,
+        Request::AckCollected(AckCollectedRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: theirs.clone(),
+            generation: Generation(1),
+            result_digest: result.result_digest,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(agent.retirement(), (true, Some(0), Some(0)));
+    drop((a, b));
+    agent.shutdown();
+}
+
 async fn alive_on(c: &Client) -> bool {
     let inspect = Request::Inspect(InspectRequest {
         preparation_observations: None,

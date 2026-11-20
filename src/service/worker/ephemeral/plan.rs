@@ -93,11 +93,16 @@ pub fn removable(live_attempts: Option<u32>) -> bool {
 }
 
 /// An ephemeral worker ends itself once a member told it that its identity
-/// is retired and nothing runs on it any more (spec chapter 15, 24.3): no
-/// member that retired the identity sends it work again, and an identity
-/// lasts for one start. A count that could not be read keeps it running.
-pub fn finished(told_retired: bool, live_attempts: Option<u64>) -> bool {
-    told_retired && live_attempts == Some(0)
+/// is retired, nothing runs on it any more, and no member that still uses
+/// it has a result to collect from it (spec chapter 15, 24.3). Until then it
+/// keeps serving the other members. A count that could not be read keeps it
+/// running.
+pub fn finished(
+    told_retired: bool,
+    live_attempts: Option<u64>,
+    uncollected_results: Option<u64>,
+) -> bool {
+    told_retired && live_attempts == Some(0) && uncollected_results == Some(0)
 }
 
 #[cfg(test)]

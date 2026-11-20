@@ -1723,7 +1723,7 @@ belt group                                # グループのID、鍵の世代、�
 - workerは、`worker_id` が自分の名前で、`worker_boot_id` が自分の今のidentityのときだけ受け付ける。それ以外は何もせずに断る。
 - 受け付けたworkerは、そのメンバーが投げたliveなattemptを、leaseの失効を待たずにcancelと同じ手順で止めて `interrupted` に確定し、「このメンバーからこのidentityの退役を告げられた」ことを永続化する。以後、同じidentityである間は、そのメンバーの接続を理由 `identity_retired` で断る。
 - 他のメンバーが投げたattempt・接続・leaseには触れない。
-- 一時workerは、退役を告げられ、liveなattemptが無くなったら、stateを消して終了してよい。
+- 一時workerは、退役を告げられた後、どのメンバーのliveなattemptも無く、そのidentityをまだ使っているメンバー（退役を告げていないメンバー）の未回収のresultも無くなったら、stateを消して終了する。それまでは他のメンバーの要求に答え続ける（退役を告げたメンバーの接続は `identity_retired` で断り、そのメンバーのresultは回収されないので数えない）。
 - 通知は同じ内容の再送に同じ答えを返す。届かなくても安全性は変わらない（submitもrenewも送られないので、attemptはleaseの失効で止まる）。通知の目的は、失効を待たずに止めて資源を空けることである。送った側は送ったことを記録するが、届いたことを前提にしない。
 
 ## 24.4 投げたメンバーをまたぐ調停

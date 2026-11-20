@@ -381,10 +381,11 @@ async fn run(
                 housekeeping.spawn_blocking(move || {
                     agent.tick();
                     // An ephemeral worker whose identity a member retired
-                    // ends itself once nothing runs on it (spec 24.3).
+                    // ends itself once nothing runs on it and no other
+                    // member has a result to collect (spec 24.3).
                     ephemeral && {
-                        let (told, live) = agent.retirement();
-                        ephemeral::plan::finished(told, live)
+                        let (told, live, uncollected) = agent.retirement();
+                        ephemeral::plan::finished(told, live, uncollected)
                     }
                 });
             }
@@ -392,7 +393,7 @@ async fn run(
                 match done {
                     Ok(false) => {}
                     Ok(true) => {
-                        eprintln!("this worker's identity was retired and nothing runs on it: ending");
+                        eprintln!("this worker's identity was retired, nothing runs on it and nothing is left to collect: ending");
                         break Ok(());
                     }
                     Err(e) => break Err(e.into()),
