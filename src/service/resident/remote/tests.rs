@@ -542,6 +542,14 @@ async fn an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_res
     let hello = first.worker.clone();
     // No real ssh: nothing is dialed.
     resident.dial = Arc::new(|_, _, _, _, _| Box::pin(async {}));
+    // The peers below never answer. A tick that follows an attached worker
+    // holds the coordinator's actor until its budget (15 s) is spent, and
+    // every request of this test that needs the actor (`workers list`,
+    // `workers forget`) queues behind it and times out after 5 s. The one
+    // tick that runs when the resident starts is over before a worker is
+    // attached; no later one may start while this test is slow (a loaded
+    // machine takes longer than the 5 s heartbeat).
+    resident.heartbeat = Duration::from_secs(3600);
     let coordinator = resident.coordinator.clone();
     let client = resident.client();
     let runner = tokio::spawn(resident.run());
