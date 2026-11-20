@@ -271,8 +271,15 @@ fn the_library_and_the_cli_share_one_repository_and_one_state_directory() {
 
     // The cache is shared: the CLI's installs left entries the library's
     // creations could use, and the other way round, without a mix-up.
+    // Directory clones (and so the cache) exist only where `clonefile(2)`
+    // does; elsewhere every creation installs afresh and the cache stays
+    // empty.
     let cached = cli_ok(&main, &["cache", "ls"]);
-    assert!(cached.contains("gen"), "{cached}");
+    if cfg!(target_os = "macos") {
+        assert!(cached.contains("gen"), "{cached}");
+    } else {
+        assert!(cached.starts_with("cache is empty"), "{cached}");
+    }
 
     // A dirty worktree: refused when strict, typed; discarded when asked.
     let dirty = wts.join("lib0");
