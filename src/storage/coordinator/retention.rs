@@ -267,17 +267,21 @@ impl CoordinatorStore {
 }
 
 /// When the run ended, for the files its jobs hand to each other; `None`
-/// while a job may still ask for one. A run has ended when every task is
-/// computed as the listing of runs counts it (`compute_complete`: its current
-/// attempt has its termination, or it was cancelled before it was placed) and
-/// no attempt of the run is still live. The end is the latest moment an
-/// attempt ended, a task was cancelled or the run was closed.
+/// while a job may still ask for one. A run has ended when no attempt of it
+/// is still live and every task is finished, by the current attempt the
+/// listing of runs counts (`query::run_facts`): that attempt has its
+/// termination, or the task was cancelled before it was placed. A task that
+/// is never placed itself is finished too: a probe whose discovery was
+/// applied, and the origin of a matrix once its members were joined. The end
+/// is the latest moment an attempt ended, a task was cancelled or the run
+/// was closed.
 fn workflow_run_end(c: &Connection, run: &str) -> Result<Option<u64>> {
-    if !query::run_facts(c, run, true, true)?.compute_complete {
-        return Ok(None);
-    }
     let (live, ended): (bool, i64) = c.query_row(
-        "SELECT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1 AND a.retired=0 AND a.state<>'terminal'),
+        "SELECT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1 AND a.retired=0 AND a.state<>'terminal')
+              OR EXISTS(SELECT 1 FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 AND aa.generation>=t.min_generation ORDER BY aa.generation DESC LIMIT 1)
+                 WHERE t.run_id=?1 AND a.termination_json IS NULL AND (t.cancel_requested_at_ms IS NULL OR a.attempt_id IS NOT NULL)
+                 AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.rtr_discovery.applied'),0)=0
+                 AND NOT (coalesce(json_extract(t.spec_json,'$.ci.dynamic_origin'),0)=1 AND json_extract(t.spec_json,'$.ci.core_outcome') IS NOT NULL)),
             max((SELECT coalesce(max(coalesce(a.terminal_at_ms,a.retired_at_ms,0)),0) FROM task t JOIN attempt a USING(task_id) WHERE t.run_id=?1),
                 (SELECT coalesce(max(t.cancel_requested_at_ms),0) FROM task t WHERE t.run_id=?1),
                 (SELECT coalesce(max(closed_at_ms),0) FROM run WHERE run_id=?1))",

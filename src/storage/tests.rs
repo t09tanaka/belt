@@ -5415,6 +5415,17 @@ fn workflow_artifact_files_outlive_their_producer_until_the_run_has_ended() {
     // A later job of the same run that is not placed yet.
     let later = TaskId::generate();
     f.store.create_task(&later, &f.run, &json!({}), 1).unwrap();
+    // The origin of a matrix is never placed itself. It holds the run open
+    // until its members are joined, and not after.
+    let origin = TaskId::generate();
+    f.store
+        .create_task(
+            &origin,
+            &f.run,
+            &json!({"ci":{"hold":true,"dynamic_origin":true}}),
+            1,
+        )
+        .unwrap();
     let digest = Digest::of_bytes(b"built");
     f.store
         .reserve_workflow_files(
@@ -5500,9 +5511,25 @@ fn workflow_artifact_files_outlive_their_producer_until_the_run_has_ended() {
     f.store
         .finalize_attempt(&consumer, done(Outcome::Succeeded), 205)
         .unwrap();
-    assert_eq!(claim(214, 24).removed, 0, "within retention of the run");
+    assert_eq!(claim(216, 26).removed, 0, "the matrix is not joined");
+    let authorization = f.store.ci_driver_authorization(&f.run).unwrap();
+    assert!(f
+        .store
+        .complete_ci_origin(&f.run, &origin, authorization, "success", 206)
+        .unwrap());
+    f.store
+        .db
+        .write(|tx| {
+            tx.execute(
+                "UPDATE attempt SET terminal_at_ms=209 WHERE terminal_at_ms=205",
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(claim(218, 28).removed, 0, "within retention of the run");
     assert_eq!(artifact_refs(), 1);
-    let ended = claim(215, 25);
+    let ended = claim(219, 29);
     assert_eq!((ended.removed, ended.queued), (1, 1));
     assert_eq!(artifact_refs(), 0);
     assert_eq!(
