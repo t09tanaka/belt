@@ -15,7 +15,7 @@
 //! are not in that file and still refuse.
 
 use crate::ecosystem::{generic, target};
-use crate::error::{bail, Error, Result};
+use crate::error::{bail, Error, Kind, Result};
 use crate::hooks::{self, Config, Stage};
 use crate::util::{errln, outln};
 use crate::{git, paths, pending, pool, trash, util};
@@ -41,19 +41,32 @@ pub struct Facts {
     pub has_submodules: bool,
 }
 
+/// Why a worktree is not removed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Refusal {
+    /// The path is inside a worktree, not its root.
     NotWorktreeRoot,
+    /// The embedding process has its current directory inside the worktree.
+    ProcessCwdInside,
+    /// The path is the repository's main checkout.
     MainCheckout,
+    /// The worktree is locked.
     Locked,
+    /// Another registered worktree is inside it.
     ContainsWorktree,
+    /// It has uncommitted or untracked changes.
     Dirty,
+    /// It has submodules.
     Submodules,
 }
 
 impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
+            Refusal::ProcessCwdInside => {
+                "process cwd is inside the worktree; refusing to remove it"
+            }
             Refusal::NotWorktreeRoot => "not a worktree root",
             Refusal::MainCheckout => "refusing to remove the main checkout",
             Refusal::Locked => "worktree is locked",
@@ -99,11 +112,39 @@ pub fn refusal(f: &Facts) -> Option<Refusal> {
     }
 }
 
+/// What [`execute`] did.
+pub struct Done {
+    /// The exit code `remove` gives: 0, or 1 when something after the move
+    /// failed (git still lists the entry, the branch was kept).
+    pub code: i32,
+    /// Where the files are, being deleted.
+    pub trash: PathBuf,
+    /// `--delete-branch` was given and the branch is gone.
+    pub branch_deleted: bool,
+}
+
 pub fn run(opts: Opts) -> Result<i32> {
+    execute(opts).map(|d| d.code)
+}
+
+/// Refuse before hooks or other removal side effects in an embedding process.
+pub(crate) fn refuse_embedded_cwd(path: &Path) -> Result<()> {
+    if crate::util::is_embedded() && std::env::current_dir().is_ok_and(|d| d.starts_with(path)) {
+        let reason = Refusal::ProcessCwdInside;
+        return Err(Error::of(
+            Kind::Refused(reason),
+            format!("{}: {reason}; nothing was removed", path.display()),
+        ));
+    }
+    Ok(())
+}
+
+pub fn execute(opts: Opts) -> Result<Done> {
     let path = opts
         .path
         .canonicalize()
-        .map_err(|e| Error(format!("{}: {e}", opts.path.display())))?;
+        .map_err(|e| Error::msg(format!("{}: {e}", opts.path.display())))?;
+    refuse_embedded_cwd(&path)?;
     let toplevel = git::toplevel(&path)?;
     let toplevel = toplevel.canonicalize().unwrap_or(toplevel);
     let worktrees = git::worktrees(&path)?;
@@ -137,12 +178,13 @@ pub fn run(opts: Opts) -> Result<i32> {
                 path.display()
             );
         }
-        match (r, &inner) {
+        let msg = match (r, &inner) {
             (Refusal::ContainsWorktree, Some(i)) => {
-                bail!("{r}: {} is inside {}", i.display(), path.display())
+                format!("{r}: {} is inside {}", i.display(), path.display())
             }
-            _ => bail!("{r}: {}", path.display()),
-        }
+            _ => format!("{r}: {}", path.display()),
+        };
+        return Err(Error::of(Kind::Refused(r), msg));
     }
     let branch = me.and_then(|w| w.branch.clone());
     // Decide about the branch before anything is removed: `git branch -d`
@@ -152,15 +194,18 @@ pub fn run(opts: Opts) -> Result<i32> {
         _ => git::Merged::Unknown,
     };
     if let (Some(b), git::Merged::No(refs)) = (&branch, &merged) {
-        bail!(
-            "branch {b} is not merged into {}; nothing was removed. \
-             Merge it first, or run remove without --delete-branch",
-            if refs.is_empty() {
-                "anything that stays".to_string()
-            } else {
-                refs.join(" or ")
-            }
-        );
+        return Err(Error::of(
+            Kind::BranchNotMerged,
+            format!(
+                "branch {b} is not merged into {}; nothing was removed. \
+                 Merge it first, or run remove without --delete-branch",
+                if refs.is_empty() {
+                    "anything that stays".to_string()
+                } else {
+                    refs.join(" or ")
+                }
+            ),
+        ));
     }
     // Taken while the worktree is in place: after the move, git can no
     // longer tell which entry was this worktree's.
@@ -183,7 +228,7 @@ pub fn run(opts: Opts) -> Result<i32> {
         }
     }
 
-    if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
+    if !crate::util::is_embedded() && std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
     }
     trash::sweep();
@@ -211,13 +256,26 @@ pub fn run(opts: Opts) -> Result<i32> {
             "fast-worktree: the worktree is gone but git still lists it ({e}); \
              `git worktree prune` removes the entry"
         );
-        return Ok(1);
+        return Ok(Done {
+            code: 1,
+            trash: dest,
+            branch_deleted: false,
+        });
     }
 
     if opts.delete_branch {
-        return Ok(delete_branch(&main, branch.as_deref(), &merged));
+        let code = delete_branch(&main, branch.as_deref(), &merged);
+        return Ok(Done {
+            code,
+            trash: dest,
+            branch_deleted: code == 0 && branch.is_some(),
+        });
     }
-    Ok(0)
+    Ok(Done {
+        code: 0,
+        trash: dest,
+        branch_deleted: false,
+    })
 }
 
 /// The worktree's `.fast-worktree.toml`, or `None`, said on stderr, when it
@@ -367,7 +425,7 @@ mod tests {
     fn a_status_that_fails_counts_as_dirty() {
         assert!(!is_dirty(&Ok(String::new())));
         assert!(is_dirty(&Ok("?? notes.txt\n".into())));
-        assert!(is_dirty(&Err(Error("git status: fatal".into()))));
+        assert!(is_dirty(&Err(Error::msg("git status: fatal"))));
     }
 
     #[test]

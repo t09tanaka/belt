@@ -5,6 +5,33 @@ based on [Keep a Changelog](https://keepachangelog.com/), and this project
 adheres to [Semantic Versioning](https://semver.org/) (pre-1.0: a breaking
 change bumps the minor version).
 
+## [0.5.0] - 2026-11-20
+
+### Added
+
+- A library. `fast_worktree::Repository` creates worktrees (`create_worktree`:
+  a new branch, an existing branch or a detached `HEAD`, with the pool, the
+  cache and the hooks as `add` does them), removes them (`remove_worktree`
+  with `RemoveMode::Strict` as `remove`, or `RemoveMode::Discard` as `hook
+  remove`, trash and kept refs included), reads the effective settings
+  (`config`: `.fast-worktree.toml`, the pool size, `.worktreeinclude`),
+  fills the pool (`fill_pool`) and lists and prunes kept refs. Errors are a
+  typed `Error` enum; output goes to the terminal, nowhere or the result's
+  `log` (`Output`).
+- A program that embeds the library and the `fast-worktree` command share
+  locks, pool, cache, trash and kept refs safely, in the same places and
+  formats; a test drives both concurrently on one repository.
+- The `cli` feature (on by default) builds the command line. A program that
+  only uses the library can leave clap out with `default-features = false`.
+
+### Changed
+
+- Library removal refuses worktrees containing the process cwd instead of changing cwd.
+
+- The command is a thin adapter over the library crate. Its behavior,
+  output, exit codes, defaults, file locations and state formats are
+  unchanged.
+
 ## [0.4.0] - 2026-11-14
 
 ### Fixed

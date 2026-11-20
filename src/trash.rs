@@ -162,10 +162,15 @@ fn spawn_rm_queued(path: &Path, lock: Option<&Path>) {
         cmd.args(["lockf", "-k"]).arg(lock);
     }
     cmd.args(["rm", "-rf"]).arg(path);
-    if spawn_detached(cmd).is_err() {
-        let mut rm = Command::new("rm");
-        rm.arg("-rf").arg(path);
-        let _ = spawn_detached(rm);
+    match spawn_detached(cmd) {
+        Ok(child) => crate::util::release(child),
+        Err(_) => {
+            let mut rm = Command::new("rm");
+            rm.arg("-rf").arg(path);
+            if let Ok(child) = spawn_detached(rm) {
+                crate::util::release(child);
+            }
+        }
     }
 }
 

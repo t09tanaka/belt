@@ -194,11 +194,10 @@ pub fn kept_time(refname: &str) -> Option<u64> {
     })
 }
 
-/// The kept refs of the repository in the current directory, with their
-/// commits.
-fn kept_refs() -> Result<Vec<(String, String)>> {
+/// The kept refs of the repository at `dir`, with their commits.
+pub fn kept_refs(dir: &Path) -> Result<Vec<(String, String)>> {
     let out = git::output(
-        Path::new("."),
+        dir,
         &[
             "for-each-ref",
             "--format=%(refname) %(objectname)",
@@ -218,7 +217,7 @@ fn count(n: usize) -> String {
 
 /// `kept ls`.
 pub fn ls() -> Result<i32> {
-    let refs = kept_refs()?;
+    let refs = kept_refs(Path::new("."))?;
     if refs.is_empty() {
         outln!("no refs under {KEPT_REFS}");
         return Ok(0);
@@ -253,17 +252,25 @@ pub fn ls() -> Result<i32> {
 /// they are older than that. Refs whose name has no time are left alone.
 pub fn prune(older_than_days: Option<u64>) -> Result<i32> {
     let days = older_than_days.unwrap_or(PRUNE_DAYS);
+    let (pruned, failed) = prune_in(Path::new("."), days)?;
+    outln!("pruned {} kept for {days} days or more", count(pruned));
+    Ok(i32::from(failed > 0))
+}
+
+/// [`prune`] for the repository at `dir`, without the summary line.
+/// Returns how many refs were pruned and how many could not be.
+pub fn prune_in(dir: &Path, days: u64) -> Result<(usize, usize)> {
     let now = now_secs();
     let mut pruned = 0;
     let mut failed = 0;
-    for (r, o) in kept_refs()? {
+    for (r, o) in kept_refs(dir)? {
         let Some(t) = kept_time(&r) else {
             continue;
         };
         if now.saturating_sub(t) < days * 86_400 {
             continue;
         }
-        match git::output(Path::new("."), &["update-ref", "-d", &r, &o]) {
+        match git::output(dir, &["update-ref", "-d", &r, &o]) {
             Ok(_) => {
                 outln!("pruned {r}");
                 pruned += 1;
@@ -274,8 +281,7 @@ pub fn prune(older_than_days: Option<u64>) -> Result<i32> {
             }
         }
     }
-    outln!("pruned {} kept for {days} days or more", count(pruned));
-    Ok(i32::from(failed > 0))
+    Ok((pruned, failed))
 }
 
 #[cfg(test)]

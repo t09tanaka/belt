@@ -89,9 +89,13 @@ pub fn is_pool_path(path: &Path) -> bool {
 
 /// Where the size comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Source {
+    /// `[pool] size` in the main checkout's `.fast-worktree.toml`.
     Repo,
+    /// `[pool] size` in the user-wide settings file.
     User,
+    /// Not set anywhere: the pool is off.
     Default,
 }
 
@@ -304,7 +308,7 @@ fn try_spawn_fill(main: &Path, pool: &Path, after: Option<&Path>) -> io::Result<
         .write(true)
         .truncate(fresh)
         .open(&log_path)?;
-    let exe = std::env::current_exe()?;
+    let exe = util::helper_exe()?;
     let mut c = Command::new(exe);
     c.args(["pool", "fill"]);
     if let Some(a) = after {
@@ -318,7 +322,7 @@ fn try_spawn_fill(main: &Path, pool: &Path, after: Option<&Path>) -> io::Result<
     for v in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_PREFIX"] {
         c.env_remove(v);
     }
-    c.spawn().map(|_| ())
+    c.spawn().map(util::release)
 }
 
 /// An exclusive `flock` on `pool/fill.lock`, held while the value lives.
@@ -342,7 +346,7 @@ pub fn try_lock(pool: &Path) -> Result<Option<FillLock>> {
         if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
             Ok(None)
         } else {
-            Err(Error(format!("{FILL_LOCK}: {e}")))
+            Err(Error::msg(format!("{FILL_LOCK}: {e}")))
         }
     }
 }
@@ -370,7 +374,12 @@ fn fetched_base(main: &Path) -> Result<String> {
 /// wait (holding the fill lock) for the background install of that
 /// worktree, if one is running.
 pub fn fill(after: Option<&Path>) -> Result<i32> {
-    let main = main_here()?;
+    fill_for(&main_here()?, after)
+}
+
+/// [`fill`] for the repository whose main checkout is `main`.
+pub fn fill_for(main: &Path, after: Option<&Path>) -> Result<i32> {
+    let main = main.to_path_buf();
     let (size, _) = size(&main);
     if size == 0 {
         outln!("the pool is off: set [pool] size in {}", hooks::FILE);

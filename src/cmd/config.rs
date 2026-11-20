@@ -36,7 +36,7 @@ fn read(path: &Path) -> Result<String> {
     match std::fs::read_to_string(path) {
         Ok(t) => Ok(t),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(String::new()),
-        Err(e) => Err(Error(format!("{}: {e}", path.display()))),
+        Err(e) => Err(Error::msg(format!("{}: {e}", path.display()))),
     }
 }
 
@@ -56,7 +56,7 @@ pub fn init(dry_run: bool) -> Result<i32> {
     let root = root_here()?;
     let path = root.join(FILE);
     let text = read(&path)?;
-    let (cfg, _) = hooks::parse(&text).map_err(|e| Error(format!("{FILE}: {e}")))?;
+    let (cfg, _) = hooks::parse(&text).map_err(|e| Error::msg(format!("{FILE}: {e}")))?;
     // An entry that does not resolve names no project: one for its
     // project would be added next to it.
     if let Err(errors) = target::resolve(&cfg.clone) {
@@ -82,14 +82,14 @@ pub fn init(dry_run: bool) -> Result<i32> {
     }
     let mut doc: toml_edit::DocumentMut = text
         .parse()
-        .map_err(|e: toml_edit::TomlError| Error(format!("{FILE}: {e}")))?;
+        .map_err(|e: toml_edit::TomlError| Error::msg(format!("{FILE}: {e}")))?;
     let added = add_entries(&mut doc, &missing)?;
     if dry_run {
         util::say(&added);
         outln!("(dry run: {FILE} was not written)");
         return Ok(0);
     }
-    std::fs::write(&path, doc.to_string()).map_err(|e| Error(format!("{FILE}: {e}")))?;
+    std::fs::write(&path, doc.to_string()).map_err(|e| Error::msg(format!("{FILE}: {e}")))?;
     for (preset, dir) in &missing {
         outln!("add    [[clone]] preset = \"{preset}\", dir = \"{dir}\"");
     }

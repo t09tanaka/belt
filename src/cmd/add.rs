@@ -28,8 +28,8 @@ pub fn run(opts: Opts) -> Result<i32> {
         name: opts.branch,
         start,
     };
-    let ok = create(here, &opts.path, &branch, false)?;
-    Ok(if ok { 0 } else { 1 })
+    let made = create(here, &opts.path, &branch, false)?;
+    Ok(if made.ok { 0 } else { 1 })
 }
 
 /// Where a new branch starts without `<start-point>`: the remote's default
@@ -38,7 +38,7 @@ pub fn run(opts: Opts) -> Result<i32> {
 /// create` and `pool fill`; when it fails, the branch starts from
 /// `origin/<default>` as last fetched, and only when there is none is that
 /// an error.
-fn fetched_start(here: &Path, limit: Duration) -> Result<String> {
+pub fn fetched_start(here: &Path, limit: Duration) -> Result<String> {
     let base = git::origin_default_branch(here)?;
     let start = format!("origin/{base}");
     if let Err(e) = git::fetch_quietly(here, &base, Some(limit)) {
@@ -59,6 +59,19 @@ pub enum Branch {
     New { name: String, start: String },
     /// An existing local branch, checked out as it is.
     Existing(String),
+    /// A detached `HEAD` at `start`: no branch is created.
+    Detached { start: String },
+}
+
+/// What [`create`] made.
+pub struct Created {
+    /// Everything after the worktree existed succeeded, or was left to the
+    /// background.
+    pub ok: bool,
+    /// The worktree was a spare taken from the pool.
+    pub from_pool: bool,
+    /// The worktree's real path.
+    pub root: PathBuf,
 }
 
 /// Create the worktree at `path`, then copy the `.worktreeinclude` files,
@@ -73,7 +86,7 @@ pub enum Branch {
 ///
 /// When the pool is on, a refill starts at the end, whether a spare was
 /// taken or not; it waits for the background install, if there is one.
-pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<bool> {
+pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<Created> {
     let start = Instant::now();
     let main = install::main_checkout(here)?;
     // Relative to the current directory, also for the git commands the
@@ -90,10 +103,11 @@ pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<
         // `--quiet`: no "Preparing worktree" lines and, above all, no
         // "Updating files: N%" progress, which git prints on a terminal for
         // a large checkout. Errors are still printed.
-        let mut args = vec!["worktree", "add", "--quiet", &p];
+        let mut args = vec!["worktree", "add", "--quiet"];
         match branch {
-            Branch::New { name, start } => args.extend(["-b", name, start]),
-            Branch::Existing(name) => args.push(name),
+            Branch::New { name, start } => args.extend([p.as_str(), "-b", name, start]),
+            Branch::Existing(name) => args.extend([p.as_str(), name.as_str()]),
+            Branch::Detached { start } => args.extend(["--detach", p.as_str(), start]),
         }
         // A post-checkout hook that calls `fast-worktree check
         // --post-checkout` would clone dependencies here before the full
@@ -119,7 +133,11 @@ pub fn create(here: &Path, path: &Path, branch: &Branch, defer: bool) -> Result<
     if pool_on {
         pool::spawn_fill(&main, Some(&root));
     }
-    Ok(ok)
+    Ok(Created {
+        ok,
+        from_pool: spare.is_some(),
+        root,
+    })
 }
 
 /// A spare taken from the pool, now the worktree.
@@ -154,6 +172,7 @@ fn from_pool(main: &Path, path: &Path, branch: &Branch) -> Option<Spare> {
     match branch {
         Branch::New { name, start } => args.extend(["-c", name, start]),
         Branch::Existing(name) => args.push(name),
+        Branch::Detached { start } => args.extend(["--detach", start]),
     }
     let switched = git::run_with_env(path, &args, &[("FAST_WORKTREE_SKIP", "1")]).is_ok();
     if switched {

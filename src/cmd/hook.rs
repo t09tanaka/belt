@@ -63,7 +63,7 @@ fn stdout_to_stderr() -> Result<File> {
 fn read_input() -> Result<Value> {
     let mut s = String::new();
     io::stdin().read_to_string(&mut s)?;
-    serde_json::from_str(&s).map_err(|e| Error(format!("hook input is not JSON: {e}")))
+    serde_json::from_str(&s).map_err(|e| Error::msg(format!("hook input is not JSON: {e}")))
 }
 
 fn field<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
@@ -153,7 +153,7 @@ fn create_worktree() -> Result<PathBuf> {
             start: fresh_start(&main),
         }
     };
-    if !add::create(&main, &path, &branch, true)? {
+    if !add::create(&main, &path, &branch, true)?.ok {
         errln!(
             "fast-worktree: warning: the worktree was created, but setting it up failed (see above); \
              `fast-worktree install` in it tries again"
@@ -211,21 +211,46 @@ fn remove_worktree() -> Result<()> {
     let Some(given) = field(&input, "worktree_path") else {
         bail!("hook input has no `worktree_path`");
     };
-    let given = PathBuf::from(given);
+    let cwd = field(&input, "cwd").map(PathBuf::from);
+    discard(Path::new(given), cwd.as_deref()).map(|_| ())
+}
+
+/// What [`discard`] did.
+pub struct Discarded {
+    /// Where the files went, `None` when the directory was already gone.
+    pub trash: Option<PathBuf>,
+    /// The worktree had changes, submodules or another worktree inside, so
+    /// its files stay in the trash for [`KEEP_SECS`] instead of being
+    /// deleted at once.
+    pub kept: bool,
+    /// Git no longer lists the worktree.
+    pub complete: bool,
+}
+
+/// What `hook remove` does for `given` (see the module description).
+/// `cwd` is any directory of the repository, for a worktree that is
+/// already gone; the current directory when `None`.
+pub fn discard(given: &Path, cwd: Option<&Path>) -> Result<Discarded> {
+    let given = given.to_path_buf();
     if given.symlink_metadata().is_err() {
         errln!("fast-worktree: {} is already gone", given.display());
-        let dir = match field(&input, "cwd") {
-            Some(c) => PathBuf::from(c),
+        let dir = match cwd {
+            Some(c) => c.to_path_buf(),
             None => std::env::current_dir()?,
         };
         forget(&dir, &given);
-        return Ok(());
+        return Ok(Discarded {
+            trash: None,
+            kept: false,
+            complete: true,
+        });
     }
     let path = given
         .canonicalize()
-        .map_err(|e| Error(format!("{}: {e}", given.display())))?;
+        .map_err(|e| Error::msg(format!("{}: {e}", given.display())))?;
+    remove::refuse_embedded_cwd(&path)?;
     let top = git::toplevel(&path).map_err(|_| {
-        Error(format!(
+        Error::msg(format!(
             "{}: not a git worktree; not removing it",
             path.display()
         ))
@@ -283,8 +308,8 @@ fn remove_worktree() -> Result<()> {
             path.display()
         );
     }
-    let subs =
-        submodules::plan(&path, &admin).map_err(|e| Error(format!("{e}; nothing was removed")))?;
+    let subs = submodules::plan(&path, &admin)
+        .map_err(|e| Error::msg(format!("{e}; nothing was removed")))?;
     // Every checked-out submodule, wherever its git directory is (one
     // inside it is deleted with the worktree as much as one in the entry).
     // When they cannot be listed, the worktree is kept all the same.
@@ -322,7 +347,7 @@ fn remove_worktree() -> Result<()> {
             errln!("fast-worktree: {failed} pre_remove hook(s) failed; removing anyway");
         }
     }
-    if std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
+    if !crate::util::is_embedded() && std::env::current_dir().is_ok_and(|d| d.starts_with(&path)) {
         std::env::set_current_dir(&main)?;
     }
     let name = path
@@ -353,7 +378,7 @@ fn remove_worktree() -> Result<()> {
     let detached_alone =
         me.branch.is_none() && head.as_deref().is_some_and(|h| !on_any_ref(&main, h));
     submodules::embed(&subs).map_err(|e| {
-        Error(format!(
+        Error::msg(format!(
             "{e}; the worktree is still there and still registered"
         ))
     })?;
@@ -364,7 +389,7 @@ fn remove_worktree() -> Result<()> {
         trash::move_aside(&path)
     };
     let dest = moved.map_err(|e| {
-        Error(format!(
+        Error::msg(format!(
             "the pre_remove hooks ran, but {} could not be moved away ({e}): \
              the worktree is still there and still registered",
             path.display()
@@ -385,6 +410,7 @@ fn remove_worktree() -> Result<()> {
         util::tilde(&path),
         util::tilde(&dest)
     );
+    let unregistered_ok = unregistered.is_ok();
     if let Err(e) = unregistered {
         errln!("fast-worktree: git still lists it ({e})");
     }
@@ -490,7 +516,11 @@ fn remove_worktree() -> Result<()> {
     if let Some(b) = me.branch.as_ref().filter(|b| **b != own) {
         errln!("fast-worktree: kept branch {b} (not created by `hook create`)");
     }
-    Ok(())
+    Ok(Discarded {
+        trash: Some(dest),
+        kept: keep,
+        complete: unregistered_ok,
+    })
 }
 
 /// The registration of a worktree whose directory is already gone: drop

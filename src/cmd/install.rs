@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn projects_are_named_by_path_root_or_a_unique_last_name() {
         let dirs = [".", "api", "provision/lambda", "web", "a/web"];
-        let r = |rel: &str, arg: &str| resolve_project(rel, arg, &dirs).map_err(|e| e.0);
+        let r = |rel: &str, arg: &str| resolve_project(rel, arg, &dirs).map_err(|e| e.msg);
         assert_eq!(r(".", ".").unwrap(), ".");
         assert_eq!(r("api", "api").unwrap(), "api");
         assert_eq!(r("root", "root").unwrap(), ".");
@@ -272,7 +272,7 @@ mod tests {
         let no_root = ["api"];
         assert!(resolve_project("root", "root", &no_root).is_err());
         let two = ["a/lambda", "b/lambda"];
-        let e = resolve_project("lambda", "lambda", &two).unwrap_err().0;
+        let e = resolve_project("lambda", "lambda", &two).unwrap_err().msg;
         assert!(
             e.contains("lambda matches several projects: a/lambda, b/lambda"),
             "{e}"

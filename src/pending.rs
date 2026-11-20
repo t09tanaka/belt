@@ -155,7 +155,7 @@ pub fn spawn(root: &Path, dirs: &[String]) -> io::Result<()> {
     let _ = fs::remove_file(dir.join(RESULT));
     write_whole(&dir.join(MARKER), &format!("{}\n", now_secs()))?;
     let log = fs::File::create(dir.join(LOG))?;
-    let exe = std::env::current_exe()?;
+    let exe = crate::util::helper_exe()?;
     let mut c = Command::new(exe);
     c.arg("install")
         .arg("--root")
@@ -171,7 +171,10 @@ pub fn spawn(root: &Path, dirs: &[String]) -> io::Result<()> {
         c.env_remove(v);
     }
     match c.spawn() {
-        Ok(_) => Ok(()),
+        Ok(child) => {
+            crate::util::release(child);
+            Ok(())
+        }
         Err(e) => {
             let _ = fs::remove_file(dir.join(MARKER));
             Err(e)
