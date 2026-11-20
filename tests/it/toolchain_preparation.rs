@@ -747,7 +747,14 @@ fn restart_keeps_same_key_barrier_until_old_writer_settles_then_installs_again()
 #[test]
 fn supervisor_deadline_drains_installer_descendants_without_publishing_receipt() {
     let mut f = Fx::new(AdapterKind::Nodenv, "node", "hang");
-    f.cfg.deadline_ms = 1500;
+    // The supervisor's deadline counts from its own start, so it also covers
+    // launching the supervisor process and the manager script that starts the
+    // child. A deadline shorter than that startup (seen on a loaded machine or
+    // for a freshly built binary) fires before the child exists, and the
+    // fixture then never sees it. This one is far longer than any startup, so
+    // the child is always recorded first, and still ends the run well inside
+    // `done`'s own limit.
+    f.cfg.deadline_ms = 10_000;
     f.setups = Setups::open(f.cfg.clone(), Arc::new(NoWorkspace)).unwrap();
     let a = f.consumer();
     f.poll(&a);
