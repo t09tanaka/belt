@@ -27,6 +27,7 @@ impl WorkerLink for Slow {
             }
             match request {
                 crate::wire::Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
+                    admission: None,
                     preparation_observations: None,
                     capabilities: None,
                     schema_version: SchemaVersion::CURRENT,

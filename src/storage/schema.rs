@@ -632,6 +632,13 @@ CREATE TABLE removed_member (
     name          TEXT PRIMARY KEY,
     removed_at_ms INTEGER NOT NULL
 ) WITHOUT ROWID;"#.into(),
+            // Spec 24.4. How often the submit of a placement was handed to
+            // its link, counted before each send. A worker that answers
+            // "nothing stored" settles an attempt only when this says the
+            // answered send was the only one; NULL (a placement made before
+            // this step) is "not known", and such an attempt is retired on
+            // its worker first.
+            "ALTER TABLE placement ADD COLUMN submit_sends INTEGER;".into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

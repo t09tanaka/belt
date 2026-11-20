@@ -16,8 +16,8 @@
 
 use super::common::{self, from_json, json, parse_state};
 use super::policy::{
-    decide_claim, decide_lease, decide_submit, Access, ClaimDecision, ExistingAttempt, GcCandidate,
-    LeaseDecision, SubmitDecision, SubmitKey,
+    decide_claim, decide_lease, decide_submit, window_full, Access, ClaimDecision, ExistingAttempt,
+    GcCandidate, LeaseDecision, SubmitDecision, SubmitKey,
 };
 use super::{
     to_i64, to_u64, BlobRef, Db, DbKind, Event, Finalized, GcReport, NewBlobRef, Result,
@@ -740,6 +740,22 @@ impl WorkerStore {
     /// included: it counts until it is confirmed stopped (terminal). Nothing
     /// here starts a command.
     pub fn submit(&self, new: NewAcceptance, at_ms: u64) -> Result<SubmitOutcome> {
+        self.submit_within(new, None, at_ms)
+    }
+
+    /// [`Self::submit`] under the admission window of this worker (spec
+    /// 24.4): a new attempt is refused with `Capacity` while `window`
+    /// attempts, of every member together, are not terminal. The count and
+    /// the insert are one transaction. A resend of an accepted attempt adds
+    /// nothing and is answered as before, and so is a stale epoch, a
+    /// tombstone, an attempt id in use and a live attempt of the task: the
+    /// window is the last thing looked at. The refusal stores nothing.
+    pub fn submit_within(
+        &self,
+        new: NewAcceptance,
+        window: Option<u64>,
+        at_ms: u64,
+    ) -> Result<SubmitOutcome> {
         let attempt = new.attempt_id.clone();
         under_epoch(
             &self.db,
@@ -810,6 +826,17 @@ impl WorkerStore {
                             .optional()?;
                         if let Some(live) = live {
                             return Err(StorageError::LiveAttemptExists(live));
+                        }
+                        if let Some(window) = window {
+                            let live: i64 = tx.query_row(
+                                "SELECT COUNT(*) FROM worker_attempt WHERE state <> 'terminal'",
+                                [],
+                                |r| r.get(0),
+                            )?;
+                            let live = to_u64(live)?;
+                            if window_full(live, window) {
+                                return Err(StorageError::Capacity { live, window });
+                            }
                         }
                         let mut receipts = Receipts::default();
                         receipts.mark(Receipt::WorkerAccepted, at_ms);

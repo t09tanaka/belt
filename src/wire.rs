@@ -468,6 +468,38 @@ pub struct InspectResponse {
     pub prefetch_per_worker: u32,
     pub disk_free_bytes: u64,
     pub draining: bool,
+    /// The admission window of this worker (`shared_admission_v1`; a worker
+    /// of this build always answers it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub admission: Option<AdmissionWindow>,
+}
+
+/// The admission window of a worker (spec 24.4): one budget over the
+/// attempts of every member, set by the worker's own configuration. Counts
+/// only; nothing of another member's attempts is named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdmissionWindow {
+    /// How many attempts that are not terminal the worker holds at most:
+    /// its own `max_active_task` plus its own `prefetch_per_worker`.
+    pub limit: u64,
+    /// How many it holds now, of every member.
+    pub used: u64,
+    /// Of `used`, the attempts of the member that asked.
+    pub own: u64,
+    /// Of `used`, the attempts of the other members.
+    pub foreign: u64,
+}
+
+impl AdmissionWindow {
+    /// Whether one more attempt fits.
+    pub fn has_room(&self) -> bool {
+        self.used < self.limit
+    }
+
+    /// Whether other members have work in the window.
+    pub fn shared(&self) -> bool {
+        self.foreign > 0
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -708,6 +740,16 @@ pub struct ForecastResponse {
     pub ttl_ms: u64,
     pub coverage: Vec<Coverage>,
     pub target: ForecastTarget,
+    /// How many attempts of other members the answer counts as demand
+    /// (`shared_admission_v1`, spec 24.5). `coverage` names the asking
+    /// member's attempts only; of the others there is this number and
+    /// nothing else.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub foreign_demand: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 // ---------------------------------------------------------------------------
@@ -2449,8 +2491,72 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_admission_window_and_the_foreign_demand_are_additions_to_the_wire() {
+        let window = AdmissionWindow {
+            limit: 3,
+            used: 2,
+            own: 1,
+            foreign: 1,
+        };
+        assert!(window.has_room() && window.shared());
+        let full = AdmissionWindow { used: 3, ..window };
+        assert!(!full.has_room());
+        assert!(!AdmissionWindow { used: 4, ..window }.has_room());
+        assert!(!AdmissionWindow {
+            foreign: 0,
+            ..window
+        }
+        .shared());
+        let mut inspect = responses()
+            .into_iter()
+            .find_map(|r| match r {
+                Response::Inspect(inspect) => Some(inspect),
+                _ => None,
+            })
+            .expect("an inspect response");
+        // Not there: not written, and read as not said.
+        let v = serde_json::to_value(&inspect).unwrap();
+        assert!(v.get("admission").is_none());
+        assert_eq!(
+            serde_json::from_value::<InspectResponse>(v).unwrap(),
+            inspect
+        );
+        inspect.admission = Some(window);
+        let v = serde_json::to_value(&inspect).unwrap();
+        assert_eq!(
+            v["admission"],
+            json!({"limit": 3, "used": 2, "own": 1, "foreign": 1})
+        );
+        assert_eq!(
+            serde_json::from_value::<InspectResponse>(v).unwrap(),
+            inspect
+        );
+        let mut forecast = responses()
+            .into_iter()
+            .find_map(|r| match r {
+                Response::Forecast(forecast) => Some(forecast),
+                _ => None,
+            })
+            .expect("a forecast response");
+        let v = serde_json::to_value(&forecast).unwrap();
+        assert!(v.get("foreign_demand").is_none());
+        assert_eq!(
+            serde_json::from_value::<ForecastResponse>(v).unwrap(),
+            forecast
+        );
+        forecast.foreign_demand = 2;
+        let v = serde_json::to_value(&forecast).unwrap();
+        assert_eq!(v["foreign_demand"], 2);
+        assert_eq!(
+            serde_json::from_value::<ForecastResponse>(v).unwrap(),
+            forecast
+        );
+    }
+
     fn responses() -> Vec<Response> {
         let forecast = ForecastResponse {
+            foreign_demand: 0,
             schema_version: SV,
             worker_id: worker(),
             worker_boot_id: boot(),
@@ -2474,6 +2580,7 @@ mod tests {
                 nonce: "cd".repeat(32),
             }),
             Response::Inspect(InspectResponse {
+                admission: None,
                 preparation_observations: None,
                 capabilities: None,
                 schema_version: SV,

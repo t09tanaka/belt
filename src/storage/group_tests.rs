@@ -736,6 +736,98 @@ fn the_directories_of_dropped_attempts_are_removed_and_nothing_else() {
 /// time. The second member is told so with a refusal that stores nothing
 /// (not a verdict on its task), and nothing it does about that id reaches
 /// the first member's attempt.
+/// A52: the window is one budget over every member, and a submit beyond it
+/// leaves nothing, no tombstone and no newer epoch either.
+#[test]
+fn a52_the_window_counts_every_member_and_a_refused_submit_stores_nothing() {
+    let t = two();
+    let (first, second) = (AttemptId::generate(), AttemptId::generate());
+    let submit = |s: &WorkerStore, a: &AttemptId, epoch: u64, at: u64| {
+        s.submit_within(acceptance(a, &TaskId::generate(), 'a', epoch), Some(2), at)
+    };
+    submit(&t.a, &first, 1, 1).unwrap();
+    submit(&t.b, &second, 2, 2).unwrap();
+    t.b.cancel(&AttemptId::generate(), CoordinatorEpoch(2), 3)
+        .unwrap();
+    let rows = |q: &'static str| {
+        t.own
+            .db
+            .call(move |c| Ok(c.query_row(q, [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    let before = (
+        rows("SELECT count(*) FROM worker_attempt"),
+        rows("SELECT count(*) FROM tombstone"),
+        rows("SELECT count(*) FROM event"),
+    );
+    // One of each member fills a window of two: a third is refused whoever
+    // sends it, also under a newer epoch.
+    let third = AttemptId::generate();
+    for store in [&t.a, &t.b] {
+        let e = submit(store, &third, 9, 4).err().unwrap();
+        assert!(
+            matches!(e, StorageError::Capacity { live: 2, window: 2 }),
+            "{e:?}"
+        );
+        assert_eq!(e.code(), ErrorCode::Overloaded);
+        assert!(e.leaves_nothing() && !e.is_retryable());
+        assert!(store.get(&third).unwrap().is_none());
+        assert!(store.tombstone(&third).unwrap().is_none());
+    }
+    let after = (
+        rows("SELECT count(*) FROM worker_attempt"),
+        rows("SELECT count(*) FROM tombstone"),
+        rows("SELECT count(*) FROM event"),
+    );
+    assert_eq!(after, before);
+    assert_eq!(t.a.max_coordinator_epoch().unwrap(), CoordinatorEpoch(1));
+    assert_eq!(t.b.max_coordinator_epoch().unwrap(), CoordinatorEpoch(2));
+    assert_eq!(t.b.count_undelivered_tombstones().unwrap(), 1);
+    // A resend of an accepted attempt adds nothing and is not refused.
+    let again = t.a.get(&first).unwrap().unwrap();
+    let resend = NewAcceptance {
+        run_id: again.run_id.clone(),
+        task_id: again.task_id.clone(),
+        ..acceptance(&first, &again.task_id, 'a', 1)
+    };
+    assert!(matches!(
+        t.a.submit_within(resend, Some(2), 5).unwrap(),
+        SubmitOutcome::Existing(_)
+    ));
+    // What is about the attempt is answered before the window: a tombstone,
+    // an older epoch, an id in use, a live attempt of the task.
+    let gone = AttemptId::generate();
+    t.a.retire(&gone, CoordinatorEpoch(1), 6).unwrap();
+    let e = submit(&t.a, &gone, 1, 7).err().unwrap();
+    assert!(matches!(e, StorageError::Retired(_)), "{e:?}");
+    let e = submit(&t.b, &third, 1, 7).err().unwrap();
+    assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
+    let e = submit(&t.b, &first, 2, 7).err().unwrap();
+    assert!(matches!(e, StorageError::AttemptIdInUse(_)), "{e:?}");
+    let live = NewAcceptance {
+        task_id: again.task_id.clone(),
+        ..acceptance(&third, &again.task_id, 'a', 1)
+    };
+    let e = t.a.submit_within(live, Some(2), 7).err().unwrap();
+    assert!(matches!(e, StorageError::LiveAttemptExists(_)), "{e:?}");
+    // A wider window, or none, takes it; and an attempt that ended gives
+    // its place back.
+    assert!(submit(&t.a, &third, 1, 8).is_err());
+    assert!(matches!(
+        t.a.submit_within(acceptance(&third, &TaskId::generate(), 'a', 1), Some(3), 8)
+            .unwrap(),
+        SubmitOutcome::Accepted(_)
+    ));
+    assert!(matches!(
+        t.b.submit(
+            acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 2),
+            9
+        )
+        .unwrap(),
+        SubmitOutcome::Accepted(_)
+    ));
+}
+
 #[test]
 fn an_attempt_id_another_member_holds_is_refused_and_nothing_is_stored() {
     let t = two();

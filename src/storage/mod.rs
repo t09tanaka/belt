@@ -115,6 +115,11 @@ pub enum StorageError {
         "attempt id {0} is in use on this worker; place the task again under a new attempt id"
     )]
     AttemptIdInUse(AttemptId),
+    /// The admission window of this worker is full, counted over every
+    /// member's attempts that are not terminal. Nothing of the call was
+    /// committed.
+    #[error("{live} attempts are not terminal on this worker and its window is {window}")]
+    Capacity { live: u64, window: u64 },
     #[error("lease for {0} cannot be renewed")]
     LeaseNotRenewable(AttemptId),
     #[error(transparent)]
@@ -170,6 +175,7 @@ impl StorageError {
             self,
             StorageError::Overloaded(_)
                 | StorageError::AttemptIdInUse(_)
+                | StorageError::Capacity { .. }
                 | StorageError::LiveAttemptExists(_)
                 | StorageError::Invalid(_)
         )
@@ -181,7 +187,9 @@ impl StorageError {
             StorageError::Incompatible(_)
             | StorageError::KindMismatch { .. }
             | StorageError::MigrationRefused(_) => ErrorCode::ProtocolIncompatible,
-            StorageError::Overloaded(_) | StorageError::AttemptIdInUse(_) => ErrorCode::Overloaded,
+            StorageError::Overloaded(_)
+            | StorageError::AttemptIdInUse(_)
+            | StorageError::Capacity { .. } => ErrorCode::Overloaded,
             StorageError::Locked(_)
             | StorageError::PayloadConflict(_)
             | StorageError::Immutable(_)

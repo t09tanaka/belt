@@ -124,6 +124,11 @@ pub enum OverloadedReason {
     /// again does not help while that one is kept: the task is placed again
     /// under a new attempt id.
     AttemptIdInUse,
+    /// A `submit_attempt` found the admission window of this worker full,
+    /// counted over the attempts of every member (spec 24.4). The worker
+    /// stored nothing, no tombstone either: an attempt that was sent once
+    /// and got this answer exists nowhere.
+    Capacity,
     /// A reason this version does not know (a newer peer sent it): the
     /// caller treats the error as a plain `OVERLOADED`.
     #[serde(other)]
@@ -422,9 +427,13 @@ mod tests {
             json!({"reason": "attempt_id_in_use"})
         );
         assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), e);
+        let full = ApiError::overloaded(OverloadedReason::Capacity, "full");
+        let v = serde_json::to_value(&full).unwrap();
+        assert_eq!(v["overloaded_reason"], json!({"reason": "capacity"}));
+        assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), full);
         // A reason of a newer peer, with whatever it carries.
         for reason in [
-            json!({"reason": "capacity"}),
+            json!({"reason": "quota"}),
             json!({"reason": "later", "n": 3}),
         ] {
             let v = json!({"code": "OVERLOADED", "message": "m", "overloaded_reason": reason});
