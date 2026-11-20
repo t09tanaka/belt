@@ -792,6 +792,8 @@ pub struct AddOptions<'a> {
     /// Install the worker over SSH.
     pub install: bool,
     pub move_group: bool,
+    /// Permit group join to replace an initialized singleton at the target.
+    pub join_singleton: bool,
     /// Register an ephemeral worker (`ephemeral = true`).
     pub ephemeral: bool,
     /// The build to send instead of the parent's own binary (`--binary`).
@@ -850,7 +852,7 @@ pub fn add(
     if existing.is_none() && spec.worker_id.as_str() == name {
         return Err(ApiError::new(
             ErrorCode::Conflict,
-            "the name belongs to the local worker",
+            "member_identity_mismatch: the name belongs to the local worker; choose a distinct name with belt init --name on a new host",
         ));
     }
     let (status, binary) = if !ephemeral {
@@ -1024,6 +1026,7 @@ fn install_remote(
             caller_name: spec.worker_id.clone(),
             caller_id: caller.coordinator_id().clone(),
             move_group: options.move_group,
+            join_singleton: options.join_singleton,
             install: options.install,
         }),
         system_user,
@@ -2053,6 +2056,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                         AddOptions {
                             install: *install,
                             move_group: *move_group,
+                            join_singleton: false,
                             ephemeral: *ephemeral,
                             binary: binary.as_deref(),
                         },

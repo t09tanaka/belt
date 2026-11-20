@@ -1,4 +1,6 @@
 //! Read-only group reporting and bounded, secret-free connection diagnostics.
+pub mod join;
+
 use super::{bootstrap::Spec, resident, workers};
 use crate::{
     error::{ApiError, ErrorCode, GroupRefusal},

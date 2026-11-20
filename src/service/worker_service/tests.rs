@@ -1107,6 +1107,7 @@ fn membership_moves_an_initialized_idle_member_without_adding_a_worker() {
         caller_name: WorkerId::parse("caller").unwrap(),
         caller_id: CoordinatorId::generate(),
         move_group: false,
+        join_singleton: false,
         install: false,
     });
     let before = fs::read(&input).unwrap();
@@ -1299,6 +1300,7 @@ fn an_unfinished_init_is_not_given_a_second_worker_service() {
         caller_name: WorkerId::parse("caller").unwrap(),
         caller_id: CoordinatorId::generate(),
         move_group: false,
+        join_singleton: false,
         install: true,
     });
     assert!(h.install().is_err());
@@ -1463,3 +1465,5 @@ fn init_resident_refuses_legacy_start_stop_and_upgrade_without_a_worker_journal(
     assert!(h.launchctl_calls().is_empty());
     assert!(!paths.journal.exists());
 }
+
+mod join;

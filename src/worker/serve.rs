@@ -60,7 +60,7 @@ pub fn admit(agent: &Agent, peer: &ProvenMember) -> Result<WorkerIdentity, ApiEr
     let mismatch = |message: String| {
         Err(ApiError::group_refused(
             GroupRefusal::MemberIdentityMismatch,
-            message,
+            format!("{message}; choose a distinct member name with belt init --name when initializing a new host"),
         ))
     };
     match pin {

@@ -770,3 +770,48 @@ async fn malformed_worker_enrollment_is_refused_without_init_writes() {
     assert!(!paths.state.exists());
     assert!(!paths.worker.exists());
 }
+
+#[test]
+fn default_member_name_reduces_short_hostname_and_requires_valid_result() {
+    assert_eq!(hostname_name("Mini_A.local").unwrap().as_str(), "Mini_A");
+    assert_eq!(
+        hostname_name("my mac🦀.example").unwrap().as_str(),
+        "my-mac-"
+    );
+    for name in ["", ".local", &"a".repeat(129)] {
+        assert!(hostname_name(name)
+            .unwrap_err()
+            .to_string()
+            .contains("init --name"));
+    }
+}
+
+#[tokio::test]
+async fn init_name_cannot_rename_on_rerun() {
+    let (_t, c) = fixture();
+    let paths = Paths::resolve(&c.env).unwrap();
+    let error = initialize_named(c.clone(), Some("chosen"), &mut Unknown)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("unknown"));
+    let before = fs::read(&paths.journal).unwrap();
+    assert_eq!(
+        bootstrap::read_input(&paths.input)
+            .unwrap()
+            .worker_id
+            .as_str(),
+        "chosen"
+    );
+    let error = initialize_named(c.clone(), Some("different"), &mut Unknown)
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("cannot rename"));
+    assert_eq!(fs::read(&paths.journal).unwrap(), before);
+    for name in [None, Some("chosen")] {
+        assert!(initialize_named(c.clone(), name, &mut Unknown)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("unknown"));
+    }
+}

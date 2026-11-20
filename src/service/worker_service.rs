@@ -94,6 +94,9 @@ pub struct Membership {
     pub caller_name: WorkerId,
     pub caller_id: CoordinatorId,
     pub move_group: bool,
+    /// group join may replace an idle, initialized singleton.
+    #[serde(default)]
+    pub join_singleton: bool,
     pub install: bool,
 }
 

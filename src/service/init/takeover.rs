@@ -137,12 +137,14 @@ fn stages(dirs: &[PathBuf]) -> anyhow::Result<BTreeSet<PathBuf>> {
 pub(super) async fn initialize<L: Launcher>(
     mut context: ContextInput,
     worker: worker_service::Paths,
+    name: Option<&WorkerId>,
     launcher: &mut L,
     durability: &mut impl Durability,
 ) -> anyhow::Result<ResultReceipt> {
     let _switch = worker_service::switch_lock(&worker, true, Duration::from_secs(2))?
         .context("worker service switch is running; retry init when it finishes")?;
     let enrollment = worker_service::enrollment(&worker).context("invalid worker enrollment")?;
+    check_name(name, &enrollment.worker_id)?;
     drained(&worker, &enrollment)?;
     // Keep the installed execution environment, including its resource scope.
     context.env = enrollment.env.clone();
@@ -217,6 +219,7 @@ pub(super) async fn initialize<L: Launcher>(
             context,
             paths.clone(),
             Some(&enrollment),
+            name,
             launcher,
             durability,
         )

@@ -40,7 +40,11 @@ pub enum Command {
     #[command(hide = true)]
     Daemon(DaemonArgs),
     /// Configure the coordinator and the local worker.
-    Init,
+    Init {
+        /// Member name (defaults to the reduced short hostname).
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Run CI for the project.
     Ci(CiArgs),
     /// Run one command and wait for its result.
@@ -72,7 +76,13 @@ pub enum Command {
     /// Check the setup.
     Doctor,
     /// Show this group's identity, key generations and configured members.
-    Group,
+    Group {
+        #[command(subcommand)]
+        command: Option<GroupSub>,
+    },
+    /// Enroll a joining member using a bounded stdin request (internal).
+    #[command(hide = true)]
+    GroupJoinHelper,
     /// Manage workers.
     Workers(WorkersArgs),
     /// Run as a worker (internal).
@@ -84,6 +94,18 @@ pub enum Command {
     /// Supervise one attempt as its own process (internal).
     #[command(hide = true)]
     Supervise(SuperviseArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GroupSub {
+    /// Join through an existing member, registering both directions.
+    Join {
+        existing_member_ssh: String,
+        #[arg(long)]
+        ssh: Option<String>,
+        #[arg(long = "move")]
+        move_group: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -382,8 +404,8 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::ToolchainInstall { request, binding } = &cli.command {
         return crate::toolchain::preparation::helper_main(request, binding);
     }
-    if matches!(cli.command, Command::Init) {
-        return match crate::service::init::command() {
+    if let Command::Init { name } = &cli.command {
+        return match crate::service::init::command(name.as_deref()) {
             Ok(receipt) => {
                 if cli.json {
                     println!(
@@ -428,8 +450,23 @@ pub fn run(cli: Cli) -> i32 {
     if matches!(cli.command, Command::Doctor) {
         return crate::service::doctor::command(cli.json);
     }
-    if matches!(cli.command, Command::Group) {
-        return crate::service::group::command(cli.json);
+    if let Command::Group { command } = &cli.command {
+        return match command {
+            None => crate::service::group::command(cli.json),
+            Some(GroupSub::Join {
+                existing_member_ssh,
+                ssh,
+                move_group,
+            }) => crate::service::group::join::command(
+                existing_member_ssh,
+                ssh.as_deref(),
+                *move_group,
+                cli.json,
+            ),
+        };
+    }
+    if matches!(cli.command, Command::GroupJoinHelper) {
+        return crate::service::group::join::helper_command();
     }
     if let Command::Estimate(args) = &cli.command {
         return crate::service::estimate::cli(args, cli.json);

@@ -1678,6 +1678,10 @@ Runtime tests invoke only private owned TempDir state; no production user-state 
 - 相手が別のグループに属するときは、何も変えずに断る。黙って移すことはしない。`--move` を明示し、かつ相手がliveなattemptも非terminalのrunも持たないときだけ、自分のグループへ移す（グループのIDと鍵を置き換える。相手の `coordinator_id` と過去のrunの記録は残る）。1つのメンバーが2つのグループに属することは無い。
 - 相手が仕事を配る側にもなるには、相手の側でも `init` と `workers add` を行う（一覧はメンバーごと）。
 
+参加する側Bからは `belt group join <既存メンバーAのSSH接続先> [--ssh <他のメンバーからBへの接続先>] [--move]` を実行できる。Bは `init` 済みであること（未導入・workerのみなら先に `belt init` を求めて断る）。名前は `init` が記録したものを使い、joinに `--name` は置かない。`--ssh` の既定値は `<現在のOS user>@<hostname>`。まずBがSSHでAの固定helperへBの名前・接続先・move指定をstdinの小さなJSONとして渡す。Aは既存の `workers add`（`--install` 無し）でBを追加し、BのグループID・鍵と双方のpinを更新する。AからBへ `--ssh` で到達できなければ、その必要を示して断る。次にBはhelperが返したAの名前と最初のSSH接続先を使い、同じグループへの `workers add` でAを自分の一覧に追加する。Bの旧グループが自分だけ（他の名前の一覧行もpinも無い）で仕事が無ければ `--move` 無しで置き換える。それ以外の移動には既存の `--move` の規則を使い、liveな仕事・未回収の結果があれば移さない。同じグループへの再実行はpinを取り替える既存の追加処理と同じである。第1段だけ成功したときは「BはAのグループに入ったが、BでのAの登録が完了していない」と報告し、巻き戻さない。再実行で第2段まで完了できる。
+
+`belt init [--name <メンバー名>]` の名前の既定値は短いhostname（最初の `.` より前）を `[A-Za-z0-9._-]` 以外の文字を `-` に置き換えたものとする。1〜128文字、先頭の `.` と `..` を禁止する名前の形式に合わなければ、`init --name` の指定を求めて断る。workerのみのホストの引継ぎでも初期化済みホストでの再実行でも、`--name` は省略または既存の名前と同じ値だけを許し、renameは行わない。同名のホストが出会ったときは既存のpinによる `member_identity_mismatch` で断り、新しいホストの初期化時に `init --name` で別名を選ぶよう案内する。
+
 **削除と鍵の更新**。メンバーを外すには、残るメンバーの一覧からそのメンバーを消し、鍵を更新する。beltの中の信頼を取り消すのは鍵の更新であり、一覧から消すだけでは、外したメンバーからの仕事を断れない。メンバーごとの登録・取消の操作は置かない。
 
 鍵の更新は、SSHのアクセスを取り消さない。外したマシンのSSH鍵が残るメンバーの `authorized_keys` に残っていれば、そのマシンはbeltを通さずに、同じOS userとしてcommandを実行できる。beltは `authorized_keys` を編集しない。`group rotate-key --remove` は、残る各メンバーのbelt用accountから外したマシンのSSH鍵を消す手順を表示する。`group` と `doctor` は、外したメンバーへSSHでまだ到達できる間、警告を出し続ける（到達できなくなったら消える）。一覧の行を消した後も、警告が消えるまで、名前と削除時刻を小さな「削除済みメンバー」の記録に残す。
@@ -1685,6 +1689,7 @@ Runtime tests invoke only private owned TempDir state; no production user-state 
 鍵の「世代」は、番号と鍵の指紋（鍵から導く短いdigest。鍵そのものは復元できない）の組で表す。どの鍵を持っているかは指紋で比べ、番号だけで判断しない。
 
 ```sh
+belt group join me@main.local --ssh me@sub.local # 参加する側から双方の一覧へ追加
 belt group rotate-key --remove old-mini   # 一覧から消し、残る全員へ新しい鍵を配って切り替える
 belt group send-key mini-b                # 取り残されたメンバーへ、今の鍵を送り直す
 belt group                                # グループのID、鍵の世代、メンバーごとの状態

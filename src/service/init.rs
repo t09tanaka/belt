@@ -564,18 +564,38 @@ async fn initialize_with_durability<L: Launcher>(
     launcher: &mut L,
     durability: &mut impl Durability,
 ) -> anyhow::Result<ResultReceipt> {
+    initialize_named_with_durability(context, None, launcher, durability).await
+}
+
+/// Initialize with an explicit member name; existing members cannot be renamed.
+pub async fn initialize_named<L: Launcher>(
+    context: ContextInput,
+    name: Option<&str>,
+    launcher: &mut L,
+) -> anyhow::Result<ResultReceipt> {
+    initialize_named_with_durability(context, name, launcher, &mut NativeDurability).await
+}
+
+async fn initialize_named_with_durability<L: Launcher>(
+    context: ContextInput,
+    name: Option<&str>,
+    launcher: &mut L,
+    durability: &mut impl Durability,
+) -> anyhow::Result<ResultReceipt> {
+    let name = name.map(WorkerId::parse).transpose()?;
     let paths = Paths::resolve_for(&context.env, launcher.backend())?;
     let worker = super::worker_service::Paths::resolve_for(&context.env, launcher.backend())?;
     if worker.journal.try_exists()? {
-        return takeover::initialize(context, worker, launcher, durability).await;
+        return takeover::initialize(context, worker, name.as_ref(), launcher, durability).await;
     }
-    initialize_prepared(context, paths, None, launcher, durability).await
+    initialize_prepared(context, paths, None, name.as_ref(), launcher, durability).await
 }
 
 async fn initialize_prepared<L: Launcher>(
     context: ContextInput,
     mut paths: Paths,
     enrollment: Option<&super::worker_service::Enrollment>,
+    name: Option<&WorkerId>,
     launcher: &mut L,
     durability: &mut impl Durability,
 ) -> anyhow::Result<ResultReceipt> {
@@ -635,6 +655,7 @@ async fn initialize_prepared<L: Launcher>(
             .read_to_end(&mut bytes)?;
         ensure!(bytes.len() as u64 <= LIMIT, "init journal too large");
         let j: Journal = serde_json::from_slice(&bytes)?;
+        check_name(name, &j.spec.worker_id)?;
         validate_journal(&j, &paths, uid, &digest)?;
         jf.proof = Some(Proof::read(&paths.journal)?);
         j
@@ -662,7 +683,10 @@ async fn initialize_prepared<L: Launcher>(
                 worker_state_dir: paths.worker.clone(),
                 worker_id: match enrollment {
                     Some(e) => e.worker_id.clone(),
-                    None => WorkerId::parse(&format!("local-{}", ulid::Ulid::new()))?,
+                    None => match name {
+                        Some(name) => name.clone(),
+                        None => hostname_name(&crate::platform::hostname()?)?,
+                    },
                 },
                 cluster_key_path: paths.key.clone(),
                 executable: paths.config.join("bin").join(&digest).join("belt"),
@@ -986,11 +1010,22 @@ pub(crate) fn handover<L: Launcher>(
     journal = checked;
     let old = journal.cluster.as_ref().context("group missing")?;
     let moving = old != &request.cluster;
+    let worker = WorkerStore::open_read_only(&paths.worker)?;
+    let is_singleton = || -> anyhow::Result<bool> {
+        Ok(super::workers::registrations(env)
+            .map_err(|e| anyhow::anyhow!(e.message))?
+            .iter()
+            .all(|entry| entry.id == spec.worker_id.as_str())
+            && worker
+                .members()?
+                .iter()
+                .all(|(name, _)| name == spec.worker_id.as_str()))
+    };
+    let singleton = member.join_singleton && is_singleton()?;
     ensure!(
-        !moving || member.move_group,
+        !moving || member.move_group || singleton,
         "target belongs to group {old}; use --move to move an idle member"
     );
-    let worker = WorkerStore::open_read_only(&paths.worker)?;
     let coordinator = CoordinatorStore::open_read_only(&paths.state)?;
     ensure!(
         !moving || (worker.count_group_work()? == 0 && !coordinator.has_group_work()?),
@@ -1045,7 +1080,10 @@ pub(crate) fn handover<L: Launcher>(
     } else {
         None
     };
-    if moving && (worker.count_group_work()? != 0 || coordinator.has_group_work()?) {
+    let no_longer_singleton = moving && !member.move_group && !is_singleton()?;
+    if moving
+        && (worker.count_group_work()? != 0 || coordinator.has_group_work()? || no_longer_singleton)
+    {
         control::write(&paths.worker, previous)?;
         drop(_agent);
         drop(_owner);
@@ -1055,6 +1093,9 @@ pub(crate) fn handover<L: Launcher>(
                     .start_arguments(receipt.path())
                     .map_err(anyhow::Error::msg)?,
             )?;
+        }
+        if no_longer_singleton {
+            anyhow::bail!("another member appeared before stopping; group unchanged; use --move");
         }
         anyhow::bail!("live work appeared before stopping; group unchanged");
     }
@@ -1188,7 +1229,7 @@ pub(crate) async fn managed_health<L: Launcher>(
 /// `init`. The coordinator and its local worker run as one service of the
 /// host's service manager: a LaunchAgent on macOS, a systemd user unit on
 /// Linux (`HostLauncher::native`).
-pub fn command() -> Result<ResultReceipt, ApiError> {
+pub fn command(name: Option<&str>) -> Result<ResultReceipt, ApiError> {
     let context = ContextInput {
         env: std::env::vars_os()
             .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
@@ -1201,8 +1242,9 @@ pub fn command() -> Result<ResultReceipt, ApiError> {
         .build()
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     runtime
-        .block_on(initialize(
+        .block_on(initialize_named(
             context,
+            name,
             &mut super::worker_service::HostLauncher::native(),
         ))
         .map_err(|e| {
@@ -1222,3 +1264,27 @@ pub fn command() -> Result<ResultReceipt, ApiError> {
 mod tests;
 
 mod takeover;
+
+fn check_name(requested: Option<&WorkerId>, enrolled: &WorkerId) -> anyhow::Result<()> {
+    ensure!(
+        requested.is_none_or(|name| name == enrolled),
+        "member is already named {enrolled}; init --name cannot rename a member"
+    );
+    Ok(())
+}
+
+fn hostname_name(hostname: &str) -> anyhow::Result<WorkerId> {
+    let short = hostname.split('.').next().unwrap_or("");
+    let reduced: String = short
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    WorkerId::parse(&reduced)
+        .context("hostname is not a valid member name; run belt init --name <member-name>")
+}
