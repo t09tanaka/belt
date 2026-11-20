@@ -352,7 +352,8 @@ fn action_failure(e: CoordinatorError) -> Result<Failure> {
             StorageError::Io(_)
             | StorageError::SourceBusy
             | StorageError::Overloaded(_)
-            | StorageError::AttemptIdInUse(_),
+            | StorageError::AttemptIdInUse(_)
+            | StorageError::Capacity { .. },
         ) => Ok(Failure::Retry(e.to_string())),
         CoordinatorError::Invalid(reason)
         | CoordinatorError::Storage(StorageError::Invalid(reason)) => Ok(Failure::Answer(reason)),

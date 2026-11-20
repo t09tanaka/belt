@@ -200,6 +200,22 @@ fn free_by_retire(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
         ));
     }
     confirm_tombstone(conn, aid, at_ms)?;
+    free_attempt(conn, aid, at_ms)?;
+    let run = run_of(conn, aid)?;
+    common::append_event(
+        conn,
+        run.as_deref(),
+        Some(aid),
+        "retire_confirmed",
+        &Value::Null,
+        at_ms,
+    )?;
+    Ok(())
+}
+
+/// Retire an attempt that did not end: its task is free for a new one, and
+/// it puts no demand on its worker any more.
+fn free_attempt(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
     let n = conn.execute(
         "UPDATE attempt SET retired = 1, retired_at_ms = COALESCE(retired_at_ms, ?2)
          WHERE attempt_id = ?1 AND state <> 'terminal'",
@@ -219,15 +235,6 @@ fn free_by_retire(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
         "UPDATE placement SET acked_at_ms = COALESCE(acked_at_ms, ?2)
          WHERE attempt_id = ?1",
         params![aid, to_i64(at_ms)?],
-    )?;
-    let run = run_of(conn, aid)?;
-    common::append_event(
-        conn,
-        run.as_deref(),
-        Some(aid),
-        "retire_confirmed",
-        &Value::Null,
-        at_ms,
     )?;
     Ok(())
 }

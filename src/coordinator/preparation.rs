@@ -284,6 +284,7 @@ mod tests {
                     }
                 });
                 Ok(Response::Inspect(InspectResponse {
+                    admission: None,
                     preparation_observations: page,
                     capabilities: None,
                     schema_version: SchemaVersion::CURRENT,

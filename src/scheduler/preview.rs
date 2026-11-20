@@ -112,8 +112,9 @@ fn compared(worker: &Compared, evidence: Option<&WorkerCostEvidence>) -> String 
         None => String::new(),
     };
     let mut text = format!(
-        "{}: {head}{unusable}; priority {} (+{} ms); load {}; queue {}; execution {}; conditional={}\n",
+        "{}: {head}{}{unusable}; priority {} (+{} ms); load {}; queue {}; execution {}; conditional={}\n",
         worker.worker_id,
+        crate::scheduler::decide::foreign_demand_note(worker.outlook.foreign_demand),
         worker.priority,
         worker.penalty_ms,
         worker.load,
@@ -212,6 +213,7 @@ mod tests {
             conditional: finish.is_none(),
             null_reason: None,
             unusable: None,
+            foreign_demand: 0,
         }
     }
 
@@ -352,6 +354,49 @@ mod tests {
             human(true, None, &[], &[]),
             "estimate: online (conditional)\n"
         );
+    }
+
+    #[test]
+    fn a_compared_worker_shows_how_much_of_its_forecast_is_other_members_work() {
+        let shared = Outlook {
+            foreign_demand: 2,
+            ..outlook(Some(4000), None, RuntimeSource::Measured)
+        };
+        let decision = decide(
+            vec![
+                candidate("w-a", 0, Costs::default(), shared),
+                candidate(
+                    "w-b",
+                    0,
+                    Costs::default(),
+                    outlook(Some(9000), None, RuntimeSource::Measured),
+                ),
+            ],
+            vec![Excluded {
+                worker_id: id("w-c"),
+                why: Exclusion::Capacity,
+                unmet: vec![],
+            }],
+            rules(),
+        );
+        let text = human(true, Some(&decision), &[], &[]);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines[1],
+            "w-a: earliest predicted completion; compared: [w-a=4000ms measured (includes 2 attempts of other members), w-b=9000ms measured]; excluded: [w-c capacity]"
+        );
+        assert!(
+            lines[3].starts_with(
+                "w-a: predicted completion in 4000 ms (measured) (includes 2 attempts of other members); priority 0"
+            ),
+            "{text}"
+        );
+        let other = lines
+            .iter()
+            .find(|l| l.starts_with("w-b: predicted"))
+            .unwrap();
+        assert!(!other.contains("other members"), "{text}");
+        assert!(text.contains("w-c: excluded: capacity\n"), "{text}");
     }
 
     #[test]

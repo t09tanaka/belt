@@ -291,6 +291,25 @@ pub fn fits(found: usize, cap: u32) -> bool {
     found <= cap as usize
 }
 
+/// The admission window of a worker: how many attempts, of every member
+/// together, it holds that are not terminal (spec chapters 9 and 24.4).
+pub fn window(max_active_task: u32, prefetch_per_worker: u32) -> u64 {
+    u64::from(max_active_task) + u64::from(prefetch_per_worker)
+}
+
+/// The window as `inspect` answers it: `used` attempts of every member are
+/// not terminal, `own` of them the asking member's. The rest is the other
+/// members', as a number and nothing else.
+pub fn admission(limit: u64, used: usize, own: usize) -> crate::wire::AdmissionWindow {
+    let count = |n: usize| u64::try_from(n).unwrap_or(u64::MAX);
+    crate::wire::AdmissionWindow {
+        limit,
+        used: count(used),
+        own: count(own),
+        foreign: count(used.saturating_sub(own)),
+    }
+}
+
 /// Whether a new attempt is refused because `live` attempts are not terminal.
 pub fn at_live_cap(live: u64, cap: u32) -> bool {
     live >= u64::from(cap)
@@ -1129,6 +1148,16 @@ mod tests {
     fn caps_are_inclusive_where_they_say_so() {
         assert!(fits(0, 5) && fits(5, 5));
         assert!(!fits(6, 5));
+        let w = admission(3, 3, 1);
+        assert_eq!((w.limit, w.used, w.own, w.foreign), (3, 3, 1, 2));
+        assert!(w.shared() && !w.has_room());
+        let w = admission(3, 2, 2);
+        assert_eq!((w.used, w.own, w.foreign), (2, 2, 0));
+        assert!(!w.shared() && w.has_room());
+        assert_eq!(admission(1, 0, 4).foreign, 0);
+        assert_eq!(window(2, 1), 3);
+        assert_eq!(window(0, 0), 0);
+        assert_eq!(window(u32::MAX, u32::MAX), 2 * u64::from(u32::MAX));
         assert!(!at_live_cap(31, 32));
         assert!(at_live_cap(32, 32) && at_live_cap(33, 32));
         assert!(!gives_up(4, 5));

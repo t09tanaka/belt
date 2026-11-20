@@ -608,8 +608,9 @@ impl CoordinatorStore {
                 super::bind_permit(tx, permit.as_str(), &aid, &run)?;
             }
             tx.execute(
-                "INSERT INTO placement (task_id, worker_id, attempt_id, demand_json, created_at_ms)
-                 VALUES (?1,?2,?3,?4,?5)",
+                "INSERT INTO placement (task_id, worker_id, attempt_id, demand_json, created_at_ms,
+                    submit_sends)
+                 VALUES (?1,?2,?3,?4,?5,0)",
                 params![task, worker, aid, demand.to_string(), to_i64(at_ms)?],
             )?;
             common::append_event(
@@ -819,6 +820,88 @@ impl CoordinatorStore {
                 )?;
             }
             load_attempt(tx, &aid)?.ok_or_else(|| not_found(format!("attempt {aid}")))
+        })
+    }
+
+    /// The submit of an attempt is about to be handed to its link: count it,
+    /// durably, before anything is sent. Returns how often it was sent
+    /// before this one; `None` when that is not known (a placement made
+    /// before the count was kept, or none at all), and such a count stays
+    /// unknown.
+    ///
+    /// A send that was never answered is counted too, so "zero before, and
+    /// this one was answered" is the only case in which exactly one copy of
+    /// the submit ever left and none is still on its way.
+    pub fn count_submit_send(&self, attempt_id: &AttemptId) -> Result<Option<u64>> {
+        let aid = attempt_id.to_string();
+        self.db.write(move |tx| {
+            let before: Option<i64> = tx
+                .query_row(
+                    "SELECT submit_sends FROM placement WHERE attempt_id = ?1
+                     ORDER BY placement_id LIMIT 1",
+                    [&aid],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            tx.execute(
+                "UPDATE placement SET submit_sends = submit_sends + 1 WHERE attempt_id = ?1",
+                [&aid],
+            )?;
+            before.map(to_u64).transpose()
+        })
+    }
+
+    /// Close an attempt its worker stored nothing of, without a retire
+    /// (spec 11 and 24.4): the one copy of its submit that ever left was
+    /// answered "nothing stored", so nothing of it exists anywhere. One
+    /// commit writes the tombstone, confirmed as it is written, with
+    /// `reason` (kept in this database only), retires the attempt, which
+    /// frees its task for the next generation, and appends the event `note`
+    /// (kind, payload) on the attempt.
+    ///
+    /// Returns `false`, having written nothing, when the attempt is not one
+    /// to close this way as it is recorded now: it is terminal or retired, a
+    /// retire or a cancel was asked for meanwhile, or its task is in-place
+    /// (never placed again by itself). The caller then takes the retire
+    /// path, which settles each of those by its own rule.
+    pub fn close_unstored(
+        &self,
+        attempt_id: &AttemptId,
+        reason: &str,
+        note: (&str, &Value),
+        at_ms: u64,
+    ) -> Result<bool> {
+        let (aid, reason) = (attempt_id.to_string(), reason.to_string());
+        let (kind, payload) = (note.0.to_string(), note.1.clone());
+        self.db.write(move |tx| {
+            let closable: Option<(String, bool)> = tx
+                .query_row(
+                    "SELECT a.worker_id,
+                        a.state <> 'terminal' AND a.retired = 0
+                        AND a.cancel_requested_at_ms IS NULL
+                        AND t.cancel_requested_at_ms IS NULL
+                        AND coalesce(json_extract(t.spec_json,'$.in_place'),0) = 0
+                        AND NOT EXISTS
+                            (SELECT 1 FROM retire_tombstone rt WHERE rt.attempt_id = a.attempt_id)
+                     FROM attempt a JOIN task t USING (task_id) WHERE a.attempt_id = ?1",
+                    [&aid],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            let Some((worker, true)) = closable else {
+                return Ok(false);
+            };
+            tx.execute(
+                "INSERT INTO retire_tombstone
+                    (attempt_id, worker_id, reason, requested_at_ms, confirmed_at_ms)
+                 VALUES (?1,?2,?3,?4,?4)",
+                params![aid, worker, reason, to_i64(at_ms)?],
+            )?;
+            super::free_attempt(tx, &aid, at_ms)?;
+            let run = run_of(tx, &aid)?;
+            common::append_event(tx, run.as_deref(), Some(&aid), &kind, &payload, at_ms)?;
+            Ok(true)
         })
     }
 

@@ -151,6 +151,13 @@ pub fn decide_submit(
     }
 }
 
+/// Whether the admission window of a worker has no room for one more
+/// attempt: `live` attempts of every member are not terminal, and the window
+/// (the worker's own active limit plus its prefetch) holds `window`.
+pub fn window_full(live: u64, window: u64) -> bool {
+    live >= window
+}
+
 // ---------------------------------------------------------------- launch
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -350,6 +357,13 @@ mod tests {
 
     fn plan(f: Found, a: Access) -> Result<SchemaPlan, Incompat> {
         plan_schema(f, a, T)
+    }
+
+    #[test]
+    fn the_window_is_full_from_its_size_on() {
+        assert!(!window_full(0, 1) && !window_full(2, 3));
+        assert!(window_full(3, 3) && window_full(4, 3));
+        assert!(window_full(0, 0));
     }
 
     #[test]

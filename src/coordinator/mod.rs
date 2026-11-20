@@ -58,7 +58,7 @@ use crate::wire::{
     SubmitAttemptRequest, WorkloadPlan,
 };
 use link::Budgeted;
-use policy::{Answer, Ended, Facts, Limits, Refusal, RetireVerdict, Step};
+use policy::{Answer, Ended, Facts, Limits, Refusal, RetireVerdict, Step, Unstored};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
@@ -76,17 +76,31 @@ use tokio::time::Instant;
 /// placed again, once the retire is confirmed.
 pub const REASON_SUBMIT_REFUSED: &str = "submit_refused";
 
-/// The reason recorded for a retire the coordinator starts because the
-/// worker answered that the attempt id is held there by an attempt of
-/// another member (spec 24.4). Once the retire is confirmed the task is free
-/// again and is placed under a new attempt id; no worker is left out for it
-/// and the task does not fail.
+/// The reason recorded for an attempt its worker refused because the
+/// attempt id is held there by an attempt of another member (spec 24.4).
+/// The attempt is closed without a retire when the answered send was the
+/// only one, and retired on the worker first otherwise. The task is then
+/// free again and is placed under a new attempt id; no worker is left out
+/// for it and the task does not fail.
 pub const REASON_ATTEMPT_ID_IN_USE: &str = "attempt_id_in_use";
 
 /// The event on an attempt whose id its worker could not take. Payload:
-/// `{"worker", "code", "reason"}`; written with the tombstone, in one
-/// transaction.
+/// `{"worker", "code", "reason", "retire"}` (`retire`: whether a retire was
+/// asked for); written with the tombstone, in one transaction.
 pub const EVENT_SUBMIT_REFUSED_ATTEMPT_ID: &str = "submit_refused_attempt_id";
+
+/// The reason recorded for an attempt its worker refused because its
+/// admission window was full with the attempts of every member (spec 24.4).
+/// Kept in this database only. The attempt is closed without a retire when
+/// the answered send was the only one, and retired on the worker first
+/// otherwise; either way the task does not fail and goes on as its next
+/// generation, and the worker is left out only until it answers room.
+pub const REASON_CAPACITY_REFUSED: &str = "capacity_refused";
+
+/// The event on an attempt its worker refused for capacity. Payload:
+/// `{"worker", "code", "reason", "retire"}` (`retire`: whether a retire was
+/// asked for); written with the tombstone, in one transaction.
+pub const EVENT_SUBMIT_REFUSED_CAPACITY: &str = "submit_refused_capacity";
 
 /// The most queued tasks one tick looks at.
 pub const DISPATCH_SCAN: u32 = 256;
@@ -286,7 +300,9 @@ pub struct TickReport {
     pub placed: Vec<AttemptId>,
     /// Attempts left `unknown` because their worker gave no answer.
     pub unknown: Vec<AttemptId>,
-    /// Attempts whose retire was confirmed: their tasks are queued again.
+    /// Attempts whose retire was confirmed, or that were closed without one
+    /// because their worker stored nothing of them: their tasks are queued
+    /// again.
     pub retired: Vec<AttemptId>,
     /// Attempts that became terminal on the parent.
     pub settled: Vec<AttemptId>,
@@ -309,6 +325,9 @@ struct Reached {
     attachment: Arc<dyn WorkerLink>,
     limits: Limits,
     draining: bool,
+    /// Its admission window as it answered it: one budget over the attempts
+    /// of every member.
+    admission: Option<crate::wire::AdmissionWindow>,
     /// Who answered: a forecast from another boot or agent is not used.
     boot_id: WorkerBootId,
     agent_epoch: AgentEpoch,
@@ -363,8 +382,19 @@ enum Sent {
     Taken,
     /// The worker did not take it (now).
     NotTaken,
+    /// The worker did not take it because its admission window is full.
+    WindowFull,
     /// It was not sent: a cancel or a retire for it was recorded first.
     Withheld,
+}
+
+/// A submit the worker stored nothing of was not taken; a full window also
+/// says that nothing else goes there for now.
+fn not_taken(why: Unstored) -> Sent {
+    match why {
+        Unstored::Capacity => Sent::WindowFull,
+        Unstored::AttemptIdInUse => Sent::NotTaken,
+    }
 }
 
 type Followed = Result<(Option<Reached>, TickReport)>;
@@ -939,6 +969,7 @@ impl Coordinator {
                 prefetch_per_worker: inspected.prefetch_per_worker,
             }),
             draining: inspected.draining,
+            admission: inspected.admission,
             boot_id: inspected.worker_boot_id,
             agent_epoch: inspected.agent_epoch,
         };
@@ -1125,7 +1156,7 @@ impl Coordinator {
         link: &dyn WorkerLink,
         live: &LiveAttempt,
         report: &mut TickReport,
-    ) -> Result<bool> {
+    ) -> Result<Sent> {
         let a = &live.record;
         let payload: Option<AttemptPayload> = live
             .placement
@@ -1140,12 +1171,18 @@ impl Coordinator {
             self.note(&a.attempt_id, "submit_payload_mismatch", Value::Null)
                 .await?;
             self.unknown(&a.attempt_id, report).await?;
-            return Ok(false);
+            return Ok(Sent::NotTaken);
         };
         // An in-place task is never placed again by itself (it works on the
-        // user's own directory), so for it an attempt id in use is waited
-        // out like any other `OVERLOADED`: the same attempt is sent again.
+        // user's own directory), so for it an attempt id in use or a full
+        // window is waited out like any other `OVERLOADED`: the same attempt
+        // is sent again.
         let replaceable = !request.payload.in_place;
+        // Counted before the send, durably: a copy that leaves and is never
+        // answered, or whose answer this process does not live to see, is a
+        // send all the same.
+        let id = a.attempt_id.clone();
+        let sends_before = self.db(move |s| s.count_submit_send(&id)).await?;
         match link.call(Request::SubmitAttempt(request)).await {
             Ok(Response::SubmitAttempt(r))
                 if r.attempt_id == a.attempt_id && r.generation == a.generation =>
@@ -1160,43 +1197,47 @@ impl Coordinator {
                 let id = a.attempt_id.clone();
                 self.db(move |s| s.record_seen(&id, true, seen, Observation::Known, wall_ms()))
                     .await?;
-                Ok(true)
+                Ok(Sent::Taken)
             }
             Err(LinkError::Remote(e)) => {
                 let mismatch = e.conflict_reason == Some(ConflictReason::PayloadMismatch);
-                let in_use =
-                    replaceable && e.overloaded_reason == Some(OverloadedReason::AttemptIdInUse);
-                match policy::submit_refusal(e.code, mismatch, in_use) {
+                let unstored = match e.overloaded_reason {
+                    Some(OverloadedReason::Capacity) if replaceable => Some(Unstored::Capacity),
+                    Some(OverloadedReason::AttemptIdInUse) if replaceable => {
+                        Some(Unstored::AttemptIdInUse)
+                    }
+                    _ => None,
+                };
+                let once = policy::sent_once(sends_before);
+                match policy::submit_refusal(e.code, mismatch, unstored, once) {
                     Refusal::Fenced => Err(self.fence()),
-                    Refusal::Replace => {
-                        // The worker stored nothing of this attempt. A copy
-                        // of the submit that is still on its way could be
-                        // taken later, once the other member's attempt is
-                        // gone, so the attempt is retired there first (the
-                        // tombstone is this member's own and refuses that
-                        // copy); the task is free once the worker confirmed
-                        // and is then placed under a new attempt id.
-                        let refused = json!({
-                            "worker": a.worker_id.to_string(),
-                            "code": e.code.to_string(),
-                            "reason": REASON_ATTEMPT_ID_IN_USE,
-                        });
-                        let id = a.attempt_id.clone();
-                        self.db(move |s| {
-                            s.begin_retire_noting(
-                                &id,
-                                REASON_ATTEMPT_ID_IN_USE,
-                                Some((EVENT_SUBMIT_REFUSED_ATTEMPT_ID, &refused)),
-                                wall_ms(),
-                            )
-                        })
-                        .await?;
+                    Refusal::Close(why) => {
+                        // The worker stored nothing of this attempt and the
+                        // one copy of its submit that ever left was answered:
+                        // none exists anywhere. No retire is sent; the task
+                        // is free with this commit.
+                        if self.move_on(a, &e, why, false).await? {
+                            report.retired.push(a.attempt_id.clone());
+                        } else {
+                            self.observe(&a.attempt_id, Observation::Known).await?;
+                        }
+                        Ok(not_taken(why))
+                    }
+                    Refusal::Replace(why) => {
+                        // The worker stored nothing of this attempt, but a
+                        // copy of the submit may still be on its way and
+                        // could be taken later, once there is room or the
+                        // other member's attempt is gone. So the attempt is
+                        // retired there first (the tombstone is this
+                        // member's own and refuses that copy); the task is
+                        // free once the worker confirmed.
+                        self.move_on(a, &e, why, true).await?;
                         self.observe(&a.attempt_id, Observation::Known).await?;
-                        Ok(false)
+                        Ok(not_taken(why))
                     }
                     Refusal::Tombstoned => {
                         self.observe(&a.attempt_id, Observation::Known).await?;
-                        Ok(false)
+                        Ok(Sent::NotTaken)
                     }
                     Refusal::Later => {
                         let before = self
@@ -1226,7 +1267,7 @@ impl Coordinator {
                             .await?;
                         }
                         self.observe(&a.attempt_id, Observation::Known).await?;
-                        Ok(false)
+                        Ok(Sent::NotTaken)
                     }
                     Refusal::Never => {
                         self.note_refusal(&a.attempt_id, "submit_refused", &e)
@@ -1234,16 +1275,59 @@ impl Coordinator {
                         self.request_retire(&a.attempt_id, REASON_SUBMIT_REFUSED)
                             .await?;
                         self.observe(&a.attempt_id, Observation::Known).await?;
-                        Ok(false)
+                        Ok(Sent::NotTaken)
                     }
                 }
             }
             // Sent or not, accepted or not: nothing is known.
             _ => {
                 self.unknown(&a.attempt_id, report).await?;
-                Ok(false)
+                Ok(Sent::NotTaken)
             }
         }
+    }
+
+    /// The worker stored nothing of an attempt and will not take it as it
+    /// is: let its task go on as the next generation. With `retire` the
+    /// attempt is retired on the worker first (the task is free once that is
+    /// confirmed); without, it is closed here and now. Why is written with
+    /// the tombstone, in one transaction. Returns whether the attempt was
+    /// closed by this call.
+    ///
+    /// An attempt that cannot be closed as it is recorded now (a cancel or
+    /// a retire was asked for meanwhile) takes the retire path instead.
+    async fn move_on(
+        &self,
+        a: &AttemptRecord,
+        e: &ApiError,
+        why: Unstored,
+        retire: bool,
+    ) -> Result<bool> {
+        let (reason, kind, word) = match why {
+            Unstored::Capacity => (
+                REASON_CAPACITY_REFUSED,
+                EVENT_SUBMIT_REFUSED_CAPACITY,
+                "capacity",
+            ),
+            Unstored::AttemptIdInUse => (
+                REASON_ATTEMPT_ID_IN_USE,
+                EVENT_SUBMIT_REFUSED_ATTEMPT_ID,
+                REASON_ATTEMPT_ID_IN_USE,
+            ),
+        };
+        let id = a.attempt_id.clone();
+        let (worker, code) = (a.worker_id.to_string(), e.code.to_string());
+        self.db(move |s| {
+            let note = |retire: bool| {
+                json!({"worker": worker, "code": code, "reason": word, "retire": retire})
+            };
+            if !retire && s.close_unstored(&id, reason, (kind, &note(false)), wall_ms())? {
+                return Ok(true);
+            }
+            s.begin_retire_noting(&id, reason, Some((kind, &note(true))), wall_ms())?;
+            Ok(false)
+        })
+        .await
     }
 
     async fn cancel(
@@ -1683,6 +1767,17 @@ impl Coordinator {
             for worker_id in &full {
                 round.close(worker_id, Exclusion::Full);
             }
+            // A worker whose window is full with the work of every member
+            // takes nothing either, however little of it is this parent's.
+            let closed: Vec<WorkerId> = round
+                .open
+                .iter()
+                .filter(|w| policy::window_closed(w.admission.as_ref(), loads[&w.worker_id]))
+                .map(|w| w.worker_id.clone())
+                .collect();
+            for worker_id in &closed {
+                round.close(worker_id, Exclusion::Capacity);
+            }
             let mut excluded: Vec<Excluded> = round
                 .out
                 .iter()
@@ -2003,11 +2098,15 @@ impl Coordinator {
                         let sent = self
                             .send_placed(&winner, &*link, &attempt_id, report)
                             .await?;
-                        if sent == Sent::NotTaken {
+                        match sent {
                             // A worker that did not take this one gets no
                             // more in this tick: what is placed there cannot
                             // move until it answers.
-                            round.close(&winner, Exclusion::NotTaking);
+                            Sent::NotTaken => round.close(&winner, Exclusion::NotTaking),
+                            // Nor does one whose window is full, until its
+                            // `inspect` answers room: every tick asks.
+                            Sent::WindowFull => round.close(&winner, Exclusion::Capacity),
+                            Sent::Taken | Sent::Withheld => {}
                         }
                     }
                     return Ok(());
@@ -2051,14 +2150,9 @@ impl Coordinator {
             return Ok(());
         }
         let run = task.run_id.clone();
-        let capability_mismatch = !decision.excluded.is_empty()
-            && decision
-                .excluded
-                .iter()
-                .all(|e| e.why == Exclusion::CapabilityMismatch);
         let payload = json!({
             "task": task.task_id.to_string(),
-            "blocked_reason": capability_mismatch.then_some("no_compatible_worker"),
+            "blocked_reason": decide::blocked_reason(decision),
             "decision": serde_json::to_value(decision)
                 .map_err(|e| CoordinatorError::Invalid(e.to_string()))?,
         });
@@ -2097,11 +2191,7 @@ impl Coordinator {
         if !policy::may_send(facts) {
             return Ok(Sent::Withheld);
         }
-        if self.submit(link, &placed, report).await? {
-            Ok(Sent::Taken)
-        } else {
-            Ok(Sent::NotTaken)
-        }
+        self.submit(link, &placed, report).await
     }
 
     /// A queued task no payload can be made for stays queued and is passed

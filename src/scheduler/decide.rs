@@ -118,6 +118,47 @@ pub struct Outlook {
     /// Why the worker gave no finish time.
     pub null_reason: Option<Uncertainty>,
     pub unusable: Option<Unusable>,
+    /// How many attempts of other members the worker counted as demand in
+    /// its answer (spec 24.5). Not written when there is none.
+    #[serde(default, skip_serializing_if = "no_foreign_demand")]
+    pub foreign_demand: u32,
+}
+
+fn no_foreign_demand(n: &u32) -> bool {
+    *n == 0
+}
+
+/// How the demand of other members in a worker's forecast is shown, in a
+/// placement reason and in an estimate; nothing when there is none.
+pub fn foreign_demand_note(n: u32) -> String {
+    match n {
+        0 => String::new(),
+        1 => " (includes 1 attempt of other members)".to_string(),
+        n => format!(" (includes {n} attempts of other members)"),
+    }
+}
+
+/// The reason a task that no worker could be chosen for waits, where one
+/// reason says it all (`blocked_reason` of the event `task_waiting`): no
+/// worker is able to run it, or a worker that could is full with the work
+/// of every member (spec 24.4).
+pub fn blocked_reason(decision: &Decision) -> Option<&'static str> {
+    let all = |why: Exclusion| {
+        !decision.excluded.is_empty() && decision.excluded.iter().all(|e| e.why == why)
+    };
+    if decision.winner.is_some() {
+        None
+    } else if all(Exclusion::CapabilityMismatch) {
+        Some("no_compatible_worker")
+    } else if decision
+        .excluded
+        .iter()
+        .any(|e| e.why == Exclusion::Capacity)
+    {
+        Some("capacity")
+    } else {
+        None
+    }
 }
 
 impl Outlook {
@@ -133,6 +174,7 @@ impl Outlook {
             conditional: false,
             null_reason: None,
             unusable: Some(why),
+            foreign_demand: 0,
         }
     }
 }
@@ -180,6 +222,7 @@ pub fn outlook_of(
         conditional: t.conditional,
         null_reason: t.null_reasons.get(&ForecastField::FinishInMs).copied(),
         unusable: None,
+        foreign_demand: answer.foreign_demand,
     }
 }
 
@@ -213,6 +256,10 @@ pub enum Exclusion {
     /// It did not take the input of the run (why is in `unmet`): the frozen
     /// plan of a CI run it has no room for. Over when the input arrives.
     InputRefused,
+    /// Its admission window is full with the attempts of every member (it
+    /// said so in `inspect`, or refused a submit for it in this tick). Over
+    /// when its `inspect` answers room again.
+    Capacity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -321,10 +368,13 @@ impl Decision {
         let compared: Vec<String> = self
             .compared
             .iter()
-            .map(|c| match (c.compare_ms, c.label) {
-                (Some(ms), Label::Measured) => format!("{}={}ms measured", c.worker_id, ms),
-                (Some(rank), _) => format!("{}=rank {} fallback", c.worker_id, rank),
-                (None, _) => format!("{}=unknown (not counted as free)", c.worker_id),
+            .map(|c| {
+                let number = match (c.compare_ms, c.label) {
+                    (Some(ms), Label::Measured) => format!("{}={}ms measured", c.worker_id, ms),
+                    (Some(rank), _) => format!("{}=rank {} fallback", c.worker_id, rank),
+                    (None, _) => format!("{}=unknown (not counted as free)", c.worker_id),
+                };
+                format!("{number}{}", foreign_demand_note(c.outlook.foreign_demand))
             })
             .collect();
         let excluded: Vec<String> = self
@@ -495,7 +545,8 @@ impl Exclusion {
             Exclusion::RefusedTask
             | Exclusion::Draining
             | Exclusion::CapabilityMismatch
-            | Exclusion::InputRefused => true,
+            | Exclusion::InputRefused
+            | Exclusion::Capacity => true,
             Exclusion::Unreached
             | Exclusion::Full
             | Exclusion::NoForecast
@@ -543,6 +594,7 @@ mod tests {
             conditional: false,
             null_reason: None,
             unusable: None,
+            foreign_demand: 0,
         }
     }
 
@@ -1004,6 +1056,7 @@ mod tests {
             null_reasons.insert(ForecastField::FinishInMs, Uncertainty::Overrun);
         }
         ForecastResponse {
+            foreign_demand: 0,
             schema_version: SchemaVersion::CURRENT,
             worker_id: w("w-a"),
             worker_boot_id: WorkerBootId::parse("b1").unwrap(),
@@ -1055,6 +1108,7 @@ mod tests {
                 conditional: true,
                 null_reason: None,
                 unusable: None,
+                foreign_demand: 0,
             }
         );
         // The ranking and the reason for the missing time are carried.
@@ -1211,6 +1265,124 @@ mod tests {
         ] {
             assert_eq!(e.lasts(), lasting.contains(&e));
         }
+    }
+
+    #[test]
+    fn the_demand_of_other_members_is_shown_as_a_count_and_kept_out_when_none() {
+        assert_eq!(foreign_demand_note(0), "");
+        assert_eq!(
+            foreign_demand_note(1),
+            " (includes 1 attempt of other members)"
+        );
+        assert_eq!(
+            foreign_demand_note(2),
+            " (includes 2 attempts of other members)"
+        );
+        // From the worker's answer into the outlook, and from there into
+        // the recorded decision and its one line.
+        let mut said = answer(Some(7000), None);
+        said.foreign_demand = 3;
+        let asked = Asked {
+            worker_id: &w("w-a"),
+            plan_digest: &said.target.plan_digest.clone(),
+            boot_id: &said.worker_boot_id.clone(),
+            agent_epoch: said.agent_epoch,
+        };
+        let outlook = outlook_of(&asked, &said, 0, 2000);
+        assert_eq!(outlook.unusable, None);
+        assert_eq!(outlook.foreign_demand, 3);
+        said.foreign_demand = 0;
+        assert_eq!(outlook_of(&asked, &said, 0, 2000).foreign_demand, 0);
+        assert_eq!(Outlook::unusable(Unusable::Refused).foreign_demand, 0);
+        let d = run(vec![
+            cand(
+                "w-a",
+                Outlook {
+                    foreign_demand: 3,
+                    ..measured(80_000)
+                },
+            ),
+            cand("w-b", measured(90_000)),
+        ]);
+        assert_eq!(
+            d.summary(),
+            "w-a: earliest predicted completion; compared: [w-a=80000ms measured \
+             (includes 3 attempts of other members), w-b=90000ms measured]; excluded: []"
+        );
+        // Written only when there is some, and read back either way.
+        let v = serde_json::to_value(&d).unwrap();
+        assert_eq!(v["compared"][0]["outlook"]["foreign_demand"], 3);
+        assert!(v["compared"][1]["outlook"].get("foreign_demand").is_none());
+        assert_eq!(serde_json::from_value::<Decision>(v).unwrap(), d);
+    }
+
+    #[test]
+    fn a_wait_has_one_reason_when_no_worker_fits_or_one_that_fits_is_full() {
+        fn waits(excluded: &[(&str, Exclusion)]) -> Decision {
+            let excluded = excluded
+                .iter()
+                .map(|(w, why)| Excluded {
+                    unmet: Vec::new(),
+                    worker_id: WorkerId::parse(w).unwrap(),
+                    why: *why,
+                })
+                .collect();
+            decide(Vec::new(), excluded, RULES_1S)
+        }
+        use Exclusion::*;
+        assert_eq!(blocked_reason(&waits(&[])), None);
+        assert_eq!(
+            blocked_reason(&waits(&[("w-a", CapabilityMismatch)])),
+            Some("no_compatible_worker")
+        );
+        assert_eq!(
+            blocked_reason(&waits(&[
+                ("w-a", CapabilityMismatch),
+                ("w-b", CapabilityMismatch)
+            ])),
+            Some("no_compatible_worker")
+        );
+        assert_eq!(
+            blocked_reason(&waits(&[("w-a", Capacity)])),
+            Some("capacity")
+        );
+        // One that could take it is full: that is why it waits, whatever
+        // keeps the others out.
+        for other in [CapabilityMismatch, Full, Unreached, Draining, RefusedTask] {
+            assert_eq!(
+                blocked_reason(&waits(&[("w-a", other), ("w-b", Capacity)])),
+                Some("capacity"),
+                "{other:?}"
+            );
+        }
+        for other in [
+            Full,
+            Unreached,
+            Draining,
+            RefusedTask,
+            NoForecast,
+            NotTaking,
+        ] {
+            assert_eq!(blocked_reason(&waits(&[("w-a", other)])), None);
+            assert_eq!(
+                blocked_reason(&waits(&[("w-a", CapabilityMismatch), ("w-b", other)])),
+                None
+            );
+        }
+        // A task that was placed does not wait.
+        let placed = Decision {
+            excluded: waits(&[("w-b", Capacity)]).excluded,
+            ..run(vec![cand("w-a", measured(1000))])
+        };
+        assert!(placed.winner.is_some());
+        assert_eq!(blocked_reason(&placed), None);
+        // A full window spans ticks: it is news when it comes and goes.
+        assert!(Capacity.lasts());
+        assert!(!same_wait(
+            &waits(&[("w-a", Capacity)]),
+            &waits(&[("w-a", Full)])
+        ));
+        assert_eq!(word(&Capacity), "capacity");
     }
 
     #[test]

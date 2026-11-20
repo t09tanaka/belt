@@ -364,6 +364,11 @@ fn api(e: StorageError) -> ApiError {
     if matches!(e, StorageError::AttemptIdInUse(_)) {
         return ApiError::overloaded(OverloadedReason::AttemptIdInUse, e.to_string());
     }
+    // Nothing was stored, no tombstone either: the window of this worker is
+    // full with the attempts of every member.
+    if matches!(e, StorageError::Capacity { .. }) {
+        return ApiError::overloaded(OverloadedReason::Capacity, e.to_string());
+    }
     // A busy database committed nothing: the same request may be sent again.
     let code = if e.is_retryable() {
         ErrorCode::Overloaded
@@ -2238,7 +2243,7 @@ impl Agent {
             Request::IdentityRetired(r) => self
                 .identity_retired(store, r)
                 .map(Response::IdentityRetired),
-            Request::Inspect(r) => self.inspect(r).map(Response::Inspect),
+            Request::Inspect(r) => self.inspect(store, r).map(Response::Inspect),
             Request::SubmitAttempt(r) => self.submit(store, r).map(Response::SubmitAttempt),
             Request::GetAttempt(r) => {
                 let rec = self.known(store, &r.attempt_id)?;
@@ -2472,7 +2477,7 @@ impl Agent {
             );
         }
         let outcome = store
-            .submit(
+            .submit_within(
                 NewAcceptance {
                     attempt_id: r.attempt_id.clone(),
                     run_id: r.payload.run_id.clone(),
@@ -2482,6 +2487,10 @@ impl Agent {
                     coordinator_epoch: r.coordinator_epoch,
                     spec,
                 },
+                Some(policy::window(
+                    self.cfg.max_active_task,
+                    self.cfg.prefetch_per_worker,
+                )),
                 now(),
             )
             .map_err(api)?;
@@ -2931,12 +2940,21 @@ impl Agent {
     }
 
     /// Read-only: nothing is written, whatever the request.
+    ///
+    /// Every member's accepted attempts are demand. The answer names the
+    /// asking member's only; of the others it carries a count (spec 24.5).
     fn forecast(
         &self,
         store: &WorkerStore,
         r: ForecastRequest,
     ) -> Result<ForecastResponse, ApiError> {
         let attempts = store.list_nonterminal().map_err(api)?;
+        let asking = store.member();
+        let foreign: std::collections::BTreeSet<AttemptId> = attempts
+            .iter()
+            .filter(|a| Some(&a.coordinator_id) != asking.as_ref())
+            .map(|a| a.attempt_id.clone())
+            .collect();
         let max_epoch = store.max_coordinator_epoch().map_err(api)?;
         let ident = crate::forecast::plan::Ident {
             worker_id: self.cfg.worker_id.clone(),
@@ -2957,6 +2975,7 @@ impl Agent {
             max_epoch,
             &r,
         )
+        .map(|answer| crate::forecast::plan::for_member(answer, &foreign))
     }
 
     /// How many of an accepted attempt's tools are not installed yet (read
@@ -3065,9 +3084,25 @@ impl Agent {
         }
         Ok(())
     }
-    fn inspect(&self, request: InspectRequest) -> Result<InspectResponse, ApiError> {
+    /// `store` is the asking member's: the window is counted over every
+    /// member, and split into its attempts and the others' (counts only).
+    fn inspect(
+        &self,
+        store: &WorkerStore,
+        request: InspectRequest,
+    ) -> Result<InspectResponse, ApiError> {
         let live = self.store.list_nonterminal().map_err(api)?;
         let (active, pending) = policy::load_counts(live.iter().map(|r| r.state));
+        let asking = store.member();
+        let own = live
+            .iter()
+            .filter(|r| Some(&r.coordinator_id) == asking.as_ref())
+            .count();
+        let admission = policy::admission(
+            policy::window(self.cfg.max_active_task, self.cfg.prefetch_per_worker),
+            live.len(),
+            own,
+        );
         let policy_bytes = self
             .cfg
             .traffic_config
@@ -3097,6 +3132,7 @@ impl Agent {
             prefetch_per_worker: self.cfg.prefetch_per_worker,
             disk_free_bytes: disk,
             draining: super::control::Control::effective(&self.cfg.state_dir).drain,
+            admission: Some(admission),
         })
     }
 }

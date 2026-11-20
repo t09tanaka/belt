@@ -485,6 +485,17 @@ fn wait_reason_of(kind: &str) -> Option<WaitReason> {
     }
 }
 
+/// The answer as one member may see it (spec 24.5). The demand of every
+/// member's attempts is in the numbers already; `foreign` are the attempts
+/// of the other members. Their coverage is taken out, so that no attempt
+/// id, plan or node of another member leaves the worker, and how many of
+/// them there are is all the answer says.
+pub fn for_member(mut answer: ForecastResponse, foreign: &BTreeSet<AttemptId>) -> ForecastResponse {
+    answer.coverage.retain(|c| !foreign.contains(&c.attempt_id));
+    answer.foreign_demand = u32::try_from(foreign.len()).unwrap_or(u32::MAX);
+    answer
+}
+
 /// The worker answering.
 #[derive(Debug, Clone)]
 pub struct Ident {
@@ -581,6 +592,7 @@ pub fn to_wire(fc: &ttc::Forecast, w: &Wiring) -> Result<ForecastResponse, Conve
     let policy: PolicyDigest = Digest::parse(&fc.policy_digest)?;
     let snapshot: SnapshotDigest = snapshot_digest(ledger.as_str(), policy.as_str(), w.overlay);
     Ok(ForecastResponse {
+        foreign_demand: 0,
         schema_version: SchemaVersion::CURRENT,
         worker_id: w.ident.worker_id.clone(),
         worker_boot_id: w.ident.boot_id.clone(),
@@ -1387,8 +1399,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_member_sees_its_own_coverage_and_a_count_of_the_others() {
+        let (mine, theirs, other) = (
+            AttemptId::generate(),
+            AttemptId::generate(),
+            AttemptId::generate(),
+        );
+        let cover = |a: &AttemptId| Coverage {
+            attempt_id: a.clone(),
+            plan_digest: Digest::of_bytes(b"plan"),
+            expansion_seq: 0,
+            node_ids: vec![NodeId::parse("n").unwrap()],
+        };
+        let full = ForecastResponse {
+            coverage: vec![cover(&theirs), cover(&mine), cover(&other)],
+            ..answer(1, "b", 2000)
+        };
+        // Nobody else: the answer is as it was.
+        assert_eq!(for_member(full.clone(), &BTreeSet::new()), full);
+        let foreign: BTreeSet<AttemptId> = [theirs.clone(), other.clone()].into();
+        let seen = for_member(full.clone(), &foreign);
+        assert_eq!(seen.coverage, vec![cover(&mine)]);
+        assert_eq!(seen.foreign_demand, 2);
+        // Nothing but the count says the others are there, and the numbers
+        // the demand went into are untouched.
+        let text = serde_json::to_string(&seen).unwrap();
+        assert!(!text.contains(theirs.as_str()) && !text.contains(other.as_str()));
+        assert!(text.contains(mine.as_str()));
+        assert_eq!(seen.target, full.target);
+        assert_eq!(seen.snapshot_digest, full.snapshot_digest);
+        // An attempt that is counted but not covered is counted still.
+        let one: BTreeSet<AttemptId> = [AttemptId::generate()].into();
+        let seen = for_member(full.clone(), &one);
+        assert_eq!((seen.coverage.len(), seen.foreign_demand), (3, 1));
+    }
+
     fn answer(epoch: u64, boot: &str, ttl: u64) -> ForecastResponse {
         ForecastResponse {
+            foreign_demand: 0,
             schema_version: SchemaVersion::CURRENT,
             worker_id: WorkerId::parse("w").unwrap(),
             worker_boot_id: WorkerBootId::parse(boot).unwrap(),

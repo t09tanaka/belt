@@ -15,7 +15,7 @@
 use crate::error::ErrorCode;
 use crate::state::{AttemptState, Outcome};
 use crate::storage::WorkerLoad;
-use crate::wire::RetireStatus;
+use crate::wire::{AdmissionWindow, RetireStatus};
 
 /// How many tasks a worker may hold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,11 +139,50 @@ pub enum Refusal {
     /// The worker will never take this attempt: retire it there, then fail
     /// it here.
     Never,
-    /// The worker cannot take the attempt under this attempt id (an attempt
-    /// of another member holds it there) and stored nothing. The task is not
-    /// at fault: the attempt is taken off the worker and the task is placed
-    /// again, under a new attempt id.
-    Replace,
+    /// The worker stored nothing of the attempt and the answered send was
+    /// the only one: no copy of it exists anywhere. The attempt is closed
+    /// here without a retire and the task is placed again, as its next
+    /// generation.
+    Close(Unstored),
+    /// The worker stored nothing of the attempt, but a copy of its submit
+    /// may still be on its way (it was sent before, a send was never
+    /// answered, or how often it was sent is not known). The attempt is
+    /// retired on the worker first; the task is placed again once the
+    /// worker confirmed that nothing started.
+    Replace(Unstored),
+}
+
+/// Why a worker stored nothing of a submit it answered with `OVERLOADED`,
+/// where the task goes on as its next generation instead of waiting for the
+/// same attempt to be taken (spec 11 and 24.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unstored {
+    /// The worker's admission window is full, with the attempts of every
+    /// member.
+    Capacity,
+    /// An attempt of another member holds the attempt id there.
+    AttemptIdInUse,
+}
+
+/// How often the submit of an attempt was sent before the one that was just
+/// answered, as recorded before each send (`None`: not known).
+///
+/// Exactly one copy ever left only when none was sent before. With one or
+/// more before (answered or not: an unanswered send is counted too), or an
+/// unknown count, a late copy may still arrive.
+pub fn sent_once(sends_before: Option<u64>) -> bool {
+    sends_before == Some(0)
+}
+
+/// Whether nothing new is placed on a worker because its admission window
+/// is full with the work of every member: the attempts of the other members
+/// its `inspect` counted in this tick, plus what this parent holds there by
+/// its own record now (`load`; the worker's count of this parent's attempts
+/// is as old as the `inspect`, and a retire confirmed since has freed a
+/// place). A worker that did not say (`None`) is not held back by this.
+pub fn window_closed(admission: Option<&AdmissionWindow>, load: WorkerLoad) -> bool {
+    let held = u64::from(load.active) + u64::from(load.pending);
+    admission.is_some_and(|window| window.foreign.saturating_add(held) >= window.limit)
 }
 
 /// Read the error a worker answered a submit with.
@@ -153,16 +192,23 @@ pub enum Refusal {
 /// (`payload_mismatch` says so by its typed reason). Every other code, a
 /// fault of the worker, a conflict with something else it holds, a code
 /// this version does not know, is no verdict on the attempt and never fails
-/// the task. `OVERLOADED` with the reason `attempt_id_in_use`
-/// (`attempt_id_in_use` says so by its typed reason) is about the attempt id
-/// only: the task goes on under another one.
-pub fn submit_refusal(code: ErrorCode, payload_mismatch: bool, attempt_id_in_use: bool) -> Refusal {
-    match code {
-        ErrorCode::Retired => Refusal::Tombstoned,
-        ErrorCode::StaleEpoch => Refusal::Fenced,
-        ErrorCode::InvalidInput => Refusal::Never,
-        ErrorCode::Conflict if payload_mismatch => Refusal::Never,
-        ErrorCode::Overloaded if attempt_id_in_use => Refusal::Replace,
+/// the task. `OVERLOADED` with a reason that says the worker stored nothing
+/// and will not take this attempt as it is (`unstored`, from its typed
+/// reason) moves the task on to its next generation: at once when this send
+/// was the only one (`sent_once`), after a retire otherwise.
+pub fn submit_refusal(
+    code: ErrorCode,
+    payload_mismatch: bool,
+    unstored: Option<Unstored>,
+    sent_once: bool,
+) -> Refusal {
+    match (code, unstored) {
+        (ErrorCode::Retired, _) => Refusal::Tombstoned,
+        (ErrorCode::StaleEpoch, _) => Refusal::Fenced,
+        (ErrorCode::InvalidInput, _) => Refusal::Never,
+        (ErrorCode::Conflict, _) if payload_mismatch => Refusal::Never,
+        (ErrorCode::Overloaded, Some(why)) if sent_once => Refusal::Close(why),
+        (ErrorCode::Overloaded, Some(why)) => Refusal::Replace(why),
         _ => Refusal::Later,
     }
 }
@@ -671,21 +717,31 @@ mod tests {
 
     #[test]
     fn only_an_answer_about_the_attempt_itself_refuses_a_submit_for_good() {
+        let whys = [
+            None,
+            Some(Unstored::Capacity),
+            Some(Unstored::AttemptIdInUse),
+        ];
         for code in ErrorCode::ALL {
-            for (mismatch, in_use) in [(false, false), (true, false), (false, true), (true, true)] {
-                let want = match (code, mismatch, in_use) {
-                    (ErrorCode::Retired, _, _) => Refusal::Tombstoned,
-                    (ErrorCode::StaleEpoch, _, _) => Refusal::Fenced,
-                    (ErrorCode::InvalidInput, _, _) => Refusal::Never,
-                    (ErrorCode::Conflict, true, _) => Refusal::Never,
-                    (ErrorCode::Overloaded, _, true) => Refusal::Replace,
-                    _ => Refusal::Later,
-                };
-                assert_eq!(
-                    submit_refusal(code, mismatch, in_use),
-                    want,
-                    "{code:?} {mismatch} {in_use}"
-                );
+            for mismatch in [false, true] {
+                for why in whys {
+                    for once in [false, true] {
+                        let want = match (code, mismatch, why, once) {
+                            (ErrorCode::Retired, _, _, _) => Refusal::Tombstoned,
+                            (ErrorCode::StaleEpoch, _, _, _) => Refusal::Fenced,
+                            (ErrorCode::InvalidInput, _, _, _) => Refusal::Never,
+                            (ErrorCode::Conflict, true, _, _) => Refusal::Never,
+                            (ErrorCode::Overloaded, _, Some(why), true) => Refusal::Close(why),
+                            (ErrorCode::Overloaded, _, Some(why), false) => Refusal::Replace(why),
+                            _ => Refusal::Later,
+                        };
+                        assert_eq!(
+                            submit_refusal(code, mismatch, why, once),
+                            want,
+                            "{code:?} {mismatch} {why:?} {once}"
+                        );
+                    }
+                }
             }
         }
         // A fault of the worker, or a conflict with something else it holds
@@ -701,34 +757,82 @@ mod tests {
             ErrorCode::Overloaded,
             ErrorCode::Conflict,
         ] {
-            assert_eq!(
-                submit_refusal(code, false, false),
-                Refusal::Later,
-                "{code:?}"
-            );
+            for once in [false, true] {
+                assert_eq!(
+                    submit_refusal(code, false, None, once),
+                    Refusal::Later,
+                    "{code:?}"
+                );
+            }
         }
         assert_eq!(
-            submit_refusal(ErrorCode::Conflict, true, false),
+            submit_refusal(ErrorCode::Conflict, true, None, false),
             Refusal::Never
         );
         assert_eq!(
-            submit_refusal(ErrorCode::Internal, true, false),
+            submit_refusal(ErrorCode::Internal, true, None, false),
             Refusal::Later
         );
         // The reason belongs to `OVERLOADED`: under another code it says
         // nothing, and a plain `OVERLOADED` is sent again as before.
-        assert_eq!(
-            submit_refusal(ErrorCode::Overloaded, false, true),
-            Refusal::Replace
-        );
-        assert_eq!(
-            submit_refusal(ErrorCode::Overloaded, false, false),
-            Refusal::Later
-        );
-        assert_eq!(
-            submit_refusal(ErrorCode::Conflict, false, true),
-            Refusal::Later
-        );
+        for why in [Unstored::Capacity, Unstored::AttemptIdInUse] {
+            assert_eq!(
+                submit_refusal(ErrorCode::Overloaded, false, Some(why), true),
+                Refusal::Close(why)
+            );
+            assert_eq!(
+                submit_refusal(ErrorCode::Overloaded, false, Some(why), false),
+                Refusal::Replace(why)
+            );
+            assert_eq!(
+                submit_refusal(ErrorCode::Conflict, false, Some(why), true),
+                Refusal::Later
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_first_send_that_was_answered_is_the_only_copy() {
+        assert!(sent_once(Some(0)));
+        // Sent before, answered or not; or not known (after a restart of a
+        // database that did not count).
+        assert!(!sent_once(Some(1)) && !sent_once(Some(2)) && !sent_once(Some(u64::MAX)));
+        assert!(!sent_once(None));
+    }
+
+    #[test]
+    fn a_window_is_closed_only_when_the_worker_said_it_is_full() {
+        let window = |limit, own, foreign| AdmissionWindow {
+            limit,
+            used: own + foreign,
+            own,
+            foreign,
+        };
+        let load = |active, pending| WorkerLoad { active, pending };
+        assert!(!window_closed(None, load(9, 9)));
+        // The others' attempts and this parent's own fill it together.
+        assert!(!window_closed(Some(&window(3, 0, 0)), load(0, 0)));
+        assert!(!window_closed(Some(&window(3, 0, 2)), load(0, 0)));
+        assert!(window_closed(Some(&window(3, 0, 3)), load(0, 0)));
+        assert!(window_closed(Some(&window(3, 0, 4)), load(0, 0)));
+        assert!(!window_closed(Some(&window(3, 1, 1)), load(1, 0)));
+        assert!(window_closed(Some(&window(3, 1, 1)), load(1, 1)));
+        assert!(window_closed(Some(&window(3, 1, 1)), load(0, 2)));
+        assert!(window_closed(Some(&window(3, 0, 1)), load(2, 0)));
+        assert!(window_closed(Some(&window(0, 0, 0)), load(0, 0)));
+        // This parent's part is its own record now, not the worker's count
+        // from the `inspect`: an attempt whose retire was confirmed since
+        // has given its place back, and one placed since has taken one.
+        assert!(!window_closed(Some(&window(1, 1, 0)), load(0, 0)));
+        assert!(window_closed(Some(&window(2, 0, 1)), load(0, 1)));
+        assert!(!window_closed(
+            Some(&window(u64::MAX, 0, u64::MAX - 1)),
+            load(0, 0)
+        ));
+        assert!(window_closed(
+            Some(&window(u64::MAX, 0, u64::MAX)),
+            load(1, 1)
+        ));
     }
 
     #[test]

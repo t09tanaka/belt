@@ -1759,7 +1759,7 @@ DB の migration（既存は coordinator DB が step 1〜19、worker DB が step
 |---|---|---|---|
 | worker | 4 | WP24b | `worker_attempt`・`tombstone`・`lease`・`command_launch`・`log_spool`・`blob_ref` を作り直し、鍵を `(coordinator_id, attempt_id)` にする。task ごとの live な attempt の一意 index（今の `worker_attempt_one_live` は `task_id` だけ）を `(coordinator_id, task_id)` にする。今は主キーが `attempt_id` だけなので、作り直さないと、あるメンバーが別のメンバーの仕事を `RETIRED`・`CONFLICT` にできてしまう。trigger `tombstone_no_delete` を、届かなかった attempt の tombstone だけは消せる形に置き換える（仕様 §24.4）。`worker_state.max_coordinator_epoch`（全体で 1 つ）を `coordinator_id` ごとの表にする。グループ鍵の世代（番号と指紋、今・次）、メンバーの名前と `coordinator_id` の組、worker identity の後半（`send-key` で作り直す）、退役を告げられた identity、更新のための保留を持つ表。この step は drain 済みで、live な attempt も、終了したが result が回収されていない attempt（`state = 'terminal'` で `acked_at_ms` が空）も無いときだけ進む（未回収の result を捨てると、投げた側の task が unknown のまま残るため）。migration は SQL 文字列の一覧なので、この前提は SQL の実行前に code で検査する。どちらかがある DB で新しい binary の resident を起動したときは、両方の件数と対処手順（前の版で drain し、終了と回収を待つ）を示して起動を断る（A58）。古い attempt・tombstone・lease・epoch の行は引き継がずに捨てる（最初の公開版より前の DB なので、所有者を推測しない）。捨てた attempt の ID は同じ transaction で表 `dropped_attempt` に残し、agent が次の起動で、attempts の directory 直下にあるその名前の directory（spec・supervisor の状態・workspace の記録）だけを消してから行を消す（symlink はたどらず、同じ ID を再び持つメンバーがいれば触れない。消せなかった分は次の起動でやり直す）。workspace 自体は既存の起動時の掃除（行の無い workspace）が消す |
 | coordinator | 20 | WP24b | 新しい表を 2 つ足す: 退役した worker identity へ通知を送った記録と、「削除済みメンバー」の小さな記録（名前と削除時刻。SSH 到達の警告が消えるまで残す。仕様 §24.2）。既存の `worker_identity_tombstone` は trigger（`worker_identity_tombstone_fixed`）が UPDATE を拒むので、列を足しても書けない。そのため別の表にする |
-| coordinator | 21 | WP24c | 容量で断られた attempt を探す部分 index（`placement_unacked` と同じ形）。retire せずに閉じる理由 `capacity_refused` と event `submit_refused_capacity` は、既存の理由（`worker_cannot_run`）と同じく文字列で持ち、schema の制約は無いので、それ自体は step を要らない。index が不要と分かれば、この step は足さない |
+| coordinator | 21 | WP24c | `placement` に submit の送信回数の列 `submit_sends` を足す（送る直前に 1 つ進めてから送る。NULL は、この step より前に作った配置で「分からない」を表す）。「1 回だけ送り、その 1 回に答えが返った」を、親の再起動をまたいで判定するために要る（仕様 §24.4）。retire せずに閉じる理由 `capacity_refused` と event `submit_refused_capacity` は、既存の理由（`worker_cannot_run`）と同じく文字列で持ち、schema の制約は無い。容量で断られた attempt を探す index は足していない（一時的な除外は `inspect` の答えから tick ごとに決め、DB からは探さない） |
 
 - WP24d・WP24e・R68・R96 は、今の見込みでは DB の step を足さない。drain の状態は worker 全体のもので、メンバーごとには持たない。必要と分かった行は、この表に step を足してから実装する。
 - step の番号は main へ入る順に確定する。上の番号は WP24b → WP24c の順で入る前提で、順が変わったら表を直す。古い binary は知らない step を持つ DB を拒否する（既存の互換表の規則）。R68 の rollback が親 DB と worker DB を一緒に戻すのは、このためである。
@@ -1770,7 +1770,18 @@ hello の feature と wire の追加（3 つとも最初の公開版から必須
 |---|---|---|
 | `group_membership_v1` | WP24b | 相互の操作 `group_proof`（要求: メンバーの名前・鍵の指紋・自分の nonce・`cluster_id`／`coordinator_id`／名前／相手の nonce に対する HMAC。答え: 相手の HMAC と、worker identity・boot・epoch・profile・能力）。hello の答えに nonce を足し、identity などを `group_proof` の答えへ移す。断る答えの理由（`group_mismatch`・`group_key_mismatch`・`member_identity_mismatch`・`identity_retired`） |
 | `identity_retired_v1` | WP24b | 操作 `identity_retired`（要求: `coordinator_id`・`worker_id`・`worker_boot_id`。`worker_id` が自分の名前のときだけ受ける。同じ内容の再送に同じ答え） |
-| `shared_admission_v1` | WP24c | `submit_attempt` の `OVERLOADED` に付ける `overloaded_reason.reason = "capacity"`、`inspect` の受付窓（上限・使用数・聞いたメンバーの分・他のメンバーの分・自分で投げた非 terminal の run の有無）、forecast の `foreign_demand`（件数） |
+| `shared_admission_v1` | WP24c | `submit_attempt` の `OVERLOADED` に付ける `overloaded_reason.reason = "capacity"`、`inspect` の受付窓 `admission`（上限 `limit`・使用数 `used`・聞いたメンバーの分 `own`・他のメンバーの分 `foreign`。共有の有無は `foreign > 0`）、forecast の `foreign_demand`（他のメンバーの非 terminal の attempt の件数）。「自分で投げた非 terminal の run の有無」は、それを読む `workers stop`（`--all-submitters`）と一緒に WP24d で `inspect` へ足す（項目の追加なので wire の互換は変わらない） |
+
+WP24c の実装メモ（2026-11-21）:
+
+- worker の受付窓の判定は `WorkerStore::submit_within` の中、attempt を insert するのと同じ transaction で行う。古い epoch・tombstone・受理済み attempt の再送・`attempt_id_in_use`・task に live な attempt があることの判定の後に窓を見るので、それらの答えは窓が埋まっていても変わらない。断るときは `StorageError::Capacity`（`leaves_nothing`）で、epoch も tombstone の消去も巻き戻る。
+- 送信回数は `placement.submit_sends` に、`submit_attempt` を link へ渡す直前に書く（`count_submit_send`）。答えの無い送信も数に入るので、「送る前の数が 0 で、その送信に `capacity`（または `attempt_id_in_use`）が返った」ときだけ retire なしで閉じる（`policy::sent_once`・`Refusal::Close`）。1 以上、または NULL（分からない）のときは retire を通す（`Refusal::Replace`）。
+- retire なしで閉じる処理（`close_unstored`）は、1 つの transaction で、確認済みの tombstone（理由 `capacity_refused` か `attempt_id_in_use`）・attempt の retired・placement の ACK・event を書く。その時点で cancel か retire が記録されていた attempt と in-place の task は閉じずに retire の経路へ回す。retire を送らないので event `retire_requested`・`retire_confirmed` は書かない。
+- `attempt_id_in_use` にも同じ規則を当てた（仕様 第11章）。WP24b は送信回数を持たなかったので常に retire していた。
+- in-place の task は自動で配置し直さないので、`capacity` も `attempt_id_in_use` と同じく理由なしの `OVERLOADED` として扱い、同じ attempt を後で送り直す。
+- 一時的な除外は process にも DB にも状態を持たない。tick ごとの `inspect` の `admission` が満杯なら、その tick はその worker へ配置しない（除外の理由 `capacity`）。tick の途中で `capacity` が返った worker は、その tick の残りを同じ理由で外す。次の tick は `inspect` の答えで決め直すので、「空きを答えるまで外す」「再起動後は `inspect` から決め直す」の両方がこれで満たされる。親自身の件数で満杯（`full`）のときは `full` を先に付ける。
+- `task_waiting` の `blocked_reason` は、容量で外した worker が 1 台でもあれば `capacity`（全 worker が能力不一致なら従来どおり `no_compatible_worker`）。除外 `capacity` は tick をまたいで続く除外として扱い、変わったときに `task_waiting` を書き直す。
+- forecast の `foreign_demand` は、他のメンバーの非 terminal の attempt の件数（node の数ではない）。coverage からは他のメンバーの attempt を除く。配置理由（`Decision` の `compared[].outlook.foreign_demand` と要約の文）と `estimate` の表示に件数を出す。
 
 鍵の配布・切替・送り直しは SSH 越しの固定 helper で行い、worker protocol の操作にはしない（WP24d）。仕様 §22.3 が定めているのは secret bundle の HMAC であり、hello の認証は §24.2 が新しく定める。鍵そのものは同じ file を使う。
 

@@ -263,6 +263,9 @@ impl Coordinator {
                         if !policy::has_room(load, limits) {
                             return Err(Some(out(worker_id, Exclusion::Full, unmet)));
                         }
+                        if policy::window_closed(inspect.admission.as_ref(), load) {
+                            return Err(Some(out(worker_id, Exclusion::Capacity, unmet)));
+                        }
                         let measured_cold =
                             !ready && !spec.in_place && link.cold_eligible(&input.task_id) && {
                                 let query = scheduler::measured::CostQuery::task(
@@ -294,6 +297,8 @@ impl Coordinator {
                     }
                     let why = if !policy::has_room(load, limits) {
                         Some(Exclusion::Full)
+                    } else if policy::window_closed(inspect.admission.as_ref(), load) {
+                        Some(Exclusion::Capacity)
                     } else if !unmet.is_empty() {
                         Some(Exclusion::CapabilityMismatch)
                     } else if refused.contains(&worker_id) {

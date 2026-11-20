@@ -40,11 +40,16 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     crate::wire::WORKFLOW_ARTIFACTS_FEATURE,
     group::MEMBERSHIP_FEATURE,
     group::IDENTITY_RETIRED_FEATURE,
+    group::SHARED_ADMISSION_FEATURE,
 ];
 
 /// The features no connection of this build goes without, on either side
 /// (spec 24.10): there is no branch for a peer that lacks them.
-pub const GROUP_FEATURES: &[&str] = &[group::MEMBERSHIP_FEATURE, group::IDENTITY_RETIRED_FEATURE];
+pub const GROUP_FEATURES: &[&str] = &[
+    group::MEMBERSHIP_FEATURE,
+    group::IDENTITY_RETIRED_FEATURE,
+    group::SHARED_ADMISSION_FEATURE,
+];
 
 /// What one side offers and requires.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -665,6 +670,8 @@ mod tests {
         // The group features are offered and required by both sides.
         assert_eq!(group::MEMBERSHIP_FEATURE, "group_membership_v1");
         assert_eq!(group::IDENTITY_RETIRED_FEATURE, "identity_retired_v1");
+        assert_eq!(group::SHARED_ADMISSION_FEATURE, "shared_admission_v1");
+        assert_eq!(GROUP_FEATURES.len(), 3);
         for feature in GROUP_FEATURES {
             assert!(SUPPORTED_FEATURES.contains(feature));
             assert!(crate::protocol::session::required_features()

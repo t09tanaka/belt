@@ -550,6 +550,7 @@ fn an_unbound_permit_of_a_step_12_file_gives_its_slot_back_when_migrated() {
                  DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended;
                  DROP INDEX matrix_permit_held;
                  DROP TABLE identity_retired_notice; DROP TABLE removed_member;
+                 ALTER TABLE placement DROP COLUMN submit_sends;
                  UPDATE schema_meta SET value='12' WHERE key='schema_version';",
             )?;
             Ok(())
@@ -2825,6 +2826,176 @@ fn placing_commits_the_attempt_and_its_unacked_demand_together() {
     assert_eq!(store.unacked_demand().unwrap().len(), 1);
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);
     assert_eq!(queued(&store), vec![ids[1].clone()]);
+}
+
+/// Spec 24.4: how often a submit was sent is recorded before each send, and
+/// a count that is not known stays unknown.
+#[test]
+fn the_sends_of_a_submit_are_counted_before_each_and_an_unknown_count_stays_unknown() {
+    let (_d, store, _run, ids) = queue_fx(3);
+    let first = placed(place_on(&store, &ids[0], "w-a", 9));
+    let other = placed(place_on(&store, &ids[1], "w-a", 9));
+    assert_eq!(store.count_submit_send(&first.attempt_id).unwrap(), Some(0));
+    assert_eq!(store.count_submit_send(&first.attempt_id).unwrap(), Some(1));
+    assert_eq!(store.count_submit_send(&first.attempt_id).unwrap(), Some(2));
+    // Each attempt has its own count.
+    assert_eq!(store.count_submit_send(&other.attempt_id).unwrap(), Some(0));
+    // A placement that was recorded without a count (made before the count
+    // was kept): not known, however often it is sent from here on.
+    let old = placed(place_on(&store, &ids[2], "w-a", 9));
+    let aid = old.attempt_id.to_string();
+    store
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "UPDATE placement SET submit_sends = NULL WHERE attempt_id = ?1",
+                [&aid],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(store.count_submit_send(&old.attempt_id).unwrap(), None);
+    assert_eq!(store.count_submit_send(&old.attempt_id).unwrap(), None);
+    // No placement at all: not known either.
+    assert_eq!(
+        store.count_submit_send(&AttemptId::generate()).unwrap(),
+        None
+    );
+    // The count survives the process.
+    let dir = _d;
+    drop(store);
+    let store = CoordinatorStore::open(dir.path(), 2).unwrap();
+    assert_eq!(store.count_submit_send(&first.attempt_id).unwrap(), Some(3));
+}
+
+/// Spec 11 and 24.4: an attempt its worker stored nothing of is closed in
+/// one commit, without a retire, and its task is queued again.
+#[test]
+fn an_attempt_the_worker_stored_nothing_of_is_closed_without_a_retire() {
+    let (_d, store, _run, ids) = queue_fx(5);
+    let note = json!({"worker": "w-a", "reason": "capacity"});
+    let close = |a: &AttemptId, at: u64| {
+        store
+            .close_unstored(
+                a,
+                "capacity_refused",
+                ("submit_refused_capacity", &note),
+                at,
+            )
+            .unwrap()
+    };
+    let refused = placed(place_on(&store, &ids[0], "w-a", 9));
+    assert_eq!(store.unacked_demand().unwrap().len(), 1);
+    assert!(close(&refused.attempt_id, 30));
+    let after = store.get_attempt(&refused.attempt_id).unwrap().unwrap();
+    assert!(after.retired && after.termination.is_none());
+    assert_eq!(after.state, refused.state);
+    // The tombstone is confirmed as it is written, the demand is gone, the
+    // task is queued, and the worker is not left out for it.
+    assert_eq!(
+        store.retire_tombstone(&refused.attempt_id).unwrap(),
+        Some((30, Some(30)))
+    );
+    assert!(store.unacked_demand().unwrap().is_empty());
+    assert!(store.live_attempts(None).unwrap().is_empty());
+    assert_eq!(queued(&store)[0], ids[0]);
+    assert!(store
+        .excluded_workers(&ids[0], "worker_cannot_run")
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        store
+            .excluded_workers(&ids[0], "capacity_refused")
+            .unwrap()
+            .len(),
+        1
+    );
+    let kinds = |a: &AttemptId, kind: &str| store.events_of(a, kind).unwrap().len();
+    assert_eq!(kinds(&refused.attempt_id, "submit_refused_capacity"), 1);
+    assert_eq!(
+        store
+            .events_of(&refused.attempt_id, "submit_refused_capacity")
+            .unwrap()[0]
+            .payload,
+        note
+    );
+    // No retire was asked for, so none is recorded as asked or confirmed.
+    assert_eq!(kinds(&refused.attempt_id, "retire_requested"), 0);
+    assert_eq!(kinds(&refused.attempt_id, "retire_confirmed"), 0);
+    // Once: a second call finds it retired and writes nothing.
+    assert!(!close(&refused.attempt_id, 31));
+    assert_eq!(kinds(&refused.attempt_id, "submit_refused_capacity"), 1);
+    assert_eq!(
+        store.retire_tombstone(&refused.attempt_id).unwrap(),
+        Some((30, Some(30)))
+    );
+    // The next generation of the task.
+    let next = placed(place_on(&store, &ids[0], "w-b", 9));
+    assert_eq!(next.generation, Generation(2));
+
+    // Not closed this way, and nothing written: a retire was asked for, ...
+    let asked = placed(place_on(&store, &ids[1], "w-a", 9));
+    store.begin_retire(&asked.attempt_id, "move", 32).unwrap();
+    assert!(!close(&asked.attempt_id, 33));
+    assert_eq!(
+        store.retire_tombstone(&asked.attempt_id).unwrap(),
+        Some((32, None))
+    );
+    // ... a cancel of the attempt or of its task was, ...
+    let cancelled = placed(place_on(&store, &ids[2], "w-a", 9));
+    assert!(store.request_cancel(&cancelled.attempt_id, 34).unwrap());
+    assert!(!close(&cancelled.attempt_id, 35));
+    let of_task = placed(place_on(&store, &ids[3], "w-a", 9));
+    store.cancel_task(&ids[3], 36).unwrap();
+    assert!(!close(&of_task.attempt_id, 37));
+    // ... the attempt ended, or there is none.
+    let ended = placed(place_on(&store, &ids[4], "w-a", 9));
+    store
+        .record_seen(
+            &ended.attempt_id,
+            true,
+            seen(AttemptState::Terminal, Some(done(Outcome::Failed))),
+            Observation::Known,
+            38,
+        )
+        .unwrap();
+    assert!(!close(&ended.attempt_id, 39));
+    assert!(!close(&AttemptId::generate(), 39));
+    for a in [&cancelled, &of_task, &ended] {
+        assert_eq!(store.retire_tombstone(&a.attempt_id).unwrap(), None);
+        assert!(!store.get_attempt(&a.attempt_id).unwrap().unwrap().retired);
+        assert_eq!(kinds(&a.attempt_id, "submit_refused_capacity"), 0);
+    }
+}
+
+/// An in-place task is never placed again by itself, so its attempt is not
+/// closed for the next generation.
+#[test]
+fn an_in_place_attempt_is_not_closed_for_a_next_generation() {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let (run, task) = (RunId::generate(), TaskId::generate());
+    store
+        .enqueue(
+            &run,
+            None,
+            &json!({}),
+            &[(task.clone(), json!({"in_place": true}))],
+            5,
+        )
+        .unwrap();
+    let a = placed(place_on(&store, &task, "w-a", 9));
+    let note = json!({});
+    assert!(!store
+        .close_unstored(
+            &a.attempt_id,
+            "capacity_refused",
+            ("submit_refused_capacity", &note),
+            30
+        )
+        .unwrap());
+    assert_eq!(store.retire_tombstone(&a.attempt_id).unwrap(), None);
+    assert!(!store.get_attempt(&a.attempt_id).unwrap().unwrap().retired);
 }
 
 #[test]
@@ -5117,7 +5288,7 @@ fn live_log_v6_migration_preserves_final_receipt_and_bootstraps_verified_bytes()
         .set_collection_logs(&a, &result, &receipt, 23)
         .unwrap();
     // Exactly the pre-progress schema: no rows or constraints are skipped.
-    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
+    f.store.db.write(|tx|{tx.execute_batch("DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DROP TABLE ci_test_timing; DROP TABLE identity_retired_notice; DROP TABLE removed_member; ALTER TABLE placement DROP COLUMN submit_sends; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='6' WHERE key='schema_version';")?;Ok(())}).unwrap();
     drop(f.store);
     let owner = CoordinatorStore::open(f._dir.path(), 24).unwrap();
     assert_eq!(owner.collection(&a).unwrap().unwrap().logs, Some(receipt));

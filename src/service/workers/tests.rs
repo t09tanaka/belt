@@ -1335,7 +1335,8 @@ fn what_this_build_offers_and_requires_is_one_list() {
         [
             crate::outputs::FEATURE,
             crate::group::MEMBERSHIP_FEATURE,
-            crate::group::IDENTITY_RETIRED_FEATURE
+            crate::group::IDENTITY_RETIRED_FEATURE,
+            crate::group::SHARED_ADMISSION_FEATURE
         ]
     );
     assert!(required.iter().all(|f| offered.contains(f)));

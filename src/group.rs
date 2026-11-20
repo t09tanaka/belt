@@ -20,6 +20,10 @@ use std::path::{Path, PathBuf};
 pub const MEMBERSHIP_FEATURE: &str = "group_membership_v1";
 /// The hello feature of the `identity_retired` notice. Required by both sides.
 pub const IDENTITY_RETIRED_FEATURE: &str = "identity_retired_v1";
+/// The admission window of a worker is one budget over every member: the
+/// `capacity` reason of a refused submit, the window in `inspect`, and the
+/// `foreign_demand` of a forecast (spec 24.4, 24.5).
+pub const SHARED_ADMISSION_FEATURE: &str = "shared_admission_v1";
 
 const BLOCK: usize = 64;
 const NONCE_BYTES: usize = 32;

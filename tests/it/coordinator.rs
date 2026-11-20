@@ -31,6 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
 
+mod shared_admission;
+
 // ------------------------------------------------------------ the workers
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,6 +135,9 @@ pub(crate) struct State {
     pub(crate) stall: bool,
     pub(crate) draining: bool,
     pub(crate) limits: (u32, u32),
+    /// Attempts of other members that are not terminal here: they fill the
+    /// window like this member's own, and nothing else of them is seen.
+    pub(crate) foreign: u32,
     /// The requests that were carried out, in order.
     pub(crate) log: Vec<(Op, AttemptId)>,
     /// What `inspect` says its id is.
@@ -142,6 +147,20 @@ pub(crate) struct State {
     pub(crate) asked: Vec<ForecastRequest>,
     /// Every request that arrived, answered or not, in order.
     pub(crate) received: Vec<Op>,
+}
+
+impl State {
+    /// The admission window as the worker counts it.
+    fn window(&self) -> belt::wire::AdmissionWindow {
+        let (active, pending) = load_counts(self.held.values().map(|h| h.state));
+        let own = u64::from(active + pending);
+        belt::wire::AdmissionWindow {
+            limit: u64::from(self.limits.0) + u64::from(self.limits.1),
+            used: own + u64::from(self.foreign),
+            own,
+            foreign: u64::from(self.foreign),
+        }
+    }
 }
 
 pub(crate) struct FakeWorker {
@@ -180,6 +199,7 @@ impl FakeWorker {
                 stall: false,
                 draining: false,
                 limits,
+                foreign: 0,
                 log: Vec::new(),
                 says: id,
                 forecasting: Forecasting {
@@ -308,6 +328,7 @@ impl FakeWorker {
             Request::Inspect(_) => {
                 let (active, pending) = load_counts(s.held.values().map(|h| h.state));
                 Ok(Response::Inspect(InspectResponse {
+                    admission: Some(s.window()),
                     preparation_observations: None,
                     capabilities: s.capabilities.clone(),
                     schema_version: SchemaVersion::CURRENT,
@@ -362,6 +383,14 @@ impl FakeWorker {
                 }
                 if s.overloaded {
                     return Err(err(ErrorCode::Overloaded));
+                }
+                // The window is the worker's own, over every member; a
+                // submit beyond it leaves nothing, no tombstone either.
+                if !s.window().has_room() {
+                    return Err(ApiError::overloaded(
+                        belt::error::OverloadedReason::Capacity,
+                        "the window is full",
+                    ));
                 }
                 let mut receipts = Receipts::default();
                 receipts.mark(Receipt::WorkerAccepted, 1);
@@ -510,6 +539,7 @@ impl FakeWorker {
                 };
                 let known = f.says != Says::Nothing;
                 Ok(Response::Forecast(ForecastResponse {
+                    foreign_demand: s.foreign,
                     schema_version: SchemaVersion::CURRENT,
                     worker_id: s.says.clone(),
                     worker_boot_id: WorkerBootId::parse(f.boot).unwrap(),

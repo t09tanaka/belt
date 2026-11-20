@@ -299,6 +299,7 @@ mod tests {
                 if let Request::Inspect(_) = &request {
                     let r = self.response.lock().unwrap();
                     return Ok(Response::Inspect(crate::wire::InspectResponse {
+                        admission: None,
                         preparation_observations: None,
                         capabilities: Some(crate::toolchain::capability::WorkerCapabilities {
                             disk_free_bytes: None,
@@ -340,6 +341,7 @@ mod tests {
                 if let Some(forecast) = forecast {
                     let r = self.response.lock().unwrap();
                     let response = crate::wire::ForecastResponse {
+                        foreign_demand: 0,
                         schema_version: SchemaVersion::CURRENT,
                         worker_id: r.worker_id.clone(),
                         worker_boot_id: r.worker_boot_id.clone(),

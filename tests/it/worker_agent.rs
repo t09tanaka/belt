@@ -424,6 +424,14 @@ impl Fx {
     pub(crate) fn start(&self, boot: &str) -> Arc<Agent> {
         self.start_with(self.cfg(boot))
     }
+    /// An agent whose admission window holds `window` attempts that are not
+    /// terminal, of every member together (the default is 1 + 1).
+    pub(crate) fn start_holding(&self, boot: &str, window: u32) -> Arc<Agent> {
+        let mut cfg = self.cfg(boot);
+        cfg.max_active_task = window;
+        cfg.prefetch_per_worker = 0;
+        self.start_with(cfg)
+    }
     /// A new connection to the agent: its own stream and its own `hello`.
     async fn connect(&self, agent: &Arc<Agent>) -> Client {
         let (a, b) = duplex_pair(64 * 1024);
@@ -1784,6 +1792,8 @@ async fn list_attempts_filters_in_the_database_and_never_answers_with_a_part() {
     let mut cfg = f.cfg("boot-a");
     cfg.max_list_attempts = 3;
     cfg.secret_wait_ms = 120_000;
+    // Two attempts wait here while a third and more come and go.
+    cfg.max_active_task = 3;
     let agent = f.start_with(cfg);
     let c = f.connect(&agent).await;
     // The two oldest attempts are still being prepared (they wait for their

@@ -712,7 +712,7 @@ workerは受け取る量に上限を持ち、超える要求は一部だけ処�
 - 届く前にcancelしたattemptは、workerにtombstoneが書かれたことを確かめてから、親が `cancelled` を確定する。
 - workerがsubmitをerrorで断ったとき、確定的な拒否として扱うのは、attempt自体についての答えだけとする。`INVALID_INPUT` と、同じattemptを別のpayloadで受理済みであることを示す `CONFLICT`（`conflict_reason.reason = "payload_mismatch"`）である。このときは、そのworkerへretireを送ってtombstoneを残し、確認できたら親がそのattemptを `failed` に確定する。別workerへは自動で配置しない。
 - 容量による断り（`OVERLOADED` で `overloaded_reason.reason = "capacity"`）は、そのworkerが他のメンバーの仕事を含めて満杯で、何も保存しなかったことを表す。そのattemptを1回だけ送ってこの答えを得たときは、retireを送らずにattemptを閉じ（理由 `capacity_refused` は親DBにだけ記録する）、同じtransactionでattemptのevent `submit_refused_capacity` を残して、次のgenerationで別のworkerへ配置する。2回以上送っていた、または答えの無い送信があったときは、遅れて届くcopyが残り得るので、retireを依頼し、workerが未開始を確認してからtaskを空ける。どちらの場合もtaskは失敗にしない。除外は一時的で、そのworkerが `inspect` で空きを答えれば候補に戻る（24.4）。
-- `attempt_id` が使用中という断り（`OVERLOADED` で `overloaded_reason.reason = "attempt_id_in_use"`）は、そのworkerが同じ `attempt_id` を別のメンバーのattemptとして持っていて、何も保存しなかったことを表す（24.4）。taskについての答えではないので、taskを失敗にしない。容量による断りと同じ規則で、1回だけ送ってこの答えを得たときはretireを送らずにattemptを閉じ、送信の結果が不確かなときはretireを依頼してworkerの未開始の確認を待つ。どちらの場合も、同じattemptを送り直さず、新しい `attempt_id`（次のgeneration）で配置し直す。そのworkerを候補から外さない。親はattemptのevent `submit_refused_attempt_id` を残す。`in-place` のtaskは自動で配置し直さない（第6章）ので、この断りを理由の無い `OVERLOADED` と同じに扱い、同じattemptを同じworkerへ後で送り直す。
+- `attempt_id` が使用中という断り（`OVERLOADED` で `overloaded_reason.reason = "attempt_id_in_use"`）は、そのworkerが同じ `attempt_id` を別のメンバーのattemptとして持っていて、何も保存しなかったことを表す（24.4）。taskについての答えではないので、taskを失敗にしない。容量による断りと同じ規則で、1回だけ送ってこの答えを得たときはretireを送らずにattemptを閉じ、送信の結果が不確かなときはretireを依頼してworkerの未開始の確認を待つ。どちらの場合も、同じattemptを送り直さず、新しい `attempt_id`（次のgeneration）で配置し直す。そのworkerを候補から外さない。親はattemptのevent `submit_refused_attempt_id` を残す。`in-place` のtaskは自動で配置し直さない（第6章）ので、この断りと容量による断りを理由の無い `OVERLOADED` と同じに扱い、同じattemptを同じworkerへ後で送り直す。
 - それ以外のerror（理由の無い `OVERLOADED`、`INTERNAL`、`COMMUNICATION_UNKNOWN`、`NOT_IMPLEMENTED`、`NOT_FOUND`、理由が `payload_mismatch` でない `CONFLICT`、`blocked_reason` が `secret_unavailable` か無い `BLOCKED`、親の知らないcode）は、workerの一時的な不調か、そのattemptについての答えではないものとして扱う。taskを失敗にせず、同じattemptを同じworkerへ後で送り直す（何回でも）。断られた理由は、attemptのevent `submit_deferred` に、答え（error codeと、`BLOCKED` ではその `blocked_reason` の組）ごとに1回記録する（待っている理由を表示できるようにするため）。
 - workerが自分の側の理由だと明示した答え、つまり `PROTOCOL_INCOMPATIBLE` と、`blocked_reason` が `environment_mismatch` か `no_compatible_worker` の `BLOCKED` は、そのworkerでは解消しない理由として扱う。同じattemptに同じ答え（codeと `blocked_reason` の組）が2回返ったら（1回目は `submit_deferred` に記録済み）、schedulerがそのattemptのretireを依頼し（理由 `worker_cannot_run`）、同じtransactionでattemptのevent `worker_excluded` にworker・code・`blocked_reason` を残す。別の理由の `BLOCKED` が先に返っていても、それは2回目に数えない。workerが未開始を確認した時点でtaskが空き、次のgenerationで配置される。そのtaskは、理由 `worker_cannot_run` のretireが確認済みのattemptのworkerへは配置しない（retireの理由だけで判断する。親DBの記録から判断するので、親の再起動後も同じ）。taskは失敗にしない。全workerが外れたtaskは未配置のまま待ち、理由は `task_waiting` に残る。`secret_unavailable` はどのworkerでも同じなので、移さずに同じworkerへ送り直す。
 - 答えが届いたが読めなかったとき（schema versionが違う、別の操作への答えだった）は、workerのerrorではなく「答えが無い」として扱う。workerは依頼を実行したかもしれないので、拒否には数えず、unknownのまま保持する。
@@ -1734,11 +1734,11 @@ belt group                                # グループのID、鍵の世代、�
 - **窓の出所**: 受付窓は、受ける側のメンバー自身のユーザー設定（そのマシンの `[coordinator] max_active_task` と `[scheduler] prefetch_per_worker`）で決まる。workerは `inspect` でこの値を答える。投げたメンバーは、自分の設定の値とworkerが答えた値の、項目ごとに小さい方で数える（第9章）。投げたメンバーの設定が、他のマシンの窓を広げることは無い。
 - **workerが正**: workerは、terminalでないattemptをすべてのメンバーの分について数え、受付窓を超える新規submitを、何も保存せずに断る。投げた側が自分の配置を数えて上限で止める規則は残すが、断られるsubmitを減らすための最適化である。受理済みattemptの再送は数えず、断らない（第11章の冪等性）。
 - **断り方**: `OVERLOADED` に `overloaded_reason.reason = "capacity"` を付けて答える（feature `shared_admission_v1`。最初の公開版から必須）。知らない `reason` は理由なしとして読む。断ったworkerは何も保存しない。tombstoneも残さない。
-- **断られた側**: `capacity` の答えは「workerは何も保存していない」という確定した答えである。そのattemptを1回だけ送り、その1回に `capacity` が返ったときは、届いていないcopyはどこにも無いので、retireを送らずにそのattemptを閉じ（理由 `capacity_refused` を自分のDBに記録する。wireには載せない）、次のgenerationで別のworkerへ配置する。
+- **断られた側**: `capacity` の答えは「workerは何も保存していない」という確定した答えである。そのattemptを1回だけ送り、その1回に `capacity` が返ったときは、届いていないcopyはどこにも無いので、retireを送らずにそのattemptを閉じ（理由 `capacity_refused` を自分のDBに記録する。wireには載せない）、次のgenerationで別のworkerへ配置する。送信回数は、送る直前に親DBへ記録する（答えの無い送信も1回に数える）。`in-place` のtaskは自動で配置し直さない（第6章）ので、この断りを理由の無い `OVERLOADED` と同じに扱い、同じattemptを同じworkerへ後で送り直す。
 - **結果が不確かなとき**: そのattemptを2回以上送っていた、または答えの無い送信が1回でもあった場合は、遅れて届くcopyが残り得る。coordinatorの再起動後、送信回数が永続記録から分からないattemptも、結果が不確かなものとしてretireを通す。このときは従来どおりretireを依頼し、workerのtombstoneと未開始の確認を得てからtaskを空ける（第11章の「retireしてから置き直す」規則）。遅れて届いた元のsubmitは `RETIRED` で断られ、同じ仕事が2か所で走らない（A19）。確認が取れない間はunknownのまま保持し、置き直さない。
-- **除外は一時的**: `capacity_refused` のworkerは、`worker_cannot_run`（第11章）と違い、そのtaskから恒久的には外さない。そのworkerが次の `inspect` で受付窓の空きを答えるまで、どのtaskもそこへ新しく配置しない。空きを答えたら候補に戻す。この状態はprocessの中だけに持ち、再起動後は `inspect` の答えから決め直す。
-- **置き直す先が無いとき**: taskは未配置のまま待ち、理由（`capacity`）を `task_waiting` に残す。taskを失敗にしない。
-- **`inspect`**: 受付窓の上限と使用数、そのうち聞いたメンバーの分と他のメンバーの分（件数だけ）、そのマシンが自分で投げた非terminalのrunを持つかどうかを答える。
+- **除外は一時的**: `capacity_refused` のworkerは、`worker_cannot_run`（第11章）と違い、そのtaskから恒久的には外さない。そのworkerが次の `inspect` で受付窓の空きを答えるまで、どのtaskもそこへ新しく配置しない。空きを答えたら候補に戻す。この状態は永続化せず、tickごとの `inspect` の答えから決める（`inspect` が満杯を答えたworkerへは、断られる前でも配置しない）。再起動後も同じである。
+- **置き直す先が無いとき**: taskは未配置のまま待ち、理由（`capacity`）を `task_waiting` に残す（`blocked_reason` が `capacity`、外したworkerの理由も `capacity`）。taskを失敗にしない。
+- **`inspect`**: 受付窓の上限と使用数、そのうち聞いたメンバーの分と他のメンバーの分（件数だけ）、そのマシンが自分で投げた非terminalのrunを持つかどうかを答える（最後の項目は、それを読む `workers stop` と一緒に足す）。
 - **公平さ**: 受付は到着順である。メンバーごとの予約や比例配分は初回リリースに含めない。1つのメンバーが窓を埋めている間、他のメンバーはそのworkerを使えないが、失敗にはならず、他のworkerへ置くか待つ。自分のlocal workerにも優先枠は無い。自分のマシンの窓が他のメンバーの仕事で埋まっていれば、自分のrunも、他のworkerへ置くか待つことになる。
 - **その他の共有上限**: `max_live_attempts`、同時に行うworkspaceの準備、blobの受け取りの量と個数、覚える `sync_id` の数（第11章）も、すべてのメンバーの合計に対する上限である。超えた要求は従来どおり理由なしの `OVERLOADED`（何も行っていないので送り直せる）で断る。
 - **runの中の制約**: matrixのglobal permit、ShardGroup、fail-fast、joinは、runの中の制約なので、投げたメンバーが管理する（第12章）。
@@ -1752,7 +1752,7 @@ belt group                                # グループのID、鍵の世代、�
 
 - workerのforecastは、実ledger（誰が投げたかを問わず全部）、workerが受理した未登録のworkload（すべてのメンバーの分）、聞いたメンバーが送信中の未ACKの仕事（そのメンバーが渡す）を含める。
 - 他のメンバーが送信中でまだworkerに届いていない仕事は、どこからも見えない。forecastは予約券ではない（第9章）ので、その分は実際のsubmitの時点の断り（24.4）で吸収する。
-- coverageとnodeの識別子（第9章）は、聞いたメンバーの分だけを返す。他のメンバーの需要は合成済みの結果に効かせ、件数だけを `foreign_demand` として返す。識別子・command・sourceは返さない。聞いた側は、合成済みの需要をoverlayへ足し直さない。
+- coverageとnodeの識別子（第9章）は、聞いたメンバーの分だけを返す。他のメンバーの需要は合成済みの結果に効かせ、件数（他のメンバーの非terminalのattemptの数）だけを `foreign_demand` として返す。識別子・command・sourceは返さない。聞いた側は、合成済みの需要をoverlayへ足し直さない。
 - 配置理由と `estimate` の表示には、他のメンバーの需要を含むことと、その件数を出す。`estimate` は読み取り専用のままで、他のメンバーの仕事があっても何も増やさない（A06）。
 - 自分のlocal workerも同じ扱いである。他のメンバーの仕事が入っていれば、自分のrunのforecastにその分が現れる。
 

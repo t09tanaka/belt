@@ -723,9 +723,12 @@ async fn a_task_its_worker_keeps_refusing_is_retired_there_and_placed_elsewhere(
 }
 
 /// A worker that holds the attempt id for another member stored nothing
-/// (spec 24.4). The attempt is taken off it at the first such answer, the
-/// task does not fail and no worker is left out: it is placed again under a
-/// new attempt id, on the same worker if that one is still the best.
+/// (spec 24.4). The submit was sent once and answered, so the attempt is
+/// closed at the first such answer, without a retire (spec 11); the task
+/// does not fail and no worker is left out: it is placed again under a new
+/// attempt id, on the same worker if that one is still the best. (With a
+/// send that was never answered before it, the attempt is retired first:
+/// `coordinator::shared_admission`.)
 #[tokio::test]
 async fn a_task_whose_attempt_id_is_in_use_on_its_worker_is_placed_again_under_a_new_id() {
     use belt::coordinator::{EVENT_SUBMIT_REFUSED_ATTEMPT_ID, REASON_ATTEMPT_ID_IN_USE};
@@ -740,12 +743,14 @@ async fn a_task_whose_attempt_id_is_in_use_on_its_worker_is_placed_again_under_a
         ))
     });
     let task = enqueue(&c, 1).await.remove(0);
-    // Placed and refused: the retire is asked for at once, with the reason.
+    // Placed and refused: the attempt is closed at once, with the reason.
     let report = c.tick().await.unwrap();
-    assert!(report.retired.is_empty() && report.settled.is_empty());
     let first = only(&c, &task);
+    assert_eq!(report.retired, vec![first.attempt_id.clone()]);
+    assert!(report.settled.is_empty());
     assert_eq!(a.received(Op::Submit), 1);
-    assert!(tombstone(&c, &task).is_some());
+    let (asked, confirmed) = tombstone(&c, &task).unwrap();
+    assert_eq!(confirmed, Some(asked));
     let noted = c
         .store()
         .events_of(&first.attempt_id, EVENT_SUBMIT_REFUSED_ATTEMPT_ID)
@@ -754,15 +759,16 @@ async fn a_task_whose_attempt_id_is_in_use_on_its_worker_is_placed_again_under_a
     assert_eq!(noted[0].payload["worker"], "w-a");
     assert_eq!(noted[0].payload["code"], "OVERLOADED");
     assert_eq!(noted[0].payload["reason"], REASON_ATTEMPT_ID_IN_USE);
+    assert_eq!(noted[0].payload["retire"], false);
     assert_eq!(REASON_ATTEMPT_ID_IN_USE, "attempt_id_in_use");
     assert!(events(&c, EVENT_WORKER_EXCLUDED).is_empty());
-    // The worker confirms that nothing started: the task is free, did not
-    // fail, and goes to the same worker under another attempt id.
+    // Nothing of the attempt exists on the worker, so no retire is sent:
+    // the task is free, did not fail, and goes to the same worker under
+    // another attempt id.
     a.set(|s| s.fault = None);
     let report = c.tick().await.unwrap();
-    assert_eq!(report.retired, vec![first.attempt_id.clone()]);
-    assert_eq!(a.count(Op::Retire), 1);
-    c.tick().await.unwrap();
+    assert!(report.retired.is_empty());
+    assert_eq!(a.received(Op::Retire), 0);
     let all = attempts(&c, &task);
     assert_eq!(all.len(), 2);
     assert!(

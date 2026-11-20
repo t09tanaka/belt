@@ -680,7 +680,8 @@ async fn a_retired_identity_stops_that_members_attempts_now_and_refuses_it_from_
 async fn a_start_ends_an_unstarted_attempt_whose_lease_was_ended_and_no_other() {
     let f = fx();
     f.admit_commands(3);
-    let agent = f.start("boot-1");
+    // Three attempts of two members are held at once.
+    let agent = f.start_holding("boot-1", 3);
     let (main, sub) = (member("main"), member("sub"));
     let a = dial(&f, &agent, &main).await.unwrap().client;
     let b = dial(&f, &agent, &sub).await.unwrap().client;
