@@ -174,15 +174,29 @@ pub fn sent_once(sends_before: Option<u64>) -> bool {
     sends_before == Some(0)
 }
 
+/// Whether a worker's `inspect` answers that its admission window has room.
+/// This is what ends the exclusion of a worker that refused a submit for
+/// capacity (spec 24.4). A worker that does not say (`None`) is not held
+/// back.
+pub fn answers_room(admission: Option<&AdmissionWindow>) -> bool {
+    admission.is_none_or(|window| window.has_room())
+}
+
 /// Whether nothing new is placed on a worker because its admission window
-/// is full with the work of every member: the attempts of the other members
+/// is full with the work of every member.
+///
+/// `refused`: it refused a submit for capacity and its `inspect` has not
+/// answered room since. That alone keeps it out, whatever is counted: the
+/// worker is the one that knows.
+///
+/// Otherwise, before anything is refused: the attempts of the other members
 /// its `inspect` counted in this tick, plus what this parent holds there by
 /// its own record now (`load`; the worker's count of this parent's attempts
 /// is as old as the `inspect`, and a retire confirmed since has freed a
 /// place). A worker that did not say (`None`) is not held back by this.
-pub fn window_closed(admission: Option<&AdmissionWindow>, load: WorkerLoad) -> bool {
+pub fn window_closed(refused: bool, admission: Option<&AdmissionWindow>, load: WorkerLoad) -> bool {
     let held = u64::from(load.active) + u64::from(load.pending);
-    admission.is_some_and(|window| window.foreign.saturating_add(held) >= window.limit)
+    refused || admission.is_some_and(|window| window.foreign.saturating_add(held) >= window.limit)
 }
 
 /// Read the error a worker answered a submit with.
@@ -809,30 +823,43 @@ mod tests {
             foreign,
         };
         let load = |active, pending| WorkerLoad { active, pending };
-        assert!(!window_closed(None, load(9, 9)));
+        assert!(!window_closed(false, None, load(9, 9)));
         // The others' attempts and this parent's own fill it together.
-        assert!(!window_closed(Some(&window(3, 0, 0)), load(0, 0)));
-        assert!(!window_closed(Some(&window(3, 0, 2)), load(0, 0)));
-        assert!(window_closed(Some(&window(3, 0, 3)), load(0, 0)));
-        assert!(window_closed(Some(&window(3, 0, 4)), load(0, 0)));
-        assert!(!window_closed(Some(&window(3, 1, 1)), load(1, 0)));
-        assert!(window_closed(Some(&window(3, 1, 1)), load(1, 1)));
-        assert!(window_closed(Some(&window(3, 1, 1)), load(0, 2)));
-        assert!(window_closed(Some(&window(3, 0, 1)), load(2, 0)));
-        assert!(window_closed(Some(&window(0, 0, 0)), load(0, 0)));
+        assert!(!window_closed(false, Some(&window(3, 0, 0)), load(0, 0)));
+        assert!(!window_closed(false, Some(&window(3, 0, 2)), load(0, 0)));
+        assert!(window_closed(false, Some(&window(3, 0, 3)), load(0, 0)));
+        assert!(window_closed(false, Some(&window(3, 0, 4)), load(0, 0)));
+        assert!(!window_closed(false, Some(&window(3, 1, 1)), load(1, 0)));
+        assert!(window_closed(false, Some(&window(3, 1, 1)), load(1, 1)));
+        assert!(window_closed(false, Some(&window(3, 1, 1)), load(0, 2)));
+        assert!(window_closed(false, Some(&window(3, 0, 1)), load(2, 0)));
+        assert!(window_closed(false, Some(&window(0, 0, 0)), load(0, 0)));
         // This parent's part is its own record now, not the worker's count
         // from the `inspect`: an attempt whose retire was confirmed since
         // has given its place back, and one placed since has taken one.
-        assert!(!window_closed(Some(&window(1, 1, 0)), load(0, 0)));
-        assert!(window_closed(Some(&window(2, 0, 1)), load(0, 1)));
+        assert!(!window_closed(false, Some(&window(1, 1, 0)), load(0, 0)));
+        assert!(window_closed(false, Some(&window(2, 0, 1)), load(0, 1)));
         assert!(!window_closed(
+            false,
             Some(&window(u64::MAX, 0, u64::MAX - 1)),
             load(0, 0)
         ));
         assert!(window_closed(
+            false,
             Some(&window(u64::MAX, 0, u64::MAX)),
             load(1, 1)
         ));
+        // A worker that refused for capacity stays out whatever is counted,
+        // until its `inspect` answers room.
+        assert!(window_closed(true, None, load(0, 0)));
+        assert!(window_closed(true, Some(&window(3, 0, 0)), load(0, 0)));
+        assert!(window_closed(true, Some(&window(3, 1, 2)), load(0, 0)));
+        assert!(answers_room(None));
+        assert!(answers_room(Some(&window(3, 0, 0))));
+        assert!(answers_room(Some(&window(3, 1, 1))));
+        assert!(!answers_room(Some(&window(3, 2, 1))));
+        assert!(!answers_room(Some(&window(3, 3, 1))));
+        assert!(!answers_room(Some(&window(0, 0, 0))));
     }
 
     #[test]

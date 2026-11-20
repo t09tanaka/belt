@@ -2508,12 +2508,13 @@ mod tests {
             ..window
         }
         .shared());
-        let Some(Response::Inspect(mut inspect)) = responses()
+        let mut inspect = responses()
             .into_iter()
-            .find(|r| matches!(r, Response::Inspect(_)))
-        else {
-            panic!("an inspect response");
-        };
+            .find_map(|r| match r {
+                Response::Inspect(inspect) => Some(inspect),
+                _ => None,
+            })
+            .expect("an inspect response");
         // Not there: not written, and read as not said.
         let v = serde_json::to_value(&inspect).unwrap();
         assert!(v.get("admission").is_none());
@@ -2531,12 +2532,13 @@ mod tests {
             serde_json::from_value::<InspectResponse>(v).unwrap(),
             inspect
         );
-        let Some(Response::Forecast(mut forecast)) = responses()
+        let mut forecast = responses()
             .into_iter()
-            .find(|r| matches!(r, Response::Forecast(_)))
-        else {
-            panic!("a forecast response");
-        };
+            .find_map(|r| match r {
+                Response::Forecast(forecast) => Some(forecast),
+                _ => None,
+            })
+            .expect("a forecast response");
         let v = serde_json::to_value(&forecast).unwrap();
         assert!(v.get("foreign_demand").is_none());
         assert_eq!(

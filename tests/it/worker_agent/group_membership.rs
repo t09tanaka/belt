@@ -1077,6 +1077,18 @@ async fn a52_the_window_is_one_budget_over_every_member_and_a_refused_submit_lea
     let w = window_of(&a).await;
     assert_eq!((w.used, w.own, w.foreign), (1, 0, 1));
     assert!(w.has_room() && w.shared());
+    // The other member's command runs now, registered with the traffic
+    // controller: still a count and nothing else in the first member's
+    // forecast.
+    let Response::Forecast(r) = call(&a, forecast_req(&main)).await.unwrap() else {
+        panic!("a forecast answer")
+    };
+    assert_eq!(r.foreign_demand, 1);
+    assert!(r.coverage.iter().all(|c| c.attempt_id != y));
+    let text = serde_json::to_string(&r).unwrap();
+    for hidden in [y.as_str(), second.run_id.as_str(), second.task_id.as_str()] {
+        assert!(!text.contains(hidden), "{text}");
+    }
     // The attempt that was refused is taken now, as it was sent before.
     call(&b, request_of(&sub, &z, &third)).await.unwrap();
     assert_eq!(f.wait_terminal(&z), Outcome::Succeeded);

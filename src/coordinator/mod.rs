@@ -449,6 +449,11 @@ pub struct Coordinator {
     /// The queued tasks no payload could be made for, as this process
     /// already recorded.
     unplaceable: Mutex<BTreeSet<TaskId>>,
+    /// The workers that refused a submit for capacity and whose `inspect`
+    /// has not answered room since (spec 24.4). Nothing new is placed on
+    /// them. Kept in this process only: after a restart the `inspect` of
+    /// each worker decides anew.
+    capacity_refused: Mutex<BTreeSet<WorkerId>>,
     sched: Scheduler,
 }
 
@@ -500,6 +505,7 @@ impl Coordinator {
             placement_fence: Arc::default(),
             fenced: AtomicBool::new(false),
             unplaceable: Mutex::default(),
+            capacity_refused: Mutex::default(),
             sched,
         })
     }
@@ -959,6 +965,13 @@ impl Coordinator {
             // It used up its time: nothing new goes there in this tick.
             return Ok((None, report));
         }
+        if policy::answers_room(inspected.admission.as_ref()) {
+            // It has room again: it is a candidate like any other.
+            self.capacity_refused
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&worker_id);
+        }
         let reached = Reached {
             capabilities: inspected.capabilities,
             worker_id,
@@ -1209,6 +1222,14 @@ impl Coordinator {
                     _ => None,
                 };
                 let once = policy::sent_once(sends_before);
+                if unstored == Some(Unstored::Capacity) {
+                    // Until its `inspect` answers room, nothing new goes
+                    // there, whatever this parent counts.
+                    self.capacity_refused
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(a.worker_id.clone());
+                }
                 match policy::submit_refusal(e.code, mismatch, unstored, once) {
                     Refusal::Fenced => Err(self.fence()),
                     Refusal::Close(why) => {
@@ -1616,6 +1637,15 @@ impl Coordinator {
         Ok(())
     }
 
+    /// The workers that refused a submit for capacity and have not answered
+    /// room since. Read only: an estimate looks at it and changes nothing.
+    pub(crate) fn refused_for_capacity(&self) -> BTreeSet<WorkerId> {
+        self.capacity_refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// The workers a task is not placed on again: those an attempt of it was
     /// taken off because they kept refusing it.
     async fn refused_by(&self, task_id: &TaskId) -> Result<BTreeSet<WorkerId>> {
@@ -1769,10 +1799,17 @@ impl Coordinator {
             }
             // A worker whose window is full with the work of every member
             // takes nothing either, however little of it is this parent's.
+            let capacity_refused = self.refused_for_capacity();
             let closed: Vec<WorkerId> = round
                 .open
                 .iter()
-                .filter(|w| policy::window_closed(w.admission.as_ref(), loads[&w.worker_id]))
+                .filter(|w| {
+                    policy::window_closed(
+                        capacity_refused.contains(&w.worker_id),
+                        w.admission.as_ref(),
+                        loads[&w.worker_id],
+                    )
+                })
                 .map(|w| w.worker_id.clone())
                 .collect();
             for worker_id in &closed {

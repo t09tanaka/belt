@@ -119,6 +119,7 @@ impl Coordinator {
         // the input of the run, and the workers it would not ask.
         let open = Mutex::new(Vec::new());
         let not_asked = Mutex::new(Vec::new());
+        let capacity_refused = self.refused_for_capacity();
         let looks: Vec<LookFuture<'_>> = workers
             .into_iter()
             .map(|(worker_id, link)| {
@@ -128,6 +129,7 @@ impl Coordinator {
                 let query = &query;
                 let loads = &loads;
                 let refused = &refused;
+                let capacity_refused = &capacity_refused;
                 let input = input.as_ref();
                 let spec = spec.as_ref();
                 let parent_local = &parent_local;
@@ -220,6 +222,11 @@ impl Coordinator {
                         unmet.push("forecast_command_v1 unavailable".into());
                     }
                     let load = loads[&worker_id];
+                    // As the next placement would see it: a worker that
+                    // refused for capacity is out until it answers room,
+                    // and this answer is what the placement would read.
+                    let window_refused = capacity_refused.contains(&worker_id)
+                        && !policy::answers_room(inspect.admission.as_ref());
                     let limits = self.cfg.limits.stricter(Limits {
                         max_active_task: inspect.max_active_task,
                         prefetch_per_worker: inspect.prefetch_per_worker,
@@ -263,7 +270,7 @@ impl Coordinator {
                         if !policy::has_room(load, limits) {
                             return Err(Some(out(worker_id, Exclusion::Full, unmet)));
                         }
-                        if policy::window_closed(inspect.admission.as_ref(), load) {
+                        if policy::window_closed(window_refused, inspect.admission.as_ref(), load) {
                             return Err(Some(out(worker_id, Exclusion::Capacity, unmet)));
                         }
                         let measured_cold =
@@ -297,7 +304,11 @@ impl Coordinator {
                     }
                     let why = if !policy::has_room(load, limits) {
                         Some(Exclusion::Full)
-                    } else if policy::window_closed(inspect.admission.as_ref(), load) {
+                    } else if policy::window_closed(
+                        window_refused,
+                        inspect.admission.as_ref(),
+                        load,
+                    ) {
                         Some(Exclusion::Capacity)
                     } else if !unmet.is_empty() {
                         Some(Exclusion::CapabilityMismatch)

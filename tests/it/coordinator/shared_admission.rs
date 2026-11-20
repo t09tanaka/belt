@@ -444,6 +444,75 @@ async fn a_cancel_recorded_before_the_refusal_settles_the_attempt_cancelled() {
     assert_eq!(attempts(&c, &task).len(), 1);
 }
 
+/// A worker that refused for capacity is left out until its `inspect`
+/// answers room, also when this member's own count says there is room (the
+/// worker holds an attempt of this member that the member no longer
+/// counts): the worker is the one that knows. One generation is closed,
+/// and no further submit goes out tick after tick.
+#[tokio::test]
+async fn a52_a_worker_that_refused_for_capacity_gets_nothing_until_it_answers_room() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, 1).await;
+    c.tick().await.unwrap();
+    let first = only(&c, &tasks[0]);
+    // The attempt ends for the member, and the worker still holds another
+    // attempt of it that the member does not count.
+    let stray = AttemptId::generate();
+    a.set(|s| {
+        let mut left = s.held[&first.attempt_id].clone();
+        left.payload.task_id = TaskId::generate();
+        s.held.insert(stray.clone(), left);
+        let h = s.held.get_mut(&first.attempt_id).unwrap();
+        h.state = AttemptState::Terminal;
+        h.termination = Some(ended(Outcome::Succeeded));
+    });
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.settled, vec![first.attempt_id.clone()]);
+    assert_eq!(a.received(Op::Submit), 1);
+    // By the member's count the worker is free and nobody else is there, so
+    // the next task is placed: refused, sent once, closed.
+    let task = enqueue(&c, 1).await.remove(0);
+    let report = c.tick().await.unwrap();
+    let refused = only(&c, &task);
+    assert_eq!(report.retired, vec![refused.attempt_id.clone()]);
+    assert_eq!(a.received(Op::Submit), 2);
+    assert_eq!(
+        noted(&c, &refused.attempt_id, EVENT_SUBMIT_REFUSED_CAPACITY).len(),
+        1
+    );
+    // From here on nothing is placed or sent there, however often it is
+    // looked at, and an estimate says the same and changes nothing.
+    for _ in 0..5 {
+        let report = c.tick().await.unwrap();
+        assert!(report.placed.is_empty() && report.retired.is_empty());
+        let preview = c.estimate_task(task.clone()).await.unwrap();
+        assert_eq!(
+            excluded(&preview.decision.unwrap()),
+            [("w-a", Exclusion::Capacity)]
+        );
+    }
+    assert_eq!(a.received(Op::Submit), 2);
+    assert_eq!(attempts(&c, &task).len(), 1);
+    assert_eq!(queued(&c), vec![task.clone()]);
+    let waiting = events(&c, EVENT_TASK_WAITING);
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0]["blocked_reason"], "capacity");
+    // The worker answers room: it is a candidate again, and the task goes
+    // there as its next generation.
+    a.set(|s| {
+        s.held.remove(&stray);
+    });
+    let report = c.tick().await.unwrap();
+    let all = attempts(&c, &task);
+    assert_eq!(all.len(), 2);
+    assert_eq!(report.placed, vec![all[1].attempt_id.clone()]);
+    assert_eq!(all[1].generation, Generation(2));
+    assert!(a.holds().contains(&all[1].attempt_id));
+    assert_eq!(a.received(Op::Submit), 3);
+}
+
 // ------------------------------------------- two members, one real worker
 
 /// A member's own connection to a real agent, under its own name.
