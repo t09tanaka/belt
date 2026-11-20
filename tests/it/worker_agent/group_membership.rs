@@ -454,6 +454,94 @@ async fn a_member_reaches_its_own_attempts_and_another_members_are_not_found() {
     );
 }
 
+/// An attempt id is held by one member per worker (the attempt's directory,
+/// its supervisor and its commands are named by the id alone). A second
+/// member that submits the same id is refused with `OVERLOADED` and the
+/// reason `attempt_id_in_use`: nothing of it is stored, and neither that
+/// submit nor the retire that follows it touches the first member's attempt,
+/// its directory or its running command.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_attempt_id_another_member_holds_is_refused_without_touching_that_attempt() {
+    let f = fx();
+    let agent = f.start("boot-1");
+    let (main, sub) = (member("main"), member("sub"));
+    let a = dial(&f, &agent, &main).await.unwrap().client;
+    let b = dial(&f, &agent, &sub).await.unwrap().client;
+    let (script, started, release) = until_released(&f, "held");
+    let x = AttemptId::generate();
+    let first = payload(&script);
+    call(&a, request_of(&main, &x, &first)).await.unwrap();
+    wait_for("the command to start", || started.exists());
+    let dir = agent.config().attempts_root().join(x.as_str());
+    let spec = std::fs::read(dir.join("supervise.json")).unwrap();
+    let held = f.store().get(&x).unwrap().unwrap();
+
+    // The same id from the other member, with its own payload and a newer
+    // epoch of its own.
+    let mut newer = member("sub");
+    newer.coordinator = sub.coordinator.clone();
+    newer.epoch = sub.epoch + 5;
+    let second = payload("exit 0");
+    for _ in 0..2 {
+        let e = call(&b, request_of(&newer, &x, &second)).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::Overloaded);
+        assert_eq!(
+            e.overloaded_reason,
+            Some(belt::error::OverloadedReason::AttemptIdInUse)
+        );
+        assert!(
+            !e.message.contains(held.run_id.as_str()),
+            "nothing of the other member's attempt is shown"
+        );
+    }
+    // Nothing was stored for it: no attempt, and not the epoch it carried.
+    assert_eq!(code_of(&b, get_req(&x)).await, ErrorCode::NotFound);
+    assert!(listed(&b, None, true).await.is_empty());
+    let again = dial(&f, &agent, &sub).await.unwrap();
+    assert_eq!(
+        again.worker.coordinator_epoch,
+        CoordinatorEpoch(0),
+        "the refused submit left its epoch"
+    );
+    // It takes the attempt off the worker: only a tombstone of its own.
+    let mut retire = retire_req(&x);
+    if let Request::RetireAttempt(r) = &mut retire {
+        r.coordinator_epoch = CoordinatorEpoch(sub.epoch);
+    }
+    let Response::RetireAttempt(retired) = call(&b, retire).await.unwrap() else {
+        panic!()
+    };
+    assert!(retired.tombstone);
+    assert_eq!(retired.status, RetireStatus::NotStarted);
+    assert_eq!(
+        code_of(&b, request_of(&sub, &x, &second)).await,
+        ErrorCode::Retired
+    );
+    // The first member's attempt: the same row, the same files, and the
+    // command still runs.
+    let now = f.store().get(&x).unwrap().unwrap();
+    assert_eq!(now.coordinator_id, main.coordinator);
+    assert_eq!(now.payload_hash, held.payload_hash);
+    assert!(!now.retired && now.cancel_requested_at_ms.is_none());
+    assert_ne!(now.state, AttemptState::Terminal);
+    assert_eq!(std::fs::read(dir.join("supervise.json")).unwrap(), spec);
+    assert!(!status_of(&a, &x).await.retired);
+    // The second member goes on under a new attempt id.
+    let y = AttemptId::generate();
+    call(&b, request_of(&sub, &y, &second)).await.unwrap();
+    wait_for("the second member's attempt to end", || {
+        f.store().get(&y).unwrap().unwrap().state == AttemptState::Terminal
+    });
+    std::fs::write(&release, "").unwrap();
+    wait_for("the first member's attempt to end", || {
+        f.store().get(&x).unwrap().unwrap().state == AttemptState::Terminal
+    });
+    assert_eq!(
+        status_of(&a, &x).await.termination.unwrap().outcome(),
+        Outcome::Succeeded
+    );
+}
+
 fn retired_req(m: &Member, worker: &WorkerId, boot: &str) -> Request {
     Request::IdentityRetired(IdentityRetiredRequest {
         schema_version: SchemaVersion::CURRENT,

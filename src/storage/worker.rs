@@ -213,10 +213,14 @@ fn require(conn: &Connection, owner: &str, attempt_id: &str) -> Result<AcceptedA
 /// Run `body` for a request that carries a coordinator epoch, in one
 /// transaction. The epoch is checked first (an older one is `StaleEpoch` and
 /// nothing is written) and a newer one is remembered. That remembering is
-/// committed even when `body` fails with a verdict (conflict, retired, not
-/// renewable, ...): the worker has seen the newer coordinator and must refuse
-/// the older one from then on. `body`'s own writes are rolled back on failure
-/// (a savepoint), so a failed request leaves nothing but the epoch.
+/// committed even when `body` fails with a verdict about the attempt
+/// (conflict, retired, not renewable, ...): the worker has seen the newer
+/// coordinator and must refuse the older one from then on. `body`'s own
+/// writes are rolled back on failure (a savepoint), so such a request leaves
+/// nothing but the epoch. A refusal that says "nothing was done"
+/// ([`StorageError::leaves_nothing`]: a limit, an attempt id in use, a live
+/// attempt of the task, invalid input) leaves not even that: the epoch and
+/// the tombstones a newer epoch purges are as they were before the request.
 fn under_epoch<T, F>(
     db: &Db,
     scope: &Option<String>,
@@ -231,15 +235,20 @@ where
     let (scope, attempt_id) = (scope.clone(), attempt_id.to_string());
     db.write_then(move |tx| {
         let owner = owner_in(tx, &scope, Some(&attempt_id))?;
+        tx.execute_batch("SAVEPOINT request")?;
         observe_epoch(tx, &owner, epoch)?;
         tx.execute_batch("SAVEPOINT body")?;
         match body(tx, &owner) {
             Ok(v) => {
-                tx.execute_batch("RELEASE body")?;
+                tx.execute_batch("RELEASE body; RELEASE request")?;
                 Ok(Ok(v))
             }
             Err(e) => {
                 tx.execute_batch("ROLLBACK TO body; RELEASE body")?;
+                if e.leaves_nothing() {
+                    tx.execute_batch("ROLLBACK TO request")?;
+                }
+                tx.execute_batch("RELEASE request")?;
                 Ok(Err(e))
             }
         }
@@ -742,8 +751,10 @@ impl WorkerStore {
                         // The attempt's files, its supervisor and its commands
                         // are named by the attempt id alone, so an id another
                         // member's attempt holds here is not accepted a second
-                        // time. Nothing of that attempt is shown: the answer is
-                        // the same whatever its state.
+                        // time (spec 24.4). Nothing of that attempt is shown:
+                        // the answer is the same whatever its state. Nothing
+                        // is stored either, and the task is not at fault: the
+                        // member places it again under a new attempt id.
                         let held: Option<i64> = tx
                         .query_row(
                             "SELECT 1 FROM worker_attempt WHERE attempt_id = ?1 AND coordinator_id <> ?2",
@@ -752,9 +763,7 @@ impl WorkerStore {
                         )
                         .optional()?;
                         if held.is_some() {
-                            return Err(StorageError::Invalid(format!(
-                                "attempt id {aid} cannot be used on this worker"
-                            )));
+                            return Err(StorageError::AttemptIdInUse(new.attempt_id));
                         }
                         let task = new.task_id.to_string();
                         let live: Option<String> = tx

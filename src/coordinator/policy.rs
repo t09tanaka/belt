@@ -139,6 +139,11 @@ pub enum Refusal {
     /// The worker will never take this attempt: retire it there, then fail
     /// it here.
     Never,
+    /// The worker cannot take the attempt under this attempt id (an attempt
+    /// of another member holds it there) and stored nothing. The task is not
+    /// at fault: the attempt is taken off the worker and the task is placed
+    /// again, under a new attempt id.
+    Replace,
 }
 
 /// Read the error a worker answered a submit with.
@@ -148,13 +153,16 @@ pub enum Refusal {
 /// (`payload_mismatch` says so by its typed reason). Every other code, a
 /// fault of the worker, a conflict with something else it holds, a code
 /// this version does not know, is no verdict on the attempt and never fails
-/// the task.
-pub fn submit_refusal(code: ErrorCode, payload_mismatch: bool) -> Refusal {
+/// the task. `OVERLOADED` with the reason `attempt_id_in_use`
+/// (`attempt_id_in_use` says so by its typed reason) is about the attempt id
+/// only: the task goes on under another one.
+pub fn submit_refusal(code: ErrorCode, payload_mismatch: bool, attempt_id_in_use: bool) -> Refusal {
     match code {
         ErrorCode::Retired => Refusal::Tombstoned,
         ErrorCode::StaleEpoch => Refusal::Fenced,
         ErrorCode::InvalidInput => Refusal::Never,
         ErrorCode::Conflict if payload_mismatch => Refusal::Never,
+        ErrorCode::Overloaded if attempt_id_in_use => Refusal::Replace,
         _ => Refusal::Later,
     }
 }
@@ -664,15 +672,20 @@ mod tests {
     #[test]
     fn only_an_answer_about_the_attempt_itself_refuses_a_submit_for_good() {
         for code in ErrorCode::ALL {
-            for mismatch in [false, true] {
-                let want = match (code, mismatch) {
-                    (ErrorCode::Retired, _) => Refusal::Tombstoned,
-                    (ErrorCode::StaleEpoch, _) => Refusal::Fenced,
-                    (ErrorCode::InvalidInput, _) => Refusal::Never,
-                    (ErrorCode::Conflict, true) => Refusal::Never,
+            for (mismatch, in_use) in [(false, false), (true, false), (false, true), (true, true)] {
+                let want = match (code, mismatch, in_use) {
+                    (ErrorCode::Retired, _, _) => Refusal::Tombstoned,
+                    (ErrorCode::StaleEpoch, _, _) => Refusal::Fenced,
+                    (ErrorCode::InvalidInput, _, _) => Refusal::Never,
+                    (ErrorCode::Conflict, true, _) => Refusal::Never,
+                    (ErrorCode::Overloaded, _, true) => Refusal::Replace,
                     _ => Refusal::Later,
                 };
-                assert_eq!(submit_refusal(code, mismatch), want, "{code:?} {mismatch}");
+                assert_eq!(
+                    submit_refusal(code, mismatch, in_use),
+                    want,
+                    "{code:?} {mismatch} {in_use}"
+                );
             }
         }
         // A fault of the worker, or a conflict with something else it holds
@@ -688,10 +701,34 @@ mod tests {
             ErrorCode::Overloaded,
             ErrorCode::Conflict,
         ] {
-            assert_eq!(submit_refusal(code, false), Refusal::Later, "{code:?}");
+            assert_eq!(
+                submit_refusal(code, false, false),
+                Refusal::Later,
+                "{code:?}"
+            );
         }
-        assert_eq!(submit_refusal(ErrorCode::Conflict, true), Refusal::Never);
-        assert_eq!(submit_refusal(ErrorCode::Internal, true), Refusal::Later);
+        assert_eq!(
+            submit_refusal(ErrorCode::Conflict, true, false),
+            Refusal::Never
+        );
+        assert_eq!(
+            submit_refusal(ErrorCode::Internal, true, false),
+            Refusal::Later
+        );
+        // The reason belongs to `OVERLOADED`: under another code it says
+        // nothing, and a plain `OVERLOADED` is sent again as before.
+        assert_eq!(
+            submit_refusal(ErrorCode::Overloaded, false, true),
+            Refusal::Replace
+        );
+        assert_eq!(
+            submit_refusal(ErrorCode::Overloaded, false, false),
+            Refusal::Later
+        );
+        assert_eq!(
+            submit_refusal(ErrorCode::Conflict, false, true),
+            Refusal::Later
+        );
     }
 
     #[test]

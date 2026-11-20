@@ -411,8 +411,8 @@ fn tombstones_and_task_ids_are_per_member_and_an_accepted_attempt_id_is_held_by_
         t2.b.submit(acceptance(&p, &TaskId::generate(), 'c', 1), 2)
             .err()
             .unwrap();
-    assert!(matches!(&e, StorageError::Invalid(_)), "{e:?}");
-    assert_eq!(e.code(), ErrorCode::InvalidInput);
+    assert!(matches!(&e, StorageError::AttemptIdInUse(_)), "{e:?}");
+    assert_eq!(e.code(), ErrorCode::Overloaded);
     assert!(t2.b.get(&p).unwrap().is_none());
     assert_eq!(t2.a.get(&p).unwrap().unwrap().payload_hash, hash('a'));
 }
@@ -681,7 +681,12 @@ fn the_directories_of_dropped_attempts_are_removed_and_nothing_else() {
     store
         .for_member(&CoordinatorId::generate())
         .submit(
-            acceptance(&AttemptId::parse(held).unwrap(), &TaskId::generate(), 'a', 1),
+            acceptance(
+                &AttemptId::parse(held).unwrap(),
+                &TaskId::generate(),
+                'a',
+                1,
+            ),
             11,
         )
         .unwrap();
@@ -724,4 +729,159 @@ fn the_directories_of_dropped_attempts_are_removed_and_nothing_else() {
         DroppedReport::default()
     );
     assert!(root.join(untouched).join("supervise.json").exists());
+}
+
+/// The attempt's files, its supervisor and its commands are named by the
+/// attempt id alone, so one worker holds an attempt id for one member at a
+/// time. The second member is told so with a refusal that stores nothing
+/// (not a verdict on its task), and nothing it does about that id reaches
+/// the first member's attempt.
+#[test]
+fn an_attempt_id_another_member_holds_is_refused_and_nothing_is_stored() {
+    let t = two();
+    let (x, task) = (AttemptId::generate(), TaskId::generate());
+    t.a.submit(acceptance(&x, &task, 'a', 1), 1).unwrap();
+    t.b.cancel(&AttemptId::generate(), CoordinatorEpoch(2), 2)
+        .unwrap();
+    let before = t.a.get(&x).unwrap().unwrap();
+    let rows = |q: &'static str| {
+        t.own
+            .db
+            .call(move |c| Ok(c.query_row(q, [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    let (attempts, tombstones, events) = (
+        rows("SELECT count(*) FROM worker_attempt"),
+        rows("SELECT count(*) FROM tombstone"),
+        rows("SELECT count(*) FROM event"),
+    );
+    // The same id, whatever else the submit says, and under a newer epoch.
+    for (task_b, payload) in [(task.clone(), 'a'), (TaskId::generate(), 'b')] {
+        let e =
+            t.b.submit(acceptance(&x, &task_b, payload, 7), 3)
+                .err()
+                .unwrap();
+        assert!(
+            matches!(&e, StorageError::AttemptIdInUse(id) if id == &x),
+            "{e:?}"
+        );
+        assert_eq!(e.code(), ErrorCode::Overloaded);
+        assert!(e.leaves_nothing() && !e.is_retryable());
+    }
+    assert_eq!(rows("SELECT count(*) FROM worker_attempt"), attempts);
+    assert_eq!(rows("SELECT count(*) FROM tombstone"), tombstones);
+    assert_eq!(rows("SELECT count(*) FROM event"), events);
+    assert!(t.b.get(&x).unwrap().is_none());
+    // Not even the epoch the refused submit carried, and what a newer epoch
+    // purges is still there.
+    assert_eq!(t.b.max_coordinator_epoch().unwrap(), CoordinatorEpoch(2));
+    assert_eq!(t.b.count_undelivered_tombstones().unwrap(), 1);
+    // The member takes the attempt off the worker: a tombstone of its own,
+    // which refuses a late copy of its submit. The first member's attempt is
+    // as it was.
+    assert_eq!(t.b.retire(&x, CoordinatorEpoch(2), 4).unwrap(), None);
+    assert_eq!(t.b.tombstone(&x).unwrap().as_deref(), Some("retire"));
+    let e = t.b.submit(acceptance(&x, &task, 'a', 2), 5).err().unwrap();
+    assert!(matches!(e, StorageError::Retired(_)), "{e:?}");
+    assert_eq!(t.a.get(&x).unwrap().unwrap(), before);
+    assert!(t.a.tombstone(&x).unwrap().is_none());
+    // And goes on under a new attempt id, for the same task.
+    let y = AttemptId::generate();
+    assert!(matches!(
+        t.b.submit(acceptance(&y, &task, 'a', 2), 6).unwrap(),
+        SubmitOutcome::Accepted(_)
+    ));
+    // The first member's own resend still finds its attempt.
+    assert!(matches!(
+        t.a.submit(
+            NewAcceptance {
+                run_id: before.run_id.clone(),
+                ..acceptance(&x, &task, 'a', 1)
+            },
+            7
+        )
+        .unwrap(),
+        SubmitOutcome::Existing(_)
+    ));
+}
+
+/// A refusal that says "nothing was done" leaves nothing: not the newer
+/// epoch it carried, and the tombstones that epoch would have purged stay.
+/// A verdict about the attempt keeps the epoch, as before.
+#[test]
+fn a_refused_request_leaves_the_epoch_and_the_tombstones_as_they_were() {
+    let t = two();
+    let (live, task, never) = (
+        AttemptId::generate(),
+        TaskId::generate(),
+        AttemptId::generate(),
+    );
+    t.a.submit(acceptance(&live, &task, 'a', 1), 1).unwrap();
+    t.a.cancel(&never, CoordinatorEpoch(1), 2).unwrap();
+    let state = || {
+        (
+            t.a.max_coordinator_epoch().unwrap(),
+            t.a.count_undelivered_tombstones().unwrap(),
+            t.a.tombstone(&never).unwrap(),
+        )
+    };
+    let before = state();
+    assert_eq!(before.0, CoordinatorEpoch(1));
+    // Another attempt of the task while one is live, under a newer epoch.
+    let e =
+        t.a.submit(acceptance(&AttemptId::generate(), &task, 'a', 4), 3)
+            .err()
+            .unwrap();
+    assert!(matches!(e, StorageError::LiveAttemptExists(_)), "{e:?}");
+    assert_eq!(state(), before);
+    // So the epoch in between is not stale. Another payload for the live
+    // attempt is a verdict: its epoch is kept, and the purge with it.
+    let e =
+        t.a.submit(acceptance(&live, &task, 'b', 2), 4)
+            .err()
+            .unwrap();
+    assert!(matches!(e, StorageError::PayloadConflict(_)), "{e:?}");
+    assert_eq!(t.a.max_coordinator_epoch().unwrap(), CoordinatorEpoch(2));
+    assert!(t.a.tombstone(&never).unwrap().is_none());
+    let e = t.a.cancel(&live, CoordinatorEpoch(1), 5).err().unwrap();
+    assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
+}
+
+/// The tombstone limit refuses without a trace as well, and a newer epoch
+/// makes room before the limit is looked at.
+#[test]
+fn the_tombstone_limit_leaves_nothing_and_a_newer_epoch_makes_room_first() {
+    let t = two();
+    let member = t.a.member().unwrap().to_string();
+    t.own
+        .db
+        .write(move |tx| {
+            tx.execute(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?2)
+                 INSERT INTO tombstone (coordinator_id, attempt_id, kind, coordinator_epoch, recorded_at_ms)
+                 SELECT ?1, 'att_' || i, 'cancel', 3, 1 FROM n",
+                rusqlite::params![member, MAX_UNDELIVERED_TOMBSTONES as i64],
+            )?;
+            tx.execute(
+                "INSERT INTO member_epoch (coordinator_id, max_epoch) VALUES (?1, 2)",
+                [&member],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    // The tombstones are of epoch 3, so epoch 3 purges none of them: the
+    // request is refused, and the epoch it carried is not kept.
+    let over = AttemptId::generate();
+    let e = t.a.retire(&over, CoordinatorEpoch(3), 2).err().unwrap();
+    assert!(matches!(e, StorageError::Overloaded(_)), "{e:?}");
+    assert!(e.leaves_nothing());
+    assert_eq!(t.a.max_coordinator_epoch().unwrap(), CoordinatorEpoch(2));
+    assert_eq!(
+        t.a.count_undelivered_tombstones().unwrap(),
+        MAX_UNDELIVERED_TOMBSTONES
+    );
+    // Epoch 4 purges them and is then served.
+    assert_eq!(t.a.retire(&over, CoordinatorEpoch(4), 3).unwrap(), None);
+    assert_eq!(t.a.count_undelivered_tombstones().unwrap(), 1);
+    assert_eq!(t.a.max_coordinator_epoch().unwrap(), CoordinatorEpoch(4));
 }

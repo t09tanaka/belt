@@ -16,7 +16,7 @@ use super::blob_policy::BlobLimits;
 use super::blobs;
 use super::host::Host;
 use super::policy::{self, AttemptFacts, Recovery, Settle, Step, SupervisorExit};
-use crate::error::{ApiError, ConflictReason, ErrorCode};
+use crate::error::{ApiError, ConflictReason, ErrorCode, OverloadedReason};
 use crate::ids::*;
 use crate::platform;
 use crate::setup::builder::SetupPoll;
@@ -359,6 +359,11 @@ fn api(e: StorageError) -> ApiError {
     if matches!(e, StorageError::PayloadConflict(_)) {
         return ApiError::conflict(ConflictReason::PayloadMismatch, e.to_string());
     }
+    // Nothing was stored, and sending the same attempt again does not help:
+    // the reason tells the member to use a new attempt id.
+    if matches!(e, StorageError::AttemptIdInUse(_)) {
+        return ApiError::overloaded(OverloadedReason::AttemptIdInUse, e.to_string());
+    }
     // A busy database committed nothing: the same request may be sent again.
     let code = if e.is_retryable() {
         ErrorCode::Overloaded
@@ -524,8 +529,13 @@ impl Agent {
                     let dropped = remove_dropped_attempts(&cfg.attempts_root(), s).map_err(api)?;
                     for (attempt, error) in &dropped.failed {
                         let payload = json!({ "attempt": attempt, "error": error });
-                        let _ =
-                            s.append_event(None, None, "agent_dropped_attempt_kept", &payload, now());
+                        let _ = s.append_event(
+                            None,
+                            None,
+                            "agent_dropped_attempt_kept",
+                            &payload,
+                            now(),
+                        );
                     }
                 }
                 Step::Attempts => {

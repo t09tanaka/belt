@@ -2035,15 +2035,22 @@ fn a_failed_request_still_remembers_the_newer_coordinator_epoch() {
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
-    // A live-attempt refusal rolls back its own writes and keeps the epoch.
+    // A live-attempt refusal says "nothing was done": it rolls back its own
+    // writes and the epoch it carried as well (spec 24.4). The epoch a
+    // verdict left before it stands.
     let e = w
         .store
         .submit(acceptance(&AttemptId::generate(), &task, 'a', 7), 4)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::LiveAttemptExists(_)));
+    assert!(e.leaves_nothing());
     assert_eq!(w.store.list_nonterminal().unwrap().len(), 1);
-    let e = w.store.cancel(&a, CoordinatorEpoch(6), 5).err().unwrap();
+    assert_eq!(
+        w.store.max_coordinator_epoch().unwrap(),
+        CoordinatorEpoch(5)
+    );
+    let e = w.store.cancel(&a, CoordinatorEpoch(4), 5).err().unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
     // renew_lease on a retired attempt fails at epoch 9 and still raises it.
     w.store.retire(&a, CoordinatorEpoch(7), 6).unwrap();
