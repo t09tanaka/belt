@@ -5620,3 +5620,47 @@ fn a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for() {
     assert!(said(&r).contains("toolchain installs"), "{}", said(&r));
     assert!(r.target.conditional);
 }
+
+/// The start of the agent removes the directories of the attempts the
+/// rebuild of the worker database dropped (migration step 4), and only
+/// those: a directory that is not listed stays, and a link in the place of
+/// a listed one is unlinked, not followed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_start_removes_the_directories_of_attempts_the_database_rebuild_dropped() {
+    let f = fx();
+    f.start("boot-a").shutdown();
+    let attempts = f.state().join("attempts");
+    let (dropped, linked, kept) = (
+        AttemptId::generate(),
+        AttemptId::generate(),
+        AttemptId::generate(),
+    );
+    let outside = f.path("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"x").unwrap();
+    for a in [&dropped, &kept] {
+        let dir = attempts.join(a.as_str());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("supervise.json"), b"{}").unwrap();
+        std::fs::write(dir.join("workspace.json"), b"{}").unwrap();
+    }
+    std::os::unix::fs::symlink(&outside, attempts.join(linked.as_str())).unwrap();
+    {
+        let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+        for a in [&dropped, &linked] {
+            db.execute(
+                "INSERT INTO dropped_attempt (attempt_id) VALUES (?1)",
+                [a.as_str()],
+            )
+            .unwrap();
+        }
+    }
+    assert_eq!(f.store().dropped_attempts(10).unwrap().len(), 2);
+    let agent = f.start("boot-a");
+    assert!(!attempts.join(dropped.as_str()).exists());
+    assert!(std::fs::symlink_metadata(attempts.join(linked.as_str())).is_err());
+    assert!(outside.join("keep").exists());
+    assert!(attempts.join(kept.as_str()).join("supervise.json").exists());
+    assert!(f.store().dropped_attempts(10).unwrap().is_empty());
+    agent.shutdown();
+}

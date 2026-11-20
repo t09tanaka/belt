@@ -2608,6 +2608,49 @@ async fn in_place_scheduler_uses_only_explicit_parent_local_and_never_automatic_
     assert!(remote.holds().is_empty());
 }
 
+/// An in-place task is not placed again by itself, so the refusal of its
+/// attempt id (held on the worker by another member's attempt) neither
+/// retires nor fails it: the same attempt is sent again until it is taken.
+#[tokio::test]
+async fn an_in_place_task_whose_attempt_id_is_in_use_waits_and_is_neither_moved_nor_failed() {
+    let f = fx();
+    let local = f.worker("z-local", (1, 0));
+    let c = f.open(&[&local]);
+    c.set_parent_local(local.id.clone());
+    local.set(|s| {
+        s.fault = Some(ApiError::overloaded(
+            belt::error::OverloadedReason::AttemptIdInUse,
+            "in use",
+        ))
+    });
+    let task = TaskId::generate();
+    let mut input = spec();
+    input.in_place = true;
+    c.enqueue(RunId::generate(), source(&c), vec![(task.clone(), input)])
+        .await
+        .unwrap();
+    for sent in 1..=4 {
+        let report = c.tick().await.unwrap();
+        assert!(report.settled.is_empty() && report.retired.is_empty());
+        assert_eq!(local.received(Op::Submit), sent);
+    }
+    let first = only(&c, &task);
+    assert_eq!(c.store().retire_tombstone(&first.attempt_id).unwrap(), None);
+    assert_eq!(local.count(Op::Retire), 0);
+    assert_eq!(first.termination, None, "the task did not fail");
+    let why = c
+        .store()
+        .events_of(&first.attempt_id, "submit_deferred")
+        .unwrap();
+    assert_eq!(why.len(), 1);
+    assert_eq!(why[0].payload["code"], "OVERLOADED");
+    // The id is free again: the same attempt is taken.
+    local.set(|s| s.fault = None);
+    c.tick().await.unwrap();
+    assert_eq!(local.holds(), vec![first.attempt_id.clone()]);
+    assert_eq!(attempts(&c, &task).len(), 1);
+}
+
 #[tokio::test]
 async fn capability_filter_runs_before_forecast_and_records_unmet_requirements() {
     use belt::toolchain::capability::*;

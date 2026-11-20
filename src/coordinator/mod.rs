@@ -1142,6 +1142,10 @@ impl Coordinator {
             self.unknown(&a.attempt_id, report).await?;
             return Ok(false);
         };
+        // An in-place task is never placed again by itself (it works on the
+        // user's own directory), so for it an attempt id in use is waited
+        // out like any other `OVERLOADED`: the same attempt is sent again.
+        let replaceable = !request.payload.in_place;
         match link.call(Request::SubmitAttempt(request)).await {
             Ok(Response::SubmitAttempt(r))
                 if r.attempt_id == a.attempt_id && r.generation == a.generation =>
@@ -1160,7 +1164,8 @@ impl Coordinator {
             }
             Err(LinkError::Remote(e)) => {
                 let mismatch = e.conflict_reason == Some(ConflictReason::PayloadMismatch);
-                let in_use = e.overloaded_reason == Some(OverloadedReason::AttemptIdInUse);
+                let in_use =
+                    replaceable && e.overloaded_reason == Some(OverloadedReason::AttemptIdInUse);
                 match policy::submit_refusal(e.code, mismatch, in_use) {
                     Refusal::Fenced => Err(self.fence()),
                     Refusal::Replace => {
