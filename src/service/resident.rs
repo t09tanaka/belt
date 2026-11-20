@@ -477,6 +477,8 @@ pub struct Resident {
     worker_id: WorkerId,
     listener: UnixListener,
     worker_connection: tokio::task::JoinHandle<()>,
+    agent_listener: super::worker::AgentListener,
+    agent_permits: Arc<Semaphore>,
     client: Client,
     heartbeat: Duration,
     collection_interval: Duration,
@@ -655,13 +657,20 @@ impl Drop for Startup {
 async fn connect_local(
     startup: &Startup,
     config: &ResolvedConfig,
+    permits: Arc<Semaphore>,
 ) -> anyhow::Result<(
+    super::worker::AgentListener,
     UnixListener,
     tokio::task::JoinHandle<()>,
     crate::protocol::Client,
     Arc<crate::coordinator::InputGate>,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
+    let agent_listener = super::worker::AgentListener::bind(
+        &parts.agent.config().state_dir,
+        &parts.cluster,
+        &parts.worker_id,
+    )?;
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
     let (parent, worker) = UnixStream::pair()?;
     let worker_agent = parts.agent.clone();
@@ -672,7 +681,7 @@ async fn connect_local(
             worker_agent,
             Io::from_stream(worker),
             server_cluster,
-            Arc::new(Semaphore::new(64)),
+            permits,
         )
         .await;
     });
@@ -728,7 +737,13 @@ async fn connect_local(
         worker_connection.abort();
         anyhow::bail!(e.message);
     }
-    Ok((listener, worker_connection, worker_client, input_gate))
+    Ok((
+        agent_listener,
+        listener,
+        worker_connection,
+        worker_client,
+        input_gate,
+    ))
 }
 
 impl Resident {
@@ -770,14 +785,18 @@ impl Resident {
                 .map(|parts| Startup { parts: Some(parts) })
         })
         .await??;
-        let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection, worker_client, input_gate) = match connected {
-            Ok(value) => value,
-            Err(e) => {
-                tokio::task::spawn_blocking(move || startup.cleanup()).await?;
-                return Err(e);
-            }
-        };
+        let agent_permits = Arc::new(Semaphore::new(
+            crate::worker::serve::MAX_CONCURRENT_REQUESTS,
+        ));
+        let connected = connect_local(&startup, config, agent_permits.clone()).await;
+        let (agent_listener, listener, worker_connection, worker_client, input_gate) =
+            match connected {
+                Ok(value) => value,
+                Err(e) => {
+                    tokio::task::spawn_blocking(move || startup.cleanup()).await?;
+                    return Err(e);
+                }
+            };
         let parts = startup.parts.take().expect("prepared startup");
 
         Ok(Self {
@@ -794,6 +813,8 @@ impl Resident {
             worker_id: parts.worker_id,
             listener,
             worker_connection,
+            agent_listener,
+            agent_permits,
             client: Client {
                 socket: parts.socket,
                 cluster_id: parts.cluster,
@@ -820,6 +841,7 @@ impl Resident {
         let mut loops = JoinSet::new();
         // Connection failures stay inside each owner and never terminate the resident.
         let mut remotes = JoinSet::new();
+        let mut agent_connections = JoinSet::new();
         let mut dialed = BTreeSet::new();
         for worker in self.remote_config.workers.clone() {
             dialed.insert(worker.id.clone());
@@ -966,6 +988,10 @@ impl Resident {
                     let _ = answer.send(reply);
                 },
                 ended = requests.join_next(), if !requests.is_empty() => { if let Some(Err(e)) = ended { failure = Some(anyhow::Error::from(e)); break; } },
+                Some(_) = agent_connections.join_next(), if !agent_connections.is_empty() => {},
+                incoming = self.agent_listener.accept(self.agent.clone(), self.client.cluster_id.clone(), self.agent_permits.clone()) => {
+                    match incoming { Ok(connection) => { agent_connections.spawn(connection); }, Err(e) => { failure = Some(e.into()); break; } }
+                },
                 conn = self.listener.accept() => {
                     let (stream, _) = match conn { Ok(c) => c, Err(e) => { failure = Some(e.into()); break; } };
                     if stream.peer_cred().map(|peer| peer.uid()).ok() != Some(uid()) { continue; }
@@ -986,6 +1012,8 @@ impl Resident {
                 }
             }
         }
+        agent_connections.abort_all();
+        while agent_connections.join_next().await.is_some() {}
         *admission.lock().await = true;
         let _ = stop.send(true);
         while let Some(result) = requests.join_next().await {
@@ -1014,9 +1042,15 @@ impl Resident {
         let _ = tokio::task::spawn_blocking(move || costs.drain()).await;
         // No cancellation or terminal write: supervisors keep running, and a
         // restarted owner adopts the same durable attempts.
+        self.worker_connection.abort();
+        // Both transports use the same request permits. Blocking requests must
+        // finish before the shared agent releases its ownership lock.
+        let _drained = self
+            .agent_permits
+            .acquire_many(crate::worker::serve::MAX_CONCURRENT_REQUESTS as u32)
+            .await?;
         let agent = self.agent.clone();
         tokio::task::spawn_blocking(move || agent.shutdown()).await?;
-        self.worker_connection.abort();
         match failure {
             // Another loop may meet the missing files before the heartbeat
             // does; without the directory that is the same clean exit.

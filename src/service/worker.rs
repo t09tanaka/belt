@@ -198,7 +198,12 @@ struct SocketReceipt {
     ino: u64,
 }
 
-fn reconcile_socket(spec: &WorkerSpec, socket: &Path) -> anyhow::Result<()> {
+fn reconcile_socket(
+    state: &Path,
+    cluster: &ClusterId,
+    worker: &WorkerId,
+    socket: &Path,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::FileTypeExt;
     let meta = match std::fs::symlink_metadata(socket) {
         Ok(meta) => meta,
@@ -206,7 +211,7 @@ fn reconcile_socket(spec: &WorkerSpec, socket: &Path) -> anyhow::Result<()> {
         Err(e) => return Err(e.into()),
     };
     let mut bytes = Vec::new();
-    resident::secure_file(&spec.state_dir.join("worker-socket.json"), false)?
+    resident::secure_file(&state.join("worker-socket.json"), false)?
         .take(4097)
         .read_to_end(&mut bytes)?;
     anyhow::ensure!(bytes.len() <= 4096, "socket receipt too large");
@@ -217,8 +222,8 @@ fn reconcile_socket(spec: &WorkerSpec, socket: &Path) -> anyhow::Result<()> {
             && meta.mode() & 0o077 == 0
             && meta.dev() == receipt.dev
             && meta.ino() == receipt.ino
-            && receipt.cluster == spec.expected_cluster
-            && receipt.worker == spec.worker_id,
+            && receipt.cluster == *cluster
+            && receipt.worker == *worker,
         "foreign worker socket ownership"
     );
     match std::os::unix::net::UnixStream::connect(socket) {
@@ -232,39 +237,39 @@ fn reconcile_socket(spec: &WorkerSpec, socket: &Path) -> anyhow::Result<()> {
         "worker socket changed during reconciliation"
     );
     std::fs::remove_file(socket)?;
-    File::open(&spec.state_dir)?.sync_all()?;
+    File::open(state)?.sync_all()?;
     Ok(())
 }
 
 fn publish_socket(
-    spec: &WorkerSpec,
+    state: &Path,
+    cluster: &ClusterId,
+    worker: &WorkerId,
     socket: &Path,
 ) -> anyhow::Result<(tokio::net::UnixListener, OwnedSocket)> {
     // A crash before the durable receipt never leaves an unreceipted canonical
     // socket. Abandoned unpublished staging directories are left for reconciliation.
-    let stage = tempfile::Builder::new()
-        .prefix(".s")
-        .tempdir_in(&spec.state_dir)?;
+    let stage = tempfile::Builder::new().prefix(".s").tempdir_in(state)?;
     std::fs::set_permissions(stage.path(), std::fs::Permissions::from_mode(0o700))?;
     // .sXXXXXX/s is no longer than agent.sock on Unix socket paths.
     let staged = stage.path().join("s");
     let listener = crate::protocol::transport::listen_unix(&staged)?;
     let meta = std::fs::symlink_metadata(&staged)?;
     let receipt = SocketReceipt {
-        cluster: spec.expected_cluster.clone(),
-        worker: spec.worker_id.clone(),
+        cluster: cluster.clone(),
+        worker: worker.clone(),
         dev: meta.dev(),
         ino: meta.ino(),
     };
-    let receipt_path = spec.state_dir.join("worker-socket.json");
+    let receipt_path = state.join("worker-socket.json");
     if receipt_path.try_exists()? {
         resident::secure_file(&receipt_path, false)?;
     }
-    let mut temporary = tempfile::NamedTempFile::new_in(&spec.state_dir)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(state)?;
     temporary.write_all(&serde_json::to_vec(&receipt)?)?;
     temporary.as_file().sync_all()?;
     temporary.persist(&receipt_path)?;
-    File::open(&spec.state_dir)?.sync_all()?;
+    File::open(state)?.sync_all()?;
     anyhow::ensure!(
         std::fs::symlink_metadata(socket).is_err(),
         "worker socket appeared during publication"
@@ -275,7 +280,7 @@ fn publish_socket(
         dev: meta.dev(),
         ino: meta.ino(),
     };
-    File::open(&spec.state_dir)?.sync_all()?;
+    File::open(state)?.sync_all()?;
     Ok((listener, owned))
 }
 
@@ -291,6 +296,46 @@ impl Drop for OwnedSocket {
                 let _ = std::fs::remove_file(&self.path);
             }
         }
+    }
+}
+
+/// Shared by worker-only services and combined residents. The caller holds the
+/// agent ownership lock before reconciling or publishing the socket.
+pub(crate) struct AgentListener {
+    listener: tokio::net::UnixListener,
+    _socket: OwnedSocket,
+}
+impl AgentListener {
+    pub(crate) fn bind(
+        state: &Path,
+        cluster: &ClusterId,
+        worker: &WorkerId,
+    ) -> anyhow::Result<Self> {
+        let socket = state.join("agent.sock");
+        reconcile_socket(state, cluster, worker, &socket)?;
+        let (listener, owned) = publish_socket(state, cluster, worker, &socket)?;
+        Ok(Self {
+            listener,
+            _socket: owned,
+        })
+    }
+    pub(crate) async fn accept(
+        &self,
+        agent: Arc<Agent>,
+        cluster: ClusterId,
+        permits: Arc<Semaphore>,
+    ) -> std::io::Result<impl std::future::Future<Output = anyhow::Result<()>>> {
+        let (stream, _) = self.listener.accept().await?;
+        Ok(async move {
+            serve::serve_connection(
+                agent,
+                crate::protocol::Io::from_stream(stream),
+                cluster,
+                permits,
+            )
+            .await
+            .map_err(Into::into)
+        })
     }
 }
 
@@ -319,7 +364,12 @@ async fn run(
     let socket = spec.state_dir.join("agent.sock");
     // Enrollment is checked before any recorded old listener can be removed.
     bind(&spec)?;
-    reconcile_socket(&spec, &socket)?;
+    reconcile_socket(
+        &spec.state_dir,
+        &spec.expected_cluster,
+        &spec.worker_id,
+        &socket,
+    )?;
     let os_boot = crate::platform::boot_id()
         .ok_or_else(|| anyhow::anyhow!("OS boot identity unavailable"))?;
     let settings = config.runtime_settings()?;
@@ -348,7 +398,7 @@ async fn run(
     // Install handlers before publication/background tasks so readiness also
     // implies the foreground role can receive its service stop signal.
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let (listener, _socket) = publish_socket(&spec, &socket)?;
+    let listener = AgentListener::bind(&spec.state_dir, &spec.expected_cluster, &spec.worker_id)?;
     let permits = Arc::new(Semaphore::new(serve::MAX_CONCURRENT_REQUESTS));
     let mut connections = tokio::task::JoinSet::new();
     let (stop, mut stopped) = tokio::sync::watch::channel(false);
@@ -400,12 +450,8 @@ async fn run(
                 }
             },
             Some(_) = connections.join_next(), if !connections.is_empty() => {},
-            incoming = listener.accept() => match incoming {
-                Ok((stream, _)) => {
-                    let agent = worker.agent.clone(); let cluster = spec.expected_cluster.clone(); let permits = permits.clone();
-                    connections.spawn(async move { serve::serve_connection(agent, crate::protocol::Io::from_stream(stream), cluster, permits).await });
-                },
-                Err(e) => break Err(e.into()),
+            incoming = listener.accept(worker.agent.clone(), spec.expected_cluster.clone(), permits.clone()) => {
+                match incoming { Ok(connection) => { connections.spawn(connection); }, Err(e) => break Err(e.into()) }
             }
         }
     };

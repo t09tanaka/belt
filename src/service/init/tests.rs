@@ -239,7 +239,7 @@ fn home_is_checked_only_through_the_paths_made_from_it() {
     ]))
     .unwrap();
     assert_eq!(paths.state, state.join("belt/coordinator"));
-    assert_eq!(paths.worker, state.join("belt/local-worker"));
+    assert_eq!(paths.worker, home.join(".belt"));
     assert!(paths.config.starts_with(&config));
     assert_eq!(paths.services, home.join("Library/LaunchAgents"));
     // XDG_* paths are held to the same rule on their own components.
@@ -738,4 +738,35 @@ async fn a_launchd_journal_does_not_say_systemd_and_reads_as_before() {
         "{error}"
     );
     assert!(!p.config.parent().unwrap().join("systemd").exists());
+}
+
+#[tokio::test]
+async fn managed_journal_rejects_a_second_worker_path_even_when_input_agrees() {
+    let (_root, context) = fixture();
+    let paths = Paths::resolve(&context.env).unwrap();
+    assert!(initialize(context, &mut Unknown).await.is_err());
+    let mut journal: Journal = serde_json::from_slice(&fs::read(&paths.journal).unwrap()).unwrap();
+    journal.spec.worker_state_dir = paths.state.parent().unwrap().join("local-worker");
+    fs::write(&paths.journal, serde_json::to_vec(&journal).unwrap()).unwrap();
+    assert!(managed_journal(&journal.spec)
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("init paths changed"));
+}
+
+#[tokio::test]
+async fn worker_only_takeover_is_left_for_the_next_task_without_init_writes() {
+    let (_root, context) = fixture();
+    let paths = Paths::resolve(&context.env).unwrap();
+    private_dir(&paths.config).unwrap();
+    let worker_journal = super::super::worker_service::Paths::journal_path(&context.env).unwrap();
+    fs::write(&worker_journal, b"existing worker-only installation").unwrap();
+    let before = fs::read(&worker_journal).unwrap();
+    let error = initialize(context, &mut Unknown).await.unwrap_err();
+    assert!(error.to_string().contains("worker-only host takeover"));
+    assert_eq!(fs::read(worker_journal).unwrap(), before);
+    assert!(!paths.journal.exists());
+    assert!(!paths.state.exists());
+    assert!(!paths.worker.exists());
 }

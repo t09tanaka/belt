@@ -108,7 +108,7 @@ impl Paths {
         }
         Ok(Self {
             state: root.join("coordinator"),
-            worker: root.join("local-worker"),
+            worker: super::worker_service::Paths::resolve_for(env, backend)?.state,
             key: config.join("cluster.key"),
             input: config.join("coordinator.json"),
             services,
@@ -558,6 +558,12 @@ async fn initialize_with_durability<L: Launcher>(
     let uid = rustix::process::geteuid().as_raw();
     ensure!(uid > 0, "init requires a non-root user");
     let paths = Paths::resolve_for(&context.env, launcher.backend())?;
+    // TODO(worker-only host takeover): reuse its enrollment and add the
+    // coordinator role to the existing resident instead of installing another.
+    ensure!(
+        !super::worker_service::Paths::journal_path(&context.env)?.try_exists()?,
+        "worker-only host takeover is not supported yet"
+    );
     // Values rendered into the service must round-trip through `launchctl print`;
     // refuse before any file or directory is created.
     service_inputs_observable(&paths, &context.env)?;
@@ -858,17 +864,7 @@ fn managed_journal(spec: &Spec) -> anyhow::Result<(Journal, Paths)> {
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= LIMIT, "managed journal too large");
     let j: Journal = serde_json::from_slice(&bytes)?;
-    let home = PathBuf::from(spec.env.get("HOME").context("managed HOME missing")?);
-    let paths = Paths {
-        config: config.clone(),
-        state: spec.state_dir.clone(),
-        worker: spec.worker_state_dir.clone(),
-        key: spec.cluster_key_path.clone(),
-        input: config.join("coordinator.json"),
-        services: services_dir(j.backend(), &home, &config)?,
-        journal: journal.clone(),
-        backend: j.backend(),
-    };
+    let paths = Paths::resolve_for(&spec.env, j.backend())?;
     validate_journal(
         &j,
         &paths,

@@ -50,6 +50,7 @@ impl State {
                 "Too many open files",
                 "startup lock",
                 "identity",
+                "OS boot identity unavailable",
                 "database",
                 "permission",
             ]
@@ -217,6 +218,9 @@ fn concurrent_init_reuses_one_real_combined_resident_and_epoch() {
     assert_eq!(state.lock().unwrap().starts, 1);
     let input = root.path().join("config/belt/coordinator.json");
     let spec = bootstrap::read_input(&input).unwrap();
+    assert_eq!(spec.worker_state_dir, root.path().join(".belt"));
+    assert!(spec.worker_state_dir.join("worker.db").is_file());
+    assert!(!root.path().join(".local/state/belt/local-worker").exists());
     let group = test_command(env!("CARGO_BIN_EXE_belt"))
         .args(["group", "--json"])
         .envs(&context.env)
@@ -631,4 +635,210 @@ fn workers_add_replaces_both_member_pins_without_a_second_resident() {
         log.read_to_string(&mut text).unwrap();
         assert!(!text.contains(key.trim()));
     }
+}
+
+/// A real init service, with private host admission independent of host load.
+struct InitFixture {
+    root: tempfile::TempDir,
+    context: ContextInput,
+    state: Arc<Mutex<State>>,
+}
+impl InitFixture {
+    fn new() -> Self {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let context = context(root.path());
+        let config = root.path().join("config/belt");
+        std::fs::create_dir_all(&config).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(config.join("config.toml"), "schema_version = 1\n[coordinator]\nmax_active_task = 2\nheartbeat_seconds = 1\n[scheduler]\nprefetch_per_worker = 0\n").unwrap();
+        Self {
+            root,
+            context,
+            state: Arc::new(Mutex::new(State::default())),
+        }
+    }
+    fn admit_commands(&self, n: u32) {
+        crate::common::fixture_worker_traffic_budget(&self.context.env, n * 2);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn initialized_worker_bridge_shares_local_database_and_admission_window() {
+    use belt::{
+        coordinator::TaskSpec,
+        ids::*,
+        protocol::{connect, Io},
+        storage::WorkerStore,
+        wire::*,
+    };
+    let f = InitFixture::new();
+    f.admit_commands(2);
+    let initialized = initialize(f.context.clone(), &mut OwnedLauncher(f.state.clone()))
+        .await
+        .unwrap_or_else(|error| {
+            f.state.lock().unwrap().diagnose();
+            panic!("initialization failed: {error}");
+        });
+    let spec = bootstrap::read_input(&f.root.path().join("config/belt/coordinator.json")).unwrap();
+    let source = f.root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    std::fs::write(source.join("input"), "snapshot").unwrap();
+    let captured = belt::source::capture(
+        &spec.env,
+        &belt::source::SourceStore::open(&spec.worker_state_dir).unwrap(),
+        &belt::source::SourceRequest::Directory { dir: source },
+        &belt::source::CaptureParams::default(),
+    )
+    .unwrap();
+    let release = f.root.path().join("release");
+    let payload = AttemptPayload {
+        ci_task: None,
+        toolchains: None,
+        outputs: vec![],
+        requirements: Default::default(),
+        in_place: false,
+        setup: None,
+        run_id: RunId::generate(),
+        task_id: TaskId::generate(),
+        generation: Generation(1),
+        source_id: captured.manifest.source_id.clone(),
+        plan_digest: Digest::of_bytes(b"plan"),
+        manifest_digest: Digest::parse(&format!("sha256:{}", captured.manifest.manifest_digest))
+            .or_else(|_| Digest::parse(&captured.manifest.manifest_digest))
+            .unwrap(),
+        permit_id: None,
+        commands: vec![CommandSpec {
+            setup_step: None,
+            node_id: NodeId::parse("main").unwrap(),
+            argv: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                format!(
+                    "i=0; while [ ! -f '{}' ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done",
+                    release.display()
+                ),
+            ],
+            cwd: String::new(),
+            env: BTreeMap::new(),
+            depends_on: vec![],
+            timeout_ms: None,
+        }],
+        lease_ms: 60_000,
+        command_timeout_ms: None,
+        deadline_ms: None,
+        resource_wait_timeout_ms: None,
+        has_secret_bundle: false,
+        artifacts: vec![],
+    };
+    let local = Client::load(&spec.state_dir, initialized.cluster_id.clone()).unwrap();
+    let task: TaskSpec = serde_json::from_value(serde_json::to_value(&payload).unwrap()).unwrap();
+    assert!(matches!(
+        local
+            .request(belt::service::resident::Operation::Submit {
+                run_id: payload.run_id.clone(),
+                source_id: payload.source_id.clone(),
+                tasks: vec![(payload.task_id.clone(), task)],
+            })
+            .await
+            .unwrap(),
+        Reply::Accepted { .. }
+    ));
+    let store = WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
+    let member = store.for_member(&initialized.coordinator_id);
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if member.list_attempts(None, false, 10).unwrap().len() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut bridge = tokio::process::Command::from(test_command(&spec.executable))
+        .args(["worker", "--stdio"])
+        .envs(&spec.env)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let connected = connect(
+        Io::new(bridge.stdout.take().unwrap(), bridge.stdin.take().unwrap()),
+        crate::proto_common::client_cfg_keyed(&initialized.cluster_id, &spec.cluster_key_path),
+    )
+    .await
+    .unwrap();
+    assert_eq!(connected.worker.worker_id, initialized.worker_id);
+    let remote_id = crate::proto_common::coordinator_of(&initialized.cluster_id);
+    assert_ne!(remote_id, initialized.coordinator_id);
+    let mut remote_payload = payload.clone();
+    remote_payload.run_id = RunId::generate();
+    remote_payload.task_id = TaskId::generate();
+    let remote_attempt = AttemptId::generate();
+    let submit = |attempt, payload| {
+        Request::SubmitAttempt(
+            SubmitAttemptRequest::new(RequestId::generate(), CoordinatorEpoch(1), attempt, payload)
+                .unwrap(),
+        )
+    };
+    assert!(matches!(
+        connected
+            .client
+            .call(
+                submit(remote_attempt.clone(), remote_payload.clone()),
+                Duration::from_secs(5)
+            )
+            .await
+            .unwrap(),
+        Response::SubmitAttempt(_)
+    ));
+    let remote = store.for_member(&remote_id);
+    assert_eq!(
+        remote.list_attempts(None, false, 10).unwrap()[0].attempt_id,
+        remote_attempt
+    );
+    assert_eq!(member.list_attempts(None, false, 10).unwrap().len(), 1);
+    let rejected = AttemptId::generate();
+    remote_payload.task_id = TaskId::generate();
+    let response = connected
+        .client
+        .call(
+            submit(rejected.clone(), remote_payload.clone()),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(response, belt::protocol::CallError::Remote(ref e) if e.overloaded_reason == Some(belt::error::OverloadedReason::Capacity)),
+        "{response:?}"
+    );
+    assert_eq!(remote.list_attempts(None, true, 10).unwrap().len(), 1);
+    std::fs::write(release, "done").unwrap();
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            if member.list_attempts(None, false, 10).unwrap().is_empty()
+                && remote.list_attempts(None, false, 10).unwrap().is_empty()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(connected);
+    // Closing the protocol streams ends the bridge without signalling a process.
+    tokio::time::timeout(Duration::from_secs(5), bridge.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        local
+            .request(belt::service::resident::Operation::Shutdown)
+            .await
+            .unwrap(),
+        Reply::Stopping
+    ));
 }
