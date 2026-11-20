@@ -986,8 +986,8 @@ impl Agent {
         let measured = self
             .store
             .lease(a)
-            .and_then(|lease| Ok((lease.map(|(k, _)| k), self.elapsed(rec, measured_at)?)));
-        let (key, (since_accept, since_grant)) = match measured {
+            .and_then(|lease| Ok((lease, self.elapsed(rec, measured_at)?)));
+        let (lease, (since_accept, since_grant)) = match measured {
             Ok(m) => m,
             Err(e) => {
                 // Without the key the supervisor would take the seed for
@@ -1004,7 +1004,12 @@ impl Agent {
                 return Ok(None);
             }
         };
-        let Some(lease_left) = policy::remaining_ms(payload.lease_ms, since_grant) else {
+        // A lease that was ended before its time ran out (the member said
+        // it retired this identity) is over as well.
+        let ended = lease.as_ref().is_some_and(|(_, expired)| *expired);
+        let key = lease.map(|(k, _)| k);
+        let left = policy::remaining_ms(payload.lease_ms, since_grant).filter(|_| !ended);
+        let Some(lease_left) = left else {
             // The journal gets `lease_expired` with it. Still under the
             // lock: a renewal either came before the measuring or is refused.
             let _ = self.store.expire_lease(a, now());
@@ -2031,20 +2036,20 @@ impl Agent {
                 );
                 return None;
             }
-            if let Some(next) = &keys.next {
-                // The number of a next key that arrived without one (the
-                // distribution of a rotation records its own) follows the
-                // current one.
-                if let Ok((Some(have), None)) = self.store.group_keys() {
-                    let _ = self
-                        .store
-                        .set_next_group_key(&crate::storage::KeyGeneration {
-                            generation: have.generation + 1,
-                            fingerprint: crate::group::fingerprint(next),
-                        });
-                }
-            }
             self.group_key.send_replace(current.clone());
+        }
+        if let Some(next) = &keys.next {
+            // The number of a next key that arrived without one (the
+            // distribution of a rotation records its own) follows the
+            // current one. Looked at only while a next key lies there.
+            if let Ok((Some(have), None)) = self.store.group_keys() {
+                let _ = self
+                    .store
+                    .set_next_group_key(&crate::storage::KeyGeneration {
+                        generation: have.generation + 1,
+                        fingerprint: crate::group::fingerprint(next),
+                    });
+            }
         }
         Some(current)
     }
@@ -2082,8 +2087,7 @@ impl Agent {
         store
             .record_identity_retired(&r.worker_boot_id, at)
             .map_err(api)?;
-        let live = store.list_nonterminal_of_member().map_err(api)?;
-        for rec in &live {
+        for rec in &store.list_nonterminal_of_member().map_err(api)? {
             // Idempotent: the first call writes `lease_expired`, a repeat
             // changes nothing. A renewal is refused from here on.
             store.expire_lease(&rec.attempt_id, at).map_err(api)?;
@@ -2093,7 +2097,6 @@ impl Agent {
             schema_version: SchemaVersion::CURRENT,
             worker_id: r.worker_id,
             worker_boot_id: r.worker_boot_id,
-            stopping: u32::try_from(live.len()).unwrap_or(u32::MAX),
         })
     }
 

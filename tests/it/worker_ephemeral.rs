@@ -94,9 +94,12 @@ impl Fx {
             .spawn()
             .unwrap();
         let io = Io::new(bridge.stdout.take().unwrap(), bridge.stdin.take().unwrap());
-        let connected = connect(io, super::proto_common::client_cfg(&self.cluster))
-            .await
-            .unwrap();
+        let connected = connect(
+            io,
+            super::proto_common::client_cfg_keyed(&self.cluster, &self.home().join("key")),
+        )
+        .await
+        .unwrap();
         let identity = (
             connected.worker.worker_id.to_string(),
             connected.worker.worker_boot_id.to_string(),

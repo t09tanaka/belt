@@ -143,7 +143,10 @@ impl Fixture {
         let io = Io::new(child.stdout.take().unwrap(), child.stdin.take().unwrap());
         let connected = connect(
             io,
-            super::proto_common::client_cfg(&self.spec.expected_cluster),
+            super::proto_common::client_cfg_keyed(
+                &self.spec.expected_cluster,
+                &self.spec.cluster_key_path,
+            ),
         )
         .await
         .unwrap();

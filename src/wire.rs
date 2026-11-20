@@ -435,9 +435,6 @@ pub struct IdentityRetiredResponse {
     pub schema_version: SchemaVersion,
     pub worker_id: WorkerId,
     pub worker_boot_id: WorkerBootId,
-    /// The member's attempts that were live when the notice was first taken
-    /// and are being stopped as interrupted.
-    pub stopping: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -2659,7 +2656,6 @@ mod tests {
             schema_version: SV,
             worker_id: worker(),
             worker_boot_id: boot(),
-            stopping: 1,
         }));
         out
     }

@@ -32,6 +32,8 @@ use tokio::sync::Semaphore;
 
 const T: Duration = Duration::from_secs(20);
 
+mod group_membership;
+
 /// The machine, reduced to plain directories, with a record of every call.
 struct DirHost {
     base: PathBuf,
@@ -1362,12 +1364,13 @@ async fn a_secret_file_sent_while_the_mask_is_made_is_refused_and_never_placed()
     let (seen_tx, seen_rx) = mpsc::channel::<(Option<Answer>, mpsc::Receiver<Answer>)>();
     {
         let agent = agent.clone();
+        let member = super::proto_common::coordinator_of(&f.cluster);
         *f.host.on_mask.lock().unwrap() = Some(Box::new(move |_| {
             let (tx, rx) = mpsc::channel();
-            let (agent, late) = (agent.clone(), late.clone());
+            let (agent, late, member) = (agent.clone(), late.clone(), member.clone());
             std::thread::spawn(move || {
                 let session = Session {
-                    coordinator_id: CoordinatorId::nil(),
+                    coordinator_id: member,
                     coordinator_epoch: CoordinatorEpoch(1),
                 };
                 let _ = tx.send(agent.handle(session.clone(), late));
@@ -3404,6 +3407,9 @@ async fn the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_an
     let f = fx();
     let state = f.state();
     let env = real_env(&f);
+    // The key the agent of this fixture proves the group with is the key
+    // the secrets are sealed with.
+    crate::proto_common::place_group_key(&state.join("cluster.key"));
     let key = belt::secrets::key::init(&state.join("cluster.key")).unwrap();
     let store = SourceStore::open(&state).unwrap();
     let vault = Vault::open(&state).unwrap();

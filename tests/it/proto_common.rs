@@ -44,27 +44,48 @@ pub fn membership(name: &str) -> Membership {
 /// Put [`group_key`] where an agent reads its key, as a key file is kept:
 /// lower-case hex, readable by its owner only.
 pub fn place_group_key(path: &std::path::Path) {
+    place_key(path, &group_key());
+}
+
+/// Put `key` at `path` as a key file is kept.
+pub fn place_key(path: &std::path::Path, key: &ClusterKey) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let text: String = group_key()
-        .as_bytes()
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
+    let text: String = key.as_bytes().iter().map(|b| format!("{b:02x}")).collect();
     std::fs::write(path, format!("{text}\n")).unwrap();
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
 }
 
-/// A coordinator of its own: each call is another member of the group.
+/// The one member a test's group has unless the test makes more: every
+/// connection of a fixture is the same coordinator, as a reconnecting one is.
+pub fn coordinator_of(cluster: &ClusterId) -> CoordinatorId {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MEMBERS: OnceLock<Mutex<HashMap<String, CoordinatorId>>> = OnceLock::new();
+    MEMBERS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap()
+        .entry(cluster.to_string())
+        .or_insert_with(CoordinatorId::generate)
+        .clone()
+}
+
 pub fn client_cfg(cluster: &ClusterId) -> ClientConfig {
-    let coordinator = CoordinatorId::generate();
-    let name = format!("m-{}", &coordinator.as_str()[3..].to_lowercase());
     ClientConfig::new(
         cluster.clone(),
-        coordinator,
+        coordinator_of(cluster),
         CoordinatorEpoch(1),
-        membership(&name),
+        membership("parent"),
     )
+}
+
+/// [`client_cfg`] holding the key a started worker process keeps at
+/// `key_path`.
+pub fn client_cfg_keyed(cluster: &ClusterId, key_path: &std::path::Path) -> ClientConfig {
+    let mut cfg = client_cfg(cluster);
+    cfg.membership = Membership::load(cfg.membership.member.clone(), key_path).unwrap();
+    cfg
 }
 
 pub fn server_cfg(cluster: &ClusterId) -> ServerConfig {

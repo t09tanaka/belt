@@ -289,7 +289,7 @@ fn a_member_reaches_only_its_own_attempts_and_the_worker_finds_any_by_id() {
 }
 
 #[test]
-fn the_same_ids_from_two_members_do_not_retire_or_conflict_with_each_other() {
+fn tombstones_and_task_ids_are_per_member_and_an_accepted_attempt_id_is_held_by_one() {
     let t = two();
     let (x, task) = (AttemptId::generate(), TaskId::generate());
     // A retire of one member that arrived first refuses that member's late
