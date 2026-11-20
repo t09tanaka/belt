@@ -95,6 +95,10 @@ impl Fx {
     /// Queue one task and commit its placement, as `dispatch` does before it
     /// sends anything.
     pub(super) async fn placed(&self) -> (TaskId, AttemptId) {
+        self.placed_spec(spec()).await
+    }
+
+    async fn placed_spec(&self, spec: TaskSpec) -> (TaskId, AttemptId) {
         let source = SourceId::generate();
         self.c
             .store()
@@ -102,7 +106,7 @@ impl Fx {
             .unwrap();
         let task = TaskId::generate();
         self.c
-            .enqueue(RunId::generate(), source, vec![(task.clone(), spec())])
+            .enqueue(RunId::generate(), source, vec![(task.clone(), spec)])
             .await
             .unwrap();
         let attempt = AttemptId::generate();
@@ -658,4 +662,140 @@ async fn a_ci_run_that_only_could_not_be_read_now_is_left_as_it_is_and_tried_aga
         .unwrap()
         .is_empty());
     let _ = (first, held);
+}
+
+/// Room at inspect time does not guarantee room when the submit arrives.
+struct RefusesCapacity {
+    worker: WorkerId,
+    submits: AtomicUsize,
+}
+
+impl WorkerLink for RefusesCapacity {
+    fn call(&self, request: Request) -> LinkFuture<'_> {
+        Box::pin(async move {
+            match request {
+                Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
+                    admission: Some(crate::wire::AdmissionWindow {
+                        limit: 1,
+                        used: 0,
+                        own: 0,
+                        foreign: 0,
+                    }),
+                    preparation_observations: None,
+                    capabilities: None,
+                    schema_version: SchemaVersion::CURRENT,
+                    worker_id: self.worker.clone(),
+                    worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
+                    agent_epoch: AgentEpoch(1),
+                    snapshot_digest: Digest::of_bytes(b"s"),
+                    policy_digest: Digest::of_bytes(b"p"),
+                    active_task: 0,
+                    prefetch_pending: 0,
+                    max_active_task: 1,
+                    prefetch_per_worker: 0,
+                    disk_free_bytes: 1,
+                    draining: false,
+                })),
+                Request::GetAttempt(_) => Err(LinkError::Remote(ApiError::new(
+                    ErrorCode::NotFound,
+                    "absent",
+                ))),
+                Request::SubmitAttempt(_) => {
+                    self.submits.fetch_add(1, Ordering::SeqCst);
+                    Err(LinkError::Remote(ApiError::overloaded(
+                        OverloadedReason::Capacity,
+                        "full",
+                    )))
+                }
+                _ => panic!("unexpected request: {request:?}"),
+            }
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_capacity_refusal_during_follow_survives_until_the_next_inspect() {
+    let f = fx();
+    let (_, attempt) = f.placed().await;
+    let link = Arc::new(RefusesCapacity {
+        worker: f.worker.clone(),
+        submits: AtomicUsize::new(0),
+    });
+    f.c.try_attach(f.worker.clone(), link.clone()).unwrap();
+    let report = f.c.tick().await.unwrap();
+    assert_eq!(report.retired, vec![attempt]);
+    assert_eq!(link.submits.load(Ordering::SeqCst), 1);
+    assert!(f.c.refused_for_capacity().contains(&f.worker));
+
+    // Observe the next inspect before dispatch can submit anything new.
+    f.c.follow(
+        f.worker.clone(),
+        link.clone(),
+        Instant::now() + Duration::from_secs(30),
+        &Mutex::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!f.c.refused_for_capacity().contains(&f.worker));
+    assert_eq!(link.submits.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn close_unstored_preserves_a_serialized_in_place_task() {
+    let f = fx();
+    let input = TaskSpec {
+        in_place: true,
+        ..spec()
+    };
+    assert_eq!(serde_json::to_value(&input).unwrap()["in_place"], true);
+    let (_, attempt) = f.placed_spec(input).await;
+    assert!(!f
+        .c
+        .store()
+        .close_unstored(
+            &attempt,
+            REASON_CAPACITY_REFUSED,
+            (
+                EVENT_SUBMIT_REFUSED_CAPACITY,
+                &json!({"reason": "capacity"})
+            ),
+            3,
+        )
+        .unwrap());
+    let stored = f.c.store().get_attempt(&attempt).unwrap().unwrap();
+    assert!(!stored.retired && stored.termination.is_none());
+    assert!(f.c.store().retire_tombstone(&attempt).unwrap().is_none());
+}
+
+#[tokio::test]
+async fn in_place_capacity_retries_keep_the_attempt_and_deduplicate_events() {
+    let f = fx();
+    let (_, attempt) = f
+        .placed_spec(TaskSpec {
+            in_place: true,
+            ..spec()
+        })
+        .await;
+    let link = Arc::new(RefusesCapacity {
+        worker: f.worker.clone(),
+        submits: AtomicUsize::new(0),
+    });
+    f.c.try_attach(f.worker.clone(), link.clone()).unwrap();
+    for sent in 1..=4 {
+        let report = f.c.tick().await.unwrap();
+        assert!(report.retired.is_empty() && report.settled.is_empty() && report.placed.is_empty());
+        assert_eq!(link.submits.load(Ordering::SeqCst), sent);
+        let live = f.c.store().live_attempts(Some(&f.worker)).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].record.attempt_id, attempt);
+        assert!(live[0].retire_reason.is_none());
+        assert_eq!(
+            f.c.store()
+                .events_of(&attempt, "submit_deferred")
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+    assert!(f.c.store().retire_tombstone(&attempt).unwrap().is_none());
 }

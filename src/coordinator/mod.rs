@@ -903,6 +903,17 @@ impl Coordinator {
         let sent_boot = crate::platform::boot_id();
         let sent = crate::platform::monotonic_ms();
         let mut inspected = self.inspect(&worker_id, &budgeted, requested.clone()).await;
+        if inspected
+            .as_ref()
+            .is_some_and(|answer| policy::answers_room(answer.admission.as_ref()))
+        {
+            // Only this inspect can clear an earlier refusal. A refusal
+            // while driving below must wait for the next inspect.
+            self.capacity_refused
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&worker_id);
+        }
         let received = crate::platform::monotonic_ms();
         let received_boot = crate::platform::boot_id();
         if let (Some(response), Some(inputs), Some(requested), Some(transport), Some(sent_boot)) = (
@@ -964,13 +975,6 @@ impl Coordinator {
         if Instant::now() >= deadline {
             // It used up its time: nothing new goes there in this tick.
             return Ok((None, report));
-        }
-        if policy::answers_room(inspected.admission.as_ref()) {
-            // It has room again: it is a candidate like any other.
-            self.capacity_refused
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&worker_id);
         }
         let reached = Reached {
             capabilities: inspected.capabilities,
