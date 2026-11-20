@@ -143,7 +143,13 @@ async fn hello_on(
     })
     .await
     .map_err(|_| "the worker bridge did not answer hello in time".to_string())?
-    .map_err(|e| format!("the worker bridge refused hello: {e}"))?;
+    .map_err(|e| match e.group_refusal() {
+        Some(reason) => format!(
+            "the worker bridge refused hello: {}",
+            super::group::refusal_code(reason)
+        ),
+        None => format!("the worker bridge refused hello: {e}"),
+    })?;
     Ok(BridgeHello {
         cluster: connected.cluster_id,
         worker: connected.worker.worker_id,

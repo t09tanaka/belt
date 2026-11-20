@@ -217,6 +217,25 @@ fn concurrent_init_reuses_one_real_combined_resident_and_epoch() {
     assert_eq!(state.lock().unwrap().starts, 1);
     let input = root.path().join("config/belt/coordinator.json");
     let spec = bootstrap::read_input(&input).unwrap();
+    let group = test_command(env!("CARGO_BIN_EXE_belt"))
+        .args(["group", "--json"])
+        .envs(&context.env)
+        .output()
+        .unwrap();
+    assert!(
+        group.status.success(),
+        "{}",
+        String::from_utf8_lossy(&group.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&group.stdout).unwrap();
+    assert_eq!(report["result"]["group_id"], a.cluster_id.to_string());
+    assert_eq!(report["result"]["name"], a.worker_id.to_string());
+    assert_eq!(report["result"]["current"]["number"], 1);
+    assert!(report["result"]["next"].is_null());
+    assert_eq!(report["result"]["members"], serde_json::json!([]));
+    let key = std::fs::read_to_string(&spec.cluster_key_path).unwrap();
+    assert!(!String::from_utf8_lossy(&group.stdout).contains(key.trim()));
+    assert!(!String::from_utf8_lossy(&group.stderr).contains(key.trim()));
     let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
     assert_eq!(store.epoch(), a.epoch);
     drop(store);

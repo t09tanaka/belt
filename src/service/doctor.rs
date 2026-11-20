@@ -1143,6 +1143,23 @@ pub fn command(json: bool) -> i32 {
             let version = super::worker_service::sha256_file(&exe)
                 .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
             let spec = super::context::runtime_spec(&env)?;
+            let mut group_checks = Vec::new();
+            for member in workers::registrations(&env)? {
+                let name = WorkerId::parse(&member.id)
+                    .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+                match super::group::observed_refusal(&spec.state_dir, &name) {
+                    Ok(Some(reason)) => {
+                        group_checks.push(Check::new(&member.id, "group", Level::Fail, reason))
+                    }
+                    Ok(None) => {}
+                    Err(_) => group_checks.push(Check::new(
+                        &member.id,
+                        "group",
+                        Level::NotChecked,
+                        "group connection diagnostic unreadable",
+                    )),
+                }
+            }
             // Measured as `workers diff` measures it, once, and only when a
             // worker answers.
             let parent: std::sync::OnceLock<Result<EnvReport, String>> = std::sync::OnceLock::new();
@@ -1172,6 +1189,7 @@ pub fn command(json: bool) -> i32 {
                     super::context::Context::load(env.clone(), cwd, spec).map_err(|e| e.message)
                 });
             let mut checks = report.checks;
+            checks.extend(group_checks);
             checks.extend(project_checks(
                 project
                     .as_ref()

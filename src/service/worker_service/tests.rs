@@ -202,6 +202,26 @@ fn install_is_idempotent_and_starts_once() {
 }
 
 #[test]
+fn a_worker_only_member_can_read_its_group_without_a_coordinator_identity() {
+    let h = Host::new();
+    h.install().unwrap();
+    let paths = h.paths();
+    let worker = crate::storage::WorkerStore::open(&paths.state, &h.request.worker_id).unwrap();
+    let key = crate::secrets::key::load(&paths.key).unwrap();
+    worker
+        .observe_group_key(&crate::group::fingerprint(&key))
+        .unwrap();
+    let spec = crate::service::group::load_spec(&h.env).unwrap();
+    let report = crate::service::group::report(&h.env, &spec).unwrap();
+    assert_eq!(report["group_id"], h.request.cluster.to_string());
+    assert_eq!(report["name"], h.request.worker_id.to_string());
+    assert_eq!(report["current"]["number"], 1);
+    assert!(!report.to_string().contains(h.request.key_file_text.trim()));
+    assert!(!paths.config.join("coordinator.json").exists());
+    assert!(!paths.state.join("coordinator.db").exists());
+}
+
+#[test]
 fn a_rejected_start_keeps_the_receipt_and_a_retry_finishes() {
     let h = Host::new();
     h.fake.0.borrow_mut().fail_start = true;

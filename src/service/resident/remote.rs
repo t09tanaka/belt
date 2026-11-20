@@ -320,12 +320,23 @@ async fn session(
         }
     }
     let outcome = async {
+        let member = WorkerId::parse(&worker.id)?;
+        if let Some(Err(error)) = &connected {
+            if let Some(reason) = error.group_refusal() {
+                super::super::group::record_refusal(
+                    coordinator.store().state_dir(), &member, Some(reason),
+                )?;
+            }
+        }
         let Some(connected) = connected else { return Ok(()); };
         let connected = connected?;
         let client = connected.client.clone();
         let worker_id = connected.worker.worker_id.clone();
         let gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(format!("ssh-private-rpc-v1:{}",Digest::of_bytes(&serde_json::to_vec(&serde_json::json!({"argv":argv,"protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"policy":"source-64k-v1"}))?))));
         gate.observe(connected.worker.worker_boot_id.clone(),connected.worker.agent_epoch).await;
+        if worker_id == member {
+            super::super::group::record_refusal(coordinator.store().state_dir(), &member, None)?;
+        }
         let link = config.attach_gated_worker(&coordinator, WorkerTarget::Remote(&worker.id), connected, gate.clone())
             .await.map_err(|e| anyhow::anyhow!(e.message))?;
         let (cancel, cancelled) = watch::channel(false);

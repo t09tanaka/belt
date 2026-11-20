@@ -71,6 +71,8 @@ pub enum Command {
     Estimate(EstimateArgs),
     /// Check the setup.
     Doctor,
+    /// Show this group's identity, key generations and configured members.
+    Group,
     /// Manage workers.
     Workers(WorkersArgs),
     /// Run as a worker (internal).
@@ -413,6 +415,9 @@ pub fn run(cli: Cli) -> i32 {
 
     if matches!(cli.command, Command::Doctor) {
         return crate::service::doctor::command(cli.json);
+    }
+    if matches!(cli.command, Command::Group) {
+        return crate::service::group::command(cli.json);
     }
     if let Command::Estimate(args) = &cli.command {
         return crate::service::estimate::cli(args, cli.json);

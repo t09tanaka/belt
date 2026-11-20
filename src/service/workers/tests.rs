@@ -352,6 +352,16 @@ fn add_install_stages_installs_starts_and_registers_last() {
         .iter()
         .all(|c| !c.contains(key.trim()) && !c.contains("mini-a")));
     assert_eq!(w.calls(), ["bootstrap"]);
+    let paths = WorkerPaths::resolve(&w.remote.env).unwrap();
+    for path in [&paths.journal, &paths.input] {
+        assert!(!fs::read_to_string(path).unwrap().contains(key.trim()));
+    }
+    assert!(!format!("{status:?}").contains(key.trim()));
+    for payload in &w.remote.stdins {
+        if let Ok(request) = serde_json::from_slice::<InstallRequest>(payload) {
+            assert!(!format!("{request:?}").contains(key.trim()));
+        }
+    }
 }
 
 #[test]
@@ -1288,6 +1298,24 @@ fn worker_offering(
         }
     });
     (parent, server)
+}
+
+#[tokio::test]
+async fn bridge_diagnostics_preserve_group_refusal_codes_without_key_material() {
+    let cluster = ClusterId::generate();
+    let features = crate::protocol::hello::SUPPORTED_FEATURES;
+    let (io, server) = worker_offering(&cluster, features);
+    let error = hello_on(io, &ClusterId::generate(), crate::group::test_key(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error, "the worker bridge refused hello: group_mismatch");
+    server.await.unwrap();
+    let (io, server) = worker_offering(&cluster, features);
+    let key = crate::secrets::key::ClusterKey::from_bytes(vec![42; 64]).unwrap();
+    let error = hello_on(io, &cluster, key, None).await.unwrap_err();
+    assert_eq!(error, "the worker bridge refused hello: group_key_mismatch");
+    assert!(!error.contains(&"2a".repeat(64)));
+    server.await.unwrap();
 }
 
 #[tokio::test]

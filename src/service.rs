@@ -8,6 +8,7 @@ pub mod doctor;
 pub mod estimate;
 mod forward;
 pub mod github_status;
+pub mod group;
 pub mod input;
 pub mod logs;
 pub mod macos;

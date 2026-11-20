@@ -1667,6 +1667,8 @@ Runtime tests invoke only private owned TempDir state; no production user-state 
 
 - 受ける側は、proofを確かめるまで、その接続から他の操作を受けない。`cluster_id` が違う接続、HMACが合わない接続は、理由（`group_mismatch`・`group_key_mismatch`）を付けて断る。
 - **名前と `coordinator_id` の固定**: 受ける側は、proofで名乗られたメンバーの名前と `coordinator_id` の組を記録する。記録済みの名前が別の `coordinator_id` で来たとき、記録済みの `coordinator_id` が別の名前で来たときは、理由 `member_identity_mismatch` で断る。state directoryを複製・復元したマシンが別の名前で加わること、作り直したマシンが黙って同じ名前を引き継ぐことを、これで止める。組を取り替えるのは、`workers add` と `group send-key` がそのメンバーへ明示的に行ったときだけである。
+  同じグループへの `workers add` もこの明示操作であり、ID・鍵・名前を渡し直し、相手では呼出元の名前と現在の `coordinator_id`、呼出元ではhelperが返す相手の名前と現在の `coordinator_id` の組を取り替えるが、service・binary・workerは追加せず、それ以外は変えない。
+  `workers add --install` だけで導入した相手には `coordinator_id` を発行せず、相手で呼出元の組だけを取り替え、呼出元には相手の組を記録せず、後の `init` で発行された相手の `coordinator_id` は各メンバーへの最初の認証済み接続で通常どおり固定する。
 
 **前提（正直なメンバー）**。グループ鍵を持つメンバーは、相手のOS userとして任意のcommandを実行できる。したがってグループは「誰の仕事を受けるか」の境界であり、メンバーどうしを互いから隔離する仕組みではない。鍵を持つメンバーが、悪意を持って別のメンバーの名前と `coordinator_id` の組を名乗ることは防がない。上の固定と24.4の「見える範囲」は、誤り（複製・復元・設定の取り違え）を防ぐためのもので、悪意のあるメンバーへの防御ではない。信頼できるマシンだけをグループに入れる。
 

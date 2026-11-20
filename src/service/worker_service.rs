@@ -69,7 +69,7 @@ pub enum Action {
 }
 
 /// What the parent sends on stdin for `install`. The key travels only here.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -81,6 +81,19 @@ pub struct InstallRequest {
     pub key_file_text: String,
     /// SHA-256 of the binary that runs `install`; it must be its own digest.
     pub binary_sha256: String,
+}
+
+impl std::fmt::Debug for InstallRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallRequest")
+            .field("system_user", &self.system_user)
+            .field("schema", &self.schema)
+            .field("cluster", &self.cluster)
+            .field("worker_id", &self.worker_id)
+            .field("key_file_text", &"[REDACTED]")
+            .field("binary_sha256", &self.binary_sha256)
+            .finish()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
