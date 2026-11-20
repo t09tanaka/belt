@@ -142,6 +142,25 @@ fn receipt(plan: &policy::Plan) -> anyhow::Result<Receipt> {
     verify_directory(root, 0).and_then(|()| read_definition(&path, 0, plan)).with_context(|| format!("check the administrator registration at {}; on the worker host use register-system-worker with --account and --config-dir {}", path.display(), plan.working_directory().display()))
 }
 
+fn config_under_home(config: &Path, home: &Path) -> anyhow::Result<PathBuf> {
+    let config = fs::canonicalize(config).with_context(|| {
+        format!(
+            "cannot resolve worker configuration directory {}; it must exist",
+            config.display()
+        )
+    })?;
+    let home = fs::canonicalize(home)
+        .with_context(|| format!("cannot resolve execution account's home {}", home.display()))?;
+    ensure!(
+        config.starts_with(&home)
+            && config
+                .file_name()
+                .is_some_and(|name| name == crate::config::paths::USER_DIR),
+        "give the worker configuration directory under the execution account's home"
+    );
+    Ok(config)
+}
+
 /// Only an administrator-installed copy of the CLI should be used for this
 /// operation. It renders the unit from explicit inputs and the OS account
 /// database. It never reads a service definition from the worker account.
@@ -156,14 +175,8 @@ fn register(username: &str, config: &Path) -> anyhow::Result<PathBuf> {
         .context("unknown execution account")?;
     let backend = HostLauncher::native().backend();
     let (_, home) = passwd(account.uid)?;
-    ensure!(
-        config.starts_with(home)
-            && config
-                .file_name()
-                .is_some_and(|name| name == crate::config::paths::USER_DIR),
-        "give the worker configuration directory under the execution account's home"
-    );
-    let plan = plan_for(backend, config, username, account.uid)?;
+    let config = config_under_home(config, Path::new(&home))?;
+    let plan = plan_for(backend, &config, username, account.uid)?;
     let root = directory(backend);
     verify_directory(root, 0)?;
     publish_definition(root, &plan, 0)
@@ -328,6 +341,79 @@ pub(super) fn check_boot(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_under_home_accepts_valid_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let config = home.join(".config").join(crate::config::paths::USER_DIR);
+        fs::create_dir_all(&config).unwrap();
+        let home_link = dir.path().join("home-link");
+        std::os::unix::fs::symlink(&home, &home_link).unwrap();
+        assert_eq!(
+            config_under_home(&config, &home_link).unwrap(),
+            fs::canonicalize(&config).unwrap()
+        );
+    }
+
+    #[test]
+    fn config_under_home_rejects_parent_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let config = home
+            .join("../other/.config")
+            .join(crate::config::paths::USER_DIR);
+        fs::create_dir_all(&config).unwrap();
+        assert_eq!(
+            config_under_home(&config, &home).unwrap_err().to_string(),
+            "give the worker configuration directory under the execution account's home"
+        );
+    }
+
+    #[test]
+    fn config_under_home_rejects_symlink_escape() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        fs::create_dir(&home).unwrap();
+        let outside = dir
+            .path()
+            .join("other")
+            .join(crate::config::paths::USER_DIR);
+        fs::create_dir_all(&outside).unwrap();
+        let config = home.join(crate::config::paths::USER_DIR);
+        std::os::unix::fs::symlink(&outside, &config).unwrap();
+        assert_eq!(
+            config_under_home(&config, &home).unwrap_err().to_string(),
+            "give the worker configuration directory under the execution account's home"
+        );
+    }
+
+    #[test]
+    fn config_under_home_rejects_wrong_last_component() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("wrong-name");
+        fs::create_dir(&config).unwrap();
+        assert!(config_under_home(&config, dir.path()).is_err());
+    }
+
+    #[test]
+    fn config_under_home_rejects_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join(crate::config::paths::USER_DIR);
+        let error = config_under_home(&config, dir.path()).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "cannot resolve worker configuration directory {}; it must exist",
+                config.display()
+            )
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
 
     fn fixture_plan(backend: policy::Backend, config: &Path) -> policy::Plan {
         service_plan(
