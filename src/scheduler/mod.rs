@@ -313,6 +313,7 @@ fn workload_of_nodes(
 ) -> WorkloadPlan {
     let nodes = nodes
         .map(|(node_id, depends_on)| WorkloadNode {
+            ci_history_key: None,
             external_delay_ms: ready_delay_ms.filter(|_| depends_on.is_empty()),
             depends_on,
             priority: 0,

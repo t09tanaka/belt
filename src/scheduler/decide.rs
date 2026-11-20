@@ -245,6 +245,7 @@ pub enum Rule {
     Cache,
     Transfer,
     Affinity,
+    ShardAssignment,
     WorkerId,
 }
 
@@ -366,7 +367,16 @@ fn key(c: &Compared) -> [u64; 6] {
 }
 
 /// Choose a worker for one task.
-pub fn decide(candidates: Vec<Candidate>, mut excluded: Vec<Excluded>, rules: Rules) -> Decision {
+pub fn decide(candidates: Vec<Candidate>, excluded: Vec<Excluded>, rules: Rules) -> Decision {
+    decide_for_shard(candidates, excluded, rules, None)
+}
+
+pub fn decide_for_shard(
+    candidates: Vec<Candidate>,
+    mut excluded: Vec<Excluded>,
+    rules: Rules,
+    preferred: Option<&WorkerId>,
+) -> Decision {
     excluded.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
     let top = candidates.iter().map(|c| c.priority).max().unwrap_or(0);
     let mut compared: Vec<Compared> = candidates
@@ -409,7 +419,11 @@ pub fn decide(candidates: Vec<Candidate>, mut excluded: Vec<Excluded>, rules: Ru
                 (true, [0; 6], c.compare_ms.unwrap_or(u64::MAX))
             }
         };
-        (rank(a), &a.worker_id).cmp(&(rank(b), &b.worker_id))
+        (rank(a), Some(&a.worker_id) != preferred, &a.worker_id).cmp(&(
+            rank(b),
+            Some(&b.worker_id) != preferred,
+            &b.worker_id,
+        ))
     });
     let tied = compared.iter().filter(|c| c.tied).count();
     let why = match compared.as_slice() {
@@ -419,7 +433,12 @@ pub fn decide(candidates: Vec<Candidate>, mut excluded: Vec<Excluded>, rules: Ru
         [first, second, ..] => {
             let (a, b) = (key(first), key(second));
             let at = (0..RULES.len()).find(|i| a[*i] != b[*i]);
-            Why::TieBreak(at.map_or(Rule::WorkerId, |i| RULES[i]))
+            let last = if preferred == Some(&first.worker_id) {
+                Rule::ShardAssignment
+            } else {
+                Rule::WorkerId
+            };
+            Why::TieBreak(at.map_or(last, |i| RULES[i]))
         }
     };
     Decision {
@@ -699,6 +718,20 @@ mod tests {
         assert_eq!(order(&d), ["w-c", "w-b", "w-a"]);
         assert_eq!(d.why, Why::TieBreak(Rule::Load));
         assert!(d.compared.iter().all(|c| c.tied && c.compare_ms.is_none()));
+    }
+
+    #[test]
+    fn shard_speed_assignment_only_breaks_a_final_tie() {
+        let a = cand("w-a", measured(1000));
+        let b = cand("w-b", measured(1000));
+        let target = w("w-b");
+        let choose = |a, b| decide_for_shard(vec![a, b], vec![], RULES_1S, Some(&target));
+        let decision = choose(a.clone(), b.clone());
+        assert_eq!(decision.winner, Some(target.clone()));
+        assert_eq!(decision.why, Why::TieBreak(Rule::ShardAssignment));
+        let mut busy = b;
+        busy.load = 1;
+        assert_eq!(choose(a, busy).why, Why::TieBreak(Rule::Load));
     }
 
     /// Two workers that are about the same, differing in one fact.

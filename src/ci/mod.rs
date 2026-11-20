@@ -4,11 +4,14 @@
 //! interprets CLI arguments, captures source, registers demand or runs steps.
 
 pub mod advance;
+pub(crate) mod artifact_exchange;
+pub mod discovery;
 pub mod execute;
 pub mod progress;
 pub mod shards;
 pub mod status;
 pub mod summary;
+pub(crate) mod timing;
 
 use local_ci::FrozenPlan;
 use summary::PlanSummary;

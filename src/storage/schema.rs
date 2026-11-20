@@ -362,6 +362,49 @@ BEGIN SELECT RAISE(ABORT, 'identity tombstones are kept for the life of the clus
 CREATE TRIGGER worker_identity_tombstone_fixed BEFORE UPDATE ON worker_identity_tombstone
 BEGIN SELECT RAISE(ABORT, 'an identity tombstone never changes'); END;"#
                 .to_string(),
+            r#"CREATE INDEX matrix_permit_held ON matrix_permit(group_id) WHERE held=1;
+CREATE TRIGGER matrix_attempt_ended AFTER UPDATE OF state,retired ON attempt
+WHEN NEW.permit_id IS NOT NULL AND (NEW.state='terminal' OR NEW.retired=1)
+BEGIN
+UPDATE matrix_permit SET held=0,released_at_ms=coalesce(NEW.terminal_at_ms,NEW.retired_at_ms)
+WHERE permit_id=NEW.permit_id AND held=1;
+END;
+UPDATE matrix_permit SET held=0,released_at_ms=(
+  SELECT coalesce(terminal_at_ms,retired_at_ms) FROM attempt WHERE attempt.attempt_id=matrix_permit.attempt_id
+) WHERE held=1 AND attempt_id IN (SELECT attempt_id FROM attempt WHERE permit_id IS NOT NULL AND (state='terminal' OR retired=1));"#.into(),
+            r#"CREATE TABLE ci_driver_transition (
+ run_id TEXT NOT NULL REFERENCES run(run_id), authorization INTEGER NOT NULL CHECK(authorization>=0),
+ revision INTEGER NOT NULL CHECK(revision>0), record TEXT NOT NULL,
+ PRIMARY KEY(run_id,authorization,revision)
+) WITHOUT ROWID;"#.into(),
+            r#"CREATE TABLE workflow_artifact (
+ run_id TEXT NOT NULL REFERENCES run(run_id),
+ workflow TEXT NOT NULL,
+ name TEXT NOT NULL,
+ version INTEGER NOT NULL CHECK(version>0),
+ producer TEXT NOT NULL REFERENCES attempt(attempt_id),
+ action_key TEXT NOT NULL,
+ fingerprint TEXT NOT NULL,
+ receipt_json TEXT NOT NULL,
+ PRIMARY KEY(run_id,workflow,name,version),
+ UNIQUE(producer,action_key)
+) WITHOUT ROWID;"#.into(),
+            "CREATE TABLE ci_test_timing(scope TEXT NOT NULL, worker TEXT NOT NULL, identity TEXT NOT NULL, millis INTEGER NOT NULL CHECK(millis>=0), PRIMARY KEY(scope,identity,worker)) WITHOUT ROWID;".into(),
+            r#"CREATE TABLE workflow_download (
+ consumer TEXT NOT NULL REFERENCES attempt(attempt_id),
+ action_key TEXT NOT NULL,
+ fingerprint TEXT NOT NULL,
+ selection_json TEXT NOT NULL,
+ PRIMARY KEY(consumer,action_key)
+) WITHOUT ROWID;"#.into(),
+            r#"CREATE TABLE workflow_upload_inflight (
+    producer TEXT NOT NULL REFERENCES attempt(attempt_id),
+    action_key TEXT NOT NULL,
+    workflow TEXT NOT NULL,
+    name TEXT NOT NULL,
+    fingerprint TEXT NOT NULL,
+    PRIMARY KEY(producer,action_key)
+) WITHOUT ROWID;"#.into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

@@ -200,6 +200,7 @@ fn defaults_apply_without_any_file() {
     assert_eq!(r.stale_seconds, v(15, d.clone()));
     assert_eq!(r.lease_seconds, v(60, d.clone()));
     assert_eq!(r.term_grace_seconds, v(10, d.clone()));
+    assert_eq!(r.warmup_idle_seconds, v(60, d.clone()));
     assert_eq!(r.max_active_task, v(2, d.clone()));
     assert_eq!(r.log_spool_limit_bytes, v(1 << 30, d.clone()));
     assert_eq!(r.retention_days, v(7, d.clone()));
@@ -321,7 +322,10 @@ fn entries_list_every_value_with_its_origin() {
     assert_eq!(get("execution.timeout_seconds").value, "3600");
     assert_eq!(get("toolchain.match").value, "exact");
     assert_eq!(get("ci.unsupported").value, "error");
-    assert_eq!(e.len(), 26);
+    let warmup = get("coordinator.warmup_idle_seconds");
+    assert_eq!(warmup.value, "60");
+    assert_eq!(warmup.origin, Origin::Default);
+    assert_eq!(e.len(), 27);
     assert_eq!(get("ci.no_cache").value, "[]");
     let none = run(None, None, None, &Overlay::default())
         .unwrap()
@@ -331,6 +335,7 @@ fn entries_list_every_value_with_its_origin() {
     assert_eq!(get2("execution.timeout_seconds"), "(none)");
     assert_eq!(get2("coordinator.local_worker"), "true");
     assert_eq!(get2("coordinator.term_grace_seconds"), "10");
+    assert_eq!(get2("coordinator.warmup_idle_seconds"), "60");
     assert_eq!(get2("coordinator.max_active_task"), "2");
     assert_eq!(get2("coordinator.log_spool_limit_bytes"), "1073741824");
     assert_eq!(get2("coordinator.retention_days"), "7");
@@ -458,6 +463,7 @@ fn zero_values_are_errors() {
         "stale_seconds = 0",
         "lease_seconds = 0",
         "term_grace_seconds = 0",
+        "warmup_idle_seconds = 0",
         "log_spool_limit_bytes = 0",
         "max_active_task = 0",
         "retention_days = 0",
@@ -1213,7 +1219,7 @@ fn priority_wrong_types_and_unknown_keys_are_errors() {
 
 #[test]
 fn runtime_settings_map_non_default_limits_and_timing() {
-    let text = "schema_version = 1\n[coordinator]\nheartbeat_seconds = 2\nstale_seconds = 5\nlease_seconds = 12\nterm_grace_seconds = 3\nmax_active_task = 7\nlog_spool_limit_bytes = 12345\nretention_days = 2\n[scheduler]\nforecast_ttl_ms = 1500\nprefetch_per_worker = 4\npriority_step_seconds = 9\n";
+    let text = "schema_version = 1\n[coordinator]\nheartbeat_seconds = 2\nstale_seconds = 5\nlease_seconds = 12\nterm_grace_seconds = 3\nwarmup_idle_seconds = 4\nmax_active_task = 7\nlog_spool_limit_bytes = 12345\nretention_days = 2\n[scheduler]\nforecast_ttl_ms = 1500\nprefetch_per_worker = 4\npriority_step_seconds = 9\n";
     let r = run(Some(text), None, None, &Overlay::default()).unwrap();
     let s = r.runtime_settings().unwrap();
     assert_eq!(s.coordinator.limits.max_active_task, 7);
@@ -1224,6 +1230,7 @@ fn runtime_settings_map_non_default_limits_and_timing() {
     assert_eq!(s.heartbeat_ms, 2000);
     assert_eq!(s.stale_ms, 5000);
     assert_eq!(s.term_grace_ms, 3000);
+    assert_eq!(s.warmup_idle_ms, 4000);
     assert_eq!(s.retention_ms, 172_800_000);
     assert_eq!(s.log_limit_bytes, 12345);
     assert_eq!(s.scheduler.rules.forecast_ttl_ms, 1500);
@@ -1258,6 +1265,13 @@ fn runtime_settings_refuse_invalid_timing_and_overflow() {
         .to_string()
         .contains("term_grace_seconds overflows"));
     r = base.clone();
+    r.warmup_idle_seconds.value = u64::MAX;
+    assert!(r
+        .runtime_settings()
+        .unwrap_err()
+        .to_string()
+        .contains("warmup_idle_seconds overflows"));
+    r = base.clone();
     r.max_active_task.value = 0;
     assert!(r.runtime_settings().is_err());
     r = base;
@@ -1270,4 +1284,28 @@ fn runtime_settings_refuse_invalid_timing_and_overflow() {
     assert_eq!(s.coordinator.worker_budget_ms, 750);
     assert_eq!(s.coordinator.limits.prefetch_per_worker, 0);
     assert_eq!(s.scheduler.rules.priority_step_ms, 0);
+}
+
+#[test]
+fn captured_shard_policy_names_one_job_and_its_fixture_boundary() {
+    let header = "schema_version=1\n";
+    let policy="[[ci.sharding]]\nworkflow='.github/workflows/check.yml'\njob='browser'\nisolation='database per attempt'\nallow_retry=true\n";
+    let parsed = parse_project("cfg", &format!("{header}{policy}")).unwrap();
+    let policy_row = &parsed.ci.unwrap().sharding[0];
+    assert_eq!(
+        policy_row.isolation.as_deref(),
+        Some("database per attempt")
+    );
+    assert_eq!(policy_row.allow_retry, Some(true));
+    for denied in [
+        format!("{header}{policy}{policy}"),
+        format!("{header}{}", policy.replace("'browser'", r#""web\ttests""#)),
+        format!("{header}{}", policy.replace("database per attempt", " ")),
+        format!(
+            "{header}{}",
+            policy.replace(".github/workflows/check.yml", "../check.yml")
+        ),
+    ] {
+        assert!(parse_project("cfg", &denied).is_err());
+    }
 }

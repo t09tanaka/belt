@@ -208,7 +208,7 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 
 ### S25: 1 台上の試験ハーネスと A01〜A49 の自動試験の対応（2026-11-17）
 
-上の表は担当行を示す。この表は、各 A を今どの自動試験が確かめているか、何が S26（Docker・実機）に残るか、どの A は担当行が未了で試験が無いかを示す。「自動試験」の列の試験は、試験名と冒頭の説明を仕様 §19 の期待結果と突き合わせて選んだ。期待結果の一部しか試験が無いと分かった A は「一部」にした。assert まで読んだのは `one_host` の全件と A16・A33・A49 の試験で、A05・A26・A42 は試験の説明とこの計画の該当節を読んだ。ほかの行は試験名と説明までで、S26 の受入で期待結果の句ごとに確かめ直す。試験名は代表で、同じ A を確かめる試験がほかにもある。
+2026-11-17 の調査方法とハーネスの記録を以下に残す。上の表は担当行を示す。この表は、各 A を今どの自動試験が確かめているか、何が S26（Docker・実機）に残るか、どの A は担当行が未了で試験が無いかを示す。「自動試験」の列の試験は、試験名と冒頭の説明を仕様 §19 の期待結果と突き合わせて選んだ。期待結果の一部しか試験が無いと分かった A は「一部」にした。assert まで読んだのは `one_host` の全件と A16・A33・A49 の試験で、A05・A26・A42 は試験の説明とこの計画の該当節を読んだ。ほかの行は試験名と説明までで、S26 の受入で期待結果の句ごとに確かめ直す。試験名は代表で、同じ A を確かめる試験がほかにもある。
 
 ハーネスは `tests/it/one_host.rs` にある。1 つの親（`Coordinator`）と、worker ごとに別の state directory・別の supervisor process・別の protocol 接続を持つ本物の agent を、1 つの試験 process の中に立てる。既存の fixture（`worker_agent::Fx`、`coordinator` の `spec`・`only`・`Lost` など）を使い、別の仕組みは作っていない。障害の注入口は 3 つで、どれも試験 crate の中にあり、library と release binary には注入用のコードを足していない。
 
@@ -228,7 +228,9 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 - **未実装**: 担当行が未了で、期待結果を確かめる試験が無い。
 - **S26**: 実際のプロジェクトと複数 host が要り、ここでは試験しない。
 
-| A | 区分 | 自動試験（代表） | 残り |
+2026-11-18 に統合候補 `d4d5f47` の A01〜A49 全行をテスト名と照合した。「統合検証待ち」は試験がこのコミットにあり、候補全体の CI の結論を待っている項目。各行の個別検証と S26 の実環境検証は別に示す。
+
+| A | 区分 | 自動試験（代表） | 残り・検証範囲 |
 |---|---|---|---|
 | A01 | 自動＋残り | `scheduler::a01_tasks_given_to_no_host_run_on_the_parent_and_on_both_children`、`one_host::a01_three_real_workers_on_one_machine_each_run_one_of_three_tasks` | 別 host の worker（S26 の Docker） |
 | A02 | 自動＋残り | `scheduler::a02_a_worker_that_joins_takes_the_backlog_the_parent_kept`、`one_host::a02_a_real_worker_that_joins_later_starts_the_backlog_the_parent_kept` | 別 host の worker（S26 の Docker） |
@@ -239,53 +241,55 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 | A07 | 自動 | `a07_ready_delay_queue_and_runtime_make_the_finish`（`src/forecast/mod.rs`） | |
 | A08 | 自動 | `forecast::a08_a_node_is_one_demand_before_it_registers_after_and_once_finished` | |
 | A09 | 自動 | `a09_the_three_cases_stay_distinct` ほか 3 件（`src/forecast/mod.rs`） | |
-| A10 | 一部 | forecast の側: `a10_a_chain_reports_the_end_of_the_last_step`、`a10_parallel_nodes_end_with_the_longest_not_the_sum`（`src/forecast/mod.rs`） | `ci` の実行経路での複数 step・matrix の ETA（S16 が未了） |
+| A10 | 統合検証待ち | `forecast::tests::a10_matrix_variants_forecast_the_final_step_after_preparation`、`a10_parallel_nodes_end_with_the_longest_not_the_sum` | `8662486` の対象試験は6件成功。実測履歴と未計測時の予測を確認。統合後のCI待ち |
 | A11 | 自動 | `source_capture::a11_every_kind_of_change_is_captured_and_unpacks_to_the_same_content` | |
 | A12 | 自動 | `source_capture::a12_an_input_that_keeps_moving_is_source_busy_and_nothing_is_published` | |
 | A13 | 自動 | `source_capture::a13_a_capture_cut_off_before_publication_leaves_nothing_visible_and_resumes_as_the_same_id` | |
-| A14 | 自動 | `source_capture::a14_unpushed_commits_travel_in_a_bundle_and_a_worker_never_fetches_origin`、`a14_a_dirty_submodule_…`、`a14_an_lfs_file_…` | |
+| A14 | 自動 | `source_capture::a14_unpushed_commits_travel_in_a_bundle_and_a_worker_never_fetches_origin`、`a14_a_dirty_submodule_is_captured_whole_and_travels_with_its_parent`、`a14_an_lfs_file_is_captured_as_its_payload_and_the_pointer_is_not_what_travels` | |
 | A15 | 自動 | `setup::each_worker_builds_its_own_template` | |
 | A16 | 自動 | `the_key_changes_with_everything_that_decides_what_is_made`（`src/setup/policy.rs`） | |
 | A17 | 自動 | `setup::building_a_plus_b_leaves_template_a_alone_and_one_cancel_breaks_no_other` | |
 | A18 | 自動 | `worker_agent::a18_an_attempt_resent_100_times_starts_its_command_once` | |
 | A19 | 自動 | `coordinator::a19_the_task_moves_only_after_the_retire_and_the_late_submit_is_refused`、`worker_agent::a19_a_submit_that_arrives_after_the_retire_is_refused`、`one_host::a19_a21_a_lost_ack_and_a_gone_link_never_start_the_task_on_the_free_worker` | |
 | A20 | 自動 | `supervisor::after_a_supervisor_crash_the_same_process_is_stopped_and_never_respawned`、`supervisor::a_launch_without_an_identity_is_investigated_not_respawned`、`supervisor::a_crash_between_the_termination_and_the_result_is_completed_by_the_next_start`、`one_host::a20_a_killed_supervisor_ends_the_attempt_once_and_nothing_is_started_again` | |
-| A21 | 自動 | `supervisor::the_supervisor_finishes_the_attempt_after_its_agent_is_killed`、`coordinator::a21_an_attempt_whose_link_is_gone_is_kept_and_followed_again_on_return`、`one_host::a19_a21_…` | |
+| A21 | 自動 | `supervisor::the_supervisor_finishes_the_attempt_after_its_agent_is_killed`、`coordinator::a21_an_attempt_whose_link_is_gone_is_kept_and_followed_again_on_return`、`one_host::a19_a21_a_lost_ack_and_a_gone_link_never_start_the_task_on_the_free_worker` | |
 | A22 | 自動 | `supervisor::lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it`、`coordinator::a22_after_a_long_stop_the_parent_keeps_unknown_until_the_worker_says_it_stopped` | |
 | A23 | 自動 | `worker_agent::a23_a_restarted_agent_adopts_the_living_supervisor`、`coordinator::a23_a_restarted_parent_adopts_what_runs_and_starts_nothing_again`、`one_host::a23_a_killed_parent_is_followed_by_one_that_adopts_what_two_real_workers_run`、`one_host::a23_a_restarted_agent_of_one_worker_keeps_its_command_and_the_parent_follows_it` | |
 | A24 | 自動＋残り | 擬似（process を止めて boot ID を変える）: `worker_agent::a24_a_changed_boot_id_interrupts_everything_and_a_retry_runs`、`one_host::a24_a_restart_of_one_workers_machine_interrupts_its_attempt_and_spares_the_other` | 本物の reboot と OS の boot ID（S26、Mac は実機待ち） |
 | A25 | 自動 | `supervisor::cancel_terms_then_kills_the_group_and_records_only_after_it_is_gone`、`supervisor::natural_end_and_cancel_racing_still_give_one_terminal` | |
 | A26 | 自動＋残り | lease は単調時計の値だけを受ける純粋関数で、長い suspend に当たる飛びを試験する: `a_long_suspend_expires_the_lease`・`a_late_renewal_does_not_revive_an_expired_lease`（`src/supervisor/lease.rs`）。壁時計の前後への飛びは保持期間の判定で試験する: `forward_jump_requarantines_then_follows_the_new_wall`・`backward_step_holds_briefly_or_requarantines`（`src/results/clock_policy.rs`）。worker 間の壁時計のずれ: `one_host::a26_workers_whose_wall_clocks_are_off_keep_their_leases_and_end_normally` | 実行中に OS の壁時計を変える試験と、実際の Mac sleep からの復帰は無い（実機待ち） |
-| A27 | 未実装 | | S16（max-parallel・fail-fast・join・集約の進行が無い） |
+| A27 | 統合検証待ち | `bootstrap::a27_public_ci_expands_from_a_needs_output_and_joins_in_variant_order` | 対象試験3件成功。実 CLI の動的展開と join、複数 worker での permit・fail-fast を確認。統合後のCI待ち |
 | A28 | 自動 | `bootstrap::ci_plan_shows_why_a_shared_workspace_task_is_not_split` | |
 | A29 | 自動 | `non_utf8_bytes_round_trip_per_stream`・`reads_resume_from_any_offset_without_duplicates`・`limit_is_shared_and_the_rest_is_counted_as_dropped`（`src/supervisor/tests.rs`）、`collection::active_raw_logs_are_durable_before_terminal_and_reconnect_at_committed_offset` | |
 | A30 | 自動 | `collection::a30_a_worker_that_disappears_while_collecting_is_continued_where_it_stopped`、`coordinator::a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_worker_is_told` | |
 | A31 | 自動 | `collection::a31_an_empty_or_short_set_of_results_is_told_apart_and_never_a_success` | |
-| A32 | 未実装 | | S19 |
+| A32 | 統合検証待ち | `bootstrap::a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_changes_no_result`、`ci::status::a32_a_dirty_or_synthetic_snapshot_is_not_posted_to_the_original_head` | 実 CLI が未コミット変更を含む実行で success を計算し、元 HEAD を記録しつつ GitHub 投稿を呼ばないことを確認。最終 CI 待ち |
 | A33 | 自動 | `worker_agent::capabilities_keep_optional_probe_unknown_but_required_tools_fail_closed`、`worker_agent::a_secret_that_cannot_be_masked_keeps_the_command_from_starting`、`secrets::a_run_that_lost_its_bundle_is_blocked_not_resumed_with_something_else` | |
 | A34 | 自動＋残り | 偽の Launcher・偽の ssh: `upgrade_switches_checks_the_bridge_and_commits`・`an_interrupted_switch_is_finished_by_running_upgrade_again`（`src/service/workers/upgrade/tests.rs`） | 本物の launchd・実 SSH での install / upgrade / rollback（S26） |
-| A35 | 一部 | macOS の計画と偽の launchctl: `proven_start_rejection_rolls_back_but_unknown_preserves_evidence`（`src/service/macos/tests.rs`） | Linux の systemd は偽の runner での試験まで（user mode。実機は S26）、system-user mode の配線（S24 の残り）、実際の service 環境での doctor（S26） |
+| A35 | 統合検証待ち＋S26 | `worker_service::tests::a_system_service_installs_stops_restores_and_upgrades_without_replacing_the_admin_file`、`doctor::tests::the_retained_service_environment_is_the_one_that_is_checked`、`systemd::tests::a_start_runs_reload_enable_start_in_order` | 偽の launchd・systemd と一時ディレクトリの管理者定義で復旧・起動順を確認し、doctor が記録済みの service 環境を使うことを試験する。実サービスのログイン・起動時の復帰と、その環境での doctor は S26。 |
 | A36 | 自動＋残り | `doctor::an_updated_task_traffic_controller_passes_the_runtime_check`（旧い形の `status --json` を読む） | 旧コマンドと主要 workflow の互換は local-ci・task-traffic-controller 側の CI が担う（L1a〜L3・T1） |
 | A37 | S26 | | 実際のプロジェクトの CI を親のみと複数 worker で比べる |
-| A38 | 一部 | worker の側だけ: `a_job_that_needs_another_runs_in_another_attempt_from_the_first_ones_result`（`src/supervisor/ci_task/run_tests.rs`） | 親が先行 Job の output・artifact を確定してから別 host で後続を始める経路（S16 が未了） |
-| A39〜A41 | 未実装 | | S18（RTR の配置と集約）。adapter の分割・合算は local-ci 側の試験（L2・L3） |
-| A42 | 一部 | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts` | 導入中の負荷を forecast に含めること（S20 の残件）、実 manager と network での導入 |
+| A38 | 統合検証待ち | `remote_links::a38_public_ci_delivers_needs_outputs_and_a_verified_multifile_artifact_to_another_worker`、`collection::a38_live_artifact_transfer_resumes_before_either_worker_finishes` | 対象試験4件成功。実 CLI の 2 worker 間転送、ACK 再送と親再起動を確認。統合後のCI待ち |
+| A39 | 統合検証待ち | `collection::a39_discovery_collection_expands_the_run_once_before_any_test_is_placed`、`a39_file_shards_cover_every_test_once_and_add_up_to_one_job`、`worker_discovery_lists_real_cargo_tests_then_runs_only_each_shards_assigned_test` | Jest・Vitest の全件と欠落を集約で区別する。実 Cargo では列挙で本体を実行せず、分割後は割当テストだけが実行され、その合否を receipt に残す。 |
+| A40 | 統合検証待ち | `collection::a40_history_shortens_the_longest_shard_and_no_history_is_a_stable_split_that_runs`、`matches_identical_tests_and_scales_each_observation_once`、`discovery_precedes_the_matrix_journal_and_its_shard_timings_survive_replay` | 予測最長時間の短縮、決定的 fallback、同じテストの観測に基づく worker 速度補正、journal 再生後の履歴保持を確認。 |
+| A41 | 統合検証待ち | `collection::a41_a_job_that_cannot_be_split_says_why_and_runs_as_one_job`、`a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_report`、`a41_retry_rebinds_failed_downstream_needs_after_the_shards_rejoin` | 分割不可の理由、実行中 shard の停止、失敗報告、再実行後の依存結果を確認。最終 CI 待ち |
+| A42 | 自動＋残り | `bootstrap::frozen_toolchain_public_exec_installs_once_activates_setup_isolates_and_retries`、`bootstrap::frozen_toolchain_public_exec_blocks_what_cannot_be_installed_before_running`、`toolchain_preparation::all_five_adapters_execute_under_managed_supervisor_and_reuse_verified_receipts`、`worker_agent::a_forecast_counts_the_toolchain_installs_an_accepted_attempt_waits_for` | 導入待ちの負荷を含む S20 は PR #81 の実 Linux・macOS CI で成功。実 manager と network での導入は S26。 |
 | A43 | 自動 | `secrets::a43_the_secret_files_reach_the_worker_as_0600_and_are_gone_after_the_attempt` | |
 | A44 | 自動＋残り | 偽の ssh と偽の tool: `diff_classifies_the_five_ways_a_worker_can_differ`・`sync_blocks_what_needs_a_person_with_the_steps`（`tests/it/workers_lifecycle.rs` の `a44`）、`bootstrap::workers_sync_installs_through_the_resident_then_measures_again_and_needs_the_resident` | 実際の worker との差（S26） |
-| A45 | 一部 | OS 依存部分は CI の ubuntu と macOS の両方で同じ試験が走る（`src/platform` の単体試験、`tests/it/supervisor.rs`） | 実 systemd での導入・起動・停止（偽の runner での試験は S24 で済み）、system-user mode の配線（S24 の残り）、x86_64 と arm64 の実 worker（S26 の Docker） |
-| A46 | 一部 | worker の側: `tests/it/worker_ephemeral.rs`（起動ごとの identity）。親の側: `coordinator::forget::tests::an_unreachable_ephemeral_worker_keeps_its_attempt_unknown_until_it_is_forgotten`・`a_new_start_retires_the_identity_before_it_and_is_sent_none_of_its_attempts`、`service::resident::remote::tests::an_ephemeral_worker_is_let_in_by_identity_and_forgotten_through_the_resident` | トンネル越しの実 SSH で一時 worker に配置し、切断して forget するまでの通し（S26） |
+| A45 | 統合検証待ち＋S26 | `systemd::policy::tests::a_system_user_unit_names_a_non_root_user`、`worker_service::tests::a_system_service_installs_stops_restores_and_upgrades_without_replacing_the_admin_file`、`src/platform` の単調時計・boot ID・process identity・sleep 抑止の試験、`tests/it/supervisor.rs` | 非 root の User= と登録・起動・停止の手順を一時定義と偽 launcher で検証する。実 Linux x86_64・arm64 への導入、実 systemd user service の起動・停止、system-user の実行ユーザー確認は S26。 |
+| A46 | 統合検証待ち＋S26 | `two_starts_never_share_an_identity`、`remote_links::a46_a_tunnel_disconnect_keeps_the_ephemeral_attempt_until_explicit_forget` | 起動ごとの identity を検査。ローカルの SSH 代役と実 worker で、切断後の unknown 保持、明示 forget による interrupted と identity 退役、同じ worker が再接続して旧 identity が拒否されることを確認する。attempt 数も command 実行回数も 1。実 SSH トンネルは S26。 |
 | A47 | 自動 | `secrets::worktreeinclude_picks_only_ignored_untracked_files_and_the_store_never_holds_them`、`worker_agent::the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_any_name` | |
-| A48 | 一部 | `workspace::add_and_remove_a_commit_workspace`、`workspace::the_original_is_never_written`（CI は `RTR_REQUIRE_FAST_WORKTREE` で fast-worktree を必須にする） | terminal 後に portool の割当が消えることを確かめる試験が無い |
+| A48 | 統合検証待ち | `workspace::add_and_remove_a_commit_workspace`、`workspace::the_original_is_never_written`、`workspace::removing_an_attempt_releases_only_its_portool_allocation`、`secrets::worktreeinclude_picks_only_ignored_untracked_files_and_the_store_never_holds_them` | `00cd900` で未コミットの .fast-worktree.toml を含む snapshot の削除 hook を復元。実 fast-worktree と portool で同じ worker に 2 attempt を作り、一方を削除するとその workspace と割当だけが消え、最後の削除で割当が空になることを検査する。 |
 | A49 | 自動 | `scheduler::a_preferred_worker_is_taken_while_the_others_are_not_faster_by_the_correction`、`collection_is_added_to_the_forecast_and_the_priority_correction_to_that`（`src/scheduler/decide.rs`）、設定から scheduler まで: `runtime::runtime_attach_applies_only_verified_identity_priorities` | |
 
-件数（A39〜A41 は 3 件と数える）: 自動 29、自動＋残り 7、一部 6、未実装 6、S26 のみ 1。
+2026-11-17 の調査時点では、自動 29、自動＋残り 7、一部 6、未実装 6、S26 のみ 1 件だった。上表の「統合検証待ち」は、その後に試験が統合された項目を示す。
 
-S25 の完了条件「実機不要の A がすべて自動で緑」は、まだ満たしていない。区分が「一部」と「未実装」の 12 件（A10・A27・A32・A35・A38・A39〜A41・A42・A45・A46・A48）は、S16・S18・S19・S20・S24 の実装か、試験の追加が先に要る。これらの行が入ったら、この表を更新し、複数 worker が関わるものは `one_host` に試験を足す。
+S25 の完了条件は「実機不要の A がすべて自動で緑」。この表の照合時点では統合 CI は進行中で、S25 の完了判定は保留。A10・A27・A32・A35・A38〜A42・A45・A46・A48 は、統合したコミットで各受入条件を確認し、結果を上表に記録する。
 
-この変更の残件:
+2026-11-17 のハーネス作成時の残件（当時の記録。2 の現状は上表 A48）:
 
-1. `tests/it/coordinator.rs` の `LoseRetireAnswer`（retire の応答を 1 回失う link）は `one_host` の `Faults` と同じ役目だが、そのままにした。そのファイルは S16 の変更（PR #70）が編集中で、競合を避けた。S16 の統合後に `Faults` へ寄せる。
-2. A48 の portool の割当の解放は、試験が無いことを見つけただけで、足していない（S7 の範囲）。
+1. retire の応答消失には、coordinator の試験でも `one_host` の `Faults` を使う。
+2. A48 は同じ worker の 2 つの attempt に portool の資源を割り当て、片方の終了後にもう片方の割当が残ることを検証する。
 3. 単調時計を試験から進める口は無い（上の「時計について」）。lease の失効を agent・supervisor の実 process で確かめる試験は、実時間の短い lease を使う既存の試験のままである。
 4. kill の注入は、worker が launch と process identity を記録した後に限った（`OneHost::launched` で待つ）。spawn の直後で identity を記録する前に supervisor を kill すると、worker は仕様どおり起動不明として未解決のまま保持し、その command は同じ user のほかの attempt の回復からも「隠れた process」に見えて、同じ試験 process のほかの試験の回復を止める（最初の版で 6 回中 1 回起きた）。記録前の kill は `tests/it/supervisor.rs` の `a_launch_without_an_identity_is_investigated_not_respawned` が担い、ここでは注入していない。記録前の地点で確実に止める口は本体に試験用の経路が要るため、足していない。
 
@@ -1682,7 +1686,9 @@ FrozenPlan が split 済みの ShardGroup を持つとき、親がその Shard �
 
 テスト: `tests/it/collection.rs` に 8 件（A39: Vitest と Jest の file 単位の分割を worker 2 台の構成で同じ tick に配置し、全 file が 1 回ずつで Job が 1 つになること、報告されない file が有ると Job が failure になること。A40: 履歴で遅い test が 1 Shard になり最長の Shard が短くなること、履歴無しでも同じ分割になり実行できること。A41: 分割できない理由の表示と単一 Job への fallback、fail-fast の cancel の配送と停止確認と報告、後続を持たない Job で一度に配置しきれない Shard が未配置のまま止まること、retry、全 Shard が成功で集約だけが failure の run が集約まで確定せず失敗で確定すること）。失敗の原因と retry の対象は、止められた Shard の id が先に並ぶ場合、attempt が成功で test だけ失敗した場合、報告漏れの Shard だけをやり直す場合、retry の後の古い集約が書かれない場合を含む。lib は `ci::shards` 11 件、`ci::progress` 3 件、`ci_run` 1 件（ほかに既存の 2 件へ追記）。mutation は `src/ci/shards.rs` と `src/service/completion.rs` を手元で回した。
 
-残り（S18 の必須範囲として維持する）:
+以下は 2026-11-17 の初回実装で残っていた項目。11 月 18 日の統合では、worker の workspace で runner を列挙し、結果と runner の版を固定してから分割する。時間計測・worker 間の速度差・準備費を配置に使い、非冪等な shard の retry は捕捉済みの許可を確認する。独自 reporter や後続の成果物公開を分割で再現できない場合には理由を示し、元の Job を実行する。対象試験の進捗は上の A39〜A41 の行に記録する。
+
+初回実装時点の残件は次のとおり。
 
 - 本番の `ci` は分割の要求（`ShardRequest`）を作らない。`service::planning::freeze` は test の列挙（adapter の discover）を走らせないので、実際の `ci` の plan は今も Shard を持たない。上のテストは `FrozenPlan::with_shards` で作った plan を使う。列挙をどこで走らせるか（親か worker か、どの workspace か）は未決定で、adapter 本体の側の作業である。
 - 履歴の入力元が無い（A40）。worker が返す `TestResult` は所要時間を持たず、`History` と `PartitionOpts.speed_permille`（worker の性能補正）に入れる値を RTR は記録していない。Shard 数を worker の実効容量と残りの DAG から決める処理も無い。

@@ -24,7 +24,10 @@ struct Sup {
 }
 
 fn sup(workflow: &str) -> Sup {
-    let f = fixture(workflow);
+    sup_from(fixture(workflow))
+}
+
+fn sup_from(f: Fixture) -> Sup {
     let state = f.area.join("state");
     let worker = WorkerId::parse("w-ci").unwrap();
     let store = WorkerStore::open(&state, &worker).unwrap();
@@ -75,6 +78,13 @@ impl Sup {
             .materialize(&self.f.manifest, &workspace)
             .unwrap();
         let ci = CiTaskSpec {
+            verify_shard_version: false,
+            artifact_workflow: None,
+            history_scope: Some(crate::ci::timing::task_scope(
+                &self.f.plan,
+                task_of(&self.f.plan, job),
+            )),
+            dispatch: None,
             plan_path: crate::worker::ci_task::plan_path(&self.state(), &self.plan_digest),
             plan_digest: self.plan_digest.clone(),
             task_id: task_of(&self.f.plan, job).to_string(),
@@ -195,6 +205,17 @@ fn a_job_that_needs_another_runs_in_another_attempt_from_the_first_ones_result()
     assert_eq!(term.outcome(), Outcome::Succeeded);
     assert_eq!(term.exit(), Some(Exit::Code(0)));
     assert_eq!(s.steps(&build), ["step-0"], "one node per step that ran");
+    let ci = ci_of(&build);
+    let demand = local_ci::plan_task_demand(&s.f.plan, &ci.task_id).unwrap();
+    let keys = crate::ci::timing::keys(&demand, ci.history_scope.as_ref().unwrap());
+    let profile = &build.artifacts.as_ref().unwrap().profile_fingerprint;
+    let expected = crate::ci::timing::profile_key(keys[0].as_ref().unwrap(), profile);
+    let records =
+        task_traffic_controller::history::read_all(&build.traffic_state_dir.join("history.jsonl"))
+            .unwrap();
+    assert!(records
+        .iter()
+        .any(|record| record.key_argv == expected && record.measurement_id.is_some()));
     let built = s.result(&build).expect("the result is kept as an artifact");
     assert_eq!(built.outcomes.len(), 1);
     assert_eq!(built.outcomes[0].job, "build");
@@ -855,4 +876,93 @@ fn recovery_of_a_ci_task_whose_supervisor_was_lost_during_a_step_settles_it_and_
     // Nothing of the plan ran after the loss, not even the `always()` step.
     assert_eq!(s.steps(&spec), ["step-0"]);
     assert_eq!(made(&spec, &["always.txt"]), [false]);
+}
+
+#[test]
+fn worker_discovery_lists_real_cargo_tests_then_runs_only_each_shards_assigned_test() {
+    use crate::ci::discovery::{candidates, WorkerListing};
+    let workflow="on: push\njobs:\n  rust:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+    let f = crate::ci::execute::tests::fixture_with(workflow, |root| {
+        std::fs::write(root.join("Cargo.toml"), "[package]\nname='listed'\nversion='0.0.0'\nedition='2021'\n[lib]\npath='lib.rs'\ndoctest=false\n").unwrap();
+        std::fs::write(
+            root.join("lib.rs"),
+            "#[test] fn slow() { panic!(\"must not run\") } #[test] fn fast() {}",
+        )
+        .unwrap();
+    });
+    let sup = sup_from(f);
+    let step = candidates(&sup.f.plan).pop().unwrap();
+    let mut spec = sup.attempt("rust", &TaskInputs::default());
+    let ci = spec.ci.as_mut().unwrap();
+    ci.task_id = step.task_id();
+    // Resolve rustup at test setup; the service environment has a private HOME.
+    let toolchain = std::process::Command::new("rustc")
+        .args(["--print", "sysroot"])
+        .output()
+        .unwrap();
+    assert!(toolchain.status.success());
+    let bin = Path::new(std::str::from_utf8(&toolchain.stdout).unwrap().trim()).join("bin");
+    let path = format!("{}:{}", bin.display(), ci.env["PATH"]);
+    ci.env.insert("PATH".into(), path.clone());
+    ci.env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+    let report = run(&spec).unwrap();
+    assert_eq!(report.termination.unwrap().outcome(), Outcome::Succeeded);
+    let file = spec
+        .spool_dir()
+        .join(spec.attempt_id.as_str())
+        .join("artifacts")
+        .join(RESULT_ARTIFACT);
+    let listing: WorkerListing = serde_json::from_slice(&std::fs::read(file).unwrap()).unwrap();
+    assert_eq!(listing.step, step);
+    assert!(listing.runner_version.starts_with("cargo "));
+    assert_eq!(listing.discovered.tests, ["fast", "slow"]);
+    assert!(listing.discovered.complete);
+
+    let plan = crate::ci::discovery::apply(
+        &sup.f.plan,
+        &[listing],
+        |_| Ok((Default::default(), Default::default(), 2)),
+        |_| local_ci::shard::adapters::Isolation::None,
+    )
+    .unwrap();
+    let group = plan.shard_groups.iter().find(|g| g.split).unwrap();
+    let digest =
+        crate::worker::ci_task::store_plan(&sup.state(), &serde_json::to_vec(&plan).unwrap())
+            .unwrap();
+    for (task, tests) in group.shards.iter().zip(&group.assignments) {
+        let mut spec = sup.attempt("rust", &TaskInputs::default());
+        let ci = spec.ci.as_mut().unwrap();
+        ci.plan_path = crate::worker::ci_task::plan_path(&sup.state(), &digest);
+        ci.plan_digest = digest.clone();
+        ci.task_id = task.clone();
+        ci.verify_shard_version = true;
+        ci.env.insert("PATH".into(), path.clone());
+        ci.env.insert("CARGO_NET_OFFLINE".into(), "true".into());
+        assert_eq!(tests.len(), 1);
+        let passed = tests[0] == "fast";
+        let end = run(&spec).unwrap().termination.unwrap().outcome();
+        assert_eq!(
+            end,
+            if passed {
+                Outcome::Succeeded
+            } else {
+                Outcome::Failed
+            },
+            "{}",
+            sup.output(&spec)
+        );
+        let receipt = sup.result(&spec).unwrap().shard.unwrap();
+        assert!(receipt.parsed);
+        assert_eq!(receipt.exit_ok, passed);
+        assert_eq!(receipt.tests.len(), 1);
+        assert_eq!(receipt.tests[0].identity, tests[0]);
+        assert_eq!(
+            receipt.tests[0].status,
+            if passed {
+                local_ci::shard::TestStatus::Passed
+            } else {
+                local_ci::shard::TestStatus::Failed
+            }
+        );
+    }
 }

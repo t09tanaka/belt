@@ -23,6 +23,7 @@ pub struct CiTaskRow {
 #[derive(Debug, Clone, PartialEq)]
 pub struct CiAttempt {
     pub attempt_id: AttemptId,
+    pub worker: String,
     /// How it ended; `None` while it has not.
     pub termination: Option<Termination>,
     /// The verdict of its collection, once the collection is closed
@@ -33,7 +34,7 @@ pub struct CiAttempt {
 const HELD: &str = "coalesce(json_extract(t.spec_json,'$.ci.hold'),0)=1";
 /// A shard of a split job that has not been joined yet: its job has no
 /// outcome, whether the shard was cancelled or not.
-const UNJOINED_SHARD: &str = "json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL
+const UNJOINED_SHARD: &str = "coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL
     AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0";
 
 /// The task `s` ended, as the progression reads it (`ci::advance::standing`):
@@ -49,6 +50,116 @@ const ENDED_S: &str =
         AND a.state='terminal' AND x.closed_at_ms IS NOT NULL))";
 
 impl CoordinatorStore {
+    pub(crate) fn ci_run_cancelled(&self, run: &RunId, authorization: u64) -> Result<bool> {
+        let run = run.to_string();
+        self.db.call(move |c|Ok(c.query_row("SELECT EXISTS(SELECT 1 FROM run_cancel_intent WHERE run_id=?1 AND control_revision>=?2)",params![run,to_i64(authorization)?],|r|r.get(0))?))
+    }
+
+    /// A retry creates a new progression for the resulting set of task generations.
+    pub(crate) fn ci_driver_authorization(&self, run: &RunId) -> Result<u64> {
+        let run = run.to_string();
+        self.db.call(move |c| {
+            to_u64(c.query_row(
+                "SELECT coalesce(max(authorization_revision),0) FROM task WHERE run_id=?1",
+                [run],
+                |r| r.get(0),
+            )?)
+        })
+    }
+
+    /// Read one revision at a time. A transition can contain a whole validated result.
+    pub(crate) fn ci_driver_record(
+        &self,
+        run: &RunId,
+        authorization: u64,
+        revision: u64,
+    ) -> Result<Option<String>> {
+        let run = run.to_string();
+        self.db.call(move |c| Ok(c.query_row(
+            "SELECT record FROM ci_driver_transition WHERE run_id=?1 AND authorization=?2 AND revision=?3",
+            params![run,to_i64(authorization)?,to_i64(revision)?], |r| r.get(0)).optional()?))
+    }
+
+    /// Commit only the next revision of the current task generations. A second
+    /// observer of an older revision must reconstruct the winner before acting.
+    pub(crate) fn append_ci_driver_record(
+        &self,
+        run: &RunId,
+        authorization: u64,
+        revision: u64,
+        record: String,
+    ) -> Result<bool> {
+        let run = run.to_string();
+        self.db.write(move |tx| Ok(tx.execute(
+            "INSERT INTO ci_driver_transition(run_id,authorization,revision,record)
+             SELECT ?1,?2,?3,?4 WHERE ?3=(SELECT coalesce(max(revision),0)+1 FROM ci_driver_transition WHERE run_id=?1 AND authorization=?2)
+             AND ?2=(SELECT max(authorization_revision) FROM task WHERE run_id=?1)
+             AND EXISTS (SELECT 1 FROM run WHERE run_id=?1 AND closed_at_ms IS NULL)",
+            params![run,to_i64(authorization)?,to_i64(revision)?,record])? == 1))
+    }
+
+    /// Add the complete derived membership before releasing any variant. The
+    /// transaction and its event are replay-safe across a coordinator restart.
+    pub(crate) fn expand_ci_matrix(
+        &self,
+        run: &RunId,
+        origin: &TaskId,
+        authorization: u64,
+        members: Vec<(TaskId, Value)>,
+        at_ms: u64,
+    ) -> Result<bool> {
+        let (run, origin) = (run.to_string(), origin.to_string());
+        self.db.write(move|tx|{
+            let current:i64=tx.query_row("SELECT coalesce(max(authorization_revision),0) FROM task WHERE run_id=?1",[&run],|r|r.get(0))?;
+            if to_u64(current)?!=authorization { return Err(StorageError::Busy); }
+            let mut stmt=tx.prepare("SELECT json_extract(spec_json,'$.ci.task.task_id'),json_extract(spec_json,'$.ci.task.dispatch')
+                FROM task WHERE run_id=?1 AND json_extract(spec_json,'$.ci.task.dispatch.origin')=(
+                  SELECT json_extract(spec_json,'$.ci.task.task_id') FROM task WHERE run_id=?1 AND task_id=?2)")?;
+            let stored=stmt.query_map(params![run,origin],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?)))?.collect::<std::result::Result<std::collections::BTreeMap<_,_>,_>>()?;
+            drop(stmt);
+            if !stored.is_empty() {
+                if stored.len()!=members.len() || members.iter().any(|(_,spec)| {
+                    let task=&spec["ci"]["task"]; let found=task["task_id"].as_str().and_then(|id|stored.get(id));
+                    !found.is_some_and(|text|serde_json::from_str::<Value>(text).ok().as_ref()==Some(&task["dispatch"]))
+                }) { return Err(StorageError::Immutable("matrix membership or its inputs changed on retry; submit a new run".into())); }
+                tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.expanded_for',?1) WHERE task_id=?2",params![current,origin])?;
+                return Ok(false);
+            }
+            let eligible:bool=tx.query_row("SELECT EXISTS(SELECT 1 FROM task t JOIN run r USING(run_id) WHERE t.run_id=?1 AND t.task_id=?2 AND r.closed_at_ms IS NULL AND t.cancel_requested_at_ms IS NULL AND json_extract(t.spec_json,'$.ci.dynamic_origin')=1)",params![run,origin],|r|r.get(0))?;
+            if !eligible { return Ok(false); }
+            let count:i64=tx.query_row("SELECT count(*) FROM task WHERE run_id=?1",[&run],|r|r.get(0))?;
+            if count as usize+members.len()>super::queue::MAX_TASKS_PER_RUN { return Err(StorageError::Invalid("expanded CI run exceeds task limit".into())); }
+            let names:Vec<_>=members.iter().map(|(_,v)|v["ci"]["task"]["task_id"].clone()).collect();
+            for (id,spec) in members {
+                tx.execute("INSERT INTO task(task_id,run_id,spec_json,created_at_ms,authorization_revision) VALUES(?1,?2,?3,?4,?5)",
+                    params![id.as_str(),run,spec.to_string(),to_i64(at_ms)?,current])?;
+            }
+            tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.expanded_for',?1) WHERE task_id=?2",params![current,origin])?;
+            let seq:i64=tx.query_row("SELECT count(*)+1 FROM event WHERE run_id=?1 AND kind='matrix_expanded'",[&run],|r|r.get(0))?;
+            common::append_event(tx,Some(&run),None,"matrix_expanded",&serde_json::json!({"origin":origin,"expansion_seq":seq,"tasks":names}),at_ms)?;
+            Ok(true)
+        })
+    }
+
+    pub(crate) fn complete_ci_origin(
+        &self,
+        run: &RunId,
+        origin: &TaskId,
+        authorization: u64,
+        status: &str,
+        at_ms: u64,
+    ) -> Result<bool> {
+        let (run, origin, status) = (run.to_string(), origin.to_string(), status.to_string());
+        self.db.write(move|tx|{
+            let changed=tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.core_outcome',?3) WHERE run_id=?1 AND task_id=?2
+                AND json_extract(spec_json,'$.ci.dynamic_origin')=1 AND json_extract(spec_json,'$.ci.core_outcome') IS NULL
+                AND ?4=(SELECT max(authorization_revision) FROM task WHERE run_id=?1)",
+                params![run,origin,status,to_i64(authorization)?])?;
+            if changed>0 { common::append_event(tx,Some(&run),None,"ci_matrix_joined",&serde_json::json!({"origin":origin,"status":status}),at_ms)?; }
+            Ok(changed>0)
+        })
+    }
+
     /// The runs that have a task waiting for the jobs it needs, or a shard
     /// of a split job that is not joined yet (a failed shard may have to
     /// stop the others, and the job needs its one outcome before the run is
@@ -59,7 +170,7 @@ impl CoordinatorStore {
         self.db.call(move |c| {
             let mut query = c.prepare(&format!(
                 "SELECT t.run_id FROM task t JOIN run r ON r.run_id=t.run_id
-                 WHERE (({HELD} AND t.cancel_requested_at_ms IS NULL) OR ({UNJOINED_SHARD}))
+                 WHERE (({HELD} AND t.cancel_requested_at_ms IS NULL AND json_extract(t.spec_json,'$.ci.core_outcome') IS NULL) OR ({UNJOINED_SHARD}))
                  AND r.closed_at_ms IS NULL
                  GROUP BY t.run_id ORDER BY min(t.created_at_ms), min(t.rowid) LIMIT ?1"
             ))?;
@@ -99,7 +210,7 @@ impl CoordinatorStore {
             let mut query = c.prepare(
                 "SELECT t.task_id,t.spec_json,t.cancel_requested_at_ms IS NOT NULL,
                         a.attempt_id,a.state,a.termination_json,
-                        CASE WHEN x.closed_at_ms IS NOT NULL THEN x.verdict ELSE NULL END
+                        CASE WHEN x.closed_at_ms IS NOT NULL THEN x.verdict ELSE NULL END,a.worker_id
                  FROM task t
                  LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa
                      WHERE aa.task_id=t.task_id AND aa.retired=0 AND aa.generation>=t.min_generation
@@ -125,6 +236,7 @@ impl CoordinatorStore {
                                 .map(|t| from_json("termination", &t))
                                 .transpose()?,
                             collection: row.get(6)?,
+                            worker: row.get(7)?,
                         })
                     }
                 };
@@ -158,6 +270,20 @@ impl CoordinatorStore {
         rerun: &[String],
         at_ms: u64,
     ) -> Result<bool> {
+        self.join_ci_shards_with_timings(run, group, failure, rerun, at_ms, None)
+    }
+
+    /// Keep verified runner times in the very transaction that accepts the
+    /// group. Replaying a join cannot write older observations back.
+    pub fn join_ci_shards_with_timings(
+        &self,
+        run: &RunId,
+        group: &str,
+        failure: Option<&str>,
+        rerun: &[String],
+        at_ms: u64,
+        timings: Option<(String, Vec<(String, local_ci::shard::History)>)>,
+    ) -> Result<bool> {
         let (run, group, failure, rerun) = (
             run.to_string(),
             group.to_string(),
@@ -170,20 +296,29 @@ impl CoordinatorStore {
                     "UPDATE task AS t SET spec_json=CASE WHEN ?3 IS NULL
                         THEN json_set(t.spec_json,'$.ci.joined',json('true'))
                         ELSE json_set(t.spec_json,'$.ci.joined',json('true'),'$.ci.join_failure',?3) END
-                     WHERE t.run_id=?1 AND json_extract(t.spec_json,'$.ci.shard_group')=?2
+                     WHERE t.run_id=?1 AND coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group'))=?2
                      AND {UNJOINED_SHARD}
                      AND NOT EXISTS (SELECT 1 FROM task s WHERE s.run_id=?1
-                        AND json_extract(s.spec_json,'$.ci.shard_group')=?2 AND NOT {ENDED_S})"
+                        AND coalesce(json_extract(s.spec_json,'$.ci.shard_group'),json_extract(s.spec_json,'$.ci.matrix.group'))=?2 AND NOT {ENDED_S})"
                 ),
                 params![run, group, failure],
             )?;
             if changed == 0 {
                 return Ok(false);
             }
+            if let Some((scope, history)) = timings {
+                let mut insert = tx.prepare_cached("INSERT INTO ci_test_timing(scope,worker,identity,millis) VALUES(?1,?2,?3,?4)
+                    ON CONFLICT(scope,identity,worker) DO UPDATE SET millis=excluded.millis")?;
+                for (worker, shard) in history {
+                    for (identity, millis) in shard.millis {
+                        insert.execute(params![scope, worker, identity, to_i64(millis)?])?;
+                    }
+                }
+            }
             for task in &rerun {
                 tx.execute(
                     "UPDATE task SET spec_json=json_set(spec_json,'$.ci.rerun',json('true'))
-                     WHERE run_id=?1 AND json_extract(spec_json,'$.ci.shard_group')=?2
+                     WHERE run_id=?1 AND coalesce(json_extract(spec_json,'$.ci.shard_group'),json_extract(spec_json,'$.ci.matrix.group'))=?2
                      AND json_extract(spec_json,'$.ci.task.task_id')=?3",
                     params![run, group, task],
                 )?;
@@ -228,6 +363,85 @@ impl CoordinatorStore {
         })
     }
 
+    /// The timings used to make one partition. Read only the identities in
+    /// this listing: obsolete files in a repository cannot grow the snapshot.
+    pub fn ci_test_timings(
+        &self,
+        scope: String,
+        identities: Vec<String>,
+    ) -> Result<std::collections::BTreeMap<String, local_ci::shard::History>> {
+        self.db.call(move |c| {
+            let tx = c.unchecked_transaction()?;
+            let mut history = std::collections::BTreeMap::<String, local_ci::shard::History>::new();
+            {
+                let mut query = tx.prepare_cached(
+                    "SELECT worker,millis FROM ci_test_timing WHERE scope=?1 AND identity=?2",
+                )?;
+                for identity in identities {
+                    let mut rows = query.query(params![scope, identity])?;
+                    while let Some(row) = rows.next()? {
+                        let worker: String = row.get(0)?;
+                        history
+                            .entry(worker)
+                            .or_default()
+                            .millis
+                            .insert(identity.clone(), to_u64(row.get(1)?)?);
+                    }
+                }
+            }
+            tx.commit()?;
+            Ok(history)
+        })
+    }
+
+    /// Commit a frozen partition once. The first shard keeps the submitter's
+    /// task id. Later shards inherit any per-task cancellation that won the
+    /// race. The run-cancel trigger also applies to every inserted row.
+    pub fn apply_ci_discovery(
+        &self,
+        run: &RunId,
+        previous: &Digest,
+        next: &Digest,
+        probe_ids: Vec<TaskId>,
+        replacements: Vec<(TaskId, Vec<(TaskId, Value)>)>,
+        at_ms: u64,
+    ) -> Result<bool> {
+        let run = run.to_string();
+        let (previous, next) = (previous.to_string(), next.to_string());
+        self.db.write(move |tx| {
+            for id in &probe_ids {
+                let pending: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM task WHERE run_id=?1 AND task_id=?2
+                     AND json_extract(spec_json,'$.ci.task.inputs.rtr_discovery.applied')=0 AND coalesce(json_extract(spec_json,'$.ci.task.inputs.rtr_discovery.active_plan'),json_extract(spec_json,'$.plan_digest'))=?3)",
+                    params![run, id.as_str(),previous], |r| r.get(0))?;
+                if !pending { return Ok(false); }
+            }
+            for (old, parts) in replacements {
+                let cancelled: Option<i64> = tx.query_row(
+                    "SELECT cancel_requested_at_ms FROM task t WHERE run_id=?1 AND task_id=?2
+                     AND json_extract(spec_json,'$.ci.hold')=1
+                     AND NOT EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)",
+                    params![run, old.as_str()], |r| r.get(0))?;
+                for (id, spec) in parts {
+                    if id == old {
+                        tx.execute("UPDATE task SET spec_json=?3 WHERE run_id=?1 AND task_id=?2",
+                            params![run, id.as_str(), spec.to_string()])?;
+                    } else {
+                        tx.execute("INSERT INTO task(task_id,run_id,spec_json,created_at_ms,cancel_requested_at_ms) VALUES(?1,?2,?3,?4,?5)",
+                            params![id.as_str(),run,spec.to_string(),to_i64(at_ms)?,cancelled])?;
+                    }
+                }
+            }
+            for id in probe_ids {
+                tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.rtr_discovery.applied',json('true'),'$.ci.task.inputs.rtr_discovery.applied_plan',?3) WHERE run_id=?1 AND task_id=?2",
+                    params![run, id.as_str(),next])?;
+            }
+            tx.execute("UPDATE task SET spec_json=json_set(spec_json,'$.ci.task.inputs.rtr_discovery.active_plan',?2) WHERE run_id=?1 AND json_type(spec_json,'$.ci.task.inputs.rtr_discovery')='object'",params![run,next])?;
+            common::append_event(tx,Some(&run),None,"ci_discovery_applied",&serde_json::json!({}),at_ms)?;
+            Ok(true)
+        })
+    }
+
     /// Let a waiting task into the queue with the spec that holds its inputs
     /// (`spec` no longer has `ci.hold`). Nothing changes, and `false` is
     /// returned, when the task does not wait any more or a cancel was
@@ -244,9 +458,11 @@ impl CoordinatorStore {
         self.db.write(move |tx| {
             let changed = tx.execute(
                 &format!(
-                    "UPDATE task AS t SET spec_json=?2 WHERE t.task_id=?1 AND {HELD}
+                    "UPDATE task AS t SET spec_json=CASE WHEN json_type(t.spec_json,'$.ci.task.inputs.rtr_discovery')='object'
+                        THEN json_set(?2,'$.ci.task.inputs.rtr_discovery',json_extract(t.spec_json,'$.ci.task.inputs.rtr_discovery'))
+                        ELSE ?2 END WHERE t.task_id=?1 AND {HELD}
                      AND t.cancel_requested_at_ms IS NULL
-                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)"
+                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))"
                 ),
                 params![task, spec],
             )?;

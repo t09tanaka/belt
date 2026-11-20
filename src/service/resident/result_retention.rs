@@ -346,6 +346,12 @@ pub(super) mod tests {
             others.iter().all(|(_, a)| !f.directory(a).exists())
         })
         .await;
+        // Each run is paged independently. Collection of the other runs
+        // does not establish that the stuck run has been claimed yet.
+        until("the stuck run has a pending deletion", || {
+            f.pending(&stuck_run) == 1
+        })
+        .await;
         // A run that expires after the failures began is collected as well.
         let (_, late) = f.expired();
         until("a later run's result is deleted", || {

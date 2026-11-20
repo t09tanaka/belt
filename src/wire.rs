@@ -246,10 +246,11 @@ pub enum Operation {
     ForecastCommand,
     ResolveToolchains,
     PreparationProbe,
+    WorkflowArtifact,
 }
 
 impl Operation {
-    pub const ALL: [Operation; 22] = [
+    pub const ALL: [Operation; 23] = [
         Operation::Hello,
         Operation::Inspect,
         Operation::Forecast,
@@ -272,12 +273,14 @@ impl Operation {
         Operation::ForecastCommand,
         Operation::ResolveToolchains,
         Operation::PreparationProbe,
+        Operation::WorkflowArtifact,
     ];
 
     pub fn idempotency(self) -> Idempotency {
         match self {
             Operation::SubmitAttempt => Idempotency::AttemptAndPayload,
-            Operation::RenewLease
+            Operation::WorkflowArtifact
+            | Operation::RenewLease
             | Operation::CancelAttempt
             | Operation::RetireAttempt
             | Operation::AckCollected
@@ -440,6 +443,9 @@ pub struct Correlation {
 /// number is `None` when unknown; an absent value is never read as zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadNode {
+    /// Opaque SDK step identity for this source, matrix task and working directory.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ci_history_key: Option<crate::ids::Digest>,
     pub node_id: NodeId,
     #[serde(default)]
     pub depends_on: Vec<NodeId>,
@@ -903,6 +909,20 @@ pub struct AttemptPayload {
 /// no build's `SUPPORTED_FEATURES`, and a CI task that was not negotiated is
 /// refused.
 pub const CI_TASK_FEATURE: &str = "ci_task_v1";
+pub const WORKFLOW_ARTIFACTS_FEATURE: &str = "ci_workflow_artifacts_v1";
+pub const MATRIX_DISPATCH_FEATURE: &str = "ci_matrix_dispatch_v1";
+/// The worker can run dedicated listing attempts before the CI plan is partitioned.
+pub const CI_DISCOVERY_FEATURE: &str = "ci_discovery_v1";
+
+pub fn is_discovery_task(task: &CiTask) -> bool {
+    task.task_id
+        .strip_prefix("rtr-discover-")
+        .is_some_and(|id| Digest::parse(id).is_ok())
+}
+
+pub fn requires_discovery_feature(task: &CiTask) -> bool {
+    is_discovery_task(task) || task.verify_shard_version
+}
 
 /// One task of a frozen CI plan (spec chapter 7). The plan itself is not
 /// here: its bytes reach the worker as a content-addressed blob, and the
@@ -910,6 +930,14 @@ pub const CI_TASK_FEATURE: &str = "ci_task_v1";
 /// the task as the plan says and never plans again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTask {
+    /// An enumerated shard checks the discovered runner version after setup.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_shard_version: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_workflow: Option<String>,
+    /// Sealed SDK dispatch for one member derived from a dynamic matrix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<serde_json::Value>,
     /// SHA-256 of the bytes of the frozen plan.
     pub plan_digest: Digest,
     /// The task of the plan to run.
@@ -1631,6 +1659,8 @@ pub struct EnvReportResponse {
     pub arch: String,
     pub profile_fingerprint: Digest,
     pub tools: Vec<ToolStatus>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<crate::toolchain::envdiff::EnvReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1777,6 +1807,76 @@ pub struct PreparationProbeResponse {
     pub probe: crate::setup::preparation_probe::PreparationProbe,
 }
 
+/// Exchange for a live artifact action. Commands and replies are scoped to
+/// the accepted generation. Only digest identifiers cross the filesystem boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowArtifactRequest {
+    pub schema_version: SchemaVersion,
+    pub request_id: RequestId,
+    pub coordinator_epoch: CoordinatorEpoch,
+    pub attempt_id: AttemptId,
+    pub generation: Generation,
+    pub command: WorkflowArtifactCommand,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum WorkflowArtifactCommand {
+    Poll,
+    Read {
+        key: Digest,
+        digest: Digest,
+        offset: u64,
+    },
+    Answer {
+        key: Digest,
+        answer: ArtifactAnswer,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactAction {
+    pub key: Digest,
+    pub intent: ArtifactIntent,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactIntent {
+    Upload {
+        receipt: serde_json::Value,
+        overwrite: bool,
+    },
+    Catalog {
+        name: Option<String>,
+        pattern: Option<String>,
+    },
+    Fetch {
+        producer: AttemptId,
+        name: String,
+        version: u32,
+        digest: Digest,
+        offset: u64,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactAnswer {
+    Uploaded { version: u32 },
+    Catalog { artifacts: Vec<serde_json::Value> },
+    Chunk { data: Bytes },
+    Failed { reason: String },
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkflowArtifactResponse {
+    pub schema_version: SchemaVersion,
+    pub result: ArtifactExchangeResult,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ArtifactExchangeResult {
+    Pending { action: Option<ArtifactAction> },
+    Chunk { data: Bytes },
+    Accepted,
+}
+
 operations! {
     Hello(HelloRequest, HelloResponse),
     Inspect(InspectRequest, InspectResponse),
@@ -1800,6 +1900,7 @@ operations! {
     EnvSync(EnvSyncRequest, EnvSyncResponse),
     ResolveToolchains(ResolveToolchainsRequest, ResolveToolchainsResponse),
     PreparationProbe(PreparationProbeRequest, PreparationProbeResponse),
+    WorkflowArtifact(WorkflowArtifactRequest, WorkflowArtifactResponse),
 }
 
 /// An error reply.
@@ -1816,6 +1917,8 @@ pub struct ErrorResponse {
 /// are the protocol layer's concern).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
+// Keep the public frame constructors consistent with Request. Each frame is processed individually.
+#[allow(clippy::large_enum_variant)]
 pub enum Message {
     Request(Request),
     Response {
@@ -1874,6 +1977,7 @@ mod tests {
             plan_digest: dg("plan"),
             expansion_seq: 1,
             nodes: vec![WorkloadNode {
+                ci_history_key: None,
                 node_id: node("test"),
                 depends_on: vec![node("setup")],
                 priority: 0,
@@ -2243,6 +2347,14 @@ mod tests {
             requirements: Default::default(),
         }));
         out.push(Request::PreparationProbe(preparation_probe_request()));
+        out.push(Request::WorkflowArtifact(WorkflowArtifactRequest {
+            schema_version: SV,
+            request_id: rid(),
+            coordinator_epoch: CoordinatorEpoch(3),
+            attempt_id: AttemptId::generate(),
+            generation: Generation(1),
+            command: WorkflowArtifactCommand::Poll,
+        }));
         out
     }
 
@@ -2425,6 +2537,7 @@ mod tests {
                 os: "macos".into(),
                 arch: "aarch64".into(),
                 profile_fingerprint: dg("p"),
+                environment: None,
                 tools: vec![ToolStatus {
                     name: "node".into(),
                     required: "22".into(),
@@ -2453,6 +2566,10 @@ mod tests {
             worker_boot_id: boot(),
             agent_epoch: AgentEpoch(1),
             probe: crate::setup::preparation_probe::PreparationProbe::NoManagedPreparation,
+        }));
+        out.push(Response::WorkflowArtifact(WorkflowArtifactResponse {
+            schema_version: SV,
+            result: ArtifactExchangeResult::Pending { action: None },
         }));
         out
     }
@@ -2712,6 +2829,7 @@ mod tests {
             (SubmitAttempt, AttemptAndPayload),
             (GetAttempt, ReadOnly),
             (ListAttempts, ReadOnly),
+            (WorkflowArtifact, RequestId),
             (RenewLease, RequestId),
             (CancelAttempt, RequestId),
             (RetireAttempt, RequestId),
@@ -3268,6 +3386,26 @@ mod tests {
     }
 
     #[test]
+    fn discovery_task_ids_require_the_discovery_feature_without_a_version_check() {
+        let digest = dg("shard discovery");
+        let mut task = CiTask {
+            task_id: format!("rtr-discover-{digest}"),
+            plan_digest: dg("plan"),
+            inputs: json!({}),
+            dispatch: None,
+            artifact_workflow: None,
+            verify_shard_version: false,
+        };
+        assert!(is_discovery_task(&task));
+        assert!(requires_discovery_feature(&task));
+        for id in ["ci.yml/test", "rtr-discover-invalid"] {
+            task.task_id = id.into();
+            assert!(!is_discovery_task(&task));
+            assert!(!requires_discovery_feature(&task));
+        }
+    }
+
+    #[test]
     fn a_ci_task_is_part_of_the_payload_hash_and_not_written_when_absent() {
         let base = payload();
         assert!(serde_json::to_value(&base)
@@ -3275,6 +3413,9 @@ mod tests {
             .get("ci_task")
             .is_none());
         let task = |inputs: serde_json::Value| CiTask {
+            verify_shard_version: false,
+            artifact_workflow: None,
+            dispatch: None,
             plan_digest: dg("frozen plan"),
             task_id: "ci.yml/build".into(),
             inputs,

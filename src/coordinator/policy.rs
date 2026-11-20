@@ -229,12 +229,56 @@ pub fn may_send(facts: Facts) -> bool {
 
 /// What a worker that cannot be given a CI task lacks, as a placement
 /// records it for the worker it left out.
+pub fn unmet_ci(spec: &super::TaskSpec, link: &dyn super::WorkerLink) -> Option<&'static str> {
+    if let Some(reason) = missing_ci_feature(
+        spec,
+        link.ci_task_negotiated(),
+        link.ci_discovery_negotiated(),
+    ) {
+        return Some(reason);
+    }
+    if spec
+        .ci
+        .as_ref()
+        .is_some_and(|ci| ci.task.dispatch.is_some())
+        && !link.matrix_dispatch_negotiated()
+    {
+        return Some("protocol feature ci_matrix_dispatch_v1");
+    }
+    if spec
+        .ci
+        .as_ref()
+        .is_some_and(|ci| ci.task.artifact_workflow.is_some())
+        && !link.workflow_artifacts_negotiated()
+    {
+        return Some("protocol feature ci_workflow_artifacts_v1");
+    }
+    None
+}
+
+pub const DISCOVERY_UNMET: &str = "protocol feature ci_discovery_v1";
 pub const CI_TASK_UNMET: &str = "protocol feature ci_task_v1";
 
 /// Is a worker left out of the placement of `spec` because the task is a CI
 /// task and its connection did not negotiate `ci_task_v1`?
 pub fn lacks_ci_task(spec: &super::TaskSpec, negotiated: bool) -> bool {
     spec.ci.is_some() && !negotiated
+}
+
+pub fn missing_ci_feature(
+    spec: &super::TaskSpec,
+    ci: bool,
+    discovery: bool,
+) -> Option<&'static str> {
+    if lacks_ci_task(spec, ci) {
+        return Some(CI_TASK_UNMET);
+    }
+    (spec
+        .ci
+        .as_ref()
+        .is_some_and(|s| crate::wire::requires_discovery_feature(&s.task))
+        && !discovery)
+        .then_some(DISCOVERY_UNMET)
 }
 
 /// The result of a CI task is one more required artifact of its attempt: do
@@ -268,12 +312,18 @@ pub fn workload_of_spec(
     ready_delay_ms: Option<u64>,
 ) -> crate::wire::WorkloadPlan {
     match &spec.ci {
-        Some(ci) => crate::scheduler::ci_workload_of(
-            attempt_id,
-            &spec.plan_digest,
-            ci.steps,
-            ready_delay_ms,
-        ),
+        Some(ci) => {
+            let mut workload = crate::scheduler::ci_workload_of(
+                attempt_id,
+                &spec.plan_digest,
+                ci.steps,
+                ready_delay_ms,
+            );
+            for (node, key) in workload.nodes.iter_mut().zip(&ci.history_keys) {
+                node.ci_history_key.clone_from(key);
+            }
+            workload
+        }
         None => crate::scheduler::workload_of(
             attempt_id,
             &spec.plan_digest,
@@ -302,7 +352,16 @@ mod tests {
         let digest = crate::ids::Digest::of_bytes(b"plan");
         crate::coordinator::TaskSpec {
             ci: ci.then(|| crate::coordinator::CiSpec {
+                history_keys: Vec::new(),
+                dynamic_origin: false,
+                core_outcome: None,
+                matrix: None,
+                shard_retry_forbidden: false,
+                shard_preferred_worker: None,
                 task: crate::wire::CiTask {
+                    verify_shard_version: false,
+                    artifact_workflow: None,
+                    dispatch: None,
                     plan_digest: digest.clone(),
                     task_id: "ci.yml/build".into(),
                     inputs: serde_json::json!({"needs": {}}),
@@ -329,6 +388,75 @@ mod tests {
             has_secret_bundle: false,
             artifacts: Vec::new(),
         }
+    }
+
+    #[test]
+    fn placement_reports_the_first_required_ci_feature_the_worker_lacks() {
+        use crate::coordinator::tests::Silent;
+        use crate::wire::{
+            CI_DISCOVERY_FEATURE, CI_TASK_FEATURE, MATRIX_DISPATCH_FEATURE,
+            WORKFLOW_ARTIFACTS_FEATURE,
+        };
+
+        // Base CI support precedes discovery, matrix dispatch, and artifacts
+        // when more than one required feature is absent from the worker.
+        let features = [
+            CI_TASK_FEATURE,
+            CI_DISCOVERY_FEATURE,
+            MATRIX_DISPATCH_FEATURE,
+            WORKFLOW_ARTIFACTS_FEATURE,
+        ];
+        let subsets = |features: &[&'static str]| -> Vec<Vec<&'static str>> {
+            (0..1usize << features.len())
+                .map(|mask| {
+                    features
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, feature)| {
+                            (mask & (1 << index) != 0).then_some(*feature)
+                        })
+                        .collect()
+                })
+                .collect()
+        };
+        let optional_requirements = subsets(&features[1..]);
+        for negotiated in subsets(&features) {
+            let link = Silent::with_features(negotiated);
+            assert_eq!(unmet_ci(&task_spec(false), &link), None);
+            for optional in &optional_requirements {
+                let mut spec = task_spec(true);
+                let task = &mut spec.ci.as_mut().unwrap().task;
+                task.verify_shard_version = optional.contains(&CI_DISCOVERY_FEATURE);
+                task.dispatch = optional
+                    .contains(&MATRIX_DISPATCH_FEATURE)
+                    .then(|| serde_json::json!({}));
+                task.artifact_workflow = optional
+                    .contains(&WORKFLOW_ARTIFACTS_FEATURE)
+                    .then(|| "ci.yml".into());
+                let expected = std::iter::once(&CI_TASK_FEATURE)
+                    .chain(optional)
+                    .find(|feature| !link.features.contains(feature))
+                    .map(|feature| format!("protocol feature {feature}"));
+                assert_eq!(
+                    unmet_ci(&spec, &link),
+                    expected.as_deref(),
+                    "optional {optional:?}, negotiated {:?}",
+                    link.features
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_version_bound_shard_requires_the_discovery_protocol_on_its_execution_worker() {
+        let mut spec = task_spec(true);
+        assert_eq!(missing_ci_feature(&spec, true, false), None);
+        spec.ci.as_mut().unwrap().task.verify_shard_version = true;
+        assert_eq!(
+            missing_ci_feature(&spec, true, false),
+            Some("protocol feature ci_discovery_v1")
+        );
+        assert_eq!(missing_ci_feature(&spec, true, true), None);
     }
 
     #[test]

@@ -135,8 +135,23 @@ impl Index {
         }
         .context("initial source guard")?;
         this.prepare_index_file()?;
-        this.connect().context("connect source index")?.execute_batch("PRAGMA synchronous=FULL;
-          CREATE TABLE IF NOT EXISTS root(id TEXT PRIMARY KEY,kind TEXT NOT NULL,source TEXT);
+        this.initialize_schema()
+            .context("initialize source index")?;
+        Ok((this, guard))
+    }
+
+    fn initialize_schema(&self) -> Result<()> {
+        let mut db = self.connect().context("connect source index")?;
+        let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if version == 1 {
+            return Ok(());
+        }
+        ensure!(version == 0, "unknown source index version {version}");
+        // A new index and an unversioned legacy index use the same idempotent
+        // migration. Publish the marker atomically with the tables and rows.
+        db.pragma_update(None, "synchronous", "FULL")?;
+        let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS root(id TEXT PRIMARY KEY,kind TEXT NOT NULL,source TEXT);
           CREATE INDEX IF NOT EXISTS root_kind ON root(kind,id);
           CREATE INDEX IF NOT EXISTS root_unknown ON root(source,kind,id);
           CREATE TABLE IF NOT EXISTS object(id TEXT PRIMARY KEY,path TEXT NOT NULL);
@@ -154,8 +169,10 @@ impl Index {
           CREATE INDEX IF NOT EXISTS vault_delete_pending ON vault_delete_claim(done,run_id);
           CREATE TABLE IF NOT EXISTS import_session(token TEXT PRIMARY KEY,state TEXT NOT NULL CHECK(state IN ('pending','publishing','published','bound')),source TEXT,run_id TEXT);
           CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY,value TEXT NOT NULL);
-          INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');").context("initialize source index")?;
-        Ok((this, guard))
+          INSERT OR IGNORE INTO meta VALUES('legacy_registration','pending');")?;
+        tx.pragma_update(None, "user_version", 1)?;
+        tx.commit()?;
+        Ok(())
     }
     fn prepare_index_file(&self) -> Result<()> {
         use rustix::fs::{statat, AtFlags, FileType, Mode, OFlags, RenameFlags};
@@ -274,12 +291,24 @@ impl Index {
         })
     }
     fn connect(&self) -> Result<Connection> {
+        self.connect_with_timeout(std::time::Duration::from_secs(1))
+    }
+
+    // Transfers from independent connections and processes publish short
+    // transactions to the same index. Give foreground writes the five-second
+    // busy budget used by the coordinator database. Maintenance keeps its
+    // shorter budget so it can yield between pages.
+    fn connect_for_import(&self) -> Result<Connection> {
+        self.connect_with_timeout(std::time::Duration::from_secs(5))
+    }
+
+    fn connect_with_timeout(&self, timeout: std::time::Duration) -> Result<Connection> {
         self.current()?;
         let c = Connection::open_with_flags(
             &self.database,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NOFOLLOW,
         )?;
-        c.busy_timeout(std::time::Duration::from_secs(1))?;
+        c.busy_timeout(timeout)?;
         Ok(c)
     }
     pub(crate) fn pending(&self, id: &str) -> Result<()> {
@@ -571,13 +600,18 @@ impl Index {
         tx.commit()?;
         Ok(keys.len() < 32)
     }
-    fn check_token(&self, token: &ImportToken) -> Result<()> {
+    fn check_token_store(&self, token: &ImportToken) -> Result<()> {
         self.current()?;
         let m = self.root.metadata()?;
         ensure!(
             (m.dev(), m.ino()) == token.store,
             "foreign source import token"
         );
+        Ok(())
+    }
+
+    fn check_token(&self, token: &ImportToken) -> Result<()> {
+        self.check_token_store(token)?;
         let exists: bool = self.connect()?.query_row(
             "SELECT EXISTS(SELECT 1 FROM import_session WHERE token=?1)",
             [&token.id],
@@ -587,16 +621,19 @@ impl Index {
         Ok(())
     }
     pub(crate) fn import_blob(&self, token: &ImportToken, hash: &str) -> Result<()> {
-        self.check_token(token)?;
-        let mut c = self.connect()?;
+        self.check_token_store(token)?;
+        let mut c = self.connect_for_import()?;
         // Reserve the writer before reading. Competing Deferred readers cannot
         // both upgrade to a writer, even with SQLite's busy timeout installed.
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let pending: bool = tx.query_row(
-            "SELECT state='pending' FROM import_session WHERE token=?1",
-            [&token.id],
-            |r| r.get(0),
-        )?;
+        let pending: bool = tx
+            .query_row(
+                "SELECT state='pending' FROM import_session WHERE token=?1",
+                [&token.id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .context("unknown source import token")?;
         ensure!(pending, "source import already published");
         let key = format!("b:{hash}");
         Self::check_publication(&tx, &key)?;
@@ -731,7 +768,10 @@ impl Guard {
     /// The SDK discovers content IDs while writing. Pending claims therefore
     /// fence the whole raw SDK operation until B completes their incarnations.
     pub(crate) fn ensure_sdk_available(&self) -> Result<()> {
-        let claimed: bool = self.index.connect()?.query_row(
+        Self::check_sdk_available(&self.index.connect()?)
+    }
+    fn check_sdk_available(c: &Connection) -> Result<()> {
+        let claimed: bool = c.query_row(
             "SELECT EXISTS(SELECT 1 FROM publication WHERE state='claimed')",
             [],
             |r| r.get(0),
@@ -760,17 +800,16 @@ impl SourceStore {
         self.retention.guard(false)
     }
     pub fn begin_import(&self) -> Result<ImportToken> {
-        let guard = self.mutation_guard()?;
-        // Do not create an unknown root that would prevent an older claim
-        // from draining while this import waits to publish its incarnation.
-        guard.ensure_sdk_available()?;
+        let _guard = self.mutation_guard()?;
         let metadata = self.retention.root.metadata()?;
         let token = ImportToken {
             id: ulid::Ulid::new().to_string(),
             store: (metadata.dev(), metadata.ino()),
         };
-        let mut c = self.retention.connect()?;
+        let mut c = self.retention.connect_for_import()?;
         let tx = c.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        // Check the outstanding claim and register this root atomically.
+        Guard::check_sdk_available(&tx)?;
         tx.execute(
             "INSERT INTO import_session(token,state) VALUES(?1,'pending')",
             [&token.id],
@@ -1756,6 +1795,31 @@ mod tests {
         }
     }
     #[test]
+    fn unversioned_source_indexes_keep_existing_registration_data_on_upgrade() {
+        let f = Fixture::new();
+        let db = f.store.retention.connect().unwrap();
+        db.execute(
+            "UPDATE meta SET value='done' WHERE key='legacy_registration'",
+            [],
+        )
+        .unwrap();
+        db.pragma_update(None, "user_version", 0).unwrap();
+        Index::open(f.store.root()).unwrap();
+        let version: u32 = db
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 1);
+        let registration: String = db
+            .query_row(
+                "SELECT value FROM meta WHERE key='legacy_registration'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(registration, "done");
+    }
+
+    #[test]
     fn opening_another_index_preserves_live_sqlite_writer_exclusion() {
         fn probe(path: &Path) -> String {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
@@ -1775,17 +1839,10 @@ mod tests {
         let first = f.store.retention.connect().unwrap();
         first.execute_batch("BEGIN IMMEDIATE").unwrap();
         assert!(probe(&f.store.retention.database).contains("RTR_INDEX_PROBE=BUSY"));
-        // Initializing another connection needs a write too. It may report
-        // BUSY, but its cleanup must not release this process's existing lock.
-        let reopened = Index::open(f.store.root()).unwrap_err();
-        assert!(
-            matches!(
-                reopened.downcast_ref::<rusqlite::Error>(),
-                Some(rusqlite::Error::SqliteFailure(error, _))
-                    if error.code == rusqlite::ErrorCode::DatabaseBusy
-            ),
-            "{reopened:#}"
-        );
+        // The schema is already initialized. Opening it succeeds while the
+        // writer is active and never releases that writer's exclusion.
+        let reopened = Index::open(f.store.root()).unwrap();
+        drop(reopened);
         assert!(!first.is_autocommit());
         let after = probe(&f.store.retention.database);
         assert!(after.contains("RTR_INDEX_PROBE=BUSY"), "{after}");
@@ -2240,6 +2297,43 @@ mod tests {
         assert_eq!(count(&reopened, a.received_root()), 0);
         assert_eq!(count(&reopened, b.root()), 1);
         assert_eq!(reopened.source_of_run(&run).unwrap().unwrap(), id);
+    }
+
+    #[test]
+    fn blob_receivers_wait_for_a_competing_source_index_writer() {
+        let f = Fixture::new();
+        let data = b"a shared transfer";
+        let want = super::super::diff::BlobWant {
+            hash: format!("{:x}", sha2::Sha256::digest(data)),
+            size: data.len() as u64,
+        };
+        let token = f.store.begin_import().unwrap();
+        let writer = f.store.retention.connect().unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let entering = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            let legacy = scope.spawn(|| {
+                entering.wait();
+                f.store.ingest_blob(&want, &mut &data[..])
+            });
+            let bound = scope.spawn(|| {
+                entering.wait();
+                f.store
+                    .ingest_blob_with_token(&token, &want, &mut &data[..])
+            });
+            entering.wait();
+            // Hold the external writer longer than a maintenance connection's
+            // one-second wait, but within the foreground intake deadline.
+            std::thread::sleep(std::time::Duration::from_millis(1400));
+            writer.execute_batch("COMMIT").unwrap();
+            let legacy_result = legacy.join().unwrap();
+            let bound_result = bound.join().unwrap();
+            assert!(
+                legacy_result.is_ok() && bound_result.is_ok(),
+                "{legacy_result:?}, {bound_result:?}"
+            );
+        });
+        assert_eq!(f.store.read_blob(&want.hash).unwrap(), data);
     }
 
     #[test]

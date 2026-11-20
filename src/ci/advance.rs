@@ -17,6 +17,12 @@
 //! cancel that the coordinator delivers. A shard a cancel was requested for
 //! is not asked again.
 
+mod matrix;
+
+/// An unstarted variant stopped by matrix fail-fast can participate in a run retry.
+pub const MATRIX_FAIL_FAST_REASON: &str = "another variant of its matrix job failed (fail-fast)";
+mod discovery;
+
 use super::progress::{ActionKind, Input, NeedsProgression, Progression};
 use crate::coordinator::TaskSpec;
 use crate::ids::{AttemptId, Digest, RunId, TaskId};
@@ -181,6 +187,20 @@ pub fn inputs_fit(inputs: &TaskInputs) -> bool {
     serde_json::to_vec(inputs).is_ok_and(|json| json.len() <= MAX_RELEASED_INPUT_BYTES)
 }
 
+/// Check the executor and the progression actually selected for this plan.
+pub fn unsupported(plan: &FrozenPlan) -> Option<String> {
+    if matrix::applies(plan) {
+        if let Some(task) = plan.tasks.iter().find(|t| !t.services.is_empty()) {
+            return Some(format!("task `{}` has service containers", task.id));
+        }
+        if plan.tasks.iter().any(|t| t.dynamic_matrix) {
+            return plan.verify().err().map(|e| e.to_string());
+        }
+        return matrix::driver(plan).err().map(|e| e.to_string());
+    }
+    super::progress::unsupported(plan)
+}
+
 /// What one pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Pass {
@@ -265,14 +285,54 @@ fn advance_run(
 ) -> Result<(), Fault> {
     let fault = transient;
     let mut members: BTreeMap<String, Member> = BTreeMap::new();
-    let mut digest = None;
-    for row in store.ci_run_tasks(run).map_err(fault)? {
+    let rows = store.ci_run_tasks(run).map_err(fault)?;
+    if discovery::advance(store, state_dir, results, run, &rows, now_ms, pass)? {
+        return Ok(());
+    }
+    let project = rows
+        .iter()
+        .find_map(|r| {
+            r.spec
+                .pointer("/ci/task/inputs/rtr_discovery/project")
+                .and_then(|v| v.as_str())
+        })
+        .map(str::to_owned);
+    let mut digest = super::discovery::active_plan(&rows)
+        .map(Digest::parse)
+        .transpose()
+        .map_err(unrunnable)?;
+    let mut allowable = std::collections::BTreeSet::new();
+    let mut probes = BTreeMap::new();
+    for row in rows.iter().filter(|r| discovery::is_probe(r)) {
+        let meta = discovery::metadata(row).expect("discovery row");
+        let spec: TaskSpec = serde_json::from_value(row.spec.clone()).map_err(unrunnable)?;
+        allowable.insert(spec.plan_digest.clone());
+        if let Some(id) = meta["applied_plan"].as_str() {
+            allowable.insert(Digest::parse(id).map_err(unrunnable)?);
+        }
+        if meta["applied"] == false {
+            let original = meta["original_task"]
+                .as_str()
+                .ok_or_else(|| unrunnable("missing discovery target"))?;
+            probes.insert(
+                original.to_owned(),
+                Member {
+                    row: row.clone(),
+                    spec,
+                },
+            );
+        }
+    }
+    for row in rows.into_iter().filter(|r| !discovery::is_probe(r)) {
         let spec: TaskSpec = serde_json::from_value(row.spec.clone())
             .map_err(|e| unrunnable(format!("task {}: {e}", row.task_id)))?;
         let Some(ci) = &spec.ci else {
             return Err(unrunnable(format!("task {} is not a CI task", row.task_id)));
         };
-        if digest.get_or_insert_with(|| ci.task.plan_digest.clone()) != &ci.task.plan_digest {
+        pass.plans.insert(ci.task.plan_digest.clone());
+        if digest.get_or_insert_with(|| ci.task.plan_digest.clone()) != &ci.task.plan_digest
+            && !allowable.contains(&ci.task.plan_digest)
+        {
             return Err(unrunnable("the tasks of the run name different plans"));
         }
         if members
@@ -288,6 +348,10 @@ fn advance_run(
     pass.plans.insert(digest.clone());
     let plan: FrozenPlan = serde_json::from_slice(&read_plan(state_dir, &digest)?)
         .map_err(|e| unrunnable(format!("the frozen plan {digest}: {e}")))?;
+    if matrix::applies(&plan) {
+        let journal = matrix::Journal::open(store, results, run, &plan, state_dir)?;
+        return matrix::advance(journal, &plan, &members, project.as_deref(), now_ms, pass);
+    }
     let mut progress = replay(store, results, &plan, |task| {
         members.get(task).map(|member| &member.row)
     })?;
@@ -312,8 +376,20 @@ fn advance_run(
             problems.unwrap_or("a shard of the job failed").to_string()
         });
         let rerun = progress.split_job_rerun(&group.id);
+        let timings = (|| {
+            let scope = group_timing_scope(&plan, group, project.as_deref())?;
+            let observations = progress
+                .timing_samples(group)
+                .into_iter()
+                .filter_map(|(shard, history)| {
+                    let worker = &members.get(&shard)?.row.attempt.as_ref()?.worker;
+                    Some((worker.clone(), history))
+                })
+                .collect();
+            Some((scope, observations))
+        })();
         let changed = store
-            .join_ci_shards(run, &group.id, failure.as_deref(), rerun, now_ms)
+            .join_ci_shards_with_timings(run, &group.id, failure.as_deref(), rerun, now_ms, timings)
             .map_err(fault)?;
         if changed {
             pass.joined.push(group.id.clone());
@@ -327,7 +403,10 @@ fn advance_run(
         };
         match &action.kind {
             ActionKind::Ready { task, inputs } => {
-                let member = member(task)?;
+                let member = match probes.get(task) {
+                    Some(probe) => probe,
+                    None => member(task)?,
+                };
                 if member.spec.ci.as_ref().is_some_and(|ci| ci.hold) {
                     release(store, run, member, inputs, now_ms, pass).map_err(fault)?;
                 }
@@ -342,6 +421,21 @@ fn advance_run(
             .map_err(unrunnable)?;
     }
     Ok(())
+}
+
+fn group_timing_scope(
+    plan: &FrozenPlan,
+    group: &local_ci::dag::ShardGroup,
+    project: Option<&str>,
+) -> Option<String> {
+    let first = plan.task(group.shards.first()?)?.shard.as_ref()?;
+    Some(super::discovery::timing_key(
+        project?,
+        &group.workflow,
+        group.source_jobs.first()?,
+        &first.dir,
+        group.runner.as_ref()?,
+    ))
 }
 
 /// The progression of a run of `plan` with everything that ended taken in:
@@ -434,12 +528,13 @@ fn stop(
     if row.cancelled {
         return Ok(());
     }
-    if row.attempt.is_none() {
+    if let Some(attempt) = &row.attempt {
+        if store.stop_ci_attempt(run, &row.task_id, &attempt.attempt_id, reason, now_ms)? {
+            pass.stopped.push(row.task_id.clone());
+        }
+    } else {
         let stopped = store.fail_ci_tasks(run, Some(&row.task_id), reason, now_ms)?;
         pass.stopped.extend(stopped);
-    } else {
-        store.cancel_task(&row.task_id, now_ms)?;
-        pass.stopped.push(row.task_id.clone());
     }
     Ok(())
 }

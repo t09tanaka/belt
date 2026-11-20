@@ -40,6 +40,7 @@ fn runtime_factory_enables_setup_and_starts_agent() {
     cfg.prefetch_per_worker.value = 2;
     cfg.log_spool_limit_bytes.value = 8192;
     cfg.term_grace_seconds.value = 4;
+    cfg.warmup_idle_seconds.value = 7;
     cfg.profile.value = Some("custom".into());
     let input = inputs(root.path());
     let runtime = cfg.worker_runtime(input.clone()).unwrap();
@@ -90,6 +91,7 @@ fn runtime_factory_enables_setup_and_starts_agent() {
         )
     );
     assert_eq!(runtime.setup_config().term_grace_ms, 4000);
+    assert_eq!(runtime.agent_config().warmup_idle_ms, 7000);
     assert_eq!(runtime.setup_config().log_limit_bytes, 8192);
     assert_eq!(runtime.setup_config().lease_ms, 60_000);
     assert_eq!(
@@ -212,6 +214,14 @@ fn runtime_factory_preserves_git_preflight_error() {
 }
 
 async fn connected(c: &remote_task_runner::coordinator::Coordinator, name: &str) -> Connected {
+    connected_without(c, name, &[]).await
+}
+
+async fn connected_without(
+    c: &remote_task_runner::coordinator::Coordinator,
+    name: &str,
+    missing: &[&str],
+) -> Connected {
     let (near, far) = duplex_pair(65536);
     let cluster = c.store().cluster_id().clone();
     let client = ClientConfig::new(
@@ -219,7 +229,11 @@ async fn connected(c: &remote_task_runner::coordinator::Coordinator, name: &str)
         c.store().coordinator_id().clone(),
         c.epoch(),
     );
-    let server = ServerConfig::new(cluster, super::proto_common::identity(name));
+    let mut server = ServerConfig::new(cluster, super::proto_common::identity(name));
+    server
+        .local
+        .features
+        .retain(|f| !missing.contains(&f.as_str()));
     let (connection, accepted) = tokio::join!(connect(near, client), accept(far, server));
     // Keep the server side alive for the lifetime of the test.
     tokio::spawn(async move {
@@ -308,6 +322,55 @@ async fn runtime_attach_applies_only_verified_identity_priorities() {
         .await
         .is_err());
     assert_eq!(c.scheduler().priority_of(&local), -9);
+}
+
+#[tokio::test]
+async fn dispatch_and_artifact_tasks_require_their_negotiated_features() {
+    use remote_task_runner::coordinator::policy::unmet_ci;
+    use remote_task_runner::wire::{MATRIX_DISPATCH_FEATURE, WORKFLOW_ARTIFACTS_FEATURE};
+
+    let fx = super::coordinator::fx();
+    let coordinator = fx.open(&[]);
+    let config = config();
+    let worker = WorkerId::parse("local").unwrap();
+    let mut spec = super::coordinator::spec();
+    spec.commands.clear();
+    spec.ci = Some(
+        serde_json::from_value(serde_json::json!({
+            "task": {
+                "plan_digest": spec.plan_digest,
+                "task_id": "ci.yml/build",
+                "inputs": {"needs": {}},
+                "dispatch": {},
+                "artifact_workflow": "test.yml"
+            }
+        }))
+        .unwrap(),
+    );
+    let cases: &[(&[&str], Option<&str>)] = &[
+        (
+            &[MATRIX_DISPATCH_FEATURE, WORKFLOW_ARTIFACTS_FEATURE],
+            Some("protocol feature ci_matrix_dispatch_v1"),
+        ),
+        (
+            &[WORKFLOW_ARTIFACTS_FEATURE],
+            Some("protocol feature ci_workflow_artifacts_v1"),
+        ),
+        (&[], None),
+    ];
+    for &(missing, expected) in cases {
+        let connection = connected_without(&coordinator, worker.as_str(), missing).await;
+        let link = config
+            .attach_gated_worker(
+                &coordinator,
+                WorkerTarget::Local(&worker),
+                connection,
+                Arc::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(unmet_ci(&spec, link.as_ref()), expected);
+    }
 }
 
 /// A worker attached the way a remote one is (`attach_worker`): `workers

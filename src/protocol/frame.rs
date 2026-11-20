@@ -78,7 +78,10 @@ impl Frame {
 pub fn kind_of_operation(op: Operation) -> StreamKind {
     match op {
         Operation::ReadLog => StreamKind::Log,
-        Operation::BlobPut | Operation::BlobGet | Operation::SecretBundlePut => StreamKind::Blob,
+        Operation::WorkflowArtifact
+        | Operation::BlobPut
+        | Operation::BlobGet
+        | Operation::SecretBundlePut => StreamKind::Blob,
         Operation::Hello
         | Operation::Inspect
         | Operation::Forecast
@@ -301,7 +304,7 @@ mod tests {
         for op in Operation::ALL {
             let want = match op {
                 ReadLog => StreamKind::Log,
-                BlobPut | BlobGet | SecretBundlePut => StreamKind::Blob,
+                BlobPut | BlobGet | SecretBundlePut | WorkflowArtifact => StreamKind::Blob,
                 _ => StreamKind::Control,
             };
             assert_eq!(kind_of_operation(op), want, "{op:?}");

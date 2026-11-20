@@ -25,6 +25,9 @@ pub const SUPPORTED_FEATURES: &[&str] = &[
     crate::toolchain::contract::FEATURE,
     crate::wire::ENV_SYNC_FEATURE,
     crate::wire::CI_TASK_FEATURE,
+    crate::wire::MATRIX_DISPATCH_FEATURE,
+    crate::wire::CI_DISCOVERY_FEATURE,
+    crate::wire::WORKFLOW_ARTIFACTS_FEATURE,
 ];
 
 /// What one side offers and requires.

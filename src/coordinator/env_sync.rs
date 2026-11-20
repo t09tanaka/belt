@@ -5,17 +5,11 @@ use super::*;
 use crate::wire::{EnvSyncRequest, Request, Response, SchemaVersion, ToolRequirement};
 
 impl Coordinator {
-    /// Ask `worker` about the warm-up `sync_id` (the first ask starts it).
-    /// A worker whose hello did not agree on `env_sync_v1` is never sent the
-    /// request. No answer in time is `COMMUNICATION_UNKNOWN`: the warm-up may
-    /// go on, and the same `sync_id` may be asked about again.
-    pub async fn env_sync(
+    fn environment_link(
         &self,
         worker: &WorkerId,
-        sync_id: RequestId,
-        tools: Vec<ToolRequirement>,
-    ) -> std::result::Result<Vec<crate::wire::ToolSyncResult>, ApiError> {
-        let link = self
+    ) -> std::result::Result<std::sync::Arc<dyn WorkerLink>, ApiError> {
+        self
             .workers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -28,7 +22,55 @@ impl Coordinator {
                         "worker {worker} is not connected to the resident: it is not registered (workers add), or the resident has not reached it yet"
                     ),
                 )
-            })?;
+            })
+    }
+
+    pub async fn env_report(
+        &self,
+        worker: &WorkerId,
+    ) -> std::result::Result<crate::toolchain::envdiff::EnvReport, ApiError> {
+        let link = self.environment_link(worker)?;
+        let request = Request::EnvReport(crate::wire::EnvReportRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            required: Vec::new(),
+        });
+        let incompatible = || {
+            ApiError::new(
+                ErrorCode::ProtocolIncompatible,
+                format!("worker {worker} did not supply a compatible environment report"),
+            )
+        };
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            link.read_only_call(request),
+        )
+        .await
+        {
+            Ok(Ok(Response::EnvReport(answer))) => answer
+                .environment
+                .filter(|r| r.schema_version == crate::toolchain::envdiff::SCHEMA)
+                .ok_or_else(incompatible),
+            Ok(Ok(_)) => Err(incompatible()),
+            Ok(Err(LinkError::Remote(error))) => Err(error),
+            Ok(Err(LinkError::Unconfirmed)) | Err(_) => Err(ApiError::new(
+                ErrorCode::CommunicationUnknown,
+                format!("worker {worker} did not answer the environment request"),
+            )),
+        }
+    }
+
+    /// Ask `worker` about the warm-up `sync_id` (the first ask starts it).
+    /// A worker whose hello did not agree on `env_sync_v1` is never sent the
+    /// request. No answer in time is `COMMUNICATION_UNKNOWN`: the warm-up may
+    /// go on, and the same `sync_id` may be asked about again.
+    pub async fn env_sync(
+        &self,
+        worker: &WorkerId,
+        sync_id: RequestId,
+        tools: Vec<ToolRequirement>,
+    ) -> std::result::Result<Vec<crate::wire::ToolSyncResult>, ApiError> {
+        let link = self.environment_link(worker)?;
         if !link.env_sync_negotiated() {
             return Err(ApiError::new(
                 ErrorCode::ProtocolIncompatible,

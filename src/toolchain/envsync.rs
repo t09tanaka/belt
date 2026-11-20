@@ -79,15 +79,27 @@ fn project_step(worker: &EnvReport, req: &EffectiveRequirement, plan: &mut SyncP
             return;
         }
     }
-    // An alias or channel names no concrete version: nothing to install.
+    // An alias, channel or expression names no concrete version: nothing to
+    // install.
     if let Some(alias) = req.constraints.iter().find_map(|c| match c {
         Constraint::Resolve(alias) => Some(alias),
         _ => None,
     }) {
-        plan.blocked.push(blocked(
+        add_blocked(plan, blocked(
             name,
             format!("the project requires the alias {alias} for {name}, which names no concrete version"),
             format!("specify a concrete {name} version in the project's version file, then rerun workers sync"),
+        ));
+        return;
+    }
+    if let Some(expression) = req.constraints.iter().find_map(|c| match c {
+        Constraint::Expression(text) | Constraint::VersionFileExpression(text) => Some(text),
+        _ => None,
+    }) {
+        add_blocked(plan, blocked(
+            name,
+            format!("the project's {name} version is the expression {expression}, which is not known until a run"),
+            format!("pin a concrete {name} version in the workflow or a version file, then rerun workers sync"),
         ));
         return;
     }
@@ -102,18 +114,18 @@ fn project_step(worker: &EnvReport, req: &EffectiveRequirement, plan: &mut SyncP
                 .filter_map(|v| Version::parse(v).ok().map(|parsed| (parsed, v)))
                 .max_by(|a, b| a.0.cmp(&b.0));
             match best {
-                Some((_, version)) => plan.install.push(InstallStep {
+                Some((_, version)) => add_install(plan, InstallStep {
                     tool: name.into(),
                     version: version.clone(),
                 }),
-                None => plan.blocked.push(blocked(
+                None => add_blocked(plan, blocked(
                     name,
                     format!("no version of {name} the worker may install satisfies the project requirement"),
                     format!("authorize a matching {name} version in the worker's toolchains.toml, then rerun workers sync"),
                 )),
             }
         }
-        None => plan.blocked.push(blocked(
+        None => add_blocked(plan, blocked(
             name,
             format!("the worker has no {name} for the project requirement and no version manager for it"),
             envdiff::manual_steps(name).map_or_else(
@@ -121,6 +133,14 @@ fn project_step(worker: &EnvReport, req: &EffectiveRequirement, plan: &mut SyncP
                 |manual| format!("{manual}, then rerun workers sync"),
             ),
         )),
+    }
+}
+
+/// The same difference twice (two steps of one project asking for the same
+/// thing) is one line.
+fn add_blocked(plan: &mut SyncPlan, item: Blocked) {
+    if !plan.blocked.contains(&item) {
+        plan.blocked.push(item);
     }
 }
 
@@ -403,6 +423,45 @@ mod tests {
         let got = plan(&report(), &worker, Some(&reqs));
         assert_eq!(got.install, [step("node", "20.9.0")]);
         assert!(got.blocked.is_empty());
+    }
+
+    #[test]
+    fn two_requirements_for_one_tool_are_both_met_and_never_listed_twice() {
+        let mut worker = report();
+        worker.tools.insert(
+            "node".into(),
+            fact(
+                Observed::Available,
+                Some("18.0.0"),
+                Some((&["18.0.0", "20.1.0", "22.0.0"], &["18.0.0"])),
+            ),
+        );
+        // A matrix of two majors: the one the worker has stays, the other is
+        // installed, and the same ask from two steps is one install.
+        let reqs = [req("node", "^18"), req("node", "^20"), req("node", "^20")];
+        let got = plan(&report(), &worker, Some(&reqs));
+        assert_eq!(got.install, [step("node", "20.1.0")]);
+        assert!(got.blocked.is_empty());
+        // Neither can be had: one line per distinct reason, not one per step.
+        let reqs = [req("node", "^30"), req("node", "^30")];
+        assert_eq!(plan(&report(), &worker, Some(&reqs)).blocked.len(), 1);
+    }
+
+    #[test]
+    fn an_expression_is_not_installed_and_is_said() {
+        let worker = report();
+        let expr = |raw: &str| EffectiveRequirement {
+            tool: ToolId::parse("node").unwrap(),
+            constraints: vec![Constraint::parse(raw).unwrap()],
+            provenance: vec![],
+        };
+        let reqs = [expr("${{ matrix.node }}"), expr("${{ matrix.node }}")];
+        let got = plan(&report(), &worker, Some(&reqs));
+        assert!(got.install.is_empty());
+        assert_eq!(got.blocked.len(), 1, "{:?}", got.blocked);
+        assert!(got.blocked[0].missing.contains("${{ matrix.node }}"));
+        assert!(got.blocked[0].missing.contains("not known until a run"));
+        assert!(got.blocked[0].steps.contains("pin a concrete node version"));
     }
 
     #[test]

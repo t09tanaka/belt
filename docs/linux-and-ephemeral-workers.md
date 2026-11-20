@@ -137,7 +137,13 @@ the entry.
 
 - The parent never installs, upgrades, starts, stops, drains or resumes an
   ephemeral worker; those commands are refused without contacting it.
-  `doctor` only checks that it answers.
+  `doctor` checks whether it answers.
+- While the parent has a connection, `remote-task-runner workers diff colab-1`
+  compares the active worker profile with the parent. Use
+  `remote-task-runner workers sync colab-1` to install eligible tool versions
+  and measure the result. Both commands need the coordinator resident and the
+  notebook worker to be running. A disconnected worker produces a measurement
+  error.
 - While the worker cannot be reached, the tasks it held stay `unknown`. They
   are not given to another worker and not failed, however long it takes.
 - When the same worker is started again, it comes back with a new identity.

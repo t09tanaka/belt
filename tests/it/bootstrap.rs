@@ -714,7 +714,7 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
     // feature markers as well as tables so every migration can run again.
     let db = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
     db.execute_batch(
-        "DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='3' WHERE key='schema_version';",
+        "DROP TRIGGER result_gc_ref_insert; DROP TABLE result_gc_ref; DROP TABLE result_delete_claim; DROP TABLE result_gc_clock; DROP INDEX attempt_task_key; DROP TABLE collection_log; DROP TRIGGER task_inherit_cancel; DROP TRIGGER task_keep_cancel; DROP TRIGGER attempt_cancel_gate; DROP TRIGGER run_inherit_control_revision; DROP TABLE run_cancel_intent; DROP TABLE control_request; ALTER TABLE run DROP COLUMN control_revision; ALTER TABLE task DROP COLUMN min_generation; ALTER TABLE task DROP COLUMN authorization_revision; DROP INDEX task_run_key; DROP INDEX event_task_waiting; DROP INDEX placement_unacked; DROP INDEX attempt_worker_live; DROP TABLE worker_identity; DROP TABLE worker_identity_tombstone; DROP TABLE ci_test_timing; DROP TABLE workflow_upload_inflight; DROP TABLE workflow_download; DROP TABLE workflow_artifact; DROP TABLE ci_driver_transition; DROP TRIGGER matrix_attempt_ended; DROP INDEX matrix_permit_held; DELETE FROM schema_meta WHERE key IN ('execution_requirements_v1','frozen_toolchains_v1'); UPDATE schema_meta SET value='3' WHERE key='schema_version';",
     )
     .unwrap();
     let old_epoch: i64 = db
@@ -1402,7 +1402,7 @@ fn open_sources(state: &std::path::Path) -> remote_task_runner::source::SourceSt
         }
     }
 }
-fn control_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
+pub(super) fn control_fixture() -> (super::common::DaemonRoot, Spec, std::path::PathBuf) {
     let (root, spec) = fixture();
     let config = root.path().join(".config/remote-task-runner");
     std::fs::create_dir_all(&config).unwrap();
@@ -5161,7 +5161,11 @@ async fn public_exec_output_conditions_globs_and_multiple_paths_follow_the_outco
 /// A project of one workflow in the directory `ci` is run from. Every step
 /// leaves a line in `marks/<job>`, outside the workspace: what ran, and how
 /// often, is read from there.
-fn ci_project(root: &std::path::Path, input: &std::path::Path, jobs: &str) -> std::path::PathBuf {
+pub(super) fn ci_project(
+    root: &std::path::Path,
+    input: &std::path::Path,
+    jobs: &str,
+) -> std::path::PathBuf {
     let marks = root.join("marks");
     std::fs::create_dir_all(&marks).unwrap();
     std::fs::create_dir_all(input.join(".github/workflows")).unwrap();
@@ -5170,7 +5174,7 @@ fn ci_project(root: &std::path::Path, input: &std::path::Path, jobs: &str) -> st
     marks
 }
 
-fn ci_command(spec: &Spec, input: &std::path::Path) -> tokio::process::Command {
+pub(super) fn ci_command(spec: &Spec, input: &std::path::Path) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(&spec.executable);
     command
         .args(["--json", "ci"])
@@ -5689,5 +5693,51 @@ async fn a32_ci_posts_a_status_only_for_what_the_commit_holds_and_a_failed_post_
             "{text}"
         );
     }
+    shutdown(&load(&spec)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a27_public_ci_expands_from_a_needs_output_and_joins_in_variant_order() {
+    let (root, spec, input) = control_fixture();
+    let jobs = r#"  shape:
+    runs-on: ubuntu-latest
+    outputs:
+      legs: ${{ steps.out.outputs.legs }}
+    steps:
+      - id: out
+        run: echo 'legs={"include":[{"n":0},{"n":1},{"n":2}]}' >> "$GITHUB_OUTPUT"
+  leg:
+    needs: shape
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.shape.outputs.legs) }}
+    outputs:
+      last: ${{ steps.out.outputs.n }}
+    steps:
+      - id: out
+        run: |
+          mkdir MARKS/permit
+          echo "${{ matrix.n }}" >> MARKS/leg
+          echo "n=${{ matrix.n }}" >> "$GITHUB_OUTPUT"
+          rmdir MARKS/permit
+  report:
+    needs: leg
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.leg.outputs.last }}" >> MARKS/report
+"#;
+    let marks = ci_project(root.path(), &input, jobs);
+    let (exit, report) = ci_output(&spec, &input).await;
+    assert_eq!(exit, Some(0), "{report}");
+    assert_eq!(ci_marks(&marks, "leg"), ["0", "1", "2"]);
+    assert_eq!(ci_marks(&marks, "report"), ["2"]);
+    let attempts = ci_attempts(&spec, &report);
+    assert_eq!(
+        attempts.values().filter(|n| **n == 0).count(),
+        1,
+        "only the logical matrix origin has no execution"
+    );
+    assert_eq!(attempts.values().sum::<usize>(), 5);
     shutdown(&load(&spec)).await;
 }

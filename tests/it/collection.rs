@@ -125,6 +125,10 @@ struct Job {
 #[derive(Default)]
 struct State {
     jobs: BTreeMap<AttemptId, Job>,
+    one_slot: bool,
+    pending_artifacts: BTreeMap<AttemptId, ArtifactAction>,
+    artifact_answers: BTreeMap<Digest, ArtifactAnswer>,
+    artifact_data: BTreeMap<Digest, Vec<u8>>,
     offline: bool,
     /// Lose the n-th request (from 1) of a kind, and be gone after it.
     trip: Option<(&'static str, usize, Lost)>,
@@ -143,6 +147,7 @@ struct State {
     ops: Vec<(&'static str, u64)>,
     /// The connection did not negotiate `ci_task_v1`.
     no_ci: bool,
+    no_discovery: bool,
     /// The worker did not take the frozen plan of any run, for this reason:
     /// no input is ready there.
     refused_plan: Option<String>,
@@ -266,6 +271,34 @@ impl Worker {
             }
         };
         match request {
+            Request::WorkflowArtifact(r) => {
+                let result = match r.command {
+                    WorkflowArtifactCommand::Poll => ArtifactExchangeResult::Pending {
+                        action: s.pending_artifacts.get(&r.attempt_id).cloned(),
+                    },
+                    WorkflowArtifactCommand::Answer { key, answer } => {
+                        assert_eq!(&s.pending_artifacts[&r.attempt_id].key, &key);
+                        s.artifact_answers.insert(key, answer);
+                        ArtifactExchangeResult::Accepted
+                    }
+                    WorkflowArtifactCommand::Read {
+                        key,
+                        digest,
+                        offset,
+                    } => {
+                        assert_eq!(&s.pending_artifacts[&r.attempt_id].key, &key);
+                        let blob = &s.artifact_data[&digest];
+                        let start = offset as usize;
+                        ArtifactExchangeResult::Chunk {
+                            data: Bytes(blob[start..blob.len().min(start + 128 * 1024)].to_vec()),
+                        }
+                    }
+                };
+                Ok(Response::WorkflowArtifact(WorkflowArtifactResponse {
+                    schema_version: SchemaVersion::CURRENT,
+                    result,
+                }))
+            }
             Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
                 preparation_observations: None,
                 capabilities: None,
@@ -277,8 +310,8 @@ impl Worker {
                 policy_digest: Digest::of_bytes(b"p"),
                 active_task: 0,
                 prefetch_pending: 0,
-                max_active_task: 8,
-                prefetch_per_worker: 8,
+                max_active_task: if s.one_slot { 1 } else { 8 },
+                prefetch_per_worker: if s.one_slot { 0 } else { 8 },
                 disk_free_bytes: 1,
                 draining: false,
             })),
@@ -437,6 +470,11 @@ impl Worker {
 
 fn kind_of(request: &Request) -> (&'static str, u64) {
     match request {
+        Request::WorkflowArtifact(r) => match &r.command {
+            WorkflowArtifactCommand::Read { offset, .. } => ("workflow_read", *offset),
+            WorkflowArtifactCommand::Answer { .. } => ("workflow_ack", 0),
+            WorkflowArtifactCommand::Poll => ("workflow_poll", 0),
+        },
         Request::Inspect(_) => ("inspect", 0),
         Request::GetAttempt(_) => ("get", 0),
         Request::SubmitAttempt(_) => ("submit", 0),
@@ -452,6 +490,17 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
 }
 
 impl WorkerLink for Worker {
+    fn workflow_artifacts_negotiated(&self) -> bool {
+        self.ci_task_negotiated()
+    }
+
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.ci_task_negotiated()
+    }
+    fn ci_discovery_negotiated(&self) -> bool {
+        let worker = self.state.lock().unwrap();
+        !worker.no_ci && !worker.no_discovery
+    }
     fn ci_task_negotiated(&self) -> bool {
         !self.state.lock().unwrap().no_ci
     }
@@ -2819,6 +2868,11 @@ use remote_task_runner::supervisor::ci_task::RESULT_ARTIFACT;
 /// The frozen plan of a workflow, made from a capture of its own (in a
 /// directory of its own: the parent of these tests holds no source).
 fn ci_plan(workflow: &str) -> local_ci::FrozenPlan {
+    let dir = crate::test_tmp::tempdir().unwrap();
+    ci_plan_at(workflow, dir.path(), &RunId::generate())
+}
+
+fn ci_plan_at(workflow: &str, state_dir: &std::path::Path, run: &RunId) -> local_ci::FrozenPlan {
     use local_ci::frozen::Filters;
     use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
     let dir = crate::test_tmp::tempdir().unwrap();
@@ -2836,11 +2890,11 @@ fn ci_plan(workflow: &str) -> local_ci::FrozenPlan {
     .into_iter()
     .map(|(k, v)| (k.to_string(), v.to_string()))
     .collect();
-    let store = SourceStore::open(&dir.path().join("state")).unwrap();
+    let store = SourceStore::open(state_dir).unwrap();
     let captured = capture_for_run(
         &env,
         &store,
-        &RunId::generate(),
+        run,
         &SourceRequest::Directory { dir: project },
         &CaptureParams::default(),
     )
@@ -3444,13 +3498,22 @@ async fn ci_run_by_task(
     c: &Coordinator,
     plan: &local_ci::FrozenPlan,
 ) -> (RunId, BTreeMap<String, TaskId>) {
+    ci_run_by_id(fx, c, plan, RunId::generate()).await
+}
+
+async fn ci_run_by_id(
+    fx: &Fx,
+    c: &Coordinator,
+    plan: &local_ci::FrozenPlan,
+    run: RunId,
+) -> (RunId, BTreeMap<String, TaskId>) {
     let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), plan).unwrap();
     let manifest = Digest::of_bytes(b"manifest");
     let none = Default::default();
     let specs =
         remote_task_runner::service::ci_run::task_specs(plan, &digest, &manifest, &none, None)
             .unwrap();
-    let (run, source) = (RunId::generate(), SourceId::generate());
+    let source = SourceId::generate();
     c.store().put_source_ref(&source, &manifest, 1).unwrap();
     let mut ids = BTreeMap::new();
     let mut tasks = Vec::new();
@@ -3955,6 +4018,25 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
         // Asked once: a pass that sees the same again writes nothing.
         let again = ci_advance(&fx, &c);
         assert!(again.stopped.is_empty() && again.released.is_empty());
+        let stops = c
+            .store()
+            .events_after(0, 1000)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.kind == "ci_fail_fast_requested")
+            .collect::<Vec<_>>();
+        assert_eq!(stops.len(), 2);
+        for id in &group.shards[1..] {
+            let event = stops
+                .iter()
+                .find(|e| e.attempt_id.as_deref() == Some(placed[id].0.as_str()))
+                .unwrap();
+            assert_eq!(event.payload["task"], ids[id].as_str());
+            assert_eq!(
+                event.payload["reason"],
+                remote_task_runner::ci::shards::FAIL_FAST_REASON
+            );
+        }
         // The coordinator delivers the cancels; the stop is confirmed.
         for _ in 0..4 {
             c.tick().await.unwrap();
@@ -4040,6 +4122,15 @@ async fn a41_fail_fast_stops_the_running_shards_once_and_the_job_fails_with_a_re
 /// kept: the job becomes a success from the kept result and the new ones.
 #[tokio::test]
 async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the_rest() {
+    retry_shards_with_report(true).await;
+}
+
+#[tokio::test]
+async fn a41_retry_rebinds_failed_downstream_needs_after_the_shards_rejoin() {
+    retry_shards_with_report(false).await;
+}
+
+async fn retry_shards_with_report(report_passes: bool) {
     use remote_task_runner::service::ci_run::Part;
     use remote_task_runner::service::completion::Target;
     use remote_task_runner::storage::RetryPreparation;
@@ -4087,14 +4178,23 @@ async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the
     let lines = ci_lines(&fx, &c, &files, &run);
     let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
     assert_eq!(job.status, "failure");
-    // report runs (it is `if: always()`) and ends.
+    let report = ci_task_of(&plan, "report");
     let b = c.tick().await.unwrap().placed[0].clone();
     let sent = fx.w.payload(&b);
-    let done = ci_result(&ci_task_of(&plan, "report"), "report", "success", json!({}));
-    end(&fx, &c, &b, Outcome::Succeeded, ci_out(&b, &sent, &done)).await;
+    assert_eq!(
+        sent.ci_task.as_ref().unwrap().inputs["needs"]["test"]["status"],
+        "failure"
+    );
+    let status = if report_passes { "success" } else { "failure" };
+    let outcome = if report_passes {
+        Outcome::Succeeded
+    } else {
+        Outcome::Failed
+    };
+    let done = ci_result(&report, "report", status, json!({}));
+    end(&fx, &c, &b, outcome, ci_out(&b, &sent, &done)).await;
     ci_collect(&c, &files, &b).await;
 
-    // Retry the run: only the two shards that did not pass.
     let target = Target::Run(run.clone());
     let revision = c
         .store()
@@ -4107,7 +4207,7 @@ async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the
         Err(e) => panic!("{e}"),
     };
     let receipt = c.store().commit_retry(prepared, false, wall_ms()).unwrap();
-    assert_eq!(receipt.task_count, 2);
+    assert_eq!(receipt.task_count, if report_passes { 2 } else { 3 });
     let rows = c.store().ci_run_tasks(&run).unwrap();
     let row = |at: usize| rows.iter().find(|r| r.task_id == task(at)).unwrap();
     let kept = row(0).attempt.clone().unwrap();
@@ -4157,7 +4257,28 @@ async fn a41_a_retry_runs_only_the_shards_without_a_passing_result_and_keeps_the
         (attempts(0).len(), attempts(1).len(), attempts(2).len()),
         (1, 2, 2)
     );
-    ci_advance(&fx, &c);
+    let joined = ci_advance(&fx, &c);
+    if !report_passes {
+        assert_eq!(joined.released, vec![ids[&report].clone()]);
+        let placements = c.tick().await.unwrap().placed;
+        assert_eq!(placements.len(), 1);
+        let attempt = &placements[0];
+        let sent = fx.w.payload(attempt);
+        assert_eq!(
+            sent.ci_task.as_ref().unwrap().inputs["needs"]["test"]["status"],
+            "success"
+        );
+        let done = ci_result(&report, "report", "success", json!({}));
+        end(
+            &fx,
+            &c,
+            attempt,
+            Outcome::Succeeded,
+            ci_out(attempt, &sent, &done),
+        )
+        .await;
+        ci_collect(&c, &files, attempt).await;
+    }
     assert!(c.store().ci_waiting_runs(8).unwrap().is_empty());
     let lines = ci_lines(&fx, &c, &files, &run);
     let job = lines.iter().find(|l| l.part == Some(Part::Job)).unwrap();
@@ -4844,4 +4965,670 @@ async fn a41_a_cancelled_run_is_cancelled_although_a_test_of_a_shard_had_failed(
         let status = ci_computed(&fx, &c, &files, &run);
         assert_eq!(status, Computed::Cancelled, "{said}");
     }
+}
+
+/// A27. Drive the durable queue, worker receipts and local-ci matrix driver,
+/// including replay between settlements. The job's outputs follow variant
+/// order even when collection completes in the opposite order.
+#[tokio::test]
+async fn a27_matrix_permits_join_and_fail_fast_across_workers() {
+    let workflow = r#"on: push
+jobs:
+  leg:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 2
+      fail-fast: true
+      matrix:
+        n: [0, 1, 2]
+    outputs:
+      value: ${{ steps.out.outputs.value }}
+    steps:
+      - id: out
+        run: echo "value=${{ matrix.n }}" >> "$GITHUB_OUTPUT"
+  report:
+    if: always()
+    needs: leg
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ needs.leg.outputs.value }}"
+"#;
+    for fail in [false, true] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let other = Worker::new("w-b");
+        c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+            .unwrap();
+        let plan = ci_plan(workflow);
+        let variants: Vec<_> = plan.tasks.iter().filter(|t| t.variant.is_some()).collect();
+        assert_eq!(variants.len(), 3);
+        let (_, ids) = ci_run_by_task(&fx, &c, &plan).await;
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.released.len(), 2, "{pass:?}");
+        let placements = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
+        assert_eq!(placements.len(), 2);
+        let group = &variants[0].variant.as_ref().unwrap().group;
+        for (a, w) in placements.values() {
+            assert!(w.payload(a).permit_id.is_some());
+        }
+        let result = |t: &local_ci::dag::ExecutionTask, success: bool| {
+            let index = t.variant.as_ref().unwrap().index;
+            serde_json::to_vec(&json!({"schema_version":1,"task":t.id,"jobs":[{
+                "workflow":t.workflow,"job":"leg","display":"leg","result":if success{"pass"}else{"fail"},"secs":0,"steps":[]
+            }],"outcomes":[{"job":"leg","variant":index,"status":if success{"success"}else{"failure"},
+                "outputs":{"value":index.to_string()},"skipped":null,"ancestor_failed":false}],
+                "receipt_ignored":null,"artifacts":[]})).unwrap()
+        };
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        end_shard(
+            &c,
+            &files,
+            &placements[&variants[1].id],
+            if fail {
+                Outcome::Failed
+            } else {
+                Outcome::Succeeded
+            },
+            &result(variants[1], !fail),
+        )
+        .await;
+        let pass = ci_advance(&fx, &c);
+        assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
+        if fail {
+            assert!(pass.released.is_empty());
+            assert!(pass.stopped.contains(&ids[&variants[0].id]), "{pass:?}");
+            assert!(pass.stopped.contains(&ids[&variants[2].id]), "{pass:?}");
+            assert!(c
+                .store()
+                .attempts_of_task(&ids[&variants[2].id])
+                .unwrap()
+                .is_empty());
+            continue;
+        }
+        assert_eq!(pass.released, [ids[&variants[2].id].clone()]);
+        let more = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
+        end_shard(
+            &c,
+            &files,
+            &more[&variants[2].id],
+            Outcome::Succeeded,
+            &result(variants[2], true),
+        )
+        .await;
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        end_shard(
+            &c,
+            &files,
+            &placements[&variants[0].id],
+            Outcome::Succeeded,
+            &result(variants[0], true),
+        )
+        .await;
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.joined.as_slice(), std::slice::from_ref(group));
+        let next = ci_task_of(&plan, "report");
+        assert_eq!(pass.released, [ids[&next].clone()]);
+        let last = placed_by_task(&[&fx.w, &other], &c.tick().await.unwrap().placed);
+        let (a, w) = &last[&next];
+        assert_eq!(
+            w.payload(a).ci_task.unwrap().inputs["needs"]["leg"]["outputs"]["value"],
+            "2"
+        );
+        assert!(ci_advance(&fx, &c).released.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a27_dynamic_members_are_persisted_once_and_join_after_verified_receipts() {
+    let workflow = r#"on: push
+jobs:
+  leg:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix: ${{ fromJSON('{"include":[{"n":0},{"n":1}]}') }}
+    steps:
+      - run: echo ${{ matrix.n }}
+"#;
+    let fx = fx();
+    let (c, files) = fx.open();
+    let run = RunId::generate();
+    let plan = ci_plan_at(workflow, fx.dir.path(), &run);
+    assert!(plan.tasks.iter().any(|t| t.dynamic_matrix));
+    let (_, ids) = ci_run_by_id(&fx, &c, &plan, run.clone()).await;
+    let origin = ci_task_of(&plan, "leg");
+    let pass = ci_advance(&fx, &c);
+    assert!(pass.failed.is_empty() && pass.faults.is_empty(), "{pass:?}");
+    assert_eq!(c.store().ci_run_tasks(&run).unwrap().len(), 3);
+    for index in 0..2 {
+        let pass = ci_advance(&fx, &c);
+        assert_eq!(pass.released.len(), 1, "{pass:?}");
+        let report = c.tick().await.unwrap();
+        assert_eq!(report.placed.len(), 1, "{report:?}");
+        let attempt = &report.placed[0];
+        let sent = fx.w.payload(attempt);
+        let ci = sent.ci_task.as_ref().unwrap();
+        let dispatch = ci.dispatch.as_ref().unwrap();
+        assert_eq!(dispatch["origin"], origin);
+        assert_eq!(dispatch["task"], ci.task_id);
+        assert_eq!(dispatch["index"], index);
+        assert!(sent.permit_id.is_some());
+        let receipt=serde_json::to_vec(&json!({"schema_version":1,"task":ci.task_id,"jobs":[{
+            "workflow":plan.tasks[0].workflow,"job":"leg","display":"leg","result":"pass","secs":0,"steps":[]
+        }],"outcomes":[{"job":"leg","variant":index,"status":"success","outputs":{},"skipped":null,"ancestor_failed":false}],
+        "receipt_ignored":null,"artifacts":[]})).unwrap();
+        assert!(ci_advance(&fx, &c).released.is_empty());
+        end(
+            &fx,
+            &c,
+            attempt,
+            Outcome::Succeeded,
+            ci_out(attempt, &sent, &receipt),
+        )
+        .await;
+        ci_collect(&c, &files, attempt).await;
+    }
+    let pass = ci_advance(&fx, &c);
+    assert!(pass.joined.contains(&origin), "{pass:?}");
+    assert_eq!(c.store().ci_run_tasks(&run).unwrap().len(), 3);
+    assert!(c
+        .store()
+        .attempts_of_task(&ids[&origin])
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        c.store()
+            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .unwrap()
+            .exit_code(),
+        Some(0)
+    );
+}
+
+/// The parent starts from the unpartitioned job. A separate discovery
+/// attempt yields a collected listing and only then do the two shards
+/// become eligible. Repeated progression cannot create a second copy.
+#[tokio::test]
+async fn a39_discovery_collection_expands_the_run_once_before_any_test_is_placed() {
+    use remote_task_runner::ci::discovery::{candidates, stage, WorkerListing};
+    let fx = fx();
+    let (c, files) = fx.open();
+    let whole =
+        ci_plan(&CI_CHAIN.replace("- run: echo one\n      - run: echo two", "- run: npx jest"));
+    let build = ci_task_of(&whole, "build");
+    let test = ci_task_of(&whole, "test");
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &whole).unwrap();
+    let manifest = Digest::of_bytes(b"manifest");
+    let mut specs = remote_task_runner::service::ci_run::task_specs(
+        &whole,
+        &digest,
+        &manifest,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    stage(&whole, &mut specs, 2, 2, "example/project", &[]);
+    let run = RunId::generate();
+    let source = SourceId::generate();
+    c.store().put_source_ref(&source, &manifest, 1).unwrap();
+    let steps = candidates(&whole);
+    let discovery = steps[0].task_id();
+    let probe = specs
+        .iter()
+        .find(|(id, _)| id == &discovery)
+        .and_then(|(_, spec)| spec.ci.as_ref())
+        .unwrap();
+    assert_eq!(probe.steps, 2, "runner version and test listing");
+    assert_eq!(probe.history_keys.len(), 2);
+    assert!(probe.history_keys.iter().all(Option::is_some));
+    let job = specs
+        .iter()
+        .find(|(id, _)| id == &test)
+        .and_then(|(_, spec)| spec.ci.as_ref())
+        .unwrap();
+    for key in &probe.history_keys {
+        assert!(!job.history_keys.contains(key));
+    }
+    let task_id = TaskId::generate();
+    c.enqueue(
+        run.clone(),
+        source,
+        specs
+            .into_iter()
+            .map(|(name, spec)| {
+                (
+                    if name == test {
+                        task_id.clone()
+                    } else {
+                        TaskId::generate()
+                    },
+                    spec,
+                )
+            })
+            .collect(),
+    )
+    .await
+    .unwrap();
+    let placed = c.tick().await.unwrap().placed;
+    assert_eq!(placed.len(), 1);
+    assert_eq!(fx.w.payload(&placed[0]).ci_task.unwrap().task_id, build);
+    let result = ci_result(&build, "build", "success", json!({"version":"1.2.3"}));
+    end_shard(
+        &c,
+        &files,
+        &(placed[0].clone(), fx.w.clone()),
+        Outcome::Succeeded,
+        &result,
+    )
+    .await;
+    let pass = ci_advance(&fx, &c);
+    assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
+    let placed = c.tick().await.unwrap().placed;
+    assert_eq!(placed.len(), 1);
+    assert_eq!(fx.w.payload(&placed[0]).ci_task.unwrap().task_id, discovery);
+    assert_eq!(
+        fx.w.payload(&placed[0]).ci_task.unwrap().inputs["needs"]["build"]["outputs"]["version"],
+        "1.2.3"
+    );
+    assert!(c.store().attempts_of_task(&task_id).unwrap().is_empty());
+    let listing = WorkerListing {
+        setup_ms: None,
+        step: steps[0].clone(),
+        runner_version: "30.2".into(),
+        discovered: listed(&["a.js", "b.js", "c.js", "d.js"]),
+    };
+    end_shard(
+        &c,
+        &files,
+        &(placed[0].clone(), fx.w.clone()),
+        Outcome::Succeeded,
+        &serde_json::to_vec(&listing).unwrap(),
+    )
+    .await;
+    for _ in 0..3 {
+        let pass = ci_advance(&fx, &c);
+        assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
+    }
+    let rows = c.store().ci_run_tasks(&run).unwrap();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.spec["ci"]["shard_group"].is_string())
+            .count(),
+        2
+    );
+    let placed = c.tick().await.unwrap().placed;
+    assert_eq!(placed.len(), 2);
+    assert_eq!(c.store().attempts_of_task(&task_id).unwrap().len(), 1);
+    for attempt in &placed {
+        assert!(fx.w.payload(attempt).ci_task.unwrap().verify_shard_version);
+        assert_eq!(
+            fx.w.payload(attempt).ci_task.unwrap().inputs["needs"]["build"]["outputs"]["version"],
+            "1.2.3"
+        );
+    }
+    let changed = fx.w.payload(&placed[0]).ci_task.unwrap().plan_digest;
+    assert_ne!(changed, digest);
+    let bytes = remote_task_runner::ci::advance::read_plan(fx.dir.path(), &changed).unwrap();
+    let split: local_ci::FrozenPlan = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(split_group(&split).manifest, listing.discovered.tests);
+}
+
+#[tokio::test]
+async fn a38_live_artifact_transfer_resumes_before_either_worker_finishes() {
+    let fx = fx();
+    let (mut c, files) = fx.open();
+    let other = Worker::new("w-b");
+    fx.w.set(|s| s.one_slot = true);
+    other.set(|s| s.one_slot = true);
+    c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+        .unwrap();
+    let workflow = r#"on: push
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: result.dat
+          if-no-files-found: error
+      - run: echo still-running
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: package
+"#;
+    let plan = ci_plan(workflow);
+    // Separate admission keeps each live job on a known worker without
+    // introducing a dependency on the producer's terminal result.
+    let (run, ids) = ci_run(&fx, &c, &plan).await;
+    let first = &ids["produce"];
+    let second = &ids["consume"];
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 2);
+    let producer = c.store().attempts_of_task(first).unwrap()[0]
+        .attempt_id
+        .clone();
+    let consumer = c.store().attempts_of_task(second).unwrap()[0]
+        .attempt_id
+        .clone();
+    let worker_of = |id: &AttemptId| {
+        if fx.w.state.lock().unwrap().jobs.contains_key(id) {
+            fx.w.clone()
+        } else {
+            other.clone()
+        }
+    };
+    let up = worker_of(&producer);
+    let down = worker_of(&consumer);
+    assert_ne!(up.id, down.id);
+    let contents = vec![b'c'; 128 * 1024 + 17];
+    let digest = Digest::of_bytes(&contents);
+    let logical = &plan
+        .tasks
+        .iter()
+        .find(|t| t.jobs.iter().any(|j| j == "produce"))
+        .unwrap()
+        .workflow;
+    let upload = ArtifactAction {
+        key: Digest::of_bytes(b"upload"),
+        intent: ArtifactIntent::Upload {
+            overwrite: false,
+            receipt: json!({
+                "name":"package","version":1,"files":[{"path":"result.dat","size":contents.len(),"sha256":digest.as_str().strip_prefix("sha256:").unwrap()}],
+                "plan_digest":plan.digest,"attempt_id":"run","job":format!("{logical}::produce"),"display":"produce","task":null,"retention_days":null,
+            }),
+        },
+    };
+    up.set(|s| {
+        s.artifact_data.insert(digest.clone(), contents.clone());
+        s.pending_artifacts.insert(producer.clone(), upload.clone());
+    });
+    c.tick().await.unwrap();
+    assert!(c
+        .store()
+        .workflow_artifacts(&run, logical)
+        .unwrap()
+        .is_empty());
+    assert_eq!(up.offsets("workflow_read"), [0]);
+    let catalog = ArtifactAction {
+        key: Digest::of_bytes(b"catalog"),
+        intent: ArtifactIntent::Catalog {
+            name: Some("package".into()),
+            pattern: None,
+        },
+    };
+    down.set(|s| {
+        s.pending_artifacts
+            .insert(consumer.clone(), catalog.clone());
+    });
+    drop(c);
+    drop(files);
+    (c, _) = fx.open();
+    c.try_attach(other.id.clone(), Arc::clone(&other) as Arc<dyn WorkerLink>)
+        .unwrap();
+    c.tick().await.unwrap();
+    assert!(
+        !down
+            .state
+            .lock()
+            .unwrap()
+            .artifact_answers
+            .contains_key(&catalog.key),
+        "the upload's last chunk has arrived but the parent has not published the receipt"
+    );
+    c.tick().await.unwrap();
+    assert_eq!(up.offsets("workflow_read"), [0, 128 * 1024]);
+    assert_eq!(
+        up.state.lock().unwrap().artifact_answers[&upload.key],
+        ArtifactAnswer::Uploaded { version: 1 }
+    );
+    c.tick().await.unwrap();
+    assert_eq!(
+        c.store().workflow_artifacts(&run, logical).unwrap().len(),
+        1
+    );
+    up.set(|s| {
+        s.pending_artifacts.remove(&producer);
+    });
+    c.tick().await.unwrap();
+    assert!(
+        matches!(&down.state.lock().unwrap().artifact_answers[&catalog.key],ArtifactAnswer::Catalog{artifacts} if artifacts.len()==1)
+    );
+    let fetch = ArtifactAction {
+        key: Digest::of_bytes(b"download"),
+        intent: ArtifactIntent::Fetch {
+            producer: producer.clone(),
+            name: "package".into(),
+            version: 1,
+            digest,
+            offset: 128 * 1024,
+        },
+    };
+    down.set(|s| {
+        s.pending_artifacts.insert(consumer, fetch.clone());
+    });
+    c.tick().await.unwrap();
+    assert_eq!(
+        down.state.lock().unwrap().artifact_answers[&fetch.key],
+        ArtifactAnswer::Chunk {
+            data: Bytes(vec![b'c'; 17])
+        }
+    );
+}
+
+#[test]
+fn a38_refuses_cross_run_artifact_options_before_any_job_can_be_placed() {
+    let plan = ci_plan(
+        r#"on: push
+jobs:
+  consume:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          run-id: '123'
+"#,
+    );
+    let err = remote_task_runner::service::ci_run::task_specs(
+        &plan,
+        &Digest::of_bytes(b"plan"),
+        &Digest::of_bytes(b"manifest"),
+        &Default::default(),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    assert!(err.message.contains("run-id"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn discovery_precedes_the_matrix_journal_and_its_shard_timings_survive_replay() {
+    use remote_task_runner::ci::discovery::{candidates, stage, WorkerListing};
+    let fx = fx();
+    let (c, files) = fx.open();
+    let plan = ci_plan(
+        r#"on: push
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - run: npx jest
+  variants:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        n: [1, 2]
+    steps:
+      - run: echo "${{ matrix.n }}"
+"#,
+    );
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
+    let manifest = Digest::of_bytes(b"manifest");
+    let mut specs = remote_task_runner::service::ci_run::task_specs(
+        &plan,
+        &digest,
+        &manifest,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    stage(&plan, &mut specs, 2, 2, "example/project", &[]);
+    let run = RunId::generate();
+    let source = SourceId::generate();
+    c.store().put_source_ref(&source, &manifest, 1).unwrap();
+    c.enqueue(
+        run.clone(),
+        source,
+        specs
+            .into_iter()
+            .map(|(_, s)| (TaskId::generate(), s))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    let listing = WorkerListing {
+        step: candidates(&plan).pop().unwrap(),
+        runner_version: "30.2".into(),
+        setup_ms: None,
+        discovered: listed(&["a.js", "b.js"]),
+    };
+    assert!(ci_advance(&fx, &c).released.is_empty());
+    let placements = c.tick().await.unwrap().placed;
+    assert_eq!(placements.len(), 1);
+    assert_eq!(
+        fx.w.payload(&placements[0]).ci_task.unwrap().task_id,
+        listing.step.task_id()
+    );
+    end_shard(
+        &c,
+        &files,
+        &(placements[0].clone(), fx.w.clone()),
+        Outcome::Succeeded,
+        &serde_json::to_vec(&listing).unwrap(),
+    )
+    .await;
+    for _ in 0..3 {
+        let pass = ci_advance(&fx, &c);
+        assert!(pass.faults.is_empty() && pass.failed.is_empty(), "{pass:?}");
+    }
+    let placements = c.tick().await.unwrap().placed;
+    assert_eq!(placements.len(), 2);
+    let dag = fx.w.payload(&placements[0]).ci_task.unwrap().plan_digest;
+    let split = serde_json::from_slice(
+        &remote_task_runner::ci::advance::read_plan(fx.dir.path(), &dag).unwrap(),
+    )
+    .unwrap();
+    let group = split_group(&split);
+    for attempt in placements {
+        let id = fx.w.payload(&attempt).ci_task.unwrap().task_id;
+        let index = group.shards.iter().position(|s| s == &id).unwrap();
+        let mut report: serde_json::Value =
+            serde_json::from_slice(&shard_result(&group, index, "success", "passed", None))
+                .unwrap();
+        report["jobs"] = json!([{
+            "workflow": listing.step.workflow, "job": "test", "display": "test",
+            "result": "pass", "secs": 0.035, "steps": []
+        }]);
+        for test in report["shard"]["tests"].as_array_mut().unwrap() {
+            test["millis"] = json!(35);
+        }
+        end_shard(
+            &c,
+            &files,
+            &(attempt, fx.w.clone()),
+            Outcome::Succeeded,
+            &serde_json::to_vec(&report).unwrap(),
+        )
+        .await;
+    }
+    let joined = ci_advance(&fx, &c);
+    assert!(joined.joined.contains(&group.id), "{joined:?}");
+    assert_eq!(joined.released.len(), 2);
+    let timings = c
+        .store()
+        .ci_test_timings(
+            listing.history_key(&plan, "example/project").unwrap(),
+            listing.discovered.tests,
+        )
+        .unwrap();
+    assert_eq!(
+        timings
+            .values()
+            .flat_map(|h| h.millis.values())
+            .copied()
+            .collect::<Vec<_>>(),
+        [35, 35]
+    );
+    let replay = ci_advance(&fx, &c);
+    assert!(
+        replay.joined.is_empty()
+            && replay.released.is_empty()
+            && replay.failed.is_empty()
+            && replay.faults.is_empty(),
+        "{replay:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_discovery_incompatible_worker_runs_the_original_job_after_the_probe_is_rejected() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    fx.w.set(|s| s.no_discovery = true);
+    let plan = ci_plan(
+        "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npx jest\n",
+    );
+    let (digest, _) = remote_task_runner::ci::advance::keep_plan(fx.dir.path(), &plan).unwrap();
+    let manifest = Digest::of_bytes(b"manifest");
+    let mut specs = remote_task_runner::service::ci_run::task_specs(
+        &plan,
+        &digest,
+        &manifest,
+        &Default::default(),
+        None,
+    )
+    .unwrap();
+    remote_task_runner::ci::discovery::stage(&plan, &mut specs, 2, 2, "project", &[]);
+    let run = RunId::generate();
+    let source = SourceId::generate();
+    c.store().put_source_ref(&source, &manifest, 1).unwrap();
+    c.enqueue(
+        run.clone(),
+        source,
+        specs
+            .into_iter()
+            .map(|(_, s)| (TaskId::generate(), s))
+            .collect(),
+    )
+    .await
+    .unwrap();
+    assert!(c.tick().await.unwrap().placed.is_empty());
+    for _ in 0..2 {
+        let pass = ci_advance(&fx, &c);
+        assert!(pass.failed.is_empty() && pass.faults.is_empty(), "{pass:?}");
+    }
+    let placed = c.tick().await.unwrap().placed;
+    assert_eq!(placed.len(), 1);
+    let task = fx.w.payload(&placed[0]).ci_task.unwrap();
+    assert_eq!(task.task_id, plan.tasks[0].id);
+    assert!(!task.verify_shard_version);
+    end_shard(
+        &c,
+        &files,
+        &(placed[0].clone(), fx.w.clone()),
+        Outcome::Succeeded,
+        &ci_result(&task.task_id, "test", "success", json!({})),
+    )
+    .await;
+    assert_eq!(
+        c.store()
+            .completion(remote_task_runner::service::completion::Target::Run(run))
+            .unwrap()
+            .exit_code(),
+        Some(0)
+    );
 }

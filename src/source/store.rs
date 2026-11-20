@@ -609,11 +609,12 @@ impl SourceStore {
         want: &BlobWant,
         r: &mut impl Read,
     ) -> Result<()> {
-        let mutation = self.mutation_guard()?;
+        let _mutation = self.mutation_guard()?;
         if !is_blob_hash(&want.hash) {
             return Err(corrupt(format!("not a blob hash: {:?}", want.hash)));
         }
-        mutation.ensure_blob_available(&want.hash)?;
+        // import_blob checks the publication claim in the same write
+        // transaction that binds the blob to this transfer.
         self.retention.import_blob(token, &want.hash)?;
         // hash first, in a scratch copy: a wrong blob must not enter the store
         let mut tmp = tempfile::Builder::new()

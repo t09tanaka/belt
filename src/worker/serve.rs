@@ -107,6 +107,23 @@ pub async fn serve_connection_offering(
         let agent = agent.clone();
         let negotiated_features = negotiated_features.clone();
         tokio::spawn(async move {
+            let uses_workflow_artifacts = matches!(
+                &request,
+                crate::wire::Request::WorkflowArtifact(_)
+            ) || matches!(&request, crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.as_ref().is_some_and(|ci| ci.artifact_workflow.is_some()));
+            if uses_workflow_artifacts
+                && !negotiated_features
+                    .iter()
+                    .any(|f| f == crate::wire::WORKFLOW_ARTIFACTS_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "workflow artifact exchange was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
             if matches!(&request, crate::wire::Request::PreparationProbe(_))
                 && !negotiated_features
                     .iter()
@@ -159,6 +176,32 @@ pub async fn serve_connection_offering(
                     .fail(ApiError::new(
                         ErrorCode::ProtocolIncompatible,
                         "frozen toolchains were not negotiated",
+                    ))
+                    .await;
+                return;
+            }
+            if matches!(&request, crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.as_ref().is_some_and(|ci| ci.dispatch.is_some()))
+                && !negotiated_features
+                    .iter()
+                    .any(|f| f == crate::wire::MATRIX_DISPATCH_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "derived matrix dispatch was not negotiated",
+                    ))
+                    .await;
+                return;
+            }
+            if matches!(&request,crate::wire::Request::SubmitAttempt(r) if r.payload.ci_task.as_ref().is_some_and(crate::wire::requires_discovery_feature))
+                && !negotiated_features
+                    .iter()
+                    .any(|f| f == crate::wire::CI_DISCOVERY_FEATURE)
+            {
+                let _ = responder
+                    .fail(ApiError::new(
+                        ErrorCode::ProtocolIncompatible,
+                        "runner discovery was not negotiated",
                     ))
                     .await;
                 return;

@@ -29,7 +29,7 @@ use super::error::{Result, SupervisorError};
 use super::run::{Control, NodeEnd, NodeTimes};
 use super::spec::NodeSpec;
 use super::termination::StopReason;
-use crate::ci::execute::{execute_task, TaskPaths};
+use crate::ci::execute::{execute_selected, SelectedTask, TaskPaths};
 use crate::ids::{Digest, NodeId};
 use crate::source::SourceStore;
 use crate::state::{Exit, TimeoutKind};
@@ -60,6 +60,14 @@ const RESULT_FILE: &str = "result.json";
 /// names of `env` only.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CiTaskSpec {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub verify_shard_version: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub artifact_workflow: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_scope: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch: Option<serde_json::Value>,
     /// The bytes of the frozen plan. Used only when they hash to
     /// `plan_digest`.
     pub plan_path: PathBuf,
@@ -238,6 +246,7 @@ pub(crate) type Core<'a> = &'a (dyn Fn(
          + Sync);
 
 struct StepJob {
+    sdk_key: Option<String>,
     argv: Vec<String>,
     cwd: PathBuf,
     env: Vec<(String, String)>,
@@ -249,12 +258,28 @@ struct StepJob {
 
 /// The executor the core is given: it only queues the step for the thread
 /// that owns the supervisor's state and waits for the answer.
-struct Queue(Mutex<Sender<StepJob>>);
+struct Queue {
+    verify_shard_version: bool,
+    sender: Mutex<Sender<StepJob>>,
+    artifacts: crate::ci::artifact_exchange::worker::Host,
+}
 
 impl StepExecutor for Queue {
+    fn verify_shard_runner(&self) -> bool {
+        self.verify_shard_version
+    }
+
+    fn artifact(
+        &self,
+        req: &local_ci::step_executor::ArtifactRequest<'_>,
+    ) -> std::result::Result<String, String> {
+        self.artifacts.run(req).map_err(|e| format!("{e:#}"))
+    }
+
     fn run(&self, req: &StepRequest) -> anyhow::Result<StepExit> {
         let (reply, answer) = sync_channel(1);
         let job = StepJob {
+            sdk_key: req.key.clone(),
             argv: req.argv.clone(),
             cwd: req.cwd.clone(),
             env: req.env.clone(),
@@ -263,7 +288,7 @@ impl StepExecutor for Queue {
             script_pipe: req.script_pipe.is_some(),
             reply,
         };
-        self.0
+        self.sender
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .send(job)
@@ -309,16 +334,45 @@ pub(crate) fn run_task(
         .ok_or_else(|| "the source of the attempt is not in this worker's store".to_string())?;
     let paths = ci.paths(cancel);
     let run_dir = paths.run_dir.clone();
-    let result = execute_task(
-        &store,
-        &manifest,
-        &plan,
-        &ci.task_id,
-        &inputs,
-        paths,
-        executor,
-    )
-    .map_err(|e| e.to_string())?;
+    if let Some(step) = crate::ci::discovery::DiscoveryStep::from_task(&plan, &ci.task_id) {
+        let probe = step.execution_plan(&plan).map_err(|e| e.to_string())?;
+        let task = probe
+            .tasks
+            .iter()
+            .find(|t| {
+                t.workflow == step.workflow && t.jobs.as_slice() == std::slice::from_ref(&step.job)
+            })
+            .ok_or("missing runner discovery task")?;
+        let result = execute_selected(
+            &store,
+            &manifest,
+            &probe,
+            SelectedTask::Plan(&task.id),
+            &inputs,
+            paths,
+            executor,
+        )
+        .map_err(|e| e.to_string())?;
+        let listing = step
+            .result(&plan, &ci.workspace, &run_dir, &result)
+            .map_err(|e| e.to_string())?;
+        let mut json = serde_json::to_vec(&listing).map_err(|e| e.to_string())?;
+        if json.len() as u64 > crate::ci::advance::MAX_RESULT_BYTES {
+            json = serde_json::to_vec(&listing.step.failed()).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(ci.result_path(), json).map_err(|e| e.to_string())?;
+        return Ok(vec![JobStatus::Success]);
+    }
+    let dispatch = ci
+        .dispatch
+        .as_ref()
+        .map(|value| crate::ci::execute::decode_dispatch(value, &ci.task_id))
+        .transpose()?;
+    let selected = dispatch
+        .as_ref()
+        .map_or(SelectedTask::Plan(&ci.task_id), SelectedTask::Derived);
+    let result = execute_selected(&store, &manifest, &plan, selected, &inputs, paths, executor)
+        .map_err(|e| e.to_string())?;
     let outcomes =
         serde_json::to_vec(&result.outcomes).map_err(|e| format!("the result of the task: {e}"))?;
     outcomes_fit(outcomes.len(), MAX_INPUT_BYTES)?;
@@ -363,6 +417,7 @@ fn stopped_between(reason: StopReason) -> NodeEnd {
 fn serve(
     ctl: &mut Control<'_>,
     steps: Receiver<StepJob>,
+    ci: &CiTaskSpec,
     cancel: &CancelHandle,
 ) -> (Option<NodeEnd>, String, Option<SupervisorError>) {
     let mut over: Option<NodeEnd> = None;
@@ -417,7 +472,15 @@ fn serve(
                 .append(true)
                 .open(&job.log)
                 .ok();
-            let end = ctl.run_node(index, &node);
+            let timing = ci
+                .history_scope
+                .as_ref()
+                .zip(job.sdk_key.as_deref())
+                .and_then(|(scope, key)| {
+                    let cwd = job.cwd.strip_prefix(&ci.workspace).ok()?.to_str()?;
+                    Some(crate::ci::timing::step(scope, key, cwd))
+                });
+            let end = ctl.run_node_with_ci_history(index, &node, timing.as_ref());
             ctl.tee = None;
             end
         });
@@ -450,7 +513,28 @@ pub(super) fn drive(ctl: &mut Control<'_>, ci: &CiTaskSpec, core: Core<'_>) -> R
     std::fs::create_dir_all(&ci.scratch)
         .map_err(|e| SupervisorError::State(format!("the CI scratch directory: {e}")))?;
     let (send, steps) = channel();
-    let executor: Arc<dyn StepExecutor> = Arc::new(Queue(Mutex::new(send)));
+    let executor: Arc<dyn StepExecutor> = Arc::new(Queue {
+        verify_shard_version: ci.verify_shard_version,
+        sender: Mutex::new(send),
+        artifacts: crate::ci::artifact_exchange::worker::Host {
+            root: ci.scratch.join("exchange"),
+            workflow: ci.artifact_workflow.clone(),
+            secret_files: ctl
+                .spec
+                .artifacts
+                .as_ref()
+                .map(|s| s.secret_files.clone())
+                .unwrap_or_default(),
+            secret_paths: ctl
+                .spec
+                .artifacts
+                .as_ref()
+                .map(|s| s.secret_paths.clone())
+                .unwrap_or_default(),
+            masker: ctl.spec.mask.masker(),
+            serial: Mutex::new(()),
+        },
+    });
     // The one handle of the attempt: the core watches it, this side cancels.
     let cancel = CancelHandle::new();
     let (served, ran) = std::thread::scope(|s| {
@@ -458,7 +542,7 @@ pub(super) fn drive(ctl: &mut Control<'_>, ci: &CiTaskSpec, core: Core<'_>) -> R
         // panics) the queue closes and the loop below ends.
         let handle = cancel.clone();
         let running = s.spawn(move || core(&state_dir, ci, executor, handle));
-        let served = serve(ctl, steps, &cancel);
+        let served = serve(ctl, steps, ci, &cancel);
         (served, running.join())
     });
     let (over, last_node, fatal) = served;
@@ -653,6 +737,10 @@ mod tests {
     #[test]
     fn the_spec_shows_no_value_of_its_environment_and_needs_absolute_paths() {
         let mut ci = CiTaskSpec {
+            verify_shard_version: false,
+            artifact_workflow: None,
+            history_scope: None,
+            dispatch: None,
             plan_path: "/a/plan.json".into(),
             plan_digest: Digest::of_bytes(b"plan"),
             task_id: "t".into(),

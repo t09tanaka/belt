@@ -97,14 +97,44 @@ impl Fx {
         let connected = connect(io, super::proto_common::client_cfg(&self.cluster))
             .await
             .unwrap();
-        let answer = (
+        let identity = (
             connected.worker.worker_id.to_string(),
             connected.worker.worker_boot_id.to_string(),
+        );
+        // The ephemeral process has no installed service journal. The report
+        // must come from the profile of the process serving this bridge.
+        use remote_task_runner::wire::{EnvReportRequest, Request, Response, SchemaVersion};
+        let response = connected
+            .client
+            .call(
+                Request::EnvReport(EnvReportRequest {
+                    schema_version: SchemaVersion::CURRENT,
+                    request_id: remote_task_runner::ids::RequestId::generate(),
+                    required: vec![],
+                }),
+                Duration::from_secs(60),
+            )
+            .await
+            .unwrap();
+        let Response::EnvReport(answer) = response else {
+            panic!("unexpected environment reply")
+        };
+        let environment = answer.environment.expect("active worker's full report");
+        assert_eq!(
+            environment.schema_version,
+            remote_task_runner::toolchain::envdiff::SCHEMA
+        );
+        assert_eq!(environment.os, answer.os);
+        assert_eq!(environment.arch, answer.arch);
+        assert!(!environment.profile.is_empty());
+        assert_eq!(
+            answer.profile_fingerprint,
+            connected.worker.profile_fingerprint
         );
         drop(connected);
         let _ = bridge.start_kill();
         let _ = bridge.wait().await;
-        answer
+        identity
     }
     async fn stop(&self, mut child: tokio::process::Child, pid: u32, start: String) {
         assert_eq!(

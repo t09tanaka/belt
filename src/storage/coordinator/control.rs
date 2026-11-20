@@ -30,6 +30,55 @@ impl CoordinatorStore {
         })
     }
 
+    /// Bind a fail-fast decision to the live attempt seen by the CI pass.
+    /// Concurrent passes, user cancellation and a terminal/retried attempt
+    /// cannot acquire a second or incorrect reason.
+    pub(crate) fn stop_ci_attempt(
+        &self,
+        run: &RunId,
+        task: &TaskId,
+        attempt: &AttemptId,
+        reason: &str,
+        at_ms: u64,
+    ) -> Result<bool> {
+        let (run, task, attempt, reason) = (
+            run.to_string(),
+            task.clone(),
+            attempt.to_string(),
+            reason.to_owned(),
+        );
+        self.db.write(move |tx| {
+            let live: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM task t JOIN attempt a USING(task_id)
+                 WHERE t.run_id=?1 AND t.task_id=?2 AND a.attempt_id=?3
+                 AND t.cancel_requested_at_ms IS NULL AND a.generation>=t.min_generation
+                 AND a.state<>'terminal' AND a.retired=0)",
+                params![run, task.as_str(), attempt],
+                |r| r.get(0),
+            )?;
+            if !live {
+                return Ok(false);
+            }
+            let expected = revision(tx, &run)?;
+            apply_cancel(
+                tx,
+                Target::Task(task.clone()),
+                expected,
+                RunId::generate().to_string(),
+                at_ms,
+            )?;
+            common::append_event(
+                tx,
+                Some(&run),
+                Some(&attempt),
+                "ci_fail_fast_requested",
+                &serde_json::json!({"task": task, "reason": reason}),
+                at_ms,
+            )?;
+            Ok(true)
+        })
+    }
+
     /// The CI tasks of `run` that were never placed (only `only`, when one
     /// is named) cannot be run: write why into each (`ci.unrunnable` of its
     /// spec), cancel it, and record the event `ci_task_unrunnable`, all in
@@ -54,8 +103,8 @@ impl CoordinatorStore {
                 let mut query = tx.prepare(
                     "SELECT t.task_id FROM task t WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2)
                      AND t.cancel_requested_at_ms IS NULL
-                     AND json_type(t.spec_json,'$.ci')='object'
-                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id)
+                     AND json_type(t.spec_json,'$.ci')='object' AND json_extract(t.spec_json,'$.ci.core_outcome') IS NULL
+                     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))
                      ORDER BY t.created_at_ms,t.rowid",
                 )?;
                 let rows = query.query_map(params![run, only], |row| row.get(0))?;
@@ -248,7 +297,7 @@ fn completion_on(
     } else {
         ("", "NULL")
     };
-    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,json_extract(t.spec_json,'$.ci.shard_group') IS NOT NULL,{cancel_at} FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
+    let sql = format!("SELECT t.task_id,{cancel},a.state,a.observation,a.termination_json,{verdict},coalesce(json_extract(t.spec_json,'$.in_place'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.joined'),0)=0,json_extract(t.spec_json,'$.ci.join_failure') IS NOT NULL,coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')) IS NOT NULL,{cancel_at},json_extract(t.spec_json,'$.ci.core_outcome') FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id AND aa.retired=0 {boundary} ORDER BY aa.generation DESC LIMIT 1) {join} WHERE t.run_id=?1 AND (?2 IS NOT NULL OR coalesce(json_extract(t.spec_json,'$.ci.task.inputs.rtr_discovery.applied'),0)=0) AND (?2 IS NULL OR t.task_id=?2) ORDER BY t.task_id");
     let mut stmt = c.prepare(&sql)?;
     // The first shard of a split job that is a failure (see below).
     let mut job_failed = None;
@@ -271,6 +320,24 @@ fn completion_on(
     let mut rows = stmt.query(params![run, task])?;
     while let Some(row) = rows.next()? {
         let task = id("task_id", TaskId::parse(&row.get::<_, String>(0)?))?;
+        if let Some(status) = row.get::<_, Option<String>>(11)? {
+            snapshot.task_count += 1;
+            snapshot.computed_tasks += 1;
+            if status == "failure" {
+                snapshot.job_failure(task, None);
+            } else if status == "cancelled" {
+                snapshot.cancel_requested = true;
+                snapshot
+                    .first_compute_failure
+                    .get_or_insert(crate::service::completion::Failure {
+                        task_id: task,
+                        code: crate::error::ErrorCode::CommandFailed,
+                        exit_code: crate::error::exit::CANCELLED,
+                        termination: None,
+                    });
+            }
+            continue;
+        }
         snapshot.in_place |= row.get::<_, bool>(6)?;
         let cancel: bool = row.get(1)?;
         let state: Option<String> = row.get(2)?;

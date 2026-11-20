@@ -8,11 +8,39 @@ use std::sync::atomic::AtomicUsize;
 
 /// A worker that counts what it is sent and answers nothing.
 #[derive(Default)]
-struct Silent {
+pub(super) struct Silent {
     calls: AtomicUsize,
+    pub(super) features: Vec<&'static str>,
+}
+
+impl Silent {
+    pub(super) fn with_features(features: Vec<&'static str>) -> Self {
+        Self {
+            features,
+            ..Self::default()
+        }
+    }
 }
 
 impl WorkerLink for Silent {
+    fn ci_task_negotiated(&self) -> bool {
+        self.features.contains(&crate::wire::CI_TASK_FEATURE)
+    }
+
+    fn ci_discovery_negotiated(&self) -> bool {
+        self.features.contains(&crate::wire::CI_DISCOVERY_FEATURE)
+    }
+
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.features
+            .contains(&crate::wire::MATRIX_DISPATCH_FEATURE)
+    }
+
+    fn workflow_artifacts_negotiated(&self) -> bool {
+        self.features
+            .contains(&crate::wire::WORKFLOW_ARTIFACTS_FEATURE)
+    }
+
     fn call(&self, _request: Request) -> LinkFuture<'_> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         Box::pin(async { Err(LinkError::Unconfirmed) })
@@ -151,6 +179,7 @@ fn a_spec_is_checked_with_the_construction_every_placement_uses() {
     }
     // The demand is the payload itself, under the hash that is recorded.
     let input = PlaceInput {
+        permit_id: None,
         run_id: run.clone(),
         task_id: task.clone(),
         generation: Generation(3),
@@ -188,6 +217,7 @@ async fn futures_are_joined_in_their_order_whichever_ends_first() {
 fn declared_artifacts_reach_the_payload_and_its_hash() {
     use crate::wire::MissingPolicy;
     let input = |spec: &TaskSpec| PlaceInput {
+        permit_id: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
         generation: Generation(1),
@@ -230,6 +260,7 @@ fn setup_survives_queue_serialization_and_payload_construction() {
         .setup
         .is_none());
     let input = PlaceInput {
+        permit_id: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
         generation: Generation(1),
@@ -260,7 +291,16 @@ fn setup_survives_queue_serialization_and_payload_construction() {
 fn ci_spec(hold: bool, steps: u32) -> TaskSpec {
     TaskSpec {
         ci: Some(CiSpec {
+            history_keys: Vec::new(),
+            dynamic_origin: false,
+            core_outcome: None,
+            matrix: None,
+            shard_retry_forbidden: false,
+            shard_preferred_worker: None,
             task: crate::wire::CiTask {
+                verify_shard_version: false,
+                artifact_workflow: None,
+                dispatch: None,
                 plan_digest: Digest::of_bytes(b"plan"),
                 task_id: "ci.yml/build".into(),
                 inputs: serde_json::json!({"needs": {}}),

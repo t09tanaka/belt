@@ -82,7 +82,13 @@ pub struct ShardSummary {
     pub workflow: String,
     pub source_jobs: Vec<String>,
     pub shards: Vec<String>,
+    /// Native partitions have no file assignments until the runner finishes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub assigned_test_counts: Vec<usize>,
     pub split: bool,
+    /// This unpartitioned candidate has to be listed on a worker.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub discovery_candidate: bool,
     /// Core's actual reasons. Planning does not invent test discovery facts.
     pub not_split: Vec<NotSplit>,
 }
@@ -196,6 +202,10 @@ pub(crate) fn summarize(fp: &FrozenPlan) -> Result<PlanSummary, PlanError> {
             toolchain_requirements: recipe.toolchain.len(),
         });
     }
+    let candidates: std::collections::BTreeSet<_> = super::discovery::candidates(fp)
+        .into_iter()
+        .map(|step| (step.workflow, step.job))
+        .collect();
     let mut shard_groups = vec![];
     for g in &fp.shard_groups {
         validate_path(&g.workflow)?;
@@ -210,7 +220,16 @@ pub(crate) fn summarize(fp: &FrozenPlan) -> Result<PlanSummary, PlanError> {
             workflow: g.workflow.clone(),
             source_jobs: g.source_jobs.clone(),
             shards: g.shards.clone(),
+            assigned_test_counts: if g.split && g.assignments.iter().any(|a| !a.is_empty()) {
+                g.assignments.iter().map(|tests| tests.len()).collect()
+            } else {
+                Vec::new()
+            },
             split: g.split,
+            discovery_candidate: g
+                .source_jobs
+                .first()
+                .is_some_and(|job| candidates.contains(&(g.workflow.clone(), job.clone()))),
             not_split: g.not_split.clone(),
         });
     }
@@ -278,7 +297,19 @@ pub fn render_text(s: &PlanSummary) -> String {
             ));
         }
     }
+    for g in s.shard_groups.iter().filter(|g| g.split) {
+        for (id, count) in g.shards.iter().zip(&g.assigned_test_counts) {
+            lines.push(format!("shard {id} has {count} assigned tests"));
+        }
+    }
     for g in s.shard_groups.iter().filter(|g| !g.split) {
+        if g.discovery_candidate {
+            lines.push(format!(
+                "task {} can be partitioned after worker discovery",
+                g.id
+            ));
+            continue;
+        }
         let reasons: Vec<_> = g.not_split.iter().map(reason_name).collect();
         lines.push(format!(
             "task {} is not split: [{}]",
@@ -312,6 +343,34 @@ mod tests {
         summary.shard_groups[0].split = true;
         assert_eq!(render_text(&summary), format!("{head}{list}{rest}"));
     }
+    #[test]
+    fn discovery_summary_changes_after_the_worker_partitions_tests() {
+        let path = ".github/workflows/test.yml";
+        let yaml = "on: push\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: cargo test\n";
+        let mut fp = plan(&[(path, yaml)]);
+        let summary = summarize(&fp).unwrap();
+        let group = &summary.shard_groups[0];
+        assert!(group.discovery_candidate);
+        assert!(render_text(&summary).contains(&format!(
+            "task {} can be partitioned after worker discovery",
+            group.id
+        )));
+        let group = &mut fp.shard_groups[0];
+        group.split = true;
+        group.shards = vec!["first".into(), "second".into()];
+        // Shards may already be named while no test has been assigned yet.
+        group.assignments = vec![vec![], vec![]];
+        let empty = summarize(&fp).unwrap();
+        assert!(empty.shard_groups[0].assigned_test_counts.is_empty());
+        assert!(!render_text(&empty).contains("assigned tests"));
+
+        fp.shard_groups[0].assignments = vec![vec!["one".into(), "two".into()], vec![]];
+        let summary = summarize(&fp).unwrap();
+        assert_eq!(summary.shard_groups[0].assigned_test_counts, [2, 0]);
+        assert!(render_text(&summary)
+            .contains("shard first has 2 assigned tests\nshard second has 0 assigned tests"));
+    }
+
     use local_ci::frozen::{DisabledRecord, Filters, FrozenConfig, PlanParts, SourceRef};
 
     fn plan(workflows: &[(&str, &str)]) -> FrozenPlan {

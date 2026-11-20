@@ -1802,35 +1802,6 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
     let before_generation = gate.generation();
     let before_readiness = gate.snapshot();
     let before_preferred = gate.preferred();
-    fn rows(coordinator: &Coordinator) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
-        coordinator
-            .store()
-            .db
-            .call(|db| {
-                let tables = db
-                    .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut all = vec![];
-                for table in tables {
-                    let mut statement = db.prepare(&format!(
-                        "SELECT * FROM \"{}\" ORDER BY rowid",
-                        table.replace('"', "\"\"")
-                    ))?;
-                    let columns = statement.column_count();
-                    let rows = statement
-                        .query_map([], |r| {
-                            (0..columns)
-                                .map(|i| r.get(i))
-                                .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    all.push((table, rows));
-                }
-                Ok(all)
-            })
-            .unwrap()
-    }
     fn files(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         let mut out = BTreeMap::new();
         if root.exists() {
@@ -1848,7 +1819,7 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
     // Isolate read-only IPC evidence from the enabled background input GC.
     // Production uses the same nonblocking busy skip while a reader holds SH.
     let _source_gc_pin = resident.captured.sources.mutation_guard().unwrap();
-    let before_rows = rows(&coordinator);
+    let before_rows = coordinator.store().snapshot_rows_for_test();
     let before_sources = files(&root.path().join("parent/sources"));
     let traffic = root.path().join(".local/state/task-traffic-controller");
     let before_traffic = files(&traffic);
@@ -1946,7 +1917,7 @@ async fn estimate_ipc_100_reads_preserve_rows_traffic_sources_and_readiness() {
         frozen_json
     );
     assert_eq!(before_preferred, gate.preferred());
-    assert_eq!(before_rows, rows(&coordinator));
+    assert_eq!(before_rows, coordinator.store().snapshot_rows_for_test());
     assert_eq!(before_epoch, coordinator.epoch());
     assert_eq!(before_generation, gate.generation());
     assert_eq!(before_readiness, gate.snapshot());
@@ -2099,7 +2070,16 @@ async fn retry_rpc_waits_for_source_gc_before_input_lease_and_reports_typed_expi
 fn a_run_of_ci_tasks_is_a_request_an_older_resident_refuses() {
     let ci = TaskSpec {
         ci: Some(crate::coordinator::CiSpec {
+            history_keys: Vec::new(),
+            dynamic_origin: false,
+            core_outcome: None,
+            matrix: None,
+            shard_retry_forbidden: false,
+            shard_preferred_worker: None,
             task: crate::wire::CiTask {
+                verify_shard_version: false,
+                artifact_workflow: None,
+                dispatch: None,
                 plan_digest: Digest::of_bytes(b"plan"),
                 task_id: "t".into(),
                 inputs: serde_json::json!({}),

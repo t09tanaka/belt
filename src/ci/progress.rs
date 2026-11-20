@@ -111,6 +111,24 @@ pub fn unsupported(plan: &FrozenPlan) -> Option<String> {
     task.or_else(|| shards::shape_fault(plan))
 }
 
+/// Runner milliseconds only, never job or scheduler elapsed time.
+pub(crate) fn receipt_timings(receipt: &ShardOutcome) -> local_ci::shard::History {
+    let mut history = local_ci::shard::History::default();
+    for test in &receipt.tests {
+        if test.status == local_ci::shard::TestStatus::Passed {
+            // Even the largest manifest, on the slowest supported worker,
+            // must fit the SDK's integer load arithmetic.
+            if let Some(ms) = test
+                .millis
+                .filter(|n| *n <= u64::MAX / crate::supervisor::ci_task::MAX_PLAN_BYTES / 1000)
+            {
+                history.millis.insert(test.identity.clone(), ms);
+            }
+        }
+    }
+    history
+}
+
 /// The `needs` of the plan as a DAG over its tasks.
 pub struct NeedsProgression {
     tasks: Vec<ExecutionTask>,
@@ -192,6 +210,25 @@ impl NeedsProgression {
     /// ([`shards::rerun`]); none before the job has its outcome.
     pub fn split_job_rerun(&self, group: &str) -> &[String] {
         self.reruns.get(group).map_or(&[], Vec::as_slice)
+    }
+
+    /// Times from a complete, successful join. Partial receipts, skipped
+    /// tests and absent measurements do not become observations.
+    pub fn timing_samples(&self, group: &ShardGroup) -> BTreeMap<String, local_ci::shard::History> {
+        let mut history = BTreeMap::<String, local_ci::shard::History>::new();
+        if self
+            .joins
+            .get(&group.id)
+            .is_none_or(|j| j.status != JobStatus::Success)
+        {
+            return history;
+        }
+        for id in &group.shards {
+            if let Some(receipt) = self.receipts.get(id) {
+                history.insert(id.clone(), receipt_timings(receipt));
+            }
+        }
+        history
     }
 
     pub fn is_settled(&self, task: &str) -> bool {

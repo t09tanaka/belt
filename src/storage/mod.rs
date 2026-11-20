@@ -26,13 +26,14 @@ mod tests;
 mod worker;
 
 pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
+pub(crate) use coordinator::MAX_TASKS_PER_RUN;
 pub use coordinator::{
     ArtifactReceipt, AttemptRecord, Collectable, CollectionRow, CoordinatorStore, Forgotten,
     InputCursor, InputPage, LiveAttempt, LiveAttemptPage, NewAttempt, Permit, PlaceInput,
     PlaceOutcome, Placement, PreparedRetry, QueuedTask, ResultRef, RetireEnd, RetryPreparation,
     RunStanding, Seen, WorkerLoad, PAGE_MAX,
 };
-pub use coordinator::{CiAttempt, CiTaskRow};
+pub use coordinator::{CiAttempt, CiTaskRow, WorkflowArtifact, WorkflowUpload};
 pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
 pub use db::Db;
 pub use lock::ProcessLock;

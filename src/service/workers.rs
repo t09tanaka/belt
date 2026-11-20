@@ -45,6 +45,13 @@ pub trait Remote {
         timeout: Duration,
     ) -> Result<RemoteOutput, String>;
 
+    /// Another handle that can run commands at the same time as this one, or
+    /// `None` when this remote cannot (the work is then done one command at
+    /// a time). `ssh` can: every call is its own process.
+    fn split(&self) -> Option<Box<dyn Remote + Send>> {
+        None
+    }
+
     /// The parent's operating system, as `std::env::consts::OS` names it. A
     /// test double can answer for another one so a test never depends on the
     /// machine it runs on.
@@ -164,6 +171,10 @@ async fn hello_through(
 
 pub struct SshRemote;
 impl Remote for SshRemote {
+    fn split(&self) -> Option<Box<dyn Remote + Send>> {
+        Some(Box::new(SshRemote))
+    }
+
     fn run(
         &mut self,
         target: &SshTarget,
@@ -262,6 +273,107 @@ fn ssh_hello(
         .build()
         .map_err(|e| e.to_string())?
         .block_on(hello_through(&argv, cluster, required))
+}
+
+impl Remote for Box<dyn Remote + Send> {
+    fn run(
+        &mut self,
+        target: &SshTarget,
+        shell: &str,
+        stdin: &[u8],
+        timeout: Duration,
+    ) -> Result<RemoteOutput, String> {
+        (**self).run(target, shell, stdin, timeout)
+    }
+    fn split(&self) -> Option<Box<dyn Remote + Send>> {
+        (**self).split()
+    }
+    fn parent_os(&self) -> &str {
+        (**self).parent_os()
+    }
+    fn bridge_hello(
+        &mut self,
+        target: &SshTarget,
+        binary: &str,
+        cluster: &ClusterId,
+    ) -> Result<(ClusterId, WorkerId), String> {
+        (**self).bridge_hello(target, binary, cluster)
+    }
+    fn bridge_hello_with(
+        &mut self,
+        target: &SshTarget,
+        binary: &str,
+        cluster: &ClusterId,
+        required: &[String],
+    ) -> Result<BridgeHello, String> {
+        (**self).bridge_hello_with(target, binary, cluster, required)
+    }
+}
+
+/// The most workers asked at the same time. Each is an `ssh` process.
+pub const MAX_PARALLEL_WORKERS: usize = 8;
+
+/// `job` for every item, in the order of `items`, at most
+/// `MAX_PARALLEL_WORKERS` at a time, each on its own handle of `remote`.
+/// A remote that cannot split, and a single item, run one after the other on
+/// `remote` itself. The results keep the order of the items, so what is
+/// printed does not depend on which worker answered first.
+pub fn fan_out<T: Send, R: Send>(
+    remote: &mut dyn Remote,
+    items: Vec<T>,
+    job: &(dyn Fn(&mut dyn Remote, T) -> R + Sync),
+) -> Vec<R> {
+    if items.len() < 2 || remote.split().is_none() {
+        return items.into_iter().map(|item| job(remote, item)).collect();
+    }
+    let mut out = Vec::with_capacity(items.len());
+    let mut rest = items.into_iter().peekable();
+    while rest.peek().is_some() {
+        let batch: Vec<(T, Box<dyn Remote + Send>)> = rest
+            .by_ref()
+            .take(MAX_PARALLEL_WORKERS)
+            .map(|item| {
+                (
+                    item,
+                    remote.split().expect("a remote that split once splits"),
+                )
+            })
+            .collect();
+        std::thread::scope(|scope| {
+            let running: Vec<_> = batch
+                .into_iter()
+                .map(|(item, mut handle)| scope.spawn(move || job(&mut *handle, item)))
+                .collect();
+            for one in running {
+                match one.join() {
+                    Ok(result) => out.push(result),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                }
+            }
+        });
+    }
+    out
+}
+
+/// `first` and `second` at the same time when `remote` can split, else one
+/// after the other (`first` first).
+pub fn both<A: Send, B: Send>(
+    remote: &mut dyn Remote,
+    first: impl FnOnce(&mut dyn Remote) -> A + Send,
+    second: impl FnOnce(&mut dyn Remote) -> B + Send,
+) -> (A, B) {
+    let Some(mut handle) = remote.split() else {
+        let a = first(remote);
+        return (a, second(remote));
+    };
+    std::thread::scope(|scope| {
+        let other = scope.spawn(move || second(&mut *handle));
+        let a = first(remote);
+        match other.join() {
+            Ok(b) => (a, b),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1186,7 +1298,7 @@ fn parse_env_reply(out: &RemoteOutput, name: &str) -> Result<EnvReport, ApiError
 
 /// The environment of a registered worker, measured by its own binary.
 pub fn fetch_env(
-    remote: &mut impl Remote,
+    remote: &mut (impl Remote + ?Sized),
     env: &BTreeMap<String, String>,
     exe: &Path,
     name: &str,
@@ -1194,6 +1306,20 @@ pub fn fetch_env(
     check_name(name)?;
     let registration = registered(env, name)?
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no such worker is registered"))?;
+    if registration.ephemeral {
+        let spec = super::context::runtime_spec(env)?;
+        let worker = WorkerId::parse(name)
+            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+        return match resident_request(&spec, super::resident::Operation::EnvReport { worker }) {
+            Ok(super::resident::Reply::EnvReport { environment }) => Ok(environment),
+            Ok(super::resident::Reply::ControlError { error }) => Err(error),
+            Ok(_) => Err(ApiError::new(
+                ErrorCode::ProtocolIncompatible,
+                "resident did not return the worker environment",
+            )),
+            Err(message) => Err(ApiError::new(ErrorCode::CommunicationUnknown, message)),
+        };
+    }
     let target = target_of(&registration.ssh)?;
     let digest = worker_service::sha256_file(exe)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
@@ -1240,9 +1366,14 @@ pub fn diff_workers(
         ));
     }
     let parent = local().map_err(|e| ApiError::new(ErrorCode::Internal, e))?;
+    // Every worker is asked at the same time (a named one is one ask), and the
+    // answers come back in the order of the names.
+    let fetched = fan_out(remote, names.clone(), &|handle, worker: String| {
+        fetch_env(handle, env, exe, &worker)
+    });
     let mut out = Vec::new();
-    for worker in names {
-        match fetch_env(remote, env, exe, &worker) {
+    for (worker, fetched) in names.into_iter().zip(fetched) {
+        match fetched {
             Ok(report) => {
                 let items = envdiff::diff(&parent, &report);
                 out.push(WorkerDiff {
@@ -1302,8 +1433,73 @@ pub struct SyncResult {
     pub in_sync: bool,
 }
 
+/// Directories whose workflow files `--project` reads (the project's own
+/// workflow locations; a link at any step is not followed).
+const WORKFLOW_DIRS: &[&str] = &[".ci/workflows", ".github/workflows"];
+
+/// One small regular file below `root`: `None` when it is not there. A link,
+/// a special file or a file over the size limit is refused, and nothing
+/// below follows a link the project holds.
+fn read_small(root: &Path, name: &str) -> Result<Option<Vec<u8>>, ApiError> {
+    let bad = |what: &str| invalid(format!("project version files: {what}"));
+    let file = match crate::platform::open_beneath(root, Path::new(name)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(bad(&format!("{name} is not a small regular file"))),
+    };
+    let meta = file
+        .metadata()
+        .map_err(|_| bad(&format!("{name} is unreadable")))?;
+    if !meta.is_file() || meta.len() > crate::toolchain::declarations::MAX_DOCUMENT_BYTES as u64 {
+        return Err(bad(&format!("{name} is not a small regular file")));
+    }
+    let mut bytes = Vec::new();
+    file.take(crate::toolchain::declarations::MAX_DOCUMENT_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| bad(&format!("{name} is unreadable")))?;
+    Ok(Some(bytes))
+}
+
+/// The workflow files of the project (`.yml` and `.yaml` directly in a
+/// workflow directory that is itself a plain directory), by relative path.
+fn workflow_files(root: &Path) -> Result<Vec<String>, ApiError> {
+    let bad = |what: String| invalid(format!("project workflows: {what}"));
+    let mut found = Vec::new();
+    for dir in WORKFLOW_DIRS {
+        // Every component is looked at without following a link.
+        let mut at = root.to_path_buf();
+        let mut plain = true;
+        for part in dir.split('/') {
+            at.push(part);
+            plain = std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_dir());
+            if !plain {
+                break;
+            }
+        }
+        if !plain {
+            continue;
+        }
+        let entries = std::fs::read_dir(&at).map_err(|_| bad(format!("{dir} is unreadable")))?;
+        for entry in entries {
+            let entry = entry.map_err(|_| bad(format!("{dir} is unreadable")))?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".yml") || name.ends_with(".yaml") {
+                found.push(format!("{dir}/{name}"));
+            }
+        }
+    }
+    found.sort();
+    if found.len() > crate::toolchain::declarations::MAX_DOCUMENTS {
+        return Err(bad("too many workflow files".into()));
+    }
+    Ok(found)
+}
+
 /// The project's version requirements per tool, read from the version files
-/// directly under `dir` (never followed through a link, bounded in size).
+/// directly under `dir` and from the `setup-*` inputs of its workflows (never
+/// followed through a link, bounded in size). A workflow step that pins a
+/// different version of a tool than another step is a requirement of its own:
+/// the worker needs every version the project runs.
 pub fn read_project_requirements(
     dir: &Path,
 ) -> Result<Vec<crate::toolchain::versions::EffectiveRequirement>, ApiError> {
@@ -1318,30 +1514,66 @@ pub fn read_project_requirements(
     for name in declarations::VERSION_FILES {
         // Every directory of the name (`.fvm`) and the file are opened one by
         // one without following a link.
-        let file = match crate::platform::open_beneath(&root, Path::new(name)) {
-            Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(bad(&format!("{name} is not a small regular file"))),
+        let Some(bytes) = read_small(&root, name)? else {
+            continue;
         };
-        let meta = file
-            .metadata()
-            .map_err(|_| bad(&format!("{name} is unreadable")))?;
-        if !meta.is_file() || meta.len() > declarations::MAX_DOCUMENT_BYTES as u64 {
-            return Err(bad(&format!("{name} is not a small regular file")));
-        }
-        let mut bytes = Vec::new();
-        file.take(declarations::MAX_DOCUMENT_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|_| bad(&format!("{name} is unreadable")))?;
         let doc = declarations::Document::new(name, &bytes)
             .map_err(|d| bad(&format!("{name}: {}", d.code)))?;
         documents.insert(name.to_string(), doc);
     }
-    if documents.is_empty() {
-        return Err(bad(&format!("no version files found in {}", dir.display())));
+    let workflows = workflow_files(&root)?;
+    let mut extra = Vec::new();
+    for name in &workflows {
+        let bytes = read_small(&root, name)?.ok_or_else(|| bad(&format!("{name} is gone")))?;
+        let doc = declarations::Document::new(name, &bytes)
+            .map_err(|d| bad(&format!("{name}: {}", d.code)))?;
+        // A version file a recognized setup action names is read too; the
+        // path is relative to the project, as in a captured source.
+        extra.extend(
+            declarations::workflow_version_files(&doc)
+                .map_err(|d| bad(&format!("{name}: {}", d.code)))?,
+        );
+        documents.insert(name.clone(), doc);
     }
-    let found = declarations::read_project("", &documents, &[]).map_err(|d| bad(&d.code))?;
-    versions::effective(&found, &versions::Scope::project("")).map_err(|d| bad(&d.code))
+    for name in extra {
+        if documents.contains_key(&name) {
+            continue;
+        }
+        if let Some(bytes) = read_small(&root, &name)? {
+            let doc = declarations::Document::new(&name, &bytes)
+                .map_err(|d| bad(&format!("{name}: {}", d.code)))?;
+            documents.insert(name, doc);
+        }
+    }
+    if documents.is_empty() {
+        return Err(bad(&format!(
+            "no version files or workflows found in {}",
+            dir.display()
+        )));
+    }
+    let found = declarations::read_project("", &documents, &workflows).map_err(|d| {
+        bad(&format!(
+            "{}{}",
+            d.code,
+            d.locations
+                .first()
+                .map(|l| format!(" at {}:{}", l.path, l.first_line))
+                .unwrap_or_default()
+        ))
+    })?;
+    let scopes = versions::requirement_scopes(&found);
+    let mut out: Vec<versions::EffectiveRequirement> = Vec::new();
+    for scope in scopes {
+        for requirement in versions::effective(&found, &scope).map_err(|d| bad(&d.code))? {
+            if !out
+                .iter()
+                .any(|r| r.tool == requirement.tool && r.constraints == requirement.constraints)
+            {
+                out.push(requirement);
+            }
+        }
+    }
+    Ok(out)
 }
 
 fn blocked_error(name: &str, installed: &[InstallStep], blocked: &[Blocked]) -> ApiError {
@@ -1796,6 +2028,8 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
             });
         }
         WorkersSub::Sync { name, project } => {
+            // Ctrl-C while an install is waited for lets go of it on the worker.
+            let _interrupt = warmup::interrupt::Guard::new();
             let result = (|| {
                 let exe = exe
                     .as_ref()
@@ -1820,7 +2054,10 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                 (serde_json::to_value(&done).expect("serializes"), text)
             });
             let text = result.as_ref().map(|(_, t)| t.clone()).unwrap_or_default();
-            return Some(emit(json, result.map(|(v, _)| v), || text));
+            let interrupted = matches!(&result, Err(e) if e.code == ErrorCode::Signal);
+            let code = emit(json, result.map(|(v, _)| v), || text);
+            // What a shell reports for a command ended by Ctrl-C.
+            return Some(if interrupted { 130 } else { code });
         }
         WorkersSub::Upgrade { name, binary } => {
             return Some(upgrade::command(name, binary.as_deref(), json, &env, exe))
@@ -1840,6 +2077,44 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
 pub mod target;
 pub mod upgrade;
 pub mod warmup;
+
+/// A rendezvous for tests: every caller waits until `need` of them are
+/// inside, so a run that asks one at a time fails instead of passing.
+#[cfg(test)]
+pub(crate) mod meeting {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    pub struct Gate {
+        need: usize,
+        inside: Mutex<usize>,
+        changed: Condvar,
+    }
+    impl Gate {
+        pub fn new(need: usize) -> Arc<Self> {
+            Arc::new(Gate {
+                need,
+                inside: Mutex::new(0),
+                changed: Condvar::new(),
+            })
+        }
+        /// Wait for the others; `Err` when they did not come together.
+        pub fn meet(&self) -> Result<(), String> {
+            let mut inside = self.inside.lock().unwrap();
+            *inside += 1;
+            self.changed.notify_all();
+            let (_inside, wait) = self
+                .changed
+                .wait_timeout_while(inside, Duration::from_secs(10), |n| *n < self.need)
+                .unwrap();
+            if wait.timed_out() {
+                Err("the others were never asked at the same time".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

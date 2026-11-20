@@ -209,10 +209,8 @@ impl Coordinator {
                     {
                         unmet.push("in-place task requires the parent-local worker".into());
                     }
-                    if spec
-                        .is_some_and(|spec| policy::lacks_ci_task(spec, link.ci_task_negotiated()))
-                    {
-                        unmet.push(policy::CI_TASK_UNMET.to_string());
+                    if let Some(why) = spec.and_then(|spec| policy::unmet_ci(spec, link.as_ref())) {
+                        unmet.push(why.to_string());
                     }
                     let command_supported = inspect
                         .capabilities
@@ -540,7 +538,14 @@ impl Coordinator {
                 outlook,
             });
         }
-        let decision = decide::decide(candidates, excluded, self.sched.cfg.rules);
+        let decision = decide::decide_for_shard(
+            candidates,
+            excluded,
+            self.sched.cfg.rules,
+            spec.as_ref()
+                .and_then(|s| s.ci.as_ref())
+                .and_then(|c| c.shard_preferred_worker.as_ref()),
+        );
         let components = decision
             .compared
             .iter()
@@ -650,34 +655,6 @@ mod tests {
             })
         }
     }
-    fn rows(c: &Coordinator) -> Vec<(String, Vec<Vec<rusqlite::types::Value>>)> {
-        c.store
-            .db
-            .call(|db| {
-                let tables = db
-                    .prepare("SELECT name FROM sqlite_schema WHERE type='table' ORDER BY name")?
-                    .query_map([], |r| r.get::<_, String>(0))?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                let mut all = vec![];
-                for table in tables {
-                    let mut statement = db.prepare(&format!(
-                        "SELECT * FROM \"{}\" ORDER BY rowid",
-                        table.replace('"', "\"\"")
-                    ))?;
-                    let columns = statement.column_count();
-                    let rows = statement
-                        .query_map([], |row| {
-                            (0..columns)
-                                .map(|i| row.get(i))
-                                .collect::<rusqlite::Result<Vec<rusqlite::types::Value>>>()
-                        })?
-                        .collect::<rusqlite::Result<Vec<_>>>()?;
-                    all.push((table, rows));
-                }
-                Ok(all)
-            })
-            .unwrap()
-    }
     #[tokio::test]
     async fn estimate_100_calls_preserve_every_durable_row_epoch_and_actor_state() {
         let dir = crate::test_tmp::tempdir().unwrap();
@@ -728,7 +705,7 @@ mod tests {
             )
             .unwrap();
         c.store.close_run(&run, 2).unwrap();
-        let before = rows(&c);
+        let before = c.store().snapshot_rows_for_test();
         let epoch = c.epoch();
         let lease_seq = c.lease_seq.load(Ordering::SeqCst);
         let _actor = c.actor.lock().await;
@@ -753,7 +730,7 @@ mod tests {
             assert!(known.online && known.conditional);
         }
         assert_eq!(link.calls.load(Ordering::SeqCst), 200);
-        assert_eq!(before, rows(&c));
+        assert_eq!(before, c.store().snapshot_rows_for_test());
         assert_eq!(epoch, c.epoch());
         assert_eq!(lease_seq, c.lease_seq.load(Ordering::SeqCst));
     }

@@ -54,6 +54,9 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    EnvReport {
+        worker: WorkerId,
+    },
     ResolveToolchains {
         bundle: crate::toolchain::contract::FrozenBundle,
         requirements: crate::toolchain::capability::ExecutionRequirements,
@@ -135,6 +138,9 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
+    EnvReport {
+        environment: crate::toolchain::envdiff::EnvReport,
+    },
     ResolvedToolchains {
         bundle: crate::toolchain::contract::FrozenBundle,
     },
@@ -235,6 +241,19 @@ pub struct Client {
     cluster_id: ClusterId,
     owner_token: String,
 }
+fn submit_count_is_valid(tasks: &[(TaskId, TaskSpec)]) -> bool {
+    let discovery = tasks
+        .iter()
+        .filter(|(_, spec)| {
+            spec.ci
+                .as_ref()
+                .is_some_and(|ci| crate::wire::is_discovery_task(&ci.task))
+        })
+        .count();
+    let jobs = tasks.len() - discovery;
+    (1..=64).contains(&jobs) && discovery <= jobs
+}
+
 impl Operation {
     fn requires_toolchains(&self) -> bool {
         match self {
@@ -247,6 +266,18 @@ impl Operation {
     }
     /// A run of CI tasks: a resident that does not know them must refuse the
     /// request, not read the tasks as tasks without commands.
+    fn requires_discovery(&self) -> bool {
+        match self {
+            Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
+                tasks.iter().any(|(_, spec)| {
+                    spec.ci
+                        .as_ref()
+                        .is_some_and(|ci| crate::wire::requires_discovery_feature(&ci.task))
+                })
+            }
+            _ => false,
+        }
+    }
     fn requires_ci(&self) -> bool {
         match self {
             Self::Submit { tasks, .. } | Self::SubmitCaptured { tasks, .. } => {
@@ -326,11 +357,15 @@ impl Client {
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "parent connect timeout"))??;
         let response_timeout = if matches!(&operation, Operation::SubmitCaptured { .. }) {
             Duration::from_secs(300)
+        } else if matches!(&operation, Operation::EnvReport { .. }) {
+            Duration::from_secs(65)
         } else {
             IO_TIMEOUT
         };
         let request = Request {
-            schema_version: if operation.requires_ci() {
+            schema_version: if operation.requires_discovery() {
+                6
+            } else if operation.requires_ci() {
                 5
             } else if operation.requires_toolchains() {
                 4
@@ -625,9 +660,6 @@ async fn connect_local(
     tokio::task::JoinHandle<()>,
     crate::protocol::Client,
     Arc<crate::coordinator::InputGate>,
-    bool,
-    bool,
-    bool,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
@@ -660,21 +692,6 @@ async fn connect_local(
             return Err(e.into());
         }
     };
-    let probe = connected
-        .negotiated
-        .features
-        .iter()
-        .any(|feature| feature == crate::wire::PREPARATION_PROBE_FEATURE);
-    let observations = connected
-        .negotiated
-        .features
-        .iter()
-        .any(|feature| feature == crate::setup::observation_transport::FEATURE);
-    let env_sync = connected
-        .negotiated
-        .features
-        .iter()
-        .any(|feature| feature == crate::wire::ENV_SYNC_FEATURE);
     let worker_client = connected.client.clone();
     let provenance = Digest::of_bytes(&serde_json::to_vec(
         &serde_json::json!({"transport":"local-private-rpc-v1","protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"timeout_ms":parts.worker_timeout.as_millis()}),
@@ -682,13 +699,6 @@ async fn connect_local(
     let input_gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(
         provenance.to_string(),
     ));
-    input_gate.set_ci_task(
-        connected
-            .negotiated
-            .features
-            .iter()
-            .any(|feature| feature == crate::wire::CI_TASK_FEATURE),
-    );
     input_gate
         .observe(
             connected.worker.worker_boot_id.clone(),
@@ -696,25 +706,18 @@ async fn connect_local(
         )
         .await;
     if let Err(e) = config
-        .attach_worker(
+        .attach_gated_worker(
             &parts.coordinator,
             WorkerTarget::Local(&parts.worker_id),
             connected,
+            input_gate.clone(),
         )
         .await
     {
         worker_connection.abort();
         anyhow::bail!(e.message);
     }
-    Ok((
-        listener,
-        worker_connection,
-        worker_client,
-        input_gate,
-        observations,
-        probe,
-        env_sync,
-    ))
+    Ok((listener, worker_connection, worker_client, input_gate))
 }
 
 impl Resident {
@@ -757,33 +760,15 @@ impl Resident {
         })
         .await??;
         let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection, worker_client, input_gate, observations, probe, env_sync) =
-            match connected {
-                Ok(value) => value,
-                Err(e) => {
-                    tokio::task::spawn_blocking(move || startup.cleanup()).await?;
-                    return Err(e);
-                }
-            };
+        let (listener, worker_connection, worker_client, input_gate) = match connected {
+            Ok(value) => value,
+            Err(e) => {
+                tokio::task::spawn_blocking(move || startup.cleanup()).await?;
+                return Err(e);
+            }
+        };
         let parts = startup.parts.take().expect("prepared startup");
 
-        parts
-            .coordinator
-            .attach(
-                parts.worker_id.clone(),
-                Arc::new(
-                    crate::coordinator::ClientLink::gated(
-                        worker_client.clone(),
-                        parts.worker_timeout,
-                        input_gate.clone(),
-                    )
-                    .with_preparation_observations(observations)
-                    .with_preparation_probe(probe)
-                    .with_env_sync(env_sync)
-                    .with_ci_task(input_gate.ci_task()),
-                ),
-            )
-            .await;
         Ok(Self {
             remote_config,
             remote_env: inputs_env,
@@ -1165,7 +1150,8 @@ async fn handle(
 ) -> anyhow::Result<()> {
     let request: Request = read_message(&mut stream).await?;
     anyhow::ensure!(
-        matches!(request.schema_version, 2..=5)
+        matches!(request.schema_version, 2..=6)
+            && (request.schema_version >= 6 || !request.operation.requires_discovery())
             && (request.schema_version >= 5 || !request.operation.requires_ci())
             && (request.schema_version >= 3 || !request.operation.requires_capabilities())
             && (request.schema_version >= 4 || !request.operation.requires_toolchains())
@@ -1256,6 +1242,17 @@ async fn handle(
         let reply = match coordinator.estimate(query).await {
             Ok(estimate) => Reply::Estimate { estimate },
             Err(error) => Reply::ControlError { error },
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
+    if let Operation::EnvReport { worker } = request.operation {
+        let mut stopping = stop.subscribe();
+        let reply = tokio::select! {
+            _ = stopping.changed() => Reply::Stopping,
+            result = coordinator.env_report(&worker) => match result {
+                Ok(environment) => Reply::EnvReport { environment },
+                Err(error) => Reply::ControlError { error },
+            }
         };
         return write_message(&mut stream, &reply).await.map_err(Into::into);
     }
@@ -1424,7 +1421,7 @@ async fn handle(
                 tasks,
             } => {
                 drop(gate);
-                let answer = if tasks.is_empty() || tasks.len() > 64 {
+                let answer = if !submit_count_is_valid(&tasks) {
                     Reply::Error {
                         message: "submit requires 1..64 tasks".into(),
                     }
@@ -1561,7 +1558,7 @@ async fn handle(
                         checked=checked=>checked??,
                     };
                     anyhow::ensure!(
-                        !tasks.is_empty() && tasks.len() <= 64,
+                        submit_count_is_valid(&tasks),
                         "submit requires 1..64 tasks"
                     );
                     anyhow::ensure!(
@@ -1644,6 +1641,7 @@ async fn handle(
             Operation::Query { .. }
             | Operation::Estimate { .. }
             | Operation::EstimateTask { .. }
+            | Operation::EnvReport { .. }
             | Operation::EnvSync { .. }
             | Operation::ResolveToolchains { .. } => {
                 unreachable!("read handled before admission")
