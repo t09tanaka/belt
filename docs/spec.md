@@ -922,7 +922,7 @@ repo lock、port、container slotは実行host内の資源として扱う。pare
 
 # 15. 親からの導入と常駐方式（macOS・Linux・一時worker）
 
-1つのhostには1つのresidentを置き、そのresidentがcoordinatorとworker agentの両方の役割を持つ（第24章）。`init` が登録するserviceも、`workers add --install` が相手に登録するserviceも、この1つのresidentである。既にbeltを持つhostへ `workers add` したときは、serviceもbinaryも足さず、グループのIDと鍵を渡すだけにする（24.2）。`workers add --install` で導入されただけのhostは、仕事を受ける役割だけを持つ。そのhostで `belt init` を実行すると、同じresidentにcoordinatorの役割が加わり（グループは今のものを使い、自分の `coordinator_id` を発行する）、そのhostから投入できるようになる。このときも2つ目のworkerは作らない。1つのhostに、別のstate directoryを持つ2つ目のworkerを常駐させない（試験ハーネスを除く）。
+1つのhostには1つのresidentを置き、そのresidentがcoordinatorとworker agentの両方の役割を持つ（第24章）。`init` が登録するserviceも、`workers add --install` が相手に登録するserviceも、この1つのresidentである。既にbeltを持つhostへ `workers add` したときは、serviceもbinaryも足さず、グループのIDと鍵を渡すだけにする（24.2）。`workers add --install` で導入されただけのhostは、仕事を受ける役割だけを持つ。そのhostで `belt init` を実行すると、同じresidentにcoordinatorの役割が加わり（グループは今のものを使い、自分の `coordinator_id` を発行する）、そのhostから投入できるようになる。このときも2つ目のworkerは作らない。未完了attemptまたは未回収の終端結果があれば件数を示して拒否し、各メンバーから `workers stop` でdrainするか待ってから `init` を再実行するよう案内する。workerの切替lockの下で既存serviceを停止してinit residentのserviceへ置き換え、グループID・鍵・メンバー名・pinsを引き継いで旧plistとjournalを退役させるが、停止後の失敗時は変更を戻してworker serviceを復旧する。1つのhostに、別のstate directoryを持つ2つ目のworkerを常駐させない（試験ハーネスを除く）。
 
 SSHで到達できる、起動中のMacへworkerを導入・起動できる。Remote Loginの有効化、正しいSSH認証、known_hostsの確認を利用する。SSH agent forwardingや親のprivate key複製は既定にしない。これはworker processの起動であり、電源OFFのMacをSSHだけで起動する機能ではない。
 

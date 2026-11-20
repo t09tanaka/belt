@@ -227,6 +227,15 @@ impl Journal {
         }
     }
 }
+fn read_journal(path: &Path) -> anyhow::Result<Journal> {
+    let mut bytes = Vec::new();
+    resident::secure_file(path, false)?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    ensure!(bytes.len() as u64 <= LIMIT, "init journal too large");
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 struct JournalFile {
     path: PathBuf,
     proof: Option<Proof>,
@@ -555,15 +564,41 @@ async fn initialize_with_durability<L: Launcher>(
     launcher: &mut L,
     durability: &mut impl Durability,
 ) -> anyhow::Result<ResultReceipt> {
+    let paths = Paths::resolve_for(&context.env, launcher.backend())?;
+    let worker = super::worker_service::Paths::resolve_for(&context.env, launcher.backend())?;
+    if worker.journal.try_exists()? {
+        return takeover::initialize(context, worker, launcher, durability).await;
+    }
+    initialize_prepared(context, paths, None, launcher, durability).await
+}
+
+async fn initialize_prepared<L: Launcher>(
+    context: ContextInput,
+    mut paths: Paths,
+    enrollment: Option<&super::worker_service::Enrollment>,
+    launcher: &mut L,
+    durability: &mut impl Durability,
+) -> anyhow::Result<ResultReceipt> {
     let uid = rustix::process::geteuid().as_raw();
     ensure!(uid > 0, "init requires a non-root user");
-    let paths = Paths::resolve_for(&context.env, launcher.backend())?;
-    // TODO(worker-only host takeover): reuse its enrollment and add the
-    // coordinator role to the existing resident instead of installing another.
-    ensure!(
-        !super::worker_service::Paths::journal_path(&context.env)?.try_exists()?,
-        "worker-only host takeover is not supported yet"
-    );
+    if let Some(enrollment) = enrollment {
+        paths.key = paths.config.join("worker-cluster.key");
+        ensure!(
+            enrollment.env
+                == context
+                    .env
+                    .iter()
+                    .filter(|(k, _)| ENV.contains(&k.as_str()))
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            "worker environment changed"
+        );
+    } else if paths.journal.try_exists()? {
+        let journal = read_journal(&paths.journal)?;
+        if journal.spec.cluster_key_path == paths.config.join("worker-cluster.key") {
+            paths.key = journal.spec.cluster_key_path;
+        }
+    }
     // Values rendered into the service must round-trip through `launchctl print`;
     // refuse before any file or directory is created.
     service_inputs_observable(&paths, &context.env)?;
@@ -585,7 +620,10 @@ async fn initialize_with_durability<L: Launcher>(
     let lock = resident::secure_file(&lockpath, true)?;
     // This operation is blocking filesystem/service IO, including the cooperative lock.
     // CLI runs it in its dedicated runtime; no detached process is created here.
-    lock.lock()?;
+    // Takeover holds this lock through retirement and rollback as well.
+    if enrollment.is_none() {
+        lock.lock()?;
+    }
     let mut jf = JournalFile {
         path: paths.journal.clone(),
         proof: None,
@@ -611,7 +649,9 @@ async fn initialize_with_durability<L: Launcher>(
             .filter(|(k, _)| ENV.contains(&k.as_str()))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let cluster = ClusterId::generate();
+        let cluster = enrollment
+            .map(|e| e.cluster.clone())
+            .unwrap_or_else(ClusterId::generate);
         let coordinator = CoordinatorId::generate();
         let j = Journal {
             schema_version: 1,
@@ -620,7 +660,10 @@ async fn initialize_with_durability<L: Launcher>(
             spec: Spec {
                 state_dir: paths.state.clone(),
                 worker_state_dir: paths.worker.clone(),
-                worker_id: WorkerId::parse(&format!("local-{}", ulid::Ulid::new()))?,
+                worker_id: match enrollment {
+                    Some(e) => e.worker_id.clone(),
+                    None => WorkerId::parse(&format!("local-{}", ulid::Ulid::new()))?,
+                },
                 cluster_key_path: paths.key.clone(),
                 executable: paths.config.join("bin").join(&digest).join("belt"),
                 env,
@@ -628,7 +671,18 @@ async fn initialize_with_durability<L: Launcher>(
                 expected_cluster: Some(cluster.clone()),
                 managed_service: Some(paths.journal.clone()),
             },
-            files: vec![],
+            files: if enrollment.is_some() {
+                let mut proofs = vec![Proof::read(&paths.key)?];
+                let binary = paths.config.join("bin").join(&digest).join("belt");
+                if binary.try_exists()? {
+                    let proof = Proof::read(&binary)?;
+                    ensure!(proof.digest == digest, "installed binary changed");
+                    proofs.push(proof);
+                }
+                proofs
+            } else {
+                vec![]
+            },
             pending: None,
             systemd: paths.backend == Backend::Systemd,
             plist: None,
@@ -864,7 +918,10 @@ fn managed_journal(spec: &Spec) -> anyhow::Result<(Journal, Paths)> {
         .read_to_end(&mut bytes)?;
     ensure!(bytes.len() as u64 <= LIMIT, "managed journal too large");
     let j: Journal = serde_json::from_slice(&bytes)?;
-    let paths = Paths::resolve_for(&spec.env, j.backend())?;
+    let mut paths = Paths::resolve_for(&spec.env, j.backend())?;
+    if j.spec.cluster_key_path == paths.config.join("worker-cluster.key") {
+        paths.key = j.spec.cluster_key_path.clone();
+    }
     validate_journal(
         &j,
         &paths,
@@ -1163,3 +1220,5 @@ pub fn command() -> Result<ResultReceipt, ApiError> {
 }
 #[cfg(test)]
 mod tests;
+
+mod takeover;

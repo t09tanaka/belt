@@ -756,7 +756,7 @@ async fn managed_journal_rejects_a_second_worker_path_even_when_input_agrees() {
 }
 
 #[tokio::test]
-async fn worker_only_takeover_is_left_for_the_next_task_without_init_writes() {
+async fn malformed_worker_enrollment_is_refused_without_init_writes() {
     let (_root, context) = fixture();
     let paths = Paths::resolve(&context.env).unwrap();
     private_dir(&paths.config).unwrap();
@@ -764,7 +764,7 @@ async fn worker_only_takeover_is_left_for_the_next_task_without_init_writes() {
     fs::write(&worker_journal, b"existing worker-only installation").unwrap();
     let before = fs::read(&worker_journal).unwrap();
     let error = initialize(context, &mut Unknown).await.unwrap_err();
-    assert!(error.to_string().contains("worker-only host takeover"));
+    assert!(error.to_string().contains("invalid worker enrollment"));
     assert_eq!(fs::read(worker_journal).unwrap(), before);
     assert!(!paths.journal.exists());
     assert!(!paths.state.exists());

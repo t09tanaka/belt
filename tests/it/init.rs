@@ -842,3 +842,203 @@ async fn initialized_worker_bridge_shares_local_database_and_admission_window() 
         Reply::Stopping
     ));
 }
+
+/// Tracks each registered service separately while owning only private test children.
+#[derive(Clone)]
+struct TakeoverLauncher {
+    state: Arc<Mutex<State>>,
+    active: Arc<Mutex<Option<std::path::PathBuf>>>,
+    fail_init: bool,
+}
+impl TakeoverLauncher {
+    fn stop_owned(&self) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(mut child) = state.child.take() {
+            if child.try_wait().unwrap().is_none() {
+                assert!(belt::platform::signal_pid(child.id(), libc::SIGTERM));
+            }
+            child.wait().unwrap();
+        }
+        *self.active.lock().unwrap() = None;
+    }
+}
+impl Launcher for TakeoverLauncher {
+    fn loaded_state(&mut self, _: &Plan, receipt: &Receipt) -> LoadedState {
+        if self.active.lock().unwrap().as_deref() == Some(receipt.path()) {
+            LoadedState::Match
+        } else {
+            LoadedState::Absent
+        }
+    }
+    fn verify_loaded(&mut self, plan: &Plan, receipt: &Receipt) -> Result<(), LaunchError> {
+        if self.loaded_state(plan, receipt) == LoadedState::Match {
+            Ok(())
+        } else {
+            Err(LaunchError::NotApplied("not registered".into()))
+        }
+    }
+    fn running_identity(
+        &mut self,
+        plan: &Plan,
+        receipt: &Receipt,
+    ) -> Result<belt::service::macos::RunningIdentity, LaunchError> {
+        self.verify_loaded(plan, receipt)?;
+        OwnedLauncher(self.state.clone()).running_identity(plan, receipt)
+    }
+    fn launchctl(&mut self, args: &[String]) -> Result<(), LaunchError> {
+        if args[0] == "bootout" {
+            assert_eq!(
+                self.active.lock().unwrap().as_deref(),
+                Some(std::path::Path::new(&args[2]))
+            );
+            self.stop_owned();
+            return Ok(());
+        }
+        assert_eq!(args[0], "bootstrap");
+        assert!(self.active.lock().unwrap().is_none());
+        let worker = args[2].contains(".worker.");
+        if !worker && self.fail_init {
+            return Err(LaunchError::NotApplied(
+                "injected init startup failure".into(),
+            ));
+        }
+        let input = self_input(&args[2]);
+        if worker {
+            let input = input.with_file_name("worker.json");
+            let spec = belt::service::worker::read_input(&input).unwrap();
+            let mut state = self.state.lock().unwrap();
+            let child = test_command(&spec.executable)
+                .args(["worker", "--input"])
+                .arg(&input)
+                .envs(&spec.env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(state.stderr())
+                .spawn()
+                .unwrap();
+            state.child = Some(child);
+            state.starts += 1;
+        } else {
+            start_owned(&self.state, &input);
+        }
+        *self.active.lock().unwrap() = Some(args[2].clone().into());
+        Ok(())
+    }
+}
+
+#[test]
+fn worker_only_init_preserves_membership_and_retires_old_service_or_rolls_back() {
+    use belt::{ids::*, service::worker_service as ws, storage::WorkerStore};
+    for fail_init in [false, true] {
+        let root = crate::test_tmp::tempdir().unwrap();
+        let context = context(root.path());
+        let mut launcher = TakeoverLauncher {
+            state: Arc::new(Mutex::new(State::default())),
+            active: Arc::new(Mutex::new(None)),
+            fail_init,
+        };
+        let request = ws::InstallRequest {
+            membership: None,
+            system_user: false,
+            schema: 1,
+            cluster: ClusterId::generate(),
+            worker_id: WorkerId::parse("member-a").unwrap(),
+            key_file_text: format!("{}\n", "ab".repeat(64)),
+            binary_sha256: ws::sha256_file(&context.executable).unwrap(),
+        };
+        ws::install(
+            &context.env,
+            &request,
+            &context.executable,
+            launcher.clone(),
+            Duration::from_secs(20),
+        )
+        .unwrap();
+        let paths = ws::Paths::resolve(&context.env).unwrap();
+        let old_service = launcher.active.lock().unwrap().clone().unwrap();
+        let journal = std::fs::read(&paths.journal).unwrap();
+        let peer = CoordinatorId::generate();
+        let store = WorkerStore::open(&paths.state, &request.worker_id).unwrap();
+        store.for_member(&peer).pin_member("peer", 1).unwrap();
+        let mut pins = store.members().unwrap();
+        drop(store);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let result = rt.block_on(initialize(context.clone(), &mut launcher));
+        if fail_init {
+            let error = result.unwrap_err();
+            assert!(!error.to_string().contains("rollback failed"), "{error}");
+            assert_eq!(launcher.active.lock().unwrap().as_ref(), Some(&old_service));
+            assert_eq!(std::fs::read(&paths.journal).unwrap(), journal);
+            assert!(old_service.exists());
+            assert!(!paths.config.join("init.json").exists());
+            assert!(!paths.config.join("coordinator.json").exists());
+        } else {
+            let receipt = result.unwrap_or_else(|e| {
+                launcher.state.lock().unwrap().diagnose();
+                panic!("{e}")
+            });
+            assert_eq!(receipt.cluster_id, request.cluster);
+            assert_eq!(receipt.worker_id, request.worker_id);
+            assert_ne!(receipt.coordinator_id, peer);
+            // The new local coordinator pins its own member name; earlier pins stay.
+            pins.push((
+                request.worker_id.to_string(),
+                receipt.coordinator_id.to_string(),
+            ));
+            pins.sort();
+            assert!(!paths.journal.exists());
+            assert!(!old_service.exists());
+            assert_ne!(launcher.active.lock().unwrap().as_ref(), Some(&old_service));
+            let spec = bootstrap::read_input(&paths.config.join("coordinator.json")).unwrap();
+            assert_eq!(spec.cluster_key_path, paths.key);
+            assert_eq!(spec.worker_state_dir, paths.state);
+            // Re-running init recognizes the adopted key and the same service.
+            let again = rt
+                .block_on(initialize(context.clone(), &mut launcher))
+                .unwrap();
+            assert_eq!(again.coordinator_id, receipt.coordinator_id);
+            for result in [
+                ws::start(&context.env, launcher.clone(), Duration::ZERO),
+                ws::stop(&context.env, launcher.clone(), false, Duration::ZERO),
+                ws::upgrade::upgrade(
+                    &context.env,
+                    &ws::upgrade::SwitchRequest {
+                        schema: 1,
+                        cluster: request.cluster.clone(),
+                        worker_id: request.worker_id.clone(),
+                        binary_sha256: request.binary_sha256.clone(),
+                    },
+                    &context.executable,
+                    launcher.clone(),
+                    ws::Options {
+                        cancel_running: false,
+                        all_submitters: false,
+                        submitter: None,
+                        wait: Duration::ZERO,
+                        ready_timeout: Duration::ZERO,
+                    },
+                    &mut |_| Ok(()),
+                ),
+            ] {
+                assert!(result.unwrap_err().to_string().contains("init resident"));
+            }
+            assert_eq!(launcher.state.lock().unwrap().starts, 2);
+        }
+        assert_eq!(
+            std::fs::read_to_string(&paths.key).unwrap(),
+            request.key_file_text
+        );
+        assert_eq!(
+            WorkerStore::open_read_only(&paths.state)
+                .unwrap()
+                .members()
+                .unwrap(),
+            pins
+        );
+        launcher.stop_owned();
+    }
+}

@@ -360,7 +360,56 @@ fn save_journal(paths: &Paths, journal: &Journal) -> anyhow::Result<()> {
 }
 
 fn require_journal(paths: &Paths) -> anyhow::Result<Journal> {
+    refuse_init_resident(paths)?;
     read_journal(paths)?.context("no worker is installed here; run workers add --install")
+}
+
+/// Legacy lifecycle operations must never resurrect the retired worker service.
+fn refuse_init_resident(paths: &Paths) -> anyhow::Result<()> {
+    ensure!(
+        !paths.config.join("init.json").try_exists()?,
+        "this host is managed by the init resident (init.json); manage that resident instead of worker-service"
+    );
+    Ok(())
+}
+
+pub(crate) struct Enrollment {
+    pub cluster: ClusterId,
+    pub worker_id: WorkerId,
+    pub env: BTreeMap<String, String>,
+    pub plan: policy::Plan,
+    pub receipt: macos::Receipt,
+}
+
+/// Caller holds the switch lock for the entire takeover.
+pub(crate) fn enrollment(paths: &Paths) -> anyhow::Result<Enrollment> {
+    let journal = require_journal(paths)?;
+    ensure!(
+        journal.switch.is_none() && !journal.drained_by_upgrade,
+        "finish the worker version switch before init"
+    );
+    let spec = super::worker::read_input(&paths.input)?;
+    ensure!(
+        spec.expected_cluster == journal.cluster
+            && spec.worker_id == journal.worker_id
+            && spec.state_dir == paths.state
+            && spec.cluster_key_path == paths.key,
+        "worker input differs from enrollment"
+    );
+    let plan = plan(paths, &journal)?;
+    let receipt = journal
+        .receipt
+        .clone()
+        .context("worker service receipt missing")?;
+    services(paths, &journal)?.verify(&receipt)?;
+    crate::secrets::key::load(&paths.key)?;
+    Ok(Enrollment {
+        cluster: journal.cluster,
+        worker_id: journal.worker_id,
+        env: journal.env,
+        plan,
+        receipt,
+    })
 }
 
 /// Create missing directories below `home` as 0700; refuse symlinks. The
@@ -831,6 +880,7 @@ pub fn install<L: Launcher>(
     private_dir(&paths.home, &paths.state)?;
     let _lock = switch_lock(&paths, true, LOCK_PATIENCE)?
         .context("a version switch is running on this host; retry installation when it finishes")?;
+    refuse_init_resident(&paths)?;
     let existing = read_journal(&paths)?;
     if let Some(membership) = &request.membership {
         if let Some(journal) = existing

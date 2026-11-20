@@ -10,6 +10,9 @@ pub(crate) struct World {
     pub loaded: bool,
     pub unknown: bool,
     pub fail_start: bool,
+    /// Lifecycle-only tests do not need an agent socket or health endpoint.
+    pub omit_socket: bool,
+    pub fail_init_start: bool,
     pub calls: Vec<Vec<String>>,
     /// The operator marker as the service was started (before the agent runs).
     pub control_at_bootstrap: Vec<Control>,
@@ -38,7 +41,9 @@ impl Launcher for Fake {
         };
         match verb {
             "bootstrap" => {
-                if w.fail_start {
+                if w.fail_start
+                    || (w.fail_init_start && arguments.iter().any(|a| a.contains(".local.")))
+                {
                     return Err(LaunchError::NotApplied("rejected".into()));
                 }
                 let seen = Control::effective(&w.state);
@@ -46,7 +51,9 @@ impl Launcher for Fake {
                 w.loaded = true;
                 let socket = w.state.join("agent.sock");
                 let _ = fs::remove_file(&socket);
-                w.listener = Some(UnixListener::bind(&socket).unwrap());
+                if !w.omit_socket {
+                    w.listener = Some(UnixListener::bind(&socket).unwrap());
+                }
                 Ok(())
             }
             "bootout" => {
@@ -1297,4 +1304,162 @@ fn an_unfinished_init_is_not_given_a_second_worker_service() {
     assert!(h.install().is_err());
     assert!(!h.paths().journal.exists());
     assert!(h.launchctl_calls().is_empty());
+}
+
+#[tokio::test]
+async fn init_refuses_live_attempts_and_uncollected_results_without_changes() {
+    for state in ["active", "terminal"] {
+        let h = Host::new();
+        h.fake.0.borrow_mut().omit_socket = true;
+        install(&h.env, &h.request, &h.exe, h.fake.clone(), Duration::ZERO).unwrap();
+        let paths = h.paths();
+        let store = crate::storage::WorkerStore::open(&paths.state, &h.request.worker_id).unwrap();
+        let member = CoordinatorId::generate();
+        store.for_member(&member).pin_member("peer", 1).unwrap();
+        let db = rusqlite::Connection::open(paths.state.join("worker.db")).unwrap();
+        put_attempt(&db, &member, 1, state);
+        let journal = fs::read(&paths.journal).unwrap();
+        let key = fs::read(&paths.key).unwrap();
+        let calls = h.launchctl_calls();
+        let error = crate::service::init::initialize(
+            crate::service::init::ContextInput {
+                env: h.env.clone(),
+                executable: h.exe.clone(),
+            },
+            &mut h.fake.clone(),
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(
+            error.contains("1 live attempts or uncollected results"),
+            "{error}"
+        );
+        assert!(error.contains("workers stop") && error.contains("run init again"));
+        assert_eq!(h.launchctl_calls(), calls);
+        assert!(h.fake.0.borrow().loaded);
+        assert_eq!(fs::read(&paths.journal).unwrap(), journal);
+        assert_eq!(fs::read(&paths.key).unwrap(), key);
+        assert!(!paths.config.join("init.json").exists());
+        assert!(!paths.config.join("init.lock").exists());
+        assert_eq!(store.count_group_work().unwrap(), 1);
+    }
+}
+
+#[tokio::test]
+async fn init_failure_after_bootout_restarts_the_worker_and_preserves_enrollment() {
+    let h = Host::new();
+    h.fake.0.borrow_mut().omit_socket = true;
+    install(&h.env, &h.request, &h.exe, h.fake.clone(), Duration::ZERO).unwrap();
+    let paths = h.paths();
+    let journal = require_journal(&paths).unwrap();
+    let receipt = journal.receipt.unwrap();
+    let before =
+        [&paths.journal, &paths.key, &paths.input, receipt.path()].map(|p| fs::read(p).unwrap());
+    // This owned lock injects a failure immediately after the service boot-out.
+    let _owner = crate::storage::ProcessLock::acquire(&paths.state, "agent.lock").unwrap();
+    let error = crate::service::init::initialize(
+        crate::service::init::ContextInput {
+            env: h.env.clone(),
+            executable: h.exe.clone(),
+        },
+        &mut h.fake.clone(),
+    )
+    .await
+    .unwrap_err();
+    assert!(!error.to_string().contains("rollback failed"), "{error}");
+    assert_eq!(h.launchctl_calls(), ["bootstrap", "bootout", "bootstrap"]);
+    assert!(h.fake.0.borrow().loaded);
+    assert_eq!(
+        [&paths.journal, &paths.key, &paths.input, receipt.path()].map(|p| fs::read(p).unwrap()),
+        before
+    );
+    DirectoryFiles::open(&paths.services)
+        .unwrap()
+        .verify(&receipt)
+        .unwrap();
+    assert!(!paths.config.join("init.json").exists());
+    assert!(!paths.config.join("coordinator.json").exists());
+}
+
+#[tokio::test]
+async fn init_start_failure_removes_new_files_and_restores_the_worker_binary_mode() {
+    let h = Host::new();
+    h.fake.0.borrow_mut().omit_socket = true;
+    install(&h.env, &h.request, &h.exe, h.fake.clone(), Duration::ZERO).unwrap();
+    let paths = h.paths();
+    let journal = fs::read(&paths.journal).unwrap();
+    let binary = paths.executable(&h.digest);
+    let permissions = fs::metadata(&binary).unwrap().permissions().mode();
+    let store = crate::storage::WorkerStore::open(&paths.state, &h.request.worker_id).unwrap();
+    let member = CoordinatorId::generate();
+    store.for_member(&member).pin_member("peer", 1).unwrap();
+    let db = rusqlite::Connection::open(paths.state.join("worker.db")).unwrap();
+    put_attempt(&db, &member, 1, "terminal");
+    db.execute("UPDATE worker_attempt SET acked_at_ms = 3", [])
+        .unwrap();
+    assert_eq!(store.count_group_work().unwrap(), 0);
+    h.fake.0.borrow_mut().fail_init_start = true;
+    let error = crate::service::init::initialize(
+        crate::service::init::ContextInput {
+            env: h.env.clone(),
+            executable: h.exe.clone(),
+        },
+        &mut h.fake.clone(),
+    )
+    .await
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("service bootstrap rejected"), "{error}");
+    assert!(!error.contains("rollback failed"), "{error}");
+    assert!(h.fake.0.borrow().loaded);
+    assert_eq!(
+        h.launchctl_calls(),
+        ["bootstrap", "bootout", "bootstrap", "bootstrap"]
+    );
+    assert_eq!(fs::read(&paths.journal).unwrap(), journal);
+    assert_eq!(
+        fs::metadata(binary).unwrap().permissions().mode(),
+        permissions
+    );
+    assert!(!paths.config.join("init.json").exists());
+    assert!(!paths.config.join("coordinator.json").exists());
+    assert!(!paths.home.join(".local").exists());
+    assert_eq!(fs::read_dir(&paths.services).unwrap().count(), 1);
+}
+
+#[test]
+fn init_resident_refuses_legacy_start_stop_and_upgrade_without_a_worker_journal() {
+    let h = Host::new();
+    let paths = h.paths();
+    private_dir(&paths.home, &paths.config).unwrap();
+    // Even an unfinished init is enough to prevent a second resident.
+    fs::write(paths.config.join("init.json"), b"{}").unwrap();
+    let request = serde_json::to_vec(&upgrade::SwitchRequest {
+        schema: 1,
+        cluster: h.request.cluster.clone(),
+        worker_id: h.request.worker_id.clone(),
+        binary_sha256: h.digest.clone(),
+    })
+    .unwrap();
+    for action in [Action::Start, Action::Stop, Action::Upgrade] {
+        let error = handle(
+            action,
+            &h.env,
+            &request,
+            &h.exe,
+            h.fake.clone(),
+            Options {
+                cancel_running: false,
+                all_submitters: false,
+                submitter: None,
+                wait: Duration::ZERO,
+                ready_timeout: Duration::ZERO,
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("init resident"), "{error}");
+    }
+    assert!(h.launchctl_calls().is_empty());
+    assert!(!paths.journal.exists());
 }
