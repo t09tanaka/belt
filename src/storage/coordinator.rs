@@ -591,6 +591,37 @@ impl CoordinatorStore {
         self.epoch
     }
 
+    /// Work still owned by this member prevents moving its group.
+    pub fn has_group_work(&self) -> Result<bool> {
+        self.db.call(|c| Ok(c.query_row(
+            "SELECT EXISTS(SELECT 1 FROM attempt a LEFT JOIN collection c USING(attempt_id)
+             WHERE (a.state <> 'terminal' AND a.retired = 0)
+                OR (a.state = 'terminal' AND c.acked_at_ms IS NULL AND a.collection_failed_at_ms IS NULL))",
+            [], |r| r.get(0),
+        )?))
+    }
+
+    /// Explicit, idle enrollment; keeps the member's coordinator identity.
+    pub(crate) fn move_group(state: &Path, cluster: &ClusterId) -> Result<()> {
+        let db = Db::open(
+            &state.join("coordinator.db"),
+            DbKind::Coordinator,
+            Access::ReadWrite,
+        )?;
+        let cl = cluster.to_string();
+        db.write(move |tx| {
+            tx.execute(
+                "INSERT INTO cluster (cluster_id, coordinator_id, created_at_ms)
+                SELECT ?1, coordinator_id, created_at_ms FROM cluster
+                WHERE cluster_id = (SELECT cluster_id FROM coordinator_state)",
+                [&cl],
+            )?;
+            tx.execute("UPDATE coordinator_state SET cluster_id = ?1", [&cl])?;
+            tx.execute("DELETE FROM cluster WHERE cluster_id <> ?1", [&cl])?;
+            Ok(())
+        })
+    }
+
     pub fn cluster_id(&self) -> &ClusterId {
         &self.cluster_id
     }

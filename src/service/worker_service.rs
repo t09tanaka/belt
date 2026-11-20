@@ -14,7 +14,7 @@ use super::macos::{
 };
 use super::resident;
 use crate::{
-    ids::{ClusterId, WorkerId},
+    ids::{ClusterId, CoordinatorId, WorkerId},
     worker::control::{self, Control},
 };
 use anyhow::{ensure, Context};
@@ -28,6 +28,8 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+mod membership;
 
 const LIMIT: u64 = 262_144;
 const ENV: &[&str] = &[
@@ -72,6 +74,9 @@ pub enum Action {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
+    /// Explicit membership handover by workers add; never written to the journal.
+    #[serde(default)]
+    pub membership: Option<Membership>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub system_user: bool,
     pub schema: u32,
@@ -81,6 +86,15 @@ pub struct InstallRequest {
     pub key_file_text: String,
     /// SHA-256 of the binary that runs `install`; it must be its own digest.
     pub binary_sha256: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Membership {
+    pub caller_name: WorkerId,
+    pub caller_id: CoordinatorId,
+    pub move_group: bool,
+    pub install: bool,
 }
 
 impl std::fmt::Debug for InstallRequest {
@@ -98,6 +112,11 @@ impl std::fmt::Debug for InstallRequest {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
+    /// An existing member was enrolled without installing a service.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub membership_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_id: Option<CoordinatorId>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub system_user: bool,
     pub worker_id: WorkerId,
@@ -789,13 +808,16 @@ pub fn install<L: Launcher>(
     crate::config::traffic::resolve(env).map_err(anyhow::Error::msg)?;
     let digest = sha256_file(current_exe)?;
     ensure!(
-        digest == request.binary_sha256,
+        request.membership.as_ref().is_some_and(|m| !m.install) || digest == request.binary_sha256,
         "the installing binary is not the one the parent sent"
     );
     // Validate before any file is published: a rejected key must leave nothing behind.
     let key_bytes = hex_decode(request.key_file_text.trim_end_matches('\n'))
         .context("cluster key is not lower-case hex")?;
     crate::secrets::key::ClusterKey::from_bytes(key_bytes).context("cluster key rejected")?;
+    if request.membership.is_some() && paths.config.join("coordinator.json").try_exists()? {
+        return super::init::handover(env, request, launcher);
+    }
     let account = request
         .system_user
         .then(system_user::current_account)
@@ -805,6 +827,18 @@ pub fn install<L: Launcher>(
     let _lock = switch_lock(&paths, true, LOCK_PATIENCE)?
         .context("a version switch is running on this host; retry installation when it finishes")?;
     let existing = read_journal(&paths)?;
+    if let Some(membership) = &request.membership {
+        if let Some(journal) = existing
+            .as_ref()
+            .filter(|j| j.receipt.is_some() && paths.state.join("worker-binding.json").is_file())
+        {
+            return membership::existing(&paths, journal, request, launcher, ready_timeout);
+        }
+        ensure!(
+            membership.install,
+            "no worker is installed here; use --install"
+        );
+    }
     if let Some(existing) = &existing {
         ensure!(
             existing.system_user == account && existing.cluster == request.cluster
@@ -915,6 +949,9 @@ pub fn install<L: Launcher>(
     clear_cancel(&paths.state)?;
     ensure_started(&mut files, &mut launcher, &plan, &receipt)?;
     let ready = wait_ready(&paths.state, ready_timeout);
+    if request.membership.is_some() {
+        membership::pin(&paths.state, request)?;
+    }
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
 
@@ -1107,6 +1144,8 @@ fn status_with<L: Launcher>(
     };
     let current = Control::effective(&paths.state);
     Ok(Status {
+        membership_only: false,
+        coordinator_id: None,
         system_user: journal.system_user.is_some(),
         worker_id: journal.worker_id.clone(),
         cluster: journal.cluster.clone(),

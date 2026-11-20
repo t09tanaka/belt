@@ -912,6 +912,175 @@ fn managed_journal(spec: &Spec) -> anyhow::Result<(Journal, Paths)> {
     DirectoryFiles::open(&paths.services)?.verify_read_only(receipt)?;
     Ok((j, paths))
 }
+/// The SSH helper changes membership without creating a second resident.
+pub(crate) fn handover<L: Launcher>(
+    env: &BTreeMap<String, String>,
+    request: &super::worker_service::InstallRequest,
+    mut launcher: L,
+) -> anyhow::Result<super::worker_service::Status> {
+    use crate::storage::{CoordinatorStore, WorkerStore};
+    use crate::worker::control;
+    let member = request.membership.as_ref().context("membership missing")?;
+    let spec = super::context::runtime_spec(env).map_err(|e| anyhow::anyhow!(e.message))?;
+    let (mut journal, paths) = managed_journal(&spec)?;
+    let lock = resident::secure_file(&paths.config.join("init.lock"), true)?;
+    lock.lock()?;
+    let (checked, _) = managed_journal(&spec)?;
+    ensure!(
+        checked.cluster == journal.cluster,
+        "membership changed while waiting"
+    );
+    journal = checked;
+    let old = journal.cluster.as_ref().context("group missing")?;
+    let moving = old != &request.cluster;
+    ensure!(
+        !moving || member.move_group,
+        "target belongs to group {old}; use --move to move an idle member"
+    );
+    let worker = WorkerStore::open_read_only(&paths.worker)?;
+    let coordinator = CoordinatorStore::open_read_only(&paths.state)?;
+    ensure!(
+        !moving || (worker.count_group_work()? == 0 && !coordinator.has_group_work()?),
+        "target belongs to group {old} and has live work or uncollected results; cannot move"
+    );
+    ensure!(
+        spec.worker_id == request.worker_id,
+        "target member is named {}; use that name",
+        spec.worker_id
+    );
+    ensure!(
+        !request.system_user,
+        "service mode differs from the worker registration"
+    );
+    let plan = plan(&paths, &journal)?;
+    let receipt = journal.plist.as_ref().context("service receipt missing")?;
+    let mut files = DirectoryFiles::open(&paths.services)?;
+    let _lease = files.lifecycle_lock()?;
+    files.verify(receipt)?;
+    let loaded = launcher.loaded_state(&plan, receipt);
+    ensure!(
+        loaded != LoadedState::Unknown,
+        "loaded service identity unknown"
+    );
+    let previous = control::read(&paths.worker)?;
+    if moving && loaded == LoadedState::Match {
+        control::write(&paths.worker, control::Control::draining())?;
+        launcher.verify_loaded(&plan, receipt)?;
+        launcher.launchctl(
+            &plan
+                .stop_arguments(receipt.path())
+                .map_err(anyhow::Error::msg)?,
+        )?;
+        ensure!(
+            launcher.loaded_state(&plan, receipt) == LoadedState::Absent,
+            "service did not stop; group unchanged"
+        );
+    }
+    let _owner = if moving {
+        Some(crate::storage::ProcessLock::acquire(
+            &paths.state,
+            "coordinator.lock",
+        )?)
+    } else {
+        None
+    };
+    let _agent = if moving {
+        Some(crate::storage::ProcessLock::acquire(
+            &paths.worker,
+            "agent.lock",
+        )?)
+    } else {
+        None
+    };
+    if moving && (worker.count_group_work()? != 0 || coordinator.has_group_work()?) {
+        control::write(&paths.worker, previous)?;
+        drop(_agent);
+        drop(_owner);
+        if loaded == LoadedState::Match {
+            launcher.launchctl(
+                &plan
+                    .start_arguments(receipt.path())
+                    .map_err(anyhow::Error::msg)?,
+            )?;
+        }
+        anyhow::bail!("live work appeared before stopping; group unchanged");
+    }
+    let worker = WorkerStore::open(&paths.worker, &spec.worker_id)?;
+    if moving {
+        worker.clear_group_membership()?;
+        CoordinatorStore::move_group(&paths.state, &request.cluster)?;
+        match fs::remove_file(crate::group::next_key_path(&paths.key)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        journal.cluster = Some(request.cluster.clone());
+        journal.spec.expected_cluster = Some(request.cluster.clone());
+    }
+    let mut jf = JournalFile {
+        path: paths.journal.clone(),
+        proof: Some(Proof::read(&paths.journal)?),
+    };
+    let mut replacements = vec![(paths.key.clone(), request.key_file_text.as_bytes().to_vec())];
+    if moving {
+        replacements.push((paths.input.clone(), serde_json::to_vec(&journal.spec)?));
+    }
+    for (path, bytes) in replacements {
+        let mut temp = tempfile::NamedTempFile::new_in(path.parent().context("file parent")?)?;
+        temp.write_all(&bytes)?;
+        temp.as_file().sync_all()?;
+        temp.persist(&path).map_err(|e| e.error)?;
+        File::open(path.parent().context("file parent")?)?.sync_all()?;
+        let proof = Proof::read(&path)?;
+        *journal
+            .files
+            .iter_mut()
+            .find(|p| p.path == path)
+            .context("receipt missing")? = proof;
+    }
+    jf.save(&journal)?;
+    worker.observe_group_key(&crate::group::fingerprint(&crate::secrets::key::load(
+        &paths.key,
+    )?))?;
+    worker
+        .for_member(&member.caller_id)
+        .replace_member_pin(member.caller_name.as_str(), crate::platform::wall_ms())?;
+    if moving {
+        control::write(&paths.worker, previous)?;
+    }
+    drop(_agent);
+    drop(_owner);
+    if moving && loaded == LoadedState::Match {
+        launcher.launchctl(
+            &plan
+                .start_arguments(receipt.path())
+                .map_err(anyhow::Error::msg)?,
+        )?;
+    }
+    if loaded == LoadedState::Match {
+        launcher.verify_loaded(&plan, receipt)?;
+    }
+    Ok(super::worker_service::Status {
+        membership_only: true,
+        coordinator_id: journal.coordinator,
+        system_user: false,
+        worker_id: spec.worker_id,
+        cluster: request.cluster.clone(),
+        binary_sha256: journal.binary_hash,
+        loaded: Some(loaded == LoadedState::Match),
+        ready: loaded == LoadedState::Match,
+        draining: previous.drain,
+        cancel_running: previous.cancel_running,
+        live_attempts: Some(u32::try_from(worker.count_nonterminal()?).unwrap_or(u32::MAX)),
+        bridge_binary: Some(spec.executable.to_string_lossy().into_owned()),
+        traffic_scope: None,
+        traffic_hold: None,
+        switching_from: None,
+        drained_by_upgrade: false,
+        switch_running: false,
+    })
+}
+
 pub(crate) fn managed_identity(spec: &Spec) -> anyhow::Result<(ClusterId, CoordinatorId)> {
     let (j, _) = managed_journal(spec)?;
     Ok((

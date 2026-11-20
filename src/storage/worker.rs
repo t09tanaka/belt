@@ -938,6 +938,33 @@ impl WorkerStore {
         })
     }
 
+    /// Work that prevents an explicit group move, across every member.
+    pub fn count_group_work(&self) -> Result<u64> {
+        self.db.call(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM worker_attempt WHERE state <> 'terminal' OR acked_at_ms IS NULL",
+                [], |r| r.get(0),
+            )?;
+            to_u64(n)
+        })
+    }
+
+    /// Forget the old group's authentication records only while idle.
+    pub fn clear_group_membership(&self) -> Result<()> {
+        self.db.write(|tx| {
+            let n: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM worker_attempt WHERE state <> 'terminal' OR acked_at_ms IS NULL",
+                [], |r| r.get(0),
+            )?;
+            if n != 0 {
+                return Err(StorageError::Invalid("live work prevents a group move".into()));
+            }
+            tx.execute("DELETE FROM group_member", [])?;
+            tx.execute("DELETE FROM group_key", [])?;
+            Ok(())
+        })
+    }
+
     /// How many launch intents the database holds, over every attempt.
     pub fn count_launches(&self) -> Result<u64> {
         self.db.call(|c| {

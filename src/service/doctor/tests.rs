@@ -591,6 +591,8 @@ fn one_engine_reached_from_two_hosts_fails_on_both() {
 
 fn status(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
     Status {
+        membership_only: false,
+        coordinator_id: None,
         system_user: false,
         worker_id: WorkerId::parse("mini-a").unwrap(),
         cluster: ClusterId::generate(),
@@ -1119,6 +1121,7 @@ fn a_worker_host_is_viewed_through_its_recorded_service_environment() {
     // Nothing installed: there is no service to look at.
     assert!(service_view(&env, fake.clone()).is_err());
     let request = InstallRequest {
+        membership: None,
         system_user: false,
         schema: 1,
         cluster: ClusterId::generate(),

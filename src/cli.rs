@@ -250,6 +250,9 @@ pub enum WorkersSub {
         /// Install the worker over SSH.
         #[arg(long)]
         install: bool,
+        /// Move an idle member from another group.
+        #[arg(long = "move", conflicts_with = "ephemeral")]
+        move_group: bool,
         /// With `--install`: the build to send, for a worker whose OS or
         /// architecture differs from this machine's.
         #[arg(long, requires = "install", value_name = "PATH")]

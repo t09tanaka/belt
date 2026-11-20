@@ -62,6 +62,7 @@ impl Host {
         let cluster = ClusterId::generate();
         let old = sha256_file(&old_exe).unwrap();
         let request = InstallRequest {
+            membership: None,
             system_user: false,
             schema: 1,
             cluster: cluster.clone(),

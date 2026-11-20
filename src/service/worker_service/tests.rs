@@ -107,6 +107,7 @@ impl Host {
         fake.0.borrow_mut().backend = backend;
         Host {
             request: InstallRequest {
+                membership: None,
                 system_user: false,
                 schema: 1,
                 cluster: ClusterId::generate(),
@@ -244,6 +245,7 @@ fn install_refuses_a_wrong_digest_a_changed_key_and_another_identity() {
     changed_key.env = h.env.clone();
     changed_key.exe = h.exe.clone();
     changed_key.request = InstallRequest {
+        membership: None,
         system_user: false,
         key_file_text: format!("{}\n", "cd".repeat(64)),
         cluster: h.request.cluster.clone(),
@@ -523,6 +525,7 @@ fn an_install_that_never_registered_the_service_can_be_replaced_by_a_rerun() {
     changed.env = h.env.clone();
     changed.exe = h.exe.clone();
     changed.request = InstallRequest {
+        membership: None,
         system_user: false,
         schema: 1,
         cluster: h.request.cluster.clone(),
@@ -1037,4 +1040,99 @@ fn a_system_service_installs_stops_restores_and_upgrades_without_replacing_the_a
             }
         });
     }
+}
+
+#[test]
+fn membership_moves_an_initialized_idle_member_without_adding_a_worker() {
+    use crate::service::init::{initialize, ContextInput};
+    use crate::storage::{CoordinatorStore, WorkerStore};
+    struct Unobserved;
+    impl Launcher for Unobserved {
+        fn launchctl(&mut self, _: &[String]) -> Result<(), LaunchError> {
+            panic!("no service may start")
+        }
+        fn verify_loaded(&mut self, _: &policy::Plan, _: &Receipt) -> Result<(), LaunchError> {
+            Err(LaunchError::NotApplied("unobserved".into()))
+        }
+    }
+    let h = Host::new();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    assert!(runtime
+        .block_on(initialize(
+            ContextInput {
+                env: h.env.clone(),
+                executable: h.exe.clone()
+            },
+            &mut Unobserved
+        ))
+        .is_err());
+    let input = h.paths().config.join("coordinator.json");
+    let spec = super::super::bootstrap::read_input(&input).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let original_id = store.coordinator_id().clone();
+    let worker = WorkerStore::open(&spec.worker_state_dir, &spec.worker_id).unwrap();
+    let old_member = CoordinatorId::generate();
+    worker
+        .for_member(&old_member)
+        .pin_member("old-member", 1)
+        .unwrap();
+    worker.observe_group_key("old").unwrap();
+    worker
+        .set_next_group_key(&crate::storage::KeyGeneration {
+            generation: 2,
+            fingerprint: "old-next".into(),
+        })
+        .unwrap();
+    fs::write(
+        crate::group::next_key_path(&spec.cluster_key_path),
+        b"old key",
+    )
+    .unwrap();
+    let journal_path = h.paths().journal;
+    let mut request = h.request;
+    request.worker_id = spec.worker_id.clone();
+    request.membership = Some(Membership {
+        caller_name: WorkerId::parse("caller").unwrap(),
+        caller_id: CoordinatorId::generate(),
+        move_group: false,
+        install: false,
+    });
+    let before = fs::read(&input).unwrap();
+    let error = install(&h.env, &request, &h.exe, h.fake.clone(), Duration::ZERO).unwrap_err();
+    assert!(error.to_string().contains(store.cluster_id().as_str()));
+    assert_eq!(fs::read(&input).unwrap(), before);
+    assert_eq!(
+        worker.members().unwrap(),
+        vec![("old-member".into(), old_member.to_string())]
+    );
+    request.membership.as_mut().unwrap().move_group = true;
+    let status = install(&h.env, &request, &h.exe, h.fake.clone(), Duration::ZERO).unwrap();
+    assert_eq!(status.coordinator_id, Some(original_id.clone()));
+    assert_eq!(status.cluster, request.cluster);
+    assert!(!status.ready && status.loaded == Some(false));
+    assert!(h.fake.0.borrow().calls.is_empty());
+    assert!(!journal_path.exists());
+    let changed = super::super::bootstrap::read_input(&input).unwrap();
+    assert_eq!(changed.expected_cluster, Some(request.cluster.clone()));
+    let changed_store = CoordinatorStore::open_read_only(&changed.state_dir).unwrap();
+    assert_eq!(changed_store.coordinator_id(), &original_id);
+    assert_eq!(changed_store.cluster_id(), &request.cluster);
+    assert_eq!(
+        worker.members().unwrap(),
+        vec![(
+            "caller".into(),
+            request.membership.as_ref().unwrap().caller_id.to_string()
+        )]
+    );
+    let (current, next) = worker.group_keys().unwrap();
+    assert_eq!(current.unwrap().generation, 1);
+    assert!(next.is_none());
+    assert!(!crate::group::next_key_path(&spec.cluster_key_path).exists());
+    assert_eq!(
+        fs::read_to_string(&spec.cluster_key_path).unwrap(),
+        request.key_file_text
+    );
 }

@@ -459,3 +459,174 @@ fn manual_resident_and_failed_registered_daemon_are_not_initialized() {
     assert!(!guard.child.take().unwrap().wait().unwrap().success());
     assert!(guard.manual.pop().unwrap().wait().unwrap().success());
 }
+
+#[test]
+fn workers_add_replaces_both_member_pins_without_a_second_resident() {
+    use belt::ids::{CoordinatorId, WorkerId};
+    use belt::service::{worker_service, workers};
+    use belt::storage::WorkerStore;
+    use std::path::PathBuf;
+    struct Helper {
+        env: BTreeMap<String, String>,
+        state: Arc<Mutex<State>>,
+        exe: PathBuf,
+        captured: Vec<u8>,
+        argv: Vec<String>,
+    }
+    impl workers::Remote for Helper {
+        fn run(
+            &mut self,
+            _: &belt::protocol::ssh::SshTarget,
+            shell: &str,
+            stdin: &[u8],
+            _: Duration,
+        ) -> Result<workers::RemoteOutput, String> {
+            self.argv.push(shell.into());
+            assert!(shell.contains("'worker-service' 'install'"));
+            let status = worker_service::handle(
+                worker_service::Action::Install,
+                &self.env,
+                stdin,
+                &self.exe,
+                OwnedLauncher(self.state.clone()),
+                worker_service::Options {
+                    cancel_running: false,
+                    wait: Duration::ZERO,
+                    ready_timeout: Duration::ZERO,
+                },
+            )
+            .map_err(|e| e.to_string())?;
+            let stdout =
+                serde_json::to_vec(&serde_json::json!({"ok": true, "status": status})).unwrap();
+            self.captured.extend_from_slice(&stdout);
+            Ok(workers::RemoteOutput {
+                code: Some(0),
+                stdout,
+                stderr: vec![],
+            })
+        }
+        fn bridge_hello(
+            &mut self,
+            _: &belt::protocol::ssh::SshTarget,
+            _: &str,
+            _: &belt::ids::ClusterId,
+        ) -> Result<(belt::ids::ClusterId, WorkerId), String> {
+            panic!("enrollment must reuse the existing resident")
+        }
+    }
+    let target_root = crate::test_tmp::tempdir().unwrap();
+    let target_context = context(target_root.path());
+    let state = Arc::new(Mutex::new(State::default()));
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let target = rt
+        .block_on(initialize(
+            target_context.clone(),
+            &mut OwnedLauncher(state.clone()),
+        ))
+        .unwrap();
+    let target_spec =
+        bootstrap::read_input(&target_root.path().join("config/belt/coordinator.json")).unwrap();
+    let caller_root = crate::test_tmp::tempdir().unwrap();
+    let caller_context = context(caller_root.path());
+    let caller_state = caller_root.path().join("coordinator");
+    std::fs::create_dir(&caller_state).unwrap();
+    let caller = CoordinatorStore::open(&caller_state, 1).unwrap();
+    let caller_id = caller.coordinator_id().clone();
+    drop(caller);
+    let db = rusqlite::Connection::open(caller_state.join("coordinator.db")).unwrap();
+    db.execute(
+        "INSERT INTO cluster SELECT ?1, coordinator_id, created_at_ms FROM cluster",
+        [target.cluster_id.as_str()],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE coordinator_state SET cluster_id = ?1",
+        [target.cluster_id.as_str()],
+    )
+    .unwrap();
+    db.execute(
+        "DELETE FROM cluster WHERE cluster_id <> ?1",
+        [target.cluster_id.as_str()],
+    )
+    .unwrap();
+    drop(db);
+    let local_worker = caller_root.path().join("worker");
+    std::fs::create_dir(&local_worker).unwrap();
+    let local_name = WorkerId::parse("caller").unwrap();
+    let local = WorkerStore::open(&local_worker, &local_name).unwrap();
+    local
+        .for_member(&CoordinatorId::generate())
+        .pin_member(target.worker_id.as_str(), 1)
+        .unwrap();
+    let remote = WorkerStore::open(&target_spec.worker_state_dir, &target.worker_id).unwrap();
+    remote
+        .for_member(&CoordinatorId::generate())
+        .replace_member_pin("caller", 1)
+        .unwrap();
+    let spec = bootstrap::Spec {
+        state_dir: caller_state,
+        worker_state_dir: local_worker,
+        worker_id: local_name,
+        cluster_key_path: target_spec.cluster_key_path.clone(),
+        executable: caller_context.executable.clone(),
+        env: caller_context.env.clone(),
+        repo_root: None,
+        expected_cluster: Some(target.cluster_id.clone()),
+        managed_service: None,
+    };
+    let mut helper = Helper {
+        env: target_context.env,
+        state: state.clone(),
+        exe: target_context.executable,
+        captured: vec![],
+        argv: vec![],
+    };
+    let before = state.lock().unwrap().starts;
+    let result = workers::add(
+        &mut helper,
+        &caller_context.env,
+        &spec,
+        &caller_context.executable,
+        target.worker_id.as_str(),
+        Some("fake@target"),
+        workers::AddOptions::default(),
+        |_| workers::ResidentReload::NotRunning,
+    )
+    .unwrap();
+    assert_eq!(
+        result.status.as_ref().unwrap().coordinator_id.as_ref(),
+        Some(&target.coordinator_id)
+    );
+    assert!(remote
+        .members()
+        .unwrap()
+        .contains(&("caller".into(), caller_id.to_string())));
+    assert_eq!(
+        local.members().unwrap(),
+        vec![(
+            target.worker_id.to_string(),
+            target.coordinator_id.to_string()
+        )]
+    );
+    assert_eq!(state.lock().unwrap().starts, before);
+    assert!(!target_root
+        .path()
+        .join("config/belt/worker-service.json")
+        .exists());
+    assert!(
+        bootstrap::read_input(&target_root.path().join("config/belt/coordinator.json")).is_ok()
+    );
+    let key = std::fs::read_to_string(&target_spec.cluster_key_path).unwrap();
+    assert!(helper.argv.iter().all(|arg| !arg.contains(key.trim())));
+    assert!(!String::from_utf8_lossy(&helper.captured).contains(key.trim()));
+    for log in &mut state.lock().unwrap().stderr {
+        log.seek(SeekFrom::Start(0)).unwrap();
+        let mut text = String::new();
+        log.read_to_string(&mut text).unwrap();
+        assert!(!text.contains(key.trim()));
+    }
+}

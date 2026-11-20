@@ -779,19 +779,16 @@ fn hex(bytes: &[u8]) -> String {
 pub struct AddOptions<'a> {
     /// Install the worker over SSH.
     pub install: bool,
+    pub move_group: bool,
     /// Register an ephemeral worker (`ephemeral = true`).
     pub ephemeral: bool,
     /// The build to send instead of the parent's own binary (`--binary`).
     pub binary: Option<&'a Path>,
 }
 
-/// `workers add`. Without `--install` only the registration is written.
-/// With it, the parent stages its own binary, runs the helper's install on
-/// the worker host (resumable), proves the exact bridge the resident will use
-/// (absolute binary, `worker --stdio` over ssh, `hello` from the expected
-/// worker in the expected cluster), and registers the worker last, so a
-/// failed install leaves nothing registered. Re-running continues where it
-/// stopped. Finally a running resident is asked to dial the worker now.
+/// Enroll an existing member through its SSH helper; with `--install`, stage
+/// a helper that can also install a new worker. Register only after enrollment
+/// succeeds, then ask a running resident to reload the configuration.
 #[allow(clippy::too_many_arguments)]
 pub fn add(
     remote: &mut impl Remote,
@@ -805,7 +802,7 @@ pub fn add(
 ) -> Result<AddResult, ApiError> {
     check_name(name)?;
     let install = options.install;
-    if options.ephemeral && (install || options.binary.is_some()) {
+    if options.ephemeral && (install || options.binary.is_some() || options.move_group) {
         return Err(invalid(EPHEMERAL_NO_SERVICE));
     }
     if options.binary.is_some() && !install {
@@ -844,12 +841,14 @@ pub fn add(
             "the name belongs to the local worker",
         ));
     }
-    let (status, binary) = if install {
+    let (status, binary) = if !ephemeral {
         let status = install_remote(
             remote,
             spec,
             options.binary.unwrap_or(exe),
             options.binary.is_some(),
+            options,
+            existing.as_ref().and_then(|e| e.binary.as_deref()),
             name,
             &target,
             existing
@@ -976,11 +975,14 @@ fn ensure_staged(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_remote(
     remote: &mut impl Remote,
     spec: &Spec,
     ship: &Path,
     explicit_binary: bool,
+    options: AddOptions<'_>,
+    existing_binary: Option<&str>,
     name: &str,
     target: &SshTarget,
     system_user: bool,
@@ -992,10 +994,26 @@ fn install_remote(
         .clone()
         .ok_or_else(|| invalid("the coordinator has no cluster identity; run init"))?;
     let cluster_expected = cluster.clone();
+    let caller = crate::storage::CoordinatorStore::open_read_only(&spec.state_dir)
+        .map_err(|e| internal(&e))?;
+    if caller.cluster_id() != &cluster {
+        return Err(invalid(
+            "coordinator group differs from its retained configuration",
+        ));
+    }
+
     let key = crate::secrets::key::load(&spec.cluster_key_path).map_err(|e| internal(&e))?;
     let digest = worker_service::sha256_file(ship).map_err(|e| internal(&e))?;
-    ensure_staged(remote, target, ship, &digest, explicit_binary)?;
+    if options.install {
+        ensure_staged(remote, target, ship, &digest, explicit_binary)?;
+    }
     let request = InstallRequest {
+        membership: Some(worker_service::Membership {
+            caller_name: spec.worker_id.clone(),
+            caller_id: caller.coordinator_id().clone(),
+            move_group: options.move_group,
+            install: options.install,
+        }),
         system_user,
         schema: 1,
         cluster,
@@ -1004,13 +1022,13 @@ fn install_remote(
         binary_sha256: digest.clone(),
     };
     let body = serde_json::to_vec(&request).map_err(|e| internal(&e))?;
+    let command = if options.install {
+        install_command(&digest)
+    } else {
+        launch(existing_binary, &digest, "'worker-service' 'install'")
+    };
     let out = remote
-        .run(
-            target,
-            &install_command(&digest),
-            &body,
-            Duration::from_secs(300),
-        )
+        .run(target, &command, &body, Duration::from_secs(300))
         .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
     let status = parse_reply(&out)?;
     if status.system_user != system_user {
@@ -1019,7 +1037,7 @@ fn install_remote(
             "installed service mode differs from the worker registration",
         ));
     }
-    if !status.ready || status.loaded != Some(true) {
+    if !status.membership_only && (!status.ready || status.loaded != Some(true)) {
         return Err(ApiError::new(
             ErrorCode::CommunicationUnknown,
             "the service was installed but the worker agent did not become ready; run workers add --install again to continue",
@@ -1031,25 +1049,45 @@ fn install_remote(
             "the worker did not report its installed binary path; nothing was registered",
         )
     })?;
-    // The capability check: the path and the transport the resident will use.
-    let (answered_cluster, answered_worker) = remote
-        .bridge_hello(target, &binary, &status.cluster)
-        .map_err(|m| {
-            ApiError::new(
-                ErrorCode::CommunicationUnknown,
-                format!(
+    if status.worker_id.as_str() != name || status.cluster != cluster_expected {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "the helper answered for a different worker or cluster; nothing was registered",
+        ));
+    }
+    // An initialized member's shared bridge belongs to the resident task;
+    // enrollment uses the authenticated SSH helper's current identity.
+    if status.coordinator_id.is_none() && status.ready {
+        // The capability check: the path and the transport the resident will use.
+        let (answered_cluster, answered_worker) = remote
+            .bridge_hello(target, &binary, &status.cluster)
+            .map_err(|m| {
+                ApiError::new(
+                    ErrorCode::CommunicationUnknown,
+                    format!(
                     "the worker bridge could not be started over ssh: {m}; nothing was registered"
                 ),
-            )
-        })?;
-    if answered_worker.as_str() != name
-        || answered_cluster != status.cluster
-        || status.cluster != cluster_expected
-    {
-        return Err(ApiError::new(
+                )
+            })?;
+        if answered_worker.as_str() != name
+            || answered_cluster != status.cluster
+            || status.cluster != cluster_expected
+        {
+            return Err(ApiError::new(
             ErrorCode::Conflict,
             "the worker bridge answered for a different worker or cluster; nothing was registered",
         ));
+        }
+    }
+    if let Some(coordinator) = &status.coordinator_id {
+        std::fs::create_dir_all(&spec.worker_state_dir).map_err(|e| internal(&e))?;
+        crate::storage::WorkerStore::open(&spec.worker_state_dir, &spec.worker_id)
+            .and_then(|store| {
+                store
+                    .for_member(coordinator)
+                    .replace_member_pin(name, crate::platform::wall_ms())
+            })
+            .map_err(|e| internal(&e))?;
     }
     Ok(status)
 }
@@ -1964,6 +2002,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
             name,
             ssh,
             install,
+            move_group,
             binary,
             ephemeral,
         } => {
@@ -1981,6 +2020,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                         ssh.as_deref(),
                         AddOptions {
                             install: *install,
+                            move_group: *move_group,
                             ephemeral: *ephemeral,
                             binary: binary.as_deref(),
                         },
