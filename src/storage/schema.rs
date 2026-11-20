@@ -282,10 +282,19 @@ CREATE INDEX blob_ref_locator ON blob_ref(locator);
 /// the submitting member in its key, so one member cannot retire, conflict
 /// with or read another member's work. The rows of the old tables are not
 /// carried over: nothing says which member owned them. The step runs only
-/// when no attempt is live ([`precheck`]); the files the dropped references
-/// named are queued for deletion in the same transaction.
+/// when no attempt is live and no result waits to be collected
+/// ([`precheck`]); the files the dropped references named are queued for
+/// deletion in the same transaction, and so are the ids of the dropped
+/// attempts, whose directories the agent removes at its next start.
 const WORKER_V4: &str = "
 INSERT OR IGNORE INTO pending_delete (locator, queued_at_ms) SELECT DISTINCT locator, 0 FROM blob_ref;
+-- The attempts this step dropped. Their directories (spec, supervisor
+-- state, workspace record) have no row to be cleaned up by any more: the
+-- agent removes each and then its entry here.
+CREATE TABLE dropped_attempt (
+    attempt_id TEXT PRIMARY KEY
+) WITHOUT ROWID;
+INSERT INTO dropped_attempt (attempt_id) SELECT attempt_id FROM worker_attempt;
 DROP TRIGGER tombstone_no_delete;
 DROP TRIGGER tombstone_fixed;
 DROP TABLE blob_ref;
@@ -442,7 +451,9 @@ INSERT INTO schema_meta(key,value) VALUES('group_membership_v1','1');
 
 /// What must hold before step `to` of a `kind` database runs, checked in the
 /// step's own transaction. Worker step 4 drops every attempt row, so it is
-/// refused while one is live; the database is left as it was.
+/// refused while one is live, and while one has ended with a result nobody
+/// collected (the result would be gone and its task would stay unknown to
+/// the member that submitted it); the database is left as it was.
 pub(crate) fn precheck(
     kind: &str,
     to: u32,
@@ -456,14 +467,21 @@ pub(crate) fn precheck(
         [],
         |r| r.get(0),
     )?;
-    if live == 0 {
+    let uncollected: i64 = conn.query_row(
+        "SELECT count(*) FROM worker_attempt WHERE state = 'terminal' AND acked_at_ms IS NULL",
+        [],
+        |r| r.get(0),
+    )?;
+    if live == 0 && uncollected == 0 {
         return Ok(());
     }
     Err(super::StorageError::MigrationRefused(format!(
-        "{live} attempt(s) on this worker are still live, and this version rebuilds the worker \
+        "{live} attempt(s) on this worker are still live and {uncollected} ended attempt(s) \
+         have a result that was not collected yet, and this version rebuilds the worker \
          database without carrying attempts over. Start the previous version again, run \
          `belt workers drain` for this worker, wait until its attempts have ended and their \
-         results are collected, then start this version"
+         results are collected (the coordinator that submitted them must run and reach this \
+         worker), then start this version"
     )))
 }
 

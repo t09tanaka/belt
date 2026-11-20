@@ -1709,6 +1709,40 @@ impl WorkerStore {
         self.db.call(|c| common::pending_deletes(c))
     }
 
+    /// The attempts the rebuild of this database dropped (step 4) whose
+    /// directories have not been removed yet, a bounded number of them.
+    pub fn dropped_attempts(&self, limit: u32) -> Result<Vec<String>> {
+        self.db.call(move |c| {
+            let mut stmt =
+                c.prepare("SELECT attempt_id FROM dropped_attempt ORDER BY attempt_id LIMIT ?1")?;
+            let rows = stmt.query_map([limit], |r| r.get(0))?;
+            Ok(rows.collect::<rusqlite::Result<Vec<String>>>()?)
+        })
+    }
+
+    /// Whether any member has an attempt with this id now.
+    pub fn attempt_id_held(&self, attempt_id: &str) -> Result<bool> {
+        let a = attempt_id.to_string();
+        self.db.call(move |c| {
+            Ok(c.query_row(
+                "SELECT 1 FROM worker_attempt WHERE attempt_id = ?1 LIMIT 1",
+                [&a],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+        })
+    }
+
+    /// The directory of a dropped attempt is gone (or was never this
+    /// store's to remove): forget the entry. Idempotent.
+    pub fn forget_dropped_attempt(&self, attempt_id: &str) -> Result<bool> {
+        let a = attempt_id.to_string();
+        self.db.write(move |tx| {
+            Ok(tx.execute("DELETE FROM dropped_attempt WHERE attempt_id = ?1", [&a])? == 1)
+        })
+    }
+
     /// The file of `locator` is deleted: forget it, so the name may be used
     /// again. Idempotent; returns whether a queued locator was removed.
     pub fn complete_delete(&self, locator: &str) -> Result<bool> {

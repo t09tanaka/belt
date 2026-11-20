@@ -78,6 +78,19 @@ fn old_attempt(db: &Db, id: &str, state: &'static str) {
     .unwrap();
 }
 
+/// The result of an ended attempt was collected by whoever submitted it.
+fn collected(db: &Db, id: &str) {
+    let id = id.to_string();
+    db.write(move |tx| {
+        tx.execute(
+            "UPDATE worker_attempt SET acked_at_ms = 6 WHERE attempt_id = ?1",
+            [&id],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
 fn count(db: &Db, sql: &'static str) -> i64 {
     db.call(move |c| Ok(c.query_row(sql, [], |r| r.get(0))?))
         .unwrap()
@@ -106,7 +119,11 @@ fn a_worker_database_with_a_live_attempt_is_refused_with_the_count_and_left_as_i
         let StorageError::MigrationRefused(message) = &e else {
             panic!("{e:?}");
         };
-        assert!(message.starts_with("2 attempt(s)"), "{message}");
+        assert!(
+            message.starts_with("2 attempt(s) on this worker are still live and 1 ended"),
+            "{message}"
+        );
+        assert!(message.contains("collected"), "{message}");
         assert!(message.contains("belt workers drain"), "{message}");
         assert_eq!(e.code(), ErrorCode::ProtocolIncompatible);
         assert!(!e.is_retryable());
@@ -135,11 +152,82 @@ fn a_worker_database_with_a_live_attempt_is_refused_with_the_count_and_left_as_i
     assert_eq!(count(&again, "SELECT count(*) FROM worker_attempt"), 3);
 }
 
+/// An ended attempt whose result nobody collected is as much in the way as a
+/// live one: the rebuild would drop the result. Each of the two alone
+/// refuses, with both counts, and collecting the result lets the step run.
+#[test]
+fn a_worker_database_with_an_uncollected_result_is_refused_until_it_is_collected() {
+    let refusal = |dir: &Path| {
+        let e = WorkerStore::open(dir, &worker()).err().unwrap();
+        let StorageError::MigrationRefused(message) = e else {
+            panic!("{e:?}");
+        };
+        assert_eq!(version(dir), "3");
+        assert!(message.contains("results are collected"), "{message}");
+        assert!(message.contains("previous version"), "{message}");
+        message
+    };
+    // Only uncollected results.
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let old = step_3(dir.path());
+    old_attempt(&old, "att_done1", "terminal");
+    old_attempt(&old, "att_done2", "terminal");
+    old_attempt(&old, "att_done3", "terminal");
+    collected(&old, "att_done3");
+    drop(old);
+    let message = refusal(dir.path());
+    assert!(
+        message.starts_with("0 attempt(s) on this worker are still live and 2 ended attempt(s)"),
+        "{message}"
+    );
+    // Only a live attempt: collected results do not count.
+    let live = crate::test_tmp::tempdir().unwrap();
+    let old = step_3(live.path());
+    old_attempt(&old, "att_live", "active");
+    old_attempt(&old, "att_done", "terminal");
+    collected(&old, "att_done");
+    drop(old);
+    let message = refusal(live.path());
+    assert!(
+        message.starts_with("1 attempt(s) on this worker are still live and 0 ended attempt(s)"),
+        "{message}"
+    );
+    // The previous version collects what is left; then the step runs.
+    let steps = schema::steps(DbKind::Worker);
+    let previous = db::open_with(
+        &dir.path().join("worker.db"),
+        "worker",
+        &steps[..3],
+        schema::compat(3),
+        Access::ReadWrite,
+    )
+    .unwrap();
+    collected(&previous, "att_done1");
+    collected(&previous, "att_done2");
+    drop(previous);
+    let store = WorkerStore::open(dir.path(), &worker()).unwrap();
+    assert_eq!(version(dir.path()), "4");
+    // What was dropped is listed for the agent, in bounded pages, until the
+    // agent says its directory is gone.
+    assert_eq!(
+        store.dropped_attempts(2).unwrap(),
+        vec!["att_done1", "att_done2"]
+    );
+    assert_eq!(store.dropped_attempts(10).unwrap().len(), 3);
+    assert!(store.forget_dropped_attempt("att_done1").unwrap());
+    assert!(!store.forget_dropped_attempt("att_done1").unwrap());
+    assert_eq!(
+        store.dropped_attempts(10).unwrap(),
+        vec!["att_done2", "att_done3"]
+    );
+}
+
 #[test]
 fn a_worker_database_without_live_attempts_migrates_and_drops_what_had_no_owner() {
     let dir = crate::test_tmp::tempdir().unwrap();
     let old = step_3(dir.path());
     old_attempt(&old, "att_done", "terminal");
+    collected(&old, "att_done");
     old.write(|tx| {
         tx.execute_batch(
             "INSERT INTO tombstone VALUES ('att_gone', 'retire', 9, 3);
@@ -183,6 +271,9 @@ fn a_worker_database_without_live_attempts_migrates_and_drops_what_had_no_owner(
     }
     // The epoch is counted again per member, from nothing.
     assert_eq!(store.max_coordinator_epoch().unwrap(), CoordinatorEpoch(0));
+    // The dropped attempt is named, so that its directory can go.
+    assert_eq!(store.dropped_attempts(10).unwrap(), vec!["att_done"]);
+    assert!(!store.attempt_id_held("att_done").unwrap());
     // The files the dropped references named are deleted, once each.
     assert_eq!(store.pending_deletes().unwrap(), vec!["att_done/stdout"]);
     // The journal keeps counting where it was, and the agent epoch stays.
@@ -544,4 +635,93 @@ fn a_retired_identity_is_recorded_once_per_member() {
         .a
         .identity_retired(&WorkerBootId::parse("boot2").unwrap())
         .unwrap());
+}
+
+/// The directories of the attempts step 4 dropped are removed by the agent:
+/// only entries below the attempts root that are named by a dropped id,
+/// never through a link, never one a member holds again, and a pass that
+/// could not finish goes on later.
+#[test]
+fn the_directories_of_dropped_attempts_are_removed_and_nothing_else() {
+    use crate::worker::agent::{remove_dropped_attempts, DroppedReport};
+    use std::os::unix::fs::PermissionsExt;
+    let dir = crate::test_tmp::tempdir().unwrap();
+    let root = dir.path().join("attempts");
+    let outside = dir.path().join("outside");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("keep"), b"x").unwrap();
+    let ids: Vec<String> = (0..6).map(|_| AttemptId::generate().to_string()).collect();
+    let [plain, link, absent, held, stuck, untouched] = &ids[..] else {
+        unreachable!()
+    };
+    let old = step_3(dir.path());
+    for id in [plain, link, absent, held, stuck] {
+        old_attempt(&old, id, "terminal");
+        collected(&old, id);
+    }
+    // A name that is not an attempt id, as old test data has it.
+    old_attempt(&old, "att_done", "terminal");
+    collected(&old, "att_done");
+    drop(old);
+    // An ordinary attempt directory, with a link out of the area inside.
+    std::fs::create_dir_all(root.join(plain).join("artifacts")).unwrap();
+    std::fs::write(root.join(plain).join("supervise.json"), b"{}").unwrap();
+    std::fs::write(root.join(plain).join("workspace.json"), b"{}").unwrap();
+    std::os::unix::fs::symlink(&outside, root.join(plain).join("artifacts/out")).unwrap();
+    // A link where the directory would be.
+    std::os::unix::fs::symlink(&outside, root.join(link)).unwrap();
+    for id in [held, stuck, untouched, &"att_done".to_string()] {
+        std::fs::create_dir_all(root.join(id).join("sub")).unwrap();
+        std::fs::write(root.join(id).join("supervise.json"), b"{}").unwrap();
+    }
+
+    let store = WorkerStore::open(dir.path(), &worker()).unwrap();
+    // A member submitted an attempt under one of the old ids since.
+    store
+        .for_member(&CoordinatorId::generate())
+        .submit(
+            acceptance(&AttemptId::parse(held).unwrap(), &TaskId::generate(), 'a', 1),
+            11,
+        )
+        .unwrap();
+    // One directory cannot be emptied for now.
+    let locked = root.join(stuck).join("sub");
+    std::fs::write(locked.join("f"), b"x").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let root_user = rustix::process::geteuid().is_root();
+
+    let first = remove_dropped_attempts(&root, &store).unwrap();
+    assert!(!root.join(plain).exists());
+    assert!(std::fs::symlink_metadata(root.join(link)).is_err());
+    assert!(outside.join("keep").exists(), "nothing behind a link went");
+    assert!(root.join(held).join("supervise.json").exists());
+    assert!(root.join(untouched).join("supervise.json").exists());
+    assert!(root.join("att_done").join("supervise.json").exists());
+    if !root_user {
+        assert_eq!(first.removed, 2);
+        assert_eq!(first.skipped, 3, "no directory, not an id, held again");
+        assert_eq!(first.failed.len(), 1);
+        assert_eq!(&first.failed[0].0, stuck);
+        assert_eq!(store.dropped_attempts(10).unwrap(), vec![stuck.clone()]);
+        assert!(root.join(stuck).exists());
+        // The next start goes on where this one stopped.
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let second = remove_dropped_attempts(&root, &store).unwrap();
+        assert_eq!(
+            second,
+            DroppedReport {
+                removed: 1,
+                skipped: 0,
+                failed: vec![]
+            }
+        );
+    }
+    assert!(!root.join(stuck).exists());
+    assert_eq!(store.dropped_attempts(10).unwrap(), Vec::<String>::new());
+    assert_eq!(
+        remove_dropped_attempts(&root, &store).unwrap(),
+        DroppedReport::default()
+    );
+    assert!(root.join(untouched).join("supervise.json").exists());
 }

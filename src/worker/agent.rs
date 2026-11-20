@@ -518,7 +518,15 @@ impl Agent {
                     host.sweep_workspaces(&|a| {
                         !matches!(s.get(a), Ok(None))
                             && !matches!(s.get(a), Ok(Some(r)) if r.state == AttemptState::Terminal)
-                    })?
+                    })?;
+                    // After the workspaces: what the rebuild of the database
+                    // dropped has no row that would clean its directory up.
+                    let dropped = remove_dropped_attempts(&cfg.attempts_root(), s).map_err(api)?;
+                    for (attempt, error) in &dropped.failed {
+                        let payload = json!({ "attempt": attempt, "error": error });
+                        let _ =
+                            s.append_event(None, None, "agent_dropped_attempt_kept", &payload, now());
+                    }
                 }
                 Step::Attempts => {
                     let s = store.expect("the store is open");
@@ -3066,6 +3074,63 @@ impl Agent {
             draining: super::control::Control::effective(&self.cfg.state_dir).drain,
         })
     }
+}
+
+/// The most dropped attempts one start clears; more wait for the next start.
+const DROPPED_PER_START: u32 = 10_000;
+
+/// What [`remove_dropped_attempts`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct DroppedReport {
+    /// Directories (or a link standing in their place) that were removed.
+    pub removed: u32,
+    /// Entries that were let go without touching anything: no directory, a
+    /// name that is not an attempt id, or an id a member holds again.
+    pub skipped: u32,
+    /// What could not be removed (`attempt`, the I/O error): still listed,
+    /// tried again at the next start.
+    pub failed: Vec<(String, String)>,
+}
+
+/// Remove the directories of the attempts the rebuild of the worker database
+/// dropped (migration step 4): their spec, supervisor state and workspace
+/// record have no row that would clean them up. Only an entry directly below
+/// `attempts_root` whose name is one of the dropped ids is touched. A
+/// symbolic link in its place is unlinked, never followed, and links inside
+/// the directory are removed as links. An id that a member holds again is
+/// left alone. Each entry is forgotten once its directory is gone, so a pass
+/// that was cut short goes on at the next start.
+pub fn remove_dropped_attempts(
+    attempts_root: &Path,
+    store: &WorkerStore,
+) -> Result<DroppedReport, StorageError> {
+    let mut report = DroppedReport::default();
+    for id in store.dropped_attempts(DROPPED_PER_START)? {
+        // `parse` re-encodes the id, so only the canonical spelling passes:
+        // nothing that could name another place.
+        let canonical = AttemptId::parse(&id).is_ok_and(|a| a.as_str() == id);
+        if !canonical || store.attempt_id_held(&id)? {
+            store.forget_dropped_attempt(&id)?;
+            report.skipped += 1;
+            continue;
+        }
+        let path = attempts_root.join(&id);
+        let removed = match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() => fs::remove_dir_all(&path),
+            Ok(_) => fs::remove_file(&path),
+            Err(e) => Err(e),
+        };
+        match removed {
+            Ok(()) => report.removed += 1,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => report.skipped += 1,
+            Err(e) => {
+                report.failed.push((id, e.to_string()));
+                continue;
+            }
+        }
+        store.forget_dropped_attempt(&id)?;
+    }
+    Ok(report)
 }
 
 fn acquire_lock(cfg: &AgentConfig) -> Result<ProcessLock, ApiError> {
