@@ -457,8 +457,12 @@ impl Fx {
         self.store().get(a).unwrap().unwrap()
     }
     fn wait_terminal(&self, a: &AttemptId) -> Outcome {
+        self.wait_terminal_within(a, T)
+    }
+    /// As `wait_terminal`, with a bound of the caller's choosing.
+    fn wait_terminal_within(&self, a: &AttemptId, within: Duration) -> Outcome {
         let store = self.store();
-        let end = Instant::now() + T;
+        let end = Instant::now() + within;
         while store.get(a).unwrap().unwrap().state != AttemptState::Terminal {
             // Say where it stopped, not only that it did: the journal of the
             // attempt is what tells a stuck recovery from a slow one.
@@ -4836,7 +4840,17 @@ async fn a_ci_task_whose_supervisor_is_lost_during_a_step_is_recovered_as_interr
     assert_eq!(f.rec(&a).state, AttemptState::Active);
 
     let _agent = f.start("boot-a");
-    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    // Recovery keeps the attempt unresolved while a process of this user
+    // that leads its own session and started after the step is alive: it
+    // cannot tell it from a step that escaped. Tests that run alongside leave
+    // such processes (the step of a test that killed its supervisor too), and
+    // each is gone once its own test has recovered or ended. So the wait is
+    // bounded by the longest such test, not by one recovery, and the retries
+    // of the agent back off to several seconds.
+    assert_eq!(
+        f.wait_terminal_within(&a, Duration::from_secs(120)),
+        Outcome::Interrupted
+    );
     assert_eq!(ci.steps(&a), ["step-0"], "no step is started by recovery");
     // The pipe of the step went with the recovery.
     let logs = f.state().join("attempts").join(a.as_str());
