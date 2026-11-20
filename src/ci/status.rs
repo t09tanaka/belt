@@ -103,6 +103,9 @@ pub fn cause(fault: &Fault) -> Cause {
 pub struct Job<'a> {
     pub plan_task: &'a str,
     pub status: &'a str,
+    /// Counted in the description. A shard whose split job has a line of
+    /// its own is not: the job counts once, not once and once per shard.
+    pub counted: bool,
 }
 
 /// How the run ended: the result of the run as its completion has it (the
@@ -164,6 +167,7 @@ pub fn computed(end: &RunEnd<'_>) -> Computed {
 /// `<state>: pass P / fail F / error E / skip S`, the shape of local-ci's
 /// description.
 pub fn description(computed: Computed, jobs: &[Job<'_>]) -> String {
+    let jobs: Vec<_> = jobs.iter().filter(|job| job.counted).collect();
     let count = |status: &str| jobs.iter().filter(|job| job.status == status).count();
     let (pass, fail, skip) = (count("success"), count("failure"), count("skipped"));
     let error = jobs.len() - pass - fail - skip;
@@ -428,7 +432,11 @@ mod tests {
     fn jobs<'a>(lines: &[(&'a str, &'a str)]) -> Vec<Job<'a>> {
         lines
             .iter()
-            .map(|&(plan_task, status)| Job { plan_task, status })
+            .map(|&(plan_task, status)| Job {
+                plan_task,
+                status,
+                counted: true,
+            })
             .collect()
     }
 
@@ -512,6 +520,43 @@ mod tests {
             ..end(&["a", "b"], &all)
         };
         assert_eq!(computed(&late), Computed::Cancelled);
+    }
+
+    #[test]
+    fn a_run_without_shards_that_failed_and_was_then_cancelled_stays_a_failure() {
+        let cancel = crate::error::exit::CANCELLED;
+        // a failed, the rest was cancelled with the run
+        let lines = jobs(&[("a", "failure"), ("b", "cancelled"), ("c", "cancelled")]);
+        let base = RunEnd {
+            cancel_requested: true,
+            exit_code: 1,
+            failed: Some(Cause::Job),
+            ..end(&["a", "b", "c"], &lines)
+        };
+        assert_eq!(computed(&base), Computed::Failure);
+        // also when the run's exit code is the one of the cancel
+        let coded = RunEnd {
+            exit_code: cancel,
+            ..base
+        };
+        assert_eq!(computed(&coded), Computed::Failure);
+        // and when only the lines say which job failed
+        let lines_only = RunEnd {
+            failed: None,
+            ..base
+        };
+        assert_eq!(computed(&lines_only), Computed::Failure);
+        // a run that failed of the cancel itself is cancelled, not failed
+        let own = RunEnd {
+            failed: Some(Cause::Cancel),
+            exit_code: cancel,
+            ..base
+        };
+        assert_eq!(computed(&own), Computed::Cancelled);
+        assert_eq!(
+            description(computed(&base), &lines),
+            "failure: pass 0 / fail 1 / error 2 / skip 0"
+        );
     }
 
     #[test]
@@ -655,6 +700,34 @@ mod tests {
             description(Computed::Error, &[]),
             "error: pass 0 / fail 0 / error 0 / skip 0"
         );
+    }
+
+    #[test]
+    fn a_split_job_counts_once_not_once_per_shard_and_once_more_as_the_job() {
+        // Two shards and the job they make: three lines, one job.
+        let mut lines = jobs(&[("s0", "success"), ("s1", "success"), ("job", "success")]);
+        lines[0].counted = false;
+        lines[1].counted = false;
+        assert_eq!(
+            description(Computed::Success, &lines),
+            "success: pass 1 / fail 0 / error 0 / skip 0"
+        );
+        // A shard without a job line of its own (not joined) still counts.
+        let mut lines = jobs(&[("s0", "failure"), ("s1", "no_result")]);
+        assert_eq!(
+            description(Computed::Failure, &lines),
+            "failure: pass 0 / fail 1 / error 1 / skip 0"
+        );
+        lines[0].counted = false;
+        assert_eq!(
+            description(Computed::Failure, &lines),
+            "failure: pass 0 / fail 0 / error 1 / skip 0"
+        );
+        // The shards are still lines the plan's tasks are covered by.
+        let mut shards = jobs(&[("s0", "success"), ("s1", "success"), ("job", "success")]);
+        shards[0].counted = false;
+        shards[1].counted = false;
+        assert_eq!(computed(&end(&["s0", "s1"], &shards)), Computed::Success);
     }
 
     fn source() -> Source<'static> {
