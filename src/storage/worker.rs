@@ -53,6 +53,13 @@ pub struct KeyGeneration {
     pub fingerprint: String,
 }
 
+/// Authentication rows saved while an idle init host changes groups.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct MembershipImage {
+    members: Vec<(String, String, i64)>,
+    keys: Vec<(String, i64, String)>,
+}
+
 /// What recording a member's name and coordinator id found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MemberPin {
@@ -478,6 +485,14 @@ impl WorkerStore {
                 .transpose()
             };
             Ok((read("current")?, read("next")?))
+        })
+    }
+
+    /// send-key discards a pending generation even when current is unchanged.
+    pub(crate) fn drop_next_group_key(&self) -> Result<()> {
+        self.db.write(|tx| {
+            tx.execute("DELETE FROM group_key WHERE slot = 'next'", [])?;
+            Ok(())
         })
     }
 
@@ -935,6 +950,70 @@ impl WorkerStore {
                 |r| r.get(0),
             )?;
             to_u64(n)
+        })
+    }
+
+    /// Work that prevents an explicit group move, across every member.
+    pub fn count_group_work(&self) -> Result<u64> {
+        self.db.call(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM worker_attempt WHERE state <> 'terminal' OR acked_at_ms IS NULL",
+                [], |r| r.get(0),
+            )?;
+            to_u64(n)
+        })
+    }
+
+    pub(crate) fn membership_image(&self) -> Result<MembershipImage> {
+        self.db.call(|c| {
+            let members = c
+                .prepare(
+                    "SELECT name, coordinator_id, pinned_at_ms FROM group_member ORDER BY name",
+                )?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let keys = c
+                .prepare("SELECT slot, generation, fingerprint FROM group_key ORDER BY slot")?
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(MembershipImage { members, keys })
+        })
+    }
+
+    pub(crate) fn restore_membership(&self, image: &MembershipImage) -> Result<()> {
+        let image = image.clone();
+        self.db.write(move |tx| {
+            tx.execute("DELETE FROM group_member", [])?;
+            tx.execute("DELETE FROM group_key", [])?;
+            for (name, id, time) in &image.members {
+                tx.execute(
+                    "INSERT INTO group_member VALUES (?1, ?2, ?3)",
+                    params![name, id, time],
+                )?;
+            }
+            for (slot, generation, fingerprint) in &image.keys {
+                tx.execute(
+                    "INSERT INTO group_key VALUES (?1, ?2, ?3)",
+                    params![slot, generation, fingerprint],
+                )?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Forget the old group's authentication records only while idle.
+    pub fn clear_group_membership(&self) -> Result<()> {
+        self.db.write(|tx| {
+            let n: i64 = tx.query_row(
+                "SELECT COUNT(*) FROM worker_attempt WHERE state <> 'terminal' OR acked_at_ms IS NULL",
+                [], |r| r.get(0),
+            )?;
+            if n != 0 {
+                return Err(StorageError::Invalid("live work prevents a group move".into()));
+            }
+            tx.execute("DELETE FROM group_member", [])?;
+            tx.execute("DELETE FROM group_key", [])?;
+            Ok(())
         })
     }
 

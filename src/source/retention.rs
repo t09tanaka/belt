@@ -3447,13 +3447,13 @@ mod tests {
         fn tick(
             f: &Fixture,
             v: &Vault,
-            k: &ClusterKey,
+            _k: &ClusterKey,
             c: &mut VaultCursor,
             wall: u64,
             mono: u64,
         ) -> VaultPage {
             f.store
-                .vault_retention_page(&f.owner, v, k, c, wall, mono, Some("boot".into()))
+                .vault_retention_page(&f.owner, v, c, wall, mono, Some("boot".into()))
                 .unwrap()
         }
         fn entries(f: &Fixture, r: &RunId) -> Vec<local_ci::source::SecretEntry> {
@@ -3641,7 +3641,7 @@ mod tests {
             assert!(Vault::open(&f.state).is_err());
             assert!(f
                 .store
-                .vault_retention_page(&f.owner, &v, &k, &mut c, 101, 11, Some("boot".into()))
+                .vault_retention_page(&f.owner, &v, &mut c, 101, 11, Some("boot".into()))
                 .is_err());
             assert_eq!(std::fs::read(&plaintext).unwrap(), original_plaintext);
             std::fs::write(&marker, &original).unwrap();
@@ -3671,7 +3671,7 @@ mod tests {
             assert!(f.state.join("secrets/retention.lock").exists());
             assert!(f
                 .store
-                .vault_retention_page(&f.owner, &v, &k, &mut c, 101, 11, Some("boot".into()))
+                .vault_retention_page(&f.owner, &v, &mut c, 101, 11, Some("boot".into()))
                 .is_err());
             assert_eq!(std::fs::read(&plaintext).unwrap(), original_plaintext);
         }
@@ -3942,7 +3942,7 @@ mod tests {
             std::os::unix::fs::symlink(&moved, &f.state).unwrap();
             assert!(f
                 .store
-                .vault_retention_page(&f.owner, &v, &k, &mut c, 101, 11, Some("boot".into()))
+                .vault_retention_page(&f.owner, &v, &mut c, 101, 11, Some("boot".into()))
                 .is_err());
             let bundle = moved.join("secrets").join(format!("{r}.json"));
             assert!(bundle.exists());

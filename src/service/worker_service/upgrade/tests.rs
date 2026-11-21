@@ -30,6 +30,8 @@ struct Host {
 }
 const OPTIONS: Options = Options {
     cancel_running: false,
+    all_submitters: false,
+    submitter: None,
     wait: Duration::ZERO,
     ready_timeout: Duration::from_secs(2),
 };
@@ -62,6 +64,7 @@ impl Host {
         let cluster = ClusterId::generate();
         let old = sha256_file(&old_exe).unwrap();
         let request = InstallRequest {
+            membership: None,
             system_user: false,
             schema: 1,
             cluster: cluster.clone(),

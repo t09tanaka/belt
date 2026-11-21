@@ -211,6 +211,8 @@ pub struct StartupReport {
 }
 
 pub struct Agent {
+    identity: Mutex<WorkerBootId>,
+    rekey_gate: std::sync::RwLock<()>,
     /// The fingerprint of the group key this worker signs with, as last
     /// read from its file. A connection watches it: one whose peer proved
     /// with a key this worker no longer accepts is closed.
@@ -584,6 +586,13 @@ impl Agent {
             .transpose()?
             .flatten();
         let agent = Arc::new(Agent {
+            identity: Mutex::new(if cfg.instance_id.is_some() {
+                cfg.advertised_boot().clone()
+            } else {
+                super::rekey::identity(&cfg.state_dir, &cfg.boot_id)
+                    .map_err(|e| invalid(e.to_string()))?
+            }),
+            rekey_gate: std::sync::RwLock::new(()),
             group_key: tokio::sync::watch::channel(String::new()).0,
             toolchains,
             cfg,
@@ -614,8 +623,22 @@ impl Agent {
         // The key this worker holds is recorded as a generation (the single
         // key of before the group is generation 1).
         agent.refresh_group_key();
+        agent.apply_rekey();
         for a in todo {
             agent.kick(&a);
+        }
+        // A crash during send-key must finish the handoff before hello can
+        // expose either identity. The same normal supervisor path stops work.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while super::rekey::pending(&agent.cfg.state_dir) {
+            agent.apply_rekey();
+            if std::time::Instant::now() >= deadline {
+                agent.shutdown();
+                return Err(invalid(
+                    "pending send-key has not finished stopping old attempts",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(25));
         }
         // Attempts that ended while no agent ran still hold a workspace.
         agent.cleanup_terminal(32);
@@ -1977,6 +2000,12 @@ impl Agent {
             return;
         }
         let _pass = Ticking(&self.ticking);
+        // The init resident supervises its agent only through this pass, so
+        // the key is refreshed here too: links proven with a discarded key
+        // must close on an init host as well. Its own in-process link is
+        // served by `serve_local_connection` and stays open.
+        self.apply_rekey();
+        self.refresh_group_key();
         self.supervise_attempts();
         self.cleanup_terminal(32);
     }
@@ -2025,6 +2054,7 @@ impl Agent {
             return;
         }
         let _pass = Ticking(&self.ticking);
+        self.apply_rekey();
         self.refresh_group_key();
         self.apply_control();
         self.reap_warmups();
@@ -2036,6 +2066,46 @@ impl Agent {
                 "",
                 json!({ "code": e.code, "message": e.message }),
             );
+        }
+    }
+
+    fn apply_rekey(self: &Arc<Self>) {
+        if super::rekey::pending(&self.cfg.state_dir) {
+            let _gate = self.rekey_gate.write().unwrap_or_else(|e| e.into_inner());
+            let result = (|| -> Result<(), ApiError> {
+                for rec in self.store.list_nonterminal().map_err(api)? {
+                    self.store
+                        .expire_lease(&rec.attempt_id, now())
+                        .map_err(api)?;
+                    self.kick(&rec.attempt_id);
+                }
+                if self.store.list_nonterminal().map_err(api)?.is_empty() {
+                    // Advertise the new identity before finish removes the
+                    // marker: a helper that sees the marker gone must never
+                    // find a connection still offered under the old identity.
+                    if let Some(next) =
+                        super::rekey::pending_identity(&self.cfg.state_dir, &self.cfg.boot_id)
+                            .map_err(|e| invalid(e.to_string()))?
+                    {
+                        *lock(&self.identity) = next;
+                    }
+                    super::rekey::finish(
+                        &self.cfg.state_dir,
+                        &self.cfg.group_key_path,
+                        &self.store,
+                    )
+                    .map_err(|e| invalid(e.to_string()))?;
+                    *lock(&self.identity) =
+                        super::rekey::identity(&self.cfg.state_dir, &self.cfg.boot_id)
+                            .map_err(|e| invalid(e.to_string()))?;
+                    self.refresh_group_key();
+                    self.group_key.send_modify(|_| {});
+                }
+                Ok(())
+            })();
+            if let Err(e) = result {
+                self.note_global("send_key_failed", "", json!({"code":e.code}));
+            }
         }
     }
 
@@ -2083,7 +2153,7 @@ impl Agent {
     /// collected (`None`: not readable now). An ephemeral worker ends itself
     /// on these.
     pub fn retirement(&self) -> (bool, Option<u64>, Option<u64>) {
-        let boot = self.cfg.advertised_boot();
+        let boot = &self.advertised_boot();
         let told = self.store.identity_retired_by_any(boot).unwrap_or(false);
         (
             told,
@@ -2092,7 +2162,23 @@ impl Agent {
         )
     }
 
-    /// The fingerprint of the current group key, for a connection to watch.
+    /// The identity currently published by this worker.
+    pub(crate) fn advertised_boot(&self) -> WorkerBootId {
+        lock(&self.identity).clone()
+    }
+
+    pub(crate) fn check_rekey(&self) -> Result<(), ApiError> {
+        if super::rekey::pending(&self.cfg.state_dir) {
+            Err(ApiError::new(
+                ErrorCode::Conflict,
+                "send-key is stopping the old worker identity",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Key switches and identity resets wake every member connection.
     pub fn group_key_changes(&self) -> tokio::sync::watch::Receiver<String> {
         self.group_key.subscribe()
     }
@@ -2113,7 +2199,7 @@ impl Agent {
         r: crate::wire::IdentityRetiredRequest,
     ) -> Result<crate::wire::IdentityRetiredResponse, ApiError> {
         if r.worker_id != self.cfg.worker_id
-            || &r.worker_boot_id != self.cfg.advertised_boot()
+            || r.worker_boot_id != self.advertised_boot()
             || Some(&r.coordinator_id) != store.member().as_ref()
         {
             return Err(ApiError::new(
@@ -2229,6 +2315,20 @@ impl Agent {
         session: Session,
         request: Request,
     ) -> Result<Response, ApiError> {
+        self.handle_identity(session, request, None)
+    }
+
+    pub(crate) fn handle_identity(
+        self: &Arc<Self>,
+        session: Session,
+        request: Request,
+        expected: Option<&WorkerBootId>,
+    ) -> Result<Response, ApiError> {
+        let _gate = self.rekey_gate.read().unwrap_or_else(|e| e.into_inner());
+        self.check_rekey()?;
+        if expected.is_some_and(|boot| boot != &self.advertised_boot()) {
+            return Err(invalid("connection belongs to the old worker identity"));
+        }
         request
             .ensure_current_schema()
             .map_err(|e| ApiError::new(ErrorCode::ProtocolIncompatible, e.to_string()))?;
@@ -2310,7 +2410,7 @@ impl Agent {
                 let max_epoch = store.max_coordinator_epoch().map_err(api)?;
                 let ident = crate::forecast::plan::Ident {
                     worker_id: self.cfg.worker_id.clone(),
-                    boot_id: self.cfg.advertised_boot().clone(),
+                    boot_id: self.advertised_boot(),
                     agent_epoch: self.epoch,
                     forecast_ttl_ms: self.cfg.forecast_ttl_ms,
                 };
@@ -2356,7 +2456,7 @@ impl Agent {
                     crate::wire::PreparationProbeResponse {
                         schema_version: SchemaVersion::CURRENT,
                         worker_id: self.cfg.worker_id.clone(),
-                        worker_boot_id: self.cfg.advertised_boot().clone(),
+                        worker_boot_id: self.advertised_boot(),
                         agent_epoch: self.epoch,
                         probe,
                     },
@@ -2536,7 +2636,7 @@ impl Agent {
             run_id: rec.run_id.clone(),
             task_id: rec.task_id.clone(),
             generation: rec.generation,
-            worker_boot_id: self.cfg.advertised_boot().clone(),
+            worker_boot_id: self.advertised_boot(),
             agent_epoch: self.epoch,
             state: rec.state,
             receipts: rec.receipts,
@@ -2958,7 +3058,7 @@ impl Agent {
         let max_epoch = store.max_coordinator_epoch().map_err(api)?;
         let ident = crate::forecast::plan::Ident {
             worker_id: self.cfg.worker_id.clone(),
-            boot_id: self.cfg.advertised_boot().clone(),
+            boot_id: self.advertised_boot(),
             agent_epoch: self.epoch,
             forecast_ttl_ms: self.cfg.forecast_ttl_ms,
         };
@@ -3120,7 +3220,7 @@ impl Agent {
             capabilities: self.capabilities(),
             schema_version: SchemaVersion::CURRENT,
             worker_id: self.cfg.worker_id.clone(),
-            worker_boot_id: self.cfg.advertised_boot().clone(),
+            worker_boot_id: self.advertised_boot(),
             agent_epoch: self.epoch,
             snapshot_digest: Digest::of_bytes(
                 format!("{}/{active}/{pending}", self.epoch.0).as_bytes(),
@@ -3192,6 +3292,83 @@ pub fn remove_dropped_attempts(
         store.forget_dropped_attempt(&id)?;
     }
     Ok(report)
+}
+
+/// The SSH helper holds agent.lock while the resident is absent. Stop through
+/// the same lease/supervisor recovery path; never infer that a PID is ours.
+pub(crate) fn interrupt_offline(
+    state: &Path,
+    worker: &WorkerId,
+    store: &WorkerStore,
+    deadline: std::time::Instant,
+) -> Result<(), ApiError> {
+    for rec in store.list_nonterminal().map_err(api)? {
+        if std::time::Instant::now() >= deadline {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                "send-key is still stopping old attempts; rerun send-key to continue",
+            ));
+        }
+        store.expire_lease(&rec.attempt_id, now()).map_err(api)?;
+        // A living supervisor observes the lease. Otherwise hold its lock
+        // while settling an unstarted attempt or recovering a recorded launch.
+        let Some(_owner) = SupervisorLock::try_acquire(state, &rec.attempt_id)
+            .map_err(|e| internal("supervisor lock", e))?
+        else {
+            continue;
+        };
+        if store
+            .get(&rec.attempt_id)
+            .map_err(api)?
+            .is_none_or(|r| r.termination.is_some())
+        {
+            continue;
+        }
+        if store.launches(&rec.attempt_id).map_err(api)?.is_empty() {
+            crate::supervisor::run::finalize(store, &rec.attempt_id, termination(None, None))
+                .map_err(|e| internal("settling old identity", e))?;
+            continue;
+        }
+        let path = state
+            .join("attempts")
+            .join(rec.attempt_id.as_str())
+            .join("supervise.json");
+        let file = crate::service::resident::secure_file(&path, false)
+            .map_err(|e| internal("supervisor spec", e))?;
+        let spec: crate::supervisor::spec::SuperviseSpec =
+            serde_json::from_reader(file).map_err(|e| internal("supervisor spec", e))?;
+        if spec.state_dir != state || &spec.worker_id != worker || spec.attempt_id != rec.attempt_id
+        {
+            return Err(invalid("supervisor spec does not name this attempt"));
+        }
+        // Recovery verifies recorded process identities before signalling.
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("send-key-recovery".into())
+            .spawn(move || {
+                // Keep ownership until recovery finishes, including after the helper's
+                // deadline. A later invocation resumes through the same durable state.
+                let _owner = _owner;
+                let _ = send.send(crate::supervisor::run::run(&spec));
+            })
+            .map_err(|e| internal("starting old identity recovery", e))?;
+        wait_recovery(receive, deadline)?.map_err(|e| internal("stopping old identity", e))?;
+    }
+    Ok(())
+}
+
+fn wait_recovery<T>(
+    receive: std::sync::mpsc::Receiver<T>,
+    deadline: std::time::Instant,
+) -> Result<T, ApiError> {
+    receive
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .map_err(|_| {
+            ApiError::new(
+                ErrorCode::Conflict,
+                "send-key is still stopping old attempts; rerun send-key to continue",
+            )
+        })
 }
 
 fn acquire_lock(cfg: &AgentConfig) -> Result<ProcessLock, ApiError> {
@@ -3273,4 +3450,18 @@ fn note(store: &WorkerStore, rec: &AcceptedAttempt, kind: &str, payload: Value) 
         &payload,
         now(),
     );
+}
+
+#[cfg(test)]
+mod rekey_deadline_tests {
+    #[test]
+    fn unfinished_recovery_returns_at_deadline_without_success() {
+        let (_send, receive) = std::sync::mpsc::channel::<()>();
+        let start = std::time::Instant::now();
+        let error = super::wait_recovery(receive, start + std::time::Duration::from_millis(10))
+            .unwrap_err();
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(error.message.contains("still stopping old attempts"));
+        assert!(error.message.contains("rerun send-key"));
+    }
 }

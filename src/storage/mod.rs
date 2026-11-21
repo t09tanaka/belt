@@ -39,6 +39,7 @@ pub use coordinator::{CiAttempt, CiTaskRow, WorkflowArtifact, WorkflowUpload};
 pub use coordinator::{LiveLogTarget, LogProgress, ResultDeleteClaim, ResultGcPage};
 pub use db::Db;
 pub use lock::ProcessLock;
+pub(crate) use worker::MembershipImage;
 pub use worker::{
     AcceptedAttempt, CancelOutcome, KeyGeneration, LaunchClaim, LeaseOutcome, LogPosition,
     MemberPin, NewAcceptance, ProcessIdentity, SubmitOutcome, WorkerStore, DEFAULT_ACK_WAIT_MS,

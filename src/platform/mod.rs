@@ -102,6 +102,50 @@ pub fn core_limit() -> (Option<u64>, Option<u64>) {
     (l.current, l.maximum)
 }
 
+/// The effective OS user's account name, independent of USER/LOGNAME.
+pub fn current_username() -> std::io::Result<String> {
+    let mut buffer = vec![0u8; 65536];
+    let mut record = std::mem::MaybeUninit::uninit();
+    let mut result = std::ptr::null_mut();
+    // libc stores the record's strings in the caller-owned buffer. Copy before drop.
+    let rc = unsafe {
+        libc::getpwuid_r(
+            rustix::process::geteuid().as_raw(),
+            record.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc));
+    }
+    if result.is_null() {
+        return Err(std::io::Error::other(
+            "current user has no account record; specify --ssh",
+        ));
+    }
+    let record = unsafe { record.assume_init() };
+    let name = unsafe { std::ffi::CStr::from_ptr(record.pw_name) };
+    name.to_str()
+        .map(str::to_owned)
+        .map_err(std::io::Error::other)
+}
+
+/// The OS hostname, without relying on shell environment variables.
+pub fn hostname() -> std::io::Result<String> {
+    let mut bytes = [0u8; 256];
+    // The buffer is writable for its full length; check termination before decoding.
+    if unsafe { libc::gethostname(bytes.as_mut_ptr().cast(), bytes.len()) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let end = bytes
+        .iter()
+        .position(|b| *b == 0)
+        .ok_or_else(|| std::io::Error::other("hostname too long"))?;
+    String::from_utf8(bytes[..end].to_vec()).map_err(std::io::Error::other)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

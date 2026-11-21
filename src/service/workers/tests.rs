@@ -23,6 +23,7 @@ struct FakeRemote {
     version: Option<(i32, String)>,
     log: Vec<String>,
     stdins: Vec<Vec<u8>>,
+    captured: Vec<u8>,
     /// Every `(binary, cluster)` the bridge check was asked about.
     bridges: Vec<String>,
     /// What the bridge answers instead of the installed worker's own identity.
@@ -109,6 +110,8 @@ impl Remote for FakeRemote {
         };
         let options = |cancel_running| Options {
             cancel_running,
+            all_submitters: false,
+            submitter: None,
             wait: Duration::ZERO,
             ready_timeout: Duration::from_secs(2),
         };
@@ -164,12 +167,13 @@ impl Remote for FakeRemote {
             assert!(shell.ends_with("worker-service install"));
             (Action::Install, false)
         } else {
-            let action = ["start", "stop", "drain", "resume"]
+            let action = ["start", "stop", "drain", "resume", "install"]
                 .into_iter()
                 .find(|a| shell.contains(&format!("'worker-service' '{a}'")))
                 .expect("a helper action");
             (
                 match action {
+                    "install" => Action::Install,
                     "start" => Action::Start,
                     "stop" => Action::Stop,
                     "drain" => Action::Drain,
@@ -198,7 +202,10 @@ impl Remote for FakeRemote {
             .unwrap();
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
-        Ok(Self::reply(result))
+        let output = Self::reply(result);
+        self.captured.extend_from_slice(&output.stdout);
+        self.captured.extend_from_slice(&output.stderr);
+        Ok(output)
     }
 }
 
@@ -243,6 +250,17 @@ impl World {
             expected_cluster: Some(ClusterId::generate()),
             managed_service: None,
         };
+        fs::create_dir_all(&spec.state_dir).unwrap();
+        crate::storage::CoordinatorStore::initialize_identity(
+            &spec.state_dir,
+            spec.expected_cluster.as_ref().unwrap(),
+            &crate::ids::CoordinatorId::generate(),
+            |stage| {
+                fs::rename(stage, spec.state_dir.join("coordinator.db"))?;
+                Ok(())
+            },
+        )
+        .unwrap();
         World {
             config: user_config_path(&env).unwrap(),
             remote: FakeRemote {
@@ -256,6 +274,7 @@ impl World {
                 version: None,
                 log: vec![],
                 stdins: vec![],
+                captured: vec![],
                 bridges: vec![],
                 bridge_answer: None,
                 bridge_fails: false,
@@ -352,6 +371,16 @@ fn add_install_stages_installs_starts_and_registers_last() {
         .iter()
         .all(|c| !c.contains(key.trim()) && !c.contains("mini-a")));
     assert_eq!(w.calls(), ["bootstrap"]);
+    let paths = WorkerPaths::resolve(&w.remote.env).unwrap();
+    for path in [&paths.journal, &paths.input] {
+        assert!(!fs::read_to_string(path).unwrap().contains(key.trim()));
+    }
+    assert!(!format!("{status:?}").contains(key.trim()));
+    for payload in &w.remote.stdins {
+        if let Ok(request) = serde_json::from_slice::<InstallRequest>(payload) {
+            assert!(!format!("{request:?}").contains(key.trim()));
+        }
+    }
 }
 
 #[test]
@@ -397,16 +426,16 @@ fn an_unreachable_host_is_an_unknown_outcome_and_registers_nothing() {
     let error = w.add("mini-a", Some("ci@h"), true).unwrap_err();
     assert_eq!(error.code, ErrorCode::CommunicationUnknown);
     assert!(!w.config_text().contains("mini-a"));
+    register(&w.env, "mini-a", "ci@h", None, false).unwrap();
     for action in [
         Lifecycle::Start,
         Lifecycle::Drain,
         Lifecycle::Resume,
         Lifecycle::Stop {
             cancel_running: true,
+            all_submitters: false,
         },
     ] {
-        w.remote.reachable = true;
-        w.add("mini-a", Some("ci@h"), false).ok();
         w.remote.reachable = false;
         assert_eq!(
             w.lifecycle("mini-a", action).unwrap_err().code,
@@ -629,9 +658,11 @@ fn an_ephemeral_worker_is_registered_and_never_installed_or_controlled() {
         Lifecycle::Resume,
         Lifecycle::Stop {
             cancel_running: false,
+            all_submitters: false,
         },
         Lifecycle::Stop {
             cancel_running: true,
+            all_submitters: false,
         },
     ] {
         let error = w.lifecycle("colab-1", action).unwrap_err();
@@ -640,8 +671,8 @@ fn an_ephemeral_worker_is_registered_and_never_installed_or_controlled() {
     }
     // Not one remote command was run for it.
     assert!(w.remote.log.is_empty() && w.remote.bridges.is_empty());
-    // A persistent worker stays one; a plain registration is not ephemeral.
-    w.add("mini-a", Some("ci@h"), false).unwrap();
+    // A persistent worker stays one; enrollment is not ephemeral.
+    w.add("mini-a", Some("ci@h"), true).unwrap();
     assert!(!registered(&w.env, "mini-a").unwrap().unwrap().ephemeral);
     assert!(
         !serde_json::to_value(w.add("mini-a", Some("ci@h"), false).unwrap())
@@ -666,6 +697,22 @@ fn an_ephemeral_worker_is_registered_and_never_installed_or_controlled() {
         .unwrap_err();
     assert_eq!(error.code, ErrorCode::InvalidInput);
     assert!(error.message.contains("--install"), "{}", error.message);
+}
+
+#[test]
+fn forget_preserves_the_members_remaining_wait() {
+    let message =
+        crate::coordinator::identity::ForgetRefusal::Waiting { remaining_ms: 1201 }.message();
+    let error = forget("mini-a", |_| {
+        Ok(crate::service::resident::Reply::ControlError {
+            error: ApiError::new(ErrorCode::Conflict, message.clone()),
+        })
+    })
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(error.message, message);
+    assert!(error.message.contains("2 seconds remaining"));
+    assert!(error.message.contains("group key changed"));
 }
 
 #[test]
@@ -769,15 +816,27 @@ fn add_validates_its_input() {
 }
 
 #[test]
-fn add_without_install_registers_only_and_refuses_a_changed_destination() {
+fn add_without_install_hands_over_membership_and_refuses_a_changed_destination() {
     let mut w = World::new();
+    w.add("mini-a", Some("ci@h"), true).unwrap();
+    fs::remove_file(&w.config).unwrap();
+    let calls = w.calls();
     let first = w.add("mini-a", Some("ci@h"), false).unwrap();
-    assert!(first.registered && !first.installed && first.status.is_none());
-    assert!(w.remote.log.is_empty());
+    assert!(first.registered && !first.installed && first.status.unwrap().membership_only);
+    assert_eq!(w.calls(), calls);
     assert_eq!(
         w.add("mini-a", Some("ci@other"), false).unwrap_err().code,
         ErrorCode::Conflict
     );
+}
+
+#[test]
+fn install_on_a_host_that_already_has_belt_does_not_leave_a_staged_binary() {
+    let mut w = World::new();
+    w.add("mini-a", Some("ci@h"), true).unwrap();
+    let again = w.add("mini-a", Some("ci@h"), true).unwrap();
+    assert!(again.status.unwrap().membership_only);
+    assert!(!w.remote.staged().exists());
 }
 
 #[test]
@@ -801,6 +860,7 @@ fn install_then_stop_then_start_on_one_host() {
             "mini-a",
             Lifecycle::Stop {
                 cancel_running: false,
+                all_submitters: false,
             },
         )
         .unwrap();
@@ -823,6 +883,7 @@ fn drain_and_resume_toggle_placement_and_cancel_running_stops_the_service() {
             "mini-a",
             Lifecycle::Stop {
                 cancel_running: true,
+                all_submitters: false,
             },
         )
         .unwrap();
@@ -845,7 +906,7 @@ fn lifecycle_needs_a_registered_worker_and_an_answer_for_that_worker() {
     );
     w.add("mini-a", Some("ci@h"), true).unwrap();
     // Another registration pointing at the same host must not accept mini-a's answer.
-    w.add("mini-b", Some("ci@h"), false).unwrap();
+    register(&w.env, "mini-b", "ci@h", None, false).unwrap();
     assert_eq!(
         w.lifecycle("mini-b", Lifecycle::Drain).unwrap_err().code,
         ErrorCode::Conflict
@@ -887,13 +948,30 @@ fn helper_commands_are_fixed_strings_without_names_or_paths() {
         &digest,
         Lifecycle::Stop {
             cancel_running: true,
+            all_submitters: false,
         },
         600,
+        None,
     );
     assert!(stop.contains("'worker-service' 'stop' '--wait-secs' '600' '--cancel-running'"));
     assert!(stop.contains(&format!("belt-{digest}")));
     assert!(stop.contains("exec 'belt'"));
-    let plain = helper_command(None, &digest, Lifecycle::Drain, 600);
+    let id = crate::ids::CoordinatorId::generate();
+    let all = helper_command(
+        None,
+        &digest,
+        Lifecycle::Stop {
+            cancel_running: false,
+            all_submitters: true,
+        },
+        600,
+        Some(&id),
+    );
+    assert!(all.contains(&format!(
+        "'--wait-secs' '600' '--all-submitters' '--submitter' '{id}'"
+    )));
+    let plain = helper_command(None, &digest, Lifecycle::Drain, 600, Some(&id));
+    assert!(!plain.contains("--submitter"));
     assert!(!plain.contains("--cancel-running"));
     assert!(stage_command(&digest).contains(&format!("belt-{digest}.part")));
     assert!(install_command(&digest).ends_with("worker-service install"));
@@ -901,6 +979,8 @@ fn helper_commands_are_fixed_strings_without_names_or_paths() {
 
 fn status_with(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
     Status {
+        membership_only: false,
+        coordinator_id: None,
         system_user: false,
         worker_id: WorkerId::parse("mini-a").unwrap(),
         cluster: ClusterId::generate(),
@@ -923,6 +1003,7 @@ fn status_with(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
 fn a_command_reports_only_the_state_the_host_showed() {
     let stop = Lifecycle::Stop {
         cancel_running: false,
+        all_submitters: false,
     };
     let code = |a, s: &Status| check_outcome(a, s).map_err(|e| e.code);
     assert_eq!(
@@ -974,7 +1055,8 @@ fn the_sentence_matches_what_happened() {
         describe(
             "w",
             Lifecycle::Stop {
-                cancel_running: true
+                cancel_running: true,
+                all_submitters: false
             },
             &up
         ),
@@ -1109,6 +1191,7 @@ fn add_reports_what_the_running_resident_did() {
         },
     ] {
         let mut w2 = World::new();
+        w2.add("mini-a", Some("ci@h"), true).unwrap();
         let expected = format!("{answer:?}");
         let mut once = Some(answer);
         let result = add(
@@ -1147,7 +1230,7 @@ fn a_lifecycle_answer_from_another_cluster_is_refused() {
 #[test]
 fn helper_command_runs_a_registered_path_with_its_quoting() {
     let digest = "a".repeat(64);
-    let command = helper_command(Some("/w/my dir/belt"), &digest, Lifecycle::Resume, 5);
+    let command = helper_command(Some("/w/my dir/belt"), &digest, Lifecycle::Resume, 5, None);
     assert_eq!(
         command,
         "exec '/w/my dir/belt' 'worker-service' 'resume' '--wait-secs' '5'"
@@ -1288,6 +1371,24 @@ fn worker_offering(
         }
     });
     (parent, server)
+}
+
+#[tokio::test]
+async fn bridge_diagnostics_preserve_group_refusal_codes_without_key_material() {
+    let cluster = ClusterId::generate();
+    let features = crate::protocol::hello::SUPPORTED_FEATURES;
+    let (io, server) = worker_offering(&cluster, features);
+    let error = hello_on(io, &ClusterId::generate(), crate::group::test_key(), None)
+        .await
+        .unwrap_err();
+    assert_eq!(error, "the worker bridge refused hello: group_mismatch");
+    server.await.unwrap();
+    let (io, server) = worker_offering(&cluster, features);
+    let key = crate::secrets::key::ClusterKey::from_bytes(vec![42; 64]).unwrap();
+    let error = hello_on(io, &cluster, key, None).await.unwrap_err();
+    assert_eq!(error, "the worker bridge refused hello: group_key_mismatch");
+    assert!(!error.contains(&"2a".repeat(64)));
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -1651,7 +1752,7 @@ fn diff_of_every_worker_goes_on_after_one_that_fails_and_says_when_there_is_none
     assert_eq!(err.code, ErrorCode::NotFound);
     assert!(err.message.contains("no workers are registered"));
     w.add("mini-a", Some("ci@host-a"), true).unwrap();
-    w.add("mini-b", Some("ci@host-b"), false).unwrap();
+    register(&w.env, "mini-b", "ci@host-b", None, false).unwrap();
     quiet(&w);
     // The first answers nonsense; the second is measured.
     w.remote.env_queue.push_back(b"not json".to_vec());
@@ -2354,7 +2455,7 @@ impl Remote for Together {
 
 #[test]
 fn diff_of_every_worker_asks_them_at_the_same_time_and_keeps_the_order() {
-    let mut w = World::new();
+    let w = World::new();
     for (name, host) in [
         ("mini-a", "ci@host-a"),
         ("mini-b", "ci@host-b"),
@@ -2362,7 +2463,7 @@ fn diff_of_every_worker_asks_them_at_the_same_time_and_keeps_the_order() {
     ] {
         // Each entry is measured by Together below. Registering it needs no
         // service installation in the shared fixture home.
-        w.add(name, Some(host), false).unwrap();
+        register(&w.env, name, host, None, false).unwrap();
     }
     let mut measured = parent_report();
     measured.disk_free_bytes = Some(100 * 1024 * 1024 * 1024);
@@ -2565,7 +2666,7 @@ fn the_staging_commands_run_in_a_real_shell() {
 #[test]
 fn a_preconfigured_system_worker_asks_for_the_system_manager_and_never_installs_a_user_service() {
     let mut w = World::new();
-    w.add("mini-a", Some("ci@h"), false).unwrap();
+    register(&w.env, "mini-a", "ci@h", None, false).unwrap();
     let config = w.config_text() + "service_mode = \"system-user\"\n";
     fs::write(&w.config, &config).unwrap();
     // The host is an ordinary temp HOME with no administrator registration.
@@ -2580,4 +2681,193 @@ fn a_preconfigured_system_worker_asks_for_the_system_manager_and_never_installs_
     assert_eq!(w.config_text(), config);
     let paths = WorkerPaths::resolve(&w.remote.env).unwrap();
     assert!(!paths.services.exists());
+}
+
+// An installed, stopped service exercises enrollment without requiring a socket.
+// Running resident reuse is covered by tests/it/init.rs.
+fn stopped_member() -> World {
+    let mut w = World::new();
+    w.remote.fake.0.borrow_mut().fail_start = true;
+    assert!(w.add("mini-a", Some("ci@h"), true).is_err());
+    w.remote.fake.0.borrow_mut().fail_start = false;
+    let paths = WorkerPaths::resolve(&w.remote.env).unwrap();
+    let binding = paths.state.join("worker-binding.json");
+    fs::write(
+        &binding,
+        serde_json::to_vec(&(
+            1,
+            w.spec.expected_cluster.as_ref().unwrap(),
+            "mini-a",
+            "key-digest",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    fs::set_permissions(&binding, fs::Permissions::from_mode(0o600)).unwrap();
+    crate::storage::WorkerStore::open(&paths.state, &WorkerId::parse("mini-a").unwrap()).unwrap();
+    register(
+        &w.env,
+        "mini-a",
+        "ci@h",
+        paths.bridge_binary().to_str(),
+        false,
+    )
+    .unwrap();
+    w
+}
+
+#[test]
+fn membership_worker_only_replaces_caller_pin_and_keeps_service_and_binary() {
+    use crate::ids::CoordinatorId;
+    use crate::storage::WorkerStore;
+    let mut w = stopped_member();
+    let paths = WorkerPaths::resolve(&w.remote.env).unwrap();
+    let target = WorkerStore::open(&paths.state, &WorkerId::parse("mini-a").unwrap()).unwrap();
+    target
+        .for_member(&CoordinatorId::generate())
+        .replace_member_pin("local", 1)
+        .unwrap();
+    let input = fs::read(&paths.input).unwrap();
+    let journal = fs::read(&paths.journal).unwrap();
+    let calls = w.calls();
+    let result = w.add("mini-a", Some("ci@h"), false).unwrap();
+    assert!(result.status.as_ref().unwrap().coordinator_id.is_none());
+    let caller = crate::storage::CoordinatorStore::open_read_only(&w.spec.state_dir).unwrap();
+    assert_eq!(
+        target.members().unwrap(),
+        vec![("local".into(), caller.coordinator_id().to_string())]
+    );
+    assert!(!w.spec.worker_state_dir.join("worker.db").exists());
+    assert_eq!(fs::read(&paths.input).unwrap(), input);
+    assert_eq!(fs::read(&paths.journal).unwrap(), journal);
+    assert_eq!(w.calls(), calls);
+    assert_eq!(fs::read_dir(paths.services).unwrap().count(), 1);
+    let key = fs::read_to_string(&w.spec.cluster_key_path).unwrap();
+    assert!(w.remote.log.iter().all(|argv| !argv.contains(key.trim())));
+    assert!(!format!("{result:?}").contains(key.trim()));
+    assert!(!String::from_utf8_lossy(&w.remote.captured).contains(key.trim()));
+    assert!(!String::from_utf8(journal).unwrap().contains(key.trim()));
+}
+
+#[test]
+fn membership_other_group_requires_move_and_clears_old_authentication() {
+    use crate::ids::CoordinatorId;
+    use crate::storage::{KeyGeneration, WorkerStore};
+    let mut w = stopped_member();
+    let paths = WorkerPaths::resolve(&w.remote.env).unwrap();
+    let target = WorkerStore::open(&paths.state, &WorkerId::parse("mini-a").unwrap()).unwrap();
+    target
+        .for_member(&CoordinatorId::generate())
+        .pin_member("old-peer", 1)
+        .unwrap();
+    target.observe_group_key("old-current").unwrap();
+    target
+        .set_next_group_key(&KeyGeneration {
+            generation: 2,
+            fingerprint: "old-next".into(),
+        })
+        .unwrap();
+    fs::write(crate::group::next_key_path(&paths.key), b"old next key").unwrap();
+    let old = w.spec.expected_cluster.clone().unwrap();
+    w.spec.expected_cluster = Some(ClusterId::generate());
+    crate::storage::CoordinatorStore::move_group(
+        &w.spec.state_dir,
+        w.spec.expected_cluster.as_ref().unwrap(),
+    )
+    .unwrap();
+    fs::write(&w.spec.cluster_key_path, format!("{}\n", "cd".repeat(64))).unwrap();
+    let before = [
+        fs::read(&paths.input).unwrap(),
+        fs::read(&paths.journal).unwrap(),
+        fs::read(&paths.key).unwrap(),
+    ];
+    let pins = target.members().unwrap();
+    let error = w.add("mini-a", Some("ci@h"), true).unwrap_err();
+    assert!(error.message.contains(old.as_str()));
+    assert_eq!(target.members().unwrap(), pins);
+    assert_eq!(
+        [
+            fs::read(&paths.input).unwrap(),
+            fs::read(&paths.journal).unwrap(),
+            fs::read(&paths.key).unwrap()
+        ],
+        before
+    );
+    let result = w
+        .add_with(
+            "mini-a",
+            AddOptions {
+                install: true,
+                move_group: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        result.status.unwrap().cluster,
+        w.spec.expected_cluster.clone().unwrap()
+    );
+    assert_eq!(target.members().unwrap().len(), 1);
+    let (current, next) = target.group_keys().unwrap();
+    assert_eq!(current.unwrap().generation, 1);
+    assert!(next.is_none());
+    assert!(!crate::group::next_key_path(&paths.key).exists());
+    assert_eq!(fs::read_dir(paths.services).unwrap().count(), 1);
+}
+
+#[test]
+fn membership_move_refuses_foreign_live_attempts_and_uncollected_results() {
+    use crate::ids::CoordinatorId;
+    use crate::storage::WorkerStore;
+    for terminal in [false, true] {
+        let mut w = stopped_member();
+        let paths = WorkerPaths::resolve(&w.remote.env).unwrap();
+        let target = WorkerStore::open(&paths.state, &WorkerId::parse("mini-a").unwrap()).unwrap();
+        let db = rusqlite::Connection::open(paths.state.join("worker.db")).unwrap();
+        db.execute("INSERT INTO worker_attempt (coordinator_id, attempt_id, run_id, task_id, generation, payload_hash, coordinator_epoch, spec_json, state, termination_json, receipts_json, accepted_at_ms, terminal_at_ms)
+            VALUES (?1, 'attempt_test', 'run_test', 'task_test', 1, 'h', 1, '{}', ?2, ?3, '{}', 1, ?4)", rusqlite::params![CoordinatorId::generate().as_str(), if terminal { "terminal" } else { "active" }, terminal.then_some("{}"), terminal.then_some(2)]).unwrap();
+        let before = fs::read(&paths.journal).unwrap();
+        let pins = target.members().unwrap();
+        let old = w.spec.expected_cluster.clone().unwrap();
+        w.spec.expected_cluster = Some(ClusterId::generate());
+        crate::storage::CoordinatorStore::move_group(
+            &w.spec.state_dir,
+            w.spec.expected_cluster.as_ref().unwrap(),
+        )
+        .unwrap();
+        fs::write(&w.spec.cluster_key_path, format!("{}\n", "cd".repeat(64))).unwrap();
+        let error = w
+            .add_with(
+                "mini-a",
+                AddOptions {
+                    install: true,
+                    move_group: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert!(error.message.contains("live work"), "{error:?}");
+        assert!(error.message.contains(old.as_str()));
+        assert_eq!(fs::read(&paths.journal).unwrap(), before);
+        assert_eq!(target.members().unwrap(), pins);
+        assert_eq!(w.calls(), ["bootstrap"]);
+    }
+}
+
+mod rotate;
+
+#[test]
+fn removing_workers_preserves_full_subtables_and_rejects_ambiguous_split() {
+    let text = "[[workers]]\nid = 'keep'\nssh = 'keep'\n[workers.extra]\na = 'kept'\n[[workers.jobs]]\nname = 'kept-job'\n[[workers]]\nid = 'remove'\nssh = 'remove'\n[workers.extra]\nb = 'removed'\n[[workers.jobs]]\nname = 'removed-job'\n";
+    let edited = drop_worker_tables(text, &["remove".into()]).unwrap();
+    assert!(edited.contains("kept-job"));
+    assert!(!edited.contains("removed"));
+    // A quoted subtable header is valid TOML but outside the splitter's grammar.
+    let crafted = text.replace("[workers.extra]", "[workers . extra]");
+    assert!(drop_worker_tables(&crafted, &["remove".into()]).is_err());
+    let world = World::new();
+    let path = user_config_path(&world.env).unwrap();
+    fs::write(&path, &crafted).unwrap();
+    assert!(remove_registrations(&world.env, &["remove".into()]).is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), crafted);
 }

@@ -1097,3 +1097,141 @@ async fn a52_the_window_is_one_budget_over_every_member_and_a_refused_submit_lea
     let w = window_of(&a).await;
     assert_eq!((w.limit, w.used, w.own, w.foreign), (2, 0, 0, 0));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_key_helper_stops_all_members_work_and_changes_identity_even_for_same_key() {
+    send_key_resets(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn send_key_helper_also_stops_work_when_the_resident_is_absent() {
+    send_key_resets(true).await;
+}
+
+async fn send_key_resets(offline: bool) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let f = fx();
+    f.admit_commands(2);
+    let mut agent = f.start("boot-1");
+    let main = member("main");
+    let sub = member("sub");
+    let first = dial(&f, &agent, &main).await.unwrap();
+    let old_boot = first.worker.worker_boot_id.clone();
+    let second = dial(&f, &agent, &sub).await.unwrap();
+    let mut attempts = Vec::new();
+    for (m, client, tag) in [
+        (&main, &first.client, "send-main"),
+        (&sub, &second.client, "send-sub"),
+    ] {
+        let (script, started, _) = until_released(&f, tag);
+        let attempt = AttemptId::generate();
+        call(client, request_of(m, &attempt, &payload(&script)))
+            .await
+            .unwrap();
+        wait_for("old identity command to start", || {
+            if started.exists() {
+                return true;
+            }
+            assert!(
+                f.rec(&attempt).termination.is_none(),
+                "attempt ended before send-key: {:?}",
+                f.store().events_of_attempt(&attempt, 100).unwrap()
+            );
+            false
+        });
+        attempts.push(attempt);
+    }
+    let home = f.path("helper-home");
+    std::fs::create_dir_all(&home).unwrap();
+    let env = BTreeMap::from([("HOME".into(), home.display().to_string())]);
+    let paths = belt::service::worker_service::Paths::resolve(&env).unwrap();
+    std::fs::create_dir_all(paths.input.parent().unwrap()).unwrap();
+    std::fs::set_permissions(
+        paths.input.parent().unwrap(),
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let spec = belt::service::worker::WorkerSpec {
+        schema: 1,
+        expected_cluster: f.cluster.clone(),
+        worker_id: f.worker.clone(),
+        state_dir: f.state(),
+        cluster_key_path: agent.config().group_key_path.clone(),
+        executable: PathBuf::from(env!("CARGO_BIN_EXE_belt")),
+        env,
+        config: "schema_version=1\n".into(),
+    };
+    std::fs::write(&paths.input, serde_json::to_vec(&spec).unwrap()).unwrap();
+    std::fs::set_permissions(&paths.input, std::fs::Permissions::from_mode(0o600)).unwrap();
+    if offline {
+        agent.shutdown();
+    }
+    let ticking = agent.clone();
+    let (stop, mut stopped) = tokio::sync::watch::channel(false);
+    let ticker = tokio::spawn(async move {
+        loop {
+            tokio::select! { _ = stopped.changed() => break, _ = tokio::time::sleep(Duration::from_millis(25)) => {} }
+            if offline {
+                continue;
+            }
+            let ticking = ticking.clone();
+            tokio::task::spawn_blocking(move || ticking.supervise())
+                .await
+                .unwrap();
+        }
+    });
+    let mut previous = old_boot;
+    for key in [other_key(), other_key()] {
+        let request = serde_json::json!({"cluster":f.cluster,"member":f.worker,"action":{"action":"SendKey","key":key.as_bytes()}});
+        let mut child = Command::new(env!("CARGO_BIN_EXE_belt"))
+            .arg("group-rotate-helper")
+            .env_clear()
+            .env("HOME", &home)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(&serde_json::to_vec(&request).unwrap())
+            .unwrap();
+        let out = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        if offline {
+            agent = f.start_with(agent.config().clone());
+        }
+        let new_member = Member {
+            key: key.clone(),
+            ..main.clone()
+        };
+        let connected = dial(&f, &agent, &new_member).await.unwrap();
+        assert_ne!(previous, connected.worker.worker_boot_id);
+        assert!(connected
+            .worker
+            .worker_boot_id
+            .as_str()
+            .starts_with("boot-1."));
+        previous = connected.worker.worker_boot_id;
+        if offline {
+            agent.shutdown();
+        }
+        for attempt in &attempts {
+            assert_eq!(
+                f.rec(attempt).termination.unwrap().outcome(),
+                Outcome::Interrupted
+            );
+        }
+    }
+    let _ = stop.send(true);
+    ticker.await.unwrap();
+}

@@ -9,7 +9,7 @@ use crate::results::{CollectConfig, ResultStore};
 use crate::scheduler::measured::MeasuredCosts;
 use crate::state::{AttemptState, Observation, Receipts, Termination};
 use crate::storage::CoordinatorStore;
-use crate::worker::{agent::Agent, serve::serve_connection};
+use crate::worker::{agent::Agent, serve::serve_local_connection};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -389,13 +389,18 @@ struct CapturedInputs {
     transfer: Arc<Mutex<()>>,
     sources: crate::source::SourceStore,
     vault: crate::secrets::vault::Vault,
-    key: crate::secrets::key::ClusterKey,
+    key_path: std::path::PathBuf,
     env: std::collections::BTreeMap<String, String>,
     parent_state: std::path::PathBuf,
     local_worker: WorkerId,
 }
 
 impl CapturedInputs {
+    // Keep only the path: a switch discards the previous group key.
+    fn current_key(&self) -> crate::secrets::Result<crate::secrets::key::ClusterKey> {
+        crate::secrets::key::load(&self.key_path)
+    }
+
     /// Validate the original run binding and retained bundle without capture.
     fn validate_retry(
         &self,
@@ -456,7 +461,13 @@ impl CapturedInputs {
             return Ok(false);
         }
         self.vault
-            .load(run, &manifest.secret_files, &self.key)
+            .load(
+                run,
+                &manifest.secret_files,
+                &self
+                    .current_key()
+                    .map_err(|_| StorageError::SecretUnavailable)?,
+            )
             .map_err(|_| StorageError::SecretUnavailable)?;
         Ok(!manifest.secret_files.is_empty())
     }
@@ -477,6 +488,8 @@ pub struct Resident {
     worker_id: WorkerId,
     listener: UnixListener,
     worker_connection: tokio::task::JoinHandle<()>,
+    agent_listener: super::worker::AgentListener,
+    agent_permits: Arc<Semaphore>,
     client: Client,
     heartbeat: Duration,
     collection_interval: Duration,
@@ -593,7 +606,7 @@ impl StartupParts {
             transfer: Arc::new(Mutex::new(())),
             sources: crate::source::SourceStore::open(&inputs.state_dir)?,
             vault: crate::secrets::vault::Vault::open(&inputs.state_dir)?,
-            key: crate::secrets::key::load(&inputs.worker.cluster_key_path)?,
+            key_path: inputs.worker.cluster_key_path.clone(),
             env: inputs.worker.env.clone(),
             parent_state: inputs.state_dir.clone(),
             local_worker: worker_id.clone(),
@@ -655,24 +668,31 @@ impl Drop for Startup {
 async fn connect_local(
     startup: &Startup,
     config: &ResolvedConfig,
+    permits: Arc<Semaphore>,
 ) -> anyhow::Result<(
+    super::worker::AgentListener,
     UnixListener,
     tokio::task::JoinHandle<()>,
     crate::protocol::Client,
     Arc<crate::coordinator::InputGate>,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
+    let agent_listener = super::worker::AgentListener::bind(
+        &parts.agent.config().state_dir,
+        &parts.cluster,
+        &parts.worker_id,
+    )?;
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
     let (parent, worker) = UnixStream::pair()?;
     let worker_agent = parts.agent.clone();
     let cluster = parts.cluster.clone();
     let server_cluster = cluster.clone();
     let worker_connection = tokio::spawn(async move {
-        let _ = serve_connection(
+        let _ = serve_local_connection(
             worker_agent,
             Io::from_stream(worker),
             server_cluster,
-            Arc::new(Semaphore::new(64)),
+            permits,
         )
         .await;
     });
@@ -728,7 +748,13 @@ async fn connect_local(
         worker_connection.abort();
         anyhow::bail!(e.message);
     }
-    Ok((listener, worker_connection, worker_client, input_gate))
+    Ok((
+        agent_listener,
+        listener,
+        worker_connection,
+        worker_client,
+        input_gate,
+    ))
 }
 
 impl Resident {
@@ -770,14 +796,18 @@ impl Resident {
                 .map(|parts| Startup { parts: Some(parts) })
         })
         .await??;
-        let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection, worker_client, input_gate) = match connected {
-            Ok(value) => value,
-            Err(e) => {
-                tokio::task::spawn_blocking(move || startup.cleanup()).await?;
-                return Err(e);
-            }
-        };
+        let agent_permits = Arc::new(Semaphore::new(
+            crate::worker::serve::MAX_CONCURRENT_REQUESTS,
+        ));
+        let connected = connect_local(&startup, config, agent_permits.clone()).await;
+        let (agent_listener, listener, worker_connection, worker_client, input_gate) =
+            match connected {
+                Ok(value) => value,
+                Err(e) => {
+                    tokio::task::spawn_blocking(move || startup.cleanup()).await?;
+                    return Err(e);
+                }
+            };
         let parts = startup.parts.take().expect("prepared startup");
 
         Ok(Self {
@@ -794,6 +824,8 @@ impl Resident {
             worker_id: parts.worker_id,
             listener,
             worker_connection,
+            agent_listener,
+            agent_permits,
             client: Client {
                 socket: parts.socket,
                 cluster_id: parts.cluster,
@@ -820,6 +852,7 @@ impl Resident {
         let mut loops = JoinSet::new();
         // Connection failures stay inside each owner and never terminate the resident.
         let mut remotes = JoinSet::new();
+        let mut agent_connections = JoinSet::new();
         let mut dialed = BTreeSet::new();
         for worker in self.remote_config.workers.clone() {
             dialed.insert(worker.id.clone());
@@ -966,6 +999,10 @@ impl Resident {
                     let _ = answer.send(reply);
                 },
                 ended = requests.join_next(), if !requests.is_empty() => { if let Some(Err(e)) = ended { failure = Some(anyhow::Error::from(e)); break; } },
+                Some(_) = agent_connections.join_next(), if !agent_connections.is_empty() => {},
+                incoming = self.agent_listener.accept(self.agent.clone(), self.client.cluster_id.clone(), self.agent_permits.clone()) => {
+                    match incoming { Ok(connection) => { agent_connections.spawn(connection); }, Err(e) => { failure = Some(e.into()); break; } }
+                },
                 conn = self.listener.accept() => {
                     let (stream, _) = match conn { Ok(c) => c, Err(e) => { failure = Some(e.into()); break; } };
                     if stream.peer_cred().map(|peer| peer.uid()).ok() != Some(uid()) { continue; }
@@ -986,6 +1023,8 @@ impl Resident {
                 }
             }
         }
+        agent_connections.abort_all();
+        while agent_connections.join_next().await.is_some() {}
         *admission.lock().await = true;
         let _ = stop.send(true);
         while let Some(result) = requests.join_next().await {
@@ -1014,9 +1053,15 @@ impl Resident {
         let _ = tokio::task::spawn_blocking(move || costs.drain()).await;
         // No cancellation or terminal write: supervisors keep running, and a
         // restarted owner adopts the same durable attempts.
+        self.worker_connection.abort();
+        // Both transports use the same request permits. Blocking requests must
+        // finish before the shared agent releases its ownership lock.
+        let _drained = self
+            .agent_permits
+            .acquire_many(crate::worker::serve::MAX_CONCURRENT_REQUESTS as u32)
+            .await?;
         let agent = self.agent.clone();
         tokio::task::spawn_blocking(move || agent.shutdown()).await?;
-        self.worker_connection.abort();
         match failure {
             // Another loop may meet the missing files before the heartbeat
             // does; without the directory that is the same clean exit.
@@ -1550,9 +1595,11 @@ async fn handle(
                             .manifest(&id)?
                             .ok_or_else(|| anyhow::anyhow!("source unavailable"))?;
                         crate::source::store::verify_manifest(&manifest)?;
-                        capture
-                            .vault
-                            .load(&run, &manifest.secret_files, &capture.key)?;
+                        capture.vault.load(
+                            &run,
+                            &manifest.secret_files,
+                            &capture.current_key()?,
+                        )?;
                         Ok((
                             Digest::parse(&manifest.manifest_digest).or_else(|_| {
                                 Digest::parse(&format!("sha256:{}", manifest.manifest_digest))
@@ -1776,7 +1823,7 @@ pub(super) fn reject_symlinks(path: &Path) -> io::Result<()> {
 mod tests;
 
 /// Open private regular files without following a link or blocking on a FIFO.
-pub(super) fn secure_file(path: &Path, writable: bool) -> io::Result<File> {
+pub(crate) fn secure_file(path: &Path, writable: bool) -> io::Result<File> {
     validate_components(path)?;
     let file = OpenOptions::new()
         .read(true)

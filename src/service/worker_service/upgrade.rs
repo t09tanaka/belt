@@ -599,6 +599,8 @@ pub(super) fn unsettled_status(paths: &Paths, journal: &Journal) -> anyhow::Resu
         .context("service was never installed")?;
     let current = Control::effective(&paths.state);
     Ok(Status {
+        membership_only: false,
+        coordinator_id: None,
         system_user: journal.system_user.is_some(),
         worker_id: journal.worker_id.clone(),
         cluster: journal.cluster.clone(),

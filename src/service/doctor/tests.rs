@@ -591,6 +591,8 @@ fn one_engine_reached_from_two_hosts_fails_on_both() {
 
 fn status(loaded: Option<bool>, ready: bool, draining: bool) -> Status {
     Status {
+        membership_only: false,
+        coordinator_id: None,
         system_user: false,
         worker_id: WorkerId::parse("mini-a").unwrap(),
         cluster: ClusterId::generate(),
@@ -1119,6 +1121,7 @@ fn a_worker_host_is_viewed_through_its_recorded_service_environment() {
     // Nothing installed: there is no service to look at.
     assert!(service_view(&env, fake.clone()).is_err());
     let request = InstallRequest {
+        membership: None,
         system_user: false,
         schema: 1,
         cluster: ClusterId::generate(),
@@ -1939,4 +1942,36 @@ fn doctor_reports_a_mismatch_between_registered_and_installed_service_modes() {
     let reachable = of(&report, "mini-a", "reachable");
     assert_eq!(reachable.level, Level::Fail);
     assert!(reachable.detail.contains("installed service mode differs"));
+}
+
+#[test]
+fn removed_members_warn_without_registration_and_remain_after_failed_probe() {
+    let mut w = World::new(&[("gone", "ci@gone.local", true)]);
+    fs::write(
+        w.host.home.join(".config/belt/config.toml"),
+        "schema_version=1\n",
+    )
+    .unwrap();
+    let path = w.spec.worker_state_dir.join("removed-members.json");
+    fs::write(
+        &path,
+        r#"{"gone":{"removed_at_ms":1,"ssh":"ci@gone.local"},"legacy":2}"#,
+    )
+    .unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let report = w.run();
+    let warning = of(&report, "gone", "removed_member_ssh_reachable");
+    assert_eq!(warning.level, Level::Notice);
+    assert!(text(&report).contains("authorized_keys"));
+    assert!(serde_json::to_string(&report)
+        .unwrap()
+        .contains(&warning.id));
+    assert_eq!(w.remote.shells, ["true"]);
+    w.remote.hosts.insert("ci@gone.local".into(), None);
+    let report = w.run();
+    assert!(!report.checks.iter().any(|c| c.host == "gone"));
+    assert!(of(&report, "legacy", "removed_member_ssh_unknown")
+        .detail
+        .contains("cannot be checked"));
+    assert!(path.exists());
 }

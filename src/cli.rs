@@ -40,7 +40,11 @@ pub enum Command {
     #[command(hide = true)]
     Daemon(DaemonArgs),
     /// Configure the coordinator and the local worker.
-    Init,
+    Init {
+        /// Member name (defaults to the reduced short hostname).
+        #[arg(long)]
+        name: Option<String>,
+    },
     /// Run CI for the project.
     Ci(CiArgs),
     /// Run one command and wait for its result.
@@ -71,6 +75,16 @@ pub enum Command {
     Estimate(EstimateArgs),
     /// Check the setup.
     Doctor,
+    /// Show this group's identity, key generations and configured members.
+    Group {
+        #[command(subcommand)]
+        command: Option<GroupSub>,
+    },
+    /// Enroll a joining member using a bounded stdin request (internal).
+    #[command(hide = true)]
+    GroupJoinHelper,
+    #[command(hide = true)]
+    GroupRotateHelper,
     /// Manage workers.
     Workers(WorkersArgs),
     /// Run as a worker (internal).
@@ -82,6 +96,27 @@ pub enum Command {
     /// Supervise one attempt as its own process (internal).
     #[command(hide = true)]
     Supervise(SuperviseArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GroupSub {
+    /// Send the current key and regenerate the member worker identity, stopping its live attempts.
+    SendKey { member: String },
+    /// Distribute and switch to a new group key, or resume an interrupted rotation.
+    RotateKey {
+        #[arg(long)]
+        remove: Vec<String>,
+        #[arg(long)]
+        skip: Vec<String>,
+    },
+    /// Join through an existing member, registering both directions.
+    Join {
+        existing_member_ssh: String,
+        #[arg(long)]
+        ssh: Option<String>,
+        #[arg(long = "move")]
+        move_group: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -248,6 +283,9 @@ pub enum WorkersSub {
         /// Install the worker over SSH.
         #[arg(long)]
         install: bool,
+        /// Move an idle member from another group.
+        #[arg(long = "move", conflicts_with = "ephemeral")]
+        move_group: bool,
         /// With `--install`: the build to send, for a worker whose OS or
         /// architecture differs from this machine's.
         #[arg(long, requires = "install", value_name = "PATH")]
@@ -269,6 +307,9 @@ pub enum WorkersSub {
         /// Stop immediately and cancel running work.
         #[arg(long)]
         cancel_running: bool,
+        /// Stop even while other members have live work on it.
+        #[arg(long)]
+        all_submitters: bool,
     },
     /// Upgrade a worker.
     Upgrade {
@@ -290,7 +331,7 @@ pub enum WorkersSub {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Declare an ephemeral worker gone: its attempts end as interrupted.
+    /// Forget a disconnected ephemeral worker or a rotated-out member after its lease and stop grace.
     Forget { name: String },
 }
 
@@ -304,6 +345,12 @@ pub struct WorkerServiceArgs {
     /// With `stop`: seconds to wait for accepted work to finish.
     #[arg(long, default_value_t = 600)]
     pub wait_secs: u64,
+    /// With `stop`: end other members' live work too.
+    #[arg(long)]
+    pub all_submitters: bool,
+    /// With `stop`: the coordinator id of the member that asked.
+    #[arg(long, value_parser = crate::ids::CoordinatorId::parse)]
+    pub submitter: Option<crate::ids::CoordinatorId>,
 }
 
 #[derive(Debug, Args)]
@@ -368,8 +415,8 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::ToolchainInstall { request, binding } = &cli.command {
         return crate::toolchain::preparation::helper_main(request, binding);
     }
-    if matches!(cli.command, Command::Init) {
-        return match crate::service::init::command() {
+    if let Command::Init { name } = &cli.command {
+        return match crate::service::init::command(name.as_deref()) {
             Ok(receipt) => {
                 if cli.json {
                     println!(
@@ -413,6 +460,33 @@ pub fn run(cli: Cli) -> i32 {
 
     if matches!(cli.command, Command::Doctor) {
         return crate::service::doctor::command(cli.json);
+    }
+    if let Command::Group { command } = &cli.command {
+        return match command {
+            None => crate::service::group::command(cli.json),
+            Some(GroupSub::SendKey { member }) => {
+                crate::service::group::rotate::send_key_command(member, cli.json)
+            }
+            Some(GroupSub::RotateKey { remove, skip }) => {
+                crate::service::group::rotate::command(remove, skip, cli.json)
+            }
+            Some(GroupSub::Join {
+                existing_member_ssh,
+                ssh,
+                move_group,
+            }) => crate::service::group::join::command(
+                existing_member_ssh,
+                ssh.as_deref(),
+                *move_group,
+                cli.json,
+            ),
+        };
+    }
+    if matches!(cli.command, Command::GroupRotateHelper) {
+        return crate::service::group::rotate::helper_command();
+    }
+    if matches!(cli.command, Command::GroupJoinHelper) {
+        return crate::service::group::join::helper_command();
     }
     if let Command::Estimate(args) = &cli.command {
         return crate::service::estimate::cli(args, cli.json);
@@ -474,6 +548,8 @@ pub fn run(cli: Cli) -> i32 {
             args.action,
             args.cancel_running,
             args.wait_secs,
+            args.all_submitters,
+            args.submitter.clone(),
         );
     }
     if matches!(&cli.command, Command::Workers(WorkersArgs { sub: None })) {

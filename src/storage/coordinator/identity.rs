@@ -156,6 +156,25 @@ impl CoordinatorStore {
         })
     }
 
+    /// Update a persistent member after reboot without retiring its attempts.
+    pub(crate) fn reboot_worker_identity(
+        &self,
+        worker: &WorkerId,
+        boot: &WorkerBootId,
+    ) -> Result<Admission> {
+        let (worker, boot) = (worker.to_string(), boot.to_string());
+        self.db.write(move |tx| {
+            if retired(tx, &worker, &boot)? {
+                return Ok(Admission::Retired);
+            }
+            tx.execute(
+                "UPDATE worker_identity SET boot_id = ?2 WHERE worker_id = ?1",
+                params![worker, boot],
+            )?;
+            Ok(Admission::Same)
+        })
+    }
+
     /// Whether `boot` was retired for `worker`.
     pub fn worker_identity_retired(&self, worker: &WorkerId, boot: &WorkerBootId) -> Result<bool> {
         let (worker, boot) = (worker.to_string(), boot.to_string());
@@ -216,35 +235,54 @@ impl CoordinatorStore {
         })
     }
 
-    /// A member was taken off the list: remember its name and when, for as
-    /// long as its machine may still be reachable over SSH (spec 24.2).
-    pub fn record_removed_member(&self, name: &WorkerId, at_ms: u64) -> Result<()> {
+    /// Remember removal and its SSH destination until explicitly forgotten.
+    /// A failed reachability probe must not discard this record (spec 24.2).
+    pub fn record_removed_member(
+        &self,
+        name: &WorkerId,
+        at_ms: u64,
+        ssh: Option<&str>,
+    ) -> Result<()> {
         let n = name.to_string();
+        let ssh = ssh.map(str::to_owned);
         self.db.write(move |tx| {
+            if !tx.column_exists(None, "removed_member", "ssh")? {
+                tx.execute("INSERT OR IGNORE INTO removed_member (name, removed_at_ms) VALUES (?1, ?2)", params![n, to_i64(at_ms)?])?;
+                return Ok(());
+            }
             tx.execute(
-                "INSERT OR IGNORE INTO removed_member (name, removed_at_ms) VALUES (?1, ?2)",
-                params![n, to_i64(at_ms)?],
+                "INSERT INTO removed_member (name, removed_at_ms, ssh) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET ssh=coalesce(excluded.ssh, removed_member.ssh)",
+                params![n, to_i64(at_ms)?, ssh],
             )?;
             Ok(())
         })
     }
 
     /// The removed members still remembered, by name.
-    pub fn removed_members(&self) -> Result<Vec<(String, u64)>> {
+    pub fn removed_members(&self) -> Result<Vec<(String, u64, Option<String>)>> {
         self.db.call(|c| {
-            let mut s =
-                c.prepare("SELECT name, removed_at_ms FROM removed_member ORDER BY name")?;
-            let rows = s.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?;
+            let mut s = c.prepare(if c.column_exists(None, "removed_member", "ssh")? {
+                "SELECT name, removed_at_ms, ssh FROM removed_member ORDER BY name"
+            } else {
+                "SELECT name, removed_at_ms, NULL FROM removed_member ORDER BY name"
+            })?;
+            let rows = s.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })?;
             let mut out = Vec::new();
             for row in rows {
-                let (name, at) = row?;
-                out.push((name, crate::storage::to_u64(at)?));
+                let (name, at, ssh) = row?;
+                out.push((name, crate::storage::to_u64(at)?, ssh));
             }
             Ok(out)
         })
     }
 
-    /// The removed member is not reachable any more (or is a member again):
+    /// Explicit workers forget:
     /// drop the record. Returns whether there was one.
     pub fn clear_removed_member(&self, name: &WorkerId) -> Result<bool> {
         let n = name.to_string();

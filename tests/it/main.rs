@@ -46,3 +46,7 @@ mod workers_lifecycle;
 mod workers_upgrade;
 
 mod top;
+
+mod group_join;
+
+mod group_rotate;

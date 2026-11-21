@@ -13,6 +13,8 @@ use std::path::PathBuf;
 
 const OPTIONS: Options = Options {
     cancel_running: false,
+    all_submitters: false,
+    submitter: None,
     wait: Duration::ZERO,
     ready_timeout: Duration::from_secs(2),
 };
@@ -278,6 +280,7 @@ impl World {
         fake.0.borrow_mut().state = paths.state.clone();
         let old = sha256_file(&old_exe).unwrap();
         let request = InstallRequest {
+            membership: None,
             system_user: false,
             schema: 1,
             cluster: cluster.clone(),
@@ -1342,6 +1345,8 @@ fn a_registration_without_a_binary_path_gains_it_after_the_check() {
 
 fn status(version: &str, from: Option<&str>) -> Status {
     Status {
+        membership_only: false,
+        coordinator_id: None,
         system_user: false,
         worker_id: WorkerId::parse("mini-a").unwrap(),
         cluster: ClusterId::generate(),

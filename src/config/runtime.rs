@@ -151,9 +151,9 @@ impl ResolvedConfig {
             .with_ci_discovery(discovery)
             .with_workflow_artifacts(workflow_artifacts),
         );
-        if ephemeral {
+        {
             use crate::coordinator::identity::Admission;
-            match coordinator.attach_ephemeral(id.clone(), &connected.worker.worker_boot_id, link.clone())
+            match coordinator.attach_identity(id.clone(), &connected.worker.worker_boot_id, link.clone(), ephemeral)
                 .await.map_err(|error| ApiError::new(ErrorCode::Internal, error.to_string()))? {
                 Admission::First | Admission::Same => {}
                 Admission::Retired => {
@@ -174,8 +174,6 @@ impl ResolvedConfig {
                 Admission::Conflict => return Err(ApiError::new(ErrorCode::Conflict,
                     "another identity holds this worker name; use workers forget once the previous worker is gone")),
             }
-        } else {
-            coordinator.attach(id.clone(), link.clone()).await;
         }
         Ok(link)
     }

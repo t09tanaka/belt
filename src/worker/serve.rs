@@ -37,11 +37,12 @@ pub enum ServeError {
 /// A probe ([`crate::protocol::ClientConfig::probe`]) names no coordinator:
 /// it is told who answers, nothing is recorded, and no request is served.
 pub fn admit(agent: &Agent, peer: &ProvenMember) -> Result<WorkerIdentity, ApiError> {
+    agent.check_rekey()?;
     let cfg = agent.config();
     let mut me = WorkerIdentity {
         capabilities: agent.capabilities(),
         worker_id: cfg.worker_id.clone(),
-        worker_boot_id: cfg.advertised_boot().clone(),
+        worker_boot_id: agent.advertised_boot(),
         agent_epoch: agent.agent_epoch(),
         profile: cfg.profile.clone(),
         profile_fingerprint: cfg.profile_fingerprint.clone(),
@@ -60,7 +61,7 @@ pub fn admit(agent: &Agent, peer: &ProvenMember) -> Result<WorkerIdentity, ApiEr
     let mismatch = |message: String| {
         Err(ApiError::group_refused(
             GroupRefusal::MemberIdentityMismatch,
-            message,
+            format!("{message}; choose a distinct member name with belt init --name when initializing a new host"),
         ))
     };
     match pin {
@@ -79,7 +80,7 @@ pub fn admit(agent: &Agent, peer: &ProvenMember) -> Result<WorkerIdentity, ApiEr
         }
     }
     if store
-        .identity_retired(cfg.advertised_boot())
+        .identity_retired(&agent.advertised_boot())
         .map_err(|e| failed("the retired identities", e))?
     {
         return Err(ApiError::group_refused(
@@ -127,6 +128,30 @@ pub async fn serve_connection_offering(
     permits: Arc<Semaphore>,
     more_features: &[&str],
 ) -> Result<(), ServeError> {
+    serve_proven(agent, io, cluster_id, permits, more_features, false).await
+}
+
+/// The init resident's in-process link to its own worker (a socketpair that
+/// never leaves the process). A group key switch does not close it: the
+/// proof guards links between machines, and the resident treats the end of
+/// this link as fatal. A new worker identity (send-key) still closes it.
+pub async fn serve_local_connection(
+    agent: Arc<Agent>,
+    io: Io,
+    cluster_id: ClusterId,
+    permits: Arc<Semaphore>,
+) -> Result<(), ServeError> {
+    serve_proven(agent, io, cluster_id, permits, &[], true).await
+}
+
+async fn serve_proven(
+    agent: Arc<Agent>,
+    io: Io,
+    cluster_id: ClusterId,
+    permits: Arc<Semaphore>,
+    more_features: &[&str],
+    in_process: bool,
+) -> Result<(), ServeError> {
     // The keys are read for each connection: after a switch the new key is
     // the one a peer must prove with. Without a readable key nothing is
     // answered, not even `hello`.
@@ -145,6 +170,7 @@ pub async fn serve_connection_offering(
                 format!("the group key cannot be read: {e}"),
             ))
         })?;
+    let connection_boot = agent.advertised_boot();
     let mut key_changes = agent.group_key_changes();
     key_changes.mark_unchanged();
     let admitting = agent.clone();
@@ -177,8 +203,11 @@ pub async fn serve_connection_offering(
         let next = tokio::select! {
             next = incoming.next() => next,
             changed = key_changes.changed() => {
-                if changed.is_err() {
+                if changed.is_err() || connection_boot != agent.advertised_boot() {
                     return Ok(());
+                }
+                if in_process {
+                    continue;
                 }
                 // The key was switched. A connection proven with a key this
                 // worker still accepts (the one that is current now) stays;
@@ -211,6 +240,7 @@ pub async fn serve_connection_offering(
         let agent = agent.clone();
         let negotiated_features = negotiated_features.clone();
         let session = session.clone();
+        let request_boot = connection_boot.clone();
         tokio::spawn(async move {
             let uses_workflow_artifacts = matches!(
                 &request,
@@ -344,7 +374,10 @@ pub async fn serve_connection_offering(
                     r.preparation_observations = None;
                 }
             }
-            let done = tokio::task::spawn_blocking(move || agent.handle(session, request)).await;
+            let done = tokio::task::spawn_blocking(move || {
+                agent.handle_identity(session, request, Some(&request_boot))
+            })
+            .await;
             let _ = match done {
                 Ok(Ok(mut response)) => {
                     if let crate::wire::Response::Inspect(r) = &mut response {

@@ -29,6 +29,7 @@ mod forget;
 pub mod identity;
 mod input_gate;
 mod link;
+pub(crate) mod member_contact;
 pub mod policy;
 mod prefetch;
 mod preparation;

@@ -119,7 +119,6 @@ impl Driver {
                 let page = captured.sources.vault_retention_page(
                     owner,
                     &captured.vault,
-                    &captured.key,
                     &mut self.vault,
                     sample.wall,
                     sample.mono,
@@ -270,7 +269,11 @@ mod tests {
                 transfer: Arc::new(Mutex::new(())),
                 sources: crate::source::SourceStore::open(&state).unwrap(),
                 vault: crate::secrets::vault::Vault::open(&state).unwrap(),
-                key: crate::secrets::key::ClusterKey::from_bytes(vec![7; 32]).unwrap(),
+                key_path: {
+                    let path = root.path().join("key");
+                    crate::secrets::key::init(&path).unwrap();
+                    path
+                },
                 env: BTreeMap::new(),
                 parent_state: state,
                 local_worker: WorkerId::parse("test").unwrap(),
@@ -297,7 +300,7 @@ mod tests {
                 &self.captured.sources,
                 &self.captured.vault,
                 &crate::secrets::capture::SecretInputs {
-                    key: &self.captured.key,
+                    key: &self.captured.current_key().unwrap(),
                     declared: &declared,
                 },
                 &run,
@@ -526,6 +529,50 @@ mod tests {
         }
     }
 
+    #[test]
+    fn retention_deletes_bundles_captured_before_key_switch() {
+        let f = Fixture::new();
+        let run = f.bind(true);
+        f.terminal(&run, true);
+        let source = f.captured.sources.source_of_run(&run).unwrap().unwrap();
+        let entries = f
+            .captured
+            .sources
+            .manifest(&source)
+            .unwrap()
+            .unwrap()
+            .secret_files;
+        std::fs::remove_file(&f.captured.key_path).unwrap();
+        crate::secrets::key::init(&f.captured.key_path).unwrap();
+        assert!(f
+            .captured
+            .vault
+            .load(&run, &entries, &f.captured.current_key().unwrap())
+            .is_err());
+        let mut driver = Driver::default();
+        for i in 0..12 {
+            let report = driver
+                .page(
+                    f.owner.store(),
+                    &f.captured,
+                    7,
+                    Sample {
+                        wall: 10_000 + i,
+                        mono: 10_000 + i,
+                        boot: Some("boot".into()),
+                    },
+                )
+                .unwrap();
+            assert_eq!(report.unknown, 0);
+        }
+        assert!(!f
+            .captured
+            .parent_state
+            .join("secrets")
+            .join(format!("{run}.json"))
+            .exists());
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn automatic_loop_registers_and_erases_only_closed_vault_copies() {
         let f = Fixture::new();
@@ -555,7 +602,7 @@ mod tests {
         let held = f
             .captured
             .vault
-            .load(&eligible, &entries, &f.captured.key)
+            .load(&eligible, &entries, &f.captured.current_key().unwrap())
             .unwrap();
         f.captured.retention_test.fast();
         let (stop, rx) = watch::channel(false);

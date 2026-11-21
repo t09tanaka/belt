@@ -40,6 +40,9 @@ pub fn admit(recorded: Option<&str>, presented: &str, retired: bool) -> Admissio
 /// Why `workers forget` is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ForgetRefusal {
+    Waiting {
+        remaining_ms: u64,
+    },
     /// The name is not registered.
     NotRegistered,
     /// A persistent worker comes back with its own record of its attempts.
@@ -49,16 +52,17 @@ pub enum ForgetRefusal {
 }
 
 impl ForgetRefusal {
-    pub fn message(self) -> &'static str {
+    pub fn message(self) -> String {
         match self {
+            ForgetRefusal::Waiting { remaining_ms } => return format!("group key changed since last contact; wait {} seconds remaining (lease plus TERM stop grace)", remaining_ms.div_ceil(1000)),
             ForgetRefusal::NotRegistered => "no such worker is registered",
             ForgetRefusal::NotEphemeral => {
-                "forget is only for an ephemeral worker (ephemeral = true); a persistent worker reports its own attempts when it returns"
+                "forget requires an ephemeral worker (ephemeral = true) or a disconnected member whose group key changed since last contact"
             }
             ForgetRefusal::Connected => {
                 "the worker is connected; forget declares a worker gone and is refused while it answers"
             }
-        }
+        }.to_string()
     }
 }
 

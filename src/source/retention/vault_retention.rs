@@ -1,7 +1,7 @@
 //! Explicit synchronous parent Vault deletion; no resident caller.
 use super::*;
 use crate::ids::RunId;
-use crate::secrets::{key::ClusterKey, vault::Vault};
+use crate::secrets::vault::Vault;
 use serde::{Deserialize, Serialize};
 
 /// Pinned before parent deletion is ever possible. An absent/replaced index
@@ -218,7 +218,6 @@ impl SourceStore {
         &self,
         owner: &crate::storage::CoordinatorStore,
         vault: &Vault,
-        key: &ClusterKey,
         cursor: &mut VaultCursor,
         wall: u64,
         mono: u64,
@@ -421,12 +420,7 @@ impl SourceStore {
                 budget -= 65536;
                 let binding = self.retention.exact_run_binding(&run, &source, &binding)?;
                 lease.reserve(&parsed, &mut budget, 2)?;
-                let claim = vault.claim_for_retention(
-                    &lease,
-                    &parsed,
-                    &validated.manifest.secret_files,
-                    key,
-                )?;
+                let claim = vault.claim_for_retention(&lease, &parsed)?;
                 ensure!(
                     owner.check_input_store(&self.retention.path, &self.retention.root)?
                         == identity,

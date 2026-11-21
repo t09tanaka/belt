@@ -143,7 +143,13 @@ async fn hello_on(
     })
     .await
     .map_err(|_| "the worker bridge did not answer hello in time".to_string())?
-    .map_err(|e| format!("the worker bridge refused hello: {e}"))?;
+    .map_err(|e| match e.group_refusal() {
+        Some(reason) => format!(
+            "the worker bridge refused hello: {}",
+            super::group::refusal_code(reason)
+        ),
+        None => format!("the worker bridge refused hello: {e}"),
+    })?;
     Ok(BridgeHello {
         cluster: connected.cluster_id,
         worker: connected.worker.worker_id,
@@ -395,7 +401,10 @@ pub fn both<A: Send, B: Send>(
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Lifecycle {
     Start,
-    Stop { cancel_running: bool },
+    Stop {
+        cancel_running: bool,
+        all_submitters: bool,
+    },
     Drain,
     Resume,
 }
@@ -425,6 +434,7 @@ pub fn helper_command(
     digest: &str,
     lifecycle: Lifecycle,
     wait_secs: u64,
+    submitter: Option<&crate::ids::CoordinatorId>,
 ) -> String {
     let mut words = vec![
         quote("worker-service"),
@@ -432,13 +442,21 @@ pub fn helper_command(
         quote("--wait-secs"),
         quote(&wait_secs.to_string()),
     ];
-    if matches!(
-        lifecycle,
-        Lifecycle::Stop {
-            cancel_running: true
+    if let Lifecycle::Stop {
+        cancel_running,
+        all_submitters,
+    } = lifecycle
+    {
+        if cancel_running {
+            words.push(quote("--cancel-running"));
         }
-    ) {
-        words.push(quote("--cancel-running"));
+        if all_submitters {
+            words.push(quote("--all-submitters"));
+        }
+        if let Some(id) = submitter {
+            words.push(quote("--submitter"));
+            words.push(quote(id.as_str()));
+        }
     }
     launch(binary, digest, &words.join(" "))
 }
@@ -602,6 +620,86 @@ pub fn registrations(env: &BTreeMap<String, String>) -> Result<Vec<Registered>, 
             ephemeral: w.ephemeral.unwrap_or(false),
         })
         .collect())
+}
+
+/// Remove only the named `[[workers]]` tables, atomically, keeping every other
+/// byte (comments and formatting included), like `register`.
+pub(super) fn remove_registrations(
+    env: &BTreeMap<String, String>,
+    names: &[String],
+) -> Result<(), ApiError> {
+    let (path, text) = read_user_config(env)?;
+    registrations(env)?;
+    let kept = drop_worker_tables(&text, names)?;
+    crate::config::parse::parse_user(&path.to_string_lossy(), &kept)
+        .map_err(|e| invalid(e.to_string()))?;
+    write_config(&path, &kept)
+}
+
+/// Split the text at table headers and drop each `[[workers]]` block whose
+/// `id` is named. Worker subtables stay with their preceding array element.
+fn drop_worker_tables(text: &str, names: &[String]) -> Result<String, ApiError> {
+    let mut blocks: Vec<String> = vec![String::new()];
+    for line in text.split_inclusive('\n') {
+        let header = line.trim_start();
+        if header.starts_with('[')
+            && !header.starts_with("[workers.")
+            && !header.starts_with("[[workers.")
+        {
+            blocks.push(String::new());
+        }
+        blocks.last_mut().expect("one block").push_str(line);
+    }
+    let mut out = String::new();
+    for block in blocks {
+        let header = block.lines().next().unwrap_or_default().trim();
+        if header.split('#').next().unwrap_or_default().trim() == "[[workers]]" {
+            let table: toml::Table = block.parse().map_err(|e| invalid(format!("{e}")))?;
+            if table
+                .get("workers")
+                .and_then(toml::Value::as_array)
+                .and_then(|workers| workers.first())
+                .and_then(|worker| worker.get("id"))
+                .and_then(toml::Value::as_str)
+                .is_some_and(|id| names.iter().any(|n| n == id))
+            {
+                continue;
+            }
+        }
+        out.push_str(&block);
+    }
+    let before: toml::Table = text.parse().map_err(|e| invalid(format!("{e}")))?;
+    verify_kept_workers(&before, &out, names)?;
+    Ok(out)
+}
+
+fn verify_kept_workers(
+    before: &toml::Table,
+    edited: &str,
+    names: &[String],
+) -> Result<(), ApiError> {
+    let after: toml::Table = edited.parse().map_err(|e| invalid(format!("{e}")))?;
+    let workers = |table: &toml::Table| {
+        table
+            .get("workers")
+            .and_then(toml::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let expected: Vec<_> = workers(before)
+        .into_iter()
+        .filter(|w| {
+            !w.get("id")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|id| names.iter().any(|n| n == id))
+        })
+        .collect();
+    if workers(&after) != expected {
+        return Err(invalid(
+            "workers list could not be edited in place; remove the entries by hand",
+        ));
+    }
+    Ok(())
 }
 
 /// Append one `[[workers]]` table, atomically, keeping every other byte.
@@ -773,19 +871,18 @@ fn hex(bytes: &[u8]) -> String {
 pub struct AddOptions<'a> {
     /// Install the worker over SSH.
     pub install: bool,
+    pub move_group: bool,
+    /// Permit group join to replace an initialized singleton at the target.
+    pub join_singleton: bool,
     /// Register an ephemeral worker (`ephemeral = true`).
     pub ephemeral: bool,
     /// The build to send instead of the parent's own binary (`--binary`).
     pub binary: Option<&'a Path>,
 }
 
-/// `workers add`. Without `--install` only the registration is written.
-/// With it, the parent stages its own binary, runs the helper's install on
-/// the worker host (resumable), proves the exact bridge the resident will use
-/// (absolute binary, `worker --stdio` over ssh, `hello` from the expected
-/// worker in the expected cluster), and registers the worker last, so a
-/// failed install leaves nothing registered. Re-running continues where it
-/// stopped. Finally a running resident is asked to dial the worker now.
+/// Enroll an existing member through its SSH helper; with `--install`, stage
+/// a helper that can also install a new worker. Register only after enrollment
+/// succeeds, then ask a running resident to reload the configuration.
 #[allow(clippy::too_many_arguments)]
 pub fn add(
     remote: &mut impl Remote,
@@ -799,7 +896,7 @@ pub fn add(
 ) -> Result<AddResult, ApiError> {
     check_name(name)?;
     let install = options.install;
-    if options.ephemeral && (install || options.binary.is_some()) {
+    if options.ephemeral && (install || options.binary.is_some() || options.move_group) {
         return Err(invalid(EPHEMERAL_NO_SERVICE));
     }
     if options.binary.is_some() && !install {
@@ -835,15 +932,17 @@ pub fn add(
     if existing.is_none() && spec.worker_id.as_str() == name {
         return Err(ApiError::new(
             ErrorCode::Conflict,
-            "the name belongs to the local worker",
+            "member_identity_mismatch: the name belongs to the local worker; choose a distinct name with belt init --name on a new host",
         ));
     }
-    let (status, binary) = if install {
+    let (status, binary) = if !ephemeral {
         let status = install_remote(
             remote,
             spec,
             options.binary.unwrap_or(exe),
             options.binary.is_some(),
+            options,
+            existing.as_ref().and_then(|e| e.binary.as_deref()),
             name,
             &target,
             existing
@@ -970,11 +1069,14 @@ fn ensure_staged(
     )))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn install_remote(
     remote: &mut impl Remote,
     spec: &Spec,
     ship: &Path,
     explicit_binary: bool,
+    options: AddOptions<'_>,
+    existing_binary: Option<&str>,
     name: &str,
     target: &SshTarget,
     system_user: bool,
@@ -986,10 +1088,27 @@ fn install_remote(
         .clone()
         .ok_or_else(|| invalid("the coordinator has no cluster identity; run init"))?;
     let cluster_expected = cluster.clone();
+    let caller = crate::storage::CoordinatorStore::open_read_only(&spec.state_dir)
+        .map_err(|e| internal(&e))?;
+    if caller.cluster_id() != &cluster {
+        return Err(invalid(
+            "coordinator group differs from its retained configuration",
+        ));
+    }
+
     let key = crate::secrets::key::load(&spec.cluster_key_path).map_err(|e| internal(&e))?;
     let digest = worker_service::sha256_file(ship).map_err(|e| internal(&e))?;
-    ensure_staged(remote, target, ship, &digest, explicit_binary)?;
+    if options.install {
+        ensure_staged(remote, target, ship, &digest, explicit_binary)?;
+    }
     let request = InstallRequest {
+        membership: Some(worker_service::Membership {
+            caller_name: spec.worker_id.clone(),
+            caller_id: caller.coordinator_id().clone(),
+            move_group: options.move_group,
+            join_singleton: options.join_singleton,
+            install: options.install,
+        }),
         system_user,
         schema: 1,
         cluster,
@@ -998,22 +1117,31 @@ fn install_remote(
         binary_sha256: digest.clone(),
     };
     let body = serde_json::to_vec(&request).map_err(|e| internal(&e))?;
+    let command = if options.install {
+        install_command(&digest)
+    } else {
+        launch(existing_binary, &digest, "'worker-service' 'install'")
+    };
     let out = remote
-        .run(
-            target,
-            &install_command(&digest),
-            &body,
-            Duration::from_secs(300),
-        )
+        .run(target, &command, &body, Duration::from_secs(300))
         .map_err(|m| ApiError::new(ErrorCode::CommunicationUnknown, m))?;
     let status = parse_reply(&out)?;
+    // The host already had belt: the staged copy was only for a first install.
+    if options.install && status.membership_only {
+        let _ = remote.run(
+            target,
+            &unstage_command(&digest),
+            &[],
+            Duration::from_secs(60),
+        );
+    }
     if status.system_user != system_user {
         return Err(ApiError::new(
             ErrorCode::Conflict,
             "installed service mode differs from the worker registration",
         ));
     }
-    if !status.ready || status.loaded != Some(true) {
+    if !status.membership_only && (!status.ready || status.loaded != Some(true)) {
         return Err(ApiError::new(
             ErrorCode::CommunicationUnknown,
             "the service was installed but the worker agent did not become ready; run workers add --install again to continue",
@@ -1025,25 +1153,45 @@ fn install_remote(
             "the worker did not report its installed binary path; nothing was registered",
         )
     })?;
-    // The capability check: the path and the transport the resident will use.
-    let (answered_cluster, answered_worker) = remote
-        .bridge_hello(target, &binary, &status.cluster)
-        .map_err(|m| {
-            ApiError::new(
-                ErrorCode::CommunicationUnknown,
-                format!(
+    if status.worker_id.as_str() != name || status.cluster != cluster_expected {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "the helper answered for a different worker or cluster; nothing was registered",
+        ));
+    }
+    // An initialized member's shared bridge belongs to the resident task;
+    // enrollment uses the authenticated SSH helper's current identity.
+    if status.coordinator_id.is_none() && status.ready {
+        // The capability check: the path and the transport the resident will use.
+        let (answered_cluster, answered_worker) = remote
+            .bridge_hello(target, &binary, &status.cluster)
+            .map_err(|m| {
+                ApiError::new(
+                    ErrorCode::CommunicationUnknown,
+                    format!(
                     "the worker bridge could not be started over ssh: {m}; nothing was registered"
                 ),
-            )
-        })?;
-    if answered_worker.as_str() != name
-        || answered_cluster != status.cluster
-        || status.cluster != cluster_expected
-    {
-        return Err(ApiError::new(
+                )
+            })?;
+        if answered_worker.as_str() != name
+            || answered_cluster != status.cluster
+            || status.cluster != cluster_expected
+        {
+            return Err(ApiError::new(
             ErrorCode::Conflict,
             "the worker bridge answered for a different worker or cluster; nothing was registered",
         ));
+        }
+    }
+    if let Some(coordinator) = &status.coordinator_id {
+        std::fs::create_dir_all(&spec.worker_state_dir).map_err(|e| internal(&e))?;
+        crate::storage::WorkerStore::open(&spec.worker_state_dir, &spec.worker_id)
+            .and_then(|store| {
+                store
+                    .for_member(coordinator)
+                    .replace_member_pin(name, crate::platform::wall_ms())
+            })
+            .map_err(|e| internal(&e))?;
     }
     Ok(status)
 }
@@ -1105,6 +1253,11 @@ pub fn lifecycle(
     let digest = worker_service::sha256_file(exe)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     let wait = STOP_WAIT_SECS;
+    // Which member asks decides whose live work blocks a stop. Unreadable:
+    // none is named and every member's work blocks it.
+    let caller = crate::storage::CoordinatorStore::open_read_only(&spec.state_dir)
+        .ok()
+        .map(|store| store.coordinator_id().clone());
     let timeout = match action {
         Lifecycle::Stop { .. } => Duration::from_secs(wait + 120),
         _ => Duration::from_secs(120),
@@ -1112,7 +1265,13 @@ pub fn lifecycle(
     let out = remote
         .run(
             &target,
-            &helper_command(registration.binary.as_deref(), &digest, action, wait),
+            &helper_command(
+                registration.binary.as_deref(),
+                &digest,
+                action,
+                wait,
+                caller.as_ref(),
+            ),
             &[],
             timeout,
         )
@@ -1958,6 +2117,7 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
             name,
             ssh,
             install,
+            move_group,
             binary,
             ephemeral,
         } => {
@@ -1975,6 +2135,8 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
                         ssh.as_deref(),
                         AddOptions {
                             install: *install,
+                            move_group: *move_group,
+                            join_singleton: false,
                             ephemeral: *ephemeral,
                             binary: binary.as_deref(),
                         },
@@ -2021,9 +2183,11 @@ pub fn command(sub: &WorkersSub, json: bool) -> Option<i32> {
         WorkersSub::Stop {
             name,
             cancel_running,
+            all_submitters,
         } => {
             let action = Lifecycle::Stop {
                 cancel_running: *cancel_running,
+                all_submitters: *all_submitters,
             };
             (name, action, lifecycle_of(name, action))
         }

@@ -14,7 +14,7 @@ use super::macos::{
 };
 use super::resident;
 use crate::{
-    ids::{ClusterId, WorkerId},
+    ids::{ClusterId, CoordinatorId, WorkerId},
     worker::control::{self, Control},
 };
 use anyhow::{ensure, Context};
@@ -28,6 +28,8 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+
+pub(crate) mod membership;
 
 const LIMIT: u64 = 262_144;
 const ENV: &[&str] = &[
@@ -69,9 +71,12 @@ pub enum Action {
 }
 
 /// What the parent sends on stdin for `install`. The key travels only here.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct InstallRequest {
+    /// Explicit membership handover by workers add; never written to the journal.
+    #[serde(default)]
+    pub membership: Option<Membership>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub system_user: bool,
     pub schema: u32,
@@ -83,8 +88,38 @@ pub struct InstallRequest {
     pub binary_sha256: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Membership {
+    pub caller_name: WorkerId,
+    pub caller_id: CoordinatorId,
+    pub move_group: bool,
+    /// group join may replace an idle, initialized singleton.
+    #[serde(default)]
+    pub join_singleton: bool,
+    pub install: bool,
+}
+
+impl std::fmt::Debug for InstallRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InstallRequest")
+            .field("system_user", &self.system_user)
+            .field("schema", &self.schema)
+            .field("cluster", &self.cluster)
+            .field("worker_id", &self.worker_id)
+            .field("key_file_text", &"[REDACTED]")
+            .field("binary_sha256", &self.binary_sha256)
+            .finish()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Status {
+    /// An existing member was enrolled without installing a service.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub membership_only: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coordinator_id: Option<CoordinatorId>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub system_user: bool,
     pub worker_id: WorkerId,
@@ -328,7 +363,56 @@ fn save_journal(paths: &Paths, journal: &Journal) -> anyhow::Result<()> {
 }
 
 fn require_journal(paths: &Paths) -> anyhow::Result<Journal> {
+    refuse_init_resident(paths)?;
     read_journal(paths)?.context("no worker is installed here; run workers add --install")
+}
+
+/// Legacy lifecycle operations must never resurrect the retired worker service.
+fn refuse_init_resident(paths: &Paths) -> anyhow::Result<()> {
+    ensure!(
+        !paths.config.join("init.json").try_exists()?,
+        "this host is managed by the init resident (init.json); manage that resident instead of worker-service"
+    );
+    Ok(())
+}
+
+pub(crate) struct Enrollment {
+    pub cluster: ClusterId,
+    pub worker_id: WorkerId,
+    pub env: BTreeMap<String, String>,
+    pub plan: policy::Plan,
+    pub receipt: macos::Receipt,
+}
+
+/// Caller holds the switch lock for the entire takeover.
+pub(crate) fn enrollment(paths: &Paths) -> anyhow::Result<Enrollment> {
+    let journal = require_journal(paths)?;
+    ensure!(
+        journal.switch.is_none() && !journal.drained_by_upgrade,
+        "finish the worker version switch before init"
+    );
+    let spec = super::worker::read_input(&paths.input)?;
+    ensure!(
+        spec.expected_cluster == journal.cluster
+            && spec.worker_id == journal.worker_id
+            && spec.state_dir == paths.state
+            && spec.cluster_key_path == paths.key,
+        "worker input differs from enrollment"
+    );
+    let plan = plan(paths, &journal)?;
+    let receipt = journal
+        .receipt
+        .clone()
+        .context("worker service receipt missing")?;
+    services(paths, &journal)?.verify(&receipt)?;
+    crate::secrets::key::load(&paths.key)?;
+    Ok(Enrollment {
+        cluster: journal.cluster,
+        worker_id: journal.worker_id,
+        env: journal.env,
+        plan,
+        receipt,
+    })
 }
 
 /// Create missing directories below `home` as 0700; refuse symlinks. The
@@ -776,13 +860,21 @@ pub fn install<L: Launcher>(
     crate::config::traffic::resolve(env).map_err(anyhow::Error::msg)?;
     let digest = sha256_file(current_exe)?;
     ensure!(
-        digest == request.binary_sha256,
+        request.membership.as_ref().is_some_and(|m| !m.install) || digest == request.binary_sha256,
         "the installing binary is not the one the parent sent"
     );
     // Validate before any file is published: a rejected key must leave nothing behind.
     let key_bytes = hex_decode(request.key_file_text.trim_end_matches('\n'))
         .context("cluster key is not lower-case hex")?;
     crate::secrets::key::ClusterKey::from_bytes(key_bytes).context("cluster key rejected")?;
+    // An unfinished `init` (journal without the published input) also takes
+    // this path and is refused there: no second service goes beside it.
+    if request.membership.is_some()
+        && (paths.config.join("coordinator.json").try_exists()?
+            || paths.config.join("init.json").try_exists()?)
+    {
+        return super::init::handover(env, request, launcher);
+    }
     let account = request
         .system_user
         .then(system_user::current_account)
@@ -791,7 +883,20 @@ pub fn install<L: Launcher>(
     private_dir(&paths.home, &paths.state)?;
     let _lock = switch_lock(&paths, true, LOCK_PATIENCE)?
         .context("a version switch is running on this host; retry installation when it finishes")?;
+    refuse_init_resident(&paths)?;
     let existing = read_journal(&paths)?;
+    if let Some(membership) = &request.membership {
+        if let Some(journal) = existing
+            .as_ref()
+            .filter(|j| j.receipt.is_some() && paths.state.join("worker-binding.json").is_file())
+        {
+            return membership::existing(&paths, journal, request, launcher, ready_timeout);
+        }
+        ensure!(
+            membership.install,
+            "no worker is installed here; use --install"
+        );
+    }
     if let Some(existing) = &existing {
         ensure!(
             existing.system_user == account && existing.cluster == request.cluster
@@ -902,6 +1007,9 @@ pub fn install<L: Launcher>(
     clear_cancel(&paths.state)?;
     ensure_started(&mut files, &mut launcher, &plan, &receipt)?;
     let ready = wait_ready(&paths.state, ready_timeout);
+    if request.membership.is_some() {
+        membership::pin(&paths.state, request)?;
+    }
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, ready)
 }
 
@@ -957,9 +1065,98 @@ pub fn start<L: Launcher>(
 /// launchctl change; an unreadable or uncertain state is an error.
 pub fn stop<L: Launcher>(
     env: &BTreeMap<String, String>,
+    launcher: L,
+    cancel_running: bool,
+    wait: Duration,
+) -> anyhow::Result<Status> {
+    stop_for(env, launcher, cancel_running, wait, &Submitters::all())
+}
+
+/// Whose live work a stop may end. A stop asked for by one member refuses
+/// while another member has non-terminal attempts here, unless every
+/// submitter was named (`--all-submitters`).
+#[derive(Clone, Debug)]
+pub struct Submitters {
+    pub all: bool,
+    /// The member that asked; its own attempts do not block the stop.
+    pub caller: Option<CoordinatorId>,
+}
+impl Submitters {
+    pub fn all() -> Self {
+        Self {
+            all: true,
+            caller: None,
+        }
+    }
+}
+
+/// The members other than `caller` with non-terminal attempts in the worker
+/// database, as (name or coordinator id, count). A database that cannot be
+/// read is an error: an unreadable state is never "no other work".
+fn other_submitters(
+    state: &Path,
+    caller: Option<&CoordinatorId>,
+) -> anyhow::Result<Vec<(String, u64)>> {
+    match fs::symlink_metadata(state.join("worker.db")) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(e.into()),
+    }
+    let store = crate::storage::WorkerStore::open_read_only(state)?;
+    let names: BTreeMap<String, String> = store
+        .members()?
+        .into_iter()
+        .map(|(name, id)| (id, name))
+        .collect();
+    let mut counts: BTreeMap<String, u64> = BTreeMap::new();
+    for attempt in store.list_nonterminal()? {
+        if caller == Some(&attempt.coordinator_id) {
+            continue;
+        }
+        let id = attempt.coordinator_id.to_string();
+        *counts
+            .entry(names.get(&id).cloned().unwrap_or(id))
+            .or_default() += 1;
+    }
+    Ok(counts.into_iter().collect())
+}
+
+fn refuse_other_submitters(state: &Path, submitters: &Submitters) -> anyhow::Result<()> {
+    if submitters.all {
+        return Ok(());
+    }
+    let others = other_submitters(state, submitters.caller.as_ref())
+        .context("could not read which members have live work; nothing was stopped")?;
+    if others.is_empty() {
+        return Ok(());
+    }
+    let total: u64 = others.iter().map(|(_, n)| n).sum();
+    let who: Vec<String> = others.iter().map(|(m, n)| format!("{m} ({n})")).collect();
+    anyhow::bail!(
+        "{total} live attempt(s) of other members run here: {}; nothing was stopped (wait for them, or use --all-submitters)",
+        who.join(", ")
+    )
+}
+
+fn drain_before_check(
+    state: &Path,
+    check: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let previous = control::read(state)?;
+    control::write(state, Control::draining())?;
+    if let Err(error) = check() {
+        control::write(state, previous)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
+pub fn stop_for<L: Launcher>(
+    env: &BTreeMap<String, String>,
     mut launcher: L,
     cancel_running: bool,
     wait: Duration,
+    submitters: &Submitters,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve_for(env, launcher.backend())?;
     let _lock = exclusive_lock(&paths)?;
@@ -976,6 +1173,9 @@ pub fn stop<L: Launcher>(
             "loaded service identity unknown; reconciliation required (nothing stopped)"
         ),
         LoadedState::Match => {
+            drain_before_check(&paths.state, || {
+                refuse_other_submitters(&paths.state, submitters)
+            })?;
             let mut manager = Manager {
                 identity: identity(&journal),
                 files,
@@ -983,6 +1183,7 @@ pub fn stop<L: Launcher>(
                 worker: marker(&paths, wait),
             };
             manager.stop(&plan, &receipt, cancel_running)?;
+            membership::remove_marker(&paths.state.join("membership-restart"))?;
             // A stop ends its own drain. While a switch awaits its commit,
             // or the upgrade owns the drain, the drain is not this stop's to
             // end: the next start must not take work that a rollback to the
@@ -1000,6 +1201,7 @@ pub fn stop<L: Launcher>(
             return status_with(&paths, &journal, &plan, &receipt, &mut launcher, false);
         }
     }
+    membership::remove_marker(&paths.state.join("membership-restart"))?;
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, false)
 }
 
@@ -1094,6 +1296,8 @@ fn status_with<L: Launcher>(
     };
     let current = Control::effective(&paths.state);
     Ok(Status {
+        membership_only: false,
+        coordinator_id: None,
         system_user: journal.system_user.is_some(),
         worker_id: journal.worker_id.clone(),
         cluster: journal.cluster.clone(),
@@ -1125,9 +1329,13 @@ fn status_with<L: Launcher>(
     })
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Options {
     pub cancel_running: bool,
+    /// With `stop`: end other members' live work too.
+    pub all_submitters: bool,
+    /// With `stop`: the member that asked.
+    pub submitter: Option<CoordinatorId>,
     /// How long stop waits for accepted work to finish.
     pub wait: Duration,
     pub ready_timeout: Duration,
@@ -1149,7 +1357,19 @@ pub fn handle<L: Launcher>(
             install(env, &request, current_exe, launcher, options.ready_timeout)
         }
         Action::Start => start(env, launcher, options.ready_timeout),
-        Action::Stop => stop(env, launcher, options.cancel_running, options.wait),
+        Action::Stop => {
+            let submitters = Submitters {
+                all: options.all_submitters,
+                caller: options.submitter.clone(),
+            };
+            stop_for(
+                env,
+                launcher,
+                options.cancel_running,
+                options.wait,
+                &submitters,
+            )
+        }
         Action::Drain => drain(env, launcher),
         Action::Resume => resume(env, launcher),
         Action::Status => status(env, launcher),
@@ -1243,7 +1463,13 @@ impl Launcher for HostLauncher {
 
 /// The hidden `worker-service` command. Drain, resume and status never touch
 /// the service manager; the others use the host's own.
-pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
+pub fn main(
+    action: Action,
+    cancel_running: bool,
+    wait_secs: u64,
+    all_submitters: bool,
+    submitter: Option<CoordinatorId>,
+) -> i32 {
     if action == Action::Doctor {
         return super::doctor::host_main();
     }
@@ -1292,6 +1518,8 @@ pub fn main(action: Action, cancel_running: bool, wait_secs: u64) -> i32 {
                 HostLauncher::native(),
                 Options {
                     cancel_running,
+                    all_submitters,
+                    submitter,
                     wait: Duration::from_secs(wait_secs),
                     ready_timeout: READY_TIMEOUT,
                 },
