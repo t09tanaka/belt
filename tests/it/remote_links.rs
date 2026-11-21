@@ -987,3 +987,187 @@ async fn init_key_switch_closes_peer_link_but_keeps_local_worker_and_resident_al
     ));
     owner.wait().await;
 }
+
+// SendKey regenerates the worker identity even when the key bytes stay the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn init_send_key_reconnects_local_worker_without_restarting_resident() {
+    let fixture = crate::test_tmp::tempdir().unwrap();
+    let root = fixture.path();
+    let state = root.join("parent");
+    for dir in [
+        root.to_owned(),
+        state.clone(),
+        root.join("local"),
+        root.join("config/belt"),
+    ] {
+        private(&dir);
+    }
+    write_private(
+        &root.join("config/belt/config.toml"),
+        b"schema_version=1\n[coordinator]\nheartbeat_seconds=1\nstale_seconds=3\n",
+    );
+    let key = root.join("key");
+    belt::secrets::key::init(&key).unwrap();
+    let cluster = CoordinatorStore::open(&state, wall_ms())
+        .unwrap()
+        .cluster_id()
+        .clone();
+    let (mut owner, client, spec) = start_parent(root, &state, &key, &cluster).await;
+
+    let identity = || {
+        CoordinatorStore::open_read_only(&state)
+            .unwrap()
+            .worker_identity(&spec.worker_id)
+            .unwrap()
+            .unwrap()
+    };
+    assert!(matches!(
+        client
+            .request(Operation::EnvReport {
+                worker: spec.worker_id.clone(),
+            })
+            .await
+            .unwrap(),
+        Reply::EnvReport { .. }
+    ));
+
+    let before = identity();
+
+    // The same fixture-owned helper input used by worker_agent::group_membership.
+    let home = root.join("helper-home");
+    private(&home);
+    let env = BTreeMap::from([("HOME".into(), home.display().to_string())]);
+    let paths = belt::service::worker_service::Paths::resolve(&env).unwrap();
+    private(paths.input.parent().unwrap());
+    let worker = WorkerSpec {
+        schema: 1,
+        expected_cluster: cluster.clone(),
+        worker_id: spec.worker_id.clone(),
+        state_dir: spec.worker_state_dir.clone(),
+        cluster_key_path: key.clone(),
+        executable: BIN.into(),
+        env,
+        config: "schema_version=1\n".into(),
+    };
+    write_private(&paths.input, &serde_json::to_vec(&worker).unwrap());
+    // Repeat to ensure the replacement connection can itself be replaced.
+    let mut previous = before;
+    for round in 0..2 {
+        let old_name = format!("before-send-key-{round}");
+        let old_task = submit(&client, &state, &spec.env, &key, root, &old_name, u32::MAX).await;
+        wait_for("old identity command running", || {
+            root.join(format!("count-{old_name}")).exists()
+        })
+        .await;
+        let old_attempt = attempt(&state, &old_task).unwrap();
+        let request = serde_json::json!({
+            "cluster": cluster, "member": spec.worker_id,
+            "action": {"action": "SendKey",
+                       "key": belt::secrets::key::load(&key).unwrap().as_bytes()}
+        });
+        let mut helper = tokio::process::Command::new(BIN)
+            .arg("group-rotate-helper")
+            .env_clear()
+            .env("HOME", &home)
+            .env("TOKIO_WORKER_THREADS", "2")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        {
+            use tokio::io::AsyncWriteExt;
+            helper
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(&serde_json::to_vec(&request).unwrap())
+                .await
+                .unwrap();
+        }
+        let output = tokio::time::timeout(T, helper.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "helper: {} {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let task = submit(
+            &client,
+            &state,
+            &spec.env,
+            &key,
+            root,
+            &format!("after-send-key-{round}"),
+            0,
+        )
+        .await;
+        wait_for("new local identity registered", || {
+            assert!(owner.child.as_mut().unwrap().try_wait().unwrap().is_none());
+            identity() != previous
+        })
+        .await;
+        previous = identity();
+        let Reply::WorkersListed { observations } = client
+            .request(Operation::ListWorkers {
+                names: vec![spec.worker_id.clone()],
+            })
+            .await
+            .unwrap()
+        else {
+            panic!("expected worker observations");
+        };
+        assert_eq!(
+            observations.get(&spec.worker_id),
+            Some(&(true, Some(previous.clone())))
+        );
+        assert!(matches!(
+            client
+                .request(Operation::EnvReport {
+                    worker: spec.worker_id.clone(),
+                })
+                .await
+                .unwrap(),
+            Reply::EnvReport { .. }
+        ));
+        wait_for("local source and secret delivery after send-key", || {
+            attempt(&state, &task).is_some_and(|a| {
+                a.termination
+                    .is_some_and(|t| t.outcome() == Outcome::Succeeded)
+            })
+        })
+        .await;
+        let store = CoordinatorStore::open_read_only(&state).unwrap();
+        let old_attempts = store.attempts_of_task(&old_task).unwrap();
+        assert_eq!(old_attempts.len(), 1);
+        assert_eq!(old_attempts[0].attempt_id, old_attempt.attempt_id);
+        assert_eq!(
+            old_attempts[0].termination.as_ref().unwrap().outcome(),
+            Outcome::Interrupted
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join(format!("count-{old_name}"))).unwrap(),
+            "once\n"
+        );
+        let new_attempts = store.attempts_of_task(&task).unwrap();
+        assert_eq!(new_attempts.len(), 1);
+        assert!(new_attempts[0].collection_failed_at_ms.is_none());
+        assert_eq!(
+            new_attempts[0].termination.as_ref().unwrap().outcome(),
+            Outcome::Succeeded
+        );
+        assert!(owner.child.as_mut().unwrap().try_wait().unwrap().is_none());
+    }
+    assert_eq!(
+        super::common::identity_of(owner.pid).as_deref(),
+        Some(owner.start.as_str())
+    );
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    owner.wait().await;
+}

@@ -484,10 +484,14 @@ pub struct Resident {
     sources: crate::source::SourceStore,
     captured: Arc<CapturedInputs>,
     worker_client: crate::protocol::Client,
+    worker_timeout: Duration,
+    worker_link: Arc<dyn crate::coordinator::WorkerLink>,
     input_gate: Arc<crate::coordinator::InputGate>,
     worker_id: WorkerId,
     listener: UnixListener,
-    worker_connection: tokio::task::JoinHandle<()>,
+    worker_connection: tokio::task::JoinHandle<
+        Result<crate::worker::serve::ConnectionEnd, crate::worker::serve::ServeError>,
+    >,
     agent_listener: super::worker::AgentListener,
     agent_permits: Arc<Semaphore>,
     client: Client,
@@ -672,9 +676,12 @@ async fn connect_local(
 ) -> anyhow::Result<(
     super::worker::AgentListener,
     UnixListener,
-    tokio::task::JoinHandle<()>,
+    tokio::task::JoinHandle<
+        Result<crate::worker::serve::ConnectionEnd, crate::worker::serve::ServeError>,
+    >,
     crate::protocol::Client,
     Arc<crate::coordinator::InputGate>,
+    Arc<dyn crate::coordinator::WorkerLink>,
 )> {
     let parts = startup.parts.as_ref().expect("prepared startup");
     let agent_listener = super::worker::AgentListener::bind(
@@ -683,49 +690,91 @@ async fn connect_local(
         &parts.worker_id,
     )?;
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
+    let (worker_connection, worker_client, input_gate, worker_link) = connect_local_worker(
+        &parts.agent,
+        &parts.coordinator,
+        &parts.cluster,
+        &parts.worker_id,
+        parts.worker_timeout,
+        config,
+        permits,
+    )
+    .await?;
+    Ok((
+        agent_listener,
+        listener,
+        worker_connection,
+        worker_client,
+        input_gate,
+        worker_link,
+    ))
+}
+
+async fn connect_local_worker(
+    agent: &Arc<Agent>,
+    coordinator: &Arc<Coordinator>,
+    cluster: &ClusterId,
+    worker_id: &WorkerId,
+    worker_timeout: Duration,
+    config: &ResolvedConfig,
+    permits: Arc<Semaphore>,
+) -> anyhow::Result<(
+    tokio::task::JoinHandle<
+        Result<crate::worker::serve::ConnectionEnd, crate::worker::serve::ServeError>,
+    >,
+    crate::protocol::Client,
+    Arc<crate::coordinator::InputGate>,
+    Arc<dyn crate::coordinator::WorkerLink>,
+)> {
     let (parent, worker) = UnixStream::pair()?;
-    let worker_agent = parts.agent.clone();
-    let cluster = parts.cluster.clone();
+    let worker_agent = agent.clone();
+    let cluster = cluster.clone();
     let server_cluster = cluster.clone();
     let worker_connection = tokio::spawn(async move {
-        let _ = serve_local_connection(
+        serve_local_connection(
             worker_agent,
             Io::from_stream(worker),
             server_cluster,
             permits,
         )
-        .await;
+        .await
     });
     // This member's coordinator proves to its own worker like to any other.
-    let agent_config = parts.agent.config();
-    parts.coordinator.set_group_identity(
+    let agent_config = agent.config();
+    coordinator.set_group_identity(
         agent_config.worker_id.clone(),
         agent_config.group_key_path.clone(),
     );
-    let membership = parts
-        .coordinator
+    let membership = coordinator
         .membership()
         .map_err(|e| anyhow::anyhow!(e.message))?;
-    let connected = match connect(
-        Io::from_stream(parent),
-        ClientConfig::new(
-            cluster.clone(),
-            parts.coordinator.store().coordinator_id().clone(),
-            parts.coordinator.epoch(),
-            membership,
+    let connected = match tokio::time::timeout(
+        Duration::from_secs(5),
+        connect(
+            Io::from_stream(parent),
+            ClientConfig::new(
+                cluster.clone(),
+                coordinator.store().coordinator_id().clone(),
+                coordinator.epoch(),
+                membership,
+            ),
         ),
     )
     .await
     {
-        Ok(c) => c,
-        Err(e) => {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
             worker_connection.abort();
             return Err(e.into());
+        }
+        Err(_) => {
+            worker_connection.abort();
+            anyhow::bail!("local worker handshake timed out");
         }
     };
     let worker_client = connected.client.clone();
     let provenance = Digest::of_bytes(&serde_json::to_vec(
-        &serde_json::json!({"transport":"local-private-rpc-v1","protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"timeout_ms":parts.worker_timeout.as_millis()}),
+        &serde_json::json!({"transport":"local-private-rpc-v1","protocol":connected.negotiated.version,"features":connected.negotiated.features,"schema":connected.worker.schema_version,"profile":connected.worker.profile_fingerprint,"timeout_ms":worker_timeout.as_millis()}),
     )?);
     let input_gate = Arc::new(crate::coordinator::InputGate::with_transport_policy(
         provenance.to_string(),
@@ -736,25 +785,22 @@ async fn connect_local(
             connected.worker.agent_epoch,
         )
         .await;
-    if let Err(e) = config
+    let worker_link = match config
         .attach_gated_worker(
-            &parts.coordinator,
-            WorkerTarget::Local(&parts.worker_id),
+            coordinator,
+            WorkerTarget::Local(worker_id),
             connected,
             input_gate.clone(),
         )
         .await
     {
-        worker_connection.abort();
-        anyhow::bail!(e.message);
-    }
-    Ok((
-        agent_listener,
-        listener,
-        worker_connection,
-        worker_client,
-        input_gate,
-    ))
+        Ok(link) => link,
+        Err(e) => {
+            worker_connection.abort();
+            anyhow::bail!(e.message);
+        }
+    };
+    Ok((worker_connection, worker_client, input_gate, worker_link))
 }
 
 impl Resident {
@@ -800,7 +846,7 @@ impl Resident {
             crate::worker::serve::MAX_CONCURRENT_REQUESTS,
         ));
         let connected = connect_local(&startup, config, agent_permits.clone()).await;
-        let (agent_listener, listener, worker_connection, worker_client, input_gate) =
+        let (agent_listener, listener, worker_connection, worker_client, input_gate, worker_link) =
             match connected {
                 Ok(value) => value,
                 Err(e) => {
@@ -820,6 +866,8 @@ impl Resident {
             sources: parts.sources,
             captured: parts.captured,
             worker_client,
+            worker_timeout: parts.worker_timeout,
+            worker_link,
             input_gate,
             worker_id: parts.worker_id,
             listener,
@@ -838,6 +886,28 @@ impl Resident {
             state_root: Arc::new(parts.state_root),
             _token_file: parts.token_file,
         })
+    }
+    fn start_deliveries(
+        &self,
+        deliveries: &mut JoinSet<anyhow::Result<()>>,
+        rx: watch::Receiver<bool>,
+    ) {
+        deliveries.spawn(delivery::sources(
+            self.coordinator.clone(),
+            self.captured.clone(),
+            self.worker_client.clone(),
+            self.worker_id.clone(),
+            self.input_gate.clone(),
+            rx.clone(),
+        ));
+        deliveries.spawn(delivery::secrets(
+            self.coordinator.clone(),
+            self.captured.clone(),
+            self.worker_client.clone(),
+            self.worker_id.clone(),
+            self.input_gate.clone(),
+            rx.clone(),
+        ));
     }
     pub fn client(&self) -> Client {
         self.client.clone()
@@ -934,22 +1004,9 @@ impl Resident {
                 tokio::task::spawn_blocking(move || agent.supervise()).await?;
             }
         });
-        loops.spawn(delivery::sources(
-            self.coordinator.clone(),
-            self.captured.clone(),
-            self.worker_client.clone(),
-            self.worker_id.clone(),
-            self.input_gate.clone(),
-            rx.clone(),
-        ));
-        loops.spawn(delivery::secrets(
-            self.coordinator.clone(),
-            self.captured.clone(),
-            self.worker_client.clone(),
-            self.worker_id.clone(),
-            self.input_gate.clone(),
-            rx.clone(),
-        ));
+        let mut deliveries = JoinSet::new();
+        let (mut delivery_stop, delivery_rx) = watch::channel(false);
+        self.start_deliveries(&mut deliveries, delivery_rx);
         let permits = Arc::new(Semaphore::new(32));
         // Serializes acceptance with shutdown, not with placement/collection.
         let admission = Arc::new(Mutex::new(false));
@@ -960,7 +1017,47 @@ impl Resident {
             tokio::select! {
                 _ = stopped.changed() => break,
                 result = &mut self.worker_connection => {
-                    failure = Some(anyhow::anyhow!("local worker connection ended: {result:?}"));
+                    if *stopped.borrow() {
+                        break;
+                    }
+                    if matches!(result, Ok(Ok(crate::worker::serve::ConnectionEnd::IdentityChanged))) && !self.agent.stopping() {
+                        // Delivery state belongs to the old proven session and gate.
+                        // Never redirect an in-flight old-identity request to the new client.
+                        let _ = delivery_stop.send(true);
+                        self.input_gate.invalidate().await;
+                        if let Err(error) = self.coordinator.detach_link(&self.worker_id, &self.worker_link).await {
+                            failure = Some(error.into());
+                            break;
+                        }
+                        while deliveries.join_next().await.is_some() {}
+                        let reconnected = connect_local_worker(
+                            &self.agent, &self.coordinator, &self.client.cluster_id,
+                            &self.worker_id,
+                            self.worker_timeout,
+                            &self.remote_config, self.agent_permits.clone(),
+                        ).await;
+                        match reconnected {
+                            Ok((connection, client, gate, link)) => {
+                                self.worker_connection = connection;
+                                self.worker_client = client;
+                                self.input_gate = gate;
+                                self.worker_link = link;
+                                let (cancel, cancelled) = watch::channel(false);
+                                delivery_stop = cancel;
+                                self.start_deliveries(&mut deliveries, cancelled);
+                            }
+                            Err(error) => {
+                                failure = Some(error);
+                                break;
+                            }
+                        }
+                    } else {
+                        failure = Some(anyhow::anyhow!("local worker connection ended: {result:?}"));
+                        break;
+                    }
+                },
+                result = deliveries.join_next(), if !deliveries.is_empty() => {
+                    match result { Some(Ok(Err(e))) => failure = Some(e), Some(Err(e)) => failure = Some(e.into()), _ => {} }
                     break;
                 },
                 result = loops.join_next(), if !loops.is_empty() => {
@@ -1027,9 +1124,21 @@ impl Resident {
         while agent_connections.join_next().await.is_some() {}
         *admission.lock().await = true;
         let _ = stop.send(true);
+        let _ = delivery_stop.send(true);
         while let Some(result) = requests.join_next().await {
             if let Err(e) = result {
                 failure.get_or_insert(e.into());
+            }
+        }
+        while let Some(result) = deliveries.join_next().await {
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    failure.get_or_insert(e);
+                }
+                Err(e) => {
+                    failure.get_or_insert(e.into());
+                }
             }
         }
         while let Some(result) = loops.join_next().await {

@@ -687,7 +687,7 @@ impl Agent {
         }
     }
 
-    fn stopping(&self) -> bool {
+    pub(crate) fn stopping(&self) -> bool {
         self.stopping.load(Ordering::SeqCst)
     }
 
