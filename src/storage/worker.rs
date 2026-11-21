@@ -71,6 +71,32 @@ pub enum MemberPin {
     IdTaken { name: String },
 }
 
+/// What is recorded for the member `name` and the coordinator id `scope`.
+fn recorded_pin(c: &Connection, name: &str, scope: &str) -> Result<Option<MemberPin>> {
+    let by_name: Option<String> = c
+        .query_row(
+            "SELECT coordinator_id FROM group_member WHERE name = ?1",
+            [name],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if let Some(coordinator_id) = by_name {
+        return Ok(Some(if coordinator_id == scope {
+            MemberPin::Pinned
+        } else {
+            MemberPin::NameTaken { coordinator_id }
+        }));
+    }
+    let by_id: Option<String> = c
+        .query_row(
+            "SELECT name FROM group_member WHERE coordinator_id = ?1",
+            [scope],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(by_id.map(|name| MemberPin::IdTaken { name }))
+}
+
 fn id<T>(what: &str, r: std::result::Result<T, IdError>) -> Result<T> {
     r.map_err(|e| StorageError::Corrupt(format!("{what}: {e}")))
 }
@@ -590,29 +616,8 @@ impl WorkerStore {
     pub fn pin_member(&self, name: &str, at_ms: u64) -> Result<MemberPin> {
         let (n, o) = (name.to_string(), self.member_scope());
         self.db.write(move |tx| {
-            let by_name: Option<String> = tx
-                .query_row(
-                    "SELECT coordinator_id FROM group_member WHERE name = ?1",
-                    [&n],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(coordinator_id) = by_name {
-                return Ok(if coordinator_id == o {
-                    MemberPin::Pinned
-                } else {
-                    MemberPin::NameTaken { coordinator_id }
-                });
-            }
-            let by_id: Option<String> = tx
-                .query_row(
-                    "SELECT name FROM group_member WHERE coordinator_id = ?1",
-                    [&o],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            if let Some(name) = by_id {
-                return Ok(MemberPin::IdTaken { name });
+            if let Some(pin) = recorded_pin(tx, &n, &o)? {
+                return Ok(pin);
             }
             tx.execute(
                 "INSERT INTO group_member (name, coordinator_id, pinned_at_ms) VALUES (?1, ?2, ?3)",
@@ -620,6 +625,13 @@ impl WorkerStore {
             )?;
             Ok(MemberPin::Pinned)
         })
+    }
+
+    /// What [`Self::pin_member`] would answer, without writing: `None` for
+    /// a member neither of whose name or coordinator id is recorded yet.
+    pub fn member_pin(&self, name: &str) -> Result<Option<MemberPin>> {
+        let (n, o) = (name.to_string(), self.member_scope());
+        self.db.call(move |c| recorded_pin(c, &n, &o))
     }
 
     /// Replace what is recorded for `name` and for this handle's member with
