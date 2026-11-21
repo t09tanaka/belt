@@ -369,16 +369,10 @@ impl Round {
         round
     }
 
-    /// Place once more, by `deadline`, now that some of the workers that
-    /// were not reached answered late. What closed a worker before stays.
-    fn again(&mut self, late: Vec<Reached>, deadline: Instant) {
-        self.deadline = deadline;
-        for worker in &mut self.open {
-            worker.link = Arc::new(Budgeted {
-                inner: Arc::clone(&worker.attachment),
-                deadline,
-            });
-        }
+    /// Place once more, by the same deadline, now that some of the workers
+    /// that were not reached answered late. What closed a worker before
+    /// stays, and the placing of the tick still takes one budget at most.
+    fn again(&mut self, late: Vec<Reached>) {
         for mut worker in late {
             self.out.remove(&worker.worker_id);
             worker.link = Arc::clone(&worker.attachment);
@@ -444,8 +438,9 @@ type Followed = Result<(Option<Reached>, TickReport)>;
 /// An attached worker and its connection.
 type Link = (WorkerId, Arc<dyn WorkerLink>);
 
-/// The connection of a worker as it was when the worker was asked.
-type Attached = Option<Arc<dyn WorkerLink>>;
+/// The connection a worker was asked on: the very link the calls went to,
+/// never a later read of the registry.
+type Attached = Arc<dyn WorkerLink>;
 
 /// The workers that answered, with what was done on each in `report`; the
 /// first failure, if any, after all of them were looked at.
@@ -957,6 +952,10 @@ impl Coordinator {
     /// Follow the `prompt` workers and the `late` ones side by side, and
     /// place on the prompt ones as soon as they all answered. The outer error
     /// is a failure while following, before anything was placed.
+    ///
+    /// Following takes one budget at most (`deadline`), and placing another,
+    /// shared by both rounds of placements, so the tick stays within twice
+    /// the budget.
     async fn follow_and_place(
         &self,
         (prompt, late): (Vec<Link>, Vec<Link>),
@@ -976,7 +975,17 @@ impl Coordinator {
             }
         };
         // In the order of the worker ids, whichever answered first.
-        let mut reached = absorb_all(report, prompt_done)?;
+        let mut reached = match absorb_all(report, prompt_done) {
+            Ok(reached) => reached,
+            Err(e) => {
+                // The late ones may be applying an answer: let them finish,
+                // so that no write of theirs lands after this tick ended.
+                if late_done.is_none() {
+                    (&mut late).await;
+                }
+                return Err(e);
+            }
+        };
         if late_done.is_none() && reached.is_empty() {
             // Nobody else to place on: wait for those as before.
             late_done = Some((&mut late).await);
@@ -999,7 +1008,7 @@ impl Coordinator {
                     (Ok(()), Ok(answered)) if answered.is_empty() => Ok(()),
                     (Ok(()), Ok(answered)) => {
                         // Those that answered late are placed on now.
-                        round.again(answered, self.deadline());
+                        round.again(answered);
                         self.dispatch(&mut round, report, telemetry).await
                     }
                 }
@@ -1022,9 +1031,9 @@ impl Coordinator {
             .collect()
     }
 
-    /// What is attached for a worker now. Taken before a worker is asked and
-    /// compared again before its answer is applied ([`Coordinator::answered`]).
-    fn attached_now(&self, worker_id: &WorkerId) -> Attached {
+    /// What is attached for a worker now, compared with the connection that
+    /// was asked before its answer is applied ([`Coordinator::answered`]).
+    fn attached_now(&self, worker_id: &WorkerId) -> Option<Attached> {
         self.workers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1035,7 +1044,9 @@ impl Coordinator {
     /// Take the actor to apply what a worker answered (or that it did not).
     /// `None` when the answer is stale: the connection that was asked was
     /// detached or replaced meanwhile (a `forget`, a `detach` or a new
-    /// identity ran), so nothing of it may change the record any more.
+    /// identity ran), so nothing of it may change the record any more. A
+    /// worker with nothing attached now never matches: what was asked was a
+    /// real connection, and it is gone.
     async fn answered(
         &self,
         worker_id: &WorkerId,
@@ -1043,12 +1054,9 @@ impl Coordinator {
     ) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>> {
         let actor = self.actor.lock().await;
         self.check_fenced()?;
-        let now = self.attached_now(worker_id);
-        let same = match (asked, &now) {
-            (Some(asked), Some(now)) => Arc::ptr_eq(asked, now),
-            (None, None) => true,
-            _ => false,
-        };
+        let same = self
+            .attached_now(worker_id)
+            .is_some_and(|now| Arc::ptr_eq(asked, &now));
         Ok(same.then_some(actor))
     }
 
@@ -1079,7 +1087,8 @@ impl Coordinator {
             deadline,
         };
         let mut report = TickReport::default();
-        let asked = self.attached_now(&worker_id);
+        // The link the calls below go to, whatever is attached by now.
+        let asked: Attached = Arc::clone(&link);
         let inputs = link.placement_inputs();
         let requested = self.preparation_request(&worker_id, &link, inputs.as_ref());
         let sent_boot = crate::platform::boot_id();
@@ -1363,7 +1372,7 @@ impl Coordinator {
                     status.state,
                     AttemptState::Cancelling | AttemptState::Finalizing
                 ) {
-                    self.follow_artifacts(link, &live).await?;
+                    self.follow_artifacts(link, &live, asked).await?;
                 }
                 Ok(())
             }
@@ -2293,6 +2302,9 @@ impl Coordinator {
                     return Ok(());
                 }
             }
+            // A worker followed side by side with this placing may have said
+            // that this coordinator is replaced: then nothing more is placed.
+            self.check_fenced()?;
             let (t, w, a) = (task.task_id.clone(), winner.clone(), attempt_id.clone());
             let lease_ms = self.cfg.lease_ms;
             let cost_evidence: Vec<_> = decision
@@ -2367,10 +2379,10 @@ impl Coordinator {
                         .open
                         .iter()
                         .find(|w| w.worker_id == winner)
-                        .map(|w| Arc::clone(&w.link));
-                    if let Some(link) = link {
+                        .map(|w| (Arc::clone(&w.link), Arc::clone(&w.attachment)));
+                    if let Some((link, attachment)) = link {
                         let sent = self
-                            .send_placed(&winner, &*link, &attempt_id, report)
+                            .send_placed(&winner, &*link, &attachment, &attempt_id, report)
                             .await?;
                         match sent {
                             // A worker that did not take this one gets no
@@ -2450,10 +2462,10 @@ impl Coordinator {
         &self,
         worker_id: &WorkerId,
         link: &dyn WorkerLink,
+        asked: &Attached,
         attempt_id: &AttemptId,
         report: &mut TickReport,
     ) -> Result<Sent> {
-        let asked = self.attached_now(worker_id);
         let (w, a) = (worker_id.clone(), attempt_id.clone());
         let Some(placed) = self.db(move |s| s.live_attempt(&w, &a)).await? else {
             return Ok(Sent::NotTaken);
@@ -2466,7 +2478,7 @@ impl Coordinator {
         if !policy::may_send(facts) {
             return Ok(Sent::Withheld);
         }
-        self.submit(link, &placed, report, &asked).await
+        self.submit(link, &placed, report, asked).await
     }
 
     /// A queued task no payload can be made for stays queued and is passed

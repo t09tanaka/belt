@@ -156,16 +156,18 @@ async fn a_tick_looks_at_every_live_attempt_of_a_worker_once_beyond_the_first_pa
 async fn a_placed_attempt_is_found_only_on_its_own_worker() {
     let f = fx();
     let on_a = f.placed(1, "w-a").await;
-    let link = Silent::default();
+    let link = Arc::new(Silent::default());
+    let attached: Attached = link.clone();
+    f.c.attach(worker("w-a"), attached.clone()).await;
     let mut report = TickReport::default();
     let sent =
-        f.c.send_placed(&worker("w-b"), &link, &on_a[0], &mut report)
+        f.c.send_placed(&worker("w-b"), &*link, &attached, &on_a[0], &mut report)
             .await
             .unwrap();
     assert_eq!(sent, Sent::NotTaken);
     assert_eq!(link.calls.load(Ordering::SeqCst), 0, "nothing was sent");
     let sent =
-        f.c.send_placed(&worker("w-a"), &link, &on_a[0], &mut report)
+        f.c.send_placed(&worker("w-a"), &*link, &attached, &on_a[0], &mut report)
             .await
             .unwrap();
     assert_eq!(sent, Sent::NotTaken);

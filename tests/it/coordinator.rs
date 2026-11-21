@@ -3391,3 +3391,138 @@ async fn a56_an_answer_that_comes_after_the_parent_gave_it_up_changes_nothing() 
     assert_eq!(record_of(&c, &on_a).observation, Observation::Known);
     assert_eq!(stalled.held(&on_a).unwrap().renewals, renewals + 1);
 }
+
+/// A fake worker behind a link that holds the requests of the kinds in
+/// `ops` until released; every other request goes straight through.
+struct Gate {
+    worker: Arc<FakeWorker>,
+    ops: Mutex<Vec<Op>>,
+    release: tokio::sync::Semaphore,
+    /// Held requests so far.
+    entered: Count,
+}
+
+impl Gate {
+    fn new(worker: &Arc<FakeWorker>, ops: &[Op]) -> Arc<Gate> {
+        Arc::new(Gate {
+            worker: Arc::clone(worker),
+            ops: Mutex::new(ops.to_vec()),
+            release: tokio::sync::Semaphore::new(0),
+            entered: Count::default(),
+        })
+    }
+
+    fn hold(&self, ops: &[Op]) {
+        *self.ops.lock().unwrap() = ops.to_vec();
+    }
+}
+
+impl WorkerLink for Gate {
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            let held = self.ops.lock().unwrap().contains(&op_of(&request));
+            if held {
+                self.entered.bump();
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.worker.call(request).await
+        })
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a56_the_answer_of_a_connection_replaced_before_it_was_asked_changes_nothing() {
+    let mut f = fx();
+    f.cfg.worker_budget_ms = 15_000;
+    let (c, (_, held), (healthy, watched), _, on_b) = a56_two_running(&f).await;
+    // w-b went away: its attempt is unknown until it is followed again.
+    c.detach(&healthy.id).await.unwrap();
+    assert_eq!(record_of(&c, &on_b).observation, Observation::Unknown);
+    let renewals = healthy.held(&on_b).unwrap().renewals;
+    let gets = healthy.received(Op::Get);
+    enqueue(&c, 1).await;
+
+    // The tick looks at w-a only. While it does, w-ab and w-b are attached:
+    // placing looks at them as newcomers, one after the other.
+    held.hold.store(true, Ordering::SeqCst);
+    let ticking = tokio::spawn({
+        let c = Arc::clone(&c);
+        async move { c.tick().await }
+    });
+    held.entered.reaches(1).await;
+    let newcomer = f.worker("w-ab", (2, 0));
+    let first = Gate::new(&newcomer, &[Op::Inspect]);
+    c.attach(newcomer.id.clone(), first.clone()).await;
+    c.attach(healthy.id.clone(), watched.clone()).await;
+    held.hold.store(false, Ordering::SeqCst);
+    held.release.add_permits(1);
+    // While w-ab is asked, the connection of w-b is replaced by another:
+    // the one the tick took for w-b is not attached any more when it is
+    // asked.
+    first.entered.reaches(1).await;
+    c.detach(&healthy.id).await.unwrap();
+    let replacement = Holding::new(&healthy);
+    c.attach(healthy.id.clone(), replacement.clone()).await;
+    first.hold(&[]);
+    first.release.add_permits(1);
+    ticking.await.unwrap().unwrap();
+    // What the old connection said is not applied: the attempt is not
+    // marked known, followed or renewed through it.
+    assert_eq!(record_of(&c, &on_b).observation, Observation::Unknown);
+    assert_eq!(
+        healthy.received(Op::Get),
+        gets,
+        "not followed on the old link"
+    );
+    assert_eq!(healthy.held(&on_b).unwrap().renewals, renewals);
+
+    // The next tick follows it on the connection attached now.
+    c.tick().await.unwrap();
+    assert_eq!(record_of(&c, &on_b).observation, Observation::Known);
+    assert_eq!(healthy.held(&on_b).unwrap().renewals, renewals + 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn a56_workers_that_stall_in_both_rounds_of_placing_keep_the_tick_within_twice_the_budget() {
+    let mut f = fx();
+    f.cfg.worker_budget_ms = 15_000;
+    f.sched.forecast_wait_ms = 8_000;
+    let budget = Duration::from_millis(f.cfg.worker_budget_ms);
+    let late = f.worker("w-l", (2, 0));
+    let prompt = f.worker("w-p", (2, 0));
+    let (l, p) = (Gate::new(&late, &[Op::Inspect]), Gate::new(&prompt, &[]));
+    let c = Arc::new(f.open(&[]));
+    c.attach(late.id.clone(), l.clone()).await;
+    // A look that gets no answer: w-l is not waited for by the next tick.
+    c.tick().await.unwrap();
+    c.attach(prompt.id.clone(), p.clone()).await;
+    let task = enqueue(&c, 1).await;
+    l.hold(&[Op::Inspect, Op::Submit]);
+    p.hold(&[Op::Inspect, Op::Forecast]);
+
+    let begun = tokio::time::Instant::now();
+    let ticking = tokio::spawn({
+        let c = Arc::clone(&c);
+        async move { c.tick().await }
+    });
+    // w-p answers its look late in the budget, but in time.
+    p.entered.reaches(1).await;
+    l.entered.reaches(2).await;
+    tokio::time::sleep(budget * 2 / 3).await;
+    p.release.add_permits(1);
+    // The first round of placing stalls on its forecast. Meanwhile w-l
+    // answers, and the second round stalls on the submit to it.
+    p.entered.reaches(2).await;
+    l.release.add_permits(1);
+    let report = ticking.await.unwrap().unwrap();
+    assert_eq!(l.entered.get(), 3, "the submit to w-l was held");
+    assert_eq!(report.placed, vec![only(&c, &task[0]).attempt_id]);
+    assert!(
+        begun.elapsed() <= budget * 2,
+        "a tick takes twice the budget at most: {:?}",
+        begun.elapsed()
+    );
+}
