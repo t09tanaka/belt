@@ -359,7 +359,9 @@ mod tests {
         f.c.detach_link(&f.worker, &link).await.unwrap();
         contact.at_ms = wall_ms() - 100_001;
         member_contact::write(state, &f.worker, &contact).unwrap();
-        f.c.store().record_removed_member(&f.worker, 1).unwrap();
+        f.c.store()
+            .record_removed_member(&f.worker, 1, None)
+            .unwrap();
         // --remove has already deleted the registration; the durable contact is sufficient.
         let result =
             f.c.forget_worker_after(&f.worker, None, 5000)

@@ -40,6 +40,11 @@ async fn unknown_job_preserves_receipts_and_reruns_without_replacing() {
     assert!(!spec.env.contains_key("SECRET_TOKEN"));
     assert!(spec.env.contains_key("XDG_CONFIG_HOME"));
     assert_eq!(spec.repo_root, Some(p.config.clone()));
+    // The SSH helpers find the resident binary at bin/resident without PATH.
+    assert_eq!(
+        fs::canonicalize(p.config.join("bin").join("resident").join("belt")).unwrap(),
+        fs::canonicalize(&spec.executable).unwrap()
+    );
     assert_eq!(
         crate::storage::CoordinatorStore::open_read_only(&p.state)
             .unwrap()

@@ -6293,3 +6293,55 @@ fn retry_of_a_non_idempotent_shard_requires_its_captured_permission() {
         0
     );
 }
+
+#[test]
+fn removed_member_ssh_migration_preserves_legacy_records() {
+    use super::policy::Access;
+    let root = crate::test_tmp::tempdir().unwrap();
+    let path = root.path().join("coordinator.db");
+    let steps = schema::steps(DbKind::Coordinator);
+    assert_eq!(
+        steps.last().unwrap(),
+        "ALTER TABLE removed_member ADD COLUMN ssh TEXT;"
+    );
+    assert_eq!(steps.len(), 22);
+    let previous = steps.len() - 1;
+    let old = db::open_with(
+        &path,
+        DbKind::Coordinator.as_str(),
+        &steps[..previous],
+        schema::compat(previous),
+        Access::ReadWrite,
+    )
+    .unwrap();
+    old.write(|tx| {
+        tx.execute("INSERT INTO removed_member VALUES ('old', 42)", [])?;
+        Ok(())
+    })
+    .unwrap();
+    drop(old);
+    let current = Db::open(&path, DbKind::Coordinator, Access::ReadWrite).unwrap();
+    let row = current
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT removed_at_ms, ssh FROM removed_member WHERE name='old'",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?)),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(row, (42, None));
+    drop(current);
+    let store = CoordinatorStore::open(root.path(), 50).unwrap();
+    let name = WorkerId::parse("old").unwrap();
+    store
+        .record_removed_member(&name, 50, Some("user@old-host"))
+        .unwrap();
+    store.record_removed_member(&name, 60, None).unwrap();
+    assert_eq!(
+        store.removed_members().unwrap(),
+        vec![("old".into(), 42, Some("user@old-host".into()))]
+    );
+    assert!(store.clear_removed_member(&name).unwrap());
+    assert!(store.removed_members().unwrap().is_empty());
+}

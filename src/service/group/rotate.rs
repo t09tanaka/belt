@@ -22,7 +22,7 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-pub(crate) const HELPER: &str = "exec belt group-rotate-helper";
+pub(crate) const HELPER: &str = r#"case "${XDG_CONFIG_HOME:-}" in /*) belt_config=$XDG_CONFIG_HOME ;; *) belt_config="$HOME/.config" ;; esac; if [ -x "$belt_config/belt/bin/resident/belt" ]; then exec "$belt_config/belt/bin/resident/belt" group-rotate-helper; elif [ -x "$belt_config/belt/bin/current/belt" ]; then exec "$belt_config/belt/bin/current/belt" group-rotate-helper; else exec belt group-rotate-helper; fi"#;
 const LIMIT: u64 = 65536;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -415,7 +415,7 @@ pub(crate) fn rotate(
     };
     let guidance = guidance(spec, &entries, remove);
     if !remove.is_empty() {
-        record_removals(spec, remove)?;
+        record_removals(spec, remove, &entries)?;
         workers::remove_registrations(env, remove)?;
         workers::reload_resident(spec);
     }
@@ -456,7 +456,11 @@ pub(crate) fn rotate(
 /// Receiving-only members have no coordinator database yet. Keep their small
 /// removal record beside worker state; never create a coordinator identity as
 /// a side effect of key rotation. Initialized members use the existing table.
-fn record_removals(spec: &Spec, names: &[String]) -> Result<(), ApiError> {
+fn record_removals(
+    spec: &Spec,
+    names: &[String],
+    entries: &[workers::Registered],
+) -> Result<(), ApiError> {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(internal)?
@@ -470,19 +474,28 @@ fn record_removals(spec: &Spec, names: &[String]) -> Result<(), ApiError> {
         let store = CoordinatorStore::membership_writer(&spec.state_dir).map_err(internal)?;
         for name in names {
             store
-                .record_removed_member(&WorkerId::parse(name).map_err(internal)?, now)
+                .record_removed_member(
+                    &WorkerId::parse(name).map_err(internal)?,
+                    now,
+                    entries
+                        .iter()
+                        .find(|e| &e.id == name)
+                        .map(|e| e.ssh.as_str()),
+                )
                 .map_err(internal)?;
         }
         return Ok(());
     }
     let path = spec.worker_state_dir.join("removed-members.json");
-    let mut removed: BTreeMap<String, u64> = match resident::secure_file(&path, false) {
-        Ok(file) => serde_json::from_reader(file.take(LIMIT)).map_err(internal)?,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => BTreeMap::new(),
-        Err(e) => return Err(internal(e)),
-    };
+    let mut removed = super::read_removed_json(spec)?;
     for name in names {
-        removed.entry(name.clone()).or_insert(now);
+        let record = removed.entry(name.clone()).or_insert(super::Removal {
+            removed_at_ms: now,
+            ssh: None,
+        });
+        if let Some(entry) = entries.iter().find(|e| &e.id == name) {
+            record.ssh = Some(entry.ssh.clone());
+        }
     }
     let mut temporary =
         tempfile::NamedTempFile::new_in(&spec.worker_state_dir).map_err(internal)?;

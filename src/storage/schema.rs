@@ -639,6 +639,7 @@ CREATE TABLE removed_member (
             // this step) is "not known", and such an attempt is retired on
             // its worker first.
             "ALTER TABLE placement ADD COLUMN submit_sends INTEGER;".into(),
+            "ALTER TABLE removed_member ADD COLUMN ssh TEXT;".into(),
         ],
         // Persisted payloads now carry execution constraints. A previous
         // binary must refuse this version instead of dropping unknown fields.

@@ -12,7 +12,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, io::Read, path::Path, time::Duration};
 
-const HELPER: &str = "exec belt group-join-helper";
+pub(crate) const HELPER: &str = r#"case "${XDG_CONFIG_HOME:-}" in /*) belt_config=$XDG_CONFIG_HOME ;; *) belt_config="$HOME/.config" ;; esac; if [ -x "$belt_config/belt/bin/resident/belt" ]; then exec "$belt_config/belt/bin/resident/belt" group-join-helper; elif [ -x "$belt_config/belt/bin/current/belt" ]; then exec "$belt_config/belt/bin/current/belt" group-join-helper; else exec belt group-join-helper; fi"#;
 const LIMIT: u64 = 8192;
 
 #[derive(Serialize, Deserialize)]

@@ -211,6 +211,7 @@ fn remove_records_timestamp_and_prints_manual_ssh_steps_even_on_failure() {
     assert_eq!(removed.len(), 1);
     assert_eq!(removed[0].0, "b");
     assert!(removed[0].1 > 0);
+    assert_eq!(removed[0].2.as_deref(), Some("b"));
     assert_eq!(
         registrations(&w.env)
             .unwrap()
@@ -258,8 +259,10 @@ fn receiving_only_origin_records_removal_without_creating_coordinator() {
     w.spec.state_dir = w.spec.worker_state_dir.clone();
     let path = w.spec.worker_state_dir.join("removed-members.json");
     run(&w, &mut n, &["b"], &[]).unwrap();
-    let removed: BTreeMap<String, u64> = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-    assert!(removed["b"] > 0);
+    let removed: BTreeMap<String, serde_json::Value> =
+        serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert!(removed["b"]["removed_at_ms"].as_u64().unwrap() > 0);
+    assert_eq!(removed["b"]["ssh"], "b");
     assert_eq!(
         fs::metadata(&path).unwrap().permissions().mode() & 0o777,
         0o600

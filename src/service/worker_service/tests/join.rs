@@ -84,7 +84,7 @@ impl Remote for Pair<'_> {
         _: Duration,
     ) -> Result<RemoteOutput, String> {
         self.calls += 1;
-        if shell == "exec belt group-join-helper" {
+        if shell == crate::service::group::join::HELPER {
             assert_eq!(target, &SshTarget::parse("user@a").unwrap());
             let request = serde_json::from_slice(stdin).unwrap();
             let result = join::accept(self, &self.a.env.clone(), &self.a.exe.clone(), request);

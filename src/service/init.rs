@@ -757,6 +757,7 @@ async fn initialize_prepared<L: Launcher>(
         durability.sync_directory(stage.parent().context("stage parent")?)?;
         publish(&mut j, &mut jf, &paths, &plan, &stage, &executable)?;
     }
+    link_resident(&executable, durability)?;
     let database_path = paths.state.join("coordinator.db");
     if j.database.is_none() {
         if let Some(proof) = j.files.iter().find(|p| p.path == database_path).cloned() {
@@ -920,6 +921,30 @@ async fn initialize_prepared<L: Launcher>(
         epoch,
         initialized: true,
     })
+}
+
+/// `bin/resident` -> `<digest>`: the binary this host's init resident runs,
+/// at a fixed path the SSH helpers can find without PATH. Unlike the worker
+/// service's `bin/current`, it follows every init, so it is replaced
+/// atomically (a new link renamed over the old one).
+fn link_resident(executable: &Path, durability: &mut impl Durability) -> anyhow::Result<()> {
+    let dir = executable.parent().context("binary parent")?;
+    let digest = dir.file_name().context("binary digest")?;
+    let bin = dir.parent().context("bin directory")?;
+    let link = bin.join("resident");
+    if fs::read_link(&link).ok().as_deref() == Some(Path::new(digest)) {
+        return Ok(());
+    }
+    let staged = bin.join(format!(".resident.{}", std::process::id()));
+    match fs::remove_file(&staged) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    std::os::unix::fs::symlink(digest, &staged)?;
+    fs::rename(&staged, &link)?;
+    durability.sync_directory(bin)?;
+    Ok(())
 }
 
 fn managed_journal(spec: &Spec) -> anyhow::Result<(Journal, Paths)> {

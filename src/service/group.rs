@@ -83,6 +83,95 @@ fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::new(ErrorCode::Internal, e.to_string())
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+pub(super) struct Removal {
+    pub removed_at_ms: u64,
+    #[serde(default)]
+    pub ssh: Option<String>,
+}
+
+pub(super) fn read_removed_json(spec: &Spec) -> Result<BTreeMap<String, Removal>, ApiError> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum Record {
+        Old(u64),
+        New(Removal),
+    }
+    let file =
+        match resident::secure_file(&spec.worker_state_dir.join("removed-members.json"), false) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+            Err(e) => return Err(internal(e)),
+        };
+    let records: BTreeMap<String, Record> =
+        serde_json::from_reader(file.take(65536)).map_err(internal)?;
+    Ok(records
+        .into_iter()
+        .map(|(name, record)| {
+            (
+                name,
+                match record {
+                    Record::Old(removed_at_ms) => Removal {
+                        removed_at_ms,
+                        ssh: None,
+                    },
+                    Record::New(record) => record,
+                },
+            )
+        })
+        .collect())
+}
+
+#[derive(serde::Serialize)]
+pub(crate) struct RemovalWarning {
+    pub name: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
+pub(crate) fn removal_warnings(
+    spec: &Spec,
+    remote: &mut dyn workers::Remote,
+) -> Result<Vec<RemovalWarning>, ApiError> {
+    let mut removed = read_removed_json(spec)?;
+    if spec
+        .state_dir
+        .join("coordinator.db")
+        .try_exists()
+        .map_err(internal)?
+    {
+        let store =
+            crate::storage::CoordinatorStore::open_read_only(&spec.state_dir).map_err(internal)?;
+        for (name, removed_at_ms, ssh) in store.removed_members().map_err(internal)? {
+            removed.insert(name, Removal { removed_at_ms, ssh });
+        }
+    }
+    let mut warnings = Vec::new();
+    for (name, record) in removed {
+        let (code, message) = if let Some(ssh) = record.ssh {
+            let reachable = crate::protocol::ssh::SshTarget::parse(&ssh)
+                .ok()
+                .is_some_and(|target| {
+                    remote
+                        .run(&target, "true", &[], std::time::Duration::from_secs(3))
+                        .is_ok_and(|output| output.code == Some(0))
+                });
+            if !reachable {
+                continue;
+            }
+            ("removed_member_ssh_reachable", format!("Warning: removed member {name} is still reachable over SSH; manually delete its SSH key from each remaining member's authorized_keys; belt never edits authorized_keys."))
+        } else {
+            ("removed_member_ssh_unknown", format!("Removed member {name}: SSH reachability cannot be checked because no SSH destination was recorded."))
+        };
+        warnings.push(RemovalWarning {
+            name,
+            code,
+            message,
+        });
+    }
+    Ok(warnings)
+}
+
 pub fn report(env: &BTreeMap<String, String>, spec: &Spec) -> Result<Value, ApiError> {
     let store = WorkerStore::open_read_only(&spec.worker_state_dir).map_err(internal)?;
     let (current, next) = store.group_keys().map_err(internal)?;
@@ -101,8 +190,9 @@ pub fn report(env: &BTreeMap<String, String>, spec: &Spec) -> Result<Value, ApiE
         let refusal = observed_refusal(&spec.state_dir, &name).map_err(internal)?;
         members.push(json!({"name":entry.id,"ssh":entry.ssh,"connection":observed.map(|(connected,_)| if *connected {"connected"} else {"disconnected"}).unwrap_or("unknown"),"last_group_refusal":refusal}));
     }
+    let warnings = removal_warnings(spec, &mut workers::SshRemote::new(&spec.cluster_key_path))?;
     Ok(
-        json!({"group_id":spec.expected_cluster,"name":spec.worker_id,"current":generation(current),"next":generation(next),"members":members}),
+        json!({"warnings":warnings,"group_id":spec.expected_cluster,"name":spec.worker_id,"current":generation(current),"next":generation(next),"members":members}),
     )
 }
 
@@ -124,6 +214,10 @@ pub(super) fn load_spec(env: &BTreeMap<String, String>) -> Result<Spec, ApiError
         Ok(spec) => Ok(spec),
         Err(error) if error.code == ErrorCode::NotFound => {
             let paths = super::worker_service::Paths::resolve(env).map_err(internal)?;
+            // Neither init nor a worker install: keep "not found, run init".
+            if !paths.input.try_exists().map_err(internal)? {
+                return Err(error);
+            }
             let worker = super::worker::read_input(&paths.input).map_err(internal)?;
             Ok(Spec {
                 state_dir: worker.state_dir.clone(),
@@ -145,6 +239,55 @@ pub(super) fn load_spec(env: &BTreeMap<String, String>) -> Result<Spec, ApiError
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn fixed_helpers_prefer_resident_and_fall_back_only_when_not_executable() {
+        for (helper, action) in [
+            (join::HELPER, "group-join-helper"),
+            (rotate::HELPER, "group-rotate-helper"),
+        ] {
+            assert_eq!(
+                helper,
+                format!(
+                    r#"case "${{XDG_CONFIG_HOME:-}}" in /*) belt_config=$XDG_CONFIG_HOME ;; *) belt_config="$HOME/.config" ;; esac; if [ -x "$belt_config/belt/bin/resident/belt" ]; then exec "$belt_config/belt/bin/resident/belt" {action}; elif [ -x "$belt_config/belt/bin/current/belt" ]; then exec "$belt_config/belt/bin/current/belt" {action}; else exec belt {action}; fi"#
+                )
+            );
+            let home = crate::test_tmp::tempdir().unwrap();
+            // init's resident first, then the worker service's, then PATH.
+            let init = home.path().join(".config/belt/bin/resident/belt");
+            let resident = home.path().join(".config/belt/bin/current/belt");
+            let path = home.path().join("path");
+            std::fs::create_dir_all(init.parent().unwrap()).unwrap();
+            std::fs::create_dir_all(resident.parent().unwrap()).unwrap();
+            std::fs::create_dir(&path).unwrap();
+            for (binary, marker) in [
+                (&init, "init"),
+                (&resident, "resident"),
+                (&path.join("belt"), "path"),
+            ] {
+                std::fs::write(
+                    binary,
+                    format!("#!/bin/sh\nprintf '%s %s' {marker} \"$1\"\n"),
+                )
+                .unwrap();
+                std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+            let run = || {
+                std::process::Command::new("/bin/sh")
+                    .args(["-c", helper])
+                    .env_clear()
+                    .env("HOME", home.path())
+                    .env("PATH", &path)
+                    .output()
+                    .unwrap()
+            };
+            assert_eq!(run().stdout, format!("init {action}").as_bytes());
+            std::fs::set_permissions(&init, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(run().stdout, format!("resident {action}").as_bytes());
+            std::fs::set_permissions(&resident, std::fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(run().stdout, format!("path {action}").as_bytes());
+        }
+    }
 
     #[test]
     fn report_reads_only_configured_members_and_key_metadata() {
@@ -211,6 +354,52 @@ mod tests {
             "member_identity_mismatch"
         );
         assert!(!spec.cluster_key_path.exists());
+        struct Probe(bool);
+        impl workers::Remote for Probe {
+            fn run(
+                &mut self,
+                _: &crate::protocol::ssh::SshTarget,
+                command: &str,
+                input: &[u8],
+                timeout: std::time::Duration,
+            ) -> Result<workers::RemoteOutput, String> {
+                assert_eq!(command, "true");
+                assert!(input.is_empty());
+                assert_eq!(timeout, std::time::Duration::from_secs(3));
+                Ok(workers::RemoteOutput {
+                    code: Some(if self.0 { 0 } else { 255 }),
+                    stdout: b"untrusted output".to_vec(),
+                    stderr: vec![],
+                })
+            }
+            fn bridge_hello(
+                &mut self,
+                _: &crate::protocol::ssh::SshTarget,
+                _: &str,
+                _: &crate::ids::ClusterId,
+            ) -> Result<(crate::ids::ClusterId, WorkerId), String> {
+                panic!("no belt session")
+            }
+        }
+        let path = root.path().join("removed-members.json");
+        std::fs::write(
+            &path,
+            r#"{"old":1,"removed":{"removed_at_ms":2,"ssh":"fake-host"}}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let warnings = removal_warnings(&spec, &mut Probe(true)).unwrap();
+        assert_eq!(warnings.len(), 2);
+        assert_eq!(warnings[0].code, "removed_member_ssh_unknown");
+        assert!(warnings[1].message.contains("removed"));
+        assert!(warnings[1].message.contains("authorized_keys"));
+        assert!(!serde_json::to_string(&warnings)
+            .unwrap()
+            .contains("untrusted"));
+        assert_eq!(removal_warnings(&spec, &mut Probe(false)).unwrap().len(), 1);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(removal_warnings(&spec, &mut Probe(true)).unwrap().len(), 2);
     }
 
     #[test]

@@ -889,6 +889,15 @@ pub fn run(
         )
     })?;
     let mut checks = Vec::new();
+    for warning in super::group::removal_warnings(spec, remote)? {
+        checks.push(Check::new(
+            &warning.name,
+            warning.code,
+            Level::Notice,
+            warning.message,
+        ));
+    }
+
     let mut engines = Vec::new();
     // The parent's own worker, in the environment its service was given.
     let retained = spec.env.contains_key("HOME");
@@ -1142,7 +1151,7 @@ pub fn command(json: bool) -> i32 {
         .and_then(|exe| {
             let version = super::worker_service::sha256_file(&exe)
                 .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
-            let spec = super::context::runtime_spec(&env)?;
+            let spec = super::group::load_spec(&env)?;
             let mut group_checks = Vec::new();
             for member in workers::registrations(&env)? {
                 let name = WorkerId::parse(&member.id)
