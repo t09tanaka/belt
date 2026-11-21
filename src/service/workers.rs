@@ -135,7 +135,7 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// One `hello` over an already open transport. `required`: the features the
 /// worker must agree to; `None` requires what this build requires.
-async fn hello_on(
+pub(crate) async fn hello_on(
     io: crate::protocol::Io,
     cluster: &ClusterId,
     key: crate::secrets::key::ClusterKey,

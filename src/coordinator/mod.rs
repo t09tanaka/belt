@@ -603,6 +603,23 @@ impl Coordinator {
             .is_some_and(|marker| crate::worker::control::present(marker))
     }
 
+    /// On trial, leave the proof of what this version did with an attempt
+    /// it adopted: its lease was renewed, or a worker answered and it has no
+    /// lease to renew. The upgrade checks it before its commit (§24.8). A
+    /// proof that cannot be written is missing, and the upgrade then rolls
+    /// back.
+    fn note_trial(&self, attempt: &AttemptId, renewed: bool) {
+        if let Some(marker) = self.trial.get() {
+            if crate::worker::control::present(marker) {
+                let _ = if renewed {
+                    crate::worker::control::note_renewal(marker, attempt.as_str())
+                } else {
+                    crate::worker::control::note_unrenewed(marker, attempt.as_str())
+                };
+            }
+        }
+    }
+
     /// A change asked of a member on trial is answered "send again later"
     /// (`OVERLOADED`) with nothing saved: a rollback would lose it.
     pub(crate) fn check_trial(&self) -> Result<()> {
@@ -1391,6 +1408,15 @@ impl Coordinator {
         };
         let (answer, status) = self.ask(link, a).await;
         let step = policy::next_step(facts, answer);
+        let renewing = step == Step::Follow
+            && !matches!(
+                answer,
+                Answer::Status(AttemptState::Cancelling | AttemptState::Finalizing)
+            );
+        if answer != Answer::Unreachable && !renewing {
+            // A worker answered, and this attempt has no lease to renew.
+            self.note_trial(&a.attempt_id, false);
+        }
         if self.in_trial() && !matches!(step, Step::Follow | Step::KeepUnknown) {
             // Settled, retired, cancelled or sent again after the trial.
             return Ok(());
@@ -1786,6 +1812,10 @@ impl Coordinator {
         });
         match link.call(request).await {
             Err(LinkError::Remote(e)) if e.code == ErrorCode::StaleEpoch => Err(self.fence()),
+            Ok(Response::RenewLease(r)) if r.extended && r.attempt_id == a.attempt_id => {
+                self.note_trial(&a.attempt_id, true);
+                Ok(())
+            }
             // Renewed, or not renewable any more: the next look says why.
             Ok(_) | Err(LinkError::Remote(_)) => Ok(()),
             Err(LinkError::Unconfirmed) => {

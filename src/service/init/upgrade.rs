@@ -674,16 +674,18 @@ pub fn commit<L: Launcher>(trial: &Trial, launcher: &mut L) -> anyhow::Result<Up
     })
 }
 
+/// The version an executable in its version directory is.
+fn version_of(executable: &Path) -> &str {
+    executable
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+}
+
 impl Trial {
     fn versions(&self) -> (&str, &str) {
-        let to = self
-            .spec
-            .executable
-            .parent()
-            .and_then(|p| p.file_name())
-            .and_then(|n| n.to_str())
-            .unwrap_or_default();
-        (&self.from.binary_hash, to)
+        (&self.from.binary_hash, version_of(&self.spec.executable))
     }
     /// The CLI's own health check failed: roll back now, not at the deadline.
     pub fn abandon<L: Launcher>(self, launcher: &mut L, error: anyhow::Error) -> anyhow::Error {
@@ -844,9 +846,118 @@ pub fn guard_main(config: &Path) -> i32 {
     }
 }
 
-/// The new version answers its health check as the registered service, and
-/// this version reads both databases it left.
+/// What the CLI saw of the new version before the commit (§24.8).
+#[derive(Debug)]
+pub(crate) struct Seen {
+    /// The resident's own answer: its build, and what it offers and
+    /// requires in `hello`.
+    pub build: crate::service::workers::ResidentBuild,
+    /// The features its worker agreed to in a `hello`, or why it refused.
+    pub hello: Result<Vec<String>, String>,
+    /// The attempts it adopted: the live ones of the parent database.
+    pub adopted: Vec<String>,
+    /// What it noted it did with them, on trial.
+    pub proof: control::TrialProof,
+}
+
+/// Whether the new version `to` may be committed on what was seen: it is
+/// that build and negotiates what this binary does, its worker agrees in
+/// `hello` to every feature this build requires, and, when it adopted
+/// attempts, it renewed the lease of one of them (or a worker answered for
+/// each of them that it has no lease left to renew: ended, retired,
+/// cancelling or never arrived).
+pub(crate) fn judged(to: &str, seen: &Seen) -> anyhow::Result<()> {
+    use crate::service::workers::ResidentBuild;
+    let required = crate::protocol::session::required_features();
+    match &seen.build {
+        ResidentBuild::Running {
+            binary_sha256,
+            features,
+            required_features,
+        } => {
+            ensure!(
+                binary_sha256 == to,
+                "the new version answers as build {binary_sha256}, not {to}"
+            );
+            ensure!(
+                *features == crate::protocol::session::offered_features()
+                    && *required_features == required,
+                "the new version negotiates other features than this binary"
+            );
+        }
+        ResidentBuild::NotRunning => {
+            anyhow::bail!("the new version did not say which build it is (no answer)")
+        }
+        ResidentBuild::Unknown { reason } => {
+            anyhow::bail!("the new version did not say which build it is ({reason})")
+        }
+    }
+    let agreed = seen
+        .hello
+        .as_ref()
+        .map_err(|e| anyhow::anyhow!("the new version's worker did not answer hello: {e}"))?;
+    let missing: Vec<&str> = required
+        .iter()
+        .filter(|f| !agreed.contains(f))
+        .map(String::as_str)
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "the new version's worker did not agree to {}",
+        missing.join(", ")
+    );
+    let renewed = seen.adopted.iter().any(|a| seen.proof.renewed.contains(a));
+    let none_to_renew = seen
+        .adopted
+        .iter()
+        .all(|a| seen.proof.unrenewed.contains(a));
+    ensure!(
+        renewed || none_to_renew,
+        "the new version renewed the lease of none of the {} attempt(s) it adopted",
+        seen.adopted.len()
+    );
+    Ok(())
+}
+
+/// A `hello` to the worker of the new version, as a probe: it proves the
+/// group key, and the worker records nothing. Only this build's own
+/// required features are agreed to.
+async fn local_hello(spec: &Spec, worker_state: &Path) -> Result<Vec<String>, String> {
+    let cluster = spec
+        .expected_cluster
+        .clone()
+        .ok_or_else(|| "the resident names no group".to_string())?;
+    let key = crate::protocol::Membership::load(spec.worker_id.clone(), &spec.cluster_key_path)
+        .map_err(|e| e.to_string())?
+        .key;
+    let io = crate::protocol::transport::connect_unix(&worker_state.join("agent.sock"))
+        .await
+        .map_err(|e| format!("the worker socket: {e}"))?;
+    let answer = crate::service::workers::hello_on(io, &cluster, key, None).await?;
+    if answer.worker != spec.worker_id || answer.cluster != cluster {
+        return Err("another worker answered".into());
+    }
+    Ok(answer.features)
+}
+
+/// The attempts of the parent database that are live: the ones a starting
+/// version adopts.
+fn adopted(paths: &Paths) -> anyhow::Result<Vec<String>> {
+    Ok(
+        crate::storage::CoordinatorStore::open_read_only(&paths.state)?
+            .live_attempts(None)?
+            .into_iter()
+            .map(|live| live.record.attempt_id.to_string())
+            .collect(),
+    )
+}
+
+/// The new version answers its health check as the registered service, this
+/// version reads both databases it left, and what is seen of it is judged
+/// ([`judged`]). The coordinator renews at its ticks once it reaches the
+/// workers, so the proof of a renewal is waited for, never past [`READY`].
 fn checked<L: Launcher>(spec: &Spec, launcher: &mut L) -> anyhow::Result<()> {
+    let started = std::time::Instant::now();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -863,7 +974,25 @@ fn checked<L: Launcher>(spec: &Spec, launcher: &mut L) -> anyhow::Result<()> {
         .map_err(|_| anyhow::anyhow!("the new version did not answer as the registered service"))
     })?;
     let (j, paths) = managed_journal(spec)?;
-    identity_checked(&paths, &j)
+    identity_checked(&paths, &j)?;
+    let to = version_of(&spec.executable);
+    let mut seen = Seen {
+        build: crate::service::workers::resident_build(spec),
+        hello: runtime.block_on(local_hello(spec, &paths.worker)),
+        adopted: Vec::new(),
+        proof: control::TrialProof::default(),
+    };
+    // The build and the hello first: they do not change by waiting.
+    judged(to, &seen)?;
+    seen.adopted = adopted(&paths)?;
+    loop {
+        seen.proof = control::trial_proof(&paths.worker).unwrap_or_default();
+        let judgement = judged(to, &seen);
+        if judgement.is_ok() || started.elapsed() >= READY {
+            return judgement;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 /// `belt upgrade [--binary <path>]`. A binary other than this one runs the

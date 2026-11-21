@@ -620,3 +620,173 @@ async fn a57_a_switched_trial_whose_guard_is_gone_is_rolled_back_by_the_next_upg
     assert!(format!("{error:#}").contains("no guard"), "{error:#}");
     h.assert_old_version_back();
 }
+
+/// What a healthy new version `to` shows the CLI, with no attempt adopted.
+fn healthy(to: &str) -> Seen {
+    Seen {
+        build: crate::service::workers::ResidentBuild::Running {
+            binary_sha256: to.to_string(),
+            features: crate::protocol::session::offered_features(),
+            required_features: crate::protocol::session::required_features(),
+        },
+        hello: Ok(crate::protocol::session::offered_features()),
+        adopted: Vec::new(),
+        proof: control::TrialProof::default(),
+    }
+}
+
+#[test]
+fn a57_health_asks_for_the_build_its_hello_features_and_a_renewal() {
+    use crate::service::workers::ResidentBuild;
+    let to = "new-version";
+    judged(to, &healthy(to)).unwrap();
+    let refused = |seen: Seen, words: &str| {
+        let error = judged(to, &seen).unwrap_err();
+        assert!(format!("{error:#}").contains(words), "{error:#}");
+    };
+    // Another build, or one that negotiates otherwise, is not this one.
+    let mut other = healthy(to);
+    other.build = ResidentBuild::Running {
+        binary_sha256: "old-version".into(),
+        features: crate::protocol::session::offered_features(),
+        required_features: crate::protocol::session::required_features(),
+    };
+    refused(other, "answers as build old-version");
+    let mut fewer = healthy(to);
+    fewer.build = ResidentBuild::Running {
+        binary_sha256: to.into(),
+        features: crate::protocol::session::offered_features(),
+        required_features: Vec::new(),
+    };
+    refused(fewer, "other features");
+    let mut silent = healthy(to);
+    silent.build = ResidentBuild::Unknown {
+        reason: "it did not answer".into(),
+    };
+    refused(silent, "did not say which build");
+    // A hello that lacks a required feature, or is refused, is not health.
+    let mut lacking = healthy(to);
+    lacking.hello = Ok(crate::protocol::session::offered_features()
+        .into_iter()
+        .filter(|f| f.as_str() != crate::group::MEMBERSHIP_FEATURE)
+        .collect());
+    refused(lacking, crate::group::MEMBERSHIP_FEATURE);
+    let mut refusing = healthy(to);
+    refusing.hello = Err("required features missing: group_membership_v1".into());
+    refused(refusing, "did not answer hello");
+    // Adopted attempts: one renewed lease is health; none is not, even with
+    // renewals of attempts it did not adopt.
+    let mut adopted = healthy(to);
+    adopted.adopted = vec!["a-1".into(), "a-2".into()];
+    refused(adopted, "renewed the lease of none of the 2");
+    let mut stranger = healthy(to);
+    stranger.adopted = vec!["a-1".into()];
+    stranger.proof.renewed = vec!["a-9".into()];
+    refused(stranger, "renewed the lease of none of the 1");
+    let mut renewed = healthy(to);
+    renewed.adopted = vec!["a-1".into(), "a-2".into()];
+    renewed.proof.renewed = vec!["a-2".into()];
+    renewed.proof.unrenewed = vec!["a-1".into()];
+    judged(to, &renewed).unwrap();
+    // When a worker said of every one that it has no lease left (ended
+    // before it was collected), there is nothing to renew.
+    let mut ended = healthy(to);
+    ended.adopted = vec!["a-1".into(), "a-2".into()];
+    ended.proof.unrenewed = vec!["a-1".into()];
+    refused(ended, "renewed the lease of none");
+    let mut all_ended = healthy(to);
+    all_ended.adopted = vec!["a-1".into(), "a-2".into()];
+    all_ended.proof.unrenewed = vec!["a-2".into(), "a-1".into()];
+    judged(to, &all_ended).unwrap();
+}
+
+/// The upgrade with a health check that judges what the new version shows,
+/// the proof of renewal read from where its coordinator writes it.
+fn upgrade_seeing(
+    h: &Host,
+    fake: &mut Fake,
+    adjust: &dyn Fn(&mut Seen),
+    renews: Option<&str>,
+) -> anyhow::Result<Upgraded> {
+    upgrade(
+        &h.env,
+        &h.new_exe,
+        fake,
+        OPTIONS,
+        &|| 0,
+        &mut |spec: &Spec, _: &mut Fake| {
+            // The new version on trial: its coordinator notes a renewal.
+            if let Some(attempt) = renews {
+                control::note_renewal(&control::trial_path(&h.paths.worker), attempt)?;
+            }
+            let mut seen = healthy(version_of(&spec.executable));
+            adjust(&mut seen);
+            seen.proof = control::trial_proof(&h.paths.worker)?;
+            judged(version_of(&spec.executable), &seen)
+        },
+    )
+}
+
+#[tokio::test]
+async fn a57_a_new_version_whose_hello_lacks_a_required_feature_is_not_committed() {
+    let h = Host::new().await;
+    let mut fake = h.fake.clone();
+    let error = upgrade_seeing(
+        &h,
+        &mut fake,
+        &|seen| {
+            seen.hello = Ok(crate::protocol::session::offered_features()
+                .into_iter()
+                .filter(|f| f.as_str() != crate::group::SHARED_ADMISSION_FEATURE)
+                .collect())
+        },
+        None,
+    )
+    .unwrap_err();
+    assert!(format!("{error:#}").contains("did not agree"), "{error:#}");
+    h.assert_old_version_back();
+}
+
+#[tokio::test]
+async fn a57_a_new_version_that_adopts_and_never_renews_is_not_committed() {
+    let h = Host::new().await;
+    let mut fake = h.fake.clone();
+    let error = upgrade_seeing(
+        &h,
+        &mut fake,
+        &|seen| seen.adopted = vec!["a-1".into()],
+        None,
+    )
+    .unwrap_err();
+    assert!(
+        format!("{error:#}").contains("renewed the lease of none"),
+        "{error:#}"
+    );
+    h.assert_old_version_back();
+    // The proof of that trial went with it.
+    assert_eq!(
+        control::trial_proof(&h.paths.worker).unwrap(),
+        control::TrialProof::default()
+    );
+}
+
+#[tokio::test]
+async fn a57_a_healthy_new_version_that_renews_what_it_adopted_is_committed() {
+    let h = Host::new().await;
+    let mut fake = h.fake.clone();
+    let upgraded = upgrade_seeing(
+        &h,
+        &mut fake,
+        &|seen| seen.adopted = vec!["a-1".into()],
+        Some("a-1"),
+    )
+    .unwrap();
+    assert_eq!(upgraded.to, h.new);
+    assert_eq!(h.resident_link(), Path::new(&h.new));
+    h.assert_finished();
+    // The commit ends the proof with the trial.
+    assert_eq!(
+        control::trial_proof(&h.paths.worker).unwrap(),
+        control::TrialProof::default()
+    );
+}

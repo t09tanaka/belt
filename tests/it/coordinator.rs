@@ -3583,6 +3583,19 @@ async fn a57_a_parent_on_trial_adopts_and_renews_and_promises_nothing_more() {
     assert_eq!(a.count(Op::Submit), 3, "nothing placed or sent again");
     assert_eq!(a.count(Op::Retire), 0, "no retire is sent");
     assert!(a.count(Op::Renew) > renewals, "leases are renewed");
+    // The renewal is proven to the upgrade, by an attempt that was adopted.
+    let proof = belt::worker::control::trial_proof(f.dir.path()).unwrap();
+    assert!(
+        before
+            .iter()
+            .any(|b| proof.renewed.contains(&b.attempt_id.to_string())),
+        "{proof:?}"
+    );
+    // The attempt that finished has no lease left, and a worker said so.
+    assert!(
+        proof.unrenewed.contains(&before[0].attempt_id.to_string()),
+        "{proof:?}"
+    );
     // The attempts are adopted by the new epoch, not placed again.
     let lease = a.held(&before[2].attempt_id).unwrap().lease.unwrap();
     assert_eq!(lease.coordinator_epoch, CoordinatorEpoch(2));
