@@ -882,7 +882,7 @@ fn with_pidfiles(f: &Fx, script: &str) -> (NodeSpec, PathBuf, PathBuf) {
 #[test]
 fn cancel_terms_then_kills_the_group_and_records_only_after_it_is_gone() {
     let mut f = fx(vec![]);
-    let (n, bg, leader) = with_pidfiles(&f, IGNORES_TERM);
+    let (n, bg, leader) = with_pidfiles(&f, &crate::fixture_process::script(IGNORES_TERM));
     f.spec.nodes = vec![n];
     f.spec.term_grace_ms = 600;
     let second = f.open_second();
@@ -913,7 +913,9 @@ fn a_cooperative_command_stops_on_term_within_the_grace() {
     let mut f = fx(vec![]);
     let (n, bg, leader) = with_pidfiles(
         &f,
-        "sleep 30 & echo $! > \"$BGPID\"; echo $$ > \"$LEADER\"; wait",
+        &crate::fixture_process::script(
+            "sleep 30 & echo $! > \"$BGPID\"; echo $$ > \"$LEADER\"; wait",
+        ),
     );
     f.spec.nodes = vec![n];
     let second = f.open_second();
@@ -972,7 +974,7 @@ fn natural_end_and_cancel_racing_still_give_one_terminal() {
 #[test]
 fn lease_expiry_stops_the_command_and_a_late_renewal_cannot_revive_it() {
     let mut f = fx(vec![]);
-    let (n, bg, _) = with_pidfiles(&f, IGNORES_TERM);
+    let (n, bg, _) = with_pidfiles(&f, &crate::fixture_process::script(IGNORES_TERM));
     f.spec.nodes = vec![n];
     f.spec.lease_ms = 700;
     f.spec.term_grace_ms = 300;
@@ -995,7 +997,10 @@ fn renewals_keep_the_attempt_alive_past_one_lease_period() {
     // by the renewals. A renewal every 100 ms leaves a twenty-fold margin: a
     // loaded runner (coverage instrumentation) that stalls this thread or
     // its commit for a few hundred ms must not let the lease lapse.
-    let mut f = fx(vec![node("n", "sleep 3.5")]);
+    let mut f = fx(vec![node(
+        "n",
+        &crate::fixture_process::script("sleep 3.5"),
+    )]);
     f.spec.lease_ms = 2000;
     let second = f.open_second();
     let attempt = f.attempt().clone();
@@ -1032,7 +1037,7 @@ fn renewals_keep_the_attempt_alive_past_one_lease_period() {
 
 #[test]
 fn a_replayed_renewal_does_not_extend_the_lease() {
-    let mut f = fx(vec![node("n", "sleep 30")]);
+    let mut f = fx(vec![node("n", &crate::fixture_process::script("sleep 30"))]);
     f.spec.lease_ms = 900;
     f.spec.term_grace_ms = 300;
     let second = f.open_second();
@@ -1096,7 +1101,7 @@ fn a_node_after_the_lease_ran_out_is_not_started() {
 
 #[test]
 fn the_command_timeout_stops_a_running_command() {
-    let mut f = fx(vec![node("n", "sleep 30")]);
+    let mut f = fx(vec![node("n", &crate::fixture_process::script("sleep 30"))]);
     f.spec.command_timeout_ms = Some(500);
     f.spec.term_grace_ms = 2_000;
     let started = Instant::now();
@@ -1117,10 +1122,16 @@ fn a_node_s_own_timeout_replaces_the_default_for_that_node_only() {
     let mut f = fx(vec![]);
     let marker = f.path("stuck-started");
     f.spec.nodes = vec![
-        node("slow", "sleep 3; echo slow-done"),
+        node(
+            "slow",
+            &crate::fixture_process::script("sleep 3; echo slow-done"),
+        ),
         node(
             "stuck",
-            &format!("touch {}; sleep 30; echo stuck-done", marker.display()),
+            &crate::fixture_process::script(&format!(
+                "touch {}; sleep 30; echo stuck-done",
+                marker.display()
+            )),
         ),
     ];
     f.spec.command_timeout_ms = Some(2_000);
@@ -1145,7 +1156,10 @@ fn a_node_without_its_own_timeout_keeps_the_default() {
         node("quick", "true"),
         node(
             "stuck",
-            &format!("touch {}; sleep 30; echo stuck-done", marker.display()),
+            &crate::fixture_process::script(&format!(
+                "touch {}; sleep 30; echo stuck-done",
+                marker.display()
+            )),
         ),
     ];
     // Long enough for the shell to write the marker on a loaded machine.
@@ -1170,7 +1184,7 @@ fn a_node_timeout_of_zero_is_refused() {
 #[test]
 fn a_seeded_lease_ends_when_the_grant_made_before_the_start_ends() {
     // A 30 s lease of which 700 ms are left when the supervisor starts.
-    let mut f = fx(vec![node("n", "sleep 30")]);
+    let mut f = fx(vec![node("n", &crate::fixture_process::script("sleep 30"))]);
     f.spec.lease_ms = 30_000;
     f.spec.term_grace_ms = 300;
     f.spec.lease_seed = Some(LeaseSeed {
@@ -1567,7 +1581,10 @@ fn the_deadline_counts_the_whole_attempt() {
     let marker = f.path("deadline-command-started");
     f.spec.nodes = vec![node(
         "n",
-        &format!("touch {}; sleep 30; echo deadline-missed", marker.display()),
+        &crate::fixture_process::script(&format!(
+            "touch {}; sleep 30; echo deadline-missed",
+            marker.display()
+        )),
     )];
     f.spec.deadline_ms = Some(500);
     f.spec.command_timeout_ms = Some(60_000);
@@ -1619,8 +1636,9 @@ fn the_deadline_counts_the_whole_attempt() {
 // ------------------------------------------------- A20 recovery and identity
 
 fn spawn_sleeper() -> (std::process::Child, ProcessIdentityParts) {
-    let child = Command::new("sleep")
-        .arg("60")
+    let child = Command::new("sh")
+        .arg("-c")
+        .arg(crate::fixture_process::script("exec sleep 60"))
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -1721,7 +1739,9 @@ fn a_dead_leader_with_a_surviving_descendant_is_stopped_by_recovery() {
     let bg = f.path("bg.pid");
     let mut child = Command::new("sh")
         .arg("-c")
-        .arg("sleep 60 & echo $! > \"$1\"; wait")
+        .arg(crate::fixture_process::script(
+            "sleep 60 & echo $! > \"$1\"; wait",
+        ))
         .arg("sh")
         .arg(&bg)
         .process_group(0)
@@ -2199,7 +2219,7 @@ fn a_detached_supervisor_runs_without_its_parent_waiting() {
 #[test]
 fn a_killed_supervisor_leaves_the_command_for_recovery_to_stop() {
     let f = fx(vec![]);
-    let (n, bg, leader) = with_pidfiles(&f, IGNORES_TERM);
+    let (n, bg, leader) = with_pidfiles(&f, &crate::fixture_process::script(IGNORES_TERM));
     let mut spec = f.spec.clone();
     spec.nodes = vec![n];
     spec.term_grace_ms = 300;
@@ -2248,7 +2268,10 @@ fn a_killed_supervisor_leaves_the_command_for_recovery_to_stop() {
 #[test]
 fn a_descendant_left_behind_by_an_early_exit_is_stopped_before_the_result_is_fixed() {
     let mut f = fx(vec![]);
-    let (n, bg, _leader) = with_pidfiles(&f, "sleep 1000 & echo $! > \"$BGPID\"; exit 0");
+    let (n, bg, _leader) = with_pidfiles(
+        &f,
+        &crate::fixture_process::script("sleep 1000 & echo $! > \"$BGPID\"; exit 0"),
+    );
     f.spec.nodes = vec![n];
     f.spec.term_grace_ms = 500;
     let spec = f.spec.clone();
@@ -2430,7 +2453,7 @@ fn generic_conditions_cover_timeout_prelaunch_cancel_and_prepared_only() {
         f.spec.artifacts = Some(p);
         match mode {
             "timeout" => {
-                f.spec.nodes = vec![in_ws(&f, "sleep 10")];
+                f.spec.nodes = vec![in_ws(&f, &crate::fixture_process::script("sleep 10"))];
                 f.spec.command_timeout_ms = Some(100);
                 f.spec.term_grace_ms = 20;
             }

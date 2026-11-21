@@ -608,11 +608,11 @@ fn lines(p: &Path) -> usize {
 /// A command that records each start and its PID, then stays.
 pub(crate) fn stay(f: &Fx) -> (String, PathBuf, PathBuf) {
     let (marker, pidfile) = (f.path("starts"), f.path("pid"));
-    let script = format!(
+    let script = crate::fixture_process::script(&format!(
         "echo start >> {}; echo $$ > {}; exec sleep 300",
         marker.display(),
         pidfile.display()
-    );
+    ));
     (script, marker, pidfile)
 }
 
@@ -1490,7 +1490,7 @@ async fn a_command_s_own_timeout_overrides_the_default_of_the_attempt() {
     assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
     // Shorter than the default, and with no default at all.
     for default in [Some(60_000), None] {
-        let mut p = payload("sleep 30");
+        let mut p = payload(&crate::fixture_process::script("sleep 30"));
         p.command_timeout_ms = default;
         p.commands[0].timeout_ms = Some(400);
         let b = AttemptId::generate();
@@ -4822,7 +4822,7 @@ async fn a_ci_task_with_service_containers_is_refused_before_it_is_stored() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_ci_task_whose_supervisor_is_lost_during_a_step_is_recovered_as_interrupted() {
     let ci = ci_fx(
-        "on: push\njobs:\n  job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 300\n      - if: always()\n        run: echo always > always.txt\n",
+        &crate::fixture_process::script("on: push\njobs:\n  job:\n    runs-on: ubuntu-latest\n    steps:\n      - run: sleep 300\n      - if: always()\n        run: echo always > always.txt\n"),
     );
     let f = &ci.f;
     let c = f.connect_ci(&ci.agent).await;

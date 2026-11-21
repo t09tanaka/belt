@@ -555,7 +555,9 @@ async fn a01_three_real_workers_on_one_machine_each_run_one_of_three_tasks() {
 async fn a02_a_real_worker_that_joins_later_starts_the_backlog_the_parent_kept() {
     let mut h = one_host(&["w-a"]);
     let c = h.parent().await;
-    let probes = h.enqueue(&c, 4, "exec sleep 300").await;
+    let probes = h
+        .enqueue(&c, 4, &crate::fixture_process::script("exec sleep 300"))
+        .await;
     c.tick().await.unwrap();
     c.tick().await.unwrap();
     // One runs and one waits behind it on the only worker (its own limits).
@@ -606,7 +608,9 @@ async fn a19_a21_a_lost_ack_and_a_gone_link_never_start_the_task_on_the_free_wor
     let (a, b) = (h.worker("w-a"), h.worker("w-b"));
     // The first decision goes to `w-a` (equal estimates, the lower id).
     a.faults.lose(Operation::SubmitAttempt, Lost::Answer);
-    let probes = h.enqueue(&c, 1, "exec sleep 300").await;
+    let probes = h
+        .enqueue(&c, 1, &crate::fixture_process::script("exec sleep 300"))
+        .await;
     let report = c.tick().await.unwrap();
     let first = only(&c, &probes[0].task);
     assert_eq!(first.worker_id, a.id, "{}", h.picture(&c, &probes));
@@ -668,7 +672,9 @@ struct Running {
 async fn running_on_both() -> Running {
     let h = one_host(&["w-a", "w-b"]);
     let c = h.parent().await;
-    let probes = h.enqueue(&c, 2, "exec sleep 300").await;
+    let probes = h
+        .enqueue(&c, 2, &crate::fixture_process::script("exec sleep 300"))
+        .await;
     h.tick_until(&c, &probes, "both commands on record and active", || {
         probes.iter().all(|p| {
             let a = only(&c, &p.task);
@@ -835,7 +841,9 @@ async fn a26_workers_whose_wall_clocks_are_off_keep_their_leases_and_end_normall
     h.worker("w-a").faults.skew_wall(-DAY);
     h.worker("w-b").faults.skew_wall(365 * DAY);
     let before = belt::platform::wall_ms();
-    let probes = h.enqueue(&c, 2, "sleep 6").await;
+    let probes = h
+        .enqueue(&c, 2, &crate::fixture_process::script("sleep 6"))
+        .await;
     h.settle(&c, &probes).await;
     let picture = h.picture(&c, &probes);
     let mut on = Vec::new();

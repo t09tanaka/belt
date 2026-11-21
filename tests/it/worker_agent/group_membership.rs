@@ -578,7 +578,8 @@ async fn a_retired_identity_stops_that_members_attempts_now_and_refuses_it_from_
         .await
         .unwrap();
     let other_started = f.path("other-started");
-    let other_script = format!("touch {}; sleep 600", other_started.display());
+    let other_script =
+        crate::fixture_process::script(&format!("touch {}; sleep 600", other_started.display()));
     call(&b, request_of(&sub, &theirs, &long(&other_script)))
         .await
         .unwrap();
@@ -693,7 +694,10 @@ async fn a_start_ends_an_unstarted_attempt_whose_lease_was_ended_and_no_other() 
     };
     let marked = |tag: &str| {
         let marker = f.path(&format!("{tag}-started"));
-        (format!("touch {}; sleep 600", marker.display()), marker)
+        (
+            crate::fixture_process::script(&format!("touch {}; sleep 600", marker.display())),
+            marker,
+        )
     };
     // One attempt of the retiring member runs already.
     let (running_script, running_marker) = marked("running");
@@ -764,7 +768,7 @@ async fn another_members_uncollected_result_holds_a_retired_worker_until_it_is_c
     let a = dial(&f, &agent, &main).await.unwrap().client;
     let b = dial(&f, &agent, &sub).await.unwrap().client;
     assert_eq!(agent.retirement(), (false, Some(0), Some(0)));
-    let mut long = payload("sleep 600");
+    let mut long = payload(&crate::fixture_process::script("sleep 600"));
     long.lease_ms = 600_000;
     let (mine, theirs) = (AttemptId::generate(), AttemptId::generate());
     call(&a, request_of(&main, &mine, &long)).await.unwrap();

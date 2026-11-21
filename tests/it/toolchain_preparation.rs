@@ -96,10 +96,10 @@ done
                 "flaky" => format!("if [ -e '{}/fail' ]; then exit 19; fi", host.display()),
                 "wrong" => "# wrong probe is injected below".to_string(),
                 "long" => "/usr/bin/yes x | /usr/bin/head -c 9000; exit 0".to_string(),
-                "hang" => format!(
+                "hang" => crate::fixture_process::script(&format!(
                     "/bin/sleep 120 &\nprintf '%s\\n' \"$!\" > '{0}/child.pending'\n/bin/mv '{0}/child.pending' '{0}/child'\nwait",
                     host.display()
-                ),
+                )),
                 "gate" => format!(
                     "while [ ! -f '{}/release' ]; do /bin/sleep 0.05; done",
                     host.display()
