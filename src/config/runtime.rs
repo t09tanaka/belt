@@ -267,6 +267,11 @@ impl ResolvedConfig {
 }
 
 impl WorkerRuntime {
+    pub(crate) fn with_coordinator(mut self, state: PathBuf) -> Self {
+        self.agent.coordinator_state = Some(state);
+        self
+    }
+
     pub(crate) fn with_instance(mut self, instance: Option<WorkerBootId>) -> Self {
         self.agent.instance_id = instance;
         self

@@ -591,6 +591,29 @@ impl CoordinatorStore {
         self.epoch
     }
 
+    /// Execution only: empty runs and terminal tasks awaiting collection are idle.
+    pub fn has_nonterminal_runs(&self) -> Result<bool> {
+        let boundary = if self.retry_boundaries {
+            "AND aa.generation >= t.min_generation"
+        } else {
+            ""
+        };
+        let cancelled = if self.task_cancel {
+            "t.cancel_requested_at_ms IS NULL"
+        } else {
+            "1"
+        };
+        let sql = format!("SELECT EXISTS(
+            SELECT 1 FROM task t LEFT JOIN attempt a ON a.attempt_id = (
+                SELECT aa.attempt_id FROM attempt aa
+                WHERE aa.task_id = t.task_id AND aa.retired = 0 {boundary}
+                ORDER BY aa.generation DESC LIMIT 1)
+            WHERE coalesce(json_extract(t.spec_json, '$.ci.task.inputs.belt_discovery.applied'), 0) = 0
+              AND ((a.attempt_id IS NULL AND ({cancelled})) OR a.state <> 'terminal'))");
+        self.db
+            .call(move |c| Ok(c.query_row(&sql, [], |r| r.get(0))?))
+    }
+
     /// Work still owned by this member prevents moving its group.
     pub fn has_group_work(&self) -> Result<bool> {
         self.db.call(|c| Ok(c.query_row(

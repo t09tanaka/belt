@@ -6417,3 +6417,16 @@ fn membership_maintenance_reads_and_writes_v21_without_migration() {
         .unwrap();
     assert_eq!(version, "21");
 }
+
+#[test]
+fn own_runs_ignore_collection_but_include_unplaced_tasks() {
+    let f = fx();
+    assert!(f.store.has_nonterminal_runs().unwrap());
+    let attempt = f.attempt('a').unwrap();
+    assert!(f.store.has_nonterminal_runs().unwrap());
+    f.to_finalizing(&attempt.attempt_id);
+    f.store
+        .finalize_attempt(&attempt.attempt_id, done(Outcome::Succeeded), 30)
+        .unwrap();
+    assert!(!f.store.has_nonterminal_runs().unwrap());
+}

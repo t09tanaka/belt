@@ -45,6 +45,18 @@ pub trait Remote {
         timeout: Duration,
     ) -> Result<RemoteOutput, String>;
 
+    /// Read the additive inspect fact before stopping. Older implementations
+    /// cannot establish that stopping is safe.
+    fn own_runs_active(
+        &mut self,
+        _target: &SshTarget,
+        _binary: &str,
+        _spec: &Spec,
+        _name: &str,
+    ) -> Result<Option<bool>, String> {
+        Ok(None)
+    }
+
     /// Another handle that can run commands at the same time as this one, or
     /// `None` when this remote cannot (the work is then done one command at
     /// a time). `ssh` can: every call is its own process.
@@ -188,7 +200,102 @@ impl SshRemote {
         }
     }
 }
+fn stopped_bridge(code: Option<i32>, stderr: &[u8]) -> bool {
+    code == Some(ErrorCode::NotFound.exit_code())
+        && String::from_utf8_lossy(stderr)
+            .lines()
+            .any(|line| line.starts_with("error: worker agent is not running (cannot connect to "))
+}
+
 impl Remote for SshRemote {
+    fn own_runs_active(
+        &mut self,
+        target: &SshTarget,
+        binary: &str,
+        spec: &Spec,
+        name: &str,
+    ) -> Result<Option<bool>, String> {
+        let store = crate::storage::CoordinatorStore::open_read_only(&spec.state_dir)
+            .map_err(|e| e.to_string())?;
+        let membership = crate::protocol::Membership::load(spec.worker_id.clone(), &self.key_path)
+            .map_err(|e| e.to_string())?;
+        let config = crate::protocol::ClientConfig::new(
+            store.cluster_id().clone(),
+            store.coordinator_id().clone(),
+            store.epoch(),
+            membership,
+        );
+        let command = RemoteCommand::worker_stdio(binary).map_err(|e| e.to_string())?;
+        let argv = ssh_argv(target, &command);
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| e.to_string())?
+            .block_on(async {
+                let transport = crate::protocol::transport::spawn_child_piped_stderr(&argv)
+                    .map_err(|e| e.to_string())?;
+                let mut child = transport.child;
+                let stderr = child.stderr.take().expect("piped stderr");
+                let mut stderr = tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt;
+                    let mut bytes = Vec::new();
+                    let _ = stderr.take(8192).read_to_end(&mut bytes).await;
+                    bytes
+                });
+                let answer = tokio::time::timeout(HELLO_TIMEOUT, async {
+                    let connected = crate::protocol::connect(transport.io, config)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let response = connected
+                        .client
+                        .call(
+                            crate::wire::Request::Inspect(crate::wire::InspectRequest {
+                                preparation_observations: None,
+                                schema_version: crate::wire::SchemaVersion::CURRENT,
+                                request_id: crate::ids::RequestId::generate(),
+                            }),
+                            HELLO_TIMEOUT,
+                        )
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    match response {
+                        crate::wire::Response::Inspect(report)
+                            if report.worker_id == connected.worker.worker_id =>
+                        {
+                            Ok((report.worker_id, report.own_runs_active))
+                        }
+                        _ => Err("worker did not answer inspect".into()),
+                    }
+                })
+                .await
+                .map_err(|_| "worker inspect timed out".to_string())
+                .and_then(|r| r);
+                if answer.is_err() {
+                    if let Ok(Ok(status)) =
+                        tokio::time::timeout(Duration::from_secs(5), child.wait()).await
+                    {
+                        if let Ok(Ok(bytes)) =
+                            tokio::time::timeout(Duration::from_secs(1), &mut stderr).await
+                        {
+                            if stopped_bridge(status.code(), &bytes) {
+                                return Ok(Some(false));
+                            }
+                        }
+                    }
+                }
+                stderr.abort();
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+                let (worker, active) = answer?;
+                // The target name is checked by the caller's registration as well
+                // as the lifecycle reply, before any stop is sent.
+                if worker.as_str() != name {
+                    return Err("inspect answered for a different worker".into());
+                }
+                Ok(active)
+            })
+    }
+
     fn split(&self) -> Option<Box<dyn Remote + Send>> {
         Some(Box::new(SshRemote::new(&self.key_path)))
     }
@@ -306,6 +413,15 @@ impl Remote for Box<dyn Remote + Send> {
         timeout: Duration,
     ) -> Result<RemoteOutput, String> {
         (**self).run(target, shell, stdin, timeout)
+    }
+    fn own_runs_active(
+        &mut self,
+        target: &SshTarget,
+        binary: &str,
+        spec: &Spec,
+        name: &str,
+    ) -> Result<Option<bool>, String> {
+        (**self).own_runs_active(target, binary, spec, name)
     }
     fn split(&self) -> Option<Box<dyn Remote + Send>> {
         (**self).split()
@@ -1252,6 +1368,30 @@ pub fn lifecycle(
     let target = target_of(&registration.ssh)?;
     let digest = worker_service::sha256_file(exe)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    if matches!(
+        action,
+        Lifecycle::Stop {
+            all_submitters: false,
+            ..
+        }
+    ) {
+        let active = remote
+            .own_runs_active(
+                &target,
+                registration.binary.as_deref().unwrap_or("belt"),
+                spec,
+                name,
+            )
+            .map_err(|message| ApiError::new(ErrorCode::CommunicationUnknown,
+                format!("target {name} cannot be reached for inspect: {message}; --all-submitters stops it without the check")))?;
+        match active {
+            Some(false) => {},
+            Some(true) => return Err(ApiError::new(ErrorCode::Conflict,
+                format!("target {name} has its own non-terminal runs; use --all-submitters to stop"))),
+            None => return Err(ApiError::new(ErrorCode::Conflict,
+                format!("target {name} cannot tell whether it has its own non-terminal runs; use --all-submitters to stop"))),
+        }
+    }
     let wait = STOP_WAIT_SECS;
     // Which member asks decides whose live work blocks a stop. Unreadable:
     // none is named and every member's work blocks it.

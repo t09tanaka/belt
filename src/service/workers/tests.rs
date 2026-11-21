@@ -29,6 +29,7 @@ struct FakeRemote {
     /// What the bridge answers instead of the installed worker's own identity.
     bridge_answer: Option<(ClusterId, WorkerId)>,
     bridge_fails: bool,
+    own_runs_active: Option<bool>,
     /// Replaces the answer to `worker-service env`.
     env_answer: Option<Vec<u8>>,
     /// Answers to `worker-service env`, used first, one per call.
@@ -59,6 +60,18 @@ impl FakeRemote {
     }
 }
 impl Remote for FakeRemote {
+    fn own_runs_active(
+        &mut self,
+        _: &SshTarget,
+        _: &str,
+        _: &Spec,
+        _: &str,
+    ) -> Result<Option<bool>, String> {
+        if !self.reachable {
+            return Err("SSH unavailable".into());
+        }
+        Ok(self.own_runs_active)
+    }
     fn parent_os(&self) -> &str {
         // The parent is a Mac whatever machine the test runs on, unless a
         // test says otherwise.
@@ -188,7 +201,10 @@ impl Remote for FakeRemote {
             stdin,
             &self.staged(),
             self.fake.clone(),
-            options(cancel),
+            Options {
+                all_submitters: shell.contains("'--all-submitters'"),
+                ..options(cancel)
+            },
         );
         if action == Action::Install && result.is_ok() {
             // What the running agent writes on its first start.
@@ -278,6 +294,7 @@ impl World {
                 bridges: vec![],
                 bridge_answer: None,
                 bridge_fails: false,
+                own_runs_active: Some(false),
                 env_answer: None,
                 env_queue: Default::default(),
             },
@@ -2870,4 +2887,75 @@ fn removing_workers_preserves_full_subtables_and_rejects_ambiguous_split() {
     fs::write(&path, &crafted).unwrap();
     assert!(remove_registrations(&world.env, &["remove".into()]).is_err());
     assert_eq!(fs::read_to_string(path).unwrap(), crafted);
+}
+
+#[test]
+fn stop_checks_own_runs_and_old_peers_even_when_cancelling() {
+    for active in [Some(true), None] {
+        for cancel_running in [false, true] {
+            let mut w = stopped_member();
+            w.remote.own_runs_active = active;
+            let before = w.remote.log.len();
+            let error = w
+                .lifecycle(
+                    "mini-a",
+                    Lifecycle::Stop {
+                        cancel_running,
+                        all_submitters: false,
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                error.message.contains(if active.is_none() {
+                    "cannot tell"
+                } else {
+                    "own non-terminal runs"
+                }),
+                "{error:?}"
+            );
+            assert_eq!(w.remote.log.len(), before, "refused before remote stop");
+            let status = w
+                .lifecycle(
+                    "mini-a",
+                    Lifecycle::Stop {
+                        cancel_running,
+                        all_submitters: true,
+                    },
+                )
+                .unwrap();
+            assert_eq!(status.loaded, Some(false));
+        }
+    }
+}
+
+#[test]
+fn stopped_bridge_requires_remote_missing_agent_diagnostic() {
+    let message =
+        b"error: worker agent is not running (cannot connect to /tmp/agent.sock): missing";
+    assert!(stopped_bridge(
+        Some(ErrorCode::NotFound.exit_code()),
+        message
+    ));
+    assert!(!stopped_bridge(Some(255), message));
+    assert!(!stopped_bridge(
+        Some(ErrorCode::NotFound.exit_code()),
+        b"permission denied"
+    ));
+}
+
+#[test]
+fn unreachable_stop_has_override_guidance() {
+    let mut w = stopped_member();
+    w.remote.reachable = false;
+    let error = w
+        .lifecycle(
+            "mini-a",
+            Lifecycle::Stop {
+                cancel_running: false,
+                all_submitters: false,
+            },
+        )
+        .unwrap_err();
+    assert!(error.message.contains("cannot be reached"));
+    assert!(error.message.contains("--all-submitters"));
 }

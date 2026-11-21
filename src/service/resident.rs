@@ -612,13 +612,16 @@ impl StartupParts {
             local_worker: worker_id.clone(),
         });
         coordinator.set_parent_local(worker_id.clone());
-        let runtime = config.worker_runtime(inputs.worker)?;
+        let runtime = config
+            .worker_runtime(inputs.worker)?
+            .with_coordinator(inputs.state_dir.clone());
         let host = runtime
             .open_host_in_place(inputs.state_dir.clone())
             .map_err(|e| anyhow::anyhow!(e.message))?;
         let agent = runtime
             .start_with_host(host)
             .map_err(|e| anyhow::anyhow!(e.message))?;
+        agent.set_coordinator(&coordinator);
         let cluster = coordinator.store().cluster_id().clone();
         Ok(StartupParts {
             cluster,

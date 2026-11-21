@@ -452,6 +452,9 @@ pub struct InspectRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InspectResponse {
+    /// Whether this host has non-terminal runs it submitted itself.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_runs_active: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preparation_observations: Option<crate::setup::observation_transport::ObservationPage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2518,6 +2521,23 @@ mod tests {
         // Not there: not written, and read as not said.
         let v = serde_json::to_value(&inspect).unwrap();
         assert!(v.get("admission").is_none());
+        assert!(v.get("own_runs_active").is_none());
+        assert_eq!(
+            serde_json::from_value::<InspectResponse>(v.clone())
+                .unwrap()
+                .own_runs_active,
+            None
+        );
+        for active in [false, true] {
+            let mut report = inspect.clone();
+            report.own_runs_active = Some(active);
+            let encoded = serde_json::to_value(&report).unwrap();
+            assert_eq!(encoded["own_runs_active"], active);
+            assert_eq!(
+                serde_json::from_value::<InspectResponse>(encoded).unwrap(),
+                report
+            );
+        }
         assert_eq!(
             serde_json::from_value::<InspectResponse>(v).unwrap(),
             inspect
@@ -2580,6 +2600,7 @@ mod tests {
                 nonce: "cd".repeat(32),
             }),
             Response::Inspect(InspectResponse {
+                own_runs_active: None,
                 admission: None,
                 preparation_observations: None,
                 capabilities: None,

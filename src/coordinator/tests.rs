@@ -675,6 +675,7 @@ impl WorkerLink for RefusesCapacity {
         Box::pin(async move {
             match request {
                 Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
+                    own_runs_active: None,
                     admission: Some(crate::wire::AdmissionWindow {
                         limit: 1,
                         used: 0,

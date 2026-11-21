@@ -284,6 +284,7 @@ mod tests {
                     }
                 });
                 Ok(Response::Inspect(InspectResponse {
+                    own_runs_active: None,
                     admission: None,
                     preparation_observations: page,
                     capabilities: None,
