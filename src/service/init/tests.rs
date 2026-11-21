@@ -886,7 +886,7 @@ async fn membership_rollback_restores_rows_and_preserves_service_state() {
             } else {
                 // Simulate termination at each publication boundary: recovery must
                 // run before runtime_spec / managed receipt checks on the next call.
-                membership_undo::prepare(&paths, previous, running).unwrap();
+                membership_undo::prepare(&paths, previous, running, true).unwrap();
                 worker.clear_group_membership().unwrap();
                 worker.observe_group_key("new-current").unwrap();
                 worker
@@ -996,7 +996,7 @@ async fn membership_failure_after_db_commit_restarts_and_reruns() {
         } else {
             // Simulate termination at each publication boundary: recovery must
             // run before runtime_spec / managed receipt checks on the next call.
-            membership_undo::prepare(&paths, previous, true).unwrap();
+            membership_undo::prepare(&paths, previous, true, true).unwrap();
             CoordinatorStore::move_group(&paths.state, &request.cluster).unwrap();
             if crash_step >= 2 {
                 fs::write(&paths.key, &request.key_file_text).unwrap();
@@ -1032,5 +1032,86 @@ async fn membership_failure_after_db_commit_restarts_and_reruns() {
         managed_journal(&bootstrap::read_input(&paths.input).unwrap()).unwrap();
         assert!(!paths.config.join("membership-undo.json").exists());
         CoordinatorStore::move_group(&paths.state, &request.cluster).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn membership_restart_crash_and_live_work_bail_preserve_state() {
+    use crate::service::worker_service::{
+        tests::{put_attempt, Fake},
+        InstallRequest, Membership,
+    };
+    use crate::storage::WorkerStore;
+    for live_work in [false, true] {
+        let (_t, context) = fixture();
+        let paths = Paths::resolve(&context.env).unwrap();
+        assert!(initialize(context.clone(), &mut Unknown).await.is_err());
+        let spec = bootstrap::read_input(&paths.input).unwrap();
+        let worker = WorkerStore::open(&paths.worker, &spec.worker_id).unwrap();
+        let peer = CoordinatorId::generate();
+        let request = InstallRequest {
+            schema: 1,
+            system_user: false,
+            cluster: ClusterId::generate(),
+            worker_id: spec.worker_id.clone(),
+            key_file_text: "ab".repeat(32) + "\n",
+            binary_sha256: String::new(),
+            membership: Some(Membership {
+                caller_name: WorkerId::parse("peer").unwrap(),
+                caller_id: peer.clone(),
+                move_group: true,
+                join_singleton: false,
+                install: false,
+            }),
+        };
+        let fake = Fake::default();
+        {
+            let mut w = fake.0.borrow_mut();
+            w.loaded = true;
+            w.omit_socket = true;
+            w.state = paths.worker.clone();
+            if live_work {
+                let state = paths.worker.clone();
+                let id = spec.worker_id.clone();
+                let peer = peer.clone();
+                w.after_stop = Some(Box::new(move || {
+                    let worker = WorkerStore::open(&state, &id).unwrap();
+                    worker
+                        .for_member(&peer)
+                        .replace_member_pin("late-peer", 42)
+                        .unwrap();
+                    worker.observe_group_key("late-key").unwrap();
+                    let db = rusqlite::Connection::open(state.join("worker.db")).unwrap();
+                    put_attempt(&db, &peer, 1, "active");
+                }));
+            } else {
+                w.before_start = Some(Box::new(|| panic!("simulated crash before restart")));
+            }
+        }
+        if live_work {
+            let error = handover(&context.env, &request, fake.clone()).unwrap_err();
+            assert!(error.to_string().contains("live work appeared"));
+            assert!(worker
+                .members()
+                .unwrap()
+                .iter()
+                .any(|(name, id)| name == "late-peer" && id == peer.as_str()));
+            assert_eq!(
+                worker.group_keys().unwrap().0.unwrap().fingerprint,
+                "late-key"
+            );
+            assert_eq!(worker.count_group_work().unwrap(), 1);
+            assert!(fake.0.borrow().loaded);
+        } else {
+            let crash = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                handover(&context.env, &request, fake.clone())
+            }));
+            assert!(crash.is_err());
+            assert!(!fake.0.borrow().loaded);
+            assert!(paths.config.join("membership-undo.json").exists());
+            let status = handover(&context.env, &request, fake.clone()).unwrap();
+            assert!(status.ready && fake.0.borrow().loaded);
+            assert!(!paths.config.join("membership-undo.json").exists());
+        }
     }
 }

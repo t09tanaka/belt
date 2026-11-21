@@ -10,6 +10,8 @@ pub(crate) struct World {
     pub loaded: bool,
     pub unknown: bool,
     pub fail_start: bool,
+    pub before_start: Option<Box<dyn FnOnce()>>,
+    pub after_stop: Option<Box<dyn FnOnce()>>,
     /// Lifecycle-only tests do not need an agent socket or health endpoint.
     pub omit_socket: bool,
     pub fail_init_start: bool,
@@ -41,6 +43,9 @@ impl Launcher for Fake {
         };
         match verb {
             "bootstrap" => {
+                if let Some(hook) = w.before_start.take() {
+                    hook();
+                }
                 if w.fail_start
                     || (w.fail_init_start && arguments.iter().any(|a| a.contains(".local.")))
                 {
@@ -58,6 +63,9 @@ impl Launcher for Fake {
             }
             "bootout" => {
                 w.loaded = false;
+                if let Some(hook) = w.after_stop.take() {
+                    hook();
+                }
                 w.listener = None;
                 let _ = fs::remove_file(w.state.join("agent.sock"));
                 Ok(())
@@ -1151,7 +1159,7 @@ fn membership_moves_an_initialized_idle_member_without_adding_a_worker() {
     );
 }
 
-fn put_attempt(db: &rusqlite::Connection, member: &CoordinatorId, _n: u32, state: &str) {
+pub(crate) fn put_attempt(db: &rusqlite::Connection, member: &CoordinatorId, _n: u32, state: &str) {
     db.execute(
         "INSERT INTO worker_attempt (coordinator_id, attempt_id, run_id, task_id, generation, payload_hash, coordinator_epoch, spec_json, state, termination_json, receipts_json, accepted_at_ms, terminal_at_ms)
          VALUES (?1, ?2, ?6, ?7, 1, 'sha256:0000000000000000000000000000000000000000000000000000000000000000', 1, '{}', ?3, ?4, '{}', 1, ?5)",
@@ -1541,7 +1549,7 @@ fn membership_failure_after_stop_restarts() {
 }
 
 #[test]
-fn membership_rerun_requires_a_loaded_ready_service() {
+fn membership_rerun_preserves_a_user_stopped_service() {
     let mut h = Host::new();
     h.fake.0.borrow_mut().omit_socket = true;
     h.install().unwrap();

@@ -455,24 +455,10 @@ impl Vault {
         Ok(files)
     }
 
-    pub(crate) fn claim_for_retention(
-        &self,
-        lease: &Lease,
-        run: &RunId,
-        entries: &[SecretEntry],
-        key: &ClusterKey,
-    ) -> anyhow::Result<Claim> {
-        // HMAC and file identity must describe the very same bytes. A later
-        // replacement cannot become authority merely by being privately owned.
-        let (claim, bytes) = lease.proof(run)?;
-        if let Some(bytes) = bytes {
-            anyhow::ensure!(
-                !entries.is_empty(),
-                "unexpected Vault bundle for a secret-free run"
-            );
-            Self::decode(&bytes, entries, key)?;
-        }
-        Ok(claim)
+    pub(crate) fn claim_for_retention(&self, lease: &Lease, run: &RunId) -> anyhow::Result<Claim> {
+        // Deletion proves file identity, not content authenticity: the capture
+        // key may already have been discarded. Content reads still verify HMAC.
+        lease.claim(run)
     }
 
     /// Delete the run's bundle (idempotent).

@@ -8,7 +8,7 @@ struct Undo {
     key: Vec<u8>,
     input: Vec<u8>,
     control: control::Control,
-    membership: crate::storage::MembershipImage,
+    membership: Option<crate::storage::MembershipImage>,
     restart: bool,
 }
 fn path(paths: &Paths) -> PathBuf {
@@ -26,14 +26,18 @@ pub(super) fn prepare(
     paths: &Paths,
     previous: control::Control,
     restart: bool,
+    snapshot_worker: bool,
 ) -> anyhow::Result<()> {
     let undo = Undo {
         journal: read_journal(&paths.journal)?,
         key: fs::read(&paths.key)?,
         input: fs::read(&paths.input)?,
         control: previous,
-        membership: crate::storage::WorkerStore::open_read_only(&paths.worker)?
-            .membership_image()?,
+        membership: if snapshot_worker {
+            Some(crate::storage::WorkerStore::open_read_only(&paths.worker)?.membership_image()?)
+        } else {
+            None
+        },
         restart,
     };
     replace(&path(paths), &serde_json::to_vec(&undo)?)
@@ -113,8 +117,10 @@ pub(super) fn recover<L: Launcher>(paths: &Paths, launcher: &mut L) -> anyhow::R
             &paths.state,
             undo.journal.cluster.as_ref().context("group missing")?,
         )?;
-        crate::storage::WorkerStore::open(&paths.worker, &undo.journal.spec.worker_id)?
-            .restore_membership(&undo.membership)?;
+        if let Some(membership) = &undo.membership {
+            crate::storage::WorkerStore::open(&paths.worker, &undo.journal.spec.worker_id)?
+                .restore_membership(membership)?;
+        }
         for (path, bytes) in [(&paths.key, &undo.key), (&paths.input, &undo.input)] {
             replace(path, bytes)?;
             *undo
@@ -129,11 +135,6 @@ pub(super) fn recover<L: Launcher>(paths: &Paths, launcher: &mut L) -> anyhow::R
     })();
     // Attempt both restoration and restart, even when restoring files fails.
     let control = control::write(&paths.worker, undo.control);
-    let finish = if result.is_ok() && control.is_ok() {
-        finish(&paths)
-    } else {
-        Ok(())
-    };
     let start = if undo.restart {
         launcher.launchctl(
             &plan
@@ -145,6 +146,6 @@ pub(super) fn recover<L: Launcher>(paths: &Paths, launcher: &mut L) -> anyhow::R
     };
     result
         .and(control.map_err(Into::into))
-        .and(finish)
-        .and(start.map_err(Into::into))
+        .and(start.map_err(Into::into))?;
+    finish(&paths)
 }

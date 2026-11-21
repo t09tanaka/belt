@@ -1074,7 +1074,8 @@ pub(crate) fn handover<L: Launcher>(
     );
     let previous = control::read(&paths.worker)?;
     if moving {
-        membership_undo::prepare(&paths, previous, loaded == LoadedState::Match)?;
+        // Record restart intent before stopping; worker rows are still changing.
+        membership_undo::prepare(&paths, previous, loaded == LoadedState::Match, false)?;
     }
     let result = (|| -> anyhow::Result<_> {
         if moving && loaded == LoadedState::Match {
@@ -1131,8 +1132,8 @@ pub(crate) fn handover<L: Launcher>(
         }
         let worker = WorkerStore::open(&paths.worker, &spec.worker_id)?;
         if moving {
-            // Refresh after both owners stopped so the image includes their final pins.
-            membership_undo::prepare(&paths, previous, loaded == LoadedState::Match)?;
+            // Snapshot worker rows only after both owners stopped, including final pins.
+            membership_undo::prepare(&paths, previous, loaded == LoadedState::Match, true)?;
             worker.clear_group_membership()?;
             CoordinatorStore::move_group(&paths.state, &request.cluster)?;
             match fs::remove_file(crate::group::next_key_path(&paths.key)) {
@@ -1173,7 +1174,6 @@ pub(crate) fn handover<L: Launcher>(
             .replace_member_pin(member.caller_name.as_str(), crate::platform::wall_ms())?;
         if moving {
             control::write(&paths.worker, previous)?;
-            membership_undo::finish(&paths)?;
         }
         drop(_agent);
         drop(_owner);
@@ -1214,6 +1214,7 @@ pub(crate) fn handover<L: Launcher>(
     drop(_lease);
     match result {
         Ok(status) => {
+            // Retain restart intent until the start and loaded verification succeed.
             membership_undo::finish(&paths)?;
             Ok(status)
         }
