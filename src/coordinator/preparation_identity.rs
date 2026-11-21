@@ -299,6 +299,7 @@ mod tests {
                 if let Request::Inspect(_) = &request {
                     let r = self.response.lock().unwrap();
                     return Ok(Response::Inspect(crate::wire::InspectResponse {
+                        own_runs_active: None,
                         admission: None,
                         preparation_observations: None,
                         capabilities: Some(crate::toolchain::capability::WorkerCapabilities {

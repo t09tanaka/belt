@@ -686,6 +686,7 @@ mod tests {
                 }
                 let used = u64::from(!self.room.load(Ordering::SeqCst));
                 Ok(Response::Inspect(crate::wire::InspectResponse {
+                    own_runs_active: None,
                     admission: Some(crate::wire::AdmissionWindow {
                         limit: 1,
                         used,

@@ -12,6 +12,7 @@ pub(crate) struct World {
     pub fail_start: bool,
     pub before_start: Option<Box<dyn FnOnce()>>,
     pub after_stop: Option<Box<dyn FnOnce()>>,
+    pub before_verify: Option<Box<dyn FnMut()>>,
     /// Lifecycle-only tests do not need an agent socket or health endpoint.
     pub omit_socket: bool,
     pub fail_init_start: bool,
@@ -74,6 +75,9 @@ impl Launcher for Fake {
         }
     }
     fn verify_loaded(&mut self, _: &policy::Plan, _: &Receipt) -> Result<(), LaunchError> {
+        if let Some(hook) = &mut self.0.borrow_mut().before_verify {
+            hook();
+        }
         if self.0.borrow().loaded {
             Ok(())
         } else {

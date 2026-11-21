@@ -520,6 +520,16 @@ impl<F: ManagedFiles, L: Launcher, W: WorkerControl> Manager<F, L, W> {
         receipt: &Receipt,
         cancel_running: bool,
     ) -> anyhow::Result<()> {
+        self.stop_checked(plan, receipt, cancel_running, || Ok(()))
+    }
+
+    pub(crate) fn stop_checked(
+        &mut self,
+        plan: &Plan,
+        receipt: &Receipt,
+        cancel_running: bool,
+        check: impl FnOnce() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
         let _lease = self.files.lifecycle_lock()?;
         self.ensure_installed(plan, receipt)?;
         self.launcher.verify_loaded(plan, receipt)?;
@@ -531,6 +541,7 @@ impl<F: ManagedFiles, L: Launcher, W: WorkerControl> Manager<F, L, W> {
         self.launcher.verify_loaded(plan, receipt).context(
             "worker acknowledged stop; loaded-job reconciliation required; bootout not applied",
         )?;
+        check()?;
         Ok(self.launcher.launchctl(
             &plan
                 .stop_arguments(receipt.path())

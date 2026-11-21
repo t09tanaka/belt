@@ -947,6 +947,124 @@ fn link_resident(executable: &Path, durability: &mut impl Durability) -> anyhow:
     Ok(())
 }
 
+/// Start/stop the single resident through its existing managed receipt.
+/// Serialized with membership handover by the init lock.
+pub(super) fn worker_lifecycle<L: Launcher>(
+    env: &BTreeMap<String, String>,
+    mut launcher: L,
+    stop: Option<(bool, Duration, &super::worker_service::Submitters)>,
+    ready_timeout: Duration,
+) -> anyhow::Result<super::worker_service::Status> {
+    use super::worker_service as ws;
+    use crate::worker::control::{self, Control};
+    let initial =
+        Paths::resolve_for(env, launcher.backend()).context("init resident paths unavailable")?;
+    let lock = resident::secure_file(&initial.config.join("init.lock"), true)
+        .context("init resident lock unavailable")?;
+    lock.lock()?;
+    membership_undo::recover(&initial, &mut launcher)?;
+    ensure!(
+        !initial.config.join("membership-undo.json").try_exists()?,
+        "membership undo is still pending"
+    );
+    let spec = bootstrap::read_input(&initial.input).context("init resident input unavailable")?;
+    let (journal, paths) = managed_journal(&spec)?;
+    ensure!(
+        launcher.backend() == paths.backend,
+        "service manager differs"
+    );
+    let plan = plan(&paths, &journal)?;
+    let receipt = journal.plist.as_ref().context("service receipt missing")?;
+    let identity = macos::WorkerIdentity {
+        cluster_id: journal.cluster.clone().context("group missing")?,
+        worker_id: spec.worker_id.clone(),
+    };
+    let mut manager = macos::Manager {
+        identity,
+        files: DirectoryFiles::open(&paths.services)?,
+        launcher,
+        worker: ws::MarkerControl {
+            state: paths.worker.clone(),
+            wait: stop.map(|(_, wait, _)| wait).unwrap_or(Duration::ZERO),
+            interval: Duration::from_millis(250),
+        },
+    };
+    match (manager.launcher.loaded_state(&plan, receipt), stop) {
+        (LoadedState::Unknown, _) => {
+            anyhow::bail!("loaded service identity unknown; nothing started or stopped")
+        }
+        (LoadedState::Match, Some((cancel, _, submitters))) => {
+            manager.worker.verify_binding(&manager.identity)?;
+            let previous = control::read(&paths.worker)?;
+            let store = if submitters.all {
+                None
+            } else {
+                Some(crate::storage::CoordinatorStore::open_read_only(&paths.state)
+                    .context("cannot tell whether target has its own non-terminal runs; use --all-submitters")?)
+            };
+            let check = || -> anyhow::Result<()> {
+                if let Some(store) = &store {
+                    ensure!(!store.has_nonterminal_runs()
+                        .context("cannot tell whether target has its own non-terminal runs; use --all-submitters")?,
+                        "target {} has its own non-terminal runs; nothing was stopped (use --all-submitters)", spec.worker_id);
+                }
+                Ok(())
+            };
+            ws::drain_before_check(&paths.worker, || {
+                ws::refuse_other_submitters(&paths.worker, submitters)?;
+                check()
+            })?;
+            manager.stop_checked(&plan, receipt, cancel, || {
+                if let Err(error) = check() {
+                    control::write(&paths.worker, previous)?;
+                    return Err(error);
+                }
+                Ok(())
+            })?;
+            control::write(&paths.worker, previous)?;
+        }
+        (loaded, None) => {
+            manager.worker.verify_binding(&manager.identity)?;
+            ws::clear_cancel(&paths.worker)?;
+            if loaded == LoadedState::Absent {
+                manager.start(&plan, receipt)?;
+            }
+        }
+        _ => {}
+    }
+    let loaded = match manager.launcher.loaded_state(&plan, receipt) {
+        LoadedState::Match => Some(true),
+        LoadedState::Absent => Some(false),
+        LoadedState::Unknown => None,
+    };
+    let ready =
+        stop.is_none() && loaded == Some(true) && ws::wait_ready(&paths.worker, ready_timeout);
+    let control = Control::effective(&paths.worker);
+    Ok(ws::Status {
+        membership_only: false,
+        coordinator_id: journal.coordinator,
+        system_user: false,
+        worker_id: spec.worker_id,
+        cluster: manager.identity.cluster_id,
+        binary_sha256: journal.binary_hash,
+        loaded,
+        ready,
+        draining: control.drain,
+        cancel_running: control.cancel_running,
+        live_attempts: ws::live_attempts(&paths.worker).ok(),
+        bridge_binary: Some(spec.executable.to_string_lossy().into_owned()),
+        traffic_scope: None,
+        traffic_hold: crate::config::traffic::recorded_hold(
+            &paths.worker,
+            crate::platform::wall_ms(),
+        )
+        .filter(|_| loaded != Some(false)),
+        switching_from: None,
+        drained_by_upgrade: false,
+        switch_running: false,
+    })
+}
+
 fn managed_journal(spec: &Spec) -> anyhow::Result<(Journal, Paths)> {
     let journal = spec
         .managed_service

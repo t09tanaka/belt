@@ -1001,31 +1001,36 @@ fn worker_only_init_preserves_membership_and_retires_old_service_or_rolls_back()
                 .block_on(initialize(context.clone(), &mut launcher))
                 .unwrap();
             assert_eq!(again.coordinator_id, receipt.coordinator_id);
-            for result in [
-                ws::start(&context.env, launcher.clone(), Duration::ZERO),
-                ws::stop(&context.env, launcher.clone(), false, Duration::ZERO),
-                ws::upgrade::upgrade(
-                    &context.env,
-                    &ws::upgrade::SwitchRequest {
-                        schema: 1,
-                        cluster: request.cluster.clone(),
-                        worker_id: request.worker_id.clone(),
-                        binary_sha256: request.binary_sha256.clone(),
-                    },
-                    &context.executable,
-                    launcher.clone(),
-                    ws::Options {
-                        cancel_running: false,
-                        all_submitters: false,
-                        submitter: None,
-                        wait: Duration::ZERO,
-                        ready_timeout: Duration::ZERO,
-                    },
-                    &mut |_| Ok(()),
-                ),
-            ] {
-                assert!(result.unwrap_err().to_string().contains("init resident"));
-            }
+            // Start/stop now manage the same init resident (§24.2); upgrade
+            // must still refuse to replace it with a worker-only service.
+            let active = launcher.active.lock().unwrap().clone().unwrap();
+            let started = ws::start(&context.env, launcher.clone(), Duration::ZERO).unwrap();
+            assert_eq!(started.loaded, Some(true));
+            assert_eq!(launcher.active.lock().unwrap().as_ref(), Some(&active));
+            let stopped = ws::stop(&context.env, launcher.clone(), false, Duration::ZERO).unwrap();
+            assert_eq!(stopped.loaded, Some(false));
+            assert!(launcher.active.lock().unwrap().is_none());
+            let error = ws::upgrade::upgrade(
+                &context.env,
+                &ws::upgrade::SwitchRequest {
+                    schema: 1,
+                    cluster: request.cluster.clone(),
+                    worker_id: request.worker_id.clone(),
+                    binary_sha256: request.binary_sha256.clone(),
+                },
+                &context.executable,
+                launcher.clone(),
+                ws::Options {
+                    cancel_running: false,
+                    all_submitters: false,
+                    submitter: None,
+                    wait: Duration::ZERO,
+                    ready_timeout: Duration::ZERO,
+                },
+                &mut |_| Ok(()),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("init resident"));
             assert_eq!(launcher.state.lock().unwrap().starts, 2);
         }
         assert_eq!(

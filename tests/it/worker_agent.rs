@@ -5674,3 +5674,92 @@ async fn a_start_removes_the_directories_of_attempts_the_database_rebuild_droppe
     assert!(f.store().dropped_attempts(10).unwrap().is_empty());
     agent.shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn workers_inspect_own_runs_reads_live_coordinator_store_without_self_session() {
+    async fn own(client: &Client) -> Option<bool> {
+        match call(
+            client,
+            Request::Inspect(InspectRequest {
+                preparation_observations: None,
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+            }),
+        )
+        .await
+        .unwrap()
+        {
+            Response::Inspect(report) => report.own_runs_active,
+            other => panic!("{other:?}"),
+        }
+    }
+    let f = fx();
+    let agent = f.start("boot-1");
+    let client = f.connect(&agent).await;
+    assert_eq!(own(&client).await, Some(false));
+    agent.shutdown();
+    drop(client);
+    drop(agent);
+
+    let f = fx();
+    let coordinator_state = f.path("coordinator");
+    let store = belt::storage::CoordinatorStore::open(&coordinator_state, 1).unwrap();
+    let epoch = store.epoch();
+    let mut cfg = f.cfg("boot-1");
+    cfg.coordinator_state = Some(coordinator_state.clone());
+    let agent = f.start_with(cfg);
+    let client = f.connect(&agent).await;
+    assert_eq!(own(&client).await, Some(false));
+    let run = RunId::generate();
+    store
+        .create_run(&run, None, None, &serde_json::json!({}), 1)
+        .unwrap();
+    assert_eq!(own(&client).await, Some(false), "empty run is idle");
+    let task = TaskId::generate();
+    store
+        .create_task(&task, &run, &serde_json::json!({}), 2)
+        .unwrap();
+    assert_eq!(
+        own(&client).await,
+        Some(true),
+        "queued without any attempt is active"
+    );
+    store.cancel_task(&task, 3).unwrap();
+    assert_eq!(
+        own(&client).await,
+        Some(false),
+        "settled run need not have a close timestamp"
+    );
+    assert_eq!(
+        store.epoch(),
+        epoch,
+        "inspect neither claims ownership nor advances epoch"
+    );
+    let db = rusqlite::Connection::open(coordinator_state.join("coordinator.db")).unwrap();
+    db.execute("ALTER TABLE task RENAME TO unavailable_task", [])
+        .unwrap();
+    assert_eq!(own(&client).await, None, "query errors do not fail inspect");
+}
+
+#[tokio::test]
+async fn workers_inspect_coordinator_db_error_is_unknown() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-1");
+    cfg.coordinator_state = Some(f.path("missing-coordinator"));
+    let agent = f.start_with(cfg);
+    let client = f.connect(&agent).await;
+    let response = call(
+        &client,
+        Request::Inspect(InspectRequest {
+            preparation_observations: None,
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+        }),
+    )
+    .await
+    .unwrap();
+    match response {
+        Response::Inspect(report) => assert_eq!(report.own_runs_active, None),
+        other => panic!("{other:?}"),
+    }
+}

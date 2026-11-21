@@ -61,6 +61,8 @@ mod warmup;
 /// environment: the boot ID and the supervisor binary are inputs.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
+    /// Present only in a combined resident; read without a self-session.
+    pub coordinator_state: Option<PathBuf>,
     /// `worker.db`, the attempts and the locks live here (mode 0700).
     pub state_dir: PathBuf,
     pub worker_id: WorkerId,
@@ -140,6 +142,7 @@ impl AgentConfig {
         supervisor_exe: PathBuf,
     ) -> Self {
         AgentConfig {
+            coordinator_state: None,
             group_key_path: state_dir.join("cluster.key"),
             traffic_state_dir: state_dir.join("traffic"),
             state_dir,
@@ -211,6 +214,8 @@ pub struct StartupReport {
 }
 
 pub struct Agent {
+    coordinator: Mutex<std::sync::Weak<crate::coordinator::Coordinator>>,
+    coordinator_reader: Mutex<Option<crate::storage::CoordinatorStore>>,
     identity: Mutex<WorkerBootId>,
     rekey_gate: std::sync::RwLock<()>,
     /// The fingerprint of the group key this worker signs with, as last
@@ -462,6 +467,26 @@ impl OwnedAgentLock {
 }
 
 impl Agent {
+    pub(crate) fn set_coordinator(&self, coordinator: &Arc<crate::coordinator::Coordinator>) {
+        if let Ok(mut slot) = self.coordinator.lock() {
+            *slot = Arc::downgrade(coordinator);
+        }
+    }
+
+    fn own_runs_active(&self) -> Option<bool> {
+        if let Some(coordinator) = self.coordinator.lock().ok()?.upgrade() {
+            return coordinator.store().has_nonterminal_runs().ok();
+        }
+        let Some(state) = &self.cfg.coordinator_state else {
+            return Some(false);
+        };
+        let mut reader = self.coordinator_reader.lock().ok()?;
+        if reader.is_none() {
+            *reader = Some(crate::storage::CoordinatorStore::open_read_only(state).ok()?);
+        }
+        reader.as_ref()?.has_nonterminal_runs().ok()
+    }
+
     /// Run the startup steps in [`policy::STARTUP_ORDER`] and return the
     /// running agent. Any failing step refuses the start.
     pub fn start(cfg: AgentConfig, host: Arc<dyn Host>) -> Result<Arc<Agent>, ApiError> {
@@ -586,6 +611,8 @@ impl Agent {
             .transpose()?
             .flatten();
         let agent = Arc::new(Agent {
+            coordinator: Mutex::default(),
+            coordinator_reader: Mutex::default(),
             identity: Mutex::new(if cfg.instance_id.is_some() {
                 cfg.advertised_boot().clone()
             } else {
@@ -3213,6 +3240,7 @@ impl Agent {
             .map(|s| s.f_bavail.saturating_mul(s.f_frsize))
             .unwrap_or(0);
         Ok(InspectResponse {
+            own_runs_active: self.own_runs_active(),
             preparation_observations: request
                 .preparation_observations
                 .as_ref()

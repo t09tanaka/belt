@@ -739,7 +739,7 @@ pub struct MarkerControl {
     pub interval: Duration,
 }
 impl MarkerControl {
-    fn verify_binding(&self, identity: &WorkerIdentity) -> anyhow::Result<()> {
+    pub(super) fn verify_binding(&self, identity: &WorkerIdentity) -> anyhow::Result<()> {
         let path = self.state.join("worker-binding.json");
         let mut bytes = Vec::new();
         resident::secure_file(&path, false)?
@@ -792,7 +792,7 @@ fn marker(paths: &Paths, wait: Duration) -> MarkerControl {
     }
 }
 
-fn wait_ready(state: &Path, timeout: Duration) -> bool {
+pub(super) fn wait_ready(state: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if agent_reachable(state) {
@@ -1030,7 +1030,7 @@ fn hex_decode(text: &str) -> Option<Vec<u8>> {
         .collect()
 }
 
-fn clear_cancel(state: &Path) -> anyhow::Result<()> {
+pub(super) fn clear_cancel(state: &Path) -> anyhow::Result<()> {
     let current = control::read(state).unwrap_or_else(|_| Control::draining());
     if current.cancel_running {
         control::write(state, Control::draining())?;
@@ -1044,6 +1044,9 @@ pub fn start<L: Launcher>(
     ready_timeout: Duration,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve_for(env, launcher.backend())?;
+    if paths.config.join("init.json").try_exists()? {
+        return super::init::worker_lifecycle(env, launcher, None, ready_timeout);
+    }
     let _lock = exclusive_lock(&paths)?;
     let journal = require_journal(&paths)?;
     let plan = plan(&paths, &journal)?;
@@ -1121,7 +1124,7 @@ fn other_submitters(
     Ok(counts.into_iter().collect())
 }
 
-fn refuse_other_submitters(state: &Path, submitters: &Submitters) -> anyhow::Result<()> {
+pub(super) fn refuse_other_submitters(state: &Path, submitters: &Submitters) -> anyhow::Result<()> {
     if submitters.all {
         return Ok(());
     }
@@ -1138,7 +1141,7 @@ fn refuse_other_submitters(state: &Path, submitters: &Submitters) -> anyhow::Res
     )
 }
 
-fn drain_before_check(
+pub(super) fn drain_before_check(
     state: &Path,
     check: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
@@ -1159,6 +1162,14 @@ pub fn stop_for<L: Launcher>(
     submitters: &Submitters,
 ) -> anyhow::Result<Status> {
     let paths = Paths::resolve_for(env, launcher.backend())?;
+    if paths.config.join("init.json").try_exists()? {
+        return super::init::worker_lifecycle(
+            env,
+            launcher,
+            Some((cancel_running, wait, submitters)),
+            Duration::ZERO,
+        );
+    }
     let _lock = exclusive_lock(&paths)?;
     let journal = require_journal(&paths)?;
     let plan = plan(&paths, &journal)?;

@@ -298,6 +298,7 @@ impl Worker {
                 }))
             }
             Request::Inspect(_) => Ok(Response::Inspect(InspectResponse {
+                own_runs_active: None,
                 admission: None,
                 preparation_observations: None,
                 capabilities: None,

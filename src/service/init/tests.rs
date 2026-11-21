@@ -1115,3 +1115,161 @@ async fn membership_restart_crash_and_live_work_bail_preserve_state() {
         }
     }
 }
+
+#[tokio::test]
+async fn workers_stop_start_use_init_receipt_and_preserve_refusals() {
+    use super::super::worker_service::{self as ws, tests::Fake, Submitters};
+    use crate::storage::{CoordinatorStore, WorkerStore};
+    use crate::worker::control::{self, Control};
+    for cancel in [false, true] {
+        let (_tmp, context) = fixture();
+        let paths = Paths::resolve(&context.env).unwrap();
+        assert!(initialize(context.clone(), &mut Unknown).await.is_err());
+        let spec = bootstrap::read_input(&paths.input).unwrap();
+        let worker = WorkerStore::open(&paths.worker, &spec.worker_id).unwrap();
+        let store = std::rc::Rc::new(CoordinatorStore::open(&paths.state, 1).unwrap());
+        let binding = paths.worker.join("worker-binding.json");
+        fs::write(
+            &binding,
+            serde_json::to_vec(&(1, store.cluster_id(), &spec.worker_id, "key")).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&binding, fs::Permissions::from_mode(0o600)).unwrap();
+        let run = RunId::generate();
+        store
+            .create_run(&run, None, None, &serde_json::json!({}), 1)
+            .unwrap();
+        let task = crate::ids::TaskId::generate();
+        store
+            .create_task(&task, &run, &serde_json::json!({}), 1)
+            .unwrap();
+        let fake = Fake::default();
+        {
+            let mut world = fake.0.borrow_mut();
+            world.loaded = true;
+            world.omit_socket = true;
+            world.state = paths.worker.clone();
+            let state = paths.worker.clone();
+            world.after_stop = Some(Box::new(move || {
+                let seen = control::read(&state).unwrap();
+                assert!(seen.drain);
+                assert_eq!(seen.cancel_running, cancel);
+            }));
+        }
+        let guard = Submitters {
+            all: false,
+            caller: Some(store.coordinator_id().clone()),
+        };
+        let error =
+            ws::stop_for(&context.env, fake.clone(), cancel, Duration::ZERO, &guard).unwrap_err();
+        assert!(
+            error.to_string().contains("own non-terminal runs"),
+            "{error:#}"
+        );
+        assert!(fake.0.borrow().calls.is_empty());
+        assert_eq!(control::read(&paths.worker).unwrap(), Control::default());
+        control::write(&paths.worker, Control::draining()).unwrap();
+        // --all-submitters uses the same drain-and-stop manager, even for
+        // cancel-running, and stops the init service, never a worker service.
+        let status = ws::stop_for(
+            &context.env,
+            fake.clone(),
+            cancel,
+            Duration::ZERO,
+            &Submitters::all(),
+        )
+        .unwrap();
+        assert_eq!(status.loaded, Some(false));
+        let journal = read_journal(&paths.journal).unwrap();
+        let plan = plan(&paths, &journal).unwrap();
+        assert_eq!(
+            fake.0.borrow().calls[0],
+            plan.stop_arguments(journal.plist.as_ref().unwrap().path())
+                .unwrap()
+        );
+        let status = ws::start(&context.env, fake.clone(), Duration::ZERO).unwrap();
+        assert_eq!(status.loaded, Some(true));
+        assert_eq!(
+            fake.0.borrow().calls[1],
+            plan.start_arguments(journal.plist.as_ref().unwrap().path())
+                .unwrap()
+        );
+        assert_eq!(control::read(&paths.worker).unwrap(), Control::draining());
+        assert!(!paths.config.join("worker-service.lock").exists());
+        control::write(&paths.worker, Control::default()).unwrap();
+        assert!(!paths.config.join("worker-service.json").exists());
+        // A cancelled task is no longer active; an unreadable worker DB
+        // still refuses before touching the service or leaving a drain.
+        store.cancel_task(&task, 2).unwrap();
+        store.close_run(&run, 2).unwrap();
+        assert!(!store.has_nonterminal_runs().unwrap());
+        // A task arriving during the drain is caught by the last check.
+        let late_run = RunId::generate();
+        store
+            .create_run(&late_run, None, None, &serde_json::json!({}), 3)
+            .unwrap();
+        let late_task = crate::ids::TaskId::generate();
+        let inserted = late_task.clone();
+        let writer = store.clone();
+        let mut checks = 0;
+        fake.0.borrow_mut().before_verify = Some(Box::new(move || {
+            checks += 1;
+            if checks == 2 {
+                writer
+                    .create_task(&inserted, &late_run, &serde_json::json!({}), 4)
+                    .unwrap();
+            }
+        }));
+        control::write(&paths.worker, Control::draining()).unwrap();
+        let error =
+            ws::stop_for(&context.env, fake.clone(), cancel, Duration::ZERO, &guard).unwrap_err();
+        assert!(
+            error.to_string().contains("own non-terminal runs"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fake.0.borrow().calls.len(),
+            2,
+            "no bootout after the second check"
+        );
+        assert_eq!(control::read(&paths.worker).unwrap(), Control::draining());
+        fake.0.borrow_mut().before_verify = None;
+        store.cancel_task(&late_task, 5).unwrap();
+        control::write(&paths.worker, Control::default()).unwrap();
+        let db = rusqlite::Connection::open(paths.worker.join("worker.db")).unwrap();
+        ws::tests::put_attempt(&db, &CoordinatorId::generate(), 1, "active");
+        let error =
+            ws::stop_for(&context.env, fake.clone(), cancel, Duration::ZERO, &guard).unwrap_err();
+        assert!(error.to_string().contains("other members"), "{error:#}");
+        assert_eq!(control::read(&paths.worker).unwrap(), Control::default());
+        // Override permits draining, not bootout before accepted work ends.
+        assert!(ws::stop_for(
+            &context.env,
+            fake.clone(),
+            cancel,
+            Duration::ZERO,
+            &Submitters::all()
+        )
+        .is_err());
+        assert_eq!(fake.0.borrow().calls.len(), 2);
+        assert!(control::read(&paths.worker).unwrap().drain);
+        drop(db);
+        drop(worker);
+        fs::write(paths.worker.join("worker.db"), b"unreadable").unwrap();
+        assert!(ws::stop_for(&context.env, fake.clone(), cancel, Duration::ZERO, &guard).is_err());
+        assert_eq!(fake.0.borrow().calls.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn worker_start_refuses_pending_membership_undo() {
+    use super::super::worker_service::{self as ws, tests::Fake};
+    let (_tmp, context) = fixture();
+    let paths = Paths::resolve(&context.env).unwrap();
+    assert!(initialize(context.clone(), &mut Unknown).await.is_err());
+    fs::write(paths.config.join("membership-undo.json"), b"invalid undo").unwrap();
+    let fake = Fake::default();
+    assert!(ws::start(&context.env, fake.clone(), Duration::ZERO).is_err());
+    assert!(fake.0.borrow().calls.is_empty());
+    assert!(paths.config.join("membership-undo.json").exists());
+}

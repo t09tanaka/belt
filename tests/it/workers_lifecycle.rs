@@ -74,7 +74,7 @@ impl Fx {
     /// A fake ssh: records its argv (one per line) and runs `body`.
     pub(super) fn ssh(&self, body: &str) {
         let script = format!(
-            "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\n{body}\n",
+            "#!/bin/sh\nif [ -S \"$HOME/.belt/agent.sock\" ]; then case \"$*\" in *\"worker\"*\"--stdio\"*) exec '{BIN}' worker --stdio ;; esac; fi\nprintf '%s\\n' \"$@\" > {}\n{body}\n",
             self.path("argv").display()
         );
         let path = self.path("bin/ssh");
@@ -93,6 +93,58 @@ impl Fx {
             )
             .output()
             .unwrap()
+    }
+    /// A real authenticated protocol connection for the lifecycle preflight.
+    fn inspect_peer(&self, cluster: &ClusterId, active: Option<bool>) -> tokio::runtime::Runtime {
+        use belt::ids::*;
+        use belt::protocol::{accept, Io, ServerConfig};
+        use belt::wire::*;
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let _guard = runtime.enter();
+        let state = self.path("home/.belt");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let listener = belt::protocol::transport::listen_unix(&state.join("agent.sock")).unwrap();
+        let key = belt::secrets::key::load(&self.path("cluster.key")).unwrap();
+        let cluster = cluster.clone();
+        runtime.spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let config = ServerConfig::new(
+                    cluster.clone(),
+                    super::proto_common::identity("mini-a"),
+                    belt::group::Keys::only(key.clone()),
+                );
+                tokio::spawn(async move {
+                    let accepted = accept(Io::from_stream(stream), config).await.unwrap();
+                    super::proto_common::serve(
+                        accepted.incoming,
+                        std::sync::Arc::new(move |request| {
+                            assert!(matches!(request, Request::Inspect(_)));
+                            Some(Ok(Response::Inspect(InspectResponse {
+                                own_runs_active: active,
+                                preparation_observations: None,
+                                capabilities: None,
+                                schema_version: SchemaVersion::CURRENT,
+                                worker_id: WorkerId::parse("mini-a").unwrap(),
+                                worker_boot_id: WorkerBootId::parse("boot-1").unwrap(),
+                                agent_epoch: AgentEpoch(1),
+                                snapshot_digest: Digest::of_bytes(b"snapshot"),
+                                policy_digest: Digest::of_bytes(b"policy"),
+                                active_task: 0,
+                                prefetch_pending: 0,
+                                max_active_task: 1,
+                                prefetch_per_worker: 1,
+                                disk_free_bytes: 0,
+                                draining: false,
+                                admission: None,
+                            })))
+                        }),
+                    );
+                });
+            }
+        });
+        drop(_guard);
+        runtime
     }
     pub(super) fn argv(&self) -> Vec<String> {
         std::fs::read_to_string(self.path("argv"))
@@ -175,6 +227,7 @@ fn stop_with_cancel_running_is_requested_explicitly() {
     let fx = Fx::new();
     fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@h\"\n");
     let cluster = fx.init();
+    let _peer = fx.inspect_peer(&cluster, Some(false));
     fx.ssh(&answer(&cluster, "mini-a", false, false));
     assert_eq!(
         fx.run(&["workers", "stop", "mini-a"]).status.code(),
@@ -269,6 +322,7 @@ fn an_answer_that_does_not_show_the_requested_state_is_not_reported_as_success()
     let fx = Fx::new();
     fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@h\"\n");
     let cluster = fx.init();
+    let _peer = fx.inspect_peer(&cluster, Some(false));
     // The host says the service is still loaded after stop, and not draining after drain.
     fx.ssh(&answer(&cluster, "mini-a", false, true));
     for args in [
@@ -534,4 +588,68 @@ mod a44 {
         let out = fx.run(&["workers", "sync", "mini-a", "--project", "/no/such/dir"]);
         assert_eq!(out.status.code(), Some(ErrorCode::InvalidInput.exit_code()));
     }
+}
+
+#[test]
+fn workers_a54_stop_refuses_own_runs_and_old_peers_unless_all_submitters() {
+    for active in [Some(true), None] {
+        let fx = Fx::new();
+        fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@h\"\n");
+        let cluster = fx.init();
+        let _peer = fx.inspect_peer(&cluster, active);
+        fx.ssh(&answer(&cluster, "mini-a", false, false));
+        for cancel in [false, true] {
+            let mut args = vec!["workers", "stop", "mini-a"];
+            if cancel {
+                args.push("--cancel-running");
+            }
+            let out = fx.run(&args);
+            assert_eq!(
+                out.status.code(),
+                Some(ErrorCode::Conflict.exit_code()),
+                "{}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+            let value = json(&out);
+            assert!(value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(if active.is_none() {
+                    "cannot tell"
+                } else {
+                    "own non-terminal runs"
+                }));
+            assert!(!fx.path("argv").exists(), "no stop helper was invoked");
+            args.push("--all-submitters");
+            assert!(fx.run(&args).status.success());
+            assert!(fx.argv().last().unwrap().contains("'--all-submitters'"));
+            std::fs::remove_file(fx.path("argv")).unwrap();
+        }
+    }
+}
+
+#[test]
+fn workers_stop_already_stopped_and_unreachable_are_distinct() {
+    let fx = Fx::new();
+    fx.config("schema_version = 1\n[[workers]]\nid = \"mini-a\"\nssh = \"ci@h\"\n");
+    let cluster = fx.init();
+    fx.ssh(&format!(
+        "case \"$*\" in *\"worker\"*\"--stdio\"*) exec '{BIN}' worker --stdio ;; esac\n{}",
+        answer(&cluster, "mini-a", false, false)
+    ));
+    let out = fx.run(&["workers", "stop", "mini-a"]);
+    assert!(
+        out.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(fx.argv().last().unwrap().contains("'stop'"));
+    fx.ssh("echo 'SSH unreachable' >&2; exit 255");
+    let out = fx.run(&["workers", "stop", "mini-a"]);
+    assert!(!out.status.success());
+    let value = json(&out);
+    let message = value["error"]["message"].as_str().unwrap();
+    assert!(message.contains("cannot be reached"), "{message}");
+    assert!(message.contains("--all-submitters"), "{message}");
 }
