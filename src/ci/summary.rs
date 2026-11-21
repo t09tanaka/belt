@@ -298,8 +298,22 @@ pub fn render_text(s: &PlanSummary) -> String {
         }
     }
     for g in s.shard_groups.iter().filter(|g| g.split) {
-        for (id, count) in g.shards.iter().zip(&g.assigned_test_counts) {
-            lines.push(format!("shard {id} has {count} assigned tests"));
+        // A one-shard group keeps only its shard line, as before.
+        if g.shards.len() >= 2 {
+            lines.push(format!(
+                "task {} is split into {} shards (job {})",
+                g.id,
+                g.shards.len(),
+                g.source_jobs.join("+")
+            ));
+        }
+        for (at, id) in g.shards.iter().enumerate() {
+            match g.assigned_test_counts.get(at) {
+                Some(count) => lines.push(format!("shard {id} has {count} assigned tests")),
+                // No test is assigned yet, or the runner divides them itself.
+                None if g.shards.len() >= 2 => lines.push(format!("shard {id}")),
+                None => {}
+            }
         }
     }
     for g in s.shard_groups.iter().filter(|g| !g.split) {
@@ -363,12 +377,36 @@ mod tests {
         let empty = summarize(&fp).unwrap();
         assert!(empty.shard_groups[0].assigned_test_counts.is_empty());
         assert!(!render_text(&empty).contains("assigned tests"));
+        // The shards are still listed, under the job they split.
+        let text = render_text(&empty);
+        let id = &empty.shard_groups[0].id;
+        assert!(
+            text.contains(&format!(
+                "task {id} is split into 2 shards (job test)\nshard first\nshard second"
+            )),
+            "{text}"
+        );
 
         fp.shard_groups[0].assignments = vec![vec!["one".into(), "two".into()], vec![]];
         let summary = summarize(&fp).unwrap();
         assert_eq!(summary.shard_groups[0].assigned_test_counts, [2, 0]);
-        assert!(render_text(&summary)
-            .contains("shard first has 2 assigned tests\nshard second has 0 assigned tests"));
+        assert!(render_text(&summary).contains(&format!(
+            "task {id} is split into 2 shards (job test)\nshard first has 2 assigned tests\nshard second has 0 assigned tests"
+        )));
+        // A task that keeps several jobs names them all.
+        fp.shard_groups[0].source_jobs = vec!["test".into(), "lint".into()];
+        let text = render_text(&summarize(&fp).unwrap());
+        assert!(
+            text.contains(" is split into 2 shards (job test+lint)\n"),
+            "{text}"
+        );
+        // A one-shard split keeps its shard line and gets no split header.
+        let group = &mut fp.shard_groups[0];
+        group.shards = vec!["only".into()];
+        group.assignments = vec![vec!["one".into()]];
+        let text = render_text(&summarize(&fp).unwrap());
+        assert!(text.contains("shard only has 1 assigned tests"), "{text}");
+        assert!(!text.contains(" is split into "), "{text}");
     }
 
     use local_ci::frozen::{DisabledRecord, Filters, FrozenConfig, PlanParts, SourceRef};

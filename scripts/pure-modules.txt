@@ -57,3 +57,5 @@ src/coordinator/identity.rs
 src/service/workers/target.rs
 src/service/doctor/linger.rs
 src/ci/status.rs
+src/ci/advance/pure.rs
+src/service/ci_run/lines.rs

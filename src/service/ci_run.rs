@@ -64,6 +64,10 @@ pub struct JobLine {
     /// shards together (a failed or missing test, a shard without a result).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// A shard whose split job has a line of its own: the status counts
+    /// the job, not its shards too.
+    #[serde(skip)]
+    pub superseded: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -90,6 +94,9 @@ pub enum Part {
     Shard,
     Job,
 }
+
+mod lines;
+pub use lines::render_jobs;
 
 /// A matrix variant reserves one slot shared by every worker running this job.
 fn matrix_admission(
@@ -520,6 +527,7 @@ impl JobLine {
         crate::ci::status::Job {
             plan_task: &self.plan_task,
             status: &self.status,
+            counted: !self.superseded,
         }
     }
 }
@@ -534,45 +542,6 @@ pub fn jobs(spec: &super::bootstrap::Spec, run: &RunId) -> Result<Vec<JobLine>, 
         &spec.state_dir.join("results"),
         run,
     )
-}
-
-/// The lines of the split jobs of `plan`: each shard's lines are marked,
-/// and a job whose shards all ended gets one line more, after them, with
-/// the one outcome of the job (as the progression of the run makes it).
-fn mark_split_jobs(
-    lines: &mut Vec<JobLine>,
-    plan: &local_ci::FrozenPlan,
-    progress: &crate::ci::progress::NeedsProgression,
-) {
-    use crate::ci::progress::Progression;
-    for group in plan.shard_groups.iter().filter(|g| g.split) {
-        let mut last = None;
-        for (at, line) in lines.iter_mut().enumerate() {
-            if group.shards.contains(&line.plan_task) {
-                line.part = Some(Part::Shard);
-                last = Some(at);
-            }
-        }
-        let job = group.source_jobs.join("+");
-        let (Some(last), Some(outcome)) = (last, progress.outcome(&group.workflow, &job)) else {
-            continue;
-        };
-        let first = lines.iter().find(|line| line.plan_task == group.shards[0]);
-        let line = JobLine {
-            task_id: first.unwrap_or(&lines[last]).task_id.clone(),
-            plan_task: group.id.clone(),
-            job: Some(job),
-            status: outcome.status.as_str().to_string(),
-            part: Some(Part::Job),
-            // A job that failed says what is wrong with its shards.
-            skipped: outcome
-                .skipped
-                .clone()
-                .filter(|_| outcome.status.as_str() != "failure"),
-            reason: progress.split_job_problems(&group.id).map(str::to_string),
-        };
-        lines.insert(last + 1, line);
-    }
 }
 
 /// `state_dir` holds the frozen plan of the run. Without it (it is kept as
@@ -619,28 +588,13 @@ fn job_report(
                 .find(|(name, _)| name == crate::supervisor::ci_task::RESULT_ARTIFACT)?;
             crate::ci::advance::read_result(results, &attempt.attempt_id, digest).ok()
         });
-        let line = |job: Option<String>, status: &str, skipped: Option<String>| JobLine {
-            task_id: row.task_id.clone(),
-            plan_task: ci.task.task_id.clone(),
-            job,
-            status: status.to_string(),
-            part: None,
-            skipped,
-            reason: ci.unrunnable.clone(),
-        };
-        match result {
-            Some(result) => lines.extend(
-                result
-                    .outcomes
-                    .into_iter()
-                    .map(|o| line(Some(o.job), o.status.as_str(), o.skipped)),
-            ),
-            None => lines.push(line(
-                None,
-                ci.core_outcome.as_deref().unwrap_or("no_result"),
-                None,
-            )),
-        }
+        lines.extend(lines::row_lines(
+            &row.task_id,
+            &ci.task.task_id,
+            ci.unrunnable.as_deref(),
+            ci.core_outcome.as_deref(),
+            result,
+        ));
     }
     let plan = digest
         .as_ref()
@@ -650,29 +604,10 @@ fn job_report(
     if let Some(plan) = plan {
         let row_of = |task: &str| by_plan_task.get(task).copied();
         if let Ok(progress) = crate::ci::advance::replay(store, results, &plan, row_of) {
-            mark_split_jobs(&mut lines, &plan, &progress);
+            lines::mark_split_jobs(&mut lines, &plan, &progress);
         }
     }
     Ok((digest, lines))
-}
-
-/// One line per job, as `ci` prints it.
-pub fn render_jobs(jobs: &[JobLine]) -> String {
-    jobs.iter()
-        .map(|line| {
-            // A shard is named as the task it is: its job is on a line
-            // of its own.
-            let job = line
-                .job
-                .as_deref()
-                .filter(|_| line.part != Some(Part::Shard));
-            let name = job.unwrap_or(&line.plan_task);
-            match line.skipped.as_ref().or(line.reason.as_ref()) {
-                Some(why) => format!("{name}: {} ({why})\n", line.status),
-                None => format!("{name}: {}\n", line.status),
-            }
-        })
-        .collect()
 }
 
 #[cfg(test)]
@@ -731,50 +666,40 @@ mod tests {
     }
 
     #[test]
-    fn a_job_is_printed_with_its_status_and_why_it_did_not_run() {
-        let line = |job: Option<&str>, status: &str, skipped: Option<&str>| JobLine {
-            task_id: TaskId::generate(),
-            plan_task: "ci.yml/deploy".into(),
-            job: job.map(str::to_string),
-            status: status.into(),
-            part: None,
-            skipped: skipped.map(str::to_string),
-            reason: None,
-        };
-        let unrunnable = JobLine {
-            reason: Some("the frozen plan is gone".into()),
-            ..line(None, "no_result", None)
-        };
-        let text = render_jobs(&[
-            line(Some("build"), "failure", None),
-            line(Some("test"), "skipped", Some("needs failed")),
-            line(None, "no_result", None),
-            unrunnable,
-        ]);
+    fn the_status_counts_a_split_job_once() {
+        use crate::ci::progress::{Input, NeedsProgression, Progression};
+        let plan = crate::ci::shards::tests::split_plan(false);
+        let group = crate::ci::shards::tests::group(&plan).clone();
+        let mut progress = NeedsProgression::new(&plan).unwrap();
+        let mut lines = Vec::new();
+        for shard in &group.shards {
+            progress
+                .step(Input::Fence {
+                    task: shard.clone(),
+                    status: local_ci::task::JobStatus::Failure,
+                    reason: "failed".into(),
+                })
+                .unwrap();
+            lines.push(JobLine {
+                task_id: TaskId::generate(),
+                plan_task: shard.clone(),
+                job: Some("test".into()),
+                status: "failure".into(),
+                part: None,
+                skipped: None,
+                reason: None,
+                superseded: false,
+            });
+        }
+        lines::mark_split_jobs(&mut lines, &plan, &progress);
+        assert_eq!(lines.len(), group.shards.len() + 1);
+        let status: Vec<_> = lines.iter().map(JobLine::status_line).collect();
+        // Every task of the plan is still covered by a line, and the one
+        // split job is one failure in the description.
         assert_eq!(
-            text,
-            "build: failure\ntest: skipped (needs failed)\nci.yml/deploy: no_result\nci.yml/deploy: no_result (the frozen plan is gone)\n"
+            crate::ci::status::description(crate::ci::status::Computed::Failure, &status),
+            "failure: pass 0 / fail 1 / error 0 / skip 0"
         );
-        assert_eq!(render_jobs(&[]), "");
-        // A shard is named as its task; the split job has its own line.
-        let part = |part: Part, status: &str, why: Option<&str>| JobLine {
-            part: Some(part),
-            ..line(Some("test"), status, why)
-        };
-        let text = render_jobs(&[
-            part(Part::Shard, "success", None),
-            part(Part::Job, "failure", Some("missing: shard x")),
-        ]);
-        assert_eq!(
-            text,
-            "ci.yml/deploy: success\ntest: failure (missing: shard x)\n"
-        );
-
-        let shard = part(Part::Shard, "failure", None);
-        let json = serde_json::to_value(&shard).unwrap();
-        assert_eq!(json["part"], "shard");
-        let json = serde_json::to_value(line(None, "no_result", None)).unwrap();
-        assert!(json.get("part").is_none());
     }
 
     #[test]
