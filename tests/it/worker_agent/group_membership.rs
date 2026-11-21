@@ -1354,3 +1354,61 @@ async fn a56_a_stuck_members_connection_does_not_hold_up_another_members_request
     window_of(&quiet.client).await;
     drop((after_hello, half));
 }
+
+/// A feature a later version offers that this one does not know.
+const LATER: &str = "later_feature_v1";
+
+/// The features a version before this one offers: all of this build's but
+/// an optional one it did not have yet.
+fn earlier_features() -> Vec<String> {
+    belt::protocol::session::offered_features()
+        .into_iter()
+        .filter(|f| f.as_str() != belt::wire::ENV_SYNC_FEATURE)
+        .collect()
+}
+
+async fn inspected(c: &Client) {
+    match call(c, inspect_req()).await.unwrap() {
+        Response::Inspect(_) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a57_members_of_n_and_n_plus_1_use_each_other_both_ways() {
+    let f = fx();
+    let agent = f.start("boot-1");
+    // A member of version N sends to a worker of version N+1, which offers
+    // a feature N does not know: they agree on what both have.
+    let earlier = member("earlier");
+    let mut cfg = earlier.cfg(&f.cluster);
+    cfg.features = earlier_features();
+    let (a, b) = duplex_pair(64 * 1024);
+    tokio::spawn(belt::worker::serve::serve_connection_offering(
+        agent.clone(),
+        b,
+        f.cluster.clone(),
+        Arc::new(Semaphore::new(64)),
+        &[LATER],
+    ));
+    let to_later = connect(a, cfg).await.unwrap();
+    let agreed = &to_later.negotiated.features;
+    assert!(!agreed.iter().any(|x| x == LATER));
+    assert!(!agreed.iter().any(|x| x == belt::wire::ENV_SYNC_FEATURE));
+    for required in belt::protocol::session::required_features() {
+        assert!(agreed.contains(&required), "{required}");
+    }
+    inspected(&to_later.client).await;
+    // A member of version N+1 sends to a worker of version N: the feature
+    // only N+1 has is left out, and the work goes on as before.
+    let later = member("later");
+    let mut cfg = later.cfg(&f.cluster);
+    cfg.features.push(LATER.to_string());
+    let to_earlier = dial_as(&f, &agent, cfg).await.unwrap();
+    let agreed = &to_earlier.negotiated.features;
+    assert!(!agreed.iter().any(|x| x == LATER));
+    for required in belt::protocol::session::required_features() {
+        assert!(agreed.contains(&required), "{required}");
+    }
+    inspected(&to_earlier.client).await;
+}

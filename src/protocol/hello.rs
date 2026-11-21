@@ -306,6 +306,101 @@ mod tests {
         }
     }
 
+    /// One version of a member, by what it speaks in `hello` on either side.
+    struct Version {
+        versions: Vec<u32>,
+        features: Vec<String>,
+    }
+    impl Version {
+        fn worker(&self, cluster: &ClusterId) -> LocalHello {
+            LocalHello {
+                cluster_id: cluster.clone(),
+                versions: self.versions.clone(),
+                features: self.features.clone(),
+                required_features: vec![],
+            }
+        }
+        fn submitter(&self, cluster: &ClusterId) -> HelloRequest {
+            HelloRequest {
+                protocol_versions: self.versions.clone(),
+                features: self.features.clone(),
+                ..request(cluster)
+            }
+        }
+    }
+
+    /// The submitter `from` reaches the worker `to`: both decide, and they
+    /// agree on the same version and features.
+    fn reach(from: &Version, to: &Version, cluster: &ClusterId) -> Negotiated {
+        let asked = from.submitter(cluster);
+        let chosen = negotiate(&to.worker(cluster), &asked).unwrap();
+        let checked = verify_response(
+            &asked,
+            &crate::protocol::session::required_features(),
+            &hello_response(&chosen, group::nonce().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(checked, chosen);
+        checked
+    }
+
+    #[test]
+    fn a57_versions_n_and_n_plus_1_reach_each_other_both_ways() {
+        let cluster = ClusterId::generate();
+        // N lacks an optional feature this build has; N+1 has one more that
+        // this build does not know, and a protocol version more.
+        let n = Version {
+            versions: PROTOCOL_VERSIONS.to_vec(),
+            features: crate::protocol::session::offered_features()
+                .into_iter()
+                .filter(|f| f.as_str() != crate::wire::ENV_SYNC_FEATURE)
+                .collect(),
+        };
+        let mut next = Version {
+            versions: PROTOCOL_VERSIONS.to_vec(),
+            features: crate::protocol::session::offered_features(),
+        };
+        next.versions
+            .push(PROTOCOL_VERSIONS.iter().max().unwrap() + 1);
+        next.features.push("later_feature_v1".into());
+        for (from, to) in [(&n, &next), (&next, &n)] {
+            let agreed = reach(from, to, &cluster);
+            assert_eq!(agreed.version, *PROTOCOL_VERSIONS.iter().max().unwrap());
+            // Only what both have: no optional feature one side lacks.
+            assert!(!agreed.features.iter().any(|f| f == "later_feature_v1"));
+            assert!(!agreed
+                .features
+                .iter()
+                .any(|f| f == crate::wire::ENV_SYNC_FEATURE));
+            for f in crate::protocol::session::required_features() {
+                assert!(agreed.features.contains(&f), "{f}");
+            }
+        }
+        // Between two N+1 members the new things are used.
+        let agreed = reach(&next, &next, &cluster);
+        assert_eq!(agreed.version, *next.versions.iter().max().unwrap());
+        assert!(agreed.features.iter().any(|f| f == "later_feature_v1"));
+        // A peer without a feature required since the first public version
+        // is no N: a member of this build does not use it as a worker.
+        let older = Version {
+            versions: PROTOCOL_VERSIONS.to_vec(),
+            features: n
+                .features
+                .iter()
+                .filter(|f| f.as_str() != group::SHARED_ADMISSION_FEATURE)
+                .cloned()
+                .collect(),
+        };
+        let asked = next.submitter(&cluster);
+        let chosen = negotiate(&older.worker(&cluster), &asked).unwrap();
+        assert!(verify_response(
+            &asked,
+            &crate::protocol::session::required_features(),
+            &hello_response(&chosen, group::nonce().unwrap()),
+        )
+        .is_err());
+    }
+
     fn identity() -> WorkerIdentity {
         WorkerIdentity {
             capabilities: None,
