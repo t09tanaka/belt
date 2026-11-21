@@ -40,10 +40,14 @@ impl Coordinator {
             _ => Ok(None),
         }
     }
+    /// What the worker asks of the parent for a step, answered. Like every
+    /// other answer of a worker, what it asks is applied (written here) only
+    /// under the actor and while `asked` is still the worker's connection.
     pub(super) async fn follow_artifacts(
         &self,
         link: &dyn WorkerLink,
         live: &LiveAttempt,
+        asked: &Attached,
     ) -> Result<()> {
         if !link.workflow_artifacts_negotiated() {
             return Ok(());
@@ -63,7 +67,7 @@ impl Coordinator {
             return Ok(());
         };
         let key = action.key.clone();
-        let answer = match self.placed_artifact(link, live, raw, action).await {
+        let answer = match self.placed_artifact(link, live, raw, action, asked).await {
             Ok(Some(ok)) => ok,
             Ok(None) => return Ok(()),
             // What went wrong with this one action is the answer to it: the
@@ -101,6 +105,7 @@ impl Coordinator {
         live: &LiveAttempt,
         raw: &serde_json::Value,
         action: ArtifactAction,
+        asked: &Attached,
     ) -> Result<Option<ArtifactAnswer>> {
         let invalid = |s: &str| CoordinatorError::Invalid(s.into());
         let payload: AttemptPayload = serde_json::from_value(raw.clone())
@@ -115,9 +120,20 @@ impl Coordinator {
             .artifact_workflow
             .clone()
             .ok_or_else(|| invalid("artifact placement has no workflow"))?;
-        self.process_artifact(link, &live.record, payload.run_id, workflow, ci, action)
-            .await
+        self.process_artifact(
+            link,
+            &live.record,
+            payload.run_id,
+            workflow,
+            ci,
+            action,
+            asked,
+        )
+        .await
     }
+    /// `None` when nothing is answered: also when the connection that asked
+    /// is gone, and then nothing was written either.
+    #[allow(clippy::too_many_arguments)]
     async fn process_artifact(
         &self,
         link: &dyn WorkerLink,
@@ -126,10 +142,14 @@ impl Coordinator {
         workflow: String,
         ci: CiTask,
         action: ArtifactAction,
+        asked: &Attached,
     ) -> Result<Option<ArtifactAnswer>> {
         let attempt = a.attempt_id.clone();
         match action.intent {
             ArtifactIntent::Catalog { name, pattern } => {
+                let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
+                    return Ok(None);
+                };
                 let entries = self
                     .db(move |s| {
                         s.workflow_download(&run, &workflow, &attempt, &action.key, name, pattern)
@@ -174,6 +194,12 @@ impl Coordinator {
                 Ok(Some(ArtifactAnswer::Chunk { data }))
             }
             ArtifactIntent::Upload { receipt, overwrite } => {
+                // Held while this writes, and let go while the worker is
+                // asked for a chunk.
+                let Some(actor) = self.answered(&a.worker_id, asked).await? else {
+                    return Ok(None);
+                };
+                let mut actor = Some(actor);
                 let receipt: Receipt = serde_json::from_value(receipt)
                     .map_err(|_| CoordinatorError::Invalid("invalid artifact receipt".into()))?;
                 let state = self.store.state_dir().to_owned();
@@ -225,15 +251,20 @@ impl Coordinator {
                     let ArtifactState::Partial(offset) = status else {
                         continue;
                     };
-                    let data = if offset < size {
+                    // The actor while the part is written.
+                    let (data, _actor) = if offset < size {
                         let cmd = WorkflowArtifactCommand::Read {
                             key: action.key.clone(),
                             digest: digest.clone(),
                             offset,
                         };
+                        drop(actor.take());
                         let Some(ArtifactExchangeResult::Chunk { data }) =
                             self.artifact_call(link, a, cmd).await?
                         else {
+                            return Ok(None);
+                        };
+                        let Some(again) = self.answered(&a.worker_id, asked).await? else {
                             return Ok(None);
                         };
                         if data.0.len() as u64 != (size - offset).min(CHUNK as u64) {
@@ -241,9 +272,9 @@ impl Coordinator {
                                 "worker returned incorrect artifact chunk length".into(),
                             ));
                         }
-                        data.0
+                        (data.0, Some(again))
                     } else {
-                        Vec::new()
+                        (Vec::new(), actor.take())
                     };
                     let p = files.clone();
                     let producer = attempt.clone();

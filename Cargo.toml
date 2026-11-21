@@ -47,6 +47,8 @@ unicode-normalization = "0.1.26"
 [dev-dependencies]
 assert_cmd = "2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# A virtual clock for the tests that wait out a worker's budget (A56).
+tokio = { version = "1", features = ["test-util"] }
 
 [[test]]
 name = "it"

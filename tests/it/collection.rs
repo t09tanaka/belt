@@ -5951,3 +5951,138 @@ async fn a_discovery_incompatible_worker_runs_the_original_job_after_the_probe_i
         Some(0)
     );
 }
+
+/// The worker of a test behind a link that holds its first artifact poll
+/// until released.
+struct HeldPoll {
+    worker: Arc<Worker>,
+    hold: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Semaphore,
+    release: tokio::sync::Semaphore,
+}
+
+impl WorkerLink for HeldPoll {
+    fn workflow_artifacts_negotiated(&self) -> bool {
+        self.worker.workflow_artifacts_negotiated()
+    }
+    fn matrix_dispatch_negotiated(&self) -> bool {
+        self.worker.matrix_dispatch_negotiated()
+    }
+    fn ci_discovery_negotiated(&self) -> bool {
+        self.worker.ci_discovery_negotiated()
+    }
+    fn ci_task_negotiated(&self) -> bool {
+        self.worker.ci_task_negotiated()
+    }
+    fn placement_inputs(&self) -> Option<belt::coordinator::PlacementInputs> {
+        self.worker.placement_inputs()
+    }
+    fn input_refusals(&self) -> Vec<(RunId, String)> {
+        self.worker.input_refusals()
+    }
+    fn cost_transport(&self) -> Option<belt::scheduler::measured::Transport> {
+        self.worker.cost_transport()
+    }
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            let poll = matches!(
+                &request,
+                Request::WorkflowArtifact(r) if matches!(r.command, WorkflowArtifactCommand::Poll)
+            );
+            if poll && self.hold.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                self.entered.add_permits(1);
+                self.release.acquire().await.unwrap().forget();
+            }
+            self.worker.call(request).await
+        })
+    }
+}
+
+/// The uploads the parent reserved files for.
+fn reserved_uploads(fx: &Fx) -> i64 {
+    let db = rusqlite::Connection::open_with_flags(
+        fx.dir.path().join("coordinator.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.query_row("SELECT count(*) FROM workflow_upload_inflight", [], |r| {
+        r.get(0)
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn a56_an_upload_asked_for_on_a_connection_that_went_away_meanwhile_reserves_nothing() {
+    let workflow = r#"on: push
+jobs:
+  produce:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package
+          path: result.dat
+          if-no-files-found: error
+      - run: echo still-running
+"#;
+    // Without the detach, the same exchange reserves the upload's files.
+    for detached in [false, true] {
+        let fx = fx();
+        let (c, _files) = fx.open();
+        let plan = ci_plan(workflow);
+        let (_, ids) = ci_run(&fx, &c, &plan).await;
+        assert_eq!(c.tick().await.unwrap().placed.len(), 1);
+        let producer = c.store().attempts_of_task(&ids["produce"]).unwrap()[0]
+            .attempt_id
+            .clone();
+        let contents = vec![b'c'; 17];
+        let digest = Digest::of_bytes(&contents);
+        let logical = &plan.tasks[0].workflow;
+        let upload = ArtifactAction {
+            key: Digest::of_bytes(b"upload"),
+            intent: ArtifactIntent::Upload {
+                overwrite: false,
+                receipt: json!({
+                    "name":"package","version":1,"files":[{"path":"result.dat","size":contents.len(),"sha256":digest.as_str().strip_prefix("sha256:").unwrap()}],
+                    "plan_digest":plan.digest,"attempt_id":"run","job":format!("{logical}::produce"),"display":"produce","task":null,"retention_days":null,
+                }),
+            },
+        };
+        fx.w.set(|s| {
+            s.artifact_data.insert(digest.clone(), contents.clone());
+            s.pending_artifacts.insert(producer.clone(), upload.clone());
+        });
+        let held = Arc::new(HeldPoll {
+            worker: Arc::clone(&fx.w),
+            hold: std::sync::atomic::AtomicBool::new(true),
+            entered: tokio::sync::Semaphore::new(0),
+            release: tokio::sync::Semaphore::new(0),
+        });
+        let link: Arc<dyn WorkerLink> = held.clone();
+        c.attach(fx.w.id.clone(), Arc::clone(&link)).await;
+        let (ticked, ()) = tokio::join!(c.tick(), async {
+            // The worker asks for the upload; while that answer is on its
+            // way, the connection goes away.
+            held.entered.acquire().await.unwrap().forget();
+            if detached {
+                assert!(c.detach_link(&fx.w.id, &link).await.unwrap());
+            }
+            held.release.add_permits(1);
+        });
+        ticked.unwrap();
+        assert!(
+            !held.hold.load(std::sync::atomic::Ordering::SeqCst),
+            "the poll was held"
+        );
+        if detached {
+            assert_eq!(reserved_uploads(&fx), 0);
+            assert!(fx.w.offsets("workflow_read").is_empty());
+        } else {
+            assert_eq!(reserved_uploads(&fx), 1);
+            assert_eq!(fx.w.offsets("workflow_read"), [0]);
+        }
+    }
+}

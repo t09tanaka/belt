@@ -126,10 +126,13 @@ impl Fx {
         (task, attempt)
     }
 
-    async fn send(&self, link: &Silent, attempt: &AttemptId) -> Sent {
+    /// Send on `link`, attached for the worker as a tick finds it.
+    async fn send(&self, link: &Arc<Silent>, attempt: &AttemptId) -> Sent {
+        let attached: Attached = link.clone();
+        self.c.attach(self.worker.clone(), attached.clone()).await;
         let mut report = TickReport::default();
         self.c
-            .send_placed(&self.worker, link, attempt, &mut report)
+            .send_placed(&self.worker, &**link, &attached, attempt, &mut report)
             .await
             .unwrap()
     }
@@ -138,7 +141,7 @@ impl Fx {
 #[tokio::test]
 async fn a_placed_attempt_is_sent_as_it_was_committed() {
     let f = fx();
-    let link = Silent::default();
+    let link = Arc::new(Silent::default());
     let (_task, attempt) = f.placed().await;
     // Sent; this worker gives no answer, so it did not take it.
     assert_eq!(f.send(&link, &attempt).await, Sent::NotTaken);
@@ -151,7 +154,7 @@ async fn a_placed_attempt_is_sent_as_it_was_committed() {
 #[tokio::test]
 async fn a_cancel_recorded_after_the_placement_holds_the_submit_back() {
     let f = fx();
-    let link = Silent::default();
+    let link = Arc::new(Silent::default());
     let (task, attempt) = f.placed().await;
     f.c.cancel_task(&task).await.unwrap();
     assert_eq!(f.send(&link, &attempt).await, Sent::Withheld);
@@ -161,7 +164,7 @@ async fn a_cancel_recorded_after_the_placement_holds_the_submit_back() {
 #[tokio::test]
 async fn a_retire_recorded_after_the_placement_holds_the_submit_back() {
     let f = fx();
-    let link = Silent::default();
+    let link = Arc::new(Silent::default());
     let (_task, attempt) = f.placed().await;
     f.c.request_retire(&attempt, "move").await.unwrap();
     assert_eq!(f.send(&link, &attempt).await, Sent::Withheld);

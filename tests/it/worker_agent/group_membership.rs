@@ -1239,3 +1239,79 @@ async fn send_key_resets(offline: bool) {
     let _ = stop.send(true);
     ticker.await.unwrap();
 }
+
+/// A56 on the side that receives: connections that stop in the middle (a
+/// member that says nothing after `hello`, one that sent half a frame, and
+/// a proven member that goes quiet) are held open, and another member's
+/// requests are answered all the while. All of them share one budget of
+/// requests, as on a resident.
+#[tokio::test(flavor = "multi_thread")]
+async fn a56_a_stuck_members_connection_does_not_hold_up_another_members_requests() {
+    let f = fx();
+    let agent = f.start("boot-1");
+    let permits = Arc::new(Semaphore::new(4));
+    let serve = |io| {
+        tokio::spawn(serve_connection(
+            agent.clone(),
+            io,
+            f.cluster.clone(),
+            permits.clone(),
+        ))
+    };
+    let dial_shared = |m: &Member| {
+        let (a, b) = duplex_pair(64 * 1024);
+        let served = serve(b);
+        let cfg = m.cfg(&f.cluster);
+        async move { (connect(a, cfg).await, served) }
+    };
+
+    // A proven member that sends nothing more.
+    let stuck = member("m-stuck");
+    let (quiet, quiet_served) = dial_shared(&stuck).await;
+    let quiet = quiet.unwrap();
+    // A peer that stops after `hello`.
+    let (mut after_hello, b) = duplex_pair(64 * 1024);
+    let after_hello_served = serve(b);
+    let hello = Request::Hello(HelloRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        cluster_id: f.cluster.clone(),
+        coordinator_id: stuck.coordinator.clone(),
+        coordinator_epoch: CoordinatorEpoch(stuck.epoch),
+        protocol_versions: vec![1],
+        features: belt::protocol::session::offered_features(),
+    });
+    write_frame(
+        &mut after_hello.writer,
+        &Frame::message(0, Message::Request(hello)),
+        MAX_FRAME_LEN,
+    )
+    .await
+    .unwrap();
+    let answer = read_frame(&mut after_hello.reader, MAX_FRAME_LEN)
+        .await
+        .unwrap()
+        .expect("hello is answered");
+    assert!(matches!(answer.body, Body::Message(_)));
+    // A peer that sent the first bytes of a frame and no more.
+    let (mut half, b) = duplex_pair(64 * 1024);
+    let half_served = serve(b);
+    tokio::io::AsyncWriteExt::write_all(&mut half.writer, &[0, 0])
+        .await
+        .unwrap();
+
+    // Another member is let in and answered, again and again, while all of
+    // those are held.
+    let other = member("m-other");
+    let (connected, _served) = dial_shared(&other).await;
+    let client = connected.expect("the other member is let in").client;
+    for _ in 0..8 {
+        window_of(&client).await;
+    }
+    assert!(!quiet_served.is_finished());
+    assert!(!after_hello_served.is_finished());
+    assert!(!half_served.is_finished());
+    // And the quiet member is still served when it speaks again.
+    window_of(&quiet.client).await;
+    drop((after_hello, half));
+}
