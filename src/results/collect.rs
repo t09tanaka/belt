@@ -1453,14 +1453,15 @@ impl Collector {
             record.digest.clone(),
             ci.task_id.clone(),
         );
-        let usable = self
+        let read = self
             .fs(move |files| {
                 let path = files.artifact_path(&attempt, &digest);
-                let read = crate::ci::advance::read_result_at(&path, &digest);
-                Ok(read.is_ok_and(|result| result.task == task))
+                Ok(crate::ci::advance::read_result_at(&path, &digest)
+                    .ok()
+                    .map(|result| result.task))
             })
             .await?;
-        Ok(plan::judge_ci_result(usable))
+        Ok(plan::judge_ci_result(read.as_deref(), &task))
     }
 
     /// Everything of the recorded result is verified and durable here: tell

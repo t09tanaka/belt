@@ -265,9 +265,10 @@ impl Verdict {
 }
 
 /// The result of a CI task that is here: complete only when it can be read
-/// as the result of that task.
-pub fn judge_ci_result(usable: bool) -> Verdict {
-    if usable {
+/// as the result of that task. `read` is the task its result names (none
+/// when it could not be read), `expected` the task the attempt ran.
+pub fn judge_ci_result(read: Option<&str>, expected: &str) -> Verdict {
+    if read == Some(expected) {
         Verdict::Complete
     } else {
         Verdict::RequiredMissing
@@ -509,8 +510,11 @@ mod tests {
 
     #[test]
     fn the_result_of_a_ci_task_is_complete_only_when_it_can_be_used() {
-        assert_eq!(judge_ci_result(true), Verdict::Complete);
-        assert_eq!(judge_ci_result(false), Verdict::RequiredMissing);
+        assert_eq!(judge_ci_result(Some("t"), "t"), Verdict::Complete);
+        // The result of another task, or none that can be read.
+        assert_eq!(judge_ci_result(Some("u"), "t"), Verdict::RequiredMissing);
+        assert_eq!(judge_ci_result(None, "t"), Verdict::RequiredMissing);
+        assert_eq!(judge_ci_result(None, ""), Verdict::RequiredMissing);
     }
 
     #[test]
