@@ -14,6 +14,16 @@ pub struct SupervisorLock {
     _file: File,
 }
 
+impl Drop for SupervisorLock {
+    fn drop(&mut self) {
+        // A concurrent fork can retain this open file description until exec.
+        // Closing our descriptor alone would then leave the lock held after
+        // an acknowledgement has replied that the attempt is released.
+        // SAFETY: flock only borrows this live descriptor.
+        unsafe { libc::flock(self._file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 pub fn lock_path(state_dir: &Path, attempt: &AttemptId) -> PathBuf {
     state_dir
         .join("supervisors")
@@ -49,6 +59,33 @@ impl SupervisorLock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dropping_owner_releases_lock_even_with_an_inherited_description() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let a = AttemptId::generate();
+        let owner = SupervisorLock::try_acquire(dir.path(), &a)
+            .unwrap()
+            .unwrap();
+        // dup and fork share the same open file description, so no child is
+        // needed to reproduce a descriptor inherited by a concurrent spawn.
+        let inherited = owner._file.try_clone().unwrap();
+        assert!(SupervisorLock::try_acquire(dir.path(), &a)
+            .unwrap()
+            .is_none());
+        drop(owner);
+        let next = SupervisorLock::try_acquire(dir.path(), &a)
+            .unwrap()
+            .expect("the owner released the lock before the inherited descriptor closed");
+        drop(inherited);
+        assert!(SupervisorLock::try_acquire(dir.path(), &a)
+            .unwrap()
+            .is_none());
+        drop(next);
+        assert!(SupervisorLock::try_acquire(dir.path(), &a)
+            .unwrap()
+            .is_some());
+    }
 
     #[test]
     fn the_lock_is_exclusive_and_released_on_drop() {
