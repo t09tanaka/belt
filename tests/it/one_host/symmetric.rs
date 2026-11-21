@@ -576,6 +576,7 @@ async fn a53_a_member_removed_by_a_key_switch_is_refused_and_its_attempt_ends_wi
     let theirs = g.only(&removed[0]).attempt_id;
     let command = g.members[0].command(&theirs);
 
+    let switched = Instant::now();
     // m-a and m-b switch to a key m-c never gets: first the next key on
     // both, then the switch.
     for m in &g.members[..2] {
@@ -609,6 +610,9 @@ async fn a53_a_member_removed_by_a_key_switch_is_refused_and_its_attempt_ends_wi
     )
     .await;
     assert_eq!(g.members[0].ended(&theirs), Some(Outcome::Interrupted));
+    // It ran on for its lease: its last renewal was before the switch.
+    let lease = Duration::from_millis(g.cfg.lease_ms);
+    assert!(switched.elapsed() >= lease / 2, "{:?}", switched.elapsed());
     assert_eq!(g.members[0].noted(&theirs, "lease_expired"), 1);
     assert_ne!(identity_of(command.0).as_deref(), Some(command.1.as_str()));
     g.succeeded_once(&kept[0]);
@@ -704,6 +708,7 @@ async fn a54_a_stopped_member_stalls_only_its_own_runs_and_the_others_end_on_the
     let (hit, spared) = (g.only(&stalled[0]).attempt_id, g.only(&going[0]).attempt_id);
     let command = g.members[1].command(&hit);
 
+    let stopped = Instant::now();
     g.stop(0);
     // Right after the stop, the stopped member's attempt still runs.
     assert!(g.members[1].runs(&hit), "{}", g.picture());
@@ -715,6 +720,9 @@ async fn a54_a_stopped_member_stalls_only_its_own_runs_and_the_others_end_on_the
     .await;
     let w = &g.members[1];
     assert_eq!(w.ended(&hit), Some(Outcome::Interrupted), "{}", g.picture());
+    // It ran on for its lease: its last renewal was before the stop.
+    let lease = Duration::from_millis(g.cfg.lease_ms);
+    assert!(stopped.elapsed() >= lease / 2, "{:?}", stopped.elapsed());
     assert_eq!(w.noted(&hit, "lease_expired"), 1);
     assert_ne!(identity_of(command.0).as_deref(), Some(command.1.as_str()));
     g.succeeded_once(&going[0]);
