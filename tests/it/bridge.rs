@@ -136,12 +136,18 @@ async fn the_ssh_command_line_reaches_the_bridge_through_a_remote_shell() {
 #[tokio::test]
 async fn a_child_process_is_a_transport() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut t = spawn_child(&["cat".to_string()]).unwrap();
+    let mut t = spawn_child(&[
+        "sh".into(),
+        "-c".into(),
+        crate::fixture_process::sleep_command("cat"),
+    ])
+    .unwrap();
     t.io.writer.write_all(b"ping").await.unwrap();
     t.io.writer.shutdown().await.unwrap();
     let mut got = Vec::new();
     t.io.reader.read_to_end(&mut got).await.unwrap();
-    assert_eq!(got, b"ping");
+    // The ignored test prints only libtest's startup banner before copying stdin.
+    assert_eq!(got, b"\nrunning 1 test\nping");
     assert!(spawn_child(&[]).is_err());
     assert!(spawn_child(&["/definitely/not/here".to_string()]).is_err());
 }

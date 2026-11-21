@@ -1607,6 +1607,7 @@ async fn in_place_real_exec_sigint_confirms_stop_and_preserves_original() {
 }
 async fn control_exec_sigint(in_place: bool) {
     let (_root, spec, input) = control_fixture();
+    let script = crate::fixture_process::script("sleep 30");
     let mut child = tokio::process::Command::new(&spec.executable)
         .args(if in_place {
             vec![
@@ -1616,10 +1617,10 @@ async fn control_exec_sigint(in_place: bool) {
                 "--",
                 "/bin/sh",
                 "-c",
-                "sleep 30",
+                &script,
             ]
         } else {
-            vec!["--json", "exec", "--", "/bin/sh", "-c", "sleep 30"]
+            vec!["--json", "exec", "--", "/bin/sh", "-c", &script]
         })
         .env_clear()
         .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
@@ -1697,7 +1698,11 @@ async fn control_wait_reopens_after_owner_restart_without_new_attempt() {
     let context = Context::load(spec.env.clone(), input, spec.clone()).unwrap();
     let receipt = belt::service::submit::command(
         context,
-        vec!["/bin/sh".into(), "-c".into(), "sleep 3; exit 0".into()],
+        vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            crate::fixture_process::script("sleep 3; exit 0"),
+        ],
         None,
     )
     .await
@@ -5305,7 +5310,7 @@ async fn ci_sigint_cancels_the_running_job_and_the_ones_that_wait() {
     let marks = ci_project(
         root.path(),
         &input,
-        "  first:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo started >> MARKS/first; sleep 60\n  second:\n    needs: first\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/second\n",
+        &crate::fixture_process::script("  first:\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo started >> MARKS/first; sleep 60\n  second:\n    needs: first\n    if: always()\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo ran >> MARKS/second\n"),
     );
     let mut child = ci_command(&spec, &input)
         .stdout(Stdio::piped())

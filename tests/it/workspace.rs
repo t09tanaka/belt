@@ -1445,10 +1445,10 @@ fn a_hook_that_never_ends_is_killed_with_its_children() {
     let pidfile = f.root.join("child.pid");
     let (_bin, env) = fake_tool(
         &f,
-        &format!(
+        &crate::fixture_process::script(&format!(
             "echo starting >&2\nsleep 300 &\necho $! > '{}'\nwait",
             pidfile.display()
-        ),
+        )),
     );
     // Allow the real shell and descendant to start under instrumented CI.
     // The hook still cannot complete, so timeout and group cleanup are required.

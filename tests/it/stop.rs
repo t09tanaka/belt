@@ -41,10 +41,14 @@ fn spawn_group(ignore_term: bool) -> (std::process::Child, Group) {
     let ready_path = ready.path().to_path_buf();
     std::fs::remove_file(&ready_path).unwrap();
     let body = if ignore_term {
-        "trap '' TERM; sleep 30 & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; \
-         while :; do sleep 1; done"
+        &crate::fixture_process::script(
+            "trap '' TERM; sleep 30 & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; \
+         while :; do sleep 1; done",
+        )
     } else {
-        "sleep 30 & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; wait"
+        &crate::fixture_process::script(
+            "sleep 30 & echo $! > \"$1.tmp\"; mv \"$1.tmp\" \"$1\"; wait",
+        )
     };
     let child = Command::new("sh")
         .arg("-c")
@@ -235,7 +239,11 @@ fn another_process_differs_and_a_dead_pid_is_no_process() {
     assert!(me.identity().is_some(), "{me:?}");
     // The start time has a resolution of one clock tick: let one pass.
     std::thread::sleep(Duration::from_millis(50));
-    let mut child = Command::new("sleep").arg("5").spawn().unwrap();
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(crate::fixture_process::script("exec sleep 5"))
+        .spawn()
+        .unwrap();
     let theirs = platform::process_start_identity(child.id());
     assert!(theirs.identity().is_some(), "{theirs:?}");
     assert_ne!(theirs, me);
@@ -250,7 +258,11 @@ fn another_process_differs_and_a_dead_pid_is_no_process() {
 #[test]
 fn a_zombie_keeps_the_identity_it_had_alive_until_it_is_reaped() {
     // It ends by itself: nothing is signalled here.
-    let mut child = Command::new("sleep").arg("0.5").spawn().unwrap();
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(crate::fixture_process::script("exec sleep 0.5"))
+        .spawn()
+        .unwrap();
     let pid = child.id();
     let live = platform::read_process(pid);
     let Some(start) = live.start.identity().map(str::to_string) else {

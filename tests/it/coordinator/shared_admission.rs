@@ -565,7 +565,10 @@ async fn member_link(
 /// A task whose command writes a line to `marker` when it starts, and stays.
 async fn staying_task(c: &Coordinator, marker: &std::path::Path) -> TaskId {
     let mut task_spec = spec();
-    let script = format!("echo start >> {}; exec sleep 300", marker.display());
+    let script = crate::fixture_process::script(&format!(
+        "echo start >> {}; exec sleep 300",
+        marker.display()
+    ));
     task_spec.commands[0].argv = vec!["/bin/sh".into(), "-c".into(), script];
     task_spec.commands[0]
         .env

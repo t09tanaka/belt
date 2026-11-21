@@ -157,7 +157,7 @@ async fn submit(
         let fixture = belt::protocol::ssh::quote(&root.display().to_string());
         format!("while [ -d {fixture} ] && [ ! -e {release} ]; do sleep 0.05; done")
     } else {
-        format!("sleep {delay}")
+        crate::fixture_process::script(&format!("sleep {delay}"))
     };
     let spec = TaskSpec {
         ci: None,
