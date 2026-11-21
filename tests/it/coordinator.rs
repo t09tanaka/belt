@@ -3526,3 +3526,51 @@ async fn a56_workers_that_stall_in_both_rounds_of_placing_keep_the_tick_within_t
         begun.elapsed()
     );
 }
+
+#[tokio::test]
+async fn a57_a_parent_on_trial_adopts_and_renews_and_promises_nothing_more() {
+    let f = fx();
+    let a = f.worker("w-a", (2, 1));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, 3).await;
+    c.tick().await.unwrap();
+    let before: Vec<AttemptRecord> = tasks.iter().map(|t| only(&c, t)).collect();
+    a.start(&before[0].attempt_id);
+    a.start(&before[1].attempt_id);
+    c.tick().await.unwrap();
+    drop(c);
+
+    // The new version starts on trial.
+    let marker = f.dir.path().join("upgrade-trial.json");
+    std::fs::write(&marker, b"{}").unwrap();
+    let c = f.open(&[&a]);
+    c.set_trial_marker(marker.clone());
+    assert!(c.in_trial());
+    let renewals = a.count(Op::Renew);
+    c.request_retire(&before[1].attempt_id, "moved by an operator")
+        .await
+        .unwrap();
+    a.finish(&before[0].attempt_id, Outcome::Succeeded);
+    let more = vec![(TaskId::generate(), spec())];
+    assert!(c
+        .enqueue(RunId::generate(), source(&c), more)
+        .await
+        .is_err());
+    let report = c.tick().await.unwrap();
+    assert!(report.placed.is_empty() && report.settled.is_empty());
+    assert_eq!(a.count(Op::Submit), 3, "nothing placed or sent again");
+    assert_eq!(a.count(Op::Retire), 0, "no retire is sent");
+    assert!(a.count(Op::Renew) > renewals, "leases are renewed");
+    // The attempts are adopted by the new epoch, not placed again.
+    let lease = a.held(&before[2].attempt_id).unwrap().lease.unwrap();
+    assert_eq!(lease.coordinator_epoch, CoordinatorEpoch(2));
+    for (t, was) in tasks.iter().zip(&before) {
+        assert_eq!(only(&c, t).attempt_id, was.attempt_id);
+    }
+
+    // After the commit the result is taken and the retire is sent.
+    std::fs::remove_file(&marker).unwrap();
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.settled, vec![before[0].attempt_id.clone()]);
+    assert_eq!(a.count(Op::Retire), 1);
+}

@@ -211,6 +211,7 @@ impl Host {
             .exists());
         assert!(!record_path(&self.paths).exists());
         assert!(!control::held(&self.paths.worker));
+        assert!(!control::in_trial(&self.paths.worker));
         for name in [KEPT_JOURNAL, KEPT_INPUT, KEPT_PARENT_DB, KEPT_WORKER_DB] {
             assert!(!kept(&self.paths, name).exists(), "{name} kept");
         }
@@ -235,6 +236,8 @@ async fn a57_upgrade_moves_bin_resident_and_leaves_the_old_binary_untouched() {
             assert_eq!(spec.executable, h.exe(&h.new));
             // During the trial the hold stays, and the guard watches.
             assert!(control::held(&h.paths.worker));
+            // The new version promises nothing until the commit.
+            assert!(control::in_trial(&h.paths.worker));
             assert!(launcher.running(&h.guard).is_some());
             assert!(record_path(&h.paths).exists());
             Ok(())

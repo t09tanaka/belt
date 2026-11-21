@@ -2359,6 +2359,14 @@ impl Agent {
         request
             .ensure_current_schema()
             .map_err(|e| ApiError::new(ErrorCode::ProtocolIncompatible, e.to_string()))?;
+        // A version on trial promises nothing: whoever asks for a change
+        // sends it again after the commit or the rollback (§24.8).
+        if super::control::in_trial(&self.cfg.state_dir) && changes_state(&request) {
+            return Err(ApiError::new(
+                ErrorCode::Overloaded,
+                "this worker is trying a new version; send the request again later",
+            ));
+        }
         // The member of this connection: what it names by attempt id is its
         // own attempt, and another member's is not found.
         let store = &self.store.for_member(&session.coordinator_id);
@@ -3482,6 +3490,23 @@ fn note(store: &WorkerStore, rec: &AcceptedAttempt, kind: &str, payload: Value) 
         &payload,
         now(),
     );
+}
+
+/// The requests a version on trial refuses: everything that would change or
+/// save something on this worker. Reads are answered.
+fn changes_state(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::IdentityRetired(_)
+            | Request::SubmitAttempt(_)
+            | Request::RenewLease(_)
+            | Request::CancelAttempt(_)
+            | Request::RetireAttempt(_)
+            | Request::AckCollected(_)
+            | Request::SecretBundlePut(_)
+            | Request::BlobPut(_)
+            | Request::EnvSync(_)
+    )
 }
 
 #[cfg(test)]

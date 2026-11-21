@@ -328,6 +328,7 @@ fn finish(paths: &Paths) -> anyhow::Result<()> {
     for name in [KEPT_JOURNAL, KEPT_INPUT, KEPT_PARENT_DB, KEPT_WORKER_DB] {
         wsu::remove_if_present(&kept(paths, name))?;
     }
+    control::end_trial(&paths.worker)?;
     control::lift_hold(&paths.worker)?;
     Ok(())
 }
@@ -561,6 +562,8 @@ pub fn begin<L: Launcher>(
         }
         record.backed_up = true;
         write_record(&paths, &record)?;
+        // From here the version that starts promises nothing until the commit.
+        control::begin_trial(&paths.worker)?;
         let mut j = retargeted(&paths, &from, &to);
         j.files.retain(|p| p.path != from.spec.executable);
         j.files.push(Proof::read(&j.spec.executable)?);

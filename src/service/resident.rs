@@ -748,6 +748,7 @@ async fn connect_local_worker(
         agent_config.worker_id.clone(),
         agent_config.group_key_path.clone(),
     );
+    coordinator.set_trial_marker(crate::worker::control::trial_path(&agent_config.state_dir));
     let membership = coordinator
         .membership()
         .map_err(|e| anyhow::anyhow!(e.message))?;

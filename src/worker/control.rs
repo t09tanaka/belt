@@ -91,14 +91,15 @@ pub fn write(state_dir: &Path, control: Control) -> std::io::Result<()> {
 const HOLD: &str = "upgrade-hold.json";
 
 pub fn held(state_dir: &Path) -> bool {
-    match std::fs::symlink_metadata(state_dir.join(HOLD)) {
-        Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
-    }
+    present(&state_dir.join(HOLD))
 }
 
 /// Place the hold, durably. Placing it again changes nothing.
 pub fn hold(state_dir: &Path) -> std::io::Result<()> {
+    place_marker(state_dir, HOLD)
+}
+
+fn place_marker(state_dir: &Path, name: &str) -> std::io::Result<()> {
     let mut temporary = tempfile::NamedTempFile::new_in(state_dir)?;
     temporary
         .as_file()
@@ -106,15 +107,49 @@ pub fn hold(state_dir: &Path) -> std::io::Result<()> {
     temporary.write_all(b"{}")?;
     temporary.as_file().sync_all()?;
     temporary
-        .persist(state_dir.join(HOLD))
+        .persist(state_dir.join(name))
         .map_err(|e| e.error)?;
     std::fs::File::open(state_dir)?.sync_all()
 }
 
 /// Lift the hold. Lifting a hold that is not there changes nothing.
 pub fn lift_hold(state_dir: &Path) -> std::io::Result<()> {
-    match std::fs::remove_file(state_dir.join(HOLD)) {
-        Ok(()) => std::fs::File::open(state_dir)?.sync_all(),
+    remove_marker(&state_dir.join(HOLD))
+}
+
+/// The trial of a new version (`belt upgrade`), from just before the switch
+/// to the commit or the rollback. While it is there the worker answers every
+/// state-changing request with a reasonless `OVERLOADED` and saves nothing,
+/// and the coordinator only adopts and renews. A marker that cannot be told
+/// apart from none is a trial.
+const TRIAL: &str = "upgrade-trial.json";
+
+pub fn trial_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(TRIAL)
+}
+
+pub fn present(marker: &Path) -> bool {
+    match std::fs::symlink_metadata(marker) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+pub fn in_trial(state_dir: &Path) -> bool {
+    present(&trial_path(state_dir))
+}
+
+pub fn begin_trial(state_dir: &Path) -> std::io::Result<()> {
+    place_marker(state_dir, TRIAL)
+}
+
+pub fn end_trial(state_dir: &Path) -> std::io::Result<()> {
+    remove_marker(&trial_path(state_dir))
+}
+
+fn remove_marker(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => std::fs::File::open(path.parent().unwrap_or(Path::new("/")))?.sync_all(),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(e) => Err(e),
     }

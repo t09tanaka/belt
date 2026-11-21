@@ -489,6 +489,8 @@ pub struct Coordinator {
     /// Who this coordinator is in the group: the name of its member and
     /// where the member's group key is. Set once at startup.
     group: std::sync::OnceLock<(WorkerId, std::path::PathBuf)>,
+    /// The marker of a version trial; see [`Coordinator::set_trial_marker`].
+    trial: std::sync::OnceLock<std::path::PathBuf>,
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
@@ -560,6 +562,7 @@ impl Coordinator {
         store.mark_reconciling()?;
         Ok(Coordinator {
             group: std::sync::OnceLock::new(),
+            trial: std::sync::OnceLock::new(),
             store: Arc::new(store),
             cfg,
             workers: Mutex::default(),
@@ -584,6 +587,20 @@ impl Coordinator {
             capacity_refused: Mutex::default(),
             sched,
         })
+    }
+
+    /// Name the marker of a version trial (`belt upgrade`, §24.8). While it
+    /// is there this coordinator only adopts attempts and renews their
+    /// leases: it places nothing, makes no generation, takes no submission,
+    /// sends no retire or cancel and settles no result. The first call holds.
+    pub fn set_trial_marker(&self, marker: std::path::PathBuf) {
+        let _ = self.trial.set(marker);
+    }
+
+    pub fn in_trial(&self) -> bool {
+        self.trial
+            .get()
+            .is_some_and(|marker| crate::worker::control::present(marker))
     }
 
     /// The scheduler: priorities, and why a task waits.
@@ -828,6 +845,11 @@ impl Coordinator {
         source_id: SourceId,
         tasks: Vec<(TaskId, TaskSpec)>,
     ) -> Result<()> {
+        if self.in_trial() {
+            return Err(CoordinatorError::Storage(StorageError::Overloaded(
+                "this member is trying a new version; submit again after the upgrade".into(),
+            )));
+        }
         let owner = self.store.clone();
         let source = tokio::task::spawn_blocking(move || owner.source_mutation_guard_foreground())
             .await
@@ -1348,6 +1370,10 @@ impl Coordinator {
         };
         let (answer, status) = self.ask(link, a).await;
         let step = policy::next_step(facts, answer);
+        if self.in_trial() && !matches!(step, Step::Follow | Step::KeepUnknown) {
+            // Settled, retired, cancelled or sent again after the trial.
+            return Ok(());
+        }
         match step {
             // These ask the worker first, and apply what it says themselves.
             Step::Retire => return self.retire(link, &live, report, asked).await,
@@ -1368,10 +1394,12 @@ impl Coordinator {
                 self.mirror(&status, report).await?;
                 drop(actor);
                 self.renew(link, a, status.state, report, asked).await?;
-                if !matches!(
-                    status.state,
-                    AttemptState::Cancelling | AttemptState::Finalizing
-                ) {
+                if !self.in_trial()
+                    && !matches!(
+                        status.state,
+                        AttemptState::Cancelling | AttemptState::Finalizing
+                    )
+                {
                     self.follow_artifacts(link, &live, asked).await?;
                 }
                 Ok(())
@@ -1761,6 +1789,9 @@ impl Coordinator {
         report: &mut TickReport,
         telemetry: &Mutex<Vec<preparation::RawPage>>,
     ) -> Result<()> {
+        if self.in_trial() {
+            return Ok(());
+        }
         // Tasks every attached worker is excluded for come last: however
         // many of them wait, they do not fill the scan in front of a task
         // that can be placed. A worker that is attached later is not
