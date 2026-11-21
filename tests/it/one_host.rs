@@ -16,7 +16,10 @@
 //! coordinator against in-memory workers in `coordinator` and `scheduler`.
 //! Here the acceptance items that need several workers run against real ones:
 //! A01, A02, A19, A21, A23, A24 (the restart simulated), and A20 and A26 as
-//! far as one machine shows them.
+//! far as one machine shows them. Several symmetric members of one group,
+//! each with its own parent and worker, are in [`symmetric`]: A51 to A54.
+
+mod symmetric;
 
 use crate::common::{alive, identity_of, kill_recorded_group, read_pid};
 use crate::coordinator::{attempts, only, queued, source, spec, Lost};
