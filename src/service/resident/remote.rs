@@ -126,6 +126,9 @@ pub(super) async fn forget(
                 refusal.message(),
             ),
         },
+        Err(crate::coordinator::CoordinatorError::Storage(e)) => Reply::ControlError {
+            error: ApiError::new(e.code(), e.to_string()),
+        },
         Err(e) => Reply::ControlError {
             error: ApiError::new(ErrorCode::Internal, e.to_string()),
         },

@@ -1201,6 +1201,19 @@ struct RetryCommand {
     expected: u64,
     request_id: String,
 }
+/// The parent requests a member on trial refuses: everything that would
+/// write the parent database. Reads, health and shutdown are answered.
+fn changes_parent_state(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Submit { .. }
+            | Operation::SubmitCaptured { .. }
+            | Operation::Cancel { .. }
+            | Operation::Retry { .. }
+            | Operation::RecordStatus { .. }
+    )
+}
+
 async fn retry_control<F, L>(
     coordinator: Arc<Coordinator>,
     admission: Arc<Mutex<bool>>,
@@ -1479,6 +1492,29 @@ async fn handle(
         } else {
             Reply::Error {
                 message: "resident is stopping".into(),
+            }
+        }
+    } else if coordinator.in_trial() && changes_parent_state(&request.operation) {
+        // Nothing is saved while a new version is on trial: a rollback would
+        // lose it. The asker sends again after the upgrade.
+        let message = if matches!(
+            &request.operation,
+            Operation::Submit { .. } | Operation::SubmitCaptured { .. }
+        ) {
+            "this member is trying a new version; submit again after the upgrade"
+        } else {
+            "this member is trying a new version; send again after the upgrade"
+        };
+        if matches!(
+            &request.operation,
+            Operation::Cancel { .. } | Operation::Retry { .. }
+        ) {
+            Reply::ControlError {
+                error: crate::error::ApiError::new(crate::error::ErrorCode::Overloaded, message),
+            }
+        } else {
+            Reply::Error {
+                message: message.into(),
             }
         }
     } else {

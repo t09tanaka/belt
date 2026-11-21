@@ -603,6 +603,17 @@ impl Coordinator {
             .is_some_and(|marker| crate::worker::control::present(marker))
     }
 
+    /// A change asked of a member on trial is answered "send again later"
+    /// (`OVERLOADED`) with nothing saved: a rollback would lose it.
+    pub(crate) fn check_trial(&self) -> Result<()> {
+        if self.in_trial() {
+            return Err(CoordinatorError::Storage(StorageError::Overloaded(
+                "this member is trying a new version; send again after the upgrade".into(),
+            )));
+        }
+        Ok(())
+    }
+
     /// The scheduler: priorities, and why a task waits.
     pub fn scheduler(&self) -> &Scheduler {
         &self.sched
@@ -913,6 +924,7 @@ impl Coordinator {
     /// every later one until its worker answered.
     pub async fn cancel_task(&self, task_id: &TaskId) -> Result<Option<AttemptRecord>> {
         self.check_fenced()?;
+        self.check_trial()?;
         self.clear_prefetch(&crate::service::completion::Target::Task(task_id.clone()));
         let task = task_id.clone();
         self.db(move |s| s.cancel_task(&task, wall_ms())).await
@@ -920,6 +932,7 @@ impl Coordinator {
 
     pub async fn cancel_run(&self, run_id: RunId) -> Result<()> {
         self.check_fenced()?;
+        self.check_trial()?;
         self.clear_prefetch(&crate::service::completion::Target::Run(run_id.clone()));
         self.db(move |s| s.cancel_run(&run_id, wall_ms())).await
     }
@@ -929,6 +942,13 @@ impl Coordinator {
     /// only after the worker confirmed that the attempt never started or has
     /// stopped.
     pub async fn request_retire(&self, attempt_id: &AttemptId, reason: &str) -> Result<()> {
+        self.check_trial()?;
+        self.retire_durably(attempt_id, reason).await
+    }
+
+    /// The tombstone of [`Coordinator::request_retire`], for a tick that
+    /// already knows it is not on trial (a tick on trial places nothing).
+    async fn retire_durably(&self, attempt_id: &AttemptId, reason: &str) -> Result<()> {
         let (a, reason) = (attempt_id.clone(), reason.to_string());
         self.db(move |s| s.begin_retire(&a, &reason, wall_ms()))
             .await
@@ -1553,7 +1573,7 @@ impl Coordinator {
                     Refusal::Never => {
                         self.note_refusal(&a.attempt_id, "submit_refused", &e)
                             .await?;
-                        self.request_retire(&a.attempt_id, REASON_SUBMIT_REFUSED)
+                        self.retire_durably(&a.attempt_id, REASON_SUBMIT_REFUSED)
                             .await?;
                         self.observe(&a.attempt_id, Observation::Known).await?;
                         Ok(Sent::NotTaken)

@@ -3532,12 +3532,19 @@ async fn a57_a_parent_on_trial_adopts_and_renews_and_promises_nothing_more() {
     let f = fx();
     let a = f.worker("w-a", (2, 1));
     let c = f.open(&[&a]);
-    let tasks = enqueue(&c, 3).await;
+    let run = RunId::generate();
+    let tasks: Vec<TaskId> = (0..3).map(|_| TaskId::generate()).collect();
+    let specs = tasks.iter().map(|t| (t.clone(), spec())).collect();
+    c.enqueue(run.clone(), source(&c), specs).await.unwrap();
     c.tick().await.unwrap();
     let before: Vec<AttemptRecord> = tasks.iter().map(|t| only(&c, t)).collect();
     a.start(&before[0].attempt_id);
     a.start(&before[1].attempt_id);
     c.tick().await.unwrap();
+    // Asked before the trial: the tombstone is durable and is sent later.
+    c.request_retire(&before[1].attempt_id, "moved by an operator")
+        .await
+        .unwrap();
     drop(c);
 
     // The new version starts on trial.
@@ -3547,9 +3554,24 @@ async fn a57_a_parent_on_trial_adopts_and_renews_and_promises_nothing_more() {
     c.set_trial_marker(marker.clone());
     assert!(c.in_trial());
     let renewals = a.count(Op::Renew);
-    c.request_retire(&before[1].attempt_id, "moved by an operator")
-        .await
-        .unwrap();
+    // A change asked during the trial is refused, "send again later", and
+    // nothing of it is saved: a rollback would lose it.
+    let overloaded = |e: CoordinatorError| {
+        assert!(
+            matches!(e, CoordinatorError::Storage(StorageError::Overloaded(_))),
+            "{e:?}"
+        )
+    };
+    let recorded: Vec<AttemptRecord> = tasks.iter().map(|t| only(&c, t)).collect();
+    overloaded(
+        c.request_retire(&before[2].attempt_id, "moved during the trial")
+            .await
+            .unwrap_err(),
+    );
+    overloaded(c.cancel_task(&tasks[2]).await.unwrap_err());
+    overloaded(c.cancel_run(run.clone()).await.unwrap_err());
+    let unchanged: Vec<AttemptRecord> = tasks.iter().map(|t| only(&c, t)).collect();
+    assert_eq!(unchanged, recorded, "no attempt row changed");
     a.finish(&before[0].attempt_id, Outcome::Succeeded);
     let more = vec![(TaskId::generate(), spec())];
     assert!(c

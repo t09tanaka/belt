@@ -2118,3 +2118,79 @@ fn a_run_of_ci_tasks_is_a_request_an_older_resident_refuses() {
     };
     assert!(plain.requires_ci());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a57_a_resident_on_trial_saves_no_cancel_retry_or_status_and_says_send_again() {
+    use crate::service::completion::Target;
+    let root = crate::test_tmp::tempdir().unwrap();
+    let resident = delivery_resident(root.path()).await;
+    let coordinator = resident.coordinator.clone();
+    let run = RunId::generate();
+    coordinator
+        .store()
+        .create_run(&run, None, None, &serde_json::json!({}), 1)
+        .unwrap();
+    let before = coordinator
+        .store()
+        .completion(Target::Run(run.clone()))
+        .unwrap();
+    std::fs::write(
+        crate::worker::control::trial_path(&resident.agent.config().state_dir),
+        b"{}",
+    )
+    .unwrap();
+    assert!(coordinator.in_trial());
+    let client = resident.client();
+    let runner = tokio::spawn(resident.run());
+    for operation in [
+        Operation::Cancel {
+            target: Target::Run(run.clone()),
+            expected_control_revision: before.control_revision,
+            request_id: RunId::generate().to_string(),
+        },
+        Operation::Retry {
+            target: Target::Run(run.clone()),
+            expected_control_revision: before.control_revision,
+            request_id: RunId::generate().to_string(),
+        },
+    ] {
+        match client.request(operation).await.unwrap() {
+            Reply::ControlError { error } => {
+                assert_eq!(error.code, crate::error::ErrorCode::Overloaded, "{error:?}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    let record: crate::ci::status::Record = serde_json::from_value(serde_json::json!({
+        "computed": "success", "posting": "skipped", "reason": "--no-status",
+    }))
+    .unwrap();
+    match client
+        .request(Operation::RecordStatus {
+            run_id: run.clone(),
+            record,
+        })
+        .await
+        .unwrap()
+    {
+        Reply::Error { message } => assert!(message.contains("send again"), "{message}"),
+        other => panic!("{other:?}"),
+    }
+    // Nothing of the three was saved.
+    assert_eq!(
+        serde_json::to_value(
+            coordinator
+                .store()
+                .completion(Target::Run(run.clone()))
+                .unwrap()
+        )
+        .unwrap(),
+        serde_json::to_value(&before).unwrap()
+    );
+    assert_eq!(coordinator.store().github_status_of(&run).unwrap(), None);
+    assert!(matches!(
+        client.request(Operation::Shutdown).await.unwrap(),
+        Reply::Stopping
+    ));
+    runner.await.unwrap().unwrap();
+}

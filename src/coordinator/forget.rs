@@ -128,6 +128,8 @@ impl Coordinator {
         ephemeral: Option<bool>,
         term_grace_ms: u64,
     ) -> Result<std::result::Result<Forgotten, ForgetRefusal>> {
+        // Before anything is written, the member contact included.
+        self.check_trial()?;
         let _actor = self.actor.lock().await;
         let _commit = self.placement_fence.lock().await;
         let connected = self
@@ -254,6 +256,47 @@ mod tests {
 
     fn attempt_of(f: &Fx, attempt: &AttemptId) -> AttemptRecord {
         f.c.store().get_attempt(attempt).unwrap().unwrap()
+    }
+
+    /// A member on trial forgets nobody: the attempts would be ended and
+    /// the identity retired in a database a rollback puts back.
+    #[tokio::test]
+    async fn a57_forget_during_a_trial_says_send_again_and_saves_nothing() {
+        let f = fx();
+        let first = boot("os-boot.start-1");
+        f.c.admit_identity(&f.worker, &first).await.unwrap();
+        let link: Arc<dyn WorkerLink> = Arc::new(Clean::default());
+        f.c.attach(f.worker.clone(), link.clone()).await;
+        let (_, attempt) = f.placed().await;
+        assert!(f.c.detach_link(&f.worker, &link).await.unwrap());
+        let kept = attempt_of(&f, &attempt);
+        let marker = f.c.store().state_dir().join("upgrade-trial.json");
+        std::fs::write(&marker, b"{}").unwrap();
+        f.c.set_trial_marker(marker.clone());
+        for ephemeral in [Some(true), Some(false), None] {
+            let refused =
+                f.c.forget_worker_after(&f.worker, ephemeral, 5000)
+                    .await
+                    .unwrap_err();
+            assert!(
+                matches!(
+                    refused,
+                    CoordinatorError::Storage(crate::storage::StorageError::Overloaded(_))
+                ),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(attempt_of(&f, &attempt), kept);
+        assert!(!f.c.identity_retired(&f.worker, &first).await.unwrap());
+        // After the trial the same forget goes through.
+        std::fs::remove_file(&marker).unwrap();
+        assert!(f
+            .c
+            .forget_worker(&f.worker, Some(true))
+            .await
+            .unwrap()
+            .is_ok());
+        assert_eq!(attempt_of(&f, &attempt).state, AttemptState::Terminal);
     }
 
     #[tokio::test]
