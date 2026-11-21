@@ -49,3 +49,12 @@ fn helper_bounds_input_and_never_echoes_invalid_secret_input() {
     }
     assert!(!f.path("home/.config/belt/coordinator.json").exists());
 }
+
+#[test]
+fn send_key_takes_one_member() {
+    let parsed = Cli::try_parse_from(["belt", "group", "send-key", "mini-b"]).unwrap();
+    assert!(
+        matches!(parsed.command, Command::Group { command: Some(GroupSub::SendKey { member }) } if member == "mini-b")
+    );
+    assert!(Cli::try_parse_from(["belt", "group", "send-key"]).is_err());
+}

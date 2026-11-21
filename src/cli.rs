@@ -100,6 +100,8 @@ pub enum Command {
 
 #[derive(Debug, Subcommand)]
 pub enum GroupSub {
+    /// Send the current key and regenerate the member worker identity, stopping its live attempts.
+    SendKey { member: String },
     /// Distribute and switch to a new group key, or resume an interrupted rotation.
     RotateKey {
         #[arg(long)]
@@ -329,7 +331,7 @@ pub enum WorkersSub {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Declare an ephemeral worker gone: its attempts end as interrupted.
+    /// Forget a disconnected ephemeral worker or a rotated-out member after its lease and stop grace.
     Forget { name: String },
 }
 
@@ -462,6 +464,9 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::Group { command } = &cli.command {
         return match command {
             None => crate::service::group::command(cli.json),
+            Some(GroupSub::SendKey { member }) => {
+                crate::service::group::rotate::send_key_command(member, cli.json)
+            }
             Some(GroupSub::RotateKey { remove, skip }) => {
                 crate::service::group::rotate::command(remove, skip, cli.json)
             }

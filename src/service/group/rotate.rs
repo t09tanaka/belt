@@ -44,6 +44,9 @@ pub(crate) struct Request {
 #[serde(tag = "action", deny_unknown_fields)]
 enum Action {
     Collect,
+    SendKey {
+        key: Vec<u8>,
+    },
     Distribute {
         generation: Generation,
         key: Vec<u8>,
@@ -74,6 +77,9 @@ fn store(spec: &Spec) -> Result<WorkerStore, ApiError> {
     WorkerStore::open(&spec.worker_state_dir, &spec.worker_id).map_err(internal)
 }
 fn stage(spec: &Spec, generation: &Generation, incoming: &ClusterKey) -> Result<(), ApiError> {
+    if crate::worker::rekey::pending(&spec.worker_state_dir) {
+        return Err(conflict("send-key is pending; wait for its identity reset"));
+    }
     if group::fingerprint(incoming) != generation.fingerprint || generation.number == 0 {
         return Err(conflict("invalid rotation generation"));
     }
@@ -118,6 +124,9 @@ fn stage(spec: &Spec, generation: &Generation, incoming: &ClusterKey) -> Result<
     Ok(())
 }
 fn switch(spec: &Spec, generation: &Generation) -> Result<(), ApiError> {
+    if crate::worker::rekey::pending(&spec.worker_state_dir) {
+        return Err(conflict("send-key is pending; wait for its identity reset"));
+    }
     let keys = group::load_keys(&spec.cluster_key_path).map_err(internal)?;
     if let Some(next) = keys.next {
         if group::fingerprint(&next) != generation.fingerprint {
@@ -152,6 +161,64 @@ pub(crate) fn accept(
     let _lock = ProcessLock::acquire(&spec.worker_state_dir, "group-rotation-key.lock")
         .map_err(internal)?;
     match request.action {
+        Action::SendKey { key } => {
+            let _command =
+                ProcessLock::acquire(&spec.worker_state_dir, "group-rotation-command.lock")
+                    .map_err(internal)?;
+            let key = ClusterKey::from_bytes(key).map_err(internal)?;
+            let state = &spec.worker_state_dir;
+            let database = store(spec)?;
+            // If no agent owns the state, the helper drives supervisor recovery.
+            let offline = match ProcessLock::acquire(state, "agent.lock") {
+                Ok(lock) => Some(lock),
+                Err(crate::storage::StorageError::Locked(_)) => None,
+                Err(error) => return Err(internal(error)),
+            };
+            // Resume an interrupted handoff first. Once done, this invocation
+            // still creates its own fresh identity, even for the same key.
+            let wait = || -> Result<(), ApiError> {
+                let deadline = std::time::Instant::now() + Duration::from_secs(50);
+                while crate::worker::rekey::pending(state) {
+                    if offline.is_some() {
+                        crate::worker::agent::interrupt_offline(
+                            state,
+                            &spec.worker_id,
+                            &database,
+                            deadline,
+                        )?;
+                        if std::time::Instant::now() >= deadline {
+                            return Err(conflict("send-key is still stopping old attempts; rerun send-key to continue"));
+                        }
+                        if database.list_nonterminal().map_err(internal)?.is_empty() {
+                            crate::worker::rekey::finish(state, &spec.cluster_key_path, &database)
+                                .map_err(internal)?;
+                            break;
+                        }
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(conflict("send-key is still stopping old attempts; resume with send-key or start the resident"));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Ok(())
+            };
+            wait()?;
+            let instance = crate::worker::rekey::stage(state, &key).map_err(internal)?;
+            wait()?;
+            let coordinator_id = if spec.state_dir.join("coordinator.db").exists() {
+                Some(
+                    CoordinatorStore::membership_writer(&spec.state_dir)
+                        .map_err(internal)?
+                        .coordinator_id()
+                        .clone(),
+                )
+            } else {
+                None
+            };
+            Ok(
+                json!({"fingerprint":group::fingerprint(&key), "instance":instance, "identity_regenerated":true, "coordinator_id":coordinator_id}),
+            )
+        }
         Action::Collect => Ok(
             json!({"members":workers::registrations(env)?.into_iter().map(|w| w.id).collect::<Vec<_>>()}),
         ),
@@ -206,6 +273,62 @@ fn call(
     })();
     result
         .map_err(|e: ApiError| ApiError::new(e.code, format!("member {}: {}", entry.id, e.message)))
+}
+
+pub(crate) fn send_key(
+    remote: &mut impl Remote,
+    env: &BTreeMap<String, String>,
+    spec: &Spec,
+    member: &str,
+) -> Result<Value, ApiError> {
+    let _lock = ProcessLock::acquire(&spec.worker_state_dir, "group-rotation-command.lock")
+        .map_err(internal)?;
+    let entry = workers::registrations(env)?
+        .into_iter()
+        .find(|w| w.id == member)
+        .ok_or_else(|| {
+            conflict(format!(
+                "member {member} is not in this host's [[workers]] list"
+            ))
+        })?;
+    let cluster = spec
+        .expected_cluster
+        .as_ref()
+        .ok_or_else(|| conflict("group missing"))?;
+    let key = group::load_keys(&spec.cluster_key_path)
+        .map_err(internal)?
+        .current;
+    let reply = call(
+        remote,
+        &entry,
+        cluster,
+        Action::SendKey {
+            key: key.as_bytes().to_vec(),
+        },
+    )?;
+    if let Some(id) = reply.get("coordinator_id").filter(|v| !v.is_null()) {
+        let id = serde_json::from_value(id.clone()).map_err(internal)?;
+        store(spec)?
+            .for_member(&id)
+            .replace_member_pin(member, crate::platform::wall_ms())
+            .map_err(internal)?;
+    }
+    Ok(reply)
+}
+
+pub fn send_key_command(member: &str, json_output: bool) -> i32 {
+    let env = environment();
+    let result = load_spec(&env).and_then(|spec| {
+        send_key(
+            &mut SshRemote::new(&spec.cluster_key_path),
+            &env,
+            &spec,
+            member,
+        )
+    });
+    workers::emit(json_output, result, || {
+        format!("sent current group key to {member}; worker identity regenerated (old live attempts stopped)")
+    })
 }
 
 pub(crate) fn rotate(

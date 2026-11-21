@@ -293,3 +293,90 @@ fn removing_a_registration_keeps_every_other_byte() {
     );
     assert_eq!(drop_worker_tables(text, &[]).unwrap(), text);
 }
+
+#[test]
+fn send_key_uses_current_even_with_next_and_replaces_pin_every_time() {
+    let (w, mut n) = fixture();
+    let own = WorkerStore::open(&w.spec.worker_state_dir, &w.spec.worker_id).unwrap();
+    let former = crate::ids::CoordinatorId::generate();
+    own.for_member(&former).replace_member_pin("a", 1).unwrap();
+    crate::secrets::key::init(&group::next_key_path(&w.spec.cluster_key_path)).unwrap();
+    let peer = &n.peers[0];
+    let expected_id = CoordinatorStore::membership_writer(&peer.spec.state_dir)
+        .unwrap()
+        .coordinator_id()
+        .clone();
+    let peer_store = WorkerStore::open(&peer.spec.worker_state_dir, &peer.spec.worker_id).unwrap();
+    let binding = peer.spec.worker_state_dir.join("worker-binding.json");
+    crate::worker::rekey::write(
+        &binding,
+        &serde_json::to_vec(&(
+            1,
+            peer.spec.expected_cluster.as_ref().unwrap(),
+            &peer.spec.worker_id,
+            "old-digest",
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    let next =
+        crate::secrets::key::init(&group::next_key_path(&peer.spec.cluster_key_path)).unwrap();
+    peer_store
+        .set_next_group_key(&crate::storage::KeyGeneration {
+            generation: 9,
+            fingerprint: group::fingerprint(&next),
+        })
+        .unwrap();
+    let first = rotate::send_key(&mut n, &w.env, &w.spec, "a").unwrap();
+    assert_eq!(first["identity_regenerated"], true);
+    assert_eq!(first["fingerprint"], group::fingerprint(&keys(&w).current));
+    assert_eq!(
+        group::fingerprint(&keys(&n.peers[0]).current),
+        group::fingerprint(&keys(&w).current)
+    );
+    assert!(keys(&n.peers[0]).next.is_none());
+    assert!(peer_store.group_keys().unwrap().1.is_none());
+    {
+        use sha2::Digest;
+        let bound: serde_json::Value =
+            serde_json::from_slice(&fs::read(&binding).unwrap()).unwrap();
+        assert_eq!(
+            bound[3],
+            format!(
+                "{:x}",
+                sha2::Sha256::digest(fs::read(&n.peers[0].spec.cluster_key_path).unwrap())
+            )
+        );
+        assert!(!n.peers[0]
+            .spec
+            .worker_state_dir
+            .join("send-key.key")
+            .exists());
+    }
+    assert_eq!(
+        own.for_member(&expected_id).pin_member("a", 2).unwrap(),
+        crate::storage::MemberPin::Pinned
+    );
+    assert_ne!(
+        own.for_member(&former).pin_member("a", 3).unwrap(),
+        crate::storage::MemberPin::Pinned
+    );
+    let second = rotate::send_key(&mut n, &w.env, &w.spec, "a").unwrap();
+    assert_ne!(first["instance"], second["instance"]);
+    assert_eq!(
+        n.events,
+        [
+            ("a".into(), "SendKey".into()),
+            ("a".into(), "SendKey".into())
+        ]
+    );
+}
+
+#[test]
+fn send_key_names_an_unlisted_member_without_ssh() {
+    let (w, mut n) = fixture();
+    let error = rotate::send_key(&mut n, &w.env, &w.spec, "missing").unwrap_err();
+    assert!(error.message.contains("missing"));
+    assert!(error.message.contains("[[workers]]"));
+    assert!(n.events.is_empty());
+}

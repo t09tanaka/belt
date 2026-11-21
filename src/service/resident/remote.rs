@@ -85,6 +85,7 @@ pub(super) async fn forget(
 ) -> Reply {
     use crate::coordinator::identity::ForgetRefusal;
     use crate::error::{ApiError, ErrorCode};
+    let term_grace_ms = config.term_grace_seconds.value.saturating_mul(1000);
     let (config, env, local_id) = (config.clone(), env.clone(), local_id.clone());
     let fresh = tokio::task::spawn_blocking(move || reload(&config, &env, &local_id)).await;
     let ephemeral = match fresh {
@@ -107,7 +108,10 @@ pub(super) async fn forget(
             }
         }
     };
-    match coordinator.forget_worker(worker, ephemeral).await {
+    match coordinator
+        .forget_worker_after(worker, ephemeral, term_grace_ms)
+        .await
+    {
         Ok(Ok(forgotten)) => Reply::WorkerForgotten {
             identity_retired: forgotten.identity.is_some(),
             ended: forgotten.ended,
@@ -117,7 +121,7 @@ pub(super) async fn forget(
                 match refusal {
                     ForgetRefusal::NotRegistered => ErrorCode::NotFound,
                     ForgetRefusal::NotEphemeral => ErrorCode::InvalidInput,
-                    ForgetRefusal::Connected => ErrorCode::Conflict,
+                    ForgetRefusal::Connected | ForgetRefusal::Waiting { .. } => ErrorCode::Conflict,
                 },
                 refusal.message(),
             ),
@@ -337,6 +341,10 @@ async fn session(
         if worker_id == member {
             super::super::group::record_refusal(coordinator.store().state_dir(), &member, None)?;
         }
+        let contact = crate::coordinator::member_contact::Contact { fingerprint: proven_with.clone(), at_ms: crate::platform::wall_ms(), open: true };
+        crate::coordinator::member_contact::write(coordinator.store().state_dir(), &worker_id, &contact)?;
+        let local_instance_path = coordinator.group_key_path().map(|p| p.with_extension("connections"));
+        let local_instance = local_instance_path.as_ref().and_then(|p| std::fs::read(p).ok());
         let link = config.attach_gated_worker(&coordinator, WorkerTarget::Remote(&worker.id), connected, gate.clone())
             .await.map_err(|e| anyhow::anyhow!(e.message))?;
         let (cancel, cancelled) = watch::channel(false);
@@ -351,6 +359,7 @@ async fn session(
                 _=jobs.join_next()=>break,
                 _=probe.tick()=> {
                     if outdated(coordinator.group_key_path(), &proven_with).await { break; }
+                    if local_instance_path.as_ref().and_then(|p| std::fs::read(p).ok()) != local_instance { break; }
                     let alive = tokio::select! { _=stop.changed()=>false, result=client.ping(IO_TIMEOUT)=>result.is_ok() };
                     if !alive { break; }
                 }
@@ -362,6 +371,8 @@ async fn session(
         gate.invalidate().await;
         coordinator.detach_link(&worker_id, &link).await?;
         while jobs.join_next().await.is_some() {}
+        crate::coordinator::member_contact::write(coordinator.store().state_dir(), &worker_id,
+            &crate::coordinator::member_contact::Contact { fingerprint: proven_with.clone(), at_ms: crate::platform::wall_ms(), open: false })?;
         Ok::<(), anyhow::Error>(())
     }.await;
     child.reap().await;

@@ -19,6 +19,7 @@ pub mod control;
 pub mod host;
 pub mod machine;
 pub mod policy;
+pub(crate) mod rekey;
 pub mod serve;
 
 pub use agent::{Agent, AgentConfig, Probe, ProbePoint, Session, StartupReport};

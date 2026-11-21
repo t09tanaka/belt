@@ -156,6 +156,25 @@ impl CoordinatorStore {
         })
     }
 
+    /// Update a persistent member after reboot without retiring its attempts.
+    pub(crate) fn reboot_worker_identity(
+        &self,
+        worker: &WorkerId,
+        boot: &WorkerBootId,
+    ) -> Result<Admission> {
+        let (worker, boot) = (worker.to_string(), boot.to_string());
+        self.db.write(move |tx| {
+            if retired(tx, &worker, &boot)? {
+                return Ok(Admission::Retired);
+            }
+            tx.execute(
+                "UPDATE worker_identity SET boot_id = ?2 WHERE worker_id = ?1",
+                params![worker, boot],
+            )?;
+            Ok(Admission::Same)
+        })
+    }
+
     /// Whether `boot` was retired for `worker`.
     pub fn worker_identity_retired(&self, worker: &WorkerId, boot: &WorkerBootId) -> Result<bool> {
         let (worker, boot) = (worker.to_string(), boot.to_string());

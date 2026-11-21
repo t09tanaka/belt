@@ -1810,7 +1810,7 @@ pub(super) fn reject_symlinks(path: &Path) -> io::Result<()> {
 mod tests;
 
 /// Open private regular files without following a link or blocking on a FIFO.
-pub(super) fn secure_file(path: &Path, writable: bool) -> io::Result<File> {
+pub(crate) fn secure_file(path: &Path, writable: bool) -> io::Result<File> {
     validate_components(path)?;
     let file = OpenOptions::new()
         .read(true)

@@ -37,11 +37,12 @@ pub enum ServeError {
 /// A probe ([`crate::protocol::ClientConfig::probe`]) names no coordinator:
 /// it is told who answers, nothing is recorded, and no request is served.
 pub fn admit(agent: &Agent, peer: &ProvenMember) -> Result<WorkerIdentity, ApiError> {
+    agent.check_rekey()?;
     let cfg = agent.config();
     let mut me = WorkerIdentity {
         capabilities: agent.capabilities(),
         worker_id: cfg.worker_id.clone(),
-        worker_boot_id: cfg.advertised_boot().clone(),
+        worker_boot_id: agent.advertised_boot(),
         agent_epoch: agent.agent_epoch(),
         profile: cfg.profile.clone(),
         profile_fingerprint: cfg.profile_fingerprint.clone(),
@@ -79,7 +80,7 @@ pub fn admit(agent: &Agent, peer: &ProvenMember) -> Result<WorkerIdentity, ApiEr
         }
     }
     if store
-        .identity_retired(cfg.advertised_boot())
+        .identity_retired(&agent.advertised_boot())
         .map_err(|e| failed("the retired identities", e))?
     {
         return Err(ApiError::group_refused(
@@ -145,6 +146,7 @@ pub async fn serve_connection_offering(
                 format!("the group key cannot be read: {e}"),
             ))
         })?;
+    let connection_boot = agent.advertised_boot();
     let mut key_changes = agent.group_key_changes();
     key_changes.mark_unchanged();
     let admitting = agent.clone();
@@ -177,7 +179,7 @@ pub async fn serve_connection_offering(
         let next = tokio::select! {
             next = incoming.next() => next,
             changed = key_changes.changed() => {
-                if changed.is_err() {
+                if changed.is_err() || connection_boot != agent.advertised_boot() {
                     return Ok(());
                 }
                 // The key was switched. A connection proven with a key this
@@ -211,6 +213,7 @@ pub async fn serve_connection_offering(
         let agent = agent.clone();
         let negotiated_features = negotiated_features.clone();
         let session = session.clone();
+        let request_boot = connection_boot.clone();
         tokio::spawn(async move {
             let uses_workflow_artifacts = matches!(
                 &request,
@@ -344,7 +347,10 @@ pub async fn serve_connection_offering(
                     r.preparation_observations = None;
                 }
             }
-            let done = tokio::task::spawn_blocking(move || agent.handle(session, request)).await;
+            let done = tokio::task::spawn_blocking(move || {
+                agent.handle_identity(session, request, Some(&request_boot))
+            })
+            .await;
             let _ = match done {
                 Ok(Ok(mut response)) => {
                     if let crate::wire::Response::Inspect(r) = &mut response {

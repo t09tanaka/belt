@@ -481,6 +481,14 @@ impl WorkerStore {
         })
     }
 
+    /// send-key discards a pending generation even when current is unchanged.
+    pub(crate) fn drop_next_group_key(&self) -> Result<()> {
+        self.db.write(|tx| {
+            tx.execute("DELETE FROM group_key WHERE slot = 'next'", [])?;
+            Ok(())
+        })
+    }
+
     /// Record the key this worker holds as its current one. With nothing
     /// recorded it becomes generation 1 (the single key of before the
     /// group); the recorded current generation with the same fingerprint is

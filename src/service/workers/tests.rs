@@ -700,6 +700,22 @@ fn an_ephemeral_worker_is_registered_and_never_installed_or_controlled() {
 }
 
 #[test]
+fn forget_preserves_the_members_remaining_wait() {
+    let message =
+        crate::coordinator::identity::ForgetRefusal::Waiting { remaining_ms: 1201 }.message();
+    let error = forget("mini-a", |_| {
+        Ok(crate::service::resident::Reply::ControlError {
+            error: ApiError::new(ErrorCode::Conflict, message.clone()),
+        })
+    })
+    .unwrap_err();
+    assert_eq!(error.code, ErrorCode::Conflict);
+    assert_eq!(error.message, message);
+    assert!(error.message.contains("2 seconds remaining"));
+    assert!(error.message.contains("group key changed"));
+}
+
+#[test]
 fn forget_reports_only_what_the_resident_confirmed() {
     use crate::service::resident::Reply;
     let attempt = crate::ids::AttemptId::generate();
