@@ -342,6 +342,30 @@ async fn a57_the_guard_rolls_back_files_a_newer_version_wrote_with_fields_it_doe
 }
 
 #[tokio::test]
+async fn a57_a_database_the_new_version_left_unreadable_is_still_rolled_back() {
+    let h = Host::new().await;
+    let mut fake = h.fake.clone();
+    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, 0).unwrap();
+    for database in [
+        h.paths.state.join("coordinator.db"),
+        h.paths.worker.join("worker.db"),
+    ] {
+        fs::write(&database, b"not a database at all").unwrap();
+        let mut wal = database.clone().into_os_string();
+        wal.push("-wal");
+        fs::write(&wal, b"not a log either").unwrap();
+    }
+    let deadline = COMMIT_DEADLINE.as_millis() as u64;
+    assert!(guard_tick(&h.paths.config, &mut fake, deadline).unwrap());
+    // The log of the broken database is gone before anything reads again.
+    for directory in [&h.paths.state, &h.paths.worker] {
+        assert!(!directory.join("coordinator.db-wal").exists());
+        assert!(!directory.join("worker.db-wal").exists());
+    }
+    h.assert_old_version_back();
+}
+
+#[tokio::test]
 async fn a57_rollback_never_restores_under_a_version_that_does_not_stop() {
     let h = Host::new().await;
     let mut fake = h.fake.clone();

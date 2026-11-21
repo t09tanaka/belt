@@ -295,11 +295,11 @@ fn keep_database(live: &Path, copy: &Path) -> anyhow::Result<bool> {
 }
 
 /// Put back the database kept before the switch; a database that did not
-/// exist then does not exist after.
+/// exist then does not exist after. The database it replaces is never
+/// opened: the new version may have left it in a form this version cannot
+/// read, or broken. Its log goes first, then the kept copy takes its name in
+/// one rename, so running this again after a crash ends the same way.
 fn restore_database(live: &Path, copy: &Path) -> anyhow::Result<()> {
-    if live.try_exists()? {
-        wsu::checkpoint(live)?;
-    }
     // A log of the replaced database must never be replayed into this one.
     let name = live.file_name().context("database name")?.to_owned();
     let mut wal = name.clone();
