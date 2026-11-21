@@ -369,14 +369,8 @@ pub(crate) fn rotate(
             return Err(conflict(format!("unknown member {name}")));
         }
     }
-    let peers: Vec<_> = entries
-        .iter()
-        .filter(|w| {
-            w.id != spec.worker_id.as_str() && !remove.contains(&w.id) && !skip.contains(&w.id)
-        })
-        .collect();
     let record = spec.worker_state_dir.join("group-rotation.json");
-    let (generation, next) = {
+    let (generation, next, removed) = {
         let _key_lock = ProcessLock::acquire(&spec.worker_state_dir, "group-rotation-key.lock")
             .map_err(internal)?;
         let keys = group::load_keys(&spec.cluster_key_path).map_err(internal)?;
@@ -393,6 +387,15 @@ pub(crate) fn rotate(
         {
             return Err(conflict("finish the earlier rotation first with `belt group rotate-key` without `--remove`, then run `--remove` again"));
         }
+        let removed: Vec<String> = existing
+            .as_ref()
+            .map_or_else(|| remove.to_vec(), |r| r.removed.iter().cloned().collect());
+        let peers: Vec<_> = entries
+            .iter()
+            .filter(|w| {
+                w.id != spec.worker_id.as_str() && !removed.contains(&w.id) && !skip.contains(&w.id)
+            })
+            .collect();
         for peer in &peers {
             let reply = call(remote, peer, cluster, Action::Collect)?;
             let names: Vec<String> =
@@ -400,7 +403,7 @@ pub(crate) fn rotate(
             for name in names {
                 if name != spec.worker_id.as_str()
                     && !entries.iter().any(|w| w.id == name)
-                    && !remove.contains(&name)
+                    && !removed.contains(&name)
                 {
                     return Err(conflict(format!(
                         "unknown member {name} in {}'s workers list; nothing distributed",
@@ -443,8 +446,15 @@ pub(crate) fn rotate(
             .ok_or_else(|| conflict("rotation key missing; restore it before resuming"))?
             .clone();
         stage(spec, &generation, &next)?;
-        (generation, next)
+        (generation, next, removed)
     };
+    let remove = removed.as_slice();
+    let peers: Vec<_> = entries
+        .iter()
+        .filter(|w| {
+            w.id != spec.worker_id.as_str() && !remove.contains(&w.id) && !skip.contains(&w.id)
+        })
+        .collect();
     let guidance = guidance(spec, &entries, remove);
     if !remove.is_empty() {
         record_removals(spec, remove, &entries)?;

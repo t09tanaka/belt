@@ -430,3 +430,30 @@ fn legacy_rotation_record_resumes_without_remove() {
     run(&w, &mut n, &[], &[]).unwrap();
     assert_eq!(keys(&w).current, next);
 }
+
+#[test]
+fn resume_finishes_recorded_removals_before_distributing() {
+    for requested in [vec![], vec!["b"], vec!["b", "removed"]] {
+        let (w, mut n) = fixture();
+        let db = rusqlite::Connection::open(w.spec.state_dir.join("coordinator.db")).unwrap();
+        // Publication succeeds, then recording removals fails with registrations intact.
+        db.execute_batch("CREATE TRIGGER fail_removal BEFORE INSERT ON removed_member BEGIN SELECT RAISE(FAIL, 'injected removal failure'); END;").unwrap();
+        let old = keys(&n.peers[1]).current;
+        assert!(run(&w, &mut n, &["b", "removed"], &[]).is_err());
+        assert!(w.spec.worker_state_dir.join("group-rotation.json").exists());
+        assert!(registrations(&w.env).unwrap().iter().any(|w| w.id == "b"));
+        db.execute_batch("DROP TRIGGER fail_removal").unwrap();
+        n.events.clear();
+        run(&w, &mut n, &requested, &[]).unwrap();
+        assert!(n.events.iter().all(|(name, _)| name != "b"));
+        assert_eq!(keys(&n.peers[1]).current, old);
+        assert!(keys(&n.peers[1]).next.is_none());
+        assert!(!registrations(&w.env).unwrap().iter().any(|w| w.id == "b"));
+        let removed = CoordinatorStore::open_read_only(&w.spec.state_dir)
+            .unwrap()
+            .removed_members()
+            .unwrap();
+        assert!(removed.iter().any(|r| r.0 == "b"));
+        assert!(removed.iter().any(|r| r.0 == "removed"));
+    }
+}

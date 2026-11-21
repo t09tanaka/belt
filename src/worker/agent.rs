@@ -2000,11 +2000,12 @@ impl Agent {
             return;
         }
         let _pass = Ticking(&self.ticking);
-        // No refresh_group_key here: the init resident supervises its own
-        // agent through this pass, and a key switch seen here would close the
-        // resident's local link, which it treats as fatal. `tick` (the worker
-        // service) and `apply_rekey` refresh the key themselves.
+        // The init resident supervises its agent only through this pass, so
+        // the key is refreshed here too: links proven with a discarded key
+        // must close on an init host as well. Its own in-process link is
+        // served by `serve_local_connection` and stays open.
         self.apply_rekey();
+        self.refresh_group_key();
         self.supervise_attempts();
         self.cleanup_terminal(32);
     }

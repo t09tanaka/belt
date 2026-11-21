@@ -128,6 +128,30 @@ pub async fn serve_connection_offering(
     permits: Arc<Semaphore>,
     more_features: &[&str],
 ) -> Result<(), ServeError> {
+    serve_proven(agent, io, cluster_id, permits, more_features, false).await
+}
+
+/// The init resident's in-process link to its own worker (a socketpair that
+/// never leaves the process). A group key switch does not close it: the
+/// proof guards links between machines, and the resident treats the end of
+/// this link as fatal. A new worker identity (send-key) still closes it.
+pub async fn serve_local_connection(
+    agent: Arc<Agent>,
+    io: Io,
+    cluster_id: ClusterId,
+    permits: Arc<Semaphore>,
+) -> Result<(), ServeError> {
+    serve_proven(agent, io, cluster_id, permits, &[], true).await
+}
+
+async fn serve_proven(
+    agent: Arc<Agent>,
+    io: Io,
+    cluster_id: ClusterId,
+    permits: Arc<Semaphore>,
+    more_features: &[&str],
+    in_process: bool,
+) -> Result<(), ServeError> {
     // The keys are read for each connection: after a switch the new key is
     // the one a peer must prove with. Without a readable key nothing is
     // answered, not even `hello`.
@@ -181,6 +205,9 @@ pub async fn serve_connection_offering(
             changed = key_changes.changed() => {
                 if changed.is_err() || connection_boot != agent.advertised_boot() {
                     return Ok(());
+                }
+                if in_process {
+                    continue;
                 }
                 // The key was switched. A connection proven with a key this
                 // worker still accepts (the one that is current now) stays;

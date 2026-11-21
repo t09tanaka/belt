@@ -8,6 +8,8 @@ struct Undo {
     key: Vec<u8>,
     input: Vec<u8>,
     control: control::Control,
+    membership: crate::storage::MembershipImage,
+    restart: bool,
 }
 fn path(paths: &Paths) -> PathBuf {
     paths.config.join("membership-undo.json")
@@ -20,12 +22,19 @@ fn replace(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     File::open(path.parent().context("file parent")?)?.sync_all()?;
     Ok(())
 }
-pub(super) fn prepare(paths: &Paths, previous: control::Control) -> anyhow::Result<()> {
+pub(super) fn prepare(
+    paths: &Paths,
+    previous: control::Control,
+    restart: bool,
+) -> anyhow::Result<()> {
     let undo = Undo {
         journal: read_journal(&paths.journal)?,
         key: fs::read(&paths.key)?,
         input: fs::read(&paths.input)?,
         control: previous,
+        membership: crate::storage::WorkerStore::open_read_only(&paths.worker)?
+            .membership_image()?,
+        restart,
     };
     replace(&path(paths), &serde_json::to_vec(&undo)?)
 }
@@ -104,6 +113,8 @@ pub(super) fn recover<L: Launcher>(paths: &Paths, launcher: &mut L) -> anyhow::R
             &paths.state,
             undo.journal.cluster.as_ref().context("group missing")?,
         )?;
+        crate::storage::WorkerStore::open(&paths.worker, &undo.journal.spec.worker_id)?
+            .restore_membership(&undo.membership)?;
         for (path, bytes) in [(&paths.key, &undo.key), (&paths.input, &undo.input)] {
             replace(path, bytes)?;
             *undo
@@ -123,11 +134,15 @@ pub(super) fn recover<L: Launcher>(paths: &Paths, launcher: &mut L) -> anyhow::R
     } else {
         Ok(())
     };
-    let start = launcher.launchctl(
-        &plan
-            .start_arguments(receipt.path())
-            .map_err(anyhow::Error::msg)?,
-    );
+    let start = if undo.restart {
+        launcher.launchctl(
+            &plan
+                .start_arguments(receipt.path())
+                .map_err(anyhow::Error::msg)?,
+        )
+    } else {
+        Ok(())
+    };
     result
         .and(control.map_err(Into::into))
         .and(finish)

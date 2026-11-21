@@ -1183,6 +1183,7 @@ pub fn stop_for<L: Launcher>(
                 worker: marker(&paths, wait),
             };
             manager.stop(&plan, &receipt, cancel_running)?;
+            membership::remove_marker(&paths.state.join("membership-restart"))?;
             // A stop ends its own drain. While a switch awaits its commit,
             // or the upgrade owns the drain, the drain is not this stop's to
             // end: the next start must not take work that a rollback to the
@@ -1200,6 +1201,7 @@ pub fn stop_for<L: Launcher>(
             return status_with(&paths, &journal, &plan, &receipt, &mut launcher, false);
         }
     }
+    membership::remove_marker(&paths.state.join("membership-restart"))?;
     status_with(&paths, &journal, &plan, &receipt, &mut launcher, false)
 }
 

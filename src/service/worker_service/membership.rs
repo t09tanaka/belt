@@ -166,6 +166,7 @@ pub(super) fn existing<L: Launcher>(
         let restore = control::write(&paths.state, previous_control);
         let restart = if stopped_here || resuming {
             ensure_started(&mut manager.files, &mut manager.launcher, &plan, receipt)
+                .and_then(|()| remove_marker(&restart_marker))
         } else {
             Ok(())
         };
@@ -196,7 +197,7 @@ pub(crate) fn check_same_group_key(
     Ok(())
 }
 
-fn remove_marker(path: &Path) -> anyhow::Result<()> {
+pub(super) fn remove_marker(path: &Path) -> anyhow::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

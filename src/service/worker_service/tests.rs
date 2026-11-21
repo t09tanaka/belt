@@ -1122,8 +1122,12 @@ fn membership_moves_an_initialized_idle_member_without_adding_a_worker() {
     let status = install(&h.env, &request, &h.exe, h.fake.clone(), Duration::ZERO).unwrap();
     assert_eq!(status.coordinator_id, Some(original_id.clone()));
     assert_eq!(status.cluster, request.cluster);
-    assert!(status.ready && status.loaded == Some(true));
-    assert_eq!(h.fake.0.borrow().calls.len(), 1);
+    assert!(!status.ready && status.loaded == Some(false));
+    assert_eq!(h.fake.0.borrow().calls.len(), 0);
+    let again = install(&h.env, &request, &h.exe, h.fake.clone(), Duration::ZERO).unwrap();
+    assert_eq!(again.loaded, Some(false));
+    assert!(!again.ready);
+    assert!(h.fake.0.borrow().calls.is_empty());
     assert!(!journal_path.exists());
     let changed = super::super::bootstrap::read_input(&input).unwrap();
     assert_eq!(changed.expected_cluster, Some(request.cluster.clone()));
@@ -1560,14 +1564,14 @@ fn membership_rerun_requires_a_loaded_ready_service() {
     }
     let error = h.install().unwrap_err();
     assert!(error.to_string().contains("readiness"), "{error:#}");
-    {
-        let mut w = h.fake.0.borrow_mut();
-        w.loaded = false;
-        w.omit_socket = false;
-    }
+    assert!(!h.paths().state.join("membership-restart").exists());
+    // Even a stale marker from an interrupted restart cannot override user stop.
+    fs::write(h.paths().state.join("membership-restart"), b"1").unwrap();
+    stop(&h.env, h.fake.clone(), false, Duration::ZERO).unwrap();
+    assert!(!h.paths().state.join("membership-restart").exists());
     let status = h.install().unwrap();
-    assert_eq!(status.loaded, Some(true));
-    assert!(status.ready && status.membership_only);
+    assert_eq!(status.loaded, Some(false));
+    assert!(!status.ready && status.membership_only);
 }
 
 #[test]
@@ -1596,4 +1600,23 @@ fn stop_checks_live_work_after_drain_and_restores_control_on_refusal() {
         .contains("live attempt(s) of other members"));
     assert_eq!(control::read(&state).unwrap(), previous);
     assert!(h.launchctl_calls().is_empty());
+}
+
+#[test]
+fn membership_resume_starts_service_stopped_by_handover() {
+    let mut h = Host::new();
+    h.install().unwrap();
+    h.bind();
+    h.request.membership = Some(Membership {
+        caller_name: WorkerId::parse("peer").unwrap(),
+        caller_id: CoordinatorId::generate(),
+        move_group: true,
+        join_singleton: false,
+        install: false,
+    });
+    stop(&h.env, h.fake.clone(), false, Duration::ZERO).unwrap();
+    fs::write(h.paths().state.join("membership-restart"), b"1").unwrap();
+    let status = h.install().unwrap();
+    assert!(status.ready && status.loaded == Some(true));
+    assert!(!h.paths().state.join("membership-restart").exists());
 }

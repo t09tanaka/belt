@@ -1074,7 +1074,7 @@ pub(crate) fn handover<L: Launcher>(
     );
     let previous = control::read(&paths.worker)?;
     if moving {
-        membership_undo::prepare(&paths, previous)?;
+        membership_undo::prepare(&paths, previous, loaded == LoadedState::Match)?;
     }
     let result = (|| -> anyhow::Result<_> {
         if moving && loaded == LoadedState::Match {
@@ -1131,6 +1131,8 @@ pub(crate) fn handover<L: Launcher>(
         }
         let worker = WorkerStore::open(&paths.worker, &spec.worker_id)?;
         if moving {
+            // Refresh after both owners stopped so the image includes their final pins.
+            membership_undo::prepare(&paths, previous, loaded == LoadedState::Match)?;
             worker.clear_group_membership()?;
             CoordinatorStore::move_group(&paths.state, &request.cluster)?;
             match fs::remove_file(crate::group::next_key_path(&paths.key)) {
@@ -1175,14 +1177,20 @@ pub(crate) fn handover<L: Launcher>(
         }
         drop(_agent);
         drop(_owner);
-        if launcher.loaded_state(&plan, &receipt) == LoadedState::Absent {
+        if moving
+            && loaded == LoadedState::Match
+            && launcher.loaded_state(&plan, &receipt) == LoadedState::Absent
+        {
             launcher.launchctl(
                 &plan
                     .start_arguments(receipt.path())
                     .map_err(anyhow::Error::msg)?,
             )?;
         }
-        launcher.verify_loaded(&plan, &receipt)?;
+        let running = launcher.loaded_state(&plan, &receipt) == LoadedState::Match;
+        if running {
+            launcher.verify_loaded(&plan, &receipt)?;
+        }
         Ok(super::worker_service::Status {
             membership_only: true,
             coordinator_id: journal.coordinator,
@@ -1190,8 +1198,8 @@ pub(crate) fn handover<L: Launcher>(
             worker_id: spec.worker_id.clone(),
             cluster: request.cluster.clone(),
             binary_sha256: journal.binary_hash,
-            loaded: Some(true),
-            ready: true,
+            loaded: Some(running),
+            ready: running,
             draining: previous.drain,
             cancel_running: previous.cancel_running,
             live_attempts: Some(u32::try_from(worker.count_nonterminal()?).unwrap_or(u32::MAX)),
@@ -1213,6 +1221,9 @@ pub(crate) fn handover<L: Launcher>(
             let rollback = membership_undo::recover(&paths, &mut launcher);
             let restore = control::write(&paths.worker, previous);
             let restart = (|| -> anyhow::Result<()> {
+                if !moving || loaded != LoadedState::Match {
+                    return Ok(());
+                }
                 files.verify(&receipt)?;
                 match launcher.loaded_state(&plan, &receipt) {
                     LoadedState::Absent => launcher.launchctl(

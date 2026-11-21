@@ -104,11 +104,19 @@ impl Undo {
             fs::remove_file(stage)?;
         }
         let bin = paths.config.join("bin");
-        let temporary = bin.join(format!(".resident.{}", std::process::id()));
-        match fs::remove_file(temporary) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        if bin.try_exists()? {
+            for entry in fs::read_dir(&bin)? {
+                let entry = entry?;
+                if entry.file_type()?.is_symlink()
+                    && entry.file_name().to_str().is_some_and(|name| {
+                        name.strip_prefix(".resident.").is_some_and(|pid| {
+                            !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+                        })
+                    })
+                {
+                    fs::remove_file(entry.path())?;
+                }
+            }
         }
         let link = paths.config.join("bin/resident");
         if fs::read_link(&link).ok() != self.resident_target {
@@ -151,9 +159,11 @@ fn stages(dirs: &[PathBuf]) -> anyhow::Result<BTreeSet<PathBuf>> {
         if dir.try_exists()? {
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;
-                if entry.file_name().to_str().is_some_and(|s| {
-                    s.starts_with(".init-") || s == format!(".resident.{}", std::process::id())
-                }) {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|s| s.starts_with(".init-"))
+                {
                     paths.insert(entry.path());
                 }
             }
@@ -349,7 +359,16 @@ mod tests {
             std::os::unix::fs::symlink("new-digest", &link).unwrap();
             let stage = bin.join(format!(".resident.{}", std::process::id()));
             std::os::unix::fs::symlink("new-digest", &stage).unwrap();
+            let stale = bin.join(".resident.987654");
+            std::os::unix::fs::symlink("missing-target", &stale).unwrap();
+            let regular = bin.join(".resident.123456");
+            fs::write(&regular, "keep").unwrap();
+            let unrelated = bin.join(".resident.123.extra");
+            std::os::unix::fs::symlink("missing-target", &unrelated).unwrap();
             undo.restore(&paths).unwrap();
+            assert!(fs::symlink_metadata(stale).is_err());
+            assert!(regular.is_file());
+            assert!(fs::symlink_metadata(unrelated).unwrap().is_symlink());
             assert_eq!(fs::read_link(&link).ok(), old.map(PathBuf::from));
             assert!(fs::symlink_metadata(stage).is_err());
         }

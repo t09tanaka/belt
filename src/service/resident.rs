@@ -9,7 +9,7 @@ use crate::results::{CollectConfig, ResultStore};
 use crate::scheduler::measured::MeasuredCosts;
 use crate::state::{AttemptState, Observation, Receipts, Termination};
 use crate::storage::CoordinatorStore;
-use crate::worker::{agent::Agent, serve::serve_connection};
+use crate::worker::{agent::Agent, serve::serve_local_connection};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
@@ -677,7 +677,7 @@ async fn connect_local(
     let cluster = parts.cluster.clone();
     let server_cluster = cluster.clone();
     let worker_connection = tokio::spawn(async move {
-        let _ = serve_connection(
+        let _ = serve_local_connection(
             worker_agent,
             Io::from_stream(worker),
             server_cluster,
