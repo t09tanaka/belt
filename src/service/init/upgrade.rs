@@ -55,9 +55,10 @@ enum Phase {
     Restored,
 }
 
-/// The one record commit and rollback decide on.
+/// The one record commit and rollback decide on. The guard of an older
+/// version reads what a newer one wrote, so fields it does not know are
+/// left alone rather than refused.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct Record {
     schema: u32,
     from: String,
@@ -325,12 +326,19 @@ fn finish(paths: &Paths) -> anyhow::Result<()> {
     if upgrade_dir(paths).try_exists()? {
         File::open(upgrade_dir(paths))?.sync_all()?;
     }
-    for name in [KEPT_JOURNAL, KEPT_INPUT, KEPT_PARENT_DB, KEPT_WORKER_DB] {
+    // The kept journal stays until the guard is gone: it is what the guard
+    // reads, and the live journal may be one the guard's version cannot.
+    for name in [KEPT_INPUT, KEPT_PARENT_DB, KEPT_WORKER_DB] {
         wsu::remove_if_present(&kept(paths, name))?;
     }
     control::end_trial(&paths.worker)?;
     control::lift_hold(&paths.worker)?;
     Ok(())
+}
+
+/// The last kept copy, once the guard is removed.
+fn forget(paths: &Paths) -> anyhow::Result<()> {
+    wsu::remove_if_present(&kept(paths, KEPT_JOURNAL))
 }
 
 /// Back to the version the trial began from, with both databases as they
@@ -407,7 +415,8 @@ fn abandon<L: Launcher>(
             &guard,
             &named.context("service receipt missing")?,
             launcher,
-        )
+        )?;
+        forget(paths)
     });
     match undone {
         Ok(()) => anyhow::anyhow!(
@@ -501,10 +510,6 @@ pub fn begin<L: Launcher>(
         control::lift_hold(&paths.worker)?;
         return Err(error.context("the upgrade hold is lifted"));
     }
-    let lock = upgrade_lock(&paths)?;
-    private_dir_with(&upgrade_dir(&paths), &mut NativeDurability)?;
-    wsu::copy_private(&paths.journal, &kept(&paths, KEPT_JOURNAL))?;
-    wsu::copy_private(&paths.input, &kept(&paths, KEPT_INPUT))?;
     let mut record = Record {
         schema: 1,
         from: from.binary_hash.clone(),
@@ -513,7 +518,23 @@ pub fn begin<L: Launcher>(
         backed_up: false,
         phase: Phase::Trial,
     };
-    write_record(&paths, &record)?;
+    let recorded = (|| -> anyhow::Result<File> {
+        let lock = upgrade_lock(&paths)?;
+        private_dir_with(&upgrade_dir(&paths), &mut NativeDurability)?;
+        wsu::copy_private(&paths.journal, &kept(&paths, KEPT_JOURNAL))?;
+        wsu::copy_private(&paths.input, &kept(&paths, KEPT_INPUT))?;
+        write_record(&paths, &record)?;
+        Ok(lock)
+    })();
+    // Without a record there is no trial and no guard: nothing else would
+    // ever lift the hold.
+    let lock = match recorded {
+        Ok(lock) => lock,
+        Err(error) => {
+            control::lift_hold(&paths.worker)?;
+            return Err(error.context("nothing was switched and the upgrade hold is lifted"));
+        }
+    };
     let switched = (|| -> anyhow::Result<Spec> {
         let named = from.plist.clone().context("service receipt missing")?;
         install_guard(&paths, &from, &named, launcher)?;
@@ -612,6 +633,7 @@ pub fn commit<L: Launcher>(trial: &Trial, launcher: &mut L) -> anyhow::Result<Up
         .clone()
         .context("service receipt missing")?;
     remove_guard(paths, &guard_plan(paths, &trial.from)?, &named, launcher)?;
+    forget(paths)?;
     let (from, to) = trial.versions();
     Ok(Upgraded {
         from: from.to_string(),
@@ -668,18 +690,20 @@ pub fn guard_tick<L: Launcher>(
     launcher: &mut L,
     now_ms: u64,
 ) -> anyhow::Result<bool> {
-    let input = bootstrap::read_input(&config.join("coordinator.json"))?;
-    let journal = read_journal(&config.join(KEPT_JOURNAL))?;
-    let mut paths = Paths::resolve_for(&input.env, journal.backend())?;
+    // The kept journal is what this (the previous) version wrote; the live
+    // files may be the new version's, which this one need not read.
+    let kept_journal = config.join("upgrade").join(KEPT_JOURNAL);
+    let from = if kept_journal.try_exists()? {
+        read_journal(&kept_journal)?
+    } else {
+        read_journal(&config.join("init.json"))?
+    };
+    let mut paths = Paths::resolve_for(&from.spec.env, from.backend())?;
     ensure!(
         paths.config == config,
         "the guard belongs to another member"
     );
-    paths.key = journal.spec.cluster_key_path.clone();
-    let from = match read_journal(&kept(&paths, KEPT_JOURNAL)) {
-        Ok(kept) => kept,
-        Err(_) => journal,
-    };
+    paths.key = from.spec.cluster_key_path.clone();
     let named = from.plist.clone().context("service receipt missing")?;
     let guard = guard_plan(&paths, &from)?;
     let record = {
@@ -691,6 +715,7 @@ pub fn guard_tick<L: Launcher>(
         Some(_) => {
             rollback(&paths, launcher)?;
             remove_guard(&paths, &guard, &named, launcher)?;
+            forget(&paths)?;
             Ok(true)
         }
         None => {
@@ -703,6 +728,7 @@ pub fn guard_tick<L: Launcher>(
                 }
             }
             remove_guard(&paths, &guard, &named, launcher)?;
+            forget(&paths)?;
             Ok(true)
         }
     }

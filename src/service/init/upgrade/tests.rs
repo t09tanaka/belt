@@ -322,6 +322,26 @@ async fn a57_no_commit_by_the_deadline_rolls_back_without_the_new_version_answer
 }
 
 #[tokio::test]
+async fn a57_the_guard_rolls_back_files_a_newer_version_wrote_with_fields_it_does_not_know() {
+    let h = Host::new().await;
+    let mut fake = h.fake.clone();
+    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, 0).unwrap();
+    for file in [&h.paths.journal, &h.paths.input] {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
+        value["field_of_a_newer_version"] = serde_json::json!(1);
+        fs::write(file, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&fs::read(record_path(&h.paths)).unwrap()).unwrap();
+    record["field_of_a_newer_version"] = serde_json::json!(1);
+    fs::write(record_path(&h.paths), serde_json::to_vec(&record).unwrap()).unwrap();
+    let deadline = COMMIT_DEADLINE.as_millis() as u64;
+    assert!(guard_tick(&h.paths.config, &mut fake, deadline).unwrap());
+    h.assert_old_version_back();
+}
+
+#[tokio::test]
 async fn a57_rollback_never_restores_under_a_version_that_does_not_stop() {
     let h = Host::new().await;
     let mut fake = h.fake.clone();

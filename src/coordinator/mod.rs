@@ -845,11 +845,6 @@ impl Coordinator {
         source_id: SourceId,
         tasks: Vec<(TaskId, TaskSpec)>,
     ) -> Result<()> {
-        if self.in_trial() {
-            return Err(CoordinatorError::Storage(StorageError::Overloaded(
-                "this member is trying a new version; submit again after the upgrade".into(),
-            )));
-        }
         let owner = self.store.clone();
         let source = tokio::task::spawn_blocking(move || owner.source_mutation_guard_foreground())
             .await
@@ -864,6 +859,12 @@ impl Coordinator {
         source: crate::source::retention::Guard,
     ) -> Result<()> {
         self.check_fenced()?;
+        // Every submission path comes through here, the resident's included.
+        if self.in_trial() {
+            return Err(CoordinatorError::Storage(StorageError::Overloaded(
+                "this member is trying a new version; submit again after the upgrade".into(),
+            )));
+        }
         let mut specs = Vec::with_capacity(tasks.len());
         for (task, spec) in tasks {
             if let Some(bundle) = &spec.toolchains {
