@@ -2188,6 +2188,14 @@ async fn a57_a_resident_on_trial_saves_no_cancel_retry_or_status_and_says_send_a
         serde_json::to_value(&before).unwrap()
     );
     assert_eq!(coordinator.store().github_status_of(&run).unwrap(), None);
+    // A reload would dial and record workers; it is asked again later.
+    match client.request(Operation::ReloadWorkers).await.unwrap() {
+        Reply::ControlError { error } => {
+            assert_eq!(error.code, crate::error::ErrorCode::Overloaded, "{error:?}");
+            assert!(error.message.contains("send again"), "{}", error.message);
+        }
+        other => panic!("{other:?}"),
+    }
     assert!(matches!(
         client.request(Operation::Shutdown).await.unwrap(),
         Reply::Stopping

@@ -32,11 +32,16 @@ pub(super) async fn run(
         if *stop.borrow() || coordinator.is_fenced() {
             return Ok(());
         }
+        // Paused while a new version is on trial (§24.8): what it would
+        // delete stays deleted after a rollback, while its record comes back.
+        if coordinator.in_trial() {
+            continue;
+        }
         let files = files.clone();
         // Keep owner + exclusive pin alive inside the blocking job and
         // await its drain before token/process-owner cleanup on shutdown.
         let (next, result) = owned_blocking(coordinator.clone(), move |owner| {
-            if owner.is_fenced() {
+            if owner.is_fenced() || owner.in_trial() {
                 return (cursor, Ok(PageReport::default()));
             }
             let result = page(owner.store(), &files, &mut cursor, retention_days);
@@ -418,6 +423,42 @@ pub(super) mod tests {
         task.await.unwrap().unwrap();
         assert_eq!(f.pending(&stuck_run), 0);
         assert_eq!(std::fs::read(outside.join("kept")).unwrap(), b"outside");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a57_on_trial_retention_deletes_nothing_and_resumes_after_the_commit() {
+        let f = Fixture::new();
+        let state = f.root.path().join("worker");
+        std::fs::create_dir(&state).unwrap();
+        f.owner
+            .set_trial_marker(crate::worker::control::trial_path(&state));
+        crate::worker::control::begin_trial(&state).unwrap();
+        // A durable claim: any page at all would finish it and delete this.
+        let (run_id, attempt) = claimed(f.owner.store(), &f.files);
+        let (_, expired) = f.expired();
+        let (stop, rx) = watch::channel(false);
+        let task = tokio::spawn(run(
+            f.owner.clone(),
+            f.files.clone(),
+            RETENTION_DAYS,
+            Duration::from_millis(10),
+            rx,
+        ));
+        // Many cadences pass while the trial lasts.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(!task.is_finished(), "the trial stopped the loop");
+        assert!(f.directory(&attempt).exists());
+        assert!(f.directory(&expired).exists());
+        assert_eq!(f.pending(&run_id), 1);
+        // The commit ends the trial, and the loop goes on where it was.
+        crate::worker::control::end_trial(&state).unwrap();
+        until("the claim is finished after the commit", || {
+            !f.directory(&attempt).exists() && !f.directory(&expired).exists()
+        })
+        .await;
+        stop.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        assert_eq!(f.pending(&run_id), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

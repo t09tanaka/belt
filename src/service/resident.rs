@@ -1384,6 +1384,17 @@ async fn handle(
             .await
             .map_err(Into::into);
     }
+    if matches!(request.operation, Operation::ReloadWorkers) && coordinator.in_trial() {
+        // A worker dialed now would be recorded in the parent database, and a
+        // rollback would lose the record (§24.8). Nothing is dialed.
+        let reply = Reply::ControlError {
+            error: crate::error::ApiError::new(
+                crate::error::ErrorCode::Overloaded,
+                "this member is trying a new version; send again after the upgrade",
+            ),
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     let control = match &request.operation {
         Operation::ReloadWorkers => Some((None, "the resident did not finish the reload in time")),
         Operation::ForgetWorker { worker } => Some((
