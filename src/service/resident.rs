@@ -389,13 +389,18 @@ struct CapturedInputs {
     transfer: Arc<Mutex<()>>,
     sources: crate::source::SourceStore,
     vault: crate::secrets::vault::Vault,
-    key: crate::secrets::key::ClusterKey,
+    key_path: std::path::PathBuf,
     env: std::collections::BTreeMap<String, String>,
     parent_state: std::path::PathBuf,
     local_worker: WorkerId,
 }
 
 impl CapturedInputs {
+    // Keep only the path: a switch discards the previous group key.
+    fn current_key(&self) -> crate::secrets::Result<crate::secrets::key::ClusterKey> {
+        crate::secrets::key::load(&self.key_path)
+    }
+
     /// Validate the original run binding and retained bundle without capture.
     fn validate_retry(
         &self,
@@ -456,7 +461,13 @@ impl CapturedInputs {
             return Ok(false);
         }
         self.vault
-            .load(run, &manifest.secret_files, &self.key)
+            .load(
+                run,
+                &manifest.secret_files,
+                &self
+                    .current_key()
+                    .map_err(|_| StorageError::SecretUnavailable)?,
+            )
             .map_err(|_| StorageError::SecretUnavailable)?;
         Ok(!manifest.secret_files.is_empty())
     }
@@ -595,7 +606,7 @@ impl StartupParts {
             transfer: Arc::new(Mutex::new(())),
             sources: crate::source::SourceStore::open(&inputs.state_dir)?,
             vault: crate::secrets::vault::Vault::open(&inputs.state_dir)?,
-            key: crate::secrets::key::load(&inputs.worker.cluster_key_path)?,
+            key_path: inputs.worker.cluster_key_path.clone(),
             env: inputs.worker.env.clone(),
             parent_state: inputs.state_dir.clone(),
             local_worker: worker_id.clone(),
@@ -1584,9 +1595,11 @@ async fn handle(
                             .manifest(&id)?
                             .ok_or_else(|| anyhow::anyhow!("source unavailable"))?;
                         crate::source::store::verify_manifest(&manifest)?;
-                        capture
-                            .vault
-                            .load(&run, &manifest.secret_files, &capture.key)?;
+                        capture.vault.load(
+                            &run,
+                            &manifest.secret_files,
+                            &capture.current_key()?,
+                        )?;
                         Ok((
                             Digest::parse(&manifest.manifest_digest).or_else(|_| {
                                 Digest::parse(&format!("sha256:{}", manifest.manifest_digest))

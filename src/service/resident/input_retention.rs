@@ -119,7 +119,7 @@ impl Driver {
                 let page = captured.sources.vault_retention_page(
                     owner,
                     &captured.vault,
-                    &captured.key,
+                    &captured.current_key()?,
                     &mut self.vault,
                     sample.wall,
                     sample.mono,
@@ -270,7 +270,11 @@ mod tests {
                 transfer: Arc::new(Mutex::new(())),
                 sources: crate::source::SourceStore::open(&state).unwrap(),
                 vault: crate::secrets::vault::Vault::open(&state).unwrap(),
-                key: crate::secrets::key::ClusterKey::from_bytes(vec![7; 32]).unwrap(),
+                key_path: {
+                    let path = root.path().join("key");
+                    crate::secrets::key::init(&path).unwrap();
+                    path
+                },
                 env: BTreeMap::new(),
                 parent_state: state,
                 local_worker: WorkerId::parse("test").unwrap(),
@@ -297,7 +301,7 @@ mod tests {
                 &self.captured.sources,
                 &self.captured.vault,
                 &crate::secrets::capture::SecretInputs {
-                    key: &self.captured.key,
+                    key: &self.captured.current_key().unwrap(),
                     declared: &declared,
                 },
                 &run,
@@ -555,7 +559,7 @@ mod tests {
         let held = f
             .captured
             .vault
-            .load(&eligible, &entries, &f.captured.key)
+            .load(&eligible, &entries, &f.captured.current_key().unwrap())
             .unwrap();
         f.captured.retention_test.fast();
         let (stop, rx) = watch::channel(false);

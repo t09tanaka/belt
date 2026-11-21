@@ -926,6 +926,14 @@ async fn init_key_switch_closes_peer_link_but_keeps_local_worker_and_resident_al
         .cluster_id()
         .clone();
     let (mut owner, client, spec) = start_parent(root, &state, &key, &cluster).await;
+    let before = submit(&client, &state, &spec.env, &key, root, "before-switch", 0).await;
+    wait_for("secret task before switch", || {
+        attempt(&state, &before).is_some_and(|a| {
+            a.termination
+                .is_some_and(|t| t.outcome() == Outcome::Succeeded)
+        })
+    })
+    .await;
     let peer_id = CoordinatorId::generate();
     let cfg = belt::protocol::ClientConfig::new(
         cluster.clone(),
@@ -957,6 +965,18 @@ async fn init_key_switch_closes_peer_link_but_keeps_local_worker_and_resident_al
     wait_for("old-key peer link to close", || peer.client.is_closed()).await;
     assert!(owner.child.as_mut().unwrap().try_wait().unwrap().is_none());
     assert!(matches!(report().await.unwrap(), Reply::EnvReport { .. }));
+    let after = submit(&client, &state, &spec.env, &key, root, "after-switch", 0).await;
+    wait_for("secret task after switch", || {
+        attempt(&state, &after).is_some_and(|a| {
+            a.termination
+                .is_some_and(|t| t.outcome() == Outcome::Succeeded)
+        })
+    })
+    .await;
+    assert_eq!(
+        std::fs::read_to_string(root.join("count-after-switch")).unwrap(),
+        "once\n"
+    );
     assert_eq!(
         super::common::identity_of(owner.pid).as_deref(),
         Some(owner.start.as_str())

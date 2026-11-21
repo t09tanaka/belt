@@ -996,7 +996,7 @@ async fn per_worker_secret_jobs_route_exact_attempts_and_resend_after_session_re
             &capture.sources,
             &capture.vault,
             &crate::secrets::capture::SecretInputs {
-                key: &capture.key,
+                key: &capture.current_key().unwrap(),
                 declared: &[local_ci::source::SecretSpec {
                     glob: ".env".into(),
                     required: true,

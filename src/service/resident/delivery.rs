@@ -139,14 +139,14 @@ pub(super) async fn sources(
                     })?;
                     anyhow::ensure!(
                         digest == expected.manifest_digest
-                            && (spec.in_place || secrets == !manifest.secret_files.is_empty()),
+                            && (spec.in_place || secrets != manifest.secret_files.is_empty()),
                         "source digest mismatch"
                     );
                     if !spec.in_place {
                         captured.vault.load(
                             &expected.run_id,
                             &manifest.secret_files,
-                            &captured.key,
+                            &captured.current_key()?,
                         )?;
                     }
                     Ok(())
@@ -350,7 +350,7 @@ pub(super) async fn secrets(
                 Ok((
                     capture
                         .vault
-                        .load(&run, &manifest.secret_files, &capture.key)?,
+                        .load(&run, &manifest.secret_files, &capture.current_key()?)?,
                     mutation,
                 ))
             });
