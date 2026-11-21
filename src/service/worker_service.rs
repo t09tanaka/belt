@@ -496,7 +496,18 @@ pub fn sha256_file(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn place_binary(paths: &Paths, digest: &str, current: &Path) -> anyhow::Result<PathBuf> {
+pub(crate) fn place_binary(paths: &Paths, digest: &str, current: &Path) -> anyhow::Result<PathBuf> {
+    place_binary_with(paths, digest, current, 0o755)
+}
+
+/// [`place_binary`] with the mode of a new file: the combined resident keeps
+/// its binaries private to the user (0o700), as `init` places them.
+pub(crate) fn place_binary_with(
+    paths: &Paths,
+    digest: &str,
+    current: &Path,
+    mode: u32,
+) -> anyhow::Result<PathBuf> {
     ensure!(
         digest.len() == 64
             && digest
@@ -525,7 +536,7 @@ fn place_binary(paths: &Paths, digest: &str, current: &Path) -> anyhow::Result<P
     std::io::copy(&mut File::open(current)?, &mut temporary.as_file())?;
     temporary
         .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o755))?;
+        .set_permissions(fs::Permissions::from_mode(mode))?;
     temporary.as_file().sync_all()?;
     ensure!(
         sha256_file(temporary.path())? == digest,

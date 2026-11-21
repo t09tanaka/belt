@@ -105,6 +105,28 @@ pub trait Launcher {
     /// receipt alone is insufficient. Must reject missing/foreign/unknown jobs.
     fn verify_loaded(&mut self, plan: &Plan, receipt: &Receipt) -> Result<(), LaunchError>;
 }
+/// A borrowed launcher drives the same service manager.
+impl<L: Launcher + ?Sized> Launcher for &mut L {
+    fn backend(&self) -> policy::Backend {
+        (**self).backend()
+    }
+    fn running_identity(
+        &mut self,
+        plan: &Plan,
+        receipt: &Receipt,
+    ) -> Result<RunningIdentity, LaunchError> {
+        (**self).running_identity(plan, receipt)
+    }
+    fn loaded_state(&mut self, plan: &Plan, receipt: &Receipt) -> LoadedState {
+        (**self).loaded_state(plan, receipt)
+    }
+    fn launchctl(&mut self, arguments: &[String]) -> Result<(), LaunchError> {
+        (**self).launchctl(arguments)
+    }
+    fn verify_loaded(&mut self, plan: &Plan, receipt: &Receipt) -> Result<(), LaunchError> {
+        (**self).verify_loaded(plan, receipt)
+    }
+}
 pub(crate) mod native;
 pub mod observe;
 pub use native::{

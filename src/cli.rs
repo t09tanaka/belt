@@ -45,6 +45,18 @@ pub enum Command {
         #[arg(long)]
         name: Option<String>,
     },
+    /// Upgrade this machine's resident (both roles) to this build or another.
+    Upgrade {
+        /// The build to install instead of this one; it runs the upgrade.
+        #[arg(long, value_name = "PATH")]
+        binary: Option<std::path::PathBuf>,
+    },
+    /// Watch an upgrade's commit deadline and roll it back (internal).
+    #[command(hide = true)]
+    UpgradeGuard {
+        #[arg(long)]
+        config: std::path::PathBuf,
+    },
     /// Run CI for the project.
     Ci(CiArgs),
     /// Run one command and wait for its result.
@@ -414,6 +426,37 @@ pub fn run(cli: Cli) -> i32 {
     }
     if let Command::ToolchainInstall { request, binding } = &cli.command {
         return crate::toolchain::preparation::helper_main(request, binding);
+    }
+    if let Command::UpgradeGuard { config } = &cli.command {
+        return crate::service::init::upgrade::guard_main(config);
+    }
+    if let Command::Upgrade { binary } = &cli.command {
+        use crate::service::init::upgrade::Ran;
+        return match crate::service::init::upgrade::command(binary.as_deref(), cli.json) {
+            Ok(Ran::Delegated(code)) => code,
+            Ok(Ran::Here(result)) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":true,"result":result})
+                    );
+                } else {
+                    println!("upgraded {} -> {}", &result.from[..12], &result.to[..12]);
+                }
+                exit::SUCCESS
+            }
+            Err(error) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                    );
+                } else {
+                    eprintln!("error: {}", error.message);
+                }
+                error.code.exit_code()
+            }
+        };
     }
     if let Command::Init { name } = &cli.command {
         return match crate::service::init::command(name.as_deref()) {

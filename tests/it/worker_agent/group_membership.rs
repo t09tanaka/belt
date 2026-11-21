@@ -361,6 +361,45 @@ async fn a_members_name_and_coordinator_id_are_fixed_together() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a57_a_worker_on_trial_pins_no_new_member_and_lets_a_pinned_one_in() {
+    let f = fx();
+    let agent = f.start("boot-1");
+    let main = member("main");
+    dial(&f, &agent, &main).await.unwrap();
+    belt::worker::control::begin_trial(&agent.config().state_dir).unwrap();
+    // A member seen for the first time is told to send again later, and
+    // nothing is recorded that a rollback would lose.
+    match dial(&f, &agent, &member("sub")).await {
+        Err(ConnectError::Refused(e)) => {
+            assert_eq!(e.code, ErrorCode::Overloaded, "{}", e.message);
+            assert!(
+                e.message.contains("send the request again later"),
+                "{}",
+                e.message
+            );
+        }
+        Err(e) => panic!("refused otherwise: {e}"),
+        Ok(_) => panic!("a new member was let in on trial"),
+    }
+    assert_eq!(
+        f.store().members().unwrap(),
+        vec![("main".to_string(), main.coordinator.to_string())]
+    );
+    // A member pinned before is let in as always, and a mismatch is still one.
+    dial(&f, &agent, &main).await.unwrap();
+    let mut rebuilt = member("main");
+    rebuilt.epoch = 4;
+    assert_eq!(
+        refusal(dial(&f, &agent, &rebuilt).await),
+        GroupRefusal::MemberIdentityMismatch
+    );
+    // After the commit a new member is pinned again.
+    belt::worker::control::end_trial(&agent.config().state_dir).unwrap();
+    dial(&f, &agent, &member("sub")).await.unwrap();
+    assert_eq!(f.store().members().unwrap().len(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_member_reaches_its_own_attempts_and_another_members_are_not_found() {
     let f = fx();
     // Two members run a command each at once; the default budget of a small
@@ -1314,4 +1353,62 @@ async fn a56_a_stuck_members_connection_does_not_hold_up_another_members_request
     // And the quiet member is still served when it speaks again.
     window_of(&quiet.client).await;
     drop((after_hello, half));
+}
+
+/// A feature a later version offers that this one does not know.
+const LATER: &str = "later_feature_v1";
+
+/// The features a version before this one offers: all of this build's but
+/// an optional one it did not have yet.
+fn earlier_features() -> Vec<String> {
+    belt::protocol::session::offered_features()
+        .into_iter()
+        .filter(|f| f.as_str() != belt::wire::ENV_SYNC_FEATURE)
+        .collect()
+}
+
+async fn inspected(c: &Client) {
+    match call(c, inspect_req()).await.unwrap() {
+        Response::Inspect(_) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a57_members_of_n_and_n_plus_1_use_each_other_both_ways() {
+    let f = fx();
+    let agent = f.start("boot-1");
+    // A member of version N sends to a worker of version N+1, which offers
+    // a feature N does not know: they agree on what both have.
+    let earlier = member("earlier");
+    let mut cfg = earlier.cfg(&f.cluster);
+    cfg.features = earlier_features();
+    let (a, b) = duplex_pair(64 * 1024);
+    tokio::spawn(belt::worker::serve::serve_connection_offering(
+        agent.clone(),
+        b,
+        f.cluster.clone(),
+        Arc::new(Semaphore::new(64)),
+        &[LATER],
+    ));
+    let to_later = connect(a, cfg).await.unwrap();
+    let agreed = &to_later.negotiated.features;
+    assert!(!agreed.iter().any(|x| x == LATER));
+    assert!(!agreed.iter().any(|x| x == belt::wire::ENV_SYNC_FEATURE));
+    for required in belt::protocol::session::required_features() {
+        assert!(agreed.contains(&required), "{required}");
+    }
+    inspected(&to_later.client).await;
+    // A member of version N+1 sends to a worker of version N: the feature
+    // only N+1 has is left out, and the work goes on as before.
+    let later = member("later");
+    let mut cfg = later.cfg(&f.cluster);
+    cfg.features.push(LATER.to_string());
+    let to_earlier = dial_as(&f, &agent, cfg).await.unwrap();
+    let agreed = &to_earlier.negotiated.features;
+    assert!(!agreed.iter().any(|x| x == LATER));
+    for required in belt::protocol::session::required_features() {
+        assert!(agreed.contains(&required), "{required}");
+    }
+    inspected(&to_earlier.client).await;
 }

@@ -5763,3 +5763,56 @@ async fn workers_inspect_coordinator_db_error_is_unknown() {
         other => panic!("{other:?}"),
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a57_a_worker_on_trial_refuses_every_change_saves_nothing_and_answers_reads() {
+    use belt::worker::control;
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    control::begin_trial(&f.state()).unwrap();
+    let a = AttemptId::generate();
+    for request in [submit_req(&a, &payload("exit 0")), retire_req(&a)] {
+        let refused = call(&c, request).await.unwrap_err();
+        // Send again later: no reason, so nothing is closed or replaced.
+        assert_eq!(refused.code, ErrorCode::Overloaded);
+        assert!(refused.overloaded_reason.is_none());
+    }
+    // Neither the attempt nor a tombstone for it was saved.
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert!(f.store().tombstone(&a).unwrap().is_none());
+    // Reads are answered.
+    assert!(!inspect_draining(&c).await);
+    // After the commit or the rollback the same request is taken.
+    control::end_trial(&f.state()).unwrap();
+    submit(&c, &a, &payload("exit 0")).await;
+    agent.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a57_the_upgrade_hold_refuses_new_attempts_and_resume_does_not_lift_it() {
+    use belt::worker::control::{self, Control};
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    control::hold(&f.state()).unwrap();
+    assert!(inspect_draining(&c).await);
+    let a = AttemptId::generate();
+    let refused = call(&c, submit_req(&a, &payload("exit 0")))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Overloaded);
+    // What `workers resume` writes leaves the hold in place.
+    control::write(&f.state(), Control::default()).unwrap();
+    assert!(inspect_draining(&c).await);
+    let refused = call(&c, submit_req(&a, &payload("exit 0")))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::Overloaded);
+    assert!(f.store().get(&a).unwrap().is_none());
+    // Only the upgrade lifts it.
+    control::lift_hold(&f.state()).unwrap();
+    assert!(!inspect_draining(&c).await);
+    submit(&c, &a, &payload("exit 0")).await;
+    agent.shutdown();
+}

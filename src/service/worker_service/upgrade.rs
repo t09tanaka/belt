@@ -225,7 +225,7 @@ fn saved_database(paths: &Paths, digest: &str) -> PathBuf {
 /// Move the write-ahead log into the database file. The service is stopped,
 /// so nothing else has the database open; if something does, say so rather
 /// than copy or replace a file that is in use.
-fn checkpoint(database: &Path) -> anyhow::Result<()> {
+pub(crate) fn checkpoint(database: &Path) -> anyhow::Result<()> {
     ensure!(
         fs::symlink_metadata(database)?.is_file(),
         "the worker database is not a regular file"
@@ -243,7 +243,7 @@ fn checkpoint(database: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn remove_if_present(path: &Path) -> anyhow::Result<()> {
+pub(crate) fn remove_if_present(path: &Path) -> anyhow::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -252,7 +252,7 @@ fn remove_if_present(path: &Path) -> anyhow::Result<()> {
 }
 
 /// Copy `from` to `to` through a private temporary file and a rename.
-fn copy_private(from: &Path, to: &Path) -> anyhow::Result<()> {
+pub(crate) fn copy_private(from: &Path, to: &Path) -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let directory = to.parent().context("file parent")?;
     let temporary = tempfile::NamedTempFile::new_in(directory)?;

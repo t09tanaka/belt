@@ -164,13 +164,18 @@ pub(super) async fn run(
         if *stop.borrow() || coordinator.is_fenced() {
             return Ok(());
         }
+        // Paused while a new version is on trial (§24.8): what it would
+        // delete stays deleted after a rollback, while its record comes back.
+        if coordinator.in_trial() {
+            continue;
+        }
         let inputs = captured.clone();
         // No select/cancellation of this wait: resident shutdown joins this loop
         // before owner cleanup. Even an externally aborted waiter leaves owner,
         // CapturedInputs and all synchronous guards in the blocking closure.
         let (next, result) =
             crate::results::retention::owned_blocking(coordinator.clone(), move |owner| {
-                if owner.is_fenced() {
+                if owner.is_fenced() || owner.in_trial() {
                     return (driver, Ok(Report::default()));
                 }
                 let result =

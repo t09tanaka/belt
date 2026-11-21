@@ -489,6 +489,8 @@ pub struct Coordinator {
     /// Who this coordinator is in the group: the name of its member and
     /// where the member's group key is. Set once at startup.
     group: std::sync::OnceLock<(WorkerId, std::path::PathBuf)>,
+    /// The marker of a version trial; see [`Coordinator::set_trial_marker`].
+    trial: std::sync::OnceLock<std::path::PathBuf>,
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
@@ -560,6 +562,7 @@ impl Coordinator {
         store.mark_reconciling()?;
         Ok(Coordinator {
             group: std::sync::OnceLock::new(),
+            trial: std::sync::OnceLock::new(),
             store: Arc::new(store),
             cfg,
             workers: Mutex::default(),
@@ -584,6 +587,48 @@ impl Coordinator {
             capacity_refused: Mutex::default(),
             sched,
         })
+    }
+
+    /// Name the marker of a version trial (`belt upgrade`, §24.8). While it
+    /// is there this coordinator only adopts attempts and renews their
+    /// leases: it places nothing, makes no generation, takes no submission,
+    /// sends no retire or cancel and settles no result. The first call holds.
+    pub fn set_trial_marker(&self, marker: std::path::PathBuf) {
+        let _ = self.trial.set(marker);
+    }
+
+    pub fn in_trial(&self) -> bool {
+        self.trial
+            .get()
+            .is_some_and(|marker| crate::worker::control::present(marker))
+    }
+
+    /// On trial, leave the proof of what this version did with an attempt
+    /// it adopted: its lease was renewed, or a worker answered and it has no
+    /// lease to renew. The upgrade checks it before its commit (§24.8). A
+    /// proof that cannot be written is missing, and the upgrade then rolls
+    /// back.
+    fn note_trial(&self, attempt: &AttemptId, renewed: bool) {
+        if let Some(marker) = self.trial.get() {
+            if crate::worker::control::present(marker) {
+                let _ = if renewed {
+                    crate::worker::control::note_renewal(marker, attempt.as_str())
+                } else {
+                    crate::worker::control::note_unrenewed(marker, attempt.as_str())
+                };
+            }
+        }
+    }
+
+    /// A change asked of a member on trial is answered "send again later"
+    /// (`OVERLOADED`) with nothing saved: a rollback would lose it.
+    pub(crate) fn check_trial(&self) -> Result<()> {
+        if self.in_trial() {
+            return Err(CoordinatorError::Storage(StorageError::Overloaded(
+                "this member is trying a new version; send again after the upgrade".into(),
+            )));
+        }
+        Ok(())
     }
 
     /// The scheduler: priorities, and why a task waits.
@@ -842,6 +887,12 @@ impl Coordinator {
         source: crate::source::retention::Guard,
     ) -> Result<()> {
         self.check_fenced()?;
+        // Every submission path comes through here, the resident's included.
+        if self.in_trial() {
+            return Err(CoordinatorError::Storage(StorageError::Overloaded(
+                "this member is trying a new version; submit again after the upgrade".into(),
+            )));
+        }
         let mut specs = Vec::with_capacity(tasks.len());
         for (task, spec) in tasks {
             if let Some(bundle) = &spec.toolchains {
@@ -890,6 +941,7 @@ impl Coordinator {
     /// every later one until its worker answered.
     pub async fn cancel_task(&self, task_id: &TaskId) -> Result<Option<AttemptRecord>> {
         self.check_fenced()?;
+        self.check_trial()?;
         self.clear_prefetch(&crate::service::completion::Target::Task(task_id.clone()));
         let task = task_id.clone();
         self.db(move |s| s.cancel_task(&task, wall_ms())).await
@@ -897,6 +949,7 @@ impl Coordinator {
 
     pub async fn cancel_run(&self, run_id: RunId) -> Result<()> {
         self.check_fenced()?;
+        self.check_trial()?;
         self.clear_prefetch(&crate::service::completion::Target::Run(run_id.clone()));
         self.db(move |s| s.cancel_run(&run_id, wall_ms())).await
     }
@@ -906,6 +959,13 @@ impl Coordinator {
     /// only after the worker confirmed that the attempt never started or has
     /// stopped.
     pub async fn request_retire(&self, attempt_id: &AttemptId, reason: &str) -> Result<()> {
+        self.check_trial()?;
+        self.retire_durably(attempt_id, reason).await
+    }
+
+    /// The tombstone of [`Coordinator::request_retire`], for a tick that
+    /// already knows it is not on trial (a tick on trial places nothing).
+    async fn retire_durably(&self, attempt_id: &AttemptId, reason: &str) -> Result<()> {
         let (a, reason) = (attempt_id.clone(), reason.to_string());
         self.db(move |s| s.begin_retire(&a, &reason, wall_ms()))
             .await
@@ -1348,6 +1408,19 @@ impl Coordinator {
         };
         let (answer, status) = self.ask(link, a).await;
         let step = policy::next_step(facts, answer);
+        let renewing = step == Step::Follow
+            && !matches!(
+                answer,
+                Answer::Status(AttemptState::Cancelling | AttemptState::Finalizing)
+            );
+        if answer != Answer::Unreachable && !renewing {
+            // A worker answered, and this attempt has no lease to renew.
+            self.note_trial(&a.attempt_id, false);
+        }
+        if self.in_trial() && !matches!(step, Step::Follow | Step::KeepUnknown) {
+            // Settled, retired, cancelled or sent again after the trial.
+            return Ok(());
+        }
         match step {
             // These ask the worker first, and apply what it says themselves.
             Step::Retire => return self.retire(link, &live, report, asked).await,
@@ -1368,10 +1441,12 @@ impl Coordinator {
                 self.mirror(&status, report).await?;
                 drop(actor);
                 self.renew(link, a, status.state, report, asked).await?;
-                if !matches!(
-                    status.state,
-                    AttemptState::Cancelling | AttemptState::Finalizing
-                ) {
+                if !self.in_trial()
+                    && !matches!(
+                        status.state,
+                        AttemptState::Cancelling | AttemptState::Finalizing
+                    )
+                {
                     self.follow_artifacts(link, &live, asked).await?;
                 }
                 Ok(())
@@ -1524,7 +1599,7 @@ impl Coordinator {
                     Refusal::Never => {
                         self.note_refusal(&a.attempt_id, "submit_refused", &e)
                             .await?;
-                        self.request_retire(&a.attempt_id, REASON_SUBMIT_REFUSED)
+                        self.retire_durably(&a.attempt_id, REASON_SUBMIT_REFUSED)
                             .await?;
                         self.observe(&a.attempt_id, Observation::Known).await?;
                         Ok(Sent::NotTaken)
@@ -1737,6 +1812,10 @@ impl Coordinator {
         });
         match link.call(request).await {
             Err(LinkError::Remote(e)) if e.code == ErrorCode::StaleEpoch => Err(self.fence()),
+            Ok(Response::RenewLease(r)) if r.extended && r.attempt_id == a.attempt_id => {
+                self.note_trial(&a.attempt_id, true);
+                Ok(())
+            }
             // Renewed, or not renewable any more: the next look says why.
             Ok(_) | Err(LinkError::Remote(_)) => Ok(()),
             Err(LinkError::Unconfirmed) => {
@@ -1761,6 +1840,9 @@ impl Coordinator {
         report: &mut TickReport,
         telemetry: &Mutex<Vec<preparation::RawPage>>,
     ) -> Result<()> {
+        if self.in_trial() {
+            return Ok(());
+        }
         // Tasks every attached worker is excluded for come last: however
         // many of them wait, they do not fill the scan in front of a task
         // that can be placed. A worker that is attached later is not

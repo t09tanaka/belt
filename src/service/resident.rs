@@ -748,6 +748,7 @@ async fn connect_local_worker(
         agent_config.worker_id.clone(),
         agent_config.group_key_path.clone(),
     );
+    coordinator.set_trial_marker(crate::worker::control::trial_path(&agent_config.state_dir));
     let membership = coordinator
         .membership()
         .map_err(|e| anyhow::anyhow!(e.message))?;
@@ -1200,6 +1201,19 @@ struct RetryCommand {
     expected: u64,
     request_id: String,
 }
+/// The parent requests a member on trial refuses: everything that would
+/// write the parent database. Reads, health and shutdown are answered.
+fn changes_parent_state(operation: &Operation) -> bool {
+    matches!(
+        operation,
+        Operation::Submit { .. }
+            | Operation::SubmitCaptured { .. }
+            | Operation::Cancel { .. }
+            | Operation::Retry { .. }
+            | Operation::RecordStatus { .. }
+    )
+}
+
 async fn retry_control<F, L>(
     coordinator: Arc<Coordinator>,
     admission: Arc<Mutex<bool>>,
@@ -1370,6 +1384,17 @@ async fn handle(
             .await
             .map_err(Into::into);
     }
+    if matches!(request.operation, Operation::ReloadWorkers) && coordinator.in_trial() {
+        // A worker dialed now would be recorded in the parent database, and a
+        // rollback would lose the record (§24.8). Nothing is dialed.
+        let reply = Reply::ControlError {
+            error: crate::error::ApiError::new(
+                crate::error::ErrorCode::Overloaded,
+                "this member is trying a new version; send again after the upgrade",
+            ),
+        };
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     let control = match &request.operation {
         Operation::ReloadWorkers => Some((None, "the resident did not finish the reload in time")),
         Operation::ForgetWorker { worker } => Some((
@@ -1478,6 +1503,29 @@ async fn handle(
         } else {
             Reply::Error {
                 message: "resident is stopping".into(),
+            }
+        }
+    } else if coordinator.in_trial() && changes_parent_state(&request.operation) {
+        // Nothing is saved while a new version is on trial: a rollback would
+        // lose it. The asker sends again after the upgrade.
+        let message = if matches!(
+            &request.operation,
+            Operation::Submit { .. } | Operation::SubmitCaptured { .. }
+        ) {
+            "this member is trying a new version; submit again after the upgrade"
+        } else {
+            "this member is trying a new version; send again after the upgrade"
+        };
+        if matches!(
+            &request.operation,
+            Operation::Cancel { .. } | Operation::Retry { .. }
+        ) {
+            Reply::ControlError {
+                error: crate::error::ApiError::new(crate::error::ErrorCode::Overloaded, message),
+            }
+        } else {
+            Reply::Error {
+                message: message.into(),
             }
         }
     } else {

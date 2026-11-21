@@ -41,6 +41,10 @@ impl Coordinator {
     ) -> Result<CollectReport> {
         let one = Arc::new(Arc::clone(&self.collecting).lock_owned().await);
         self.check_fenced()?;
+        if self.in_trial() {
+            // Nothing is acknowledged or adopted until the commit.
+            return Ok(CollectReport::default());
+        }
         let collector = Collector::new(Arc::clone(&self.store), Arc::clone(files), cfg)
             .with_costs(self.sched.model(), self.cost_tails.clone())
             .with_waits(Arc::clone(&self.collect_waits))

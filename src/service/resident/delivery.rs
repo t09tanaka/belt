@@ -257,6 +257,12 @@ async fn plan_undelivered(
     fault: &super::super::forward::PlanFault,
 ) {
     use super::super::forward::PlanFault;
+    // On trial nothing is recorded (§24.8): a run ended now would come back
+    // unended with a rollback. The delivery is tried again after the trial,
+    // and the refusal or the end is recorded then.
+    if coordinator.in_trial() {
+        return;
+    }
     let (owner, run) = (coordinator.clone(), run.clone());
     match fault {
         PlanFault::Retry(_) => {}
@@ -373,5 +379,73 @@ pub(super) async fn secrets(
                 sent.insert(key);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_plan_not_delivered_on_trial_records_nothing_until_the_trial_is_over() {
+        use super::super::super::forward::PlanFault;
+        let root = crate::test_tmp::tempdir().unwrap();
+        let config = crate::config::resolve(&crate::config::Inputs {
+            overlay: &crate::config::Overlay::default(),
+            project: None,
+            legacy: None,
+            user: None,
+        })
+        .unwrap();
+        let store = crate::storage::CoordinatorStore::open(&root.path().join("parent"), 1).unwrap();
+        let owner = Arc::new(
+            config
+                .runtime_settings()
+                .unwrap()
+                .start_coordinator(store, Arc::new(crate::scheduler::UnknownCosts))
+                .unwrap(),
+        );
+        let marker = crate::worker::control::trial_path(root.path());
+        owner.set_trial_marker(marker.clone());
+        crate::worker::control::begin_trial(root.path()).unwrap();
+        let run = RunId::generate();
+        owner
+            .store()
+            .create_run(&run, None, None, &serde_json::json!({}), 1)
+            .unwrap();
+        let gate = InputGate::default();
+        let worker = WorkerId::parse("w-a").unwrap();
+        let refused = || {
+            owner
+                .store()
+                .events_after(0, 100)
+                .unwrap()
+                .into_iter()
+                .filter(|e| e.kind == "ci_plan_refused")
+                .count()
+        };
+        for fault in [
+            PlanFault::Unrunnable("gone".into()),
+            PlanFault::Refused("full".into()),
+        ] {
+            plan_undelivered(&owner, &gate, &worker, gate.generation(), &run, &fault).await;
+        }
+        // Nothing was recorded: the path returns before the end of the run
+        // and before the refusal.
+        assert_eq!(refused(), 0);
+        assert!(gate.input_refusals().is_empty());
+        // After the commit the delivery that is tried again records it.
+        crate::worker::control::end_trial(root.path()).unwrap();
+        plan_undelivered(
+            &owner,
+            &gate,
+            &worker,
+            gate.generation(),
+            &run,
+            &PlanFault::Refused("full".into()),
+        )
+        .await;
+        assert_eq!(refused(), 1);
+        assert_eq!(gate.input_refusals().len(), 1);
     }
 }

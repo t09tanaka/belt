@@ -40,7 +40,9 @@ pub(super) async fn run(
     let mut stalled = std::collections::BTreeMap::new();
     loop {
         tokio::select! { _ = stop.changed() => return Ok(()), _ = timer.tick() => {} }
-        if coordinator.is_fenced() {
+        // Paused while a new version is on trial (§24.8): a run it ended, or
+        // a plan it removed, would not come back with a rollback.
+        if coordinator.is_fenced() || coordinator.in_trial() {
             continue;
         }
         let (owner, dir) = (coordinator.clone(), state.clone());

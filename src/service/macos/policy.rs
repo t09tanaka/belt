@@ -104,6 +104,14 @@ impl Plan {
             Backend::Systemd => vec![self.domain.clone(), "stop".into(), self.filename()],
         })
     }
+    /// Stop the loaded job by its name, without reading its managed file: for
+    /// a job whose file is already gone, or one that stops itself last.
+    pub fn stop_by_name_arguments(&self) -> Vec<String> {
+        match self.backend {
+            Backend::Launchd => vec!["bootout".into(), self.service_target()],
+            Backend::Systemd => vec![self.domain.clone(), "stop".into(), self.filename()],
+        }
+    }
     pub fn service_target(&self) -> String {
         match self.backend {
             Backend::Launchd => format!("{}/{}", self.domain, self.label),
@@ -266,6 +274,10 @@ mod tests {
         assert_eq!(launchd.backend(), Backend::Launchd);
         assert_eq!(launchd.domain(), "gui/501");
         assert_eq!(launchd.service_target(), "gui/501/org.example.worker");
+        assert_eq!(
+            launchd.stop_by_name_arguments(),
+            ["bootout", "gui/501/org.example.worker"]
+        );
         let unit = Plan::systemd(&d, "--user", "[Unit]\n".into());
         assert_eq!(unit.backend(), Backend::Systemd);
         assert_eq!(unit.domain(), "--user");
@@ -279,6 +291,10 @@ mod tests {
         );
         assert_eq!(
             unit.stop_arguments(file).unwrap(),
+            ["--user", "stop", "org.example.worker.service"]
+        );
+        assert_eq!(
+            unit.stop_by_name_arguments(),
             ["--user", "stop", "org.example.worker.service"]
         );
         assert!(unit.start_arguments(Path::new("rel")).is_err());

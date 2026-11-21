@@ -55,9 +55,23 @@ pub fn admit(agent: &Agent, peer: &ProvenMember) -> Result<WorkerIdentity, ApiEr
     let failed = |what: &str, e: crate::storage::StorageError| {
         ApiError::new(e.code(), format!("{what}: {e}"))
     };
-    let pin = store
-        .pin_member(peer.member.as_str(), crate::platform::wall_ms())
-        .map_err(|e| failed("the member record", e))?;
+    // A version on trial records no new member: a rollback would lose the
+    // record (§24.8). A member pinned before is admitted as always.
+    let pin = if super::control::in_trial(&cfg.state_dir) {
+        store
+            .member_pin(peer.member.as_str())
+            .map_err(|e| failed("the member record", e))?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::Overloaded,
+                    "this worker is trying a new version; send the request again later",
+                )
+            })?
+    } else {
+        store
+            .pin_member(peer.member.as_str(), crate::platform::wall_ms())
+            .map_err(|e| failed("the member record", e))?
+    };
     let mismatch = |message: String| {
         Err(ApiError::group_refused(
             GroupRefusal::MemberIdentityMismatch,
