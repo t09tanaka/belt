@@ -1,9 +1,11 @@
 //! The coordinator's side of an ephemeral worker's identity (spec chapter
 //! 15): letting an identity in at `hello`, and `workers forget`.
 //!
-//! Both run under the actor, so no tick looks at the worker's attempts while
-//! they are ended, and `forget` also holds the placement fence, so a session
-//! cannot be attached between the check that none is and the commit.
+//! Both run under the actor, so no answer a tick got from the worker is
+//! applied while its attempts are ended (a tick applies answers under the
+//! actor, and only while the connection it asked is still attached), and
+//! `forget` also holds the placement fence, so a session cannot be attached
+//! between the check that none is and the commit.
 
 use super::identity::{may_forget, Admission, ForgetRefusal};
 use super::{Coordinator, Result};

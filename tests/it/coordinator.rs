@@ -3134,3 +3134,260 @@ async fn a_worker_with_more_live_attempts_than_a_page_is_followed_completely() {
         );
     }
 }
+
+// ------------------------------------------------- A56: a call never answered
+
+/// A count that a test can wait for without a clock.
+#[derive(Default)]
+struct Count {
+    n: std::sync::atomic::AtomicUsize,
+    changed: tokio::sync::Notify,
+}
+
+impl Count {
+    fn bump(&self) {
+        self.n.fetch_add(1, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    fn get(&self) -> usize {
+        self.n.load(Ordering::SeqCst)
+    }
+
+    async fn reaches(&self, at_least: usize) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.get() >= at_least {
+                return;
+            }
+            changed.await;
+        }
+    }
+}
+
+/// A fake worker behind a link that can hold every request but `inspect`:
+/// a held request reaches nobody and gets no answer until it is released,
+/// and in a test of "never" it is never released.
+struct Holding {
+    worker: Arc<FakeWorker>,
+    hold: AtomicBool,
+    release: tokio::sync::Semaphore,
+    /// Held requests so far.
+    entered: Count,
+    /// Held requests that have not returned yet, answered or dropped.
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    /// Submits the worker answered.
+    submits: Count,
+}
+
+struct InFlight(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Holding {
+    fn new(worker: &Arc<FakeWorker>) -> Arc<Holding> {
+        Arc::new(Holding {
+            worker: Arc::clone(worker),
+            hold: AtomicBool::new(false),
+            release: tokio::sync::Semaphore::new(0),
+            entered: Count::default(),
+            in_flight: Arc::default(),
+            submits: Count::default(),
+        })
+    }
+
+    fn in_flight(&self) -> usize {
+        self.in_flight.load(Ordering::SeqCst)
+    }
+}
+
+impl WorkerLink for Holding {
+    fn call(
+        &self,
+        request: Request,
+    ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
+        Box::pin(async move {
+            let op = op_of(&request);
+            if op != Op::Inspect && self.hold.load(Ordering::SeqCst) {
+                self.in_flight.fetch_add(1, Ordering::SeqCst);
+                let _flight = InFlight(Arc::clone(&self.in_flight));
+                self.entered.bump();
+                self.release.acquire().await.unwrap().forget();
+            }
+            let answer = self.worker.call(request).await;
+            if op == Op::Submit {
+                self.submits.bump();
+            }
+            answer
+        })
+    }
+}
+
+type A56Worker = (Arc<FakeWorker>, Arc<Holding>);
+
+/// Two workers each run one attempt, followed and renewed by the parent.
+async fn a56_two_running(f: &Fx) -> (Arc<Coordinator>, A56Worker, A56Worker, AttemptId, AttemptId) {
+    let stalled = f.worker("w-a", (2, 0));
+    let healthy = f.worker("w-b", (2, 0));
+    let (held, watched) = (Holding::new(&stalled), Holding::new(&healthy));
+    let c = Arc::new(f.open(&[]));
+    c.attach(stalled.id.clone(), held.clone()).await;
+    c.attach(healthy.id.clone(), watched.clone()).await;
+    let tasks = enqueue(&c, 2).await;
+    c.tick().await.unwrap();
+    let on: Vec<AttemptRecord> = tasks.iter().map(|t| only(&c, t)).collect();
+    let on_a = on
+        .iter()
+        .find(|a| a.worker_id == stalled.id)
+        .unwrap()
+        .attempt_id
+        .clone();
+    let on_b = on
+        .iter()
+        .find(|a| a.worker_id == healthy.id)
+        .unwrap()
+        .attempt_id
+        .clone();
+    stalled.start(&on_a);
+    healthy.start(&on_b);
+    c.tick().await.unwrap();
+    (c, (stalled, held), (healthy, watched), on_a, on_b)
+}
+
+fn record_of(c: &Coordinator, a: &AttemptId) -> AttemptRecord {
+    c.store().get_attempt(a).unwrap().unwrap()
+}
+
+#[tokio::test(start_paused = true)]
+async fn a56_a_db_only_request_and_the_other_worker_go_on_while_a_call_is_never_answered() {
+    let mut f = fx();
+    f.cfg.worker_budget_ms = 15_000;
+    let (c, (stalled, held), (healthy, watched), on_a, on_b) = a56_two_running(&f).await;
+    held.hold.store(true, Ordering::SeqCst);
+    // The first look that gets no answer waits the budget out, as before.
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.unknown, vec![on_a.clone()]);
+    assert_eq!(held.in_flight(), 0, "the call was given up at the budget");
+
+    let gets = stalled.received(Op::Get);
+    let renewed = healthy.held(&on_b).unwrap().renewals;
+    let submits = watched.submits.get();
+    let more = enqueue(&c, 1).await;
+    let begun = tokio::time::Instant::now();
+    let ticking = tokio::spawn({
+        let c = Arc::clone(&c);
+        async move { c.tick().await }
+    });
+    // The next look at w-a is stuck in a call that is never answered.
+    held.entered.reaches(2).await;
+    // Meanwhile the other worker is renewed and placed on.
+    watched.submits.reaches(submits + 1).await;
+    assert_eq!(held.in_flight(), 1, "the call to w-a is still pending");
+    assert!(
+        begun.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        begun.elapsed()
+    );
+    assert_eq!(healthy.held(&on_b).unwrap().renewals, renewed + 1);
+    assert_eq!(only(&c, &more[0]).worker_id, healthy.id);
+    // A request the parent answers from its own database does not wait
+    // for that call.
+    let gone = WorkerId::parse("w-gone").unwrap();
+    tokio::time::timeout(Duration::from_secs(2), c.forget_worker(&gone, Some(true)))
+        .await
+        .expect("forget is answered while the call is pending")
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        c.admit_identity(&gone, &WorkerBootId::parse("boot-gone").unwrap()),
+    )
+    .await
+    .expect("an identity is admitted while the call is pending")
+    .unwrap();
+    assert_eq!(held.in_flight(), 1, "the call to w-a is still pending");
+    assert!(
+        begun.elapsed() < Duration::from_secs(2),
+        "{:?}",
+        begun.elapsed()
+    );
+
+    // The tick gives the call up at the budget, and w-a keeps its attempt.
+    let report = ticking.await.unwrap().unwrap();
+    assert_eq!(report.unknown, vec![on_a.clone()]);
+    assert_eq!(held.in_flight(), 0);
+    assert!(begun.elapsed() >= Duration::from_millis(15_000));
+    assert_eq!(record_of(&c, &on_a).observation, Observation::Unknown);
+    assert_eq!(
+        stalled.received(Op::Get),
+        gets,
+        "the held calls never reached it"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn a56_an_answer_that_comes_after_the_parent_gave_it_up_changes_nothing() {
+    let mut f = fx();
+    f.cfg.worker_budget_ms = 15_000;
+    let (c, (stalled, held), _, on_a, _) = a56_two_running(&f).await;
+    let renewals = stalled.held(&on_a).unwrap().renewals;
+    let gets = stalled.received(Op::Get);
+
+    // The connection is dropped while a call on it is pending: that does
+    // not wait for the call.
+    held.hold.store(true, Ordering::SeqCst);
+    let ticking = tokio::spawn({
+        let c = Arc::clone(&c);
+        async move { c.tick().await }
+    });
+    held.entered.reaches(1).await;
+    let link: Arc<dyn WorkerLink> = held.clone();
+    let begun = tokio::time::Instant::now();
+    let detached = tokio::time::timeout(Duration::from_secs(2), c.detach_link(&stalled.id, &link))
+        .await
+        .expect("detached while the call is pending")
+        .unwrap();
+    assert!(detached);
+    assert!(begun.elapsed() < Duration::from_secs(2));
+    assert_eq!(record_of(&c, &on_a).observation, Observation::Unknown);
+    // The answer arrives now: the worker says the attempt runs. It is about
+    // a connection that is gone, and changes nothing.
+    held.release.add_permits(1);
+    let report = ticking.await.unwrap().unwrap();
+    assert!(!report.unknown.contains(&on_a));
+    assert_eq!(
+        stalled.received(Op::Get),
+        gets + 1,
+        "the late answer was given"
+    );
+    assert_eq!(record_of(&c, &on_a).observation, Observation::Unknown);
+    assert_eq!(
+        stalled.held(&on_a).unwrap().renewals,
+        renewals,
+        "no renewal"
+    );
+
+    // On the same connection, after the budget: the call is given up, and
+    // what is released afterwards reaches nobody.
+    c.attach(stalled.id.clone(), held.clone()).await;
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.unknown, vec![on_a.clone()]);
+    assert_eq!(held.in_flight(), 0);
+    held.release.add_permits(1);
+    tokio::task::yield_now().await;
+    assert_eq!(stalled.received(Op::Get), gets + 1);
+    assert_eq!(record_of(&c, &on_a).observation, Observation::Unknown);
+    // It answers again: followed and renewed as before.
+    held.hold.store(false, Ordering::SeqCst);
+    held.release.forget_permits(1);
+    let report = c.tick().await.unwrap();
+    assert!(report.unknown.is_empty());
+    assert_eq!(record_of(&c, &on_a).observation, Observation::Known);
+    assert_eq!(stalled.held(&on_a).unwrap().renewals, renewals + 1);
+}

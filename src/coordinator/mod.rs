@@ -10,7 +10,12 @@
 //! ([`CoordinatorConfig::worker_budget_ms`]): a worker that stalls costs the
 //! tick that budget once, not one timeout per attempt, so the leases on the
 //! other workers are renewed in time. Placing stays one step after the
-//! other, by this one actor.
+//! other, by one tick at a time.
+//!
+//! No worker is ever asked anything under the actor: a tick applies each
+//! answer in a short critical section, and drops an answer whose connection
+//! was detached or replaced meanwhile. A request the parent answers from its
+//! own database (`workers`, `forget`) never waits for a worker (A56).
 //!
 //! Every step is decided from what is durable in the parent database and
 //! what the worker answers now ([`policy`]), so a tick can be repeated after
@@ -345,6 +350,42 @@ struct Round {
 }
 
 impl Round {
+    /// The workers that answered, among those the tick looked at; the rest
+    /// are out as not reached.
+    fn new(known: BTreeSet<WorkerId>, reached: Vec<Reached>, deadline: Instant) -> Round {
+        let mut round = Round {
+            out: BTreeMap::new(),
+            open: Vec::new(),
+            known,
+            deadline,
+        };
+        let answered: BTreeSet<WorkerId> = reached.iter().map(|w| w.worker_id.clone()).collect();
+        for missing in round.known.difference(&answered) {
+            round.out.insert(missing.clone(), Exclusion::Unreached);
+        }
+        for worker in reached {
+            round.admit(worker);
+        }
+        round
+    }
+
+    /// Place once more, by `deadline`, now that some of the workers that
+    /// were not reached answered late. What closed a worker before stays.
+    fn again(&mut self, late: Vec<Reached>, deadline: Instant) {
+        self.deadline = deadline;
+        for worker in &mut self.open {
+            worker.link = Arc::new(Budgeted {
+                inner: Arc::clone(&worker.attachment),
+                deadline,
+            });
+        }
+        for mut worker in late {
+            self.out.remove(&worker.worker_id);
+            worker.link = Arc::clone(&worker.attachment);
+            self.admit(worker);
+        }
+    }
+
     fn admit(&mut self, mut worker: Reached) {
         if worker.draining {
             self.out.insert(worker.worker_id, Exclusion::Draining);
@@ -400,6 +441,32 @@ fn not_taken(why: Unstored) -> Sent {
 
 type Followed = Result<(Option<Reached>, TickReport)>;
 
+/// An attached worker and its connection.
+type Link = (WorkerId, Arc<dyn WorkerLink>);
+
+/// The connection of a worker as it was when the worker was asked.
+type Attached = Option<Arc<dyn WorkerLink>>;
+
+/// The workers that answered, with what was done on each in `report`; the
+/// first failure, if any, after all of them were looked at.
+fn absorb_all(report: &mut TickReport, all: Vec<Followed>) -> Result<Vec<Reached>> {
+    let mut reached = Vec::new();
+    let mut failed = None;
+    for followed in all {
+        match followed {
+            Ok((worker, part)) => {
+                report.absorb(part);
+                reached.extend(worker);
+            }
+            Err(e) => failed = failed.or(Some(e)),
+        }
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(reached),
+    }
+}
+
 /// Drive every future to its end, side by side on this task.
 async fn join_all<'a, T>(mut all: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>) -> Vec<T> {
     let mut done: Vec<Option<T>> = all.iter().map(|_| None).collect();
@@ -434,7 +501,18 @@ pub struct Coordinator {
     preparation_identities: Mutex<BTreeMap<WorkerId, preparation_identity::IdentityContext>>,
     preparation_query: tokio::sync::Mutex<()>,
     preparation_cursors: Mutex<BTreeMap<WorkerId, preparation::CursorState>>,
+    /// Short critical sections over the state of the workers' attempts:
+    /// what a worker answered is applied under it, and `forget`, `detach`
+    /// and the admission of an identity hold it. It is never held while a
+    /// worker is asked anything (spec A56), so a request the parent answers
+    /// from its own database does not wait for a worker.
     actor: tokio::sync::Mutex<()>,
+    /// One tick at a time: the single placer. Nothing but a tick takes it.
+    ticking: tokio::sync::Mutex<()>,
+    /// The workers whose last look got no answer in time. A tick places on
+    /// the others once they answered, without waiting for these first.
+    /// Kept in this process only.
+    silent: Mutex<BTreeSet<WorkerId>>,
     /// One pass of result collection at a time.
     collecting: Arc<tokio::sync::Mutex<()>>,
     /// The collections that wait before they are tried again.
@@ -495,6 +573,8 @@ impl Coordinator {
             preparation_query: tokio::sync::Mutex::new(()),
             preparation_cursors: Mutex::default(),
             actor: tokio::sync::Mutex::new(()),
+            ticking: tokio::sync::Mutex::new(()),
+            silent: Mutex::default(),
             collecting: Arc::new(tokio::sync::Mutex::new(())),
             collect_waits: Arc::default(),
             cost_tails: Arc::default(),
@@ -686,9 +766,11 @@ impl Coordinator {
         Ok(())
     }
 
-    /// Every live attempt of a detached worker is `unknown`. The caller holds
-    /// the actor, so no tick places on the worker while its attempts are
-    /// walked, and the walk holds one page of them at a time.
+    /// Every live attempt of a detached worker is `unknown`. The caller
+    /// removed the link under the placement fence first, so nothing is placed
+    /// there any more, and holds the actor, so an answer of the old link that
+    /// arrives now is dropped rather than applied. The walk holds one page of
+    /// the attempts at a time.
     async fn unknown_all(&self, worker_id: &WorkerId) -> Result<()> {
         let mut after = None;
         loop {
@@ -834,11 +916,18 @@ impl Coordinator {
             .await
     }
 
-    /// One pass of the actor: follow every attempt on every attached worker,
-    /// then place queued tasks. Fails only for a storage fault or when this
-    /// coordinator was fenced; a worker that does not answer is not an error.
+    /// One pass: follow every attempt on every attached worker, then place
+    /// queued tasks. Fails only for a storage fault or when this coordinator
+    /// was fenced; a worker that does not answer is not an error.
+    ///
+    /// Only one tick runs at a time, but a tick never holds the actor while
+    /// it waits for a worker: each answer is applied in a short critical
+    /// section of its own, and only if the worker's connection is still the
+    /// one that was asked. A worker that did not answer the last look is not
+    /// waited for before the others are placed on; it is still followed
+    /// side by side, within the same budget, and placed on once it answers.
     pub async fn tick(&self) -> Result<TickReport> {
-        let actor = self.actor.lock().await;
+        let ticking = self.ticking.lock().await;
         self.check_fenced()?;
         let telemetry = Mutex::new(Vec::new());
         let mut report = TickReport::default();
@@ -851,34 +940,125 @@ impl Coordinator {
         };
         let known: BTreeSet<WorkerId> = attached.iter().map(|(w, _)| w.clone()).collect();
         let deadline = self.deadline();
-        let follows: Vec<Pin<Box<dyn Future<Output = Followed> + Send + '_>>> = attached
-            .into_iter()
-            .map(|(worker_id, link)| {
-                Box::pin(self.follow(worker_id, link, deadline, &telemetry))
-                    as Pin<Box<dyn Future<Output = Followed> + Send + '_>>
-            })
-            .collect();
-        let mut reached = Vec::new();
-        let mut failed = None;
-        // In the order of the worker ids, whichever answered first.
-        for followed in join_all(follows).await {
-            match followed {
-                Ok((worker, part)) => {
-                    report.absorb(part);
-                    reached.extend(worker);
-                }
-                Err(e) => failed = failed.or(Some(e)),
-            }
-        }
-        if let Some(e) = failed {
-            return Err(e);
-        }
-        let result = self.dispatch(known, reached, &mut report, &telemetry).await;
-        drop(actor);
+        let (late, prompt): (Vec<_>, Vec<_>) = {
+            let silent = self.silent.lock().unwrap_or_else(|e| e.into_inner());
+            attached.into_iter().partition(|(w, _)| silent.contains(w))
+        };
+        let result = self
+            .follow_and_place((prompt, late), known, deadline, &mut report, &telemetry)
+            .await?;
+        drop(ticking);
         // Conversion and the best-effort writer queue never run under the actor.
         self.ingest_preparation(telemetry.into_inner().unwrap_or_else(|e| e.into_inner()));
         result?;
         Ok(report)
+    }
+
+    /// Follow the `prompt` workers and the `late` ones side by side, and
+    /// place on the prompt ones as soon as they all answered. The outer error
+    /// is a failure while following, before anything was placed.
+    async fn follow_and_place(
+        &self,
+        (prompt, late): (Vec<Link>, Vec<Link>),
+        known: BTreeSet<WorkerId>,
+        deadline: Instant,
+        report: &mut TickReport,
+        telemetry: &Mutex<Vec<preparation::RawPage>>,
+    ) -> Result<Result<()>> {
+        let mut prompt = std::pin::pin!(join_all(self.follows(prompt, deadline, telemetry)));
+        let mut late = std::pin::pin!(join_all(self.follows(late, deadline, telemetry)));
+        let mut late_done = None;
+        let prompt_done = loop {
+            tokio::select! {
+                biased;
+                done = &mut late, if late_done.is_none() => late_done = Some(done),
+                done = &mut prompt => break done,
+            }
+        };
+        // In the order of the worker ids, whichever answered first.
+        let mut reached = absorb_all(report, prompt_done)?;
+        if late_done.is_none() && reached.is_empty() {
+            // Nobody else to place on: wait for those as before.
+            late_done = Some((&mut late).await);
+        }
+        Ok(match late_done {
+            Some(done) => {
+                reached.extend(absorb_all(report, done)?);
+                let mut round = Round::new(known, reached, self.deadline());
+                self.dispatch(&mut round, report, telemetry).await
+            }
+            None => {
+                let mut round = Round::new(known, reached, self.deadline());
+                let (placed, done) =
+                    tokio::join!(self.dispatch(&mut round, report, telemetry), &mut late);
+                let mut part = TickReport::default();
+                let answered = absorb_all(&mut part, done);
+                report.absorb(part);
+                match (placed, answered) {
+                    (Err(e), _) | (Ok(()), Err(e)) => Err(e),
+                    (Ok(()), Ok(answered)) if answered.is_empty() => Ok(()),
+                    (Ok(()), Ok(answered)) => {
+                        // Those that answered late are placed on now.
+                        round.again(answered, self.deadline());
+                        self.dispatch(&mut round, report, telemetry).await
+                    }
+                }
+            }
+        })
+    }
+
+    fn follows<'a>(
+        &'a self,
+        workers: Vec<(WorkerId, Arc<dyn WorkerLink>)>,
+        deadline: Instant,
+        telemetry: &'a Mutex<Vec<preparation::RawPage>>,
+    ) -> Vec<Pin<Box<dyn Future<Output = Followed> + Send + 'a>>> {
+        workers
+            .into_iter()
+            .map(|(worker_id, link)| {
+                Box::pin(self.follow(worker_id, link, deadline, telemetry))
+                    as Pin<Box<dyn Future<Output = Followed> + Send + 'a>>
+            })
+            .collect()
+    }
+
+    /// What is attached for a worker now. Taken before a worker is asked and
+    /// compared again before its answer is applied ([`Coordinator::answered`]).
+    fn attached_now(&self, worker_id: &WorkerId) -> Attached {
+        self.workers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(worker_id)
+            .cloned()
+    }
+
+    /// Take the actor to apply what a worker answered (or that it did not).
+    /// `None` when the answer is stale: the connection that was asked was
+    /// detached or replaced meanwhile (a `forget`, a `detach` or a new
+    /// identity ran), so nothing of it may change the record any more.
+    async fn answered(
+        &self,
+        worker_id: &WorkerId,
+        asked: &Attached,
+    ) -> Result<Option<tokio::sync::MutexGuard<'_, ()>>> {
+        let actor = self.actor.lock().await;
+        self.check_fenced()?;
+        let now = self.attached_now(worker_id);
+        let same = match (asked, &now) {
+            (Some(asked), Some(now)) => Arc::ptr_eq(asked, now),
+            (None, None) => true,
+            _ => false,
+        };
+        Ok(same.then_some(actor))
+    }
+
+    fn mark_silent(&self, worker_id: &WorkerId, silent: bool) {
+        let mut marked = self.silent.lock().unwrap_or_else(|e| e.into_inner());
+        if silent {
+            marked.insert(worker_id.clone());
+        } else {
+            marked.remove(worker_id);
+        }
     }
 
     fn deadline(&self) -> Instant {
@@ -899,21 +1079,29 @@ impl Coordinator {
             deadline,
         };
         let mut report = TickReport::default();
+        let asked = self.attached_now(&worker_id);
         let inputs = link.placement_inputs();
         let requested = self.preparation_request(&worker_id, &link, inputs.as_ref());
         let sent_boot = crate::platform::boot_id();
         let sent = crate::platform::monotonic_ms();
         let mut inspected = self.inspect(&worker_id, &budgeted, requested.clone()).await;
-        if inspected
-            .as_ref()
-            .is_some_and(|answer| policy::answers_room(answer.admission.as_ref()))
         {
-            // Only this inspect can clear an earlier refusal. A refusal
-            // while driving below must wait for the next inspect.
-            self.capacity_refused
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&worker_id);
+            let Some(_actor) = self.answered(&worker_id, &asked).await? else {
+                // Detached or replaced meanwhile: what this connection says
+                // is no longer about the worker.
+                return Ok((None, report));
+            };
+            if inspected
+                .as_ref()
+                .is_some_and(|answer| policy::answers_room(answer.admission.as_ref()))
+            {
+                // Only this inspect can clear an earlier refusal. A refusal
+                // while driving below must wait for the next inspect.
+                self.capacity_refused
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&worker_id);
+            }
         }
         let received = crate::platform::monotonic_ms();
         let received_boot = crate::platform::boot_id();
@@ -948,7 +1136,8 @@ impl Coordinator {
             }
         }
         // The worker's live attempts, one page in memory at a time. The tick
-        // holds the actor, and it places on this worker only after this walk.
+        // is the only placer, and it places on this worker only after this
+        // walk.
         let mut after = None;
         loop {
             let page = self.live_page(&worker_id, after).await?;
@@ -957,26 +1146,34 @@ impl Coordinator {
             // A short page is the end: the cursor is stable, so a row that
             // would arrive behind it is not part of this walk either way.
             let last_page = page.len() < PAGE_MAX as usize;
-            for (_, l) in page {
-                if inspected.is_none() {
+            if inspected.is_none() {
+                let Some(_actor) = self.answered(&worker_id, &asked).await? else {
+                    return Ok((None, report));
+                };
+                for (_, l) in page {
                     self.unknown(&l.record.attempt_id, &mut report).await?;
-                    continue;
                 }
-                // Another worker may have said that this coordinator is replaced.
-                self.check_fenced()?;
-                self.drive(&budgeted, l, &mut report).await?;
+            } else {
+                for (_, l) in page {
+                    // Another worker may have said that this coordinator is replaced.
+                    self.check_fenced()?;
+                    self.drive(&budgeted, l, &mut report, &asked).await?;
+                }
             }
             if last_page {
                 break;
             }
         }
         let Some(inspected) = inspected else {
+            self.mark_silent(&worker_id, true);
             return Ok((None, report));
         };
         if Instant::now() >= deadline {
             // It used up its time: nothing new goes there in this tick.
+            self.mark_silent(&worker_id, true);
             return Ok((None, report));
         }
+        self.mark_silent(&worker_id, false);
         let reached = Reached {
             capabilities: inspected.capabilities,
             worker_id,
@@ -1129,6 +1326,7 @@ impl Coordinator {
         link: &dyn WorkerLink,
         live: LiveAttempt,
         report: &mut TickReport,
+        asked: &Attached,
     ) -> Result<()> {
         let a = &live.record;
         let facts = Facts {
@@ -1140,18 +1338,27 @@ impl Coordinator {
             retire_requested: live.retire_reason.is_some(),
         };
         let (answer, status) = self.ask(link, a).await;
-        match (policy::next_step(facts, answer), status) {
+        let step = policy::next_step(facts, answer);
+        match step {
+            // These ask the worker first, and apply what it says themselves.
+            Step::Retire => return self.retire(link, &live, report, asked).await,
+            Step::Cancel => return self.cancel(link, a, status, report, asked).await,
+            Step::Submit => return self.submit(link, &live, report, asked).await.map(|_| ()),
+            _ => {}
+        }
+        let Some(actor) = self.answered(&a.worker_id, asked).await? else {
+            return Ok(());
+        };
+        match (step, status) {
             (Step::KeepUnknown, _) => self.unknown(&a.attempt_id, report).await,
-            (Step::Retire, _) => self.retire(link, &live, report).await,
-            (Step::Cancel, status) => self.cancel(link, a, status, report).await,
             (Step::SettleCancelled, _) => {
                 self.settle_here(&a.attempt_id, cancelled(), report).await
             }
-            (Step::Submit, _) => self.submit(link, &live, report).await.map(|_| ()),
             (Step::Settle, Some(status)) => self.mirror(&status, report).await,
             (Step::Follow, Some(status)) => {
                 self.mirror(&status, report).await?;
-                self.renew(link, a, status.state, report).await?;
+                drop(actor);
+                self.renew(link, a, status.state, report, asked).await?;
                 if !matches!(
                     status.state,
                     AttemptState::Cancelling | AttemptState::Finalizing
@@ -1160,6 +1367,7 @@ impl Coordinator {
                 }
                 Ok(())
             }
+            (Step::Retire | Step::Cancel | Step::Submit, _) => Ok(()),
             // A step that needs a status always comes with one; without it
             // nothing is known.
             (Step::Settle | Step::Follow, None) => self.unknown(&a.attempt_id, report).await,
@@ -1174,6 +1382,7 @@ impl Coordinator {
         link: &dyn WorkerLink,
         live: &LiveAttempt,
         report: &mut TickReport,
+        asked: &Attached,
     ) -> Result<Sent> {
         let a = &live.record;
         let payload: Option<AttemptPayload> = live
@@ -1184,6 +1393,9 @@ impl Coordinator {
             SubmitAttemptRequest::new(RequestId::generate(), self.epoch(), a.attempt_id.clone(), p)
                 .ok()
         });
+        let Some(actor) = self.answered(&a.worker_id, asked).await? else {
+            return Ok(Sent::NotTaken);
+        };
         let Some(request) = request.filter(|r| r.payload_hash == a.payload_hash) else {
             // Fail closed: what would be sent is not what was decided.
             self.note(&a.attempt_id, "submit_payload_mismatch", Value::Null)
@@ -1201,7 +1413,12 @@ impl Coordinator {
         // send all the same.
         let id = a.attempt_id.clone();
         let sends_before = self.db(move |s| s.count_submit_send(&id)).await?;
-        match link.call(Request::SubmitAttempt(request)).await {
+        drop(actor);
+        let answer = link.call(Request::SubmitAttempt(request)).await;
+        let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
+            return Ok(Sent::NotTaken);
+        };
+        match answer {
             Ok(Response::SubmitAttempt(r))
                 if r.attempt_id == a.attempt_id && r.generation == a.generation =>
             {
@@ -1362,8 +1579,12 @@ impl Coordinator {
         a: &AttemptRecord,
         status: Option<AttemptStatus>,
         report: &mut TickReport,
+        asked: &Attached,
     ) -> Result<()> {
         if let Some(status) = &status {
+            let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
+                return Ok(());
+            };
             self.mirror(status, report).await?;
         }
         let request = Request::CancelAttempt(CancelAttemptRequest {
@@ -1374,7 +1595,14 @@ impl Coordinator {
             generation: a.generation,
             reason: None,
         });
-        match link.call(request).await {
+        let answer = link.call(request).await;
+        if matches!(&answer, Err(LinkError::Remote(e)) if e.code == ErrorCode::StaleEpoch) {
+            return Err(self.fence());
+        }
+        let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
+            return Ok(());
+        };
+        match answer {
             Ok(Response::CancelAttempt(_)) => {
                 self.observe(&a.attempt_id, Observation::Known).await?;
                 Ok(())
@@ -1393,6 +1621,7 @@ impl Coordinator {
         link: &dyn WorkerLink,
         live: &LiveAttempt,
         report: &mut TickReport,
+        asked: &Attached,
     ) -> Result<()> {
         let a = &live.record;
         let request = Request::RetireAttempt(RetireAttemptRequest {
@@ -1410,10 +1639,18 @@ impl Coordinator {
                 return Err(self.fence())
             }
             Err(LinkError::Remote(e)) => {
+                let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
+                    return Ok(());
+                };
                 let payload = json!({"code": e.code.to_string()});
                 return self.note(&a.attempt_id, "retire_refused", payload).await;
             }
-            _ => return self.unknown(&a.attempt_id, report).await,
+            _ => {
+                let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
+                    return Ok(());
+                };
+                return self.unknown(&a.attempt_id, report).await;
+            }
         };
         // A worker that says the attempt is over is asked how it ended: the
         // word of the answer alone never frees the task.
@@ -1421,6 +1658,9 @@ impl Coordinator {
             (Ended::Unknown, None)
         } else {
             self.ended(link, a).await
+        };
+        let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
+            return Ok(());
         };
         match (policy::retire_verdict(status, ended), seen) {
             (RetireVerdict::Confirmed, _) => {
@@ -1472,6 +1712,7 @@ impl Coordinator {
         a: &AttemptRecord,
         state: AttemptState,
         report: &mut TickReport,
+        asked: &Attached,
     ) -> Result<()> {
         if matches!(state, AttemptState::Cancelling | AttemptState::Finalizing) {
             return Ok(());
@@ -1489,7 +1730,12 @@ impl Coordinator {
             Err(LinkError::Remote(e)) if e.code == ErrorCode::StaleEpoch => Err(self.fence()),
             // Renewed, or not renewable any more: the next look says why.
             Ok(_) | Err(LinkError::Remote(_)) => Ok(()),
-            Err(LinkError::Unconfirmed) => self.unknown(&a.attempt_id, report).await,
+            Err(LinkError::Unconfirmed) => {
+                let Some(_actor) = self.answered(&a.worker_id, asked).await? else {
+                    return Ok(());
+                };
+                self.unknown(&a.attempt_id, report).await
+            }
         }
     }
 
@@ -1502,24 +1748,10 @@ impl Coordinator {
     /// rest of the tick.
     async fn dispatch(
         &self,
-        known: BTreeSet<WorkerId>,
-        reached: Vec<Reached>,
+        round: &mut Round,
         report: &mut TickReport,
         telemetry: &Mutex<Vec<preparation::RawPage>>,
     ) -> Result<()> {
-        let mut round = Round {
-            out: BTreeMap::new(),
-            open: Vec::new(),
-            known,
-            deadline: self.deadline(),
-        };
-        let answered: BTreeSet<WorkerId> = reached.iter().map(|w| w.worker_id.clone()).collect();
-        for missing in round.known.difference(&answered) {
-            round.out.insert(missing.clone(), Exclusion::Unreached);
-        }
-        for worker in reached {
-            round.admit(worker);
-        }
         // Tasks every attached worker is excluded for come last: however
         // many of them wait, they do not fill the scan in front of a task
         // that can be placed. A worker that is attached later is not
@@ -1570,7 +1802,7 @@ impl Coordinator {
         let page_len = queued.len();
         let mut processed = 0;
         for task in queued {
-            self.join_newcomers(&mut round, report, telemetry).await?;
+            self.join_newcomers(round, report, telemetry).await?;
             let evaluated: Vec<_> = round
                 .open
                 .iter()
@@ -1588,7 +1820,7 @@ impl Coordinator {
                         .then(|| (Arc::clone(&w.link), snapshot.generation))
                 })
                 .collect();
-            self.place_one(&task, &mut round, report).await?;
+            self.place_one(&task, round, report).await?;
             for (link, generation) in evaluated {
                 link.inputs_evaluated(generation, &task.run_id);
             }
@@ -2221,6 +2453,7 @@ impl Coordinator {
         attempt_id: &AttemptId,
         report: &mut TickReport,
     ) -> Result<Sent> {
+        let asked = self.attached_now(worker_id);
         let (w, a) = (worker_id.clone(), attempt_id.clone());
         let Some(placed) = self.db(move |s| s.live_attempt(&w, &a)).await? else {
             return Ok(Sent::NotTaken);
@@ -2233,7 +2466,7 @@ impl Coordinator {
         if !policy::may_send(facts) {
             return Ok(Sent::Withheld);
         }
-        self.submit(link, &placed, report).await
+        self.submit(link, &placed, report, &asked).await
     }
 
     /// A queued task no payload can be made for stays queued and is passed
