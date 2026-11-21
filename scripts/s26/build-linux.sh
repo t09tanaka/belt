@@ -13,12 +13,12 @@ mkdir -p "$S26_BASE/linux-cache"
 build() {
     # shellcheck disable=SC2016 # expanded by the container shell
     "$TTC" exec -- docker run --rm --platform linux/arm64 \
-        --mount "type=bind,source=$1,target=/src,readonly" \
+        --mount "type=bind,source=$1,target=/src/$2,readonly" \
         --mount "type=bind,source=$S26_BASE,target=/cache" \
         -e CARGO_HOME=/cache/linux-cache/cargo \
         -e CARGO_TARGET_DIR=/cache/linux-cache/target \
         -e S26_OUTPUT="$2" \
-        -w /src rust:1.93.0-bookworm bash -euo pipefail -c '
+        -w "/src/$2" rust:1.93.0-bookworm bash -euo pipefail -c '
             cargo build --locked --release --target aarch64-unknown-linux-gnu -p belt-cli --bin belt
             cp /cache/linux-cache/target/aarch64-unknown-linux-gnu/release/belt "/cache/$S26_OUTPUT.tmp"
             chmod 755 "/cache/$S26_OUTPUT.tmp"
@@ -34,9 +34,14 @@ case "${1:-}" in
         ref=${2:?usage: build-linux.sh --upgrade <git ref>}
         python3 "$S26_ROOT/scripts/s26/harness.py" variants "$ref"
         src="$S26_BASE/linux-cache/src"
-        build "$src/n" belt-linux-aarch64
-        build "$src/n1" belt-linux-aarch64-n1
-        build "$src/n1-broken" belt-linux-aarch64-n1-broken
+        # The exports share one target directory, and Cargo fingerprints a path
+        # package by its place in the workspace and by mtime, not by where it
+        # sits: without a fresh mtime, the next export looks already built.
+        for v in n:belt-linux-aarch64 n1:belt-linux-aarch64-n1 \
+            n1-broken:belt-linux-aarch64-n1-broken; do
+            find "$src/${v%%:*}" -type f -exec touch {} +
+            build "$src/${v%%:*}" "${v#*:}"
+        done
         # The upgrade names versions by the binary's SHA-256.
         shasum -a 256 "$S26_BASE"/belt-linux-aarch64 "$S26_BASE"/belt-linux-aarch64-n1 \
             "$S26_BASE"/belt-linux-aarch64-n1-broken

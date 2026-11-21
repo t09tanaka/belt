@@ -707,7 +707,8 @@ kill -s CONT "$pid"
                     time.sleep(0.3)
             if answer is None:
                 raise RuntimeError("the version on trial gave no OVERLOADED answer within 8s")
-            if '"cancelled"' in json.dumps(self.m1_belt("show", own)):
+            held_for = time.monotonic() - held
+            if self.m1_belt("show", own)["task"]["cancel_requested_at_ms"] is not None:
                 raise RuntimeError("the refused cancel was saved")
         finally:
             if pid:
@@ -717,10 +718,15 @@ kill -s CONT "$pid"
             raise RuntimeError(f"upgrade after the held trial exited {code}: {tail}")
         if self.m1_link() != digests[key]:
             raise RuntimeError("the held upgrade did not commit")
-        self.m1_belt("cancel", own)
-        until("m1's run cancelled after the commit",
-              lambda: '"cancelled"' in json.dumps(self.m1_belt("show", own)), 60)
-        return (f"during the held trial m1 refused its own cancel with OVERLOADED ({answer!r}); "
+        # The run was never placed, so the cancel settles it at once.
+        result = self.m1_belt("cancel", own)
+        task = self.m1_belt("show", own)
+        if not (result.get("cancel_requested") and result.get("stop_confirmed")
+                and task["task"]["cancel_requested_at_ms"] is not None
+                and not task["attempts"]["items"]):
+            raise RuntimeError(f"the cancel after the commit did not take effect: {result} {task}")
+        return (f"during a trial held open {held_for:.0f}s m1 refused its own cancel with "
+                f"OVERLOADED ({answer!r}) and saved nothing; "
                 "after the commit the same cancel took effect. A host cancel of a run on m1 "
                 "cannot arise during a trial (the upgrade drains m1 first)")
 
@@ -809,7 +815,9 @@ def variants():
         (out / name).mkdir(parents=True)
         archive = subprocess.run(["git", "-C", str(ROOT), "archive", "--format=tar", commit],
                                  stdout=subprocess.PIPE, check=True).stdout
-        subprocess.run(["tar", "-x", "-C", str(out / name)], input=archive, check=True)
+        # tar would keep the commit time; Cargo compares mtimes with its last
+        # build, so an export of an older commit could look already built.
+        subprocess.run(["tar", "-x", "-m", "-C", str(out / name)], input=archive, check=True)
 
     def patch(path, old, new):
         text = path.read_text()
