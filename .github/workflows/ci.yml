@@ -14,7 +14,7 @@ env:
 
 jobs:
   test:
-    name: fmt, clippy, test (${{ matrix.os }})
+    name: fmt, clippy, test (${{ matrix.os }}, ${{ matrix.partition }})
     runs-on: ${{ matrix.os }}
     env:
       # The test binaries need line tables for backtraces, not full debug
@@ -24,8 +24,18 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     strategy:
       fail-fast: false
+      # The macOS runner has fewer cores, and each test runs about three
+      # times slower there (git, fsync and process start), so the macOS
+      # suite is split over two jobs. `hash:K/N` still runs every test
+      # exactly once across the partitions.
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            partition: hash:1/1
+          - os: macos-latest
+            partition: hash:1/2
+          - os: macos-latest
+            partition: hash:2/2
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -76,7 +86,7 @@ jobs:
           # the same for the task-traffic-controller CLI a step calls
           BELT_REQUIRE_TTC_CLI: "1"
         # every failing test is listed in one run; a failure still fails the job
-        run: cargo nextest run --workspace --all-targets --no-fail-fast
+        run: cargo nextest run --workspace --all-targets --no-fail-fast --partition ${{ matrix.partition }}
 
   msrv:
     name: MSRV (1.89)
