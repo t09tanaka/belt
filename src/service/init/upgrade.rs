@@ -41,6 +41,9 @@ pub struct Options {
     pub wait: Duration,
     /// From the record of the trial to the guard's rollback.
     pub deadline: Duration,
+    /// An interrupt (SIGINT) while accepted work finishes lifts the hold and
+    /// switches nothing. Only the CLI, which installs the handler, sets it.
+    pub interruptible: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -455,7 +458,7 @@ pub fn begin<L: Launcher>(
     current_exe: &Path,
     launcher: &mut L,
     options: Options,
-    now_ms: u64,
+    clock: &dyn Fn() -> u64,
 ) -> anyhow::Result<Trial> {
     let initial = Paths::resolve_for(env, launcher.backend())?;
     let init_lock = resident::secure_file(&initial.config.join("init.lock"), true)
@@ -467,6 +470,8 @@ pub fn begin<L: Launcher>(
         !initial.config.join("membership-undo.json").try_exists()?,
         "membership undo is still pending"
     );
+    // Before the live files are read: they may be the new version's.
+    let unwatched = recover_unwatched(&initial, launcher)?;
     let spec = bootstrap::read_input(&initial.input).context("resident input unavailable")?;
     let (from, paths) = managed_journal(&spec)?;
     ensure!(
@@ -477,21 +482,43 @@ pub fn begin<L: Launcher>(
         read_record(&paths)?.is_none(),
         "an earlier upgrade is still in trial; it is committed or rolled back by its deadline, then run upgrade again"
     );
+    let recovered = match unwatched {
+        Some(note) => Some(note),
+        None => lift_orphaned_hold(&paths)?,
+    };
     let to = ws::sha256_file(current_exe)?;
-    ensure!(
-        to != from.binary_hash,
-        "this machine already runs version {to}"
-    );
+    if to == from.binary_hash {
+        match recovered {
+            Some(note) => anyhow::bail!("this machine already runs version {to}; {note}"),
+            None => anyhow::bail!("this machine already runs version {to}"),
+        }
+    }
+    if let Some(note) = recovered {
+        let _ = writeln!(std::io::stderr(), "note: {note}");
+    }
     control::hold(&paths.worker)?;
+    // From the hold to the record an interrupt is only noted, so that the
+    // hold is lifted on the way out rather than left behind.
+    let held = options
+        .interruptible
+        .then(crate::service::workers::warmup::interrupt::Held::new);
+    let interrupted = || held.is_some() && crate::service::workers::warmup::interrupt::requested();
     let prepared = (|| -> anyhow::Result<()> {
         let live = ws::live_attempts(&paths.worker)?;
         if ws::wait_until_idle(
-            || ws::live_attempts(&paths.worker),
+            || {
+                ensure!(!interrupted(), "interrupted");
+                ws::live_attempts(&paths.worker)
+            },
             options.wait,
             Duration::from_millis(250),
         )
         .is_err()
         {
+            ensure!(
+                !interrupted(),
+                "interrupted while accepted work finished; nothing was switched"
+            );
             anyhow::bail!("{live} attempt(s) are still live after waiting; nothing was switched");
         }
         let placed = ws::place_binary_with(
@@ -504,7 +531,9 @@ pub fn begin<L: Launcher>(
             placed == retargeted(&paths, &from, &to).spec.executable,
             "the version directory is not where the resident's binaries are"
         );
-        identity_checked(&paths, &from)
+        identity_checked(&paths, &from)?;
+        ensure!(!interrupted(), "interrupted; nothing was switched");
+        Ok(())
     })();
     if let Err(error) = prepared {
         control::lift_hold(&paths.worker)?;
@@ -514,7 +543,7 @@ pub fn begin<L: Launcher>(
         schema: 1,
         from: from.binary_hash.clone(),
         to: to.clone(),
-        deadline_ms: now_ms.saturating_add(options.deadline.as_millis() as u64),
+        deadline_ms: 0,
         backed_up: false,
         phase: Phase::Trial,
     };
@@ -523,9 +552,13 @@ pub fn begin<L: Launcher>(
         private_dir_with(&upgrade_dir(&paths), &mut NativeDurability)?;
         wsu::copy_private(&paths.journal, &kept(&paths, KEPT_JOURNAL))?;
         wsu::copy_private(&paths.input, &kept(&paths, KEPT_INPUT))?;
+        // The trial's window opens here, after the wait for accepted work,
+        // however long that took.
+        record.deadline_ms = clock().saturating_add(options.deadline.as_millis() as u64);
         write_record(&paths, &record)?;
         Ok(lock)
     })();
+    drop(held);
     // Without a record there is no trial and no guard: nothing else would
     // ever lift the hold.
     let lock = match recorded {
@@ -665,15 +698,10 @@ pub fn upgrade<L: Launcher>(
     current_exe: &Path,
     launcher: &mut L,
     options: Options,
+    clock: &dyn Fn() -> u64,
     health: &mut dyn FnMut(&Spec, &mut L) -> anyhow::Result<()>,
 ) -> anyhow::Result<Upgraded> {
-    let trial = begin(
-        env,
-        current_exe,
-        launcher,
-        options,
-        crate::platform::wall_ms(),
-    )?;
+    let trial = begin(env, current_exe, launcher, options, clock)?;
     if let Err(error) = health(&trial.spec, launcher) {
         return Err(trial.abandon(
             launcher,
@@ -690,22 +718,11 @@ pub fn guard_tick<L: Launcher>(
     launcher: &mut L,
     now_ms: u64,
 ) -> anyhow::Result<bool> {
-    // The kept journal is what this (the previous) version wrote; the live
-    // files may be the new version's, which this one need not read.
-    let kept_journal = config.join("upgrade").join(KEPT_JOURNAL);
-    let from = if kept_journal.try_exists()? {
-        read_journal(&kept_journal)?
-    } else {
-        read_journal(&config.join("init.json"))?
-    };
-    let mut paths = Paths::resolve_for(&from.spec.env, from.backend())?;
-    ensure!(
-        paths.config == config,
-        "the guard belongs to another member"
-    );
-    paths.key = from.spec.cluster_key_path.clone();
-    let named = from.plist.clone().context("service receipt missing")?;
-    let guard = guard_plan(&paths, &from)?;
+    let Watch {
+        paths,
+        named,
+        guard,
+    } = watch(config)?;
     let record = {
         let _lock = upgrade_lock(&paths)?;
         read_record(&paths)?
@@ -732,6 +749,83 @@ pub fn guard_tick<L: Launcher>(
             Ok(true)
         }
     }
+}
+
+/// What the guard watches with: the paths and service names of the version
+/// the trial began from.
+struct Watch {
+    paths: Paths,
+    named: macos::Receipt,
+    guard: macos::policy::Plan,
+}
+
+fn watch(config: &Path) -> anyhow::Result<Watch> {
+    // The kept journal is what this (the previous) version wrote; the live
+    // files may be the new version's, which this one need not read.
+    let kept_journal = config.join("upgrade").join(KEPT_JOURNAL);
+    let from = if kept_journal.try_exists()? {
+        read_journal(&kept_journal)?
+    } else {
+        read_journal(&config.join("init.json"))?
+    };
+    let mut paths = Paths::resolve_for(&from.spec.env, from.backend())?;
+    ensure!(
+        paths.config == config,
+        "the guard belongs to another member"
+    );
+    paths.key = from.spec.cluster_key_path.clone();
+    let named = from.plist.clone().context("service receipt missing")?;
+    let guard = guard_plan(&paths, &from)?;
+    Ok(Watch {
+        paths,
+        named,
+        guard,
+    })
+}
+
+/// A trial record that no guard watches: the CLI died after the record and
+/// before its guard was confirmed. The caller holds `init.lock`, so no
+/// upgrade is between those two steps now, and nothing else would ever roll
+/// it back; it is rolled back here, the way the guard does.
+fn recover_unwatched<L: Launcher>(
+    initial: &Paths,
+    launcher: &mut L,
+) -> anyhow::Result<Option<&'static str>> {
+    if read_record(initial)?.is_none() {
+        return Ok(None);
+    }
+    let Watch {
+        paths,
+        named,
+        guard,
+    } = watch(&initial.config)?;
+    if launcher.loaded_state(&guard, &named) != LoadedState::Absent {
+        // Watched (or not known): the guard decides by the deadline.
+        return Ok(None);
+    }
+    rollback(&paths, launcher)?;
+    remove_guard(&paths, &guard, &named, launcher)?;
+    forget(&paths)?;
+    Ok(Some(
+        "an earlier upgrade was left in trial with no guard; it is rolled back with both databases",
+    ))
+}
+
+/// A hold, or a trial marker, with no record: an upgrade was cut short
+/// before its record (or after its commit or rollback removed it). The
+/// caller holds `init.lock`, so no upgrade owns it; it is lifted here.
+fn lift_orphaned_hold(paths: &Paths) -> anyhow::Result<Option<&'static str>> {
+    if !control::held(&paths.worker) && !control::in_trial(&paths.worker) {
+        return Ok(None);
+    }
+    let _lock = upgrade_lock(paths)?;
+    if read_record(paths)?.is_some() {
+        return Ok(None);
+    }
+    finish(paths)?;
+    Ok(Some(
+        "the upgrade hold an interrupted upgrade left is lifted",
+    ))
 }
 
 /// `upgrade-guard --config <dir>`: run by the service manager until the
@@ -803,6 +897,9 @@ pub fn command(binary: Option<&Path>, json: bool) -> Result<Ran, ApiError> {
     let env: BTreeMap<String, String> = std::env::vars_os()
         .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
         .collect();
+    // Ours while this upgrade runs; an interrupt outside the wait still ends
+    // the command at once.
+    let interrupt = crate::service::workers::warmup::interrupt::Guard::new();
     upgrade(
         &env,
         &current,
@@ -810,7 +907,9 @@ pub fn command(binary: Option<&Path>, json: bool) -> Result<Ran, ApiError> {
         Options {
             wait: Duration::from_secs(600),
             deadline: COMMIT_DEADLINE,
+            interruptible: interrupt.is_some(),
         },
+        &crate::platform::wall_ms,
         &mut checked,
     )
     .map(Ran::Here)

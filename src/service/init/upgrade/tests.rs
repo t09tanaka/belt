@@ -79,6 +79,7 @@ impl Fake {
 const OPTIONS: Options = Options {
     wait: Duration::ZERO,
     deadline: COMMIT_DEADLINE,
+    interruptible: false,
 };
 
 struct Host {
@@ -231,6 +232,7 @@ async fn a57_upgrade_moves_bin_resident_and_leaves_the_old_binary_untouched() {
         &h.new_exe,
         &mut fake,
         OPTIONS,
+        &|| 0,
         &mut |spec: &Spec, launcher: &mut Fake| {
             checked += 1;
             assert_eq!(spec.executable, h.exe(&h.new));
@@ -267,7 +269,15 @@ async fn a57_upgrade_moves_bin_resident_and_leaves_the_old_binary_untouched() {
     // The user's own drain outlives the commit.
     assert_eq!(control::read(&h.paths.worker).unwrap(), Control::draining());
     // The same version again is refused before anything is held.
-    let again = upgrade(&h.env, &h.new_exe, &mut fake, OPTIONS, &mut |_, _| Ok(())).unwrap_err();
+    let again = upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap_err();
     assert!(again.to_string().contains("already runs"), "{again:#}");
     assert!(!control::held(&h.paths.worker));
 }
@@ -281,6 +291,7 @@ async fn a57_health_failure_restores_both_databases_together_and_the_previous_ve
         &h.new_exe,
         &mut fake,
         OPTIONS,
+        &|| 0,
         &mut |_: &Spec, _: &mut Fake| {
             h.write_as_new_version();
             assert!(!h.own_run_open());
@@ -304,7 +315,7 @@ async fn a57_health_failure_restores_both_databases_together_and_the_previous_ve
 async fn a57_no_commit_by_the_deadline_rolls_back_without_the_new_version_answering() {
     let h = Host::new().await;
     let mut fake = h.fake.clone();
-    let trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, 1_000).unwrap();
+    let trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 1_000).unwrap();
     // The new version runs, writes, and never answers; the CLI is gone.
     h.write_as_new_version();
     let deadline = 1_000 + COMMIT_DEADLINE.as_millis() as u64;
@@ -325,7 +336,7 @@ async fn a57_no_commit_by_the_deadline_rolls_back_without_the_new_version_answer
 async fn a57_the_guard_rolls_back_files_a_newer_version_wrote_with_fields_it_does_not_know() {
     let h = Host::new().await;
     let mut fake = h.fake.clone();
-    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, 0).unwrap();
+    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0).unwrap();
     for file in [&h.paths.journal, &h.paths.input] {
         let mut value: serde_json::Value =
             serde_json::from_slice(&fs::read(file).unwrap()).unwrap();
@@ -345,7 +356,7 @@ async fn a57_the_guard_rolls_back_files_a_newer_version_wrote_with_fields_it_doe
 async fn a57_a_database_the_new_version_left_unreadable_is_still_rolled_back() {
     let h = Host::new().await;
     let mut fake = h.fake.clone();
-    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, 0).unwrap();
+    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0).unwrap();
     for database in [
         h.paths.state.join("coordinator.db"),
         h.paths.worker.join("worker.db"),
@@ -369,7 +380,7 @@ async fn a57_a_database_the_new_version_left_unreadable_is_still_rolled_back() {
 async fn a57_rollback_never_restores_under_a_version_that_does_not_stop() {
     let h = Host::new().await;
     let mut fake = h.fake.clone();
-    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, 0).unwrap();
+    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0).unwrap();
     h.write_as_new_version();
     fake.0.borrow_mut().stuck = true;
     let deadline = COMMIT_DEADLINE.as_millis() as u64;
@@ -393,7 +404,7 @@ async fn a57_rollback_never_restores_under_a_version_that_does_not_stop() {
 async fn a57_a_commit_cut_short_after_its_record_is_finished_by_the_guard() {
     let h = Host::new().await;
     let mut fake = h.fake.clone();
-    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, 0).unwrap();
+    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0).unwrap();
     // The CLI removed the record (the commit) and died at once.
     fs::remove_file(record_path(&h.paths)).unwrap();
     assert!(control::held(&h.paths.worker));
@@ -411,7 +422,7 @@ async fn a57_a_commit_cut_short_after_its_record_is_finished_by_the_guard() {
 async fn a57_workers_resume_does_not_lift_the_upgrade_hold() {
     let h = Host::new().await;
     let mut fake = h.fake.clone();
-    let trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, 0).unwrap();
+    let trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0).unwrap();
     let spec = bootstrap::read_input(&h.paths.input).unwrap();
     let store = CoordinatorStore::open_read_only(&h.paths.state).unwrap();
     let identity = macos::WorkerIdentity {
@@ -443,7 +454,15 @@ async fn a57_a_failure_before_the_switch_lifts_the_hold_and_changes_nothing() {
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
     fs::write(h.exe(&h.new), b"something else").unwrap();
     let mut fake = h.fake.clone();
-    let error = upgrade(&h.env, &h.new_exe, &mut fake, OPTIONS, &mut |_, _| Ok(())).unwrap_err();
+    let error = upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap_err();
     assert!(
         format!("{error:#}").contains("refusing to overwrite"),
         "{error:#}"
@@ -462,9 +481,142 @@ async fn a57_live_work_keeps_the_old_version_and_lifts_the_hold() {
     ws::tests::put_attempt(&db, &CoordinatorId::generate(), 3, "active");
     drop(db);
     let mut fake = h.fake.clone();
-    let error = upgrade(&h.env, &h.new_exe, &mut fake, OPTIONS, &mut |_, _| Ok(())).unwrap_err();
+    let error = upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap_err();
     assert!(format!("{error:#}").contains("still live"), "{error:#}");
     assert!(fake.0.borrow().calls.is_empty());
     assert!(!control::held(&h.paths.worker));
     assert!(!h.exe(&h.new).exists());
+}
+
+#[tokio::test]
+async fn a57_a_wait_for_work_longer_than_the_trial_window_still_reaches_health_and_commits() {
+    use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    let h = Host::new().await;
+    let db = rusqlite::Connection::open(h.paths.worker.join("worker.db")).unwrap();
+    ws::tests::put_attempt(&db, &CoordinatorId::generate(), 3, "active");
+    drop(db);
+    let now = std::sync::Arc::new(AtomicU64::new(1_000));
+    let later = 1_000 + 10 * COMMIT_DEADLINE.as_millis() as u64;
+    // The work finishes after far longer than the trial window, by this clock.
+    let finisher = {
+        let (now, database) = (now.clone(), h.paths.worker.join("worker.db"));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            now.store(later, SeqCst);
+            rusqlite::Connection::open(database)
+                .unwrap()
+                .execute(
+                    "UPDATE worker_attempt SET state = 'terminal', termination_json = '{}', terminal_at_ms = 2 WHERE state = 'active'",
+                    [],
+                )
+                .unwrap();
+        })
+    };
+    let clock = move || now.load(SeqCst);
+    let mut fake = h.fake.clone();
+    let mut checked = 0;
+    let options = Options {
+        wait: Duration::from_secs(10),
+        ..OPTIONS
+    };
+    let upgraded = upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        options,
+        &clock,
+        &mut |_: &Spec, launcher: &mut Fake| {
+            checked += 1;
+            // The guard, looking now, finds the trial within its window.
+            assert!(!guard_tick(&h.paths.config, launcher, clock()).unwrap());
+            Ok(())
+        },
+    )
+    .unwrap();
+    finisher.join().unwrap();
+    assert_eq!(checked, 1);
+    assert_eq!(upgraded.to, h.new);
+    assert_eq!(h.resident_link(), Path::new(&h.new));
+    h.assert_finished();
+}
+
+#[tokio::test]
+async fn a57_a_hold_left_without_a_record_is_lifted_by_the_next_upgrade_of_any_build() {
+    let h = Host::new().await;
+    let mut fake = h.fake.clone();
+    // The CLI was killed while it waited: a hold, nothing else.
+    control::hold(&h.paths.worker).unwrap();
+    let same = h.exe(&h.old);
+    let error = upgrade(&h.env, &same, &mut fake, OPTIONS, &|| 0, &mut |_, _| Ok(())).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("already runs") && text.contains("hold") && text.contains("lifted"),
+        "{text}"
+    );
+    assert!(!control::held(&h.paths.worker));
+    assert!(fake.0.borrow().calls.is_empty());
+    // Cut short after a trial marker too: the next upgrade lifts both and runs.
+    control::hold(&h.paths.worker).unwrap();
+    control::begin_trial(&h.paths.worker).unwrap();
+    upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        OPTIONS,
+        &|| 0,
+        &mut |_, _| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(h.resident_link(), Path::new(&h.new));
+    h.assert_finished();
+}
+
+#[tokio::test]
+async fn a57_a_trial_record_whose_guard_never_ran_is_rolled_back_by_the_next_upgrade() {
+    let h = Host::new().await;
+    let mut fake = h.fake.clone();
+    // The CLI died after the record and before the guard: nothing switched.
+    control::hold(&h.paths.worker).unwrap();
+    private_dir_with(&upgrade_dir(&h.paths), &mut NativeDurability).unwrap();
+    wsu::copy_private(&h.paths.journal, &kept(&h.paths, KEPT_JOURNAL)).unwrap();
+    wsu::copy_private(&h.paths.input, &kept(&h.paths, KEPT_INPUT)).unwrap();
+    let record = Record {
+        schema: 1,
+        from: h.old.clone(),
+        to: h.new.clone(),
+        deadline_ms: u64::MAX,
+        backed_up: false,
+        phase: Phase::Trial,
+    };
+    write_record(&h.paths, &record).unwrap();
+    let same = h.exe(&h.old);
+    let error = upgrade(&h.env, &same, &mut fake, OPTIONS, &|| 0, &mut |_, _| Ok(())).unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("already runs") && text.contains("no guard"),
+        "{text}"
+    );
+    h.assert_old_version_back();
+}
+
+#[tokio::test]
+async fn a57_a_switched_trial_whose_guard_is_gone_is_rolled_back_by_the_next_upgrade() {
+    let h = Host::new().await;
+    let mut fake = h.fake.clone();
+    let _trial = begin(&h.env, &h.new_exe, &mut fake, OPTIONS, &|| 0).unwrap();
+    h.write_as_new_version();
+    // The guard is gone and the CLI with it; the deadline is far ahead.
+    fake.0.borrow_mut().loaded.remove(&h.guard);
+    let same = h.exe(&h.old);
+    let error = upgrade(&h.env, &same, &mut fake, OPTIONS, &|| 0, &mut |_, _| Ok(())).unwrap_err();
+    assert!(format!("{error:#}").contains("no guard"), "{error:#}");
+    h.assert_old_version_back();
 }
