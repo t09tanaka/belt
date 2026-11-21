@@ -346,3 +346,43 @@ fn takeover_name_mismatch_refuses_before_stopping() {
     assert_eq!(fs::read(h.paths().journal).unwrap(), before);
     assert_eq!(h.fake.0.borrow().calls.len(), calls);
 }
+
+#[test]
+fn initialized_same_group_enrollment_keeps_current_next_and_records_on_mismatch() {
+    let mut h = initialized("target");
+    let spec = spec(&h);
+    let store = WorkerStore::open(&spec.worker_state_dir, &spec.worker_id).unwrap();
+    let current = crate::secrets::key::load(&spec.cluster_key_path).unwrap();
+    store
+        .observe_group_key(&crate::group::fingerprint(&current))
+        .unwrap();
+    let next_path = crate::group::next_key_path(&spec.cluster_key_path);
+    let next = crate::secrets::key::init(&next_path).unwrap();
+    store
+        .set_next_group_key(&crate::storage::KeyGeneration {
+            generation: 2,
+            fingerprint: crate::group::fingerprint(&next),
+        })
+        .unwrap();
+    let records = store.group_keys().unwrap();
+    let before = snapshot(&h);
+    let next_before = fs::read(&next_path).unwrap();
+    h.request.cluster = spec.expected_cluster.unwrap();
+    h.request.worker_id = spec.worker_id;
+    h.request.key_file_text = "ab".repeat(32) + "\n";
+    h.request.membership = Some(Membership {
+        caller_name: WorkerId::parse("caller").unwrap(),
+        caller_id: CoordinatorId::generate(),
+        move_group: false,
+        join_singleton: false,
+        install: false,
+    });
+    let error = h.install().unwrap_err();
+    assert!(
+        error.to_string().contains("belt group send-key <member>"),
+        "{error}"
+    );
+    assert_eq!(snapshot(&h), before);
+    assert_eq!(fs::read(next_path).unwrap(), next_before);
+    assert_eq!(store.group_keys().unwrap(), records);
+}

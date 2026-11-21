@@ -246,6 +246,10 @@ impl CoordinatorStore {
         let n = name.to_string();
         let ssh = ssh.map(str::to_owned);
         self.db.write(move |tx| {
+            if !tx.column_exists(None, "removed_member", "ssh")? {
+                tx.execute("INSERT OR IGNORE INTO removed_member (name, removed_at_ms) VALUES (?1, ?2)", params![n, to_i64(at_ms)?])?;
+                return Ok(());
+            }
             tx.execute(
                 "INSERT INTO removed_member (name, removed_at_ms, ssh) VALUES (?1, ?2, ?3) ON CONFLICT(name) DO UPDATE SET ssh=coalesce(excluded.ssh, removed_member.ssh)",
                 params![n, to_i64(at_ms)?, ssh],
@@ -257,8 +261,11 @@ impl CoordinatorStore {
     /// The removed members still remembered, by name.
     pub fn removed_members(&self) -> Result<Vec<(String, u64, Option<String>)>> {
         self.db.call(|c| {
-            let mut s =
-                c.prepare("SELECT name, removed_at_ms, ssh FROM removed_member ORDER BY name")?;
+            let mut s = c.prepare(if c.column_exists(None, "removed_member", "ssh")? {
+                "SELECT name, removed_at_ms, ssh FROM removed_member ORDER BY name"
+            } else {
+                "SELECT name, removed_at_ms, NULL FROM removed_member ORDER BY name"
+            })?;
             let rows = s.query_map([], |r| {
                 Ok((
                     r.get::<_, String>(0)?,

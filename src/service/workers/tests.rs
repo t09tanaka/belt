@@ -2855,3 +2855,19 @@ fn membership_move_refuses_foreign_live_attempts_and_uncollected_results() {
 }
 
 mod rotate;
+
+#[test]
+fn removing_workers_preserves_full_subtables_and_rejects_ambiguous_split() {
+    let text = "[[workers]]\nid = 'keep'\nssh = 'keep'\n[workers.extra]\na = 'kept'\n[[workers.jobs]]\nname = 'kept-job'\n[[workers]]\nid = 'remove'\nssh = 'remove'\n[workers.extra]\nb = 'removed'\n[[workers.jobs]]\nname = 'removed-job'\n";
+    let edited = drop_worker_tables(text, &["remove".into()]).unwrap();
+    assert!(edited.contains("kept-job"));
+    assert!(!edited.contains("removed"));
+    // A quoted subtable header is valid TOML but outside the splitter's grammar.
+    let crafted = text.replace("[workers.extra]", "[workers . extra]");
+    assert!(drop_worker_tables(&crafted, &["remove".into()]).is_err());
+    let world = World::new();
+    let path = user_config_path(&world.env).unwrap();
+    fs::write(&path, &crafted).unwrap();
+    assert!(remove_registrations(&world.env, &["remove".into()]).is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), crafted);
+}

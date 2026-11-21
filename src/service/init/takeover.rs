@@ -26,6 +26,7 @@ struct Undo {
     stage_dirs: Vec<PathBuf>,
     binary_permissions: Option<(PathBuf, fs::Permissions)>,
     created_parents: Vec<PathBuf>,
+    resident_target: Option<PathBuf>,
 }
 impl Undo {
     fn prepare(paths: &Paths, digest: &str) -> anyhow::Result<Self> {
@@ -73,6 +74,13 @@ impl Undo {
                 roots.push(path);
             }
         }
+        let mut stage_dirs = stage_dirs;
+        stage_dirs.push(paths.config.join("bin"));
+        let resident_target = match fs::read_link(paths.config.join("bin/resident")) {
+            Ok(target) => Some(target),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e.into()),
+        };
         let stages = stages(&stage_dirs)?;
         Ok(Self {
             roots,
@@ -80,6 +88,7 @@ impl Undo {
             stage_dirs,
             binary_permissions,
             created_parents,
+            resident_target,
         })
     }
     fn restore(&self, paths: &Paths) -> anyhow::Result<()> {
@@ -93,6 +102,27 @@ impl Undo {
         }
         for stage in stages(&self.stage_dirs)?.difference(&self.stages) {
             fs::remove_file(stage)?;
+        }
+        let bin = paths.config.join("bin");
+        let temporary = bin.join(format!(".resident.{}", std::process::id()));
+        match fs::remove_file(temporary) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let link = paths.config.join("bin/resident");
+        if fs::read_link(&link).ok() != self.resident_target {
+            match fs::remove_file(&link) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            if let Some(target) = &self.resident_target {
+                std::os::unix::fs::symlink(target, &link)?;
+            }
+        }
+        if bin.try_exists()? {
+            File::open(&bin)?.sync_all()?;
         }
         for path in &self.roots {
             if path.try_exists()? {
@@ -121,11 +151,9 @@ fn stages(dirs: &[PathBuf]) -> anyhow::Result<BTreeSet<PathBuf>> {
         if dir.try_exists()? {
             for entry in fs::read_dir(dir)? {
                 let entry = entry?;
-                if entry
-                    .file_name()
-                    .to_str()
-                    .is_some_and(|s| s.starts_with(".init-"))
-                {
+                if entry.file_name().to_str().is_some_and(|s| {
+                    s.starts_with(".init-") || s == format!(".resident.{}", std::process::id())
+                }) {
                     paths.insert(entry.path());
                 }
             }
@@ -209,6 +237,9 @@ pub(super) async fn initialize<L: Launcher>(
             .open(worker.state.join("agent.lock"))?;
         owner.try_lock()?;
         drained(&worker, &enrollment)?;
+        // `worker --stdio` only connects to agent.sock (run_worker_stdio);
+        // it never starts an agent. The switch lock excludes service helpers
+        // throughout this gap until the combined resident acquires agent.lock.
         drop(owner);
         // Init receipts require private files; the worker installer uses 0755.
         // Preserve the inode and bytes, and restore the mode on rollback.
@@ -290,6 +321,37 @@ pub(super) async fn initialize<L: Launcher>(
                     "{error}; worker takeover rollback failed: {rollback}"
                 )),
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rollback_restores_resident_link_and_removes_its_stage() {
+        for old in [None, Some("previous-digest")] {
+            let dir = crate::test_tmp::tempdir().unwrap();
+            let env = BTreeMap::from([("HOME".into(), dir.path().to_str().unwrap().into())]);
+            let paths = Paths::resolve(&env).unwrap();
+            private_dir(&paths.config).unwrap();
+            let bin = paths.config.join("bin");
+            private_dir(&bin).unwrap();
+            let link = bin.join("resident");
+            if let Some(target) = old {
+                std::os::unix::fs::symlink(target, &link).unwrap();
+            }
+            let undo = Undo::prepare(&paths, "new-digest").unwrap();
+            if old.is_some() {
+                fs::remove_file(&link).unwrap();
+            }
+            std::os::unix::fs::symlink("new-digest", &link).unwrap();
+            let stage = bin.join(format!(".resident.{}", std::process::id()));
+            std::os::unix::fs::symlink("new-digest", &stage).unwrap();
+            undo.restore(&paths).unwrap();
+            assert_eq!(fs::read_link(&link).ok(), old.map(PathBuf::from));
+            assert!(fs::symlink_metadata(stage).is_err());
         }
     }
 }

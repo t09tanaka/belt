@@ -820,3 +820,93 @@ async fn init_name_cannot_rename_on_rerun() {
             .contains("unknown"));
     }
 }
+
+#[tokio::test]
+async fn membership_failure_after_db_commit_restarts_and_reruns() {
+    use crate::service::worker_service::{tests::Fake, InstallRequest, Membership};
+    use crate::storage::{CoordinatorStore, WorkerStore};
+    for crash_step in 0..5 {
+        let (_t, context) = fixture();
+        let paths = Paths::resolve(&context.env).unwrap();
+        assert!(initialize(context.clone(), &mut Unknown).await.is_err());
+        let spec = bootstrap::read_input(&paths.input).unwrap();
+        WorkerStore::open(&paths.worker, &spec.worker_id).unwrap();
+        let original = CoordinatorStore::open_read_only(&paths.state).unwrap();
+        let coordinator = original.coordinator_id().clone();
+        let request = InstallRequest {
+            schema: 1,
+            system_user: false,
+            cluster: ClusterId::generate(),
+            worker_id: spec.worker_id.clone(),
+            key_file_text: "ab".repeat(32) + "\n",
+            binary_sha256: String::new(),
+            membership: Some(Membership {
+                caller_name: WorkerId::parse("peer").unwrap(),
+                caller_id: CoordinatorId::generate(),
+                move_group: true,
+                join_singleton: false,
+                install: false,
+            }),
+        };
+        let fake = Fake::default();
+        {
+            let mut w = fake.0.borrow_mut();
+            w.loaded = true;
+            w.omit_socket = true;
+            w.state = paths.worker.clone();
+        }
+        let previous = crate::worker::control::Control::draining();
+        crate::worker::control::write(&paths.worker, previous).unwrap();
+        if crash_step == 0 {
+            // This removal fails immediately after move_group commits, before key publication.
+            let next = crate::group::next_key_path(&paths.key);
+            fs::create_dir(&next).unwrap();
+            assert!(handover(&context.env, &request, fake.clone()).is_err());
+            assert!(fake.0.borrow().loaded);
+            assert_eq!(
+                crate::worker::control::read(&paths.worker).unwrap(),
+                previous
+            );
+            assert_eq!(fake.0.borrow().calls.len(), 2);
+            fs::remove_dir(next).unwrap();
+        } else {
+            // Simulate termination at each publication boundary: recovery must
+            // run before runtime_spec / managed receipt checks on the next call.
+            membership_undo::prepare(&paths, previous).unwrap();
+            CoordinatorStore::move_group(&paths.state, &request.cluster).unwrap();
+            if crash_step >= 2 {
+                fs::write(&paths.key, &request.key_file_text).unwrap();
+            }
+            if crash_step >= 3 {
+                let mut moved = spec.clone();
+                moved.expected_cluster = Some(request.cluster.clone());
+                fs::write(&paths.input, serde_json::to_vec(&moved).unwrap()).unwrap();
+            }
+            if crash_step == 4 {
+                let mut journal = read_journal(&paths.journal).unwrap();
+                journal.cluster = Some(request.cluster.clone());
+                journal.spec.expected_cluster = Some(request.cluster.clone());
+                for path in [&paths.key, &paths.input] {
+                    *journal.files.iter_mut().find(|p| &p.path == path).unwrap() =
+                        Proof::read(path).unwrap();
+                }
+                JournalFile {
+                    path: paths.journal.clone(),
+                    proof: Some(Proof::read(&paths.journal).unwrap()),
+                }
+                .save(&journal)
+                .unwrap();
+            }
+            fake.0.borrow_mut().loaded = false;
+        }
+        let status = handover(&context.env, &request, fake.clone()).unwrap();
+        assert!(status.ready && fake.0.borrow().loaded);
+        assert_eq!(status.cluster, request.cluster);
+        let db = CoordinatorStore::open_read_only(&paths.state).unwrap();
+        assert_eq!(db.cluster_id(), &request.cluster);
+        assert_eq!(db.coordinator_id(), &coordinator);
+        managed_journal(&bootstrap::read_input(&paths.input).unwrap()).unwrap();
+        assert!(!paths.config.join("membership-undo.json").exists());
+        CoordinatorStore::move_group(&paths.state, &request.cluster).unwrap();
+    }
+}

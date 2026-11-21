@@ -32,6 +32,15 @@ struct Generation {
     fingerprint: String,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RotationRecord {
+    #[serde(flatten)]
+    generation: Generation,
+    #[serde(default)]
+    removed: std::collections::BTreeSet<String>,
+}
+
 // Deliberately no Debug: the distribution request contains the key.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -133,9 +142,13 @@ fn switch(spec: &Spec, generation: &Generation) -> Result<(), ApiError> {
             return Err(earlier());
         }
         group::switch_to_next(&spec.cluster_key_path).map_err(internal)?;
-        std::fs::File::open(spec.cluster_key_path.parent().unwrap())
-            .and_then(|f| f.sync_all())
-            .map_err(internal)?;
+        std::fs::File::open(
+            spec.cluster_key_path
+                .parent()
+                .ok_or_else(|| internal("missing key parent"))?,
+        )
+        .and_then(|f| f.sync_all())
+        .map_err(internal)?;
     } else if group::fingerprint(&keys.current) != generation.fingerprint {
         return Err(conflict(
             "requested next key is missing; rerun distribution",
@@ -362,30 +375,43 @@ pub(crate) fn rotate(
             w.id != spec.worker_id.as_str() && !remove.contains(&w.id) && !skip.contains(&w.id)
         })
         .collect();
-    for peer in &peers {
-        let reply = call(remote, peer, cluster, Action::Collect)?;
-        let names: Vec<String> =
-            serde_json::from_value(reply["members"].clone()).map_err(internal)?;
-        for name in names {
-            if name != spec.worker_id.as_str()
-                && !entries.iter().any(|w| w.id == name)
-                && !remove.contains(&name)
-            {
-                return Err(conflict(format!(
-                    "unknown member {name} in {}'s workers list; nothing distributed",
-                    peer.id
-                )));
-            }
-        }
-    }
     let record = spec.worker_state_dir.join("group-rotation.json");
     let (generation, next) = {
         let _key_lock = ProcessLock::acquire(&spec.worker_state_dir, "group-rotation-key.lock")
             .map_err(internal)?;
         let keys = group::load_keys(&spec.cluster_key_path).map_err(internal)?;
-        let generation: Generation = match resident::secure_file(&record, false) {
-            Ok(file) => serde_json::from_reader(file.take(LIMIT)).map_err(internal)?,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+        let existing: Option<RotationRecord> = match resident::secure_file(&record, false) {
+            Ok(file) => Some(serde_json::from_reader(file.take(LIMIT)).map_err(internal)?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(internal(e)),
+        };
+        if !remove.is_empty()
+            && (keys.next.is_some() || existing.is_some())
+            && !existing
+                .as_ref()
+                .is_some_and(|r| remove.iter().all(|n| r.removed.contains(n)))
+        {
+            return Err(conflict("finish the earlier rotation first with `belt group rotate-key` without `--remove`, then run `--remove` again"));
+        }
+        for peer in &peers {
+            let reply = call(remote, peer, cluster, Action::Collect)?;
+            let names: Vec<String> =
+                serde_json::from_value(reply["members"].clone()).map_err(internal)?;
+            for name in names {
+                if name != spec.worker_id.as_str()
+                    && !entries.iter().any(|w| w.id == name)
+                    && !remove.contains(&name)
+                {
+                    return Err(conflict(format!(
+                        "unknown member {name} in {}'s workers list; nothing distributed",
+                        peer.id
+                    )));
+                }
+            }
+        }
+        let generation = match existing {
+            Some(record) => record.generation,
+            None => {
                 let store = store(spec)?;
                 let current = store
                     .observe_group_key(&group::fingerprint(&keys.current))
@@ -400,10 +426,16 @@ pub(crate) fn rotate(
                     number: recorded.map_or(current.generation + 1, |g| g.generation),
                     fingerprint: group::fingerprint(&next),
                 };
-                publish(&record, &serde_json::to_vec(&generation).map_err(internal)?)?;
+                publish(
+                    &record,
+                    &serde_json::to_vec(&RotationRecord {
+                        generation: generation.clone(),
+                        removed: remove.iter().cloned().collect(),
+                    })
+                    .map_err(internal)?,
+                )?;
                 generation
             }
-            Err(e) => return Err(internal(e)),
         };
         let keys = group::load_keys(&spec.cluster_key_path).map_err(internal)?;
         let next = keys

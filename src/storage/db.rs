@@ -52,6 +52,19 @@ impl Db {
         )
     }
 
+    /// Open an existing database for maintenance without changing its schema.
+    pub(crate) fn open_without_migration(path: &Path, kind: DbKind) -> Result<Db> {
+        let steps = schema::steps(kind);
+        open_once(
+            path,
+            kind.as_str(),
+            &steps,
+            schema::compat(steps.len()),
+            Access::ReadWrite,
+            false,
+        )
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -239,7 +252,7 @@ pub(crate) fn open_with(
     let started = std::time::Instant::now();
     let mut pause = Duration::from_millis(2);
     loop {
-        match open_once(path, kind, steps, table, access) {
+        match open_once(path, kind, steps, table, access, true) {
             Err(e) if e.is_retryable() && started.elapsed() < BUSY_TIMEOUT => {
                 std::thread::sleep(pause);
                 pause = (pause * 2).min(Duration::from_millis(50));
@@ -273,6 +286,7 @@ fn open_once(
     steps: &[String],
     table: CompatTable,
     access: Access,
+    migrate: bool,
 ) -> Result<Db> {
     // Held until the setup below is done (dropped on return).
     let _init = if access == Access::ReadWrite {
@@ -282,7 +296,10 @@ fn open_once(
     };
     let flags = match access {
         Access::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
-        Access::ReadWrite => OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,
+        Access::ReadWrite if migrate => {
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE
+        }
+        Access::ReadWrite => OpenFlags::SQLITE_OPEN_READ_WRITE,
     } | OpenFlags::SQLITE_OPEN_NO_MUTEX;
     if access == Access::ReadOnly && !path.exists() {
         return Err(StorageError::NotFound {
@@ -313,7 +330,12 @@ fn open_once(
         }
         other => other?,
     };
-    let plan = plan_schema(found, access, table).map_err(StorageError::Incompatible)?;
+    let plan = plan_schema(
+        found,
+        if migrate { access } else { Access::ReadOnly },
+        table,
+    )
+    .map_err(StorageError::Incompatible)?;
     if access == Access::ReadWrite {
         let mode: String = conn.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))?;
         if !mode.eq_ignore_ascii_case("wal") {

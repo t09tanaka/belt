@@ -629,30 +629,23 @@ pub(super) fn remove_registrations(
     names: &[String],
 ) -> Result<(), ApiError> {
     let (path, text) = read_user_config(env)?;
-    let before = registrations(env)?;
+    registrations(env)?;
     let kept = drop_worker_tables(&text, names)?;
-    let user = crate::config::parse::parse_user(&path.to_string_lossy(), &kept)
+    crate::config::parse::parse_user(&path.to_string_lossy(), &kept)
         .map_err(|e| invalid(e.to_string()))?;
-    let expected: Vec<&str> = before
-        .iter()
-        .map(|w| w.id.as_str())
-        .filter(|id| !names.iter().any(|n| n == id))
-        .collect();
-    let left: Vec<&str> = user.workers.iter().map(|w| w.id.as_str()).collect();
-    if left != expected {
-        return Err(invalid(
-            "workers list could not be edited in place; remove the entries by hand",
-        ));
-    }
     write_config(&path, &kept)
 }
 
 /// Split the text at table headers and drop each `[[workers]]` block whose
-/// `id` is named. A block runs from its header to the next header.
+/// `id` is named. Worker subtables stay with their preceding array element.
 fn drop_worker_tables(text: &str, names: &[String]) -> Result<String, ApiError> {
     let mut blocks: Vec<String> = vec![String::new()];
     for line in text.split_inclusive('\n') {
-        if line.trim_start().starts_with('[') {
+        let header = line.trim_start();
+        if header.starts_with('[')
+            && !header.starts_with("[workers.")
+            && !header.starts_with("[[workers.")
+        {
             blocks.push(String::new());
         }
         blocks.last_mut().expect("one block").push_str(line);
@@ -661,10 +654,12 @@ fn drop_worker_tables(text: &str, names: &[String]) -> Result<String, ApiError> 
     for block in blocks {
         let header = block.lines().next().unwrap_or_default().trim();
         if header.split('#').next().unwrap_or_default().trim() == "[[workers]]" {
-            let body: String = block.split_inclusive('\n').skip(1).collect();
-            let table: toml::Table = body.parse().map_err(|e| invalid(format!("{e}")))?;
+            let table: toml::Table = block.parse().map_err(|e| invalid(format!("{e}")))?;
             if table
-                .get("id")
+                .get("workers")
+                .and_then(toml::Value::as_array)
+                .and_then(|workers| workers.first())
+                .and_then(|worker| worker.get("id"))
                 .and_then(toml::Value::as_str)
                 .is_some_and(|id| names.iter().any(|n| n == id))
             {
@@ -673,7 +668,38 @@ fn drop_worker_tables(text: &str, names: &[String]) -> Result<String, ApiError> 
         }
         out.push_str(&block);
     }
+    let before: toml::Table = text.parse().map_err(|e| invalid(format!("{e}")))?;
+    verify_kept_workers(&before, &out, names)?;
     Ok(out)
+}
+
+fn verify_kept_workers(
+    before: &toml::Table,
+    edited: &str,
+    names: &[String],
+) -> Result<(), ApiError> {
+    let after: toml::Table = edited.parse().map_err(|e| invalid(format!("{e}")))?;
+    let workers = |table: &toml::Table| {
+        table
+            .get("workers")
+            .and_then(toml::Value::as_array)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let expected: Vec<_> = workers(before)
+        .into_iter()
+        .filter(|w| {
+            !w.get("id")
+                .and_then(toml::Value::as_str)
+                .is_some_and(|id| names.iter().any(|n| n == id))
+        })
+        .collect();
+    if workers(&after) != expected {
+        return Err(invalid(
+            "workers list could not be edited in place; remove the entries by hand",
+        ));
+    }
+    Ok(())
 }
 
 /// Append one `[[workers]]` table, atomically, keeping every other byte.

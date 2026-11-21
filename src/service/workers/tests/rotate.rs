@@ -383,3 +383,50 @@ fn send_key_names_an_unlisted_member_without_ssh() {
     assert!(error.message.contains("[[workers]]"));
     assert!(n.events.is_empty());
 }
+
+#[test]
+fn remove_refuses_a_next_key_received_without_a_rotation_record() {
+    let (w, mut n) = fixture();
+    let next = crate::secrets::key::init(&group::next_key_path(&n.peers[1].spec.cluster_key_path))
+        .unwrap();
+    fs::copy(
+        group::next_key_path(&n.peers[1].spec.cluster_key_path),
+        group::next_key_path(&w.spec.cluster_key_path),
+    )
+    .unwrap();
+    let error = run(&w, &mut n, &["b"], &[]).unwrap_err();
+    assert!(error.message.contains("without `--remove`"));
+    assert!(n.events.is_empty());
+    assert_eq!(keys(&w).next.unwrap(), next);
+    assert!(!w.spec.worker_state_dir.join("group-rotation.json").exists());
+}
+
+#[test]
+fn remove_refuses_a_generation_previously_distributed_to_that_member() {
+    let (w, mut n) = fixture();
+    n.fail = Some(("b".into(), "Distribute".into(), true));
+    run(&w, &mut n, &[], &[]).unwrap_err();
+    let record = w.spec.worker_state_dir.join("group-rotation.json");
+    let before = fs::read(&record).unwrap();
+    let next = keys(&w).next.unwrap();
+    n.events.clear();
+    let error = run(&w, &mut n, &["b"], &[]).unwrap_err();
+    assert!(error.message.contains("without `--remove`"));
+    assert!(n.events.is_empty());
+    assert_eq!(fs::read(record).unwrap(), before);
+    assert_eq!(keys(&w).next.unwrap(), next);
+}
+
+#[test]
+fn legacy_rotation_record_resumes_without_remove() {
+    let (w, mut n) = fixture();
+    n.fail = Some(("b".into(), "Distribute".into(), false));
+    run(&w, &mut n, &[], &[]).unwrap_err();
+    let record = w.spec.worker_state_dir.join("group-rotation.json");
+    let mut value: serde_json::Value = serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+    value.as_object_mut().unwrap().remove("removed");
+    fs::write(record, serde_json::to_vec(&value).unwrap()).unwrap();
+    let next = keys(&w).next.unwrap();
+    run(&w, &mut n, &[], &[]).unwrap();
+    assert_eq!(keys(&w).current, next);
+}

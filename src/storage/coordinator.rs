@@ -605,11 +605,7 @@ impl CoordinatorStore {
     /// taking its process lock or advancing its epoch.
     pub(crate) fn membership_writer(state: &Path) -> Result<Self> {
         let mut store = Self::open_read_only(state)?;
-        store.db = Db::open(
-            &state.join("coordinator.db"),
-            DbKind::Coordinator,
-            Access::ReadWrite,
-        )?;
+        store.db = Db::open_without_migration(&state.join("coordinator.db"), DbKind::Coordinator)?;
         Ok(store)
     }
 
@@ -623,7 +619,7 @@ impl CoordinatorStore {
         let cl = cluster.to_string();
         db.write(move |tx| {
             tx.execute(
-                "INSERT INTO cluster (cluster_id, coordinator_id, created_at_ms)
+                "INSERT OR IGNORE INTO cluster (cluster_id, coordinator_id, created_at_ms)
                 SELECT ?1, coordinator_id, created_at_ms FROM cluster
                 WHERE cluster_id = (SELECT cluster_id FROM coordinator_state)",
                 [&cl],

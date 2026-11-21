@@ -29,7 +29,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod membership;
+pub(crate) mod membership;
 
 const LIMIT: u64 = 262_144;
 const ENV: &[&str] = &[
@@ -1138,6 +1138,19 @@ fn refuse_other_submitters(state: &Path, submitters: &Submitters) -> anyhow::Res
     )
 }
 
+fn drain_before_check(
+    state: &Path,
+    check: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let previous = control::read(state)?;
+    control::write(state, Control::draining())?;
+    if let Err(error) = check() {
+        control::write(state, previous)?;
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub fn stop_for<L: Launcher>(
     env: &BTreeMap<String, String>,
     mut launcher: L,
@@ -1160,7 +1173,9 @@ pub fn stop_for<L: Launcher>(
             "loaded service identity unknown; reconciliation required (nothing stopped)"
         ),
         LoadedState::Match => {
-            refuse_other_submitters(&paths.state, submitters)?;
+            drain_before_check(&paths.state, || {
+                refuse_other_submitters(&paths.state, submitters)
+            })?;
             let mut manager = Manager {
                 identity: identity(&journal),
                 files,

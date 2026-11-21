@@ -1122,8 +1122,8 @@ fn membership_moves_an_initialized_idle_member_without_adding_a_worker() {
     let status = install(&h.env, &request, &h.exe, h.fake.clone(), Duration::ZERO).unwrap();
     assert_eq!(status.coordinator_id, Some(original_id.clone()));
     assert_eq!(status.cluster, request.cluster);
-    assert!(!status.ready && status.loaded == Some(false));
-    assert!(h.fake.0.borrow().calls.is_empty());
+    assert!(status.ready && status.loaded == Some(true));
+    assert_eq!(h.fake.0.borrow().calls.len(), 1);
     assert!(!journal_path.exists());
     let changed = super::super::bootstrap::read_input(&input).unwrap();
     assert_eq!(changed.expected_cluster, Some(request.cluster.clone()));
@@ -1467,3 +1467,133 @@ fn init_resident_refuses_legacy_start_stop_and_upgrade_without_a_worker_journal(
 }
 
 mod join;
+
+#[test]
+fn same_group_enrollment_refuses_different_key_without_changing_state() {
+    let mut h = Host::new();
+    h.fake.0.borrow_mut().omit_socket = true;
+    h.install().unwrap();
+    h.bind();
+    let paths = h.paths();
+    let store = crate::storage::WorkerStore::open(&paths.state, &h.request.worker_id).unwrap();
+    let current = crate::secrets::key::load(&paths.key).unwrap();
+    store
+        .observe_group_key(&crate::group::fingerprint(&current))
+        .unwrap();
+    let next_path = crate::group::next_key_path(&paths.key);
+    let next = crate::secrets::key::init(&next_path).unwrap();
+    store
+        .set_next_group_key(&crate::storage::KeyGeneration {
+            generation: 2,
+            fingerprint: crate::group::fingerprint(&next),
+        })
+        .unwrap();
+    let records = store.group_keys().unwrap();
+    let key_before = fs::read(&paths.key).unwrap();
+    let next_before = fs::read(&next_path).unwrap();
+    let journal_before = fs::read(&paths.journal).unwrap();
+    h.request.key_file_text = "ab".repeat(32) + "\n";
+    h.request.membership = Some(Membership {
+        caller_name: WorkerId::parse("caller").unwrap(),
+        caller_id: CoordinatorId::generate(),
+        move_group: false,
+        join_singleton: false,
+        install: false,
+    });
+    let error = h.install().unwrap_err();
+    assert!(
+        error.to_string().contains("belt group send-key <member>"),
+        "{error}"
+    );
+    assert_eq!(fs::read(&paths.key).unwrap(), key_before);
+    assert_eq!(fs::read(next_path).unwrap(), next_before);
+    assert_eq!(fs::read(&paths.journal).unwrap(), journal_before);
+    assert_eq!(store.group_keys().unwrap(), records);
+}
+
+#[test]
+fn membership_failure_after_stop_restarts() {
+    let mut h = Host::new();
+    h.fake.0.borrow_mut().omit_socket = true;
+    h.install().unwrap();
+    h.bind();
+    let paths = h.paths();
+    crate::storage::WorkerStore::open(&paths.state, &h.request.worker_id).unwrap();
+    h.request.cluster = ClusterId::generate();
+    h.request.key_file_text = "ab".repeat(32) + "\n";
+    h.request.membership = Some(Membership {
+        caller_name: WorkerId::parse("peer").unwrap(),
+        caller_id: CoordinatorId::generate(),
+        move_group: true,
+        join_singleton: false,
+        install: false,
+    });
+    let next = crate::group::next_key_path(&paths.key);
+    fs::create_dir(&next).unwrap();
+    assert!(h.install().is_err());
+    assert!(h.fake.0.borrow().loaded);
+    assert_eq!(control::read(&paths.state).unwrap(), Control::default());
+    fs::remove_dir(next).unwrap();
+}
+
+#[test]
+fn membership_rerun_requires_a_loaded_ready_service() {
+    let mut h = Host::new();
+    h.fake.0.borrow_mut().omit_socket = true;
+    h.install().unwrap();
+    h.bind();
+    h.request.membership = Some(Membership {
+        caller_name: WorkerId::parse("peer").unwrap(),
+        caller_id: CoordinatorId::generate(),
+        move_group: true,
+        join_singleton: false,
+        install: false,
+    });
+    // Model a crash after this handover stopped the service (it left its
+    // restart marker), then an unsuccessful start's readiness.
+    std::fs::write(h.paths().state.join("membership-restart"), b"1").unwrap();
+    {
+        let mut w = h.fake.0.borrow_mut();
+        w.loaded = false;
+        w.listener = None;
+        w.omit_socket = true;
+    }
+    let error = h.install().unwrap_err();
+    assert!(error.to_string().contains("readiness"), "{error:#}");
+    {
+        let mut w = h.fake.0.borrow_mut();
+        w.loaded = false;
+        w.omit_socket = false;
+    }
+    let status = h.install().unwrap();
+    assert_eq!(status.loaded, Some(true));
+    assert!(status.ready && status.membership_only);
+}
+
+#[test]
+fn stop_checks_live_work_after_drain_and_restores_control_on_refusal() {
+    let h = Host::new();
+    let state = h.paths().state;
+    crate::storage::WorkerStore::open(&state, &h.request.worker_id).unwrap();
+    let db = rusqlite::Connection::open(state.join("worker.db")).unwrap();
+    let previous = Control::cancelling();
+    control::write(&state, previous).unwrap();
+    let error = drain_before_check(&state, || {
+        assert_eq!(control::read(&state).unwrap(), Control::draining());
+        // Model an admission that was already in flight when drain was written.
+        put_attempt(&db, &CoordinatorId::generate(), 1, "active");
+        refuse_other_submitters(
+            &state,
+            &Submitters {
+                all: false,
+                caller: None,
+            },
+        )
+    })
+    .unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("live attempt(s) of other members"));
+    assert_eq!(control::read(&state).unwrap(), previous);
+    assert!(h.launchctl_calls().is_empty());
+}

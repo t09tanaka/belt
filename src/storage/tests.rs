@@ -6345,3 +6345,75 @@ fn removed_member_ssh_migration_preserves_legacy_records() {
     assert!(store.clear_removed_member(&name).unwrap());
     assert!(store.removed_members().unwrap().is_empty());
 }
+
+#[test]
+fn membership_maintenance_reads_and_writes_v21_without_migration() {
+    use super::policy::Access;
+    let root = crate::test_tmp::tempdir().unwrap();
+    let path = root.path().join("coordinator.db");
+    let steps = schema::steps(DbKind::Coordinator);
+    let old = db::open_with(
+        &path,
+        DbKind::Coordinator.as_str(),
+        &steps[..21],
+        schema::compat(21),
+        Access::ReadWrite,
+    )
+    .unwrap();
+    old.write(|tx| {
+        let cluster = ClusterId::generate();
+        let coordinator = CoordinatorId::generate();
+        tx.execute(
+            "INSERT INTO cluster VALUES (?1, ?2, 0)",
+            rusqlite::params![cluster.as_str(), coordinator.as_str()],
+        )?;
+        tx.execute(
+            "INSERT INTO coordinator_state (singleton, cluster_id, epoch) VALUES (1, ?1, 0)",
+            [cluster.as_str()],
+        )?;
+        tx.execute("INSERT INTO removed_member VALUES ('old', 42)", [])?;
+        Ok(())
+    })
+    .unwrap();
+    let reader = CoordinatorStore::open_read_only(root.path()).unwrap();
+    assert_eq!(
+        reader.removed_members().unwrap(),
+        vec![("old".into(), 42, None)]
+    );
+    let writer = CoordinatorStore::membership_writer(root.path()).unwrap();
+    writer
+        .record_removed_member(&WorkerId::parse("new").unwrap(), 50, Some("user@host"))
+        .unwrap();
+    assert_eq!(
+        reader.removed_members().unwrap(),
+        vec![("new".into(), 50, None), ("old".into(), 42, None)]
+    );
+    let worker_id = WorkerId::parse("local").unwrap();
+    WorkerStore::open(root.path(), &worker_id).unwrap();
+    let env =
+        std::collections::BTreeMap::from([("HOME".into(), root.path().to_str().unwrap().into())]);
+    let spec = crate::service::bootstrap::Spec {
+        state_dir: root.path().into(),
+        worker_state_dir: root.path().into(),
+        worker_id,
+        cluster_key_path: root.path().join("unused-key"),
+        executable: root.path().join("belt"),
+        env: env.clone(),
+        repo_root: None,
+        expected_cluster: Some(reader.cluster_id().clone()),
+        managed_service: None,
+    };
+    let report = crate::service::group::report(&env, &spec).unwrap();
+    assert_eq!(report["warnings"].as_array().unwrap().len(), 2);
+    assert_eq!(report["warnings"][0]["code"], "removed_member_ssh_unknown");
+    let version: String = old
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT value FROM schema_meta WHERE key='schema_version'",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(version, "21");
+}
