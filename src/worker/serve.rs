@@ -128,19 +128,28 @@ pub async fn serve_connection_offering(
     permits: Arc<Semaphore>,
     more_features: &[&str],
 ) -> Result<(), ServeError> {
-    serve_proven(agent, io, cluster_id, permits, more_features, false).await
+    serve_proven(agent, io, cluster_id, permits, more_features, false)
+        .await
+        .map(|_| ())
+}
+
+/// The local owner only reconnects after an explicit identity change.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConnectionEnd {
+    Closed,
+    IdentityChanged,
 }
 
 /// The init resident's in-process link to its own worker (a socketpair that
 /// never leaves the process). A group key switch does not close it: the
-/// proof guards links between machines, and the resident treats the end of
-/// this link as fatal. A new worker identity (send-key) still closes it.
+/// proof guards links between machines. A new worker identity (send-key)
+/// closes it with an explicit reason so the resident can reconnect.
 pub async fn serve_local_connection(
     agent: Arc<Agent>,
     io: Io,
     cluster_id: ClusterId,
     permits: Arc<Semaphore>,
-) -> Result<(), ServeError> {
+) -> Result<ConnectionEnd, ServeError> {
     serve_proven(agent, io, cluster_id, permits, &[], true).await
 }
 
@@ -151,7 +160,7 @@ async fn serve_proven(
     permits: Arc<Semaphore>,
     more_features: &[&str],
     in_process: bool,
-) -> Result<(), ServeError> {
+) -> Result<ConnectionEnd, ServeError> {
     // The keys are read for each connection: after a switch the new key is
     // the one a peer must prove with. Without a readable key nothing is
     // answered, not even `hello`.
@@ -185,7 +194,7 @@ async fn serve_proven(
     let accepted = accept(io, config).await?;
     if accepted.coordinator_id == CoordinatorId::nil() {
         // A probe: it was told who answers. Nothing is served on it.
-        return Ok(());
+        return Ok(ConnectionEnd::Closed);
     }
     let session = Session {
         coordinator_id: accepted.coordinator_id.clone(),
@@ -203,8 +212,11 @@ async fn serve_proven(
         let next = tokio::select! {
             next = incoming.next() => next,
             changed = key_changes.changed() => {
-                if changed.is_err() || connection_boot != agent.advertised_boot() {
-                    return Ok(());
+                if changed.is_err() || (in_process && agent.stopping()) {
+                    return Ok(ConnectionEnd::Closed);
+                }
+                if connection_boot != agent.advertised_boot() {
+                    return Ok(ConnectionEnd::IdentityChanged);
                 }
                 if in_process {
                     continue;
@@ -221,7 +233,7 @@ async fn serve_proven(
                 if still {
                     continue;
                 }
-                return Ok(());
+                return Ok(ConnectionEnd::Closed);
             }
         };
         let Some(InboundRequest {
@@ -229,13 +241,13 @@ async fn serve_proven(
             responder,
         }) = next
         else {
-            return Ok(());
+            return Ok(ConnectionEnd::Closed);
         };
         // No further request is taken from this connection until this one
         // may run: what cannot run yet stays queued where the protocol layer
         // counts it. An idle connection holds no permit.
         let Ok(permit) = permits.clone().acquire_owned().await else {
-            return Ok(());
+            return Ok(ConnectionEnd::Closed);
         };
         let agent = agent.clone();
         let negotiated_features = negotiated_features.clone();
