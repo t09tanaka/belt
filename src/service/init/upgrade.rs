@@ -44,6 +44,9 @@ pub struct Options {
     /// An interrupt (SIGINT) while accepted work finishes lifts the hold and
     /// switches nothing. Only the CLI, which installs the handler, sets it.
     pub interruptible: bool,
+    /// Whether an interrupt came: the handler's flag, or what stands for it
+    /// in a test.
+    pub interrupted: fn() -> bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,7 +505,7 @@ pub fn begin<L: Launcher>(
     let held = options
         .interruptible
         .then(crate::service::workers::warmup::interrupt::Held::new);
-    let interrupted = || held.is_some() && crate::service::workers::warmup::interrupt::requested();
+    let interrupted = || held.is_some() && (options.interrupted)();
     let prepared = (|| -> anyhow::Result<()> {
         let live = ws::live_attempts(&paths.worker)?;
         if ws::wait_until_idle(
@@ -1037,6 +1040,7 @@ pub fn command(binary: Option<&Path>, json: bool) -> Result<Ran, ApiError> {
             wait: Duration::from_secs(600),
             deadline: COMMIT_DEADLINE,
             interruptible: interrupt.is_some(),
+            interrupted: crate::service::workers::warmup::interrupt::requested,
         },
         &crate::platform::wall_ms,
         &mut checked,

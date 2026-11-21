@@ -76,10 +76,15 @@ impl Fake {
     }
 }
 
+fn never() -> bool {
+    false
+}
+
 const OPTIONS: Options = Options {
     wait: Duration::ZERO,
     deadline: COMMIT_DEADLINE,
     interruptible: false,
+    interrupted: never,
 };
 
 struct Host {
@@ -789,4 +794,47 @@ async fn a57_a_healthy_new_version_that_renews_what_it_adopted_is_committed() {
         control::trial_proof(&h.paths.worker).unwrap(),
         control::TrialProof::default()
     );
+}
+
+#[tokio::test]
+async fn a57_ctrl_c_while_work_finishes_lifts_the_hold_and_switches_nothing() {
+    let h = Host::new().await;
+    let db = rusqlite::Connection::open(h.paths.worker.join("worker.db")).unwrap();
+    ws::tests::put_attempt(&db, &CoordinatorId::generate(), 3, "active");
+    drop(db);
+    let mut fake = h.fake.clone();
+    // Ctrl-C arrives during the wait for the live attempt.
+    fn pressed() -> bool {
+        true
+    }
+    let options = Options {
+        wait: Duration::from_secs(600),
+        interruptible: true,
+        interrupted: pressed,
+        ..OPTIONS
+    };
+    let started = std::time::Instant::now();
+    let error = upgrade(
+        &h.env,
+        &h.new_exe,
+        &mut fake,
+        options,
+        &|| 0,
+        &mut |_, _| panic!("nothing is switched, so nothing is checked"),
+    )
+    .unwrap_err();
+    let text = format!("{error:#}");
+    assert!(
+        text.contains("interrupted while accepted work finished; nothing was switched")
+            && text.contains("the upgrade hold is lifted"),
+        "{text}"
+    );
+    // It did not wait for the work.
+    assert!(started.elapsed() < Duration::from_secs(60));
+    assert!(fake.0.borrow().calls.is_empty());
+    assert!(!control::held(&h.paths.worker));
+    assert!(!control::in_trial(&h.paths.worker));
+    assert!(!record_path(&h.paths).exists());
+    assert!(!h.exe(&h.new).exists());
+    assert_eq!(h.resident_link(), Path::new(&h.old));
 }
