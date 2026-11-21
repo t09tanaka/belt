@@ -2589,7 +2589,10 @@ impl Agent {
         // (stop drains, then counts what is live, then boots the service out).
         // Checked under the acceptance lock, just before the insert; a resend
         // of an accepted attempt was answered above and is unaffected.
-        if fresh && super::control::Control::effective(&self.cfg.state_dir).drain {
+        if fresh
+            && (super::control::Control::effective(&self.cfg.state_dir).drain
+                || super::control::held(&self.cfg.state_dir))
+        {
             return Err(ApiError::new(
                 ErrorCode::Overloaded,
                 "this worker is draining; no new attempt is accepted",
@@ -3259,7 +3262,8 @@ impl Agent {
             max_active_task: self.cfg.max_active_task,
             prefetch_per_worker: self.cfg.prefetch_per_worker,
             disk_free_bytes: disk,
-            draining: super::control::Control::effective(&self.cfg.state_dir).drain,
+            draining: super::control::Control::effective(&self.cfg.state_dir).drain
+                || super::control::held(&self.cfg.state_dir),
             admission: Some(admission),
         })
     }

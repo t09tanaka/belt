@@ -198,7 +198,7 @@ struct Pending {
     staged: Proof,
     target: PathBuf,
 }
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Journal {
     schema_version: u32,
@@ -469,6 +469,19 @@ fn service_inputs_observable(paths: &Paths, env: &BTreeMap<String, String>) -> a
     Ok(())
 }
 fn plan(paths: &Paths, j: &Journal) -> anyhow::Result<macos::policy::Plan> {
+    render(paths, definition(paths, j)?)
+}
+fn render(
+    paths: &Paths,
+    definition: macos::policy::Definition,
+) -> anyhow::Result<macos::policy::Plan> {
+    let render = match paths.backend {
+        Backend::Launchd => macos::policy::render,
+        Backend::Systemd => super::systemd::policy::render,
+    };
+    render(&definition).map_err(anyhow::Error::msg)
+}
+fn definition(paths: &Paths, j: &Journal) -> anyhow::Result<macos::policy::Definition> {
     let label = format!(
         "io.github.t09tanaka.belt.local.{}.{}",
         j.uid,
@@ -484,11 +497,7 @@ fn plan(paths: &Paths, j: &Journal) -> anyhow::Result<macos::policy::Plan> {
         .filter(|(k, _)| !matches!(k.as_str(), "XDG_CONFIG_HOME" | "XDG_STATE_HOME"))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
-    let render = match paths.backend {
-        Backend::Launchd => macos::policy::render,
-        Backend::Systemd => super::systemd::policy::render,
-    };
-    render(&macos::policy::Definition {
+    Ok(macos::policy::Definition {
         label,
         mode: macos::policy::Mode::User { uid: j.uid },
         executable: j.spec.executable.clone(),
@@ -496,7 +505,6 @@ fn plan(paths: &Paths, j: &Journal) -> anyhow::Result<macos::policy::Plan> {
         environment: env,
         working_directory: paths.config.clone(),
     })
-    .map_err(anyhow::Error::msg)
 }
 fn validate_journal(j: &Journal, p: &Paths, uid: u32, digest: &str) -> anyhow::Result<()> {
     ensure!(
@@ -1457,6 +1465,7 @@ mod tests;
 
 mod membership_undo;
 mod takeover;
+pub mod upgrade;
 
 fn check_name(requested: Option<&WorkerId>, enrolled: &WorkerId) -> anyhow::Result<()> {
     ensure!(

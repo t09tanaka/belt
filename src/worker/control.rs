@@ -84,6 +84,42 @@ pub fn write(state_dir: &Path, control: Control) -> std::io::Result<()> {
     std::fs::File::open(state_dir)?.sync_all()
 }
 
+/// The upgrade hold (`belt upgrade`): like a drain, no new attempt is
+/// placed here, but it is a state of its own. `resume` writes only the
+/// control file, so it never lifts the hold; only the upgrade's commit or
+/// rollback does. A hold that cannot be told apart from none is a hold.
+const HOLD: &str = "upgrade-hold.json";
+
+pub fn held(state_dir: &Path) -> bool {
+    match std::fs::symlink_metadata(state_dir.join(HOLD)) {
+        Ok(_) => true,
+        Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Place the hold, durably. Placing it again changes nothing.
+pub fn hold(state_dir: &Path) -> std::io::Result<()> {
+    let mut temporary = tempfile::NamedTempFile::new_in(state_dir)?;
+    temporary
+        .as_file()
+        .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    temporary.write_all(b"{}")?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist(state_dir.join(HOLD))
+        .map_err(|e| e.error)?;
+    std::fs::File::open(state_dir)?.sync_all()
+}
+
+/// Lift the hold. Lifting a hold that is not there changes nothing.
+pub fn lift_hold(state_dir: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(state_dir.join(HOLD)) {
+        Ok(()) => std::fs::File::open(state_dir)?.sync_all(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn invalid(message: &str) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
@@ -140,6 +176,22 @@ mod tests {
         std::fs::write(&target, br#"{"drain":false,"cancel_running":false}"#).unwrap();
         std::os::unix::fs::symlink(&target, path(d.path())).unwrap();
         assert!(read(d.path()).is_err());
+    }
+
+    #[test]
+    fn the_hold_is_its_own_state_and_resume_does_not_lift_it() {
+        let d = dir();
+        assert!(!held(d.path()));
+        hold(d.path()).unwrap();
+        hold(d.path()).unwrap();
+        assert!(held(d.path()));
+        // What `resume` writes leaves the hold in place.
+        write(d.path(), Control::default()).unwrap();
+        assert!(held(d.path()));
+        assert_eq!(read(d.path()).unwrap(), Control::default());
+        lift_hold(d.path()).unwrap();
+        lift_hold(d.path()).unwrap();
+        assert!(!held(d.path()));
     }
 
     #[test]

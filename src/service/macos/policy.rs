@@ -104,6 +104,14 @@ impl Plan {
             Backend::Systemd => vec![self.domain.clone(), "stop".into(), self.filename()],
         })
     }
+    /// Stop the loaded job by its name, without reading its managed file: for
+    /// a job whose file is already gone, or one that stops itself last.
+    pub fn stop_by_name_arguments(&self) -> Vec<String> {
+        match self.backend {
+            Backend::Launchd => vec!["bootout".into(), self.service_target()],
+            Backend::Systemd => vec![self.domain.clone(), "stop".into(), self.filename()],
+        }
+    }
     pub fn service_target(&self) -> String {
         match self.backend {
             Backend::Launchd => format!("{}/{}", self.domain, self.label),
