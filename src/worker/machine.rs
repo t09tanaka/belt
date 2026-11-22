@@ -174,31 +174,27 @@ pub fn check_toolchain_source(
     // CI task is frozen from those and the setup steps of its own
     // jobs: which jobs, and the values of its matrix variant, come
     // from the delivered plan, never from the bundle being checked.
-    let (scope, declarations) = match &payload.ci_task {
-        None => (
-            crate::toolchain::versions::Scope::project(project),
-            crate::toolchain::snapshot::read_captured(store, m, project, &[])
-                .map_err(|e| invalid(&e.code))?,
-        ),
-        Some(ci) => {
-            let (plan, task) = super::ci_task::plan_task(state_dir, ci)?;
-            // The function the parent froze with: what it left out as not
-            // interpreted is left out here as well.
-            let (scope, own, _) =
-                crate::ci::toolchains::task_declarations(store, m, &plan, &task, project)
-                    .map_err(|e| invalid(&e.code))?;
-            (scope, own)
+    let Some(ci) = &payload.ci_task else {
+        if bundle.frozen.scope != crate::toolchain::versions::Scope::project(project) {
+            return Err(invalid("toolchain source scope mismatch"));
         }
+        let declarations = crate::toolchain::snapshot::read_captured(store, m, project, &[])
+            .map_err(|e| invalid(&e.code))?;
+        let effective = crate::toolchain::versions::effective(&declarations, &bundle.frozen.scope)
+            .map_err(|e| invalid(&e.code))?;
+        if effective != bundle.frozen.requirements {
+            return Err(invalid("toolchain source declarations mismatch"));
+        }
+        return Ok(());
     };
-    if bundle.frozen.scope != scope {
-        return Err(invalid("toolchain source scope mismatch"));
-    }
-    let effective = crate::toolchain::versions::effective(&declarations, &bundle.frozen.scope)
+    let (plan, task) = super::ci_task::plan_task(state_dir, ci)?;
+    // The function the parent froze with, and the check the parent made of
+    // its own bundle: what it left out as not interpreted is left out here
+    // as well.
+    let source = crate::ci::toolchains::read_task(store, m, project, &task.workflow)
         .map_err(|e| invalid(&e.code))?;
-    if effective != bundle.frozen.requirements {
-        return Err(invalid("toolchain source declarations mismatch"));
-    }
-    Ok(())
+    crate::ci::toolchains::check_frozen(&source, &plan, &task, project, &bundle.frozen)
+        .map_err(|e| invalid(&e))
 }
 
 /// The manifest of the source the payload names, and only if it is the

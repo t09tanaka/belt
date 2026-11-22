@@ -115,17 +115,7 @@ fn too_many_documents() -> Diagnostic {
 /// never read as a plain version.
 pub const STRUCTURED_VERSION_FILE: &str = "structured_version_file";
 const STRUCTURED: &[&str] = &[
-    ".tool-versions",
-    ".mod",
-    ".work",
-    ".toml",
-    ".json",
-    ".yaml",
-    ".yml",
-    ".lock",
-    ".xml",
-    ".gradle",
-    ".kts",
+    ".mod", ".work", ".toml", ".json", ".yaml", ".yml", ".lock", ".xml", ".gradle", ".kts",
 ];
 
 /// Read one explicit project scope. Call separately for monorepo roots; only
@@ -418,6 +408,13 @@ pub fn read_workflow(
                 first_line: line,
                 last_line: line,
             };
+            // The step itself: its `uses:` line.
+            let step_line = Location {
+                path: doc.path.clone(),
+                first_line: start + 1,
+                last_line: start + 1,
+            };
+            read.steps.push((scope.clone(), step_line.clone()));
             if step.cond.is_some() {
                 read.conditional.push(scope.clone());
             }
@@ -428,7 +425,7 @@ pub fn read_workflow(
                 found.push((constraint, raw, here.clone()));
             }
             if let Some(file) = file {
-                let (constraint, location) = version_file(action, file, documents, &here);
+                let (constraint, location) = version_file(action, &tool, file, documents, &here);
                 found.push((constraint, file, location));
             }
             if action == "dtolnay/rust-toolchain"
@@ -453,7 +450,7 @@ pub fn read_workflow(
                         code,
                         value: value.chars().take(80).collect(),
                         location,
-                        step: here.clone(),
+                        step: step_line.clone(),
                     }),
                 }
             }
@@ -465,6 +462,7 @@ pub fn read_workflow(
 /// the file, or at the step (`here`) when no file was read.
 fn version_file(
     action: &str,
+    tool: &ToolId,
     file: &str,
     documents: &BTreeMap<String, Document>,
     here: &Location,
@@ -486,6 +484,25 @@ fn version_file(
             Err(diagnostic) => (Err(diagnostic.code), diagnostic.locations[0].clone()),
         };
     }
+    // A file in a format the project's own reader knows is read by it, for
+    // the tool of the step.
+    let registered = VERSION_FILES.iter().find_map(|name| {
+        let dir = file.strip_suffix(name)?;
+        (dir.is_empty() || dir.ends_with('/')).then(|| dir.trim_end_matches('/'))
+    });
+    if let Some(dir) = registered {
+        let one = BTreeMap::from([(file.to_string(), input.clone())]);
+        return match read_files(dir, &one) {
+            Ok(found) => match found.into_iter().find(|d| &d.tool == tool) {
+                Some(d) => (Ok(d.constraint), d.location),
+                None => at_step(Err("version_file_without_tool")),
+            },
+            Err(unread) => {
+                let at = unread.locations.first().unwrap_or(here).clone();
+                (Err(unread.code), at)
+            }
+        };
+    }
     if STRUCTURED.iter().any(|suffix| file.ends_with(suffix)) {
         return at_step(Err(STRUCTURED_VERSION_FILE));
     }
@@ -497,8 +514,7 @@ fn version_file(
 /// of the action or a commit does not.
 fn rust_reference(reference: &str) -> bool {
     ["stable", "beta", "nightly"].contains(&reference)
-        || (reference.contains('.')
-            && reference.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+        || (reference.contains('.') && reference.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
 }
 
 fn action_tool(action: &str) -> Option<(&'static str, &'static str)> {
@@ -557,7 +573,8 @@ pub fn workflow_version_files(doc: &Document) -> Result<Vec<String>, Diagnostic>
 pub fn setup_version_files(doc: &Document) -> Vec<String> {
     let inputs = version_file_inputs(doc).unwrap_or_default();
     let paths = inputs.into_iter().map(|(_, path)| path);
-    paths.filter(|path| safe_path(path)).collect()
+    let named = |path: &String| !path.contains("${{") && safe_path(path);
+    paths.filter(named).collect()
 }
 
 // setup-node returns its nonempty direct input before it consults a file.

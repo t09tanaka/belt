@@ -360,32 +360,93 @@ async fn freeze_resolved_each(
     guard: crate::source::retention::Guard,
 ) -> Result<Frozen, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
-    let (frozen, guard) = {
+    let plan = std::sync::Arc::new(plan);
+    let (prepared, guard) = {
         let (context, manifest) = (context.clone(), manifest.clone());
-        let (digest, requirements) = (digest.clone(), requirements.clone());
+        let (requirements, plan) = (requirements.clone(), plan.clone());
         tokio::task::spawn_blocking(move || {
             // Blocking source IO retains ownership even when the submit future
             // is cancelled. Return the guard only after that IO has drained.
-            let frozen =
-                freeze_toolchains(&context, &manifest, digest, &requirements, plan.as_ref());
-            (frozen, guard)
+            let prepared = prepare(&context, &manifest, &requirements, plan.as_ref().as_ref());
+            (prepared, guard)
         })
         .await
         .map_err(|e| invalid(e.to_string()))?
     };
-    let (frozen, notices) = frozen?;
-    let mut resolved: Vec<Option<crate::toolchain::contract::FrozenBundle>> = Vec::new();
-    for (index, bundle) in frozen.iter().enumerate() {
-        // The same unresolved bundle is the same question to the owner.
-        let earlier = frozen[..index].iter().position(|b| b == bundle);
-        let bundle = match earlier {
-            Some(earlier) => resolved[earlier].clone(),
-            None => resolve_bundle(owner, digest, requirements, bundle.clone()).await?,
+    let mut prepared = prepared?;
+    // The setup-step aliases of each task that nothing resolves: no
+    // requirement, and a notice (spec 22.1).
+    let tasks = plan.as_ref().as_ref().map_or(1, |plan| plan.tasks.len());
+    let mut dropped: Vec<Vec<crate::toolchain::versions::ToolId>> = vec![Vec::new(); tasks];
+    loop {
+        let (frozen, back) = {
+            let (context, digest) = (context.clone(), digest.clone());
+            let (plan, dropped) = (plan.clone(), dropped.clone());
+            tokio::task::spawn_blocking(move || {
+                // Reads this host's inventory only: the source was read above.
+                let plan = plan.as_ref().as_ref();
+                let frozen = freeze_prepared(&context, &prepared, digest, plan, &dropped);
+                (frozen, prepared)
+            })
+            .await
+            .map_err(|e| invalid(e.to_string()))?
         };
-        resolved.push(bundle);
+        prepared = back;
+        let (frozen, aliases, notices) = frozen?;
+        let mut resolved: Vec<Option<crate::toolchain::contract::FrozenBundle>> = Vec::new();
+        let mut again = false;
+        for (index, bundle) in frozen.iter().enumerate() {
+            // The same unresolved bundle is the same question to the owner.
+            if let Some(earlier) = frozen[..index].iter().position(|b| b == bundle) {
+                resolved.push(resolved[earlier].clone());
+                continue;
+            }
+            match resolve_bundle(owner, digest, requirements, bundle.clone()).await {
+                Ok(bundle) => resolved.push(bundle),
+                Err(unresolved) => {
+                    // An alias of a setup step that stays unresolved is no
+                    // requirement. Anything else is refused as it was.
+                    let open = unresolved_aliases(&unresolved, bundle.as_ref(), &aliases[index]);
+                    if open.is_empty() {
+                        return Err(unresolved);
+                    }
+                    for (other, drop) in frozen.iter().zip(dropped.iter_mut()) {
+                        if other == bundle {
+                            drop.extend(open.iter().cloned());
+                        }
+                    }
+                    again = true;
+                    resolved.push(None);
+                }
+            }
+        }
+        if !again {
+            drop(guard);
+            return Ok((resolved, crate::ci::toolchains::render(&notices)));
+        }
     }
-    drop(guard);
-    Ok((resolved, notices))
+}
+
+/// The tools of `aliases` (the setup-step aliases of the task `bundle` was
+/// frozen for) that `bundle` holds no evidence for, when `refused` says the
+/// bundle could not be resolved. An answer that never came says nothing of
+/// the kind.
+fn unresolved_aliases(
+    refused: &ApiError,
+    bundle: Option<&crate::toolchain::contract::FrozenBundle>,
+    aliases: &[crate::toolchain::versions::ToolId],
+) -> Vec<crate::toolchain::versions::ToolId> {
+    let mismatch = matches!(
+        refused.blocked_reason,
+        Some(crate::error::BlockedReason::EnvironmentMismatch)
+    );
+    let Some(bundle) = bundle.filter(|_| mismatch) else {
+        return Vec::new();
+    };
+    let open = |tool: &&crate::toolchain::versions::ToolId| {
+        !bundle.evidence.iter().any(|e| &e.tool == *tool)
+    };
+    aliases.iter().filter(open).cloned().collect()
 }
 
 async fn resolve_bundle(
@@ -438,18 +499,32 @@ fn located(diagnostic: &crate::toolchain::versions::Diagnostic) -> String {
     format!("{} at {}", diagnostic.code, at.join(" and "))
 }
 
-/// One bundle for a plain command (`plan` is `None`: no workflow is read),
-/// one per task of `plan` otherwise, in plan order.
-fn freeze_toolchains(
+/// What the freeze reads once: the declarations of the captured source and
+/// this host's profile.
+struct Prepared {
+    project: String,
+    /// The declarations of a plain command.
+    plain: Vec<crate::toolchain::versions::Declaration>,
+    /// What each task of the plan reads of its workflow, in plan order.
+    sources: Vec<crate::ci::toolchains::TaskSource>,
+    profile: crate::toolchain::profile::Profile,
+    required: Vec<(
+        crate::toolchain::versions::ToolId,
+        crate::toolchain::versions::Location,
+    )>,
+}
+
+/// Read the captured source for a plain command (`plan` is `None`: no
+/// workflow is read) or for each task of `plan`.
+fn prepare(
     context: &Context,
     captured: &crate::source::manifest::SourceManifest,
-    digest: Digest,
     requirements: &crate::toolchain::capability::ExecutionRequirements,
     plan: Option<&local_ci::FrozenPlan>,
-) -> Result<Frozen, ApiError> {
+) -> Result<Prepared, ApiError> {
     use crate::toolchain::{
-        contract::{self, FrozenBundle},
-        versions::{FrozenToolchains, Location, MatchPolicy, Scope, ToolId},
+        contract,
+        versions::{Location, ToolId},
     };
     let blocked =
         |e: String| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e);
@@ -464,32 +539,25 @@ fn freeze_toolchains(
     }
     let project = std::str::from_utf8(&manifest.cwd_relative.0)
         .map_err(|_| blocked("invalid toolchain project scope".into()))?;
-    // What each bundle is frozen from: the project as a whole for a plain
-    // command, the declarations of its own jobs for a task of a plan. An
-    // input of a setup step belt cannot interpret requires nothing and is
-    // told as a notice; the worker reads the same with the same function.
-    let mut sets = Vec::new();
-    let mut notices: Vec<String> = Vec::new();
+    let mut plain = Vec::new();
+    let mut sources: Vec<crate::ci::toolchains::TaskSource> = Vec::new();
     match plan {
         None => {
-            let declarations =
-                crate::toolchain::snapshot::read_captured(&store, &manifest, project, &[])
-                    .map_err(|e| blocked(e.code))?;
-            sets.push((String::new(), Scope::project(project), declarations));
+            plain = crate::toolchain::snapshot::read_captured(&store, &manifest, project, &[])
+                .map_err(|e| blocked(e.code))?;
         }
         Some(plan) => {
-            for task in &plan.tasks {
-                let (scope, own, told) = crate::ci::toolchains::task_declarations(
-                    &store, &manifest, plan, task, project,
-                )
-                .map_err(|e| blocked(located(&e)))?;
-                for line in told {
-                    if !notices.contains(&line) {
-                        notices.push(line);
+            for (index, task) in plan.tasks.iter().enumerate() {
+                // The tasks of one workflow read the same of it.
+                let same = |t: &local_ci::dag::ExecutionTask| t.workflow == task.workflow;
+                let source = match plan.tasks[..index].iter().position(same) {
+                    Some(earlier) => sources[earlier].clone(),
+                    None => {
+                        crate::ci::toolchains::read_task(&store, &manifest, project, &task.workflow)
+                            .map_err(|e| blocked(located(&e)))?
                     }
-                }
-                let who = format!("task `{}` (job {}): ", task.id, task.jobs.join(", "));
-                sets.push((who, scope, own));
+                };
+                sources.push(source);
             }
         }
     }
@@ -523,6 +591,73 @@ fn freeze_toolchains(
                 .map_err(|e| blocked(e.into()))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    Ok(Prepared {
+        project: project.into(),
+        plain,
+        sources,
+        profile,
+        required,
+    })
+}
+
+/// The bundles of a freeze, the setup-step aliases each was frozen with, and
+/// the notices of what is no requirement.
+type Bundles = (
+    Vec<Option<crate::toolchain::contract::FrozenBundle>>,
+    Vec<Vec<crate::toolchain::versions::ToolId>>,
+    Vec<crate::ci::toolchains::Notice>,
+);
+
+/// One bundle for a plain command, one per task of `plan` otherwise, in plan
+/// order. `dropped` names, for each task, the tools whose setup-step alias
+/// nothing resolved: no requirement comes from those.
+fn freeze_prepared(
+    context: &Context,
+    prepared: &Prepared,
+    digest: Digest,
+    plan: Option<&local_ci::FrozenPlan>,
+    dropped: &[Vec<crate::toolchain::versions::ToolId>],
+) -> Result<Bundles, ApiError> {
+    use crate::toolchain::{
+        contract::{self, FrozenBundle},
+        versions::{FrozenToolchains, MatchPolicy, Scope},
+    };
+    let blocked =
+        |e: String| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e);
+    let (project, profile) = (prepared.project.as_str(), &prepared.profile);
+    // What each bundle is frozen from: the project as a whole for a plain
+    // command, the declarations of its own jobs for a task of a plan. An
+    // input of a setup step belt cannot interpret requires nothing and is
+    // told as a notice; the worker reads the same with the same function.
+    let mut sets = Vec::new();
+    let mut aliases = Vec::new();
+    let mut notices = Vec::new();
+    match plan {
+        None => {
+            sets.push((
+                String::new(),
+                Scope::project(project),
+                prepared.plain.clone(),
+            ));
+            aliases.push(Vec::new());
+        }
+        Some(plan) => {
+            for (index, task) in plan.tasks.iter().enumerate() {
+                let unresolved = |tool: &_, _: &str| dropped[index].contains(tool);
+                let freeze = crate::ci::toolchains::task_declarations(
+                    &prepared.sources[index],
+                    plan,
+                    task,
+                    project,
+                    &unresolved,
+                );
+                aliases.push(freeze.aliases());
+                notices.extend(freeze.notices);
+                let who = format!("task `{}` (job {}): ", task.id, task.jobs.join(", "));
+                sets.push((who, freeze.scope, freeze.declarations));
+            }
+        }
+    }
     let policy = match context.config.toolchain_match.value {
         crate::config::model::ToolchainMatch::Exact => MatchPolicy::Exact,
         crate::config::model::ToolchainMatch::Minor => MatchPolicy::Minor,
@@ -538,7 +673,7 @@ fn freeze_toolchains(
             bundles.push(bundles[earlier].clone());
             continue;
         }
-        if declarations.is_empty() && required.is_empty() {
+        if declarations.is_empty() && prepared.required.is_empty() {
             bundles.push(None);
             continue;
         }
@@ -547,7 +682,7 @@ fn freeze_toolchains(
             profile.definition_digest().clone(),
             scope.clone(),
             declarations,
-            &required,
+            &prepared.required,
             &observations,
             policy,
         )
@@ -558,9 +693,22 @@ fn freeze_toolchains(
                 e.code
             })
         })?;
-        bundles.push(Some(seal(context, &profile, frozen)?));
+        bundles.push(Some(seal(context, profile, frozen)?));
     }
-    Ok((bundles, notices))
+    // What a worker will check of each bundle, checked here first: a bundle
+    // the source does not read back to is refused at the submit, not on a
+    // worker.
+    if let Some(plan) = plan {
+        for (index, task) in plan.tasks.iter().enumerate() {
+            let Some(bundle) = &bundles[index] else {
+                continue;
+            };
+            let source = &prepared.sources[index];
+            crate::ci::toolchains::check_frozen(source, plan, task, project, &bundle.frozen)
+                .map_err(|e| blocked(format!("{}{e}", sets[index].0)))?;
+        }
+    }
+    Ok((bundles, aliases, notices))
 }
 
 /// Seal what the source pins exactly, and take what the configured inventory
