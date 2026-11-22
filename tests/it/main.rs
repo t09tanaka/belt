@@ -37,6 +37,7 @@ mod bootstrap;
 
 mod init;
 
+mod warmup_stop;
 mod worker_ephemeral;
 mod worker_role;
 
