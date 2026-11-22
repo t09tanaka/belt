@@ -4,6 +4,10 @@ use super::{Result, StorageError};
 use std::fs::{File, OpenOptions, TryLockError};
 use std::path::{Path, PathBuf};
 
+/// Tries (and the pause between them) before `acquire` reports `Locked`.
+const ACQUIRE_TRIES: u32 = 10;
+const ACQUIRE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(10);
+
 /// An exclusive advisory lock (`flock`) on a file in the state directory. It
 /// is released when this value is dropped or the process dies, so a crashed
 /// coordinator never leaves a stale lock behind.
@@ -16,6 +20,12 @@ pub struct ProcessLock {
 impl ProcessLock {
     /// Take the lock, creating the directory and the file if needed. A second
     /// holder (in this or another process) fails with [`StorageError::Locked`].
+    ///
+    /// A refusal is retried for about 100 ms first: a read-only probe (for
+    /// example `belt exec` asking whether a resident runs) holds a shared lock
+    /// on the same file for microseconds, and must not make a resident that is
+    /// starting at that moment give up. A real second owner still holds the
+    /// lock after the retries and is refused.
     pub fn acquire(dir: &Path, name: &str) -> Result<Self> {
         std::fs::create_dir_all(dir)?;
         let path = dir.join(name);
@@ -25,11 +35,17 @@ impl ProcessLock {
             .read(true)
             .write(true)
             .open(&path)?;
-        match file.try_lock() {
-            Ok(()) => Ok(Self { _file: file, path }),
-            Err(TryLockError::WouldBlock) => Err(StorageError::Locked(path)),
-            Err(TryLockError::Error(e)) => Err(e.into()),
+        for attempt in 0..ACQUIRE_TRIES {
+            if attempt > 0 {
+                std::thread::sleep(ACQUIRE_RETRY_DELAY);
+            }
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { _file: file, path }),
+                Err(TryLockError::WouldBlock) => {}
+                Err(TryLockError::Error(e)) => return Err(e.into()),
+            }
         }
+        Err(StorageError::Locked(path))
     }
 
     /// Transfer an already-held private file descriptor without dropping its lock.
@@ -113,6 +129,40 @@ mod tests {
         assert!(first.path().ends_with("x.lock"));
         drop(first);
         ProcessLock::acquire(dir.path(), "x.lock").unwrap();
+    }
+
+    fn open_shared(dir: &Path) -> File {
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(dir.join("x.lock"))
+            .unwrap();
+        file.lock_shared().unwrap();
+        file
+    }
+
+    #[test]
+    fn a_brief_shared_holder_does_not_make_acquire_fail() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let probe = open_shared(dir.path());
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            probe.unlock().unwrap();
+        });
+        ProcessLock::acquire(dir.path(), "x.lock").unwrap();
+        release.join().unwrap();
+    }
+
+    #[test]
+    fn a_lock_held_the_whole_time_is_still_refused() {
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let _probe = open_shared(dir.path());
+        let started = std::time::Instant::now();
+        let err = ProcessLock::acquire(dir.path(), "x.lock").unwrap_err();
+        assert!(matches!(err, StorageError::Locked(_)), "{err:?}");
+        assert!(started.elapsed() >= std::time::Duration::from_millis(90));
     }
 
     #[test]
