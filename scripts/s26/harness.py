@@ -209,8 +209,7 @@ class Checks:
             if not (RUN / "state/parent/request.sock").is_socket():
                 return False
             try:
-                self.belt("ls")
-                return True
+                return self.belt("top").get("resident_observed") is True
             except RuntimeError:
                 return False
         until("foreground parent ready", ready, 30)
