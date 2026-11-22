@@ -22,6 +22,8 @@ mod lock;
 #[cfg(test)]
 mod paging_tests;
 pub mod policy;
+#[cfg(test)]
+mod retry_dependents_tests;
 mod schema;
 #[cfg(test)]
 mod tests;

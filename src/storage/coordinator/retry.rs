@@ -70,13 +70,14 @@ impl CoordinatorStore {
         if request_id.is_empty() || request_id.len() > 128 {
             return Err(StorageError::Invalid("invalid retry request ID".into()));
         }
+        let state_dir = self.state_dir.clone();
         let preparation=self.db.call(move |c| {
             let tx = c.unchecked_transaction()?;
             if let Some(receipt) = control_receipt(&tx, &target, expected, &request_id, "retry")? {
                 return Ok(RetryPreparation::Replay(receipt));
             }
             let binding = binding(&tx, &target, expected)?;
-            let scan = scan(&tx, &binding, None)?;
+            let scan = scan(&tx, &binding, None, &state_dir)?;
             let in_place: bool=tx.query_row("SELECT count(*)>0 AND min(coalesce(json_extract(spec_json,'$.in_place'),0))=1 FROM task WHERE run_id=?1 AND (?2 IS NULL OR task_id=?2)", rusqlite::params![binding.run.as_str(),binding.selected.as_deref()],|r|r.get(0))?;
             Ok(RetryPreparation::Prepared(PreparedRetry {
                 target,
@@ -141,6 +142,7 @@ impl CoordinatorStore {
         }
         let _source = source;
 
+        let state_dir = self.state_dir.clone();
         self.db.write(move |tx| {
             if let Some(receipt) = control_receipt(tx, &prepared.target, prepared.expected, &prepared.request_id, "retry")? {
                 return Ok(receipt);
@@ -160,7 +162,7 @@ impl CoordinatorStore {
                 .checked_add(1)
                 .filter(|v| *v <= i64::MAX as u64)
                 .ok_or_else(|| StorageError::Invalid("control revision exhausted".into()))?;
-            let scan = scan(tx, &binding, Some(next))?;
+            let scan = scan(tx, &binding, Some(next), &state_dir)?;
             if scan.fingerprint != prepared.fingerprint || scan.secret != verified_secret {
                 return Err(StorageError::Immutable(
                     "retry task snapshot changed".into(),
@@ -250,6 +252,90 @@ fn unjoin(c: &Connection, run: &RunId, group: &str) -> Result<()> {
     Ok(())
 }
 
+/// A retry of one job: the jobs of the plan that need it must not keep the
+/// results of its earlier attempt. One that did not start yet waits again
+/// (`commit`) and is given the new results when the job ends; one that
+/// started or ended is a refusal, which the user answers by retrying it too
+/// or the run. A shard is left to its own rules (the job is joined again).
+fn hold_dependents(
+    c: &Connection,
+    binding: &Binding,
+    task: &str,
+    commit: bool,
+    state_dir: &std::path::Path,
+) -> Result<()> {
+    let spec: Option<String> = c
+        .query_row("SELECT spec_json FROM task WHERE task_id=?1", [task], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let spec: serde_json::Value = from_json("task spec", &spec.unwrap_or_default())?;
+    let ci = &spec["ci"];
+    let (Some(plan), Some(name)) = (
+        ci["task"]["plan_digest"].as_str(),
+        ci["task"]["task_id"].as_str(),
+    ) else {
+        return Ok(());
+    };
+    if ci["shard_group"].is_string() || ci["dynamic_origin"] == true {
+        return Ok(());
+    }
+    let digest = id("plan_digest", Digest::parse(plan))?;
+    let bytes = crate::ci::advance::plan_bytes(state_dir, &digest).map_err(|why| {
+        StorageError::Immutable(format!(
+            "retry cannot tell which jobs need {task}: the frozen plan is unavailable ({why})"
+        ))
+    })?;
+    let plan: local_ci::FrozenPlan = serde_json::from_slice(&bytes).map_err(|e| {
+        StorageError::Immutable(format!(
+            "retry cannot tell which jobs need {task}: the frozen plan is unreadable ({e})"
+        ))
+    })?;
+    let dependents: Vec<&str> = plan
+        .tasks
+        .iter()
+        .filter(|t| t.depends_on.iter().any(|d| d == name))
+        .map(|t| t.id.as_str())
+        .collect();
+    let mut stmt = c.prepare(
+        "SELECT t.task_id,coalesce(json_extract(t.spec_json,'$.ci.hold'),0),
+         EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))
+         FROM task t WHERE t.run_id=?1 AND json_extract(t.spec_json,'$.ci.task.task_id')=?2",
+    )?;
+    let mut hold = Vec::new();
+    for dependent in dependents {
+        let rows = stmt
+            .query_map(params![binding.run.as_str(), dependent], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, bool>(1)?,
+                    r.get::<_, bool>(2)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        for (other, held, started) in rows {
+            if started {
+                return Err(StorageError::Immutable(format!(
+                    "retry of {task} would leave {other} ({dependent}) with the results of the earlier attempt; retry {other} as well or retry the run"
+                )));
+            }
+            if !held {
+                hold.push(other);
+            }
+        }
+    }
+    drop(stmt);
+    if commit {
+        for other in hold {
+            c.execute(
+                "UPDATE task SET spec_json=json_set(spec_json,'$.ci.hold',json('true')) WHERE task_id=?1",
+                [other],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn binding(c: &Connection, target: &Target, expected: u64) -> Result<Binding> {
     let (run, selected) = resolve(c, target)?;
     let (closed, source, digest): (Option<i64>, Option<String>, Option<String>) = c.query_row(
@@ -282,7 +368,12 @@ fn binding(c: &Connection, target: &Target, expected: u64) -> Result<Binding> {
 
 /// Pages are fully read and dropped before task updates on the same connection.
 /// What a later page is chosen by (`ci.rerun`) is not written before the last.
-fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Scan> {
+fn scan(
+    c: &Connection,
+    binding: &Binding,
+    authorize: Option<u64>,
+    state_dir: &std::path::Path,
+) -> Result<Scan> {
     let mut after = String::new();
     let mut count = 0_u64;
     let mut boundary = None;
@@ -450,6 +541,11 @@ fn scan(c: &Connection, binding: &Binding, authorize: Option<u64>) -> Result<Sca
     }
     for group in &unjoined {
         unjoin(c, &binding.run, group)?;
+    }
+    if count > 0 {
+        if let Some(task) = &binding.selected {
+            hold_dependents(c, binding, task, authorize.is_some(), state_dir)?;
+        }
     }
     if count == 0 {
         return Err(StorageError::Invalid(

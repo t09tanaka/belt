@@ -46,6 +46,7 @@ mod test_tmp_root;
 mod workers_lifecycle;
 mod workers_upgrade;
 
+mod retry_dependents;
 mod top;
 
 mod group_join;
