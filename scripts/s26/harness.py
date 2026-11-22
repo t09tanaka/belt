@@ -409,10 +409,28 @@ class Checks:
         return ssh("m1", f'f="$HOME/.config/belt/bin/{digest}/belt"; '
                    'stat -c "%i %Y %s %a" "$f" && sha256sum "$f"').stdout
 
+    # Rosetta supplies the interpreter as /proc/PID/exe. Validate the guest
+    # executable against an executable mapping of the same path and inode.
+    PROCESS_EXE = r'''process_exe() {
+  local interpreter guest inode
+  interpreter=$(readlink "/proc/$1/exe") || return 1
+  if [ "$interpreter" != /run/rosetta/rosetta ]; then
+    printf '%s\n' "$interpreter"
+    return
+  fi
+  IFS= read -r -d '' guest < "/proc/$1/cmdline" || return 1
+  case "$guest" in /*) ;; *) return 1 ;; esac
+  guest=$(readlink -f "$guest") || return 1
+  inode=$(stat -c %i "$guest") || return 1
+  awk -v file="$guest" -v ino="$inode" '$2 ~ /x/ && $5 == ino && $6 == file {found=1} END {exit !found}' "/proc/$1/maps" || return 1
+  printf '%s\n' "$guest"
+}
+'''
+
     def m1_main_exe(self):
-        p = self.m1_exec('set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.local.*.service; '
+        p = self.m1_exec(self.PROCESS_EXE + 'set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.local.*.service; '
                          'pid=$(systemctl --user -M belt@ show -p MainPID --value "$(basename "$1")"); '
-                         '[ "$pid" -gt 1 ] && readlink "/proc/$pid/exe"', check=False)
+                         '[ "$pid" -gt 1 ] && process_exe "$pid"', check=False)
         return p.stdout.strip() if p.returncode == 0 else None
 
     def m1_upgraded_away(self):
@@ -581,7 +599,7 @@ class Checks:
     # the pid file: STOP holds the trial open, TERM ends the CLI so that only
     # the guard can decide. The process is identified by its executable and
     # argv first; with --binary the CLI is the one child of the named pid.
-    WATCH = r'''set -eu
+    WATCH = PROCESS_EXE + r'''set -eu
 marker="$1/upgrade-trial.json"; want="$HOME/.config/belt/bin/$2/belt"
 sig=$3; exe=$4; child=$5; deadline=$((SECONDS + $6))
 set -- "$HOME"/.config/systemd/user/io.github.t09tanaka.belt.local.*.service
@@ -589,7 +607,7 @@ unit=$(basename "$1")
 while :; do
   if [ -e "$marker" ]; then
     main=$(systemctl --user -M belt@ show -p MainPID --value "$unit" 2>/dev/null || echo 0)
-    if [ "${main:-0}" -gt 1 ] && [ "$(readlink "/proc/$main/exe" 2>/dev/null)" = "$want" ]; then break; fi
+    if [ "${main:-0}" -gt 1 ] && [ "$(process_exe "$main" 2>/dev/null)" = "$want" ]; then break; fi
   fi
   [ "$SECONDS" -lt "$deadline" ] || { echo "no trial of $want seen" >&2; exit 3; }
   sleep 0.02
@@ -598,17 +616,17 @@ pid=$(cat "$HOME/s26-bin/upgrade.pid")
 if [ "$child" = yes ]; then pid=$(pgrep -P "$pid"); fi
 case "$pid" in ''|*[!0-9]*) echo "no single upgrade process: '$pid'" >&2; exit 4 ;; esac
 [ "$pid" -gt 1 ] || exit 4
-[ "$(readlink "/proc/$pid/exe")" = "$(readlink -f "$exe")" ] || { echo "pid $pid is not $exe" >&2; exit 4; }
+[ "$(process_exe "$pid")" = "$(readlink -f "$exe")" ] || { echo "pid $pid is not $exe" >&2; exit 4; }
 tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q ' upgrade' || { echo "pid $pid is not an upgrade" >&2; exit 4; }
 kill -s "$sig" "$pid"
 echo "$pid"
 '''
 
-    SIGNAL = r'''set -eu
+    SIGNAL = PROCESS_EXE + r'''set -eu
 pid=$1; exe=$2
 case "$pid" in ''|*[!0-9]*) exit 4 ;; esac
 [ "$pid" -gt 1 ] || exit 4
-[ "$(readlink "/proc/$pid/exe")" = "$(readlink -f "$exe")" ] || exit 4
+[ "$(process_exe "$pid")" = "$(readlink -f "$exe")" ] || exit 4
 tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q ' upgrade' || exit 4
 kill -s CONT "$pid"
 '''

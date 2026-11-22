@@ -2,6 +2,8 @@
 
 `docs/spec.md`（仕様版 1.5）の実装を、PR 単位に分けた計画である。仕様 1.5 で追加した A50 と A55 を含め、A01〜A58 の担当は下の対応表に示す。
 
+初回公開前に製品名を再考する。現行の CLI 名は `belt`、Cargo のパッケージ名は `belt-cli`。
+
 ## 前提
 
 - lease 更新の実プロセス試験は、準備開始・更新の durable commit・seed の更新キーと単一 monotonic 測定期限・コマンド開始・supervisor の更新キー観測を順に確認する。短い実時間枠内での起動速度や旧 watcher を期待せず、期限境界は純粋な LeaseClock 試験で検証する。観測 journal は best-effort 診断であり、lease の判定やコマンドの継続条件にしない。
