@@ -5533,6 +5533,20 @@ async fn ci_refuses_two_setup_versions_of_one_tool_in_one_job() {
         ),
         "{text}"
     );
+    // A channel the project's own version file names is refused as it was,
+    // also when a setup step names the same channel.
+    std::fs::write(input.join("rust-toolchain"), "stable\n").unwrap();
+    ci_project(
+        root.path(),
+        &input,
+        "  build:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: dtolnay/rust-toolchain@stable\n      - run: node --version >> MARKS/build\n",
+    );
+    let (code, value) = ci_output(&spec, &input).await;
+    assert_ne!(code, Some(0), "{value}");
+    let text = value.to_string();
+    assert!(text.contains("environment_mismatch"), "{text}");
+    assert!(text.contains("toolchain resolve required"), "{text}");
+    assert!(text.contains("rust=stable"), "{text}");
     assert!(ci_marks(&marks, "build").is_empty(), "a step ran anyway");
     assert!(!host.join("calls").exists(), "a manager ran");
     shutdown(&load(&spec)).await;
@@ -5580,7 +5594,9 @@ async fn ci_accepts_what_it_does_not_interpret_with_a_notice_and_the_worker_agre
             "",
             "      - uses: actions/setup-node@v4\n        if: always()\n        with:\n          node-version: 18.0.0\n",
         ),
-        // A channel nothing here resolves to a version.
+        // A channel nothing here resolves to a version, of a tool with a
+        // recipe and of one without.
+        job("channel", "", "      - uses: dtolnay/rust-toolchain@stable\n"),
         job("alias", "", &node("lts/*")),
         // A matrix key the legs do not have.
         job(
@@ -5593,6 +5609,8 @@ async fn ci_accepts_what_it_does_not_interpret_with_a_notice_and_the_worker_agre
     ]
     .concat();
     let marks = ci_project(root.path(), &input, &jobs);
+    // The rust step looks for `cargo`; no rust version is asked of it.
+    crate::common::write_executable(&host.join("cargo"), "#!/bin/sh\nprintf 'cargo 1.80.0\\n'\n");
     let output = ci_command(&spec, &input).output().await.unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let value: serde_json::Value =
@@ -5610,6 +5628,7 @@ async fn ci_accepts_what_it_does_not_interpret_with_a_notice_and_the_worker_agre
         "missing",
         "cond",
         "alias",
+        "channel",
         "legs",
     ] {
         let ran = ci_marks(&marks, id);
@@ -5657,7 +5676,12 @@ async fn ci_accepts_what_it_does_not_interpret_with_a_notice_and_the_worker_agre
     let legs = told("legs", 0, "node: the version is the expression ${{ matrix.node }}, which is not known until the run; no node version is required from this step");
     assert!(legs.starts_with("warning: job legs, 2 tasks ("), "{legs}");
     told("mixed", 1, "python: the version file pyproject.toml is not a plain version file; no python version is required from this step");
-    assert_eq!(notices.len(), 8, "{stderr}");
+    told(
+        "channel",
+        0,
+        "rust: `stable` names no concrete version; no rust version is required from this step",
+    );
+    assert_eq!(notices.len(), 9, "{stderr}");
     // What each task carries: nothing of a step that was not interpreted, in
     // the project's scope; the pinned Node in the job's scope.
     let file = ".github/workflows/ci.yml";
@@ -5665,13 +5689,13 @@ async fn ci_accepts_what_it_does_not_interpret_with_a_notice_and_the_worker_agre
     let mixed = serde_json::json!({"project": "", "workflow": file, "job": "mixed", "step": null});
     let carried: Vec<(serde_json::Value, Vec<String>)> =
         ci_task_toolchains(&spec, &value).into_values().collect();
-    assert_eq!(carried.len(), 9);
+    assert_eq!(carried.len(), 10);
     let pinned = (mixed, vec!["node=20.0.0".to_string()]);
     assert_eq!(carried.iter().filter(|c| **c == pinned).count(), 1);
     let none = (project, vec![]);
     assert_eq!(
         carried.iter().filter(|c| **c == none).count(),
-        8,
+        9,
         "{carried:?}"
     );
     // The manager ran for the pinned version only.

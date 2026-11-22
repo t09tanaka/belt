@@ -378,6 +378,10 @@ async fn freeze_resolved_each(
     // requirement, and a notice (spec 22.1).
     let tasks = plan.as_ref().as_ref().map_or(1, |plan| plan.tasks.len());
     let mut dropped: Vec<Vec<crate::toolchain::versions::ToolId>> = vec![Vec::new(); tasks];
+    // The refusal that made an alias be left out. When the freeze without the
+    // alias is no bundle of this source (the project's own file names the
+    // same alias, so the requirement is still there), that refusal stands.
+    let mut refused: Option<ApiError> = None;
     loop {
         let (frozen, back) = {
             let (context, digest) = (context.clone(), digest.clone());
@@ -392,7 +396,11 @@ async fn freeze_resolved_each(
             .map_err(|e| invalid(e.to_string()))?
         };
         prepared = back;
-        let (frozen, aliases, notices) = frozen?;
+        let (frozen, aliases, notices) = match (frozen, refused.take()) {
+            (Ok(frozen), _) => frozen,
+            (Err(_), Some(refused)) => return Err(refused),
+            (Err(unread), None) => return Err(unread),
+        };
         let mut resolved: Vec<Option<crate::toolchain::contract::FrozenBundle>> = Vec::new();
         let mut again = false;
         for (index, bundle) in frozen.iter().enumerate() {
@@ -416,6 +424,7 @@ async fn freeze_resolved_each(
                         }
                     }
                     again = true;
+                    refused = Some(unresolved);
                     resolved.push(None);
                 }
             }
