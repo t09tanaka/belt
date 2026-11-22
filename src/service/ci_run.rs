@@ -409,15 +409,16 @@ pub async fn run(
                     &spec.state_dir,
                     &spec.state_dir.join("results"),
                     &run_id,
+                    false,
                 )
                 .ok()
             })
             .unwrap_or_default();
         let record = expected.map(|expected| {
-            let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
-            let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
-            let end = end.with(&expected, &lines);
-            super::github_status::settle(&settled, &run_id, &end, &status, poster.as_ref())
+            let verdict = verdict_of(&settled, &run_id, end, &expected, &jobs, &status);
+            let posting =
+                crate::ci::status::outcome(verdict.decision.clone(), |post| poster.post(post));
+            verdict.record(posting)
         });
         (executed_digest, jobs, record.map(|record| (run_id, record)))
     })
@@ -442,7 +443,7 @@ pub async fn run(
 
 /// Keep the status with the run, so that `show` says it later. The resident
 /// owns the journal; an older one does not know the request and says so.
-async fn keep_status(
+pub(super) async fn keep_status(
     context: &Context,
     run_id: RunId,
     record: crate::ci::status::Record,
@@ -498,7 +499,23 @@ impl Ended {
         }
     }
 
-    fn with<'a>(
+    /// How a run that has not been waited for stands, from what the parent
+    /// has recorded of it. `settled` is whether its completion has an exit
+    /// code, as `wait` reads it.
+    pub fn of_snapshot(snapshot: &super::completion::Snapshot) -> Self {
+        Self {
+            settled: snapshot.exit_code().is_some(),
+            cancel_requested: snapshot.cancel_requested,
+            collection_pending: Some(snapshot.collection_pending_tasks > 0),
+            exit_code: snapshot.exit_code().unwrap_or(0),
+            failed: snapshot
+                .first_compute_failure
+                .as_ref()
+                .map(|failure| crate::ci::status::cause(&fault(failure))),
+        }
+    }
+
+    pub(super) fn with<'a>(
         &self,
         expected: &'a [&'a str],
         jobs: &'a [crate::ci::status::Job<'a>],
@@ -522,9 +539,43 @@ impl Ended {
     }
 }
 
+/// What the status of the run is and whether it may be posted: the one
+/// decision the automatic post after `ci` and a post again share.
+pub(super) fn verdict_of(
+    context: &Context,
+    run: &RunId,
+    end: Ended,
+    expected: &[String],
+    jobs: &[JobLine],
+    options: &super::github_status::Options,
+) -> super::github_status::Verdict {
+    let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+    let lines: Vec<_> = jobs.iter().map(JobLine::status_line).collect();
+    let end = end.with(&expected, &lines);
+    super::github_status::verdict(context, run, &end, options)
+}
+
+/// The tasks of the frozen plan that were submitted, from the rows of the
+/// run: the ones the submit receipt names (a discovery task is not one).
+pub fn expected_tasks(
+    store: &crate::storage::CoordinatorStore,
+    run: &RunId,
+) -> Result<Vec<String>, String> {
+    let rows = store.ci_run_tasks(run).map_err(|e| e.to_string())?;
+    let specs = rows.iter().filter_map(|row| {
+        serde_json::from_value::<TaskSpec>(row.spec.clone())
+            .ok()?
+            .ci
+    });
+    Ok(specs
+        .filter(|ci| !crate::wire::is_discovery_task(&ci.task))
+        .map(|ci| ci.task.task_id)
+        .collect())
+}
+
 impl JobLine {
     /// The line as the status decision reads it.
-    fn status_line(&self) -> crate::ci::status::Job<'_> {
+    pub(super) fn status_line(&self) -> crate::ci::status::Job<'_> {
         crate::ci::status::Job {
             plan_task: &self.plan_task,
             status: &self.status,
@@ -545,6 +596,19 @@ pub fn jobs(spec: &super::bootstrap::Spec, run: &RunId) -> Result<Vec<JobLine>, 
     )
 }
 
+/// The lines of a run for a post again: [`job_lines`], and the digest, but a
+/// result or the plan that the run recorded and that cannot be read is an
+/// error. Posting `error` over what GitHub holds from the first time because a
+/// file was removed would be wrong.
+pub fn job_lines_strict(
+    store: &crate::storage::CoordinatorStore,
+    state_dir: &std::path::Path,
+    results: &std::path::Path,
+    run: &RunId,
+) -> Result<Vec<JobLine>, String> {
+    job_report(store, state_dir, results, run, true).map(|(_, lines)| lines)
+}
+
 /// `state_dir` holds the frozen plan of the run. Without it (it is kept as
 /// long as the results, a day at least) the lines of a split job are those
 /// of its shards alone.
@@ -554,14 +618,36 @@ pub fn job_lines(
     results: &std::path::Path,
     run: &RunId,
 ) -> Result<Vec<JobLine>, String> {
-    job_report(store, state_dir, results, run).map(|(_, lines)| lines)
+    job_report(store, state_dir, results, run, false).map(|(_, lines)| lines)
 }
 
+/// The result a finished attempt kept, if it kept one. `Err` when it did and
+/// the file cannot be read.
+fn row_result(
+    store: &crate::storage::CoordinatorStore,
+    results: &std::path::Path,
+    attempt: &crate::ids::AttemptId,
+) -> Result<Option<local_ci::WireTaskResult>, String> {
+    let kept = store
+        .persisted_artifacts(attempt)
+        .map_err(|e| e.to_string())?;
+    let Some((_, digest)) = kept
+        .iter()
+        .find(|(name, _)| name == crate::supervisor::ci_task::RESULT_ARTIFACT)
+    else {
+        return Ok(None);
+    };
+    crate::ci::advance::read_result(results, attempt, digest).map(Some)
+}
+
+/// `strict`: a result or the plan that the run recorded but that cannot be
+/// read now (kept "a day at least") is an error, not a task without a result.
 fn job_report(
     store: &crate::storage::CoordinatorStore,
     state_dir: &std::path::Path,
     results: &std::path::Path,
     run: &RunId,
+    strict: bool,
 ) -> Result<(Option<Digest>, Vec<JobLine>), String> {
     let mut lines = Vec::new();
     let rows = store.ci_run_tasks(run).map_err(|e| e.to_string())?;
@@ -582,13 +668,19 @@ fn job_report(
         }
         by_plan_task.insert(ci.task.task_id.clone(), row);
         digest.get_or_insert_with(|| ci.task.plan_digest.clone());
-        let result = row.attempt.as_ref().and_then(|attempt| {
-            let kept = store.persisted_artifacts(&attempt.attempt_id).ok()?;
-            let (_, digest) = kept
-                .iter()
-                .find(|(name, _)| name == crate::supervisor::ci_task::RESULT_ARTIFACT)?;
-            crate::ci::advance::read_result(results, &attempt.attempt_id, digest).ok()
-        });
+        let result = match row.attempt.as_ref() {
+            None => None,
+            Some(attempt) => match row_result(store, results, &attempt.attempt_id) {
+                Ok(result) => result,
+                Err(why) if strict => {
+                    return Err(format!(
+                        "the result of task {} cannot be read: {why}",
+                        row.task_id
+                    ))
+                }
+                Err(_) => None,
+            },
+        };
         lines.extend(lines::row_lines(
             &row.task_id,
             &ci.task.task_id,
@@ -597,11 +689,17 @@ fn job_report(
             result,
         ));
     }
-    let plan = digest
-        .as_ref()
-        .and_then(|digest| crate::ci::advance::read_plan(state_dir, digest).ok())
-        .and_then(|bytes| serde_json::from_slice::<local_ci::FrozenPlan>(&bytes).ok())
-        .filter(|plan| plan.shard_groups.iter().any(|group| group.split));
+    let read = digest.as_ref().map(|digest| {
+        let bytes = crate::ci::advance::plan_bytes(state_dir, digest)?;
+        serde_json::from_slice::<local_ci::FrozenPlan>(&bytes).map_err(|e| e.to_string())
+    });
+    let plan = match read {
+        Some(Err(why)) if strict => {
+            return Err(format!("the frozen plan of the run cannot be read: {why}"))
+        }
+        read => read.and_then(Result::ok),
+    }
+    .filter(|plan| plan.shard_groups.iter().any(|group| group.split));
     if let Some(plan) = plan {
         let row_of = |task: &str| by_plan_task.get(task).copied();
         if let Ok(progress) = crate::ci::advance::replay(store, results, &plan, row_of) {

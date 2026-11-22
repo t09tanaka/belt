@@ -170,6 +170,19 @@ pub enum CiSub {
         #[arg(long)]
         run: Option<String>,
     },
+    /// Show the GitHub status of a run from what was recorded of it. With
+    /// `--post`, post it again (after a failed or skipped post, or a retry).
+    Status {
+        /// The run.
+        run: String,
+        /// Post the status. Without it nothing is posted.
+        #[arg(long)]
+        post: bool,
+        /// The context to post under (default: the one the run was last
+        /// posted under, else `local-ci`).
+        #[arg(long)]
+        status_context: Option<String>,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -496,6 +509,9 @@ pub fn run(cli: Cli) -> i32 {
 
     if matches!(&cli.command, Command::Ci(args) if matches!(args.sub, Some(CiSub::Plan { .. }))) {
         return run_ci_plan(&cli);
+    }
+    if matches!(&cli.command, Command::Ci(args) if matches!(args.sub, Some(CiSub::Status { .. }))) {
+        return run_ci_status(&cli);
     }
     if matches!(&cli.command, Command::Ci(_)) {
         return run_ci(&cli);
@@ -852,6 +868,77 @@ fn run_ci(cli: &Cli) -> i32 {
                 }
             }
             code
+        }
+        Err(error) => {
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                );
+            } else {
+                eprintln!("error: {}", error.message);
+            }
+            error.code.exit_code()
+        }
+    }
+}
+
+/// `ci status <run> [--post]`: the status of a run as recorded, and with
+/// `--post` posted again. Reads only; `--post` records the attempt through
+/// the resident.
+fn run_ci_status(cli: &Cli) -> i32 {
+    let result = (|| -> Result<crate::service::status_post::Reposted, crate::error::ApiError> {
+        let Command::Ci(args) = &cli.command else {
+            unreachable!()
+        };
+        let Some(CiSub::Status {
+            run,
+            post,
+            status_context,
+        }) = &args.sub
+        else {
+            unreachable!()
+        };
+        let invalid =
+            |e: String| crate::error::ApiError::new(crate::error::ErrorCode::InvalidInput, e);
+        if args.snapshot.is_some() || args.git_ref.is_some() || args.no_status {
+            return Err(invalid(
+                "a stored run already selects its source and status".into(),
+            ));
+        }
+        let run = crate::ids::RunId::parse(run).map_err(|e| invalid(e.to_string()))?;
+        let context = ci_context(args)?;
+        let poster = std::sync::Arc::new(crate::service::github_status::Gh::new(&context));
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| crate::error::ApiError::new(ErrorCode::Internal, e.to_string()))?;
+        let result = runtime.block_on(crate::service::status_post::run(
+            context,
+            run,
+            *post,
+            status_context.clone(),
+            poster,
+        ));
+        runtime.shutdown_background();
+        result
+    })();
+    match result {
+        Ok(shown) => {
+            let ok = shown.ok();
+            if cli.json {
+                println!(
+                    "{}",
+                    serde_json::json!({"schema_version":1,"ok":ok,"result":shown})
+                );
+            } else {
+                print!("{}", shown.render());
+            }
+            if ok {
+                0
+            } else {
+                ErrorCode::CommandFailed.exit_code()
+            }
         }
         Err(error) => {
             if cli.json {
