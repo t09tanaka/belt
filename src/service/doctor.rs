@@ -35,7 +35,7 @@ use std::{
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
-use task_traffic_controller::{config::Config, ledger::Ledger, Paths};
+use task_traffic_controller::{config::Config, ledger::Ledger, lock, Context, Paths};
 
 const TRAFFIC_CLI: &str = "task-traffic-controller";
 /// Where `loginctl` is when the service environment's PATH does not have it.
@@ -84,6 +84,18 @@ pub struct Scope {
     pub ledger_entries: Option<usize>,
 }
 
+/// The jobs of the `task-traffic-controller` command in its scope: the
+/// ledger entries that have no managed sidecar (belt's own entries always
+/// have one), told apart by their lease, which the owning process holds for
+/// as long as it lives.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CliJobs {
+    /// Their owner holds the lease: the job is running or queued now.
+    pub live: usize,
+    /// Nobody holds the lease: the owner is gone and the entry is left over.
+    pub stale: usize,
+}
+
 /// The `task-traffic-controller` binary the service environment resolves.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TrafficCli {
@@ -118,6 +130,10 @@ pub struct HostFacts {
     pub worker_scope: Scope,
     pub cli_scope: Scope,
     pub cli: Option<TrafficCli>,
+    /// `None`: the command's ledger could not be read, or the host that
+    /// answered predates the check.
+    #[serde(default)]
+    pub cli_jobs: Option<CliJobs>,
     pub docker: Docker,
     pub profile: ProfileFacts,
     /// Lingering of the service user. Only a host whose service is a systemd
@@ -254,6 +270,30 @@ fn scope(state_dir: &Path, config_file: &Path) -> Scope {
     }
 }
 
+/// Who holds the entries of one scope, read without writing anything. The
+/// lease is the library's own proof that an owner lives (a PID alone is
+/// reused), so no process is looked up or signalled here.
+fn cli_jobs(state_dir: &Path, config_file: &Path) -> Option<CliJobs> {
+    let paths = Paths::new(state_dir, config_file);
+    if std::fs::symlink_metadata(paths.ledger_file()).is_err() {
+        return Some(CliJobs::default());
+    }
+    let context = Context::new(paths);
+    let snapshot = lock::snapshot_read_only(&context).ok()?;
+    let mut jobs = CliJobs::default();
+    for entry in &snapshot.ledger.entries {
+        if context.paths.managed_file(&entry.id).exists() {
+            continue;
+        }
+        if snapshot.suspect_dead.contains(&entry.id) {
+            jobs.stale += 1;
+        } else {
+            jobs.live += 1;
+        }
+    }
+    Some(jobs)
+}
+
 fn traffic_cli(env: &BTreeMap<String, String>, runner: &mut dyn Runner) -> Option<TrafficCli> {
     let path = find_on_path(env, TRAFFIC_CLI)?;
     let answer = runner
@@ -330,6 +370,7 @@ pub fn gather(
         worker_scope: scope(&worker_dir, &worker_config),
         cli_scope: scope(&cli_dir, &cli_config),
         cli: traffic_cli(env, runner),
+        cli_jobs: cli_jobs(&cli_dir, &cli_config),
         docker: docker(env, runner),
         profile: profile(worker_state, env),
         linger: None,
@@ -402,27 +443,62 @@ pub fn evaluate(host: &str, facts: &HostFacts) -> Vec<Check> {
         ),
     });
     // A job started by an older command keeps running that older code
-    // whatever the PATH resolves now. Such a job leaves state in the
-    // command's scope, so without a command and without state there is
-    // none; otherwise the processes would have to be examined, and are not.
-    out.push(if cli_present {
-        check(
-            "traffic_processes",
-            Level::NotChecked,
-            format!(
-                "running task-traffic-controller processes are not examined ({}); a job started by an older build may still be running",
-                match facts.cli_scope.ledger_entries {
-                    Some(n) => format!("{n} entries in the command's ledger"),
-                    None => "the command's ledger is unreadable".into(),
-                }
-            ),
-        )
-    } else {
+    // whatever the PATH resolves now. Such a job is an entry of the
+    // command's scope that is not belt's (no sidecar) and whose owner still
+    // holds its lease. Without a command and without state there is none.
+    out.push(if !cli_present {
         check(
             "traffic_processes",
             Level::Ok,
             "no separate task-traffic-controller command or state, so none of its jobs can be running".into(),
         )
+    } else {
+        match &facts.cli_jobs {
+            None => check(
+                "traffic_processes",
+                Level::NotChecked,
+                match facts.cli_scope.ledger_entries {
+                    None => "the command's ledger is unreadable, so its running jobs cannot be told".into(),
+                    Some(_) => "this host did not report the command's jobs (its helper predates the check); update it".into(),
+                },
+            ),
+            Some(jobs) if jobs.live > 0 => {
+                let old = facts
+                    .cli
+                    .as_ref()
+                    .is_some_and(|cli| !cli.status_readable || !cli.knows_managed);
+                let text = format!(
+                    "{} job(s) of the command are running in its scope ({} left-over entries)",
+                    jobs.live, jobs.stale
+                );
+                if old {
+                    check(
+                        "traffic_processes",
+                        Level::Fail,
+                        format!("{text} under a command that does not know managed entries: let them finish and update the command before it shares a scope with belt"),
+                    )
+                } else {
+                    check(
+                        "traffic_processes",
+                        Level::Notice,
+                        format!("{text}; they are not belt's, and a job started by an older build keeps its code: let them finish before updating the command"),
+                    )
+                }
+            }
+            Some(jobs) if jobs.stale > 0 => check(
+                "traffic_processes",
+                Level::Notice,
+                format!(
+                    "{} entries of the command's ledger have no live owner; the next task-traffic-controller run releases them",
+                    jobs.stale
+                ),
+            ),
+            Some(_) => check(
+                "traffic_processes",
+                Level::Ok,
+                "no job of the command is running".into(),
+            ),
+        }
     });
     let same_scope = facts.worker_scope.state_dir == facts.cli_scope.state_dir
         && facts.worker_scope.config_file == facts.cli_scope.config_file;
