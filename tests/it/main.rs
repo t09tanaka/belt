@@ -46,6 +46,7 @@ mod remote_links;
 mod test_tmp_root;
 
 mod workers_lifecycle;
+mod workers_listing;
 mod workers_upgrade;
 
 mod top;
