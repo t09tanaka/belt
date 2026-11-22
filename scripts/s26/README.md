@@ -1,13 +1,19 @@
 # S26: Mac parent, two Linux workers and a Linux init member
 
 This is a disposable, real SSH/systemd harness, not a simulated worker test.
-It runs a native Mac parent and three `linux/arm64` Docker Desktop containers:
+It runs a native Mac parent and three Linux Docker Desktop containers (arm64 by default):
 w1 and w2 stay worker-only, and m1 becomes an `init` member (its own resident,
 parent and worker, as a lingering systemd user service).
 The parent uses the hidden foreground `belt daemon --input` entry point and a
 private bootstrap (the same contract used by `tests/it/remote_links.rs`). It
 never calls Mac `belt init` or registers a LaunchAgent; the public `init`
 service-registration path is exercised on Linux only, by m1.
+
+For x86_64 workers, export `S26_ARCH=amd64` before building, starting,
+running and cleaning up. This selects a native x86_64 compiler inside Docker,
+the `belt-linux-x86_64` artifacts and an architecture-specific image. The
+default base is `target/s26-amd64`; if setting `S26_BASE` explicitly, give
+each architecture its own base so the workers and evidence stay separate.
 
 ## Prerequisites and run
 

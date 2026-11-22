@@ -15,6 +15,6 @@ cp "$S26_ROOT/scripts/s26/ports.toml" "$S26_BASE/resources/.portool.toml"
 cd "$S26_BASE/resources"
 "$PORTOOL" sync --quiet
 "$PORTOOL" check
-"$TTC" exec -- docker build --platform linux/arm64 \
-    -t belt-s26-worker:debian12.9-fw0.4.0 "$S26_ROOT/scripts/s26"
+"$TTC" exec -- docker build --platform "linux/$S26_ARCH" \
+    -t "$S26_IMAGE" "$S26_ROOT/scripts/s26"
 exec "$PORTOOL" exec --strict -- python3 "$S26_ROOT/scripts/s26/harness.py" up

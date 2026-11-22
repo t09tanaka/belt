@@ -15,6 +15,7 @@ import time
 
 ROOT = Path(os.environ["S26_ROOT"])
 BASE = Path(os.environ["S26_BASE"])
+LINUX_BINARY = "belt-linux-" + os.environ["S26_MACHINE"]
 RUN = Path(os.environ["S26_RUN"])
 LABEL = "io.belt.s26.run"
 # w1 and w2 stay worker-only (installed by the host); m1 becomes an init member.
@@ -103,14 +104,14 @@ def up():
     command(["docker", "network", "create", "--label", f"{LABEL}={token}", prefix])
     for host, name in zip(HOSTS, manifest["containers"]):
         port = os.environ["S26_" + host.upper() + "_PORT"]
-        command(["docker", "run", "-d", "--platform", "linux/arm64",
+        command(["docker", "run", "-d", "--platform", "linux/" + os.environ["S26_ARCH"],
                  "--privileged", "--cgroupns=host", "--tmpfs", "/run",
                  "--tmpfs", "/run/lock", "--tmpfs", "/tmp",
                  "-v", "/sys/fs/cgroup:/sys/fs/cgroup:rw",
                  "--label", f"{LABEL}={token}", "--name", name,
                  "--hostname", host, "--network", prefix,
                  "-p", f"127.0.0.1:{port}:22",
-                 "belt-s26-worker:debian12.9-fw0.4.0"])
+                 os.environ["S26_IMAGE"]])
         command(["docker", "cp", RUN / "id_ed25519.pub",
                  f"{name}:/home/belt/.ssh/authorized_keys"])
         command(["docker", "exec", name, "sh", "-ec",
@@ -128,7 +129,7 @@ class Checks:
         binary = Path(os.environ["S26_BELT"])
         if not binary.is_absolute() or not binary.is_file():
             raise RuntimeError("S26_BELT must name an existing absolute native binary")
-        if not (BASE / "belt-linux-aarch64").is_file():
+        if not (BASE / LINUX_BINARY).is_file():
             raise RuntimeError("run build-linux.sh first")
         if len(os.fsencode(RUN / "state/parent/request.sock")) >= 104:
             raise RuntimeError("checkout path is too long for macOS Unix sockets; use a shorter checkout path")
@@ -232,7 +233,7 @@ class Checks:
 
     def install(self, host):
         self.belt("workers", "add", host, "--ssh", host, "--install", "--binary",
-                  str(BASE / "belt-linux-aarch64"), timeout=180)
+                  str(BASE / LINUX_BINARY), timeout=180)
         self.service(host, "active")
 
     def service(self, host, expected, kind="worker"):
@@ -452,7 +453,7 @@ class Checks:
         return views
 
     def m1(self):
-        n = BASE / "belt-linux-aarch64"
+        n = BASE / LINUX_BINARY
         # The spec's order for a host that becomes a member: an existing
         # member installs it as a worker, then `init` runs there.
         self.install("m1")
@@ -502,8 +503,8 @@ class Checks:
     # A57: `belt upgrade` on m1 (§24.8). These need a Linux build with the
     # upgrade subcommand and the variants from `build-linux.sh --upgrade`.
 
-    VARIANTS = {"n": "belt-linux-aarch64", "n1": "belt-linux-aarch64-n1",
-                "broken": "belt-linux-aarch64-n1-broken"}
+    VARIANTS = {"n": LINUX_BINARY, "n1": LINUX_BINARY + "-n1",
+                "broken": LINUX_BINARY + "-n1-broken"}
 
     def a57_ready(self, *need):
         if not self.m1_ready:
