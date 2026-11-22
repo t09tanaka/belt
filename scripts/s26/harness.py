@@ -360,7 +360,8 @@ class Checks:
         self.service("w2", "inactive")
         self.belt("workers", "start", "w2")
         self.service("w2", "active")
-        return "workers stop/start changed w2 user service inactive -> active"
+        from worker_upgrade import verify
+        return verify(self, RUN, BASE / LINUX_BINARY, "w2", command, ssh, sha256, save)
 
     # m1: an init member. The host installs it as a worker, then `belt init`
     # runs there as its user, so its one resident (parent and worker) is a
@@ -799,7 +800,7 @@ def run():
         checks.check("A02", checks.a02)
         checks.check("A45 (part)", checks.a45)
         checks.check("A01", checks.a01)
-        checks.check("A34 (part)", checks.a34)
+        checks.check("A34 worker lifecycle and upgrade", checks.a34)
         checks.check("M1 init member", checks.m1)
         # A57 needs `belt upgrade` (R68); each check skips, with its reason,
         # when the Linux belt on m1 has no such subcommand.
