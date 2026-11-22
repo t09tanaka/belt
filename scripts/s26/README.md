@@ -185,18 +185,26 @@ ran `PYTHONPATH=vendor python3 -m pytest -q tests/test_<module>.py`.
 The parent was macOS and the w1/w2 workers were arm64 Linux containers on
 the same machine.
 
-| Configuration | Elapsed seconds | Sum of step seconds | Sum of resource wait seconds | Workers that ran jobs |
-| --- | ---: | ---: | ---: | --- |
-| Parent, first | 38.97 | 5.95 | 0.055 | local |
-| Parent, repeat | 22.21 | 7.22 | 0.067 | local |
-| Group, after reconnect | 12.10 | 4.85 | 0.140 | local, w2 |
-| Group, repeat | 11.51 | 5.17 | 0.189 | local, w1, w2 |
+The native timing build was `15aef9e` on macOS 27.0.1 arm64. The first
+parent run started with a fresh allocation. The group inherited the parent's
+cache and added two fresh arm64 Debian workers over SSH; the resident stayed
+running throughout. Each topology ran the same four independent jobs twice.
 
-All job outcomes matched. The repeat elapsed-time ratio was 1.93×.
-The group measurements retained existing caches and restarted the resident
-between runs during diagnosis. This sample has no cold-group or physical LAN
-measurement. The coordinator did not retain a transfer-duration sample for
-these runs; the elapsed totals include delivery and collection.
+| Configuration | Elapsed (s) | Preparation (s) | Input delivery (s) | Resource wait (s) | Work (s) | Collection (s) | Workers executing jobs |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| Parent, first | 25.86 | 9.065 | 8.136 | 0.035 | 5.624 | 0.768 | local |
+| Parent, repeat | 16.84 | 7.924 | 0.000 | 0.037 | 5.054 | 0.891 | local |
+| Group, first | 13.20 | 5.846 | 3.334 | 0.053 | 5.409 | 1.412 | local, w1 |
+| Group, repeat | 12.70 | 11.495 | 0.002 | 0.293 | 5.182 | 2.873 | local, w1, w2 |
+
+All four job outcomes matched on every run. The first-run elapsed-time ratio
+was 1.96× and the repeat ratio was 1.33×. Preparation spans worker acceptance
+to command registration. Delivery includes source forwarding and frozen-plan
+delivery, measured on the parent. Cached source delivery takes zero forwarding
+time. Resource wait and work come from the collected job artifacts. Collection
+spans terminal status to closed collection. These phase totals sum observations
+across jobs or workers that can overlap; elapsed time is measured once per run.
+A physical LAN and four independent cold worker caches were outside this sample.
 
 ## Dedicated system service
 

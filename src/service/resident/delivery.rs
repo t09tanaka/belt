@@ -109,6 +109,8 @@ pub(super) async fn sources(
                 return Ok(());
             }
             let mut transfer_started = None;
+            let mut source_ms = 0;
+            let mut plan_ms = 0;
             let query = crate::scheduler::measured::CostQuery::task(
                 &serde_json::to_value(&spec)?,
                 Some(source.as_str()),
@@ -167,17 +169,20 @@ pub(super) async fn sources(
                     let (cancel, stopped) = watch::channel(false);
                     // This detached job owns only captured IO and its lease. Shutdown
                     // releases resident ownership while blocking exporter cleanup drains.
+                    let forwarding = std::time::Instant::now();
                     let mut job = tokio::spawn(async move {
                         super::super::forward::source_timed(
                             &client, epoch, store, &source, env, stopped, transfer,
                         )
                         .await
                     });
-                    tokio::select! {
+                    let delivered = tokio::select! {
                         _=input_stop.changed()=> { let _=cancel.send(true); return Ok(()); },
                         _ = tokio::time::sleep(Duration::from_secs(30)) => { let _=cancel.send(true); tokio::select! { _=input_stop.changed()=>return Ok(()), result=job=>result?.is_ok() } },
                         result=&mut job=>match result? {Ok(started)=>{transfer_started=started;true},Err(_)=>false},
-                    }
+                    };
+                    source_ms = forwarding.elapsed().as_millis() as u64;
+                    delivered
                 }
             };
             // The frozen plan of a CI run goes with its source, before a task
@@ -187,6 +192,7 @@ pub(super) async fn sources(
                 && match spec.ci.as_ref().filter(|_| gate.ci_task()) {
                     None => true,
                     Some(ci) => {
+                        let forwarding = std::time::Instant::now();
                         let sent = super::super::forward::plan(
                             &worker,
                             coordinator.epoch(),
@@ -195,6 +201,7 @@ pub(super) async fn sources(
                             &ci.task.plan_digest,
                         );
                         let sent = tokio::select! { _=input_stop.changed()=>return Ok(()), sent=sent=>sent };
+                        plan_ms = forwarding.elapsed().as_millis() as u64;
                         if let Err(fault) = &sent {
                             plan_undelivered(
                                 &coordinator,
@@ -234,6 +241,26 @@ pub(super) async fn sources(
                             coordinator.scheduler().model().record(sample);
                         }
                     }
+                }
+                // Unlike the scheduler's reusable estimate, the run's own
+                // timing includes large and cached sources. Keep trial state read-only.
+                if spec.ci.is_some() && gate.ci_task() && !coordinator.in_trial() {
+                    let owner = coordinator.clone();
+                    let run = input.run_id.clone();
+                    let timing = serde_json::json!({
+                        "worker": worker_id, "source_was_ready": verified,
+                        "source_ms": source_ms, "plan_ms": plan_ms,
+                    });
+                    let _ = tokio::task::spawn_blocking(move || {
+                        owner.store().append_event(
+                            Some(&run),
+                            None,
+                            "ci_input_delivered",
+                            &timing,
+                            wall_ms(),
+                        )
+                    })
+                    .await;
                 }
             }
         }
