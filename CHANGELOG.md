@@ -20,6 +20,8 @@ the minor version).
 
 - `retention` module: `sweep`, `sweep_if_due`, `Report`, and the pure rules (`job_action`, `stale_temp_files`, `orphan_job_files`). An embedder that writes state without `run_gated` or `register` calls `retention::sweep_if_due` itself. Also `managed::trim_history_aged`, `history::trim_aged`, `history::trim_collect`, `jobs::cap_log`, `Paths::sweep_stamp`.
 
+## [0.10.6] - 2026-11-23
+
 ### Fixed
 
 - `exec` no longer starts the command with SIGINT and SIGQUIT ignored. While the command runs the wrapper used `SIG_IGN` for them (so the terminal's Ctrl-C does not kill the wrapper), and an ignored disposition survives `exec`, so a command without its own handler could not be interrupted. The wrapper now uses a handler that does nothing, which `exec` resets to the default; the wrapper's own behaviour is unchanged.
