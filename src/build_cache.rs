@@ -819,6 +819,23 @@ fn is_tmp(name: &str) -> bool {
     name.contains(".tmp-")
 }
 
+/// Whether `name` is that of an entry ([`key`]: 64 lowercase hex digits) or
+/// of a temporary one (`<key>.tmp-<pid>-<seq>`), and nothing else.
+pub fn is_entry_name(name: &str) -> bool {
+    let is_key =
+        |s: &str| s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+    let digits = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    match name.split_once(".tmp-") {
+        None => is_key(name),
+        Some((key, rest)) => {
+            is_key(key)
+                && rest
+                    .split_once('-')
+                    .is_some_and(|(pid, seq)| digits(pid) && digits(seq))
+        }
+    }
+}
+
 /// The entries of the cache (not the temporary ones, nor anything that is
 /// not an entry: those have the marker file), as they are on disk.
 pub fn entries(dir: &Path) -> Vec<Entry> {
@@ -1375,6 +1392,44 @@ mod tests {
             .unwrap()
             .set_modified(SystemTime::now() - Duration::from_secs(age))
             .unwrap();
+    }
+
+    #[test]
+    fn what_the_cache_moves_to_the_trash_is_emptied_from_it() {
+        let t = tempfile::tempdir().unwrap();
+        let s = settings(t.path());
+        let k = key(&inputs());
+        let tmp = format!("{k}.tmp-{}-3", std::process::id());
+        let mut moved = Vec::new();
+        for name in [k.as_str(), tmp.as_str()] {
+            let p = s.dir.join(name);
+            std::fs::create_dir_all(p.join("target/debug")).unwrap();
+            moved.push(crate::git::move_to_trash(&p, &s.trash).unwrap());
+        }
+        crate::git::empty_trash_now(&s.trash);
+        for p in &moved {
+            assert!(!p.exists(), "{} is left in the trash", p.display());
+        }
+    }
+
+    #[test]
+    fn only_the_names_of_entries_are_entry_names() {
+        let k = "a".repeat(64);
+        assert!(is_entry_name(&k));
+        assert!(is_entry_name(&format!("{k}.tmp-42-0")));
+        for not in [
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+            format!("{k}.tmp-"),
+            format!("{k}.tmp-42"),
+            format!("{k}.tmp-x-0"),
+            format!("{k}.old"),
+            "old".to_string(),
+        ] {
+            assert!(!is_entry_name(&not), "{not}");
+        }
     }
 
     #[test]

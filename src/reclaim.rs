@@ -1202,6 +1202,9 @@ mod tests {
             "backup.2024.11",
             "abc1234-4242.other.1",
             "x.1.2",
+            // a key one digit short, and one with a suffix of its own
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcde.77.0",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.bak.77.0",
         ];
         for d in theirs {
             std::fs::create_dir_all(trash.join(d).join("sub")).unwrap();
@@ -1211,6 +1214,9 @@ mod tests {
             "abc1234-4242.77.0",
             "abc1234-u1-4242.tools.77.12",
             "abc1234-4242",
+            // what the build cache moved there
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.77.3",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef.tmp-77-0.77.4",
         ] {
             std::fs::create_dir_all(trash.join(d).join("sub")).unwrap();
         }

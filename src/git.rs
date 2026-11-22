@@ -755,6 +755,27 @@ pub fn is_moved_name(name: &std::ffi::OsStr) -> bool {
     moved || is_entry(name)
 }
 
+/// Whether `name` is one local-ci gives to what it moves into the trash: an
+/// entry of `wt` ([`is_moved_name`]) or an entry of the build cache, done or
+/// being written, under [`moved_name`] (`<key>.<pid>.<n>`,
+/// `<key>.tmp-<pid>-<seq>.<pid>.<n>`).
+pub fn is_trash_name(name: &std::ffi::OsStr) -> bool {
+    if is_moved_name(name) {
+        return true;
+    }
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.len() <= 20 && s.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = name.rsplitn(3, '.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(n), Some(pid), Some(entry)) => {
+            digits(n) && digits(pid) && crate::build_cache::is_entry_name(entry)
+        }
+        _ => false,
+    }
+}
+
 /// A directory itself, not a link to one: what is behind a link is not
 /// local-ci's to list or delete.
 pub fn is_real_dir(path: &Path) -> bool {
@@ -769,14 +790,14 @@ fn trashed(trash: &Path) -> Vec<PathBuf> {
         .into_iter()
         .flatten()
         .flatten()
-        .filter(|e| is_moved_name(&e.file_name()))
+        .filter(|e| is_trash_name(&e.file_name()))
         .map(|e| e.path())
         .collect()
 }
 
 /// Delete in the background what local-ci left in the trash: what a deletion
 /// that was killed (with its run, or by a reboot) left there. Only names
-/// local-ci gives ([`is_moved_name`]) are touched.
+/// local-ci gives ([`is_trash_name`]) are touched.
 pub fn empty_trash(ctx: &ExecContext, trash: &Path) {
     for some in trashed(trash).chunks(64) {
         delete_in_background(ctx, some, trash);
