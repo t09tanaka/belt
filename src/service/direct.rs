@@ -50,7 +50,8 @@ pub fn resident_status(env: &BTreeMap<String, String>) -> Result<Resident, ApiEr
         .map_err(|e| unknown(e.to_string()))?;
     runtime.block_on(async {
         if let Some(spec) = &spec {
-            if listening(&spec.state_dir.join("parent/request.sock")).await? {
+            let socket = spec.state_dir.join("parent/request.sock");
+            if listening(&socket).await? {
                 let client =
                     super::bootstrap::load_client(spec).map_err(|e| unknown(e.to_string()))?;
                 return match tokio::time::timeout(
@@ -62,6 +63,20 @@ pub fn resident_status(env: &BTreeMap<String, String>) -> Result<Resident, ApiEr
                     Ok(Ok(super::resident::Reply::Ready { .. })) => Ok(Resident::Running),
                     _ => Err(unknown("the coordinator did not confirm readiness".into())),
                 };
+            }
+            // No answer on the socket is not "no resident": one that is still
+            // starting has not bound it yet, and one that hangs does not
+            // answer. A resident holds `startup.lock` while it is being
+            // started and `coordinator.lock` for as long as it lives (the
+            // system drops both when the process dies), so a stale socket
+            // file left by a dead one is not mistaken for one.
+            for name in OWNERSHIP_LOCKS {
+                if lock_held(&spec.state_dir, name)? {
+                    return Err(unknown(format!(
+                        "the coordinator is starting or not answering ({name} is held in {}); the command was not run",
+                        spec.state_dir.display()
+                    )));
+                }
             }
             if listening(&spec.worker_state_dir.join("agent.sock")).await? {
                 return Err(unknown(
@@ -85,6 +100,44 @@ pub fn resident_status(env: &BTreeMap<String, String>) -> Result<Resident, ApiEr
     })
 }
 
+/// The files a resident locks (`flock`) while it starts and while it lives.
+const OWNERSHIP_LOCKS: [&str; 2] = ["startup.lock", "coordinator.lock"];
+
+/// Whether another process holds the lock `name` in `dir`. Read-only: a file
+/// that does not exist is not held and is never created, and the lock taken
+/// to find out (shared, so concurrent probes do not see each other) is
+/// released at once.
+fn lock_held(dir: &std::path::Path, name: &str) -> Result<bool, ApiError> {
+    use std::fs::{File, OpenOptions, TryLockError};
+    use std::os::unix::fs::OpenOptionsExt;
+    let path = dir.join(name);
+    let file: File = match OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => {
+            return Err(ApiError::new(
+                ErrorCode::CommunicationUnknown,
+                format!("cannot confirm that {} is free: {e}", path.display()),
+            ))
+        }
+    };
+    match file.try_lock_shared() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(false)
+        }
+        Err(TryLockError::WouldBlock) => Ok(true),
+        Err(TryLockError::Error(e)) => Err(ApiError::new(
+            ErrorCode::CommunicationUnknown,
+            format!("cannot confirm that {} is free: {e}", path.display()),
+        )),
+    }
+}
+
 async fn listening(path: &std::path::Path) -> Result<bool, ApiError> {
     use std::io::ErrorKind;
     match tokio::time::timeout(PROBE, tokio::net::UnixStream::connect(path)).await {
@@ -103,8 +156,10 @@ async fn listening(path: &std::path::Path) -> Result<bool, ApiError> {
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Flags {
     pub snapshot: bool,
+    pub git_ref: bool,
     pub in_place: bool,
-    pub placement: bool,
+    pub profile: bool,
+    pub requires: bool,
 }
 
 /// The refusal of an option that needs a run, or `None`. `--local` is not
@@ -112,10 +167,14 @@ pub struct Flags {
 pub fn refusal(flags: Flags) -> Option<ApiError> {
     let option = if flags.snapshot {
         "--snapshot"
+    } else if flags.git_ref {
+        "--ref"
     } else if flags.in_place {
         "--in-place"
-    } else if flags.placement {
-        "--profile and --requires"
+    } else if flags.profile {
+        "--profile"
+    } else if flags.requires {
+        "--requires"
     } else {
         return None;
     };
@@ -272,7 +331,7 @@ pub fn run(
 
 static PENDING: AtomicI32 = AtomicI32::new(0);
 
-/// Ctrl-C while the command runs: the command has it from the terminal.
+/// SIGQUIT while the command runs: the command has it from the terminal.
 extern "C" fn on_terminal(_: libc::c_int) {}
 
 extern "C" fn on_signal(sig: libc::c_int) {
@@ -291,16 +350,22 @@ fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
     }
 }
 
-/// The standalone CLI's signal handling, for the one run of this process.
-/// Waiting, a stop signal is recorded so the entry is removed before the
-/// process ends. Running, Ctrl-C reaches the command's process group from
-/// the terminal (the command stays in the caller's group) and is not sent a
-/// second time; SIGTERM and SIGHUP are forwarded to the command.
+/// Signal handling for the one run of this process. The command stays in
+/// belt's own process group, so a terminal's Ctrl-C and job control reach it
+/// as if it ran without belt; belt does not create a group and does not
+/// signal one. Grandchildren are the command's own responsibility, the same
+/// as running the command without belt.
 ///
-/// Unlike the standalone CLI, Ctrl-C is caught by a handler that does
-/// nothing rather than ignored: an ignored signal stays ignored in the
-/// command started after it (a handler is reset by `exec`), and a shell
-/// started with SIGINT ignored never stops on Ctrl-C.
+/// SIGINT, SIGTERM and SIGHUP that belt itself receives are recorded. Waiting
+/// for admission, the run is stopped and its entry removed before the process
+/// ends, and the command is never started. Running, the runner forwards the
+/// signal to the command's pid alone (never a group), once per signal belt
+/// received. A terminal's Ctrl-C reaches belt and the command both, so the
+/// command then gets SIGINT twice, once from the terminal and once forwarded.
+///
+/// Handlers do nothing but store (SIGQUIT: nothing at all) rather than
+/// ignoring the signal: an ignored signal stays ignored in the command
+/// started after it, while a handler is reset by `exec`.
 struct Signals;
 
 impl Supervisor for Signals {
@@ -314,13 +379,11 @@ impl Supervisor for Signals {
     }
 
     fn running(&self) {
-        for sig in [libc::SIGINT, libc::SIGQUIT] {
-            set_handler(
-                sig,
-                on_terminal as extern "C" fn(libc::c_int) as libc::sighandler_t,
-            );
-        }
-        for sig in [libc::SIGTERM, libc::SIGHUP] {
+        set_handler(
+            libc::SIGQUIT,
+            on_terminal as extern "C" fn(libc::c_int) as libc::sighandler_t,
+        );
+        for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
             set_handler(
                 sig,
                 on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
@@ -356,6 +419,13 @@ mod tests {
             ),
             (
                 Flags {
+                    git_ref: true,
+                    ..Flags::default()
+                },
+                "--ref",
+            ),
+            (
+                Flags {
                     in_place: true,
                     ..Flags::default()
                 },
@@ -363,10 +433,17 @@ mod tests {
             ),
             (
                 Flags {
-                    placement: true,
+                    profile: true,
                     ..Flags::default()
                 },
                 "--profile",
+            ),
+            (
+                Flags {
+                    requires: true,
+                    ..Flags::default()
+                },
+                "--requires",
             ),
         ] {
             let error = refusal(flags).unwrap();
