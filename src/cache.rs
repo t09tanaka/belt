@@ -542,13 +542,7 @@ impl Store {
             return;
         };
         for e in rd.flatten() {
-            let old = e
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .is_some_and(|t| now.saturating_sub(t.as_secs()) > TTL_SECS);
-            if old {
+            if e.metadata().is_ok_and(|m| is_old(&m, now)) {
                 let p = e.path();
                 let _ = if p.is_dir() {
                     std::fs::remove_dir_all(&p)
@@ -556,6 +550,42 @@ impl Store {
                     std::fs::remove_file(&p)
                 };
             }
+        }
+    }
+}
+
+/// Whether what `m` is of was last written longer than [`TTL_SECS`] ago.
+fn is_old(m: &std::fs::Metadata, now: u64) -> bool {
+    m.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .is_some_and(|t| now.saturating_sub(t.as_secs()) > TTL_SECS)
+}
+
+/// [`Store::prune`] for the results of every repository under `results`, and
+/// the removal of the directory of one that no run has written to for as
+/// long. A run looks only at the results of its own repository (a worktree),
+/// so those of a worktree that is gone would otherwise stay for good.
+///
+/// The age of a directory is read before its results are removed, which
+/// writes it. A run that saves a result writes the directory too, so one
+/// that is about to be removed has none that could still be used; a removal
+/// that races a save only loses that result.
+pub fn prune_all(results: &Path, now: u64) {
+    let Ok(rd) = std::fs::read_dir(results) else {
+        return;
+    };
+    for e in rd.flatten() {
+        // a link is not followed: what is behind it is not the cache's
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        let idle = e.metadata().is_ok_and(|m| is_old(&m, now));
+        let dir = e.path();
+        Store::new(dir.clone()).prune(now);
+        if idle {
+            // only when it is empty
+            let _ = std::fs::remove_dir(&dir);
         }
     }
 }
@@ -695,6 +725,53 @@ jobs:
         assert!(volatile("node scripts/audit-dependencies.mjs"));
         assert!(!volatile("npm ci --no-audit"));
         assert!(names("cd api && npm test", "npm") && !names("pnpm i", "npm"));
+    }
+
+    #[test]
+    fn the_old_results_of_every_repository_go_and_so_do_idle_directories() {
+        let tmp = tempfile::tempdir().unwrap();
+        let results = tmp.path().join("results");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let long_ago =
+            std::time::SystemTime::now() - std::time::Duration::from_secs(TTL_SECS + 3600);
+        let age = |p: &Path| {
+            std::fs::File::open(p)
+                .unwrap()
+                .set_modified(long_ago)
+                .unwrap()
+        };
+        // a worktree that is gone: only old results
+        let gone = results.join("gone-0000aaaa");
+        std::fs::create_dir_all(gone.join("f1.artifacts")).unwrap();
+        std::fs::write(gone.join("f2.json"), "{}").unwrap();
+        age(&gone.join("f1.artifacts"));
+        age(&gone.join("f2.json"));
+        age(&gone);
+        // one in use: an old result and a new one
+        let used = results.join("used-0000bbbb");
+        std::fs::create_dir_all(&used).unwrap();
+        std::fs::write(used.join("old.json"), "{}").unwrap();
+        std::fs::write(used.join("new.json"), "{}").unwrap();
+        age(&used.join("old.json"));
+        // one that is old but not empty once pruned keeps its directory
+        let idle = results.join("idle-0000cccc");
+        std::fs::create_dir_all(&idle).unwrap();
+        std::fs::write(idle.join("new.json"), "{}").unwrap();
+        age(&idle);
+        // what is not a directory is not touched
+        std::fs::write(results.join("notes.txt"), "x").unwrap();
+        age(&results.join("notes.txt"));
+
+        prune_all(&results, now);
+
+        assert!(!gone.exists());
+        assert!(!used.join("old.json").exists());
+        assert!(used.join("new.json").exists());
+        assert!(idle.join("new.json").exists());
+        assert!(results.join("notes.txt").exists());
     }
 
     #[test]
