@@ -1,6 +1,6 @@
 //! Exercise the installed CLI with a real terminal, resident and worker.
-#[test]
-fn top_refreshes_the_live_task_and_restores_the_terminal_on_each_quit_key() {
+#[tokio::test]
+async fn top_refreshes_the_live_task_and_restores_the_terminal_on_each_quit_key() {
     let (_root, spec, input) = super::bootstrap::control_fixture_with(|spec| {
         // An initialized client pins its cluster before observing its resident.
         let store =
@@ -8,6 +8,7 @@ fn top_refreshes_the_live_task_and_restores_the_terminal_on_each_quit_key() {
                 .unwrap();
         spec.expected_cluster = Some(store.cluster_id().clone());
     });
+    super::bootstrap::start_resident(&spec).await;
     let harness = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/it/top_pty.py");
     let out = std::process::Command::new("python3")
         .args([harness.as_os_str(), spec.executable.as_os_str()])

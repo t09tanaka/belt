@@ -20,6 +20,16 @@ pub struct Receipt {
     #[serde(skip)]
     pub warnings: Vec<String>,
 }
+
+/// Where a submitted command may run.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Mode {
+    /// In the original directory, on the local worker (`--in-place`).
+    pub in_place: bool,
+    /// On the local worker, from a snapshot (`--local`).
+    pub local: bool,
+}
+
 pub async fn command(
     context: Context,
     command: Vec<String>,
@@ -41,7 +51,7 @@ pub async fn command_with_ids(
     run_id: RunId,
     task_id: TaskId,
 ) -> Result<Receipt, ApiError> {
-    command_with_mode(context, command, revision, run_id, task_id, false).await
+    command_with_mode(context, command, revision, run_id, task_id, Mode::default()).await
 }
 
 pub async fn command_with_mode(
@@ -50,11 +60,15 @@ pub async fn command_with_mode(
     revision: Option<String>,
     run_id: RunId,
     task_id: TaskId,
-    in_place: bool,
+    mode: Mode,
 ) -> Result<Receipt, ApiError> {
     let invalid = |e: String| ApiError::new(ErrorCode::InvalidInput, e);
+    let in_place = mode.in_place;
     if in_place && (!context.config.local_worker.value || revision.is_some()) {
         return Err(invalid("in-place requires the parent local worker".into()));
+    }
+    if mode.local && !context.config.local_worker.value {
+        return Err(invalid("--local requires the parent local worker".into()));
     }
     if in_place {
         let root = context.repo_root.as_deref().unwrap_or(&context.cwd);
@@ -214,6 +228,7 @@ pub async fn command_with_mode(
         toolchains: toolchains.clone(),
         requirements: requirements.clone(),
         in_place,
+        local: mode.local,
         outputs: outputs.clone(),
         setup,
         plan_digest: if let Some(bundle) = &toolchains {

@@ -124,6 +124,7 @@ async fn resident_socket_keeps_accepted_work_running_after_submitter_disconnects
         ],
         requirements: Default::default(),
         in_place: false,
+        local: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::parse(manifest)
@@ -674,6 +675,7 @@ async fn resident_measured_fixture(metrics_fail: bool) {
         outputs: vec![],
         requirements: Default::default(),
         in_place: false,
+        local: false,
         setup: None,
         plan_digest: Digest::of_bytes(b"measured-plan"),
         manifest_digest: Digest::parse(manifest)

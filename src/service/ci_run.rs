@@ -212,6 +212,7 @@ pub fn task_specs(
                 toolchains: None,
                 requirements: requirements.clone(),
                 in_place: false,
+                local: false,
                 setup: None,
                 plan_digest: plan_digest.clone(),
                 manifest_digest: manifest_digest.clone(),
