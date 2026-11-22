@@ -478,11 +478,17 @@ fn freeze_toolchains(
                                 &u.expression,
                             );
                             blocked(format!(
-                                "task `{}` ({}:{}): {}: {}",
-                                task.id, u.location.path, u.location.first_line, b.missing, b.steps
+                                "task `{}` (job {}, {}:{}): {}: {}",
+                                task.id,
+                                task.jobs.join(", "),
+                                u.location.path,
+                                u.location.first_line,
+                                b.missing,
+                                b.steps
                             ))
                         })?;
-                sets.push((format!("task `{}`: ", task.id), scope, own));
+                let who = format!("task `{}` (job {}): ", task.id, task.jobs.join(", "));
+                sets.push((who, scope, own));
             }
         }
     }

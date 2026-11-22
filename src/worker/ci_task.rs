@@ -734,6 +734,36 @@ mod tests {
         );
     }
 
+    /// The discovery attempt as the submit really stages it resolves to the
+    /// task whose tests it lists, so its bundle is checked as that task's.
+    #[test]
+    fn a_staged_discovery_attempt_resolves_to_the_task_it_lists_the_tests_of() {
+        let f = fixture(
+            "on: push\njobs:\n  js:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npx jest\n",
+        );
+        let dir = crate::test_tmp::tempdir().unwrap();
+        let digest = store_plan(dir.path(), &serde_json::to_vec(&f.plan).unwrap()).unwrap();
+        let source = Digest::of_bytes(b"source");
+        let mut specs = crate::service::ci_run::task_specs(
+            &f.plan,
+            &digest,
+            &source,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        crate::ci::discovery::stage(&f.plan, &mut specs, 2, 1, "project", &[]);
+        let probes: Vec<&CiTask> = specs
+            .iter()
+            .filter_map(|(_, spec)| spec.ci.as_ref().map(|ci| &ci.task))
+            .filter(|task| crate::wire::is_discovery_task(task))
+            .collect();
+        assert_eq!(probes.len(), 1);
+        assert!(f.plan.task(&probes[0].task_id).is_none());
+        let (_, found) = plan_task(dir.path(), probes[0]).unwrap();
+        assert_eq!(found.id, task_of(&f.plan, "js"));
+    }
+
     fn payload_for(f: &Fixture, digest: &Digest, job: &str) -> AttemptPayload {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {

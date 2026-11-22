@@ -5531,7 +5531,10 @@ async fn ci_refuses_a_setup_version_it_cannot_freeze() {
         "{text}"
     );
     assert!(text.contains("pin a concrete node version"), "{text}");
-    assert!(text.contains(".github/workflows/ci.yml:8"), "{text}");
+    assert!(
+        text.contains("(job build, .github/workflows/ci.yml:8)"),
+        "{text}"
+    );
     // Two versions of one tool in one job: both places are named.
     ci_project(
         root.path(),
@@ -5543,7 +5546,7 @@ async fn ci_refuses_a_setup_version_it_cannot_freeze() {
     let text = refused(&value);
     assert!(
         text.contains(
-            "conflicting_versions at .github/workflows/ci.yml:8 and .github/workflows/ci.yml:11"
+            "(job build): conflicting_versions at .github/workflows/ci.yml:8 and .github/workflows/ci.yml:11"
         ),
         "{text}"
     );
