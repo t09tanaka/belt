@@ -393,6 +393,32 @@ fn invalid(m: impl Into<String>) -> ApiError {
     ApiError::new(ErrorCode::InvalidInput, m)
 }
 
+/// The frozen selections of one bundle, split by how this worker serves them.
+#[derive(Default)]
+struct ProvidedToolchains {
+    requests: Vec<crate::toolchain::preparation::PreparationRequest>,
+    native: Vec<crate::toolchain::contract::NativeTool>,
+}
+/// The refusal of an activation: its code, or, when a managed install would
+/// run in place of a native tool, the two tools by name.
+fn activation_refused(
+    code: &'static str,
+    native: &[crate::toolchain::contract::NativeTool],
+    plans: &[crate::toolchain::adapters::InstallPlan],
+) -> ApiError {
+    let shadowed = (code == "activation_native_mismatch")
+        .then(|| {
+            crate::toolchain::adapters::shadowed_native(native, &plans.iter().collect::<Vec<_>>())
+        })
+        .flatten();
+    ApiError::blocked(
+        crate::error::BlockedReason::EnvironmentMismatch,
+        match shadowed {
+            Some(shadowed) => format!("{code}: {shadowed}"),
+            None => code.into(),
+        },
+    )
+}
 /// The identity of the profile shell's real file. A profile may name its shell
 /// through a symlink (`/bin/sh` is one on many Linux hosts) and already
 /// measures the resolved file for its fingerprint, so a retargeted link is
@@ -1556,14 +1582,14 @@ impl Agent {
                 ));
             }
         }
-        let registry = self
-            .toolchains
-            .as_ref()
-            .ok_or_else(|| invalid("proposal registry unavailable"))?;
         for requirement in bundle.frozen.requirements.clone() {
             if bundle.evidence.iter().any(|e| e.tool == requirement.tool) {
                 continue;
             }
+            let registry = self
+                .toolchains
+                .as_ref()
+                .ok_or_else(|| invalid("proposal registry unavailable"))?;
             let request = registry
                 .request(&bundle.frozen, &requirement.tool, None)
                 .map_err(|e| {
@@ -1581,7 +1607,7 @@ impl Agent {
         bundle
             .validate(&bundle.frozen.source_manifest)
             .map_err(invalid)?;
-        self.toolchain_requests(&bundle)?;
+        self.toolchain_requests(&bundle, &|| Some(report.clone()))?;
         if !crate::toolchain::capability::missing_with_installable(
             requirements,
             Some(&report),
@@ -1614,30 +1640,52 @@ impl Agent {
         )
     }
 
+    /// How each frozen selection is served here: by a managed install the
+    /// registry plans, or, when no managed install can serve it, by the tool
+    /// the profile itself has at exactly the selected version. `report` is
+    /// asked at most once, and only for a selection the registry cannot serve.
     fn toolchain_requests(
         &self,
         bundle: &crate::toolchain::contract::FrozenBundle,
-    ) -> Result<Vec<crate::toolchain::preparation::PreparationRequest>, ApiError> {
-        let registry = self.toolchains.as_ref().ok_or_else(|| {
-            ApiError::blocked(
-                crate::error::BlockedReason::EnvironmentMismatch,
-                "toolchain registry unavailable",
-            )
-        })?;
-        bundle
-            .evidence
-            .iter()
-            .map(|e| {
-                registry
-                    .request(&bundle.frozen, &e.tool, Some(e))
-                    .map_err(|e| {
-                        ApiError::blocked(
-                            crate::error::BlockedReason::EnvironmentMismatch,
-                            format!("toolchain unavailable: {e:?}"),
-                        )
-                    })
-            })
-            .collect()
+        report: &dyn Fn() -> Option<crate::toolchain::capability::WorkerCapabilities>,
+    ) -> Result<ProvidedToolchains, ApiError> {
+        use crate::toolchain::registry::Unavailable;
+        let mut provided = ProvidedToolchains::default();
+        let mut measured = None;
+        for evidence in &bundle.evidence {
+            let refused = match self
+                .toolchains
+                .as_ref()
+                .map_or(Err(Unavailable::Unconfigured), |registry| {
+                    registry.request(&bundle.frozen, &evidence.tool, Some(evidence))
+                }) {
+                Ok(request) => {
+                    provided.requests.push(request);
+                    continue;
+                }
+                Err(refused) => refused,
+            };
+            let native = refused
+                .allows_native()
+                .then(|| measured.get_or_insert_with(report).as_ref())
+                .flatten()
+                .and_then(|report| {
+                    crate::toolchain::contract::native_tool(&bundle.frozen, &evidence.tool, report)
+                });
+            match native {
+                Some(native) => provided.native.push(native),
+                None => {
+                    return Err(ApiError::blocked(
+                        crate::error::BlockedReason::EnvironmentMismatch,
+                        match &self.toolchains {
+                            Some(_) => format!("toolchain unavailable: {refused:?}"),
+                            None => "toolchain registry unavailable".into(),
+                        },
+                    ))
+                }
+            }
+        }
+        Ok(provided)
     }
     fn execution_binding_path(&self, attempt: &AttemptId) -> PathBuf {
         self.attempt_dir(attempt).join("execution-binding.json")
@@ -1654,12 +1702,15 @@ impl Agent {
         )
         .map_err(|e| internal("execution binding", e))?;
         use crate::toolchain::{adapters, contract::observations};
-        let requests = self.toolchain_requests(&bundle)?;
-        let registry = self.toolchains.as_ref().expect("requests checked registry");
+        // One report decides what is native and is what the activation is
+        // checked against.
+        let measured = std::cell::OnceCell::new();
+        let measure = || measured.get_or_init(|| self.capabilities()).clone();
+        let ProvidedToolchains { requests, native } = self.toolchain_requests(&bundle, &measure)?;
         let mut receipts = Vec::with_capacity(requests.len());
         for request in &requests {
-            match registry.detect(request) {
-                Ok(adapters::Availability::Installed(receipt)) => receipts.push(receipt),
+            match self.toolchains.as_ref().map(|r| r.detect(request)) {
+                Some(Ok(adapters::Availability::Installed(receipt))) => receipts.push(receipt),
                 _ => {
                     return Err(ApiError::blocked(
                         crate::error::BlockedReason::EnvironmentMismatch,
@@ -1673,7 +1724,7 @@ impl Agent {
             .capability_profile
             .as_ref()
             .ok_or_else(|| invalid("toolchain profile unavailable"))?;
-        let report = self.capabilities().ok_or_else(|| {
+        let report = measure().ok_or_else(|| {
             ApiError::blocked(
                 crate::error::BlockedReason::EnvironmentMismatch,
                 "accepted base profile changed",
@@ -1694,16 +1745,17 @@ impl Agent {
         // A valid same-version replacement receipt is a different execution
         // identity. Reconstruct the complete activation read-only; never repair
         // or rewrite the accepted binding during launch/recovery checks.
-        let current = adapters::activate_set(
+        let current = adapters::activate_with_native(
             &bundle.frozen,
             &installed,
+            &native,
             self.cfg.profile_fingerprint.clone(),
             &observations(&report),
             profile.environment(),
             setup_policy,
             &shell,
         )
-        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))?;
+        .map_err(|e| activation_refused(e, &native, &plans))?;
         if current != binding.activation {
             return Err(ApiError::blocked(
                 crate::error::BlockedReason::EnvironmentMismatch,
@@ -1735,7 +1787,13 @@ impl Agent {
             .map_err(|e| internal("execution binding", e))?;
             return Ok(Some(Some(binding)));
         }
-        let requests = self.toolchain_requests(bundle)?;
+        // The report that decides what is native is the one the activation is
+        // made from: two probes could differ and refuse a tool that did not
+        // change. With no native tool nothing is measured here.
+        let measured = std::cell::OnceCell::new();
+        let ProvidedToolchains { requests, native } = self.toolchain_requests(bundle, &|| {
+            measured.get_or_init(|| self.capabilities()).clone()
+        })?;
         let profile = self
             .cfg
             .capability_profile
@@ -1786,16 +1844,36 @@ impl Agent {
         let setup_policy = Digest::of_bytes(
             &serde_json::to_vec(&payload.setup).map_err(|e| internal("setup policy", e))?,
         );
-        let activation = adapters::activate_set(
+        let (native, report) = if native.is_empty() {
+            (native, profile.report())
+        } else if requests.is_empty() {
+            // Nothing was waited for: the report that named the native tools.
+            let report = measured.into_inner().flatten();
+            (native, report.unwrap_or_else(|| profile.report()))
+        } else {
+            // An install may have taken long. What is native is decided again
+            // from the report of this moment, and the activation uses that
+            // same report: a tool that changed meanwhile is refused here.
+            let report = self.capabilities().ok_or_else(|| {
+                ApiError::blocked(
+                    crate::error::BlockedReason::EnvironmentMismatch,
+                    "accepted base profile changed",
+                )
+            })?;
+            let again = self.toolchain_requests(bundle, &|| Some(report.clone()))?;
+            (again.native, report)
+        };
+        let activation = adapters::activate_with_native(
             &bundle.frozen,
             &installed,
+            &native,
             self.cfg.profile_fingerprint.clone(),
-            &observations(&profile.report()),
+            &observations(&report),
             profile.environment(),
             setup_policy,
             &shell,
         )
-        .map_err(|e| ApiError::blocked(crate::error::BlockedReason::EnvironmentMismatch, e))?;
+        .map_err(|e| activation_refused(e, &native, &plans))?;
         let binding = ExecutionBinding { activation };
         let path = self.execution_binding_path(&rec.attempt_id);
         if path.exists() {
@@ -3164,11 +3242,13 @@ impl Agent {
         let (Some(bundle), Some(registry)) = (&payload.toolchains, &self.toolchains) else {
             return 0;
         };
-        let Ok(requests) = self.toolchain_requests(bundle) else {
-            return 0;
-        };
-        requests
+        // A selection the registry does not plan is served natively or not at
+        // all (admission decides); neither is an install to wait for, and
+        // this forecast path must not probe the profile.
+        bundle
+            .evidence
             .iter()
+            .filter_map(|e| registry.request(&bundle.frozen, &e.tool, Some(e)).ok())
             .filter(|r| {
                 !matches!(
                     registry.detect(r),
@@ -3212,7 +3292,7 @@ impl Agent {
         payload.requirements.validate().map_err(invalid)?;
         if let Some(bundle) = &payload.toolchains {
             bundle.validate(&payload.manifest_digest).map_err(invalid)?;
-            self.toolchain_requests(bundle)?;
+            self.toolchain_requests(bundle, &|| self.capabilities())?;
         }
         if let Some(profile) = &self.cfg.capability_profile {
             for command in &payload.commands {

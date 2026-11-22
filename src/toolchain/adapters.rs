@@ -1351,9 +1351,36 @@ pub fn activate_set(
     setup_policy: Digest,
     shell: &FileIdentity,
 ) -> Result<ActivationReceipt> {
+    activate_with_native(
+        frozen,
+        installed,
+        &[],
+        base_profile,
+        base_observations,
+        base_env,
+        setup_policy,
+        shell,
+    )
+}
+/// `activate_set` for a contract some of whose selections the profile's own
+/// tools serve. A native tool adds no private path: the attempt uses the one
+/// on the profile path, and its observed identity stands where an
+/// installation receipt would.
+#[allow(clippy::too_many_arguments)]
+pub fn activate_with_native(
+    frozen: &FrozenToolchains,
+    installed: &[(&InstallPlan, &InstallationReceipt)],
+    native: &[super::contract::NativeTool],
+    base_profile: Digest,
+    base_observations: &BTreeMap<ToolId, super::versions::VersionObservation>,
+    base_env: &BTreeMap<String, String>,
+    setup_policy: Digest,
+    shell: &FileIdentity,
+) -> Result<ActivationReceipt> {
     compose_activation(
         frozen,
         installed,
+        native,
         base_profile,
         base_observations,
         base_env,
@@ -1363,10 +1390,54 @@ pub fn activate_set(
         |plan, receipt| receipt.validate(plan),
     )
 }
+/// The names a native tool is started by: the profile probes that stand for
+/// it (`rust` is `rustc` and `cargo`), or its own name.
+fn native_programs(tool: &ToolId) -> Vec<&str> {
+    let probes: Vec<&str> = super::capability::TOOLS
+        .iter()
+        .copied()
+        .filter(|name| super::contract::canonical_tool(name) == tool.as_str())
+        .map(|name| if name == "xcode" { "xcodebuild" } else { name })
+        .collect();
+    if probes.is_empty() {
+        vec![tool.as_str()]
+    } else {
+        probes
+    }
+}
+/// Why the activated path would start a native tool from a managed install
+/// instead of the one the profile measured: a managed directory, all of which
+/// go before the profile path, holds a program of that name (the `npm` next
+/// to a managed `node`, the `dart` next to a managed `flutter`). `None` when
+/// every native tool resolves to what was measured. Reads file metadata only.
+pub fn shadowed_native(
+    native: &[super::contract::NativeTool],
+    managed: &[&InstallPlan],
+) -> Option<String> {
+    native.iter().find_map(|tool| {
+        native_programs(&tool.tool).into_iter().find_map(|program| {
+            managed
+                .iter()
+                .find(|plan| {
+                    fs::metadata(plan.activation_bin.join(program))
+                        .is_ok_and(|m| m.is_file() && m.mode() & 0o111 != 0)
+                })
+                .map(|plan| {
+                    format!(
+                        "native {} {} is not what would run: the managed {} install has its own {program}",
+                        tool.tool.as_str(),
+                        tool.version,
+                        plan.tool.as_str(),
+                    )
+                })
+        })
+    })
+}
 #[allow(clippy::too_many_arguments)]
 fn compose_activation(
     frozen: &FrozenToolchains,
     installed: &[(&InstallPlan, &InstallationReceipt)],
+    native: &[super::contract::NativeTool],
     base_profile: Digest,
     base_observations: &BTreeMap<ToolId, super::versions::VersionObservation>,
     base_env: &BTreeMap<String, String>,
@@ -1376,7 +1447,9 @@ fn compose_activation(
     validate_receipt: impl Fn(&InstallPlan, &InstallationReceipt) -> Result<()>,
 ) -> Result<ActivationReceipt> {
     use super::versions::{Match, MatchPolicy, VersionObservation};
-    if !frozen.is_resolved() || installed.len() != frozen.selections.len() || installed.len() > 256
+    if !frozen.is_resolved()
+        || installed.len() + native.len() != frozen.selections.len()
+        || installed.len() > 256
     {
         return Err("complete_activation_set_required");
     }
@@ -1437,6 +1510,32 @@ fn compose_activation(
             }
         }
         receipts.push((plan.tool.clone(), receipt.digest()));
+    }
+    for tool in native {
+        // The profile has to report the selected version at this moment too.
+        let selected = frozen
+            .selections
+            .iter()
+            .find(|s| s.tool == tool.tool)
+            .is_some_and(|s| s.concrete == tool.version);
+        if !selected
+            || !tools.insert(tool.tool.clone())
+            || MatchPolicy::Exact.compare(
+                &VersionObservation::Known(tool.version.clone()),
+                base_observations
+                    .get(&tool.tool)
+                    .unwrap_or(&VersionObservation::Unknown),
+            ) != Match::Match
+        {
+            return Err("activation_native_mismatch");
+        }
+        receipts.push((tool.tool.clone(), tool.identity.clone()));
+    }
+    // The probe measured a native tool on the base path; every managed
+    // directory goes before that path.
+    let managed: Vec<_> = installed.iter().map(|(plan, _)| *plan).collect();
+    if shadowed_native(native, &managed).is_some() {
+        return Err("activation_native_mismatch");
     }
     if frozen.selections.iter().any(|s| !tools.contains(&s.tool)) {
         return Err("complete_activation_set_required");

@@ -1539,6 +1539,7 @@ fn preparation_probe_complete_installation_matches_real_activation_and_detects_d
         let sampled = prospective_activation(
             &f.plan.frozen,
             &[verified],
+            &[],
             base,
             &BTreeMap::new(),
             &base_env(&f.plan),
@@ -1675,6 +1676,7 @@ fn preparation_probe_activation_cannot_mix_verification_queries() {
         prospective_activation(
             &f.plan.frozen,
             &[verified],
+            &[],
             Digest::of_bytes(b"base"),
             &BTreeMap::new(),
             &base_env(&f.plan),
@@ -1768,4 +1770,282 @@ fn an_accepted_binding_stays_valid_when_the_worker_gains_scope_variables() {
     let mut other = before.clone();
     other.insert("ORDINARY".into(), "x".into());
     assert_ne!(activation_of(&other).1, binding.activation);
+}
+
+#[test]
+fn a_native_selection_adds_no_private_path_and_its_identity_is_the_receipt() {
+    use crate::toolchain::contract::NativeTool;
+    use crate::toolchain::versions::VersionObservation;
+    let f = fixture(AdapterKind::Nodenv, "node");
+    let frozen = &f.plan.frozen;
+    let env = base_env(&f.plan);
+    let base = Digest::of_bytes(b"base");
+    let policy = Digest::of_bytes(b"policy");
+    let native = |tool: &ToolId, version: &str, identity: &[u8]| NativeTool {
+        tool: tool.clone(),
+        version: Version::parse(version).unwrap(),
+        identity: Digest::of_bytes(identity),
+    };
+    let seen =
+        |version: &str| BTreeMap::from([(f.plan.tool.clone(), VersionObservation::parse(version))]);
+    let activate = |native: &[NativeTool], observed: &BTreeMap<_, _>| {
+        activate_with_native(
+            frozen,
+            &[],
+            native,
+            base.clone(),
+            observed,
+            &env,
+            policy.clone(),
+            &f.shell,
+        )
+    };
+    let node = &f.plan.tool;
+    let first = activate(&[native(node, "1.2.3", b"a")], &seen("1.2.3")).unwrap();
+    // The attempt uses the tool of the profile path; nothing is put before it.
+    assert_eq!(first.environment, env);
+    assert_eq!(
+        first.installation,
+        hash(&vec![(node.clone(), Digest::of_bytes(b"a"))])
+    );
+    // The same version from another executable is another execution identity.
+    let replaced = activate(&[native(node, "1.2.3", b"b")], &seen("1.2.3")).unwrap();
+    assert_ne!(replaced.installation, first.installation);
+    assert_ne!(replaced.binding_digest, first.binding_digest);
+    assert_ne!(replaced.execution_fingerprint, first.execution_fingerprint);
+    // The profile has to report the selected version when it is activated.
+    for observed in [seen("1.2.4"), BTreeMap::new()] {
+        assert_eq!(
+            activate(&[native(node, "1.2.3", b"a")], &observed),
+            Err("activation_native_mismatch")
+        );
+    }
+    // A native tool stands only for its own selection, at its version, once.
+    let other = ToolId::parse("go").unwrap();
+    for (tools, observed) in [
+        (vec![native(node, "1.2.4", b"a")], seen("1.2.4")),
+        (
+            vec![native(&other, "1.2.3", b"a")],
+            BTreeMap::from([(other.clone(), VersionObservation::parse("1.2.3"))]),
+        ),
+    ] {
+        assert_eq!(
+            activate(&tools, &observed),
+            Err("activation_native_mismatch")
+        );
+    }
+    for tools in [
+        vec![],
+        vec![native(node, "1.2.3", b"a"), native(node, "1.2.3", b"a")],
+    ] {
+        assert_eq!(
+            activate(&tools, &seen("1.2.3")),
+            Err("complete_activation_set_required")
+        );
+    }
+    // A managed install and a native tool cannot both claim one selection.
+    let receipt = install_admitted(&f.plan, &mut Fake::for_plan(&f.plan)).unwrap();
+    assert_eq!(
+        activate_with_native(
+            frozen,
+            &[(&f.plan, &receipt)],
+            &[native(node, "1.2.3", b"a")],
+            base.clone(),
+            &seen("1.2.3"),
+            &env,
+            policy.clone(),
+            &f.shell,
+        ),
+        Err("complete_activation_set_required")
+    );
+}
+
+/// An install whose directory also gets `ships`, as a real one arrives with
+/// more programs than the tool itself (the receipt covers them).
+struct Shipping<'a> {
+    inner: Fake,
+    bin: PathBuf,
+    ships: &'a [&'a str],
+}
+impl AdmittedExecutor for Shipping<'_> {
+    fn execute(&mut self, command: &CommandSpec) -> Result<CommandOutput> {
+        let output = self.inner.execute(command)?;
+        for program in self.ships {
+            executable(&self.bin.join(program), b"shipped with the managed tool");
+        }
+        Ok(output)
+    }
+}
+/// One contract of two pins: `managed` installed by its adapter (with `ships`
+/// beside it), `native` served by the profile. Returns the contract, the
+/// managed plan and its receipt.
+fn managed_beside_native(
+    f: &Fixture,
+    kind: AdapterKind,
+    managed: &str,
+    native: &str,
+    ships: &[&str],
+) -> (FrozenToolchains, InstallPlan, InstallationReceipt) {
+    let state = f.plan.root.parent().unwrap();
+    let scope = Scope::project("");
+    let declarations = [managed, native].map(|tool| Declaration {
+        tool: ToolId::parse(tool).unwrap(),
+        constraint: Constraint::parse("1.2.3").unwrap(),
+        scope: scope.clone(),
+        location: Location {
+            path: "captured".into(),
+            first_line: 1,
+            last_line: 1,
+        },
+    });
+    let initial = FrozenToolchains::freeze(
+        Digest::of_bytes(b"source"),
+        Digest::of_bytes(b"profile"),
+        scope,
+        &declarations,
+        &[],
+        &BTreeMap::new(),
+        MatchPolicy::Exact,
+    )
+    .unwrap();
+    let evidence = |tool: &str| ResolutionEvidence {
+        contract: initial.digest(),
+        tool: ToolId::parse(tool).unwrap(),
+        concrete: Version::parse("1.2.3").unwrap(),
+        catalog: Digest::of_bytes(b"catalog"),
+        resolved_inputs: BTreeMap::new(),
+    };
+    let managed = evidence(managed);
+    let frozen = resolve(&resolve(&initial, &managed).unwrap(), &evidence(native)).unwrap();
+    let host = HostTools {
+        manager: f.plan.external[0].clone(),
+        dependencies: f.plan.external[1..].to_vec(),
+        search_path: vec![f.plan.external[0].path.parent().unwrap().into()],
+        rust_host: "aarch64-apple-darwin".into(),
+    };
+    let plan = plan(kind, &frozen, &managed.tool, &managed, state, &host).unwrap();
+    let receipt = install_admitted(
+        &plan,
+        &mut Shipping {
+            inner: Fake::for_plan(&plan),
+            bin: plan.activation_bin.clone(),
+            ships,
+        },
+    )
+    .unwrap();
+    (frozen, plan, receipt)
+}
+
+/// Every managed directory goes before the profile path, where the native
+/// tool was measured. A managed install that ships a program of a native tool
+/// would therefore run in its place: the activation is refused, and accepted
+/// only while no managed directory holds such a program.
+#[test]
+fn a_managed_install_that_would_run_in_place_of_a_native_tool_is_refused() {
+    use crate::toolchain::contract::NativeTool;
+    use crate::toolchain::versions::VersionObservation;
+    for (kind, managed, native, programs) in [
+        // npm, npx and corepack come in the directory of a node install.
+        (AdapterKind::Nodenv, "node", "npm", vec!["npm"]),
+        // The flutter SDK has its own dart.
+        (AdapterKind::Fvm, "flutter", "dart", vec!["dart"]),
+        (AdapterKind::Nodenv, "node", "rust", vec!["rustc", "cargo"]),
+        (AdapterKind::Nodenv, "node", "xcode", vec!["xcodebuild"]),
+        // A tool no profile probe stands for is started by its own name.
+        (AdapterKind::Nodenv, "node", "python", vec!["python"]),
+    ] {
+        let tool = ToolId::parse(native).unwrap();
+        let served = [NativeTool {
+            tool: tool.clone(),
+            version: Version::parse("1.2.3").unwrap(),
+            identity: Digest::of_bytes(b"measured on the profile path"),
+        }];
+        let activate = |f: &Fixture,
+                        frozen: &FrozenToolchains,
+                        plan: &InstallPlan,
+                        receipt: &InstallationReceipt| {
+            activate_with_native(
+                frozen,
+                &[(plan, receipt)],
+                &served,
+                Digest::of_bytes(b"base"),
+                &BTreeMap::from([(tool.clone(), VersionObservation::parse("1.2.3"))]),
+                &base_env(plan),
+                Digest::of_bytes(b"policy"),
+                &f.shell,
+            )
+        };
+        // No overlap (npx and corepack are not npm): the managed directory
+        // first, then the profile path, on which the native tool is the first
+        // of its name.
+        let f = fixture(kind, managed);
+        let (frozen, plan, receipt) =
+            managed_beside_native(&f, kind, managed, native, &["npx", "corepack"]);
+        let accepted = activate(&f, &frozen, &plan, &receipt)
+            .unwrap_or_else(|e| panic!("{managed}+{native}: {e}"));
+        assert_eq!(
+            accepted.environment["PATH"],
+            format!(
+                "{}:{}",
+                text(&plan.activation_bin).unwrap(),
+                base_env(&plan)["PATH"]
+            ),
+            "{managed}+{native}"
+        );
+        // Both stand in the identity, by tool, whichever way they are served.
+        let mut receipts = vec![
+            (plan.tool.clone(), receipt.digest()),
+            (tool.clone(), served[0].identity.clone()),
+        ];
+        receipts.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(accepted.installation, hash(&receipts));
+        assert_eq!(shadowed_native(&served, &[&plan]), None);
+        // The read-only forecast of this activation is this activation.
+        let budget = IdentityReadBudget::probe();
+        let verified = inspect_installation(plan.clone(), &budget).unwrap();
+        let forecast = |native: &[NativeTool]| {
+            prospective_activation(
+                &frozen,
+                std::slice::from_ref(&verified),
+                native,
+                Digest::of_bytes(b"base"),
+                &BTreeMap::from([(tool.clone(), VersionObservation::parse("1.2.3"))]),
+                &base_env(&plan),
+                Digest::of_bytes(b"policy"),
+                &f.shell.path,
+                &budget,
+            )
+        };
+        assert_eq!(forecast(&served).as_ref(), Ok(&accepted));
+        assert_eq!(forecast(&[]), Err("complete_activation_set_required"));
+        for program in programs {
+            // What a shell would not start does not stand in the way.
+            let shipped = plan.activation_bin.join(program);
+            fs::create_dir(&shipped).unwrap();
+            assert_eq!(shadowed_native(&served, &[&plan]), None, "{program}");
+            fs::remove_dir(&shipped).unwrap();
+            fs::write(&shipped, b"data").unwrap();
+            fs::set_permissions(&shipped, fs::Permissions::from_mode(0o600)).unwrap();
+            assert_eq!(shadowed_native(&served, &[&plan]), None, "{program}");
+            fs::remove_file(&shipped).unwrap();
+            // An install that came with the program: it would be the one run.
+            let f = fixture(kind, managed);
+            let (frozen, plan, receipt) =
+                managed_beside_native(&f, kind, managed, native, &[program]);
+            assert_eq!(
+                activate(&f, &frozen, &plan, &receipt),
+                Err("activation_native_mismatch"),
+                "{managed} ships {program}"
+            );
+            let said = shadowed_native(&served, &[&plan]).unwrap();
+            assert!(
+                said.contains(&format!("native {native} 1.2.3"))
+                    && said.contains(&format!("managed {managed} install has its own {program}")),
+                "{said}"
+            );
+            // Under the managed tool's own selection the program is that
+            // tool: with nothing native, nothing is refused.
+            assert_eq!(shadowed_native(&[], &[&plan]), None);
+        }
+    }
 }

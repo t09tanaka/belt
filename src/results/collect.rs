@@ -1442,10 +1442,13 @@ impl Collector {
     ) -> Result<Verdict> {
         let verdict = verdict_of(&declared.names(result), result);
         let name = crate::supervisor::ci_task::RESULT_ARTIFACT;
+        let ci = declared.payload.ci_task.as_ref();
         let record = result.artifacts.iter().find(|r| r.name == name);
-        let (Some(ci), Some(record), Verdict::Complete) =
-            (&declared.payload.ci_task, record, verdict)
-        else {
+        let (Some(ci), Some(record), true) = (
+            ci,
+            record,
+            plan::needs_ci_read(ci.is_some(), record.is_some(), verdict),
+        ) else {
             return Ok(verdict);
         };
         let (attempt, digest, task) = (

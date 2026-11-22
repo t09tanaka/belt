@@ -5,9 +5,10 @@
 //! uses. No snapshot, run or attempt is made.
 
 use crate::error::{ApiError, ErrorCode};
+use crate::platform;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use task_traffic_controller::config::Config;
@@ -336,13 +337,75 @@ pub fn run(
     }
 }
 
-static PENDING: AtomicI32 = AtomicI32::new(0);
+/// One bit per signal number received and not yet delivered to the command or
+/// taken by the runner: no signal replaces another.
+static PENDING: AtomicU64 = AtomicU64::new(0);
+
+/// The running command's pid, or 0 for none. The handler forwards to it
+/// directly, so a signal that lands just before the runner blocks in its wait
+/// is not left for an interruption that never comes.
+static CHILD: AtomicU32 = AtomicU32::new(0);
+
+/// Handlers between "about to read [`CHILD`]" and "the signal was sent".
+/// Invariant: a pid is signalled only while unreaped. A handler can run on any
+/// thread that does not block the signal, so it may be preempted between
+/// loading [`CHILD`] and signalling; `child_exited` therefore clears [`CHILD`]
+/// and then waits for this to reach 0, and the runner reaps only after that,
+/// so a recycled pid is never signalled.
+static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 
 /// SIGQUIT while the command runs: the command has it from the terminal.
 extern "C" fn on_terminal(_: libc::c_int) {}
 
+/// Address of this thread's `errno`.
+unsafe fn errno_location() -> *mut libc::c_int {
+    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+    {
+        // SAFETY: returns the calling thread's errno slot.
+        unsafe { libc::__error() }
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "freebsd")))]
+    {
+        // SAFETY: returns the calling thread's errno slot.
+        unsafe { libc::__errno_location() }
+    }
+}
+
+/// Takes the bit for `sig` out of [`PENDING`]; true only for the one caller
+/// that cleared it, so a signal is delivered exactly once.
+fn claim(sig: libc::c_int) -> bool {
+    let bit = 1u64 << sig;
+    PENDING.fetch_and(!bit, Ordering::SeqCst) & bit != 0
+}
+
+/// Async-signal-safe: atomics and `platform::signal_pid` (one `kill`) only.
+/// Records the signal first, then forwards it itself if a command is
+/// published. The runner publishes the command and only then drains
+/// [`PENDING`]; with both sides sequentially consistent at least one of them
+/// sees the signal, and `claim` lets only one of them deliver it. `errno` is
+/// left as found: the interrupted code may be between a failing call and its
+/// check.
 extern "C" fn on_signal(sig: libc::c_int) {
-    PENDING.store(sig, Ordering::SeqCst);
+    // SAFETY: reads and restores this thread's errno slot.
+    let saved_errno = unsafe { *errno_location() };
+    record_and_forward(sig);
+    // SAFETY: as above.
+    unsafe { *errno_location() = saved_errno };
+}
+
+fn record_and_forward(sig: libc::c_int) {
+    if !(1..64).contains(&sig) {
+        return;
+    }
+    PENDING.fetch_or(1u64 << sig, Ordering::SeqCst);
+    // Raised before CHILD is read, lowered after the signal is sent.
+    IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+    let pid = CHILD.load(Ordering::SeqCst);
+    // `signal_pid` refuses pid 0, 1 and anything that wraps negative.
+    if pid != 0 && claim(sig) {
+        platform::signal_pid(pid, sig);
+    }
+    IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
 }
 
 /// The descriptor of belt's controlling terminal, or -1 when it has none.
@@ -389,13 +452,17 @@ extern "C" fn on_running_signal(sig: libc::c_int) {
     let fd = TTY.load(Ordering::SeqCst);
     // SAFETY: tcgetpgrp and getpgrp are async-signal-safe and touch no memory.
     let foreground = fd >= 0 && unsafe { libc::tcgetpgrp(fd) == libc::getpgrp() };
-    if forwards(sig, foreground) {
+    running_signal(sig, foreground);
+}
+
+fn running_signal(sig: libc::c_int, terminal_foreground: bool) {
+    if forwards(sig, terminal_foreground) {
         on_signal(sig);
     }
 }
 
 fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
-    // SAFETY: installs a handler that only stores to an atomic.
+    // SAFETY: installs an async-signal-safe handler.
     unsafe {
         let mut action: libc::sigaction = std::mem::zeroed();
         action.sa_sigaction = handler;
@@ -414,17 +481,19 @@ fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
 ///
 /// SIGINT, SIGTERM and SIGHUP that belt itself receives are recorded. Waiting
 /// for admission, the run is stopped and its entry removed before the process
-/// ends, and the command is never started. Running, the runner forwards the
-/// signal to the command's pid alone (never a group). It keeps a single
-/// pending slot, so two different signals close together forward only the
-/// last, and a signal that lands just before `wait4` blocks is forwarded at
-/// the next interruption of that wait, not at once. A terminal's Ctrl-C
-/// already reaches the command, so it is not forwarded again (see
-/// [`on_running_signal`]).
+/// ends, and the command is never started. Running, each signal is forwarded
+/// to the command's pid alone (never a group), exactly once: pending signals
+/// are a bitmask, so two different signals close together are both kept, and
+/// the runner publishes the command's pid (`child_started`) so the handler
+/// forwards at once, even when the signal lands just before the runner blocks
+/// in its wait. `child_exited` runs before the command is reaped and waits
+/// for handlers in flight, so a reaped pid is never signalled. A terminal's
+/// Ctrl-C already reaches the command, so it is not recorded or forwarded
+/// again (see [`on_running_signal`]).
 ///
-/// Handlers do nothing but store (SIGQUIT: nothing at all) rather than
-/// ignoring the signal: an ignored signal stays ignored in the command
-/// started after it, while a handler is reset by `exec`.
+/// Handlers only touch atomics and send one signal (SIGQUIT: nothing at all)
+/// rather than ignoring the signal: an ignored signal stays ignored in the
+/// command started after it, while a handler is reset by `exec`.
 struct Signals;
 
 impl Supervisor for Signals {
@@ -449,6 +518,9 @@ impl Supervisor for Signals {
                 on_running_signal as extern "C" fn(libc::c_int) as libc::sighandler_t,
             );
         }
+        // An inherited SIG_IGN would auto-reap the command while its pid is
+        // still published.
+        set_handler(libc::SIGCHLD, libc::SIG_DFL);
     }
 
     fn finished(&self) {
@@ -458,13 +530,177 @@ impl Supervisor for Signals {
     }
 
     fn take_pending(&self) -> i32 {
-        PENDING.swap(0, Ordering::SeqCst)
+        loop {
+            let bits = PENDING.load(Ordering::SeqCst);
+            if bits == 0 {
+                return 0;
+            }
+            let sig = bits.trailing_zeros() as i32;
+            if claim(sig) {
+                return sig;
+            }
+        }
+    }
+
+    /// belt signals the command alone. The runner passes `group` only for a
+    /// managed command, which belt's direct exec never is; if it ever did,
+    /// nothing is published, so the handler never signals a group (the runner
+    /// itself still would, in its drain).
+    fn child_started(&self, pid: u32, group: bool) {
+        if pid > 1 && !group {
+            CHILD.store(pid, Ordering::SeqCst);
+        }
+    }
+
+    fn child_exited(&self) {
+        CHILD.store(0, Ordering::SeqCst);
+        // A handler that loaded the old value may still be about to signal:
+        // do not return (and let the runner reap) until none is.
+        while IN_FLIGHT.load(Ordering::SeqCst) != 0 {
+            std::hint::spin_loop();
+            std::thread::yield_now();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The statics are process-wide: one test at a time.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn serial() -> std::sync::MutexGuard<'static, ()> {
+        let guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        while Signals.take_pending() != 0 {}
+        Signals.child_exited();
+        guard
+    }
+
+    fn spawn_sleep() -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30");
+        // SAFETY: signal() is async-signal-safe. A parent started in the
+        // background hands SIGINT down as ignored, which would hide the signal.
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+                Ok(())
+            });
+        }
+        cmd.spawn().unwrap()
+    }
+
+    #[test]
+    fn two_different_signals_before_they_are_taken_are_both_kept() {
+        let _g = serial();
+        on_signal(libc::SIGTERM);
+        on_signal(libc::SIGINT);
+        on_signal(libc::SIGTERM);
+        assert_eq!(Signals.take_pending(), libc::SIGINT);
+        assert_eq!(Signals.take_pending(), libc::SIGTERM);
+        assert_eq!(Signals.take_pending(), 0);
+    }
+
+    #[test]
+    fn the_handler_reaches_a_published_child_without_a_wait_interrupt() {
+        use std::os::unix::process::ExitStatusExt;
+        let _g = serial();
+        let mut child = spawn_sleep();
+        Signals.child_started(child.id(), false);
+        on_signal(libc::SIGTERM);
+        let status = child.wait().unwrap();
+        Signals.child_exited();
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
+        // Delivered by the handler, so the drain has nothing left to send.
+        assert_eq!(Signals.take_pending(), 0);
+    }
+
+    #[test]
+    fn nothing_is_signalled_without_a_published_child_or_for_pid_0_or_1_or_a_group() {
+        let _g = serial();
+        for (pid, group) in [(0u32, false), (1, false), (std::process::id(), true)] {
+            Signals.child_started(pid, group);
+            assert_eq!(CHILD.load(Ordering::SeqCst), 0, "pid {pid} group {group}");
+        }
+        // No child: the handler only records, and the signal stays for the runner.
+        on_signal(libc::SIGHUP);
+        assert_eq!(Signals.take_pending(), libc::SIGHUP);
+        assert_eq!(Signals.take_pending(), 0);
+    }
+
+    #[test]
+    fn child_exited_waits_for_handlers_in_flight() {
+        let _g = serial();
+        // A pid that is never signalled here: no handler runs in this test.
+        Signals.child_started(std::process::id(), false);
+        IN_FLIGHT.fetch_add(1, Ordering::SeqCst);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let t = std::thread::spawn(move || {
+            go_tx.send(()).unwrap();
+            Signals.child_exited();
+            done_tx.send(()).unwrap();
+        });
+        go_rx.recv().unwrap();
+        // The published pid is cleared first, so no new handler can use it.
+        while CHILD.load(Ordering::SeqCst) != 0 {
+            std::thread::yield_now();
+        }
+        // Judged after the counter is lowered: a failed assertion with the
+        // counter still raised would leave every later `child_exited` waiting.
+        let returned_early = done_rx.try_recv().is_ok();
+        IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        if !returned_early {
+            done_rx.recv().unwrap();
+        }
+        t.join().unwrap();
+        assert!(!returned_early, "returned with a handler in flight");
+        assert_eq!(IN_FLIGHT.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn a_sigint_with_the_terminal_foreground_is_neither_recorded_nor_delivered() {
+        use std::os::unix::process::ExitStatusExt;
+        let _g = serial();
+        let mut child = spawn_sleep();
+        Signals.child_started(child.id(), false);
+        running_signal(libc::SIGINT, true);
+        assert_eq!(Signals.take_pending(), 0);
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "the child was signalled"
+        );
+        // SIGTERM is forwarded in the foreground; SIGINT is when it is not.
+        running_signal(libc::SIGTERM, true);
+        assert_eq!(child.wait().unwrap().signal(), Some(libc::SIGTERM));
+        Signals.child_exited();
+        let mut other = spawn_sleep();
+        Signals.child_started(other.id(), false);
+        running_signal(libc::SIGINT, false);
+        assert_eq!(other.wait().unwrap().signal(), Some(libc::SIGINT));
+        Signals.child_exited();
+    }
+
+    #[test]
+    fn the_handler_keeps_errno() {
+        let _g = serial();
+        // SAFETY: this thread's errno slot.
+        unsafe { *errno_location() = libc::ENOENT };
+        on_signal(libc::SIGHUP);
+        // SAFETY: as above.
+        assert_eq!(unsafe { *errno_location() }, libc::ENOENT);
+        assert_eq!(Signals.take_pending(), libc::SIGHUP);
+    }
+
+    #[test]
+    fn a_signal_number_outside_the_mask_is_ignored() {
+        let _g = serial();
+        on_signal(0);
+        on_signal(64);
+        assert_eq!(Signals.take_pending(), 0);
+    }
 
     #[test]
     fn sigint_is_not_forwarded_only_while_the_terminal_has_it_in_the_foreground() {

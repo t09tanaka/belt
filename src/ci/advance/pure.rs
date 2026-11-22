@@ -136,6 +136,71 @@ pub fn timing_scope(
     ))
 }
 
+/// The plan digest a run is carried out under, as far as a task of it names
+/// it: a task naming another plan is only allowed when a discovery probe
+/// said so.
+pub fn plan_agrees(
+    current: &crate::ids::Digest,
+    task: &crate::ids::Digest,
+    allowable: &std::collections::BTreeSet<crate::ids::Digest>,
+) -> bool {
+    current == task || allowable.contains(task)
+}
+
+/// The project a run names: the first discovery marker that has one.
+pub fn discovery_project<'a>(
+    specs: impl IntoIterator<Item = &'a serde_json::Value>,
+) -> Option<String> {
+    specs.into_iter().find_map(|spec| {
+        spec.pointer("/ci/task/inputs/belt_discovery/project")
+            .and_then(|v| v.as_str())
+            .map(str::to_owned)
+    })
+}
+
+/// Have all the shards of a split job been marked joined? `joined` says it
+/// of a shard; none for a shard that is not a CI task of the run.
+pub fn all_joined(shards: &[String], joined: impl Fn(&str) -> Option<bool>) -> bool {
+    shards.iter().all(|id| joined(id) == Some(true))
+}
+
+/// Is a task that is ready held back (so that releasing it is the step)?
+/// `hold` is its mark, none for a task that is not a CI task.
+pub fn is_held(hold: Option<bool>) -> bool {
+    hold == Some(true)
+}
+
+/// The result of an ended attempt, read from what it kept: `kept` are its
+/// artifacts as `(name, digest)`, `read` reads the one named `wanted`.
+pub fn result_of_kept(
+    kept: &[(String, crate::ids::Digest)],
+    wanted: &str,
+    read: impl FnOnce(&crate::ids::Digest) -> Result<WireTaskResult, String>,
+) -> Result<WireTaskResult, String> {
+    match kept.iter().find(|(name, _)| name == wanted) {
+        None => Err("its result was not collected".to_string()),
+        Some((_, digest)) => read(digest),
+    }
+}
+
+/// What releasing a held task does.
+#[derive(Debug, PartialEq)]
+pub enum Release {
+    /// Its inputs do not fit a payload: it is cancelled with the reason.
+    Refuse(String),
+    /// It goes into the queue with this spec.
+    Send(serde_json::Value),
+}
+
+pub fn release_step(spec: &TaskSpec, inputs: &TaskInputs) -> Result<Release, serde_json::Error> {
+    if !inputs_fit(inputs) {
+        return Ok(Release::Refuse(oversize_reason()));
+    }
+    serde_json::to_value(inputs)
+        .and_then(|inputs| serde_json::to_value(released_spec(spec, inputs)))
+        .map(Release::Send)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,5 +389,116 @@ mod tests {
             None
         );
         assert_eq!(timing_scope(Some("p"), &group(&["a"], None), "d"), None);
+    }
+
+    #[test]
+    fn a_task_may_name_the_plan_of_the_run_or_one_a_probe_allowed() {
+        let (a, b, c) = (
+            crate::ids::Digest::of_bytes(b"a"),
+            crate::ids::Digest::of_bytes(b"b"),
+            crate::ids::Digest::of_bytes(b"c"),
+        );
+        let allowed: std::collections::BTreeSet<_> = [b.clone()].into();
+        let none = Default::default();
+        assert!(plan_agrees(&a, &a, &none));
+        assert!(!plan_agrees(&a, &b, &none));
+        assert!(plan_agrees(&a, &b, &allowed));
+        assert!(!plan_agrees(&a, &c, &allowed));
+    }
+
+    #[test]
+    fn the_project_is_the_first_discovery_marker_that_names_one() {
+        let marked = |project: serde_json::Value| serde_json::json!({"ci": {"task": {"inputs": {"belt_discovery": {"project": project}}}}});
+        let none = serde_json::json!({"ci": {"task": {"inputs": {}}}});
+        let number = marked(serde_json::json!(3));
+        let (one, two) = (marked("one".into()), marked("two".into()));
+        assert_eq!(discovery_project([&none, &number]), None);
+        assert_eq!(discovery_project(Vec::<&serde_json::Value>::new()), None);
+        assert_eq!(
+            discovery_project([&none, &number, &one, &two]),
+            Some("one".to_string())
+        );
+    }
+
+    #[test]
+    fn a_split_job_is_joined_when_every_shard_is_marked_joined() {
+        let shards = vec!["a".to_string(), "b".to_string()];
+        let of = |a: Option<bool>, b: Option<bool>| move |id: &str| if id == "a" { a } else { b };
+        assert!(all_joined(&shards, of(Some(true), Some(true))));
+        assert!(!all_joined(&shards, of(Some(true), Some(false))));
+        assert!(!all_joined(&shards, of(Some(false), Some(true))));
+        assert!(!all_joined(&shards, of(Some(true), None)));
+        assert!(all_joined(&[], of(None, None)));
+    }
+
+    #[test]
+    fn only_a_task_marked_held_is_released() {
+        assert!(is_held(Some(true)));
+        assert!(!is_held(Some(false)));
+        assert!(!is_held(None));
+    }
+
+    #[test]
+    fn the_result_is_read_from_the_artifact_of_that_name_or_missing() {
+        let (x, y) = (
+            crate::ids::Digest::of_bytes(b"x"),
+            crate::ids::Digest::of_bytes(b"y"),
+        );
+        let kept = vec![
+            ("other".to_string(), x.clone()),
+            ("result".to_string(), y.clone()),
+        ];
+        let got = result_of_kept(&kept, "result", |d| {
+            assert_eq!(d, &y);
+            Ok(result_of("t"))
+        });
+        assert_eq!(got.unwrap().task, "t");
+        let unreadable = |_: &crate::ids::Digest| Err("unreadable".to_string());
+        let got = result_of_kept(&kept, "result", unreadable);
+        assert_eq!(got.unwrap_err(), "unreadable");
+        let got = result_of_kept(&kept[..1], "result", unreadable);
+        assert_eq!(got.unwrap_err(), "its result was not collected");
+        let got = result_of_kept(&[], "result", unreadable);
+        assert_eq!(got.unwrap_err(), "its result was not collected");
+    }
+
+    #[test]
+    fn releasing_sends_the_spec_with_its_inputs_or_refuses_oversize_ones() {
+        let f = crate::ci::execute::tests::fixture(crate::ci::execute::tests::WORKFLOW);
+        let digest = crate::ids::Digest::of_bytes(b"plan");
+        let manifest = crate::ids::Digest::of_bytes(b"manifest");
+        let specs = crate::service::ci_run::task_specs(
+            &f.plan,
+            &digest,
+            &manifest,
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        let held = specs
+            .iter()
+            .map(|(_, spec)| spec)
+            .find(|spec| spec.ci.as_ref().is_some_and(|ci| ci.hold))
+            .expect("a task that waits");
+        let outcome = |bytes: usize| local_ci::task::JobOutcome {
+            job: "a".into(),
+            variant: None,
+            status: JobStatus::Success,
+            outputs: [("o".to_string(), "x".repeat(bytes))].into(),
+            skipped: None,
+            ancestor_failed: false,
+        };
+        let inputs = |bytes| {
+            let o = outcome(bytes);
+            TaskInputs::new([&o], [&o], false)
+        };
+        let small = inputs(4);
+        let want = serde_json::to_value(released_spec(held, serde_json::to_value(&small).unwrap()))
+            .unwrap();
+        assert_eq!(release_step(held, &small).unwrap(), Release::Send(want));
+        assert_eq!(
+            release_step(held, &inputs(MAX_RELEASED_INPUT_BYTES)).unwrap(),
+            Release::Refuse(oversize_reason())
+        );
     }
 }
