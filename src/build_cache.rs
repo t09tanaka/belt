@@ -48,7 +48,7 @@ const MARKER: &str = ".local-ci-entry";
 pub const DIR: &str = "build";
 
 /// Total size of the cache before the least recently used entries go, in GiB.
-const DEFAULT_MAX_GB: f64 = 20.0;
+const DEFAULT_MAX_GB: f64 = 50.0;
 
 /// The most a copy that is not a clone may take, in MiB. Above it the cache
 /// is skipped rather than slow the job down with a copy.
@@ -80,7 +80,7 @@ impl Settings {
     /// The settings for a cache directory, from the environment of `ctx`:
     /// `LOCAL_CI_NO_BUILD_CACHE` (anything but empty or `0`) turns the cache
     /// off (`None`), `LOCAL_CI_BUILD_CACHE_MAX_GB` sets the size cap (default
-    /// 20; `0` turns the cache off) and `LOCAL_CI_BUILD_CACHE_COPY_LIMIT_MB` the
+    /// 50; `0` turns the cache off) and `LOCAL_CI_BUILD_CACHE_COPY_LIMIT_MB` the
     /// most that is copied where cloning is not available (default 512).
     /// `LOCAL_CI_BUILD_CACHE_PROBE_TIMEOUT_SECS` bounds the toolchain probe
     /// (default 20).
@@ -1597,7 +1597,7 @@ mod tests {
         };
         let s = Settings::from_ctx(&with("X", "1"), dir, false).unwrap();
         assert_eq!(s.dir, Path::new("/c/build"));
-        assert_eq!(s.max_bytes, 20 * 1024 * 1024 * 1024);
+        assert_eq!(s.max_bytes, 50 * 1024 * 1024 * 1024);
         assert_eq!(s.probe_timeout, Duration::from_secs(20));
         assert!(Settings::from_ctx(&with("X", "1"), dir, true).is_none());
         assert!(Settings::from_ctx(&with("LOCAL_CI_NO_BUILD_CACHE", "1"), dir, false).is_none());

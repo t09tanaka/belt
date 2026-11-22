@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- Raise the default cap of the build cache from 20 GB to 50 GB. An entry for a mid-sized Rust workspace is 2 to 3 GB and one run of such a workspace needs about eight of them (test legs, an MSRV job, mutation shards), so the old cap was the whole of what one run needed and the entries were evicted by the run that needed them and saved again on the next. `LOCAL_CI_BUILD_CACHE_MAX_GB` still sets the cap.
+
 ## [0.18.4] - 2026-11-23
 
 - Fix the build cache's entries never being deleted from the trash. An entry that the cache evicts, or a temporary one it gives up, is moved to `<cache>/trash`, but the trash was emptied only of the names a worktree gets there, so neither a run nor `local-ci cache prune` deleted them and they piled up (on one machine to over a hundred GB). They are now deleted like the rest, and what is already there goes at the start of the next run. Nothing else in the trash is touched.
