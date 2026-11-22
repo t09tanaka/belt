@@ -1020,6 +1020,8 @@ if __name__ == "__main__":
                 from a46 import run as action
             elif sys.argv[1] == "peers":
                 from peers import run as action
+            elif sys.argv[1] == "linux_parent":
+                from linux_parent import run as action
             if action is None:
                 raise ValueError(f"unknown action: {sys.argv[1]}")
             sys.exit(action() or 0)
