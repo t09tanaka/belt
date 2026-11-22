@@ -142,19 +142,55 @@ fn the_worker_ends_itself_only_after_the_notice_with_nothing_live_and_nothing_to
 }
 
 #[test]
-fn the_stop_bound_is_the_grace_plus_the_kill_wait_and_a_margin() {
+fn the_stop_bound_is_the_grace_plus_the_kill_wait_and_a_margin_capped_at_a_day() {
     assert_eq!(stop_bound_ms(10_000), 20_000);
     assert_eq!(stop_bound_ms(0), 10_000);
-    assert_eq!(stop_bound_ms(u64::MAX), u64::MAX);
+    assert_eq!(stop_bound_ms(86_400_000 - 10_000), 86_400_000);
+    assert_eq!(stop_bound_ms(86_400_000 - 9_999), 86_400_000);
+    assert_eq!(stop_bound_ms(u64::MAX), 86_400_000);
 }
 
 #[test]
-fn a_graceful_end_waits_until_nothing_lives_or_the_bound_passes() {
-    assert_eq!(stop_step(Some(0), false), StopStep::Settled);
-    assert_eq!(stop_step(Some(0), true), StopStep::Settled);
-    assert_eq!(stop_step(Some(2), false), StopStep::Wait);
-    assert_eq!(stop_step(Some(2), true), StopStep::GiveUp);
-    // A count that cannot be read is never taken as idle.
-    assert_eq!(stop_step(None, false), StopStep::Wait);
-    assert_eq!(stop_step(None, true), StopStep::GiveUp);
+fn only_a_fully_read_empty_worker_is_quiet() {
+    assert!(quiet(Some(0), Some(0)));
+    assert!(!quiet(Some(1), Some(0)));
+    assert!(!quiet(Some(0), Some(1)));
+    assert!(!quiet(None, Some(0)));
+    assert!(!quiet(Some(0), None));
+}
+
+#[test]
+fn two_quiet_looks_after_the_begin_settle_and_nothing_else_does() {
+    use StopStep::*;
+    assert_eq!(stop_step(true, true, true, false), (Settled, true));
+    assert_eq!(stop_step(true, true, true, true), (Settled, true));
+    // The first quiet look waits for a second.
+    assert_eq!(stop_step(true, true, false, false), (Wait, true));
+    // Something alive resets the pair.
+    assert_eq!(stop_step(true, false, true, false), (Wait, false));
+    // A look begun before the stop says nothing, even quiet, even after one.
+    assert_eq!(stop_step(false, true, true, false), (Wait, false));
+    assert_eq!(stop_step(false, true, false, false), (Wait, false));
+    // The bound gives up unless the pair is complete.
+    assert_eq!(stop_step(true, false, false, true), (GiveUp, false));
+    assert_eq!(stop_step(true, true, false, true), (GiveUp, true));
+    assert_eq!(stop_step(false, true, true, true), (GiveUp, false));
+}
+
+#[test]
+fn a_count_taken_before_the_stop_cannot_settle_an_attempt_accepted_after_it() {
+    use StopStep::*;
+    // The interleaving: a look spawned before the marker returns zero, an
+    // attempt is accepted, the looks after the marker see it.
+    let mut before = false;
+    let mut next = |after_begin, quiet, bound| {
+        let (step, q) = stop_step(after_begin, quiet, before, bound);
+        before = q;
+        step
+    };
+    assert_eq!(next(false, true, false), Wait);
+    assert_eq!(next(false, true, false), Wait);
+    assert_eq!(next(true, false, false), Wait);
+    assert_eq!(next(true, true, false), Wait);
+    assert_eq!(next(true, true, false), Settled);
 }

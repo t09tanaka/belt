@@ -344,6 +344,15 @@ impl Drop for Worker {
     }
 }
 
+/// Wait for `f`; after a give-up only for a few seconds (`None` then).
+async fn bounded<F: std::future::Future>(give_up: bool, f: F) -> Option<F::Output> {
+    if give_up {
+        tokio::time::timeout(Duration::from_secs(5), f).await.ok()
+    } else {
+        Some(f.await)
+    }
+}
+
 /// An ephemeral worker told to end stops what runs on it the way an operator's
 /// cancel does: no new placement, every live attempt cancelled on the agent's
 /// ticks, the supervisors ending their commands (TERM, grace, KILL). A second
@@ -358,7 +367,11 @@ fn begin_stop(
     }
     crate::worker::control::write(state, crate::worker::control::Control::cancelling())?;
     eprintln!("ending: stopping the attempts that still run");
-    *ending = Some(tokio::time::Instant::now() + bound);
+    let now = tokio::time::Instant::now();
+    *ending = Some(
+        now.checked_add(bound)
+            .unwrap_or_else(|| now + Duration::from_secs(365 * 86_400)),
+    );
     Ok(())
 }
 
@@ -423,6 +436,8 @@ async fn run(
     // Set when an ephemeral worker was told to end: when its wait for the
     // supervisors stops.
     let mut ending: Option<tokio::time::Instant> = None;
+    // The previous look after the stop began found nothing running.
+    let mut quiet_before = false;
     let listener = AgentListener::bind(&spec.state_dir, &spec.expected_cluster, &spec.worker_id)?;
     let permits = Arc::new(Semaphore::new(serve::MAX_CONCURRENT_REQUESTS));
     let mut connections = tokio::task::JoinSet::new();
@@ -443,8 +458,21 @@ async fn run(
     let mut housekeeping = tokio::task::JoinSet::new();
     let mut ticker = tokio::time::interval(Duration::from_millis(100));
     let mut supervisor_done = false;
+    let giving_up = || {
+        anyhow::anyhow!(
+            "the attempts did not stop within {} s",
+            stop_bound.as_secs()
+        )
+    };
     let result: anyhow::Result<()> = loop {
+        let deadline = ending;
         tokio::select! {
+            _ = async {
+                match deadline {
+                    Some(d) => tokio::time::sleep_until(d).await,
+                    None => std::future::pending().await,
+                }
+            } => break Err(giving_up()),
             r = tokio::signal::ctrl_c() => {
                 if !ephemeral { break r.map_err(Into::into); }
                 if let Err(e) = r { break Err(e.into()); }
@@ -468,6 +496,8 @@ async fn run(
             },
             _ = ticker.tick(), if housekeeping.is_empty() => {
                 let agent = worker.agent.clone();
+                // A look started before the stop began says nothing about it.
+                let after_begin = ending.is_some();
                 housekeeping.spawn_blocking(move || {
                     agent.tick();
                     // An ephemeral worker whose identity a member retired
@@ -475,29 +505,32 @@ async fn run(
                     // member has a result to collect (spec 24.3).
                     if ephemeral {
                         let (told, live, uncollected) = agent.retirement();
-                        (ephemeral::plan::finished(told, live, uncollected), live)
+                        let (live, running) = if after_begin { agent.settling() } else { (live, None) };
+                        (ephemeral::plan::finished(told, live, uncollected), after_begin, ephemeral::plan::quiet(live, running))
                     } else {
-                        (false, None)
+                        (false, false, false)
                     }
                 });
             }
             Some(done) = housekeeping.join_next(), if !housekeeping.is_empty() => {
                 match done {
-                    Ok((true, _)) => {
+                    Ok((true, _, _)) => {
                         eprintln!("this worker's identity was retired, nothing runs on it and nothing is left to collect: ending");
                         break Ok(());
                     }
-                    Ok((false, live)) => {
+                    Ok((false, after_begin, quiet)) => {
                         let Some(deadline) = ending else { continue };
-                        match ephemeral::plan::stop_step(live, tokio::time::Instant::now() >= deadline) {
+                        let (step, q) = ephemeral::plan::stop_step(
+                            after_begin,
+                            quiet,
+                            quiet_before,
+                            tokio::time::Instant::now() >= deadline,
+                        );
+                        quiet_before = q;
+                        match step {
                             ephemeral::plan::StopStep::Wait => {}
                             ephemeral::plan::StopStep::Settled => break Ok(()),
-                            ephemeral::plan::StopStep::GiveUp => {
-                                break Err(anyhow::anyhow!(
-                                    "the attempts did not stop within {} s",
-                                    stop_bound.as_secs()
-                                ))
-                            }
+                            ephemeral::plan::StopStep::GiveUp => break Err(giving_up()),
                         }
                     }
                     Err(e) => break Err(e.into()),
@@ -509,24 +542,34 @@ async fn run(
             }
         }
     };
+    // After a give-up, a pass blocked in a tick must not hold the exit: the
+    // state is kept and the process ends.
+    let give_up = ending.is_some() && result.is_err();
     drop(listener);
     let _ = stop.send(true);
     connections.abort_all();
     while connections.join_next().await.is_some() {}
     // Accepted blocking requests finish before releasing the agent owner lock.
-    let _drained = permits
-        .acquire_many(serve::MAX_CONCURRENT_REQUESTS as u32)
-        .await?;
+    let _drained = bounded(
+        give_up,
+        permits.acquire_many(serve::MAX_CONCURRENT_REQUESTS as u32),
+    )
+    .await
+    .transpose()?;
     let supervised = if supervisor_done {
         Ok(())
     } else {
-        supervisor
+        bounded(give_up, &mut supervisor)
             .await
-            .map_err(anyhow::Error::from)
-            .and_then(|done| done)
+            .map_or(Ok(()), |done| {
+                done.map_err(anyhow::Error::from).and_then(|done| done)
+            })
     };
     let mut ticking_error = None;
-    while let Some(done) = housekeeping.join_next().await {
+    loop {
+        let Some(done) = bounded(give_up, housekeeping.join_next()).await.flatten() else {
+            break;
+        };
         if let Err(e) = done {
             ticking_error.get_or_insert(e);
         }

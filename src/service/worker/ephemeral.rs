@@ -97,13 +97,18 @@ fn start(args: &Args) -> anyhow::Result<()> {
             "ephemeral worker {} started as instance {instance}",
             spec.worker_id
         );
-        tokio::runtime::Builder::new_multi_thread()
+        let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .build()?
-            .block_on(super::run(spec, config, Some(planned.boot_id)))
+            .build()?;
+        let done = runtime.block_on(super::run(spec, config, Some(planned.boot_id)));
+        // A blocking pass that never returns must not hold the exit.
+        runtime.shutdown_timeout(std::time::Duration::from_secs(5));
+        done
     })();
-    match clean_up(&created) {
-        Ok(true) => {}
+    // Exit 0 only for a complete erase (or an end that had nothing to erase
+    // under a failure already being reported).
+    let erased = match clean_up(&created) {
+        Ok(true) => Ok(()),
         Ok(false) => {
             let alive = crate::storage::WorkerStore::open_read_only(&created.path)
                 .and_then(|s| s.list_nonterminal())
@@ -114,11 +119,19 @@ fn start(args: &Args) -> anyhow::Result<()> {
                         .join(", ")
                 })
                 .unwrap_or_default();
-            eprintln!("work is still recorded in the worker state; it was kept (attempts still alive: {alive})");
+            eprintln!(
+                "work is still recorded in the worker state; it was kept (attempts still alive: {alive}). \
+                 Its cancel marker is set; once those attempts are gone, remove {} to start a new ephemeral worker",
+                created.path.display()
+            );
+            Err(anyhow::anyhow!("worker state was kept"))
         }
-        Err(e) => eprintln!("worker state was not removed: {e}"),
-    }
-    result
+        Err(e) => {
+            eprintln!("worker state was not removed: {e}");
+            Err(e)
+        }
+    };
+    result.and(erased)
 }
 
 /// Foreground until stopped (SIGTERM or interrupt). Never installs anything.

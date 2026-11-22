@@ -105,15 +105,24 @@ pub fn finished(
     told_retired && live_attempts == Some(0) && uncollected_results == Some(0)
 }
 
-/// How long after a TERM to the commands a graceful end waits: the TERM
-/// grace the supervisors use, the wait after their KILL (the agent's
-/// default, 5 s) and a little for the records to settle.
+/// How long a graceful end waits: the TERM grace the supervisors use, the
+/// wait after their KILL (the agent's default, 5 s) and a little for the
+/// records to settle. Capped at a day so that a huge configured grace never
+/// overflows a deadline.
 pub fn stop_bound_ms(term_grace_ms: u64) -> u64 {
-    term_grace_ms.saturating_add(5_000).saturating_add(5_000)
+    term_grace_ms
+        .saturating_add(5_000)
+        .saturating_add(5_000)
+        .min(86_400_000)
 }
 
-/// What a graceful end does next, given how many attempts are still live
-/// (`None`: not readable now) and whether the bound has passed.
+/// Nothing of this worker runs: no live attempt, and no supervisor or setup
+/// builder process. A count that could not be read is never quiet.
+pub fn quiet(live_attempts: Option<u64>, running_processes: Option<u64>) -> bool {
+    live_attempts == Some(0) && running_processes == Some(0)
+}
+
+/// What a graceful end does next.
 #[derive(Debug, PartialEq, Eq)]
 pub enum StopStep {
     /// Keep waiting for the supervisors.
@@ -124,14 +133,27 @@ pub enum StopStep {
     GiveUp,
 }
 
-pub fn stop_step(live_attempts: Option<u64>, bound_passed: bool) -> StopStep {
-    if live_attempts == Some(0) {
+/// One look at the worker, and the decision it leads to. `after_begin`: the
+/// look was started after the stop marker was written (a look started before
+/// it can miss an attempt accepted in between, so it says nothing).
+/// `quiet_before`: the previous look was quiet and after the begin; two quiet
+/// looks in a row are idle, as `wait_until_idle` requires. Returns the step
+/// and whether this look counts as a quiet one for the next.
+pub fn stop_step(
+    after_begin: bool,
+    quiet: bool,
+    quiet_before: bool,
+    bound_passed: bool,
+) -> (StopStep, bool) {
+    let quiet_now = after_begin && quiet;
+    let step = if quiet_now && quiet_before {
         StopStep::Settled
     } else if bound_passed {
         StopStep::GiveUp
     } else {
         StopStep::Wait
-    }
+    };
+    (step, quiet_now)
 }
 
 #[cfg(test)]
