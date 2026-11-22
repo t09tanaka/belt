@@ -115,6 +115,26 @@ pub fn source_manifest(
     source_manifest_in(context.state_dir(), run)
 }
 
+/// [`source_manifest`] for a caller that must not create anything: when this
+/// host holds no source store, the input is not available.
+pub fn source_manifest_existing(
+    context: &Context,
+    run: &RunId,
+) -> Result<local_ci::source::SourceManifest, ApiError> {
+    if !context
+        .state_dir()
+        .join("sources")
+        .join("retention.db")
+        .is_file()
+    {
+        return Err(ApiError::new(
+            ErrorCode::NotFound,
+            "this host holds no captured input",
+        ));
+    }
+    source_manifest(context, run)
+}
+
 /// Resolve the same bound descriptor from an explicitly owned input store.
 pub fn source_manifest_in(
     input_state: &std::path::Path,

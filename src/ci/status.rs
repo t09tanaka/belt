@@ -164,6 +164,36 @@ pub fn computed(end: &RunEnd<'_>) -> Computed {
     }
 }
 
+/// Why the status of a run cannot be posted again at this moment, as one
+/// sentence, or `None` when [`computed`] gives a state that may be posted.
+/// A run that has not settled has no result yet, and a cancelled run or one
+/// whose collection is still open is no final state either.
+pub fn refusal(end: &RunEnd<'_>) -> Option<String> {
+    if !end.settled {
+        return Some("the run has not finished yet, so it has no state to post".into());
+    }
+    match computed(end) {
+        Computed::Cancelled => {
+            Some("the run was cancelled, and a cancelled run is not posted".into())
+        }
+        Computed::Pending => Some(
+            "the results of the run are not all collected yet, so it has no state to post".into(),
+        ),
+        _ => None,
+    }
+}
+
+/// The context a post again is made under: the one asked for, else the one
+/// the last post or failed post of the run used, else the default. A post
+/// that was only skipped names no context.
+pub fn context_for(asked: Option<&str>, last: Option<&Record>) -> String {
+    let recorded = last.and_then(|record| match &record.posting {
+        Posting::Posted { context, .. } | Posting::Failed { context, .. } => Some(context.as_str()),
+        Posting::Skipped { .. } => None,
+    });
+    asked.or(recorded).unwrap_or(DEFAULT_CONTEXT).to_string()
+}
+
 /// `<state>: pass P / fail F / error E / skip S`, the shape of local-ci's
 /// description.
 pub fn description(computed: Computed, jobs: &[Job<'_>]) -> String {
@@ -1048,5 +1078,81 @@ mod tests {
             render(&failed),
             "status: ci=failure could not be posted to 0123456 (0123456 is not on GitHub yet)"
         );
+    }
+
+    #[test]
+    fn only_a_settled_run_with_a_final_state_is_posted_again() {
+        let lines = jobs(&[("a", "success")]);
+        let good = end(&["a"], &lines);
+        assert_eq!(refusal(&good), None);
+        let failed = RunEnd {
+            exit_code: 1,
+            failed: Some(Cause::Job),
+            ..good
+        };
+        assert_eq!(computed(&failed), Computed::Failure);
+        assert_eq!(refusal(&failed), None);
+        let error = RunEnd {
+            exit_code: 1,
+            failed: Some(Cause::Other),
+            ..good
+        };
+        assert_eq!(computed(&error), Computed::Error);
+        assert_eq!(refusal(&error), None);
+        // still running: its own sentence, not the one of a cancel
+        let running = RunEnd {
+            settled: false,
+            ..good
+        };
+        assert_eq!(
+            refusal(&running).as_deref(),
+            Some("the run has not finished yet, so it has no state to post")
+        );
+        let cancelled = RunEnd {
+            cancel_requested: true,
+            ..good
+        };
+        assert_eq!(
+            refusal(&cancelled).as_deref(),
+            Some("the run was cancelled, and a cancelled run is not posted")
+        );
+        let pending = RunEnd {
+            collection_pending: Some(true),
+            ..good
+        };
+        assert_eq!(
+            refusal(&pending).as_deref(),
+            Some("the results of the run are not all collected yet, so it has no state to post")
+        );
+    }
+
+    #[test]
+    fn a_post_again_keeps_the_context_of_the_last_post_unless_one_is_asked_for() {
+        let with = |posting| {
+            Some(Record {
+                computed: Computed::Success,
+                posting,
+                source_digest: None,
+                original_head: None,
+            })
+        };
+        let posted = with(Posting::Posted {
+            sha: HEAD.into(),
+            state: "success".into(),
+            context: "posted-as".into(),
+        });
+        let failed = with(Posting::Failed {
+            sha: HEAD.into(),
+            state: "success".into(),
+            context: "failed-as".into(),
+            error: "x".into(),
+        });
+        let skipped = with(Posting::Skipped { reason: "x".into() });
+        assert_eq!(context_for(None, posted.as_ref()), "posted-as");
+        assert_eq!(context_for(None, failed.as_ref()), "failed-as");
+        assert_eq!(context_for(None, skipped.as_ref()), DEFAULT_CONTEXT);
+        assert_eq!(context_for(None, None), DEFAULT_CONTEXT);
+        assert_eq!(context_for(Some("asked"), posted.as_ref()), "asked");
+        assert_eq!(context_for(Some("asked"), None), "asked");
     }
 }
