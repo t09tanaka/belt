@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.18.4] - 2026-11-23
+
+- Fix the build cache's entries never being deleted from the trash. An entry that the cache evicts, or a temporary one it gives up, is moved to `<cache>/trash`, but the trash was emptied only of the names a worktree gets there, so neither a run nor `local-ci cache prune` deleted them and they piled up (on one machine to over a hundred GB). They are now deleted like the rest, and what is already there goes at the start of the next run. Nothing else in the trash is touched.
+- Expire the reusable results of every worktree, not only the one being run. A run removed the results older than a day only for its own worktree, so those of a worktree that was gone stayed for good. A run now removes them for every worktree, and the directory of one that saved nothing for a day. The first run after the upgrade removes what has piled up.
+- Keep only the last run of each worktree under `runs/`, instead of the last 20, and drop the runs of a worktree that is gone. Only `local-ci status` reads a run, the one `last` names; reusing a result does not read earlier runs. A run records its worktree's path to tell when it is gone; a run directory without `result.json` is left for a day, as another run may still be writing it, and the runs an earlier version recorded no path for go once unused for a week.
+
 ## [0.18.3] - 2026-11-18
 
 - Fix a step's clock starting while it still waited for task-traffic-controller, so that a step that runs for seconds timed out with only the controller's "waiting" lines in its log (`timed out after 599s (what was left of the job's 10 min)`). The log was read up to its end, and task-traffic-controller writes a line and its newline apart: a read that came between them left a bare newline for the next one, and that blank line was taken for the command's output. A line is now read again from its start until it is finished, and a line not finished yet is the command's output unless it is, or may still become, one of task-traffic-controller's (so a progress line with no newline still starts the clock). A job's `timeout-minutes` still counts only the running of its setup and steps, as since 0.17.2.
