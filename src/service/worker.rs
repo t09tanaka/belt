@@ -14,6 +14,7 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 pub mod ephemeral;
+pub(super) mod rotation_binding;
 
 const LIMIT: u64 = 262_144;
 const ENV: &[&str] = &[
@@ -128,17 +129,11 @@ fn private_lock(state: &Path, name: &str) -> anyhow::Result<File> {
 /// Durable cluster binding is separate from the coordinator database. Existing
 /// bytes must match exactly: changing cluster, worker identity or key is enrollment.
 fn bind(spec: &WorkerSpec) -> anyhow::Result<()> {
-    use sha2::{Digest, Sha256};
-    let mut key = Vec::new();
-    resident::secure_file(&spec.cluster_key_path, false)?
-        .take(4097)
-        .read_to_end(&mut key)?;
-    let bytes = serde_json::to_vec(&(
-        1,
+    let bytes = rotation_binding::expected(
+        &spec.cluster_key_path,
         &spec.expected_cluster,
         &spec.worker_id,
-        format!("{:x}", Sha256::digest(&key)),
-    ))?;
+    )?;
     let path = spec.state_dir.join("worker-binding.json");
     match std::fs::symlink_metadata(&path) {
         Ok(_) => {
@@ -146,7 +141,7 @@ fn bind(spec: &WorkerSpec) -> anyhow::Result<()> {
             resident::secure_file(&path, false)?
                 .take(LIMIT + 1)
                 .read_to_end(&mut existing)?;
-            anyhow::ensure!(existing == bytes, "foreign worker enrollment binding");
+            rotation_binding::reconcile(&spec.state_dir, &existing, &bytes)?;
             return Ok(());
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
