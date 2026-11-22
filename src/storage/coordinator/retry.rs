@@ -45,6 +45,8 @@ struct TaskRow {
     rerun: bool,
     /// The split job it is a shard of.
     shard_group: Option<String>,
+    /// The task of the frozen plan, and the plan.
+    plan_task: Option<(String, String)>,
     task: String,
     min: i64,
     generation: Option<i64>,
@@ -252,88 +254,136 @@ fn unjoin(c: &Connection, run: &RunId, group: &str) -> Result<()> {
     Ok(())
 }
 
-/// A retry of one job: the jobs of the plan that need it must not keep the
-/// results of its earlier attempt. One that did not start yet waits again
-/// (`commit`) and is given the new results when the job ends; one that
-/// started or ended is a refusal, which the user answers by retrying it too
-/// or the run. A shard is left to its own rules (the job is joined again).
-fn hold_dependents(
+/// What a retry does to the jobs of the plan that need a retried job: none
+/// may keep the results of its earlier attempt without a word.
+/// - One that did not start waits again (it is held) and is given the new
+///   results when the retried job ends.
+/// - One that ended without running a step (every job of it was skipped)
+///   did not use those results: it is opened again with the retry (its
+///   generation is raised and it is held), and the progression decides anew
+///   whether it runs. The jobs that need it are looked at the same way.
+/// - One that ran (running, or ended after its steps) is a refusal when one
+///   job was selected (retry it too, or the run). A retry of the run keeps it.
+///
+/// `retried` names the tasks of the plan that run again, by plan digest and
+/// task. Returns the tasks of the run opened again (to count). A shard is left
+/// to its own rules (the job is joined again).
+fn reopen_dependents(
     c: &Connection,
     binding: &Binding,
-    task: &str,
-    commit: bool,
+    retried: &[(String, String)],
+    authorize: Option<u64>,
     state_dir: &std::path::Path,
-) -> Result<()> {
-    let spec: Option<String> = c
-        .query_row("SELECT spec_json FROM task WHERE task_id=?1", [task], |r| {
-            r.get(0)
-        })
-        .optional()?;
-    let spec: serde_json::Value = from_json("task spec", &spec.unwrap_or_default())?;
-    let ci = &spec["ci"];
-    let (Some(plan), Some(name)) = (
-        ci["task"]["plan_digest"].as_str(),
-        ci["task"]["task_id"].as_str(),
-    ) else {
-        return Ok(());
+) -> Result<Vec<String>> {
+    let mut reopened = Vec::new();
+    let Some((digest, _)) = retried.first() else {
+        return Ok(reopened);
     };
-    if ci["shard_group"].is_string() || ci["dynamic_origin"] == true {
-        return Ok(());
-    }
-    let digest = id("plan_digest", Digest::parse(plan))?;
+    let digest = id("plan_digest", Digest::parse(digest))?;
     let bytes = crate::ci::advance::plan_bytes(state_dir, &digest).map_err(|why| {
         StorageError::Immutable(format!(
-            "retry cannot tell which jobs need {task}: the frozen plan is unavailable ({why})"
+            "retry cannot tell which jobs need the retried ones: the frozen plan is unavailable ({why})"
         ))
     })?;
     let plan: local_ci::FrozenPlan = serde_json::from_slice(&bytes).map_err(|e| {
         StorageError::Immutable(format!(
-            "retry cannot tell which jobs need {task}: the frozen plan is unreadable ({e})"
+            "retry cannot tell which jobs need the retried ones: the frozen plan is unreadable ({e})"
         ))
     })?;
-    let dependents: Vec<&str> = plan
-        .tasks
-        .iter()
-        .filter(|t| t.depends_on.iter().any(|d| d == name))
-        .map(|t| t.id.as_str())
-        .collect();
-    let mut stmt = c.prepare(
-        "SELECT t.task_id,coalesce(json_extract(t.spec_json,'$.ci.hold'),0),
-         EXISTS(SELECT 1 FROM attempt a WHERE a.task_id=t.task_id AND a.retired=0 AND (a.generation>=t.min_generation OR a.state<>'terminal'))
-         FROM task t WHERE t.run_id=?1 AND json_extract(t.spec_json,'$.ci.task.task_id')=?2",
-    )?;
-    let mut hold = Vec::new();
-    for dependent in dependents {
-        let rows = stmt
-            .query_map(params![binding.run.as_str(), dependent], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, bool>(1)?,
-                    r.get::<_, bool>(2)?,
-                ))
-            })?
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-        for (other, held, started) in rows {
-            if started {
-                return Err(StorageError::Immutable(format!(
-                    "retry of {task} would leave {other} ({dependent}) with the results of the earlier attempt; retry {other} as well or retry the run"
-                )));
+    let mut seen: std::collections::BTreeSet<String> =
+        retried.iter().map(|(_, task)| task.clone()).collect();
+    let mut queue: Vec<String> = seen.iter().cloned().collect();
+    let results = state_dir.join("results");
+    let mut groups = std::collections::BTreeSet::new();
+    while let Some(of) = queue.pop() {
+        for dependent in plan.tasks.iter().filter(|t| t.depends_on.contains(&of)) {
+            if !seen.insert(dependent.id.clone()) {
+                continue;
             }
-            if !held {
-                hold.push(other);
+            let rows = {
+                let mut stmt = c.prepare(
+                    "SELECT t.task_id,coalesce(json_extract(t.spec_json,'$.ci.hold'),0),a.attempt_id,a.generation,a.state,
+                     coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group'))
+                     FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa
+                         WHERE aa.task_id=t.task_id AND aa.retired=0 AND (aa.generation>=t.min_generation OR aa.state<>'terminal')
+                         ORDER BY aa.generation DESC LIMIT 1)
+                     WHERE t.run_id=?1 AND json_extract(t.spec_json,'$.ci.task.task_id')=?2",
+                )?;
+                let rows = stmt
+                    .query_map(params![binding.run.as_str(), dependent.id], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, bool>(1)?,
+                            r.get::<_, Option<String>>(2)?,
+                            r.get::<_, Option<i64>>(3)?,
+                            r.get::<_, Option<String>>(4)?,
+                            r.get::<_, Option<String>>(5)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut go_on = false;
+            for (task, held, attempt, generation, state, group) in rows {
+                let (Some(attempt), Some(generation)) = (attempt, generation) else {
+                    // It did not start: it waits for the new results.
+                    if !held && authorize.is_some() {
+                        c.execute(
+                            "UPDATE task SET spec_json=json_set(spec_json,'$.ci.hold',json('true')) WHERE task_id=?1",
+                            [&task],
+                        )?;
+                    }
+                    go_on = true;
+                    continue;
+                };
+                if state.as_deref() == Some("terminal") && skipped_only(c, &results, &attempt)? {
+                    reopened.push(task.clone());
+                    if let Some(revision) = authorize {
+                        c.execute(
+                            "UPDATE task SET min_generation=?1,authorization_revision=?2,cancel_requested_at_ms=NULL,
+                             spec_json=json_set(json_remove(spec_json,'$.ci.unrunnable'),'$.ci.hold',json('true')) WHERE task_id=?3",
+                            params![generation + 1, to_i64(revision)?, task],
+                        )?;
+                        groups.extend(group);
+                    }
+                    go_on = true;
+                } else if binding.selected.is_some() {
+                    let selected = binding.selected.as_deref().unwrap_or_default();
+                    return Err(StorageError::Immutable(format!(
+                        "retry of {selected} would leave {task} ({}) with the results of the earlier attempt; retry {task} as well or retry the run",
+                        dependent.id
+                    )));
+                }
+            }
+            if go_on {
+                queue.push(dependent.id.clone());
             }
         }
     }
-    drop(stmt);
-    if commit {
-        for other in hold {
-            c.execute(
-                "UPDATE task SET spec_json=json_set(spec_json,'$.ci.hold',json('true')) WHERE task_id=?1",
-                [other],
-            )?;
-        }
+    for group in &groups {
+        unjoin(c, &binding.run, group)?;
     }
-    Ok(())
+    reopened.sort();
+    Ok(reopened)
+}
+
+/// The attempt ended and left a result in which every job was skipped: no
+/// step of it ran, so it did not use the results of the jobs it needs.
+fn skipped_only(c: &Connection, results: &std::path::Path, attempt: &str) -> Result<bool> {
+    let digest: Option<String> = c
+        .query_row(
+            "SELECT digest FROM artifact_receipt WHERE attempt_id=?1 AND name=?2 AND persisted_at_ms IS NOT NULL",
+            params![attempt, crate::supervisor::ci_task::RESULT_ARTIFACT],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let Some(digest) = digest else {
+        return Ok(false);
+    };
+    let attempt = id("attempt_id", AttemptId::parse(attempt))?;
+    let digest = id("digest", Digest::parse(&digest))?;
+    Ok(crate::ci::advance::read_result(results, &attempt, &digest)
+        .is_ok_and(|r| !r.outcomes.is_empty() && r.outcomes.iter().all(|o| o.skipped.is_some())))
 }
 
 fn binding(c: &Connection, target: &Target, expected: u64) -> Result<Binding> {
@@ -381,6 +431,8 @@ fn scan(
     let mut hash = Sha256::new();
     // The split jobs a shard of which runs again.
     let mut unjoined = std::collections::BTreeSet::new();
+    // The tasks of the plan that run again, not shards.
+    let mut retried: Vec<(String, String)> = Vec::new();
     loop {
         let page = {
             let mut stmt = c.prepare(
@@ -388,7 +440,7 @@ fn scan(
                  EXISTS(SELECT 1 FROM attempt x LEFT JOIN retire_tombstone z USING(attempt_id) WHERE x.task_id=t.task_id AND x.retired=0 AND (x.state<>'terminal' OR (z.attempt_id IS NOT NULL AND z.confirmed_at_ms IS NULL))),
                  json_extract(t.spec_json,'$.manifest_digest'),json_extract(t.spec_json,'$.has_secret_bundle'),coalesce(json_extract(t.spec_json,'$.in_place'),0),
                  t.cancel_requested_at_ms IS NOT NULL AND coalesce(json_extract(t.spec_json,'$.ci.unrunnable'),'') IN (?5,?6),
-                 coalesce(json_extract(t.spec_json,'$.ci.rerun'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')),coalesce(json_extract(t.spec_json,'$.ci.shard_retry_forbidden'),0)
+                 coalesce(json_extract(t.spec_json,'$.ci.rerun'),0),coalesce(json_extract(t.spec_json,'$.ci.shard_group'),json_extract(t.spec_json,'$.ci.matrix.group')),coalesce(json_extract(t.spec_json,'$.ci.shard_retry_forbidden'),0),json_extract(t.spec_json,'$.ci.task.plan_digest'),json_extract(t.spec_json,'$.ci.task.task_id')
                  FROM task t LEFT JOIN attempt a ON a.attempt_id=(SELECT aa.attempt_id FROM attempt aa WHERE aa.task_id=t.task_id ORDER BY aa.generation DESC LIMIT 1)
                  WHERE t.run_id=?1 AND coalesce(json_extract(t.spec_json,'$.ci.task.inputs.belt_discovery.applied'),0)=0 AND coalesce(json_extract(t.spec_json,'$.ci.dynamic_origin'),0)=0 AND (?2 IS NULL OR t.task_id=?2) AND t.task_id>?3 ORDER BY t.task_id LIMIT ?4",
             )?;
@@ -418,6 +470,9 @@ fn scan(
                         rerun: r.get(12)?,
                         shard_group: r.get(13)?,
                         shard_retry_forbidden: r.get(14)?,
+                        plan_task: r
+                            .get::<_, Option<String>>(15)?
+                            .zip(r.get::<_, Option<String>>(16)?),
                     })
                 },
             )?;
@@ -525,7 +580,10 @@ fn scan(
             if let Some(revision) = authorize {
                 c.execute("UPDATE task SET min_generation=?1,authorization_revision=?2,cancel_requested_at_ms=NULL,spec_json=json_remove(spec_json,'$.ci.unrunnable') WHERE task_id=?3",
                     params![next, to_i64(revision)?, row.task])?;
-                unjoined.extend(row.shard_group);
+                unjoined.extend(row.shard_group.clone());
+            }
+            if row.shard_group.is_none() {
+                retried.extend(row.plan_task);
             }
         }
     }
@@ -543,8 +601,14 @@ fn scan(
         unjoin(c, &binding.run, group)?;
     }
     if count > 0 {
-        if let Some(task) = &binding.selected {
-            hold_dependents(c, binding, task, authorize.is_some(), state_dir)?;
+        let reopened = reopen_dependents(c, binding, &retried, authorize, state_dir)?;
+        if binding.selected.is_none() {
+            for task in reopened {
+                hash.update((task.len() as u64).to_be_bytes());
+                hash.update(task.as_bytes());
+                hash.update(b"reopened");
+                count += 1;
+            }
         }
     }
     if count == 0 {

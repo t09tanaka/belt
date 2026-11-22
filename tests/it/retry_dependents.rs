@@ -115,3 +115,94 @@ async fn a_retry_of_a_job_is_refused_while_the_job_that_needs_it_runs() {
     assert_eq!(lines(marks.join("b")), ["b saw 1"]);
     assert_eq!(store.attempts_of_task(&a).unwrap().len(), 1);
 }
+
+/// `a` counts its runs and fails until it ran `passes_at` times; `b` needs
+/// `a` and `c` needs `b`, so both are skipped while `a` fails.
+fn failing_jobs(passes_at: u32) -> String {
+    format!("  a:\n    runs-on: ubuntu-latest\n    outputs:\n      n: ${{{{ steps.c.outputs.n }}}}\n    steps:\n      - id: c\n        run: |\n          echo ran >> MARKS/a\n          n=$(wc -l < MARKS/a | tr -d ' ')\n          echo \"n=$n\" >> \"$GITHUB_OUTPUT\"\n          [ \"$n\" -ge {passes_at} ]\n  b:\n    needs: a\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"b saw ${{{{ needs.a.outputs.n }}}}\" >> MARKS/b\n  c:\n    needs: b\n    runs-on: ubuntu-latest\n    steps:\n      - run: echo \"c ran\" >> MARKS/c\n")
+}
+
+struct Failed {
+    _root: super::common::DaemonRoot,
+    spec: belt::service::bootstrap::Spec,
+    marks: std::path::PathBuf,
+    run: RunId,
+    a: TaskId,
+    store: CoordinatorStore,
+}
+
+/// The run of `failing_jobs` ended: `a` failed, `b` and `c` were skipped.
+async fn failed_run(passes_at: u32) -> Failed {
+    let (root, spec, input) = control_fixture();
+    let marks = ci_project(root.path(), &input, &failing_jobs(passes_at));
+    start_resident(&spec).await;
+    let out = ci_command(&spec, &input).output().await.unwrap();
+    assert!(!out.status.success());
+    let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let run = RunId::parse(value["result"]["target"]["id"].as_str().unwrap()).unwrap();
+    let store = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let a = task_of(&store, &run, "a");
+    assert_eq!(lines(marks.join("a")), ["ran"]);
+    assert!(lines(marks.join("b")).is_empty() && lines(marks.join("c")).is_empty());
+    Failed {
+        _root: root,
+        spec,
+        marks,
+        run,
+        a,
+        store,
+    }
+}
+
+async fn settle(f: &Failed) {
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    tokio::time::timeout(
+        Duration::from_secs(120),
+        control::wait(&f.spec, Target::Run(f.run.clone()), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+}
+
+fn attempts(f: &Failed, job: &str) -> usize {
+    let task = task_of(&f.store, &f.run, job);
+    f.store.attempts_of_task(&task).unwrap().len()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_of_the_failed_job_runs_the_jobs_that_were_skipped_for_it_once_with_the_new_result()
+{
+    let f = failed_run(2).await;
+    control::retry(&f.spec, Target::Task(f.a.clone()))
+        .await
+        .unwrap();
+    settle(&f).await;
+    assert_eq!(lines(f.marks.join("a")), ["ran", "ran"]);
+    assert_eq!(lines(f.marks.join("b")), ["b saw 2"]);
+    assert_eq!(lines(f.marks.join("c")), ["c ran"]);
+    assert_eq!((attempts(&f, "b"), attempts(&f, "c")), (2, 2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn when_the_retried_job_fails_again_the_jobs_that_need_it_are_skipped_again() {
+    let f = failed_run(99).await;
+    control::retry(&f.spec, Target::Task(f.a.clone()))
+        .await
+        .unwrap();
+    settle(&f).await;
+    assert_eq!(lines(f.marks.join("a")), ["ran", "ran"]);
+    assert!(lines(f.marks.join("b")).is_empty() && lines(f.marks.join("c")).is_empty());
+    assert_eq!((attempts(&f, "b"), attempts(&f, "c")), (2, 2));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retry_of_the_run_runs_the_jobs_that_were_skipped_for_the_failed_job() {
+    let f = failed_run(2).await;
+    control::retry(&f.spec, Target::Run(f.run.clone()))
+        .await
+        .unwrap();
+    settle(&f).await;
+    assert_eq!(lines(f.marks.join("b")), ["b saw 2"]);
+    assert_eq!(lines(f.marks.join("c")), ["c ran"]);
+}

@@ -97,6 +97,57 @@ impl Chain {
             .unwrap();
     }
 
+    /// The task ended without a step: the result of its attempt says every job
+    /// of it was skipped.
+    fn end_skipped(&self, task: &TaskId) {
+        use local_ci::task::{JobOutcome, JobStatus};
+        self.end(task, Outcome::Succeeded);
+        let attempt = self.store.attempts_of_task(task).unwrap().pop().unwrap();
+        let result = local_ci::WireTaskResult {
+            schema_version: local_ci::wire::WIRE_SCHEMA_VERSION,
+            task: "t".into(),
+            jobs: vec![],
+            outcomes: vec![JobOutcome {
+                job: "t".into(),
+                variant: None,
+                status: JobStatus::Skipped,
+                outputs: Default::default(),
+                skipped: Some("needs failed".into()),
+                ancestor_failed: true,
+            }],
+            receipt_ignored: None,
+            artifacts: vec![],
+            shard: None,
+        };
+        let bytes = serde_json::to_vec(&result).unwrap();
+        let digest = crate::ids::Digest::of_bytes(&bytes);
+        let text = digest.to_string();
+        let dir = self
+            ._dir
+            .path()
+            .join("results")
+            .join(attempt.attempt_id.as_str())
+            .join("artifacts");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(text.strip_prefix("sha256:").unwrap()), &bytes).unwrap();
+        let id = attempt.attempt_id.to_string();
+        self.store
+            .db
+            .write(move |tx| {
+                tx.execute(
+                    "INSERT INTO artifact_receipt(attempt_id,name,required,digest,persisted_at_ms) VALUES(?1,?2,0,?3,1)",
+                    rusqlite::params![id, crate::supervisor::ci_task::RESULT_ARTIFACT, text],
+                )?;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    fn row(&self, task: &TaskId) -> crate::storage::CiTaskRow {
+        let rows = self.store.ci_run_tasks(&self.run).unwrap();
+        rows.into_iter().find(|r| &r.task_id == task).unwrap()
+    }
+
     /// The progression let the task in with the results of what it needs.
     fn release(&self, task: &TaskId) {
         let mut spec = self.spec(task);
@@ -218,4 +269,67 @@ fn a_retry_of_the_dependent_alone_is_not_refused() {
     f.end(&f.b, Outcome::Failed);
     let receipt = f.retry(Target::Task(f.b.clone()), 0).unwrap();
     assert_eq!(receipt.task_count, 1);
+}
+
+/// a failed, so b and c ended without a step (skipped).
+fn skipped_chain() -> Chain {
+    let f = chain();
+    f.end(&f.a, Outcome::Failed);
+    f.release(&f.b);
+    f.end_skipped(&f.b);
+    f.release(&f.c);
+    f.end_skipped(&f.c);
+    f
+}
+
+#[test]
+fn jobs_that_were_skipped_for_the_failed_job_are_opened_again_with_its_retry() {
+    let f = skipped_chain();
+    let receipt = f.retry(Target::Task(f.a.clone()), 0).unwrap();
+    assert_eq!(receipt.task_count, 1);
+    for task in [&f.b, &f.c] {
+        let row = f.row(task);
+        assert!(
+            row.attempt.is_none(),
+            "the skipped attempt no longer counts"
+        );
+        assert!(f.held(task), "waits for the new result of a");
+    }
+    assert!(f
+        .store
+        .queued_tasks(10)
+        .unwrap()
+        .iter()
+        .all(|t| t.task_id != f.b && t.task_id != f.c));
+}
+
+#[test]
+fn a_skipped_job_behind_a_job_that_ran_keeps_the_refusal() {
+    let f = chain();
+    f.end(&f.a, Outcome::Failed);
+    f.release(&f.b);
+    f.end(&f.b, Outcome::Succeeded);
+    refusal(
+        f.retry(Target::Task(f.a.clone()), 0).unwrap_err(),
+        &f.b,
+        &f.a,
+    );
+}
+
+#[test]
+fn a_retry_of_the_run_opens_the_skipped_jobs_again_and_keeps_the_one_that_ran() {
+    let f = skipped_chain();
+    let receipt = f.retry(Target::Run(f.run.clone()), 0).unwrap();
+    assert_eq!(receipt.task_count, 3, "a, and b and c opened again");
+    assert!(f.row(&f.b).attempt.is_none() && f.row(&f.c).attempt.is_none());
+    // A job that ran with the failed result (`if: always()`) is kept.
+    let f = chain();
+    f.end(&f.a, Outcome::Failed);
+    f.release(&f.b);
+    f.end(&f.b, Outcome::Succeeded);
+    f.release(&f.c);
+    f.end(&f.c, Outcome::Succeeded);
+    let receipt = f.retry(Target::Run(f.run.clone()), 0).unwrap();
+    assert_eq!(receipt.task_count, 1);
+    assert!(f.row(&f.b).attempt.is_some());
 }
