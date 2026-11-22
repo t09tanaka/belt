@@ -92,22 +92,52 @@ pub fn for_key(path: &Path, key: &str) -> Result<Vec<Record>> {
 
 /// Keep only the newest `keep` records per key. Returns records dropped.
 pub fn trim(path: &Path, keep: usize) -> Result<usize> {
+    trim_aged(path, keep, None)
+}
+
+/// [`trim`], and with `cutoff` also drop every record of a key whose newest
+/// record started before it (a command nobody has run since). A key that
+/// was seen after `cutoff` keeps its newest `keep` records whatever their
+/// age. Returns records dropped.
+pub fn trim_aged(path: &Path, keep: usize, cutoff: Option<DateTime<Utc>>) -> Result<usize> {
+    Ok(trim_collect(path, keep, cutoff)?.0)
+}
+
+/// [`trim_aged`], also returning the `measurement_id` of every record it
+/// dropped, so the caller can remove their markers at once. A history left
+/// with no record is removed, not kept as an empty file.
+pub fn trim_collect(
+    path: &Path,
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<(usize, Vec<String>)> {
     let all = read_all(path)?;
     let mut counts: HashMap<&str, usize> = HashMap::new();
+    let mut newest: HashMap<&str, DateTime<Utc>> = HashMap::new();
     for r in &all {
         *counts.entry(r.key.as_str()).or_default() += 1;
+        let t = newest.entry(r.key.as_str()).or_insert(r.started_at);
+        if r.started_at > *t {
+            *t = r.started_at;
+        }
     }
     let mut seen: HashMap<&str, usize> = HashMap::new();
     let mut kept = Vec::new();
+    let mut gone_ids = Vec::new();
     for r in &all {
         let n = seen.entry(r.key.as_str()).or_default();
         *n += 1;
-        if counts[r.key.as_str()] - *n < keep {
+        let stale = cutoff.is_some_and(|c| newest[r.key.as_str()] < c);
+        if !stale && counts[r.key.as_str()] - *n < keep {
             kept.push(r);
+        } else if let Some(id) = &r.measurement_id {
+            gone_ids.push(id.clone());
         }
     }
     let dropped = all.len() - kept.len();
-    if dropped > 0 {
+    if dropped > 0 && kept.is_empty() {
+        std::fs::remove_file(path)?;
+    } else if dropped > 0 {
         let dir = path.parent().unwrap_or_else(|| Path::new("."));
         let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
         for r in &kept {
@@ -117,7 +147,7 @@ pub fn trim(path: &Path, keep: usize) -> Result<usize> {
         }
         tmp.persist(path).map_err(|e| e.error)?;
     }
-    Ok(dropped)
+    Ok((dropped, gone_ids))
 }
 
 #[cfg(test)]
@@ -224,5 +254,45 @@ mod tests {
         );
         assert_eq!(for_key(&p, "b").unwrap().len(), 1);
         assert_eq!(trim(&p, 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn trim_aged_drops_keys_not_seen_since_the_cutoff_and_nothing_else() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("history.jsonl");
+        let at = |days_ago: i64| Utc::now() - chrono::Duration::days(days_ago);
+        let put = |key: &str, days_ago: i64| {
+            let mut r = rec(key, 1.0);
+            r.started_at = at(days_ago);
+            append(&p, &r).unwrap();
+        };
+        // "old": every record before the cutoff. "mixed": one old, one new
+        // (the key is still in use, so both stay). "new": recent.
+        put("old", 200);
+        put("old", 100);
+        put("mixed", 200);
+        put("mixed", 1);
+        put("new", 2);
+        let cutoff = Some(at(90));
+        assert_eq!(trim_aged(&p, 200, cutoff).unwrap(), 2);
+        assert!(for_key(&p, "old").unwrap().is_empty());
+        assert_eq!(for_key(&p, "mixed").unwrap().len(), 2);
+        assert_eq!(for_key(&p, "new").unwrap().len(), 1);
+        assert_eq!(trim_aged(&p, 200, cutoff).unwrap(), 0);
+    }
+
+    #[test]
+    fn trim_aged_keeps_a_key_whose_newest_record_is_exactly_the_cutoff() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("history.jsonl");
+        let cutoff = Utc::now();
+        let mut r = rec("edge", 1.0);
+        r.started_at = cutoff;
+        append(&p, &r).unwrap();
+        assert_eq!(trim_aged(&p, 200, Some(cutoff)).unwrap(), 0);
+        r.started_at = cutoff - chrono::Duration::seconds(1);
+        let q = d.path().join("h2.jsonl");
+        append(&q, &r).unwrap();
+        assert_eq!(trim_aged(&q, 200, Some(cutoff)).unwrap(), 1);
     }
 }

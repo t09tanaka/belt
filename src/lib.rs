@@ -51,6 +51,7 @@ pub mod paths;
 pub mod process;
 pub mod reap;
 pub mod receipt;
+pub mod retention;
 pub mod runner;
 pub mod tracker;
 pub mod usage;

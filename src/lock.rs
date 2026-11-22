@@ -29,15 +29,25 @@ impl Drop for Lock {
 }
 
 fn open_lock_file(path: &Path) -> Result<File> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+    // The retention sweep removes an empty directory (`leases/`), so one
+    // that vanishes between the two calls is made again.
+    let mut attempt = 0;
+    loop {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        match OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+        {
+            Ok(f) => return Ok(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && attempt < 3 => attempt += 1,
+            Err(e) => return Err(e.into()),
+        }
     }
-    Ok(OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)?)
 }
 
 /// Exclusive lock with polling and timeout. Only contention is retried.

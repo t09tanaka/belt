@@ -186,8 +186,8 @@ fn job_survives_submitter_and_records_history() {
     assert!(out.status.success());
     let hist = fs::read_to_string(env.state().join("history.jsonl")).unwrap();
     assert_eq!(hist.lines().count(), 1);
-    let log = fs::read_to_string(env.state().join(format!("jobs/{id}.log"))).unwrap();
-    assert_eq!(log, "done\n");
+    // The output was handed over by `wait`, so it is gone.
+    assert!(!env.state().join(format!("jobs/{id}.log")).exists());
 }
 
 #[test]
@@ -246,6 +246,83 @@ fn gc_removes_old_finished_jobs_only() {
     let text = String::from_utf8_lossy(&out.stdout);
     assert!(text.contains("removed 1 old jobs"), "{text}");
     assert!(env.jobs_json().is_empty());
+}
+
+#[test]
+fn a_job_log_over_the_limit_is_cut_before_wait_can_see_it() {
+    let env = TestEnv::new("budget = 4\njobs_log_max_mib = 1\n");
+    let (id, _) = env.submit(&[], "yes 0123456789abcdef | head -c 3000000; echo the-end");
+    let out = env.run(&["wait", &id]);
+    assert!(out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.len() < (1 << 20) + 1000, "{}", text.len());
+    assert!(text.contains("were cut"), "{}", &text[..300]);
+    assert!(text.trim_end().ends_with("the-end"));
+}
+
+#[test]
+fn wait_removes_the_output_once_it_has_handed_it_over() {
+    let env = TestEnv::new("budget = 4\n");
+    let (id, _) = env.submit(&[], "echo hi");
+    let out = env.run(&["wait", &id]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("hi"));
+    let mut left: Vec<String> = fs::read_dir(env.state().join("jobs"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .collect();
+    left.sort();
+    // The descriptor and exit code stay for `jobs` and a repeated `wait`.
+    assert_eq!(left, [format!("{id}.exit"), format!("{id}.json")]);
+    assert_eq!(env.state_of(&id), "done 0");
+    // `--no-output` hands nothing over, so it leaves the log alone.
+    let (id2, _) = env.submit(&[], "echo keep");
+    assert!(env.run(&["wait", "--no-output", &id2]).status.success());
+    assert!(env.state().join(format!("jobs/{id2}.log")).exists());
+}
+
+#[test]
+fn a_job_log_under_the_limit_is_printed_whole() {
+    let env = TestEnv::new("budget = 4\n");
+    let (id, _) = env.submit(&[], "echo first; echo second");
+    let out = env.run(&["wait", &id]);
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.ends_with("first\nsecond\n"), "{text}");
+    assert!(!text.contains("were cut"));
+}
+
+#[test]
+fn exec_and_submit_clean_up_by_themselves_when_the_sweep_is_due() {
+    let env = TestEnv::new("budget = 4\n");
+    let state = env.state();
+    fs::create_dir_all(state.join("jobs")).unwrap();
+    // A job file with no descriptor, a day old, and a sweep last run long ago.
+    let orphan = state.join("jobs/gone.log");
+    fs::write(&orphan, "x").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&orphan)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 86_400))
+        .unwrap();
+    // The first run only starts the clock.
+    assert!(env.run(&["exec", "--", "true"]).status.success());
+    assert!(orphan.exists());
+    fs::write(state.join("last-sweep"), "2000-01-01T00:00:00Z").unwrap();
+    assert!(env.run(&["exec", "--", "true"]).status.success());
+    assert!(!orphan.exists());
+    // submit does the same (the sweep removed the empty directory).
+    fs::create_dir_all(state.join("jobs")).unwrap();
+    fs::write(&orphan, "x").unwrap();
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&orphan)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(2 * 86_400))
+        .unwrap();
+    fs::write(state.join("last-sweep"), "2000-01-01T00:00:00Z").unwrap();
+    let (id, _) = env.submit(&[], "true");
+    assert!(env.run(&["wait", &id]).status.success());
+    assert!(!orphan.exists());
 }
 
 #[test]

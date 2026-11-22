@@ -900,6 +900,8 @@ pub fn register(
     spec: &CommandSpec,
 ) -> Result<Registration> {
     check_id("command_id", &spec.command_id)?;
+    // At most every six hours; no lock is held yet.
+    let _ = crate::retention::sweep_if_due(ctx, cfg);
     if spec.spec_digest.is_empty() {
         return Err(Error::Conflict("spec_digest must not be empty".into()));
     }
@@ -1604,15 +1606,39 @@ pub fn resolve_checked_typed_with(ctx: &Context, id: &str, force: bool) -> Resul
 /// rewrite (which would drop the record but leave its `.applied` marker).
 /// Returns the records dropped.
 pub fn trim_history(ctx: &Context, keep: usize) -> Result<usize> {
+    trim_history_aged(ctx, keep, None)
+}
+
+/// [`trim_history`], and with `cutoff` also drop the records of every key
+/// whose newest record started before it ([`history::trim_aged`]).
+pub fn trim_history_aged(
+    ctx: &Context,
+    keep: usize,
+    cutoff: Option<DateTime<Utc>>,
+) -> Result<usize> {
     let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
-    history::trim(ctx.paths.history_file(), keep)
+    let (dropped, ids) = history::trim_collect(ctx.paths.history_file(), keep, cutoff)?;
+    // A marker lives exactly as long as its record: remove it now, under
+    // the same lock, not when a later sweep notices.
+    for id in ids {
+        let _ = std::fs::remove_file(ctx.paths.measurements_dir().join(format!("{id}.applied")));
+    }
+    let _ = std::fs::remove_dir(ctx.paths.measurements_dir());
+    Ok(dropped)
 }
 
 /// Remove the `.applied` markers whose measurement no longer has a record in
 /// the history. A marker is kept for as long as its record is: the history
 /// keeps the newest records per key ([`history::trim`]), and what it still
 /// holds is exactly what a replayed measurement could duplicate. Run after
-/// [`trim_history`]. Returns how many were removed.
+/// [`trim_history`].
+///
+/// Also settles the `.pending` markers an attempt left behind (it failed
+/// or died between the two markers of [`record_measurement`]). An attempt
+/// holds the history lock for its whole length, so under that lock a
+/// `.pending` is always a dead attempt's: when its record is in the history
+/// it becomes `.applied` (what a retry would conclude), otherwise it is
+/// removed (a retry appends again). Returns how many files were removed.
 pub fn gc_measurements(ctx: &Context) -> Result<usize> {
     let _lock = lock::acquire(&ctx.paths.history_lock(), ctx.ledger_lock_timeout)?;
     let Ok(rd) = std::fs::read_dir(ctx.paths.measurements_dir()) else {
@@ -1624,22 +1650,38 @@ pub fn gc_measurements(ctx: &Context) -> Result<usize> {
         .collect();
     let mut removed = 0;
     for p in rd.filter_map(|e| e.ok()).map(|e| e.path()) {
-        let stem = p.file_stem().and_then(|s| s.to_str());
-        let applied = p.extension().is_some_and(|x| x == "applied");
-        if applied
-            && stem.is_some_and(|s| !recorded.contains(s))
-            && std::fs::remove_file(&p).is_ok()
-        {
-            removed += 1;
+        let Some(stem) = p.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        match p.extension().and_then(|x| x.to_str()) {
+            Some("applied") => {
+                if !recorded.contains(stem) && std::fs::remove_file(&p).is_ok() {
+                    removed += 1;
+                }
+            }
+            Some("pending") => {
+                if recorded.contains(stem) {
+                    // Applied before it is removed, so a crash here still
+                    // leaves one of the two.
+                    if std::fs::write(p.with_extension("applied"), b"").is_ok() {
+                        let _ = std::fs::remove_file(&p);
+                    }
+                } else if std::fs::remove_file(&p).is_ok() {
+                    removed += 1;
+                }
+            }
+            _ => {}
         }
     }
+    // Empty: remove it too (creators hold this lock).
+    let _ = std::fs::remove_dir(ctx.paths.measurements_dir());
     Ok(removed)
 }
 
 /// Remove the sidecars of managed commands that ended more than `keep_days`
 /// ago and have no ledger entry (the receipt of a finished run is only
 /// needed so a repeated registration finds its outcome), and temporary files
-/// of that age that an interrupted write left behind. A sidecar that is not
+/// an hour old that an interrupted write left behind. A sidecar that is not
 /// terminal, one that cannot be read, and one whose entry is still in the
 /// ledger are never removed. Returns how many files were removed.
 pub fn gc_sidecars(ctx: &Context, keep_days: u64) -> Result<usize> {
@@ -1663,15 +1705,18 @@ pub fn gc_sidecars(ctx: &Context, keep_days: u64) -> Result<usize> {
                 _ => false,
             },
             // Not a sidecar: what a crashed atomic write leaves.
-            _ => p
-                .metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|t| DateTime::<Utc>::from(t) < cutoff),
+            _ => p.metadata().and_then(|m| m.modified()).is_ok_and(|t| {
+                DateTime::<Utc>::from(t)
+                    < ctx.clock.now()
+                        - chrono::Duration::seconds(crate::retention::STRAY_AFTER_SECS)
+            }),
         };
         if old && std::fs::remove_file(&p).is_ok() {
             removed += 1;
         }
     }
+    // Empty: remove it too (every creator of a sidecar holds this lock).
+    let _ = std::fs::remove_dir(ctx.paths.managed_dir());
     Ok(removed)
 }
 
@@ -1713,7 +1758,20 @@ pub fn record_measurement(ctx: &Context, measurement_id: &str, rec: &Record) -> 
         measurement_id: Some(measurement_id.to_string()),
         ..rec.clone()
     };
-    history::append(ctx.paths.history_file(), &rec)?;
+    if let Err(e) = history::append(ctx.paths.history_file(), &rec) {
+        // Settle the marker now rather than leave it for a sweep: if the
+        // failed append still wrote the record, a retry must see a
+        // duplicate, otherwise it appends again.
+        let wrote = history::read_all(ctx.paths.history_file()).is_ok_and(|all| {
+            all.iter()
+                .any(|r| r.measurement_id.as_deref() == Some(measurement_id))
+        });
+        if wrote {
+            let _ = std::fs::write(&applied, b"");
+        }
+        let _ = std::fs::remove_file(&pending);
+        return Err(e);
+    }
     std::fs::write(&applied, b"")?;
     let _ = std::fs::remove_file(&pending);
     Ok(Measured::Applied)

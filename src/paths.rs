@@ -120,6 +120,11 @@ impl Paths {
         self.state_dir.join("history.lock")
     }
 
+    /// When the retention sweep last ran ([`crate::retention`]).
+    pub fn sweep_stamp(&self) -> PathBuf {
+        self.state_dir.join("last-sweep")
+    }
+
     pub fn jobs_dir(&self) -> PathBuf {
         self.state_dir.join("jobs")
     }

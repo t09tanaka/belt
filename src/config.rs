@@ -32,6 +32,9 @@ pub struct Config {
     /// about.
     pub mutation_initial_weight: u32,
     pub history_keep: usize,
+    /// The retention sweep drops every record of a key that has not run for
+    /// this many days. Must be 1 to 3650.
+    pub history_keep_days: u64,
     pub progress_interval_secs: u64,
     /// When stderr is not a terminal: a progress line only when the wait
     /// reason or queue position changes, and at most this far apart
@@ -61,8 +64,13 @@ pub struct Config {
     /// has waited this long and every nested command of the same parent
     /// that is running has run this long (0: it waits until it fits).
     pub nested_sibling_max_wait_secs: u64,
-    /// `gc` removes finished job files older than this.
+    /// The retention sweep (and `gc`) removes the files of a job that
+    /// finished, or was found dead, more than this many days ago.
     pub jobs_keep_days: u64,
+    /// A job log longer than this many MiB is cut to its last part when the
+    /// job ends (and by the sweep, for a job that died). Must be 1 to
+    /// 1048576.
+    pub jobs_log_max_mib: u64,
     /// `gc` removes the sidecars (receipts) of managed commands that ended
     /// more than this many days ago, and leftover temporary files of that
     /// age. A command that has not ended is never removed. Must be 1 to 3650.
@@ -87,7 +95,8 @@ impl Default for Config {
             default_weight: 2,
             test_initial_weight: 4,
             mutation_initial_weight: 6,
-            history_keep: 200,
+            history_keep: 50,
+            history_keep_days: 30,
             progress_interval_secs: 5,
             progress_interval_secs_non_tty: 60,
             memory_reserve_mib: 2048,
@@ -99,7 +108,8 @@ impl Default for Config {
             backfill_max_wait_secs: 300,
             nested_guard_max_wait_secs: 60,
             nested_sibling_max_wait_secs: 600,
-            jobs_keep_days: 7,
+            jobs_keep_days: 1,
+            jobs_log_max_mib: 16,
             managed_keep_days: 7,
             jobs_orphan_grace_secs: 30,
             patterns: Vec::new(),
@@ -140,6 +150,16 @@ impl Config {
         if !(1..=3650).contains(&self.managed_keep_days) {
             return Err(Error::Config(
                 "managed_keep_days must be between 1 and 3650".into(),
+            ));
+        }
+        if !(1..=3650).contains(&self.history_keep_days) {
+            return Err(Error::Config(
+                "history_keep_days must be between 1 and 3650".into(),
+            ));
+        }
+        if !(1..=1_048_576).contains(&self.jobs_log_max_mib) {
+            return Err(Error::Config(
+                "jobs_log_max_mib must be between 1 and 1048576".into(),
             ));
         }
         for p in &self.patterns {
@@ -236,6 +256,20 @@ mod tests {
         assert!(Config::parse("managed_keep_days = 0").is_err());
         assert!(Config::parse("managed_keep_days = 3651").is_err());
         assert!(Config::parse("managed_keep_days = 9223372036854775807").is_err());
+    }
+
+    #[test]
+    fn retention_limits_are_bounded() {
+        assert!(Config::parse("history_keep_days = 1").is_ok());
+        assert!(Config::parse("history_keep_days = 3650").is_ok());
+        assert!(Config::parse("history_keep_days = 0").is_err());
+        assert!(Config::parse("history_keep_days = 3651").is_err());
+        assert!(Config::parse("jobs_log_max_mib = 1").is_ok());
+        assert!(Config::parse("jobs_log_max_mib = 1048576").is_ok());
+        assert!(Config::parse("jobs_log_max_mib = 0").is_err());
+        assert!(Config::parse("jobs_log_max_mib = 1048577").is_err());
+        assert_eq!(Config::default().history_keep_days, 30);
+        assert_eq!(Config::default().jobs_log_max_mib, 16);
     }
 
     #[test]

@@ -1525,6 +1525,9 @@ fn gc_keeps_a_marker_exactly_as_long_as_its_record() {
     std::fs::write(ctx.paths.measurements_dir().join("p.pending"), b"").unwrap();
     // Per key: only m0 (the oldest of "a") loses its record.
     assert_eq!(managed::trim_history(&ctx, 2).unwrap(), 1);
+    // m0's marker went with its record, at the trim; the gc only has the
+    // `.pending` of an attempt that never appended left to remove.
+    assert!(!ctx.paths.measurements_dir().join("m0.applied").exists());
     assert_eq!(managed::gc_measurements(&ctx).unwrap(), 1);
     let mut left: Vec<String> = std::fs::read_dir(ctx.paths.measurements_dir())
         .unwrap()
@@ -1533,13 +1536,7 @@ fn gc_keeps_a_marker_exactly_as_long_as_its_record() {
     left.sort();
     assert_eq!(
         left,
-        [
-            "m1.applied",
-            "m2.applied",
-            "m3.applied",
-            "m4.applied",
-            "p.pending"
-        ]
+        ["m1.applied", "m2.applied", "m3.applied", "m4.applied"]
     );
     // Every marker left has its record, so none is dropped (the old
     // behaviour kept the newest N markers overall and could keep one whose
@@ -1569,8 +1566,9 @@ fn trimming_the_history_waits_for_the_history_lock() {
     );
     drop(held);
     assert_eq!(managed::trim_history(&ctx, 1).unwrap(), 1);
-    // The marker of the dropped record goes with the next gc, not before.
-    assert_eq!(managed::gc_measurements(&ctx).unwrap(), 1);
+    // The marker of the dropped record went with it.
+    assert!(!ctx.paths.measurements_dir().join("m0.applied").exists());
+    assert_eq!(managed::gc_measurements(&ctx).unwrap(), 0);
 }
 
 // ---- descendants recorded while the command runs, and `resolve --force` ----

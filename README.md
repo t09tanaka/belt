@@ -343,7 +343,13 @@ cancelled.
 
 The runner is the same admission path as `exec`: weights, guards, history
 and liveness all apply. Job files live in `jobs/` under the state
-directory; `gc` removes those finished more than `jobs_keep_days` ago.
+directory. `wait` removes the job's log as soon as it has printed it (unless
+another `wait` is on the same job, or `--no-output` was given); the
+descriptor and exit code stay for `jobs` and a repeated `wait` until
+`jobs_keep_days` (see [Retention](#retention)). A job log longer than `jobs_log_max_mib`
+(default 16) is cut to its last part when the job ends, with a note on its
+first line saying how much was cut; a normal job's output reaches `wait`
+whole.
 
 ### `task-traffic-controller inspect --json` and `task-traffic-controller estimate --json -- <command>`
 
@@ -573,16 +579,9 @@ What is not found, and what follows:
 ### `task-traffic-controller config [--path]` and `task-traffic-controller gc`
 
 `config` prints the effective configuration (defaults merged with the
-file). `gc` reaps dead entries and trims history to `history_keep`
-records per key (under the history lock), removes the
-`measurements/*.applied` markers that `managed::record_measurement` leaves
-once their record is trimmed away (a marker is kept as long as its
-record), and removes the receipts of managed commands (`managed/<id>.json`)
-that ended more than `managed_keep_days` (default 7; 1 to 3650, anything else
-is a configuration error) ago and have no ledger
-entry, together with leftover temporary files of that age. A command that
-has not ended is never removed. Reaping also happens on the fly, so `gc` is
-only for tidiness.
+file). `gc` runs the [retention](#retention) sweep now and prints what it
+did. The same sweep runs by itself; `gc` is for running it on demand and
+seeing its errors.
 
 ## Configuration
 
@@ -594,7 +593,8 @@ budget = 12                 # default: logical CPU count
 default_weight = 2          # used when nothing is known about a command
 test_initial_weight = 4     # ...unless it is a test runner
 mutation_initial_weight = 6 # ...or a mutation-testing tool
-history_keep = 200          # records kept per command key
+history_keep = 50           # records kept per command key
+history_keep_days = 30      # a key not run for this long is dropped (1..3650)
 progress_interval_secs = 5  # between progress lines on a terminal
 progress_interval_secs_non_tty = 60 # heartbeat when stderr is not a terminal
 memory_reserve_mib = 2048   # keep this much available before admitting
@@ -607,8 +607,9 @@ backfill_max_wait_secs = 300 # ...until that head, held up by such commands, has
 nested_guard_max_wait_secs = 60 # the first nested exec of a command is held by the memory/CPU guards for at most this long
 nested_sibling_max_wait_secs = 600 # a nested exec that does not fit starts anyway after this, one per period (0: never)
 jobs_orphan_grace_secs = 30 # a job nobody `wait`s on is cancelled after this
-jobs_keep_days = 7          # `gc` removes finished job files older than this
-managed_keep_days = 7       # ...and receipts of managed commands that ended longer ago (1..3650)
+jobs_keep_days = 1          # an uncollected job's files are removed this long after it finished or was found dead
+jobs_log_max_mib = 16       # a job log is cut to its last part beyond this (1..1048576)
+managed_keep_days = 7       # receipts of managed commands are removed this long after they ended (1..3650)
 
 [[pattern]]                 # glob over the full argv string, first match wins
 match = "*stryker*"
@@ -649,7 +650,8 @@ State lives in `~/.local/state/task-traffic-controller/` (or `$XDG_STATE_HOME/ta
   exclusive `flock` on it from registration until exit. **Liveness is
   "this flock cannot be taken."** Anyone holding the ledger lock probes
   each lease non-blockingly and drops the entries whose lock it obtains.
-- `history.jsonl` — append-only measurements.
+- `history.jsonl` — measurements, appended to by every run and trimmed by
+  the retention sweep (see [Retention](#retention)).
 
 Admission is a pure function of the ledger plus a live snapshot: the
 candidate must be the head of the queue (`--front` entries first, then
@@ -859,6 +861,55 @@ CPU samples only when the process has no CPU sample from the last 5 seconds.
 A long-lived process that asks more often than that gets the usage since its
 previous sample without waiting, and the previous figure itself when it asks
 again within 200 ms. Memory and the load average are read on every call.
+
+## Retention
+
+Everything is removed at the moment nothing reads it any more; a sweep is
+only the backstop for what a crash left behind. The sweep runs by itself, at
+most once every 6 hours per state directory, from the commands that write
+state: `exec`, `submit`, and (for a program that embeds the library)
+`exec::run_gated` and `managed::register`. The first run in a state
+directory only starts the 6-hour clock. It never fails the command that
+started it; `gc` runs the same sweep on demand and prints its errors. Each
+command pays one read of the 25-byte `last-sweep` file; the sweep itself
+lists only small directories and reads `history.jsonl` once.
+
+| what | who reads it again | removed | at most |
+|---|---|---|---|
+| `leases/<id>.lock` | the queue's liveness test, while the command lives | when the command ends; the sweep for a crashed one | one per live entry |
+| `jobs/<id>.json`, `.exit` | `jobs`, `cancel`, and a repeated `wait` (the exit code lives nowhere else) | by the sweep, `jobs_keep_days` (1) after the job finished or was found dead: a day is how long a result can wait for its reader | a few hundred bytes per job in a day |
+| `jobs/<id>.log` | `wait`, which prints it | by `wait`, the moment it has printed it; else with the job. Cut to `jobs_log_max_mib` (16 MiB, which `wait` reads into memory) when the job ends | 16 MiB per job |
+| `jobs/<id>.waiter` | `wait`, while it runs | by `wait` when it reports; else with the job | one per job |
+| `history.jsonl` | the weight learner (the newest 5 usable records of a key), `estimate`, `inspect`, `history` | each record beyond `history_keep` (50) per key, and every key not run for `history_keep_days` (30, the age at which the forecast already calls a sample stale), by the sweep; the file itself when nothing is left | 50 records for each key run in 30 days |
+| `measurements/<id>.applied` | `record_measurement`, to refuse a replay while the record exists | at the moment the history drops the record | one per kept record |
+| `measurements/<id>.pending` | nobody (a dead attempt's) | at once when the append fails; the sweep for a crash. It becomes `.applied` if its record exists | none |
+| `managed/<id>.json` | a repeated registration of the same command id finds its outcome here | `managed_keep_days` (7) after the command ended, never while it runs; the owner of the id sets how late it may retry, so this is the existing contract | per command in 7 days |
+| `.tmp*` files, job files with no descriptor | nobody | by the sweep, when an hour old | none |
+| empty `leases/`, `jobs/`, `measurements/`, `managed/` | nobody | by the sweep (every writer makes its directory again) | none |
+| `ledger.json`, `ledger.lock`, `history.lock`, `last-sweep` | every command | never: the queue itself, its two locks, and the sweep clock; removing a lock another process is about to take would need a re-check on every acquire for no saving | four small files |
+
+How a job is found dead: it has no exit file, no ledger entry, and nobody
+holds its lease (its runner holds the lease from registration to exit, so
+this is the same test the queue uses for a command), and it was submitted
+more than an hour ago. The sweep gives it the finish time it never got
+(`finished_at`, now), so `jobs_keep_days` later its files go. Until then
+`jobs` still shows it as `lost`.
+
+A running job's log is not touched: it is cut when the job ends, so a job
+that writes without limit fills the disk while it runs.
+
+Files the caller owns are not ours. `Opts::stdout_log` (the library's way
+to send a command's output to a file) is appended to by the library and
+never truncated, rotated or removed by it: its size and lifetime belong to
+the caller. A `history.jsonl` placed elsewhere with
+`Paths::with_history_file` is trimmed like any other, but the sweep does
+not look for leftover temporary files in its directory.
+
+A program that embeds the library gets the sweep from `run_gated` and
+`register`. One that writes state in other ways (only
+`managed::record_measurement`, for example) calls
+`retention::sweep_if_due(&ctx, &cfg)` from its own entry points;
+`retention::sweep` runs it unconditionally.
 
 ## Platform support
 

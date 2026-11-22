@@ -20,6 +20,7 @@ pub fn submit(ctx: &Context, cfg: &Config, opts: Opts, detach: bool) -> Result<i
             "usage: task-traffic-controller submit [--weight N] [--front] [--key K] -- <command> [args...]".into(),
         ));
     }
+    crate::cmd::exec::sweep_if_due(ctx, cfg);
     let job = Job {
         id: exec::new_id(),
         argv: opts.argv,
@@ -107,16 +108,16 @@ pub fn run_job(ctx: &Context, cfg: &Config, id: &str) -> Result<i32> {
     }) {
         Ok(Gated::Finished(exit)) => exit,
         Ok(Gated::Interrupted(sig)) => {
-            jobs::write_exit(ctx, id, 128 + sig);
+            end_job(ctx, cfg, id, 128 + sig);
             reraise(sig);
         }
         Err(e) => {
             eprintln!("task-traffic-controller: {e}");
-            jobs::write_exit(ctx, id, 2);
+            end_job(ctx, cfg, id, 2);
             return Ok(2);
         }
     };
-    jobs::write_exit(ctx, id, exit.code());
+    end_job(ctx, cfg, id, exit.code());
     match exit {
         Exit::Code(c) => {
             crate::signals::restore();
@@ -124,6 +125,14 @@ pub fn run_job(ctx: &Context, cfg: &Config, id: &str) -> Result<i32> {
         }
         Exit::Signal(s) => reraise(s),
     }
+}
+
+/// Record how the job ended. The log is cut to `jobs_log_max_mib` first,
+/// so that whoever sees the exit file reads the log in its final size
+/// (nothing is writing it any more; a failure to cut leaves it whole).
+fn end_job(ctx: &Context, cfg: &Config, id: &str, code: i32) {
+    let _ = jobs::cap_log(ctx, id, cfg.jobs_log_max_mib * 1024 * 1024);
+    jobs::write_exit(ctx, id, code);
 }
 
 /// Once the grace period is over, a job nobody waits on is cancelled:
@@ -189,10 +198,10 @@ pub fn wait(ctx: &Context, ids: &[String], no_output: bool) -> Result<i32> {
             "usage: task-traffic-controller wait [--no-output] <job-id>...".into(),
         ));
     }
-    let mut waiter_locks = Vec::with_capacity(ids.len());
+    let mut waiter_locks: Vec<Option<lock::Lock>> = Vec::with_capacity(ids.len());
     for id in ids {
         jobs::load(ctx, id)?;
-        waiter_locks.push(jobs::take_waiter(ctx, id)?);
+        waiter_locks.push(Some(jobs::take_waiter(ctx, id)?));
     }
     let mut lost_strikes: HashMap<&str, u32> = HashMap::new();
     let mut final_code = 0;
@@ -241,6 +250,16 @@ pub fn wait(ctx: &Context, ids: &[String], no_output: bool) -> Result<i32> {
             }
             reported.push(id.as_str());
             progressed = true;
+            // The output has been handed over and nothing reads it again:
+            // remove it now (unless another `wait` is on the job, or the
+            // caller asked not to read it). The descriptor and exit file,
+            // a few bytes, stay for `jobs` and a repeated `wait`.
+            if let Some(i) = ids.iter().position(|x| x == id) {
+                waiter_locks[i] = None;
+            }
+            if !no_output && !jobs::has_waiter(ctx, id) {
+                jobs::remove_output(ctx, id);
+            }
         }
         if !progressed {
             thread::sleep(POLL_INTERVAL);
@@ -381,17 +400,4 @@ pub fn cancel(ctx: &Context, ids: &[String]) -> Result<i32> {
         }
     }
     Ok(0)
-}
-
-/// Remove job files finished more than `keep_days` ago. Returns the count.
-pub fn gc(ctx: &Context, keep_days: u64) -> Result<usize> {
-    let cutoff = ctx.clock.now() - chrono::Duration::days(keep_days as i64);
-    let mut n = 0;
-    for j in jobs::list(ctx)? {
-        if j.finished_at.map(|t| t < cutoff).unwrap_or(false) {
-            jobs::remove_files(ctx, &j.id);
-            n += 1;
-        }
-    }
-    Ok(n)
 }

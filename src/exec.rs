@@ -52,7 +52,9 @@ pub struct Opts {
     pub env: Option<std::collections::BTreeMap<String, String>>,
     /// `Some`: the child's stdout and stderr are appended to this file
     /// (created if missing) and its stdin is `/dev/null`. `None`: all three
-    /// are inherited.
+    /// are inherited. The caller owns the file: nothing here truncates,
+    /// rotates or removes it, so its size and lifetime are the caller's to
+    /// bound.
     pub stdout_log: Option<PathBuf>,
 }
 
@@ -350,6 +352,9 @@ pub fn run_gated(
     id: &str,
     hooks: &Hooks,
 ) -> Result<Gated> {
+    // At most every six hours, before anything is registered: no lock is
+    // held and the command has not started waiting.
+    let _ = crate::retention::sweep_if_due(ctx, cfg);
     let plan = plan(ctx, cfg, opts)?;
     let limits = cfg.limits();
 

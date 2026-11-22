@@ -7,6 +7,19 @@ the minor version).
 
 ## [Unreleased]
 
+### Changed
+
+- Nothing is kept without a rule that removes it, at the moment it stops being needed, with a sweep only as the backstop for crashes. The sweep that `gc` ran runs by itself, at most once every 6 hours per state directory, from `exec`, `submit`, `exec::run_gated` and `managed::register` (the first run in a state directory only starts the clock; the stamp is `last-sweep`). `gc` runs the same sweep on demand and exits 2 after printing every error. See the new Retention section of the README, which says who reads each file again.
+- `wait` removes a job's log and waiter file as soon as it has printed the output (unless another `wait` holds the job or `--no-output` was given); the descriptor and exit code stay for `jobs_keep_days`. The `.applied` marker of a measurement is removed when the history drops its record; a failed measurement settles its `.pending` marker at once; a history left empty and empty `leases/`, `jobs/`, `measurements/` and `managed/` directories are removed (every writer makes its directory again).
+- Defaults lowered to what the readers use: `history_keep` 200 to 50 (the learner reads 5), `jobs_keep_days` 7 to 1, and new `history_keep_days` 30 (the forecast already calls older samples stale; a key unseen that long is dropped, so the key count is bounded too) and `jobs_log_max_mib` 16 (1 to 1048576). A job log over the limit is cut to its last part, behind a one-line note, when the job ends and before `wait` can see it; a log under the limit is unchanged.
+- A job whose runner died (no exit file, no ledger entry, lease not held, submitted more than an hour ago) is given a `finished_at`, so its files are removed `jobs_keep_days` later instead of never. It still shows as `lost` until then.
+- Leftover `.tmp*` files and job files without a descriptor, an hour old, are swept (24 hours and 7 days before, or never). Job files are now removed descriptor last, so an interrupted removal is finished by the next sweep.
+- `Opts::stdout_log` documents that the caller owns the file's size and lifetime.
+
+### Added
+
+- `retention` module: `sweep`, `sweep_if_due`, `Report`, and the pure rules (`job_action`, `stale_temp_files`, `orphan_job_files`). An embedder that writes state without `run_gated` or `register` calls `retention::sweep_if_due` itself. Also `managed::trim_history_aged`, `history::trim_aged`, `history::trim_collect`, `jobs::cap_log`, `Paths::sweep_stamp`.
+
 ### Fixed
 
 - `exec` no longer starts the command with SIGINT and SIGQUIT ignored. While the command runs the wrapper used `SIG_IGN` for them (so the terminal's Ctrl-C does not kill the wrapper), and an ignored disposition survives `exec`, so a command without its own handler could not be interrupted. The wrapper now uses a handler that does nothing, which `exec` resets to the default; the wrapper's own behaviour is unchanged.

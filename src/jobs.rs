@@ -56,10 +56,25 @@ impl JobState {
     }
 }
 
+/// A temporary file in `jobs/`, creating the directory. The retention
+/// sweep removes the directory when it is empty, so a directory that
+/// vanishes between the two calls is made again.
+fn jobs_tempfile(ctx: &Context) -> Result<tempfile::NamedTempFile> {
+    let mut last = None;
+    for _ in 0..3 {
+        fs::create_dir_all(ctx.paths.jobs_dir())?;
+        match tempfile::NamedTempFile::new_in(ctx.paths.jobs_dir()) {
+            Ok(t) => return Ok(t),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => last = Some(e),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last.expect("loop ran").into())
+}
+
 pub fn save(ctx: &Context, job: &Job) -> Result<()> {
     let path = ctx.paths.job_json(&job.id);
-    fs::create_dir_all(ctx.paths.jobs_dir())?;
-    let mut tmp = tempfile::NamedTempFile::new_in(ctx.paths.jobs_dir())?;
+    let mut tmp = jobs_tempfile(ctx)?;
     serde_json::to_writer_pretty(&mut tmp, job)?;
     tmp.write_all(b"\n")?;
     tmp.persist(path).map_err(|e| e.error)?;
@@ -106,8 +121,7 @@ pub fn write_exit(ctx: &Context, id: &str, code: i32) {
     if path.exists() {
         return;
     }
-    let _ = fs::create_dir_all(ctx.paths.jobs_dir());
-    if let Ok(mut tmp) = tempfile::NamedTempFile::new_in(ctx.paths.jobs_dir()) {
+    if let Ok(mut tmp) = jobs_tempfile(ctx) {
         let _ = writeln!(tmp, "{code}");
         let _ = tmp.persist(&path);
     }
@@ -168,15 +182,67 @@ pub fn mark_orphaned(ctx: &Context, id: &str) {
     }
 }
 
+/// Remove every file of job `id`. The descriptor goes last: it is what
+/// [`list`] (and so every later sweep) finds the job by, so a crash half way
+/// leaves a job the next sweep removes, not orphans nothing looks at.
 pub fn remove_files(ctx: &Context, id: &str) {
     for p in [
-        ctx.paths.job_json(id),
         ctx.paths.job_log(id),
         ctx.paths.job_exit(id),
         ctx.paths.job_waiter(id),
+        ctx.paths.job_json(id),
     ] {
         let _ = fs::remove_file(p);
     }
+}
+
+/// Bytes kept free in a cut log for its first line.
+const NOTE_ROOM: u64 = 160;
+
+/// Remove the log and the waiter lock of job `id`: what is left once its
+/// output has been handed over.
+pub fn remove_output(ctx: &Context, id: &str) {
+    let _ = fs::remove_file(ctx.paths.job_log(id));
+    let _ = fs::remove_file(ctx.paths.job_waiter(id));
+}
+
+/// Cut the log of job `id` to its last `max_bytes` (from the start of a
+/// line when one is near) behind a one-line note, when it is longer. Call it
+/// only once nothing writes the log any more: the tail is copied to a new
+/// file that replaces the log. Returns whether the log was cut.
+pub fn cap_log(ctx: &Context, id: &str, max_bytes: u64) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = ctx.paths.job_log(id);
+    let mut f = match fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    let len = f.metadata()?.len();
+    if len <= max_bytes {
+        return Ok(false);
+    }
+    // Room for the note, so the cut log is within the limit and a second
+    // look leaves it alone.
+    let keep = max_bytes - NOTE_ROOM.min(max_bytes / 2);
+    f.seek(SeekFrom::Start(len - keep))?;
+    // Start at the next line, unless the first 8 KiB has none.
+    let mut head = vec![0u8; 8192.min(keep as usize)];
+    let n = f.read(&mut head)?;
+    let skip = head[..n]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map_or(0, |i| i as u64 + 1);
+    let cut = len - keep + skip;
+    f.seek(SeekFrom::Start(cut))?;
+    let mut tmp = jobs_tempfile(ctx)?;
+    writeln!(
+        tmp,
+        "[task-traffic-controller: the first {cut} bytes of this log were cut; it is kept to its last part]"
+    )?;
+    std::io::copy(&mut f, &mut tmp)?;
+    tmp.persist(&path).map_err(|e| e.error)?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -205,5 +271,46 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    fn ctx_in(d: &std::path::Path) -> Context {
+        Context::new(crate::Paths::new(d.join("s"), d.join("c.toml")))
+    }
+
+    #[test]
+    fn cap_log_keeps_the_tail_from_a_line_start_and_says_what_it_cut() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(d.path());
+        fs::create_dir_all(ctx.paths.jobs_dir()).unwrap();
+        let log = ctx.paths.job_log("j");
+        fs::write(&log, "aaaa\nbbbb\ncccc\n").unwrap();
+        // Exactly at the limit: untouched.
+        assert!(!cap_log(&ctx, "j", 15).unwrap());
+        assert_eq!(fs::read_to_string(&log).unwrap(), "aaaa\nbbbb\ncccc\n");
+        // One byte over: half of the limit is room for the note, the 7 bytes
+        // kept start inside "bbbb", so the log begins at the next line.
+        assert!(cap_log(&ctx, "j", 14).unwrap());
+        let got = fs::read_to_string(&log).unwrap();
+        assert!(got.ends_with("]\ncccc\n"), "{got}");
+        assert!(
+            got.starts_with("[task-traffic-controller: the first 10 bytes"),
+            "{got}"
+        );
+        assert!(!got.contains("bbbb"));
+        // A missing log is not an error.
+        assert!(!cap_log(&ctx, "none", 1).unwrap());
+    }
+
+    #[test]
+    fn cap_log_without_a_newline_in_reach_keeps_the_raw_tail() {
+        let d = tempfile::tempdir().unwrap();
+        let ctx = ctx_in(d.path());
+        fs::create_dir_all(ctx.paths.jobs_dir()).unwrap();
+        let log = ctx.paths.job_log("j");
+        fs::write(&log, "abcdefghij").unwrap();
+        assert!(cap_log(&ctx, "j", 4).unwrap());
+        let got = fs::read_to_string(&log).unwrap();
+        assert!(got.ends_with("]\nij"), "{got}");
+        assert_eq!(fs::read_dir(ctx.paths.jobs_dir()).unwrap().count(), 1);
     }
 }
