@@ -823,7 +823,10 @@ async fn a57_an_unconfirmed_retire_survives_the_other_members_rollback() {
     g.link(0, 1).await;
     g.link(0, 0).await;
     let report = g.c(0).tick().await.unwrap();
-    assert_eq!(report.retired, [first.attempt_id.clone()]);
+    assert_eq!(
+        report.retired.as_slice(),
+        std::slice::from_ref(&first.attempt_id)
+    );
     assert!(g.members[1]
         .store()
         .for_member(g.c(0).store().coordinator_id())

@@ -1795,3 +1795,22 @@ WP24c の実装メモ（2026-11-21）:
 R68 と R96 は backlog の番号をそのまま行の名前にした。R68（resident が自分を更新する）は、どのメンバーも投入する側になることで全員に要るようになったため、初回リリースの範囲に含める（仕様 §24.8）。R96 は、2026-11-20 時点で coordinator の tick が応答しない worker 1 台につき `worker_budget_ms`（既定 15 秒）のあいだ actor を持ち続け、CLI の要求が時間切れになる問題で、仕様 §24.7 を完了条件とする。WP21 の残り（退役した identity の worker へ伝える wire の message。S24 の残り 5）は WP24b が担当する。
 
 WP25cのfast-worktreeとportoolのライブラリ依存は、前提APIを含むマージコミットに固定する。beltをcrates.ioに公開する前に、対応する両ライブラリを公開してからregistryの固定版に切り替え、A48・A55を再検証する。
+
+## 仕様1.5とS26の非実機受入
+
+検証対象は統合版 `6c3a304` の製品コード（`belt-cli 0.0.0`、release profile）と、`627274d` の A57 追加試験。親は macOS 27.0.1 arm64、Linux は Debian 12 の arm64・amd64。両アーキテクチャで基本の Docker 受入は各9件合格した。組み込みは local-ci 0.18.3、task-traffic-controller 0.10.2、fast-worktree 0.6.0、portool 0.13.0。初回利用は [README](../README.md)、受入環境の起動・更新・撤収は [S26 手順](../scripts/s26/README.md) に従う。
+
+| 経路 | 確認内容 |
+| --- | --- |
+| 1台での初回利用（A50） | 初期化前のHOMEで `belt exec -- <command>` と `belt --json exec --local -- <command>` が直接実行され、終了コードを引き継ぐ。 |
+| 登録と配置（A01・A02・A45） | Dockerで親とworker 2台に仕事が分散し、途中参加したworkerが既存の未配置キューを処理した。 |
+| 再起動と時刻のずれ（A24・A26、自動試験） | `tests/it/one_host.rs` で起動 ID が変わった worker の attempt だけが interrupted になり、他方が継続することを検証する。worker 2台の時計を1日遅れと1年進みに設定し、lease 期間を超える両ジョブが1回ずつ完了することも検証する。 |
+| ワーカー更新（A34・A35） | 疎通確認の失敗で旧版に戻り、再試行で更新できた。systemdのsystem unitを再起動した後、非root workerが親へ再接続してジョブを実行した。 |
+| 実プロジェクト（A37） | 同じコミットの4ジョブについて単独・分散、各2回の結果を照合。単独の初回25.86秒・再実行16.84秒に対し、分散では13.20秒・12.70秒。15テストの結果は一致した。 |
+| toolchain（A42・A44） | 実 SSH 接続した Linux worker で Node.js 20.19.0 を明示同期し、20.19.1 をジョブから自動導入した。20.19.2 は `workers diff` が `auto_installable` と導入手順を表示し、同期後に `same` となった。再同期で追加導入は0件、指定版のジョブは成功した。 |
+| workspace と組み込みツール（A48・A55） | macOS の実 worker で `.worktreeinclude` の選別、単独版 portool との別割当、hook の有無にかかわらず対象の割当だけが解放されることを確認。Linux worker は外部 CLI のないイメージでジョブ内の組み込み portool を使用。 |
+| 一時ワーカー（A46） | SSH転送だけを切断すると既存attemptがunknownを保ち、forget後にinterruptedとなった。旧identityの再接続による再実行は0件。 |
+| グループ（A51・A53・A54） | 各投入元だけがそのrunの正本を保持。片方のresidentを停止した間も他の投入元のrunは同じworkerで完走。鍵切替後も初期化済みメンバーとworker専用サービスが利用でき、skip・send-key・removeまで確認した。 |
+| メンバー更新（A57） | 更新の試行中は変更要求を拒否。異常時はガードが旧版と両DBを復元し、既存attemptを再実行せずに引き継いだ。75秒のジョブの終了を待つ正常更新も確認。追加の対称メンバー試験では、試用中に2回拒否された retire が復旧後に元の DB で tombstone として確定し、遅延 submit を拒否した。再配置先のコマンド起動は1回。 |
+
+マシンの実際の再起動に伴うboot ID変更、Macのsleep、異なる物理ホスト間のLAN性能は実機検証の対象として残る。Dockerではホストカーネルを共有する。x86_64 Dockerはarm64上のRosettaによる実行。
