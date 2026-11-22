@@ -110,7 +110,7 @@ def up():
                  "--label", f"{LABEL}={token}", "--name", name,
                  "--hostname", host, "--network", prefix,
                  "-p", f"127.0.0.1:{port}:22",
-                 "belt-s26-worker:debian12.9-fw0.4.0"])
+                 "belt-s26-worker:debian12.9-embedded"])
         command(["docker", "cp", RUN / "id_ed25519.pub",
                  f"{name}:/home/belt/.ssh/authorized_keys"])
         command(["docker", "exec", name, "sh", "-ec",
@@ -136,10 +136,6 @@ class Checks:
             raise RuntimeError("run.sh is single-use per up; down.sh then up.sh to repeat")
         self.binary = RUN / "bin/belt"
         shutil.copy2(binary, self.binary)
-        fw = Path(os.environ["S26_FAST_WORKTREE"])
-        if command([fw, "--version"]).stdout.strip() != "fast-worktree 0.4.0":
-            raise RuntimeError("native fast-worktree 0.4.0 is required")
-        (RUN / "bin/fast-worktree").symlink_to(fw)
         for name in ("home", "config/belt", "state", "local", "tmp", "evidence", "project"):
             (RUN / name).mkdir(parents=True, mode=0o700)
         self.env = {"HOME": str(RUN / "home"), "XDG_CONFIG_HOME": str(RUN / "config"),
@@ -162,13 +158,16 @@ class Checks:
         for args in (["init", "-q"], ["config", "user.name", "S26 Harness"],
                      ["config", "user.email", "s26@example.invalid"]):
             command(["git", *args], env=self.env, cwd=self.project)
+        (self.project / ".portool.toml").write_text("[ports]\nweb = 0\n")
         (self.project / "job.sh").write_text(
             '#!/bin/sh\nset -eu\n'
             'if [ -n "${2:-}" ]; then mkdir -p "$HOME/s26-starts"; '
             'hostname >> "$HOME/s26-starts/$2"; fi\n'
             'printf "s26 start %s\\n" "$(hostname)"\n'
+            'case "$(command -v portool)" in */tool-bin/*/portool) ;; *) exit 22;; esac\n'
+            'fast-worktree --version && portool exec -- sh -ec \'test -n "$WEB_PORT"\'\n'
             'sleep "$1"\nprintf "s26 complete %s\\n" "$(hostname)"\n')
-        command(["git", "add", "job.sh"], env=self.env, cwd=self.project)
+        command(["git", "add", "job.sh", ".portool.toml"], env=self.env, cwd=self.project)
         command(["git", "-c", "commit.gpgsign=false", "commit", "-qm", "S26 fixture"],
                 env=self.env, cwd=self.project)
         self.count = 0

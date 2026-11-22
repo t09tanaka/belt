@@ -271,10 +271,13 @@ async fn worker_identity_survives_restart_and_bridge_loss_preserves_task() {
     })
     .await
     .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&command_path).unwrap(),
-        f.spec.env["PATH"]
-    );
+    let observed = std::fs::read_to_string(&command_path).unwrap();
+    let mut dirs = std::env::split_paths(&observed);
+    assert!(dirs
+        .next()
+        .unwrap()
+        .starts_with(f.spec.state_dir.join("tool-bin")));
+    assert!(dirs.eq(std::env::split_paths(&f.spec.env["PATH"])));
     let command_pid = super::common::read_pid(&started).expect("running command PID");
     assert!(command_pid > 1);
     let command_start =

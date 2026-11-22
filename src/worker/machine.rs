@@ -342,6 +342,12 @@ impl Host for Machine {
         attempt: &AcceptedAttempt,
         payload: &AttemptPayload,
     ) -> Result<Workspace, ApiError> {
+        if let Some(why) = crate::workspace::embedded::incompatible_registry(&self.env) {
+            return Err(ApiError::blocked(
+                crate::error::BlockedReason::EnvironmentMismatch,
+                why,
+            ));
+        }
         let m = self.manifest(attempt)?;
         if let Some(bundle) = &payload.toolchains {
             let invalid = |e: &str| ApiError::new(crate::error::ErrorCode::InvalidInput, e);

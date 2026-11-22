@@ -234,6 +234,12 @@ impl ResolvedConfig {
         agent.log_limit_bytes = settings.log_limit_bytes;
         agent.retention_ms = settings.retention_ms;
         let profile = crate::toolchain::profile::Profile::load(&inputs.state_dir, &inputs.env)
+            .and_then(|profile| {
+                profile.with_embedded_bin(crate::workspace::embedded::bin(
+                    &inputs.state_dir,
+                    &inputs.supervisor_exe,
+                ))
+            })
             .map_err(|e| super::ConfigError::Invalid { problems: vec![e] })?;
         agent.profile = profile.name().into();
         agent.profile_fingerprint = profile.startup_report().profile_fingerprint;
@@ -285,26 +291,32 @@ impl WorkerRuntime {
     }
     /// Preserve Machine's Git preflight and typed BLOCKED errors.
     pub fn open_host(&self) -> Result<Arc<Machine>, ApiError> {
-        Machine::open(
+        self.machine().map(Arc::new)
+    }
+
+    fn machine(&self) -> Result<Machine, ApiError> {
+        let machine = Machine::open(
             &self.agent.state_dir,
             self.env.clone(),
             self.cluster_key_path.clone(),
-        )
-        .and_then(|machine| machine.with_setup(self.setup.clone()))
-        .map(Arc::new)
+        )?;
+        crate::workspace::embedded::install(&self.agent.state_dir, &self.agent.supervisor_exe)
+            .map_err(|e| {
+                ApiError::new(
+                    crate::error::ErrorCode::Internal,
+                    format!("worker tool links: {e}"),
+                )
+            })?;
+        machine.with_setup(self.setup.clone())
     }
 
     pub(crate) fn open_host_in_place(
         &self,
         parent_state: PathBuf,
     ) -> Result<Arc<Machine>, ApiError> {
-        Machine::open(
-            &self.agent.state_dir,
-            self.env.clone(),
-            self.cluster_key_path.clone(),
-        )
-        .and_then(|machine| machine.with_setup(self.setup.clone()))
-        .map(|machine| Arc::new(machine.with_in_place(parent_state, self.agent.worker_id.clone())))
+        self.machine().map(|machine| {
+            Arc::new(machine.with_in_place(parent_state, self.agent.worker_id.clone()))
+        })
     }
     pub(crate) fn start_with_host(self, host: Arc<Machine>) -> Result<Arc<Agent>, ApiError> {
         Agent::start(self.agent, host)
