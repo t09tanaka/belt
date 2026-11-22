@@ -200,24 +200,38 @@ fn wait_on_unknown_id_is_an_error() {
 #[test]
 fn submit_prints_an_estimate_from_history() {
     let env = TestEnv::new("budget = 1\n");
-    // Learn ~1.2s for this command.
-    let out = env.run(&["exec", "--", "sh", "-c", "sleep 1.2"]);
+    // The command only holds while `hold` exists, so learning its key is
+    // instant; the recorded duration is then replaced by a fixed one, so the
+    // figures below come from that history and not from how long a real run
+    // took on a loaded machine.
+    let script = "if [ -e hold ]; then sleep 30; fi";
+    let out = env.run(&["exec", "--", "sh", "-c", script]);
     assert!(out.status.success());
-    let (a, est_a) = env.submit(&[], "sleep 1.2");
-    assert!(est_a.contains("done in ~0:01"), "{est_a}");
+    let path = env.state().join("history.jsonl");
+    let hist = fs::read_to_string(&path).unwrap();
+    let mut rec: serde_json::Value = serde_json::from_str(hist.lines().next().unwrap()).unwrap();
+    rec["wall_secs"] = 100.0.into();
+    rec["cpu_secs"] = 0.1.into();
+    fs::write(&path, format!("{rec}\n")).unwrap();
+    fs::write(env.dir.path().join("hold"), "").unwrap();
+    // Seconds are truncated and the first job has already run for a moment,
+    // so check the minute only (100s is 1:39 or 1:40, a few seconds later
+    // 1:3x).
+    let (a, est_a) = env.submit(&[], script);
+    assert!(est_a.contains("done in ~1:"), "{est_a}");
     assert!(!est_a.contains('?'), "{est_a}");
-    // Second one waits behind the first: start in ~0:01.
-    let (b, est_b) = env.submit(&[], "sleep 1.2");
-    assert!(est_b.contains("start in ~0:01"), "{est_b}");
+    // Second one waits behind the first: start in ~1:xx, done in ~3:xx.
+    let (b, est_b) = env.submit(&[], script);
+    assert!(est_b.contains("start in ~1:"), "{est_b}");
+    assert!(est_b.contains("done in ~3:"), "{est_b}");
     // Unknown command: rough estimate.
     let (c, est_c) = env.submit(&[], "true # never seen");
     assert!(est_c.contains('?'), "{est_c}");
     let jobs = String::from_utf8_lossy(&env.run(&["jobs"]).stdout).into_owned();
     assert!(jobs.contains("start in ~"), "{jobs}");
-    assert!(env
-        .run(&["wait", "--no-output", &a, &b, &c])
-        .status
-        .success());
+    for id in [&a, &b, &c] {
+        assert!(env.run(&["cancel", id]).status.success());
+    }
 }
 
 #[test]
