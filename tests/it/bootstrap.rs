@@ -4833,12 +4833,48 @@ async fn wait_calls(host: &std::path::Path, version: &str, wanted: usize) {
     panic!("the manager was not asked for {version} {wanted} time(s)");
 }
 
+/// What a failed wait after a restart needs to be understood from the log
+/// alone: how long each part took, what the setup area holds, and which
+/// processes of this test's root are alive.
+fn restart_report(spec: &Spec, host: &std::path::Path, t0: std::time::Instant) -> String {
+    fn walk(dir: &std::path::Path, depth: usize, out: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for ent in rd.flatten() {
+            out.push(ent.path().display().to_string());
+            if depth > 0 && ent.path().is_dir() {
+                walk(&ent.path(), depth - 1, out);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(&spec.worker_state_dir.join("setup"), 3, &mut files);
+    let root = host.parent().unwrap().display().to_string();
+    let ps = std::process::Command::new("ps")
+        .args(["-axo", "pid,ppid,pgid,stat,etime,command"])
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    let ours: Vec<&str> = ps.lines().filter(|l| l.contains(&root)).collect();
+    format!(
+        "after {:?}; manager runs of 22.0.0: {}; hold present: {}\nsetup area:\n{}\nprocesses of this root:\n{}",
+        t0.elapsed(),
+        calls_of(host, "22.0.0"),
+        host.join("hold").exists(),
+        files.join("\n"),
+        ours.join("\n")
+    )
+}
+
 /// M4 (c), and a worker that restarts in the middle of an install: the local
 /// worker lives in the resident, so both go away and come back together.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_sync_goes_on_over_a_restart_of_the_resident_in_the_middle_of_an_install() {
     let (_root, spec, host) = sync_fixture();
+    let t0 = std::time::Instant::now();
     let client = ensure(spec.clone()).await.unwrap();
+    eprintln!("T ensure1 {:?}", t0.elapsed());
     std::fs::write(host.join("hold"), "").unwrap();
     let sync = tokio::spawn({
         let spec = spec.clone();
@@ -4846,9 +4882,11 @@ async fn a_sync_goes_on_over_a_restart_of_the_resident_in_the_middle_of_an_insta
     });
     // The manager runs: the sync was answered `pending` well before that.
     wait_calls(&host, "22.0.0", 1).await;
+    eprintln!("T called {:?}", t0.elapsed());
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(!sync.is_finished());
     shutdown(&client).await;
+    eprintln!("T shut {:?}", t0.elapsed());
     // While nothing listens, the sync asks again instead of ending.
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(
@@ -4856,12 +4894,23 @@ async fn a_sync_goes_on_over_a_restart_of_the_resident_in_the_middle_of_an_insta
         "the sync ended while the resident was away"
     );
     let client = ensure(spec.clone()).await.unwrap();
+    eprintln!("T ensure2 {:?}", t0.elapsed());
     std::fs::remove_file(host.join("hold")).unwrap();
     let done = tokio::time::timeout(Duration::from_secs(120), sync)
         .await
         .expect("the sync must end after the resident is back")
-        .unwrap()
         .unwrap();
+    let done = done.unwrap_or_else(|e| {
+        panic!(
+            "the sync after the restart failed: {e:?}\n{}",
+            restart_report(&spec, &host, t0)
+        )
+    });
+    eprintln!(
+        "T done {:?} calls {}",
+        t0.elapsed(),
+        calls_of(&host, "22.0.0")
+    );
     assert_eq!(done.installed.len(), 1);
     assert_eq!(done.installed[0].version, "22.0.0");
     assert_eq!(installed_node(&spec), ["22.0.0"]);
