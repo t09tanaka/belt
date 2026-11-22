@@ -17,7 +17,7 @@ use crate::key::{self, CommandKey};
 use crate::ledger::Entry;
 use crate::ledger::Ledger;
 use crate::managed::{self, OwnerGuard, Ran, TryAdmit, Waiting};
-use crate::runner::Exit;
+use crate::runner::{self, Exit};
 use crate::weight::{self, Measurement};
 use crate::{lock, Context};
 use std::io::Read;
@@ -444,7 +444,17 @@ pub fn run_gated(
         remove_entry(ctx, id);
         return Ok(Gated::Interrupted(sig));
     }
-    let ran = managed::run_command(ctx, &guard, opts, limits);
+    let ran = match managed::run_plain_command(ctx, &guard, opts, limits) {
+        // A signal landed after the last check above but before the command
+        // existed: it never starts. Same path as an interruption while
+        // waiting.
+        Ok(runner::Launch::Interrupted(sig)) => {
+            remove_entry(ctx, id);
+            return Ok(Gated::Interrupted(sig));
+        }
+        Ok(runner::Launch::Ran(r)) => Ok(r),
+        Err(e) => Err(e),
+    };
     let cpu_secs = ran.as_ref().map_or(0.0, |r| r.outcome.cpu_secs);
     let entry = settle_entry(ctx, id, opts.parent.as_deref(), cpu_secs);
     drop(guard);
@@ -758,6 +768,64 @@ mod tests {
                 .paths
                 .history_file()
                 .starts_with(dir.path().join("state")));
+        }
+
+        /// Reports nothing until the command is about to start, then one
+        /// SIGTERM: a signal that lands after the last check while waiting.
+        #[derive(Default)]
+        struct LandsAtStart {
+            running: std::sync::atomic::AtomicBool,
+            started: std::sync::atomic::AtomicBool,
+        }
+
+        impl crate::Supervisor for LandsAtStart {
+            fn running(&self) {
+                self.running
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            fn take_pending(&self) -> i32 {
+                if self
+                    .running
+                    .swap(false, std::sync::atomic::Ordering::SeqCst)
+                {
+                    libc::SIGTERM
+                } else {
+                    0
+                }
+            }
+            fn child_started(&self, _pid: u32, _group: bool) {
+                self.started
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+
+        #[test]
+        fn a_signal_between_the_last_wait_check_and_the_spawn_means_no_command() {
+            let dir = tempfile::tempdir().unwrap();
+            let (ctx, _) = ctx_in(dir.path());
+            let sup = Arc::new(LandsAtStart::default());
+            let ctx = ctx.with_supervisor(sup.clone());
+            let proof = dir.path().join("ran");
+            let o = opts(dir.path(), &["touch", proof.to_str().unwrap()]);
+            let polls = Cell::new(0);
+            let cancelled = bounded(50, &polls);
+            let hooks = Hooks {
+                cancelled: &cancelled,
+                progress: &|_| {},
+                progress_tty: false,
+            };
+            let got = run_gated(&ctx, &Config::default(), &o, "late", &hooks).unwrap();
+            assert_eq!(got, Gated::Interrupted(libc::SIGTERM));
+            assert!(!proof.exists(), "the command was started");
+            assert!(!sup.started.load(std::sync::atomic::Ordering::SeqCst));
+            assert!(Ledger::load(&ctx.paths.ledger_file())
+                .unwrap()
+                .entries
+                .is_empty());
+            assert!(!ctx.paths.lease_file("late").exists());
+            assert!(history::read_all(ctx.paths.history_file())
+                .unwrap_or_default()
+                .is_empty());
         }
 
         #[test]

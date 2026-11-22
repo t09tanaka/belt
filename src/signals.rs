@@ -73,7 +73,49 @@ fn forward_from_handler(sig: libc::c_int) {
     IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
 }
 
+/// Does nothing. Used instead of `SIG_IGN` for the terminal's SIGINT and
+/// SIGQUIT while the command runs: an ignored disposition would survive
+/// `exec` and leave the command unable to be interrupted, whereas a handler
+/// is reset to the default by `exec`.
+extern "C" fn ignore_in_wrapper(_sig: libc::c_int) {}
+
+/// Signals that were `SIG_IGN` when the process started (one bit each),
+/// read once before the first handler is installed.
+static STARTED_IGNORED: AtomicU64 = AtomicU64::new(0);
+static CAPTURE: std::sync::Once = std::sync::Once::new();
+
+/// Shell convention: a non-interactive shell starts background jobs with
+/// SIGINT/SIGQUIT ignored and `nohup` starts with SIGHUP ignored. What the
+/// process started with is kept, so the wrapped command inherits it just as
+/// a bare `cmd &` / `nohup cmd` would.
+fn capture_initial_dispositions() {
+    CAPTURE.call_once(|| {
+        let mut bits = 0u64;
+        for sig in [libc::SIGINT, libc::SIGQUIT, libc::SIGHUP, libc::SIGTERM] {
+            unsafe {
+                let mut old: libc::sigaction = std::mem::zeroed();
+                if libc::sigaction(sig, std::ptr::null(), &mut old) == 0
+                    && old.sa_sigaction == libc::SIG_IGN
+                {
+                    bits |= 1u64 << sig;
+                }
+            }
+        }
+        STARTED_IGNORED.store(bits, Ordering::SeqCst);
+    });
+}
+
+fn started_ignored(sig: libc::c_int) -> bool {
+    STARTED_IGNORED.load(Ordering::SeqCst) & (1u64 << sig) != 0
+}
+
 fn set_handler(sig: libc::c_int, handler: libc::sighandler_t) {
+    // The first call here precedes every handler installation.
+    capture_initial_dispositions();
+    // Ignored at start-up: leave it ignored in every phase.
+    if started_ignored(sig) {
+        return;
+    }
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = handler;
@@ -102,9 +144,11 @@ impl Supervisor for ProcessSignals {
     fn running(&self) {
         // Terminal-originated signals reach the child directly (same
         // process group); a second copy from us would make test runners
-        // force-quit.
-        set_handler(libc::SIGINT, libc::SIG_IGN);
-        set_handler(libc::SIGQUIT, libc::SIG_IGN);
+        // force-quit. A no-op handler, not SIG_IGN, so the command does
+        // not inherit an ignored SIGINT/SIGQUIT across `exec`.
+        let noop = ignore_in_wrapper as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        set_handler(libc::SIGINT, noop);
+        set_handler(libc::SIGQUIT, noop);
         for sig in [libc::SIGTERM, libc::SIGHUP] {
             set_handler(sig, record());
         }
@@ -162,7 +206,9 @@ pub fn restore() {
 }
 
 /// Terminate ourselves the way the child did, so the calling shell sees
-/// the same signal death. Falls back to exiting 128+N.
+/// the same signal death. Falls back to exiting 128+N. (The default is set
+/// on purpose here even for a signal ignored at start-up: the child died of
+/// it, so the child had reset it itself.)
 pub fn reraise(sig: i32) -> ! {
     // Only now, with the outcome recorded, do the handled signals go back
     // to their defaults: earlier, a second SIGTERM would kill the process

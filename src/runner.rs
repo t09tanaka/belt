@@ -75,6 +75,14 @@ pub fn run(
     run_with(ctx, argv, cwd, lease, measure, Spawn::default())
 }
 
+/// How a launch that may be refused ended.
+pub(crate) enum Launch<T> {
+    Ran(T),
+    /// A stop signal arrived before the command existed, so it was not
+    /// started.
+    Interrupted(i32),
+}
+
 /// How [`run_with`] spawns.
 #[derive(Default)]
 pub struct Spawn<'a> {
@@ -269,10 +277,34 @@ pub fn run_with(
     measure: bool,
     spawn: Spawn<'_>,
 ) -> Result<Outcome> {
+    match launch(ctx, argv, cwd, lease, measure, spawn, false)? {
+        Launch::Ran(out) => Ok(out),
+        Launch::Interrupted(_) => unreachable!("only reported when asked to check"),
+    }
+}
+
+/// [`run_with`]; with `abort_if_pending` a stop signal that is pending once
+/// the supervisor is in its running state, right before the spawn, means
+/// the command is not started.
+pub(crate) fn launch(
+    ctx: &Context,
+    argv: &[String],
+    cwd: &Path,
+    lease: &str,
+    measure: bool,
+    spawn: Spawn<'_>,
+    abort_if_pending: bool,
+) -> Result<Launch<Outcome>> {
     let (prog, args) = argv
         .split_first()
         .ok_or_else(|| Error::Spawn("no command given".into()))?;
     ctx.supervisor.running();
+    if abort_if_pending {
+        let sig = ctx.supervisor.take_pending();
+        if sig != 0 {
+            return Ok(Launch::Interrupted(sig));
+        }
+    }
     let start = ctx.clock.monotonic();
     let mut cmd = Command::new(prog);
     cmd.args(args).current_dir(cwd);
@@ -452,7 +484,7 @@ pub fn run_with(
     let cpu_secs = tv(ru.ru_utime) + tv(ru.ru_stime);
     let max_rss_bytes = normalise_maxrss(ru.ru_maxrss as u64);
     let own_max_rss_bytes = monitor.and_then(crate::usage::Monitor::finish);
-    Ok(Outcome {
+    Ok(Launch::Ran(Outcome {
         exit,
         wall_secs,
         cpu_secs,
@@ -461,7 +493,7 @@ pub fn run_with(
         tracker_unknown,
         tracked_to_exit_at,
         own_max_rss_bytes,
-    })
+    }))
 }
 
 /// `task-traffic-controller exec -- "npm run x"` looks for a program named `npm run x`.
