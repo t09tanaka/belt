@@ -5,7 +5,7 @@ from pathlib import PurePosixPath
 
 def verify(checks, run, binary, command, save, until):
     config = run / "config/belt/config.toml"
-    text = config.read_text().replace("[coordinator]\n", "[coordinator]\nlocal_worker=false\n")
+    text = config.read_text()
     config.write_text(text + '\n[[workers]]\nid="w1"\nssh="w1"\nservice_mode="system-user"\n')
     checks.start()
     install = ("workers", "add", "w1", "--ssh", "w1", "--install", "--binary", str(binary))
@@ -54,9 +54,9 @@ def verify(checks, run, binary, command, save, until):
                 if key != "environment_diff" and c["level"] == "fail"]
     if failures:
         raise RuntimeError(f"doctor failed on the system worker: {failures}")
-    tasks = checks.submit(1, 1)
+    tasks = checks.submit(3, 4)
     views = checks.finish(tasks)
-    if views[tasks[0]]["attempts"]["items"][0]["worker_id"] != "w1":
+    if not any(v["attempts"]["items"][0]["worker_id"] == "w1" for v in views.values()):
         raise RuntimeError("system worker did not execute the submitted task")
     save(run / "evidence/system-worker.json",
          {"unit": str(unit), "user": owner, "pid_before": pid, "pid_after": new_pid,

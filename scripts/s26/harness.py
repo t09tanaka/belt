@@ -793,7 +793,7 @@ def run():
         if repo := os.environ.get("S26_PROJECT_CI"):
             from project_ci import compare
             checks.check("A37 Docker project comparison",
-                         lambda: compare(checks, repo, RUN, command, save))
+                         lambda: compare(checks, repo, RUN, command, save, until))
             return 0 if checks.results[-1]["pass"] else 1
         checks.start()
         checks.check("A02", checks.a02)

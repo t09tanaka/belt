@@ -62,7 +62,7 @@ def measure(checks, commit, state):
             "run_id": run_id}
 
 
-def compare(checks, repo, run, command, save):
+def compare(checks, repo, run, command, save, until):
     source = Path(repo).resolve(strict=True)
     project = run / "comparison-project"
     command(["git", "clone", "--no-local", "--", source, project], env=checks.env)
@@ -74,6 +74,10 @@ def compare(checks, repo, run, command, save):
         if topology == "group":
             for host in ("w1", "w2"):
                 checks.install(host)
+            def connected():
+                workers = checks.belt("top")["workers"]
+                return all(workers.get(host) == "connected" for host in ("w1", "w2"))
+            until("both newly enrolled workers connected", connected, 90)
         for cache in ("first", "repeat"):
             sample = measure(checks, commit, run / "state")
             evidence["runs"][f"{topology}-{cache}"] = sample
