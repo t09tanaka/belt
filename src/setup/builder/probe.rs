@@ -99,6 +99,9 @@ impl Setups {
                 return Err(Unknown::ProfileUnavailable);
             }
             let mut entries = Vec::new();
+            // What the worker would serve from its own profile, by the rule of
+            // the real run, read from this sample: nothing is probed here.
+            let mut native = Vec::new();
             if first_pass.get() && input.frozen.is_some() {
                 verification_started.set(Some(platform::monotonic_ms()));
             }
@@ -106,10 +109,27 @@ impl Setups {
                 crate::toolchain::contract::check_baselines(&bundle.frozen, Some(&snapshot))
                     .map_err(|_| Unknown::ProfileUnavailable)?;
                 for evidence in &bundle.evidence {
-                    let registry = registry.ok_or(Unknown::MissingContext)?;
-                    let (request, plan) = registry
-                        .probe_plan_request(&bundle.frozen, &evidence.tool, evidence, &byte_budget)
-                        .map_err(|_| Unknown::IoUnavailable)?;
+                    let planned = match registry {
+                        Some(registry) => registry.probe_plan_request(&bundle.frozen, &evidence.tool, evidence, &byte_budget),
+                        None => Err(crate::toolchain::registry::Unavailable::Unconfigured),
+                    };
+                    let (request, plan) = match planned {
+                        Ok(planned) => planned,
+                        Err(refused) => {
+                            let served = refused.allows_native().then(|| {
+                                crate::toolchain::contract::native_tool(&bundle.frozen, &evidence.tool, &snapshot)
+                            });
+                            match served.flatten() {
+                                // No install to wait for and no private path.
+                                Some(tool) => {
+                                    native.push(tool);
+                                    continue;
+                                }
+                                None if registry.is_none() => return Err(Unknown::MissingContext),
+                                None => return Err(Unknown::IoUnavailable),
+                            }
+                        }
+                    };
                     if self.cfg.profile_definition.as_ref() != Some(&request.profile_definition)
                         || self.cfg.profile_fingerprint.as_ref() != Some(&request.base_profile)
                     {
@@ -133,7 +153,7 @@ impl Setups {
                 if input.frozen.is_some() {
                     let bundle = input.frozen.as_ref().expect("frozen checked");
                     let activation = adapters::prospective_activation(
-                        &bundle.frozen, &verified.borrow(), fingerprint.clone(),
+                        &bundle.frozen, &verified.borrow(), &native, fingerprint.clone(),
                         &crate::toolchain::contract::observations(&snapshot), profile.environment(),
                         Digest::of_bytes(&serde_json::to_vec(&input.setup).map_err(|_| Unknown::InvalidBinding)?),
                         profile.shell(), &byte_budget,
@@ -320,8 +340,13 @@ mod preparation_probe_tests {
     }
     impl Fixture {
         fn new() -> Self {
+            Self::with_profile_tools(|_| {})
+        }
+        /// `tools` puts executables on the profile path before it is measured.
+        fn with_profile_tools(tools: impl FnOnce(&std::path::Path)) -> Self {
             let temp = crate::test_tmp::tempdir().unwrap();
             let root = std::fs::canonicalize(temp.path()).unwrap();
+            tools(&root);
             // A real fixed shell path, but no tool executable to discover/probe.
             let shell = root.join("sh");
             std::fs::copy("/bin/sh", &shell).unwrap();
@@ -364,6 +389,14 @@ mod preparation_probe_tests {
                 frozen: &self.frozen,
                 in_place: false,
             }
+        }
+        fn probe_with(&self, registry: Option<&crate::toolchain::registry::Registry>) -> Probe {
+            self.owner.probe_preparation(
+                self.input(),
+                Some(&self.profile),
+                Some(&self.fingerprint),
+                registry,
+            )
         }
         fn probe(&self) -> Probe {
             self.owner.probe_preparation(
@@ -837,6 +870,95 @@ mod preparation_probe_tests {
         assert_eq!(
             entries[1].state,
             State::Unknown(Unknown::ActivationUnverified)
+        );
+    }
+    /// A selection the worker serves from its own profile is no install: the
+    /// probe names no tool entry for it, and the workspace key is the one of
+    /// the activation the real run composes, with or without a registry.
+    #[test]
+    fn preparation_probe_native_selection_has_the_activation_of_the_real_run() {
+        use crate::toolchain::versions::*;
+        let mut f = Fixture::with_profile_tools(|root| {
+            let node = root.join("node");
+            std::fs::write(&node, "#!/bin/sh\necho v1.2.3\n").unwrap();
+            std::fs::set_permissions(&node, std::fs::Permissions::from_mode(0o700)).unwrap();
+        });
+        let node = ToolId::parse("node").unwrap();
+        let bundle = |version: &str| {
+            let scope = Scope::project("");
+            let frozen = FrozenToolchains::freeze(
+                f.manifest.clone(),
+                f.profile.definition_digest().clone(),
+                scope.clone(),
+                &[Declaration {
+                    tool: node.clone(),
+                    constraint: Constraint::parse(version).unwrap(),
+                    scope,
+                    location: Location {
+                        path: "captured".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &BTreeMap::new(),
+                MatchPolicy::Exact,
+            )
+            .unwrap();
+            Box::new(crate::toolchain::contract::FrozenBundle::seal_exact(frozen).unwrap())
+        };
+        let exact = bundle("1.2.3");
+        let other = bundle("1.2.4");
+        let (snapshot, _) = f.profile.preparation_snapshot(&f.fingerprint).unwrap();
+        let native =
+            crate::toolchain::contract::native_tool(&exact.frozen, &node, &snapshot).unwrap();
+        let activation = adapters::activate_with_native(
+            &exact.frozen,
+            &[],
+            &[native],
+            f.fingerprint.clone(),
+            &crate::toolchain::contract::observations(&snapshot),
+            f.profile.environment(),
+            Digest::of_bytes(&serde_json::to_vec(&f.setup).unwrap()),
+            &adapters::FileIdentity::capture(f.profile.shell()).unwrap(),
+        )
+        .unwrap();
+        let expected = policy::template_key(
+            f.setup.as_ref().unwrap(),
+            &workspace_key_context(
+                f.setup.as_ref().unwrap(),
+                &f.manifest,
+                &f.run,
+                activation.execution_fingerprint.to_string(),
+                activation.environment,
+            ),
+        );
+        f.frozen = Some(exact);
+        // No registry at all.
+        let only = entry(f.probe_with(None));
+        assert_eq!(only.kind, PreparationKind::WorkspaceSetup);
+        assert_eq!(only.state, State::ConcretePlan);
+        assert_eq!(only.key, Some(Digest::of_bytes(expected.as_bytes())));
+        // A registry that has no recipe for the tool.
+        let manager = std::fs::canonicalize(f._temp.path())
+            .unwrap()
+            .join("manager");
+        std::fs::write(&manager, b"private-manager-never-executed").unwrap();
+        std::fs::set_permissions(&manager, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let node_bundle = f.frozen.take();
+        let (registry, _, _) = small_install(&mut f, &manager);
+        f.frozen = node_bundle;
+        assert_eq!(entry(f.probe_with(Some(&registry))), only);
+        // With no workspace to prepare there is nothing to name.
+        let setup = f.setup.take();
+        assert!(matches!(f.probe_with(None), Probe::Entries { entries, .. } if entries.is_empty()));
+        f.setup = setup;
+        // Another version than the profile has is not served: as before.
+        f.frozen = Some(other);
+        assert_eq!(f.probe_with(None), Probe::Unknown(Unknown::MissingContext));
+        assert_eq!(
+            f.probe_with(Some(&registry)),
+            Probe::Unknown(Unknown::IoUnavailable)
         );
     }
     #[test]

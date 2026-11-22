@@ -335,11 +335,11 @@ pub(super) async fn freeze_resolved(
         .map_err(|e| invalid(e.to_string()))?
     };
     let toolchains = match frozen? {
-        Some(bundle) if bundle.validate(digest).is_err() => {
+        Some((bundle, observed)) if bundle.validate(digest).is_err() => {
             let asked = bundle.frozen.describe_requirements();
             match owner
                 .request(Operation::ResolveToolchains {
-                    bundle,
+                    bundle: bundle.clone(),
                     requirements: requirements.clone(),
                 })
                 .await
@@ -349,7 +349,9 @@ pub(super) async fn freeze_resolved(
                     bundle.validate(digest).map_err(|e| invalid(e.into()))?;
                     Some(bundle)
                 }
-                Reply::ControlError { error } => return Err(error),
+                Reply::ControlError { error } => {
+                    Some(seal_after_refusal(bundle, &observed, digest, error)?)
+                }
                 _ => {
                     return Err(ApiError::blocked(
                         crate::error::BlockedReason::EnvironmentMismatch,
@@ -358,10 +360,35 @@ pub(super) async fn freeze_resolved(
                 }
             }
         }
-        other => other,
+        other => other.map(|(bundle, _)| bundle),
     };
     drop(guard);
     Ok(toolchains)
+}
+
+/// What the owner's refusal to resolve leaves the submit with. Only the
+/// answer that no registry could resolve the requirements (`blocked:
+/// environment_mismatch`) lets a range the tool this host observed satisfies
+/// be sealed to that version. Every other error — the owner stopping, fenced
+/// or overloaded, a storage or protocol failure — says nothing about the
+/// requirements, and is returned as it came, as is a refusal the observation
+/// cannot answer.
+fn seal_after_refusal(
+    bundle: crate::toolchain::contract::FrozenBundle,
+    observed: &Observed,
+    digest: &Digest,
+    error: ApiError,
+) -> Result<crate::toolchain::contract::FrozenBundle, ApiError> {
+    if error.code != ErrorCode::Blocked
+        || error.blocked_reason != Some(crate::error::BlockedReason::EnvironmentMismatch)
+    {
+        return Err(error);
+    }
+    let sealed = bundle.seal_observed(observed);
+    if sealed.validate(digest).is_err() {
+        return Err(error);
+    }
+    Ok(sealed)
 }
 
 fn freeze_toolchains(
@@ -369,7 +396,7 @@ fn freeze_toolchains(
     captured: &crate::source::manifest::SourceManifest,
     digest: Digest,
     requirements: &crate::toolchain::capability::ExecutionRequirements,
-) -> Result<Option<crate::toolchain::contract::FrozenBundle>, ApiError> {
+) -> Result<Option<(crate::toolchain::contract::FrozenBundle, Observed)>, ApiError> {
     use crate::toolchain::{
         contract::{self, FrozenBundle},
         versions::{FrozenToolchains, Location, MatchPolicy, Scope, ToolId, VersionObservation},
@@ -453,7 +480,7 @@ fn freeze_toolchains(
     }
     let mut bundle = FrozenBundle::seal_exact(frozen).map_err(|e| blocked(e.into()))?;
     if bundle.validate(&bundle.frozen.source_manifest).is_ok() {
-        return Ok(Some(bundle));
+        return Ok(Some((bundle, observations)));
     }
     // Loading a configured inventory is read-only and invokes no managers.
     if let Some(registry) = worker_inventory(&context.bootstrap.worker_state_dir, &profile) {
@@ -467,8 +494,14 @@ fn freeze_toolchains(
             }
         }
     }
-    Ok(Some(bundle))
+    Ok(Some((bundle, observations)))
 }
+
+/// What the profile of this host reports for each tool at capture.
+type Observed = std::collections::BTreeMap<
+    crate::toolchain::versions::ToolId,
+    crate::toolchain::versions::VersionObservation,
+>;
 
 /// The inventory of the local worker, if this host has one. The worker opens
 /// its state through the canonical path and the inventory refuses any other
@@ -490,6 +523,71 @@ fn worker_inventory(
 #[cfg(test)]
 mod tests {
     use super::worker_inventory;
+
+    /// A range is sealed to the observed version only after the refusal that
+    /// says the requirements could not be resolved. An error that says
+    /// nothing about them leaves the bundle unsealed and comes back unchanged.
+    #[test]
+    fn only_the_unresolved_requirements_refusal_seals_to_the_observed_version() {
+        use super::seal_after_refusal;
+        use crate::error::{ApiError, BlockedReason, ErrorCode};
+        use crate::ids::Digest;
+        use crate::toolchain::{contract::FrozenBundle, versions::*};
+        let source = Digest::of_bytes(b"source");
+        let scope = Scope::project("");
+        let node = ToolId::parse("node").unwrap();
+        let bundle = FrozenBundle::seal_exact(
+            FrozenToolchains::freeze(
+                source.clone(),
+                Digest::of_bytes(b"parent"),
+                scope.clone(),
+                &[Declaration {
+                    tool: node.clone(),
+                    constraint: Constraint::parse("20").unwrap(),
+                    scope,
+                    location: Location {
+                        path: ".nvmrc".into(),
+                        first_line: 1,
+                        last_line: 1,
+                    },
+                }],
+                &[],
+                &Default::default(),
+                MatchPolicy::Exact,
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(bundle.validate(&source).is_err());
+        let seen = |version: &str| [(node.clone(), VersionObservation::parse(version))].into();
+        let unresolved = || {
+            ApiError::blocked(
+                BlockedReason::EnvironmentMismatch,
+                "toolchain resolve required: no coherent worker proposal",
+            )
+        };
+        let sealed =
+            seal_after_refusal(bundle.clone(), &seen("20.11.1"), &source, unresolved()).unwrap();
+        sealed.validate(&source).unwrap();
+        assert_eq!(sealed.evidence[0].concrete.to_string(), "20.11.1");
+        // The observation does not answer the refusal: it stays the refusal.
+        assert_eq!(
+            seal_after_refusal(bundle.clone(), &seen("18.0.0"), &source, unresolved()),
+            Err(unresolved())
+        );
+        for transient in [
+            ApiError::new(ErrorCode::CommunicationUnknown, "resident is stopping"),
+            ApiError::new(ErrorCode::StaleEpoch, "fenced"),
+            ApiError::new(ErrorCode::Overloaded, "send again"),
+            ApiError::new(ErrorCode::Internal, "storage"),
+            ApiError::blocked(BlockedReason::SecretUnavailable, "secret"),
+        ] {
+            assert_eq!(
+                seal_after_refusal(bundle.clone(), &seen("20.11.1"), &source, transient.clone()),
+                Err(transient)
+            );
+        }
+    }
     use crate::toolchain::{profile::Profile, registry::Registry};
     use std::os::unix::fs::{symlink, DirBuilderExt};
 

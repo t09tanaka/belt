@@ -5932,3 +5932,238 @@ async fn worker_commands_find_the_embedded_helpers_before_standalone_tools() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A worker with no toolchain registry whose profile has a `node` that reports
+/// `reported`, and a project whose only declaration is `.nvmrc` = `declared`.
+/// The project has a prepare command that records the version setup saw.
+/// Returns the outcome of the public submit of a command that checks that
+/// record, records the version it ran on itself and exits with `exit`, and
+/// the path it records to (next to the `node` of the profile).
+async fn submit_with_native_node(
+    reported: &str,
+    declared: &str,
+    exit: i32,
+) -> (
+    super::common::DaemonRoot,
+    Spec,
+    Result<belt::service::submit::Receipt, belt::error::ApiError>,
+    std::path::PathBuf,
+) {
+    let (root, spec, input) = control_fixture();
+    let host = root.path().join("native-tools");
+    let stubs = root.path().join("tool-stubs");
+    std::fs::create_dir(&host).unwrap();
+    crate::common::write_executable(
+        &host.join("node"),
+        &format!("#!/bin/sh\nprintf 'v{reported}\\n'\n"),
+    );
+    let profile_text = format!("schema_version=1\nactive='native'\n[profiles.native]\npath=[{:?},{stubs:?},'/usr/bin','/bin']\nshell='/bin/sh'\ncache_namespace='native'\nrequired_tools=['node']\nallowed_env=['GIT_CONFIG_GLOBAL','GIT_CONFIG_NOSYSTEM','LLVM_PROFILE_FILE']\n", host.to_str().unwrap());
+    let profile_file = spec.worker_state_dir.join("profiles.toml");
+    std::fs::write(&profile_file, &profile_text).unwrap();
+    std::fs::set_permissions(&profile_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(!spec.worker_state_dir.join("toolchains.toml").exists());
+    std::fs::write(input.join(".nvmrc"), format!("{declared}\n")).unwrap();
+    let ran = host.join("ran-on");
+    let script = format!(
+        "test \"$(cat prepared-node.txt)\" = \"$(node --version)\" || exit 91; node --version > '{}'; exit {exit}",
+        ran.display()
+    );
+    let mut context =
+        belt::service::context::Context::load(spec.env.clone(), input.clone(), spec.clone())
+            .unwrap();
+    context.config.prepare_commands = vec![vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        "node --version > prepared-node.txt".into(),
+    ]];
+    let accepted =
+        belt::service::submit::command(context, vec!["/bin/sh".into(), "-c".into(), script], None)
+            .await;
+    (root, spec, accepted, ran)
+}
+
+/// The first `task_waiting` event of the task after event `after`.
+async fn native_task_waiting(
+    spec: &Spec,
+    task: &belt::ids::TaskId,
+    after: usize,
+) -> serde_json::Value {
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let limit = Duration::from_secs(30);
+    let deadline = tokio::time::Instant::now() + limit;
+    loop {
+        let events = owner.events_after(0, 512).unwrap();
+        let waiting = events
+            .iter()
+            .skip(after)
+            .find(|e| e.kind == "task_waiting" && e.payload["task"] == task.as_str());
+        if let Some(waiting) = waiting {
+            return waiting.payload.clone();
+        }
+        if tokio::time::Instant::now() >= deadline {
+            let kinds: Vec<_> = events.iter().map(|e| e.kind.as_str()).collect();
+            panic!("task {task} was not reported as waiting within {limit:?}; events after {after}: {kinds:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// The one attempt of the task: the version its bundle was frozen to, and
+/// the binding the worker accepted for it.
+fn native_attempt(
+    spec: &Spec,
+    task: &belt::ids::TaskId,
+) -> (String, belt::toolchain::contract::ExecutionBinding) {
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let attempts = owner.attempts_of_task(task).unwrap();
+    assert_eq!(attempts.len(), 1);
+    let worker = belt::storage::WorkerStore::open_read_only(&spec.worker_state_dir).unwrap();
+    let accepted = worker.get(&attempts[0].attempt_id).unwrap().unwrap();
+    let payload: belt::wire::AttemptPayload = serde_json::from_value(accepted.spec).unwrap();
+    let bundle = payload.toolchains.unwrap();
+    assert_eq!(bundle.frozen.selections.len(), 1);
+    let binding = serde_json::from_slice(
+        &std::fs::read(
+            spec.worker_state_dir
+                .join("attempts")
+                .join(attempts[0].attempt_id.as_str())
+                .join("execution-binding.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    (bundle.frozen.selections[0].concrete.to_string(), binding)
+}
+
+/// A declared version that no managed install can serve runs on the tool the
+/// worker already has when that tool is exactly the declared version: an exact
+/// pin as it is, and a range frozen to the version the parent observed. Nothing
+/// is installed and no private path is put before the profile's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_declared_version_runs_on_the_native_tool_of_exactly_that_version() {
+    use belt::service::{completion::Target, control};
+    for declared in ["20.11.1", "20"] {
+        let (_root, spec, accepted, ran) = submit_with_native_node("20.11.1", declared, 0).await;
+        let accepted = accepted.unwrap_or_else(|e| panic!("{declared}: {e:?}"));
+        let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+        let done = tokio::time::timeout(
+            Duration::from_secs(45),
+            control::wait(&spec, Target::Run(accepted.run_id.clone()), &mut signals),
+        )
+        .await;
+        if !matches!(&done, Ok(Ok(done)) if done.cli_exit_code == 0) {
+            diagnose_coordinator(&spec);
+            diagnose_worker(&spec);
+            shutdown(&load(&spec)).await;
+            panic!("{declared}: {done:?}");
+        }
+        assert_eq!(std::fs::read_to_string(&ran).unwrap(), "v20.11.1\n");
+        let (frozen_to, binding) = native_attempt(&spec, &accepted.task_id);
+        assert_eq!(frozen_to, "20.11.1", "{declared}");
+        let path = &binding.activation.environment["PATH"];
+        assert!(
+            !path.contains("/toolchains/"),
+            "{declared}: a private tool path was activated: {path}"
+        );
+        assert_eq!(
+            std::fs::read_dir(spec.worker_state_dir.join("toolchains"))
+                .map(|entries| entries.count())
+                .unwrap_or(0),
+            0,
+            "{declared}: something was installed"
+        );
+        shutdown(&load(&spec)).await;
+    }
+}
+
+/// The native tool serves only its own version: a pin it does not equal has no
+/// install path either, so the task is not placed and the worker is left out
+/// with the line that names what the task asks for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_tool_of_another_version_does_not_serve_the_pin() {
+    let (_root, spec, accepted, ran) = submit_with_native_node("20.11.0", "20.11.1", 0).await;
+    let accepted = accepted.unwrap();
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let payload = native_task_waiting(&spec, &accepted.task_id, 0).await;
+    assert_eq!(payload["blocked_reason"], "no_compatible_worker");
+    assert_eq!(payload["decision"]["winner"], serde_json::Value::Null);
+    let excluded = &payload["decision"]["excluded"][0];
+    assert_eq!(excluded["why"], "capability_mismatch", "{payload}");
+    assert_eq!(
+        excluded["unmet"],
+        serde_json::json!(["toolchain node=20.11.1 unavailable"])
+    );
+    assert!(owner
+        .attempts_of_task(&accepted.task_id)
+        .unwrap()
+        .is_empty());
+    assert!(!ran.exists(), "the command ran anyway");
+    shutdown(&load(&spec)).await;
+}
+
+/// What an observation cannot prove stays refused at submit as before: a
+/// channel or alias (the probe reports no channel), and a range the observed
+/// version is outside of.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_alias_or_an_unmet_range_is_not_resolved_from_the_native_tool() {
+    for (declared, asked) in [
+        ("lts/*", "node=lts/*"),
+        ("stable", "node=stable"),
+        ("18", "node=>=18.0.0 <19.0.0-0"),
+    ] {
+        let (_root, spec, accepted, ran) = submit_with_native_node("20.11.1", declared, 0).await;
+        let refused = accepted.expect_err(declared);
+        assert_eq!(
+            refused.blocked_reason,
+            Some(belt::error::BlockedReason::EnvironmentMismatch),
+            "{declared}"
+        );
+        assert_eq!(
+            refused.message,
+            format!("toolchain resolve required: no coherent worker proposal ({asked})")
+        );
+        assert!(!ran.exists(), "{declared}: the command ran anyway");
+        shutdown(&load(&spec)).await;
+    }
+}
+
+/// The native tool is bound to the version the run was frozen to: when the
+/// profile's tool reports another version afterwards, a retry of the same run
+/// is not started on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_native_tool_that_changed_version_does_not_run_the_retry() {
+    use belt::service::{completion::Target, control};
+    let (_root, spec, accepted, ran) = submit_with_native_node("20.11.1", "20.11.1", 23).await;
+    let accepted = accepted.unwrap();
+    let (_tx, mut signals) = tokio::sync::mpsc::unbounded_channel();
+    let done = tokio::time::timeout(
+        Duration::from_secs(45),
+        control::wait(&spec, Target::Run(accepted.run_id.clone()), &mut signals),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(done.cli_exit_code, 23, "{done:?}");
+    assert_eq!(std::fs::read_to_string(&ran).unwrap(), "v20.11.1\n");
+    std::fs::remove_file(&ran).unwrap();
+    crate::common::write_executable(
+        &ran.with_file_name("node"),
+        "#!/bin/sh\nprintf 'v20.11.2\\n'\n",
+    );
+    let owner = CoordinatorStore::open_read_only(&spec.state_dir).unwrap();
+    let before = owner.events_after(0, 512).unwrap().len();
+    control::retry(&spec, Target::Run(accepted.run_id.clone()))
+        .await
+        .unwrap();
+    let payload = native_task_waiting(&spec, &accepted.task_id, before).await;
+    assert_eq!(payload["blocked_reason"], "no_compatible_worker");
+    assert_eq!(payload["decision"]["winner"], serde_json::Value::Null);
+    assert_eq!(
+        payload["decision"]["excluded"][0]["unmet"],
+        serde_json::json!(["toolchain node=20.11.1 unavailable"]),
+        "{payload}"
+    );
+    assert_eq!(owner.attempts_of_task(&accepted.task_id).unwrap().len(), 1);
+    assert!(!ran.exists(), "the retry ran on the changed tool");
+    shutdown(&load(&spec)).await;
+}
