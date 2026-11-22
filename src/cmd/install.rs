@@ -136,6 +136,7 @@ pub fn install_projects(
 ) -> Result<Vec<std::result::Result<Report, String>>> {
     crate::retention::run(None);
     let ctx = context(root, cfg)?;
+    crate::retention::note_main(&ctx.cache_repo, &ctx.main);
     let mut results: Vec<Option<std::result::Result<Report, String>>> = vec![None; projects.len()];
     for phase in [true, false] {
         std::thread::scope(|s| {

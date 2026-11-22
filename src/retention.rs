@@ -125,6 +125,14 @@ fn own(root: &Path, main: &Path) {
     trash::sweep_siblings(&worktree_parents(main));
 }
 
+/// [`record_main`] for a repository that only ever installs (no `add`, no
+/// removal): once its directory `repo` of the cache is there.
+pub fn note_main(repo: &Path, main: &Path) {
+    if repo.is_dir() {
+        record_main(repo, main);
+    }
+}
+
 /// Write the real path of `main` into the [`MAIN_RECORD`] of its directory
 /// `repo` of the cache, unless it is there already.
 fn record_main(repo: &Path, main: &Path) {
