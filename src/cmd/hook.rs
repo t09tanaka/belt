@@ -508,8 +508,11 @@ pub fn discard(given: &Path, cwd: Option<&Path>) -> Result<Discarded> {
     }
     if kept_ref.is_some() || !sub_refs.is_empty() {
         errln!(
-            "fast-worktree: `fast-worktree kept ls` lists such refs, \
-             they are deleted by themselves after {} days (`fast-worktree kept prune` does it at once)",
+            "fast-worktree: `fast-worktree kept ls` lists such refs. Each is deleted by itself on {} \
+             ({} days from now), and what it holds can then be dropped by `git gc`; sooner only \
+             when a branch or tag has its commit. Make a branch of what you want to keep: \
+             git branch <name> <commit>",
+            kept::expiry_date(),
             kept::PRUNE_DAYS
         );
     }

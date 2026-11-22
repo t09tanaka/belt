@@ -46,6 +46,39 @@ pub fn output_with_env(dir: &Path, args: &[&str], env: &[(&str, &str)]) -> Resul
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// [`output`] for a command that reads `input` on its standard input and
+/// takes no part in worktree registration (`update-ref --stdin`).
+pub fn output_with_stdin(dir: &Path, args: &[&str], input: &str) -> Result<String> {
+    use std::io::Write;
+    let fail = |e: std::io::Error| Error::of(Kind::Git, format!("cannot run git: {e}"));
+    let mut child = command(dir)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(fail)?;
+    // Written from another thread: git may fill its output pipes before it
+    // has read everything.
+    let mut stdin = child.stdin.take();
+    let text = input.to_string();
+    let writer = std::thread::spawn(move || {
+        if let Some(mut pipe) = stdin.take() {
+            let _ = pipe.write_all(text.as_bytes());
+        }
+    });
+    let out = child.wait_with_output().map_err(fail)?;
+    let _ = writer.join();
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(Error::of(
+            Kind::Git,
+            format!("git {}: {}", args.join(" "), err.trim()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
 /// Run git in `dir` with inherited stdout/stderr (for commands whose
 /// output the user should see, like `git worktree add`), with extra
 /// environment variables for git and its hooks.
@@ -92,16 +125,13 @@ fn registration_lock(dir: &Path) -> Result<RegistrationLock> {
     ))
 }
 
+/// The lock file, in the repository's common git directory. It is never
+/// unlinked: the versions from 0.4.0 on take the lock on whatever file
+/// they opened, without looking at the path again, so one that waited on a
+/// file that was unlinked meanwhile would hold "the lock" together with
+/// the next operation, and two registrations would run side by side. It is
+/// one empty file for a repository, and goes with the repository.
 const REGISTRATION_LOCK: &str = "fast-worktree-registration.lock";
-
-impl Drop for RegistrationLock {
-    /// The lock file is not kept: it goes with the lock, and whoever
-    /// waited on it takes the next one on a new file
-    /// ([`crate::util::lock_path`]).
-    fn drop(&mut self) {
-        let _ = fs::remove_file(self.key.join(REGISTRATION_LOCK));
-    }
-}
 
 fn lock_common(common: &Path) -> Result<RegistrationLock> {
     let key = common.canonicalize()?;

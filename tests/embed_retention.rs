@@ -84,7 +84,7 @@ fn library_calls_make_the_sweep() {
 
     let repo = Repository::open(&main)
         .unwrap()
-        .with_output(Output::Discard)
+        .with_output(Output::Capture)
         .with_helper(None);
 
     // Creating a worktree deletes the old kept refs of its repository.
@@ -97,6 +97,12 @@ fn library_calls_make_the_sweep() {
         ))
         .unwrap();
     assert!(refs(&main).is_empty(), "{}", refs(&main));
+    // The deletion of a ref is in the log of the call that made it.
+    let said = made
+        .log
+        .iter()
+        .any(|l| l.text.contains(old) && l.text.contains(&head));
+    assert!(said, "{:?}", made.log);
 
     // So does removing one, an hour later.
     git(&main, &["update-ref", old, &head]);
@@ -111,9 +117,10 @@ fn library_calls_make_the_sweep() {
     let proj = cache.join("gone-0123abcd/app");
     let key = "0123456789abcdef-v20.1.0";
     fs::create_dir_all(proj.join(key)).unwrap();
+    fs::write(proj.join(format!("{key}.ok")), "").unwrap();
     age(&proj.join(key), 8 * 86_400);
     let _ = fs::remove_file(cache.join(".retention-stamp"));
     sweep_trash();
-    wait_gone(&proj);
-    assert!(!proj.exists());
+    wait_gone(&proj.join(key));
+    assert!(!proj.join(key).exists());
 }
